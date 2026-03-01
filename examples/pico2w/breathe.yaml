@@ -1,0 +1,27 @@
+# Breathing LED (Pico 2 W)
+#
+# Smooth pulsing LED effect using software PWM on the CYW43 wireless chip LED.
+#
+# The sequencer outputs a sine-like brightness pattern (16 steps, 50ms each = 800ms cycle).
+# The brightness module applies gamma 2.2 correction for perceptually smooth dimming.
+# CYW43 drives the LED via software PWM at 50Hz (20ms period).
+#
+# Preset values are raw brightness (0-255); the brightness module's gamma
+# curve maps these to perceptual brightness levels.
+target: pico2w
+
+
+modules:
+  - name: cyw43
+  - name: sequencer
+    step_ms: 50
+    mode: loop
+    preset: [0, 5, 10, 25, 40, 60, 80, 105, 130, 155, 180, 200, 220, 235, 250, 252, 255, 252, 250, 235, 220, 200, 180, 155, 130, 105, 80, 60, 40, 25, 10]
+  - name: brightness
+    curve: gamma22
+
+wiring:
+  - from: sequencer.notes
+    to: brightness.source
+  - from: brightness.level
+    to: cyw43.led

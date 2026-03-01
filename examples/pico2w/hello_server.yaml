@@ -1,0 +1,65 @@
+# Hello Server
+#
+# Serves a single HTML page over HTTP. The page content is defined in the
+# data section — no SD card or filesystem needed.
+#
+# Hardware:
+# - CYW43 WiFi (onboard, Pico W)
+#
+# Pipeline:
+#
+#   http_server <--socket--> ip <--frames--> cyw43
+#                                              ^
+#                                           wifi
+#
+# Usage:
+#   1. Flash this config
+#   2. Device connects to WiFi
+#   3. Note IP address from debug output
+#   4. curl http://<ip>/
+target: pico2w
+
+
+hardware:
+  network:
+    type: wifi
+    driver: cyw43
+    ssid: "${WIFI_SSID}"
+    password: "${WIFI_PASSWORD}"
+    security: wpa3
+
+data:
+  hello_page:
+    type: html
+    content: |
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Hello from Fluxor</title>
+        <style>
+          body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+          h1 { color: #2563eb; }
+        </style>
+      </head>
+      <body>
+        <h1>Hello, World!</h1>
+        <p>This page is served by <strong>Fluxor</strong> on an RP2350.</p>
+        <p>The HTML is defined inline in the YAML config &mdash; no filesystem needed.</p>
+      </body>
+      </html>
+
+modules:
+  - name: http_server
+    port: 80
+    body: hello_page
+
+  # Debug output
+  - name: debug
+    mode: plaintext
+
+wiring:
+  # Debug: WiFi scan results
+  - from: cyw43.scan_text
+    to: debug.data

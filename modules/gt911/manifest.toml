@@ -1,0 +1,24 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "touch"
+direction = "output"
+content_type = "InputEvent"
+required = true
+
+[[resources]]
+device_class = "i2c"
+access = "exclusive"
+
+[[resources]]
+device_class = "gpio"
+access = "write"
+
+[[resources]]
+device_class = "event"
+access = "write"
+
+[[resources]]
+device_class = "timer"
+access = "write"

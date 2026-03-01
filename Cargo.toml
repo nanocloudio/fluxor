@@ -1,0 +1,76 @@
+[package]
+name = "fluxor"
+description = "Fluxor"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/nanocloudio/fluxor"
+
+[[bin]]
+name = "fluxor"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Async executor for main task and logger task.
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+# Timers for async delays between SD reads.
+embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
+# RP2350 HAL (SPI, GPIO, USB, DMA, clocks).
+# Chip variant (rp235xa or rp235xb) selected via features below.
+embassy-rp = { version = "0.9.0", features = ["defmt", "time-driver", "critical-section-impl", "rt", "unstable-pac"] }
+# USB device stack for CDC logging.
+embassy-usb = { version = "0.5.1", features = ["defmt"] }
+# USB serial logger implementation.
+embassy-usb-logger = "0.5.1"
+# Minimal async yield helper for syscall polling loops.
+embassy-futures = "0.1.2"
+# Async primitives (signals, channels, mutexes).
+embassy-sync = "0.7.2"
+# Cortex-M core utilities (used for low-level delays).
+cortex-m = "0.7.7"
+# Cortex-M runtime and startup.
+cortex-m-rt = "0.7.5"
+# Static initialization for shared peripherals.
+static_cell = "2.1.1"
+# Structured logging facade used by embassy-usb-logger.
+log = "0.4.27"
+# PIO assembler/proc macros for RP2350 PIO programs.
+pio-proc = "0.3.0"
+# PIO instruction encoding utilities.
+pio = "0.3.0"
+# Fixed-point math used by PIO helpers.
+fixed = "1.29.0"
+# defmt logging backend (required by selected embassy features).
+defmt = "1.0.1"
+# RTT logger for early debug output.
+defmt-rtt = "1.1.0"
+# Panic handler with defmt output.
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+sha2 = { version = "0.10.9", default-features = false }
+embedded-io-async = "0.6.1"
+# Portable atomics with CAS emulation for thumbv6m (RP2040 Cortex-M0+).
+# On thumbv8m (RP2350) this is a zero-cost pass-through.
+portable-atomic = { version = "1", default-features = false }
+
+[features]
+default = ["chip-rp2350b"]
+# Single binary for both RP2350A and RP2350B. Always compile with B (superset).
+# Runtime silicon detection (SYSINFO.package_sel) gates pin availability.
+chip-rp2350b = ["embassy-rp/rp235xb"]
+# RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
+chip-rp2040 = ["embassy-rp/rp2040"]
+
+[profile.release]
+debug = 2
+lto = false
+opt-level = 2
+
+[profile.dev]
+debug = 2
+opt-level = 1
+
+[workspace]
+members = ["tools"]

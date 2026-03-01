@@ -1,0 +1,12 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "brightness"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[resources]]
+device_class = "pwm"
+access = "exclusive"

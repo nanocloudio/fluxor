@@ -1,0 +1,34 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "mic"
+direction = "input"
+content_type = "AudioPcm"
+
+[[ports]]
+name = "audio"
+direction = "output"
+content_type = "AudioPcm"
+required = true
+
+[[ports]]
+name = "rtp"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "sip_ctrl"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "call"
+direction = "ctrl_input"
+content_type = "FmpMessage"
+
+[[resources]]
+device_class = "socket"
+access = "write"

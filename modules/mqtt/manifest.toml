@@ -1,0 +1,16 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "mesh_rx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "mesh_tx"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+device_class = "socket"
+access = "write"

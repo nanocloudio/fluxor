@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["thumbv8m.main-none-eabihf"]
+# Add "thumbv6m-none-eabi" when RP2040 target is needed (requires: rustup target add thumbv6m-none-eabi)

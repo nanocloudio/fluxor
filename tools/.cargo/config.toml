@@ -1,0 +1,3 @@
+# Override parent config to build for host instead of embedded target
+[build]
+target = "aarch64-unknown-linux-gnu"

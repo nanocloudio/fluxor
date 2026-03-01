@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "pixels"
+direction = "input"
+content_type = "ImageRaw"
+required = false
+
+[[resources]]
+device_class = "gpio"
+access = "write"
+
+[[resources]]
+device_class = "pio"
+access = "exclusive"
+
+[[resources]]
+device_class = "timer"
+access = "write"

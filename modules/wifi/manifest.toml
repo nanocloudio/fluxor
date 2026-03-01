@@ -1,0 +1,26 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "status"
+direction = "input"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "scan_data"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "wifi_ctrl"
+direction = "output"
+content_type = "FmpMessage"
+
+[[resources]]
+device_class = "netif"
+access = "write"
+
+[commands]
+accepts = ["radio_ready", "connected", "disconnected", "scan_done", "scan_result"]
+emits = ["connect", "disconnect", "scan"]

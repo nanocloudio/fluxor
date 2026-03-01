@@ -1,0 +1,14 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[resources]]
+device_class = "gpio"
+access = "exclusive"
+
+[[resources]]
+device_class = "system"
+access = "exclusive"
+
+[[resources]]
+device_class = "pwm"
+access = "exclusive"

@@ -1,0 +1,22 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "audio"
+direction = "input"
+content_type = "AudioPcm"
+required = true
+
+[[ports]]
+name = "processed"
+direction = "output"
+content_type = "AudioPcm"
+required = true
+
+[[ports]]
+name = "preset"
+direction = "ctrl_input"
+content_type = "FmpMessage"
+
+[commands]
+accepts = ["next", "prev"]

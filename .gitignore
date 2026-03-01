@@ -1,0 +1,18 @@
+# Build output
+target/
+*.uf2
+*.bin
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Claude Code
+.claude/
+.context/

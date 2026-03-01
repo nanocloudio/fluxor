@@ -1,0 +1,71 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "frames_tx"
+direction = "input"
+content_type = "EthernetFrame"
+
+[[ports]]
+name = "led"
+index = 1
+direction = "input"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "hci_tx"
+index = 2
+direction = "input"
+content_type = "HciMessage"
+
+[[ports]]
+name = "frames_rx"
+direction = "output"
+content_type = "EthernetFrame"
+required = true
+
+[[ports]]
+name = "scan_text"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "scan_data"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "status"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "hci_rx"
+index = 4
+direction = "output"
+content_type = "HciMessage"
+
+[[ports]]
+name = "wifi_ctrl"
+direction = "ctrl_input"
+content_type = "FmpMessage"
+
+[[resources]]
+device_class = "pio"
+access = "exclusive"
+instance = 1
+
+[[resources]]
+device_class = "gpio"
+access = "write"
+
+[[resources]]
+device_class = "netif"
+access = "exclusive"
+
+[commands]
+accepts = ["connect", "disconnect", "scan"]
+emits = ["radio_ready", "connected", "disconnected", "scan_done", "scan_result"]

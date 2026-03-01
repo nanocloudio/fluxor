@@ -1,0 +1,21 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "net_tx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_rx"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[resources]]
+device_class = "uart"
+access = "exclusive"
+
+[[resources]]
+device_class = "gpio"
+access = "write"

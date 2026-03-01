@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "stream"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[commands]
+emits = ["toggle", "next", "prev", "long_press", "on", "off"]
+
+[[resources]]
+device_class = "system"
+access = "read"

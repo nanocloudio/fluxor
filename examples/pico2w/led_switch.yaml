@@ -1,0 +1,20 @@
+# LED Switch (Pico 2 W)
+#
+# Press BOOTSEL to turn LED on, release to turn it off.
+#
+# Control flow:
+#   flash (mode: direct) → cyw43 (LED)
+#
+# In direct mode, flash emits on/off messages tracking button state.
+# No gesture module needed.
+target: pico2w
+
+
+modules:
+  - name: cyw43
+  - name: flash
+    mode: 1
+
+wiring:
+  - from: flash.events
+    to: cyw43.led

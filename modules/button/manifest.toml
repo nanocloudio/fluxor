@@ -1,0 +1,11 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "raw"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+device_class = "gpio"
+access = "read"

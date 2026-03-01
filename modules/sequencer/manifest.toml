@@ -1,0 +1,16 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "control"
+direction = "input"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "notes"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[commands]
+accepts = ["status", "toggle", "select"]

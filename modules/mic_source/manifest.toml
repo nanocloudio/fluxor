@@ -1,0 +1,12 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "audio"
+direction = "output"
+content_type = "AudioPcm"
+
+[[resources]]
+device_class = "pio"
+access = "read"
+instance = 0

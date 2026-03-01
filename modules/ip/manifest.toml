@@ -1,0 +1,22 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "frames_rx"
+direction = "input"
+content_type = "EthernetFrame"
+required = true
+
+[[ports]]
+name = "frames_tx"
+direction = "output"
+content_type = "EthernetFrame"
+required = true
+
+[[resources]]
+device_class = "netif"
+access = "write"
+
+[[resources]]
+device_class = "socket"
+access = "exclusive"

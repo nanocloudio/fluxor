@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "blocks"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[resources]]
+device_class = "spi"
+access = "exclusive"
+
+[[resources]]
+device_class = "gpio"
+access = "write"
+
+[[resources]]
+device_class = "timer"
+access = "write"

@@ -1,0 +1,26 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "audio_in"
+direction = "input"
+content_type = "AudioPcm"
+
+[[ports]]
+name = "audio_out"
+direction = "output"
+content_type = "AudioPcm"
+
+[[ports]]
+name = "ctrl_fwd"
+direction = "output"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "control"
+direction = "ctrl_input"
+content_type = "FmpMessage"
+
+[[resources]]
+device_class = "uart"
+access = "exclusive"

@@ -1,0 +1,17 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "audio"
+direction = "input"
+content_type = "AudioPcm"
+required = true
+
+[[resources]]
+device_class = "pio"
+access = "exclusive"
+instance = 0
+
+[[resources]]
+device_class = "gpio"
+access = "write"

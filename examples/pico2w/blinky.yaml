@@ -1,0 +1,20 @@
+# Blinky (Pico 2 W)
+#
+# Flashes the status LED on a 1-second cycle (500ms on, 500ms off).
+#
+# On Pico 2 W, the LED is behind the CYW43 wireless chip (WL_GPIO0).
+# The sequencer outputs alternating note/rest events; the cyw43 module
+# interprets non-zero freq as LED on, zero freq as LED off.
+target: pico2w
+
+
+modules:
+  - name: cyw43
+  - name: sequencer
+    step_ms: 500
+    mode: loop
+    preset: [440, 0]
+
+wiring:
+  - from: sequencer.notes
+    to: cyw43.led

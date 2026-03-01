@@ -1,0 +1,29 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "mqtt_rx"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "notify"
+index = 1
+direction = "input"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "mqtt_tx"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "commands"
+direction = "ctrl_output"
+content_type = "FmpMessage"
+
+[commands]
+accepts = ["status"]
+emits = ["next", "prev", "toggle", "select"]
