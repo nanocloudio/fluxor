@@ -1,0 +1,10 @@
+# Raspberry Pi Pico (original)
+# RP2040, no wireless, on-board LED on GP25.
+
+[board]
+id = "pico"
+silicon = "rp2040"
+description = "Raspberry Pi Pico"
+
+[gpio]
+reserved_pins = []

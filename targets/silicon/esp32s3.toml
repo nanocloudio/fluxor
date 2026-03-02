@@ -1,0 +1,44 @@
+# ESP32-S3 — Validation only (no build integration yet)
+# GPIO matrix allows flexible pin assignment for most peripherals.
+
+[target]
+id = "esp32s3"
+family = "esp32"
+description = "ESP32-S3 (validation only)"
+
+# No [build] section — validation only, no kernel build support yet.
+
+[gpio]
+max_pin = 44
+
+[peripherals]
+spi_count = 3
+i2c_count = 2
+uart_count = 3
+adc_channels = 20
+pwm_slices = 8
+pio_count = 0
+pio_state_machines = 0
+dma_channels = 5
+
+# ESP32-S3 uses GPIO matrix: any valid GPIO can be assigned to SPI/I2C.
+[peripherals.spi0]
+valid_pins = "any"
+
+[peripherals.spi1]
+valid_pins = "any"
+
+[peripherals.spi2]
+valid_pins = "any"
+
+[peripherals.i2c0]
+valid_pins = "any"
+
+[peripherals.i2c1]
+valid_pins = "any"
+
+[memory]
+flash_base = "0x3c000000"
+flash_size = "0x800000"
+ram_base = "0x3fc88000"
+ram_size = "0x78000"

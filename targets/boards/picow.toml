@@ -1,0 +1,30 @@
+# Raspberry Pi Pico W (original)
+# RP2040 with CYW43439 wireless (uses GP23-25, GP29)
+# 2MB flash, 264KB SRAM.
+
+[board]
+id = "picow"
+silicon = "rp2040"
+description = "Raspberry Pi Pico W"
+
+# Default PIO: gSPI cmd (CYW43) on PIO1, I2S stream on PIO0
+[[hardware.pio]]
+pio_idx = 1
+data_pin = 24
+clk_pin = 29
+extra_pin = 255
+
+[[hardware.pio]]
+pio_idx = 0
+data_pin = 28
+clk_pin = 26
+extra_pin = 27
+
+[gpio]
+reserved_pins = [23, 24, 25, 29]
+
+[gpio.reserved_reasons]
+23 = "WL_GPIO_ON (wireless power)"
+24 = "WL_GPIO_CS (wireless SPI CS)"
+25 = "WL_GPIO_CLK (wireless SPI CLK)"
+29 = "WL_CLK (wireless SPI clock) / VSYS sense (ADC3)"

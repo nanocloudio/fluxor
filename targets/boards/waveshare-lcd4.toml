@@ -1,0 +1,12 @@
+# Waveshare RP2350-Touch-LCD-4
+# RP2350B with ST7701S 480x480 display and GT911 touch controller.
+# Display data bus (D0-D15: GPIO 24-39) and control signals are
+# managed by module ownership, not globally reserved.
+
+[board]
+id = "waveshare-lcd4"
+silicon = "rp2350b"
+description = "Waveshare RP2350-Touch-LCD-4"
+
+[gpio]
+reserved_pins = []
