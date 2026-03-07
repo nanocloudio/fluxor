@@ -1,0 +1,57 @@
+# Drum Machine - TR-808 Style Beat
+#
+# Classic 4/4 drum pattern with:
+# - Kick on beats 1 and 3 (with pickup)
+# - Snare on beats 2 and 4
+# - Hi-hats on eighth notes
+# - Reverb for room ambience
+#
+# sequencer -> drum -> effects -> i2s
+#
+# Pattern (16th notes at 120 BPM, 125ms each):
+#   Step: 1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16
+#   Hit:  K  H  H  H  S  H  H  H  K  H  K  H  S  H  H  H
+#
+# Drum types: 1=kick, 2=snare, 3=closed hat, 4=open hat, 5=clap
+target: pico2w
+
+
+data:
+  beat:
+    type: sequence
+    step_ms: 125
+    values: [1, 3, 3, 3, 2, 3, 3, 3, 1, 3, 1, 3, 2, 3, 3, 3]
+
+modules:
+- name: sequencer
+  presets: [beat]
+  mode: loop
+  step_ms: 125
+  sample_rate: 8000
+  retrigger: on
+- name: drum
+  sample_rate: 8000
+  level: 200
+  kick_decay: 180
+  kick_pitch: 60
+  snare_decay: 120
+  snare_tone: 128
+  hat_decay: 60
+- name: effects
+  sample_rate: 8000
+  reverb:
+    decay: 120
+    damping: 140
+    predelay_ms: 8
+    mix: 60
+- name: i2s
+  data_pin: 28
+  clock_base: 26
+  sample_rate: 8000
+wiring:
+- from: sequencer.notes
+  to: drum.pattern
+- from: drum.audio
+  to: effects.audio
+- from: effects.processed
+  to: i2s.audio

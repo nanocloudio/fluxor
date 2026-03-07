@@ -1,0 +1,1063 @@
+# Synth Voice Bank
+#
+# 31 voice presets, BOOTSEL cycles through voices,
+# sequencer auto-advances through melody presets on loop end.
+#
+# Hardware:
+# - BOOTSEL button (no GPIO buttons needed)
+# - I2S audio output (data=28, bclk=26, lrclk=27)
+#
+# Pipeline:
+#
+#   flash ──→ synth.preset
+#         └──→ effects.preset
+#   sequencer ──→ synth ──→ effects → i2s
+target: pico2w
+
+
+# ============================================================================
+# Data Section: Melodies + Voices
+# ============================================================================
+
+data:
+  # --- Melodies ---
+  c_major:
+    type: sequence
+    step_ms: 500
+    values: [262, 294, 330, 349, 392, 440, 494, 523]
+
+  c_minor:
+    type: sequence
+    step_ms: 500
+    values: [262, 294, 311, 349, 392, 415, 466, 523]
+
+  pentatonic:
+    type: sequence
+    step_ms: 400
+    values: [262, 294, 330, 392, 440]
+
+  blues:
+    type: sequence
+    step_ms: 450
+    values: [262, 311, 349, 370, 392, 466]
+
+  # --- Voice 1: Acid Bass ---
+  # Squelchy resonant filter, short decay, portamento
+  acid_bass:
+    type: voice
+    synth:
+      waveform: sawtooth
+      cutoff: 60
+      resonance: 230
+      env_amount: 200
+      key_track: 80
+      filter_attack_ms: 2
+      filter_decay_ms: 120
+      filter_sustain: 20
+      filter_release_ms: 80
+      amp_attack_ms: 2
+      amp_decay_ms: 150
+      amp_sustain: 0
+      amp_release_ms: 50
+      accent: 150
+      glide_ms: 30
+      glide_mode: legato
+      drive: 80
+      level: 200
+      sample_rate: 8000
+    effects:
+      delay_ms: 30
+      delay_feedback: 80
+      delay_mix: 60
+      delay_filter: 150
+
+  # --- Voice 2: Glass Pad ---
+  # Shimmering pad with chorus, delay, and reverb
+  glass_pad:
+    type: voice
+    synth:
+      waveform: triangle
+      cutoff: 120
+      resonance: 50
+      env_amount: 60
+      filter_attack_ms: 300
+      filter_decay_ms: 900
+      filter_sustain: 120
+      filter_release_ms: 800
+      amp_attack_ms: 200
+      amp_decay_ms: 500
+      amp_sustain: 180
+      amp_release_ms: 900
+      polyphony: 4
+      voice_detune_cents: 12
+      detune_curve: linear
+      lfo_rate: 8
+      lfo_depth: 70
+      lfo_waveform: sine
+      lfo_target: 1
+      level: 180
+      sample_rate: 8000
+    effects:
+      chorus_depth_ms: 6
+      chorus_rate: 120
+      chorus_mix: 120
+      delay_ms: 220
+      delay_feedback: 100
+      delay_mix: 80
+      reverb_decay: 220
+      reverb_damping: 70
+      reverb_predelay_ms: 24
+      reverb_mix: 150
+
+  # --- Voice 3: 8-Bit Retro ---
+  # Chiptune square wave with bitcrushing
+  retro_8bit:
+    type: voice
+    synth:
+      waveform: square
+      pulse_width: 128
+      cutoff: 200
+      resonance: 40
+      env_amount: 80
+      filter_attack_ms: 1
+      filter_decay_ms: 50
+      filter_sustain: 100
+      filter_release_ms: 30
+      amp_attack_ms: 1
+      amp_decay_ms: 80
+      amp_sustain: 0
+      amp_release_ms: 30
+      level: 220
+      sample_rate: 8000
+    effects:
+      bitcrush_bits: 8
+      bitcrush_rate_div: 4
+
+  # --- Voice 4: Ambient ---
+  # Slow evolving pads with phaser and reverb
+  ambient:
+    type: voice
+    synth:
+      waveform: triangle
+      sub_level: 100
+      cutoff: 100
+      resonance: 60
+      env_amount: 50
+      key_track: 50
+      filter_attack_ms: 300
+      filter_decay_ms: 800
+      filter_sustain: 100
+      filter_release_ms: 600
+      amp_attack_ms: 200
+      amp_decay_ms: 400
+      amp_sustain: 160
+      amp_release_ms: 800
+      glide_ms: 80
+      glide_mode: always
+      level: 180
+      polyphony: 3
+      lfo_rate: 10
+      lfo_depth: 80
+      lfo_waveform: sine
+      lfo_target: 1
+      sample_rate: 8000
+    effects:
+      phaser_rate: 200
+      phaser_depth: 150
+      phaser_feedback: 100
+      phaser_stages: 6
+      phaser_mix: 90
+      reverb_decay: 240
+      reverb_damping: 60
+      reverb_predelay_ms: 30
+      reverb_mix: 140
+
+  # --- Voice 5: Sub Bass ---
+  # Deep triangle bass with sub oscillator
+  sub_bass:
+    type: voice
+    synth:
+      waveform: triangle
+      sub_level: 220
+      cutoff: 50
+      resonance: 60
+      env_amount: 80
+      key_track: 30
+      filter_attack_ms: 20
+      filter_decay_ms: 400
+      filter_sustain: 60
+      filter_release_ms: 200
+      amp_attack_ms: 10
+      amp_decay_ms: 100
+      amp_sustain: 180
+      amp_release_ms: 150
+      accent: 50
+      drive: 20
+      level: 220
+      sample_rate: 8000
+    effects:
+      limiter_threshold: 200
+      limiter_mode: soft
+
+  # --- Voice 6: Synth Demo ---
+  # Basic sawtooth, no effects
+  synth_demo:
+    type: voice
+    synth:
+      waveform: sawtooth
+      cutoff: 120
+      resonance: 200
+      env_amount: 128
+      key_track: 64
+      filter_attack_ms: 5
+      filter_decay_ms: 200
+      filter_sustain: 50
+      filter_release_ms: 100
+      amp_attack_ms: 5
+      amp_decay_ms: 200
+      amp_sustain: 100
+      amp_release_ms: 100
+      level: 192
+      sample_rate: 8000
+    effects: {}
+
+  # --- Voice 7: Vibrato Lead ---
+  # Saw with glide, no effects
+  vibrato_lead:
+    type: voice
+    synth:
+      waveform: sawtooth
+      cutoff: 100
+      resonance: 180
+      env_amount: 180
+      key_track: 80
+      filter_attack_ms: 10
+      filter_decay_ms: 300
+      filter_sustain: 40
+      filter_release_ms: 200
+      amp_attack_ms: 10
+      amp_decay_ms: 250
+      amp_sustain: 140
+      amp_release_ms: 200
+      glide_ms: 40
+      glide_mode: legato
+      level: 200
+      sample_rate: 8000
+    effects: {}
+
+  # --- Voice 8: Jet Flanger ---
+  # Sweeping flanger on saw pad
+  jet_flanger:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      cutoff: 180
+      resonance: 60
+      env_amount: 100
+      filter_attack_ms: 20
+      filter_decay_ms: 300
+      filter_sustain: 80
+      filter_release_ms: 200
+      amp_attack_ms: 10
+      amp_decay_ms: 100
+      amp_sustain: 200
+      amp_release_ms: 300
+      level: 200
+      sample_rate: 8000
+    effects:
+      flanger_rate: 200
+      flanger_depth: 200
+      flanger_feedback: 180
+      flanger_manual: 128
+      flanger_mix: 180
+
+  # --- Voice 9: Robot Voice ---
+  # Ring mod + flanger + delay
+  robot_voice:
+    type: voice
+    synth:
+      waveform: sawtooth
+      cutoff: 120
+      resonance: 40
+      env_amount: 40
+      filter_attack_ms: 10
+      filter_decay_ms: 300
+      filter_sustain: 60
+      filter_release_ms: 200
+      amp_attack_ms: 5
+      amp_decay_ms: 300
+      amp_sustain: 80
+      amp_release_ms: 200
+      level: 180
+      sample_rate: 8000
+    effects:
+      ring_mod_freq: 180
+      ring_mod_mix: 200
+      flanger_depth: 180
+      flanger_feedback: 90
+      flanger_manual: 120
+      flanger_mix: 90
+      delay_ms: 120
+      delay_feedback: 80
+      delay_mix: 70
+
+  # --- Voice 10: Tape Echo Dub ---
+  # Square chord with chorus, long delay, reverb
+  tape_echo:
+    type: voice
+    synth:
+      waveform: square
+      cutoff: 110
+      resonance: 60
+      env_amount: 40
+      filter_attack_ms: 40
+      filter_decay_ms: 600
+      filter_sustain: 80
+      filter_release_ms: 500
+      amp_attack_ms: 10
+      amp_decay_ms: 400
+      amp_sustain: 120
+      amp_release_ms: 600
+      polyphony: 3
+      voice_detune_cents: 10
+      level: 180
+      sample_rate: 8000
+    effects:
+      chorus_depth_ms: 5
+      chorus_rate: 120
+      chorus_mix: 100
+      delay_ms: 260
+      delay_feedback: 140
+      delay_mix: 120
+      delay_filter: 140
+      reverb_decay: 200
+      reverb_damping: 90
+      reverb_predelay_ms: 30
+      reverb_mix: 120
+      macro1_depth: 90
+
+  # --- Voice 11: Metallic Bell ---
+  # Sine with pitch shift, comb filter, reverb
+  metallic_bell:
+    type: voice
+    synth:
+      waveform: sine
+      cutoff: 200
+      resonance: 20
+      env_amount: 30
+      filter_attack_ms: 5
+      filter_decay_ms: 400
+      filter_sustain: 0
+      filter_release_ms: 300
+      amp_attack_ms: 2
+      amp_decay_ms: 600
+      amp_sustain: 0
+      amp_release_ms: 500
+      level: 200
+      sample_rate: 8000
+    effects:
+      pitch_shift_semitones: 135
+      pitch_shift_mix: 60
+      comb_delay_ms: 12
+      comb_feedback: 120
+      comb_mix: 120
+      reverb_decay: 220
+      reverb_damping: 80
+      reverb_predelay_ms: 20
+      reverb_mix: 160
+
+  # --- Voice 12: Lo-Fi Drums ---
+  # Noise + gate + bitcrush + waveshaper + compressor
+  lofi_drums:
+    type: voice
+    synth:
+      waveform: noise
+      cutoff: 180
+      resonance: 0
+      env_amount: 0
+      filter_attack_ms: 1
+      filter_decay_ms: 50
+      filter_sustain: 0
+      filter_release_ms: 30
+      amp_attack_ms: 1
+      amp_decay_ms: 60
+      amp_sustain: 0
+      amp_release_ms: 20
+      level: 200
+      sample_rate: 8000
+    effects:
+      gate_threshold: 40
+      gate_attack_ms: 1
+      gate_release_ms: 60
+      bitcrush_bits: 6
+      bitcrush_rate_div: 2
+      waveshaper_curve: hard
+      waveshaper_amount: 140
+      waveshaper_mix: 200
+      compressor_threshold: 200
+      compressor_ratio: 6
+      compressor_attack_ms: 4
+      compressor_release_ms: 80
+
+  # --- Voice 13: Lo-Fi Beats ---
+  # Triangle with overdrive + bitcrush + compressor
+  lofi_beats:
+    type: voice
+    synth:
+      waveform: triangle
+      cutoff: 100
+      resonance: 80
+      amp_attack_ms: 10
+      amp_decay_ms: 200
+      amp_sustain: 100
+      amp_release_ms: 150
+      level: 180
+      sample_rate: 8000
+    effects:
+      overdrive_gain: 80
+      overdrive_tone: 100
+      bitcrush_bits: 10
+      bitcrush_rate_div: 2
+      compressor_threshold: 160
+      compressor_ratio: 4
+      compressor_attack_ms: 10
+      compressor_release_ms: 80
+      compressor_makeup: 150
+      compressor_mix: 255
+
+  # --- Voice 14: Pure Sine ---
+  # Clean sine wave, no effects
+  pure_sine:
+    type: voice
+    synth:
+      waveform: sine
+      cutoff: 255
+      resonance: 0
+      env_amount: 0
+      key_track: 0
+      filter_attack_ms: 0
+      filter_decay_ms: 0
+      filter_sustain: 255
+      filter_release_ms: 0
+      amp_attack_ms: 1
+      amp_decay_ms: 0
+      amp_sustain: 255
+      amp_release_ms: 10
+      level: 128
+      sample_rate: 8000
+    effects: {}
+
+  # --- Voice 15: Acid Hi-Fi ---
+  # Higher sample rate acid with overdrive
+  acid_hifi:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      sub_level: 0
+      cutoff: 40
+      resonance: 220
+      env_amount: 200
+      key_track: 100
+      filter_attack_ms: 1
+      filter_decay_ms: 120
+      filter_sustain: 20
+      filter_release_ms: 80
+      amp_attack_ms: 1
+      amp_decay_ms: 150
+      amp_sustain: 0
+      amp_release_ms: 50
+      accent: 200
+      glide_ms: 50
+      glide_mode: legato
+      drive: 60
+      level: 200
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      delay_ms: 75
+      delay_feedback: 60
+      delay_mix: 60
+      delay_filter: 150
+      overdrive_gain: 120
+      overdrive_tone: 180
+
+  # --- Voice 16: Acid 303 ---
+  # Classic TB-303 acid with overdrive + slapback delay
+  acid_303:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      sub_level: 0
+      cutoff: 40
+      resonance: 220
+      env_amount: 200
+      key_track: 100
+      filter_attack_ms: 1
+      filter_decay_ms: 120
+      filter_sustain: 20
+      filter_release_ms: 80
+      amp_attack_ms: 1
+      amp_decay_ms: 150
+      amp_sustain: 0
+      amp_release_ms: 50
+      accent: 200
+      glide_ms: 50
+      glide_mode: legato
+      drive: 60
+      level: 200
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      delay_ms: 75
+      delay_feedback: 60
+      delay_mix: 60
+      delay_filter: 150
+      overdrive_gain: 120
+      overdrive_tone: 180
+
+  # --- Voice 17: Square Lead ---
+  # Square wave lead with chorus and delay, glide
+  square_lead:
+    type: voice
+    synth:
+      waveform: square
+      cutoff: 120
+      resonance: 140
+      env_amount: 160
+      key_track: 100
+      filter_attack_ms: 5
+      filter_decay_ms: 180
+      filter_sustain: 80
+      filter_release_ms: 120
+      amp_attack_ms: 5
+      amp_decay_ms: 80
+      amp_sustain: 200
+      amp_release_ms: 100
+      accent: 120
+      glide_ms: 60
+      glide_mode: legato
+      drive: 40
+      level: 180
+      sample_rate: 8000
+    effects:
+      chorus_depth_ms: 4
+      chorus_rate: 48
+      chorus_mix: 100
+      delay_ms: 45
+      delay_feedback: 100
+      delay_mix: 70
+
+  # --- Voice 18: Lo-Fi Crunch ---
+  # Square + sub with chorus, delay, and bitcrush
+  lofi_crunch:
+    type: voice
+    synth:
+      waveform: square
+      pulse_width: 128
+      sub_level: 80
+      cutoff: 140
+      resonance: 60
+      env_amount: 80
+      key_track: 40
+      filter_attack_ms: 20
+      filter_decay_ms: 300
+      filter_sustain: 100
+      filter_release_ms: 200
+      amp_attack_ms: 10
+      amp_decay_ms: 200
+      amp_sustain: 200
+      amp_release_ms: 300
+      accent: 40
+      level: 160
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      chorus_depth_ms: 8
+      chorus_rate: 60
+      chorus_mix: 120
+      delay_ms: 200
+      delay_feedback: 140
+      delay_mix: 100
+      delay_filter: 120
+      bitcrush_bits: 8
+      bitcrush_rate_div: 2
+
+  # --- Voice 19: Combined Saw ---
+  # Saw + sub with chorus and delay
+  combined_saw:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      sub_level: 60
+      cutoff: 160
+      resonance: 120
+      env_amount: 140
+      key_track: 64
+      filter_attack_ms: 10
+      filter_decay_ms: 250
+      filter_sustain: 60
+      filter_release_ms: 150
+      amp_attack_ms: 5
+      amp_decay_ms: 150
+      amp_sustain: 180
+      amp_release_ms: 200
+      accent: 80
+      glide_ms: 30
+      glide_mode: legato
+      drive: 40
+      level: 180
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      chorus_depth_ms: 5
+      chorus_rate: 80
+      chorus_mix: 100
+      delay_ms: 120
+      delay_feedback: 100
+      delay_mix: 80
+      delay_filter: 180
+
+  # --- Voice 20: Delay Echo ---
+  # Square with high-feedback delay
+  delay_echo:
+    type: voice
+    synth:
+      waveform: square
+      cutoff: 180
+      resonance: 100
+      env_amount: 100
+      key_track: 64
+      filter_attack_ms: 2
+      filter_decay_ms: 150
+      filter_sustain: 40
+      filter_release_ms: 80
+      amp_attack_ms: 2
+      amp_decay_ms: 150
+      amp_sustain: 60
+      amp_release_ms: 80
+      level: 180
+      sample_rate: 8000
+    effects:
+      delay_ms: 50
+      delay_feedback: 140
+      delay_mix: 128
+      delay_filter: 180
+
+  # --- Voice 21: Analog Bass ---
+  # Saw + sub with compressor, EQ, limiter
+  analog_bass:
+    type: voice
+    synth:
+      waveform: sawtooth
+      sub_level: 110
+      cutoff: 70
+      resonance: 80
+      env_amount: 140
+      filter_attack_ms: 2
+      filter_decay_ms: 120
+      filter_sustain: 20
+      filter_release_ms: 80
+      amp_attack_ms: 1
+      amp_decay_ms: 120
+      amp_sustain: 0
+      amp_release_ms: 60
+      drive: 40
+      level: 200
+      sample_rate: 8000
+    effects:
+      compressor_threshold: 180
+      compressor_ratio: 4
+      compressor_attack_ms: 8
+      compressor_release_ms: 120
+      compressor_makeup: 150
+      eq_low_gain: 170
+      eq_mid_gain: 120
+      eq_high_gain: 110
+      limiter_threshold: 240
+
+  # --- Voice 22: Distorted Lead ---
+  # Saw with overdrive, compressor, phaser, reverb
+  distorted_lead:
+    type: voice
+    synth:
+      waveform: sawtooth
+      sub_level: 60
+      cutoff: 180
+      resonance: 100
+      env_amount: 120
+      key_track: 80
+      filter_attack_ms: 2
+      filter_decay_ms: 100
+      filter_sustain: 60
+      filter_release_ms: 50
+      amp_attack_ms: 2
+      amp_decay_ms: 100
+      amp_sustain: 160
+      amp_release_ms: 80
+      accent: 140
+      glide_ms: 20
+      glide_mode: legato
+      drive: 60
+      level: 200
+      sample_rate: 8000
+    effects:
+      overdrive_gain: 220
+      overdrive_tone: 160
+      compressor_threshold: 140
+      compressor_ratio: 8
+      compressor_attack_ms: 2
+      compressor_release_ms: 60
+      compressor_makeup: 180
+      compressor_mix: 255
+      phaser_rate: 2000
+      phaser_depth: 140
+      phaser_feedback: 80
+      phaser_stages: 4
+      phaser_mix: 60
+      reverb_decay: 100
+      reverb_damping: 150
+      reverb_predelay_ms: 5
+      reverb_mix: 50
+
+  # --- Voice 23: EQ Sculpted ---
+  # Saw with parametric 3-band EQ
+  eq_sculpted:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      cutoff: 240
+      resonance: 40
+      env_amount: 60
+      filter_attack_ms: 10
+      filter_decay_ms: 200
+      filter_sustain: 160
+      filter_release_ms: 150
+      amp_attack_ms: 5
+      amp_decay_ms: 100
+      amp_sustain: 200
+      amp_release_ms: 180
+      level: 180
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      eq_low_freq: 150
+      eq_low_gain: 158
+      eq_mid_freq: 800
+      eq_mid_gain: 108
+      eq_mid_q: 100
+      eq_high_freq: 4000
+      eq_high_gain: 143
+
+  # --- Voice 24: Gated Pad ---
+  # Saw pad with gate and reverb
+  gated_pad:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      cutoff: 140
+      resonance: 100
+      env_amount: 30
+      filter_attack_ms: 80
+      filter_decay_ms: 400
+      filter_sustain: 180
+      filter_release_ms: 300
+      amp_attack_ms: 50
+      amp_decay_ms: 200
+      amp_sustain: 240
+      amp_release_ms: 400
+      level: 200
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      gate_threshold: 60
+      gate_attack_ms: 5
+      gate_release_ms: 80
+      reverb_decay: 180
+      reverb_damping: 160
+      reverb_mix: 140
+
+  # --- Voice 25: Granular Atmo ---
+  # Sine with granular + reverb, slow evolving
+  granular_atmo:
+    type: voice
+    synth:
+      waveform: sine
+      cutoff: 200
+      resonance: 10
+      env_amount: 10
+      filter_attack_ms: 200
+      filter_decay_ms: 800
+      filter_sustain: 180
+      filter_release_ms: 900
+      amp_attack_ms: 300
+      amp_decay_ms: 900
+      amp_sustain: 200
+      amp_release_ms: 1000
+      level: 160
+      sample_rate: 8000
+    effects:
+      granular_grain_size_ms: 80
+      granular_density: 3
+      granular_pitch: 150
+      granular_spread: 80
+      granular_mix: 200
+      reverb_decay: 240
+      reverb_damping: 70
+      reverb_predelay_ms: 40
+      reverb_mix: 180
+      fx_lfo_rate: 8
+      fx_lfo_depth: 40
+      fx_lfo_shape: sine
+      fx_lfo_target: 2
+
+  # --- Voice 26: Granular Texture ---
+  # Saw with granular + reverb
+  granular_tex:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      cutoff: 160
+      resonance: 80
+      env_amount: 40
+      filter_attack_ms: 100
+      filter_decay_ms: 400
+      filter_sustain: 180
+      filter_release_ms: 500
+      amp_attack_ms: 50
+      amp_decay_ms: 200
+      amp_sustain: 220
+      amp_release_ms: 600
+      level: 180
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      granular_grain_size_ms: 60
+      granular_density: 4
+      granular_pitch: 140
+      granular_spread: 80
+      granular_mix: 200
+      reverb_decay: 220
+      reverb_damping: 140
+      reverb_mix: 160
+
+  # --- Voice 27: Harmony ---
+  # Saw with harmonizer (thirds + fifths)
+  harmony:
+    type: voice
+    synth:
+      waveform: sawtooth
+      pulse_width: 128
+      cutoff: 200
+      resonance: 50
+      env_amount: 80
+      filter_attack_ms: 10
+      filter_decay_ms: 200
+      filter_sustain: 140
+      filter_release_ms: 150
+      amp_attack_ms: 5
+      amp_decay_ms: 100
+      amp_sustain: 200
+      amp_release_ms: 200
+      level: 160
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      harmonizer_voice1_semitones: 4
+      harmonizer_voice1_level: 180
+      harmonizer_voice2_semitones: 7
+      harmonizer_voice2_level: 140
+      harmonizer_dry_level: 200
+
+  # --- Voice 28: Ring Mod ---
+  # Square with ring modulation
+  ring_mod:
+    type: voice
+    synth:
+      waveform: square
+      pulse_width: 128
+      cutoff: 200
+      resonance: 40
+      env_amount: 80
+      filter_attack_ms: 2
+      filter_decay_ms: 100
+      filter_sustain: 120
+      filter_release_ms: 80
+      amp_attack_ms: 2
+      amp_decay_ms: 80
+      amp_sustain: 180
+      amp_release_ms: 100
+      level: 180
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      ring_mod_freq: 175
+      ring_mod_mix: 200
+
+  # --- Voice 29: Techno ---
+  # Saw + sub with LFO cutoff, overdrive + delay
+  techno:
+    type: voice
+    synth:
+      waveform: sawtooth
+      sub_level: 80
+      cutoff: 80
+      resonance: 180
+      env_amount: 160
+      key_track: 40
+      filter_attack_ms: 2
+      filter_decay_ms: 100
+      filter_sustain: 30
+      filter_release_ms: 60
+      amp_attack_ms: 1
+      amp_decay_ms: 100
+      amp_sustain: 0
+      amp_release_ms: 40
+      accent: 130
+      glide_ms: 20
+      glide_mode: legato
+      drive: 60
+      level: 200
+      lfo_rate: 15
+      lfo_depth: 100
+      lfo_waveform: sine
+      lfo_target: 1
+      sample_rate: 8000
+    effects:
+      overdrive_gain: 100
+      overdrive_tone: 150
+      delay_ms: 160
+      delay_feedback: 100
+      delay_mix: 70
+      delay_filter: 140
+
+  # --- Voice 30: Tremolo Surf ---
+  # Triangle with tremolo effect
+  tremolo_surf:
+    type: voice
+    synth:
+      waveform: triangle
+      pulse_width: 128
+      cutoff: 220
+      resonance: 30
+      env_amount: 60
+      filter_attack_ms: 5
+      filter_decay_ms: 150
+      filter_sustain: 150
+      filter_release_ms: 100
+      amp_attack_ms: 5
+      amp_decay_ms: 50
+      amp_sustain: 220
+      amp_release_ms: 150
+      level: 200
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      tremolo_rate: 6000
+      tremolo_depth: 200
+      tremolo_shape: triangle
+
+  # --- Voice 31: Wavefold ---
+  # Sine with wavefolding for rich harmonics
+  wavefold:
+    type: voice
+    synth:
+      waveform: sine
+      pulse_width: 128
+      cutoff: 255
+      resonance: 20
+      env_amount: 40
+      filter_attack_ms: 5
+      filter_decay_ms: 150
+      filter_sustain: 200
+      filter_release_ms: 100
+      amp_attack_ms: 5
+      amp_decay_ms: 80
+      amp_sustain: 230
+      amp_release_ms: 120
+      level: 220
+      sample_rate: 22050
+    effects:
+      sample_rate: 22050
+      waveshaper_curve: fold
+      waveshaper_amount: 200
+      waveshaper_mix: 220
+
+
+# ============================================================================
+# Modules
+# ============================================================================
+
+modules:
+  # --- BOOTSEL control (flash has built-in gesture detection) ---
+  - name: flash
+    click: next
+    double_click: prev
+    long_press: toggle
+
+  # --- Audio chain ---
+  - name: sequencer
+    mode: ping_pong
+    step_ms: 500
+    auto_advance_preset: on
+    presets: [c_major, c_minor, pentatonic, blues]
+
+  - name: synth
+    sample_rate: 8000
+    voices: [acid_bass, glass_pad, retro_8bit, ambient, sub_bass,
+             synth_demo, vibrato_lead, jet_flanger, robot_voice,
+             tape_echo, metallic_bell, lofi_drums, lofi_beats,
+             pure_sine, acid_hifi, acid_303]
+
+  - name: effects
+    sample_rate: 8000
+    voices: [acid_bass, glass_pad, retro_8bit, ambient, sub_bass,
+             synth_demo, vibrato_lead, jet_flanger, robot_voice,
+             tape_echo, metallic_bell, lofi_drums, lofi_beats,
+             pure_sine, acid_hifi, acid_303]
+
+  - name: i2s
+    data_pin: 28
+    clock_base: 26
+    sample_rate: 8000
+
+# ============================================================================
+# Wiring
+# ============================================================================
+
+wiring:
+  # BOOTSEL control: flash emits FMP commands directly
+  - from: flash.events
+    to: synth.preset
+  - from: flash.events
+    to: effects.preset
+
+  # Audio chain: sequencer → synth → effects → i2s
+  - from: sequencer.notes
+    to: synth.notes
+  - from: synth.audio
+    to: effects.audio
+  - from: effects.processed
+    to: i2s.audio
+
+# BOOTSEL actions:
+#   Click: next voice
+#   Double-click: previous voice
+#   Long press: toggle play/pause
+#
+# All 31 voices defined in data section. First 16 loaded into voice tables.
+# Remaining voices available by changing the voices: arrays above.
+#
+# Available voices:
+#   acid_bass, glass_pad, retro_8bit, ambient, sub_bass, synth_demo,
+#   vibrato_lead, jet_flanger, robot_voice, tape_echo, metallic_bell,
+#   lofi_drums, lofi_beats, pure_sine, acid_hifi, acid_303, square_lead,
+#   lofi_crunch, combined_saw, delay_echo, analog_bass, distorted_lead,
+#   eq_sculpted, gated_pad, granular_atmo, granular_tex, harmony,
+#   ring_mod, techno, tremolo_surf, wavefold
