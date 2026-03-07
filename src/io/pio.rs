@@ -169,14 +169,7 @@ pub unsafe fn build_program_from_raw(
 
 /// Get PAC PIO instance by block index (0, 1, 2).
 pub fn pio_pac(pio_num: u8) -> pac::pio::Pio {
-    match pio_num {
-        0 => pac::PIO0,
-        1 => pac::PIO1,
-        #[cfg(not(feature = "chip-rp2040"))]
-        _ => pac::PIO2,
-        #[cfg(feature = "chip-rp2040")]
-        _ => pac::PIO0, // RP2040 has no PIO2; caller should never request it
-    }
+    crate::kernel::chip::pio_pac(pio_num)
 }
 
 /// Allocate contiguous instruction slots in a PIO block.
@@ -254,8 +247,7 @@ pub fn setup_pio_pin(pin: u8, pio_num: u8, pull: PioPull) {
         w.set_funcsel(funcsel as _);
     });
     pac::PADS_BANK0.gpio(pin as usize).write(|w| {
-        #[cfg(not(feature = "chip-rp2040"))]
-        w.set_iso(false);
+        crate::kernel::chip::pad_set_iso_false!(w);
         w.set_schmitt(true);
         w.set_slewfast(true);
         w.set_ie(true);
@@ -2031,13 +2023,7 @@ fn dma_transfer_blocking(
     let ch = pac::DMA.ch(dma_ch as usize);
     ch.read_addr().write_value(read_addr);
     ch.write_addr().write_value(write_addr);
-    #[cfg(not(feature = "chip-rp2040"))]
-    ch.trans_count().write(|w| {
-        w.set_mode(0.into()); // Normal (non-ring) mode
-        w.set_count(count);
-    });
-    #[cfg(feature = "chip-rp2040")]
-    ch.trans_count().write_value(count);
+    crate::kernel::chip::dma_write_trans_count(&ch, count);
     compiler_fence(Ordering::SeqCst);
     ch.ctrl_trig().write(|w| {
         w.set_treq_sel(pac::dma::vals::TreqSel::from(dreq));

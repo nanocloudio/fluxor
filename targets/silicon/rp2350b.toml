@@ -55,3 +55,24 @@ flash_base = "0x10000000"
 flash_size = "0x400000"
 ram_base = "0x20000000"
 ram_size = "0x80000"
+
+[kernel]
+watchdog_ctrl = "0x400D8000"
+boot2_src = "0x400e0000"
+state_arena_kb = 256
+buffer_arena_kb = 32
+config_buffer_kb = 16
+flash_erase_block_size = "0x80000000"
+flash_erase_cmd = "0x00"
+
+[kernel.bootsel]
+dma_ch_count = 16
+qspi_ss_bit = 27
+flash_release_addr = "0x400D0000"
+flash_release_value = "0x01"
+pad_addr = "0x40040018"
+pad_value = "0xCA"
+ctrl_addr = "0x4003000C"
+ctrl_value = "0x8005"
+status_addr = "0x40030008"
+gpio_hi_addr = "0xD0000008"

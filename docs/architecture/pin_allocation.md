@@ -10,6 +10,16 @@ This document describes the config-driven pin and bus allocation system for Flux
 4. Initialize buses at runtime based on config, before module instantiation
 5. Support SPI, I2C, and GPIO resources
 
+Current status (validated against runtime code):
+
+- Hardware config + runtime context live in `src/kernel/config.rs` (`HardwareConfig`, `HardwareContext`)
+- Boot-time pin/bus conflict planning lives in `src/kernel/planner.rs`
+- Scheduler validates hardware requirements before graph start
+- SPI bus initialization state is tracked and enforced before module use
+
+Historical migration mechanics are archived in
+`docs/legacy/pin_allocation_migration.md`.
+
 ## Resource Ownership Discipline
 
 Hardware resource ownership is explicit and declared, not opportunistic:
@@ -49,7 +59,7 @@ Hardware resource ownership is explicit and declared, not opportunistic:
 +-------------------------------------------------------------+
 |                        Modules                               |
 |  - Request resources by name/id from config                  |
-|  - Use syscalls: gpio_request_output, spi_open, i2c_open     |
+|  - Use `dev_call` device classes: GPIO/SPI/I2C               |
 |  - No knowledge of physical pins                             |
 +-------------------------------------------------------------+
 ```
@@ -345,16 +355,17 @@ async fn main(spawner: Spawner) {
 
 ## Syscall Interface Updates
 
-### Resource Discovery Syscalls
+### Resource Access Contract
 
 ```rust
-// Get bus handle by bus number (returns -1 if not configured)
-pub fn spi_get_bus(bus_num: u8) -> i32;
-pub fn i2c_get_bus(bus_num: u8) -> i32;
-
-// GPIO exposes gpio_request_output(pin_num)
-// Add input variant:
-pub fn gpio_request_input(pin_num: u8, pull: u8) -> i32;
+// Modules access GPIO/SPI/I2C via dev_call opcodes (stable ABI classes).
+// Runtime helpers in modules/pic_runtime.rs provide ergonomic wrappers.
+//
+// Examples:
+// - dev_call(-1, dev_gpio::REQUEST_OUTPUT, ...)
+// - dev_call(-1, dev_gpio::REQUEST_INPUT, ...)
+// - dev_call(-1, dev_spi::OPEN, ...)
+// - dev_call(-1, dev_i2c::OPEN, ...)
 ```
 
 ### Module Resource Access Pattern
@@ -375,11 +386,23 @@ pub struct SdSourceParams {
 // Module initialization
 unsafe fn sd_init_hw(cfg: &SdSourceParams) -> i32 {
     // Request CS pin
-    CS_HANDLE = (sys().gpio_request_output)(cfg.cs_pin);
+    let mut cs_arg = [cfg.cs_pin];
+    CS_HANDLE = (sys().dev_call)(-1, dev_gpio::REQUEST_OUTPUT, cs_arg.as_mut_ptr(), 1);
     if CS_HANDLE < 0 { return -10; }
 
     // Open SPI on the configured bus
-    SPI_HANDLE = (sys().spi_open)(cfg.spi_bus, CS_HANDLE, INIT_FREQ, 0);
+    let mut spi = SpiOpenArgs {
+        bus: cfg.spi_bus,
+        cs_handle: CS_HANDLE,
+        freq_hz: INIT_FREQ,
+        mode: 0,
+    };
+    SPI_HANDLE = (sys().dev_call)(
+        -1,
+        dev_spi::OPEN,
+        &mut spi as *mut _ as *mut u8,
+        core::mem::size_of::<SpiOpenArgs>(),
+    );
     if SPI_HANDLE < 0 { return -12; }
 
     // ... rest of init

@@ -76,13 +76,9 @@ pub const MAX_BUFFER_SLOTS: usize = 20;
 /// Derived from the canonical constant in abi.rs.
 pub const BUFFER_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
 
-/// Size of the dedicated buffer arena for channel buffers.
-/// Separate from STATE_ARENA (used for module state) so that channel buffer
-/// allocations don't compete with module state for memory.
-#[cfg(not(feature = "chip-rp2040"))]
-const BUFFER_ARENA_SIZE: usize = 32768;
-#[cfg(feature = "chip-rp2040")]
-const BUFFER_ARENA_SIZE: usize = 16384;
+/// Buffer arena size — from silicon TOML [kernel] section.
+/// RP2350: 32 KB, RP2040: 16 KB.
+const BUFFER_ARENA_SIZE: usize = super::chip::BUFFER_ARENA_SIZE;
 
 // ============================================================================
 // Buffer Arena (separate from module state arena)

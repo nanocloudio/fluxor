@@ -63,6 +63,10 @@ chip-rp2350b = ["embassy-rp/rp235xb"]
 # RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
 chip-rp2040 = ["embassy-rp/rp2040"]
 
+[build-dependencies]
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+
 [profile.release]
 debug = 2
 lto = false

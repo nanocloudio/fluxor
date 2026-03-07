@@ -3,9 +3,6 @@
 //! Master mode: generates BCLK/LRCLK via sideset, samples data via `in pins`.
 //! Mirrors the TX program structure but uses `in` instead of `out`.
 
-/// System clock frequency (RP2350)
-pub const SYS_FREQ_HZ: u32 = 150_000_000;
-
 /// Cycles per stereo sample (32 bits x 2 cycles/bit)
 pub const CYCLES_PER_SAMPLE: u32 = 64;
 

@@ -4,7 +4,7 @@ This document describes how networking is integrated into Fluxor.
 
 ## Design Principles
 
-1. **Kernel provides primitives, not networking** - Bus syscalls (SPI, PIO, GPIO), IPC (channels), timers. No WiFi, no TCP/IP, no sockets in the kernel.
+1. **Kernel provides contracts and plumbing, not protocol logic** - Bus primitives, channels/buffers, event/timer/scheduler services, plus netif/socket dispatch and slot management. No WiFi policy, no DHCP/DNS/TCP/IP protocol logic in kernel.
 2. **All networking is PIC modules** - Drivers, IP stack, protocols, everything.
 3. **NetIF is a contract** - The boundary between driver modules (frame providers) and the IP stack module. All drivers implement the same contract upward, regardless of hardware.
 4. **Drivers are allowed to be ugly** - Platform-specific, non-portable, vendor-coupled. That's their job.
@@ -44,6 +44,9 @@ This document describes how networking is integrated into Fluxor.
 ```
 
 On ESP32, `cyw43` is replaced by `esp_wifi` which calls the vendor WiFi library instead of PIO syscalls. Same netif contract upward.
+
+Current ABI note: modules typically use `dev_call` opcode wrappers (for example in
+`modules/pic_runtime.rs`) rather than older direct `netif_*`/`socket_*` syscall names.
 
 ## Network Drivers
 
@@ -157,6 +160,24 @@ The kernel supports a single ioctl:
 All state values and their meanings are defined by modules, not the kernel.
 WiFi-specific commands (100-199) are routed through the netif provider and
 handled by driver modules (e.g. cyw43) — the kernel does not interpret them.
+
+## Socket and Poll Contract
+
+Socket operations are exposed through `dev_call` opcodes in the `dev_socket`
+class (`src/abi.rs`) and dispatched by the socket provider (`src/kernel/syscalls.rs`).
+
+Poll flags are stable ABI values:
+
+| Flag | Value | Meaning |
+|------|-------|---------|
+| `POLL_IN` | `0x01` | Data available to read |
+| `POLL_OUT` | `0x02` | Space available to write |
+| `POLL_ERR` | `0x04` | Error condition |
+| `POLL_HUP` | `0x08` | Hang-up / closed |
+| `POLL_CONN` | `0x10` | Connect complete |
+
+Error codes follow stable negative errno values from `src/abi.rs::errno`
+(for example `EAGAIN=-11`, `EINVAL=-22`, `ENOSYS=-38`, `ENOTCONN=-107`).
 
 ## Data Structures
 
@@ -323,7 +344,8 @@ The kernel provides only generic primitives:
 7. **Contract dispatch** — routing netif/socket operations between providers and consumers
 8. **dev_call/dev_query** — generic device operation dispatch (ABI v3)
 
-smoltcp (TCP/IP), netif implementation, and socket table are part of the networking subsystem.
+smoltcp (TCP/IP), netif state machines, and protocol policy live in PIC modules.
+Kernel socket slot bookkeeping (`src/kernel/socket.rs`) is transport-neutral plumbing.
 
 ## What Lives in PIC Modules
 
@@ -342,7 +364,9 @@ Everything above bus primitives:
 |-----------|----------|-------------|
 | NetIf registry | `src/kernel/net.rs` | Interface slot management, opaque state storage |
 | NetIf provider | `src/kernel/syscalls.rs` | `dev_netif` dispatch via provider registry |
-| NetIf opcodes | `src/abi.rs` | `dev_netif` module |
-| Device class opcodes | `src/abi.rs` | `dev_netif`, `dev_socket` modules |
-| ENC28J60 driver | `modules/enc28j60.rs` | Frame provider example |
-| W5500 driver | `modules/w5500.rs` | Socket provider example |
+| Socket core plumbing | `src/kernel/socket.rs` | Socket slots, poll readiness, TX/RX buffers |
+| NetIf/socket opcodes | `src/abi.rs` | `dev_netif` / `dev_socket` opcode namespaces |
+| Runtime wrapper helpers | `modules/pic_runtime.rs` | `dev_socket_*`, `dev_channel_*`, `dev_netif_*` helpers |
+| ENC28J60 driver | `modules/enc28j60/mod.rs` | Frame provider example |
+| CYW43 driver | `modules/cyw43/mod.rs` | WiFi frame provider example |
+| IP stack service | `modules/ip/mod.rs` | IP/socket provider service |

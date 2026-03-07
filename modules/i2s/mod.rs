@@ -289,7 +289,8 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
     }
 
     // Configure stream (pins, clock divider, shift width)
-    let clock_div = pio::calc_clock_div_88(pio::SYS_FREQ_HZ, sample_rate);
+    let sys_freq = dev_sys_clock_hz(sys);
+    let clock_div = pio::calc_clock_div_88(sys_freq, sample_rate);
     let cfg_args = PioConfigureArgs {
         clock_div,
         data_pin,

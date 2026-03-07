@@ -17,6 +17,16 @@ hardware input -> input module -> gesture/mapper -> action consumers
 The system emphasizes contract stability: modules consume actions, not electrical
 signal details.
 
+Current implementation pattern:
+
+```text
+button/touch/bootsel module -> raw channel bytes -> gesture module -> FMP command messages -> target modules
+```
+
+Legacy note: older docs referenced a kernel `emit_action` syscall and central
+action dispatcher. The current control plane is module-to-module channel
+messages (typically FMP command messages), not a dedicated action syscall.
+
 ## Core Principles
 
 - input capture is source-specific
@@ -51,12 +61,19 @@ Typical binding choices:
 
 The binding layer owns policy, keeping input and application modules reusable.
 
+In current modules, gesture mappings are typically configured as command hashes
+(`click`, `double_click`, `long_press`, etc.) and emitted on a control channel.
+
 ## Event Integration
 
 Input modules may use event objects and scheduler wake semantics for low-latency
 reaction to hardware changes.
 
 See `docs/architecture/events.md` for the event architecture.
+
+Special case: the board user button is available as virtual pin `0xFF` in the
+GPIO request-input path, allowing BOOTSEL-style input without board-specific
+logic in application modules.
 
 ## Design Guidance
 

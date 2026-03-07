@@ -2199,13 +2199,7 @@ pub(crate) unsafe fn dma_start_raw(ch: u8, read_addr: u32, write_addr: u32, coun
     let dma_ch = pac::DMA.ch(ch as usize);
     dma_ch.read_addr().write_value(read_addr);
     dma_ch.write_addr().write_value(write_addr);
-    #[cfg(not(feature = "chip-rp2040"))]
-    dma_ch.trans_count().write(|w| {
-        w.set_mode(0.into());
-        w.set_count(count);
-    });
-    #[cfg(feature = "chip-rp2040")]
-    dma_ch.trans_count().write_value(count);
+    super::chip::dma_write_trans_count(&dma_ch, count);
     compiler_fence(Ordering::SeqCst);
 
     let incr_read = flags & 0x01 != 0;
@@ -2419,8 +2413,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             pac::PADS_BANK0.gpio(pin).modify(|w| {
                 w.set_ie(false);
                 w.set_od(false);
-                #[cfg(not(feature = "chip-rp2040"))]
-                w.set_iso(false);
+                super::chip::pad_set_iso_false!(w);
             });
             0
         }
@@ -2578,6 +2571,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             0
         }
         dev_system::PIO_GPIOBASE => {
+            // PIO GPIOBASE: RP2350 only (register absent on RP2040 PAC)
             #[cfg(not(feature = "chip-rp2040"))]
             {
                 if arg.is_null() || arg_len < 2 { return E_INVAL; }
@@ -2588,7 +2582,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
                 0
             }
             #[cfg(feature = "chip-rp2040")]
-            { E_NOSYS } // RP2040 has no PIO gpiobase register
+            { E_NOSYS }
         }
         dev_system::PIO_TXF_WRITE => {
             if arg.is_null() || arg_len < 6 { return E_INVAL; }
@@ -2728,8 +2722,7 @@ unsafe fn spi9_pac_gpio_init(pin: u8, high: bool) {
     use embassy_rp::pac;
     pac::IO_BANK0.gpio(pin as usize).ctrl().write(|w| w.set_funcsel(5));
     pac::PADS_BANK0.gpio(pin as usize).write(|w| {
-        #[cfg(not(feature = "chip-rp2040"))]
-        w.set_iso(false);
+        super::chip::pad_set_iso_false!(w);
         w.set_schmitt(false);
         w.set_slewfast(false);
         w.set_ie(true);
@@ -2766,11 +2759,7 @@ unsafe fn spi9_pac_pin_set(pin: u8, high: bool) {
 /// This is the same approach as the Pico SDK's busy_wait_us_32().
 #[inline(always)]
 unsafe fn spi9_timer_us(us: u32) {
-    use embassy_rp::pac;
-    #[cfg(not(feature = "chip-rp2040"))]
-    let timer = pac::TIMER0;
-    #[cfg(feature = "chip-rp2040")]
-    let timer = pac::TIMER;
+    let timer = super::chip::timer();
     let t0 = timer.timerawl().read();
     while timer.timerawl().read().wrapping_sub(t0) < us {}
 }
@@ -3068,6 +3057,11 @@ unsafe extern "C" fn syscall_dev_query(
                     if out.is_null() || out_len < 4 { return E_INVAL; }
                     let idx = scheduler::current_module_index();
                     *(out as *mut u32) = scheduler::downstream_latency(idx);
+                    0
+                }
+                dev_system::SYS_CLOCK_HZ => {
+                    if out.is_null() || out_len < 4 { return E_INVAL; }
+                    *(out as *mut u32) = embassy_rp::clocks::clk_sys_freq();
                     0
                 }
                 _ => E_NOSYS,

@@ -157,14 +157,15 @@ fn make_spi_config(freq: u32) -> SpiCfg {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let hal_config = embassy_rp::config::Config::new(
+    #[cfg(feature = "chip-rp2040")]
+    let p = embassy_rp::init(embassy_rp::config::Config::default());
+    #[cfg(not(feature = "chip-rp2040"))]
+    let p = embassy_rp::init(embassy_rp::config::Config::new(
         embassy_rp::clocks::ClockConfig::system_freq(240_000_000).unwrap(),
-    );
-    let p = embassy_rp::init(hal_config);
+    ));
 
     // Disable watchdog — bootloader may have enabled it, and we don't feed it.
-    // WATCHDOG_CTRL at 0x400D_8000: bit 30 = ENABLE. Clear to disable.
-    unsafe { core::ptr::write_volatile(0x400D_8000 as *mut u32, 0); }
+    unsafe { core::ptr::write_volatile(fluxor::kernel::chip::WATCHDOG_CTRL as *mut u32, 0); }
 
     // Spawn USB logger and wait for enumeration
     let usb_driver = Driver::new(p.USB, Irqs);

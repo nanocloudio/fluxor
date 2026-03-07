@@ -621,6 +621,8 @@ pub mod dev_system {
     pub const ARENA_USAGE: u32 = 0x0C32;
     /// Query downstream latency for current module. handle=-1. Returns u32 frames.
     pub const DOWNSTREAM_LATENCY: u32 = 0x0C33;
+    /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
+    pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
     /// Report module's own processing latency in frames. handle=-1, arg[0..4]=frames (u32 LE).
     pub const REPORT_LATENCY: u32 = 0x0C50;
     /// Raw PWM pin enable: set pin funcsel to PWM (4), configure pad.

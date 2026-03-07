@@ -439,6 +439,18 @@ unsafe fn with_flash_op<F: FnOnce()>(op: F) -> Result<(), ()> {
     Ok(())
 }
 
+/// Copy boot2 into a RAM buffer and return a callable function pointer.
+///
+/// RP2040: boot2 lives at flash offset 0 (XIP 0x10000000). Must be copied
+///         before flash_exit_xip() since flash is inaccessible after that.
+/// RP2350: boot2 is shadowed in BOOTRAM (0x400e_0000), always readable.
+#[inline(always)]
+unsafe fn copy_boot2(buf: &mut [u32; 256 / 4]) -> unsafe extern "C" fn() {
+    core::ptr::copy_nonoverlapping(super::chip::BOOT2_SRC as *const u8, buf.as_mut_ptr() as *mut u8, 256);
+    let fn_ptr = (buf.as_ptr() as *const u8).offset(1);
+    core::mem::transmute(fn_ptr)
+}
+
 /// Erase one 4KB sector at the given flash offset.
 ///
 /// # Safety
@@ -448,19 +460,18 @@ unsafe fn with_flash_op<F: FnOnce()>(op: F) -> Result<(), ()> {
 unsafe fn flash_erase_sector(offset: u32) {
     use embassy_rp::rom_data;
 
-    // Copy boot2 from BOOTRAM (required for XIP re-entry on RP2350)
     let mut boot2 = [0u32; 256 / 4];
-    let bootram_base = 0x400e_0000u32 as *const u8;
-    core::ptr::copy_nonoverlapping(bootram_base, boot2.as_mut_ptr() as *mut u8, 256);
-
-    let boot2_fn_ptr = (boot2.as_ptr() as *const u8).offset(1);
-    let boot2_fn: unsafe extern "C" fn() = core::mem::transmute(boot2_fn_ptr);
+    let boot2_fn = copy_boot2(&mut boot2);
 
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     (rom_data::connect_internal_flash::ptr())();
     (rom_data::flash_exit_xip::ptr())();
-    (rom_data::flash_range_erase::ptr())(offset, SECTOR_SIZE, 1 << 31, 0);
+    (rom_data::flash_range_erase::ptr())(
+        offset, SECTOR_SIZE,
+        super::chip::FLASH_ERASE_BLOCK_SIZE,
+        super::chip::FLASH_ERASE_CMD,
+    );
     (rom_data::flash_flush_cache::ptr())();
     boot2_fn();
 }
@@ -477,11 +488,7 @@ unsafe fn flash_program_page(offset: u32, data: *const u8) {
     use embassy_rp::rom_data;
 
     let mut boot2 = [0u32; 256 / 4];
-    let bootram_base = 0x400e_0000u32 as *const u8;
-    core::ptr::copy_nonoverlapping(bootram_base, boot2.as_mut_ptr() as *mut u8, 256);
-
-    let boot2_fn_ptr = (boot2.as_ptr() as *const u8).offset(1);
-    let boot2_fn: unsafe extern "C" fn() = core::mem::transmute(boot2_fn_ptr);
+    let boot2_fn = copy_boot2(&mut boot2);
 
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 

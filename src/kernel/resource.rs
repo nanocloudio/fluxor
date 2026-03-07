@@ -145,35 +145,25 @@ pub fn flash_sideband_read_cs() -> i32 {
 }
 
 // ============================================================================
-// Low-level BOOTSEL read (RP2350 QMI direct mode approach)
+// Low-level BOOTSEL read
 // ============================================================================
 
-/// Read the BOOTSEL button state on RP2350.
+/// Read the BOOTSEL button state.
 ///
-/// On RP2350, QMI has a dedicated pad driver on the flash CS path.
-/// This routine places QMI in direct mode and temporarily configures
-/// the QSPI SS pad for input so the pad level can be sampled reliably.
-///
-/// Current implementation derives the pressed state from
-/// SIO GPIO_HI_IN bit 27 (QSPI SS) sampled while QMI direct mode is active.
-/// IO_QSPI GPIO_STATUS.INFROMPAD is logged for diagnostics.
-///
-/// Sequence:
-///  1. Put QMI in direct mode (DIRECT_CSR.EN=1) with CS not asserted
-///  2. This stops QMI from driving the CS pad
-///  3. Read SIO GPIO_HI_IN (bit 27 = QSPI SS) and IO_QSPI STATUS for diagnostics
-///  4. Restore QMI to normal XIP operation
+/// Temporarily disconnects flash and samples the QSPI SS pad as a GPIO input.
+/// Must run entirely from RAM with interrupts disabled.
 ///
 /// Returns 0 (not pressed) or 1 (pressed).
 fn read_bootsel() -> i32 {
     use embassy_rp::pac;
+    use super::chip;
 
     let mut sio_hi_sample: u32 = 0;
 
     cortex_m::interrupt::free(|_| {
         // Wait for all DMA channels reading from flash to finish.
         const SRAM_LOWER: u32 = 0x2000_0000;
-        for n in 0..16 {
+        for n in 0..chip::BOOTSEL_DMA_CH_COUNT {
             let ch = pac::DMA.ch(n);
             if ch.read_addr().read() < SRAM_LOWER && ch.ctrl_trig().read().busy() {
                 while ch.read_addr().read() < SRAM_LOWER && ch.ctrl_trig().read().busy() {}
@@ -186,71 +176,56 @@ fn read_bootsel() -> i32 {
         sio_hi_sample = sio;
     });
 
-    // QSPI SS is bit 27 of SIO GPIO_HI_IN.
-    // BOOTSEL is active-low: pressed when this bit is LOW.
-    if (sio_hi_sample >> 27) & 1 == 0 { 1 } else { 0 }
+    // BOOTSEL is active-low: pressed when the QSPI SS bit is LOW.
+    if (sio_hi_sample >> chip::BOOTSEL_QSPI_SS_BIT) & 1 == 0 { 1 } else { 0 }
 }
 
-/// RAM-resident BOOTSEL read for RP2350.
+// ============================================================================
+// RAM-resident BOOTSEL IO read
+// ============================================================================
+
+/// Temporarily release flash CS and sample QSPI SS as GPIO input.
 ///
-/// 1. Save QMI_CSR, PADS_QSPI_SS, IO_QSPI_SS_CTRL
-/// 2. QMI direct mode (releases dedicated pad driver)
-/// 3. PADS OD=1, IE=1, PUE=1 (disable pad output, enable input + pull-up)
-/// 4. OEOVER=DISABLE + FUNCSEL=SIO (0x8005)
-/// 5. Delay, read IO_QSPI_SS_STATUS + SIO_GPIO_HI_IN, restore all
+/// All register addresses and values come from the silicon TOML via
+/// chip_generated.rs. The algorithm is identical for RP2040 (XIP_SSI disable)
+/// and RP2350 (QMI direct mode) — only the addresses/values differ.
 ///
 /// # Safety
 /// Must be called within a critical section with flash DMA idle.
 #[inline(never)]
 #[link_section = ".data.ram_func"]
 unsafe fn read_bootsel_io_qspi() -> (u32, u32) {
-    const IO_QSPI_SS_STATUS: *const u32 = 0x4003_0008 as *const u32;
-    const IO_QSPI_SS_CTRL: *mut u32 = 0x4003_000C as *mut u32;
-    const QMI_DIRECT_CSR: *mut u32 = 0x400D_0000 as *mut u32;
-    // PADS_QSPI GPIO_QSPI_SS register.
-    const PADS_QSPI_SS: *mut u32 = 0x4004_0018 as *mut u32;
-    const SIO_GPIO_HI_IN: *const u32 = 0xD000_0008 as *const u32;
+    use super::chip;
 
-    // Save original register values
-    let orig_ctrl = core::ptr::read_volatile(IO_QSPI_SS_CTRL);
-    let orig_qmi = core::ptr::read_volatile(QMI_DIRECT_CSR);
-    let orig_pad = core::ptr::read_volatile(PADS_QSPI_SS);
+    // Save originals
+    let orig_ctrl = core::ptr::read_volatile(chip::BOOTSEL_CTRL_ADDR as *const u32);
+    let orig_release = core::ptr::read_volatile(chip::BOOTSEL_FLASH_RELEASE_ADDR as *const u32);
+    let orig_pad = core::ptr::read_volatile(chip::BOOTSEL_PAD_ADDR as *const u32);
 
-    // QMI direct mode: EN=1, CS not asserted
-    core::ptr::write_volatile(QMI_DIRECT_CSR, 0x01);
-
-    // PADS: OD=1(7), IE=1(6), PUE=1(3), SCHMITT=1(1) = 0xCA
-    core::ptr::write_volatile(PADS_QSPI_SS, 0xCA);
-
-    // IO_QSPI CTRL: OEOVER=DISABLE + FUNCSEL=SIO (5) = 0x8005
-    core::ptr::write_volatile(IO_QSPI_SS_CTRL, 0x8005);
+    // Release flash CS (disable XIP_SSI on RP2040, enter QMI direct mode on RP2350)
+    core::ptr::write_volatile(chip::BOOTSEL_FLASH_RELEASE_ADDR as *mut u32, chip::BOOTSEL_FLASH_RELEASE_VALUE);
+    // Configure pad: OD=1, IE=1, PUE=1, SCHMITT=1
+    core::ptr::write_volatile(chip::BOOTSEL_PAD_ADDR as *mut u32, chip::BOOTSEL_PAD_VALUE);
+    // IO control: output disable + SIO funcsel
+    core::ptr::write_volatile(chip::BOOTSEL_CTRL_ADDR as *mut u32, chip::BOOTSEL_CTRL_VALUE);
 
     // Settle delay (~4000 cycles)
-    // CRITICAL: Use inline asm directly — cortex_m::asm functions live in
-    // flash and get called via linker thunks. Since QMI is in direct mode
-    // here (flash inaccessible), calling into flash would hard fault.
-    // The XIP cache may mask this bug for some binary layouts but not others.
-    core::arch::asm!("dsb sy", options(nomem, nostack, preserves_flags));
+    core::arch::asm!("dsb", options(nomem, nostack, preserves_flags));
     for _ in 0..1000u32 {
         core::arch::asm!("nop", options(nomem, nostack, preserves_flags));
     }
 
-    // Sample while direct mode is active
-    let status = core::ptr::read_volatile(IO_QSPI_SS_STATUS);
-    let sio_hi = core::ptr::read_volatile(SIO_GPIO_HI_IN);
+    // Sample
+    let status = core::ptr::read_volatile(chip::BOOTSEL_STATUS_ADDR as *const u32);
+    let sio_hi = core::ptr::read_volatile(chip::BOOTSEL_GPIO_HI_ADDR as *const u32);
 
-    // Restore (CTRL first, then PADS, then QMI last)
-    core::ptr::write_volatile(IO_QSPI_SS_CTRL, orig_ctrl);
-    core::ptr::write_volatile(PADS_QSPI_SS, orig_pad);
-    core::ptr::write_volatile(QMI_DIRECT_CSR, orig_qmi);
+    // Restore (ctrl first, pad, flash release last)
+    core::ptr::write_volatile(chip::BOOTSEL_CTRL_ADDR as *mut u32, orig_ctrl);
+    core::ptr::write_volatile(chip::BOOTSEL_PAD_ADDR as *mut u32, orig_pad);
+    core::ptr::write_volatile(chip::BOOTSEL_FLASH_RELEASE_ADDR as *mut u32, orig_release);
 
-    // Ensure QMI has fully exited direct mode before returning.
-    // Without this barrier, the first instruction fetch from flash after
-    // return may race the QMI register write and hit a bus fault or stale
-    // data. The DSB ensures the peripheral write completes; the ISB flushes
-    // the instruction pipeline so subsequent fetches use the restored QMI.
-    core::arch::asm!("dsb sy", options(nomem, nostack, preserves_flags));
-    core::arch::asm!("isb sy", options(nomem, nostack, preserves_flags));
+    core::arch::asm!("dsb", options(nomem, nostack, preserves_flags));
+    core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
 
     (status, sio_hi)
 }

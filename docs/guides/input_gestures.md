@@ -38,6 +38,12 @@ contain domain-side effects.
 - Gesture output should be deterministic for a given pattern window.
 - Control channels should remain independent from bulk data channels.
 
+Current message shape:
+
+- Raw input modules usually emit byte transitions (`0x01` pressed, `0x00` released).
+- Gesture modules convert those transitions into semantic command messages on
+  control channels (for example `toggle`, `next`, `prev`, `long_press` mappings).
+
 This improves responsiveness and prevents control jitter under data-plane load.
 
 ## Configuration Model
@@ -50,6 +56,10 @@ Configuration typically binds:
 
 Gesture defaults should be treated as baseline behavior; project-specific policy
 belongs in configuration.
+
+Legacy note: previous input-action docs described kernel-side action dispatch.
+Current behavior keeps gesture recognition and command emission inside modules,
+with consumers reacting to command channels.
 
 ## Integration Patterns
 

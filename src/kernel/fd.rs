@@ -346,13 +346,7 @@ pub fn dma_fd_queue(fd: i32, read_addr: u32, count: u32) -> i32 {
 
         // Configure inactive channel's READ_ADDR and TRANS_COUNT (non-trigger writes)
         inactive_ch.read_addr().write_value(read_addr);
-        #[cfg(not(feature = "chip-rp2040"))]
-        inactive_ch.trans_count().write(|w| {
-            w.set_mode(0.into());
-            w.set_count(count);
-        });
-        #[cfg(feature = "chip-rp2040")]
-        inactive_ch.trans_count().write_value(count);
+        super::chip::dma_write_trans_count(&inactive_ch, count);
 
         compiler_fence(Ordering::SeqCst);
 

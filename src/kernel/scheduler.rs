@@ -328,11 +328,8 @@ pub fn close_channels(edges: &[Edge]) {
 // Parameter Buffer
 // ============================================================================
 
-/// Maximum module-specific config size
-#[cfg(not(feature = "chip-rp2040"))]
-const MAX_MODULE_CONFIG_SIZE: usize = 16384;
-#[cfg(feature = "chip-rp2040")]
-const MAX_MODULE_CONFIG_SIZE: usize = 8192;
+/// Maximum module-specific config size — from silicon TOML [kernel] section.
+const MAX_MODULE_CONFIG_SIZE: usize = super::chip::MAX_MODULE_CONFIG_SIZE;
 
 /// Buffer for module params.
 ///

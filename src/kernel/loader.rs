@@ -35,14 +35,9 @@ pub const MODULE_MAGIC: u32 = 0x444D5846;
 /// Channel buffers are allocated from a separate arena in buffer_pool.rs,
 /// so this entire budget is available for module state.
 ///
-/// RP2350: 256 KB covers typical pipelines. Large allocations (e.g. display
-/// framebuffers) should use module_arena_size() for separate arena
-/// allocation from the same bump allocator.
-/// RP2040: 64 KB — Pico W has only 256 KB RAM; smaller pipelines only.
-#[cfg(not(feature = "chip-rp2040"))]
-const STATE_ARENA_SIZE: usize = 262144;
-#[cfg(feature = "chip-rp2040")]
-const STATE_ARENA_SIZE: usize = 65536;
+/// Module state arena size — from silicon TOML [kernel] section.
+/// RP2350: 256 KB, RP2040: 64 KB.
+const STATE_ARENA_SIZE: usize = super::chip::STATE_ARENA_SIZE;
 
 // MAX_PARAMS_SIZE removed — pending modules now store a pointer to the
 // static PARAM_BUFFER instead of copying, eliminating truncation.

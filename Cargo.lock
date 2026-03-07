@@ -749,8 +749,10 @@ dependencies = [
  "pio",
  "pio-proc",
  "portable-atomic",
+ "serde",
  "sha2",
  "static_cell",
+ "toml",
 ]
 
 [[package]]

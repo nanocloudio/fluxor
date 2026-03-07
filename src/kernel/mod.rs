@@ -16,3 +16,4 @@ pub mod fd;
 pub mod provider;
 pub mod planner;
 pub mod flash_store;
+pub mod chip;

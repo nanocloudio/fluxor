@@ -230,6 +230,23 @@ Each dynamic module follows this lifecycle:
 
 This contract keeps modules loadable, relocatable, and independent of board-specific firmware code.
 
+### Binary and Loader Contract
+
+The runtime loader enforces a concrete module binary contract:
+
+- Table magic: `FXMT`; module magic: `FXMD`
+- Module ABI version must match loader expectation
+- Required exports are hash-resolved: `module_state_size`, `module_init`,
+  `module_new`, `module_step`
+- Optional exports include `module_channel_hints` and `module_arena_size`
+- The header carries schema/manifest section sizes and required capability bits
+- Parameter schema and manifest payloads are embedded in the `.fmod` image
+  (not separate builder-only JSON sidecars)
+
+This is the durable part of the older dynamic-linking proposals: module loading
+is strict at ABI/header/export boundaries, while module logic remains fully PIC.
+See `src/kernel/loader.rs` and `modules/module.ld` for current implementation.
+
 ### Step Outcome Contract
 
 `module_step` uses a compact result model:

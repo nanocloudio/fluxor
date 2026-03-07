@@ -521,6 +521,16 @@ unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
     if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
 }
 
+/// Query system clock frequency via dev_query (SYSTEM::SYS_CLOCK_HZ 0x0C3B).
+/// Returns 0 on error (should not happen in practice).
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_sys_clock_hz(sys: &SyscallTable) -> u32 {
+    let mut buf = [0u8; 4];
+    let r = (sys.dev_query)(-1, 0x0C3B, buf.as_mut_ptr(), 4);
+    if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
+}
+
 /// Query PIO stream time via dev_query (SYSTEM::STREAM_TIME 0x0C30).
 /// Returns (consumed_units, queued_units, units_per_sec_q16, t0_micros) or zeros on error.
 #[allow(dead_code)]
