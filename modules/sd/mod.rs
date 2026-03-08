@@ -1100,7 +1100,9 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
             }
 
             // ----------------------------------------------------------------
-            // Send 80+ clock cycles with CS high (SD spec requirement)
+            // Flush card with dummy clocks, CS high (SD spec: ≥74 clocks).
+            // After warm reset the card may be mid-block-read, so we send
+            // 16 × 64 = 1024 bytes (8192 clocks) to drain any stuck data.
             // ----------------------------------------------------------------
             SdInitPhase::Preclocking => {
                 if s.init_preclk_count >= 16 {
@@ -1108,7 +1110,7 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
                     s.init_state = SdInitPhase::Cmd0Start;
                     return 0; // Yield
                 }
-                if !spi_transfer_start(s, ptr::null(), ptr::null_mut(), 1) {
+                if !spi_transfer_start(s, ptr::null(), ptr::null_mut(), 64) {
                     fail!(s);
                 }
                 s.init_state = SdInitPhase::PreclockingWait;
