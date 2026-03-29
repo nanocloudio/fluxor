@@ -388,25 +388,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             process_samples(s.buf.as_mut_ptr(), stereo_count, s);
         }
 
-        // Diagnostic: every 64th step, log first 2 L/R pairs after processing
-        if s.step_count & 63 == 0 && stereo_count >= 4 {
-            let mut lb = [0u8; 48];
-            let bp = lb.as_mut_ptr();
-            let tag = b"[mix] #";
-            let mut p = 0usize;
-            let mut t = 0usize;
-            while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
-            p += fmt_u32_raw(bp.add(p), s.step_count as u32);
-            *bp.add(p) = b' '; p += 1;
-            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(0));
-            *bp.add(p) = b','; p += 1;
-            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(1));
-            *bp.add(p) = b','; p += 1;
-            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(2));
-            *bp.add(p) = b','; p += 1;
-            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(3));
-            dev_log(sys, 3, bp, p);
-        }
 
         // Write output — channel_write handles both FIFO and mailbox transparently
         let out_bytes = stereo_count * 2;

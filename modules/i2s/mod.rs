@@ -480,27 +480,6 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
             dev_log(syscalls, 3, b"[i2s] audio".as_ptr(), 11);
         }
 
-        // Diagnostic: dump first 12 i16 samples on 8th audio buffer
-        if s.audio_count == 7 {
-            let mut lb = [0u8; 96];
-            let bp = lb.as_mut_ptr();
-            let mut p = 0usize;
-            let tag = b"[i2s] S";
-            let mut t = 0usize;
-            while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
-            let mut si = 0usize;
-            while si < 12 {
-                let base = si * 2; // 2 bytes per i16
-                let lo = *in_ptr.add(base);
-                let hi = *in_ptr.add(base + 1);
-                let sample = i16::from_le_bytes([lo, hi]);
-                *bp.add(p) = b' '; p += 1;
-                p += fmt_i16_raw(bp.add(p), sample);
-                si += 1;
-            }
-            dev_log(syscalls, 3, bp, p);
-        }
-
         s.audio_count = s.audio_count.wrapping_add(1);
 
         // Move trailing bytes to start of in_buf

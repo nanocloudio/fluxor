@@ -379,6 +379,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // ============================================================================
+// Channel Hints
+// ============================================================================
+
+/// Request larger output buffer for MP3 decode expansion.
+/// One MP3 frame (576 bytes) → 2304 stereo i16 samples (4608 bytes).
+/// Request 8192 bytes (≈2 frames) so downstream always has data during decode.
+#[no_mangle]
+#[link_section = ".text.module_channel_hints"]
+pub extern "C" fn module_channel_hints(hints: *mut ChannelHint, max_hints: usize) -> usize {
+    if hints.is_null() || max_hints == 0 { return 0; }
+    unsafe {
+        *hints = ChannelHint { port_type: 1, port_index: 0, buffer_size: 8192 };
+    }
+    1
+}
+
+// ============================================================================
 // Panic Handler
 // ============================================================================
 

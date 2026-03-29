@@ -1,0 +1,65 @@
+# Audio Player - Play WAV, MP3 and AAC files from SD card
+#
+# Cycles through files with button presses using the
+# sd->fat32->bank->decoder pipeline.
+#
+# SD card should be FAT32 formatted with audio files.
+# Supported formats: WAV, MP3, AAC (auto-detected).
+#
+# button -> gesture -> bank -> decoder -> mixer -> i2s
+#                        ^
+# sd -> fat32 ----------/
+target: pico2w
+
+
+modules:
+  - name: sd
+    spi_bus: 0
+    cs_pin: 17
+    start_block: 0
+    block_count: 0
+
+  - name: fat32
+    pattern: "*.wav,mp3,aac"
+
+  - name: button
+    pin: 22
+    control_id: 0
+    active_low: 1
+    pull: up
+
+  - name: gesture
+    multi_click_ms: 300
+    long_press_ms: 500
+
+  - name: bank
+    file_count: 16
+    mode: 1                   # Loop mode (cycle through files)
+    initial_index: 0
+
+  - name: decoder
+
+  - name: mixer
+    gain_in: 128
+    gain_out: 38
+
+  - name: i2s
+    data_pin: 28
+    clock_base: 26
+    sample_rate: 48000
+
+wiring:
+  - from: sd.blocks
+    to: fat32.blocks
+  - from: fat32.files
+    to: bank.files
+  - from: bank.stream
+    to: decoder.encoded
+  - from: decoder.audio
+    to: mixer.audio
+  - from: mixer.mixed
+    to: i2s.audio
+  - from: button.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: bank.commands
