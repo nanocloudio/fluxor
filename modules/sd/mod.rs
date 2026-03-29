@@ -1494,7 +1494,7 @@ unsafe fn check_seek_request(s: &SdState) -> u32 {
     }
     let mut seek_pos: u32 = 0;
     let seek_ptr = &mut seek_pos as *mut u32 as *mut u8;
-    let res = dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_GET_SEEK, seek_ptr);
+    let res = dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_POLL_NOTIFY, seek_ptr);
     if res == 0 {
         seek_pos
     } else {

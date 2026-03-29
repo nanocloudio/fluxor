@@ -51,7 +51,9 @@ struct MixerState {
     pending_out: u16,
     pending_offset: u16,
     step_count: u16,
-    _diag_pad: u16,
+    /// Saved trailing byte from odd-length channel_read (0xFF = none)
+    trail_byte: u8,
+    _diag_pad: u8,
     // Raw EQ params (for TLV v2 post-parse computation)
     eq_low_freq: u16,
     eq_low_gain: u8,
@@ -227,6 +229,7 @@ pub extern "C" fn module_new(
 
         // Detect in-place aliasing
         s.inplace = if in_chan >= 0 && in_chan == out_chan { 1 } else { 0 };
+        s.trail_byte = 0xFF; // No trailing byte
 
         // Initialize raw EQ params
         s.eq_low_freq = 200;
@@ -328,6 +331,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // Forward sample rate IOCTL from input to output
+        {
+            let mut rate_val = [0u8; 4];
+            let rv = rate_val.as_mut_ptr();
+            let res = dev_channel_ioctl(sys, s.in_chan, IOCTL_POLL_NOTIFY, rv);
+            if res == 0 {
+                let new_rate = u32::from_le_bytes(rate_val);
+                if new_rate > 0 {
+                    s.sample_rate = new_rate;
+                    dev_channel_ioctl(sys, s.out_chan, IOCTL_NOTIFY, rv);
+                }
+            }
+        }
+
         // Check output ready
         let out_poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
         if out_poll & POLL_OUT as i32 == 0 {
@@ -343,17 +360,52 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
 
-        // Read input — channel_read handles both FIFO and mailbox transparently
-        let read = (sys.channel_read)(s.in_chan, s.buf.as_mut_ptr() as *mut u8, BUF_SAMPLES * 2);
-        if read <= 0 {
+        // Read input with trailing-byte handling to maintain i16 alignment.
+        // If the previous read had an odd byte count, prepend the saved byte.
+        let buf_ptr = s.buf.as_mut_ptr() as *mut u8;
+        let mut fill: usize = 0;
+        if s.trail_byte != 0xFF {
+            *buf_ptr = s.trail_byte;
+            s.trail_byte = 0xFF;
+            fill = 1;
+        }
+        let max_read = BUF_SAMPLES * 2 - fill;
+        let read = (sys.channel_read)(s.in_chan, buf_ptr.add(fill), max_read);
+        if read <= 0 && fill == 0 {
             return 0;
         }
-
-        let sample_count = (read as usize) / 2;
+        let total = fill + (if read > 0 { read as usize } else { 0 });
+        // Save trailing byte if odd
+        if (total & 1) != 0 {
+            s.trail_byte = *buf_ptr.add(total - 1);
+        } else {
+            s.trail_byte = 0xFF;
+        }
+        let sample_count = total / 2;
         let stereo_count = sample_count & !1;
 
         if stereo_count > 0 {
             process_samples(s.buf.as_mut_ptr(), stereo_count, s);
+        }
+
+        // Diagnostic: every 64th step, log first 2 L/R pairs after processing
+        if s.step_count & 63 == 0 && stereo_count >= 4 {
+            let mut lb = [0u8; 48];
+            let bp = lb.as_mut_ptr();
+            let tag = b"[mix] #";
+            let mut p = 0usize;
+            let mut t = 0usize;
+            while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
+            p += fmt_u32_raw(bp.add(p), s.step_count as u32);
+            *bp.add(p) = b' '; p += 1;
+            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(0));
+            *bp.add(p) = b','; p += 1;
+            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(1));
+            *bp.add(p) = b','; p += 1;
+            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(2));
+            *bp.add(p) = b','; p += 1;
+            p += fmt_i16_raw(bp.add(p), *s.buf.as_ptr().add(3));
+            dev_log(sys, 3, bp, p);
         }
 
         // Write output — channel_write handles both FIFO and mailbox transparently

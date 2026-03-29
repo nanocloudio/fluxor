@@ -83,8 +83,11 @@ struct PioConfigureArgs {
 // Constants
 // ============================================================================
 
-/// Input buffer size (bytes) — matches CHANNEL_BUFFER_SIZE from abi.rs
-const IN_BUF_SIZE: usize = abi::CHANNEL_BUFFER_SIZE;
+/// Input buffer: 2× PIO buffer size to handle mailbox messages that arrive
+/// when in_buf is partially filled. On mailbox channels, channel_read returns
+/// the full message or EINVAL — we need space for one partial buffer + one
+/// full message to avoid data loss.
+const IN_BUF_SIZE: usize = abi::CHANNEL_BUFFER_SIZE * 2; // 4096 bytes
 
 // ============================================================================
 // Module Parameters
@@ -115,6 +118,8 @@ enum I2sPhase {
     Init = 0,
     Running = 1,
     Error = 2,
+    /// Wait for sample rate IOCTL before initializing PIO
+    WaitRate = 3,
 }
 
 #[repr(C)]
@@ -125,11 +130,13 @@ struct I2sState {
     data_pin: u8,
     clock_base: u8,
     phase: I2sPhase,
-    /// How many bytes in partial_buf (0-3)
-    partial_len: u8,
+    /// Skip mailbox path (set on first size mismatch, use FIFO forever)
+    skip_mbox: u8,
+    _pad0: u8,
     sample_rate: u32,
-    /// Buffer for partial stereo pair from previous read
-    partial_buf: [u8; 4],
+    /// Bytes accumulated in in_buf waiting for a full PIO buffer
+    in_buf_fill: u16,
+    _pad1: u16,
     /// Diagnostic: count of audio buffers vs silence buffers
     audio_count: u16,
     silence_count: u16,
@@ -147,9 +154,11 @@ impl I2sState {
         self.data_pin = 28;
         self.clock_base = 26;
         self.phase = I2sPhase::Init;
-        self.partial_len = 0;
+        self.skip_mbox = 0;
+        self._pad0 = 0;
         self.sample_rate = 44100;
-        self.partial_buf = [0; 4];
+        self.in_buf_fill = 0;
+        self._pad1 = 0;
         self.audio_count = 0;
         self.silence_count = 0;
         self.last_sample = 0;
@@ -211,7 +220,7 @@ pub extern "C" fn module_new(
             let p = &*(params as *const I2sParams);
             s.data_pin = if p.data_pin == 0 { 28 } else { p.data_pin };
             s.clock_base = if p.clock_base == 0 { 26 } else { p.clock_base };
-            s.sample_rate = if p.sample_rate == 0 { 44100 } else { p.sample_rate };
+            s.sample_rate = p.sample_rate; // 0 = auto-detect from upstream IOCTL
         }
 
         let sys = s.sys();
@@ -235,11 +244,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         match s.phase {
             I2sPhase::Init => {
+                // Check for rate IOCTL before init (one-shot, non-blocking)
+                {
+                    let sys = &*s.syscalls;
+                    let mut rate_val = [0u8; 4];
+                    let rv = rate_val.as_mut_ptr();
+                    let res = dev_channel_ioctl(sys, s.in_chan, IOCTL_POLL_NOTIFY, rv);
+                    if res == 0 {
+                        let new_rate = u32::from_le_bytes(rate_val);
+                        if new_rate > 0 {
+                            s.sample_rate = new_rate;
+                        }
+                    }
+                }
                 let r = step_init(s);
                 if r < 0 { return r; }
-                // Fall through to consume any data already waiting so
-                // upstream buffers aren't stuck in READY for a tick.
                 step_running(s)
+            }
+            I2sPhase::WaitRate => {
+                // Unused — kept for enum compatibility
+                0
             }
             I2sPhase::Running => step_running(s),
             I2sPhase::Error => -1,
@@ -319,7 +343,19 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
     s.stream_handle = handle;
     s.phase = I2sPhase::Running;
 
-    dev_log(sys, 3, b"[i2s] running".as_ptr(), 13);
+    // Log actual rate used for PIO configuration
+    {
+        let mut lb = [0u8; 24];
+        let bp = lb.as_mut_ptr();
+        let tag = b"[i2s] @";
+        let mut p = 0usize;
+        let mut t = 0usize;
+        while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
+        p += fmt_u32_raw(bp.add(p), s.sample_rate);
+        *bp.add(p) = b'H'; p += 1;
+        *bp.add(p) = b'z'; p += 1;
+        dev_log(sys, 3, bp, p);
+    }
     0
 }
 
@@ -352,6 +388,22 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
     let stream_handle = s.stream_handle;
     let in_chan = s.in_chan;
 
+    // Check for dynamic sample rate IOCTL (consumed but NOT applied at runtime —
+    // PIO CONFIGURE on a running SM resets it to Ready state, breaking DMA).
+    // Rate is applied at next stream init (file switch/reset).
+    {
+        let mut rate_val = [0u8; 4];
+        let rv = rate_val.as_mut_ptr();
+        let res = dev_channel_ioctl(syscalls, in_chan, IOCTL_POLL_NOTIFY, rv);
+        if res == 0 {
+            let new_rate = u32::from_le_bytes(rate_val);
+            if new_rate > 0 {
+                s.sample_rate = new_rate;
+                // Rate will be used on next PIO init; don't reconfigure running PIO
+            }
+        }
+    }
+
     let mut buffers_filled = 0;
     while buffers_filled < 2 {
         let can_push = (dev_call)(stream_handle, DEV_PIO_STREAM_CAN_PUSH, core::ptr::null_mut(), 0);
@@ -359,136 +411,42 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
             break;
         }
 
-        // === Zero-copy mailbox path ===
-        // Contract: producer must fill exactly one DMA buffer worth of
-        // frame-aligned stereo data (PIO_BUFFER_WORDS * 4 bytes).
-        // Size mismatch is a fatal contract violation — the producer is
-        // misconfigured and will never recover, so we go to I2sPhase::Error.
-        let mut mailbox_len: u32 = 0;
-        let mailbox_ptr = dev_buffer_acquire_read(syscalls, in_chan, &mut mailbox_len);
-        if !mailbox_ptr.is_null() {
-            let expected = (pio::PIO_BUFFER_WORDS * 4) as u32;
-            if mailbox_len != expected {
-                // Log actual vs expected: "[i2s] mbox got NNNN need 2048"
-                let mut msg = *b"[i2s] mbox got       need     \0";
-                let mp = msg.as_mut_ptr();
-                let n1 = fmt_u32_raw(mp.add(15), mailbox_len);
-                // Shift " need " to right after the number
-                let src = b" need ";
-                let mut j = 0usize;
-                while j < 6 {
-                    *mp.add(15 + n1 + j) = *src.as_ptr().add(j);
-                    j += 1;
+        // === Unified read path ===
+        // channel_read handles both FIFO and mailbox channels transparently.
+        // For mailbox: returns the full message (or EAGAIN if no message ready).
+        // For FIFO: returns available bytes up to requested size.
+        // in_buf is 4096 bytes (2× PIO buffer) so there's always room for
+        // one partial PIO buffer + one full mailbox message.
+        let max_bytes = pio::PIO_BUFFER_WORDS * 4; // 2048
+        {
+            let fill = s.in_buf_fill as usize;
+            let space = IN_BUF_SIZE - fill; // Use full 4096 buffer space
+            if space > 0 {
+                let read = (channel_read)(in_chan, s.in_buf.as_mut_ptr().add(fill), space);
+                if read > 0 {
+                    s.in_buf_fill += read as u16;
                 }
-                let n2 = fmt_u32_raw(mp.add(15 + n1 + 6), expected);
-                dev_log(syscalls, 1, msg.as_ptr(), 15 + n1 + 6 + n2);
-                dev_buffer_release_read(syscalls, in_chan);
-                s.phase = I2sPhase::Error;
-                return -1;
-            }
-
-            let buffer = pio_get_buffer(dev_query, stream_handle);
-            if buffer.is_null() {
-                dev_buffer_release_read(syscalls, in_chan);
-                dev_log(syscalls, 1, b"[i2s] null buf".as_ptr(), 14);
-                s.phase = I2sPhase::Error;
-                return -1;
-            }
-
-            let in_ptr = mailbox_ptr;
-            let mut last = s.last_sample;
-            let mut i = 0;
-            while i < pio::PIO_BUFFER_WORDS {
-                let base = i * 4;
-                let l0 = *in_ptr.add(base);
-                let l1 = *in_ptr.add(base + 1);
-                let r0 = *in_ptr.add(base + 2);
-                let r1 = *in_ptr.add(base + 3);
-                let left = i16::from_le_bytes([l0, l1]);
-                let right = i16::from_le_bytes([r0, r1]);
-                last = ((right as u16 as u32) << 16) | (left as u16 as u32);
-                core::ptr::write_volatile(buffer.add(i), last);
-                i += 1;
-            }
-            s.last_sample = last;
-
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-            let result = pio_push(dev_call, stream_handle, pio::PIO_BUFFER_WORDS);
-            dev_buffer_release_read(syscalls, in_chan);
-
-            if result < 0 {
-                dev_log(syscalls, 1, b"[i2s] push err".as_ptr(), 14);
-                s.phase = I2sPhase::Error;
-                return -1;
-            }
-
-            buffers_filled += 1;
-            s.audio_count = s.audio_count.wrapping_add(1);
-            continue;
-        }
-
-        // === channel_read path (FIFO + transparent mailbox fallback) ===
-        let partial = s.partial_len as usize;
-        if partial > 0 {
-            let src = s.partial_buf.as_ptr();
-            let dst = s.in_buf.as_mut_ptr();
-            let mut i = 0;
-            while i < partial {
-                *dst.add(i) = *src.add(i);
-                i += 1;
+                // EAGAIN and other errors: just try again next tick
             }
         }
 
-        let max_bytes = pio::PIO_BUFFER_WORDS * 4;
-        let available_space = if max_bytes < IN_BUF_SIZE { max_bytes } else { IN_BUF_SIZE };
-        let read_bytes = available_space - partial;
-
-        let read = (channel_read)(in_chan, s.in_buf.as_mut_ptr().add(partial), read_bytes);
-        if read == E_AGAIN || read == 0 {
-            // No data available. Push a hold buffer (repeat last sample)
-            // to keep I2S clocks continuous. Letting the SM stall causes
-            // clock discontinuities that many DACs hear as clicks.
-            // Fill ALL available buffers — gating on buffers_filled==0
-            // would leave the second buffer empty, causing periodic starvation.
-            if partial == 0 {
-                let buffer = pio_get_buffer(dev_query, stream_handle);
-                if !buffer.is_null() {
-                    let fill = s.last_sample;
-                    let mut i = 0;
-                    while i < pio::PIO_BUFFER_WORDS {
-                        core::ptr::write_volatile(buffer.add(i), fill);
-                        i += 1;
-                    }
-                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                    pio_push(dev_call, stream_handle, pio::PIO_BUFFER_WORDS);
-                    s.silence_count = s.silence_count.wrapping_add(1);
-                    buffers_filled += 1;
-                    continue;
-                }
-            }
+        let total = s.in_buf_fill as usize;
+        if total < max_bytes {
+            // Not enough for a full PIO buffer yet.
+            // Don't push anything — PIO double-buffer replays the last real buffer.
+            // Pushing held-sample data would REPLACE the real audio in the back buffer.
             break;
         }
-        if read < 0 {
-            dev_log(syscalls, 1, b"[i2s] read err".as_ptr(), 14);
-            s.phase = I2sPhase::Error;
-            return -1;
-        }
 
-        let total_bytes = partial + (read as usize);
-        let sample_pairs = (total_bytes / 4).min(pio::PIO_BUFFER_WORDS);
+        // Full PIO buffer accumulated — process and push
+        let sample_pairs = pio::PIO_BUFFER_WORDS;  // total / 4, always == PIO_BUFFER_WORDS
         let used_bytes = sample_pairs * 4;
-        let trailing = total_bytes - used_bytes;
-
-        if sample_pairs == 0 {
-            s.partial_len = total_bytes as u8;
-            break;
-        }
+        let trailing = total - used_bytes;
 
         let buffer = pio_get_buffer(dev_query, stream_handle);
         if buffer.is_null() {
-            dev_log(syscalls, 1, b"[i2s] null buf".as_ptr(), 14);
-            s.phase = I2sPhase::Error;
-            return -1;
+            // PIO not ready for more data — keep accumulated bytes for next tick
+            break;
         }
 
         // Convert interleaved i16 stereo to packed u32 for I2S
@@ -509,12 +467,6 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
         }
         s.last_sample = last;
 
-        // Pad remainder with last sample for continuous I2S clocks
-        while i < pio::PIO_BUFFER_WORDS {
-            core::ptr::write_volatile(buffer.add(i), last);
-            i += 1;
-        }
-
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         let result = pio_push(dev_call, stream_handle, pio::PIO_BUFFER_WORDS);
         if result < 0 {
@@ -524,19 +476,42 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
         }
 
         buffers_filled += 1;
+        if s.audio_count == 0 {
+            dev_log(syscalls, 3, b"[i2s] audio".as_ptr(), 11);
+        }
+
+        // Diagnostic: dump first 12 i16 samples on 8th audio buffer
+        if s.audio_count == 7 {
+            let mut lb = [0u8; 96];
+            let bp = lb.as_mut_ptr();
+            let mut p = 0usize;
+            let tag = b"[i2s] S";
+            let mut t = 0usize;
+            while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
+            let mut si = 0usize;
+            while si < 12 {
+                let base = si * 2; // 2 bytes per i16
+                let lo = *in_ptr.add(base);
+                let hi = *in_ptr.add(base + 1);
+                let sample = i16::from_le_bytes([lo, hi]);
+                *bp.add(p) = b' '; p += 1;
+                p += fmt_i16_raw(bp.add(p), sample);
+                si += 1;
+            }
+            dev_log(syscalls, 3, bp, p);
+        }
+
         s.audio_count = s.audio_count.wrapping_add(1);
 
-        // Save trailing bytes for next read
+        // Move trailing bytes to start of in_buf
         if trailing > 0 {
-            let src = s.in_buf.as_ptr().add(used_bytes);
-            let dst = s.partial_buf.as_mut_ptr();
             let mut j = 0;
             while j < trailing {
-                *dst.add(j) = *src.add(j);
+                *s.in_buf.as_mut_ptr().add(j) = *s.in_buf.as_ptr().add(used_bytes + j);
                 j += 1;
             }
         }
-        s.partial_len = trailing as u8;
+        s.in_buf_fill = trailing as u16;
     }
 
     0

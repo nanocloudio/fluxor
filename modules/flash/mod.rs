@@ -6,7 +6,7 @@
 //!    debounces, detects click patterns, emits FMP commands on out[0].
 //!
 //! 2. **Blob serving** — Stores inline data blobs from config presets,
-//!    serves them on out[1] via IOCTL_SEEK protocol (replaces data_source).
+//!    serves them on out[1] via IOCTL_NOTIFY protocol (replaces data_source).
 //!
 //! 3. **Param store provider** — Registers via FLASH_STORE_ENABLE. Other
 //!    modules persist params via PARAM_STORE/DELETE/CLEAR_ALL syscalls.
@@ -24,7 +24,7 @@
 //!
 //! **Outputs:**
 //!   - out[0]: FMP messages (gesture/direct mode commands)
-//!   - out[1]: Blob stream (IOCTL_SEEK indexed, 512B chunks, IOCTL_EOF)
+//!   - out[1]: Blob stream (IOCTL_NOTIFY indexed, 512B chunks, IOCTL_EOF)
 
 #![no_std]
 
@@ -613,7 +613,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // Poll for seek request from downstream (bank)
                     let mut seek_pos: u32 = 0;
                     let seek_ptr = &mut seek_pos as *mut u32 as *mut u8;
-                    let res = dev_channel_ioctl(sys, s.stream_chan, IOCTL_GET_SEEK, seek_ptr);
+                    let res = dev_channel_ioctl(sys, s.stream_chan, IOCTL_POLL_NOTIFY, seek_ptr);
                     if res == 0 && (seek_pos as u8) < s.blob_count {
                         s.current_blob = seek_pos as u8;
                         s.blob_write_pos = 0;

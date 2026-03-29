@@ -21,7 +21,7 @@
 //!
 //! # Seek Protocol
 //!
-//! Downstream (bank) sends IOCTL_SEEK with file index (0, 1, 2, ...).
+//! Downstream (bank) sends IOCTL_NOTIFY with file index (0, 1, 2, ...).
 //! Fat32 starts streaming that file's data.
 
 #![no_std]
@@ -305,7 +305,7 @@ unsafe fn log_info(s: &Fat32State, msg: &[u8]) {
 unsafe fn seek_sd(s: &Fat32State, block: u32) -> i32 {
     let mut pos = block;
     let pos_ptr = &mut pos as *mut u32 as *mut u8;
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_SEEK, pos_ptr)
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_NOTIFY, pos_ptr)
 }
 
 /// Flush SD's output buffer (our input)
@@ -322,7 +322,7 @@ unsafe fn check_seek_request(s: &Fat32State) -> u32 {
     }
     let mut seek_pos: u32 = 0;
     let seek_ptr = &mut seek_pos as *mut u32 as *mut u8;
-    let res = dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_GET_SEEK, seek_ptr);
+    let res = dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_POLL_NOTIFY, seek_ptr);
     if res == 0 {
         seek_pos
     } else {
@@ -471,8 +471,27 @@ unsafe fn matches_83(name: *const u8, name_len: usize, entry: *const u8) -> bool
     true
 }
 
+/// Check if entry extension matches a 3-byte uppercase extension at pp+offset.
+/// Returns true if all 3 extension bytes match (space-padded).
+#[inline(always)]
+unsafe fn ext_matches(pp: *const u8, offset: usize, entry: *const u8) -> bool {
+    let mut i = 0usize;
+    let mut pi = offset;
+    while i < 3 && *pp.add(pi) != 0 && *pp.add(pi) != b',' {
+        if *entry.add(8 + i) != to_upper(*pp.add(pi)) { return false; }
+        i += 1;
+        pi += 1;
+    }
+    while i < 3 {
+        if *entry.add(8 + i) != b' ' { return false; }
+        i += 1;
+    }
+    true
+}
+
 /// Check if an 8.3 entry name matches a glob pattern.
-/// Supports: empty (all), "*" (all), "*.ext" (by extension), exact match.
+/// Supports: empty (all), "*" (all), "*.ext" (by extension),
+/// "*.ext,ext2,ext3" (comma-separated extensions), exact match.
 unsafe fn pattern_matches(pattern: &[u8; 16], entry: *const u8) -> bool {
     let pp = pattern.as_ptr();
     let p0 = *pp;
@@ -480,20 +499,19 @@ unsafe fn pattern_matches(pattern: &[u8; 16], entry: *const u8) -> bool {
         return true;
     }
 
-    // "*.ext" — match extension only
+    // "*.ext" or "*.ext,ext2,ext3" — match extension(s)
     if p0 == b'*' && *pp.add(1) == b'.' {
-        let mut i = 0usize;
+        // Try first extension at offset 2
+        if ext_matches(pp, 2, entry) { return true; }
+        // Scan for comma-separated alternatives
         let mut pi = 2usize;
-        while i < 3 && *pp.add(pi) != 0 {
-            if *entry.add(8 + i) != to_upper(*pp.add(pi)) { return false; }
-            i += 1;
+        while pi < 15 && *pp.add(pi) != 0 {
+            if *pp.add(pi) == b',' {
+                if ext_matches(pp, pi + 1, entry) { return true; }
+            }
             pi += 1;
         }
-        while i < 3 {
-            if *entry.add(8 + i) != b' ' { return false; }
-            i += 1;
-        }
-        return true;
+        return false;
     }
 
     // Exact 8.3 match
@@ -1101,6 +1119,7 @@ unsafe fn stream_step(s: &mut Fat32State) -> i32 {
 
                 s.file_offset += written as u32;
                 s.block_offset += written as u16;
+
             }
 
             // Check if we need more data

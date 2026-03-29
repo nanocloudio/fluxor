@@ -320,8 +320,8 @@ pub const NETIF_TYPE_WIFI: u8 = 1;
 // Channel Ioctl Commands
 // ============================================================================
 
-pub const IOCTL_SEEK: u32 = 1;
-pub const IOCTL_GET_SEEK: u32 = 2;
+pub const IOCTL_NOTIFY: u32 = 1;
+pub const IOCTL_POLL_NOTIFY: u32 = 2;
 pub const IOCTL_FLUSH: u32 = 3;
 pub const IOCTL_EOF: u32 = 4;
 
@@ -397,6 +397,31 @@ pub unsafe fn fmt_ip_raw(dst: *mut u8, ip: u32) -> usize {
         octet += 1;
     }
     pos
+}
+
+/// Format i16 as signed decimal. Caller must ensure `dst` has at least 6 bytes.
+#[inline(always)]
+pub unsafe fn fmt_i16_raw(dst: *mut u8, val: i16) -> usize {
+    let mut pos = 0usize;
+    let abs_val: u16 = if val < 0 {
+        *dst = b'-';
+        pos = 1;
+        (0i32 - val as i32) as u16
+    } else {
+        val as u16
+    };
+    pos += fmt_u32_raw(dst.add(pos), abs_val as u32);
+    pos
+}
+
+/// Format u8 as 2-digit hex. Caller must ensure `dst` has at least 2 bytes.
+#[inline(always)]
+pub unsafe fn fmt_hex_u8(dst: *mut u8, val: u8) -> usize {
+    let hi = val >> 4;
+    let lo = val & 0x0F;
+    *dst = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+    *dst.add(1) = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+    2
 }
 
 // ============================================================================

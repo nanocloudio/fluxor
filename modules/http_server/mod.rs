@@ -782,7 +782,7 @@ pub extern "C" fn module_new(
         if s.file_chan >= 0 {
             let mut count: u32 = 0;
             let count_ptr = &mut count as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(&*sys, s.file_chan, IOCTL_GET_SEEK, count_ptr);
+            let r = dev_channel_ioctl(&*sys, s.file_chan, IOCTL_POLL_NOTIFY, count_ptr);
             if r >= 0 {
                 s.file_count = count as u16;
             }
@@ -974,7 +974,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let mut pos = src_idx as u32;
                                 let pos_ptr = &mut pos as *mut u32 as *mut u8;
                                 dev_channel_ioctl(
-                                    s.sys(), s.file_chan, IOCTL_SEEK, pos_ptr,
+                                    s.sys(), s.file_chan, IOCTL_NOTIFY, pos_ptr,
                                 );
                                 s.phase = HttpPhase::FetchContent;
                             }
@@ -994,7 +994,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let mut count: u32 = 0;
                                 let count_ptr = &mut count as *mut u32 as *mut u8;
                                 let r = dev_channel_ioctl(
-                                    s.sys(), s.file_chan, IOCTL_GET_SEEK, count_ptr,
+                                    s.sys(), s.file_chan, IOCTL_POLL_NOTIFY, count_ptr,
                                 );
                                 if r >= 0 { s.file_count = count as u16; }
                             }
@@ -1010,7 +1010,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let mut pos = fi as u32;
                                 let pos_ptr = &mut pos as *mut u32 as *mut u8;
                                 let r = dev_channel_ioctl(
-                                    s.sys(), s.file_chan, IOCTL_SEEK, pos_ptr,
+                                    s.sys(), s.file_chan, IOCTL_NOTIFY, pos_ptr,
                                 );
                                 if r < 0 {
                                     build_error(s, b"404 Not Found", b"Not Found\n");
@@ -1352,7 +1352,7 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpServerState) {
         if s.file_chan >= 0 {
             let mut count: u32 = 0;
             let count_ptr = &mut count as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(s.sys(), s.file_chan, IOCTL_GET_SEEK, count_ptr);
+            let r = dev_channel_ioctl(s.sys(), s.file_chan, IOCTL_POLL_NOTIFY, count_ptr);
             if r >= 0 { s.file_count = count as u16; }
         }
         build_header(s, b"200 OK", b"text/plain");
@@ -1384,7 +1384,7 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpServerState) {
             dev_channel_ioctl(s.sys(), s.file_chan, IOCTL_FLUSH, core::ptr::null_mut());
             let mut pos = idx as u32;
             let pos_ptr = &mut pos as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(s.sys(), s.file_chan, IOCTL_SEEK, pos_ptr);
+            let r = dev_channel_ioctl(s.sys(), s.file_chan, IOCTL_NOTIFY, pos_ptr);
             if r < 0 {
                 build_error(s, b"404 Not Found", b"Not Found\n");
                 s.phase = HttpPhase::DrainSend;

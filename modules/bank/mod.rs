@@ -12,7 +12,7 @@
 //! fat32 ------[data]------/
 //!        ^
 //!        |
-//!        +--- IOCTL_SEEK(file_index) when selection changes
+//!        +--- IOCTL_NOTIFY(file_index) when selection changes
 //! ```
 //!
 //! # Configuration
@@ -36,8 +36,8 @@
 //!
 //! # Behavior
 //!
-//! - On init: Sends IOCTL_SEEK to select initial file
-//! - On control message: Sends IOCTL_SEEK to switch files
+//! - On init: Sends IOCTL_NOTIFY to select initial file
+//! - On control message: Sends IOCTL_NOTIFY to switch files
 //! - In steady state: Passes file data through to output
 
 #![no_std]
@@ -171,7 +171,7 @@ unsafe fn seek_file(s: &BankState, index: u16) -> i32 {
     }
     // Flush input channel (clears fat32's eof_flag + buffer) and seek to new file
     dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut());
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_SEEK, pos_ptr)
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_NOTIFY, pos_ptr)
 }
 
 /// Advance to next file (shared by `next` command and auto-advance).
@@ -304,7 +304,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut pos = s.index as u32;
                 let pos_ptr = &mut pos as *mut u32 as *mut u8;
                 dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut());
-                dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_SEEK, pos_ptr);
+                dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_NOTIFY, pos_ptr);
                 emit_notification(s);
                 log_info(s, b"[bank] init seek");
             }

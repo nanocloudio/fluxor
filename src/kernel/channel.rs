@@ -92,13 +92,13 @@ pub use crate::abi::poll::CONN as POLL_CONN;
 // Ioctl Commands (stable ABI values — modules hardcode these)
 // ============================================================================
 
-/// Store auxiliary u32 value. arg: pointer to u32.
-/// Module-defined meaning (e.g. seek position, file index, command token).
-pub const IOCTL_SET_U32: u32 = 1;
+/// Post a u32 notification value to a channel's sideband slot.
+/// Semantics are channel-defined (seek position, sample rate, etc.).
+pub const IOCTL_NOTIFY: u32 = 1;
 
-/// Atomically read and clear the auxiliary u32 value. arg: pointer to u32 output.
+/// Atomically read and clear the sideband notification. arg: pointer to u32 output.
 /// Returns CHAN_OK if value was pending (written to arg), CHAN_EAGAIN if not.
-pub const IOCTL_GET_U32: u32 = 2;
+pub const IOCTL_POLL_NOTIFY: u32 = 2;
 
 /// Full channel reset: clears ring buffer (or mailbox state), HUP flag,
 /// sticky event flags (HUP/ERR), and aux_u32. After flush the channel
@@ -496,18 +496,18 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
     }
 
     match cmd {
-        IOCTL_SET_U32 => {
-            // Store auxiliary u32 value (module-defined: seek pos, file index, etc.)
+        IOCTL_NOTIFY => {
+            // Post sideband notification value
             if arg.is_null() {
                 return CHAN_EINVAL;
             }
             let val = unsafe { *(arg as *const u32) };
             slot.aux_u32.store(val, Ordering::Release);
-            debug!("chan_ioctl h={} SET_U32 val={}", handle, val);
+            debug!("chan_ioctl h={} NOTIFY val={}", handle, val);
             CHAN_OK
         }
-        IOCTL_GET_U32 => {
-            // Atomically read and clear the auxiliary u32
+        IOCTL_POLL_NOTIFY => {
+            // Atomically read and clear sideband notification
             if arg.is_null() {
                 return CHAN_EINVAL;
             }
@@ -516,7 +516,7 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
                 CHAN_EAGAIN
             } else {
                 unsafe { *(arg as *mut u32) = val; }
-                debug!("chan_ioctl h={} GET_U32 val={}", handle, val);
+                debug!("chan_ioctl h={} POLL_NOTIFY val={}", handle, val);
                 CHAN_OK
             }
         }

@@ -4,7 +4,7 @@ ENTRY(module_init)
 
 MEMORY
 {
-    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 64K
+    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 256K
     /* No RAM section - modules are stateless, state passed via pointer */
 }
 
