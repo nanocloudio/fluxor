@@ -100,6 +100,10 @@ struct BankState {
     /// Auto-advance on EOF (1=advance to next, 0=pause)
     auto_advance: u8,
 
+    /// Pending write tracking for data output
+    pending_out: u16,
+    pending_offset: u16,
+
     /// Pass-through buffer
     buf: [u8; BUF_SIZE],
     /// Scratch buffer for FMP message payloads
@@ -387,6 +391,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.paused == 0 && s.in_chan >= 0 && s.out_chans[0] >= 0 {
             // Check if we can read
             let poll_in = (s.sys().channel_poll)(s.in_chan, POLL_IN);
+            // Drain any pending data from previous partial write
+            if s.pending_out > 0 {
+                let sys = &*s.syscalls;
+                if !drain_pending(
+                    sys, s.out_chans[0],
+                    s.buf.as_ptr(),
+                    &mut s.pending_out,
+                    &mut s.pending_offset,
+                ) {
+                    return 0; // Still draining pending
+                }
+            }
+
             if poll_in > 0 && (poll_in as u8 & POLL_IN) != 0 {
                 // Check if we can write
                 let poll_out = (s.sys().channel_poll)(s.out_chans[0], POLL_OUT);
@@ -399,12 +416,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     );
 
                     if read > 0 {
-                        // Write to data output
-                        let _written = (s.sys().channel_write)(
+                        // Write to data output with pending tracking
+                        let written = (s.sys().channel_write)(
                             s.out_chans[0],
                             s.buf.as_ptr(),
                             read as usize,
                         );
+                        track_pending(written, read as usize, &mut s.pending_out, &mut s.pending_offset);
                     }
                 }
             }
