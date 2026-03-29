@@ -1,5 +1,7 @@
 # Fluxor Mesh Architecture
 
+*It's a way to stop caring which computer something is on.*
+
 > **Note:** This document describes the mesh architecture model. The implementation
 > is in Rust, not C++. Code examples are pseudocode illustrating the concepts.
 > See the source code in `src/` for implementation details.
@@ -8,7 +10,9 @@ Fluxor is a mesh-native firmware framework for embedded systems. This document d
 
 ## Overview
 
-The mesh is a distributed computing model that provides uniform language and API expectations regardless of device capability. A Pico 2 W running fluxor participates in the mesh as a first-class citizen.
+A mesh surface is a distributed object substrate where state, events, and commands are addressable without assuming where they run, and where locality is handled by placement rather than by interface.
+
+A Pico 2 W running fluxor participates in the mesh as a first-class citizen.
 
 ```
 +--------------- Pico Device -----------------+
