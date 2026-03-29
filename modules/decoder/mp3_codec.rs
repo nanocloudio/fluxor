@@ -14,8 +14,6 @@ use super::{POLL_IN, POLL_OUT, E_AGAIN, IOCTL_NOTIFY, drain_pending, track_pendi
 // ============================================================================
 
 const IO_BUF_SIZE: usize = 256;
-#[allow(dead_code)]
-const MAX_FRAME_SIZE: usize = 1441;
 const SAMPLES_PER_FRAME: usize = 1152;
 const SUBBANDS: usize = 32;
 const GRANULE_SAMPLES: usize = 576;
@@ -27,21 +25,15 @@ enum Mp3Phase {
     Sync = 0,
     Frame = 1,
     Decode = 2,
-    #[allow(dead_code)]
-    Output = 3,
 }
 
 // --- Q15 fixed-point helpers ---
-#[allow(dead_code)]
-type Q15 = i16;
 
 #[inline(always)]
 fn q15_mul(a: i16, b: i16) -> i16 {
     let product = (a as i32) * (b as i32);
     let rounded = (product + 0x4000) >> 15;
-    if rounded > 32767 { 32767i16 }
-    else if rounded < -32768 { -32768i16 }
-    else { rounded as i16 }
+    rounded.clamp(-32768, 32767) as i16
 }
 
 #[inline(always)]
@@ -66,19 +58,16 @@ fn q30_to_q15(val: i32) -> i16 {
     rounded.clamp(-32768, 32767) as i16
 }
 
-// --- Cosine approximation ---
-fn cos_q15(phase: u16) -> i16 {
-    sin_q15(phase.wrapping_add(0x4000))
+/// Clamp i64 to i32 range (used throughout IMDCT/synthesis to avoid overflow).
+#[inline(always)]
+fn clamp_i32(v: i64) -> i32 {
+    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
-fn sin_q15(phase: u16) -> i16 {
-    // Half-cycle parabolic approximation: 4x(1-x) over [0, π]
-    // phase [0, 32767] = positive half, [32768, 65535] = negative half
-    let half = (phase >> 15) & 1;
-    let x = (phase & 0x7FFF) as i32; // [0, 32767] within half-cycle
-    let parabola = ((4i64 * x as i64 * (0x7FFF - x) as i64) >> 15) as i32;
-    let value = if parabola > 32767 { 32767i16 } else { parabola as i16 };
-    if half == 0 { value } else { (0i16).wrapping_sub(value) }
+/// Clamp i64 to i16 range (used by scale_pcm and similar).
+#[inline(always)]
+fn clamp_i16(v: i64) -> i16 {
+    v.clamp(-32768, 32767) as i16
 }
 
 // --- BitReader (pointer-based, no slices) ---
@@ -733,17 +722,6 @@ fn requantize(
 // Section 6: Stereo processing (MS stereo, intensity stereo)
 // ============================================================================
 
-#[allow(dead_code)]
-static IS_RATIO_TABLE: [(i16, i16); 7] = [
-    (32767, 0),
-    (28378, 13573),
-    (23170, 23170),
-    (17876, 28377),
-    (13573, 31163),
-    (9949, 32179),
-    (6965, 32485),
-];
-
 /// Process MS stereo: convert mid/side to left/right
 /// freq_lines layout: [ch0: 576 i16][ch1: 576 i16]
 // ISO 11172-3 Table B.9: Antialiasing butterfly coefficients in Q15
@@ -785,18 +763,14 @@ fn antialias_butterflies(freq: *mut i32, sb_limit: usize) {
 
 fn process_ms_stereo(freq_lines: *mut i32) {
     unsafe {
-        // 1/sqrt(2) in Q15
-        let inv_sqrt2: i64 = 23170;
-        let left_ptr = freq_lines;
-        let right_ptr = freq_lines.add(GRANULE_SAMPLES);
+        let inv_sqrt2: i64 = 23170; // 1/sqrt(2) in Q15
+        let right = freq_lines.add(GRANULE_SAMPLES);
         let mut i: usize = 0;
         while i < GRANULE_SAMPLES {
-            let m = *left_ptr.add(i) as i64;
-            let s = *right_ptr.add(i) as i64;
-            let sum = m + s;
-            let diff = m - s;
-            *left_ptr.add(i) = ((sum * inv_sqrt2) >> 15) as i32;
-            *right_ptr.add(i) = ((diff * inv_sqrt2) >> 15) as i32;
+            let m = *freq_lines.add(i) as i64;
+            let s = *right.add(i) as i64;
+            *freq_lines.add(i) = (((m + s) * inv_sqrt2) >> 15) as i32;
+            *right.add(i) = (((m - s) * inv_sqrt2) >> 15) as i32;
             i += 1;
         }
     }
@@ -1093,34 +1067,6 @@ fn process_imdct(
     }
 }
 
-// Keep old window tables for reference (used by short block IMDCT if needed later)
-static WINDOW_LONG_TABLE: [i16; 36] = [
-    1429, 4277, 7092, 9854, 12540, 15131, 17606, 19948, 22138,
-    24159, 25997, 27636, 29066, 30274, 31251, 31991, 32488, 32737,
-    32737, 32488, 31991, 31251, 30274, 29066, 27636, 25997, 24159,
-    22138, 19948, 17606, 15131, 12540, 9854, 7092, 4277, 1429,
-];
-
-static WINDOW_SHORT_TABLE: [i16; 12] = [
-    4277, 12540, 19948, 25997, 30274, 32488, 32488, 30274, 25997, 19948, 12540, 4277,
-];
-
-static WINDOW_START_TABLE: [i16; 36] = [
-    1429, 4277, 7092, 9854, 12540, 15131, 17606, 19948, 22138,
-    24159, 25997, 27636, 29066, 30274, 31251, 31991, 32488, 32737,
-    32767, 32767, 32767, 32767, 32767, 32767,
-    32488, 30274, 25997, 19948, 12540, 4277,
-    0, 0, 0, 0, 0, 0,
-];
-
-static WINDOW_STOP_TABLE: [i16; 36] = [
-    0, 0, 0, 0, 0, 0,
-    4277, 12540, 19948, 25997, 30274, 32488,
-    32767, 32767, 32767, 32767, 32767, 32767,
-    32737, 32488, 31991, 31251, 30274, 29066, 27636, 25997, 24159,
-    22138, 19948, 17606, 15131, 12540, 9854, 7092, 4277, 1429,
-];
-
 // Precomputed IMDCT-36 cosines: cos(π/72 × (2n+19) × (2k+1)), indexed [n*18+k]
 #[rustfmt::skip]
 static IMDCT_COS_36: [i16; 648] = [
@@ -1164,193 +1110,6 @@ static IMDCT_COS_36: [i16; 648] = [
 
 fn imdct_cos_36(n: usize, k: usize) -> i16 {
     unsafe { *IMDCT_COS_36.as_ptr().add(n * 18 + k) }
-}
-
-fn imdct_cos_12(n: usize, k: usize) -> i16 {
-    let phase_num = ((2 * n + 7) * (2 * k + 1)) as i32;
-    let phase_denom: i32 = 48;
-    let rem = phase_num - (phase_num / (phase_denom * 2)) * (phase_denom * 2);
-    let phase_normalized = ((rem * 32768) / phase_denom) as u16;
-    cos_q15(phase_normalized)
-}
-
-/// 36-point IMDCT. Input: i32. Output: i32 (>>4, clamped).
-fn imdct_36(input: *const i32, output: *mut i32) {
-    unsafe {
-        let mut n: usize = 0;
-        while n < IMDCT_LONG {
-            let mut sum: i64 = 0;
-            let mut k: usize = 0;
-            while k < IMDCT_LONG_IN {
-                let cos_val = imdct_cos_36(n, k) as i64;
-                sum += (*input.add(k) as i64) * cos_val;
-                k += 1;
-            }
-            let shifted = sum >> 4;
-            *output.add(n) = if shifted > i32::MAX as i64 { i32::MAX } else if shifted < i32::MIN as i64 { i32::MIN } else { shifted as i32 };
-            n += 1;
-        }
-    }
-}
-
-/// 12-point IMDCT. Input: i32. Output: i32 (>>11, for short blocks).
-fn imdct_12(input: *const i32, output: *mut i32) {
-    unsafe {
-        let mut n: usize = 0;
-        while n < IMDCT_SHORT {
-            let mut sum: i64 = 0;
-            let mut k: usize = 0;
-            while k < IMDCT_SHORT_IN {
-                let cos_val = imdct_cos_12(n, k) as i64;
-                sum += (*input.add(k) as i64) * cos_val;
-                k += 1;
-            }
-            *output.add(n) = (sum >> 11) as i32;
-            n += 1;
-        }
-    }
-}
-
-// Old direct IMDCT removed — replaced by DCT-III decomposed mp3_imdct36 above
-
-fn process_windowed_blocks(freq_lines: *mut i32, overlap: *mut i32, window: *const i16) {
-    unsafe {
-        let mut sb: usize = 0;
-        while sb < SUBBANDS {
-            let offset = sb * IMDCT_LONG_IN;
-
-            // Fused IMDCT + window: compute IMDCT sum in i64, multiply by window
-            // in i64, then >>19 (=4+15) to i32. Avoids i32 overflow between stages.
-            let mut n: usize = 0;
-            while n < IMDCT_LONG_IN {
-                // IMDCT output[n] (first half: overlap-add with previous)
-                let mut sum1: i64 = 0;
-                let mut k: usize = 0;
-                while k < IMDCT_LONG_IN {
-                    let cos_val = imdct_cos_36(n, k) as i64;
-                    sum1 += (*freq_lines.add(offset + k) as i64) * cos_val;
-                    k += 1;
-                }
-                // IMDCT output[n+18] (second half: store to overlap for next frame)
-                let mut sum2: i64 = 0;
-                k = 0;
-                while k < IMDCT_LONG_IN {
-                    let cos_val = imdct_cos_36(n + IMDCT_LONG_IN, k) as i64;
-                    sum2 += (*freq_lines.add(offset + k) as i64) * cos_val;
-                    k += 1;
-                }
-
-                // Fused window multiply: (imdct_sum * win_Q15) >> 19
-                let win_val1 = *window.add(IMDCT_LONG_IN + n) as i64;
-                let windowed1 = (sum1 * win_val1) >> 19;
-                let w1 = if windowed1 > i32::MAX as i64 { i32::MAX } else if windowed1 < i32::MIN as i64 { i32::MIN } else { windowed1 as i32 };
-
-                let win_val2 = *window.add(n) as i64;
-                let windowed2 = (sum2 * win_val2) >> 19;
-                let w2 = if windowed2 > i32::MAX as i64 { i32::MAX } else if windowed2 < i32::MIN as i64 { i32::MIN } else { windowed2 as i32 };
-
-                let out = (*overlap.add(offset + n)).saturating_add(w1);
-                *overlap.add(offset + n) = w2;
-                *freq_lines.add(offset + n) = out;
-                n += 1;
-            }
-            sb += 1;
-        }
-    }
-}
-
-fn process_short_blocks(freq_lines: *const i32, overlap: *mut i32) {
-    unsafe {
-        let mut sb: usize = 0;
-        while sb < SUBBANDS {
-            let mut win_idx: usize = 0;
-            while win_idx < 3 {
-                let offset = sb * IMDCT_LONG_IN + win_idx * IMDCT_SHORT_IN;
-                let overlap_offset = sb * IMDCT_LONG_IN + win_idx * 6;
-
-                // Fused IMDCT_12 + window: stay in i64, >>26 (=11+15)
-                let mut n: usize = 0;
-                while n < IMDCT_SHORT {
-                    let mut sum: i64 = 0;
-                    let mut k: usize = 0;
-                    while k < IMDCT_SHORT_IN {
-                        let idx = offset + k;
-                        let input = if idx < GRANULE_SAMPLES { *freq_lines.add(idx) as i64 } else { 0 };
-                        let cos_val = imdct_cos_12(n, k) as i64;
-                        sum += input * cos_val;
-                        k += 1;
-                    }
-                    let win_val = *WINDOW_SHORT_TABLE.as_ptr().add(n) as i64;
-                    let windowed = (sum * win_val) >> 26;
-                    let w = if windowed > i32::MAX as i64 { i32::MAX } else if windowed < i32::MIN as i64 { i32::MIN } else { windowed as i32 };
-                    if overlap_offset + n < GRANULE_SAMPLES {
-                        *overlap.add(overlap_offset + n) = (*overlap.add(overlap_offset + n)).saturating_add(w);
-                    }
-                    n += 1;
-                }
-                win_idx += 1;
-            }
-            sb += 1;
-        }
-    }
-}
-
-fn process_mixed_block(freq_lines: *const i32, overlap: *mut i32) {
-    unsafe {
-        // First 2 subbands: fused IMDCT_36 + window (>>19)
-        let mut sb: usize = 0;
-        while sb < 2 {
-            let offset = sb * IMDCT_LONG_IN;
-            let mut n: usize = 0;
-            while n < IMDCT_LONG {
-                let mut sum: i64 = 0;
-                let mut k: usize = 0;
-                while k < IMDCT_LONG_IN {
-                    let cos_val = imdct_cos_36(n, k) as i64;
-                    sum += (*freq_lines.add(offset + k) as i64) * cos_val;
-                    k += 1;
-                }
-                let win_val = *WINDOW_LONG_TABLE.as_ptr().add(n) as i64;
-                let windowed = (sum * win_val) >> 19;
-                let w = if windowed > i32::MAX as i64 { i32::MAX } else if windowed < i32::MIN as i64 { i32::MIN } else { windowed as i32 };
-                *overlap.add(offset + n) = (*overlap.add(offset + n)).saturating_add(w);
-                n += 1;
-            }
-            sb += 1;
-        }
-
-        // Remaining subbands: fused IMDCT_12 + window (>>26)
-        sb = 2;
-        while sb < SUBBANDS {
-            let mut win_idx: usize = 0;
-            while win_idx < 3 {
-                let offset = sb * IMDCT_LONG_IN + win_idx * IMDCT_SHORT_IN;
-                let overlap_offset = sb * IMDCT_LONG_IN + win_idx * 6;
-
-                let mut n: usize = 0;
-                while n < IMDCT_SHORT {
-                    let mut sum: i64 = 0;
-                    let mut k: usize = 0;
-                    while k < IMDCT_SHORT_IN {
-                        let idx = offset + k;
-                        let input = if idx < GRANULE_SAMPLES { *freq_lines.add(idx) as i64 } else { 0 };
-                        let cos_val = imdct_cos_12(n, k) as i64;
-                        sum += input * cos_val;
-                        k += 1;
-                    }
-                    let win_val = *WINDOW_SHORT_TABLE.as_ptr().add(n) as i64;
-                    let windowed = (sum * win_val) >> 26;
-                    let w = if windowed > i32::MAX as i64 { i32::MAX } else if windowed < i32::MIN as i64 { i32::MIN } else { windowed as i32 };
-                    if overlap_offset + n < GRANULE_SAMPLES {
-                        *overlap.add(overlap_offset + n) = (*overlap.add(overlap_offset + n)).saturating_add(w);
-                    }
-                    n += 1;
-                }
-                win_idx += 1;
-            }
-            sb += 1;
-        }
-    }
 }
 
 // ============================================================================
@@ -1407,8 +1166,7 @@ fn mul_q15_i32(a: i32, b: i32) -> i32 { ((a as i64 * b as i64) >> 15) as i32 }
 /// amplified to restore correct level — all in i64 space, no overflow possible.
 #[inline(always)]
 fn mp3d_scale_pcm(a: i64, shift: u32) -> i16 {
-    let v = a >> shift;
-    if v > 32767 { 32767i16 } else if v < -32768 { -32768i16 } else { v as i16 }
+    clamp_i16(a >> shift)
 }
 
 /// In-place DCT-II on granule buffer (32-subband polyphase analysis)
