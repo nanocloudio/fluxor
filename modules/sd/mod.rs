@@ -960,7 +960,10 @@ fn get_rb_buf(s: &SdState) -> *mut u8 {
 }
 
 /// Poll block read.
-/// Returns: 0 = pending, 1 = done, -1 = error
+/// Returns: 0 = pending, 1 = done, negative = error
+/// Error codes: -1=idle, -2=claim_xfer, -3=claim_timeout, -4=cmd_xfer,
+///   -5=r1_poll, -6=r1_error(response in rb_attempts), -7=r1_timeout,
+///   -8=data_block, -9=unknown
 unsafe fn read_block_poll(s: &mut SdState) -> i32 {
     loop {
         match s.rb_state {
@@ -973,14 +976,14 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
                     let cmd_ptr = s.cmd_buf.as_ptr();
                     if !spi_transfer_start(s, cmd_ptr, ptr::null_mut(), 6) {
                         s.rb_state = BlockReadState::Idle;
-                        return -1;
+                        return -2; // claim ok but CMD17 transfer start failed
                     }
                     s.rb_state = BlockReadState::SendingCmd;
                     continue;
                 }
                 if claim_res < 0 {
                     s.rb_state = BlockReadState::Idle;
-                    return -1;
+                    return -3; // SPI claim timeout
                 }
                 return 0;
             }
@@ -989,7 +992,7 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
                 let res = spi_transfer_poll(s);
                 if res < 0 {
                     s.rb_state = BlockReadState::Idle;
-                    return -1;
+                    return -4; // CMD17 SPI transfer error
                 }
                 if res > 0 {
                     s.rb_attempts = 0;
@@ -1003,7 +1006,7 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
                 let res = poll_or_start_byte(s);
                 if res < 0 {
                     s.rb_state = BlockReadState::Idle;
-                    return -1;
+                    return -5; // R1 poll byte error
                 }
                 if res >= 0x100 {
                     s.cmd_response = (res & 0xFF) as u8;
@@ -1012,7 +1015,8 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
                             deselect(s);
                             release(s);
                             s.rb_state = BlockReadState::Idle;
-                            return -1;
+                            s.rb_attempts = s.cmd_response; // stash R1 for logging
+                            return -6; // R1 error (non-zero response)
                         }
                         let buf = get_rb_buf(s);
                         read_data_block_start(s, buf, true);
@@ -1023,7 +1027,7 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
                         deselect(s);
                         release(s);
                         s.rb_state = BlockReadState::Idle;
-                        return -1;
+                        return -7; // R1 timeout (100 attempts)
                     }
                     s.rb_attempts += 1;
                 }
@@ -1034,7 +1038,7 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
                 let res = read_data_block_poll(s);
                 if res < 0 {
                     s.rb_state = BlockReadState::Idle;
-                    return -1;
+                    return -8; // data block read error
                 }
                 if res > 0 {
                     s.rb_state = BlockReadState::Idle;
@@ -1043,7 +1047,7 @@ unsafe fn read_block_poll(s: &mut SdState) -> i32 {
                 return 0;
             }
 
-            _ => return -1,
+            _ => return -9,
         }
     }
 }
@@ -1522,13 +1526,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             log_info(s, b"[sd] init done");
         }
 
-        // Check for seek request (only when idle, not mid-read)
-        if s.rb_state == BlockReadState::Idle && s.mod_state == SdModPhase::Reading {
+        // Check for seek request (when not mid-SPI-read)
+        if s.rb_state == BlockReadState::Idle {
             let seek_pos = check_seek_request(s);
             if seek_pos != u32::MAX {
-                // Seek to the requested block
+                // Seek to the requested block — discard any pending write
                 s.current_block = seek_pos;
                 s.pending_offset = 0;
+                s.mod_state = SdModPhase::Reading;
             }
         }
 
@@ -1557,17 +1562,43 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Poll the read
                 let res = read_block_poll(s);
                 if res < 0 {
-                    log_info(s, b"[sd] read failed");
+                    // Log: [sd] E<code> @<block>
+                    let mut lb = [0u8; 40];
+                    let tag = b"[sd] E";
+                    let mut p = 0usize;
+                    let mut t = 0usize;
+                    while t < tag.len() { unsafe { *lb.as_mut_ptr().add(p) = *tag.as_ptr().add(t); } p += 1; t += 1; }
+                    // Error code (negate to get positive)
+                    let ecode = (0i32.wrapping_sub(res)) as u32;
+                    p += unsafe { fmt_u32_raw(lb.as_mut_ptr().add(p), ecode) };
+                    let at = b" @";
+                    t = 0; while t < at.len() { unsafe { *lb.as_mut_ptr().add(p) = *at.as_ptr().add(t); } p += 1; t += 1; }
+                    p += unsafe { fmt_u32_raw(lb.as_mut_ptr().add(p), s.current_block) };
+                    if res == -6 {
+                        // Also log R1 response byte
+                        let r1t = b" R1=";
+                        t = 0; while t < r1t.len() { unsafe { *lb.as_mut_ptr().add(p) = *r1t.as_ptr().add(t); } p += 1; t += 1; }
+                        p += unsafe { fmt_u32_raw(lb.as_mut_ptr().add(p), s.rb_attempts as u32) };
+                    }
+                    unsafe { dev_log(s.sys(), 3, lb.as_ptr(), p); }
                     return E_READ_FAILED;
                 }
                 if res > 0 {
-                    // Block read complete - try to write
-                    s.pending_offset = 0;
-                    match try_write_block(s) {
-                        WriteResult::Complete => s.current_block += 1,
-                        WriteResult::Partial => s.mod_state = SdModPhase::WritingPending,
-                        WriteResult::WouldBlock => s.mod_state = SdModPhase::Writing,
-                        WriteResult::Error(e) => return e,
+                    // Block read complete — check if a seek arrived during the read
+                    let seek_pos = check_seek_request(s);
+                    if seek_pos != u32::MAX {
+                        // Discard this stale block — seek overrides
+                        s.current_block = seek_pos;
+                        s.pending_offset = 0;
+                    } else {
+                        // No seek — write the block normally
+                        s.pending_offset = 0;
+                        match try_write_block(s) {
+                            WriteResult::Complete => s.current_block += 1,
+                            WriteResult::Partial => s.mod_state = SdModPhase::WritingPending,
+                            WriteResult::WouldBlock => s.mod_state = SdModPhase::Writing,
+                            WriteResult::Error(e) => return e,
+                        }
                     }
                 }
                 0
