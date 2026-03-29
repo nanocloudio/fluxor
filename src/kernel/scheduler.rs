@@ -1805,7 +1805,21 @@ fn finalize_module(
     sched.finished[module_idx] = true;
 }
 
-static mut DBG_TICK: u32 = 0;
+#[no_mangle]
+pub static mut DBG_TICK: u32 = 0;
+/// Last module index attempted before a crash — readable by HardFault handler
+#[no_mangle]
+pub static mut DBG_STEP_MODULE: u8 = 0xFF;
+
+/// Crash data buffer in .uninit section — NOT zeroed by cortex-m-rt startup,
+/// survives SYSRESETREQ software resets. Written by HardFault handler, read at tick 500.
+/// Layout: [0]=magic, [1]=PC, [2]=LR, [3]=module, [4]=tick, [5]=R0
+#[link_section = ".uninit.CRASH_DATA"]
+#[no_mangle]
+pub static mut CRASH_DATA: core::mem::MaybeUninit<[u32; 8]> = core::mem::MaybeUninit::uninit();
+
+/// Magic marker for valid crash data
+pub const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
 
 fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepResult {
     let sched = unsafe { &mut *(&raw mut SCHED) };
@@ -1813,6 +1827,28 @@ fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepRe
     unsafe { DBG_TICK += 1; }
     // Periodic heartbeat — confirms scheduler is alive
     if tick % 500 == 0 && tick > 0 {
+        // Check for crash info from previous run (in .uninit RAM, set by HardFault handler)
+        // Done at t=500 so USB serial is definitely connected.
+        if tick == 500 {
+            unsafe {
+                let crash = (&raw const CRASH_DATA) as *const u32;
+                let magic = core::ptr::read_volatile(crash);
+                if magic == CRASH_MAGIC {
+                    let pc = core::ptr::read_volatile(crash.add(1));
+                    let lr = core::ptr::read_volatile(crash.add(2));
+                    let module = core::ptr::read_volatile(crash.add(3));
+                    let prev_tick = core::ptr::read_volatile(crash.add(4));
+                    let r0 = core::ptr::read_volatile(crash.add(5));
+                    let cfsr = core::ptr::read_volatile(crash.add(6));
+                    let bfar = core::ptr::read_volatile(crash.add(7));
+                    log::error!("[crash] pc={:08x} lr={:08x} r0={:08x} mod={} t={}",
+                        pc, lr, r0, module, prev_tick);
+                    log::error!("[crash] cfsr={:08x} bfar={:08x}", cfsr, bfar);
+                    // Clear marker so it doesn't repeat
+                    core::ptr::write_volatile((&raw mut CRASH_DATA) as *mut u32, 0);
+                }
+            }
+        }
         log::info!("[sched] alive t={}", tick);
     }
     // Count active (non-finished) modules upfront so step-period gating
@@ -1875,6 +1911,8 @@ fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepRe
         if let Some(m) = modules[module_idx].as_module_mut() {
             // Set current_module so channel_port works during module_step
             sched.current_module = module_idx;
+            // Track for HardFault diagnosis
+            unsafe { core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8); }
             match m.step() {
                 Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::Ready) => {

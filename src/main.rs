@@ -66,6 +66,36 @@ bind_interrupts!(struct Uart1Irqs {
     UART1_IRQ => BufferedInterruptHandler<UART1>;
 });
 
+// ============================================================================
+// HardFault handler — captures crash context to .uninit RAM (survives reset)
+// ============================================================================
+
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    use fluxor::kernel::scheduler::{CRASH_DATA, CRASH_MAGIC, DBG_STEP_MODULE, DBG_TICK};
+
+    let crash = (&raw mut CRASH_DATA) as *mut u32;
+    core::ptr::write_volatile(crash, CRASH_MAGIC);
+    core::ptr::write_volatile(crash.add(1), ef.pc());
+    core::ptr::write_volatile(crash.add(2), ef.lr());
+    core::ptr::write_volatile(crash.add(3),
+        core::ptr::read_volatile(&raw const DBG_STEP_MODULE) as u32);
+    core::ptr::write_volatile(crash.add(4),
+        core::ptr::read_volatile(&raw const DBG_TICK));
+    core::ptr::write_volatile(crash.add(5), ef.r0());
+    // CFSR: Configurable Fault Status Register — tells us the fault type
+    let cfsr = core::ptr::read_volatile(0xE000_ED28 as *const u32);
+    core::ptr::write_volatile(crash.add(6), cfsr);
+    // BFAR: Bus Fault Address Register — exact address that caused the fault
+    let bfar = core::ptr::read_volatile(0xE000_ED38 as *const u32);
+    core::ptr::write_volatile(crash.add(7), bfar);
+
+    // Trigger system reset via AIRCR
+    let aircr = 0xE000_ED0C as *mut u32;
+    core::ptr::write_volatile(aircr, 0x05FA_0004); // VECTKEY | SYSRESETREQ
+    loop { cortex_m::asm::nop(); }
+}
+
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(4096, log::LevelFilter::Info, driver);
