@@ -39,7 +39,7 @@ pub unsafe fn apply_params(s: &mut SynthState) {
     if tlv::is_tlv(p, len) {
         if len >= 2 && *p.add(1) == 0x02 {
             // TLV v2: per-param tags (schema-driven)
-            params_def::parse_tlv_v2(s, p, len);
+            params_def::parse_tlv(s, p, len);
         } else {
             // TLV v1: grouped tags (legacy)
             tlv::parse_tlv(s);

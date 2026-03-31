@@ -247,7 +247,7 @@ pub extern "C" fn module_new(
     unsafe {
         params_def::set_defaults(s);
         if !params.is_null() && params_len > 0 {
-            params_def::parse_tlv_v2(s, params, params_len);
+            params_def::parse_tlv(s, params, params_len);
         }
     }
 

@@ -211,11 +211,11 @@ pub extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
         s.in_chan = in_chan;
 
-        let is_tlv_v2 = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x02;
+        let is_tlv = !params.is_null() && params_len >= 4
+            && *params == 0xFE && *params.add(1) == 0x01;
 
-        if is_tlv_v2 {
-            params_def::parse_tlv_v2(s, params, params_len);
+        if is_tlv {
+            params_def::parse_tlv(s, params, params_len);
         } else if !params.is_null() && params_len >= core::mem::size_of::<I2sParams>() {
             let p = &*(params as *const I2sParams);
             s.data_pin = if p.data_pin == 0 { 28 } else { p.data_pin };

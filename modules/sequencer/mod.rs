@@ -285,14 +285,14 @@ pub extern "C" fn module_new(
         }
 
         // Parse params: detect TLV v2 vs legacy format
-        let is_tlv_v2 = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x02;
+        let is_tlv = !params.is_null() && params_len >= 4
+            && *params == 0xFE && *params.add(1) == 0x01;
 
-        if is_tlv_v2 {
+        if is_tlv {
             // TLV v2: per-param tags (schema-driven)
             // set_defaults sets sample_rate, step_frames, mode.
             // Preset u16_array tags accumulate via preset_count.
-            params_def::parse_tlv_v2(seq, params, params_len);
+            params_def::parse_tlv(seq, params, params_len);
         } else {
             // Legacy fixed-offset format
             let sample_rate = if !params.is_null() && params_len >= 4 {

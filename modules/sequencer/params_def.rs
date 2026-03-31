@@ -1,6 +1,6 @@
 // Sequencer parameter definitions (single source of truth).
 //
-// Generates: dispatch_param(), set_defaults(), parse_tlv_v2(), PARAM_SCHEMA.
+// Generates: dispatch_param(), set_defaults(), parse_tlv(), PARAM_SCHEMA.
 //
 // IMPORTANT: sample_rate must be first — step_ms depends on it for
 // computing step_frames.

@@ -224,9 +224,10 @@ pub extern "C" fn main() -> ! {
         core::arch::asm!("msr daifclr, #2"); // enable IRQs
     }
 
-    // Initialize syscall table and provider registry
+    // Initialize syscall table, provider registry, and step guard
     fluxor::kernel::syscalls::init_syscall_table();
     fluxor::kernel::syscalls::init_providers();
+    fluxor::kernel::step_guard::init();
 
     // --- Config-driven module graph ---
     use fluxor::kernel::channel;
@@ -341,8 +342,9 @@ pub extern "C" fn main() -> ! {
 
     uart_puts(b"[sched] starting\r\n");
 
-    // Main loop — step all modules, that's it
+    // Main loop — step all modules with step guard
     use fluxor::modules::Module;
+    use fluxor::kernel::step_guard;
     loop {
         unsafe { core::arch::asm!("wfi") };
         unsafe { scheduler::DBG_TICK += 1; }
@@ -350,7 +352,15 @@ pub extern "C" fn main() -> ! {
 
         let mut j = 0;
         while j < mod_count {
-            if let Some(ref mut m) = modules[j] { let _ = m.step(); }
+            if let Some(ref mut m) = modules[j] {
+                step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
+                let _ = m.step();
+                step_guard::disarm();
+                step_guard::post_step_check();
+                if step_guard::check_and_clear_timeout() {
+                    log::warn!("[guard] module {} timeout", j);
+                }
+            }
             j += 1;
         }
 

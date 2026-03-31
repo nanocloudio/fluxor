@@ -381,7 +381,7 @@ pub extern "C" fn module_new(
 
         // Parse TLV params
         if !params.is_null() && params_len > 0 {
-            params_def::parse_tlv_v2(s, params, params_len);
+            params_def::parse_tlv(s, params, params_len);
         }
 
         log_info(s, b"[ip] module loaded");

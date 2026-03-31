@@ -184,11 +184,11 @@ pub extern "C" fn module_new(
         s.map_long_press = DEFAULT_LONG_PRESS;
 
         // Parse params
-        let is_tlv_v2 = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x02;
+        let is_tlv = !params.is_null() && params_len >= 4
+            && *params == 0xFE && *params.add(1) == 0x01;
 
-        if is_tlv_v2 {
-            params_def::parse_tlv_v2(s, params, params_len);
+        if is_tlv {
+            params_def::parse_tlv(s, params, params_len);
         } else {
             params_def::set_defaults(s);
         }

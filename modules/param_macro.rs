@@ -33,11 +33,11 @@ pub const SCHEMA_MAGIC: [u8; 2] = [0x53, 0x50];
 /// Schema version
 pub const SCHEMA_VERSION: u8 = 1;
 
-/// TLV v2 magic byte (same envelope as v1, new version)
+/// TLV magic byte
 pub const TLV_MAGIC: u8 = 0xFE;
 
-/// TLV v2 version byte (per-param tags)
-pub const TLV_V2: u8 = 0x02;
+/// TLV version byte
+pub const TLV_VERSION: u8 = 0x01;
 
 /// TLV end marker tag
 pub const TLV_END: u8 = 0xFF;
@@ -102,9 +102,9 @@ macro_rules! define_params {
         }
 
         // ================================================================
-        // Generic TLV v2 parser: set defaults then dispatch each entry
+        // Generic TLV parser: set defaults then dispatch each entry
         // ================================================================
-        pub unsafe fn parse_tlv_v2(s: &mut $state_type, p: *const u8, total_len: usize) {
+        pub unsafe fn parse_tlv(s: &mut $state_type, p: *const u8, total_len: usize) {
             set_defaults(s);
             if total_len < 4 { return; }
             let payload_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;

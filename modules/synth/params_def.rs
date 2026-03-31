@@ -1,6 +1,6 @@
 // Synth parameter definitions (single source of truth).
 //
-// Generates: dispatch_param(), set_defaults(), parse_tlv_v2(), PARAM_SCHEMA.
+// Generates: dispatch_param(), set_defaults(), parse_tlv(), PARAM_SCHEMA.
 // The schema is embedded in the .fmod via #[link_section = ".param_schema"].
 //
 // IMPORTANT: sample_rate must be first — its apply closure recomputes

@@ -1110,8 +1110,62 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
         params_len = build_legacy_params(type_name, module, &mut entry, data_section, config);
     }
 
+    // Append protection/fault policy params as reserved TLV tags (0xF0-0xF3).
+    // These are parsed by the kernel scheduler during instantiation.
+    let mut extra_len = 0usize;
+    let base = MODULE_ENTRY_HEADER_SIZE + params_len;
+
+    // Tag 0xF0: step_deadline_us (u32, 4 bytes)
+    if let Some(deadline) = module.get("step_deadline_us").and_then(|v| v.as_u64()) {
+        if base + extra_len + 6 < entry.len() {
+            entry[base + extra_len] = 0xF0;
+            entry[base + extra_len + 1] = 4;
+            let bytes = (deadline as u32).to_le_bytes();
+            entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&bytes);
+            extra_len += 6;
+        }
+    }
+
+    // Tag 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph)
+    if let Some(policy_str) = module.get("fault_policy").and_then(|v| v.as_str()) {
+        let policy_val: u8 = match policy_str {
+            "skip" => 0,
+            "restart" => 1,
+            "restart_graph" => 2,
+            _ => 0,
+        };
+        if base + extra_len + 3 < entry.len() {
+            entry[base + extra_len] = 0xF1;
+            entry[base + extra_len + 1] = 1;
+            entry[base + extra_len + 2] = policy_val;
+            extra_len += 3;
+        }
+    }
+
+    // Tag 0xF2: max_restarts (u16, 2 bytes)
+    if let Some(max_r) = module.get("max_restarts").and_then(|v| v.as_u64()) {
+        if base + extra_len + 4 < entry.len() {
+            entry[base + extra_len] = 0xF2;
+            entry[base + extra_len + 1] = 2;
+            let bytes = (max_r as u16).to_le_bytes();
+            entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
+            extra_len += 4;
+        }
+    }
+
+    // Tag 0xF3: restart_backoff_ms (u16, 2 bytes)
+    if let Some(backoff) = module.get("restart_backoff_ms").and_then(|v| v.as_u64()) {
+        if base + extra_len + 4 < entry.len() {
+            entry[base + extra_len] = 0xF3;
+            entry[base + extra_len + 1] = 2;
+            let bytes = (backoff as u16).to_le_bytes();
+            entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
+            extra_len += 4;
+        }
+    }
+
     // Calculate total entry length and write to header
-    let entry_len = MODULE_ENTRY_HEADER_SIZE + params_len;
+    let entry_len = MODULE_ENTRY_HEADER_SIZE + params_len + extra_len;
     entry[0..2].copy_from_slice(&(entry_len as u16).to_le_bytes());
 
     // Truncate to actual size

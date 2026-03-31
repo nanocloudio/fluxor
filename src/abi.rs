@@ -892,6 +892,9 @@ pub mod dev_query_key {
     /// Heap statistics (returns HeapStats struct, 16 bytes).
     /// handle=-1 queries the calling module's heap.
     pub const HEAP_STATS: u32 = 6;
+    /// Fault statistics (returns FaultStats struct, 12 bytes).
+    /// handle=-1 queries the calling module, handle=N queries module N.
+    pub const FAULT_STATS: u32 = 7;
 }
 
 // ============================================================================

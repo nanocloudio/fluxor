@@ -991,6 +991,21 @@ unsafe extern "C" fn syscall_dev_query(
                 *(out as *mut crate::kernel::heap::HeapStats) = stats;
                 stats_size as i32
             }
+            dev_query_key::FAULT_STATS => {
+                use crate::kernel::step_guard::FaultStats;
+                let stats_size = core::mem::size_of::<FaultStats>();
+                if out.is_null() || out_len < stats_size { return E_INVAL; }
+                let module_idx = if handle == -1 {
+                    crate::kernel::scheduler::current_module_index()
+                } else {
+                    handle as usize
+                };
+                let stats = crate::kernel::scheduler::get_fault_stats(module_idx);
+                core::ptr::copy_nonoverlapping(
+                    &stats as *const FaultStats as *const u8, out, stats_size,
+                );
+                stats_size as i32
+            }
             _ => E_NOSYS,
         };
     }

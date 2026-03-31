@@ -262,11 +262,11 @@ pub extern "C" fn module_new(
         s.paused = 0;
 
         // Parse params
-        let is_tlv_v2 = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x02;
+        let is_tlv = !params.is_null() && params_len >= 4
+            && *params == 0xFE && *params.add(1) == 0x01;
 
-        if is_tlv_v2 {
-            params_def::parse_tlv_v2(s, params, params_len);
+        if is_tlv {
+            params_def::parse_tlv(s, params, params_len);
         } else if !params.is_null() && params_len >= 2 {
             s.count = read_u16_at(params, 0);
             s.mode = if params_len >= 3 { *params.add(2) } else { MODE_LOOP };

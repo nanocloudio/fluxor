@@ -473,7 +473,7 @@ pub extern "C" fn module_new(
 
         // Scan params TLV for 0xFD voice entries and populate voice_table
         if copy_len >= 4 && !params.is_null()
-            && *params == 0xFE && *params.add(1) == 0x02
+            && *params == 0xFE && *params.add(1) == 0x01
         {
             let mut vcount = 0u8;
             let mut off = 4usize;
@@ -595,7 +595,7 @@ unsafe fn apply_params(s: &mut EffectsState) {
         match *p.add(1) {
             0x02 => {
                 // TLV v2: flat per-param tags with schema
-                parse_tlv_v2(s);
+                parse_tlv(s);
                 return;
             }
             0x01 => {
@@ -615,7 +615,7 @@ unsafe fn apply_params(s: &mut EffectsState) {
 /// TLV v2 parser with two-pass approach:
 /// 1. First pass: extract sample_rate so derivation closures can use it
 /// 2. Second pass: dispatch all params, tracking fx_enable
-unsafe fn parse_tlv_v2(s: &mut EffectsState) {
+unsafe fn parse_tlv(s: &mut EffectsState) {
     tlv::set_defaults(s);
     s.fx_enable = 0;
 

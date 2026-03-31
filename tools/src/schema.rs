@@ -1,6 +1,6 @@
 //! Parameter schema reader and generic TLV packer.
 //!
-//! Reads schema from .fmod files and packs YAML config into TLV v2 format.
+//! Reads schema from .fmod files and packs YAML config into TLV format.
 //! No module-specific knowledge — everything is driven by the schema.
 
 use std::collections::HashMap;
@@ -13,9 +13,9 @@ use crate::modules::ModuleInfo;
 /// Schema magic bytes: "SP"
 const SCHEMA_MAGIC: [u8; 2] = [0x53, 0x50];
 
-/// TLV v2 header: magic + version
+/// TLV header: magic + version
 const TLV_MAGIC: u8 = 0xFE;
-const TLV_V2: u8 = 0x02;
+const TLV_VERSION: u8 = 0x01;
 const TLV_END: u8 = 0xFF;
 
 /// Parameter types (must match module-side param_macro.rs)
@@ -156,6 +156,7 @@ impl ParamSchema {
 /// Unknown keys are silently skipped by pack_param().
 const SKIP_KEYS: &[&str] = &[
     "name", "type", "wiring", "preset", "presets", "voices", "routes",
+    "step_deadline_us", "fault_policy", "max_restarts", "restart_backoff_ms",
 ];
 
 /// Grouping suffixes that YAML nesting may introduce in outer keys
@@ -165,7 +166,7 @@ const SKIP_KEYS: &[&str] = &[
 /// schema param `filter_attack_ms`.
 const GROUPING_SUFFIXES: &[&str] = &["_envelope", "_config", "_settings", "_params"];
 
-/// Pack YAML module config into TLV v2 format using schema.
+/// Pack YAML module config into TLV format using schema.
 ///
 /// Returns the number of bytes written to `entry` starting at `base_offset`.
 /// Returns Err if a preset reference cannot be resolved.
@@ -241,9 +242,9 @@ pub fn build_params_from_schema(
 
     let mut pos = base_offset;
 
-    // TLV v2 header
+    // TLV header
     entry[pos] = TLV_MAGIC; pos += 1;
-    entry[pos] = TLV_V2; pos += 1;
+    entry[pos] = TLV_VERSION; pos += 1;
     let len_pos = pos; // payload length placeholder
     pos += 2;
 
@@ -313,7 +314,7 @@ pub fn build_params_from_schema(
         }
     }
 
-    // Pack voice preset blobs (tag 0xFD, each containing a complete inner TLV v2 blob)
+    // Pack voice preset blobs (tag 0xFD, each containing a complete inner TLV blob)
     if let Some(voice_refs) = voices.as_ref() {
         for voice_ref in voice_refs {
             if let Some(voice_params) = resolve_voice_params(voice_ref, data_section, module_name) {
@@ -649,7 +650,7 @@ fn resolve_voice_params(voice_ref: &Value, data_section: Option<&Value>, module_
     None
 }
 
-/// Pack voice params into a complete inner TLV v2 blob.
+/// Pack voice params into a complete inner TLV blob.
 ///
 /// Produces `[0xFE, 0x02, len_lo, len_hi, ...tag-len-value entries..., 0xFF, 0x00]`.
 /// This is stored inside the outer `0xFD` tag. When the module switches voices,
@@ -690,10 +691,10 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
         }
     }
 
-    // TLV v2 header
+    // TLV header
     let mut pos = 0usize;
     buf[pos] = TLV_MAGIC; pos += 1;
-    buf[pos] = TLV_V2; pos += 1;
+    buf[pos] = TLV_VERSION; pos += 1;
     let len_pos = pos;
     pos += 2; // payload length placeholder
 

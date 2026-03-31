@@ -238,7 +238,7 @@ pub extern "C" fn module_new(
 
         // Scan params TLV for 0xFD voice entries and populate voice_table
         if copy_len >= 4 && !params.is_null()
-            && *params == 0xFE && *params.add(1) == 0x02
+            && *params == 0xFE && *params.add(1) == 0x01
         {
             let mut vcount = 0u8;
             let mut off = 4usize;

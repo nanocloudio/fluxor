@@ -274,7 +274,7 @@ unsafe fn upsert_override(module_id: u8, tag: u8, src: *const u8, value_len: u8)
 /// Merge runtime overrides for `module_id` into `param_buf`.
 ///
 /// Appends override TLV entries after the compiled params. Since
-/// `parse_tlv_v2()` processes entries sequentially (last writer wins),
+/// `parse_tlv()` processes entries sequentially (last writer wins),
 /// overrides naturally take precedence.
 ///
 /// `param_buf` points to PARAM_BUFFER data, `param_len` is current length.

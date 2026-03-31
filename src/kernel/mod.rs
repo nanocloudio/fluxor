@@ -21,3 +21,4 @@ pub mod flash_store;
 pub mod chip;
 pub mod guard;
 pub mod heap;
+pub mod step_guard;

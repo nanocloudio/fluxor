@@ -321,11 +321,11 @@ pub extern "C" fn module_new(
         if ch >= 0 { s.out_ctrl_rtp = ch; }
 
         // Parse params
-        let is_tlv_v2 = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x02;
+        let is_tlv = !params.is_null() && params_len >= 4
+            && *params == 0xFE && *params.add(1) == 0x01;
 
-        if is_tlv_v2 {
-            params_def::parse_tlv_v2(s, params, params_len);
+        if is_tlv {
+            params_def::parse_tlv(s, params, params_len);
         } else {
             params_def::set_defaults(s);
         }

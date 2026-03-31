@@ -1,6 +1,6 @@
 // Drum parameter definitions (single source of truth).
 //
-// Generates: dispatch_param(), set_defaults(), parse_tlv_v2(), PARAM_SCHEMA.
+// Generates: dispatch_param(), set_defaults(), parse_tlv(), PARAM_SCHEMA.
 
 use super::DrumState;
 use super::{p_u8, p_u32};

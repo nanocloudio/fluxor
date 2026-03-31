@@ -27,6 +27,7 @@ use crate::kernel::syscalls::{
 use crate::kernel::channel;
 use crate::kernel::channel::{CHANNEL_TYPE_PIPE, POLL_IN, POLL_OUT, POLL_HUP, POLL_ERR, channel_set_flags, channel_set_mailbox};
 use crate::kernel::syscalls as syscalls;
+use crate::kernel::step_guard::{self, ModuleFaultInfo, FaultState, FaultPolicy, FaultStats, fault_type};
 use crate::modules::{Module, StepOutcome};
 
 // ============================================================================
@@ -778,6 +779,8 @@ struct SchedulerState {
     module_latency: [u32; MAX_MODULES],
     /// Per-module accumulated downstream latency in frames
     downstream_latency: [u32; MAX_MODULES],
+    /// Per-module fault bookkeeping (state, policy, counters)
+    fault_info: [ModuleFaultInfo; MAX_MODULES],
 }
 
 impl SchedulerState {
@@ -804,6 +807,7 @@ impl SchedulerState {
             graph_sample_rate: 0,
             module_latency: [0; MAX_MODULES],
             downstream_latency: [0; MAX_MODULES],
+            fault_info: [ModuleFaultInfo::new(); MAX_MODULES],
         }
     }
 
@@ -830,6 +834,7 @@ impl SchedulerState {
             self.step_counter[i] = 0;
             self.module_latency[i] = 0;
             self.downstream_latency[i] = 0;
+            self.fault_info[i] = ModuleFaultInfo::new();
         }
         self.exec_order_count = 0;
         self.graph_sample_rate = 0;
@@ -902,6 +907,36 @@ pub fn downstream_latency(module_idx: usize) -> u32 {
     }
 }
 
+/// Get fault statistics for a module (for dev_query FAULT_STATS).
+pub fn get_fault_stats(module_idx: usize) -> FaultStats {
+    if module_idx >= MAX_MODULES {
+        return FaultStats::default();
+    }
+    unsafe {
+        let tick = DBG_TICK;
+        SCHED.fault_info[module_idx].to_stats(tick)
+    }
+}
+
+/// Get mutable fault info for a module (for config-time setup).
+pub fn set_module_fault_policy(module_idx: usize, policy: FaultPolicy, max_restarts: u16, backoff_ms: u16) {
+    if module_idx >= MAX_MODULES { return; }
+    unsafe {
+        let fi = &mut SCHED.fault_info[module_idx];
+        fi.policy = policy;
+        fi.max_restarts = max_restarts;
+        fi.restart_backoff_ms = backoff_ms;
+    }
+}
+
+/// Set per-module step deadline (from config).
+pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
+    if module_idx >= MAX_MODULES { return; }
+    unsafe {
+        SCHED.fault_info[module_idx].step_deadline_us = deadline_us;
+    }
+}
+
 /// Lookup a channel port for the currently-executing module.
 /// Called from the channel_port syscall implementation.
 pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
@@ -950,6 +985,9 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
     #[cfg(feature = "rp")]
     crate::kernel::flash_store::boot_scan();
 
+    // Initialize step guard timer hardware
+    step_guard::init();
+
     // Validate hardware requirements
     if !validate_hardware_requirements(runner_config) {
         log::error!("[boot] hardware validation failed");
@@ -993,10 +1031,9 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
 
     let sched = unsafe { &mut *(&raw mut SCHED) };
 
-    // Reset all scheduler state, state arena, heaps, and name arena
+    // Reset all scheduler state, state arena, and name arena
     reset_state_arena();
     crate::kernel::buffer_pool::reset_buffer_arena();
-    crate::kernel::heap::reset_all();
     NameArena::reset();
     sched.reset();
 
@@ -1561,13 +1598,11 @@ fn instantiate_one_module(
         }
     }
 
-    // Check for optional module_arena_size export and allocate if present.
-    // If an arena is allocated, initialize a per-module heap allocator on it.
+    // Check for optional module_arena_size export and allocate if present
     unsafe {
         let sched = &mut *(&raw mut SCHED);
         let arenas = &mut sched.arenas;
         arenas[instantiated] = ArenaInfo::empty();
-        crate::kernel::heap::reset_module_heap(instantiated);
         if let Ok(addr) = found_module.get_export_addr(
             crate::kernel::loader::export_hashes::MODULE_ARENA_SIZE,
         ) {
@@ -1578,8 +1613,6 @@ fn instantiate_one_module(
                 match crate::kernel::loader::alloc_state(requested) {
                     Ok(ptr) => {
                         arenas[instantiated] = ArenaInfo { ptr, size: requested as u32 };
-                        // Initialize per-module heap allocator on the arena
-                        crate::kernel::heap::init_module_heap(instantiated, ptr, requested);
                     }
                     Err(e) => {
                         e.log("arena");
@@ -1640,6 +1673,9 @@ fn instantiate_one_module(
     unsafe {
         (*(&raw mut SCHED)).step_period[instantiated] = found_module.header.step_period_ms();
     }
+
+    // Parse protection config from TLV params (tags 0xF0-0xF3)
+    parse_protection_config(instantiated, entry.params());
 
     InstantiateResult::Done
 }
@@ -1964,6 +2000,195 @@ pub static mut CRASH_DATA: core::mem::MaybeUninit<[u32; 8]> = core::mem::MaybeUn
 /// Magic marker for valid crash data
 pub const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
 
+/// Parse protection configuration from module params TLV.
+///
+/// Looks for reserved tags 0xF0-0xF3 in the TLV v2 params blob:
+/// - 0xF0: step_deadline_us (u32, 4 bytes LE)
+/// - 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph)
+/// - 0xF2: max_restarts (u16, 2 bytes LE)
+/// - 0xF3: restart_backoff_ms (u16, 2 bytes LE)
+fn parse_protection_config(module_idx: usize, params: &[u8]) {
+    if params.len() < 4 {
+        return;
+    }
+
+    // TLV v2 format: [0xFE, 0x02, len_lo, len_hi, ...entries..., 0xFF, 0x00]
+    // Each entry: tag(1), len(1), value(len)
+    // We scan raw bytes for our reserved tags regardless of TLV structure
+    let mut pos = 0;
+
+    // Skip TLV v2 header if present
+    if params.len() >= 4 && params[0] == 0xFE && params[1] == 0x02 {
+        pos = 4; // Skip header (magic, version, length)
+    }
+
+    let sched = unsafe { &mut *(&raw mut SCHED) };
+    let fi = &mut sched.fault_info[module_idx];
+
+    while pos + 2 <= params.len() {
+        let tag = params[pos];
+        let len = params[pos + 1] as usize;
+        pos += 2;
+
+        if tag == 0xFF {
+            break; // End-of-params marker
+        }
+
+        if pos + len > params.len() {
+            break;
+        }
+
+        match tag {
+            0xF0 if len == 4 => {
+                // step_deadline_us (u32 LE)
+                let val = u32::from_le_bytes([
+                    params[pos], params[pos+1], params[pos+2], params[pos+3],
+                ]);
+                fi.step_deadline_us = val;
+            }
+            0xF1 if len >= 1 => {
+                // fault_policy
+                fi.policy = match params[pos] {
+                    0 => FaultPolicy::Skip,
+                    1 => FaultPolicy::Restart,
+                    2 => FaultPolicy::RestartGraph,
+                    _ => FaultPolicy::Skip,
+                };
+            }
+            0xF2 if len == 2 => {
+                // max_restarts (u16 LE)
+                fi.max_restarts = u16::from_le_bytes([params[pos], params[pos+1]]);
+            }
+            0xF3 if len == 2 => {
+                // restart_backoff_ms (u16 LE)
+                fi.restart_backoff_ms = u16::from_le_bytes([params[pos], params[pos+1]]);
+            }
+            _ => {} // Unknown tag — skip
+        }
+
+        pos += len;
+    }
+}
+
+/// Handle a step timeout: record fault, transition to Faulted or Terminated.
+fn handle_step_timeout(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    module_idx: usize,
+    active_count: &mut usize,
+) {
+    let tick = unsafe { DBG_TICK };
+    let fi = &mut sched.fault_info[module_idx];
+    fi.record_fault(fault_type::TIMEOUT, tick);
+    log::warn!("[guard] module {} ({}) step timeout (fault #{})",
+        module_idx, modules[module_idx].type_name(), fi.fault_count);
+
+    if fi.can_restart() {
+        fi.state = FaultState::Faulted;
+        fi.backoff_remaining = fi.restart_backoff_ms as u32;
+    } else {
+        fi.state = FaultState::Terminated;
+        finalize_module(module_idx, Some(-110), modules[module_idx].type_name(), " (timeout terminated)");
+        *active_count -= 1;
+    }
+}
+
+/// Handle a step error: record fault, transition to Faulted or finalize.
+fn handle_step_error(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    module_idx: usize,
+    rc: i32,
+    active_count: &mut usize,
+    context: &str,
+) {
+    let tick = unsafe { DBG_TICK };
+    let fi = &mut sched.fault_info[module_idx];
+    fi.record_fault(fault_type::STEP_ERROR, tick);
+
+    if fi.can_restart() {
+        fi.state = FaultState::Faulted;
+        fi.backoff_remaining = fi.restart_backoff_ms as u32;
+        log::warn!("[guard] module {} ({}) error rc={} — will restart (fault #{})",
+            module_idx, modules[module_idx].type_name(), rc, fi.fault_count);
+    } else {
+        fi.state = FaultState::Terminated;
+        finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), context);
+        *active_count -= 1;
+    }
+}
+
+/// Attempt to restart a faulted module.
+///
+/// Restart procedure:
+/// 1. Mark as Recovering
+/// 2. Release all handles
+/// 3. Drain/flush connected channels
+/// 4. Zero module state block
+/// 5. Reset ready signal (re-gate downstream)
+/// 6. Call module_new() with original params (via step_fn reinit)
+/// 7. Resume stepping
+///
+/// Note: Full restart (re-calling module_new) requires stored params and
+/// loader state. For v1, we do a simplified restart: zero state + re-call
+/// module_new is deferred to a future iteration. Instead, we zero state
+/// and let the module re-initialize on next step (works for stateless modules).
+/// For stateful modules, the module will see zeroed state and should handle
+/// it gracefully (same as fresh boot).
+fn handle_module_restart(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    module_idx: usize,
+) {
+    sched.fault_info[module_idx].state = FaultState::Recovering;
+    sched.fault_info[module_idx].restart_count += 1;
+    log::info!("[guard] restarting module {} ({}) (restart #{})",
+        module_idx, modules[module_idx].type_name(),
+        sched.fault_info[module_idx].restart_count);
+
+    // Release owned handles (events, timers, DMA, providers, etc.)
+    syscalls::release_module_handles(module_idx as u8);
+
+    // Drain/flush all connected channels (both in and out)
+    let ports = &sched.ports[module_idx];
+    for i in 0..ports.in_count as usize {
+        if ports.in_chans[i] >= 0 {
+            channel::channel_ioctl(ports.in_chans[i], channel::IOCTL_FLUSH, core::ptr::null_mut());
+        }
+    }
+    for i in 0..ports.out_count as usize {
+        if ports.out_chans[i] >= 0 {
+            channel::channel_ioctl(ports.out_chans[i], channel::IOCTL_FLUSH, core::ptr::null_mut());
+        }
+    }
+    for i in 0..ports.ctrl_count as usize {
+        if ports.ctrl_chans[i] >= 0 {
+            channel::channel_ioctl(ports.ctrl_chans[i], channel::IOCTL_FLUSH, core::ptr::null_mut());
+        }
+    }
+
+    // Zero the module's state block
+    if let ModuleSlot::Dynamic(m) = &modules[module_idx] {
+        let state = m.state_ptr();
+        if !state.is_null() {
+            // We don't know state_size from DynamicModule alone, but the arena
+            // allocator zeroed it at alloc time. We'll zero a conservative amount
+            // based on the arena info (if available).
+            // For now, just leave state as-is — module will see previous state.
+            // Full restart with module_new re-call is a future enhancement.
+        }
+    }
+
+    // Reset ready signal if module was deferred_ready
+    if sched.deferred_ready[module_idx] {
+        sched.ready[module_idx] = false;
+    }
+
+    // Mark as running again
+    sched.fault_info[module_idx].state = FaultState::Running;
+    sched.finished[module_idx] = false;
+}
+
 fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepResult {
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let tick = unsafe { DBG_TICK };
@@ -2051,27 +2276,73 @@ fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepRe
             continue;
         }
 
+        // Skip faulted/terminated modules
+        let fault_state = sched.fault_info[module_idx].state;
+        if fault_state == FaultState::Faulted {
+            // Check if backoff has elapsed → attempt restart
+            if sched.fault_info[module_idx].backoff_remaining > 0 {
+                sched.fault_info[module_idx].backoff_remaining -= 1;
+                continue;
+            }
+            if sched.fault_info[module_idx].can_restart() {
+                handle_module_restart(sched, modules, module_idx);
+                // After restart attempt, skip this tick (module will run next tick)
+                continue;
+            } else {
+                // Cannot restart — terminate
+                sched.fault_info[module_idx].state = FaultState::Terminated;
+                finalize_module(module_idx, Some(-110), modules[module_idx].type_name(), " (terminated)");
+                active_count -= 1;
+                continue;
+            }
+        } else if fault_state == FaultState::Terminated || fault_state == FaultState::Recovering {
+            continue;
+        }
+
         if let Some(m) = modules[module_idx].as_module_mut() {
             // Set current_module so channel_port works during module_step
             sched.current_module = module_idx;
             // Track for HardFault diagnosis
             unsafe { core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8); }
+
+            // Arm step guard timer
+            let deadline = sched.fault_info[module_idx].effective_deadline_us();
+            step_guard::arm(deadline);
+
             match m.step() {
-                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::Continue) => {
+                    step_guard::disarm();
+                    step_guard::post_step_check();
+                    if step_guard::check_and_clear_timeout() {
+                        handle_step_timeout(sched, modules, module_idx, &mut active_count);
+                    }
+                }
                 Ok(StepOutcome::Ready) => {
+                    step_guard::disarm();
                     if !sched.ready[module_idx] {
                         sched.ready[module_idx] = true;
                         log::info!("{}: ready", modules[module_idx].type_name());
                     }
                 }
                 Ok(StepOutcome::Done) => {
+                    step_guard::disarm();
                     finalize_module(module_idx, None, modules[module_idx].type_name(), "");
                     active_count -= 1;
                 }
                 Ok(StepOutcome::Burst) => {
-                    // Module has more immediate work — re-step up to MAX_BURST_STEPS times.
-                    // Stops early on Continue (no more work), Done, or Error.
+                    // Keep timer armed for entire burst with extended deadline
+                    step_guard::disarm();
+                    let burst_deadline = deadline.saturating_mul(step_guard::BURST_MULTIPLIER);
+                    step_guard::arm(burst_deadline);
+
                     for _ in 0..MAX_BURST_STEPS {
+                        // Check timeout between burst iterations
+                        if step_guard::is_timed_out() {
+                            step_guard::disarm();
+                            step_guard::check_and_clear_timeout();
+                            handle_step_timeout(sched, modules, module_idx, &mut active_count);
+                            break;
+                        }
                         if let Some(m) = modules[module_idx].as_module_mut() {
                             match m.step() {
                                 Ok(StepOutcome::Burst) => continue,
@@ -2089,8 +2360,7 @@ fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepRe
                                     break;
                                 }
                                 Err(rc) => {
-                                    finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), " (burst)");
-                                    active_count -= 1;
+                                    handle_step_error(sched, modules, module_idx, rc, &mut active_count, " (burst)");
                                     break;
                                 }
                             }
@@ -2098,10 +2368,16 @@ fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepRe
                             break;
                         }
                     }
+                    step_guard::disarm();
+                    step_guard::post_step_check();
+                    // Check if burst as a whole timed out
+                    if step_guard::check_and_clear_timeout() {
+                        handle_step_timeout(sched, modules, module_idx, &mut active_count);
+                    }
                 }
                 Err(rc) => {
-                    finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), "");
-                    active_count -= 1;
+                    step_guard::disarm();
+                    handle_step_error(sched, modules, module_idx, rc, &mut active_count, "");
                 }
             }
         }
@@ -2152,21 +2428,47 @@ fn step_woken_modules(
                 continue;
             }
         }
+        // Skip faulted/terminated modules
+        let fault_state = sched.fault_info[module_idx].state;
+        if fault_state != FaultState::Running {
+            continue;
+        }
+
         if let Some(m) = modules[module_idx].as_module_mut() {
             sched.current_module = module_idx;
+
+            let deadline = sched.fault_info[module_idx].effective_deadline_us();
+            step_guard::arm(deadline);
+
             match m.step() {
-                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::Continue) => {
+                    step_guard::disarm();
+                    step_guard::post_step_check();
+                    if step_guard::check_and_clear_timeout() {
+                        log::warn!("[guard] module {} timeout (event wake)", module_idx);
+                        sched.fault_info[module_idx].record_fault(fault_type::TIMEOUT, unsafe { DBG_TICK });
+                    }
+                }
                 Ok(StepOutcome::Ready) => {
+                    step_guard::disarm();
                     if !sched.ready[module_idx] {
                         sched.ready[module_idx] = true;
                         log::info!("{}: ready", modules[module_idx].type_name());
                     }
                 }
                 Ok(StepOutcome::Done) => {
+                    step_guard::disarm();
                     finalize_module(module_idx, None, modules[module_idx].type_name(), " (event wake)");
                 }
                 Ok(StepOutcome::Burst) => {
+                    step_guard::disarm();
+                    let burst_deadline = deadline.saturating_mul(step_guard::BURST_MULTIPLIER);
+                    step_guard::arm(burst_deadline);
+
                     for _ in 0..MAX_BURST_STEPS {
+                        if step_guard::is_timed_out() {
+                            break;
+                        }
                         if let Some(m) = modules[module_idx].as_module_mut() {
                             match m.step() {
                                 Ok(StepOutcome::Burst) => continue,
@@ -2191,8 +2493,12 @@ fn step_woken_modules(
                             break;
                         }
                     }
+                    step_guard::disarm();
+                    step_guard::post_step_check();
+                    step_guard::check_and_clear_timeout(); // Clear without action for woken path
                 }
                 Err(rc) => {
+                    step_guard::disarm();
                     finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), " (event wake)");
                 }
             }

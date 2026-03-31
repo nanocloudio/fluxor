@@ -170,11 +170,11 @@ pub unsafe extern "C" fn module_new(
     state.pending_path_len = 0;
 
     // Parse params
-    let is_tlv_v2 = !params.is_null() && params_len >= 4
-        && *params == 0xFE && *params.add(1) == 0x02;
+    let is_tlv = !params.is_null() && params_len >= 4
+        && *params == 0xFE && *params.add(1) == 0x01;
 
-    if is_tlv_v2 {
-        params_def::parse_tlv_v2(state, params, params_len);
+    if is_tlv {
+        params_def::parse_tlv(state, params, params_len);
     } else if !params.is_null() && params_len >= 1 {
         // Legacy flat layout: [loop_mode, channels, bits, _pad, sample_rate(u32)]
         state.loop_mode = *params;

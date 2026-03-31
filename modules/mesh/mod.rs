@@ -423,7 +423,7 @@ pub extern "C" fn module_new(
         // Detect TLV v2 envelope — mesh uses structured binary params
         // within the TLV v2 envelope (tags parsed manually).
         let (p, plen) = if !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x02
+            && *params == 0xFE && *params.add(1) == 0x01
         {
             // TLV v2: skip 4-byte header, payload follows
             let payload_len = u16::from_le_bytes([*params.add(2), *params.add(3)]) as usize;
