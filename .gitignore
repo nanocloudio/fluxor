@@ -2,6 +2,7 @@
 target/
 *.uf2
 *.bin
+vm/
 
 # Editor/IDE
 .vscode/

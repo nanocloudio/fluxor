@@ -8,12 +8,14 @@
 //! Modules use `fd_poll` for readiness, then the per-type API for consumption.
 
 use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering, compiler_fence};
+#[cfg(feature = "rp")]
 use embassy_time::Instant;
 
 use crate::kernel::channel::{self, POLL_IN, POLL_OUT};
 use crate::kernel::errno;
 use crate::kernel::event;
 use crate::kernel::socket::SocketService;
+#[cfg(feature = "rp")]
 use crate::io::pio::{PioStreamService, PioCmdService, PioRxStreamService};
 
 // ============================================================================
@@ -89,7 +91,10 @@ impl TimerSlot {
 static TIMER_SLOTS: [TimerSlot; MAX_TIMERS] = [const { TimerSlot::new() }; MAX_TIMERS];
 
 fn now_ms() -> u32 {
-    Instant::now().as_millis() as u32
+    #[cfg(feature = "rp")]
+    { Instant::now().as_millis() as u32 }
+    #[cfg(feature = "chip-bcm2712")]
+    { crate::kernel::scheduler::tick_count() }
 }
 
 /// Create a new timer owned by the current module.
@@ -190,11 +195,14 @@ pub fn release_timers_owned_by(module_idx: u8) {
 }
 
 // ============================================================================
-// DMA-as-fd
+// DMA-as-fd (RP-only — uses PAC DMA registers)
 // ============================================================================
 
+// Everything below until "Unified poll" is RP-only (DMA PAC registers).
+#[cfg(feature = "rp")]
 const MAX_DMA_FDS: usize = 8;
 
+#[cfg(feature = "rp")]
 struct DmaFdSlot {
     allocated: AtomicBool,
     owner: AtomicU8,
@@ -204,6 +212,7 @@ struct DmaFdSlot {
     pending: AtomicBool,      // queue() called since last poll-ready
 }
 
+#[cfg(feature = "rp")]
 impl DmaFdSlot {
     const fn new() -> Self {
         Self {
@@ -233,10 +242,12 @@ impl DmaFdSlot {
     }
 }
 
+#[cfg(feature = "rp")]
 static DMA_FD_SLOTS: [DmaFdSlot; MAX_DMA_FDS] = [const { DmaFdSlot::new() }; MAX_DMA_FDS];
 
 /// Create a new DMA FD: allocates two DMA channels (CH8-15) for ping-pong and
 /// wraps them in a tagged fd. Returns tagged fd or negative errno.
+#[cfg(feature = "rp")]
 pub fn dma_fd_create() -> i32 {
     let ch_a = crate::kernel::syscalls::dma_alloc_channel();
     if ch_a < 0 {
@@ -270,6 +281,7 @@ pub fn dma_fd_create() -> i32 {
 /// Start a full DMA transfer on a DMA FD.
 /// Configures and starts channel A. Pre-configures channel B with same
 /// WRITE_ADDR/DREQ/flags but doesn't start it (ready for dma_fd_queue).
+#[cfg(feature = "rp")]
 pub fn dma_fd_start(fd: i32, read_addr: u32, write_addr: u32, count: u32, dreq: u8, flags: u8) -> i32 {
     let slot = slot_of(fd);
     if slot < 0 || slot as usize >= MAX_DMA_FDS {
@@ -296,7 +308,7 @@ pub fn dma_fd_start(fd: i32, read_addr: u32, write_addr: u32, count: u32, dreq: 
 }
 
 /// Pre-configure a DMA channel's WRITE_ADDR and CTRL without starting it.
-/// CHAIN_TO = self (no chaining until queue sets it on the active channel).
+#[cfg(feature = "rp")]
 unsafe fn dma_preconfigure_inactive(ch: u8, write_addr: u32, dreq: u8, flags: u8) {
     use embassy_rp::pac;
     let dma_ch = pac::DMA.ch(ch as usize);
@@ -327,6 +339,7 @@ unsafe fn dma_preconfigure_inactive(ch: u8, write_addr: u32, dreq: u8, flags: u8
 /// Queue next DMA transfer for ping-pong. Configures the inactive channel and
 /// sets CHAIN_TO on the active channel so the queued transfer starts automatically
 /// when the current one completes — zero-gap handoff via hardware chaining.
+#[cfg(feature = "rp")]
 pub fn dma_fd_queue(fd: i32, read_addr: u32, count: u32) -> i32 {
     let slot = slot_of(fd);
     if slot < 0 || slot as usize >= MAX_DMA_FDS {
@@ -381,6 +394,7 @@ pub fn dma_fd_queue(fd: i32, read_addr: u32, count: u32) -> i32 {
 /// Fast DMA re-trigger via AL3 registers (count + read_addr_trig).
 /// Preserves existing write_addr, dreq, flags from the initial start.
 /// Operates on the active channel only (no ping-pong).
+#[cfg(feature = "rp")]
 pub fn dma_fd_restart(fd: i32, read_addr: u32, count: u32) -> i32 {
     let slot = slot_of(fd);
     if slot < 0 || slot as usize >= MAX_DMA_FDS {
@@ -395,6 +409,7 @@ pub fn dma_fd_restart(fd: i32, read_addr: u32, count: u32) -> i32 {
 }
 
 /// Free a DMA FD: aborts both channels, frees them, releases slot.
+#[cfg(feature = "rp")]
 pub fn dma_fd_free(fd: i32) -> i32 {
     let slot = slot_of(fd);
     if slot < 0 || slot as usize >= MAX_DMA_FDS {
@@ -423,6 +438,7 @@ pub fn dma_fd_free(fd: i32) -> i32 {
 /// - Active channel busy → not ready
 /// - Active channel done + pending=true → swap active, clear pending, reset CHAIN_TO → POLL_IN
 /// - Active channel done + pending=false → idle (DMA stopped) → POLL_IN
+#[cfg(feature = "rp")]
 fn dma_fd_poll_ready(slot: i32) -> bool {
     if slot < 0 || slot as usize >= MAX_DMA_FDS {
         return false;
@@ -455,6 +471,7 @@ fn dma_fd_poll_ready(slot: i32) -> bool {
 }
 
 /// Release all DMA FD slots owned by a specific module. Called on module finish.
+#[cfg(feature = "rp")]
 pub fn release_dma_fds_owned_by(module_idx: u8) {
     for i in 0..MAX_DMA_FDS {
         let dma = &DMA_FD_SLOTS[i];
@@ -524,16 +541,16 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
             }
             ready as i32
         }
+        #[cfg(feature = "rp")]
         FD_TAG_PIO_STREAM => {
-            // can_push → POLL_OUT
             let mut ready = 0u8;
             if (events & POLL_OUT) != 0 && PioStreamService::can_push(slot) > 0 {
                 ready |= POLL_OUT;
             }
             ready as i32
         }
+        #[cfg(feature = "rp")]
         FD_TAG_PIO_CMD => {
-            // poll() returns 0=busy, >0=done, <0=error — non-destructive read
             let mut ready = 0u8;
             if (events & POLL_IN) != 0 {
                 let result = PioCmdService::poll(slot);
@@ -543,16 +560,16 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
             }
             ready as i32
         }
+        #[cfg(feature = "rp")]
         FD_TAG_PIO_RX_STREAM => {
-            // can_pull → POLL_IN (data available for reading)
             let mut ready = 0u8;
             if (events & POLL_IN) != 0 && PioRxStreamService::can_pull(slot) > 0 {
                 ready |= POLL_IN;
             }
             ready as i32
         }
+        #[cfg(feature = "rp")]
         FD_TAG_DMA => {
-            // DMA active channel done → POLL_IN (with ping-pong swap if pending)
             let mut ready = 0u8;
             if (events & POLL_IN) != 0 && dma_fd_poll_ready(slot) {
                 ready |= POLL_IN;

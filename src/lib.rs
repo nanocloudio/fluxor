@@ -1,8 +1,12 @@
 #![no_std]
 
+#[cfg(feature = "rp")]
 pub mod io;
+#[cfg(any(feature = "rp", feature = "chip-bcm2712"))]
 pub mod kernel;
+#[cfg(any(feature = "rp", feature = "chip-bcm2712"))]
 pub mod abi;
+#[cfg(any(feature = "rp", feature = "chip-bcm2712"))]
 #[path = "../modules/mod.rs"]
 pub mod modules;
 

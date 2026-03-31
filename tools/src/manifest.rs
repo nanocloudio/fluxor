@@ -213,6 +213,9 @@ pub struct Manifest {
     pub integrity_hash: Option<[u8; 32]>,
     /// FMP command vocabulary (parsed from TOML, not in binary format)
     pub commands: CommandVocabulary,
+    /// Services this module provides to others (parsed from TOML, not in binary format).
+    /// e.g. ip provides "socket", pwm provides "pwm"
+    pub provides: Vec<String>,
 }
 
 impl Default for Manifest {
@@ -226,6 +229,7 @@ impl Default for Manifest {
             dependencies: Vec::new(),
             integrity_hash: None,
             commands: CommandVocabulary::default(),
+            provides: Vec::new(),
         }
     }
 }
@@ -349,6 +353,8 @@ impl Manifest {
             CommandVocabulary::default()
         };
 
+        let provides = toml_val.provides.unwrap_or_default();
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -358,6 +364,7 @@ impl Manifest {
             dependencies,
             integrity_hash: None, // set later by caller
             commands,
+            provides,
         })
     }
 
@@ -514,6 +521,7 @@ impl Manifest {
             dependencies,
             integrity_hash,
             commands: CommandVocabulary::default(),
+            provides: Vec::new(), // not serialized in binary format
         })
     }
 
@@ -611,6 +619,7 @@ struct TomlManifest {
     resources: Option<Vec<TomlResource>>,
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
+    provides: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]

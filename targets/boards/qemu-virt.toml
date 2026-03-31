@@ -1,0 +1,11 @@
+# QEMU virt machine (aarch64)
+# Virtual board for development and testing via QEMU.
+
+[board]
+id = "qemu-virt"
+silicon = "bcm2712"
+description = "QEMU aarch64 virt machine"
+
+# No reserved pins — virtual platform
+[gpio]
+reserved_pins = []

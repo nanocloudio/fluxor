@@ -13,7 +13,9 @@
 
 use portable_atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
+#[cfg(feature = "rp")]
 use embassy_sync::signal::Signal;
+#[cfg(feature = "rp")]
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use crate::kernel::errno;
@@ -55,9 +57,10 @@ static EVENT_SLOTS: [EventSlot; MAX_EVENTS] = [const { EventSlot::new() }; MAX_E
 /// Scheduler reads + clears atomically via swap(0).
 static EVENT_WAKE_PENDING: AtomicU16 = AtomicU16::new(0);
 
-/// Embassy Signal to break the main loop out of Timer::after(1ms).
-/// ISR-safe: Signal<CriticalSectionRawMutex, ()> uses brief interrupt disable
-/// on single-core Cortex-M33. Same mechanism used by PIO DMA completion.
+/// Signal to break the scheduler out of its idle wait.
+/// RP: Embassy Signal (ISR-safe via CriticalSectionRawMutex).
+/// BCM2712: uses SEV instruction instead (no static needed).
+#[cfg(feature = "rp")]
 pub static SCHEDULER_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 // ============================================================================
@@ -121,7 +124,10 @@ pub fn event_signal(handle: i32) -> i32 {
     if (owner as usize) < crate::kernel::config::MAX_MODULES {
         EVENT_WAKE_PENDING.fetch_or(1u16 << owner, Ordering::Release);
     }
+    #[cfg(feature = "rp")]
     SCHEDULER_WAKE.signal(());
+    #[cfg(feature = "chip-bcm2712")]
+    unsafe { core::arch::asm!("sev") }; // Wake scheduler WFE
     0
 }
 
@@ -140,7 +146,10 @@ pub fn event_signal_from_isr(handle: i32) {
     if (owner as usize) < crate::kernel::config::MAX_MODULES {
         EVENT_WAKE_PENDING.fetch_or(1u16 << owner, Ordering::Release);
     }
+    #[cfg(feature = "rp")]
     SCHEDULER_WAKE.signal(());
+    #[cfg(feature = "chip-bcm2712")]
+    unsafe { core::arch::asm!("sev") };
 }
 
 /// Poll an event (non-blocking). Clears the signaled flag atomically.

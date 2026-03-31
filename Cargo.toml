@@ -14,54 +14,69 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+# --- RP-family dependencies (Cortex-M targets) ---
 # Async executor for main task and logger task.
-embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "defmt"], optional = true }
 # Timers for async delays between SD reads.
-embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"], optional = true }
 # RP2350 HAL (SPI, GPIO, USB, DMA, clocks).
 # Chip variant (rp235xa or rp235xb) selected via features below.
-embassy-rp = { version = "0.9.0", features = ["defmt", "time-driver", "critical-section-impl", "rt", "unstable-pac"] }
+embassy-rp = { version = "0.9.0", features = ["defmt", "time-driver", "critical-section-impl", "rt", "unstable-pac"], optional = true }
 # USB device stack for CDC logging.
-embassy-usb = { version = "0.5.1", features = ["defmt"] }
+embassy-usb = { version = "0.5.1", features = ["defmt"], optional = true }
 # USB serial logger implementation.
-embassy-usb-logger = "0.5.1"
+embassy-usb-logger = { version = "0.5.1", optional = true }
 # Minimal async yield helper for syscall polling loops.
-embassy-futures = "0.1.2"
+embassy-futures = { version = "0.1.2", optional = true }
 # Async primitives (signals, channels, mutexes).
-embassy-sync = "0.7.2"
+embassy-sync = { version = "0.7.2", optional = true }
 # Cortex-M core utilities (used for low-level delays).
-cortex-m = "0.7.7"
+cortex-m = { version = "0.7.7", optional = true }
 # Cortex-M runtime and startup.
-cortex-m-rt = "0.7.5"
+cortex-m-rt = { version = "0.7.5", optional = true }
 # Static initialization for shared peripherals.
-static_cell = "2.1.1"
+static_cell = { version = "2.1.1", optional = true }
 # Structured logging facade used by embassy-usb-logger.
 log = "0.4.27"
 # PIO assembler/proc macros for RP2350 PIO programs.
-pio-proc = "0.3.0"
+pio-proc = { version = "0.3.0", optional = true }
 # PIO instruction encoding utilities.
-pio = "0.3.0"
+pio = { version = "0.3.0", optional = true }
 # Fixed-point math used by PIO helpers.
-fixed = "1.29.0"
+fixed = { version = "1.29.0", optional = true }
 # defmt logging backend (required by selected embassy features).
-defmt = "1.0.1"
+defmt = { version = "1.0.1", optional = true }
 # RTT logger for early debug output.
-defmt-rtt = "1.1.0"
+defmt-rtt = { version = "1.1.0", optional = true }
 # Panic handler with defmt output.
-panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-sha2 = { version = "0.10.9", default-features = false }
-embedded-io-async = "0.6.1"
+panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
+embedded-io-async = { version = "0.6.1", optional = true }
 # Portable atomics with CAS emulation for thumbv6m (RP2040 Cortex-M0+).
 # On thumbv8m (RP2350) this is a zero-cost pass-through.
-portable-atomic = { version = "1", default-features = false }
+portable-atomic = { version = "1", default-features = false, optional = true }
 
 [features]
 default = ["chip-rp2350b"]
+
+# RP-family shared dependencies (pulled in by any chip-rp* feature)
+rp = [
+    "embassy-executor", "embassy-time", "embassy-rp", "embassy-usb",
+    "embassy-usb-logger", "embassy-futures", "embassy-sync",
+    "cortex-m", "cortex-m-rt", "static_cell", "pio-proc", "pio", "fixed",
+    "defmt", "defmt-rtt", "panic-probe", "sha2", "embedded-io-async",
+    "portable-atomic",
+]
+
 # Single binary for both RP2350A and RP2350B. Always compile with B (superset).
 # Runtime silicon detection (SYSINFO.package_sel) gates pin availability.
-chip-rp2350b = ["embassy-rp/rp235xb"]
+chip-rp2350b = ["rp", "embassy-rp/rp235xb"]
 # RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
-chip-rp2040 = ["embassy-rp/rp2040"]
+chip-rp2040 = ["rp", "embassy-rp/rp2040"]
+
+# BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
+# Minimal — no embassy, no cortex-m. Bare-metal from scratch.
+chip-bcm2712 = ["portable-atomic", "sha2"]
 
 [build-dependencies]
 toml = "0.8"

@@ -11,6 +11,7 @@
 
 use core::ptr::null;
 
+#[cfg(feature = "rp")]
 use embassy_time::{Duration, Timer};
 
 use crate::kernel::config::{
@@ -447,6 +448,9 @@ pub enum ModuleSlot {
     Dummy(DummyModule),
     Tee(TeeModule),
     Merge(MergeModule),
+    /// Statically linked built-in module (function pointers + state buffer).
+    /// Used on platforms without PIC loading (e.g. aarch64 QEMU).
+    BuiltIn(BuiltInModule),
 }
 
 impl ModuleSlot {
@@ -463,6 +467,7 @@ impl ModuleSlot {
             ModuleSlot::Dummy(_) => "dummy",
             ModuleSlot::Tee(_) => "tee",
             ModuleSlot::Merge(_) => "merge",
+            ModuleSlot::BuiltIn(m) => m.name,
         }
     }
 
@@ -473,6 +478,7 @@ impl ModuleSlot {
             ModuleSlot::Dummy(m) => Some(m),
             ModuleSlot::Tee(m) => Some(m),
             ModuleSlot::Merge(m) => Some(m),
+            ModuleSlot::BuiltIn(m) => Some(m),
         }
     }
 }
@@ -490,6 +496,37 @@ impl Module for DummyModule {
 
     fn name(&self) -> &'static str {
         "dummy"
+    }
+}
+
+/// Built-in module: step function pointer + opaque state.
+/// Used for statically-linked modules on platforms without PIC loading.
+pub struct BuiltInModule {
+    pub name: &'static str,
+    step_fn: fn(*mut u8) -> i32,
+    state: [u8; 64], // Fixed-size state (enough for channel handles + counters)
+}
+
+impl BuiltInModule {
+    pub fn new(name: &'static str, step_fn: fn(*mut u8) -> i32) -> Self {
+        Self { name, step_fn, state: [0u8; 64] }
+    }
+}
+
+impl Module for BuiltInModule {
+    fn step(&mut self) -> Result<StepOutcome, i32> {
+        let rc = (self.step_fn)(self.state.as_mut_ptr());
+        match rc {
+            0 => Ok(StepOutcome::Continue),
+            1 => Ok(StepOutcome::Done),
+            2 => Ok(StepOutcome::Burst),
+            3 => Ok(StepOutcome::Ready),
+            _ => Err(rc),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -908,6 +945,7 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
         return false;
     }
     // Scan runtime parameter store (flash sector with persistent overrides)
+    #[cfg(feature = "rp")]
     crate::kernel::flash_store::boot_scan();
 
     // Validate hardware requirements
@@ -1017,6 +1055,7 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
 }
 
 /// Async graph setup - instantiates modules with executor running.
+#[cfg(feature = "rp")]
 pub async fn setup_graph_async() -> i32 {
     let (module_list, module_count) = match prepare_graph() {
         Ok(v) => v,
@@ -1048,7 +1087,8 @@ pub async fn setup_graph_async() -> i32 {
     result
 }
 
-/// Run the main graph loop
+/// Run the main graph loop (async, embassy)
+#[cfg(feature = "rp")]
 pub async fn run_main_loop(module_count: usize) -> ! {
     let modules = unsafe { &mut *(&raw mut SCHED.modules) };
 
@@ -1549,13 +1589,16 @@ fn instantiate_one_module(
         pb.write(entry.params());
 
         // Overlay any runtime parameter overrides from flash store
-        let new_len = crate::kernel::flash_store::merge_runtime_overrides(
-            entry.id,
-            pb.as_mut_ptr(),
-            pb.len(),
-            MAX_MODULE_CONFIG_SIZE,
-        );
-        pb.set_len(new_len);
+        #[cfg(feature = "rp")]
+        {
+            let new_len = crate::kernel::flash_store::merge_runtime_overrides(
+                entry.id,
+                pb.as_mut_ptr(),
+                pb.len(),
+                MAX_MODULE_CONFIG_SIZE,
+            );
+            pb.set_len(new_len);
+        }
     }
 
     // Full instantiation via start_new
@@ -1595,6 +1638,7 @@ fn instantiate_one_module(
 }
 
 /// Async wrapper — only the tiny pending-retry loop lives in the async future.
+#[cfg(feature = "rp")]
 #[inline(never)]
 async fn instantiate_all_modules_async(
     loader: &ModuleLoader,
@@ -1650,6 +1694,93 @@ async fn instantiate_all_modules_async(
     }
 
     instantiated as i32
+}
+
+/// Synchronous graph setup (bcm2712) — no embassy, no async.
+#[cfg(feature = "chip-bcm2712")]
+pub fn setup_graph_sync() -> i32 {
+    let (module_list, module_count) = match prepare_graph() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let loader = unsafe { &*(&raw const STATIC_LOADER) };
+    let sched = unsafe { &mut *(&raw mut SCHED) };
+    let mut instantiated = 0usize;
+
+    for module_idx in 0..module_count {
+        let entry = match &module_list[module_idx] {
+            Some(entry) => entry,
+            None => continue,
+        };
+
+        unsafe { SCHED.current_module = instantiated; }
+        match instantiate_one_module(
+            loader, entry, module_idx, instantiated,
+            &mut sched.edges, &mut sched.modules, &mut sched.ports,
+        ) {
+            InstantiateResult::Done => {}
+            InstantiateResult::Pending(mut pending) => {
+                // Spin-wait for pending modules (no async executor)
+                loop {
+                    match unsafe { pending.try_complete() } {
+                        Ok(Some(dynamic)) => {
+                            sched.modules[instantiated] = ModuleSlot::Dynamic(dynamic);
+                            break;
+                        }
+                        Ok(None) => {
+                            // Yield CPU briefly
+                            for _ in 0..1000 { unsafe { core::arch::asm!("nop") }; }
+                        }
+                        Err(e) => {
+                            e.log("scheduler");
+                            return -1;
+                        }
+                    }
+                }
+            }
+            InstantiateResult::Error(e) => {
+                log::error!("[inst] failed module={} error={}", module_idx, e);
+                return e;
+            }
+        }
+        instantiated += 1;
+    }
+
+    if !validate_buffer_groups(&sched.edges) {
+        log::error!("[graph] buffer group validation failed");
+        return -1;
+    }
+    compute_downstream_latency(sched, module_count);
+    instantiated as i32
+}
+
+/// Synchronous main loop (bcm2712) — step all modules, increment tick, WFE.
+#[cfg(feature = "chip-bcm2712")]
+pub fn run_main_loop_sync(module_count: usize) -> ! {
+    let modules = unsafe { &mut *(&raw mut SCHED.modules) };
+    log::info!("[sched] running modules={}", module_count);
+
+    loop {
+        unsafe { DBG_TICK += 1; }
+        let tick = unsafe { DBG_TICK };
+
+        step_modules(modules, module_count);
+
+        // Check event wake
+        let wake = crate::kernel::event::take_wake_pending();
+        if wake != 0 {
+            step_woken_modules(modules, module_count, wake);
+        }
+
+        // Periodic alive message
+        if tick % 500 == 0 {
+            log::info!("[sched] alive t={}", tick);
+        }
+
+        // Yield until next tick (timer interrupt or SEV from event_signal)
+        unsafe { core::arch::asm!("wfe") };
+    }
 }
 
 /// Compute topological execution order from the edge graph using Kahn's algorithm.
@@ -1807,6 +1938,11 @@ fn finalize_module(
 
 #[no_mangle]
 pub static mut DBG_TICK: u32 = 0;
+
+/// Current tick count (milliseconds since boot). Used by timer FDs on aarch64.
+pub fn tick_count() -> u32 {
+    unsafe { DBG_TICK }
+}
 /// Last module index attempted before a crash — readable by HardFault handler
 #[no_mangle]
 pub static mut DBG_STEP_MODULE: u8 = 0xFF;
@@ -2112,4 +2248,75 @@ fn collect_ctrl_channels(
 ) -> usize {
     // Only collect ctrl input channels
     collect_channels(edges, module_idx, FanDirection::In, true, out)
+}
+
+// ============================================================================
+// Built-in module graph (no PIC loading, no config parsing)
+// ============================================================================
+
+/// Manually insert built-in modules and run the scheduler loop.
+/// Used on platforms without flash/PIC (e.g. aarch64 QEMU).
+///
+/// `modules`: array of (name, step_fn) pairs. Channels between them are
+/// created automatically: module[0].out → module[1].in → module[1].out → ...
+pub fn run_builtin_graph(modules: &[(&'static str, fn(*mut u8) -> i32)]) -> ! {
+    let count = modules.len().min(MAX_MODULES);
+    let sched = unsafe { &mut *(&raw mut SCHED) };
+
+    // Create channels between consecutive modules
+    let mut channels = [0i32; MAX_MODULES];
+    let mut chan_count = 0usize;
+    if count > 1 {
+        let mut i = 0;
+        while i < count - 1 {
+            let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, null(), 0);
+            if ch >= 0 {
+                channels[i] = ch;
+                chan_count += 1;
+            }
+            i += 1;
+        }
+    }
+
+    // Insert modules
+    let mut i = 0;
+    while i < count {
+        let mut m = BuiltInModule::new(modules[i].0, modules[i].1);
+        // Store channel handles in state: bytes 0-3 = input, 4-7 = output
+        let state = m.state.as_mut_ptr();
+        // Input channel (from previous module)
+        let in_ch: i32 = if i > 0 { channels[i - 1] } else { -1 };
+        unsafe { core::ptr::write(state as *mut i32, in_ch) };
+        // Output channel (to next module)
+        let out_ch: i32 = if i < count - 1 { channels[i] } else { -1 };
+        unsafe { core::ptr::write(state.add(4) as *mut i32, out_ch) };
+
+        sched.modules[i] = ModuleSlot::BuiltIn(m);
+        sched.ready[i] = true;
+        i += 1;
+    }
+
+    log::info!("[sched] running modules={} channels={}", count, chan_count);
+
+    // Synchronous main loop
+    loop {
+        unsafe {
+            core::arch::asm!("wfi"); // Wait for timer tick
+        }
+
+        unsafe { DBG_TICK += 1; }
+        let tick = unsafe { DBG_TICK };
+
+        step_modules(&mut sched.modules, count);
+
+        // Check event wake
+        let wake = crate::kernel::event::take_wake_pending();
+        if wake != 0 {
+            step_woken_modules(&mut sched.modules, count, wake);
+        }
+
+        if tick % 500 == 0 {
+            log::info!("[sched] alive t={}", tick);
+        }
+    }
 }

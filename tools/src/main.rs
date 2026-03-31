@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::config::{decode_config, generate_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config};
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
@@ -126,6 +126,14 @@ enum Commands {
     },
     /// List available targets
     Targets,
+    /// Build module table blob from .fmod files
+    Mktable {
+        /// Directory containing .fmod files
+        dir: PathBuf,
+        /// Output binary file
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 fn main() {
@@ -156,6 +164,7 @@ fn main() {
         Commands::Validate { config, target } => cmd_validate(&config, target.as_deref()),
         Commands::TargetInfo { target, field } => cmd_target_info(&target, field.as_deref()),
         Commands::Targets => cmd_targets(),
+        Commands::Mktable { dir, output } => cmd_mktable(&dir, &output),
     };
 
     if let Err(e) = result {
@@ -969,6 +978,46 @@ fn cmd_targets() -> Result<()> {
                 println!("  {:20} (error loading)", name);
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Build a module table blob from .fmod files in a directory.
+fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
+    use std::fs;
+
+    let mut fmod_files: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("fmod") {
+            fmod_files.push(path);
+        }
+    }
+    fmod_files.sort();
+
+    if fmod_files.is_empty() {
+        return Err(Error::Module("No .fmod files found".into()));
+    }
+
+    let mut modules = Vec::new();
+    for path in &fmod_files {
+        let info = modules::ModuleInfo::from_file(path)?;
+        modules.push(info);
+    }
+
+    let table = build_module_table(&modules)?;
+    fs::write(output, &table)?;
+
+    println!(
+        "{} modules, {} bytes → {}",
+        modules.len(),
+        table.len(),
+        output.display()
+    );
+    for m in &modules {
+        println!("  {} ({} bytes)", m.name, m.data.len());
     }
 
     Ok(())

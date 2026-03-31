@@ -154,8 +154,11 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     let mut data_offset = TABLE_HEADER_SIZE + entries_size;
 
     for module in modules {
-        // Align each .fmod to 4-byte boundary
-        let padding = (4 - (data_offset % 4)) % 4;
+        // Align code start (offset + 68 bytes header) to page boundary for aarch64 ADRP.
+        // The .fmod header is 68 bytes, then code follows. ADRP needs code at page boundary.
+        let code_start = data_offset + 68;
+        let aligned_code = (code_start + 4095) & !4095; // round up to page
+        let padding = aligned_code - 68 - data_offset;
         data_offset += padding;
         data_size += padding;
 
@@ -184,10 +187,10 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
         result.extend_from_slice(&[0u8; 2]); // reserved
     }
 
-    // Module data (with alignment padding)
-    for module in modules {
-        // Pad to 4-byte alignment
-        while result.len() % 4 != 0 {
+    // Module data (with alignment padding — code must start at page boundary)
+    for (i, module) in modules.iter().enumerate() {
+        // Pad so that offset + 68 (header size) is page-aligned
+        while (result.len() + 68) % 4096 != 0 {
             result.push(0);
         }
         result.extend_from_slice(&module.data);
@@ -329,16 +332,16 @@ struct ElfSymbol {
     section_idx: u16,
 }
 
-/// Parse ELF32 file and extract sections and symbols
+/// Parse ELF file (32 or 64-bit) and extract sections and symbols
 fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
     // Verify ELF magic
-    if data.len() < 52 || &data[0..4] != b"\x7fELF" {
+    if data.len() < 64 || &data[0..4] != b"\x7fELF" {
         return Err(Error::Module("Not a valid ELF file".into()));
     }
 
-    // ELF32 check
-    if data[4] != 1 {
-        return Err(Error::Module("Only ELF32 is supported".into()));
+    let elf64 = data[4] == 2;
+    if data[4] != 1 && data[4] != 2 {
+        return Err(Error::Module("Unknown ELF class (expected 32 or 64)".into()));
     }
 
     // Little-endian check
@@ -346,24 +349,41 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
         return Err(Error::Module("Only little-endian ELF is supported".into()));
     }
 
-    // Read ELF header fields
-    let e_shoff = u32::from_le_bytes([data[32], data[33], data[34], data[35]]) as usize;
-    let e_shentsize = u16::from_le_bytes([data[46], data[47]]) as usize;
-    let e_shnum = u16::from_le_bytes([data[48], data[49]]) as usize;
-    let e_shstrndx = u16::from_le_bytes([data[50], data[51]]) as usize;
+    // Read ELF header fields — offsets differ between ELF32 and ELF64
+    let (e_shoff, e_shentsize, e_shnum, e_shstrndx) = if elf64 {
+        let off = u64::from_le_bytes(data[40..48].try_into().unwrap()) as usize;
+        let ent = u16::from_le_bytes([data[58], data[59]]) as usize;
+        let num = u16::from_le_bytes([data[60], data[61]]) as usize;
+        let str = u16::from_le_bytes([data[62], data[63]]) as usize;
+        (off, ent, num, str)
+    } else {
+        let off = u32::from_le_bytes([data[32], data[33], data[34], data[35]]) as usize;
+        let ent = u16::from_le_bytes([data[46], data[47]]) as usize;
+        let num = u16::from_le_bytes([data[48], data[49]]) as usize;
+        let str = u16::from_le_bytes([data[50], data[51]]) as usize;
+        (off, ent, num, str)
+    };
 
     if e_shoff == 0 || e_shnum == 0 {
         return Err(Error::Module("ELF file has no section headers".into()));
     }
 
+    // Helper: read section header fields (offset and size differ for ELF32/64)
+    let sh_offset_size = |sh_off: usize| -> (usize, usize) {
+        if elf64 {
+            let off = u64::from_le_bytes(data[sh_off+24..sh_off+32].try_into().unwrap()) as usize;
+            let sz = u64::from_le_bytes(data[sh_off+32..sh_off+40].try_into().unwrap()) as usize;
+            (off, sz)
+        } else {
+            let off = u32::from_le_bytes([data[sh_off+16], data[sh_off+17], data[sh_off+18], data[sh_off+19]]) as usize;
+            let sz = u32::from_le_bytes([data[sh_off+20], data[sh_off+21], data[sh_off+22], data[sh_off+23]]) as usize;
+            (off, sz)
+        }
+    };
+
     // First pass: find section header string table
     let shstrtab_hdr_off = e_shoff + e_shstrndx * e_shentsize;
-    let shstrtab_off =
-        u32::from_le_bytes([data[shstrtab_hdr_off + 16], data[shstrtab_hdr_off + 17],
-                           data[shstrtab_hdr_off + 18], data[shstrtab_hdr_off + 19]]) as usize;
-    let shstrtab_size =
-        u32::from_le_bytes([data[shstrtab_hdr_off + 20], data[shstrtab_hdr_off + 21],
-                           data[shstrtab_hdr_off + 22], data[shstrtab_hdr_off + 23]]) as usize;
+    let (shstrtab_off, shstrtab_size) = sh_offset_size(shstrtab_hdr_off);
     let shstrtab = &data[shstrtab_off..shstrtab_off + shstrtab_size];
 
     // Second pass: read all sections
@@ -377,10 +397,7 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
                                               data[sh_off + 2], data[sh_off + 3]]) as usize;
         let sh_type = u32::from_le_bytes([data[sh_off + 4], data[sh_off + 5],
                                           data[sh_off + 6], data[sh_off + 7]]);
-        let sh_offset = u32::from_le_bytes([data[sh_off + 16], data[sh_off + 17],
-                                            data[sh_off + 18], data[sh_off + 19]]) as usize;
-        let sh_size = u32::from_le_bytes([data[sh_off + 20], data[sh_off + 21],
-                                          data[sh_off + 22], data[sh_off + 23]]) as usize;
+        let (sh_offset, sh_size) = sh_offset_size(sh_off);
 
         // Get section name
         let name_end = shstrtab[sh_name_idx..].iter().position(|&b| b == 0).unwrap_or(0);
@@ -416,20 +433,30 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
         let symtab = &sections[symtab_i].data;
         let strtab = &sections[strtab_i].data;
 
-        // Each ELF32 symbol entry is 16 bytes
-        for i in (0..symtab.len()).step_by(16) {
-            if i + 16 > symtab.len() {
+        // ELF32 symbol: 16 bytes. ELF64 symbol: 24 bytes.
+        let sym_size = if elf64 { 24 } else { 16 };
+        for i in (0..symtab.len()).step_by(sym_size) {
+            if i + sym_size > symtab.len() {
                 break;
             }
 
-            let st_name = u32::from_le_bytes([symtab[i], symtab[i + 1],
-                                              symtab[i + 2], symtab[i + 3]]) as usize;
-            let st_value = u32::from_le_bytes([symtab[i + 4], symtab[i + 5],
-                                               symtab[i + 6], symtab[i + 7]]);
-            let st_size = u32::from_le_bytes([symtab[i + 8], symtab[i + 9],
-                                              symtab[i + 10], symtab[i + 11]]);
-            let st_info = symtab[i + 12];
-            let st_shndx = u16::from_le_bytes([symtab[i + 14], symtab[i + 15]]);
+            let (st_name, st_value, st_size, st_info, st_shndx) = if elf64 {
+                // ELF64: name(4), info(1), other(1), shndx(2), value(8), size(8)
+                let name = u32::from_le_bytes(symtab[i..i+4].try_into().unwrap()) as usize;
+                let info = symtab[i + 4];
+                let shndx = u16::from_le_bytes([symtab[i + 6], symtab[i + 7]]);
+                let value = u64::from_le_bytes(symtab[i+8..i+16].try_into().unwrap()) as u32;
+                let size = u64::from_le_bytes(symtab[i+16..i+24].try_into().unwrap()) as u32;
+                (name, value, size, info, shndx)
+            } else {
+                // ELF32: name(4), value(4), size(4), info(1), other(1), shndx(2)
+                let name = u32::from_le_bytes(symtab[i..i+4].try_into().unwrap()) as usize;
+                let value = u32::from_le_bytes(symtab[i+4..i+8].try_into().unwrap());
+                let size = u32::from_le_bytes(symtab[i+8..i+12].try_into().unwrap());
+                let info = symtab[i + 12];
+                let shndx = u16::from_le_bytes([symtab[i + 14], symtab[i + 15]]);
+                (name, value, size, info, shndx)
+            };
 
             // Get symbol name
             if st_name < strtab.len() {

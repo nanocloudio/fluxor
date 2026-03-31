@@ -1,0 +1,38 @@
+# BCM2712 — Raspberry Pi 5 / Compute Module 5
+# Quad Cortex-A76 @ 2.4 GHz, aarch64
+#
+# Initial target: QEMU virt machine for kernel bring-up.
+# Memory map and peripheral addresses below are for the QEMU virt platform.
+# Real BCM2712 addresses will differ and need a board-level overlay.
+
+[target]
+id = "bcm2712"
+family = "bcm"
+description = "BCM2712 (Cortex-A76, aarch64)"
+
+[build]
+rust_target = "aarch64-unknown-none"
+cargo_features = ["chip-bcm2712"]
+uf2_family_id = "0x00000000"
+module_target = "aarch64-unknown-none"
+
+[gpio]
+max_pin = 27
+
+[peripherals]
+spi_count = 6
+i2c_count = 4
+uart_count = 5
+adc_channels = 0
+pwm_slices = 4
+pio_count = 0
+pio_state_machines = 0
+dma_channels = 16
+
+[memory]
+# QEMU virt: RAM at 0x4000_0000, 2 GB
+ram_base = "0x40000000"
+ram_size = "0x80000000"
+# No XIP flash — kernel loaded to RAM by bootloader
+flash_base = "0x00000000"
+flash_size = "0x00000000"

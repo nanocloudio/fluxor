@@ -1643,6 +1643,9 @@ pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, modu
         validate_manifests(&module_names, module_caps)?;
     }
 
+    // Validate service dependencies from YAML `services:` section
+    validate_services(config, &module_names, &manifests)?;
+
     // Assign buffer groups for aliasable edge chains
     let buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps);
 
@@ -1842,6 +1845,56 @@ fn validate_manifests(module_names: &[String], module_caps: &[ModuleCaps]) -> Re
                 exclusive_claims.push((res.device_class, res.instance, &cap.name));
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Validate service dependencies declared in the YAML `services:` section.
+///
+/// Each entry maps a service name to a provider module name. Validation checks:
+/// 1. The provider module exists in the config
+/// 2. The provider module's manifest declares `provides` for that service
+fn validate_services(
+    config: &serde_json::Value,
+    module_names: &[String],
+    manifests: &std::collections::HashMap<String, crate::manifest::Manifest>,
+) -> Result<()> {
+    let services = match config.get("services") {
+        Some(s) => s,
+        None => return Ok(()), // no services section — skip validation
+    };
+
+    let services_map = match services.as_object() {
+        Some(m) => m,
+        None => return Err(Error::Config("services must be a mapping of service_name: provider_module".into())),
+    };
+
+    for (service_name, provider_val) in services_map {
+        let provider = provider_val.as_str().ok_or_else(|| {
+            Error::Config(format!("services.{}: provider must be a string", service_name))
+        })?;
+
+        // Check provider module exists in config
+        // Module names come from either name or type field — check by type too
+        let provider_found = module_names.iter().any(|n| n == provider);
+        if !provider_found {
+            return Err(Error::Config(format!(
+                "services.{}: provider module '{}' not found in config modules",
+                service_name, provider,
+            )));
+        }
+
+        // Check provider's manifest declares this service
+        if let Some(manifest) = manifests.get(provider) {
+            if !manifest.provides.iter().any(|p| p == service_name) {
+                return Err(Error::Config(format!(
+                    "services.{}: module '{}' does not declare 'provides = [\"{}\"]' in its manifest",
+                    service_name, provider, service_name,
+                )));
+            }
+        }
+        // If no manifest found, skip the provides check (backward compat)
     }
 
     Ok(())

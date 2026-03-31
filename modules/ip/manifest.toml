@@ -1,5 +1,6 @@
 version = "1.0.0"
-hardware_targets = ["rp2350"]
+hardware_targets = ["rp2350", "bcm2712"]
+provides = ["socket"]
 
 [[ports]]
 name = "frames_rx"

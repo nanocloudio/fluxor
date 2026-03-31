@@ -1,11 +1,11 @@
-/* Generic linker script for stateless PIC modules */
-/* Code runs from flash (XIP), state is passed via pointer from kernel */
+/* Generic linker script for stateless PIC modules (all architectures) */
+/* Code runs from flash (XIP on RP) or embedded blob (aarch64). */
+/* State is passed via pointer from kernel — no RAM section needed. */
 ENTRY(module_init)
 
 MEMORY
 {
     FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 256K
-    /* No RAM section - modules are stateless, state passed via pointer */
 }
 
 SECTIONS
@@ -21,44 +21,38 @@ SECTIONS
         KEEP(*(.text.module_mailbox_safe*))
         KEEP(*(.text.module_deferred_ready*))
         *(.text*)
-        . = ALIGN(4);
+        . = ALIGN(8);
     } > FLASH
 
     .rodata : {
         *(.rodata*)
-        . = ALIGN(4);
+        . = ALIGN(8);
         _code_end = .;
     } > FLASH
 
-    /* .data in FLASH (read-only constants) - separate section for packer compatibility */
     .data : {
         *(.data*)
-        . = ALIGN(4);
+        . = ALIGN(8);
     } > FLASH
 
-    /* Parameter schema — embedded metadata for config tool.
-       Must be AFTER .data so it doesn't create a VMA gap between
-       .text/.rodata and .data (the packer strips .param_schema from
-       the code+data layout). */
     .param_schema : {
         KEEP(*(.param_schema*))
-        . = ALIGN(4);
+        . = ALIGN(8);
     } > FLASH
 
-    /* Discard .bss - modules must not use static mut variables */
     /DISCARD/ : {
         *(.bss*)
         *(COMMON)
         *(.ARM.exidx*)
         *(.ARM.extab*)
+        *(.ARM.attributes)
+        *(.eh_frame*)
         *(.comment)
         *(.note*)
         *(.debug*)
-        *(.ARM.attributes)
     }
 }
 
 PROVIDE(_code_size = _code_end - _code_start);
-/* No data or bss in stateless modules */
 PROVIDE(_data_size = 0);
 PROVIDE(_bss_size = 0);

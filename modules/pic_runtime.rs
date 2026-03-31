@@ -124,6 +124,42 @@ static _KEEP_MEMMOVE: [unsafe extern "C" fn(*mut u8, *const u8, usize); 3] = [
 ];
 
 // ============================================================================
+// Standard C memory functions (required on aarch64 — no __aeabi_* there)
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, n: usize) -> *mut u8 {
+    __aeabi_memset(dest, n, val);
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    __aeabi_memcpy(dest, src, n);
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    __aeabi_memmove(dest, src, n);
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    let mut i = 0;
+    while i < n {
+        let va = core::ptr::read_volatile(a.add(i));
+        let vb = core::ptr::read_volatile(b.add(i));
+        if va != vb {
+            return (va as i32) - (vb as i32);
+        }
+        i += 1;
+    }
+    0
+}
+
+// ============================================================================
 // Integer Division (ARM EABI — required on Cortex-M0+ / RP2040)
 // ============================================================================
 //

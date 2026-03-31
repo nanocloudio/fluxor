@@ -113,8 +113,25 @@ fn generate_chip_rs(k: &KernelConfig, is_rp2040: bool) -> String {
 fn main() {
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let is_rp2040 = env::var("CARGO_FEATURE_CHIP_RP2040").is_ok();
+    let is_bcm2712 = env::var("CARGO_FEATURE_CHIP_BCM2712").is_ok();
 
-    // --- Linker script ---
+    if is_bcm2712 {
+        // --- BCM2712 (aarch64 bare-metal) ---
+        // Custom linker script — no embassy, no cortex-m-rt.
+        let linker_script = include_bytes!("memory-bcm2712.x") as &[u8];
+        File::create(out.join("memory-bcm2712.x"))
+            .unwrap()
+            .write_all(linker_script)
+            .unwrap();
+        println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
+        println!("cargo:rerun-if-changed=memory-bcm2712.x");
+        println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
+        println!("cargo:rerun-if-changed=target/bcm2712/modules.bin");
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
+
+    // --- RP family (Cortex-M) ---
     let linker_script = if is_rp2040 {
         include_bytes!("memory-rp2040.x") as &[u8]
     } else {

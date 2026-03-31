@@ -16,11 +16,21 @@ ifeq ($(TARGET_ID),rp2040)
   RUST_TARGET := thumbv6m-none-eabi
   CARGO_FEATURES := chip-rp2040
   MODULE_TARGET := thumbv6m-none-eabi
+  MODULE_LD := modules/module.ld
+  MODULE_LINKER := arm-none-eabi-ld
+else ifeq ($(TARGET_ID),bcm2712)
+  RUST_TARGET := aarch64-unknown-none
+  CARGO_FEATURES := chip-bcm2712
+  MODULE_TARGET := aarch64-unknown-none
+  MODULE_LD := modules/module.ld
+  MODULE_LINKER := rust-lld -flavor gnu
 else
   # rp2350, rp2350a, rp2350b: all use the same binary (runtime detection handles A/B)
   RUST_TARGET := thumbv8m.main-none-eabihf
   CARGO_FEATURES := chip-rp2350b
   MODULE_TARGET := thumbv8m.main-none-eabihf
+  MODULE_LD := modules/module.ld
+  MODULE_LINKER := arm-none-eabi-ld
 endif
 
 RELEASE_DIR := target/$(RUST_TARGET)/release
@@ -45,7 +55,7 @@ ABI_HEADER := src/abi.rs
 # Source/Transformer: channels + buffers + timers only
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm,$(1)),5,$(if $(filter i2s,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_source,$(1)),1,2)))))))))))))
 
-.PHONY: all build firmware firmware-all tools modules package examples clean targets
+.PHONY: all build firmware firmware-all tools modules package examples clean targets vm vm-run
 
 all: build
 
@@ -55,11 +65,41 @@ firmware:
 	@echo "Building firmware for $(TARGET_ID) ($(RUST_TARGET))..."
 	cargo build --release --target $(RUST_TARGET) --no-default-features --features $(CARGO_FEATURES)
 	@mkdir -p target/$(TARGET_ID)
+ifeq ($(TARGET_ID),bcm2712)
+	@rust-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
+else
 	@arm-none-eabi-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
+endif
 
 firmware-all:
 	$(MAKE) firmware TARGET_ID=rp2350
 	$(MAKE) firmware TARGET_ID=rp2040
+	$(MAKE) firmware TARGET_ID=bcm2712
+
+# --- QEMU VM targets (BCM2712/aarch64) ---
+
+VM_CONFIG ?= examples/qemu-virt/hello_server.yaml
+VM_MODULES := virtio_net ip http_server debug
+
+vm: tools ## Build BCM2712 kernel image for QEMU
+	@$(MAKE) modules TARGET_ID=bcm2712 --no-print-directory
+	@mkdir -p target/bcm2712/vm_modules
+	@for mod in $(VM_MODULES); do \
+		cp -u target/bcm2712/modules/$$mod.fmod target/bcm2712/vm_modules/ 2>/dev/null || true; \
+	done
+	@$(FLUXOR_TOOL) mktable target/bcm2712/vm_modules -o target/bcm2712/modules.bin
+	@$(FLUXOR_TOOL) generate $(VM_CONFIG) -o target/bcm2712/config.bin --binary
+	@$(MAKE) firmware TARGET_ID=bcm2712 --no-print-directory
+	@mkdir -p vm
+	@cp target/bcm2712/firmware.bin vm/kernel8.img
+	@echo "vm/kernel8.img ready ($(shell stat -c%s vm/kernel8.img 2>/dev/null || echo 0) bytes)"
+
+vm-run: vm ## Build and run in QEMU with virtio-net
+	qemu-system-aarch64 \
+		-machine virt -cpu cortex-a76 -m 2G -nographic \
+		-device virtio-net-device,netdev=net0,mac=52:54:00:12:34:56 \
+		-netdev user,id=net0,hostfwd=tcp::18080-:80 \
+		-kernel vm/kernel8.img
 
 tools:
 	@echo "Building tools..."
@@ -83,7 +123,7 @@ modules: tools
 		out="$(MODULES_OUT)/$$mod.fmod"; \
 		if [ "$$src" -nt "$$out" ] 2>/dev/null || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/param_macro.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/module.ld" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
 			rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
-			arm-none-eabi-ld -T $(MODULES_DIR)/module.ld --gc-sections --no-undefined -o "$$elf" "$$obj" || exit 1; \
+			$(MODULE_LINKER) -T $(MODULE_LD) --gc-sections --no-undefined -o "$$elf" "$$obj" || exit 1; \
 			mtype=$$(echo "$(foreach m,$(PIC_NAMES),$(m)=$(call mod_type,$(m)))" | tr ' ' '\n' | grep "^$$mod=" | cut -d= -f2); \
 			[ -z "$$mtype" ] && mtype=2; \
 			$(FLUXOR_TOOL) pack "$$elf" -o "$$out" -n "$$mod" -t "$$mtype" || exit 1; \
@@ -97,10 +137,10 @@ modules: tools
 		elf="$(MODULES_OUT)/$$mod.elf"; \
 		out="$(MODULES_OUT)/$$mod.fmod"; \
 		newest=$$(find "$(MODULES_DIR)/$$mod" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
-		if [ -f "$(MODULES_DIR)/$$mod/module.ld" ]; then ld_script="$(MODULES_DIR)/$$mod/module.ld"; else ld_script="$(MODULES_DIR)/module.ld"; fi; \
+		if [ -f "$(MODULES_DIR)/$$mod/module.ld" ]; then ld_script="$(MODULES_DIR)/$$mod/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
 		if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/param_macro.rs" -nt "$$out" ] 2>/dev/null || [ "$$ld_script" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
 			rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
-			arm-none-eabi-ld -T "$$ld_script" --gc-sections --no-undefined -o "$$elf" "$$obj" || exit 1; \
+			$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined -o "$$elf" "$$obj" || exit 1; \
 			mtype=$$(echo "$(foreach m,$(PIC_DIR_NAMES),$(m)=$(call mod_type,$(m)))" | tr ' ' '\n' | grep "^$$mod=" | cut -d= -f2); \
 			[ -z "$$mtype" ] && mtype=2; \
 			manifest_arg=""; \

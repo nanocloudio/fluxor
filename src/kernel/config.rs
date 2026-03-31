@@ -535,8 +535,13 @@ pub fn read_config_at(config_addr: u32) -> Option<Config> {
 /// Returns true if config was read successfully, false otherwise.
 /// This avoids allocating a large Config struct on the stack.
 pub fn read_config_at_into(config_addr: u32, config: &mut Config) -> bool {
-    // Safety: We're reading from a flash address that's mapped into memory
-    let flash_ptr = config_addr as *const u8;
+    read_config_from_ptr(config_addr as *const u8, config)
+}
+
+/// Read config from a memory pointer directly into provided destination.
+///
+/// Works with any memory-mapped config blob (flash on RP, embedded blob on aarch64).
+pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
 
     // Read header (16 bytes)
     let header = unsafe {
@@ -1022,7 +1027,10 @@ impl Hardware {
 
     /// Initialize all GPIO pins from config
     pub fn init_gpio(&self) -> usize {
-        crate::io::gpio::init_all_from_config(&self.config.gpio)
+        #[cfg(feature = "rp")]
+        { crate::io::gpio::init_all_from_config(&self.config.gpio) }
+        #[cfg(not(feature = "rp"))]
+        { 0 }
     }
 }
 

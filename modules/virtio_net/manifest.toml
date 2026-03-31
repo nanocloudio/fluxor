@@ -1,0 +1,13 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "frames_tx"
+direction = "input"
+content_type = "EthernetFrame"
+
+[[ports]]
+name = "frames_rx"
+direction = "output"
+content_type = "EthernetFrame"
+required = true
