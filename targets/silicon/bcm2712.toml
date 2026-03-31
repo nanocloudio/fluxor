@@ -29,6 +29,10 @@ pio_count = 0
 pio_state_machines = 0
 dma_channels = 16
 
+[kernel]
+state_arena_kb = 256
+buffer_arena_kb = 32
+
 [memory]
 # QEMU virt: RAM at 0x4000_0000, 2 GB
 ram_base = "0x40000000"

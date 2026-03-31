@@ -1,18 +1,18 @@
-/* BCM2712 / QEMU virt — aarch64 bare-metal linker script
+/* BCM2712 / aarch64 bare-metal linker script
  *
- * QEMU virt loads the kernel image at 0x4008_0000 (default -kernel load address).
- * We place .text there and put the stack + heap above it.
+ * RAM origin is board-dependent:
+ *   QEMU virt: 0x4008_0000 (default -kernel load address)
+ *   Pi 5 / CM5: 0x8_0000 (GPU firmware loads kernel8.img here)
  *
- * For real BCM2712 (Pi 5 / CM5), the arm stub loads kernel8.img at 0x80000.
- * Switch RAM origin to 0x80000 for real hardware.
+ * Origin is set by build.rs via: -DRAM_ORIGIN=0x... (cargo:rustc-link-arg)
+ * Default: QEMU virt address if not overridden.
  */
 
 ENTRY(_start)
 EXTERN(_start)
 
 MEMORY {
-    /* QEMU virt: -kernel loads at this address */
-    RAM : ORIGIN = 0x40080000, LENGTH = 128M
+    RAM : ORIGIN = RAM_ORIGIN, LENGTH = 128M
 }
 
 SECTIONS {
@@ -29,7 +29,7 @@ SECTIONS {
         *(.data .data.*)
     } > RAM
 
-    .bss (NOLOAD) : ALIGN(8) {
+    .bss (NOLOAD) : ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)

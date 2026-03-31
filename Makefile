@@ -18,6 +18,12 @@ ifeq ($(TARGET_ID),rp2040)
   MODULE_TARGET := thumbv6m-none-eabi
   MODULE_LD := modules/module.ld
   MODULE_LINKER := arm-none-eabi-ld
+else ifeq ($(TARGET_ID),cm5)
+  RUST_TARGET := aarch64-unknown-none
+  CARGO_FEATURES := board-cm5
+  MODULE_TARGET := aarch64-unknown-none
+  MODULE_LD := modules/module.ld
+  MODULE_LINKER := rust-lld -flavor gnu
 else ifeq ($(TARGET_ID),bcm2712)
   RUST_TARGET := aarch64-unknown-none
   CARGO_FEATURES := chip-bcm2712
@@ -55,7 +61,7 @@ ABI_HEADER := src/abi.rs
 # Source/Transformer: channels + buffers + timers only
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm,$(1)),5,$(if $(filter i2s,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_source,$(1)),1,2)))))))))))))
 
-.PHONY: all build firmware firmware-all tools modules package examples clean targets vm vm-run
+.PHONY: all build firmware firmware-all tools modules package examples clean targets vm vm-run cm5
 
 all: build
 
@@ -67,6 +73,8 @@ firmware:
 	@mkdir -p target/$(TARGET_ID)
 ifeq ($(TARGET_ID),bcm2712)
 	@rust-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
+else ifeq ($(TARGET_ID),cm5)
+	@rust-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
 else
 	@arm-none-eabi-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
 endif
@@ -75,6 +83,7 @@ firmware-all:
 	$(MAKE) firmware TARGET_ID=rp2350
 	$(MAKE) firmware TARGET_ID=rp2040
 	$(MAKE) firmware TARGET_ID=bcm2712
+	$(MAKE) firmware TARGET_ID=cm5
 
 # --- QEMU VM targets (BCM2712/aarch64) ---
 
@@ -100,6 +109,25 @@ vm-run: vm ## Build and run in QEMU with virtio-net
 		-device virtio-net-device,netdev=net0,mac=52:54:00:12:34:56 \
 		-netdev user,id=net0,hostfwd=tcp::18080-:80 \
 		-kernel vm/kernel8.img
+
+# --- CM5 bare-metal targets (Pi 5 / CM5 real hardware) ---
+
+CM5_CONFIG ?= examples/cm5/hello_uart.yaml
+CM5_MODULES ?= debug
+
+cm5: tools ## Build kernel8.img for real Pi 5 / CM5 hardware
+	@$(MAKE) modules TARGET_ID=cm5 --no-print-directory
+	@mkdir -p target/cm5/cm5_modules
+	@for mod in $(CM5_MODULES); do \
+		cp -u target/cm5/modules/$$mod.fmod target/cm5/cm5_modules/ 2>/dev/null || true; \
+	done
+	@$(FLUXOR_TOOL) mktable target/cm5/cm5_modules -o target/bcm2712/modules.bin
+	@$(FLUXOR_TOOL) generate $(CM5_CONFIG) -o target/bcm2712/config.bin --binary
+	@$(MAKE) firmware TARGET_ID=cm5 --no-print-directory
+	@mkdir -p target/cm5/boot
+	@cp target/cm5/firmware.bin target/cm5/boot/kernel8.img
+	@echo "target/cm5/boot/kernel8.img ready ($$(stat -c%s target/cm5/boot/kernel8.img 2>/dev/null || echo 0) bytes)"
+	@echo "Copy to SD card with: cp target/cm5/boot/kernel8.img /boot/firmware/"
 
 tools:
 	@echo "Building tools..."

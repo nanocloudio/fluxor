@@ -117,13 +117,15 @@ fn main() {
 
     if is_bcm2712 {
         // --- BCM2712 (aarch64 bare-metal) ---
-        // Custom linker script — no embassy, no cortex-m-rt.
-        let linker_script = include_bytes!("memory-bcm2712.x") as &[u8];
+        // Single linker script with board-dependent RAM origin via --defsym.
+        let is_cm5 = env::var("CARGO_FEATURE_BOARD_CM5").is_ok();
+        let ram_origin = if is_cm5 { "0x80000" } else { "0x40080000" };
         File::create(out.join("memory-bcm2712.x"))
             .unwrap()
-            .write_all(linker_script)
+            .write_all(include_bytes!("memory-bcm2712.x"))
             .unwrap();
         println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
+        println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={}", ram_origin);
         println!("cargo:rerun-if-changed=memory-bcm2712.x");
         println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
         println!("cargo:rerun-if-changed=target/bcm2712/modules.bin");

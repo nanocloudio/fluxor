@@ -78,6 +78,11 @@ chip-rp2040 = ["rp", "embassy-rp/rp2040"]
 # Minimal — no embassy, no cortex-m. Bare-metal from scratch.
 chip-bcm2712 = ["portable-atomic", "sha2"]
 
+# Board-level selection for BCM2712 targets.
+# board-cm5: Real Raspberry Pi 5 / CM5 hardware (kernel loaded at 0x80000).
+# Without board-cm5: QEMU virt machine (kernel loaded at 0x40080000).
+board-cm5 = ["chip-bcm2712"]
+
 [build-dependencies]
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }

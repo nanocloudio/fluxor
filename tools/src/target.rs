@@ -22,6 +22,12 @@ struct TomlSiliconFile {
     gpio: TomlGpioConfig,
     peripherals: TomlPeripherals,
     memory: Option<TomlMemoryConfig>,
+    kernel: Option<TomlKernelConfig>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlKernelConfig {
+    state_arena_kb: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +150,8 @@ pub struct TargetDescriptor {
     pub memory: Option<MemoryConfig>,
     /// Board-level hardware defaults (merged when YAML omits a section)
     pub hardware_defaults: Option<serde_json::Value>,
+    /// State arena size in KB (from [kernel] section, default 256)
+    pub state_arena_kb: u32,
 }
 
 /// Build configuration for targets that support kernel compilation.
@@ -348,6 +356,9 @@ fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
         i2c_pins: build_i2c_tables(p),
         memory,
         hardware_defaults: None,
+        state_arena_kb: silicon.kernel.as_ref()
+            .and_then(|k| k.state_arena_kb)
+            .unwrap_or(256),
     })
 }
 

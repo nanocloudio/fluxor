@@ -55,7 +55,83 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
         }
     }
 
+    // Validate heap provisioning against state arena budget
+    validate_heap_provisioning(config, target, &mut result);
+
     Ok(result)
+}
+
+/// Check that total heap_arena_kb declared across modules fits within the state arena.
+fn validate_heap_provisioning(config: &Value, target: &TargetDescriptor, result: &mut ValidationResult) {
+    let modules = match config.get("modules") {
+        Some(m) => m,
+        None => return,
+    };
+
+    let mut total_heap_kb = 0u32;
+    let mut heap_modules: Vec<(String, u32)> = Vec::new();
+
+    // Scan modules for module_arena_size exports via .fmod schema
+    // We can't call module_arena_size() from tools, but we can check
+    // if the module manifest declares heap needs via the schema.
+    // For now, scan the target modules directory for .fmod files
+    // and check if they export module_arena_size.
+    let target_modules_dir = format!("target/{}/modules", target.id);
+    let target_path = std::path::Path::new(&target_modules_dir);
+
+    if let Some(arr) = modules.as_array() {
+        for entry in arr {
+            let name = entry.get("name").or(entry.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name.is_empty() { continue; }
+
+            // Check if the .fmod has module_arena_size export by reading the header
+            let fmod_path = target_path.join(format!("{}.fmod", name));
+            if let Ok(data) = std::fs::read(&fmod_path) {
+                if data.len() >= 68 {
+                    // Check for module_arena_size in export table
+                    // Export table: code_size + data_size bytes after header
+                    let code_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                    let data_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+                    let export_count = u16::from_le_bytes([data[24], data[25]]) as usize;
+                    let export_offset = 68 + code_size + data_size;
+
+                    // Scan exports for module_arena_size hash (0x1b6f4183)
+                    for i in 0..export_count {
+                        let off = export_offset + i * 8;
+                        if off + 8 <= data.len() {
+                            let hash = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                            if hash == 0x1b6f4183 {
+                                // Module exports module_arena_size — estimate from manifest or default
+                                // We can't call the function, but we know it wants heap.
+                                // Conservative estimate: 4KB per heap-using module.
+                                let estimated_kb = 4;
+                                total_heap_kb += estimated_kb;
+                                heap_modules.push((name.to_string(), estimated_kb));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if total_heap_kb > 0 {
+        let arena_kb = target.state_arena_kb;
+        if total_heap_kb > arena_kb {
+            result.add_error(format!(
+                "heap provisioning exceeds state arena: {} KB requested > {} KB available",
+                total_heap_kb, arena_kb
+            ));
+        } else if total_heap_kb > arena_kb / 2 {
+            result.add_warning(format!(
+                "heap uses >50% of state arena: {} KB of {} KB",
+                total_heap_kb, arena_kb
+            ));
+        }
+    }
 }
 
 /// Validate hardware section

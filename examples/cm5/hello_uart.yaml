@@ -1,0 +1,18 @@
+# Hello UART (Pi 5 / CM5 bare-metal)
+#
+# Minimal config for bare-metal Pi 5 boot validation.
+# Boots kernel, prints to UART, runs debug module.
+#
+# Build:
+#   make cm5
+# Deploy:
+#   cp target/cm5/boot/kernel8.img /boot/firmware/
+# Console:
+#   minicom -b 115200 -D /dev/ttyS0
+target: cm5
+
+modules:
+  - name: debug
+    mode: plaintext
+
+wiring: []
