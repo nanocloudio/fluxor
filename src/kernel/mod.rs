@@ -19,3 +19,5 @@ pub mod planner;
 #[cfg(feature = "rp")]
 pub mod flash_store;
 pub mod chip;
+pub mod guard;
+pub mod heap;

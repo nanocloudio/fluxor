@@ -88,6 +88,22 @@ pub struct SyscallTable {
     ///
     /// Returns: bytes written to out on success, or ENOSYS (-38) if not supported
     pub dev_query: unsafe extern "C" fn(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32,
+
+    // ---- Heap syscalls (added in ABI v2) ----
+
+    /// Allocate memory from this module's heap arena.
+    /// Returns pointer to allocated memory, or null on failure.
+    /// Size is rounded up to 16-byte alignment internally.
+    pub heap_alloc: unsafe extern "C" fn(size: u32) -> *mut u8,
+
+    /// Free memory previously allocated by heap_alloc.
+    /// Passing null is a no-op. Passing an invalid pointer is detected
+    /// and logged by the kernel.
+    pub heap_free: unsafe extern "C" fn(ptr: *mut u8),
+
+    /// Reallocate memory. Returns new pointer or null on failure.
+    /// If null is returned, the original allocation is unchanged.
+    pub heap_realloc: unsafe extern "C" fn(ptr: *mut u8, new_size: u32) -> *mut u8,
 }
 
 // ============================================================================
@@ -741,68 +757,28 @@ pub mod dev_system {
 
     // --- Raw SPI peripheral bridge (0x0CA0-0x0CA5) ---
     // Thin MMIO access to SPI peripheral registers for PIC driver modules.
-
-    /// Write SPI peripheral register.
-    /// handle=bus_id (0/1), arg=[reg_offset:u8, value:u32 LE] (5 bytes).
     pub const SPI_REG_WRITE: u32 = 0x0CA0;
-    /// Read SPI peripheral register.
-    /// handle=bus_id (0/1), arg=[reg_offset:u8] (1 byte). Value written to arg[1..5].
     pub const SPI_REG_READ: u32 = 0x0CA1;
-    /// Get SPI bus hardware info (data register address, DREQ numbers).
-    /// handle=bus_id (0/1), arg=output buffer (12 bytes min).
-    /// Returns: [dr_addr:u32 LE, tx_dreq:u8, rx_dreq:u8, max_freq:u32 LE, pad0:u16]
     pub const SPI_BUS_INFO: u32 = 0x0CA2;
-    /// Initialize SPI pins (claim + set funcsel to SPI).
-    /// handle=bus_id (0/1), arg=[clk_pin:u8, mosi_pin:u8, miso_pin:u8] (3 bytes).
-    /// Pins with value 0xFF are skipped.
     pub const SPI_PIN_INIT: u32 = 0x0CA3;
-    /// Set SPI enabled/disabled (SSPCR1.SSE).
-    /// handle=bus_id (0/1), arg=[enable:u8] (1 byte).
     pub const SPI_SET_ENABLE: u32 = 0x0CA4;
 
     // --- Raw I2C peripheral bridge (0x0CB0-0x0CB4) ---
-
-    /// Write I2C peripheral register.
-    /// handle=bus_id (0/1), arg=[reg_offset:u8, value:u32 LE] (5 bytes).
     pub const I2C_REG_WRITE: u32 = 0x0CB0;
-    /// Read I2C peripheral register.
-    /// handle=bus_id (0/1), arg=[reg_offset:u8] (1 byte). Value written to arg[1..5].
     pub const I2C_REG_READ: u32 = 0x0CB1;
-    /// Get I2C bus hardware info.
-    /// handle=bus_id, arg=output (8 bytes): [data_cmd_addr:u32 LE, tx_dreq:u8, rx_dreq:u8, pad:u16]
     pub const I2C_BUS_INFO: u32 = 0x0CB2;
-    /// Initialize I2C pins (claim + set funcsel).
-    /// handle=bus_id, arg=[sda_pin:u8, scl_pin:u8] (2 bytes).
     pub const I2C_PIN_INIT: u32 = 0x0CB3;
-    /// Set I2C enabled/disabled (IC_ENABLE).
-    /// handle=bus_id, arg=[enable:u8] (1 byte).
     pub const I2C_SET_ENABLE: u32 = 0x0CB4;
 
     // --- Raw UART peripheral bridge (0x0CC0-0x0CC4) ---
-
-    /// Write UART peripheral register.
-    /// handle=bus_id (0/1), arg=[reg_offset:u8, value:u32 LE] (5 bytes).
     pub const UART_REG_WRITE: u32 = 0x0CC0;
-    /// Read UART peripheral register.
-    /// handle=bus_id (0/1), arg=[reg_offset:u8] (1 byte). Value written to arg[1..5].
     pub const UART_REG_READ: u32 = 0x0CC1;
-    /// Initialize UART pins (claim + set funcsel).
-    /// handle=bus_id, arg=[tx_pin:u8, rx_pin:u8] (2 bytes). 0xFF = skip.
     pub const UART_PIN_INIT: u32 = 0x0CC2;
-    /// Set UART enabled/disabled (UARTCR.UARTEN).
-    /// handle=bus_id, arg=[enable:u8] (1 byte).
     pub const UART_SET_ENABLE: u32 = 0x0CC3;
 
     // --- Raw ADC peripheral bridge (0x0CD0-0x0CD3) ---
-
-    /// Write ADC peripheral register.
-    /// handle=-1, arg=[reg_offset:u8, value:u32 LE] (5 bytes).
     pub const ADC_REG_WRITE: u32 = 0x0CD0;
-    /// Read ADC peripheral register.
-    /// handle=-1, arg=[reg_offset:u8] (1 byte). Value written to arg[1..5].
     pub const ADC_REG_READ: u32 = 0x0CD1;
-    /// Initialize ADC pin (claim + set to ADC function).
-    /// handle=-1, arg=[pin:u8] (1 byte). Pin 26-29 only.
     pub const ADC_PIN_INIT: u32 = 0x0CD2;
 
     // --- Runtime parameter store (0x0C34-0x0C36) ---
@@ -913,6 +889,9 @@ pub mod dev_query_key {
     pub const STATE: u32 = 4;
     /// Error count since last reset (returns u32)
     pub const ERROR_COUNT: u32 = 5;
+    /// Heap statistics (returns HeapStats struct, 16 bytes).
+    /// handle=-1 queries the calling module's heap.
+    pub const HEAP_STATS: u32 = 6;
 }
 
 // ============================================================================

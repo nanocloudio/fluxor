@@ -7,11 +7,15 @@
 //! `fd_poll` provides non-destructive (peek) readiness checks across all handle types.
 //! Modules use `fd_poll` for readiness, then the per-type API for consumption.
 
-use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering, compiler_fence};
+use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+#[cfg(feature = "rp")]
+use portable_atomic::compiler_fence;
 #[cfg(feature = "rp")]
 use embassy_time::Instant;
 
-use crate::kernel::channel::{self, POLL_IN, POLL_OUT};
+use crate::kernel::channel::{self, POLL_IN};
+#[cfg(feature = "rp")]
+use crate::kernel::channel::POLL_OUT;
 use crate::kernel::errno;
 use crate::kernel::event;
 use crate::kernel::socket::SocketService;

@@ -357,6 +357,7 @@ impl ParamBuffer {
         self.data.as_ptr()
     }
 
+    #[cfg(feature = "rp")]
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_mut_ptr()
     }
@@ -365,6 +366,7 @@ impl ParamBuffer {
         self.len
     }
 
+    #[cfg(feature = "rp")]
     fn set_len(&mut self, len: usize) {
         self.len = len;
     }
@@ -991,9 +993,10 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
 
     let sched = unsafe { &mut *(&raw mut SCHED) };
 
-    // Reset all scheduler state, state arena, and name arena
+    // Reset all scheduler state, state arena, heaps, and name arena
     reset_state_arena();
     crate::kernel::buffer_pool::reset_buffer_arena();
+    crate::kernel::heap::reset_all();
     NameArena::reset();
     sched.reset();
 
@@ -1558,11 +1561,13 @@ fn instantiate_one_module(
         }
     }
 
-    // Check for optional module_arena_size export and allocate if present
+    // Check for optional module_arena_size export and allocate if present.
+    // If an arena is allocated, initialize a per-module heap allocator on it.
     unsafe {
         let sched = &mut *(&raw mut SCHED);
         let arenas = &mut sched.arenas;
         arenas[instantiated] = ArenaInfo::empty();
+        crate::kernel::heap::reset_module_heap(instantiated);
         if let Ok(addr) = found_module.get_export_addr(
             crate::kernel::loader::export_hashes::MODULE_ARENA_SIZE,
         ) {
@@ -1573,6 +1578,8 @@ fn instantiate_one_module(
                 match crate::kernel::loader::alloc_state(requested) {
                     Ok(ptr) => {
                         arenas[instantiated] = ArenaInfo { ptr, size: requested as u32 };
+                        // Initialize per-module heap allocator on the arena
+                        crate::kernel::heap::init_module_heap(instantiated, ptr, requested);
                     }
                     Err(e) => {
                         e.log("arena");

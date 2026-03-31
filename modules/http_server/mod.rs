@@ -62,7 +62,7 @@ const RECV_BUF_SIZE: usize = 256;
 const SEND_BUF_SIZE: usize = 512;
 const MAX_ROUTES: usize = 4;
 const MAX_PATH: usize = 32;
-const BODY_POOL_SIZE: usize = 3072;
+const DEFAULT_BODY_POOL_SIZE: usize = 3072;
 const MAX_VARS: usize = 16;
 const MAX_VAR_VALUE: usize = 16;
 
@@ -219,7 +219,12 @@ struct HttpServerState {
     cache_entries: [CacheEntry; MAX_CACHE],
     recv_buf: [u8; RECV_BUF_SIZE],
     send_buf: [u8; SEND_BUF_SIZE],
-    body_pool: [u8; BODY_POOL_SIZE],
+    /// Body pool: heap-allocated via module_arena_size + heap_alloc.
+    /// Falls back to null (no body content) if heap unavailable.
+    body_pool: *mut u8,
+    /// Capacity of the heap-allocated body pool.
+    body_pool_cap: u16,
+    _state_pad: [u8; 2],
 }
 
 impl HttpServerState {
@@ -322,13 +327,15 @@ unsafe fn parse_route_path(s: &mut HttpServerState, idx: usize, d: *const u8, le
 
 unsafe fn parse_route_body(s: &mut HttpServerState, idx: usize, d: *const u8, len: usize) {
     if idx >= MAX_ROUTES || len == 0 { return; }
+    if s.body_pool.is_null() { return; }
     let offset = s.body_pool_used as usize;
-    let remaining = BODY_POOL_SIZE - offset;
+    let cap = s.body_pool_cap as usize;
+    let remaining = cap - offset;
     if remaining == 0 { return; }
     let n = len.min(remaining);
     let mut i = 0;
     while i < n {
-        *s.body_pool.as_mut_ptr().add(offset + i) = *d.add(i);
+        *s.body_pool.add(offset + i) = *d.add(i);
         i += 1;
     }
     let route = &mut *s.routes.as_mut_ptr().add(idx);
@@ -606,7 +613,7 @@ unsafe fn render_template_chunk(s: &mut HttpServerState) -> bool {
     let route = &*s.routes.as_ptr().add(s.matched_route as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
-    let pool = s.body_pool.as_ptr();
+    let pool = s.body_pool as *const u8;
     let buf = s.send_buf.as_mut_ptr();
     let mut out = 0usize;
     let mut pos = body_start + s.tmpl_pos as usize;
@@ -701,6 +708,14 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<HttpServerState>() as u32
 }
 
+/// Declare heap arena size. The body pool is allocated from this arena.
+#[no_mangle]
+#[link_section = ".text.module_arena_size"]
+pub extern "C" fn module_arena_size() -> u32 {
+    // Request enough for body pool + some headroom for future allocations
+    (DEFAULT_BODY_POOL_SIZE + 64) as u32
+}
+
 #[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
@@ -748,6 +763,17 @@ pub extern "C" fn module_new(
         s.legacy_mode = 0;
         s.cache_count = 0;
         s.cache_tick = 0;
+
+        // Allocate body pool from heap
+        let pool = heap_alloc(&*sys, DEFAULT_BODY_POOL_SIZE as u32);
+        if pool.is_null() {
+            // Heap unavailable — module will have no body content capability
+            s.body_pool = core::ptr::null_mut();
+            s.body_pool_cap = 0;
+        } else {
+            s.body_pool = pool;
+            s.body_pool_cap = DEFAULT_BODY_POOL_SIZE as u16;
+        }
 
         // Parse TLV params
         let is_tlv_v2 = !params.is_null() && params_len >= 4
@@ -1146,12 +1172,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let ce = &mut *s.cache_entries.as_mut_ptr().add(ce_idx);
                 let arena_off = ce.arena_offset as usize;
                 let cur_len = ce.length as usize;
-                let pool_cap = BODY_POOL_SIZE;
+                let pool_cap = s.body_pool_cap as usize;
 
                 // Read from channel into body_pool cache arena
                 let space = pool_cap - (arena_off + cur_len);
-                if space > 0 {
-                    let dst = s.body_pool.as_mut_ptr().add(arena_off + cur_len);
+                if space > 0 && !s.body_pool.is_null() {
+                    let dst = s.body_pool.add(arena_off + cur_len);
                     let to_read = space.min(SEND_BUF_SIZE);
                     let n = (s.sys().channel_read)(s.file_chan, dst, to_read);
                     if n > 0 {
@@ -1235,7 +1261,7 @@ unsafe fn step_send_static(s: &mut HttpServerState) -> i32 {
 
     let remaining = body_end - pos;
     let to_send = remaining.min(SEND_BUF_SIZE);
-    let ptr = s.body_pool.as_ptr().add(pos);
+    let ptr = (s.body_pool as *const u8).add(pos);
     let sent = dev_socket_send(s.sys(), s.socket_handle, ptr, to_send);
     if sent > 0 {
         s.tmpl_pos += sent as u16;

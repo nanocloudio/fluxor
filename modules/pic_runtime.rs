@@ -974,3 +974,83 @@ pub unsafe fn p_u32(params: *const u8, len: usize, offset: usize, default: u32) 
         default
     }
 }
+
+// ============================================================================
+// Heap Allocation Helpers
+// ============================================================================
+//
+// Wrappers for the kernel-managed per-module heap. Modules that export
+// `module_arena_size() -> u32` with a non-zero return value receive a
+// heap arena. These helpers call through the SyscallTable function pointers.
+//
+// The heap is bounded per-module: allocation failures return null.
+// Modules MUST check for null returns and handle gracefully.
+
+/// Allocate `size` bytes from this module's heap arena.
+///
+/// Returns a pointer to the allocated memory, or null if the heap is
+/// exhausted or if this module has no heap. Size is rounded up to 16-byte
+/// alignment internally by the kernel allocator.
+///
+/// # Safety
+/// Caller must ensure `sys` points to a valid SyscallTable.
+#[allow(dead_code)]
+#[inline(always)]
+pub unsafe fn heap_alloc(sys: &SyscallTable, size: u32) -> *mut u8 {
+    (sys.heap_alloc)(size)
+}
+
+/// Free memory previously allocated by `heap_alloc`.
+///
+/// Passing null is a no-op. Passing a pointer not returned by `heap_alloc`
+/// for this module is detected by the kernel (logged, not crashed).
+///
+/// # Safety
+/// Caller must ensure `sys` points to a valid SyscallTable.
+/// `ptr` must be null or a pointer previously returned by `heap_alloc`.
+#[allow(dead_code)]
+#[inline(always)]
+pub unsafe fn heap_free(sys: &SyscallTable, ptr: *mut u8) {
+    (sys.heap_free)(ptr)
+}
+
+/// Reallocate memory to `new_size` bytes.
+///
+/// Returns a new pointer on success, or null on failure. If null is returned,
+/// the original allocation at `ptr` is unchanged (not freed).
+///
+/// If `ptr` is null, behaves like `heap_alloc(sys, new_size)`.
+/// If `new_size` is 0, behaves like `heap_free(sys, ptr)` and returns null.
+///
+/// # Safety
+/// Caller must ensure `sys` points to a valid SyscallTable.
+/// `ptr` must be null or a pointer previously returned by `heap_alloc`.
+#[allow(dead_code)]
+#[inline(always)]
+pub unsafe fn heap_realloc(sys: &SyscallTable, ptr: *mut u8, new_size: u32) -> *mut u8 {
+    (sys.heap_realloc)(ptr, new_size)
+}
+
+/// Query heap statistics for this module.
+///
+/// Returns a HeapStats struct with current usage, high-water mark, etc.
+/// All fields are zero if this module has no heap.
+///
+/// # Safety
+/// Caller must ensure `sys` points to a valid SyscallTable.
+#[allow(dead_code)]
+#[inline(always)]
+pub unsafe fn heap_stats(sys: &SyscallTable) -> (u32, u32, u16, u16, u32) {
+    // Query via dev_query with HEAP_STATS key (6)
+    let mut buf = [0u8; 16];
+    let r = (sys.dev_query)(-1, 6, buf.as_mut_ptr(), 16);
+    if r < 0 {
+        return (0, 0, 0, 0, 0);
+    }
+    let arena_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let allocated = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let alloc_count = u16::from_le_bytes([buf[8], buf[9]]);
+    let total_allocs = u16::from_le_bytes([buf[10], buf[11]]);
+    let high_water = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    (arena_size, allocated, alloc_count, total_allocs, high_water)
+}

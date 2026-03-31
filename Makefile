@@ -123,7 +123,7 @@ modules: tools
 		out="$(MODULES_OUT)/$$mod.fmod"; \
 		if [ "$$src" -nt "$$out" ] 2>/dev/null || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/param_macro.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/module.ld" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
 			rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
-			$(MODULE_LINKER) -T $(MODULE_LD) --gc-sections --no-undefined -o "$$elf" "$$obj" || exit 1; \
+			$(MODULE_LINKER) -T $(MODULE_LD) --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
 			mtype=$$(echo "$(foreach m,$(PIC_NAMES),$(m)=$(call mod_type,$(m)))" | tr ' ' '\n' | grep "^$$mod=" | cut -d= -f2); \
 			[ -z "$$mtype" ] && mtype=2; \
 			$(FLUXOR_TOOL) pack "$$elf" -o "$$out" -n "$$mod" -t "$$mtype" || exit 1; \
@@ -140,7 +140,7 @@ modules: tools
 		if [ -f "$(MODULES_DIR)/$$mod/module.ld" ]; then ld_script="$(MODULES_DIR)/$$mod/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
 		if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/param_macro.rs" -nt "$$out" ] 2>/dev/null || [ "$$ld_script" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
 			rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
-			$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined -o "$$elf" "$$obj" || exit 1; \
+			$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
 			mtype=$$(echo "$(foreach m,$(PIC_DIR_NAMES),$(m)=$(call mod_type,$(m)))" | tr ' ' '\n' | grep "^$$mod=" | cut -d= -f2); \
 			[ -z "$$mtype" ] && mtype=2; \
 			manifest_arg=""; \
@@ -187,6 +187,7 @@ package: build
 	silicon=$$($(FLUXOR_TOOL) target-info $$board --field id 2>/dev/null); \
 	case "$$silicon" in \
 		rp2040) fw="target/rp2040/firmware.bin"; outdir="target/rp2040/uf2" ;; \
+		bcm2712) echo "Error: use 'make vm' for bcm2712 targets"; exit 1 ;; \
 		*)      fw="target/rp2350/firmware.bin"; outdir="target/rp2350/uf2" ;; \
 	esac; \
 	if [ ! -f "$$fw" ]; then echo "Error: $$fw not built (run: make firmware TARGET_ID=rp2040)"; exit 1; fi; \
@@ -203,6 +204,8 @@ examples: build
 		silicon=$$($(FLUXOR_TOOL) target-info $$board --field id 2>/dev/null); \
 		case "$$silicon" in \
 			rp2040) fw="target/rp2040/firmware.bin"; outdir="target/rp2040/uf2" ;; \
+			rp2350*) fw="target/rp2350/firmware.bin"; outdir="target/rp2350/uf2" ;; \
+			bcm2712) echo "Skip $$subdir/$$name (use 'make vm' for bcm2712)"; skip=$$((skip + 1)); continue ;; \
 			*)      fw="target/rp2350/firmware.bin"; outdir="target/rp2350/uf2" ;; \
 		esac; \
 		if [ ! -f "$$fw" ]; then \

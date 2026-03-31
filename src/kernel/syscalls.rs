@@ -27,6 +27,7 @@
 //! - `E_NOSYS` (-38): Function not implemented
 
 use core::ptr::null_mut;
+#[cfg(feature = "rp")]
 use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering, compiler_fence};
 
 use crate::kernel::channel;
@@ -35,16 +36,21 @@ use crate::kernel::net;
 use crate::kernel::socket;
 #[cfg(feature = "rp")]
 use crate::io::gpio;
-use crate::abi::{DeviceInfo, SpiCaps, SyscallTable, ABI_VERSION};
+use crate::abi::{DeviceInfo, SyscallTable, ABI_VERSION};
+#[cfg(feature = "rp")]
+use crate::abi::SpiCaps;
 
 // ============================================================================
 // Error Codes (Linux errno values)
 // ============================================================================
 
 const E_INVAL: i32 = errno::EINVAL;
-const E_AGAIN: i32 = errno::EAGAIN;
-const E_BUSY: i32 = errno::EBUSY;
 const E_NOSYS: i32 = errno::ENOSYS;
+#[cfg(feature = "rp")]
+const E_AGAIN: i32 = errno::EAGAIN;
+#[cfg(feature = "rp")]
+const E_BUSY: i32 = errno::EBUSY;
+#[cfg(feature = "rp")]
 const E_NOMEM: i32 = errno::ENOMEM;
 
 // ============================================================================
@@ -65,6 +71,9 @@ pub fn init_syscall_table() {
         channel_poll: channel::syscall_channel_poll,
         dev_call: syscall_dev_call,
         dev_query: syscall_dev_query,
+        heap_alloc: syscall_heap_alloc,
+        heap_free: syscall_heap_free,
+        heap_realloc: syscall_heap_realloc,
     });
 }
 
@@ -560,6 +569,7 @@ unsafe fn event_provider_dispatch(handle: i32, opcode: u32, _arg: *mut u8, _arg_
 /// Extension point for platform-specific system opcodes (PWM, PIO, DMA, SPI9, etc.)
 static mut SYSTEM_EXTENSION: Option<unsafe fn(i32, u32, *mut u8, usize) -> i32> = None;
 
+#[cfg(feature = "rp")]
 fn register_system_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
     unsafe { SYSTEM_EXTENSION = Some(f); }
 }
@@ -804,43 +814,35 @@ pub unsafe extern "C" fn syscall_micros() -> u64 { 0 }
 // ============================================================================
 
 /// Bitmap of allocated DMA channels. CH0-CH7 pre-marked at boot.
+#[cfg(feature = "rp")]
 static DMA_CHANNELS_USED: AtomicU16 = AtomicU16::new(0x00FF); // CH0-CH7 reserved
 
+#[cfg(feature = "rp")]
 pub(crate) fn dma_alloc_channel() -> i32 {
-    #[cfg(feature = "rp")]
-    {
-        loop {
-            let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
-            // Find first free bit in CH8-CH15 range
-            let free_mask = !used & 0xFF00; // only look at CH8-CH15
-            if free_mask == 0 {
-                return E_NOMEM;
-            }
-            let ch = free_mask.trailing_zeros() as u16;
-            let bit = 1u16 << ch;
-            if DMA_CHANNELS_USED.compare_exchange(
-                used, used | bit,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Acquire,
-            ).is_ok() {
-                return ch as i32;
-            }
+    loop {
+        let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
+        let free_mask = !used & 0xFF00;
+        if free_mask == 0 {
+            return E_NOMEM;
+        }
+        let ch = free_mask.trailing_zeros() as u16;
+        let bit = 1u16 << ch;
+        if DMA_CHANNELS_USED.compare_exchange(
+            used, used | bit,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ).is_ok() {
+            return ch as i32;
         }
     }
-    #[cfg(not(feature = "rp"))]
-    { E_NOSYS }
 }
 
+#[cfg(feature = "rp")]
 pub(crate) fn dma_free_channel(ch: u8) -> i32 {
-    #[cfg(feature = "rp")]
-    {
-        if ch < 8 || ch > 15 { return E_INVAL; }
-        let bit = 1u16 << ch;
-        DMA_CHANNELS_USED.fetch_and(!bit, core::sync::atomic::Ordering::Release);
-        0
-    }
-    #[cfg(not(feature = "rp"))]
-    { let _ = ch; E_NOSYS }
+    if ch < 8 || ch > 15 { return E_INVAL; }
+    let bit = 1u16 << ch;
+    DMA_CHANNELS_USED.fetch_and(!bit, core::sync::atomic::Ordering::Release);
+    0
 }
 
 #[cfg(feature = "rp")]
@@ -878,10 +880,6 @@ pub(crate) unsafe fn dma_start_raw(ch: u8, read_addr: u32, write_addr: u32, coun
     0
 }
 
-#[cfg(not(feature = "rp"))]
-pub(crate) unsafe fn dma_start_raw(_ch: u8, _read_addr: u32, _write_addr: u32, _count: u32, _dreq: u8, _flags: u8) -> i32 {
-    E_NOSYS
-}
 
 #[cfg(feature = "rp")]
 fn dma_busy(ch: u8) -> i32 {
@@ -890,8 +888,6 @@ fn dma_busy(ch: u8) -> i32 {
     if pac::DMA.ch(ch as usize).ctrl_trig().read().busy() { 1 } else { 0 }
 }
 
-#[cfg(not(feature = "rp"))]
-fn dma_busy(_ch: u8) -> i32 { E_NOSYS }
 
 #[cfg(feature = "rp")]
 pub(crate) fn dma_abort(ch: u8) -> i32 {
@@ -904,8 +900,6 @@ pub(crate) fn dma_abort(ch: u8) -> i32 {
     0
 }
 
-#[cfg(not(feature = "rp"))]
-pub(crate) fn dma_abort(_ch: u8) -> i32 { E_NOSYS }
 
 /// Fast DMA re-trigger via Alias 3 registers.
 /// Writes AL3_TRANS_COUNT (no trigger) then AL3_READ_ADDR_TRIG (triggers start).
@@ -922,13 +916,11 @@ pub(crate) unsafe fn dma_restart_raw(ch: u8, read_addr: u32, count: u32) -> i32 
     0
 }
 
-#[cfg(not(feature = "rp"))]
-pub(crate) unsafe fn dma_restart_raw(_ch: u8, _read_addr: u32, _count: u32) -> i32 { E_NOSYS }
-
 // ============================================================================
 // Device Query
 // ============================================================================
 
+#[cfg(feature = "rp")]
 use crate::abi::StreamTime;
 
 /// Query device information by key.
@@ -989,6 +981,15 @@ unsafe extern "C" fn syscall_dev_query(
                     }
                     _ => E_NOSYS,
                 }
+            }
+            dev_query_key::HEAP_STATS => {
+                // Return heap stats for the calling module
+                let stats_size = core::mem::size_of::<crate::kernel::heap::HeapStats>();
+                if out.is_null() || out_len < stats_size { return E_INVAL; }
+                let idx = crate::kernel::scheduler::current_module_index();
+                let stats = crate::kernel::heap::heap_stats(idx);
+                *(out as *mut crate::kernel::heap::HeapStats) = stats;
+                stats_size as i32
             }
             _ => E_NOSYS,
         };
@@ -1137,6 +1138,9 @@ impl SyscallTable {
             channel_poll: stub_channel_poll,
             dev_call: stub_dev_call,
             dev_query: stub_dev_query,
+            heap_alloc: stub_heap_alloc,
+            heap_free: stub_heap_free,
+            heap_realloc: stub_heap_realloc,
         }
     }
 }
@@ -1167,6 +1171,31 @@ unsafe extern "C" fn stub_channel_write(_handle: i32, _data: *const u8, _len: us
 unsafe extern "C" fn stub_channel_poll(_handle: i32, _events: u8) -> i32 { E_NOSYS }
 unsafe extern "C" fn stub_dev_call(_handle: i32, _opcode: u32, _arg: *mut u8, _arg_len: usize) -> i32 { E_NOSYS }
 unsafe extern "C" fn stub_dev_query(_handle: i32, _key: u32, _out: *mut u8, _out_len: usize) -> i32 { E_NOSYS }
+unsafe extern "C" fn stub_heap_alloc(_size: u32) -> *mut u8 { null_mut() }
+unsafe extern "C" fn stub_heap_free(_ptr: *mut u8) {}
+unsafe extern "C" fn stub_heap_realloc(_ptr: *mut u8, _new_size: u32) -> *mut u8 { null_mut() }
+
+// ============================================================================
+// Heap Syscall Implementations
+// ============================================================================
+
+/// Allocate from the calling module's heap.
+unsafe extern "C" fn syscall_heap_alloc(size: u32) -> *mut u8 {
+    let idx = crate::kernel::scheduler::current_module_index();
+    crate::kernel::heap::heap_alloc(idx, size as usize)
+}
+
+/// Free a previous allocation from the calling module's heap.
+unsafe extern "C" fn syscall_heap_free(ptr: *mut u8) {
+    let idx = crate::kernel::scheduler::current_module_index();
+    crate::kernel::heap::heap_free(idx, ptr)
+}
+
+/// Reallocate from the calling module's heap.
+unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u8 {
+    let idx = crate::kernel::scheduler::current_module_index();
+    crate::kernel::heap::heap_realloc(idx, ptr, new_size as usize)
+}
 
 // ============================================================================
 // RP Platform Providers (hardware drivers)

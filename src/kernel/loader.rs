@@ -43,10 +43,9 @@ const STATE_ARENA_SIZE: usize = super::chip::STATE_ARENA_SIZE;
 // static PARAM_BUFFER instead of copying, eliminating truncation.
 
 // Flash memory bounds (RP2350 XIP range)
-// 16MB upper bound covers both 4MB (Pico 2 W) and 16MB (Waveshare) boards.
-// On smaller flash, addresses beyond physical size won't contain valid module
-// headers, so validate_module()'s magic checks reject them safely.
+#[cfg(feature = "rp")]
 const FLASH_BASE: u32 = 0x10000000;
+#[cfg(feature = "rp")]
 const FLASH_END: u32 = 0x11000000;
 
 // ============================================================================
@@ -782,23 +781,18 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
     // Verify integrity hash from manifest section (ABI v2)
     let manifest_size = module.header.manifest_size() as usize;
     if manifest_size >= 48 {
-        // Manifest binary layout: 16-byte header + variable sections + 32-byte SHA-256
-        // Locate the manifest in flash
+        // Verify manifest integrity (SHA-256) — RP only (too slow in QEMU)
+        #[cfg(feature = "rp")]
+        {
         let code_size = module.header.code_size as usize;
         let data_size = module.header.data_size as usize;
         let export_size = module.header.export_count as usize * 8;
         let schema_size = module.header.schema_size() as usize;
         let manifest_offset = ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
         let manifest_ptr = unsafe { offset_ptr(module.base, manifest_offset) };
-
-        // Read manifest header fields safely from flash
         let manifest_data = unsafe {
             core::slice::from_raw_parts(manifest_ptr, manifest_size)
         };
-
-        // Verify manifest magic (FXMF = 0x464D5846)
-        // Skip entirely on bcm2712 — SHA-256 is too slow in QEMU emulation
-        #[cfg(feature = "rp")]
         if manifest_size >= 16 {
             let magic = u32::from_le_bytes([manifest_data[0], manifest_data[1], manifest_data[2], manifest_data[3]]);
             if magic == 0x464D5846 {
@@ -834,7 +828,8 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                 }
             }
         }
-    }
+        } // #[cfg(feature = "rp")]
+    } // if manifest_size >= 48
 
     Ok(())
 }
@@ -1134,6 +1129,18 @@ impl DynamicModule {
 
         // 4. Allocate state from arena (safe)
         let state_ptr = alloc_state(required_size)?;
+
+        // 4b. If module exports module_arena_size, allocate and init heap
+        if let Ok(arena_addr) = module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
+            let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
+            let arena_size = call_state_size(arena_fn);
+            if arena_size > 0 {
+                if let Ok(arena_ptr) = alloc_state(arena_size) {
+                    let module_idx = super::scheduler::current_module_index();
+                    super::heap::init_module_heap(module_idx as usize, arena_ptr, arena_size);
+                }
+            }
+        }
 
         // 5. Initialize module (FFI call, but validated)
         if let Err(e) = invoke_init(module, syscalls, name) {

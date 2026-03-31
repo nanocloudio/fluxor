@@ -230,7 +230,7 @@ pub extern "C" fn main() -> ! {
 
     // --- Config-driven module graph ---
     use fluxor::kernel::channel;
-    use fluxor::kernel::config::{self, MAX_MODULES, MAX_GRAPH_EDGES};
+    use fluxor::kernel::config::{self, MAX_MODULES};
 
     // Parse config
     let mut cfg = config::Config::empty();
@@ -285,7 +285,7 @@ pub extern "C" fn main() -> ! {
     }
 
     // Mask IRQs during module instantiation
-    unsafe { core::arch::asm!("msr daifset, #2") };
+    let _inst_guard = fluxor::kernel::guard::KernelGuard::acquire();
 
     let syscalls = fluxor::kernel::syscalls::get_table_for_module_type(0);
 
@@ -297,6 +297,8 @@ pub extern "C" fn main() -> ! {
     while i < n_modules && i < MAX_MODS {
         if let Some(ref entry) = cfg.modules[i] {
             if let Ok(m) = ldr.find_by_name_hash(entry.name_hash) {
+                // Set current module index so heap init and syscalls work
+                fluxor::kernel::scheduler::set_current_module(mod_count);
                 let result = unsafe {
                     loader::DynamicModule::start_new(
                         &m, syscalls,
@@ -331,7 +333,7 @@ pub extern "C" fn main() -> ! {
     }
 
     // Re-enable IRQs
-    unsafe { core::arch::asm!("msr daifclr, #2") };
+    drop(_inst_guard);
 
     uart_puts(b"[inst] ");
     uart_put_u32(mod_count as u32);

@@ -188,7 +188,7 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     }
 
     // Module data (with alignment padding — code must start at page boundary)
-    for (i, module) in modules.iter().enumerate() {
+    for (_i, module) in modules.iter().enumerate() {
         // Pad so that offset + 68 (header size) is page-aligned
         while (result.len() + 68) % 4096 != 0 {
             result.push(0);
@@ -629,6 +629,8 @@ pub fn pack_fmod(
         "i2s_mix",
         // channel hints (dynamic buffer sizing)
         "module_channel_hints",
+        // heap arena size (per-module heap allocation)
+        "module_arena_size",
         // buffer capability markers
         "module_in_place_safe",
         "module_mailbox_safe",

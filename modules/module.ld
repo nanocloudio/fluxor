@@ -20,6 +20,7 @@ SECTIONS
         KEEP(*(.text.module_in_place_safe*))
         KEEP(*(.text.module_mailbox_safe*))
         KEEP(*(.text.module_deferred_ready*))
+        KEEP(*(.text.module_arena_size*))
         *(.text*)
         . = ALIGN(8);
     } > FLASH
