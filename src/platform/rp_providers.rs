@@ -1947,6 +1947,231 @@ unsafe fn rp_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, 
             spi9_pac_pin_set(cs, level);
             0
         }
+        // ── Raw SPI peripheral bridge ─────────────────────────────────
+        dev_system::SPI_REG_WRITE => {
+            // handle=bus_id, arg=[offset:u8, value:u32 LE]
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4008_0000usize } else { 0x4009_0000usize };
+            let offset = (*arg as usize) & 0xFC; // 4-byte aligned
+            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            core::ptr::write_volatile((base + offset) as *mut u32, val);
+            0
+        }
+        dev_system::SPI_REG_READ => {
+            // handle=bus_id, arg=[offset:u8], returns value in arg[1..5]
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4008_0000usize } else { 0x4009_0000usize };
+            let offset = (*arg as usize) & 0xFC;
+            let val = core::ptr::read_volatile((base + offset) as *const u32);
+            let bytes = val.to_le_bytes();
+            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            0
+        }
+        dev_system::SPI_BUS_INFO => {
+            // handle=bus_id, returns [dr_addr:u32, tx_dreq:u8, rx_dreq:u8, max_freq:u32, pad:u16]
+            if arg.is_null() || arg_len < 12 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let dr_addr: u32 = if bus == 0 { 0x4008_0008 } else { 0x4009_0008 };
+            let tx_dreq: u8 = if bus == 0 { 16 } else { 18 };
+            let rx_dreq: u8 = if bus == 0 { 17 } else { 19 };
+            let max_freq: u32 = 150_000_000 / 2; // SPI max = Fsys/2 (default 150MHz)
+            let dr = dr_addr.to_le_bytes();
+            *arg = dr[0]; *arg.add(1) = dr[1]; *arg.add(2) = dr[2]; *arg.add(3) = dr[3];
+            *arg.add(4) = tx_dreq;
+            *arg.add(5) = rx_dreq;
+            let mf = max_freq.to_le_bytes();
+            *arg.add(6) = mf[0]; *arg.add(7) = mf[1]; *arg.add(8) = mf[2]; *arg.add(9) = mf[3];
+            *arg.add(10) = 0; *arg.add(11) = 0;
+            0
+        }
+        dev_system::SPI_PIN_INIT => {
+            // handle=bus_id, arg=[clk:u8, mosi:u8, miso:u8]
+            if arg.is_null() || arg_len < 3 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let funcsel: u32 = 1; // SPI function on RP2350
+            let pins = [*arg, *arg.add(1), *arg.add(2)];
+            let mut i = 0usize;
+            while i < 3 {
+                let pin = pins[i];
+                if pin != 0xFF && pin < 30 {
+                    let pad_base = 0x4003_8004usize + (pin as usize) * 4;
+                    let io_base = 0x4002_8004usize + (pin as usize) * 8;
+                    // Enable pad (IE + drive)
+                    core::ptr::write_volatile(pad_base as *mut u32, 0x56);
+                    // Set funcsel
+                    core::ptr::write_volatile(io_base as *mut u32, funcsel);
+                }
+                i += 1;
+            }
+            0
+        }
+        // ── Raw I2C peripheral bridge ──────────────────────────────────
+        dev_system::I2C_REG_WRITE => {
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4009_0000usize } else { 0x4009_8000usize };
+            let offset = (*arg as usize) & 0xFC;
+            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            core::ptr::write_volatile((base + offset) as *mut u32, val);
+            0
+        }
+        dev_system::I2C_REG_READ => {
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4009_0000usize } else { 0x4009_8000usize };
+            let offset = (*arg as usize) & 0xFC;
+            let val = core::ptr::read_volatile((base + offset) as *const u32);
+            let bytes = val.to_le_bytes();
+            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            0
+        }
+        dev_system::I2C_BUS_INFO => {
+            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let data_cmd: u32 = if bus == 0 { 0x4009_0010 } else { 0x4009_8010 }; // IC_DATA_CMD
+            let tx_dreq: u8 = if bus == 0 { 20 } else { 22 }; // I2C0_TX=20, I2C1_TX=22
+            let rx_dreq: u8 = if bus == 0 { 21 } else { 23 };
+            let dc = data_cmd.to_le_bytes();
+            *arg = dc[0]; *arg.add(1) = dc[1]; *arg.add(2) = dc[2]; *arg.add(3) = dc[3];
+            *arg.add(4) = tx_dreq; *arg.add(5) = rx_dreq;
+            *arg.add(6) = 0; *arg.add(7) = 0;
+            0
+        }
+        dev_system::I2C_PIN_INIT => {
+            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            let funcsel: u32 = 3; // I2C function on RP2350
+            let pins = [*arg, *arg.add(1)];
+            let mut i = 0usize;
+            while i < 2 {
+                let pin = pins[i];
+                if pin != 0xFF && pin < 30 {
+                    let pad_base = 0x4003_8004usize + (pin as usize) * 4;
+                    let io_base = 0x4002_8004usize + (pin as usize) * 8;
+                    // I2C needs pullup + input enable
+                    core::ptr::write_volatile(pad_base as *mut u32, 0x4E); // IE + PUE + drive=4mA
+                    core::ptr::write_volatile(io_base as *mut u32, funcsel);
+                }
+                i += 1;
+            }
+            0
+        }
+        dev_system::I2C_SET_ENABLE => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4009_0000usize } else { 0x4009_8000usize };
+            // IC_ENABLE at offset 0x6C
+            core::ptr::write_volatile((base + 0x6C) as *mut u32, if *arg != 0 { 1 } else { 0 });
+            0
+        }
+        // ── Raw UART peripheral bridge ─────────────────────────────────
+        dev_system::UART_REG_WRITE => {
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4007_0000usize } else { 0x4007_8000usize };
+            let offset = (*arg as usize) & 0xFC;
+            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            core::ptr::write_volatile((base + offset) as *mut u32, val);
+            0
+        }
+        dev_system::UART_REG_READ => {
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4007_0000usize } else { 0x4007_8000usize };
+            let offset = (*arg as usize) & 0xFC;
+            let val = core::ptr::read_volatile((base + offset) as *const u32);
+            let bytes = val.to_le_bytes();
+            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            0
+        }
+        dev_system::UART_PIN_INIT => {
+            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            let funcsel: u32 = 2; // UART function on RP2350
+            let pins = [*arg, *arg.add(1)];
+            let mut i = 0usize;
+            while i < 2 {
+                let pin = pins[i];
+                if pin != 0xFF && pin < 30 {
+                    let pad_base = 0x4003_8004usize + (pin as usize) * 4;
+                    let io_base = 0x4002_8004usize + (pin as usize) * 8;
+                    core::ptr::write_volatile(pad_base as *mut u32, 0x56);
+                    core::ptr::write_volatile(io_base as *mut u32, funcsel);
+                }
+                i += 1;
+            }
+            0
+        }
+        dev_system::UART_SET_ENABLE => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4007_0000usize } else { 0x4007_8000usize };
+            // UARTCR at offset 0x30
+            let cr = core::ptr::read_volatile((base + 0x30) as *const u32);
+            if *arg != 0 {
+                core::ptr::write_volatile((base + 0x30) as *mut u32, cr | 0x301); // UARTEN + TXE + RXE
+            } else {
+                core::ptr::write_volatile((base + 0x30) as *mut u32, cr & !1); // clear UARTEN
+            }
+            0
+        }
+        // ── Raw ADC peripheral bridge ──────────────────────────────────
+        dev_system::ADC_REG_WRITE => {
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let base = 0x400A_0000usize;
+            let offset = (*arg as usize) & 0xFC;
+            let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            core::ptr::write_volatile((base + offset) as *mut u32, val);
+            0
+        }
+        dev_system::ADC_REG_READ => {
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let base = 0x400A_0000usize;
+            let offset = (*arg as usize) & 0xFC;
+            let val = core::ptr::read_volatile((base + offset) as *const u32);
+            let bytes = val.to_le_bytes();
+            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            0
+        }
+        dev_system::ADC_PIN_INIT => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let pin = *arg;
+            if pin < 26 || pin > 29 { return E_INVAL; }
+            let pad_base = 0x4003_8004usize + (pin as usize) * 4;
+            // ADC: disable digital input (IE=0), no pulls
+            core::ptr::write_volatile(pad_base as *mut u32, 0x80); // ISO=1 (analog mode)
+            0
+        }
+        // ── SPI bridge (continued) ─────────────────────────────────────
+        dev_system::SPI_SET_ENABLE => {
+            // handle=bus_id, arg=[enable:u8]
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let bus = _handle as u8;
+            if bus > 1 { return E_INVAL; }
+            let base = if bus == 0 { 0x4008_0000usize } else { 0x4009_0000usize };
+            let cr1 = core::ptr::read_volatile((base + 0x04) as *const u32);
+            if *arg != 0 {
+                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 | (1 << 1)); // SSE=1
+            } else {
+                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 & !(1 << 1)); // SSE=0
+            }
+            0
+        }
         _ => E_NOSYS,
     }
 }
