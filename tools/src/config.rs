@@ -428,6 +428,9 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     let to_port = (byte2 >> 7) & 1;
     let buffer_group = byte2 & 0x7F;
     let port_byte = entry[3];
+    let from_port_index = (port_byte >> 6) & 0x03;
+    let edge_class = (port_byte >> 4) & 0x03;
+    let to_port_index = port_byte & 0x0F;
     let mut edge = serde_json::Map::new();
     edge.insert("from_id".into(), json!(from_id));
     edge.insert("to_id".into(), json!(to_id));
@@ -435,9 +438,17 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     if buffer_group > 0 {
         edge.insert("buffer_group".into(), json!(buffer_group));
     }
-    if port_byte != 0 {
-        edge.insert("from_port_index".into(), json!((port_byte >> 4) & 0x0F));
-        edge.insert("to_port_index".into(), json!(port_byte & 0x0F));
+    if from_port_index != 0 || to_port_index != 0 {
+        edge.insert("from_port_index".into(), json!(from_port_index));
+        edge.insert("to_port_index".into(), json!(to_port_index));
+    }
+    if edge_class != 0 {
+        let ec_name = match edge_class {
+            1 => "dma_owned",
+            2 => "cross_core",
+            _ => "local",
+        };
+        edge.insert("edge_class".into(), json!(ec_name));
     }
     Value::Object(edge)
 }
@@ -1075,10 +1086,38 @@ fn build_mesh_bridge_params(module: &Value, entry: &mut [u8], config: &Value) ->
 /// Build a variable-length module entry from config.
 ///
 /// Binary format (variable length):
+/// Resolve a module's domain assignment to a numeric domain ID.
+///
+/// Looks up the module's `domain` field (string) in the `execution.domains` list.
+/// Returns 0 (default domain) if no domain is specified or the name is not found.
+fn resolve_domain_id(module: &Value, config: &Value) -> u8 {
+    let domain_name = match module.get("domain").and_then(|d| d.as_str()) {
+        Some(name) => name,
+        None => return 0,
+    };
+
+    // Look up in execution.domains list
+    if let Some(exec) = config.get("execution") {
+        if let Some(domains) = exec.get("domains").and_then(|d| d.as_array()) {
+            for (i, domain) in domains.iter().enumerate() {
+                if let Some(name) = domain.get("name").and_then(|n| n.as_str()) {
+                    if name == domain_name {
+                        return i as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    // Domain name not found in config — treat as domain 0 with a warning
+    eprintln!("warning: module domain '{}' not found in execution.domains, using default", domain_name);
+    0
+}
+
 /// - Bytes 0-1: entry_length (u16) - total size including header
 /// - Bytes 2-5: name_hash (fnv1a32)
 /// - Byte 6: id
-/// - Byte 7: reserved
+/// - Byte 7: domain_id
 /// - Bytes 8+: params (variable, module-specific)
 fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&Value>, config: &Value, modules_dir: &Path) -> Result<Vec<u8>> {
     // Start with max possible size, will truncate to actual used size
@@ -1096,7 +1135,9 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
 
     // Module ID (byte 6)
     entry[6] = id;
-    // Byte 7 is reserved (already 0)
+    // Domain ID (byte 7) — resolved from module's "domain" field against domain_names
+    let domain_id = resolve_domain_id(module, config);
+    entry[7] = domain_id;
 
     // Track actual params length used
     let params_len: usize;
@@ -1566,6 +1607,63 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
     Ok(result)
 }
 
+/// Resolve edge_class for each wiring entry.
+///
+/// Reads `edge_class` field from each wiring entry:
+/// - "local" (default) → 0
+/// - "dma_owned" → 1
+/// - "cross_core" → 2
+///
+/// Also validates: cross_core edges must connect modules in different domains.
+fn resolve_edge_classes(config: &Value, _module_names: &[String], domain_names: &[String]) -> Vec<u8> {
+    let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+
+    let mut classes = Vec::with_capacity(wiring.len());
+
+    // Build module_name → domain_id lookup
+    let modules_list = config.get("modules").and_then(|m| m.as_array());
+    let mut module_domain: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    if let Some(mods) = modules_list {
+        for m in mods {
+            if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                let domain = resolve_domain_id(m, config);
+                module_domain.insert(name.to_string(), domain);
+            }
+        }
+    }
+
+    for (i, entry) in wiring.iter().enumerate() {
+        let ec_str = entry.get("edge_class").and_then(|v| v.as_str()).unwrap_or("local");
+        let ec = match ec_str {
+            "dma_owned" => 1u8,
+            "cross_core" => {
+                // Validate: from and to must be in different domains
+                if let (Some(from_spec), Some(to_spec)) = (
+                    entry.get("from").and_then(|v| v.as_str()),
+                    entry.get("to").and_then(|v| v.as_str()),
+                ) {
+                    let from_mod = from_spec.split('.').next().unwrap_or("");
+                    let to_mod = to_spec.split('.').next().unwrap_or("");
+                    let from_d = module_domain.get(from_mod).copied().unwrap_or(0);
+                    let to_d = module_domain.get(to_mod).copied().unwrap_or(0);
+                    if from_d == to_d && !domain_names.is_empty() {
+                        eprintln!("warning: wiring[{}] edge_class=cross_core but '{}' and '{}' are in same domain {}",
+                            i, from_mod, to_mod, from_d);
+                    }
+                }
+                2u8
+            }
+            _ => 0u8, // "local" or unknown
+        };
+        classes.push(ec);
+    }
+
+    classes
+}
+
 /// Generate binary config in FXWR format (version 1)
 ///
 /// Layout:
@@ -1600,12 +1698,46 @@ pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, modu
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
+    // Parse tick_us (top-level or under execution:)
+    let tick_us: u16 = config.get("tick_us")
+        .or_else(|| config.get("execution").and_then(|e| e.get("tick_us")))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u16;
+
+    // Validate tick_us range
+    if tick_us > 0 && (tick_us < 100 || tick_us > 50000) {
+        return Err(Error::Config(format!(
+            "tick_us {} out of range (valid: 100-50000, or 0 for default 1000)",
+            tick_us
+        )));
+    }
+
+    // Parse execution.domains
+    let mut domain_names: Vec<String> = Vec::new();
+    let mut domain_tick_us: Vec<u16> = Vec::new();
+    if let Some(exec) = config.get("execution") {
+        if let Some(domains) = exec.get("domains").and_then(|d| d.as_array()) {
+            for domain in domains {
+                let name = domain.get("name").and_then(|n| n.as_str()).unwrap_or("default");
+                domain_names.push(name.to_string());
+                let dtick = domain.get("tick_us").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                domain_tick_us.push(dtick);
+            }
+        }
+    }
+    // Domain count is inferred by the kernel from module domain_id assignments.
+    // domain_names is still used for edge_class validation below.
+
+    // Warn if tick_us < 500 with many modules
+    let module_list = modules.as_array().ok_or_else(|| Error::Config("modules must be a list".into()))?;
+    if tick_us > 0 && tick_us < 500 && module_list.len() > 8 {
+        eprintln!("warning: tick_us={} with {} modules may exceed tick budget", tick_us, module_list.len());
+    }
+
     // Inject graph sample_rate into modules that don't declare their own
     let modules_with_rate;
     let modules_ref = if graph_sample_rate > 0 {
-        let mut list = modules.as_array()
-            .ok_or_else(|| Error::Config("modules must be a list".into()))?
-            .clone();
+        let mut list = module_list.clone();
         for m in &mut list {
             if m.get("sample_rate").is_none() {
                 if let Some(obj) = m.as_object_mut() {
@@ -1673,11 +1805,11 @@ pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, modu
     result.extend_from_slice(&version.to_le_bytes());
     result.extend_from_slice(&0u16.to_le_bytes()); // checksum (computed later)
 
-    // Counts (8 bytes): module_count(1), edge_count(1), reserved(2), graph_sample_rate(4)
+    // Counts (8 bytes): module_count(1), edge_count(1), tick_us(2), graph_sample_rate(4)
     result.push(module_entries.len() as u8); // module_count
     result.push(edges.len() as u8); // edge_count
-    result.extend_from_slice(&[0u8; 2]); // reserved
-    result.extend_from_slice(&graph_sample_rate.to_le_bytes()); // graph_sample_rate
+    result.extend_from_slice(&tick_us.to_le_bytes()); // tick_us (u16, bytes 10-11)
+    result.extend_from_slice(&graph_sample_rate.to_le_bytes()); // graph_sample_rate (u32, bytes 12-15)
 
     // Calculate total module section size
     let module_section_size: usize = module_entries.iter().map(|e| e.len()).sum();
@@ -1703,20 +1835,24 @@ pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, modu
     // Assign buffer groups for aliasable edge chains
     let buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps);
 
+    // Resolve per-edge edge_class from wiring entries
+    let edge_classes = resolve_edge_classes(config, &module_names, &domain_names);
+
     // Graph section (64 bytes)
     // Format: edge_count, flags, reserved[2], edges[N]
     // Edge format: from_id, to_id, byte2, port_byte
     //   byte2: (to_port << 7) | (buffer_group & 0x7F)
-    //   port_byte: (from_port_index << 4) | to_port_index
+    //   port_byte: (from_port_index << 6) | (edge_class << 4) | to_port_index
     let mut graph_section = Vec::with_capacity(GRAPH_SECTION_SIZE);
     graph_section.push(edges.len() as u8);
     graph_section.extend_from_slice(&[0u8; 3]);
     for (i, (from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
         let group = buffer_groups.get(i).copied().unwrap_or(0);
+        let ec = edge_classes.get(i).copied().unwrap_or(0);
         graph_section.push(*from_id);
         graph_section.push(*to_id);
         graph_section.push((to_port << 7) | (group & 0x7F));
-        graph_section.push((from_port_index << 4) | (to_port_index & 0x0F));
+        graph_section.push((from_port_index << 6) | ((ec & 0x03) << 4) | (to_port_index & 0x0F));
     }
     while graph_section.len() < GRAPH_SECTION_SIZE {
         graph_section.push(0);

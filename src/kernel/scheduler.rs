@@ -60,6 +60,12 @@ pub enum StepResult {
 /// while remaining cooperative (each individual step is still bounded).
 const MAX_BURST_STEPS: usize = 16384;
 
+/// Maximum number of execution domains.
+pub const MAX_DOMAINS: usize = 4;
+
+/// Default tick period in microseconds (1ms).
+pub const DEFAULT_TICK_US: u32 = 1000;
+
 /// Describes a connection between two module ports.
 #[derive(Debug, Clone, Copy)]
 pub struct Edge {
@@ -80,6 +86,8 @@ pub struct Edge {
     /// Buffer group ID for aliasing. 0 = no aliasing.
     /// Edges with the same non-zero group share the same channel buffer.
     pub buffer_group: u8,
+    /// Edge class metadata (Local, DmaOwned, CrossCore). Pure metadata on single-core.
+    pub edge_class: crate::kernel::config::EdgeClass,
 }
 
 impl Edge {
@@ -99,6 +107,7 @@ impl Edge {
             from_port_index: 0,
             to_port_index: 0,
             buffer_group: 0,
+            edge_class: crate::kernel::config::EdgeClass::Local,
         }
     }
 
@@ -120,6 +129,7 @@ impl Edge {
             from_port_index,
             to_port_index,
             buffer_group: 0,
+            edge_class: crate::kernel::config::EdgeClass::Local,
         }
     }
 
@@ -775,12 +785,25 @@ struct SchedulerState {
     current_module: usize,
     /// Graph-level sample rate from config (0 = not set)
     graph_sample_rate: u32,
+    /// Tick period in microseconds (0 = default 1000us)
+    tick_us: u32,
     /// Per-module self-reported latency in frames
     module_latency: [u32; MAX_MODULES],
     /// Per-module accumulated downstream latency in frames
     downstream_latency: [u32; MAX_MODULES],
     /// Per-module fault bookkeeping (state, policy, counters)
     fault_info: [ModuleFaultInfo; MAX_MODULES],
+    /// Per-module domain assignment (0 = default domain)
+    domain_id: [u8; MAX_MODULES],
+    /// Per-domain topological execution order
+    domain_exec_order: [[u8; MAX_MODULES]; MAX_DOMAINS],
+    /// Number of modules in each domain's execution order
+    domain_module_count: [u8; MAX_DOMAINS],
+    /// Number of domains configured (0 or 1 = single default domain)
+    domain_count: u8,
+    /// Per-domain tick_us (0 = use global tick_us). Index 0 = default domain.
+    /// TODO(Epic 6): populate from config when multi-core execution lands.
+    domain_tick_us: [u32; MAX_DOMAINS],
 }
 
 impl SchedulerState {
@@ -805,9 +828,15 @@ impl SchedulerState {
             exec_order_count: 0,
             current_module: 0,
             graph_sample_rate: 0,
+            tick_us: 0,
             module_latency: [0; MAX_MODULES],
             downstream_latency: [0; MAX_MODULES],
             fault_info: [ModuleFaultInfo::new(); MAX_MODULES],
+            domain_id: [0; MAX_MODULES],
+            domain_exec_order: [[0; MAX_MODULES]; MAX_DOMAINS],
+            domain_module_count: [0; MAX_DOMAINS],
+            domain_count: 0,
+            domain_tick_us: [0; MAX_DOMAINS],
         }
     }
 
@@ -838,6 +867,12 @@ impl SchedulerState {
         }
         self.exec_order_count = 0;
         self.graph_sample_rate = 0;
+        self.tick_us = 0;
+        self.domain_count = 0;
+        for d in 0..MAX_DOMAINS {
+            self.domain_module_count[d] = 0;
+            self.domain_tick_us[d] = 0;
+        }
     }
 }
 
@@ -888,6 +923,12 @@ pub fn graph_sample_rate() -> u32 {
 /// Set the graph-level sample rate (called from config parsing).
 pub fn set_graph_sample_rate(rate: u32) {
     unsafe { SCHED.graph_sample_rate = rate; }
+}
+
+/// Return the configured tick period in microseconds.
+pub fn tick_us() -> u32 {
+    let t = unsafe { SCHED.tick_us };
+    if t == 0 { DEFAULT_TICK_US } else { t }
 }
 
 /// Report a module's processing latency in frames.
@@ -1038,10 +1079,28 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
     sched.reset();
 
     // Store graph-level sample rate from config header
-    sched.graph_sample_rate = config.header.graph_sample_rate;
+    sched.graph_sample_rate = config.header.graph_sample_rate as u32;
     if sched.graph_sample_rate != 0 {
         log::info!("[graph] sample_rate={}", sched.graph_sample_rate);
     }
+
+    // Store tick_us from config header (0 = default 1000us)
+    let raw_tick_us = config.header.tick_us as u32;
+    sched.tick_us = if raw_tick_us == 0 { DEFAULT_TICK_US } else { raw_tick_us };
+    if raw_tick_us != 0 {
+        log::info!("[graph] tick_us={}", sched.tick_us);
+    }
+
+    // Store per-module domain assignments and infer domain count
+    let mut max_domain: u8 = 0;
+    for entry in config.modules.iter().flatten() {
+        let id = entry.id as usize;
+        if id < MAX_MODULES {
+            sched.domain_id[id] = entry.domain_id;
+            if entry.domain_id > max_domain { max_domain = entry.domain_id; }
+        }
+    }
+    sched.domain_count = if max_domain > 0 { (max_domain + 1).min(MAX_DOMAINS as u8) } else { 0 };
 
     let edges = &mut sched.edges;
 
@@ -1062,6 +1121,7 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
                 to_slot as usize, to_port_name, edge.to_port_index,
             );
             e.buffer_group = edge.buffer_group;
+            e.edge_class = edge.edge_class;
             edges[i] = e;
         } else {
             log::error!("[graph] edge {} missing", i);
@@ -1090,6 +1150,11 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
 
     // Compute upstream dependency masks for ready-signal gating
     compute_upstream_mask(edges, runtime_edge_count);
+
+    // Partition modules by domain (E4-S4) and validate (E4-S5)
+    // These use the global SCHED directly to avoid borrow conflicts with `edges`.
+    compute_domain_exec_orders_static(module_count);
+    validate_domains_static(module_count, runtime_edge_count);
 
     Ok((module_list, module_count))
 }
@@ -1131,8 +1196,9 @@ pub async fn setup_graph_async() -> i32 {
 #[cfg(feature = "rp")]
 pub async fn run_main_loop(module_count: usize) -> ! {
     let modules = unsafe { &mut *(&raw mut SCHED.modules) };
+    let tick_period_us = tick_us() as u64;
 
-    log::info!("[sched] running modules={}", module_count);
+    log::info!("[sched] running modules={} tick_us={}", module_count, tick_period_us);
 
     loop {
         // 1. Poll GPIO edges (signals events for pins with bindings)
@@ -1159,10 +1225,10 @@ pub async fn run_main_loop(module_count: usize) -> ! {
             step_woken_modules(modules, module_count, wake);
         }
 
-        // 4. Sleep until 1ms tick OR event signal (from future ISR sources)
+        // 4. Sleep until configurable tick period OR event signal
         crate::kernel::event::SCHEDULER_WAKE.reset();
         embassy_futures::select::select(
-            Timer::after(Duration::from_millis(1)),
+            Timer::after(Duration::from_micros(tick_period_us)),
             crate::kernel::event::SCHEDULER_WAKE.wait(),
         ).await;
 
@@ -1279,6 +1345,7 @@ fn push_internal_module(
     module_list[idx] = Some(ModuleEntry {
         name_hash,
         id: idx as u8,
+        domain_id: 0,
         params_ptr: core::ptr::null(),
         params_len: 0,
     });
@@ -1915,6 +1982,100 @@ fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) {
     }
 
     unsafe { SCHED.exec_order_count = count; }
+}
+
+/// Partition the global exec_order into per-domain execution orders (E4-S4).
+///
+/// Each domain gets its own ordered list of modules. On single-core, all domains
+/// execute sequentially in the same tick (no behavior change). The data structures
+/// are ready for Epic 6 multi-core where each domain maps to a core.
+/// Accesses SCHED global directly to avoid borrow conflicts.
+fn compute_domain_exec_orders_static(_module_count: usize) {
+    let sched = unsafe { &mut *(&raw mut SCHED) };
+
+    // Clear domain module counts
+    for d in 0..MAX_DOMAINS {
+        sched.domain_module_count[d] = 0;
+    }
+
+    // Walk exec_order (already topologically sorted) and partition by domain
+    for order_pos in 0..sched.exec_order_count {
+        let module_idx = sched.exec_order[order_pos] as usize;
+        let domain = sched.domain_id[module_idx] as usize;
+        let domain = if domain < MAX_DOMAINS { domain } else { 0 };
+
+        let count = sched.domain_module_count[domain] as usize;
+        if count < MAX_MODULES {
+            sched.domain_exec_order[domain][count] = module_idx as u8;
+            sched.domain_module_count[domain] = (count + 1) as u8;
+        }
+    }
+
+    // Log domain composition
+    let effective_domains = if sched.domain_count > 0 { sched.domain_count as usize } else { 1 };
+    for d in 0..effective_domains {
+        let count = sched.domain_module_count[d];
+        if count > 0 || d == 0 {
+            let tick = if sched.domain_tick_us[d] > 0 { sched.domain_tick_us[d] } else { sched.tick_us };
+            log::info!("[domain] {} modules={} tick_us={}", d, count, tick);
+        }
+    }
+}
+
+/// Validate domain configuration (E4-S5).
+///
+/// Accesses SCHED global directly to avoid borrow conflicts with edges.
+/// Checks:
+/// - Warn on empty domains
+/// - Warn on modules without domain assignment when domains are configured
+/// - Validate cross_core edges connect modules in different domains
+fn validate_domains_static(module_count: usize, edge_count: usize) {
+    let sched = unsafe { &*(&raw const SCHED) };
+
+    if sched.domain_count <= 1 {
+        return; // Single domain — nothing to validate
+    }
+
+    let effective_domains = sched.domain_count as usize;
+
+    // Warn on empty domains
+    for d in 0..effective_domains {
+        if sched.domain_module_count[d] == 0 {
+            log::warn!("[domain] domain {} is empty (no modules assigned)", d);
+        }
+    }
+
+    // Check for modules assigned to out-of-range domains
+    for i in 0..module_count {
+        let domain = sched.domain_id[i] as usize;
+        if domain >= effective_domains && domain != 0 {
+            log::warn!("[domain] module {} assigned to domain {} (max {}), using domain 0",
+                i, domain, effective_domains - 1);
+        }
+    }
+
+    // Validate cross_core edges connect modules in different domains
+    for i in 0..edge_count {
+        let e = &sched.edges[i];
+        if let crate::kernel::config::EdgeClass::CrossCore = e.edge_class {
+            let from_domain = if e.from_module < MAX_MODULES { sched.domain_id[e.from_module] } else { 0 };
+            let to_domain = if e.to_module < MAX_MODULES { sched.domain_id[e.to_module] } else { 0 };
+            if from_domain == to_domain {
+                log::warn!("[domain] cross_core edge {}→{} but both in domain {}",
+                    e.from_module, e.to_module, from_domain);
+            }
+        }
+    }
+
+    // Estimate tick budget: warn if module count exceeds rough budget
+    for d in 0..effective_domains {
+        let count = sched.domain_module_count[d] as usize;
+        let domain_tick = if sched.domain_tick_us[d] > 0 { sched.domain_tick_us[d] } else { sched.tick_us };
+        if domain_tick < 500 && count > 8 {
+            log::warn!("[domain] domain {} has {} modules with tick_us={} — may exceed tick budget",
+                d, count, domain_tick);
+        }
+    }
 }
 
 /// Compute downstream latency for each module.

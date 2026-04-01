@@ -383,12 +383,14 @@ fn arena_reset() {
 /// - Bytes 0-1: entry_length (u16) - total entry size including header
 /// - Bytes 2-5: name_hash (fnv1a32)
 /// - Byte 6: id
-/// - Byte 7: reserved
+/// - Byte 7: domain_id (0 = default domain)
 /// - Bytes 8+: params (entry_length - 8 bytes)
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEntry {
     pub name_hash: u32,
     pub id: u8,
+    /// Execution domain ID (0 = default domain)
+    pub domain_id: u8,
     /// Pointer to params in arena (stable for lifetime of config)
     pub params_ptr: *const u8,
     /// Length of params
@@ -411,6 +413,7 @@ impl Default for ModuleEntry {
         Self {
             name_hash: 0,
             id: 0,
+            domain_id: 0,
             params_ptr: core::ptr::null(),
             params_len: 0,
         }
@@ -422,6 +425,18 @@ impl ModuleEntry {
     pub fn is_empty(&self) -> bool {
         self.name_hash == 0
     }
+}
+
+/// Edge class for channels — metadata for future multi-core scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EdgeClass {
+    /// Local: same domain, default
+    Local = 0,
+    /// DMA-owned: buffer managed by DMA controller
+    DmaOwned = 1,
+    /// Cross-core: connects modules in different execution domains
+    CrossCore = 2,
 }
 
 /// Graph edge connecting two modules
@@ -445,6 +460,9 @@ pub struct GraphEdge {
     /// Binary encoding: 7 bits (0..127) in byte 2 bits [6:0] of the graph edge
     /// (bit 7 of byte 2 is `to_port`). See `parse_graph_edge`.
     pub buffer_group: u8,
+    /// Edge class metadata (Local, DmaOwned, CrossCore).
+    /// Encoded in bits [5:4] of byte 3. Pure metadata on single-core; no runtime cost.
+    pub edge_class: EdgeClass,
 }
 
 // ============================================================================
@@ -459,9 +477,10 @@ pub struct ConfigHeader {
     pub checksum: u16,
     pub module_count: u8,
     pub edge_count: u8,
-    pub reserved0: u8,
-    pub reserved1: u8,
-    /// Graph-level sample rate (0 = not set). Bytes 12-15 of binary header.
+    /// Tick period in microseconds (bytes 10-11). 0 = default 1000us.
+    /// Valid range: 100-50000.
+    pub tick_us: u16,
+    /// Graph-level sample rate (bytes 12-15). 0 = not set.
     pub graph_sample_rate: u32,
 }
 
@@ -485,8 +504,7 @@ impl Config {
                 checksum: 0,
                 module_count: 0,
                 edge_count: 0,
-                reserved0: 0,
-                reserved1: 0,
+                tick_us: 0,
                 graph_sample_rate: 0,
             },
             modules: [None; MAX_MODULES],
@@ -555,8 +573,7 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         let checksum = read_u16(flash_ptr.add(6));
         let module_count = *flash_ptr.add(8);
         let edge_count = *flash_ptr.add(9);
-        let reserved0 = *flash_ptr.add(10);
-        let reserved1 = *flash_ptr.add(11);
+        let tick_us = read_u16(flash_ptr.add(10));
         let graph_sample_rate = read_u32(flash_ptr.add(12));
 
         ConfigHeader {
@@ -565,8 +582,7 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
             checksum,
             module_count,
             edge_count,
-            reserved0,
-            reserved1,
+            tick_us,
             graph_sample_rate,
         }
     };
@@ -694,12 +710,14 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
     unsafe {
         let name_hash = read_u32(ptr.add(2));
         let id = *ptr.add(6);
+        let domain_id = *ptr.add(7);
 
         let params_len = entry_len.saturating_sub(8);
         if params_len == 0 {
             return Some(ModuleEntry {
                 name_hash,
                 id,
+                domain_id,
                 params_ptr: core::ptr::null(),
                 params_len: 0,
             });
@@ -712,6 +730,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
         Some(ModuleEntry {
             name_hash,
             id,
+            domain_id,
             params_ptr: arena_buf.as_ptr(),
             params_len,
         })
@@ -737,9 +756,16 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
         let to_port = (byte2 >> 7) & 1;
         let buffer_group = byte2 & 0x7F;
         let port_byte = *ptr.add(3);
-        let from_port_index = (port_byte >> 4) & 0x0F;
+        // from_port_index: bits [7:6] (max 3), edge_class: bits [5:4], to_port_index: bits [3:0]
+        let from_port_index = (port_byte >> 6) & 0x03;
         let to_port_index = port_byte & 0x0F;
-        GraphEdge { from_id, to_id, to_port, from_port_index, to_port_index, buffer_group }
+        let edge_class_raw = (port_byte >> 4) & 0x03;
+        let edge_class = match edge_class_raw {
+            1 => EdgeClass::DmaOwned,
+            2 => EdgeClass::CrossCore,
+            _ => EdgeClass::Local,
+        };
+        GraphEdge { from_id, to_id, to_port, from_port_index, to_port_index, buffer_group, edge_class }
     }
 }
 

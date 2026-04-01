@@ -629,14 +629,15 @@ unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     uart_puts(b"\r\n");
 }
 
-static mut TICKS_PER_MS: u32 = 0;
+/// Timer ticks per scheduler tick (set from tick_us config or default 1ms)
+static mut TICKS_PER_TICK: u32 = 0;
 
 #[no_mangle]
 unsafe extern "C" fn irq_handler() {
     let iar = core::ptr::read_volatile(GICC_IAR);
     let int_id = iar & 0x3FF;
     if int_id == TIMER_PPI {
-        timer_set(TICKS_PER_MS);
+        timer_set(TICKS_PER_TICK);
         scheduler::DBG_TICK += 1;
     }
     core::ptr::write_volatile(GICC_EOIR, iar);
@@ -732,11 +733,13 @@ pub extern "C" fn main() -> ! {
     uart_puts(b" Hz\r\n");
 
     // Exception vectors + GIC + timer
+    // Timer tick period will be recalculated after config is parsed (tick_us).
+    // Start with 1ms default so the system runs during init.
     unsafe {
         core::arch::asm!("adr {tmp}, exception_vectors", "msr vbar_el1, {tmp}", tmp = out(reg) _);
         gic_init();
-        TICKS_PER_MS = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
-        timer_set(TICKS_PER_MS);
+        TICKS_PER_TICK = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
+        timer_set(TICKS_PER_TICK);
         core::arch::asm!("msr daifclr, #2"); // enable IRQs
     }
 
@@ -759,6 +762,23 @@ pub extern "C" fn main() -> ! {
     }
     let n_modules = cfg.module_count as usize;
     let n_edges = cfg.edge_count as usize;
+
+    // Reconfigure timer tick from config tick_us (E4-S1)
+    let tick_us = if cfg.header.tick_us > 0 { cfg.header.tick_us as u32 } else { 1000 };
+    unsafe {
+        // freq is in Hz, so ticks_per_us = freq / 1_000_000
+        // TICKS_PER_TICK = tick_us * (freq / 1_000_000) = tick_us * freq / 1_000_000
+        TICKS_PER_TICK = if freq > 0 {
+            ((tick_us as u64) * freq / 1_000_000) as u32
+        } else {
+            62500 * tick_us / 1000
+        };
+        timer_set(TICKS_PER_TICK);
+    }
+    uart_puts(b"[timer] tick_us=");
+    uart_put_u32(tick_us);
+    uart_puts(b"\r\n");
+
     uart_puts(b"[config] ");
     uart_put_u32(n_modules as u32);
     uart_puts(b" modules, ");
