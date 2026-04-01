@@ -8,14 +8,18 @@
 //   - E3-S7: Secondary core parking (Pi 5 boots all 4 cores; we park 1-3 in WFE)
 //   - E3-S2: Early MMU init with identity-mapped page tables (cacheable DRAM, device MMIO)
 //   - E3-S4/S5: RP1 peripheral access via PCIe BAR (GPIO, SPI, I2C register bridges)
+//   - E6: Multi-domain execution — modules assigned to domains by config, secondary cores woken
 //
 // Fully config-driven: YAML -> config.bin + modules.bin embedded at compile time.
 
 use core::panic::PanicInfo;
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use fluxor::kernel::scheduler;
 use fluxor::kernel::loader;
+use fluxor::kernel::cross_domain;
+use fluxor::kernel::config::EdgeClass;
 
 // Embedded module table + config — built by `make vm` or `make cm5`
 #[repr(C, align(4096))]
@@ -532,6 +536,15 @@ unsafe fn gic_init() {
     core::ptr::write_volatile(GICC_BASE as *mut u32, 1); // GICC_CTLR: enable
 }
 
+/// Initialize GIC CPU interface on a secondary core.
+/// Each core needs its own GICC setup for PPIs (like the timer).
+unsafe fn gic_init_secondary() {
+    core::ptr::write_volatile((GICC_BASE + 0x004) as *mut u32, 0xFF); // PMR
+    core::ptr::write_volatile(GICC_BASE as *mut u32, 1); // GICC_CTLR
+    // Enable timer PPI for this core
+    core::ptr::write_volatile((GICD_BASE + 0x100) as *mut u32, 1u32 << TIMER_PPI);
+}
+
 // ============================================================================
 // ARM Generic Timer
 // ============================================================================
@@ -559,6 +572,7 @@ unsafe fn timer_set(ticks: u32) {
 global_asm!(
     ".section .text",
     ".balign 2048",
+    ".global exception_vectors",
     "exception_vectors:",
     // Current EL with SP_EL0 (4 entries)
     ".balign 128", "b unhandled_exception",  // Synchronous
@@ -632,16 +646,76 @@ unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
 /// Timer ticks per scheduler tick (set from tick_us config or default 1ms)
 static mut TICKS_PER_TICK: u32 = 0;
 
+/// Per-core tick counters. Core 0 uses DBG_TICK for backward compatibility.
+/// Secondary cores use this array.
+static CORE_TICKS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Read the current core's MPIDR Aff0 field (core number 0-3).
+#[inline(always)]
+fn current_core_id() -> u8 {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)); }
+    (mpidr & 0xFF) as u8
+}
+
 #[no_mangle]
 unsafe extern "C" fn irq_handler() {
     let iar = core::ptr::read_volatile(GICC_IAR);
     let int_id = iar & 0x3FF;
     if int_id == TIMER_PPI {
         timer_set(TICKS_PER_TICK);
-        scheduler::DBG_TICK += 1;
+        let core_id = current_core_id() as usize;
+        if core_id == 0 {
+            scheduler::DBG_TICK += 1;
+        }
+        if core_id < 4 {
+            CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
+        }
     }
     core::ptr::write_volatile(GICC_EOIR, iar);
 }
+
+// ============================================================================
+// Multi-domain module storage (E6)
+// ============================================================================
+
+/// Maximum modules per domain on this platform.
+const MAX_MODS_PER_DOMAIN: usize = 8;
+
+/// Module storage for each domain. Domain 0 is on core 0, domain 1 on core 1, etc.
+/// Each domain's modules array is only accessed by its owning core after init.
+struct DomainModules {
+    modules: [Option<loader::DynamicModule>; MAX_MODS_PER_DOMAIN],
+    count: usize,
+    /// Local channel handles per module: input, output, ctrl.
+    /// Used for cross-domain channel pumping.
+    mod_in: [i32; MAX_MODS_PER_DOMAIN],
+    mod_out: [i32; MAX_MODS_PER_DOMAIN],
+}
+
+impl DomainModules {
+    const fn new() -> Self {
+        Self {
+            modules: [const { None }; MAX_MODS_PER_DOMAIN],
+            count: 0,
+            mod_in: [-1; MAX_MODS_PER_DOMAIN],
+            mod_out: [-1; MAX_MODS_PER_DOMAIN],
+        }
+    }
+}
+
+/// Per-domain module storage. Indexed by domain_id.
+/// SAFETY: After init, each domain's storage is only accessed by its owning core.
+static mut DOMAIN_MODULES: [DomainModules; cross_domain::MAX_DOMAINS] =
+    [const { DomainModules::new() }; cross_domain::MAX_DOMAINS];
+
+/// Signal that domain module storage has been initialized and secondary cores can start.
+static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
 // E3-S7: Entry point with secondary core parking
@@ -793,26 +867,84 @@ pub extern "C" fn main() -> ! {
         loop { unsafe { core::arch::asm!("wfi") }; }
     }
 
-    // Create channels from graph edges
+    // Create channels from graph edges.
+    // Track per-global-module-index: input, output, ctrl channel handles.
     let mut mod_in: [i32; MAX_MODULES] = [-1; MAX_MODULES];
     let mut mod_out: [i32; MAX_MODULES] = [-1; MAX_MODULES];
     let mut mod_ctrl: [i32; MAX_MODULES] = [-1; MAX_MODULES];
 
+    // Track which edges are cross-domain so we can set up CrossDomainChannels.
+    // For cross-domain edges, we still create local pipe channels on each side,
+    // and the domain loop pumps data between the cross-domain ring buffer and
+    // the local channel.
     let mut e = 0usize;
     while e < n_edges {
         if let Some(ref edge) = cfg.graph_edges[e] {
-            let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-            if ch >= 0 {
-                let from = edge.from_id as usize;
-                let to = edge.to_id as usize;
-                if from < MAX_MODULES && mod_out[from] < 0 {
-                    mod_out[from] = ch;
+            let from = edge.from_id as usize;
+            let to = edge.to_id as usize;
+
+            // Determine if this edge crosses domains
+            let from_domain = if from < n_modules {
+                cfg.modules[from].as_ref().map(|m| m.domain_id).unwrap_or(0)
+            } else { 0 };
+            let to_domain = if to < n_modules {
+                cfg.modules[to].as_ref().map(|m| m.domain_id).unwrap_or(0)
+            } else { 0 };
+
+            let is_cross = from_domain != to_domain || edge.edge_class == EdgeClass::CrossCore;
+
+            if is_cross {
+                // Cross-domain edge: create separate local channels on each side
+                // and a CrossDomainChannel to bridge them.
+                let out_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+                let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+
+                if out_ch >= 0 && in_ch >= 0 {
+                    if from < MAX_MODULES && mod_out[from] < 0 {
+                        mod_out[from] = out_ch;
+                    }
+                    if to < MAX_MODULES {
+                        if edge.to_port == 0 && mod_in[to] < 0 {
+                            mod_in[to] = in_ch;
+                        } else if edge.to_port == 1 && mod_ctrl[to] < 0 {
+                            mod_ctrl[to] = in_ch;
+                        }
+                    }
+
+                    // Allocate a cross-domain channel and register the edge
+                    if let Some(cross_ch_idx) = cross_domain::alloc_cross_channel() {
+                        // Compute per-domain module indices.
+                        // We need to count how many modules with lower global index are
+                        // in the same domain, to find the domain-local index.
+                        let from_mod_in_domain = domain_local_index(&cfg, from, from_domain, n_modules);
+                        let to_mod_in_domain = domain_local_index(&cfg, to, to_domain, n_modules);
+
+                        unsafe {
+                            cross_domain::register_cross_edge(cross_domain::CrossDomainEdge {
+                                from_domain,
+                                from_module: from_mod_in_domain as u8,
+                                from_port: 0,
+                                to_domain,
+                                to_module: to_mod_in_domain as u8,
+                                to_port: edge.to_port,
+                                channel_idx: cross_ch_idx as u8,
+                            });
+                        }
+                    }
                 }
-                if to < MAX_MODULES {
-                    if edge.to_port == 0 && mod_in[to] < 0 {
-                        mod_in[to] = ch;
-                    } else if edge.to_port == 1 && mod_ctrl[to] < 0 {
-                        mod_ctrl[to] = ch;
+            } else {
+                // Same-domain edge: single shared channel
+                let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+                if ch >= 0 {
+                    if from < MAX_MODULES && mod_out[from] < 0 {
+                        mod_out[from] = ch;
+                    }
+                    if to < MAX_MODULES {
+                        if edge.to_port == 0 && mod_in[to] < 0 {
+                            mod_in[to] = ch;
+                        } else if edge.to_port == 1 && mod_ctrl[to] < 0 {
+                            mod_ctrl[to] = ch;
+                        }
                     }
                 }
             }
@@ -825,15 +957,30 @@ pub extern "C" fn main() -> ! {
 
     let syscalls = fluxor::kernel::syscalls::get_table_for_module_type(0);
 
-    const MAX_MODS: usize = 8;
-    let mut modules: [Option<loader::DynamicModule>; MAX_MODS] = [const { None }; MAX_MODS];
-    let mut mod_count = 0usize;
-
+    // Instantiate modules and assign to domains based on entry.domain_id.
     let mut i = 0usize;
-    while i < n_modules && i < MAX_MODS {
+    while i < n_modules {
         if let Some(ref entry) = cfg.modules[i] {
+            let domain_id = entry.domain_id as usize;
+            if domain_id >= cross_domain::MAX_DOMAINS {
+                uart_puts(b"[inst] invalid domain_id for module ");
+                uart_put_u32(i as u32);
+                uart_puts(b"\r\n");
+                i += 1;
+                continue;
+            }
+
             if let Ok(m) = ldr.find_by_name_hash(entry.name_hash) {
-                fluxor::kernel::scheduler::set_current_module(mod_count);
+                let dm_ref = unsafe { &mut DOMAIN_MODULES[domain_id] };
+                if dm_ref.count >= MAX_MODS_PER_DOMAIN {
+                    uart_puts(b"[inst] domain ");
+                    uart_put_u32(domain_id as u32);
+                    uart_puts(b" full\r\n");
+                    i += 1;
+                    continue;
+                }
+                let mod_idx = dm_ref.count;
+                fluxor::kernel::scheduler::set_current_module(mod_idx);
                 let result = unsafe {
                     loader::DynamicModule::start_new(
                         &m, syscalls,
@@ -843,16 +990,20 @@ pub extern "C" fn main() -> ! {
                 };
                 match result {
                     Ok(loader::StartNewResult::Ready(dm)) => {
-                        modules[mod_count] = Some(dm);
-                        mod_count += 1;
+                        dm_ref.mod_in[mod_idx] = mod_in[i];
+                        dm_ref.mod_out[mod_idx] = mod_out[i];
+                        dm_ref.modules[mod_idx] = Some(dm);
+                        dm_ref.count += 1;
                     }
                     Ok(loader::StartNewResult::Pending(mut pending)) => {
                         for _ in 0..100 {
                             for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
                             match unsafe { pending.try_complete() } {
                                 Ok(Some(dm)) => {
-                                    modules[mod_count] = Some(dm);
-                                    mod_count += 1;
+                                    dm_ref.mod_in[mod_idx] = mod_in[i];
+                                    dm_ref.mod_out[mod_idx] = mod_out[i];
+                                    dm_ref.modules[mod_idx] = Some(dm);
+                                    dm_ref.count += 1;
                                     break;
                                 }
                                 Ok(None) => {}
@@ -867,39 +1018,259 @@ pub extern "C" fn main() -> ! {
         i += 1;
     }
 
+    // Set up domain execution state for all domains that have modules.
+    let mut d = 0usize;
+    while d < cross_domain::MAX_DOMAINS {
+        let mod_count = unsafe { DOMAIN_MODULES[d].count };
+        if mod_count > 0 {
+            unsafe {
+                let ds = cross_domain::domain_state(d);
+                ds.core_id = d as u8; // Domain N runs on core N
+                ds.module_count = mod_count as u8;
+                ds.active = true;
+            }
+            uart_puts(b"[domain] ");
+            uart_put_u32(d as u32);
+            uart_puts(b": ");
+            uart_put_u32(mod_count as u32);
+            uart_puts(b" modules (core ");
+            uart_put_u32(d as u32);
+            uart_puts(b")\r\n");
+        }
+        d += 1;
+    }
+
     // Re-enable IRQs
     drop(_inst_guard);
 
+    let total_mods: usize = {
+        let mut total = 0usize;
+        let mut dd = 0;
+        while dd < cross_domain::MAX_DOMAINS {
+            total += unsafe { DOMAIN_MODULES[dd].count };
+            dd += 1;
+        }
+        total
+    };
     uart_puts(b"[inst] ");
-    uart_put_u32(mod_count as u32);
-    uart_puts(b" modules loaded\r\n");
+    uart_put_u32(total_mods as u32);
+    uart_puts(b" modules loaded total\r\n");
 
-    uart_puts(b"[sched] starting\r\n");
+    // Signal init complete — secondary cores can start
+    INIT_COMPLETE.store(1, Ordering::Release);
 
-    // Main loop — step all modules with step guard
+    // Log cross-domain channel status
+    uart_puts(b"[cross] channels=");
+    uart_put_u32(cross_domain::cross_edge_count() as u32);
+    uart_puts(b" dma_arena_used=");
+    uart_put_u32(cross_domain::dma_arena_used() as u32);
+    uart_puts(b"\r\n");
+
+    // Wake secondary cores that have non-empty domains assigned
+    wake_secondary_cores();
+
+    uart_puts(b"[sched] starting domain 0 on core 0\r\n");
+
+    // Main loop — domain 0 on core 0
+    run_domain_loop(0)
+}
+
+/// Compute domain-local module index for a given global module index.
+/// Counts how many modules with global index < `global_idx` are in the same domain.
+fn domain_local_index(
+    cfg: &fluxor::kernel::config::Config,
+    global_idx: usize,
+    domain_id: u8,
+    n_modules: usize,
+) -> usize {
+    let mut count = 0usize;
+    let mut j = 0;
+    while j < n_modules && j < global_idx {
+        if let Some(ref entry) = cfg.modules[j] {
+            if entry.domain_id == domain_id {
+                count += 1;
+            }
+        }
+        j += 1;
+    }
+    count
+}
+
+// ============================================================================
+// Domain execution loop (E6)
+// ============================================================================
+
+/// Run the main loop for a domain. Steps all modules assigned to that domain.
+///
+/// This function never returns. On core 0 it is called directly from main().
+/// On secondary cores it is called from the secondary_core_main() entry point.
+fn run_domain_loop(domain_id: usize) -> ! {
     use fluxor::modules::Module;
     use fluxor::kernel::step_guard;
+
     loop {
         unsafe { core::arch::asm!("wfi") };
-        unsafe { scheduler::DBG_TICK += 1; }
-        let tick = unsafe { scheduler::DBG_TICK };
 
+        let core_id = current_core_id() as usize;
+        let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
+
+        // Step all modules in this domain
+        let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
         let mut j = 0;
-        while j < mod_count {
-            if let Some(ref mut m) = modules[j] {
+        while j < dm.count {
+            if let Some(ref mut m) = dm.modules[j] {
                 step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
                 let _ = m.step();
                 step_guard::disarm();
                 step_guard::post_step_check();
                 if step_guard::check_and_clear_timeout() {
-                    log::warn!("[guard] module {} timeout", j);
+                    log::warn!("[guard] domain {} module {} timeout", domain_id, j);
                 }
             }
             j += 1;
         }
 
-        if tick % 10000 == 0 {
-            log::info!("[sched] alive t={}", tick);
+        // Pump cross-domain channels.
+        // For edges where we are the producer (from_domain == domain_id):
+        //   Read from local output channel → send to cross-domain ring.
+        // For edges where we are the consumer (to_domain == domain_id):
+        //   Receive from cross-domain ring → write to local input channel.
+        let n_cross = cross_domain::cross_edge_count();
+        let mut ei = 0;
+        while ei < n_cross {
+            if let Some(edge) = cross_domain::get_cross_edge(ei) {
+                if let Some(ch) = cross_domain::get_cross_channel(edge.channel_idx as usize) {
+                    if edge.from_domain == domain_id as u8 {
+                        // Producer side: drain local output channel into cross-domain ring
+                        let mod_local = edge.from_module as usize;
+                        let dm_src = unsafe { &DOMAIN_MODULES[domain_id] };
+                        if mod_local < dm_src.count {
+                            let out_handle = dm_src.mod_out[mod_local];
+                            if out_handle >= 0 {
+                                let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                                let n = unsafe {
+                                    fluxor::kernel::channel::channel_read(
+                                        out_handle, buf.as_mut_ptr(), buf.len(),
+                                    )
+                                };
+                                if n > 0 {
+                                    let _ = ch.send(&buf[..n as usize]);
+                                }
+                            }
+                        }
+                    }
+                    if edge.to_domain == domain_id as u8 {
+                        // Consumer side: receive from cross-domain ring into local input
+                        let mod_local = edge.to_module as usize;
+                        let dm_dst = unsafe { &DOMAIN_MODULES[domain_id] };
+                        if mod_local < dm_dst.count {
+                            let in_handle = dm_dst.mod_in[mod_local];
+                            if in_handle >= 0 {
+                                let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                                if let Some(len) = ch.try_recv(&mut buf) {
+                                    unsafe {
+                                        fluxor::kernel::channel::channel_write(
+                                            in_handle, buf.as_ptr(), len,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ei += 1;
+        }
+
+        // Periodic status (every ~10 seconds at 1kHz tick)
+        if domain_id == 0 && tick % 10000 == 0 && tick > 0 {
+            log::info!("[sched] alive t={} core={}", tick, core_id);
+        }
+    }
+}
+
+// ============================================================================
+// Secondary core entry points (E6)
+// ============================================================================
+
+/// Entry point for secondary cores after wake.
+///
+/// Waits for init_complete, sets up its own timer and GIC, then runs its
+/// assigned domain loop. If no domain is assigned, parks in WFE.
+fn secondary_core_main_1() -> ! {
+    secondary_core_main(1)
+}
+
+fn secondary_core_main_2() -> ! {
+    secondary_core_main(2)
+}
+
+fn secondary_core_main_3() -> ! {
+    secondary_core_main(3)
+}
+
+fn secondary_core_main(domain_id: usize) -> ! {
+    // Wait for init to complete on core 0
+    while INIT_COMPLETE.load(Ordering::Acquire) == 0 {
+        unsafe { core::arch::asm!("wfe"); }
+    }
+
+    let core_id = current_core_id();
+    uart_puts(b"[core");
+    uart_put_u32(core_id as u32);
+    uart_puts(b"] started, domain=");
+    uart_put_u32(domain_id as u32);
+    uart_puts(b"\r\n");
+
+    // Set up GIC CPU interface for this core
+    unsafe {
+        gic_init_secondary();
+        // Set up the timer for this core
+        timer_set(TICKS_PER_TICK);
+        // Enable IRQs
+        core::arch::asm!("msr daifclr, #2");
+    }
+
+    // Check if this domain is active
+    let ds = cross_domain::domain_state_ref(domain_id);
+    if !ds.active || ds.module_count == 0 {
+        uart_puts(b"[core");
+        uart_put_u32(core_id as u32);
+        uart_puts(b"] no work, parking\r\n");
+        loop { unsafe { core::arch::asm!("wfe"); } }
+    }
+
+    // Run the domain loop
+    run_domain_loop(domain_id)
+}
+
+/// Wake all secondary cores that have domains assigned.
+///
+/// Called after module instantiation on core 0. Each secondary core
+/// gets its own entry function that maps to its domain.
+pub fn wake_secondary_cores() {
+    let entries: [fn() -> !; 3] = [
+        secondary_core_main_1,
+        secondary_core_main_2,
+        secondary_core_main_3,
+    ];
+
+    for core_id in 1u8..=3 {
+        let domain_id = core_id as usize;
+        let ds = cross_domain::domain_state_ref(domain_id);
+        if ds.active && ds.module_count > 0 {
+            uart_puts(b"[wake] core ");
+            uart_put_u32(core_id as u32);
+            uart_puts(b" for domain ");
+            uart_put_u32(domain_id as u32);
+            uart_puts(b"\r\n");
+
+            let entry = entries[(core_id - 1) as usize];
+            if !cross_domain::wake_core(core_id, entry) {
+                uart_puts(b"[wake] FAILED core ");
+                uart_put_u32(core_id as u32);
+                uart_puts(b"\r\n");
+            }
         }
     }
 }
@@ -929,6 +1300,8 @@ impl log::Log for UartLogger {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    uart_puts(b"[fluxor] PANIC\r\n");
+    uart_puts(b"[fluxor] PANIC on core ");
+    uart_put_u32(current_core_id() as u32);
+    uart_puts(b"\r\n");
     loop { unsafe { core::arch::asm!("wfi") }; }
 }

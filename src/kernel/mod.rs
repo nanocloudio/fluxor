@@ -22,3 +22,5 @@ pub mod chip;
 pub mod guard;
 pub mod heap;
 pub mod step_guard;
+#[cfg(feature = "chip-bcm2712")]
+pub mod cross_domain;

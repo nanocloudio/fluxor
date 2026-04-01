@@ -1,0 +1,67 @@
+# Multi-Domain Pipeline (QEMU virt / E6)
+#
+# Demonstrates multi-core execution with two domains:
+#
+#   Domain 0 (core 0): virtio_net <-> ip <-> http_server
+#   Domain 1 (core 1): debug (logging module)
+#
+# Cross-domain edge connects http_server output to debug input, bridged by
+# a lock-free SPSC ring buffer (CrossDomainChannel). The domain 0 loop reads
+# http_server's output channel and sends messages into the ring. The domain 1
+# loop receives from the ring and writes to debug's input channel.
+#
+# Usage:
+#   1. make vm VM_CONFIG=examples/qemu-virt/multi_domain.yaml
+#   2. qemu-system-aarch64 -machine virt -cpu cortex-a76 -smp 2 -m 2G \
+#        -nographic -device virtio-net-device,netdev=net0,mac=52:54:00:12:34:56 \
+#        -netdev user,id=net0,hostfwd=tcp::18080-:80 -kernel vm/kernel8.img
+#   3. curl http://localhost:18080/
+#
+# With -smp 2, QEMU provides two Cortex-A76 cores. Core 1 is woken via PSCI
+# CPU_ON and runs domain 1's step loop independently.
+#
+# Expected boot log:
+#   [domain] 0: 3 modules (core 0)
+#   [domain] 1: 1 modules (core 1)
+#   [wake] core 1 for domain 1
+#   [core1] started, domain=1
+target: qemu-virt
+
+execution:
+  domains:
+    - name: network
+    - name: compute
+
+modules:
+  # Domain 0 (network): Network stack
+  - name: virtio_net
+    domain: network
+
+  - name: ip
+    domain: network
+    use_dhcp: 1
+
+  - name: http_server
+    domain: network
+    port: 80
+    routes:
+      - path: "/"
+        body: "<html><body><h1>Multi-Domain Pipeline</h1><p>Domain 0: network (core 0). Domain 1: compute (core 1).</p></body></html>"
+
+  # Domain 1 (compute): Debug logger on core 1
+  - name: debug
+    domain: compute
+    mode: plaintext
+
+wiring:
+  - from: virtio_net.frames_rx
+    to: ip.frames_rx
+  - from: ip.frames_tx
+    to: virtio_net.frames_tx
+  # Cross-domain edge: http_server output -> debug input (bridged via ring buffer)
+  - from: http_server.out
+    to: debug.in
+    edge_class: cross_core
+
+services:
+  socket: ip
