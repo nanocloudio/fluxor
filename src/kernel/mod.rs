@@ -26,3 +26,6 @@ pub mod bridge;
 pub mod isr_tier;
 #[cfg(feature = "chip-bcm2712")]
 pub mod cross_domain;
+pub mod mpu;
+#[cfg(feature = "chip-bcm2712")]
+pub mod mmu;

@@ -23,11 +23,18 @@ struct TomlSiliconFile {
     peripherals: TomlPeripherals,
     memory: Option<TomlMemoryConfig>,
     kernel: Option<TomlKernelConfig>,
+    isolation: Option<TomlIsolationConfig>,
 }
 
 #[derive(Deserialize, Default)]
 struct TomlKernelConfig {
     state_arena_kb: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlIsolationConfig {
+    mpu_regions: Option<u8>,
+    has_mmu: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +159,10 @@ pub struct TargetDescriptor {
     pub hardware_defaults: Option<serde_json::Value>,
     /// State arena size in KB (from [kernel] section, default 256)
     pub state_arena_kb: u32,
+    /// Number of MPU regions available (0 = no MPU, e.g. Cortex-M0+)
+    pub mpu_regions: u8,
+    /// Whether the target has an MMU (for full page-table isolation)
+    pub has_mmu: bool,
 }
 
 /// Build configuration for targets that support kernel compilation.
@@ -359,6 +370,12 @@ fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
         state_arena_kb: silicon.kernel.as_ref()
             .and_then(|k| k.state_arena_kb)
             .unwrap_or(256),
+        mpu_regions: silicon.isolation.as_ref()
+            .and_then(|i| i.mpu_regions)
+            .unwrap_or(0),
+        has_mmu: silicon.isolation.as_ref()
+            .and_then(|i| i.has_mmu)
+            .unwrap_or(false),
     })
 }
 

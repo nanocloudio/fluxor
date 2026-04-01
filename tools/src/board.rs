@@ -72,6 +72,9 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
         validate_isr_modules(modules, target, &mut result);
     }
 
+    // Validate isolation settings if present
+    validate_isolation(config, target, &mut result);
+
     Ok(result)
 }
 
@@ -576,5 +579,36 @@ fn validate_sink_pins(
             }
         }
         _ => {}
+    }
+}
+
+/// Validate isolation settings against target capabilities.
+///
+/// Checks that `protection: isolated` is only set on targets that have
+/// an MPU (RP2350, 8 regions) or MMU (BCM2712). RP2040 (Cortex-M0+) has
+/// no MPU and cannot support hardware isolation.
+fn validate_isolation(
+    config: &Value,
+    target: &TargetDescriptor,
+    result: &mut ValidationResult,
+) {
+    // Check for protection setting in config (can be at top level or in graph)
+    let protection = config
+        .get("protection")
+        .or_else(|| config.get("graph").and_then(|g| g.get("protection")))
+        .and_then(|v| v.as_str());
+
+    if let Some(mode) = protection {
+        if mode == "isolated" {
+            let has_isolation = target.mpu_regions >= 8 || target.has_mmu;
+            if !has_isolation {
+                result.add_error(format!(
+                    "protection: isolated requires MPU or MMU, but target '{}' has \
+                     {} MPU regions and has_mmu={}. RP2040 (Cortex-M0+) does not \
+                     support hardware isolation.",
+                    target.id, target.mpu_regions, target.has_mmu,
+                ));
+            }
+        }
     }
 }

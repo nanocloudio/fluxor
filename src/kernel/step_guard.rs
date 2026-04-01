@@ -65,6 +65,8 @@ pub mod fault_type {
     pub const STEP_ERROR: u8 = 2;
     /// Module caused a hard fault (bus error, etc).
     pub const HARD_FAULT: u8 = 3;
+    /// Module caused an MPU/MMU memory protection fault.
+    pub const MPU_FAULT: u8 = 4;
 }
 
 /// Per-module fault statistics (queryable via dev_query).
@@ -191,10 +193,26 @@ static GUARDED_MODULE: AtomicU8 = AtomicU8::new(0xFF);
 /// Whether the step guard is currently armed.
 static GUARD_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Flag: set by MPU/MMU fault handler when a memory protection violation occurs.
+static MPU_FAULT_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Check if the last step timed out (and clear the flag).
 #[inline]
 pub fn check_and_clear_timeout() -> bool {
     STEP_TIMED_OUT.swap(false, Ordering::AcqRel)
+}
+
+/// Record an MPU/MMU fault for the current module.
+/// Called from the MemManage (Cortex-M) or Data Abort (aarch64) handler.
+pub fn record_mpu_fault(module_idx: usize) {
+    MPU_FAULT_PENDING.store(true, Ordering::Release);
+    GUARDED_MODULE.store(module_idx as u8, Ordering::Release);
+}
+
+/// Check if an MPU fault is pending (and clear the flag).
+#[inline]
+pub fn check_and_clear_mpu_fault() -> bool {
+    MPU_FAULT_PENDING.swap(false, Ordering::AcqRel)
 }
 
 /// Check if a timeout is pending without clearing.

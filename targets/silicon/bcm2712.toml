@@ -29,6 +29,9 @@ pio_count = 0
 pio_state_machines = 0
 dma_channels = 16
 
+[isolation]
+has_mmu = true
+
 [kernel]
 state_arena_kb = 256
 buffer_arena_kb = 32
