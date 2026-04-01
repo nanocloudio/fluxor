@@ -470,6 +470,8 @@ pub enum EdgeClass {
     DmaOwned = 1,
     /// Cross-core: connects modules in different execution domains
     CrossCore = 2,
+    /// NIC ring: zero-copy packet buffer via NicRing DMA descriptors
+    NicRing = 3,
 }
 
 /// Graph edge connecting two modules
@@ -812,6 +814,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
         let edge_class = match edge_class_raw {
             1 => EdgeClass::DmaOwned,
             2 => EdgeClass::CrossCore,
+            3 => EdgeClass::NicRing,
             _ => EdgeClass::Local,
         };
         GraphEdge { from_id, to_id, to_port, from_port_index, to_port_index, buffer_group, edge_class }

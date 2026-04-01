@@ -788,8 +788,8 @@ global_asm!(
     "9:",
 
     // Zero BSS
-    "    adr x0, __bss_start",
-    "    adr x1, __bss_end",
+    "    ldr x0, =__bss_start",
+    "    ldr x1, =__bss_end",
     "0:  cmp x0, x1",
     "    b.ge 1f",
     "    str xzr, [x0], #8",

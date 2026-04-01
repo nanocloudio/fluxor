@@ -2,10 +2,11 @@
 
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH6, I2C0, I2C1, PIO0, PIO1, UART0, UART1, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, DMA_CH4, DMA_CH5, DMA_CH6, I2C0, I2C1, PIO0, PIO1, UART0, UART1, USB};
 #[cfg(not(feature = "chip-rp2040"))]
 use embassy_rp::peripherals::PIO2;
 use embassy_rp::adc::{self as embassy_adc, InterruptHandler as AdcInterruptHandler};
+use embassy_rp::dma::InterruptHandler as DmaInterruptHandler;
 use embassy_rp::i2c::{I2c, InterruptHandler as I2cInterruptHandler};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::spi::{Config as SpiCfg, Phase, Polarity, Spi};
@@ -28,6 +29,7 @@ use fluxor::kernel::planner::{self, PioRole};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    DMA_IRQ_0 => DmaInterruptHandler<DMA_CH0>, DmaInterruptHandler<DMA_CH1>, DmaInterruptHandler<DMA_CH2>, DmaInterruptHandler<DMA_CH3>, DmaInterruptHandler<DMA_CH4>, DmaInterruptHandler<DMA_CH5>, DmaInterruptHandler<DMA_CH6>;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
 
@@ -193,7 +195,7 @@ async fn main(spawner: Spawner) {
 
     // Spawn USB logger and wait for enumeration
     let usb_driver = Driver::new(p.USB, Irqs);
-    spawner.spawn(logger_task(usb_driver)).unwrap();
+    spawner.spawn(logger_task(usb_driver).unwrap());
     Timer::after(Duration::from_secs(1)).await;
 
     log::info!("[fluxor] starting");
@@ -223,29 +225,29 @@ async fn main(spawner: Spawner) {
         let cfg = make_spi_config(spi.freq_hz);
         let bus = match (spi.miso, spi.mosi, spi.sck) {
             (0, 3, 2) => {
-                let s = Spi::new(p.SPI0, p.PIN_2, p.PIN_3, p.PIN_0, p.DMA_CH2, p.DMA_CH3, cfg);
+                let s = Spi::new(p.SPI0, p.PIN_2, p.PIN_3, p.PIN_0, p.DMA_CH2, p.DMA_CH3, Irqs, cfg);
                 SPI_BUS_0.init(SpiBus::new_spi0(s))
             }
             (4, 7, 6) => {
-                let s = Spi::new(p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, p.DMA_CH2, p.DMA_CH3, cfg);
+                let s = Spi::new(p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, p.DMA_CH2, p.DMA_CH3, Irqs, cfg);
                 SPI_BUS_0.init(SpiBus::new_spi0(s))
             }
             (16, 19, 18) => {
-                let s = Spi::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH2, p.DMA_CH3, cfg);
+                let s = Spi::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, p.DMA_CH2, p.DMA_CH3, Irqs, cfg);
                 SPI_BUS_0.init(SpiBus::new_spi0(s))
             }
             (20, 23, 22) => {
-                let s = Spi::new(p.SPI0, p.PIN_22, p.PIN_23, p.PIN_20, p.DMA_CH2, p.DMA_CH3, cfg);
+                let s = Spi::new(p.SPI0, p.PIN_22, p.PIN_23, p.PIN_20, p.DMA_CH2, p.DMA_CH3, Irqs, cfg);
                 SPI_BUS_0.init(SpiBus::new_spi0(s))
             }
             #[cfg(not(feature = "chip-rp2040"))]
             (32, 35, 34) => {
-                let s = Spi::new(p.SPI0, p.PIN_34, p.PIN_35, p.PIN_32, p.DMA_CH2, p.DMA_CH3, cfg);
+                let s = Spi::new(p.SPI0, p.PIN_34, p.PIN_35, p.PIN_32, p.DMA_CH2, p.DMA_CH3, Irqs, cfg);
                 SPI_BUS_0.init(SpiBus::new_spi0(s))
             }
             #[cfg(not(feature = "chip-rp2040"))]
             (36, 39, 38) => {
-                let s = Spi::new(p.SPI0, p.PIN_38, p.PIN_39, p.PIN_36, p.DMA_CH2, p.DMA_CH3, cfg);
+                let s = Spi::new(p.SPI0, p.PIN_38, p.PIN_39, p.PIN_36, p.DMA_CH2, p.DMA_CH3, Irqs, cfg);
                 SPI_BUS_0.init(SpiBus::new_spi0(s))
             }
             _ => {
@@ -265,34 +267,34 @@ async fn main(spawner: Spawner) {
         let cfg = make_spi_config(spi.freq_hz);
         let bus = match (spi.miso, spi.mosi, spi.sck) {
             (8, 11, 10) => {
-                let s = Spi::new(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_8, p.DMA_CH4, p.DMA_CH5, cfg);
+                let s = Spi::new(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_8, p.DMA_CH4, p.DMA_CH5, Irqs, cfg);
                 SPI_BUS_1.init(SpiBus::new_spi1(s))
             }
             (12, 11, 10) => {
-                let s = Spi::new(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH4, p.DMA_CH5, cfg);
+                let s = Spi::new(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH4, p.DMA_CH5, Irqs, cfg);
                 SPI_BUS_1.init(SpiBus::new_spi1(s))
             }
             (12, 15, 14) => {
-                let s = Spi::new(p.SPI1, p.PIN_14, p.PIN_15, p.PIN_12, p.DMA_CH4, p.DMA_CH5, cfg);
+                let s = Spi::new(p.SPI1, p.PIN_14, p.PIN_15, p.PIN_12, p.DMA_CH4, p.DMA_CH5, Irqs, cfg);
                 SPI_BUS_1.init(SpiBus::new_spi1(s))
             }
             (24, 27, 26) => {
-                let s = Spi::new(p.SPI1, p.PIN_26, p.PIN_27, p.PIN_24, p.DMA_CH4, p.DMA_CH5, cfg);
+                let s = Spi::new(p.SPI1, p.PIN_26, p.PIN_27, p.PIN_24, p.DMA_CH4, p.DMA_CH5, Irqs, cfg);
                 SPI_BUS_1.init(SpiBus::new_spi1(s))
             }
             #[cfg(not(feature = "chip-rp2040"))]
             (28, 31, 30) => {
-                let s = Spi::new(p.SPI1, p.PIN_30, p.PIN_31, p.PIN_28, p.DMA_CH4, p.DMA_CH5, cfg);
+                let s = Spi::new(p.SPI1, p.PIN_30, p.PIN_31, p.PIN_28, p.DMA_CH4, p.DMA_CH5, Irqs, cfg);
                 SPI_BUS_1.init(SpiBus::new_spi1(s))
             }
             #[cfg(not(feature = "chip-rp2040"))]
             (40, 43, 42) => {
-                let s = Spi::new(p.SPI1, p.PIN_42, p.PIN_43, p.PIN_40, p.DMA_CH4, p.DMA_CH5, cfg);
+                let s = Spi::new(p.SPI1, p.PIN_42, p.PIN_43, p.PIN_40, p.DMA_CH4, p.DMA_CH5, Irqs, cfg);
                 SPI_BUS_1.init(SpiBus::new_spi1(s))
             }
             #[cfg(not(feature = "chip-rp2040"))]
             (44, 47, 46) => {
-                let s = Spi::new(p.SPI1, p.PIN_46, p.PIN_47, p.PIN_44, p.DMA_CH4, p.DMA_CH5, cfg);
+                let s = Spi::new(p.SPI1, p.PIN_46, p.PIN_47, p.PIN_44, p.DMA_CH4, p.DMA_CH5, Irqs, cfg);
                 SPI_BUS_1.init(SpiBus::new_spi1(s))
             }
             _ => {
@@ -305,7 +307,7 @@ async fn main(spawner: Spawner) {
     }
 
     // Spawn SPI async task (single task routes to correct bus per handle)
-    spawner.spawn(syscalls::spi_async_task()).unwrap();
+    spawner.spawn(syscalls::spi_async_task().unwrap());
 
     // --- I2C buses ---
     // Safety: Pin peripherals are ZST markers. Planner enforces pin uniqueness across
@@ -455,7 +457,7 @@ async fn main(spawner: Spawner) {
     }
 
     // Spawn I2C async task (single task routes to correct bus per handle)
-    spawner.spawn(syscalls::i2c_async_task()).unwrap();
+    spawner.spawn(syscalls::i2c_async_task().unwrap());
 
     // --- UART bus 0 ---
     static UART_BUS_0: static_cell::StaticCell<UartBus> = static_cell::StaticCell::new();
@@ -534,7 +536,7 @@ async fn main(spawner: Spawner) {
     }
 
     // Spawn UART async task
-    spawner.spawn(syscalls::uart_async_task()).unwrap();
+    spawner.spawn(syscalls::uart_async_task().unwrap());
 
     // --- ADC ---
     {
@@ -543,7 +545,7 @@ async fn main(spawner: Spawner) {
         let temp_ch = embassy_adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
         let adc_bus = ADC_BUS.init(AdcBus::new(adc_dev, temp_ch));
         syscalls::set_adc_bus(adc_bus);
-        spawner.spawn(syscalls::adc_async_task()).unwrap();
+        spawner.spawn(syscalls::adc_async_task().unwrap());
         syscalls::mark_adc_initialized();
     }
 
@@ -586,11 +588,11 @@ async fn main(spawner: Spawner) {
                 pio::setup_pio_pin(entry.data_pin, entry.pio_idx, pio::PioPull::None);
                 pio::setup_pio_pin(entry.clk_pin, entry.pio_idx, pio::PioPull::None);
                 let cmd_runner = PioCmdRunner::new_with_clk(
-                    pio0.sm0, dma_ch0_pio0,
+                    pio0.sm0, dma_ch0_pio0, Irqs,
                     entry.data_pin, entry.clk_pin,
                     0, entry.pio_idx,
                 );
-                spawner.spawn(pio_cmd_runner_task_pio0(cmd_runner)).unwrap();
+                spawner.spawn(pio_cmd_runner_task_pio0(cmd_runner).unwrap());
                 core::mem::forget(pio0.sm1);
                 log::info!("[boot] pio0 cmd dio={} clk={}", entry.data_pin, entry.clk_pin);
             }
@@ -601,11 +603,11 @@ async fn main(spawner: Spawner) {
                     pio::setup_pio_pin(entry.extra_pin, entry.pio_idx, pio::PioPull::PullUp);
                 }
                 let runner = PioStreamRunner::new_with_sideset(
-                    pio0.sm0, dma_ch1_pio0,
+                    pio0.sm0, dma_ch1_pio0, Irqs,
                     entry.data_pin, entry.clk_pin, entry.extra_pin,
                     0, entry.pio_idx,
                 );
-                spawner.spawn(pio_stream_runner_task(runner)).unwrap();
+                spawner.spawn(pio_stream_runner_task(runner).unwrap());
                 // RxStream on same PIO block (SM1) — from plan entry if present
                 if let Some(rx) = rx_on_pio0 {
                     pio::setup_pio_pin(rx.data_pin, rx.pio_idx, pio::PioPull::PullUp);
@@ -616,11 +618,11 @@ async fn main(spawner: Spawner) {
                         pio::setup_pio_pin(rx.extra_pin, rx.pio_idx, pio::PioPull::PullUp);
                     }
                     let rx_runner = PioRxStreamRunner::new_with_sideset(
-                        pio0.sm1, dma_ch6_pio0,
+                        pio0.sm1, dma_ch6_pio0, Irqs,
                         rx.data_pin, rx.clk_pin, rx.extra_pin,
                         0, rx.pio_idx,
                     );
-                    spawner.spawn(pio_rx_stream_runner_task(rx_runner)).unwrap();
+                    spawner.spawn(pio_rx_stream_runner_task(rx_runner).unwrap());
                     log::info!("[boot] pio0 rx data={} clk={} extra={}",
                         rx.data_pin, rx.clk_pin, rx.extra_pin);
                 } else {
@@ -644,11 +646,11 @@ async fn main(spawner: Spawner) {
                 pio::setup_pio_pin(entry.data_pin, entry.pio_idx, pio::PioPull::None);
                 pio::setup_pio_pin(entry.clk_pin, entry.pio_idx, pio::PioPull::None);
                 let cmd_runner = PioCmdRunner::new_with_clk(
-                    pio1.sm0, dma_ch0_pio1,
+                    pio1.sm0, dma_ch0_pio1, Irqs,
                     entry.data_pin, entry.clk_pin,
                     0, entry.pio_idx,
                 );
-                spawner.spawn(pio_cmd_runner_task(cmd_runner)).unwrap();
+                spawner.spawn(pio_cmd_runner_task(cmd_runner).unwrap());
                 core::mem::forget(pio1.sm1);
                 log::info!("[boot] pio1 cmd dio={} clk={}", entry.data_pin, entry.clk_pin);
             }
@@ -659,11 +661,11 @@ async fn main(spawner: Spawner) {
                     pio::setup_pio_pin(entry.extra_pin, entry.pio_idx, pio::PioPull::PullUp);
                 }
                 let runner = PioStreamRunner::new_with_sideset(
-                    pio1.sm0, dma_ch1_pio1,
+                    pio1.sm0, dma_ch1_pio1, Irqs,
                     entry.data_pin, entry.clk_pin, entry.extra_pin,
                     0, entry.pio_idx,
                 );
-                spawner.spawn(pio_stream_runner_task_pio1(runner)).unwrap();
+                spawner.spawn(pio_stream_runner_task_pio1(runner).unwrap());
                 // RxStream on same PIO block (SM1) — from plan entry if present
                 if let Some(rx) = rx_on_pio1 {
                     pio::setup_pio_pin(rx.data_pin, rx.pio_idx, pio::PioPull::PullUp);
@@ -674,11 +676,11 @@ async fn main(spawner: Spawner) {
                         pio::setup_pio_pin(rx.extra_pin, rx.pio_idx, pio::PioPull::PullUp);
                     }
                     let rx_runner = PioRxStreamRunner::new_with_sideset(
-                        pio1.sm1, dma_ch6_pio1,
+                        pio1.sm1, dma_ch6_pio1, Irqs,
                         rx.data_pin, rx.clk_pin, rx.extra_pin,
                         0, rx.pio_idx,
                     );
-                    spawner.spawn(pio_rx_stream_runner_task_pio1(rx_runner)).unwrap();
+                    spawner.spawn(pio_rx_stream_runner_task_pio1(rx_runner).unwrap());
                     log::info!("[boot] pio1 rx data={} clk={} extra={}",
                         rx.data_pin, rx.clk_pin, rx.extra_pin);
                 } else {
@@ -703,11 +705,11 @@ async fn main(spawner: Spawner) {
                 pio::setup_pio_pin(entry.data_pin, entry.pio_idx, pio::PioPull::None);
                 pio::setup_pio_pin(entry.clk_pin, entry.pio_idx, pio::PioPull::None);
                 let cmd_runner = PioCmdRunner::new_with_clk(
-                    pio2.sm0, dma_ch0_pio2,
+                    pio2.sm0, dma_ch0_pio2, Irqs,
                     entry.data_pin, entry.clk_pin,
                     0, entry.pio_idx,
                 );
-                spawner.spawn(pio_cmd_runner_task_pio2(cmd_runner)).unwrap();
+                spawner.spawn(pio_cmd_runner_task_pio2(cmd_runner).unwrap());
                 core::mem::forget(pio2.sm1);
                 log::info!("[boot] pio2 cmd dio={} clk={}", entry.data_pin, entry.clk_pin);
             }
@@ -718,11 +720,11 @@ async fn main(spawner: Spawner) {
                     pio::setup_pio_pin(entry.extra_pin, entry.pio_idx, pio::PioPull::PullUp);
                 }
                 let runner = PioStreamRunner::new_with_sideset(
-                    pio2.sm0, dma_ch1_pio2,
+                    pio2.sm0, dma_ch1_pio2, Irqs,
                     entry.data_pin, entry.clk_pin, entry.extra_pin,
                     0, entry.pio_idx,
                 );
-                spawner.spawn(pio_stream_runner_task_pio2(runner)).unwrap();
+                spawner.spawn(pio_stream_runner_task_pio2(runner).unwrap());
                 // RxStream on same PIO block (SM1) — from plan entry if present
                 if let Some(rx) = rx_on_pio2 {
                     pio::setup_pio_pin(rx.data_pin, rx.pio_idx, pio::PioPull::PullUp);
@@ -733,11 +735,11 @@ async fn main(spawner: Spawner) {
                         pio::setup_pio_pin(rx.extra_pin, rx.pio_idx, pio::PioPull::PullUp);
                     }
                     let rx_runner = PioRxStreamRunner::new_with_sideset(
-                        pio2.sm1, dma_ch6_pio2,
+                        pio2.sm1, dma_ch6_pio2, Irqs,
                         rx.data_pin, rx.clk_pin, rx.extra_pin,
                         0, rx.pio_idx,
                     );
-                    spawner.spawn(pio_rx_stream_runner_task_pio2(rx_runner)).unwrap();
+                    spawner.spawn(pio_rx_stream_runner_task_pio2(rx_runner).unwrap());
                     log::info!("[boot] pio2 rx data={} clk={} extra={}",
                         rx.data_pin, rx.clk_pin, rx.extra_pin);
                 } else {

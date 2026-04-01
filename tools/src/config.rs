@@ -446,6 +446,7 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
         let ec_name = match edge_class {
             1 => "dma_owned",
             2 => "cross_core",
+            3 => "nic_ring",
             _ => "local",
         };
         edge.insert("edge_class".into(), json!(ec_name));
@@ -935,8 +936,10 @@ impl ConfigBuilder {
 const GRAPH_EDGE_SIZE: usize = 4;
 /// Maximum number of graph edges
 const MAX_GRAPH_EDGES: usize = 15;
-/// Graph section size (header + edges)
-const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE; // 64 bytes
+/// Per-domain metadata: 4 domains × (tick_us:u16 + exec_mode:u8 + reserved:u8) = 16 bytes
+const DOMAIN_META_SIZE: usize = 16;
+/// Graph section size (header + edges + domain metadata)
+const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE; // 80 bytes
 
 /// Maximum number of modules
 const MAX_MODULES: usize = 16;
@@ -1656,6 +1659,7 @@ fn resolve_edge_classes(config: &Value, _module_names: &[String], domain_names: 
                 }
                 2u8
             }
+            "nic_ring" => 3u8,
             _ => 0u8, // "local" or unknown
         };
         classes.push(ec);
@@ -1853,6 +1857,29 @@ pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, modu
         graph_section.push(*to_id);
         graph_section.push((to_port << 7) | (group & 0x7F));
         graph_section.push((from_port_index << 6) | ((ec & 0x03) << 4) | (to_port_index & 0x0F));
+    }
+    // Pad edge entries to fixed offset, then write domain metadata
+    while graph_section.len() < 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE {
+        graph_section.push(0);
+    }
+    // Domain metadata: 4 entries × (tick_us:u16 LE + exec_mode:u8 + reserved:u8) = 16 bytes
+    for d in 0..4usize {
+        let dtick = domain_tick_us.get(d).copied().unwrap_or(0);
+        graph_section.extend_from_slice(&dtick.to_le_bytes());
+        let mode = if let Some(domains) = config.get("execution").and_then(|e| e.get("domains")).and_then(|d| d.as_array()) {
+            domains.get(d)
+                .and_then(|dom| dom.get("exec_mode").and_then(|m| m.as_str()))
+                .map(|m| match m {
+                    "high_rate" | "tier1a" => 1u8,
+                    "poll" | "tier3" => 3u8,
+                    _ => 0u8,
+                })
+                .unwrap_or(0)
+        } else {
+            0u8
+        };
+        graph_section.push(mode);
+        graph_section.push(0); // reserved
     }
     while graph_section.len() < GRAPH_SECTION_SIZE {
         graph_section.push(0);

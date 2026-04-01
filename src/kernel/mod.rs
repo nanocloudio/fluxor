@@ -29,3 +29,9 @@ pub mod cross_domain;
 pub mod mpu;
 #[cfg(feature = "chip-bcm2712")]
 pub mod mmu;
+#[cfg(feature = "chip-bcm2712")]
+pub mod pcie;
+#[cfg(feature = "chip-bcm2712")]
+pub mod smmu;
+#[cfg(feature = "chip-bcm2712")]
+pub mod nic_ring;

@@ -790,6 +790,27 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         dev_system::ISR_METRICS => {
             crate::kernel::isr_tier::isr_metrics_dispatch(arg, arg_len)
         }
+        // ── NIC kernel-bypass (BCM2712 only) ──
+        #[cfg(feature = "chip-bcm2712")]
+        dev_system::NIC_BAR_MAP => {
+            crate::kernel::pcie::syscall_bar_map(arg, arg_len)
+        }
+        #[cfg(feature = "chip-bcm2712")]
+        dev_system::NIC_BAR_UNMAP => {
+            crate::kernel::pcie::syscall_bar_unmap(arg, arg_len)
+        }
+        #[cfg(feature = "chip-bcm2712")]
+        dev_system::NIC_RING_CREATE => {
+            crate::kernel::nic_ring::syscall_ring_create(arg, arg_len)
+        }
+        #[cfg(feature = "chip-bcm2712")]
+        dev_system::NIC_RING_DESTROY => {
+            crate::kernel::nic_ring::syscall_ring_destroy(arg, arg_len)
+        }
+        #[cfg(feature = "chip-bcm2712")]
+        dev_system::NIC_RING_INFO => {
+            crate::kernel::nic_ring::syscall_ring_info(handle, arg, arg_len)
+        }
         _ => {
             // Delegate to platform extension for hardware-specific opcodes
             if let Some(ext) = SYSTEM_EXTENSION {

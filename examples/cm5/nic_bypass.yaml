@@ -1,0 +1,52 @@
+# Kernel-Bypass NIC on CM5
+#
+# RP1 Cadence GEM driver in poll-mode (Tier 3) on a dedicated core.
+# Packets flow: NIC → eth_parser → pkt_filter → downstream.
+#
+# Build:
+#   make cm5
+# Deploy:
+#   cp target/cm5/boot/kernel8.img /boot/firmware/
+target: cm5
+
+execution:
+  domains:
+    - name: main
+      cores: [0]
+    - name: nic
+      cores: [1]
+      exec_mode: poll      # Tier 3: tight poll loop, no sleep
+
+modules:
+  - name: rp1_gem
+    domain: nic
+  - name: eth_parser
+    domain: nic
+  - name: pkt_filter
+    domain: nic
+    params:
+      rule_count: 2
+      rule_0:               # Accept TCP port 80
+        action: 1
+        proto: 6
+        dst_port_lo: 80
+        dst_port_hi: 80
+      rule_1:               # Accept UDP port 53
+        action: 1
+        proto: 17
+        dst_port_lo: 53
+        dst_port_hi: 53
+      default_action: 0     # Drop everything else
+  - name: debug
+    domain: main
+    mode: plaintext
+
+wiring:
+  - from: rp1_gem
+    to: eth_parser
+    edge_class: nic_ring
+  - from: eth_parser
+    to: pkt_filter
+  - from: pkt_filter
+    to: debug
+    edge_class: cross_core

@@ -4,9 +4,10 @@
 //! in a single flat module.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering, compiler_fence};
 
-use embassy_rp::dma::Channel;
+use embassy_rp::dma::{self, ChannelInstance};
 use embassy_rp::pac;
 use embassy_rp::pio::{Instance, StateMachine};
 use embassy_rp::Peri;
@@ -912,9 +913,10 @@ impl PioStreamService {
 // ============================================================================
 
 /// PIO Stream Runner - owns PIO/DMA resources and executes pending pushes
-pub struct PioStreamRunner<'d, PIO: Instance, const SM: usize, DMA: Channel> {
+pub struct PioStreamRunner<'d, PIO: Instance, const SM: usize, DMA: ChannelInstance> {
     sm: StateMachine<'d, PIO, SM>,
-    dma: Peri<'d, DMA>,
+    dma: dma::Channel<'d>,
+    dma_ty: PhantomData<DMA>,
     pin_num: u8,
     sideset_pin0: Option<u8>,
     sideset_pin1: Option<u8>,
@@ -925,11 +927,12 @@ pub struct PioStreamRunner<'d, PIO: Instance, const SM: usize, DMA: Channel> {
     used_mask: u32,
 }
 
-impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioStreamRunner<'d, PIO, SM, DMA> {
+impl<'d, PIO: Instance, const SM: usize, DMA: ChannelInstance> PioStreamRunner<'d, PIO, SM, DMA> {
     /// Create a new PIO stream runner (single output pin)
     pub fn new(
         sm: StateMachine<'d, PIO, SM>,
         dma: Peri<'d, DMA>,
+        irq: impl embassy_rp::interrupt::typelevel::Binding<DMA::Interrupt, dma::InterruptHandler<DMA>> + 'd,
         pin_num: u8,
         slot: usize,
         pio_num: u8,
@@ -937,7 +940,8 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioStreamRunner<'d, PIO, 
         log::info!("[pio] stream slot={} PIO{}", slot, pio_num);
         Self {
             sm,
-            dma,
+            dma: dma::Channel::new(dma, irq),
+            dma_ty: PhantomData,
             pin_num,
             sideset_pin0: None,
             sideset_pin1: None,
@@ -953,6 +957,7 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioStreamRunner<'d, PIO, 
     pub fn new_with_sideset(
         sm: StateMachine<'d, PIO, SM>,
         dma: Peri<'d, DMA>,
+        irq: impl embassy_rp::interrupt::typelevel::Binding<DMA::Interrupt, dma::InterruptHandler<DMA>> + 'd,
         out_pin: u8,
         sideset_pin0: u8,
         sideset_pin1: u8,
@@ -962,7 +967,8 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioStreamRunner<'d, PIO, 
         log::info!("[pio] stream slot={} PIO{} sideset", slot, pio_num);
         Self {
             sm,
-            dma,
+            dma: dma::Channel::new(dma, irq),
+            dma_ty: PhantomData,
             pin_num: out_pin,
             sideset_pin0: Some(sideset_pin0),
             sideset_pin1: Some(sideset_pin1),
@@ -1139,7 +1145,8 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioStreamRunner<'d, PIO, 
                         if let Some(buffer) = PioStreamService::get_front_buffer(self.slot) {
                             let data = &buffer[..count];
                             let tx = self.sm.tx();
-                            tx.dma_push(self.dma.reborrow(), data, false).await;
+                            let mut dma = self.dma.reborrow();
+                            tx.dma_push(&mut dma, data, false).await;
 
                             // Track consumed units (count = u32 words = stereo frames for I2S)
                             PioStreamService::complete_units_for(self.slot, count as u32);
@@ -1728,11 +1735,12 @@ impl PioCmdService {
 // ============================================================================
 
 /// PIO Command Runner — owns PIO SM + DMA resources, handles program loading
-pub struct PioCmdRunner<'d, PIO: Instance, const SM: usize, DMA: Channel> {
+pub struct PioCmdRunner<'d, PIO: Instance, const SM: usize, DMA: ChannelInstance> {
     #[allow(dead_code)] // Held for Embassy resource ownership (prevents double-use)
     sm: StateMachine<'d, PIO, SM>,
     #[allow(dead_code)] // Held for Embassy resource ownership; number stored in slot at construction
-    dma: Peri<'d, DMA>,
+    dma: dma::Channel<'d>,
+    dma_ty: PhantomData<DMA>,
     #[allow(dead_code)] // Stored for future diagnostic use
     data_pin_num: u8,
     #[allow(dead_code)] // Stored for future diagnostic use
@@ -1744,11 +1752,12 @@ pub struct PioCmdRunner<'d, PIO: Instance, const SM: usize, DMA: Channel> {
     used_mask: u32,
 }
 
-impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioCmdRunner<'d, PIO, SM, DMA> {
+impl<'d, PIO: Instance, const SM: usize, DMA: ChannelInstance> PioCmdRunner<'d, PIO, SM, DMA> {
     /// Create a new PIO command runner
     pub fn new(
         sm: StateMachine<'d, PIO, SM>,
         dma: Peri<'d, DMA>,
+        irq: impl embassy_rp::interrupt::typelevel::Binding<DMA::Interrupt, dma::InterruptHandler<DMA>> + 'd,
         data_pin_num: u8,
         slot: usize,
         pio_num: u8,
@@ -1756,11 +1765,12 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioCmdRunner<'d, PIO, SM,
         log::info!("[pio] cmd ready slot={} PIO{}:SM{}", slot, pio_num, SM);
         // Store DMA channel number in slot for sync_transfer() access
         if let Some(s) = PioCmdService::get_slot_by_index(slot) {
-            s.dma_channel.store(dma.number(), Ordering::Release);
+            s.dma_channel.store(DMA::number(), Ordering::Release);
         }
         Self {
             sm,
-            dma,
+            dma: dma::Channel::new(dma, irq),
+            dma_ty: PhantomData,
             data_pin_num,
             clk_pin_num: None,
             slot,
@@ -1775,6 +1785,7 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioCmdRunner<'d, PIO, SM,
     pub fn new_with_clk(
         sm: StateMachine<'d, PIO, SM>,
         dma: Peri<'d, DMA>,
+        irq: impl embassy_rp::interrupt::typelevel::Binding<DMA::Interrupt, dma::InterruptHandler<DMA>> + 'd,
         data_pin_num: u8,
         clk_pin_num: u8,
         slot: usize,
@@ -1783,11 +1794,12 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioCmdRunner<'d, PIO, SM,
         log::info!("[pio] cmd ready slot={} PIO{}:SM{} clk", slot, pio_num, SM);
         // Store DMA channel number in slot for sync_transfer() access
         if let Some(s) = PioCmdService::get_slot_by_index(slot) {
-            s.dma_channel.store(dma.number(), Ordering::Release);
+            s.dma_channel.store(DMA::number(), Ordering::Release);
         }
         Self {
             sm,
-            dma,
+            dma: dma::Channel::new(dma, irq),
+            dma_ty: PhantomData,
             data_pin_num,
             clk_pin_num: Some(clk_pin_num),
             slot,
@@ -2490,9 +2502,10 @@ impl PioRxStreamService {
 // PIO RX Stream Runner (Embassy task that executes DMA capture)
 // ============================================================================
 
-pub struct PioRxStreamRunner<'d, PIO: Instance, const SM: usize, DMA: Channel> {
+pub struct PioRxStreamRunner<'d, PIO: Instance, const SM: usize, DMA: ChannelInstance> {
     sm: StateMachine<'d, PIO, SM>,
-    dma: Peri<'d, DMA>,
+    dma: dma::Channel<'d>,
+    dma_ty: PhantomData<DMA>,
     _in_pin: u8,
     sideset_pin0: Option<u8>,
     sideset_pin1: Option<u8>,
@@ -2503,10 +2516,11 @@ pub struct PioRxStreamRunner<'d, PIO: Instance, const SM: usize, DMA: Channel> {
     used_mask: u32,
 }
 
-impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioRxStreamRunner<'d, PIO, SM, DMA> {
+impl<'d, PIO: Instance, const SM: usize, DMA: ChannelInstance> PioRxStreamRunner<'d, PIO, SM, DMA> {
     pub fn new_with_sideset(
         sm: StateMachine<'d, PIO, SM>,
         dma: Peri<'d, DMA>,
+        irq: impl embassy_rp::interrupt::typelevel::Binding<DMA::Interrupt, dma::InterruptHandler<DMA>> + 'd,
         in_pin: u8,
         sideset_pin0: u8,
         sideset_pin1: u8,
@@ -2516,7 +2530,8 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioRxStreamRunner<'d, PIO
         log::info!("[pio] rx ready slot={} PIO{}", slot, pio_num);
         Self {
             sm,
-            dma,
+            dma: dma::Channel::new(dma, irq),
+            dma_ty: PhantomData,
             _in_pin: in_pin,
             sideset_pin0: Some(sideset_pin0),
             sideset_pin1: Some(sideset_pin1),
@@ -2690,7 +2705,8 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioRxStreamRunner<'d, PIO
 
                 // DMA pull: blocks until RX FIFO fills the buffer
                 let rx = self.sm.rx();
-                rx.dma_pull(self.dma.reborrow(), fill_slice, false).await;
+                let mut dma = self.dma.reborrow();
+                rx.dma_pull(&mut dma, fill_slice, false).await;
 
                 // Signal buffer ready to module (handles overflow counting + swap)
                 PioRxStreamService::signal_buffer_ready(self.slot, RX_BUFFER_WORDS);
@@ -2758,4 +2774,3 @@ pub unsafe extern "C" fn syscall_pio_rx_stream_free(handle: i32) {
 }
 
 // RGB parallel output moved to src/io/rgb.rs
-
