@@ -22,5 +22,7 @@ pub mod chip;
 pub mod guard;
 pub mod heap;
 pub mod step_guard;
+pub mod bridge;
+pub mod isr_tier;
 #[cfg(feature = "chip-bcm2712")]
 pub mod cross_domain;

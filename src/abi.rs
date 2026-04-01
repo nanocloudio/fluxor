@@ -813,6 +813,27 @@ pub mod dev_system {
     /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
     /// Returns arena size in bytes (0 if no arena allocated).
     pub const ARENA_GET: u32 = 0x0C3A;
+
+    // --- Bridge channel operations (0x0CE0-0x0CE5) ---
+
+    /// Write data to a bridge channel.
+    /// handle=bridge_fd, arg=data bytes. Returns 0 on success, -EAGAIN if ring full.
+    pub const BRIDGE_WRITE: u32 = 0x0CE0;
+    /// Read data from a bridge channel.
+    /// handle=bridge_fd, arg=output buffer. Returns bytes read, -EAGAIN if empty/no new.
+    pub const BRIDGE_READ: u32 = 0x0CE1;
+    /// Poll bridge readiness. handle=bridge_fd. Returns 1 if readable, 0 if not.
+    pub const BRIDGE_POLL: u32 = 0x0CE2;
+    /// Get bridge info. handle=bridge_fd, arg=12-byte output buffer.
+    /// Returns: [type:u8, from:u8, to:u8, _:u8, drops:u32 LE, seq:u32 LE]
+    pub const BRIDGE_INFO: u32 = 0x0CE3;
+
+    // --- ISR Tier metrics (0x0CE8) ---
+
+    /// Query ISR module metrics. handle=-1, arg=[tier:u8, slot:u8] (2 bytes input).
+    /// On success, writes IsrMetrics (24 bytes) to arg buffer.
+    /// tier: 1=Tier 1b, 2=Tier 2. slot: slot index within tier.
+    pub const ISR_METRICS: u32 = 0x0CE8;
 }
 
 /// Flash sideband operation kinds

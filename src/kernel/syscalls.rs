@@ -778,6 +778,18 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             crate::kernel::fd::dma_fd_queue(handle, read_addr, count)
         }
+        // ── Bridge channel operations ──
+        dev_system::BRIDGE_WRITE | dev_system::BRIDGE_READ |
+        dev_system::BRIDGE_POLL | dev_system::BRIDGE_INFO => {
+            let bridge_op = opcode - dev_system::BRIDGE_WRITE; // 0=write, 1=read, 2=poll, 3=info
+            let slot = crate::kernel::fd::slot_of(handle);
+            if slot < 0 { return E_INVAL; }
+            crate::kernel::bridge::bridge_dispatch(slot as usize, bridge_op, arg, arg_len)
+        }
+        // ── ISR tier metrics ──
+        dev_system::ISR_METRICS => {
+            crate::kernel::isr_tier::isr_metrics_dispatch(arg, arg_len)
+        }
         _ => {
             // Delegate to platform extension for hardware-specific opcodes
             if let Some(ext) = SYSTEM_EXTENSION {

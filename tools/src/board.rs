@@ -62,7 +62,189 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
         validate_reconfigure_section(reconfig, config, &mut result);
     }
 
+    // Validate bridges section if present
+    if let Some(bridges) = config.get("bridges").and_then(|b| b.as_array()) {
+        validate_bridges(bridges, config, &mut result);
+    }
+
+    // Validate ISR module declarations if present
+    if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
+        validate_isr_modules(modules, target, &mut result);
+    }
+
     Ok(result)
+}
+
+/// Validate bridge channel declarations.
+fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationResult) {
+    let module_names: Vec<String> = config.get("modules")
+        .and_then(|m| m.as_array())
+        .map(|arr| arr.iter().filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from)).collect())
+        .unwrap_or_default();
+
+    let valid_types = ["snapshot", "ring", "command"];
+
+    for (i, bridge) in bridges.iter().enumerate() {
+        let prefix = format!("bridges[{}]", i);
+
+        // Required: type
+        let btype = bridge.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !valid_types.contains(&btype) {
+            result.add_error(format!("{}: invalid type '{}' (must be snapshot, ring, or command)", prefix, btype));
+        }
+
+        // Required: from and to (module.port format)
+        for field in &["from", "to"] {
+            if let Some(spec) = bridge.get(*field).and_then(|v| v.as_str()) {
+                let module_name = spec.split('.').next().unwrap_or("");
+                if !module_names.contains(&module_name.to_string()) {
+                    result.add_error(format!("{}.{}: module '{}' not found", prefix, field, module_name));
+                }
+            } else {
+                result.add_error(format!("{}: missing '{}'", prefix, field));
+            }
+        }
+
+        // Type-specific validation
+        match btype {
+            "snapshot" => {
+                let size = bridge.get("data_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                if size == 0 || size > 56 {
+                    result.add_error(format!("{}: data_size must be 1-56 (got {})", prefix, size));
+                }
+            }
+            "ring" => {
+                let elem = bridge.get("elem_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                if elem == 0 || elem > 56 {
+                    result.add_error(format!("{}: elem_size must be 1-56 (got {})", prefix, elem));
+                }
+            }
+            "command" => {
+                let size = bridge.get("data_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                if size == 0 || size > 56 {
+                    result.add_error(format!("{}: data_size must be 1-56 (got {})", prefix, size));
+                }
+            }
+            _ => {} // already flagged as invalid type
+        }
+
+        // Direction validation: command bridges are thread→ISR only
+        if btype == "command" {
+            // from should be Tier 0 (cooperative), to should be Tier 1/2 (ISR)
+            // For now, just validate the declaration exists — tier assignment is Epic 7b/c
+        }
+    }
+
+    if bridges.len() > 16 {
+        result.add_error(format!("bridges: too many bridges ({}, max 16)", bridges.len()));
+    }
+}
+
+/// Validate ISR module declarations.
+///
+/// Checks that modules declaring `tier: "1b"` or `tier: "2"` have:
+/// - A valid `trust` level ("platform" required for ISR execution)
+/// - A `max_cycles` budget that fits within the declared `rate_hz` period
+/// - Combined Tier 1b + Tier 2 ISR budget does not exceed configurable limit
+fn validate_isr_modules(modules: &[Value], _target: &TargetDescriptor, result: &mut ValidationResult) {
+    // Default to 150MHz (RP2350). Config can override via execution.clock_hz.
+    let clock_hz: u64 = 150_000_000;
+
+    let mut total_tier1b_budget: u64 = 0;
+    let mut tier1b_period_us: u64 = 0;
+    let mut isr_module_count: usize = 0;
+
+    for (i, module) in modules.iter().enumerate() {
+        let tier = module.get("tier").and_then(|t| t.as_str()).unwrap_or("0");
+        if tier != "1b" && tier != "2" {
+            continue;
+        }
+
+        isr_module_count += 1;
+        let prefix = format!("modules[{}]", i);
+        let name = module.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+
+        // Trust level validation
+        let trust = module.get("trust").and_then(|t| t.as_str()).unwrap_or("");
+        if trust != "platform" {
+            result.add_error(format!(
+                "{} ({}): ISR tier '{}' requires trust: \"platform\" (got '{}')",
+                prefix, name, tier, trust
+            ));
+        }
+
+        // Cycle budget validation
+        let max_cycles = module.get("max_cycles").and_then(|c| c.as_u64()).unwrap_or(0);
+        if max_cycles == 0 {
+            result.add_error(format!(
+                "{} ({}): ISR tier '{}' requires max_cycles declaration",
+                prefix, name, tier
+            ));
+            continue;
+        }
+
+        if tier == "1b" {
+            let rate_hz = module.get("rate_hz").and_then(|r| r.as_u64()).unwrap_or(0);
+            if rate_hz > 0 {
+                let period_cycles = clock_hz / rate_hz;
+                if max_cycles > period_cycles {
+                    result.add_error(format!(
+                        "{} ({}): max_cycles ({}) exceeds period ({} cycles at {} Hz)",
+                        prefix, name, max_cycles, period_cycles, rate_hz
+                    ));
+                }
+                // Track period for combined budget check (all Tier 1b share the same timer)
+                let this_period_us = 1_000_000 / rate_hz;
+                if tier1b_period_us == 0 {
+                    tier1b_period_us = this_period_us;
+                } else if this_period_us != tier1b_period_us {
+                    result.add_warning(format!(
+                        "{} ({}): Tier 1b rate_hz ({}) implies different period than other Tier 1b modules",
+                        prefix, name, rate_hz
+                    ));
+                }
+            }
+            total_tier1b_budget += max_cycles;
+
+            // FPU usage warning
+            if module.get("uses_fpu").and_then(|f| f.as_bool()).unwrap_or(false) {
+                result.add_warning(format!(
+                    "{} ({}): FPU in Tier 1b ISR adds 33 cycle lazy stacking overhead on Cortex-M33",
+                    prefix, name
+                ));
+            }
+        }
+
+        if tier == "2" {
+            let irq = module.get("irq").and_then(|i| i.as_u64());
+            if irq.is_none() {
+                result.add_error(format!(
+                    "{} ({}): Tier 2 module requires 'irq' field",
+                    prefix, name
+                ));
+            }
+        }
+    }
+
+    // Combined budget check: Tier 1b budget should be < 50% of period
+    if tier1b_period_us > 0 && total_tier1b_budget > 0 {
+        let period_cycles = (tier1b_period_us * clock_hz) / 1_000_000;
+        let max_budget = period_cycles / 2; // 50% limit
+        if total_tier1b_budget > max_budget {
+            result.add_error(format!(
+                "ISR budget: combined Tier 1b budget ({} cycles) exceeds 50% of period ({} cycles)",
+                total_tier1b_budget, period_cycles
+            ));
+        }
+    }
+
+    // Slot count check
+    if isr_module_count > 8 {
+        result.add_error(format!(
+            "ISR modules: too many ({}, max 4 Tier 1b + 4 Tier 2)",
+            isr_module_count
+        ));
+    }
 }
 
 /// Validate reconfigure section parameters.

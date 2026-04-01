@@ -838,8 +838,9 @@ struct SchedulerState {
     /// Number of domains configured (0 or 1 = single default domain)
     domain_count: u8,
     /// Per-domain tick_us (0 = use global tick_us). Index 0 = default domain.
-    /// TODO(Epic 6): populate from config when multi-core execution lands.
     domain_tick_us: [u32; MAX_DOMAINS],
+    /// Per-domain execution mode (0=cooperative/Tier 0, 1=high-rate/Tier 1a, 3=poll/Tier 3).
+    domain_exec_mode: [u8; MAX_DOMAINS],
 
     // ── Live Reconfigure State ──────────────────────────────────────
     /// Current reconfigure phase (Running during normal operation).
@@ -890,6 +891,7 @@ impl SchedulerState {
             domain_module_count: [0; MAX_DOMAINS],
             domain_count: 0,
             domain_tick_us: [0; MAX_DOMAINS],
+            domain_exec_mode: [0; MAX_DOMAINS],
             reconfigure_phase: ReconfigurePhase::Running,
             drain_state: [DrainState::Surviving; MAX_MODULES],
             drain_capable: [false; MAX_MODULES],
@@ -998,6 +1000,41 @@ pub fn set_graph_sample_rate(rate: u32) {
 pub fn tick_us() -> u32 {
     let t = unsafe { SCHED.tick_us };
     if t == 0 { DEFAULT_TICK_US } else { t }
+}
+
+/// Return the configured tick period for a specific domain.
+/// Falls back to global tick_us if domain has no override.
+pub fn domain_tick_us(domain_id: usize) -> u32 {
+    if domain_id < MAX_DOMAINS {
+        let t = unsafe { SCHED.domain_tick_us[domain_id] };
+        if t > 0 { return t; }
+    }
+    tick_us()
+}
+
+/// Return the execution mode for a domain.
+/// 0 = cooperative (Tier 0), 1 = high-rate periodic (Tier 1a), 3 = poll-mode (Tier 3).
+pub fn domain_exec_mode(domain_id: usize) -> u8 {
+    if domain_id < MAX_DOMAINS {
+        unsafe { SCHED.domain_exec_mode[domain_id] }
+    } else {
+        0
+    }
+}
+
+/// Return the number of configured domains.
+pub fn domain_count() -> usize {
+    let c = unsafe { SCHED.domain_count } as usize;
+    if c == 0 { 1 } else { c }
+}
+
+/// Return the module count for a specific domain.
+pub fn domain_module_count(domain_id: usize) -> usize {
+    if domain_id < MAX_DOMAINS {
+        unsafe { SCHED.domain_module_count[domain_id] as usize }
+    } else {
+        0
+    }
 }
 
 /// Report a module's processing latency in frames.
@@ -1170,6 +1207,12 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
         }
     }
     sched.domain_count = if max_domain > 0 { (max_domain + 1).min(MAX_DOMAINS as u8) } else { 0 };
+
+    // Populate per-domain tick_us and exec_mode from config
+    for d in 0..MAX_DOMAINS {
+        sched.domain_tick_us[d] = config.domain_tick_us[d] as u32;
+        sched.domain_exec_mode[d] = config.domain_exec_mode[d];
+    }
 
     let edges = &mut sched.edges;
 

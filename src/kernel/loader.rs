@@ -21,6 +21,8 @@ pub mod export_hashes {
     pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
     pub const MODULE_DRAIN: u32 = 0xc4c5636c;      // "module_drain"
+    pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03;  // "module_isr_init"
+    pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743;  // "module_isr_entry"
 }
 
 /// Module table magic: "FXMT"
@@ -274,6 +276,14 @@ unsafe fn call_step(f: ModuleStepFn, state: *mut u8) -> i32 {
 /// Function pointer type for module_drain export
 pub type ModuleDrainFn = unsafe extern "C" fn(*mut u8) -> i32;
 
+/// Function pointer type for module_isr_init export (Tier 2 ISR modules).
+/// Called once during setup (non-ISR context) to initialize ISR-tier state.
+pub type ModuleIsrInitFn = unsafe extern "C" fn(*mut u8, *const SyscallTable) -> i32;
+
+/// Function pointer type for module_isr_entry export (Tier 2 ISR modules).
+/// Called from the IRQ handler. Returns i32 status (0 = ok, <0 = error).
+pub type ModuleIsrEntryFn = unsafe extern "C" fn(*mut u8) -> i32;
+
 /// Call module_drain export.
 #[inline]
 unsafe fn call_drain(f: ModuleDrainFn, state: *mut u8) -> i32 {
@@ -409,7 +419,9 @@ impl ModuleHeader {
     ///            one in_place_writer per buffer_group is allowed.
     ///     bit 2: deferred_ready — module needs init time before downstream runs.
     ///     bit 3: drain_capable — module exports module_drain for live reconfigure.
-    ///     bits 4-7: reserved (0)
+    ///     bit 4: isr_module — module exports module_isr_init / module_isr_entry
+    ///            for Tier 2 ISR execution. Set by pack tool when these exports exist.
+    ///     bits 5-7: reserved (0)
     ///   byte 1: step_period_ms
     ///   bytes 2-3: schema_size (u16 LE)
     ///   bytes 4-5: manifest_size (u16 LE)
@@ -434,6 +446,11 @@ impl ModuleHeader {
     /// Bit N set = module requires device class N through dev_call.
     pub fn required_caps(&self) -> u16 {
         u16::from_le_bytes([self.reserved[6], self.reserved[7]])
+    }
+
+    /// Whether this module is an ISR module (Tier 2). Flags bit 4.
+    pub fn is_isr_module(&self) -> bool {
+        self.reserved[0] & 0x10 != 0
     }
 }
 

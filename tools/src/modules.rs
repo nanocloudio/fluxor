@@ -644,6 +644,9 @@ pub fn pack_fmod(
         "module_deferred_ready",
         // drain support (graceful shutdown for live reconfigure)
         "module_drain",
+        // ISR tier 2 module exports
+        "module_isr_init",
+        "module_isr_entry",
     ];
 
     let mut exports: Vec<(String, u32, u32)> = Vec::new();
@@ -742,6 +745,10 @@ pub fn pack_fmod(
     }
     if has_drain {
         reserved[0] |= 0x08; // drain_capable (bit 3)
+    }
+    let has_isr_entry = symbols.iter().any(|s| s.bind == 1 && s.name == "module_isr_entry");
+    if has_isr_entry {
+        reserved[0] |= 0x10; // isr_module (bit 4)
     }
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());

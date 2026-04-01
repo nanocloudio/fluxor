@@ -557,6 +557,13 @@ fn timer_freq() -> u64 {
     freq
 }
 
+/// Read the physical counter (CNTPCT_EL0) for cycle-accurate timing.
+fn read_timer_count() -> u32 {
+    let val: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
+    val as u32
+}
+
 unsafe fn timer_set(ticks: u32) {
     core::arch::asm!(
         "msr cntp_tval_el0, {val}",
@@ -1136,88 +1143,189 @@ fn domain_local_index(
 ///
 /// This function never returns. On core 0 it is called directly from main().
 /// On secondary cores it is called from the secondary_core_main() entry point.
+/// Per-domain metrics (E7b-S3).
+struct DomainMetrics {
+    /// Total ticks processed.
+    tick_count: u32,
+    /// Ticks where step work exceeded 50% of tick budget.
+    busy_ticks: u32,
+    /// Tier 3 only: total step calls.
+    poll_steps: u32,
+    /// Tier 3 only: steps where all modules returned Continue (idle).
+    poll_idle: u32,
+    /// Tier 3 only: WFE count.
+    wfe_count: u32,
+    /// Worst-case step duration in timer ticks (for deadline margin).
+    worst_step_ticks: u32,
+}
+
+impl DomainMetrics {
+    const fn new() -> Self {
+        Self { tick_count: 0, busy_ticks: 0, poll_steps: 0, poll_idle: 0, wfe_count: 0, worst_step_ticks: 0 }
+    }
+}
+
+static mut DOMAIN_METRICS: [DomainMetrics; cross_domain::MAX_DOMAINS] =
+    [const { DomainMetrics::new() }; cross_domain::MAX_DOMAINS];
+
 fn run_domain_loop(domain_id: usize) -> ! {
     use fluxor::modules::Module;
     use fluxor::kernel::step_guard;
 
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+    let exec_mode = scheduler::domain_exec_mode(domain_id);
+    let core_id = current_core_id() as usize;
 
-        let core_id = current_core_id() as usize;
-        let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
-
-        // Step all modules in this domain
-        let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
-        let mut j = 0;
-        while j < dm.count {
-            if let Some(ref mut m) = dm.modules[j] {
-                step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
-                let _ = m.step();
-                step_guard::disarm();
-                step_guard::post_step_check();
-                if step_guard::check_and_clear_timeout() {
-                    log::warn!("[guard] domain {} module {} timeout", domain_id, j);
+    match exec_mode {
+        // ── Tier 1a: High-rate periodic (1-10 kHz) ──
+        // Same as Tier 0 but with per-domain timer tick rate.
+        // Timer IRQ fires at domain_tick_us; full module ABI retained.
+        1 => {
+            log::info!("[domain] {} core={} tier=1a tick_us={}", domain_id, core_id,
+                scheduler::domain_tick_us(domain_id));
+            loop {
+                unsafe { core::arch::asm!("wfi") };
+                let t0 = read_timer_count();
+                domain_step_all(domain_id);
+                pump_cross_domain(domain_id);
+                let elapsed = read_timer_count().wrapping_sub(t0);
+                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
+                metrics.tick_count += 1;
+                if elapsed > metrics.worst_step_ticks { metrics.worst_step_ticks = elapsed; }
+                // Track busy ticks (step work exceeded 50% of tick budget)
+                let freq = timer_freq() as u32;
+                let budget_ticks = if freq > 0 { (scheduler::domain_tick_us(domain_id) as u64 * freq as u64 / 1_000_000) as u32 } else { 62500 };
+                if elapsed > budget_ticks / 2 { metrics.busy_ticks += 1; }
+                // Report every ~10s (at domain tick rate)
+                let report_interval = 10_000_000 / scheduler::domain_tick_us(domain_id);
+                if metrics.tick_count % report_interval == 0 && metrics.tick_count > 0 {
+                    log::info!("[tier1a] d={} ticks={} worst={}cyc", domain_id, metrics.tick_count, metrics.worst_step_ticks);
                 }
             }
-            j += 1;
         }
+        // ── Tier 3: Poll-mode (continuous stepping) ──
+        // Module step returns Burst → re-step immediately. WFE when all idle.
+        3 => {
+            log::info!("[domain] {} core={} tier=3 poll-mode", domain_id, core_id);
+            loop {
+                let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
+                let mut any_burst = false;
+                let mut j = 0;
+                while j < dm.count {
+                    if let Some(ref mut m) = dm.modules[j] {
+                        step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
+                        let outcome = m.step();
+                        step_guard::disarm();
+                        step_guard::post_step_check();
+                        if step_guard::check_and_clear_timeout() {
+                            log::warn!("[guard] domain {} module {} timeout", domain_id, j);
+                        }
+                        // StepOutcome::Burst
+                        if matches!(outcome, Ok(fluxor::modules::StepOutcome::Burst)) {
+                            any_burst = true;
+                        }
+                    }
+                    j += 1;
+                }
+                pump_cross_domain(domain_id);
 
-        // Pump cross-domain channels.
-        // For edges where we are the producer (from_domain == domain_id):
-        //   Read from local output channel → send to cross-domain ring.
-        // For edges where we are the consumer (to_domain == domain_id):
-        //   Receive from cross-domain ring → write to local input channel.
-        let n_cross = cross_domain::cross_edge_count();
-        let mut ei = 0;
-        while ei < n_cross {
-            if let Some(edge) = cross_domain::get_cross_edge(ei) {
-                if let Some(ch) = cross_domain::get_cross_channel(edge.channel_idx as usize) {
-                    if edge.from_domain == domain_id as u8 {
-                        // Producer side: drain local output channel into cross-domain ring
-                        let mod_local = edge.from_module as usize;
-                        let dm_src = unsafe { &DOMAIN_MODULES[domain_id] };
-                        if mod_local < dm_src.count {
-                            let out_handle = dm_src.mod_out[mod_local];
-                            if out_handle >= 0 {
-                                let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
-                                let n = unsafe {
-                                    fluxor::kernel::channel::channel_read(
-                                        out_handle, buf.as_mut_ptr(), buf.len(),
-                                    )
-                                };
-                                if n > 0 {
-                                    let _ = ch.send(&buf[..n as usize]);
+                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
+                metrics.poll_steps += 1;
+                if !any_burst {
+                    metrics.poll_idle += 1;
+                    metrics.wfe_count += 1;
+                    unsafe { core::arch::asm!("wfe") };
+                }
+                // Report every ~1M poll steps
+                if metrics.poll_steps & 0xFFFFF == 0 && metrics.poll_steps > 0 {
+                    let idle_pct = if metrics.poll_steps > 0 { metrics.poll_idle * 100 / metrics.poll_steps } else { 0 };
+                    log::info!("[tier3] d={} polls={} idle={}% wfe={}",
+                        domain_id, metrics.poll_steps, idle_pct, metrics.wfe_count);
+                }
+            }
+        }
+        // ── Tier 0: Cooperative (default, 1ms tick) ──
+        _ => {
+            loop {
+                unsafe { core::arch::asm!("wfi") };
+                let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
+                domain_step_all(domain_id);
+                pump_cross_domain(domain_id);
+                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
+                metrics.tick_count += 1;
+                if domain_id == 0 && tick % 10000 == 0 && tick > 0 {
+                    log::info!("[sched] alive t={} core={}", tick, core_id);
+                }
+            }
+        }
+    }
+}
+
+/// Step all modules in a domain with step guard protection.
+fn domain_step_all(domain_id: usize) {
+    use fluxor::modules::Module;
+    use fluxor::kernel::step_guard;
+
+    let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
+    let mut j = 0;
+    while j < dm.count {
+        if let Some(ref mut m) = dm.modules[j] {
+            step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
+            let _ = m.step();
+            step_guard::disarm();
+            step_guard::post_step_check();
+            if step_guard::check_and_clear_timeout() {
+                log::warn!("[guard] domain {} module {} timeout", domain_id, j);
+            }
+        }
+        j += 1;
+    }
+}
+
+/// Pump cross-domain channels for a domain.
+fn pump_cross_domain(domain_id: usize) {
+    let n_cross = cross_domain::cross_edge_count();
+    let mut ei = 0;
+    while ei < n_cross {
+        if let Some(edge) = cross_domain::get_cross_edge(ei) {
+            if let Some(ch) = cross_domain::get_cross_channel(edge.channel_idx as usize) {
+                if edge.from_domain == domain_id as u8 {
+                    let mod_local = edge.from_module as usize;
+                    let dm_src = unsafe { &DOMAIN_MODULES[domain_id] };
+                    if mod_local < dm_src.count {
+                        let out_handle = dm_src.mod_out[mod_local];
+                        if out_handle >= 0 {
+                            let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                            let n = unsafe {
+                                fluxor::kernel::channel::channel_read(
+                                    out_handle, buf.as_mut_ptr(), buf.len(),
+                                )
+                            };
+                            if n > 0 {
+                                let _ = ch.send(&buf[..n as usize]);
+                            }
+                        }
+                    }
+                }
+                if edge.to_domain == domain_id as u8 {
+                    let mod_local = edge.to_module as usize;
+                    let dm_dst = unsafe { &DOMAIN_MODULES[domain_id] };
+                    if mod_local < dm_dst.count {
+                        let in_handle = dm_dst.mod_in[mod_local];
+                        if in_handle >= 0 {
+                            let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                            if let Some(len) = ch.try_recv(&mut buf) {
+                                unsafe {
+                                    fluxor::kernel::channel::channel_write(
+                                        in_handle, buf.as_ptr(), len,
+                                    );
                                 }
                             }
                         }
                     }
-                    if edge.to_domain == domain_id as u8 {
-                        // Consumer side: receive from cross-domain ring into local input
-                        let mod_local = edge.to_module as usize;
-                        let dm_dst = unsafe { &DOMAIN_MODULES[domain_id] };
-                        if mod_local < dm_dst.count {
-                            let in_handle = dm_dst.mod_in[mod_local];
-                            if in_handle >= 0 {
-                                let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
-                                if let Some(len) = ch.try_recv(&mut buf) {
-                                    unsafe {
-                                        fluxor::kernel::channel::channel_write(
-                                            in_handle, buf.as_ptr(), len,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
-            ei += 1;
         }
-
-        // Periodic status (every ~10 seconds at 1kHz tick)
-        if domain_id == 0 && tick % 10000 == 0 && tick > 0 {
-            log::info!("[sched] alive t={} core={}", tick, core_id);
-        }
+        ei += 1;
     }
 }
 
@@ -1257,9 +1365,16 @@ fn secondary_core_main(domain_id: usize) -> ! {
     // Set up GIC CPU interface for this core
     unsafe {
         gic_init_secondary();
-        // Set up the timer for this core
-        timer_set(TICKS_PER_TICK);
-        // Enable IRQs
+        // Set per-domain timer rate (Tier 1a may run faster than global tick)
+        let domain_tick = scheduler::domain_tick_us(domain_id);
+        let freq = timer_freq();
+        let ticks_for_domain = if freq > 0 {
+            ((domain_tick as u64) * freq / 1_000_000) as u32
+        } else {
+            TICKS_PER_TICK
+        };
+        timer_set(ticks_for_domain);
+        // Enable IRQs (not needed for Tier 3 poll-mode, but harmless)
         core::arch::asm!("msr daifclr, #2");
     }
 

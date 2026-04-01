@@ -374,7 +374,7 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 
 /// Graph section binary format sizes
 pub const GRAPH_EDGE_SIZE: usize = 4;
-pub const GRAPH_SECTION_SIZE: usize = 64; // 4 header + 15 edges * 4 bytes
+pub const GRAPH_SECTION_SIZE: usize = 80; // 4 header + 15 edges * 4 bytes + 16 domain metadata
 
 // ============================================================================
 // Graph Config (Version 1: Variable-Length Module Entries)
@@ -525,6 +525,10 @@ pub struct Config {
     pub module_count: u8,
     pub edge_count: u8,
     pub hardware: HardwareConfig,
+    /// Per-domain tick_us (from graph section domain metadata). 0 = use global.
+    pub domain_tick_us: [u16; 4],
+    /// Per-domain execution mode: 0=cooperative, 1=high_rate/Tier1a, 3=poll/Tier3.
+    pub domain_exec_mode: [u8; 4],
 }
 
 impl Config {
@@ -545,6 +549,8 @@ impl Config {
             module_count: 0,
             edge_count: 0,
             hardware: HardwareConfig::new(),
+            domain_tick_us: [0; 4],
+            domain_exec_mode: [0; 4],
         }
     }
 }
@@ -720,7 +726,17 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         config.graph_edges[i] = Some(parse_graph_edge(entry_ptr));
     }
 
-    // Hardware section starts after graph section (64 bytes)
+    // Parse domain metadata (16 bytes after edge entries)
+    let domain_meta_base = unsafe { section_base.add(4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE) };
+    for d in 0..4usize {
+        unsafe {
+            let base = domain_meta_base.add(d * 4);
+            config.domain_tick_us[d] = read_u16(base);
+            config.domain_exec_mode[d] = *base.add(2);
+        }
+    }
+
+    // Hardware section starts after graph section (80 bytes)
     let hw_base = unsafe { section_base.add(GRAPH_SECTION_SIZE) };
     config.hardware = parse_hardware_section(hw_base);
 

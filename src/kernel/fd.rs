@@ -34,6 +34,7 @@ pub const FD_TAG_PIO_STREAM: i32 = 4;
 pub const FD_TAG_PIO_CMD: i32 = 5;
 pub const FD_TAG_PIO_RX_STREAM: i32 = 6;
 pub const FD_TAG_DMA: i32 = 7;
+pub const FD_TAG_BRIDGE: i32 = 8;
 
 const TAG_SHIFT: u32 = 27;
 const SLOT_MASK: i32 = 0x07FF_FFFF;
@@ -577,6 +578,14 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
             let mut ready = 0u8;
             if (events & POLL_IN) != 0 && dma_fd_poll_ready(slot) {
                 ready |= POLL_IN;
+            }
+            ready as i32
+        }
+        FD_TAG_BRIDGE => {
+            let mut ready = 0u8;
+            if (events & POLL_IN) != 0 {
+                let poll = crate::kernel::bridge::bridge_dispatch(slot as usize, 2, core::ptr::null_mut(), 0);
+                if poll > 0 { ready |= POLL_IN; }
             }
             ready as i32
         }
