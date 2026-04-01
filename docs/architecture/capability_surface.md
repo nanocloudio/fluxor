@@ -507,10 +507,10 @@ modules:
     port: 80
 
 wiring:
-  - from: fat32.out
-    to: http_server.in
-  - from: http_server.out
-    to: fat32.ctrl
+  - from: fat32.files
+    to: http_server.variables
+  - from: http_server.file_ctrl
+    to: fat32.seek
 ```
 
 Same app on CH9120 Ethernet — only hardware changes:
@@ -532,10 +532,10 @@ modules:
     port: 80
 
 wiring:
-  - from: fat32.out
-    to: http_server.in
-  - from: http_server.out
-    to: fat32.ctrl
+  - from: fat32.files
+    to: http_server.variables
+  - from: http_server.file_ctrl
+    to: fat32.seek
 ```
 
 Same app on enc28j60 — still just hardware:
@@ -557,10 +557,10 @@ modules:
     port: 80
 
 wiring:
-  - from: fat32.out
-    to: http_server.in
-  - from: http_server.out
-    to: fat32.ctrl
+  - from: fat32.files
+    to: http_server.variables
+  - from: http_server.file_ctrl
+    to: fat32.seek
 ```
 
 The `modules:` and `wiring:` sections are identical across all three boards.

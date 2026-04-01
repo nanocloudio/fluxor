@@ -86,6 +86,19 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Combine firmware.bin + config + modules into a raw boot image
+    PackImage {
+        /// Firmware binary image
+        firmware: PathBuf,
+        /// Config file (YAML or JSON)
+        config: PathBuf,
+        /// Directory containing built .fmod files
+        #[arg(short = 'm', long)]
+        modules_dir: PathBuf,
+        /// Output packed image
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Show example configuration
     Example {
         /// Example name: blinky, sd-audio, playlist, test-tone, gesture-led
@@ -135,6 +148,17 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Build a module table blob from modules referenced by a config file
+    MktableConfig {
+        /// Config file (YAML or JSON)
+        config: PathBuf,
+        /// Directory containing built .fmod files
+        #[arg(short = 'm', long)]
+        modules_dir: PathBuf,
+        /// Output binary file
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Show transition plan between two config files (live reconfigure diff)
     Diff {
         /// Old config file (YAML)
@@ -164,6 +188,12 @@ fn main() {
             config,
             output,
         } => cmd_combine(&firmware, &config, &output, verbose),
+        Commands::PackImage {
+            firmware,
+            config,
+            modules_dir,
+            output,
+        } => cmd_pack_image(&firmware, &config, &modules_dir, &output, verbose),
         Commands::Example { name } => cmd_example(&name),
         Commands::Pack {
             input,
@@ -176,6 +206,9 @@ fn main() {
         Commands::TargetInfo { target, field } => cmd_target_info(&target, field.as_deref()),
         Commands::Targets => cmd_targets(),
         Commands::Mktable { dir, output } => cmd_mktable(&dir, &output),
+        Commands::MktableConfig { config, modules_dir, output } => {
+            cmd_mktable_config(&config, &modules_dir, &output)
+        }
         Commands::Diff { old_config, new_config, target } => cmd_diff(&old_config, &new_config, target.as_deref()),
     };
 
@@ -677,12 +710,15 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
         eprintln!("  Runtime:   0x{:08x} (4096 bytes, reserved)", RUNTIME_STORE_ADDR);
     }
 
+    // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
+    let payload_crc = crc16_xmodem(&modules_data, &config_data);
+
     // Build trailer (16 bytes)
     let mut trailer = Vec::with_capacity(16);
     trailer.extend_from_slice(&TRAILER_MAGIC.to_le_bytes());
     trailer.push(TRAILER_VERSION);
     trailer.push(0); // flags
-    trailer.extend_from_slice(&[0u8; 2]); // reserved
+    trailer.extend_from_slice(&payload_crc.to_le_bytes()); // CRC-16 of payload
     trailer.extend_from_slice(&modules_addr.to_le_bytes());
     trailer.extend_from_slice(&config_addr.to_le_bytes());
     assert_eq!(trailer.len(), 16);
@@ -735,6 +771,242 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
             modules_size / 1024,
             config_data.len() / 1024,
             combined.len() / 1024
+        );
+    }
+
+    Ok(())
+}
+
+fn load_config_with_defaults(config_path: &PathBuf, verbose: bool) -> Result<(serde_json::Value, target::TargetDescriptor)> {
+    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
+    let config: serde_json::Value = if config_path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+
+    let mut config = config;
+    let auto_added = hardware_expand::expand_hardware_section(&mut config)?;
+    if verbose && !auto_added.is_empty() {
+        eprintln!("Auto-added from hardware.network: {}", auto_added.join(", "));
+    }
+
+    let target_desc = resolve_target(&config, None)?;
+    if verbose {
+        eprintln!("Target: {}", target_desc.display_name());
+    }
+
+    if let Some(ref defaults) = target_desc.hardware_defaults {
+        let hw = config
+            .get("hardware")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let hw_obj = hw.as_object().cloned().unwrap_or_default();
+        let def_obj = defaults.as_object().unwrap();
+        let mut merged = hw_obj;
+        for (key, val) in def_obj {
+            if !merged.contains_key(key) {
+                merged.insert(key.clone(), val.clone());
+            }
+        }
+        config["hardware"] = serde_json::Value::Object(merged);
+    }
+
+    let validation = board::validate_config(&config, &target_desc)?;
+    for warning in &validation.warnings {
+        eprintln!("  \x1b[1;33mWARNING:\x1b[0m {}", warning);
+    }
+    if !validation.is_ok() {
+        for err in &validation.errors {
+            eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
+        }
+        return Err(error::Error::Config("Config validation failed for target".into()));
+    }
+
+    Ok((config, target_desc))
+}
+
+fn build_packaged_blobs(
+    config: &serde_json::Value,
+    modules_dir: &std::path::Path,
+    target_desc: &target::TargetDescriptor,
+    verbose: bool,
+) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
+    let modules = parse_modules_from_config(config, modules_dir)?;
+
+    let caps: Vec<ModuleCaps> = modules
+        .iter()
+        .map(|m| ModuleCaps {
+            name: m.name.clone(),
+            mailbox_safe: m.mailbox_safe,
+            in_place_writer: m.in_place_writer,
+            manifest: m.manifest.clone(),
+        })
+        .collect();
+
+    let builder = ConfigBuilder::new();
+    let config_data = generate_config_with_caps(
+        config,
+        &builder,
+        &caps,
+        modules_dir,
+        target_desc.max_pin + 1,
+        target_desc.pio_count,
+    )?;
+
+    let modules_data = if !modules.is_empty() {
+        if verbose {
+            eprintln!("Embedding {} module(s):", modules.len());
+            for module in &modules {
+                eprintln!(
+                    "  - {} ({} bytes, type={})",
+                    module.name,
+                    module.data.len(),
+                    module.module_type
+                );
+            }
+        }
+        Some(build_module_table(&modules)?)
+    } else {
+        None
+    };
+
+    Ok((modules_data, config_data))
+}
+
+/// CRC-16/XMODEM over modules + config payload.
+/// Catches truncated images at boot time with zero runtime cost.
+fn crc16_xmodem(modules_data: &Option<Vec<u8>>, config_data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    let mut feed = |data: &[u8]| {
+        for &byte in data {
+            crc ^= (byte as u16) << 8;
+            for _ in 0..8 {
+                if crc & 0x8000 != 0 {
+                    crc = (crc << 1) ^ 0x1021;
+                } else {
+                    crc <<= 1;
+                }
+            }
+        }
+    };
+    if let Some(ref m) = modules_data {
+        feed(m);
+    }
+    feed(config_data);
+    crc
+}
+
+fn cmd_pack_image(
+    firmware_path: &PathBuf,
+    config_path: &PathBuf,
+    modules_dir: &PathBuf,
+    output_path: &PathBuf,
+    verbose: bool,
+) -> Result<()> {
+    const IMAGE_ALIGN: u32 = 256;
+    const PACKAGE_HEADER_MAGIC: u32 = 0x4B505846; // "FXPK"
+    const PACKAGE_HEADER_SIZE: usize = 16;
+
+    let mut firmware = std::fs::read(firmware_path)?;
+    if firmware.len() < PACKAGE_HEADER_SIZE {
+        return Err(error::Error::Config("firmware image is too small to contain package header".into()));
+    }
+
+    let header_offset = firmware.len() - PACKAGE_HEADER_SIZE;
+    let magic = u32::from_le_bytes(firmware[header_offset..header_offset + 4].try_into().unwrap());
+    if magic != PACKAGE_HEADER_MAGIC {
+        return Err(error::Error::Config(format!(
+            "firmware image missing package header magic (got 0x{:08x})",
+            magic
+        )));
+    }
+    let runtime_end = u32::from_le_bytes(
+        firmware[header_offset + 8..header_offset + 12]
+            .try_into()
+            .unwrap(),
+    );
+    let trailer_addr = (runtime_end + IMAGE_ALIGN - 1) & !(IMAGE_ALIGN - 1);
+
+    let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
+    let (modules_data, config_data) =
+        build_packaged_blobs(&config, modules_dir.as_path(), &target_desc, verbose)?;
+
+    let modules_addr = if modules_data.is_some() {
+        trailer_addr + IMAGE_ALIGN
+    } else {
+        0
+    };
+    let config_addr = if let Some(ref mdata) = modules_data {
+        let after_modules = modules_addr + mdata.len() as u32;
+        (after_modules + IMAGE_ALIGN - 1) & !(IMAGE_ALIGN - 1)
+    } else {
+        trailer_addr + IMAGE_ALIGN
+    };
+
+    // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
+    let payload_crc = crc16_xmodem(&modules_data, &config_data);
+
+    let mut trailer = Vec::with_capacity(16);
+    trailer.extend_from_slice(&TRAILER_MAGIC.to_le_bytes());
+    trailer.push(TRAILER_VERSION);
+    trailer.push(0);
+    trailer.extend_from_slice(&payload_crc.to_le_bytes()); // CRC-16 of payload
+    trailer.extend_from_slice(&modules_addr.to_le_bytes());
+    trailer.extend_from_slice(&config_addr.to_le_bytes());
+
+    let mut package = Vec::new();
+    package.extend_from_slice(&trailer);
+    while package.len() < IMAGE_ALIGN as usize {
+        package.push(0);
+    }
+    if let Some(ref mdata) = modules_data {
+        package.extend_from_slice(mdata);
+        while (trailer_addr as usize + package.len()) % IMAGE_ALIGN as usize != 0 {
+            package.push(0);
+        }
+    }
+    package.extend_from_slice(&config_data);
+
+    let runtime_base = trailer_addr;
+    let package_size = package.len() as u32;
+    firmware[header_offset + 8..header_offset + 12].copy_from_slice(&runtime_base.to_le_bytes());
+    firmware[header_offset + 12..header_offset + 16].copy_from_slice(&package_size.to_le_bytes());
+
+    let firmware_size = firmware.len();
+    let mut image = firmware;
+    image.extend_from_slice(&package);
+
+    if verbose {
+        eprintln!("Layout:");
+        eprintln!("  Runtime:   0x{:08x}", runtime_base);
+        eprintln!("  Trailer:   0x{:08x} (16 bytes)", trailer_addr);
+        if let Some(ref mdata) = modules_data {
+            eprintln!("  Modules:   0x{:08x} ({} bytes)", modules_addr, mdata.len());
+        }
+        eprintln!("  Config:    0x{:08x} ({} bytes)", config_addr, config_data.len());
+    }
+
+    std::fs::write(output_path, &image)?;
+
+    if verbose {
+        println!(
+            "\x1b[1;32mSuccess:\x1b[0m Wrote {} ({} bytes)",
+            output_path.display(),
+            image.len()
+        );
+    } else {
+        let modules_size = modules_data.as_ref().map(|m| m.len()).unwrap_or(0);
+        println!(
+            "\x1b[1;32mSuccess\x1b[0m {} fw={}K mod={}K cfg={}K total={}K",
+            output_path.file_name().unwrap_or_default().to_string_lossy(),
+            firmware_size / 1024,
+            modules_size / 1024,
+            config_data.len() / 1024,
+            image.len() / 1024
         );
     }
 
@@ -1026,6 +1298,38 @@ fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
         "{} modules, {} bytes → {}",
         modules.len(),
         table.len(),
+        output.display()
+    );
+    for m in &modules {
+        println!("  {} ({} bytes)", m.name, m.data.len());
+    }
+
+    Ok(())
+}
+
+fn cmd_mktable_config(config_path: &PathBuf, modules_dir: &PathBuf, output: &PathBuf) -> Result<()> {
+    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
+    let config: serde_json::Value = if config_path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+
+    let modules = parse_modules_from_config(&config, modules_dir)?;
+    if modules.is_empty() {
+        return Err(Error::Module("No modules referenced in config".into()));
+    }
+
+    let table = build_module_table(&modules)?;
+    std::fs::write(output, &table)?;
+
+    println!(
+        "{} modules from {} → {}",
+        modules.len(),
+        config_path.display(),
         output.display()
     );
     for m in &modules {

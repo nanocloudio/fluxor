@@ -10,7 +10,8 @@
 //   - E3-S4/S5: RP1 peripheral access via PCIe BAR (GPIO, SPI, I2C register bridges)
 //   - E6: Multi-domain execution — modules assigned to domains by config, secondary cores woken
 //
-// Fully config-driven: YAML -> config.bin + modules.bin embedded at compile time.
+// Fully config-driven: the boot image carries trailer, modules.bin, and config.bin
+// after the fixed kernel binary, discovered at runtime via the layout trailer.
 
 use core::panic::PanicInfo;
 use core::arch::global_asm;
@@ -20,17 +21,6 @@ use fluxor::kernel::scheduler;
 use fluxor::kernel::loader;
 use fluxor::kernel::cross_domain;
 use fluxor::kernel::config::EdgeClass;
-
-// Embedded module table + config — built by `make vm` or `make cm5`
-#[repr(C, align(4096))]
-struct PageAligned([u8; include_bytes!("../../target/bcm2712/modules.bin").len()]);
-static MODULE_BLOB: PageAligned = PageAligned(*include_bytes!("../../target/bcm2712/modules.bin"));
-static MODULE_TABLE: &[u8] = &MODULE_BLOB.0;
-
-#[repr(C, align(4))]
-struct ConfigAligned([u8; include_bytes!("../../target/bcm2712/config.bin").len()]);
-static CONFIG_BLOB: ConfigAligned = ConfigAligned(*include_bytes!("../../target/bcm2712/config.bin"));
-static CONFIG_DATA: &[u8] = &CONFIG_BLOB.0;
 
 // ============================================================================
 // Platform address constants (compile-time board selection)
@@ -55,6 +45,18 @@ const GICC_BASE: usize = 0xFF84_2000; // Pi 5 GIC-400 CPU interface
 const GICC_IAR: *mut u32 = (GICC_BASE + 0x00C) as *mut u32;
 const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32;
 const TIMER_PPI: u32 = 30; // Non-secure physical timer PPI
+
+global_asm!(
+    ".section .layout_header,\"a\"",
+    ".global __package_header_start",
+    ".global __package_source_start",
+    "__package_header_start:",
+    "    .word 0x4B505846", // PACKAGE_HEADER_MAGIC
+    "    .byte 1, 0, 0, 0", // version + reserved
+    "    .word __end_block_addr",
+    "    .word 0",          // package_size (patched by pack-image)
+    "__package_source_start:",
+);
 
 // ============================================================================
 // PL011 UART registers (full register set for Pi 5 init)
@@ -744,6 +746,40 @@ global_asm!(
     "    msr cpacr_el1, x0",
     "    isb",
 
+    // Set up stack before relocating the packaged payload.
+    "    ldr x30, =__stack_end",
+    "    mov sp, x30",
+
+    // If a packaged payload is appended after the image, relocate it above the
+    // runtime-reserved RAM region before zeroing .bss.
+    "    ldr x2, =__package_header_start",
+    "    ldr w3, [x2]",
+    "    movz w4, #0x5846",
+    "    movk w4, #0x4B50, lsl #16",
+    "    cmp w3, w4",
+    "    b.ne 9f",
+    "    ldr w5, [x2, #12]",     // package_size
+    "    cbz w5, 9f",
+    "    add x6, x2, #16",       // source: bytes appended after the header
+    "    ldr w7, [x2, #8]",      // destination base (__end_block_addr, aligned by pack-image)
+    // Fast 8-byte copy loop (both src and dst are 256-byte aligned from pack-image)
+    "    bic x10, x5, #7",       // x10 = size rounded down to 8-byte multiple
+    "    mov x8, xzr",
+    "8:  cmp x8, x10",
+    "    b.ge 7f",
+    "    ldr x9, [x6, x8]",
+    "    str x9, [x7, x8]",
+    "    add x8, x8, #8",
+    "    b 8b",
+    // Copy remaining 0-7 tail bytes
+    "7:  cmp x8, x5",
+    "    b.ge 9f",
+    "    ldrb w9, [x6, x8]",
+    "    strb w9, [x7, x8]",
+    "    add x8, x8, #1",
+    "    b 7b",
+    "9:",
+
     // Zero BSS
     "    adr x0, __bss_start",
     "    adr x1, __bss_end",
@@ -752,10 +788,6 @@ global_asm!(
     "    str xzr, [x0], #8",
     "    b 0b",
     "1:",
-
-    // Set up stack
-    "    ldr x30, =__stack_end",
-    "    mov sp, x30",
 
     // Jump to Rust main
     "    bl main",
@@ -828,9 +860,9 @@ pub extern "C" fn main() -> ! {
     use fluxor::kernel::channel;
     use fluxor::kernel::config::{self, MAX_MODULES};
 
-    // Parse config
+    // Parse config from the layout trailer appended to kernel8.img
     let mut cfg = config::Config::empty();
-    if !config::read_config_from_ptr(CONFIG_DATA.as_ptr(), &mut cfg) {
+    if !config::read_config_into(&mut cfg) {
         uart_puts(b"[config] parse failed\r\n");
         loop { unsafe { core::arch::asm!("wfi") }; }
     }
@@ -859,10 +891,10 @@ pub extern "C" fn main() -> ! {
     uart_put_u32(n_edges as u32);
     uart_puts(b" edges\r\n");
 
-    // Load module table
+    // Load module table from the layout trailer appended to kernel8.img
     loader::reset_state_arena();
     let mut ldr = loader::ModuleLoader::new();
-    if ldr.init_from_blob(MODULE_TABLE.as_ptr()).is_err() {
+    if ldr.init().is_err() {
         uart_puts(b"[loader] no modules\r\n");
         loop { unsafe { core::arch::asm!("wfi") }; }
     }

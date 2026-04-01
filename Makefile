@@ -61,7 +61,7 @@ ABI_HEADER := src/abi.rs
 # Source/Transformer: channels + buffers + timers only
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm,$(1)),5,$(if $(filter i2s,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_source,$(1)),1,2)))))))))))))
 
-.PHONY: all build firmware firmware-all tools modules package examples clean targets vm vm-run cm5
+.PHONY: all build firmware firmware-all tools modules package examples examples-rp examples-vm examples-cm5 examples-aarch64 clean targets vm vm-run cm5 aarch64-image
 
 all: build
 
@@ -88,20 +88,11 @@ firmware-all:
 # --- QEMU VM targets (BCM2712/aarch64) ---
 
 VM_CONFIG ?= examples/qemu-virt/hello_server.yaml
-VM_MODULES := virtio_net ip http_server debug
 
-vm: tools ## Build BCM2712 kernel image for QEMU
-	@$(MAKE) modules TARGET_ID=bcm2712 --no-print-directory
-	@mkdir -p target/bcm2712/vm_modules
-	@for mod in $(VM_MODULES); do \
-		cp -u target/bcm2712/modules/$$mod.fmod target/bcm2712/vm_modules/ 2>/dev/null || true; \
-	done
-	@$(FLUXOR_TOOL) mktable target/bcm2712/vm_modules -o target/bcm2712/modules.bin
-	@$(FLUXOR_TOOL) generate $(VM_CONFIG) -o target/bcm2712/config.bin --binary
-	@$(MAKE) firmware TARGET_ID=bcm2712 --no-print-directory
-	@mkdir -p vm
-	@cp target/bcm2712/firmware.bin vm/kernel8.img
-	@echo "vm/kernel8.img ready ($(shell stat -c%s vm/kernel8.img 2>/dev/null || echo 0) bytes)"
+vm: AARCH64_FIRMWARE_TARGET=bcm2712
+vm: AARCH64_CONFIG=$(VM_CONFIG)
+vm: AARCH64_OUTPUT=vm/kernel8.img
+vm: aarch64-image ## Build BCM2712 kernel image for QEMU
 
 vm-run: vm ## Build and run in QEMU with virtio-net
 	qemu-system-aarch64 \
@@ -113,21 +104,22 @@ vm-run: vm ## Build and run in QEMU with virtio-net
 # --- CM5 bare-metal targets (Pi 5 / CM5 real hardware) ---
 
 CM5_CONFIG ?= examples/cm5/hello_uart.yaml
-CM5_MODULES ?= debug
 
-cm5: tools ## Build kernel8.img for real Pi 5 / CM5 hardware
-	@$(MAKE) modules TARGET_ID=cm5 --no-print-directory
-	@mkdir -p target/cm5/cm5_modules
-	@for mod in $(CM5_MODULES); do \
-		cp -u target/cm5/modules/$$mod.fmod target/cm5/cm5_modules/ 2>/dev/null || true; \
-	done
-	@$(FLUXOR_TOOL) mktable target/cm5/cm5_modules -o target/bcm2712/modules.bin
-	@$(FLUXOR_TOOL) generate $(CM5_CONFIG) -o target/bcm2712/config.bin --binary
-	@$(MAKE) firmware TARGET_ID=cm5 --no-print-directory
-	@mkdir -p target/cm5/boot
-	@cp target/cm5/firmware.bin target/cm5/boot/kernel8.img
-	@echo "target/cm5/boot/kernel8.img ready ($$(stat -c%s target/cm5/boot/kernel8.img 2>/dev/null || echo 0) bytes)"
+cm5: AARCH64_FIRMWARE_TARGET=cm5
+cm5: AARCH64_CONFIG=$(CM5_CONFIG)
+cm5: AARCH64_OUTPUT=target/cm5/boot/kernel8.img
+cm5: aarch64-image ## Build kernel8.img for real Pi 5 / CM5 hardware
 	@echo "Copy to SD card with: cp target/cm5/boot/kernel8.img /boot/firmware/"
+
+aarch64-image: tools
+	@if [ -z "$(AARCH64_FIRMWARE_TARGET)" ] || [ -z "$(AARCH64_CONFIG)" ] || [ -z "$(AARCH64_OUTPUT)" ]; then \
+		echo "Usage: make aarch64-image AARCH64_FIRMWARE_TARGET=<bcm2712|cm5> AARCH64_CONFIG=<yaml> AARCH64_OUTPUT=<img>"; \
+		exit 1; \
+	fi
+	@$(MAKE) modules TARGET_ID=$(AARCH64_FIRMWARE_TARGET) --no-print-directory
+	@$(MAKE) firmware TARGET_ID=$(AARCH64_FIRMWARE_TARGET) --no-print-directory
+	@mkdir -p $$(dirname $(AARCH64_OUTPUT))
+	@$(FLUXOR_TOOL) pack-image target/$(AARCH64_FIRMWARE_TARGET)/firmware.bin $(AARCH64_CONFIG) --modules-dir target/$(AARCH64_FIRMWARE_TARGET)/modules -o $(AARCH64_OUTPUT)
 
 tools:
 	@echo "Building tools..."
@@ -221,11 +213,13 @@ package: build
 	if [ ! -f "$$fw" ]; then echo "Error: $$fw not built (run: make firmware TARGET_ID=rp2040)"; exit 1; fi; \
 	mkdir -p $$outdir && $(FLUXOR_TOOL) combine $$fw $$yaml -o $$outdir/$(NAME).uf2
 
-examples: build
+examples: examples-rp examples-aarch64
+
+examples-rp: build
 	@$(MAKE) firmware TARGET_ID=rp2040 --no-print-directory
 	@$(MAKE) modules TARGET_ID=rp2040 --no-print-directory
-	@count=0; skip=0; \
-	for yaml in $$(find examples -name '*.yaml' | sort); do \
+	@count=0; \
+	for yaml in $$(find examples -name '*.yaml' ! -path 'examples/qemu-virt/*' ! -path 'examples/cm5/*' | sort); do \
 		name=$$(basename $$yaml .yaml); \
 		subdir=$$(basename $$(dirname $$yaml)); \
 		board=$$(grep '^target:' $$yaml | head -1 | awk '{print $$2}'); \
@@ -233,17 +227,45 @@ examples: build
 		case "$$silicon" in \
 			rp2040) fw="target/rp2040/firmware.bin"; outdir="target/rp2040/uf2" ;; \
 			rp2350*) fw="target/rp2350/firmware.bin"; outdir="target/rp2350/uf2" ;; \
-			bcm2712) echo "Skip $$subdir/$$name (use 'make vm' for bcm2712)"; skip=$$((skip + 1)); continue ;; \
 			*)      fw="target/rp2350/firmware.bin"; outdir="target/rp2350/uf2" ;; \
 		esac; \
 		if [ ! -f "$$fw" ]; then \
-			echo "Skip $$subdir/$$name ($$fw not built)"; skip=$$((skip + 1)); continue; \
+			echo "Skip $$subdir/$$name ($$fw not built)"; continue; \
 		fi; \
 		mkdir -p $$outdir/$$subdir; \
 		$(FLUXOR_TOOL) combine $$fw $$yaml -o $$outdir/$$subdir/$${name}.uf2 && count=$$((count + 1)); \
 	done; \
-	echo "Built $$count example UF2s"; \
-	if [ "$$skip" -gt 0 ]; then echo "Skipped $$skip examples"; fi
+	echo "Built $$count RP example UF2s"
+
+examples-aarch64: examples-vm examples-cm5
+
+examples-vm: tools
+	@count=0; \
+	for yaml in $$(find examples/qemu-virt -name '*.yaml' | sort); do \
+		name=$$(basename $$yaml .yaml); \
+		out="target/bcm2712/images/qemu-virt/$${name}.img"; \
+		$(MAKE) aarch64-image \
+			AARCH64_FIRMWARE_TARGET=bcm2712 \
+			AARCH64_CONFIG=$$yaml \
+			AARCH64_OUTPUT=$$out \
+			--no-print-directory || exit 1; \
+		count=$$((count + 1)); \
+	done; \
+	echo "Built $$count QEMU example images"
+
+examples-cm5: tools
+	@count=0; \
+	for yaml in $$(find examples/cm5 -name '*.yaml' | sort); do \
+		name=$$(basename $$yaml .yaml); \
+		out="target/cm5/images/cm5/$${name}.img"; \
+		$(MAKE) aarch64-image \
+			AARCH64_FIRMWARE_TARGET=cm5 \
+			AARCH64_CONFIG=$$yaml \
+			AARCH64_OUTPUT=$$out \
+			--no-print-directory || exit 1; \
+		count=$$((count + 1)); \
+	done; \
+	echo "Built $$count CM5 example images"
 
 targets:
 	@$(FLUXOR_TOOL) targets

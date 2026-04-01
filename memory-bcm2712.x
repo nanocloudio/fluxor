@@ -29,6 +29,10 @@ SECTIONS {
         *(.data .data.*)
     } > RAM
 
+    .layout_header : ALIGN(8) {
+        KEEP(*(.layout_header))
+    } > RAM
+
     .bss (NOLOAD) : ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)
@@ -40,11 +44,14 @@ SECTIONS {
         *(.uninit .uninit.*)
     } > RAM
 
-    /* Stack at end of used RAM */
+    /* Stack in RAM, not part of the loadable image. */
     . = ALIGN(16);
     __stack_start = .;
     . = . + 64K;
     __stack_end = .;
+
+    /* End of runtime-reserved RAM. Relocated package payload lives above this. */
+    __end_block_addr = .;
 
     /DISCARD/ : {
         *(.ARM.exidx .ARM.exidx.*)
@@ -52,6 +59,4 @@ SECTIONS {
     }
 }
 
-/* Stubs for RP-specific linker symbols referenced by config.rs */
-__end_block_addr = 0;
 __start_block_addr = 0;

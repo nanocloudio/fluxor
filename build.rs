@@ -128,7 +128,6 @@ fn main() {
         println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={}", ram_origin);
         println!("cargo:rerun-if-changed=memory-bcm2712.x");
         println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
-        println!("cargo:rerun-if-changed=target/bcm2712/modules.bin");
         println!("cargo:rerun-if-changed=build.rs");
         return;
     }

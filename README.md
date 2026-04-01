@@ -101,10 +101,26 @@ List all example names:
 find examples -name '*.yaml' | sort
 ```
 
-### 4. Build all example UF2s
+### 4. Build all example artifacts
 
 ```bash
 make examples
+```
+
+`make examples` builds all shipped example artifacts:
+
+- RP examples as UF2s
+- QEMU virt examples as `kernel8.img` images under `target/bcm2712/images/qemu-virt/`
+- CM5 examples as `kernel8.img` images under `target/cm5/images/cm5/`
+
+For every target, packaging is driven by the YAML config and prebuilt `.fmod` modules. QEMU virt and CM5 `kernel8.img` files are assembled as raw boot images with a layout trailer, module table, and config blob appended after the fixed kernel binary.
+
+If you want only one class of outputs:
+
+```bash
+make examples-rp
+make examples-vm
+make examples-cm5
 ```
 
 ## CLI Workflow
@@ -114,6 +130,9 @@ The host tool is built as `fluxor` and provides package and inspection commands:
 ```bash
 # Compose firmware + YAML config into UF2
 fluxor combine <firmware.bin> <config.yaml> -o <out.uf2>
+
+# Compose firmware.bin + YAML config into a raw boot image
+fluxor pack-image <firmware.bin> <config.yaml> --modules-dir <dir> -o <kernel8.img>
 
 # Pack module ELF into .fmod
 fluxor pack <module.elf> -o <module.fmod> -n <name> -t <module_type>

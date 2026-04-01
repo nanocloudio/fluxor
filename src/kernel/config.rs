@@ -318,8 +318,41 @@ pub fn read_layout() -> Option<FlashLayout> {
             return None;
         }
 
+        let expected_crc = read_u16(trailer_ptr.add(6));
         let modules_addr = read_u32(trailer_ptr.add(8));
         let config_addr = read_u32(trailer_ptr.add(12));
+
+        // Verify payload CRC if non-zero (CRC-16/XMODEM over modules + config)
+        if expected_crc != 0 {
+            let mut crc: u16 = 0;
+            // CRC over modules blob (from modules_addr to config_addr)
+            if modules_addr != 0 && modules_addr < config_addr {
+                let len = (config_addr - modules_addr) as usize;
+                let ptr = modules_addr as *const u8;
+                for i in 0..len {
+                    crc ^= (*ptr.add(i) as u16) << 8;
+                    for _ in 0..8 {
+                        if crc & 0x8000 != 0 { crc = (crc << 1) ^ 0x1021; } else { crc <<= 1; }
+                    }
+                }
+            }
+            // CRC over config blob (read header to get size)
+            let config_ptr = config_addr as *const u8;
+            let config_magic = read_u32(config_ptr);
+            if config_magic == MAGIC_CONFIG {
+                let config_len = read_u16(config_ptr.add(4)) as usize;
+                for i in 0..config_len {
+                    crc ^= (*config_ptr.add(i) as u16) << 8;
+                    for _ in 0..8 {
+                        if crc & 0x8000 != 0 { crc = (crc << 1) ^ 0x1021; } else { crc <<= 1; }
+                    }
+                }
+            }
+            if crc != expected_crc {
+                log::error!("[config] payload CRC mismatch: expected 0x{:04x} got 0x{:04x}", expected_crc, crc);
+                return None;
+            }
+        }
 
         Some(FlashLayout {
             modules_addr,
