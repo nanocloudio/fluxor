@@ -37,6 +37,10 @@ pub struct ModuleInfo {
     pub mailbox_safe: bool,
     /// Module uses buffer_acquire_inplace to modify buffer (header flags bit 1)
     pub in_place_writer: bool,
+    /// Module exports module_drain for live reconfigure (header flags bit 3).
+    /// Used by `fluxor info` and `fluxor diff` for transition plan display.
+    #[allow(dead_code)]
+    pub drain_capable: bool,
     /// Raw param schema bytes (if module uses define_params! macro)
     pub schema: Option<Vec<u8>>,
     /// Module manifest (always present in ABI v2)
@@ -80,6 +84,7 @@ impl ModuleInfo {
         let flags_byte = if data.len() > 60 { data[60] } else { 0 };
         let mailbox_safe = (flags_byte & 0x01) != 0;
         let in_place_writer = (flags_byte & 0x02) != 0;
+        let drain_capable = (flags_byte & 0x08) != 0;
 
         // ABI v2 reserved layout:
         //   byte 0 (offset 60): flags (bit 0: mailbox_safe, bit 1: in_place_writer)
@@ -127,6 +132,7 @@ impl ModuleInfo {
             module_type,
             mailbox_safe,
             in_place_writer,
+            drain_capable,
             schema,
             manifest,
             data,
@@ -636,6 +642,8 @@ pub fn pack_fmod(
         "module_mailbox_safe",
         // deferred ready (infrastructure modules that need init time)
         "module_deferred_ready",
+        // drain support (graceful shutdown for live reconfigure)
+        "module_drain",
     ];
 
     let mut exports: Vec<(String, u32, u32)> = Vec::new();
@@ -721,6 +729,7 @@ pub fn pack_fmod(
     let has_in_place_safe = symbols.iter().any(|s| s.bind == 1 && s.name == "module_in_place_safe");
     let has_mailbox_safe = symbols.iter().any(|s| s.bind == 1 && s.name == "module_mailbox_safe");
     let has_deferred_ready = symbols.iter().any(|s| s.bind == 1 && s.name == "module_deferred_ready");
+    let has_drain = symbols.iter().any(|s| s.bind == 1 && s.name == "module_drain");
     let mut reserved = [0u8; 8];
     if has_in_place_safe {
         reserved[0] |= 0x03; // mailbox_safe (bit 0) + in_place_writer (bit 1)
@@ -730,6 +739,9 @@ pub fn pack_fmod(
     }
     if has_deferred_ready {
         reserved[0] |= 0x04; // deferred_ready (bit 2)
+    }
+    if has_drain {
+        reserved[0] |= 0x08; // drain_capable (bit 3)
     }
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());

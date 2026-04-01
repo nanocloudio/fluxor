@@ -20,6 +20,7 @@ pub mod export_hashes {
     pub const MODULE_STEP: u32 = 0xc7ea2db4;       // "module_step"
     pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
+    pub const MODULE_DRAIN: u32 = 0xc4c5636c;      // "module_drain"
 }
 
 /// Module table magic: "FXMT"
@@ -270,6 +271,17 @@ unsafe fn call_step(f: ModuleStepFn, state: *mut u8) -> i32 {
     r
 }
 
+/// Function pointer type for module_drain export
+pub type ModuleDrainFn = unsafe extern "C" fn(*mut u8) -> i32;
+
+/// Call module_drain export.
+#[inline]
+unsafe fn call_drain(f: ModuleDrainFn, state: *mut u8) -> i32 {
+    let r = f(state);
+    pic_barrier();
+    r
+}
+
 /// Return count of PIC calls that left interrupts disabled.
 pub fn pic_irq_disabled_count() -> u32 {
     unsafe { PIC_IRQ_DISABLED_COUNT }
@@ -395,7 +407,9 @@ impl ModuleHeader {
     ///     bit 1: in_place_writer — module uses buffer_acquire_inplace to modify
     ///            the buffer in place. Used for setup-time validation: at most
     ///            one in_place_writer per buffer_group is allowed.
-    ///     bits 2-7: reserved (0)
+    ///     bit 2: deferred_ready — module needs init time before downstream runs.
+    ///     bit 3: drain_capable — module exports module_drain for live reconfigure.
+    ///     bits 4-7: reserved (0)
     ///   byte 1: step_period_ms
     ///   bytes 2-3: schema_size (u16 LE)
     ///   bytes 4-5: manifest_size (u16 LE)
@@ -966,6 +980,9 @@ pub unsafe fn invoke_new(
 pub struct DynamicModule {
     step_fn: ModuleStepFn,
     state_ptr: *mut u8,
+    /// Optional drain function pointer (resolved from module_drain export).
+    /// None if the module does not export module_drain.
+    drain_fn: Option<ModuleDrainFn>,
 }
 
 /// Partially initialized module waiting for async operations to complete.
@@ -992,6 +1009,7 @@ pub struct DynamicModulePending {
     params_ptr: *const u8,
     params_len: usize,
     name: &'static str,
+    drain_fn: Option<ModuleDrainFn>,
 }
 
 impl DynamicModulePending {
@@ -1029,6 +1047,7 @@ impl DynamicModulePending {
             params_ptr: params,
             params_len,
             name,
+            drain_fn: None,
         }
     }
 
@@ -1055,6 +1074,7 @@ impl DynamicModulePending {
                 Ok(Some(DynamicModule {
                     step_fn: self.step_fn,
                     state_ptr: self.state_ptr,
+                    drain_fn: self.drain_fn,
                 }))
             }
             NewStatus::Pending => Ok(None),
@@ -1083,7 +1103,21 @@ impl DynamicModule {
 
     /// Create from pre-validated parts (for debug stepping through instantiation).
     pub fn from_parts(step_fn: ModuleStepFn, state_ptr: *mut u8) -> Self {
-        Self { step_fn, state_ptr }
+        Self { step_fn, state_ptr, drain_fn: None }
+    }
+
+    /// Call module_drain if the module exports it.
+    /// Returns the drain function's return code, or -1 if not drain-capable.
+    pub unsafe fn call_drain(&self) -> i32 {
+        match self.drain_fn {
+            Some(f) => call_drain(f, self.state_ptr),
+            None => -1,
+        }
+    }
+
+    /// Returns true if this module exports module_drain.
+    pub fn has_drain(&self) -> bool {
+        self.drain_fn.is_some()
     }
 
     /// Create from loaded module with configuration parameters.
@@ -1148,6 +1182,11 @@ impl DynamicModule {
             return Err(e);
         }
 
+        // 5b. Resolve optional module_drain export
+        let drain_fn: Option<ModuleDrainFn> = module.get_export_addr(export_hashes::MODULE_DRAIN)
+            .ok()
+            .map(|addr| fn_ptr_from_addr(addr));
+
         // 6. Try to create instance (may return pending)
         match invoke_new(exports.new_fn, syscalls, in_chan, out_chan, ctrl_chan, params, params_len, state_ptr, required_size)? {
             NewStatus::Ready => {
@@ -1155,6 +1194,7 @@ impl DynamicModule {
                 Ok(StartNewResult::Ready(DynamicModule {
                     step_fn: exports.step_fn,
                     state_ptr,
+                    drain_fn,
                 }))
             }
             NewStatus::Pending => {
@@ -1172,6 +1212,7 @@ impl DynamicModule {
                     params_ptr: params,
                     params_len,
                     name,
+                    drain_fn,
                 };
                 log::info!("[inst] pending {}", name);
                 Ok(StartNewResult::Pending(pending))

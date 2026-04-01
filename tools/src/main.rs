@@ -17,6 +17,7 @@ mod hardware_expand;
 mod hash;
 mod manifest;
 mod modules;
+pub mod reconfigure;
 mod schema;
 pub mod target;
 mod uf2;
@@ -134,6 +135,16 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Show transition plan between two config files (live reconfigure diff)
+    Diff {
+        /// Old config file (YAML)
+        old_config: PathBuf,
+        /// New config file (YAML)
+        new_config: PathBuf,
+        /// Target override (default: read from new config YAML 'target:' field, fallback: pico2w)
+        #[arg(short, long)]
+        target: Option<String>,
+    },
 }
 
 fn main() {
@@ -165,6 +176,7 @@ fn main() {
         Commands::TargetInfo { target, field } => cmd_target_info(&target, field.as_deref()),
         Commands::Targets => cmd_targets(),
         Commands::Mktable { dir, output } => cmd_mktable(&dir, &output),
+        Commands::Diff { old_config, new_config, target } => cmd_diff(&old_config, &new_config, target.as_deref()),
     };
 
     if let Err(e) = result {
@@ -1019,6 +1031,24 @@ fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
     for m in &modules {
         println!("  {} ({} bytes)", m.name, m.data.len());
     }
+
+    Ok(())
+}
+
+fn cmd_diff(old_path: &PathBuf, new_path: &PathBuf, target_override: Option<&str>) -> Result<()> {
+    let old_content = substitute_env_vars(&std::fs::read_to_string(old_path)?)?;
+    let new_content = substitute_env_vars(&std::fs::read_to_string(new_path)?)?;
+
+    let old_config: serde_json::Value = serde_yaml::from_str(&old_content)?;
+    let new_config: serde_json::Value = serde_yaml::from_str(&new_content)?;
+
+    let target_desc = resolve_target(&new_config, target_override)?;
+    let modules_dir_path = format!("target/{}/modules", target_desc.id);
+    let modules_dir = std::path::Path::new(&modules_dir_path);
+
+    let plan = reconfigure::compute_transition_plan(&old_config, &new_config, modules_dir);
+
+    print!("{}", reconfigure::format_plan(&plan));
 
     Ok(())
 }

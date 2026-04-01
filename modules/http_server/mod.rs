@@ -224,7 +224,9 @@ struct HttpServerState {
     body_pool: *mut u8,
     /// Capacity of the heap-allocated body pool.
     body_pool_cap: u16,
-    _state_pad: [u8; 2],
+    /// Set to 1 by module_drain — stops accepting new connections.
+    draining: u8,
+    _state_pad: [u8; 1],
 }
 
 impl HttpServerState {
@@ -857,6 +859,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
 
             HttpPhase::WaitListen => {
+                // If draining, don't accept new connections — signal done
+                if s.draining != 0 {
+                    return 1; // StepOutcome::Done
+                }
                 let rc = dev_socket_accept(s.sys(), s.socket_handle);
                 if rc == E_BUSY { return 0; }
                 if rc < 0 && rc != E_INPROGRESS {
@@ -867,6 +873,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
 
             HttpPhase::WaitAccept => {
+                // If drain was signaled while waiting, stop accepting
+                if s.draining != 0 {
+                    return 1; // StepOutcome::Done
+                }
                 let poll = dev_socket_poll(s.sys(), s.socket_handle, POLL_CONN | POLL_HUP);
                 if poll <= 0 { return 0; }
                 if (poll as u8 & POLL_CONN) != 0 {
@@ -1212,6 +1222,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // ── Connection Close + Re-listen ─────────────────────────
             HttpPhase::CloseConn => {
                 reset_socket(s);
+                // If draining, don't re-listen — signal done
+                if s.draining != 0 {
+                    return 1; // StepOutcome::Done
+                }
             }
 
             // ── Proxy Phases (Phase 3 stubs) ─────────────────────────
@@ -1427,6 +1441,29 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpServerState) {
         build_error(s, b"400 Bad Request", b"Bad Request\n");
         s.phase = HttpPhase::DrainSend;
     }
+}
+
+// ============================================================================
+// Drain Support (Live Reconfigure)
+// ============================================================================
+
+/// Called by the scheduler when entering DRAINING phase.
+///
+/// Sets the draining flag so that:
+/// - If waiting to accept, returns Done immediately (no new connections)
+/// - If mid-request, completes the current request then returns Done
+///
+/// The module continues to be stepped normally via module_step().
+/// When the current connection (if any) completes, module_step returns Done.
+#[no_mangle]
+#[link_section = ".text.module_drain"]
+pub extern "C" fn module_drain(state: *mut u8) -> i32 {
+    if state.is_null() { return -1; }
+    unsafe {
+        let s = &mut *(state as *mut HttpServerState);
+        s.draining = 1;
+    }
+    0
 }
 
 // ============================================================================
