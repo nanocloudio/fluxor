@@ -842,6 +842,66 @@ unsafe fn dev_arena_get(sys: &SyscallTable) -> (*mut u8, u32) {
 }
 
 // ============================================================================
+// Paged Arena (demand-paged memory larger than RAM)
+// ============================================================================
+
+/// Paged arena stats returned by dev_paged_arena_stats.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+struct PagedArenaStats {
+    resident: u32,
+    faults: u32,
+    evictions: u32,
+    dirty: u32,
+    writebacks: u32,
+    hit_ratio_q8: u16,
+    _reserved: u16,
+}
+
+/// Get paged arena base address and size.
+/// Returns (base_ptr, size, status). status=1 if active, 0 if not.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_paged_arena_get(sys: &SyscallTable) -> (*mut u8, usize, u32) {
+    let mut buf = [0u8; 20];
+    let rc = (sys.dev_call)(-1, 0x0CF8, buf.as_mut_ptr(), 20);
+    if rc < 0 {
+        return (core::ptr::null_mut(), 0, 0);
+    }
+    let base = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+    let size = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+    let status = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    (base as *mut u8, size as usize, status)
+}
+
+/// Get paged arena statistics.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_paged_arena_stats(sys: &SyscallTable) -> PagedArenaStats {
+    let mut stats = PagedArenaStats::default();
+    let p = &mut stats as *mut _ as *mut u8;
+    (sys.dev_call)(-1, 0x0CF9, p, core::mem::size_of::<PagedArenaStats>());
+    stats
+}
+
+/// Prefault pages into the paged arena.
+/// `offset`: starting page index, `count`: number of pages to prefault.
+/// Returns number of pages actually prefaulted.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_paged_arena_prefault(sys: &SyscallTable, offset: u32, count: u32) -> u32 {
+    let mut buf = [0u8; 8];
+    let bp = buf.as_mut_ptr();
+    let ob = offset.to_le_bytes();
+    let cb = count.to_le_bytes();
+    *bp = ob[0]; *bp.add(1) = ob[1]; *bp.add(2) = ob[2]; *bp.add(3) = ob[3];
+    *bp.add(4) = cb[0]; *bp.add(5) = cb[1]; *bp.add(6) = cb[2]; *bp.add(7) = cb[3];
+    let rc = (sys.dev_call)(-1, 0x0CFA, bp, 8);
+    if rc > 0 { rc as u32 } else { 0 }
+}
+
+// ============================================================================
 // FMP (Fluxor Message Protocol) — typed messages on channels
 // ============================================================================
 

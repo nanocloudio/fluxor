@@ -786,6 +786,42 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             if slot < 0 { return E_INVAL; }
             crate::kernel::bridge::bridge_dispatch(slot as usize, bridge_op, arg, arg_len)
         }
+        // ── Paged arena ──
+        dev_system::PAGED_ARENA_GET => {
+            let idx = scheduler::current_module_index();
+            let config = crate::kernel::pager::get_config(idx);
+            if !arg.is_null() && arg_len >= 20 {
+                let base = if config.active { config.base_vaddr as u64 } else { 0 };
+                let size = if config.active { config.virtual_size as u64 } else { 0 };
+                let status: u32 = if config.active { 1 } else { 0 };
+                let p = arg;
+                let base_bytes = base.to_le_bytes();
+                let size_bytes = size.to_le_bytes();
+                let status_bytes = status.to_le_bytes();
+                core::ptr::copy_nonoverlapping(base_bytes.as_ptr(), p, 8);
+                core::ptr::copy_nonoverlapping(size_bytes.as_ptr(), p.add(8), 8);
+                core::ptr::copy_nonoverlapping(status_bytes.as_ptr(), p.add(16), 4);
+            }
+            if config.active { 0 } else { E_NOSYS }
+        }
+        dev_system::PAGED_ARENA_STATS => {
+            let idx = scheduler::current_module_index();
+            let stats = crate::kernel::pager::build_stats(idx);
+            if !arg.is_null() && arg_len >= core::mem::size_of::<crate::kernel::pager::PagedArenaStats>() {
+                let src = &stats as *const _ as *const u8;
+                core::ptr::copy_nonoverlapping(src, arg, core::mem::size_of::<crate::kernel::pager::PagedArenaStats>());
+                0
+            } else {
+                E_INVAL
+            }
+        }
+        dev_system::PAGED_ARENA_PREFAULT => {
+            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            let idx = scheduler::current_module_index();
+            crate::kernel::pager::prefault(idx, offset, count) as i32
+        }
         // ── ISR tier metrics ──
         dev_system::ISR_METRICS => {
             crate::kernel::isr_tier::isr_metrics_dispatch(arg, arg_len)

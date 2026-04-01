@@ -828,6 +828,19 @@ pub mod dev_system {
     /// Returns: [type:u8, from:u8, to:u8, _:u8, drops:u32 LE, seq:u32 LE]
     pub const BRIDGE_INFO: u32 = 0x0CE3;
 
+    // --- Paged arena (0x0CF8-0x0CFA) ---
+
+    /// Get paged arena info. handle=-1, arg=20-byte output buffer.
+    /// Returns: [base_vaddr:u64 LE, virtual_size:u64 LE, status:u32 LE].
+    /// status: 0=no arena, 1=active.
+    pub const PAGED_ARENA_GET: u32 = 0x0CF8;
+    /// Get paged arena statistics. handle=-1, arg=24-byte output buffer.
+    /// Returns PagedArenaStats struct.
+    pub const PAGED_ARENA_STATS: u32 = 0x0CF9;
+    /// Prefault pages into paged arena. handle=-1, arg=[offset_pages:u32 LE, count:u32 LE] (8 bytes).
+    /// Returns number of pages prefaulted.
+    pub const PAGED_ARENA_PREFAULT: u32 = 0x0CFA;
+
     // --- ISR Tier metrics (0x0CE8) ---
 
     /// Query ISR module metrics. handle=-1, arg=[tier:u8, slot:u8] (2 bytes input).

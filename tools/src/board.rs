@@ -75,6 +75,9 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
     // Validate isolation settings if present
     validate_isolation(config, target, &mut result);
 
+    // Validate paged arena settings if present
+    validate_paged_arenas(config, target, &mut result);
+
     Ok(result)
 }
 
@@ -610,5 +613,99 @@ fn validate_isolation(
                 ));
             }
         }
+    }
+}
+
+/// Validate paged_arena settings against target capabilities.
+///
+/// Checks that paged_arena is only used on targets with MMU support (BCM2712).
+/// Validates resident_max_mb sum fits within reasonable pool limits.
+fn validate_paged_arenas(
+    config: &Value,
+    target: &TargetDescriptor,
+    result: &mut ValidationResult,
+) {
+    let modules = match config.get("modules").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return,
+    };
+
+    let mut total_resident_mb: u64 = 0;
+    let mut has_paged_arena = false;
+
+    for (i, module) in modules.iter().enumerate() {
+        let pa = match module.get("paged_arena") {
+            Some(pa) => pa,
+            None => continue,
+        };
+        has_paged_arena = true;
+
+        let name = module.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+        let prefix = format!("modules[{}] ({})", i, name);
+
+        // Validate virtual_size_mb
+        let virtual_mb = pa.get("virtual_size_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+        if virtual_mb == 0 {
+            result.add_error(format!(
+                "{}: paged_arena.virtual_size_mb must be > 0", prefix
+            ));
+        }
+        if virtual_mb > 4096 {
+            result.add_error(format!(
+                "{}: paged_arena.virtual_size_mb {} exceeds 4GB limit", prefix, virtual_mb
+            ));
+        }
+
+        // Validate resident_max_mb
+        let resident_mb = pa.get("resident_max_mb").and_then(|v| v.as_u64()).unwrap_or(1);
+        if resident_mb > virtual_mb {
+            result.add_warning(format!(
+                "{}: paged_arena.resident_max_mb ({}) > virtual_size_mb ({}), clamped",
+                prefix, resident_mb, virtual_mb
+            ));
+        }
+        total_resident_mb += resident_mb;
+
+        // Validate backing type
+        let backing = pa.get("backing").and_then(|v| v.as_str()).unwrap_or("ramdisk");
+        match backing {
+            "ramdisk" | "nvme" => {}
+            _ => {
+                result.add_error(format!(
+                    "{}: paged_arena.backing '{}' must be 'ramdisk' or 'nvme'",
+                    prefix, backing
+                ));
+            }
+        }
+
+        // Validate writeback policy
+        let writeback = pa.get("writeback").and_then(|v| v.as_str()).unwrap_or("deferred");
+        match writeback {
+            "deferred" | "write_through" => {}
+            _ => {
+                result.add_error(format!(
+                    "{}: paged_arena.writeback '{}' must be 'deferred' or 'write_through'",
+                    prefix, writeback
+                ));
+            }
+        }
+    }
+
+    // Check target has MMU
+    if has_paged_arena && !target.has_mmu {
+        result.add_error(format!(
+            "paged_arena requires MMU support (target '{}' has_mmu=false). \
+             Only BCM2712/CM5 targets support demand paging.",
+            target.id
+        ));
+    }
+
+    // Check total resident fits in reasonable pool (256 pages = 1MB for RAM-disk testing)
+    if total_resident_mb > 1 {
+        result.add_warning(format!(
+            "Total paged_arena resident_max across all modules is {}MB. \
+             Ensure pool is sized accordingly (default 1MB for testing).",
+            total_resident_mb
+        ));
     }
 }

@@ -516,8 +516,9 @@ mod bcm2712_impl {
 
     /// Data abort handler (called from exception vector).
     ///
-    /// Reads FAR_EL1 to get the faulting address, identifies the module
-    /// from scheduler's current_module, triggers fault recovery.
+    /// Reads FAR_EL1 to get the faulting address. If the address falls within
+    /// a module's paged arena, delegates to the demand pager. Otherwise,
+    /// records a protection fault.
     pub unsafe fn handle_data_abort() {
         let far: u64;
         let esr: u64;
@@ -527,6 +528,23 @@ mod bcm2712_impl {
         let module_idx = crate::kernel::scheduler::current_module_index();
         let dfsc = esr & 0x3F; // Data Fault Status Code
 
+        // Check if this is a translation fault in a paged arena (DFSC 0x04-0x07 = translation fault)
+        let is_translation_fault = (dfsc & 0x3C) == 0x04;
+        if is_translation_fault {
+            if crate::kernel::pager::is_paged_arena_fault(module_idx, far as usize) {
+                match crate::kernel::pager::handle_page_fault(module_idx, far as usize) {
+                    Ok(()) => return, // Page loaded, retry faulting instruction
+                    Err(e) => {
+                        log::error!(
+                            "[mmu] pager fault failed for module {} at 0x{:016x}: {:?}",
+                            module_idx, far, e
+                        );
+                        // Fall through to record as MPU fault
+                    }
+                }
+            }
+        }
+
         log::error!(
             "[mmu] module {} data abort at 0x{:016x} ESR=0x{:08x} DFSC=0x{:02x}",
             module_idx, far, esr, dfsc
@@ -534,6 +552,148 @@ mod bcm2712_impl {
 
         // Record fault via step_guard
         crate::kernel::step_guard::record_mpu_fault(module_idx);
+    }
+
+    // ========================================================================
+    // L3 page table support for 4KB demand paging (E10)
+    // ========================================================================
+
+    /// L3 page table (512 entries, each maps a 4KB page).
+    #[repr(C, align(4096))]
+    struct L3PageTable([u64; TABLE_ENTRIES]);
+
+    /// Maximum L3 tables per module (each covers 2MB = 512 x 4KB pages).
+    /// 4 tables = 8MB paged arena range per module.
+    const MAX_L3_PER_MODULE: usize = 4;
+
+    /// Per-module L3 page tables for paged arena regions.
+    static mut MODULE_L3: [[L3PageTable; MAX_L3_PER_MODULE]; MAX_MODULES] = {
+        const EMPTY_L3: L3PageTable = L3PageTable([0; TABLE_ENTRIES]);
+        const EMPTY_MODULE_L3: [L3PageTable; MAX_L3_PER_MODULE] = [EMPTY_L3; MAX_L3_PER_MODULE];
+        [EMPTY_MODULE_L3; MAX_MODULES]
+    };
+
+    /// Per-module: base VA of paged arena (0 = no paged arena).
+    static mut MODULE_PAGED_BASE: [u64; MAX_MODULES] = [0; MAX_MODULES];
+    /// Per-module: size of paged arena in bytes.
+    static mut MODULE_PAGED_SIZE: [u64; MAX_MODULES] = [0; MAX_MODULES];
+    /// Per-module: number of L3 tables allocated.
+    static mut MODULE_L3_COUNT: [u8; MAX_MODULES] = [0; MAX_MODULES];
+
+    /// L3 index for a given address (bits [20:12]).
+    #[inline]
+    const fn l3_index(addr: u64) -> usize {
+        ((addr >> 12) & 0x1FF) as usize
+    }
+
+    /// Make a 4KB page descriptor.
+    fn make_page_desc(phys: u64, attr_idx: u64, ap: u64, xn_el0: bool, xn_el1: bool) -> u64 {
+        let pxn = if xn_el1 { PXN } else { 0 };
+        let uxn = if xn_el0 { UXN } else { 0 };
+        (phys & !0xFFF)
+            | DESC_VALID
+            | (1 << 1) // bit 1 = page (not block) at L3
+            | (attr_idx << ATTR_IDX_SHIFT)
+            | (ap << AP_SHIFT)
+            | (SH_ISH << SH_SHIFT)
+            | AF
+            | _NG
+            | pxn
+            | uxn
+    }
+
+    /// Set up the paged arena L3 tables for a module.
+    ///
+    /// Called once during module instantiation. Creates invalid L3 entries
+    /// (fault-on-access) and wires L2 entries to point to L3 tables.
+    ///
+    /// `base_va`: base virtual address of the paged arena (must be 2MB-aligned).
+    /// `size`: virtual size in bytes (rounded up to 2MB).
+    pub fn setup_paged_arena(module_idx: usize, base_va: u64, size: u64) {
+        if module_idx >= MAX_MODULES {
+            return;
+        }
+        unsafe {
+            MODULE_PAGED_BASE[module_idx] = base_va;
+            MODULE_PAGED_SIZE[module_idx] = size;
+
+            // Compute number of L3 tables needed (each covers 2MB)
+            let l3_count = ((size + L2_BLOCK_SIZE - 1) / L2_BLOCK_SIZE) as usize;
+            let l3_count = l3_count.min(MAX_L3_PER_MODULE);
+            MODULE_L3_COUNT[module_idx] = l3_count as u8;
+
+            // Initialize all L3 entries as invalid (unmapped)
+            for t in 0..l3_count {
+                for e in 0..TABLE_ENTRIES {
+                    MODULE_L3[module_idx][t].0[e] = 0; // Invalid = fault
+                }
+            }
+
+            // Wire L2 entries to point to L3 tables instead of 2MB blocks
+            let l2 = &mut MODULE_L2[module_idx];
+            for t in 0..l3_count {
+                let va = base_va + (t as u64) * L2_BLOCK_SIZE;
+                let idx = l2_index(va);
+                if idx < TABLE_ENTRIES {
+                    let l3_addr = &MODULE_L3[module_idx][t] as *const _ as u64;
+                    // L2 table descriptor pointing to L3 table
+                    l2.0[idx] = (l3_addr & !0xFFF) | DESC_VALID | DESC_TABLE;
+                }
+            }
+        }
+    }
+
+    /// Map a single 4KB page in a module's paged arena.
+    ///
+    /// `vaddr`: virtual address (must be page-aligned and within the paged arena).
+    /// `phys`: physical address of the page.
+    /// `writable`: whether the page is writable by the module (EL0).
+    pub fn map_4k_page_impl(module_idx: usize, vaddr: u64, phys: u64, writable: bool) {
+        if module_idx >= MAX_MODULES {
+            return;
+        }
+        unsafe {
+            let base = MODULE_PAGED_BASE[module_idx];
+            let size = MODULE_PAGED_SIZE[module_idx];
+            if base == 0 || vaddr < base || vaddr >= base + size {
+                return;
+            }
+
+            // Which L3 table?
+            let offset = vaddr - base;
+            let l3_table_idx = (offset / L2_BLOCK_SIZE) as usize;
+            if l3_table_idx >= MODULE_L3_COUNT[module_idx] as usize {
+                return;
+            }
+
+            let l3_entry_idx = l3_index(vaddr);
+            let ap = if writable { AP_EL0_RW } else { AP_EL0_RO };
+            MODULE_L3[module_idx][l3_table_idx].0[l3_entry_idx] =
+                make_page_desc(phys, ATTR_IDX_NORMAL, ap, true, true); // XN for both (data only)
+        }
+    }
+
+    /// Unmap a single 4KB page (set PTE to invalid).
+    pub fn unmap_4k_page_impl(module_idx: usize, vaddr: u64) {
+        if module_idx >= MAX_MODULES {
+            return;
+        }
+        unsafe {
+            let base = MODULE_PAGED_BASE[module_idx];
+            let size = MODULE_PAGED_SIZE[module_idx];
+            if base == 0 || vaddr < base || vaddr >= base + size {
+                return;
+            }
+
+            let offset = vaddr - base;
+            let l3_table_idx = (offset / L2_BLOCK_SIZE) as usize;
+            if l3_table_idx >= MODULE_L3_COUNT[module_idx] as usize {
+                return;
+            }
+
+            let l3_entry_idx = l3_index(vaddr);
+            MODULE_L3[module_idx][l3_table_idx].0[l3_entry_idx] = 0; // Invalid
+        }
     }
 }
 
@@ -624,4 +784,25 @@ pub fn set_enabled(enabled: bool) {
 pub unsafe fn handle_data_abort() {
     #[cfg(feature = "chip-bcm2712")]
     bcm2712_impl::handle_data_abort();
+}
+
+/// Set up paged arena L3 tables for a module (BCM2712 only).
+pub fn setup_paged_arena(module_idx: usize, base_va: u64, size: u64) {
+    #[cfg(feature = "chip-bcm2712")]
+    bcm2712_impl::setup_paged_arena(module_idx, base_va, size);
+    let _ = (module_idx, base_va, size);
+}
+
+/// Map a 4KB page in a module's paged arena.
+pub fn map_4k_page(module_idx: usize, vaddr: u64, phys: u64, writable: bool) {
+    #[cfg(feature = "chip-bcm2712")]
+    bcm2712_impl::map_4k_page_impl(module_idx, vaddr, phys, writable);
+    let _ = (module_idx, vaddr, phys, writable);
+}
+
+/// Unmap a 4KB page in a module's paged arena.
+pub fn unmap_4k_page(module_idx: usize, vaddr: u64) {
+    #[cfg(feature = "chip-bcm2712")]
+    bcm2712_impl::unmap_4k_page_impl(module_idx, vaddr);
+    let _ = (module_idx, vaddr);
 }

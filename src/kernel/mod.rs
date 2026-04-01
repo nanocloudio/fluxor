@@ -35,3 +35,6 @@ pub mod pcie;
 pub mod smmu;
 #[cfg(feature = "chip-bcm2712")]
 pub mod nic_ring;
+pub mod page_pool;
+pub mod backing_store;
+pub mod pager;
