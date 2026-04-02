@@ -500,6 +500,10 @@ pub mod dev_fs {
     pub const SEEK: u32 = 0x0902;
     pub const CLOSE: u32 = 0x0903;
     pub const STAT: u32 = 0x0904;
+    /// Sync file data to disk. handle=file. Returns 0 or negative errno.
+    pub const FSYNC: u32 = 0x0905;
+    /// Write data. handle=file, arg=data, arg_len=data_len. Returns bytes written.
+    pub const WRITE: u32 = 0x0906;
 }
 
 /// Buffer opcodes (0x0A00-0x0AFF)

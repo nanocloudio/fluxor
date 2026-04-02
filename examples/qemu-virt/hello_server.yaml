@@ -4,7 +4,7 @@
 #
 # Pipeline:
 #
-#   virtio_net <--frames--> ip <--sockets--> http_server
+#   virtio_net <--frames--> ip <--sockets--> http
 #
 # Usage:
 #   1. make vm-run
@@ -20,7 +20,7 @@ modules:
     use_dhcp: 1
 
   # HTTP server
-  - name: http_server
+  - name: http
     port: 80
     routes:
       - path: "/"

@@ -29,6 +29,9 @@ pub mod chip;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "../platform/bcm2712_chip.rs"]
 pub mod chip;
+#[cfg(feature = "host-linux")]
+#[path = "../platform/linux_chip.rs"]
+pub mod chip;
 #[cfg(feature = "rp")]
 #[path = "../platform/rp_ext.rs"]
 pub mod rp_ext;

@@ -1,0 +1,36 @@
+# Linux hosted — runs as a userspace process on aarch64 Linux
+# No real hardware peripherals; modules communicate via kernel channels.
+
+[target]
+id = "linux"
+family = "linux"
+description = "Linux hosted (aarch64 userspace)"
+
+[build]
+rust_target = "aarch64-unknown-linux-gnu"
+cargo_features = ["host-linux"]
+uf2_family_id = "0x00000000"
+module_target = "aarch64-unknown-linux-gnu"
+
+[gpio]
+max_pin = 0
+
+[peripherals]
+spi_count = 0
+i2c_count = 0
+uart_count = 0
+adc_channels = 0
+pwm_slices = 0
+pio_count = 0
+pio_state_machines = 0
+dma_channels = 0
+
+[kernel]
+state_arena_kb = 256
+buffer_arena_kb = 32
+
+[memory]
+ram_base = "0x00000000"
+ram_size = "0x00000000"
+flash_base = "0x00000000"
+flash_size = "0x00000000"

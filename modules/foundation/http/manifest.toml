@@ -1,0 +1,31 @@
+version = "2.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "variables"
+direction = "input"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "file_data"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "file_ctrl"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "data"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+device_class = "socket"
+access = "write"
+
+[[resources]]
+device_class = "channel"
+access = "read"

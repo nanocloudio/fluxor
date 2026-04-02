@@ -114,6 +114,14 @@ fn main() {
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let is_rp2040 = env::var("CARGO_FEATURE_CHIP_RP2040").is_ok();
     let is_bcm2712 = env::var("CARGO_FEATURE_CHIP_BCM2712").is_ok();
+    let is_host_linux = env::var("CARGO_FEATURE_HOST_LINUX").is_ok();
+
+    if is_host_linux {
+        // --- Linux hosted (aarch64 userspace) ---
+        // No linker script, no chip generation. Standard Linux toolchain.
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
 
     if is_bcm2712 {
         // --- BCM2712 (aarch64 bare-metal) ---

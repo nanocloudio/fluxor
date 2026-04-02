@@ -1,10 +1,10 @@
-#![no_std]
+#![cfg_attr(not(feature = "host-linux"), no_std)]
 
-#[cfg(any(feature = "rp", feature = "chip-bcm2712"))]
+#[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux"))]
 pub mod kernel;
-#[cfg(any(feature = "rp", feature = "chip-bcm2712"))]
+#[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux"))]
 pub mod abi;
-#[cfg(any(feature = "rp", feature = "chip-bcm2712"))]
+#[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux"))]
 #[path = "../modules/mod.rs"]
 pub mod modules;
 

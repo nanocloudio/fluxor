@@ -12,9 +12,9 @@ target: pico2w
 
 modules:
   - name: cyw43
-  - name: flash
+  - name: flash_rp
     mode: 1
 
 wiring:
-  - from: flash.events
+  - from: flash_rp.events
     to: cyw43.led

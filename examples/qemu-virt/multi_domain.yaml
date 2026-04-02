@@ -2,12 +2,12 @@
 #
 # Demonstrates multi-core execution with two domains:
 #
-#   Domain 0 (core 0): virtio_net <-> ip <-> http_server
+#   Domain 0 (core 0): virtio_net <-> ip <-> http
 #   Domain 1 (core 1): debug (logging module)
 #
-# Cross-domain edge connects http_server's file control output to the debug
+# Cross-domain edge connects http's file control output to the debug
 # logger, bridged by a lock-free SPSC ring buffer (CrossDomainChannel). The
-# domain 0 loop reads http_server's output channel and sends messages into the
+# domain 0 loop reads http's output channel and sends messages into the
 # ring. The domain 1 loop receives from the ring and writes to debug's input
 # channel.
 #
@@ -42,7 +42,7 @@ modules:
     domain: network
     use_dhcp: 1
 
-  - name: http_server
+  - name: http
     domain: network
     port: 80
     routes:
@@ -59,8 +59,8 @@ wiring:
     to: ip.frames_rx
   - from: ip.frames_tx
     to: virtio_net.frames_tx
-  # Cross-domain edge: http_server file_ctrl output -> debug input
-  - from: http_server.file_ctrl
+  # Cross-domain edge: http file_ctrl output -> debug input
+  - from: http.file_ctrl
     to: debug.data
     edge_class: cross_core
 

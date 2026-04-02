@@ -37,13 +37,13 @@ modules:
     mode: 1                   # Loop mode (cycle through files)
     initial_index: 0
 
-  - name: decoder
+  - name: codec
 
   - name: mixer
     gain_in: 128
     gain_out: 38
 
-  - name: i2s
+  - name: i2s_pio
     data_pin: 28
     clock_base: 26
     sample_rate: 48000
@@ -54,11 +54,11 @@ wiring:
   - from: fat32.files
     to: bank.files
   - from: bank.stream
-    to: decoder.encoded
-  - from: decoder.audio
+    to: codec.encoded
+  - from: codec.audio
     to: mixer.audio
   - from: mixer.mixed
-    to: i2s.audio
+    to: i2s_pio.audio
   - from: button.raw
     to: gesture.raw
   - from: gesture.commands

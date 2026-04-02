@@ -996,7 +996,7 @@ data:
 
 modules:
   # --- BOOTSEL control (flash has built-in gesture detection) ---
-  - name: flash
+  - name: flash_rp
     click: next
     double_click: prev
     long_press: toggle
@@ -1022,7 +1022,7 @@ modules:
              tape_echo, metallic_bell, lofi_drums, lofi_beats,
              pure_sine, acid_hifi, acid_303]
 
-  - name: i2s
+  - name: i2s_pio
     data_pin: 28
     clock_base: 26
     sample_rate: 8000
@@ -1033,9 +1033,9 @@ modules:
 
 wiring:
   # BOOTSEL control: flash emits FMP commands directly
-  - from: flash.events
+  - from: flash_rp.events
     to: synth.preset
-  - from: flash.events
+  - from: flash_rp.events
     to: effects.preset
 
   # Audio chain: sequencer → synth → effects → i2s
@@ -1044,7 +1044,7 @@ wiring:
   - from: synth.audio
     to: effects.audio
   - from: effects.processed
-    to: i2s.audio
+    to: i2s_pio.audio
 
 # BOOTSEL actions:
 #   Click: next voice

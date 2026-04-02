@@ -8,7 +8,7 @@
 #
 # Pipeline:
 #
-#   http_server <--socket--> ip <--frames--> cyw43
+#   http <--socket--> ip <--frames--> cyw43
 #                                              ^
 #                                           wifi
 #
@@ -51,7 +51,7 @@ data:
       </html>
 
 modules:
-  - name: http_server
+  - name: http
     port: 80
     body: hello_page
 

@@ -10,6 +10,11 @@ repository = "https://github.com/nanocloudio/fluxor"
 name = "fluxor"
 path = "src/main.rs"
 
+[[bin]]
+name = "fluxor-linux"
+path = "src/platform/linux.rs"
+required-features = ["host-linux"]
+
 [lib]
 path = "src/lib.rs"
 
@@ -45,6 +50,8 @@ defmt-rtt = { version = "1.1.0", optional = true }
 # Panic handler with defmt output.
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 sha2 = { version = "0.11.0", default-features = false, optional = true }
+env_logger = { version = "0.11", optional = true }
+libc = { version = "0.2", optional = true }
 embedded-io-async = { version = "0.7.0", optional = true }
 # Portable atomics with CAS emulation for thumbv6m (RP2040 Cortex-M0+).
 # On thumbv8m (RP2350) this is a zero-cost pass-through.
@@ -76,6 +83,10 @@ chip-bcm2712 = ["portable-atomic", "sha2"]
 # board-cm5: Real Raspberry Pi 5 / CM5 hardware (kernel loaded at 0x80000).
 # Without board-cm5: QEMU virt machine (kernel loaded at 0x40080000).
 board-cm5 = ["chip-bcm2712"]
+
+# Linux hosted (aarch64 userspace). Uses std — no embassy, no cortex-m.
+# Loads real PIC .fmod modules and runs the same scheduler/graph model.
+host-linux = ["portable-atomic", "sha2", "env_logger", "libc"]
 
 [build-dependencies]
 toml = "1.1.2"

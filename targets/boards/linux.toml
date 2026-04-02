@@ -1,0 +1,9 @@
+# Linux hosted board — runs Fluxor as a userspace process.
+
+[board]
+id = "linux"
+silicon = "linux"
+description = "Linux Hosted"
+
+[gpio]
+reserved_pins = []

@@ -1,0 +1,18 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "audio"
+direction = "output"
+content_type = "AudioPcm"
+
+[[ports]]
+name = "pixels"
+direction = "output"
+content_type = "OctetStream"

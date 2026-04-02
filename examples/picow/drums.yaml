@@ -44,7 +44,7 @@ modules:
     damping: 140
     predelay_ms: 8
     mix: 60
-- name: i2s
+- name: i2s_pio
   data_pin: 28
   clock_base: 26
   sample_rate: 8000
@@ -54,4 +54,4 @@ wiring:
 - from: drum.audio
   to: effects.audio
 - from: effects.processed
-  to: i2s.audio
+  to: i2s_pio.audio

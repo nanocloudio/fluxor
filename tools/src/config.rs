@@ -1265,7 +1265,13 @@ fn parse_modules_map(modules: &Value, data_section: Option<&Value>, config: &Val
 /// Manifests live in the source `modules/` directory, not `target/modules/`.
 fn load_module_manifests(modules_config: &Value) -> HashMap<String, Manifest> {
     let mut manifests = HashMap::new();
-    let source_dir = std::path::Path::new("modules");
+    // Scan all module source directories for manifest.toml files
+    let source_dirs: &[&str] = &[
+        "modules/drivers",
+        "modules/foundation",
+        "modules/app",
+        "modules", // legacy flat layout fallback
+    ];
     let list = match modules_config.as_array() {
         Some(l) => l,
         None => return manifests,
@@ -1276,10 +1282,13 @@ fn load_module_manifests(modules_config: &Value) -> HashMap<String, Manifest> {
             None => continue,
         };
         let type_name = module["type"].as_str().unwrap_or(name);
-        let manifest_path = source_dir.join(type_name).join("manifest.toml");
-        if manifest_path.exists() {
-            if let Ok(m) = Manifest::from_toml(&manifest_path) {
-                manifests.insert(name.to_string(), m);
+        for dir in source_dirs {
+            let manifest_path = std::path::Path::new(dir).join(type_name).join("manifest.toml");
+            if manifest_path.exists() {
+                if let Ok(m) = Manifest::from_toml(&manifest_path) {
+                    manifests.insert(name.to_string(), m);
+                }
+                break;
             }
         }
     }

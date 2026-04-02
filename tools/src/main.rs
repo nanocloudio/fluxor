@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 use crate::config::{decode_config, generate_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES};
 use crate::error::{Error, Result};
-use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config};
+use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config, parse_modules_from_config_multi};
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
 /// Flash layout constants
@@ -72,6 +72,9 @@ enum Commands {
         /// Output file
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Override modules directory (default: target/{silicon}/modules)
+        #[arg(short = 'm', long)]
+        modules_dir: Option<PathBuf>,
         /// Output raw binary instead of UF2
         #[arg(long)]
         binary: bool,
@@ -92,9 +95,9 @@ enum Commands {
         firmware: PathBuf,
         /// Config file (YAML or JSON)
         config: PathBuf,
-        /// Directory containing built .fmod files
-        #[arg(short = 'm', long)]
-        modules_dir: PathBuf,
+        /// Directory containing built .fmod files (repeatable)
+        #[arg(short = 'm', long, action = clap::ArgAction::Append)]
+        modules_dir: Vec<PathBuf>,
         /// Output packed image
         #[arg(short, long)]
         output: PathBuf,
@@ -152,9 +155,9 @@ enum Commands {
     MktableConfig {
         /// Config file (YAML or JSON)
         config: PathBuf,
-        /// Directory containing built .fmod files
-        #[arg(short = 'm', long)]
-        modules_dir: PathBuf,
+        /// Directory containing built .fmod files (repeatable)
+        #[arg(short = 'm', long, action = clap::ArgAction::Append)]
+        modules_dir: Vec<PathBuf>,
         /// Output binary file
         #[arg(short, long)]
         output: PathBuf,
@@ -181,8 +184,9 @@ fn main() {
         Commands::Generate {
             config,
             output,
+            modules_dir,
             binary,
-        } => cmd_generate(&config, output.as_deref(), binary),
+        } => cmd_generate(&config, output.as_deref(), modules_dir.as_deref(), binary),
         Commands::Combine {
             firmware,
             config,
@@ -500,7 +504,7 @@ fn substitute_env_vars(input: &str) -> Result<String> {
     Ok(out)
 }
 
-fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, binary: bool) -> Result<()> {
+fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules_dir_override: Option<&std::path::Path>, binary: bool) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let config: serde_json::Value = if config_path
         .extension()
@@ -528,8 +532,8 @@ fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, binary:
         }
         config["hardware"] = serde_json::Value::Object(merged);
     }
-    let modules_dir_path = format!("target/{}/modules", target_desc.id);
-    let modules_dir = std::path::Path::new(&modules_dir_path);
+    let modules_dir_default = format!("target/{}/modules", target_desc.id);
+    let modules_dir = modules_dir_override.unwrap_or(std::path::Path::new(&modules_dir_default));
     let binary_data = generate_config(&config, &builder, modules_dir, target_desc.max_pin + 1, target_desc.pio_count)?;
 
     eprintln!("Config size: {} bytes", binary_data.len());
@@ -832,10 +836,11 @@ fn load_config_with_defaults(config_path: &PathBuf, verbose: bool) -> Result<(se
 fn build_packaged_blobs(
     config: &serde_json::Value,
     modules_dir: &std::path::Path,
+    extra_dirs: &[&std::path::Path],
     target_desc: &target::TargetDescriptor,
     verbose: bool,
 ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
-    let modules = parse_modules_from_config(config, modules_dir)?;
+    let modules = parse_modules_from_config_multi(config, modules_dir, extra_dirs)?;
 
     let caps: Vec<ModuleCaps> = modules
         .iter()
@@ -903,7 +908,7 @@ fn crc16_xmodem(modules_data: &Option<Vec<u8>>, config_data: &[u8]) -> u16 {
 fn cmd_pack_image(
     firmware_path: &PathBuf,
     config_path: &PathBuf,
-    modules_dir: &PathBuf,
+    modules_dirs: &[PathBuf],
     output_path: &PathBuf,
     verbose: bool,
 ) -> Result<()> {
@@ -932,8 +937,15 @@ fn cmd_pack_image(
     let trailer_addr = (runtime_end + IMAGE_ALIGN - 1) & !(IMAGE_ALIGN - 1);
 
     let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
+    let primary_dir = if modules_dirs.is_empty() {
+        let p = format!("target/{}/modules", target_desc.id);
+        std::path::PathBuf::from(p)
+    } else {
+        modules_dirs[0].clone()
+    };
+    let extra_dirs: Vec<&std::path::Path> = modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
     let (modules_data, config_data) =
-        build_packaged_blobs(&config, modules_dir.as_path(), &target_desc, verbose)?;
+        build_packaged_blobs(&config, primary_dir.as_path(), &extra_dirs, &target_desc, verbose)?;
 
     let modules_addr = if modules_data.is_some() {
         trailer_addr + IMAGE_ALIGN
@@ -1307,7 +1319,7 @@ fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mktable_config(config_path: &PathBuf, modules_dir: &PathBuf, output: &PathBuf) -> Result<()> {
+fn cmd_mktable_config(config_path: &PathBuf, modules_dirs: &[PathBuf], output: &PathBuf) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let config: serde_json::Value = if config_path
         .extension()
@@ -1318,7 +1330,13 @@ fn cmd_mktable_config(config_path: &PathBuf, modules_dir: &PathBuf, output: &Pat
         serde_json::from_str(&content)?
     };
 
-    let modules = parse_modules_from_config(&config, modules_dir)?;
+    let primary_dir = if modules_dirs.is_empty() {
+        return Err(Error::Module("--modules-dir is required".into()));
+    } else {
+        &modules_dirs[0]
+    };
+    let extra_dirs: Vec<&std::path::Path> = modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
+    let modules = parse_modules_from_config_multi(&config, primary_dir, &extra_dirs)?;
     if modules.is_empty() {
         return Err(Error::Module("No modules referenced in config".into()));
     }

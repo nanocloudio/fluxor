@@ -391,7 +391,7 @@ fn pack_param(
                 let resolved = resolve_str_content(s, data_section);
                 let bytes = resolved.as_bytes();
                 // Split into chunks of up to 255 bytes (same tag for each).
-                // Modules that expect large content (e.g. http_server body)
+                // Modules that expect large content (e.g. http body)
                 // append in their dispatch handler.
                 let mut offset = 0;
                 loop {

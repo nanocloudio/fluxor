@@ -43,14 +43,13 @@ RELEASE_DIR := target/$(RUST_TARGET)/release
 FIRMWARE_ELF := $(RELEASE_DIR)/fluxor
 FIRMWARE_BIN := target/$(TARGET_ID)/firmware.bin
 UF2_OUT := target/$(TARGET_ID)/uf2
-MODULES_DIR := modules
 MODULES_OUT := target/$(TARGET_ID)/modules
 FLUXOR_TOOL := target/aarch64-unknown-linux-gnu/release/fluxor
 
-PIC_SOURCES := $(filter-out $(MODULES_DIR)/mod.rs $(MODULES_DIR)/pic_runtime.rs $(MODULES_DIR)/param_macro.rs,$(wildcard $(MODULES_DIR)/*.rs))
-PIC_NAMES := $(patsubst $(MODULES_DIR)/%.rs,%,$(PIC_SOURCES))
-PIC_DIR_SOURCES := $(wildcard $(MODULES_DIR)/*/mod.rs)
-PIC_DIR_NAMES := $(patsubst $(MODULES_DIR)/%/mod.rs,%,$(PIC_DIR_SOURCES))
+# Module source directories under modules/
+MODULE_DIRS := modules/drivers modules/foundation modules/app
+# Shared PIC build files (pic_runtime.rs, param_macro.rs, module.ld) live in modules/
+SHARED_DIR := modules
 ABI_HEADER := src/abi.rs
 
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
@@ -59,9 +58,9 @@ ABI_HEADER := src/abi.rs
 # Sink: channels + PIO stream
 # EventHandler: channels + GPIO read-only
 # Source/Transformer: channels + buffers + timers only
-mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm,$(1)),5,$(if $(filter i2s,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_source,$(1)),1,2)))))))))))))
+mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,2)))))))))))))
 
-.PHONY: all build firmware firmware-all tools modules package examples examples-rp examples-vm examples-cm5 examples-aarch64 clean targets vm vm-run cm5 aarch64-image
+.PHONY: all build firmware firmware-all tools modules package examples examples-rp examples-vm examples-cm5 examples-aarch64 clean targets vm vm-run cm5 aarch64-image linux linux-run
 
 all: build
 
@@ -135,39 +134,27 @@ modules: tools
 		{ [ -e target/rp2350b ] || ln -s rp2350 target/rp2350b; }; \
 	fi
 	@built=0; total=0; \
-	for mod in $(PIC_NAMES); do \
-		total=$$((total + 1)); \
-		src="$(MODULES_DIR)/$$mod.rs"; \
-		obj="$(MODULES_OUT)/$$mod.o"; \
-		elf="$(MODULES_OUT)/$$mod.elf"; \
-		out="$(MODULES_OUT)/$$mod.fmod"; \
-		if [ "$$src" -nt "$$out" ] 2>/dev/null || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/param_macro.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/module.ld" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
-			rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
-			$(MODULE_LINKER) -T $(MODULE_LD) --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
-			mtype=$$(echo "$(foreach m,$(PIC_NAMES),$(m)=$(call mod_type,$(m)))" | tr ' ' '\n' | grep "^$$mod=" | cut -d= -f2); \
-			[ -z "$$mtype" ] && mtype=2; \
-			$(FLUXOR_TOOL) pack "$$elf" -o "$$out" -n "$$mod" -t "$$mtype" || exit 1; \
-			built=$$((built + 1)); \
-		fi \
-	done; \
-	for mod in $(PIC_DIR_NAMES); do \
-		total=$$((total + 1)); \
-		src="$(MODULES_DIR)/$$mod/mod.rs"; \
-		obj="$(MODULES_OUT)/$$mod.o"; \
-		elf="$(MODULES_OUT)/$$mod.elf"; \
-		out="$(MODULES_OUT)/$$mod.fmod"; \
-		newest=$$(find "$(MODULES_DIR)/$$mod" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
-		if [ -f "$(MODULES_DIR)/$$mod/module.ld" ]; then ld_script="$(MODULES_DIR)/$$mod/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
-		if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULES_DIR)/param_macro.rs" -nt "$$out" ] 2>/dev/null || [ "$$ld_script" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
-			rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
-			$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
-			mtype=$$(echo "$(foreach m,$(PIC_DIR_NAMES),$(m)=$(call mod_type,$(m)))" | tr ' ' '\n' | grep "^$$mod=" | cut -d= -f2); \
-			[ -z "$$mtype" ] && mtype=2; \
-			manifest_arg=""; \
-			if [ -f "$(MODULES_DIR)/$$mod/manifest.toml" ]; then manifest_arg="--manifest $(MODULES_DIR)/$$mod/manifest.toml"; fi; \
-			$(FLUXOR_TOOL) pack "$$elf" -o "$$out" -n "$$mod" -t "$$mtype" $$manifest_arg || exit 1; \
-			built=$$((built + 1)); \
-		fi \
+	for dir in $(MODULE_DIRS); do \
+		[ -d "$$dir" ] || continue; \
+		for src in $$(find "$$dir" -mindepth 2 -maxdepth 3 -name 'mod.rs' | sort); do \
+			mod_dir=$$(dirname "$$src"); \
+			mod=$$(basename "$$mod_dir"); \
+			total=$$((total + 1)); \
+			obj="$(MODULES_OUT)/$$mod.o"; \
+			elf="$(MODULES_OUT)/$$mod.elf"; \
+			out="$(MODULES_OUT)/$$mod.fmod"; \
+			newest=$$(find "$$mod_dir" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
+			if [ -f "$$mod_dir/module.ld" ]; then ld_script="$$mod_dir/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
+			if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(SHARED_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULE_LD)" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
+				rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
+				$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
+				mtype=$$(echo "$(call mod_type,$$mod)"); [ -z "$$mtype" ] && mtype=2; \
+				manifest_arg=""; \
+				if [ -f "$$mod_dir/manifest.toml" ]; then manifest_arg="--manifest $$mod_dir/manifest.toml"; fi; \
+				$(FLUXOR_TOOL) pack "$$elf" -o "$$out" -n "$$mod" -t "$$mtype" $$manifest_arg || exit 1; \
+				built=$$((built + 1)); \
+			fi; \
+		done; \
 	done; \
 	if [ "$$built" -gt 0 ]; then \
 		echo "Modules ($(TARGET_ID)): built $$built of $$total"; \
@@ -219,7 +206,7 @@ examples-rp: build
 	@$(MAKE) firmware TARGET_ID=rp2040 --no-print-directory
 	@$(MAKE) modules TARGET_ID=rp2040 --no-print-directory
 	@count=0; \
-	for yaml in $$(find examples -name '*.yaml' ! -path 'examples/qemu-virt/*' ! -path 'examples/cm5/*' | sort); do \
+	for yaml in $$(find examples -name '*.yaml' ! -path 'examples/qemu-virt/*' ! -path 'examples/cm5/*' ! -path 'examples/linux/*' | sort); do \
 		name=$$(basename $$yaml .yaml); \
 		subdir=$$(basename $$(dirname $$yaml)); \
 		board=$$(grep '^target:' $$yaml | head -1 | awk '{print $$2}'); \
@@ -266,6 +253,23 @@ examples-cm5: tools
 		count=$$((count + 1)); \
 	done; \
 	echo "Built $$count CM5 example images"
+
+# --- Linux hosted target ---
+
+linux: tools
+	@$(MAKE) modules TARGET_ID=bcm2712 --no-print-directory
+	@echo "Building fluxor-linux..."
+	cargo build --release --bin fluxor-linux --no-default-features --features host-linux --target aarch64-unknown-linux-gnu
+	@echo "Binary: target/aarch64-unknown-linux-gnu/release/fluxor-linux"
+
+LINUX_CONFIG ?= examples/linux/hello.yaml
+LINUX_BIN := target/aarch64-unknown-linux-gnu/release/fluxor-linux
+
+linux-run: linux ## Build and run Fluxor on Linux
+	@mkdir -p target/linux
+	@$(FLUXOR_TOOL) mktable-config $(LINUX_CONFIG) -m target/bcm2712/modules -o target/linux/modules.bin
+	@$(FLUXOR_TOOL) generate $(LINUX_CONFIG) -m target/bcm2712/modules -o target/linux/config.bin --binary
+	$(LINUX_BIN) --config target/linux/config.bin --modules target/linux/modules.bin
 
 targets:
 	@$(FLUXOR_TOOL) targets

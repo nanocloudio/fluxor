@@ -293,6 +293,105 @@ pub fn parse_modules_from_config(
     Ok(modules)
 }
 
+/// Resolve a module .fmod file by searching primary dir, then extra dirs in order.
+fn resolve_fmod(module_type: &str, primary_dir: &Path, extra_dirs: &[&Path]) -> Option<std::path::PathBuf> {
+    let filename = format!("{}.fmod", module_type);
+    let p = primary_dir.join(&filename);
+    if p.exists() {
+        return Some(p);
+    }
+    for dir in extra_dirs {
+        let p = dir.join(&filename);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Like `parse_modules_from_config` but searches multiple directories.
+pub fn parse_modules_from_config_multi(
+    config: &serde_json::Value,
+    modules_dir: &Path,
+    extra_dirs: &[&Path],
+) -> Result<Vec<ModuleInfo>> {
+    let mut modules = Vec::new();
+
+    if let Some(modules_array) = config["modules"].as_array() {
+        let mut loaded_types = std::collections::HashSet::new();
+
+        for module_entry in modules_array {
+            let module_name = if let Some(name) = module_entry.as_str() {
+                name.to_string()
+            } else if let Some(name) = module_entry["name"].as_str() {
+                name.to_string()
+            } else {
+                return Err(Error::Module(
+                    "Module entry must be a name string or object with 'name' field".into(),
+                ));
+            };
+
+            let module_type = module_entry["type"].as_str().unwrap_or(&module_name);
+
+            if !loaded_types.insert(module_type.to_string()) {
+                continue;
+            }
+
+            let module_path = match resolve_fmod(module_type, modules_dir, extra_dirs) {
+                Some(p) => p,
+                None => {
+                    let searched: Vec<String> = std::iter::once(modules_dir)
+                        .chain(extra_dirs.iter().copied())
+                        .map(|d| d.display().to_string())
+                        .collect();
+                    return Err(Error::Module(format!(
+                        "Module '{}' (type '{}') not found in: {}\nRun 'make modules' to build modules.",
+                        module_name,
+                        module_type,
+                        searched.join(", "),
+                    )));
+                }
+            };
+
+            let module_info = ModuleInfo::from_file(&module_path)?;
+            modules.push(module_info);
+        }
+    } else if let Some(modules_map) = config["modules"].as_object() {
+        let mut loaded_types = std::collections::HashSet::new();
+
+        for (instance_name, module_def) in modules_map {
+            let module_type = module_def["type"]
+                .as_str()
+                .unwrap_or(instance_name.as_str());
+
+            if !loaded_types.insert(module_type.to_string()) {
+                continue;
+            }
+
+            let module_path = match resolve_fmod(module_type, modules_dir, extra_dirs) {
+                Some(p) => p,
+                None => {
+                    let searched: Vec<String> = std::iter::once(modules_dir)
+                        .chain(extra_dirs.iter().copied())
+                        .map(|d| d.display().to_string())
+                        .collect();
+                    return Err(Error::Module(format!(
+                        "Module '{}' (type '{}') not found in: {}\nRun 'make modules' to build modules.",
+                        instance_name,
+                        module_type,
+                        searched.join(", "),
+                    )));
+                }
+            };
+
+            let module_info = ModuleInfo::from_file(&module_path)?;
+            modules.push(module_info);
+        }
+    }
+
+    Ok(modules)
+}
+
 // =============================================================================
 // ELF Parsing and Module Packing
 // =============================================================================
