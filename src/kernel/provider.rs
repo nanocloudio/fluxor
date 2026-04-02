@@ -92,24 +92,6 @@ pub fn register_module_provider(
 
 /// Unregister a module provider for a device class.
 ///
-/// Only the owning module can unregister (checked by caller).
-/// Returns 0 on success, EINVAL if class out of range or no module provider.
-pub fn unregister_module_provider(class: u8) -> i32 {
-    let idx = class as usize;
-    if idx >= MAX_PROVIDERS {
-        return errno::EINVAL;
-    }
-    unsafe {
-        if PROVIDERS[idx].module_dispatch.is_none() {
-            return errno::EINVAL;
-        }
-        PROVIDERS[idx].module_idx = 0xFF;
-        PROVIDERS[idx].module_dispatch = None;
-        PROVIDERS[idx].module_state = core::ptr::null_mut();
-    }
-    0
-}
-
 /// Release all module providers owned by a given module index.
 /// Called on module finish (Done/Error) for cleanup.
 pub fn release_module_providers(module_idx: u8) {

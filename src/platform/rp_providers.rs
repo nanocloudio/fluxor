@@ -91,11 +91,11 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
             }
             result
         }
-        dev_gpio::REQUEST_OUTPUT => {
+        dev_gpio::SET_OUTPUT => {
             if arg.is_null() || arg_len < 1 { return E_INVAL; }
             syscall_gpio_request_output(*arg)
         }
-        dev_gpio::REQUEST_INPUT => {
+        dev_gpio::SET_INPUT => {
             if arg.is_null() || arg_len < 2 { return E_INVAL; }
             syscall_gpio_request_input(*arg, *arg.add(1))
         }
@@ -121,25 +121,12 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
         dev_gpio::GET_LEVEL => {
             syscall_gpio_get_level(handle)
         }
-        dev_gpio::SET_IRQ => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            gpio::syscall_gpio_set_irq(handle, *arg)
-        }
-        dev_gpio::POLL_IRQ => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-            gpio::syscall_gpio_poll_irq(handle)
-        }
         dev_gpio::WATCH_EDGE => {
             if !gpio::gpio_check_owner(handle) { return E_INVAL; }
             if arg.is_null() || arg_len < 5 { return E_INVAL; }
             let edge = *arg;
             let evt = i32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             gpio::gpio_watch_edge(handle as u8, edge, evt)
-        }
-        dev_gpio::UNWATCH_EDGE => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-            gpio::gpio_unwatch_edge(handle as u8)
         }
         _ => E_NOSYS,
     }
@@ -752,12 +739,6 @@ unsafe fn rp_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, 
             }
             0
         }
-        // ── Resource locking ──
-        dev_system::RESOURCE_TRY_LOCK => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            crate::kernel::resource::try_lock(*arg)
-        }
-        dev_system::RESOURCE_UNLOCK => crate::kernel::resource::unlock(_handle),
         dev_system::FLASH_SIDEBAND => {
             use crate::abi::flash_sideband_op;
             if arg.is_null() || arg_len < 1 { return E_INVAL; }

@@ -175,12 +175,12 @@ unsafe fn setup_write(s: &mut Gt911State, reg: u16, data: &[u8]) -> usize {
 
 unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.dev_call)(-1, 0x0106, arg.as_mut_ptr(), 1) // GPIO_REQUEST_OUTPUT
+    (sys.dev_call)(-1, 0x0106, arg.as_mut_ptr(), 1) // GPIO_SET_OUTPUT
 }
 
 unsafe fn claim_gpio_input(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.dev_call)(-1, 0x0107, arg.as_mut_ptr(), 1) // GPIO_REQUEST_INPUT
+    (sys.dev_call)(-1, 0x0107, arg.as_mut_ptr(), 1) // GPIO_SET_INPUT
 }
 
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {

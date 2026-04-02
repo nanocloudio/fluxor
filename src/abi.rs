@@ -1,5 +1,10 @@
 //! Shared ABI definitions for core and PIC modules.
-#![allow(dead_code)]
+//!
+//! Organization:
+//!   - `SyscallTable`: The 8 function pointers every PIC module receives at init.
+//!   - `dev_call` opcodes (`dev_*` modules): namespaced as class << 8 | operation.
+//!   - `dev_query_key`: introspection keys for `dev_query`.
+//!   - Everything else: constants and structs shared between kernel and modules.
 
 pub const ABI_VERSION: u32 = 1;
 
@@ -49,12 +54,6 @@ impl ChannelAddr {
     }
 }
 
-#[repr(C)]
-pub struct SpiCaps {
-    pub max_freq_hz: u32,
-    pub mode_mask: u8,
-}
-
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SyscallTable {
@@ -88,8 +87,6 @@ pub struct SyscallTable {
     ///
     /// Returns: bytes written to out on success, or ENOSYS (-38) if not supported
     pub dev_query: unsafe extern "C" fn(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32,
-
-    // ---- Heap syscalls (added in ABI v2) ----
 
     /// Allocate memory from this module's heap arena.
     /// Returns pointer to allocated memory, or null on failure.
@@ -168,7 +165,7 @@ pub mod errno {
 // GPIO Edge Detection Modes
 // ============================================================================
 
-/// GPIO edge detection modes (used with dev_gpio::SET_IRQ).
+/// GPIO edge detection modes (used with dev_gpio::WATCH_EDGE).
 /// These values are part of the stable ABI — modules hardcode them.
 pub mod gpio_edge {
     /// No edge detection.
@@ -211,9 +208,6 @@ pub mod gpio_edge {
 // Contract classes define interfaces that driver modules *provide* and service
 // modules *consume*. The kernel dispatches between them but does not implement
 // networking, filesystems, or any domain-specific logic.
-//
-// Current typed syscalls (spi_open, gpio_get_level, etc.) remain the primary
-// API. dev_call dispatches to the same implementations via opcode lookup.
 
 /// Device class identifiers.
 /// Upper byte of opcode = class. Lower byte = operation within class.
@@ -252,45 +246,6 @@ pub mod dev_class {
     pub const PWM: u8 = 0x0F;
 }
 
-/// Standard cross-class opcodes (0x0000-0x00FF).
-/// Every device class should respond to these (or return ENOSYS).
-pub mod dev_common {
-    /// Get device statistics. Returns class-specific stats struct.
-    /// arg: pointer to output buffer, arg_len: buffer size
-    pub const GET_STATS: u32 = 0x0001;
-    /// Set power state. arg: pointer to u8 (0=off, 1=low, 2=normal, 3=high)
-    pub const SET_POWER_STATE: u32 = 0x0002;
-    /// Get power state. arg: pointer to u8 output
-    pub const GET_POWER_STATE: u32 = 0x0003;
-    /// Reset device to initial state.
-    pub const RESET: u32 = 0x0004;
-    /// Get device info (class, version, capabilities bitfield).
-    /// arg: pointer to DeviceInfo struct
-    pub const GET_INFO: u32 = 0x0005;
-}
-
-/// Power states for SET_POWER_STATE / GET_POWER_STATE
-pub mod power_state {
-    pub const OFF: u8 = 0;
-    pub const LOW: u8 = 1;
-    pub const NORMAL: u8 = 2;
-    pub const HIGH: u8 = 3;
-}
-
-/// Device info returned by GET_INFO
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DeviceInfo {
-    /// Device class (dev_class::*)
-    pub class: u8,
-    /// Class-specific version
-    pub version: u8,
-    /// Reserved
-    pub _reserved: u16,
-    /// Capability bitfield (class-specific)
-    pub capabilities: u32,
-}
-
 /// GPIO opcodes (0x0100-0x01FF)
 pub mod dev_gpio {
     pub const CLAIM: u32 = 0x0100;
@@ -299,18 +254,12 @@ pub mod dev_gpio {
     pub const SET_PULL: u32 = 0x0103;
     pub const SET_LEVEL: u32 = 0x0104;
     pub const GET_LEVEL: u32 = 0x0105;
-    pub const REQUEST_OUTPUT: u32 = 0x0106;
-    pub const REQUEST_INPUT: u32 = 0x0107;
-    /// Set edge detection interest. handle=gpio, arg[0]=edge (0=none, 1=rising, 2=falling, 3=both).
-    pub const SET_IRQ: u32 = 0x0108;
-    /// Poll and clear pending edges. handle=gpio. Returns edge bits (bit0=rising, bit1=falling).
-    pub const POLL_IRQ: u32 = 0x0109;
+    pub const SET_OUTPUT: u32 = 0x0106;
+    pub const SET_INPUT: u32 = 0x0107;
     /// Bind event to GPIO edge. handle=gpio (pin).
     /// arg[0]=edge (1=rising, 2=falling, 3=both), arg[1..5]=event_handle (i32 LE).
     /// Sets up edge detection and auto-signals the event on each detected edge.
     pub const WATCH_EDGE: u32 = 0x010A;
-    /// Unbind event from GPIO edge. handle=gpio (pin). Clears edge detection and event binding.
-    pub const UNWATCH_EDGE: u32 = 0x010B;
 }
 
 /// SPI opcodes (0x0200-0x02FF)
@@ -375,8 +324,6 @@ pub mod dev_pio {
     pub const RX_STREAM_FREE: u32 = 0x0425;
     pub const RX_STREAM_GET_BUFFER: u32 = 0x0426;
     pub const RX_STREAM_SET_RATE: u32 = 0x0427;
-    // RGB opcodes 0x0430-0x0437 removed — display logic moved to PIC module
-    // using generic PIO + DMA bridges (dev_system 0x0C70-0x0C84)
 }
 
 /// Arguments for `dev_pio::STREAM_LOAD_PROGRAM` via `dev_call`
@@ -388,26 +335,6 @@ pub struct PioLoadProgramArgs {
     pub wrap: u8,
     pub sideset_bits: u8,
     pub options: u8,
-}
-
-/// Arguments for `dev_pio::STREAM_CONFIGURE` via `dev_call`
-#[repr(C)]
-pub struct PioConfigureArgs {
-    pub clock_div: u32,
-    pub data_pin: u8,
-    pub clock_base: u8,
-    pub shift_bits: u8,
-    pub _pad: u8,
-}
-
-/// Arguments for `dev_pio::RX_STREAM_CONFIGURE` via `dev_call`
-#[repr(C)]
-pub struct PioRxConfigureArgs {
-    pub clock_div: u32,
-    pub in_pin: u8,
-    pub sideset_base: u8,
-    pub shift_bits: u8,
-    pub _pad: u8,
 }
 
 /// Arguments for `dev_pio::CMD_CONFIGURE` via `dev_call`
@@ -427,8 +354,6 @@ pub struct PioCmdTransferArgs {
     pub rx_ptr: *mut u8,
     pub rx_len: u32,
 }
-
-// PioRgbConfigureArgs removed — display config is module-internal
 
 /// Arguments for `dev_system::REGISTER_PROVIDER` via `dev_call`.
 ///
@@ -467,13 +392,6 @@ pub struct SpiTransferStartArgs {
     pub _pad: [u8; 3],
 }
 
-/// Arguments for `dev_gpio::SET_MODE` via `dev_call`
-#[repr(C)]
-pub struct GpioSetModeArgs {
-    pub mode: u8,
-    pub initial_level: u8,
-}
-
 /// Channel opcodes (0x0500-0x05FF)
 pub mod dev_channel {
     pub const OPEN: u32 = 0x0500;
@@ -483,8 +401,6 @@ pub mod dev_channel {
     pub const WRITE: u32 = 0x0504;
     pub const POLL: u32 = 0x0505;
     pub const IOCTL: u32 = 0x0506;
-    pub const SENDTO: u32 = 0x0507;
-    pub const RECVFROM: u32 = 0x0508;
     pub const BIND: u32 = 0x0509;
     pub const LISTEN: u32 = 0x050A;
     pub const ACCEPT: u32 = 0x050B;
@@ -610,23 +526,16 @@ pub mod dev_event {
 
 /// System opcodes (0x0C00-0x0CFF)
 pub mod dev_system {
+
+    // ── Core kernel services ─────────────────────────────────────────────
+
     /// Log message. handle=log_level, arg=message, arg_len=message length.
     pub const LOG: u32 = 0x0C40;
     /// Poll any fd. handle=fd, arg[0]=events mask. Returns poll result bitmask.
     pub const FD_POLL: u32 = 0x0C41;
-    /// Non-blocking resource lock attempt.
-    /// handle=-1, arg[0]=resource_id. Returns lock handle (>=0) or EBUSY.
-    pub const RESOURCE_TRY_LOCK: u32 = 0x0C00;
-    /// Release resource lock. handle=lock handle. Returns 0 or error.
-    pub const RESOURCE_UNLOCK: u32 = 0x0C01;
-    /// Flash sideband operation (internally acquires FLASH_XIP).
-    /// handle=-1, arg[0]=operation kind. Returns result or EAGAIN.
-    pub const FLASH_SIDEBAND: u32 = 0x0C10;
     /// Register a PIC module as provider for a device class.
     /// handle=-1, arg = RegisterProviderArgs. Returns 0 or error.
     pub const REGISTER_PROVIDER: u32 = 0x0C20;
-    /// Unregister a module provider. handle=-1, arg[0]=device_class. Returns 0 or error.
-    pub const UNREGISTER_PROVIDER: u32 = 0x0C21;
     /// Query stream time from first active PIO stream (handle=-1).
     /// Returns StreamTime struct. No PIO handle or ownership required.
     pub const STREAM_TIME: u32 = 0x0C30;
@@ -637,10 +546,78 @@ pub mod dev_system {
     pub const ARENA_USAGE: u32 = 0x0C32;
     /// Query downstream latency for current module. handle=-1. Returns u32 frames.
     pub const DOWNSTREAM_LATENCY: u32 = 0x0C33;
-    /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
-    pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
     /// Report module's own processing latency in frames. handle=-1, arg[0..4]=frames (u32 LE).
     pub const REPORT_LATENCY: u32 = 0x0C50;
+    /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
+    pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
+    /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
+    /// Returns arena size in bytes (0 if no arena allocated).
+    pub const ARENA_GET: u32 = 0x0C3A;
+
+    // ── Runtime parameter store ──────────────────────────────────────────
+
+    /// Store a runtime parameter override (persists across reboots).
+    /// handle=-1, arg=[tag:u8, value_bytes...], arg_len=1+value_len.
+    /// Scoped to current module instance. Returns 0 or negative errno.
+    pub const PARAM_STORE: u32 = 0x0C34;
+    /// Delete a runtime parameter override (reverts to compiled default).
+    /// handle=-1, arg=[tag:u8], arg_len=1.
+    /// Scoped to current module instance. Returns 0 or negative errno.
+    pub const PARAM_DELETE: u32 = 0x0C35;
+    /// Clear all runtime overrides for current module (arg_len=0) or
+    /// global factory reset (arg[0]=0xFF). handle=-1.
+    pub const PARAM_CLEAR_ALL: u32 = 0x0C36;
+    /// Register flash store dispatch function. Called by flash module on init.
+    /// handle=-1, arg=[fn_addr:u32 LE] (4 bytes). Kernel stores fn ptr + module state.
+    /// Returns 0 or negative errno.
+    pub const FLASH_STORE_ENABLE: u32 = 0x0C37;
+    /// Raw flash erase: erase 4KB sector (restricted to runtime store bounds).
+    /// handle=-1, arg=[offset:u32 LE] (4 bytes). Returns 0 or negative errno.
+    pub const FLASH_RAW_ERASE: u32 = 0x0C38;
+    /// Raw flash program: program 256B page (restricted to runtime store bounds).
+    /// handle=-1, arg=[offset:u32 LE, data:256 bytes] (260 bytes). Returns 0 or negative errno.
+    pub const FLASH_RAW_PROGRAM: u32 = 0x0C39;
+    /// Flash sideband operation (internally acquires FLASH_XIP).
+    /// handle=-1, arg[0]=operation kind. Returns result or EAGAIN.
+    pub const FLASH_SIDEBAND: u32 = 0x0C10;
+
+    // ── Bridge channels ──────────────────────────────────────────────────
+
+    /// Write data to a bridge channel.
+    /// handle=bridge_fd, arg=data bytes. Returns 0 on success, -EAGAIN if ring full.
+    pub const BRIDGE_WRITE: u32 = 0x0CE0;
+    /// Read data from a bridge channel.
+    /// handle=bridge_fd, arg=output buffer. Returns bytes read, -EAGAIN if empty/no new.
+    pub const BRIDGE_READ: u32 = 0x0CE1;
+    /// Poll bridge readiness. handle=bridge_fd. Returns 1 if readable, 0 if not.
+    pub const BRIDGE_POLL: u32 = 0x0CE2;
+    /// Get bridge info. handle=bridge_fd, arg=12-byte output buffer.
+    /// Returns: [type:u8, from:u8, to:u8, _:u8, drops:u32 LE, seq:u32 LE]
+    pub const BRIDGE_INFO: u32 = 0x0CE3;
+
+    // ── ISR tier ─────────────────────────────────────────────────────────
+
+    /// Query ISR module metrics. handle=-1, arg=[tier:u8, slot:u8] (2 bytes input).
+    /// On success, writes IsrMetrics (24 bytes) to arg buffer.
+    /// tier: 1=Tier 1b, 2=Tier 2. slot: slot index within tier.
+    pub const ISR_METRICS: u32 = 0x0CE8;
+
+    // ── Paged arenas ─────────────────────────────────────────────────────
+
+    /// Get paged arena info. handle=-1, arg=20-byte output buffer.
+    /// Returns: [base_vaddr:u64 LE, virtual_size:u64 LE, status:u32 LE].
+    /// status: 0=no arena, 1=active.
+    pub const PAGED_ARENA_GET: u32 = 0x0CF8;
+    /// Get paged arena statistics. handle=-1, arg=24-byte output buffer.
+    /// Returns PagedArenaStats struct.
+    pub const PAGED_ARENA_STATS: u32 = 0x0CF9;
+    /// Prefault pages into paged arena. handle=-1, arg=[offset_pages:u32 LE, count:u32 LE] (8 bytes).
+    /// Returns number of pages prefaulted.
+    pub const PAGED_ARENA_PREFAULT: u32 = 0x0CFA;
+
+    // ── Hardware register bridges (platform-specific, routed via HAL) ────
+
+    // PWM
     /// Raw PWM pin enable: set pin funcsel to PWM (4), configure pad.
     /// handle=-1, arg[0]=pin. Returns 0 or error.
     pub const PWM_PIN_ENABLE: u32 = 0x0C60;
@@ -655,9 +632,7 @@ pub mod dev_system {
     /// handle=-1, arg=[slice:u8, reg:u8] (2 bytes). Returns register value as i32.
     pub const PWM_SLICE_READ: u32 = 0x0C63;
 
-    // --- Raw PIO register bridge (0x0C70-0x0C7F) ---
-    // Generic PIO SM access. Module specifies pio_num (0/1/2) in every call.
-
+    // PIO
     /// Force-execute an instruction on a PIO SM.
     /// handle=-1, arg=[pio:u8, sm:u8, instr:u16 LE] (4 bytes).
     pub const PIO_SM_EXEC: u32 = 0x0C70;
@@ -698,9 +673,7 @@ pub mod dev_system {
     /// handle=-1, arg=[pio:u8, mask:u8] (2 bytes).
     pub const PIO_SM_RESTART: u32 = 0x0C7B;
 
-    // --- Raw DMA bridge (0x0C80-0x0C84) ---
-    // Generic DMA channel access for PIC modules.
-
+    // DMA
     /// Allocate a DMA channel. handle=-1, arg=[]. Returns channel number (i32) or <0.
     pub const DMA_ALLOC: u32 = 0x0C80;
     /// Free a DMA channel. handle=-1, arg=[ch:u8] (1 byte).
@@ -715,10 +688,6 @@ pub mod dev_system {
     /// Abort a DMA transfer.
     /// handle=-1, arg=[ch:u8] (1 byte).
     pub const DMA_ABORT: u32 = 0x0C84;
-
-    // --- DMA FD (0x0C85-0x0C88) ---
-    // FD-wrapped DMA channels with fd_poll(POLL_IN) for non-blocking completion.
-
     /// Create a DMA FD: allocates CH8-15 channel, returns tagged fd.
     /// handle=-1, arg=[]. Returns tagged DMA fd or <0.
     pub const DMA_FD_CREATE: u32 = 0x0C85;
@@ -737,114 +706,46 @@ pub mod dev_system {
     /// handle=dma_fd, arg=[read_addr:u32 LE, count:u32 LE] (8 bytes).
     pub const DMA_FD_QUEUE: u32 = 0x0C89;
 
-    // --- 9-bit SPI bit-bang (0x0C90) ---
-    // Raw PAC GPIO bit-bang for display register init.
-
+    // SPI 9-bit bit-bang
     /// Send a 9-bit SPI command + data block.
     /// handle=-1, arg=[cs:u8, sck:u8, sda:u8, cmd:u8, data_len:u8, data[0..data_len]].
     /// Total arg_len = 5 + data_len. Drives SIO pins directly via PAC.
     pub const SPI9_SEND: u32 = 0x0C90;
-
     /// Execute 9-bit SPI reset sequence.
     /// handle=-1, arg=[rst:u8, cs:u8, sck:u8, sda:u8] (4 bytes).
     /// RST high 20ms → low 20ms → high 200ms, then inits SIO pins.
     pub const SPI9_RESET: u32 = 0x0C91;
-
     /// Set 9-bit SPI CS pin level explicitly.
     /// handle=-1, arg=[cs_pin:u8, level:u8] (2 bytes). level: 0=low, 1=high.
     /// Used to hold CS low across delays (e.g. SLEEP_OUT 120ms).
     pub const SPI9_CS_SET: u32 = 0x0C92;
 
-    // --- Raw SPI peripheral bridge (0x0CA0-0x0CA5) ---
-    // Thin MMIO access to SPI peripheral registers for PIC driver modules.
+    // SPI register bridge
     pub const SPI_REG_WRITE: u32 = 0x0CA0;
     pub const SPI_REG_READ: u32 = 0x0CA1;
     pub const SPI_BUS_INFO: u32 = 0x0CA2;
     pub const SPI_PIN_INIT: u32 = 0x0CA3;
     pub const SPI_SET_ENABLE: u32 = 0x0CA4;
 
-    // --- Raw I2C peripheral bridge (0x0CB0-0x0CB4) ---
+    // I2C register bridge
     pub const I2C_REG_WRITE: u32 = 0x0CB0;
     pub const I2C_REG_READ: u32 = 0x0CB1;
     pub const I2C_BUS_INFO: u32 = 0x0CB2;
     pub const I2C_PIN_INIT: u32 = 0x0CB3;
     pub const I2C_SET_ENABLE: u32 = 0x0CB4;
 
-    // --- Raw UART peripheral bridge (0x0CC0-0x0CC4) ---
+    // UART register bridge
     pub const UART_REG_WRITE: u32 = 0x0CC0;
     pub const UART_REG_READ: u32 = 0x0CC1;
     pub const UART_PIN_INIT: u32 = 0x0CC2;
     pub const UART_SET_ENABLE: u32 = 0x0CC3;
 
-    // --- Raw ADC peripheral bridge (0x0CD0-0x0CD3) ---
+    // ADC register bridge
     pub const ADC_REG_WRITE: u32 = 0x0CD0;
     pub const ADC_REG_READ: u32 = 0x0CD1;
     pub const ADC_PIN_INIT: u32 = 0x0CD2;
 
-    // --- Runtime parameter store (0x0C34-0x0C36) ---
-
-    /// Store a runtime parameter override (persists across reboots).
-    /// handle=-1, arg=[tag:u8, value_bytes...], arg_len=1+value_len.
-    /// Scoped to current module instance. Returns 0 or negative errno.
-    pub const PARAM_STORE: u32 = 0x0C34;
-    /// Delete a runtime parameter override (reverts to compiled default).
-    /// handle=-1, arg=[tag:u8], arg_len=1.
-    /// Scoped to current module instance. Returns 0 or negative errno.
-    pub const PARAM_DELETE: u32 = 0x0C35;
-    /// Clear all runtime overrides for current module (arg_len=0) or
-    /// global factory reset (arg[0]=0xFF). handle=-1.
-    pub const PARAM_CLEAR_ALL: u32 = 0x0C36;
-
-    // --- Flash store bridge (0x0C37-0x0C39) ---
-
-    /// Register flash store dispatch function. Called by flash module on init.
-    /// handle=-1, arg=[fn_addr:u32 LE] (4 bytes). Kernel stores fn ptr + module state.
-    /// Returns 0 or negative errno.
-    pub const FLASH_STORE_ENABLE: u32 = 0x0C37;
-    /// Raw flash erase: erase 4KB sector (restricted to runtime store bounds).
-    /// handle=-1, arg=[offset:u32 LE] (4 bytes). Returns 0 or negative errno.
-    pub const FLASH_RAW_ERASE: u32 = 0x0C38;
-    /// Raw flash program: program 256B page (restricted to runtime store bounds).
-    /// handle=-1, arg=[offset:u32 LE, data:256 bytes] (260 bytes). Returns 0 or negative errno.
-    pub const FLASH_RAW_PROGRAM: u32 = 0x0C39;
-
-    // --- Module arena (0x0C3A) ---
-
-    /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
-    /// Returns arena size in bytes (0 if no arena allocated).
-    pub const ARENA_GET: u32 = 0x0C3A;
-
-    // --- Bridge channel operations (0x0CE0-0x0CE5) ---
-
-    /// Write data to a bridge channel.
-    /// handle=bridge_fd, arg=data bytes. Returns 0 on success, -EAGAIN if ring full.
-    pub const BRIDGE_WRITE: u32 = 0x0CE0;
-    /// Read data from a bridge channel.
-    /// handle=bridge_fd, arg=output buffer. Returns bytes read, -EAGAIN if empty/no new.
-    pub const BRIDGE_READ: u32 = 0x0CE1;
-    /// Poll bridge readiness. handle=bridge_fd. Returns 1 if readable, 0 if not.
-    pub const BRIDGE_POLL: u32 = 0x0CE2;
-    /// Get bridge info. handle=bridge_fd, arg=12-byte output buffer.
-    /// Returns: [type:u8, from:u8, to:u8, _:u8, drops:u32 LE, seq:u32 LE]
-    pub const BRIDGE_INFO: u32 = 0x0CE3;
-
-    // --- Paged arena (0x0CF8-0x0CFA) ---
-
-    /// Get paged arena info. handle=-1, arg=20-byte output buffer.
-    /// Returns: [base_vaddr:u64 LE, virtual_size:u64 LE, status:u32 LE].
-    /// status: 0=no arena, 1=active.
-    pub const PAGED_ARENA_GET: u32 = 0x0CF8;
-    /// Get paged arena statistics. handle=-1, arg=24-byte output buffer.
-    /// Returns PagedArenaStats struct.
-    pub const PAGED_ARENA_STATS: u32 = 0x0CF9;
-    /// Prefault pages into paged arena. handle=-1, arg=[offset_pages:u32 LE, count:u32 LE] (8 bytes).
-    /// Returns number of pages prefaulted.
-    pub const PAGED_ARENA_PREFAULT: u32 = 0x0CFA;
-
-    // --- Generic MMIO bridge (0x0CE4-0x0CE6) ---
-    // Raw memory-mapped I/O for PIC modules on aarch64 (BCM2712).
-    // On RP targets these return ENOSYS.
-
+    // Generic MMIO (aarch64)
     /// Read a 32-bit value from a physical MMIO address (aarch64 only).
     /// handle=-1, arg=[addr:u64 LE] (8 bytes input).
     /// On success, writes u32 LE result to arg[8..12]. Returns 0 or negative errno.
@@ -857,14 +758,7 @@ pub mod dev_system {
     /// On success, writes phys_addr:u64 LE to arg[8..16]. Returns 0 or negative errno.
     pub const DMA_ALLOC_CONTIG: u32 = 0x0CE6;
 
-    // --- ISR Tier metrics (0x0CE8) ---
-
-    /// Query ISR module metrics. handle=-1, arg=[tier:u8, slot:u8] (2 bytes input).
-    /// On success, writes IsrMetrics (24 bytes) to arg buffer.
-    /// tier: 1=Tier 1b, 2=Tier 2. slot: slot index within tier.
-    pub const ISR_METRICS: u32 = 0x0CE8;
-
-    // --- NIC kernel-bypass (0x0CF0-0x0CF4) ---
+    // ── NIC kernel-bypass ────────────────────────────────────────────────
 
     /// Map a PCIe device BAR into kernel virtual address space.
     /// handle=-1, arg=[dev_idx:u8, bar_idx:u8] (2 bytes).
@@ -883,10 +777,6 @@ pub mod dev_system {
     /// Get NIC ring info (addresses, sizes). handle=ring_handle, arg=32-byte output buffer.
     /// Returns 32 on success (bytes written), or negative errno.
     pub const NIC_RING_INFO: u32 = 0x0CF4;
-
-    // --- SMMU/IOMMU (0x0CFB-0x0CFD) ---
-    // Dispatched to smmu_cfg PIC module when loaded.
-
     /// Map DMA for an IOMMU stream.
     /// handle=-1, arg=[stream_id:u16 LE, iova:u64 LE, phys:u64 LE, size:u64 LE] (26 bytes).
     pub const SMMU_MAP_DMA: u32 = 0x0CFB;
@@ -983,7 +873,7 @@ pub mod dev_query_key {
 // Module ABI
 // ============================================================================
 
-// Module ABI (v3):
+// Module ABI:
 //
 // module_new(in_chan, out_chan, ctrl_chan, params, params_len, state, state_size, syscalls) -> i32
 //
@@ -1000,6 +890,6 @@ pub mod dev_query_key {
 //   { target_frame: u32, command: u8, control_id: u8, param: u16 } (8 bytes)
 //   Commands: 0x01=Toggle, 0x10=Next, 0x11=Prev, 0x12=Select
 //
-// Multi-port (ABI v2):
+// Multi-port:
 //   Modules with multiple inputs/outputs discover extra ports via channel_port() syscall.
 //   port_type: 0=in, 1=out, 2=ctrl. index 0 = primary (same as in_chan/out_chan/ctrl_chan).

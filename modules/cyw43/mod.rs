@@ -416,7 +416,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
         0 => {
             // Claim power pin (output, initially low = off)
             let mut pwr_arg = [s.pwr_pin];
-            let h = (sys.dev_call)(-1, dev_gpio::REQUEST_OUTPUT, pwr_arg.as_mut_ptr(), 1);
+            let h = (sys.dev_call)(-1, dev_gpio::SET_OUTPUT, pwr_arg.as_mut_ptr(), 1);
             if h < 0 {
                 log_error(s, b"[cyw43] pwr pin fail");
                 s.phase = Cyw43Phase::Error;
@@ -428,7 +428,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
 
             // Claim CS pin (output, initially high = deasserted)
             let mut cs_arg = [s.cs_pin];
-            let h = (sys.dev_call)(-1, dev_gpio::REQUEST_OUTPUT, cs_arg.as_mut_ptr(), 1);
+            let h = (sys.dev_call)(-1, dev_gpio::SET_OUTPUT, cs_arg.as_mut_ptr(), 1);
             if h < 0 {
                 log_error(s, b"[cyw43] cs pin fail");
                 s.phase = Cyw43Phase::Error;

@@ -535,16 +535,6 @@ pub fn poll_gpio_edges() {
     }
 }
 
-/// Syscall: set edge detection interest
-pub unsafe extern "C" fn syscall_gpio_set_irq(handle: i32, edge: u8) -> i32 {
-    gpio_set_irq(handle, edge)
-}
-
-/// Syscall: poll edge detection
-pub unsafe extern "C" fn syscall_gpio_poll_irq(handle: i32) -> i32 {
-    gpio_poll_irq(handle)
-}
-
 // ============================================================================
 // Edge-to-event binding (GPIO provider owns the full lifecycle)
 // ============================================================================
@@ -574,22 +564,6 @@ pub fn gpio_watch_edge(pin: u8, edge: u8, event_handle: i32) -> i32 {
     }
     // Bind the event
     GPIO_EVENT_BINDING[idx].store(event_handle, Ordering::Release);
-    0
-}
-
-/// Unbind event from a GPIO pin's edge detection.
-/// Disables edge detection and clears the event binding.
-/// Caller (provider dispatch) must have already verified pin ownership.
-pub fn gpio_unwatch_edge(pin: u8) -> i32 {
-    let idx = pin as usize;
-    if idx >= MAX_GPIO {
-        return errno::EINVAL;
-    }
-    if !CLAIMED[idx].load(Ordering::Acquire) {
-        return errno::ENODEV;
-    }
-    let _ = gpio_set_irq(pin as i32, 0);
-    GPIO_EVENT_BINDING[idx].store(-1, Ordering::Release);
     0
 }
 

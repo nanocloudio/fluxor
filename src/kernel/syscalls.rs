@@ -33,7 +33,7 @@ use crate::kernel::errno;
 use crate::kernel::hal;
 use crate::kernel::net;
 use crate::kernel::socket;
-use crate::abi::{DeviceInfo, SyscallTable, ABI_VERSION};
+use crate::abi::{SyscallTable, ABI_VERSION};
 // ============================================================================
 // Error Codes (Linux errno values)
 // ============================================================================
@@ -192,7 +192,7 @@ unsafe extern "C" fn syscall_dev_call(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    use crate::abi::{dev_class, dev_common};
+    use crate::abi::dev_class;
 
     let class = ((opcode >> 8) & 0xFF) as u8;
 
@@ -238,23 +238,8 @@ unsafe extern "C" fn syscall_dev_call(
         }
     }
 
-    // Handle cross-class operations first
     if class == dev_class::COMMON {
-        return match opcode {
-            dev_common::GET_STATS => E_NOSYS,        // Future: per-class stats
-            dev_common::SET_POWER_STATE => E_NOSYS,   // Future: power management
-            dev_common::GET_POWER_STATE => E_NOSYS,
-            dev_common::RESET => E_NOSYS,             // Future: device reset
-            dev_common::GET_INFO => {
-                if arg.is_null() || arg_len < core::mem::size_of::<DeviceInfo>() {
-                    return E_INVAL;
-                }
-                // Without a handle-to-class registry, GET_INFO requires
-                // the caller to know the class. Return ENOSYS for now.
-                E_NOSYS
-            }
-            _ => E_NOSYS,
-        };
+        return E_NOSYS;
     }
 
     // Dispatch to registered provider
@@ -594,11 +579,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
                 state,
             )
         }
-        dev_system::UNREGISTER_PROVIDER => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            let class = *arg;
-            provider::unregister_module_provider(class)
-        }
         dev_system::ARENA_GET => {
             // Return module's arena pointer via arg buffer, size as return value
             let mut size_out: u32 = 0;
@@ -713,29 +693,12 @@ unsafe extern "C" fn syscall_dev_query(
     out: *mut u8,
     out_len: usize,
 ) -> i32 {
-    use crate::abi::{dev_class, dev_common, dev_query_key, DeviceInfo};
+    use crate::abi::{dev_class, dev_query_key};
     use crate::kernel::fd;
 
     // Handle cross-class common queries (0x0000-0x00FF)
     if key < 0x0100 {
         return match key {
-            dev_common::GET_INFO => {
-                if out.is_null() || out_len < core::mem::size_of::<DeviceInfo>() {
-                    return E_INVAL;
-                }
-                // System-wide info when handle == -1
-                if handle == -1 {
-                    let info = DeviceInfo {
-                        class: dev_class::SYSTEM,
-                        version: ABI_VERSION as u8,
-                        _reserved: 0,
-                        capabilities: 0x001F, // GPIO | SPI | I2C | PIO | Timer
-                    };
-                    *(out as *mut DeviceInfo) = info;
-                    return 0;
-                }
-                E_NOSYS
-            }
             dev_query_key::CLASS => {
                 if out.is_null() || out_len < 1 { return E_INVAL; }
                 let (tag, _) = fd::untag_fd(handle);
