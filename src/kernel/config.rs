@@ -182,14 +182,11 @@ impl HardwareConfig {
 
 /// Hardware context - tracks which bus resources have been initialized.
 ///
-/// Note: I2C tracking is present for forward-compatibility but currently
-/// unused — I2C syscalls are stubs (E_NOSYS). The fields will be consumed
-/// once I2C bus support is wired up.
+/// Tracks which hardware buses have been configured at boot.
+/// Used by the scheduler to validate hardware requirements.
 pub struct HardwareContext {
     spi_initialized: [bool; MAX_SPI_BUSES],
     i2c_initialized: [bool; MAX_I2C_BUSES],
-    uart_initialized: [bool; MAX_UART_BUSES],
-    adc_initialized: bool,
 }
 
 impl HardwareContext {
@@ -197,8 +194,6 @@ impl HardwareContext {
         Self {
             spi_initialized: [false; MAX_SPI_BUSES],
             i2c_initialized: [false; MAX_I2C_BUSES],
-            uart_initialized: [false; MAX_UART_BUSES],
-            adc_initialized: false,
         }
     }
 
@@ -228,28 +223,6 @@ impl HardwareContext {
         if (bus as usize) < MAX_I2C_BUSES {
             self.i2c_initialized[bus as usize] = true;
         }
-    }
-
-    pub fn is_uart_initialized(&self, bus: u8) -> bool {
-        if (bus as usize) < MAX_UART_BUSES {
-            self.uart_initialized[bus as usize]
-        } else {
-            false
-        }
-    }
-
-    pub fn mark_uart_initialized(&mut self, bus: u8) {
-        if (bus as usize) < MAX_UART_BUSES {
-            self.uart_initialized[bus as usize] = true;
-        }
-    }
-
-    pub fn is_adc_initialized(&self) -> bool {
-        self.adc_initialized
-    }
-
-    pub fn mark_adc_initialized(&mut self) {
-        self.adc_initialized = true;
     }
 }
 
@@ -1105,10 +1078,7 @@ impl Hardware {
 
     /// Initialize all GPIO pins from config
     pub fn init_gpio(&self) -> usize {
-        #[cfg(feature = "rp")]
-        { crate::io::gpio::init_all_from_config(&self.config.gpio) }
-        #[cfg(not(feature = "rp"))]
-        { 0 }
+        (crate::kernel::hal::init_gpio)(&self.config.gpio)
     }
 }
 

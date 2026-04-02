@@ -858,6 +858,9 @@ pub extern "C" fn main() -> ! {
 
     uart_puts(b"[gic] initialized, IRQs enabled\r\n");
 
+    // Initialize HAL with BCM2712 platform ops
+    fluxor::kernel::hal::init(&BCM2712_HAL_OPS);
+
     // Initialize syscall table and provider registry
     fluxor::kernel::syscalls::init_syscall_table();
     fluxor::kernel::syscalls::init_providers();
@@ -1444,6 +1447,235 @@ impl log::Log for UartLogger {
     }
     fn flush(&self) {}
 }
+
+// ============================================================================
+// BCM2712 HAL Ops
+// ============================================================================
+
+use fluxor::kernel::hal::HalOps;
+
+fn bcm_disable_interrupts() -> u32 {
+    let daif: u32;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0:x}, daif",
+            "msr daifset, #2",
+            out(reg) daif,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    daif
+}
+
+fn bcm_restore_interrupts(saved: u32) {
+    unsafe {
+        core::arch::asm!(
+            "msr daif, {0:x}",
+            in(reg) saved,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+fn bcm_wake_scheduler() {
+    unsafe { core::arch::asm!("sev") };
+}
+
+fn bcm_now_millis() -> u64 { 0 }
+fn bcm_now_micros() -> u64 { 0 }
+fn bcm_tick_count() -> u32 {
+    fluxor::kernel::scheduler::tick_count()
+}
+
+fn bcm_flash_base() -> usize { 0 }
+fn bcm_flash_end() -> usize { 0 }
+fn bcm_apply_code_bit(addr: usize) -> usize { addr }
+fn bcm_validate_fn_addr(addr: usize) -> bool { addr != 0 }
+fn bcm_validate_module_base(addr: usize) -> bool { addr != 0 }
+fn bcm_validate_fn_in_code(_addr: usize, _code_base: usize, _code_size: u32) -> bool { true }
+fn bcm_verify_integrity(_computed: &[u8], _expected: &[u8]) -> bool { true }
+
+fn bcm_pic_barrier() {
+    unsafe { core::arch::asm!("dsb sy", "isb") };
+}
+
+// Step guard: software elapsed-time check
+static mut BCM_ARM_TIME: u64 = 0;
+static mut BCM_DEADLINE_TICKS: u64 = 0;
+
+fn bcm_read_cntpct() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
+    val
+}
+
+fn bcm_counter_freq() -> u64 {
+    let freq: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
+    freq
+}
+
+fn bcm_step_guard_init() {}
+
+fn bcm_step_guard_arm(deadline_us: u32) {
+    use fluxor::kernel::step_guard;
+    step_guard::clear_timed_out();
+    step_guard::set_armed(true);
+    let freq = bcm_counter_freq();
+    let ticks = (deadline_us as u64 * freq) / 1_000_000;
+    unsafe {
+        BCM_ARM_TIME = bcm_read_cntpct();
+        BCM_DEADLINE_TICKS = ticks;
+    }
+}
+
+fn bcm_step_guard_disarm() {
+    fluxor::kernel::step_guard::set_armed(false);
+}
+
+fn bcm_step_guard_post_check() {
+    use fluxor::kernel::step_guard;
+    if !step_guard::is_armed() { return; }
+    let now = bcm_read_cntpct();
+    let elapsed = now.wrapping_sub(unsafe { BCM_ARM_TIME });
+    if elapsed >= unsafe { BCM_DEADLINE_TICKS } {
+        step_guard::set_timed_out();
+    }
+    step_guard::set_armed(false);
+}
+
+fn bcm_read_cycle_count() -> u32 {
+    bcm_read_cntpct() as u32
+}
+
+fn bcm_isr_tier_init() {}
+
+// ISR tier 1b: software poll on aarch64
+static mut BCM_ISR_LAST_TICK: u64 = 0;
+static mut BCM_ISR_PERIOD_TICKS: u64 = 0;
+
+fn bcm_isr_tier_start(period_us: u32) {
+    use fluxor::kernel::isr_tier;
+    isr_tier::set_tier1b_period_us(period_us);
+    let freq = bcm_counter_freq();
+    unsafe {
+        BCM_ISR_PERIOD_TICKS = (period_us as u64 * freq) / 1_000_000;
+        BCM_ISR_LAST_TICK = bcm_read_cntpct();
+    }
+    isr_tier::TIER1B_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+fn bcm_isr_tier_stop() {
+    fluxor::kernel::isr_tier::TIER1B_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+}
+
+fn bcm_isr_tier_poll() {
+    use fluxor::kernel::isr_tier;
+    if !isr_tier::TIER1B_ACTIVE.load(core::sync::atomic::Ordering::Acquire) { return; }
+    let now = bcm_read_cntpct();
+    let elapsed = now.wrapping_sub(unsafe { BCM_ISR_LAST_TICK });
+    let period = unsafe { BCM_ISR_PERIOD_TICKS };
+    if period > 0 && elapsed >= period {
+        unsafe {
+            BCM_ISR_LAST_TICK = now;
+            isr_tier::isr_tier1b_handler();
+        }
+    }
+}
+
+fn bcm_init_providers() {
+    // BCM2712 system extension for MMIO and NIC opcodes
+    fluxor::kernel::syscalls::register_system_extension(bcm_system_extension_dispatch);
+}
+
+fn bcm_release_module_handles(_module_idx: u8) {}
+fn bcm_boot_scan() {}
+fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize { len }
+
+unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use fluxor::abi::dev_system;
+    match opcode {
+        dev_system::MMIO_READ32 => {
+            if arg.is_null() || arg_len < 12 { return -22; }
+            let addr = u64::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]);
+            let val = core::ptr::read_volatile(addr as *const u32);
+            let vb = val.to_le_bytes();
+            *arg.add(8) = vb[0]; *arg.add(9) = vb[1];
+            *arg.add(10) = vb[2]; *arg.add(11) = vb[3];
+            0
+        }
+        dev_system::MMIO_WRITE32 => {
+            if arg.is_null() || arg_len < 12 { return -22; }
+            let addr = u64::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]);
+            let val = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            core::ptr::write_volatile(addr as *mut u32, val);
+            0
+        }
+        dev_system::DMA_ALLOC_CONTIG => {
+            if arg.is_null() || arg_len < 16 { return -22; }
+            let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            let phys = fluxor::kernel::nic_ring::dma_alloc_contig(size as usize, align as usize);
+            if phys == 0 { return -38; }
+            let pb = (phys as u64).to_le_bytes();
+            core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
+            0
+        }
+        dev_system::NIC_BAR_MAP => {
+            fluxor::kernel::pcie::syscall_bar_map(arg, arg_len)
+        }
+        dev_system::NIC_BAR_UNMAP => {
+            fluxor::kernel::pcie::syscall_bar_unmap(arg, arg_len)
+        }
+        dev_system::NIC_RING_CREATE => {
+            fluxor::kernel::nic_ring::syscall_ring_create(arg, arg_len)
+        }
+        dev_system::NIC_RING_DESTROY => {
+            fluxor::kernel::nic_ring::syscall_ring_destroy(arg, arg_len)
+        }
+        dev_system::NIC_RING_INFO => {
+            fluxor::kernel::nic_ring::syscall_ring_info(_handle, arg, arg_len)
+        }
+        _ => -38, // E_NOSYS
+    }
+}
+
+static BCM2712_HAL_OPS: HalOps = HalOps {
+    disable_interrupts: bcm_disable_interrupts,
+    restore_interrupts: bcm_restore_interrupts,
+    wake_scheduler: bcm_wake_scheduler,
+    now_millis: bcm_now_millis,
+    now_micros: bcm_now_micros,
+    tick_count: bcm_tick_count,
+    flash_base: bcm_flash_base,
+    flash_end: bcm_flash_end,
+    apply_code_bit: bcm_apply_code_bit,
+    validate_fn_addr: bcm_validate_fn_addr,
+    validate_module_base: bcm_validate_module_base,
+    validate_fn_in_code: bcm_validate_fn_in_code,
+    verify_integrity: bcm_verify_integrity,
+    pic_barrier: bcm_pic_barrier,
+    step_guard_init: bcm_step_guard_init,
+    step_guard_arm: bcm_step_guard_arm,
+    step_guard_disarm: bcm_step_guard_disarm,
+    step_guard_post_check: bcm_step_guard_post_check,
+    read_cycle_count: bcm_read_cycle_count,
+    isr_tier_init: bcm_isr_tier_init,
+    isr_tier_start: bcm_isr_tier_start,
+    isr_tier_stop: bcm_isr_tier_stop,
+    isr_tier_poll: bcm_isr_tier_poll,
+    init_providers: bcm_init_providers,
+    release_module_handles: bcm_release_module_handles,
+    boot_scan: bcm_boot_scan,
+    merge_runtime_overrides: bcm_merge_runtime_overrides,
+    init_gpio: |_| 0, // no GPIO init on aarch64 (handled by PIC modules)
+};
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

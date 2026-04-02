@@ -20,9 +20,8 @@
 //!
 //! ## Platform backends
 //!
-//! - **RP2350**: TIMER1 alarm 1 for Tier 1b (alarm 0 is step_guard).
-//! - **RP2040**: TIMER alarm 2 for Tier 1b (alarm 3 is step_guard, 0-1 are Embassy).
-//! - **BCM2712**: Generic timer compare value for Tier 1b periodic interrupt.
+//! Platform-specific timer setup and ISR vectors are in the HAL layer.
+//! The HAL calls `isr_tier1b_handler()` from the timer ISR.
 //!
 //! ## Cycle budgeting
 //!
@@ -31,6 +30,7 @@
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
+use crate::kernel::hal;
 use crate::kernel::loader::ModuleStepFn;
 
 // ============================================================================
@@ -218,7 +218,7 @@ static mut ISR_T2_COUNT: u8 = 0;
 static mut TIER1B_PERIOD_US: u32 = 0;
 
 /// Whether the Tier 1b timer is running.
-static TIER1B_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static TIER1B_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Global overrun flag — set if any ISR module exceeds total budget.
 static TIER1B_OVERRUN: AtomicBool = AtomicBool::new(false);
@@ -354,7 +354,7 @@ pub fn reset_all() {
 /// # Safety
 /// Called from ISR context. Must not call any blocking or allocating functions.
 #[inline(never)]
-unsafe fn isr_tier1b_handler() {
+pub unsafe fn isr_tier1b_handler() {
     TIER1B_TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let count = ISR_COUNT as usize;
@@ -364,31 +364,12 @@ unsafe fn isr_tier1b_handler() {
             continue;
         }
 
-        let before = read_cycle_count();
+        let before = hal::read_cycle_count();
         let _rc = (slot.step_fn)(slot.state_ptr);
-        let after = read_cycle_count();
+        let after = hal::read_cycle_count();
         let elapsed = after.wrapping_sub(before);
 
         slot.metrics.record(elapsed);
-    }
-}
-
-/// Read hardware cycle counter (platform-specific).
-#[inline(always)]
-fn read_cycle_count() -> u32 {
-    #[cfg(feature = "rp")]
-    {
-        // Cortex-M DWT cycle counter (CYCCNT)
-        // Must be enabled first — see init().
-        unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
-    }
-    #[cfg(feature = "chip-bcm2712")]
-    {
-        // aarch64: use PMCCNTR_EL0 (performance monitor cycle counter)
-        // Fallback to CNTPCT_EL0 if PMU not available.
-        let val: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
-        val as u32
     }
 }
 
@@ -413,9 +394,9 @@ pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
             continue;
         }
 
-        let before = read_cycle_count();
+        let before = hal::read_cycle_count();
         let rc = (slot.isr_entry)(slot.state_ptr);
-        let after = read_cycle_count();
+        let after = hal::read_cycle_count();
 
         let mut elapsed = after.wrapping_sub(before);
         // Account for FPU lazy stacking overhead on Cortex-M33
@@ -480,198 +461,28 @@ pub fn check_and_clear_overrun() -> bool {
     TIER1B_OVERRUN.swap(false, Ordering::AcqRel)
 }
 
-// ============================================================================
-// RP2350 backend: TIMER1 alarm 1 (periodic)
-// ============================================================================
+/// Get the Tier 1b period in microseconds.
+pub fn tier1b_period_us() -> u32 {
+    unsafe { TIER1B_PERIOD_US }
+}
 
-#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-mod rp2350_backend {
-    use super::*;
-    use embassy_rp::pac;
-
-    fn timer1() -> pac::timer::Timer {
-        pac::TIMER1
-    }
-
-    /// Start the Tier 1b periodic timer.
-    pub fn start(period_us: u32) {
-        unsafe { super::TIER1B_PERIOD_US = period_us; }
-
-        let t = timer1();
-        // Clear and configure alarm 1
-        t.inte().modify(|w| w.set_alarm(1, false));
-        t.intr().write(|w| w.set_alarm(1, true));
-
-        // Set first alarm
-        let now_lo = t.timelr().read();
-        let target = now_lo.wrapping_add(period_us);
-        t.alarm(1).write_value(target);
-        t.inte().modify(|w| w.set_alarm(1, true));
-
-        // Enable TIMER1_IRQ_1 in NVIC
-        unsafe {
-            let nvic = &*cortex_m::peripheral::NVIC::PTR;
-            // TIMER1_IRQ_1 on RP2350 is interrupt 5
-            // (TIMER1_IRQ_0=4, TIMER1_IRQ_1=5)
-            const TIMER1_IRQ_1: u16 = 5;
-            nvic.iser[0].write(1 << TIMER1_IRQ_1);
-        }
-
-        super::TIER1B_ACTIVE.store(true, Ordering::Release);
-    }
-
-    /// Stop the Tier 1b periodic timer.
-    pub fn stop() {
-        let t = timer1();
-        t.inte().modify(|w| w.set_alarm(1, false));
-        t.intr().write(|w| w.set_alarm(1, true));
-        super::TIER1B_ACTIVE.store(false, Ordering::Release);
-    }
-
-    /// Timer1 alarm 1 ISR — periodic Tier 1b handler.
-    pub fn on_timer_irq() {
-        let t = timer1();
-        // Acknowledge interrupt
-        t.intr().write(|w| w.set_alarm(1, true));
-
-        // Re-arm for next period (before stepping modules for minimal jitter)
-        let period = unsafe { super::TIER1B_PERIOD_US };
-        if period > 0 && super::TIER1B_ACTIVE.load(Ordering::Acquire) {
-            let now_lo = t.timelr().read();
-            let target = now_lo.wrapping_add(period);
-            t.alarm(1).write_value(target);
-        } else {
-            // Disable if no longer active
-            t.inte().modify(|w| w.set_alarm(1, false));
-            return;
-        }
-
-        // Step all Tier 1b modules
-        unsafe { isr_tier1b_handler(); }
-    }
+/// Set the Tier 1b period in microseconds (called by platform start).
+pub fn set_tier1b_period_us(period_us: u32) {
+    unsafe { TIER1B_PERIOD_US = period_us; }
 }
 
 // ============================================================================
-// RP2040 backend: TIMER alarm 2 (periodic)
+// Platform backend entry points (called by HAL implementations)
 // ============================================================================
 
-#[cfg(feature = "chip-rp2040")]
-mod rp2040_backend {
-    use super::*;
-    use embassy_rp::pac;
-
-    fn timer() -> pac::timer::Timer {
-        pac::TIMER
-    }
-
-    /// Start the Tier 1b periodic timer.
-    pub fn start(period_us: u32) {
-        unsafe { super::TIER1B_PERIOD_US = period_us; }
-
-        let t = timer();
-        t.inte().modify(|w| w.set_alarm(2, false));
-        t.intr().write(|w| w.set_alarm(2, true));
-
-        let now_lo = t.timelr().read();
-        let target = now_lo.wrapping_add(period_us);
-        t.alarm(2).write_value(target);
-        t.inte().modify(|w| w.set_alarm(2, true));
-
-        // Enable TIMER_IRQ_2 in NVIC (IRQ 2 on RP2040)
-        unsafe {
-            let nvic = &*cortex_m::peripheral::NVIC::PTR;
-            const TIMER_IRQ_2: u16 = 2;
-            nvic.iser[0].write(1 << TIMER_IRQ_2);
-        }
-
-        super::TIER1B_ACTIVE.store(true, Ordering::Release);
-    }
-
-    /// Stop the Tier 1b periodic timer.
-    pub fn stop() {
-        let t = timer();
-        t.inte().modify(|w| w.set_alarm(2, false));
-        t.intr().write(|w| w.set_alarm(2, true));
-        super::TIER1B_ACTIVE.store(false, Ordering::Release);
-    }
-
-    /// Timer alarm 2 ISR.
-    pub fn on_timer_irq() {
-        let t = timer();
-        t.intr().write(|w| w.set_alarm(2, true));
-
-        // Re-arm for next period
-        let period = unsafe { super::TIER1B_PERIOD_US };
-        if period > 0 && super::TIER1B_ACTIVE.load(Ordering::Acquire) {
-            let now_lo = t.timelr().read();
-            let target = now_lo.wrapping_add(period);
-            t.alarm(2).write_value(target);
-        } else {
-            t.inte().modify(|w| w.set_alarm(2, false));
-            return;
-        }
-
-        unsafe { isr_tier1b_handler(); }
-    }
+/// Platform start implementation — called by HAL after hardware timer setup.
+pub fn platform_start(period_us: u32) {
+    hal::isr_tier_start(period_us);
 }
 
-// ============================================================================
-// BCM2712/aarch64 backend: software timer emulation
-// ============================================================================
-
-#[cfg(feature = "chip-bcm2712")]
-mod bcm2712_backend {
-    use super::*;
-
-    /// Last Tier 1b invocation timestamp (counter ticks).
-    static mut LAST_TICK: u64 = 0;
-    /// Period in counter ticks.
-    static mut PERIOD_TICKS: u64 = 0;
-
-    fn read_cntpct() -> u64 {
-        let val: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
-        val
-    }
-
-    fn counter_freq() -> u64 {
-        let freq: u64;
-        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
-        freq
-    }
-
-    /// Start Tier 1b (record initial time, compute period in ticks).
-    pub fn start(period_us: u32) {
-        unsafe {
-            super::TIER1B_PERIOD_US = period_us;
-            let freq = counter_freq();
-            PERIOD_TICKS = (period_us as u64 * freq) / 1_000_000;
-            LAST_TICK = read_cntpct();
-        }
-        super::TIER1B_ACTIVE.store(true, Ordering::Release);
-    }
-
-    /// Stop Tier 1b.
-    pub fn stop() {
-        super::TIER1B_ACTIVE.store(false, Ordering::Release);
-    }
-
-    /// Poll-based Tier 1b tick. Called from the main loop on aarch64.
-    /// Checks if enough time has elapsed and runs the ISR handler if so.
-    pub fn poll_tick() {
-        if !super::TIER1B_ACTIVE.load(Ordering::Acquire) {
-            return;
-        }
-        let now = read_cntpct();
-        let elapsed = now.wrapping_sub(unsafe { LAST_TICK });
-        let period = unsafe { PERIOD_TICKS };
-        if period > 0 && elapsed >= period {
-            unsafe {
-                LAST_TICK = now;
-                isr_tier1b_handler();
-            }
-        }
-    }
+/// Platform stop implementation — called by HAL.
+pub fn platform_stop() {
+    hal::isr_tier_stop();
 }
 
 // ============================================================================
@@ -680,19 +491,7 @@ mod bcm2712_backend {
 
 /// Initialize ISR tier hardware (DWT cycle counter, etc).
 pub fn init() {
-    #[cfg(feature = "rp")]
-    {
-        // Enable DWT cycle counter for timing measurements
-        unsafe {
-            let demcr = 0xE000_EDFC as *mut u32;
-            let val = core::ptr::read_volatile(demcr);
-            core::ptr::write_volatile(demcr, val | (1 << 24)); // TRCENA
-
-            let dwt_ctrl = 0xE000_1000 as *mut u32;
-            let val = core::ptr::read_volatile(dwt_ctrl);
-            core::ptr::write_volatile(dwt_ctrl, val | 1); // CYCCNTENA
-        }
-    }
+    hal::isr_tier_init();
 }
 
 /// Start the Tier 1b periodic timer with the given period in microseconds.
@@ -701,48 +500,20 @@ pub fn start_tier1b(period_us: u32) {
         return;
     }
     init(); // Ensure cycle counter is enabled
-    #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-    rp2350_backend::start(period_us);
-    #[cfg(feature = "chip-rp2040")]
-    rp2040_backend::start(period_us);
-    #[cfg(feature = "chip-bcm2712")]
-    bcm2712_backend::start(period_us);
+    set_tier1b_period_us(period_us);
+    hal::isr_tier_start(period_us);
     log::info!("[isr] tier1b started period={}us", period_us);
 }
 
 /// Stop the Tier 1b periodic timer.
 pub fn stop_tier1b() {
-    #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-    rp2350_backend::stop();
-    #[cfg(feature = "chip-rp2040")]
-    rp2040_backend::stop();
-    #[cfg(feature = "chip-bcm2712")]
-    bcm2712_backend::stop();
+    hal::isr_tier_stop();
 }
 
 /// Poll Tier 1b from main loop (aarch64 only — no-op on Cortex-M).
 #[inline]
 pub fn poll_tier1b() {
-    #[cfg(feature = "chip-bcm2712")]
-    bcm2712_backend::poll_tick();
-}
-
-// ============================================================================
-// ISR Vector Entry Points (RP platforms)
-// ============================================================================
-
-/// TIMER1 alarm 1 ISR — Tier 1b on RP2350.
-#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-#[no_mangle]
-pub unsafe extern "C" fn TIMER1_IRQ_1() {
-    rp2350_backend::on_timer_irq();
-}
-
-/// TIMER alarm 2 ISR — Tier 1b on RP2040.
-#[cfg(feature = "chip-rp2040")]
-#[no_mangle]
-pub unsafe extern "C" fn TIMER_IRQ_2() {
-    rp2040_backend::on_timer_irq();
+    hal::isr_tier_poll();
 }
 
 // ============================================================================

@@ -841,6 +841,22 @@ pub mod dev_system {
     /// Returns number of pages prefaulted.
     pub const PAGED_ARENA_PREFAULT: u32 = 0x0CFA;
 
+    // --- Generic MMIO bridge (0x0CE4-0x0CE6) ---
+    // Raw memory-mapped I/O for PIC modules on aarch64 (BCM2712).
+    // On RP targets these return ENOSYS.
+
+    /// Read a 32-bit value from a physical MMIO address (aarch64 only).
+    /// handle=-1, arg=[addr:u64 LE] (8 bytes input).
+    /// On success, writes u32 LE result to arg[8..12]. Returns 0 or negative errno.
+    pub const MMIO_READ32: u32 = 0x0CE4;
+    /// Write a 32-bit value to a physical MMIO address (aarch64 only).
+    /// handle=-1, arg=[addr:u64 LE, value:u32 LE] (12 bytes input). Returns 0 or negative errno.
+    pub const MMIO_WRITE32: u32 = 0x0CE5;
+    /// Allocate physically contiguous DMA memory (aarch64 only).
+    /// handle=-1, arg=[size:u32 LE, align:u32 LE] (8 bytes input).
+    /// On success, writes phys_addr:u64 LE to arg[8..16]. Returns 0 or negative errno.
+    pub const DMA_ALLOC_CONTIG: u32 = 0x0CE6;
+
     // --- ISR Tier metrics (0x0CE8) ---
 
     /// Query ISR module metrics. handle=-1, arg=[tier:u8, slot:u8] (2 bytes input).
@@ -867,6 +883,18 @@ pub mod dev_system {
     /// Get NIC ring info (addresses, sizes). handle=ring_handle, arg=32-byte output buffer.
     /// Returns 32 on success (bytes written), or negative errno.
     pub const NIC_RING_INFO: u32 = 0x0CF4;
+
+    // --- SMMU/IOMMU (0x0CFB-0x0CFD) ---
+    // Dispatched to smmu_cfg PIC module when loaded.
+
+    /// Map DMA for an IOMMU stream.
+    /// handle=-1, arg=[stream_id:u16 LE, iova:u64 LE, phys:u64 LE, size:u64 LE] (26 bytes).
+    pub const SMMU_MAP_DMA: u32 = 0x0CFB;
+    /// Unmap DMA for an IOMMU stream.
+    /// handle=-1, arg=[stream_id:u16 LE, iova:u64 LE, size:u64 LE] (18 bytes).
+    pub const SMMU_UNMAP_DMA: u32 = 0x0CFC;
+    /// Check for SMMU faults. handle=-1, arg=unused.
+    pub const SMMU_FAULT_CHECK: u32 = 0x0CFD;
 }
 
 /// Flash sideband operation kinds

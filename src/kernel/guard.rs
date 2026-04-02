@@ -1,9 +1,8 @@
 //! KernelGuard — cross-platform critical section abstraction.
 //!
 //! Provides a drop-based RAII guard that disables interrupts on entry and
-//! restores them on drop. On single-core targets (RP2040, RP2350) this is
-//! a simple interrupt disable/enable. On aarch64 (BCM2712) it masks IRQs
-//! via DAIF.
+//! restores them on drop. Platform-specific interrupt control is delegated
+//! to the HAL function pointer table — no cfg blocks here.
 //!
 //! Usage:
 //! ```ignore
@@ -11,6 +10,8 @@
 //! // critical section — interrupts disabled
 //! // automatically restored when _guard drops
 //! ```
+
+use crate::kernel::hal;
 
 /// RAII guard that holds a critical section.
 ///
@@ -28,7 +29,7 @@ impl KernelGuard {
     /// Returns a guard whose Drop impl restores the prior interrupt state.
     #[inline(always)]
     pub fn acquire() -> Self {
-        let saved = disable_interrupts();
+        let saved = hal::disable_interrupts();
         Self { _saved: saved }
     }
 }
@@ -36,68 +37,6 @@ impl KernelGuard {
 impl Drop for KernelGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        restore_interrupts(self._saved);
-    }
-}
-
-// ============================================================================
-// Platform-specific interrupt control
-// ============================================================================
-
-/// Disable interrupts and return the prior state.
-#[cfg(feature = "rp")]
-#[inline(always)]
-fn disable_interrupts() -> u32 {
-    let primask: u32;
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, PRIMASK",
-            "cpsid i",
-            out(reg) primask,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    primask
-}
-
-/// Restore interrupt state saved by disable_interrupts.
-#[cfg(feature = "rp")]
-#[inline(always)]
-fn restore_interrupts(saved: u32) {
-    unsafe {
-        core::arch::asm!(
-            "msr PRIMASK, {}",
-            in(reg) saved,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-}
-
-/// Disable IRQs and return the prior DAIF state.
-#[cfg(feature = "chip-bcm2712")]
-#[inline(always)]
-fn disable_interrupts() -> u32 {
-    let daif: u32;
-    unsafe {
-        core::arch::asm!(
-            "mrs {0:x}, daif",
-            "msr daifset, #2",
-            out(reg) daif,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    daif
-}
-
-/// Restore DAIF state saved by disable_interrupts.
-#[cfg(feature = "chip-bcm2712")]
-#[inline(always)]
-fn restore_interrupts(saved: u32) {
-    unsafe {
-        core::arch::asm!(
-            "msr daif, {0:x}",
-            in(reg) saved,
-            options(nomem, nostack, preserves_flags),
-        );
+        hal::restore_interrupts(self._saved);
     }
 }

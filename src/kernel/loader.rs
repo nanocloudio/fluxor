@@ -6,6 +6,7 @@
 use crate::abi::SyscallTable;
 use crate::fnv1a32;
 use crate::kernel::config::read_layout;
+use crate::kernel::hal;
 use crate::modules::{Module, StepOutcome};
 
 // ============================================================================
@@ -44,12 +45,6 @@ const STATE_ARENA_SIZE: usize = super::chip::STATE_ARENA_SIZE;
 
 // MAX_PARAMS_SIZE removed — pending modules now store a pointer to the
 // static PARAM_BUFFER instead of copying, eliminating truncation.
-
-// Flash memory bounds (RP2350 XIP range)
-#[cfg(feature = "rp")]
-const FLASH_BASE: u32 = 0x10000000;
-#[cfg(feature = "rp")]
-const FLASH_END: u32 = 0x11000000;
 
 // ============================================================================
 // Error types
@@ -209,27 +204,16 @@ unsafe fn fn_ptr_from_addr<F: Copy>(addr: usize) -> F {
 /// Count of PIC calls that returned with interrupts disabled.
 static mut PIC_IRQ_DISABLED_COUNT: u32 = 0;
 
+/// Increment the IRQ-disabled counter (called by HAL pic_barrier).
+pub fn increment_irq_disabled_count() {
+    unsafe { PIC_IRQ_DISABLED_COUNT += 1; }
+}
+
 /// Flush pipeline, synchronize, and restore interrupts after PIC call.
+/// Delegates to the platform HAL for architecture-specific barrier sequences.
 #[inline(always)]
 fn pic_barrier() {
-    #[cfg(feature = "rp")]
-    {
-        cortex_m::asm::dsb();
-        cortex_m::asm::isb();
-        // Check if PIC code accidentally disabled interrupts
-        let primask = cortex_m::register::primask::read();
-        if !primask.is_active() {
-            unsafe {
-                PIC_IRQ_DISABLED_COUNT += 1;
-                cortex_m::interrupt::enable();
-            }
-        }
-    }
-    #[cfg(feature = "chip-bcm2712")]
-    {
-        // aarch64: DSB + ISB for pipeline sync after PIC call
-        unsafe { core::arch::asm!("dsb sy", "isb") };
-    }
+    hal::pic_barrier();
 }
 
 /// Call module_state_size export.
@@ -526,8 +510,7 @@ impl LoadedModule {
             if entry.hash == hash {
                 let offset = entry.offset & !1;
                 let fn_addr = (code_base as usize).wrapping_add(offset as usize);
-                #[cfg(feature = "rp")]
-                let fn_addr = fn_addr | 1; // Set Thumb bit for Cortex-M
+                let fn_addr = hal::apply_code_bit(fn_addr);
                 return Ok(fn_addr);
             }
         }
@@ -735,49 +718,20 @@ impl<'a> Iterator for ModuleIter<'a> {
 /// - 2-byte aligned for Thumb-2
 /// - Within flash memory range
 fn validate_fn_addr(addr: usize, name: &str) -> Result<(), LoaderError> {
-    #[cfg(feature = "rp")]
-    {
-        // Check Thumb bit (bit 0 must be set for Thumb code)
-        if addr & 1 == 0 {
-            log::error!("[loader] {}: missing thumb bit addr=0x{:08x}", name, addr);
-            return Err(LoaderError::InvalidFnPtr);
-        }
-        // Check if within flash range
-        let instr_addr = addr & !1;
-        if instr_addr < FLASH_BASE as usize || instr_addr >= FLASH_END as usize {
-            log::error!("[loader] {}: outside flash addr=0x{:08x}", name, addr);
-            return Err(LoaderError::InvalidFnPtr);
-        }
+    if !hal::validate_fn_addr(addr) {
+        log::error!("[loader] {}: invalid fn addr=0x{:08x}", name, addr);
+        return Err(LoaderError::InvalidFnPtr);
     }
-    #[cfg(feature = "chip-bcm2712")]
-    {
-        // aarch64: non-null check only (PIC code may not be 4-byte aligned)
-        if addr == 0 {
-            log::error!("[loader] {}: null addr", name);
-            return Err(LoaderError::InvalidFnPtr);
-        }
-    }
-    let _ = name; // suppress unused warning
+    let _ = name;
     Ok(())
 }
 
 /// Validate a loaded module's base address and header.
 pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderError> {
     // Check base is in valid memory range
-    #[cfg(feature = "rp")]
-    {
-        let base = module.base as u32;
-        if base < FLASH_BASE || base >= FLASH_END {
-            log::error!("[loader] {}: base outside flash addr=0x{:08x}", name, base);
-            return Err(LoaderError::InvalidModuleBase);
-        }
-    }
-    #[cfg(feature = "chip-bcm2712")]
-    {
-        if module.base.is_null() {
-            log::error!("[loader] {}: null base", name);
-            return Err(LoaderError::InvalidModuleBase);
-        }
+    if !hal::validate_module_base(module.base as usize) {
+        log::error!("[loader] {}: invalid base addr=0x{:08x}", name, module.base as usize);
+        return Err(LoaderError::InvalidModuleBase);
     }
 
     // Check ABI version
@@ -799,11 +753,11 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
     }
 
     // Check code base is still in valid memory
-    #[cfg(feature = "rp")]
     {
-        let code_base = module.code_base() as u32;
-        let code_end = code_base + module.header.code_size;
-        if code_end > FLASH_END {
+        let code_base = module.code_base() as usize;
+        let code_end = code_base + module.header.code_size as usize;
+        let flash_end = hal::flash_end();
+        if flash_end > 0 && code_end > flash_end {
             log::error!("[loader] {}: code past flash end=0x{:08x}", name, code_end);
             return Err(LoaderError::CodeOutOfBounds);
         }
@@ -812,9 +766,6 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
     // Verify integrity hash from manifest section (ABI v2)
     let manifest_size = module.header.manifest_size() as usize;
     if manifest_size >= 48 {
-        // Verify manifest integrity (SHA-256) — RP only (too slow in QEMU)
-        #[cfg(feature = "rp")]
-        {
         let code_size = module.header.code_size as usize;
         let data_size = module.header.data_size as usize;
         let export_size = module.header.export_count as usize * 8;
@@ -846,20 +797,13 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     }
                     let computed = hasher.finalize();
 
-                    if computed.as_slice() != stored_hash {
-                        // Skip integrity failure for embedded blob modules
-                        #[cfg(feature = "chip-bcm2712")]
-                        { log::warn!("[loader] {}: integrity skip (blob)", name); }
-                        #[cfg(feature = "rp")]
-                        {
-                            log::error!("[loader] {}: integrity mismatch", name);
-                            return Err(LoaderError::IntegrityMismatch);
-                        }
+                    if !hal::verify_integrity(computed.as_slice(), stored_hash) {
+                        log::error!("[loader] {}: integrity mismatch", name);
+                        return Err(LoaderError::IntegrityMismatch);
                     }
                 }
             }
         }
-        } // #[cfg(feature = "rp")]
     } // if manifest_size >= 48
 
     Ok(())
@@ -872,17 +816,11 @@ fn validate_fn_in_code(
     code_size: u32,
     _name: &str,
 ) -> Result<(), LoaderError> {
-    #[cfg(feature = "rp")]
-    {
-        let fn_addr = addr & !1;
-        let code_end = code_base.wrapping_add(code_size as usize);
-        if fn_addr < code_base || fn_addr >= code_end {
-            log::error!("[loader] {}: outside code", _name);
-            return Err(LoaderError::InvalidFnPtr);
-        }
+    if !hal::validate_fn_in_code(addr, code_base, code_size) {
+        log::error!("[loader] {}: outside code", _name);
+        return Err(LoaderError::InvalidFnPtr);
     }
-    // On aarch64, skip code range check — PIC code is in embedded blob
-    let _ = (addr, code_base, code_size);
+    let _ = (_name,);
     Ok(())
 }
 

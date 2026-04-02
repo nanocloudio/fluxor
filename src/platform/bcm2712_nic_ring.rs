@@ -198,6 +198,36 @@ fn dma_arena_phys(offset: usize) -> u64 {
     dma_arena_ptr(offset) as u64
 }
 
+/// Allocate physically contiguous memory from the DMA arena.
+/// Returns the physical address, or 0 on failure.
+/// `align` must be a power of 2 (minimum 16).
+#[cfg(feature = "chip-bcm2712")]
+pub fn dma_alloc_contig(size: usize, align: usize) -> usize {
+    let a = if align < 16 { 16 } else { align };
+    // Round current offset up to alignment
+    let cur = DMA_ARENA_OFFSET.load(Ordering::Relaxed) as usize;
+    let aligned_start = (cur + a - 1) & !(a - 1);
+    let aligned_size = (size + 15) & !15;
+    let new_end = aligned_start + aligned_size;
+    if new_end > DMA_ARENA_SIZE {
+        return 0;
+    }
+    // Try to claim this range
+    let prev = DMA_ARENA_OFFSET.compare_exchange(
+        cur as u32, new_end as u32,
+        Ordering::AcqRel, Ordering::Relaxed
+    );
+    match prev {
+        Ok(_) => dma_arena_ptr(aligned_start) as usize,
+        Err(_) => 0, // concurrent allocation, caller retries
+    }
+}
+
+#[cfg(not(feature = "chip-bcm2712"))]
+pub fn dma_alloc_contig(_size: usize, _align: usize) -> usize {
+    0
+}
+
 // ============================================================================
 // Ring create / destroy / info
 // ============================================================================

@@ -7,8 +7,8 @@
 //! # Architecture
 //!
 //! Portable kernel code lives in this file. Platform-specific hardware drivers
-//! (SPI, I2C, UART, ADC, DMA, PIO, PWM, GPIO hardware ops) are in
-//! `src/platform/rp_providers.rs`, included at the bottom under `#[cfg(feature = "rp")]`.
+//! (SPI, I2C, UART, ADC, DMA, PIO, PWM, GPIO hardware ops) are registered
+//! via the HAL `init_providers()` callback at boot time.
 //!
 //! # Return Value Convention
 //!
@@ -27,30 +27,20 @@
 //! - `E_NOSYS` (-38): Function not implemented
 
 use core::ptr::null_mut;
-#[cfg(feature = "rp")]
-use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering, compiler_fence};
 
 use crate::kernel::channel;
 use crate::kernel::errno;
+use crate::kernel::hal;
 use crate::kernel::net;
 use crate::kernel::socket;
-#[cfg(feature = "rp")]
-use crate::io::gpio;
 use crate::abi::{DeviceInfo, SyscallTable, ABI_VERSION};
-#[cfg(feature = "rp")]
-use crate::abi::SpiCaps;
-
 // ============================================================================
 // Error Codes (Linux errno values)
 // ============================================================================
 
 const E_INVAL: i32 = errno::EINVAL;
 const E_NOSYS: i32 = errno::ENOSYS;
-#[cfg(feature = "rp")]
-const E_AGAIN: i32 = errno::EAGAIN;
-#[cfg(feature = "rp")]
-const E_BUSY: i32 = errno::EBUSY;
-#[cfg(feature = "rp")]
+#[allow(dead_code)]
 const E_NOMEM: i32 = errno::ENOMEM;
 
 // ============================================================================
@@ -140,40 +130,28 @@ pub fn channel_close(handle: i32) {
 // SPI/I2C Initialization Status
 // ============================================================================
 
-#[cfg(feature = "rp")]
 use crate::kernel::config::HardwareContext;
 
 // Hardware context - tracks which resources have been initialized
-#[cfg(feature = "rp")]
 static mut HARDWARE_CONTEXT: HardwareContext = HardwareContext::new();
 
-#[cfg(feature = "rp")]
 pub fn mark_spi_initialized(bus: u8) {
     unsafe { (*(&raw mut HARDWARE_CONTEXT)).mark_spi_initialized(bus) }
 }
 
 /// Check if an SPI bus has been initialized
-#[cfg(feature = "rp")]
 pub fn is_spi_initialized(bus: u8) -> bool {
     unsafe { (*(&raw const HARDWARE_CONTEXT)).is_spi_initialized(bus) }
 }
 
-#[cfg(not(feature = "rp"))]
-pub fn is_spi_initialized(_bus: u8) -> bool { false }
-
-#[cfg(feature = "rp")]
 pub fn mark_i2c_initialized(bus: u8) {
     unsafe { (*(&raw mut HARDWARE_CONTEXT)).mark_i2c_initialized(bus) }
 }
 
 /// Check if an I2C bus has been initialized
-#[cfg(feature = "rp")]
 pub fn is_i2c_initialized(bus: u8) -> bool {
     unsafe { (*(&raw const HARDWARE_CONTEXT)).is_i2c_initialized(bus) }
 }
-
-#[cfg(not(feature = "rp"))]
-pub fn is_i2c_initialized(_bus: u8) -> bool { false }
 
 // ============================================================================
 // Provider Registration
@@ -192,9 +170,8 @@ pub fn init_providers() {
     provider::register(dev_class::SYSTEM, system_provider_dispatch);
     provider::register(dev_class::FS, fs_provider_dispatch);
     provider::register(dev_class::BUFFER, buffer_provider_dispatch);
-    // RP-specific providers (SPI, I2C, GPIO, PIO, UART, ADC) registered in rp_providers
-    #[cfg(feature = "rp")]
-    init_rp_providers();
+    // Platform-specific providers (GPIO, PIO, etc.) registered via HAL
+    hal::init_providers();
 }
 
 // ============================================================================
@@ -569,8 +546,7 @@ unsafe fn event_provider_dispatch(handle: i32, opcode: u32, _arg: *mut u8, _arg_
 /// Extension point for platform-specific system opcodes (PWM, PIO, DMA, SPI9, etc.)
 static mut SYSTEM_EXTENSION: Option<unsafe fn(i32, u32, *mut u8, usize) -> i32> = None;
 
-#[cfg(feature = "rp")]
-fn register_system_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
+pub fn register_system_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
     unsafe { SYSTEM_EXTENSION = Some(f); }
 }
 
@@ -578,8 +554,7 @@ fn register_system_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
 #[allow(dead_code)]
 static mut DEV_QUERY_EXTENSION: Option<unsafe fn(i32, u32, *mut u8, usize) -> i32> = None;
 
-#[allow(dead_code)]
-fn register_dev_query_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
+pub fn register_dev_query_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
     unsafe { DEV_QUERY_EXTENSION = Some(f); }
 }
 
@@ -587,36 +562,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     use crate::abi::{dev_system, RegisterProviderArgs};
     use crate::kernel::{provider, scheduler};
     match opcode {
-        #[cfg(feature = "rp")]
-        dev_system::RESOURCE_TRY_LOCK => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            crate::kernel::resource::try_lock(*arg)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::RESOURCE_UNLOCK => crate::kernel::resource::unlock(handle),
-        #[cfg(feature = "rp")]
-        dev_system::FLASH_SIDEBAND => {
-            use crate::abi::flash_sideband_op;
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            match *arg {
-                flash_sideband_op::READ_CS => crate::kernel::resource::flash_sideband_read_cs(),
-                flash_sideband_op::XIP_READ => {
-                    if arg_len < 6 { return E_INVAL; }
-                    let offset = u32::from_le_bytes([
-                        *arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4),
-                    ]);
-                    const FLASH_SIZE: u32 = 0x0040_0000;
-                    let data_len = arg_len - 5;
-                    if offset >= FLASH_SIZE { return E_INVAL; }
-                    let avail = (FLASH_SIZE - offset) as usize;
-                    let copy_len = if data_len < avail { data_len } else { avail };
-                    let xip_src = (0x1000_0000u32 + offset) as *const u8;
-                    core::ptr::copy_nonoverlapping(xip_src, arg.add(5), copy_len);
-                    copy_len as i32
-                }
-                _ => E_NOSYS,
-            }
-        }
         dev_system::REGISTER_PROVIDER => {
             if arg.is_null() || arg_len < core::mem::size_of::<RegisterProviderArgs>() {
                 return E_INVAL;
@@ -654,66 +599,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             let class = *arg;
             provider::unregister_module_provider(class)
         }
-        // ── Runtime parameter store (shims → flash module dispatch, RP-only) ─
-        #[cfg(feature = "rp")]
-        dev_system::PARAM_STORE => {
-            // Shim: prepend caller module_id, forward to flash module
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            let module_id = scheduler::current_module_index() as u8;
-            let mut fwd = [0u8; 252]; // module_id + tag + 250 max value
-            fwd[0] = module_id;
-            let n = if arg_len > 251 { 251 } else { arg_len };
-            core::ptr::copy_nonoverlapping(arg, fwd.as_mut_ptr().add(1), n);
-            crate::kernel::flash_store::dispatch_param_op(
-                dev_system::PARAM_STORE, fwd.as_mut_ptr(), 1 + n)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::PARAM_DELETE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            let module_id = scheduler::current_module_index() as u8;
-            let mut fwd = [module_id, *arg];
-            crate::kernel::flash_store::dispatch_param_op(
-                dev_system::PARAM_DELETE, fwd.as_mut_ptr(), 2)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::PARAM_CLEAR_ALL => {
-            if arg_len >= 1 && !arg.is_null() && *arg == 0xFF {
-                let mut fwd = [0xFFu8];
-                crate::kernel::flash_store::dispatch_param_op(
-                    dev_system::PARAM_CLEAR_ALL, fwd.as_mut_ptr(), 1)
-            } else {
-                let module_id = scheduler::current_module_index() as u8;
-                let mut fwd = [module_id];
-                crate::kernel::flash_store::dispatch_param_op(
-                    dev_system::PARAM_CLEAR_ALL, fwd.as_mut_ptr(), 1)
-            }
-        }
-        // ── Flash store bridge (RP-only) ─────────────────────────────
-        #[cfg(feature = "rp")]
-        dev_system::FLASH_STORE_ENABLE => {
-            // Register flash module dispatch: arg = [fn_addr:u32 LE]
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
-            let fn_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let dispatch: crate::kernel::flash_store::FlashStoreDispatchFn =
-                core::mem::transmute(fn_addr as usize);
-            let module_idx = scheduler::current_module_index();
-            let state = scheduler::get_module_state(module_idx);
-            crate::kernel::flash_store::register_dispatch(dispatch, state)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::FLASH_RAW_ERASE => {
-            // Erase runtime store sector: arg = [offset:u32 LE]
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
-            let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            crate::kernel::flash_store::raw_erase(offset)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::FLASH_RAW_PROGRAM => {
-            // Program page: arg = [offset:u32 LE, data:256 bytes]
-            if arg.is_null() || arg_len < 4 + 256 { return E_INVAL; }
-            let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            crate::kernel::flash_store::raw_program(offset, arg.add(4))
-        }
         dev_system::ARENA_GET => {
             // Return module's arena pointer via arg buffer, size as return value
             let mut size_out: u32 = 0;
@@ -741,42 +626,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         dev_system::FD_POLL => {
             let events = if !arg.is_null() && arg_len >= 1 { *arg } else { 0xFF };
             crate::kernel::fd::fd_poll(handle, events)
-        }
-        // ── DMA FD (RP-only: fd-wrapped DMA channels) ──
-        #[cfg(feature = "rp")]
-        dev_system::DMA_FD_CREATE => {
-            crate::kernel::fd::dma_fd_create()
-        }
-        #[cfg(feature = "rp")]
-        dev_system::DMA_FD_START => {
-            // handle=dma_fd, arg=[read_addr:u32, write_addr:u32, count:u32, dreq:u8, flags:u8] (14 bytes)
-            if arg.is_null() || arg_len < 14 { return E_INVAL; }
-            let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let write_addr = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            let dreq = *arg.add(12);
-            let flags = *arg.add(13);
-            crate::kernel::fd::dma_fd_start(handle, read_addr, write_addr, count, dreq, flags)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::DMA_FD_RESTART => {
-            // handle=dma_fd, arg=[read_addr:u32, count:u32] (8 bytes)
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
-            let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            crate::kernel::fd::dma_fd_restart(handle, read_addr, count)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::DMA_FD_FREE => {
-            crate::kernel::fd::dma_fd_free(handle)
-        }
-        #[cfg(feature = "rp")]
-        dev_system::DMA_FD_QUEUE => {
-            // handle=dma_fd, arg=[read_addr:u32, count:u32] (8 bytes)
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
-            let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            crate::kernel::fd::dma_fd_queue(handle, read_addr, count)
         }
         // ── Bridge channel operations ──
         dev_system::BRIDGE_WRITE | dev_system::BRIDGE_READ |
@@ -826,27 +675,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         dev_system::ISR_METRICS => {
             crate::kernel::isr_tier::isr_metrics_dispatch(arg, arg_len)
         }
-        // ── NIC kernel-bypass (BCM2712 only) ──
-        #[cfg(feature = "chip-bcm2712")]
-        dev_system::NIC_BAR_MAP => {
-            crate::kernel::pcie::syscall_bar_map(arg, arg_len)
-        }
-        #[cfg(feature = "chip-bcm2712")]
-        dev_system::NIC_BAR_UNMAP => {
-            crate::kernel::pcie::syscall_bar_unmap(arg, arg_len)
-        }
-        #[cfg(feature = "chip-bcm2712")]
-        dev_system::NIC_RING_CREATE => {
-            crate::kernel::nic_ring::syscall_ring_create(arg, arg_len)
-        }
-        #[cfg(feature = "chip-bcm2712")]
-        dev_system::NIC_RING_DESTROY => {
-            crate::kernel::nic_ring::syscall_ring_destroy(arg, arg_len)
-        }
-        #[cfg(feature = "chip-bcm2712")]
-        dev_system::NIC_RING_INFO => {
-            crate::kernel::nic_ring::syscall_ring_info(handle, arg, arg_len)
-        }
         _ => {
             // Delegate to platform extension for hardware-specific opcodes
             if let Some(ext) = SYSTEM_EXTENSION {
@@ -862,135 +690,19 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // Timer (millis / micros) — delegates to platform
 // ============================================================================
 
-#[cfg(feature = "rp")]
 pub unsafe extern "C" fn syscall_millis() -> u64 {
-    embassy_time::Instant::now().as_millis()
+    hal::now_millis()
 }
 
-#[cfg(feature = "rp")]
 pub unsafe extern "C" fn syscall_micros() -> u64 {
-    embassy_time::Instant::now().as_micros()
+    hal::now_micros()
 }
 
-#[cfg(not(feature = "rp"))]
-pub unsafe extern "C" fn syscall_millis() -> u64 { 0 }
-
-#[cfg(not(feature = "rp"))]
-pub unsafe extern "C" fn syscall_micros() -> u64 { 0 }
-
-// ============================================================================
-// DMA channel allocation and bridge
-// ============================================================================
-
-/// Bitmap of allocated DMA channels. CH0-CH7 pre-marked at boot.
-#[cfg(feature = "rp")]
-static DMA_CHANNELS_USED: AtomicU16 = AtomicU16::new(0x00FF); // CH0-CH7 reserved
-
-#[cfg(feature = "rp")]
-pub(crate) fn dma_alloc_channel() -> i32 {
-    loop {
-        let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
-        let free_mask = !used & 0xFF00;
-        if free_mask == 0 {
-            return E_NOMEM;
-        }
-        let ch = free_mask.trailing_zeros() as u16;
-        let bit = 1u16 << ch;
-        if DMA_CHANNELS_USED.compare_exchange(
-            used, used | bit,
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-        ).is_ok() {
-            return ch as i32;
-        }
-    }
-}
-
-#[cfg(feature = "rp")]
-pub(crate) fn dma_free_channel(ch: u8) -> i32 {
-    if ch < 8 || ch > 15 { return E_INVAL; }
-    let bit = 1u16 << ch;
-    DMA_CHANNELS_USED.fetch_and(!bit, core::sync::atomic::Ordering::Release);
-    0
-}
-
-#[cfg(feature = "rp")]
-pub(crate) unsafe fn dma_start_raw(ch: u8, read_addr: u32, write_addr: u32, count: u32, dreq: u8, flags: u8) -> i32 {
-    if ch > 15 { return E_INVAL; }
-    // Verify channel is allocated
-    let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
-    if used & (1u16 << ch) == 0 { return E_INVAL; }
-
-    use embassy_rp::pac;
-
-    let dma_ch = pac::DMA.ch(ch as usize);
-    dma_ch.read_addr().write_value(read_addr);
-    dma_ch.write_addr().write_value(write_addr);
-    super::chip::dma_write_trans_count(&dma_ch, count);
-    compiler_fence(Ordering::SeqCst);
-
-    let incr_read = flags & 0x01 != 0;
-    let incr_write = flags & 0x02 != 0;
-    let data_size = if flags & 0x04 != 0 {
-        pac::dma::vals::DataSize::SIZE_WORD  // 32-bit
-    } else {
-        pac::dma::vals::DataSize::SIZE_HALFWORD  // 16-bit
-    };
-
-    dma_ch.ctrl_trig().write(|w| {
-        w.set_treq_sel(pac::dma::vals::TreqSel::from(dreq));
-        w.set_data_size(data_size);
-        w.set_incr_read(incr_read);
-        w.set_incr_write(incr_write);
-        w.set_chain_to(ch); // self-chain = no chain
-        w.set_en(true);
-    });
-    compiler_fence(Ordering::SeqCst);
-    0
-}
-
-
-#[cfg(feature = "rp")]
-fn dma_busy(ch: u8) -> i32 {
-    if ch > 15 { return E_INVAL; }
-    use embassy_rp::pac;
-    if pac::DMA.ch(ch as usize).ctrl_trig().read().busy() { 1 } else { 0 }
-}
-
-
-#[cfg(feature = "rp")]
-pub(crate) fn dma_abort(ch: u8) -> i32 {
-    if ch > 15 { return E_INVAL; }
-    use embassy_rp::pac;
-    // Write 1 to CHAN_ABORT bit to abort the channel
-    pac::DMA.chan_abort().write(|w| w.0 = 1u32 << ch);
-    // Wait for abort to complete
-    while pac::DMA.ch(ch as usize).ctrl_trig().read().busy() {}
-    0
-}
-
-
-/// Fast DMA re-trigger via Alias 3 registers.
-/// Writes AL3_TRANS_COUNT (no trigger) then AL3_READ_ADDR_TRIG (triggers start).
-/// Preserves CTRL, WRITE_ADDR from the initial dma_start_raw configuration.
-#[cfg(feature = "rp")]
-pub(crate) unsafe fn dma_restart_raw(ch: u8, read_addr: u32, count: u32) -> i32 {
-    if ch > 15 { return E_INVAL; }
-    use embassy_rp::pac;
-    let dma_ch = pac::DMA.ch(ch as usize);
-    compiler_fence(Ordering::SeqCst);
-    dma_ch.al3_trans_count().write_value(count);
-    dma_ch.al3_read_addr_trig().write_value(read_addr);
-    compiler_fence(Ordering::SeqCst);
-    0
-}
+// DMA channel allocation and bridge — platform-specific, moved to rp_providers.rs
 
 // ============================================================================
 // Device Query
 // ============================================================================
-
-#[cfg(feature = "rp")]
-use crate::abi::StreamTime;
 
 /// Query device information by key.
 ///
@@ -1032,7 +744,6 @@ unsafe extern "C" fn syscall_dev_query(
                     fd::FD_TAG_SOCKET => dev_class::SOCKET,
                     fd::FD_TAG_EVENT => dev_class::EVENT,
                     fd::FD_TAG_TIMER => dev_class::TIMER,
-                    fd::FD_TAG_PIO_STREAM | fd::FD_TAG_PIO_CMD => dev_class::PIO,
                     _ => return E_INVAL,
                 };
                 *out = class;
@@ -1081,19 +792,6 @@ unsafe extern "C" fn syscall_dev_query(
 
     let class = ((key >> 8) & 0xFF) as u8;
     match class {
-        #[cfg(feature = "rp")]
-        dev_class::GPIO => {
-            use crate::abi::dev_gpio;
-            match key {
-                dev_gpio::GET_LEVEL => {
-                    if !gpio::gpio_check_owner(handle) {
-                        return E_INVAL;
-                    }
-                    gpio::gpio_get_level(handle)
-                }
-                _ => E_NOSYS,
-            }
-        }
         dev_class::SPI => {
             use crate::abi::dev_spi;
             match key {
@@ -1118,35 +816,7 @@ unsafe extern "C" fn syscall_dev_query(
                 _ => E_NOSYS,
             }
         }
-        #[cfg(feature = "rp")]
-        dev_class::PIO => {
-            use crate::abi::dev_pio;
-            use crate::io::pio;
-            match key {
-                dev_pio::STREAM_GET_BUFFER => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
-                    let ptr = pio::syscall_pio_stream_get_buffer(handle);
-                    *(out as *mut *mut u32) = ptr;
-                    0
-                }
-                dev_pio::STREAM_TIME => {
-                    if out.is_null() || out_len < core::mem::size_of::<StreamTime>() { return E_INVAL; }
-                    pio::syscall_stream_time(handle, out as *mut StreamTime)
-                }
-                dev_pio::PROGRAM_STATUS => {
-                    // Check FD tag to determine stream vs cmd
-                    let (tag, slot) = crate::kernel::fd::untag_fd(handle);
-                    match tag {
-                        crate::kernel::fd::FD_TAG_PIO_STREAM =>
-                            pio::PioStreamService::program_status_for(slot),
-                        crate::kernel::fd::FD_TAG_PIO_CMD =>
-                            pio::PioCmdService::program_status_for(slot),
-                        _ => E_INVAL,
-                    }
-                }
-                _ => E_NOSYS,
-            }
-        }
+        // PIO dev_query removed — PIC pio_stream module handles PIO directly
         dev_class::NETIF => {
             use crate::abi::dev_netif;
             match key {
@@ -1166,19 +836,7 @@ unsafe extern "C" fn syscall_dev_query(
                     *(out as *mut u32) = ABI_VERSION;
                     0
                 }
-                #[cfg(feature = "rp")]
-                dev_system::STREAM_TIME => {
-                    use crate::io::pio;
-                    // Stream time from first active PIO stream (no handle needed)
-                    if out.is_null() || out_len < core::mem::size_of::<StreamTime>() { return E_INVAL; }
-                    match pio::PioStreamService::stream_time_any() {
-                        Some(time) => {
-                            *(out as *mut StreamTime) = time;
-                            0
-                        }
-                        None => E_NOSYS, // no active stream
-                    }
-                }
+                // STREAM_TIME removed — PIC pio_stream module handles stream time
                 dev_system::ARENA_USAGE => {
                     if out.is_null() || out_len < 4 { return E_INVAL; }
                     let (used, total) = crate::kernel::loader::arena_usage();
@@ -1196,16 +854,24 @@ unsafe extern "C" fn syscall_dev_query(
                     *(out as *mut u32) = scheduler::downstream_latency(idx);
                     0
                 }
-                #[cfg(feature = "rp")]
-                dev_system::SYS_CLOCK_HZ => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
-                    *(out as *mut u32) = embassy_rp::clocks::clk_sys_freq();
-                    0
+                _ => {
+                    // Delegate to platform extension for dev_query
+                    if let Some(ext) = DEV_QUERY_EXTENSION {
+                        ext(handle, key, out, out_len)
+                    } else {
+                        E_NOSYS
+                    }
                 }
-                _ => E_NOSYS,
             }
         }
-        _ => E_NOSYS,
+        _ => {
+            // Delegate to platform extension for dev_query
+            if let Some(ext) = unsafe { DEV_QUERY_EXTENSION } {
+                unsafe { ext(handle, key, out, out_len) }
+            } else {
+                E_NOSYS
+            }
+        }
     }
 }
 
@@ -1236,16 +902,12 @@ impl SyscallTable {
 /// Release all hardware handles owned by a module.
 /// Called when a module finishes (done or error) to prevent resource leaks.
 pub fn release_module_handles(module_idx: u8) {
-    // Release RP-specific handles (SPI, I2C, UART, ADC, PIO, GPIO)
-    #[cfg(feature = "rp")]
-    release_rp_handles(module_idx);
+    // Release platform-specific handles (GPIO, DMA FDs, etc.)
+    hal::release_platform_handles(module_idx);
     // Release events
     crate::kernel::event::release_owned_by(module_idx);
     // Release fd-based timers
     crate::kernel::fd::release_timers_owned_by(module_idx);
-    // Release DMA FDs (RP-only)
-    #[cfg(feature = "rp")]
-    crate::kernel::fd::release_dma_fds_owned_by(module_idx);
     // Release module provider registrations
     crate::kernel::provider::release_module_providers(module_idx);
 }
@@ -1281,9 +943,5 @@ unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u
     crate::kernel::heap::heap_realloc(idx, ptr, new_size as usize)
 }
 
-// ============================================================================
-// RP Platform Providers (hardware drivers)
-// ============================================================================
-
-#[cfg(feature = "rp")]
-include!("../platform/rp_providers.rs");
+// RP platform providers are now registered via HAL (init_providers / release_module_handles).
+// The rp_providers.rs file is included from the rp_hal module instead.

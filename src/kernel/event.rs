@@ -4,7 +4,7 @@
 //! single-bit flag that can be signaled (from any context, including ISR)
 //! and polled (non-blocking, clears on read).
 //!
-//! Device-specific bindings (e.g. GPIO edge → event) are handled by the
+//! Device-specific bindings (e.g. GPIO edge -> event) are handled by the
 //! respective device providers, not here. Providers call `event_signal()`
 //! when their hardware condition fires.
 //!
@@ -13,12 +13,8 @@
 
 use portable_atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
-#[cfg(feature = "rp")]
-use embassy_sync::signal::Signal;
-#[cfg(feature = "rp")]
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-
 use crate::kernel::errno;
+use crate::kernel::hal;
 
 /// Maximum concurrent events across all modules.
 pub const MAX_EVENTS: usize = 32;
@@ -56,12 +52,6 @@ static EVENT_SLOTS: [EventSlot; MAX_EVENTS] = [const { EventSlot::new() }; MAX_E
 /// Set when any owned event is signaled.
 /// Scheduler reads + clears atomically via swap(0).
 static EVENT_WAKE_PENDING: AtomicU16 = AtomicU16::new(0);
-
-/// Signal to break the scheduler out of its idle wait.
-/// RP: Embassy Signal (ISR-safe via CriticalSectionRawMutex).
-/// BCM2712: uses SEV instruction instead (no static needed).
-#[cfg(feature = "rp")]
-pub static SCHEDULER_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 // ============================================================================
 // Ownership validation
@@ -124,10 +114,7 @@ pub fn event_signal(handle: i32) -> i32 {
     if (owner as usize) < crate::kernel::config::MAX_MODULES {
         EVENT_WAKE_PENDING.fetch_or(1u16 << owner, Ordering::Release);
     }
-    #[cfg(feature = "rp")]
-    SCHEDULER_WAKE.signal(());
-    #[cfg(feature = "chip-bcm2712")]
-    unsafe { core::arch::asm!("sev") }; // Wake scheduler WFE
+    hal::wake_scheduler();
     0
 }
 
@@ -146,10 +133,7 @@ pub fn event_signal_from_isr(handle: i32) {
     if (owner as usize) < crate::kernel::config::MAX_MODULES {
         EVENT_WAKE_PENDING.fetch_or(1u16 << owner, Ordering::Release);
     }
-    #[cfg(feature = "rp")]
-    SCHEDULER_WAKE.signal(());
-    #[cfg(feature = "chip-bcm2712")]
-    unsafe { core::arch::asm!("sev") };
+    hal::wake_scheduler();
 }
 
 /// Poll an event (non-blocking). Clears the signaled flag atomically.

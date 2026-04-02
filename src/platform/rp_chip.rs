@@ -1,29 +1,14 @@
-//! Chip abstraction layer.
+//! Chip abstraction layer — RP targets.
 //!
 //! Constants are generated from silicon TOML `[kernel]` sections by build.rs.
 //! Helper functions centralize the remaining PAC API differences.
 
-// Generated constants from silicon TOML (RP targets only — BCM2712 skips this).
-#[cfg(feature = "rp")]
+// Generated constants from silicon TOML (RP targets only).
 include!(concat!(env!("OUT_DIR"), "/chip_generated.rs"));
 
-// BCM2712: provide equivalent constants directly (no chip_generated.rs).
-#[cfg(feature = "chip-bcm2712")]
-pub const STATE_ARENA_SIZE: usize = 256 * 1024;
-#[cfg(feature = "chip-bcm2712")]
-pub const BUFFER_ARENA_SIZE: usize = 32 * 1024;
-#[cfg(feature = "chip-bcm2712")]
-pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
-
-// ============================================================================
-// RP-specific PAC helpers (not compiled for aarch64)
-// ============================================================================
-
-#[cfg(feature = "rp")]
 use embassy_rp::pac;
 
 /// Write DMA transfer count. RP2350 has MODE+COUNT fields; RP2040 is plain u32.
-#[cfg(feature = "rp")]
 #[inline(always)]
 pub fn dma_write_trans_count(ch: &pac::dma::Channel, count: u32) {
     #[cfg(not(feature = "chip-rp2040"))]
@@ -36,7 +21,7 @@ pub fn dma_write_trans_count(ch: &pac::dma::Channel, count: u32) {
 }
 
 /// Clear pad ISO on RP2350. No-op on RP2040 (field doesn't exist).
-#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
+#[cfg(not(feature = "chip-rp2040"))]
 macro_rules! pad_set_iso_false {
     ($w:expr) => { $w.set_iso(false) };
 }
@@ -46,11 +31,9 @@ macro_rules! pad_set_iso_false {
     ($w:expr) => { };
 }
 
-#[cfg(feature = "rp")]
 pub(crate) use pad_set_iso_false;
 
 /// Get hardware timer. RP2350: TIMER0, RP2040: TIMER.
-#[cfg(feature = "rp")]
 #[inline(always)]
 pub fn timer() -> pac::timer::Timer {
     #[cfg(not(feature = "chip-rp2040"))]
@@ -60,7 +43,6 @@ pub fn timer() -> pac::timer::Timer {
 }
 
 /// Get PAC PIO instance by index.
-#[cfg(feature = "rp")]
 #[inline(always)]
 pub fn pio_pac(idx: u8) -> pac::pio::Pio {
     match idx {
@@ -74,7 +56,6 @@ pub fn pio_pac(idx: u8) -> pac::pio::Pio {
 }
 
 /// Whether PIO GPIOBASE register is available.
-#[cfg(feature = "rp")]
 #[inline(always)]
 pub const fn has_pio_gpiobase() -> bool {
     !IS_RP2040

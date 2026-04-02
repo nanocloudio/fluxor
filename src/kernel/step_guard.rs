@@ -9,11 +9,10 @@
 //!
 //! ## Platform backends
 //!
-//! - **RP2350**: TIMER1 alarm 0 (Embassy uses TIMER0). One-shot deadline.
-//! - **RP2040**: TIMER alarm 3 (Embassy uses alarms 0-2). One-shot deadline.
-//! - **BCM2712/aarch64**: Software check — no hardware timer manipulation.
-//!   The main loop is single-threaded; modules that hang are caught by a
-//!   simple elapsed-time check after each step returns (or by watchdog).
+//! Platform-specific timer setup (RP2350 TIMER1, RP2040 TIMER alarm3,
+//! BCM2712 advisory elapsed-time check) is implemented in the HAL layer.
+//! The `platform_init/arm/disarm` entry points are called by the HAL
+//! implementations and by the ISR vectors in the platform files.
 //!
 //! ## Fault trampoline
 //!
@@ -24,6 +23,7 @@
 //! return).
 
 use portable_atomic::{AtomicBool, AtomicU8, Ordering};
+use crate::kernel::hal;
 
 // ============================================================================
 // Fault state machine
@@ -222,209 +222,27 @@ pub fn is_timed_out() -> bool {
 }
 
 // ============================================================================
-// RP2350 backend: TIMER1 alarm 0
+// Platform backend entry points (called by HAL implementations)
 // ============================================================================
 
-#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-mod rp2350_backend {
-    use super::*;
-    use embassy_rp::pac;
-
-    /// TIMER1 on RP2350 — separate from Embassy's TIMER0.
-    fn timer1() -> pac::timer::Timer {
-        pac::TIMER1
-    }
-
-    /// Arm the step guard with a deadline in microseconds.
-    pub fn arm(deadline_us: u32) {
-        STEP_TIMED_OUT.store(false, Ordering::Release);
-        GUARD_ARMED.store(true, Ordering::Release);
-
-        let t = timer1();
-        // Read current time and set alarm 0 to fire at now + deadline
-        let now_lo = t.timelr().read();
-        let target = now_lo.wrapping_add(deadline_us);
-
-        // Clear any pending alarm 0 interrupt
-        t.intr().write(|w| w.set_alarm(0, true));
-        // Set alarm target
-        t.alarm(0).write_value(target);
-        // Enable alarm 0 interrupt
-        t.inte().modify(|w| w.set_alarm(0, true));
-    }
-
-    /// Disarm the step guard (normal return from step).
-    pub fn disarm() {
-        if !GUARD_ARMED.load(Ordering::Acquire) {
-            return;
-        }
-        let t = timer1();
-        // Disable alarm 0 interrupt
-        t.inte().modify(|w| w.set_alarm(0, false));
-        // Clear any pending
-        t.intr().write(|w| w.set_alarm(0, true));
-        GUARD_ARMED.store(false, Ordering::Release);
-    }
-
-    /// Timer1 alarm 0 ISR — called from vector table.
-    /// Sets the timeout flag. Does NOT force-return (v1: advisory only).
-    pub fn on_timer_irq() {
-        let t = timer1();
-        // Acknowledge interrupt
-        t.intr().write(|w| w.set_alarm(0, true));
-        // Disable further interrupts from this alarm
-        t.inte().modify(|w| w.set_alarm(0, false));
-
-        STEP_TIMED_OUT.store(true, Ordering::Release);
-        GUARD_ARMED.store(false, Ordering::Release);
-    }
-
-    /// Initialize the timer1 hardware for step guard use.
-    pub fn init() {
-        // TIMER1 runs from the same clock as TIMER0 (1MHz by default on RP2350).
-        // Just ensure alarm 0 is disabled and cleared.
-        let t = timer1();
-        t.inte().modify(|w| w.set_alarm(0, false));
-        t.intr().write(|w| w.set_alarm(0, true));
-
-        // Enable TIMER1_IRQ_0 in NVIC (IRQ number for TIMER1 alarm 0)
-        // On RP2350, TIMER1_IRQ_0 = IRQ 4 + offset. The actual IRQ number
-        // is chip-specific. We use cortex-m NVIC directly.
-        unsafe {
-            let nvic = &*cortex_m::peripheral::NVIC::PTR;
-            // TIMER1_IRQ_0 on RP2350 is interrupt 4
-            // (TIMER0_IRQ_0=0, TIMER0_IRQ_1=1, TIMER0_IRQ_2=2, TIMER0_IRQ_3=3,
-            //  TIMER1_IRQ_0=4)
-            const TIMER1_IRQ_0: u16 = 4;
-            nvic.iser[0].write(1 << TIMER1_IRQ_0);
-        }
-    }
+/// Set the timeout flag. Called by platform timer ISR.
+pub fn set_timed_out() {
+    STEP_TIMED_OUT.store(true, Ordering::Release);
 }
 
-// ============================================================================
-// RP2040 backend: TIMER alarm 3
-// ============================================================================
-
-#[cfg(feature = "chip-rp2040")]
-mod rp2040_backend {
-    use super::*;
-    use embassy_rp::pac;
-
-    fn timer() -> pac::timer::Timer {
-        pac::TIMER
-    }
-
-    /// Arm the step guard with a deadline in microseconds.
-    pub fn arm(deadline_us: u32) {
-        STEP_TIMED_OUT.store(false, Ordering::Release);
-        GUARD_ARMED.store(true, Ordering::Release);
-
-        let t = timer();
-        let now_lo = t.timelr().read();
-        let target = now_lo.wrapping_add(deadline_us);
-
-        // Clear any pending alarm 3 interrupt
-        t.intr().write(|w| w.set_alarm(3, true));
-        // Set alarm target
-        t.alarm(3).write_value(target);
-        // Enable alarm 3 interrupt
-        t.inte().modify(|w| w.set_alarm(3, true));
-    }
-
-    /// Disarm the step guard (normal return from step).
-    pub fn disarm() {
-        if !GUARD_ARMED.load(Ordering::Acquire) {
-            return;
-        }
-        let t = timer();
-        t.inte().modify(|w| w.set_alarm(3, false));
-        t.intr().write(|w| w.set_alarm(3, true));
-        GUARD_ARMED.store(false, Ordering::Release);
-    }
-
-    /// Timer alarm 3 ISR.
-    pub fn on_timer_irq() {
-        let t = timer();
-        t.intr().write(|w| w.set_alarm(3, true));
-        t.inte().modify(|w| w.set_alarm(3, false));
-
-        STEP_TIMED_OUT.store(true, Ordering::Release);
-        GUARD_ARMED.store(false, Ordering::Release);
-    }
-
-    /// Initialize alarm 3 for step guard use.
-    pub fn init() {
-        let t = timer();
-        t.inte().modify(|w| w.set_alarm(3, false));
-        t.intr().write(|w| w.set_alarm(3, true));
-
-        // Enable TIMER_IRQ_3 in NVIC (IRQ 3 on RP2040)
-        unsafe {
-            let nvic = &*cortex_m::peripheral::NVIC::PTR;
-            const TIMER_IRQ_3: u16 = 3;
-            nvic.iser[0].write(1 << TIMER_IRQ_3);
-        }
-    }
+/// Clear the timeout flag. Called by platform arm.
+pub fn clear_timed_out() {
+    STEP_TIMED_OUT.store(false, Ordering::Release);
 }
 
-// ============================================================================
-// BCM2712/aarch64 backend: software elapsed-time check
-// ============================================================================
+/// Set the armed flag. Called by platform arm.
+pub fn set_armed(armed: bool) {
+    GUARD_ARMED.store(armed, Ordering::Release);
+}
 
-#[cfg(feature = "chip-bcm2712")]
-mod bcm2712_backend {
-    use super::*;
-
-    /// Timestamp when guard was armed (CNT_CT virtual count).
-    static mut ARM_TIME: u64 = 0;
-    /// Deadline in counter ticks.
-    static mut DEADLINE_TICKS: u64 = 0;
-
-    fn read_cntpct() -> u64 {
-        let val: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
-        val
-    }
-
-    fn counter_freq() -> u64 {
-        let freq: u64;
-        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
-        freq
-    }
-
-    /// Arm the step guard (record start time).
-    pub fn arm(deadline_us: u32) {
-        STEP_TIMED_OUT.store(false, Ordering::Release);
-        GUARD_ARMED.store(true, Ordering::Release);
-        let freq = counter_freq();
-        let ticks = (deadline_us as u64 * freq) / 1_000_000;
-        unsafe {
-            ARM_TIME = read_cntpct();
-            DEADLINE_TICKS = ticks;
-        }
-    }
-
-    /// Disarm the step guard.
-    pub fn disarm() {
-        GUARD_ARMED.store(false, Ordering::Release);
-    }
-
-    /// Check elapsed time after step returns (called by scheduler).
-    /// On aarch64 there is no forced return — this is advisory.
-    pub fn check_elapsed() {
-        if !GUARD_ARMED.load(Ordering::Acquire) {
-            return;
-        }
-        let now = read_cntpct();
-        let elapsed = now.wrapping_sub(unsafe { ARM_TIME });
-        if elapsed >= unsafe { DEADLINE_TICKS } {
-            STEP_TIMED_OUT.store(true, Ordering::Release);
-        }
-        GUARD_ARMED.store(false, Ordering::Release);
-    }
-
-    /// Init — no-op on aarch64 (software check only).
-    pub fn init() {}
+/// Check if armed. Called by platform disarm/post-check.
+pub fn is_armed() -> bool {
+    GUARD_ARMED.load(Ordering::Acquire)
 }
 
 // ============================================================================
@@ -433,12 +251,7 @@ mod bcm2712_backend {
 
 /// Initialize the step guard hardware for the current platform.
 pub fn init() {
-    #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-    rp2350_backend::init();
-    #[cfg(feature = "chip-rp2040")]
-    rp2040_backend::init();
-    #[cfg(feature = "chip-bcm2712")]
-    bcm2712_backend::init();
+    hal::step_guard_init();
 }
 
 /// Arm the step guard with a deadline in microseconds.
@@ -448,43 +261,18 @@ pub fn arm(deadline_us: u32) {
         crate::kernel::scheduler::current_module_index() as u8,
         Ordering::Release,
     );
-    #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-    rp2350_backend::arm(deadline_us);
-    #[cfg(feature = "chip-rp2040")]
-    rp2040_backend::arm(deadline_us);
-    #[cfg(feature = "chip-bcm2712")]
-    bcm2712_backend::arm(deadline_us);
+    hal::step_guard_arm(deadline_us);
 }
 
 /// Disarm the step guard (normal return path).
 #[inline]
 pub fn disarm() {
-    #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-    rp2350_backend::disarm();
-    #[cfg(feature = "chip-rp2040")]
-    rp2040_backend::disarm();
-    #[cfg(feature = "chip-bcm2712")]
-    bcm2712_backend::disarm();
+    hal::step_guard_disarm();
 }
 
 /// Post-step check for aarch64 (software elapsed check).
 /// On Cortex-M this is a no-op (hardware ISR sets the flag).
 #[inline]
 pub fn post_step_check() {
-    #[cfg(feature = "chip-bcm2712")]
-    bcm2712_backend::check_elapsed();
-}
-
-/// Timer ISR entry point — called from interrupt vector.
-/// Only needed on RP platforms (Cortex-M hardware timer).
-#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-#[no_mangle]
-pub unsafe extern "C" fn TIMER1_IRQ_0() {
-    rp2350_backend::on_timer_irq();
-}
-
-#[cfg(feature = "chip-rp2040")]
-#[no_mangle]
-pub unsafe extern "C" fn TIMER_IRQ_3() {
-    rp2040_backend::on_timer_irq();
+    hal::step_guard_post_check();
 }

@@ -11,9 +11,7 @@
 
 use core::ptr::null;
 
-#[cfg(feature = "rp")]
-use embassy_time::{Duration, Timer};
-
+use crate::kernel::hal;
 use crate::kernel::config::{
     read_config_into, Config, ModuleEntry,
     MAX_MODULES as CONFIG_MAX_MODULES,
@@ -339,7 +337,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
 ///   writers cause runtime stalls (READY_PROCESSED rejection by buffer_pool).
 ///
 /// Returns true if valid, false if constraints violated.
-fn validate_buffer_groups(edges: &[Edge]) -> bool {
+pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
     let sched = unsafe { &*(&raw const SCHED) };
     let mut group_writers: [u8; 128] = [0; 128];
     let mut valid = true;
@@ -388,7 +386,7 @@ const MAX_MODULE_CONFIG_SIZE: usize = super::chip::MAX_MODULE_CONFIG_SIZE;
 /// future size (16KB+ buffer would cause stack overflow when embedded
 /// in the async state machine).
 #[repr(C, align(4))]
-struct ParamBuffer {
+pub struct ParamBuffer {
     data: [u8; MAX_MODULE_CONFIG_SIZE],
     len: usize,
 }
@@ -404,7 +402,6 @@ impl ParamBuffer {
         self.data.as_ptr()
     }
 
-    #[cfg(feature = "rp")]
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_mut_ptr()
     }
@@ -413,7 +410,6 @@ impl ParamBuffer {
         self.len
     }
 
-    #[cfg(feature = "rp")]
     fn set_len(&mut self, len: usize) {
         self.len = len;
     }
@@ -720,12 +716,17 @@ impl Default for RunnerConfig {
 static mut STATIC_CONFIG: Config = Config::empty();
 static mut STATIC_LOADER: ModuleLoader = ModuleLoader::new();
 
+/// Get a reference to the static loader.
+pub unsafe fn static_loader() -> &'static ModuleLoader {
+    &*(&raw const STATIC_LOADER)
+}
+
 /// Maximum ports per direction (in/out/ctrl) per module
 const MAX_PORTS: usize = 4;
 
 /// Per-module port assignments (replaces old MODULE_CHANNELS tuple)
 #[derive(Clone, Copy)]
-struct ModulePorts {
+pub struct ModulePorts {
     in_chans:   [i32; MAX_PORTS],
     out_chans:  [i32; MAX_PORTS],
     ctrl_chans: [i32; MAX_PORTS],
@@ -782,13 +783,13 @@ impl ArenaInfo {
 ///
 /// Replaces 14 scattered `static mut` arrays. A single `reset()` method
 /// replaces the multi-line reset block in `prepare_graph()`.
-struct SchedulerState {
+pub struct SchedulerState {
     /// Graph edge wiring
-    edges: [Edge; MAX_CHANNELS],
+    pub edges: [Edge; MAX_CHANNELS],
     /// Instantiated module slots
-    modules: [ModuleSlot; MAX_MODULES],
+    pub modules: [ModuleSlot; MAX_MODULES],
     /// Per-module port assignments
-    ports: [ModulePorts; MAX_MODULES],
+    pub ports: [ModulePorts; MAX_MODULES],
     /// Per-module channel hints (buffer size requests)
     hints: [ModuleHints; MAX_MODULES],
     /// Per-module finished flags (done or errored)
@@ -948,6 +949,29 @@ impl SchedulerState {
 }
 
 static mut SCHED: SchedulerState = SchedulerState::new();
+
+/// Get a mutable reference to the scheduler state.
+///
+/// # Safety
+/// Caller must ensure exclusive access.
+pub unsafe fn sched_mut() -> &'static mut SchedulerState {
+    &mut *(&raw mut SCHED)
+}
+
+/// Get an immutable reference to the scheduler state.
+pub unsafe fn sched_ref() -> &'static SchedulerState {
+    &*(&raw const SCHED)
+}
+
+/// Get a mutable reference to the modules array.
+pub unsafe fn sched_modules() -> &'static mut [ModuleSlot; MAX_MODULES] {
+    &mut *(&raw mut SCHED.modules)
+}
+
+/// Get a mutable reference to the static param buffer.
+pub unsafe fn param_buffer_mut() -> &'static mut ParamBuffer {
+    &mut *core::ptr::addr_of_mut!(PARAM_BUFFER)
+}
 
 /// Return the index of the module currently being stepped.
 /// Used by event::event_create() to set event ownership.
@@ -1129,8 +1153,7 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
         return false;
     }
     // Scan runtime parameter store (flash sector with persistent overrides)
-    #[cfg(feature = "rp")]
-    crate::kernel::flash_store::boot_scan();
+    hal::boot_scan();
 
     // Initialize step guard timer hardware
     step_guard::init();
@@ -1149,7 +1172,7 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
 ///
 /// Returns (module_list, module_count) on success, or -1 on error.
 /// After this call, edges/modules/module_ports/finished/exec_order are initialized.
-fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
+pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
     let config = unsafe { &*(&raw const STATIC_CONFIG) };
     let loader = unsafe { &*(&raw const STATIC_LOADER) };
     let edge_count = config.edge_count as usize;
@@ -1271,89 +1294,10 @@ fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
     Ok((module_list, module_count))
 }
 
-/// Async graph setup - instantiates modules with executor running.
-#[cfg(feature = "rp")]
-pub async fn setup_graph_async() -> i32 {
-    let (module_list, module_count) = match prepare_graph() {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    let loader = unsafe { &*(&raw const STATIC_LOADER) };
-    let sched = unsafe { &mut *(&raw mut SCHED) };
-    let result = instantiate_all_modules_async(
-        loader, &module_list, module_count,
-        &mut sched.edges, &mut sched.modules, &mut sched.ports,
-    ).await;
-
-    if result < 0 {
-        log::error!("[graph] instantiation failed");
-        return -1;
-    }
-
-    // Validate buffer group constraints (in_place_writer flags now populated)
-    if !validate_buffer_groups(&sched.edges) {
-        log::error!("[graph] buffer group validation failed");
-        return -1;
-    }
-
-    // Compute downstream latency: walk graph in reverse exec order (sinks first).
-    // For each module M with output to N: downstream_latency[M] = max(latency[N] + downstream[N])
-    compute_downstream_latency(sched, module_count);
-
-    result
-}
-
-/// Run the main graph loop (async, embassy)
-#[cfg(feature = "rp")]
-pub async fn run_main_loop(module_count: usize) -> ! {
-    let modules = unsafe { &mut *(&raw mut SCHED.modules) };
-    let tick_period_us = tick_us() as u64;
-
-    log::info!("[sched] running modules={} tick_us={}", module_count, tick_period_us);
-
-    loop {
-        // 1. Poll GPIO edges (signals events for pins with bindings)
-        crate::io::gpio::poll_gpio_edges();
-
-        // 2. Step all modules in topological order
-        let result = step_modules(modules, module_count);
-        match result {
-            StepResult::Continue => {}
-            StepResult::Done => {
-                log::warn!("[sched] all modules done");
-                break;
-            }
-            StepResult::Error(i) => {
-                log::error!("[sched] step error module={}", i);
-                break;
-            }
-        }
-
-        // 3. Intra-tick wake: events that fired during step_modules
-        //    (e.g. module A signaling module B's event, or poll_gpio_edges)
-        let wake = crate::kernel::event::take_wake_pending();
-        if wake != 0 {
-            step_woken_modules(modules, module_count, wake);
-        }
-
-        // 4. Sleep until configurable tick period OR event signal
-        crate::kernel::event::SCHEDULER_WAKE.reset();
-        embassy_futures::select::select(
-            Timer::after(Duration::from_micros(tick_period_us)),
-            crate::kernel::event::SCHEDULER_WAKE.wait(),
-        ).await;
-
-        // 5. Post-sleep wake: events from ISR during sleep
-        let wake = crate::kernel::event::take_wake_pending();
-        if wake != 0 {
-            step_woken_modules(modules, module_count, wake);
-        }
-    }
-
-    log::info!("[sched] stopped");
-    loop { Timer::after(Duration::from_millis(1000)).await; }
-}
+// Async graph setup (setup_graph_async) and run_main_loop are in
+// src/platform/rp.rs — they use embassy async/await which is RP-only.
+// Sync variants (setup_graph_sync, run_main_loop_sync) are in
+// src/platform/bcm2712.rs.
 
 // ============================================================================
 // Module Instantiation
@@ -1692,7 +1636,7 @@ fn populate_ports(
 }
 
 /// Result of synchronous per-module instantiation.
-enum InstantiateResult {
+pub enum InstantiateResult {
     /// Module ready, increment count
     Done,
     /// Module needs async completion
@@ -1704,7 +1648,7 @@ enum InstantiateResult {
 /// Synchronous per-module instantiation — all large locals live on the
 /// regular call stack rather than in the async future state machine.
 #[inline(never)]
-fn instantiate_one_module(
+pub fn instantiate_one_module(
     loader: &ModuleLoader,
     entry: &ModuleEntry,
     module_idx: usize,
@@ -1809,10 +1753,9 @@ fn instantiate_one_module(
         pb.write(entry.params());
 
         // Overlay any runtime parameter overrides from flash store
-        #[cfg(feature = "rp")]
         {
-            let new_len = crate::kernel::flash_store::merge_runtime_overrides(
-                entry.id,
+            let new_len = hal::merge_runtime_overrides(
+                entry.id as u16,
                 pb.as_mut_ptr(),
                 pb.len(),
                 MAX_MODULE_CONFIG_SIZE,
@@ -1860,151 +1803,11 @@ fn instantiate_one_module(
     InstantiateResult::Done
 }
 
-/// Async wrapper — only the tiny pending-retry loop lives in the async future.
-#[cfg(feature = "rp")]
-#[inline(never)]
-async fn instantiate_all_modules_async(
-    loader: &ModuleLoader,
-    module_list: &[Option<ModuleEntry>; MAX_MODULES],
-    module_count: usize,
-    edges: &mut [Edge; MAX_CHANNELS],
-    modules: &mut [ModuleSlot; MAX_MODULES],
-    module_ports: &mut [ModulePorts; MAX_MODULES],
-) -> i32 {
-    let mut instantiated = 0;
-
-    for module_idx in 0..module_count {
-        let entry = match &module_list[module_idx] {
-            Some(entry) => entry,
-            None => continue,
-        };
-
-        // Set current_module so dev_channel_port() during module_new
-        // reads the correct module's ports (not module 0).
-        unsafe { SCHED.current_module = instantiated; }
-        match instantiate_one_module(
-            loader, entry, module_idx, instantiated, edges, modules, module_ports,
-        ) {
-            InstantiateResult::Done => {}
-            InstantiateResult::Pending(mut pending) => {
-                // Small async retry loop — only `pending` crosses the await
-                loop {
-                    Timer::after(Duration::from_millis(1)).await;
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dynamic)) => {
-                            modules[instantiated] = ModuleSlot::Dynamic(dynamic);
-                            break;
-                        }
-                        Ok(None) => continue,
-                        Err(e) => {
-                            e.log("scheduler");
-                            return -1;
-                        }
-                    }
-                }
-            }
-            InstantiateResult::Error(e) => {
-                log::error!("[inst] failed module={} error={}", module_idx, e);
-                return e;
-            }
-        }
-
-        // Grant any config-declared GPIO pins to this module
-        crate::io::gpio::grant_pending_pins(instantiated as u8);
-
-        instantiated += 1;
-        Timer::after(Duration::from_millis(1)).await;
-    }
-
-    instantiated as i32
-}
-
-/// Synchronous graph setup (bcm2712) — no embassy, no async.
-#[cfg(feature = "chip-bcm2712")]
-pub fn setup_graph_sync() -> i32 {
-    let (module_list, module_count) = match prepare_graph() {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    let loader = unsafe { &*(&raw const STATIC_LOADER) };
-    let sched = unsafe { &mut *(&raw mut SCHED) };
-    let mut instantiated = 0usize;
-
-    for module_idx in 0..module_count {
-        let entry = match &module_list[module_idx] {
-            Some(entry) => entry,
-            None => continue,
-        };
-
-        unsafe { SCHED.current_module = instantiated; }
-        match instantiate_one_module(
-            loader, entry, module_idx, instantiated,
-            &mut sched.edges, &mut sched.modules, &mut sched.ports,
-        ) {
-            InstantiateResult::Done => {}
-            InstantiateResult::Pending(mut pending) => {
-                // Spin-wait for pending modules (no async executor)
-                loop {
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dynamic)) => {
-                            sched.modules[instantiated] = ModuleSlot::Dynamic(dynamic);
-                            break;
-                        }
-                        Ok(None) => {
-                            // Yield CPU briefly
-                            for _ in 0..1000 { unsafe { core::arch::asm!("nop") }; }
-                        }
-                        Err(e) => {
-                            e.log("scheduler");
-                            return -1;
-                        }
-                    }
-                }
-            }
-            InstantiateResult::Error(e) => {
-                log::error!("[inst] failed module={} error={}", module_idx, e);
-                return e;
-            }
-        }
-        instantiated += 1;
-    }
-
-    if !validate_buffer_groups(&sched.edges) {
-        log::error!("[graph] buffer group validation failed");
-        return -1;
-    }
-    compute_downstream_latency(sched, module_count);
-    instantiated as i32
-}
-
-/// Synchronous main loop (bcm2712) — step all modules, increment tick, WFE.
-#[cfg(feature = "chip-bcm2712")]
-pub fn run_main_loop_sync(module_count: usize) -> ! {
-    let modules = unsafe { &mut *(&raw mut SCHED.modules) };
-    log::info!("[sched] running modules={}", module_count);
-
-    loop {
-        unsafe { DBG_TICK += 1; }
-        let tick = unsafe { DBG_TICK };
-
-        step_modules(modules, module_count);
-
-        // Check event wake
-        let wake = crate::kernel::event::take_wake_pending();
-        if wake != 0 {
-            step_woken_modules(modules, module_count, wake);
-        }
-
-        // Periodic alive message
-        if tick % 500 == 0 {
-            log::info!("[sched] alive t={}", tick);
-        }
-
-        // Yield until next tick (timer interrupt or SEV from event_signal)
-        unsafe { core::arch::asm!("wfe") };
-    }
-}
+// Platform-specific graph setup and main loop functions have been moved
+// to their respective platform files (rp.rs, bcm2712.rs).
+// They use the pub(crate) accessors: prepare_graph(), instantiate_one_module(),
+// sched_mut(), sched_modules(), validate_buffer_groups(), compute_downstream_latency(),
+// step_modules(), step_woken_modules().
 
 /// Compute topological execution order from the edge graph using Kahn's algorithm.
 ///
@@ -2196,7 +1999,7 @@ fn validate_domains_static(module_count: usize, edge_count: usize) {
 /// Walk graph in reverse execution order (sinks→sources). For each module M,
 /// find all successors N via edges. downstream_latency[M] = max over all N of
 /// (module_latency[N] + downstream_latency[N]).
-fn compute_downstream_latency(sched: &mut SchedulerState, module_count: usize) {
+pub fn compute_downstream_latency(sched: &mut SchedulerState, module_count: usize) {
     let _edge_count = sched.exec_order_count;
 
     // Walk in reverse exec order: sinks have downstream_latency=0, then work backwards
@@ -2463,7 +2266,7 @@ fn handle_module_restart(
     sched.finished[module_idx] = false;
 }
 
-fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepResult {
+pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepResult {
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let tick = unsafe { DBG_TICK };
     unsafe { DBG_TICK += 1; }
@@ -2676,7 +2479,7 @@ fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepRe
 /// Step only modules whose bit is set in `wake_bits`.
 /// Bypasses frequency gating — an event overrides the step period.
 /// Uses topological order to preserve producer-before-consumer invariant.
-fn step_woken_modules(
+pub fn step_woken_modules(
     modules: &mut [ModuleSlot; MAX_MODULES],
     count: usize,
     wake_bits: u16,

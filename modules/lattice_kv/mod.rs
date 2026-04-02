@@ -327,6 +327,10 @@ unsafe fn kv_delete(state: &State, key: *const u8, key_len: usize) -> bool {
 // ============================================================================
 
 #[no_mangle]
+#[link_section = ".text.module_init"]
+pub unsafe extern "C" fn module_init(_syscalls: *const core::ffi::c_void) {}
+
+#[no_mangle]
 pub unsafe extern "C" fn module_new(
     in_ch: i32,
     out_ch: i32,
