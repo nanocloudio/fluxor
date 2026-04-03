@@ -466,6 +466,9 @@ pub mod dev_socket {
     pub const SERVICE_SET_STATE: u32 = 0x0814;
     /// Get number of socket slots. handle=-1. Returns count.
     pub const SERVICE_COUNT: u32 = 0x0815;
+    /// Reset a socket slot (free for reuse). handle=slot_idx. Called by provider
+    /// after the connection is fully closed and no further state is needed.
+    pub const SERVICE_RESET: u32 = 0x0816;
 }
 
 /// Socket service info structure (returned by SERVICE_INFO).

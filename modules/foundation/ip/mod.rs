@@ -68,6 +68,7 @@ const DEV_SOCKET_SERVICE_RX_WRITE: u32 = 0x0812;
 const DEV_SOCKET_SERVICE_COMPLETE_OP: u32 = 0x0813;
 const DEV_SOCKET_SERVICE_SET_STATE: u32 = 0x0814;
 const DEV_SOCKET_SERVICE_COUNT: u32 = 0x0815;
+const DEV_SOCKET_SERVICE_RESET: u32 = 0x0816;
 
 /// Socket lifecycle phases (module-defined, kernel stores opaquely as u8).
 #[repr(u8)]
@@ -166,6 +167,10 @@ pub struct IpState {
     // Frame buffers
     rx_frame: [u8; MAX_FRAME_SIZE],
     tx_frame: [u8; MAX_FRAME_SIZE],
+    /// Length of pending TX frame (0 = no pending). When the channel is full,
+    /// the frame stays in tx_frame and pending_tx_len is set. Next step retries.
+    pending_tx_len: u16,
+    _ptx_pad: [u8; 2],
 
     // Step counter for timers
     step_count: u32,
@@ -252,6 +257,10 @@ unsafe fn socket_complete_op(s: &IpState, slot_idx: i32, result: i32, new_state:
         arg.as_mut_ptr(),
         6,
     );
+    // Free the slot when fully closed — allows kernel to reuse it
+    if new_state == SocketPhase::Closed {
+        socket_reset(s, slot_idx);
+    }
 }
 
 /// Set socket state via dev_call.
@@ -265,6 +274,17 @@ unsafe fn socket_set_state(s: &IpState, slot_idx: i32, state: SocketPhase, poll_
         arg.as_mut_ptr(),
         2,
     );
+    // Free the slot when fully closed — allows kernel to reuse it
+    if state == SocketPhase::Closed {
+        socket_reset(s, slot_idx);
+    }
+}
+
+/// Reset (free) a socket slot so it can be reused for new connections.
+#[inline(always)]
+unsafe fn socket_reset(s: &IpState, slot_idx: i32) {
+    let sys = &*s.syscalls;
+    (sys.dev_call)(slot_idx, DEV_SOCKET_SERVICE_RESET, core::ptr::null_mut(), 0);
 }
 
 /// Unchecked TCP conn access (avoids bounds check panic in PIC).
@@ -296,8 +316,11 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
     if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
         (sys.channel_write)(s.out_chan, frame, len);
         s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
+        s.pending_tx_len = 0;
     } else {
-        log_info(s, b"[ip] send_frame: chan full");
+        // Channel full — mark pending for retry next step.
+        // The frame data is already in s.tx_frame (caller built it there).
+        s.pending_tx_len = len as u16;
     }
 }
 
@@ -396,7 +419,23 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut IpState);
     s.step_count = s.step_count.wrapping_add(1);
 
-    // 0. Lazy-init: find an active netif to push IP config to
+    // 0a. Flush any pending TX frame from previous step
+    if s.pending_tx_len > 0 && s.out_chan >= 0 {
+        let sys = &*s.syscalls;
+        let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
+        if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+            let len = s.pending_tx_len as usize;
+            (sys.channel_write)(s.out_chan, s.tx_frame.as_ptr(), len);
+            s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
+            s.pending_tx_len = 0;
+        }
+        // If still full, return Burst to try again quickly
+        if s.pending_tx_len > 0 {
+            return 2; // StepOutcome::Burst
+        }
+    }
+
+    // 0b. Lazy-init: find an active netif to push IP config to
     if s.netif_handle < 0 {
         let sys = &*s.syscalls;
         let mut slot = 0i32;

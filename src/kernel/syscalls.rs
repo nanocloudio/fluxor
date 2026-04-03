@@ -234,7 +234,6 @@ unsafe extern "C" fn syscall_dev_call(
             && (INFRA_CLASSES & (1 << class)) == 0
             && (req & (1 << class)) == 0
         {
-            log::error!("[dev_call] class 0x{:02x} blocked for module {} caps=0x{:08x}", class, crate::kernel::scheduler::current_module_index(), req);
             return E_NOSYS;
         }
     }
@@ -481,7 +480,8 @@ unsafe fn socket_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             };
             let result = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             slot.complete_op(result);
-            slot.set_state(*arg.add(4));
+            let new_state = *arg.add(4);
+            slot.set_state(new_state);
             if arg_len >= 6 {
                 slot.set_poll_flags(*arg.add(5));
             }
@@ -499,6 +499,15 @@ unsafe fn socket_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             if arg_len >= 2 {
                 slot.set_poll_flags(*arg.add(1));
             }
+            0
+        }
+        dev_socket::SERVICE_RESET => {
+            if handle < 0 || handle >= socket::MAX_SOCKETS as i32 { return E_INVAL; }
+            let slot = match socket::SocketService::get_slot_by_index(handle as usize) {
+                Some(s) => s,
+                None => return E_INVAL,
+            };
+            slot.reset();
             0
         }
         _ => E_NOSYS,
@@ -574,9 +583,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             let resolved_addr = crate::kernel::loader::resolve_export_for_module(
                 module_idx, fn_addr
             ).unwrap_or(fn_addr as usize);
-
-            log::debug!("[provider] register class=0x{:02x} resolved=0x{:08x} module={}",
-                class, resolved_addr, module_idx);
 
             // Transmute resolved address to function pointer
             let dispatch_fn: provider::ModuleProviderDispatchFn =
