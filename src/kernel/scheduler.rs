@@ -859,6 +859,14 @@ pub struct SchedulerState {
     drain_inflight: [u32; MAX_MODULES],
     /// Number of modules in the current graph (for reconfigure).
     active_module_count: usize,
+
+    // ── Per-module export table info (for resolve_export_for_module) ──
+    /// Code base address per module (for resolving export offsets)
+    module_code_base: [usize; MAX_MODULES],
+    /// Export table pointer per module
+    module_export_table: [*const u8; MAX_MODULES],
+    /// Export count per module
+    module_export_count: [u16; MAX_MODULES],
 }
 
 impl SchedulerState {
@@ -900,6 +908,9 @@ impl SchedulerState {
             drain_timeout_ticks: 5000,
             drain_inflight: [0; MAX_MODULES],
             active_module_count: 0,
+            module_code_base: [0; MAX_MODULES],
+            module_export_table: [core::ptr::null(); MAX_MODULES],
+            module_export_count: [0; MAX_MODULES],
         }
     }
 
@@ -927,6 +938,9 @@ impl SchedulerState {
             self.module_latency[i] = 0;
             self.downstream_latency[i] = 0;
             self.fault_info[i] = ModuleFaultInfo::new();
+            self.module_code_base[i] = 0;
+            self.module_export_table[i] = core::ptr::null();
+            self.module_export_count[i] = 0;
         }
         self.exec_order_count = 0;
         self.graph_sample_rate = 0;
@@ -986,11 +1000,30 @@ pub fn set_current_module(idx: usize) {
 
 /// Get the state pointer for a module by index.
 /// Returns null if the slot is empty or not a dynamic module.
+/// State pointer for the module currently being instantiated (set during module_new).
+/// Allows REGISTER_PROVIDER to find the state before the module is stored in SCHED.
+static mut INSTANTIATION_STATE: *mut u8 = core::ptr::null_mut();
+static mut INSTANTIATION_IDX: usize = usize::MAX;
+
+/// Set the instantiation state pointer (called before module_new).
+pub fn set_instantiation_state(idx: usize, state: *mut u8) {
+    unsafe { INSTANTIATION_STATE = state; INSTANTIATION_IDX = idx; }
+}
+
+/// Clear the instantiation state pointer (called after module_new).
+pub fn clear_instantiation_state() {
+    unsafe { INSTANTIATION_STATE = core::ptr::null_mut(); INSTANTIATION_IDX = usize::MAX; }
+}
+
 pub fn get_module_state(idx: usize) -> *mut u8 {
     if idx >= MAX_MODULES {
         return core::ptr::null_mut();
     }
     unsafe {
+        // During module_new, the module isn't stored in SCHED yet
+        if idx == INSTANTIATION_IDX && !INSTANTIATION_STATE.is_null() {
+            return INSTANTIATION_STATE;
+        }
         match &SCHED.modules[idx] {
             ModuleSlot::Dynamic(m) => m.state_ptr(),
             _ => core::ptr::null_mut(),
@@ -1008,6 +1041,19 @@ pub fn current_module_cap_class() -> u8 {
 /// Bit N set = module declared it needs device class N in its manifest.
 pub fn current_module_required_caps() -> u32 {
     unsafe { SCHED.required_caps[SCHED.current_module] }
+}
+
+/// Return the export table info for a module by index.
+/// Used by loader::resolve_export_for_module to resolve export hashes.
+pub fn get_module_exports(idx: usize) -> (usize, *const u8, u16) {
+    if idx >= MAX_MODULES {
+        return (0, core::ptr::null(), 0);
+    }
+    unsafe {
+        (SCHED.module_code_base[idx],
+         SCHED.module_export_table[idx],
+         SCHED.module_export_count[idx])
+    }
 }
 
 /// Return the graph-level sample rate (0 = not configured).
@@ -1711,6 +1757,10 @@ pub fn instantiate_one_module(
             _ => 0,  // Source, Transformer → CAP_SERVICE
         };
         sched.required_caps[instantiated] = found_module.header.required_caps() as u32;
+        // Store export table info for resolve_export_for_module
+        sched.module_code_base[instantiated] = found_module.code_base() as usize;
+        sched.module_export_table[instantiated] = found_module.export_table_ptr();
+        sched.module_export_count[instantiated] = found_module.header.export_count;
         let flags_byte = found_module.header.reserved[0];
         sched.mailbox_safe[instantiated] = (flags_byte & 0x01) != 0;
         sched.in_place_writer[instantiated] = (flags_byte & 0x02) != 0;
@@ -1765,6 +1815,8 @@ pub fn instantiate_one_module(
     }
 
     // Full instantiation via start_new
+    // Set current module index so REGISTER_PROVIDER can identify us
+    set_current_module(instantiated);
     let result = unsafe {
         let pb = core::ptr::addr_of!(PARAM_BUFFER);
         DynamicModule::start_new(
@@ -1774,6 +1826,7 @@ pub fn instantiate_one_module(
             static_name,
         )
     };
+    clear_instantiation_state();
 
     match result {
         Ok(StartNewResult::Ready(dynamic)) => {

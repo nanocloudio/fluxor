@@ -24,6 +24,8 @@ pub mod export_hashes {
     pub const MODULE_DRAIN: u32 = 0xc4c5636c;      // "module_drain"
     pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03;  // "module_isr_init"
     pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743;  // "module_isr_entry"
+    pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76; // "module_provider_dispatch"
+    pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
 }
 
 /// Module table magic: "FXMT"
@@ -483,8 +485,8 @@ impl LoadedModule {
         core::str::from_utf8(&self.header.name[..end]).unwrap_or("")
     }
 
-    /// Get export table pointer
-    fn export_table(&self) -> *const u8 {
+    /// Get export table pointer (used internally and by scheduler for export resolution)
+    pub fn export_table_ptr(&self) -> *const u8 {
         // Compute from code_size + data_size (both u32) to avoid u16 overflow
         // in the header's export_offset field for modules > 64KB.
         let offset = self.header.code_size as usize + self.header.data_size as usize;
@@ -501,7 +503,7 @@ impl LoadedModule {
         }
 
         let code_base = self.code_base();
-        let export_table = self.export_table();
+        let export_table = self.export_table_ptr();
 
         for i in 0..export_count {
             // SAFETY: i < export_count from validated header
@@ -1119,6 +1121,10 @@ impl DynamicModule {
         // 4. Allocate state from arena (safe)
         let state_ptr = alloc_state(required_size)?;
 
+        // Set instantiation state so REGISTER_PROVIDER can find our state during module_new
+        let inst_idx = super::scheduler::current_module_index();
+        super::scheduler::set_instantiation_state(inst_idx, state_ptr);
+
         // 4b. If module exports module_arena_size, allocate and init heap
         if let Ok(arena_addr) = module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
             let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
@@ -1272,6 +1278,40 @@ pub fn find_hint_for_port(
 }
 
 // ============================================================================
+// Export resolution for provider dispatch
+// ============================================================================
+
+/// Resolve an export hash to an absolute address for a given module.
+///
+/// Called by the REGISTER_PROVIDER syscall handler. The module passes an
+/// FNV-1a hash of the export name (e.g. 0xc7832e76 for "module_provider_dispatch").
+/// We walk the module's export table to find the matching entry and compute
+/// the absolute address from code_base + offset.
+///
+/// Returns `Some(absolute_address)` on success, `None` if the hash is not found
+/// in the module's export table (falls back to treating the value as a raw address).
+pub fn resolve_export_for_module(module_idx: usize, export_hash: u32) -> Option<usize> {
+    let (code_base, export_table, export_count) =
+        super::scheduler::get_module_exports(module_idx);
+
+    if export_table.is_null() || export_count == 0 || code_base == 0 {
+        return None;
+    }
+
+    for i in 0..export_count as usize {
+        let entry = unsafe { read_export_entry(export_table, i) };
+        if entry.hash == export_hash {
+            let offset = entry.offset & !1;
+            let fn_addr = code_base.wrapping_add(offset as usize);
+            let fn_addr = hal::apply_code_bit(fn_addr);
+            return Some(fn_addr);
+        }
+    }
+
+    None
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1287,5 +1327,7 @@ mod tests {
         assert_eq!(fnv1a32(b"module_new"), export_hashes::MODULE_NEW);
         assert_eq!(fnv1a32(b"module_step"), export_hashes::MODULE_STEP);
         assert_eq!(fnv1a32(b"module_channel_hints"), export_hashes::MODULE_CHANNEL_HINTS);
+        assert_eq!(fnv1a32(b"module_provider_dispatch"), export_hashes::MODULE_PROVIDER_DISPATCH);
+        assert_eq!(fnv1a32(b"module_flash_store_dispatch"), export_hashes::MODULE_FLASH_STORE_DISPATCH);
     }
 }

@@ -43,6 +43,7 @@ modules:
     gain_in: 128
     gain_out: 38
 
+  - name: pio_rp
   - name: i2s_pio
     data_pin: 28
     clock_base: 26

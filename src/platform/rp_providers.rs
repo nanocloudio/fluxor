@@ -19,12 +19,13 @@ pub fn is_gpio_registered(pin_num: u8) -> bool {
 pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     let handle = gpio::gpio_claim(pin_num);
     if handle < 0 {
+        log::error!("[gpio] request_output pin {} claim failed rc={}", pin_num, handle);
         return handle;
     }
     gpio::gpio_set_owner(pin_num, crate::kernel::scheduler::current_module_index() as u8);
-    // Configure as output, initially high (typical for CS pins)
     let result = gpio::gpio_set_mode(handle, gpio::PinMode::Output, true);
     if result < 0 {
+        log::error!("[gpio] request_output pin {} set_mode failed rc={}", pin_num, result);
         gpio::gpio_release(handle);
         return result;
     }
@@ -454,6 +455,95 @@ unsafe fn rp_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, 
             });
             0
         }
+        dev_system::PIO_INPUT_SYNC_BYPASS => {
+            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            let pio_num = *arg;
+            if pio_num > 2 { return E_INVAL; }
+            let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
+            let p = pio_util::pio_pac(pio_num);
+            p.input_sync_bypass().modify(|w| *w |= mask);
+            0
+        }
+        dev_system::PIO_CMD_TRANSFER => {
+            // Atomic PIO cmd transfer: setup SM + DMA in one call (no syscall latency between steps)
+            // arg layout (28 bytes):
+            //   [0] pio_num, [1] sm_num, [2] origin, [3] reserved
+            //   [4..8] write_bits (u32 LE), [8..12] read_bits (u32 LE)
+            //   [12..16] tx_addr (u32 LE), [16..20] tx_words (u32 LE)
+            //   [20..24] rx_addr (u32 LE), [24] dma_ch_tx, [25] dma_ch_rx, [26..28] reserved
+            if arg.is_null() || arg_len < 28 { return E_INVAL; }
+            let pio_num = *arg;
+            let sm_num = *arg.add(1) as usize;
+            let origin = *arg.add(2);
+            if pio_num > 2 || sm_num > 3 { return E_INVAL; }
+
+            let write_bits = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            let read_bits = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            let tx_addr = u32::from_le_bytes([*arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15)]);
+            let tx_words = u32::from_le_bytes([*arg.add(16), *arg.add(17), *arg.add(18), *arg.add(19)]);
+            let rx_addr = u32::from_le_bytes([*arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23)]);
+            let ch_tx = *arg.add(24);
+            let _ch_rx = *arg.add(25);
+
+            let pio = pio_util::pio_pac(pio_num);
+            let sm = pio.sm(sm_num);
+            let sm_mask = 1u8 << sm_num;
+
+            // Disable SM
+            pio.ctrl().modify(|w| w.set_sm_enable(w.sm_enable() & !sm_mask));
+
+            // Set X = write_bits via TXF + forced OUT X,32
+            pio.txf(sm_num).write_value(write_bits);
+            sm.instr().write(|w| w.set_instr(0x6020)); // OUT X, 32
+            cortex_m::asm::delay(10);
+
+            // Set Y = read_bits via TXF + forced OUT Y,32
+            pio.txf(sm_num).write_value(read_bits);
+            sm.instr().write(|w| w.set_instr(0x6040)); // OUT Y, 32
+            cortex_m::asm::delay(10);
+
+            // SET PINDIRS, 1 (output for TX phase)
+            sm.instr().write(|w| w.set_instr(0xE081));
+            cortex_m::asm::delay(10);
+
+            // JMP origin
+            sm.instr().write(|w| w.set_instr(origin as u16));
+            cortex_m::asm::delay(10);
+
+            compiler_fence(Ordering::SeqCst);
+
+            let tx_dreq = (pio_num << 3) + sm_num as u8;
+            let rx_dreq = tx_dreq + 4;
+            let txf_addr = pio.txf(sm_num).as_ptr() as u32;
+            let rxf_addr = pio.rxf(sm_num).as_ptr() as u32;
+
+            // Enable SM first (matches old embassy code ordering)
+            pio.ctrl().modify(|w| w.set_sm_enable(w.sm_enable() | sm_mask));
+
+            compiler_fence(Ordering::SeqCst);
+
+            // Sequential DMA with single channel (matches old code exactly)
+            // ALWAYS do RX DMA — even for write-only transactions.
+            // The PIO program expects the full TX→RX cycle to complete.
+            let rx_words = if read_bits > 0 { (read_bits + 1 + 31) / 32 } else { 1 };
+
+            // TX DMA blocking
+            if tx_words > 0 {
+                crate::kernel::rp_ext::dma_start_raw(ch_tx, tx_addr, txf_addr, tx_words, tx_dreq, 0x05);
+                compiler_fence(Ordering::SeqCst);
+                while crate::kernel::rp_ext::dma_busy(ch_tx) != 0 {}
+                compiler_fence(Ordering::SeqCst);
+            }
+
+            // RX DMA blocking (always — PIO needs full TX→RX cycle)
+            crate::kernel::rp_ext::dma_start_raw(ch_tx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06);
+            compiler_fence(Ordering::SeqCst);
+            while crate::kernel::rp_ext::dma_busy(ch_tx) != 0 {}
+            compiler_fence(Ordering::SeqCst);
+
+            let total = (tx_words * 4 + rx_words * 4) as i32;
+            total
+        }
         // ── Raw DMA bridge ────────────────────────────────────────────
         dev_system::DMA_ALLOC => {
             dma_alloc_channel()
@@ -795,9 +885,13 @@ unsafe fn rp_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, 
         dev_system::FLASH_STORE_ENABLE => {
             if arg.is_null() || arg_len < 4 { return E_INVAL; }
             let fn_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let dispatch: crate::kernel::flash_store::FlashStoreDispatchFn =
-                core::mem::transmute(fn_addr as usize);
             let module_idx = crate::kernel::scheduler::current_module_index();
+            // Resolve export hash to absolute address (PIC-safe)
+            let resolved_addr = crate::kernel::loader::resolve_export_for_module(
+                module_idx, fn_addr
+            ).unwrap_or(fn_addr as usize);
+            let dispatch: crate::kernel::flash_store::FlashStoreDispatchFn =
+                core::mem::transmute(resolved_addr);
             let state = crate::kernel::scheduler::get_module_state(module_idx);
             crate::kernel::flash_store::register_dispatch(dispatch, state)
         }

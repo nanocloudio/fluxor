@@ -342,6 +342,8 @@ const SPI_GET_CAPS: u32 = 0x020A;
 // Provider dispatch — called from kernel via registered function pointer.
 // SAFETY: state is our SpiState, validated at registration time.
 #[unsafe(no_mangle)]
+#[link_section = ".text.module_provider_dispatch"]
+#[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn spi_dispatch(
     state: *mut u8,
     handle: i32,
@@ -548,12 +550,12 @@ pub extern "C" fn module_new(
         }
 
         // Register as SPI provider (device class 0x02)
-        let dispatch_addr = spi_dispatch as *const () as u32;
+        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
         let mut reg_args = [0u8; 8];
         let rp = reg_args.as_mut_ptr();
         *rp = 0x02; // device_class = SPI
         *rp.add(1) = 0; *rp.add(2) = 0; *rp.add(3) = 0;
-        let da = dispatch_addr.to_le_bytes();
+        let da = dispatch_hash.to_le_bytes();
         *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
         (sys.dev_call)(-1, 0x0C20, rp, 8); // REGISTER_PROVIDER
 

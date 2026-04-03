@@ -367,8 +367,10 @@ pub struct RegisterProviderArgs {
     /// Device class to provide (0x00..0x1F).
     pub device_class: u8,
     pub _pad: [u8; 3],
-    /// Module's dispatch function pointer (with Thumb bit set).
-    /// Signature: `fn(state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32`
+    /// FNV-1a hash of the exported dispatch symbol name (e.g. 0xc7832e76 for
+    /// "module_provider_dispatch"). The kernel resolves this hash against the
+    /// module's export table to obtain the actual function address.
+    /// Dispatch signature: `fn(state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32`
     pub dispatch_fn: u32,
 }
 
@@ -557,6 +559,11 @@ pub mod dev_system {
     /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
     /// Returns arena size in bytes (0 if no arena allocated).
     pub const ARENA_GET: u32 = 0x0C3A;
+    /// Fill buffer with cryptographically secure random bytes.
+    /// handle=-1, arg=output buffer, arg_len=requested byte count.
+    /// Returns bytes written (== arg_len) on success, or negative errno.
+    /// Source: TRNG/ROSC on RP, timer hash on BCM2712, getrandom on Linux.
+    pub const CSPRNG_FILL: u32 = 0x0C3C;
 
     // ── Runtime parameter store ──────────────────────────────────────────
 
@@ -572,7 +579,8 @@ pub mod dev_system {
     /// global factory reset (arg[0]=0xFF). handle=-1.
     pub const PARAM_CLEAR_ALL: u32 = 0x0C36;
     /// Register flash store dispatch function. Called by flash module on init.
-    /// handle=-1, arg=[fn_addr:u32 LE] (4 bytes). Kernel stores fn ptr + module state.
+    /// handle=-1, arg=[export_hash:u32 LE] (4 bytes). Kernel resolves the hash
+    /// against the module's export table to get the dispatch address.
     /// Returns 0 or negative errno.
     pub const FLASH_STORE_ENABLE: u32 = 0x0C37;
     /// Raw flash erase: erase 4KB sector (restricted to runtime store bounds).
@@ -676,6 +684,15 @@ pub mod dev_system {
     /// SM restart + clock divider restart.
     /// handle=-1, arg=[pio:u8, mask:u8] (2 bytes).
     pub const PIO_SM_RESTART: u32 = 0x0C7B;
+    /// Set PIO INPUT_SYNC_BYPASS register (bypass 2-FF synchronizer on input pins).
+    /// handle=-1, arg=[pio:u8, pin_mask:u32 LE] (5 bytes). Sets bits in bypass reg.
+    pub const PIO_INPUT_SYNC_BYPASS: u32 = 0x0C7C;
+    /// Atomic PIO CMD transfer — sets up SM + runs DMA in one call.
+    /// handle=-1, arg = PioCmdExecTransferArgs (28 bytes).
+    /// Performs: disable SM, set X (write_bits), set Y (read_bits),
+    /// SET PINDIRS=1, JMP origin, arm DMA, enable SM, wait completion.
+    /// Returns total bytes transferred or negative errno.
+    pub const PIO_CMD_TRANSFER: u32 = 0x0C7D;
 
     // DMA
     /// Allocate a DMA channel. handle=-1, arg=[]. Returns channel number (i32) or <0.

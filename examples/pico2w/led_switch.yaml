@@ -11,6 +11,7 @@ target: pico2w
 
 
 modules:
+  - name: pio_rp
   - name: cyw43
   - name: flash_rp
     mode: 1

@@ -159,6 +159,8 @@ const UART_POLL: u32 = 0x0D04;
 const UART_CONFIGURE: u32 = 0x0D05;
 
 #[unsafe(no_mangle)]
+#[link_section = ".text.module_provider_dispatch"]
+#[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn uart_dispatch(
     state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize,
 ) -> i32 {
@@ -254,11 +256,11 @@ pub extern "C" fn module_new(
         s.in_chan = in_chan; s.out_chan = out_chan; s.ctrl_chan = ctrl_chan;
 
         let sys = &*s.syscalls;
-        let dispatch_addr = uart_dispatch as *const () as u32;
+        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
         let mut reg = [0u8; 8];
         let rp = reg.as_mut_ptr();
         *rp = 0x0D; // UART class
-        let da = dispatch_addr.to_le_bytes();
+        let da = dispatch_hash.to_le_bytes();
         *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
         (sys.dev_call)(-1, 0x0C20, rp, 8);
         dev_log(sys, 3, b"[uart] provider registered".as_ptr(), 25);

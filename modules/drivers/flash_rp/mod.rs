@@ -454,8 +454,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // ---- Register as flash store provider on first step ----
         if s.registered == 0 {
-            let fn_addr = flash_store_dispatch as usize as u32;
-            let mut args = fn_addr.to_le_bytes();
+            let dispatch_hash: u32 = 0x2f7172b5; // FNV-1a("module_flash_store_dispatch")
+            let mut args = dispatch_hash.to_le_bytes();
             let result = (sys.dev_call)(-1, FLASH_STORE_ENABLE, args.as_mut_ptr(), 4);
             if result < 0 {
                 return result;
@@ -681,6 +681,8 @@ unsafe fn emit_msg(s: &FlashState, sys: &SyscallTable, msg_type: u32, payload: *
 /// PARAM_STORE/DELETE/CLEAR_ALL syscalls. The kernel prepends the caller's
 /// module_id to the arg buffer before forwarding here.
 #[no_mangle]
+#[link_section = ".text.module_flash_store_dispatch"]
+#[export_name = "module_flash_store_dispatch"]
 #[link_section = ".text.flash_store_dispatch"]
 pub unsafe extern "C" fn flash_store_dispatch(
     state: *mut u8,

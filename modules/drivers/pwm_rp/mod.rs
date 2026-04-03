@@ -155,6 +155,8 @@ unsafe fn get_slot_mut(s: &mut PwmState, handle: i32) -> *mut PwmSlot {
 // ============================================================================
 
 #[no_mangle]
+#[link_section = ".text.module_provider_dispatch"]
+#[export_name = "module_provider_dispatch"]
 #[link_section = ".text.pwm_provider_dispatch"]
 pub unsafe extern "C" fn pwm_provider_dispatch(
     state: *mut u8,
@@ -420,9 +422,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Register as PWM provider on first step
         if !s.registered {
-            // Build RegisterProviderArgs: [class:u8, pad:3, fn_addr:u32 LE]
-            let fn_addr = pwm_provider_dispatch as usize as u32;
-            let fn_bytes = fn_addr.to_le_bytes();
+            // Build RegisterProviderArgs: [class:u8, pad:3, dispatch_hash:u32 LE]
+            let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
+            let fn_bytes = dispatch_hash.to_le_bytes();
             let mut args = [DEV_CLASS_PWM, 0, 0, 0, fn_bytes[0], fn_bytes[1], fn_bytes[2], fn_bytes[3]];
             let result = (sys.dev_call)(-1, SYS_REGISTER_PROVIDER, args.as_mut_ptr(), 8);
             if result < 0 {

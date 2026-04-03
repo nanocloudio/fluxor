@@ -91,6 +91,8 @@ const PIO_GPIOBASE: u32 = 0x0C78;
 const PIO_TXF_WRITE: u32 = 0x0C79;
 const PIO_FSTAT_READ: u32 = 0x0C7A;
 const PIO_SM_RESTART: u32 = 0x0C7B;
+const PIO_INPUT_SYNC_BYPASS: u32 = 0x0C7C;
+const PIO_CMD_XFER: u32 = 0x0C7D;
 
 const DMA_FD_CREATE: u32 = 0x0C85;
 const DMA_FD_START: u32 = 0x0C86;
@@ -189,8 +191,9 @@ struct CmdSlot {
     clock_div: u32,
     instr_mask: u32,
     instr_origin: u8,
-    dma_ch: u8,       // raw DMA channel (not FD — cmd uses blocking)
-    _pad1: [u8; 2],
+    dma_ch_tx: u8,    // TX DMA channel (raw, blocking)
+    dma_ch_rx: u8,    // RX DMA channel (raw, blocking) — separate for full-duplex
+    _pad1: u8,
     program: PioProgram,
     scratch: [u32; CMD_SCRATCH_WORDS],
 }
@@ -267,6 +270,13 @@ unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8, val
     let vb = value.to_le_bytes();
     *p.add(3) = vb[0]; *p.add(4) = vb[1]; *p.add(5) = vb[2]; *p.add(6) = vb[3];
     (sys.dev_call)(-1, PIO_SM_WRITE_REG, p, 7);
+}
+
+#[inline(always)]
+unsafe fn pio_sm_read_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8) -> u32 {
+    let mut buf = [pio_num, sm, reg, 0, 0, 0, 0];
+    let r = (sys.dev_call)(-1, PIO_SM_READ_REG, buf.as_mut_ptr(), 7);
+    if r >= 0 { r as u32 } else { 0 }
 }
 
 #[inline(always)]
@@ -596,6 +606,15 @@ unsafe fn configure_cmd_sm(
     // Restore pinctrl
     pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
 
+    // Enable input sync bypass on data pin for reduced input latency.
+    // Bypasses the 2-flipflop synchronizer — critical for gSPI RX bit alignment.
+    {
+        let pin_mask = 1u32 << slot.data_pin;
+        let mask_bytes = pin_mask.to_le_bytes();
+        let mut buf = [slot.pio_num, mask_bytes[0], mask_bytes[1], mask_bytes[2], mask_bytes[3]];
+        (sys.dev_call)(-1, PIO_INPUT_SYNC_BYPASS, buf.as_mut_ptr(), 5);
+    }
+
     // Jump to entry point (wrap_target for cmd)
     let entry = origin + slot.program.wrap_target;
     pio_sm_exec(sys, pio_num, sm, entry as u16); // JMP entry
@@ -719,6 +738,8 @@ unsafe fn copy_program(prog: &mut PioProgram, src: *const u16, len: u8, wrap_tar
 // ============================================================================
 
 #[unsafe(no_mangle)]
+#[link_section = ".text.module_provider_dispatch"]
+#[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn pio_dispatch(
     state: *mut u8,
     handle: i32,
@@ -726,6 +747,7 @@ pub unsafe extern "C" fn pio_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
+    if state.is_null() { return -22; }
     let s = &mut *(state as *mut PioState);
     let sys = &*s.syscalls;
 
@@ -956,7 +978,7 @@ pub unsafe extern "C" fn pio_dispatch(
                     (*cp).program_loaded = 0;
                     (*cp).program_status = 0;
                     (*cp).instr_mask = 0;
-                    (*cp).dma_ch = 0xFF;
+                    (*cp).dma_ch_tx = 0xFF; (*cp).dma_ch_rx = 0xFF;
                     return i as i32;
                 }
                 i += 1;
@@ -997,11 +1019,11 @@ pub unsafe extern "C" fn pio_dispatch(
                     pio_pin_setup(sys, (*cp).data_pin, (*cp).pio_num, 1); // PullDown for DIO
                     pio_pin_setup(sys, (*cp).clk_pin, (*cp).pio_num, 0); // None for CLK
                     configure_cmd_sm(sys, &*cp, origin as u8);
-                    // Allocate raw DMA channel
-                    let ch = raw_dma_alloc(sys);
-                    if ch >= 0 {
-                        (*cp).dma_ch = ch as u8;
-                    }
+                    // Allocate two raw DMA channels (TX + RX for full-duplex gSPI)
+                    let tx_ch = raw_dma_alloc(sys);
+                    let rx_ch = raw_dma_alloc(sys);
+                    if tx_ch >= 0 { (*cp).dma_ch_tx = tx_ch as u8; }
+                    if rx_ch >= 0 { (*cp).dma_ch_rx = rx_ch as u8; }
                     (*cp).program_loaded = 1;
                     (*cp).program_status = 2;
                 } else {
@@ -1065,56 +1087,47 @@ pub unsafe extern "C" fn pio_dispatch(
                 }
             }
 
-            let write_bits = if tx_words > 0 { (tx_words << 5) - 1 } else { 0 }; // tx_words * 32 - 1
+            let write_bits = if tx_words > 0 { (tx_words << 5) - 1 } else { 0 };
+            // Always do at least 1 word RX (PIO program needs full TX→RX cycle)
             let read_words = if rx_words > 0 { rx_words } else { 1 };
             let read_bits = (read_words << 5) - 1;
 
             let origin = (*cp).instr_origin;
             let pio_n = (*cp).pio_num;
             let sm_n = (*cp).sm_num;
-            let dma_ch = (*cp).dma_ch;
-            if dma_ch == 0xFF { return -5; }
+            let dma_ch_tx = (*cp).dma_ch_tx;
+            let dma_ch_rx = (*cp).dma_ch_rx;
+            if dma_ch_tx == 0xFF || dma_ch_rx == 0xFF { return -5; }
 
-            // Per-transaction SM setup
-            pio_sm_enable(sys, pio_n, 1 << sm_n, false);
+            // RX writes to the second half of scratch to avoid clobbering TX data
+            let rx_scratch = scratch.add(CMD_SCRATCH_WORDS >> 1);
 
-            // Set X = write_bits (push to TXF, force OUT X, 32)
-            pio_txf_write(sys, pio_n, sm_n, write_bits as u32);
-            pio_sm_exec(sys, pio_n, sm_n, 0x6020); // OUT X, 32
+            // Atomic PIO CMD transfer via kernel — all SM setup + DMA in one call
+            // to eliminate syscall latency between register writes.
+            let mut xfer_args = [0u8; 28];
+            let xp = xfer_args.as_mut_ptr();
+            *xp = pio_n;
+            *xp.add(1) = sm_n;
+            *xp.add(2) = origin;
+            let wb = (write_bits as u32).to_le_bytes();
+            *xp.add(4) = wb[0]; *xp.add(5) = wb[1]; *xp.add(6) = wb[2]; *xp.add(7) = wb[3];
+            let rb = (read_bits as u32).to_le_bytes();
+            *xp.add(8) = rb[0]; *xp.add(9) = rb[1]; *xp.add(10) = rb[2]; *xp.add(11) = rb[3];
+            let ta = (scratch as u32).to_le_bytes();
+            *xp.add(12) = ta[0]; *xp.add(13) = ta[1]; *xp.add(14) = ta[2]; *xp.add(15) = ta[3];
+            let tw = (tx_words as u32).to_le_bytes();
+            *xp.add(16) = tw[0]; *xp.add(17) = tw[1]; *xp.add(18) = tw[2]; *xp.add(19) = tw[3];
+            let ra = (rx_scratch as u32).to_le_bytes();
+            *xp.add(20) = ra[0]; *xp.add(21) = ra[1]; *xp.add(22) = ra[2]; *xp.add(23) = ra[3];
+            *xp.add(24) = dma_ch_tx;
+            *xp.add(25) = dma_ch_rx;
+            (sys.dev_call)(-1, PIO_CMD_XFER, xp, 28);
 
-            // Set Y = read_bits
-            pio_txf_write(sys, pio_n, sm_n, read_bits as u32);
-            pio_sm_exec(sys, pio_n, sm_n, 0x6040); // OUT Y, 32
-
-            // SET PINDIRS, 1 (output)
-            pio_sm_exec(sys, pio_n, sm_n, 0xE081);
-
-            // JMP origin
-            pio_sm_exec(sys, pio_n, sm_n, origin as u16);
-
-            pio_sm_enable(sys, pio_n, 1 << sm_n, true);
-
-            // TX DMA: scratch → PIO TXF (blocking via raw DMA)
-            let tx_dreq = (pio_n << 3) + sm_n; // pio_num * 8 + sm_num
-            if tx_words > 0 {
-                raw_dma_start(sys, dma_ch, scratch as u32,
-                    pio_txf_addr(pio_n, sm_n), tx_words as u32,
-                    tx_dreq, DMA_FLAG_INCR_READ | DMA_FLAG_SIZE_32);
-                while raw_dma_busy(sys, dma_ch) {}
-            }
-
-            // RX DMA: PIO RXF → scratch (blocking)
-            let rx_dreq = (pio_n << 3) + sm_n + 4;
-            raw_dma_start(sys, dma_ch, pio_rxf_addr(pio_n, sm_n),
-                scratch as u32, read_words as u32,
-                rx_dreq, DMA_FLAG_INCR_WRITE | DMA_FLAG_SIZE_32);
-            while raw_dma_busy(sys, dma_ch) {}
-
-            // Copy RX to caller
+            // Copy RX to caller (from second half of scratch where RX DMA wrote)
             let mut total_bytes = tx_len as i32;
             if rx_words > 0 && rx_ptr != 0 && rx_len > 0 {
                 let copy_len = if (rx_words << 2) < rx_len { rx_words << 2 } else { rx_len };
-                let src = scratch as *const u8;
+                let src = rx_scratch as *const u8;
                 let dst = rx_ptr as *mut u8;
                 let mut b = 0usize;
                 while b < copy_len {
@@ -1138,9 +1151,13 @@ pub unsafe extern "C" fn pio_dispatch(
             let cp = s.cmds.as_mut_ptr().add(idx);
             if (*cp).state == SLOT_FREE { return 0; }
             pio_sm_enable(sys, (*cp).pio_num, 1 << (*cp).sm_num, false);
-            if (*cp).dma_ch != 0xFF {
-                raw_dma_free(sys, (*cp).dma_ch);
-                (*cp).dma_ch = 0xFF;
+            if (*cp).dma_ch_tx != 0xFF {
+                raw_dma_free(sys, (*cp).dma_ch_tx);
+                (*cp).dma_ch_tx = 0xFF;
+            }
+            if (*cp).dma_ch_rx != 0xFF {
+                raw_dma_free(sys, (*cp).dma_ch_rx);
+                (*cp).dma_ch_rx = 0xFF;
             }
             if (*cp).instr_mask != 0 {
                 pio_instr_free(sys, (*cp).pio_num, (*cp).instr_mask);
@@ -1340,12 +1357,12 @@ pub extern "C" fn module_new(
 
         // Register as PIO provider (device class 0x04)
         let sys = &*s.syscalls;
-        let dispatch_addr = pio_dispatch as *const () as u32;
+        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
         let mut reg_args = [0u8; 8];
         let rp = reg_args.as_mut_ptr();
         *rp = 0x04; // device_class = PIO
         *rp.add(1) = 0; *rp.add(2) = 0; *rp.add(3) = 0;
-        let da = dispatch_addr.to_le_bytes();
+        let da = dispatch_hash.to_le_bytes();
         *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
         (sys.dev_call)(-1, 0x0C20, rp, 8); // REGISTER_PROVIDER
 

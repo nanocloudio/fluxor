@@ -127,6 +127,7 @@ unsafe fn claimed_slot_mut(handle: i32) -> Result<(usize, &'static mut GpioSlot)
 /// - `EAGAIN` if already claimed
 pub fn gpio_claim(pin_num: u8) -> i32 {
     if pin_num >= runtime_max_gpio() {
+        log::error!("[gpio] claim pin {} rejected: max={}", pin_num, runtime_max_gpio());
         return errno::ERROR;
     }
 

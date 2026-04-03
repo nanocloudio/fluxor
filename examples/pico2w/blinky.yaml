@@ -9,6 +9,7 @@ target: pico2w
 
 
 modules:
+  - name: pio_rp
   - name: cyw43
   - name: sequencer
     step_ms: 500

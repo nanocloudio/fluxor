@@ -325,6 +325,8 @@ unsafe fn bar_unmap(s: &mut PcieScanState, arg: *mut u8, arg_len: usize) -> i32 
 // ============================================================================
 
 #[unsafe(no_mangle)]
+#[link_section = ".text.module_provider_dispatch"]
+#[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn pcie_scan_dispatch(
     state: *mut u8,
     handle: i32,
@@ -427,7 +429,7 @@ pub extern "C" fn module_new(
         // dispatch function via the flash_store-style registration pattern.
 
         // Register dispatch via a custom opcode
-        let dispatch_addr = pcie_scan_dispatch as *const () as u32;
+        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
         let mut reg_args = [0u8; 8];
         let rp = reg_args.as_mut_ptr();
         // Use a "virtual" device class. Since NIC opcodes are 0x0CF0-CF4
@@ -436,7 +438,7 @@ pub extern "C" fn module_new(
         // Class 0x10 is first unused. But required_caps is u16...
         // Simplest: register nothing, kernel dispatches to us directly.
         // The thinned kernel code will call our dispatch fn.
-        let _ = (dispatch_addr, rp);
+        let _ = (dispatch_hash, rp);
 
         dev_log(sys, 3, b"[pcie_scan] ready\0".as_ptr(), 16);
         0

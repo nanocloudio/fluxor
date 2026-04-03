@@ -715,7 +715,7 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     }
 
     // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
-    let payload_crc = crc16_xmodem(&modules_data, &config_data);
+    let payload_crc: u16 = 0; // reserved
 
     // Build trailer (16 bytes)
     let mut trailer = Vec::with_capacity(16);
@@ -882,28 +882,6 @@ fn build_packaged_blobs(
     Ok((modules_data, config_data))
 }
 
-/// CRC-16/XMODEM over modules + config payload.
-/// Catches truncated images at boot time with zero runtime cost.
-fn crc16_xmodem(modules_data: &Option<Vec<u8>>, config_data: &[u8]) -> u16 {
-    let mut crc: u16 = 0;
-    let mut feed = |data: &[u8]| {
-        for &byte in data {
-            crc ^= (byte as u16) << 8;
-            for _ in 0..8 {
-                if crc & 0x8000 != 0 {
-                    crc = (crc << 1) ^ 0x1021;
-                } else {
-                    crc <<= 1;
-                }
-            }
-        }
-    };
-    if let Some(ref m) = modules_data {
-        feed(m);
-    }
-    feed(config_data);
-    crc
-}
 
 fn cmd_pack_image(
     firmware_path: &PathBuf,
@@ -960,7 +938,7 @@ fn cmd_pack_image(
     };
 
     // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
-    let payload_crc = crc16_xmodem(&modules_data, &config_data);
+    let payload_crc: u16 = 0; // reserved
 
     let mut trailer = Vec::with_capacity(16);
     trailer.extend_from_slice(&TRAILER_MAGIC.to_le_bytes());

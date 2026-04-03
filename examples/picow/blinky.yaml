@@ -9,6 +9,7 @@ target: picow
 
 
 modules:
+  - name: pio_rp
   - name: cyw43
   - name: sequencer
     step_ms: 500

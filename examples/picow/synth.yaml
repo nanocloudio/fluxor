@@ -533,6 +533,7 @@ modules:
              tape_echo, metallic_bell, lofi_drums, lofi_beats,
              pure_sine, acid_hifi, acid_303]
 
+  - name: pio_rp
   - name: i2s_pio
     data_pin: 28
     clock_base: 26

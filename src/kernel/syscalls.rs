@@ -234,6 +234,7 @@ unsafe extern "C" fn syscall_dev_call(
             && (INFRA_CLASSES & (1 << class)) == 0
             && (req & (1 << class)) == 0
         {
+            log::error!("[dev_call] class 0x{:02x} blocked for module {} caps=0x{:08x}", class, crate::kernel::scheduler::current_module_index(), req);
             return E_NOSYS;
         }
     }
@@ -554,7 +555,6 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             let args = &*(arg as *const RegisterProviderArgs);
             let class = args.device_class;
             let fn_addr = args.dispatch_fn;
-
             // Validate: module must declare the class in required_caps
             let module_idx = scheduler::current_module_index();
             let required_caps = scheduler::current_module_required_caps();
@@ -565,19 +565,33 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             // Get module state pointer
             let state = scheduler::get_module_state(module_idx);
             if state.is_null() {
+                log::error!("[provider] register class=0x{:02x}: state null for module {}", class, module_idx);
                 return E_INVAL;
             }
 
-            // Transmute u32 address to function pointer
-            let dispatch_fn: provider::ModuleProviderDispatchFn =
-                core::mem::transmute(fn_addr as usize);
+            // fn_addr is either a raw function address (legacy) or FNV-1a hash
+            // of an exported symbol name. Try to resolve from module exports first.
+            let resolved_addr = crate::kernel::loader::resolve_export_for_module(
+                module_idx, fn_addr
+            ).unwrap_or(fn_addr as usize);
 
-            provider::register_module_provider(
+            log::debug!("[provider] register class=0x{:02x} resolved=0x{:08x} module={}",
+                class, resolved_addr, module_idx);
+
+            // Transmute resolved address to function pointer
+            let dispatch_fn: provider::ModuleProviderDispatchFn =
+                core::mem::transmute(resolved_addr);
+
+            let reg_result = provider::register_module_provider(
                 class,
                 module_idx as u8,
                 dispatch_fn,
                 state,
-            )
+            );
+            if reg_result != 0 {
+                log::error!("[provider] register failed class=0x{:02x} rc={}", class, reg_result);
+            }
+            reg_result
         }
         dev_system::ARENA_GET => {
             // Return module's arena pointer via arg buffer, size as return value
@@ -654,6 +668,11 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         // ── ISR tier metrics ──
         dev_system::ISR_METRICS => {
             crate::kernel::isr_tier::isr_metrics_dispatch(arg, arg_len)
+        }
+        // ── CSPRNG fill ──
+        dev_system::CSPRNG_FILL => {
+            if arg.is_null() || arg_len == 0 { return E_INVAL; }
+            hal::csprng_fill(arg, arg_len)
         }
         _ => {
             // Delegate to platform extension for hardware-specific opcodes

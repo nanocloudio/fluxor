@@ -746,6 +746,9 @@ pub fn pack_fmod(
         // ISR tier 2 module exports
         "module_isr_init",
         "module_isr_entry",
+        // Provider dispatch (resolved by kernel via export hash)
+        "module_provider_dispatch",
+        "module_flash_store_dispatch",
     ];
 
     let mut exports: Vec<(String, u32, u32)> = Vec::new();

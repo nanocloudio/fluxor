@@ -34,6 +34,7 @@ struct NetworkTemplate {
 fn wifi_cyw43_template() -> NetworkTemplate {
     NetworkTemplate {
         modules: vec![
+            TemplateModule { name: "pio_rp", param_keys: &[] },
             TemplateModule { name: "cyw43", param_keys: &[] },
             TemplateModule {
                 name: "wifi",

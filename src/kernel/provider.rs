@@ -135,7 +135,10 @@ pub unsafe fn dispatch(class: u8, handle: i32, opcode: u32, arg: *mut u8, arg_le
         // Fall back to kernel provider
         match entry.kernel_dispatch {
             Some(handler) => handler(handle, opcode, arg, arg_len),
-            None => errno::ENOSYS,
+            None => {
+                log::warn!("[provider] class 0x{:02x} op 0x{:04x}: no provider", class, opcode);
+                errno::ENOSYS
+            }
         }
     }
 }
