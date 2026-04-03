@@ -1,0 +1,21 @@
+# Hello Server (Linux hosted)
+#
+# Serves a static HTML page over HTTP using the Linux socket provider.
+# No ip/cyw43 module needed — the OS provides networking.
+#
+# Usage:
+#   fluxor run examples/linux/hello_server.yaml
+#   curl http://localhost:9090/
+target: linux
+
+modules:
+  - name: http
+    port: 9090
+    routes:
+      - path: "/"
+        body: "<html><body><h1>Hello from Fluxor!</h1><p>Running on Linux.</p></body></html>"
+
+  - name: debug
+    mode: plaintext
+
+wiring: []

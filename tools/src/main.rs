@@ -172,6 +172,24 @@ enum Commands {
         #[arg(short, long)]
         target: Option<String>,
     },
+    /// Build one config or all configs in a directory
+    Build {
+        /// Config file (YAML) or directory containing YAML files
+        path: PathBuf,
+        /// Output file (default: auto-derived from target)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Build and run a config (Linux or QEMU targets)
+    Run {
+        /// Config file (YAML)
+        config: PathBuf,
+    },
+    /// Build and flash a config to hardware
+    Flash {
+        /// Config file (YAML)
+        config: PathBuf,
+    },
 }
 
 fn main() {
@@ -214,6 +232,9 @@ fn main() {
             cmd_mktable_config(&config, &modules_dir, &output)
         }
         Commands::Diff { old_config, new_config, target } => cmd_diff(&old_config, &new_config, target.as_deref()),
+        Commands::Build { path, output } => cmd_build(&path, output.as_deref(), verbose),
+        Commands::Run { config } => cmd_run(&config, verbose),
+        Commands::Flash { config } => cmd_flash(&config, verbose),
     };
 
     if let Err(e) = result {
@@ -1349,6 +1370,486 @@ fn cmd_diff(old_path: &PathBuf, new_path: &PathBuf, target_override: Option<&str
     let plan = reconfigure::compute_transition_plan(&old_config, &new_config, modules_dir);
 
     print!("{}", reconfigure::format_plan(&plan));
+
+    Ok(())
+}
+
+// ── Build / Run / Flash ────────────────────────────────────────────────────
+
+/// Result of a successful single-config build.
+struct BuildResult {
+    output_path: PathBuf,
+    family: String,
+    board_id: Option<String>,
+}
+
+/// Derive the output subdirectory from a YAML path relative to `examples/`.
+/// e.g. `examples/pico2w/blinky.yaml` -> "pico2w", otherwise empty string.
+fn subdir_from_path(yaml_path: &std::path::Path) -> String {
+    // Walk components looking for "examples" then take the next component
+    let components: Vec<_> = yaml_path.components().collect();
+    for (i, c) in components.iter().enumerate() {
+        if let std::path::Component::Normal(s) = c {
+            if *s == "examples" {
+                if let Some(std::path::Component::Normal(next)) = components.get(i + 1) {
+                    // Only use as subdir if the YAML is deeper (not directly in examples/)
+                    if i + 2 < components.len() {
+                        return next.to_string_lossy().to_string();
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Build a single YAML config into its output artifact.
+fn build_one(
+    yaml_path: &std::path::Path,
+    output_override: Option<&std::path::Path>,
+    verbose: bool,
+) -> Result<BuildResult> {
+    // Load and parse config
+    let content = match substitute_env_vars(&std::fs::read_to_string(yaml_path)?) {
+        Ok(c) => c,
+        Err(e) => return Err(e),
+    };
+    let config: serde_json::Value = if yaml_path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+
+    let mut config = config;
+    hardware_expand::expand_hardware_section(&mut config)?;
+    let target_desc = resolve_target(&config, None)?;
+    let family = target_desc.family.clone();
+    let silicon_id = target_desc.id.clone();
+    let board_id = target_desc.board_id.clone();
+
+    // Derive output path
+    let name = yaml_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let subdir = subdir_from_path(yaml_path);
+
+    let output_path = if let Some(o) = output_override {
+        o.to_path_buf()
+    } else {
+        match family.as_str() {
+            "rp2" => {
+                let mut p = PathBuf::from(format!("target/{}/uf2", silicon_id));
+                if !subdir.is_empty() {
+                    p.push(&subdir);
+                }
+                p.push(format!("{}.uf2", name));
+                p
+            }
+            "bcm" => {
+                let mut p = PathBuf::from(format!("target/{}/images", silicon_id));
+                if !subdir.is_empty() {
+                    p.push(&subdir);
+                }
+                p.push(format!("{}.img", name));
+                p
+            }
+            "linux" => {
+                let mut p = PathBuf::from(format!("target/linux/{}", name));
+                // Linux produces two files; the "output_path" is the directory
+                p.push("config.bin");
+                p
+            }
+            _ => {
+                return Err(Error::Config(format!(
+                    "Unsupported target family '{}' for build",
+                    family
+                )));
+            }
+        }
+    };
+
+    // Ensure parent directory exists
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match family.as_str() {
+        "rp2" => {
+            // RP family: combine firmware + config + modules -> UF2
+            let firmware_path = PathBuf::from(format!("target/{}/firmware.bin", silicon_id));
+            if !firmware_path.exists() {
+                return Err(Error::Config(format!(
+                    "Firmware not found at {}. Run 'make firmware' first.",
+                    firmware_path.display()
+                )));
+            }
+            let modules_dir = PathBuf::from(format!("target/{}/modules", silicon_id));
+            if !modules_dir.exists() {
+                return Err(Error::Config(format!(
+                    "Modules not found at {}. Run 'make modules' first.",
+                    modules_dir.display()
+                )));
+            }
+            cmd_combine(&firmware_path, &yaml_path.to_path_buf(), &output_path, verbose)?;
+        }
+        "bcm" => {
+            // BCM family: pack-image firmware + config + modules -> img
+            let firmware_path = PathBuf::from(format!("target/{}/firmware.bin", silicon_id));
+            if !firmware_path.exists() {
+                return Err(Error::Config(format!(
+                    "Firmware not found at {}. Run 'make firmware' first.",
+                    firmware_path.display()
+                )));
+            }
+            let modules_dir = PathBuf::from(format!("target/{}/modules", silicon_id));
+            if !modules_dir.exists() {
+                return Err(Error::Config(format!(
+                    "Modules not found at {}. Run 'make modules' first.",
+                    modules_dir.display()
+                )));
+            }
+            cmd_pack_image(
+                &firmware_path,
+                &yaml_path.to_path_buf(),
+                &[modules_dir],
+                &output_path,
+                verbose,
+            )?;
+        }
+        "linux" => {
+            // Linux: generate config.bin + modules.bin in output directory
+            let out_dir = output_path
+                .parent()
+                .unwrap_or(std::path::Path::new("target/linux"));
+            std::fs::create_dir_all(out_dir)?;
+
+            let config_bin_path = out_dir.join("config.bin");
+            let modules_bin_path = out_dir.join("modules.bin");
+
+            // Use bcm2712 modules for linux (aarch64 compatible)
+            let modules_dir = PathBuf::from("target/bcm2712/modules");
+            if !modules_dir.exists() {
+                return Err(Error::Config(format!(
+                    "Modules not found at {}. Run 'make modules TARGET=bcm2712' first.",
+                    modules_dir.display()
+                )));
+            }
+
+            // Generate modules.bin (mktable-config)
+            cmd_mktable_config(
+                &yaml_path.to_path_buf(),
+                &[modules_dir.clone()],
+                &modules_bin_path,
+            )?;
+
+            // Generate config.bin (binary config)
+            cmd_generate(
+                &yaml_path.to_path_buf(),
+                Some(config_bin_path.as_path()),
+                Some(modules_dir.as_path()),
+                true,
+            )?;
+        }
+        _ => {
+            return Err(Error::Config(format!(
+                "Unsupported target family '{}' for build",
+                family
+            )));
+        }
+    }
+
+    Ok(BuildResult {
+        output_path,
+        family,
+        board_id,
+    })
+}
+
+fn cmd_build(path: &PathBuf, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
+    if path.is_dir() {
+        // Glob for all YAML files recursively
+        let mut yamls: Vec<PathBuf> = Vec::new();
+        collect_yaml_files(path, &mut yamls);
+        yamls.sort();
+
+        if yamls.is_empty() {
+            return Err(Error::Config(format!(
+                "No YAML files found in {}",
+                path.display()
+            )));
+        }
+
+        let total = yamls.len();
+        let mut built = 0;
+        let mut failed = 0;
+
+        for yaml in &yamls {
+            match build_one(yaml, None, verbose) {
+                Ok(_) => built += 1,
+                Err(e) => {
+                    eprintln!(
+                        "\x1b[1;33mWarn:\x1b[0m {} -- {}",
+                        yaml.display(),
+                        e
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        println!(
+            "\nBuilt {}/{} configs ({} failed)",
+            built, total, failed
+        );
+        if failed > 0 && built == 0 {
+            return Err(Error::Config("All builds failed".into()));
+        }
+        Ok(())
+    } else {
+        build_one(path, output, verbose)?;
+        Ok(())
+    }
+}
+
+/// Recursively collect *.yaml files from a directory.
+fn collect_yaml_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_yaml_files(&p, out);
+            } else if p.extension().is_some_and(|ext| ext == "yaml" || ext == "yml") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
+    let result = build_one(config_path, None, verbose)?;
+
+    match result.family.as_str() {
+        "linux" => {
+            let out_dir = result.output_path.parent().unwrap();
+            let config_bin = out_dir.join("config.bin");
+            let modules_bin = out_dir.join("modules.bin");
+            let linux_bin = PathBuf::from("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+
+            if !linux_bin.exists() {
+                return Err(Error::Config(format!(
+                    "Linux binary not found at {}. Run 'make linux' first.",
+                    linux_bin.display()
+                )));
+            }
+
+            eprintln!(
+                "Running: {} --config {} --modules {}",
+                linux_bin.display(),
+                config_bin.display(),
+                modules_bin.display()
+            );
+
+            let status = std::process::Command::new(&linux_bin)
+                .arg("--config")
+                .arg(&config_bin)
+                .arg("--modules")
+                .arg(&modules_bin)
+                .status()?;
+
+            if !status.success() {
+                return Err(Error::Config(format!(
+                    "fluxor-linux exited with status {}",
+                    status
+                )));
+            }
+        }
+        "bcm" => {
+            // Check if this is qemu-virt board
+            let is_qemu = result
+                .board_id
+                .as_deref()
+                .map(|b| b == "qemu-virt")
+                .unwrap_or(false);
+
+            if is_qemu {
+                eprintln!("Running: qemu-system-aarch64 -kernel {}", result.output_path.display());
+
+                let status = std::process::Command::new("qemu-system-aarch64")
+                    .args([
+                        "-machine", "virt",
+                        "-cpu", "cortex-a76",
+                        "-m", "2G",
+                        "-nographic",
+                        "-device", "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
+                        "-netdev", "user,id=net0,hostfwd=tcp::18080-:80",
+                        "-kernel",
+                    ])
+                    .arg(&result.output_path)
+                    .status()?;
+
+                if !status.success() {
+                    return Err(Error::Config(format!(
+                        "QEMU exited with status {}",
+                        status
+                    )));
+                }
+            } else {
+                eprintln!("Use 'fluxor flash' for hardware targets");
+                return Err(Error::Config(
+                    "Cannot run BCM hardware targets directly. Use 'fluxor flash' instead.".into(),
+                ));
+            }
+        }
+        "rp2" => {
+            eprintln!("Use 'fluxor flash' for hardware targets");
+            return Err(Error::Config(
+                "Cannot run RP targets directly. Use 'fluxor flash' instead.".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Config(format!(
+                "Unsupported target family '{}' for run",
+                result.family
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_flash(config_path: &PathBuf, verbose: bool) -> Result<()> {
+    let result = build_one(config_path, None, verbose)?;
+
+    match result.family.as_str() {
+        "rp2" => {
+            // Look for mounted Pico in BOOTSEL mode
+            let mut mount_point = None;
+            if let Ok(entries) = std::fs::read_dir("/media") {
+                for entry in entries.flatten() {
+                    let user_dir = entry.path();
+                    if user_dir.is_dir() {
+                        if let Ok(sub_entries) = std::fs::read_dir(&user_dir) {
+                            for sub in sub_entries.flatten() {
+                                let p = sub.path();
+                                if p.file_name().is_some_and(|n| n == "RPI-RP2") {
+                                    mount_point = Some(p);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if mount_point.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            // Also check /run/media/ (some distros)
+            if mount_point.is_none() {
+                if let Ok(entries) = std::fs::read_dir("/run/media") {
+                    for entry in entries.flatten() {
+                        let user_dir = entry.path();
+                        if user_dir.is_dir() {
+                            if let Ok(sub_entries) = std::fs::read_dir(&user_dir) {
+                                for sub in sub_entries.flatten() {
+                                    let p = sub.path();
+                                    if p.file_name().is_some_and(|n| n == "RPI-RP2") {
+                                        mount_point = Some(p);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if mount_point.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref mp) = mount_point {
+                let dest = mp.join(
+                    result
+                        .output_path
+                        .file_name()
+                        .unwrap_or_default(),
+                );
+                eprintln!(
+                    "Copying {} -> {}",
+                    result.output_path.display(),
+                    dest.display()
+                );
+                std::fs::copy(&result.output_path, &dest)?;
+                println!(
+                    "\x1b[1;32mFlashed\x1b[0m {}",
+                    result.output_path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            } else {
+                // Try picotool as fallback
+                let picotool = std::process::Command::new("picotool")
+                    .args(["load", "-f"])
+                    .arg(&result.output_path)
+                    .status();
+
+                match picotool {
+                    Ok(status) if status.success() => {
+                        println!(
+                            "\x1b[1;32mFlashed\x1b[0m {} via picotool",
+                            result.output_path.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                    }
+                    _ => {
+                        return Err(Error::Config(
+                            "No Pico found in BOOTSEL mode (checked /media/*/RPI-RP2/) and picotool not available. \
+                             Hold BOOTSEL and plug in the Pico, then retry."
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        "bcm" => {
+            let is_cm5 = result
+                .board_id
+                .as_deref()
+                .map(|b| b == "cm5")
+                .unwrap_or(false);
+
+            if is_cm5 {
+                let dest = PathBuf::from("/boot/firmware/kernel8.img");
+                eprintln!(
+                    "\x1b[1;33mWarning:\x1b[0m This will replace {}",
+                    dest.display()
+                );
+                eprintln!(
+                    "Copying {} -> {}",
+                    result.output_path.display(),
+                    dest.display()
+                );
+                std::fs::copy(&result.output_path, &dest)?;
+                println!("\x1b[1;32mFlashed\x1b[0m kernel8.img — reboot to apply");
+            } else {
+                return Err(Error::Config(
+                    "Only CM5 targets support flash. Use 'fluxor run' for QEMU targets.".into(),
+                ));
+            }
+        }
+        "linux" => {
+            return Err(Error::Config(
+                "Linux targets run directly. Use 'fluxor run' instead.".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Config(format!(
+                "Unsupported target family '{}' for flash",
+                result.family
+            )));
+        }
+    }
 
     Ok(())
 }
