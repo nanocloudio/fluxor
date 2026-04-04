@@ -193,8 +193,12 @@ unsafe extern "C" fn syscall_dev_call(
     arg_len: usize,
 ) -> i32 {
     use crate::abi::dev_class;
+    use crate::kernel::provider;
 
-    let class = ((opcode >> 8) & 0xFF) as u8;
+    // Check for CHAIN_NEXT flag and strip it
+    let chain_next = (opcode & provider::CHAIN_NEXT) != 0;
+    let clean_opcode = opcode & 0xFFFF;
+    let class = ((clean_opcode >> 8) & 0xFF) as u8;
 
     // Capability enforcement: check if the calling module's tier allows this class.
     // Bit N in the mask = device class N is allowed through dev_call.
@@ -242,8 +246,15 @@ unsafe extern "C" fn syscall_dev_call(
         return E_NOSYS;
     }
 
-    // Dispatch to registered provider
-    crate::kernel::provider::dispatch(class, handle, opcode, arg, arg_len)
+    // Debug: track socket ops going to provider chain
+    // Dispatch to registered provider (or next in chain if CHAIN_NEXT set)
+    let result = if chain_next {
+        let caller = crate::kernel::scheduler::current_module_index() as u8;
+        provider::dispatch_next(caller, class, handle, clean_opcode, arg, arg_len)
+    } else {
+        provider::dispatch(class, handle, clean_opcode, arg, arg_len)
+    };
+    result
 }
 
 // ============================================================================

@@ -1208,6 +1208,44 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
         }
     }
 
+    // Tag 10: cert_file (DER blob, extended TLV for > 255 bytes)
+    if let Some(cert_path) = module.get("cert_file").and_then(|v| v.as_str()) {
+        match std::fs::read(cert_path) {
+            Ok(cert_data) => {
+                let n = cert_data.len();
+                if n > 0 && base + extra_len + 4 + n < entry.len() {
+                    entry[base + extra_len] = 10; // tag
+                    entry[base + extra_len + 1] = 0x00; // extended length marker
+                    entry[base + extra_len + 2] = (n >> 8) as u8;
+                    entry[base + extra_len + 3] = n as u8;
+                    entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&cert_data);
+                    extra_len += 4 + n;
+                    eprintln!("  cert_file: {} ({} bytes)", cert_path, n);
+                }
+            }
+            Err(e) => eprintln!("  warn: cert_file: could not read '{}': {}", cert_path, e),
+        }
+    }
+
+    // Tag 11: key_file (DER blob, extended TLV for > 255 bytes)
+    if let Some(key_path) = module.get("key_file").and_then(|v| v.as_str()) {
+        match std::fs::read(key_path) {
+            Ok(key_data) => {
+                let n = key_data.len();
+                if n > 0 && base + extra_len + 4 + n < entry.len() {
+                    entry[base + extra_len] = 11; // tag
+                    entry[base + extra_len + 1] = 0x00; // extended length marker
+                    entry[base + extra_len + 2] = (n >> 8) as u8;
+                    entry[base + extra_len + 3] = n as u8;
+                    entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&key_data);
+                    extra_len += 4 + n;
+                    eprintln!("  key_file: {} ({} bytes)", key_path, n);
+                }
+            }
+            Err(e) => eprintln!("  warn: key_file: could not read '{}': {}", key_path, e),
+        }
+    }
+
     // Calculate total entry length and write to header
     let entry_len = MODULE_ENTRY_HEADER_SIZE + params_len + extra_len;
     entry[0..2].copy_from_slice(&(entry_len as u16).to_le_bytes());

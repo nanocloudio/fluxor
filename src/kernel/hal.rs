@@ -80,6 +80,10 @@ pub struct HalOps {
     pub merge_runtime_overrides: fn(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize,
     /// Initialize GPIO pins from config. Returns count of pins initialized.
     pub init_gpio: fn(gpio: &[Option<crate::kernel::config::GpioConfig>]) -> usize,
+
+    /// Fill buffer with cryptographically secure random bytes.
+    /// Returns 0 on success, negative errno on failure.
+    pub csprng_fill: fn(buf: *mut u8, len: usize) -> i32,
 }
 
 /// Global HAL operations table. Set once at boot by `init()`.
@@ -249,4 +253,9 @@ pub fn merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: us
 #[inline(always)]
 pub fn init_gpio(gpio: &[Option<crate::kernel::config::GpioConfig>]) -> usize {
     (ops().init_gpio)(gpio)
+}
+
+#[inline(always)]
+pub fn csprng_fill(buf: *mut u8, len: usize) -> i32 {
+    (ops().csprng_fill)(buf, len)
 }

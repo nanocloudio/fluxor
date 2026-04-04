@@ -23,11 +23,17 @@ use crate::kernel::ringbuf::RingBufState;
 /// Maximum concurrent sockets (8 sockets × 1KB = 8KB total socket buffer RAM)
 pub const MAX_SOCKETS: usize = 8;
 
-/// Socket receive buffer size per socket (512 bytes)
-/// Smaller buffers are fine since stream flow control handles backpressure
+/// Socket receive buffer size per socket.
+/// Linux uses 4KB for TLS record support; embedded uses 512B.
+#[cfg(feature = "host-linux")]
+const SOCKET_RX_BUF_SIZE: usize = 4096;
+#[cfg(not(feature = "host-linux"))]
 const SOCKET_RX_BUF_SIZE: usize = 512;
 
-/// Socket transmit buffer size per socket (512 bytes)
+/// Socket transmit buffer size per socket.
+#[cfg(feature = "host-linux")]
+const SOCKET_TX_BUF_SIZE: usize = 4096;
+#[cfg(not(feature = "host-linux"))]
 const SOCKET_TX_BUF_SIZE: usize = 512;
 
 // ============================================================================

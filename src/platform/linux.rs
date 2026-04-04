@@ -21,7 +21,6 @@ use fluxor::kernel::channel;
 use fluxor::kernel::scheduler;
 use fluxor::kernel::step_guard;
 use fluxor::kernel::syscalls;
-use fluxor::modules::Module;
 
 // ============================================================================
 // Linker symbol stub
@@ -128,7 +127,31 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     boot_scan: linux_boot_scan,
     merge_runtime_overrides: linux_merge_runtime_overrides,
     init_gpio: |_| 0,
+    csprng_fill: linux_csprng_fill,
 };
+
+fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+    unsafe {
+        // getrandom() syscall (318 on aarch64 Linux, 318 on x86_64)
+        #[cfg(target_arch = "aarch64")]
+        const SYS_GETRANDOM: i64 = 278;
+        #[cfg(target_arch = "x86_64")]
+        const SYS_GETRANDOM: i64 = 318;
+        let ret: i64;
+        core::arch::asm!(
+            "svc 0",
+            in("x8") SYS_GETRANDOM,
+            in("x0") buf as u64,
+            in("x1") len as u64,
+            in("x2") 0u64,  // flags: 0 = /dev/urandom
+            lateout("x0") ret,
+        );
+        if ret < 0 || ret as usize != len {
+            return -1;
+        }
+        0
+    }
+}
 
 // ============================================================================
 // CLI argument parsing
@@ -354,8 +377,6 @@ unsafe fn linux_service_sockets() {
                             libc::SOCK_NONBLOCK,
                         );
                         if new_fd >= 0 {
-                            // Replace listening fd with connected fd.
-                            // The slot transforms from listening to connected.
                             libc::close(lsock.fd);
                             lsock.fd = new_fd;
                             lsock.listening = false;
@@ -364,7 +385,7 @@ unsafe fn linux_service_sockets() {
                                 u16::from_be(addr.sin_port),
                             );
                             slot.complete_op(0);
-                            slot.set_state(4); // Connected
+                            slot.set_state(4);
                             slot.set_poll_flags(poll_flags::CONN);
                         } else {
                             let err = *libc::__errno_location();
@@ -696,12 +717,25 @@ fn main() {
 
     // Instantiate modules
     let syscall_table = syscalls::get_table_for_module_type(0);
-    let mut modules: Vec<Option<DynamicModule>> = Vec::with_capacity(n_modules);
+    let mut modules: Vec<bool> = Vec::with_capacity(n_modules);
 
     for i in 0..n_modules {
         if let Some(ref entry) = cfg.modules[i] {
             if let Ok(m) = ldr.find_by_name_hash(entry.name_hash) {
                 scheduler::set_current_module(i);
+
+                // Store export table and caps info for provider registration
+                scheduler::set_module_exports(
+                    i,
+                    m.code_base() as usize,
+                    m.export_table_ptr(),
+                    m.header.export_count,
+                );
+                let cap_class = match m.header.module_type {
+                    5 => 3, 3 => 1, 4 => 2, _ => 0,
+                };
+                scheduler::set_module_caps(i, cap_class, m.header.required_caps() as u32);
+
                 let result = unsafe {
                     DynamicModule::start_new(
                         &m, syscall_table,
@@ -712,7 +746,8 @@ fn main() {
                 match result {
                     Ok(StartNewResult::Ready(dm)) => {
                         log::info!("[inst] module {} ready", i);
-                        modules.push(Some(dm));
+                        scheduler::store_dynamic_module(i, dm);
+                        modules.push(true);
                     }
                     Ok(StartNewResult::Pending(mut pending)) => {
                         let mut loaded = false;
@@ -721,14 +756,15 @@ fn main() {
                             match unsafe { pending.try_complete() } {
                                 Ok(Some(dm)) => {
                                     log::info!("[inst] module {} ready (pending)", i);
-                                    modules.push(Some(dm));
+                                    scheduler::store_dynamic_module(i, dm);
+                                    modules.push(true);
                                     loaded = true;
                                     break;
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
                                     log::error!("[inst] module {} failed: {:?}", i, e);
-                                    modules.push(None);
+                                    modules.push(false);
                                     loaded = true;
                                     break;
                                 }
@@ -736,24 +772,24 @@ fn main() {
                         }
                         if !loaded {
                             log::error!("[inst] module {} timeout", i);
-                            modules.push(None);
+                            modules.push(false);
                         }
                     }
                     Err(e) => {
                         log::error!("[inst] module {} error: {:?}", i, e);
-                        modules.push(None);
+                        modules.push(false);
                     }
                 }
             } else {
                 log::warn!("[inst] module {} not found (hash={:#010x})", i, entry.name_hash);
-                modules.push(None);
+                modules.push(false);
             }
         } else {
-            modules.push(None);
+            modules.push(false);
         }
     }
 
-    let loaded_count = modules.iter().filter(|m| m.is_some()).count();
+    let loaded_count = modules.iter().filter(|m| **m).count();
     log::info!("[inst] {} of {} modules loaded", loaded_count, n_modules);
 
     if loaded_count == 0 {
@@ -769,9 +805,10 @@ fn main() {
     loop {
         let t0 = Instant::now();
 
-        for m in modules.iter_mut() {
-            if let Some(ref mut dm) = m {
-                let _ = dm.step();
+        for i in 0..modules.len() {
+            if modules[i] {
+                scheduler::set_current_module(i);
+                scheduler::step_module(i);
             }
         }
 
@@ -785,7 +822,6 @@ fn main() {
             log::info!("[sched] alive t={} elapsed_ms={}", tick, linux_now_millis());
         }
 
-        // Sleep for the remainder of the tick
         let elapsed = t0.elapsed();
         if elapsed < tick_duration {
             std::thread::sleep(tick_duration - elapsed);

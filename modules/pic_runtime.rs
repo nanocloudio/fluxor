@@ -6,6 +6,53 @@
 // Compiler Intrinsics: ARM EABI memclr/memcpy for struct init/assignment.
 // Param Helpers: Safe(r) little-endian reads from a raw params pointer.
 
+
+// ============================================================================
+// Core runtime stubs for slice bounds-checking
+// ============================================================================
+
+// Bounds-checked slice indexing (`&data[a..b]`) emits calls to these core
+// functions. In freestanding PIC modules, core's panic infrastructure isn't
+// linked. We provide the actual Rust functions so the compiler resolves them.
+// These trap (same as the panic handler) — only reached on actual OOB access.
+
+#[allow(dead_code)]
+mod core_stubs {
+    #[inline(never)]
+    pub fn slice_index_trap() -> ! { loop {} }
+}
+
+// The compiler emits mangled calls into core::slice::index and core::panicking.
+// Hash suffixes are toolchain-dependent. If a toolchain upgrade changes them,
+// extract new hashes: readelf -Ws module.o | grep UND
+// thumbv8m (RP2350):
+#[no_mangle]
+pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h4ded73b0c5f4c0cfE(_: usize, _: usize) -> ! {
+    loop {}
+}
+#[no_mangle]
+pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h974ddc284291fde1E(_: usize, _: usize) -> ! {
+    loop {}
+}
+// aarch64 (BCM2712/Linux):
+#[no_mangle]
+pub extern "C" fn _ZN4core5slice5index16slice_index_fail17hf6dd4a5d97b8b298E(_: usize, _: usize) -> ! {
+    loop {}
+}
+#[no_mangle]
+pub extern "C" fn _ZN4core9panicking18panic_bounds_check17he29bb21320f32a38E(_: usize, _: usize) -> ! {
+    loop {}
+}
+// thumbv6m (RP2040):
+#[no_mangle]
+pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h9ac54fc02d7db528E(_: usize, _: usize) -> ! {
+    loop {}
+}
+#[no_mangle]
+pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h1329d9c5a4d8cefbE(_: usize, _: usize) -> ! {
+    loop {}
+}
+
 // ============================================================================
 // Compiler Runtime Intrinsics
 // ============================================================================
@@ -340,6 +387,9 @@ pub const E_CONNREFUSED: i32 = -111;
 
 pub const SOCK_TYPE_STREAM: u8 = 1;
 pub const SOCK_TYPE_DGRAM: u8 = 2;
+
+/// Flag ORed onto opcode to dispatch to the next provider below the caller.
+pub const CHAIN_NEXT: u32 = 0x0001_0000;
 
 // ============================================================================
 // Network Interface State (set via dev_netif_set_state)
@@ -760,6 +810,29 @@ unsafe fn dev_socket_listen(sys: &SyscallTable, handle: i32) -> i32 {
 #[inline(always)]
 unsafe fn dev_socket_accept(sys: &SyscallTable, handle: i32) -> i32 {
     (sys.dev_call)(handle, 0x0808, core::ptr::null_mut(), 0)
+}
+
+/// Register as a provider for a device class.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_register_provider(sys: &SyscallTable, class: u8, dispatch_fn: usize, state: *mut u8) -> i32 {
+    let mut buf = [0u8; 8];
+    buf[0] = class;
+    // dispatch_fn as u32 (function pointer)
+    let fn_bytes = (dispatch_fn as u32).to_le_bytes();
+    buf[4] = fn_bytes[0];
+    buf[5] = fn_bytes[1];
+    buf[6] = fn_bytes[2];
+    buf[7] = fn_bytes[3];
+    (sys.dev_call)(-1, 0x0C20, buf.as_mut_ptr(), 8)
+}
+
+/// Fill buffer with cryptographically secure random bytes.
+/// Returns 0 on success, negative errno on failure.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
+    (sys.dev_call)(-1, 0x0C3C, buf, len)
 }
 
 // ============================================================================

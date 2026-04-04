@@ -1056,6 +1056,43 @@ pub fn get_module_exports(idx: usize) -> (usize, *const u8, u16) {
     }
 }
 
+/// Set the export table info for a module (used by Linux platform loader).
+pub fn set_module_exports(idx: usize, code_base: usize, export_table: *const u8, export_count: u16) {
+    if idx >= MAX_MODULES { return; }
+    unsafe {
+        SCHED.module_code_base[idx] = code_base;
+        SCHED.module_export_table[idx] = export_table;
+        SCHED.module_export_count[idx] = export_count;
+    }
+}
+
+/// Set the capability class and required_caps for a module (used by Linux platform loader).
+pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32) {
+    if idx >= MAX_MODULES { return; }
+    unsafe {
+        SCHED.cap_class[idx] = cap_class;
+        SCHED.required_caps[idx] = required_caps;
+    }
+}
+
+/// Step a single module by index (used by Linux platform main loop).
+pub fn step_module(idx: usize) {
+    if idx >= MAX_MODULES { return; }
+    unsafe {
+        if let ModuleSlot::Dynamic(ref mut m) = SCHED.modules[idx] {
+            let _ = m.step();
+        }
+    }
+}
+
+/// Store a DynamicModule in the scheduler's module table (used by Linux platform).
+pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
+    if idx >= MAX_MODULES { return; }
+    unsafe {
+        SCHED.modules[idx] = ModuleSlot::Dynamic(dm);
+    }
+}
+
 /// Return the graph-level sample rate (0 = not configured).
 pub fn graph_sample_rate() -> u32 {
     unsafe { SCHED.graph_sample_rate }

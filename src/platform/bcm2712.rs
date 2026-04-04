@@ -1675,7 +1675,77 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     boot_scan: bcm_boot_scan,
     merge_runtime_overrides: bcm_merge_runtime_overrides,
     init_gpio: |_| 0, // no GPIO init on aarch64 (handled by PIC modules)
+    csprng_fill: bcm_csprng_fill,
 };
+
+// iproc-rng200 registers (BCM2712 / Pi 5)
+#[cfg(feature = "board-cm5")]
+const RNG200_BASE: usize = 0xFE10_4000;
+#[cfg(feature = "board-cm5")]
+const RNG200_CTRL: *mut u32 = (RNG200_BASE + 0x00) as *mut u32;
+#[cfg(feature = "board-cm5")]
+#[allow(dead_code)]
+const RNG200_STATUS: *const u32 = (RNG200_BASE + 0x04) as *const u32;
+#[cfg(feature = "board-cm5")]
+const RNG200_DATA: *const u32 = (RNG200_BASE + 0x08) as *const u32;
+#[cfg(feature = "board-cm5")]
+const RNG200_COUNT: *const u32 = (RNG200_BASE + 0x0C) as *const u32;
+
+/// Fill buffer with hardware random bytes.
+///
+/// Pi 5 (board-cm5): Uses iproc-rng200 hardware TRNG at 0xFE104000.
+/// QEMU virt: Uses CNTPCT_EL0 counter jitter with LCG mixing (weak).
+fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+    unsafe {
+        #[cfg(feature = "board-cm5")]
+        {
+            // Enable RNG if not already running
+            let ctrl = core::ptr::read_volatile(RNG200_CTRL);
+            if ctrl & 1 == 0 {
+                core::ptr::write_volatile(RNG200_CTRL, ctrl | 1);
+                // Wait for initial seed
+                let mut wait = 0u32;
+                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 100_000 {
+                    wait += 1;
+                }
+            }
+
+            let mut i = 0usize;
+            while i < len {
+                // Wait for data available
+                let mut wait = 0u32;
+                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 100_000 {
+                    wait += 1;
+                }
+                let word = core::ptr::read_volatile(RNG200_DATA);
+                let bytes = word.to_le_bytes();
+                let mut j = 0;
+                while j < 4 && i < len {
+                    core::ptr::write_volatile(buf.add(i), bytes[j]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+
+        #[cfg(not(feature = "board-cm5"))]
+        {
+            // QEMU virt: no hardware RNG. Use counter jitter + LCG mixing.
+            // Adequate for testing only.
+            let mut state: u64 = 0;
+            let mut i = 0usize;
+            while i < len {
+                let cnt: u64;
+                core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) cnt);
+                state ^= cnt;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                core::ptr::write_volatile(buf.add(i), (state >> 32) as u8);
+                i += 1;
+            }
+        }
+    }
+    len as i32
+}
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

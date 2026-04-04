@@ -8,7 +8,9 @@
 //! - Kernel-internal functions (registered at startup via `register()`)
 //! - PIC module exports (registered at runtime via `register_module_provider()`)
 //!
-//! Module providers take priority over kernel providers for the same class.
+//! Module providers form a chain (stack) per device class. The top-of-chain
+//! provider receives dispatch first. Middleware modules (TLS, compression)
+//! can intercept calls and forward to the next layer via `CHAIN_NEXT`.
 
 use crate::kernel::errno;
 
@@ -28,25 +30,35 @@ pub type ModuleProviderDispatchFn =
 /// Maximum device classes (matches 5-bit class field extracted from opcode).
 const MAX_PROVIDERS: usize = 32;
 
+/// Maximum chain depth per device class (kernel + up to 3 middleware modules).
+pub const MAX_CHAIN_DEPTH: usize = 3;
+
+/// Flag ORed onto opcode to dispatch to the next provider below the caller.
+pub const CHAIN_NEXT: u32 = 0x0001_0000;
+
+/// A single layer in a provider chain.
+struct ProviderLayer {
+    module_idx: u8,
+    dispatch: ModuleProviderDispatchFn,
+    state: *mut u8,
+}
+
 /// Provider entry — combines kernel and module providers for a single device class.
 struct ProviderEntry {
     /// Kernel-internal dispatch (None if no kernel provider).
     kernel_dispatch: Option<ProviderDispatch>,
-    /// Module provider index (0xFF = none).
-    module_idx: u8,
-    /// Module provider dispatch function (None if no module provider).
-    module_dispatch: Option<ModuleProviderDispatchFn>,
-    /// Module state pointer (passed as first arg to module dispatch).
-    module_state: *mut u8,
+    /// Module provider chain (stack). chain[depth-1] is the top.
+    chain: [Option<ProviderLayer>; MAX_CHAIN_DEPTH],
+    /// Number of active layers in the chain.
+    depth: u8,
 }
 
 impl ProviderEntry {
     const fn empty() -> Self {
         Self {
             kernel_dispatch: None,
-            module_idx: 0xFF,
-            module_dispatch: None,
-            module_state: core::ptr::null_mut(),
+            chain: [const { None }; MAX_CHAIN_DEPTH],
+            depth: 0,
         }
     }
 }
@@ -67,8 +79,8 @@ pub fn register(class: u8, dispatch: ProviderDispatch) {
 
 /// Register a PIC module as provider for a device class.
 ///
-/// Returns 0 on success, EINVAL if class is out of range,
-/// EBUSY if a module provider is already registered for this class.
+/// Pushes the module onto the top of the chain. Returns 0 on success,
+/// EINVAL if class is out of range, EBUSY if chain is full.
 pub fn register_module_provider(
     class: u8,
     module_idx: u8,
@@ -80,36 +92,70 @@ pub fn register_module_provider(
         return errno::EINVAL;
     }
     unsafe {
-        if PROVIDERS[idx].module_dispatch.is_some() {
+        let entry = &mut PROVIDERS[idx];
+
+        // Check same module isn't already registered for this class
+        for i in 0..entry.depth as usize {
+            if let Some(ref layer) = entry.chain[i] {
+                if layer.module_idx == module_idx {
+                    return errno::EBUSY;
+                }
+            }
+        }
+
+        // Check chain capacity
+        if entry.depth as usize >= MAX_CHAIN_DEPTH {
             return errno::EBUSY;
         }
-        PROVIDERS[idx].module_idx = module_idx;
-        PROVIDERS[idx].module_dispatch = Some(dispatch);
-        PROVIDERS[idx].module_state = state;
+
+        // Push onto top of chain
+        let d = entry.depth as usize;
+        entry.chain[d] = Some(ProviderLayer {
+            module_idx,
+            dispatch,
+            state,
+        });
+        entry.depth += 1;
+        log::info!("[provider] module {} registered for class 0x{:02x} at depth {}", module_idx, class, entry.depth);
     }
     0
 }
 
-/// Unregister a module provider for a device class.
-///
 /// Release all module providers owned by a given module index.
 /// Called on module finish (Done/Error) for cleanup.
+/// Compacts chains to maintain stack ordering.
 pub fn release_module_providers(module_idx: u8) {
     unsafe {
         let providers = &mut *(&raw mut PROVIDERS);
         for entry in providers.iter_mut() {
-            if entry.module_idx == module_idx {
-                entry.module_idx = 0xFF;
-                entry.module_dispatch = None;
-                entry.module_state = core::ptr::null_mut();
+            // Compact: remove layers belonging to this module
+            let mut write = 0usize;
+            for read in 0..entry.depth as usize {
+                let keep = match &entry.chain[read] {
+                    Some(layer) => layer.module_idx != module_idx,
+                    None => false,
+                };
+                if keep {
+                    if write != read {
+                        // Move layer down
+                        let layer = entry.chain[read].take();
+                        entry.chain[write] = layer;
+                    }
+                    write += 1;
+                }
             }
+            // Clear remaining slots
+            for i in write..entry.depth as usize {
+                entry.chain[i] = None;
+            }
+            entry.depth = write as u8;
         }
     }
 }
 
 /// Dispatch an operation to the registered provider for the given class.
 ///
-/// Module providers take priority over kernel providers.
+/// Module provider chain top takes priority. Falls back to kernel provider.
 /// Returns E_NOSYS if no provider is registered for this class.
 ///
 /// # Safety
@@ -123,13 +169,16 @@ pub unsafe fn dispatch(class: u8, handle: i32, opcode: u32, arg: *mut u8, arg_le
     unsafe {
         let entry = &PROVIDERS[idx];
 
-        // Try module provider first
-        if let Some(dispatch_fn) = entry.module_dispatch {
-            let saved = crate::kernel::scheduler::current_module_index();
-            crate::kernel::scheduler::set_current_module(entry.module_idx as usize);
-            let result = dispatch_fn(entry.module_state, handle, opcode, arg, arg_len);
-            crate::kernel::scheduler::set_current_module(saved);
-            return result;
+        // Dispatch to top of chain if any module providers registered
+        if entry.depth > 0 {
+            let top = (entry.depth - 1) as usize;
+            if let Some(ref layer) = entry.chain[top] {
+                let saved = crate::kernel::scheduler::current_module_index();
+                crate::kernel::scheduler::set_current_module(layer.module_idx as usize);
+                let result = (layer.dispatch)(layer.state, handle, opcode, arg, arg_len);
+                crate::kernel::scheduler::set_current_module(saved);
+                return result;
+            }
         }
 
         // Fall back to kernel provider
@@ -139,6 +188,77 @@ pub unsafe fn dispatch(class: u8, handle: i32, opcode: u32, arg: *mut u8, arg_le
                 log::warn!("[provider] class 0x{:02x} op 0x{:04x}: no provider", class, opcode);
                 errno::ENOSYS
             }
+        }
+    }
+}
+
+/// Dispatch to the next provider below the caller in the chain.
+///
+/// Called when a module sets the CHAIN_NEXT flag on an opcode.
+/// Finds the caller's position in the chain and dispatches to the layer below.
+/// If the caller is at the bottom (position 0), dispatches to the kernel provider.
+///
+/// # Safety
+/// Same requirements as `dispatch`.
+pub unsafe fn dispatch_next(
+    caller_module: u8,
+    class: u8,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    let idx = class as usize;
+    if idx >= MAX_PROVIDERS {
+        return errno::ENOSYS;
+    }
+    unsafe {
+        let entry = &PROVIDERS[idx];
+
+        // Find caller's position in the chain (search top-down)
+        let mut caller_pos: Option<usize> = None;
+        for i in (0..entry.depth as usize).rev() {
+            if let Some(ref layer) = entry.chain[i] {
+                if layer.module_idx == caller_module {
+                    caller_pos = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let pos = match caller_pos {
+            Some(p) => p,
+            None => {
+                // Caller not in chain — fall back to kernel provider
+                return match entry.kernel_dispatch {
+                    Some(handler) => handler(handle, opcode, arg, arg_len),
+                    None => errno::ENOSYS,
+                };
+            }
+        };
+
+        // If caller is at bottom (position 0), dispatch to kernel provider
+        if pos == 0 {
+            return match entry.kernel_dispatch {
+                Some(handler) => handler(handle, opcode, arg, arg_len),
+                None => errno::ENOSYS,
+            };
+        }
+
+        // Dispatch to layer below
+        let below = pos - 1;
+        if let Some(ref layer) = entry.chain[below] {
+            let saved = crate::kernel::scheduler::current_module_index();
+            crate::kernel::scheduler::set_current_module(layer.module_idx as usize);
+            let result = (layer.dispatch)(layer.state, handle, opcode, arg, arg_len);
+            crate::kernel::scheduler::set_current_module(saved);
+            return result;
+        }
+
+        // Gap in chain — shouldn't happen but fall back to kernel
+        match entry.kernel_dispatch {
+            Some(handler) => handler(handle, opcode, arg, arg_len),
+            None => errno::ENOSYS,
         }
     }
 }

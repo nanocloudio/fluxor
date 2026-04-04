@@ -322,7 +322,32 @@ static RP_HAL_OPS: HalOps = HalOps {
     boot_scan: rp_boot_scan,
     merge_runtime_overrides: rp_merge_runtime_overrides,
     init_gpio: |gpio| fluxor::kernel::gpio::init_all_from_config(gpio),
+    csprng_fill: rp_csprng_fill,
 };
+
+/// Fill buffer with random bytes from the ROSC RANDOMBIT register.
+///
+/// RP2040/RP2350 both have a ring oscillator with a RANDOMBIT register that
+/// provides one random bit per read from oscillator jitter. We accumulate
+/// 8 bits per output byte. This is genuine hardware entropy suitable for
+/// seeding cryptographic keys.
+fn rp_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+    unsafe {
+        use embassy_rp::pac;
+        let mut i = 0usize;
+        while i < len {
+            let mut byte: u8 = 0;
+            let mut bit = 0u32;
+            while bit < 8 {
+                byte = (byte << 1) | (pac::ROSC.randombit().read().randombit() as u8);
+                bit += 1;
+            }
+            core::ptr::write_volatile(buf.add(i), byte);
+            i += 1;
+        }
+    }
+    len as i32
+}
 
 // ============================================================================
 // Step guard platform backends (RP2350 / RP2040)

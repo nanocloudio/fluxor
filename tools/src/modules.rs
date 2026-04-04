@@ -180,8 +180,10 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     result.extend_from_slice(&MODULE_TABLE_MAGIC.to_le_bytes());
     result.push(TABLE_VERSION);
     result.push(modules.len() as u8);
-    result.extend_from_slice(&(total_size as u16).to_le_bytes());
-    result.extend_from_slice(&[0u8; 8]); // reserved
+    // total_size as u32 split across u16 lo + u16 hi (backward compatible)
+    result.extend_from_slice(&((total_size & 0xFFFF) as u16).to_le_bytes());
+    result.extend_from_slice(&(((total_size >> 16) & 0xFFFF) as u16).to_le_bytes());
+    result.extend_from_slice(&[0u8; 6]); // remaining reserved
 
     // Entries (16 bytes each)
     for (i, module) in modules.iter().enumerate() {

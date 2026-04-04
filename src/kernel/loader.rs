@@ -353,8 +353,9 @@ pub struct ModuleTableHeader {
     pub magic: u32,
     pub version: u8,
     pub module_count: u8,
-    pub total_size: u16,
-    pub reserved: [u8; 8],
+    pub total_size_lo: u16,   // low 16 bits (backward compat)
+    pub total_size_hi: u16,   // high 16 bits (uses first 2 reserved bytes)
+    pub reserved: [u8; 6],
 }
 
 /// Module table entry (16 bytes)
