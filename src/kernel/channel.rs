@@ -246,11 +246,20 @@ impl ChannelSlot {
     where
         F: FnOnce(&mut FifoState, Option<&mut [u8]>) -> R,
     {
+        // Bounded spin with yield to prevent starvation under cross-core contention.
+        // The critical section is short (ring buffer read/write), so contention is brief.
+        let mut spins = 0u32;
         while self
             .lock
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            spins += 1;
+            if spins > 256 {
+                #[cfg(target_arch = "aarch64")]
+                unsafe { core::arch::asm!("yield", options(nomem, nostack)); }
+                spins = 0;
+            }
             core::hint::spin_loop();
         }
         let buf_ptr = self.get_buffer_ptr();

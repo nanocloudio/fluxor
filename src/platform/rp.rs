@@ -323,6 +323,7 @@ static RP_HAL_OPS: HalOps = HalOps {
     merge_runtime_overrides: rp_merge_runtime_overrides,
     init_gpio: |gpio| fluxor::kernel::gpio::init_all_from_config(gpio),
     csprng_fill: rp_csprng_fill,
+    core_id: || 0, // Single-core on RP2350/RP2040
 };
 
 /// Fill buffer with random bytes from the ROSC RANDOMBIT register.

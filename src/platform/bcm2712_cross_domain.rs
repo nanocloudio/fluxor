@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const CACHE_LINE: usize = 64;
 
 /// Maximum number of cross-domain channels.
-pub const MAX_CROSS_CHANNELS: usize = 8;
+pub const MAX_CROSS_CHANNELS: usize = 32;
 
 /// Maximum number of cores we can wake.
 pub const MAX_SECONDARY_CORES: usize = 3;
@@ -810,9 +810,6 @@ pub fn dma_arena_reset() {
 /// Maximum number of execution domains (matches scheduler).
 pub const MAX_DOMAINS: usize = 4;
 
-/// Maximum modules per domain.
-pub const MAX_MODULES_PER_DOMAIN: usize = 16;
-
 /// Per-domain execution state, used by secondary core loops.
 ///
 /// The boot core (core 0) populates these during init. Secondary cores
@@ -877,6 +874,10 @@ pub struct CrossDomainEdge {
     pub to_port: u8,
     /// Index into CROSS_CHANNELS.
     pub channel_idx: u8,
+    /// Local channel handle on the producer side (module writes to this).
+    pub local_out_handle: i32,
+    /// Local channel handle on the consumer side (module reads from this).
+    pub local_in_handle: i32,
 }
 
 impl CrossDomainEdge {
@@ -889,12 +890,14 @@ impl CrossDomainEdge {
             to_module: 0,
             to_port: 0,
             channel_idx: 0,
+            local_out_handle: -1,
+            local_in_handle: -1,
         }
     }
 }
 
 /// Maximum number of cross-domain edges.
-pub const MAX_CROSS_EDGES: usize = MAX_CROSS_CHANNELS;
+pub const MAX_CROSS_EDGES: usize = 32;
 
 /// Global cross-domain edge table.
 static mut CROSS_EDGES: [CrossDomainEdge; MAX_CROSS_EDGES] = [const { CrossDomainEdge::empty() }; MAX_CROSS_EDGES];

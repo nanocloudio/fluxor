@@ -307,8 +307,8 @@ pub fn read_layout() -> Option<FlashLayout> {
 }
 
 /// Maximum counts
-pub const MAX_MODULES: usize = 16;
-pub const MAX_GRAPH_EDGES: usize = 31;
+pub const MAX_MODULES: usize = 24;
+pub const MAX_GRAPH_EDGES: usize = 48;
 
 /// Hardware section binary format sizes
 pub const SPI_CONFIG_BIN_SIZE: usize = 8;
@@ -319,7 +319,7 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 
 /// Graph section binary format sizes
 pub const GRAPH_EDGE_SIZE: usize = 4;
-pub const GRAPH_SECTION_SIZE: usize = 80; // 4 header + 15 edges * 4 bytes + 16 domain metadata
+pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + 16; // header + edges + domain metadata
 
 // ============================================================================
 // Graph Config (Version 1: Variable-Length Module Entries)

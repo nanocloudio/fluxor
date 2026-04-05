@@ -84,6 +84,9 @@ pub struct HalOps {
     /// Fill buffer with cryptographically secure random bytes.
     /// Returns 0 on success, negative errno on failure.
     pub csprng_fill: fn(buf: *mut u8, len: usize) -> i32,
+
+    /// Return the current CPU core ID (0-3). Returns 0 on single-core platforms.
+    pub core_id: fn() -> usize,
 }
 
 /// Global HAL operations table. Set once at boot by `init()`.
@@ -258,4 +261,10 @@ pub fn init_gpio(gpio: &[Option<crate::kernel::config::GpioConfig>]) -> usize {
 #[inline(always)]
 pub fn csprng_fill(buf: *mut u8, len: usize) -> i32 {
     (ops().csprng_fill)(buf, len)
+}
+
+/// Return the current CPU core ID (0-3). Returns 0 on single-core platforms.
+#[inline(always)]
+pub fn core_id() -> usize {
+    (ops().core_id)()
 }

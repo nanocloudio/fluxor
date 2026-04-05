@@ -694,17 +694,18 @@ unsafe extern "C" fn irq_handler() {
 // ============================================================================
 
 /// Maximum modules per domain on this platform.
-const MAX_MODS_PER_DOMAIN: usize = 8;
+const MAX_MODS_PER_DOMAIN: usize = 12;
 
 /// Module storage for each domain. Domain 0 is on core 0, domain 1 on core 1, etc.
 /// Each domain's modules array is only accessed by its owning core after init.
 struct DomainModules {
     modules: [Option<loader::DynamicModule>; MAX_MODS_PER_DOMAIN],
     count: usize,
-    /// Local channel handles per module: input, output, ctrl.
-    /// Used for cross-domain channel pumping.
-    mod_in: [i32; MAX_MODS_PER_DOMAIN],
-    mod_out: [i32; MAX_MODS_PER_DOMAIN],
+    /// Topological execution order (domain-local indices).
+    exec_order: [u8; MAX_MODS_PER_DOMAIN],
+    exec_order_count: usize,
+    /// Map from domain-local index to global module index.
+    global_idx: [u8; MAX_MODS_PER_DOMAIN],
 }
 
 impl DomainModules {
@@ -712,8 +713,9 @@ impl DomainModules {
         Self {
             modules: [const { None }; MAX_MODS_PER_DOMAIN],
             count: 0,
-            mod_in: [-1; MAX_MODS_PER_DOMAIN],
-            mod_out: [-1; MAX_MODS_PER_DOMAIN],
+            exec_order: [0; MAX_MODS_PER_DOMAIN],
+            exec_order_count: 0,
+            global_idx: [0; MAX_MODS_PER_DOMAIN],
         }
     }
 }
@@ -937,11 +939,14 @@ pub extern "C" fn main() -> ! {
 
             if is_cross {
                 // Cross-domain edge: create separate local channels on each side
-                // and a CrossDomainChannel to bridge them.
+                // and a CrossDomainChannel to bridge them. Each cross-domain edge
+                // gets its own local channel pair (supports multi-port modules).
                 let out_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
                 let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
 
                 if out_ch >= 0 && in_ch >= 0 {
+                    // Track in per-module arrays for module instantiation.
+                    // First cross-domain out/in for a module sets the module's primary handle.
                     if from < MAX_MODULES && mod_out[from] < 0 {
                         mod_out[from] = out_ch;
                     }
@@ -953,11 +958,10 @@ pub extern "C" fn main() -> ! {
                         }
                     }
 
-                    // Allocate a cross-domain channel and register the edge
+                    // Allocate a cross-domain channel and register the edge.
+                    // The edge stores both local handles directly so pump_cross_domain
+                    // can operate per-edge without module-index indirection.
                     if let Some(cross_ch_idx) = cross_domain::alloc_cross_channel() {
-                        // Compute per-domain module indices.
-                        // We need to count how many modules with lower global index are
-                        // in the same domain, to find the domain-local index.
                         let from_mod_in_domain = domain_local_index(&cfg, from, from_domain, n_modules);
                         let to_mod_in_domain = domain_local_index(&cfg, to, to_domain, n_modules);
 
@@ -965,11 +969,13 @@ pub extern "C" fn main() -> ! {
                             cross_domain::register_cross_edge(cross_domain::CrossDomainEdge {
                                 from_domain,
                                 from_module: from_mod_in_domain as u8,
-                                from_port: 0,
+                                from_port: edge.from_port_index,
                                 to_domain,
                                 to_module: to_mod_in_domain as u8,
                                 to_port: edge.to_port,
                                 channel_idx: cross_ch_idx as u8,
+                                local_out_handle: out_ch,
+                                local_in_handle: in_ch,
                             });
                         }
                     }
@@ -1032,8 +1038,7 @@ pub extern "C" fn main() -> ! {
                 };
                 match result {
                     Ok(loader::StartNewResult::Ready(dm)) => {
-                        dm_ref.mod_in[mod_idx] = mod_in[i];
-                        dm_ref.mod_out[mod_idx] = mod_out[i];
+                        dm_ref.global_idx[mod_idx] = i as u8;
                         dm_ref.modules[mod_idx] = Some(dm);
                         dm_ref.count += 1;
                     }
@@ -1042,8 +1047,7 @@ pub extern "C" fn main() -> ! {
                             for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
                             match unsafe { pending.try_complete() } {
                                 Ok(Some(dm)) => {
-                                    dm_ref.mod_in[mod_idx] = mod_in[i];
-                                    dm_ref.mod_out[mod_idx] = mod_out[i];
+                                    dm_ref.global_idx[mod_idx] = i as u8;
                                     dm_ref.modules[mod_idx] = Some(dm);
                                     dm_ref.count += 1;
                                     break;
@@ -1058,6 +1062,30 @@ pub extern "C" fn main() -> ! {
             }
         }
         i += 1;
+    }
+
+    // Compute per-domain topological execution order (Kahn's algorithm).
+    // Must be done after all modules are instantiated so global_idx is populated.
+    {
+        let mut d = 0usize;
+        while d < cross_domain::MAX_DOMAINS {
+            let mod_count = unsafe { DOMAIN_MODULES[d].count };
+            if mod_count > 0 {
+                compute_domain_topo_order(d, &cfg, n_edges);
+                let dm = unsafe { &DOMAIN_MODULES[d] };
+                uart_puts(b"[topo] domain ");
+                uart_put_u32(d as u32);
+                uart_puts(b" order: ");
+                let mut k = 0;
+                while k < dm.exec_order_count {
+                    if k > 0 { uart_puts(b"->"); }
+                    uart_put_u32(dm.exec_order[k] as u32);
+                    k += 1;
+                }
+                uart_puts(b"\r\n");
+            }
+            d += 1;
+        }
     }
 
     // Set up domain execution state for all domains that have modules.
@@ -1138,6 +1166,107 @@ fn domain_local_index(
     count
 }
 
+/// Compute topological execution order for modules within a single domain.
+///
+/// Uses Kahn's algorithm restricted to intra-domain edges. Edges are identified
+/// by matching global module indices against the domain's global_idx map.
+/// The result is stored in dm.exec_order[] as domain-local indices.
+fn compute_domain_topo_order(
+    domain_id: usize,
+    cfg: &fluxor::kernel::config::Config,
+    n_edges: usize,
+) {
+    let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
+    let n = dm.count;
+    if n == 0 { return; }
+
+    // Build global→local index map for this domain
+    let mut global_to_local = [0xFFu8; fluxor::kernel::config::MAX_MODULES];
+    let mut j = 0;
+    while j < n {
+        let g = dm.global_idx[j] as usize;
+        if g < global_to_local.len() {
+            global_to_local[g] = j as u8;
+        }
+        j += 1;
+    }
+
+    // Compute in-degree for domain-local modules (only intra-domain edges)
+    let mut in_degree = [0u8; MAX_MODS_PER_DOMAIN];
+    let mut e = 0;
+    while e < n_edges {
+        if let Some(ref edge) = cfg.graph_edges[e] {
+            let from_local = global_to_local.get(edge.from_id as usize).copied().unwrap_or(0xFF);
+            let to_local = global_to_local.get(edge.to_id as usize).copied().unwrap_or(0xFF);
+            if from_local != 0xFF && to_local != 0xFF && from_local != to_local {
+                in_degree[to_local as usize] = in_degree[to_local as usize].saturating_add(1);
+            }
+        }
+        e += 1;
+    }
+
+    // BFS: start with zero in-degree modules
+    let mut queue = [0u8; MAX_MODS_PER_DOMAIN];
+    let mut qhead = 0usize;
+    let mut qtail = 0usize;
+    j = 0;
+    while j < n {
+        if in_degree[j] == 0 {
+            queue[qtail] = j as u8;
+            qtail += 1;
+        }
+        j += 1;
+    }
+
+    let mut count = 0usize;
+    while qhead < qtail {
+        let m = queue[qhead] as usize;
+        qhead += 1;
+        dm.exec_order[count] = m as u8;
+        count += 1;
+
+        // Decrement in-degree of successors
+        e = 0;
+        while e < n_edges {
+            if let Some(ref edge) = cfg.graph_edges[e] {
+                let from_local = global_to_local.get(edge.from_id as usize).copied().unwrap_or(0xFF);
+                let to_local = global_to_local.get(edge.to_id as usize).copied().unwrap_or(0xFF);
+                if from_local != 0xFF && to_local != 0xFF
+                    && from_local as usize == m
+                    && (to_local as usize) < n
+                {
+                    in_degree[to_local as usize] -= 1;
+                    if in_degree[to_local as usize] == 0 {
+                        queue[qtail] = to_local;
+                        qtail += 1;
+                    }
+                }
+            }
+            e += 1;
+        }
+    }
+
+    // Append any remaining (isolated or cycle-broken) modules
+    if count < n {
+        j = 0;
+        while j < n {
+            let mut found = false;
+            let mut k = 0;
+            while k < count {
+                if dm.exec_order[k] as usize == j { found = true; }
+                k += 1;
+            }
+            if !found {
+                dm.exec_order[count] = j as u8;
+                count += 1;
+            }
+            j += 1;
+        }
+    }
+
+    dm.exec_order_count = count;
+}
+
 // ============================================================================
 // Domain execution loop (E6)
 // ============================================================================
@@ -1212,9 +1341,13 @@ fn run_domain_loop(domain_id: usize) -> ! {
             loop {
                 let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
                 let mut any_burst = false;
-                let mut j = 0;
-                while j < dm.count {
+                // Step in topological order for correct producer-before-consumer
+                let n = if dm.exec_order_count > 0 { dm.exec_order_count } else { dm.count };
+                let mut pos = 0;
+                while pos < n {
+                    let j = if dm.exec_order_count > 0 { dm.exec_order[pos] as usize } else { pos };
                     if let Some(ref mut m) = dm.modules[j] {
+                        fluxor::kernel::scheduler::set_current_module(dm.global_idx[j] as usize);
                         step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
                         let outcome = m.step();
                         step_guard::disarm();
@@ -1222,12 +1355,11 @@ fn run_domain_loop(domain_id: usize) -> ! {
                         if step_guard::check_and_clear_timeout() {
                             log::warn!("[guard] domain {} module {} timeout", domain_id, j);
                         }
-                        // StepOutcome::Burst
                         if matches!(outcome, Ok(fluxor::modules::StepOutcome::Burst)) {
                             any_burst = true;
                         }
                     }
-                    j += 1;
+                    pos += 1;
                 }
                 pump_cross_domain(domain_id);
 
@@ -1264,14 +1396,18 @@ fn run_domain_loop(domain_id: usize) -> ! {
 }
 
 /// Step all modules in a domain with step guard protection.
+/// Uses topological order when available for correct producer-before-consumer.
 fn domain_step_all(domain_id: usize) {
     use fluxor::modules::Module;
     use fluxor::kernel::step_guard;
 
     let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
-    let mut j = 0;
-    while j < dm.count {
+    let n = if dm.exec_order_count > 0 { dm.exec_order_count } else { dm.count };
+    let mut pos = 0;
+    while pos < n {
+        let j = if dm.exec_order_count > 0 { dm.exec_order[pos] as usize } else { pos };
         if let Some(ref mut m) = dm.modules[j] {
+            fluxor::kernel::scheduler::set_current_module(dm.global_idx[j] as usize);
             step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
             let _ = m.step();
             step_guard::disarm();
@@ -1280,49 +1416,41 @@ fn domain_step_all(domain_id: usize) {
                 log::warn!("[guard] domain {} module {} timeout", domain_id, j);
             }
         }
-        j += 1;
+        pos += 1;
     }
 }
 
 /// Pump cross-domain channels for a domain.
+///
+/// Each cross-domain edge stores its local channel handles directly.
+/// Producer side: read from local_out_handle, send to SPSC ring.
+/// Consumer side: recv from SPSC ring, write to local_in_handle.
 fn pump_cross_domain(domain_id: usize) {
     let n_cross = cross_domain::cross_edge_count();
     let mut ei = 0;
     while ei < n_cross {
         if let Some(edge) = cross_domain::get_cross_edge(ei) {
             if let Some(ch) = cross_domain::get_cross_channel(edge.channel_idx as usize) {
-                if edge.from_domain == domain_id as u8 {
-                    let mod_local = edge.from_module as usize;
-                    let dm_src = unsafe { &DOMAIN_MODULES[domain_id] };
-                    if mod_local < dm_src.count {
-                        let out_handle = dm_src.mod_out[mod_local];
-                        if out_handle >= 0 {
-                            let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
-                            let n = unsafe {
-                                fluxor::kernel::channel::channel_read(
-                                    out_handle, buf.as_mut_ptr(), buf.len(),
-                                )
-                            };
-                            if n > 0 {
-                                let _ = ch.send(&buf[..n as usize]);
-                            }
-                        }
+                // Producer side: this domain owns the output handle
+                if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
+                    let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                    let n = unsafe {
+                        fluxor::kernel::channel::channel_read(
+                            edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
+                        )
+                    };
+                    if n > 0 {
+                        let _ = ch.send(&buf[..n as usize]);
                     }
                 }
-                if edge.to_domain == domain_id as u8 {
-                    let mod_local = edge.to_module as usize;
-                    let dm_dst = unsafe { &DOMAIN_MODULES[domain_id] };
-                    if mod_local < dm_dst.count {
-                        let in_handle = dm_dst.mod_in[mod_local];
-                        if in_handle >= 0 {
-                            let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
-                            if let Some(len) = ch.try_recv(&mut buf) {
-                                unsafe {
-                                    fluxor::kernel::channel::channel_write(
-                                        in_handle, buf.as_ptr(), len,
-                                    );
-                                }
-                            }
+                // Consumer side: this domain owns the input handle
+                if edge.to_domain == domain_id as u8 && edge.local_in_handle >= 0 {
+                    let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                    if let Some(len) = ch.try_recv(&mut buf) {
+                        unsafe {
+                            fluxor::kernel::channel::channel_write(
+                                edge.local_in_handle, buf.as_ptr(), len,
+                            );
                         }
                     }
                 }
@@ -1676,6 +1804,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     merge_runtime_overrides: bcm_merge_runtime_overrides,
     init_gpio: |_| 0, // no GPIO init on aarch64 (handled by PIC modules)
     csprng_fill: bcm_csprng_fill,
+    core_id: || current_core_id() as usize,
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5)

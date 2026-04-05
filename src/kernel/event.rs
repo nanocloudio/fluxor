@@ -11,7 +11,7 @@
 //! The scheduler checks `EVENT_WAKE_PENDING` and steps only the affected
 //! modules via `step_woken_modules()`, providing intra-tick wake response.
 
-use portable_atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crate::kernel::errno;
 use crate::kernel::hal;
@@ -48,10 +48,10 @@ impl EventSlot {
 
 static EVENT_SLOTS: [EventSlot; MAX_EVENTS] = [const { EventSlot::new() }; MAX_EVENTS];
 
-/// One bit per module (MAX_MODULES=16 fits in u16).
+/// One bit per module (MAX_MODULES=24 fits in u32).
 /// Set when any owned event is signaled.
 /// Scheduler reads + clears atomically via swap(0).
-static EVENT_WAKE_PENDING: AtomicU16 = AtomicU16::new(0);
+static EVENT_WAKE_PENDING: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
 // Ownership validation
@@ -112,7 +112,7 @@ pub fn event_signal(handle: i32) -> i32 {
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
     if (owner as usize) < crate::kernel::config::MAX_MODULES {
-        EVENT_WAKE_PENDING.fetch_or(1u16 << owner, Ordering::Release);
+        EVENT_WAKE_PENDING.fetch_or(1u32 << owner, Ordering::Release);
     }
     hal::wake_scheduler();
     0
@@ -131,7 +131,7 @@ pub fn event_signal_from_isr(handle: i32) {
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
     if (owner as usize) < crate::kernel::config::MAX_MODULES {
-        EVENT_WAKE_PENDING.fetch_or(1u16 << owner, Ordering::Release);
+        EVENT_WAKE_PENDING.fetch_or(1u32 << owner, Ordering::Release);
     }
     hal::wake_scheduler();
 }
@@ -184,8 +184,8 @@ pub fn event_destroy(handle: i32) -> i32 {
 // ============================================================================
 
 /// Atomically read and clear the wake-pending bitmask.
-/// Returns a u16 where bit N is set if module N has pending events.
-pub fn take_wake_pending() -> u16 {
+/// Returns a u32 where bit N is set if module N has pending events.
+pub fn take_wake_pending() -> u32 {
     EVENT_WAKE_PENDING.swap(0, Ordering::AcqRel)
 }
 

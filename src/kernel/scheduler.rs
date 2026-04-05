@@ -809,7 +809,7 @@ pub struct SchedulerState {
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
     ready: [bool; MAX_MODULES],
     /// Per-module upstream dependency bitmask (precomputed from edges)
-    upstream_mask: [u16; MAX_MODULES],
+    upstream_mask: [u32; MAX_MODULES],
     /// Per-module step period (0 = every tick, N = every N ms)
     step_period: [u8; MAX_MODULES],
     /// Per-module step counter (counts ticks toward period)
@@ -818,8 +818,6 @@ pub struct SchedulerState {
     exec_order: [u8; MAX_MODULES],
     /// Number of entries in exec_order
     exec_order_count: usize,
-    /// Index of the module currently being stepped or instantiated
-    current_module: usize,
     /// Graph-level sample rate from config (0 = not set)
     graph_sample_rate: u32,
     /// Tick period in microseconds (0 = default 1000us)
@@ -889,7 +887,6 @@ impl SchedulerState {
             step_counter: [0; MAX_MODULES],
             exec_order: [0; MAX_MODULES],
             exec_order_count: 0,
-            current_module: 0,
             graph_sample_rate: 0,
             tick_us: 0,
             module_latency: [0; MAX_MODULES],
@@ -987,15 +984,23 @@ pub unsafe fn param_buffer_mut() -> &'static mut ParamBuffer {
     &mut *core::ptr::addr_of_mut!(PARAM_BUFFER)
 }
 
+/// Per-core current module index (supports multi-core BCM2712).
+/// On single-core platforms, only index 0 is used. Avoids data races
+/// when multiple cores step modules concurrently.
+static CURRENT_MODULE_PER_CORE: [portable_atomic::AtomicU32; MAX_DOMAINS] =
+    [const { portable_atomic::AtomicU32::new(0) }; MAX_DOMAINS];
+
 /// Return the index of the module currently being stepped.
 /// Used by event::event_create() to set event ownership.
 pub fn current_module_index() -> usize {
-    unsafe { SCHED.current_module }
+    let core = crate::kernel::hal::core_id();
+    CURRENT_MODULE_PER_CORE[core].load(portable_atomic::Ordering::Relaxed) as usize
 }
 
 /// Set the current module index. Used by provider dispatch for context switching.
 pub fn set_current_module(idx: usize) {
-    unsafe { SCHED.current_module = idx; }
+    let core = crate::kernel::hal::core_id();
+    CURRENT_MODULE_PER_CORE[core].store(idx as u32, portable_atomic::Ordering::Relaxed);
 }
 
 /// Get the state pointer for a module by index.
@@ -1034,13 +1039,15 @@ pub fn get_module_state(idx: usize) -> *mut u8 {
 /// Return the capability class of the module currently being stepped.
 /// Used by dev_call to enforce device class access restrictions.
 pub fn current_module_cap_class() -> u8 {
-    unsafe { SCHED.cap_class[SCHED.current_module] }
+    let idx = current_module_index();
+    unsafe { SCHED.cap_class[idx] }
 }
 
 /// Return the required_caps bitmask of the module currently being stepped.
 /// Bit N set = module declared it needs device class N in its manifest.
 pub fn current_module_required_caps() -> u32 {
-    unsafe { SCHED.required_caps[SCHED.current_module] }
+    let idx = current_module_index();
+    unsafe { SCHED.required_caps[idx] }
 }
 
 /// Return the export table info for a module by index.
@@ -1195,7 +1202,8 @@ pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
 /// Called from the channel_port syscall implementation.
 pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
     let idx = index as usize;
-    let ports = unsafe { &SCHED.ports[SCHED.current_module] };
+    let cm = current_module_index();
+    let ports = unsafe { &SCHED.ports[cm] };
     match port_type {
         0 => if idx < ports.in_count as usize { ports.in_chans[idx] } else { -1 },
         1 => if idx < ports.out_count as usize { ports.out_chans[idx] } else { -1 },
@@ -1207,7 +1215,8 @@ pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
 /// Syscall: get the calling module's arena allocation.
 /// Returns null if no arena was allocated.
 pub unsafe extern "C" fn syscall_arena_get(size_out: *mut u32) -> *mut u8 {
-    let arena = &SCHED.arenas[SCHED.current_module];
+    let cm = current_module_index();
+    let arena = &SCHED.arenas[cm];
     if !size_out.is_null() {
         *size_out = arena.size;
     }
@@ -1914,7 +1923,7 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
         let from = edges[i].from_module;
         let to = edges[i].to_module;
         if from < MAX_MODULES && to < MAX_MODULES {
-            sched.upstream_mask[to] |= 1u16 << from;
+            sched.upstream_mask[to] |= 1u32 << from;
         }
     }
 }
@@ -2405,10 +2414,10 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     }
 
     // Compute not-ready bitmask for upstream gating
-    let mut not_ready: u16 = 0;
+    let mut not_ready: u32 = 0;
     for i in 0..count {
         if !sched.ready[i] {
-            not_ready |= 1u16 << i;
+            not_ready |= 1u32 << i;
         }
     }
 
@@ -2477,7 +2486,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 
         if let Some(m) = modules[module_idx].as_module_mut() {
             // Set current_module so channel_port works during module_step
-            sched.current_module = module_idx;
+            set_current_module(module_idx);
             // Track for HardFault diagnosis
             unsafe { core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8); }
 
@@ -2572,7 +2581,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 pub fn step_woken_modules(
     modules: &mut [ModuleSlot; MAX_MODULES],
     count: usize,
-    wake_bits: u16,
+    wake_bits: u32,
 ) {
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let exec_count = sched.exec_order_count;
@@ -2587,15 +2596,15 @@ pub fn step_woken_modules(
             continue;
         }
         // Only step modules with pending events
-        if (wake_bits & (1u16 << module_idx)) == 0 {
+        if (wake_bits & (1u32 << module_idx)) == 0 {
             continue;
         }
         // Ready-signal gating: skip if any upstream module hasn't signaled Ready.
         // Deferred-ready modules are exempt while initializing.
         {
-            let mut not_ready: u16 = 0;
+            let mut not_ready: u32 = 0;
             for i in 0..count {
-                if !sched.ready[i] { not_ready |= 1u16 << i; }
+                if !sched.ready[i] { not_ready |= 1u32 << i; }
             }
             if not_ready != 0
                 && !sched.deferred_ready[module_idx]
@@ -2611,7 +2620,7 @@ pub fn step_woken_modules(
         }
 
         if let Some(m) = modules[module_idx].as_module_mut() {
-            sched.current_module = module_idx;
+            set_current_module(module_idx);
 
             let deadline = sched.fault_info[module_idx].effective_deadline_us();
             step_guard::arm(deadline);
@@ -2699,7 +2708,7 @@ pub fn reconfigure_phase() -> ReconfigurePhase {
 ///
 /// `surviving`: bitmask where bit N set = module N survives the transition.
 /// `drain_timeout_ms`: maximum time in ms to wait for drain completion.
-pub fn enter_draining(surviving: u16, drain_timeout_ms: u32) {
+pub fn enter_draining(surviving: u32, drain_timeout_ms: u32) {
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let count = sched.active_module_count;
     let tick = unsafe { DBG_TICK };
@@ -2719,7 +2728,7 @@ pub fn enter_draining(surviving: u16, drain_timeout_ms: u32) {
         let module_idx = sched.exec_order[order_pos] as usize;
         if module_idx >= count { continue; }
 
-        if (surviving & (1u16 << module_idx)) != 0 {
+        if (surviving & (1u32 << module_idx)) != 0 {
             sched.drain_state[module_idx] = DrainState::Surviving;
             continue;
         }
@@ -2727,7 +2736,7 @@ pub fn enter_draining(surviving: u16, drain_timeout_ms: u32) {
         if sched.drain_capable[module_idx] {
             // Call module_drain on the module
             if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
-                sched.current_module = module_idx;
+                set_current_module(module_idx);
                 let _rc = unsafe { m.call_drain() };
             }
             sched.drain_state[module_idx] = DrainState::Draining;
@@ -2800,7 +2809,7 @@ fn check_upstream_draining(module_idx: usize, count: usize) -> bool {
 
     for i in 0..count {
         if i == module_idx { continue; }
-        if (upstream & (1u16 << i)) != 0 && sched.drain_state[i] == DrainState::Draining {
+        if (upstream & (1u32 << i)) != 0 && sched.drain_state[i] == DrainState::Draining {
             return true;
         }
     }
@@ -2860,19 +2869,19 @@ fn enter_migrating_v1() {
 /// V1 note: This function is implemented but not used in the v1 full-reset
 /// path. It will be used by v2 selective channel migration.
 #[allow(dead_code)]
-fn compute_preserved_channels(surviving: u16, edge_count: usize) -> u32 {
+fn compute_preserved_channels(surviving: u32, edge_count: usize) -> u64 {
     let sched = unsafe { &*(&raw const SCHED) };
-    let mut preserved: u32 = 0;
+    let mut preserved: u64 = 0;
 
     for i in 0..edge_count {
         let edge = &sched.edges[i];
         if edge.channel < 0 { continue; }
 
-        let from_survives = (surviving & (1u16 << edge.from_module)) != 0;
-        let to_survives = (surviving & (1u16 << edge.to_module)) != 0;
+        let from_survives = (surviving & (1u32 << edge.from_module)) != 0;
+        let to_survives = (surviving & (1u32 << edge.to_module)) != 0;
 
         if from_survives && to_survives {
-            preserved |= 1u32 << i;
+            preserved |= 1u64 << i;
         }
     }
 

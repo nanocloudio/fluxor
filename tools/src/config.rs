@@ -935,14 +935,14 @@ impl ConfigBuilder {
 /// Graph edge size in bytes
 const GRAPH_EDGE_SIZE: usize = 4;
 /// Maximum number of graph edges
-const MAX_GRAPH_EDGES: usize = 15;
+const MAX_GRAPH_EDGES: usize = 48;
 /// Per-domain metadata: 4 domains × (tick_us:u16 + exec_mode:u8 + reserved:u8) = 16 bytes
 const DOMAIN_META_SIZE: usize = 16;
 /// Graph section size (header + edges + domain metadata)
-const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE; // 80 bytes
+const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
 
 /// Maximum number of modules
-const MAX_MODULES: usize = 16;
+const MAX_MODULES: usize = 24;
 
 /// Module entry header size (entry_length + name_hash + id + reserved)
 const MODULE_ENTRY_HEADER_SIZE: usize = 8;

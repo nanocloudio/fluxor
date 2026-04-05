@@ -157,12 +157,19 @@ impl SocketSlot {
     where
         F: FnOnce(&mut RingBuffer<SOCKET_TX_BUF_SIZE>, &mut RingBuffer<SOCKET_RX_BUF_SIZE>) -> R,
     {
-        // Spinlock acquire
+        // Bounded spinlock acquire with yield for cross-core safety
+        let mut spins = 0u32;
         while self
             .lock
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            spins += 1;
+            if spins > 256 {
+                #[cfg(target_arch = "aarch64")]
+                unsafe { core::arch::asm!("yield", options(nomem, nostack)); }
+                spins = 0;
+            }
             core::hint::spin_loop();
         }
         // Safety: we hold the lock

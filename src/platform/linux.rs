@@ -128,6 +128,7 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     merge_runtime_overrides: linux_merge_runtime_overrides,
     init_gpio: |_| 0,
     csprng_fill: linux_csprng_fill,
+    core_id: || 0, // Single-threaded on Linux
 };
 
 fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {

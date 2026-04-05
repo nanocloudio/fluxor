@@ -69,8 +69,8 @@ use crate::kernel::errno;
 // ============================================================================
 
 /// Maximum number of buffer registry slots.
-/// Must be >= MAX_CHANNELS (15) plus headroom for dynamic allocations.
-pub const MAX_BUFFER_SLOTS: usize = 20;
+/// Must be >= MAX_CHANNELS plus headroom for dynamic allocations.
+pub const MAX_BUFFER_SLOTS: usize = 56;
 
 /// Default buffer size for channels without hints (audio channels).
 /// Derived from the canonical constant in abi.rs.
@@ -308,19 +308,8 @@ impl BufferRegistrySlot {
 // ============================================================================
 
 /// Registry of buffer slots — metadata only, data lives in the buffer arena.
-/// 20 slots × ~20 bytes = ~400 bytes BSS (vs 16 KB for the old static pool).
-static BUFFER_REGISTRY: [BufferRegistrySlot; MAX_BUFFER_SLOTS] = [
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-    BufferRegistrySlot::new(), BufferRegistrySlot::new(),
-];
+static BUFFER_REGISTRY: [BufferRegistrySlot; MAX_BUFFER_SLOTS] =
+    [const { BufferRegistrySlot::new() }; MAX_BUFFER_SLOTS];
 
 fn valid_slot(slot: i32) -> bool {
     slot >= 0 && (slot as usize) < MAX_BUFFER_SLOTS
