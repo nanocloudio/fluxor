@@ -88,6 +88,7 @@ fn access_mode_from_str(s: &str) -> Result<u8> {
         "read" => Ok(0),
         "write" => Ok(1),
         "exclusive" => Ok(2),
+        "chain" => Ok(3),
         _ => Err(Error::Module(format!("unknown access mode: {}", s))),
     }
 }
@@ -97,6 +98,7 @@ fn access_mode_to_str(mode: u8) -> &'static str {
         0 => "read",
         1 => "write",
         2 => "exclusive",
+        3 => "chain",
         _ => "unknown",
     }
 }

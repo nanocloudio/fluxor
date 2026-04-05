@@ -4,7 +4,7 @@ provides = ["socket"]
 
 [[resources]]
 device_class = "socket"
-access = "exclusive"
+access = "chain"
 
 [[resources]]
 device_class = "system"

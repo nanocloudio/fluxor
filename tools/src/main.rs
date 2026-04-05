@@ -946,8 +946,12 @@ fn cmd_pack_image(
     let (modules_data, config_data) =
         build_packaged_blobs(&config, primary_dir.as_path(), &extra_dirs, &target_desc, verbose)?;
 
+    // Module table must be page-aligned (4096) because aarch64 PIC modules use
+    // ADRP for PC-relative rodata access. The table packing aligns code within
+    // the blob relative to offset 0, so the blob base must be page-aligned.
+    const MODULE_TABLE_ALIGN: u32 = 4096;
     let modules_addr = if modules_data.is_some() {
-        trailer_addr + IMAGE_ALIGN
+        (trailer_addr + IMAGE_ALIGN + MODULE_TABLE_ALIGN - 1) & !(MODULE_TABLE_ALIGN - 1)
     } else {
         0
     };
@@ -971,12 +975,20 @@ fn cmd_pack_image(
 
     let mut package = Vec::new();
     package.extend_from_slice(&trailer);
-    while package.len() < IMAGE_ALIGN as usize {
-        package.push(0);
-    }
+    // Pad to reach modules_addr (or config_addr if no modules)
     if let Some(ref mdata) = modules_data {
+        let target_offset = (modules_addr - trailer_addr) as usize;
+        while package.len() < target_offset {
+            package.push(0);
+        }
         package.extend_from_slice(mdata);
-        while (trailer_addr as usize + package.len()) % IMAGE_ALIGN as usize != 0 {
+        // Pad to config alignment
+        let target_config = (config_addr - trailer_addr) as usize;
+        while package.len() < target_config {
+            package.push(0);
+        }
+    } else {
+        while package.len() < IMAGE_ALIGN as usize {
             package.push(0);
         }
     }
@@ -1676,8 +1688,25 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 .unwrap_or(false);
 
             if is_qemu {
-                eprintln!("Running: qemu-system-aarch64 -kernel {}", result.output_path.display());
+                // Extract HTTP port from config YAML for QEMU port forwarding
+                let yaml_text = std::fs::read_to_string(config_path)?;
+                let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
+                    .map_err(|e| Error::Config(format!("YAML parse: {}", e)))?;
+                let guest_port = yaml.get("modules")
+                    .and_then(|m| m.as_sequence())
+                    .and_then(|mods| mods.iter().find(|m| {
+                        m.get("name").and_then(|n| n.as_str()) == Some("http")
+                    }))
+                    .and_then(|http| http.get("port"))
+                    .and_then(|p| p.as_u64())
+                    .unwrap_or(80);
+                let host_port = if guest_port < 1024 { guest_port + 18000 } else { guest_port };
+                let hostfwd = format!("user,id=net0,hostfwd=tcp::{}-:{}", host_port, guest_port);
 
+                eprintln!("Running: qemu-system-aarch64 -kernel {}", result.output_path.display());
+                eprintln!("  Port forward: host {} -> guest {}", host_port, guest_port);
+
+                let dump_arg = format!("filter-dump,id=dump0,netdev=net0,file=/tmp/fluxor-qemu.pcap");
                 let status = std::process::Command::new("qemu-system-aarch64")
                     .args([
                         "-machine", "virt",
@@ -1685,7 +1714,8 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                         "-m", "2G",
                         "-nographic",
                         "-device", "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
-                        "-netdev", "user,id=net0,hostfwd=tcp::18080-:80",
+                        "-netdev", &hostfwd,
+                        "-object", &dump_arg,
                         "-kernel",
                     ])
                     .arg(&result.output_path)

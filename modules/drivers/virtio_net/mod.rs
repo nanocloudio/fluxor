@@ -36,7 +36,7 @@ include!("../../pic_runtime.rs");
 const QUEUE_SIZE: usize = 16;
 const NET_HDR_SIZE: usize = 10;
 const MAX_FRAME_SIZE: usize = 1514;
-const BUF_SIZE: usize = NET_HDR_SIZE + MAX_FRAME_SIZE;
+const BUF_SIZE: usize = 1536; // >= NET_HDR + MAX_FRAME, rounded for alignment
 
 // virtio-mmio register offsets
 const MAGIC_VALUE: usize = 0x000;
@@ -50,44 +50,62 @@ const GUEST_PAGE_SIZE: usize = 0x028;
 const QUEUE_SEL: usize = 0x030;
 const QUEUE_NUM_MAX: usize = 0x034;
 const QUEUE_NUM: usize = 0x038;
-const QUEUE_PFN: usize = 0x040;
 const QUEUE_ALIGN_REG: usize = 0x03c;
+const QUEUE_PFN: usize = 0x040;
+const QUEUE_READY: usize = 0x044;
 const QUEUE_NOTIFY: usize = 0x050;
 const INTERRUPT_STATUS: usize = 0x060;
 const INTERRUPT_ACK: usize = 0x064;
 const STATUS_REG: usize = 0x070;
+const QUEUE_DESC_LOW: usize = 0x080;
+const QUEUE_DESC_HIGH: usize = 0x084;
+const QUEUE_DRIVER_LOW: usize = 0x090;
+const QUEUE_DRIVER_HIGH: usize = 0x094;
+const QUEUE_DEVICE_LOW: usize = 0x0a0;
+const QUEUE_DEVICE_HIGH: usize = 0x0a4;
 const CONFIG_SPACE: usize = 0x100;
 
 const STATUS_ACK: u32 = 1;
 const STATUS_DRIVER: u32 = 2;
+const STATUS_FEATURES_OK: u32 = 8;
 const STATUS_DRIVER_OK: u32 = 4;
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 const VRING_DESC_F_WRITE: u16 = 2;
 
-// Legacy virtqueue layout sizes (QUEUE_SIZE=16):
-//   desc: 16 * 16 = 256 bytes
-//   avail: 6 + 2*16 = 38 bytes
-//   pad to 4096
-//   used: 6 + 8*16 = 134 bytes
+// Virtqueue layout sizes (QUEUE_SIZE=16):
+//   Descriptors: 16 * 16 = 256 bytes (16-aligned)
+//   Driver (avail) ring: 6 + 2*16 = 38 bytes (2-aligned)
+//   Device (used) ring: 6 + 8*16 = 134 bytes (4-aligned)
 const VQ_DESC_SIZE: usize = QUEUE_SIZE * 16;  // 256
 const VQ_AVAIL_SIZE: usize = 6 + 2 * QUEUE_SIZE;  // 38
 const VQ_USED_SIZE: usize = 6 + 8 * QUEUE_SIZE;  // 134
-// Total per virtqueue: 4096 (desc+avail+pad) + 134 (used) = 4230
-// With 4096-alignment padding: up to 4096 extra
-const VQ_TOTAL: usize = 4096 + VQ_USED_SIZE + 2; // +2 for last_used_idx
+// Per virtqueue (v1 legacy): page-aligned, desc+avail in first page, used at +4096.
+// Needs 4096 + VQ_USED_SIZE = 4230 bytes, plus page-alignment overhead (~4096).
+// v2 modern: desc + avail + used contiguous, much smaller. We size for v1 (worst case).
+const VQ_LEGACY_SIZE: usize = 4096 + VQ_USED_SIZE; // 4230
 
 // State layout offsets (computed in module_new for alignment)
-// Metadata (256 bytes) → RXQ (4096-aligned) → TXQ (4096-aligned) → RX_BUFS → TX_BUF
+// Metadata (256 bytes) → RXQ (page-aligned) → TXQ (page-aligned) → RX_BUFS → TX_BUF
 const META_SIZE: usize = 256;
 const RX_BUFS_TOTAL: usize = QUEUE_SIZE * BUF_SIZE; // 16 * 1524 = 24384
 const TX_BUF_TOTAL: usize = BUF_SIZE; // 1524
 
-// Total state: metadata + alignment + 2 queues + buffers
-const STATE_SIZE: usize = META_SIZE + 4096 + VQ_TOTAL + 4096 + VQ_TOTAL + RX_BUFS_TOTAL + TX_BUF_TOTAL;
+// Total state: metadata + 2 queues (page-aligned) + buffers + alignment slack
+const STATE_SIZE: usize = META_SIZE + 4096 + VQ_LEGACY_SIZE + 4096 + VQ_LEGACY_SIZE + RX_BUFS_TOTAL + TX_BUF_TOTAL;
 
 // ============================================================================
 // State (in metadata region)
 // ============================================================================
+
+#[repr(C)]
+struct VirtQueue {
+    desc: usize,    // descriptor table base
+    avail: usize,   // driver (available) ring base
+    used: usize,    // device (used) ring base
+    last_used: u16, // driver-side tracking
+    next_avail: u16, // driver-side avail index tracking
+}
 
 #[repr(C)]
 struct VirtioNetState {
@@ -99,14 +117,12 @@ struct VirtioNetState {
     mac_addr: [u8; 6],
     initialized: u8,
     mac_announced: u8,
-    // Computed pointers into state buffer
-    rxq_ptr: usize,
-    txq_ptr: usize,
+    // Virtqueues
+    rxq: VirtQueue,
+    txq: VirtQueue,
+    // Buffer pointers
     rx_bufs_ptr: usize,
     tx_buf_ptr: usize,
-    // Queue tracking
-    rx_last_used: u16,
-    _pad0: u16,
     step_count: u32,
 }
 
@@ -126,51 +142,36 @@ unsafe fn mmio_write(base: usize, offset: usize, val: u32) {
 // Virtqueue helpers (operate on raw pointers)
 // ============================================================================
 
-// Descriptor: 16 bytes each at vq_base + i*16
+// Descriptor: 16 bytes each
 // [addr: u64, len: u32, flags: u16, next: u16]
-unsafe fn desc_set(vq: usize, i: usize, addr: u64, len: u32, flags: u16) {
-    let p = vq + i * 16;
+unsafe fn desc_set(desc_base: usize, i: usize, addr: u64, len: u32, flags: u16) {
+    let p = desc_base + i * 16;
     write_volatile(p as *mut u64, addr);
     write_volatile((p + 8) as *mut u32, len);
     write_volatile((p + 12) as *mut u16, flags);
     write_volatile((p + 14) as *mut u16, 0); // next
 }
 
-// Avail ring: at vq_base + VQ_DESC_SIZE
-// [flags: u16, idx: u16, ring[N]: u16]
-unsafe fn avail_idx(vq: usize) -> u16 {
-    read_volatile((vq + VQ_DESC_SIZE + 2) as *const u16)
+// Avail (driver) ring: [flags: u16, idx: u16, ring[N]: u16]
+unsafe fn avail_set_idx(avail_base: usize, idx: u16) {
+    write_volatile((avail_base + 2) as *mut u16, idx)
 }
 
-unsafe fn avail_set_idx(vq: usize, idx: u16) {
-    write_volatile((vq + VQ_DESC_SIZE + 2) as *mut u16, idx)
+unsafe fn avail_ring_set(avail_base: usize, slot: usize, val: u16) {
+    write_volatile((avail_base + 4 + slot * 2) as *mut u16, val)
 }
 
-unsafe fn avail_ring_set(vq: usize, slot: usize, val: u16) {
-    write_volatile((vq + VQ_DESC_SIZE + 4 + slot * 2) as *mut u16, val)
+// Used (device) ring: [flags: u16, idx: u16, ring[N]: {id: u32, len: u32}]
+unsafe fn used_idx(used_base: usize) -> u16 {
+    read_volatile((used_base + 2) as *const u16)
 }
 
-// Used ring: at vq_base + 4096
-// [flags: u16, idx: u16, ring[N]: {id: u32, len: u32}]
-unsafe fn used_idx(vq: usize) -> u16 {
-    read_volatile((vq + 4096 + 2) as *const u16)
+unsafe fn used_ring_id(used_base: usize, slot: usize) -> u32 {
+    read_volatile((used_base + 4 + slot * 8) as *const u32)
 }
 
-unsafe fn used_ring_id(vq: usize, slot: usize) -> u32 {
-    read_volatile((vq + 4096 + 4 + slot * 8) as *const u32)
-}
-
-unsafe fn used_ring_len(vq: usize, slot: usize) -> u32 {
-    read_volatile((vq + 4096 + 4 + slot * 8 + 4) as *const u32)
-}
-
-// last_used_idx stored after used ring
-unsafe fn last_used(vq: usize) -> u16 {
-    read_volatile((vq + 4096 + VQ_USED_SIZE) as *const u16)
-}
-
-unsafe fn set_last_used(vq: usize, val: u16) {
-    write_volatile((vq + 4096 + VQ_USED_SIZE) as *mut u16, val)
+unsafe fn used_ring_len(used_base: usize, slot: usize) -> u32 {
+    read_volatile((used_base + 4 + slot * 8 + 4) as *const u32)
 }
 
 // ============================================================================
@@ -192,6 +193,45 @@ unsafe fn find_net_device() -> usize {
     0
 }
 
+/// Setup a virtqueue (v2 modern): split desc/avail/used addresses.
+unsafe fn setup_queue_v2(base: usize, queue_idx: u32, vq: &VirtQueue) -> bool {
+    mmio_write(base, QUEUE_SEL, queue_idx);
+    let max = mmio_read(base, QUEUE_NUM_MAX);
+    if max == 0 || (max as usize) < QUEUE_SIZE { return false; }
+    mmio_write(base, QUEUE_NUM, QUEUE_SIZE as u32);
+
+    let desc = vq.desc as u64;
+    let avail = vq.avail as u64;
+    let used = vq.used as u64;
+    mmio_write(base, QUEUE_DESC_LOW, desc as u32);
+    mmio_write(base, QUEUE_DESC_HIGH, (desc >> 32) as u32);
+    mmio_write(base, QUEUE_DRIVER_LOW, avail as u32);
+    mmio_write(base, QUEUE_DRIVER_HIGH, (avail >> 32) as u32);
+    mmio_write(base, QUEUE_DEVICE_LOW, used as u32);
+    mmio_write(base, QUEUE_DEVICE_HIGH, (used >> 32) as u32);
+
+    mmio_write(base, QUEUE_READY, 1);
+    true
+}
+
+/// Setup a virtqueue (v1 legacy): PFN-based with desc+avail contiguous, used at 4096 offset.
+/// Requires desc and avail to be contiguous starting at a page-aligned address,
+/// with used ring at +4096 from the descriptor table base.
+unsafe fn setup_queue_v1(base: usize, queue_idx: u32, vq: &mut VirtQueue, page_buf: usize) -> bool {
+    mmio_write(base, QUEUE_SEL, queue_idx);
+    let max = mmio_read(base, QUEUE_NUM_MAX);
+    if max == 0 || (max as usize) < QUEUE_SIZE { return false; }
+    mmio_write(base, QUEUE_NUM, QUEUE_SIZE as u32);
+    mmio_write(base, QUEUE_ALIGN_REG, 4096);
+    mmio_write(base, QUEUE_PFN, (page_buf as u64 / 4096) as u32);
+
+    // Legacy layout: desc at base, avail immediately after, used at +4096
+    vq.desc = page_buf;
+    vq.avail = page_buf + VQ_DESC_SIZE;
+    vq.used = page_buf + 4096;
+    true
+}
+
 unsafe fn init_device(s: &mut VirtioNetState) -> bool {
     let base = find_net_device();
     if base == 0 { return false; }
@@ -205,43 +245,51 @@ unsafe fn init_device(s: &mut VirtioNetState) -> bool {
     mmio_write(base, STATUS_REG, STATUS_ACK);
     mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER);
 
-    // Features
+    // Features: negotiate VIRTIO_NET_F_MAC
     mmio_write(base, DEVICE_FEATURES_SEL, 0);
     let features = mmio_read(base, DEVICE_FEATURES);
     mmio_write(base, DRIVER_FEATURES_SEL, 0);
-    mmio_write(base, DRIVER_FEATURES, features & VIRTIO_NET_F_MAC);
+    // Only negotiate features we actually handle. Accepting MRG_RXBUF
+    // (bit 15) without providing 12-byte header buffers causes QEMU to
+    // silently drop all RX frames (buffer too small check fails).
+    let wanted = VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
+    mmio_write(base, DRIVER_FEATURES, features & wanted);
 
-    // Legacy: set guest page size
     if ver == 1 {
+        // Legacy: set guest page size before queue setup
         mmio_write(base, GUEST_PAGE_SIZE, 4096);
+    } else {
+        // Modern: FEATURES_OK step
+        mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
+        let status = mmio_read(base, STATUS_REG);
+        if status & STATUS_FEATURES_OK == 0 { return false; }
     }
 
-    // Setup RX queue
-    mmio_write(base, QUEUE_SEL, 0);
-    let max = mmio_read(base, QUEUE_NUM_MAX);
-    if max == 0 || (max as usize) < QUEUE_SIZE { return false; }
-    mmio_write(base, QUEUE_NUM, QUEUE_SIZE as u32);
-    mmio_write(base, QUEUE_ALIGN_REG, 4096);
-    mmio_write(base, QUEUE_PFN, (s.rxq_ptr as u64 / 4096) as u32);
-
-    // Setup TX queue
-    mmio_write(base, QUEUE_SEL, 1);
-    let max = mmio_read(base, QUEUE_NUM_MAX);
-    if max == 0 || (max as usize) < QUEUE_SIZE { return false; }
-    mmio_write(base, QUEUE_NUM, QUEUE_SIZE as u32);
-    mmio_write(base, QUEUE_ALIGN_REG, 4096);
-    mmio_write(base, QUEUE_PFN, (s.txq_ptr as u64 / 4096) as u32);
+    // Setup queues — v1 needs page-aligned contiguous buffers, v2 uses split addresses
+    if ver == 1 {
+        // For v1, we need page-aligned buffers for the legacy PFN layout.
+        // Recompute: desc+avail in first page, used starts at +4096.
+        let rxq_page = (s.rxq.desc + 4095) & !4095; // page-align
+        if !setup_queue_v1(base, 0, &mut s.rxq, rxq_page) { return false; }
+        let txq_page = (s.txq.desc + 4095) & !4095;
+        if !setup_queue_v1(base, 1, &mut s.txq, txq_page) { return false; }
+    } else {
+        if !setup_queue_v2(base, 0, &s.rxq) { return false; }
+        if !setup_queue_v2(base, 1, &s.txq) { return false; }
+    }
 
     // Pre-fill RX descriptors
     let mut i = 0usize;
     while i < QUEUE_SIZE {
         let buf_addr = s.rx_bufs_ptr + i * BUF_SIZE;
-        desc_set(s.rxq_ptr, i, buf_addr as u64, BUF_SIZE as u32, VRING_DESC_F_WRITE);
-        avail_ring_set(s.rxq_ptr, i, i as u16);
+        desc_set(s.rxq.desc, i, buf_addr as u64, BUF_SIZE as u32, VRING_DESC_F_WRITE);
+        avail_ring_set(s.rxq.avail, i, i as u16);
         i += 1;
     }
-    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-    avail_set_idx(s.rxq_ptr, QUEUE_SIZE as u16);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    avail_set_idx(s.rxq.avail, QUEUE_SIZE as u16);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    s.rxq.next_avail = QUEUE_SIZE as u16;
 
     // Read MAC
     if features & VIRTIO_NET_F_MAC != 0 {
@@ -254,9 +302,13 @@ unsafe fn init_device(s: &mut VirtioNetState) -> bool {
     }
 
     // Driver OK
-    mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK);
+    if ver == 1 {
+        mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK);
+    } else {
+        mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+    }
 
-    // Notify RX queue
+    // Notify RX queue that buffers are available
     mmio_write(base, QUEUE_NOTIFY, 0);
 
     s.initialized = 1;
@@ -273,13 +325,13 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
 
     let mut count = 0;
     while count < 4 {
-        let ui = used_idx(s.rxq_ptr);
-        let lu = last_used(s.rxq_ptr);
+        let ui = used_idx(s.rxq.used);
+        let lu = s.rxq.last_used;
         if lu == ui { break; }
 
         let slot = (lu as usize) % QUEUE_SIZE;
-        let desc_idx = used_ring_id(s.rxq_ptr, slot) as usize;
-        let total_len = used_ring_len(s.rxq_ptr, slot) as usize;
+        let desc_idx = used_ring_id(s.rxq.used, slot) as usize;
+        let total_len = used_ring_len(s.rxq.used, slot) as usize;
 
         if total_len > NET_HDR_SIZE && desc_idx < QUEUE_SIZE {
             let frame_ptr = (s.rx_bufs_ptr + desc_idx * BUF_SIZE + NET_HDR_SIZE) as *const u8;
@@ -290,13 +342,14 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
             }
         }
 
-        // Recycle descriptor
-        set_last_used(s.rxq_ptr, lu.wrapping_add(1));
-        let ai = avail_idx(s.rxq_ptr);
+        // Recycle descriptor back to avail ring
+        s.rxq.last_used = lu.wrapping_add(1);
+        let ai = s.rxq.next_avail;
         let avail_slot = (ai as usize) % QUEUE_SIZE;
-        avail_ring_set(s.rxq_ptr, avail_slot, desc_idx as u16);
+        avail_ring_set(s.rxq.avail, avail_slot, desc_idx as u16);
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        avail_set_idx(s.rxq_ptr, ai.wrapping_add(1));
+        s.rxq.next_avail = ai.wrapping_add(1);
+        avail_set_idx(s.rxq.avail, s.rxq.next_avail);
         mmio_write(s.device_base, QUEUE_NOTIFY, 0);
 
         count += 1;
@@ -325,12 +378,12 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
     let total = NET_HDR_SIZE + r as usize;
 
     // Submit to TX queue
-    let txq = s.txq_ptr;
-    desc_set(txq, 0, tx_buf as u64, total as u32, 0);
-    let ai = avail_idx(txq);
-    avail_ring_set(txq, (ai as usize) % QUEUE_SIZE, 0);
+    desc_set(s.txq.desc, 0, tx_buf as u64, total as u32, 0);
+    let ai = s.txq.next_avail;
+    avail_ring_set(s.txq.avail, (ai as usize) % QUEUE_SIZE, 0);
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-    avail_set_idx(txq, ai.wrapping_add(1));
+    s.txq.next_avail = ai.wrapping_add(1);
+    avail_set_idx(s.txq.avail, s.txq.next_avail);
     mmio_write(s.device_base, QUEUE_NOTIFY, 1);
 }
 
@@ -380,18 +433,30 @@ pub extern "C" fn module_new(
         s.out_chan = out_chan;
         s.ctrl_chan = ctrl_chan;
 
-        // Compute 4096-aligned addresses for virtqueues within state buffer
+        // Compute page-aligned addresses for virtqueue areas.
+        // v1 legacy requires page-aligned PFN with desc+avail in first page, used at +4096.
+        // v2 modern requires desc 16-aligned, avail 2-aligned, used 4-aligned.
+        // We allocate for v1 (page-aligned, larger) which also satisfies v2.
+        // init_device will rewrite desc/avail/used for whichever version it finds.
         let base = state as usize;
-        let rxq_raw = base + META_SIZE;
-        let rxq_aligned = (rxq_raw + 4095) & !4095;
-        s.rxq_ptr = rxq_aligned;
+        let rxq_page = (base + META_SIZE + 4095) & !4095; // page-align
 
-        let txq_raw = rxq_aligned + VQ_TOTAL;
-        let txq_aligned = (txq_raw + 4095) & !4095;
-        s.txq_ptr = txq_aligned;
+        // Initial layout (will be overwritten by setup_queue_v1 or kept for v2)
+        s.rxq.desc = rxq_page;
+        s.rxq.avail = rxq_page + VQ_DESC_SIZE;
+        s.rxq.used = rxq_page + 4096;
+        s.rxq.last_used = 0;
+        s.rxq.next_avail = 0;
 
-        // Buffers follow (no alignment needed)
-        s.rx_bufs_ptr = txq_aligned + VQ_TOTAL;
+        let txq_page = (rxq_page + VQ_LEGACY_SIZE + 4095) & !4095;
+        s.txq.desc = txq_page;
+        s.txq.avail = txq_page + VQ_DESC_SIZE;
+        s.txq.used = txq_page + 4096;
+        s.txq.last_used = 0;
+        s.txq.next_avail = 0;
+
+        // Buffers follow
+        s.rx_bufs_ptr = txq_page + VQ_LEGACY_SIZE;
         s.tx_buf_ptr = s.rx_bufs_ptr + RX_BUFS_TOTAL;
 
         // Init device

@@ -1028,7 +1028,22 @@ pub extern "C" fn main() -> ! {
                     continue;
                 }
                 let mod_idx = dm_ref.count;
-                fluxor::kernel::scheduler::set_current_module(mod_idx);
+
+                // Set global module index so REGISTER_PROVIDER and syscalls
+                // can identify the calling module during module_new.
+                fluxor::kernel::scheduler::set_current_module(i);
+
+                // Populate export table and caps in SCHED so
+                // resolve_export_for_module works for provider registration.
+                scheduler::set_module_exports(
+                    i, m.code_base() as usize,
+                    m.export_table_ptr(), m.header.export_count,
+                );
+                let cap_class = match m.header.module_type {
+                    5 => 3, 3 => 1, 4 => 2, _ => 0,
+                };
+                scheduler::set_module_caps(i, cap_class, m.header.required_caps() as u32);
+
                 let result = unsafe {
                     loader::DynamicModule::start_new(
                         &m, syscalls,

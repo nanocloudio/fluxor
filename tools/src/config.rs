@@ -2084,7 +2084,10 @@ fn validate_manifests(module_names: &[String], module_caps: &[ModuleCaps]) -> Re
         }
     }
 
-    // Check exclusive resource conflicts (instance-aware)
+    // Check exclusive resource conflicts (instance-aware).
+    // Chain providers (access_mode 3) sit on top of exclusive providers via the
+    // provider chain pattern (CHAIN_NEXT dispatch). They coexist with exclusive
+    // providers and with each other on the same device class.
     // (device_class, instance, module_name)
     let mut exclusive_claims: Vec<(u8, u8, &str)> = Vec::new();
     for cap in module_caps {
@@ -2108,6 +2111,7 @@ fn validate_manifests(module_names: &[String], module_caps: &[ModuleCaps]) -> Re
                 }
                 exclusive_claims.push((res.device_class, res.instance, &cap.name));
             }
+            // access_mode 3 (chain) — no conflict check, chains stack on top
         }
     }
 
