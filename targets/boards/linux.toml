@@ -7,3 +7,6 @@ description = "Linux Hosted"
 
 [gpio]
 reserved_pins = []
+
+[platform.net]
+provider = "host"

@@ -1,0 +1,87 @@
+# Net stack — provides socket service via platform-appropriate modules.
+#
+# Variants are matched against merged config (user platform.net fields +
+# board defaults + target metadata). All match keys must equal for a variant
+# to be eligible. Highest-scoring eligible variant wins.
+
+[stack]
+name = "net"
+provides = ["socket"]
+
+# ── Pico 2W: WiFi via CYW43 ─────────────────────────────────────────────
+[[variant]]
+match = { board = "pico2w", phy = "wifi", driver = "cyw43" }
+modules = [
+  { name = "cyw43" },
+  { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
+  { name = "ip", params = { use_dhcp = "1" } },
+]
+wiring = [
+  "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
+  "cyw43.status -> wifi.status",
+  "cyw43.frames_rx -> ip.frames_rx",
+  "ip.frames_tx -> cyw43.frames_tx",
+]
+service = "ip"
+
+# ── Pico 2W: wired Ethernet via ENC28J60 ────────────────────────────────
+[[variant]]
+match = { board = "pico2w", phy = "ethernet", driver = "enc28j60" }
+modules = [
+  { name = "enc28j60" },
+  { name = "ip", params = { use_dhcp = "1" } },
+]
+wiring = [
+  "enc28j60.frames_rx -> ip.frames_rx",
+  "ip.frames_tx -> enc28j60.frames_tx",
+]
+service = "ip"
+
+# ── Pico W (RP2040): WiFi via CYW43 ─────────────────────────────────────
+[[variant]]
+match = { board = "picow", phy = "wifi", driver = "cyw43" }
+modules = [
+  { name = "cyw43" },
+  { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
+  { name = "ip", params = { use_dhcp = "1" } },
+]
+wiring = [
+  "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
+  "cyw43.status -> wifi.status",
+  "cyw43.frames_rx -> ip.frames_rx",
+  "ip.frames_tx -> cyw43.frames_tx",
+]
+service = "ip"
+
+# ── QEMU virt: virtio-net ───────────────────────────────────────────────
+[[variant]]
+match = { board = "qemu-virt", phy = "ethernet", driver = "virtio_net" }
+modules = [
+  { name = "virtio_net" },
+  { name = "ip", params = { use_dhcp = "1" } },
+]
+wiring = [
+  "virtio_net.frames_rx -> ip.frames_rx",
+  "ip.frames_tx -> virtio_net.frames_tx",
+]
+service = "ip"
+
+# ── CM5: Ethernet via RP1 GEM (future — needs manifest + hardware test) ─
+# [[variant]]
+# match = { board = "cm5", phy = "ethernet", driver = "rp1_gem" }
+# modules = [
+#   { name = "rp1_gem" },
+#   { name = "ip", params = { use_dhcp = "1" } },
+# ]
+# wiring = [
+#   "rp1_gem.frames_rx -> ip.frames_rx",
+#   "ip.frames_tx -> rp1_gem.frames_tx",
+# ]
+# service = "ip"
+
+# ── Linux: host-provided sockets ────────────────────────────────────────
+[[variant]]
+match = { family = "linux" }
+modules = []
+wiring = []
+service = "host"

@@ -2,40 +2,21 @@
 #
 # Serves a static HTML page over HTTP via virtio-net on aarch64 QEMU.
 #
-# Pipeline:
-#
-#   virtio_net <--frames--> ip <--sockets--> http
-#
 # Usage:
 #   make run CONFIG=examples/qemu-virt/hello_server.yaml
 #   curl http://localhost:18080/
 target: qemu-virt
-tick_us: 10000  # 100Hz — reduces GIC trap rate under KVM
+tick_us: 10000
+
+platform:
+  net: {}
 
 modules:
-  # Virtio-net driver — exchanges frames with QEMU virtual NIC
-  - name: virtio_net
-
-  # IP stack — ARP, DHCP, ICMP, TCP, UDP, socket service
-  - name: ip
-    use_dhcp: 1
-
-  # HTTP server
   - name: http
     port: 80
     routes:
       - path: "/"
         body: "<html><body><h1>Hello from Fluxor!</h1><p>Running on aarch64 QEMU virt.</p></body></html>"
 
-  # Debug logger
   - name: debug
     mode: plaintext
-
-wiring:
-  - from: virtio_net.frames_rx
-    to: ip.frames_rx
-  - from: ip.frames_tx
-    to: virtio_net.frames_tx
-
-services:
-  socket: ip

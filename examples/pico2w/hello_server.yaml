@@ -20,13 +20,8 @@
 target: pico2w
 
 
-hardware:
-  network:
-    type: wifi
-    driver: cyw43
-    ssid: "${WIFI_SSID}"
-    password: "${WIFI_PASSWORD}"
-    security: wpa3
+platform:
+  net: {}
 
 data:
   hello_page:

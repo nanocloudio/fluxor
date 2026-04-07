@@ -22,3 +22,5 @@ reserved_pins = [14, 15]
 [gpio.reserved_reasons]
 14 = "UART0 TX (console)"
 15 = "UART0 RX (console)"
+
+# platform.net defaults deferred until rp1_gem variant is production-ready

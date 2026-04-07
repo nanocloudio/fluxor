@@ -28,3 +28,7 @@ reserved_pins = [23, 24, 25, 29]
 24 = "WL_GPIO_CS (wireless SPI CS)"
 25 = "WL_GPIO_CLK (wireless SPI CLK)"
 29 = "WL_CLK (wireless SPI clock) / VSYS sense (ADC3)"
+
+[platform.net]
+phy = "wifi"
+driver = "cyw43"

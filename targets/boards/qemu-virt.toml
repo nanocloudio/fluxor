@@ -9,3 +9,7 @@ description = "QEMU aarch64 virt machine"
 # No reserved pins — virtual platform
 [gpio]
 reserved_pins = []
+
+[platform.net]
+phy = "ethernet"
+driver = "virtio_net"

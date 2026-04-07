@@ -13,8 +13,8 @@
 mod board;
 mod config;
 mod error;
-mod hardware_expand;
 mod hash;
+mod stack_expand;
 mod manifest;
 mod modules;
 pub mod reconfigure;
@@ -537,10 +537,11 @@ fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules
     };
 
     let mut config = config;
-    hardware_expand::expand_hardware_section(&mut config)?;
+    let target_desc = resolve_target(&config, None)?;
+    let project_root = std::env::current_dir().unwrap_or_default();
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     let builder = ConfigBuilder::new();
-    let target_desc = resolve_target(&config, None)?;
     if let Some(ref defaults) = target_desc.hardware_defaults {
         let hw = config.get("hardware").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
         let hw_obj = hw.as_object().cloned().unwrap_or_default();
@@ -597,15 +598,13 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
         serde_json::from_str(&content)?
     };
 
-    // Expand hardware subsections into modules + wiring
     let mut config = config;
-    let auto_added = hardware_expand::expand_hardware_section(&mut config)?;
-    if verbose && !auto_added.is_empty() {
-        eprintln!("Auto-added from hardware.network: {}", auto_added.join(", "));
-    }
-
-    // Resolve and validate target
     let target_desc = resolve_target(&config, None)?;
+    let project_root = std::env::current_dir().unwrap_or_default();
+    let stack_added = stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    if verbose && !stack_added.is_empty() {
+        eprintln!("Auto-added from platform: {}", stack_added.join(", "));
+    }
     if verbose {
         eprintln!("Target: {}", target_desc.display_name());
     }
@@ -814,14 +813,18 @@ fn load_config_with_defaults(config_path: &PathBuf, verbose: bool) -> Result<(se
     };
 
     let mut config = config;
-    let auto_added = hardware_expand::expand_hardware_section(&mut config)?;
-    if verbose && !auto_added.is_empty() {
-        eprintln!("Auto-added from hardware.network: {}", auto_added.join(", "));
-    }
 
+    // Resolve target first — stack expansion needs board_id and family
     let target_desc = resolve_target(&config, None)?;
     if verbose {
         eprintln!("Target: {}", target_desc.display_name());
+    }
+
+    // Expand platform: stacks (TOML-driven)
+    let project_root = std::env::current_dir().unwrap_or_default();
+    let stack_added = stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    if verbose && !stack_added.is_empty() {
+        eprintln!("Auto-added from platform: {}", stack_added.join(", "));
     }
 
     if let Some(ref defaults) = target_desc.hardware_defaults {
@@ -1115,9 +1118,9 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
     };
 
     let mut config = config;
-    hardware_expand::expand_hardware_section(&mut config)?;
-
     let target_desc = resolve_target(&config, target_override)?;
+    let project_root = std::env::current_dir().unwrap_or_default();
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     println!(
         "Validating {} against target '{}'...",
@@ -1436,8 +1439,9 @@ fn build_one(
     };
 
     let mut config = config;
-    hardware_expand::expand_hardware_section(&mut config)?;
     let target_desc = resolve_target(&config, None)?;
+    let project_root = std::env::current_dir().unwrap_or_default();
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     let family = target_desc.family.clone();
     let silicon_id = target_desc.id.clone();
     let board_id = target_desc.board_id.clone();

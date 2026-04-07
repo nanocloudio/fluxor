@@ -1,0 +1,41 @@
+# Storage stack — provides block device + filesystem modules.
+#
+# v1: no service injection. Consumers wire to fat32 directly
+# (e.g. fat32.files -> bank.files in user YAML).
+# A future services.fs concept may be added when an FS provider
+# contract exists.
+
+[stack]
+name = "storage"
+
+# ── RP2 family: SD card via SPI ──────────────────────────────────────────
+[[variant]]
+match = { family = "rp2", media = "sd" }
+modules = [
+  { name = "sd" },
+  { name = "fat32" },
+]
+wiring = [
+  "sd.blocks -> fat32.blocks",
+]
+
+# ── CM5: NVMe (future — nvme module does not exist yet) ─────────────────
+# [[variant]]
+# match = { board = "cm5", media = "nvme" }
+# modules = [
+#   { name = "pcie_scan" },
+#   { name = "smmu" },
+#   { name = "nvme" },
+#   { name = "fat32" },
+# ]
+# wiring = [
+#   "pcie_scan.bars -> nvme.bars",
+#   "nvme.blocks -> fat32.blocks",
+# ]
+
+# ── Linux: host filesystem ──────────────────────────────────────────────
+[[variant]]
+match = { family = "linux" }
+modules = []
+wiring = []
+service = "host"

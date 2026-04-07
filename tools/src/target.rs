@@ -102,6 +102,8 @@ struct TomlBoardFile {
     board: TomlBoardMeta,
     gpio: Option<TomlGpioConfig>,
     hardware: Option<TomlBoardHardware>,
+    /// Platform stack defaults (e.g. [platform.net] phy="wifi", driver="cyw43")
+    platform: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -157,6 +159,8 @@ pub struct TargetDescriptor {
     pub memory: Option<MemoryConfig>,
     /// Board-level hardware defaults (merged when YAML omits a section)
     pub hardware_defaults: Option<serde_json::Value>,
+    /// Platform stack defaults from board TOML (e.g. net → {phy: wifi, driver: cyw43})
+    pub platform_defaults: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// State arena size in KB (from [kernel] section, default 256)
     pub state_arena_kb: u32,
     /// Number of MPU regions available (0 = no MPU, e.g. Cortex-M0+)
@@ -367,6 +371,7 @@ fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
         i2c_pins: build_i2c_tables(p),
         memory,
         hardware_defaults: None,
+        platform_defaults: std::collections::HashMap::new(),
         state_arena_kb: silicon.kernel.as_ref()
             .and_then(|k| k.state_arena_kb)
             .unwrap_or(256),
@@ -437,6 +442,11 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
         if !map.is_empty() {
             desc.hardware_defaults = Some(serde_json::Value::Object(map));
         }
+    }
+
+    // Platform stack defaults (e.g. [platform.net] phy="wifi")
+    if let Some(platform) = board.platform {
+        desc.platform_defaults = platform;
     }
 
     Ok(desc)
