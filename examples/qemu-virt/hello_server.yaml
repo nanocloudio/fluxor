@@ -7,9 +7,10 @@
 #   virtio_net <--frames--> ip <--sockets--> http
 #
 # Usage:
-#   1. make vm-run
-#   2. curl http://localhost:18080/
+#   make run CONFIG=examples/qemu-virt/hello_server.yaml
+#   curl http://localhost:18080/
 target: qemu-virt
+tick_us: 10000  # 100Hz — reduces GIC trap rate under KVM
 
 modules:
   # Virtio-net driver — exchanges frames with QEMU virtual NIC

@@ -557,6 +557,11 @@ pub mod dev_system {
     pub const DOWNSTREAM_LATENCY: u32 = 0x0C33;
     /// Report module's own processing latency in frames. handle=-1, arg[0..4]=frames (u32 LE).
     pub const REPORT_LATENCY: u32 = 0x0C50;
+    /// Bind an event handle to a hardware IRQ number.
+    /// handle=event_handle, arg=[irq_number:u32 LE], arg_len=4.
+    /// The kernel signals the event when the IRQ fires (ISR-safe).
+    /// Returns 0 on success, negative errno on failure.
+    pub const IRQ_BIND: u32 = 0x0C51;
     /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
     pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
     /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).

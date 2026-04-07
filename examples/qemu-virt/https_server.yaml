@@ -12,6 +12,7 @@
 #   make run CONFIG=examples/qemu-virt/https_server.yaml
 #   curl -vsk https://localhost:59443/
 target: qemu-virt
+tick_us: 1000   # 1ms tick — TLS handshake needs fast round-trips
 
 modules:
   # Virtio-net driver

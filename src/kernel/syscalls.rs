@@ -634,6 +634,21 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             syscall_log(handle as u8, arg, arg_len);
             0
         }
+        dev_system::IRQ_BIND => {
+            // Bind an event handle to a hardware IRQ. handle=event, arg=[irq:u32, mmio_base:u64]
+            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            let irq = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let mmio_base = if arg_len >= 12 {
+                u64::from_le_bytes([
+                    *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                    *arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11),
+                ]) as usize
+            } else { 0 };
+            // Pass raw event slot (not tagged FD) to the ISR binding
+            let event_slot = crate::kernel::fd::slot_of(handle);
+            if event_slot < 0 { return E_INVAL; }
+            hal::irq_bind(irq, event_slot, mmio_base)
+        }
         dev_system::FD_POLL => {
             let events = if !arg.is_null() && arg_len >= 1 { *arg } else { 0xFF };
             crate::kernel::fd::fd_poll(handle, events)

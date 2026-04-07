@@ -32,7 +32,7 @@ const UART_BASE: usize = 0x0900_0000; // QEMU virt PL011
 #[cfg(feature = "board-cm5")]
 const UART_BASE: usize = 0xFE20_1000; // Pi 5 PL011 (BCM2712 legacy peripheral space)
 
-// GICv2
+// GIC
 #[cfg(not(feature = "board-cm5"))]
 const GICD_BASE: usize = 0x0800_0000; // QEMU virt GICv2 distributor
 #[cfg(not(feature = "board-cm5"))]
@@ -44,7 +44,16 @@ const GICC_BASE: usize = 0xFF84_2000; // Pi 5 GIC-400 CPU interface
 
 const GICC_IAR: *mut u32 = (GICC_BASE + 0x00C) as *mut u32;
 const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32;
-const TIMER_PPI: u32 = 30; // Non-secure physical timer PPI
+// Pi 5 (board-cm5): physical timer PPI 30 — no hypervisor, direct access.
+// QEMU: virtual timer PPI 27 — avoids KVM trap overhead on physical timer.
+#[cfg(feature = "board-cm5")]
+const TIMER_PPI: u32 = 30;
+#[cfg(not(feature = "board-cm5"))]
+const TIMER_PPI: u32 = 27;
+#[cfg(not(feature = "board-cm5"))]
+const QEMU_CONFIG_BLOB_ADDR: usize = 0x4100_0000;
+#[cfg(not(feature = "board-cm5"))]
+const QEMU_MODULES_BLOB_ADDR: usize = 0x4200_0000;
 
 global_asm!(
     ".section .layout_header,\"a\"",
@@ -311,7 +320,7 @@ mod mmu {
     }
 }
 
-// On QEMU virt, skip MMU setup (QEMU handles cacheability transparently)
+// On QEMU virt, no MMU setup needed (identity mapped by QEMU firmware).
 #[cfg(not(feature = "board-cm5"))]
 mod mmu {
     pub unsafe fn init_page_tables() {}
@@ -530,6 +539,53 @@ mod rp1 {
 // GICv2
 // ============================================================================
 
+/// IRQ-to-event binding table. When a bound IRQ fires, the kernel signals the
+/// associated event via event_signal_from_isr (ISR-safe, lock-free).
+/// Up to 4 bindings (virtio devices, GPIO, etc.).
+const MAX_IRQ_BINDINGS: usize = 4;
+struct IrqBinding {
+    irq: u32,           // GIC interrupt ID (e.g. 48 for virtio SPI 16)
+    event_handle: i32,  // Fluxor event handle to signal
+    mmio_base: usize,   // If nonzero, ACK device by reading INTERRUPT_STATUS and writing INTERRUPT_ACK
+}
+static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = [
+    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
+    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
+    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
+    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
+];
+static mut IRQ_BINDING_COUNT: usize = 0;
+
+/// Bind an event to a hardware IRQ. Enables the IRQ in the GIC distributor.
+/// `mmio_base`: if nonzero, the ISR reads offset 0x60 (INTERRUPT_STATUS) and
+/// writes offset 0x64 (INTERRUPT_ACK) to ACK virtio-mmio devices.
+///
+/// Returns 0 on success, negative errno on failure.
+pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
+    unsafe {
+        if IRQ_BINDING_COUNT >= MAX_IRQ_BINDINGS {
+            return fluxor::kernel::errno::ENOMEM;
+        }
+        let idx = IRQ_BINDING_COUNT;
+        IRQ_BINDINGS[idx] = IrqBinding { irq, event_handle, mmio_base };
+        IRQ_BINDING_COUNT = idx + 1;
+
+        // Enable the SPI in the GIC distributor
+        // SPIs start at IRQ 32. ISENABLER register: base + 0x100 + (irq/32)*4, bit = irq%32
+        let reg = GICD_BASE + 0x100 + (irq as usize / 32) * 4;
+        let bit = 1u32 << (irq % 32);
+        core::ptr::write_volatile(reg as *mut u32,
+            core::ptr::read_volatile(reg as *const u32) | bit);
+        // Set priority to 0 (highest)
+        core::ptr::write_volatile((GICD_BASE + 0x400 + irq as usize) as *mut u8, 0);
+        // Target CPU 0
+        core::ptr::write_volatile((GICD_BASE + 0x800 + irq as usize) as *mut u8, 1);
+
+        log::info!("[irq] bind irq={} event={} mmio={:#x}", irq, event_handle, mmio_base);
+    }
+    0
+}
+
 unsafe fn gic_init() {
     core::ptr::write_volatile(GICD_BASE as *mut u32, 1); // GICD_CTLR: enable
     core::ptr::write_volatile((GICD_BASE + 0x100) as *mut u32, 1u32 << TIMER_PPI); // ISENABLER0
@@ -557,18 +613,32 @@ fn timer_freq() -> u64 {
     freq
 }
 
-/// Read the physical counter (CNTPCT_EL0) for cycle-accurate timing.
+/// Read the timer counter for cycle-accurate timing.
+/// Pi 5: physical counter (CNTPCT_EL0) — direct hardware access.
+/// QEMU: virtual counter (CNTVCT_EL0) — no KVM trap overhead.
 fn read_timer_count() -> u32 {
     let val: u64;
+    #[cfg(feature = "board-cm5")]
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
+    #[cfg(not(feature = "board-cm5"))]
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
     val as u32
 }
 
 unsafe fn timer_set(ticks: u32) {
+    #[cfg(feature = "board-cm5")]
     core::arch::asm!(
         "msr cntp_tval_el0, {val}",
         "mov {ctl}, #1",
         "msr cntp_ctl_el0, {ctl}",
+        val = in(reg) ticks as u64,
+        ctl = out(reg) _,
+    );
+    #[cfg(not(feature = "board-cm5"))]
+    core::arch::asm!(
+        "msr cntv_tval_el0, {val}",
+        "mov {ctl}, #1",
+        "msr cntv_ctl_el0, {ctl}",
         val = in(reg) ticks as u64,
         ctl = out(reg) _,
     );
@@ -639,12 +709,34 @@ global_asm!(
     "bl exception_dump",
     "ldp x0, x1, [sp], #16",
     "ldp x29, x30, [sp], #16",
-    "1: wfe",
-    "b 1b",
+    // Spin on exception — no recovery, keep CPU in diagnosable state.
+    "1: b 1b",
 );
+
+/// Guard against recursive exceptions in exception_dump.
+static EXCEPTION_DEPTH: AtomicU32 = AtomicU32::new(0);
+/// Set to 1 after UART is initialised — exception_dump won't touch UART before this.
+static UART_READY: AtomicU32 = AtomicU32::new(0);
 
 #[no_mangle]
 unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
+    // Prevent recursive exception storms — if we fault inside the handler,
+    // just spin silently rather than faulting again.
+    if EXCEPTION_DEPTH.fetch_add(1, Ordering::Relaxed) > 0 {
+        return;
+    }
+    // Always store exception state at a fixed address for QEMU monitor inspection.
+    // Read with: (qemu) xp /4gx 0x40070000
+    // Useful when UART is not yet initialized (early boot / KVM).
+    core::ptr::write_volatile(0x4007_0000 as *mut u64, elr);
+    core::ptr::write_volatile(0x4007_0008 as *mut u64, esr);
+    core::ptr::write_volatile(0x4007_0010 as *mut u64, far);
+    core::ptr::write_volatile(0x4007_0018 as *mut u64, 0xDEAD_BEEF_CAFE_BABE);
+
+    // Don't touch UART if it hasn't been initialised yet (early boot / KVM)
+    if UART_READY.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     uart_puts(b"\r\n!!! EXCEPTION\r\n");
     uart_puts(b"  ELR=0x"); uart_put_hex64(elr);
     uart_puts(b"\r\n  ESR=0x"); uart_put_hex64(esr);
@@ -675,18 +767,37 @@ fn current_core_id() -> u8 {
 #[no_mangle]
 unsafe extern "C" fn irq_handler() {
     let iar = core::ptr::read_volatile(GICC_IAR);
-    let int_id = iar & 0x3FF;
-    if int_id == TIMER_PPI {
+    let irq_id = iar & 0x3FF;
+    core::ptr::write_volatile(GICC_EOIR, iar);
+
+    if irq_id == TIMER_PPI {
+        // Timer tick — reload and count
         timer_set(TICKS_PER_TICK);
-        let core_id = current_core_id() as usize;
-        if core_id == 0 {
-            scheduler::DBG_TICK += 1;
-        }
-        if core_id < 4 {
-            CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
+        let core_id = {
+            let mpidr: u64;
+            core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
+            (mpidr & 0xFF) as usize
+        };
+        CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
+    } else {
+        // Check IRQ bindings (virtio, etc.)
+        let n = IRQ_BINDING_COUNT;
+        let mut i = 0;
+        while i < n {
+            let binding = &IRQ_BINDINGS[i];
+            if binding.irq == irq_id && binding.event_handle >= 0 {
+                // ACK device if mmio_base is set (virtio-mmio)
+                if binding.mmio_base != 0 {
+                    let isr = core::ptr::read_volatile((binding.mmio_base + 0x60) as *const u32);
+                    if isr != 0 {
+                        core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
+                    }
+                }
+                fluxor::kernel::event::event_signal_from_isr(binding.event_handle);
+            }
+            i += 1;
         }
     }
-    core::ptr::write_volatile(GICC_EOIR, iar);
 }
 
 // ============================================================================
@@ -744,6 +855,13 @@ global_asm!(
     ".global _start",
     ".type _start, @function",
     "_start:",
+    // ---- Install exception vectors FIRST (before any register/MMIO access) ----
+    // Default VBAR_EL1 may point to unmapped memory. Must be set before
+    // anything that could fault.
+    "    adr x1, exception_vectors",
+    "    msr vbar_el1, x1",
+    "    isb",
+
     // ---- E3-S7: Check core ID, park secondary cores ----
     "    mrs x0, mpidr_el1",
     "    and x0, x0, #0xFF",     // Aff0 = core ID
@@ -753,6 +871,10 @@ global_asm!(
     // Enable NEON/FP (CPACR_EL1.FPEN = 0b11)
     "    mov x0, #(3 << 20)",
     "    msr cpacr_el1, x0",
+    "    isb",
+
+    // Use SP_EL1 for kernel execution so IRQs take the EL1h/SP_ELx vector slot.
+    "    msr SPSel, #1",
     "    isb",
 
     // Set up stack before relocating the packaged payload.
@@ -802,12 +924,12 @@ global_asm!(
     "    bl main",
 
     // Should never return
-    "2:  wfe",
-    "    b 2b",
+    "2:  b 2b",
 
     // ---- Secondary core parking (E3-S7) ----
+    // WFI: secondary cores sleep until woken by IPI from wake_secondary_cores().
     ".Lpark_core:",
-    "    wfe",
+    "    wfi",
     "    b .Lpark_core",
 );
 
@@ -819,6 +941,7 @@ global_asm!(
 pub extern "C" fn main() -> ! {
     // Initialize UART first (Pi 5 needs explicit PL011 setup)
     unsafe { uart_init() };
+    UART_READY.store(1, Ordering::Release);
 
     #[cfg(feature = "board-cm5")]
     uart_puts(b"[fluxor] bcm2712 boot (Pi 5 / CM5)\r\n");
@@ -851,7 +974,6 @@ pub extern "C" fn main() -> ! {
     // Timer tick period will be recalculated after config is parsed (tick_us).
     // Start with 1ms default so the system runs during init.
     unsafe {
-        core::arch::asm!("adr {tmp}, exception_vectors", "msr vbar_el1, {tmp}", tmp = out(reg) _);
         gic_init();
         TICKS_PER_TICK = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
         timer_set(TICKS_PER_TICK);
@@ -872,9 +994,25 @@ pub extern "C" fn main() -> ! {
     use fluxor::kernel::channel;
     use fluxor::kernel::config::{self, MAX_MODULES};
 
-    // Parse config from the layout trailer appended to kernel8.img
+    // Parse config from the QEMU side-loaded blob when present; otherwise use
+    // the packaged trailer path (Pi 5 / raw packed image).
     let mut cfg = config::Config::empty();
-    if !config::read_config_into(&mut cfg) {
+    let cfg_ok = {
+        #[cfg(not(feature = "board-cm5"))]
+        {
+            let blob_magic = unsafe { core::ptr::read_volatile(QEMU_CONFIG_BLOB_ADDR as *const u32) };
+            if blob_magic == config::MAGIC_CONFIG {
+                config::read_config_from_ptr(QEMU_CONFIG_BLOB_ADDR as *const u8, &mut cfg)
+            } else {
+                config::read_config_into(&mut cfg)
+            }
+        }
+        #[cfg(feature = "board-cm5")]
+        {
+            config::read_config_into(&mut cfg)
+        }
+    };
+    if !cfg_ok {
         uart_puts(b"[config] parse failed\r\n");
         loop { unsafe { core::arch::asm!("wfi") }; }
     }
@@ -903,10 +1041,26 @@ pub extern "C" fn main() -> ! {
     uart_put_u32(n_edges as u32);
     uart_puts(b" edges\r\n");
 
-    // Load module table from the layout trailer appended to kernel8.img
+    // Load module table from the QEMU side-loaded blob when present; otherwise
+    // use the packaged trailer path.
     loader::reset_state_arena();
     let mut ldr = loader::ModuleLoader::new();
-    if ldr.init().is_err() {
+    let loader_ok = {
+        #[cfg(not(feature = "board-cm5"))]
+        {
+            let blob_magic = unsafe { core::ptr::read_volatile(QEMU_MODULES_BLOB_ADDR as *const u32) };
+            if blob_magic == loader::MODULE_TABLE_MAGIC {
+                ldr.init_from_blob(QEMU_MODULES_BLOB_ADDR as *const u8)
+            } else {
+                ldr.init()
+            }
+        }
+        #[cfg(feature = "board-cm5")]
+        {
+            ldr.init()
+        }
+    };
+    if loader_ok.is_err() {
         uart_puts(b"[loader] no modules\r\n");
         loop { unsafe { core::arch::asm!("wfi") }; }
     }
@@ -1646,9 +1800,13 @@ fn bcm_pic_barrier() {
 static mut BCM_ARM_TIME: u64 = 0;
 static mut BCM_DEADLINE_TICKS: u64 = 0;
 
+/// Read the timer counter (physical on Pi 5, virtual on QEMU for KVM compat).
 fn bcm_read_cntpct() -> u64 {
     let val: u64;
+    #[cfg(feature = "board-cm5")]
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
+    #[cfg(not(feature = "board-cm5"))]
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
     val
 }
 
@@ -1820,6 +1978,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     init_gpio: |_| 0, // no GPIO init on aarch64 (handled by PIC modules)
     csprng_fill: bcm_csprng_fill,
     core_id: || current_core_id() as usize,
+    irq_bind: irq_bind,
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5)
@@ -1880,7 +2039,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
             let mut i = 0usize;
             while i < len {
                 let cnt: u64;
-                core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) cnt);
+                core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt);
                 state ^= cnt;
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 core::ptr::write_volatile(buf.add(i), (state >> 32) as u8);

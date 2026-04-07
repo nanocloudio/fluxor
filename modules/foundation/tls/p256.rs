@@ -302,6 +302,58 @@ fn fp_mul(a: &U256, b: &U256) -> U256 {
     fp_reduce(&t)
 }
 
+/// Wide squaring: a^2 → 512-bit result.
+/// Exploits symmetry: cross-products a[i]*a[j] (i≠j) computed once and doubled.
+/// 10 multiplications instead of 16 for general multiply.
+fn u256_sqr_wide(a: &U256) -> [u64; 8] {
+    let mut r = [0u128; 8];
+
+    // Cross-products (i < j only), then double
+    let mut i = 0;
+    while i < 4 {
+        let mut j = i + 1;
+        while j < 4 {
+            let prod = (a[i] as u128) * (a[j] as u128);
+            r[i + j] += prod;
+            r[i + j + 1] += r[i + j] >> 64;
+            r[i + j] &= 0xFFFFFFFFFFFFFFFF;
+            j += 1;
+        }
+        i += 1;
+    }
+
+    // Double all cross-products
+    i = 7;
+    while i > 0 {
+        r[i] = (r[i] << 1) | (r[i - 1] >> 63);
+        i -= 1;
+    }
+    r[0] <<= 1;
+
+    // Add squared terms a[i]*a[i]
+    i = 0;
+    while i < 4 {
+        let sq = (a[i] as u128) * (a[i] as u128);
+        r[i * 2] += sq & 0xFFFFFFFFFFFFFFFF;
+        r[i * 2 + 1] += r[i * 2] >> 64;
+        r[i * 2] &= 0xFFFFFFFFFFFFFFFF;
+        r[i * 2 + 1] += sq >> 64;
+        if i < 3 {
+            r[i * 2 + 2] += r[i * 2 + 1] >> 64;
+            r[i * 2 + 1] &= 0xFFFFFFFFFFFFFFFF;
+        }
+        i += 1;
+    }
+
+    let mut out = [0u64; 8];
+    i = 0;
+    while i < 8 {
+        out[i] = r[i] as u64;
+        i += 1;
+    }
+    out
+}
+
 /// Modular squaring: a^2 mod p
 fn fp_sqr(a: &U256) -> U256 {
     fp_mul(a, a)

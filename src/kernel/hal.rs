@@ -87,6 +87,10 @@ pub struct HalOps {
 
     /// Return the current CPU core ID (0-3). Returns 0 on single-core platforms.
     pub core_id: fn() -> usize,
+
+    /// Bind an event handle to a hardware IRQ. Platform-specific.
+    /// Returns 0 on success, negative errno on failure.
+    pub irq_bind: fn(irq: u32, event_handle: i32, mmio_base: usize) -> i32,
 }
 
 /// Global HAL operations table. Set once at boot by `init()`.
@@ -267,4 +271,10 @@ pub fn csprng_fill(buf: *mut u8, len: usize) -> i32 {
 #[inline(always)]
 pub fn core_id() -> usize {
     (ops().core_id)()
+}
+
+/// Bind an event handle to a hardware IRQ.
+#[inline(always)]
+pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
+    (ops().irq_bind)(irq, event_handle, mmio_base)
 }

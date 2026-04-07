@@ -307,8 +307,8 @@ static mut STATE_ARENA_OFFSET: usize = 0;
 pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
     // SAFETY: Single-threaded embedded context, no concurrent access
     unsafe {
-        // Align offset up to 4 bytes (ARM word alignment)
-        let aligned = (STATE_ARENA_OFFSET + 3) & !3;
+        // Align offset up to 8 bytes (aarch64 pointer alignment)
+        let aligned = (STATE_ARENA_OFFSET + 7) & !7;
         if aligned + size > STATE_ARENA_SIZE {
             log::error!("[loader] state arena full need={} used={} cap={}",
                 size, aligned, STATE_ARENA_SIZE);

@@ -622,6 +622,35 @@ unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u8) -> i32 {
     (sys.dev_call)(fd, 0x0C41, buf.as_mut_ptr(), 1)
 }
 
+/// Create an event via dev_call (EVENT::CREATE 0x0B00).
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_event_create(sys: &SyscallTable) -> i32 {
+    (sys.dev_call)(-1, 0x0B00, core::ptr::null_mut(), 0)
+}
+
+/// Poll an event via dev_call (EVENT::POLL 0x0B02). Returns 1 if signaled (clears it), 0 if not.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_event_poll(sys: &SyscallTable, handle: i32) -> i32 {
+    (sys.dev_call)(handle, 0x0B02, core::ptr::null_mut(), 0)
+}
+
+/// Bind an event to a hardware IRQ (SYSTEM::IRQ_BIND 0x0C51).
+/// `irq`: GIC interrupt number. `mmio_base`: virtio-mmio base for auto-ACK (0 = none).
+#[allow(dead_code)]
+unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_base: usize) -> i32 {
+    let mut buf = [0u8; 12];
+    let bp = buf.as_mut_ptr();
+    let irq_bytes = irq.to_le_bytes();
+    *bp = irq_bytes[0]; *bp.add(1) = irq_bytes[1];
+    *bp.add(2) = irq_bytes[2]; *bp.add(3) = irq_bytes[3];
+    let mb = (mmio_base as u64).to_le_bytes();
+    let mut i = 0;
+    while i < 8 { *bp.add(4 + i) = mb[i]; i += 1; }
+    (sys.dev_call)(event_handle, 0x0C51, bp, 12)
+}
+
 /// Query graph-level sample rate via dev_query (SYSTEM::GRAPH_SAMPLE_RATE 0x0C31).
 /// Returns 0 if not configured.
 #[allow(dead_code)]

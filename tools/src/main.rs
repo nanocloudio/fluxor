@@ -1642,6 +1642,9 @@ fn collect_yaml_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 }
 
 fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
+    const QEMU_CONFIG_BLOB_ADDR: u64 = 0x4100_0000;
+    const QEMU_MODULES_BLOB_ADDR: u64 = 0x4200_0000;
+
     let result = build_one(config_path, None, verbose)?;
 
     match result.family.as_str() {
@@ -1688,6 +1691,35 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 .unwrap_or(false);
 
             if is_qemu {
+                let elf_path = PathBuf::from("target/aarch64-unknown-none/release/fluxor");
+                if !elf_path.exists() {
+                    return Err(Error::Config(format!(
+                        "Firmware ELF not found at {}. Run 'make firmware TARGET=bcm2712' first.",
+                        elf_path.display()
+                    )));
+                }
+
+                let out_dir = result.output_path.parent().unwrap();
+                let config_blob = out_dir.join("config.bin");
+                let modules_blob = out_dir.join("modules.bin");
+
+                let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
+                let modules_dir = PathBuf::from(format!("target/{}/modules", target_desc.id));
+                if !modules_dir.exists() {
+                    return Err(Error::Config(format!(
+                        "Modules not found at {}. Run 'make modules TARGET={}' first.",
+                        modules_dir.display(),
+                        target_desc.id
+                    )));
+                }
+                let (modules_data, config_data) =
+                    build_packaged_blobs(&config, modules_dir.as_path(), &[], &target_desc, verbose)?;
+                let modules_data = modules_data.ok_or_else(|| {
+                    Error::Config("QEMU bare-metal run requires at least one module blob".into())
+                })?;
+                std::fs::write(&config_blob, &config_data)?;
+                std::fs::write(&modules_blob, &modules_data)?;
+
                 // Extract HTTP port from config YAML for QEMU port forwarding
                 let yaml_text = std::fs::read_to_string(config_path)?;
                 let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
@@ -1703,22 +1735,47 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 let host_port = if guest_port < 1024 { guest_port + 18000 } else { guest_port };
                 let hostfwd = format!("user,id=net0,hostfwd=tcp::{}-:{}", host_port, guest_port);
 
-                eprintln!("Running: qemu-system-aarch64 -kernel {}", result.output_path.display());
+                eprintln!("Running: qemu-system-aarch64 -kernel {}", elf_path.display());
                 eprintln!("  Port forward: host {} -> guest {}", host_port, guest_port);
+                eprintln!(
+                    "  Side-load: config={} @ 0x{:08x}, modules={} @ 0x{:08x}",
+                    config_blob.display(),
+                    QEMU_CONFIG_BLOB_ADDR,
+                    modules_blob.display(),
+                    QEMU_MODULES_BLOB_ADDR
+                );
 
-                let dump_arg = format!("filter-dump,id=dump0,netdev=net0,file=/tmp/fluxor-qemu.pcap");
+                let mut qemu_args: Vec<&str> = vec![
+                    "-machine", "virt",
+                    "-cpu", "cortex-a76",
+                    "-smp", "1",
+                    "-m", "256M",
+                    "-nographic",
+                ];
+                qemu_args.extend_from_slice(&[
+                    "-device", "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
+                ]);
+                let hostfwd_ref: &str = &hostfwd;
+                let config_loader = format!(
+                    "loader,file={},addr=0x{:x},force-raw=on",
+                    config_blob.display(),
+                    QEMU_CONFIG_BLOB_ADDR
+                );
+                let modules_loader = format!(
+                    "loader,file={},addr=0x{:x},force-raw=on",
+                    modules_blob.display(),
+                    QEMU_MODULES_BLOB_ADDR
+                );
+                qemu_args.extend_from_slice(&[
+                    "-netdev", hostfwd_ref,
+                    "-device", config_loader.as_str(),
+                    "-device", modules_loader.as_str(),
+                    "-kernel",
+                ]);
+
                 let status = std::process::Command::new("qemu-system-aarch64")
-                    .args([
-                        "-machine", "virt",
-                        "-cpu", "cortex-a76",
-                        "-m", "2G",
-                        "-nographic",
-                        "-device", "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
-                        "-netdev", &hostfwd,
-                        "-object", &dump_arg,
-                        "-kernel",
-                    ])
-                    .arg(&result.output_path)
+                    .args(&qemu_args)
+                    .arg(&elf_path)
                     .status()?;
 
                 if !status.success() {
