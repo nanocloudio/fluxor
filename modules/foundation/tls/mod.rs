@@ -12,13 +12,13 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../src/abi.rs"]
+#[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
 // PIC runtime (syscalls, helpers, intrinsics)
-include!("../../pic_runtime.rs");
-include!("../../param_macro.rs");
+include!("../../sdk/runtime.rs");
+include!("../../sdk/params.rs");
 
 // Crypto primitives
 include!("sha256.rs");

@@ -23,11 +23,11 @@
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
-#[path = "../../../src/abi.rs"]
+#[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../pic_runtime.rs");
+include!("../../sdk/runtime.rs");
 
 // ============================================================================
 // Constants

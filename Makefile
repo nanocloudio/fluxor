@@ -47,9 +47,9 @@ FLUXOR_TOOL := target/aarch64-unknown-linux-gnu/release/fluxor
 
 # Module source directories under modules/
 MODULE_DIRS := modules/drivers modules/foundation modules/app
-# Shared PIC build files (pic_runtime.rs, param_macro.rs, module.ld) live in modules/
-SHARED_DIR := modules
-ABI_HEADER := src/abi.rs
+# Shared PIC SDK files (abi.rs, runtime.rs, params.rs) live in modules/sdk/
+SDK_DIR := modules/sdk
+ABI_HEADER := $(SDK_DIR)/abi.rs
 
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,2)))))))))))))
@@ -101,7 +101,7 @@ modules: tools
 			out="$(MODULES_OUT)/$$mod.fmod"; \
 			newest=$$(find "$$mod_dir" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
 			if [ -f "$$mod_dir/module.ld" ]; then ld_script="$$mod_dir/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
-			if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(SHARED_DIR)/pic_runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULE_LD)" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
+			if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(SDK_DIR)/runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULE_LD)" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
 				rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
 				$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
 				mtype=$$(echo "$(call mod_type,$$mod)"); [ -z "$$mtype" ] && mtype=2; \

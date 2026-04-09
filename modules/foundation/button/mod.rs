@@ -18,12 +18,12 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../src/abi.rs"]
+#[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../pic_runtime.rs");
-include!("../../param_macro.rs");
+include!("../../sdk/runtime.rs");
+include!("../../sdk/params.rs");
 
 // ============================================================================
 // Constants

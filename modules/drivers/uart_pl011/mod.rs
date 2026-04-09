@@ -8,11 +8,11 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../src/abi.rs"]
+#[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../pic_runtime.rs");
+include!("../../sdk/runtime.rs");
 
 const MAX_HANDLES: usize = 4;
 const MAX_BUSES: usize = 2;

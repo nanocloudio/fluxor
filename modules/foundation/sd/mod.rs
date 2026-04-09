@@ -37,7 +37,7 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
 
-#[path = "../../../src/abi.rs"]
+#[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::{SyscallTable, SpiOpenArgs, SpiTransferStartArgs};
 
@@ -62,8 +62,8 @@ struct SdParams {
     block_count: u32,
 }
 
-include!("../../pic_runtime.rs");
-include!("../../param_macro.rs");
+include!("../../sdk/runtime.rs");
+include!("../../sdk/params.rs");
 
 // ============================================================================
 // SD Protocol Constants

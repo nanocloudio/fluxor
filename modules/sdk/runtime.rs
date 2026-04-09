@@ -1,7 +1,7 @@
 // Shared PIC module runtime support.
 //
 // Provides compiler runtime intrinsics and helper functions required by all
-// PIC modules. Each module includes this via `include!("pic_runtime.rs")`.
+// PIC modules. Each module includes this via `include!("../../sdk/runtime.rs")`.
 //
 // Compiler Intrinsics: ARM EABI memclr/memcpy for struct init/assignment.
 // Param Helpers: Safe(r) little-endian reads from a raw params pointer.
@@ -808,6 +808,9 @@ unsafe fn net_write_frame(
 /// Read a net protocol frame from channel into buf.
 /// Returns (msg_type, payload_len) or (0, 0) if no data.
 /// Payload starts at buf[3]. Caller must provide buf >= FRAME_HDR + max payload.
+///
+/// Two-step read: first the 3-byte TLV header, then exactly payload_len bytes.
+/// This prevents consuming multiple frames from the byte-stream FIFO in one call.
 #[allow(dead_code)]
 unsafe fn net_read_frame(
     sys: &SyscallTable,
@@ -816,13 +819,17 @@ unsafe fn net_read_frame(
     buf_max: usize,
 ) -> (u8, usize) {
     if chan < 0 || buf_max < NET_FRAME_HDR { return (0, 0); }
-    // No poll pre-check: channel_read returns 0 when empty.
-    let n = (sys.channel_read)(chan, buf, buf_max);
+    // Step 1: read just the 3-byte TLV header
+    let n = (sys.channel_read)(chan, buf, NET_FRAME_HDR);
     if n < NET_FRAME_HDR as i32 { return (0, 0); }
     let msg_type = *buf;
     let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
-    let available = (n as usize).saturating_sub(NET_FRAME_HDR);
-    let actual = if payload_len < available { payload_len } else { available };
+    if payload_len == 0 { return (msg_type, 0); }
+    // Step 2: read exactly payload_len bytes into buf[3..]
+    let max_payload = buf_max - NET_FRAME_HDR;
+    let to_read = if payload_len < max_payload { payload_len } else { max_payload };
+    let n2 = (sys.channel_read)(chan, buf.add(NET_FRAME_HDR), to_read);
+    let actual = if n2 > 0 { n2 as usize } else { 0 };
     (msg_type, actual)
 }
 

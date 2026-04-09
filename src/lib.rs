@@ -3,6 +3,7 @@
 #[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux"))]
 pub mod kernel;
 #[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux"))]
+#[path = "../modules/sdk/abi.rs"]
 pub mod abi;
 #[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux"))]
 #[path = "../modules/mod.rs"]

@@ -28,7 +28,7 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../src/abi.rs"]
+#[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
@@ -90,8 +90,8 @@ enum Fat32ModPhase {
     WaitFat = 7,
 }
 
-include!("../../pic_runtime.rs");
-include!("../../param_macro.rs");
+include!("../../sdk/runtime.rs");
+include!("../../sdk/params.rs");
 
 // ============================================================================
 // Parameter Definitions
