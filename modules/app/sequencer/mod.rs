@@ -375,7 +375,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Process control input events (FMP messages)
         if seq.in_chan >= 0 {
             let poll_in = (sys.channel_poll)(seq.in_chan, POLL_IN);
-            if poll_in > 0 && ((poll_in as u8) & POLL_IN) != 0 {
+            if poll_in > 0 && ((poll_in as u32) & POLL_IN) != 0 {
                 let (ty, len) = msg_read(sys, seq.in_chan, seq.msg_buf.as_mut_ptr(), 16);
                 if ty != 0 {
                     match ty {
@@ -498,7 +498,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Send pending ratchets (if any)
         if seq.ratchet_pending > 0 {
             let poll = (sys.channel_poll)(out_chan, POLL_OUT);
-            if poll > 0 && ((poll as u8) & POLL_OUT) != 0 {
+            if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
                 let idx = seq.ratchet_index;
                 let count = if seq.ratchet_count == 0 { 1 } else { seq.ratchet_count };
 
@@ -679,7 +679,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             seq.output_vel = vel;
 
             let poll = (sys.channel_poll)(out_chan, POLL_OUT);
-            if poll > 0 && ((poll as u8) & POLL_OUT) != 0 {
+            if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
                 // Compute absolute target frame: hw base + relative position - downstream latency
                 let mut abs_frame = if seq.hw_synced != 0 {
                     let abs = (seq.hw_frame_base as u32).wrapping_add(seq.next_change_frame);

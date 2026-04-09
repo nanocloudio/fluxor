@@ -1551,7 +1551,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if s.rb_state == BlockReadState::Idle {
                     if s.out_chan >= 0 {
                         let poll = (s.sys().channel_poll)(s.out_chan, POLL_OUT);
-                        if poll <= 0 || (poll as u8 & POLL_OUT) == 0 {
+                        if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
                             return 0; // Channel not ready
                         }
                     }

@@ -1,6 +1,5 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
-provides = ["socket"]
 
 [[ports]]
 name = "frames_rx"
@@ -14,10 +13,16 @@ direction = "output"
 content_type = "EthernetFrame"
 required = true
 
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
 [[resources]]
 device_class = "netif"
 access = "write"
-
-[[resources]]
-device_class = "socket"
-access = "exclusive"

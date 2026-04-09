@@ -1,10 +1,25 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
-provides = ["socket"]
 
-[[resources]]
-device_class = "socket"
-access = "chain"
+[[ports]]
+name = "cipher_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "clear_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cipher_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "clear_out"
+direction = "output"
+content_type = "OctetStream"
 
 [[resources]]
 device_class = "system"

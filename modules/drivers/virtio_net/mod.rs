@@ -339,7 +339,7 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
             let frame_ptr = (s.rx_bufs_ptr + desc_idx * BUF_SIZE + NET_HDR_SIZE) as *const u8;
             let frame_len = total_len - NET_HDR_SIZE;
             let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-            if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+            if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
                 (sys.channel_write)(s.out_chan, frame_ptr, frame_len);
             }
         }
@@ -364,7 +364,7 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
 
     // Read one frame from in_chan and transmit
     let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-    if poll <= 0 || (poll as u8 & POLL_IN) == 0 { return; }
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return; }
 
     let tx_buf = s.tx_buf_ptr as *mut u8;
     // Zero virtio-net header
@@ -508,7 +508,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             }
             // EtherType 0x0000 = MAC announcement (bytes 12-13 already zero)
             let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-            if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+            if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
                 (sys.channel_write)(s.out_chan, fp as *const u8, 14);
                 s.mac_announced = 1;
                 dev_log(sys, 3, b"[virtio_net] mac announced".as_ptr(), 26);

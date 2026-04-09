@@ -214,7 +214,7 @@ unsafe fn bmp_step(s: *mut ImgDecodeState) -> i32 {
 
             // Read more header data
             let poll = (sys.channel_poll)(in_chan, POLL_IN);
-            if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+            if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
                 return 0;
             }
             let to_read = bmp_codec::BMP_HDR_SIZE - bmp.hdr_len as usize;
@@ -228,7 +228,7 @@ unsafe fn bmp_step(s: *mut ImgDecodeState) -> i32 {
 
         bmp_codec::BmpPhase::SkipToData => {
             let poll = (sys.channel_poll)(in_chan, POLL_IN);
-            if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+            if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
                 return 0;
             }
             let need = (bmp.data_offset - bmp.bytes_skipped) as usize;
@@ -270,7 +270,7 @@ unsafe fn bmp_step(s: *mut ImgDecodeState) -> i32 {
             while bmp.src_rows_read < needed_src_y {
                 // Need to consume source rows we don't need
                 let poll = (sys.channel_poll)(in_chan, POLL_IN);
-                if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+                if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
                     return 0; // Wait for input
                 }
                 let stride = bmp.row_stride as usize;
@@ -293,7 +293,7 @@ unsafe fn bmp_step(s: *mut ImgDecodeState) -> i32 {
                 // Need to accumulate this row
                 if bmp.row_ready == 0 {
                     let poll = (sys.channel_poll)(in_chan, POLL_IN);
-                    if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+                    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
                         return 0;
                     }
                     let stride = bmp.row_stride as usize;
@@ -381,7 +381,7 @@ unsafe fn bmp_step(s: *mut ImgDecodeState) -> i32 {
         bmp_codec::BmpPhase::Flushing => {
             // Write output row to channel
             let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-            if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+            if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
                 return 0; // Wait for output space
             }
 
@@ -430,7 +430,7 @@ unsafe fn jpeg_step(s: *mut ImgDecodeState) -> i32 {
         jpeg_codec::JpegPhase::Markers => {
             // Read more data and feed to marker parser
             let poll = (sys.channel_poll)(in_chan, POLL_IN);
-            if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+            if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
                 return 0;
             }
             let n = (sys.channel_read)(in_chan, io_buf, IO_BUF_SIZE);
@@ -603,7 +603,7 @@ unsafe fn jpeg_step(s: *mut ImgDecodeState) -> i32 {
 
         jpeg_codec::JpegPhase::FlushRow => {
             let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-            if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+            if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
                 return 0;
             }
 
@@ -726,8 +726,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Only reset if HUP *and* no more readable data in channel
         if s.phase != DecodePhase::Detecting {
             let in_poll = (sys.channel_poll)(s.in_chan, POLL_IN | POLL_HUP);
-            if (in_poll as u8) & POLL_HUP != 0
-                && ((in_poll as u8) & POLL_IN) == 0
+            if (in_poll as u32) & POLL_HUP != 0
+                && ((in_poll as u32) & POLL_IN) == 0
             {
                 dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut());
                 dev_log(sys, 3, b"[img] rst".as_ptr(), 9);
@@ -739,7 +739,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         match s.phase {
             DecodePhase::Detecting => {
                 let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-                if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+                if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
                     return 0;
                 }
 

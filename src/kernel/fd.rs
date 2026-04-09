@@ -1,6 +1,6 @@
 //! Unified file descriptor table — tagged handles and unified poll.
 //!
-//! Every kernel resource handle (channel, socket, event, PIO, etc.) is encoded
+//! Every kernel resource handle (channel, event, PIO, etc.) is encoded
 //! as a tagged i32: bits [30..27] = type tag (4 bits), bits [26..0] = slot index.
 //! Bit 31 is always 0, so tagged fds are positive and error codes (negative) are unambiguous.
 //!
@@ -13,13 +13,11 @@ use crate::kernel::channel::{self, POLL_IN};
 use crate::kernel::errno;
 use crate::kernel::event;
 use crate::kernel::hal;
-use crate::kernel::socket::SocketService;
 // ============================================================================
 // Tag constants
 // ============================================================================
 
 pub const FD_TAG_CHANNEL: i32 = 0;
-pub const FD_TAG_SOCKET: i32 = 1;
 pub const FD_TAG_EVENT: i32 = 2;
 pub const FD_TAG_TIMER: i32 = 3;
 // Tags 4-6 were PIO stream/cmd/rx (removed — PIC module handles PIO directly)
@@ -218,36 +216,33 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
     if fd < 0 {
         return errno::EINVAL;
     }
+    let ev = events as u32;
     let (tag, slot) = untag_fd(fd);
     match tag {
         FD_TAG_CHANNEL => {
             // channel_poll is already non-destructive and returns a bitmask
-            channel::channel_poll(slot, events)
-        }
-        FD_TAG_SOCKET => {
-            // socket poll is already non-destructive and returns a bitmask
-            SocketService::poll(slot, events)
+            channel::channel_poll(slot, ev)
         }
         FD_TAG_EVENT => {
             // Non-destructive peek (load, not swap)
-            let mut ready = 0u8;
-            if (events & POLL_IN) != 0 && event::event_is_signaled(slot) {
+            let mut ready = 0u32;
+            if (ev & POLL_IN) != 0 && event::event_is_signaled(slot) {
                 ready |= POLL_IN;
             }
             ready as i32
         }
         FD_TAG_TIMER => {
             // Timer expired -> POLL_IN
-            let mut ready = 0u8;
-            if (events & POLL_IN) != 0 && timer_is_expired(slot) {
+            let mut ready = 0u32;
+            if (ev & POLL_IN) != 0 && timer_is_expired(slot) {
                 ready |= POLL_IN;
             }
             ready as i32
         }
         FD_TAG_DMA => {
             // Route to platform DMA FD poll (RP-only; returns false on other platforms)
-            let mut ready = 0u8;
-            if (events & POLL_IN) != 0 {
+            let mut ready = 0u32;
+            if (ev & POLL_IN) != 0 {
                 let poll_fn = unsafe { DMA_FD_POLL_FN };
                 if let Some(f) = poll_fn {
                     if f(slot) {
@@ -258,8 +253,8 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
             ready as i32
         }
         FD_TAG_BRIDGE => {
-            let mut ready = 0u8;
-            if (events & POLL_IN) != 0 {
+            let mut ready = 0u32;
+            if (ev & POLL_IN) != 0 {
                 let poll = crate::kernel::bridge::bridge_dispatch(slot as usize, 2, core::ptr::null_mut(), 0);
                 if poll > 0 { ready |= POLL_IN; }
             }

@@ -445,7 +445,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if next_tail == s.eq_head { break; } // queue full
 
                 let poll_in = (sys.channel_poll)(in_chan, POLL_IN);
-                if poll_in <= 0 || ((poll_in as u8) & POLL_IN) == 0 { break; }
+                if poll_in <= 0 || ((poll_in as u32) & POLL_IN) == 0 { break; }
 
                 let mut buf: [u8; NOTE_EVENT_SIZE] = [0; NOTE_EVENT_SIZE];
                 let read = (sys.channel_read)(in_chan, buf.as_mut_ptr(), NOTE_EVENT_SIZE);
@@ -543,7 +543,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             if !is_mailbox {
                 let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-                if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 { break; }
+                if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 { break; }
             } else if mbox_frames_written + SAMPLES_PER_CHUNK > mbox_max_frames {
                 break; // mailbox full
             }

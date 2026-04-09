@@ -1,6 +1,6 @@
 # HTTPS Server (Linux hosted)
 #
-# TLS 1.3 with pure Rust TLS module as socket provider chain.
+# TLS 1.3 with pure Rust TLS module as channel-based encryption layer.
 # Generate test certs first:
 #   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 #     -nodes -keyout /tmp/server_key.pem -out /tmp/server_cert.pem -days 365 -subj "/CN=localhost"
@@ -11,6 +11,9 @@
 #   fluxor run examples/linux/https_server.yaml
 #   curl -vsk https://localhost:9443/
 target: linux
+
+platform:
+  net: {}
 
 modules:
   - name: tls
@@ -25,4 +28,14 @@ modules:
       - path: "/"
         body: "<html><body><h1>Hello HTTPS</h1></body></html>"
 
-wiring: []
+wiring:
+  # TLS <-> linux_net (encrypted side)
+  - from: linux_net.net_out
+    to: tls.cipher_in
+  - from: tls.cipher_out
+    to: linux_net.net_in
+  # HTTP <-> TLS (cleartext side)
+  - from: tls.clear_out
+    to: http.net_in
+  - from: http.net_out
+    to: tls.clear_in

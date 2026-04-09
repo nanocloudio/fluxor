@@ -238,7 +238,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
     // State: PARSING_HEADER
     if s.phase == WavPhase::ParsingHeader {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-        if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 {
+        if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
 
@@ -290,7 +290,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
                             }
 
                             let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-                            if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+                            if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
                                 s.pending_offset = 0;
                                 s.pending_out = chunk as u16;
                                 s.data_read += written_total as u32;
@@ -329,7 +329,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
     // State: SKIPPING_TO_DATA
     if s.phase == WavPhase::SkippingToData {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-        if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 {
+        if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
 
@@ -367,12 +367,12 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
         }
 
         let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-        if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+        if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
             return 0;
         }
 
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-        if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 {
+        if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
 

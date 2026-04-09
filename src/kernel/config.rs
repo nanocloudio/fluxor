@@ -307,8 +307,8 @@ pub fn read_layout() -> Option<FlashLayout> {
 }
 
 /// Maximum counts
-pub const MAX_MODULES: usize = 24;
-pub const MAX_GRAPH_EDGES: usize = 48;
+pub const MAX_MODULES: usize = 32;
+pub const MAX_GRAPH_EDGES: usize = 64;
 
 /// Hardware section binary format sizes
 pub const SPI_CONFIG_BIN_SIZE: usize = 8;

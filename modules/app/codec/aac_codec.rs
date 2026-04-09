@@ -2098,7 +2098,7 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
     // Step 2: If decoded samples are waiting, write a chunk to out_chan
     if s.out_buf_pos < s.out_buf_len {
         let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-        if out_poll > 0 && ((out_poll as u8) & POLL_OUT) != 0 {
+        if out_poll > 0 && ((out_poll as u32) & POLL_OUT) != 0 {
             let remaining = (s.out_buf_len - s.out_buf_pos) as usize;
             let chunk = if remaining > IO_BUF_SIZE { IO_BUF_SIZE } else { remaining };
             // Ensure chunk is even (i16 samples = 2 bytes each)
@@ -2136,7 +2136,7 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
 
     // Step 3: Read more compressed data from in_chan
     let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-    if in_poll > 0 && ((in_poll as u8) & POLL_IN) != 0 {
+    if in_poll > 0 && ((in_poll as u32) & POLL_IN) != 0 {
         let buf_free = FRAME_BUF_SIZE - (s.frame_buf_len as usize);
         if buf_free > 0 {
             let read_len = if buf_free > IO_BUF_SIZE { IO_BUF_SIZE } else { buf_free };

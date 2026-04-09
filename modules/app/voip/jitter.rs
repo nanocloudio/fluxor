@@ -74,29 +74,27 @@ unsafe fn step_jitter(s: &mut VoipState) {
 }
 
 // ============================================================================
-// Init — open and bind RTP receive socket
+// Init — send CMD_BIND via jitter net channel
 // ============================================================================
 
 unsafe fn jitter_step_init(s: &mut VoipState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let mut sock_arg = [SOCK_TYPE_DGRAM];
-    let handle = (dev_call)(-1, DEV_SOCKET_OPEN, sock_arg.as_mut_ptr(), 1);
-    if handle < 0 {
-        dev_log(sys, 1, b"[voip] jbuf socket fail".as_ptr(), 23);
+    if s.jitter_net_out < 0 {
+        dev_log(sys, 1, b"[voip] jbuf no net".as_ptr(), 18);
         s.jitter_phase = JitterPhase::Error;
         return;
     }
-    s.jitter_socket = handle;
 
-    let mut port_arg = s.rtp_port.to_le_bytes();
-    let rc = (dev_call)(handle, DEV_SOCKET_BIND, port_arg.as_mut_ptr(), 2);
-    if rc < 0 && rc != E_INPROGRESS {
-        dev_log(sys, 1, b"[voip] jbuf bind fail".as_ptr(), 21);
-        (dev_call)(handle, DEV_SOCKET_CLOSE, core::ptr::null_mut(), 0);
-        s.jitter_phase = JitterPhase::Error;
-        return;
+    // CMD_BIND payload: [port: u16 LE]
+    let port_le = s.rtp_port.to_le_bytes();
+    let wrote = net_write_frame(
+        sys, s.jitter_net_out, NET_CMD_BIND,
+        port_le.as_ptr(), 2,
+        s.jitter_net_buf.as_mut_ptr(), NET_BUF_SIZE,
+    );
+    if wrote == 0 {
+        return; // Channel full, retry next tick
     }
 
     s.jitter_phase = JitterPhase::BindWait;
@@ -104,22 +102,45 @@ unsafe fn jitter_step_init(s: &mut VoipState) {
 
 unsafe fn jitter_step_bind_wait(s: &mut VoipState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let addr = ChannelAddr::new(s.jitter_remote_ip, s.jitter_remote_port);
-    let rc = (dev_call)(
-        s.jitter_socket,
-        DEV_SOCKET_CONNECT,
-        &addr as *const _ as *mut u8,
-        core::mem::size_of::<ChannelAddr>(),
-    );
+    if s.jitter_net_in < 0 { return; }
 
-    if rc == E_BUSY {
+    let poll = (sys.channel_poll)(s.jitter_net_in, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return;
     }
-    if rc < 0 && rc != E_INPROGRESS {
-        dev_log(sys, 1, b"[voip] jbuf conn fail".as_ptr(), 21);
+
+    let buf = s.jitter_net_buf.as_mut_ptr();
+    let (msg_type, _payload_len) = net_read_frame(sys, s.jitter_net_in, buf, NET_BUF_SIZE);
+
+    if msg_type == NET_MSG_ERROR {
+        dev_log(sys, 1, b"[voip] jbuf bind fail".as_ptr(), 21);
         s.jitter_phase = JitterPhase::Error;
+        return;
+    }
+    if msg_type != NET_MSG_BOUND {
+        return;
+    }
+
+    // Bound — now send CMD_CONNECT: [sock_type: u8][ip: u32 LE][port: u16 LE]
+    let ip_le = s.jitter_remote_ip.to_le_bytes();
+    let port_le = s.jitter_remote_port.to_le_bytes();
+    let payload = s.jitter_net_buf.as_mut_ptr();
+    *payload = SOCK_TYPE_DGRAM;
+    *payload.add(1) = ip_le[0];
+    *payload.add(2) = ip_le[1];
+    *payload.add(3) = ip_le[2];
+    *payload.add(4) = ip_le[3];
+    *payload.add(5) = port_le[0];
+    *payload.add(6) = port_le[1];
+
+    let scratch = s.jitter_rx_buf.as_mut_ptr(); // Reuse jitter_rx_buf as scratch
+    let wrote = net_write_frame(
+        sys, s.jitter_net_out, NET_CMD_CONNECT,
+        payload, 7,
+        scratch, JITTER_RX_BUF_SIZE,
+    );
+    if wrote == 0 {
         return;
     }
 
@@ -128,17 +149,24 @@ unsafe fn jitter_step_bind_wait(s: &mut VoipState) {
 
 unsafe fn jitter_step_connect_wait(s: &mut VoipState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let mut poll_arg = [POLL_CONN | POLL_ERR];
-    let poll = (dev_call)(s.jitter_socket, DEV_SOCKET_POLL, poll_arg.as_mut_ptr(), 1);
+    if s.jitter_net_in < 0 { return; }
 
-    if poll > 0 && ((poll as u8) & POLL_ERR) != 0 {
-        dev_log(sys, 1, b"[voip] jbuf poll err".as_ptr(), 20);
+    let poll = (sys.channel_poll)(s.jitter_net_in, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        return;
+    }
+
+    let buf = s.jitter_net_buf.as_mut_ptr();
+    let (msg_type, payload_len) = net_read_frame(sys, s.jitter_net_in, buf, NET_BUF_SIZE);
+
+    if msg_type == NET_MSG_ERROR {
+        dev_log(sys, 1, b"[voip] jbuf conn err".as_ptr(), 20);
         s.jitter_phase = JitterPhase::Error;
         return;
     }
-    if poll > 0 && ((poll as u8) & POLL_CONN) != 0 {
+    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+        s.jitter_conn_id = *buf.add(NET_FRAME_HDR);
         dev_log(sys, 3, b"[voip] jbuf buffering".as_ptr(), 21);
         s.jitter_phase = JitterPhase::Buffering;
     }
@@ -220,26 +248,32 @@ unsafe fn jitter_step_running(s: &mut VoipState) {
 // ============================================================================
 
 unsafe fn jitter_receive_packets(s: &mut VoipState) {
-    let dev_call = (&*s.syscalls).dev_call;
+    let sys = &*s.syscalls;
+
+    if s.jitter_net_in < 0 { return; }
 
     loop {
-        let read = (dev_call)(
-            s.jitter_socket,
-            DEV_SOCKET_RECV,
-            s.jitter_rx_buf.as_mut_ptr(),
-            JITTER_RX_BUF_SIZE,
-        );
-
-        if read <= 0 {
+        let poll = (sys.channel_poll)(s.jitter_net_in, POLL_IN);
+        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
             break;
         }
 
-        let pkt_len = read as usize;
-        if pkt_len < RTP_HEADER_SIZE {
+        let buf = s.jitter_net_buf.as_mut_ptr();
+        let (msg_type, frame_payload_len) = net_read_frame(sys, s.jitter_net_in, buf, NET_BUF_SIZE);
+
+        if msg_type != NET_MSG_DATA || frame_payload_len < 2 {
+            break;
+        }
+
+        // MSG_DATA payload: [conn_id: u8][rtp_data...]
+        let rtp_len = frame_payload_len - 1;
+        let rtp_start = buf.add(NET_FRAME_HDR + 1); // skip frame hdr + conn_id
+
+        if rtp_len < RTP_HEADER_SIZE {
             continue;
         }
 
-        let pkt = s.jitter_rx_buf.as_ptr();
+        let pkt = rtp_start;
         let version = (*pkt >> 6) & 0x03;
         if version != 2 {
             continue;
@@ -247,12 +281,12 @@ unsafe fn jitter_receive_packets(s: &mut VoipState) {
 
         let cc = *pkt & 0x0F;
         let header_len = RTP_HEADER_SIZE + (cc as usize * 4);
-        if pkt_len <= header_len {
+        if rtp_len <= header_len {
             continue;
         }
 
         let seq = ((*pkt.add(2) as u16) << 8) | (*pkt.add(3) as u16);
-        let payload_len = pkt_len - header_len;
+        let payload_len = rtp_len - header_len;
 
         s.packets_received = s.packets_received.wrapping_add(1);
 
@@ -316,11 +350,16 @@ unsafe fn jitter_start(s: &mut VoipState) {
 }
 
 unsafe fn jitter_stop(s: &mut VoipState) {
-    if s.jitter_socket >= 0 {
-        let dev_call = (&*s.syscalls).dev_call;
-        (dev_call)(s.jitter_socket, DEV_SOCKET_CLOSE, core::ptr::null_mut(), 0);
-        s.jitter_socket = -1;
+    if s.jitter_net_out >= 0 && s.jitter_conn_id != 0 {
+        let sys = &*s.syscalls;
+        let payload = [s.jitter_conn_id];
+        net_write_frame(
+            sys, s.jitter_net_out, NET_CMD_CLOSE,
+            payload.as_ptr(), 1,
+            s.jitter_net_buf.as_mut_ptr(), NET_BUF_SIZE,
+        );
     }
+    s.jitter_conn_id = 0;
     s.jitter_out_len = 0;
     s.jitter_out_offset = 0;
     s.jitter_phase = JitterPhase::Idle;

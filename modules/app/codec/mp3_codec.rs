@@ -2173,7 +2173,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     // Cap at 2048 bytes per write (matches channel buffer sizes).
     if s.out_pos < s.out_len {
         let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-        if out_poll > 0 && ((out_poll as u8) & POLL_OUT) != 0 {
+        if out_poll > 0 && ((out_poll as u32) & POLL_OUT) != 0 {
             let remaining_bytes = ((s.out_len - s.out_pos) as usize) * 2;
             let chunk = if remaining_bytes > 2048 { 2048 } else { remaining_bytes };
             let src = s.out_buf.as_ptr().add(s.out_pos as usize) as *const u8;
@@ -2188,7 +2188,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     // 3. Skip ID3 tag data before sync search
     if s.id3_skip > 0 {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-        if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 { return 0; }
+        if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 { return 0; }
         let max_read = if s.id3_skip > IO_BUF_SIZE as u32 { IO_BUF_SIZE } else { s.id3_skip as usize };
         let read = (sys.channel_read)(in_chan, s.io_buf.as_mut_ptr(), max_read);
         if read > 0 {
@@ -2200,7 +2200,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     // 4. State machine for input processing
     if s.phase == Mp3Phase::Sync {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-        if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 { return 0; }
+        if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 { return 0; }
 
         let read = (sys.channel_read)(in_chan, s.io_buf.as_mut_ptr(), IO_BUF_SIZE);
         if read <= 0 { return 0; }
@@ -2253,7 +2253,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
 
     if s.phase == Mp3Phase::Frame {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-        if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 {
+        if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             // Only count as underrun when output is also drained (i2s will starve).
             // Normal pipeline latency (waiting for SD read) is not an underrun.
             if s.out_pos >= s.out_len {

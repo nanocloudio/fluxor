@@ -589,7 +589,7 @@ unsafe fn step_running(s: &mut Ch9120State) -> i32 {
         if result > 0 {
             let bytes = result as usize;
             let poll = (sys.channel_poll)(out_ch, POLL_OUT);
-            if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+            if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
                 (sys.channel_write)(out_ch, s.rx_buf.as_ptr(), bytes);
                 did_work = true;
             }
@@ -599,7 +599,7 @@ unsafe fn step_running(s: &mut Ch9120State) -> i32 {
     // 3. Check input channel → UART TX
     if in_ch >= 0 && s.tx_pending == 0 {
         let poll = (sys.channel_poll)(in_ch, POLL_IN);
-        if poll > 0 && (poll as u8 & POLL_IN) != 0 {
+        if poll > 0 && (poll as u32 & POLL_IN) != 0 {
             let bytes = (sys.channel_read)(in_ch, s.tx_buf.as_mut_ptr(), DATA_BUF_SIZE);
             if bytes > 0 {
                 dev_uart_write(sys, uart, s.tx_buf.as_ptr(), bytes as usize);

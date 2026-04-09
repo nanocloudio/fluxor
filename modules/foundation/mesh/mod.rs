@@ -231,7 +231,7 @@ unsafe fn handle_inbound_command(s: &mut MeshBridgeState) {
     if s.in_chan < 0 { return; }
 
     let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-    if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return;
     }
 
@@ -275,7 +275,7 @@ unsafe fn handle_inbound_command(s: &mut MeshBridgeState) {
     // Write FMP message to ctrl_chan
     if s.ctrl_chan >= 0 {
         let ctrl_poll = (sys.channel_poll)(s.ctrl_chan, POLL_OUT);
-        if ctrl_poll > 0 && ((ctrl_poll as u8) & POLL_OUT) != 0 {
+        if ctrl_poll > 0 && ((ctrl_poll as u32) & POLL_OUT) != 0 {
             // For SELECT, pass u16 index from CBOR args as payload
             if msg_type == MSG_SELECT && cmd.args_length >= 2 {
                 let args_start = cmd_start + COMMAND_HEADER_SIZE;
@@ -305,7 +305,7 @@ unsafe fn handle_outbound_notification(s: &mut MeshBridgeState) {
     if s.object_count == 0 { return; }
 
     let poll = (sys.channel_poll)(s.notif_chan, POLL_IN);
-    if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return;
     }
 
@@ -367,7 +367,7 @@ unsafe fn handle_outbound_notification(s: &mut MeshBridgeState) {
 
     // Write to out_chan (to MQTT)
     let out_poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-    if out_poll > 0 && ((out_poll as u8) & POLL_OUT) != 0 {
+    if out_poll > 0 && ((out_poll as u32) & POLL_OUT) != 0 {
         (sys.channel_write)(s.out_chan, cb, offset);
     }
     // If channel not ready, drop (QoS 0 — best effort)

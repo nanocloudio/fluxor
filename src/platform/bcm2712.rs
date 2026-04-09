@@ -1111,6 +1111,10 @@ pub extern "C" fn main() -> ! {
                             mod_ctrl[to] = in_ch;
                         }
                     }
+                    // Populate scheduler port table for cross-domain channels too
+                    scheduler::set_module_port(from, 1, edge.from_port_index, out_ch);
+                    let to_port_type = if edge.to_port == 1 { 2u8 } else { 0u8 };
+                    scheduler::set_module_port(to, to_port_type, edge.to_port_index, in_ch);
 
                     // Allocate a cross-domain channel and register the edge.
                     // The edge stores both local handles directly so pump_cross_domain
@@ -1148,6 +1152,10 @@ pub extern "C" fn main() -> ! {
                             mod_ctrl[to] = ch;
                         }
                     }
+                    // Populate scheduler port table so dev_channel_port works
+                    scheduler::set_module_port(from, 1, edge.from_port_index, ch); // out port
+                    let to_port_type = if edge.to_port == 1 { 2u8 } else { 0u8 }; // ctrl=2, in=0
+                    scheduler::set_module_port(to, to_port_type, edge.to_port_index, ch);
                 }
             }
         }

@@ -2,25 +2,27 @@
 //!
 //! Implements TCP/IP networking as a PIC module. Receives raw ethernet frames
 //! from a driver module (e.g. cyw43) via channels, processes ARP/IPv4/ICMP/TCP/UDP,
-//! and services kernel socket slots.
+//! and communicates with consumer modules (HTTP, TLS) via a channel-based net protocol.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Driver Module (cyw43/enc28j60)           IP Module                    Socket Slots
-//! ─────────────────────────────           ─────────                    ────────────
+//! Driver Module (cyw43/enc28j60)           IP Module                    Consumer (HTTP/TLS)
+//! ─────────────────────────────           ─────────                    ───────────────────
 //! ETH frames → [out_chan] ──────► [in_chan] → ARP/IPv4 parse
 //!                                            ├── ICMP echo → reply ──► [out_chan] → driver
 //!                                            ├── DHCP reply → config
-//!                                            ├── TCP segment → socket RX ringbuf ──► module recv()
-//!                                            └── UDP datagram → socket RX ringbuf
-//! module send() ──► socket TX ringbuf ──► TCP/UDP build ──► [out_chan] → driver
+//!                                            ├── TCP data ────────────► [net_out] MSG_DATA
+//!                                            └── UDP datagram ────────► [net_out] MSG_DATA
+//! [net_in] CMD_SEND ──────────► TCP/UDP build ──► [out_chan] → driver
 //! ```
 //!
 //! # Channels
 //!
-//! - `in_chan`: Raw ethernet frames from driver module
-//! - `out_chan`: Raw ethernet frames to driver module
+//! - `in_chan` (in[0]): Raw ethernet frames from driver module
+//! - `out_chan` (out[0]): Raw ethernet frames to driver module
+//! - `net_in_chan` (in[1]): Net protocol commands from consumer (CMD_BIND, CMD_SEND, etc.)
+//! - `net_out_chan` (out[1]): Net protocol messages to consumer (MSG_DATA, MSG_ACCEPTED, etc.)
 //!
 //! # Config Parameters
 //!
@@ -61,56 +63,24 @@ mod dhcp;
 /// Maximum ethernet frame size
 const MAX_FRAME_SIZE: usize = 1536;
 
-/// Socket service dev_call opcodes (mirror abi::dev_socket)
-const DEV_SOCKET_SERVICE_INFO: u32 = 0x0810;
-const DEV_SOCKET_SERVICE_TX_READ: u32 = 0x0811;
-const DEV_SOCKET_SERVICE_RX_WRITE: u32 = 0x0812;
-const DEV_SOCKET_SERVICE_COMPLETE_OP: u32 = 0x0813;
-const DEV_SOCKET_SERVICE_SET_STATE: u32 = 0x0814;
-const DEV_SOCKET_SERVICE_COUNT: u32 = 0x0815;
-const DEV_SOCKET_SERVICE_RESET: u32 = 0x0816;
+// NET_FRAME_HDR (3 bytes: msg_type + len u16 LE) defined in pic_runtime.rs
 
-/// Socket lifecycle phases (module-defined, kernel stores opaquely as u8).
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-enum SocketPhase {
-    Free = 0,
-    Allocated = 1,
-    Connecting = 2,
-    Connected = 3,
-    Listening = 4,
-    Closing = 5,
-    Closed = 6,
-}
+/// Net protocol: downstream messages (IP → consumer)
+const NET_MSG_ACCEPTED: u8 = 0x01;
+const NET_MSG_DATA: u8 = 0x02;
+const NET_MSG_CLOSED: u8 = 0x03;
+const NET_MSG_BOUND: u8 = 0x04;
+const NET_MSG_CONNECTED: u8 = 0x05;
+const NET_MSG_ERROR: u8 = 0x06;
 
-/// Socket operations (mirror kernel::socket::SocketOp)
-const SOCKOP_NONE: u8 = 0;
-const SOCKOP_CONNECT: u8 = 1;
-const SOCKOP_BIND: u8 = 2;
-const SOCKOP_LISTEN: u8 = 3;
-const SOCKOP_ACCEPT: u8 = 4;
-const SOCKOP_CLOSE: u8 = 5;
+/// Net protocol: upstream commands (consumer → IP)
+const NET_CMD_BIND: u8 = 0x10;
+const NET_CMD_SEND: u8 = 0x11;
+const NET_CMD_CLOSE: u8 = 0x12;
+const NET_CMD_CONNECT: u8 = 0x13;
 
 /// Netif dev_call opcodes (mirror abi::dev_netif)
 const DEV_NETIF_STATE: u32 = 0x0704;
-
-// ============================================================================
-// Socket Service Info (matches abi::SocketServiceInfo)
-// ============================================================================
-
-#[repr(C)]
-struct SocketServiceInfo {
-    socket_type: u8,
-    state: u8,
-    pending_op: u8,
-    _pad: u8,
-    local_id: u16,
-    remote_id: u16,
-    remote_endpoint: u32,
-    tx_pending: u16,
-    rx_available: u16,
-    rx_space: u16,
-}
 
 // ============================================================================
 // Module State
@@ -160,9 +130,12 @@ pub struct IpState {
     ip_id: u16,
     _id_pad: [u8; 2],
 
-    // Socket service
-    socket_count: u8,
-    _sock_pad: [u8; 3],
+    // Net protocol channels (consumer ↔ IP)
+    net_in_chan: i32,
+    net_out_chan: i32,
+
+    // Net protocol scratch buffer for frame assembly (MTU 576 + headers)
+    net_scratch: [u8; 600],
 
     // Frame buffers
     rx_frame: [u8; MAX_FRAME_SIZE],
@@ -216,75 +189,179 @@ unsafe fn log_error(s: &IpState, msg: &[u8]) {
 
 // Formatting helpers (fmt_u32_raw, fmt_ip_raw) are in pic_runtime.rs
 
-/// Get a socket slot's info via dev_call.
-unsafe fn socket_info(s: &IpState, slot_idx: i32, info: &mut SocketServiceInfo) -> i32 {
-    let sys = &*s.syscalls;
-    (sys.dev_call)(
-        slot_idx,
-        DEV_SOCKET_SERVICE_INFO,
-        info as *mut SocketServiceInfo as *mut u8,
-        core::mem::size_of::<SocketServiceInfo>(),
-    )
-}
-
-/// Read from socket TX buffer via dev_call.
-unsafe fn socket_tx_read(s: &IpState, slot_idx: i32, buf: *mut u8, len: usize) -> i32 {
-    let sys = &*s.syscalls;
-    (sys.dev_call)(slot_idx, DEV_SOCKET_SERVICE_TX_READ, buf, len)
-}
-
-/// Write to socket RX buffer via dev_call.
-unsafe fn socket_rx_write(s: &IpState, slot_idx: i32, data: *const u8, len: usize) -> i32 {
-    let sys = &*s.syscalls;
-    (sys.dev_call)(slot_idx, DEV_SOCKET_SERVICE_RX_WRITE, data as *mut u8, len)
-}
-
-/// Complete a pending socket operation via dev_call.
-/// `poll_flags` sets provider-controlled readiness (POLL_CONN, POLL_HUP, POLL_ERR).
-unsafe fn socket_complete_op(s: &IpState, slot_idx: i32, result: i32, new_state: SocketPhase, poll_flags: u8) {
-    let sys = &*s.syscalls;
-    let mut arg = [0u8; 6];
-    let r = result.to_le_bytes();
-    arg[0] = r[0];
-    arg[1] = r[1];
-    arg[2] = r[2];
-    arg[3] = r[3];
-    arg[4] = new_state as u8;
-    arg[5] = poll_flags;
-    (sys.dev_call)(
-        slot_idx,
-        DEV_SOCKET_SERVICE_COMPLETE_OP,
-        arg.as_mut_ptr(),
-        6,
-    );
-    // Free the slot when fully closed — allows kernel to reuse it
-    if new_state == SocketPhase::Closed {
-        socket_reset(s, slot_idx);
-    }
-}
-
-/// Set socket state via dev_call.
-/// `poll_flags` sets provider-controlled readiness (POLL_CONN, POLL_HUP, POLL_ERR).
-unsafe fn socket_set_state(s: &IpState, slot_idx: i32, state: SocketPhase, poll_flags: u8) {
-    let sys = &*s.syscalls;
-    let mut arg = [state as u8, poll_flags];
-    (sys.dev_call)(
-        slot_idx,
-        DEV_SOCKET_SERVICE_SET_STATE,
-        arg.as_mut_ptr(),
-        2,
-    );
-    // Free the slot when fully closed — allows kernel to reuse it
-    if state == SocketPhase::Closed {
-        socket_reset(s, slot_idx);
-    }
-}
-
-/// Reset (free) a socket slot so it can be reused for new connections.
+/// Write a net protocol frame to a channel.
+/// Frame format: [msg_type: u8] [payload_len: u16 LE] [payload...]
+/// Returns 0 on success, -1 on failure.
 #[inline(always)]
-unsafe fn socket_reset(s: &IpState, slot_idx: i32) {
+/// Write a net_proto frame. Module-local variant of pic_runtime::net_write_frame
+/// with i32 return (0 or -1) for IP's error handling pattern.
+unsafe fn ip_net_write_frame(
+    sys: &SyscallTable,
+    chan: i32,
+    msg_type: u8,
+    payload: *const u8,
+    payload_len: usize,
+    scratch: *mut u8,
+) -> i32 {
+    // Build frame in scratch: [type][len_lo][len_hi][payload...]
+    *scratch = msg_type;
+    let pl = (payload_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    if payload_len > 0 && !payload.is_null() {
+        core::ptr::copy_nonoverlapping(payload, scratch.add(NET_FRAME_HDR), payload_len);
+    }
+    let total = NET_FRAME_HDR + payload_len;
+    let written = (sys.channel_write)(chan, scratch, total);
+    if written < total as i32 { -1 } else { 0 }
+}
+
+/// Read a net_proto frame header + payload. Module-local variant that reads
+/// header and payload in two channel_read calls so the payload goes directly
+/// into the caller's buffer without an intermediate copy.
+#[inline(always)]
+unsafe fn ip_net_read_frame(
+    sys: &SyscallTable,
+    chan: i32,
+    buf: *mut u8,
+    buf_cap: usize,
+) -> (u8, u16) {
+    // Read 3-byte header first, then payload
+    let mut hdr = [0u8; 3];
+    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
+    if n < 3 { return (0, 0); }
+    let msg_type = *hdr.as_ptr();
+    let payload_len = (*hdr.as_ptr().add(1) as u16) | ((*hdr.as_ptr().add(2) as u16) << 8);
+    if payload_len > 0 && buf_cap > 0 {
+        let to_read = (payload_len as usize).min(buf_cap);
+        (sys.channel_read)(chan, buf, to_read);
+    }
+    (msg_type, payload_len)
+}
+
+/// Send a MSG_DATA frame to the net consumer channel.
+#[inline(always)]
+unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len: usize) {
+    if s.net_out_chan < 0 || data_len == 0 {
+        return;
+    }
     let sys = &*s.syscalls;
-    (sys.dev_call)(slot_idx, DEV_SOCKET_SERVICE_RESET, core::ptr::null_mut(), 0);
+    let scratch = s.net_scratch.as_mut_ptr();
+    let payload_len = 1 + data_len; // conn_id + data
+    *scratch = NET_MSG_DATA;
+    let pl = (payload_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    *scratch.add(3) = conn_id;
+    core::ptr::copy_nonoverlapping(data, scratch.add(4), data_len);
+    let total = NET_FRAME_HDR + payload_len;
+    (sys.channel_write)(s.net_out_chan, scratch, total);
+}
+
+/// Send a MSG_DATA frame for a bound UDP conn, prefixed with source addressing:
+/// [msg_type:1][len:2 LE][conn_id:1][src_ip:4 LE][src_port:2 LE][data...]
+#[inline(always)]
+unsafe fn net_send_udp_data(
+    s: &mut IpState,
+    conn_id: u8,
+    src_ip: u32,
+    src_port: u16,
+    data: *const u8,
+    data_len: usize,
+) {
+    if s.net_out_chan < 0 || data_len == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    let payload_len = 1 + 4 + 2 + data_len; // conn_id + ip + port + data
+    *scratch = NET_MSG_DATA;
+    let pl = (payload_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    *scratch.add(3) = conn_id;
+    let ip_bytes = src_ip.to_le_bytes();
+    *scratch.add(4) = ip_bytes[0];
+    *scratch.add(5) = ip_bytes[1];
+    *scratch.add(6) = ip_bytes[2];
+    *scratch.add(7) = ip_bytes[3];
+    let port_bytes = src_port.to_le_bytes();
+    *scratch.add(8) = port_bytes[0];
+    *scratch.add(9) = port_bytes[1];
+    core::ptr::copy_nonoverlapping(data, scratch.add(10), data_len);
+    let total = NET_FRAME_HDR + payload_len;
+    (sys.channel_write)(s.net_out_chan, scratch, total);
+}
+
+/// Send a MSG_ACCEPTED frame to the net consumer channel.
+#[inline(always)]
+unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) {
+    if s.net_out_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    *scratch = NET_MSG_ACCEPTED;
+    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
+    *scratch.add(3) = conn_id;
+    (sys.channel_write)(s.net_out_chan, scratch, 4);
+}
+
+/// Send a MSG_CLOSED frame to the net consumer channel.
+#[inline(always)]
+unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) {
+    if s.net_out_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    *scratch = NET_MSG_CLOSED;
+    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
+    *scratch.add(3) = conn_id;
+    (sys.channel_write)(s.net_out_chan, scratch, 4);
+}
+
+/// Send a MSG_BOUND frame to the net consumer channel.
+#[inline(always)]
+unsafe fn net_send_bound(s: &mut IpState, conn_id: u8) {
+    if s.net_out_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    *scratch = NET_MSG_BOUND;
+    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
+    *scratch.add(3) = conn_id;
+    (sys.channel_write)(s.net_out_chan, scratch, 4);
+}
+
+/// Send a MSG_CONNECTED frame to the net consumer channel.
+#[inline(always)]
+unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) {
+    if s.net_out_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    *scratch = NET_MSG_CONNECTED;
+    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
+    *scratch.add(3) = conn_id;
+    (sys.channel_write)(s.net_out_chan, scratch, 4);
+}
+
+/// Send a MSG_ERROR frame to the net consumer channel.
+#[inline(always)]
+unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8) {
+    if s.net_out_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    *scratch = NET_MSG_ERROR;
+    *scratch.add(1) = 2; *scratch.add(2) = 0; // len=2
+    *scratch.add(3) = conn_id;
+    *scratch.add(4) = errno as u8;
+    (sys.channel_write)(s.net_out_chan, scratch, 5);
 }
 
 /// Unchecked TCP conn access (avoids bounds check panic in PIC).
@@ -313,7 +390,7 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
     }
     let sys = &*s.syscalls;
     let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-    if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+    if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
         (sys.channel_write)(s.out_chan, frame, len);
         s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
         s.pending_tx_len = 0;
@@ -395,12 +472,10 @@ pub extern "C" fn module_new(
         s.ip_id = 1;
         s.next_ephemeral_port = 49152;
 
-        // Query socket count
+        // Discover net protocol channels
         let sys = &*s.syscalls;
-        let count = (sys.dev_call)(-1, DEV_SOCKET_SERVICE_COUNT, core::ptr::null_mut(), 0);
-        if count > 0 {
-            s.socket_count = count as u8;
-        }
+        s.net_in_chan = dev_channel_port(sys, 0, 1);   // in[1]: net commands from consumer
+        s.net_out_chan = dev_channel_port(sys, 1, 1);   // out[1]: net messages to consumer
 
         // Parse TLV params
         if !params.is_null() && params_len > 0 {
@@ -423,7 +498,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     if s.pending_tx_len > 0 && s.out_chan >= 0 {
         let sys = &*s.syscalls;
         let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-        if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+        if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
             let len = s.pending_tx_len as usize;
             (sys.channel_write)(s.out_chan, s.tx_frame.as_ptr(), len);
             s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
@@ -461,16 +536,20 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         while i < prefix.len() { buf[i] = prefix[i]; i += 1; }
         // Format MAC as hex
         let hex = b"0123456789abcdef";
+        let bp = buf.as_mut_ptr();
+        let hp = hex.as_ptr();
         let mut p = prefix.len();
-        let mut m = 0;
-        while m < 6 && p + 2 < buf.len() {
-            buf[p] = hex[(s.mac_addr[m] >> 4) as usize];
-            buf[p + 1] = hex[(s.mac_addr[m] & 0x0F) as usize];
+        let mut m = 0usize;
+        while m < 6 && p + 2 < 40 {
+            let byte = *s.mac_addr.as_ptr().add(m);
+            *bp.add(p) = *hp.add((byte >> 4) as usize);
+            *bp.add(p + 1) = *hp.add((byte & 0x0F) as usize);
             p += 2;
-            if m < 5 && p < buf.len() { buf[p] = b':'; p += 1; }
+            if m < 5 && p < 40 { *bp.add(p) = b':'; p += 1; }
             m += 1;
         }
-        log_info(s, &buf[..p]);
+        let sl = core::slice::from_raw_parts(bp, p);
+        log_info(s, sl);
     }
 
     // Diagnostic: periodic status (every ~5s at 1ms steps)
@@ -508,8 +587,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         step_dhcp(s);
     }
 
-    // 3. Service socket slots
-    service_sockets(s);
+    // 3. Service net protocol channels (consumer ↔ IP)
+    // channel_poll verified working from PIC on aarch64 after u8→u32 widening
+    service_net_channels(s);
 
     // 4. Periodic ARP maintenance
     if s.step_count % 256 == 0 {
@@ -536,6 +616,8 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let hints = [
         ChannelHint { port_type: 0, port_index: 0, buffer_size: 4096 }, // in[0]: RX ethernet frames
         ChannelHint { port_type: 1, port_index: 0, buffer_size: 4096 }, // out[0]: TX ethernet frames
+        ChannelHint { port_type: 0, port_index: 1, buffer_size: 2048 }, // in[1]: net commands from consumer
+        ChannelHint { port_type: 1, port_index: 1, buffer_size: 2048 }, // out[1]: net messages to consumer
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }
@@ -561,7 +643,7 @@ unsafe fn process_rx_frames(s: &mut IpState) {
     let mut count = 0;
     while count < 4 {
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll <= 0 || (poll as u8 & POLL_IN) == 0 {
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
         }
 
@@ -742,39 +824,27 @@ unsafe fn process_udp_packet(
         return;
     }
 
-    // Deliver to matching UDP socket
+    // Deliver UDP data to matching conn slot.
+    // Listen-state (bound) conns get framed addressing: [src_ip:4 LE][src_port:2 LE][data]
+    // Established (connected) conns get raw data only.
     let mut i = 0;
-    while i < s.socket_count as usize {
-        let mut info = core::mem::zeroed::<SocketServiceInfo>();
-        if socket_info(s, i as i32, &mut info) < 0 {
-            i += 1;
-            continue;
-        }
-        if info.socket_type == SOCK_TYPE_DGRAM && info.local_id == udp_hdr.dst_port {
-            if info.state == SocketPhase::Allocated as u8 {
-                // Framed mode for bound-but-not-connected sockets:
-                // Prepend [src_ip:4][src_port:2][payload_len:2] before payload
-                let total_len = 8 + udp_hdr.payload_len;
-                // Check RX space before writing — avoid partial frame corruption
-                if (info.rx_space as usize) < total_len {
-                    return; // Drop datagram rather than corrupt framing
-                }
-                let mut hdr = [0u8; 8];
-                let ip_bytes = ip_hdr.src_ip.to_le_bytes();
-                hdr[0] = ip_bytes[0]; hdr[1] = ip_bytes[1];
-                hdr[2] = ip_bytes[2]; hdr[3] = ip_bytes[3];
-                let port_bytes = udp_hdr.src_port.to_le_bytes();
-                hdr[4] = port_bytes[0]; hdr[5] = port_bytes[1];
-                let len_bytes = (udp_hdr.payload_len as u16).to_le_bytes();
-                hdr[6] = len_bytes[0]; hdr[7] = len_bytes[1];
-                socket_rx_write(s, i as i32, hdr.as_ptr(), 8);
+    while i < tcp::MAX_TCP_CONNS {
+        let conn = &*s.tcp_conns.as_ptr().add(i);
+        if conn.local_port == udp_hdr.dst_port {
+            if conn.state == tcp::TcpState::Listen {
+                // Bound UDP — prefix with source addressing so consumer can reply
                 let payload = data.add(udp_hdr.payload_offset);
-                socket_rx_write(s, i as i32, payload, udp_hdr.payload_len);
+                let addr_len = 6; // 4 bytes IP + 2 bytes port
+                let total = addr_len + udp_hdr.payload_len;
+                net_send_udp_data(s, i as u8, ip_hdr.src_ip, udp_hdr.src_port, payload, udp_hdr.payload_len);
                 return;
-            } else if info.state == SocketPhase::Connected as u8 {
-                // Raw mode for connected sockets (existing behavior)
+            } else if conn.state == tcp::TcpState::Established
+                && conn.remote_ip == ip_hdr.src_ip
+                && conn.remote_port == udp_hdr.src_port
+            {
+                // Connected UDP — raw data only
                 let payload = data.add(udp_hdr.payload_offset);
-                socket_rx_write(s, i as i32, payload, udp_hdr.payload_len);
+                net_send_data(s, i as u8, payload, udp_hdr.payload_len);
                 return;
             }
         }
@@ -975,43 +1045,47 @@ unsafe fn process_tcp_segment(
         }
         ACTION_COMPLETE_CONNECT => {
             send_tcp_control(s, conn_idx, tcp::ACK);
-            socket_complete_op(s, conn_idx as i32, 0, SocketPhase::Connected, POLL_CONN);
+            net_send_connected(s, conn_idx as u8);
         }
         ACTION_COMPLETE_REFUSED => {
-            socket_complete_op(s, conn_idx as i32, -111, SocketPhase::Closed, POLL_HUP | POLL_ERR);
+            net_send_error(s, conn_idx as u8, -111i8);
+            // Reset the connection slot
+            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+            *conn = tcp::TcpConn::new();
         }
         ACTION_SET_CLOSED => {
-            socket_set_state(s, conn_idx as i32, SocketPhase::Closed, POLL_HUP);
+            net_send_closed(s, conn_idx as u8);
+            // Reset the connection slot
+            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+            *conn = tcp::TcpConn::new();
         }
         ACTION_SET_CLOSING => {
             send_tcp_control(s, conn_idx, tcp::ACK);
-            socket_set_state(s, conn_idx as i32, SocketPhase::Closing, POLL_HUP);
+            net_send_closed(s, conn_idx as u8);
         }
         ACTION_RX_DATA | ACTION_RX_DATA_FIN => {
             let payload = data.add(rx_payload_offset);
-            let written = socket_rx_write(s, conn_idx as i32, payload, rx_payload_len);
-            if written > 0 {
-                (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt.wrapping_add(written as u32);
-            }
+            // Deliver data via net protocol channel
+            net_send_data(s, conn_idx as u8, payload, rx_payload_len);
+            // Advance rcv_nxt by the amount delivered
+            (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt.wrapping_add(rx_payload_len as u32);
             send_tcp_control(s, conn_idx, tcp::ACK);
             if action == ACTION_RX_DATA_FIN {
-                socket_set_state(s, conn_idx as i32, SocketPhase::Closing, POLL_HUP);
+                net_send_closed(s, conn_idx as u8);
             }
         }
         ACTION_COMPLETE_ACCEPT => {
-            socket_complete_op(s, conn_idx as i32, 0, SocketPhase::Connected, POLL_CONN);
+            net_send_accepted(s, conn_idx as u8);
             // Deliver piggybacked data (e.g. HTTP GET in same segment as ACK)
             if rx_payload_len > 0 {
                 let payload = data.add(rx_payload_offset);
-                let written = socket_rx_write(s, conn_idx as i32, payload, rx_payload_len);
-                if written > 0 {
-                    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt.wrapping_add(written as u32);
-                }
+                net_send_data(s, conn_idx as u8, payload, rx_payload_len);
+                (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt.wrapping_add(rx_payload_len as u32);
                 send_tcp_control(s, conn_idx, tcp::ACK);
             }
         }
         ACTION_RST_TO_LISTEN => {
-            socket_set_state(s, conn_idx as i32, SocketPhase::Listening, 0);
+            // Connection refused during handshake — reset to listen, no notification needed
         }
         ACTION_RETRANSMIT_SYNACK => {
             send_tcp_control(s, conn_idx, tcp::SYN | tcp::ACK);
@@ -1174,6 +1248,51 @@ unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, pa
     (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt.wrapping_add(payload_len as u32);
 }
 
+/// Send a UDP datagram.  Used for CMD_SEND on Listen-state (bound) conns where
+/// the consumer supplies [dst_ip:4 LE][dst_port:2 LE][payload...], and for
+/// Established (connected) conns where remote_ip/port come from the conn slot.
+unsafe fn send_udp_data(
+    s: &mut IpState,
+    dst_ip: u32,
+    dst_port: u16,
+    src_port: u16,
+    payload: *const u8,
+    payload_len: usize,
+) {
+    if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
+        return;
+    }
+
+    let dst_mac = resolve_mac(s, dst_ip);
+    let dst_mac = match dst_mac {
+        Some(m) => m,
+        None => return,
+    };
+
+    let hdr_offset = eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN;
+    let udp_start = s.tx_frame.as_mut_ptr().add(hdr_offset);
+
+    // Copy payload after UDP header first so build_udp_header can checksum it
+    let payload_dst = udp_start.add(udp::UDP_HEADER_LEN);
+    let mut i = 0;
+    while i < payload_len {
+        *payload_dst.add(i) = *payload.add(i);
+        i += 1;
+    }
+
+    udp::build_udp_header(udp_start, src_port, dst_port, payload_len, s.local_ip, dst_ip, payload_dst);
+
+    let ip_total = (ipv4::IPV4_HEADER_LEN + udp::UDP_HEADER_LEN + payload_len) as u16;
+    let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
+    s.ip_id = s.ip_id.wrapping_add(1);
+    ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_UDP, s.local_ip, dst_ip, s.ip_id);
+
+    eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+
+    let total = eth::ETH_HEADER_LEN + ip_total as usize;
+    send_frame(s, s.tx_frame.as_ptr(), total);
+}
+
 /// Resolve IP to MAC (returns cached entry or triggers ARP request).
 unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
     // Broadcast
@@ -1323,7 +1442,10 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
         }
         dhcp::DHCP_ACK => {
             log_info(s, b"[ip] dhcp ack rx");
-            if s.dhcp.state == dhcp::DhcpState::Requesting {
+            // Accept ACK in either Requesting or Discovering state.
+            // Some DHCP servers (e.g. QEMU SLIRP) may send ACK directly.
+            if s.dhcp.state == dhcp::DhcpState::Requesting
+                || s.dhcp.state == dhcp::DhcpState::Discovering {
                 s.local_ip = offered_ip;
                 s.netmask = if subnet_mask != 0 { subnet_mask } else { 0xFFFFFF00 };
                 s.gateway = gateway;
@@ -1373,267 +1495,183 @@ unsafe fn apply_ip_config(s: &IpState) {
 }
 
 // ============================================================================
-// Socket Service
+// Net Protocol Channel Service
 // ============================================================================
 
-/// Poll socket slots and service pending operations + data transfer.
-unsafe fn service_sockets(s: &mut IpState) {
-    let count = s.socket_count as usize;
-    let mut i = 0;
-    while i < count {
-        let mut info = core::mem::zeroed::<SocketServiceInfo>();
-        if socket_info(s, i as i32, &mut info) < 0 {
-            i += 1;
-            continue;
+/// Read and dispatch net protocol commands from the consumer channel.
+/// Replaces the old socket-based service_sockets().
+unsafe fn service_net_channels(s: &mut IpState) {
+    if s.net_in_chan < 0 { return; }
+    let sys = &*s.syscalls;
+
+    // Process up to 4 commands per step.
+    // Skip channel_poll — it returns wrong results from PIC modules on aarch64.
+    // ip_net_read_frame returns (0,0) when the channel is empty.
+    let mut count = 0;
+    while count < 4 {
+        let mut buf = [0u8; 580]; // enough for MTU payload
+        let (msg_type, payload_len) = ip_net_read_frame(sys, s.net_in_chan, buf.as_mut_ptr(), buf.len());
+        if msg_type == 0 {
+            break;
         }
 
-        // Skip free sockets
-        if info.socket_type == 0 {
-            i += 1;
-            continue;
-        }
+        let plen = payload_len as usize;
 
-        // Handle pending operations
-        if info.pending_op != SOCKOP_NONE {
-            service_socket_op(s, i, &info);
-        }
-
-        // Handle TX data for connected sockets and bound-unconnected datagrams
-        if info.tx_pending > 0
-            && (info.state == SocketPhase::Connected as u8
-                || (info.state == SocketPhase::Allocated as u8 && info.socket_type == SOCK_TYPE_DGRAM))
-        {
-            service_socket_tx(s, i, &info);
-        }
-
-        i += 1;
-    }
-}
-
-/// Service a pending socket operation.
-///
-// ════════════════════════════════════════════════════════════════
-// Socket Phase Transitions
-// ════════════════════════════════════════════════════════════════
-//
-// Phase      | Trigger                      | Next        | Notes
-// ───────────|──────────────────────────────|─────────────|────────────────
-// Free       | open()                       | Allocated   | kernel allocs slot
-// Allocated  | CONNECT (TCP)                | Connecting  | send SYN
-// Allocated  | CONNECT (UDP)                | Connected   | immediate
-// Allocated  | BIND                         | Allocated   | set local_id
-// Allocated  | LISTEN (TCP)                 | Listening   |
-// Allocated  | CLOSE                        | Closed      |
-// Connecting | TCP SYN+ACK received         | Connected   | complete_op
-// Connecting | timeout / RST                | Closed      | complete_op + ERR
-// Connected  | CLOSE / FIN received         | Closing     |
-// Connected  | RST received                 | Closed      |
-// Listening  | ACCEPT + SYN received        | Connected   | complete_op
-// Closing    | FIN_WAIT / LAST_ACK complete | Closed      |
-// Closed     | (terminal)                   | —           | kernel reclaims
-//
-unsafe fn service_socket_op(s: &mut IpState, slot_idx: usize, info: &SocketServiceInfo) {
-    match info.pending_op {
-        SOCKOP_CONNECT => {
-            if info.socket_type == SOCK_TYPE_STREAM {
-                if slot_idx < tcp::MAX_TCP_CONNS {
-                    let local_port = if info.local_id != 0 {
-                        info.local_id
+        match msg_type {
+            NET_CMD_BIND => {
+                // Payload: [port: u16 LE]
+                if plen >= 2 {
+                    let port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
+                    // Find a free tcp_conn and set it to Listen
+                    let mut found = false;
+                    let mut ci = 0;
+                    while ci < tcp::MAX_TCP_CONNS {
+                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+                        if conn.state == tcp::TcpState::Closed {
+                            conn.state = tcp::TcpState::Listen;
+                            conn.local_port = port;
+                            conn.remote_ip = 0;
+                            conn.remote_port = 0;
+                            conn.retransmit_timer = 0;
+                            found = true;
+                            break;
+                        }
+                        ci += 1;
+                    }
+                    if found {
+                        log_info(s, b"[ip] net bind");
+                        net_send_bound(s, ci as u8);
                     } else {
-                        next_port(s)
-                    };
-                    let iss = s.step_count.wrapping_mul(2654435761);
-
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).state = tcp::TcpState::SynSent;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).remote_ip = info.remote_endpoint;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).remote_port = info.remote_id;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).local_port = local_port;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).iss = iss;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).snd_nxt = iss;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).snd_una = iss;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).rcv_wnd = 512;
-                    (*s.tcp_conns.as_mut_ptr().add(slot_idx)).retransmit_timer = 0;
-
-                    send_tcp_control(s, slot_idx, tcp::SYN);
-                }
-            } else if info.socket_type == SOCK_TYPE_DGRAM {
-                socket_complete_op(s, slot_idx as i32, 0, SocketPhase::Connected, POLL_CONN);
-            }
-        }
-        SOCKOP_BIND => {
-            log_info(s, b"[ip] sock bind");
-            socket_complete_op(s, slot_idx as i32, 0, SocketPhase::Allocated, 0);
-        }
-        SOCKOP_CLOSE => {
-            if info.socket_type == SOCK_TYPE_STREAM && slot_idx < tcp::MAX_TCP_CONNS {
-                let conn_state = (*s.tcp_conns.as_mut_ptr().add(slot_idx)).state;
-                match conn_state {
-                    tcp::TcpState::Established => {
-                        send_tcp_control(s, slot_idx, tcp::FIN | tcp::ACK);
-                        (*s.tcp_conns.as_mut_ptr().add(slot_idx)).state = tcp::TcpState::FinWait1;
-                    }
-                    tcp::TcpState::CloseWait => {
-                        send_tcp_control(s, slot_idx, tcp::FIN | tcp::ACK);
-                        (*s.tcp_conns.as_mut_ptr().add(slot_idx)).state = tcp::TcpState::LastAck;
-                    }
-                    _ => {
-                        (*s.tcp_conns.as_mut_ptr().add(slot_idx)).state = tcp::TcpState::Closed;
-                        socket_complete_op(s, slot_idx as i32, 0, SocketPhase::Closed, POLL_HUP);
+                        log_info(s, b"[ip] net bind: no free conn");
+                        net_send_error(s, 0, -12); // ENOMEM
                     }
                 }
-            } else {
-                socket_complete_op(s, slot_idx as i32, 0, SocketPhase::Closed, POLL_HUP);
             }
-        }
-        SOCKOP_LISTEN => {
-            if info.socket_type == SOCK_TYPE_STREAM && slot_idx < tcp::MAX_TCP_CONNS {
-                log_info(s, b"[ip] sock listen");
-                let conn = &mut *s.tcp_conns.as_mut_ptr().add(slot_idx);
-                conn.state = tcp::TcpState::Listen;
-                conn.local_port = info.local_id;
-                conn.remote_ip = 0;
-                conn.remote_port = 0;
-                conn.retransmit_timer = 0;
-                socket_complete_op(s, slot_idx as i32, 0, SocketPhase::Listening, 0);
-            } else {
-                socket_complete_op(s, slot_idx as i32, -22, SocketPhase::Allocated, POLL_ERR); // EINVAL
-            }
-        }
-        SOCKOP_ACCEPT => {
-            if info.socket_type == SOCK_TYPE_STREAM && slot_idx < tcp::MAX_TCP_CONNS {
-                let conn_state = (*s.tcp_conns.as_ptr().add(slot_idx)).state;
-                if conn_state == tcp::TcpState::Established {
-                    // SYN already arrived and handshake completed — finish accept now
-                    socket_complete_op(s, slot_idx as i32, 0, SocketPhase::Connected, POLL_CONN);
-                }
-                // Otherwise remain pending — completed when SYN-ACK-ACK finishes
-                // in process_tcp_segment
-            } else {
-                socket_complete_op(s, slot_idx as i32, -22, SocketPhase::Allocated, POLL_ERR);
-            }
-        }
-        _ => {}
-    }
-}
+            NET_CMD_CONNECT => {
+                // Payload: [sock_type: u8] [ip: u32 LE] [port: u16 LE]
+                if plen >= 7 {
+                    let bp = buf.as_ptr();
+                    let sock_type = *bp;
+                    let ip = u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
+                    let port = u16::from_le_bytes([*bp.add(5), *bp.add(6)]);
 
-/// Drain TX data from a socket and send it.
-unsafe fn service_socket_tx(s: &mut IpState, slot_idx: usize, info: &SocketServiceInfo) {
-    if info.socket_type == SOCK_TYPE_STREAM && slot_idx < tcp::MAX_TCP_CONNS {
-        let conn = &*s.tcp_conns.as_ptr().add(slot_idx);
-        if conn.state != tcp::TcpState::Established {
-            return;
-        }
-        let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
-        let can_send = (conn.snd_wnd as usize).saturating_sub(in_flight).min(1400);
-        if can_send == 0 {
-            return;
-        }
-        // Only read what we can actually send — read is destructive
-        let mut tx_buf = [0u8; 1400];
-        let max_read = can_send.min(tx_buf.len());
-        let read = socket_tx_read(s, slot_idx as i32, tx_buf.as_mut_ptr(), max_read);
-        if read <= 0 {
-            return;
-        }
-        send_tcp_data(s, slot_idx, tx_buf.as_ptr(), read as usize);
-    } else if info.socket_type == SOCK_TYPE_DGRAM {
-        // Read TX data from socket buffer
-        let mut tx_buf = [0u8; 512];
-        let read = socket_tx_read(s, slot_idx as i32, tx_buf.as_mut_ptr(), tx_buf.len());
-        if read <= 0 {
-            return;
-        }
-        let data_len = read as usize;
-
-        if info.state == SocketPhase::Allocated as u8 && data_len >= 8 {
-            // Framed mode for bound-but-not-connected sockets:
-            // TX buffer contains [dst_ip:4][dst_port:2][payload_len:2][payload:N]
-            let dst_ip = u32::from_le_bytes([tx_buf[0], tx_buf[1], tx_buf[2], tx_buf[3]]);
-            let dst_port = u16::from_le_bytes([tx_buf[4], tx_buf[5]]);
-            let payload_len = u16::from_le_bytes([tx_buf[6], tx_buf[7]]) as usize;
-            if payload_len > 0 && 8 + payload_len <= data_len && s.mac_valid && s.local_ip != 0 {
-                let dst_mac = resolve_mac(s, dst_ip);
-                if let Some(dm) = dst_mac {
-                    let hdr_offset = eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN;
-                    let udp_start = s.tx_frame.as_mut_ptr().add(hdr_offset);
-
-                    udp::build_udp_header(
-                        udp_start,
-                        info.local_id,
-                        dst_port,
-                        payload_len,
-                        s.local_ip,
-                        dst_ip,
-                        tx_buf.as_ptr().add(8),
-                    );
-
-                    // Copy payload after UDP header
-                    let payload_dst = udp_start.add(udp::UDP_HEADER_LEN);
-                    let mut j = 0;
-                    while j < payload_len {
-                        *payload_dst.add(j) = *tx_buf.as_ptr().add(8 + j);
-                        j += 1;
+                    // Find a free conn slot
+                    let mut conn_id: i32 = -1;
+                    let mut ci = 0;
+                    while ci < tcp::MAX_TCP_CONNS {
+                        let conn = &*s.tcp_conns.as_ptr().add(ci);
+                        if conn.state == tcp::TcpState::Closed {
+                            conn_id = ci as i32;
+                            break;
+                        }
+                        ci += 1;
                     }
 
-                    let ip_total = (ipv4::IPV4_HEADER_LEN + udp::UDP_HEADER_LEN + payload_len) as u16;
-                    let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
-                    s.ip_id = s.ip_id.wrapping_add(1);
-                    ipv4::build_ipv4_header(
-                        ip_start, ip_total, ipv4::PROTO_UDP,
-                        s.local_ip, dst_ip, s.ip_id,
-                    );
+                    if conn_id < 0 {
+                        net_send_error(s, 0, -12); // ENOMEM
+                    } else {
+                        let ci = conn_id as usize;
+                        if sock_type == SOCK_TYPE_STREAM {
+                            let local_port = next_port(s);
+                            let iss = s.step_count.wrapping_mul(2654435761);
 
-                    eth::build_eth_header(
-                        s.tx_frame.as_mut_ptr(), &dm, &s.mac_addr, eth::ETHERTYPE_IPV4,
-                    );
+                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+                            conn.state = tcp::TcpState::SynSent;
+                            conn.remote_ip = ip;
+                            conn.remote_port = port;
+                            conn.local_port = local_port;
+                            conn.iss = iss;
+                            conn.snd_nxt = iss;
+                            conn.snd_una = iss;
+                            conn.rcv_wnd = 512;
+                            conn.retransmit_timer = 0;
 
-                    let total = eth::ETH_HEADER_LEN + ip_total as usize;
-                    send_frame(s, s.tx_frame.as_ptr(), total);
-                }
-            }
-        } else if info.state == SocketPhase::Connected as u8 {
-            // Connected mode: use info.remote_endpoint/remote_id
-            if s.mac_valid && s.local_ip != 0 {
-                let dst_mac = resolve_mac(s, info.remote_endpoint);
-                if let Some(dm) = dst_mac {
-                    let hdr_offset = eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN;
-                    let udp_start = s.tx_frame.as_mut_ptr().add(hdr_offset);
-
-                    udp::build_udp_header(
-                        udp_start,
-                        info.local_id,
-                        info.remote_id,
-                        data_len,
-                        s.local_ip,
-                        info.remote_endpoint,
-                        tx_buf.as_ptr(),
-                    );
-
-                    // Copy payload after UDP header
-                    let payload_dst = udp_start.add(udp::UDP_HEADER_LEN);
-                    let mut j = 0;
-                    while j < data_len {
-                        *payload_dst.add(j) = *tx_buf.as_ptr().add(j);
-                        j += 1;
+                            send_tcp_control(s, ci, tcp::SYN);
+                        } else {
+                            // UDP: immediately connected
+                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+                            conn.state = tcp::TcpState::Established;
+                            conn.remote_ip = ip;
+                            conn.remote_port = port;
+                            conn.local_port = next_port(s);
+                            net_send_connected(s, ci as u8);
+                        }
                     }
-
-                    let ip_total = (ipv4::IPV4_HEADER_LEN + udp::UDP_HEADER_LEN + data_len) as u16;
-                    let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
-                    s.ip_id = s.ip_id.wrapping_add(1);
-                    ipv4::build_ipv4_header(
-                        ip_start, ip_total, ipv4::PROTO_UDP,
-                        s.local_ip, info.remote_endpoint, s.ip_id,
-                    );
-
-                    eth::build_eth_header(
-                        s.tx_frame.as_mut_ptr(), &dm, &s.mac_addr, eth::ETHERTYPE_IPV4,
-                    );
-
-                    let total = eth::ETH_HEADER_LEN + ip_total as usize;
-                    send_frame(s, s.tx_frame.as_ptr(), total);
                 }
             }
+            NET_CMD_SEND => {
+                // Payload: [conn_id: u8] [data...]
+                if plen >= 2 {
+                    let conn_id = *buf.as_ptr() as usize;
+                    let data_ptr = buf.as_ptr().add(1);
+                    let data_len = plen - 1;
+
+                    if conn_id < tcp::MAX_TCP_CONNS {
+                        let conn = &*s.tcp_conns.as_ptr().add(conn_id);
+                        if conn.state == tcp::TcpState::Established {
+                            if conn.rcv_wnd != 0 {
+                                // TCP send — check window and send
+                                let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+                                let can_send = (conn.snd_wnd as usize).saturating_sub(in_flight).min(1400);
+                                let send_len = data_len.min(can_send);
+                                if send_len > 0 {
+                                    send_tcp_data(s, conn_id, data_ptr, send_len);
+                                }
+                            } else {
+                                // Connected UDP — remote addr from conn slot
+                                send_udp_data(
+                                    s, conn.remote_ip, conn.remote_port,
+                                    conn.local_port, data_ptr, data_len,
+                                );
+                            }
+                        } else if conn.state == tcp::TcpState::Listen {
+                            // Bound UDP — payload: [dst_ip:4 LE][dst_port:2 LE][data...]
+                            if data_len >= 7 {
+                                let dp = data_ptr;
+                                let dst_ip = u32::from_le_bytes([*dp, *dp.add(1), *dp.add(2), *dp.add(3)]);
+                                let dst_port = u16::from_le_bytes([*dp.add(4), *dp.add(5)]);
+                                let udp_data = dp.add(6);
+                                let udp_len = data_len - 6;
+                                send_udp_data(s, dst_ip, dst_port, conn.local_port, udp_data, udp_len);
+                            }
+                        }
+                    }
+                }
+            }
+            NET_CMD_CLOSE => {
+                // Payload: [conn_id: u8]
+                if plen >= 1 {
+                    let conn_id = *buf.as_ptr() as usize;
+                    if conn_id < tcp::MAX_TCP_CONNS {
+                        let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
+                        match conn_state {
+                            tcp::TcpState::Established => {
+                                send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK);
+                                (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::FinWait1;
+                            }
+                            tcp::TcpState::CloseWait => {
+                                send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK);
+                                (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::LastAck;
+                            }
+                            tcp::TcpState::Listen => {
+                                // Close a listening socket
+                                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+                                *conn = tcp::TcpConn::new();
+                                net_send_closed(s, conn_id as u8);
+                            }
+                            _ => {
+                                // Already closing/closed — reset and notify
+                                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+                                *conn = tcp::TcpConn::new();
+                                net_send_closed(s, conn_id as u8);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
+        count += 1;
     }
 }
 
@@ -1673,7 +1711,9 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                 // Exit time-wait after ~30 seconds
                 if conn.timewait_timer > 600 {
                     conn.state = tcp::TcpState::Closed;
-                    socket_set_state(s, i as i32, SocketPhase::Closed, POLL_HUP);
+                    net_send_closed(s, i as u8);
+                    // Reset the connection slot
+                    *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
                 }
             }
             _ => {}

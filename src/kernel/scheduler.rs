@@ -549,7 +549,7 @@ impl Module for DummyModule {
 pub struct BuiltInModule {
     pub name: &'static str,
     step_fn: fn(*mut u8) -> i32,
-    state: [u8; 64], // Fixed-size state (enough for channel handles + counters)
+    pub state: [u8; 64], // Fixed-size state (enough for channel handles + counters)
 }
 
 impl BuiltInModule {
@@ -722,7 +722,7 @@ pub unsafe fn static_loader() -> &'static ModuleLoader {
 }
 
 /// Maximum ports per direction (in/out/ctrl) per module
-const MAX_PORTS: usize = 4;
+const MAX_PORTS: usize = 8;
 
 /// Per-module port assignments (replaces old MODULE_CHANNELS tuple)
 #[derive(Clone, Copy)]
@@ -745,6 +745,30 @@ impl ModulePorts {
             out_count:  0,
             ctrl_count: 0,
         }
+    }
+}
+
+/// Set a port channel handle for a module. Used by BCM2712 platform
+/// which doesn't go through the RP-side instantiate_one_module path.
+/// port_type: 0=in, 1=out, 2=ctrl
+pub fn set_module_port(module_idx: usize, port_type: u8, port_index: u8, channel: i32) {
+    if module_idx >= MAX_MODULES { return; }
+    let ports = unsafe { &mut SCHED.ports[module_idx] };
+    let idx = port_index as usize;
+    match port_type {
+        0 => if idx < MAX_PORTS {
+            ports.in_chans[idx] = channel;
+            if idx as u8 >= ports.in_count { ports.in_count = idx as u8 + 1; }
+        },
+        1 => if idx < MAX_PORTS {
+            ports.out_chans[idx] = channel;
+            if idx as u8 >= ports.out_count { ports.out_count = idx as u8 + 1; }
+        },
+        2 => if idx < MAX_PORTS {
+            ports.ctrl_chans[idx] = channel;
+            if idx as u8 >= ports.ctrl_count { ports.ctrl_count = idx as u8 + 1; }
+        },
+        _ => {}
     }
 }
 
@@ -1086,9 +1110,18 @@ pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32) {
 pub fn step_module(idx: usize) {
     if idx >= MAX_MODULES { return; }
     unsafe {
-        if let ModuleSlot::Dynamic(ref mut m) = SCHED.modules[idx] {
+        if let Some(m) = SCHED.modules[idx].as_module_mut() {
             let _ = m.step();
         }
+    }
+}
+
+/// Store a BuiltInModule in the scheduler's module table (used by Linux platform).
+pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
+    if idx >= MAX_MODULES { return; }
+    unsafe {
+        SCHED.modules[idx] = ModuleSlot::BuiltIn(m);
+        SCHED.ready[idx] = true;
     }
 }
 
@@ -2136,7 +2169,7 @@ fn finalize_module(
 ) {
     let sched = unsafe { &mut *(&raw mut SCHED) };
 
-    let flag = if error_code.is_some() { POLL_ERR } else { POLL_HUP };
+    let flag = if error_code.is_some() { POLL_ERR as u8 } else { POLL_HUP as u8 }; // u8: sticky_events is AtomicU8
     if let Some(rc) = error_code {
         log::warn!("[sched] module {} ({}) error rc={}{}", module_idx, type_name, rc, context);
     } else {

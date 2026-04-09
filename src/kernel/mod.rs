@@ -7,7 +7,6 @@ pub mod config;
 pub mod scheduler;
 pub mod loader;
 pub mod net;
-pub mod socket;
 pub mod buffer_pool;
 pub mod errno;
 pub mod event;

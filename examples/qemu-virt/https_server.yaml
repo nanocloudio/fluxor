@@ -1,6 +1,6 @@
 # HTTPS Server (QEMU virt)
 #
-# TLS 1.3 with pure Rust TLS module as socket provider chain over virtio-net.
+# TLS 1.3 channel-based encryption between IP and HTTP.
 #
 # Generate test certs first:
 #   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -12,7 +12,6 @@
 #   make run CONFIG=examples/qemu-virt/https_server.yaml
 #   curl -vsk https://localhost:59443/
 target: qemu-virt
-tick_us: 1000
 
 platform:
   net: {}
@@ -29,3 +28,13 @@ modules:
     routes:
       - path: "/"
         body: "<html><body><h1>Hello HTTPS from Fluxor!</h1><p>TLS 1.3 on aarch64 QEMU virt.</p></body></html>"
+
+wiring:
+  - from: ip.net_out
+    to: tls.cipher_in
+  - from: tls.cipher_out
+    to: ip.net_in
+  - from: tls.clear_out
+    to: http.net_in
+  - from: http.net_out
+    to: tls.clear_in

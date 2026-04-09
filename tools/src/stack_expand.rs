@@ -225,7 +225,7 @@ fn select_variant<'a>(
 fn inject_variant(
     config: &mut Value,
     variant: &StackVariant,
-    merged: &HashMap<String, String>,
+    _merged: &HashMap<String, String>,
     stack_meta: &StackMeta,
 ) -> Result<Vec<String>> {
     let mut added = Vec::new();

@@ -59,10 +59,13 @@ wiring:
     to: ip.frames_rx
   - from: ip.frames_tx
     to: virtio_net.frames_tx
+  # HTTP <-> IP net protocol channels
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in
+
   # Cross-domain edge: http file_ctrl output -> debug input
   - from: http.file_ctrl
     to: debug.data
     edge_class: cross_core
-
-services:
-  socket: ip

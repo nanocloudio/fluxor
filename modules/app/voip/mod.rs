@@ -29,7 +29,7 @@ use core::ffi::c_void;
 
 #[path = "../../../src/abi.rs"]
 mod abi;
-use abi::{SyscallTable, ChannelAddr};
+use abi::SyscallTable;
 
 include!("../../pic_runtime.rs");
 include!("../../param_macro.rs");
@@ -42,13 +42,22 @@ include!("jitter.rs");
 // Shared Constants
 // ============================================================================
 
-const DEV_SOCKET_OPEN: u32 = 0x0800;
-const DEV_SOCKET_CONNECT: u32 = 0x0801;
-const DEV_SOCKET_SEND: u32 = 0x0802;
-const DEV_SOCKET_RECV: u32 = 0x0803;
-const DEV_SOCKET_POLL: u32 = 0x0804;
-const DEV_SOCKET_CLOSE: u32 = 0x0805;
-const DEV_SOCKET_BIND: u32 = 0x0806;
+// Net protocol frame types (downstream from IP)
+const NET_MSG_ACCEPTED: u8 = 0x01;
+const NET_MSG_DATA: u8 = 0x02;
+const NET_MSG_CLOSED: u8 = 0x03;
+const NET_MSG_BOUND: u8 = 0x04;
+const NET_MSG_CONNECTED: u8 = 0x05;
+const NET_MSG_ERROR: u8 = 0x06;
+
+// Net protocol frame types (upstream to IP)
+const NET_CMD_BIND: u8 = 0x10;
+const NET_CMD_SEND: u8 = 0x11;
+const NET_CMD_CLOSE: u8 = 0x12;
+const NET_CMD_CONNECT: u8 = 0x13;
+
+/// Net scratch buffer size
+const NET_BUF_SIZE: usize = 600;
 
 // Control channel protocol (8-byte messages to rtp)
 const CTRL_SET_ENDPOINT: u8 = 0x01;
@@ -73,15 +82,23 @@ struct VoipState {
     syscalls: *const SyscallTable,
 
     // Channel handles
-    encode_in: i32,       // in[0]: PCM stereo from mic
-    decode_out: i32,      // out[0]: PCM stereo to i2s
-    encode_out: i32,      // out[1]: G.711 to rtp
+    encode_in: i32,       // in[2]: PCM stereo from mic
+    decode_out: i32,      // out[2]: PCM stereo to i2s
+    encode_out: i32,      // out[3]: G.711 to rtp
     ctrl_chan: i32,        // ctrl: gesture/flash
-    out_ctrl_rtp: i32,    // out[2]: ctrl to rtp
+    out_ctrl_rtp: i32,    // out[4]: ctrl to rtp
 
-    // Sockets
-    sip_socket: i32,      // SIP signaling
-    jitter_socket: i32,   // RTP receive
+    // Net channels (SIP)
+    sip_net_in: i32,      // in[0]: SIP net from IP
+    sip_net_out: i32,     // out[0]: SIP net to IP
+    sip_conn_id: u8,
+    _pad_sip_conn: [u8; 3],
+
+    // Net channels (jitter/RTP receive)
+    jitter_net_in: i32,   // in[1]: jitter net from IP
+    jitter_net_out: i32,  // out[1]: jitter net to IP
+    jitter_conn_id: u8,
+    _pad_jitter_conn: [u8; 3],
 
     // SIP config
     local_ip: u32,
@@ -159,6 +176,8 @@ struct VoipState {
     ctrl_out: [u8; CTRL_MSG_SIZE],
     jitter_rx_buf: [u8; JITTER_RX_BUF_SIZE],
     jitter_out_buf: [u8; SLOT_SIZE],
+    sip_net_buf: [u8; NET_BUF_SIZE],
+    jitter_net_buf: [u8; NET_BUF_SIZE],
 
     // Jitter buffer slots (largest, last)
     slots: [JitterSlot; MAX_SLOTS],
@@ -172,8 +191,14 @@ impl VoipState {
         self.encode_out = -1;
         self.ctrl_chan = -1;
         self.out_ctrl_rtp = -1;
-        self.sip_socket = -1;
-        self.jitter_socket = -1;
+        self.sip_net_in = -1;
+        self.sip_net_out = -1;
+        self.sip_conn_id = 0;
+        self._pad_sip_conn = [0; 3];
+        self.jitter_net_in = -1;
+        self.jitter_net_out = -1;
+        self.jitter_conn_id = 0;
+        self._pad_jitter_conn = [0; 3];
         self.local_ip = 0;
         self.peer_ip = 0;
         self.local_sip_port = SIP_PORT_DEFAULT;
@@ -308,16 +333,33 @@ pub extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
         let sys = &*s.syscalls;
 
-        // Primary ports
-        s.encode_in = in_chan;    // in[0]: PCM from mic
-        s.decode_out = out_chan;  // out[0]: PCM to i2s
+        // Primary ports: in[0]/out[0] = SIP net channels
+        s.sip_net_in = in_chan;    // in[0]: SIP net from IP
+        s.sip_net_out = out_chan;  // out[0]: SIP net to IP
         s.ctrl_chan = ctrl_chan;
 
-        // Discover additional output ports
-        let ch = dev_channel_port(sys, 1, 1); // out[1]: G.711 to rtp
+        // in[1]: jitter net from IP
+        let ch = dev_channel_port(sys, 0, 1);
+        if ch >= 0 { s.jitter_net_in = ch; }
+
+        // in[2]: PCM from mic
+        let ch = dev_channel_port(sys, 0, 2);
+        if ch >= 0 { s.encode_in = ch; }
+
+        // out[1]: jitter net to IP
+        let ch = dev_channel_port(sys, 1, 1);
+        if ch >= 0 { s.jitter_net_out = ch; }
+
+        // out[2]: PCM to i2s
+        let ch = dev_channel_port(sys, 1, 2);
+        if ch >= 0 { s.decode_out = ch; }
+
+        // out[3]: G.711 to rtp
+        let ch = dev_channel_port(sys, 1, 3);
         if ch >= 0 { s.encode_out = ch; }
 
-        let ch = dev_channel_port(sys, 1, 2); // out[2]: ctrl to rtp
+        // out[4]: ctrl to rtp
+        let ch = dev_channel_port(sys, 1, 4);
         if ch >= 0 { s.out_ctrl_rtp = ch; }
 
         // Parse params

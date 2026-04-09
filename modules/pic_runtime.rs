@@ -365,11 +365,11 @@ pub unsafe extern "C" fn __aeabi_llsr(v_lo: u32, v_hi: u32, shift: u32) -> u64 {
 // Channel Poll Constants
 // ============================================================================
 
-pub const POLL_IN: u8 = 0x01;
-pub const POLL_OUT: u8 = 0x02;
-pub const POLL_ERR: u8 = 0x04;
-pub const POLL_HUP: u8 = 0x08;
-pub const POLL_CONN: u8 = 0x10;
+pub const POLL_IN: u32 = 0x01;
+pub const POLL_OUT: u32 = 0x02;
+pub const POLL_ERR: u32 = 0x04;
+pub const POLL_HUP: u32 = 0x08;
+pub const POLL_CONN: u32 = 0x10;
 
 // ============================================================================
 // Common Error Codes (from kernel errno)
@@ -526,7 +526,7 @@ pub unsafe fn drain_pending(
 ) -> bool {
     if *pending_out == 0 { return true; }
     let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-    if out_poll > 0 && ((out_poll as u8) & POLL_OUT) != 0 {
+    if out_poll > 0 && (out_poll as u32 & POLL_OUT) != 0 {
         let written = (sys.channel_write)(out_chan, buf.add(*pending_offset as usize), *pending_out as usize);
         if written > 0 {
             let w = written as u16;
@@ -617,8 +617,8 @@ unsafe fn dev_log(sys: &SyscallTable, level: u8, msg: *const u8, len: usize) {
 /// Poll any fd via dev_call (SYSTEM::FD_POLL 0x0C41).
 #[allow(dead_code)]
 #[inline(always)]
-unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u8) -> i32 {
-    let mut buf = [events];
+unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u32) -> i32 {
+    let mut buf = [events as u8];
     (sys.dev_call)(fd, 0x0C41, buf.as_mut_ptr(), 1)
 }
 
@@ -772,73 +772,58 @@ unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
 }
 
 // ============================================================================
-// Socket helpers (dev_call wrappers for SOCKET class 0x08)
+// Channel-based networking helpers (net_proto framing)
 // ============================================================================
 
-/// Open a socket. socket_type: 1=stream, 2=dgram. Returns tagged fd or <0.
+/// Net protocol frame header size.
+const NET_FRAME_HDR: usize = 3;
+
+/// Write a net protocol frame: [msg_type: u8] [len: u16 LE] [payload].
+/// The frame is assembled in `scratch` and written atomically.
+/// Returns total bytes written, or 0 if channel not ready.
 #[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_open(sys: &SyscallTable, socket_type: u8) -> i32 {
-    let mut buf = [socket_type];
-    (sys.dev_call)(-1, 0x0800, buf.as_mut_ptr(), 1)
+unsafe fn net_write_frame(
+    sys: &SyscallTable,
+    chan: i32,
+    msg_type: u8,
+    payload: *const u8,
+    payload_len: usize,
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
+    let total = NET_FRAME_HDR + payload_len;
+    if chan < 0 || total > scratch_max { return 0; }
+    // No poll pre-check: channel_write handles full buffers by returning 0.
+    let len_le = (payload_len as u16).to_le_bytes();
+    *scratch = msg_type;
+    *scratch.add(1) = len_le[0];
+    *scratch.add(2) = len_le[1];
+    if payload_len > 0 && !payload.is_null() {
+        core::ptr::copy_nonoverlapping(payload, scratch.add(NET_FRAME_HDR), payload_len);
+    }
+    (sys.channel_write)(chan, scratch, total);
+    total
 }
 
-/// Connect socket to remote address. Returns EINPROGRESS or error.
+/// Read a net protocol frame from channel into buf.
+/// Returns (msg_type, payload_len) or (0, 0) if no data.
+/// Payload starts at buf[3]. Caller must provide buf >= FRAME_HDR + max payload.
 #[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_connect(sys: &SyscallTable, handle: i32, addr: *mut u8) -> i32 {
-    (sys.dev_call)(handle, 0x0801, addr, 8) // ChannelAddr is 8 bytes
-}
-
-/// Send data on socket. Returns bytes sent or EAGAIN.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_send(sys: &SyscallTable, handle: i32, data: *const u8, len: usize) -> i32 {
-    (sys.dev_call)(handle, 0x0802, data as *mut u8, len)
-}
-
-/// Receive data from socket. Returns bytes received or EAGAIN.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_recv(sys: &SyscallTable, handle: i32, buf: *mut u8, len: usize) -> i32 {
-    (sys.dev_call)(handle, 0x0803, buf, len)
-}
-
-/// Poll socket readiness. Returns bitmask of ready events.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_poll(sys: &SyscallTable, handle: i32, events: u8) -> i32 {
-    let mut buf = [events];
-    (sys.dev_call)(handle, 0x0804, buf.as_mut_ptr(), 1)
-}
-
-/// Close socket.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_close(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, 0x0805, core::ptr::null_mut(), 0)
-}
-
-/// Bind socket to local port.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_bind(sys: &SyscallTable, handle: i32, port: u16) -> i32 {
-    let mut buf = port.to_le_bytes();
-    (sys.dev_call)(handle, 0x0806, buf.as_mut_ptr(), 2)
-}
-
-/// Listen for incoming connections.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_listen(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, 0x0807, core::ptr::null_mut(), 0)
-}
-
-/// Accept incoming connection. Transforms listening socket into connected.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_socket_accept(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, 0x0808, core::ptr::null_mut(), 0)
+unsafe fn net_read_frame(
+    sys: &SyscallTable,
+    chan: i32,
+    buf: *mut u8,
+    buf_max: usize,
+) -> (u8, usize) {
+    if chan < 0 || buf_max < NET_FRAME_HDR { return (0, 0); }
+    // No poll pre-check: channel_read returns 0 when empty.
+    let n = (sys.channel_read)(chan, buf, buf_max);
+    if n < NET_FRAME_HDR as i32 { return (0, 0); }
+    let msg_type = *buf;
+    let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
+    let available = (n as usize).saturating_sub(NET_FRAME_HDR);
+    let actual = if payload_len < available { payload_len } else { available };
+    (msg_type, actual)
 }
 
 /// Register as a provider for a device class.

@@ -195,7 +195,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.state_processed = 1;
             let byte = [s.current_state]; // 0x01=pressed, 0x00=released
             let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-            if poll > 0 && ((poll as u8) & POLL_OUT) != 0 {
+            if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
                 (sys.channel_write)(s.out_chan, byte.as_ptr(), 1);
             }
         }

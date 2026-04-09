@@ -216,8 +216,11 @@ pub struct Manifest {
     /// FMP command vocabulary (parsed from TOML, not in binary format)
     pub commands: CommandVocabulary,
     /// Services this module provides to others (parsed from TOML, not in binary format).
-    /// e.g. ip provides "socket", pwm provides "pwm"
+    /// e.g. pwm provides "pwm". (Legacy: socket routing used this, now replaced by channels.)
     pub provides: Vec<String>,
+    /// Module is built into the kernel (no .fmod file needed).
+    /// Used by platform-specific modules like linux_net.
+    pub builtin: bool,
 }
 
 impl Default for Manifest {
@@ -232,6 +235,7 @@ impl Default for Manifest {
             integrity_hash: None,
             commands: CommandVocabulary::default(),
             provides: Vec::new(),
+            builtin: false,
         }
     }
 }
@@ -357,6 +361,8 @@ impl Manifest {
 
         let provides = toml_val.provides.unwrap_or_default();
 
+        let builtin = toml_val.builtin.unwrap_or(false);
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -367,6 +373,7 @@ impl Manifest {
             integrity_hash: None, // set later by caller
             commands,
             provides,
+            builtin,
         })
     }
 
@@ -524,6 +531,7 @@ impl Manifest {
             integrity_hash,
             commands: CommandVocabulary::default(),
             provides: Vec::new(), // not serialized in binary format
+            builtin: false,
         })
     }
 
@@ -622,6 +630,8 @@ struct TomlManifest {
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
     provides: Option<Vec<String>>,
+    /// Module is built into the kernel (no .fmod file needed).
+    builtin: Option<bool>,
 }
 
 #[derive(Deserialize)]

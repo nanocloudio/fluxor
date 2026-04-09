@@ -172,7 +172,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Not currently reading: wait for timer to expire
         if !s.reading {
             let poll = dev_fd_poll(sys, s.timer_fd, POLL_IN);
-            if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+            if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
                 return 0;
             }
             // Timer expired — start ADC read
@@ -192,7 +192,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Write 4 bytes (i32 LE) to output channel
         let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-        if poll > 0 && ((poll as u8) & POLL_OUT) != 0 {
+        if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
             let bytes = temp_mc.to_le_bytes();
             (sys.channel_write)(s.out_chan, bytes.as_ptr(), 4);
         }

@@ -110,7 +110,7 @@ unsafe fn step_decode(s: &mut VoipState) {
 
     // Check output ready
     let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-    if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+    if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
         return;
     }
 
@@ -167,13 +167,13 @@ unsafe fn step_encode(s: &mut VoipState) {
 
     // Check output ready
     let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-    if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+    if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
         return;
     }
 
     // Check input available
     let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-    if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 {
+    if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
         return;
     }
 

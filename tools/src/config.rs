@@ -935,7 +935,7 @@ impl ConfigBuilder {
 /// Graph edge size in bytes
 const GRAPH_EDGE_SIZE: usize = 4;
 /// Maximum number of graph edges
-const MAX_GRAPH_EDGES: usize = 48;
+const MAX_GRAPH_EDGES: usize = 64;
 /// Per-domain metadata: 4 domains × (tick_us:u16 + exec_mode:u8 + reserved:u8) = 16 bytes
 const DOMAIN_META_SIZE: usize = 16;
 /// Graph section size (header + edges + domain metadata)
@@ -1830,7 +1830,7 @@ pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, modu
     // Validate per-module port indices against MAX_PORTS.
     // The kernel's populate_ports() enforces this at runtime, but catching
     // it here gives a clear build-time error instead of a cryptic boot failure.
-    const MAX_PORTS: u8 = 4;
+    const MAX_PORTS: u8 = 8;
     for &(from_id, to_id, _to_port, from_port_index, to_port_index) in &edges {
         if from_port_index >= MAX_PORTS {
             return Err(Error::Config(format!(

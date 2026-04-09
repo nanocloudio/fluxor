@@ -8,7 +8,7 @@
 #
 # Pipeline:
 #
-#   http <--socket--> ip <--frames--> cyw43
+#   http <--channel--> ip <--frames--> cyw43
 #                                              ^
 #                                           wifi
 #
@@ -55,6 +55,12 @@ modules:
     mode: plaintext
 
 wiring:
+  # HTTP <-> IP net protocol channels
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in
+
   # Debug: WiFi scan results
   - from: cyw43.scan_text
     to: debug.data

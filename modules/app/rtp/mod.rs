@@ -24,7 +24,7 @@ use core::ffi::c_void;
 
 #[path = "../../../src/abi.rs"]
 mod abi;
-use abi::{SyscallTable, ChannelAddr};
+use abi::SyscallTable;
 
 include!("../../pic_runtime.rs");
 include!("../../param_macro.rs");
@@ -33,14 +33,22 @@ include!("../../param_macro.rs");
 // Constants
 // ============================================================================
 
-// dev_call socket opcodes
-const DEV_SOCKET_OPEN: u32 = 0x0800;
-const DEV_SOCKET_CONNECT: u32 = 0x0801;
-const DEV_SOCKET_SEND: u32 = 0x0802;
-const DEV_SOCKET_RECV: u32 = 0x0803;
-const DEV_SOCKET_POLL: u32 = 0x0804;
-const DEV_SOCKET_CLOSE: u32 = 0x0805;
-const DEV_SOCKET_BIND: u32 = 0x0806;
+// Net protocol frame types (downstream from IP)
+const NET_MSG_ACCEPTED: u8 = 0x01;
+const NET_MSG_DATA: u8 = 0x02;
+const NET_MSG_CLOSED: u8 = 0x03;
+const NET_MSG_BOUND: u8 = 0x04;
+const NET_MSG_CONNECTED: u8 = 0x05;
+const NET_MSG_ERROR: u8 = 0x06;
+
+// Net protocol frame types (upstream to IP)
+const NET_CMD_BIND: u8 = 0x10;
+const NET_CMD_SEND: u8 = 0x11;
+const NET_CMD_CLOSE: u8 = 0x12;
+const NET_CMD_CONNECT: u8 = 0x13;
+
+/// Net scratch buffer — enough for RTP header + payload + frame header
+const NET_BUF_SIZE: usize = 512;
 
 /// RTP header size (V2, no CSRC, no extensions)
 const RTP_HEADER_SIZE: usize = 12;
@@ -89,11 +97,14 @@ struct RtpState {
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
-    socket_handle: i32,
+    net_in_chan: i32,
+    net_out_chan: i32,
+    conn_id: u8,
     phase: RtpPhase,
     ptime: u8,
     payload_type: u8,
     ctrl_mode: u8,
+    _pad0: u8,
     peer_ip: u32,
     peer_port: u16,
     local_port: u16,
@@ -118,6 +129,7 @@ struct RtpState {
     pkt_buf: [u8; PKT_BUF_SIZE],
     rx_buf: [u8; RX_BUF_SIZE],
     out_buf: [u8; MAX_PAYLOAD],
+    net_buf: [u8; NET_BUF_SIZE],
 }
 
 impl RtpState {
@@ -126,11 +138,14 @@ impl RtpState {
         self.in_chan = -1;
         self.out_chan = -1;
         self.ctrl_chan = -1;
-        self.socket_handle = -1;
+        self.net_in_chan = -1;
+        self.net_out_chan = -1;
+        self.conn_id = 0;
         self.phase = RtpPhase::Init;
         self.ptime = 20;
         self.payload_type = 0; // PCMU
         self.ctrl_mode = 0;
+        self._pad0 = 0;
         self.peer_ip = 0;
         self.peer_port = 5004;
         self.local_port = 5004;
@@ -219,8 +234,24 @@ pub extern "C" fn module_new(
 
         let s = &mut *(state as *mut RtpState);
         s.init(syscalls as *const SyscallTable);
-        s.in_chan = in_chan;
-        s.out_chan = out_chan;
+
+        let sys = &*s.syscalls;
+
+        // Net channels: in[0] = net_in (from IP), in[1] = g711 audio data
+        // out[0] = net_out (to IP), out[1] = packets (audio out)
+        // Primary in/out are net channels; audio ports are secondary
+        s.net_in_chan = in_chan;
+        s.net_out_chan = out_chan;
+
+        // Discover additional ports: in[1] = g711 audio input
+        let ch = dev_channel_port(sys, 0, 1); // in[1]
+        if ch >= 0 { s.in_chan = ch; }
+
+        // out[1] = decoded packets output
+        let ch = dev_channel_port(sys, 1, 1); // out[1]
+        if ch >= 0 { s.out_chan = ch; }
+
+        // ctrl channel
         s.ctrl_chan = ctrl_chan;
 
         // Parse params
@@ -232,8 +263,6 @@ pub extern "C" fn module_new(
         } else {
             params_def::set_defaults(s);
         }
-
-        let sys = &*s.syscalls;
 
         if ctrl_chan >= 0 {
             // Ctrl mode: start idle, wait for commands
@@ -285,7 +314,7 @@ unsafe fn step_idle(s: &mut RtpState) -> i32 {
     let sys = &*s.syscalls;
 
     let poll = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
-    if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return 0;
     }
 
@@ -317,29 +346,27 @@ unsafe fn step_idle(s: &mut RtpState) -> i32 {
 }
 
 // ============================================================================
-// State: Init — open and bind socket
+// State: Init — send CMD_BIND via net channel
 // ============================================================================
 
 unsafe fn step_init(s: &mut RtpState) -> i32 {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let mut sock_arg = [SOCK_TYPE_DGRAM];
-    let handle = (dev_call)(-1, DEV_SOCKET_OPEN, sock_arg.as_mut_ptr(), 1);
-    if handle < 0 {
-        dev_log(sys, 1, b"[rtp] socket fail".as_ptr(), 17);
+    if s.net_out_chan < 0 {
+        dev_log(sys, 1, b"[rtp] no net chan".as_ptr(), 16);
         s.phase = RtpPhase::Error;
         return -1;
     }
-    s.socket_handle = handle;
 
-    let mut port_arg = s.local_port.to_le_bytes();
-    let rc = (dev_call)(handle, DEV_SOCKET_BIND, port_arg.as_mut_ptr(), 2);
-    if rc < 0 && rc != E_INPROGRESS {
-        dev_log(sys, 1, b"[rtp] bind fail".as_ptr(), 15);
-        (dev_call)(handle, DEV_SOCKET_CLOSE, core::ptr::null_mut(), 0);
-        s.phase = RtpPhase::Error;
-        return -1;
+    // CMD_BIND payload: [port: u16 LE]
+    let port_le = s.local_port.to_le_bytes();
+    let wrote = net_write_frame(
+        sys, s.net_out_chan, NET_CMD_BIND,
+        port_le.as_ptr(), 2,
+        s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
+    );
+    if wrote == 0 {
+        return 0; // Channel full, retry next tick
     }
 
     s.phase = RtpPhase::BindWait;
@@ -347,28 +374,52 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
 }
 
 // ============================================================================
-// State: BindWait — try connect once bind completes
+// State: BindWait — wait for MSG_BOUND, then send CMD_CONNECT
 // ============================================================================
 
 unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let addr = ChannelAddr::new(s.peer_ip, s.peer_port);
-    let rc = (dev_call)(
-        s.socket_handle,
-        DEV_SOCKET_CONNECT,
-        &addr as *const _ as *mut u8,
-        core::mem::size_of::<ChannelAddr>(),
-    );
+    if s.net_in_chan < 0 { return 0; }
 
-    if rc == E_BUSY {
+    let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return 0;
     }
-    if rc < 0 && rc != E_INPROGRESS {
-        dev_log(sys, 1, b"[rtp] conn fail".as_ptr(), 15);
+
+    let buf = s.net_buf.as_mut_ptr();
+    let (msg_type, _payload_len) = net_read_frame(sys, s.net_in_chan, buf, NET_BUF_SIZE);
+
+    if msg_type == NET_MSG_ERROR {
+        dev_log(sys, 1, b"[rtp] bind fail".as_ptr(), 15);
         s.phase = RtpPhase::Error;
         return -1;
+    }
+    if msg_type != NET_MSG_BOUND {
+        return 0;
+    }
+
+    // Bound — now send CMD_CONNECT: [sock_type: u8][ip: u32 LE][port: u16 LE]
+    let ip_le = s.peer_ip.to_le_bytes();
+    let port_le = s.peer_port.to_le_bytes();
+    let payload = s.net_buf.as_mut_ptr();
+    *payload = SOCK_TYPE_DGRAM;
+    *payload.add(1) = ip_le[0];
+    *payload.add(2) = ip_le[1];
+    *payload.add(3) = ip_le[2];
+    *payload.add(4) = ip_le[3];
+    *payload.add(5) = port_le[0];
+    *payload.add(6) = port_le[1];
+
+    // Write frame using a separate scratch area (offset past payload)
+    let scratch = s.pkt_buf.as_mut_ptr(); // Reuse pkt_buf as scratch
+    let wrote = net_write_frame(
+        sys, s.net_out_chan, NET_CMD_CONNECT,
+        payload, 7,
+        scratch, PKT_BUF_SIZE,
+    );
+    if wrote == 0 {
+        return 0;
     }
 
     s.phase = RtpPhase::ConnectWait;
@@ -376,22 +427,29 @@ unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
 }
 
 // ============================================================================
-// State: ConnectWait — poll for connection ready
+// State: ConnectWait — wait for MSG_CONNECTED
 // ============================================================================
 
 unsafe fn step_connect_wait(s: &mut RtpState) -> i32 {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let mut poll_arg = [POLL_CONN | POLL_ERR];
-    let poll = (dev_call)(s.socket_handle, DEV_SOCKET_POLL, poll_arg.as_mut_ptr(), 1);
+    if s.net_in_chan < 0 { return 0; }
 
-    if poll > 0 && ((poll as u8) & POLL_ERR) != 0 {
-        dev_log(sys, 1, b"[rtp] poll err".as_ptr(), 14);
+    let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        return 0;
+    }
+
+    let buf = s.net_buf.as_mut_ptr();
+    let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, buf, NET_BUF_SIZE);
+
+    if msg_type == NET_MSG_ERROR {
+        dev_log(sys, 1, b"[rtp] conn fail".as_ptr(), 15);
         s.phase = RtpPhase::Error;
         return -1;
     }
-    if poll > 0 && ((poll as u8) & POLL_CONN) != 0 {
+    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+        s.conn_id = *buf.add(NET_FRAME_HDR);
         dev_log(sys, 3, b"[rtp] connected".as_ptr(), 15);
         s.phase = RtpPhase::Running;
         return 2; // Burst — start data flow immediately
@@ -409,12 +467,12 @@ unsafe fn step_running(s: &mut RtpState) -> i32 {
     // Check for STOP command on ctrl channel
     if s.ctrl_mode != 0 {
         let ctrl_poll = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
-        if ctrl_poll > 0 && ((ctrl_poll as u8) & POLL_IN) != 0 {
+        if ctrl_poll > 0 && ((ctrl_poll as u32) & POLL_IN) != 0 {
             let read = (sys.channel_read)(s.ctrl_chan, s.ctrl_buf.as_mut_ptr(), CTRL_MSG_SIZE);
             if read >= CTRL_MSG_SIZE as i32 {
                 let cmd = s.ctrl_buf[0];
                 if cmd == CTRL_STOP {
-                    close_socket(s);
+                    close_connection(s);
                     dev_log(sys, 3, b"[rtp] stopped".as_ptr(), 13);
                     s.phase = RtpPhase::Idle;
                     return 0;
@@ -450,7 +508,7 @@ unsafe fn step_tx(s: &mut RtpState) {
     let in_chan = s.in_chan;
 
     let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-    if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 {
+    if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
         return;
     }
 
@@ -481,7 +539,6 @@ unsafe fn step_tx(s: &mut RtpState) {
 
 unsafe fn step_rx(s: &mut RtpState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
     let out_chan = s.out_chan;
 
     // Drain any pending output from previous step
@@ -491,23 +548,32 @@ unsafe fn step_rx(s: &mut RtpState) {
 
     // Check output channel ready
     let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-    if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+    if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
         return;
     }
 
-    // Try to receive a packet
-    let read = (dev_call)(
-        s.socket_handle,
-        DEV_SOCKET_RECV,
-        s.rx_buf.as_mut_ptr(),
-        RX_BUF_SIZE,
-    );
+    // Try to receive a MSG_DATA frame from net channel
+    if s.net_in_chan < 0 { return; }
 
-    if read <= 0 {
+    let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return;
     }
 
-    let pkt_len = read as usize;
+    let buf = s.rx_buf.as_mut_ptr();
+    let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, buf, RX_BUF_SIZE);
+
+    if msg_type != NET_MSG_DATA || payload_len < 2 {
+        return;
+    }
+
+    // MSG_DATA payload: [conn_id: u8][data...] — skip conn_id byte
+    let pkt_len = payload_len - 1;
+    // Shift data so pkt starts at rx_buf[0] (overwrite the frame header + conn_id)
+    let data_start = NET_FRAME_HDR + 1; // skip frame hdr + conn_id
+    __aeabi_memmove(s.rx_buf.as_mut_ptr(), s.rx_buf.as_ptr().add(data_start), pkt_len);
+
+    let pkt_len = pkt_len;
     if pkt_len < RTP_HEADER_SIZE {
         return;
     }
@@ -558,15 +624,20 @@ unsafe fn step_rx(s: &mut RtpState) {
 }
 
 // ============================================================================
-// Close socket and reset streaming state
+// Close connection and reset streaming state
 // ============================================================================
 
-unsafe fn close_socket(s: &mut RtpState) {
-    if s.socket_handle >= 0 {
-        let dev_call = (&*s.syscalls).dev_call;
-        (dev_call)(s.socket_handle, DEV_SOCKET_CLOSE, core::ptr::null_mut(), 0);
-        s.socket_handle = -1;
+unsafe fn close_connection(s: &mut RtpState) {
+    if s.net_out_chan >= 0 && s.conn_id != 0 {
+        let sys = &*s.syscalls;
+        let payload = [s.conn_id];
+        net_write_frame(
+            sys, s.net_out_chan, NET_CMD_CLOSE,
+            payload.as_ptr(), 1,
+            s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
+        );
     }
+    s.conn_id = 0;
     // Reset TX state
     s.seq_num = 0;
     s.timestamp = 0;
@@ -586,7 +657,6 @@ unsafe fn close_socket(s: &mut RtpState) {
 
 unsafe fn send_rtp_packet(s: &mut RtpState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
     let payload_len = if s.acc_len < s.ptime_bytes {
         s.acc_len as usize
@@ -622,11 +692,23 @@ unsafe fn send_rtp_packet(s: &mut RtpState) {
     // Copy payload after header
     __aeabi_memcpy(pkt.add(RTP_HEADER_SIZE), s.acc_buf.as_ptr(), payload_len);
 
-    // Send packet
+    // Send packet via CMD_SEND frame: [conn_id][rtp_data...]
     let total = RTP_HEADER_SIZE + payload_len;
-    let sent = (dev_call)(s.socket_handle, DEV_SOCKET_SEND, pkt, total);
-    if sent < 0 && sent != E_AGAIN {
-        dev_log(sys, 2, b"[rtp] send err".as_ptr(), 14);
+    // Build CMD_SEND frame manually in net_buf:
+    // [CMD_SEND][len_lo][len_hi][conn_id][rtp_packet...]
+    let scratch = s.net_buf.as_mut_ptr();
+    let frame_payload_len = 1 + total; // conn_id + rtp data
+    if frame_payload_len + NET_FRAME_HDR <= NET_BUF_SIZE {
+        *scratch = NET_CMD_SEND;
+        *scratch.add(1) = (frame_payload_len & 0xFF) as u8;
+        *scratch.add(2) = ((frame_payload_len >> 8) & 0xFF) as u8;
+        *scratch.add(NET_FRAME_HDR) = s.conn_id;
+        core::ptr::copy_nonoverlapping(pkt, scratch.add(NET_FRAME_HDR + 1), total);
+        let frame_total = NET_FRAME_HDR + frame_payload_len;
+        let sent = (sys.channel_write)(s.net_out_chan, scratch, frame_total);
+        if sent < 0 && sent != E_AGAIN {
+            dev_log(sys, 2, b"[rtp] send err".as_ptr(), 14);
+        }
     }
 
     // Advance sequence and timestamp

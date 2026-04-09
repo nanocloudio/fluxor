@@ -19,7 +19,7 @@ pub const MODULE_MAGIC: u32 = 0x444D5846;
 pub const TABLE_VERSION: u8 = 1;
 
 /// Maximum modules in table
-pub const MAX_TABLE_MODULES: usize = 16;
+pub const MAX_TABLE_MODULES: usize = 32;
 
 /// Module table header (16 bytes)
 pub const TABLE_HEADER_SIZE: usize = 16;
@@ -250,6 +250,10 @@ pub fn parse_modules_from_config(
             let module_path = modules_dir.join(format!("{}.fmod", module_type));
 
             if !module_path.exists() {
+                // Check if this is a built-in module (no .fmod needed)
+                if is_builtin_module(module_type) {
+                    continue;
+                }
                 return Err(Error::Module(format!(
                     "Module '{}' (type '{}') not found at: {}\nRun 'make pack-modules' to build modules.",
                     module_name,
@@ -279,6 +283,10 @@ pub fn parse_modules_from_config(
             let module_path = modules_dir.join(format!("{}.fmod", module_type));
 
             if !module_path.exists() {
+                // Check if this is a built-in module (no .fmod needed)
+                if is_builtin_module(module_type) {
+                    continue;
+                }
                 return Err(Error::Module(format!(
                     "Module '{}' (type '{}') not found at: {}\nRun 'make pack-modules' to build modules.",
                     instance_name,
@@ -293,6 +301,26 @@ pub fn parse_modules_from_config(
     }
 
     Ok(modules)
+}
+
+/// Check if a module type is a kernel built-in (has `builtin = true` in its manifest).
+/// Built-in modules don't have .fmod files — they're compiled into the kernel binary.
+fn is_builtin_module(module_type: &str) -> bool {
+    let source_dirs: &[&str] = &[
+        "modules/drivers",
+        "modules/foundation",
+        "modules/app",
+        "modules",
+    ];
+    for dir in source_dirs {
+        let manifest_path = std::path::Path::new(dir).join(module_type).join("manifest.toml");
+        if manifest_path.exists() {
+            if let Ok(m) = manifest::Manifest::from_toml(&manifest_path) {
+                return m.builtin;
+            }
+        }
+    }
+    false
 }
 
 /// Resolve a module .fmod file by searching primary dir, then extra dirs in order.
@@ -342,6 +370,10 @@ pub fn parse_modules_from_config_multi(
             let module_path = match resolve_fmod(module_type, modules_dir, extra_dirs) {
                 Some(p) => p,
                 None => {
+                    // Check if this is a built-in module (no .fmod needed)
+                    if is_builtin_module(module_type) {
+                        continue;
+                    }
                     let searched: Vec<String> = std::iter::once(modules_dir)
                         .chain(extra_dirs.iter().copied())
                         .map(|d| d.display().to_string())
@@ -373,6 +405,10 @@ pub fn parse_modules_from_config_multi(
             let module_path = match resolve_fmod(module_type, modules_dir, extra_dirs) {
                 Some(p) => p,
                 None => {
+                    // Check if this is a built-in module (no .fmod needed)
+                    if is_builtin_module(module_type) {
+                        continue;
+                    }
                     let searched: Vec<String> = std::iter::once(modules_dir)
                         .chain(extra_dirs.iter().copied())
                         .map(|d| d.display().to_string())
@@ -422,6 +458,7 @@ struct ElfSection {
     name: String,
     #[allow(dead_code)]
     sh_type: u32,
+    addr: usize,
     data: Vec<u8>,
     size: usize,
 }
@@ -475,22 +512,24 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
         return Err(Error::Module("ELF file has no section headers".into()));
     }
 
-    // Helper: read section header fields (offset and size differ for ELF32/64)
-    let sh_offset_size = |sh_off: usize| -> (usize, usize) {
+    // Helper: read section header fields (offset, size, addr differ for ELF32/64)
+    let sh_offset_size_addr = |sh_off: usize| -> (usize, usize, usize) {
         if elf64 {
+            let addr = u64::from_le_bytes(data[sh_off+16..sh_off+24].try_into().unwrap()) as usize;
             let off = u64::from_le_bytes(data[sh_off+24..sh_off+32].try_into().unwrap()) as usize;
             let sz = u64::from_le_bytes(data[sh_off+32..sh_off+40].try_into().unwrap()) as usize;
-            (off, sz)
+            (off, sz, addr)
         } else {
+            let addr = u32::from_le_bytes([data[sh_off+12], data[sh_off+13], data[sh_off+14], data[sh_off+15]]) as usize;
             let off = u32::from_le_bytes([data[sh_off+16], data[sh_off+17], data[sh_off+18], data[sh_off+19]]) as usize;
             let sz = u32::from_le_bytes([data[sh_off+20], data[sh_off+21], data[sh_off+22], data[sh_off+23]]) as usize;
-            (off, sz)
+            (off, sz, addr)
         }
     };
 
     // First pass: find section header string table
     let shstrtab_hdr_off = e_shoff + e_shstrndx * e_shentsize;
-    let (shstrtab_off, shstrtab_size) = sh_offset_size(shstrtab_hdr_off);
+    let (shstrtab_off, shstrtab_size, _) = sh_offset_size_addr(shstrtab_hdr_off);
     let shstrtab = &data[shstrtab_off..shstrtab_off + shstrtab_size];
 
     // Second pass: read all sections
@@ -504,7 +543,7 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
                                               data[sh_off + 2], data[sh_off + 3]]) as usize;
         let sh_type = u32::from_le_bytes([data[sh_off + 4], data[sh_off + 5],
                                           data[sh_off + 6], data[sh_off + 7]]);
-        let (sh_offset, sh_size) = sh_offset_size(sh_off);
+        let (sh_offset, sh_size, sh_addr) = sh_offset_size_addr(sh_off);
 
         // Get section name
         let name_end = shstrtab[sh_name_idx..].iter().position(|&b| b == 0).unwrap_or(0);
@@ -529,6 +568,7 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
         sections.push(ElfSection {
             name,
             sh_type,
+            addr: sh_addr,
             data: section_data,
             size: sh_size,
         });
@@ -602,8 +642,12 @@ pub fn pack_fmod(
     let (sections, symbols) = parse_elf(&elf_data)?;
 
     // Extract section data
-    let text_data = find_section(&sections, ".text").map(|s| &s.data[..]).unwrap_or(&[]);
-    let rodata_data = find_section(&sections, ".rodata").map(|s| &s.data[..]).unwrap_or(&[]);
+    let text_section = find_section(&sections, ".text");
+    let rodata_section = find_section(&sections, ".rodata");
+    let text_data = text_section.map(|s| &s.data[..]).unwrap_or(&[]);
+    let rodata_data = rodata_section.map(|s| &s.data[..]).unwrap_or(&[]);
+    let text_addr = text_section.map(|s| s.addr).unwrap_or(0);
+    let rodata_addr = rodata_section.map(|s| s.addr).unwrap_or(0);
     let data_data = find_section(&sections, ".data").map(|s| &s.data[..]).unwrap_or(&[]);
     let bss_size = find_section(&sections, ".bss").map(|s| s.size).unwrap_or(0);
 
@@ -643,10 +687,22 @@ pub fn pack_fmod(
         })
         .unwrap_or(&[]);
 
-    // Combine code sections (text + rodata)
-    let mut code_data = Vec::with_capacity(text_data.len() + rodata_data.len());
-    code_data.extend_from_slice(text_data);
-    code_data.extend_from_slice(rodata_data);
+    // Combine code sections (text + rodata), preserving ELF layout.
+    // ADRP on aarch64 uses PC-relative page addressing — the relative offset between
+    // .text and .rodata must match the linker's placement exactly.
+    let code_data = if !rodata_data.is_empty() && rodata_addr > text_addr {
+        let gap = rodata_addr - text_addr;
+        let mut v = Vec::with_capacity(gap + rodata_data.len());
+        v.extend_from_slice(text_data);
+        v.resize(gap, 0); // pad to preserve rodata offset
+        v.extend_from_slice(rodata_data);
+        v
+    } else {
+        let mut v = Vec::with_capacity(text_data.len() + rodata_data.len());
+        v.extend_from_slice(text_data);
+        v.extend_from_slice(rodata_data);
+        v
+    };
 
     let code_size = code_data.len();
     let data_size = data_data.len();
@@ -775,11 +831,8 @@ pub fn pack_fmod(
         }
     };
 
-    // Compute integrity hash over code + data sections
-    let mut combined_code = Vec::with_capacity(text_data.len() + rodata_data.len());
-    combined_code.extend_from_slice(text_data);
-    combined_code.extend_from_slice(rodata_data);
-    module_manifest.integrity_hash = Some(manifest::compute_integrity(&combined_code, data_data));
+    // Compute integrity hash over code + data sections (use code_data which preserves layout)
+    module_manifest.integrity_hash = Some(manifest::compute_integrity(&code_data, data_data));
 
     let manifest_bytes = module_manifest.to_bytes();
 

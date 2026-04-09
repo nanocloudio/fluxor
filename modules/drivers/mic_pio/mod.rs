@@ -307,7 +307,7 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
 
     // Check output channel ready
     let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-    if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 {
+    if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
         return 0;
     }
 

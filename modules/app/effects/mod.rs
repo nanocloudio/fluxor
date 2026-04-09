@@ -714,7 +714,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Read voice navigation commands (FMP messages)
         if s.nav_chan >= 0 && s.voice_count > 1 {
             let nav_poll = (sys.channel_poll)(s.nav_chan, POLL_IN);
-            if nav_poll > 0 && ((nav_poll as u8) & POLL_IN) != 0 {
+            if nav_poll > 0 && ((nav_poll as u32) & POLL_IN) != 0 {
                 let (ty, _len) = msg_read(sys, s.nav_chan, s.nav_buf.as_mut_ptr(), 16);
                 if ty != 0 {
                     let vc = s.voice_count;
@@ -752,7 +752,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if ctrl_chan >= 0 {
             loop {
                 let ctrl_poll = (sys.channel_poll)(ctrl_chan, POLL_IN);
-                if ctrl_poll <= 0 || ((ctrl_poll as u8) & POLL_IN) == 0 { break; }
+                if ctrl_poll <= 0 || ((ctrl_poll as u32) & POLL_IN) == 0 { break; }
 
                 let mut hdr: [u8; 1] = [0];
                 let r = (sys.channel_read)(ctrl_chan, hdr.as_mut_ptr(), 1);
@@ -809,7 +809,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 // FIFO fallback: check output space and input availability
                 let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-                if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 { break; }
+                if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 { break; }
 
                 let in_poll = (sys.channel_poll)(in_chan, POLL_IN | POLL_HUP);
                 if in_poll & POLL_HUP as i32 != 0 { return 1; }

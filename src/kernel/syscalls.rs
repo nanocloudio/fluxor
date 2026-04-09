@@ -32,7 +32,6 @@ use crate::kernel::channel;
 use crate::kernel::errno;
 use crate::kernel::hal;
 use crate::kernel::net;
-use crate::kernel::socket;
 use crate::abi::{SyscallTable, ABI_VERSION};
 // ============================================================================
 // Error Codes (Linux errno values)
@@ -165,7 +164,6 @@ pub fn init_providers() {
     provider::register(dev_class::CHANNEL, channel_provider_dispatch);
     provider::register(dev_class::TIMER, timer_provider_dispatch);
     provider::register(dev_class::NETIF, netif_provider_dispatch);
-    provider::register(dev_class::SOCKET, socket_provider_dispatch);
     provider::register(dev_class::EVENT, event_provider_dispatch);
     provider::register(dev_class::SYSTEM, system_provider_dispatch);
     provider::register(dev_class::FS, fs_provider_dispatch);
@@ -246,7 +244,6 @@ unsafe extern "C" fn syscall_dev_call(
         return E_NOSYS;
     }
 
-    // Debug: track socket ops going to provider chain
     // Dispatch to registered provider (or next in chain if CHAIN_NEXT set)
     let result = if chain_next {
         let caller = crate::kernel::scheduler::current_module_index() as u8;
@@ -280,7 +277,7 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
         }
         dev_channel::POLL => {
             if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            channel::syscall_channel_poll(handle, *arg)
+            channel::syscall_channel_poll(handle, *arg as u32)
         }
         dev_channel::PORT => {
             if arg.is_null() || arg_len < 2 { return E_INVAL; }
@@ -364,12 +361,6 @@ unsafe fn netif_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             let channel = i32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             net::NetIfService::register_frame_provider(if_type, channel)
         }
-        dev_netif::REGISTER_SOCKET => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
-            let if_type = *arg;
-            let channel = i32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            net::NetIfService::register_socket_provider(if_type, channel)
-        }
         dev_netif::IOCTL => {
             if arg.is_null() || arg_len < 4 { return E_INVAL; }
             let cmd = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
@@ -378,149 +369,6 @@ unsafe fn netif_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
         }
         dev_netif::STATE => net::NetIfService::state(handle),
         dev_netif::CLOSE => net::NetIfService::close(handle),
-        _ => E_NOSYS,
-    }
-}
-
-unsafe fn socket_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::{dev_socket, SocketServiceInfo, ChannelAddr};
-    use crate::kernel::fd;
-    let slot_handle = fd::slot_of(handle);
-    match opcode {
-        // --- User-facing socket ops ---
-        dev_socket::OPEN => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            fd::tag_fd(fd::FD_TAG_SOCKET, socket::SocketService::open(*arg))
-        }
-        dev_socket::CONNECT => {
-            if arg.is_null() || arg_len < core::mem::size_of::<ChannelAddr>() { return E_INVAL; }
-            socket::SocketService::connect(slot_handle, &*(arg as *const ChannelAddr))
-        }
-        dev_socket::SEND => {
-            if arg.is_null() || arg_len == 0 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot(slot_handle) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            let input = core::slice::from_raw_parts(arg as *const u8, arg_len);
-            let written = slot.tx_write(input);
-            if written == 0 { socket::SOCK_EAGAIN } else { written as i32 }
-        }
-        dev_socket::RECV => {
-            if arg.is_null() || arg_len == 0 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot(slot_handle) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            let output = core::slice::from_raw_parts_mut(arg, arg_len);
-            let read = slot.rx_read(output);
-            if read == 0 { socket::SOCK_EAGAIN } else { read as i32 }
-        }
-        dev_socket::POLL => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            socket::SocketService::poll(slot_handle, *arg)
-        }
-        dev_socket::CLOSE => socket::SocketService::close(slot_handle),
-        dev_socket::BIND => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
-            let port = u16::from_le_bytes([*arg, *arg.add(1)]);
-            socket::SocketService::bind(slot_handle, port)
-        }
-        dev_socket::LISTEN => {
-            let backlog = if arg.is_null() || arg_len < 4 { 1 } else {
-                i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)])
-            };
-            socket::SocketService::listen(slot_handle, backlog)
-        }
-        dev_socket::ACCEPT => socket::SocketService::accept(slot_handle),
-        // --- Service ops (used by IP module) ---
-        dev_socket::SERVICE_COUNT => socket::MAX_SOCKETS as i32,
-        dev_socket::SERVICE_INFO => {
-            if arg.is_null() || arg_len < core::mem::size_of::<SocketServiceInfo>() { return E_INVAL; }
-            if handle < 0 || handle >= socket::MAX_SOCKETS as i32 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot_by_index(handle as usize) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            let info = &mut *(arg as *mut SocketServiceInfo);
-            if slot.is_free() {
-                info.socket_type = 0;
-                info.state = 0;
-                info.pending_op = 0;
-            } else {
-                info.socket_type = slot.socket_type();
-                info.state = slot.state() as u8;
-                info.pending_op = slot.pending_op() as u8;
-                info.local_id = slot.local_id();
-                info.remote_id = slot.remote_id();
-                info.remote_endpoint = slot.remote_endpoint();
-                info.tx_pending = slot.tx_pending() as u16;
-                info.rx_available = slot.rx_available() as u16;
-                info.rx_space = slot.rx_space() as u16;
-            }
-            info._pad = 0;
-            0
-        }
-        dev_socket::SERVICE_TX_READ => {
-            if arg.is_null() || arg_len == 0 { return E_INVAL; }
-            if handle < 0 || handle >= socket::MAX_SOCKETS as i32 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot_by_index(handle as usize) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-            slot.tx_read(buf) as i32
-        }
-        dev_socket::SERVICE_RX_WRITE => {
-            if arg.is_null() || arg_len == 0 { return E_INVAL; }
-            if handle < 0 || handle >= socket::MAX_SOCKETS as i32 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot_by_index(handle as usize) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            let data = core::slice::from_raw_parts(arg as *const u8, arg_len);
-            slot.rx_write(data) as i32
-        }
-        dev_socket::SERVICE_COMPLETE_OP => {
-            // arg[0..4]=result(i32 LE), arg[4]=state, arg[5]=poll_flags (optional)
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
-            if handle < 0 || handle >= socket::MAX_SOCKETS as i32 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot_by_index(handle as usize) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            let result = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            slot.complete_op(result);
-            let new_state = *arg.add(4);
-            slot.set_state(new_state);
-            if arg_len >= 6 {
-                slot.set_poll_flags(*arg.add(5));
-            }
-            0
-        }
-        dev_socket::SERVICE_SET_STATE => {
-            // arg[0]=state, arg[1]=poll_flags (optional)
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
-            if handle < 0 || handle >= socket::MAX_SOCKETS as i32 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot_by_index(handle as usize) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            slot.set_state(*arg);
-            if arg_len >= 2 {
-                slot.set_poll_flags(*arg.add(1));
-            }
-            0
-        }
-        dev_socket::SERVICE_RESET => {
-            if handle < 0 || handle >= socket::MAX_SOCKETS as i32 { return E_INVAL; }
-            let slot = match socket::SocketService::get_slot_by_index(handle as usize) {
-                Some(s) => s,
-                None => return E_INVAL,
-            };
-            slot.reset();
-            0
-        }
         _ => E_NOSYS,
     }
 }
@@ -755,7 +603,6 @@ unsafe extern "C" fn syscall_dev_query(
                 let (tag, _) = fd::untag_fd(handle);
                 let class = match tag {
                     fd::FD_TAG_CHANNEL => dev_class::CHANNEL,
-                    fd::FD_TAG_SOCKET => dev_class::SOCKET,
                     fd::FD_TAG_EVENT => dev_class::EVENT,
                     fd::FD_TAG_TIMER => dev_class::TIMER,
                     _ => return E_INVAL,
@@ -764,17 +611,7 @@ unsafe extern "C" fn syscall_dev_query(
                 0
             }
             dev_query_key::STATE => {
-                if out.is_null() || out_len < 1 { return E_INVAL; }
-                let (tag, slot) = fd::untag_fd(handle);
-                match tag {
-                    fd::FD_TAG_SOCKET => {
-                        match socket::SocketService::get_slot(slot) {
-                            Some(s) => { *out = s.state(); 0 }
-                            None => E_INVAL,
-                        }
-                    }
-                    _ => E_NOSYS,
-                }
+                E_NOSYS
             }
             dev_query_key::HEAP_STATS => {
                 // Return heap stats for the calling module
@@ -928,7 +765,7 @@ pub fn release_module_handles(module_idx: u8) {
 
 unsafe extern "C" fn stub_channel_read(_handle: i32, _buf: *mut u8, _len: usize) -> i32 { E_NOSYS }
 unsafe extern "C" fn stub_channel_write(_handle: i32, _data: *const u8, _len: usize) -> i32 { E_NOSYS }
-unsafe extern "C" fn stub_channel_poll(_handle: i32, _events: u8) -> i32 { E_NOSYS }
+unsafe extern "C" fn stub_channel_poll(_handle: i32, _events: u32) -> i32 { E_NOSYS }
 unsafe extern "C" fn stub_dev_call(_handle: i32, _opcode: u32, _arg: *mut u8, _arg_len: usize) -> i32 { E_NOSYS }
 unsafe extern "C" fn stub_dev_query(_handle: i32, _key: u32, _out: *mut u8, _out_len: usize) -> i32 { E_NOSYS }
 unsafe extern "C" fn stub_heap_alloc(_size: u32) -> *mut u8 { null_mut() }

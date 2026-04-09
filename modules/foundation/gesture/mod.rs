@@ -130,7 +130,7 @@ mod params_def {
 unsafe fn emit_mapped(sys: &SyscallTable, out_chan: i32, msg_type: u32) {
     if msg_type != 0 && out_chan >= 0 {
         let poll = (sys.channel_poll)(out_chan, POLL_OUT);
-        if poll > 0 && ((poll as u8) & POLL_OUT) != 0 {
+        if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
             msg_write_empty(sys, out_chan, msg_type);
         }
     }
@@ -221,7 +221,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Read raw byte transitions from input
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll > 0 && (poll as u8 & POLL_IN) != 0 {
+        if poll > 0 && (poll as u32 & POLL_IN) != 0 {
             let mut byte = [0u8; 1];
             let n = (sys.channel_read)(s.in_chan, byte.as_mut_ptr(), 1);
             if n == 1 {

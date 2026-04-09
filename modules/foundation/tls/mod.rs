@@ -1,8 +1,8 @@
 //! TLS 1.3 PIC Module for Fluxor
 //!
 //! Pure Rust implementation — no C, no GOT, no data relocations.
-//! Registers as socket provider (class 0x08) via provider chain.
-//! Supports server and client mode, mTLS, SPIFFE validation.
+//! Channel-based graph node sitting between IP and HTTP:
+//!   IP <--cipher_in/cipher_out--> TLS <--clear_in/clear_out--> HTTP
 //!
 //! Cipher suites: TLS_CHACHA20_POLY1305_SHA256 (preferred),
 //!                TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384
@@ -42,20 +42,24 @@ include!("handshake.rs");
 const MAX_SESSIONS: usize = 2;
 const MAX_CERT_LEN: usize = 512;
 const MAX_KEY_LEN: usize = 160;
-const RECV_BUF_SIZE: usize = 1536;
+const RECV_BUF_SIZE: usize = 2048;
 const SEND_BUF_SIZE: usize = 1536;
 const SCRATCH_SIZE: usize = 1024;
+const NET_SCRATCH_SIZE: usize = 1600;
 
-// Socket opcodes (class 0x08)
-const SOCKET_OPEN: u32 = 0x0800;
-const SOCKET_CONNECT: u32 = 0x0801;
-const SOCKET_SEND: u32 = 0x0802;
-const SOCKET_RECV: u32 = 0x0803;
-const SOCKET_POLL: u32 = 0x0804;
-const SOCKET_CLOSE: u32 = 0x0805;
-const SOCKET_BIND: u32 = 0x0806;
-const SOCKET_LISTEN: u32 = 0x0807;
-const SOCKET_ACCEPT: u32 = 0x0808;
+// Net protocol message types (downstream: IP -> TLS -> HTTP)
+const NET_MSG_ACCEPTED: u8 = 0x01;
+const NET_MSG_DATA: u8 = 0x02;
+const NET_MSG_CLOSED: u8 = 0x03;
+const NET_MSG_BOUND: u8 = 0x04;
+const NET_MSG_CONNECTED: u8 = 0x05;
+const NET_MSG_ERROR: u8 = 0x06;
+
+// Net protocol command types (upstream: HTTP -> TLS -> IP)
+const NET_CMD_BIND: u8 = 0x10;
+const NET_CMD_SEND: u8 = 0x11;
+const NET_CMD_CLOSE: u8 = 0x12;
+const NET_CMD_CONNECT: u8 = 0x13;
 
 // ============================================================================
 // Session state
@@ -76,7 +80,8 @@ enum SessionState {
 
 struct TlsSession {
     state: SessionState,
-    raw_handle: i32,          // underlying socket handle
+    conn_id: u8,              // net_proto connection ID
+    held_msg_type: u8,        // held ACCEPTED/CONNECTED msg type to forward after handshake
     is_server: bool,
     hrr_sent: bool,           // HelloRetryRequest was sent, expecting 2nd ClientHello
     hs_state: HandshakeState,
@@ -135,7 +140,8 @@ impl TlsSession {
     const fn empty() -> Self {
         Self {
             state: SessionState::Idle,
-            raw_handle: -1,
+            conn_id: 0,
+            held_msg_type: 0,
             is_server: false,
             hrr_sent: false,
             hs_state: HandshakeState::RecvClientHello,
@@ -183,7 +189,8 @@ impl TlsSession {
             }
         }
         self.state = SessionState::Idle;
-        self.raw_handle = -1;
+        self.conn_id = 0;
+        self.held_msg_type = 0;
         self.hrr_sent = false;
         self.recv_len = 0;
         self.recv_expected = 0;
@@ -208,7 +215,12 @@ struct TlsState {
     syscalls: *const SyscallTable,
     mode: u8,           // 0=client, 1=server
     verify_peer: u8,
-    registered: bool,
+
+    // Channel ports (4-port node: cipher side facing IP, clear side facing HTTP)
+    cipher_in: i32,     // from IP: ciphertext net_proto frames
+    cipher_out: i32,    // to IP: ciphertext net_proto frames
+    clear_in: i32,      // from HTTP: cleartext net_proto frames (commands)
+    clear_out: i32,     // to HTTP: cleartext net_proto frames (events)
 
     // Pre-computed ephemeral ECDH key pairs (one per session, computed in module_new)
     eph_private: [[u8; 32]; MAX_SESSIONS],
@@ -227,6 +239,9 @@ struct TlsState {
 
     // Sessions
     sessions: [TlsSession; MAX_SESSIONS],
+
+    // Scratch buffer for net_proto frame assembly
+    net_scratch: [u8; NET_SCRATCH_SIZE],
 }
 
 // ============================================================================
@@ -260,10 +275,6 @@ pub extern "C" fn module_arena_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn module_init(_syscalls: *const core::ffi::c_void) {}
 
-/// Exported for pack tool: sets deferred_ready flag bit 2
-#[no_mangle]
-pub extern "C" fn module_deferred_ready() {}
-
 #[no_mangle]
 pub unsafe extern "C" fn module_new(
     _in_chan: i32,
@@ -277,10 +288,19 @@ pub unsafe extern "C" fn module_new(
 ) -> i32 {
     let s = &mut *(state as *mut TlsState);
     s.syscalls = syscalls;
-    s.registered = false;
     s.cert_len = 0;
     s.key_len = 0;
     s.trust_domain_len = 0;
+
+    let sys = &*s.syscalls;
+
+    // Discover 4 channel ports
+    // in[0] = cipher_in (from IP), in[1] = clear_in (from HTTP)
+    // out[0] = cipher_out (to IP), out[1] = clear_out (to HTTP)
+    s.cipher_in = dev_channel_port(sys, 0, 0);
+    s.clear_in = dev_channel_port(sys, 0, 1);
+    s.cipher_out = dev_channel_port(sys, 1, 0);
+    s.clear_out = dev_channel_port(sys, 1, 1);
 
     // Initialize sessions
     let mut i = 0;
@@ -303,7 +323,6 @@ pub unsafe extern "C" fn module_new(
 
     // Pre-compute ephemeral ECDH key pairs (one per session) during module_new.
     // This runs on the full kernel stack, avoiding PIC stack overflow.
-    let sys = &*s.syscalls;
     {
         let mut i = 0;
         while i < MAX_SESSIONS {
@@ -319,18 +338,6 @@ pub unsafe extern "C" fn module_new(
             while j < 32 { core::ptr::write_volatile(&mut random[j], 0); j += 1; }
             i += 1;
         }
-    }
-
-    // Register as socket provider immediately during module_new.
-    let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-    let mut buf = [0u8; 8];
-    buf[0] = 0x08; // SOCKET class
-    let fn_bytes = dispatch_hash.to_le_bytes();
-    buf[4] = fn_bytes[0]; buf[5] = fn_bytes[1];
-    buf[6] = fn_bytes[2]; buf[7] = fn_bytes[3];
-    let rc = (sys.dev_call)(-1, 0x0C20, buf.as_mut_ptr(), 8);
-    if rc >= 0 {
-        s.registered = true;
     }
 
     0
@@ -384,58 +391,240 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
 pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = &mut *(state as *mut TlsState);
     let sys = &*s.syscalls;
-
-    if !s.registered {
-        return -1;
-    }
-
-    // Drive all active sessions
     let mut did_work = false;
+
+    // ── Phase 1: Drive active handshake sessions ──
     let mut i = 0;
     while i < MAX_SESSIONS {
         if s.sessions[i].state == SessionState::Handshaking {
             if pump_session(s, i) {
                 did_work = true;
             }
-        } else if s.sessions[i].state == SessionState::AcceptPending {
-            // Check if raw accept completed — use FD_POLL (SYSTEM 0x0C41) to bypass provider chain
-            let raw_h = s.sessions[i].raw_handle;
-            let poll = dev_fd_poll(sys, raw_h, POLL_CONN);
-            if poll > 0 && (poll as u8 & POLL_CONN) != 0 {
-                // Accept completed — start TLS handshake
-                dev_log(sys, 3, b"[tls] accept done, handshake".as_ptr(), 27);
-                s.sessions[i].state = SessionState::Handshaking;
-                s.sessions[i].is_server = true;
-                s.sessions[i].hs_state = HandshakeState::RecvClientHello;
-                init_session_crypto(s, i);
-                did_work = true;
-            }
-        } else if s.sessions[i].state == SessionState::Connecting {
-            // Check if raw connect completed — use FD_POLL
-            let raw_h = s.sessions[i].raw_handle;
-            let poll = dev_fd_poll(sys, raw_h, POLL_CONN);
-            if poll > 0 && (poll as u8 & POLL_CONN) != 0 {
-                s.sessions[i].state = SessionState::Handshaking;
-                s.sessions[i].is_server = false;
-                s.sessions[i].hs_state = HandshakeState::SendClientHello;
-                init_session_crypto(s, i);
-                did_work = true;
-            }
-        } else if s.sessions[i].state == SessionState::Ready {
-            if s.sessions[i].send_offset < s.sessions[i].send_len {
-                drain_send_buffer(s, i);
-                did_work = true;
-            }
         } else if s.sessions[i].state == SessionState::Closed {
-            // Closed gracefully — free slot for reuse
             s.sessions[i].reset();
         } else if s.sessions[i].state == SessionState::Error {
-            // Error — close raw socket and free slot
-            let raw_h = s.sessions[i].raw_handle;
-            if raw_h >= 0 {
-                (sys.dev_call)(raw_h, CHAIN_NEXT | SOCKET_CLOSE, core::ptr::null_mut(), 0);
-            }
+            // Send CMD_CLOSE upstream for this conn_id, then forward MSG_CLOSED downstream
+            let cid = s.sessions[i].conn_id;
+            tls_write_frame(sys, s.cipher_out, NET_CMD_CLOSE, cid, core::ptr::null(), 0, &mut s.net_scratch);
+            tls_write_frame(sys, s.clear_out, NET_MSG_CLOSED, cid, core::ptr::null(), 0, &mut s.net_scratch);
             s.sessions[i].reset();
+        }
+        i += 1;
+    }
+
+    // ── Phase 2: Read from cipher_in (downstream: IP → TLS) ──
+    let poll_ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
+    if poll_ci > 0 && (poll_ci as u32 & POLL_IN) != 0 {
+        let (msg_type, payload_len) = tls_read_header(sys, s.cipher_in);
+        if msg_type != 0 {
+            did_work = true;
+            match msg_type {
+                t if t == NET_MSG_ACCEPTED as u8 || t == NET_MSG_CONNECTED as u8 => {
+                    // Read conn_id from payload
+                    let mut payload = [0u8; 256];
+                    let pl = payload_len as usize;
+                    if pl > 0 {
+                        let rd = if pl < 256 { pl } else { 256 };
+                        (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
+                        // Discard excess
+                        if pl > 256 { tls_discard(sys, s.cipher_in, pl - 256); }
+                    }
+                    let conn_id = if pl > 0 { payload[0] } else { 0 };
+                    // Allocate session for this connection
+                    match alloc_session_for_conn(s, conn_id) {
+                        Some(idx) => {
+                            s.sessions[idx].is_server = (t == NET_MSG_ACCEPTED as u8);
+                            s.sessions[idx].held_msg_type = t;
+                            s.sessions[idx].state = SessionState::Handshaking;
+                            if s.sessions[idx].is_server {
+                                s.sessions[idx].hs_state = HandshakeState::RecvClientHello;
+                            } else {
+                                s.sessions[idx].hs_state = HandshakeState::SendClientHello;
+                            }
+                            init_session_crypto(s, idx);
+                        }
+                        None => {
+                            // No session slots — forward close
+                            tls_write_frame(sys, s.cipher_out, NET_CMD_CLOSE, conn_id, core::ptr::null(), 0, &mut s.net_scratch);
+                        }
+                    }
+                }
+                t if t == NET_MSG_DATA as u8 => {
+                    // Read conn_id + ciphertext payload
+                    let pl = payload_len as usize;
+                    if pl < 1 {
+                        // Malformed — skip
+                    } else {
+                        let mut conn_id_buf = [0u8; 1];
+                        (sys.channel_read)(s.cipher_in, conn_id_buf.as_mut_ptr(), 1);
+                        let conn_id = conn_id_buf[0];
+                        let data_len = pl - 1;
+                        let si = find_session_by_conn_id(s, conn_id);
+                        if si >= 0 {
+                            let idx = si as usize;
+                            if s.sessions[idx].state == SessionState::Handshaking {
+                                // Feed ciphertext into handshake recv_buf
+                                let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
+                                let to_read = if data_len < space { data_len } else { space };
+                                if to_read > 0 {
+                                    (sys.channel_read)(s.cipher_in,
+                                        s.sessions[idx].recv_buf.as_mut_ptr().add(s.sessions[idx].recv_len),
+                                        to_read);
+                                    s.sessions[idx].recv_len += to_read;
+                                }
+                                if data_len > to_read {
+                                    tls_discard(sys, s.cipher_in, data_len - to_read);
+                                }
+                            } else if s.sessions[idx].state == SessionState::Ready {
+                                // Feed ciphertext into recv_buf for decryption
+                                let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
+                                let to_read = if data_len < space { data_len } else { space };
+                                if to_read > 0 {
+                                    (sys.channel_read)(s.cipher_in,
+                                        s.sessions[idx].recv_buf.as_mut_ptr().add(s.sessions[idx].recv_len),
+                                        to_read);
+                                    s.sessions[idx].recv_len += to_read;
+                                }
+                                if data_len > to_read {
+                                    tls_discard(sys, s.cipher_in, data_len - to_read);
+                                }
+                                // Try to decrypt and forward
+                                try_decrypt_forward(s, idx);
+                            } else {
+                                tls_discard(sys, s.cipher_in, data_len);
+                            }
+                        } else {
+                            tls_discard(sys, s.cipher_in, data_len);
+                        }
+                    }
+                }
+                t if t == NET_MSG_CLOSED as u8 => {
+                    // Read conn_id and forward to clear_out
+                    let pl = payload_len as usize;
+                    let mut payload = [0u8; 16];
+                    let rd = if pl < 16 { pl } else { 16 };
+                    if rd > 0 { (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd); }
+                    if pl > 16 { tls_discard(sys, s.cipher_in, pl - 16); }
+                    let conn_id = if pl > 0 { payload[0] } else { 0 };
+                    // Clean up session
+                    let si = find_session_by_conn_id(s, conn_id);
+                    if si >= 0 { s.sessions[si as usize].reset(); }
+                    // Forward to HTTP
+                    tls_write_frame(sys, s.clear_out, NET_MSG_CLOSED, conn_id, core::ptr::null(), 0, &mut s.net_scratch);
+                }
+                t if t == NET_MSG_BOUND as u8 || t == NET_MSG_ERROR as u8 => {
+                    // Pass through unchanged to clear_out
+                    let pl = payload_len as usize;
+                    let rd = if pl < NET_SCRATCH_SIZE { pl } else { NET_SCRATCH_SIZE };
+                    if rd > 0 { (sys.channel_read)(s.cipher_in, s.net_scratch.as_mut_ptr(), rd); }
+                    if pl > rd { tls_discard(sys, s.cipher_in, pl - rd); }
+                    // Write frame header + payload to clear_out
+                    tls_write_raw_frame(sys, s.clear_out, t, s.net_scratch.as_ptr(), rd as u16);
+                }
+                _ => {
+                    // Unknown — discard
+                    tls_discard(sys, s.cipher_in, payload_len as usize);
+                }
+            }
+        }
+    }
+
+    // ── Phase 3: Read from clear_in (upstream: HTTP → TLS) ──
+    let poll_cl = (sys.channel_poll)(s.clear_in, POLL_IN);
+    if poll_cl > 0 && (poll_cl as u32 & POLL_IN) != 0 {
+        let (msg_type, payload_len) = tls_read_header(sys, s.clear_in);
+        if msg_type != 0 {
+            did_work = true;
+            match msg_type {
+                t if t == NET_CMD_SEND as u8 => {
+                    // Encrypt and forward as CMD_SEND on cipher_out
+                    let pl = payload_len as usize;
+                    if pl < 1 {
+                        // Malformed
+                    } else {
+                        let mut conn_id_buf = [0u8; 1];
+                        (sys.channel_read)(s.clear_in, conn_id_buf.as_mut_ptr(), 1);
+                        let conn_id = conn_id_buf[0];
+                        let data_len = pl - 1;
+                        let si = find_session_by_conn_id(s, conn_id);
+                        if si >= 0 {
+                            let idx = si as usize;
+                            if s.sessions[idx].state == SessionState::Ready && data_len > 0 {
+                                // Read plaintext
+                                let rd = if data_len < SEND_BUF_SIZE { data_len } else { SEND_BUF_SIZE };
+                                let sess = &mut s.sessions[idx];
+                                (sys.channel_read)(s.clear_in, sess.send_buf.as_mut_ptr(), rd);
+                                if data_len > rd { tls_discard(sys, s.clear_in, data_len - rd); }
+
+                                // Encrypt as TLS application_data record
+                                let mut enc_buf = [0u8; SEND_BUF_SIZE];
+                                let enc_len = encrypt_record(
+                                    sess.suite,
+                                    &mut sess.write_keys,
+                                    CT_APPLICATION_DATA,
+                                    &sess.send_buf[..rd],
+                                    &mut enc_buf,
+                                );
+
+                                // Build TLS record: 5-byte header + ciphertext
+                                let mut rec = [0u8; SEND_BUF_SIZE + 5];
+                                *rec.as_mut_ptr() = CT_APPLICATION_DATA;
+                                *rec.as_mut_ptr().add(1) = 0x03;
+                                *rec.as_mut_ptr().add(2) = 0x03;
+                                *rec.as_mut_ptr().add(3) = (enc_len >> 8) as u8;
+                                *rec.as_mut_ptr().add(4) = enc_len as u8;
+                                core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), rec.as_mut_ptr().add(5), enc_len);
+                                let total = 5 + enc_len;
+
+                                // Write CMD_SEND(conn_id, tls_record) to cipher_out
+                                tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
+                            } else {
+                                tls_discard(sys, s.clear_in, data_len);
+                            }
+                        } else {
+                            tls_discard(sys, s.clear_in, data_len);
+                        }
+                    }
+                }
+                t if t == NET_CMD_CLOSE as u8 => {
+                    let pl = payload_len as usize;
+                    let mut payload = [0u8; 16];
+                    let rd = if pl < 16 { pl } else { 16 };
+                    if rd > 0 { (sys.channel_read)(s.clear_in, payload.as_mut_ptr(), rd); }
+                    if pl > 16 { tls_discard(sys, s.clear_in, pl - 16); }
+                    let conn_id = if pl > 0 { payload[0] } else { 0 };
+                    // Send close_notify alert if session is ready
+                    let si = find_session_by_conn_id(s, conn_id);
+                    if si >= 0 {
+                        let idx = si as usize;
+                        if s.sessions[idx].state == SessionState::Ready {
+                            send_alert(s, idx, ALERT_CLOSE_NOTIFY);
+                        }
+                        s.sessions[idx].reset();
+                    }
+                    // Forward CMD_CLOSE to cipher_out
+                    tls_write_frame(sys, s.cipher_out, NET_CMD_CLOSE, conn_id, core::ptr::null(), 0, &mut s.net_scratch);
+                }
+                t if t == NET_CMD_BIND as u8 || t == NET_CMD_CONNECT as u8 => {
+                    // Pass through unchanged to cipher_out
+                    let pl = payload_len as usize;
+                    let rd = if pl < NET_SCRATCH_SIZE { pl } else { NET_SCRATCH_SIZE };
+                    if rd > 0 { (sys.channel_read)(s.clear_in, s.net_scratch.as_mut_ptr(), rd); }
+                    if pl > rd { tls_discard(sys, s.clear_in, pl - rd); }
+                    tls_write_raw_frame(sys, s.cipher_out, t, s.net_scratch.as_ptr(), rd as u16);
+                }
+                _ => {
+                    tls_discard(sys, s.clear_in, payload_len as usize);
+                }
+            }
+        }
+    }
+
+    // ── Phase 4: For Ready sessions, try to decrypt any buffered data ──
+    i = 0;
+    while i < MAX_SESSIONS {
+        if s.sessions[i].state == SessionState::Ready && s.sessions[i].recv_len >= 5 {
+            try_decrypt_forward(s, i);
         }
         i += 1;
     }
@@ -444,239 +633,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // ============================================================================
-// Provider dispatch — called by kernel when any module does dev_call(SOCKET, ...)
-// ============================================================================
-
-#[no_mangle]
-pub unsafe extern "C" fn module_provider_dispatch(
-    state: *mut u8,
-    handle: i32,
-    opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
-    let s = &mut *(state as *mut TlsState);
-    let sys = &*s.syscalls;
-    match opcode {
-        SOCKET_OPEN => {
-            // Forward to raw socket, then wrap in TLS session
-            let rc = (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_OPEN, arg, arg_len);
-            if rc < 0 { return rc; }
-            let raw_handle = rc;
-            // Allocate TLS session
-            match alloc_session(s, raw_handle) {
-                Some(idx) => raw_handle, // Return the raw handle (TLS wraps it transparently)
-                None => {
-                    (sys.dev_call)(raw_handle, CHAIN_NEXT | SOCKET_CLOSE, core::ptr::null_mut(), 0);
-                    -12 // ENOMEM
-                }
-            }
-        }
-
-        SOCKET_CONNECT => {
-            // Forward connect, then start client handshake
-            let session_idx = find_session(s);
-            if session_idx < 0 {
-                return (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_CONNECT, arg, arg_len);
-            }
-            let idx = session_idx as usize;
-            let rc = (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_CONNECT, arg, arg_len);
-            if rc == E_INPROGRESS || rc >= 0 {
-                s.sessions[idx].state = SessionState::Connecting;
-            }
-            rc
-        }
-
-        SOCKET_SEND => {
-            let si = find_session(s);
-            if si < 0 {
-                return (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_SEND, arg, arg_len);
-            }
-            let idx = si as usize;
-            if s.sessions[idx].state != SessionState::Ready {
-                return E_AGAIN;
-            }
-
-            // Encrypt and send
-            let plaintext = core::slice::from_raw_parts(arg, arg_len);
-            let mut enc_buf = [0u8; SEND_BUF_SIZE];
-
-            // Build encrypted record
-            let enc_len = encrypt_record(
-                s.sessions[idx].suite,
-                &mut s.sessions[idx].write_keys,
-                CT_APPLICATION_DATA,
-                plaintext,
-                &mut enc_buf,
-            );
-
-            // Build record header
-            let mut hdr = [0u8; 5];
-            hdr[0] = CT_APPLICATION_DATA;
-            hdr[1] = 0x03; hdr[2] = 0x03;
-            hdr[3] = (enc_len >> 8) as u8;
-            hdr[4] = enc_len as u8;
-
-            // Send header + encrypted data via raw socket
-            let mut full = [0u8; SEND_BUF_SIZE + 5];
-            core::ptr::copy_nonoverlapping(hdr.as_ptr(), full.as_mut_ptr(), 5);
-            core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), full.as_mut_ptr().add(5), enc_len);
-            let total = 5 + enc_len;
-
-            let sent = (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_SEND, full.as_mut_ptr(), total);
-            if sent >= 0 {
-                arg_len as i32 // Report plaintext bytes sent
-            } else {
-                sent
-            }
-        }
-
-        SOCKET_RECV => {
-            let si = find_session(s);
-            if si < 0 {
-                return (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_RECV, arg, arg_len);
-            }
-            let idx = si as usize;
-            if s.sessions[idx].state != SessionState::Ready {
-                return E_AGAIN;
-            }
-
-            let sess = &mut s.sessions[idx];
-            {
-                let space = RECV_BUF_SIZE - sess.recv_len;
-                if space > 0 {
-                    let mut raw_buf = [0u8; 512]; // smaller stack alloc
-                    let read_max = if space < 512 { space } else { 512 };
-                    let n = (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_RECV, raw_buf.as_mut_ptr(), read_max);
-                    if n > 0 {
-                        let n = n as usize;
-                        core::ptr::copy_nonoverlapping(raw_buf.as_ptr(), sess.recv_buf.as_mut_ptr().add(sess.recv_len), n);
-                        sess.recv_len += n;
-                    }
-                }
-            }
-
-            // Try to parse a complete record from recv_buf
-            if sess.recv_len < 5 { return E_AGAIN; }
-            let rec_type = sess.recv_buf[0];
-            let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
-            if sess.recv_len < 5 + rec_len { return E_AGAIN; }
-
-            if rec_type == CT_APPLICATION_DATA {
-                let mut hdr = [0u8; 5];
-                core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
-                let mut ct = [0u8; RECV_BUF_SIZE];
-                core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr().add(5), ct.as_mut_ptr(), rec_len);
-
-                let consumed = 5 + rec_len;
-                let remain = sess.recv_len - consumed;
-                if remain > 0 {
-                    core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-                }
-                sess.recv_len = remain;
-
-                match decrypt_record(sess.suite, &mut sess.read_keys, &hdr, &mut ct[..rec_len]) {
-                    Some((pt_len, inner_type)) => {
-                        if inner_type == CT_ALERT {
-                            if pt_len >= 2 && ct[1] == ALERT_CLOSE_NOTIFY {
-                                sess.state = SessionState::Closed;
-                                return 0;
-                            }
-                            sess.state = SessionState::Error;
-                            return -1;
-                        }
-                        let copy_len = if pt_len < arg_len { pt_len } else { arg_len };
-                        core::ptr::copy_nonoverlapping(ct.as_ptr(), arg, copy_len);
-                        copy_len as i32
-                    }
-                    None => {
-                        sess.state = SessionState::Error;
-                        -1
-                    }
-                }
-            } else if rec_type == CT_CHANGE_CIPHER_SPEC {
-                let consumed = 5 + rec_len;
-                let remain = sess.recv_len - consumed;
-                if remain > 0 {
-                    core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-                }
-                sess.recv_len = remain;
-                E_AGAIN
-            } else {
-                E_AGAIN
-            }
-        }
-
-        SOCKET_POLL => {
-            let si = find_session(s);
-            if si < 0 {
-                return (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_POLL, arg, arg_len);
-            }
-            let idx = si as usize;
-            match s.sessions[idx].state {
-                SessionState::Ready => {
-                    (POLL_CONN | POLL_IN | POLL_OUT) as i32
-                }
-                SessionState::Handshaking | SessionState::AcceptPending | SessionState::Connecting => {
-                    0 // Not ready yet
-                }
-                SessionState::Closed | SessionState::Error => {
-                    POLL_HUP as i32
-                }
-                _ => 0,
-            }
-        }
-
-        SOCKET_CLOSE => {
-            let session_idx = find_session(s);
-            if session_idx >= 0 {
-                let idx = session_idx as usize;
-                // Send close_notify if session is ready
-                if s.sessions[idx].state == SessionState::Ready {
-                    send_alert(s, idx, ALERT_CLOSE_NOTIFY);
-                }
-                s.sessions[idx].reset();
-            }
-            (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_CLOSE, core::ptr::null_mut(), 0)
-        }
-
-        SOCKET_BIND | SOCKET_LISTEN => {
-            // Pass through directly
-            (sys.dev_call)(handle, CHAIN_NEXT | opcode, arg, arg_len)
-        }
-
-        SOCKET_ACCEPT => {
-            // Forward accept, transition session to AcceptPending
-            let session_idx = find_session(s);
-            if session_idx < 0 {
-                // No session yet — might need to create one
-                return (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_ACCEPT, arg, arg_len);
-            }
-            let idx = session_idx as usize;
-            let rc = (sys.dev_call)(handle, CHAIN_NEXT | SOCKET_ACCEPT, arg, arg_len);
-            if rc == E_INPROGRESS || rc >= 0 {
-                s.sessions[idx].state = SessionState::AcceptPending;
-            }
-            rc
-        }
-
-        _ => {
-            // Forward anything unrecognized via CHAIN_NEXT
-            (sys.dev_call)(handle, CHAIN_NEXT | opcode, arg, arg_len)
-        }
-    }
-}
-
-// ============================================================================
 // Session management
 // ============================================================================
 
-fn alloc_session(s: &mut TlsState, raw_handle: i32) -> Option<usize> {
+fn alloc_session_for_conn(s: &mut TlsState, conn_id: u8) -> Option<usize> {
     let mut i = 0;
     while i < MAX_SESSIONS {
         if s.sessions[i].state == SessionState::Idle {
             s.sessions[i].state = SessionState::Allocated;
-            s.sessions[i].raw_handle = raw_handle;
+            s.sessions[i].conn_id = conn_id;
+            s.sessions[i].held_msg_type = 0;
             s.sessions[i].recv_len = 0;
             s.sessions[i].send_len = 0;
             s.sessions[i].send_offset = 0;
@@ -687,10 +653,10 @@ fn alloc_session(s: &mut TlsState, raw_handle: i32) -> Option<usize> {
     None
 }
 
-fn find_session(s: &TlsState) -> i32 {
+fn find_session_by_conn_id(s: &TlsState, conn_id: u8) -> i32 {
     let mut i = 0;
     while i < MAX_SESSIONS {
-        if s.sessions[i].state != SessionState::Idle {
+        if s.sessions[i].state != SessionState::Idle && s.sessions[i].conn_id == conn_id {
             return i as i32;
         }
         i += 1;
@@ -826,13 +792,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
 
-    // Read from raw socket into recv_buf
-    let space = RECV_BUF_SIZE - sess.recv_len;
-    if space == 0 { return false; }
-    let n = (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_RECV,
-                           sess.recv_buf.as_mut_ptr().add(sess.recv_len), space);
-    if n > 0 { sess.recv_len += n as usize; }
-
+    // Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
     skip_ccs(sess);
 
     // Need at least record header (5) + handshake header (4)
@@ -964,7 +924,7 @@ unsafe fn pump_send_server_hello(s: &mut TlsState, idx: usize) -> bool {
         t.update(&sess.scratch[..msg_len]);
     }
 
-    // Wrap in record and send
+    // Wrap in TLS record
     let mut rec = [0u8; SEND_BUF_SIZE];
     let mut hdr = [0u8; 5];
     build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
@@ -972,15 +932,16 @@ unsafe fn pump_send_server_hello(s: &mut TlsState, idx: usize) -> bool {
     core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
 
     let total = 5 + msg_len;
-    let sent = (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_SEND, rec.as_mut_ptr(), total);
-    if sent < 0 {
-        // Buffer send for retry
-        return false;
-    }
+    let conn_id = sess.conn_id;
+    // Send as CMD_SEND(conn_id, tls_record) on cipher_out
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
 
-    // Also send ChangeCipherSpec for middlebox compatibility
-    let ccs = [CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01];
-    (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_SEND, ccs.as_ptr() as *mut u8, 6);
+    // Send ChangeCipherSpec for middlebox compatibility — but only if not already
+    // sent after HelloRetryRequest (RFC 8446: server sends at most one CCS).
+    if !sess.hrr_sent {
+        let ccs = [CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01];
+        tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, ccs.as_ptr(), 6, &mut s.net_scratch);
+    }
 
     sess.hs_state = HandshakeState::DeriveHandshakeKeys;
     true
@@ -1016,17 +977,18 @@ unsafe fn pump_send_hello_retry(s: &mut TlsState, idx: usize) -> bool {
         t.update(&sess.scratch[..msg_len]);
     }
 
-    // Wrap in record and send
+    // Wrap in TLS record and send via channel
     let mut rec = [0u8; SEND_BUF_SIZE];
     let mut hdr = [0u8; 5];
     build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
     core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
     core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
-    (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_SEND, rec.as_mut_ptr(), 5 + msg_len);
+    let conn_id = sess.conn_id;
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), (5 + msg_len) as u16, &mut s.net_scratch);
 
     // Send CCS for middlebox compatibility
     let ccs = [CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01];
-    (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_SEND, ccs.as_ptr() as *mut u8, 6);
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, ccs.as_ptr(), 6, &mut s.net_scratch);
 
     sess.hrr_sent = true;
     sess.hs_state = HandshakeState::RecvSecondClientHello;
@@ -1378,6 +1340,14 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
     sess.state = SessionState::Ready;
     sess.hs_state = HandshakeState::Complete;
     dev_log(sys, 3, b"[tls] handshake complete".as_ptr(), b"[tls] handshake complete".len());
+
+    // Forward held MSG_ACCEPTED/MSG_CONNECTED to clear_out so HTTP knows connection is ready
+    let held = sess.held_msg_type;
+    let conn_id = sess.conn_id;
+    if held != 0 {
+        sess.held_msg_type = 0;
+        tls_write_frame(sys, s.clear_out, held, conn_id, core::ptr::null(), 0, &mut s.net_scratch);
+    }
     true
 }
 
@@ -1405,14 +1375,15 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
         t.update(&sess.scratch[..msg_len]);
     }
 
-    // Wrap in record and send
+    // Wrap in TLS record and send via channel
     let mut rec = [0u8; SEND_BUF_SIZE];
     let mut hdr = [0u8; 5];
     build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
     core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
     core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
 
-    (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_SEND, rec.as_mut_ptr(), 5 + msg_len);
+    let conn_id = sess.conn_id;
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), (5 + msg_len) as u16, &mut s.net_scratch);
 
     sess.hs_state = HandshakeState::RecvServerHello;
     true
@@ -1422,12 +1393,7 @@ unsafe fn pump_recv_server_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
 
-    // Read
-    let space = RECV_BUF_SIZE - sess.recv_len;
-    if space == 0 { return false; }
-    let n = (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_RECV,
-                           sess.recv_buf.as_mut_ptr().add(sess.recv_len), space);
-    if n > 0 { sess.recv_len += n as usize; }
+    // Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
     if sess.recv_len < 9 { return false; }
 
     skip_ccs(sess);
@@ -1651,7 +1617,7 @@ unsafe fn pump_send_client_finished(s: &mut TlsState, idx: usize) -> bool {
 // Encrypted record helpers
 // ============================================================================
 
-/// Send an encrypted handshake record
+/// Send an encrypted handshake record via cipher_out channel
 unsafe fn send_encrypted_handshake(s: &mut TlsState, idx: usize, msg: &[u8], msg_len: usize) {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
@@ -1660,28 +1626,23 @@ unsafe fn send_encrypted_handshake(s: &mut TlsState, idx: usize, msg: &[u8], msg
     let enc_len = encrypt_record(sess.suite, &mut sess.write_keys, CT_HANDSHAKE, &msg[..msg_len], &mut enc_buf);
 
     let mut rec = [0u8; SEND_BUF_SIZE + 5];
-    rec[0] = CT_APPLICATION_DATA;
-    rec[1] = 0x03; rec[2] = 0x03;
-    rec[3] = (enc_len >> 8) as u8;
-    rec[4] = enc_len as u8;
+    *rec.as_mut_ptr() = CT_APPLICATION_DATA;
+    *rec.as_mut_ptr().add(1) = 0x03;
+    *rec.as_mut_ptr().add(2) = 0x03;
+    *rec.as_mut_ptr().add(3) = (enc_len >> 8) as u8;
+    *rec.as_mut_ptr().add(4) = enc_len as u8;
     core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), rec.as_mut_ptr().add(5), enc_len);
 
-    (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_SEND, rec.as_mut_ptr(), 5 + enc_len);
+    let total = 5 + enc_len;
+    let conn_id = sess.conn_id;
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
 }
 
 /// Try to receive and decrypt an encrypted handshake record.
 /// Returns (decrypted_data_in_scratch, length, handshake_msg_type) or None if not enough data.
+/// Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
 unsafe fn recv_encrypted_handshake(s: &mut TlsState, idx: usize) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
-    let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
-
-    // Read more data
-    let space = RECV_BUF_SIZE - sess.recv_len;
-    if space > 0 {
-        let n = (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_RECV,
-                               sess.recv_buf.as_mut_ptr().add(sess.recv_len), space);
-        if n > 0 { sess.recv_len += n as usize; }
-    }
 
     skip_ccs(sess);
 
@@ -1765,7 +1726,7 @@ unsafe fn recv_encrypted_handshake(s: &mut TlsState, idx: usize) -> Option<([u8;
     }
 }
 
-/// Send an encrypted alert
+/// Send an encrypted alert via cipher_out channel
 unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
@@ -1775,34 +1736,157 @@ unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
     let enc_len = encrypt_record(sess.suite, &mut sess.write_keys, CT_ALERT, &alert_body, &mut enc_buf);
 
     let mut rec = [0u8; 69];
-    rec[0] = CT_APPLICATION_DATA;
-    rec[1] = 0x03; rec[2] = 0x03;
-    rec[3] = (enc_len >> 8) as u8;
-    rec[4] = enc_len as u8;
+    *rec.as_mut_ptr() = CT_APPLICATION_DATA;
+    *rec.as_mut_ptr().add(1) = 0x03;
+    *rec.as_mut_ptr().add(2) = 0x03;
+    *rec.as_mut_ptr().add(3) = (enc_len >> 8) as u8;
+    *rec.as_mut_ptr().add(4) = enc_len as u8;
     core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), rec.as_mut_ptr().add(5), enc_len);
 
-    (sys.dev_call)(sess.raw_handle, CHAIN_NEXT | SOCKET_SEND, rec.as_mut_ptr(), 5 + enc_len);
+    let total = 5 + enc_len;
+    let conn_id = sess.conn_id;
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
 }
 
-/// Drain pending send buffer
-unsafe fn drain_send_buffer(s: &mut TlsState, idx: usize) {
+// ============================================================================
+// Net protocol frame helpers
+// ============================================================================
+
+/// Read a net_proto frame header from a channel.
+/// Frame format: [msg_type: u8] [len: u16 LE]
+/// Returns (msg_type, payload_len). (0, 0) if no complete header.
+/// Read net_proto frame header only (type + length). Payload is read
+/// separately because TLS needs to route it to the correct session buffer.
+unsafe fn tls_read_header(sys: &SyscallTable, chan: i32) -> (u8, u16) {
+    let mut hdr = [0u8; 3];
+    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
+    if n < 3 { return (0, 0); }
+    let msg_type = hdr[0];
+    let payload_len = (hdr[1] as u16) | ((hdr[2] as u16) << 8);
+    (msg_type, payload_len)
+}
+
+/// Write a net_proto frame with conn_id prefix, atomically.
+/// Frame: [msg_type: u8] [len: u16 LE] [conn_id: u8] [data...]
+/// len = 1 + data_len (conn_id byte + payload bytes)
+/// Assembled in scratch buffer and written in a single channel_write to
+/// prevent split-read issues on byte-stream FIFO channels.
+unsafe fn tls_write_frame(
+    sys: &SyscallTable,
+    chan: i32,
+    msg_type: u8,
+    conn_id: u8,
+    data: *const u8,
+    data_len: u16,
+    scratch: &mut [u8; NET_SCRATCH_SIZE],
+) {
+    let total_payload = 1u16 + data_len; // conn_id + data
+    let frame_len = 3 + total_payload as usize;
+    if frame_len > NET_SCRATCH_SIZE { return; }
+    // Assemble complete frame in scratch
+    *scratch.as_mut_ptr() = msg_type;
+    *scratch.as_mut_ptr().add(1) = total_payload as u8;
+    *scratch.as_mut_ptr().add(2) = (total_payload >> 8) as u8;
+    *scratch.as_mut_ptr().add(3) = conn_id;
+    if data_len > 0 && !data.is_null() {
+        core::ptr::copy_nonoverlapping(data, scratch.as_mut_ptr().add(4), data_len as usize);
+    }
+    (sys.channel_write)(chan, scratch.as_ptr(), frame_len);
+}
+
+/// Write a raw net_proto frame (no conn_id prefix — used for pass-through).
+/// Frame: [msg_type: u8] [len: u16 LE] [payload...]
+/// Write a raw net_proto frame (no conn_id prefix — used for pass-through).
+/// Payload must already be in a buffer that can be prepended with a 3-byte header.
+/// Uses a stack buffer to assemble atomically.
+unsafe fn tls_write_raw_frame(
+    sys: &SyscallTable,
+    chan: i32,
+    msg_type: u8,
+    payload: *const u8,
+    payload_len: u16,
+) {
+    let frame_len = 3 + payload_len as usize;
+    let mut frame = [0u8; 256];
+    if frame_len > 256 { return; }
+    frame[0] = msg_type;
+    frame[1] = payload_len as u8;
+    frame[2] = (payload_len >> 8) as u8;
+    if payload_len > 0 && !payload.is_null() {
+        core::ptr::copy_nonoverlapping(payload, frame.as_mut_ptr().add(3), payload_len as usize);
+    }
+    (sys.channel_write)(chan, frame.as_ptr(), frame_len);
+}
+
+/// Discard bytes from a channel.
+unsafe fn tls_discard(sys: &SyscallTable, chan: i32, mut count: usize) {
+    let mut discard = [0u8; 64];
+    while count > 0 {
+        let chunk = if count < 64 { count } else { 64 };
+        (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
+        count -= chunk;
+    }
+}
+
+/// Try to decrypt a complete TLS record from a Ready session's recv_buf
+/// and forward the plaintext as MSG_DATA to clear_out.
+unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
 
-    if sess.send_offset < sess.send_len {
-        let remain = sess.send_len - sess.send_offset;
-        let sent = (sys.dev_call)(
-            sess.raw_handle,
-            CHAIN_NEXT | SOCKET_SEND,
-            sess.send_buf.as_mut_ptr().add(sess.send_offset),
-            remain,
-        );
-        if sent > 0 {
-            sess.send_offset += sent as usize;
-            if sess.send_offset >= sess.send_len {
-                sess.send_len = 0;
-                sess.send_offset = 0;
+    if sess.recv_len < 5 { return; }
+
+    let rec_type = *sess.recv_buf.as_ptr();
+    let rec_len = ((*sess.recv_buf.as_ptr().add(3) as usize) << 8) | (*sess.recv_buf.as_ptr().add(4) as usize);
+    if sess.recv_len < 5 + rec_len { return; }
+
+    if rec_type == CT_CHANGE_CIPHER_SPEC {
+        // Skip CCS
+        let consumed = 5 + rec_len;
+        let remain = sess.recv_len - consumed;
+        if remain > 0 {
+            core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
+        }
+        sess.recv_len = remain;
+        return;
+    }
+
+    if rec_type != CT_APPLICATION_DATA { return; }
+
+    // Copy header + ciphertext for decryption
+    let mut hdr = [0u8; 5];
+    core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
+    let mut ct = [0u8; RECV_BUF_SIZE];
+    core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr().add(5), ct.as_mut_ptr(), rec_len);
+
+    // Consume record from recv_buf
+    let consumed = 5 + rec_len;
+    let remain = sess.recv_len - consumed;
+    if remain > 0 {
+        core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
+    }
+    sess.recv_len = remain;
+
+    match decrypt_record(sess.suite, &mut sess.read_keys, &hdr, &mut ct[..rec_len]) {
+        Some((pt_len, inner_type)) => {
+            if inner_type == CT_ALERT {
+                if pt_len >= 2 && *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
+                    sess.state = SessionState::Closed;
+                    let conn_id = sess.conn_id;
+                    tls_write_frame(sys, s.clear_out, NET_MSG_CLOSED, conn_id, core::ptr::null(), 0, &mut s.net_scratch);
+                    return;
+                }
+                sess.state = SessionState::Error;
+                return;
             }
+            if inner_type == CT_APPLICATION_DATA && pt_len > 0 {
+                // Forward decrypted data as MSG_DATA(conn_id, plaintext) to clear_out
+                let conn_id = sess.conn_id;
+                tls_write_frame(sys, s.clear_out, NET_MSG_DATA, conn_id, ct.as_ptr(), pt_len as u16, &mut s.net_scratch);
+            }
+        }
+        None => {
+            sess.state = SessionState::Error;
         }
     }
 }

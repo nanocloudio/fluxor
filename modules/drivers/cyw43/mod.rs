@@ -2020,7 +2020,7 @@ unsafe fn step_wifi_ops(s: &mut Cyw43State) {
         && s.txn_step == gspi::TxnStep::Idle
     {
         let poll = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
-        if poll > 0 && (poll as u8 & POLL_IN) != 0 {
+        if poll > 0 && (poll as u32 & POLL_IN) != 0 {
             let mut cmd_buf = [0u8; 128];
             let (ty, len) = msg_read(sys, s.ctrl_chan, cmd_buf.as_mut_ptr(), cmd_buf.len());
             if ty != 0 {
@@ -2080,7 +2080,7 @@ unsafe fn step_tx(s: &mut Cyw43State) {
         && (s.last_status & (STATUS_F2_PKT_AVAILABLE | STATUS_F3_PKT_AVAILABLE)) == 0
     {
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll > 0 && (poll as u8 & POLL_IN) != 0 {
+        if poll > 0 && (poll as u32 & POLL_IN) != 0 {
             let r = (sys.channel_read)(
                 s.in_chan,
                 s.frame_buf.as_mut_ptr(),
@@ -2219,7 +2219,7 @@ unsafe fn step_led(s: &mut Cyw43State) {
     if s.led_gpio_ready && s.led_op == LED_OP_IDLE {
         let sys = &*s.syscalls;
         let poll = (sys.channel_poll)(s.led_chan, POLL_IN);
-        if poll > 0 && (poll as u8 & POLL_IN) != 0 {
+        if poll > 0 && (poll as u32 & POLL_IN) != 0 {
             let mut led_buf = [0u8; 8];
             let r = (sys.channel_read)(s.led_chan, led_buf.as_mut_ptr(), 8);
             if r > 0 {
@@ -2440,7 +2440,7 @@ unsafe fn emit_scan_result_binary(
     let sys = &*s.syscalls;
 
     let poll = (sys.channel_poll)(s.scan_bin_chan, POLL_OUT);
-    if poll <= 0 || (poll as u8 & POLL_OUT) == 0 {
+    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
         return;
     }
 
@@ -2475,7 +2475,7 @@ unsafe fn emit_status_event(s: &mut Cyw43State, msg_type: u32, payload: &[u8]) {
     let sys = &*s.syscalls;
 
     let poll = (sys.channel_poll)(s.status_chan, POLL_OUT);
-    if poll <= 0 || (poll as u8 & POLL_OUT) == 0 {
+    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
         return;
     }
 
@@ -2684,7 +2684,7 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                                 mac_frame[12] = 0;
                                 mac_frame[13] = 0;
                                 let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-                                if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+                                if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
                                     (sys.channel_write)(
                                         s.out_chan,
                                         mac_frame.as_ptr(),
@@ -2786,7 +2786,7 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                 if s.out_chan >= 0 {
                     let sys = &*s.syscalls;
                     let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-                    if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+                    if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
                             (sys.channel_write)(
                             s.out_chan,
                             payload.add(eth_start),

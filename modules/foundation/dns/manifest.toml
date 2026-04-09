@@ -1,6 +1,16 @@
-version = "1.0.0"
-hardware_targets = ["rp2350"]
+version = "2.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
 
 [[resources]]
-device_class = "socket"
-access = "write"
+device_class = "channel"
+access = "read"

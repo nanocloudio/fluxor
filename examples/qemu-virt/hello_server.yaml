@@ -6,7 +6,6 @@
 #   make run CONFIG=examples/qemu-virt/hello_server.yaml
 #   curl http://localhost:18080/
 target: qemu-virt
-tick_us: 10000
 
 platform:
   net: {}
@@ -18,5 +17,8 @@ modules:
       - path: "/"
         body: "<html><body><h1>Hello from Fluxor!</h1><p>Running on aarch64 QEMU virt.</p></body></html>"
 
-  - name: debug
-    mode: plaintext
+wiring:
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in

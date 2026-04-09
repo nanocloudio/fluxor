@@ -3,12 +3,9 @@
 //! Channels are FIFO buffers that connect modules in the processing graph.
 //! The kernel allocates channels at config time and passes handles to modules.
 //!
-//! Channels are distinct from sockets:
-//! - Channels (pipes): Fixed graph wiring between modules, kernel-managed
-//! - Sockets: Network connections that modules create internally via socket_* syscalls
-//!
 //! From a module's perspective, channels are for reading/writing to adjacent
-//! modules in the graph. For network I/O, use the socket_* syscalls instead.
+//! modules in the graph. Network I/O also flows through channels: the ip or
+//! linux_net module exposes net_out/net_in ports wired to consumer modules.
 //!
 //! ## Buffer Modes
 //!
@@ -431,7 +428,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     }
 }
 
-pub fn channel_poll(handle: i32, events: u8) -> i32 {
+pub fn channel_poll(handle: i32, events: u32) -> i32 {
     if handle < 0 {
         return CHAN_EINVAL;
     }
@@ -443,7 +440,7 @@ pub fn channel_poll(handle: i32, events: u8) -> i32 {
     if !slot.is_pipe() {
         return CHAN_EINVAL;
     }
-    let mut ready = 0u8;
+    let mut ready = 0u32;
     if slot.mailbox.load(Ordering::Acquire) {
         // Mailbox channels: check buffer state for readiness.
         // POLL_IN = mailbox has data (READY/READY_PROCESSED state).
@@ -472,7 +469,7 @@ pub fn channel_poll(handle: i32, events: u8) -> i32 {
         }
     }
     // Include persistent flags (HUP, ERR) if requested
-    let persistent = slot.sticky_events.load(Ordering::Acquire);
+    let persistent = slot.sticky_events.load(Ordering::Acquire) as u32;
     if (events & POLL_HUP) != 0 {
         // Check both: permanent HUP (from scheduler) and hup_flag (from IOCTL_SET_HUP).
         // hup_flag is non-destructive here — cleared by IOCTL_FLUSH when
@@ -645,7 +642,7 @@ pub unsafe extern "C" fn syscall_channel_write(handle: i32, data: *const u8, len
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn syscall_channel_poll(handle: i32, events: u8) -> i32 {
+pub extern "C" fn syscall_channel_poll(handle: i32, events: u32) -> i32 {
     channel_poll(handle, events)
 }
 

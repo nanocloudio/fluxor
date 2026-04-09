@@ -243,7 +243,7 @@ unsafe fn step_sequencer(s: &mut BrightnessState) {
     let sys = &*s.syscalls;
 
     let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-    if poll <= 0 || (poll as u8 & POLL_IN) == 0 {
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
         return;
     }
 
@@ -263,7 +263,7 @@ unsafe fn step_sequencer(s: &mut BrightnessState) {
     // Only write if changed
     if brightness != s.last_brightness {
         let out_poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-        if out_poll > 0 && (out_poll as u8 & POLL_OUT) != 0 {
+        if out_poll > 0 && (out_poll as u32 & POLL_OUT) != 0 {
             let b = [brightness];
             (sys.channel_write)(s.out_chan, b.as_ptr(), 1);
             s.last_brightness = brightness;
@@ -280,7 +280,7 @@ unsafe fn step_audio(s: &mut BrightnessState) {
     let sys = &*s.syscalls;
 
     let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-    if poll <= 0 || (poll as u8 & POLL_IN) == 0 {
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
         return;
     }
 
@@ -358,7 +358,7 @@ unsafe fn step_audio(s: &mut BrightnessState) {
 
     if brightness != s.last_brightness {
         let out_poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-        if out_poll > 0 && (out_poll as u8 & POLL_OUT) != 0 {
+        if out_poll > 0 && (out_poll as u32 & POLL_OUT) != 0 {
             let b = [brightness];
             (sys.channel_write)(s.out_chan, b.as_ptr(), 1);
             s.last_brightness = brightness;

@@ -592,7 +592,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
         if in_chan >= 0 && s.wire_pending_len == 0 {
             let block_bytes = (s.block_size as usize) * 2;
             let in_poll = (channel_poll)(in_chan, POLL_IN);
-            if in_poll > 0 && ((in_poll as u8) & POLL_IN) != 0 {
+            if in_poll > 0 && ((in_poll as u32) & POLL_IN) != 0 {
                 // Try mailbox
                 let mut mailbox_len: u32 = 0;
                 let mailbox_ptr = (dev_call)(
@@ -639,7 +639,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
         let ctrl_chan = s.ctrl_chan;
         if ctrl_chan >= 0 && s.wire_pending_len == 0 {
             let ctrl_poll = (channel_poll)(ctrl_chan, POLL_IN);
-            if ctrl_poll > 0 && ((ctrl_poll as u8) & POLL_IN) != 0 {
+            if ctrl_poll > 0 && ((ctrl_poll as u32) & POLL_IN) != 0 {
                 let ctrl_offset = MAX_WIRE_BUF - 256;
                 let ctrl_buf = s.wire_buf.as_mut_ptr().add(ctrl_offset);
 
@@ -680,7 +680,7 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
         let depth = s.jitter_depth as usize;
 
         let out_poll = (channel_poll)(out_chan, POLL_OUT);
-        if out_poll > 0 && ((out_poll as u8) & POLL_OUT) != 0 {
+        if out_poll > 0 && ((out_poll as u32) & POLL_OUT) != 0 {
             let slot_idx = mod_small(s.playout_frame_id as usize, depth);
             let sp = &*s.jitter_slots.as_ptr().add(slot_idx);
 

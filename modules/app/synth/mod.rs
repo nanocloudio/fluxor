@@ -354,7 +354,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Read navigation commands from ctrl.1 (FMP messages)
         if s.nav_chan >= 0 && s.voice_count > 1 {
             let nav_poll = (sys.channel_poll)(s.nav_chan, POLL_IN);
-            if nav_poll > 0 && ((nav_poll as u8) & POLL_IN) != 0 {
+            if nav_poll > 0 && ((nav_poll as u32) & POLL_IN) != 0 {
                 let (ty, _len) = msg_read(sys, s.nav_chan, s.nav_buf.as_mut_ptr(), 16);
                 if ty != 0 {
                     let vc = s.voice_count;
@@ -392,7 +392,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if ctrl_chan >= 0 {
             loop {
                 let ctrl_poll = (sys.channel_poll)(ctrl_chan, POLL_IN);
-                if ctrl_poll <= 0 || ((ctrl_poll as u8) & POLL_IN) == 0 { break; }
+                if ctrl_poll <= 0 || ((ctrl_poll as u32) & POLL_IN) == 0 { break; }
 
                 // Read discriminator byte
                 let mut hdr: [u8; 1] = [0];
@@ -429,7 +429,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let next_tail = (s.queue_tail + 1) & ((EVENT_QUEUE_SIZE - 1) as u8);
             if next_tail == s.queue_head { break; }
             let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-            if in_poll <= 0 || ((in_poll as u8) & POLL_IN) == 0 { break; }
+            if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 { break; }
             let mut msg_buf: [u8; NOTE_EVENT_SIZE] = [0; NOTE_EVENT_SIZE];
             let read = (sys.channel_read)(in_chan, msg_buf.as_mut_ptr(), NOTE_EVENT_SIZE);
             if read >= 6 {
@@ -514,7 +514,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !is_mailbox {
             // FIFO path: check output channel has space
             let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-            if out_poll <= 0 || ((out_poll as u8) & POLL_OUT) == 0 { break; }
+            if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 { break; }
         } else if mailbox_frames_written + SAMPLES_PER_CHUNK > mailbox_max_frames {
             // Mailbox buffer full
             break;

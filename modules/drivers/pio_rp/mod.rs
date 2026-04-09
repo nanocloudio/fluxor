@@ -381,7 +381,8 @@ unsafe fn dma_fd_free(sys: &SyscallTable, fd: i32) {
 }
 
 unsafe fn dma_fd_poll(sys: &SyscallTable, fd: i32) -> bool {
-    (sys.dev_call)(fd, FD_POLL, &POLL_IN as *const u8 as *mut u8, 1) & (POLL_IN as i32) != 0
+    let ev = POLL_IN as u8; // dev_call FD_POLL takes 1-byte events arg
+    (sys.dev_call)(fd, FD_POLL, &ev as *const u8 as *mut u8, 1) & (POLL_IN as i32) != 0
 }
 
 // Raw DMA helpers (for CMD blocking transfers)

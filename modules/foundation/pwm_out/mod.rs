@@ -125,7 +125,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Poll input channel for brightness data
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll <= 0 || ((poll as u8) & POLL_IN) == 0 {
+        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
             return 0;
         }
 

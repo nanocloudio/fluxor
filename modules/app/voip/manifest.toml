@@ -2,25 +2,49 @@ version = "1.0.0"
 hardware_targets = ["rp2350"]
 
 [[ports]]
+name = "sip_net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "jitter_net_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
 name = "mic"
+index = 2
 direction = "input"
 content_type = "AudioPcm"
 
 [[ports]]
+name = "sip_net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "jitter_net_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
 name = "audio"
+index = 2
 direction = "output"
 content_type = "AudioPcm"
 required = true
 
 [[ports]]
 name = "rtp"
-index = 1
+index = 3
 direction = "output"
 content_type = "OctetStream"
 
 [[ports]]
 name = "sip_ctrl"
-index = 2
+index = 4
 direction = "output"
 content_type = "OctetStream"
 
@@ -30,5 +54,5 @@ direction = "ctrl_input"
 content_type = "FmpMessage"
 
 [[resources]]
-device_class = "socket"
-access = "write"
+device_class = "channel"
+access = "read"

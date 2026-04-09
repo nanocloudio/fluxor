@@ -378,7 +378,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                     if len > 0 && s.out_chan >= 0 {
                         let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-                        if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+                        if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
                             (sys.channel_write)(s.out_chan, s.rx_buf.as_ptr(), len);
                         }
                     }
@@ -387,7 +387,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Check for frames to transmit
                 if s.in_chan >= 0 {
                     let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-                    if poll > 0 && (poll as u8 & POLL_IN) != 0 {
+                    if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                         let len = (sys.channel_read)(s.in_chan, s.tx_buf.as_mut_ptr(), MTU);
                         if len > 0 {
                             let _frame_len = len as usize;

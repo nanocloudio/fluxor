@@ -84,8 +84,6 @@ fn linux_isr_tier_poll() {}
 
 fn linux_init_providers() {
     // Override the default stub FS provider with one backed by real libc I/O.
-    // Socket provider is already registered by syscalls::init_providers();
-    // we service socket slots from the main loop via linux_service_sockets().
     use fluxor::kernel::provider;
     use fluxor::abi::dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
@@ -214,252 +212,6 @@ fn parse_args() -> CliArgs {
     }
 
     CliArgs { config_path, modules_path }
-}
-
-// ============================================================================
-// Linux Socket Service — polls SocketSlots and services via libc
-// ============================================================================
-
-/// Per-slot Linux socket state.  Maps kernel SocketSlot index to a real libc fd.
-struct LinuxSocketSlot {
-    /// Real libc file descriptor (-1 if not open)
-    fd: i32,
-    /// Is this a listening socket?
-    listening: bool,
-}
-
-const MAX_LINUX_SOCKETS: usize = fluxor::kernel::socket::MAX_SOCKETS;
-
-static mut LINUX_SOCKETS: [LinuxSocketSlot; MAX_LINUX_SOCKETS] = {
-    // Cannot call const fn with struct init in array repeat, so use a const block
-    const EMPTY: LinuxSocketSlot = LinuxSocketSlot { fd: -1, listening: false };
-    [EMPTY; MAX_LINUX_SOCKETS]
-};
-
-/// Service all socket slots once per tick.  Mirrors what the `ip` module does
-/// on bare-metal — reads SERVICE_INFO via direct SocketService access, then
-/// performs libc calls for pending operations and data transfer.
-unsafe fn linux_service_sockets() {
-    use fluxor::kernel::socket::{SocketService, SocketOp};
-    use fluxor::abi::poll as poll_flags;
-
-    let sockets = &mut *(&raw mut LINUX_SOCKETS);
-
-    for idx in 0..MAX_LINUX_SOCKETS {
-        let slot = match SocketService::get_slot_by_index(idx) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        if slot.is_free() {
-            // Reclaim any leaked libc fd
-            if sockets[idx].fd >= 0 {
-                libc::close(sockets[idx].fd);
-                sockets[idx].fd = -1;
-                sockets[idx].listening = false;
-            }
-            continue;
-        }
-
-        let lsock = &mut sockets[idx];
-
-        // Service pending operations
-        let op = slot.pending_op();
-        if op != SocketOp::None {
-            match op {
-                SocketOp::Connect => {
-                    let sock_type = slot.socket_type();
-                    // Ensure libc socket exists
-                    if lsock.fd < 0 {
-                        let ltype = if sock_type == 1 { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                        lsock.fd = libc::socket(libc::AF_INET, ltype | libc::SOCK_NONBLOCK, 0);
-                    }
-                    if lsock.fd < 0 {
-                        slot.complete_op(-1);
-                        slot.set_state(0); // closed
-                        slot.set_poll_flags(poll_flags::ERR);
-                    } else {
-                        let remote_ip = slot.remote_endpoint();
-                        let remote_port = slot.remote_id();
-                        let mut addr: libc::sockaddr_in = core::mem::zeroed();
-                        addr.sin_family = libc::AF_INET as u16;
-                        addr.sin_port = remote_port.to_be();
-                        addr.sin_addr.s_addr = remote_ip.to_be();
-                        let ret = libc::connect(
-                            lsock.fd,
-                            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
-                            core::mem::size_of::<libc::sockaddr_in>() as u32,
-                        );
-                        if ret == 0 {
-                            slot.complete_op(0);
-                            slot.set_state(4); // Connected
-                            slot.set_poll_flags(poll_flags::CONN);
-                        } else {
-                            let err = *libc::__errno_location();
-                            if err == libc::EINPROGRESS {
-                                // Will complete later — leave op pending for now
-                                // Actually complete it immediately to keep it simple
-                                slot.complete_op(0);
-                                slot.set_state(4); // Connected
-                                slot.set_poll_flags(poll_flags::CONN);
-                            } else {
-                                slot.complete_op(-err);
-                                slot.set_state(7); // Closed
-                                slot.set_poll_flags(poll_flags::ERR);
-                            }
-                        }
-                    }
-                }
-                SocketOp::Bind => {
-                    let sock_type = slot.socket_type();
-                    if lsock.fd < 0 {
-                        let ltype = if sock_type == 1 { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                        lsock.fd = libc::socket(libc::AF_INET, ltype | libc::SOCK_NONBLOCK, 0);
-                    }
-                    if lsock.fd < 0 {
-                        slot.complete_op(-1);
-                        slot.set_poll_flags(poll_flags::ERR);
-                    } else {
-                        // Set SO_REUSEADDR
-                        let one: i32 = 1;
-                        libc::setsockopt(
-                            lsock.fd,
-                            libc::SOL_SOCKET,
-                            libc::SO_REUSEADDR,
-                            &one as *const i32 as *const libc::c_void,
-                            core::mem::size_of::<i32>() as u32,
-                        );
-
-                        let port = slot.local_id();
-                        let mut addr: libc::sockaddr_in = core::mem::zeroed();
-                        addr.sin_family = libc::AF_INET as u16;
-                        addr.sin_port = port.to_be();
-                        addr.sin_addr.s_addr = 0; // INADDR_ANY
-
-                        let ret = libc::bind(
-                            lsock.fd,
-                            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
-                            core::mem::size_of::<libc::sockaddr_in>() as u32,
-                        );
-                        if ret == 0 {
-                            slot.complete_op(0);
-                            slot.set_state(1); // Allocated (bound)
-                        } else {
-                            let err = *libc::__errno_location();
-                            slot.complete_op(-err);
-                            slot.set_poll_flags(poll_flags::ERR);
-                        }
-                    }
-                }
-                SocketOp::Listen => {
-                    if lsock.fd >= 0 {
-                        let ret = libc::listen(lsock.fd, 8);
-                        if ret == 0 {
-                            lsock.listening = true;
-                            slot.complete_op(0);
-                            slot.set_state(5); // Listening
-                        } else {
-                            let err = *libc::__errno_location();
-                            slot.complete_op(-err);
-                            slot.set_poll_flags(poll_flags::ERR);
-                        }
-                    } else {
-                        slot.complete_op(-22); // EINVAL
-                        slot.set_poll_flags(poll_flags::ERR);
-                    }
-                }
-                SocketOp::Accept => {
-                    if lsock.fd >= 0 && lsock.listening {
-                        let mut addr: libc::sockaddr_in = core::mem::zeroed();
-                        let mut addrlen: u32 = core::mem::size_of::<libc::sockaddr_in>() as u32;
-                        let new_fd = libc::accept4(
-                            lsock.fd,
-                            &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
-                            &mut addrlen,
-                            libc::SOCK_NONBLOCK,
-                        );
-                        if new_fd >= 0 {
-                            libc::close(lsock.fd);
-                            lsock.fd = new_fd;
-                            lsock.listening = false;
-                            slot.set_remote(
-                                u32::from_be(addr.sin_addr.s_addr),
-                                u16::from_be(addr.sin_port),
-                            );
-                            slot.complete_op(0);
-                            slot.set_state(4);
-                            slot.set_poll_flags(poll_flags::CONN);
-                        } else {
-                            let err = *libc::__errno_location();
-                            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-                                // No connection yet — leave op pending (will retry next tick)
-                            } else {
-                                slot.complete_op(-err);
-                                slot.set_poll_flags(poll_flags::ERR);
-                            }
-                        }
-                    } else {
-                        slot.complete_op(-22); // EINVAL
-                        slot.set_poll_flags(poll_flags::ERR);
-                    }
-                }
-                SocketOp::Close => {
-                    if lsock.fd >= 0 {
-                        libc::close(lsock.fd);
-                        lsock.fd = -1;
-                        lsock.listening = false;
-                    }
-                    slot.complete_op(0);
-                    slot.set_state(7); // Closed
-                    slot.set_poll_flags(poll_flags::HUP);
-                    slot.reset();
-                }
-                SocketOp::None => {}
-            }
-        }
-
-        // Data transfer for connected sockets
-        if lsock.fd >= 0 && !lsock.listening && slot.state() == 4 {
-            // TX: drain kernel TX buffer → libc send()
-            let mut tx_buf = [0u8; 512];
-            let n = slot.tx_read(&mut tx_buf);
-            if n > 0 {
-                let sent = libc::send(
-                    lsock.fd,
-                    tx_buf.as_ptr() as *const libc::c_void,
-                    n,
-                    libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
-                );
-                if sent < 0 {
-                    let err = *libc::__errno_location();
-                    if err != libc::EAGAIN && err != libc::EWOULDBLOCK {
-                        // Connection error
-                        slot.set_poll_flags(poll_flags::ERR | poll_flags::HUP);
-                    }
-                    // On EAGAIN, data is lost — acceptable for v1. Modules will resend.
-                }
-            }
-
-            // RX: libc recv() → kernel RX buffer
-            if slot.rx_space() > 0 {
-                let mut rx_buf = [0u8; 512];
-                let max = slot.rx_space().min(512);
-                let recvd = libc::recv(
-                    lsock.fd,
-                    rx_buf.as_mut_ptr() as *mut libc::c_void,
-                    max,
-                    libc::MSG_DONTWAIT,
-                );
-                if recvd > 0 {
-                    slot.rx_write(&rx_buf[..recvd as usize]);
-                } else if recvd == 0 {
-                    // Peer closed
-                    slot.set_poll_flags(poll_flags::HUP);
-                }
-                // recvd < 0 with EAGAIN is normal for non-blocking
-            }
-        }
-    }
 }
 
 // ============================================================================
@@ -606,6 +358,416 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
 }
 
 // ============================================================================
+// linux_net built-in module — channel-based net_proto framing via libc sockets
+// ============================================================================
+
+/// FNV-1a hash of "linux_net"
+const LINUX_NET_HASH: u32 = 0xFBCC7DC9;
+
+// Net protocol message types (downstream: linux_net → consumer)
+const MSG_ACCEPTED:  u8 = 0x01;
+const MSG_DATA:      u8 = 0x02;
+const MSG_CLOSED:    u8 = 0x03;
+const MSG_BOUND:     u8 = 0x04;
+const MSG_CONNECTED: u8 = 0x05;
+const MSG_ERROR:     u8 = 0x06;
+
+// Net protocol command types (upstream: consumer → linux_net)
+const CMD_BIND:    u8 = 0x10;
+const CMD_SEND:    u8 = 0x11;
+const CMD_CLOSE:   u8 = 0x12;
+const CMD_CONNECT: u8 = 0x13;
+
+const LINUX_NET_MAX_CONNS: usize = 8;
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct LinuxNetConn {
+    fd: i32,        // libc socket fd (-1 = unused)
+    conn_type: u8,  // 1=stream(TCP), 2=dgram(UDP)
+    state: u8,      // 0=unused, 1=connecting, 2=connected, 3=listening
+}
+
+impl LinuxNetConn {
+    const EMPTY: Self = Self { fd: -1, conn_type: 0, state: 0 };
+}
+
+struct LinuxNetState {
+    net_in: i32,        // channel handle for reading CMD frames
+    net_out: i32,       // channel handle for writing MSG frames
+    listen_fd: i32,     // listening socket fd (-1 = none)
+    conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
+    cmd_buf: [u8; 2048],  // incoming command frame buffer
+    msg_buf: [u8; 2048],  // outgoing message frame assembly
+    recv_buf: [u8; 1500], // socket recv scratch
+    initialized: bool,
+}
+
+static mut LINUX_NET: LinuxNetState = LinuxNetState {
+    net_in: -1,
+    net_out: -1,
+    listen_fd: -1,
+    conns: [LinuxNetConn::EMPTY; LINUX_NET_MAX_CONNS],
+    cmd_buf: [0u8; 2048],
+    msg_buf: [0u8; 2048],
+    recv_buf: [0u8; 1500],
+    initialized: false,
+};
+
+/// Set a socket to non-blocking mode.
+unsafe fn set_nonblocking(fd: i32) {
+    let flags = libc::fcntl(fd, libc::F_GETFL);
+    if flags >= 0 {
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
+/// Find a free connection slot. Returns index or -1.
+unsafe fn linux_net_alloc_conn() -> i32 {
+    let st = &mut *(&raw mut LINUX_NET);
+    for i in 0..LINUX_NET_MAX_CONNS {
+        if st.conns[i].state == 0 {
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// Send a MSG frame on net_out.
+/// Send a net_proto TLV frame: [msg_type] [len: u16 LE] [payload].
+/// `msg_type` is the first byte of `data`, payload is `data[1..]`.
+unsafe fn linux_net_send_msg(data: &[u8]) {
+    let st = &*(&raw const LINUX_NET);
+    if st.net_out < 0 || data.is_empty() { return; }
+    let msg_type = data[0];
+    let payload = &data[1..];
+    let payload_len = payload.len() as u16;
+    let mut frame = [0u8; 512];
+    frame[0] = msg_type;
+    frame[1] = payload_len as u8;
+    frame[2] = (payload_len >> 8) as u8;
+    if !payload.is_empty() {
+        frame[3..3 + payload.len()].copy_from_slice(payload);
+    }
+    let total = 3 + payload.len();
+    channel::channel_write(st.net_out, frame.as_ptr(), total);
+}
+
+/// Handle CMD_BIND: create TCP listening socket on given port.
+unsafe fn linux_net_cmd_bind(port: u16) {
+    let st = &mut *(&raw mut LINUX_NET);
+
+    // Close existing listener if any
+    if st.listen_fd >= 0 {
+        libc::close(st.listen_fd);
+        st.listen_fd = -1;
+    }
+
+    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    if fd < 0 {
+        log::error!("[linux_net] socket() failed");
+        return;
+    }
+
+    // SO_REUSEADDR
+    let opt: i32 = 1;
+    libc::setsockopt(
+        fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+        &opt as *const i32 as *const libc::c_void, 4,
+    );
+
+    let mut addr: libc::sockaddr_in = core::mem::zeroed();
+    addr.sin_family = libc::AF_INET as u16;
+    addr.sin_port = port.to_be();
+    addr.sin_addr.s_addr = 0; // INADDR_ANY
+
+    if libc::bind(fd, &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                  core::mem::size_of::<libc::sockaddr_in>() as u32) < 0 {
+        log::error!("[linux_net] bind() failed on port {}", port);
+        libc::close(fd);
+        return;
+    }
+
+    if libc::listen(fd, 8) < 0 {
+        log::error!("[linux_net] listen() failed");
+        libc::close(fd);
+        return;
+    }
+
+    set_nonblocking(fd);
+    st.listen_fd = fd;
+    log::info!("[linux_net] listening on port {}", port);
+
+    // Send MSG_BOUND
+    let msg = [MSG_BOUND];
+    linux_net_send_msg(&msg);
+}
+
+/// Handle CMD_CONNECT: create socket and connect to remote.
+unsafe fn linux_net_cmd_connect(sock_type: u8, ip: u32, port: u16) {
+    let st = &mut *(&raw mut LINUX_NET);
+    let slot = linux_net_alloc_conn();
+    if slot < 0 {
+        log::error!("[linux_net] no free connection slots");
+        return;
+    }
+    let idx = slot as usize;
+
+    let libc_type = if sock_type == 2 { libc::SOCK_DGRAM } else { libc::SOCK_STREAM };
+    let fd = libc::socket(libc::AF_INET, libc_type, 0);
+    if fd < 0 {
+        log::error!("[linux_net] socket() failed for connect");
+        return;
+    }
+
+    set_nonblocking(fd);
+
+    let mut addr: libc::sockaddr_in = core::mem::zeroed();
+    addr.sin_family = libc::AF_INET as u16;
+    addr.sin_port = port.to_be();
+    addr.sin_addr.s_addr = ip.to_be();
+
+    let ret = libc::connect(fd, &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                            core::mem::size_of::<libc::sockaddr_in>() as u32);
+
+    if ret < 0 {
+        let errno = *libc::__errno_location();
+        if errno != libc::EINPROGRESS {
+            log::error!("[linux_net] connect() failed errno={}", errno);
+            libc::close(fd);
+            // Send MSG_ERROR
+            let msg = [MSG_ERROR, idx as u8, errno as u8];
+            linux_net_send_msg(&msg);
+            return;
+        }
+        // EINPROGRESS: connection in progress (non-blocking)
+        st.conns[idx] = LinuxNetConn { fd, conn_type: sock_type, state: 1 };
+    } else {
+        // Immediate connection (unlikely for TCP, normal for UDP)
+        st.conns[idx] = LinuxNetConn { fd, conn_type: sock_type, state: 2 };
+        let msg = [MSG_CONNECTED, idx as u8];
+        linux_net_send_msg(&msg);
+    }
+}
+
+/// Handle CMD_SEND: write data to a connection's socket.
+unsafe fn linux_net_cmd_send(conn_id: u8, data: &[u8]) {
+    let st = &*(&raw const LINUX_NET);
+    let idx = conn_id as usize;
+    if idx >= LINUX_NET_MAX_CONNS || st.conns[idx].state < 2 {
+        return;
+    }
+    let fd = st.conns[idx].fd;
+    if fd < 0 { return; }
+    libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), libc::MSG_NOSIGNAL);
+}
+
+/// Handle CMD_CLOSE: close a connection.
+unsafe fn linux_net_cmd_close(conn_id: u8) {
+    let st = &mut *(&raw mut LINUX_NET);
+    let idx = conn_id as usize;
+    if idx >= LINUX_NET_MAX_CONNS || st.conns[idx].state == 0 {
+        return;
+    }
+    if st.conns[idx].fd >= 0 {
+        libc::close(st.conns[idx].fd);
+    }
+    st.conns[idx] = LinuxNetConn::EMPTY;
+    let msg = [MSG_CLOSED, conn_id];
+    linux_net_send_msg(&msg);
+}
+
+/// Poll listening socket for new connections.
+unsafe fn linux_net_poll_accept() -> bool {
+    let st = &mut *(&raw mut LINUX_NET);
+    if st.listen_fd < 0 { return false; }
+
+    let mut addr: libc::sockaddr_in = core::mem::zeroed();
+    let mut addr_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
+
+    let client_fd = libc::accept4(
+        st.listen_fd,
+        &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
+        &mut addr_len,
+        libc::SOCK_NONBLOCK,
+    );
+    if client_fd < 0 { return false; }
+
+    let slot = linux_net_alloc_conn();
+    if slot < 0 {
+        libc::close(client_fd);
+        return false;
+    }
+    let idx = slot as usize;
+    st.conns[idx] = LinuxNetConn { fd: client_fd, conn_type: 1, state: 2 };
+
+    let msg = [MSG_ACCEPTED, idx as u8];
+    linux_net_send_msg(&msg);
+    log::info!("[linux_net] accepted conn_id={}", idx);
+    true
+}
+
+/// Poll all connected sockets for incoming data.
+unsafe fn linux_net_poll_recv() -> bool {
+    let st = &mut *(&raw mut LINUX_NET);
+    let mut had_work = false;
+
+    for i in 0..LINUX_NET_MAX_CONNS {
+        if st.conns[i].state < 2 || st.conns[i].fd < 0 {
+            // Check connecting sockets for completion
+            if st.conns[i].state == 1 && st.conns[i].fd >= 0 {
+                let mut pfd = libc::pollfd {
+                    fd: st.conns[i].fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                if libc::poll(&mut pfd, 1, 0) > 0 {
+                    if pfd.revents & libc::POLLOUT != 0 {
+                        // Connection completed
+                        let mut err: i32 = 0;
+                        let mut errlen: libc::socklen_t = 4;
+                        libc::getsockopt(
+                            st.conns[i].fd, libc::SOL_SOCKET, libc::SO_ERROR,
+                            &mut err as *mut i32 as *mut libc::c_void, &mut errlen,
+                        );
+                        if err == 0 {
+                            st.conns[i].state = 2;
+                            let msg = [MSG_CONNECTED, i as u8];
+                            linux_net_send_msg(&msg);
+                            had_work = true;
+                        } else {
+                            libc::close(st.conns[i].fd);
+                            st.conns[i] = LinuxNetConn::EMPTY;
+                            let msg = [MSG_ERROR, i as u8, err as u8];
+                            linux_net_send_msg(&msg);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        let n = libc::recv(
+            st.conns[i].fd,
+            st.recv_buf.as_mut_ptr() as *mut libc::c_void,
+            st.recv_buf.len(),
+            0,
+        );
+        if n > 0 {
+            // Build MSG_DATA TLV frame: [MSG_DATA] [len: u16 LE] [conn_id] [data...]
+            let payload_len = 1 + n as usize; // conn_id + data
+            let frame_len = 3 + payload_len;
+            if frame_len <= st.msg_buf.len() {
+                st.msg_buf[0] = MSG_DATA;
+                st.msg_buf[1] = payload_len as u8;
+                st.msg_buf[2] = (payload_len >> 8) as u8;
+                st.msg_buf[3] = i as u8; // conn_id
+                core::ptr::copy_nonoverlapping(
+                    st.recv_buf.as_ptr(),
+                    st.msg_buf.as_mut_ptr().add(4),
+                    n as usize,
+                );
+                if st.net_out >= 0 {
+                    channel::channel_write(st.net_out, st.msg_buf.as_ptr(), frame_len);
+                }
+            }
+            had_work = true;
+        } else if n == 0 {
+            // Connection closed by peer
+            libc::close(st.conns[i].fd);
+            st.conns[i] = LinuxNetConn::EMPTY;
+            let msg = [MSG_CLOSED, i as u8];
+            linux_net_send_msg(&msg);
+            had_work = true;
+        }
+        // n < 0: EAGAIN/EWOULDBLOCK = no data, just continue
+    }
+    had_work
+}
+
+/// Step function for the linux_net built-in module.
+///
+/// The `state` pointer points at the BuiltInModule.state[64] buffer.
+/// Bytes 0..3 = net_in channel handle (i32 LE)
+/// Bytes 4..7 = net_out channel handle (i32 LE)
+fn linux_net_step(state: *mut u8) -> i32 {
+    unsafe {
+        let st = &mut *(&raw mut LINUX_NET);
+
+        // First call: read channel handles from BuiltIn state and store in static
+        if !st.initialized {
+            st.net_in = core::ptr::read(state as *const i32);
+            st.net_out = core::ptr::read(state.add(4) as *const i32);
+            st.initialized = true;
+            log::info!("[linux_net] init net_in={} net_out={}", st.net_in, st.net_out);
+        }
+
+        let mut had_work = false;
+
+        // Read CMD frames from net_in channel using two-step TLV reads.
+        // Step 1: read 3-byte header [msg_type:u8][len:u16 LE]
+        // Step 2: read exactly payload_len bytes
+        // This prevents consuming multiple TLV frames in one read.
+        if st.net_in >= 0 {
+            loop {
+                let mut hdr = [0u8; 3];
+                let n = channel::channel_read(st.net_in, hdr.as_mut_ptr(), 3);
+                if n < 3 { break; }
+                let msg_type = hdr[0];
+                let payload_len = (hdr[1] as u16 | ((hdr[2] as u16) << 8)) as usize;
+                if payload_len > 0 && payload_len <= st.cmd_buf.len() {
+                    let n2 = channel::channel_read(st.net_in, st.cmd_buf.as_mut_ptr(), payload_len);
+                    if n2 < payload_len as i32 { break; }
+                }
+
+                // Payload is in cmd_buf[0..payload_len]
+                match msg_type {
+                    CMD_BIND if payload_len >= 2 => {
+                        let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                        linux_net_cmd_bind(port);
+                        had_work = true;
+                    }
+                    CMD_CONNECT if payload_len >= 7 => {
+                        let sock_type = st.cmd_buf[0];
+                        let ip = u32::from_le_bytes([
+                            st.cmd_buf[1], st.cmd_buf[2], st.cmd_buf[3], st.cmd_buf[4],
+                        ]);
+                        let port = u16::from_le_bytes([st.cmd_buf[5], st.cmd_buf[6]]);
+                        linux_net_cmd_connect(sock_type, ip, port);
+                        had_work = true;
+                    }
+                    CMD_SEND if payload_len >= 2 => {
+                        // Payload: [conn_id: u8] [data...]
+                        let conn_id = st.cmd_buf[0];
+                        let data_len = payload_len - 1;
+                        let data_slice = core::slice::from_raw_parts(
+                            st.cmd_buf.as_ptr().add(1), data_len,
+                        );
+                        linux_net_cmd_send(conn_id, data_slice);
+                        had_work = true;
+                    }
+                    CMD_CLOSE if payload_len >= 1 => {
+                        let conn_id = st.cmd_buf[0];
+                        linux_net_cmd_close(conn_id);
+                        had_work = true;
+                    }
+                    _ => {
+                        log::warn!("[linux_net] unknown cmd 0x{:02x} pl={}", msg_type, payload_len);
+                    }
+                }
+            }
+        }
+
+        // Poll for incoming connections and data
+        if linux_net_poll_accept() { had_work = true; }
+        if linux_net_poll_recv() { had_work = true; }
+
+        // Return Burst(2) when there's active work, Continue(0) otherwise
+        if had_work { 2 } else { 0 }
+    }
+}
+
+// ============================================================================
 // Module storage
 // ============================================================================
 
@@ -691,7 +853,9 @@ fn main() {
 
     log::info!("[loader] module table loaded");
 
-    // Create channels from graph edges
+    // Create channels from graph edges and register ports via set_module_port.
+    // This supports multi-port modules (e.g. linux_net.net_out, ip.net_in).
+    // Legacy: also track port-0 in/out/ctrl for DynamicModule::start_new().
     let mut mod_in: [i32; MAX_MODS] = [-1; MAX_MODS];
     let mut mod_out: [i32; MAX_MODS] = [-1; MAX_MODS];
     let mut mod_ctrl: [i32; MAX_MODS] = [-1; MAX_MODS];
@@ -702,16 +866,24 @@ fn main() {
             let to = edge.to_id as usize;
 
             let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-            if ch >= 0 {
-                if from < MAX_MODS && mod_out[from] < 0 {
+            if ch < 0 { continue; }
+
+            // Register source (output) port
+            if from < MAX_MODS {
+                scheduler::set_module_port(from, 1, edge.from_port_index, ch);
+                if edge.from_port_index == 0 && mod_out[from] < 0 {
                     mod_out[from] = ch;
                 }
-                if to < MAX_MODS {
-                    if edge.to_port == 0 && mod_in[to] < 0 {
-                        mod_in[to] = ch;
-                    } else if edge.to_port == 1 && mod_ctrl[to] < 0 {
-                        mod_ctrl[to] = ch;
-                    }
+            }
+
+            // Register destination port (input or ctrl)
+            if to < MAX_MODS {
+                let port_type = if edge.to_port == 1 { 2u8 } else { 0u8 }; // ctrl=2, in=0
+                scheduler::set_module_port(to, port_type, edge.to_port_index, ch);
+                if edge.to_port == 0 && edge.to_port_index == 0 && mod_in[to] < 0 {
+                    mod_in[to] = ch;
+                } else if edge.to_port == 1 && edge.to_port_index == 0 && mod_ctrl[to] < 0 {
+                    mod_ctrl[to] = ch;
                 }
             }
         }
@@ -723,6 +895,26 @@ fn main() {
 
     for i in 0..n_modules {
         if let Some(ref entry) = cfg.modules[i] {
+            // Check for built-in modules first
+            if entry.name_hash == LINUX_NET_HASH {
+                scheduler::set_current_module(i);
+
+                // Create BuiltInModule with channel handles in state buffer
+                let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
+                let state = m.state.as_mut_ptr();
+                // Read channel handles from set_module_port (input port 0, output port 0)
+                let net_in_ch = scheduler::channel_port_lookup(0, 0); // input port 0
+                let net_out_ch = scheduler::channel_port_lookup(1, 0); // output port 0
+                unsafe {
+                    core::ptr::write(state as *mut i32, net_in_ch);
+                    core::ptr::write(state.add(4) as *mut i32, net_out_ch);
+                }
+                scheduler::store_builtin_module(i, m);
+                log::info!("[inst] module {} = linux_net (built-in) net_in={} net_out={}", i, net_in_ch, net_out_ch);
+                modules.push(true);
+                continue;
+            }
+
             if let Ok(m) = ldr.find_by_name_hash(entry.name_hash) {
                 scheduler::set_current_module(i);
 
@@ -813,9 +1005,6 @@ fn main() {
                 scheduler::step_module(i);
             }
         }
-
-        // Service socket slots — drain TX to libc, fill RX from libc, handle ops
-        unsafe { linux_service_sockets(); }
 
         tick += 1;
 

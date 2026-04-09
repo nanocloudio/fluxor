@@ -42,7 +42,7 @@ use core::ffi::c_void;
 
 #[path = "../../../src/abi.rs"]
 mod abi;
-use abi::{SyscallTable, ChannelAddr};
+use abi::SyscallTable;
 
 include!("../../pic_runtime.rs");
 include!("../../param_macro.rs");
@@ -74,14 +74,21 @@ const CLI_RECV_BUF_SIZE: usize = 512;
 const CLI_MAX_PATH_LEN: usize = 128;
 const CONNECT_TIMEOUT_MS: u64 = 10000;
 
-const DEV_SOCKET_OPEN: u32 = 0x0800;
-const DEV_SOCKET_CONNECT: u32 = 0x0801;
-const DEV_SOCKET_SEND: u32 = 0x0802;
-const DEV_SOCKET_RECV: u32 = 0x0803;
-const DEV_SOCKET_POLL: u32 = 0x0804;
-const DEV_SOCKET_CLOSE: u32 = 0x0805;
+// ── Net framing protocol constants ──
+const NET_MSG_ACCEPTED: u8 = 0x01;
+const NET_MSG_DATA: u8 = 0x02;
+const NET_MSG_CLOSED: u8 = 0x03;
+const NET_MSG_BOUND: u8 = 0x04;
+const NET_MSG_CONNECTED: u8 = 0x05;
+const NET_MSG_ERROR: u8 = 0x06;
+const NET_CMD_BIND: u8 = 0x10;
+const NET_CMD_SEND: u8 = 0x11;
+const NET_CMD_CLOSE: u8 = 0x12;
+const NET_CMD_CONNECT: u8 = 0x13;
 
-const E_SOCKET_FAILED: i32 = -30;
+const NET_BUF_SIZE: usize = 600;
+
+const E_NET_FAILED: i32 = -30;
 const E_CONNECT_FAILED: i32 = -31;
 const E_SEND_FAILED: i32 = -32;
 const E_RECV_FAILED: i32 = -33;
@@ -102,9 +109,8 @@ const MODE_CLIENT: u8 = 1;
 #[derive(Clone, Copy, PartialEq)]
 enum ServerPhase {
     Init = 0,
-    SocketOpen = 1,
-    WaitBind = 2,
-    WaitListen = 3,
+    Binding = 1,
+    WaitBound = 2,
     WaitAccept = 4,
     RecvRequest = 5,
     DispatchRoute = 6,
@@ -126,15 +132,14 @@ enum ServerPhase {
 #[derive(Clone, Copy, PartialEq)]
 enum ClientPhase {
     Init = 0,
-    SocketOpen = 1,
-    Connecting = 2,
-    WaitConnect = 3,
-    SendRequest = 4,
-    WaitSend = 5,
-    RecvHeaders = 6,
-    RecvBody = 7,
-    Writing = 8,
-    Done = 9,
+    Connecting = 1,
+    WaitConnect = 2,
+    SendRequest = 3,
+    WaitSend = 4,
+    RecvHeaders = 5,
+    RecvBody = 6,
+    Writing = 7,
+    Done = 8,
     Error = 255,
 }
 
@@ -227,12 +232,16 @@ struct HttpState {
     mode: u8,
     _mode_pad: [u8; 3],
 
+    // ── Network channels (shared between server/client) ──
+    net_in_chan: i32,
+    net_out_chan: i32,
+
     // ── Server fields ──
     srv_var_chan: i32,
     srv_file_chan: i32,
     srv_out_chan: i32,
-    srv_socket_handle: i32,
-    srv_upstream_handle: i32,
+    srv_conn_id: u8,
+    _srv_conn_pad: [u8; 3],
 
     srv_port: u16,
     srv_body_pool_used: u16,
@@ -266,7 +275,8 @@ struct HttpState {
     _srv_pad: [u8; 1],
 
     // ── Client fields ──
-    cli_socket_handle: i32,
+    cli_conn_id: u8,
+    _cli_conn_pad: [u8; 3],
     cli_out_chan: i32,
 
     cli_host_ip: u32,
@@ -291,6 +301,9 @@ struct HttpState {
     cli_path: [u8; CLI_MAX_PATH_LEN],
     cli_recv_buf: [u8; CLI_RECV_BUF_SIZE],
     cli_request_buf: [u8; 256],
+
+    // ── Shared net frame scratch buffer ──
+    net_buf: [u8; NET_BUF_SIZE],
 }
 
 impl HttpState {
@@ -443,16 +456,18 @@ unsafe fn srv_log(s: &HttpState, msg: &[u8]) {
     dev_log(s.sys(), 3, msg.as_ptr(), msg.len());
 }
 
-unsafe fn reset_socket(s: &mut HttpState) {
-    if s.srv_socket_handle >= 0 {
-        dev_socket_close(s.sys(), s.srv_socket_handle);
-        s.srv_socket_handle = -1;
+unsafe fn reset_connection(s: &mut HttpState) {
+    // Send CMD_CLOSE for current connection if we're past WaitAccept
+    // (srv_conn_id=0 is a valid connection, so check phase instead)
+    if s.srv_phase as u8 > ServerPhase::WaitAccept as u8 && s.net_out_chan >= 0 {
+        let sys = &*s.syscalls;
+        let chan = s.net_out_chan;
+        let buf = s.net_buf.as_mut_ptr();
+        let mut payload = [0u8; 1];
+        payload[0] = s.srv_conn_id;
+        net_write_frame(sys, chan, NET_CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
     }
-    if s.srv_upstream_handle >= 0 {
-        dev_socket_close(s.sys(), s.srv_upstream_handle);
-        s.srv_upstream_handle = -1;
-    }
-    s.srv_phase = ServerPhase::SocketOpen;
+    s.srv_phase = ServerPhase::WaitAccept;
 }
 
 unsafe fn parse_request_line(s: &mut HttpState) -> i32 {
@@ -572,7 +587,7 @@ unsafe fn drain_variables(s: &mut HttpState) {
 
     loop {
         let poll = ((*syscalls).channel_poll)(var_chan, POLL_IN);
-        if poll <= 0 || (poll as u8 & POLL_IN) == 0 { break; }
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 { break; }
 
         let (msg_type, payload_len) = msg_read(&*syscalls, var_chan, buf.as_mut_ptr(), buf.len());
         if msg_type == 0 && payload_len == 0 { break; }
@@ -843,11 +858,13 @@ unsafe fn find_header_end(buf: &[u8], len: usize) -> Option<usize> {
 
 unsafe fn server_init(s: &mut HttpState, in_chan: i32, out_chan: i32) {
     let sys = s.syscalls;
-    s.srv_var_chan = in_chan;
+    // Primary channels are net_in (from IP) and net_out (to IP)
+    s.net_in_chan = in_chan;
+    s.net_out_chan = out_chan;
+    s.srv_var_chan = -1;
     s.srv_file_chan = -1;
-    s.srv_out_chan = out_chan;
-    s.srv_socket_handle = -1;
-    s.srv_upstream_handle = -1;
+    s.srv_out_chan = -1;
+    s.srv_conn_id = 0;
     s.srv_port = 80;
     s.srv_body_pool_used = 0;
     s.srv_recv_len = 0;
@@ -878,11 +895,15 @@ unsafe fn server_init(s: &mut HttpState, in_chan: i32, out_chan: i32) {
     }
 }
 
-unsafe fn server_post_params(s: &mut HttpState, in_chan: i32) {
+unsafe fn server_post_params(s: &mut HttpState) {
     let sys = &*s.syscalls;
 
-    // Discover additional ports
-    s.srv_file_chan = dev_channel_port(sys, 0, 1); // in[1] = file data
+    // Discover additional ports:
+    // in[1] = variables, in[2] = file data
+    // out[1] = file ctrl
+    s.srv_var_chan = dev_channel_port(sys, 0, 1);  // in[1]: variable updates
+    s.srv_file_chan = dev_channel_port(sys, 0, 2); // in[2]: file data
+    s.srv_out_chan = dev_channel_port(sys, 1, 1);  // out[1]: file ctrl
 
     if s.srv_route_count == 0 {
         let r0 = &mut *s.srv_routes.as_mut_ptr().add(0);
@@ -892,9 +913,7 @@ unsafe fn server_post_params(s: &mut HttpState, in_chan: i32) {
             r0.handler = HANDLER_STATIC;
             s.srv_route_count = 1;
             s.srv_legacy_mode = 1;
-        } else if in_chan >= 0 {
-            s.srv_file_chan = in_chan;
-            s.srv_var_chan = -1;
+        } else if s.srv_file_chan >= 0 {
             s.srv_legacy_mode = 2;
         }
     }
@@ -916,9 +935,12 @@ unsafe fn server_post_params(s: &mut HttpState, in_chan: i32) {
 // Client Init
 // ============================================================================
 
-unsafe fn client_init(s: &mut HttpState, out_chan: i32) {
-    s.cli_socket_handle = -1;
-    s.cli_out_chan = out_chan;
+unsafe fn client_init(s: &mut HttpState, in_chan: i32, out_chan: i32) {
+    // Primary channels are net_in/net_out (same as server)
+    s.net_in_chan = in_chan;
+    s.net_out_chan = out_chan;
+    s.cli_conn_id = 0;
+    s.cli_out_chan = -1; // will be discovered via port
     s.cli_host_ip = 0;
     s.cli_port = 80;
     s.cli_path_len = 0;
@@ -934,6 +956,11 @@ unsafe fn client_init(s: &mut HttpState, out_chan: i32) {
 }
 
 unsafe fn client_post_params(s: &mut HttpState) {
+    let sys = &*s.syscalls;
+
+    // Discover output channel for body data
+    s.cli_out_chan = dev_channel_port(sys, 1, 1); // out[1]: body data
+
     // Default to "/" if no path given
     if s.cli_path_len == 0 {
         s.cli_path[0] = b'/';
@@ -948,70 +975,99 @@ unsafe fn client_post_params(s: &mut HttpState) {
 // ============================================================================
 
 unsafe fn server_step(s: &mut HttpState) -> i32 {
-    // Drain variable updates from input channel
+    // Drain variable updates from variable channel
     drain_variables(s);
 
     match s.srv_phase {
-        // ── Socket Setup ─────────────────────────────────────────
-        ServerPhase::Init | ServerPhase::SocketOpen => {
-            let handle = dev_socket_open(s.sys(), SOCK_TYPE_STREAM);
-            if handle < 0 { return 0; }
-            s.srv_socket_handle = handle;
-            let rc = dev_socket_bind(s.sys(), handle, s.srv_port);
-            if rc < 0 && rc != E_INPROGRESS {
-                reset_socket(s);
-                return 0;
-            }
-            s.srv_phase = ServerPhase::WaitBind;
+        // ── Bind via CMD_BIND ────────────────────────────────────
+        ServerPhase::Init | ServerPhase::Binding => {
+            if s.net_out_chan < 0 { return 0; }
+            let sys = &*s.syscalls;
+            let chan = s.net_out_chan;
+            let buf = s.net_buf.as_mut_ptr();
+            let mut payload = [0u8; 2];
+            payload[0] = (s.srv_port & 0xFF) as u8;
+            payload[1] = (s.srv_port >> 8) as u8;
+            let wrote = net_write_frame(sys, chan, NET_CMD_BIND, payload.as_ptr(), 2, buf, NET_BUF_SIZE);
+            if wrote == 0 { return 0; }
+            s.srv_phase = ServerPhase::WaitBound;
             return 2;
         }
 
-        ServerPhase::WaitBind => {
-            let rc = dev_socket_listen(s.sys(), s.srv_socket_handle);
-            if rc == E_BUSY { return 0; }
-            if rc < 0 && rc != E_INPROGRESS {
-                reset_socket(s);
-                return 0;
-            }
-            s.srv_phase = ServerPhase::WaitListen;
-            return 2;
-        }
+        // ── Wait for MSG_BOUND ───────────────────────────────────
+        ServerPhase::WaitBound => {
+            if s.net_in_chan < 0 { return 0; }
+            let sys = &*s.syscalls;
+            let chan = s.net_in_chan;
+            let poll = (sys.channel_poll)(chan, POLL_IN);
+            if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
 
-        ServerPhase::WaitListen => {
-            if s.srv_draining != 0 {
-                return 1;
-            }
-            let rc = dev_socket_accept(s.sys(), s.srv_socket_handle);
-            if rc == E_BUSY { return 0; }
-            if rc < 0 && rc != E_INPROGRESS {
+            let buf = s.net_buf.as_mut_ptr();
+            let (msg_type, _payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+            if msg_type == NET_MSG_BOUND {
+                srv_log(s, b"[http] bound, waiting for connections");
+                s.srv_phase = ServerPhase::WaitAccept;
+                return 2;
+            } else if msg_type == NET_MSG_ERROR {
                 s.srv_phase = ServerPhase::Error;
                 return -1;
             }
-            s.srv_phase = ServerPhase::WaitAccept;
+            // Ignore other messages while waiting for bind
         }
 
+        // ── Wait for MSG_ACCEPTED ────────────────────────────────
         ServerPhase::WaitAccept => {
             if s.srv_draining != 0 {
                 return 1;
             }
-            let poll = dev_socket_poll(s.sys(), s.srv_socket_handle, POLL_CONN | POLL_HUP);
-            if poll <= 0 { return 0; }
-            if (poll as u8 & POLL_CONN) != 0 {
+            if s.net_in_chan < 0 { return 0; }
+            let sys = &*s.syscalls;
+            let chan = s.net_in_chan;
+            let poll = (sys.channel_poll)(chan, POLL_IN);
+            if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
+
+            let buf = s.net_buf.as_mut_ptr();
+            let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+            if msg_type == NET_MSG_ACCEPTED && payload_len >= 1 {
+                s.srv_conn_id = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
                 s.srv_recv_len = 0;
                 s.srv_recv_parsed = 0;
                 s.srv_phase = ServerPhase::RecvRequest;
-            } else if (poll as u8 & POLL_HUP) != 0 {
-                s.srv_phase = ServerPhase::CloseConn;
             }
+            // Ignore other messages while waiting
         }
 
-        // ── Request Parsing ──────────────────────────────────────
+        // ── Request Parsing (from MSG_DATA) ──────────────────────
         ServerPhase::RecvRequest => {
-            let space = SRV_RECV_BUF_SIZE - s.srv_recv_len as usize;
-            if space > 0 {
-                let buf_ptr = s.srv_recv_buf.as_mut_ptr().add(s.srv_recv_len as usize);
-                let n = dev_socket_recv(s.sys(), s.srv_socket_handle, buf_ptr, space);
-                if n > 0 { s.srv_recv_len += n as u16; }
+            if s.net_in_chan < 0 { return 0; }
+            let sys = &*s.syscalls;
+            let chan = s.net_in_chan;
+            let poll = (sys.channel_poll)(chan, POLL_IN);
+            if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
+
+            let buf = s.net_buf.as_mut_ptr();
+            let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+
+            if msg_type == NET_MSG_CLOSED {
+                s.srv_phase = ServerPhase::CloseConn;
+                return 0;
+            }
+
+            if msg_type == NET_MSG_DATA && payload_len > 1 {
+                // payload[0] = conn_id, payload[1..] = TCP data
+                let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                let data_len = payload_len - 1;
+
+                // Append to recv buffer
+                let space = SRV_RECV_BUF_SIZE - s.srv_recv_len as usize;
+                let to_copy = data_len.min(space);
+                if to_copy > 0 {
+                    let dst = s.srv_recv_buf.as_mut_ptr().add(s.srv_recv_len as usize);
+                    core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
+                    s.srv_recv_len += to_copy as u16;
+                }
+            } else {
+                return 0;
             }
 
             let len = s.srv_recv_len as usize;
@@ -1034,7 +1090,7 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
                         return 0;
                     }
                     s.srv_recv_parsed = 1;
-                } else if space == 0 {
+                } else if s.srv_recv_len as usize >= SRV_RECV_BUF_SIZE {
                     build_error(s, b"400 Bad Request", b"Bad Request\n");
                     s.srv_phase = ServerPhase::DrainSend;
                     return 0;
@@ -1061,7 +1117,7 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
                 if found {
                     s.srv_phase = ServerPhase::DispatchRoute;
                     return 2;
-                } else if space == 0 {
+                } else if s.srv_recv_len as usize >= SRV_RECV_BUF_SIZE {
                     let l = s.srv_recv_len as usize;
                     if l >= 3 {
                         let p = s.srv_recv_buf.as_mut_ptr();
@@ -1071,11 +1127,6 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
                         s.srv_recv_len = 3;
                     }
                 }
-            }
-
-            let poll = dev_socket_poll(s.sys(), s.srv_socket_handle, POLL_HUP);
-            if poll > 0 && (poll as u8 & POLL_HUP) != 0 {
-                s.srv_phase = ServerPhase::CloseConn;
             }
         }
 
@@ -1194,18 +1245,8 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
                 };
 
                 match handler {
-                    HANDLER_STATIC => {
+                    HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE => {
                         s.srv_phase = ServerPhase::SendBody;
-                    }
-                    HANDLER_TEMPLATE => {
-                        s.srv_phase = ServerPhase::SendBody;
-                    }
-                    HANDLER_FILE => {
-                        if s.srv_file_index < 0 {
-                            s.srv_phase = ServerPhase::SendBody;
-                        } else {
-                            s.srv_phase = ServerPhase::SendBody;
-                        }
                     }
                     _ => {
                         s.srv_phase = ServerPhase::CloseConn;
@@ -1213,8 +1254,7 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
                 }
                 return 2;
             }
-            let ptr = s.srv_send_buf.as_ptr().add(s.srv_send_offset as usize);
-            let sent = dev_socket_send(s.sys(), s.srv_socket_handle, ptr, remaining);
+            let sent = srv_net_send(s, s.srv_send_buf.as_ptr().add(s.srv_send_offset as usize), remaining);
             if sent > 0 { s.srv_send_offset += sent as u16; }
         }
 
@@ -1253,8 +1293,7 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
                 s.srv_phase = ServerPhase::CloseConn;
                 return 0;
             }
-            let ptr = s.srv_send_buf.as_ptr().add(s.srv_send_offset as usize);
-            let sent = dev_socket_send(s.sys(), s.srv_socket_handle, ptr, remaining);
+            let sent = srv_net_send(s, s.srv_send_buf.as_ptr().add(s.srv_send_offset as usize), remaining);
             if sent > 0 { s.srv_send_offset += sent as u16; }
         }
 
@@ -1266,7 +1305,7 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
                 return 0;
             }
             let poll = (s.sys().channel_poll)(s.srv_file_chan, POLL_IN | POLL_HUP);
-            if poll > 0 && ((poll as u8 & POLL_IN) != 0 || (poll as u8 & POLL_HUP) != 0) {
+            if poll > 0 && ((poll as u32 & POLL_IN) != 0 || (poll as u32 & POLL_HUP) != 0) {
                 s.srv_phase = ServerPhase::CacheStream;
                 return 2;
             }
@@ -1295,8 +1334,8 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
             }
 
             let poll = (s.sys().channel_poll)(s.srv_file_chan, POLL_IN | POLL_HUP);
-            let eof = poll > 0 && (poll as u8 & POLL_HUP) != 0
-                && (poll <= 0 || (poll as u8 & POLL_IN) == 0);
+            let eof = poll > 0 && (poll as u32 & POLL_HUP) != 0
+                && (poll <= 0 || (poll as u32 & POLL_IN) == 0);
             let full = (arena_off + ce.length as usize) >= pool_cap;
 
             if eof || full {
@@ -1314,9 +1353,9 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
             return 2;
         }
 
-        // ── Connection Close + Re-listen ─────────────────────────
+        // ── Connection Close + Re-accept ─────────────────────────
         ServerPhase::CloseConn => {
-            reset_socket(s);
+            reset_connection(s);
             if s.srv_draining != 0 {
                 return 1;
             }
@@ -1346,15 +1385,39 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
 }
 
 // ============================================================================
+// Server Net Send Helper
+// ============================================================================
+
+/// Send HTTP data via CMD_SEND frame. Builds frame manually in net_buf:
+/// [CMD_SEND][len_lo][len_hi][conn_id][http_data...]
+/// Returns bytes of http_data accepted, or 0 if channel full.
+unsafe fn srv_net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
+    if s.net_out_chan < 0 { return 0; }
+    // Max payload in one frame: net_buf - header(3) - conn_id(1)
+    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+    let to_send = len.min(max_data);
+    if to_send == 0 { return 0; }
+
+    let sys = &*s.syscalls;
+    let chan = s.net_out_chan;
+    let conn_id = s.srv_conn_id;
+    let scratch = s.net_buf.as_mut_ptr();
+    let payload_len = 1 + to_send; // conn_id + data
+    *scratch = NET_CMD_SEND;
+    *scratch.add(1) = (payload_len & 0xFF) as u8;
+    *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
+    *scratch.add(3) = conn_id;
+    core::ptr::copy_nonoverlapping(data, scratch.add(4), to_send);
+    let total = NET_FRAME_HDR + payload_len;
+    let written = (sys.channel_write)(chan, scratch, total);
+    if written >= total as i32 { to_send as i32 } else { 0 }
+}
+
+// ============================================================================
 // Body Send Helpers (Server)
 // ============================================================================
 
 unsafe fn step_send_static(s: &mut HttpState) -> i32 {
-    let poll = dev_socket_poll(s.sys(), s.srv_socket_handle, POLL_OUT | POLL_HUP);
-    if poll <= 0 { return 0; }
-    if (poll as u8 & POLL_HUP) != 0 { s.srv_phase = ServerPhase::CloseConn; return 0; }
-    if (poll as u8 & POLL_OUT) == 0 { return 0; }
-
     let route = &*s.srv_routes.as_ptr().add(s.srv_matched_route as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
@@ -1368,7 +1431,7 @@ unsafe fn step_send_static(s: &mut HttpState) -> i32 {
     let remaining = body_end - pos;
     let to_send = remaining.min(SRV_SEND_BUF_SIZE);
     let ptr = (s.srv_body_pool as *const u8).add(pos);
-    let sent = dev_socket_send(s.sys(), s.srv_socket_handle, ptr, to_send);
+    let sent = srv_net_send(s, ptr, to_send);
     if sent > 0 {
         s.srv_tmpl_pos += sent as u16;
         return 2;
@@ -1377,15 +1440,10 @@ unsafe fn step_send_static(s: &mut HttpState) -> i32 {
 }
 
 unsafe fn step_send_template(s: &mut HttpState) -> i32 {
-    let poll = dev_socket_poll(s.sys(), s.srv_socket_handle, POLL_OUT | POLL_HUP);
-    if poll <= 0 { return 0; }
-    if (poll as u8 & POLL_HUP) != 0 { s.srv_phase = ServerPhase::CloseConn; return 0; }
-    if (poll as u8 & POLL_OUT) == 0 { return 0; }
-
     if s.srv_send_offset < s.srv_send_len {
         let remaining = (s.srv_send_len - s.srv_send_offset) as usize;
         let ptr = s.srv_send_buf.as_ptr().add(s.srv_send_offset as usize);
-        let sent = dev_socket_send(s.sys(), s.srv_socket_handle, ptr, remaining);
+        let sent = srv_net_send(s, ptr, remaining);
         if sent > 0 { s.srv_send_offset += sent as u16; }
         return 0;
     }
@@ -1393,7 +1451,7 @@ unsafe fn step_send_template(s: &mut HttpState) -> i32 {
     let has_more = render_template_chunk(s);
     if s.srv_send_len > 0 {
         let ptr = s.srv_send_buf.as_ptr();
-        let sent = dev_socket_send(s.sys(), s.srv_socket_handle, ptr, s.srv_send_len as usize);
+        let sent = srv_net_send(s, ptr, s.srv_send_len as usize);
         if sent > 0 { s.srv_send_offset = sent as u16; }
         return if has_more { 2 } else { 0 };
     }
@@ -1427,7 +1485,7 @@ unsafe fn step_send_index(s: &mut HttpState) -> i32 {
 
     let remaining = (s.srv_send_len - s.srv_send_offset) as usize;
     let ptr = s.srv_send_buf.as_ptr().add(s.srv_send_offset as usize);
-    let sent = dev_socket_send(s.sys(), s.srv_socket_handle, ptr, remaining);
+    let sent = srv_net_send(s, ptr, remaining);
     if sent > 0 {
         s.srv_send_offset += sent as u16;
         return 2;
@@ -1436,11 +1494,6 @@ unsafe fn step_send_index(s: &mut HttpState) -> i32 {
 }
 
 unsafe fn step_send_file(s: &mut HttpState) -> i32 {
-    let poll = dev_socket_poll(s.sys(), s.srv_socket_handle, POLL_OUT | POLL_HUP);
-    if poll <= 0 { return 0; }
-    if (poll as u8 & POLL_HUP) != 0 { s.srv_phase = ServerPhase::CloseConn; return 0; }
-    if (poll as u8 & POLL_OUT) == 0 { return 0; }
-
     if s.srv_send_offset >= s.srv_send_len {
         let n = (s.sys().channel_read)(s.srv_file_chan, s.srv_send_buf.as_mut_ptr(), SRV_SEND_BUF_SIZE);
         if n > 0 {
@@ -1448,7 +1501,7 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
             s.srv_send_len = n as u16;
         } else {
             let chan_poll = (s.sys().channel_poll)(s.srv_file_chan, POLL_IN | POLL_HUP);
-            if chan_poll > 0 && (chan_poll as u8 & POLL_HUP) != 0 {
+            if chan_poll > 0 && (chan_poll as u32 & POLL_HUP) != 0 {
                 s.srv_phase = ServerPhase::CloseConn;
             }
             return 0;
@@ -1457,7 +1510,7 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
 
     let remaining = (s.srv_send_len - s.srv_send_offset) as usize;
     let ptr = s.srv_send_buf.as_ptr().add(s.srv_send_offset as usize);
-    let sent = dev_socket_send(s.sys(), s.srv_socket_handle, ptr, remaining);
+    let sent = srv_net_send(s, ptr, remaining);
     if sent > 0 {
         s.srv_send_offset += sent as u16;
         return 2;
@@ -1535,51 +1588,59 @@ unsafe fn client_step(s: &mut HttpState) -> i32 {
     loop {
         match s.cli_phase {
             ClientPhase::Init => {
-                srv_log(s, b"[http] opening socket");
-                s.cli_phase = ClientPhase::SocketOpen;
-                continue;
-            }
-
-            ClientPhase::SocketOpen => {
-                let mut sock_arg = [SOCK_TYPE_STREAM];
-                let handle = (s.sys().dev_call)(-1, DEV_SOCKET_OPEN, sock_arg.as_mut_ptr(), 1);
-                if handle < 0 {
-                    srv_log(s, b"[http] socket_open failed");
-                    s.cli_phase = ClientPhase::Error;
-                    return E_SOCKET_FAILED;
-                }
-                s.cli_socket_handle = handle;
+                srv_log(s, b"[http] connecting");
                 s.cli_phase = ClientPhase::Connecting;
                 continue;
             }
 
+            // ── Send CMD_CONNECT ─────────────────────────────────
             ClientPhase::Connecting => {
-                let addr = ChannelAddr::new(s.cli_host_ip, s.cli_port);
-                let rc = (s.sys().dev_call)(s.cli_socket_handle, DEV_SOCKET_CONNECT, &addr as *const _ as *mut u8, core::mem::size_of::<ChannelAddr>());
-                if rc < 0 && rc != E_INPROGRESS {
-                    srv_log(s, b"[http] connect failed");
+                if s.net_out_chan < 0 {
                     s.cli_phase = ClientPhase::Error;
-                    return E_CONNECT_FAILED;
+                    return E_NET_FAILED;
                 }
-                s.cli_connect_start_ms = dev_millis(s.sys());
+                let sys = &*s.syscalls;
+                let chan = s.net_out_chan;
+                let buf = s.net_buf.as_mut_ptr();
+                // CMD_CONNECT payload: [sock_type: u8] [ip: u32 LE] [port: u16 LE]
+                let mut payload = [0u8; 7];
+                payload[0] = SOCK_TYPE_STREAM;
+                let ip_bytes = s.cli_host_ip.to_le_bytes();
+                payload[1] = ip_bytes[0];
+                payload[2] = ip_bytes[1];
+                payload[3] = ip_bytes[2];
+                payload[4] = ip_bytes[3];
+                payload[5] = (s.cli_port & 0xFF) as u8;
+                payload[6] = (s.cli_port >> 8) as u8;
+                let wrote = net_write_frame(sys, chan, NET_CMD_CONNECT, payload.as_ptr(), 7, buf, NET_BUF_SIZE);
+                if wrote == 0 { return 0; }
+                s.cli_connect_start_ms = dev_millis(sys);
                 s.cli_phase = ClientPhase::WaitConnect;
                 return 0;
             }
 
+            // ── Wait for MSG_CONNECTED ───────────────────────────
             ClientPhase::WaitConnect => {
-                let mut poll_arg = [POLL_CONN];
-                let poll = (s.sys().dev_call)(s.cli_socket_handle, DEV_SOCKET_POLL, poll_arg.as_mut_ptr(), 1);
-                if poll < 0 {
-                    s.cli_phase = ClientPhase::Error;
-                    return E_CONNECT_FAILED;
+                if s.net_in_chan < 0 { return 0; }
+                let sys = &*s.syscalls;
+                let chan = s.net_in_chan;
+                let poll = (sys.channel_poll)(chan, POLL_IN);
+                if poll > 0 && (poll as u32 & POLL_IN) != 0 {
+                    let buf = s.net_buf.as_mut_ptr();
+                    let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+                    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                        s.cli_conn_id = *buf.add(NET_FRAME_HDR);
+                        srv_log(s, b"[http] connected");
+                        build_client_request(s);
+                        s.cli_phase = ClientPhase::SendRequest;
+                        continue;
+                    } else if msg_type == NET_MSG_ERROR {
+                        srv_log(s, b"[http] connect error");
+                        s.cli_phase = ClientPhase::Error;
+                        return E_CONNECT_FAILED;
+                    }
                 }
-                if (poll as u8 & POLL_CONN) != 0 {
-                    srv_log(s, b"[http] connected");
-                    build_client_request(s);
-                    s.cli_phase = ClientPhase::SendRequest;
-                    continue;
-                }
-                if dev_millis(s.sys()).wrapping_sub(s.cli_connect_start_ms) >= CONNECT_TIMEOUT_MS {
+                if dev_millis(sys).wrapping_sub(s.cli_connect_start_ms) >= CONNECT_TIMEOUT_MS {
                     srv_log(s, b"[http] connect timeout");
                     s.cli_phase = ClientPhase::Error;
                     return E_CONNECT_FAILED;
@@ -1587,128 +1648,159 @@ unsafe fn client_step(s: &mut HttpState) -> i32 {
                 return 0;
             }
 
+            // ── Send HTTP request via CMD_SEND ───────────────────
             ClientPhase::SendRequest => {
+                if s.net_out_chan < 0 { return E_SEND_FAILED; }
+                let sys = &*s.syscalls;
+                let out_chan = s.net_out_chan;
+                let conn_id = s.cli_conn_id;
                 let remaining = (s.cli_request_len - s.cli_request_sent) as usize;
-                let buf_ptr = s.cli_request_buf.as_mut_ptr().add(s.cli_request_sent as usize);
+                let data_ptr = s.cli_request_buf.as_ptr().add(s.cli_request_sent as usize);
 
-                let sent = (s.sys().dev_call)(
-                    s.cli_socket_handle,
-                    DEV_SOCKET_SEND,
-                    buf_ptr,
-                    remaining,
-                );
+                // Build CMD_SEND frame manually in net_buf
+                let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+                let to_send = remaining.min(max_data);
+                let scratch = s.net_buf.as_mut_ptr();
+                let payload_len = 1 + to_send;
+                *scratch = NET_CMD_SEND;
+                *scratch.add(1) = (payload_len & 0xFF) as u8;
+                *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
+                *scratch.add(3) = conn_id;
+                core::ptr::copy_nonoverlapping(data_ptr, scratch.add(4), to_send);
+                let total = NET_FRAME_HDR + payload_len;
+                let written = (sys.channel_write)(out_chan, scratch, total);
 
-                if sent < 0 {
-                    if sent == E_AGAIN {
-                        return 0;
-                    }
-                    srv_log(s, b"[http] send failed");
-                    s.cli_phase = ClientPhase::Error;
-                    return E_SEND_FAILED;
+                if written < total as i32 {
+                    return 0; // Channel full, retry next step
                 }
 
-                s.cli_request_sent += sent as u16;
+                s.cli_request_sent += to_send as u16;
                 if s.cli_request_sent >= s.cli_request_len {
                     srv_log(s, b"[http] request sent");
                     s.cli_headers_done = 0;
+                    s.cli_recv_len = 0;
                     s.cli_phase = ClientPhase::RecvHeaders;
                 }
                 return 0;
             }
 
+            // ── Receive response headers via MSG_DATA ────────────
             ClientPhase::RecvHeaders => {
-                let read = (s.sys().dev_call)(
-                    s.cli_socket_handle,
-                    DEV_SOCKET_RECV,
-                    s.cli_recv_buf.as_mut_ptr(),
-                    CLI_RECV_BUF_SIZE,
-                );
+                if s.net_in_chan < 0 { return 0; }
+                let sys = &*s.syscalls;
+                let chan = s.net_in_chan;
+                let poll = (sys.channel_poll)(chan, POLL_IN);
+                if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
 
-                if read < 0 {
-                    if read == E_AGAIN {
-                        return 0;
-                    }
-                    srv_log(s, b"[http] recv failed");
-                    s.cli_phase = ClientPhase::Error;
-                    return E_RECV_FAILED;
-                }
+                let nbuf = s.net_buf.as_mut_ptr();
+                let (msg_type, payload_len) = net_read_frame(sys, chan, nbuf, NET_BUF_SIZE);
 
-                if read == 0 {
+                if msg_type == NET_MSG_CLOSED {
                     srv_log(s, b"[http] premature close");
                     s.cli_phase = ClientPhase::Done;
                     return 1;
                 }
 
-                if let Some(body_start) = find_header_end(&s.cli_recv_buf, read as usize) {
-                    let body_len = (read as usize) - body_start;
-                    if body_len > 0 {
-                        let buf_ptr = s.cli_recv_buf.as_mut_ptr();
-                        let mut i = 0;
-                        while i < body_len {
-                            *buf_ptr.add(i) = *buf_ptr.add(body_start + i);
-                            i += 1;
-                        }
-                        s.cli_recv_len = body_len as u16;
-                        s.cli_pending_offset = 0;
-                        s.cli_phase = ClientPhase::Writing;
-                    } else {
-                        s.cli_phase = ClientPhase::RecvBody;
+                if msg_type == NET_MSG_DATA && payload_len > 1 {
+                    let data_ptr = nbuf.add(NET_FRAME_HDR + 1) as *const u8;
+                    let data_len = payload_len - 1;
+
+                    // Append to recv buffer
+                    let cur = s.cli_recv_len as usize;
+                    let space = CLI_RECV_BUF_SIZE - cur;
+                    let to_copy = data_len.min(space);
+                    if to_copy > 0 {
+                        core::ptr::copy_nonoverlapping(
+                            data_ptr,
+                            s.cli_recv_buf.as_mut_ptr().add(cur),
+                            to_copy,
+                        );
+                        s.cli_recv_len += to_copy as u16;
                     }
-                    srv_log(s, b"[http] headers done");
+
+                    if let Some(body_start) = find_header_end(&s.cli_recv_buf, s.cli_recv_len as usize) {
+                        let body_len = (s.cli_recv_len as usize) - body_start;
+                        if body_len > 0 {
+                            let buf_ptr = s.cli_recv_buf.as_mut_ptr();
+                            let mut i = 0;
+                            while i < body_len {
+                                *buf_ptr.add(i) = *buf_ptr.add(body_start + i);
+                                i += 1;
+                            }
+                            s.cli_recv_len = body_len as u16;
+                            s.cli_pending_offset = 0;
+                            s.cli_phase = ClientPhase::Writing;
+                        } else {
+                            s.cli_recv_len = 0;
+                            s.cli_phase = ClientPhase::RecvBody;
+                        }
+                        srv_log(s, b"[http] headers done");
+                        continue;
+                    }
+                }
+
+                return 0;
+            }
+
+            // ── Receive body data via MSG_DATA ───────────────────
+            ClientPhase::RecvBody => {
+                let sys = &*s.syscalls;
+                if s.cli_out_chan >= 0 {
+                    let poll = (sys.channel_poll)(s.cli_out_chan, POLL_OUT);
+                    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
+                        return 0;
+                    }
+                }
+
+                if s.net_in_chan < 0 { return 0; }
+                let chan = s.net_in_chan;
+                let poll = (sys.channel_poll)(chan, POLL_IN);
+                if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
+
+                let nbuf = s.net_buf.as_mut_ptr();
+                let (msg_type, payload_len) = net_read_frame(sys, chan, nbuf, NET_BUF_SIZE);
+
+                if msg_type == NET_MSG_CLOSED {
+                    srv_log(s, b"[http] transfer done");
+                    s.cli_phase = ClientPhase::Done;
+                    return 1;
+                }
+
+                if msg_type == NET_MSG_DATA && payload_len > 1 {
+                    let data_ptr = nbuf.add(NET_FRAME_HDR + 1) as *const u8;
+                    let data_len = payload_len - 1;
+
+                    // Copy to recv buf
+                    let to_copy = data_len.min(CLI_RECV_BUF_SIZE);
+                    core::ptr::copy_nonoverlapping(
+                        data_ptr,
+                        s.cli_recv_buf.as_mut_ptr(),
+                        to_copy,
+                    );
+                    s.cli_recv_len = to_copy as u16;
+                    s.cli_pending_offset = 0;
+                    s.cli_bytes_received += to_copy as u32;
+                    s.cli_phase = ClientPhase::Writing;
                     continue;
                 }
 
                 return 0;
             }
 
-            ClientPhase::RecvBody => {
-                if s.cli_out_chan >= 0 {
-                    let poll = (s.sys().channel_poll)(s.cli_out_chan, POLL_OUT);
-                    if poll <= 0 || (poll as u8 & POLL_OUT) == 0 {
-                        return 0;
-                    }
-                }
-
-                let read = (s.sys().dev_call)(
-                    s.cli_socket_handle,
-                    DEV_SOCKET_RECV,
-                    s.cli_recv_buf.as_mut_ptr(),
-                    CLI_RECV_BUF_SIZE,
-                );
-
-                if read < 0 {
-                    if read == E_AGAIN {
-                        return 0;
-                    }
-                    srv_log(s, b"[http] recv body failed");
-                    s.cli_phase = ClientPhase::Error;
-                    return E_RECV_FAILED;
-                }
-
-                if read == 0 {
-                    srv_log(s, b"[http] transfer done");
-                    s.cli_phase = ClientPhase::Done;
-                    return 1;
-                }
-
-                s.cli_recv_len = read as u16;
-                s.cli_pending_offset = 0;
-                s.cli_bytes_received += read as u32;
-                s.cli_phase = ClientPhase::Writing;
-                continue;
-            }
-
+            // ── Write body to output channel ─────────────────────
             ClientPhase::Writing => {
                 if s.cli_out_chan < 0 {
                     s.cli_phase = ClientPhase::RecvBody;
                     continue;
                 }
 
+                let sys = &*s.syscalls;
+                let out_chan = s.cli_out_chan;
                 let offset = s.cli_pending_offset as usize;
                 let remaining = (s.cli_recv_len as usize) - offset;
 
-                let written = (s.sys().channel_write)(
-                    s.cli_out_chan,
+                let written = (sys.channel_write)(
+                    out_chan,
                     s.cli_recv_buf.as_ptr().add(offset),
                     remaining,
                 );
@@ -1729,18 +1821,29 @@ unsafe fn client_step(s: &mut HttpState) -> i32 {
                 return 0;
             }
 
+            // ── Done: send CMD_CLOSE ─────────────────────────────
             ClientPhase::Done => {
-                if s.cli_socket_handle >= 0 {
-                    (s.sys().dev_call)(s.cli_socket_handle, DEV_SOCKET_CLOSE, core::ptr::null_mut(), 0);
-                    s.cli_socket_handle = -1;
+                if s.cli_conn_id != 0 && s.net_out_chan >= 0 {
+                    let sys = &*s.syscalls;
+                    let chan = s.net_out_chan;
+                    let buf = s.net_buf.as_mut_ptr();
+                    let mut payload = [0u8; 1];
+                    payload[0] = s.cli_conn_id;
+                    net_write_frame(sys, chan, NET_CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
+                    s.cli_conn_id = 0;
                 }
                 return 1;
             }
 
             ClientPhase::Error => {
-                if s.cli_socket_handle >= 0 {
-                    (s.sys().dev_call)(s.cli_socket_handle, DEV_SOCKET_CLOSE, core::ptr::null_mut(), 0);
-                    s.cli_socket_handle = -1;
+                if s.cli_conn_id != 0 && s.net_out_chan >= 0 {
+                    let sys = &*s.syscalls;
+                    let chan = s.net_out_chan;
+                    let buf = s.net_buf.as_mut_ptr();
+                    let mut payload = [0u8; 1];
+                    payload[0] = s.cli_conn_id;
+                    net_write_frame(sys, chan, NET_CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
+                    s.cli_conn_id = 0;
                 }
                 return -1;
             }
@@ -1793,8 +1896,9 @@ pub extern "C" fn module_new(
         s.mode = MODE_SERVER; // default
 
         // Pre-init both modes so body pool is ready for param parsing
+        // in_chan = net_in (from IP), out_chan = net_out (to IP)
         server_init(s, in_chan, out_chan);
-        client_init(s, out_chan);
+        client_init(s, in_chan, out_chan);
 
         // Parse TLV params (sets mode, server params, client params)
         let is_tlv = !params.is_null() && params_len >= 4
@@ -1809,7 +1913,7 @@ pub extern "C" fn module_new(
         if s.mode == MODE_CLIENT {
             client_post_params(s);
         } else {
-            server_post_params(s, in_chan);
+            server_post_params(s);
         }
 
         0
@@ -1857,9 +1961,11 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 256 },  // in[0]: var updates
-        ChannelHint { port_type: 0, port_index: 1, buffer_size: 2048 }, // in[1]: file data
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 256 },  // out[0]: fat32 ctrl
+        ChannelHint { port_type: 0, port_index: 0, buffer_size: 2048 }, // in[0]: net_in (from IP)
+        ChannelHint { port_type: 0, port_index: 1, buffer_size: 256 },  // in[1]: var updates
+        ChannelHint { port_type: 0, port_index: 2, buffer_size: 2048 }, // in[2]: file data
+        ChannelHint { port_type: 1, port_index: 0, buffer_size: 2048 }, // out[0]: net_out (to IP)
+        ChannelHint { port_type: 1, port_index: 1, buffer_size: 256 },  // out[1]: file ctrl
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }

@@ -1,7 +1,7 @@
 # Hello Server (Linux hosted)
 #
 # Serves a static HTML page over HTTP using the Linux socket provider.
-# No ip/cyw43 module needed — the OS provides networking.
+# linux_net provides channel-based networking via OS sockets.
 #
 # Usage:
 #   fluxor run examples/linux/hello_server.yaml
@@ -21,4 +21,9 @@ modules:
   - name: debug
     mode: plaintext
 
-wiring: []
+wiring:
+  # HTTP <-> linux_net channel-based networking
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in

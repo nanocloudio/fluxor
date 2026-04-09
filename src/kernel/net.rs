@@ -29,11 +29,11 @@ pub struct NetIfSlot {
     state: AtomicU8,
     /// Interface type (opaque, module-defined)
     if_type: AtomicU8,
-    /// Provider type (opaque u8: 1=frame, 2=socket by convention)
+    /// Provider type (opaque u8: 1=frame by convention)
     provider_type: AtomicU8,
     /// In use flag
     in_use: AtomicBool,
-    /// Channel handle for frame/socket providers (-1 if none)
+    /// Channel handle for frame providers (-1 if none)
     provider_channel: AtomicU32,
 }
 
@@ -67,7 +67,7 @@ impl NetIfSlot {
         self.if_type.load(Ordering::Acquire)
     }
 
-    /// Get provider type (opaque u8: 1=frame, 2=socket by convention).
+    /// Get provider type (opaque u8: 1=frame by convention).
     pub fn provider_type_raw(&self) -> u8 {
         self.provider_type.load(Ordering::Acquire)
     }
@@ -192,19 +192,6 @@ impl NetIfService {
         for i in 0..MAX_NETIFS {
             let slot = &NETIF_SLOTS[i];
             if slot.try_allocate(if_type, 1) { // provider_type 1 = frame
-                slot.set_provider_channel(channel);
-                return i as i32;
-            }
-        }
-        NET_EBUSY
-    }
-
-    /// Register a socket provider (PIC module with hardware socket transport).
-    /// `if_type` is opaque (module-defined).
-    pub fn register_socket_provider(if_type: u8, channel: i32) -> i32 {
-        for i in 0..MAX_NETIFS {
-            let slot = &NETIF_SLOTS[i];
-            if slot.try_allocate(if_type, 2) { // provider_type 2 = socket
                 slot.set_provider_channel(channel);
                 return i as i32;
             }

@@ -63,7 +63,7 @@ pub struct SyscallTable {
     /// Write to a channel. Returns bytes written, 0 on full, <0 on error.
     pub channel_write: unsafe extern "C" fn(handle: i32, data: *const u8, len: usize) -> i32,
     /// Poll a channel for readiness. Returns bitmask of ready events.
-    pub channel_poll: unsafe extern "C" fn(handle: i32, events: u8) -> i32,
+    pub channel_poll: unsafe extern "C" fn(handle: i32, events: u32) -> i32,
     /// Invoke a device operation by opcode. Dispatches to the appropriate
     /// per-class handler via the provider registry.
     ///
@@ -111,15 +111,15 @@ pub struct SyscallTable {
 /// These values are part of the stable ABI — modules hardcode them.
 pub mod poll {
     /// Data available for reading.
-    pub const IN: u8 = 0x01;
+    pub const IN: u32 = 0x01;
     /// Space available for writing.
-    pub const OUT: u8 = 0x02;
+    pub const OUT: u32 = 0x02;
     /// Error condition.
-    pub const ERR: u8 = 0x04;
+    pub const ERR: u32 = 0x04;
     /// Hang-up (peer closed / end-of-stream).
-    pub const HUP: u8 = 0x08;
+    pub const HUP: u32 = 0x08;
     /// Connection established.
-    pub const CONN: u8 = 0x10;
+    pub const CONN: u32 = 0x10;
 }
 
 // ============================================================================
@@ -228,8 +228,6 @@ pub mod dev_class {
     pub const TIMER: u8 = 0x06;
     /// Network interfaces (contract: drivers provide, services consume)
     pub const NETIF: u8 = 0x07;
-    /// Network sockets (contract: IP stack provides, services consume)
-    pub const SOCKET: u8 = 0x08;
     /// Filesystem (contract: FS module provides, services consume)
     pub const FS: u8 = 0x09;
     /// Zero-copy buffers
@@ -427,75 +425,45 @@ pub mod dev_timer {
 pub mod dev_netif {
     pub const OPEN: u32 = 0x0700;
     pub const REGISTER_FRAME: u32 = 0x0701;
-    pub const REGISTER_SOCKET: u32 = 0x0702;
     pub const CLOSE: u32 = 0x0703;
     pub const STATE: u32 = 0x0704;
     pub const IOCTL: u32 = 0x0705;
 }
 
-/// Socket opcodes (0x0800-0x08FF)
-pub mod dev_socket {
-    pub const OPEN: u32 = 0x0800;
-    pub const CONNECT: u32 = 0x0801;
-    pub const SEND: u32 = 0x0802;
-    pub const RECV: u32 = 0x0803;
-    pub const POLL: u32 = 0x0804;
-    pub const CLOSE: u32 = 0x0805;
-    /// Bind socket to local port. handle=socket, arg[0..2]=port (u16 LE).
-    pub const BIND: u32 = 0x0806;
-    /// Listen for incoming connections. handle=socket, arg[0..4]=backlog (i32 LE, optional).
-    pub const LISTEN: u32 = 0x0807;
-    /// Accept incoming connection. handle=socket (must be listening).
-    /// Transforms the listening socket into the connected socket.
-    pub const ACCEPT: u32 = 0x0808;
+/// Channel-based networking protocol.
+///
+/// Frame format: [msg_type: u8] [len: u16 LE] [payload: len bytes]
+/// Used on channels between IP/TLS/HTTP modules.
+pub mod net_proto {
+    /// Frame header size (msg_type + len).
+    pub const FRAME_HDR: usize = 3;
 
-    // Socket service opcodes (0x0810-0x081F) — for IP stack module
-    // These allow the IP stack module to service socket slots directly.
-    /// Get socket slot info. handle=slot_idx, arg=*mut SocketServiceInfo.
-    pub const SERVICE_INFO: u32 = 0x0810;
-    /// Read from socket TX buffer. handle=slot_idx, arg=*mut u8, arg_len=buf_size.
-    /// Returns bytes read.
-    pub const SERVICE_TX_READ: u32 = 0x0811;
-    /// Write to socket RX buffer. handle=slot_idx, arg=*const u8, arg_len=data_len.
-    /// Returns bytes written.
-    pub const SERVICE_RX_WRITE: u32 = 0x0812;
-    /// Complete pending socket operation. handle=slot_idx.
-    /// arg[0..4] = result (i32 LE), arg[4] = new_state (u8), arg[5] = poll_flags (u8, optional).
-    pub const SERVICE_COMPLETE_OP: u32 = 0x0813;
-    /// Set socket state. handle=slot_idx, arg[0] = state (u8), arg[1] = poll_flags (u8, optional).
-    pub const SERVICE_SET_STATE: u32 = 0x0814;
-    /// Get number of socket slots. handle=-1. Returns count.
-    pub const SERVICE_COUNT: u32 = 0x0815;
-    /// Reset a socket slot (free for reuse). handle=slot_idx. Called by provider
-    /// after the connection is fully closed and no further state is needed.
-    pub const SERVICE_RESET: u32 = 0x0816;
-}
+    // Downstream: IP/net → consumer
+    /// New connection accepted. Payload: [conn_id: u8]
+    pub const MSG_ACCEPTED: u8 = 0x01;
+    /// Received data. Payload: [conn_id: u8] [data...]
+    pub const MSG_DATA: u8 = 0x02;
+    /// Remote closed connection. Payload: [conn_id: u8]
+    pub const MSG_CLOSED: u8 = 0x03;
+    /// Bind/listen completed. No payload.
+    pub const MSG_BOUND: u8 = 0x04;
+    /// Outbound connect completed. Payload: [conn_id: u8]
+    pub const MSG_CONNECTED: u8 = 0x05;
+    /// Error. Payload: [conn_id: u8] [errno: i8]
+    pub const MSG_ERROR: u8 = 0x06;
 
-/// Socket service info structure (returned by SERVICE_INFO).
-/// Field values (type codes, states, operations) are defined by the
-/// socket provider module — the kernel fills them from opaque slot data.
-#[repr(C)]
-pub struct SocketServiceInfo {
-    /// Provider-defined type code (0=free)
-    pub socket_type: u8,
-    /// Provider-defined state value
-    pub state: u8,
-    /// Provider-defined pending operation code
-    pub pending_op: u8,
-    /// Padding
-    pub _pad: u8,
-    /// Local identifier (provider-defined)
-    pub local_id: u16,
-    /// Remote identifier (provider-defined)
-    pub remote_id: u16,
-    /// Remote endpoint identifier (provider-defined)
-    pub remote_endpoint: u32,
-    /// TX buffer bytes pending
-    pub tx_pending: u16,
-    /// RX buffer bytes available
-    pub rx_available: u16,
-    /// RX buffer free space
-    pub rx_space: u16,
+    // Upstream: consumer → IP/net
+    /// Bind to port and listen. Payload: [port: u16 LE]
+    pub const CMD_BIND: u8 = 0x10;
+    /// Send data on connection. Payload: [conn_id: u8] [data...]
+    pub const CMD_SEND: u8 = 0x11;
+    /// Close connection. Payload: [conn_id: u8]
+    pub const CMD_CLOSE: u8 = 0x12;
+    /// Initiate outbound connection. Payload: [sock_type: u8] [ip: u32 LE] [port: u16 LE]
+    pub const CMD_CONNECT: u8 = 0x13;
+
+    pub const SOCK_TYPE_STREAM: u8 = 1;
+    pub const SOCK_TYPE_DGRAM: u8 = 2;
 }
 
 /// Filesystem opcodes (0x0900-0x09FF)

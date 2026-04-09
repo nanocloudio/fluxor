@@ -45,29 +45,27 @@ unsafe fn step_sip(s: &mut VoipState) {
 }
 
 // ============================================================================
-// Init — open signaling socket
+// Init — send CMD_BIND via SIP net channel
 // ============================================================================
 
 unsafe fn sip_step_init(s: &mut VoipState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let mut sock_arg = [SOCK_TYPE_DGRAM];
-    let handle = (dev_call)(-1, DEV_SOCKET_OPEN, sock_arg.as_mut_ptr(), 1);
-    if handle < 0 {
-        dev_log(sys, 1, b"[voip] sip socket fail".as_ptr(), 22);
+    if s.sip_net_out < 0 {
+        dev_log(sys, 1, b"[voip] sip no net".as_ptr(), 17);
         s.sip_state = SipPhase::Error;
         return;
     }
-    s.sip_socket = handle;
 
-    let mut port_arg = s.local_sip_port.to_le_bytes();
-    let rc = (dev_call)(handle, DEV_SOCKET_BIND, port_arg.as_mut_ptr(), 2);
-    if rc < 0 && rc != E_INPROGRESS {
-        dev_log(sys, 1, b"[voip] sip bind fail".as_ptr(), 20);
-        (dev_call)(handle, DEV_SOCKET_CLOSE, core::ptr::null_mut(), 0);
-        s.sip_state = SipPhase::Error;
-        return;
+    // CMD_BIND payload: [port: u16 LE]
+    let port_le = s.local_sip_port.to_le_bytes();
+    let wrote = net_write_frame(
+        sys, s.sip_net_out, NET_CMD_BIND,
+        port_le.as_ptr(), 2,
+        s.sip_net_buf.as_mut_ptr(), NET_BUF_SIZE,
+    );
+    if wrote == 0 {
+        return; // Channel full, retry next tick
     }
 
     s.sip_state = SipPhase::BindWait;
@@ -75,22 +73,45 @@ unsafe fn sip_step_init(s: &mut VoipState) {
 
 unsafe fn sip_step_bind_wait(s: &mut VoipState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let addr = ChannelAddr::new(s.peer_ip, s.peer_sip_port);
-    let rc = (dev_call)(
-        s.sip_socket,
-        DEV_SOCKET_CONNECT,
-        &addr as *const _ as *mut u8,
-        core::mem::size_of::<ChannelAddr>(),
-    );
+    if s.sip_net_in < 0 { return; }
 
-    if rc == E_BUSY {
+    let poll = (sys.channel_poll)(s.sip_net_in, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
         return;
     }
-    if rc < 0 && rc != E_INPROGRESS {
-        dev_log(sys, 1, b"[voip] sip conn fail".as_ptr(), 20);
+
+    let buf = s.sip_net_buf.as_mut_ptr();
+    let (msg_type, _payload_len) = net_read_frame(sys, s.sip_net_in, buf, NET_BUF_SIZE);
+
+    if msg_type == NET_MSG_ERROR {
+        dev_log(sys, 1, b"[voip] sip bind fail".as_ptr(), 20);
         s.sip_state = SipPhase::Error;
+        return;
+    }
+    if msg_type != NET_MSG_BOUND {
+        return;
+    }
+
+    // Bound — now send CMD_CONNECT: [sock_type: u8][ip: u32 LE][port: u16 LE]
+    let ip_le = s.peer_ip.to_le_bytes();
+    let port_le = s.peer_sip_port.to_le_bytes();
+    let payload = s.sip_net_buf.as_mut_ptr();
+    *payload = SOCK_TYPE_DGRAM;
+    *payload.add(1) = ip_le[0];
+    *payload.add(2) = ip_le[1];
+    *payload.add(3) = ip_le[2];
+    *payload.add(4) = ip_le[3];
+    *payload.add(5) = port_le[0];
+    *payload.add(6) = port_le[1];
+
+    let scratch = s.sip_tx_buf.as_mut_ptr(); // Reuse sip_tx_buf as scratch
+    let wrote = net_write_frame(
+        sys, s.sip_net_out, NET_CMD_CONNECT,
+        payload, 7,
+        scratch, SIP_TX_BUF_SIZE,
+    );
+    if wrote == 0 {
         return;
     }
 
@@ -99,17 +120,24 @@ unsafe fn sip_step_bind_wait(s: &mut VoipState) {
 
 unsafe fn sip_step_connect_wait(s: &mut VoipState) {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
 
-    let mut poll_arg = [POLL_CONN | POLL_ERR];
-    let poll = (dev_call)(s.sip_socket, DEV_SOCKET_POLL, poll_arg.as_mut_ptr(), 1);
+    if s.sip_net_in < 0 { return; }
 
-    if poll > 0 && ((poll as u8) & POLL_ERR) != 0 {
-        dev_log(sys, 1, b"[voip] sip poll err".as_ptr(), 19);
+    let poll = (sys.channel_poll)(s.sip_net_in, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        return;
+    }
+
+    let buf = s.sip_net_buf.as_mut_ptr();
+    let (msg_type, payload_len) = net_read_frame(sys, s.sip_net_in, buf, NET_BUF_SIZE);
+
+    if msg_type == NET_MSG_ERROR {
+        dev_log(sys, 1, b"[voip] sip conn err".as_ptr(), 19);
         s.sip_state = SipPhase::Error;
         return;
     }
-    if poll > 0 && ((poll as u8) & POLL_CONN) != 0 {
+    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+        s.sip_conn_id = *buf.add(NET_FRAME_HDR);
         dev_log(sys, 3, b"[voip] sip listening".as_ptr(), 20);
         s.sip_state = SipPhase::Ready;
     }
@@ -124,7 +152,7 @@ unsafe fn sip_step_ready(s: &mut VoipState) {
 
     if s.ctrl_chan >= 0 {
         let poll = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
-        if poll > 0 && ((poll as u8) & POLL_IN) != 0 {
+        if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
             let mut buf = [0u8; 1];
             let read = (sys.channel_read)(s.ctrl_chan, buf.as_mut_ptr(), 1);
             if read > 0 {
@@ -205,7 +233,7 @@ unsafe fn sip_step_active(s: &mut VoipState) {
 
     if s.ctrl_chan >= 0 {
         let poll = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
-        if poll > 0 && ((poll as u8) & POLL_IN) != 0 {
+        if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
             let mut buf = [0u8; 1];
             let read = (sys.channel_read)(s.ctrl_chan, buf.as_mut_ptr(), 1);
             if read > 0 {
@@ -763,30 +791,53 @@ unsafe fn sip_flush_tx(s: &mut VoipState) {
     if s.sip_tx_len == 0 {
         return;
     }
-    let dev_call = (&*s.syscalls).dev_call;
-    let sent = (dev_call)(
-        s.sip_socket,
-        DEV_SOCKET_SEND,
-        s.sip_tx_buf.as_mut_ptr(),
-        s.sip_tx_len as usize,
-    );
-    if sent < 0 && sent != E_AGAIN {
-        dev_log(&*s.syscalls, 2, b"[voip] send err".as_ptr(), 15);
+    let sys = &*s.syscalls;
+    if s.sip_net_out < 0 { return; }
+
+    // Build CMD_SEND frame: [CMD_SEND][len_lo][len_hi][conn_id][sip_data...]
+    let data_len = s.sip_tx_len as usize;
+    let scratch = s.sip_net_buf.as_mut_ptr();
+    let frame_payload_len = 1 + data_len; // conn_id + SIP data
+    if frame_payload_len + NET_FRAME_HDR <= NET_BUF_SIZE {
+        *scratch = NET_CMD_SEND;
+        *scratch.add(1) = (frame_payload_len & 0xFF) as u8;
+        *scratch.add(2) = ((frame_payload_len >> 8) & 0xFF) as u8;
+        *scratch.add(NET_FRAME_HDR) = s.sip_conn_id;
+        core::ptr::copy_nonoverlapping(
+            s.sip_tx_buf.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data_len,
+        );
+        let frame_total = NET_FRAME_HDR + frame_payload_len;
+        let sent = (sys.channel_write)(s.sip_net_out, scratch, frame_total);
+        if sent < 0 && sent != E_AGAIN {
+            dev_log(sys, 2, b"[voip] send err".as_ptr(), 15);
+        }
     }
 }
 
 unsafe fn sip_try_receive(s: &mut VoipState) {
-    let dev_call = (&*s.syscalls).dev_call;
-    let read = (dev_call)(
-        s.sip_socket,
-        DEV_SOCKET_RECV,
-        s.sip_rx_buf.as_mut_ptr(),
-        SIP_RX_BUF_SIZE,
-    );
-    if read > 0 {
-        s.sip_rx_have = read as u16;
-    } else {
-        s.sip_rx_have = 0;
+    let sys = &*s.syscalls;
+    s.sip_rx_have = 0;
+
+    if s.sip_net_in < 0 { return; }
+
+    let poll = (sys.channel_poll)(s.sip_net_in, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+        return;
+    }
+
+    let buf = s.sip_net_buf.as_mut_ptr();
+    let (msg_type, payload_len) = net_read_frame(sys, s.sip_net_in, buf, NET_BUF_SIZE);
+
+    if msg_type == NET_MSG_DATA && payload_len > 1 {
+        // MSG_DATA payload: [conn_id: u8][data...] — copy data to sip_rx_buf
+        let data_len = payload_len - 1;
+        let copy_len = if data_len > SIP_RX_BUF_SIZE { SIP_RX_BUF_SIZE } else { data_len };
+        __aeabi_memcpy(
+            s.sip_rx_buf.as_mut_ptr(),
+            buf.add(NET_FRAME_HDR + 1),
+            copy_len,
+        );
+        s.sip_rx_have = copy_len as u16;
     }
 }
 

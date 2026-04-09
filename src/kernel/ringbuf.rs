@@ -1,11 +1,10 @@
-//! Shared ring buffer state for FIFO channels and sockets.
+//! Shared ring buffer state for FIFO channels.
 
 /// Tracks head/tail/len for a circular byte buffer.
 ///
 /// Storage is external — callers pass a `&[u8]` or `&mut [u8]` slice
-/// that backs the ring. This lets the same logic serve both:
-/// - channel FIFO (arena-allocated buffer, capacity set at open time)
-/// - socket TX/RX (inline `[u8; N]` array)
+/// that backs the ring. Used by channel FIFOs (arena-allocated buffer,
+/// capacity set at open time).
 ///
 /// Capacity MUST be a power of two. This allows wrap-around to use
 /// bitwise AND (`& cap_mask`) instead of modulo division — saving

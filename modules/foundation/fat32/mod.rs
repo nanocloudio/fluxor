@@ -413,7 +413,7 @@ unsafe fn parse_mbr(buf: &[u8]) -> u32 {
 #[inline]
 unsafe fn try_read_block(s: &mut Fat32State) -> i32 {
     let poll = (s.sys().channel_poll)(s.in_chan, POLL_IN);
-    if poll <= 0 || (poll as u8 & POLL_IN) == 0 {
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
         return 0;
     }
     let fill = s.read_fill as usize;
@@ -1103,7 +1103,7 @@ unsafe fn stream_step(s: &mut Fat32State) -> i32 {
             } else {
                 // Check if output is ready
                 let poll = (s.sys().channel_poll)(s.out_chan, POLL_OUT);
-                if poll <= 0 || (poll as u8 & POLL_OUT) == 0 {
+                if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
                     return 0;
                 }
 

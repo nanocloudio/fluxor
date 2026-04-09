@@ -5,11 +5,11 @@
 //!
 //! # Architecture
 //!
-//! Uses two UDP sockets:
-//! - **Server socket** — bound to port 53, unconnected (framed mode)
-//!   Receives queries from any client with `[src_ip:4][src_port:2][len:2][payload]`
-//! - **Upstream socket** — connected to upstream DNS (raw mode)
-//!   Forwards non-local queries and relays responses
+//! Uses channel-based net protocol through the IP module:
+//! - **Server conn** — CMD_BIND on port 53, receives MSG_DATA with source addressing
+//!   MSG_DATA payload: [conn_id:1][src_ip:4 LE][src_port:2 LE][dns_data...]
+//! - **Upstream conn** — CMD_CONNECT to upstream DNS, receives MSG_DATA (raw)
+//!   MSG_DATA payload: [conn_id:1][dns_data...]
 //!
 //! # Parameters
 //!
@@ -52,8 +52,20 @@ const FLAG_RA: u16 = 0x0080;       // Recursion available
 const FLAG_RD: u16 = 0x0100;       // Recursion desired
 const RCODE_NXDOMAIN: u16 = 0x0003;
 
-/// Framed UDP header size: [ip:4][port:2][len:2]
-const FRAME_HDR_LEN: usize = 8;
+/// Net protocol frame constants
+const NET_MSG_DATA: u8 = 0x02;
+const NET_MSG_BOUND: u8 = 0x04;
+const NET_MSG_CONNECTED: u8 = 0x05;
+const NET_MSG_ERROR: u8 = 0x06;
+const NET_CMD_BIND: u8 = 0x10;
+const NET_CMD_SEND: u8 = 0x11;
+const NET_CMD_CONNECT: u8 = 0x13;
+
+/// Net buffer size (frame header + conn_id + addressing + DNS packet)
+const NET_BUF_SIZE: usize = 600;
+
+/// UDP addressing prefix in MSG_DATA/CMD_SEND for bound conns: [ip:4][port:2]
+const UDP_ADDR_LEN: usize = 6;
 
 /// Maximum local host entries
 const MAX_HOSTS: usize = 16;
@@ -72,9 +84,9 @@ const MAX_NAME_LEN: usize = 63;
 #[derive(Clone, Copy, PartialEq)]
 enum DnsPhase {
     Init = 0,
-    OpenServer = 1,
-    WaitBind = 2,
-    OpenUpstream = 3,
+    Binding = 1,
+    WaitBound = 2,
+    Connecting = 3,
     WaitConnect = 4,
     Serving = 5,
     Error = 255,
@@ -164,16 +176,18 @@ impl PendingQuery {
 #[repr(C)]
 struct DnsState {
     syscalls: *const SyscallTable,
-    in_chan: i32,
-    out_chan: i32,
-    server_sock: i32,
-    upstream_sock: i32,
+    net_in_chan: i32,
+    net_out_chan: i32,
 
     upstream_ip: u32,
     ttl: u32,
     listen_port: u16,
     phase: DnsPhase,
     host_count: u8,
+
+    /// Conn IDs assigned by the IP module
+    server_conn_id: u8,
+    upstream_conn_id: u8,
 
     // Statistics
     queries_local: u32,
@@ -185,23 +199,25 @@ struct DnsState {
     // Pending upstream queries
     pending: [PendingQuery; MAX_PENDING],
 
-    // Packet buffers
-    rx_buf: [u8; DNS_MAX_PACKET + FRAME_HDR_LEN],
-    tx_buf: [u8; DNS_MAX_PACKET + FRAME_HDR_LEN],
+    // Net protocol frame buffer (shared for TX)
+    net_buf: [u8; NET_BUF_SIZE],
+
+    // DNS packet work buffer
+    tx_buf: [u8; DNS_MAX_PACKET],
 }
 
 impl DnsState {
     fn init(&mut self, syscalls: *const SyscallTable) {
         self.syscalls = syscalls;
-        self.in_chan = -1;
-        self.out_chan = -1;
-        self.server_sock = -1;
-        self.upstream_sock = -1;
+        self.net_in_chan = -1;
+        self.net_out_chan = -1;
         self.upstream_ip = 0x08080808; // 8.8.8.8
         self.ttl = 300;
         self.listen_port = 53;
         self.phase = DnsPhase::Init;
         self.host_count = 0;
+        self.server_conn_id = 0;
+        self.upstream_conn_id = 0;
         self.queries_local = 0;
         self.queries_forwarded = 0;
     }
@@ -654,37 +670,83 @@ unsafe fn build_nxdomain(
     copy_len
 }
 
-/// Send a DNS packet via the framed server socket.
-/// Prepends [dst_ip:4][dst_port:2][len:2] header.
-unsafe fn send_framed(
-    s: &mut DnsState,
+/// Send a DNS reply via CMD_SEND on the server conn (bound UDP).
+/// Builds: [CMD_SEND][len:2 LE][conn_id:1][dst_ip:4 LE][dst_port:2 LE][dns_data...]
+///
+/// Uses raw state pointer to access net_buf independently of any &mut borrow,
+/// since the received frame data has already been consumed by caller.
+unsafe fn send_server_reply(
+    state: *mut DnsState,
     dst_ip: u32,
     dst_port: u16,
     dns_data: *const u8,
     dns_len: usize,
 ) {
-    let total = FRAME_HDR_LEN + dns_len;
-    if total > s.tx_buf.len() { return; }
+    let net_out = (*state).net_out_chan;
+    let conn_id = (*state).server_conn_id;
+    let sys = (*state).syscalls;
+    if net_out < 0 { return; }
+    let payload_len = 1 + UDP_ADDR_LEN + dns_len; // conn_id + addr + data
+    let total = NET_FRAME_HDR + payload_len;
+    if total > NET_BUF_SIZE { return; }
 
-    let buf = s.tx_buf.as_mut_ptr();
+    let buf = (*state).net_buf.as_mut_ptr();
 
     // Frame header
-    let ip_bytes = dst_ip.to_le_bytes();
-    *buf = ip_bytes[0]; *buf.add(1) = ip_bytes[1];
-    *buf.add(2) = ip_bytes[2]; *buf.add(3) = ip_bytes[3];
-    let port_bytes = dst_port.to_le_bytes();
-    *buf.add(4) = port_bytes[0]; *buf.add(5) = port_bytes[1];
-    let len_bytes = (dns_len as u16).to_le_bytes();
-    *buf.add(6) = len_bytes[0]; *buf.add(7) = len_bytes[1];
+    *buf = NET_CMD_SEND;
+    let pl = (payload_len as u16).to_le_bytes();
+    *buf.add(1) = pl[0];
+    *buf.add(2) = pl[1];
 
-    // Copy DNS payload
+    // Payload: conn_id + addressing + DNS data
+    *buf.add(3) = conn_id;
+    let ip_bytes = dst_ip.to_le_bytes();
+    *buf.add(4) = ip_bytes[0]; *buf.add(5) = ip_bytes[1];
+    *buf.add(6) = ip_bytes[2]; *buf.add(7) = ip_bytes[3];
+    let port_bytes = dst_port.to_le_bytes();
+    *buf.add(8) = port_bytes[0]; *buf.add(9) = port_bytes[1];
+
     let mut i = 0;
     while i < dns_len {
-        *buf.add(FRAME_HDR_LEN + i) = *dns_data.add(i);
+        *buf.add(10 + i) = *dns_data.add(i);
         i += 1;
     }
 
-    dev_socket_send(s.sys(), s.server_sock, buf as *const u8, total);
+    ((*sys).channel_write)(net_out, buf, total);
+}
+
+/// Send a DNS query via CMD_SEND on the upstream conn (connected UDP).
+/// Builds: [CMD_SEND][len:2 LE][conn_id:1][dns_data...]
+///
+/// Uses raw state pointer to access net_buf independently of any &mut borrow.
+unsafe fn send_upstream_query(
+    state: *mut DnsState,
+    dns_data: *const u8,
+    dns_len: usize,
+) {
+    let net_out = (*state).net_out_chan;
+    let conn_id = (*state).upstream_conn_id;
+    let sys = (*state).syscalls;
+    if net_out < 0 { return; }
+    let payload_len = 1 + dns_len; // conn_id + data
+    let total = NET_FRAME_HDR + payload_len;
+    if total > NET_BUF_SIZE { return; }
+
+    let buf = (*state).net_buf.as_mut_ptr();
+
+    *buf = NET_CMD_SEND;
+    let pl = (payload_len as u16).to_le_bytes();
+    *buf.add(1) = pl[0];
+    *buf.add(2) = pl[1];
+    *buf.add(3) = conn_id;
+
+    let mut i = 0;
+    while i < dns_len {
+        *buf.add(4 + i) = *dns_data.add(i);
+        i += 1;
+    }
+
+    ((*sys).channel_write)(net_out, buf, total);
 }
 
 /// Store a pending upstream query.
@@ -803,11 +865,11 @@ unsafe fn handle_query(
                     // Build and send local A response
                     let resp_len = build_a_response(
                         s, pkt, pkt_len, question_end, ip,
-                        tx_ptr.add(FRAME_HDR_LEN),
+                        tx_ptr,
                     );
                     if resp_len > 0 {
-                        send_framed(s, client_ip, client_port,
-                            tx_ptr.add(FRAME_HDR_LEN) as *const u8, resp_len);
+                        send_server_reply(s as *mut DnsState, client_ip, client_port,
+                            tx_ptr as *const u8, resp_len);
                         s.queries_local += 1;
                     }
                 }
@@ -824,11 +886,11 @@ unsafe fn handle_query(
                 // Send empty response (no answer, no error) — host exists but no IPv6
                 let resp_len = build_empty_response(
                     pkt, pkt_len,
-                    tx_ptr.add(FRAME_HDR_LEN),
+                    tx_ptr,
                 );
                 if resp_len > 0 {
-                    send_framed(s, client_ip, client_port,
-                        tx_ptr.add(FRAME_HDR_LEN) as *const u8, resp_len);
+                    send_server_reply(s as *mut DnsState, client_ip, client_port,
+                        tx_ptr as *const u8, resp_len);
                 }
             } else {
                 forward_to_upstream(s, id, client_ip, client_port, pkt, pkt_len);
@@ -840,11 +902,11 @@ unsafe fn handle_query(
                 Some((_ip, host_idx)) => {
                     let resp_len = build_ptr_response(
                         s, pkt, pkt_len, question_end, host_idx,
-                        tx_ptr.add(FRAME_HDR_LEN),
+                        tx_ptr,
                     );
                     if resp_len > 0 {
-                        send_framed(s, client_ip, client_port,
-                            tx_ptr.add(FRAME_HDR_LEN) as *const u8, resp_len);
+                        send_server_reply(s as *mut DnsState, client_ip, client_port,
+                            tx_ptr as *const u8, resp_len);
                         s.queries_local += 1;
                     }
                 }
@@ -899,13 +961,13 @@ unsafe fn forward_to_upstream(
     pkt: *const u8,
     pkt_len: usize,
 ) {
-    if s.upstream_sock < 0 { return; }
+    if s.upstream_conn_id == 0 { return; }
 
     // Store pending entry
     store_pending(s, dns_id, client_ip, client_port);
 
-    // Send query to upstream via connected socket (raw mode)
-    dev_socket_send(s.sys(), s.upstream_sock, pkt, pkt_len);
+    // Send query to upstream via CMD_SEND on connected conn
+    send_upstream_query(s as *mut DnsState, pkt, pkt_len);
     s.queries_forwarded += 1;
 }
 
@@ -917,8 +979,8 @@ unsafe fn handle_upstream_response(s: &mut DnsState, pkt: *const u8, pkt_len: us
 
     // Find the pending query for this transaction ID
     if let Some((client_ip, client_port)) = take_pending(s, id) {
-        // Relay response back to original client via framed server socket
-        send_framed(s, client_ip, client_port, pkt, pkt_len);
+        // Relay response back to original client via server conn
+        send_server_reply(s as *mut DnsState, client_ip, client_port, pkt, pkt_len);
     }
 }
 
@@ -955,8 +1017,10 @@ pub extern "C" fn module_new(
 
         let s = &mut *(state as *mut DnsState);
         s.init(syscalls as *const SyscallTable);
-        s.in_chan = in_chan;
-        s.out_chan = out_chan;
+
+        // Net channels: in[0] = net_in (from IP), out[0] = net_out (to IP)
+        s.net_in_chan = in_chan;
+        s.net_out_chan = out_chan;
 
         // Parse TLV params
         let is_tlv = !params.is_null() && params_len >= 4
@@ -967,7 +1031,7 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        log_info(s, b"[dns] ready");
+        log_info(s, b"[dns] init");
 
         0
     }
@@ -983,113 +1047,139 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         match s.phase {
             DnsPhase::Init => {
-                s.phase = DnsPhase::OpenServer;
+                s.phase = DnsPhase::Binding;
             }
 
-            DnsPhase::OpenServer => {
-                let handle = dev_socket_open(s.sys(), SOCK_TYPE_DGRAM);
-                if handle < 0 {
-                    log_err(s, b"[dns] server socket_open failed");
-                    s.phase = DnsPhase::Error;
-                    return -1;
-                }
-                s.server_sock = handle;
+            DnsPhase::Binding => {
+                // Send CMD_BIND for the server port
+                if s.net_out_chan < 0 { return 0; }
+                let sys = &*s.syscalls;
+                let buf = s.net_buf.as_mut_ptr();
+                let mut payload = [0u8; 2];
+                let pp = payload.as_mut_ptr();
+                let port_bytes = s.listen_port.to_le_bytes();
+                *pp = port_bytes[0];
+                *pp.add(1) = port_bytes[1];
+                let wrote = net_write_frame(sys, s.net_out_chan, NET_CMD_BIND, payload.as_ptr(), 2, buf, NET_BUF_SIZE);
+                if wrote == 0 { return 0; }
+                s.phase = DnsPhase::WaitBound;
+                return 2;
+            }
 
-                // Bind to listen port
-                let rc = dev_socket_bind(s.sys(), handle, s.listen_port);
-                if rc < 0 && rc != E_INPROGRESS {
+            DnsPhase::WaitBound => {
+                if s.net_in_chan < 0 { return 0; }
+                let sys = &*s.syscalls;
+                let chan = s.net_in_chan;
+                let poll = (sys.channel_poll)(chan, POLL_IN);
+                if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
+
+                let buf = s.net_buf.as_mut_ptr();
+                let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+                if msg_type == NET_MSG_BOUND {
+                    // Extract conn_id from payload
+                    if payload_len >= 1 {
+                        s.server_conn_id = *buf.add(NET_FRAME_HDR);
+                    }
+                    log_info(s, b"[dns] bound");
+                    s.phase = DnsPhase::Connecting;
+                    return 2;
+                } else if msg_type == NET_MSG_ERROR {
                     log_err(s, b"[dns] bind failed");
                     s.phase = DnsPhase::Error;
                     return -1;
                 }
-                s.phase = DnsPhase::WaitBind;
             }
 
-            DnsPhase::WaitBind => {
-                // Bind completes synchronously for UDP
-                // Move on to open upstream socket
-                s.phase = DnsPhase::OpenUpstream;
-            }
-
-            DnsPhase::OpenUpstream => {
-                let handle = dev_socket_open(s.sys(), SOCK_TYPE_DGRAM);
-                if handle < 0 {
-                    log_err(s, b"[dns] upstream socket_open failed");
-                    s.phase = DnsPhase::Error;
-                    return -1;
-                }
-                s.upstream_sock = handle;
-
-                // Connect to upstream DNS server
-                let mut addr = [0u8; 6];
-                let ap = addr.as_mut_ptr();
+            DnsPhase::Connecting => {
+                // Send CMD_CONNECT for the upstream DNS server (UDP)
+                if s.net_out_chan < 0 { return 0; }
+                let sys = &*s.syscalls;
+                let buf = s.net_buf.as_mut_ptr();
+                // CMD_CONNECT payload: [sock_type: u8] [ip: u32 LE] [port: u16 LE]
+                let mut payload = [0u8; 7];
+                let pp = payload.as_mut_ptr();
+                *pp = SOCK_TYPE_DGRAM;
                 let ip_bytes = s.upstream_ip.to_le_bytes();
-                *ap = ip_bytes[0]; *ap.add(1) = ip_bytes[1];
-                *ap.add(2) = ip_bytes[2]; *ap.add(3) = ip_bytes[3];
-                // Port 53
+                *pp.add(1) = ip_bytes[0];
+                *pp.add(2) = ip_bytes[1];
+                *pp.add(3) = ip_bytes[2];
+                *pp.add(4) = ip_bytes[3];
                 let port_bytes = 53u16.to_le_bytes();
-                *ap.add(4) = port_bytes[0]; *ap.add(5) = port_bytes[1];
-
-                let rc = dev_socket_connect(s.sys(), handle, addr.as_mut_ptr());
-                if rc < 0 && rc != E_INPROGRESS {
-                    log_err(s, b"[dns] upstream connect failed");
-                    s.phase = DnsPhase::Error;
-                    return -1;
-                }
+                *pp.add(5) = port_bytes[0];
+                *pp.add(6) = port_bytes[1];
+                let wrote = net_write_frame(sys, s.net_out_chan, NET_CMD_CONNECT, payload.as_ptr(), 7, buf, NET_BUF_SIZE);
+                if wrote == 0 { return 0; }
                 s.phase = DnsPhase::WaitConnect;
             }
 
             DnsPhase::WaitConnect => {
-                let poll = dev_socket_poll(s.sys(), s.upstream_sock, POLL_CONN);
-                if poll <= 0 { return 0; }
-                if (poll as u8 & POLL_CONN) != 0 {
+                if s.net_in_chan < 0 { return 0; }
+                let sys = &*s.syscalls;
+                let chan = s.net_in_chan;
+                let poll = (sys.channel_poll)(chan, POLL_IN);
+                if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
+
+                let buf = s.net_buf.as_mut_ptr();
+                let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+                if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                    s.upstream_conn_id = *buf.add(NET_FRAME_HDR);
                     log_info(s, b"[dns] serving");
                     s.phase = DnsPhase::Serving;
+                    return 2;
+                } else if msg_type == NET_MSG_ERROR {
+                    log_err(s, b"[dns] upstream connect failed");
+                    s.phase = DnsPhase::Error;
+                    return -1;
                 }
             }
 
             DnsPhase::Serving => {
                 let mut did_work = false;
-                let sys = s.syscalls;
-                let rx_ptr = s.rx_buf.as_mut_ptr();
-                let rx_len = s.rx_buf.len();
 
-                // Poll server socket for incoming queries
-                let poll = dev_socket_poll(&*sys, s.server_sock, POLL_IN);
-                if poll > 0 && (poll as u8 & POLL_IN) != 0 {
-                    // Read framed data: [src_ip:4][src_port:2][len:2][payload]
-                    let n = dev_socket_recv(&*sys, s.server_sock, rx_ptr, rx_len);
-                    if n >= FRAME_HDR_LEN as i32 {
-                        let buf = rx_ptr as *const u8;
-                        let client_ip = u32::from_le_bytes([
-                            *buf, *buf.add(1), *buf.add(2), *buf.add(3)
-                        ]);
-                        let client_port = u16::from_le_bytes([
-                            *buf.add(4), *buf.add(5)
-                        ]);
-                        let payload_len = u16::from_le_bytes([
-                            *buf.add(6), *buf.add(7)
-                        ]) as usize;
+                // Read net protocol frames from net_in channel
+                let chan = s.net_in_chan;
+                if chan < 0 { return 0; }
 
-                        let actual_payload = (n as usize) - FRAME_HDR_LEN;
-                        let dns_len = payload_len.min(actual_payload);
+                let sys = &*s.syscalls;
+                let poll = (sys.channel_poll)(chan, POLL_IN);
+                if poll > 0 && (poll as u32 & POLL_IN) != 0 {
+                    let buf = s.net_buf.as_mut_ptr();
+                    let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
 
-                        if dns_len >= DNS_HEADER_LEN {
-                            handle_query(
-                                s, client_ip, client_port,
-                                buf.add(FRAME_HDR_LEN), dns_len,
-                            );
+                    if msg_type == NET_MSG_DATA && payload_len >= 1 {
+                        let conn_id = *buf.add(NET_FRAME_HDR);
+                        let server_cid = s.server_conn_id;
+                        let upstream_cid = s.upstream_conn_id;
+
+                        if conn_id == server_cid {
+                            // Server data: [conn_id:1][src_ip:4 LE][src_port:2 LE][dns_data...]
+                            if payload_len >= 1 + UDP_ADDR_LEN + DNS_HEADER_LEN {
+                                let p = buf.add(NET_FRAME_HDR + 1);
+                                let client_ip = u32::from_le_bytes([
+                                    *p, *p.add(1), *p.add(2), *p.add(3)
+                                ]);
+                                let client_port = u16::from_le_bytes([
+                                    *p.add(4), *p.add(5)
+                                ]);
+                                let dns_data = p.add(UDP_ADDR_LEN) as *const u8;
+                                let dns_len = payload_len - 1 - UDP_ADDR_LEN;
+
+                                if dns_len >= DNS_HEADER_LEN {
+                                    handle_query(
+                                        s, client_ip, client_port,
+                                        dns_data, dns_len,
+                                    );
+                                }
+                            }
+                        } else if conn_id == upstream_cid {
+                            // Upstream data: [conn_id:1][dns_data...]
+                            let dns_data = buf.add(NET_FRAME_HDR + 1) as *const u8;
+                            let dns_len = payload_len - 1;
+
+                            if dns_len >= DNS_HEADER_LEN {
+                                handle_upstream_response(s, dns_data, dns_len);
+                            }
                         }
-                        did_work = true;
-                    }
-                }
-
-                // Poll upstream socket for responses
-                let poll = dev_socket_poll(&*sys, s.upstream_sock, POLL_IN);
-                if poll > 0 && (poll as u8 & POLL_IN) != 0 {
-                    let n = dev_socket_recv(&*sys, s.upstream_sock, rx_ptr, DNS_MAX_PACKET);
-                    if n > 0 {
-                        handle_upstream_response(s, rx_ptr as *const u8, n as usize);
                         did_work = true;
                     }
                 }

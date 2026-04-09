@@ -203,7 +203,7 @@ unsafe fn emit_notification(s: &BankState) {
     }
     let chan = s.out_chans[1];
     let poll = (s.sys().channel_poll)(chan, POLL_OUT);
-    if poll > 0 && (poll as u8 & POLL_OUT) != 0 {
+    if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
         let mut payload = [0u8; 6];
         let ib = s.index.to_le_bytes();
         payload[0] = ib[0]; payload[1] = ib[1];
@@ -316,7 +316,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.ctrl_chan >= 0 {
             let sys = &*s.syscalls;
             let poll_ctrl = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
-            if poll_ctrl > 0 && (poll_ctrl as u8 & POLL_IN) != 0 {
+            if poll_ctrl > 0 && (poll_ctrl as u32 & POLL_IN) != 0 {
                 let (ty, _len) = msg_read(sys, s.ctrl_chan, s.msg_buf.as_mut_ptr(), 16);
                 if ty != 0 {
                     match ty {
@@ -370,7 +370,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // EOF handling: detect EOF from fat32 (file finished streaming)
         if s.paused == 0 && s.in_chan >= 0 && s.phase == BankPhase::Running {
             let poll = (s.sys().channel_poll)(s.in_chan, POLL_IN | POLL_HUP);
-            if poll > 0 && ((poll as u8) & POLL_HUP) != 0 && ((poll as u8) & POLL_IN) == 0 {
+            if poll > 0 && ((poll as u32) & POLL_HUP) != 0 && ((poll as u32) & POLL_IN) == 0 {
                 if s.auto_advance != 0 {
                     // Auto-advance to next file
                     if advance_next(s) {
@@ -404,10 +404,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
 
-            if poll_in > 0 && (poll_in as u8 & POLL_IN) != 0 {
+            if poll_in > 0 && (poll_in as u32 & POLL_IN) != 0 {
                 // Check if we can write
                 let poll_out = (s.sys().channel_poll)(s.out_chans[0], POLL_OUT);
-                if poll_out > 0 && (poll_out as u8 & POLL_OUT) != 0 {
+                if poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0 {
                     // Read data
                     let read = (s.sys().channel_read)(
                         s.in_chan,

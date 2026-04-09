@@ -133,11 +133,11 @@ pub unsafe fn build_dhcp_message(
         i += 1;
     }
 
-    // Magic cookie at offset 236
-    *d.add(236) = DHCP_MAGIC[0];
-    *d.add(237) = DHCP_MAGIC[1];
-    *d.add(238) = DHCP_MAGIC[2];
-    *d.add(239) = DHCP_MAGIC[3];
+    // Magic cookie at offset 236 (inline to avoid PIC rodata issues)
+    *d.add(236) = 99;   // 0x63
+    *d.add(237) = 130;  // 0x82
+    *d.add(238) = 83;   // 0x53
+    *d.add(239) = 99;   // 0x63
 
     // DHCP options
     let mut opt = 240;
@@ -190,32 +190,62 @@ pub unsafe fn build_dhcp_message(
     // Pad to minimum 300 bytes
     let dhcp_len = if dhcp_len < 300 { 300 } else { dhcp_len };
 
-    // Build UDP header
+    // Build UDP header manually (the checksum computation in build_udp_header
+    // produces wrong results on aarch64 PIC due to rodata constant issues).
+    // DHCP allows UDP checksum = 0 (RFC 768: "no checksum").
     let udp_start = buf.add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
-    udp::build_udp_header(
-        udp_start,
-        DHCP_CLIENT_PORT,
-        DHCP_SERVER_PORT,
-        dhcp_len,
-        0, // src_ip = 0.0.0.0
-        0xFFFFFFFF, // dst_ip = broadcast
-        d, // payload
-    );
+    let udp_len = (udp::UDP_HEADER_LEN + dhcp_len) as u16;
+    core::ptr::write_volatile(udp_start, (DHCP_CLIENT_PORT >> 8) as u8);
+    core::ptr::write_volatile(udp_start.add(1), (DHCP_CLIENT_PORT & 0xFF) as u8);
+    core::ptr::write_volatile(udp_start.add(2), (DHCP_SERVER_PORT >> 8) as u8);
+    core::ptr::write_volatile(udp_start.add(3), (DHCP_SERVER_PORT & 0xFF) as u8);
+    core::ptr::write_volatile(udp_start.add(4), (udp_len >> 8) as u8);
+    core::ptr::write_volatile(udp_start.add(5), (udp_len & 0xFF) as u8);
+    core::ptr::write_volatile(udp_start.add(6), 0x00u8); // checksum = 0 (disabled)
+    core::ptr::write_volatile(udp_start.add(7), 0x00u8);
 
-    // Build IPv4 header
+    // Build headers with write_volatile to prevent compiler reordering/elision.
+    // The shared build_eth_header/build_ipv4_header helpers have aarch64 PIC
+    // code generation issues where rodata constants load incorrect values.
     let ip_total = (ipv4::IPV4_HEADER_LEN + udp::UDP_HEADER_LEN + dhcp_len) as u16;
-    let ip_start = buf.add(eth::ETH_HEADER_LEN);
-    ipv4::build_ipv4_header(
-        ip_start,
-        ip_total,
-        ipv4::PROTO_UDP,
-        0,           // src = 0.0.0.0
-        0xFFFFFFFF,  // dst = broadcast
-        0,
-    );
 
-    // Build Ethernet header (broadcast)
-    eth::build_eth_header(buf, &eth::BROADCAST_MAC, mac, eth::ETHERTYPE_IPV4);
+    // Ethernet header (14 bytes)
+    let mut j = 0usize;
+    while j < 6 {
+        core::ptr::write_volatile(buf.add(j), 0xFFu8);
+        core::ptr::write_volatile(buf.add(6 + j), core::ptr::read_volatile(mac.as_ptr().add(j)));
+        j += 1;
+    }
+    core::ptr::write_volatile(buf.add(12), 0x08u8);
+    core::ptr::write_volatile(buf.add(13), 0x00u8);
+
+    // IPv4 header (20 bytes at offset 14)
+    let ip = buf.add(14);
+    core::ptr::write_volatile(ip, 0x45u8);
+    core::ptr::write_volatile(ip.add(1), 0x00u8);
+    core::ptr::write_volatile(ip.add(2), (ip_total >> 8) as u8);
+    core::ptr::write_volatile(ip.add(3), (ip_total & 0xFF) as u8);
+    core::ptr::write_volatile(ip.add(4), 0x00u8);
+    core::ptr::write_volatile(ip.add(5), 0x00u8);
+    core::ptr::write_volatile(ip.add(6), 0x40u8);
+    core::ptr::write_volatile(ip.add(7), 0x00u8);
+    core::ptr::write_volatile(ip.add(8), 64u8);
+    core::ptr::write_volatile(ip.add(9), 17u8);
+    core::ptr::write_volatile(ip.add(10), 0x00u8);
+    core::ptr::write_volatile(ip.add(11), 0x00u8);
+    // src: 0.0.0.0
+    core::ptr::write_volatile(ip.add(12), 0x00u8);
+    core::ptr::write_volatile(ip.add(13), 0x00u8);
+    core::ptr::write_volatile(ip.add(14), 0x00u8);
+    core::ptr::write_volatile(ip.add(15), 0x00u8);
+    // dst: 255.255.255.255
+    core::ptr::write_volatile(ip.add(16), 0xFFu8);
+    core::ptr::write_volatile(ip.add(17), 0xFFu8);
+    core::ptr::write_volatile(ip.add(18), 0xFFu8);
+    core::ptr::write_volatile(ip.add(19), 0xFFu8);
+    let cksum = ipv4::checksum(ip, 20);
+    core::ptr::write_volatile(ip.add(10), (cksum >> 8) as u8);
+    core::ptr::write_volatile(ip.add(11), (cksum & 0xFF) as u8);
 
     eth::ETH_HEADER_LEN + ip_total as usize
 }
@@ -252,11 +282,11 @@ pub unsafe fn parse_dhcp_reply(
         *data.add(16), *data.add(17), *data.add(18), *data.add(19),
     ]);
 
-    // Check magic cookie
-    if *data.add(236) != DHCP_MAGIC[0]
-        || *data.add(237) != DHCP_MAGIC[1]
-        || *data.add(238) != DHCP_MAGIC[2]
-        || *data.add(239) != DHCP_MAGIC[3]
+    // Check magic cookie (inline constants to avoid PIC rodata issues)
+    if *data.add(236) != 99
+        || *data.add(237) != 130
+        || *data.add(238) != 83
+        || *data.add(239) != 99
     {
         return None;
     }

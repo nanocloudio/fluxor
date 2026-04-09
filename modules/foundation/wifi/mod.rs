@@ -146,7 +146,7 @@ unsafe fn drain_status_events(s: &mut WifiConnectState) {
 
     loop {
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll <= 0 || (poll as u8 & POLL_IN) == 0 {
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
         }
         let (ty, _len) = msg_read(sys, s.in_chan, s.msg_buf.as_mut_ptr(), s.msg_buf.len());
@@ -190,7 +190,7 @@ unsafe fn read_scan_result(s: &mut WifiConnectState) -> bool {
     }
     let sys = &*s.syscalls;
     let poll = (sys.channel_poll)(s.scan_chan, POLL_IN);
-    if poll <= 0 || (poll as u8 & POLL_IN) == 0 {
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
         return false;
     }
 

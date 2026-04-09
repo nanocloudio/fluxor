@@ -624,7 +624,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 StreamPhase::Streaming => {
                     // Check if output channel is ready for writing
                     let poll = (sys.channel_poll)(s.stream_chan, POLL_OUT);
-                    if poll <= 0 || ((poll as u8) & POLL_OUT) == 0 {
+                    if poll <= 0 || ((poll as u32) & POLL_OUT) == 0 {
                         return 0; // Backpressure — try next tick
                     }
 
@@ -668,7 +668,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Emit an FMP message on the output channel.
 unsafe fn emit_msg(s: &FlashState, sys: &SyscallTable, msg_type: u32, payload: *const u8, payload_len: u16) {
     let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-    if poll > 0 && ((poll as u8) & POLL_OUT) != 0 {
+    if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
         msg_write(sys, s.out_chan, msg_type, payload, payload_len);
     }
 }
