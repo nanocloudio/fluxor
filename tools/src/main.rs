@@ -556,7 +556,17 @@ fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules
     }
     let modules_dir_default = format!("target/{}/modules", target_desc.id);
     let modules_dir = modules_dir_override.unwrap_or(std::path::Path::new(&modules_dir_default));
-    let binary_data = generate_config(&config, &builder, modules_dir, target_desc.max_pin + 1, target_desc.pio_count)?;
+
+    // Derive extra module search path from the config file's directory.
+    // If config is at /project/configs/foo.yaml, search /project/modules/ for manifests.
+    let config_parent = config_path.parent().and_then(|p| p.parent());
+    let extra_modules_dir = config_parent.map(|p| p.join("modules"));
+    let extra_dirs: Vec<&std::path::Path> = extra_modules_dir.iter().map(|p| p.as_path()).collect();
+
+    let binary_data = config::generate_config_ext(
+        &config, &builder, &[], modules_dir, &extra_dirs,
+        target_desc.max_pin + 1, target_desc.pio_count,
+    )?;
 
     eprintln!("Config size: {} bytes", binary_data.len());
     eprintln!("Note: Use 'combine' command to create a complete UF2 with trailer");
@@ -1546,19 +1556,31 @@ fn build_one(
             let config_bin_path = out_dir.join("config.bin");
             let modules_bin_path = out_dir.join("modules.bin");
 
-            // Use bcm2712 modules for linux (aarch64 compatible)
+            // Use bcm2712 modules for linux (aarch64 compatible).
+            // Search both the standard path and config-relative path.
             let modules_dir = PathBuf::from("target/bcm2712/modules");
-            if !modules_dir.exists() {
-                return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'make modules TARGET=bcm2712' first.",
-                    modules_dir.display()
-                )));
+            let mut fmod_dirs: Vec<PathBuf> = Vec::new();
+            if modules_dir.exists() {
+                fmod_dirs.push(modules_dir.clone());
+            }
+            // Also search relative to the config file's project root
+            // (e.g., config at /project/configs/foo.yaml → /project/deps/fluxor/target/bcm2712/modules/)
+            if let Some(config_parent) = yaml_path.parent().and_then(|p| p.parent()) {
+                let ext_modules = config_parent.join("deps/fluxor/target/bcm2712/modules");
+                if ext_modules.exists() {
+                    fmod_dirs.push(ext_modules);
+                }
+            }
+            if fmod_dirs.is_empty() {
+                return Err(Error::Config(
+                    "Modules not found. Run 'make modules TARGET=bcm2712' first.".into()
+                ));
             }
 
             // Generate modules.bin (mktable-config)
             cmd_mktable_config(
                 &yaml_path.to_path_buf(),
-                &[modules_dir.clone()],
+                &fmod_dirs,
                 &modules_bin_path,
             )?;
 

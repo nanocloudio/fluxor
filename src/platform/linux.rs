@@ -378,7 +378,7 @@ const CMD_SEND:    u8 = 0x11;
 const CMD_CLOSE:   u8 = 0x12;
 const CMD_CONNECT: u8 = 0x13;
 
-const LINUX_NET_MAX_CONNS: usize = 8;
+const LINUX_NET_MAX_CONNS: usize = 24;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -395,7 +395,6 @@ impl LinuxNetConn {
 struct LinuxNetState {
     net_in: i32,        // channel handle for reading CMD frames
     net_out: i32,       // channel handle for writing MSG frames
-    listen_fd: i32,     // listening socket fd (-1 = none)
     conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
     cmd_buf: [u8; 2048],  // incoming command frame buffer
     msg_buf: [u8; 2048],  // outgoing message frame assembly
@@ -406,7 +405,6 @@ struct LinuxNetState {
 static mut LINUX_NET: LinuxNetState = LinuxNetState {
     net_in: -1,
     net_out: -1,
-    listen_fd: -1,
     conns: [LinuxNetConn::EMPTY; LINUX_NET_MAX_CONNS],
     cmd_buf: [0u8; 2048],
     msg_buf: [0u8; 2048],
@@ -454,13 +452,15 @@ unsafe fn linux_net_send_msg(data: &[u8]) {
 }
 
 /// Handle CMD_BIND: create TCP listening socket on given port.
+/// Allocates a connection slot with state=3 (listening).
+/// Supports multiple concurrent listeners on different ports.
 unsafe fn linux_net_cmd_bind(port: u16) {
     let st = &mut *(&raw mut LINUX_NET);
 
-    // Close existing listener if any
-    if st.listen_fd >= 0 {
-        libc::close(st.listen_fd);
-        st.listen_fd = -1;
+    let slot = linux_net_alloc_conn();
+    if slot < 0 {
+        log::error!("[linux_net] no free slots for listener");
+        return;
     }
 
     let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
@@ -495,8 +495,9 @@ unsafe fn linux_net_cmd_bind(port: u16) {
     }
 
     set_nonblocking(fd);
-    st.listen_fd = fd;
-    log::info!("[linux_net] listening on port {}", port);
+    let idx = slot as usize;
+    st.conns[idx] = LinuxNetConn { fd, conn_type: 1, state: 3 };
+    log::info!("[linux_net] listening on port {} (slot {})", port, idx);
 
     // Send MSG_BOUND
     let msg = [MSG_BOUND];
@@ -577,34 +578,39 @@ unsafe fn linux_net_cmd_close(conn_id: u8) {
     linux_net_send_msg(&msg);
 }
 
-/// Poll listening socket for new connections.
+/// Poll all listening sockets (state=3) for new connections.
 unsafe fn linux_net_poll_accept() -> bool {
     let st = &mut *(&raw mut LINUX_NET);
-    if st.listen_fd < 0 { return false; }
+    let mut had_work = false;
 
-    let mut addr: libc::sockaddr_in = core::mem::zeroed();
-    let mut addr_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
+    for li in 0..LINUX_NET_MAX_CONNS {
+        if st.conns[li].state != 3 || st.conns[li].fd < 0 { continue; }
 
-    let client_fd = libc::accept4(
-        st.listen_fd,
-        &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
-        &mut addr_len,
-        libc::SOCK_NONBLOCK,
-    );
-    if client_fd < 0 { return false; }
+        let mut addr: libc::sockaddr_in = core::mem::zeroed();
+        let mut addr_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
 
-    let slot = linux_net_alloc_conn();
-    if slot < 0 {
-        libc::close(client_fd);
-        return false;
+        let client_fd = libc::accept4(
+            st.conns[li].fd,
+            &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
+            &mut addr_len,
+            libc::SOCK_NONBLOCK,
+        );
+        if client_fd < 0 { continue; }
+
+        let slot = linux_net_alloc_conn();
+        if slot < 0 {
+            libc::close(client_fd);
+            continue;
+        }
+        let idx = slot as usize;
+        st.conns[idx] = LinuxNetConn { fd: client_fd, conn_type: 1, state: 2 };
+
+        let msg = [MSG_ACCEPTED, idx as u8];
+        linux_net_send_msg(&msg);
+        log::info!("[linux_net] accepted conn_id={}", idx);
+        had_work = true;
     }
-    let idx = slot as usize;
-    st.conns[idx] = LinuxNetConn { fd: client_fd, conn_type: 1, state: 2 };
-
-    let msg = [MSG_ACCEPTED, idx as u8];
-    linux_net_send_msg(&msg);
-    log::info!("[linux_net] accepted conn_id={}", idx);
-    true
+    had_work
 }
 
 /// Poll all connected sockets for incoming data.
@@ -613,9 +619,14 @@ unsafe fn linux_net_poll_recv() -> bool {
     let mut had_work = false;
 
     for i in 0..LINUX_NET_MAX_CONNS {
-        if st.conns[i].state < 2 || st.conns[i].fd < 0 {
-            // Check connecting sockets for completion
-            if st.conns[i].state == 1 && st.conns[i].fd >= 0 {
+        if st.conns[i].state != 2 && st.conns[i].state != 1 {
+            continue; // skip unused (0), listening (3) slots
+        }
+        if st.conns[i].fd < 0 { continue; }
+
+        if st.conns[i].state != 2 {
+            // Check connecting sockets (state=1) for completion
+            if st.conns[i].state == 1 {
                 let mut pfd = libc::pollfd {
                     fd: st.conns[i].fd,
                     events: libc::POLLOUT,

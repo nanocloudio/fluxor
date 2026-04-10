@@ -1302,13 +1302,19 @@ fn parse_modules_map(modules: &Value, data_section: Option<&Value>, config: &Val
 /// `modules/button/manifest.toml` and stores it under key `btn_melody`).
 /// Manifests live in the source `modules/` directory, not `target/modules/`.
 fn load_module_manifests(modules_config: &Value) -> HashMap<String, Manifest> {
+    load_module_manifests_with_extra(modules_config, &[])
+}
+
+/// Load manifests from both the standard fluxor module directories and
+/// any additional search paths (e.g., relative to the config file).
+pub fn load_module_manifests_with_extra(modules_config: &Value, extra_dirs: &[&std::path::Path]) -> HashMap<String, Manifest> {
     let mut manifests = HashMap::new();
-    // Scan all module source directories for manifest.toml files
-    let source_dirs: &[&str] = &[
-        "modules/drivers",
-        "modules/foundation",
-        "modules/app",
-        "modules", // legacy flat layout fallback
+    // Standard fluxor module directories (relative to CWD = fluxor root)
+    let standard: Vec<std::path::PathBuf> = vec![
+        "modules/drivers".into(),
+        "modules/foundation".into(),
+        "modules/app".into(),
+        "modules".into(),
     ];
     let list = match modules_config.as_array() {
         Some(l) => l,
@@ -1320,13 +1326,30 @@ fn load_module_manifests(modules_config: &Value) -> HashMap<String, Manifest> {
             None => continue,
         };
         let type_name = module["type"].as_str().unwrap_or(name);
-        for dir in source_dirs {
-            let manifest_path = std::path::Path::new(dir).join(type_name).join("manifest.toml");
+        let mut found = false;
+
+        // Search standard dirs first
+        for dir in &standard {
+            let manifest_path = dir.join(type_name).join("manifest.toml");
             if manifest_path.exists() {
                 if let Ok(m) = Manifest::from_toml(&manifest_path) {
                     manifests.insert(name.to_string(), m);
+                    found = true;
                 }
                 break;
+            }
+        }
+
+        // Then search extra dirs (config-relative module paths)
+        if !found {
+            for extra in extra_dirs {
+                let manifest_path = extra.join(type_name).join("manifest.toml");
+                if manifest_path.exists() {
+                    if let Ok(m) = Manifest::from_toml(&manifest_path) {
+                        manifests.insert(name.to_string(), m);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1735,10 +1758,19 @@ pub struct ModuleCaps {
 }
 
 pub fn generate_config(config: &Value, _template: &ConfigBuilder, modules_dir: &Path, max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
-    generate_config_with_caps(config, _template, &[], modules_dir, max_gpio, pio_count)
+    generate_config_ext(config, _template, &[], modules_dir, &[], max_gpio, pio_count)
+}
+
+/// Generate config with extra module search directories (for external projects).
+pub fn generate_config_ext(config: &Value, _template: &ConfigBuilder, module_caps: &[ModuleCaps], modules_dir: &Path, extra_module_dirs: &[&Path], max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
+    generate_config_impl(config, _template, module_caps, modules_dir, extra_module_dirs, max_gpio, pio_count)
 }
 
 pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, module_caps: &[ModuleCaps], modules_dir: &Path, max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
+    generate_config_impl(config, _template, module_caps, modules_dir, &[], max_gpio, pio_count)
+}
+
+fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: &[ModuleCaps], modules_dir: &Path, extra_module_dirs: &[&Path], max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
     let modules = config.get("modules").ok_or_else(|| {
         Error::Config("modules section required".into())
     })?;
@@ -1808,7 +1840,7 @@ pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, modu
     let (module_entries, module_names) = parse_modules_map(modules_ref, data_section, config, modules_dir)?;
 
     // Load manifests for named port resolution and type validation
-    let manifests = load_module_manifests(modules_ref);
+    let manifests = load_module_manifests_with_extra(modules_ref, extra_module_dirs);
 
     let (edges, force_flags, from_specs, to_specs) = if config.get("wiring").is_some() {
         parse_wiring_edges(&config["wiring"], &module_names, &manifests)?

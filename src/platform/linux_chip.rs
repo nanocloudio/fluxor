@@ -4,5 +4,5 @@
 //! and the BCM2712 chip module. No real hardware — generous arena sizes.
 
 pub const STATE_ARENA_SIZE: usize = 256 * 1024;
-pub const BUFFER_ARENA_SIZE: usize = 32 * 1024;
+pub const BUFFER_ARENA_SIZE: usize = 128 * 1024;
 pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
