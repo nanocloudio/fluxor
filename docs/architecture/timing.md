@@ -1,4 +1,9 @@
-# Concise Timing Guide for This Architecture
+# Timing Model
+
+Fluxor distinguishes wall-clock time (when work is scheduled) from
+stream-clock time (what time the data corresponds to). Getting this
+distinction right is the difference between predictable A/V sync and
+mysterious drift.
 
 ## 1) Define what "time" means in your system
 

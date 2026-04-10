@@ -51,17 +51,38 @@ Events are the mechanism that enables hardware drivers to run entirely as module
 
 The System class provides exclusive resource locking and platform sideband operations. `RESOURCE_TRY_LOCK` / `RESOURCE_UNLOCK` guard critical resources like FLASH_XIP (exclusive flash/QSPI access). `FLASH_SIDEBAND` performs operations requiring exclusive flash access, such as reading the BOOTSEL button via the QSPI CS pin. The lock pool is bounded (4 slots) with non-blocking try semantics — modules receive `EBUSY` if a resource is already held.
 
-### Contract Classes (driver-to-service boundaries)
+### Bus Classes (continued)
 
 | Class | ID | Opcode Range | Description |
 |-------|----|-------------|-------------|
-| NetIF | `0x07` | `0x0700-0x07FF` | Network interfaces (frames + control) |
-| Socket | `0x08` | `0x0800-0x08FF` | TCP/UDP network sockets |
-| FS | `0x09` | `0x0900-0x09FF` | Filesystem (VFS) |
+| UART | `0x0D` | `0x0D00-0x0DFF` | UART serial bus |
+| ADC | `0x0E` | `0x0E00-0x0EFF` | Analog-to-digital conversion |
+| PWM | `0x0F` | `0x0F00-0x0FFF` | Pulse-width modulation |
 
-Contract classes define the boundary between driver modules and service modules. A driver module *provides* a contract (e.g., a WiFi driver registers as a netif provider). A service module *consumes* a contract (e.g., an MQTT client uses sockets). The kernel routes between them.
+Like the other bus classes, these provide hardware transport with no
+device knowledge. PWM is structured as a kernel raw register bridge plus
+a PIC provider module that owns the per-pin slot logic — see
+`modules/foundation/pwm_out/`.
 
-NetIF, Socket, and FS are not "kernel networking" or "kernel filesystem" — they are contract interfaces that driver modules implement and service modules consume. The kernel's role is dispatch, not implementation.
+### Contract Classes (filesystem dispatch)
+
+| Class | ID | Opcode Range | Description |
+|-------|----|-------------|-------------|
+| FS | `0x09` | `0x0900-0x09FF` | Filesystem (VFS) dispatch |
+
+The FS class is the only contract class still in active use. A
+filesystem driver module (e.g., `fat32`) registers as the FS provider
+for a particular storage backend, and consumer modules call
+`dev_call(handle, dev_fs::OPEN, ...)` to access files. The kernel's
+role is dispatch — it routes the call to the registered provider —
+not filesystem implementation.
+
+Networking does not use a contract class. All networking is
+channel-based via the net_proto framing convention; the IP module is
+a standalone PIC module that exchanges Ethernet frames with driver
+modules over channels and net_proto frames with consumer modules over
+channels. There is no `dev_socket` or `dev_netif` dispatch in the
+hot path. See [network.md](network.md) for the full architecture.
 
 ### Cross-Class Operations
 
@@ -75,42 +96,57 @@ NetIF, Socket, and FS are not "kernel networking" or "kernel filesystem" — the
 
 Every device class should respond to cross-class opcodes (or return `ENOSYS`).
 
-## Module Tiers
+## Module Categories
 
-The device class system defines a clear boundary between module types.
+Modules are organized into three categories by directory. The device
+class system defines which kinds of syscalls each category may use.
 
-### Driver Modules
+### Driver Modules (`modules/drivers/`)
 
-The lowest software component that directly touches the hardware interface the platform exposes. Use **bus class** syscalls or platform-specific hardware APIs to communicate with hardware, and register as providers of **contract class** interfaces.
+The lowest software component that directly touches the hardware
+interface the platform exposes. Use **bus class** syscalls or
+platform-specific hardware APIs to communicate with hardware.
 
-- Named after what they drive (e.g., `enc28j60`, `cyw43`, `sd`, `button`)
+- Named after what they drive (e.g., `enc28j60`, `cyw43`, `sd`, `i2s`)
 - Platform-specific (depend on available hardware interfaces)
 - Allowed to be ugly and non-portable — that's their job
 - Examples:
-  - `enc28j60` — uses SPI syscalls, registers as netif frame provider
-  - `cyw43` — uses PIO syscalls (gSPI protocol), registers as netif frame provider
-  - `esp_wifi` — calls vendor WiFi library, registers as netif frame provider
-  - `sd` — uses SPI syscalls, provides block I/O
-  - `button` — uses GPIO syscalls, emits control events
-  - `flash` — uses System flash sideband (BOOTSEL), emits control events
-  - `status_led` — uses GPIO syscalls, receives control commands
-  - `i2s` — uses PIO syscalls, consumes audio frames
+  - `enc28j60` — uses SPI syscalls, exchanges Ethernet frames with IP via channel
+  - `cyw43` — uses PIO syscalls (gSPI protocol), exchanges Ethernet frames with IP via channel
+  - `virtio_net` — uses MMIO, exchanges Ethernet frames with IP via channel
+  - `sd` — uses SPI syscalls, provides block I/O on a channel
+  - `i2s` — uses PIO syscalls, consumes audio frames from a channel
+  - `st7701s` — uses SPI + PIO syscalls, consumes pixel data from a channel
 
-Fluxor does not require drivers to use bus primitives; it requires services not to. The ESP32 WiFi driver is a normal driver module whose hardware interface happens to be a vendor-defined call surface rather than SPI or PIO.
+Fluxor does not require drivers to use bus primitives; it requires
+foundation modules not to. A vendor WiFi library exposed through a
+function-call surface is still a driver module — driver-ness is about
+what the module touches, not how.
 
-### Service Modules
+### Foundation Modules
 
-Use only **infrastructure class** and **contract class** interfaces (channels, timers, netif, sockets, filesystem). No hardware access. Portable across all platforms.
+Use only **infrastructure class** and **contract class** interfaces
+(channels, timers, events, FS dispatch). No hardware access. Portable
+across all platforms.
 
-- Named after what they do (e.g., `fat32`, `mqtt`, `synth`, `wifi`)
+- Named after what they do (e.g., `fat32`, `mqtt`, `ip`, `tls`)
+- Live in `modules/foundation/`
 - Portable across all platforms
-- Never know or care how the underlying contract is implemented
+- Never know what hardware is providing their inputs
 - Examples:
-  - `ip` — TCP/UDP/IP stack (smoltcp), consumes netif frames, provides sockets
-  - `wifi` — WiFi policy (association, reconnection), uses netif ioctls
-  - `fat32` — filesystem, reads from block I/O channel
-  - `mqtt` — MQTT client, uses sockets
-  - `dhcp` — DHCP client, uses sockets or raw netif frames
+  - `ip` — TCP/UDP/IP stack, exchanges Ethernet frames with a driver
+    over a channel, exposes net_proto to consumer modules over channels
+  - `fat32` — filesystem, reads from a block-I/O channel
+  - `mqtt` — MQTT client, exchanges net_proto frames with the IP module
+  - `http` — HTTP server/client, exchanges net_proto frames with IP or TLS
+  - `tls` — TLS 1.3 transformer, sits between consumer modules and IP
+
+### App Modules
+
+Application-level modules that compose drivers and foundation modules
+into a workload. Live in `modules/app/`. Examples include audio
+synthesizers, codecs, sequencers, mixers, and distributed-systems
+components like the Clustor consensus stack.
 
 ## dev_call Interface
 
@@ -135,32 +171,34 @@ int dev_query(
 ### Usage Example
 
 ```rust
-// All modules use dev_call (typed netif_* syscalls are deprecated stubs)
-let mut if_type = [NETIF_WIFI];
-let handle = (sys.dev_call)(-1, dev_netif::OPEN, if_type.as_mut_ptr(), 1);
-let state = (sys.dev_call)(handle, dev_netif::STATE, core::ptr::null_mut(), 0);
+// Acquire a GPIO pin as an input with pull-up
+let mut arg = [pin_number, GPIO_PULL_UP];
+let handle = (sys.dev_call)(-1, dev_gpio::REQUEST_INPUT, arg.as_mut_ptr(), 2);
+
+// Read the level
+let level = (sys.dev_call)(handle, dev_gpio::GET_LEVEL, core::ptr::null_mut(), 0);
 ```
 
 ## Kernel Scope
 
 The kernel provides:
 
-- **Scheduling** — cooperative async executor, module step() dispatch, event-driven wake
-- **Memory** — allocation for module state, channel buffers
-- **IPC** — channels, buffers, polling
+- **Scheduling** — cooperative dispatch, deferred-ready chain, event-driven wake, fault recovery
+- **Memory** — module state arenas, channel buffer arena, optional per-module heap, optional demand-paged arenas
+- **IPC** — channels (FIFO and mailbox modes), buffer pool, polling
 - **Events** — signalable/pollable flags with IRQ binding for hardware notification
-- **Timers** — monotonic timers, millisecond/microsecond queries
-- **Bus primitives** — GPIO, SPI, I2C, PIO (hardware transport only)
-- **Contract dispatch** — routing between netif/socket/fs providers and consumers
-- **dev_call/dev_query** — generic device operation dispatch
+- **Timers** — monotonic timers, millisecond/microsecond queries, `StreamTime`
+- **Bus primitives** — GPIO, SPI, I2C, PIO, UART, ADC, PWM (hardware transport only)
+- **FS dispatch** — routing FS opcodes to registered filesystem providers
+- **`dev_call` / `dev_query`** — generic device operation dispatch
 
 The kernel does **not** provide:
 
-- WiFi (driver modules: `cyw43`, `esp_wifi`)
-- TCP/IP (service module: `ip` with smoltcp)
-- Filesystem logic (service module: `fat32`)
-- Application protocols (service modules: `mqtt`, `http`, `dhcp`)
-- Any domain-specific knowledge
+- TCP/IP, ARP, ICMP, or any network protocol (foundation module: `ip`)
+- WiFi association, scan, or driver-specific opcodes (driver modules: `cyw43`, `enc28j60`, etc.)
+- Filesystem implementation (foundation module: `fat32`)
+- Application protocols (foundation modules: `mqtt`, `http`, `dns`, `tls`, ...)
+- Audio formats, display protocols, or any domain-specific knowledge
 
 ## Operational Model
 

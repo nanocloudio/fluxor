@@ -17,15 +17,17 @@ hardware input -> input module -> gesture/mapper -> action consumers
 The system emphasizes contract stability: modules consume actions, not electrical
 signal details.
 
-Current implementation pattern:
+Implementation pattern:
 
 ```text
 button/touch/bootsel module -> raw channel bytes -> gesture module -> FMP command messages -> target modules
 ```
 
-Legacy note: older docs referenced a kernel `emit_action` syscall and central
-action dispatcher. The current control plane is module-to-module channel
-messages (typically FMP command messages), not a dedicated action syscall.
+Input modules emit raw byte transitions on data channels. Gesture
+modules consume those transitions and emit FMP command messages on
+control channels. Target modules read the FMP messages and act on
+them. The kernel has no concept of "actions" — control flow is
+ordinary module-to-module channel traffic.
 
 ## Core Principles
 

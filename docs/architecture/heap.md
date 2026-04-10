@@ -60,9 +60,9 @@ Three new entries in the SyscallTable (appended, backward-compatible):
 | `heap_free` | `fn(ptr: *mut u8)` | Free allocation. Null is a no-op. Invalid pointer is logged. |
 | `heap_realloc` | `fn(ptr: *mut u8, new_size: u32) -> *mut u8` | Grow/shrink. Null return = failure (original unchanged). |
 
-## PIC Runtime Helpers
+## SDK Helpers
 
-In `modules/pic_runtime.rs`:
+In `modules/sdk/runtime.rs`:
 
 ```rust
 // Allocate from this module's heap

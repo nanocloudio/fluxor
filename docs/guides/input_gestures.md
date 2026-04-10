@@ -54,12 +54,12 @@ Configuration typically binds:
 - gesture pattern mapping
 - target module/control port
 
-Gesture defaults should be treated as baseline behavior; project-specific policy
-belongs in configuration.
+Gesture defaults should be treated as baseline behavior; project-specific
+policy belongs in configuration.
 
-Legacy note: previous input-action docs described kernel-side action dispatch.
-Current behavior keeps gesture recognition and command emission inside modules,
-with consumers reacting to command channels.
+Gesture recognition and command emission live entirely inside modules.
+Consumers react to command messages on control channels — there is no
+kernel-side action registry or dispatch table.
 
 ## Integration Patterns
 
@@ -67,7 +67,7 @@ Common patterns:
 
 - playback control: input -> gesture -> bank/transport
 - UI navigation: touch/button -> gesture -> display controller
-- system control: bootsel/diagnostic input -> gesture -> service module
+- system control: bootsel/diagnostic input -> gesture -> foundation module
 
 ## Design Guidance
 

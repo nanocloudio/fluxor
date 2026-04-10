@@ -1,24 +1,26 @@
-# Fluxor Pin Allocation Design
+# Pin and Bus Allocation
 
-## Overview
-
-This document describes the config-driven pin and bus allocation system for Fluxor. The goals are:
+This document describes the config-driven pin and bus allocation system
+for Fluxor. The goals are:
 
 1. Represent pin and bus configuration in the graph config
 2. Allow the config file to fully describe hardware resource usage
-3. Validate configurations against board capabilities at compile/CLI time
+3. Validate configurations against silicon capabilities at build time
 4. Initialize buses at runtime based on config, before module instantiation
-5. Support SPI, I2C, and GPIO resources
+5. Support SPI, I2C, GPIO, UART, ADC, PWM, PIO resources across silicon families
 
-Current status (validated against runtime code):
+Hardware config and runtime context live in `src/kernel/config.rs`
+(`HardwareConfig`, `HardwareContext`). Boot-time pin/bus conflict
+planning lives in `src/kernel/planner.rs`. The scheduler validates
+hardware requirements before graph start, and SPI bus initialization
+state is tracked and enforced before module use.
 
-- Hardware config + runtime context live in `src/kernel/config.rs` (`HardwareConfig`, `HardwareContext`)
-- Boot-time pin/bus conflict planning lives in `src/kernel/planner.rs`
-- Scheduler validates hardware requirements before graph start
-- SPI bus initialization state is tracked and enforced before module use
-
-Historical migration mechanics are archived in
-`docs/legacy/pin_allocation_migration.md`.
+The silicon capabilities themselves come from `targets/silicon/*.toml`,
+which the config tool reads at validation time and the kernel build
+script reads at compile time. Adding support for a new silicon target
+means writing a TOML file that describes its peripherals and a HAL
+backend that implements the bus primitives — see
+[hal_architecture.md](hal_architecture.md).
 
 ## Resource Ownership Discipline
 
@@ -64,7 +66,13 @@ Hardware resource ownership is explicit and declared, not opportunistic:
 +-------------------------------------------------------------+
 ```
 
-## Board Definitions
+## Silicon and Board Definitions
+
+Silicon capabilities are declared once per chip family in
+`targets/silicon/*.toml` and shared across every board that uses that
+chip. Boards layer their own pin assignments and on-board peripheral
+declarations on top in `targets/boards/*.toml`. The `fluxor targets`
+CLI command lists every available target.
 
 ### Pico 2 W Pin Capabilities
 
@@ -265,15 +273,9 @@ Error: SPI bus reconfiguration
 
 ## Runtime Initialization Flow
 
-### Baseline Runtime Pattern
-
-```rust
-// BAD: Hardcoded pins and bus config
-let spi = Spi::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, ...);
-let cs = Output::new(p.PIN_17, Level::High);
-```
-
-### Config-Driven Runtime Pattern
+The runtime brings up hardware exactly as the binary config describes.
+There are no hardcoded pin assignments anywhere in the kernel —
+everything flows from the validated config blob loaded at boot.
 
 ```rust
 // In runtime initializer (not main.rs)

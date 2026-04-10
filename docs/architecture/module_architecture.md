@@ -206,11 +206,11 @@ low-overhead operational visibility.
 
 ### 12) Capability boundaries must remain explicit
 
-**Rule:** Service modules remain hardware-agnostic; driver modules may use bus
-primitives, but both must keep syscall and port contracts explicit.
+**Rule:** Foundation modules remain hardware-agnostic; driver modules may
+use bus primitives, but both must keep syscall and port contracts explicit.
 
-**Rationale:** This preserves portability of service layers while allowing
-hardware-specific driver modules to remain isolated and composable.
+**Rationale:** This preserves portability of the foundation layer while
+allowing hardware-specific driver modules to remain isolated and composable.
 
 ---
 
@@ -236,16 +236,39 @@ The runtime loader enforces a concrete module binary contract:
 
 - Table magic: `FXMT`; module magic: `FXMD`
 - Module ABI version must match loader expectation
-- Required exports are hash-resolved: `module_state_size`, `module_init`,
-  `module_new`, `module_step`
-- Optional exports include `module_channel_hints` and `module_arena_size`
-- The header carries schema/manifest section sizes and required capability bits
+- Required exports are FNV-1a hash resolved: `module_state_size`,
+  `module_init`, `module_new`, `module_step`
+- Optional exports: `module_channel_hints`, `module_arena_size`,
+  `module_drain`, `module_deferred_ready`, `module_mailbox_safe`,
+  `module_in_place_safe`
+- The header carries schema/manifest section sizes, capability flag
+  byte (`reserved[0]`), and required capability bits
 - Parameter schema and manifest payloads are embedded in the `.fmod` image
-  (not separate builder-only JSON sidecars)
 
-This is the durable part of the older dynamic-linking proposals: module loading
-is strict at ABI/header/export boundaries, while module logic remains fully PIC.
-See `src/kernel/loader.rs` and `modules/module.ld` for current implementation.
+Module sources include three SDK files via the standard pattern:
+
+```rust
+#![no_std]
+
+use core::ffi::c_void;
+
+#[path = "../../sdk/abi.rs"]
+mod abi;
+use abi::SyscallTable;
+
+include!("../../sdk/runtime.rs");
+include!("../../sdk/params.rs");
+```
+
+`modules/sdk/abi.rs` is the stable kernel ABI definition. `runtime.rs`
+contains compiler intrinsics and helper functions every PIC module
+needs. `params.rs` provides the `define_params!` macro and parameter
+schema encoding. Modules outside the fluxor tree (such as the Clustor
+project's modules) include the same files via a relative path through
+their git submodule.
+
+See `src/kernel/loader.rs`, `modules/module.ld`, and `tools/src/modules.rs`
+for the loader, linker script, and pack tool.
 
 ### Step Outcome Contract
 
@@ -254,9 +277,55 @@ See `src/kernel/loader.rs` and `modules/module.ld` for current implementation.
 - `0`: Continue (yield, no terminal state)
 - `1`: Done (module reached terminal completion)
 - `2`: Burst (request immediate re-step in the same scheduler cycle)
+- `3`: Ready (initialization complete, downstream may run)
 - `<0`: Error (errno-style failure)
 
-`Burst` is a scheduling hint, not a permission for unbounded work. Each step call remains bounded and non-blocking.
+`Burst` is a scheduling hint, not a license for unbounded work. Each step
+call remains bounded and non-blocking.
+
+`Ready` participates in the deferred-ready chain. A module that exports
+`module_deferred_ready` (header flag bit 2) gates its downstream consumers
+until it returns `Ready` from a step. This is how drivers like cyw43 and
+the IP module signal "I am initialized" without the kernel needing to
+know what initialization means for any specific device.
+
+### Drain Contract (Live Reconfigure)
+
+Modules that export `module_drain` participate in graceful shutdown
+during a live graph reconfigure. The pack tool sets header flag bit 3
+(`drain_capable`) when the export is present. During the `DRAINING`
+phase, the scheduler calls `module_drain(state)` once on the module
+(in reverse topological order) to signal "stop accepting new work."
+The module then continues stepping normally until in-flight work is
+complete and it returns `Done` (1) from `module_step`. After all
+drain-capable modules have completed, the scheduler transitions to
+`MIGRATING` and instantiates the new graph.
+
+See `architecture/reconfigure.md` for the full state machine.
+
+### Fault Recovery
+
+Modules can be assigned a protection level at config time:
+
+- **Level 0 (None)** — direct call, no isolation. Same as historical behavior.
+- **Level 1 (Guarded)** — step guard timer detects timeouts. A module
+  that overruns its step deadline is marked as faulted.
+- **Level 2 (Isolated)** — hardware memory protection (MPU on RP2350,
+  MMU on CM5). The kernel maps only the module's state, code, channel
+  buffers, and heap; any other memory access raises a fault.
+
+Faulted modules transition through `Running → Faulted → Recovering`
+according to a per-module fault policy:
+
+| Policy | Behavior |
+|--------|----------|
+| `Skip` | Log the fault and skip this module on subsequent ticks |
+| `Restart` | Re-allocate state, call `module_new` again, re-enter the graph |
+| `RestartGraph` | Trigger a full graph reconfigure (last resort) |
+
+Recovery is bounded by a per-module restart count and exponential
+backoff. The kernel records `FaultStats` per module accessible via
+`dev_query` for telemetry.
 
 ### Async I/O Pattern
 

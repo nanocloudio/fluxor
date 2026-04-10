@@ -11,7 +11,7 @@ This architecture defines:
 - Per-module capability declarations in `manifest.toml`
 - Named ports and typed wiring
 - Content-type validation during config compilation
-- Hardware-domain expansion into concrete driver/service module graphs
+- Hardware-domain expansion into concrete driver and foundation module graphs
 - Auto-wiring via capability resolution
 
 ## The Problem
@@ -84,7 +84,7 @@ A file on local SD and a file on a network share both provide `file.data`.
                     (config tool, build time)
                               |
 +----------------------------------------------------------------+
-|                    Service Modules                              |
+|                    Foundation Modules                           |
 |             (ip, fat32, mp3_decoder, ble_stack)                |
 |                                                                |
 |        provides: [socket]        requires: [frame]             |
@@ -916,14 +916,15 @@ execution substrate. Capability resolution adds modules and wiring edges before
 the runner sees it. From the runner's perspective, auto-added modules are
 no different from user-declared ones.
 
-## Capability Specification
+## Implementation
 
-Capability resolution is performed by the config tool. The runtime executes the
-resolved graph.
+Capability resolution runs in the `fluxor` config tool at build time.
+The runtime executes the resolved graph; the kernel itself has no
+knowledge of capabilities or content types.
 
-### Manifest Extensions
+### Manifest Schema
 
-`manifest.toml` supports a `[capabilities]` section:
+`manifest.toml` for each module declares what it provides and requires:
 
 ```toml
 [capabilities]
@@ -931,56 +932,102 @@ provides = ["audio.pcm"]
 requires = ["socket"]
 ```
 
-Modules without the section use empty `provides`/`requires` lists.
+Modules without the section have empty `provides`/`requires` lists and
+participate only in explicit wiring.
 
 ### Port Content Types
 
-Ports in `manifest.toml` support an optional `content_type` field:
+Ports in `manifest.toml` declare their `content_type`:
 
 ```toml
 [[ports]]
+name = "out"
 direction = "output"
 content_type = "audio.pcm"
 ```
 
-Content types are consumed by validation and resolution.
+The config tool uses content types for validation and for unambiguous
+auto-wiring matching.
 
 ### Hardware Section
 
-The config schema supports a `hardware:` section. Example:
-
-```yaml
-hardware:
-  network:
-    type: wifi
-    driver: cyw43
-    ssid: "..."
-    password: "..."
-```
-
-The config tool maps hardware declarations to module lists and wiring
-templates. Example lookup table:
+The config schema's `hardware:` section maps to a built-in lookup table
+of driver bundles. Each (subsection, driver) pair resolves to a module
+list and a wiring template:
 
 ```
-(wifi, cyw43)     -> modules: [cyw43, wifi, ip]
-                     wiring: [wifi.out->cyw43.ctrl, cyw43.out[3]->wifi.in,
-                              cyw43.out->ip.in, ip.out->cyw43.in]
+(wifi, cyw43)        → modules: [cyw43, ip]
+                       wiring:  [cyw43.frames_rx → ip.frames_rx,
+                                 ip.frames_tx   → cyw43.frames_tx]
 
-(ethernet, enc28j60) -> modules: [enc28j60, ip]
-                        wiring: [enc28j60.out->ip.in, ip.out->enc28j60.in]
+(ethernet, enc28j60) → modules: [enc28j60, ip]
+                       wiring:  [enc28j60.frames_rx → ip.frames_rx,
+                                 ip.frames_tx       → enc28j60.frames_tx]
 
-(ethernet, ch9120)   -> modules: [ch9120]
-                        wiring: []
+(ethernet, ch9120)   → modules: [ch9120]
+                       wiring:  []   (ch9120 speaks net_proto directly)
+
+(audio.out, i2s)     → modules: [i2s]
+                       wiring:  [i2s gets the auto-wired audio.pcm input]
+
+(display, ili9341)   → modules: [ili9341]
+                       wiring:  [ili9341 gets the auto-wired display.draw input]
 ```
 
-### Auto-Wiring and Validation
+The hardware section is the board support declaration: it describes the
+physical platform independently of the application. Two configs that
+target different boards but share the same `modules:` and `wiring:`
+sections produce two different resolved graphs from the same application
+description.
 
-Implement the resolution algorithm: walk the capability graph, auto-wire
-unambiguous connections, validate type matches, report errors for unmet
-requirements.
+### Resolution Algorithm
 
-Modules can be added to config with only high-level requirements and resolved
-to complete graphs by the tool.
+The config tool walks the capability graph:
 
-- **Dynamic drivers**: Can a module loaded from the marketplace
-  declare new capability types, or are types fixed by the platform?
+1. Collect every module's `provides` and `requires` from manifests
+2. Collect hardware section providers from the lookup table
+3. For each unsatisfied `requires`, find a provider chain through service
+   modules (e.g. `socket` ← `ip` ← `frame.wifi` ← hardware section)
+4. Auto-add intermediate modules (the `ip` module if a socket consumer
+   needs frames-from-driver)
+5. Auto-wire content-type matches where there is exactly one unconnected
+   producer and one unconnected consumer of that type
+6. Validate every connection (explicit or auto-wired) against content
+   type and direction
+7. Emit the resolved module list and full wiring as the binary config
+
+### Auto-Wiring Rules
+
+- **Always auto-wire hardware infrastructure**: storage driver to filesystem,
+  frame driver to IP module, audio.pcm output to audio output
+- **Auto-wire when unambiguous**: exactly one unconnected producer and
+  exactly one unconnected consumer of a given content type
+- **Error when ambiguous**: multiple producers of `audio.pcm` and one
+  i2s consumer requires explicit user wiring to disambiguate
+- **Never override explicit wiring**: user-declared wiring always wins
+- **Validate all connections**: even explicit wiring is checked against
+  content types
+
+### Diagnostics
+
+Resolution errors are reported with the source location and a list of
+candidates:
+
+```
+Error: 'game' requires 'display.video' but hardware.display (epaper/ssd1680)
+       only provides 'display.still'.
+       Compatible hardware: lcd/ili9341, lcd/st7789, oled/ssd1306.
+
+Error: Ambiguous auto-wire for 'audio.pcm' into i2s.in.
+       Multiple unconnected providers: synth.out, mp3_decoder.out.
+       Add explicit wiring to resolve.
+```
+
+### Marketplace Modules
+
+Modules loaded from a marketplace declare their capabilities and content
+types in the same `manifest.toml` schema as first-party modules. New
+content types are not restricted to the platform — any string value is
+valid, and modules that share a string match without coordination. The
+content type registry in this document lists the well-known types used
+by the first-party module set; third-party modules can extend it freely.

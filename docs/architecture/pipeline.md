@@ -1,36 +1,54 @@
 # Graph Runner Architecture
 
+The graph runner is the heart of Fluxor. It loads PIC modules into a runtime
+graph, opens channels between them, and steps them cooperatively in
+topological order. This document describes the runtime model, the channel
+mechanics, the execution loop, and the lifecycle of modules and graphs.
+
 ## Design Goals
 
-- Compose modules into arbitrary graphs via config, not firmware changes.
-- Keep core logic domain-agnostic and expose a small syscall surface.
-- Make all I/O non-blocking with clear backpressure handling via channels.
+- Compose modules into arbitrary graphs via configuration, not firmware code
+- Keep the kernel small and protocol-agnostic
+- Make all I/O non-blocking with structural backpressure
+- Support live reconfiguration without dropping in-flight work
+- Run identical module binaries across silicon families
 
 ## Runtime Model
 
 ```
-Config (flash)             Runtime
---------------             -------
-modules[]     -------->  ModuleSlot (Dynamic, Tee, Merge)
-edges[]       -------->  Edge[] with channel handles
-              -------->  run_main_loop()
+Config (flash or boot image)              Runtime
+-----------------------------             -------
+modules[]   ───────────────────►  ModuleSlot[] (state, hints, caps)
+edges[]     ───────────────────►  Edge[] with channel handles
+domains[]   ───────────────────►  Per-domain tick budget
+            ───────────────────►  setup() → setup_graph() → run_main_loop()
 ```
 
-Each PIC module is loaded via the loader and wrapped in a `DynamicModule`.
-The graph runner steps all modules in order, and modules communicate via
-kernel-managed channels.
+A graph is a set of module instances and a set of directed edges that
+connect them. Each module is a `.fmod` artifact loaded from flash. Each
+edge becomes a kernel-allocated channel ring buffer. The runner steps
+all instantiated modules each iteration, in topological order, until
+the graph reaches a terminal state, encounters a fault, or is asked to
+reconfigure.
 
 ## Graph Configuration Model
 
-Graphs are declared in config as module instances plus explicit wiring edges.
+Graphs are declared in config as module instances plus explicit wiring
+edges, with an optional hardware section that the config tool resolves
+into driver modules and infrastructure wiring (see
+[capability_surface.md](capability_surface.md)).
 
 ### Top-Level Shape
 
-- `modules`: module instances and parameterization
-- `wiring`: directed edges between module ports
-- `data` (optional): inline assets referenced by modules
+- `target` — silicon/board identifier (e.g. `pico2w`, `cm5`, `qemu-virt`)
+- `hardware` — physical hardware declarations (network, audio, display, storage)
+- `modules` — application module instances and their parameters
+- `wiring` — directed edges between module ports
+- `data` — optional inline assets referenced by modules
+- `execution` — optional per-domain tick periods and core assignments
+- `reconfigure` — optional drain timeout and policy
 
-### Wiring Semantics
+### Wiring
 
 Each wiring entry connects one source port to one destination port:
 
@@ -42,193 +60,178 @@ wiring:
     to: display.pixels
 ```
 
-Port names are manifest-defined contracts. The runner resolves names to channel
-bindings and validates direction and content compatibility.
+Port names are manifest-defined contracts. The config tool resolves names
+to channel bindings and validates direction and content compatibility
+against the source and destination modules' manifests.
 
 ### Topology Rules
 
-- Graph execution order is topological.
-- Fan-out and fan-in are represented as explicit runtime helpers (tee/merge).
-- Cycles require explicit buffering/control semantics and are treated as advanced patterns.
+- Graph execution order is topological (producers before consumers)
+- Fan-out and fan-in are represented as runtime helpers (tee/merge)
+- Cycles require explicit buffering and are an advanced pattern
 
 ### Inline Data Assets
 
-The optional `data` section stores small assets directly in config payloads.
-This is suited for embedded presets, sequences, and test fixtures where external
-storage is not required.
+The optional `data` section stores small assets directly in the config
+payload. This is suited for embedded presets, sequences, and test
+fixtures where external storage is not required.
 
-### Validation Model
+### Validation
 
-Configuration validation enforces:
+The config tool enforces:
 
-- module existence and parameter shape
-- valid port references
-- content-type compatibility
-- bounded resource usage (channels, buffers, module slots)
+- module existence and parameter shape against the manifest
+- valid port references on both ends of every wire
+- content-type compatibility on each edge
+- bounded resource usage (channels, buffers, module slots, arena fits)
+- pin and bus conflicts against the silicon's hardware capabilities
+- capability satisfaction (every `requires` met by some `provides`)
 
 ## Module Execution
 
-Modules implement the `Module` trait with a single entry point:
+Modules implement four required exports:
 
 ```rust
-pub enum StepOutcome { Continue, Done, Burst }
-
-pub trait Module {
-    /// Advance the module by one step.
-    ///
-    /// Returns:
-    /// - `Ok(Continue)` - More work possible on later ticks
-    /// - `Ok(Done)`     - Module completed its task
-    /// - `Ok(Burst)`    - Re-step immediately (has more work this tick)
-    /// - `Err(())`      - Error occurred
-    fn step(&mut self) -> Result<StepOutcome, ()>;
-}
+#[no_mangle] pub extern "C" fn module_state_size() -> u32 { ... }
+#[no_mangle] pub extern "C" fn module_init(syscalls: *const c_void) { ... }
+#[no_mangle] pub extern "C" fn module_new(in_chan: i32, out_chan: i32, ctrl_chan: i32,
+                                          params: *const u8, params_len: usize,
+                                          state: *mut u8, state_size: usize,
+                                          syscalls: *const c_void) -> i32 { ... }
+#[no_mangle] pub extern "C" fn module_step(state: *mut u8) -> i32 { ... }
 ```
 
-The runner calls `step()` on all modules each iteration. When a module returns
-`Burst`, the scheduler re-steps it up to `MAX_BURST_STEPS` (4) additional times
-within the same tick, enabling compute-heavy modules to do multiple chunks of
-work per tick while remaining cooperative. Modules use channel syscalls to read
-inputs and write outputs.
+Optional exports surface additional capabilities:
 
-## Graph Runner
+| Export | Purpose |
+|--------|--------|
+| `module_arena_size` | Request a per-module heap (see [heap.md](heap.md)) |
+| `module_channel_hints` | Request specific channel buffer sizes per port |
+| `module_drain` | Support graceful drain during live reconfigure |
+| `module_deferred_ready` | Gate downstream modules until init completes |
+| `module_mailbox_safe` | Declare safe consumption from mailbox channels |
+| `module_in_place_safe` | Declare safe in-place mailbox transformation |
 
-The runner in `src/kernel/scheduler.rs` uses a three-stage initialization sequence:
+### Step Outcome
 
-```rust
-// Stage 1: Initialize loader and config
-if !setup(&runner_config) {
-    panic!("Setup failed");
-}
+`module_step` returns a small integer:
 
-// Stage 2: Build graph, open channels, instantiate modules
-let count = setup_graph(&runner_config);
-if count < 0 {
-    panic!("Graph setup failed");
-}
+| Value | Meaning |
+|-------|--------|
+| `0` | Continue — yield, more work possible later |
+| `1` | Done — module reached terminal completion |
+| `2` | Burst — re-step immediately, more work this tick |
+| `3` | Ready — initialization complete, downstream may run |
+| `<0` | Error (errno-style negative codes) |
 
-// Stage 3: Run the main loop
-run_main_loop(count as usize).await;
+`Burst` is a scheduling hint, not a license for unbounded work. The
+scheduler re-steps a bursting module up to `MAX_BURST_STEPS` (4)
+additional times in the same tick. Each burst step still has to satisfy
+the bounded-time contract.
+
+`Ready` participates in the deferred-ready chain: a module that exports
+`module_deferred_ready` is gated by the scheduler so that its downstream
+consumers do not run until it has returned `Ready` from a step. The
+gating is transitive — if A is gated on B and B is gated on C, then A's
+consumers wait until C reports ready, then B reports ready.
+
+### Async I/O Pattern
+
+Hardware-facing operations use start/poll sequencing:
+
+1. Begin an operation (`*_start`)
+2. Return / yield while pending
+3. Poll for completion (`*_poll`) on a subsequent step
+
+This pattern keeps every module cooperative and predictable. There is
+no blocking syscall in the table — even DMA-backed transfers are
+expressed as start/poll pairs.
+
+## The Main Loop
+
+The kernel main loop on every target is the same shape:
+
 ```
-
-### Main Loop
-
-The main loop uses Embassy's `select()` to sleep efficiently. When an event fires (GPIO edge, module-to-module signal, or ISR source), the scheduler wakes immediately instead of waiting for the next 1ms tick.
-
-```rust
-pub async fn run_main_loop(module_count: usize) -> ! {
-    loop {
-        // 1. Poll GPIO edges (signals events for pins with bindings)
-        gpio::poll_gpio_edges();
-
-        // 2. Step all modules in topological order
-        match step_modules(modules, module_count) {
-            StepResult::Continue => {}
-            StepResult::Done => break,
-            StepResult::Error(i) => { log::error!("Step failed: {}", i); break; }
-        }
-
-        // 3. Intra-tick wake: events fired during step (module A signals module B)
-        let wake = event::take_wake_pending();
-        if wake != 0 {
-            step_woken_modules(modules, module_count, wake);
-        }
-
-        // 4. Sleep until 1ms tick OR event signal
-        event::SCHEDULER_WAKE.reset();
-        select(Timer::after(1ms), event::SCHEDULER_WAKE.wait()).await;
-
-        // 5. Post-sleep wake: events from ISR during sleep
-        let wake = event::take_wake_pending();
-        if wake != 0 {
-            step_woken_modules(modules, module_count, wake);
-        }
+loop {
+    poll_hardware_edges();           // GPIO/IRQ → event signals
+    step_modules(modules, count);    // topological walk
+    if let wake = take_wake_pending() {
+        step_woken_modules(wake);    // intra-tick wake from events
+    }
+    sleep_until_tick_or_event();
+    if let wake = take_wake_pending() {
+        step_woken_modules(wake);    // post-sleep wake from ISR
     }
 }
 ```
 
-`step_woken_modules()` is a lightweight variant that only steps modules whose bit is set in the wake bitmask, bypassing frequency gating. See `architecture/events.md` for the full event system design.
+The "sleep until tick or event" step differs by target:
+
+| Target | Sleep mechanism |
+|--------|----------------|
+| RP2040, RP2350 | Embassy `select(Timer::after(tick), SCHEDULER_WAKE.wait()).await` |
+| BCM2712, CM5 | Synchronous wait on the chip's monotonic timer with interrupt unmasking |
+
+In both cases, an event signal from an ISR or another module wakes the
+loop early — the sleep is bounded above by the configured tick period
+but can return immediately when there is work to do. See
+[events.md](events.md) for the event/wake contract.
 
 ## Channel-Based IPC
 
-Modules communicate through channels, not direct buffer passing:
+Modules communicate exclusively through channels, allocated by the
+kernel and addressed by handle:
 
 ```rust
-// In module step():
-let ready = syscalls::channel_poll(self.in_chan, POLL_IN);
+let ready = (sys.channel_poll)(in_chan, POLL_IN);
 if ready & POLL_IN != 0 {
-    let n = syscalls::channel_read(self.in_chan, buf.as_mut_ptr(), buf.len());
-    // Process data...
-    syscalls::channel_write(self.out_chan, output.as_ptr(), output.len());
+    let n = (sys.channel_read)(in_chan, buf.as_mut_ptr(), buf.len());
+    // process n bytes
+    (sys.channel_write)(out_chan, output.as_ptr(), output.len());
 }
 ```
 
-### Channel Types
+A channel is a ring buffer between exactly one producer and one
+consumer. Fan-out and fan-in are handled by tee/merge helper modules
+inserted by the runner when wiring requires them. The kernel allocates
+channel buffers from a dedicated buffer arena, separate from module
+state, so that channel sizing does not compete with module memory.
 
-| Type | Value | Description |
-|------|-------|-------------|
-| `Pipe` | 3 | In-memory ring buffer between modules |
-| `Tcp` | 1 | TCP stream socket |
-| `Udp` | 2 | UDP datagram socket |
+### Channel Buffer Sizing
 
-## Module Roles
+Before opening channels, the scheduler queries each module's optional
+`module_channel_hints` export to determine per-port buffer sizes.
+Channel buffers are allocated from the **buffer arena**. Both the state
+arena and the buffer arena are reset on graph reconfigure.
 
-Modules declare their role in the header, which determines channel requirements:
+| Workload class | Typical channel size |
+|---------------|---------------------|
+| Audio data (PCM frames) | 2048 bytes |
+| Control / FMP commands | 256 bytes |
+| Network frames (Ethernet MTU) | 4096–8192 bytes |
+| Mailbox video frames | up to 65535 bytes |
 
-| Role | Value | Inputs | Outputs |
-|------|-------|--------|---------|
-| Source | 1 | None | Required |
-| Transformer | 2 | Required | Required |
-| Sink | 3 | Required | None |
+Modules without channel hints get the default 2048 bytes per port. The
+config tool validates that the sum of all channel buffers fits within
+the buffer arena for the target silicon.
 
-## Fan-Out and Fan-In
+### FIFO Mode
 
-The runner automatically inserts helper modules for complex topologies:
+The default channel mode is FIFO with copy semantics. `channel_write`
+copies bytes into the ring buffer; `channel_read` copies bytes out.
+This is the right mode for byte-stream producers that build their
+output incrementally — a decoder emitting partial frames, a sensor
+emitting timestamped readings, a network driver pushing variable-size
+packets.
 
-- **Tee Module**: Inserted when one output feeds multiple inputs
-- **Merge Module**: Inserted when multiple outputs feed one input
+### Mailbox Mode (Zero-Copy)
 
-```
-Config:                    Runtime:
-A -> B                      A -> B
-A -> C                      A -> [tee] -> B
-                                   -> C
-```
-
-## Module Instantiation
-
-PIC modules go through this sequence:
-
-1. **Load**: Find module in flash by name hash
-2. **Validate**: Check magic, ABI version, code bounds
-3. **Size Query**: Call `module_state_size()` to get buffer size
-4. **Allocate**: Get state buffer from state arena
-5. **Init**: Call `module_init(syscalls)` for one-time setup
-6. **Create**: Call `module_new(params, len, state, syscalls)`
-
-### Channel Buffer Allocation
-
-Before opening channels, the scheduler queries each module's optional `module_channel_hints` export to determine per-port buffer sizes. Channel buffers are allocated from a **dedicated buffer arena** (32 KB, separate from the module state arena). Both arenas are reset on graph reconfigure.
-
-Audio data channels use the default 2048 bytes. Control and event channels typically request 256 bytes via hints. Bulk data channels (e.g. video framebuffers for mailbox mode) can request larger sizes (up to 65535 bytes via the `u16` hint field). Channel buffer allocation does not compete with module state memory.
-
-### FIFO→Mailbox Chaining
-
-Channels support two buffer modes: **FIFO** (copy via `channel_write`/`channel_read`)
-and **mailbox** (zero-copy via `buffer_acquire_write`/`release`/`acquire_read`/`release`).
-The two modes serve different roles in a pipeline and can coexist:
-
-**When to use FIFO:**
-A producer that builds output incrementally (partial writes, byte-at-a-time) must
-write into a FIFO channel. Copy semantics are required because the producer cannot
-fill a whole buffer in a single step.
-
-**When to use mailbox:**
-A module that can produce (or transform) a complete buffer in one step should use
-mailbox mode. The buffer stays in place — no copy — and downstream modules consume
-or transform it directly.
-
-**The chaining pattern:**
+For workloads where a producer can fill a complete buffer in one step
+and the consumer can process it without copying, channels support
+**mailbox mode**. Producer and consumer exchange ownership of the same
+underlying buffer through `buffer_acquire_*` / `buffer_release_*`
+syscalls. No copy occurs — the buffer stays in place and the consumer
+reads it directly.
 
 ```
   FIFO copy        mailbox (zero-copy alias chain)
@@ -237,129 +240,242 @@ or transform it directly.
          ch A      (group=1)  ch B    (group=1)  ch B    (DMA)
 ```
 
-1. Use a **FIFO channel** for any producer that cannot write whole buffers in place
-   (e.g., a byte-stream source, a decoder that emits partial frames).
+Mailbox mode is enabled per edge by setting a `buffer_group` value in
+the wiring. All edges in the same group share one underlying buffer.
 
-2. A **mailbox chain** begins at the first module that can produce full buffers and
-   wants zero-copy handoff. All edges in the chain share the same `buffer_group`
-   value in config. The scheduler aliases them to the same underlying buffer in
-   `open_channels`.
+#### State machine
 
-3. An **in-place transform** within a mailbox chain acquires the buffer via
-   `buffer_acquire_inplace` (READY → PRODUCER), modifies it, and releases via
-   `buffer_release_write` (→ READY_PROCESSED). The module must set both
-   `mailbox_safe` (header flags bit 0) and `in_place_writer` (bit 1).
+A mailbox buffer cycles through four states:
 
-4. **Read-only consumers** (sinks) at the end of a mailbox chain only need
-   `mailbox_safe` (bit 0). They consume via `buffer_acquire_read` or
-   transparent `channel_read`. Example: I2S reads mailbox data without
-   modifying it.
+1. **STREAMING** — initial state; the producer is filling the buffer
+2. **READY** — producer has released the buffer; consumer can read it
+3. **READY_PROCESSED** — an in-place writer has transformed the buffer
+4. (back to STREAMING when the final consumer releases)
 
-5. At most **one in-place transform** is supported per alias chain (the
-   READY_PROCESSED state prevents double-processing, and `validate_buffer_groups`
-   rejects configs with multiple `in_place_writer` modules per group). For
-   multiple transforms, insert a FIFO copy step between them.
+#### Capability flags
 
-**Capability flags** (header `reserved[0]`):
-- `mailbox_safe` (bit 0): module can safely consume from mailbox channels.
-  Required for any module in a `buffer_group` chain.
-- `in_place_writer` (bit 1): module uses `buffer_acquire_inplace` to modify
-  the buffer. Only for chain-interior modules.
-- `module_in_place_safe` export: sets both bits (backward compatible).
-- `module_mailbox_safe` export: sets bit 0 only (read-only consumers).
+Each module participating in a mailbox chain declares its capabilities
+via header flags (`reserved[0]`):
 
-**Buffer sizing:** For grouped edges, the scheduler computes the buffer size
-as the maximum of all port hints across all edges in the group. This ensures
-the channel is large enough for the most demanding consumer.
+| Bit | Name | Meaning |
+|-----|------|--------|
+| 0 | `mailbox_safe` | Module can consume from a mailbox channel |
+| 1 | `in_place_writer` | Module uses `buffer_acquire_inplace` to transform the buffer |
+| 2 | `deferred_ready` | Module needs init time before downstream may run |
+| 3 | `drain_capable` | Module exports `module_drain` for live reconfigure |
 
-**Constraints:**
-- `buffer_group` aliasing is incompatible with tee/merge. `insert_fan` clears
-  `buffer_group` on fan edges and logs an error.
-- Any edge with `buffer_group != 0` enables mailbox mode on its channel,
-  even if it is the only edge in the group.
+The pack tool detects the corresponding `module_*` export and sets the
+flag automatically. The loader uses these flags to validate that the
+config's mailbox chains are consistent — a module without
+`mailbox_safe` cannot appear in a `buffer_group` chain.
 
-See `channel.rs` module docs for mailbox size semantics and `buffer_pool.rs` for
-the full state machine.
+#### Constraints
 
-### FIFO→Mailbox Backpressure
+- At most one in-place transform per alias chain (the `READY_PROCESSED`
+  state prevents double-processing)
+- `buffer_group` is incompatible with tee/merge helpers; the runner
+  clears `buffer_group` on inserted fan edges
+- Buffer sizing for grouped edges is the maximum of all port hints
+  across the group, so the channel is large enough for the most
+  demanding consumer
 
-When a transformer module reads from a FIFO input and writes to a mailbox
-output (the FIFO→mailbox boundary), it must follow a strict ordering rule:
+### FIFO → Mailbox Boundary Rule
 
-**Rule: Check mailbox output acquirability BEFORE consuming FIFO input.**
+When a transformer reads from a FIFO input and writes to a mailbox
+output, it must check the mailbox output is acquirable **before**
+consuming the FIFO input:
 
-FIFO reads are destructive — `channel_read` dequeues data from the ring
-buffer. If the module reads FIFO data but then cannot acquire the mailbox
-output buffer (because the downstream consumer has not released it), the
-read data is lost. Unlike a FIFO output where partial writes leave data
-in the ring buffer, a failed mailbox acquire has no recovery path.
-
-**Correct pattern:**
 ```c
-// 1. Check mailbox output is available
+// Correct: reserve the output buffer first
 u32 cap = 0;
 u8 *buf = buffer_acquire_write(out_chan, &cap);
-if (!buf) return 0; // DO NOT read input — output not ready
-// 2. Now safe to read FIFO input (output buffer is reserved)
+if (!buf) return 0;          // do not read input — output not ready
 int read = channel_read(in_chan, buf, cap);
 if (read > 0) buffer_release_write(out_chan, read);
 ```
 
-**Alternative:** use `channel_write` for transparent handling. The module
-still must check `channel_poll(out_chan, POLL_OUT)` before reading input.
+FIFO reads are destructive. If the module reads input but then cannot
+acquire the mailbox output, the data is lost — there is no recovery
+path because the FIFO has already advanced. Reserving the output first
+guarantees that any byte taken off the FIFO has a place to land.
 
-Modules at the FIFO→mailbox boundary are those with a FIFO input channel
-(no `buffer_group` on incoming edge) and a mailbox output channel
-(`buffer_group` set on outgoing edge).
+### Backpressure
+
+Backpressure is structural: a producer that cannot write its output
+(because the channel buffer is full or the mailbox is busy) does not
+advance its internal state. Time, frame counters, and read positions
+only move when the corresponding output has been committed. This is
+the same rule whether the producer is generating audio samples,
+emitting Ethernet frames, or fanning out a Raft proposal — see
+[module_architecture.md](module_architecture.md) for the principles.
+
+## Tee and Merge
+
+When the wiring connects one output to multiple inputs, or multiple
+outputs to one input, the runner inserts a helper module:
+
+```
+Config:                Runtime:
+A → B                  A → B
+A → C                  A → [tee] → B
+                              → C
+
+A → C                  A → [merge] → C
+B → C                  B →
+```
+
+Tee and merge use a shared static fan buffer. They are not visible in
+the config and do not count against module slot limits. They are
+incompatible with mailbox `buffer_group` aliasing — fan helpers always
+copy.
+
+## Module Instantiation
+
+PIC modules go through this sequence during `setup_graph`:
+
+1. **Find** — locate the module in flash by name hash
+2. **Validate** — check magic bytes, ABI version, code bounds
+3. **Size query** — call `module_state_size()` for the state buffer size
+4. **Allocate** — reserve state from the state arena
+5. **Heap query** — call `module_arena_size()` if exported, reserve heap
+6. **Init** — call `module_init(syscalls)` once
+7. **New** — call `module_new(in, out, ctrl, params, params_len, state, state_size, syscalls)`
+8. **Channel hints** — call `module_channel_hints()` if exported
+9. **Wait for ready** — if `deferred_ready` flag is set, gate downstream until first `Ready` outcome
+
+State memory is zeroed by `alloc_state()` before `module_new` is
+called, so modules do not need to re-zero their state struct.
+Instantiation is sequential — a module that returns a transient error
+from `module_new` is retried in a bounded loop before the next module
+proceeds.
+
+### Per-Module Heap
+
+Modules that need dynamic allocation export `module_arena_size()`. The
+kernel allocates a per-module heap arena alongside the state buffer
+during instantiation and the SDK helpers `heap_alloc`, `heap_free`,
+`heap_realloc` allocate within that arena. Modules that do not export
+the function get no heap and pay zero cost. See [heap.md](heap.md).
+
+### Per-Module Sandboxing
+
+Modules can declare a protection level:
+
+| Level | Name | Mechanism |
+|-------|------|----------|
+| 0 | None | Direct call, no isolation |
+| 1 | Guarded | Step guard timer detects timeouts |
+| 2 | Isolated | Hardware memory protection (MPU on RP2350, MMU on CM5) per step |
+
+Isolated modules execute with their state, code, and channel buffers
+mapped via the MPU/MMU and everything else excluded. A wild pointer
+write outside their permitted regions raises a fault that the scheduler
+catches, classifies, and handles via a per-module fault policy
+(`Skip`, `Restart`, or `RestartGraph`). The same step guard catches
+modules that exceed their per-step time budget. See
+[reconfigure.md](reconfigure.md) for the recovery state machine.
+
+## Live Graph Reconfigure
+
+The scheduler supports updating a running graph through four phases:
+
+```
+RUNNING → DRAINING → MIGRATING → RUNNING
+```
+
+In `DRAINING`, modules with the `drain_capable` flag have `module_drain`
+called in reverse topological order. They stop accepting new work but
+keep stepping until in-flight work completes (or the drain timeout
+expires). In `MIGRATING`, the new graph's modules are instantiated and
+the scheduler swaps over. Surviving modules — same binary, same config,
+same wiring — are preserved across the swap.
+
+This is what makes live config updates possible: an HTTP server can
+finish responding to in-flight requests, then the new HTTP server
+instance takes over without dropping connections. See
+[reconfigure.md](reconfigure.md) for the full state machine and the
+drain protocol.
+
+## Demand-Paged Arenas
+
+On targets with an MMU (BCM2712, CM5), modules can request demand-paged
+arenas larger than physical RAM. The kernel allocates virtual address
+space backed by a page pool with clock eviction and a backing store
+(NVMe or RAM disk). The module sees a flat large arena and accesses
+pages directly; the kernel handles faults transparently. This is how
+data-heavy workloads — large lookup tables, decoded image caches,
+streaming buffers — run on the same scheduler that drives microsecond-
+scale audio modules.
+
+## Static Memory
+
+The runner consolidates per-module arrays into a single
+`SchedulerState` struct (`static mut SCHED`) to avoid async state
+machine bloat:
+
+```rust
+static mut SCHED: SchedulerState; // edges, modules, ports, caps, arenas, hints, drain state, ...
+```
+
+Limits are configurable per target via constants in `scheduler.rs`:
+
+| Resource | Configurable via | Typical defaults |
+|----------|-----------------|-----------------|
+| Modules | `MAX_MODULES` | 8 (RP2040), 64 (RP2350), 256 (BCM2712) |
+| Channel edges | `MAX_GRAPH_EDGES` | 16 (RP2040), 128 (RP2350), 1024 (BCM2712) |
+| Event slots | `MAX_EVENTS` | 32 |
+| State arena | `STATE_ARENA_SIZE` | 64 KB (RP2040), 256 KB (RP2350), 1 MB+ (BCM2712) |
+| Buffer arena | `BUFFER_ARENA_SIZE` | 16 KB (RP2040), 32 KB (RP2350), 256 KB+ (BCM2712) |
+| Buffer slots | `MAX_BUFFER_SLOTS` | 20 |
+| Module name | `MAX_MODULE_NAME` | 16 bytes |
+| Burst steps | `MAX_BURST_STEPS` | 4 per module per tick |
+
+These are sized per silicon — small embedded targets have tight
+budgets, server-class targets have headroom for larger graphs. The
+config tool validates that the requested resources fit within the
+target's limits.
+
+## Async Runtime Guardrails
+
+The runtime enforces cooperative async behavior across all graph
+workloads:
+
+- Hardware-facing operations use non-blocking start/poll patterns
+- Backpressure flows through channel/buffer readiness, never sleep loops
+- Periodic async tasks include explicit yield points and avoid tight loops
+- Long critical sections in hot paths are avoided to protect scheduler latency
+- Stream interfaces return promptly when data or capacity is unavailable
+
+These rules apply to kernel HAL code (Embassy tasks on RP, polled DMA
+on aarch64) and to PIC modules. They are the contract that makes the
+"single 1 ms tick" model work at all.
 
 ## Loader Architecture
 
 The loader (`src/kernel/loader/`) is split into focused submodules:
 
-- `error.rs` - Typed error enum (`LoaderError`)
-- `flash.rs` - Safe wrappers for flash memory reads
-- `ffi.rs` - FFI call wrappers for module functions
-- `loader.rs` - State arena allocation and channel hint queries
-- `validation.rs` - Function pointer and module validation
-- `table.rs` - Module table parsing and lookup
-- `dynamic.rs` - `DynamicModule` wrapper (implements `Module` trait)
+| Submodule | Purpose |
+|-----------|--------|
+| `error.rs` | Typed `LoaderError` enum |
+| `flash.rs` | Safe wrappers around flash reads (XIP-aware) |
+| `ffi.rs` | FFI call wrappers for module exports |
+| `loader.rs` | State arena allocation and channel hint queries |
+| `validation.rs` | Function pointer validation, magic checks |
+| `table.rs` | Module table parsing and lookup |
+| `dynamic.rs` | `DynamicModule` wrapper implementing the `Module` trait |
 
-## Non-Blocking Contract
+The loader resolves required exports via FNV-1a name hashing — there is
+no symbol table in the `.fmod` file beyond a list of exported function
+hashes and offsets. This keeps the binary format compact and the
+loader fast.
 
-All module operations must be non-blocking:
+## Related Documentation
 
-- `step()` must return immediately
-- Use `channel_poll()` before reads/writes
-- Backpressure is signaled by channel fullness (POLL_OUT == 0)
-
-## Async Runtime Guardrails
-
-The runtime enforces cooperative async behavior across all graph workloads:
-
-- Hardware-facing operations use non-blocking start/poll patterns, not blocking waits.
-- Backpressure is signaled through channel/buffer readiness, never by sleep-based retries.
-- Periodic async tasks include explicit delay/yield points and avoid tight loops.
-- Long critical sections in hot paths are avoided to protect scheduler latency.
-- Stream interfaces return promptly when data or capacity is unavailable.
-
-## Static Memory
-
-The runner consolidates all per-module arrays into a single `SchedulerState`
-struct (`static mut SCHED`) to avoid async state machine bloat:
-
-```rust
-static mut SCHED: SchedulerState;  // edges, modules, ports, caps, arenas, hints, …
-```
-
-## Limits
-
-| Resource | Limit | Notes |
-|----------|-------|-------|
-| Modules | 8 | `MAX_MODULES` in scheduler.rs |
-| Channels/Edges | 15 | `MAX_GRAPH_EDGES` in config.rs |
-| Events | 32 | |
-| State arena | 256 KB | Module state + module arenas (configurable via `STATE_ARENA_SIZE`) |
-| Buffer arena | 32 KB | Channel buffers only (configurable via `BUFFER_ARENA_SIZE`) |
-| Buffer slots | 20 | `MAX_BUFFER_SLOTS` in buffer_pool.rs |
-| Module name | 16 bytes | |
-| Burst steps | 4 | `MAX_BURST_STEPS` per module per tick |
+- [module_architecture.md](module_architecture.md) — module step contract, principles, ABI
+- [device_classes.md](device_classes.md) — `dev_call` opcodes and provider dispatch
+- [hal_architecture.md](hal_architecture.md) — bus primitives, syscall table, per-silicon HAL
+- [events.md](events.md) — event signals, IRQ binding, intra-tick wake
+- [heap.md](heap.md) — per-module heap allocation
+- [reconfigure.md](reconfigure.md) — live graph reconfigure phases and drain protocol
+- [timing.md](timing.md) — stream clock vs wall clock, StreamTime, producer scheduling
+- [capability_surface.md](capability_surface.md) — hardware section, capability resolution, auto-wiring

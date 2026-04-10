@@ -332,9 +332,9 @@ The kernel does NOT provide:
 
 ## Limits
 
-| Resource | Limit |
-|----------|-------|
-| Event slots | 32 |
-| Modules (wake bitmask) | 8 |
-| IRQ source types | GPIO (type 0) — extensible |
+| Resource | Default | Notes |
+|----------|---------|-------|
+| Event slots | 32 | `MAX_EVENTS` in `event.rs` |
+| Modules (wake bitmask) | Sized to `MAX_MODULES` per target | u32 bitmask up to 32 modules; larger targets use a wider bitmask |
+| IRQ source types | GPIO (type 0); extensible per HAL |
 | GPIO pins per binding | 1 event per pin, 1 pin per event |
