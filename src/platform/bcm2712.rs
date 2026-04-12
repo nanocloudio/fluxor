@@ -30,7 +30,9 @@ use fluxor::kernel::config::EdgeClass;
 #[cfg(not(feature = "board-cm5"))]
 const UART_BASE: usize = 0x0900_0000; // QEMU virt PL011
 #[cfg(feature = "board-cm5")]
-const UART_BASE: usize = 0xFE20_1000; // Pi 5 PL011 (BCM2712 legacy peripheral space)
+const UART_BASE: usize = 0x1c_0003_0000; // Pi 5 RP1 UART0 on GPIO14/15
+// RP1 is mapped at 0x1c_0000_0000 by VPU firmware (PCIe outbound window).
+// Requires enable_uart=1, enable_rp1_uart=1, and pciex4_reset=0 in config.txt.
 
 // GIC
 #[cfg(not(feature = "board-cm5"))]
@@ -38,9 +40,9 @@ const GICD_BASE: usize = 0x0800_0000; // QEMU virt GICv2 distributor
 #[cfg(not(feature = "board-cm5"))]
 const GICC_BASE: usize = 0x0801_0000; // QEMU virt GICv2 CPU interface
 #[cfg(feature = "board-cm5")]
-const GICD_BASE: usize = 0xFF84_1000; // Pi 5 GIC-400 distributor
+const GICD_BASE: usize = 0x10_7fff_9000; // Pi 5 GIC-400 distributor
 #[cfg(feature = "board-cm5")]
-const GICC_BASE: usize = 0xFF84_2000; // Pi 5 GIC-400 CPU interface
+const GICC_BASE: usize = 0x10_7fff_a000; // Pi 5 GIC-400 CPU interface
 
 const GICC_IAR: *mut u32 = (GICC_BASE + 0x00C) as *mut u32;
 const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32;
@@ -72,47 +74,199 @@ global_asm!(
 // ============================================================================
 
 const UART_DR: *mut u32 = UART_BASE as *mut u32;
+#[cfg(feature = "board-cm5")]
+const UART_FR: *const u32 = (UART_BASE + 0x18) as *const u32;
+#[cfg(feature = "board-cm5")]
+const UART_FR_TXFF: u32 = 1 << 5;
 
-// Full PL011 register set (used on Pi 5 for UART init)
+// ============================================================================
+// BCM2712 PCIe Root Complex
+// ============================================================================
+//
+// RP1 is connected via PCIe x4. VPU firmware (with enable_rp1_uart=1 and
+// pciex4_reset=0 in config.txt) brings up the link and maps RP1 at
+// 0x1c_0000_0000 before kernel handoff. We only need to disable ASPM
+// for reliable infrequent-access patterns (per RP1 datasheet §3.3.1.3).
+// PCIe root complex (onboard) MMIO base — used by rp1_pcie_disable_aspm.
 #[cfg(feature = "board-cm5")]
-const UART_FR: *const u32 = (UART_BASE + 0x18) as *const u32;    // Flag register
+const PCIE_RC_BASE: usize = 0x10_0012_0000;
+#[cfg(feature = "board-cm5")] const PCIE_MISC_HARD_PCIE_HARD_DEBUG: usize = 0x4304;
+#[cfg(feature = "board-cm5")] const PCIE_MISC_UBUS_CTRL:            usize = 0x40a4;
+
 #[cfg(feature = "board-cm5")]
-const UART_IBRD: *mut u32 = (UART_BASE + 0x24) as *mut u32;     // Integer baud rate
+#[inline(always)]
+unsafe fn pcie_read(off: usize) -> u32 {
+    core::ptr::read_volatile((PCIE_RC_BASE + off) as *const u32)
+}
+
 #[cfg(feature = "board-cm5")]
-const UART_FBRD: *mut u32 = (UART_BASE + 0x28) as *mut u32;     // Fractional baud rate
+#[inline(always)]
+unsafe fn pcie_write(off: usize, val: u32) {
+    core::ptr::write_volatile((PCIE_RC_BASE + off) as *mut u32, val);
+}
+
+/// Disable ASPM on the PCIe RC so that
+/// writes from infrequent access patterns (ours) don't get stalled or
+/// dropped by L1 wake latency. Per RP1 datasheet §3.3.1.3.
+///
+/// Does NOT toggle PCIe resets or touch the outbound window — VPU firmware
+/// already brought the link up at kernel handoff.
 #[cfg(feature = "board-cm5")]
-const UART_LCRH: *mut u32 = (UART_BASE + 0x2C) as *mut u32;     // Line control
+unsafe fn rp1_pcie_disable_aspm() {
+    // HARD_PCIE_HARD_DEBUG (+0x4304 on Pi 5 RC).
+    //  bit 1  = CLKREQ_DEBUG_ENABLE
+    //  bit 16 = REFCLK_OVRD_ENABLE
+    //  bit 20 = REFCLK_OVRD_OUT
+    //  bit 21 = L1SS_ENABLE
+    // Clearing these matches `brcm_pcie_start_link` phase 1 in pcie-brcmstb.c.
+    let mut tmp = pcie_read(PCIE_MISC_HARD_PCIE_HARD_DEBUG);
+    tmp &= !0x0032_0002;
+    pcie_write(PCIE_MISC_HARD_PCIE_HARD_DEBUG, tmp);
+
+    // UBUS error suppression — without REPLY_ERR_DIS, a read to an unmapped
+    // PCIe address raises an AXI external abort. Set it so UART writes
+    // (which target legitimate addresses) aren't ambient-affected by stray
+    // reads elsewhere in the kernel.
+    let mut tmp = pcie_read(PCIE_MISC_UBUS_CTRL);
+    tmp |= (1 << 13) | (1 << 19);
+    pcie_write(PCIE_MISC_UBUS_CTRL, tmp);
+}
+
+// ============================================================================
+// RP1 Ethernet (Cadence GEM_GXL 1p09) — register map
+// ============================================================================
+//
+// Two MMIO regions:
+//   eth     @ 0x1c_0010_0000 (16 kB)   Cadence GEM core
+//   eth_cfg @ 0x1c_0010_4000 (16 kB)   RP1 wrapper (clkgen, TSU, irq mux)
+//   pads_eth@ 0x1c_000f_c000           RGMII pad config
+//
+// Core offsets from Linux drivers/net/ethernet/cadence/macb.h (MACB + GEM
+// classic register indices) cross-referenced with RP1 datasheet §7.
+//
+// VPU firmware leaves the GEM powered, clocked, and out of reset at kernel
+// handoff — ethernet works under Linux with no clock/reset setup in the
+// macb driver path. We rely on that state for initial bring-up.
+
 #[cfg(feature = "board-cm5")]
-const UART_CR: *mut u32 = (UART_BASE + 0x30) as *mut u32;       // Control register
-#[cfg(feature = "board-cm5")]
-const UART_FR_TXFF: u32 = 1 << 5; // Transmit FIFO full
+#[allow(dead_code)]
+mod eth {
+    pub const GEM_BASE:     usize = 0x1c_0010_0000;
+    pub const ETH_CFG_BASE: usize = 0x1c_0010_4000;
+
+    // --- Cadence GEM core register offsets ---
+    pub const NCR:    usize = 0x000;  // Network Control
+    pub const NCFGR:  usize = 0x004;  // Network Config
+    pub const NSR:    usize = 0x008;  // Network Status (MDIO idle etc)
+    pub const TSR:    usize = 0x014;  // Transmit Status
+    pub const RBQP:   usize = 0x018;  // classic MACB RX Queue Ptr
+    pub const TBQP:   usize = 0x01c;  // classic MACB TX Queue Ptr
+    pub const RSR:    usize = 0x020;  // Receive Status
+    pub const ISR:    usize = 0x024;
+    pub const IER:    usize = 0x028;
+    pub const IDR:    usize = 0x02c;
+    pub const IMR:    usize = 0x030;
+    pub const MAN:    usize = 0x034;  // PHY Maintenance (MDIO)
+    pub const HRB:    usize = 0x090;  // Hash Bottom
+    pub const HRT:    usize = 0x094;  // Hash Top
+    pub const SA1B:   usize = 0x098;  // Specific address 1 Bottom (MAC lo)
+    pub const SA1T:   usize = 0x09c;  // Specific address 1 Top    (MAC hi)
+    pub const USRIO:  usize = 0x0c0;  // User IO
+    pub const WOL:    usize = 0x0c4;
+    pub const MID:    usize = 0x0fc;  // Module ID (RO) — Pi 5 = 0x00070109
+
+    pub const DMACFG: usize = 0x010;  // GEM DMA Config
+    pub const GEM_TBQP_0: usize = 0x440;  // GEM queue-0 TX BD ptr
+    pub const GEM_RBQP_0: usize = 0x480;  // GEM queue-0 RX BD ptr
+
+    // --- NCR bits ---
+    pub const NCR_LB:      u32 = 1 << 0;   // loopback
+    pub const NCR_LLB:     u32 = 1 << 1;   // local loopback
+    pub const NCR_RE:      u32 = 1 << 2;   // RX enable
+    pub const NCR_TE:      u32 = 1 << 3;   // TX enable
+    pub const NCR_MPE:     u32 = 1 << 4;   // Management port enable (MDIO)
+    pub const NCR_CLRSTAT: u32 = 1 << 5;
+    pub const NCR_INCSTAT: u32 = 1 << 6;
+    pub const NCR_WESTAT:  u32 = 1 << 7;
+    pub const NCR_BP:      u32 = 1 << 8;
+    pub const NCR_TSTART:  u32 = 1 << 9;   // Start transmission
+    pub const NCR_THALT:   u32 = 1 << 10;
+
+    // --- MID expected value (verified via Linux /dev/mem on DUT) ---
+    pub const EXPECTED_MID: u32 = 0x0007_0109;
+
+    // --- eth_cfg wrapper offsets (RP1 datasheet §7.1) ---
+    pub const CFG_CONTROL:   usize = 0x00;
+    pub const CFG_STATUS:    usize = 0x04;  // RGMII_LINK/SPEED/DUPLEX
+    pub const CFG_TSU_CNT0:  usize = 0x08;
+    pub const CFG_TSU_CNT1:  usize = 0x0c;
+    pub const CFG_TSU_CNT2:  usize = 0x10;
+    pub const CFG_CLKGEN:    usize = 0x14;  // TXCLKDELEN, ENABLE, SPEED_OVERRIDE
+    pub const CFG_CLK2FC:    usize = 0x18;
+    pub const CFG_INTR:      usize = 0x1c;  // bit 0 = ETHERNET top-level irq
+    pub const CFG_INTE:      usize = 0x20;
+    pub const CFG_INTF:      usize = 0x24;
+    pub const CFG_INTS:      usize = 0x28;
+
+    #[inline(always)]
+    pub unsafe fn read(off: usize) -> u32 {
+        core::ptr::read_volatile((GEM_BASE + off) as *const u32)
+    }
+
+    #[inline(always)]
+    pub unsafe fn write(off: usize, val: u32) {
+        core::ptr::write_volatile((GEM_BASE + off) as *mut u32, val);
+    }
+
+    #[inline(always)]
+    pub unsafe fn cfg_read(off: usize) -> u32 {
+        core::ptr::read_volatile((ETH_CFG_BASE + off) as *const u32)
+    }
+
+    #[inline(always)]
+    pub unsafe fn cfg_write(off: usize, val: u32) {
+        core::ptr::write_volatile((ETH_CFG_BASE + off) as *mut u32, val);
+    }
+}
 
 // ============================================================================
 // UART driver
 // ============================================================================
 
-/// Initialize PL011 UART. On QEMU virt the UART is already configured.
-/// On Pi 5, GPU firmware typically sets up UART0 on GPIO 14/15, but we
-/// reinitialize to be safe.
+/// Initialize PL011 UART for Pi 5 (RP1 UART0 at 0x1c_0003_0000).
+///
+/// Depends on `rp1_clocks_init()` having run first to ungate the PL011
+/// reference clock. Values are the ones a running Linux kernel programs
+/// (captured via devmem) for 115200 baud at RP1's 50 MHz UART ref clock.
+///
+///   +0x24 IBRD = 0x1B  (27)     -> 50 MHz ref / (16 * (27 + 8/64)) = 115200 baud
+///   +0x28 FBRD = 0x08  (8)
+///   +0x2c LCRH = 0x70           -> 8N1, FIFO enabled
+///   +0x30 CR   = 0x301          -> UARTEN | TXE | RXE (no hardware flow control)
 #[cfg(feature = "board-cm5")]
 unsafe fn uart_init() {
-    // Disable UART
-    core::ptr::write_volatile(UART_CR, 0);
+    // VPU firmware (with enable_rp1_uart=1) fully configures PL011 at
+    // 115200 8N1 before kernel handoff. We just reprogram to be sure.
+    let fr   = (UART_BASE + 0x18) as *const u32;
+    let ibrd = (UART_BASE + 0x24) as *mut u32;
+    let fbrd = (UART_BASE + 0x28) as *mut u32;
+    let lcrh = (UART_BASE + 0x2c) as *mut u32;
+    let cr   = (UART_BASE + 0x30) as *mut u32;
+    let imsc = (UART_BASE + 0x38) as *mut u32;
+    let icr  = (UART_BASE + 0x44) as *mut u32;
 
-    // Wait for ongoing TX to complete
-    while core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {}
-
-    // Set baud rate: 115200 @ 48MHz UART clock
-    // Divider = 48000000 / (16 * 115200) = 26.0416...
-    // Integer = 26, Fractional = (0.0416 * 64 + 0.5) = 3
-    core::ptr::write_volatile(UART_IBRD, 26);
-    core::ptr::write_volatile(UART_FBRD, 3);
-
-    // 8N1, enable FIFOs
-    core::ptr::write_volatile(UART_LCRH, (0b11 << 5) | (1 << 4));
-
-    // Enable UART, TX, RX
-    core::ptr::write_volatile(UART_CR, (1 << 0) | (1 << 8) | (1 << 9));
+    core::ptr::write_volatile(cr, 0);
+    let mut retries = 0u32;
+    while retries < 10_000 {
+        if core::ptr::read_volatile(fr) & (1 << 3) == 0 { break; }
+        retries += 1;
+    }
+    core::ptr::write_volatile(imsc, 0);
+    core::ptr::write_volatile(icr, 0x7FF);
+    core::ptr::write_volatile(ibrd, 27);
+    core::ptr::write_volatile(fbrd, 8);
+    core::ptr::write_volatile(lcrh, 0x70);
+    core::ptr::write_volatile(cr, 0x301);
 }
 
 #[cfg(not(feature = "board-cm5"))]
@@ -124,7 +278,6 @@ fn uart_putc(c: u8) {
     unsafe {
         #[cfg(feature = "board-cm5")]
         {
-            // Wait for space in TX FIFO
             while core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {}
         }
         core::ptr::write_volatile(UART_DR, c as u32);
@@ -208,11 +361,15 @@ mod mmu {
 
     // MAIR_EL1 encoding
     // Attr0: Normal, Write-Back Write-Allocate (inner+outer) = 0xFF
-    // Attr1: Device-nGnRnE = 0x00
+    // Attr1: Device-nGnRE = 0x04 (per RP1 datasheet §3.3.1.2: recommended
+    //        AArch64 mapping for the RP1 PCIe peripheral region is nGnRE,
+    //        not nGnRnE — nGnRnE forces the CPU to wait for writes to be
+    //        "observable" before proceeding, which stalls on PCIe Posted
+    //        writes that never return explicit completions)
     // Attr2: Normal Non-cacheable = 0x44
     pub const MAIR_VALUE: u64 =
         0xFF              // index 0: Normal WB-WA
-        | (0x00 << 8)    // index 1: Device-nGnRnE
+        | (0x04 << 8)    // index 1: Device-nGnRE
         | (0x44 << 16);  // index 2: Normal Non-cacheable
 
     // TCR_EL1: 48-bit VA (T0SZ=16), 4KB granule, inner+outer WB-WA cacheable
@@ -278,13 +435,21 @@ mod mmu {
         // a bare-metal kernel that uses < 1MB.
         table[3] = device_block(0x0_C000_0000);
 
-        // RP1 PCIe BAR region at 0x1f_0000_0000.
-        // L1 index = 0x1f_0000_0000 / 0x4000_0000 = 124.
+        // BCM2712 SoC peripheral aperture at 0x10_0000_0000..0x10_8000_0000 (2 GB).
+        // This covers the legacy peripherals block that device tree exposes under
+        // `soc@107c000000 { ranges = <0x00 0x10 0x00 0x80000000>; }`, including
+        // GIC-400 at 0x10_7fff_9000/a000 and the BCM7271 UART, pinctrl, etc.
+        // L1 index = 0x10_0000_0000 / 0x4000_0000 = 64. Two 1GB blocks = 64, 65.
+        table[64] = device_block(0x10_0000_0000);
+        table[65] = device_block(0x10_4000_0000);
+
+        // RP1 PCIe BAR region at 0x1c_0000_0000 (VPU firmware window).
+        // L1 index = 0x1c_0000_0000 / 0x4000_0000 = 112.
         // Map 4 GB of device space covering the full RP1 BAR range.
-        table[124] = device_block(0x1f_0000_0000);
-        table[125] = device_block(0x1f_4000_0000);
-        table[126] = device_block(0x1f_8000_0000);
-        table[127] = device_block(0x1f_C000_0000);
+        table[112] = device_block(0x1c_0000_0000);
+        table[113] = device_block(0x1c_4000_0000);
+        table[114] = device_block(0x1c_8000_0000);
+        table[115] = device_block(0x1c_C000_0000);
     }
 
     /// Enable the MMU with the identity-mapped page tables.
@@ -336,7 +501,7 @@ mod mmu {
 // With `pciex4_reset=0` in config.txt, these mappings survive kernel handoff.
 //
 // RP1 BAR base address (set by GPU firmware, confirmed via /proc/iomem on Linux):
-//   0x1f_0000_0000 (typical, may vary)
+//   0x1c_0000_0000 (typical, may vary)
 //
 // RP1 peripheral offsets from BAR base:
 //   GPIO bank0: BAR + 0xd0000
@@ -349,16 +514,16 @@ mod mmu {
 mod rp1 {
     /// RP1 PCIe BAR base address as mapped by GPU firmware.
     /// This is the standard address on Pi 5 with stock firmware.
-    const RP1_BAR_BASE: usize = 0x1f_0000_d000;
+    const RP1_BAR_BASE: usize = 0x1c_0000_d000;
 
     // RP1 GPIO bank0 registers (offset 0xd0000 from RP1 BAR)
     // But RP1_BAR_BASE already includes the offset to the peripheral aperture.
     // The actual layout from rp1-peripherals.pdf:
     //   GPIO bank0 base = RP1 BAR + 0x0_d0000
-    // The BAR itself is at 0x1f_0000_0000, so GPIO is at 0x1f_000d_0000.
+    // The BAR itself is at 0x1c_0000_0000, so GPIO is at 0x1c_000d_0000.
 
     /// RP1 peripheral base (start of RP1 address space on PCIe BAR)
-    const RP1_PERI_BASE: usize = 0x1f_0000_0000;
+    const RP1_PERI_BASE: usize = 0x1c_0000_0000;
 
     /// GPIO bank0 base within RP1 peripheral space
     const RP1_GPIO_BASE: usize = RP1_PERI_BASE + 0xd_0000;
@@ -855,19 +1020,69 @@ global_asm!(
     ".global _start",
     ".type _start, @function",
     "_start:",
-    // ---- Install exception vectors FIRST (before any register/MMIO access) ----
-    // Default VBAR_EL1 may point to unmapped memory. Must be set before
-    // anything that could fault.
-    "    adr x1, exception_vectors",
-    "    msr vbar_el1, x1",
-    "    isb",
-
-    // ---- E3-S7: Check core ID, park secondary cores ----
+    // ---- E3-S7: Check core ID, park secondary cores (do this FIRST, before
+    //      touching any EL-specific system registers — secondaries don't
+    //      need EL drop or vector setup) ----
     "    mrs x0, mpidr_el1",
     "    and x0, x0, #0xFF",     // Aff0 = core ID
     "    cbnz x0, .Lpark_core",  // core != 0 → park
 
     // ---- Primary core (core 0) continues ----
+    // Pi 5 firmware hands off at EL2. Our kernel runs as EL1, so we must
+    // drop down. If we're already at EL1 this short-circuits.
+    "    mrs x0, CurrentEL",
+    "    cmp x0, #(2 << 2)",     // currently at EL2?
+    "    b.ne 2f",                // no → skip EL drop
+
+    // At EL2: disable EL2 MMU/caches and prepare an eret to EL1h.
+    "    mrs x0, sctlr_el2",
+    "    bic x0, x0, #(1 << 0)", // M
+    "    bic x0, x0, #(1 << 2)", // C
+    "    bic x0, x0, #(1 << 12)",// I
+    "    msr sctlr_el2, x0",
+    "    isb",
+
+    // HCR_EL2.RW = 1 → EL1 is aarch64
+    "    mrs x0, hcr_el2",
+    "    mov x1, #(1 << 31)",
+    "    orr x0, x0, x1",
+    "    msr hcr_el2, x0",
+
+    // CNTHCTL_EL2: allow EL1 physical timer / counter access
+    "    mrs x0, cnthctl_el2",
+    "    orr x0, x0, #(1 << 0)", // EL1PCTEN
+    "    orr x0, x0, #(1 << 1)", // EL1PCEN
+    "    msr cnthctl_el2, x0",
+    "    msr cntvoff_el2, xzr",
+
+    // Fake EL1h return state: DAIF all masked, SP_EL1 selected
+    "    mov x0, #0x3c5",        // (D|A|I|F)<<6 | 0b0101 = EL1h
+    "    msr spsr_el2, x0",
+    "    adr x0, 2f",
+    "    msr elr_el2, x0",
+    "    eret",
+
+    "2:",
+    // Now at EL1 (either originally or via eret).
+    // Install exception vectors for EL1.
+    "    adr x1, exception_vectors",
+    "    msr vbar_el1, x1",
+    "    isb",
+
+    // Make sure EL1 MMU/caches are off. We enable them ourselves in
+    // mmu::enable() after setting up page tables; any residual VPU state
+    // needs to be cleared so our setup actually takes effect.
+    "    mrs x0, sctlr_el1",
+    "    bic x0, x0, #(1 << 0)", // M
+    "    bic x0, x0, #(1 << 2)", // C
+    "    bic x0, x0, #(1 << 12)",// I
+    "    msr sctlr_el1, x0",
+    "    isb",
+    "    ic iallu",
+    "    tlbi vmalle1",
+    "    dsb sy",
+    "    isb",
+
     // Enable NEON/FP (CPACR_EL1.FPEN = 0b11)
     "    mov x0, #(3 << 20)",
     "    msr cpacr_el1, x0",
@@ -939,7 +1154,21 @@ global_asm!(
 
 #[no_mangle]
 pub extern "C" fn main() -> ! {
-    // Initialize UART first (Pi 5 needs explicit PL011 setup)
+    // Pi 5 bring-up sequence:
+    //   1. MMU enable — DRAM cacheable, RP1 MMIO as Device-nGnRE at 0x1c.
+    //   2. rp1_pcie_disable_aspm() — surgical ASPM disable on PCIe RC.
+    //      VPU firmware (with enable_rp1_uart=1 + pciex4_reset=0) has
+    //      already brought up the PCIe link, enabled RP1 endpoint
+    //      PCI_COMMAND, and configured GPIO14/15 + PL011 for UART.
+    //   3. uart_init() — reprogram PL011 to be sure (VPU may have left
+    //      it configured, but we set our own baud/params).
+    #[cfg(feature = "board-cm5")]
+    unsafe {
+        mmu::init_page_tables();
+        mmu::enable();
+        rp1_pcie_disable_aspm();
+    }
+
     unsafe { uart_init() };
     UART_READY.store(1, Ordering::Release);
 
@@ -948,14 +1177,15 @@ pub extern "C" fn main() -> ! {
     #[cfg(not(feature = "board-cm5"))]
     uart_puts(b"[fluxor] bcm2712 boot (QEMU virt)\r\n");
 
-    // E3-S2: MMU setup (identity-mapped page tables)
+    // QEMU virt: MMU init happens here (Pi 5 did it earlier, before PCIe).
+    #[cfg(not(feature = "board-cm5"))]
     unsafe {
         mmu::init_page_tables();
         mmu::enable();
     }
 
     #[cfg(feature = "board-cm5")]
-    uart_puts(b"[mmu] enabled: DRAM cacheable, peripherals device\r\n");
+    uart_puts(b"[mmu] already enabled earlier in boot\r\n");
 
     // E3-S4: Probe RP1 (Pi 5 only — checks PCIe BAR mapping)
     rp1::report(uart_puts, uart_put_hex32);
