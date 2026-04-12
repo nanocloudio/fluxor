@@ -232,6 +232,8 @@ impl HardwareContext {
 
 extern "C" {
     static __end_block_addr: u8;
+    #[cfg(target_arch = "aarch64")]
+    static __end_data_addr: u8;
 }
 
 /// Trailer magic: "FXLT" (Fluxor Layout Trailer)
@@ -256,13 +258,23 @@ pub struct FlashLayout {
     pub config_addr: u32,
 }
 
-/// Compute trailer address from linker symbol
+/// Compute trailer address from linker symbol.
 ///
-/// The trailer is placed at the first 256-byte aligned address after the firmware.
+/// On RP (flash/XIP): trailer is after `__end_block_addr` (includes BSS in flash).
+/// On aarch64 (RAM-loaded): trailer is after `__end_data_addr` (end of loadable
+/// sections, before BSS), because the VPU loads the image contiguously and BSS
+/// is zeroed separately in RAM.
 fn get_trailer_addr() -> u32 {
-    let end_block = unsafe { &__end_block_addr as *const u8 as u32 };
-    // Round up to 256-byte alignment
-    (end_block + 255) & !255
+    #[cfg(target_arch = "aarch64")]
+    {
+        let end_data = unsafe { &__end_data_addr as *const u8 as u32 };
+        (end_data + 255) & !255
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let end_block = unsafe { &__end_block_addr as *const u8 as u32 };
+        (end_block + 255) & !255
+    }
 }
 
 /// Read flash layout from trailer

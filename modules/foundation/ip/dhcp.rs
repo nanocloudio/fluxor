@@ -283,15 +283,14 @@ pub unsafe fn parse_dhcp_reply(
     ]);
 
     // Check magic cookie (inline constants to avoid PIC rodata issues)
-    if *data.add(236) != 99
-        || *data.add(237) != 130
-        || *data.add(238) != 83
-        || *data.add(239) != 99
-    {
-        return None;
-    }
+    // Expected: 0x63(99), 0x82(130), 0x53(83), 0x63(99)
+    let c0 = *data.add(236);
+    let c1 = *data.add(237);
+    let c2 = *data.add(238);
+    let c3 = *data.add(239);
+    let has_cookie = c0 == 99 && c1 == 130 && c2 == 83 && c3 == 99;
 
-    // Parse options
+    // Parse options (only if DHCP magic cookie present)
     let mut msg_type = 0u8;
     let mut server_ip = 0u32;
     let mut subnet_mask = 0u32;
@@ -299,7 +298,7 @@ pub unsafe fn parse_dhcp_reply(
     let mut dns = 0u32;
     let mut lease_time = 0u32;
 
-    let mut pos = 240;
+    let mut pos = if has_cookie { 240 } else { len }; // skip options if no cookie
     while pos < len {
         let opt = *data.add(pos);
         if opt == 255 {
@@ -366,6 +365,13 @@ pub unsafe fn parse_dhcp_reply(
         }
 
         pos = opt_data + opt_len;
+    }
+
+    // If no DHCP message type option (53) found, this is a pure BOOTP reply.
+    // BOOTP replies with a valid yiaddr are implicit address assignments —
+    // treat as DHCP ACK to complete the address configuration.
+    if msg_type == 0 && offered_ip != 0 {
+        msg_type = DHCP_ACK;
     }
 
     if msg_type == 0 {

@@ -25,7 +25,7 @@ mod uf2;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::config::{decode_config, generate_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES};
+use crate::config::{decode_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES};
 use crate::error::{Error, Result};
 use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config, parse_modules_from_config_multi};
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
@@ -619,13 +619,25 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
         eprintln!("Target: {}", target_desc.display_name());
     }
 
+    // Detect aarch64 targets — they use raw binary output (no UF2).
+    // Pi 5 VPU loads kernel as a raw binary to 0x80000.
+    let is_aarch64 = target_desc.build.as_ref()
+        .map(|b| b.rust_target.starts_with("aarch64"))
+        .unwrap_or(false);
+    const AARCH64_LOAD_BASE: u32 = 0x0008_0000;
+
     // Read firmware - keep as UF2 blocks to preserve non-contiguous sections like .end_block
     // Use the target's UF2 family ID so the correct chip accepts the image (e.g. RP2040 vs RP2350).
-    let (firmware_uf2, firmware_max_addr) = if firmware_path.extension().is_some_and(|ext| ext == "bin") {
+    let (firmware_data, firmware_max_addr) = if firmware_path.extension().is_some_and(|ext| ext == "bin") {
         let data = std::fs::read(firmware_path)?;
-        let end = XIP_BASE + data.len() as u32;
-        let family_id = target_desc.build.as_ref().map(|b| b.uf2_family_id).unwrap_or(UF2_FAMILY_RP2350);
-        (create_uf2_blocks(&data, XIP_BASE, family_id), end)
+        if is_aarch64 {
+            let end = AARCH64_LOAD_BASE + data.len() as u32;
+            (data, end) // raw binary, not UF2
+        } else {
+            let end = XIP_BASE + data.len() as u32;
+            let family_id = target_desc.build.as_ref().map(|b| b.uf2_family_id).unwrap_or(UF2_FAMILY_RP2350);
+            (create_uf2_blocks(&data, XIP_BASE, family_id), end)
+        }
     } else {
         // Keep original UF2 blocks intact - they may contain non-contiguous sections
         // like .end_block that the RP2350 boot ROM requires
@@ -639,7 +651,8 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     };
 
     if verbose {
-        eprintln!("Firmware: UF2 ends at 0x{:08x}", firmware_max_addr);
+        let fmt = if is_aarch64 { "raw" } else { "UF2" };
+        eprintln!("Firmware: {} ends at 0x{:08x}", fmt, firmware_max_addr);
     }
 
     // Merge board hardware defaults for sections the YAML doesn't specify
@@ -724,24 +737,27 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     };
 
     // Ensure combined image doesn't overlap the runtime parameter store sector
-    const RUNTIME_STORE_ADDR: u32 = 0x1000_0000 + 0x003F_F000;
-    let config_end = config_addr + config_data.len() as u32;
-    if config_end > RUNTIME_STORE_ADDR {
-        return Err(error::Error::Config(format!(
-            "Combined image end ({:#010x}) overlaps runtime store at {:#010x}. Reduce firmware/config size.",
-            config_end, RUNTIME_STORE_ADDR
-        )));
+    // (only applicable to flash-based targets, not aarch64 RAM images)
+    if !is_aarch64 {
+        const RUNTIME_STORE_ADDR: u32 = 0x1000_0000 + 0x003F_F000;
+        let config_end = config_addr + config_data.len() as u32;
+        if config_end > RUNTIME_STORE_ADDR {
+            return Err(error::Error::Config(format!(
+                "Combined image end ({:#010x}) overlaps runtime store at {:#010x}. Reduce firmware/config size.",
+                config_end, RUNTIME_STORE_ADDR
+            )));
+        }
     }
 
     if verbose {
+        let base_str = if is_aarch64 { AARCH64_LOAD_BASE } else { XIP_BASE };
         eprintln!("Layout:");
-        eprintln!("  Firmware:  0x{:08x} - 0x{:08x}", XIP_BASE, firmware_max_addr);
+        eprintln!("  Firmware:  0x{:08x} - 0x{:08x}", base_str, firmware_max_addr);
         eprintln!("  Trailer:   0x{:08x} (16 bytes)", trailer_addr);
         if let Some(ref mdata) = modules_data {
             eprintln!("  Modules:   0x{:08x} ({} bytes)", modules_addr, mdata.len());
         }
         eprintln!("  Config:    0x{:08x} ({} bytes)", config_addr, config_data.len());
-        eprintln!("  Runtime:   0x{:08x} (4096 bytes, reserved)", RUNTIME_STORE_ADDR);
     }
 
     // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
@@ -757,35 +773,67 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     trailer.extend_from_slice(&config_addr.to_le_bytes());
     assert_eq!(trailer.len(), 16);
 
-    // Create UF2 blocks for modules, config, trailer
-    // Use same family ID as original firmware UF2 blocks
-    let firmware_family_id = {
-        // Read family ID from first firmware block (offset 28)
-        if firmware_uf2.len() >= 32 {
-            u32::from_le_bytes([firmware_uf2[28], firmware_uf2[29], firmware_uf2[30], firmware_uf2[31]])
-        } else {
-            UF2_FAMILY_RP2350
+    // Build the combined image.
+    // aarch64: raw binary (firmware + padding + trailer + modules + config)
+    // RP:      UF2 container with blocks for each section
+    let (combined, firmware_size) = if is_aarch64 {
+        let base = AARCH64_LOAD_BASE;
+        let mut raw = firmware_data; // already raw bytes for aarch64
+        let fw_size = raw.len();
+
+        // Pad to trailer address
+        let pad_to = (trailer_addr - base) as usize;
+        if pad_to > raw.len() {
+            raw.resize(pad_to, 0);
         }
+
+        // Append trailer
+        raw.extend_from_slice(&trailer);
+
+        // Pad to modules address (if modules exist)
+        if let Some(ref mdata) = modules_data {
+            let mod_off = (modules_addr - base) as usize;
+            if mod_off > raw.len() {
+                raw.resize(mod_off, 0);
+            }
+            raw.extend_from_slice(mdata);
+        }
+
+        // Pad to config address
+        let cfg_off = (config_addr - base) as usize;
+        if cfg_off > raw.len() {
+            raw.resize(cfg_off, 0);
+        }
+        raw.extend_from_slice(&config_data);
+
+        (raw, fw_size)
+    } else {
+        // UF2 path for RP targets
+        let firmware_family_id = {
+            if firmware_data.len() >= 32 {
+                u32::from_le_bytes([firmware_data[28], firmware_data[29], firmware_data[30], firmware_data[31]])
+            } else {
+                UF2_FAMILY_RP2350
+            }
+        };
+
+        let modules_uf2 = modules_data.as_ref().map(|mdata| {
+            create_uf2_blocks(mdata, modules_addr, firmware_family_id)
+        });
+        let trailer_uf2 = create_uf2_blocks(&trailer, trailer_addr, firmware_family_id);
+        let config_uf2 = create_uf2_blocks(&config_data, config_addr, firmware_family_id);
+
+        let firmware_size = firmware_data.len();
+        let mut combined = firmware_data;
+        combined.extend_from_slice(&trailer_uf2);
+        if let Some(muf2) = modules_uf2 {
+            combined.extend_from_slice(&muf2);
+        }
+        combined.extend_from_slice(&config_uf2);
+
+        fix_uf2_block_numbers(&mut combined);
+        (combined, firmware_size)
     };
-
-    let modules_uf2 = modules_data.as_ref().map(|mdata| {
-        create_uf2_blocks(mdata, modules_addr, firmware_family_id)
-    });
-
-    let trailer_uf2 = create_uf2_blocks(&trailer, trailer_addr, firmware_family_id);
-    let config_uf2 = create_uf2_blocks(&config_data, config_addr, firmware_family_id);
-
-    // Combine all sections: firmware, trailer, modules (optional), config
-    let firmware_size = firmware_uf2.len();
-    let mut combined = firmware_uf2;
-    combined.extend_from_slice(&trailer_uf2);
-    if let Some(muf2) = modules_uf2 {
-        combined.extend_from_slice(&muf2);
-    }
-    combined.extend_from_slice(&config_uf2);
-
-    // Only fix block numbers, preserve original family IDs
-    fix_uf2_block_numbers(&mut combined);
 
     std::fs::write(output_path, &combined)?;
 

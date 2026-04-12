@@ -33,6 +33,12 @@ SECTIONS {
         KEEP(*(.layout_header))
     } > RAM
 
+    /* End of loadable (file-backed) sections.
+     * On aarch64 (RAM-loaded), the combine trailer is placed right after this
+     * rather than after __end_block_addr (which includes BSS + stack). */
+    . = ALIGN(256);
+    __end_data_addr = .;
+
     .bss (NOLOAD) : ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)

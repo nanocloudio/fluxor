@@ -41,6 +41,17 @@ wiring = [
 ]
 
 [[variant]]
+match = { board = "cm5", phy = "ethernet", driver = "rp1_gem" }
+modules = [
+  { name = "rp1_gem" },
+  { name = "ip", params = { use_dhcp = "1" } },
+]
+wiring = [
+  "rp1_gem.frames_rx -> ip.frames_rx",
+  "ip.frames_tx -> rp1_gem.frames_tx",
+]
+
+[[variant]]
 match = { family = "linux" }
 modules = [
   { name = "linux_net" },

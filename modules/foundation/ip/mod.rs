@@ -391,6 +391,7 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
     let sys = &*s.syscalls;
     let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
     if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
+        // Write frame to NIC driver channel.
         (sys.channel_write)(s.out_chan, frame, len);
         s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
         s.pending_tx_len = 0;

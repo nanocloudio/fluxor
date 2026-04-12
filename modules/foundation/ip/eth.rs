@@ -62,14 +62,15 @@ pub unsafe fn build_eth_header(
     src_mac: &[u8; 6],
     ethertype: u16,
 ) {
+    use core::ptr::{read_volatile, write_volatile};
     let mut i = 0;
     while i < 6 {
-        *dst.add(i) = *dst_mac.as_ptr().add(i);
-        *dst.add(6 + i) = *src_mac.as_ptr().add(i);
+        write_volatile(dst.add(i), read_volatile(dst_mac.as_ptr().add(i)));
+        write_volatile(dst.add(6 + i), read_volatile(src_mac.as_ptr().add(i)));
         i += 1;
     }
-    *dst.add(12) = (ethertype >> 8) as u8;
-    *dst.add(13) = (ethertype & 0xFF) as u8;
+    write_volatile(dst.add(12), (ethertype >> 8) as u8);
+    write_volatile(dst.add(13), (ethertype & 0xFF) as u8);
 }
 
 /// Broadcast MAC address

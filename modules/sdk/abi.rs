@@ -755,6 +755,11 @@ pub mod dev_system {
     /// On success, writes phys_addr:u64 LE to arg[8..16]. Returns 0 or negative errno.
     pub const DMA_ALLOC_CONTIG: u32 = 0x0CE6;
 
+    /// Flush (clean + invalidate) a virtual address range from data cache.
+    /// Required for DMA coherency on aarch64 where DMA arena is cacheable.
+    /// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0.
+    pub const CACHE_FLUSH_RANGE: u32 = 0x0CE7;
+
     // ── NIC kernel-bypass ────────────────────────────────────────────────
 
     /// Map a PCIe device BAR into kernel virtual address space.

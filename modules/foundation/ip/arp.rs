@@ -194,46 +194,50 @@ pub unsafe fn build_arp(
 
     let p = buf.add(eth::ETH_HEADER_LEN);
 
+    // All stores use write_volatile to prevent LLVM from merging them into
+    // word stores with constants from .rodata (PIC relocation issue on aarch64).
+    use core::ptr::write_volatile;
+
     // Hardware type: Ethernet (1)
-    *p.add(0) = 0x00;
-    *p.add(1) = 0x01;
+    write_volatile(p.add(0), 0x00u8);
+    write_volatile(p.add(1), 0x01u8);
     // Protocol type: IPv4
-    *p.add(2) = 0x08;
-    *p.add(3) = 0x00;
+    write_volatile(p.add(2), 0x08u8);
+    write_volatile(p.add(3), 0x00u8);
     // Hardware addr len, protocol addr len
-    *p.add(4) = 6;
-    *p.add(5) = 4;
+    write_volatile(p.add(4), 6u8);
+    write_volatile(p.add(5), 4u8);
     // Opcode
-    *p.add(6) = (opcode >> 8) as u8;
-    *p.add(7) = (opcode & 0xFF) as u8;
+    write_volatile(p.add(6), (opcode >> 8) as u8);
+    write_volatile(p.add(7), (opcode & 0xFF) as u8);
 
     // Sender hardware address
     let mut i = 0;
     while i < 6 {
-        *p.add(8 + i) = *src_mac.as_ptr().add(i);
+        write_volatile(p.add(8 + i), core::ptr::read_volatile(src_mac.as_ptr().add(i)));
         i += 1;
     }
 
     // Sender protocol address
     let src_ip_bytes = src_ip.to_be_bytes();
-    *p.add(14) = src_ip_bytes[0];
-    *p.add(15) = src_ip_bytes[1];
-    *p.add(16) = src_ip_bytes[2];
-    *p.add(17) = src_ip_bytes[3];
+    write_volatile(p.add(14), src_ip_bytes[0]);
+    write_volatile(p.add(15), src_ip_bytes[1]);
+    write_volatile(p.add(16), src_ip_bytes[2]);
+    write_volatile(p.add(17), src_ip_bytes[3]);
 
     // Target hardware address
     i = 0;
     while i < 6 {
-        *p.add(18 + i) = *dst_mac.as_ptr().add(i);
+        write_volatile(p.add(18 + i), core::ptr::read_volatile(dst_mac.as_ptr().add(i)));
         i += 1;
     }
 
     // Target protocol address
     let dst_ip_bytes = dst_ip.to_be_bytes();
-    *p.add(24) = dst_ip_bytes[0];
-    *p.add(25) = dst_ip_bytes[1];
-    *p.add(26) = dst_ip_bytes[2];
-    *p.add(27) = dst_ip_bytes[3];
+    write_volatile(p.add(24), dst_ip_bytes[0]);
+    write_volatile(p.add(25), dst_ip_bytes[1]);
+    write_volatile(p.add(26), dst_ip_bytes[2]);
+    write_volatile(p.add(27), dst_ip_bytes[3]);
 
     eth::ETH_HEADER_LEN + ARP_HEADER_LEN
 }

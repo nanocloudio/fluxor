@@ -398,6 +398,18 @@ mod mmu {
         addr | VALID | BLOCK | (1 << ATTR_IDX_SHIFT) | AP_RW | AF | PXN | UXN
     }
 
+    // Block descriptor for DMA memory: Normal Non-Cacheable, RW, Inner Shareable
+    // Used for NIC DMA arena so hardware DMA and CPU see coherent data without
+    // explicit cache maintenance. MAIR index 2 = 0x44 (Normal Non-cacheable).
+    const fn dma_block(addr: u64) -> u64 {
+        addr | VALID | BLOCK | (2 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | UXN
+    }
+
+    // Table descriptor: points L1 entry to an L2 table (for 2MB granularity)
+    const fn table_desc(l2_addr: u64) -> u64 {
+        l2_addr | VALID | TABLE
+    }
+
     /// Static L1 page table (512 entries, 4KB aligned, in BSS).
     /// Each entry covers 1 GB.
     #[repr(C, align(4096))]
@@ -406,13 +418,44 @@ mod mmu {
     #[link_section = ".bss"]
     pub static mut L1_TABLE: PageTable = PageTable([0; 512]);
 
+    /// L2 page table for the first 1GB of DRAM (0x0 - 0x3FFFFFFF).
+    /// This allows the NIC DMA arena (2MB-aligned in BSS) to be mapped
+    /// as non-cacheable while the rest of DRAM stays cacheable.
+    /// Each entry covers 2MB.
+    #[repr(C, align(4096))]
+    struct L2Table([u64; 512]);
+
+    #[link_section = ".bss"]
+    static mut L2_TABLE_0: L2Table = L2Table([0; 512]);
+
     /// Fill the L1 page table with identity mappings.
     /// Must be called before enabling the MMU.
     pub unsafe fn init_page_tables() {
         let table = &mut *(&raw mut L1_TABLE.0);
 
-        // 0x0_0000_0000 .. 0x0_3FFF_FFFF (1 GB): DRAM
-        table[0] = dram_block(0x0_0000_0000);
+        // 0x0_0000_0000 .. 0x0_3FFF_FFFF (1 GB): DRAM with L2 table
+        // for fine-grained non-cacheable mapping of NIC DMA arena.
+        {
+            let l2 = &mut *(&raw mut L2_TABLE_0.0);
+            // Fill all 512 L2 entries as cacheable DRAM (each 2MB)
+            let mut i = 0usize;
+            while i < 512 {
+                l2[i] = dram_block((i as u64) * 0x20_0000);
+                i += 1;
+            }
+            // Override the DMA arena entry with non-cacheable.
+            // The NIC DMA arena is a 2MB-aligned static in BSS. We query its
+            // address and mark that 2MB L2 entry as Normal Non-cacheable (MAIR
+            // index 2). This eliminates all cache maintenance from the NIC data
+            // path — hardware DMA and CPU see coherent memory by construction.
+            let dma_addr = fluxor::kernel::nic_ring::dma_arena_base();
+            if dma_addr != 0 && dma_addr < 0x4000_0000 {
+                let l2_idx = dma_addr >> 21; // divide by 2MB
+                l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
+            }
+            // Point L1[0] to our L2 table
+            table[0] = table_desc(&raw const L2_TABLE_0 as u64);
+        }
         // 0x0_4000_0000 .. 0x0_7FFF_FFFF (1 GB): DRAM
         table[1] = dram_block(0x0_4000_0000);
         // 0x0_8000_0000 .. 0x0_BFFF_FFFF (1 GB): DRAM
@@ -1184,11 +1227,30 @@ pub extern "C" fn main() -> ! {
         mmu::enable();
     }
 
-    #[cfg(feature = "board-cm5")]
-    uart_puts(b"[mmu] already enabled earlier in boot\r\n");
-
     // E3-S4: Probe RP1 (Pi 5 only — checks PCIe BAR mapping)
     rp1::report(uart_puts, uart_put_hex32);
+
+    // E3-S4b: PCIe enumeration — populate DEVICES[] so NIC_BAR_MAP works.
+    {
+        let n = fluxor::kernel::pcie::enumerate();
+        uart_puts(b"[pcie] enumerated ");
+        uart_put_u32(n as u32);
+        uart_puts(b" device(s)\r\n");
+
+        #[cfg(feature = "board-cm5")]
+        {
+            // Report GEM Module ID to confirm RP1 ethernet is reachable
+            let mid = unsafe { core::ptr::read_volatile(eth::GEM_BASE.wrapping_add(eth::MID) as *const u32) };
+            uart_puts(b"[gem] MID=0x");
+            uart_put_hex32(mid);
+            if mid == eth::EXPECTED_MID {
+                uart_puts(b" (OK)\r\n");
+            } else {
+                uart_puts(b" (UNEXPECTED - expected 0x00070109)\r\n");
+            }
+
+        }
+    }
 
     static LOGGER: UartLogger = UartLogger;
     unsafe { log::set_logger_racy(&LOGGER).ok() };
@@ -2154,6 +2216,23 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             ]);
             let val = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             core::ptr::write_volatile(addr as *mut u32, val);
+            0
+        }
+        dev_system::CACHE_FLUSH_RANGE => {
+            if arg.is_null() || arg_len < 12 { return -22; }
+            let addr = u64::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]);
+            let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            // Clean + invalidate data cache by VA range
+            let mut ptr = (addr as usize) & !63;
+            let end = ((addr as usize) + size as usize + 63) & !63;
+            while ptr < end {
+                core::arch::asm!("dc civac, {}", in(reg) ptr, options(nostack));
+                ptr += 64;
+            }
+            core::arch::asm!("dsb sy");
             0
         }
         dev_system::DMA_ALLOC_CONTIG => {

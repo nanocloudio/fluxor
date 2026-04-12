@@ -164,6 +164,17 @@ static mut DMA_ARENA: DmaArena = DmaArena([0u8; DMA_ARENA_SIZE]);
 #[cfg(feature = "chip-bcm2712")]
 static DMA_ARENA_OFFSET: AtomicU32 = AtomicU32::new(0);
 
+/// Return the DMA arena base address for MMU non-cacheable mapping.
+/// Called once during early boot (init_page_tables) to identify which
+/// 2MB L2 entry to mark as Normal Non-cacheable.
+#[cfg(feature = "chip-bcm2712")]
+pub fn dma_arena_base() -> usize {
+    (&raw const DMA_ARENA) as *const _ as usize
+}
+
+#[cfg(not(feature = "chip-bcm2712"))]
+pub fn dma_arena_base() -> usize { 0 }
+
 /// NIC ring slots.
 static mut NIC_RINGS: [NicRing; MAX_NIC_RINGS] = [const { NicRing::empty() }; MAX_NIC_RINGS];
 
