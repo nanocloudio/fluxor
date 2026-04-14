@@ -103,6 +103,21 @@ struct Poly1305 {
     buf_len: usize,
 }
 
+impl Drop for Poly1305 {
+    fn drop(&mut self) {
+        let rp = self.r.as_mut_ptr();
+        let hp = self.h.as_mut_ptr();
+        let pp = self.pad.as_mut_ptr();
+        unsafe {
+            let mut i = 0;
+            while i < 5 { core::ptr::write_volatile(rp.add(i), 0); core::ptr::write_volatile(hp.add(i), 0); i += 1; }
+            let mut j = 0;
+            while j < 4 { core::ptr::write_volatile(pp.add(j), 0); j += 1; }
+        }
+        zeroize(&mut self.buf);
+    }
+}
+
 impl Poly1305 {
     fn new(key: &[u8; 32]) -> Self {
         // r = key[0..16] with clamping

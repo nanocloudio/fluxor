@@ -39,12 +39,12 @@ include!("handshake.rs");
 // Module constants
 // ============================================================================
 
-const MAX_SESSIONS: usize = 2;
-const MAX_CERT_LEN: usize = 512;
+const MAX_SESSIONS: usize = 4;
+const MAX_CERT_LEN: usize = 1024;
 const MAX_KEY_LEN: usize = 160;
-const RECV_BUF_SIZE: usize = 2048;
-const SEND_BUF_SIZE: usize = 1536;
-const SCRATCH_SIZE: usize = 1024;
+const RECV_BUF_SIZE: usize = 4096;
+const SEND_BUF_SIZE: usize = 2048;
+const SCRATCH_SIZE: usize = 1536;
 const NET_SCRATCH_SIZE: usize = 1600;
 
 // Net protocol message types (downstream: IP -> TLS -> HTTP)
@@ -54,6 +54,8 @@ const NET_MSG_CLOSED: u8 = 0x03;
 const NET_MSG_BOUND: u8 = 0x04;
 const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
+const NET_MSG_RETRANSMIT: u8 = 0x07;
+const NET_MSG_ACK: u8 = 0x08;
 
 // Net protocol command types (upstream: HTTP -> TLS -> IP)
 const NET_CMD_BIND: u8 = 0x10;
@@ -233,6 +235,14 @@ struct TlsState {
     key: [u8; MAX_KEY_LEN],
     key_len: usize,
 
+    // Trust anchor: public key extracted from a CA certificate provided via
+    // params. When require_ca is true and ca_pubkey is populated, every peer
+    // certificate's ECDSA signature is verified against this key before the
+    // handshake is allowed to proceed.
+    ca_pubkey: [u8; 65],
+    ca_pubkey_len: u8,
+    require_ca: bool,
+
     // Trust domain for SPIFFE validation
     trust_domain: [u8; 64],
     trust_domain_len: usize,
@@ -291,6 +301,8 @@ pub unsafe extern "C" fn module_new(
     s.cert_len = 0;
     s.key_len = 0;
     s.trust_domain_len = 0;
+    s.ca_pubkey_len = 0;
+    s.require_ca = false;
 
     let sys = &*s.syscalls;
 
@@ -353,11 +365,11 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     let mut pos = 0;
     let end = params_len;
 
-    // Search for extended TLV pattern: tag(10 or 11) + 0x00 + len_hi + len_lo
+    // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
     while pos + 4 <= end {
         let tag = data[pos];
-        // Look for extended TLV marker: tag byte followed by 0x00
-        if (tag == 10 || tag == 11 || tag == 3) && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
+        let ext_tags = tag == 3 || tag == 10 || tag == 11 || tag == 12;
+        if ext_tags && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let data_start = pos + 4;
             if data_start + len > end { break; }
@@ -377,6 +389,19 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                     let n = if len < MAX_KEY_LEN { len } else { MAX_KEY_LEN };
                     core::ptr::copy_nonoverlapping(data.as_ptr().add(data_start), s.key.as_mut_ptr(), n);
                     s.key_len = n;
+                }
+                12 => {
+                    // Trust anchor: parse the supplied CA certificate and
+                    // extract its subject public key for later verification
+                    // of peer certs. Enables require_ca.
+                    let ca_der = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
+                    if let Some(ca) = parse_certificate(ca_der) {
+                        let pk = ca.public_key;
+                        let n = if pk.len() <= 65 { pk.len() } else { 65 };
+                        core::ptr::copy_nonoverlapping(pk.as_ptr(), s.ca_pubkey.as_mut_ptr(), n);
+                        s.ca_pubkey_len = n as u8;
+                        s.require_ca = true;
+                    }
                 }
                 _ => {}
             }
@@ -518,8 +543,24 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let rd = if pl < NET_SCRATCH_SIZE { pl } else { NET_SCRATCH_SIZE };
                     if rd > 0 { (sys.channel_read)(s.cipher_in, s.net_scratch.as_mut_ptr(), rd); }
                     if pl > rd { tls_discard(sys, s.cipher_in, pl - rd); }
-                    // Write frame header + payload to clear_out
                     tls_write_raw_frame(sys, s.clear_out, t, s.net_scratch.as_ptr(), rd as u16);
+                }
+                t if t == NET_MSG_ACK as u8 => {
+                    // IP has advanced its send-side ACK watermark. Today we
+                    // rely on TCP's own ARQ and do not retain ciphertext
+                    // across records, so this is a no-op; consume the frame.
+                    tls_discard(sys, s.cipher_in, payload_len as usize);
+                }
+                t if t == NET_MSG_RETRANSMIT as u8 => {
+                    // TCP fast-retransmit or RTO fired. Full TLS-level
+                    // retransmission of already-encrypted records requires
+                    // ciphertext retention (RFC §1.3) which is not yet
+                    // implemented. Log and consume; TCP retransmit at the
+                    // segment level will still carry the stream forward.
+                    dev_log(sys, 2,
+                        b"[tls] MSG_RETRANSMIT unhandled".as_ptr(),
+                        b"[tls] MSG_RETRANSMIT unhandled".len());
+                    tls_discard(sys, s.cipher_in, payload_len as usize);
                 }
                 _ => {
                     // Unknown — discard
@@ -696,6 +737,21 @@ unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: us
 unsafe fn extract_peer_cert_key(s: &mut TlsState, idx: usize, hs_body: &[u8]) -> bool {
     if let Some(cert_der) = parse_certificate_msg(hs_body) {
         if let Some(cert) = parse_certificate(cert_der) {
+            // Trust anchor check: if a CA public key is configured, verify
+            // the peer certificate's TBS signature against it. Chain-of-one
+            // path validation — leaf must be signed directly by the CA.
+            if s.require_ca && s.ca_pubkey_len > 0 {
+                let ca_pk = &s.ca_pubkey[..s.ca_pubkey_len as usize];
+                let tbs_hash = sha256(cert.tbs_raw);
+                let raw_sig = match parse_der_signature(cert.signature) {
+                    Some(r) => r,
+                    None => return false,
+                };
+                if !ecdsa_verify(ca_pk, &tbs_hash, &raw_sig) {
+                    return false;
+                }
+            }
+
             let pk = cert.public_key;
             let pk_len = if pk.len() <= 65 { pk.len() } else { 65 };
             core::ptr::copy_nonoverlapping(pk.as_ptr(), s.sessions[idx].peer_cert_pubkey.as_mut_ptr(), pk_len);
@@ -730,14 +786,32 @@ unsafe fn skip_ccs(sess: &mut TlsSession) {
 }
 
 unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
+    let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
 
-    // Use pre-computed ephemeral key pair for this session index
-    // Each session gets a unique key pair for forward secrecy
-    let key_idx = if idx < MAX_SESSIONS && !s.eph_used[idx] { idx } else { 0 };
-    sess.ecdh_private = s.eph_private[key_idx];
-    sess.ecdh_public = s.eph_public[key_idx];
-    s.eph_used[key_idx] = true;
+    // Generate a fresh ephemeral ECDH key pair per session (RFC §2.4).
+    // Pre-computing keys at module_new and reusing them across sessions
+    // weakens forward secrecy: a memory disclosure after session N reveals
+    // the private key of every subsequent session that reuses it.
+    let mut random = [0u8; 32];
+    if dev_csprng_fill(sys, random.as_mut_ptr(), 32) < 0 {
+        // Fall back to the pre-computed pool slot if CSPRNG is unavailable.
+        let key_idx = if idx < MAX_SESSIONS && !s.eph_used[idx] { idx } else { 0 };
+        sess.ecdh_private = s.eph_private[key_idx];
+        sess.ecdh_public = s.eph_public[key_idx];
+        s.eph_used[key_idx] = true;
+    } else {
+        let (priv_key, pub_key) = ecdh_keygen(&random);
+        sess.ecdh_private = priv_key;
+        sess.ecdh_public = pub_key;
+        // Volatile wipe of the stack buffer — the private scalar has been
+        // consumed by ecdh_keygen but the random seed also leaks it.
+        let mut i = 0;
+        while i < 32 {
+            core::ptr::write_volatile(random.as_mut_ptr().add(i), 0);
+            i += 1;
+        }
+    }
 
     // Default suite (will be set during handshake)
     sess.suite = CipherSuite::ChaCha20Poly1305;

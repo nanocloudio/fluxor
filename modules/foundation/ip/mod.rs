@@ -72,6 +72,12 @@ const NET_MSG_CLOSED: u8 = 0x03;
 const NET_MSG_BOUND: u8 = 0x04;
 const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
+/// Request that the consumer retransmit data from `from_seq` onwards on
+/// the named connection. Fires on 3 duplicate ACKs or an RTO timeout.
+const NET_MSG_RETRANSMIT: u8 = 0x07;
+/// Advance the consumer-side "acknowledged bytes" watermark so the
+/// consumer may free its retained send buffer up to this offset.
+const NET_MSG_ACK: u8 = 0x08;
 
 /// Net protocol: upstream commands (consumer → IP)
 const NET_CMD_BIND: u8 = 0x10;
@@ -171,6 +177,8 @@ mod params_def {
 
         1, use_dhcp, u8, 1, enum { no=0, yes=1 }
             => |s, d, len| { s.use_dhcp = p_u8(d, len, 0, 1); };
+        2, expected_dhcp_server, u32, 0
+            => |s, d, len| { s.dhcp.expected_server = p_u32(d, len, 0, 0); };
     }
 }
 
@@ -344,6 +352,61 @@ unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8) {
     core::ptr::write_volatile(scratch.add(3), conn_id);
     core::ptr::write_volatile(scratch.add(4), errno as u8);
     (sys.channel_write)(s.net_out_chan, scratch, 5);
+}
+
+/// Emit a MSG_RETRANSMIT frame. Payload: [conn_id:1][from_seq:4 LE].
+#[inline(always)]
+unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u8, from_seq: u32) {
+    if s.net_out_chan < 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    core::ptr::write_volatile(scratch, NET_MSG_RETRANSMIT);
+    core::ptr::write_volatile(scratch.add(1), 5u8);
+    core::ptr::write_volatile(scratch.add(2), 0u8);
+    core::ptr::write_volatile(scratch.add(3), conn_id);
+    let b = from_seq.to_le_bytes();
+    core::ptr::write_volatile(scratch.add(4), b[0]);
+    core::ptr::write_volatile(scratch.add(5), b[1]);
+    core::ptr::write_volatile(scratch.add(6), b[2]);
+    core::ptr::write_volatile(scratch.add(7), b[3]);
+    (sys.channel_write)(s.net_out_chan, scratch, 8);
+}
+
+/// Emit a MSG_ACK frame. Payload: [conn_id:1][acked_seq:4 LE].
+#[inline(always)]
+#[allow(dead_code)]
+unsafe fn net_send_ack(s: &mut IpState, conn_id: u8, acked_seq: u32) {
+    if s.net_out_chan < 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    core::ptr::write_volatile(scratch, NET_MSG_ACK);
+    core::ptr::write_volatile(scratch.add(1), 5u8);
+    core::ptr::write_volatile(scratch.add(2), 0u8);
+    core::ptr::write_volatile(scratch.add(3), conn_id);
+    let b = acked_seq.to_le_bytes();
+    core::ptr::write_volatile(scratch.add(4), b[0]);
+    core::ptr::write_volatile(scratch.add(5), b[1]);
+    core::ptr::write_volatile(scratch.add(6), b[2]);
+    core::ptr::write_volatile(scratch.add(7), b[3]);
+    (sys.channel_write)(s.net_out_chan, scratch, 8);
+}
+
+/// Recompute the advertised receive window from consumer-channel backpressure.
+/// Called after delivering data on a connection.
+unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
+    let sys = &*s.syscalls;
+    // Check whether the consumer channel has drained space.
+    let poll_out = (sys.channel_poll)(s.net_out_chan, POLL_OUT);
+    let consumer_ready = poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0;
+    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+    // Heuristic: if consumer channel reports writable, treat the
+    // downstream buffer as fully drained.
+    if consumer_ready {
+        conn.consumed_bytes = conn.delivered_bytes;
+    }
+    let in_flight = conn.delivered_bytes.wrapping_sub(conn.consumed_bytes);
+    let avail = (tcp::MAX_RCV_WND as u32).saturating_sub(in_flight) as u16;
+    conn.rcv_wnd = core::cmp::min(avail, tcp::MAX_RCV_WND);
 }
 
 /// Unchecked TCP conn access (avoids bounds check panic in PIC).
@@ -636,31 +699,29 @@ pub extern "C" fn module_in_place_safe() -> u32 {
 // ============================================================================
 
 /// Read and process all pending RX frames from in_chan.
+///
+/// The NIC driver writes length-prefixed frames (`[len:u16 LE][frame...]`).
+/// We read the 2-byte header first, then exactly `len` bytes so back-to-back
+/// frames in the byte-stream channel don't concatenate into one giant "frame".
 unsafe fn process_rx_frames(s: &mut IpState) {
-    if s.in_chan < 0 {
-        return;
-    }
+    if s.in_chan < 0 { return; }
     let sys = &*s.syscalls;
 
-    // Process up to 4 frames per step
     let mut count = 0;
     while count < 4 {
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
-            break;
-        }
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 { break; }
 
-        let r = (sys.channel_read)(
-            s.in_chan,
-            s.rx_frame.as_mut_ptr(),
-            MAX_FRAME_SIZE,
-        );
-        if r <= 0 {
-            break;
-        }
+        let mut hdr = [0u8; 2];
+        let hn = (sys.channel_read)(s.in_chan, hdr.as_mut_ptr(), 2);
+        if hn < 2 { break; }
+        let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
+        if frame_len == 0 || frame_len > MAX_FRAME_SIZE { break; }
 
-        let frame_len = r as usize;
-        process_frame(s, frame_len);
+        let r = (sys.channel_read)(s.in_chan, s.rx_frame.as_mut_ptr(), frame_len) as i32;
+        if r <= 0 { break; }
+
+        process_frame(s, r as usize);
         count += 1;
     }
 }
@@ -712,6 +773,26 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
         None => return,
     };
     let (opcode, sender_ip, sender_mac, target_ip) = parsed;
+
+    // Gratuitous-ARP conflict detection: if someone claims our IP from a
+    // different MAC, defend by broadcasting a gratuitous reply asserting
+    // our MAC for our IP, then notify the consumer via MSG_ERROR.
+    if s.local_ip != 0 && sender_ip == s.local_ip && sender_mac != s.mac_addr {
+        log_info(s, b"[ip] arp conflict");
+        if s.mac_valid {
+            let frame_len = arp::build_arp(
+                s.tx_frame.as_mut_ptr(),
+                arp::ARP_REPLY,
+                &s.mac_addr,
+                s.local_ip,
+                &eth::BROADCAST_MAC,
+                s.local_ip,
+            );
+            send_frame(s, s.tx_frame.as_ptr(), frame_len);
+        }
+        net_send_error(s, 0, -1);
+        return;
+    }
 
     // Always learn from ARP packets
     arp::insert(&mut s.arp_table, sender_ip, sender_mac, s.step_count as u16);
@@ -895,7 +976,10 @@ unsafe fn process_tcp_segment(
                     conn.snd_una = iss;
                     conn.rcv_nxt = tcp_hdr.seq_num.wrapping_add(1);
                     conn.snd_wnd = tcp_hdr.window;
-                    conn.rcv_wnd = 512;
+                    conn.rcv_wnd = tcp::INITIAL_RCV_WND;
+                    conn.cwnd = tcp::MSS;
+                    conn.ssthresh = 0xFFFF;
+                    conn.rto = tcp::RTO_INITIAL;
                     conn.retransmit_timer = 0;
                     conn.state = tcp::TcpState::SynReceived;
                     send_tcp_control(s, li, tcp::SYN | tcp::ACK);
@@ -927,6 +1011,13 @@ unsafe fn process_tcp_segment(
     let mut action: u8 = ACTION_NONE;
     let mut rx_payload_offset: usize = 0;
     let mut rx_payload_len: usize = 0;
+    let mut reorder_pending: bool = false;
+    let mut reorder_seq: u32 = 0;
+    let mut reorder_offset: usize = 0;
+    let mut reorder_len: usize = 0;
+    let mut net_send_fast_retransmit: bool = false;
+    let mut net_send_fast_retransmit_conn: u8 = 0;
+    let mut net_send_fast_retransmit_seq: u32 = 0;
 
     {
         let conn = &mut (*s.tcp_conns.as_mut_ptr().add(conn_idx));
@@ -953,15 +1044,37 @@ unsafe fn process_tcp_segment(
                     action = ACTION_SET_CLOSED;
                 } else {
                     if (tcp_hdr.flags & tcp::ACK) != 0 {
+                        let prev_una = conn.snd_una;
                         if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1)) {
                             conn.snd_una = tcp_hdr.ack_num;
                         }
                         conn.snd_wnd = tcp_hdr.window;
+                        if conn.snd_una != prev_una {
+                            // New data acknowledged.
+                            tcp::on_new_ack(conn);
+                            tcp::rtt_ack(conn, tcp_hdr.ack_num, s.step_count as u16);
+                        } else if tcp_hdr.ack_num == prev_una && tcp_hdr.payload_len == 0 {
+                            // Duplicate ACK (no new data, no new ACK).
+                            if tcp::on_dup_ack(conn) {
+                                // Fast retransmit trigger — consumer notified.
+                                net_send_fast_retransmit = true;
+                                net_send_fast_retransmit_conn = conn_idx as u8;
+                                net_send_fast_retransmit_seq = conn.snd_una;
+                            }
+                        }
                     }
                     if tcp_hdr.payload_len > 0 && tcp_hdr.seq_num == conn.rcv_nxt {
                         rx_payload_offset = tcp_hdr.payload_offset;
                         rx_payload_len = tcp_hdr.payload_len;
                         action = ACTION_RX_DATA;
+                    } else if tcp_hdr.payload_len > 0 && seq_between(conn.rcv_nxt, tcp_hdr.seq_num, conn.rcv_nxt.wrapping_add(conn.rcv_wnd as u32)) {
+                        // Out-of-order segment within the receive window —
+                        // buffer for reassembly and send a duplicate ACK.
+                        reorder_pending = true;
+                        reorder_seq = tcp_hdr.seq_num;
+                        reorder_offset = tcp_hdr.payload_offset;
+                        reorder_len = tcp_hdr.payload_len;
+                        action = ACTION_SEND_ACK; // duplicate ACK
                     }
                     if (tcp_hdr.flags & tcp::FIN) != 0 {
                         conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
@@ -1052,16 +1165,18 @@ unsafe fn process_tcp_segment(
         ACTION_COMPLETE_CONNECT => {
             send_tcp_control(s, conn_idx, tcp::ACK);
             net_send_connected(s, conn_idx as u8);
+            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
+            arp::pin(&mut s.arp_table, remote_ip);
         }
         ACTION_COMPLETE_REFUSED => {
             net_send_error(s, conn_idx as u8, -111i8);
-            // Reset the connection slot
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
             *conn = tcp::TcpConn::new();
         }
         ACTION_SET_CLOSED => {
+            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
+            if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
             net_send_closed(s, conn_idx as u8);
-            // Reset the connection slot
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
             *conn = tcp::TcpConn::new();
         }
@@ -1071,16 +1186,40 @@ unsafe fn process_tcp_segment(
         }
         ACTION_RX_DATA | ACTION_RX_DATA_FIN => {
             let payload = data.add(rx_payload_offset);
-            // Deliver data via net protocol channel
+            // Deliver in-order data via net protocol channel.
             net_send_data(s, conn_idx as u8, payload, rx_payload_len);
-            // Advance rcv_nxt by the amount delivered
-            (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt.wrapping_add(rx_payload_len as u32);
+            {
+                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
+                conn.delivered_bytes = conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
+            }
+            // Drain any reorder slots that are now contiguous.
+            loop {
+                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                let rcv_nxt = conn.rcv_nxt;
+                let taken = tcp::reorder_take_next(conn, rcv_nxt);
+                match taken {
+                    Some((slice, next_seq)) => {
+                        // Copy slice to stable pointer (slice aliases reorder_buf).
+                        let ptr = slice.as_ptr();
+                        let len = slice.len();
+                        net_send_data(s, conn_idx as u8, ptr, len);
+                        let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                        conn2.rcv_nxt = next_seq;
+                        conn2.delivered_bytes = conn2.delivered_bytes.wrapping_add(len as u32);
+                    }
+                    None => break,
+                }
+            }
+            update_rcv_wnd(s, conn_idx);
             send_tcp_control(s, conn_idx, tcp::ACK);
             if action == ACTION_RX_DATA_FIN {
                 net_send_closed(s, conn_idx as u8);
             }
         }
         ACTION_COMPLETE_ACCEPT => {
+            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
+            arp::pin(&mut s.arp_table, remote_ip);
             net_send_accepted(s, conn_idx as u8);
             // Deliver piggybacked data (e.g. HTTP GET in same segment as ACK)
             if rx_payload_len > 0 {
@@ -1097,6 +1236,18 @@ unsafe fn process_tcp_segment(
             send_tcp_control(s, conn_idx, tcp::SYN | tcp::ACK);
         }
         _ => {}
+    }
+
+    // Buffer an out-of-order segment if one was flagged.
+    if reorder_pending {
+        let payload = data.add(reorder_offset);
+        let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+        tcp::reorder_insert(conn, reorder_seq, payload, reorder_len);
+    }
+
+    // Fast retransmit — signal the consumer to resend from `snd_una`.
+    if net_send_fast_retransmit {
+        net_send_retransmit(s, net_send_fast_retransmit_conn, net_send_fast_retransmit_seq);
     }
 }
 
@@ -1351,10 +1502,20 @@ unsafe fn step_dhcp(s: &mut IpState) {
 
     match s.dhcp.state {
         dhcp::DhcpState::Idle => {
-            // Start DHCP discovery — only generate XID once
+            // Start DHCP discovery — generate an unpredictable XID from the
+            // kernel CSPRNG to avoid precomputable race attacks.
             if s.dhcp.xid == 0 {
-                s.dhcp.xid = s.step_count ^ 0xDEADBEEF;
-                if s.dhcp.xid == 0 { s.dhcp.xid = 1; }
+                let sys = &*s.syscalls;
+                let mut xid_bytes = [0u8; 4];
+                if dev_csprng_fill(sys, xid_bytes.as_mut_ptr(), 4) < 0 {
+                    // Fall back to a step-count derivation if the CSPRNG is
+                    // unavailable — better than 0 (which parse_dhcp_reply
+                    // rejects) and better than reusing the boot constant.
+                    s.dhcp.xid = s.step_count.wrapping_mul(2654435761).wrapping_add(1);
+                } else {
+                    s.dhcp.xid = u32::from_le_bytes(xid_bytes);
+                    if s.dhcp.xid == 0 { s.dhcp.xid = 1; }
+                }
             }
             s.dhcp.retries = 0;
             send_dhcp_discover(s);
@@ -1391,7 +1552,22 @@ unsafe fn step_dhcp(s: &mut IpState) {
             }
         }
         dhcp::DhcpState::Bound => {
-            // Already configured — nothing to do
+            // Track lease expiry (RFC 2131 §4.4.5). T1 = 0.5 * lease, T2 =
+            // 0.875 * lease. On T1, send a unicast REQUEST (renewal). At
+            // expiry, drop back to Idle and start a fresh discover.
+            if s.dhcp.lease_duration > 0 {
+                let elapsed = s.step_count.wrapping_sub(s.dhcp.lease_start);
+                if elapsed >= s.dhcp.lease_duration {
+                    s.ip_configured = false;
+                    s.dhcp.state = dhcp::DhcpState::Idle;
+                    s.dhcp.xid = 0;
+                    s.dhcp.timer = 0;
+                    s.dhcp.renew_sent = false;
+                } else if !s.dhcp.renew_sent && elapsed >= s.dhcp.lease_duration / 2 {
+                    s.dhcp.renew_sent = true;
+                    send_dhcp_request(s);
+                }
+            }
         }
     }
 }
@@ -1429,6 +1605,18 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
     };
     let (msg_type, offered_ip, server_ip, subnet_mask, gateway, dns, lease_time) = parsed;
 
+    // Reject replies from servers other than the configured one.
+    if s.dhcp.expected_server != 0 && server_ip != s.dhcp.expected_server {
+        log_info(s, b"[ip] dhcp reject: unexpected server");
+        return;
+    }
+
+    // Sanity-check the offered configuration.
+    if !dhcp::validate_dhcp_config(offered_ip, subnet_mask, gateway, lease_time) {
+        log_info(s, b"[ip] dhcp reject: invalid config");
+        return;
+    }
+
     match msg_type {
         dhcp::DHCP_OFFER => {
             log_info(s, b"[ip] dhcp offer rx");
@@ -1457,6 +1645,16 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                 s.dns_server = dns;
                 s.ip_configured = true;
                 s.dhcp.state = dhcp::DhcpState::Bound;
+                s.dhcp.lease_start = s.step_count;
+                // Convert lease seconds into step ticks (one step = 100 µs or 1 ms
+                // depending on config; we approximate by treating step_count as
+                // an opaque tick counter and multiplying by 1000 to get ms).
+                s.dhcp.lease_duration = lease_time.saturating_mul(1000);
+                s.dhcp.renew_sent = false;
+                // Permanently pin the gateway ARP entry if already learnt.
+                if s.gateway != 0 {
+                    arp::pin_gateway(&mut s.arp_table, s.gateway);
+                }
 
                 // Log the assigned IP address with startup timing
                 {
@@ -1615,12 +1813,17 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         let conn = &*s.tcp_conns.as_ptr().add(conn_id);
                         if conn.state == tcp::TcpState::Established {
                             if conn.rcv_wnd != 0 {
-                                // TCP send — check window and send
+                                // Effective window is min(peer snd_wnd, cwnd).
+                                let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
                                 let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
-                                let can_send = (conn.snd_wnd as usize).saturating_sub(in_flight).min(1400);
+                                let can_send = eff_wnd.saturating_sub(in_flight).min(1400);
                                 let send_len = data_len.min(can_send);
                                 if send_len > 0 {
+                                    let seq = conn.snd_nxt;
+                                    let tick = s.step_count as u16;
                                     send_tcp_data(s, conn_id, data_ptr, send_len);
+                                    let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+                                    tcp::rtt_arm(conn2, seq, tick);
                                 }
                             } else {
                                 // Connected UDP — remote addr from conn slot
@@ -1666,6 +1869,8 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             }
                             _ => {
                                 // Already closing/closed — reset and notify
+                                let remote_ip = (*s.tcp_conns.as_ptr().add(conn_id)).remote_ip;
+                                if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
                                 let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
                                 *conn = tcp::TcpConn::new();
                                 net_send_closed(s, conn_id as u8);
@@ -1715,10 +1920,30 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                 conn.timewait_timer += 1;
                 // Exit time-wait after ~30 seconds
                 if conn.timewait_timer > 600 {
+                    let remote_ip = conn.remote_ip;
+                    if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
                     conn.state = tcp::TcpState::Closed;
                     net_send_closed(s, i as u8);
-                    // Reset the connection slot
                     *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                }
+            }
+            tcp::TcpState::Established => {
+                // RTO: if there is unacknowledged data and the timer expires,
+                // collapse cwnd, signal the consumer to retransmit, and arm
+                // backoff. Karn: don't use the retransmit sample for RTT.
+                if conn.snd_nxt != conn.snd_una {
+                    conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
+                    if conn.retransmit_timer >= conn.rto {
+                        tcp::on_rto(conn);
+                        let seq = conn.snd_una;
+                        conn.retransmit_timer = 0;
+                        // Exponential backoff — double RTO for next timeout.
+                        conn.rto = core::cmp::min(conn.rto.saturating_mul(2), tcp::RTO_MAX);
+                        conn.rtt_active = false; // Karn's algorithm
+                        net_send_retransmit(s, i as u8, seq);
+                    }
+                } else {
+                    conn.retransmit_timer = 0;
                 }
             }
             _ => {}

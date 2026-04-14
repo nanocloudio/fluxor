@@ -131,7 +131,7 @@ const DMA_OFFSET: u64 = 0;
 // State
 // ============================================================================
 
-const STATE_SIZE: usize = 256;
+const STATE_SIZE: usize = core::mem::size_of::<GemState>();
 
 #[repr(C)]
 struct GemState {
@@ -160,6 +160,10 @@ struct GemState {
     rx_packets: u32,
     tx_packets: u32,
     link_poll_counter: u32,
+    /// Staging buffer for RX length-prefixed frames. Each frame is copied
+    /// out of the DMA pool with a 2-byte LE length header so the byte-stream
+    /// channel to the IP module preserves frame boundaries.
+    rx_stage: [u8; MAX_FRAME + 2],
 }
 
 // ============================================================================
@@ -524,10 +528,18 @@ unsafe fn poll_rx(s: &mut GemState) {
             let buf_addr = s.buf_pool_addr as usize + idx * s.buf_size as usize;
             let buf_ptr = buf_addr as *const u8;
 
+            // Stage "[len_lo][len_hi][frame...]" in rx_stage so the byte-stream
+            // channel to IP preserves per-frame boundaries (same convention as
+            // the IP→GEM TX path).
+            let sp = s.rx_stage.as_mut_ptr();
+            core::ptr::write_volatile(sp, len as u8);
+            core::ptr::write_volatile(sp.add(1), (len >> 8) as u8);
+            core::ptr::copy_nonoverlapping(buf_ptr, sp.add(2), len);
+
             // Writes are atomic (all-or-nothing); on a full channel the frame
             // is dropped. The GEM descriptor is still returned below so the
             // ring does not stall.
-            let written = (sys.channel_write)(s.out_chan, buf_ptr, len);
+            let written = (sys.channel_write)(s.out_chan, sp, 2 + len);
             if written > 0 {
                 s.rx_packets = s.rx_packets.wrapping_add(1);
             }
@@ -694,17 +706,18 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 // MAC announcement and extracts the destination MAC.
                 if s.out_chan >= 0 {
                     let sys = &*s.syscalls;
-                    let mut announce = [0u8; 14];
+                    // Length-prefixed frame: [14][0][dst MAC][src=0][ethertype=0]
+                    let mut announce = [0u8; 16];
                     let ap = announce.as_mut_ptr();
-                    // dst MAC = our MAC (bytes 0-5)
+                    write_volatile(ap, 14u8);
+                    write_volatile(ap.add(1), 0u8);
                     let mut m = 0usize;
                     while m < 6 {
-                        write_volatile(ap.add(m), read_volatile(s.mac.as_ptr().add(m)));
+                        write_volatile(ap.add(2 + m), read_volatile(s.mac.as_ptr().add(m)));
                         m += 1;
                     }
-                    // src MAC = zeros (bytes 6-11), ethertype = 0 (bytes 12-13)
-                    // already zeroed
-                    (sys.channel_write)(s.out_chan, ap, 14);
+                    // Remaining bytes (src MAC + ethertype) stay zero.
+                    (sys.channel_write)(s.out_chan, ap, 16);
                 }
                 s.phase = 2;
                 return 3; // StepOutcome::Ready

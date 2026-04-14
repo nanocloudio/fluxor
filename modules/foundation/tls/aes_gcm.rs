@@ -306,6 +306,22 @@ pub struct AesGcm {
     h: [u8; 16],  // GHASH subkey = AES_K(0^128)
 }
 
+impl Drop for AesKey {
+    fn drop(&mut self) {
+        let mut i = 0;
+        while i < self.round_keys.len() {
+            zeroize(&mut self.round_keys[i]);
+            i += 1;
+        }
+    }
+}
+
+impl Drop for AesGcm {
+    fn drop(&mut self) {
+        zeroize(&mut self.h);
+    }
+}
+
 impl AesGcm {
     pub fn new_128(key: &[u8; 16]) -> Self {
         let aes = AesKey::expand_128(key);
@@ -368,6 +384,8 @@ impl AesGcm {
         // XOR with encrypted J0
         let mut i = 0;
         while i < 16 { tag[i] ^= tag_mask[i]; i += 1; }
+        zeroize(&mut tag_mask);
+        zeroize(&mut ctr);
         tag
     }
 
@@ -403,12 +421,18 @@ impl AesGcm {
         while i < 16 { diff |= computed_tag[i] ^ tag[i]; i += 1; }
 
         if diff != 0 {
+            zeroize(&mut tag_mask);
+            zeroize(&mut computed_tag);
+            zeroize(&mut ctr);
             return false;
         }
 
         // Decrypt
         Self::inc_counter(&mut ctr);
         self.ctr_xor(&mut ctr, data);
+        zeroize(&mut tag_mask);
+        zeroize(&mut computed_tag);
+        zeroize(&mut ctr);
         true
     }
 

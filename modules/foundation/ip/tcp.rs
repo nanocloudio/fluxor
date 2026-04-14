@@ -51,30 +51,74 @@ pub enum TcpState {
     SynReceived = 9,
 }
 
+/// Reorder buffer: number of slots and bytes per slot.
+pub const REORDER_SLOTS: usize = 4;
+pub const REORDER_SLOT_BYTES: usize = 512;
+
+/// A single out-of-order segment held for reassembly.
+pub struct ReorderSlot {
+    pub seq: u32,
+    pub len: u16,
+    pub valid: bool,
+}
+
+impl ReorderSlot {
+    pub const fn empty() -> Self {
+        Self { seq: 0, len: 0, valid: false }
+    }
+}
+
 /// TCP connection block (one per socket)
-#[derive(Clone, Copy)]
 pub struct TcpConn {
     pub state: TcpState,
     pub local_port: u16,
     pub remote_port: u16,
     pub remote_ip: u32,
-    /// Send sequence variables
-    pub snd_una: u32,  // oldest unacknowledged
-    pub snd_nxt: u32,  // next to send
-    pub snd_wnd: u16,  // send window
-    /// Receive sequence variables
-    pub rcv_nxt: u32,  // next expected
-    pub rcv_wnd: u16,  // receive window
-    /// Initial sequence numbers
+
+    // Send sequence variables
+    pub snd_una: u32,   // oldest unacknowledged
+    pub snd_nxt: u32,   // next to send
+    pub snd_wnd: u16,   // peer's advertised receive window
+
+    // Receive sequence variables
+    pub rcv_nxt: u32,   // next expected
+    pub rcv_wnd: u16,   // our receive window advertisement
+
     pub iss: u32,
-    /// Retransmit timer (step counts)
     pub retransmit_timer: u16,
-    /// Time-wait timer
     pub timewait_timer: u16,
+
+    // NewReno congestion control (§4.2)
+    pub cwnd: u16,              // congestion window (bytes)
+    pub ssthresh: u16,          // slow-start threshold
+    pub dup_ack_count: u8,      // consecutive duplicate ACKs
+    pub in_recovery: bool,
+    pub recover_seq: u32,       // snd_nxt at recovery entry
+
+    // Jacobson/Karn RTT estimation (RFC 6298). Values are in step ticks
+    // using a 3-bit fixed-point shift (srtt = RTT * 8).
+    pub srtt: u16,
+    pub rttvar: u16,
+    pub rto: u16,
+    pub rtt_seq: u32,
+    pub rtt_start: u16,
+    pub rtt_active: bool,
+
+    // Dynamic receive window bookkeeping (§4.3). `delivered_bytes` is the
+    // total written to the consumer channel for this connection;
+    // `consumed_bytes` tracks what the consumer has read.
+    pub delivered_bytes: u32,
+    pub consumed_bytes: u32,
+
+    // Bounded reorder buffer (§4.1). Per-slot payload storage lives in
+    // `reorder_buf`; metadata in `reorder_slots`.
+    pub reorder_slots: [ReorderSlot; REORDER_SLOTS],
+    pub reorder_buf: [u8; REORDER_SLOTS * REORDER_SLOT_BYTES],
 }
 
 impl TcpConn {
     pub const fn new() -> Self {
+        const EMPTY: ReorderSlot = ReorderSlot::empty();
         Self {
             state: TcpState::Closed,
             local_port: 0,
@@ -84,10 +128,25 @@ impl TcpConn {
             snd_nxt: 0,
             snd_wnd: 0,
             rcv_nxt: 0,
-            rcv_wnd: 512, // match socket buffer size
+            rcv_wnd: INITIAL_RCV_WND,
             iss: 0,
             retransmit_timer: 0,
             timewait_timer: 0,
+            cwnd: MSS,
+            ssthresh: 0xFFFF,
+            dup_ack_count: 0,
+            in_recovery: false,
+            recover_seq: 0,
+            srtt: 0,
+            rttvar: 0,
+            rto: RTO_INITIAL,
+            rtt_seq: 0,
+            rtt_start: 0,
+            rtt_active: false,
+            delivered_bytes: 0,
+            consumed_bytes: 0,
+            reorder_slots: [EMPTY; REORDER_SLOTS],
+            reorder_buf: [0u8; REORDER_SLOTS * REORDER_SLOT_BYTES],
         }
     }
 
@@ -96,8 +155,24 @@ impl TcpConn {
     }
 }
 
+/// Path MSS used for cwnd accounting (conservative lower bound below Ethernet MTU).
+pub const MSS: u16 = 1460;
+
+/// Starting receive window. Grows dynamically up to MAX_RCV_WND.
+pub const INITIAL_RCV_WND: u16 = 2048;
+
+/// Upper bound on the advertised receive window.
+pub const MAX_RCV_WND: u16 = 8192;
+
+/// Initial retransmission timeout in step ticks (≈1 s at 1 kHz).
+pub const RTO_INITIAL: u16 = 1000;
+
+/// Minimum and maximum RTO clamps (step ticks).
+pub const RTO_MIN: u16 = 200;
+pub const RTO_MAX: u16 = 6000;
+
 /// Maximum TCP connections
-pub const MAX_TCP_CONNS: usize = 4;
+pub const MAX_TCP_CONNS: usize = 8;
 
 /// Parsed TCP header
 pub struct TcpHeader {
@@ -277,4 +352,188 @@ pub unsafe fn compute_tcp_checksum(
 
     wv(tcp_start.add(16), (cksum >> 8) as u8);
     wv(tcp_start.add(17), (cksum & 0xFF) as u8);
+}
+
+// ============================================================================
+// Sequence arithmetic helpers
+// ============================================================================
+
+/// Returns true if `a` is before `b` modulo 2^32 (standard TCP ordering).
+#[inline]
+pub fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+// ============================================================================
+// Reorder buffer (§4.1)
+// ============================================================================
+
+/// Store an out-of-order segment in the reorder buffer. Returns true if the
+/// segment was buffered, false if there is no slot (caller drops it).
+pub unsafe fn reorder_insert(conn: &mut TcpConn, seq: u32, payload: *const u8, len: usize) -> bool {
+    if len == 0 || len > REORDER_SLOT_BYTES { return false; }
+    // Reject duplicates and overlaps — overlap detection defends against
+    // reassembly-based injection.
+    let mut i = 0;
+    while i < REORDER_SLOTS {
+        let slot = &conn.reorder_slots[i];
+        if slot.valid {
+            let end = slot.seq.wrapping_add(slot.len as u32);
+            // New seg fully inside existing?
+            if !seq_lt(seq, slot.seq) && seq_lt(seq.wrapping_add(len as u32), end.wrapping_add(1)) {
+                return true; // already buffered
+            }
+            // Any overlap at all — reject to avoid overwrite attacks.
+            let new_end = seq.wrapping_add(len as u32);
+            if seq_lt(seq, end) && seq_lt(slot.seq, new_end) {
+                return false;
+            }
+        }
+        i += 1;
+    }
+    // Find a free slot.
+    let mut slot_idx: Option<usize> = None;
+    i = 0;
+    while i < REORDER_SLOTS {
+        if !conn.reorder_slots[i].valid { slot_idx = Some(i); break; }
+        i += 1;
+    }
+    let si = match slot_idx {
+        Some(v) => v,
+        None => return false, // all slots full — drop (caller ACKs to re-trigger)
+    };
+    let off = si * REORDER_SLOT_BYTES;
+    let dst = conn.reorder_buf.as_mut_ptr().add(off);
+    core::ptr::copy_nonoverlapping(payload, dst, len);
+    conn.reorder_slots[si].seq = seq;
+    conn.reorder_slots[si].len = len as u16;
+    conn.reorder_slots[si].valid = true;
+    true
+}
+
+/// Pop the next in-order segment from the reorder buffer if its seq matches
+/// `rcv_nxt`. Returns (ptr, len) on hit, None otherwise. The returned pointer
+/// is valid until the next `reorder_insert` or `reorder_take_next`.
+pub unsafe fn reorder_take_next<'a>(conn: &'a mut TcpConn, rcv_nxt: u32) -> Option<(&'a [u8], u32)> {
+    let mut i = 0;
+    while i < REORDER_SLOTS {
+        if conn.reorder_slots[i].valid && conn.reorder_slots[i].seq == rcv_nxt {
+            let len = conn.reorder_slots[i].len as usize;
+            let off = i * REORDER_SLOT_BYTES;
+            let next_seq = rcv_nxt.wrapping_add(len as u32);
+            conn.reorder_slots[i].valid = false;
+            let slice = core::slice::from_raw_parts(conn.reorder_buf.as_ptr().add(off), len);
+            return Some((slice, next_seq));
+        }
+        i += 1;
+    }
+    None
+}
+
+// ============================================================================
+// Congestion control (§4.2) — NewReno
+// ============================================================================
+
+/// Minimum useful cwnd per RFC 5681 after a loss event.
+#[inline]
+pub fn cwnd_min() -> u16 { 2 * MSS }
+
+/// Handler for a new ACK that advances snd_una. Grows cwnd in slow start
+/// or congestion avoidance per RFC 5681.
+pub fn on_new_ack(conn: &mut TcpConn) {
+    conn.dup_ack_count = 0;
+    if conn.in_recovery && !seq_lt(conn.snd_una, conn.recover_seq) {
+        conn.in_recovery = false;
+        conn.cwnd = conn.ssthresh;
+        return;
+    }
+    if conn.cwnd < conn.ssthresh {
+        // Slow start — exponential.
+        conn.cwnd = conn.cwnd.saturating_add(MSS);
+    } else {
+        // Congestion avoidance — ~1 MSS per RTT.
+        let inc = ((MSS as u32) * (MSS as u32) / (conn.cwnd as u32).max(1)) as u16;
+        conn.cwnd = conn.cwnd.saturating_add(inc.max(1));
+    }
+}
+
+/// Handler for a duplicate ACK (ack == snd_una, no new data). Returns true
+/// when fast-retransmit should fire.
+pub fn on_dup_ack(conn: &mut TcpConn) -> bool {
+    if conn.in_recovery {
+        conn.cwnd = conn.cwnd.saturating_add(MSS);
+        return false;
+    }
+    conn.dup_ack_count = conn.dup_ack_count.saturating_add(1);
+    if conn.dup_ack_count == 3 {
+        conn.ssthresh = (conn.cwnd / 2).max(cwnd_min());
+        conn.cwnd = conn.ssthresh.saturating_add(3 * MSS);
+        conn.in_recovery = true;
+        conn.recover_seq = conn.snd_nxt;
+        return true;
+    }
+    false
+}
+
+/// Handler for an RTO timeout — collapses cwnd to slow start.
+pub fn on_rto(conn: &mut TcpConn) {
+    conn.ssthresh = (conn.cwnd / 2).max(cwnd_min());
+    conn.cwnd = MSS;
+    conn.dup_ack_count = 0;
+    conn.in_recovery = false;
+}
+
+/// Effective send window — minimum of peer's advertised window and cwnd.
+#[inline]
+pub fn effective_snd_wnd(conn: &TcpConn) -> u16 {
+    core::cmp::min(conn.snd_wnd, conn.cwnd)
+}
+
+// ============================================================================
+// RTT estimation (RFC 6298)
+// ============================================================================
+
+/// Update RTT estimator with a measured sample (step ticks). Fixed-point
+/// srtt/rttvar with 3-bit shift (srtt = R * 8).
+pub fn rtt_update(conn: &mut TcpConn, sample_ticks: u16) {
+    let r = sample_ticks as u32;
+    if conn.srtt == 0 {
+        conn.srtt = (r << 3) as u16;
+        conn.rttvar = (r << 2) as u16;
+    } else {
+        let srtt_shifted = (conn.srtt >> 3) as u32;
+        let delta = if r > srtt_shifted { r - srtt_shifted } else { srtt_shifted - r };
+        // rttvar = rttvar - (rttvar >> 2) + delta
+        conn.rttvar = (conn.rttvar as u32)
+            .wrapping_sub((conn.rttvar as u32) >> 2)
+            .wrapping_add(delta) as u16;
+        // srtt = srtt - (srtt >> 3) + R
+        conn.srtt = (conn.srtt as u32)
+            .wrapping_sub((conn.srtt as u32) >> 3)
+            .wrapping_add(r) as u16;
+    }
+    // RTO = SRTT + 4 * RTTVAR (both fixed-point)
+    let rto_raw = ((conn.srtt >> 3) as u32).saturating_add(conn.rttvar as u32);
+    let rto = rto_raw.min(RTO_MAX as u32).max(RTO_MIN as u32) as u16;
+    conn.rto = rto;
+}
+
+/// Called when sending a segment — start an RTT measurement if one is not
+/// already active (Karn's algorithm: never time a retransmit).
+pub fn rtt_arm(conn: &mut TcpConn, seq: u32, step_tick: u16) {
+    if !conn.rtt_active {
+        conn.rtt_seq = seq;
+        conn.rtt_start = step_tick;
+        conn.rtt_active = true;
+    }
+}
+
+/// Called when `ack` arrives. If it acknowledges the timed sequence, sample
+/// the RTT and update the estimator.
+pub fn rtt_ack(conn: &mut TcpConn, ack: u32, step_tick: u16) {
+    if conn.rtt_active && !seq_lt(ack, conn.rtt_seq.wrapping_add(1)) {
+        let sample = step_tick.wrapping_sub(conn.rtt_start);
+        rtt_update(conn, sample);
+        conn.rtt_active = false;
+    }
 }

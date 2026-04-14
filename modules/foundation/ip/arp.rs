@@ -48,7 +48,7 @@ impl ArpEntry {
 }
 
 /// ARP table size
-pub const ARP_TABLE_SIZE: usize = 8;
+pub const ARP_TABLE_SIZE: usize = 16;
 
 /// ARP pending request state
 pub const ARP_PENDING_NONE: u8 = 0;
