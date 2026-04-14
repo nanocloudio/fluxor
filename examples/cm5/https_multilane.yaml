@@ -1,0 +1,117 @@
+# Two-lane HTTPS server (Pi 5 / CM5 bare-metal)
+#
+# Horizontal scaling pattern: each lane gets its own ip + tls + http
+# instance, its own connection/session pool, and its own domain (core). A
+# `demux` module sits between the NIC and the per-lane IP instances and
+# routes each inbound frame to one lane based on a hash of the IPv4/TCP
+# 4-tuple (src_ip, dst_ip, src_port, dst_port). Outbound frames merge into
+# a single NIC TX queue via the built-in merge node.
+#
+# Generate test certs:
+#   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+#     -nodes -keyout /tmp/server_key.pem -out /tmp/server_cert.pem -days 365 -subj "/CN=fluxor"
+#   openssl x509 -in /tmp/server_cert.pem -outform DER -out /tmp/server_cert.der
+#   openssl ec  -in /tmp/server_key.pem  -outform DER -out /tmp/server_key.der
+#
+# Build:
+#   make firmware TARGET=cm5 && make modules TARGET=bcm2712
+#   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/cm5/https_multilane.yaml
+target: cm5
+tick_us: 100
+
+execution:
+  domains:
+    - name: nic
+      cores: [1]
+      exec_mode: poll
+    - name: lane0
+      cores: [2]
+    - name: lane1
+      cores: [3]
+
+platform:
+  net: {}
+
+modules:
+  # Frame demultiplexer — hashes IPv4/TCP 4-tuple, routes to out[0] or out[1].
+  # Each outbound half-duplex pair pairs with one full IP+TLS+HTTP lane.
+  - name: demux
+    domain: nic
+
+  # Lane 0.
+  - name: ip_0
+    domain: lane0
+    type: ip
+
+  - name: tls_0
+    domain: lane0
+    type: tls
+    mode: 1
+    verify_peer: 0
+    cert_file: "/tmp/server_cert.der"
+    key_file:  "/tmp/server_key.der"
+
+  - name: http_0
+    domain: lane0
+    type: http
+    port: 443
+    routes:
+      - path: "/"
+        body: "<html><body><h1>Fluxor HTTPS (lane 0)</h1></body></html>"
+
+  # Lane 1 (identical shape, independent state).
+  - name: ip_1
+    domain: lane1
+    type: ip
+
+  - name: tls_1
+    domain: lane1
+    type: tls
+    mode: 1
+    verify_peer: 0
+    cert_file: "/tmp/server_cert.der"
+    key_file:  "/tmp/server_key.der"
+
+  - name: http_1
+    domain: lane1
+    type: http
+    port: 443
+    routes:
+      - path: "/"
+        body: "<html><body><h1>Fluxor HTTPS (lane 1)</h1></body></html>"
+
+wiring:
+  # RX: NIC → demux → per-lane IP.
+  - from: rp1_gem.frames_rx
+    to:   demux.frames_rx
+  - from: demux.lane_0
+    to:   ip_0.frames_rx
+  - from: demux.lane_1
+    to:   ip_1.frames_rx
+
+  # TX: each lane IP → merge → NIC. The internal merge node fans in.
+  - from: ip_0.frames_tx
+    to:   rp1_gem.frames_tx
+    edge_class: merge
+  - from: ip_1.frames_tx
+    to:   rp1_gem.frames_tx
+    edge_class: merge
+
+  # Per-lane TLS + HTTP wiring (identical to the single-lane config).
+  - from: ip_0.net_out
+    to:   tls_0.cipher_in
+  - from: tls_0.cipher_out
+    to:   ip_0.net_in
+  - from: tls_0.clear_out
+    to:   http_0.net_in
+  - from: http_0.net_out
+    to:   tls_0.clear_in
+
+  - from: ip_1.net_out
+    to:   tls_1.cipher_in
+  - from: tls_1.cipher_out
+    to:   ip_1.net_in
+  - from: tls_1.clear_out
+    to:   http_1.net_in
+  - from: http_1.net_out
+    to:   tls_1.clear_in

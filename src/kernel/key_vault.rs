@@ -4,13 +4,15 @@
 //! live in kernel static memory and are never returned to callers. Keys are
 //! zeroised on DESTROY and on scheduler reset.
 //!
-//! Slot management (PROBE, STORE, DESTROY) is implemented here. ECDH, SIGN
-//! and VERIFY return `ENOSYS` at this layer and are expected to be handled
-//! by a kernel P-256 provider registered separately; callers that see
-//! `ENOSYS` are responsible for falling back to their own signer.
+//! ECDH, SIGN and VERIFY run the kernel P-256 primitives directly: the
+//! vault is authoritative for any slot holding P-256 scalar material.
 
 use crate::abi::dev_key_vault;
 use crate::abi::errno::{ENOSYS, EINVAL};
+use crate::kernel::crypto::p256;
+
+/// P-256 raw-scalar key type, as passed in the STORE `key_type` byte.
+const KEY_TYPE_P256_SCALAR: u8 = 1;
 
 /// Number of key slots. Sized for TLS session fan-out.
 pub const MAX_SLOTS: usize = 8;
@@ -109,11 +111,80 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             0
         }
 
-        dev_key_vault::ECDH | dev_key_vault::SIGN | dev_key_vault::VERIFY => {
-            // Crypto operations are expected to be satisfied by a registered
-            // provider. If none is attached, report ENOSYS so callers can
-            // fall back rather than hang.
-            ENOSYS
+        dev_key_vault::SIGN => {
+            if arg.is_null() || arg_len < 4 + 32 + 64 { return EINVAL; }
+            if handle < 0 || (handle as usize) >= MAX_SLOTS { return EINVAL; }
+            let slot = &SLOTS[handle as usize];
+            if (slot.flags & FLAG_IN_USE) == 0
+                || slot.key_type != KEY_TYPE_P256_SCALAR
+                || slot.key_len != 32
+            {
+                return EINVAL;
+            }
+            let hash_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+            if hash_len == 0 || hash_len > 64 || 4 + hash_len + 64 > arg_len {
+                return EINVAL;
+            }
+            let hash = core::slice::from_raw_parts(arg.add(4), hash_len);
+            let mut priv_key = [0u8; 32];
+            for i in 0..32 { priv_key[i] = slot.data[i]; }
+            // RFC 6979 derives its nonce deterministically; the `_random` arg
+            // on ecdsa_sign is unused.
+            let sig = p256::ecdsa_sign(&priv_key, hash, &[0u8; 32]);
+            for i in 0..32 { core::ptr::write_volatile(&mut priv_key[i], 0); }
+            let out = arg.add(4 + hash_len);
+            for i in 0..64 { *out.add(i) = sig[i]; }
+            0
+        }
+
+        dev_key_vault::ECDH => {
+            if arg.is_null() || arg_len < 4 { return EINVAL; }
+            if handle < 0 || (handle as usize) >= MAX_SLOTS { return EINVAL; }
+            let slot = &SLOTS[handle as usize];
+            if (slot.flags & FLAG_IN_USE) == 0
+                || slot.key_type != KEY_TYPE_P256_SCALAR
+                || slot.key_len != 32
+            {
+                return EINVAL;
+            }
+            let peer_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+            if peer_len == 0 || 4 + peer_len + 32 > arg_len {
+                return EINVAL;
+            }
+            let peer = core::slice::from_raw_parts(arg.add(4), peer_len);
+            let mut priv_key = [0u8; 32];
+            for i in 0..32 { priv_key[i] = slot.data[i]; }
+            let result = p256::ecdh_shared_secret(&priv_key, peer);
+            for i in 0..32 { core::ptr::write_volatile(&mut priv_key[i], 0); }
+            match result {
+                Some(shared) => {
+                    let out = arg.add(4 + peer_len);
+                    for i in 0..32 { *out.add(i) = shared[i]; }
+                    0
+                }
+                None => crate::abi::errno::EINVAL,
+            }
+        }
+
+        dev_key_vault::VERIFY => {
+            // VERIFY is independent of the stored key — it takes a
+            // caller-supplied public key in the peer field of the argument.
+            // We accept: [hash_len:u16][sig_len:u16][pub_len:u16][pad:u16]
+            //            [hash][sig][pub]. For backward compatibility with a
+            //            simpler call (no pub embedded), fall back to ENOSYS.
+            if arg.is_null() || arg_len < 8 { return EINVAL; }
+            let hash_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+            let sig_len = u16::from_le_bytes([*arg.add(2), *arg.add(3)]) as usize;
+            let pub_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]) as usize;
+            if hash_len == 0 || sig_len != 64 || pub_len < 64
+                || 8 + hash_len + sig_len + pub_len > arg_len
+            {
+                return EINVAL;
+            }
+            let hash = core::slice::from_raw_parts(arg.add(8), hash_len);
+            let sig = core::slice::from_raw_parts(arg.add(8 + hash_len), sig_len);
+            let pk = core::slice::from_raw_parts(arg.add(8 + hash_len + sig_len), pub_len);
+            if p256::ecdsa_verify(pk, hash, sig) { 1 } else { 0 }
         }
 
         _ => ENOSYS,
@@ -190,20 +261,46 @@ mod tests {
     }
 
     #[test]
-    fn crypto_ops_report_not_implemented() {
+    fn sign_then_verify_roundtrip() {
+        use crate::kernel::crypto::p256;
         unsafe { reset_all(); }
-        assert_eq!(
-            unsafe { provider_dispatch(0, dev_key_vault::SIGN, core::ptr::null_mut(), 0) },
-            crate::abi::errno::ENOSYS,
-        );
-        assert_eq!(
-            unsafe { provider_dispatch(0, dev_key_vault::ECDH, core::ptr::null_mut(), 0) },
-            crate::abi::errno::ENOSYS,
-        );
-        assert_eq!(
-            unsafe { provider_dispatch(0, dev_key_vault::VERIFY, core::ptr::null_mut(), 0) },
-            crate::abi::errno::ENOSYS,
-        );
+
+        // Deterministic test private key.
+        let priv_key: [u8; 32] = [
+            0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
+            0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6, 0x93,
+            0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12,
+            0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f, 0x67, 0x21,
+        ];
+
+        let mut store_arg = [0u8; 4 + 32];
+        store_arg[0] = KEY_TYPE_P256_SCALAR;
+        store_arg[1] = 32;
+        store_arg[4..4 + 32].copy_from_slice(&priv_key);
+        let handle = unsafe {
+            provider_dispatch(-1, dev_key_vault::STORE, store_arg.as_mut_ptr(), store_arg.len())
+        };
+        assert!(handle >= 0);
+
+        // Public key for the above private scalar (uncompressed 0x04 || X || Y).
+        let pk = p256::public_key_from_scalar(&priv_key);
+
+        // SIGN a known hash through the vault, then VERIFY with the public key.
+        let hash = [0x42u8; 32];
+        let mut sign_arg = [0u8; 4 + 32 + 64];
+        sign_arg[0] = 32;
+        sign_arg[4..4 + 32].copy_from_slice(&hash);
+        let rc = unsafe {
+            provider_dispatch(handle, dev_key_vault::SIGN, sign_arg.as_mut_ptr(), sign_arg.len())
+        };
+        assert_eq!(rc, 0);
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&sign_arg[4 + 32..]);
+
+        // Cross-check with the kernel verify path.
+        assert!(p256::ecdsa_verify(&pk, &hash, &sig));
+
+        unsafe { provider_dispatch(handle, dev_key_vault::DESTROY, core::ptr::null_mut(), 0); }
     }
 
     #[test]

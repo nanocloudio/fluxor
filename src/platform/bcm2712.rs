@@ -2140,7 +2140,9 @@ fn bcm_apply_code_bit(addr: usize) -> usize { addr }
 fn bcm_validate_fn_addr(addr: usize) -> bool { addr != 0 }
 fn bcm_validate_module_base(addr: usize) -> bool { addr != 0 }
 fn bcm_validate_fn_in_code(_addr: usize, _code_base: usize, _code_size: u32) -> bool { true }
-fn bcm_verify_integrity(_computed: &[u8], _expected: &[u8]) -> bool { true }
+fn bcm_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
+    computed.len() == expected.len() && computed == expected
+}
 
 fn bcm_pic_barrier() {
     unsafe { core::arch::asm!("dsb sy", "isb") };

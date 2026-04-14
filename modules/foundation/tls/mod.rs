@@ -46,6 +46,10 @@ const RECV_BUF_SIZE: usize = 4096;
 const SEND_BUF_SIZE: usize = 2048;
 const SCRATCH_SIZE: usize = 1536;
 const NET_SCRATCH_SIZE: usize = 1600;
+/// Ciphertext retention window for TCP-level retransmission. Holds the
+/// encrypted net_proto frames TLS has written to `cipher_out` so they can
+/// be replayed on MSG_RETRANSMIT without re-encryption.
+const RETX_BUF_SIZE: usize = 4096;
 
 // Net protocol message types (downstream: IP -> TLS -> HTTP)
 const NET_MSG_ACCEPTED: u8 = 0x01;
@@ -132,6 +136,15 @@ struct TlsSession {
     send_len: usize,
     send_offset: usize,
 
+    // Retransmit buffer — retains ciphertext (including the net_proto
+    // CMD_SEND framing bytes) so MSG_RETRANSMIT can replay unacked bytes
+    // without re-encrypting. `retx_base_seq` is the TCP sequence number
+    // of `retx_buf[0]`, anchored on the first MSG_ACK for this connection.
+    retx_buf: [u8; RETX_BUF_SIZE],
+    retx_len: u16,
+    retx_base_seq: u32,
+    retx_seq_anchored: bool,
+
     // Transcript hash at server Finished (used for app key derivation)
     server_finished_hash: [u8; 48],
 
@@ -172,6 +185,10 @@ impl TlsSession {
             send_buf: [0; SEND_BUF_SIZE],
             send_len: 0,
             send_offset: 0,
+            retx_buf: [0; RETX_BUF_SIZE],
+            retx_len: 0,
+            retx_base_seq: 0,
+            retx_seq_anchored: false,
             server_finished_hash: [0; 48],
             hs_accum_len: 0,
             scratch: [0; SCRATCH_SIZE],
@@ -202,6 +219,9 @@ impl TlsSession {
         self.recv_len = 0;
         self.recv_expected = 0;
         self.send_len = 0;
+        self.retx_len = 0;
+        self.retx_base_seq = 0;
+        self.retx_seq_anchored = false;
         self.send_offset = 0;
         self.hs_accum_len = 0;
         self.peer_key_share_len = 0;
@@ -393,7 +413,18 @@ pub unsafe extern "C" fn module_new(
             store_arg[1] = 32; // key_len
             core::ptr::copy_nonoverlapping(raw.as_ptr(), store_arg.as_mut_ptr().add(4), 32);
             let h = (sys.dev_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
-            if h >= 0 { s.key_vault_handle = h; }
+            if h >= 0 {
+                s.key_vault_handle = h;
+                // Vault now holds the authoritative copy; wipe the in-module
+                // key material so pump_send_certificate_verify signs through
+                // the vault (and can't silently fall back to a plaintext key).
+                let mut j = 0;
+                while j < s.key_len {
+                    core::ptr::write_volatile(&mut s.key[j], 0);
+                    j += 1;
+                }
+                s.key_len = 0;
+            }
             let mut j = 0;
             while j < 32 {
                 core::ptr::write_volatile(&mut raw[j], 0);
@@ -597,21 +628,36 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     tls_write_raw_frame(sys, s.clear_out, t, s.net_scratch.as_ptr(), rd as u16);
                 }
                 t if t == NET_MSG_ACK as u8 => {
-                    // IP has advanced its send-side ACK watermark. Today we
-                    // rely on TCP's own ARQ and do not retain ciphertext
-                    // across records, so this is a no-op; consume the frame.
-                    tls_discard(sys, s.cipher_in, payload_len as usize);
+                    // Payload: [conn_id:1][acked_seq:4 LE].
+                    let pl = payload_len as usize;
+                    let mut payload = [0u8; 5];
+                    let rd = if pl < 5 { pl } else { 5 };
+                    if rd > 0 { (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd); }
+                    if pl > rd { tls_discard(sys, s.cipher_in, pl - rd); }
+                    if rd == 5 {
+                        let conn_id = payload[0];
+                        let acked_seq = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        let si = find_session_by_conn_id(s, conn_id);
+                        if si >= 0 {
+                            retx_ack(&mut s.sessions[si as usize], acked_seq);
+                        }
+                    }
                 }
                 t if t == NET_MSG_RETRANSMIT as u8 => {
-                    // TCP fast-retransmit or RTO fired. Full TLS-level
-                    // retransmission of already-encrypted records requires
-                    // ciphertext retention (RFC §1.3) which is not yet
-                    // implemented. Log and consume; TCP retransmit at the
-                    // segment level will still carry the stream forward.
-                    dev_log(sys, 2,
-                        b"[tls] MSG_RETRANSMIT unhandled".as_ptr(),
-                        b"[tls] MSG_RETRANSMIT unhandled".len());
-                    tls_discard(sys, s.cipher_in, payload_len as usize);
+                    // Payload: [conn_id:1][from_seq:4 LE].
+                    let pl = payload_len as usize;
+                    let mut payload = [0u8; 5];
+                    let rd = if pl < 5 { pl } else { 5 };
+                    if rd > 0 { (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd); }
+                    if pl > rd { tls_discard(sys, s.cipher_in, pl - rd); }
+                    if rd == 5 {
+                        let conn_id = payload[0];
+                        let from_seq = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        let si = find_session_by_conn_id(s, conn_id);
+                        if si >= 0 {
+                            retx_replay(s, si as usize, from_seq);
+                        }
+                    }
                 }
                 _ => {
                     // Unknown — discard
@@ -670,6 +716,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
                                 // Write CMD_SEND(conn_id, tls_record) to cipher_out
                                 tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
+                                retx_push(&mut s.sessions[idx], rec.as_ptr(), total as u16);
                             } else {
                                 tls_discard(sys, s.clear_in, data_len);
                             }
@@ -1993,11 +2040,69 @@ unsafe fn tls_write_frame(
     (sys.channel_write)(chan, scratch.as_ptr(), frame_len);
 }
 
+/// Retain `n` bytes of encrypted record in the session's retransmit buffer.
+/// Overflow is ignored — the record has already been emitted, so TCP's ARQ
+/// still delivers the stream; only the retransmit fast-path degrades.
+unsafe fn retx_push(sess: &mut TlsSession, rec: *const u8, n: u16) {
+    let free = RETX_BUF_SIZE - sess.retx_len as usize;
+    if (n as usize) <= free {
+        core::ptr::copy_nonoverlapping(
+            rec,
+            sess.retx_buf.as_mut_ptr().add(sess.retx_len as usize),
+            n as usize,
+        );
+        sess.retx_len = sess.retx_len.wrapping_add(n);
+    }
+}
+
+/// Drop bytes up to `acked_seq` from the session's retransmit buffer.
+/// Anchors `retx_base_seq` to `acked_seq - retx_len` on the first ACK for
+/// this connection — IP supplies the absolute TCP sequence number.
+unsafe fn retx_ack(sess: &mut TlsSession, acked_seq: u32) {
+    if !sess.retx_seq_anchored {
+        sess.retx_base_seq = acked_seq.wrapping_sub(sess.retx_len as u32);
+        sess.retx_seq_anchored = true;
+    }
+    let delta = acked_seq.wrapping_sub(sess.retx_base_seq);
+    if delta == 0 || delta > sess.retx_len as u32 { return; }
+    let d = delta as usize;
+    let remain = sess.retx_len as usize - d;
+    if remain > 0 {
+        core::ptr::copy(
+            sess.retx_buf.as_ptr().add(d),
+            sess.retx_buf.as_mut_ptr(),
+            remain,
+        );
+    }
+    sess.retx_len = remain as u16;
+    sess.retx_base_seq = acked_seq;
+}
+
+/// Replay retained ciphertext from `from_seq` to end of retx buffer.
+unsafe fn retx_replay(s: &mut TlsState, idx: usize, from_seq: u32) {
+    let (offset, len) = {
+        let sess = &s.sessions[idx];
+        if !sess.retx_seq_anchored { return; }
+        let off = from_seq.wrapping_sub(sess.retx_base_seq);
+        if off >= sess.retx_len as u32 { return; }
+        (off as usize, sess.retx_len as usize)
+    };
+    let bytes = len - offset;
+    let mut local = [0u8; RETX_BUF_SIZE];
+    core::ptr::copy_nonoverlapping(
+        s.sessions[idx].retx_buf.as_ptr().add(offset),
+        local.as_mut_ptr(),
+        bytes,
+    );
+    let sys = &*s.syscalls;
+    let conn_id = s.sessions[idx].conn_id;
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id,
+                    local.as_ptr(), bytes as u16, &mut s.net_scratch);
+}
+
 /// Write a raw net_proto frame (no conn_id prefix — used for pass-through).
-/// Frame: [msg_type: u8] [len: u16 LE] [payload...]
-/// Write a raw net_proto frame (no conn_id prefix — used for pass-through).
-/// Payload must already be in a buffer that can be prepended with a 3-byte header.
-/// Uses a stack buffer to assemble atomically.
+/// Payload must already be in a buffer that can be prepended with a 3-byte
+/// header. Uses a stack buffer to assemble atomically.
 unsafe fn tls_write_raw_frame(
     sys: &SyscallTable,
     chan: i32,
