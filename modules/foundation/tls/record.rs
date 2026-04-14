@@ -173,6 +173,7 @@ pub fn encrypt_record(
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
             let tag = chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut out_buf[..data_len]);
             unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
+            zeroize(&mut key);
         }
         CipherSuite::Aes128Gcm => {
             let mut key = [0u8; 16];
@@ -180,6 +181,7 @@ pub fn encrypt_record(
             let gcm = AesGcm::new_128(&key);
             let tag = gcm.encrypt(&nonce, &aad, &mut out_buf[..data_len]);
             unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
+            zeroize(&mut key);
         }
         CipherSuite::Aes256Gcm => {
             let mut key = [0u8; 32];
@@ -187,6 +189,7 @@ pub fn encrypt_record(
             let gcm = AesGcm::new_256(&key);
             let tag = gcm.encrypt(&nonce, &aad, &mut out_buf[..data_len]);
             unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
+            zeroize(&mut key);
         }
     }
 
@@ -217,21 +220,29 @@ pub fn decrypt_record(
         CipherSuite::ChaCha20Poly1305 => {
             let mut key = [0u8; 32];
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
-            chacha20_poly1305_decrypt(&key, &nonce, record_header, data, &tag)
+            let r = chacha20_poly1305_decrypt(&key, &nonce, record_header, data, &tag);
+            zeroize(&mut key);
+            r
         }
         CipherSuite::Aes128Gcm => {
             let mut key = [0u8; 16];
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16); }
             let gcm = AesGcm::new_128(&key);
-            gcm.decrypt(&nonce, record_header, data, &tag)
+            let r = gcm.decrypt(&nonce, record_header, data, &tag);
+            zeroize(&mut key);
+            r
         }
         CipherSuite::Aes256Gcm => {
             let mut key = [0u8; 32];
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
             let gcm = AesGcm::new_256(&key);
-            gcm.decrypt(&nonce, record_header, data, &tag)
+            let r = gcm.decrypt(&nonce, record_header, data, &tag);
+            zeroize(&mut key);
+            r
         }
     };
+
+    zeroize(&mut tag);
 
     if !ok { return None; }
 
@@ -246,6 +257,9 @@ pub fn decrypt_record(
     if pt_len == 0 { return None; }
     pt_len -= 1;
     let inner_type = data[pt_len];
+    // Wipe the inner-type byte — it is copied into the return value, and
+    // leaving it in the scratch buffer leaks across record reuses.
+    unsafe { core::ptr::write_volatile(data.as_mut_ptr().add(pt_len), 0u8); }
 
     Some((pt_len, inner_type))
 }

@@ -88,6 +88,8 @@ pub enum LoaderError {
     AbiVersionMismatch { expected: u8, found: u8 },
     /// Integrity hash mismatch (manifest SHA-256 doesn't match code+data)
     IntegrityMismatch,
+    /// Ed25519 signature invalid or missing when enforce_signatures is set.
+    SignatureInvalid,
 }
 
 impl LoaderError {
@@ -111,6 +113,8 @@ impl LoaderError {
                 log::error!("[loader] {}: abi mismatch expected={} found={}", context, expected, found),
             Self::IntegrityMismatch =>
                 log::error!("[loader] {}: integrity hash mismatch", context),
+            Self::SignatureInvalid =>
+                log::error!("[loader] {}: signature invalid", context),
         }
     }
 }
@@ -781,13 +785,25 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
         if manifest_size >= 16 {
             let magic = u32::from_le_bytes([manifest_data[0], manifest_data[1], manifest_data[2], manifest_data[3]]);
             if magic == 0x464D5846 {
-                let has_integrity = manifest_data[14] != 0;
+                let version = manifest_data[4];
+                let flags = manifest_data[14];
+                let has_integrity = (flags & 0x01) != 0;
+                let has_signature = version >= 2 && (flags & 0x02) != 0;
+                let mut computed_hash: Option<[u8; 32]> = None;
                 if has_integrity {
-                    // Extract stored hash (last 32 bytes of manifest)
-                    let hash_offset = manifest_size - 32;
+                    // Stored hash sits after ports/resources/dependencies; its
+                    // offset depends on those counts. If signature follows,
+                    // the hash is still first (signature is appended after).
+                    let var_size = (manifest_data[5] as usize) * 4
+                        + (manifest_data[6] as usize) * 4
+                        + (manifest_data[7] as usize) * 8;
+                    let hash_offset = 16 + var_size;
+                    if hash_offset + 32 > manifest_size {
+                        log::error!("[loader] {}: manifest hash out of range", name);
+                        return Err(LoaderError::IntegrityMismatch);
+                    }
                     let stored_hash = &manifest_data[hash_offset..hash_offset + 32];
 
-                    // Compute SHA-256 over code + data sections from flash
                     use sha2::{Sha256, Digest};
                     let mut hasher = Sha256::new();
                     let code_ptr = module.code_base();
@@ -799,11 +815,52 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         hasher.update(data_section);
                     }
                     let computed = hasher.finalize();
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&computed);
 
-                    if !hal::verify_integrity(computed.as_slice(), stored_hash) {
+                    if !hal::verify_integrity(&h, stored_hash) {
                         log::error!("[loader] {}: integrity mismatch", name);
                         return Err(LoaderError::IntegrityMismatch);
                     }
+                    computed_hash = Some(h);
+                }
+
+                // Signature verification. The feature flag gates enforcement;
+                // when off, we still verify if a signature is present (to
+                // surface mismatches in test builds) but do not reject on
+                // missing signatures.
+                if has_signature {
+                    let var_size = (manifest_data[5] as usize) * 4
+                        + (manifest_data[6] as usize) * 4
+                        + (manifest_data[7] as usize) * 8;
+                    let sig_offset = 16 + var_size + 32;
+                    if sig_offset + 96 > manifest_size {
+                        return Err(LoaderError::SignatureInvalid);
+                    }
+                    let mut sig = [0u8; 64];
+                    sig.copy_from_slice(&manifest_data[sig_offset..sig_offset + 64]);
+                    let mut _signer_fp = [0u8; 32];
+                    _signer_fp.copy_from_slice(&manifest_data[sig_offset + 64..sig_offset + 96]);
+
+                    let hash = match computed_hash {
+                        Some(h) => h,
+                        None => return Err(LoaderError::SignatureInvalid),
+                    };
+
+                    let mut pubkey = [0u8; 32];
+                    if hal::otp_read_signing_key(&mut pubkey) {
+                        if !crate::kernel::crypto::ed25519::verify(&pubkey, &hash, &sig) {
+                            log::error!("[loader] {}: signature invalid", name);
+                            return Err(LoaderError::SignatureInvalid);
+                        }
+                    } else if cfg!(feature = "enforce_signatures") {
+                        // No pubkey provisioned but enforcement demanded — reject.
+                        return Err(LoaderError::SignatureInvalid);
+                    }
+                } else if cfg!(feature = "enforce_signatures") {
+                    // Unsigned module under enforcement — reject.
+                    log::error!("[loader] {}: unsigned module rejected", name);
+                    return Err(LoaderError::SignatureInvalid);
                 }
             }
         }

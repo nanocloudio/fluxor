@@ -44,10 +44,14 @@ wiring = [
 match = { board = "cm5", phy = "ethernet", driver = "rp1_gem" }
 modules = [
   { name = "rp1_gem" },
+  { name = "conn_guard" },
   { name = "ip", params = { use_dhcp = "1" } },
 ]
+# RX path passes through conn_guard for SYN-flood admission control.
+# TX path goes direct from ip back to the NIC (no per-egress filtering).
 wiring = [
-  "rp1_gem.frames_rx -> ip.frames_rx",
+  "rp1_gem.frames_rx -> conn_guard.frames_rx",
+  "conn_guard.frames_tx -> ip.frames_rx",
   "ip.frames_tx -> rp1_gem.frames_tx",
 ]
 

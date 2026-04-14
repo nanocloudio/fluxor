@@ -12,6 +12,7 @@
 
 mod board;
 mod config;
+mod crypto;
 mod error;
 mod hash;
 mod stack_expand;
@@ -190,6 +191,23 @@ enum Commands {
         /// Config file (YAML)
         config: PathBuf,
     },
+    /// Sign a packed .fmod module with an Ed25519 private key.
+    ///
+    /// Overwrites the module's manifest with a v2 manifest carrying a valid
+    /// Ed25519 signature over the existing SHA-256 integrity hash plus the
+    /// signer's public-key fingerprint. The module's code/data/export
+    /// sections are unchanged.
+    Sign {
+        /// Input .fmod file (modified in place unless --output is given)
+        input: PathBuf,
+        /// Path to a 32-byte raw Ed25519 seed (private key) file.
+        /// Generate with `head -c 32 /dev/urandom > key.raw`.
+        #[arg(short = 'k', long)]
+        key: PathBuf,
+        /// Output path (default: overwrite input in place)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -235,6 +253,7 @@ fn main() {
         Commands::Build { path, output } => cmd_build(&path, output.as_deref(), verbose),
         Commands::Run { config } => cmd_run(&config, verbose),
         Commands::Flash { config } => cmd_flash(&config, verbose),
+        Commands::Sign { input, key, output } => cmd_sign(&input, &key, output.as_deref(), verbose),
     };
 
     if let Err(e) = result {
@@ -2015,6 +2034,97 @@ fn cmd_flash(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 result.family
             )));
         }
+    }
+
+    Ok(())
+}
+
+/// Sign a packed .fmod module with an Ed25519 seed, appending a v2 manifest
+/// carrying the signature + signer fingerprint. Writes either in place or to
+/// `output`.
+fn cmd_sign(input: &PathBuf, key_path: &PathBuf, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
+    use std::fs;
+
+    let seed_bytes = fs::read(key_path)
+        .map_err(|e| Error::Module(format!("read key {}: {}", key_path.display(), e)))?;
+    if seed_bytes.len() != 32 {
+        return Err(Error::Module(format!(
+            "key must be exactly 32 bytes, got {}", seed_bytes.len()
+        )));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes);
+
+    let fmod = fs::read(input)
+        .map_err(|e| Error::Module(format!("read {}: {}", input.display(), e)))?;
+    if fmod.len() < 68 {
+        return Err(Error::Module("fmod file too small".into()));
+    }
+
+    // Locate the manifest section from the module header.
+    let code_size = u32::from_le_bytes([fmod[8], fmod[9], fmod[10], fmod[11]]) as usize;
+    let data_size = u32::from_le_bytes([fmod[12], fmod[13], fmod[14], fmod[15]]) as usize;
+    let export_count = u16::from_le_bytes([fmod[24], fmod[25]]) as usize;
+    let export_table_size = export_count * 8;
+    let schema_size = u16::from_le_bytes([fmod[62], fmod[63]]) as usize;
+    let manifest_size = u16::from_le_bytes([fmod[64], fmod[65]]) as usize;
+
+    const MODULE_HEADER_SIZE: usize = 68;
+    let manifest_offset = MODULE_HEADER_SIZE + code_size + data_size + export_table_size + schema_size;
+    if manifest_offset + manifest_size > fmod.len() {
+        return Err(Error::Module("fmod truncated before manifest".into()));
+    }
+
+    let mut manifest = manifest::Manifest::from_bytes(&fmod[manifest_offset..manifest_offset + manifest_size])?;
+
+    // Re-derive the integrity hash from the file (matches what the kernel
+    // computes). Signature covers this hash.
+    use sha2::Digest as _;
+    let code_data = &fmod[MODULE_HEADER_SIZE..MODULE_HEADER_SIZE + code_size + data_size];
+    let mut h = sha2::Sha256::new();
+    h.update(code_data);
+    let hh = h.finalize();
+    let mut integrity_hash = [0u8; 32];
+    integrity_hash.copy_from_slice(&hh);
+
+    let (pk, sig) = crypto::sign(&seed, &integrity_hash);
+    let signer_fp = crypto::sha256(&pk);
+    if !crypto::verify(&pk, &integrity_hash, &sig) {
+        return Err(Error::Module("internal: round-trip verify failed".into()));
+    }
+
+    manifest.integrity_hash = Some(integrity_hash);
+    manifest.signature = Some(sig);
+    manifest.signer_fp = Some(signer_fp);
+    let new_manifest_bytes = manifest.to_bytes();
+    let new_manifest_size = new_manifest_bytes.len();
+
+    let mut out_bytes = Vec::with_capacity(manifest_offset + new_manifest_size);
+    out_bytes.extend_from_slice(&fmod[..manifest_offset]);
+    out_bytes.extend_from_slice(&new_manifest_bytes);
+
+    let manifest_size_le = (new_manifest_size as u16).to_le_bytes();
+    out_bytes[64] = manifest_size_le[0];
+    out_bytes[65] = manifest_size_le[1];
+
+    let out_path = output.unwrap_or(input.as_path());
+    fs::write(out_path, &out_bytes)
+        .map_err(|e| Error::Module(format!("write {}: {}", out_path.display(), e)))?;
+
+    fn hex(b: &[u8]) -> String {
+        let mut s = String::with_capacity(b.len() * 2);
+        for &x in b { s.push_str(&format!("{:02x}", x)); }
+        s
+    }
+
+    if verbose {
+        println!("Signed {} ({} bytes)", out_path.display(), out_bytes.len());
+        println!("  pubkey:    {}", hex(&pk));
+        println!("  signer_fp: {}", hex(&signer_fp));
+    } else {
+        let full = hex(&pk);
+        println!("\x1b[1;32mSigned\x1b[0m {} pubkey={}...{}",
+                 out_path.display(), &full[..8], &full[full.len() - 8..]);
     }
 
     Ok(())

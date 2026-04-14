@@ -1058,14 +1058,25 @@ static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
 // On QEMU virt with -smp 1 (default), MPIDR_EL1.Aff0 = 0, so the check
 // is harmless. With -smp 4, secondary cores will park correctly.
 
+// DTB pointer handed to us by the firmware. `main` records it once the
+// MMU is up; `kernel::dtb::read_ethernet_mac` consults it. Placed in
+// `.data` with a non-zero sentinel to keep it out of `.bss` (which the
+// boot code zeros).
+#[no_mangle]
+#[link_section = ".data"]
+pub static mut _boot_dtb_ptr: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
 global_asm!(
     ".section .text._start",
     ".global _start",
     ".type _start, @function",
     "_start:",
-    // ---- E3-S7: Check core ID, park secondary cores (do this FIRST, before
-    //      touching any EL-specific system registers — secondaries don't
-    //      need EL drop or vector setup) ----
+    // aarch64 Linux boot protocol: x0 = DTB physical address. Stash it in
+    // x19 (callee-saved) so we can hand it to `main` after the MMU comes
+    // up — storing to a symbol here would use the virtual link address,
+    // which does not map anywhere real with the MMU off.
+    "    mov x19, x0",
+    // ---- E3-S7: Check core ID, park secondary cores ----
     "    mrs x0, mpidr_el1",
     "    and x0, x0, #0xFF",     // Aff0 = core ID
     "    cbnz x0, .Lpark_core",  // core != 0 → park
@@ -1178,7 +1189,8 @@ global_asm!(
     "    b 0b",
     "1:",
 
-    // Jump to Rust main
+    // Jump to Rust main — pass DTB pointer (firmware-provided) as first arg.
+    "    mov x0, x19",
     "    bl main",
 
     // Should never return
@@ -1196,7 +1208,7 @@ global_asm!(
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn main() -> ! {
+pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Pi 5 bring-up sequence:
     //   1. MMU enable — DRAM cacheable, RP1 MMIO as Device-nGnRE at 0x1c.
     //   2. rp1_pcie_disable_aspm() — surgical ASPM disable on PCIe RC.
@@ -1214,6 +1226,12 @@ pub extern "C" fn main() -> ! {
 
     unsafe { uart_init() };
     UART_READY.store(1, Ordering::Release);
+
+    // Record the DTB pointer now that the MMU is on; later DTB reads
+    // dereference `_boot_dtb_ptr`.
+    unsafe {
+        core::ptr::write_volatile(&raw mut _boot_dtb_ptr, dtb_phys);
+    }
 
     #[cfg(feature = "board-cm5")]
     uart_puts(b"[fluxor] bcm2712 boot (Pi 5 / CM5)\r\n");

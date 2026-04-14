@@ -345,8 +345,16 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     gem_write(base, GEM_TBQPH, (tx_dma >> 32) as u32);
     gem_write(base, GEM_TXQBASE, tx_dma as u32);
 
-    // Set MAC address
-    s.mac = DEFAULT_MAC;
+    // Ask the kernel for the hardware-provisioned MAC (sourced from the
+    // firmware-provided DTB). Fall back to DEFAULT_MAC — a locally-
+    // administered address — if the kernel has nothing for us.
+    const SYS_GET_HW_ETHERNET_MAC: u32 = 0x0C3D;
+    let mut probed = [0u8; 6];
+    s.mac = if (sys.dev_call)(-1, SYS_GET_HW_ETHERNET_MAC, probed.as_mut_ptr(), 6) == 6 {
+        probed
+    } else {
+        DEFAULT_MAC
+    };
     let mac_lo = (s.mac[0] as u32) | ((s.mac[1] as u32) << 8)
         | ((s.mac[2] as u32) << 16) | ((s.mac[3] as u32) << 24);
     let mac_hi = (s.mac[4] as u32) | ((s.mac[5] as u32) << 8);

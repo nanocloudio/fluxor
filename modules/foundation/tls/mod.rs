@@ -103,6 +103,10 @@ struct TlsSession {
     ecdh_private: [u8; 32],
     ecdh_public: [u8; 65],
 
+    // Resumable ECDH shared-secret computation, advanced in bounded chunks
+    // so concurrent handshakes interleave instead of blocking each other.
+    ecdh_state: ScalarMulState,
+
     // Peer key share (from ClientHello/ServerHello)
     peer_key_share: [u8; 65],
     peer_key_share_len: u8,
@@ -154,6 +158,7 @@ impl TlsSession {
             transcript: None,
             ecdh_private: [0; 32],
             ecdh_public: [0; 65],
+            ecdh_state: ScalarMulState::empty(),
             peer_key_share: [0; 65],
             peer_key_share_len: 0,
             peer_cert_pubkey: [0; 65],
@@ -201,6 +206,8 @@ impl TlsSession {
         self.hs_accum_len = 0;
         self.peer_key_share_len = 0;
         self.peer_cert_pubkey_len = 0;
+        self.ecdh_state.zeroise_scalar();
+        self.ecdh_state = ScalarMulState::empty();
         self.key_schedule = None;
         self.transcript = None;
         self.read_keys = TrafficKeys::empty();
@@ -217,6 +224,10 @@ struct TlsState {
     syscalls: *const SyscallTable,
     mode: u8,           // 0=client, 1=server
     verify_peer: u8,
+    /// Bits of the P-256 ladder to process per pump tick. 256 runs the full
+    /// ladder in one call; smaller values yield between chunks so a second
+    /// concurrent handshake doesn't wait for the first to finish.
+    ecdh_bits_per_step: u16,
 
     // Channel ports (4-port node: cipher side facing IP, clear side facing HTTP)
     cipher_in: i32,     // from IP: ciphertext net_proto frames
@@ -247,6 +258,11 @@ struct TlsState {
     trust_domain: [u8; 64],
     trust_domain_len: usize,
 
+    /// KEY_VAULT slot handle for the identity private key, or -1 if the
+    /// vault is unavailable. When >= 0, CertificateVerify signs via the
+    /// vault and falls back to the in-module `key` on ENOSYS.
+    key_vault_handle: i32,
+
     // Sessions
     sessions: [TlsSession; MAX_SESSIONS],
 
@@ -266,6 +282,12 @@ define_params! {
 
     2, verify_peer, u8, 1
         => |s, d, len| { s.verify_peer = p_u8(d, len, 0, 1); };
+
+    3, ecdh_bits_per_step, u16, 256
+        => |s, d, len| {
+            let v = p_u16(d, len, 0, 256);
+            s.ecdh_bits_per_step = if v == 0 { 1 } else if v > 256 { 256 } else { v };
+        };
 }
 
 // ============================================================================
@@ -303,6 +325,7 @@ pub unsafe extern "C" fn module_new(
     s.trust_domain_len = 0;
     s.ca_pubkey_len = 0;
     s.require_ca = false;
+    s.key_vault_handle = -1;
 
     let sys = &*s.syscalls;
 
@@ -345,10 +368,38 @@ pub unsafe extern "C" fn module_new(
             s.eph_private[i] = priv_key;
             s.eph_public[i] = pub_key;
             s.eph_used[i] = false;
-            // Zeroize random seed
             let mut j = 0;
             while j < 32 { core::ptr::write_volatile(&mut random[j], 0); j += 1; }
             i += 1;
+        }
+    }
+
+    // If a kernel KEY_VAULT is available, deposit the identity private key
+    // so CertificateVerify signs through the vault. The in-module `key`
+    // bytes remain as a fallback for SIGN operations the vault declines.
+    const KV_PROBE: u32 = 0x1000;
+    const KV_STORE: u32 = 0x1001;
+    if s.key_len >= 32 {
+        let present = (sys.dev_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
+        if present == 1 {
+            let mut raw = [0u8; 32];
+            if s.key_len == 32 {
+                core::ptr::copy_nonoverlapping(s.key.as_ptr(), raw.as_mut_ptr(), 32);
+            } else {
+                extract_ec_private_key(&s.key[..s.key_len], &mut raw);
+            }
+            let mut store_arg = [0u8; 4 + 32];
+            store_arg[0] = 1;  // key_type = P-256 scalar
+            store_arg[1] = 32; // key_len
+            core::ptr::copy_nonoverlapping(raw.as_ptr(), store_arg.as_mut_ptr().add(4), 32);
+            let h = (sys.dev_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
+            if h >= 0 { s.key_vault_handle = h; }
+            let mut j = 0;
+            while j < 32 {
+                core::ptr::write_volatile(&mut raw[j], 0);
+                core::ptr::write_volatile(&mut store_arg[4 + j], 0);
+                j += 1;
+            }
         }
     }
 
@@ -1149,16 +1200,48 @@ unsafe fn pump_recv_client_cert_verify(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_derive_handshake_keys(s: &mut TlsState, idx: usize) -> bool {
-    let sess = &mut s.sessions[idx];
-
-    // Compute ECDH shared secret
-    let shared = match ecdh_shared_secret(&sess.ecdh_private, &sess.peer_key_share[..sess.peer_key_share_len as usize]) {
-        Some(v) => v,
-        None => {
-            sess.state = SessionState::Error;
+    // A `bits_per_step` of 0 runs the whole ladder in one step() call, used
+    // when the caller-configured value is >= 256.
+    let bits_per_step_u8 = if s.ecdh_bits_per_step >= 256 { 0u8 } else { s.ecdh_bits_per_step as u8 };
+    {
+        let sess = &mut s.sessions[idx];
+        if !sess.ecdh_state.is_initialised() {
+            let new = match ecdh_shared_secret_init(
+                &sess.ecdh_private,
+                &sess.peer_key_share[..sess.peer_key_share_len as usize],
+                bits_per_step_u8,
+            ) {
+                Some(v) => v,
+                None => {
+                    sess.state = SessionState::Error;
+                    return true;
+                }
+            };
+            sess.ecdh_state = new;
+            // Yield after init so a second handshake can start its own ECDH
+            // before we advance ladder bits for this one.
             return true;
         }
+
+        if !sess.ecdh_state.complete() {
+            sess.ecdh_state.step();
+            return true;
+        }
+    }
+
+    let shared = {
+        let sess = &mut s.sessions[idx];
+        let out = match ecdh_shared_secret_finalise(&sess.ecdh_state) {
+            Some(v) => v,
+            None => {
+                sess.state = SessionState::Error;
+                return true;
+            }
+        };
+        sess.ecdh_state.zeroise_scalar();
+        out
     };
+    let sess = &mut s.sessions[idx];
 
     // Get transcript hash (ClientHello..ServerHello)
     let transcript_hash = match &sess.transcript {
@@ -1252,16 +1335,33 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     let mut k_random = [0u8; 32];
     dev_csprng_fill(sys, k_random.as_mut_ptr(), 32);
 
-    let mut priv_key = [0u8; 32];
-    // Parse SEC1/PKCS#8 private key (simplified: assume raw 32 bytes or SEC1 wrapper)
-    if s.key_len == 32 {
-        core::ptr::copy_nonoverlapping(s.key.as_ptr(), priv_key.as_mut_ptr(), 32);
-    } else if s.key_len > 32 {
-        // Try to extract raw key from SEC1/PKCS#8 DER
-        extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
+    // Sign via kernel KEY_VAULT when the identity key is held there; fall
+    // back to the in-module signer on ENOSYS.
+    const KV_SIGN: u32 = 0x1003;
+    let mut raw_sig = [0u8; 64];
+    let mut signed_via_vault = false;
+    if s.key_vault_handle >= 0 {
+        // arg layout: [hash_len: u16 LE][pad: u16][hash[32]][sig_out[64]]
+        let mut sign_arg = [0u8; 4 + 32 + 64];
+        sign_arg[0] = 32;
+        core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(4), 32);
+        let rc = (sys.dev_call)(s.key_vault_handle, KV_SIGN, sign_arg.as_mut_ptr(), sign_arg.len());
+        if rc == 0 {
+            core::ptr::copy_nonoverlapping(sign_arg.as_ptr().add(4 + 32), raw_sig.as_mut_ptr(), 64);
+            signed_via_vault = true;
+        }
     }
-
-    let raw_sig = ecdsa_sign(&priv_key, &vc_hash, &k_random);
+    if !signed_via_vault {
+        let mut priv_key = [0u8; 32];
+        if s.key_len == 32 {
+            core::ptr::copy_nonoverlapping(s.key.as_ptr(), priv_key.as_mut_ptr(), 32);
+        } else if s.key_len > 32 {
+            extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
+        }
+        raw_sig = ecdsa_sign(&priv_key, &vc_hash, &k_random);
+        let mut j = 0;
+        while j < 32 { core::ptr::write_volatile(&mut priv_key[j], 0); j += 1; }
+    }
     let (der_sig, der_len) = encode_der_signature(&raw_sig);
 
     let msg_len = build_certificate_verify(&der_sig, der_len, &mut sess.scratch);

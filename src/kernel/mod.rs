@@ -1,6 +1,10 @@
 //! Kernel syscall surfaces (minimal).
 
 pub mod hal;
+pub mod crypto;
+#[cfg(feature = "chip-bcm2712")]
+pub mod dtb;
+pub mod key_vault;
 pub mod syscalls;
 pub mod channel;
 pub mod config;

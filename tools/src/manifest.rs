@@ -16,11 +16,19 @@ use crate::hash::fnv1a_hash;
 /// Manifest section magic: "FXMF"
 pub const MANIFEST_MAGIC: u32 = 0x464D5846;
 
-/// Current manifest format version
-pub const MANIFEST_VERSION: u8 = 1;
+/// Current manifest format version. v1 = unsigned (integrity hash optional).
+/// v2 adds an optional Ed25519 signature block after the integrity hash:
+///   [ed25519_signature: 64B][signer_pubkey_fingerprint: 32B]
+/// The signature covers the 32-byte SHA-256 integrity hash (not the full
+/// module bytes directly) — integrity hash is still the anchor; the
+/// signature authenticates it.
+pub const MANIFEST_VERSION: u8 = 2;
 
 /// Manifest header size (fixed portion before variable sections)
 pub const MANIFEST_HEADER_SIZE: usize = 16;
+
+/// Signature block size (ed25519 signature + signer fingerprint).
+pub const SIGNATURE_BLOCK_SIZE: usize = 96;
 
 // ── Content type string→u8 mapping (matches config.rs CONTENT_TYPES) ────────
 
@@ -213,6 +221,12 @@ pub struct Manifest {
     pub resources: Vec<ResourceClaim>,
     pub dependencies: Vec<Dependency>,
     pub integrity_hash: Option<[u8; 32]>,
+    /// Ed25519 signature over the integrity hash. Set by the `fluxor sign`
+    /// subcommand; absent on unsigned (v1) manifests.
+    pub signature: Option<[u8; 64]>,
+    /// SHA-256 fingerprint of the signer's Ed25519 public key. Loader
+    /// matches this against OTP/provisioned pubkey to accept/reject.
+    pub signer_fp: Option<[u8; 32]>,
     /// FMP command vocabulary (parsed from TOML, not in binary format)
     pub commands: CommandVocabulary,
     /// Services this module provides to others (parsed from TOML, not in binary format).
@@ -233,6 +247,8 @@ impl Default for Manifest {
             resources: Vec::new(),
             dependencies: Vec::new(),
             integrity_hash: None,
+            signature: None,
+            signer_fp: None,
             commands: CommandVocabulary::default(),
             provides: Vec::new(),
             builtin: false,
@@ -371,6 +387,8 @@ impl Manifest {
             resources,
             dependencies,
             integrity_hash: None, // set later by caller
+            signature: None,
+            signer_fp: None,
             commands,
             provides,
             builtin,
@@ -380,23 +398,32 @@ impl Manifest {
     /// Serialize manifest to binary format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let has_integrity = self.integrity_hash.is_some();
+        let has_signature = self.signature.is_some() && self.signer_fp.is_some();
+        // Signature requires integrity (signature is over the hash).
+        let has_signature = has_signature && has_integrity;
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
-            + if has_integrity { 32 } else { 0 };
+            + if has_integrity { 32 } else { 0 }
+            + if has_signature { SIGNATURE_BLOCK_SIZE } else { 0 };
         let total = MANIFEST_HEADER_SIZE + var_size;
         let mut buf = Vec::with_capacity(total);
 
-        // Header (16 bytes)
+        // Header (16 bytes). Emit v2 only when a signature block is
+        // actually present; unsigned manifests stay at v1.
+        let version = if has_signature { MANIFEST_VERSION } else { 1 };
         buf.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
-        buf.push(MANIFEST_VERSION);
+        buf.push(version);
         buf.push(self.ports.len() as u8);
         buf.push(self.resources.len() as u8);
         buf.push(self.dependencies.len() as u8);
         buf.extend_from_slice(&self.module_version.to_le_bytes());
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
         buf.extend_from_slice(&self.state_size_hint.to_le_bytes());
-        buf.push(if has_integrity { 1 } else { 0 });
+        // byte 14: bit 0 = has_integrity, bit 1 = has_signature.
+        let flags = (if has_integrity { 1 } else { 0 })
+            | (if has_signature { 2 } else { 0 });
+        buf.push(flags);
         buf.push(0); // reserved
 
         // Ports (4 bytes each)
@@ -428,6 +455,14 @@ impl Manifest {
             buf.extend_from_slice(hash);
         }
 
+        // Signature block (64 B sig + 32 B signer fingerprint). Only emitted
+        // when both present *and* the integrity hash is set (signature is
+        // over that hash).
+        if has_signature {
+            buf.extend_from_slice(self.signature.as_ref().unwrap());
+            buf.extend_from_slice(self.signer_fp.as_ref().unwrap());
+        }
+
         debug_assert_eq!(buf.len(), total);
         buf
     }
@@ -448,7 +483,7 @@ impl Manifest {
         }
 
         let version = data[4];
-        if version != MANIFEST_VERSION {
+        if version != 1 && version != 2 {
             return Err(Error::Module(format!(
                 "unsupported manifest version: {}", version
             )));
@@ -460,13 +495,16 @@ impl Manifest {
         let module_version = u16::from_le_bytes([data[8], data[9]]);
         let hardware_targets = u16::from_le_bytes([data[10], data[11]]);
         let state_size_hint = u16::from_le_bytes([data[12], data[13]]);
-        let has_integrity = data[14] != 0;
+        let flags = data[14];
+        let has_integrity = (flags & 0x01) != 0;
+        let has_signature = version >= 2 && (flags & 0x02) != 0;
 
         let expected_size = MANIFEST_HEADER_SIZE
             + port_count * 4
             + resource_count * 4
             + dependency_count * 8
-            + if has_integrity { 32 } else { 0 };
+            + if has_integrity { 32 } else { 0 }
+            + if has_signature { SIGNATURE_BLOCK_SIZE } else { 0 };
 
         if data.len() < expected_size {
             return Err(Error::Module(format!(
@@ -516,9 +554,21 @@ impl Manifest {
         let integrity_hash = if has_integrity {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&data[offset..offset + 32]);
+            offset += 32;
             Some(hash)
         } else {
             None
+        };
+
+        let (signature, signer_fp) = if has_signature {
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&data[offset..offset + 64]);
+            offset += 64;
+            let mut fp = [0u8; 32];
+            fp.copy_from_slice(&data[offset..offset + 32]);
+            (Some(sig), Some(fp))
+        } else {
+            (None, None)
         };
 
         Ok(Manifest {
@@ -529,6 +579,8 @@ impl Manifest {
             resources,
             dependencies,
             integrity_hash,
+            signature,
+            signer_fp,
             commands: CommandVocabulary::default(),
             provides: Vec::new(), // not serialized in binary format
             builtin: false,

@@ -242,6 +242,10 @@ pub mod dev_class {
     pub const ADC: u8 = 0x0E;
     /// PWM (pulse-width modulation)
     pub const PWM: u8 = 0x0F;
+    /// Key vault — kernel-managed asymmetric keys (ECDSA/ECDH/verify).
+    /// Callers receive opaque i32 handles; raw key material never leaves
+    /// kernel static memory.
+    pub const KEY_VAULT: u8 = 0x10;
 }
 
 /// GPIO opcodes (0x0100-0x01FF)
@@ -540,6 +544,13 @@ pub mod dev_system {
     /// Returns bytes written (== arg_len) on success, or negative errno.
     /// Source: TRNG/ROSC on RP, timer hash on BCM2712, getrandom on Linux.
     pub const CSPRNG_FILL: u32 = 0x0C3C;
+
+    /// Read the hardware-provisioned ethernet MAC address from platform
+    /// sources (on bcm2712, the DTB passed by Pi 5 firmware). handle=-1,
+    /// arg=output buffer of exactly 6 bytes. Returns 6 on success, negative
+    /// errno (ENODEV) if no MAC is available — callers should fall back to
+    /// a configured default in that case.
+    pub const GET_HW_ETHERNET_MAC: u32 = 0x0C3D;
 
     // ── Runtime parameter store ──────────────────────────────────────────
 
@@ -849,6 +860,45 @@ pub mod dev_pwm {
     pub const CONFIGURE: u32 = 0x0F02;
     pub const SET_DUTY: u32 = 0x0F03;
     pub const GET_DUTY: u32 = 0x0F04;
+}
+
+/// KEY_VAULT opcodes (0x1000-0x10FF).
+///
+/// All operations run in kernel context; private key material never leaves
+/// the kernel static slot table. Callers see opaque `i32` handles.
+///
+/// Args buffers use the following layouts (all little-endian, tightly
+/// packed). Fields starting with `*_out` are written back by the kernel.
+pub mod dev_key_vault {
+    /// Returns 1 if a key-vault backend is present, 0 if not. Call with
+    /// handle=-1 and arg=null to detect at `module_new`.
+    pub const PROBE: u32 = 0x1000;
+
+    /// Store a private key. handle=-1.
+    /// arg layout: [key_type:u8][len:u8][_pad:u16][bytes[len]]
+    /// - key_type 1 = raw 32-byte P-256 scalar (for ECDSA + ECDH)
+    /// - len is the key-material length in bytes
+    /// Returns: slot handle (>= 0) or negative errno.
+    pub const STORE: u32 = 0x1001;
+
+    /// ECDH: derive shared secret. handle = slot.
+    /// arg layout: [peer_pub_len:u16][_pad:u16][peer_pub_bytes[len]][out[32]]
+    /// On success, the 32-byte X coordinate is written into the trailing
+    /// out region. Returns 0 on success, negative errno otherwise.
+    pub const ECDH: u32 = 0x1002;
+
+    /// ECDSA sign (P-256, deterministic RFC 6979 nonce). handle = slot.
+    /// arg layout: [hash_len:u16][_pad:u16][hash_bytes[hash_len]][sig_out[64]]
+    /// Returns 0 on success.
+    pub const SIGN: u32 = 0x1003;
+
+    /// ECDSA verify. handle = slot.
+    /// arg layout: [hash_len:u16][sig_len:u16][hash_bytes[hash_len]][sig_bytes[sig_len]]
+    /// Returns 1 if valid, 0 if invalid, negative errno on malformed input.
+    pub const VERIFY: u32 = 0x1004;
+
+    /// Zeroise and free the slot. handle = slot. Returns 0.
+    pub const DESTROY: u32 = 0x1005;
 }
 
 /// Query keys for dev_query

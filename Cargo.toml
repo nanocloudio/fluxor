@@ -88,6 +88,12 @@ board-cm5 = ["chip-bcm2712"]
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
 host-linux = ["portable-atomic", "sha2", "env_logger", "libc"]
 
+# Require every loaded module to carry a valid Ed25519 signature from the
+# provisioned root-of-trust key (see hal::otp_read_signing_key). When
+# unset, the loader accepts unsigned modules; set it for production images
+# built from a signed module tree.
+enforce_signatures = []
+
 [build-dependencies]
 toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }

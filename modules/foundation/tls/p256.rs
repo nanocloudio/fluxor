@@ -746,6 +746,145 @@ fn scalar_mul(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
 }
 
 // ============================================================================
+// Resumable scalar multiplication
+// ============================================================================
+//
+// Splits the constant-time Montgomery ladder into chunks so a caller can
+// yield between chunks — each ECDH on aarch64 runs long enough that a
+// concurrent handshake otherwise waits for the whole ladder to finish.
+//
+// One ladder bit performs: ct_swap, add_jacobian, double, ct_swap. Each
+// step() processes `bits_per_step` ladder bits (clamped to remaining bits);
+// the caller checks `complete()` to know when to extract the result.
+
+pub struct ScalarMulState {
+    r0: JacobianPoint,
+    r1: JacobianPoint,
+    k: U256,
+    /// Next ladder bit to process, counted from 255 down to 0. -1 = done.
+    bit_index: i16,
+    bits_per_step: u8,
+    /// Set to 1 once `new`/`new_base` has populated r0/r1/k. 0 means the
+    /// struct is in its kernel-zeroed initial state and must be (re)initialised
+    /// before stepping.
+    initialised: u8,
+}
+
+impl ScalarMulState {
+    pub const fn empty() -> Self {
+        Self {
+            r0: JacobianPoint { x: ZERO, y: ZERO, z: ZERO },
+            r1: JacobianPoint { x: ZERO, y: ZERO, z: ZERO },
+            k: ZERO,
+            bit_index: -1,
+            bits_per_step: 0,
+            initialised: 0,
+        }
+    }
+
+    /// Initialise for `k * P` with arbitrary affine P. `bits_per_step == 0`
+    /// means "process the entire scalar in a single `step()` call", matching
+    /// one-shot `scalar_mul_ct` behaviour.
+    pub fn new(k: &U256, px: &U256, py: &U256, bits_per_step: u8) -> Self {
+        let p_jac = JacobianPoint::from_affine(px, py);
+        Self {
+            r0: JacobianPoint::identity(),
+            r1: JacobianPoint { x: p_jac.x, y: p_jac.y, z: p_jac.z },
+            k: *k,
+            bit_index: 255,
+            bits_per_step,
+            initialised: 1,
+        }
+    }
+
+    /// Initialise for `k * G`.
+    #[allow(dead_code)]
+    pub fn new_base(k: &U256, bits_per_step: u8) -> Self {
+        let gx = load_gx();
+        let gy = load_gy();
+        Self::new(k, &gx, &gy, bits_per_step)
+    }
+
+    pub fn complete(&self) -> bool {
+        self.initialised != 0 && self.bit_index < 0
+    }
+
+    /// True once `new`/`new_base` has populated the state; false when the
+    /// struct is in its kernel-zeroed empty form.
+    pub fn is_initialised(&self) -> bool {
+        self.initialised != 0
+    }
+
+    /// Advance the ladder by up to `bits_per_step` bits. Returns true when
+    /// the multiplication is complete.
+    pub fn step(&mut self) -> bool {
+        if self.initialised == 0 || self.bit_index < 0 {
+            return self.complete();
+        }
+        // bits_per_step == 0 → run to completion in this call.
+        let mut remaining: i16 = if self.bits_per_step == 0 {
+            i16::MAX
+        } else {
+            self.bits_per_step as i16
+        };
+        while remaining > 0 && self.bit_index >= 0 {
+            let bi = self.bit_index as u32;
+            let word = self.k[(bi >> 6) as usize];
+            let bit = ((word >> (bi & 63)) & 1) as u8;
+            ct_swap(&mut self.r0, &mut self.r1, bit);
+            self.r1 = self.r0.add_jacobian(&self.r1);
+            self.r0 = self.r0.double();
+            ct_swap(&mut self.r0, &mut self.r1, bit);
+            self.bit_index -= 1;
+            remaining -= 1;
+        }
+        self.complete()
+    }
+
+    /// Extract the result. Caller must ensure `complete()` is true.
+    pub fn result(&self) -> JacobianPoint {
+        JacobianPoint { x: self.r0.x, y: self.r0.y, z: self.r0.z }
+    }
+
+    /// Zeroise the secret scalar via volatile writes. Call once the result
+    /// has been extracted to limit how long the private key sits in RAM.
+    pub fn zeroise_scalar(&mut self) {
+        zeroize_u256(&mut self.k);
+    }
+}
+
+/// Resumable variant of `ecdh_shared_secret`. The caller drives the returned
+/// state with `step()` and finalises with `ecdh_shared_secret_finalise`.
+pub fn ecdh_shared_secret_init(
+    my_private: &[u8; 32],
+    peer_pub: &[u8],
+    bits_per_step: u8,
+) -> Option<ScalarMulState> {
+    let offset = if peer_pub.len() == 65 && peer_pub[0] == 0x04 {
+        1
+    } else if peer_pub.len() == 64 {
+        0
+    } else {
+        return None;
+    };
+    let px = u256_from_be(&peer_pub[offset..offset + 32]);
+    let py = u256_from_be(&peer_pub[offset + 32..offset + 64]);
+    let k = u256_from_be(my_private);
+    Some(ScalarMulState::new(&k, &px, &py, bits_per_step))
+}
+
+/// Extract the shared-secret X coordinate from a completed `ScalarMulState`.
+/// Returns None if the result is the point at infinity (invalid).
+pub fn ecdh_shared_secret_finalise(state: &ScalarMulState) -> Option<[u8; 32]> {
+    let result = state.result();
+    if result.is_identity() {
+        return None;
+    }
+    let (x, _) = result.to_affine();
+    Some(u256_to_be(&x))
+}
+
+// ============================================================================
 // Serialization
 // ============================================================================
 

@@ -181,6 +181,42 @@ pub fn verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     (ops().verify_integrity)(computed, expected)
 }
 
+/// Read the root-of-trust Ed25519 signing pubkey into `out`.
+///
+/// Returns true if a pubkey is provisioned (writes 32 bytes into `out`);
+/// false otherwise. The loader uses this to authenticate module signatures
+/// when the `enforce_signatures` feature is set.
+///
+/// Provisioning: the pubkey is a compile-time constant taken from the
+/// `FLUXOR_SIGNING_PUBKEY_HEX` environment variable at build time (64 hex
+/// characters, 32 bytes). Unset means the device is unprovisioned and
+/// module signatures cannot be checked; with `enforce_signatures` set,
+/// the loader then refuses to load any module.
+pub fn otp_read_signing_key(out: &mut [u8; 32]) -> bool {
+    match option_env!("FLUXOR_SIGNING_PUBKEY_HEX") {
+        Some(hex) if hex.len() == 64 => {
+            let bytes = hex.as_bytes();
+            for i in 0..32 {
+                let hi = match bytes[i * 2] {
+                    b'0'..=b'9' => bytes[i * 2] - b'0',
+                    b'a'..=b'f' => bytes[i * 2] - b'a' + 10,
+                    b'A'..=b'F' => bytes[i * 2] - b'A' + 10,
+                    _ => return false,
+                };
+                let lo = match bytes[i * 2 + 1] {
+                    b'0'..=b'9' => bytes[i * 2 + 1] - b'0',
+                    b'a'..=b'f' => bytes[i * 2 + 1] - b'a' + 10,
+                    b'A'..=b'F' => bytes[i * 2 + 1] - b'A' + 10,
+                    _ => return false,
+                };
+                out[i] = (hi << 4) | lo;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 #[inline(always)]
 pub fn pic_barrier() {
     (ops().pic_barrier)()

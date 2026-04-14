@@ -168,8 +168,14 @@ pub fn init_providers() {
     provider::register(dev_class::SYSTEM, system_provider_dispatch);
     provider::register(dev_class::FS, fs_provider_dispatch);
     provider::register(dev_class::BUFFER, buffer_provider_dispatch);
+    provider::register(dev_class::KEY_VAULT, key_vault_provider_dispatch);
     // Platform-specific providers (GPIO, PIO, etc.) registered via HAL
     hal::init_providers();
+}
+
+/// KEY_VAULT provider adapter — forwards to the kernel key_vault module.
+unsafe fn key_vault_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    crate::kernel::key_vault::provider_dispatch(handle, opcode, arg, arg_len)
 }
 
 // ============================================================================
@@ -202,10 +208,13 @@ unsafe extern "C" fn syscall_dev_call(
     // Bit N in the mask = device class N is allowed through dev_call.
     //   COMMON(0) GPIO(1) SPI(2) I2C(3) PIO(4) Chan(5) Timer(6)
     //   NetIF(7) Socket(8) FS(9) Buffer(A) Event(B) System(C) UART(D) ADC(E)
+    // Bit 16 = KEY_VAULT. Exposed to every cap tier because it's a kernel
+    // service that strictly reduces the trust surface of callers (they store
+    // keys by handle, the kernel never hands bytes back out).
     const CAP_CLASS_MASK: [u32; 4] = [
-        0x0000_1FE1, // CAP_SERVICE: infra + contract (no GPIO/SPI/I2C/PIO/UART/ADC)
-        0x0000_1FF1, // CAP_SERVICE_PIO: service + PIO
-        0x0000_1FE3, // CAP_SERVICE_GPIO: service + GPIO
+        0x0001_1FE1, // CAP_SERVICE: infra + contract + KEY_VAULT
+        0x0001_1FF1, // CAP_SERVICE_PIO: service + PIO + KEY_VAULT
+        0x0001_1FE3, // CAP_SERVICE_GPIO: service + GPIO + KEY_VAULT
         0xFFFF_FFFF, // CAP_FULL: all classes (0-31)
     ];
     {
@@ -225,12 +234,13 @@ unsafe extern "C" fn syscall_dev_call(
         // timing, IPC, buffers, events) that any module may use, not hardware
         // resources that need explicit declaration.
         const INFRA_CLASSES: u32 =
-            (1 << dev_class::COMMON)  |
-            (1 << dev_class::CHANNEL) |
-            (1 << dev_class::TIMER)   |
-            (1 << dev_class::BUFFER)  |
-            (1 << dev_class::EVENT)   |
-            (1 << dev_class::SYSTEM);
+            (1 << dev_class::COMMON)    |
+            (1 << dev_class::CHANNEL)   |
+            (1 << dev_class::TIMER)     |
+            (1 << dev_class::BUFFER)    |
+            (1 << dev_class::EVENT)     |
+            (1 << dev_class::SYSTEM)    |
+            (1 << dev_class::KEY_VAULT);
         let req = crate::kernel::scheduler::current_module_required_caps();
         if req != 0 && (class as u32) < 32
             && (INFRA_CLASSES & (1 << class)) == 0
@@ -481,6 +491,21 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         dev_system::LOG => {
             syscall_log(handle as u8, arg, arg_len);
             0
+        }
+        dev_system::GET_HW_ETHERNET_MAC => {
+            if arg.is_null() || arg_len < 6 { return E_INVAL; }
+            #[cfg(feature = "chip-bcm2712")]
+            {
+                match crate::kernel::dtb::read_ethernet_mac() {
+                    Some(mac) => {
+                        for i in 0..6 { *arg.add(i) = mac[i]; }
+                        6
+                    }
+                    None => errno::ENODEV,
+                }
+            }
+            #[cfg(not(feature = "chip-bcm2712"))]
+            { let _ = arg; errno::ENODEV }
         }
         dev_system::IRQ_BIND => {
             // Bind an event handle to a hardware IRQ. handle=event, arg=[irq:u32, mmio_base:u64]

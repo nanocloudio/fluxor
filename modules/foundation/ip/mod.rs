@@ -745,15 +745,11 @@ unsafe fn process_frame(s: &mut IpState, len: usize) {
         return;
     }
 
-    // Fallback MAC learning from frame headers (only if driver didn't provide MAC)
+    // Drivers must announce their MAC explicitly (ethertype=0 frame); we
+    // refuse to infer it from inbound traffic, which would let a forged ARP
+    // or misconfigured peer drive us to adopt an arbitrary identity.
     if !s.mac_valid {
-        let dst = eth::dst_mac(s.rx_frame.as_ptr());
-        // Only learn from unicast destination (= our MAC)
-        if dst[0] & 0x01 == 0 {
-            s.mac_addr = dst;
-            s.mac_valid = true;
-        }
-        // Don't learn from source MAC — that's another device's MAC
+        return;
     }
 
     let payload = s.rx_frame.as_ptr().add(payload_offset);
