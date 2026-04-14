@@ -322,10 +322,13 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     let nwcfg: u32 = 0x00d40502 & !(1 << 24);
     gem_write(base, GEM_NWCFG, nwcfg);
 
-    // DMA config: RX buffer size in [23:16], plus fixed burst/RX buf/TX config, 64-bit bus.
-    // 0x0F1F = FBLDO(0x1F)|RXBMS(3)|TX_PBUF|TX_CSUM
+    // DMA config: RX buffer size, TX_PBUF, RXBMS=3, FBLDO=16, 64-bit bus.
+    // TX checksum offload intentionally disabled — software computes it in
+    // the IP module so the transmitted checksum matches the payload.
     let dmacfg = ((BUF_SIZE as u32 >> 6) << DMACFG_RXBUF_SIZE_SHIFT)
-        | 0x0F1F
+        | (1u32 << 10)       // TX_PBUF
+        | (3u32 << 8)        // RXBMS=3
+        | 0x10u32            // FBLDO=16
         | DMACFG_ADDR64;
     gem_write(base, GEM_DMACFG, dmacfg);
 
@@ -521,8 +524,13 @@ unsafe fn poll_rx(s: &mut GemState) {
             let buf_addr = s.buf_pool_addr as usize + idx * s.buf_size as usize;
             let buf_ptr = buf_addr as *const u8;
 
-            (sys.channel_write)(s.out_chan, buf_ptr, len);
-            s.rx_packets = s.rx_packets.wrapping_add(1);
+            // Writes are atomic (all-or-nothing); on a full channel the frame
+            // is dropped. The GEM descriptor is still returned below so the
+            // ring does not stall.
+            let written = (sys.channel_write)(s.out_chan, buf_ptr, len);
+            if written > 0 {
+                s.rx_packets = s.rx_packets.wrapping_add(1);
+            }
         }
 
         // Return descriptor to GEM: clear ownership, set DMA buffer address, preserve wrap
@@ -571,7 +579,14 @@ unsafe fn poll_tx(s: &mut GemState) {
     let buf_dma = buf_arm as u64 + DMA_OFFSET;
     let buf_ptr = buf_arm as *mut u8;
 
-    let n = (sys.channel_read)(s.in_chan, buf_ptr, MAX_FRAME);
+    // Length-prefixed framing: IP writes [len:u16 LE][frame...].
+    // Read the 2-byte header first, then exactly that many payload bytes.
+    let mut hdr = [0u8; 2];
+    let hn = (sys.channel_read)(s.in_chan, hdr.as_mut_ptr(), 2);
+    if hn < 2 { return; }
+    let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
+    if frame_len == 0 || frame_len > MAX_FRAME { return; }
+    let n = (sys.channel_read)(s.in_chan, buf_ptr, frame_len) as i32;
     if n <= 0 { return; }
 
     // Program TX descriptor in GEM format (use DMA addresses)

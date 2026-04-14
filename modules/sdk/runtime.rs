@@ -710,7 +710,11 @@ unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 {
-    let mut buf = [port_type, index];
+    let mut buf = [0u8; 2];
+    // Volatile stores: PIC aarch64 otherwise dead-stores the buffer and
+    // dev_call sees zeros on entry.
+    core::ptr::write_volatile(buf.as_mut_ptr(), port_type);
+    core::ptr::write_volatile(buf.as_mut_ptr().add(1), index);
     (sys.dev_call)(-1, 0x050C, buf.as_mut_ptr(), 2)
 }
 

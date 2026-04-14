@@ -50,10 +50,12 @@ SECTIONS {
         *(.uninit .uninit.*)
     } > RAM
 
-    /* Stack in RAM, not part of the loadable image. */
+    /* Stack in RAM, not part of the loadable image. 1 MB covers the deep
+       call chains in the P-256 primitives (each curve constant materialised
+       on the stack per call). */
     . = ALIGN(16);
     __stack_start = .;
-    . = . + 64K;
+    . = . + 1M;
     __stack_end = .;
 
     /* End of runtime-reserved RAM. Relocated package payload lives above this. */

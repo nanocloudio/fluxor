@@ -1,0 +1,44 @@
+# HTTPS Server (Pi 5 / CM5 bare-metal)
+#
+# TLS 1.3 over RP1 GEM ethernet with DHCP.
+# 100us tick for responsive descriptor polling.
+#
+# Generate test certs:
+#   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+#     -nodes -keyout /tmp/server_key.pem -out /tmp/server_cert.pem -days 365 -subj "/CN=fluxor"
+#   openssl x509 -in /tmp/server_cert.pem -outform DER -out /tmp/server_cert.der
+#   openssl ec -in /tmp/server_key.pem -outform DER -out /tmp/server_key.der
+#
+# Build:
+#   make firmware TARGET=cm5 && make modules TARGET=bcm2712
+#   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/cm5/https_server.yaml
+# Test:
+#   curl -vsk https://<DUT_IP>:443/
+target: cm5
+tick_us: 100
+
+platform:
+  net: {}
+
+modules:
+  - name: tls
+    mode: 1
+    verify_peer: 0
+    cert_file: "/tmp/server_cert.der"
+    key_file: "/tmp/server_key.der"
+
+  - name: http
+    port: 443
+    routes:
+      - path: "/"
+        body: "<html><body><h1>Fluxor HTTPS on Pi 5</h1><p>TLS 1.3 bare-metal.</p></body></html>"
+
+wiring:
+  - from: ip.net_out
+    to: tls.cipher_in
+  - from: tls.cipher_out
+    to: ip.net_in
+  - from: tls.clear_out
+    to: http.net_in
+  - from: http.net_out
+    to: tls.clear_in

@@ -112,43 +112,46 @@ pub unsafe fn build_ipv4_header(
     dst_ip: u32,
     identification: u16,
 ) -> usize {
+    use core::ptr::write_volatile;
+    // Every field stored via write_volatile — PIC aarch64 otherwise
+    // dead-stores part of the header through this byte-serialisation.
     // Version (4) + IHL (5) = 0x45
-    *dst = 0x45;
+    write_volatile(dst, 0x45u8);
     // DSCP + ECN
-    *dst.add(1) = 0x00;
+    write_volatile(dst.add(1), 0x00u8);
     // Total length
-    *dst.add(2) = (total_len >> 8) as u8;
-    *dst.add(3) = (total_len & 0xFF) as u8;
+    write_volatile(dst.add(2), (total_len >> 8) as u8);
+    write_volatile(dst.add(3), (total_len & 0xFF) as u8);
     // Identification
-    *dst.add(4) = (identification >> 8) as u8;
-    *dst.add(5) = (identification & 0xFF) as u8;
+    write_volatile(dst.add(4), (identification >> 8) as u8);
+    write_volatile(dst.add(5), (identification & 0xFF) as u8);
     // Flags (Don't Fragment) + Fragment offset
-    *dst.add(6) = 0x40; // DF flag
-    *dst.add(7) = 0x00;
+    write_volatile(dst.add(6), 0x40u8);
+    write_volatile(dst.add(7), 0x00u8);
     // TTL
-    *dst.add(8) = 64;
+    write_volatile(dst.add(8), 64u8);
     // Protocol
-    *dst.add(9) = protocol;
+    write_volatile(dst.add(9), protocol);
     // Checksum placeholder (computed after)
-    *dst.add(10) = 0;
-    *dst.add(11) = 0;
+    write_volatile(dst.add(10), 0u8);
+    write_volatile(dst.add(11), 0u8);
     // Source IP
     let src = src_ip.to_be_bytes();
-    *dst.add(12) = src[0];
-    *dst.add(13) = src[1];
-    *dst.add(14) = src[2];
-    *dst.add(15) = src[3];
+    write_volatile(dst.add(12), src[0]);
+    write_volatile(dst.add(13), src[1]);
+    write_volatile(dst.add(14), src[2]);
+    write_volatile(dst.add(15), src[3]);
     // Destination IP
     let d = dst_ip.to_be_bytes();
-    *dst.add(16) = d[0];
-    *dst.add(17) = d[1];
-    *dst.add(18) = d[2];
-    *dst.add(19) = d[3];
+    write_volatile(dst.add(16), d[0]);
+    write_volatile(dst.add(17), d[1]);
+    write_volatile(dst.add(18), d[2]);
+    write_volatile(dst.add(19), d[3]);
 
     // Compute and set checksum
     let cksum = checksum(dst, 20);
-    *dst.add(10) = (cksum >> 8) as u8;
-    *dst.add(11) = (cksum & 0xFF) as u8;
+    write_volatile(dst.add(10), (cksum >> 8) as u8);
+    write_volatile(dst.add(11), (cksum & 0xFF) as u8);
 
     IPV4_HEADER_LEN
 }
@@ -157,6 +160,7 @@ pub unsafe fn build_ipv4_header(
 ///
 /// # Safety
 /// This adds src_ip, dst_ip, protocol, and payload_len to the checksum accumulator.
+#[inline(never)]
 pub fn pseudo_header_sum(src_ip: u32, dst_ip: u32, protocol: u8, payload_len: u16) -> u32 {
     let src = src_ip.to_be_bytes();
     let dst = dst_ip.to_be_bytes();
@@ -171,6 +175,7 @@ pub fn pseudo_header_sum(src_ip: u32, dst_ip: u32, protocol: u8, payload_len: u1
 }
 
 /// Finalize a checksum accumulator to a 16-bit ones-complement value.
+#[inline(never)]
 pub fn finalize_checksum(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);

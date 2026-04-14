@@ -21,7 +21,17 @@ pub struct ArpEntry {
     pub valid: bool,
     /// Age in step counts (for eviction)
     pub age: u16,
+    /// Pinned by active TCP connection — rejects MAC changes while pinned
+    pub pinned: bool,
+    /// Number of connections using this entry (0 = unpinned, 255 = permanent)
+    pub pin_count: u8,
+    /// Step count of last MAC change (for rate limiting)
+    pub last_update: u16,
 }
+
+/// Minimum steps between MAC address changes for a given IP (rate limiting).
+/// Default ~2 minutes at 20ms step rate = 6000 ticks.
+pub const ARP_UPDATE_COOLDOWN: u16 = 6000;
 
 impl ArpEntry {
     pub const fn empty() -> Self {
@@ -30,6 +40,9 @@ impl ArpEntry {
             mac: [0; 6],
             valid: false,
             age: 0,
+            pinned: false,
+            pin_count: 0,
+            last_update: 0,
         }
     }
 }
@@ -61,18 +74,34 @@ pub fn lookup(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32) -> Option<[u8; 6]> {
 }
 
 /// Insert or update an ARP table entry.
+/// Respects pinning (active TCP connections) and rate limiting.
 ///
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
-pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6]) {
+pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], step_count: u16) {
     unsafe {
         // Check if already exists
         let mut i = 0;
         while i < ARP_TABLE_SIZE {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
+                // If MAC is unchanged, just refresh age
+                if entry.mac == mac {
+                    entry.age = 0;
+                    return;
+                }
+                // Reject MAC change if entry is pinned (active TCP connection)
+                if entry.pinned {
+                    return;
+                }
+                // Rate-limit MAC changes
+                let elapsed = step_count.wrapping_sub(entry.last_update);
+                if elapsed < ARP_UPDATE_COOLDOWN {
+                    return; // reject rapid MAC changes
+                }
                 entry.mac = mac;
                 entry.age = 0;
+                entry.last_update = step_count;
                 return;
             }
             i += 1;
@@ -83,25 +112,86 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6]) {
         while i < ARP_TABLE_SIZE {
             let entry = &*table.as_ptr().add(i);
             if !entry.valid {
-                *table.as_mut_ptr().add(i) = ArpEntry { ip, mac, valid: true, age: 0 };
+                *table.as_mut_ptr().add(i) = ArpEntry {
+                    ip, mac, valid: true, age: 0,
+                    pinned: false, pin_count: 0, last_update: step_count,
+                };
                 return;
             }
             i += 1;
         }
 
-        // Evict oldest entry
-        let mut oldest_idx = 0;
+        // Evict oldest non-pinned entry
+        let mut oldest_idx: usize = ARP_TABLE_SIZE; // sentinel: no candidate
         let mut oldest_age = 0u16;
         i = 0;
         while i < ARP_TABLE_SIZE {
             let entry = &*table.as_ptr().add(i);
-            if entry.age > oldest_age {
+            if !entry.pinned && entry.age > oldest_age {
                 oldest_age = entry.age;
                 oldest_idx = i;
             }
             i += 1;
         }
-        *table.as_mut_ptr().add(oldest_idx) = ArpEntry { ip, mac, valid: true, age: 0 };
+        if oldest_idx < ARP_TABLE_SIZE {
+            *table.as_mut_ptr().add(oldest_idx) = ArpEntry {
+                ip, mac, valid: true, age: 0,
+                pinned: false, pin_count: 0, last_update: step_count,
+            };
+        }
+        // If all entries are pinned, drop the new entry (defence: don't evict pinned)
+    }
+}
+
+/// Pin an ARP entry for the given IP (called when TCP connection established).
+pub fn pin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            let entry = &mut *table.as_mut_ptr().add(i);
+            if entry.valid && entry.ip == ip {
+                entry.pinned = true;
+                if entry.pin_count < 255 {
+                    entry.pin_count += 1;
+                }
+                return;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Unpin an ARP entry (called when TCP connection closed).
+pub fn unpin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            let entry = &mut *table.as_mut_ptr().add(i);
+            if entry.valid && entry.ip == ip && entry.pin_count > 0 && entry.pin_count < 255 {
+                entry.pin_count -= 1;
+                if entry.pin_count == 0 {
+                    entry.pinned = false;
+                }
+                return;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Permanently pin the gateway ARP entry (set pin_count = 255).
+pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            let entry = &mut *table.as_mut_ptr().add(i);
+            if entry.valid && entry.ip == ip {
+                entry.pinned = true;
+                entry.pin_count = 255; // permanent
+                return;
+            }
+            i += 1;
+        }
     }
 }
 

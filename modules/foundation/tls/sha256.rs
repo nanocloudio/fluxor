@@ -1,24 +1,58 @@
 // SHA-256 implementation (FIPS 180-4)
-// Pure Rust, no_std, no heap, no tables in .data (all const)
+// Pure Rust, no_std, no heap. Round constants are materialised on the stack
+// via per-word volatile stores; PIC aarch64 modules cannot rely on
+// ADRP-based loads from .rodata for a `const [u32; 64]` array.
 
-const K256: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
+/// Load SHA-256 round constants into a stack buffer via per-word volatile
+/// writes. Each store goes through `k256_store` (`#[inline(never)]`) so
+/// LLVM cannot batch them into a NEON literal-pool load.
+#[inline(never)]
+fn load_k256() -> [u32; 64] {
+    let mut k = [0u32; 64];
+    unsafe {
+        let p = k.as_mut_ptr();
+        k256_store(p,  0, 0x428a2f98); k256_store(p,  1, 0x71374491);
+        k256_store(p,  2, 0xb5c0fbcf); k256_store(p,  3, 0xe9b5dba5);
+        k256_store(p,  4, 0x3956c25b); k256_store(p,  5, 0x59f111f1);
+        k256_store(p,  6, 0x923f82a4); k256_store(p,  7, 0xab1c5ed5);
+        k256_store(p,  8, 0xd807aa98); k256_store(p,  9, 0x12835b01);
+        k256_store(p, 10, 0x243185be); k256_store(p, 11, 0x550c7dc3);
+        k256_store(p, 12, 0x72be5d74); k256_store(p, 13, 0x80deb1fe);
+        k256_store(p, 14, 0x9bdc06a7); k256_store(p, 15, 0xc19bf174);
+        k256_store(p, 16, 0xe49b69c1); k256_store(p, 17, 0xefbe4786);
+        k256_store(p, 18, 0x0fc19dc6); k256_store(p, 19, 0x240ca1cc);
+        k256_store(p, 20, 0x2de92c6f); k256_store(p, 21, 0x4a7484aa);
+        k256_store(p, 22, 0x5cb0a9dc); k256_store(p, 23, 0x76f988da);
+        k256_store(p, 24, 0x983e5152); k256_store(p, 25, 0xa831c66d);
+        k256_store(p, 26, 0xb00327c8); k256_store(p, 27, 0xbf597fc7);
+        k256_store(p, 28, 0xc6e00bf3); k256_store(p, 29, 0xd5a79147);
+        k256_store(p, 30, 0x06ca6351); k256_store(p, 31, 0x14292967);
+        k256_store(p, 32, 0x27b70a85); k256_store(p, 33, 0x2e1b2138);
+        k256_store(p, 34, 0x4d2c6dfc); k256_store(p, 35, 0x53380d13);
+        k256_store(p, 36, 0x650a7354); k256_store(p, 37, 0x766a0abb);
+        k256_store(p, 38, 0x81c2c92e); k256_store(p, 39, 0x92722c85);
+        k256_store(p, 40, 0xa2bfe8a1); k256_store(p, 41, 0xa81a664b);
+        k256_store(p, 42, 0xc24b8b70); k256_store(p, 43, 0xc76c51a3);
+        k256_store(p, 44, 0xd192e819); k256_store(p, 45, 0xd6990624);
+        k256_store(p, 46, 0xf40e3585); k256_store(p, 47, 0x106aa070);
+        k256_store(p, 48, 0x19a4c116); k256_store(p, 49, 0x1e376c08);
+        k256_store(p, 50, 0x2748774c); k256_store(p, 51, 0x34b0bcb5);
+        k256_store(p, 52, 0x391c0cb3); k256_store(p, 53, 0x4ed8aa4a);
+        k256_store(p, 54, 0x5b9cca4f); k256_store(p, 55, 0x682e6ff3);
+        k256_store(p, 56, 0x748f82ee); k256_store(p, 57, 0x78a5636f);
+        k256_store(p, 58, 0x84c87814); k256_store(p, 59, 0x8cc70208);
+        k256_store(p, 60, 0x90befffa); k256_store(p, 61, 0xa4506ceb);
+        k256_store(p, 62, 0xbef9a3f7); k256_store(p, 63, 0xc67178f2);
+    }
+    k
+}
+
+/// Single u32 volatile store. `#[inline(never)]` keeps LLVM from batching
+/// adjacent stores into a NEON literal load.
+#[inline(never)]
+unsafe fn k256_store(base: *mut u32, idx: usize, val: u32) {
+    core::ptr::write_volatile(base.add(idx), val);
+}
 
 #[derive(Clone)]
 pub struct Sha256 {
@@ -143,42 +177,57 @@ impl Sha256 {
 }
 
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let k = load_k256();
     let mut w = [0u32; 64];
 
-    // Load message schedule
+    // Load message schedule via pointer arithmetic (no bounds checks).
     let mut i = 0;
+    let bp = block.as_ptr();
+    let wp = w.as_mut_ptr();
     while i < 16 {
-        w[i] = u32::from_be_bytes([
-            block[i * 4],
-            block[i * 4 + 1],
-            block[i * 4 + 2],
-            block[i * 4 + 3],
-        ]);
+        unsafe {
+            let off = i * 4;
+            let b0 = *bp.add(off) as u32;
+            let b1 = *bp.add(off + 1) as u32;
+            let b2 = *bp.add(off + 2) as u32;
+            let b3 = *bp.add(off + 3) as u32;
+            *wp.add(i) = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        }
         i += 1;
     }
 
-    // Extend
+    // Extend.
     while i < 64 {
-        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        unsafe {
+            let w15 = *wp.add(i - 15);
+            let w2  = *wp.add(i - 2);
+            let w16 = *wp.add(i - 16);
+            let w7  = *wp.add(i - 7);
+            let s0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
+            let s1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
+            *wp.add(i) = w16.wrapping_add(s0).wrapping_add(w7).wrapping_add(s1);
+        }
         i += 1;
     }
 
-    let mut a = state[0];
-    let mut b = state[1];
-    let mut c = state[2];
-    let mut d = state[3];
-    let mut e = state[4];
-    let mut f = state[5];
-    let mut g = state[6];
-    let mut h = state[7];
+    let sp = state.as_ptr();
+    let mut a = unsafe { *sp.add(0) };
+    let mut b = unsafe { *sp.add(1) };
+    let mut c = unsafe { *sp.add(2) };
+    let mut d = unsafe { *sp.add(3) };
+    let mut e = unsafe { *sp.add(4) };
+    let mut f = unsafe { *sp.add(5) };
+    let mut g = unsafe { *sp.add(6) };
+    let mut h = unsafe { *sp.add(7) };
 
+    let kp = k.as_ptr();
     i = 0;
     while i < 64 {
+        let ki = unsafe { *kp.add(i) };
+        let wi = unsafe { *wp.add(i) };
         let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
         let ch = (e & f) ^ ((!e) & g);
-        let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K256[i]).wrapping_add(w[i]);
+        let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(ki).wrapping_add(wi);
         let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
         let maj = (a & b) ^ (a & c) ^ (b & c);
         let temp2 = s0.wrapping_add(maj);
@@ -194,14 +243,17 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
         i += 1;
     }
 
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
-    state[5] = state[5].wrapping_add(f);
-    state[6] = state[6].wrapping_add(g);
-    state[7] = state[7].wrapping_add(h);
+    let smp = state.as_mut_ptr();
+    unsafe {
+        *smp.add(0) = (*smp.add(0)).wrapping_add(a);
+        *smp.add(1) = (*smp.add(1)).wrapping_add(b);
+        *smp.add(2) = (*smp.add(2)).wrapping_add(c);
+        *smp.add(3) = (*smp.add(3)).wrapping_add(d);
+        *smp.add(4) = (*smp.add(4)).wrapping_add(e);
+        *smp.add(5) = (*smp.add(5)).wrapping_add(f);
+        *smp.add(6) = (*smp.add(6)).wrapping_add(g);
+        *smp.add(7) = (*smp.add(7)).wrapping_add(h);
+    }
 }
 
 /// Compute SHA-256 hash of data in one shot.

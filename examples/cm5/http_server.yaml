@@ -1,0 +1,28 @@
+# HTTP Server (Pi 5 / CM5 bare-metal)
+#
+# Plain HTTP over RP1 GEM ethernet with DHCP.
+# 100us tick for responsive descriptor polling.
+#
+# Build:
+#   make firmware TARGET=cm5 && make modules TARGET=bcm2712
+#   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/cm5/http_server.yaml
+# Test:
+#   curl http://<DUT_IP>/
+target: cm5
+tick_us: 100
+
+platform:
+  net: {}
+
+modules:
+  - name: http
+    port: 80
+    routes:
+      - path: "/"
+        body: "<html><body><h1>Hello from Fluxor Pi 5!</h1></body></html>"
+
+wiring:
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in

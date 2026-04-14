@@ -116,13 +116,17 @@ impl TrafficKeys {
     }
 }
 
-/// Build a plaintext record header
+/// Build a plaintext record header. All stores are volatile so PIC aarch64
+/// cannot dead-store part of the header.
 pub fn build_record_header(content_type: u8, length: usize, out: &mut [u8; 5]) {
-    out[0] = content_type;
-    out[1] = LEGACY_VERSION[0];
-    out[2] = LEGACY_VERSION[1];
-    out[3] = (length >> 8) as u8;
-    out[4] = length as u8;
+    unsafe {
+        let p = out.as_mut_ptr();
+        core::ptr::write_volatile(p, content_type);
+        core::ptr::write_volatile(p.add(1), LEGACY_VERSION[0]);
+        core::ptr::write_volatile(p.add(2), LEGACY_VERSION[1]);
+        core::ptr::write_volatile(p.add(3), (length >> 8) as u8);
+        core::ptr::write_volatile(p.add(4), length as u8);
+    }
 }
 
 /// Build an encrypted record header (always type 0x17, version 0x0303)

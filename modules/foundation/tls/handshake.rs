@@ -169,6 +169,9 @@ pub fn build_client_hello(
 
 /// Build ServerHello message body.
 /// Returns length written to `out`.
+///
+/// Uses raw pointer writes throughout — array indexing generates
+/// bounds-check stubs that miscompile on PIC aarch64.
 pub fn build_server_hello(
     random: &[u8; 32],
     session_id: &[u8; 32],
@@ -176,52 +179,65 @@ pub fn build_server_hello(
     pub_key: &[u8; 65],
     out: &mut [u8],
 ) -> usize {
-    let mut pos = 0;
+    unsafe {
+        use core::ptr::write_volatile as wv;
+        let p = out.as_mut_ptr();
+        let mut pos: usize = 0;
 
-    out[pos] = HT_SERVER_HELLO; pos += 1;
-    let len_pos = pos; pos += 3;
+        wv(p.add(pos), HT_SERVER_HELLO); pos += 1;
+        let len_pos = pos; pos += 3;
 
-    // legacy_version
-    out[pos] = 0x03; out[pos + 1] = 0x03; pos += 2;
-    // random
-    unsafe { core::ptr::copy_nonoverlapping(random.as_ptr(), out.as_mut_ptr().add(pos), 32); }
-    pos += 32;
-    // session_id (echo back)
-    out[pos] = 32; pos += 1;
-    unsafe { core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32); }
-    pos += 32;
-    // cipher_suite
-    put_u16(out, pos, suite.id()); pos += 2;
-    // compression_method
-    out[pos] = 0; pos += 1;
+        // legacy_version
+        wv(p.add(pos), 0x03u8); wv(p.add(pos + 1), 0x03u8); pos += 2;
+        // random
+        core::ptr::copy_nonoverlapping(random.as_ptr(), p.add(pos), 32);
+        pos += 32;
+        // session_id (echo back)
+        wv(p.add(pos), 32u8); pos += 1;
+        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), 32);
+        pos += 32;
+        // cipher_suite
+        let sid = suite.id();
+        wv(p.add(pos), (sid >> 8) as u8); wv(p.add(pos + 1), sid as u8); pos += 2;
+        // compression_method
+        wv(p.add(pos), 0u8); pos += 1;
 
-    // Extensions
-    let ext_len_pos = pos; pos += 2;
-    let ext_start = pos;
+        // Extensions
+        let ext_len_pos = pos; pos += 2;
+        let ext_start = pos;
 
-    // supported_versions (TLS 1.3)
-    put_u16(out, pos, EXT_SUPPORTED_VERSIONS); pos += 2;
-    put_u16(out, pos, 2); pos += 2; // extension data length
-    put_u16(out, pos, TLS13_VERSION); pos += 2;
+        // supported_versions (TLS 1.3)
+        pu16(p, &mut pos, EXT_SUPPORTED_VERSIONS);
+        pu16(p, &mut pos, 2); // extension data length
+        pu16(p, &mut pos, TLS13_VERSION);
 
-    // key_share
-    put_u16(out, pos, EXT_KEY_SHARE); pos += 2;
-    // key_share data: group(2) + key_len(2) + key(65)
-    put_u16(out, pos, 2 + 2 + 65); pos += 2;
-    put_u16(out, pos, GROUP_SECP256R1); pos += 2;
-    put_u16(out, pos, 65); pos += 2;
-    unsafe { core::ptr::copy_nonoverlapping(pub_key.as_ptr(), out.as_mut_ptr().add(pos), 65); }
-    pos += 65;
+        // key_share
+        pu16(p, &mut pos, EXT_KEY_SHARE);
+        pu16(p, &mut pos, 2 + 2 + 65); // key_share data length
+        pu16(p, &mut pos, GROUP_SECP256R1);
+        pu16(p, &mut pos, 65); // key length
+        core::ptr::copy_nonoverlapping(pub_key.as_ptr(), p.add(pos), 65);
+        pos += 65;
 
-    let ext_len = pos - ext_start;
-    put_u16(out, ext_len_pos, ext_len as u16);
+        let ext_len = (pos - ext_start) as u16;
+        wv(p.add(ext_len_pos), (ext_len >> 8) as u8);
+        wv(p.add(ext_len_pos + 1), ext_len as u8);
 
-    let body_len = pos - len_pos - 3;
-    out[len_pos] = (body_len >> 16) as u8;
-    out[len_pos + 1] = (body_len >> 8) as u8;
-    out[len_pos + 2] = body_len as u8;
+        let body_len = pos - len_pos - 3;
+        wv(p.add(len_pos), (body_len >> 16) as u8);
+        wv(p.add(len_pos + 1), (body_len >> 8) as u8);
+        wv(p.add(len_pos + 2), body_len as u8);
 
-    pos
+        pos
+    }
+}
+
+/// Write a u16 big-endian at *p.add(pos), advance pos by 2.
+#[inline(never)]
+pub unsafe fn pu16(p: *mut u8, pos: &mut usize, val: u16) {
+    core::ptr::write_volatile(p.add(*pos), (val >> 8) as u8);
+    core::ptr::write_volatile(p.add(*pos + 1), val as u8);
+    *pos += 2;
 }
 
 /// SHA-256 hash of "HelloRetryRequest" — magic random for HRR
@@ -230,161 +246,201 @@ const HRR_RANDOM: [u8; 32] = [
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
-/// Build HelloRetryRequest (special ServerHello requesting P-256 key share)
+/// Build HelloRetryRequest (special ServerHello requesting P-256 key share).
+/// Uses raw pointer writes throughout for PIC aarch64 safety.
 pub fn build_hello_retry_request(
     session_id: &[u8; 32],
     suite: CipherSuite,
     out: &mut [u8],
 ) -> usize {
-    let mut pos = 0;
-    out[pos] = HT_SERVER_HELLO; pos += 1;
-    let len_pos = pos; pos += 3;
+    unsafe {
+        use core::ptr::write_volatile as wv;
+        let p = out.as_mut_ptr();
+        let mut pos: usize = 0;
 
-    // legacy_version
-    out[pos] = 0x03; out[pos + 1] = 0x03; pos += 2;
-    // HRR magic random
-    unsafe { core::ptr::copy_nonoverlapping(HRR_RANDOM.as_ptr(), out.as_mut_ptr().add(pos), 32); }
-    pos += 32;
-    // session_id (echo)
-    out[pos] = 32; pos += 1;
-    unsafe { core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32); }
-    pos += 32;
-    // cipher_suite
-    put_u16(out, pos, suite.id()); pos += 2;
-    // compression
-    out[pos] = 0; pos += 1;
+        // Use write_volatile for ALL stores to prevent dead-store elimination
+        // and ensure correct codegen on PIC aarch64
+        wv(p.add(pos), HT_SERVER_HELLO); pos += 1;
+        let len_pos = pos; pos += 3;
 
-    // Extensions
-    let ext_len_pos = pos; pos += 2;
-    let ext_start = pos;
+        // legacy_version
+        wv(p.add(pos), 0x03u8); wv(p.add(pos + 1), 0x03u8); pos += 2;
+        // HRR magic random — write each byte individually with write_volatile
+        // to prevent LLVM from using ADRP-based const loading (broken in PIC)
+        wv(p.add(pos), 0xCFu8); wv(p.add(pos+1), 0x21u8);
+        wv(p.add(pos+2), 0xADu8); wv(p.add(pos+3), 0x74u8);
+        wv(p.add(pos+4), 0xE5u8); wv(p.add(pos+5), 0x9Au8);
+        wv(p.add(pos+6), 0x61u8); wv(p.add(pos+7), 0x11u8);
+        wv(p.add(pos+8), 0xBEu8); wv(p.add(pos+9), 0x1Du8);
+        wv(p.add(pos+10), 0x8Cu8); wv(p.add(pos+11), 0x02u8);
+        wv(p.add(pos+12), 0x1Eu8); wv(p.add(pos+13), 0x65u8);
+        wv(p.add(pos+14), 0xB8u8); wv(p.add(pos+15), 0x91u8);
+        wv(p.add(pos+16), 0xC2u8); wv(p.add(pos+17), 0xA2u8);
+        wv(p.add(pos+18), 0x11u8); wv(p.add(pos+19), 0x16u8);
+        wv(p.add(pos+20), 0x7Au8); wv(p.add(pos+21), 0xBBu8);
+        wv(p.add(pos+22), 0x8Cu8); wv(p.add(pos+23), 0x5Eu8);
+        wv(p.add(pos+24), 0x07u8); wv(p.add(pos+25), 0x9Eu8);
+        wv(p.add(pos+26), 0x09u8); wv(p.add(pos+27), 0xE2u8);
+        wv(p.add(pos+28), 0xC8u8); wv(p.add(pos+29), 0xA8u8);
+        wv(p.add(pos+30), 0x33u8); wv(p.add(pos+31), 0x9Cu8);
+        pos += 32;
+        // session_id (echo)
+        wv(p.add(pos), 32u8); pos += 1;
+        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), 32);
+        pos += 32;
+        // cipher_suite
+        let sid = suite.id();
+        *p.add(pos) = (sid >> 8) as u8; *p.add(pos + 1) = sid as u8; pos += 2;
+        // compression
+        *p.add(pos) = 0; pos += 1;
 
-    // supported_versions (TLS 1.3)
-    put_u16(out, pos, EXT_SUPPORTED_VERSIONS); pos += 2;
-    put_u16(out, pos, 2); pos += 2;
-    put_u16(out, pos, TLS13_VERSION); pos += 2;
+        // Extensions
+        let ext_len_pos = pos; pos += 2;
+        let ext_start = pos;
 
-    // key_share: request P-256 (named_group only, no key_exchange)
-    put_u16(out, pos, EXT_KEY_SHARE); pos += 2;
-    put_u16(out, pos, 2); pos += 2; // extension data: just the group
-    put_u16(out, pos, GROUP_SECP256R1); pos += 2;
+        // supported_versions (TLS 1.3)
+        pu16(p, &mut pos, EXT_SUPPORTED_VERSIONS);
+        pu16(p, &mut pos, 2);
+        pu16(p, &mut pos, TLS13_VERSION);
 
-    let ext_len = pos - ext_start;
-    put_u16(out, ext_len_pos, ext_len as u16);
+        // key_share: request P-256 (named_group only, no key_exchange)
+        pu16(p, &mut pos, EXT_KEY_SHARE);
+        pu16(p, &mut pos, 2); // extension data: just the group
+        pu16(p, &mut pos, GROUP_SECP256R1);
 
-    let body_len = pos - len_pos - 3;
-    out[len_pos] = (body_len >> 16) as u8;
-    out[len_pos + 1] = (body_len >> 8) as u8;
-    out[len_pos + 2] = body_len as u8;
-    pos
+        let ext_len = (pos - ext_start) as u16;
+        *p.add(ext_len_pos) = (ext_len >> 8) as u8;
+        *p.add(ext_len_pos + 1) = ext_len as u8;
+
+        let body_len = pos - len_pos - 3;
+        *p.add(len_pos) = (body_len >> 16) as u8;
+        *p.add(len_pos + 1) = (body_len >> 8) as u8;
+        *p.add(len_pos + 2) = body_len as u8;
+        pos
+    }
 }
 
-/// Build CertificateRequest message (for mTLS)
+/// Build CertificateRequest message (for mTLS, raw pointer writes)
 pub fn build_certificate_request(out: &mut [u8]) -> usize {
-    let mut pos = 0;
-    out[pos] = HT_CERTIFICATE_REQUEST; pos += 1;
-    let len_pos = pos; pos += 3;
+    unsafe {
+        let p = out.as_mut_ptr();
+        let mut pos = 0;
+        *p.add(pos) = HT_CERTIFICATE_REQUEST; pos += 1;
+        let len_pos = pos; pos += 3;
 
-    // certificate_request_context (empty)
-    out[pos] = 0; pos += 1;
+        *p.add(pos) = 0; pos += 1; // empty context
 
-    // extensions: signature_algorithms
-    let ext_len_pos = pos; pos += 2;
-    let ext_start = pos;
-    // signature_algorithms extension
-    put_u16(out, pos, EXT_SIGNATURE_ALGORITHMS); pos += 2;
-    put_u16(out, pos, 4); pos += 2; // ext data len
-    put_u16(out, pos, 2); pos += 2; // list len
-    put_u16(out, pos, SIG_ECDSA_SECP256R1_SHA256); pos += 2;
+        let ext_len_pos = pos; pos += 2;
+        let ext_start = pos;
+        pu16(p, &mut pos, EXT_SIGNATURE_ALGORITHMS);
+        pu16(p, &mut pos, 4);
+        pu16(p, &mut pos, 2);
+        pu16(p, &mut pos, SIG_ECDSA_SECP256R1_SHA256);
 
-    let ext_len = pos - ext_start;
-    put_u16(out, ext_len_pos, ext_len as u16);
+        let ext_len = (pos - ext_start) as u16;
+        *p.add(ext_len_pos) = (ext_len >> 8) as u8;
+        *p.add(ext_len_pos + 1) = ext_len as u8;
 
-    let body_len = pos - len_pos - 3;
-    out[len_pos] = (body_len >> 16) as u8;
-    out[len_pos + 1] = (body_len >> 8) as u8;
-    out[len_pos + 2] = body_len as u8;
-    pos
+        let body_len = pos - len_pos - 3;
+        *p.add(len_pos) = (body_len >> 16) as u8;
+        *p.add(len_pos + 1) = (body_len >> 8) as u8;
+        *p.add(len_pos + 2) = body_len as u8;
+        pos
+    }
 }
 
 /// Build EncryptedExtensions (empty — no extensions needed)
 pub fn build_encrypted_extensions(out: &mut [u8]) -> usize {
-    out[0] = HT_ENCRYPTED_EXTENSIONS;
-    out[1] = 0; out[2] = 0; out[3] = 2; // length = 2
-    out[4] = 0; out[5] = 0; // extensions length = 0
+    unsafe {
+        let p = out.as_mut_ptr();
+        *p.add(0) = HT_ENCRYPTED_EXTENSIONS;
+        *p.add(1) = 0; *p.add(2) = 0; *p.add(3) = 2;
+        *p.add(4) = 0; *p.add(5) = 0;
+    }
     6
 }
 
-/// Build Certificate message with a single cert
+/// Build Certificate message with a single cert.
+/// Uses raw pointer writes — array indexing generates bounds-check panics
+/// that crash on PIC aarch64 (panic handler accesses .rodata via ADRP).
 pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> usize {
-    let mut pos = 0;
+    unsafe {
+        let p = out.as_mut_ptr();
+        let mut pos = 0;
 
-    out[pos] = HT_CERTIFICATE; pos += 1;
-    let len_pos = pos; pos += 3;
+        *p.add(pos) = HT_CERTIFICATE; pos += 1;
+        let len_pos = pos; pos += 3;
 
-    // certificate_request_context (empty)
-    out[pos] = 0; pos += 1;
+        // certificate_request_context (empty)
+        *p.add(pos) = 0; pos += 1;
 
-    // certificate_list length
-    let list_len = 3 + cert_der.len() + 2; // cert_data_len(3) + cert_data + extensions_len(2)
-    let list_len_pos = pos; pos += 3;
+        // certificate_list length
+        let list_len = 3 + cert_der.len() + 2;
+        let list_len_pos = pos; pos += 3;
 
-    // CertificateEntry
-    // cert_data length (3 bytes)
-    out[pos] = (cert_der.len() >> 16) as u8;
-    out[pos + 1] = (cert_der.len() >> 8) as u8;
-    out[pos + 2] = cert_der.len() as u8;
-    pos += 3;
-    // cert_data
-    unsafe { core::ptr::copy_nonoverlapping(cert_der.as_ptr(), out.as_mut_ptr().add(pos), cert_der.len()); }
-    pos += cert_der.len();
-    // extensions (empty)
-    out[pos] = 0; out[pos + 1] = 0; pos += 2;
+        // CertificateEntry: cert_data length (3 bytes)
+        *p.add(pos) = (cert_der.len() >> 16) as u8;
+        *p.add(pos + 1) = (cert_der.len() >> 8) as u8;
+        *p.add(pos + 2) = cert_der.len() as u8;
+        pos += 3;
+        // cert_data
+        core::ptr::copy_nonoverlapping(cert_der.as_ptr(), p.add(pos), cert_der.len());
+        pos += cert_der.len();
+        // extensions (empty)
+        *p.add(pos) = 0; *p.add(pos + 1) = 0; pos += 2;
 
-    // Fill lengths
-    out[list_len_pos] = (list_len >> 16) as u8;
-    out[list_len_pos + 1] = (list_len >> 8) as u8;
-    out[list_len_pos + 2] = list_len as u8;
+        // Fill lengths
+        *p.add(list_len_pos) = (list_len >> 16) as u8;
+        *p.add(list_len_pos + 1) = (list_len >> 8) as u8;
+        *p.add(list_len_pos + 2) = list_len as u8;
 
-    let body_len = pos - len_pos - 3;
-    out[len_pos] = (body_len >> 16) as u8;
-    out[len_pos + 1] = (body_len >> 8) as u8;
-    out[len_pos + 2] = body_len as u8;
+        let body_len = pos - len_pos - 3;
+        *p.add(len_pos) = (body_len >> 16) as u8;
+        *p.add(len_pos + 1) = (body_len >> 8) as u8;
+        *p.add(len_pos + 2) = body_len as u8;
 
-    pos
+        pos
+    }
 }
 
-/// Build CertificateVerify message
+/// Build CertificateVerify message (raw pointer writes for PIC safety)
 pub fn build_certificate_verify(
     signature_der: &[u8],
     sig_len: usize,
     out: &mut [u8],
 ) -> usize {
-    let mut pos = 0;
+    unsafe {
+        let p = out.as_mut_ptr();
+        let mut pos = 0;
 
-    out[pos] = HT_CERTIFICATE_VERIFY; pos += 1;
-    let body_len = 2 + 2 + sig_len; // sig_algorithm(2) + sig_len(2) + sig
-    out[pos] = (body_len >> 16) as u8;
-    out[pos + 1] = (body_len >> 8) as u8;
-    out[pos + 2] = body_len as u8;
-    pos += 3;
+        *p.add(pos) = HT_CERTIFICATE_VERIFY; pos += 1;
+        let body_len = 2 + 2 + sig_len;
+        *p.add(pos) = (body_len >> 16) as u8;
+        *p.add(pos + 1) = (body_len >> 8) as u8;
+        *p.add(pos + 2) = body_len as u8;
+        pos += 3;
 
-    // SignatureScheme
-    put_u16(out, pos, SIG_ECDSA_SECP256R1_SHA256); pos += 2;
-    // Signature
-    put_u16(out, pos, sig_len as u16); pos += 2;
-    unsafe { core::ptr::copy_nonoverlapping(signature_der.as_ptr(), out.as_mut_ptr().add(pos), sig_len); }
-    pos += sig_len;
+        // SignatureScheme
+        pu16(p, &mut pos, SIG_ECDSA_SECP256R1_SHA256);
+        // Signature
+        pu16(p, &mut pos, sig_len as u16);
+        core::ptr::copy_nonoverlapping(signature_der.as_ptr(), p.add(pos), sig_len);
+        pos += sig_len;
 
-    pos
+        pos
+    }
 }
 
-/// Build Finished message
+/// Build Finished message (raw pointer writes for PIC safety)
 pub fn build_finished(verify_data: &[u8], hash_len: usize, out: &mut [u8]) -> usize {
-    out[0] = HT_FINISHED;
-    out[1] = (hash_len >> 16) as u8;
-    out[2] = (hash_len >> 8) as u8;
-    out[3] = hash_len as u8;
-    unsafe { core::ptr::copy_nonoverlapping(verify_data.as_ptr(), out.as_mut_ptr().add(4), hash_len); }
+    unsafe {
+        let p = out.as_mut_ptr();
+        *p.add(0) = HT_FINISHED;
+        *p.add(1) = (hash_len >> 16) as u8;
+        *p.add(2) = (hash_len >> 8) as u8;
+        *p.add(3) = hash_len as u8;
+        core::ptr::copy_nonoverlapping(verify_data.as_ptr(), p.add(4), hash_len);
+    }
     4 + hash_len
 }
 
@@ -402,86 +458,92 @@ pub struct ClientHello<'a> {
 }
 
 /// Parse ClientHello from handshake message body (after type+length)
+/// Parse ClientHello handshake message body.
+///
+/// Uses raw pointer reads to avoid array-indexing bounds checks that
+/// miscompile on PIC aarch64.
 pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
     if data.len() < 38 { return None; }
-    let mut pos = 0;
+    let dlen = data.len();
+    let dp = data.as_ptr();
+    let mut pos: usize = 0;
 
-    // legacy_version (skip)
-    pos += 2;
-    // random
-    let random = &data[pos..pos + 32]; pos += 32;
-    // session_id
-    let sid_len = data[pos] as usize; pos += 1;
-    if pos + sid_len > data.len() { return None; }
-    let session_id = &data[pos..pos + sid_len]; pos += sid_len;
-    // cipher_suites
-    if pos + 2 > data.len() { return None; }
-    let cs_len = get_u16(data, pos) as usize; pos += 2;
-    if pos + cs_len > data.len() { return None; }
-    let cipher_suites = &data[pos..pos + cs_len]; pos += cs_len;
-    // compression_methods (skip)
-    if pos >= data.len() { return None; }
-    let comp_len = data[pos] as usize; pos += 1;
-    pos += comp_len;
+    unsafe {
+        // legacy_version (skip)
+        pos += 2;
+        // random
+        let random = core::slice::from_raw_parts(dp.add(pos), 32); pos += 32;
+        // session_id
+        let sid_len = *dp.add(pos) as usize; pos += 1;
+        if pos + sid_len > dlen { return None; }
+        let session_id = core::slice::from_raw_parts(dp.add(pos), sid_len); pos += sid_len;
+        // cipher_suites
+        if pos + 2 > dlen { return None; }
+        let cs_len = get_u16(data, pos) as usize; pos += 2;
+        if pos + cs_len > dlen { return None; }
+        let cipher_suites = core::slice::from_raw_parts(dp.add(pos), cs_len); pos += cs_len;
+        // compression_methods (skip)
+        if pos >= dlen { return None; }
+        let comp_len = *dp.add(pos) as usize; pos += 1;
+        pos += comp_len;
 
-    // Extensions
-    let mut key_share: Option<(u16, &[u8])> = None;
-    let mut supported_versions: Option<u16> = None;
+        // Extensions
+        let mut key_share: Option<(u16, &[u8])> = None;
+        let mut supported_versions: Option<u16> = None;
 
-    if pos + 2 <= data.len() {
-        let ext_len = get_u16(data, pos) as usize; pos += 2;
-        let ext_end = pos + ext_len;
-        while pos + 4 <= ext_end {
-            let ext_type = get_u16(data, pos); pos += 2;
-            let ext_data_len = get_u16(data, pos) as usize; pos += 2;
-            if pos + ext_data_len > ext_end { break; }
-            let ext_data = &data[pos..pos + ext_data_len];
+        if pos + 2 <= dlen {
+            let ext_len = get_u16(data, pos) as usize; pos += 2;
+            let ext_end = pos + ext_len;
+            while pos + 4 <= ext_end {
+                let ext_type = get_u16(data, pos); pos += 2;
+                let ext_data_len = get_u16(data, pos) as usize; pos += 2;
+                if pos + ext_data_len > ext_end { break; }
+                let ext_data = core::slice::from_raw_parts(dp.add(pos), ext_data_len);
 
-            match ext_type {
-                EXT_SUPPORTED_VERSIONS => {
-                    // List of supported versions
-                    if ext_data.len() >= 3 {
-                        let list_len = ext_data[0] as usize;
-                        let mut vpos = 1;
-                        while vpos + 1 < 1 + list_len && vpos + 1 < ext_data.len() {
-                            let v = get_u16(ext_data, vpos);
-                            if v == TLS13_VERSION {
-                                supported_versions = Some(v);
+                match ext_type {
+                    EXT_SUPPORTED_VERSIONS => {
+                        if ext_data_len >= 3 {
+                            let list_len = *dp.add(pos) as usize;
+                            let mut vpos = 1usize;
+                            while vpos + 1 < 1 + list_len && vpos + 1 < ext_data_len {
+                                let v = get_u16(ext_data, vpos);
+                                if v == TLS13_VERSION {
+                                    supported_versions = Some(v);
+                                }
+                                vpos += 2;
                             }
-                            vpos += 2;
                         }
                     }
-                }
-                EXT_KEY_SHARE => {
-                    // ClientHello key_share: client_shares_length(2) + entries
-                    if ext_data.len() >= 4 {
-                        let shares_len = get_u16(ext_data, 0) as usize;
-                        let mut spos = 2;
-                        let send = 2 + shares_len;
-                        while spos + 4 <= send && spos + 4 <= ext_data.len() {
-                            let group = get_u16(ext_data, spos); spos += 2;
-                            let klen = get_u16(ext_data, spos) as usize; spos += 2;
-                            if spos + klen > ext_data.len() { break; }
-                            if group == GROUP_SECP256R1 {
-                                key_share = Some((group, &ext_data[spos..spos + klen]));
+                    EXT_KEY_SHARE => {
+                        if ext_data_len >= 4 {
+                            let shares_len = get_u16(ext_data, 0) as usize;
+                            let mut spos = 2usize;
+                            let send = 2 + shares_len;
+                            while spos + 4 <= send && spos + 4 <= ext_data_len {
+                                let group = get_u16(ext_data, spos); spos += 2;
+                                let klen = get_u16(ext_data, spos) as usize; spos += 2;
+                                if spos + klen > ext_data_len { break; }
+                                if group == GROUP_SECP256R1 {
+                                    key_share = Some((group, core::slice::from_raw_parts(ext_data.as_ptr().add(spos), klen)));
+                                }
+                                spos += klen;
                             }
-                            spos += klen;
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
+                pos += ext_data_len;
             }
-            pos += ext_data_len;
         }
-    }
 
-    Some(ClientHello {
-        random,
-        session_id,
-        cipher_suites,
-        key_share,
-        supported_versions,
-    })
+        Some(ClientHello {
+            random,
+            session_id,
+            cipher_suites,
+            key_share,
+            supported_versions,
+        })
+    }
 }
 
 /// Parsed ServerHello
@@ -549,19 +611,18 @@ pub fn parse_server_hello(data: &[u8]) -> Option<ServerHello<'_>> {
     })
 }
 
-/// Select best cipher suite from client's list
+/// Select best cipher suite from client's list.
+/// Currently restricted to ChaCha20-Poly1305 only — AES-GCM requires SBOX
+/// lookup tables in .rodata which miscompile on PIC aarch64.
 pub fn select_cipher_suite(client_suites: &[u8]) -> Option<CipherSuite> {
-    // Server preference: ChaCha20 > AES-128-GCM > AES-256-GCM
-    let prefs = [0x1303u16, 0x1301, 0x1302];
-    for pref in &prefs {
-        let mut i = 0;
-        while i + 1 < client_suites.len() {
-            let cs = get_u16(client_suites, i);
-            if cs == *pref {
-                return CipherSuite::from_id(cs);
-            }
-            i += 2;
+    // Only ChaCha20-Poly1305 is PIC-safe (no lookup tables, no .rodata consts)
+    let mut i = 0;
+    while i + 1 < client_suites.len() {
+        let cs = get_u16(client_suites, i);
+        if cs == 0x1303 {
+            return Some(CipherSuite::ChaCha20Poly1305);
         }
+        i += 2;
     }
     None
 }
@@ -649,13 +710,21 @@ fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
 
 #[inline(always)]
 fn put_u16(buf: &mut [u8], pos: usize, val: u16) {
-    buf[pos] = (val >> 8) as u8;
-    buf[pos + 1] = val as u8;
+    // Use raw pointer writes — array indexing miscompiles on PIC aarch64
+    unsafe {
+        let p = buf.as_mut_ptr();
+        *p.add(pos) = (val >> 8) as u8;
+        *p.add(pos + 1) = val as u8;
+    }
 }
 
 #[inline(always)]
 fn get_u16(buf: &[u8], pos: usize) -> u16 {
-    ((buf[pos] as u16) << 8) | (buf[pos + 1] as u16)
+    // Use raw pointer reads — array indexing miscompiles on PIC aarch64
+    unsafe {
+        let p = buf.as_ptr();
+        ((*p.add(pos) as u16) << 8) | (*p.add(pos + 1) as u16)
+    }
 }
 
 #[inline(always)]

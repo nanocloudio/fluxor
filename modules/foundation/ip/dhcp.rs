@@ -65,13 +65,21 @@ pub struct DhcpClient {
     pub timer: u32,
     /// Retry count
     pub retries: u8,
+    /// Expected DHCP server IP (0 = accept any)
+    pub expected_server: u32,
+    /// Lease tracking: step_count when ACK received
+    pub lease_start: u32,
+    /// Lease duration in step ticks (converted from seconds)
+    pub lease_duration: u32,
+    /// Whether renewal REQUEST has been sent
+    pub renew_sent: bool,
 }
 
 impl DhcpClient {
     pub const fn new() -> Self {
         Self {
             state: DhcpState::Idle,
-            xid: 0, // Set once on first discover from step_count
+            xid: 0,
             offered_ip: 0,
             server_ip: 0,
             subnet_mask: 0,
@@ -80,8 +88,45 @@ impl DhcpClient {
             lease_time: 0,
             timer: 0,
             retries: 0,
+            expected_server: 0,
+            lease_start: 0,
+            lease_duration: 0,
+            renew_sent: false,
         }
     }
+}
+
+/// Validate DHCP configuration for internal consistency.
+/// Returns true if the configuration is sane.
+pub fn validate_dhcp_config(
+    offered_ip: u32,
+    subnet_mask: u32,
+    gateway: u32,
+    lease_time: u32,
+) -> bool {
+    // Subnet mask must be contiguous (no holes)
+    let inverted = !subnet_mask;
+    if inverted & (inverted.wrapping_add(1)) != 0 {
+        return false; // non-contiguous mask
+    }
+
+    // Gateway must be on the same subnet
+    if gateway != 0 && (gateway & subnet_mask) != (offered_ip & subnet_mask) {
+        return false;
+    }
+
+    // Offered IP must not be network or broadcast address
+    let host_bits = offered_ip & !subnet_mask;
+    if host_bits == 0 || host_bits == !subnet_mask {
+        return false;
+    }
+
+    // Lease time must be reasonable (> 60s, < 30 days)
+    if lease_time > 0 && (lease_time < 60 || lease_time > 2_592_000) {
+        return false;
+    }
+
+    true
 }
 
 /// Build a DHCP DISCOVER or REQUEST message.

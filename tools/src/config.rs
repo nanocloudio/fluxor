@@ -1301,10 +1301,6 @@ fn parse_modules_map(modules: &Value, data_section: Option<&Value>, config: &Val
 /// Resolves module type aliases (e.g., `name: btn_melody, type: button` loads
 /// `modules/button/manifest.toml` and stores it under key `btn_melody`).
 /// Manifests live in the source `modules/` directory, not `target/modules/`.
-fn load_module_manifests(modules_config: &Value) -> HashMap<String, Manifest> {
-    load_module_manifests_with_extra(modules_config, &[])
-}
-
 /// Load manifests from both the standard fluxor module directories and
 /// any additional search paths (e.g., relative to the config file).
 pub fn load_module_manifests_with_extra(modules_config: &Value, extra_dirs: &[&std::path::Path]) -> HashMap<String, Manifest> {
@@ -1755,10 +1751,6 @@ pub struct ModuleCaps {
     /// Uses buffer_acquire_inplace to modify buffer (header flags bit 1)
     pub in_place_writer: bool,
     pub manifest: crate::manifest::Manifest,
-}
-
-pub fn generate_config(config: &Value, _template: &ConfigBuilder, modules_dir: &Path, max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
-    generate_config_ext(config, _template, &[], modules_dir, &[], max_gpio, pio_count)
 }
 
 /// Generate config with extra module search directories (for external projects).

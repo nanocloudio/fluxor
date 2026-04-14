@@ -114,6 +114,12 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
             unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), out.as_mut_ptr(), n); }
         }
     }
+
+    // Zeroise key material and intermediate state.
+    zeroize(&mut k_pad);
+    zeroize(&mut ipad[..block_len]);
+    zeroize(&mut opad[..block_len]);
+    zeroize(&mut inner_hash);
 }
 
 /// HKDF-Extract: PRK = HMAC-Hash(salt, IKM)

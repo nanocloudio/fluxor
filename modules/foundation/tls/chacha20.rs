@@ -344,7 +344,10 @@ pub fn chacha20_poly1305_encrypt(
     }
     mac.update(&lens);
 
-    mac.finalize()
+    let tag = mac.finalize();
+    // Zeroise Poly1305 one-time key.
+    zeroize(&mut poly_key);
+    tag
 }
 
 /// Decrypt in-place. Returns true if tag is valid, false otherwise.
@@ -391,6 +394,9 @@ pub fn chacha20_poly1305_decrypt(
     if diff != 0 {
         return false;
     }
+
+    // Zeroise Poly1305 one-time key.
+    zeroize(&mut poly_key);
 
     // Decrypt
     chacha20_xor(key, 1, nonce, data);

@@ -1363,6 +1363,13 @@ pub extern "C" fn main() -> ! {
     let mut mod_out: [i32; MAX_MODULES] = [-1; MAX_MODULES];
     let mut mod_ctrl: [i32; MAX_MODULES] = [-1; MAX_MODULES];
 
+    // Remember the channel opened for each edge so the per-module port
+    // registrations can be re-applied immediately before start_new. A later
+    // provider registration or allocation can otherwise disturb the port
+    // table before the module sees it.
+    const MAX_EDGE_CHANNELS: usize = 16;
+    let mut edge_channels: [i32; MAX_EDGE_CHANNELS] = [-1; MAX_EDGE_CHANNELS];
+
     // Track which edges are cross-domain so we can set up CrossDomainChannels.
     // For cross-domain edges, we still create local pipe channels on each side,
     // and the domain loop pumps data between the cross-domain ring buffer and
@@ -1392,14 +1399,15 @@ pub extern "C" fn main() -> ! {
 
                 if out_ch >= 0 && in_ch >= 0 {
                     // Track in per-module arrays for module instantiation.
-                    // First cross-domain out/in for a module sets the module's primary handle.
-                    if from < MAX_MODULES && mod_out[from] < 0 {
+                    // Only port_index==0 sets the module's primary handle (passed to start_new).
+                    // Secondary ports are accessible via dev_channel_port() syscall.
+                    if from < MAX_MODULES && edge.from_port_index == 0 && mod_out[from] < 0 {
                         mod_out[from] = out_ch;
                     }
                     if to < MAX_MODULES {
-                        if edge.to_port == 0 && mod_in[to] < 0 {
+                        if edge.to_port == 0 && edge.to_port_index == 0 && mod_in[to] < 0 {
                             mod_in[to] = in_ch;
-                        } else if edge.to_port == 1 && mod_ctrl[to] < 0 {
+                        } else if edge.to_port == 1 && edge.to_port_index == 0 && mod_ctrl[to] < 0 {
                             mod_ctrl[to] = in_ch;
                         }
                     }
@@ -1434,13 +1442,13 @@ pub extern "C" fn main() -> ! {
                 // Same-domain edge: single shared channel
                 let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
                 if ch >= 0 {
-                    if from < MAX_MODULES && mod_out[from] < 0 {
+                    if from < MAX_MODULES && edge.from_port_index == 0 && mod_out[from] < 0 {
                         mod_out[from] = ch;
                     }
                     if to < MAX_MODULES {
-                        if edge.to_port == 0 && mod_in[to] < 0 {
+                        if edge.to_port == 0 && edge.to_port_index == 0 && mod_in[to] < 0 {
                             mod_in[to] = ch;
-                        } else if edge.to_port == 1 && mod_ctrl[to] < 0 {
+                        } else if edge.to_port == 1 && edge.to_port_index == 0 && mod_ctrl[to] < 0 {
                             mod_ctrl[to] = ch;
                         }
                     }
@@ -1448,6 +1456,7 @@ pub extern "C" fn main() -> ! {
                     scheduler::set_module_port(from, 1, edge.from_port_index, ch); // out port
                     let to_port_type = if edge.to_port == 1 { 2u8 } else { 0u8 }; // ctrl=2, in=0
                     scheduler::set_module_port(to, to_port_type, edge.to_port_index, ch);
+                    if e < MAX_EDGE_CHANNELS { edge_channels[e] = ch; }
                 }
             }
         }
@@ -1497,6 +1506,29 @@ pub extern "C" fn main() -> ! {
                     5 => 3, 3 => 1, 4 => 2, _ => 0,
                 };
                 scheduler::set_module_caps(i, cap_class, m.header.required_caps() as u32);
+
+                // Re-apply port registrations for this module from the stored edge
+                // channel table. This keeps SCHED.ports consistent if earlier
+                // instantiation (or provider registration) has perturbed it.
+                {
+                    let mut ee = 0usize;
+                    while ee < n_edges && ee < MAX_EDGE_CHANNELS {
+                        if edge_channels[ee] >= 0 {
+                            if let Some(ref edge) = cfg.graph_edges[ee] {
+                                let from = edge.from_id as usize;
+                                let to = edge.to_id as usize;
+                                if from == i {
+                                    scheduler::set_module_port(i, 1, edge.from_port_index, edge_channels[ee]);
+                                }
+                                if to == i {
+                                    let tp = if edge.to_port == 1 { 2u8 } else { 0u8 };
+                                    scheduler::set_module_port(i, tp, edge.to_port_index, edge_channels[ee]);
+                                }
+                            }
+                        }
+                        ee += 1;
+                    }
+                }
 
                 let result = unsafe {
                     loader::DynamicModule::start_new(
@@ -2298,9 +2330,10 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     irq_bind: irq_bind,
 };
 
-// iproc-rng200 registers (BCM2712 / Pi 5)
+// iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000
+// with ranges <0x0 0x10_0000_0000 0x8000_0000>.
 #[cfg(feature = "board-cm5")]
-const RNG200_BASE: usize = 0xFE10_4000;
+const RNG200_BASE: usize = 0x10_7d20_8000;
 #[cfg(feature = "board-cm5")]
 const RNG200_CTRL: *mut u32 = (RNG200_BASE + 0x00) as *mut u32;
 #[cfg(feature = "board-cm5")]
@@ -2313,8 +2346,10 @@ const RNG200_COUNT: *const u32 = (RNG200_BASE + 0x0C) as *const u32;
 
 /// Fill buffer with hardware random bytes.
 ///
-/// Pi 5 (board-cm5): Uses iproc-rng200 hardware TRNG at 0xFE104000.
+/// Pi 5 (board-cm5): Uses iproc-rng200 hardware TRNG at 0x10_7d20_8000.
 /// QEMU virt: Uses CNTPCT_EL0 counter jitter with LCG mixing (weak).
+///
+/// Returns len on success, -1 if the hardware failed to produce entropy.
 fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     unsafe {
         #[cfg(feature = "board-cm5")]
@@ -2325,8 +2360,12 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
                 core::ptr::write_volatile(RNG200_CTRL, ctrl | 1);
                 // Wait for initial seed
                 let mut wait = 0u32;
-                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 100_000 {
+                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 1_000_000 {
                     wait += 1;
+                }
+                if core::ptr::read_volatile(RNG200_COUNT) == 0 {
+                    uart_puts(b"[rng200] FATAL: no entropy after enable\r\n");
+                    return -1;
                 }
             }
 
@@ -2334,8 +2373,12 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
             while i < len {
                 // Wait for data available
                 let mut wait = 0u32;
-                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 100_000 {
+                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 1_000_000 {
                     wait += 1;
+                }
+                if core::ptr::read_volatile(RNG200_COUNT) == 0 {
+                    uart_puts(b"[rng200] FATAL: entropy timeout\r\n");
+                    return -1;
                 }
                 let word = core::ptr::read_volatile(RNG200_DATA);
                 let bytes = word.to_le_bytes();

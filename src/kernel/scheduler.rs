@@ -885,6 +885,8 @@ pub struct SchedulerState {
     // ── Per-module export table info (for resolve_export_for_module) ──
     /// Code base address per module (for resolving export offsets)
     module_code_base: [usize; MAX_MODULES],
+    /// Code size per module (for provider pointer validation)
+    module_code_size: [u32; MAX_MODULES],
     /// Export table pointer per module
     module_export_table: [*const u8; MAX_MODULES],
     /// Export count per module
@@ -930,6 +932,7 @@ impl SchedulerState {
             drain_inflight: [0; MAX_MODULES],
             active_module_count: 0,
             module_code_base: [0; MAX_MODULES],
+            module_code_size: [0; MAX_MODULES],
             module_export_table: [core::ptr::null(); MAX_MODULES],
             module_export_count: [0; MAX_MODULES],
         }
@@ -960,6 +963,7 @@ impl SchedulerState {
             self.downstream_latency[i] = 0;
             self.fault_info[i] = ModuleFaultInfo::new();
             self.module_code_base[i] = 0;
+            self.module_code_size[i] = 0;
             self.module_export_table[i] = core::ptr::null();
             self.module_export_count[i] = 0;
         }
@@ -1094,6 +1098,16 @@ pub fn set_module_exports(idx: usize, code_base: usize, export_table: *const u8,
         SCHED.module_code_base[idx] = code_base;
         SCHED.module_export_table[idx] = export_table;
         SCHED.module_export_count[idx] = export_count;
+    }
+}
+
+/// Get the code region (base, size) for a module, used for provider pointer validation.
+pub fn module_code_region(idx: usize) -> (usize, u32) {
+    if idx >= MAX_MODULES {
+        return (0, 0);
+    }
+    unsafe {
+        (SCHED.module_code_base[idx], SCHED.module_code_size[idx])
     }
 }
 
@@ -1838,6 +1852,7 @@ pub fn instantiate_one_module(
         sched.required_caps[instantiated] = found_module.header.required_caps() as u32;
         // Store export table info for resolve_export_for_module
         sched.module_code_base[instantiated] = found_module.code_base() as usize;
+        sched.module_code_size[instantiated] = found_module.header.code_size;
         sched.module_export_table[instantiated] = found_module.export_table_ptr();
         sched.module_export_count[instantiated] = found_module.header.export_count;
         let flags_byte = found_module.header.reserved[0];

@@ -467,7 +467,9 @@ unsafe fn reset_connection(s: &mut HttpState) {
         payload[0] = s.srv_conn_id;
         net_write_frame(sys, chan, NET_CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
     }
-    s.srv_phase = ServerPhase::WaitAccept;
+    // Re-bind: the IP module resets the listener slot to Closed when a
+    // connection completes, so we must send a fresh CMD_BIND to re-listen.
+    s.srv_phase = ServerPhase::Binding;
 }
 
 unsafe fn parse_request_line(s: &mut HttpState) -> i32 {

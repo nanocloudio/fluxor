@@ -193,11 +193,13 @@ pub unsafe fn find_listener(
     None
 }
 
-/// Build a TCP segment (header only, no payload) at `dst`.
-/// Returns header length.
+/// Build a TCP header at `dst`. Does NOT compute checksum — caller must
+/// call `compute_tcp_checksum` after the full segment (header + payload)
+/// is assembled in the frame buffer.
 ///
 /// # Safety
 /// `dst` must point to at least 20 writable bytes.
+#[inline(never)]
 pub unsafe fn build_tcp_header(
     dst: *mut u8,
     src_port: u16,
@@ -206,103 +208,73 @@ pub unsafe fn build_tcp_header(
     ack_num: u32,
     flags: u8,
     window: u16,
-    src_ip: u32,
-    dst_ip: u32,
-    payload_len: usize,
 ) -> usize {
-    // Source port
-    *dst = (src_port >> 8) as u8;
-    *dst.add(1) = (src_port & 0xFF) as u8;
-    // Destination port
-    *dst.add(2) = (dst_port >> 8) as u8;
-    *dst.add(3) = (dst_port & 0xFF) as u8;
-    // Sequence number
+    use core::ptr::write_volatile as wv;
+    wv(dst, (src_port >> 8) as u8);
+    wv(dst.add(1), (src_port & 0xFF) as u8);
+    wv(dst.add(2), (dst_port >> 8) as u8);
+    wv(dst.add(3), (dst_port & 0xFF) as u8);
     let seq = seq_num.to_be_bytes();
-    *dst.add(4) = seq[0];
-    *dst.add(5) = seq[1];
-    *dst.add(6) = seq[2];
-    *dst.add(7) = seq[3];
-    // Ack number
+    wv(dst.add(4), seq[0]);
+    wv(dst.add(5), seq[1]);
+    wv(dst.add(6), seq[2]);
+    wv(dst.add(7), seq[3]);
     let ack = ack_num.to_be_bytes();
-    *dst.add(8) = ack[0];
-    *dst.add(9) = ack[1];
-    *dst.add(10) = ack[2];
-    *dst.add(11) = ack[3];
-    // Data offset (5 words = 20 bytes) + reserved
-    *dst.add(12) = 0x50;
-    // Flags
-    *dst.add(13) = flags;
-    // Window
-    *dst.add(14) = (window >> 8) as u8;
-    *dst.add(15) = (window & 0xFF) as u8;
-    // Checksum placeholder
-    *dst.add(16) = 0;
-    *dst.add(17) = 0;
-    // Urgent pointer
-    *dst.add(18) = 0;
-    *dst.add(19) = 0;
-
-    // Compute TCP checksum (pseudo-header + header + payload)
-    let tcp_len = (TCP_HEADER_LEN + payload_len) as u16;
-    let mut sum = ipv4::pseudo_header_sum(src_ip, dst_ip, ipv4::PROTO_TCP, tcp_len);
-
-    // Add TCP header words
-    let mut i = 0;
-    while i + 1 < TCP_HEADER_LEN {
-        sum += ((*dst.add(i) as u32) << 8) | (*dst.add(i + 1) as u32);
-        i += 2;
-    }
-
-    // Note: payload checksum must be added by caller if payload_len > 0
-    // For control segments (SYN/ACK/FIN/RST) there's no payload
-    if payload_len == 0 {
-        let cksum = ipv4::finalize_checksum(sum);
-        *dst.add(16) = (cksum >> 8) as u8;
-        *dst.add(17) = (cksum & 0xFF) as u8;
-    }
-    // If payload_len > 0, caller must finalize checksum after appending payload
+    wv(dst.add(8), ack[0]);
+    wv(dst.add(9), ack[1]);
+    wv(dst.add(10), ack[2]);
+    wv(dst.add(11), ack[3]);
+    wv(dst.add(12), 0x50u8);
+    wv(dst.add(13), flags);
+    wv(dst.add(14), (window >> 8) as u8);
+    wv(dst.add(15), (window & 0xFF) as u8);
+    wv(dst.add(16), 0u8);
+    wv(dst.add(17), 0u8);
+    wv(dst.add(18), 0u8);
+    wv(dst.add(19), 0u8);
 
     TCP_HEADER_LEN
 }
 
-/// Finalize TCP checksum after payload has been appended.
+/// Compute the TCP checksum over a complete segment (header + payload) that
+/// has already been assembled in the frame buffer. Every byte is loaded
+/// through a volatile read so LLVM cannot rewrite the loop as a NEON/TBL
+/// sequence backed by ADRP — which miscompiles in a PIC module.
 ///
 /// # Safety
-/// `tcp_start` must point to the start of the TCP header.
-/// `payload` must point to `payload_len` bytes after the header.
-pub unsafe fn finalize_tcp_checksum(
+/// `tcp_start` must point to at least `tcp_seg_len` valid bytes.
+#[inline(never)]
+pub unsafe fn compute_tcp_checksum(
     tcp_start: *mut u8,
-    tcp_header_len: usize,
-    payload: *const u8,
-    payload_len: usize,
+    tcp_seg_len: usize,
     src_ip: u32,
     dst_ip: u32,
 ) {
-    // Clear existing checksum
-    *tcp_start.add(16) = 0;
-    *tcp_start.add(17) = 0;
+    use core::ptr::{read_volatile as rv, write_volatile as wv};
 
-    let tcp_len = (tcp_header_len + payload_len) as u16;
-    let mut sum = ipv4::pseudo_header_sum(src_ip, dst_ip, ipv4::PROTO_TCP, tcp_len);
+    wv(tcp_start.add(16), 0u8);
+    wv(tcp_start.add(17), 0u8);
 
-    // Add TCP header
-    let mut i = 0;
-    while i + 1 < tcp_header_len {
-        sum += ((*tcp_start.add(i) as u32) << 8) | (*tcp_start.add(i + 1) as u32);
-        i += 2;
+    let mut sum: u32 = 0;
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += ipv4::PROTO_TCP as u32;
+    sum += tcp_seg_len as u32;
+
+    let mut i: usize = 0;
+    while i < tcp_seg_len {
+        let b = rv(tcp_start.add(i)) as u32;
+        if (i & 1) == 0 { sum += b << 8; } else { sum += b; }
+        i += 1;
     }
 
-    // Add payload
-    i = 0;
-    while i + 1 < payload_len {
-        sum += ((*payload.add(i) as u32) << 8) | (*payload.add(i + 1) as u32);
-        i += 2;
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    if i < payload_len {
-        sum += (*payload.add(i) as u32) << 8;
-    }
+    let cksum = !(sum as u16);
 
-    let cksum = ipv4::finalize_checksum(sum);
-    *tcp_start.add(16) = (cksum >> 8) as u8;
-    *tcp_start.add(17) = (cksum & 0xFF) as u8;
+    wv(tcp_start.add(16), (cksum >> 8) as u8);
+    wv(tcp_start.add(17), (cksum & 0xFF) as u8);
 }

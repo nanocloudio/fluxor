@@ -46,7 +46,10 @@ impl RingBufState {
         let cap = self.cap;
         if cap == 0 { return 0; }
         let avail = cap - self.len;
-        let total = data.len().min(avail);
+        // All-or-nothing: partial writes corrupt byte-stream framing
+        // (e.g. net_proto between NIC driver and IP module).
+        if data.len() > avail { return 0; }
+        let total = data.len();
         if total == 0 { return 0; }
 
         let first = total.min(cap - self.tail);
@@ -157,14 +160,14 @@ mod tests {
     }
 
     #[test]
-    fn write_clamps_to_available_space() {
+    fn write_rejects_when_larger_than_available_space() {
         let mut r = RingBufState::with_capacity(4);
         let mut storage = [0u8; 4];
 
         let written = r.write(&mut storage, &[1, 2, 3, 4, 5, 6]);
-        assert_eq!(written, 4);
-        assert_eq!(r.len(), 4);
-        assert!(!r.is_writable());
+        assert_eq!(written, 0);
+        assert_eq!(r.len(), 0);
+        assert!(r.is_writable());
     }
 
     #[test]

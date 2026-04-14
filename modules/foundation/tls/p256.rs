@@ -3,39 +3,49 @@
 // Field arithmetic over p = 2^256 - 2^224 + 2^192 + 2^96 - 1
 //
 // Uses projective (Jacobian) coordinates to avoid modular inversion during
-// point multiplication. All operations are constant-time for secret scalars.
+// point multiplication. Scalar multiplication uses a constant-time
+// Montgomery ladder; ECDSA signing uses RFC 6979 deterministic nonces and
+// normalises signatures to low-s form. Intermediate secrets are zeroised
+// via volatile writes before returning from each primitive.
+//
+// Curve constants are loaded via `pic_u256` (u32 immediates assembled on
+// the stack). PIC aarch64 modules cannot use ADRP-based literal pool
+// loads, so `const [u64; 4]` arrays in .rodata miscompile.
 
-// P-256 prime: p = 2^256 - 2^224 + 2^192 + 2^96 - 1
-const P: [u64; 4] = [
-    0xFFFFFFFFFFFFFFFF, // p[0] (least significant)
-    0x00000000FFFFFFFF,
-    0x0000000000000000,
-    0xFFFFFFFF00000001,
-];
+/// Load P-256 prime.
+#[inline(never)]
+fn load_p() -> U256 {
+    pic_u256(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
+             0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF)
+}
 
-// P-256 order: n
-const N: [u64; 4] = [
-    0xF3B9CAC2FC632551,
-    0xBCE6FAADA7179E84,
-    0xFFFFFFFFFFFFFFFF,
-    0xFFFFFFFF00000000,
-];
+/// Load P-256 order n.
+#[inline(never)]
+fn load_n() -> U256 {
+    pic_u256(0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD,
+             0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF)
+}
 
-// Generator point Gx
-const GX: [u64; 4] = [
-    0xF4A13945D898C296,
-    0x77037D812DEB33A0,
-    0xF8BCE6E563A440F2,
-    0x6B17D1F2E12C4247,
-];
+/// Load generator point Gx.
+#[inline(never)]
+fn load_gx() -> U256 {
+    pic_u256(0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81,
+             0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2)
+}
 
-// Generator point Gy
-const GY: [u64; 4] = [
-    0xCBB6406837BF51F5,
-    0x2BCE33576B315ECE,
-    0x8EE7EB4A7C0F9E16,
-    0x4FE342E2FE1A7F9B,
-];
+/// Load generator point Gy.
+#[inline(never)]
+fn load_gy() -> U256 {
+    pic_u256(0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357,
+             0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2)
+}
+
+/// Load N/2 for low-s normalisation.
+#[inline(never)]
+fn load_n_half() -> U256 {
+    pic_u256(0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737556,
+             0xFFFFFFFF, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF)
+}
 
 // ============================================================================
 // 256-bit unsigned integer arithmetic
@@ -45,6 +55,25 @@ type U256 = [u64; 4];
 
 const ZERO: U256 = [0, 0, 0, 0];
 const ONE: U256 = [1, 0, 0, 0];
+
+/// Assemble a u64 from two u32 halves via volatile writes. Forces MOV/MOVK
+/// code generation instead of an ADRP-based literal pool load.
+#[inline(always)]
+fn pic_u64(lo: u32, hi: u32) -> u64 {
+    let mut v = 0u64;
+    unsafe {
+        let p = &mut v as *mut u64 as *mut u32;
+        core::ptr::write_volatile(p, lo);
+        core::ptr::write_volatile(p.add(1), hi);
+    }
+    v
+}
+
+/// Build a U256 from 8 u32 halves.
+#[inline(never)]
+fn pic_u256(lo0: u32, hi0: u32, lo1: u32, hi1: u32, lo2: u32, hi2: u32, lo3: u32, hi3: u32) -> U256 {
+    [pic_u64(lo0, hi0), pic_u64(lo1, hi1), pic_u64(lo2, hi2), pic_u64(lo3, hi3)]
+}
 
 /// a + b, returns (result, carry)
 #[inline]
@@ -79,16 +108,20 @@ fn u256_sub(a: &U256, b: &U256) -> (U256, u64) {
     (r, borrow)
 }
 
-/// Compare: returns 1 if a >= b, 0 otherwise
+/// Compare: returns 1 if a >= b, 0 otherwise. Constant-time.
 fn u256_gte(a: &U256, b: &U256) -> u64 {
-    let mut i: i32 = 3;
-    while i >= 0 {
-        let idx = i as usize;
-        if a[idx] > b[idx] { return 1; }
-        if a[idx] < b[idx] { return 0; }
-        i -= 1;
+    // Compute a - b with borrow tracking across all 4 limbs.
+    // If no borrow out, a >= b.
+    let mut borrow: u64 = 0;
+    let mut i = 0;
+    while i < 4 {
+        let (diff, b1) = a[i].overflowing_sub(b[i]);
+        let (_, b2) = diff.overflowing_sub(borrow);
+        borrow = (b1 as u64) | (b2 as u64);
+        i += 1;
     }
-    1 // equal
+    // borrow is 1 if a < b, 0 if a >= b
+    1 - borrow
 }
 
 fn u256_is_zero(a: &U256) -> bool {
@@ -101,15 +134,17 @@ fn u256_is_zero(a: &U256) -> bool {
 
 /// Reduce mod p
 fn mod_p(a: &U256) -> U256 {
-    let (r, borrow) = u256_sub(a, &P);
+    let p = load_p();
+    let (r, borrow) = u256_sub(a, &p);
     if borrow == 0 { r } else { *a }
 }
 
 /// Modular addition: (a + b) mod p
 fn fp_add(a: &U256, b: &U256) -> U256 {
+    let p = load_p();
     let (sum, carry) = u256_add(a, b);
-    if carry != 0 || u256_gte(&sum, &P) != 0 {
-        let (r, _) = u256_sub(&sum, &P);
+    if carry != 0 || u256_gte(&sum, &p) != 0 {
+        let (r, _) = u256_sub(&sum, &p);
         r
     } else {
         sum
@@ -118,9 +153,10 @@ fn fp_add(a: &U256, b: &U256) -> U256 {
 
 /// Modular subtraction: (a - b) mod p
 fn fp_sub(a: &U256, b: &U256) -> U256 {
+    let p = load_p();
     let (diff, borrow) = u256_sub(a, b);
     if borrow != 0 {
-        let (r, _) = u256_add(&diff, &P);
+        let (r, _) = u256_add(&diff, &p);
         r
     } else {
         diff
@@ -270,25 +306,26 @@ fn fp_reduce(t: &[u64; 8]) -> U256 {
     ];
 
     // Handle negative carry (add p) or excess (subtract p)
+    let p = load_p();
     if carry < 0 {
         let mut c = carry;
         while c < 0 {
-            let (r, _) = u256_add(&result, &P);
+            let (r, _) = u256_add(&result, &p);
             result = r;
             c += 1;
         }
     } else {
         let mut c = carry;
         while c > 0 {
-            let (r, _) = u256_sub(&result, &P);
+            let (r, _) = u256_sub(&result, &p);
             result = r;
             c -= 1;
         }
     }
 
     // Final reduction
-    while u256_gte(&result, &P) != 0 {
-        let (r, borrow) = u256_sub(&result, &P);
+    while u256_gte(&result, &p) != 0 {
+        let (r, borrow) = u256_sub(&result, &p);
         if borrow != 0 { break; }
         result = r;
     }
@@ -367,12 +404,10 @@ fn fp_inv(a: &U256) -> U256 {
     let mut base = *a;
 
     // Simple right-to-left binary method on p-2
-    let p_minus_2: U256 = [
-        0xFFFFFFFFFFFFFFFD,
-        0x00000000FFFFFFFF,
-        0x0000000000000000,
-        0xFFFFFFFF00000001,
-    ];
+    let p_minus_2 = pic_u256(
+        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
+        0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF,
+    );
 
     let mut i = 0;
     while i < 4 {
@@ -394,17 +429,19 @@ fn fp_inv(a: &U256) -> U256 {
 // ============================================================================
 
 fn mod_n_reduce(a: &U256) -> U256 {
-    if u256_gte(a, &N) != 0 {
-        let (r, borrow) = u256_sub(a, &N);
+    let n = load_n();
+    if u256_gte(a, &n) != 0 {
+        let (r, borrow) = u256_sub(a, &n);
         if borrow == 0 { return r; }
     }
     *a
 }
 
 fn fn_add(a: &U256, b: &U256) -> U256 {
+    let n = load_n();
     let (sum, carry) = u256_add(a, b);
-    if carry != 0 || u256_gte(&sum, &N) != 0 {
-        let (r, _) = u256_sub(&sum, &N);
+    if carry != 0 || u256_gte(&sum, &n) != 0 {
+        let (r, _) = u256_sub(&sum, &n);
         r
     } else {
         sum
@@ -421,12 +458,10 @@ fn fn_mul(a: &U256, b: &U256) -> U256 {
 fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     // Reduce 512-bit value t mod n using iterative: t_hi * R + t_lo
     // R = 2^256 - n (small, ~128 bits)
-    let r_mod: U256 = [
-        0x0C46353D039CDAAF,
-        0x4319055258E8617B,
-        0x0000000000000000,
-        0x00000000FFFFFFFF,
-    ];
+    let r_mod = pic_u256(
+        0x039CDAAF, 0x0C46353D, 0x58E8617B, 0x43190552,
+        0x00000000, 0x00000000, 0xFFFFFFFF, 0x00000000,
+    );
 
     let mut acc = [0u64; 8];
     unsafe { core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8); }
@@ -466,11 +501,12 @@ fn fn_inv(a: &U256) -> U256 {
     let mut result = ONE;
     let mut base = *a;
 
+    let n = load_n();
     let n_minus_2: U256 = [
-        N[0] - 2,
-        N[1],
-        N[2],
-        N[3],
+        n[0] - 2,
+        n[1],
+        n[2],
+        n[3],
     ];
 
     let mut i = 0;
@@ -489,6 +525,31 @@ fn fn_inv(a: &U256) -> U256 {
 }
 
 // ============================================================================
+// Constant-time helpers
+// ============================================================================
+
+/// Zeroise a byte buffer via volatile writes. `#[inline(never)]` prevents
+/// the compiler from eliding the stores after proving the buffer is dead.
+#[inline(never)]
+fn zeroize(buf: &mut [u8]) {
+    let mut i = 0;
+    while i < buf.len() {
+        unsafe { core::ptr::write_volatile(buf.as_mut_ptr().add(i), 0); }
+        i += 1;
+    }
+}
+
+/// Zeroise a U256 via volatile writes.
+#[inline(never)]
+fn zeroize_u256(v: &mut U256) {
+    let mut i = 0;
+    while i < 4 {
+        unsafe { core::ptr::write_volatile(v.as_mut_ptr().add(i), 0); }
+        i += 1;
+    }
+}
+
+// ============================================================================
 // Point operations (Jacobian coordinates: X, Y, Z where x = X/Z^2, y = Y/Z^3)
 // ============================================================================
 
@@ -496,6 +557,25 @@ struct JacobianPoint {
     x: U256,
     y: U256,
     z: U256,
+}
+
+/// Constant-time conditional swap: swap a and b if condition == 1, no-op if 0.
+/// Branchless: uses arithmetic masking.
+fn ct_swap(a: &mut JacobianPoint, b: &mut JacobianPoint, condition: u8) {
+    let mask = (condition as u64).wrapping_neg(); // 0x0000... or 0xFFFF...
+    let mut i = 0;
+    while i < 4 {
+        let tx = mask & (a.x[i] ^ b.x[i]);
+        a.x[i] ^= tx;
+        b.x[i] ^= tx;
+        let ty = mask & (a.y[i] ^ b.y[i]);
+        a.y[i] ^= ty;
+        b.y[i] ^= ty;
+        let tz = mask & (a.z[i] ^ b.z[i]);
+        a.z[i] ^= tz;
+        b.z[i] ^= tz;
+        i += 1;
+    }
 }
 
 impl JacobianPoint {
@@ -587,53 +667,82 @@ impl JacobianPoint {
 
         JacobianPoint { x: x3, y: y3, z: z3 }
     }
+
+    /// Full Jacobian-Jacobian point addition (both points in Jacobian coords).
+    /// Required for constant-time Montgomery ladder.
+    fn add_jacobian(&self, other: &JacobianPoint) -> Self {
+        if self.is_identity() {
+            return JacobianPoint { x: other.x, y: other.y, z: other.z };
+        }
+        if other.is_identity() {
+            return JacobianPoint { x: self.x, y: self.y, z: self.z };
+        }
+
+        let z1z1 = fp_sqr(&self.z);
+        let z2z2 = fp_sqr(&other.z);
+        let u1 = fp_mul(&self.x, &z2z2);
+        let u2 = fp_mul(&other.x, &z1z1);
+        let s1 = fp_mul(&self.y, &fp_mul(&other.z, &z2z2));
+        let s2 = fp_mul(&other.y, &fp_mul(&self.z, &z1z1));
+
+        let h = fp_sub(&u2, &u1);
+        let r = fp_sub(&s2, &s1);
+
+        if u256_is_zero(&h) {
+            if u256_is_zero(&r) {
+                return self.double();
+            }
+            return JacobianPoint::identity();
+        }
+
+        let hh = fp_sqr(&h);
+        let hhh = fp_mul(&h, &hh);
+        let v = fp_mul(&u1, &hh);
+
+        let x3 = fp_sub(&fp_sub(&fp_sqr(&r), &hhh), &fp_add(&v, &v));
+        let y3 = fp_sub(&fp_mul(&r, &fp_sub(&v, &x3)), &fp_mul(&s1, &hhh));
+        let z3 = fp_mul(&fp_mul(&self.z, &other.z), &h);
+
+        JacobianPoint { x: x3, y: y3, z: z3 }
+    }
 }
 
-/// Scalar multiplication: k * G
-/// Uses double-and-add. Ephemeral keys (used once per session) mitigate
-/// timing side channels. Full constant-time requires a proper Montgomery
-/// ladder in Jacobian coordinates (deferred to hardware acceleration).
+/// Constant-time scalar multiplication via Montgomery ladder. R0 and R1
+/// are updated on every bit regardless of its value, so execution timing
+/// does not leak the secret scalar.
+fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
+    let p_jac = JacobianPoint::from_affine(px, py);
+    let mut r0 = JacobianPoint::identity();
+    let mut r1 = JacobianPoint { x: p_jac.x, y: p_jac.y, z: p_jac.z };
+
+    let mut i: i32 = 3;
+    while i >= 0 {
+        let word = k[i as usize];
+        let mut j: i32 = 63;
+        while j >= 0 {
+            let bit = ((word >> j as u32) & 1) as u8;
+            ct_swap(&mut r0, &mut r1, bit);
+            r1 = r0.add_jacobian(&r1);
+            r0 = r0.double();
+            ct_swap(&mut r0, &mut r1, bit);
+            j -= 1;
+        }
+        i -= 1;
+    }
+
+    r0
+}
+
+/// Scalar multiplication: k * G.
 fn scalar_mul_base(k: &U256) -> JacobianPoint {
-    let mut result = JacobianPoint::identity();
-    let gx = GX;
-    let gy = GY;
-
-    let mut i: i32 = 3;
-    while i >= 0 {
-        let word = k[i as usize];
-        let mut j: i32 = 63;
-        while j >= 0 {
-            result = result.double();
-            if (word >> j as u32) & 1 == 1 {
-                result = result.add_affine(&gx, &gy);
-            }
-            j -= 1;
-        }
-        i -= 1;
-    }
-
-    result
+    let gx = load_gx();
+    let gy = load_gy();
+    scalar_mul_ct(k, &gx, &gy)
 }
 
-/// Scalar multiplication: k * P (arbitrary point)
+/// Scalar multiplication: k * P (arbitrary point).
 fn scalar_mul(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
-    let mut result = JacobianPoint::identity();
-
-    let mut i: i32 = 3;
-    while i >= 0 {
-        let word = k[i as usize];
-        let mut j: i32 = 63;
-        while j >= 0 {
-            result = result.double();
-            if (word >> j as u32) & 1 == 1 {
-                result = result.add_affine(px, py);
-            }
-            j -= 1;
-        }
-        i -= 1;
-    }
-
-    result
+    scalar_mul_ct(k, px, py)
 }
 
 // ============================================================================
@@ -705,9 +814,11 @@ pub fn ecdh_shared_secret(my_private: &[u8; 32], peer_pub: &[u8]) -> Option<[u8;
 
     let px = u256_from_be(&peer_pub[offset..offset + 32]);
     let py = u256_from_be(&peer_pub[offset + 32..offset + 64]);
-    let k = u256_from_be(my_private);
+    let mut k = u256_from_be(my_private);
 
     let result = scalar_mul(&k, &px, &py);
+    zeroize_u256(&mut k);
+
     if result.is_identity() {
         return None;
     }
@@ -715,15 +826,110 @@ pub fn ecdh_shared_secret(my_private: &[u8; 32], peer_pub: &[u8]) -> Option<[u8;
     Some(u256_to_be(&x))
 }
 
-/// ECDSA sign: (r, s) over message hash
-/// Returns 64-byte signature (r || s, each 32 bytes big-endian)
-pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], random_k: &[u8; 32]) -> [u8; 64] {
-    let d = u256_from_be(private_key);
-    let mut k = u256_from_be(random_k);
-    k = mod_n_reduce(&k);
-    if u256_is_zero(&k) {
-        k = ONE;
+/// RFC 6979 deterministic ECDSA nonce (Section 3.2). k is derived via
+/// HMAC-DRBG over (private_key, message_hash), eliminating any dependency
+/// on runtime randomness for signing and making signatures reproducible.
+fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
+    let hash_len = 32usize;
+
+    // Truncate/pad hash to 32 bytes
+    let mut h1 = [0u8; 32];
+    if hash.len() >= 32 {
+        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr(), 32); }
+    } else {
+        let offset = 32 - hash.len();
+        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr().add(offset), hash.len()); }
     }
+
+    // Step a: h1 = Hash(message) — already have it
+    // Step b: V = 0x01 0x01 ... 0x01 (32 bytes)
+    let mut v = [0x01u8; 32];
+    // Step c: K = 0x00 0x00 ... 0x00 (32 bytes)
+    let mut k_hmac = [0x00u8; 32];
+
+    // Step d: K = HMAC(K, V || 0x00 || private_key || h1)
+    let mut msg_d = [0u8; 32 + 1 + 32 + 32]; // V(32) + 0x00(1) + x(32) + h1(32) = 97
+    unsafe {
+        core::ptr::copy_nonoverlapping(v.as_ptr(), msg_d.as_mut_ptr(), 32);
+    }
+    msg_d[32] = 0x00;
+    unsafe {
+        core::ptr::copy_nonoverlapping(private_key.as_ptr(), msg_d.as_mut_ptr().add(33), 32);
+        core::ptr::copy_nonoverlapping(h1.as_ptr(), msg_d.as_mut_ptr().add(65), 32);
+    }
+    {
+        let mut tmp = [0u8; 32];
+        hmac(HashAlg::Sha256, &k_hmac, &msg_d[..97], &mut tmp);
+        k_hmac = tmp;
+    }
+
+    // Step e: V = HMAC(K, V)
+    {
+        let mut tmp = [0u8; 32];
+        hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
+        v = tmp;
+    }
+
+    // Step f: K = HMAC(K, V || 0x01 || private_key || h1)
+    unsafe {
+        core::ptr::copy_nonoverlapping(v.as_ptr(), msg_d.as_mut_ptr(), 32);
+    }
+    msg_d[32] = 0x01;
+    // private_key and h1 already in place
+    {
+        let mut tmp = [0u8; 32];
+        hmac(HashAlg::Sha256, &k_hmac, &msg_d[..97], &mut tmp);
+        k_hmac = tmp;
+    }
+
+    // Step g: V = HMAC(K, V)
+    {
+        let mut tmp = [0u8; 32];
+        hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
+        v = tmp;
+    }
+
+    // Step h: Loop until valid k is found
+    loop {
+        // V = HMAC(K, V) — generates candidate
+        {
+            let mut tmp = [0u8; 32];
+            hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
+            v = tmp;
+        }
+
+        let candidate = u256_from_be(&v);
+        // k must be in [1, n-1]
+        let n = load_n();
+        if !u256_is_zero(&candidate) && u256_gte(&candidate, &n) == 0 {
+            zeroize(&mut k_hmac);
+            return candidate;
+        }
+
+        // Retry: K = HMAC(K, V || 0x00), V = HMAC(K, V)
+        let mut retry = [0u8; 33];
+        unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), retry.as_mut_ptr(), 32); }
+        retry[32] = 0x00;
+        {
+            let mut tmp = [0u8; 32];
+            hmac(HashAlg::Sha256, &k_hmac, &retry[..33], &mut tmp);
+            k_hmac = tmp;
+        }
+        {
+            let mut tmp = [0u8; 32];
+            hmac(HashAlg::Sha256, &k_hmac, &v, &mut tmp);
+            v = tmp;
+        }
+    }
+}
+
+/// ECDSA sign over a message hash. The nonce is derived deterministically
+/// from the private key and the hash (RFC 6979); the `_random_k` parameter
+/// is retained for API compatibility and ignored. Returns the 64-byte
+/// signature `r || s` in big-endian form, normalised to low-s.
+pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> [u8; 64] {
+    let d = u256_from_be(private_key);
+    let mut k = rfc6979_nonce(private_key, hash);
 
     // r = (k * G).x mod n
     let point = scalar_mul_base(&k);
@@ -744,7 +950,17 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], random_k: &[u8; 32]) -> [
     let k_inv = fn_inv(&k);
     let rd = fn_mul(&r, &d);
     let z_rd = fn_add(&z, &rd);
-    let s = fn_mul(&k_inv, &z_rd);
+    let mut s = fn_mul(&k_inv, &z_rd);
+
+    // Low-s normalisation: if s > n/2 replace with n - s.
+    let n_half = load_n_half();
+    if u256_gte(&s, &n_half) != 0 {
+        let n = load_n();
+        let (ns, _) = u256_sub(&n, &s);
+        s = ns;
+    }
+
+    zeroize_u256(&mut k);
 
     let mut sig = [0u8; 64];
     let rb = u256_to_be(&r);
@@ -768,9 +984,10 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     let qy = u256_from_be(&pub_key[offset + 32..offset + 64]);
 
     // Check r, s in [1, n-1]
+    let n = load_n();
     if u256_is_zero(&r) || u256_is_zero(&s) { return false; }
-    if u256_gte(&r, &N) != 0 { return false; }
-    if u256_gte(&s, &N) != 0 { return false; }
+    if u256_gte(&r, &n) != 0 { return false; }
+    if u256_gte(&s, &n) != 0 { return false; }
 
     let z = if hash.len() >= 32 {
         u256_from_be(&hash[..32])

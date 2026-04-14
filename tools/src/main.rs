@@ -717,13 +717,18 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     // Calculate addresses - trailer goes right after firmware, then modules, then config
     // All sections 256-byte aligned (UF2 block payload size)
     const UF2_BLOCK_ALIGN: u32 = 256;
+    // aarch64 PIC modules use ADRP which requires code_base to be 4KB aligned.
+    // The combine tool aligns WITHIN the blob so offset+header = 4KB boundary,
+    // but modules_addr itself must also be 4KB aligned for absolute addresses.
+    const MODULES_ALIGN: u32 = 4096;
 
     // Trailer immediately after firmware (256-byte aligned)
     let trailer_addr = (firmware_max_addr + UF2_BLOCK_ALIGN - 1) & !(UF2_BLOCK_ALIGN - 1);
 
-    // Modules after trailer (trailer is 16 bytes, but takes a full 256-byte block)
+    // Modules after trailer: 4KB aligned for aarch64 ADRP compatibility
     let modules_addr = if modules_data.is_some() {
-        trailer_addr + UF2_BLOCK_ALIGN
+        let raw = trailer_addr + UF2_BLOCK_ALIGN;
+        (raw + MODULES_ALIGN - 1) & !(MODULES_ALIGN - 1)
     } else {
         0 // Sentinel for "no modules"
     };

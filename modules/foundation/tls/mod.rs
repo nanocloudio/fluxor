@@ -429,7 +429,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // Discard excess
                         if pl > 256 { tls_discard(sys, s.cipher_in, pl - 256); }
                     }
-                    let conn_id = if pl > 0 { payload[0] } else { 0 };
+                    let conn_id = if pl > 0 { unsafe { *payload.as_ptr() } } else { 0 };
                     // Allocate session for this connection
                     match alloc_session_for_conn(s, conn_id) {
                         Some(idx) => {
@@ -457,7 +457,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     } else {
                         let mut conn_id_buf = [0u8; 1];
                         (sys.channel_read)(s.cipher_in, conn_id_buf.as_mut_ptr(), 1);
-                        let conn_id = conn_id_buf[0];
+                        let conn_id = unsafe { *conn_id_buf.as_ptr() };
                         let data_len = pl - 1;
                         let si = find_session_by_conn_id(s, conn_id);
                         if si >= 0 {
@@ -716,8 +716,9 @@ unsafe fn extract_peer_cert_key(s: &mut TlsState, idx: usize, hs_body: &[u8]) ->
 
 /// Skip any CCS records at the front of a session's recv_buf.
 unsafe fn skip_ccs(sess: &mut TlsSession) {
-    while sess.recv_len >= 5 && sess.recv_buf[0] == CT_CHANGE_CIPHER_SPEC {
-        let ccs_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
+    while sess.recv_len >= 5 && *sess.recv_buf.as_ptr() == CT_CHANGE_CIPHER_SPEC {
+        let p = sess.recv_buf.as_ptr();
+        let ccs_len = ((*p.add(3) as usize) << 8) | (*p.add(4) as usize);
         let consumed = 5 + ccs_len;
         if sess.recv_len < consumed || consumed > RECV_BUF_SIZE { break; }
         let remain = sess.recv_len - consumed;
@@ -798,21 +799,23 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // Need at least record header (5) + handshake header (4)
     if sess.recv_len < 9 { return false; }
 
-    // Parse record header with length validation
-    let rec_type = sess.recv_buf[0];
-    let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
+    // Parse record header with length validation (raw pointer access for PIC safety)
+    let rbp = sess.recv_buf.as_ptr();
+    let rec_type = *rbp;
+    let rec_len = ((*rbp.add(3) as usize) << 8) | (*rbp.add(4) as usize);
     if rec_len > MAX_CIPHERTEXT || rec_len > RECV_BUF_SIZE { return false; }
     if sess.recv_len < 5 + rec_len { return false; }
 
     if rec_type != CT_HANDSHAKE { return false; }
 
-    // Parse handshake message
-    let hs_data = &sess.recv_buf[5..5 + rec_len];
-    if hs_data[0] != 1 { return false; } // ClientHello type
-    let hs_len = ((hs_data[1] as usize) << 16) | ((hs_data[2] as usize) << 8) | (hs_data[3] as usize);
+    // Parse handshake message (raw pointer slicing for PIC safety)
+    let hs_ptr = rbp.add(5);
+    let hs_data = core::slice::from_raw_parts(hs_ptr, rec_len);
+    if *hs_ptr != 1 { return false; } // ClientHello type
+    let hs_len = ((*hs_ptr.add(1) as usize) << 16) | ((*hs_ptr.add(2) as usize) << 8) | (*hs_ptr.add(3) as usize);
     if hs_len + 4 > rec_len { return false; }
 
-    let ch_body = &hs_data[4..4 + hs_len];
+    let ch_body = core::slice::from_raw_parts(hs_ptr.add(4), hs_len);
     let ch = match parse_client_hello(ch_body) {
         Some(c) => c,
         None => {
@@ -909,41 +912,50 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
 
 unsafe fn pump_send_server_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
-    let sess = &mut s.sessions[idx];
 
-    let msg_len = build_server_hello(
-        &sess.server_random,
-        &sess.peer_session_id,
-        sess.suite,
-        &sess.ecdh_public,
-        &mut sess.scratch,
-    );
+    {
+        let sess = &mut s.sessions[idx];
 
-    // Update transcript
-    if let Some(ref mut t) = sess.transcript {
-        t.update(&sess.scratch[..msg_len]);
+        let msg_len = build_server_hello(
+            &sess.server_random,
+            &sess.peer_session_id,
+            sess.suite,
+            &sess.ecdh_public,
+            &mut sess.scratch,
+        );
+
+        // Update transcript
+        if let Some(ref mut t) = sess.transcript {
+            t.update(&sess.scratch[..msg_len]);
+        }
+
+        // Wrap ServerHello in a TLS record, appending the middlebox-compat
+        // CCS record into the same send when one has not already followed
+        // an HRR (RFC 8446 §5: server sends at most one CCS).
+        let mut rec = [0u8; 256];
+        let mut hdr = [0u8; 5];
+        build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
+        core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
+        core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
+
+        let sh_total = 5 + msg_len;
+        let conn_id = sess.conn_id;
+
+        let total = if !sess.hrr_sent {
+            *rec.as_mut_ptr().add(sh_total) = CT_CHANGE_CIPHER_SPEC;
+            *rec.as_mut_ptr().add(sh_total + 1) = 0x03;
+            *rec.as_mut_ptr().add(sh_total + 2) = 0x03;
+            *rec.as_mut_ptr().add(sh_total + 3) = 0x00;
+            *rec.as_mut_ptr().add(sh_total + 4) = 0x01;
+            *rec.as_mut_ptr().add(sh_total + 5) = 0x01;
+            sh_total + 6
+        } else {
+            sh_total
+        };
+        tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
     }
 
-    // Wrap in TLS record
-    let mut rec = [0u8; SEND_BUF_SIZE];
-    let mut hdr = [0u8; 5];
-    build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
-    core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
-    core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
-
-    let total = 5 + msg_len;
-    let conn_id = sess.conn_id;
-    // Send as CMD_SEND(conn_id, tls_record) on cipher_out
-    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
-
-    // Send ChangeCipherSpec for middlebox compatibility — but only if not already
-    // sent after HelloRetryRequest (RFC 8446: server sends at most one CCS).
-    if !sess.hrr_sent {
-        let ccs = [CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01];
-        tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, ccs.as_ptr(), 6, &mut s.net_scratch);
-    }
-
-    sess.hs_state = HandshakeState::DeriveHandshakeKeys;
+    s.sessions[idx].hs_state = HandshakeState::DeriveHandshakeKeys;
     true
 }
 
@@ -977,18 +989,24 @@ unsafe fn pump_send_hello_retry(s: &mut TlsState, idx: usize) -> bool {
         t.update(&sess.scratch[..msg_len]);
     }
 
-    // Wrap in TLS record and send via channel
+    // Ship HRR and the middlebox-compat CCS record as a single send so they
+    // land in the same TCP segment (RFC 8446 §4.1.4).
     let mut rec = [0u8; SEND_BUF_SIZE];
     let mut hdr = [0u8; 5];
     build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
     core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
     core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
+    let hrr_total = 5 + msg_len;
+    use core::ptr::write_volatile as wv;
+    wv(rec.as_mut_ptr().add(hrr_total),     CT_CHANGE_CIPHER_SPEC);
+    wv(rec.as_mut_ptr().add(hrr_total + 1), 0x03u8);
+    wv(rec.as_mut_ptr().add(hrr_total + 2), 0x03u8);
+    wv(rec.as_mut_ptr().add(hrr_total + 3), 0x00u8);
+    wv(rec.as_mut_ptr().add(hrr_total + 4), 0x01u8);
+    wv(rec.as_mut_ptr().add(hrr_total + 5), 0x01u8);
+    let total = hrr_total + 6;
     let conn_id = sess.conn_id;
-    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), (5 + msg_len) as u16, &mut s.net_scratch);
-
-    // Send CCS for middlebox compatibility
-    let ccs = [CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01];
-    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, ccs.as_ptr(), 6, &mut s.net_scratch);
+    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
 
     sess.hrr_sent = true;
     sess.hs_state = HandshakeState::RecvSecondClientHello;
@@ -1061,7 +1079,7 @@ unsafe fn pump_derive_handshake_keys(s: &mut TlsState, idx: usize) -> bool {
 
     // Compute ECDH shared secret
     let shared = match ecdh_shared_secret(&sess.ecdh_private, &sess.peer_key_share[..sess.peer_key_share_len as usize]) {
-        Some(s) => s,
+        Some(v) => v,
         None => {
             sess.state = SessionState::Error;
             return true;
@@ -1120,7 +1138,10 @@ unsafe fn pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_send_certificate(s: &mut TlsState, idx: usize) -> bool {
-    let cert = &s.cert[..s.cert_len];
+    // Bounds-checked slice indexing can pull the panic handler (and its
+    // .rodata strings) into a PIC module; raw pointer + length is safe.
+    let cert_len = if s.cert_len <= MAX_CERT_LEN { s.cert_len } else { 0 };
+    let cert = core::slice::from_raw_parts(s.cert.as_ptr(), cert_len);
     let msg_len = build_certificate(cert, &mut s.sessions[idx].scratch);
 
     if let Some(ref mut t) = s.sessions[idx].transcript {
@@ -1391,41 +1412,82 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
 
 unsafe fn pump_recv_server_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
-    let sess = &mut s.sessions[idx];
 
-    // Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
-    if sess.recv_len < 9 { return false; }
+    {
+        let sess = &mut s.sessions[idx];
 
-    skip_ccs(sess);
-    if sess.recv_len < 9 { return false; }
+        // Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
+        if sess.recv_len < 9 { return false; }
 
-    let rec_type = sess.recv_buf[0];
-    let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
-    if sess.recv_len < 5 + rec_len { return false; }
-    if rec_type != CT_HANDSHAKE { return false; }
+        skip_ccs(sess);
+        if sess.recv_len < 9 { return false; }
 
-    let hs_data = &sess.recv_buf[5..5 + rec_len];
-    if hs_data[0] != 2 { return false; } // ServerHello
-    let hs_len = ((hs_data[1] as usize) << 16) | ((hs_data[2] as usize) << 8) | (hs_data[3] as usize);
+        let rec_type = sess.recv_buf[0];
+        let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
+        if sess.recv_len < 5 + rec_len { return false; }
+        if rec_type != CT_HANDSHAKE { return false; }
 
-    let sh = match parse_server_hello(&hs_data[4..4 + hs_len]) {
-        Some(h) => h,
-        None => { sess.state = SessionState::Error; return true; }
-    };
+        let hs_data = &sess.recv_buf[5..5 + rec_len];
+        if hs_data[0] != 2 { return false; } // ServerHello
+        let hs_len = ((hs_data[1] as usize) << 16) | ((hs_data[2] as usize) << 8) | (hs_data[3] as usize);
 
-    // Validate TLS 1.3
-    if sh.supported_version != Some(0x0304) {
-        sess.state = SessionState::Error;
-        return true;
-    }
+        let sh = match parse_server_hello(&hs_data[4..4 + hs_len]) {
+            Some(h) => h,
+            None => { sess.state = SessionState::Error; return true; }
+        };
 
-    // Check for HelloRetryRequest (magic random value)
-    if sh.random.len() == 32 && sh.random == HRR_RANDOM {
-        // Server requests retry with different key share
-        // Update transcript: add this HRR to it
+        // Validate TLS 1.3
+        if sh.supported_version != Some(0x0304) {
+            sess.state = SessionState::Error;
+            return true;
+        }
+
+        // Check for HelloRetryRequest (magic random value)
+        if sh.random.len() == 32 && sh.random == HRR_RANDOM {
+            // Server requests retry with different key share
+            // Update transcript: add this HRR to it
+            if let Some(ref mut t) = sess.transcript {
+                t.update(hs_data);
+            }
+            // Consume record
+            let consumed = 5 + rec_len;
+            let remain = sess.recv_len - consumed;
+            if remain > 0 {
+                core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
+            }
+            sess.recv_len = remain;
+            // Client needs to send a new ClientHello (with P-256 key share)
+            // For now, since we already offer P-256, this shouldn't happen.
+            // If it does, error — we can't change our key share.
+            sess.state = SessionState::Error;
+            return true;
+        }
+
+        // Set cipher suite
+        sess.suite = match CipherSuite::from_id(sh.cipher_suite) {
+            Some(cs) => cs,
+            None => { sess.state = SessionState::Error; return true; }
+        };
+
+        // Switch transcript to correct hash algorithm for negotiated suite.
+        if let Some(ref mut t) = sess.transcript {
+            t.set_alg(sess.suite.hash_alg());
+        }
+
+        // Extract server key share
+        match sh.key_share {
+            Some((_, key_data)) if key_data.len() <= 65 => {
+                core::ptr::copy_nonoverlapping(key_data.as_ptr(), sess.peer_key_share.as_mut_ptr(), key_data.len());
+                sess.peer_key_share_len = key_data.len() as u8;
+            }
+            _ => { sess.state = SessionState::Error; return true; }
+        }
+
+        // Update transcript with ServerHello
         if let Some(ref mut t) = sess.transcript {
             t.update(hs_data);
         }
+
         // Consume record
         let consumed = 5 + rec_len;
         let remain = sess.recv_len - consumed;
@@ -1433,47 +1495,9 @@ unsafe fn pump_recv_server_hello(s: &mut TlsState, idx: usize) -> bool {
             core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
         }
         sess.recv_len = remain;
-        // Client needs to send a new ClientHello (with P-256 key share)
-        // For now, since we already offer P-256, this shouldn't happen.
-        // If it does, error — we can't change our key share.
-        sess.state = SessionState::Error;
-        return true;
-    }
+    } // drop `sess` borrow
 
-    // Set cipher suite
-    sess.suite = match CipherSuite::from_id(sh.cipher_suite) {
-        Some(cs) => cs,
-        None => { sess.state = SessionState::Error; return true; }
-    };
-
-    // Switch transcript to correct hash algorithm for negotiated suite.
-    if let Some(ref mut t) = sess.transcript {
-        t.set_alg(sess.suite.hash_alg());
-    }
-
-    // Extract server key share
-    match sh.key_share {
-        Some((_, key_data)) if key_data.len() <= 65 => {
-            core::ptr::copy_nonoverlapping(key_data.as_ptr(), sess.peer_key_share.as_mut_ptr(), key_data.len());
-            sess.peer_key_share_len = key_data.len() as u8;
-        }
-        _ => { sess.state = SessionState::Error; return true; }
-    }
-
-    // Update transcript with ServerHello
-    if let Some(ref mut t) = sess.transcript {
-        t.update(hs_data);
-    }
-
-    // Consume record
-    let consumed = 5 + rec_len;
-    let remain = sess.recv_len - consumed;
-    if remain > 0 {
-        core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-    }
-    sess.recv_len = remain;
-
-    sess.hs_state = HandshakeState::ClientDeriveHandshakeKeys;
+    s.sessions[idx].hs_state = HandshakeState::ClientDeriveHandshakeKeys;
     true
 }
 
@@ -1761,8 +1785,9 @@ unsafe fn tls_read_header(sys: &SyscallTable, chan: i32) -> (u8, u16) {
     let mut hdr = [0u8; 3];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
     if n < 3 { return (0, 0); }
-    let msg_type = hdr[0];
-    let payload_len = (hdr[1] as u16) | ((hdr[2] as u16) << 8);
+    let p = hdr.as_ptr();
+    let msg_type = *p;
+    let payload_len = (*p.add(1) as u16) | ((*p.add(2) as u16) << 8);
     (msg_type, payload_len)
 }
 

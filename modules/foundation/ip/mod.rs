@@ -134,16 +134,18 @@ pub struct IpState {
     net_in_chan: i32,
     net_out_chan: i32,
 
-    // Net protocol scratch buffer for frame assembly (MTU 576 + headers)
-    net_scratch: [u8; 600],
+    // Net protocol scratch buffer: NET_FRAME_HDR(3) + conn_id(1) + TCP payload.
+    net_scratch: [u8; 1600],
 
     // Frame buffers
     rx_frame: [u8; MAX_FRAME_SIZE],
     tx_frame: [u8; MAX_FRAME_SIZE],
-    /// Length of pending TX frame (0 = no pending). When the channel is full,
-    /// the frame stays in tx_frame and pending_tx_len is set. Next step retries.
+    /// Length of a TX frame staged in `pending_tx_buf` awaiting channel space
+    /// (0 = no pending). The frame is held in its own buffer so subsequent
+    /// `send_frame` calls can reuse `tx_frame` without clobbering it.
     pending_tx_len: u16,
     _ptx_pad: [u8; 2],
+    pending_tx_buf: [u8; MAX_FRAME_SIZE + 2],
 
     // Step counter for timers
     step_count: u32,
@@ -248,11 +250,13 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len:
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 1 + data_len; // conn_id + data
-    *scratch = NET_MSG_DATA;
+    let max_copy = s.net_scratch.len() - NET_FRAME_HDR;
+    if data_len > max_copy { return; } // safety: don't overflow scratch
+    core::ptr::write_volatile(scratch, NET_MSG_DATA);
     let pl = (payload_len as u16).to_le_bytes();
-    *scratch.add(1) = pl[0];
-    *scratch.add(2) = pl[1];
-    *scratch.add(3) = conn_id;
+    core::ptr::write_volatile(scratch.add(1), pl[0]);
+    core::ptr::write_volatile(scratch.add(2), pl[1]);
+    core::ptr::write_volatile(scratch.add(3), conn_id);
     core::ptr::copy_nonoverlapping(data, scratch.add(4), data_len);
     let total = NET_FRAME_HDR + payload_len;
     (sys.channel_write)(s.net_out_chan, scratch, total);
@@ -275,92 +279,70 @@ unsafe fn net_send_udp_data(
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 1 + 4 + 2 + data_len; // conn_id + ip + port + data
-    *scratch = NET_MSG_DATA;
+    use core::ptr::write_volatile as wv;
+    wv(scratch, NET_MSG_DATA);
     let pl = (payload_len as u16).to_le_bytes();
-    *scratch.add(1) = pl[0];
-    *scratch.add(2) = pl[1];
-    *scratch.add(3) = conn_id;
+    wv(scratch.add(1), pl[0]);
+    wv(scratch.add(2), pl[1]);
+    wv(scratch.add(3), conn_id);
     let ip_bytes = src_ip.to_le_bytes();
-    *scratch.add(4) = ip_bytes[0];
-    *scratch.add(5) = ip_bytes[1];
-    *scratch.add(6) = ip_bytes[2];
-    *scratch.add(7) = ip_bytes[3];
+    wv(scratch.add(4), ip_bytes[0]);
+    wv(scratch.add(5), ip_bytes[1]);
+    wv(scratch.add(6), ip_bytes[2]);
+    wv(scratch.add(7), ip_bytes[3]);
     let port_bytes = src_port.to_le_bytes();
-    *scratch.add(8) = port_bytes[0];
-    *scratch.add(9) = port_bytes[1];
+    wv(scratch.add(8), port_bytes[0]);
+    wv(scratch.add(9), port_bytes[1]);
     core::ptr::copy_nonoverlapping(data, scratch.add(10), data_len);
     let total = NET_FRAME_HDR + payload_len;
     (sys.channel_write)(s.net_out_chan, scratch, total);
 }
 
-/// Send a MSG_ACCEPTED frame to the net consumer channel.
+/// Helper: write a short net-proto frame (MSG_ACCEPTED/CLOSED/BOUND/CONNECTED) to net_out.
+/// All stores use write_volatile to prevent LLVM from eliding them in PIC on aarch64.
+#[inline(always)]
+unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u8) {
+    if s.net_out_chan < 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    core::ptr::write_volatile(scratch, msg_type);
+    core::ptr::write_volatile(scratch.add(1), 1u8);
+    core::ptr::write_volatile(scratch.add(2), 0u8);
+    core::ptr::write_volatile(scratch.add(3), conn_id);
+    (sys.channel_write)(s.net_out_chan, scratch, 4);
+}
+
 #[inline(always)]
 unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) {
-    if s.net_out_chan < 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    *scratch = NET_MSG_ACCEPTED;
-    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
-    *scratch.add(3) = conn_id;
-    (sys.channel_write)(s.net_out_chan, scratch, 4);
+    net_send_short(s, NET_MSG_ACCEPTED, conn_id);
 }
 
-/// Send a MSG_CLOSED frame to the net consumer channel.
 #[inline(always)]
 unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) {
-    if s.net_out_chan < 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    *scratch = NET_MSG_CLOSED;
-    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
-    *scratch.add(3) = conn_id;
-    (sys.channel_write)(s.net_out_chan, scratch, 4);
+    net_send_short(s, NET_MSG_CLOSED, conn_id);
 }
 
-/// Send a MSG_BOUND frame to the net consumer channel.
 #[inline(always)]
 unsafe fn net_send_bound(s: &mut IpState, conn_id: u8) {
-    if s.net_out_chan < 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    *scratch = NET_MSG_BOUND;
-    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
-    *scratch.add(3) = conn_id;
-    (sys.channel_write)(s.net_out_chan, scratch, 4);
+    net_send_short(s, NET_MSG_BOUND, conn_id);
 }
 
-/// Send a MSG_CONNECTED frame to the net consumer channel.
 #[inline(always)]
 unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) {
-    if s.net_out_chan < 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    *scratch = NET_MSG_CONNECTED;
-    *scratch.add(1) = 1; *scratch.add(2) = 0; // len=1
-    *scratch.add(3) = conn_id;
-    (sys.channel_write)(s.net_out_chan, scratch, 4);
+    net_send_short(s, NET_MSG_CONNECTED, conn_id);
 }
 
 /// Send a MSG_ERROR frame to the net consumer channel.
 #[inline(always)]
 unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8) {
-    if s.net_out_chan < 0 {
-        return;
-    }
+    if s.net_out_chan < 0 { return; }
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
-    *scratch = NET_MSG_ERROR;
-    *scratch.add(1) = 2; *scratch.add(2) = 0; // len=2
-    *scratch.add(3) = conn_id;
-    *scratch.add(4) = errno as u8;
+    core::ptr::write_volatile(scratch, NET_MSG_ERROR);
+    core::ptr::write_volatile(scratch.add(1), 2u8);
+    core::ptr::write_volatile(scratch.add(2), 0u8);
+    core::ptr::write_volatile(scratch.add(3), conn_id);
+    core::ptr::write_volatile(scratch.add(4), errno as u8);
     (sys.channel_write)(s.net_out_chan, scratch, 5);
 }
 
@@ -383,22 +365,42 @@ fn next_port(s: &mut IpState) -> u16 {
 }
 
 /// Send a raw ethernet frame via out_chan.
+///
+/// Frames are prefixed with a 2-byte little-endian length so the byte-stream
+/// FIFO to the NIC driver preserves frame boundaries. Writes are atomic
+/// (all 2+N bytes or nothing), so a partial frame cannot reach the driver.
+/// If the channel is full, the frame is staged in pending_tx_buf and
+/// flushed on the next step.
 unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
-    if s.out_chan < 0 || len == 0 {
-        log_info(s, b"[ip] send_frame: no out_chan");
-        return;
-    }
+    if s.out_chan < 0 || len == 0 || len > MAX_FRAME_SIZE - 2 { return; }
     let sys = &*s.syscalls;
+
+    // Flush any frame pending from a previous step before writing a new one.
+    if s.pending_tx_len > 0 {
+        let p = (sys.channel_poll)(s.out_chan, POLL_OUT);
+        if p > 0 && (p as u32 & POLL_OUT) != 0 {
+            let plen = s.pending_tx_len as usize;
+            (sys.channel_write)(s.out_chan, s.pending_tx_buf.as_ptr(), plen);
+            s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
+            s.pending_tx_len = 0;
+        } else {
+            return; // still full; drop new frame — TCP will retransmit
+        }
+    }
+
+    // Stage "[len_lo][len_hi][frame...]" in pending_tx_buf for atomic write.
+    let pbuf = s.pending_tx_buf.as_mut_ptr();
+    core::ptr::write_volatile(pbuf, len as u8);
+    core::ptr::write_volatile(pbuf.add(1), (len >> 8) as u8);
+    core::ptr::copy_nonoverlapping(frame, pbuf.add(2), len);
+    let total = 2 + len;
+
     let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
     if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-        // Write frame to NIC driver channel.
-        (sys.channel_write)(s.out_chan, frame, len);
+        (sys.channel_write)(s.out_chan, pbuf, total);
         s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
-        s.pending_tx_len = 0;
     } else {
-        // Channel full — mark pending for retry next step.
-        // The frame data is already in s.tx_frame (caller built it there).
-        s.pending_tx_len = len as u16;
+        s.pending_tx_len = total as u16;
     }
 }
 
@@ -495,13 +497,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut IpState);
     s.step_count = s.step_count.wrapping_add(1);
 
-    // 0a. Flush any pending TX frame from previous step
+    // 0a. Flush any pending TX frame from previous step.
     if s.pending_tx_len > 0 && s.out_chan >= 0 {
         let sys = &*s.syscalls;
         let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
         if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
             let len = s.pending_tx_len as usize;
-            (sys.channel_write)(s.out_chan, s.tx_frame.as_ptr(), len);
+            (sys.channel_write)(s.out_chan, s.pending_tx_buf.as_ptr(), len);
             s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
             s.pending_tx_len = 0;
         }
@@ -712,7 +714,7 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     let (opcode, sender_ip, sender_mac, target_ip) = parsed;
 
     // Always learn from ARP packets
-    arp::insert(&mut s.arp_table, sender_ip, sender_mac);
+    arp::insert(&mut s.arp_table, sender_ip, sender_mac, s.step_count as u16);
 
     // If this resolves our pending ARP request
     if s.arp_pending_state == arp::ARP_PENDING_WAITING && s.arp_pending_ip == sender_ip {
@@ -744,7 +746,7 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
     if ip_hdr.src_ip != 0 && ip_hdr.src_ip != 0xFFFFFFFF {
         let src_mac = eth::src_mac(s.rx_frame.as_ptr());
         if (src_mac[0] | src_mac[1] | src_mac[2] | src_mac[3] | src_mac[4] | src_mac[5]) != 0 {
-            arp::insert(&mut s.arp_table, ip_hdr.src_ip, src_mac);
+            arp::insert(&mut s.arp_table, ip_hdr.src_ip, src_mac, s.step_count as u16);
         }
     }
 
@@ -876,8 +878,11 @@ unsafe fn process_tcp_segment(
     let conn_idx = match conn_idx {
         Some(i) => i,
         None => {
-            // No established connection — check for a listener if this is a SYN
-            if (tcp_hdr.flags & tcp::SYN) != 0 && (tcp_hdr.flags & tcp::ACK) == 0 {
+            // No established connection — accept SYN on a listening socket.
+            // Only accept once the interface is configured; otherwise we
+            // consume a listener slot but cannot send SYN-ACK.
+            if (tcp_hdr.flags & tcp::SYN) != 0 && (tcp_hdr.flags & tcp::ACK) == 0
+               && s.mac_valid && s.local_ip != 0 {
                 if let Some(li) = tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port) {
                     log_info(s, b"[ip] tcp syn received");
                     // Accept incoming connection on the listening socket
@@ -1132,7 +1137,6 @@ unsafe fn send_tcp_rst(
     tcp::build_tcp_header(
         tcp_start, local_port, remote_port,
         seq, ack, flags, 0,
-        s.local_ip, remote_ip, 0,
     );
 
     let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN) as u16;
@@ -1141,6 +1145,8 @@ unsafe fn send_tcp_rst(
     ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_TCP, s.local_ip, remote_ip, s.ip_id);
 
     eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+
+    tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, s.local_ip, remote_ip);
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     send_frame(s, s.tx_frame.as_ptr(), total);
@@ -1173,7 +1179,7 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8) {
     tcp::build_tcp_header(
         tcp_start,
         local_port, remote_port, snd_nxt, rcv_nxt,
-        flags, rcv_wnd, s.local_ip, remote_ip, 0,
+        flags, rcv_wnd,
     );
 
     let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN) as u16;
@@ -1182,6 +1188,8 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8) {
     ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_TCP, s.local_ip, remote_ip, s.ip_id);
 
     eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+
+    tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, s.local_ip, remote_ip);
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     send_frame(s, s.tx_frame.as_ptr(), total);
@@ -1193,6 +1201,7 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8) {
 }
 
 /// Send TCP data segment for a connection.
+#[inline(never)]
 unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, payload_len: usize) {
     if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
         return;
@@ -1218,22 +1227,12 @@ unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, pa
     tcp::build_tcp_header(
         tcp_start,
         local_port, remote_port, snd_nxt, rcv_nxt,
-        tcp::ACK | tcp::PSH, rcv_wnd, s.local_ip, remote_ip, payload_len,
+        tcp::ACK | tcp::PSH, rcv_wnd,
     );
 
     // Copy payload after TCP header
     let payload_dst = tcp_start.add(tcp::TCP_HEADER_LEN);
-    let mut i = 0;
-    while i < payload_len {
-        *payload_dst.add(i) = *payload.add(i);
-        i += 1;
-    }
-
-    // Finalize TCP checksum with payload
-    tcp::finalize_tcp_checksum(
-        tcp_start, tcp::TCP_HEADER_LEN, payload_dst, payload_len,
-        s.local_ip, remote_ip,
-    );
+    core::ptr::copy_nonoverlapping(payload, payload_dst, payload_len);
 
     let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN + payload_len) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
@@ -1241,6 +1240,11 @@ unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, pa
     ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_TCP, s.local_ip, remote_ip, s.ip_id);
 
     eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+
+    tcp::compute_tcp_checksum(
+        tcp_start, tcp::TCP_HEADER_LEN + payload_len,
+        s.local_ip, remote_ip,
+    );
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     send_frame(s, s.tx_frame.as_ptr(), total);

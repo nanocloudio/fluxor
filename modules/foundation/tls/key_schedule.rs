@@ -60,6 +60,11 @@ impl KeySchedule {
         // Handshake Secret = HKDF-Extract(Derived, ECDH)
         hkdf_extract(alg, &derived[..hl], ecdh_shared, &mut self.handshake_secret[..hl]);
 
+        // The early secret and the intermediate HKDF derivation are no
+        // longer needed once the handshake secret has been extracted.
+        zeroize(&mut self.early_secret);
+        zeroize(&mut derived);
+
         // client/server handshake traffic secrets
         derive_secret(alg, &self.handshake_secret[..hl], b"c hs traffic", transcript_hash, &mut self.client_hs_secret[..hl]);
         derive_secret(alg, &self.handshake_secret[..hl], b"s hs traffic", transcript_hash, &mut self.server_hs_secret[..hl]);
@@ -81,6 +86,8 @@ impl KeySchedule {
         // Master Secret = HKDF-Extract(Derived, 0)
         let zero = [0u8; 48];
         hkdf_extract(alg, &derived[..hl], &zero[..hl], &mut self.master_secret[..hl]);
+
+        zeroize(&mut derived);
 
         // Application traffic secrets
         derive_secret(alg, &self.master_secret[..hl], b"c ap traffic", transcript_hash, &mut self.client_app_secret[..hl]);

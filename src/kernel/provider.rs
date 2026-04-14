@@ -80,7 +80,8 @@ pub fn register(class: u8, dispatch: ProviderDispatch) {
 /// Register a PIC module as provider for a device class.
 ///
 /// Pushes the module onto the top of the chain. Returns 0 on success,
-/// EINVAL if class is out of range, EBUSY if chain is full.
+/// EINVAL if class is out of range or dispatch pointer is outside the
+/// module's code region, EBUSY if chain is full.
 pub fn register_module_provider(
     class: u8,
     module_idx: u8,
@@ -91,6 +92,27 @@ pub fn register_module_provider(
     if idx >= MAX_PROVIDERS {
         return errno::EINVAL;
     }
+
+    // Validate dispatch function pointer is within the registering module's
+    // code region. Prevents a corrupted module from registering a pointer
+    // into kernel memory or another module's code.
+    let fn_addr = dispatch as usize;
+    let (code_base, code_size) = crate::kernel::scheduler::module_code_region(module_idx as usize);
+    if code_base != 0 && code_size != 0 {
+        let code_end = code_base + code_size as usize;
+        if fn_addr < code_base || fn_addr >= code_end {
+            log::error!("[provider] module {} fn_ptr 0x{:08x} outside code region 0x{:08x}..0x{:08x}",
+                module_idx, fn_addr, code_base, code_end);
+            return errno::EINVAL;
+        }
+        // On Cortex-M (Thumb mode): verify LSB is set
+        #[cfg(target_arch = "arm")]
+        if fn_addr & 1 == 0 {
+            log::error!("[provider] module {} fn_ptr 0x{:08x} missing Thumb bit", module_idx, fn_addr);
+            return errno::EINVAL;
+        }
+    }
+
     unsafe {
         let entry = &mut PROVIDERS[idx];
 
