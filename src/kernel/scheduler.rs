@@ -1371,6 +1371,8 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     reset_state_arena();
     crate::kernel::buffer_pool::reset_buffer_arena();
     NameArena::reset();
+    crate::kernel::blob_store::unregister();
+    crate::kernel::graph_slot::unregister();
     sched.reset();
 
     // Store graph-level sample rate from config header

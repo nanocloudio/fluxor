@@ -422,6 +422,23 @@ pub fn register_dev_query_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i3
     unsafe { DEV_QUERY_EXTENSION = Some(f); }
 }
 
+/// Shared helper for *_ENABLE registration syscalls. Validates that
+/// `arg` carries a 4-byte export hash, resolves the hash to a function
+/// address in the calling module, and returns `(fn_addr, state_ptr)`.
+/// Returns `None` on any validation failure.
+unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize, *mut u8)> {
+    use crate::kernel::scheduler;
+    if arg.is_null() || arg_len < 4 { return None; }
+    let hash = core::ptr::read_unaligned(arg as *const u32);
+    let module_idx = scheduler::current_module_index();
+    let resolved = crate::kernel::loader::resolve_export_for_module(module_idx, hash)
+        .unwrap_or(0);
+    if resolved == 0 { return None; }
+    let state = scheduler::get_module_state(module_idx);
+    if state.is_null() { return None; }
+    Some((resolved, state))
+}
+
 unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::{dev_system, RegisterProviderArgs};
     use crate::kernel::{provider, scheduler};
@@ -668,6 +685,42 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             let idx = unsafe { core::ptr::read(arg) } as usize;
             if scheduler::module_is_finished(idx) { 1 } else { 0 }
         }
+        // ── Blob store (forwarded to modules/foundation/blob_store) ──
+        dev_system::BLOB_STORE_ENABLE => {
+            match unsafe { resolve_register_target(arg, arg_len) } {
+                Some((f, state)) => {
+                    let dispatch: crate::kernel::blob_store::BlobStoreDispatchFn =
+                        unsafe { core::mem::transmute(f) };
+                    unsafe { crate::kernel::blob_store::register(dispatch, state); }
+                    0
+                }
+                None => E_INVAL,
+            }
+        }
+        dev_system::BLOB_PUT | dev_system::BLOB_GET | dev_system::BLOB_DELETE => {
+            crate::kernel::blob_store::dispatch(opcode, arg, arg_len)
+        }
+
+        // ── A/B graph slots (forwarded to modules/foundation/graph_slot) ──
+        dev_system::GRAPH_SLOT_ENABLE => {
+            match unsafe { resolve_register_target(arg, arg_len) } {
+                Some((f, state)) => {
+                    let dispatch: crate::kernel::graph_slot::GraphSlotDispatchFn =
+                        unsafe { core::mem::transmute(f) };
+                    unsafe { crate::kernel::graph_slot::register(dispatch, state); }
+                    0
+                }
+                None => E_INVAL,
+            }
+        }
+        dev_system::GRAPH_SLOT_ACTIVE
+        | dev_system::GRAPH_SLOT_ERASE
+        | dev_system::GRAPH_SLOT_WRITE
+        | dev_system::GRAPH_SLOT_ACTIVATE
+        | dev_system::GRAPH_SLOT_CONFIG_ADDR => {
+            crate::kernel::graph_slot::dispatch(opcode, arg, arg_len)
+        }
+
         dev_system::RECONFIGURE_TRIGGER_REBUILD => {
             // arg = [config_ptr:usize, config_len:usize] (platform pointer size)
             let ptr_size = core::mem::size_of::<usize>();

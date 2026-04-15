@@ -381,9 +381,49 @@ pub unsafe fn merge_runtime_overrides(module_id: u8, param_buf: *mut u8, param_l
 // Raw flash bridge — thin kernel-side operations called by flash module
 // ============================================================================
 
-/// Erase the runtime store sector. Validates offset == runtime_store::OFFSET.
+/// Bounds-check a flash offset against all regions writable via the raw
+/// bridge. Returns true when `offset` lies within the `size`-byte
+/// region starting at a known-writable sector.
+fn is_writable_sector(offset: u32, size: u32) -> bool {
+    use crate::abi::{blob_store, graph_slot};
+    let end = offset.saturating_add(size);
+
+    // Runtime parameter store — one sector.
+    if offset >= runtime_store::OFFSET
+        && end <= runtime_store::OFFSET + SECTOR_SIZE as u32
+    {
+        return true;
+    }
+
+    // Blob store — two-sector ping-pong.
+    if offset >= blob_store::OFFSET
+        && end <= blob_store::OFFSET + blob_store::SIZE as u32
+    {
+        return true;
+    }
+
+    // Graph slots A and B — OTA-writable bundles.
+    if offset >= graph_slot::SLOT_A_OFFSET
+        && end <= graph_slot::SLOT_A_OFFSET + graph_slot::SLOT_SIZE
+    {
+        return true;
+    }
+    if offset >= graph_slot::SLOT_B_OFFSET
+        && end <= graph_slot::SLOT_B_OFFSET + graph_slot::SLOT_SIZE
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Erase a 4KB sector. Validates the offset is sector-aligned and falls
+/// within a known writable region (`is_writable_sector`).
 pub fn raw_erase(offset: u32) -> i32 {
-    if offset != runtime_store::OFFSET {
+    if offset & (SECTOR_SIZE as u32 - 1) != 0 {
+        return crate::kernel::errno::EINVAL;
+    }
+    if !is_writable_sector(offset, SECTOR_SIZE as u32) {
         return crate::kernel::errno::EINVAL;
     }
     unsafe {
@@ -394,12 +434,10 @@ pub fn raw_erase(offset: u32) -> i32 {
     }
 }
 
-/// Program a 256-byte page within the runtime store sector.
-/// Validates offset is within sector bounds.
+/// Program a 256-byte page. Validates the offset falls within a known
+/// writable region (`is_writable_sector`).
 pub fn raw_program(offset: u32, data: *const u8) -> i32 {
-    if offset < runtime_store::OFFSET
-        || offset >= runtime_store::OFFSET + SECTOR_SIZE as u32
-    {
+    if !is_writable_sector(offset, PAGE_SIZE as u32) {
         return crate::kernel::errno::EINVAL;
     }
     unsafe {

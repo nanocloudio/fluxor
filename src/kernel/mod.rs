@@ -6,6 +6,8 @@ pub mod crypto;
 pub mod dtb;
 pub mod key_vault;
 pub mod syscalls;
+pub mod blob_store;
+pub mod graph_slot;
 pub mod channel;
 pub mod config;
 pub mod scheduler;

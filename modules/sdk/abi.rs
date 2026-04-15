@@ -629,6 +629,48 @@ pub mod dev_system {
     /// handle=-1, arg=[module_idx:u8]. Returns 1 if finished, 0 otherwise.
     pub const RECONFIGURE_MODULE_DONE: u32 = 0x0C6F;
 
+    // ── Content-addressed blob store ─────────────────────────────────────
+    // The blob_store PIC module owns the on-flash format; the kernel
+    // provides a dispatch hook and forwards PUT/GET/DELETE here.
+
+    /// Register the blob_store dispatch function. Called by the blob_store
+    /// module during its first step. handle=-1, arg=[dispatch_hash:u32 LE].
+    /// Returns 0 on success, negative errno on failure.
+    pub const BLOB_STORE_ENABLE: u32 = 0x0C80;
+    /// Upsert a blob. handle=-1,
+    /// arg=[key:16, val_len:u16 LE, value:val_len]. Returns 0 or -errno.
+    pub const BLOB_PUT: u32 = 0x0C81;
+    /// Read a blob. handle=-1, arg=[key:16] (in), writes value bytes to
+    /// `arg[16..16+val_len]`, returns val_len or -ENOENT.
+    pub const BLOB_GET: u32 = 0x0C82;
+    /// Delete a blob. handle=-1, arg=[key:16]. Returns 0 or -ENOENT.
+    pub const BLOB_DELETE: u32 = 0x0C83;
+
+    // ── A/B graph slots ───────────────────────────────────────────────────
+    // The graph_slot PIC module owns the on-flash format; the kernel
+    // forwards these opcodes to its dispatch function.
+
+    /// Register the graph_slot dispatch function.
+    /// handle=-1, arg=[dispatch_hash:u32 LE]. Returns 0 or -errno.
+    pub const GRAPH_SLOT_ENABLE: u32 = 0x0C90;
+    /// Query which slot is currently live.
+    /// handle=-1, arg=NULL. Returns 0 (slot A), 1 (slot B), or -1 (neither).
+    pub const GRAPH_SLOT_ACTIVE: u32 = 0x0C91;
+    /// Erase the inactive slot (required before writes).
+    /// handle=-1, arg=NULL. Returns 0 or -errno.
+    pub const GRAPH_SLOT_ERASE: u32 = 0x0C92;
+    /// Write a 256-byte page to the inactive slot.
+    /// handle=-1, arg=[offset_in_slot:u32 LE, page:256 bytes]. Returns 0 or -errno.
+    pub const GRAPH_SLOT_WRITE: u32 = 0x0C93;
+    /// Mark the inactive slot active by bumping its epoch.
+    /// handle=-1, arg=NULL. Computes SHA-256 over (modules || config)
+    /// and validates against the header before activating.
+    /// Returns 0 or -errno.
+    pub const GRAPH_SLOT_ACTIVATE: u32 = 0x0C94;
+    /// Return the live slot's absolute flash address of its config blob.
+    /// handle=-1, arg=NULL. Returns u32 (as i32) address, or -1 if no live slot.
+    pub const GRAPH_SLOT_CONFIG_ADDR: u32 = 0x0C95;
+
     // ── Bridge channels ──────────────────────────────────────────────────
 
     /// Write data to a bridge channel.
@@ -872,6 +914,62 @@ pub mod runtime_store {
     pub const MAGIC: u32 = 0x4650_5846;
     /// Sector format version.
     pub const VERSION: u8 = 1;
+}
+
+/// A/B graph slot constants.
+///
+/// Two 512 KB regions that each hold one version of the graph bundle
+/// (modules table + static config). The slot with a valid magic and
+/// higher epoch is live; OTA writes target the other slot and become
+/// live by incrementing the epoch. The firmware itself is not stored
+/// here — it lives at flash offset 0 and is unchanged by live
+/// reconfigure.
+///
+/// Slot header (256 bytes, at the start of each slot):
+///
+///   offset 0..4    magic  "FXSL"
+///   offset 4       version (1)
+///   offset 5..8    reserved
+///   offset 8..16   epoch (u64 LE, higher wins)
+///   offset 16..20  modules_offset (u32 LE, relative to slot start)
+///   offset 20..24  modules_size   (u32 LE)
+///   offset 24..28  config_offset  (u32 LE, relative to slot start)
+///   offset 28..32  config_size    (u32 LE)
+///   offset 32..64  sha256 over (modules_bytes || config_bytes)
+///   offset 64..256 reserved
+pub mod graph_slot {
+    // Slots sit just below the blob store at the top of flash, preserving
+    // the existing firmware+modules+config budget at offset 0.
+    pub const SLOT_A_OFFSET: u32 = 0x002F_D000;
+    pub const SLOT_B_OFFSET: u32 = 0x0037_D000;
+    pub const SLOT_SIZE: u32 = 0x0008_0000;  // 512 KB
+    pub const MAGIC: u32 = 0x4C53_5846;      // "FXSL"
+    pub const VERSION: u8 = 1;
+    pub const HEADER_SIZE: usize = 256;
+}
+
+/// Content-addressed blob store constants.
+///
+/// Two-sector ping-pong layout immediately below the runtime parameter
+/// store. At any time the sector with the higher epoch and a valid
+/// checksum is live; writes target the other sector and become live by
+/// incrementing the epoch. Keys are fixed 16-byte byte arrays (caller-
+/// supplied hashes). Values up to `MAX_VALUE_SIZE` bytes.
+pub mod blob_store {
+    /// Flash offset of sector A.
+    pub const OFFSET: u32 = 0x003F_D000;
+    /// Total size (two 4KB sectors).
+    pub const SIZE: usize = 8192;
+    /// Sector size.
+    pub const SECTOR_SIZE: u32 = 4096;
+    /// Sector header magic ("FXBS" little-endian).
+    pub const MAGIC: u32 = 0x5342_5846;
+    /// Sector format version.
+    pub const VERSION: u8 = 1;
+    /// Fixed key size in bytes.
+    pub const KEY_SIZE: usize = 16;
+    /// Maximum value size per blob.
+    pub const MAX_VALUE_SIZE: usize = 1024;
 }
 
 /// UART opcodes (0x0D00-0x0DFF)

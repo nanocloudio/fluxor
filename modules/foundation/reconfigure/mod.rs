@@ -37,6 +37,11 @@ const SYS_RECONFIG_TRIGGER_REBUILD: u32 = 0x0C6D;
 const SYS_RECONFIG_MODULE_UPSTREAM: u32 = 0x0C6E;
 const SYS_RECONFIG_MODULE_DONE: u32     = 0x0C6F;
 
+// Optional graph_slot integration. When a graph_slot provider is
+// registered, the reconfigure module activates the staged slot so the
+// post-rebuild boot loads its modules and config.
+const SYS_GRAPH_SLOT_ACTIVATE: u32      = 0x0C94;
+
 // Phase values mirror scheduler::ReconfigurePhase.
 const PHASE_RUNNING: u8   = 0;
 const PHASE_DRAINING: u8  = 1;
@@ -255,7 +260,13 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
 unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
     sys_set_phase(sys, PHASE_MIGRATING);
     s.phase = PHASE_MIGRATING;
-    // Null pointer + zero length tells the main loop to reload STATIC_CONFIG.
+    // If a graph_slot provider is registered and an activation succeeds,
+    // the kernel's boot-time layout scan will pick the newly-live slot on
+    // the next rebuild. A negative return means no graph_slot is present
+    // (ENOSYS) or the staged slot failed integrity — either way we fall
+    // back to the current STATIC_CONFIG, which is the same image we are
+    // already running. The rebuild path is therefore idempotent on failure.
+    let _ = (sys.dev_call)(-1, SYS_GRAPH_SLOT_ACTIVATE, core::ptr::null_mut(), 0);
     sys_trigger_rebuild(sys, 0, 0);
 }
 

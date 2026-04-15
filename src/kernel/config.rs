@@ -277,11 +277,81 @@ fn get_trailer_addr() -> u32 {
     }
 }
 
-/// Read flash layout from trailer
-///
-/// Returns the addresses for modules and config from the trailer.
-/// Returns None if trailer is invalid or missing.
+/// Read flash layout. On targets that expose A/B graph slots, the slot
+/// with a valid header and the higher epoch wins; otherwise the
+/// layout trailer at the end of the firmware is used.
 pub fn read_layout() -> Option<FlashLayout> {
+    #[cfg(feature = "rp")]
+    if let Some(layout) = read_layout_from_slots() {
+        return Some(layout);
+    }
+    read_layout_from_trailer()
+}
+
+#[cfg(feature = "rp")]
+fn read_layout_from_slots() -> Option<FlashLayout> {
+    use crate::abi::graph_slot;
+    const XIP_BASE: u32 = 0x1000_0000;
+    let slot_a = (XIP_BASE + graph_slot::SLOT_A_OFFSET) as *const u8;
+    let slot_b = (XIP_BASE + graph_slot::SLOT_B_OFFSET) as *const u8;
+
+    let a = unsafe { decode_slot_header(slot_a) };
+    let b = unsafe { decode_slot_header(slot_b) };
+    let (base, hdr) = match (a, b) {
+        (Some(ha), Some(hb)) => {
+            if ha.epoch >= hb.epoch { (slot_a, ha) } else { (slot_b, hb) }
+        }
+        (Some(ha), None) => (slot_a, ha),
+        (None, Some(hb)) => (slot_b, hb),
+        (None, None) => return None,
+    };
+    let slot_base = base as u32;
+    Some(FlashLayout {
+        modules_addr: slot_base + hdr.modules_offset,
+        config_addr: slot_base + hdr.config_offset,
+    })
+}
+
+#[cfg(feature = "rp")]
+struct SlotHeader {
+    epoch: u64,
+    modules_offset: u32,
+    config_offset: u32,
+}
+
+#[cfg(feature = "rp")]
+unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
+    use crate::abi::graph_slot;
+    let magic = read_u32(base);
+    if magic != graph_slot::MAGIC { return None; }
+    let version = *base.add(4);
+    if version != graph_slot::VERSION { return None; }
+    let epoch = read_u64(base.add(8));
+    let modules_offset = read_u32(base.add(16));
+    let modules_size = read_u32(base.add(20));
+    let config_offset = read_u32(base.add(24));
+    let config_size = read_u32(base.add(28));
+
+    // Both regions must fit inside the slot.
+    if (modules_offset as u64) + (modules_size as u64) > graph_slot::SLOT_SIZE as u64 {
+        return None;
+    }
+    if (config_offset as u64) + (config_size as u64) > graph_slot::SLOT_SIZE as u64 {
+        return None;
+    }
+
+    Some(SlotHeader { epoch, modules_offset, config_offset })
+}
+
+#[cfg(feature = "rp")]
+unsafe fn read_u64(p: *const u8) -> u64 {
+    let lo = read_u32(p) as u64;
+    let hi = read_u32(p.add(4)) as u64;
+    lo | (hi << 32)
+}
+
+/// Read flash layout from the firmware trailer.
+fn read_layout_from_trailer() -> Option<FlashLayout> {
     let trailer_addr = get_trailer_addr();
     let trailer_ptr = trailer_addr as *const u8;
 

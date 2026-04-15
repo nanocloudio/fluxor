@@ -21,7 +21,7 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 
 // Crypto primitives
-include!("sha256.rs");
+include!("../../sdk/sha256.rs");
 include!("sha384.rs");
 include!("hmac.rs");
 include!("chacha20.rs");

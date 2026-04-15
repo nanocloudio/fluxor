@@ -92,6 +92,22 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Build an OTA slot image (modules + config + slot header) for
+    /// writing to a graph_slot A/B region. Excludes firmware.
+    SlotImage {
+        /// Config file (YAML or JSON)
+        config: PathBuf,
+        /// Output slot image (raw binary sized to the slot)
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Target override (default: read from config YAML 'target:' field)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Epoch to embed in the slot header. Must exceed the currently
+        /// live slot's epoch for activation to succeed.
+        #[arg(long, default_value = "1")]
+        epoch: u64,
+    },
     /// Combine firmware.bin + config + modules into a raw boot image
     PackImage {
         /// Firmware binary image
@@ -247,6 +263,12 @@ fn main() {
             config,
             output,
         } => cmd_combine(&firmware, &config, &output, verbose),
+        Commands::SlotImage {
+            config,
+            output,
+            target,
+            epoch,
+        } => cmd_slot_image(&config, &output, target.as_deref(), epoch, verbose),
         Commands::PackImage {
             firmware,
             config,
@@ -780,15 +802,16 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
         trailer_addr + UF2_BLOCK_ALIGN
     };
 
-    // Ensure combined image doesn't overlap the runtime parameter store sector
-    // (only applicable to flash-based targets, not aarch64 RAM images)
+    // Ensure combined image doesn't overlap any reserved flash region:
+    // graph slot A (OTA), graph slot B (OTA), blob store, or the runtime
+    // parameter store. Only applies to flash-based targets.
     if !is_aarch64 {
-        const RUNTIME_STORE_ADDR: u32 = 0x1000_0000 + 0x003F_F000;
+        const SLOT_A_ADDR: u32 = 0x1000_0000 + 0x002F_D000;
         let config_end = config_addr + config_data.len() as u32;
-        if config_end > RUNTIME_STORE_ADDR {
+        if config_end > SLOT_A_ADDR {
             return Err(error::Error::Config(format!(
-                "Combined image end ({:#010x}) overlaps runtime store at {:#010x}. Reduce firmware/config size.",
-                config_end, RUNTIME_STORE_ADDR
+                "Combined image end ({:#010x}) overlaps reserved OTA/store region at {:#010x}. Reduce firmware/config size.",
+                config_end, SLOT_A_ADDR
             )));
         }
     }
@@ -1008,6 +1031,127 @@ fn build_packaged_blobs(
     Ok((modules_data, config_data))
 }
 
+/// Emit an OTA slot image: 256-byte header + modules table + static config,
+/// padded to the slot size. Layout mirrors `abi::graph_slot`.
+///
+/// The header records the epoch, the in-slot offsets and sizes of the
+/// modules and config regions, and a SHA-256 over their concatenation.
+/// `graph_slot::ACTIVATE` recomputes the hash from flash and rejects
+/// mismatches.
+fn cmd_slot_image(
+    config_path: &PathBuf,
+    output_path: &PathBuf,
+    target_override: Option<&str>,
+    epoch: u64,
+    verbose: bool,
+) -> Result<()> {
+    // Slot layout constants mirror modules/sdk/abi.rs :: graph_slot.
+    const SLOT_SIZE: usize = 0x0008_0000;
+    const HEADER_SIZE: usize = 256;
+    const MODULES_ALIGN: usize = 4096;
+    const SECTION_ALIGN: usize = 256;
+    const MAGIC: u32 = 0x4C53_5846; // "FXSL"
+    const VERSION: u8 = 1;
+
+    // Parse config (reusing the same path as cmd_combine).
+    let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
+    let mut config: serde_json::Value = if config_path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+
+    let target_desc = resolve_target(&config, target_override)?;
+    let project_root = std::env::current_dir().unwrap_or_default();
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+
+    if let Some(ref defaults) = target_desc.hardware_defaults {
+        let hw = config.get("hardware").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+        let hw_obj = hw.as_object().cloned().unwrap_or_default();
+        let def_obj = defaults.as_object().unwrap();
+        let mut merged = hw_obj;
+        for (key, val) in def_obj {
+            if !merged.contains_key(key) {
+                merged.insert(key.clone(), val.clone());
+            }
+        }
+        config["hardware"] = serde_json::Value::Object(merged);
+    }
+
+    let validation = board::validate_config(&config, &target_desc)?;
+    if !validation.is_ok() {
+        for err in &validation.errors {
+            eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
+        }
+        return Err(error::Error::Config("Config validation failed for target".into()));
+    }
+
+    let modules_dir_path = format!("target/{}/modules", target_desc.id);
+    let modules_dir = std::path::Path::new(&modules_dir_path);
+    let (modules_data, config_data) =
+        build_packaged_blobs(&config, modules_dir, &[], &target_desc, verbose)?;
+    let modules_data = modules_data.ok_or_else(|| {
+        error::Error::Config("Slot image requires at least one module".into())
+    })?;
+
+    // Lay out the slot: header | pad → 4KB | modules | pad → 256B | config.
+    let modules_offset = ((HEADER_SIZE + MODULES_ALIGN - 1) / MODULES_ALIGN) * MODULES_ALIGN;
+    let modules_end = modules_offset + modules_data.len();
+    let config_offset = ((modules_end + SECTION_ALIGN - 1) / SECTION_ALIGN) * SECTION_ALIGN;
+    let config_end = config_offset + config_data.len();
+    if config_end > SLOT_SIZE {
+        return Err(error::Error::Config(format!(
+            "Slot image ({} bytes) exceeds slot size ({} bytes). Reduce modules/config.",
+            config_end, SLOT_SIZE
+        )));
+    }
+
+    // Build the payload bytes that are covered by the SHA-256.
+    let mut payload = Vec::with_capacity(modules_data.len() + config_data.len());
+    payload.extend_from_slice(&modules_data);
+    payload.extend_from_slice(&config_data);
+    let digest = {
+        use sha2::Digest;
+        sha2::Sha256::digest(&payload)
+    };
+
+    // Compose the final slot image.
+    let mut out = vec![0xFFu8; SLOT_SIZE];
+    // Header.
+    out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    out[4] = VERSION;
+    out[8..16].copy_from_slice(&epoch.to_le_bytes());
+    out[16..20].copy_from_slice(&(modules_offset as u32).to_le_bytes());
+    out[20..24].copy_from_slice(&(modules_data.len() as u32).to_le_bytes());
+    out[24..28].copy_from_slice(&(config_offset as u32).to_le_bytes());
+    out[28..32].copy_from_slice(&(config_data.len() as u32).to_le_bytes());
+    out[32..64].copy_from_slice(&digest);
+    // Payload.
+    out[modules_offset..modules_offset + modules_data.len()].copy_from_slice(&modules_data);
+    out[config_offset..config_offset + config_data.len()].copy_from_slice(&config_data);
+
+    std::fs::write(output_path, &out)?;
+    if verbose {
+        eprintln!(
+            "slot image: modules_off=0x{:x} ({} bytes), config_off=0x{:x} ({} bytes), epoch={}",
+            modules_offset, modules_data.len(),
+            config_offset, config_data.len(),
+            epoch,
+        );
+    }
+    println!(
+        "\x1b[1;32mSuccess\x1b[0m {} modules={}K config={}K size={}K epoch={}",
+        output_path.display(),
+        modules_data.len() / 1024,
+        config_data.len() / 1024,
+        SLOT_SIZE / 1024,
+        epoch,
+    );
+    Ok(())
+}
 
 fn cmd_pack_image(
     firmware_path: &PathBuf,
