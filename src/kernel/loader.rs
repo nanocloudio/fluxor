@@ -291,58 +291,182 @@ pub fn pic_irq_disabled_count() -> u32 {
 // State pool
 // ============================================================================
 
-/// Bump-allocated arena for module state buffers.
-/// Each module gets exactly what module_state_size() reports.
-/// Reset on graph reconfigure via reset_state_arena().
+/// Pool of state buffers for PIC modules.
 ///
-/// Must be 4-byte aligned so that allocations at aligned offsets
-/// produce 4-byte-aligned pointers (ARM requires aligned access for
-/// struct fields like pointers and u32).
+/// The pool is a bump allocator with a bounded free list for granular
+/// reuse. Allocations served from the free list (first-fit over freed
+/// regions); when no free region is large enough, the pool bumps
+/// `STATE_ARENA_OFFSET` upward. `free_state_range` returns a region to
+/// the free list, coalescing with adjacent free regions. When the region
+/// being freed ends at the high-water mark, the bump offset is lowered.
+///
+/// `reset_state_arena` clears the free list and resets the bump offset,
+/// returning the entire pool to empty. This is the path taken by the
+/// atomic graph reconfigure in `prepare_graph`.
+///
+/// Must be 4-byte aligned so aligned offsets produce 4-byte-aligned
+/// pointers (ARM requires aligned access for struct fields like pointers
+/// and u32).
 #[repr(C, align(4))]
 struct AlignedArena([u8; STATE_ARENA_SIZE]);
 static mut STATE_ARENA: AlignedArena = AlignedArena([0; STATE_ARENA_SIZE]);
 
-/// Current bump offset into STATE_ARENA.
+/// Bump offset — high-water mark. Memory at `[0, STATE_ARENA_OFFSET)`
+/// has been handed out at some point; free holes in that range are
+/// recorded in `FREE_LIST`.
 static mut STATE_ARENA_OFFSET: usize = 0;
 
-/// Allocate a state buffer of `size` bytes from the arena.
+/// Free-list entry describing a reusable hole.
+#[derive(Copy, Clone)]
+struct FreeRegion {
+    offset: u32,
+    size: u32,
+}
+
+/// Bounded free list. Coalescing keeps fragmentation manageable in
+/// practice. When the free list is full, a freed region is leaked until
+/// the next full `reset_state_arena`.
+const MAX_FREE_REGIONS: usize = 32;
+static mut FREE_LIST: [FreeRegion; MAX_FREE_REGIONS] =
+    [FreeRegion { offset: 0, size: 0 }; MAX_FREE_REGIONS];
+static mut FREE_COUNT: usize = 0;
+
+const STATE_ALIGN: usize = 8;
+
+#[inline]
+fn align_up(n: usize) -> usize {
+    (n + STATE_ALIGN - 1) & !(STATE_ALIGN - 1)
+}
+
+/// Allocate a state buffer of `size` bytes from the pool.
 ///
-/// Returns pointer to zeroed buffer, aligned to 4 bytes.
+/// Returns a pointer to a zeroed, 8-byte-aligned buffer. Served from
+/// the free list if a region fits; otherwise bumps the high-water mark.
 pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
     // SAFETY: Single-threaded embedded context, no concurrent access
     unsafe {
-        // Align offset up to 8 bytes (aarch64 pointer alignment)
-        let aligned = (STATE_ARENA_OFFSET + 7) & !7;
-        if aligned + size > STATE_ARENA_SIZE {
+        let need = align_up(size);
+
+        // 1. Scan free list for first-fit.
+        let free_list = &raw mut FREE_LIST;
+        let count = FREE_COUNT;
+        let mut i = 0;
+        while i < count {
+            let region = (*free_list)[i];
+            if (region.size as usize) >= need {
+                let offset = region.offset as usize;
+                let remainder = region.size as usize - need;
+                if remainder == 0 {
+                    // Consume the whole region: compact the list.
+                    for j in i..count - 1 {
+                        (*free_list)[j] = (*free_list)[j + 1];
+                    }
+                    FREE_COUNT = count - 1;
+                } else {
+                    // Shrink: advance the region past the allocation.
+                    (*free_list)[i] = FreeRegion {
+                        offset: (offset + need) as u32,
+                        size: remainder as u32,
+                    };
+                }
+                let ptr = core::ptr::addr_of_mut!(STATE_ARENA.0)
+                    .cast::<u8>()
+                    .add(offset);
+                core::ptr::write_bytes(ptr, 0, size);
+                return Ok(ptr);
+            }
+            i += 1;
+        }
+
+        // 2. Bump from the high-water mark.
+        let aligned = align_up(STATE_ARENA_OFFSET);
+        if aligned + need > STATE_ARENA_SIZE {
             log::error!("[loader] state arena full need={} used={} cap={}",
-                size, aligned, STATE_ARENA_SIZE);
+                need, aligned, STATE_ARENA_SIZE);
             return Err(LoaderError::StatePoolExhausted);
         }
-        let ptr = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>().add(aligned);
+        let ptr = core::ptr::addr_of_mut!(STATE_ARENA.0)
+            .cast::<u8>()
+            .add(aligned);
         core::ptr::write_bytes(ptr, 0, size);
-        STATE_ARENA_OFFSET = aligned + size;
+        STATE_ARENA_OFFSET = aligned + need;
         Ok(ptr)
     }
 }
 
-/// Return current arena usage: (used_bytes, total_bytes).
+/// Return high-water mark: (used_bytes, total_bytes). Does not reflect
+/// free-list holes — live memory is (used − Σ holes).
 pub fn arena_usage() -> (usize, usize) {
     unsafe { (STATE_ARENA_OFFSET, STATE_ARENA_SIZE) }
 }
 
-/// Free a state buffer — no-op for arena allocator.
-/// Full reset happens via reset_state_arena() on graph reconfigure.
-fn free_state(_ptr: *mut u8) {
-    // Arena: individual free is a no-op
+/// Return a previously allocated region to the pool. `size` must match
+/// the original allocation size; it is re-aligned internally. Adjacent
+/// free regions are coalesced. If the region ends at the high-water
+/// mark, the mark is lowered.
+///
+/// # Safety
+/// `ptr` must have been returned by `alloc_state` and not already freed.
+pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 { return; }
+    let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>();
+    let offset = ptr as usize - base as usize;
+    let need = align_up(size);
+
+    let free_list = &raw mut FREE_LIST;
+    let mut new_offset = offset as u32;
+    let mut new_size = need as u32;
+
+    // Coalesce with adjacent regions (walk + merge + remove merged entries).
+    let mut i = 0;
+    while i < FREE_COUNT {
+        let r = (*free_list)[i];
+        if r.offset + r.size == new_offset {
+            // Previous neighbour: absorb.
+            new_offset = r.offset;
+            new_size += r.size;
+            for j in i..FREE_COUNT - 1 {
+                (*free_list)[j] = (*free_list)[j + 1];
+            }
+            FREE_COUNT -= 1;
+            continue;
+        }
+        if new_offset + new_size == r.offset {
+            // Next neighbour: absorb.
+            new_size += r.size;
+            for j in i..FREE_COUNT - 1 {
+                (*free_list)[j] = (*free_list)[j + 1];
+            }
+            FREE_COUNT -= 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    // If the region ends at the high-water mark, retract instead of storing.
+    if (new_offset + new_size) as usize == STATE_ARENA_OFFSET {
+        STATE_ARENA_OFFSET = new_offset as usize;
+        return;
+    }
+
+    // Otherwise record in the free list; if full, the region is leaked
+    // until the next full reset.
+    if FREE_COUNT < MAX_FREE_REGIONS {
+        (*free_list)[FREE_COUNT] = FreeRegion { offset: new_offset, size: new_size };
+        FREE_COUNT += 1;
+    } else {
+        log::warn!("[loader] free list full; leaking {} bytes until reset", new_size);
+    }
 }
 
-/// Reset the arena for a new graph configuration.
-/// Called from scheduler before instantiating modules.
+/// Reset the pool: clear the free list and drop the high-water mark to 0.
+/// Called from scheduler at the start of `prepare_graph`.
 pub fn reset_state_arena() {
     // SAFETY: Single-threaded embedded context
     unsafe {
         STATE_ARENA_OFFSET = 0;
-        // Don't zero the whole arena — alloc_state zeros each allocation
+        FREE_COUNT = 0;
+        // Content is not zeroed; alloc_state zeros each allocation.
     }
 }
 
@@ -995,6 +1119,9 @@ pub unsafe fn invoke_new(
 pub struct DynamicModule {
     step_fn: ModuleStepFn,
     state_ptr: *mut u8,
+    /// Size of the state buffer `state_ptr` points into. Needed so the
+    /// pool can reclaim the region on module teardown.
+    state_size: u32,
     /// Optional drain function pointer (resolved from module_drain export).
     /// None if the module does not export module_drain.
     drain_fn: Option<ModuleDrainFn>,
@@ -1089,6 +1216,7 @@ impl DynamicModulePending {
                 Ok(Some(DynamicModule {
                     step_fn: self.step_fn,
                     state_ptr: self.state_ptr,
+                    state_size: self.state_size as u32,
                     drain_fn: self.drain_fn,
                 }))
             }
@@ -1096,9 +1224,10 @@ impl DynamicModulePending {
         }
     }
 
-    /// Free state if we're dropping without completing
+    /// Release this pending module's state buffer back to the pool.
+    /// Consumes the pending state. Use when dropping without completing.
     pub unsafe fn abort(self) {
-        free_state(self.state_ptr);
+        free_state_range(self.state_ptr, self.state_size);
     }
 }
 
@@ -1117,8 +1246,21 @@ impl DynamicModule {
     }
 
     /// Create from pre-validated parts (for debug stepping through instantiation).
-    pub fn from_parts(step_fn: ModuleStepFn, state_ptr: *mut u8) -> Self {
-        Self { step_fn, state_ptr, drain_fn: None }
+    pub fn from_parts(step_fn: ModuleStepFn, state_ptr: *mut u8, state_size: u32) -> Self {
+        Self { step_fn, state_ptr, state_size, drain_fn: None }
+    }
+
+    /// Release this module's state buffer back to the pool. Consumes the
+    /// module. Call this only when the module is being torn down.
+    ///
+    /// # Safety
+    /// The module must not be stepped after this call. The caller is
+    /// responsible for also freeing any heap arena recorded separately
+    /// (see `free_state_range`).
+    pub unsafe fn free(self) {
+        if !self.state_ptr.is_null() && self.state_size > 0 {
+            free_state_range(self.state_ptr, self.state_size as usize);
+        }
     }
 
     /// Call module_drain if the module exports it.
@@ -1197,7 +1339,7 @@ impl DynamicModule {
 
         // 5. Initialize module (FFI call, but validated)
         if let Err(e) = invoke_init(module, syscalls, name) {
-            free_state(state_ptr);
+            free_state_range(state_ptr, required_size);
             return Err(e);
         }
 
@@ -1213,6 +1355,7 @@ impl DynamicModule {
                 Ok(StartNewResult::Ready(DynamicModule {
                     step_fn: exports.step_fn,
                     state_ptr,
+                    state_size: required_size as u32,
                     drain_fn,
                 }))
             }

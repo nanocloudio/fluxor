@@ -783,6 +783,7 @@ impl ModuleHints {
 }
 
 /// Per-module arena info: (ptr, size). Null if module has no arena.
+#[derive(Copy, Clone)]
 struct ArenaInfo {
     ptr: *mut u8,
     size: u32,
@@ -2939,6 +2940,48 @@ pub unsafe fn request_rebuild(config_ptr: *const u8, config_len: usize) {
 /// Consume the pending rebuild request, if any.
 pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
     unsafe { (*(&raw mut SCHED)).rebuild_request.take() }
+}
+
+/// Tear down a single module: release its module heap arena, then its
+/// state buffer, back to the loader pool. Clears the slot, port
+/// assignments, hints, drain flags, and finished state so the slot can
+/// be reused.
+///
+/// Intended for use by the graph-rebuild path when only some modules
+/// need to be replaced. Not called by the atomic reconfigure path,
+/// which uses `reset_state_arena` to drop everything at once.
+pub fn free_module_state(module_idx: usize) {
+    if module_idx >= MAX_MODULES { return; }
+    let sched = unsafe { &mut *(&raw mut SCHED) };
+
+    // Heap arena (from module_arena_size export, if any).
+    let arena = sched.arenas[module_idx];
+    if !arena.ptr.is_null() && arena.size > 0 {
+        unsafe { crate::kernel::loader::free_state_range(arena.ptr, arena.size as usize); }
+    }
+    sched.arenas[module_idx] = ArenaInfo::empty();
+
+    // State buffer lives inside the DynamicModule; consume the slot.
+    let slot = core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty);
+    if let ModuleSlot::Dynamic(m) = slot {
+        unsafe { m.free(); }
+    }
+
+    // Reset per-module scheduler bookkeeping so reuse is clean.
+    sched.ports[module_idx] = ModulePorts::empty();
+    sched.hints[module_idx] = ModuleHints::empty();
+    sched.finished[module_idx] = false;
+    sched.ready[module_idx] = true;
+    sched.deferred_ready[module_idx] = false;
+    sched.mailbox_safe[module_idx] = false;
+    sched.in_place_writer[module_idx] = false;
+    sched.upstream_mask[module_idx] = 0;
+    sched.step_period[module_idx] = 0;
+    sched.step_counter[module_idx] = 0;
+    sched.module_code_base[module_idx] = 0;
+    sched.module_code_size[module_idx] = 0;
+    sched.module_export_table[module_idx] = core::ptr::null();
+    sched.module_export_count[module_idx] = 0;
 }
 
 // ============================================================================
