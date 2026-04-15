@@ -534,6 +534,19 @@ pub mod dev_system {
     /// The kernel signals the event when the IRQ fires (ISR-safe).
     /// Returns 0 on success, negative errno on failure.
     pub const IRQ_BIND: u32 = 0x0C51;
+    /// Subscribe to fault events. handle=event_handle (or -1 to unsubscribe).
+    /// Kernel signals the event whenever any module faults. Only one subscriber.
+    pub const FAULT_MONITOR_SUBSCRIBE: u32 = 0x0C52;
+    /// Pop the next fault record from the fault ring.
+    /// handle=-1, arg=12-byte output buffer (FaultRecord layout).
+    /// Returns 1 if a record was copied, 0 if empty, negative on error.
+    pub const FAULT_MONITOR_POP: u32 = 0x0C53;
+    /// Query per-module fault stats. handle=module_idx, arg=12-byte output
+    /// buffer (FaultStats layout). Returns 0 or negative errno.
+    pub const FAULT_STATS_QUERY: u32 = 0x0C54;
+    /// Query step timing histogram. handle=module_idx (or -1 for global),
+    /// arg=output buffer of 8*u32 (bucket counts). Returns 0 or errno.
+    pub const STEP_HISTOGRAM_QUERY: u32 = 0x0C55;
     /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
     pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
     /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).

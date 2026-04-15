@@ -1208,6 +1208,77 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
         }
     }
 
+    // Tag 0xF4: trust_tier (u8: 0=platform, 1=verified, 2=community, 3=unsigned).
+    // Per-module field wins; `default_trust_tier` at the top level or under
+    // `graph:` applies to any module that omits it. Defaults to `platform`
+    // (most permissive) for first-party builds.
+    let tier_str = module
+        .get("trust_tier")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            config
+                .get("default_trust_tier")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    config
+                        .get("graph")
+                        .and_then(|g| g.get("default_trust_tier"))
+                        .and_then(|v| v.as_str())
+                })
+        })
+        .unwrap_or("platform");
+    let tier_val: u8 = match tier_str {
+        "platform" => 0,
+        "verified" => 1,
+        "community" => 2,
+        "unsigned" => 3,
+        _ => 0,
+    };
+    if base + extra_len + 3 < entry.len() {
+        entry[base + extra_len] = 0xF4;
+        entry[base + extra_len + 1] = 1;
+        entry[base + extra_len + 2] = tier_val;
+        extra_len += 3;
+    }
+
+    // Tag 0xF5: protection level (u8: 0=none, 1=guarded, 2=isolated).
+    // An explicit `protection:` on the module (or the graph) wins; otherwise
+    // derive from the trust tier:
+    //   platform  -> none
+    //   verified  -> guarded
+    //   community -> isolated
+    //   unsigned  -> isolated (signature enforcement refuses the load elsewhere)
+    let explicit_prot = module
+        .get("protection")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            config
+                .get("protection")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    config
+                        .get("graph")
+                        .and_then(|g| g.get("protection"))
+                        .and_then(|v| v.as_str())
+                })
+        });
+    let prot_val: u8 = match explicit_prot {
+        Some("none") => 0,
+        Some("guarded") => 1,
+        Some("isolated") => 2,
+        _ => match tier_val {
+            0 => 0, // platform -> none
+            1 => 1, // verified -> guarded
+            _ => 2, // community/unsigned -> isolated
+        },
+    };
+    if base + extra_len + 3 < entry.len() {
+        entry[base + extra_len] = 0xF5;
+        entry[base + extra_len + 1] = 1;
+        entry[base + extra_len + 2] = prot_val;
+        extra_len += 3;
+    }
+
     // Tag 10: cert_file (DER blob, extended TLV for > 255 bytes)
     if let Some(cert_path) = module.get("cert_file").and_then(|v| v.as_str()) {
         match std::fs::read(cert_path) {

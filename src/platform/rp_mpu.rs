@@ -198,6 +198,34 @@ mod rp2350_impl {
     struct ModuleStack([u8; MODULE_STACK_SIZE]);
     static mut MODULE_PSP_STACK: ModuleStack = ModuleStack([0; MODULE_STACK_SIZE]);
 
+    /// Magic word written across a 32-byte band at the bottom of the module
+    /// PSP stack. The MPU's eight regions are fully committed to code/data/
+    /// syscalls/module-state/heap/channels/MMIO, leaving no hardware region
+    /// for a guard page, so overflow detection is software-only: the
+    /// scheduler verifies these cells after each step.
+    const STACK_CANARY_WORD: u32 = 0xDEAD_C0DE;
+    const STACK_CANARY_CELLS: usize = 8;
+
+    /// Initialise stack canary cells at the bottom of the module PSP stack.
+    pub unsafe fn init_stack_canary() {
+        let base = core::ptr::addr_of_mut!(MODULE_PSP_STACK.0).cast::<u32>();
+        for i in 0..STACK_CANARY_CELLS {
+            unsafe { core::ptr::write_volatile(base.add(i), STACK_CANARY_WORD); }
+        }
+    }
+
+    /// Check whether the stack canary is still intact.
+    /// Returns `true` if unchanged, `false` if the stack overflowed.
+    pub unsafe fn check_stack_canary() -> bool {
+        let base = core::ptr::addr_of!(MODULE_PSP_STACK.0).cast::<u32>();
+        for i in 0..STACK_CANARY_CELLS {
+            if unsafe { core::ptr::read_volatile(base.add(i)) } != STACK_CANARY_WORD {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Align address down to 32-byte boundary (ARMv8-M MPU requirement).
     #[inline]
     const fn align_down_32(addr: u32) -> u32 {
@@ -752,7 +780,30 @@ mod rp2350_impl {
 /// Initialize hardware isolation (MPU on RP2350, no-op on RP2040/BCM2712).
 pub fn init() {
     #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-    rp2350_impl::mpu_init();
+    {
+        rp2350_impl::mpu_init();
+        unsafe { rp2350_impl::init_stack_canary(); }
+    }
+}
+
+/// Verify the module stack canary. Returns `true` if intact, `false` if an
+/// overflow has clobbered it.
+pub fn check_stack_canary() -> bool {
+    #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
+    {
+        // The canary only guards the unprivileged PSP stack, which is only
+        // in use once isolation is enabled.
+        if !rp2350_impl::is_enabled() { return true; }
+        unsafe { rp2350_impl::check_stack_canary() }
+    }
+    #[cfg(any(not(feature = "rp"), feature = "chip-rp2040"))]
+    { true }
+}
+
+/// Re-write the stack canary after an overflow has been recorded.
+pub fn reinit_stack_canary() {
+    #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
+    unsafe { rp2350_impl::init_stack_canary(); }
 }
 
 /// Register a module's memory regions for isolation.

@@ -23,9 +23,9 @@ use crate::kernel::syscalls::{
     is_spi_initialized,
 };
 use crate::kernel::channel;
-use crate::kernel::channel::{CHANNEL_TYPE_PIPE, POLL_IN, POLL_OUT, POLL_HUP, POLL_ERR, channel_set_flags, channel_set_mailbox};
+use crate::kernel::channel::{POLL_IN, POLL_OUT, POLL_HUP, POLL_ERR, channel_set_flags, channel_set_mailbox};
 use crate::kernel::syscalls as syscalls;
-use crate::kernel::step_guard::{self, ModuleFaultInfo, FaultState, FaultPolicy, FaultStats, fault_type};
+use crate::kernel::step_guard::{self, ModuleFaultInfo, FaultState, FaultPolicy, FaultStats, FaultRecord, fault_type};
 use crate::modules::{Module, StepOutcome};
 
 // ============================================================================
@@ -306,11 +306,16 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             }
         };
 
+        let producer_mod = edge.from_module as u8;
         let chan = if buf_size > 0 {
             let config = buf_size.to_le_bytes();
-            syscalls::channel_open(CHANNEL_TYPE_PIPE, config.as_ptr(), 2)
+            channel::channel_open_for_module(
+                channel::CHANNEL_TYPE_PIPE, config.as_ptr(), 2, producer_mod,
+            )
         } else {
-            syscalls::channel_open(CHANNEL_TYPE_PIPE, null(), 0)
+            channel::channel_open_for_module(
+                channel::CHANNEL_TYPE_PIPE, null(), 0, producer_mod,
+            )
         };
 
         if chan < 0 {
@@ -891,6 +896,12 @@ pub struct SchedulerState {
     module_export_table: [*const u8; MAX_MODULES],
     /// Export count per module
     module_export_count: [u16; MAX_MODULES],
+
+    // ── Step timing histogram (8 log2 buckets) ─────────────────────
+    /// Per-module bucket counts: <64us, <128, <256, <512, <1024, <2048, <4096, >=4096
+    step_hist: [[u32; 8]; MAX_MODULES],
+    /// Global bucket counts across all modules.
+    step_hist_global: [u32; 8],
 }
 
 impl SchedulerState {
@@ -935,6 +946,8 @@ impl SchedulerState {
             module_code_size: [0; MAX_MODULES],
             module_export_table: [core::ptr::null(); MAX_MODULES],
             module_export_count: [0; MAX_MODULES],
+            step_hist: [[0; 8]; MAX_MODULES],
+            step_hist_global: [0; 8],
         }
     }
 
@@ -966,7 +979,9 @@ impl SchedulerState {
             self.module_code_size[i] = 0;
             self.module_export_table[i] = core::ptr::null();
             self.module_export_count[i] = 0;
+            self.step_hist[i] = [0; 8];
         }
+        self.step_hist_global = [0; 8];
         self.exec_order_count = 0;
         self.graph_sample_rate = 0;
         self.tick_us = 0;
@@ -1215,6 +1230,48 @@ pub fn downstream_latency(module_idx: usize) -> u32 {
     }
 }
 
+/// Bucket index for a step elapsed time in microseconds.
+/// 0: <64, 1: <128, 2: <256, 3: <512, 4: <1024, 5: <2048, 6: <4096, 7: >=4096
+#[inline]
+fn step_bucket(elapsed_us: u32) -> usize {
+    if elapsed_us < 64 { 0 }
+    else if elapsed_us < 128 { 1 }
+    else if elapsed_us < 256 { 2 }
+    else if elapsed_us < 512 { 3 }
+    else if elapsed_us < 1024 { 4 }
+    else if elapsed_us < 2048 { 5 }
+    else if elapsed_us < 4096 { 6 }
+    else { 7 }
+}
+
+/// Record a step's elapsed time into per-module and global histograms.
+pub fn record_step_time(module_idx: usize, elapsed_us: u32) {
+    if module_idx >= MAX_MODULES { return; }
+    let b = step_bucket(elapsed_us);
+    unsafe {
+        SCHED.step_hist[module_idx][b] = SCHED.step_hist[module_idx][b].saturating_add(1);
+        SCHED.step_hist_global[b] = SCHED.step_hist_global[b].saturating_add(1);
+    }
+}
+
+/// Query step histogram. `module_idx == usize::MAX` returns the global
+/// histogram; otherwise a per-module histogram. Writes 8 u32 LE to `out_buf`.
+pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
+    let hist_ptr: *const [u32; 8] = if module_idx == usize::MAX {
+        &raw const SCHED.step_hist_global
+    } else if module_idx < MAX_MODULES {
+        unsafe { (&raw const SCHED.step_hist).cast::<[u32; 8]>().add(module_idx) }
+    } else {
+        return crate::kernel::errno::EINVAL;
+    };
+    for i in 0..8 {
+        let v = unsafe { (*hist_ptr)[i] };
+        let bytes = v.to_le_bytes();
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.add(i * 4), 4); }
+    }
+    0
+}
+
 /// Get fault statistics for a module (for dev_query FAULT_STATS).
 pub fn get_fault_stats(module_idx: usize) -> FaultStats {
     if module_idx >= MAX_MODULES {
@@ -1417,6 +1474,17 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     if open_channels(&mut edges[..runtime_edge_count]) < 0 {
         log::error!("[graph] channel open failed");
         return Err(-1);
+    }
+
+    // Register each module's channel-buffer range with the MPU/MMU so an
+    // isolated module sees only its own buffers through region 6.
+    for i in 0..module_count {
+        let (base, size) = crate::kernel::buffer_pool::compute_module_buffer_range(i as u8);
+        if size > 0 {
+            crate::kernel::mpu::set_channel_region(i, base as u32, size as u32);
+            #[cfg(feature = "chip-bcm2712")]
+            crate::kernel::mmu::set_channel_region(i, base as u64, size as u64);
+        }
     }
 
     // Compute topological execution order
@@ -2287,7 +2355,23 @@ fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 // restart_backoff_ms (u16 LE)
                 fi.restart_backoff_ms = u16::from_le_bytes([params[pos], params[pos+1]]);
             }
-            _ => {} // Unknown tag — skip
+            0xF4 if len == 1 => {
+                // trust_tier: 0=platform, 1=verified, 2=community, 3=unsigned.
+                // Signature verification happens in the loader; this tag only
+                // surfaces the outcome for telemetry.
+                if params[pos] == 3 {
+                    log::warn!("[trust] module {} is unsigned", module_idx);
+                }
+            }
+            0xF5 if len == 1 => {
+                // protection: 0=none, 1=guarded, 2=isolated.
+                // An isolated module opts the whole graph into MPU isolation;
+                // per-module MPU regions are registered during instantiation.
+                if params[pos] >= 2 {
+                    crate::kernel::mpu::set_enabled(true);
+                }
+            }
+            _ => {}
         }
 
         pos += len;
@@ -2306,6 +2390,14 @@ fn handle_step_timeout(
     fi.record_fault(fault_type::TIMEOUT, tick);
     log::warn!("[guard] module {} ({}) step timeout (fault #{})",
         module_idx, modules[module_idx].type_name(), fi.fault_count);
+    step_guard::push_fault(FaultRecord {
+        module_idx: module_idx as u8,
+        fault_kind: fault_type::TIMEOUT,
+        _reserved: 0,
+        tick,
+        fault_count: fi.fault_count,
+        restart_count: fi.restart_count,
+    });
 
     if fi.can_restart() {
         fi.state = FaultState::Faulted;
@@ -2329,6 +2421,14 @@ fn handle_step_error(
     let tick = unsafe { DBG_TICK };
     let fi = &mut sched.fault_info[module_idx];
     fi.record_fault(fault_type::STEP_ERROR, tick);
+    step_guard::push_fault(FaultRecord {
+        module_idx: module_idx as u8,
+        fault_kind: fault_type::STEP_ERROR,
+        _reserved: 0,
+        tick,
+        fault_count: fi.fault_count,
+        restart_count: fi.restart_count,
+    });
 
     if fi.can_restart() {
         fi.state = FaultState::Faulted;
@@ -2338,6 +2438,37 @@ fn handle_step_error(
     } else {
         fi.state = FaultState::Terminated;
         finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), context);
+        *active_count -= 1;
+    }
+}
+
+/// Handle an MPU/MMU protection fault: record, emit event, transition state.
+fn handle_mpu_fault(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    module_idx: usize,
+    active_count: &mut usize,
+) {
+    let tick = unsafe { DBG_TICK };
+    let fi = &mut sched.fault_info[module_idx];
+    fi.record_fault(fault_type::MPU_FAULT, tick);
+    log::warn!("[mpu] module {} ({}) protection fault (fault #{})",
+        module_idx, modules[module_idx].type_name(), fi.fault_count);
+    step_guard::push_fault(FaultRecord {
+        module_idx: module_idx as u8,
+        fault_kind: fault_type::MPU_FAULT,
+        _reserved: 0,
+        tick,
+        fault_count: fi.fault_count,
+        restart_count: fi.restart_count,
+    });
+
+    if fi.can_restart() {
+        fi.state = FaultState::Faulted;
+        fi.backoff_remaining = fi.restart_backoff_ms as u32;
+    } else {
+        fi.state = FaultState::Terminated;
+        finalize_module(module_idx, Some(-14), modules[module_idx].type_name(), " (mpu terminated)");
         *active_count -= 1;
     }
 }
@@ -2541,13 +2672,28 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
             // Arm step guard timer
             let deadline = sched.fault_info[module_idx].effective_deadline_us();
             step_guard::arm(deadline);
+            let step_t0 = crate::kernel::hal::now_micros();
 
             match m.step() {
                 Ok(StepOutcome::Continue) => {
                     step_guard::disarm();
+                    let elapsed = (crate::kernel::hal::now_micros() - step_t0) as u32;
+                    record_step_time(module_idx, elapsed);
                     step_guard::post_step_check();
                     if step_guard::check_and_clear_timeout() {
                         handle_step_timeout(sched, modules, module_idx, &mut active_count);
+                    }
+                    if step_guard::check_and_clear_mpu_fault() {
+                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
+                    }
+                    // PSP stack overflow detection: the canary word at the
+                    // bottom of the module stack is clobbered by an overflow.
+                    // Re-arm it so the next module starts with a clean band.
+                    if !crate::kernel::mpu::check_stack_canary() {
+                        log::error!("[mpu] module {} stack canary violated",
+                            module_idx);
+                        crate::kernel::mpu::reinit_stack_canary();
+                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
                     }
                 }
                 Ok(StepOutcome::Ready) => {
@@ -2607,10 +2753,16 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
                     if step_guard::check_and_clear_timeout() {
                         handle_step_timeout(sched, modules, module_idx, &mut active_count);
                     }
+                    if step_guard::check_and_clear_mpu_fault() {
+                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
+                    }
                 }
                 Err(rc) => {
                     step_guard::disarm();
                     handle_step_error(sched, modules, module_idx, rc, &mut active_count, "");
+                    if step_guard::check_and_clear_mpu_fault() {
+                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
+                    }
                 }
             }
         }

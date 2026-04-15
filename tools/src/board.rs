@@ -614,6 +614,53 @@ fn validate_isolation(
             }
         }
     }
+
+    // Per-module `trust_tier` and `protection` cross-checks.
+    //   trust_tier: platform | verified | community | unsigned
+    //   protection: none     | guarded  | isolated
+    // When `protection` is omitted it defaults from the tier:
+    //   platform -> none,  verified -> guarded,  community/unsigned -> isolated.
+    let valid_tiers = ["platform", "verified", "community", "unsigned"];
+    let valid_prot = ["none", "guarded", "isolated"];
+    if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
+        let has_isolation = target.mpu_regions >= 8 || target.has_mmu;
+        for (i, m) in modules.iter().enumerate() {
+            if let Some(t) = m.get("trust_tier").and_then(|v| v.as_str()) {
+                if !valid_tiers.contains(&t) {
+                    result.add_error(format!(
+                        "modules[{i}]: invalid trust_tier '{t}' (expected one of {valid_tiers:?})",
+                    ));
+                }
+            }
+            if let Some(p) = m.get("protection").and_then(|v| v.as_str()) {
+                if !valid_prot.contains(&p) {
+                    result.add_error(format!(
+                        "modules[{i}]: invalid protection '{p}' (expected one of {valid_prot:?})",
+                    ));
+                } else if p == "isolated" && !has_isolation {
+                    result.add_error(format!(
+                        "modules[{i}]: protection: isolated requires MPU or MMU, target '{}' lacks both",
+                        target.id,
+                    ));
+                }
+            }
+            // A community/unsigned tier without an explicit protection override
+            // implies isolation — catch targets that can't provide it.
+            let tier = m.get("trust_tier").and_then(|v| v.as_str()).unwrap_or("platform");
+            let explicit_prot = m.get("protection").and_then(|v| v.as_str());
+            if explicit_prot.is_none()
+                && (tier == "community" || tier == "unsigned")
+                && !has_isolation
+            {
+                result.add_error(format!(
+                    "modules[{i}]: trust_tier '{tier}' implies protection: isolated, \
+                     but target '{}' has no MPU/MMU. Either set protection explicitly \
+                     or deploy to a target with isolation.",
+                    target.id,
+                ));
+            }
+        }
+    }
 }
 
 /// Validate paged_arena settings against target capabilities.

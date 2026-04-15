@@ -290,6 +290,11 @@ mod bcm2712_impl {
     /// - Module heap as RW at EL0
     /// - Channel buffers as RW at EL0
     /// - Kernel data: NOT mapped at EL0 (will fault)
+    // Stack guard page is deferred: modules currently execute at EL1 on the
+    // kernel stack, so there is no per-module stack region to protect. Once
+    // modules run at EL0 with their own stacks, leave the lowest 4 KB of
+    // the stack region as an invalid L3 entry — `handle_data_abort` already
+    // routes translation faults into the fault state machine.
     pub fn build_module_page_table(module_idx: usize) {
         if module_idx >= MAX_MODULES {
             return;

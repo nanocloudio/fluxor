@@ -179,7 +179,7 @@ impl ChannelSlot {
         }
     }
 
-    fn try_allocate(&self, idx: usize, buf_capacity: usize) -> bool {
+    fn try_allocate(&self, idx: usize, buf_capacity: usize, producer_module: u8) -> bool {
         if self
             .state
             .compare_exchange(
@@ -191,7 +191,9 @@ impl ChannelSlot {
             .is_ok()
         {
             // Allocate an arena-backed buffer of the requested size
-            let buf_slot = buffer_pool::alloc_streaming(idx as i8, buf_capacity);
+            let buf_slot = buffer_pool::alloc_streaming_for_module(
+                idx as i8, buf_capacity, producer_module,
+            );
             if buf_slot < 0 {
                 // No buffer available, rollback
                 self.state.store(ChannelState::Free as u8, Ordering::Release);
@@ -279,26 +281,33 @@ static CHANNELS: [ChannelSlot; MAX_CHANNELS] = [const { ChannelSlot::new() }; MA
 // ============================================================================
 
 pub fn channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
+    channel_open_for_module(chan_type, config, config_len, 0xFF)
+}
+
+/// Same as `channel_open`, but tags the buffer with its producer module
+/// so the scheduler can compute a per-module MPU region after graph setup.
+pub fn channel_open_for_module(
+    chan_type: u8,
+    config: *const u8,
+    config_len: usize,
+    producer_module: u8,
+) -> i32 {
     if chan_type != CHANNEL_TYPE_PIPE {
         return CHAN_EINVAL;
     }
-    // Read requested buffer size from config (2 bytes LE), or use default.
-    // Always rounds up to a power of two — ring buffer uses bitwise AND
-    // for wrap-around instead of modulo (saves ~20-40 cycles on CM33).
+    // Requested size comes as 2 LE bytes in `config`. Round up to a power of
+    // two so the ring buffer can wrap with a bitwise AND instead of modulo.
     let buf_capacity = if !config.is_null() && config_len >= 2 {
         let size = unsafe {
             u16::from_le_bytes([*config, *config.add(1)]) as usize
         };
-        // Clamp to sane range, then round up to power of two
-        let clamped = size.max(64).min(4096);
-        clamped.next_power_of_two()
+        size.max(64).min(4096).next_power_of_two()
     } else {
-        BUFFER_SIZE // 2048 default (already power of 2)
+        BUFFER_SIZE
     };
 
-    // Allocate a pipe channel with an arena-backed buffer
     for (idx, slot) in CHANNELS.iter().enumerate() {
-        if slot.try_allocate(idx, buf_capacity) {
+        if slot.try_allocate(idx, buf_capacity, producer_module) {
             slot.state
                 .store(ChannelState::Connected as u8, Ordering::Release);
             debug!("channel_open: allocated channel {} buf_size={}", idx, buf_capacity);

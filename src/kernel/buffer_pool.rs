@@ -179,6 +179,9 @@ struct BufferRegistrySlot {
     owner_channel: AtomicI8,
     /// Set when current PRODUCER was acquired via in-place (not fresh write)
     inplace_flag: AtomicU8,
+    /// Producer module index (0xFF if unknown). The scheduler reads this to
+    /// compute a per-module channel-buffer range for an MPU/MMU region.
+    producer_module: AtomicU8,
 }
 
 unsafe impl Sync for BufferRegistrySlot {}
@@ -192,6 +195,7 @@ impl BufferRegistrySlot {
             state: AtomicU8::new(STATE_FREE),
             owner_channel: AtomicI8::new(-1),
             inplace_flag: AtomicU8::new(0),
+            producer_module: AtomicU8::new(0xFF),
         }
     }
 
@@ -299,6 +303,7 @@ impl BufferRegistrySlot {
         self.capacity.store(0, Ordering::Release);
         self.len.store(0, Ordering::Release);
         self.inplace_flag.store(0, Ordering::Release);
+        self.producer_module.store(0xFF, Ordering::Release);
         unsafe { *self.data_ptr.get() = core::ptr::null_mut(); }
     }
 }
@@ -324,6 +329,18 @@ fn valid_slot(slot: i32) -> bool {
 /// `capacity` specifies the buffer size in bytes (e.g. 2048 for audio, 256 for events).
 /// Returns buffer slot index, or -1 if no slot or arena space available.
 pub fn alloc_streaming(channel: i8, capacity: usize) -> i32 {
+    alloc_streaming_for_module(channel, capacity, 0xFF)
+}
+
+/// Allocate a streaming buffer tagged with its producer module.
+///
+/// When channels for the same producer are opened consecutively during graph
+/// setup, the bump allocator places them contiguously so
+/// `compute_module_buffer_range` can report a tight `(base, size)` for a
+/// per-module MPU/MMU region. Interleaved allocations widen the reported
+/// range into a conservative superset — still safe, but may include a peer
+/// module's buffer.
+pub fn alloc_streaming_for_module(channel: i8, capacity: usize, producer_module: u8) -> i32 {
     for (i, slot) in BUFFER_REGISTRY.iter().enumerate() {
         if slot.state.compare_exchange(
             STATE_FREE,
@@ -331,14 +348,15 @@ pub fn alloc_streaming(channel: i8, capacity: usize) -> i32 {
             Ordering::AcqRel,
             Ordering::Acquire,
         ).is_ok() {
-            // Allocate buffer data from the dedicated buffer arena
             match alloc_buffer(capacity) {
                 Some(ptr) => {
                     slot.assign(ptr, capacity, channel);
+                    slot.producer_module.store(producer_module, Ordering::Release);
                     return i as i32;
                 }
                 None => {
-                    // Buffer arena exhausted — roll back slot allocation
+                    // Roll back the slot claim so it can be retried for a
+                    // smaller capacity.
                     slot.state.store(STATE_FREE, Ordering::Release);
                     log::warn!("[buf] arena exhausted size={}", capacity);
                     return -1;
@@ -348,6 +366,25 @@ pub fn alloc_streaming(channel: i8, capacity: usize) -> i32 {
     }
     log::warn!("[buf] no free slots ch={}", channel);
     -1
+}
+
+/// Compute the buffer-address range occupied by a given producer module.
+/// Returns `(base_ptr, size_bytes)`; size is 0 if the module owns no buffers.
+/// Used to register a per-module MPU region for channel buffers.
+pub fn compute_module_buffer_range(module_idx: u8) -> (usize, usize) {
+    let mut lo = usize::MAX;
+    let mut hi: usize = 0;
+    for slot in BUFFER_REGISTRY.iter() {
+        if slot.producer_module.load(Ordering::Acquire) != module_idx {
+            continue;
+        }
+        let ptr = slot.data_ptr() as usize;
+        if ptr == 0 { continue; }
+        let cap = slot.get_capacity() as usize;
+        if ptr < lo { lo = ptr; }
+        if ptr + cap > hi { hi = ptr + cap; }
+    }
+    if hi == 0 { (0, 0) } else { (lo, hi - lo) }
 }
 
 /// Free a streaming buffer slot.

@@ -579,6 +579,49 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             if arg.is_null() || arg_len == 0 { return E_INVAL; }
             hal::csprng_fill(arg, arg_len)
         }
+        // ── Fault monitor ──
+        dev_system::FAULT_MONITOR_SUBSCRIBE => {
+            if handle < 0 {
+                crate::kernel::step_guard::subscribe(-1)
+            } else {
+                // Resolve the event fd to its raw slot so the kernel can
+                // signal it from any context without re-looking-up the tag.
+                let slot = crate::kernel::fd::slot_of(handle);
+                if slot < 0 { return E_INVAL; }
+                crate::kernel::step_guard::subscribe(slot)
+            }
+        }
+        dev_system::FAULT_MONITOR_POP => {
+            use crate::kernel::step_guard::FaultRecord;
+            if arg.is_null() || arg_len < FaultRecord::SIZE { return E_INVAL; }
+            let mut rec = FaultRecord::default();
+            let got = crate::kernel::step_guard::pop_fault(&mut rec);
+            if got == 1 {
+                let bytes = rec.to_bytes();
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, FaultRecord::SIZE);
+            }
+            got
+        }
+        dev_system::FAULT_STATS_QUERY => {
+            use crate::kernel::step_guard::FaultStats;
+            if handle < 0 || handle as usize >= crate::kernel::config::MAX_MODULES {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < core::mem::size_of::<FaultStats>() { return E_INVAL; }
+            let stats = scheduler::get_fault_stats(handle as usize);
+            core::ptr::copy_nonoverlapping(
+                &stats as *const FaultStats as *const u8,
+                arg,
+                core::mem::size_of::<FaultStats>(),
+            );
+            0
+        }
+        dev_system::STEP_HISTOGRAM_QUERY => {
+            // 8 u32 bucket counts = 32 bytes
+            if arg.is_null() || arg_len < 32 { return E_INVAL; }
+            let idx = if handle < 0 { usize::MAX } else { handle as usize };
+            scheduler::query_step_histogram(idx, arg)
+        }
         _ => {
             // Delegate to platform extension for hardware-specific opcodes
             if let Some(ext) = SYSTEM_EXTENSION {

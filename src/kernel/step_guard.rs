@@ -22,7 +22,8 @@
 //! step guard is advisory — it records the timeout but relies on cooperative
 //! return).
 
-use portable_atomic::{AtomicBool, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicI32, Ordering};
+use core::cell::UnsafeCell;
 use crate::kernel::hal;
 
 // ============================================================================
@@ -275,4 +276,134 @@ pub fn disarm() {
 #[inline]
 pub fn post_step_check() {
     hal::step_guard_post_check();
+}
+
+// ============================================================================
+// Fault monitor: broadcast fault records to a subscribing module
+// ============================================================================
+
+/// Externally-visible fault record. Kept compact; serialised LE for monitors.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FaultRecord {
+    /// Module index (0..MAX_MODULES).
+    pub module_idx: u8,
+    /// Fault type (fault_type::*).
+    pub fault_kind: u8,
+    /// Reserved for alignment.
+    pub _reserved: u16,
+    /// Tick at which the fault was observed.
+    pub tick: u32,
+    /// Cumulative fault count for this module after this event.
+    pub fault_count: u16,
+    /// Cumulative restart count for this module after this event.
+    pub restart_count: u16,
+}
+
+impl FaultRecord {
+    pub const SIZE: usize = 12;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0] = self.module_idx;
+        b[1] = self.fault_kind;
+        b[4..8].copy_from_slice(&self.tick.to_le_bytes());
+        b[8..10].copy_from_slice(&self.fault_count.to_le_bytes());
+        b[10..12].copy_from_slice(&self.restart_count.to_le_bytes());
+        b
+    }
+}
+
+/// Ring of recent fault records. Producer and consumer both run on the
+/// kernel thread; atomics guard the indices so an ISR that flags a pending
+/// fault and the thread-mode push cannot race.
+const FAULT_RING_CAP: usize = 16;
+
+struct FaultRing {
+    records: UnsafeCell<[FaultRecord; FAULT_RING_CAP]>,
+    head: AtomicU16,
+    tail: AtomicU16,
+    dropped: AtomicU16,
+}
+
+// SAFETY: The actual push always happens in thread mode from the scheduler
+// (handle_step_timeout / handle_step_error / handle_mpu_fault). ISRs only set
+// a pending flag; they never touch this ring directly.
+unsafe impl Sync for FaultRing {}
+
+static FAULT_RING: FaultRing = FaultRing {
+    records: UnsafeCell::new([FaultRecord {
+        module_idx: 0,
+        fault_kind: 0,
+        _reserved: 0,
+        tick: 0,
+        fault_count: 0,
+        restart_count: 0,
+    }; FAULT_RING_CAP]),
+    head: AtomicU16::new(0),
+    tail: AtomicU16::new(0),
+    dropped: AtomicU16::new(0),
+};
+
+/// Event handle to signal on fault (set by FAULT_MONITOR_SUBSCRIBE syscall).
+/// -1 means no subscriber.
+static FAULT_EVENT_HANDLE: AtomicI32 = AtomicI32::new(-1);
+
+/// Register an event handle to be signaled whenever a fault is recorded.
+/// Pass -1 to unsubscribe. Returns 0.
+pub fn subscribe(event_handle: i32) -> i32 {
+    FAULT_EVENT_HANDLE.store(event_handle, Ordering::Release);
+    0
+}
+
+/// Push a fault record into the ring and signal the subscribed event.
+/// Safe to call from scheduler thread context. Drops oldest if full.
+pub fn push_fault(rec: FaultRecord) {
+    // Emit on the host-facing log transport so `fluxor monitor` can parse
+    // faults without a second channel.
+    log::info!(
+        "MON_FAULT mod={} kind={} fault_count={} restart_count={} tick={}",
+        rec.module_idx, rec.fault_kind, rec.fault_count, rec.restart_count, rec.tick,
+    );
+    let head = FAULT_RING.head.load(Ordering::Relaxed);
+    let tail = FAULT_RING.tail.load(Ordering::Acquire);
+    let next = head.wrapping_add(1);
+    if (next as usize) % FAULT_RING_CAP == (tail as usize) % FAULT_RING_CAP {
+        // Ring full: drop the oldest by advancing the tail.
+        FAULT_RING.tail.store(tail.wrapping_add(1), Ordering::Release);
+        FAULT_RING.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe {
+        let slot = &mut (*FAULT_RING.records.get())[(head as usize) % FAULT_RING_CAP];
+        *slot = rec;
+    }
+    FAULT_RING.head.store(next, Ordering::Release);
+
+    let eh = FAULT_EVENT_HANDLE.load(Ordering::Acquire);
+    if eh >= 0 {
+        // Bypass event_signal's owner check: the kernel is the producer and
+        // has no module identity for the caller.
+        crate::kernel::event::event_signal_from_isr(eh);
+    }
+}
+
+/// Pop the next fault record into `out`. Returns 1 if a record was copied,
+/// 0 if the ring was empty.
+pub fn pop_fault(out: &mut FaultRecord) -> i32 {
+    let tail = FAULT_RING.tail.load(Ordering::Relaxed);
+    let head = FAULT_RING.head.load(Ordering::Acquire);
+    if (head as usize) % FAULT_RING_CAP == (tail as usize) % FAULT_RING_CAP {
+        return 0;
+    }
+    unsafe {
+        let slot = &(*FAULT_RING.records.get())[(tail as usize) % FAULT_RING_CAP];
+        *out = *slot;
+    }
+    FAULT_RING.tail.store(tail.wrapping_add(1), Ordering::Release);
+    1
+}
+
+/// Return the dropped-record count (records overwritten because ring was full).
+pub fn dropped_count() -> u16 {
+    FAULT_RING.dropped.load(Ordering::Relaxed)
 }
