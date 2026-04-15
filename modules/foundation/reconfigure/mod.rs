@@ -42,6 +42,12 @@ const SYS_RECONFIG_MODULE_DONE: u32     = 0x0C6F;
 // post-rebuild boot loads its modules and config.
 const SYS_GRAPH_SLOT_ACTIVATE: u32      = 0x0C94;
 
+// Fault monitor integration. Raise a fault against a module whose drain
+// exceeded its deadline so the unified fault pipeline (monitor CLI,
+// metrics sinks) records it alongside step-guard and MPU faults.
+const SYS_FAULT_RAISE: u32              = 0x0C56;
+const FAULT_KIND_DRAIN_TIMEOUT: u8      = 5;
+
 // Phase values mirror scheduler::ReconfigurePhase.
 const PHASE_RUNNING: u8   = 0;
 const PHASE_DRAINING: u8  = 1;
@@ -66,6 +72,14 @@ const READY: i32    = 3;
 // Sentinel for "self index not yet resolved".
 const SELF_IDX_UNKNOWN: u8 = 0xFF;
 
+// Status event kinds emitted on the output channel. Each record is
+// 8 bytes: `[kind:u8, module_idx:u8, extra:u16 LE, tick:u32 LE]`.
+const STATUS_DRAINING_ENTERED: u8   = 0x01;
+const STATUS_MODULE_DRAINED: u8     = 0x02;
+const STATUS_MODULE_FORCED: u8      = 0x03;
+const STATUS_MIGRATING_ENTERED: u8  = 0x04;
+const STATUS_RECORD_SIZE: usize     = 8;
+
 // ============================================================================
 // State
 // ============================================================================
@@ -74,6 +88,9 @@ const SELF_IDX_UNKNOWN: u8 = 0xFF;
 struct State {
     syscalls: *const SyscallTable,
     ctrl_chan: i32,
+    /// Output channel for structured status events. `-1` when the graph
+    /// does not wire an output; events are silently dropped in that case.
+    status_chan: i32,
     phase: u8,
     self_idx: u8,
     signaled_ready: u8,
@@ -105,6 +122,30 @@ unsafe fn sys_call_drain(sys: &SyscallTable, idx: u8) -> i32 {
 unsafe fn sys_mark_finished(sys: &SyscallTable, idx: u8) {
     let mut arg = [idx];
     (sys.dev_call)(-1, SYS_RECONFIG_MARK_FINISHED, arg.as_mut_ptr(), 1);
+}
+
+unsafe fn sys_fault_raise(sys: &SyscallTable, idx: u8, kind: u8) {
+    let mut arg = [idx, kind];
+    (sys.dev_call)(-1, SYS_FAULT_RAISE, arg.as_mut_ptr(), 2);
+}
+
+/// Write a single 8-byte status record to the output channel. Silently
+/// drops the event if the channel is not wired or the ring is full.
+unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, module_idx: u8, extra: u16) {
+    if s.status_chan < 0 { return; }
+    let mut rec = [0u8; STATUS_RECORD_SIZE];
+    let p = rec.as_mut_ptr();
+    core::ptr::write_volatile(p.add(0), kind);
+    core::ptr::write_volatile(p.add(1), module_idx);
+    let eb = extra.to_le_bytes();
+    core::ptr::write_volatile(p.add(2), eb[0]);
+    core::ptr::write_volatile(p.add(3), eb[1]);
+    let tb = s.tick_count.to_le_bytes();
+    core::ptr::write_volatile(p.add(4), tb[0]);
+    core::ptr::write_volatile(p.add(5), tb[1]);
+    core::ptr::write_volatile(p.add(6), tb[2]);
+    core::ptr::write_volatile(p.add(7), tb[3]);
+    let _ = (sys.channel_write)(s.status_chan, rec.as_ptr(), STATUS_RECORD_SIZE);
 }
 
 unsafe fn sys_module_count(sys: &SyscallTable) -> i32 {
@@ -174,6 +215,7 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
     // Classify every module. The reconfigure module itself is marked
     // Surviving so the scheduler keeps stepping it; drain-capable modules
     // enter Draining; the rest are terminated immediately.
+    let mut draining = 0u16;
     let mut i = 0;
     while i < count {
         let idx = i as u8;
@@ -183,6 +225,7 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
             let flags = sys_module_info(sys, idx);
             if (flags & INFO_DRAIN_CAPABLE) != 0 {
                 ds_set(s, i, DS_DRAINING);
+                draining += 1;
             } else {
                 ds_set(s, i, DS_PENDING_TERMINATE);
                 sys_mark_finished(sys, idx);
@@ -202,6 +245,8 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
         }
         i += 1;
     }
+
+    emit_status(s, sys, STATUS_DRAINING_ENTERED, 0, draining);
 }
 
 /// Returns true once every non-surviving module is Drained or
@@ -238,10 +283,13 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
                 if upstream_ok {
                     ds_set(s, i, DS_DRAINED);
                     sys_mark_finished(sys, idx);
+                    emit_status(s, sys, STATUS_MODULE_DRAINED, idx, 0);
                 }
             } else if timed_out {
                 ds_set(s, i, DS_DRAINED);
                 sys_mark_finished(sys, idx);
+                sys_fault_raise(sys, idx, FAULT_KIND_DRAIN_TIMEOUT);
+                emit_status(s, sys, STATUS_MODULE_FORCED, idx, 0);
             }
         }
         i += 1;
@@ -260,6 +308,9 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
 unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
     sys_set_phase(sys, PHASE_MIGRATING);
     s.phase = PHASE_MIGRATING;
+    let elapsed = s.tick_count.wrapping_sub(s.drain_start_tick);
+    let elapsed_u16 = if elapsed > u16::MAX as u32 { u16::MAX } else { elapsed as u16 };
+    emit_status(s, sys, STATUS_MIGRATING_ENTERED, 0, elapsed_u16);
     // If a graph_slot provider is registered and an activation succeeds,
     // the kernel's boot-time layout scan will pick the newly-live slot on
     // the next rebuild. A negative return means no graph_slot is present
@@ -288,7 +339,7 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     _in_chan: i32,
-    _out_chan: i32,
+    out_chan: i32,
     ctrl_chan: i32,
     params: *const u8,
     params_len: usize,
@@ -306,6 +357,7 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
         s.ctrl_chan = ctrl_chan;
+        s.status_chan = out_chan;
         s.phase = PHASE_RUNNING;
         s.self_idx = SELF_IDX_UNKNOWN;
         s.signaled_ready = 0;

@@ -68,6 +68,8 @@ pub mod fault_type {
     pub const HARD_FAULT: u8 = 3;
     /// Module caused an MPU/MMU memory protection fault.
     pub const MPU_FAULT: u8 = 4;
+    /// Module failed to drain within its deadline.
+    pub const DRAIN_TIMEOUT: u8 = 5;
 }
 
 /// Per-module fault statistics (queryable via dev_query).

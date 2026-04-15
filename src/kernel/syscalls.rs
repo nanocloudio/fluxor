@@ -633,6 +633,13 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             );
             0
         }
+        dev_system::FAULT_RAISE => {
+            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            let idx = unsafe { core::ptr::read(arg) } as usize;
+            let kind = unsafe { core::ptr::read(arg.add(1)) };
+            scheduler::raise_module_fault(idx, kind);
+            0
+        }
         dev_system::STEP_HISTOGRAM_QUERY => {
             // 8 u32 bucket counts = 32 bytes
             if arg.is_null() || arg_len < 32 { return E_INVAL; }

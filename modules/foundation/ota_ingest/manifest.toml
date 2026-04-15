@@ -1,8 +1,8 @@
 version = "1.0.0"
-hardware_targets = ["rp2350", "rp2040", "bcm2712"]
+hardware_targets = ["rp2350", "rp2040"]
 
 [[ports]]
-name = "trigger"
+name = "stream"
 direction = "input"
 content_type = "OctetStream"
 required = true

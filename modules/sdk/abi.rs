@@ -547,6 +547,11 @@ pub mod dev_system {
     /// Query step timing histogram. handle=module_idx (or -1 for global),
     /// arg=output buffer of 8*u32 (bucket counts). Returns 0 or errno.
     pub const STEP_HISTOGRAM_QUERY: u32 = 0x0C55;
+    /// Raise a fault against a module. handle=-1,
+    /// arg=[module_idx:u8, fault_kind:u8]. Fault kinds mirror
+    /// `step_guard::fault_type::*` (TIMEOUT=1, STEP_ERROR=2, HARD_FAULT=3,
+    /// MPU_FAULT=4, DRAIN_TIMEOUT=5). Returns 0 or -errno.
+    pub const FAULT_RAISE: u32 = 0x0C56;
     /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
     pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
     /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).

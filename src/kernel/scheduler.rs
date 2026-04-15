@@ -2898,6 +2898,26 @@ pub fn mark_module_finished(module_idx: usize) {
     }
 }
 
+/// Raise a fault against module `idx` with the given `fault_kind`
+/// (see `step_guard::fault_type`). Updates the module's fault bookkeeping
+/// and pushes a record to the global fault ring so subscribers (monitor
+/// CLI, metrics sinks) observe it uniformly with step-guard / MPU faults.
+pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
+    if module_idx >= MAX_MODULES { return; }
+    let sched = unsafe { &mut *(&raw mut SCHED) };
+    let tick = unsafe { DBG_TICK };
+    sched.fault_info[module_idx].record_fault(fault_kind, tick);
+    let fi = &sched.fault_info[module_idx];
+    step_guard::push_fault(FaultRecord {
+        module_idx: module_idx as u8,
+        fault_kind,
+        _reserved: 0,
+        tick,
+        fault_count: fi.fault_count,
+        restart_count: fi.restart_count,
+    });
+}
+
 /// Module capability flag bitmask:
 ///   bit 0: drain_capable (module exports module_drain)
 ///   bit 1: deferred_ready
