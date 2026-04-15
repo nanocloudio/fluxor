@@ -930,3 +930,81 @@ pub fn get_cross_edge(idx: usize) -> Option<&'static CrossDomainEdge> {
         None
     }
 }
+
+// ============================================================================
+// Cross-domain quiesce
+// ============================================================================
+//
+// A one-shot "pause all non-primary domains" primitive, used when the
+// primary core needs to mutate global scheduler state (graph rebuild,
+// snapshot, debugger pause) without races against other domains still
+// stepping modules.
+//
+// Protocol:
+//   1. Primary calls `request_quiesce()` — sets the flag, issues SEV.
+//   2. Each non-primary domain calls `park_if_requested()` at its tick
+//      boundary. If the flag is set, the domain increments `PARKED_COUNT`
+//      and WFEs in a loop until the flag clears.
+//   3. Primary polls `wait_parked(expected)` to confirm all non-primary
+//      domains have reached the park point.
+//   4. Primary does its critical section.
+//   5. Primary calls `release_quiesce()` — clears the flag, issues SEV.
+//   6. Parked domains observe the clear and resume stepping.
+//
+// The primary domain never parks itself. `non_primary_active_count()`
+// returns the expected parked count at request time.
+
+const QUIESCE_RUNNING: u32 = 0;
+const QUIESCE_REQUESTED: u32 = 1;
+
+static QUIESCE_STATE: AtomicU32 = AtomicU32::new(QUIESCE_RUNNING);
+static PARKED_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Primary-only. Ask all non-primary domains to park at their next tick
+/// boundary. Must be paired with `release_quiesce()`.
+pub fn request_quiesce() {
+    PARKED_COUNT.store(0, Ordering::Release);
+    QUIESCE_STATE.store(QUIESCE_REQUESTED, Ordering::Release);
+    unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
+}
+
+/// True while a quiesce is in flight.
+pub fn quiesce_requested() -> bool {
+    QUIESCE_STATE.load(Ordering::Acquire) == QUIESCE_REQUESTED
+}
+
+/// Tick-boundary hook. No-op on the primary domain (`domain_id == 0`)
+/// and when no quiesce is in flight. Otherwise registers arrival and
+/// WFE-spins until `release_quiesce` clears the flag.
+pub fn park_if_requested(domain_id: usize) {
+    if domain_id == 0 || !quiesce_requested() { return; }
+    PARKED_COUNT.fetch_add(1, Ordering::AcqRel);
+    while quiesce_requested() {
+        unsafe { core::arch::asm!("wfe", options(nostack)) };
+    }
+}
+
+/// Primary-only. Spin until `expected` non-primary domains have parked.
+pub fn wait_parked(expected: u32) {
+    while PARKED_COUNT.load(Ordering::Acquire) < expected {
+        core::hint::spin_loop();
+    }
+}
+
+/// Primary-only. Release all parked domains. Pairs with `request_quiesce`.
+pub fn release_quiesce() {
+    QUIESCE_STATE.store(QUIESCE_RUNNING, Ordering::Release);
+    unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
+}
+
+/// Count of non-primary domains currently active. The primary passes
+/// this to `wait_parked` after issuing a quiesce.
+pub fn non_primary_active_count() -> u32 {
+    let mut n = 0u32;
+    let mut i = 1usize;
+    while i < MAX_DOMAINS {
+        if domain_state_ref(i).active { n += 1; }
+        i += 1;
+    }
+    n
+}

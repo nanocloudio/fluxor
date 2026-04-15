@@ -1835,6 +1835,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 scheduler::domain_tick_us(domain_id));
             loop {
                 unsafe { core::arch::asm!("wfi") };
+                cross_domain::park_if_requested(domain_id);
                 let t0 = read_timer_count();
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
@@ -1858,6 +1859,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
         3 => {
             log::info!("[domain] {} core={} tier=3 poll-mode", domain_id, core_id);
             loop {
+                cross_domain::park_if_requested(domain_id);
                 let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
                 let mut any_burst = false;
                 // Step in topological order for correct producer-before-consumer
@@ -1901,6 +1903,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
         _ => {
             loop {
                 unsafe { core::arch::asm!("wfi") };
+                cross_domain::park_if_requested(domain_id);
                 let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
@@ -1909,17 +1912,22 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 if domain_id == 0 && tick % 10000 == 0 && tick > 0 {
                     log::info!("[sched] alive t={} core={}", tick, core_id);
                 }
-                // Rebuild requests are drained on the primary domain only.
-                // Full multi-core rebuild requires a cross-core quiesce that
-                // this platform does not perform; the request is discarded
-                // and the phase reset so the graph keeps running.
-                if domain_id == 0 {
-                    if scheduler::take_rebuild_request().is_some() {
-                        log::warn!("[reconfigure] bcm2712 rebuild unsupported; phase reset");
-                        scheduler::set_reconfigure_phase(
-                            scheduler::ReconfigurePhase::Running
-                        );
-                    }
+                // Rebuild bridge. On the primary domain, a pending rebuild
+                // request quiesces every non-primary domain (so mutation of
+                // global scheduler state is race-free), then clears the
+                // phase byte and releases. The rebuild body itself — full
+                // arena reset, prepare_graph, module instantiation — is
+                // not invoked here; on bcm2712 the request is consumed
+                // without rebuilding, leaving the current graph running.
+                if domain_id == 0 && scheduler::take_rebuild_request().is_some() {
+                    let expected = cross_domain::non_primary_active_count();
+                    cross_domain::request_quiesce();
+                    cross_domain::wait_parked(expected);
+                    log::warn!("[reconfigure] quiesced {} domains; phase reset", expected);
+                    scheduler::set_reconfigure_phase(
+                        scheduler::ReconfigurePhase::Running
+                    );
+                    cross_domain::release_quiesce();
                 }
             }
         }
