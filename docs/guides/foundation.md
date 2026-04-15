@@ -43,6 +43,9 @@ The foundation layer covers:
 
 - **Storage and filesystems** (`fat32`)
 - **Networking** (`ip`, `dns`, `dhcp`, `mqtt`, `http`, `tls`, `mesh`)
+- **Network-plane hygiene** (`conn_guard` for per-source-IP SYN
+  admission, `demux` for 4-tuple hashed fan-out to replicated IP
+  lanes, `pkt_filter` for stateless rule-based filtering)
 - **Protocol clients and servers** (`mqtt`, `http`, `dns`)
 - **Media and session orchestration** (audio format normalization,
   control plane bridges)
@@ -101,3 +104,4 @@ Foundation modules should define clear behavior for:
 - [../architecture/pipeline.md](../architecture/pipeline.md)
 - [../architecture/network.md](../architecture/network.md)
 - [../architecture/module_architecture.md](../architecture/module_architecture.md)
+- [../architecture/security.md](../architecture/security.md)

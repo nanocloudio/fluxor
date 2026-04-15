@@ -39,6 +39,7 @@ How the system works. These are the authoritative references.
 - [architecture/reconfigure.md](architecture/reconfigure.md) — live graph reconfigure, drain protocol
 - [architecture/mesh.md](architecture/mesh.md) — mesh architecture: identity, authority, discovery, events, binding
 - [architecture/network_boot.md](architecture/network_boot.md) — stateless network boot, fleet deployment, trust model
+- [architecture/security.md](architecture/security.md) — trust root, module signing, KEY_VAULT, network hardening
 - [architecture/pin_allocation.md](architecture/pin_allocation.md) — GPIO allocation, pin validation, peripheral assignments
 
 ## Guides

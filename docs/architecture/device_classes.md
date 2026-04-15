@@ -44,12 +44,15 @@ Bus classes provide transport with no device knowledge. A module using SPI sysca
 | Buffer | `0x0A` | `0x0A00-0x0AFF` | Zero-copy buffer operations |
 | Event | `0x0B` | `0x0B00-0x0BFF` | Signalable/pollable notification flags |
 | System | `0x0C` | `0x0C00-0x0CFF` | Resource locks and flash sideband ops |
+| KeyVault | `0x10` | `0x1000-0x10FF` | Asymmetric-key slots; kernel-held key material |
 
 Infrastructure classes are kernel-provided services that all modules can use.
 
 Events are the mechanism that enables hardware drivers to run entirely as modules without kernel knowledge of the device. A driver creates an event, binds it to an IRQ source, and polls the event in `step()`. The scheduler only wakes the owning module when its event fires. See `architecture/events.md` for details.
 
 The System class provides exclusive resource locking and platform sideband operations. `RESOURCE_TRY_LOCK` / `RESOURCE_UNLOCK` guard critical resources like FLASH_XIP (exclusive flash/QSPI access). `FLASH_SIDEBAND` performs operations requiring exclusive flash access, such as reading the BOOTSEL button via the QSPI CS pin. The lock pool is bounded (4 slots) with non-blocking try semantics — modules receive `EBUSY` if a resource is already held.
+
+KeyVault is a kernel-managed asymmetric-key store. A module calls `STORE` with raw key material and receives an opaque `i32` handle; `ECDH`, `SIGN`, and `VERIFY` run P-256 directly in the kernel, and `DESTROY` zeroises the slot. The raw bytes never leave kernel static memory — TLS uses this to sign `CertificateVerify` without its own module arena ever seeing the private key after module_new. See `architecture/security.md` for the trust model.
 
 ### Bus Classes (continued)
 

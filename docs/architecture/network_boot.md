@@ -435,15 +435,27 @@ reconfigure commands to running devices without waiting for a reboot cycle.
 
 ### Trust Root
 
-Each device has a trust root — a public key stored in non-volatile,
-tamper-resistant storage:
+Each device has a trust root — an Ed25519 public key surfaced through
+`hal::otp_read_signing_key`:
 
 - RP2350: OTP (one-time programmable) memory. Written once at manufacturing.
-- CM5: Secure flash partition or hardware security element.
+- CM5: Secure flash partition or hardware security element. Today the
+  CM5 HAL reads a compile-time constant from the
+  `FLUXOR_SIGNING_PUBKEY_HEX` build environment variable; production
+  deployments swap this for an on-silicon OTP bank.
 
-The trust root verifies the deployment server's bundle signatures. A bundle
-signed by an unknown key is rejected. A bundle with a tampered module (hash
-mismatch) is rejected. The netboot_agent never executes unverified code.
+Each PIC module carries a v2 manifest with a 64-byte Ed25519 signature
+over its SHA-256 integrity hash plus a 32-byte signer fingerprint. The
+loader recomputes the hash at admission, verifies the signature
+against the provisioned pubkey, and — with `enforce_signatures` set —
+refuses unsigned or mismatched modules. A tampered module fails with
+`IntegrityMismatch`; a bad signature fails with `SignatureInvalid`. See
+`security.md` for the full admission path.
+
+The trust root also verifies the deployment server's bundle signatures.
+A bundle signed by an unknown key is rejected. A bundle with a tampered
+module (hash mismatch) is rejected. The netboot_agent never executes
+unverified code.
 
 ### Network Security
 
@@ -489,7 +501,7 @@ level. The GPU firmware boot chain (`start4.elf`, `kernel8.img`) is local.
 | Remote channel transport | `mesh.md` — mesh primitives, capability binding |
 | Graph bundle format and signing | `capability_surface.md` — module manifests, content types |
 | Live graph reconfigure | `pipeline.md` — graph runner, module lifecycle |
-| Module signing and trust | `module_architecture.md` — module binary contract |
+| Module signing and trust | `security.md` — trust root, signature path, KEY_VAULT |
 | Fleet telemetry | `events.md` — observable metrics, event signalling |
 | WiFi/network drivers | `network.md` — netif contract, driver/service split |
 | Hardware boot (CM5) | `hal_architecture.md` — HAL boundary, boot sequence |

@@ -179,6 +179,29 @@ has 12 + a separate "system DMA" controller, BCM2712 has its own DMA
 engines. Modules see only the abstract `dev_call` operations on PIO and
 SPI; the DMA wiring is hidden.
 
+### Trust and platform metadata
+
+Two HAL hooks front the security-relevant platform state so loader code
+stays silicon-oblivious:
+
+- `verify_integrity(&[u8], &[u8]) -> bool` — byte-compare of computed
+  against stored hash. Every silicon ships a real comparison; the
+  loader relies on it for module admission.
+- `otp_read_signing_key(&mut [u8; 32]) -> bool` — returns the device
+  root-of-trust Ed25519 pubkey. CM5 reads it from a build-time
+  environment variable (`FLUXOR_SIGNING_PUBKEY_HEX`) baked into the
+  image; silicon with a real OTP bank reads from fuses. False means
+  "no key provisioned" — the `enforce_signatures` feature then blocks
+  module load.
+
+On BCM2712, `kernel::dtb::read_ethernet_mac()` walks the firmware-
+provided flattened device tree for the `local-mac-address` property.
+The rp1_gem driver calls this via a SYSTEM syscall
+(`GET_HW_ETHERNET_MAC`, `0x0C3D`) and programs the returned MAC into
+the GEM's SA1 register. On silicon without DTB plumbing the syscall
+returns `ENODEV`, and drivers fall back to a locally-administered
+default.
+
 ## Syscall Table
 
 The syscall table (`SyscallTable` in `modules/sdk/abi.rs`) is a

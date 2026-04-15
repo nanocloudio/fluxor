@@ -121,6 +121,15 @@ SDK helper `net_read_frame` in `modules/sdk/runtime.rs` handles this.
 | `0x04` | `MSG_BOUND` | port (u16) | Listener is ready |
 | `0x05` | `MSG_CONNECTED` | conn_id (u8) | Outbound connection established |
 | `0x06` | `MSG_ERROR` | code (i16) + conn_id (u8, optional) | Error |
+| `0x07` | `MSG_RETRANSMIT` | conn_id (u8) + from_seq (u32 LE) | Replay bytes from this TCP seq |
+| `0x08` | `MSG_ACK` | conn_id (u8) + acked_seq (u32 LE) | Consumer may drop bytes up to this seq |
+
+The IP module does not itself retain TCP segments for retransmission —
+the consumer does, if it wants to. `MSG_ACK` lets the consumer
+truncate its send buffer; `MSG_RETRANSMIT` fires when TCP's fast-
+retransmit or RTO trigger and asks the consumer to re-supply from a
+given absolute TCP sequence number. The TLS module uses this to hold
+encrypted records until they're acknowledged; see `security.md`.
 
 ### Connection identity
 
@@ -234,6 +243,16 @@ talks net_proto to the IP module on a Pico W talks net_proto to the
 ch9120 driver on a CH9120 board, with no code change. The capability
 surface (see `capability_surface.md`) determines which configuration to
 emit based on the hardware section.
+
+## Admission Control: conn_guard
+
+Between the NIC driver and the IP module sits an optional stateless
+admission filter (`modules/foundation/conn_guard/`). It parses Ethernet
++ IPv4 + TCP headers just far enough to identify pure SYNs and applies a
+per-source-IP rate limit (default: 16 SYNs per 1 s window, 32-entry
+LRU table). Non-TCP, non-SYN, and within-budget traffic passes through
+untouched. The CM5 ethernet stack wires it automatically via
+`stacks/net.toml`; `security.md` covers the full threat model.
 
 ## The IP Module
 
@@ -568,3 +587,4 @@ on which channel pair the connection was opened on.
 - `architecture/capability_surface.md` — hardware section, driver auto-wiring
 - `architecture/events.md` — IRQ binding for interrupt-driven drivers
 - `architecture/device_classes.md` — bus primitives drivers use to touch hardware
+- `architecture/security.md` — conn_guard, retx buffering, KEY_VAULT, trust model
