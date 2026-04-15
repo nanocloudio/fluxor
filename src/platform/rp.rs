@@ -142,17 +142,30 @@ async fn main(spawner: Spawner) {
         loop { Timer::after(Duration::from_millis(1000)).await; }
     }
 
-    // Load modules (may do async init like SPI DMA)
-    let module_count = rp_setup_graph_async().await;
-    if module_count < 0 {
-        log::error!("[boot] graph setup failed");
-        loop { Timer::after(Duration::from_millis(1000)).await; }
+    // Setup / run / rebuild loop. `rp_run_main_loop` returns when the
+    // reconfigure module calls RECONFIGURE_TRIGGER_REBUILD; we then reset
+    // the phase and re-run setup against STATIC_CONFIG.
+    loop {
+        let module_count = rp_setup_graph_async().await;
+        if module_count < 0 {
+            log::error!("[boot] graph setup failed");
+            loop { Timer::after(Duration::from_millis(1000)).await; }
+        }
+
+        log::info!("[boot] ready modules={}", module_count);
+
+        match rp_run_main_loop(module_count as usize).await {
+            Some(_rebuild) => {
+                log::info!("[reconfigure] main loop yielded, rebuilding graph");
+                scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
+                continue;
+            }
+            None => {
+                log::info!("[sched] stopped");
+                loop { Timer::after(Duration::from_millis(1000)).await; }
+            }
+        }
     }
-
-    log::info!("[boot] ready modules={}", module_count);
-
-    // Run the main loop
-    rp_run_main_loop(module_count as usize).await;
 }
 
 // ============================================================================
@@ -446,7 +459,9 @@ async fn rp_instantiate_all_modules_async(
     instantiated as i32
 }
 
-async fn rp_run_main_loop(module_count: usize) -> ! {
+/// Step the graph until either a rebuild is requested (returns `Some((ptr, len))`)
+/// or the graph halts (returns `None`).
+async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
     let modules = unsafe { scheduler::sched_modules() };
     let tick_period_us = scheduler::tick_us() as u64;
 
@@ -460,12 +475,16 @@ async fn rp_run_main_loop(module_count: usize) -> ! {
             StepResult::Continue => {}
             StepResult::Done => {
                 log::warn!("[sched] all modules done");
-                break;
+                return None;
             }
             StepResult::Error(i) => {
                 log::error!("[sched] step error module={}", i);
-                break;
+                return None;
             }
+        }
+
+        if let Some(req) = scheduler::take_rebuild_request() {
+            return Some(req);
         }
 
         let wake = fluxor::kernel::event::take_wake_pending();
@@ -484,7 +503,4 @@ async fn rp_run_main_loop(module_count: usize) -> ! {
             scheduler::step_woken_modules(modules, module_count, wake);
         }
     }
-
-    log::info!("[sched] stopped");
-    loop { Timer::after(Duration::from_millis(1000)).await; }
 }

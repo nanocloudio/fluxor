@@ -72,20 +72,6 @@ pub enum ReconfigurePhase {
     Migrating = 2,
 }
 
-/// Per-module drain state during DRAINING phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DrainState {
-    /// Module is surviving the transition — not draining.
-    Surviving = 0,
-    /// Module is actively draining in-flight work.
-    Draining = 1,
-    /// Module has signaled drain complete (returned Done).
-    Drained = 2,
-    /// Module does not support drain — will be force-terminated.
-    PendingTerminate = 3,
-}
-
 /// Maximum number of burst re-steps per module per tick.
 /// When step() returns StepOutcome::Burst, the scheduler re-steps the module
 /// up to this many additional times, stopping early if the module returns
@@ -871,21 +857,14 @@ pub struct SchedulerState {
     domain_exec_mode: [u8; MAX_DOMAINS],
 
     // ── Live Reconfigure State ──────────────────────────────────────
-    /// Current reconfigure phase (Running during normal operation).
+    /// Current reconfigure phase, queryable via `reconfigure_phase()`.
     reconfigure_phase: ReconfigurePhase,
-    /// Per-module drain state (only meaningful during DRAINING).
-    drain_state: [DrainState; MAX_MODULES],
-    /// Per-module drain-capable flag (header flags bit 3).
-    /// Set during module instantiation from the module binary header.
-    drain_capable: [bool; MAX_MODULES],
-    /// Tick count when DRAINING phase started (for timeout).
-    drain_start_tick: u32,
-    /// Drain timeout in ticks (ms). Default 5000.
-    drain_timeout_ticks: u32,
-    /// Per-module in-flight count (reported by modules during drain).
-    drain_inflight: [u32; MAX_MODULES],
-    /// Number of modules in the current graph (for reconfigure).
+    /// Number of modules in the current graph, set by `prepare_graph`.
     active_module_count: usize,
+    /// Pending rebuild request (config_ptr, len). Set by `request_rebuild`,
+    /// consumed by the per-platform main loop, which performs a destructive
+    /// reset + reload.
+    rebuild_request: Option<(*const u8, usize)>,
 
     // ── Per-module export table info (for resolve_export_for_module) ──
     /// Code base address per module (for resolving export offsets)
@@ -936,12 +915,8 @@ impl SchedulerState {
             domain_tick_us: [0; MAX_DOMAINS],
             domain_exec_mode: [0; MAX_DOMAINS],
             reconfigure_phase: ReconfigurePhase::Running,
-            drain_state: [DrainState::Surviving; MAX_MODULES],
-            drain_capable: [false; MAX_MODULES],
-            drain_start_tick: 0,
-            drain_timeout_ticks: 5000,
-            drain_inflight: [0; MAX_MODULES],
             active_module_count: 0,
+            rebuild_request: None,
             module_code_base: [0; MAX_MODULES],
             module_code_size: [0; MAX_MODULES],
             module_export_table: [core::ptr::null(); MAX_MODULES],
@@ -991,14 +966,8 @@ impl SchedulerState {
             self.domain_tick_us[d] = 0;
         }
         self.reconfigure_phase = ReconfigurePhase::Running;
-        for i in 0..MAX_MODULES {
-            self.drain_state[i] = DrainState::Surviving;
-            self.drain_capable[i] = false;
-            self.drain_inflight[i] = 0;
-        }
-        self.drain_start_tick = 0;
-        self.drain_timeout_ticks = 5000;
         self.active_module_count = 0;
+        self.rebuild_request = None;
     }
 }
 
@@ -1498,6 +1467,8 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     compute_domain_exec_orders_static(module_count);
     validate_domains_static(module_count, runtime_edge_count);
 
+    sched.active_module_count = module_count;
+
     Ok((module_list, module_count))
 }
 
@@ -1928,7 +1899,6 @@ pub fn instantiate_one_module(
         sched.in_place_writer[instantiated] = (flags_byte & 0x02) != 0;
         let deferred = (flags_byte & 0x04) != 0;
         sched.deferred_ready[instantiated] = deferred;
-        sched.drain_capable[instantiated] = (flags_byte & 0x08) != 0;
         if deferred {
             sched.ready[instantiated] = false;
         }
@@ -2549,14 +2519,6 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     let tick = unsafe { DBG_TICK };
     unsafe { DBG_TICK += 1; }
 
-    // ── Live Reconfigure: drain progress check ─────────────────────
-    // Single branch-not-taken during normal RUNNING — zero overhead.
-    if sched.reconfigure_phase == ReconfigurePhase::Draining {
-        if check_drain_progress(count) {
-            enter_migrating_v1();
-            // V1: signal that migration should happen (caller handles rebuild)
-        }
-    }
     // Periodic heartbeat — confirms scheduler is alive
     if tick % 500 == 0 && tick > 0 {
         // Check for crash info from previous run (in .uninit RAM, set by HardFault handler)
@@ -2892,245 +2854,91 @@ pub fn step_woken_modules(
 }
 
 // ============================================================================
-// Live Reconfigure — Drain Phase
+// Live Reconfigure — Kernel Primitives
 // ============================================================================
+//
+// Raw primitives exposed to the `modules/reconfigure` PIC module via the
+// `dev_system` reconfigure opcodes (0x0C67–0x0C6F).
 
-/// Return the current reconfigure phase (for observability).
+/// Return the current reconfigure phase.
 pub fn reconfigure_phase() -> ReconfigurePhase {
     unsafe { SCHED.reconfigure_phase }
 }
 
-/// Enter the DRAINING phase for a live reconfigure.
-///
-/// Classifies each module as Surviving, Draining, or PendingTerminate based on
-/// the `surviving` bitmask and each module's drain_capable flag.
-/// Calls module_drain() on all drain-capable non-surviving modules.
-///
-/// `surviving`: bitmask where bit N set = module N survives the transition.
-/// `drain_timeout_ms`: maximum time in ms to wait for drain completion.
-pub fn enter_draining(surviving: u32, drain_timeout_ms: u32) {
-    let sched = unsafe { &mut *(&raw mut SCHED) };
-    let count = sched.active_module_count;
-    let tick = unsafe { DBG_TICK };
-
-    sched.reconfigure_phase = ReconfigurePhase::Draining;
-    sched.drain_start_tick = tick;
-    sched.drain_timeout_ticks = drain_timeout_ms;
-
-    let mut draining_count: usize = 0;
-    let mut terminate_count: usize = 0;
-
-    // Classify modules and call module_drain on drain-capable ones
-    // RFC: module_drain() called in reverse topological order (downstream first)
-    let exec_count = sched.exec_order_count;
-    for rev_pos in 0..exec_count {
-        let order_pos = exec_count - 1 - rev_pos;
-        let module_idx = sched.exec_order[order_pos] as usize;
-        if module_idx >= count { continue; }
-
-        if (surviving & (1u32 << module_idx)) != 0 {
-            sched.drain_state[module_idx] = DrainState::Surviving;
-            continue;
-        }
-
-        if sched.drain_capable[module_idx] {
-            // Call module_drain on the module
-            if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
-                set_current_module(module_idx);
-                let _rc = unsafe { m.call_drain() };
-            }
-            sched.drain_state[module_idx] = DrainState::Draining;
-            sched.drain_inflight[module_idx] = 0;
-            draining_count += 1;
-        } else {
-            sched.drain_state[module_idx] = DrainState::PendingTerminate;
-            terminate_count += 1;
-        }
-    }
-
-    log::info!(
-        "[reconfigure] phase=DRAINING draining={} terminate={} surviving={} timeout={}ms",
-        draining_count, terminate_count,
-        count - draining_count - terminate_count,
-        drain_timeout_ms,
-    );
+/// Set the current reconfigure phase.
+pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
+    unsafe { SCHED.reconfigure_phase = phase; }
 }
 
-/// Check drain progress and handle timeouts.
-///
-/// Called each tick during DRAINING phase (from step_modules).
-/// Returns true if draining is complete (all non-surviving modules are
-/// Drained or PendingTerminate), meaning we should transition to MIGRATING.
-fn check_drain_progress(count: usize) -> bool {
-    let sched = unsafe { &mut *(&raw mut SCHED) };
-    let tick = unsafe { DBG_TICK };
-
-    // Check timeout
-    let elapsed = tick.wrapping_sub(sched.drain_start_tick);
-    if elapsed >= sched.drain_timeout_ticks {
-        force_drain_complete(count);
-        return true;
-    }
-
-    // Check if all draining modules have returned Done
-    for i in 0..count {
-        if sched.drain_state[i] == DrainState::Draining {
-            // Still draining — check if module returned Done in last step
-            if sched.finished[i] {
-                // Module returned Done during step — check upstream drain ordering.
-                // A module cannot be marked Drained until all upstream draining
-                // modules are already Drained (forward topological ordering).
-                let upstream_still_draining = check_upstream_draining(i, count);
-                if !upstream_still_draining {
-                    sched.drain_state[i] = DrainState::Drained;
-                    log::info!("[reconfigure] module={} ({}) drain_complete elapsed={}ms",
-                        i, sched.modules[i].type_name(), elapsed);
-                }
-                // If upstream still draining, keep this module as Draining
-                // until upstream completes (forward topo ordering)
-            }
-        }
-    }
-
-    // Check if all non-surviving modules are done
-    for i in 0..count {
-        if sched.drain_state[i] == DrainState::Draining {
-            return false; // Still draining
-        }
-    }
-
-    true // All drained or pending-terminate
+/// Return the number of active modules in the current graph.
+pub fn active_module_count() -> usize {
+    unsafe { SCHED.active_module_count }
 }
 
-/// Check if any upstream module of `module_idx` is still in Draining state.
-fn check_upstream_draining(module_idx: usize, count: usize) -> bool {
+/// Invoke `module_drain()` on module N. Returns the module's return code,
+/// or -1 if the module is not drain-capable or the index is invalid.
+pub fn call_module_drain(module_idx: usize) -> i32 {
+    if module_idx >= MAX_MODULES { return -1; }
     let sched = unsafe { &*(&raw const SCHED) };
-    let upstream = sched.upstream_mask[module_idx];
-
-    for i in 0..count {
-        if i == module_idx { continue; }
-        if (upstream & (1u32 << i)) != 0 && sched.drain_state[i] == DrainState::Draining {
-            return true;
-        }
-    }
-    false
-}
-
-/// Force all still-draining modules to Drained state (timeout exceeded).
-fn force_drain_complete(count: usize) {
-    let sched = unsafe { &mut *(&raw mut SCHED) };
-
-    for i in 0..count {
-        if sched.drain_state[i] == DrainState::Draining {
-            log::warn!("[reconfigure] module={} ({}) drain_forced inflight={}",
-                i, sched.modules[i].type_name(), sched.drain_inflight[i]);
-            sched.drain_state[i] = DrainState::Drained;
-        }
+    if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
+        set_current_module(module_idx);
+        unsafe { m.call_drain() }
+    } else {
+        -1
     }
 }
 
-/// Execute the MIGRATING phase: v1 fallback (full arena reset).
-///
-/// V1 strategy: drain-capable modules get a graceful shutdown, then we do
-/// a full destructive reconfigure. Arena compaction is deferred to v2.
-///
-/// Rationale for v1 full-reset fallback:
-/// - Many existing modules may use absolute pointers in state (not audited yet)
-/// - Arena compaction requires moving state blocks, which breaks self-referential ptrs
-/// - The drain phase already provides the key value: in-flight work completes gracefully
-/// - Full reset is safe, simple, and matches current behavior after drain completes
-///
-/// V2 will add: state arena compaction, selective module instantiation, channel
-/// preservation for surviving modules. This requires auditing all modules for
-/// absolute pointer usage and adding module_state_export/import where needed.
-fn enter_migrating_v1() {
-    let sched = unsafe { &mut *(&raw mut SCHED) };
-
-    log::info!("[reconfigure] phase=MIGRATING (v1 full reset)");
-    sched.reconfigure_phase = ReconfigurePhase::Migrating;
-
-    // V1: After drain completes, perform a full destructive reconfigure.
-    // The drain phase already allowed in-flight work to complete gracefully.
-    // Now we tear down everything and rebuild from the new config.
-    //
-    // This is functionally identical to the existing prepare_graph() path,
-    // but preceded by the drain phase that let modules finish their work.
-    //
-    // The actual graph rebuild is triggered by the caller (run_main_loop)
-    // which detects the Migrating phase and calls setup_graph_async().
-}
-
-/// Identify channels that should be preserved during MIGRATING.
-///
-/// A channel is preserved if BOTH endpoints (from_module and to_module)
-/// are in the `surviving` bitmask. All other channels are closed.
-///
-/// Returns a bitmask of edge indices that should be preserved.
-/// V1 note: This function is implemented but not used in the v1 full-reset
-/// path. It will be used by v2 selective channel migration.
-#[allow(dead_code)]
-fn compute_preserved_channels(surviving: u32, edge_count: usize) -> u64 {
-    let sched = unsafe { &*(&raw const SCHED) };
-    let mut preserved: u64 = 0;
-
-    for i in 0..edge_count {
-        let edge = &sched.edges[i];
-        if edge.channel < 0 { continue; }
-
-        let from_survives = (surviving & (1u32 << edge.from_module)) != 0;
-        let to_survives = (surviving & (1u32 << edge.to_module)) != 0;
-
-        if from_survives && to_survives {
-            preserved |= 1u64 << i;
-        }
-    }
-
-    preserved
-}
-
-/// Report in-flight work count for a draining module (called from syscall).
-pub fn drain_report_inflight(module_idx: usize, count: u32) {
+/// Mark a module as finished so the scheduler skips it in future ticks.
+pub fn mark_module_finished(module_idx: usize) {
     if module_idx < MAX_MODULES {
-        unsafe { SCHED.drain_inflight[module_idx] = count; }
+        unsafe { SCHED.finished[module_idx] = true; }
     }
 }
 
-/// Rollback from a failed migration attempt.
-///
-/// If migration fails (module_new returns error, arena exhausted, etc.),
-/// the scheduler falls back to a full destructive reconfigure from the
-/// previous known-good config. In v1, this is equivalent to calling
-/// prepare_graph() + setup_graph_async() with the old config.
-///
-/// The A/B slot mechanism ensures the old config is always available:
-/// the slot flip only happens AFTER successful migration.
-pub fn rollback_reconfigure() {
-    let sched = unsafe { &mut *(&raw mut SCHED) };
-
-    log::error!("[reconfigure] migration failed, rolling back to previous config");
-
-    // Reset phase to Running — the old graph continues
-    sched.reconfigure_phase = ReconfigurePhase::Running;
-
-    // Clear drain state
-    for i in 0..MAX_MODULES {
-        sched.drain_state[i] = DrainState::Surviving;
-        sched.drain_inflight[i] = 0;
-    }
-
-    // The caller should reload the old config and do a full destructive
-    // reconfigure. In v1, this means the drained modules are already stopped
-    // and we've lost their state — but at least the system recovers.
-}
-
-/// Return elapsed drain time in ms (0 if not draining).
-pub fn drain_elapsed_ms() -> u32 {
+/// Module capability flag bitmask:
+///   bit 0: drain_capable (module exports module_drain)
+///   bit 1: deferred_ready
+///   bit 2: mailbox_safe
+///   bit 3: in_place_writer
+pub fn module_info_flags(module_idx: usize) -> u32 {
+    if module_idx >= MAX_MODULES { return 0; }
     let sched = unsafe { &*(&raw const SCHED) };
-    if sched.reconfigure_phase != ReconfigurePhase::Draining {
-        return 0;
+    let mut flags: u32 = 0;
+    if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
+        if m.has_drain() { flags |= 0x01; }
     }
-    let tick = unsafe { DBG_TICK };
-    tick.wrapping_sub(sched.drain_start_tick)
+    if sched.deferred_ready[module_idx] { flags |= 0x02; }
+    if sched.mailbox_safe[module_idx] { flags |= 0x04; }
+    if sched.in_place_writer[module_idx] { flags |= 0x08; }
+    flags
+}
+
+/// Upstream-module bitmask for module N.
+pub fn module_upstream_mask(module_idx: usize) -> u32 {
+    if module_idx >= MAX_MODULES { return 0; }
+    unsafe { SCHED.upstream_mask[module_idx] }
+}
+
+/// Whether module N has returned StepOutcome::Done.
+pub fn module_is_finished(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES { return false; }
+    unsafe { SCHED.finished[module_idx] }
+}
+
+/// Request a graph rebuild. The per-platform main loop consumes the request
+/// after `step_modules` returns.
+///
+/// # Safety
+/// The caller must ensure `config_ptr..config_ptr+config_len` remains valid
+/// until the main loop consumes the request. A null pointer with zero length
+/// signals "reload current STATIC_CONFIG".
+pub unsafe fn request_rebuild(config_ptr: *const u8, config_len: usize) {
+    unsafe { SCHED.rebuild_request = Some((config_ptr, config_len)); }
+}
+
+/// Consume the pending rebuild request, if any.
+pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
+    unsafe { (*(&raw mut SCHED)).rebuild_request.take() }
 }
 
 // ============================================================================

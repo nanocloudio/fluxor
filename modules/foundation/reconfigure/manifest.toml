@@ -1,0 +1,12 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040", "bcm2712"]
+
+[[ports]]
+name = "trigger"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[resources]]
+device_class = "system"
+access = "write"

@@ -1909,6 +1909,18 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 if domain_id == 0 && tick % 10000 == 0 && tick > 0 {
                     log::info!("[sched] alive t={} core={}", tick, core_id);
                 }
+                // Rebuild requests are drained on the primary domain only.
+                // Full multi-core rebuild requires a cross-core quiesce that
+                // this platform does not perform; the request is discarded
+                // and the phase reset so the graph keeps running.
+                if domain_id == 0 {
+                    if scheduler::take_rebuild_request().is_some() {
+                        log::warn!("[reconfigure] bcm2712 rebuild unsupported; phase reset");
+                        scheduler::set_reconfigure_phase(
+                            scheduler::ReconfigurePhase::Running
+                        );
+                    }
+                }
             }
         }
     }

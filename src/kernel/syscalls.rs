@@ -622,6 +622,62 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             let idx = if handle < 0 { usize::MAX } else { handle as usize };
             scheduler::query_step_histogram(idx, arg)
         }
+
+        // ── Live Reconfigure primitives (consumed by modules/reconfigure) ──
+        dev_system::RECONFIGURE_SELF_INDEX => {
+            scheduler::current_module_index() as i32
+        }
+        dev_system::RECONFIGURE_SET_PHASE => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let phase_byte = unsafe { core::ptr::read(arg) };
+            let phase = match phase_byte {
+                0 => scheduler::ReconfigurePhase::Running,
+                1 => scheduler::ReconfigurePhase::Draining,
+                2 => scheduler::ReconfigurePhase::Migrating,
+                _ => return E_INVAL,
+            };
+            scheduler::set_reconfigure_phase(phase);
+            0
+        }
+        dev_system::RECONFIGURE_CALL_DRAIN => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let idx = unsafe { core::ptr::read(arg) } as usize;
+            scheduler::call_module_drain(idx)
+        }
+        dev_system::RECONFIGURE_MARK_FINISHED => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let idx = unsafe { core::ptr::read(arg) } as usize;
+            scheduler::mark_module_finished(idx);
+            0
+        }
+        dev_system::RECONFIGURE_MODULE_COUNT => {
+            scheduler::active_module_count() as i32
+        }
+        dev_system::RECONFIGURE_MODULE_INFO => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let idx = unsafe { core::ptr::read(arg) } as usize;
+            scheduler::module_info_flags(idx) as i32
+        }
+        dev_system::RECONFIGURE_MODULE_UPSTREAM => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let idx = unsafe { core::ptr::read(arg) } as usize;
+            scheduler::module_upstream_mask(idx) as i32
+        }
+        dev_system::RECONFIGURE_MODULE_DONE => {
+            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            let idx = unsafe { core::ptr::read(arg) } as usize;
+            if scheduler::module_is_finished(idx) { 1 } else { 0 }
+        }
+        dev_system::RECONFIGURE_TRIGGER_REBUILD => {
+            // arg = [config_ptr:usize, config_len:usize] (platform pointer size)
+            let ptr_size = core::mem::size_of::<usize>();
+            if arg.is_null() || arg_len < 2 * ptr_size { return E_INVAL; }
+            let config_ptr = unsafe { core::ptr::read_unaligned(arg as *const usize) } as *const u8;
+            let config_len = unsafe { core::ptr::read_unaligned(arg.add(ptr_size) as *const usize) };
+            unsafe { scheduler::request_rebuild(config_ptr, config_len); }
+            0
+        }
+
         _ => {
             // Delegate to platform extension for hardware-specific opcodes
             if let Some(ext) = SYSTEM_EXTENSION {
