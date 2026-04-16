@@ -552,6 +552,32 @@ pub mod dev_system {
     /// `step_guard::fault_type::*` (TIMEOUT=1, STEP_ERROR=2, HARD_FAULT=3,
     /// MPU_FAULT=4, DRAIN_TIMEOUT=5). Returns 0 or -errno.
     pub const FAULT_RAISE: u32 = 0x0C56;
+
+    /// Drain bytes from the kernel log ring.
+    /// handle=-1, arg=output buffer, arg_len=capacity.
+    /// Returns bytes copied (0 if empty, never negative). The low 16 bits of
+    /// the return value are the payload length; the high 16 bits carry the
+    /// overflow-dropped byte count since the last drain (saturating).
+    pub const LOG_RING_DRAIN: u32 = 0x0C64;
+
+    /// Write raw bytes to the platform's primary UART synchronously.
+    /// handle=-1, arg=input buffer, arg_len=byte count.
+    /// Returns bytes written (== arg_len) on success, or ENOSYS if the
+    /// platform has no UART, EINVAL on bad args. Blocking: the call does
+    /// not return until all bytes have been flushed to the FIFO.
+    /// Used by the log_uart overlay module to drive the wire from
+    /// user-space. Kernel emergency writes (panic handler) use a separate
+    /// internal path so they work even if the ring/dispatch table is corrupt.
+    pub const UART_WRITE_RAW: u32 = 0x0C65;
+
+    /// Enqueue bytes for transmission on the platform's USB CDC endpoint.
+    /// handle=-1, arg=input buffer, arg_len=byte count.
+    /// Returns bytes enqueued (may be < arg_len if the internal TX pipe is
+    /// backpressured), or ENOSYS if the platform has no USB. Non-blocking:
+    /// the call does not wait for USB frames to go on the wire. The actual
+    /// transmit is driven by an embassy task that drains the pipe.
+    /// Used by the log_usb overlay module.
+    pub const USB_WRITE_RAW: u32 = 0x0C66;
     /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
     pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
     /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).

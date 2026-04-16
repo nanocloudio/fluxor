@@ -16,6 +16,9 @@ pub mod net;
 pub mod buffer_pool;
 pub mod errno;
 pub mod event;
+pub mod log_ring;
+pub mod uart_write;
+pub mod usb_write;
 #[cfg(feature = "rp")]
 #[path = "../platform/rp_resource.rs"]
 pub mod resource;

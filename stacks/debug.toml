@@ -1,0 +1,98 @@
+[stack]
+name = "debug"
+
+# Opt-in log observability. One `to:` variant selects the transport; the
+# matching log_<transport> PIC module drains the kernel log ring (SYSTEM::
+# LOG_RING_DRAIN) and forwards each chunk over its wire. One log producer
+# (kernel log crate) feeds one ring; one consumer drains it. Multiple
+# transports active at once is not supported — variants are mutually
+# exclusive. If that becomes a real need, upgrade the ring to per-consumer
+# cursors at that time.
+#
+# ## Dependencies
+#
+# Each variant's wiring references the destination transport stack's
+# modules (e.g. `to: net` wires to `ip.net_in` / `ip.net_out`). Those
+# modules come from another `platform:` stack — `debug` does not auto-add
+# them. This is the same rule that applies to any user-written wiring: if
+# you wire to a module you haven't asked for, config validation fails with
+# a clear "unknown module" error. Pair `debug: { to: net }` with
+# `platform: net: {}`, same as you would with any consumer of the IP
+# stack.
+#
+# Usage:
+#
+#   platform:
+#     net: {}                        # required for `to: net`
+#     debug:
+#       to: net                      # or: uart, usb
+#       # dst_ip: "0xC0A80A0A"       # optional, transport-specific
+#       # dst_port: 6666
+#       # bind_port: 6667
+#
+# Host capture depends on the transport:
+#   to: net  →  nc -ul 6666  (or python UDP recvfrom)
+#   to: uart →  tio /dev/ttyUSB0  (115200 by default)
+#   to: usb  →  cat /dev/ttyACM0
+#
+# The same stream carries MON_* monitor lines (`fluxor monitor` host tool).
+
+[[variant]]
+match = { to = "net" }
+modules = [
+  { name = "log_net", params = {
+      dst_ip    = "user:dst_ip",
+      dst_port  = "user:dst_port",
+      bind_port = "user:bind_port",
+  } },
+]
+wiring = [
+  "ip.net_out -> log_net.net_in",
+  "log_net.net_out -> ip.net_in",
+]
+
+# Serial UART via the platform's primary UART (RP1 PL011 on cm5).
+# Synchronous writes through UART_WRITE_RAW — no backpressure, no wiring.
+# RP targets don't register a UART writer today, so `to: uart` is a
+# no-op (syscall returns ENOSYS) on pico2w / picow.
+[[variant]]
+match = { to = "uart" }
+modules = [
+  { name = "log_uart" },
+]
+wiring = []
+
+# USB CDC-ACM on RP platforms. Enqueues bytes into a kernel-side pipe
+# that an embassy task drains into the CDC endpoint. Writes may be
+# backpressured when the host hasn't opened the CDC port yet —
+# log_usb holds the unsent tail and retries on the next step.
+[[variant]]
+match = { to = "usb" }
+modules = [
+  { name = "log_usb" },
+]
+wiring = []
+
+# ----------------------------------------------------------------------------
+# Overlays — additive switches that layer on top of the chosen transport.
+# ----------------------------------------------------------------------------
+
+# Monitor telemetry: periodic `MON_HIST` lines for the `fluxor monitor` CLI
+# (per-module step-time histogram). Orthogonal to `to:` — the monitor
+# module just emits via log::info!, and the transport carries it out.
+# `MON_FAULT` is emitted by the kernel itself, so it streams whether this
+# overlay is on or not.
+#
+#   platform:
+#     debug:
+#       to: uart       # (or net / usb)
+#       monitor: true
+#       # monitor_interval_ms: 5000   # optional; default 5000
+[[overlay]]
+match = { monitor = "*" }
+modules = [
+  { name = "monitor", params = {
+      interval_ms = "user:monitor_interval_ms",
+  } },
+]
+wiring = []

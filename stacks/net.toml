@@ -61,3 +61,10 @@ modules = [
   { name = "linux_net" },
 ]
 wiring = []
+
+# Debug log overlays live in `stacks/debug.toml`. To enable netconsole:
+#
+#   platform:
+#     net: {}
+#     debug:
+#       to: net

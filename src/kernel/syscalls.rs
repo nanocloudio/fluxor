@@ -509,6 +509,37 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             syscall_log(handle as u8, arg, arg_len);
             0
         }
+        dev_system::LOG_RING_DRAIN => {
+            if arg.is_null() || arg_len == 0 { return E_INVAL; }
+            let out = core::slice::from_raw_parts_mut(arg, arg_len);
+            let n = crate::kernel::log_ring::drain(out);
+            let dropped = crate::kernel::log_ring::take_dropped();
+            let dropped_sat = if dropped > 0xFFFF { 0xFFFF } else { dropped };
+            ((dropped_sat << 16) | (n as u32 & 0xFFFF)) as i32
+        }
+        dev_system::UART_WRITE_RAW => {
+            if arg.is_null() || arg_len == 0 { return E_INVAL; }
+            // Platform hook — a platform registers its UART writer via
+            // `uart_write::install`. If nothing is installed, the platform
+            // has no UART available to user-space, so we report ENOSYS
+            // rather than silently dropping bytes.
+            let bytes = core::slice::from_raw_parts(arg, arg_len);
+            match crate::kernel::uart_write::write(bytes) {
+                Some(n) => n as i32,
+                None => errno::ENOSYS,
+            }
+        }
+        dev_system::USB_WRITE_RAW => {
+            if arg.is_null() || arg_len == 0 { return E_INVAL; }
+            // Same shape as UART_WRITE_RAW but for USB CDC. May return
+            // short counts when the USB TX pipe is backpressured — the
+            // caller (log_usb) holds the unsent tail in its staging buffer.
+            let bytes = core::slice::from_raw_parts(arg, arg_len);
+            match crate::kernel::usb_write::write(bytes) {
+                Some(n) => n as i32,
+                None => errno::ENOSYS,
+            }
+        }
         dev_system::GET_HW_ETHERNET_MAC => {
             if arg.is_null() || arg_len < 6 { return E_INVAL; }
             #[cfg(feature = "chip-bcm2712")]

@@ -274,7 +274,22 @@ unsafe fn uart_init() {
     // QEMU virt: UART is already configured, nothing to do
 }
 
+// Normal kernel log path: push to the log ring only. The wire is driven
+// by the log_uart overlay module via UART_WRITE_RAW. This keeps logs
+// opt-in and orthogonal to the application.
 fn uart_putc(c: u8) {
+    fluxor::kernel::log_ring::push_byte(c);
+}
+
+fn uart_puts(s: &[u8]) {
+    fluxor::kernel::log_ring::push_bytes(s);
+}
+
+// Direct synchronous MMIO path — used by:
+//   (a) `log_uart` module via the UART_WRITE_RAW syscall
+//   (b) the exception/panic handler, which cannot rely on the scheduler
+//       (and therefore cannot rely on any overlay) still being alive.
+fn uart_raw_putc(c: u8) {
     unsafe {
         #[cfg(feature = "board-cm5")]
         {
@@ -284,9 +299,23 @@ fn uart_putc(c: u8) {
     }
 }
 
-fn uart_puts(s: &[u8]) {
+fn uart_raw_puts(s: &[u8]) {
     let mut i = 0;
-    while i < s.len() { uart_putc(s[i]); i += 1; }
+    while i < s.len() {
+        uart_raw_putc(s[i]);
+        i += 1;
+    }
+}
+
+/// Raw pointer adapter for `kernel::uart_write::install`. Writes all
+/// bytes and returns the count so the caller can report it.
+unsafe fn uart_raw_write_bytes(ptr: *const u8, len: usize) -> usize {
+    let mut i = 0;
+    while i < len {
+        uart_raw_putc(*ptr.add(i));
+        i += 1;
+    }
+    len
 }
 
 fn uart_put_u32(mut n: u32) {
@@ -303,15 +332,6 @@ fn uart_put_hex32(val: u32) {
     let mut i = 28i32;
     while i >= 0 {
         uart_putc(hex[((val >> i as u32) & 0xf) as usize]);
-        i -= 4;
-    }
-}
-
-fn uart_put_hex64(val: u64) {
-    let hex = b"0123456789abcdef";
-    let mut i = 60i32;
-    while i >= 0 {
-        uart_putc(hex[((val >> i as u64) & 0xf) as usize]);
         i -= 4;
     }
 }
@@ -945,11 +965,26 @@ unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     if UART_READY.load(Ordering::Relaxed) == 0 {
         return;
     }
-    uart_puts(b"\r\n!!! EXCEPTION\r\n");
-    uart_puts(b"  ELR=0x"); uart_put_hex64(elr);
-    uart_puts(b"\r\n  ESR=0x"); uart_put_hex64(esr);
-    uart_puts(b"\r\n  FAR=0x"); uart_put_hex64(far);
-    uart_puts(b"\r\n");
+    // Exception path writes directly to the UART hardware. The ring
+    // is unusable here — the scheduler may be dead, the log_uart
+    // overlay won't drain, and even the heap allocator might be
+    // poisoned. Raw MMIO is the only thing we can trust.
+    uart_raw_puts(b"\r\n!!! EXCEPTION\r\n");
+    uart_raw_puts(b"  ELR=0x"); exception_dump_hex64(elr);
+    uart_raw_puts(b"\r\n  ESR=0x"); exception_dump_hex64(esr);
+    uart_raw_puts(b"\r\n  FAR=0x"); exception_dump_hex64(far);
+    uart_raw_puts(b"\r\n");
+}
+
+/// Hex dump for exception handler. Duplicates uart_put_hex64 but routes
+/// through uart_raw_putc — see exception_dump rationale.
+fn exception_dump_hex64(val: u64) {
+    let hex = b"0123456789abcdef";
+    let mut i = 60i32;
+    while i >= 0 {
+        uart_raw_putc(hex[((val >> i as u64) & 0xf) as usize]);
+        i -= 4;
+    }
 }
 
 /// Timer ticks per scheduler tick (set from tick_us config or default 1ms)
@@ -1227,6 +1262,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     unsafe { uart_init() };
     UART_READY.store(1, Ordering::Release);
 
+    // Register the raw UART writer so the log_uart overlay (and any
+    // future consumer) can drive the wire via UART_WRITE_RAW syscall.
+    fluxor::kernel::uart_write::install(uart_raw_write_bytes);
+
     // Record the DTB pointer now that the MMU is on; later DTB reads
     // dereference `_boot_dtb_ptr`.
     unsafe {
@@ -1270,7 +1309,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         }
     }
 
-    static LOGGER: UartLogger = UartLogger;
+    static LOGGER: RingLogger = RingLogger;
     unsafe { log::set_logger_racy(&LOGGER).ok() };
     log::set_max_level(log::LevelFilter::Info);
 
@@ -1583,6 +1622,21 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         i += 1;
     }
 
+    // Sum per-domain module counts into SCHED.active_module_count so
+    // queries like RECONFIGURE_MODULE_COUNT (used by the monitor overlay)
+    // see the right number on bcm2712. The domain path instantiates
+    // directly into DOMAIN_MODULES and doesn't go through
+    // `prepare_graph`, which is the RP path that normally sets this.
+    unsafe {
+        let mut total = 0usize;
+        let mut d = 0usize;
+        while d < cross_domain::MAX_DOMAINS {
+            total += DOMAIN_MODULES[d].count;
+            d += 1;
+        }
+        fluxor::kernel::scheduler::set_active_module_count(total);
+    }
+
     // Compute per-domain topological execution order (Kahn's algorithm).
     // Must be done after all modules are instantiated so global_idx is populated.
     {
@@ -1858,6 +1912,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
         // Module step returns Burst → re-step immediately. WFE when all idle.
         3 => {
             log::info!("[domain] {} core={} tier=3 poll-mode", domain_id, core_id);
+            let freq = bcm_counter_freq();
             loop {
                 cross_domain::park_if_requested(domain_id);
                 let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
@@ -1868,13 +1923,20 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 while pos < n {
                     let j = if dm.exec_order_count > 0 { dm.exec_order[pos] as usize } else { pos };
                     if let Some(ref mut m) = dm.modules[j] {
-                        fluxor::kernel::scheduler::set_current_module(dm.global_idx[j] as usize);
+                        let global_idx = dm.global_idx[j] as usize;
+                        fluxor::kernel::scheduler::set_current_module(global_idx);
                         step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
+                        let t0 = bcm_read_cntpct();
                         let outcome = m.step();
+                        let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
                         step_guard::disarm();
                         step_guard::post_step_check();
                         if step_guard::check_and_clear_timeout() {
                             log::warn!("[guard] domain {} module {} timeout", domain_id, j);
+                        }
+                        if freq > 0 {
+                            let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
+                            fluxor::kernel::scheduler::record_step_time(global_idx, elapsed_us);
                         }
                         if matches!(outcome, Ok(fluxor::modules::StepOutcome::Burst)) {
                             any_burst = true;
@@ -1940,19 +2002,31 @@ fn domain_step_all(domain_id: usize) {
     use fluxor::modules::Module;
     use fluxor::kernel::step_guard;
 
+    // Counter frequency is invariant at runtime — read once per call.
+    let freq = bcm_counter_freq();
     let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
     let n = if dm.exec_order_count > 0 { dm.exec_order_count } else { dm.count };
     let mut pos = 0;
     while pos < n {
         let j = if dm.exec_order_count > 0 { dm.exec_order[pos] as usize } else { pos };
         if let Some(ref mut m) = dm.modules[j] {
-            fluxor::kernel::scheduler::set_current_module(dm.global_idx[j] as usize);
+            let global_idx = dm.global_idx[j] as usize;
+            fluxor::kernel::scheduler::set_current_module(global_idx);
             step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
+            let t0 = bcm_read_cntpct();
             let _ = m.step();
+            let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
             step_guard::disarm();
             step_guard::post_step_check();
             if step_guard::check_and_clear_timeout() {
                 log::warn!("[guard] domain {} module {} timeout", domain_id, j);
+            }
+            // Feed the step-time histogram so MON_HIST / fluxor monitor
+            // see non-zero buckets. freq != 0 after uart_init, but guard
+            // anyway in case this path runs pre-timer.
+            if freq > 0 {
+                let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
+                fluxor::kernel::scheduler::record_step_time(global_idx, elapsed_us);
             }
         }
         pos += 1;
@@ -2093,24 +2167,51 @@ pub fn wake_secondary_cores() {
 }
 
 // ============================================================================
-// log crate backend
+// log crate backend — formats records into the kernel log ring.
 // ============================================================================
+//
+// Parallel to the RingLogger on RP platforms: both routes funnel every
+// `log::info!` etc. into `kernel::log_ring::push_bytes`. Wire output is
+// driven by an opt-in overlay module (log_uart / log_usb / log_net).
 
-struct UartLogger;
+struct RingLogger;
 
-impl log::Log for UartLogger {
+impl log::Log for RingLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
     fn log(&self, record: &log::Record) {
         use core::fmt::Write;
-        struct UartWriter;
-        impl Write for UartWriter {
+        // Format into a stack buffer first, then push the whole record
+        // (plus CRLF) into the ring in a single call. Incremental
+        // write_str pushes let a preempting ISR or cross-core producer
+        // interleave bytes with our message; per-record staging prevents
+        // that on both single-core and multi-core boots.
+        struct BufWriter<'a> {
+            buf: &'a mut [u8],
+            pos: usize,
+        }
+        impl<'a> Write for BufWriter<'a> {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for b in s.bytes() { uart_putc(b); }
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len().saturating_sub(self.pos);
+                let take = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + take].copy_from_slice(&bytes[..take]);
+                self.pos += take;
                 Ok(())
             }
         }
-        let _ = core::fmt::write(&mut UartWriter, *record.args());
-        uart_puts(b"\r\n");
+
+        let mut buf = [0u8; 256];
+        let written = {
+            let mut w = BufWriter { buf: &mut buf, pos: 0 };
+            let _ = core::fmt::write(&mut w, *record.args());
+            if w.pos + 2 <= w.buf.len() {
+                w.buf[w.pos] = b'\r';
+                w.buf[w.pos + 1] = b'\n';
+                w.pos += 2;
+            }
+            w.pos
+        };
+        fluxor::kernel::log_ring::push_bytes(&buf[..written]);
     }
     fn flush(&self) {}
 }

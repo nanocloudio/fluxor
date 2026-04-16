@@ -1,0 +1,30 @@
+# Netconsole-style log forwarding (Pi 5 / CM5 bare-metal).
+#
+# Enables the `debug` stack with `to: net`: the kernel log ring is drained
+# each tick and forwarded as UDP datagrams through the ethernet+ip path.
+# Use when the UART is unavailable (HAT blocks GPIO14/15, etc.).
+#
+# The `debug: { to: net }` variant wires to the ip module, which is provided
+# by the `net` stack — so both stacks must be listed. Stacks don't auto-add
+# each other's modules.
+#
+# Build:
+#   make firmware TARGET=cm5 && make modules TARGET=bcm2712
+#   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/cm5/log_net.yaml
+#
+# Host capture (same L2 segment):
+#   python3 - <<'PY'
+#   import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#   s.bind(("",6666))
+#   while True:
+#       d,a=s.recvfrom(4096); print(a,d.decode(errors="replace"),end="")
+#   PY
+target: cm5
+tick_us: 100
+
+platform:
+  net: {}
+  debug:
+    to: net
+    # dst_ip: "0xC0A80A0A"   # uncomment and set to your host for unicast
+    # dst_port: 6666

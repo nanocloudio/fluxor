@@ -2878,6 +2878,14 @@ pub fn active_module_count() -> usize {
     unsafe { SCHED.active_module_count }
 }
 
+/// Platform hook: set the active module count. Called by platforms whose
+/// graph-setup path doesn't go through `prepare_graph` (e.g. the bcm2712
+/// domain-based instantiator) but which still want queries like
+/// `RECONFIGURE_MODULE_COUNT` to report the right value.
+pub fn set_active_module_count(n: usize) {
+    unsafe { SCHED.active_module_count = n; }
+}
+
 /// Invoke `module_drain()` on module N. Returns the module's return code,
 /// or -1 if the module is not drain-capable or the index is invalid.
 pub fn call_module_drain(module_idx: usize) -> i32 {

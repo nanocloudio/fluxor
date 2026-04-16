@@ -5,6 +5,20 @@
 //! modules, wiring, params, and services into the config before the existing
 //! config generation pipeline runs.
 //!
+//! Two kinds of injection blocks coexist in a stack file:
+//!
+//! - `[[variant]]` — **exclusive**. Exactly one is selected by specificity-
+//!   scored match. This answers "which driver/phy shape does this board use?".
+//! - `[[overlay]]` — **additive**. Each is evaluated independently; every
+//!   overlay whose match predicate holds is applied on top of the variant.
+//!   This answers "what optional capabilities does the user want layered on?"
+//!   (debug netconsole, pcap sink, perf exporter, …).
+//!
+//! Param sources (per-module-param):
+//!   `env:VAR`   — read from the environment; skip if unset
+//!   `user:KEY`  — read from merged user platform fields; skip if unset
+//!   literal     — string used as-is (with number/bool coercion)
+//!
 //! See `.context/platform_stacks.md` for the full specification.
 
 use std::collections::HashMap;
@@ -21,7 +35,10 @@ use crate::target::TargetDescriptor;
 #[derive(Deserialize)]
 struct StackFile {
     stack: StackMeta,
-    variant: Vec<StackVariant>,
+    #[serde(default)]
+    variant: Vec<StackInjection>,
+    #[serde(default)]
+    overlay: Vec<StackInjection>,
 }
 
 #[derive(Deserialize)]
@@ -31,8 +48,12 @@ struct StackMeta {
     provides: Option<Vec<String>>,
 }
 
+/// A match-and-inject block. Shared by `[[variant]]` (exclusive) and
+/// `[[overlay]]` (additive). The only difference between the two is
+/// *how many* can fire: variants pick one by specificity score, overlays
+/// fire independently whenever their match holds.
 #[derive(Deserialize)]
-struct StackVariant {
+struct StackInjection {
     #[serde(rename = "match")]
     match_keys: HashMap<String, String>,
     #[serde(default)]
@@ -76,9 +97,24 @@ pub fn expand_platform_stacks(
     for (stack_name, user_fields) in &platform_map {
         let stack_file = load_stack(stack_name, project_root)?;
         let merged = merge_with_board_defaults(user_fields, stack_name, target);
-        let variant = select_variant(&stack_file, &merged)?;
-        let added = inject_variant(config, variant, &merged, &stack_file.stack)?;
-        auto_added.extend(added);
+
+        // Variants are exclusive: pick exactly one by specificity score.
+        if !stack_file.variant.is_empty() {
+            let variant = select_variant(&stack_file, &merged)?;
+            let added = inject_injection(config, variant, &merged, &stack_file.stack)?;
+            auto_added.extend(added);
+        }
+
+        // Overlays are additive: every overlay whose match predicate holds
+        // is applied on top of the variant. Deduplication by module name and
+        // edge-key already handles repeated application.
+        for overlay in &stack_file.overlay {
+            if !injection_matches(&overlay.match_keys, &merged) {
+                continue;
+            }
+            let added = inject_injection(config, overlay, &merged, &stack_file.stack)?;
+            auto_added.extend(added);
+        }
     }
 
     // Remove platform: key so downstream code doesn't see it
@@ -173,15 +209,11 @@ fn merge_with_board_defaults(
 fn select_variant<'a>(
     stack: &'a StackFile,
     merged: &HashMap<String, String>,
-) -> Result<&'a StackVariant> {
-    let mut eligible: Vec<(&StackVariant, u32)> = Vec::new();
+) -> Result<&'a StackInjection> {
+    let mut eligible: Vec<(&StackInjection, u32)> = Vec::new();
 
     for variant in &stack.variant {
-        // Filter: every key in the match block must equal the merged config
-        let all_match = variant.match_keys.iter().all(|(mk, mv)| {
-            merged.get(mk).map_or(false, |v| v == mv)
-        });
-        if !all_match {
+        if !injection_matches(&variant.match_keys, merged) {
             continue;
         }
 
@@ -218,14 +250,32 @@ fn select_variant<'a>(
     Ok(eligible[0].0)
 }
 
+/// True iff every match-key is satisfied by `merged`.
+///
+/// A match value of `"*"` matches any present truthy value (non-empty,
+/// not `"false"`, not `"0"`). Exact string match otherwise.
+fn injection_matches(
+    match_keys: &HashMap<String, String>,
+    merged: &HashMap<String, String>,
+) -> bool {
+    match_keys.iter().all(|(k, expected)| {
+        let actual = merged.get(k);
+        if expected == "*" {
+            actual.map_or(false, |v| !v.is_empty() && v != "false" && v != "0")
+        } else {
+            actual.map_or(false, |v| v == expected)
+        }
+    })
+}
+
 // ============================================================================
 // Injection
 // ============================================================================
 
-fn inject_variant(
+fn inject_injection(
     config: &mut Value,
-    variant: &StackVariant,
-    _merged: &HashMap<String, String>,
+    variant: &StackInjection,
+    merged: &HashMap<String, String>,
     stack_meta: &StackMeta,
 ) -> Result<Vec<String>> {
     let mut added = Vec::new();
@@ -254,13 +304,21 @@ fn inject_variant(
         // Map params: module_param_name <- source value.
         // Sources:
         //   "env:VAR_NAME" → read from environment variable
+        //   "user:KEY"     → read from merged user platform fields
         //   literal string  → use as-is (number/bool coercion applied)
+        //
+        // `env:` and `user:` skip the param if the source is unset, letting
+        // the module's compile-time default apply.
         for (module_key, source) in &sm.params {
             let val = if let Some(var_name) = source.strip_prefix("env:") {
-                // Environment variable — skip if not set (module uses its default)
                 match std::env::var(var_name) {
                     Ok(v) => v,
                     Err(_) => continue,
+                }
+            } else if let Some(key) = source.strip_prefix("user:") {
+                match merged.get(key) {
+                    Some(v) if !v.is_empty() => v.clone(),
+                    _ => continue,
                 }
             } else {
                 source.clone()

@@ -1,0 +1,20 @@
+# Netconsole + monitor telemetry end-to-end test.
+#
+# Enables the `debug` stack with transport=net and the monitor overlay.
+# The monitor PIC module periodically emits `MON_HIST` lines via log::info!,
+# which flow through the log ring into the netconsole stream. The `fluxor
+# monitor --net :6666` CLI consumes that stream and renders a dashboard.
+#
+# Build + capture:
+#   make firmware TARGET=cm5 && make modules TARGET=bcm2712
+#   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/cm5/log_net_monitor.yaml
+#   fluxor monitor --net :6666
+target: cm5
+tick_us: 100
+
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+    monitor_interval_ms: 3000

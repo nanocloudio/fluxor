@@ -129,6 +129,19 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max.saturating_sub(1)]) }
 }
 
+/// Dispatcher — choose transport based on whether --net was set.
+pub fn cmd_monitor_dispatch(
+    port: &str,
+    baud: u32,
+    refresh_ms: u64,
+    net: Option<&str>,
+) -> Result<()> {
+    match net {
+        Some(bind) => cmd_monitor_udp(bind, refresh_ms),
+        None => cmd_monitor(port, baud, refresh_ms),
+    }
+}
+
 pub fn cmd_monitor(port: &str, _baud: u32, refresh_ms: u64) -> Result<()> {
     eprintln!(
         "fluxor monitor: opening {} (configure baud externally, e.g. \
@@ -155,6 +168,51 @@ pub fn cmd_monitor(port: &str, _baud: u32, refresh_ms: u64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Consume MON_* lines from UDP netconsole datagrams. Each datagram may
+/// carry multiple newline-framed log lines (the device batches them).
+pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
+    use std::net::UdpSocket;
+    let normalized = if bind.starts_with(':') {
+        format!("0.0.0.0{}", bind)
+    } else {
+        bind.to_string()
+    };
+    let sock = UdpSocket::bind(&normalized)
+        .map_err(|e| Error::Config(format!("bind {}: {}", normalized, e)))?;
+    sock.set_read_timeout(Some(Duration::from_millis(refresh_ms)))
+        .ok();
+    eprintln!("fluxor monitor: listening on {} (UDP)", normalized);
+
+    let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
+    let mut last_render = Instant::now();
+    let refresh = Duration::from_millis(refresh_ms);
+    let mut buf = [0u8; 4096];
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((n, _addr)) => {
+                // A single datagram may batch several \r\n-separated lines.
+                for line in buf[..n].split(|&b| b == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(s) = std::str::from_utf8(line) {
+                        apply_line(&mut rows, s.trim_end_matches('\r'));
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // idle tick — fall through to render
+            }
+            Err(e) => return Err(Error::Config(format!("udp recv: {}", e))),
+        }
+        if last_render.elapsed() >= refresh {
+            render(&rows);
+            last_render = Instant::now();
+        }
+    }
 }
 
 #[cfg(test)]

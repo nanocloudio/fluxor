@@ -53,9 +53,152 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     loop { cortex_m::asm::nop(); }
 }
 
+// ============================================================================
+// Log backend — formats log records into the kernel log ring.
+// ============================================================================
+//
+// Replaces embassy_usb_logger on RP platforms. Every log crate record
+// becomes plain UTF-8 bytes in `kernel::log_ring`, which is the canonical
+// log bus across all boards. A transport overlay (`log_net`, `log_usb`,
+// `log_uart`) drains the ring and forwards the bytes on its wire; if no
+// overlay is loaded, log output stays in the ring until it overflows and
+// drops.
+
+struct RingLogger;
+
+impl log::Log for RingLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn log(&self, record: &log::Record) {
+        use core::fmt::Write;
+
+        // Format into a stack buffer first. A full log line fits in 256 B
+        // in practice; anything longer gets truncated to the buffer limit
+        // rather than spilling into adjacent bytes. The alternative —
+        // formatting byte-by-byte into the ring — is O(lines × capacity)
+        // of atomic RMWs per log event, which is too heavy for the hot path.
+        struct BufWriter<'a> {
+            buf: &'a mut [u8],
+            pos: usize,
+        }
+        impl<'a> Write for BufWriter<'a> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let remaining = self.buf.len().saturating_sub(self.pos);
+                let take = bytes.len().min(remaining);
+                self.buf[self.pos..self.pos + take].copy_from_slice(&bytes[..take]);
+                self.pos += take;
+                Ok(())
+            }
+        }
+
+        let mut buf = [0u8; 256];
+        let written = {
+            let mut w = BufWriter { buf: &mut buf, pos: 0 };
+            let _ = core::fmt::write(&mut w, *record.args());
+            if w.pos + 2 <= w.buf.len() {
+                w.buf[w.pos] = b'\r';
+                w.buf[w.pos + 1] = b'\n';
+                w.pos += 2;
+            }
+            w.pos
+        };
+        fluxor::kernel::log_ring::push_bytes(&buf[..written]);
+    }
+    fn flush(&self) {}
+}
+
+static RING_LOGGER: RingLogger = RingLogger;
+
+fn init_logger() {
+    // Safe: called exactly once, before any task spawns.
+    // set_max_level_racy (vs set_max_level) works on Cortex-M0+ too,
+    // which lacks target_has_atomic = "ptr".
+    unsafe {
+        let _ = log::set_logger_racy(&RING_LOGGER);
+        log::set_max_level_racy(log::LevelFilter::Info);
+    }
+}
+
+// ============================================================================
+// USB CDC-ACM bridge — shared pipe drained by an embassy task.
+// ============================================================================
+//
+// The `log_usb` overlay module enqueues bytes through the `USB_WRITE_RAW`
+// syscall, which pushes them into `USB_TX_PIPE`. The CDC task below reads
+// packet-sized chunks out of the pipe and writes them to the CDC endpoint.
+// Pipe is lock-free on the producer side via `try_write` and async on the
+// consumer side — exactly the shape we need for sync-syscall → async-USB.
+
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::pipe::Pipe;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
+use embassy_usb::{Builder, Config as UsbConfig};
+use embassy_futures::join::join;
+use static_cell::StaticCell;
+
+const USB_TX_PIPE_SIZE: usize = 4096;
+
+static USB_TX_PIPE: Pipe<CriticalSectionRawMutex, USB_TX_PIPE_SIZE> = Pipe::new();
+
+/// Raw adapter for `kernel::usb_write::install`. Non-blocking: writes as
+/// many bytes as fit in the pipe and returns the count. Callers must
+/// handle short writes.
+unsafe fn usb_write_raw(ptr: *const u8, len: usize) -> usize {
+    let bytes = core::slice::from_raw_parts(ptr, len);
+    match USB_TX_PIPE.try_write(bytes) {
+        Ok(n) => n,
+        Err(_) => 0,
+    }
+}
+
 #[embassy_executor::task]
-async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(4096, log::LevelFilter::Info, driver);
+async fn usb_cdc_task(driver: Driver<'static, USB>) {
+    // Descriptor and state buffers live for the lifetime of the task.
+    // StaticCell ensures single initialization without unsafe statics.
+    static CONFIG_DESC: StaticCell<[u8; 128]> = StaticCell::new();
+    static BOS_DESC: StaticCell<[u8; 16]> = StaticCell::new();
+    static MSOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
+
+    let mut config = UsbConfig::new(0xc0de, 0xcafe);
+    config.manufacturer = Some("Fluxor");
+    config.product = Some("Fluxor USB CDC");
+    config.max_power = 100;
+    config.max_packet_size_0 = 64;
+
+    let mut builder = Builder::new(
+        driver,
+        config,
+        CONFIG_DESC.init([0; 128]),
+        BOS_DESC.init([0; 16]),
+        MSOS_DESC.init([0; 256]),
+        CONTROL_BUF.init([0; 64]),
+    );
+
+    let class = CdcAcmClass::new(&mut builder, CDC_STATE.init(CdcState::new()), 64);
+    let (mut sender, _receiver) = class.split();
+    let mut device = builder.build();
+
+    let run_fut = device.run();
+    let tx_fut = async {
+        let mut buf = [0u8; 64];
+        loop {
+            sender.wait_connection().await;
+            loop {
+                let n = USB_TX_PIPE.read(&mut buf).await;
+                if sender.write_packet(&buf[..n]).await.is_err() {
+                    break;
+                }
+                // A full 64-byte packet needs a zero-length packet to
+                // terminate the CDC transfer (CDC framing rule).
+                if n == 64 && sender.write_packet(&[]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+    join(run_fut, tx_fut).await;
 }
 
 #[embassy_executor::main]
@@ -70,10 +213,18 @@ async fn main(spawner: Spawner) {
     // Disable watchdog — bootloader may have enabled it, and we don't feed it.
     unsafe { core::ptr::write_volatile(fluxor::kernel::chip::WATCHDOG_CTRL as *mut u32, 0); }
 
-    // Spawn USB logger and wait for enumeration
+    // Install the ring-backed log backend. Records go into kernel::log_ring
+    // and are consumed by PIC modules (e.g. log_net for UDP netconsole).
+    init_logger();
+
+    // Spawn the USB CDC drain task. It's always running — the `log_usb`
+    // overlay module decides whether anything actually feeds it. If no
+    // overlay is active, the pipe stays empty and the task sits in
+    // `wait_connection`/`read.await`. Installing `usb_write_raw` here
+    // lets the USB_WRITE_RAW syscall work regardless.
     let usb_driver = Driver::new(p.USB, Irqs);
-    spawner.spawn(logger_task(usb_driver).unwrap());
-    Timer::after(Duration::from_secs(1)).await;
+    spawner.spawn(usb_cdc_task(usb_driver).unwrap());
+    fluxor::kernel::usb_write::install(usb_write_raw);
 
     log::info!("[fluxor] starting");
 
@@ -174,7 +325,6 @@ async fn main(spawner: Spawner) {
 
 use fluxor::kernel::hal::HalOps;
 use embassy_sync::signal::Signal;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 /// Scheduler wake signal — Embassy-safe, used by HAL wake_scheduler.
 pub static SCHEDULER_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();

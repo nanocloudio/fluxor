@@ -29,7 +29,7 @@ use std::path::PathBuf;
 
 use crate::config::{decode_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES};
 use crate::error::{Error, Result};
-use crate::monitor::cmd_monitor;
+use crate::monitor::cmd_monitor_dispatch;
 use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config, parse_modules_from_config_multi};
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
@@ -225,6 +225,11 @@ enum Commands {
         /// Refresh period in milliseconds (default: 500)
         #[arg(long, default_value = "500")]
         refresh_ms: u64,
+        /// Consume MON_* lines from UDP netconsole instead of a serial
+        /// port. Pass a bind spec like `:6666` or `0.0.0.0:6666`. When
+        /// set, --port is ignored.
+        #[arg(long)]
+        net: Option<String>,
     },
     /// Sign a packed .fmod module with an Ed25519 private key.
     ///
@@ -295,7 +300,9 @@ fn main() {
         Commands::Run { config } => cmd_run(&config, verbose),
         Commands::Flash { config } => cmd_flash(&config, verbose),
         Commands::Sign { input, key, output } => cmd_sign(&input, &key, output.as_deref(), verbose),
-        Commands::Monitor { port, baud, refresh_ms } => cmd_monitor(&port, baud, refresh_ms),
+        Commands::Monitor { port, baud, refresh_ms, net } => {
+            cmd_monitor_dispatch(&port, baud, refresh_ms, net.as_deref())
+        }
     };
 
     if let Err(e) = result {

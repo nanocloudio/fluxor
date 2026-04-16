@@ -1,0 +1,2 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
