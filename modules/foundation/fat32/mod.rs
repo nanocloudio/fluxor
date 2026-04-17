@@ -129,6 +129,58 @@ mod params_def {
                     *dst.add(len) = 0;
                 }
             };
+
+        // Phase 6: write_file as a user-friendly "name.ext" (e.g.
+        // "boot.txt"). We convert to FAT 8.3 short-name form (8 name
+        // bytes + 3 extension bytes, space-padded, uppercased) so a
+        // raw 11-byte compare against FileEntry.short_name finds it.
+        3, write_file, str, 0
+            => |s, d, len| {
+                let mut name: [u8; 11] = [b' '; 11];
+                let mut dot_pos = len;
+                let mut i = 0usize;
+                while i < len {
+                    if *d.add(i) == b'.' { dot_pos = i; break; }
+                    i += 1;
+                }
+                let n_len = if dot_pos > 8 { 8 } else { dot_pos };
+                let mut j = 0usize;
+                while j < n_len {
+                    let b = *d.add(j);
+                    name[j] = if b >= b'a' && b <= b'z' { b - 32 } else { b };
+                    j += 1;
+                }
+                if dot_pos < len {
+                    let ext_avail = len - dot_pos - 1;
+                    let e_len = if ext_avail > 3 { 3 } else { ext_avail };
+                    let mut k = 0usize;
+                    while k < e_len {
+                        let b = *d.add(dot_pos + 1 + k);
+                        name[8 + k] = if b >= b'a' && b <= b'z' { b - 32 } else { b };
+                        k += 1;
+                    }
+                }
+                let dst = s.write_file.as_mut_ptr();
+                let mut x = 0usize;
+                while x < 11 {
+                    *dst.add(x) = name[x];
+                    x += 1;
+                }
+                // Flag the write as enabled when any bytes were given.
+                s.write_file_len = if len > 0 { 11 } else { 0 };
+            };
+
+        4, write_data, str, 0
+            => |s, d, len| {
+                let n = if len > 48 { 48 } else { len };
+                let dst = s.write_data.as_mut_ptr();
+                let mut i = 0;
+                while i < n {
+                    *dst.add(i) = *d.add(i);
+                    i += 1;
+                }
+                s.write_data_len = n as u8;
+            };
     }
 }
 
@@ -144,6 +196,11 @@ struct FileEntry {
     start_cluster: u32,
     /// File size in bytes
     size: u32,
+    /// Short 8.3 name as stored in the directory entry: 8 name bytes
+    /// padded with spaces, then 3 extension bytes. Used by the
+    /// Phase 6 write path to locate a file by name.
+    short_name: [u8; 11],
+    _pad:       u8,
 }
 
 impl FileEntry {
@@ -151,6 +208,8 @@ impl FileEntry {
         Self {
             start_cluster: 0,
             size: 0,
+            short_name: [b' '; 11],
+            _pad: 0,
         }
     }
 }
@@ -207,6 +266,27 @@ struct Fat32State {
     block_offset: u16,
     read_fill: u16,
     block_buf: [u8; BLOCK_SIZE],
+
+    /// Diagnostic tick counter — drives the periodic heartbeat
+    /// emitted by `module_step` so init-time state is still visible
+    /// after `log_net` starts streaming.
+    tick_count: u32,
+
+    // Phase 6 one-shot file write. After init completes and the
+    // target file is found (by short 8.3 name), fat32 emits a single
+    // 528-byte write request (16-byte header + 512-byte payload) on
+    // the `block_writes` output channel. `write_file_len == 0` or
+    // `write_file[0] == 0` disables the write.
+    write_out_chan:  i32,
+    write_phase:     u8,
+    write_file_len:  u8,
+    write_data_len:  u8,
+    _pad_write:      u8,
+    write_file:      [u8; 11],
+    write_data:      [u8; 48],
+    write_lba:       u32,
+    write_sent:      u16,
+    _pad_write2:     u16,
 }
 
 impl Fat32State {
@@ -239,7 +319,15 @@ impl Fat32State {
         self.pending_block = 0;
         self.block_offset = 0;
         self.read_fill = 0;
-        // path, pattern, files arrays are zeroed by kernel
+        self.tick_count = 0;
+        self.write_out_chan = -1;
+        self.write_phase = 0;
+        self.write_file_len = 0;
+        self.write_data_len = 0;
+        self.write_lba = 0;
+        self.write_sent = 0;
+        // path, pattern, files, write_file, write_data arrays are
+        // zeroed by the kernel allocator.
     }
 
     #[inline(always)]
@@ -588,6 +676,13 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
         let file_ptr = s.files.as_mut_ptr().add(idx);
         (*file_ptr).start_cluster = cluster;
         (*file_ptr).size = size;
+        // Copy the 11-byte short 8.3 name so the write-once path can
+        // look the file up without re-parsing the directory.
+        let mut i = 0usize;
+        while i < 11 {
+            (*file_ptr).short_name[i] = *buf_ptr.add(entry_offset + i);
+            i += 1;
+        }
         s.file_count += 1;
     }
 
@@ -633,6 +728,11 @@ pub extern "C" fn module_new(
 
         s.in_chan = in_chan;
         s.out_chan = out_chan;
+        // Second output port (`block_writes`, index 1) carries Phase 6
+        // write requests. When the YAML wires it to nvme.requests the
+        // lookup returns a valid handle; otherwise it stays -1 and the
+        // write logic is inert.
+        s.write_out_chan = dev_channel_port(&*s.syscalls, 1, 1);
 
         // Parse params
         let is_tlv = !params.is_null() && params_len >= 4
@@ -660,9 +760,52 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return -1;
         }
 
+        s.tick_count = s.tick_count.wrapping_add(1);
+        if s.tick_count % 5000 == 0 {
+            let mut msg = [0u8; 64];
+            let p = msg.as_mut_ptr();
+            let prefix = b"[fat32] hb init=";
+            core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+            let mut pos = prefix.len();
+            let ip = s.init_phase as u8;
+            *p.add(pos)     = b'0' + (ip / 10);
+            *p.add(pos + 1) = b'0' + (ip % 10);
+            pos += 2;
+            let mp_tag = b" mod=";
+            core::ptr::copy_nonoverlapping(mp_tag.as_ptr(), p.add(pos), mp_tag.len());
+            pos += mp_tag.len();
+            let mp = s.mod_phase as u8;
+            *p.add(pos) = b'0' + mp;
+            pos += 1;
+            let fc_tag = b" files=";
+            core::ptr::copy_nonoverlapping(fc_tag.as_ptr(), p.add(pos), fc_tag.len());
+            pos += fc_tag.len();
+            let fc = s.file_count.min(999);
+            *p.add(pos)     = b'0' + ((fc / 100) % 10) as u8;
+            *p.add(pos + 1) = b'0' + ((fc / 10)  % 10) as u8;
+            *p.add(pos + 2) = b'0' + ( fc         % 10) as u8;
+            pos += 3;
+            // Write-path progress (0=scan, 1=emitting, 2=done) — worth
+            // keeping in the heartbeat so a stuck write is observable
+            // from the log alone.
+            let wp_tag = b" wp=";
+            core::ptr::copy_nonoverlapping(wp_tag.as_ptr(), p.add(pos), wp_tag.len());
+            pos += wp_tag.len();
+            *p.add(pos) = b'0' + s.write_phase;
+            pos += 1;
+            dev_log(s.sys(), 3, p, pos);
+        }
+
         // Run initialization if not done
         if s.init_phase != Fat32InitPhase::Done {
             return init_step(s);
+        }
+
+        // Phase 6: if a one-shot write is configured, run it before
+        // serving file-reads so the write lands before downstream
+        // consumers start fighting over the blocks channel.
+        if s.write_file_len > 0 && s.write_phase != 2 {
+            return write_step(s);
         }
 
         // Check for seek request from downstream
@@ -683,6 +826,114 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // File streaming state machine
         stream_step(s)
+    }
+}
+
+/// Phase 6 one-shot write. After init completes, if the `write_file`
+/// param is set and a matching entry was enumerated, emit a 528-byte
+/// packet on the `block_writes` output channel:
+///   16 B header = { op: u32 = 1 (WRITE), lba: u64, nlb: u32 = 1 }
+///   512 B payload = write_data, zero-padded to a block.
+/// The downstream (nvme) picks this up on its `requests` input and
+/// submits an NVMe Write — see `step_ready` in modules/drivers/nvme.
+///
+/// `write_phase` transitions: 0 (scan) → 1 (emitting) → 2 (done).
+unsafe fn write_step(s: &mut Fat32State) -> i32 {
+    match s.write_phase {
+        0 => {
+            // Phase 0: locate the target file by short 8.3 name. When
+            // no channel is wired, or the file isn't present, skip.
+            if s.write_out_chan < 0 {
+                s.write_phase = 2;
+                dev_log(s.sys(), 3,
+                    b"[fat32] write: no block_writes channel\0".as_ptr(), 37);
+                return 0;
+            }
+            let mut found: i32 = -1;
+            let mut i = 0u16;
+            while (i as usize) < s.file_count as usize {
+                let fptr = s.files.as_ptr().add(i as usize);
+                let mut eq = true;
+                let mut k = 0usize;
+                while k < 11 {
+                    if (*fptr).short_name[k] != s.write_file[k] { eq = false; break; }
+                    k += 1;
+                }
+                if eq { found = i as i32; break; }
+                i += 1;
+            }
+            if found < 0 {
+                s.write_phase = 2;
+                dev_log(s.sys(), 3, b"[fat32] write: target file not found\0".as_ptr(), 36);
+                return 0;
+            }
+            let fptr = s.files.as_ptr().add(found as usize);
+            let cluster = (*fptr).start_cluster;
+            s.write_lba = s.data_start_sector
+                .wrapping_add((cluster - 2) * (s.sectors_per_cluster as u32));
+            s.write_sent = 0;
+            s.write_phase = 1;
+
+            // Log the resolved LBA once so the test harness can
+            // verify it matches the host-side filefrag/dd offset.
+            let mut msg = [0u8; 48];
+            let p = msg.as_mut_ptr();
+            let prefix = b"[fat32] write lba=0x";
+            core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+            let mut pos = prefix.len();
+            let v = s.write_lba;
+            let mut bi = 0usize;
+            while bi < 8 {
+                let n = ((v >> (28 - bi * 4)) & 0xF) as u8;
+                *p.add(pos) = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+                pos += 1;
+                bi += 1;
+            }
+            dev_log(s.sys(), 3, p, pos);
+            0
+        }
+        1 => {
+            // Phase 1: push the 528-byte packet. channel_write may
+            // take multiple calls to drain (ring backpressure), so we
+            // track progress in write_sent and resume from there.
+            let total: u16 = 16 + 512;
+            let mut packet = [0u8; 16 + 512];
+            // Header (little-endian).
+            packet[0] = 0x01;
+            // lba at bytes 4..12
+            let lba = s.write_lba as u64;
+            let lb = lba.to_le_bytes();
+            let mut b = 0usize;
+            while b < 8 {
+                packet[4 + b] = lb[b];
+                b += 1;
+            }
+            // nlb = 1 at bytes 12..16
+            packet[12] = 0x01;
+            // Payload at bytes 16..528. Copy write_data then zero-pad.
+            let n = s.write_data_len as usize;
+            let mut j = 0usize;
+            while j < n {
+                packet[16 + j] = s.write_data[j];
+                j += 1;
+            }
+            // (packet already zero-initialised past payload)
+
+            let remaining = total as usize - s.write_sent as usize;
+            let src = packet.as_ptr().add(s.write_sent as usize);
+            let rc = (s.sys().channel_write)(s.write_out_chan, src, remaining);
+            if rc < 0 {
+                // E_AGAIN (-11) etc. — retry next tick.
+                return 0;
+            }
+            s.write_sent += rc as u16;
+            if s.write_sent as u16 >= total {
+                s.write_phase = 2;
+                dev_log(s.sys(), 3, b"[fat32] write: packet emitted\0".as_ptr(), 29);
+            }
+            0
+        }
+        _ => 0, // done
     }
 }
 
