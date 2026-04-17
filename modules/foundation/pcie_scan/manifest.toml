@@ -1,0 +1,7 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "devices"
+direction = "output"
+content_type = "OctetStream"

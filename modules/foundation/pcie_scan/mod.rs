@@ -2,12 +2,21 @@
 //!
 //! Extracts the PCIe enumeration and BAR management logic from
 //! `bcm2712_pcie.rs` into a PIC module. Uses the kernel's generic
-//! MMIO_READ32/WRITE32 bridges to access ECAM config space.
+//! MMIO_READ32/WRITE32 bridges to access PCIe config space.
 //!
-//! On init (module_new): scans ECAM bus 0, discovers devices.
-//! Registers as a provider so downstream modules can request BAR maps.
+//! On init (module_new): scans bus 0 of the configured controller and
+//! discovers devices. Registers as a provider so downstream modules can
+//! request BAR maps.
 //!
-//! # Provider Dispatch (SYSTEM class, NIC_BAR_MAP/UNMAP subcommands)
+//! # Controllers (BCM2712 / Pi 5 / CM5)
+//!
+//! - `controller = 0` (default): PCIe2 — the internal x4 link to RP1.
+//!   Historical ECAM value `0xFD50_0000` preserved for back-compat.
+//! - `controller = 1`: PCIe1 — the external x1 slot used by the NVMe
+//!   HAT+ and other Pi 5 PCIe peripherals. Requires `pciex1` enabled in
+//!   `config.txt` so VPU trains the link before kernel handoff.
+//!
+//! # Provider Dispatch (NIC_BAR_MAP/UNMAP subcommands)
 //!
 //! - NIC_BAR_MAP:   arg=[dev_idx:u8, bar_idx:u8], returns mapped address
 //! - NIC_BAR_UNMAP: arg=[virt_addr:u64 LE], returns 0 or error
@@ -23,6 +32,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
+include!("../../sdk/params.rs");
 
 // ============================================================================
 // Constants
@@ -36,14 +46,25 @@ const MMIO_WRITE32: u32 = 0x0CE5;
 const NIC_BAR_MAP: u32 = 0x0CF0;
 const NIC_BAR_UNMAP: u32 = 0x0CF1;
 
-/// BCM2712 PCIe2 ECAM base (RP1 is on PCIe2).
-const ECAM_BASE_CM5: u64 = 0xFD50_0000;
-/// QEMU: fake ECAM not really used, we provide stub devices.
-const ECAM_BASE_QEMU: u64 = 0;
+// Controller presets -- see module-level docs for the why.
+const CTRL_PCIE2: u8 = 0;
+const CTRL_PCIE1: u8 = 1;
 
-/// BCM2712 PCIe2 MMIO window base (outbound BAR region).
-const PCIE_MMIO_BASE_CM5: u64 = 0x1F_0000_0000;
-const PCIE_MMIO_BASE_QEMU: u64 = 0x4000_0000;
+/// PCIe2 (RP1, x4) — historical back-compat values.
+const ECAM_BASE_PCIE2: u64       = 0xFD50_0000;
+const PCIE_MMIO_BASE_PCIE2: u64  = 0x1F_0000_0000;
+
+/// PCIe1 (external x1 / NVMe HAT+) — verified against the Pi 5 base
+/// board 6.12 rpt kernel (dmesg 2026-04-16): controller at
+/// `0x10_0011_0000`, outbound MMIO window `0x18_0000_0000..0x1B_FFFF_FFFF`.
+/// Requires `dtparam=pciex1` (no `=on`) in `config.txt`.
+const ECAM_BASE_PCIE1: u64       = 0x10_0011_0000;
+const PCIE_MMIO_BASE_PCIE1: u64  = 0x18_0000_0000;
+
+/// QEMU virt stub: no real ECAM; synthesise a fake RP1 so higher layers
+/// have something to wire against.
+const ECAM_BASE_QEMU: u64        = 0;
+const PCIE_MMIO_BASE_QEMU: u64   = 0x4000_0000;
 
 const MAX_DEVICES: usize = 8;
 const MAX_BARS: usize = 6;
@@ -89,11 +110,30 @@ struct PcieScanState {
     ctrl_chan: i32,
     device_count: u8,
     scan_done: u8,
+    controller: u8,
+    _pad0: u8,
     ecam_base: u64,
     mmio_base: u64,
-    _pad: [u8; 6],
+    _pad: [u8; 4],
     devices: [PcieDevice; MAX_DEVICES],
     bar_maps: [BarMap; MAX_BAR_MAPS],
+}
+
+// ============================================================================
+// Parameter schema
+// ============================================================================
+
+mod params_def {
+    use super::PcieScanState;
+    use super::p_u8;
+    use super::SCHEMA_MAX;
+
+    define_params! {
+        PcieScanState;
+
+        1, controller, u8, 0, enum { pcie2=0, pcie1=1 }
+            => |s, d, len| { s.controller = p_u8(d, len, 0, 0); };
+    }
 }
 
 // ============================================================================
@@ -369,11 +409,18 @@ pub extern "C" fn module_state_size() -> usize {
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+unsafe fn bases_for_controller(ctrl: u8) -> (u64, u64) {
+    match ctrl {
+        CTRL_PCIE1 => (ECAM_BASE_PCIE1, PCIE_MMIO_BASE_PCIE1),
+        _          => (ECAM_BASE_PCIE2, PCIE_MMIO_BASE_PCIE2),
+    }
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
+    params: *const u8, params_len: usize,
     state: *mut u8, state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
@@ -386,59 +433,52 @@ pub extern "C" fn module_new(
         s.in_chan = in_chan;
         s.out_chan = out_chan;
         s.ctrl_chan = ctrl_chan;
+        s.device_count = 0;
+        s.scan_done = 0;
+        s.controller = CTRL_PCIE2;
 
         let sys = &*s.syscalls;
 
-        // Detect ECAM base: try reading millis to detect platform.
-        // On BCM2712 with board-cm5, ecam is at CM5 address.
-        // On QEMU, ecam is 0 (stub). We use a param or detect.
-        // Default: use QEMU base (safe on both — real CM5 modules
-        // will be configured with the real ECAM base via config param).
-        // For now detect by trying to read the ECAM base and seeing
-        // if it returns a valid vendor ID.
-        s.ecam_base = ECAM_BASE_CM5;
-        s.mmio_base = PCIE_MMIO_BASE_CM5;
-
-        // Probe: if ECAM read returns 0xFFFFFFFF, fall back to QEMU stub
-        let probe = mmio_read32(sys, s.ecam_base);
-        if probe == 0xFFFF_FFFF || probe == 0 {
-            // MMIO_READ32 returned ENOSYS or no device — QEMU stub
-            s.ecam_base = ECAM_BASE_QEMU;
-            s.mmio_base = PCIE_MMIO_BASE_QEMU;
+        // Parse TLV params (controller selector).
+        let is_tlv = !params.is_null() && params_len >= 4
+            && *params == 0xFE && *params.add(1) == 0x01;
+        if is_tlv {
+            params_def::parse_tlv(s, params, params_len);
+        } else {
+            params_def::set_defaults(s);
         }
 
-        // Enumerate devices
-        enumerate(s);
+        let (ecam, mmio) = bases_for_controller(s.controller);
+        s.ecam_base = ecam;
+        s.mmio_base = mmio;
+
+        if s.controller == CTRL_PCIE1 {
+            dev_log(sys, 3, b"[pcie_scan] controller=PCIe1 (external)\0".as_ptr(), 37);
+        } else {
+            dev_log(sys, 3, b"[pcie_scan] controller=PCIe2 (RP1)\0".as_ptr(), 33);
+        }
+
+        // Probe: if ECAM read returns 0xFFFFFFFF, fall back to QEMU stub.
+        // On real hardware without the controller brought up (e.g. missing
+        // `pciex1` in config.txt for PCIe1), this also trips — but the
+        // intended semantics here are "QEMU virt has no PCIe RC", so we
+        // only fall back when the MMIO bridge itself is unavailable.
+        let probe = mmio_read32(sys, s.ecam_base);
+        if probe == 0xFFFF_FFFF || probe == 0 {
+            if s.controller == CTRL_PCIE1 {
+                dev_log(sys, 2, b"[pcie_scan] PCIe1 ECAM unreadable (pciex1 enabled?)\0".as_ptr(), 51);
+                // Leave device_count = 0; do NOT fabricate QEMU stub.
+                s.ecam_base = 0xFFFF_FFFF_FFFF_FFFF; // suppress enumerate()
+            } else {
+                s.ecam_base = ECAM_BASE_QEMU;
+                s.mmio_base = PCIE_MMIO_BASE_QEMU;
+            }
+        }
+
+        if s.ecam_base != 0xFFFF_FFFF_FFFF_FFFF {
+            enumerate(s);
+        }
         s.scan_done = 1;
-
-        // Register as SYSTEM provider for NIC_BAR_MAP/UNMAP.
-        // We reuse the SYSTEM class (0x0C) since NIC_BAR_MAP lives there.
-        // Actually, NIC BAR MAP opcodes are in SYSTEM class already.
-        // But SYSTEM is already registered by the kernel. So we can't
-        // re-register it. Instead, we publish our dispatch via a custom
-        // opcode and the kernel routes NIC_BAR_MAP to us.
-        //
-        // Actually the cleanest approach: register with the kernel-internal
-        // provider registration, but since we're a PIC module, we use
-        // REGISTER_PROVIDER with a class that the kernel NIC_BAR_MAP
-        // dispatch checks. Let's not change the dispatch flow — instead
-        // the kernel will be thinned to call our module directly.
-        //
-        // For the initial implementation, we don't register as a provider.
-        // The kernel thinned NIC_BAR_MAP dispatch calls this module's
-        // dispatch function via the flash_store-style registration pattern.
-
-        // Register dispatch via a custom opcode
-        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-        let mut reg_args = [0u8; 8];
-        let rp = reg_args.as_mut_ptr();
-        // Use a "virtual" device class. Since NIC opcodes are 0x0CF0-CF4
-        // which falls in class 0x0C (SYSTEM), and system class is kernel,
-        // we need a different approach. Let's use an unused class slot.
-        // Class 0x10 is first unused. But required_caps is u16...
-        // Simplest: register nothing, kernel dispatches to us directly.
-        // The thinned kernel code will call our dispatch fn.
-        let _ = (dispatch_hash, rp);
 
         dev_log(sys, 3, b"[pcie_scan] ready\0".as_ptr(), 16);
         0

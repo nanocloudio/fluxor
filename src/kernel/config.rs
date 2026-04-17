@@ -388,9 +388,12 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
     }
 }
 
-/// Maximum counts
-pub const MAX_MODULES: usize = 32;
-pub const MAX_GRAPH_EDGES: usize = 64;
+/// Maximum counts.
+///
+/// MAX_MODULES=64 accommodates graphs like Quantum (42 modules). The event
+/// wake bitmap in `kernel/event.rs` is u64 to match.
+pub const MAX_MODULES: usize = 64;
+pub const MAX_GRAPH_EDGES: usize = 128;
 
 /// Hardware section binary format sizes
 pub const SPI_CONFIG_BIN_SIZE: usize = 8;

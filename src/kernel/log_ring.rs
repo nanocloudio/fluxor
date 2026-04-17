@@ -24,8 +24,13 @@
 use portable_atomic::{AtomicU32, Ordering};
 
 /// Ring capacity. Must be a power of two; sized to cover early boot until the
-/// log_net module is up (~a few seconds of chatty logging).
-const CAPACITY: usize = 8192;
+/// log_net module is up (~a few seconds of chatty logging). Smaller on RP2040
+/// (264 KB total SRAM — a 64 KB ring is 25% of DRAM and pushes .bss past
+/// the region when combined with STATE_ARENA / BUFFER_ARENA).
+#[cfg(feature = "chip-rp2040")]
+const CAPACITY: usize = 4096;
+#[cfg(not(feature = "chip-rp2040"))]
+const CAPACITY: usize = 65536;
 const MASK: usize = CAPACITY - 1;
 
 static mut BUF: [u8; CAPACITY] = [0; CAPACITY];

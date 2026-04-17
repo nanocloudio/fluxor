@@ -453,8 +453,12 @@ mod mmu {
     pub unsafe fn init_page_tables() {
         let table = &mut *(&raw mut L1_TABLE.0);
 
-        // 0x0_0000_0000 .. 0x0_3FFF_FFFF (1 GB): DRAM with L2 table
-        // for fine-grained non-cacheable mapping of NIC DMA arena.
+        // 0x0_0000_0000 .. 0x0_3FFF_FFFF (1 GB): DRAM with L2 table so
+        // the 2 MB blocks enclosing the BSS-backed DMA arenas (NIC ring
+        // and PCIe1) can be flipped to Normal Non-Cacheable while the
+        // rest stays cacheable. Both arenas must live below 4 GB because
+        // the PCIe1 inbound ATU only covers PCI bus 0..0xFFFFFFFF on
+        // Pi 5 (see hw/nvme_trace/baseline/README.md).
         {
             let l2 = &mut *(&raw mut L2_TABLE_0.0);
             // Fill all 512 L2 entries as cacheable DRAM (each 2MB)
@@ -463,14 +467,18 @@ mod mmu {
                 l2[i] = dram_block((i as u64) * 0x20_0000);
                 i += 1;
             }
-            // Override the DMA arena entry with non-cacheable.
-            // The NIC DMA arena is a 2MB-aligned static in BSS. We query its
-            // address and mark that 2MB L2 entry as Normal Non-cacheable (MAIR
-            // index 2). This eliminates all cache maintenance from the NIC data
-            // path — hardware DMA and CPU see coherent memory by construction.
+            // Flip each BSS DMA arena's enclosing 2 MB to Normal
+            // Non-Cacheable (MAIR index 2). Hardware DMA and CPU see
+            // coherent memory by construction — no DC CVAC / IVAC on
+            // the fast path.
             let dma_addr = fluxor::kernel::nic_ring::dma_arena_base();
             if dma_addr != 0 && dma_addr < 0x4000_0000 {
-                let l2_idx = dma_addr >> 21; // divide by 2MB
+                let l2_idx = dma_addr >> 21;
+                l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
+            }
+            let pcie1_dma = fluxor::kernel::nic_ring::pcie1_dma_arena_base();
+            if pcie1_dma != 0 && pcie1_dma < 0x4000_0000 {
+                let l2_idx = pcie1_dma >> 21;
                 l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
             }
             // Point L1[0] to our L2 table
@@ -483,8 +491,11 @@ mod mmu {
         // 0x0_C000_0000 .. 0x0_FFFF_FFFF (1 GB): DRAM
         table[3] = dram_block(0x0_C000_0000);
 
-        // 0x1_0000_0000 .. 0x1_3FFF_FFFF: PCIe / RP1 BAR region (device)
-        table[4] = device_block(0x1_0000_0000);
+        // 0x1_0000_0000 .. 0x1_3FFF_FFFF: real DRAM on 8/16 GB Pi 5
+        // boards. No longer used as DMA target (see PCIE1_DMA_ARENA
+        // comment in bcm2712_nic_ring.rs) — mapped as regular cacheable
+        // DRAM in case a future consumer wants it.
+        table[4] = dram_block(0x1_0000_0000);
         // 0x1_4000_0000 .. 0x1_7FFF_FFFF: more PCIe space (device)
         table[5] = device_block(0x1_4000_0000);
         // 0x1_8000_0000 .. 0x1_BFFF_FFFF: PCIe range (device)
@@ -513,6 +524,19 @@ mod mmu {
         table[113] = device_block(0x1c_4000_0000);
         table[114] = device_block(0x1c_8000_0000);
         table[115] = device_block(0x1c_C000_0000);
+
+        // PCIe1 (external x1 slot, NVMe HAT+) outbound MMIO window at
+        // 0x18_0000_0000..0x1b_ffff_ffff (16 GB total) — verified
+        // against the Pi 5 base-board 6.12 rpt kernel `dmesg` ranges
+        // for the 1000110000.pcie controller (two ranges: mem1 at
+        // 0x1800_0000_00 prefetchable, mem0 at 0x1b80_0000_00).
+        // L1 indices 96..111, one 1 GB block each.
+        let mut pcie1_idx = 96usize;
+        while pcie1_idx < 112 {
+            let addr = (pcie1_idx as u64) * 0x4000_0000;
+            table[pcie1_idx] = device_block(addr);
+            pcie1_idx += 1;
+        }
     }
 
     /// Enable the MMU with the identity-mapped page tables.
@@ -1287,31 +1311,32 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // E3-S4: Probe RP1 (Pi 5 only — checks PCIe BAR mapping)
     rp1::report(uart_puts, uart_put_hex32);
 
-    // E3-S4b: PCIe enumeration — populate DEVICES[] so NIC_BAR_MAP works.
+    // E3-S4b: GEM module-ID probe still runs pre-logger since it's used
+    // for UART diagnostics only. Full PCIe enumeration moves below so
+    // its log::info! lines reach the ring (and therefore log_net → UDP).
+    #[cfg(feature = "board-cm5")]
     {
-        let n = fluxor::kernel::pcie::enumerate();
-        uart_puts(b"[pcie] enumerated ");
-        uart_put_u32(n as u32);
-        uart_puts(b" device(s)\r\n");
-
-        #[cfg(feature = "board-cm5")]
-        {
-            // Report GEM Module ID to confirm RP1 ethernet is reachable
-            let mid = unsafe { core::ptr::read_volatile(eth::GEM_BASE.wrapping_add(eth::MID) as *const u32) };
-            uart_puts(b"[gem] MID=0x");
-            uart_put_hex32(mid);
-            if mid == eth::EXPECTED_MID {
-                uart_puts(b" (OK)\r\n");
-            } else {
-                uart_puts(b" (UNEXPECTED - expected 0x00070109)\r\n");
-            }
-
+        let mid = unsafe { core::ptr::read_volatile(eth::GEM_BASE.wrapping_add(eth::MID) as *const u32) };
+        uart_puts(b"[gem] MID=0x");
+        uart_put_hex32(mid);
+        if mid == eth::EXPECTED_MID {
+            uart_puts(b" (OK)\r\n");
+        } else {
+            uart_puts(b" (UNEXPECTED - expected 0x00070109)\r\n");
         }
     }
 
     static LOGGER: RingLogger = RingLogger;
     unsafe { log::set_logger_racy(&LOGGER).ok() };
     log::set_max_level(log::LevelFilter::Info);
+
+    // PCIe1 bring-up: stages 1 + 2a + 2b (reset/RESCAL + RC-wide regs
+    // + MDIO tuning). Stage 2c onwards (SerDes/PERST#/link) is deferred
+    // pending cold-boot stability work.
+    {
+        let n = fluxor::kernel::pcie::enumerate();
+        log::info!("[pcie] bus1 devices={}", n);
+    }
 
     // Report timer frequency
     let freq = timer_freq();
@@ -2412,7 +2437,10 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             if arg.is_null() || arg_len < 16 { return -22; }
             let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let phys = fluxor::kernel::nic_ring::dma_alloc_contig(size as usize, align as usize);
+            // Use the PCIe1-reachable arena at AXI 0x1_0000_0000 so
+            // device DMA routed through the PCIe1 inbound window lands
+            // in real DRAM. See `bcm2712_nic_ring::pcie1_dma_alloc_contig`.
+            let phys = fluxor::kernel::nic_ring::pcie1_dma_alloc_contig(size as usize, align as usize);
             if phys == 0 { return -38; }
             let pb = (phys as u64).to_le_bytes();
             core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
@@ -2432,6 +2460,11 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
         }
         dev_system::NIC_RING_INFO => {
             fluxor::kernel::nic_ring::syscall_ring_info(_handle, arg, arg_len)
+        }
+        dev_system::PCIE_RESCAN => {
+            let _ = arg;
+            let _ = arg_len;
+            fluxor::kernel::pcie::enumerate() as i32
         }
         _ => -38, // E_NOSYS
     }

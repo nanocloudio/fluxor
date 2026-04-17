@@ -175,6 +175,74 @@ pub fn dma_arena_base() -> usize {
 #[cfg(not(feature = "chip-bcm2712"))]
 pub fn dma_arena_base() -> usize { 0 }
 
+// ----------------------------------------------------------------------------
+// PCIe1 (external / NVMe HAT+) DMA arena
+// ----------------------------------------------------------------------------
+//
+// The BCM2712 PCIe1 inbound ATU — whether programmed by Linux or left at
+// VPU defaults — only covers PCI bus addresses `0..0xFFFFFFFF` (see
+// `hw/nvme_trace/baseline/README.md`: Linux's userspace nvme_trace fails
+// with pagemap addresses above 4 GB, which is why baseline capture cuts
+// off mid-Identify). Any DMA target has to be reachable in that 4 GB
+// window with an identity PCI↔AXI mapping.
+//
+// This arena therefore lives in low DRAM as a BSS-backed static, the same
+// way `DMA_ARENA` above does. `init_page_tables` flips the enclosing 2 MB
+// L2 entry to Normal Non-Cacheable so CPU and device see coherent memory
+// without explicit maintenance. PCI bus addr == CPU/AXI addr under the
+// inbound identity window.
+
+#[cfg(feature = "chip-bcm2712")]
+pub const PCIE1_DMA_ARENA_SIZE: usize = 2 * 1024 * 1024;
+
+#[cfg(feature = "chip-bcm2712")]
+#[repr(C, align(2097152))]
+struct Pcie1DmaArena([u8; PCIE1_DMA_ARENA_SIZE]);
+
+#[cfg(feature = "chip-bcm2712")]
+static mut PCIE1_DMA_ARENA: Pcie1DmaArena = Pcie1DmaArena([0u8; PCIE1_DMA_ARENA_SIZE]);
+
+#[cfg(feature = "chip-bcm2712")]
+static PCIE1_DMA_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+/// Return the PCIe1 DMA arena base (CPU physical / AXI / identity-mapped
+/// virtual). Consumed by `init_page_tables` to flip the enclosing 2 MB
+/// L2 entry to Normal Non-Cacheable.
+#[cfg(feature = "chip-bcm2712")]
+pub fn pcie1_dma_arena_base() -> usize {
+    (&raw const PCIE1_DMA_ARENA) as *const _ as usize
+}
+
+#[cfg(not(feature = "chip-bcm2712"))]
+pub fn pcie1_dma_arena_base() -> usize { 0 }
+
+/// Allocate physically contiguous memory from the PCIe1 DMA arena.
+/// Returns the physical address (identity-mapped = CPU virt = PCI bus
+/// addr under the VPU-default inbound window) or 0 on failure.
+/// `align` must be a power of 2, minimum 16.
+#[cfg(feature = "chip-bcm2712")]
+pub fn pcie1_dma_alloc_contig(size: usize, align: usize) -> usize {
+    let a = if align < 16 { 16 } else { align };
+    let cur = PCIE1_DMA_OFFSET.load(Ordering::Relaxed) as usize;
+    let aligned_start = (cur + a - 1) & !(a - 1);
+    let aligned_size = (size + 15) & !15;
+    let new_end = aligned_start + aligned_size;
+    if new_end > PCIE1_DMA_ARENA_SIZE {
+        return 0;
+    }
+    let prev = PCIE1_DMA_OFFSET.compare_exchange(
+        cur as u32, new_end as u32,
+        Ordering::AcqRel, Ordering::Relaxed,
+    );
+    match prev {
+        Ok(_) => pcie1_dma_arena_base() + aligned_start,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(not(feature = "chip-bcm2712"))]
+pub fn pcie1_dma_alloc_contig(_size: usize, _align: usize) -> usize { 0 }
+
 /// NIC ring slots.
 static mut NIC_RINGS: [NicRing; MAX_NIC_RINGS] = [const { NicRing::empty() }; MAX_NIC_RINGS];
 

@@ -934,15 +934,20 @@ impl ConfigBuilder {
 
 /// Graph edge size in bytes
 const GRAPH_EDGE_SIZE: usize = 4;
-/// Maximum number of graph edges
-const MAX_GRAPH_EDGES: usize = 64;
+/// Maximum number of graph edges. Raised from 64 to 128 to fit the
+/// Quantum graph (114 edges).
+const MAX_GRAPH_EDGES: usize = 128;
 /// Per-domain metadata: 4 domains × (tick_us:u16 + exec_mode:u8 + reserved:u8) = 16 bytes
 const DOMAIN_META_SIZE: usize = 16;
 /// Graph section size (header + edges + domain metadata)
 const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
 
-/// Maximum number of modules
-const MAX_MODULES: usize = 24;
+/// Maximum number of modules.
+///
+/// Raised from 24 to 64 to accommodate graphs like Quantum's multi-protocol
+/// broker (42 modules: 23 Clustor substrate + 19 application). The wake
+/// bitmap in `kernel/event.rs` also bumped to u64 to match.
+const MAX_MODULES: usize = 64;
 
 /// Module entry header size (entry_length + name_hash + id + reserved)
 const MODULE_ENTRY_HEADER_SIZE: usize = 8;

@@ -903,6 +903,10 @@ pub mod dev_system {
     /// Unmap a previously mapped BAR region.
     /// handle=-1, arg=[virt_addr:u64 LE] (8 bytes). Returns 0 or negative errno.
     pub const NIC_BAR_UNMAP: u32 = 0x0CF1;
+    /// Re-run PCIe bus enumeration. Intended for cold-boot recovery on
+    /// platforms where the link trains slowly (Pi 5 NVMe HAT+ PCIe1).
+    /// handle=-1, arg=[] (unused). Returns new device count.
+    pub const PCIE_RESCAN: u32 = 0x0CF5;
     /// Create a NIC DMA ring (RX+TX descriptors + buffer pool).
     /// handle=-1, arg=[rx_desc_count:u16, tx_desc_count:u16, buf_size:u16, buf_count:u16] (8 bytes).
     /// Returns ring handle (>=0) or negative errno.

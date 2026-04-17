@@ -2746,7 +2746,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 pub fn step_woken_modules(
     modules: &mut [ModuleSlot; MAX_MODULES],
     count: usize,
-    wake_bits: u32,
+    wake_bits: u64,
 ) {
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let exec_count = sched.exec_order_count;
@@ -2761,7 +2761,7 @@ pub fn step_woken_modules(
             continue;
         }
         // Only step modules with pending events
-        if (wake_bits & (1u32 << module_idx)) == 0 {
+        if (wake_bits & (1u64 << module_idx)) == 0 {
             continue;
         }
         // Ready-signal gating: skip if any upstream module hasn't signaled Ready.

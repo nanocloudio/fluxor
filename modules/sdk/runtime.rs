@@ -860,6 +860,33 @@ unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
     (sys.dev_call)(-1, 0x0C3C, buf, len)
 }
 
+/// Allocate `size` bytes of DMA-coherent memory with `align`-byte alignment
+/// from the kernel's non-cacheable DMA arena. Returns the physical address
+/// (== virtual address under identity mapping) or 0 on failure.
+///
+/// Buffers returned here are Normal Non-cacheable memory — safe for device
+/// DMA without explicit cache maintenance. See
+/// `src/platform/bcm2712_nic_ring.rs` (the arena implementation) and
+/// `src/platform/bcm2712.rs` `init_page_tables()` (MAIR attr2 = 0x44).
+///
+/// Bump-only for v1 — there is no matching `dev_dma_free`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
+    let mut buf = [0u8; 16];
+    let bp = buf.as_mut_ptr();
+    let sb = size.to_le_bytes();
+    *bp = sb[0]; *bp.add(1) = sb[1]; *bp.add(2) = sb[2]; *bp.add(3) = sb[3];
+    let ab = align.to_le_bytes();
+    *bp.add(4) = ab[0]; *bp.add(5) = ab[1]; *bp.add(6) = ab[2]; *bp.add(7) = ab[3];
+    let rc = (sys.dev_call)(-1, 0x0CE6, bp, 16);
+    if rc != 0 { return 0; }
+    u64::from_le_bytes([
+        *bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11),
+        *bp.add(12), *bp.add(13), *bp.add(14), *bp.add(15),
+    ])
+}
+
 // ============================================================================
 // Network Interface helpers
 // ============================================================================

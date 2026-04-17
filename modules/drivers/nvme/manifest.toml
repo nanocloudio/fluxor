@@ -1,0 +1,20 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# Wire: pcie_scan.devices -> nvme.pcie_devices (for controller discovery)
+[[ports]]
+name = "pcie_devices"
+direction = "input"
+content_type = "OctetStream"
+
+# Block I/O request channel (from fat32 or equivalent).
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+# Block data output — same contract as sd.blocks, so fat32 consumes it.
+[[ports]]
+name = "blocks"
+direction = "output"
+content_type = "OctetStream"

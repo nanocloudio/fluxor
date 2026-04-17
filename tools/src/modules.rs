@@ -18,8 +18,8 @@ pub const MODULE_MAGIC: u32 = 0x444D5846;
 /// Current table version
 pub const TABLE_VERSION: u8 = 1;
 
-/// Maximum modules in table
-pub const MAX_TABLE_MODULES: usize = 32;
+/// Maximum modules in table. Raised to 64 to match MAX_MODULES.
+pub const MAX_TABLE_MODULES: usize = 64;
 
 /// Module table header (16 bytes)
 pub const TABLE_HEADER_SIZE: usize = 16;
