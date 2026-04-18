@@ -33,10 +33,10 @@ SECTIONS {
         KEEP(*(.layout_header))
     } > RAM
 
-    /* End of loadable (file-backed) sections.
-     * On aarch64 (RAM-loaded), the combine trailer is placed right after this
-     * rather than after __end_block_addr (which includes BSS + stack). */
-    . = ALIGN(256);
+    /* End of loadable (file-backed) sections. Pack-image and combine
+     * pad from this address up to the trailer's 256-byte boundary, so
+     * __end_data_addr must mark the true end of the emitted binary
+     * (no ALIGN here) for the trailer to land at the right offset. */
     __end_data_addr = .;
 
     .bss (NOLOAD) : ALIGN(4096) {

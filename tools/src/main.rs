@@ -1171,7 +1171,7 @@ fn cmd_pack_image(
     const PACKAGE_HEADER_MAGIC: u32 = 0x4B505846; // "FXPK"
     const PACKAGE_HEADER_SIZE: usize = 16;
 
-    let mut firmware = std::fs::read(firmware_path)?;
+    let firmware = std::fs::read(firmware_path)?;
     if firmware.len() < PACKAGE_HEADER_SIZE {
         return Err(error::Error::Config("firmware image is too small to contain package header".into()));
     }
@@ -1229,44 +1229,46 @@ fn cmd_pack_image(
     trailer.extend_from_slice(&modules_addr.to_le_bytes());
     trailer.extend_from_slice(&config_addr.to_le_bytes());
 
-    let mut package = Vec::new();
-    package.extend_from_slice(&trailer);
-    // Pad to reach modules_addr (or config_addr if no modules)
-    if let Some(ref mdata) = modules_data {
-        let target_offset = (modules_addr - trailer_addr) as usize;
-        while package.len() < target_offset {
-            package.push(0);
-        }
-        package.extend_from_slice(mdata);
-        // Pad to config alignment
-        let target_config = (config_addr - trailer_addr) as usize;
-        while package.len() < target_config {
-            package.push(0);
-        }
-    } else {
-        while package.len() < IMAGE_ALIGN as usize {
-            package.push(0);
-        }
-    }
-    package.extend_from_slice(&config_data);
-
-    let runtime_base = trailer_addr;
-    let package_size = package.len() as u32;
-    firmware[header_offset + 8..header_offset + 12].copy_from_slice(&runtime_base.to_le_bytes());
-    firmware[header_offset + 12..header_offset + 16].copy_from_slice(&package_size.to_le_bytes());
-
+    // Pad firmware up to trailer_addr, then append trailer, modules,
+    // and config in turn. The FXPK header is left untouched: the
+    // kernel resolves the trailer via the `__end_data_addr` linker
+    // symbol (see `config::get_trailer_addr`), so no runtime
+    // relocation is required for RAM-loaded images and `_start`'s
+    // copy loop stays skipped (package_size == 0).
     let firmware_size = firmware.len();
     let mut image = firmware;
-    image.extend_from_slice(&package);
+    let pad_to = trailer_addr as usize - (runtime_end as usize - firmware_size);
+    if pad_to > image.len() {
+        image.resize(pad_to, 0);
+    }
+    image.extend_from_slice(&trailer);
+    if let Some(ref mdata) = modules_data {
+        let modules_file_offset = pad_to + (modules_addr - trailer_addr) as usize;
+        if image.len() < modules_file_offset {
+            image.resize(modules_file_offset, 0);
+        }
+        image.extend_from_slice(mdata);
+        let config_file_offset = pad_to + (config_addr - trailer_addr) as usize;
+        if image.len() < config_file_offset {
+            image.resize(config_file_offset, 0);
+        }
+    } else {
+        let config_file_offset = pad_to + IMAGE_ALIGN as usize;
+        if image.len() < config_file_offset {
+            image.resize(config_file_offset, 0);
+        }
+    }
+    image.extend_from_slice(&config_data);
 
     if verbose {
         eprintln!("Layout:");
-        eprintln!("  Runtime:   0x{:08x}", runtime_base);
+        eprintln!("  Runtime:   0x{:08x}", runtime_end);
         eprintln!("  Trailer:   0x{:08x} (16 bytes)", trailer_addr);
         if let Some(ref mdata) = modules_data {
             eprintln!("  Modules:   0x{:08x} ({} bytes)", modules_addr, mdata.len());
         }
         eprintln!("  Config:    0x{:08x} ({} bytes)", config_addr, config_data.len());
+        eprintln!("  Total:     {} bytes", image.len() - firmware_size);
     }
 
     std::fs::write(output_path, &image)?;

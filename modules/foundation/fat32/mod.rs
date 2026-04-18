@@ -42,6 +42,16 @@ const BLOCK_SIZE: usize = 512;
 /// Maximum files to enumerate
 const MAX_FILES: usize = 128;
 
+/// Maximum payload accepted for the `write_data` param. Sized to
+/// span more than one cluster at common mkfs.vfat cluster sizes (up
+/// to 4 KB) so the write path exercises FAT-chain-walk and cluster
+/// allocation, while keeping the state-arena footprint bounded.
+const WRITE_DATA_MAX: usize = 8192;
+
+/// FAT32 reserved value marking the tail of an allocated chain when
+/// written into a FAT entry. Any read-back entry with its low 28 bits
+/// >= `FAT32_EOC` is treated as end-of-chain.
+const FAT32_TAIL: u32 = 0x0FFF_FFFF;
 
 // FAT32 cluster values
 const FAT32_EOC: u32 = 0x0FFFFFF8; // End of cluster chain (>= this value)
@@ -89,6 +99,54 @@ enum Fat32ModPhase {
     ReadFat = 6,
     WaitFat = 7,
 }
+
+// ============================================================================
+// Write state machine discriminants (stored in `Fat32State::write_state`).
+// Kept as u8 consts instead of an enum so the heartbeat can print the
+// raw value and so transitions between states never need a cast.
+// ============================================================================
+
+// Idle (no write requested or write already complete).
+const WS_IDLE:              u8 = 0;
+// Locate the target file by 8.3 short-name; capture dir_lba/offset.
+const WS_SCAN:              u8 = 1;
+// Build one sector's worth of payload into the outbuf + transition to SendPacket.
+const WS_SEND_SECTOR:       u8 = 2;
+// Called after SendPacket completes from WS_SEND_SECTOR — advance counters.
+const WS_AFTER_SECTOR:      u8 = 3;
+// Flush + seek to FAT sector containing the cur cluster; wait for read.
+const WS_WALK_FAT_READ:     u8 = 4;
+const WS_WALK_FAT_WAIT:     u8 = 5;
+// Allocate a new cluster: iterate FAT sectors looking for a zero entry.
+const WS_ALLOC_READ:        u8 = 6;
+const WS_ALLOC_WAIT:        u8 = 7;
+// New cluster found + patched in block_buf (EOC, and optionally prev→new).
+// Emit the write for the allocation-side FAT sector.
+const WS_ALLOC_WRITE:       u8 = 8;
+// Link the previous cluster to the new one (separate FAT sector case).
+const WS_LINK_READ:         u8 = 9;
+const WS_LINK_WAIT:         u8 = 10;
+const WS_LINK_WRITE:        u8 = 11;
+// Write the FAT sector mirror copy (FAT2) when num_fats > 1.
+const WS_MIRROR_WRITE:      u8 = 12;
+// Directory-entry size patch (read-modify-write).
+const WS_DIR_READ:          u8 = 13;
+const WS_DIR_WAIT:          u8 = 14;
+const WS_DIR_WRITE:         u8 = 15;
+// Terminal: all writes successfully pushed onto the request channel.
+const WS_DONE:              u8 = 16;
+// Generic outbuf-drain state used by any emitter; resumes at
+// `w_return_state` when the 528-byte packet is fully sent.
+const WS_SEND_PACKET:       u8 = 17;
+// FSINFO sector update (read-modify-write): decrement the free-cluster
+// count and bump the next-free hint after each successful allocation.
+const WS_FSINFO_READ:       u8 = 18;
+const WS_FSINFO_WAIT:       u8 = 19;
+const WS_FSINFO_WRITE:      u8 = 20;
+
+/// Operation tag inside the 16-byte write-request header. v1 only
+/// supports op=1 (single-block WRITE). Must match `nvme::pump_requests`.
+const REQ_OP_WRITE:         u32 = 1;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
@@ -170,16 +228,22 @@ mod params_def {
                 s.write_file_len = if len > 0 { 11 } else { 0 };
             };
 
+        // The tool's TLV encoder splits strings longer than 255 bytes
+        // into multiple entries with the same tag, so the handler
+        // appends each chunk rather than overwriting. Accumulates up
+        // to WRITE_DATA_MAX.
         4, write_data, str, 0
             => |s, d, len| {
-                let n = if len > 48 { 48 } else { len };
-                let dst = s.write_data.as_mut_ptr();
+                let already = s.write_data_len as usize;
+                let room = super::WRITE_DATA_MAX.saturating_sub(already);
+                let n = if len > room { room } else { len };
+                let dst = s.write_data.as_mut_ptr().add(already);
                 let mut i = 0;
                 while i < n {
                     *dst.add(i) = *d.add(i);
                     i += 1;
                 }
-                s.write_data_len = n as u8;
+                s.write_data_len = (already + n) as u16;
             };
     }
 }
@@ -196,6 +260,13 @@ struct FileEntry {
     start_cluster: u32,
     /// File size in bytes
     size: u32,
+    /// Absolute LBA of the 512-byte sector holding this file's 32-byte
+    /// directory entry. Captured during enumeration so the write path
+    /// can re-read that exact sector for the size-field update without
+    /// re-walking the directory.
+    dir_lba:    u32,
+    /// Byte offset of the 32-byte entry inside `dir_lba`.
+    dir_offset: u16,
     /// Short 8.3 name as stored in the directory entry: 8 name bytes
     /// padded with spaces, then 3 extension bytes. Used by the
     /// Phase 6 write path to locate a file by name.
@@ -208,6 +279,8 @@ impl FileEntry {
         Self {
             start_cluster: 0,
             size: 0,
+            dir_lba: 0,
+            dir_offset: 0,
             short_name: [b' '; 11],
             _pad: 0,
         }
@@ -234,6 +307,11 @@ struct Fat32State {
     fat_start_sector: u32,
     data_start_sector: u32,
     partition_lba: u32,
+    /// Sector number of the FSINFO sector relative to `partition_lba`,
+    /// from BPB_FSInfo (boot-sector offset 48). `0` or `0xFFFF` means
+    /// the volume has no FSINFO sector and the free-cluster bookkeeping
+    /// is skipped on alloc.
+    fsinfo_sector: u16,
 
     // State machine
     init_phase: Fat32InitPhase,
@@ -272,21 +350,68 @@ struct Fat32State {
     /// after `log_net` starts streaming.
     tick_count: u32,
 
-    // Phase 6 one-shot file write. After init completes and the
-    // target file is found (by short 8.3 name), fat32 emits a single
-    // 528-byte write request (16-byte header + 512-byte payload) on
-    // the `block_writes` output channel. `write_file_len == 0` or
-    // `write_file[0] == 0` disables the write.
-    write_out_chan:  i32,
-    write_phase:     u8,
-    write_file_len:  u8,
-    write_data_len:  u8,
-    _pad_write:      u8,
-    write_file:      [u8; 11],
-    write_data:      [u8; 48],
-    write_lba:       u32,
-    write_sent:      u16,
-    _pad_write2:     u16,
+    // ── Phase 6 write state machine ────────────────────────────────
+    //
+    // After init completes and the target file is located (by short
+    // 8.3 name), fat32 overwrites the file starting at offset 0 with
+    // `write_data[..write_data_len]`. The state machine handles:
+    //   * multi-sector writes within a single cluster
+    //   * multi-cluster writes walking an existing FAT chain
+    //   * growing the FAT chain by allocating new clusters when the
+    //     existing allocation is too short
+    //   * mirroring every FAT sector write to FAT2 when num_fats > 1
+    //   * updating the file's dir-entry size field if the write grew
+    //     the file past its previous size
+    //
+    // `write_file_len == 0` (empty `write_file` param) disables the
+    // entire path — the module boots read-only.
+    //
+    // The 528-byte outbound packet format matches the nvme module's
+    // `requests` port: 16 B header { op:u32=1, lba:u64, nlb:u32=1 }
+    // followed by 512 B payload.
+    write_out_chan:    i32,
+    write_state:       u8,   // current WS_* discriminant
+    write_file_len:    u8,   // 0 = disabled (no `write_file` param given)
+    _pad_w0:           u16,
+    write_file:        [u8; 11],
+    _pad_w1:           u8,
+    write_data_len:    u16,
+    _pad_w2:           u16,
+    write_data:        [u8; WRITE_DATA_MAX],
+
+    // Target file (resolved once during WS_Scan).
+    w_target_first_cluster: u32,
+    w_target_old_size:      u32,
+    w_target_dir_lba:       u32,
+    w_target_dir_offset:    u16,
+    _pad_wt:                u16,
+
+    // Write-progress counters.
+    w_bytes_written:       u32, // bytes of `write_data` already pushed
+    w_current_cluster:     u32, // cluster currently being written into
+    w_sector_in_cluster:   u8,  // sector offset within current_cluster
+    _pad_wp:               [u8; 3],
+
+    // Cluster-allocation scratch (used by AllocInit..LinkWait).
+    w_prev_cluster:        u32, // last cluster of the existing chain (parent of the new allocation)
+    w_new_cluster:         u32, // cluster just allocated (marked EOC)
+    w_alloc_probe:         u32, // next cluster number to test in the linear free-cluster scan
+    w_fat_sector_in_buf:   u32, // which absolute FAT LBA is currently cached in block_buf, or 0
+    w_fat_copy_idx:        u8,  // 0 = primary FAT, 1 = mirror FAT (only on num_fats=2)
+    w_patched_prev_inline: u8,  // 1 = prev_cluster's entry was in the same sector as new_cluster, already linked
+    w_fsinfo_pending:      u8,  // 1 = an FSINFO update is owed once the post-alloc FAT writes drain
+    _pad_wa:               u8,
+
+    // Post-write size patch.
+    w_new_size:            u32,
+
+    // Outbound 528-byte packet staging. Filled before transitioning
+    // into WS_SendPacket; drained across ticks (channel ring may take
+    // several ticks to accept all 528 bytes under backpressure).
+    w_outbuf:         [u8; 16 + BLOCK_SIZE],
+    w_outbuf_sent:    u16,
+    w_return_state:   u8,  // where to go after w_outbuf drains
+    _pad_wo:          u8,
 }
 
 impl Fat32State {
@@ -303,6 +428,7 @@ impl Fat32State {
         self.fat_start_sector = 0;
         self.data_start_sector = 0;
         self.partition_lba = 0;
+        self.fsinfo_sector = 0;
         self.init_phase = Fat32InitPhase::Idle;
         self.mod_phase = Fat32ModPhase::Idle;
         self.file_count = 0;
@@ -321,12 +447,27 @@ impl Fat32State {
         self.read_fill = 0;
         self.tick_count = 0;
         self.write_out_chan = -1;
-        self.write_phase = 0;
+        self.write_state = WS_IDLE;
         self.write_file_len = 0;
         self.write_data_len = 0;
-        self.write_lba = 0;
-        self.write_sent = 0;
-        // path, pattern, files, write_file, write_data arrays are
+        self.w_target_first_cluster = 0;
+        self.w_target_old_size = 0;
+        self.w_target_dir_lba = 0;
+        self.w_target_dir_offset = 0;
+        self.w_bytes_written = 0;
+        self.w_current_cluster = 0;
+        self.w_sector_in_cluster = 0;
+        self.w_prev_cluster = 0;
+        self.w_new_cluster = 0;
+        self.w_alloc_probe = 2;
+        self.w_fat_sector_in_buf = 0;
+        self.w_fat_copy_idx = 0;
+        self.w_patched_prev_inline = 0;
+        self.w_fsinfo_pending = 0;
+        self.w_new_size = 0;
+        self.w_outbuf_sent = 0;
+        self.w_return_state = WS_DONE;
+        // path, pattern, files, write_file, write_data, w_outbuf are
         // zeroed by the kernel allocator.
     }
 
@@ -447,6 +588,7 @@ unsafe fn parse_boot_sector(s: &mut Fat32State) -> bool {
     s.num_fats = *buf.as_ptr().add(16);
     s.fat_size_32 = read_u32_le(buf, 36);
     s.root_cluster = read_u32_le(buf, 44);
+    s.fsinfo_sector = read_u16_le(buf, 48);
 
     // Calculate derived values (absolute sectors, including partition offset)
     s.fat_start_sector = s.partition_lba + s.reserved_sectors as u32;
@@ -676,6 +818,12 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
         let file_ptr = s.files.as_mut_ptr().add(idx);
         (*file_ptr).start_cluster = cluster;
         (*file_ptr).size = size;
+        // Capture the directory-sector LBA + entry offset so the
+        // Phase 6 write path can re-read this exact sector when it
+        // needs to patch the size field.
+        (*file_ptr).dir_lba =
+            cluster_to_sector(s, s.dir_cluster) + (s.dir_sector_in_cluster as u32);
+        (*file_ptr).dir_offset = entry_offset as u16;
         // Copy the 11-byte short 8.3 name so the write-once path can
         // look the file up without re-parsing the directory.
         let mut i = 0usize;
@@ -785,14 +933,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             *p.add(pos + 1) = b'0' + ((fc / 10)  % 10) as u8;
             *p.add(pos + 2) = b'0' + ( fc         % 10) as u8;
             pos += 3;
-            // Write-path progress (0=scan, 1=emitting, 2=done) — worth
-            // keeping in the heartbeat so a stuck write is observable
-            // from the log alone.
-            let wp_tag = b" wp=";
-            core::ptr::copy_nonoverlapping(wp_tag.as_ptr(), p.add(pos), wp_tag.len());
-            pos += wp_tag.len();
-            *p.add(pos) = b'0' + s.write_phase;
-            pos += 1;
+            // Write-path progress: current write_state discriminant
+            // and bytes pushed so far. A stuck write is observable
+            // from a frozen `ws=` / `bw=` pair across heartbeats.
+            let ws_tag = b" ws=";
+            core::ptr::copy_nonoverlapping(ws_tag.as_ptr(), p.add(pos), ws_tag.len());
+            pos += ws_tag.len();
+            let ws = s.write_state.min(99);
+            *p.add(pos)     = b'0' + (ws / 10);
+            *p.add(pos + 1) = b'0' + (ws % 10);
+            pos += 2;
+            let bw_tag = b" bw=";
+            core::ptr::copy_nonoverlapping(bw_tag.as_ptr(), p.add(pos), bw_tag.len());
+            pos += bw_tag.len();
+            pos += fmt_u32_raw(p.add(pos), s.w_bytes_written);
             dev_log(s.sys(), 3, p, pos);
         }
 
@@ -803,8 +957,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Phase 6: if a one-shot write is configured, run it before
         // serving file-reads so the write lands before downstream
-        // consumers start fighting over the blocks channel.
-        if s.write_file_len > 0 && s.write_phase != 2 {
+        // consumers start fighting over the blocks channel. Enter the
+        // state machine at WS_SCAN on first entry; stay until WS_DONE.
+        if s.write_file_len > 0 && s.write_state != WS_DONE {
+            if s.write_state == WS_IDLE {
+                s.write_state = WS_SCAN;
+            }
             return write_step(s);
         }
 
@@ -829,112 +987,683 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Phase 6 one-shot write. After init completes, if the `write_file`
-/// param is set and a matching entry was enumerated, emit a 528-byte
-/// packet on the `block_writes` output channel:
-///   16 B header = { op: u32 = 1 (WRITE), lba: u64, nlb: u32 = 1 }
-///   512 B payload = write_data, zero-padded to a block.
-/// The downstream (nvme) picks this up on its `requests` input and
-/// submits an NVMe Write — see `step_ready` in modules/drivers/nvme.
-///
-/// `write_phase` transitions: 0 (scan) → 1 (emitting) → 2 (done).
-unsafe fn write_step(s: &mut Fat32State) -> i32 {
-    match s.write_phase {
-        0 => {
-            // Phase 0: locate the target file by short 8.3 name. When
-            // no channel is wired, or the file isn't present, skip.
-            if s.write_out_chan < 0 {
-                s.write_phase = 2;
-                dev_log(s.sys(), 3,
-                    b"[fat32] write: no block_writes channel\0".as_ptr(), 37);
-                return 0;
-            }
-            let mut found: i32 = -1;
-            let mut i = 0u16;
-            while (i as usize) < s.file_count as usize {
-                let fptr = s.files.as_ptr().add(i as usize);
-                let mut eq = true;
-                let mut k = 0usize;
-                while k < 11 {
-                    if (*fptr).short_name[k] != s.write_file[k] { eq = false; break; }
-                    k += 1;
-                }
-                if eq { found = i as i32; break; }
-                i += 1;
-            }
-            if found < 0 {
-                s.write_phase = 2;
-                dev_log(s.sys(), 3, b"[fat32] write: target file not found\0".as_ptr(), 36);
-                return 0;
-            }
-            let fptr = s.files.as_ptr().add(found as usize);
-            let cluster = (*fptr).start_cluster;
-            s.write_lba = s.data_start_sector
-                .wrapping_add((cluster - 2) * (s.sectors_per_cluster as u32));
-            s.write_sent = 0;
-            s.write_phase = 1;
+// ============================================================================
+// Write-state helpers
+// ============================================================================
 
-            // Log the resolved LBA once so the test harness can
-            // verify it matches the host-side filefrag/dd offset.
-            let mut msg = [0u8; 48];
-            let p = msg.as_mut_ptr();
-            let prefix = b"[fat32] write lba=0x";
-            core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
-            let mut pos = prefix.len();
-            let v = s.write_lba;
-            let mut bi = 0usize;
-            while bi < 8 {
-                let n = ((v >> (28 - bi * 4)) & 0xF) as u8;
-                *p.add(pos) = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
-                pos += 1;
-                bi += 1;
-            }
-            dev_log(s.sys(), 3, p, pos);
-            0
-        }
-        1 => {
-            // Phase 1: push the 528-byte packet. channel_write may
-            // take multiple calls to drain (ring backpressure), so we
-            // track progress in write_sent and resume from there.
-            let total: u16 = 16 + 512;
-            let mut packet = [0u8; 16 + 512];
-            // Header (little-endian).
-            packet[0] = 0x01;
-            // lba at bytes 4..12
-            let lba = s.write_lba as u64;
-            let lb = lba.to_le_bytes();
-            let mut b = 0usize;
-            while b < 8 {
-                packet[4 + b] = lb[b];
-                b += 1;
-            }
-            // nlb = 1 at bytes 12..16
-            packet[12] = 0x01;
-            // Payload at bytes 16..528. Copy write_data then zero-pad.
-            let n = s.write_data_len as usize;
-            let mut j = 0usize;
-            while j < n {
-                packet[16 + j] = s.write_data[j];
-                j += 1;
-            }
-            // (packet already zero-initialised past payload)
+/// Absolute LBA of the FAT sector containing a given cluster's entry,
+/// for the `copy_idx`'th FAT (0 = primary, 1 = mirror on a 2-FAT vol).
+#[inline]
+fn fat_sector_abs(s: &Fat32State, cluster: u32, copy_idx: u8) -> u32 {
+    let rel = fat_sector_for_cluster(s, cluster) - s.fat_start_sector;
+    s.fat_start_sector
+        .wrapping_add((copy_idx as u32).wrapping_mul(s.fat_size_32))
+        .wrapping_add(rel)
+}
 
-            let remaining = total as usize - s.write_sent as usize;
-            let src = packet.as_ptr().add(s.write_sent as usize);
-            let rc = (s.sys().channel_write)(s.write_out_chan, src, remaining);
-            if rc < 0 {
-                // E_AGAIN (-11) etc. — retry next tick.
-                return 0;
-            }
-            s.write_sent += rc as u16;
-            if s.write_sent as u16 >= total {
-                s.write_phase = 2;
-                dev_log(s.sys(), 3, b"[fat32] write: packet emitted\0".as_ptr(), 29);
-            }
-            0
-        }
-        _ => 0, // done
+/// Read a FAT32 entry from the in-buffer FAT sector. Caller must
+/// ensure `block_buf` holds `fat_sector_abs(s, cluster, _)`.
+#[inline]
+unsafe fn read_fat_entry(s: &Fat32State, cluster: u32) -> u32 {
+    let off = fat_offset_for_cluster(s, cluster);
+    read_u32_le(&s.block_buf, off) & FAT32_MASK
+}
+
+/// Patch a FAT32 entry in the in-buffer FAT sector. Preserves the
+/// top 4 reserved bits of the existing word.
+#[inline]
+unsafe fn patch_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) {
+    let off = fat_offset_for_cluster(s, cluster);
+    let existing = read_u32_le(&s.block_buf, off);
+    let merged = (existing & !FAT32_MASK) | (value & FAT32_MASK);
+    let le = merged.to_le_bytes();
+    let dst = s.block_buf.as_mut_ptr().add(off);
+    *dst        = le[0];
+    *dst.add(1) = le[1];
+    *dst.add(2) = le[2];
+    *dst.add(3) = le[3];
+}
+
+/// Write the 16-byte WRITE-request header { op, lba, nlb } at the
+/// start of `w_outbuf` and reset the drain counter.
+unsafe fn stage_header(s: &mut Fat32State, lba: u32) {
+    let out = s.w_outbuf.as_mut_ptr();
+    let op  = REQ_OP_WRITE.to_le_bytes();
+    let lb  = (lba as u64).to_le_bytes();
+    let nlb = 1u32.to_le_bytes();
+    let mut i = 0usize;
+    while i < 4 { *out.add(i) = op[i]; i += 1; }
+    i = 0;
+    while i < 8 { *out.add(4 + i) = lb[i]; i += 1; }
+    i = 0;
+    while i < 4 { *out.add(12 + i) = nlb[i]; i += 1; }
+    s.w_outbuf_sent = 0;
+}
+
+/// Stage a 1-sector WRITE whose payload is `payload_src[..BLOCK_SIZE]`.
+unsafe fn stage_packet(s: &mut Fat32State, lba: u32, payload_src: *const u8) {
+    stage_header(s, lba);
+    let out = s.w_outbuf.as_mut_ptr();
+    core::ptr::copy_nonoverlapping(payload_src, out.add(16), BLOCK_SIZE);
+}
+
+/// Stage a 1-sector WRITE whose payload is `write_data[off..off+n]`,
+/// zero-padded to a full 512-byte sector for the partial last sector.
+unsafe fn stage_data_sector(s: &mut Fat32State, lba: u32, off: usize, n: usize) {
+    stage_header(s, lba);
+    let out = s.w_outbuf.as_mut_ptr();
+    let src = s.write_data.as_ptr().add(off);
+    core::ptr::copy_nonoverlapping(src, out.add(16), n);
+    let mut z = n;
+    while z < BLOCK_SIZE {
+        *out.add(16 + z) = 0;
+        z += 1;
     }
+}
+
+/// Drain `w_outbuf` through `write_out_chan`. Returns 1 when the
+/// full 528 bytes are sent, 0 when partial (retry next tick), -1 on
+/// channel error (non-E_AGAIN).
+unsafe fn drain_packet(s: &mut Fat32State) -> i32 {
+    let total: usize = 16 + BLOCK_SIZE;
+    let remaining = total - s.w_outbuf_sent as usize;
+    let src = s.w_outbuf.as_ptr().add(s.w_outbuf_sent as usize);
+    let rc = (s.sys().channel_write)(s.write_out_chan, src, remaining);
+    if rc == E_AGAIN {
+        return 0;
+    }
+    if rc < 0 {
+        return -1;
+    }
+    s.w_outbuf_sent += rc as u16;
+    if s.w_outbuf_sent as usize >= total { 1 } else { 0 }
+}
+
+/// Log a hex-formatted 32-bit LBA with the given prefix.
+unsafe fn log_lba(s: &Fat32State, prefix: &[u8], v: u32) {
+    let mut msg = [0u8; 64];
+    let p = msg.as_mut_ptr();
+    core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+    let mut pos = prefix.len();
+    *p.add(pos) = b'0'; pos += 1;
+    *p.add(pos) = b'x'; pos += 1;
+    let mut bi = 0usize;
+    while bi < 8 {
+        let n = ((v >> (28 - bi * 4)) & 0xF) as u8;
+        *p.add(pos) = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+        pos += 1;
+        bi += 1;
+    }
+    dev_log(s.sys(), 3, p, pos);
+}
+
+/// Transition to `WS_SEND_PACKET`, remembering the next state to
+/// resume at once the 528-byte packet drains successfully.
+#[inline(always)]
+fn enter_send_packet(s: &mut Fat32State, resume_state: u8) {
+    s.w_return_state = resume_state;
+    s.write_state = WS_SEND_PACKET;
+}
+
+// ============================================================================
+// Write state machine
+// ============================================================================
+
+/// Phase 6 write state machine. Overwrites the contents of the named
+/// file starting at offset 0 with `write_data[..write_data_len]`.
+/// Extends the file (new size > old size → dir-entry size update +
+/// potentially cluster allocation to grow the FAT chain).
+///
+/// See `WS_*` constants for state semantics. Each state does at most
+/// one I/O action (seek, block-read, or packet emission) per tick.
+unsafe fn write_step(s: &mut Fat32State) -> i32 {
+    match s.write_state {
+        WS_SCAN => ws_scan(s),
+        WS_SEND_SECTOR => ws_send_sector(s),
+        WS_AFTER_SECTOR => ws_after_sector(s),
+        WS_WALK_FAT_READ => ws_walk_fat_read(s),
+        WS_WALK_FAT_WAIT => ws_walk_fat_wait(s),
+        WS_ALLOC_READ => ws_alloc_read(s),
+        WS_ALLOC_WAIT => ws_alloc_wait(s),
+        WS_ALLOC_WRITE => ws_alloc_write(s),
+        WS_LINK_READ => ws_link_read(s),
+        WS_LINK_WAIT => ws_link_wait(s),
+        WS_LINK_WRITE => ws_link_write(s),
+        WS_MIRROR_WRITE => ws_mirror_write(s),
+        WS_DIR_READ => ws_dir_read(s),
+        WS_DIR_WAIT => ws_dir_wait(s),
+        WS_DIR_WRITE => ws_dir_write(s),
+        WS_SEND_PACKET => ws_send_packet(s),
+        WS_FSINFO_READ => ws_fsinfo_read(s),
+        WS_FSINFO_WAIT => ws_fsinfo_wait(s),
+        WS_FSINFO_WRITE => ws_fsinfo_write(s),
+        _ => 0, // WS_IDLE / WS_DONE / unknown
+    }
+}
+
+/// Shared drain-then-resume step used by any state that emitted a
+/// packet and needs to wait for the channel to accept the full 528 B.
+unsafe fn ws_send_packet(s: &mut Fat32State) -> i32 {
+    match drain_packet(s) {
+        0 => 0, // partial — retry next tick
+        1 => {
+            s.write_state = s.w_return_state;
+            2 // burst: advance into the resume state immediately
+        }
+        _ => {
+            // Channel error (not E_AGAIN). Abort the write session —
+            // leave downstream consumers to report the partial state.
+            log_info(s, b"[fat32] write: chan err");
+            s.write_state = WS_DONE;
+            0
+        }
+    }
+}
+
+/// WS_SCAN: locate the target file by 8.3 short-name + prepare the
+/// counters for the first data-sector write. Runs once.
+unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
+    if s.write_out_chan < 0 {
+        log_info(s, b"[fat32] write: no block_writes channel");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+
+    let mut found: i32 = -1;
+    let mut i = 0u16;
+    while (i as usize) < s.file_count as usize {
+        let fptr = s.files.as_ptr().add(i as usize);
+        let mut eq = true;
+        let mut k = 0usize;
+        while k < 11 {
+            if (*fptr).short_name[k] != s.write_file[k] { eq = false; break; }
+            k += 1;
+        }
+        if eq { found = i as i32; break; }
+        i += 1;
+    }
+    if found < 0 {
+        log_info(s, b"[fat32] write: target file not found");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+
+    let fptr = s.files.as_ptr().add(found as usize);
+    s.w_target_first_cluster = (*fptr).start_cluster;
+    s.w_target_old_size      = (*fptr).size;
+    s.w_target_dir_lba       = (*fptr).dir_lba;
+    s.w_target_dir_offset    = (*fptr).dir_offset;
+
+    // POSIX-style overwrite: extend the file if the write is longer
+    // than the existing size, but keep the existing tail on shorter
+    // writes (no truncation).
+    let old_size = s.w_target_old_size;
+    let wdl      = s.write_data_len as u32;
+    s.w_new_size = if wdl > old_size { wdl } else { old_size };
+
+    // Initial cluster-walk state.
+    s.w_bytes_written     = 0;
+    s.w_current_cluster   = s.w_target_first_cluster;
+    s.w_sector_in_cluster = 0;
+    s.w_prev_cluster      = 0;
+    s.w_new_cluster       = 0;
+    s.w_alloc_probe       = 2;
+    s.w_fat_sector_in_buf = 0;
+    s.w_fat_copy_idx      = 0;
+
+    // Log the LBA of the first sector that will be written so test
+    // harnesses can cross-check against host-side filefrag/dd offsets.
+    let first_lba = s.data_start_sector
+        .wrapping_add((s.w_target_first_cluster - 2)
+            * (s.sectors_per_cluster as u32));
+    log_lba(s, b"[fat32] write lba=", first_lba);
+
+    if s.write_data_len == 0 {
+        // No payload at all — nothing to emit. (Size field would
+        // already match, so dir-update is moot.)
+        log_info(s, b"[fat32] write: empty payload");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+
+    s.write_state = WS_SEND_SECTOR;
+    2 // burst into first sector send
+}
+
+/// WS_SEND_SECTOR: stage one sector of payload and transition to the
+/// packet-drain state. `w_sector_in_cluster` + `w_current_cluster`
+/// select the LBA; `w_bytes_written` selects the payload slice.
+unsafe fn ws_send_sector(s: &mut Fat32State) -> i32 {
+    let lba = s.data_start_sector
+        .wrapping_add((s.w_current_cluster - 2) * (s.sectors_per_cluster as u32))
+        .wrapping_add(s.w_sector_in_cluster as u32);
+
+    let off = s.w_bytes_written as usize;
+    let remaining = (s.write_data_len as usize).saturating_sub(off);
+    let n = if remaining > BLOCK_SIZE { BLOCK_SIZE } else { remaining };
+
+    stage_data_sector(s, lba, off, n);
+    enter_send_packet(s, WS_AFTER_SECTOR);
+    2 // burst
+}
+
+/// WS_AFTER_SECTOR: advance counters + pick the next action:
+///   - more payload + current cluster has sectors left → WS_SEND_SECTOR
+///   - more payload + cluster exhausted → WS_WALK_FAT_READ (walk chain
+///     or, if EOC, start an allocation)
+///   - all payload written → WS_DIR_READ (size-field update) or
+///     WS_DONE if new_size == old_size
+unsafe fn ws_after_sector(s: &mut Fat32State) -> i32 {
+    s.w_bytes_written = s.w_bytes_written.saturating_add(BLOCK_SIZE as u32);
+    s.w_sector_in_cluster += 1;
+
+    let written = s.w_bytes_written;
+    let total   = s.write_data_len as u32;
+
+    if written >= total {
+        // All payload pushed. Decide whether a dir-entry update is
+        // needed (only when the write grew the file).
+        if s.w_new_size != s.w_target_old_size {
+            s.write_state = WS_DIR_READ;
+            return 2;
+        }
+        log_info(s, b"[fat32] write: data done (no size change)");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+
+    if s.w_sector_in_cluster >= s.sectors_per_cluster {
+        // Cluster exhausted — walk the FAT chain to find the next one,
+        // or allocate a new cluster if this is the tail.
+        s.w_sector_in_cluster = 0;
+        s.write_state = WS_WALK_FAT_READ;
+        return 2;
+    }
+
+    // Same cluster, next sector.
+    s.write_state = WS_SEND_SECTOR;
+    2
+}
+
+/// WS_WALK_FAT_READ: seek to the FAT sector holding the entry for
+/// `w_current_cluster` (primary FAT).
+unsafe fn ws_walk_fat_read(s: &mut Fat32State) -> i32 {
+    let lba = fat_sector_abs(s, s.w_current_cluster, 0);
+    flush_input(s);
+    if seek_sd(s, lba) < 0 {
+        log_info(s, b"[fat32] write: fat seek fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    s.read_fill = 0;
+    s.w_fat_sector_in_buf = lba;
+    s.write_state = WS_WALK_FAT_WAIT;
+    0
+}
+
+/// WS_WALK_FAT_WAIT: parse the next-cluster pointer. EOC →
+/// allocation; in-range cluster → advance `w_current_cluster`.
+unsafe fn ws_walk_fat_wait(s: &mut Fat32State) -> i32 {
+    let res = try_read_block(s);
+    if res < 0 {
+        log_info(s, b"[fat32] write: fat read fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    if res == 0 { return 0; }
+
+    let next = read_fat_entry(s, s.w_current_cluster);
+    if next >= FAT32_EOC || next < 2 {
+        // Tail of the chain — need to allocate a new cluster, link
+        // it in, and mirror to FAT2 if num_fats > 1.
+        s.w_prev_cluster = s.w_current_cluster;
+        s.w_new_cluster = 0;
+        s.w_patched_prev_inline = 0;
+        s.w_alloc_probe = 2;
+        s.w_fat_copy_idx = 0;
+        s.write_state = WS_ALLOC_READ;
+        return 2;
+    }
+
+    // In-chain next cluster.
+    s.w_current_cluster = next;
+    s.w_sector_in_cluster = 0;
+    s.write_state = WS_SEND_SECTOR;
+    2
+}
+
+/// WS_ALLOC_READ: seek to the FAT sector containing `w_alloc_probe`
+/// so we can scan it for a free (zero) entry.
+unsafe fn ws_alloc_read(s: &mut Fat32State) -> i32 {
+    let lba = fat_sector_abs(s, s.w_alloc_probe, 0);
+    flush_input(s);
+    if seek_sd(s, lba) < 0 {
+        log_info(s, b"[fat32] write: alloc seek fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    s.read_fill = 0;
+    s.w_fat_sector_in_buf = lba;
+    s.write_state = WS_ALLOC_WAIT;
+    0
+}
+
+/// WS_ALLOC_WAIT: scan the buffered FAT sector for the first zero
+/// entry ≥ `w_alloc_probe`. If found, stage the writeback (EOC on the
+/// new cluster, plus prev→new link if they happen to share a sector).
+/// If the whole sector is full, bump `w_alloc_probe` and loop.
+unsafe fn ws_alloc_wait(s: &mut Fat32State) -> i32 {
+    let res = try_read_block(s);
+    if res < 0 {
+        log_info(s, b"[fat32] write: alloc read fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    if res == 0 { return 0; }
+
+    // Scan this FAT sector for a zero entry. `entries_per_sector`
+    // = bytes_per_sector / 4.
+    let bps = s.bytes_per_sector as u32;
+    let entries_per_sector = bps / 4;
+    // Absolute cluster number of the first entry in this sector.
+    let sec_rel    = s.w_fat_sector_in_buf - s.fat_start_sector;
+    let first_clst = sec_rel.wrapping_mul(entries_per_sector);
+
+    // Scan starting from max(first_clst, w_alloc_probe).
+    let start_clst = if s.w_alloc_probe > first_clst {
+        s.w_alloc_probe
+    } else {
+        first_clst
+    };
+    let mut c = start_clst;
+    let end_clst = first_clst + entries_per_sector;
+    let mut found: u32 = 0;
+    while c < end_clst && c >= 2 {
+        let off = ((c - first_clst) * 4) as usize;
+        let v = read_u32_le(&s.block_buf, off) & FAT32_MASK;
+        if v == 0 {
+            found = c;
+            break;
+        }
+        c += 1;
+    }
+
+    if found == 0 {
+        // No free entry in this sector — advance probe past it.
+        s.w_alloc_probe = end_clst;
+        // Guard against runaway scan on tiny / bogus filesystems:
+        // FAT32 caps cluster count at ~2^28. Stop after we've walked
+        // the full FAT.
+        let max_clst = entries_per_sector.saturating_mul(s.fat_size_32);
+        if s.w_alloc_probe >= max_clst {
+            log_info(s, b"[fat32] write: disk full");
+            s.write_state = WS_DONE;
+            return 0;
+        }
+        s.write_state = WS_ALLOC_READ;
+        return 2;
+    }
+
+    s.w_new_cluster = found;
+    s.w_fsinfo_pending = 1;
+    // Mark the new cluster as EOC.
+    patch_fat_entry(s, found, FAT32_TAIL);
+
+    // If the previous cluster's entry is in this same FAT sector, we
+    // can patch it in-place with a single write. This covers the
+    // common case where the tail cluster is adjacent to free space.
+    let prev_lba = fat_sector_abs(s, s.w_prev_cluster, 0);
+    if prev_lba == s.w_fat_sector_in_buf {
+        patch_fat_entry(s, s.w_prev_cluster, found);
+        s.w_patched_prev_inline = 1;
+    } else {
+        s.w_patched_prev_inline = 0;
+    }
+
+    log_lba(s, b"[fat32] write: allocated cluster=", found);
+    s.write_state = WS_ALLOC_WRITE;
+    2
+}
+
+/// WS_ALLOC_WRITE: emit the write for the FAT sector containing the
+/// newly allocated cluster (already patched in block_buf). Next step
+/// depends on whether we also patched prev inline and whether the
+/// filesystem has a mirror FAT.
+unsafe fn ws_alloc_write(s: &mut Fat32State) -> i32 {
+    let lba = s.w_fat_sector_in_buf;
+    stage_packet(s, lba, s.block_buf.as_ptr());
+    let next = next_state_after_fat_write(s, s.w_patched_prev_inline != 0);
+    enter_send_packet(s, next);
+    2
+}
+
+/// Pick the state to resume at after a FAT sector write completes.
+///   * `links_prev`: true if the just-written sector already linked
+///     the previous cluster to the new one (inline patch). When false,
+///     a separate LINK read-modify-write is needed next.
+///   * Mirror FAT: if num_fats > 1 and we just wrote the primary,
+///     replicate the same block_buf to the mirror's corresponding
+///     sector before moving on.
+fn next_state_after_fat_write(s: &mut Fat32State, links_prev: bool) -> u8 {
+    if s.w_fat_copy_idx == 0 && s.num_fats > 1 {
+        // Still need to mirror this FAT sector.
+        s.w_fat_copy_idx = 1;
+        WS_MIRROR_WRITE
+    } else {
+        // Primary (+ mirror) for this sector done. Reset copy idx
+        // for subsequent FAT operations.
+        s.w_fat_copy_idx = 0;
+        if links_prev {
+            // The chain is fully linked. If an allocation just landed
+            // and the volume has an FSINFO sector, update its
+            // free-cluster bookkeeping before resuming data writes.
+            if s.w_fsinfo_pending != 0
+                && s.fsinfo_sector != 0
+                && s.fsinfo_sector != 0xFFFF
+            {
+                WS_FSINFO_READ
+            } else {
+                s.w_current_cluster = s.w_new_cluster;
+                s.w_sector_in_cluster = 0;
+                WS_SEND_SECTOR
+            }
+        } else {
+            // Need a separate LINK RMW for prev_cluster's FAT entry.
+            WS_LINK_READ
+        }
+    }
+}
+
+/// WS_MIRROR_WRITE: write `block_buf` (unchanged) to the mirror FAT
+/// sector at the same relative offset. Uses the same RMW result from
+/// the primary write, so no re-read is needed.
+unsafe fn ws_mirror_write(s: &mut Fat32State) -> i32 {
+    let rel = s.w_fat_sector_in_buf - s.fat_start_sector;
+    let lba = s.fat_start_sector
+        .wrapping_add(s.fat_size_32)
+        .wrapping_add(rel);
+    stage_packet(s, lba, s.block_buf.as_ptr());
+    let next = next_state_after_fat_write(s, s.w_patched_prev_inline != 0);
+    enter_send_packet(s, next);
+    2
+}
+
+/// WS_LINK_READ: seek to the FAT sector containing `w_prev_cluster`'s
+/// entry so we can patch it to point at `w_new_cluster`.
+unsafe fn ws_link_read(s: &mut Fat32State) -> i32 {
+    let lba = fat_sector_abs(s, s.w_prev_cluster, 0);
+    flush_input(s);
+    if seek_sd(s, lba) < 0 {
+        log_info(s, b"[fat32] write: link seek fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    s.read_fill = 0;
+    s.w_fat_sector_in_buf = lba;
+    s.write_state = WS_LINK_WAIT;
+    0
+}
+
+/// WS_LINK_WAIT: patch `prev_cluster`'s entry to point at `new_cluster`,
+/// then emit the FAT sector write.
+unsafe fn ws_link_wait(s: &mut Fat32State) -> i32 {
+    let res = try_read_block(s);
+    if res < 0 {
+        log_info(s, b"[fat32] write: link read fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    if res == 0 { return 0; }
+
+    patch_fat_entry(s, s.w_prev_cluster, s.w_new_cluster);
+    s.write_state = WS_LINK_WRITE;
+    2
+}
+
+/// WS_LINK_WRITE: emit the write for the (now patched) FAT sector.
+unsafe fn ws_link_write(s: &mut Fat32State) -> i32 {
+    let lba = s.w_fat_sector_in_buf;
+    stage_packet(s, lba, s.block_buf.as_ptr());
+    // Signal that this RMW landed the prev→new link, so the
+    // post-mirror transition can advance to data sectors.
+    s.w_patched_prev_inline = 1;
+    let next = next_state_after_fat_write(s, true);
+    enter_send_packet(s, next);
+    2
+}
+
+/// WS_DIR_READ: seek to the dir sector holding the target entry.
+unsafe fn ws_dir_read(s: &mut Fat32State) -> i32 {
+    flush_input(s);
+    if seek_sd(s, s.w_target_dir_lba) < 0 {
+        log_info(s, b"[fat32] write: dir seek fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    s.read_fill = 0;
+    s.write_state = WS_DIR_WAIT;
+    0
+}
+
+/// WS_DIR_WAIT: patch the 4-byte size field in the dir entry + queue
+/// the writeback.
+unsafe fn ws_dir_wait(s: &mut Fat32State) -> i32 {
+    let res = try_read_block(s);
+    if res < 0 {
+        log_info(s, b"[fat32] write: dir read fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    if res == 0 { return 0; }
+
+    // Per the FAT32 spec, the file-size field lives at dir_entry + 28.
+    let off = s.w_target_dir_offset as usize + 28;
+    let le = s.w_new_size.to_le_bytes();
+    let dst = s.block_buf.as_mut_ptr().add(off);
+    *dst        = le[0];
+    *dst.add(1) = le[1];
+    *dst.add(2) = le[2];
+    *dst.add(3) = le[3];
+
+    s.write_state = WS_DIR_WRITE;
+    2
+}
+
+/// WS_DIR_WRITE: emit the patched dir sector write, then terminate.
+unsafe fn ws_dir_write(s: &mut Fat32State) -> i32 {
+    stage_packet(s, s.w_target_dir_lba, s.block_buf.as_ptr());
+    enter_send_packet(s, WS_DONE);
+    // Log on the way in so a successful write is observable even if
+    // the dir writeback takes a moment to drain.
+    log_info(s, b"[fat32] write: dir size patched");
+    2
+}
+
+/// Drop any pending FSINFO update and resume data writes into the
+/// freshly allocated cluster. FSINFO bookkeeping is best-effort —
+/// fsck recomputes the free count on the next mount, so any error
+/// in the read-modify-write path takes this fall-back rather than
+/// abandoning the whole user write.
+fn resume_after_alloc(s: &mut Fat32State) {
+    s.w_fsinfo_pending = 0;
+    s.w_current_cluster = s.w_new_cluster;
+    s.w_sector_in_cluster = 0;
+}
+
+/// WS_FSINFO_READ: seek to the FSINFO sector so we can decrement the
+/// cached free-cluster count and bump the next-free hint.
+unsafe fn ws_fsinfo_read(s: &mut Fat32State) -> i32 {
+    let lba = s.partition_lba.wrapping_add(s.fsinfo_sector as u32);
+    flush_input(s);
+    if seek_sd(s, lba) < 0 {
+        log_info(s, b"[fat32] write: fsinfo seek fail");
+        resume_after_alloc(s);
+        s.write_state = WS_SEND_SECTOR;
+        return 2;
+    }
+    s.read_fill = 0;
+    s.w_fat_sector_in_buf = lba;
+    s.write_state = WS_FSINFO_WAIT;
+    0
+}
+
+/// WS_FSINFO_WAIT: validate the FSINFO signatures, decrement the
+/// free-cluster count if it's a known value, and update the next-free
+/// hint to one past the cluster we just allocated.
+unsafe fn ws_fsinfo_wait(s: &mut Fat32State) -> i32 {
+    let res = try_read_block(s);
+    if res < 0 {
+        log_info(s, b"[fat32] write: fsinfo read fail");
+        resume_after_alloc(s);
+        s.write_state = WS_SEND_SECTOR;
+        return 2;
+    }
+    if res == 0 { return 0; }
+
+    // FSINFO layout (FAT32 spec): lead sig at 0x000, struct sig at
+    // 0x1E4, free count at 0x1E8, next-free hint at 0x1EC, trail sig
+    // at 0x1FC. Reject the sector on any signature mismatch rather
+    // than risk writing garbage back.
+    let lead    = read_u32_le(&s.block_buf, 0x000);
+    let struc   = read_u32_le(&s.block_buf, 0x1E4);
+    let trailer = read_u32_le(&s.block_buf, 0x1FC);
+    if lead != 0x4161_5252 || struc != 0x6141_7272 || trailer != 0xAA55_0000 {
+        log_info(s, b"[fat32] write: fsinfo bad sig");
+        resume_after_alloc(s);
+        s.write_state = WS_SEND_SECTOR;
+        return 2;
+    }
+
+    let free = read_u32_le(&s.block_buf, 0x1E8);
+    if free != 0xFFFF_FFFF && free > 0 {
+        let new_free = free - 1;
+        let le = new_free.to_le_bytes();
+        let dst = s.block_buf.as_mut_ptr().add(0x1E8);
+        *dst        = le[0];
+        *dst.add(1) = le[1];
+        *dst.add(2) = le[2];
+        *dst.add(3) = le[3];
+    }
+
+    let hint = s.w_new_cluster.wrapping_add(1).max(2);
+    let le = hint.to_le_bytes();
+    let dst = s.block_buf.as_mut_ptr().add(0x1EC);
+    *dst        = le[0];
+    *dst.add(1) = le[1];
+    *dst.add(2) = le[2];
+    *dst.add(3) = le[3];
+
+    s.write_state = WS_FSINFO_WRITE;
+    2
+}
+
+/// WS_FSINFO_WRITE: emit the patched FSINFO sector, then resume data
+/// writes into the freshly allocated cluster.
+unsafe fn ws_fsinfo_write(s: &mut Fat32State) -> i32 {
+    stage_packet(s, s.w_fat_sector_in_buf, s.block_buf.as_ptr());
+    resume_after_alloc(s);
+    enter_send_packet(s, WS_SEND_SECTOR);
+    2
 }
 
 /// Initialization state machine

@@ -391,65 +391,172 @@ unsafe fn pcie1_program_outbound() {
     rc_w32(rc, brcm::MEM_WIN0_LIMIT_HI, (limit_mb >> 12) as u32);
 }
 
-/// Scan bus 1 for downstream devices (NVMe HAT+, etc.) via indirect
-/// config access. Assigns BAR0 (and BAR1-hi for 64-bit BARs) into the
-/// outbound window and enables MEM + BusMaster. v1 only supports the
-/// single CM5 NVMe HAT+ slot (bus 1 dev 0) with a fixed 16 KB BAR0
-/// assumption; add multi-device + BAR size probing in a follow-up.
+/// Probe BAR0 size using the standard PCI write-ones / read-back
+/// trick. Leaves the BAR contents restored on return.
+///
+/// Returns (is_mem, is_64bit, size_bytes). `size_bytes == 0` means
+/// the BAR is unimplemented or wasn't probeable.
+#[cfg(feature = "board-cm5")]
+unsafe fn pcie1_probe_bar0(rc: u64, bus: u8, dev: u8) -> (bool, bool, u64) {
+    let original_lo = cfg_r32(rc, bus, dev, 0, 0x10);
+    if original_lo == 0xFFFF_FFFF || original_lo == 0 {
+        return (false, false, 0);
+    }
+    let is_mem = (original_lo & 1) == 0;
+    if !is_mem {
+        // I/O BARs: we don't use them on this platform.
+        return (false, false, 0);
+    }
+    let is_64b = ((original_lo >> 1) & 3) == 2;
+
+    // Write all-ones; for 64-bit BARs do both halves before reading
+    // back so the probe doesn't race hardware aliasing.
+    let original_hi = if is_64b { cfg_r32(rc, bus, dev, 0, 0x14) } else { 0 };
+    cfg_w32(rc, bus, dev, 0, 0x10, 0xFFFF_FFFF);
+    if is_64b {
+        cfg_w32(rc, bus, dev, 0, 0x14, 0xFFFF_FFFF);
+    }
+    let probe_lo = cfg_r32(rc, bus, dev, 0, 0x10);
+    let probe_hi = if is_64b { cfg_r32(rc, bus, dev, 0, 0x14) } else { 0 };
+
+    // Restore original BAR contents so we leave the device in its
+    // pre-probe state; the caller will rewrite with the chosen
+    // outbound address.
+    cfg_w32(rc, bus, dev, 0, 0x10, original_lo);
+    if is_64b {
+        cfg_w32(rc, bus, dev, 0, 0x14, original_hi);
+    }
+
+    // Size: mask off the low 4 flag bits, invert, +1.
+    let size_mask_lo = (probe_lo & 0xFFFF_FFF0) as u64;
+    let size_mask    = if is_64b {
+        size_mask_lo | ((probe_hi as u64) << 32)
+    } else {
+        size_mask_lo | 0xFFFF_FFFF_0000_0000u64
+    };
+    if size_mask == 0xFFFF_FFFF_FFFF_FFF0u64 {
+        // No bits cleared → BAR not fully decoded by the device.
+        return (true, is_64b, 0);
+    }
+    let size = (!size_mask).wrapping_add(1);
+    (true, is_64b, size)
+}
+
+/// Scan bus 1 for downstream devices via indirect config access. For
+/// each valid device, probe BAR0 to learn its size, assign a slot in
+/// the outbound window (naturally-aligned to the BAR size), and
+/// enable MEM + BusMaster.
+///
+/// Assignment strategy: cursor starts at
+/// `PCIE1_OUTBOUND_PCI_BASE + 0x20000` (the slack Linux leaves between
+/// the RC and downstream BARs), advancing by each BAR's size rounded
+/// up to its natural alignment. Capped at
+/// `PCIE1_OUTBOUND_PCI_LIMIT`; devices past that are logged but not
+/// registered.
 #[cfg(feature = "board-cm5")]
 unsafe fn pcie1_enumerate_bus1() {
     let rc = BCM2712_PCIE1_RC_BASE;
-    let dev_num = 0u8;
-    let id = cfg_r32(rc, 1, dev_num, 0, 0x00);
-    let vendor_id = (id & 0xFFFF) as u16;
-    let device_id = ((id >> 16) & 0xFFFF) as u16;
-    if vendor_id == 0xFFFF || vendor_id == 0 { return; }
 
-    let class_rev = cfg_r32(rc, 1, dev_num, 0, 0x08);
-    let mut pdev = PcieDevice::empty();
-    pdev.bus = 1;
-    pdev.dev = dev_num;
-    pdev.vendor_id = vendor_id;
-    pdev.device_id = device_id;
-    pdev.class = class_rev >> 8;
+    // Outbound window is 2 GB wide on CM5 (CPU_LIMIT - CPU_BASE + 1).
+    // Reserve a small slack at the start to match Linux's layout and
+    // so the RC's own internal region isn't overlapped.
+    let window_size = brcm::PCIE1_OUTBOUND_CPU_LIMIT - brcm::PCIE1_OUTBOUND_CPU_BASE + 1;
+    let mut cursor = brcm::PCIE1_OUTBOUND_PCI_BASE + 0x20000;
+    let limit = brcm::PCIE1_OUTBOUND_PCI_BASE + window_size;
 
-    // Disable MEM + BusMaster while we write BAR0 so in-flight cycles
-    // don't race the reassignment.
-    let cmd_before = cfg_r32(rc, 1, dev_num, 0, 0x04);
-    cfg_w32(rc, 1, dev_num, 0, 0x04, cmd_before & !0x0006);
-
-    let bar0_lo_raw = cfg_r32(rc, 1, dev_num, 0, 0x10);
-    let is_mem = bar0_lo_raw & 1 == 0;
-    let is_64b = is_mem && ((bar0_lo_raw >> 1) & 3) == 2;
-
-    let assigned_pci: u64 = if is_mem {
-        let base = brcm::PCIE1_OUTBOUND_PCI_BASE + 0x20000;
-        let low  = (base & 0xFFFF_FFF0) as u32 | (bar0_lo_raw & 0xF);
-        cfg_w32(rc, 1, dev_num, 0, 0x10, low);
-        if is_64b {
-            cfg_w32(rc, 1, dev_num, 0, 0x14, (base >> 32) as u32);
+    let mut dev_num = 0u8;
+    while dev_num < 32 {
+        let id = cfg_r32(rc, 1, dev_num, 0, 0x00);
+        let vendor_id = (id & 0xFFFF) as u16;
+        // 0xFFFF / 0x0000 both mean "no responder": Type-0 config reads
+        // for a missing function return all-ones; the RC also maps
+        // completion aborts to zero on some implementations.
+        if vendor_id == 0xFFFF || vendor_id == 0 {
+            dev_num += 1;
+            continue;
         }
-        base
-    } else { 0 };
 
-    // Re-enable MEM + BusMaster.
-    cfg_w32(rc, 1, dev_num, 0, 0x04, cmd_before | 0x0006);
+        let device_id = ((id >> 16) & 0xFFFF) as u16;
+        let class_rev = cfg_r32(rc, 1, dev_num, 0, 0x08);
+        let header_type = ((cfg_r32(rc, 1, dev_num, 0, 0x0C) >> 16) & 0x7F) as u8;
 
-    if is_mem && assigned_pci >= brcm::PCIE1_OUTBOUND_PCI_BASE {
-        let offset = assigned_pci - brcm::PCIE1_OUTBOUND_PCI_BASE;
-        pdev.bars[0] = brcm::PCIE1_OUTBOUND_CPU_BASE + offset;
-        pdev.bar_sizes[0] = 0x4000;
+        let mut pdev = PcieDevice::empty();
+        pdev.bus = 1;
+        pdev.dev = dev_num;
+        pdev.vendor_id = vendor_id;
+        pdev.device_id = device_id;
+        pdev.class = class_rev >> 8;
+
+        // Disable MEM + BusMaster while we rewrite BAR0.
+        let cmd_before = cfg_r32(rc, 1, dev_num, 0, 0x04);
+        cfg_w32(rc, 1, dev_num, 0, 0x04, cmd_before & !0x0006);
+
+        // Type-1 (PCI-to-PCI bridges) don't have device BARs we need
+        // to program; skip the BAR assignment but still record the
+        // device so downstream tools can see it.
+        if header_type != 0 {
+            log::info!(
+                "[pcie1] bus1 dev{} vid={:04x} did={:04x} (bridge, htype={})",
+                dev_num, vendor_id, device_id, header_type
+            );
+            cfg_w32(rc, 1, dev_num, 0, 0x04, cmd_before | 0x0006);
+            pdev.identify_nic();
+            record_device(pdev);
+            dev_num += 1;
+            continue;
+        }
+
+        let (is_mem, is_64b, size) = pcie1_probe_bar0(rc, 1, dev_num);
+
+        if is_mem && size > 0 {
+            // Align cursor up to a multiple of `size`. PCI BARs must
+            // be naturally aligned; for power-of-two sizes that's
+            // just `(cursor + size - 1) & !(size - 1)`.
+            let aligned = (cursor + size - 1) & !(size - 1);
+            if aligned + size > limit {
+                log::warn!(
+                    "[pcie1] bus1 dev{} BAR0 size={:#x} exceeds outbound window",
+                    dev_num, size
+                );
+            } else {
+                let bar_lo_flags = cfg_r32(rc, 1, dev_num, 0, 0x10) & 0xF;
+                let low = ((aligned & 0xFFFF_FFF0) as u32) | bar_lo_flags;
+                cfg_w32(rc, 1, dev_num, 0, 0x10, low);
+                if is_64b {
+                    cfg_w32(rc, 1, dev_num, 0, 0x14, (aligned >> 32) as u32);
+                }
+                pdev.bars[0] = brcm::PCIE1_OUTBOUND_CPU_BASE
+                    + (aligned - brcm::PCIE1_OUTBOUND_PCI_BASE);
+                pdev.bar_sizes[0] = size;
+                cursor = aligned + size;
+            }
+        }
+
+        // Re-enable MEM + BusMaster.
+        cfg_w32(rc, 1, dev_num, 0, 0x04, cmd_before | 0x0006);
+
+        log::info!(
+            "[pcie1] bus1 dev{} vid={:04x} did={:04x} bar0_cpu={:#x} size={:#x}",
+            dev_num, vendor_id, device_id, pdev.bars[0], pdev.bar_sizes[0]
+        );
+
+        pdev.identify_nic();
+        record_device(pdev);
+
+        dev_num += 1;
     }
-    log::info!(
-        "[pcie1] bus1 dev{} vid={:04x} did={:04x} bar0_cpu={:#x}",
-        dev_num, vendor_id, device_id, pdev.bars[0]
-    );
+}
 
-    pdev.identify_nic();
-    if DEVICE_COUNT < MAX_SCAN_DEVS {
-        DEVICES[DEVICE_COUNT] = pdev;
-        DEVICE_COUNT += 1;
-    }
+/// Append `pdev` to the global DEVICES table if there's room.
+/// Uses raw pointer writes so each call site avoids tripping the
+/// Rust 2024 static_mut_refs lint individually.
+#[cfg(feature = "board-cm5")]
+unsafe fn record_device(pdev: PcieDevice) {
+    let count = *core::ptr::addr_of!(DEVICE_COUNT);
+    if count >= MAX_SCAN_DEVS { return; }
+    let slot = core::ptr::addr_of_mut!(DEVICES) as *mut PcieDevice;
+    core::ptr::write(slot.add(count), pdev);
+    core::ptr::write(core::ptr::addr_of_mut!(DEVICE_COUNT), count + 1);
 }
 
 /// Program the PCIe bridge secondary/subordinate bus numbers AND the
@@ -781,10 +888,13 @@ pub fn device_count() -> usize { unsafe { DEVICE_COUNT } }
 
 pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
     unsafe {
-        if dev_idx >= DEVICE_COUNT || bar_idx >= MAX_BARS {
+        // Use addr_of! so the log macro doesn't expand into an
+        // &static-mut reference (Rust 2024 static_mut_refs).
+        let count = *core::ptr::addr_of!(DEVICE_COUNT);
+        if dev_idx >= count || bar_idx >= MAX_BARS {
             log::warn!(
                 "[pcie] bar_map: dev_idx={} count={} bar_idx={} out of range",
-                dev_idx, DEVICE_COUNT, bar_idx
+                dev_idx, count, bar_idx
             );
             return 0;
         }

@@ -64,8 +64,14 @@ global_asm!(
     "__package_header_start:",
     "    .word 0x4B505846", // PACKAGE_HEADER_MAGIC
     "    .byte 1, 0, 0, 0", // version + reserved
-    "    .word __end_block_addr",
-    "    .word 0",          // package_size (patched by pack-image)
+    // runtime_end: end of file-backed sections (must NOT include BSS
+    // or stack). The kernel resolves the trailer via this same symbol
+    // through `config::get_trailer_addr()`, so the value here is what
+    // pack-image will use to place the trailer. `_start`'s relocator
+    // copies `package_size` bytes here only when package_size != 0;
+    // RAM-loaded aarch64 images leave it at 0 and skip the copy.
+    "    .word __end_data_addr",
+    "    .word 0",          // package_size (set by pack-image on RP/XIP only)
     "__package_source_start:",
 );
 

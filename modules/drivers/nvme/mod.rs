@@ -197,7 +197,15 @@ struct NvmeState {
     identify_ns_buf: u64,
     io_sq:           u64,
     io_cq:           u64,
+    /// DMA buffer for the read-stream pipeline (BLK_PHASE_READING
+    /// fills it; BLK_PHASE_WRITING drains it byte-by-byte to
+    /// `blk_out`).
     read_buf:        u64,
+    /// DMA buffer for write-request payloads accepted on `req_in`.
+    /// Separate from `read_buf` so an incoming write payload cannot
+    /// alias an in-flight read whose contents the consumer hasn't
+    /// finished draining yet.
+    write_buf:       u64,
 
     // Admin queue indices (QID=0).
     sq_tail:  u32,
@@ -930,10 +938,12 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
     }
 }
 
-/// Submit a 1-block Write command on the I/O SQ for `lba`. Data
-/// sourced from `s.read_buf` (the same PAGE the read path uses).
-unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, cid: u16) {
-    let prp1_pci = s.read_buf | PCI_DMA_OFFSET;
+/// Submit a 1-block Write command on the I/O SQ for `lba`, sourcing
+/// DMA from `dma_buf`. Boot-time WRITE_ONCE uses `read_buf`;
+/// consumer-driven writes via `req_in` use `write_buf` so they don't
+/// alias an in-flight read.
+unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, cid: u16, dma_buf: u64) {
+    let prp1_pci = dma_buf | PCI_DMA_OFFSET;
     let cdw = [
         ((cid as u32) << 16) | (OPC_WRITE as u32),
         s.namespace,
@@ -994,7 +1004,7 @@ unsafe fn step_write_once(s: &mut NvmeState) -> i32 {
                 write_volatile(bbuf.add(j), *s.write_data.as_ptr().add(j));
                 j += 1;
             }
-            submit_io_write(s, s.write_lba as u64, CID_WRITE_ONCE);
+            submit_io_write(s, s.write_lba as u64, CID_WRITE_ONCE, s.read_buf);
             s.substate = 1;
             0
         }
@@ -1174,17 +1184,19 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
             true
         }
         1 => {
-            // Accumulate 512 bytes of payload directly into read_buf.
-            if s.read_buf == 0 {
+            // Accumulate 512 bytes of payload into the dedicated
+            // write_buf so the in-flight read pipeline (which owns
+            // read_buf) is unaffected.
+            if s.write_buf == 0 {
                 let p = dev_dma_alloc(sys, PAGE, PAGE);
                 if p == 0 {
                     fault(s, 30, b"[nvme] req buf alloc fail\0");
                     return true;
                 }
-                s.read_buf = p;
+                s.write_buf = p;
             }
             let need = (BLOCK_SIZE - s.req_fill as u32) as usize;
-            let dst = (s.read_buf as *mut u8).add(s.req_fill as usize);
+            let dst = (s.write_buf as *mut u8).add(s.req_fill as usize);
             let n = (sys.channel_read)(s.req_in, dst, need);
             if n <= 0 { return true; }
             s.req_fill += n as u16;
@@ -1194,7 +1206,7 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
             true
         }
         2 => {
-            submit_io_write(s, s.req_lba, CID_WRITE_ONCE);
+            submit_io_write(s, s.req_lba, CID_WRITE_ONCE, s.write_buf);
             s.req_phase = 3;
             true
         }

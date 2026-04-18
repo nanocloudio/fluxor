@@ -19,19 +19,23 @@ wiring = [
   "sd.blocks -> fat32.blocks",
 ]
 
-# ── CM5: NVMe (future — nvme module does not exist yet) ─────────────────
-# [[variant]]
-# match = { board = "cm5", media = "nvme" }
-# modules = [
-#   { name = "pcie_scan" },
-#   { name = "smmu" },
-#   { name = "nvme" },
-#   { name = "fat32" },
-# ]
-# wiring = [
-#   "pcie_scan.bars -> nvme.bars",
-#   "nvme.blocks -> fat32.blocks",
-# ]
+# ── CM5: NVMe on PCIe1 + FAT32 ──────────────────────────────────────────
+# Injects the full driver stack for the external NVMe HAT on Pi 5 /
+# CM5. `controller = pcie1` targets the x1 slot (PCIe2 is the internal
+# RP1 link). `fat32.block_writes → nvme.requests` is the write path;
+# drop that edge if only reads are needed.
+[[variant]]
+match = { board = "cm5", media = "nvme" }
+modules = [
+  { name = "pcie_scan", params = { controller = "pcie1" } },
+  { name = "nvme" },
+  { name = "fat32" },
+]
+wiring = [
+  "pcie_scan.devices -> nvme.pcie_devices",
+  "nvme.blocks -> fat32.blocks",
+  "fat32.block_writes -> nvme.requests",
+]
 
 # ── Linux: host filesystem ──────────────────────────────────────────────
 [[variant]]

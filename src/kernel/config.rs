@@ -694,7 +694,7 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
 
     // Sanity-check total config size against flash bounds
     let total_size = 8 + body_size;
-    const MAX_CONFIG_SIZE: usize = 8192;
+    const MAX_CONFIG_SIZE: usize = 16384;
     if total_size > MAX_CONFIG_SIZE {
         log::error!("[config] too large size={} max={}", total_size, MAX_CONFIG_SIZE);
         return false;
@@ -712,7 +712,7 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         }
     }
     // Bounds-check: module section size should be reasonable
-    const MAX_MODULE_SECTION: usize = 4096;
+    const MAX_MODULE_SECTION: usize = 16384;
     if section_size > MAX_MODULE_SECTION {
         log::error!("[config] module section too large size={} max={}", section_size, MAX_MODULE_SECTION);
         return false;

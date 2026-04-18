@@ -59,9 +59,9 @@ pub mod mmu;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "../platform/bcm2712_pcie.rs"]
 pub mod pcie;
-#[cfg(feature = "chip-bcm2712")]
-#[path = "../platform/bcm2712_smmu.rs"]
-pub mod smmu;
+// SMMU/IOMMU on BCM2712 lives in the `smmu` PIC module
+// (`modules/foundation/smmu/`) via MMIO bridges. CM5 NVMe uses
+// direct UBUS_REMAP inbound-DMA windowing and does not need SMMU.
 #[cfg(feature = "chip-bcm2712")]
 #[path = "../platform/bcm2712_nic_ring.rs"]
 pub mod nic_ring;
