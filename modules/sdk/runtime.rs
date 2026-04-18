@@ -379,6 +379,7 @@ pub const E_AGAIN: i32 = -11;
 pub const E_BUSY: i32 = -16;
 pub const E_INVAL: i32 = -22;
 pub const E_INPROGRESS: i32 = -36;
+pub const E_NOSYS: i32 = -38;
 pub const E_CONNREFUSED: i32 = -111;
 
 // ============================================================================
@@ -732,6 +733,70 @@ unsafe fn dev_channel_ioctl(sys: &SyscallTable, handle: i32, cmd: u32, data: *mu
     let result = (sys.dev_call)(handle, 0x0506, buf.as_mut_ptr(), len);
     if !data.is_null() {
         core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), data, 4);
+    }
+    result
+}
+
+/// Bind a module-provided ioctl handler to `handle`. When any
+/// [`dev_channel_ioctl`] cmd arrives that the kernel does not recognise,
+/// the kernel calls `handler(state, cmd, arg)` with the opaque `state`
+/// pointer captured here. Pass `handler = None` to clear.
+///
+/// Registration is one-shot per channel; the last call wins. The
+/// `state` pointer is typically `&mut MyState as *mut c_void`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_channel_register_ioctl(
+    sys: &SyscallTable,
+    handle: i32,
+    state: *mut core::ffi::c_void,
+    handler: Option<unsafe extern "C" fn(state: *mut core::ffi::c_void, cmd: u32, arg: *mut u8) -> i32>,
+) -> i32 {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&(state as u64).to_le_bytes());
+    let hfn = match handler {
+        Some(h) => h as usize as u64,
+        None => 0u64,
+    };
+    buf[8..16].copy_from_slice(&hfn.to_le_bytes());
+    (sys.dev_call)(handle, 0x0507, buf.as_mut_ptr(), 16)
+}
+
+/// Variable-length channel ioctl / query. Identical wire format to
+/// [`dev_channel_ioctl`] — 4-byte cmd prefix followed by `arg_len`
+/// bytes of payload — but accepts an arbitrary payload size. Used for
+/// module-registered handlers (see [`dev_channel_register_ioctl`])
+/// that exchange structured data larger than 4 bytes.
+///
+/// The caller provides a scratch buffer large enough to hold both the
+/// 4-byte cmd header and `arg_len` payload bytes, and supplies the
+/// payload via `arg`/`arg_len`. On return the first `arg_len` bytes of
+/// `arg` are the handler's response (copied back from the scratch).
+///
+/// Returns the handler's i32 result, or `-22` (EINVAL) if `arg` is
+/// null and `arg_len > 0`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_channel_query(
+    sys: &SyscallTable,
+    handle: i32,
+    cmd: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    const MAX_QUERY_ARG: usize = 64;
+    if arg_len > MAX_QUERY_ARG {
+        return -22;
+    }
+    let mut buf = [0u8; 4 + MAX_QUERY_ARG];
+    buf[..4].copy_from_slice(&cmd.to_le_bytes());
+    if arg_len > 0 {
+        if arg.is_null() { return -22; }
+        core::ptr::copy_nonoverlapping(arg, buf.as_mut_ptr().add(4), arg_len);
+    }
+    let result = (sys.dev_call)(handle, 0x0506, buf.as_mut_ptr(), 4 + arg_len);
+    if arg_len > 0 {
+        core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), arg, arg_len);
     }
     result
 }

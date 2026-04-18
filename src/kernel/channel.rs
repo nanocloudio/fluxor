@@ -60,7 +60,8 @@
 //! produce whole buffers. See `docs/architecture/pipeline.md` §FIFO→Mailbox.
 
 use core::cell::UnsafeCell;
-use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicI8, Ordering};
+use core::ffi::c_void;
+use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicI8, AtomicPtr, Ordering};
 
 use crate::kernel::buffer_pool::{self, BUFFER_SIZE};
 use crate::kernel::config::MAX_GRAPH_EDGES;
@@ -105,6 +106,19 @@ pub const IOCTL_FLUSH: u32 = 3;
 /// Set HUP flag (end-of-stream signal from producer).
 /// Consumer detects via channel_poll/fd_poll with POLL_HUP.
 pub const IOCTL_SET_HUP: u32 = 4;
+
+/// Channel-side ioctl handler registered by a module. Signature matches
+/// [`syscall_channel_ioctl`] (cmd + arg pointer), with a state pointer
+/// bound at registration time so the handler can reach the owning
+/// module's state arena without looking it up each call.
+///
+/// The kernel does not own `state` — the module's state arena outlives
+/// the channel in the current single-binding-per-graph design (no
+/// module unload path exists). If a future feature adds unload,
+/// handlers must be cleared via `channel_register_ioctl_handler(handle,
+/// null, null)` before the state arena is released.
+pub type ChannelIoctlHandler =
+    unsafe extern "C" fn(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32;
 
 /// No auxiliary value pending (sentinel).
 const NO_AUX_PENDING: u32 = u32::MAX;
@@ -160,6 +174,15 @@ struct ChannelSlot {
     buffer_slot: AtomicI8,
     /// FIFO state for circular buffer operations
     fifo: UnsafeCell<FifoState>,
+    /// Optional module-registered ioctl handler. When non-null, any
+    /// `channel_ioctl` cmd that does not match a built-in command is
+    /// forwarded to this function with `ioctl_state` as its first arg.
+    /// Stored as `*mut ()` because `AtomicPtr<fn>` is not available;
+    /// the reader transmutes back to [`ChannelIoctlHandler`].
+    ioctl_handler: AtomicPtr<()>,
+    /// Opaque module state pointer passed as the first argument to
+    /// `ioctl_handler`. See `channel_register_ioctl_handler`.
+    ioctl_state: AtomicPtr<()>,
 }
 
 unsafe impl Sync for ChannelSlot {}
@@ -176,6 +199,8 @@ impl ChannelSlot {
             aux_u32: AtomicU32::new(NO_AUX_PENDING),
             buffer_slot: AtomicI8::new(-1),
             fifo: UnsafeCell::new(FifoState::new()),
+            ioctl_handler: AtomicPtr::new(core::ptr::null_mut()),
+            ioctl_state: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -224,6 +249,8 @@ impl ChannelSlot {
         self.hup_flag.store(false, Ordering::Release);
         self.mailbox.store(false, Ordering::Release);
         self.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
+        self.ioctl_handler.store(core::ptr::null_mut(), Ordering::Release);
+        self.ioctl_state.store(core::ptr::null_mut(), Ordering::Release);
         unsafe {
             *self.fifo.get() = FifoState::new();
         }
@@ -561,8 +588,66 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             debug!("chan_ioctl h={} SET_HUP", handle);
             CHAN_OK
         }
-        _ => CHAN_ENOSYS,
+        _ => {
+            // Forward unrecognised cmds to a module-registered handler
+            // if one was bound to this channel. Load the handler first,
+            // and only read `ioctl_state` if it's non-null — see
+            // `channel_register_ioctl_handler` for the store ordering.
+            let h = slot.ioctl_handler.load(Ordering::Acquire);
+            if h.is_null() {
+                return CHAN_ENOSYS;
+            }
+            let state = slot.ioctl_state.load(Ordering::Acquire);
+            let handler: ChannelIoctlHandler =
+                unsafe { core::mem::transmute(h) };
+            unsafe { handler(state as *mut c_void, cmd, arg) }
+        }
     }
+}
+
+/// Bind a module-provided ioctl handler to `handle`. Any `channel_ioctl`
+/// cmd that doesn't match a built-in (`IOCTL_NOTIFY`, `IOCTL_POLL_NOTIFY`,
+/// `IOCTL_FLUSH`, `IOCTL_SET_HUP`) is dispatched to `handler(state, cmd,
+/// arg)` instead of returning `CHAN_ENOSYS`.
+///
+/// Passing `handler == null` clears the registration (no call is made).
+/// Otherwise `handler` must be a function pointer whose lifetime exceeds
+/// the channel's — in practice the owning module's entry code, which
+/// lives as long as the loaded module image.
+///
+/// Returns `CHAN_OK` on success, or `CHAN_EINVAL` for an invalid handle.
+/// `state` is opaque to the kernel — typically a pointer into the
+/// module's state arena.
+pub fn channel_register_ioctl_handler(
+    handle: i32,
+    state: *mut c_void,
+    handler: Option<ChannelIoctlHandler>,
+) -> i32 {
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+
+    // Publish state before handler. Reader in channel_ioctl loads
+    // handler first (Acquire) — if it sees non-null, `ioctl_state`
+    // must already be visible.
+    slot.ioctl_state.store(state as *mut (), Ordering::Release);
+    match handler {
+        Some(h) => slot
+            .ioctl_handler
+            .store(h as *mut (), Ordering::Release),
+        None => slot
+            .ioctl_handler
+            .store(core::ptr::null_mut(), Ordering::Release),
+    }
+    CHAN_OK
 }
 
 /// Enable mailbox mode on a channel.
@@ -658,6 +743,28 @@ pub extern "C" fn syscall_channel_poll(handle: i32, events: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
     channel_ioctl(handle, cmd, arg)
+}
+
+/// Register (or clear) a module-provided ioctl handler on `handle`.
+/// `handler` is a C-ABI function pointer cast to `*mut ()`; a null
+/// handler clears the registration. `state` is an opaque module-state
+/// pointer echoed back as the handler's first argument.
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_channel_register_ioctl_handler(
+    handle: i32,
+    state: *mut c_void,
+    handler: *mut (),
+) -> i32 {
+    let h = if handler.is_null() {
+        None
+    } else {
+        // SAFETY: caller promises `handler` is a valid
+        // [`ChannelIoctlHandler`] function pointer; kernel merely
+        // stores and later calls it. Function-pointer lifetime is the
+        // module's — see the handler type's docstring.
+        Some(unsafe { core::mem::transmute::<*mut (), ChannelIoctlHandler>(handler) })
+    };
+    channel_register_ioctl_handler(handle, state, h)
 }
 
 // ============================================================================

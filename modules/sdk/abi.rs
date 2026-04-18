@@ -405,6 +405,12 @@ pub mod dev_channel {
     pub const WRITE: u32 = 0x0504;
     pub const POLL: u32 = 0x0505;
     pub const IOCTL: u32 = 0x0506;
+    /// Bind a module-provided ioctl handler to this channel. Arg layout:
+    /// `{ state_ptr: u64 LE, handler_fn: u64 LE }` (16 B). Any
+    /// `channel_ioctl` cmd not handled by the kernel's built-in set
+    /// (NOTIFY / POLL_NOTIFY / FLUSH / SET_HUP) is forwarded to
+    /// `handler_fn(state_ptr, cmd, arg)`. `handler_fn = 0` clears.
+    pub const REGISTER_IOCTL: u32 = 0x0507;
     pub const BIND: u32 = 0x0509;
     pub const LISTEN: u32 = 0x050A;
     pub const ACCEPT: u32 = 0x050B;

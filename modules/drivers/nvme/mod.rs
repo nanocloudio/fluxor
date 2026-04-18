@@ -12,7 +12,8 @@
 //! ReadLba0 (proof) → Ready. In Ready we service a byte-stream `blocks`
 //! channel (multi-block reads into `read_buf`, drained to the consumer
 //! 512 B at a time), and a `requests` channel carrying write packets
-//! (header + nlb × 512 B payload into `write_buf`, one SQE per packet).
+//! (header + nlb × 512 B payload into one of `write_bufs[]`, one SQE per
+//! packet, up to `inflight_cap` in flight concurrently).
 //!
 //! # Register map (NVMe 1.4 §3.1)
 //!
@@ -104,6 +105,24 @@ const BLOCK_SIZE: u32 = 512;
 /// caller — v1 has no PRP2 / PRP-list support.
 const MAX_NLB: u16 = 8;
 
+/// Inbound write-request header on `req_in`: op:u32 | lba:u64 | nlb:u32 |
+/// nsid:u32. Producers (fat32, future block consumers) stage 20 B before
+/// the payload; nsid=0 falls back to `s.namespace`.
+const REQ_HDR_SIZE: usize = 20;
+
+/// Module-registered ioctl on `req_in`: query namespace geometry.
+///
+/// Arg layout (13 B scratch provided by caller, bi-directional):
+///   in:  `nsid: u32 LE` at offset 0 (0 ⇒ whatever namespace nvme was
+///        configured with via the `namespace` param)
+///   out: `ns_size: u64 LE` at offset 0, `ns_lbads: u8` at offset 8
+///
+/// Returns `CHAN_OK` on success; `-11` (EAGAIN) if nvme hasn't yet
+/// completed IdentifyNamespace; `-22` (EINVAL) if the requested nsid
+/// doesn't match the controller's active namespace (v1 drives only
+/// one ns).
+const IOCTL_NVME_NS_INFO: u32 = 0x4E56_0001;
+
 // ============================================================================
 // State machine
 // ============================================================================
@@ -136,13 +155,35 @@ const CID_IDENTIFY_NS:       u16 = 0x0002;
 const CID_CREATE_IO_CQ:      u16 = 0x0003;
 const CID_CREATE_IO_SQ:      u16 = 0x0004;
 const CID_READ_LBA0:         u16 = 0x0005;
-const CID_IO_WRITE:          u16 = 0x0006;
 
 // I/O queue sizing. Single QID=1 pair for v1. 64 entries is well
-// within any controller's MQES and more than enough for single-
-// in-flight polled I/O.
+// within any controller's MQES and more than enough for the
+// MAX_INFLIGHT-bounded pipelined I/O the driver actually submits.
 const IO_QID:                u16 = 1;
 const IO_Q_ENTRIES:          u32 = 64;
+
+/// Maximum write requests the driver keeps in flight at once. Each
+/// in-flight slot owns a 4 KB DMA buffer, so this caps per-instance
+/// DMA-arena usage at `MAX_INFLIGHT * 4 KB` on top of the fixed
+/// admin/read/identify pages. The effective bound is also clamped at
+/// module_new time by the `queue_depth` param and by `IO_Q_ENTRIES-1`
+/// (always keep one SQE slot free so the ring never looks full-empty
+/// ambiguous).
+const MAX_INFLIGHT:          usize = 8;
+
+/// Base CID for pipelined write SQEs. The per-inflight CID is
+/// `CID_IO_WRITE_BASE | buf_idx`, giving each in-flight write a
+/// unique 16-bit CID the controller can echo back. The buf_idx
+/// occupies the low bits so values stay in a compact range and CID
+/// collisions with the admin/read constants above are impossible.
+const CID_IO_WRITE_BASE:     u16 = 0x0100;
+
+/// Sentinel for `poll_io_cqe(_, CID_NONE)` — harvest-only mode.
+/// Tells the poller to drain any ready write-pipeline CQEs but not
+/// consume anything else. 0xFFFF is outside every live CID range
+/// (admin 0x0001..=0x0005, IO writes 0x0100..=0x0107), so it can
+/// never match a real completion.
+const CID_NONE: u16 = 0xFFFF;
 
 // Identify Namespace response (NVMe 1.4 §5.15.2.2 Figure 246).
 const INS_NSZE:              usize = 0;     // u64
@@ -193,11 +234,13 @@ struct NvmeState {
     /// fills it; BLK_PHASE_WRITING drains it byte-by-byte to
     /// `blk_out`).
     read_buf:        u64,
-    /// DMA buffer for write-request payloads accepted on `req_in`.
-    /// Separate from `read_buf` so an incoming write payload cannot
-    /// alias an in-flight read whose contents the consumer hasn't
-    /// finished draining yet.
-    write_buf:       u64,
+    /// Ring of DMA buffers for write-request payloads accepted on
+    /// `req_in`. Each entry is a 4 KB page lazily allocated on first
+    /// use. Separate from `read_buf` so an incoming write payload
+    /// cannot alias an in-flight read, and separate-per-slot so the
+    /// driver can hold up to `inflight_cap` writes in flight at once
+    /// without one clobbering another's outstanding DMA.
+    write_bufs:      [u64; MAX_INFLIGHT],
 
     // Admin queue indices (QID=0).
     sq_tail:  u32,
@@ -222,25 +265,51 @@ struct NvmeState {
     discard_cqe:      u8,
 
     // Incoming write-request pipeline (Phase 6). Producers push a
-    // 16-byte header { op:u32, lba:u64, nlb:u32 } followed by
-    // nlb * 512 bytes of payload onto `req_in`. `req_phase` walks:
+    // REQ_HDR_SIZE header { op:u32, lba:u64, nlb:u32, nsid:u32 }
+    // followed by nlb * 512 bytes of payload onto `req_in`.
+    // `req_phase` walks:
     //   0 Header  — accumulating header into req_hdr
-    //   1 Payload — accumulating payload into read_buf
-    //   2 Submit  — header + payload ready; submit NVMe Write
-    //   3 Wait    — write SQE issued, polling the I/O CQE
+    //   1 Payload — accumulating payload into write_bufs[inflight_tail]
+    //   2 Submit  — header + payload ready; submit NVMe Write SQE,
+    //                advance inflight ring, return to phase 0
+    // Completion harvest happens at the top of every pump tick, so
+    // there is no separate "wait" phase — the pump keeps accepting
+    // further requests while earlier ones are still in-flight.
     req_phase:       u8,
     _pad_req:        u8,
     req_fill:        u16,
     req_lba:         u64,
-    req_hdr:         [u8; 16],
+    req_hdr:         [u8; REQ_HDR_SIZE],
+    req_nsid:        u32,
+
+    // In-flight write tracking (B4 concurrent I/O). `inflight_count`
+    // outstanding writes; `inflight_head` is the FIFO head (oldest
+    // unacknowledged submission, matches the next CQE to arrive);
+    // `inflight_tail` is where the NEXT submission will go.
+    // `inflight_cap` is the effective bound: min(MAX_INFLIGHT,
+    // IO_Q_ENTRIES - 1, queue_depth). `inflight_submit_ms` records the
+    // submission timestamp per slot so a stuck write still triggers
+    // the same IO_READ_BUDGET_MS timeout that the single-in-flight
+    // path had.
+    inflight_count:    u8,
+    inflight_head:     u8,
+    inflight_tail:     u8,
+    inflight_cap:      u8,
+    inflight_cid:      [u16; MAX_INFLIGHT],
+    inflight_submit_ms:[u64; MAX_INFLIGHT],
 
     // Namespace geometry (extracted from IdentifyNamespace response).
     ns_size:  u64,
     ns_lbads: u8,
     _pad3:    [u8; 7],
 
-    // Timing anchors.
-    wait_start_ms: u64,
+    // Timing anchors. `wait_start_ms` is owned by the admin queue
+    // (submit_admin_cmd / poll_admin_cqe). `read_submit_ms` tracks
+    // the last IO-queue read submission so its timeout budget is
+    // independent of any concurrent write submits. Writes carry their
+    // own per-slot timestamps in `inflight_submit_ms[]`.
+    wait_start_ms:   u64,
+    read_submit_ms:  u64,
 
     returned_ready: u8,
     _pad2: [u8; 7],
@@ -462,6 +531,14 @@ unsafe fn heartbeat(s: &NvmeState) {
     pos += bp.len();
     write_dec3(p, &mut pos, s.blk_phase as u32);
 
+    let inflight = b" if=";
+    core::ptr::copy_nonoverlapping(inflight.as_ptr(), p.add(pos), inflight.len());
+    pos += inflight.len();
+    write_dec3(p, &mut pos, s.inflight_count as u32);
+    *p.add(pos) = b'/';
+    pos += 1;
+    write_dec3(p, &mut pos, s.inflight_cap as u32);
+
     dev_log(&*s.syscalls, 3, p, pos);
 
     // Re-emit the Phase 3 acceptance line once we're in READY. The
@@ -472,6 +549,7 @@ unsafe fn heartbeat(s: &NvmeState) {
     // clobbered by the steady-state block-stream loop (read_buf is).
     if s.state == S_READY {
         emit_identify_info(s);
+        emit_ns_info(s);
     }
 }
 
@@ -555,6 +633,32 @@ unsafe fn emit_identify_info(s: &NvmeState) {
     }
     *p.add(pos) = b'\'';
     pos += 1;
+    dev_log(&*s.syscalls, 3, p, pos);
+}
+
+/// Emit the `[nvme] ns=N size=0xHHHHHHHHHHHHHHHH lbads=DDD` line — one
+/// per controller at IdentifyNamespace completion, and repeatedly from
+/// the heartbeat so it survives early-boot log-drain gaps. Consumers
+/// reach the same values via the NS_INFO ioctl (B3.3).
+unsafe fn emit_ns_info(s: &NvmeState) {
+    let mut buf = [0u8; 64];
+    let p = buf.as_mut_ptr();
+    let prefix = b"[nvme] ns=";
+    core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+    let mut pos = prefix.len();
+    write_dec3(p, &mut pos, s.namespace);
+
+    let sz_tag = b" size=0x";
+    core::ptr::copy_nonoverlapping(sz_tag.as_ptr(), p.add(pos), sz_tag.len());
+    pos += sz_tag.len();
+    write_hex32(p, &mut pos, (s.ns_size >> 32) as u32);
+    write_hex32(p, &mut pos, s.ns_size as u32);
+
+    let lb_tag = b" lbads=";
+    core::ptr::copy_nonoverlapping(lb_tag.as_ptr(), p.add(pos), lb_tag.len());
+    pos += lb_tag.len();
+    write_dec3(p, &mut pos, s.ns_lbads as u32);
+
     dev_log(&*s.syscalls, 3, p, pos);
 }
 
@@ -832,6 +936,7 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
                 let lbaf_off = INS_LBAF0 + (flbas as usize) * 4;
                 let lbaf = read_volatile(id.add(lbaf_off) as *const u32);
                 s.ns_lbads = ((lbaf >> 16) & 0xFF) as u8;
+                emit_ns_info(s);
                 s.state = S_CREATE_IO_CQ;
                 s.substate = 0;
                 0
@@ -916,18 +1021,23 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
 }
 
 /// Submit an N-block Write on the I/O SQ for `lba`, sourcing DMA from
-/// `dma_buf`. `nlb` is clamped to [1, MAX_NLB] so a single PRP1 covers
-/// the transfer; callers that want more must split.
+/// `dma_buf`. `nsid` targets the destination namespace directly (producer
+/// sets this per packet); pass 0 and the caller is responsible for
+/// falling back to the driver-wide default. `nlb` is clamped to
+/// [1, MAX_NLB] so a single PRP1 covers the transfer; callers that want
+/// more must split.
 ///
 /// `dma_buf` must not alias the read-stream buffer — pump_requests uses
-/// `write_buf` precisely so an incoming write payload cannot clobber an
-/// in-flight read whose consumer hasn't finished draining yet.
-unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16, dma_buf: u64) {
+/// per-slot entries in `write_bufs[]` precisely so an incoming write
+/// payload cannot clobber an in-flight read whose consumer hasn't
+/// finished draining yet, nor a still-outstanding write still being
+/// DMA'd by the controller.
+unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16, nsid: u32, dma_buf: u64) {
     let nlb = clamp_nlb(nlb);
     let prp1_pci = dma_buf | PCI_DMA_OFFSET;
     let cdw = [
         ((cid as u32) << 16) | (OPC_WRITE as u32),
-        s.namespace,
+        nsid,
         0, 0,
         0, 0,
         prp1_pci as u32, (prp1_pci >> 32) as u32,
@@ -940,7 +1050,8 @@ unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16, dma_b
     write_sqe(s.io_sq, s.io_sq_tail, cdw);
     s.io_sq_tail = (s.io_sq_tail + 1) % IO_Q_ENTRIES;
     reg_w32(s, sq_doorbell(s, IO_QID as u32), s.io_sq_tail);
-    s.wait_start_ms = now_ms(s);
+    // Per-write submit time is kept in `inflight_submit_ms[tail]` by
+    // the caller; wait_start_ms must stay owned by the read path.
 }
 
 /// Clamp a caller-supplied NLB to the driver's single-PRP1 limit.
@@ -975,7 +1086,7 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
             s.substate = 1;
             0
         }
-        _ => match poll_io_cqe(s) {
+        _ => match poll_io_cqe(s, CID_READ_LBA0) {
             CqeResult::Pending => 0,
             CqeResult::Timeout => fault(s, 22, b"[nvme] ReadLba0 CQE timeout\0"),
             CqeResult::Failed(_) => fault(s, 23, b"[nvme] ReadLba0 failed\0"),
@@ -1017,25 +1128,89 @@ unsafe fn submit_io_read(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16) {
     write_sqe(s.io_sq, s.io_sq_tail, cdw);
     s.io_sq_tail = (s.io_sq_tail + 1) % IO_Q_ENTRIES;
     reg_w32(s, sq_doorbell(s, IO_QID as u32), s.io_sq_tail);
-    s.wait_start_ms = now_ms(s);
+    s.read_submit_ms = now_ms(s);
 }
 
-/// Poll the I/O CQ head for a completion matching the current phase.
-unsafe fn poll_io_cqe(s: &mut NvmeState) -> CqeResult {
-    let cqe = (s.io_cq + (s.io_cq_head as u64) * CQE_BYTES as u64) as *const u32;
-    let dw3 = read_volatile(cqe.add(3));
-    let phase = (dw3 >> 16) & 1;
-    if phase != s.io_cq_phase {
-        if now_ms(s).saturating_sub(s.wait_start_ms) > IO_READ_BUDGET_MS {
-            return CqeResult::Timeout;
+/// Poll the I/O CQ for a completion with `expected_cid`.
+///
+/// Write-pipeline CQEs (CIDs in `CID_IO_WRITE_BASE..+MAX_INFLIGHT`)
+/// are auto-absorbed into the inflight ring on every call, regardless
+/// of what the caller is waiting for — reads and writes share the
+/// single I/O CQ without either path consuming the other's entry.
+///
+/// The sentinel [`CID_NONE`] is the "harvest-only" mode used by
+/// `pump_requests`: the function drains write CQEs and returns `Ok`
+/// when either the inflight ring is empty or the next CQE is a non-
+/// write (it is NOT consumed, so the real owner still sees it). A
+/// concrete CID waits for that specific completion; `Pending` means
+/// it hasn't arrived yet.
+///
+/// Timeout budget: `read_submit_ms` when the caller is waiting on a
+/// read, the head inflight slot's submit time when harvesting writes.
+unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
+    loop {
+        let cqe = (s.io_cq + (s.io_cq_head as u64) * CQE_BYTES as u64) as *const u32;
+        let dw3 = read_volatile(cqe.add(3));
+        let phase = (dw3 >> 16) & 1;
+        if phase != s.io_cq_phase {
+            // No CQE ready. Pick the right budget anchor and either
+            // time out, report "nothing to do", or ask the caller to
+            // retry.
+            let budget_start = if expected_cid == CID_NONE {
+                if s.inflight_count == 0 {
+                    return CqeResult::Ok;
+                }
+                let head = s.inflight_head as usize;
+                *s.inflight_submit_ms.as_ptr().add(head)
+            } else {
+                s.read_submit_ms
+            };
+            if now_ms(s).saturating_sub(budget_start) > IO_READ_BUDGET_MS {
+                return CqeResult::Timeout;
+            }
+            return CqeResult::Pending;
         }
-        return CqeResult::Pending;
+
+        // A CQE is present. Read CID first — a harvest-only caller
+        // must NOT consume a non-write CQE, or the read path loses
+        // its completion and stalls.
+        let cid = (dw3 & 0xFFFF) as u16;
+        let is_write = cid >= CID_IO_WRITE_BASE
+            && cid < CID_IO_WRITE_BASE + MAX_INFLIGHT as u16;
+        if expected_cid == CID_NONE && !is_write {
+            return CqeResult::Ok;
+        }
+
+        // Commit: advance head + ring doorbell.
+        let sc = ((dw3 >> 17) & 0x7FFF) as u16;
+        s.io_cq_head = (s.io_cq_head + 1) % IO_Q_ENTRIES;
+        if s.io_cq_head == 0 { s.io_cq_phase ^= 1; }
+        reg_w32(s, cq_doorbell(s, IO_QID as u32), s.io_cq_head);
+
+        if is_write {
+            if s.inflight_count > 0 {
+                s.inflight_head =
+                    ((s.inflight_head as usize + 1) % MAX_INFLIGHT) as u8;
+                s.inflight_count -= 1;
+            }
+            if sc != 0 {
+                return CqeResult::Failed(sc);
+            }
+            if expected_cid == CID_NONE && s.inflight_count == 0 {
+                return CqeResult::Ok;
+            }
+            continue;
+        }
+
+        if cid == expected_cid {
+            return if sc == 0 { CqeResult::Ok } else { CqeResult::Failed(sc) };
+        }
+
+        // Stray CQE with a CID we didn't submit. Admin CQEs land on
+        // the admin CQ (separate ring), so hitting this branch points
+        // at a CID-allocation bug worth investigating.
+        dev_log(&*s.syscalls, 2, b"[nvme] stray io cqe\0".as_ptr(), 20);
     }
-    let sc = ((dw3 >> 17) & 0x7FFF) as u16;
-    s.io_cq_head = (s.io_cq_head + 1) % IO_Q_ENTRIES;
-    if s.io_cq_head == 0 { s.io_cq_phase ^= 1; }
-    reg_w32(s, cq_doorbell(s, IO_QID as u32), s.io_cq_head);
-    if sc == 0 { CqeResult::Ok } else { CqeResult::Failed(sc) }
 }
 
 /// Check the block-output channel for a consumer-originated seek
@@ -1058,28 +1233,78 @@ unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
     }
 }
 
-/// READY-state block I/O loop. Drives a seek → read → stream pipeline
-/// on the `blocks` output channel, matching the contract `sd.blocks →
-/// fat32.blocks` uses today: sequential 512 B byte stream with a
-/// consumer-originated seek via `IOCTL_POLL_NOTIFY`.
-/// Write-request pump. Drains `16 + nlb*512` byte packets off `req_in`
-/// (header followed by nlb × 512 bytes of payload) and issues one NVMe
-/// Write per packet. Returns `true` if the pump owns the I/O queue this
-/// tick and block-streaming should stall (so it doesn't submit a
-/// concurrent SQE that would share the CQE slot).
+/// Harvest every ready write-pipeline CQE. Thin wrapper around
+/// [`poll_io_cqe(s, CID_NONE)`] that converts its result into the
+/// integer status the pump expects (0 on drain, -1 on fault).
+unsafe fn harvest_write_cqes(s: &mut NvmeState) -> i32 {
+    match poll_io_cqe(s, CID_NONE) {
+        CqeResult::Ok | CqeResult::Pending => 0,
+        CqeResult::Failed(_) => {
+            fault(s, 32, b"[nvme] req write failed\0");
+            -1
+        }
+        CqeResult::Timeout => {
+            fault(s, 31, b"[nvme] req write CQE timeout\0");
+            -1
+        }
+    }
+}
+
+/// Ensure `write_bufs[idx]` has a 4 KB DMA page allocated; returns
+/// true on success, false on allocation failure (caller should fault).
+unsafe fn ensure_write_buf(s: &mut NvmeState, idx: usize) -> bool {
+    let sys = &*s.syscalls;
+    let cur = *s.write_bufs.as_ptr().add(idx);
+    if cur != 0 {
+        return true;
+    }
+    let p = dev_dma_alloc(sys, PAGE, PAGE);
+    if p == 0 {
+        return false;
+    }
+    *s.write_bufs.as_mut_ptr().add(idx) = p;
+    true
+}
+
+/// Write-request pump. Reads `{op, lba, nlb, nsid}` headers + payloads
+/// off `req_in` and issues NVMe Writes with up to `inflight_cap` in
+/// flight concurrently. `poll_io_cqe` is CID-aware, so running the
+/// pump is safe even while a read is outstanding.
+///
+/// Returns `true` iff the pump has work in progress this tick (an
+/// outstanding write CQE is pending, or a header/payload is still
+/// being accumulated). Callers today use it as an informational
+/// "is the pump busy" signal; a `false` return is not a promise
+/// that step_ready can skip its read path.
 unsafe fn pump_requests(s: &mut NvmeState) -> bool {
     if s.req_in < 0 { return false; }
     let sys = &*s.syscalls;
 
-    match s.req_phase {
-        0 => {
-            // Accumulate the 16-byte header: { op:u32, lba:u64, nlb:u32 }.
-            let need = 16 - s.req_fill as usize;
-            let dst = s.req_hdr.as_mut_ptr().add(s.req_fill as usize);
-            let n = (sys.channel_read)(s.req_in, dst, need);
-            if n <= 0 { return false; }
-            s.req_fill += n as u16;
-            if s.req_fill as usize == 16 {
+    // Always try to drain completions first so freshly completed
+    // writes release slots for the submission loop below.
+    if harvest_write_cqes(s) < 0 {
+        return true; // fault set
+    }
+
+    loop {
+        match s.req_phase {
+            0 => {
+                // Don't start a new request until the inflight ring
+                // has room. This also prevents us from reading a
+                // header off the channel that we'd have to stall
+                // mid-payload because the tail slot is still busy.
+                if s.inflight_count >= s.inflight_cap {
+                    break;
+                }
+                let need = REQ_HDR_SIZE - s.req_fill as usize;
+                let dst = s.req_hdr.as_mut_ptr().add(s.req_fill as usize);
+                let n = (sys.channel_read)(s.req_in, dst, need);
+                if n <= 0 { break; }
+                s.req_fill += n as u16;
+                if s.req_fill as usize != REQ_HDR_SIZE {
+                    // Partial header — the rest will land next tick.
+                    break;
+                }
                 let op = u32::from_le_bytes([
                     s.req_hdr[0], s.req_hdr[1], s.req_hdr[2], s.req_hdr[3],
                 ]);
@@ -1090,71 +1315,63 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 let nlb = u32::from_le_bytes([
                     s.req_hdr[12], s.req_hdr[13], s.req_hdr[14], s.req_hdr[15],
                 ]);
+                let nsid = u32::from_le_bytes([
+                    s.req_hdr[16], s.req_hdr[17], s.req_hdr[18], s.req_hdr[19],
+                ]);
                 if op != 1 {
                     s.req_fill = 0;
                     dev_log(sys, 3, b"[nvme] req: unknown op\0".as_ptr(), 22);
-                    return false;
+                    continue;
                 }
                 if nlb == 0 || nlb > MAX_NLB as u32 {
-                    // Producer contract: NLB must fit in one PRP1.
-                    // Larger requests must be split before sending.
                     fault(s, 33, b"[nvme] req: nlb out of range\0");
                     return true;
                 }
                 s.req_lba = lba;
                 s.req_nlb = nlb as u16;
+                s.req_nsid = if nsid != 0 { nsid } else { s.namespace };
                 s.req_fill = 0;
                 s.req_phase = 1;
             }
-            true
-        }
-        1 => {
-            // Accumulate `req_nlb * 512` bytes of payload into write_buf
-            // so the in-flight read pipeline (which owns read_buf) is
-            // unaffected. write_buf is a full 4 KB page so any NLB up to
-            // MAX_NLB fits.
-            if s.write_buf == 0 {
-                let p = dev_dma_alloc(sys, PAGE, PAGE);
-                if p == 0 {
+            1 => {
+                // Payload goes into write_bufs[tail]. Each buffer is
+                // 4 KB so any NLB up to MAX_NLB fits.
+                let tail = s.inflight_tail as usize;
+                if !ensure_write_buf(s, tail) {
                     fault(s, 30, b"[nvme] req buf alloc fail\0");
                     return true;
                 }
-                s.write_buf = p;
+                let buf = *s.write_bufs.as_ptr().add(tail);
+                let total = (s.req_nlb as u32) * BLOCK_SIZE;
+                let need = (total - s.req_fill as u32) as usize;
+                let dst = (buf as *mut u8).add(s.req_fill as usize);
+                let n = (sys.channel_read)(s.req_in, dst, need);
+                if n <= 0 { break; }
+                s.req_fill += n as u16;
+                if s.req_fill as u32 >= total {
+                    s.req_phase = 2;
+                }
             }
-            let total = (s.req_nlb as u32) * BLOCK_SIZE;
-            let need = (total - s.req_fill as u32) as usize;
-            let dst = (s.write_buf as *mut u8).add(s.req_fill as usize);
-            let n = (sys.channel_read)(s.req_in, dst, need);
-            if n <= 0 { return true; }
-            s.req_fill += n as u16;
-            if s.req_fill as u32 >= total {
-                s.req_phase = 2;
-            }
-            true
-        }
-        2 => {
-            submit_io_write(s, s.req_lba, s.req_nlb, CID_IO_WRITE, s.write_buf);
-            s.req_phase = 3;
-            true
-        }
-        _ => match poll_io_cqe(s) {
-            CqeResult::Pending => true,
-            CqeResult::Timeout => {
-                fault(s, 31, b"[nvme] req write CQE timeout\0");
-                true
-            }
-            CqeResult::Failed(_) => {
-                fault(s, 32, b"[nvme] req write failed\0");
-                true
-            }
-            CqeResult::Ok => {
-                dev_log(&*s.syscalls, 3, b"[nvme] req write ok\0".as_ptr(), 19);
-                s.req_phase = 0;
+            _ => {
+                // Phase 2: submit + release the phase latch. CID
+                // encodes the tail index so out-of-order completion
+                // (when/if the driver grows to match by CID) can
+                // locate the right inflight slot directly.
+                let tail = s.inflight_tail as usize;
+                let buf = *s.write_bufs.as_ptr().add(tail);
+                let cid = CID_IO_WRITE_BASE | (tail as u16);
+                submit_io_write(s, s.req_lba, s.req_nlb, cid, s.req_nsid, buf);
+                *s.inflight_cid.as_mut_ptr().add(tail) = cid;
+                *s.inflight_submit_ms.as_mut_ptr().add(tail) = now_ms(s);
+                s.inflight_tail = ((tail + 1) as u8) % (MAX_INFLIGHT as u8);
+                s.inflight_count += 1;
                 s.req_fill = 0;
-                false
+                s.req_phase = 0;
             }
         }
     }
+
+    s.inflight_count > 0 || s.req_phase != 0 || s.req_fill != 0
 }
 
 unsafe fn step_ready(s: &mut NvmeState) -> i32 {
@@ -1163,12 +1380,11 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
         s.returned_ready = 1;
         return 3; // signal scheduler we've reached the steady state
     }
-    // Service incoming write requests first. When one is mid-flight
-    // it owns the I/O queue for the duration (read_buf + CQE), so we
-    // pause block-streaming until it completes.
-    if pump_requests(s) {
-        return 0;
-    }
+    // Service incoming write requests on every tick. poll_io_cqe is
+    // CID-aware (reads ask for CID_READ_LBA0, writes use the
+    // 0x0100-range), so pump_requests can submit in parallel with a
+    // read in flight without either path consuming the other's CQE.
+    pump_requests(s);
     if s.blk_out < 0 {
         return 0;
     }
@@ -1215,7 +1431,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             s.blk_phase = BLK_PHASE_READING;
             0
         }
-        BLK_PHASE_READING => match poll_io_cqe(s) {
+        BLK_PHASE_READING => match poll_io_cqe(s, CID_READ_LBA0) {
             CqeResult::Pending => 0,
             CqeResult::Timeout => fault(s, 24, b"[nvme] block read CQE timeout\0"),
             CqeResult::Failed(_) => fault(s, 25, b"[nvme] block read failed\0"),
@@ -1286,6 +1502,43 @@ unsafe fn step_fault(s: &mut NvmeState) -> i32 {
 }
 
 // ============================================================================
+// Channel ioctl handler (registered on `req_in` at module_new)
+// ============================================================================
+
+/// Services [`IOCTL_NVME_NS_INFO`] queries from any consumer wired to
+/// `req_in`. Reads the requested nsid (u32 LE) from `arg`, returns
+/// `{ns_size:u64 LE, ns_lbads:u8}` overwriting the same buffer.
+///
+/// Signature must be `unsafe extern "C"` to match
+/// [`ChannelIoctlHandler`]. Kernel holds the function pointer + state
+/// pointer across the module's lifetime; see `channel.rs`.
+unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+    if state.is_null() || arg.is_null() {
+        return E_INVAL;
+    }
+    if cmd != IOCTL_NVME_NS_INFO {
+        return E_NOSYS;
+    }
+    let s = &*(state as *const NvmeState);
+    // Reject queries until IdentifyNamespace has populated the
+    // geometry fields. ns_size is non-zero for any real namespace.
+    if s.ns_size == 0 {
+        return E_AGAIN;
+    }
+    let requested_nsid = u32::from_le_bytes([
+        *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+    ]);
+    if requested_nsid != 0 && requested_nsid != s.namespace {
+        return E_INVAL; // v1 only drives one namespace
+    }
+    let size = s.ns_size.to_le_bytes();
+    let mut i = 0usize;
+    while i < 8 { *arg.add(i) = size[i]; i += 1; }
+    *arg.add(8) = s.ns_lbads;
+    0
+}
+
+// ============================================================================
 // Module ABI
 // ============================================================================
 
@@ -1327,6 +1580,21 @@ pub extern "C" fn module_new(
         s.state = S_WAIT_PCIE;
         s.logged_state = 0xFE;
 
+        // Register the NS_INFO ioctl handler on req_in. Consumers
+        // (fat32, future block users) read namespace geometry via
+        // IOCTL_NVME_NS_INFO on their write channel. The handler
+        // refuses queries until IdentifyNamespace has populated
+        // ns_size; callers should wait for the module's Ready signal
+        // before querying.
+        if s.req_in >= 0 {
+            dev_channel_register_ioctl(
+                &*s.syscalls,
+                s.req_in,
+                state as *mut c_void,
+                Some(nvme_ioctl_handler),
+            );
+        }
+
         let is_tlv = !params.is_null() && params_len >= 4
             && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
@@ -1334,6 +1602,15 @@ pub extern "C" fn module_new(
         } else {
             params_def::set_defaults(s);
         }
+
+        // Resolve the in-flight cap after params parse. A queue_depth
+        // of 0 is nonsensical (would stall pump_requests forever), so
+        // floor at 1; IO_Q_ENTRIES-1 keeps a free SQE slot so a ring
+        // full condition is distinguishable from empty. MAX_INFLIGHT
+        // caps the DMA-buffer footprint.
+        let qd = if s.queue_depth == 0 { 1u32 } else { s.queue_depth as u32 };
+        let cap = qd.min(MAX_INFLIGHT as u32).min(IO_Q_ENTRIES - 1) as u8;
+        s.inflight_cap = if cap == 0 { 1 } else { cap };
 
         dev_log(&*s.syscalls, 3, b"[nvme] init\0".as_ptr(), 11);
         0

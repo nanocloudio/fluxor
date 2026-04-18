@@ -220,6 +220,7 @@ unsafe fn enumerate(s: &mut PcieScanState) {
     }
 
     let mut dev_num = 0u8;
+    let mut nvme_count = 0u8;
     while dev_num < 32 && (s.device_count as usize) < MAX_DEVICES {
         let id = ecam_read32(sys, s.ecam_base, 0, dev_num, 0, 0x00);
         let vendor_id = (id & 0xFFFF) as u16;
@@ -232,6 +233,13 @@ unsafe fn enumerate(s: &mut PcieScanState) {
 
         let class_rev = ecam_read32(sys, s.ecam_base, 0, dev_num, 0, 0x08);
         let class_code = class_rev >> 8;
+        // NVMe is PCI class 0x01_08_02 (mass-storage / NVM / NVMe).
+        // The nvme driver only attaches to `controller_index` (0 by
+        // default), so any extras are ignored — warn the user once so
+        // the silent selection isn't a surprise.
+        if class_code == 0x01_08_02 {
+            nvme_count = nvme_count.saturating_add(1);
+        }
 
         let idx = s.device_count as usize;
         let dp = s.devices.as_mut_ptr().add(idx);
@@ -283,6 +291,21 @@ unsafe fn enumerate(s: &mut PcieScanState) {
 
         s.device_count += 1;
         dev_num += 1;
+    }
+
+    if nvme_count > 1 {
+        let mut msg = [0u8; 64];
+        let p = msg.as_mut_ptr();
+        let prefix = b"[pcie_scan] multiple NVMe controllers (";
+        core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+        let mut pos = prefix.len();
+        *p.add(pos) = b'0' + ((nvme_count / 10) % 10);
+        *p.add(pos + 1) = b'0' + (nvme_count % 10);
+        pos += 2;
+        let tail = b"); v1 only drives index 0";
+        core::ptr::copy_nonoverlapping(tail.as_ptr(), p.add(pos), tail.len());
+        pos += tail.len();
+        dev_log(sys, 2, p, pos);
     }
 
     dev_log(sys, 3, b"[pcie_scan] enumeration done\0".as_ptr(), 27);

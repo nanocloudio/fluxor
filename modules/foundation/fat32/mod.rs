@@ -144,17 +144,56 @@ const WS_DIR_WRITE:         u8 = 15;
 // Terminal: all writes successfully pushed onto the request channel.
 const WS_DONE:              u8 = 16;
 // Generic outbuf-drain state used by any emitter; resumes at
-// `w_return_state` when the 528-byte packet is fully sent.
+// `w_return_state` when the packet (REQ_HDR_SIZE + nlb*512 B) is fully sent.
 const WS_SEND_PACKET:       u8 = 17;
 // FSINFO sector update (read-modify-write): decrement the free-cluster
 // count and bump the next-free hint after each successful allocation.
 const WS_FSINFO_READ:       u8 = 18;
 const WS_FSINFO_WAIT:       u8 = 19;
 const WS_FSINFO_WRITE:      u8 = 20;
+// ClnShutBit toggle on cluster 1's FAT entry. WS_MARK_DIRTY_* runs
+// once before any data/FAT writes so a crash mid-write leaves the
+// filesystem visibly dirty; WS_MARK_CLEAN_* runs last so a normal
+// completion restores the clean-shutdown bit and Linux doesn't warn
+// on the next mount. Both flows RMW fat_start_sector (the primary
+// FAT's sector 0) and mirror to FAT2 when num_fats > 1.
+const WS_MARK_DIRTY_READ:   u8 = 21;
+const WS_MARK_DIRTY_WAIT:   u8 = 22;
+const WS_MARK_DIRTY_WRITE:  u8 = 23;
+const WS_MARK_DIRTY_MIRROR: u8 = 24;
+const WS_MARK_CLEAN_READ:   u8 = 25;
+const WS_MARK_CLEAN_WAIT:   u8 = 26;
+const WS_MARK_CLEAN_WRITE:  u8 = 27;
+const WS_MARK_CLEAN_MIRROR: u8 = 28;
+// One-shot geometry query on the block_writes channel. If the consumer
+// (nvme) answers, fat32 logs size+lbads and verifies a 512 B LBA; on
+// ENOSYS (no handler registered, e.g. sd driver) the check is skipped.
+const WS_NS_CHECK:          u8 = 29;
 
-/// Operation tag inside the 16-byte write-request header. v1 only
+/// FAT32 "clean shutdown" bit in cluster 1's FAT entry. When set the
+/// filesystem was properly unmounted; when cleared Linux reports
+/// "Dirty bit is set. Fs was not properly unmounted". See the FAT32
+/// white paper and dosfstools `FAT32_CLN_SHUT_BIT_MASK`.
+const CLN_SHUT_BIT:         u32 = 0x0800_0000;
+
+/// Geometry-query ioctl on the block_writes channel. Matches
+/// `nvme::IOCTL_NVME_NS_INFO`. Arg is 13 B: in=`nsid:u32` / out=
+/// `ns_size:u64 + ns_lbads:u8`. A non-nvme consumer returns ENOSYS,
+/// which fat32 treats as "geometry info unavailable, proceed".
+const IOCTL_NVME_NS_INFO:   u32 = 0x4E56_0001;
+
+/// Expected LBA data-size shift. LBA size = 2^ns_lbads; fat32 only
+/// supports 512 B LBAs, i.e. `ns_lbads == 9`.
+const EXPECTED_LBADS:       u8 = 9;
+
+/// Operation tag inside the 20-byte write-request header. v1 only
 /// supports op=1 (single-block WRITE). Must match `nvme::pump_requests`.
 const REQ_OP_WRITE:         u32 = 1;
+
+/// Outbound write-request header size on `block_writes`:
+///   op:u32 | lba:u64 | nlb:u32 | nsid:u32    (20 bytes)
+/// `nsid == 0` lets the consumer use its driver-wide default namespace.
+const REQ_HDR_SIZE:         usize = 20;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
@@ -166,6 +205,7 @@ include!("../../sdk/params.rs");
 mod params_def {
     use super::Fat32State;
     use super::SCHEMA_MAX;
+    use super::p_u32;
 
     define_params! {
         Fat32State;
@@ -253,6 +293,9 @@ mod params_def {
                 }
                 s.write_data_len = (already + n) as u16;
             };
+
+        5, namespace, u32, 1
+            => |s, d, len| { s.namespace = p_u32(d, len, 0, 1); };
     }
 }
 
@@ -374,10 +417,14 @@ struct Fat32State {
     // `write_file_len == 0` (empty `write_file` param) disables the
     // entire path — the module boots read-only.
     //
-    // The 528-byte outbound packet format matches the nvme module's
-    // `requests` port: 16 B header { op:u32=1, lba:u64, nlb:u32=1 }
-    // followed by 512 B payload.
+    // The outbound packet format matches the nvme module's `requests`
+    // port: REQ_HDR_SIZE header { op:u32=1, lba:u64, nlb:u32, nsid:u32 }
+    // followed by nlb * 512 B payload.
     write_out_chan:    i32,
+    /// NVMe namespace id stamped into every WRITE header. `0` forwards
+    /// to the consumer's driver-wide default (nvme falls back to its
+    /// `namespace` param in that case).
+    namespace:         u32,
     write_state:       u8,   // current WS_* discriminant
     write_file_len:    u8,   // 0 = disabled (no `write_file` param given)
     _pad_w0:           u16,
@@ -413,15 +460,15 @@ struct Fat32State {
     // Post-write size patch.
     w_new_size:            u32,
 
-    // Outbound packet staging: 16-byte request header + up to
+    // Outbound packet staging: REQ_HDR_SIZE request header + up to
     // MAX_WRITE_NLB sectors of payload. Filled before transitioning
     // into WS_SendPacket; drained across ticks (channel ring may take
     // several ticks to accept the full packet under backpressure).
-    w_outbuf:         [u8; 16 + MAX_WRITE_NLB as usize * BLOCK_SIZE],
+    w_outbuf:         [u8; REQ_HDR_SIZE + MAX_WRITE_NLB as usize * BLOCK_SIZE],
     w_outbuf_sent:    u16,
-    /// Total bytes in the current packet (16 + nlb * BLOCK_SIZE). Set by
-    /// stage_header and consumed by drain_packet so the drain knows when
-    /// the packet is fully on the wire.
+    /// Total bytes in the current packet (REQ_HDR_SIZE + nlb * BLOCK_SIZE).
+    /// Set by stage_header and consumed by drain_packet so the drain
+    /// knows when the packet is fully on the wire.
     w_outbuf_len:     u16,
     /// NLB of the in-flight data batch. Used by ws_after_sector to
     /// advance w_bytes_written and w_sector_in_cluster by `nlb` sectors.
@@ -463,6 +510,7 @@ impl Fat32State {
         self.read_fill = 0;
         self.tick_count = 0;
         self.write_out_chan = -1;
+        self.namespace = 1;
         self.write_state = WS_IDLE;
         self.write_file_len = 0;
         self.write_data_len = 0;
@@ -979,7 +1027,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // state machine at WS_SCAN on first entry; stay until WS_DONE.
         if s.write_file_len > 0 && s.write_state != WS_DONE {
             if s.write_state == WS_IDLE {
-                s.write_state = WS_SCAN;
+                s.write_state = WS_NS_CHECK;
             }
             return write_step(s);
         }
@@ -1042,23 +1090,26 @@ unsafe fn patch_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) {
     *dst.add(3) = le[3];
 }
 
-/// Write the 16-byte WRITE-request header { op, lba, nlb } at the
+/// Write the 20-byte WRITE-request header { op, lba, nlb, nsid } at the
 /// start of `w_outbuf`. Also records the full packet length
-/// (16 + nlb * BLOCK_SIZE) so `drain_packet` knows when the packet is
-/// fully on the wire.
+/// (REQ_HDR_SIZE + nlb * BLOCK_SIZE) so `drain_packet` knows when the
+/// packet is fully on the wire.
 unsafe fn stage_header(s: &mut Fat32State, lba: u32, nlb: u16) {
     let out = s.w_outbuf.as_mut_ptr();
     let op  = REQ_OP_WRITE.to_le_bytes();
     let lb  = (lba as u64).to_le_bytes();
     let nb  = (nlb as u32).to_le_bytes();
+    let ns  = s.namespace.to_le_bytes();
     let mut i = 0usize;
-    while i < 4 { *out.add(i) = op[i]; i += 1; }
+    while i < 4 { *out.add(i)      = op[i]; i += 1; }
     i = 0;
-    while i < 8 { *out.add(4 + i) = lb[i]; i += 1; }
+    while i < 8 { *out.add(4 + i)  = lb[i]; i += 1; }
     i = 0;
     while i < 4 { *out.add(12 + i) = nb[i]; i += 1; }
+    i = 0;
+    while i < 4 { *out.add(16 + i) = ns[i]; i += 1; }
     s.w_outbuf_sent = 0;
-    s.w_outbuf_len = 16 + (nlb as u16) * (BLOCK_SIZE as u16);
+    s.w_outbuf_len = (REQ_HDR_SIZE as u16) + (nlb as u16) * (BLOCK_SIZE as u16);
 }
 
 /// Stage a 1-sector WRITE whose payload is `payload_src[..BLOCK_SIZE]`.
@@ -1067,7 +1118,7 @@ unsafe fn stage_header(s: &mut Fat32State, lba: u32, nlb: u16) {
 unsafe fn stage_packet(s: &mut Fat32State, lba: u32, payload_src: *const u8) {
     stage_header(s, lba, 1);
     let out = s.w_outbuf.as_mut_ptr();
-    core::ptr::copy_nonoverlapping(payload_src, out.add(16), BLOCK_SIZE);
+    core::ptr::copy_nonoverlapping(payload_src, out.add(REQ_HDR_SIZE), BLOCK_SIZE);
 }
 
 /// Stage an N-sector WRITE whose payload is `write_data[off..off+nlb*512]`,
@@ -1080,18 +1131,19 @@ unsafe fn stage_data_batch(s: &mut Fat32State, lba: u32, nlb: u16, off: usize) {
     let avail = wdl.saturating_sub(off).min(total);
     if avail > 0 {
         let src = s.write_data.as_ptr().add(off);
-        core::ptr::copy_nonoverlapping(src, out.add(16), avail);
+        core::ptr::copy_nonoverlapping(src, out.add(REQ_HDR_SIZE), avail);
     }
     let mut z = avail;
     while z < total {
-        *out.add(16 + z) = 0;
+        *out.add(REQ_HDR_SIZE + z) = 0;
         z += 1;
     }
 }
 
 /// Drain `w_outbuf` through `write_out_chan`. Returns 1 when the
-/// full packet (16 + nlb*512 B, tracked in `w_outbuf_len`) is sent,
-/// 0 when partial (retry next tick), -1 on channel error (non-E_AGAIN).
+/// full packet (REQ_HDR_SIZE + nlb*512 B, tracked in `w_outbuf_len`)
+/// is sent, 0 when partial (retry next tick), -1 on channel error
+/// (non-E_AGAIN).
 ///
 /// Writes are issued in sector-sized pieces because the kernel ring is
 /// all-or-nothing per call (kernel/ringbuf.rs): a request larger than
@@ -1134,7 +1186,7 @@ unsafe fn log_lba(s: &Fat32State, prefix: &[u8], v: u32) {
 }
 
 /// Transition to `WS_SEND_PACKET`, remembering the next state to
-/// resume at once the 528-byte packet drains successfully.
+/// resume at once the packet drains successfully.
 #[inline(always)]
 fn enter_send_packet(s: &mut Fat32State, resume_state: u8) {
     s.w_return_state = resume_state;
@@ -1173,12 +1225,21 @@ unsafe fn write_step(s: &mut Fat32State) -> i32 {
         WS_FSINFO_READ => ws_fsinfo_read(s),
         WS_FSINFO_WAIT => ws_fsinfo_wait(s),
         WS_FSINFO_WRITE => ws_fsinfo_write(s),
+        WS_MARK_DIRTY_READ => ws_mark_fat_read(s, WS_MARK_DIRTY_WAIT),
+        WS_MARK_DIRTY_WAIT => ws_mark_fat_wait(s, false),
+        WS_MARK_DIRTY_WRITE => ws_mark_fat_write(s, false),
+        WS_MARK_DIRTY_MIRROR => ws_mark_fat_mirror(s, false),
+        WS_MARK_CLEAN_READ => ws_mark_fat_read(s, WS_MARK_CLEAN_WAIT),
+        WS_MARK_CLEAN_WAIT => ws_mark_fat_wait(s, true),
+        WS_MARK_CLEAN_WRITE => ws_mark_fat_write(s, true),
+        WS_MARK_CLEAN_MIRROR => ws_mark_fat_mirror(s, true),
+        WS_NS_CHECK => ws_ns_check(s),
         _ => 0, // WS_IDLE / WS_DONE / unknown
     }
 }
 
 /// Shared drain-then-resume step used by any state that emitted a
-/// packet and needs to wait for the channel to accept the full 528 B.
+/// packet and needs to wait for the channel to accept the full packet.
 unsafe fn ws_send_packet(s: &mut Fat32State) -> i32 {
     match drain_packet(s) {
         0 => 0, // partial — retry next tick
@@ -1262,8 +1323,14 @@ unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
         return 0;
     }
 
-    s.write_state = WS_SEND_SECTOR;
-    2 // burst into first sector send
+    // Mark the volume dirty before any data or FAT mutation. If
+    // Fluxor crashes mid-write the bit stays cleared; Linux then
+    // flags the FS as "not properly unmounted" on the next mount
+    // instead of silently accepting a potentially inconsistent state.
+    // On a normal completion the symmetric WS_MARK_CLEAN_* flow
+    // restores the bit.
+    s.write_state = WS_MARK_DIRTY_READ;
+    2
 }
 
 /// WS_SEND_SECTOR: stage a contiguous run of data sectors into one
@@ -1318,8 +1385,8 @@ unsafe fn ws_after_sector(s: &mut Fat32State) -> i32 {
             return 2;
         }
         log_info(s, b"[fat32] write: data done (no size change)");
-        s.write_state = WS_DONE;
-        return 0;
+        s.write_state = WS_MARK_CLEAN_READ;
+        return 2;
     }
 
     if s.w_sector_in_cluster >= s.sectors_per_cluster {
@@ -1619,10 +1686,13 @@ unsafe fn ws_dir_wait(s: &mut Fat32State) -> i32 {
     2
 }
 
-/// WS_DIR_WRITE: emit the patched dir sector write, then terminate.
+/// WS_DIR_WRITE: emit the patched dir sector write, then restore the
+/// ClnShutBit before finalising. The FAT dirty-bit dance always runs
+/// last (post-dir) so a crash between the dir write and clean-mark is
+/// still visible to Linux as "dirty".
 unsafe fn ws_dir_write(s: &mut Fat32State) -> i32 {
     stage_packet(s, s.w_target_dir_lba, s.block_buf.as_ptr());
-    enter_send_packet(s, WS_DONE);
+    enter_send_packet(s, WS_MARK_CLEAN_READ);
     // Log on the way in so a successful write is observable even if
     // the dir writeback takes a moment to drain.
     log_info(s, b"[fat32] write: dir size patched");
@@ -1714,6 +1784,179 @@ unsafe fn ws_fsinfo_write(s: &mut Fat32State) -> i32 {
     resume_after_alloc(s);
     enter_send_packet(s, WS_SEND_SECTOR);
     2
+}
+
+/// Read fat_start_sector into block_buf in preparation for toggling
+/// cluster 1's ClnShutBit. `wait_state` is the state to re-enter once
+/// the block arrives (either WS_MARK_DIRTY_WAIT or WS_MARK_CLEAN_WAIT).
+unsafe fn ws_mark_fat_read(s: &mut Fat32State, wait_state: u8) -> i32 {
+    let lba = s.fat_start_sector;
+    flush_input(s);
+    if seek_sd(s, lba) < 0 {
+        log_info(s, b"[fat32] write: clnshut seek fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    s.read_fill = 0;
+    s.w_fat_sector_in_buf = lba;
+    s.write_state = wait_state;
+    0
+}
+
+/// Patch cluster 1's FAT entry in block_buf to toggle ClnShutBit.
+/// `set_clean == true` sets the bit (→ clean); false clears it
+/// (→ dirty). Bit 26 (HrdErrBit) is left as-is — fat32 never sets
+/// that bit, so the mkfs default of "no error" is preserved across
+/// normal Fluxor runs.
+unsafe fn patch_clnshut_bit(buf: *mut u8, set_clean: bool) {
+    let entry_ptr = buf.add(4); // cluster 1 = bytes 4..8 of FAT sector 0
+    let cur = (*entry_ptr as u32)
+        | ((*entry_ptr.add(1) as u32) << 8)
+        | ((*entry_ptr.add(2) as u32) << 16)
+        | ((*entry_ptr.add(3) as u32) << 24);
+    let next = if set_clean {
+        cur | CLN_SHUT_BIT
+    } else {
+        cur & !CLN_SHUT_BIT
+    };
+    let le = next.to_le_bytes();
+    *entry_ptr        = le[0];
+    *entry_ptr.add(1) = le[1];
+    *entry_ptr.add(2) = le[2];
+    *entry_ptr.add(3) = le[3];
+}
+
+/// Once the FAT sector read completes, toggle ClnShutBit and stage
+/// the write. `set_clean == true` transitions via the CLEAN states;
+/// false via the DIRTY states.
+unsafe fn ws_mark_fat_wait(s: &mut Fat32State, set_clean: bool) -> i32 {
+    let res = try_read_block(s);
+    if res < 0 {
+        log_info(s, b"[fat32] write: clnshut read fail");
+        s.write_state = WS_DONE;
+        return 0;
+    }
+    if res == 0 { return 0; }
+
+    patch_clnshut_bit(s.block_buf.as_mut_ptr(), set_clean);
+    s.write_state = if set_clean { WS_MARK_CLEAN_WRITE } else { WS_MARK_DIRTY_WRITE };
+    2
+}
+
+/// Stage the primary-FAT-sector write with the toggled ClnShutBit.
+/// On resume, go to the mirror step when num_fats > 1; otherwise
+/// skip directly to the next phase (WS_SEND_SECTOR after dirty;
+/// WS_DONE after clean).
+unsafe fn ws_mark_fat_write(s: &mut Fat32State, set_clean: bool) -> i32 {
+    let lba = s.fat_start_sector;
+    stage_packet(s, lba, s.block_buf.as_ptr());
+    let next = if s.num_fats > 1 {
+        if set_clean { WS_MARK_CLEAN_MIRROR } else { WS_MARK_DIRTY_MIRROR }
+    } else if set_clean {
+        WS_DONE
+    } else {
+        WS_SEND_SECTOR
+    };
+    enter_send_packet(s, next);
+    2
+}
+
+/// Mirror the primary-FAT ClnShutBit write to FAT2's sector 0. The
+/// mirror FAT starts at `fat_start_sector + fat_size_32`; sector 0 of
+/// the mirror is at the same relative offset (=0). block_buf already
+/// holds the patched data.
+unsafe fn ws_mark_fat_mirror(s: &mut Fat32State, set_clean: bool) -> i32 {
+    let lba = s.fat_start_sector.wrapping_add(s.fat_size_32);
+    stage_packet(s, lba, s.block_buf.as_ptr());
+    let next = if set_clean { WS_DONE } else { WS_SEND_SECTOR };
+    enter_send_packet(s, next);
+    2
+}
+
+/// WS_NS_CHECK: one-shot geometry query over block_writes. The nvme
+/// driver registers an IOCTL_NVME_NS_INFO handler on its req_in side,
+/// so fat32 can sanity-check that the underlying namespace uses 512 B
+/// LBAs (the only size fat32 supports today) before it stages any
+/// writes. Non-nvme consumers (sd driver, etc.) don't register a
+/// handler; the kernel returns ENOSYS and fat32 proceeds anyway so
+/// this stays a soft check.
+///
+/// ns_size returned is in LBAs. For info only — fat32 doesn't cap
+/// writes at ns_size because partition geometry already does.
+unsafe fn ws_ns_check(s: &mut Fat32State) -> i32 {
+    if s.write_out_chan < 0 {
+        // No downstream wired — WS_SCAN's own guard will emit the
+        // "no block_writes channel" error. Just advance.
+        s.write_state = WS_SCAN;
+        return 2;
+    }
+    // Request nsid=0 ("whatever the default is"); we don't need the
+    // exact nsid, just the geometry of what fat32's writes will land
+    // on. `scratch` is sized for the {ns_size:u64 + ns_lbads:u8}
+    // response; the 4-byte nsid input sits in the first 4 bytes.
+    let mut scratch = [0u8; 13];
+    let rc = dev_channel_query(
+        s.sys(),
+        s.write_out_chan,
+        IOCTL_NVME_NS_INFO,
+        scratch.as_mut_ptr(),
+        scratch.len(),
+    );
+    match rc {
+        E_AGAIN => 0, // nvme mid-IdentifyNamespace; retry next tick
+        E_NOSYS => {
+            // No handler registered (sd driver, out-of-tree consumer).
+            // Skip the geometry check and proceed.
+            log_info(s, b"[fat32] ns_check: no nvme handler, skipping");
+            s.write_state = WS_SCAN;
+            2
+        }
+        0 => {
+            let ns_size = u64::from_le_bytes([
+                scratch[0], scratch[1], scratch[2], scratch[3],
+                scratch[4], scratch[5], scratch[6], scratch[7],
+            ]);
+            let ns_lbads = scratch[8];
+            emit_ns_info(s, ns_size, ns_lbads);
+            if ns_lbads != EXPECTED_LBADS {
+                // fat32 hard-codes 512 B sectors in stage_packet +
+                // drain chunking. A 4 KiB-native SSD would silently
+                // corrupt data without broader rework — refuse.
+                log_info(s, b"[fat32] ns_check: unsupported lbads; writes disabled");
+                s.write_state = WS_DONE;
+                0
+            } else {
+                s.write_state = WS_SCAN;
+                2
+            }
+        }
+        _ => {
+            log_info(s, b"[fat32] ns_check: ioctl err");
+            s.write_state = WS_DONE;
+            0
+        }
+    }
+}
+
+/// Emit `[fat32] ns size=NNN lbads=DD`. Helper so ws_ns_check stays
+/// focused on the control flow. `ns_size` is reported as a truncated
+/// u32 (LBA count); for drives up to ~2 TiB at 512 B LBAs this fits.
+/// Oversized namespaces will log a wrapped value — reasonable for a
+/// one-shot diagnostic line.
+unsafe fn emit_ns_info(s: &Fat32State, ns_size: u64, ns_lbads: u8) {
+    let mut msg = [0u8; 48];
+    let p = msg.as_mut_ptr();
+    let prefix = b"[fat32] ns size=";
+    core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+    let mut pos = prefix.len();
+    pos += fmt_u32_raw(p.add(pos), ns_size as u32);
+    let lb = b" lbads=";
+    core::ptr::copy_nonoverlapping(lb.as_ptr(), p.add(pos), lb.len());
+    pos += lb.len();
+    *p.add(pos)     = b'0' + (ns_lbads / 10);
+    *p.add(pos + 1) = b'0' + (ns_lbads % 10);
+    pos += 2;
+    dev_log(s.sys(), 3, p, pos);
 }
 
 /// Initialization state machine

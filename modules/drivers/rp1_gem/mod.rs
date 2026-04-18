@@ -42,7 +42,7 @@ const GEM_DMACFG: usize = 0x010;        // DMA config
 const GEM_TXSTATUS: usize = 0x014;      // TX status
 const GEM_RXQBASE: usize = 0x018;       // RX queue base addr
 const GEM_TXQBASE: usize = 0x01C;       // TX queue base addr
-const GEM_RXSTATUS: usize = 0x020;      // RX status
+const GEM_RXSTATUS: usize = 0x020;      // RX status (RSR): BNA/RXREC/RXOVR
 const GEM_ISR: usize = 0x024;           // Interrupt status
 const GEM_IDR: usize = 0x02C;           // Interrupt disable
 const GEM_PHYMGMT: usize = 0x034;       // PHY management
@@ -54,6 +54,18 @@ const GEM_USRIO: usize = 0x0C0;         // User IO (RGMII mode select)
 const GEM_MID: usize = 0x0FC;           // Module ID (RO)
 const GEM_DCFG1: usize = 0x280;         // Design config 1
 const GEM_DCFG2: usize = 0x284;         // Design config 2
+
+// Hardware statistics counters. Each is RW1C (read, auto-clear) on
+// most Cadence GEM revisions; treat reads as monotonic deltas between
+// heartbeats without assuming persistence across reads.
+const GEM_FRAMES_RX:     usize = 0x0158; // frames received OK
+const GEM_RX_RESOURCE:   usize = 0x01A0; // RX resource errors (BNA)
+const GEM_RX_OVERRUN:    usize = 0x01A4; // RX overrun errors
+
+// Network / RX status register bits (RSR @ 0x020):
+const RSR_BNA:           u32 = 1 << 0;   // buffer not available on RX
+const RSR_FRMREC:        u32 = 1 << 1;   // frame received
+const RSR_RXOVR:         u32 = 1 << 2;   // RX overrun
 
 // Upper base address registers (64-bit DMA)
 const GEM_RBQPH: usize = 0x04D4;        // RX queue base addr high
@@ -160,6 +172,15 @@ struct GemState {
     rx_packets: u32,
     tx_packets: u32,
     link_poll_counter: u32,
+    /// Cumulative RX resource errors (BNA). Cadence GEM RW1Cs the HW
+    /// counter on read, so we accumulate into state so the heartbeat
+    /// still shows the total over the run.
+    rx_resource_total: u32,
+    /// Cumulative RX overrun errors.
+    rx_overrun_total: u32,
+    /// Cumulative RX frames at hardware level (may exceed
+    /// `rx_packets` if some frames couldn't be forwarded upstream).
+    rx_frames_hw_total: u32,
     /// Staging buffer for RX length-prefixed frames. Each frame is copied
     /// out of the DMA pool with a 2-byte LE length header so the byte-stream
     /// channel to the IP module preserves frame boundaries.
@@ -186,6 +207,64 @@ unsafe fn gem_write(base: usize, offset: usize, val: u32) {
 
 unsafe fn log_msg(sys: &SyscallTable, msg: &[u8]) {
     dev_log(sys, 3, msg.as_ptr(), msg.len()); // level 3 = info
+}
+
+/// Append a `" tag="` prefix followed by `fmt_u32_raw(val)` to the
+/// message buffer and advance `pos`. Keeps heartbeat composition flat.
+unsafe fn append_dec_field(p: *mut u8, pos: &mut usize, tag: &[u8], val: u32) {
+    core::ptr::copy_nonoverlapping(tag.as_ptr(), p.add(*pos), tag.len());
+    *pos += tag.len();
+    *pos += fmt_u32_raw(p.add(*pos), val);
+}
+
+/// Periodic heartbeat: emits `[rp1_gem] rx=N tx=M rsr=0xHH bna=K ovr=J
+/// hwrx=H` once every ~5 s in phase 2. `bna` is the cumulative
+/// RX_RESOURCE error count (buffer not available — a non-zero value
+/// means poll_rx fell behind the controller); `ovr` is cumulative
+/// RX overruns; `hwrx` is what the HW counted vs. `rx` which is
+/// what the module forwarded upstream.
+///
+/// RSR (network status) is a snapshot at heartbeat time. The
+/// known-interesting sticky bits are write-1-cleared at the bottom
+/// so the next window starts fresh.
+unsafe fn heartbeat(s: &mut GemState) {
+    let base = s.gem_base;
+    let rsr = gem_read(base, GEM_RXSTATUS);
+    // HW stat registers are RW1C on read (Cadence convention); each
+    // read returns the delta since the last read. Sum into state so
+    // the heartbeat shows a monotonic total over the run.
+    s.rx_resource_total  = s.rx_resource_total.wrapping_add(gem_read(base, GEM_RX_RESOURCE));
+    s.rx_overrun_total   = s.rx_overrun_total.wrapping_add(gem_read(base, GEM_RX_OVERRUN));
+    s.rx_frames_hw_total = s.rx_frames_hw_total.wrapping_add(gem_read(base, GEM_FRAMES_RX));
+
+    let mut msg = [0u8; 96];
+    let p = msg.as_mut_ptr();
+    let prefix = b"[rp1_gem] rx=";
+    core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+    let mut pos = prefix.len();
+    pos += fmt_u32_raw(p.add(pos), s.rx_packets);
+    append_dec_field(p, &mut pos, b" tx=", s.tx_packets);
+
+    // rsr is 8 hex nibbles.
+    let rsr_tag = b" rsr=0x";
+    core::ptr::copy_nonoverlapping(rsr_tag.as_ptr(), p.add(pos), rsr_tag.len());
+    pos += rsr_tag.len();
+    let mut n = 0u32;
+    while n < 8 {
+        let nib = ((rsr >> (28 - n * 4)) & 0xF) as u8;
+        *p.add(pos) = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        pos += 1;
+        n += 1;
+    }
+
+    append_dec_field(p, &mut pos, b" bna=",  s.rx_resource_total);
+    append_dec_field(p, &mut pos, b" ovr=",  s.rx_overrun_total);
+    append_dec_field(p, &mut pos, b" hwrx=", s.rx_frames_hw_total);
+    dev_log(&*s.syscalls, 3, p, pos);
+
+    // Write-1-clear the bits we interpret so the next heartbeat sees
+    // a fresh window. Unrelated bits we don't touch stay as-is.
+    gem_write(base, GEM_RXSTATUS, rsr & (RSR_BNA | RSR_FRMREC | RSR_RXOVR));
 }
 
 // ============================================================================
@@ -687,6 +766,9 @@ pub extern "C" fn module_new(
     s.rx_packets = 0;
     s.tx_packets = 0;
     s.link_poll_counter = 0;
+    s.rx_resource_total = 0;
+    s.rx_overrun_total = 0;
+    s.rx_frames_hw_total = 0;
     0
 }
 
@@ -737,8 +819,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             poll_rx(s);
             poll_tx(s);
 
-            // No diagnostic logging in the hot path — UART I/O blocks
-            // the scheduler and causes frame loss from FIFO overruns.
+            // Heartbeat cadence = 50_000 ticks. At tick_us=100
+            // (ethernet_hello) that's every 5 s; at tick_us=1000 it
+            // drops to every 50 s. Stat-counter reads are cheap
+            // (one MMIO word each) and touch no scheduler state.
+            if s.step_count % 50_000 == 0 {
+                heartbeat(s);
+            }
             0
         }
     }

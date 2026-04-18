@@ -299,6 +299,18 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
             let data_ptr = if arg_len >= 8 { arg.add(4) } else { core::ptr::null_mut() };
             channel::syscall_channel_ioctl(handle, cmd, data_ptr)
         }
+        dev_channel::REGISTER_IOCTL => {
+            if arg.is_null() || arg_len < 16 { return E_INVAL; }
+            let state = u64::from_le_bytes([
+                *arg,        *arg.add(1), *arg.add(2), *arg.add(3),
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]) as *mut core::ffi::c_void;
+            let handler = u64::from_le_bytes([
+                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
+                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+            ]) as *mut ();
+            channel::syscall_channel_register_ioctl_handler(handle, state, handler)
+        }
         _ => E_NOSYS,
     }
 }
