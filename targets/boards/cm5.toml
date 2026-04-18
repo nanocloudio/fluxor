@@ -15,6 +15,12 @@ id = "cm5"
 silicon = "bcm2712"
 description = "Raspberry Pi 5 / Compute Module 5 (bare-metal)"
 
+# `board-cm5` selects the RAM-origin, UART base, and RP1 init that the VPU
+# firmware leaves for a real Pi 5. Without it, the same silicon builds for
+# QEMU virt. Inherits rust_target + module_target from silicon.
+[build]
+cargo_features = ["board-cm5"]
+
 # GPIO 14/15 reserved for UART console, activity LED on GPIO 25 (active low via RP1)
 [gpio]
 reserved_pins = [14, 15]

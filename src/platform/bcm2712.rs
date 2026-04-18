@@ -66,12 +66,11 @@ global_asm!(
     "    .byte 1, 0, 0, 0", // version + reserved
     // runtime_end: end of file-backed sections (must NOT include BSS
     // or stack). The kernel resolves the trailer via this same symbol
-    // through `config::get_trailer_addr()`, so the value here is what
-    // pack-image will use to place the trailer. `_start`'s relocator
-    // copies `package_size` bytes here only when package_size != 0;
-    // RAM-loaded aarch64 images leave it at 0 and skip the copy.
+    // through `config::get_trailer_addr()`. `_start`'s relocator copies
+    // `package_size` bytes here only when package_size != 0; RAM-loaded
+    // aarch64 images leave it at 0 and skip the copy.
     "    .word __end_data_addr",
-    "    .word 0",          // package_size (set by pack-image on RP/XIP only)
+    "    .word 0",          // package_size (RP/XIP post-BSS relocation only)
     "__package_source_start:",
 );
 
@@ -1226,8 +1225,8 @@ global_asm!(
     "    ldr w5, [x2, #12]",     // package_size
     "    cbz w5, 9f",
     "    add x6, x2, #16",       // source: bytes appended after the header
-    "    ldr w7, [x2, #8]",      // destination base (__end_block_addr, aligned by pack-image)
-    // Fast 8-byte copy loop (both src and dst are 256-byte aligned from pack-image)
+    "    ldr w7, [x2, #8]",      // destination base (__end_block_addr, aligned by packer)
+    // Fast 8-byte copy loop (both src and dst are 256-byte aligned by packer)
     "    bic x10, x5, #7",       // x10 = size rounded down to 8-byte multiple
     "    mov x8, xzr",
     "8:  cmp x8, x10",

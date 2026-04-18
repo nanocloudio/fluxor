@@ -213,11 +213,9 @@ fluxor targets
 # Validate a config without packaging
 fluxor validate examples/pico2w/music_player.yaml
 
-# Compose firmware + YAML config into UF2 (RP targets)
-fluxor combine <firmware.bin> <config.yaml> -o <out.uf2>
-
-# Compose firmware.bin + YAML config into a raw boot image (aarch64 targets)
-fluxor pack-image <firmware.bin> <config.yaml> --modules-dir <dir> -o <kernel8.img>
+# Compose firmware + YAML config + modules into a bootable image.
+#   RP targets -> UF2; aarch64 targets -> raw binary (kernel8.img)
+fluxor combine <firmware.bin> <config.yaml> -o <out.{uf2,img}>
 
 # Pack a module ELF into .fmod
 fluxor pack <module.elf> -o <module.fmod> -n <name> -t <module_type>
@@ -243,7 +241,7 @@ fluxor/
 │   ├── drivers/        # Hardware drivers (cyw43, enc28j60, sd, st7701s, ...)
 │   ├── foundation/     # Portable services (ip, fat32, http, mqtt, dns, tls, ...)
 │   └── app/            # Application modules (synth, codec, mixer, voip, ...)
-├── tools/              # Host CLI: validate, combine, pack, pack-image, diff
+├── tools/              # Host CLI: validate, combine, pack, build, diff
 ├── examples/           # Example YAML configs per target board
 ├── docs/               # Architecture references and guides
 └── targets/            # Silicon and board definitions

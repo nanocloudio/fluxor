@@ -100,10 +100,22 @@ struct TomlMemoryConfig {
 #[derive(Deserialize)]
 struct TomlBoardFile {
     board: TomlBoardMeta,
+    build: Option<TomlBoardBuild>,
     gpio: Option<TomlGpioConfig>,
     hardware: Option<TomlBoardHardware>,
     /// Platform stack defaults (e.g. [platform.net] phy="wifi", driver="cyw43")
     platform: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+}
+
+/// Board-level build overrides. Only present for boards that need cargo
+/// features beyond the silicon defaults (e.g. `board-cm5` selects Pi 5
+/// RAM origin and RP1 init). Unspecified fields inherit from silicon.
+#[derive(Deserialize)]
+struct TomlBoardBuild {
+    rust_target: Option<String>,
+    module_target: Option<String>,
+    /// Cargo features to add on top of silicon's features.
+    cargo_features: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -235,6 +247,13 @@ impl TargetDescriptor {
         } else {
             None
         }
+    }
+
+    /// Build id used for firmware + packed-image output paths.
+    /// Equals the board id when loaded as a board, otherwise the silicon id.
+    /// Modules live under the silicon id (`self.id`) regardless.
+    pub fn build_id(&self) -> &str {
+        self.board_id.as_deref().unwrap_or(&self.id)
     }
 
     /// Display name: "pico2w (RP2350A)" or just "rp2350a (RP2350A)"
@@ -447,6 +466,26 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
     // Platform stack defaults (e.g. [platform.net] phy="wifi")
     if let Some(platform) = board.platform {
         desc.platform_defaults = platform;
+    }
+
+    // Merge board-level build overrides onto silicon's build config. Only
+    // used by boards that need extra cargo features (cm5 adds `board-cm5`).
+    if let Some(bb) = board.build {
+        if let Some(ref mut build) = desc.build {
+            if let Some(rt) = bb.rust_target {
+                build.rust_target = rt;
+            }
+            if let Some(mt) = bb.module_target {
+                build.module_target = mt;
+            }
+            if let Some(features) = bb.cargo_features {
+                for f in features {
+                    if !build.cargo_features.contains(&f) {
+                        build.cargo_features.push(f);
+                    }
+                }
+            }
+        }
     }
 
     Ok(desc)

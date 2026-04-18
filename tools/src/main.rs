@@ -108,19 +108,6 @@ enum Commands {
         #[arg(long, default_value = "1")]
         epoch: u64,
     },
-    /// Combine firmware.bin + config + modules into a raw boot image
-    PackImage {
-        /// Firmware binary image
-        firmware: PathBuf,
-        /// Config file (YAML or JSON)
-        config: PathBuf,
-        /// Directory containing built .fmod files (repeatable)
-        #[arg(short = 'm', long, action = clap::ArgAction::Append)]
-        modules_dir: Vec<PathBuf>,
-        /// Output packed image
-        #[arg(short, long)]
-        output: PathBuf,
-    },
     /// Show example configuration
     Example {
         /// Example name: blinky, sd-audio, playlist, test-tone, gesture-led
@@ -274,12 +261,6 @@ fn main() {
             target,
             epoch,
         } => cmd_slot_image(&config, &output, target.as_deref(), epoch, verbose),
-        Commands::PackImage {
-            firmware,
-            config,
-            modules_dir,
-            output,
-        } => cmd_pack_image(&firmware, &config, &modules_dir, &output, verbose),
         Commands::Example { name } => cmd_example(&name),
         Commands::Pack {
             input,
@@ -1160,140 +1141,6 @@ fn cmd_slot_image(
     Ok(())
 }
 
-fn cmd_pack_image(
-    firmware_path: &PathBuf,
-    config_path: &PathBuf,
-    modules_dirs: &[PathBuf],
-    output_path: &PathBuf,
-    verbose: bool,
-) -> Result<()> {
-    const IMAGE_ALIGN: u32 = 256;
-    const PACKAGE_HEADER_MAGIC: u32 = 0x4B505846; // "FXPK"
-    const PACKAGE_HEADER_SIZE: usize = 16;
-
-    let firmware = std::fs::read(firmware_path)?;
-    if firmware.len() < PACKAGE_HEADER_SIZE {
-        return Err(error::Error::Config("firmware image is too small to contain package header".into()));
-    }
-
-    let header_offset = firmware.len() - PACKAGE_HEADER_SIZE;
-    let magic = u32::from_le_bytes(firmware[header_offset..header_offset + 4].try_into().unwrap());
-    if magic != PACKAGE_HEADER_MAGIC {
-        return Err(error::Error::Config(format!(
-            "firmware image missing package header magic (got 0x{:08x})",
-            magic
-        )));
-    }
-    let runtime_end = u32::from_le_bytes(
-        firmware[header_offset + 8..header_offset + 12]
-            .try_into()
-            .unwrap(),
-    );
-    let trailer_addr = (runtime_end + IMAGE_ALIGN - 1) & !(IMAGE_ALIGN - 1);
-
-    let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
-    let primary_dir = if modules_dirs.is_empty() {
-        let p = format!("target/{}/modules", target_desc.id);
-        std::path::PathBuf::from(p)
-    } else {
-        modules_dirs[0].clone()
-    };
-    let extra_dirs: Vec<&std::path::Path> = modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
-    let (modules_data, config_data) =
-        build_packaged_blobs(&config, primary_dir.as_path(), &extra_dirs, &target_desc, verbose)?;
-
-    // Module table must be page-aligned (4096) because aarch64 PIC modules use
-    // ADRP for PC-relative rodata access. The table packing aligns code within
-    // the blob relative to offset 0, so the blob base must be page-aligned.
-    const MODULE_TABLE_ALIGN: u32 = 4096;
-    let modules_addr = if modules_data.is_some() {
-        (trailer_addr + IMAGE_ALIGN + MODULE_TABLE_ALIGN - 1) & !(MODULE_TABLE_ALIGN - 1)
-    } else {
-        0
-    };
-    let config_addr = if let Some(ref mdata) = modules_data {
-        let after_modules = modules_addr + mdata.len() as u32;
-        (after_modules + IMAGE_ALIGN - 1) & !(IMAGE_ALIGN - 1)
-    } else {
-        trailer_addr + IMAGE_ALIGN
-    };
-
-    // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
-    let payload_crc: u16 = 0; // reserved
-
-    let mut trailer = Vec::with_capacity(16);
-    trailer.extend_from_slice(&TRAILER_MAGIC.to_le_bytes());
-    trailer.push(TRAILER_VERSION);
-    trailer.push(0);
-    trailer.extend_from_slice(&payload_crc.to_le_bytes()); // CRC-16 of payload
-    trailer.extend_from_slice(&modules_addr.to_le_bytes());
-    trailer.extend_from_slice(&config_addr.to_le_bytes());
-
-    // Pad firmware up to trailer_addr, then append trailer, modules,
-    // and config in turn. The FXPK header is left untouched: the
-    // kernel resolves the trailer via the `__end_data_addr` linker
-    // symbol (see `config::get_trailer_addr`), so no runtime
-    // relocation is required for RAM-loaded images and `_start`'s
-    // copy loop stays skipped (package_size == 0).
-    let firmware_size = firmware.len();
-    let mut image = firmware;
-    let pad_to = trailer_addr as usize - (runtime_end as usize - firmware_size);
-    if pad_to > image.len() {
-        image.resize(pad_to, 0);
-    }
-    image.extend_from_slice(&trailer);
-    if let Some(ref mdata) = modules_data {
-        let modules_file_offset = pad_to + (modules_addr - trailer_addr) as usize;
-        if image.len() < modules_file_offset {
-            image.resize(modules_file_offset, 0);
-        }
-        image.extend_from_slice(mdata);
-        let config_file_offset = pad_to + (config_addr - trailer_addr) as usize;
-        if image.len() < config_file_offset {
-            image.resize(config_file_offset, 0);
-        }
-    } else {
-        let config_file_offset = pad_to + IMAGE_ALIGN as usize;
-        if image.len() < config_file_offset {
-            image.resize(config_file_offset, 0);
-        }
-    }
-    image.extend_from_slice(&config_data);
-
-    if verbose {
-        eprintln!("Layout:");
-        eprintln!("  Runtime:   0x{:08x}", runtime_end);
-        eprintln!("  Trailer:   0x{:08x} (16 bytes)", trailer_addr);
-        if let Some(ref mdata) = modules_data {
-            eprintln!("  Modules:   0x{:08x} ({} bytes)", modules_addr, mdata.len());
-        }
-        eprintln!("  Config:    0x{:08x} ({} bytes)", config_addr, config_data.len());
-        eprintln!("  Total:     {} bytes", image.len() - firmware_size);
-    }
-
-    std::fs::write(output_path, &image)?;
-
-    if verbose {
-        println!(
-            "\x1b[1;32mSuccess:\x1b[0m Wrote {} ({} bytes)",
-            output_path.display(),
-            image.len()
-        );
-    } else {
-        let modules_size = modules_data.as_ref().map(|m| m.len()).unwrap_or(0);
-        println!(
-            "\x1b[1;32mSuccess\x1b[0m {} fw={}K mod={}K cfg={}K total={}K",
-            output_path.file_name().unwrap_or_default().to_string_lossy(),
-            firmware_size / 1024,
-            modules_size / 1024,
-            config_data.len() / 1024,
-            image.len() / 1024
-        );
-    }
-
-    Ok(())
-}
-
 fn cmd_example(name: &str) -> Result<()> {
     if let Some(example) = EXAMPLES.get(name) {
         println!("{}", serde_json::to_string_pretty(example)?);
@@ -1699,9 +1546,18 @@ fn build_one(
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     let family = target_desc.family.clone();
     let silicon_id = target_desc.id.clone();
+    let build_id = target_desc.build_id().to_string();
     let board_id = target_desc.board_id.clone();
 
-    // Derive output path
+    // Artifact layout:
+    //   firmware  target/{build_id}/firmware.bin   (board-specific when cargo
+    //                                               features differ per board)
+    //   modules   target/{silicon_id}/modules/     (byte-identical per
+    //                                               silicon + module target)
+    //   output    target/{build_id}/{images|uf2}/<subdir>/<name>.{img|uf2}
+    let firmware_path = PathBuf::from(format!("target/{}/firmware.bin", build_id));
+    let modules_dir = PathBuf::from(format!("target/{}/modules", silicon_id));
+
     let name = yaml_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1713,7 +1569,7 @@ fn build_one(
     } else {
         match family.as_str() {
             "rp2" => {
-                let mut p = PathBuf::from(format!("target/{}/uf2", silicon_id));
+                let mut p = PathBuf::from(format!("target/{}/uf2", build_id));
                 if !subdir.is_empty() {
                     p.push(&subdir);
                 }
@@ -1721,7 +1577,7 @@ fn build_one(
                 p
             }
             "bcm" => {
-                let mut p = PathBuf::from(format!("target/{}/images", silicon_id));
+                let mut p = PathBuf::from(format!("target/{}/images", build_id));
                 if !subdir.is_empty() {
                     p.push(&subdir);
                 }
@@ -1743,56 +1599,29 @@ fn build_one(
         }
     };
 
-    // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     match family.as_str() {
-        "rp2" => {
-            // RP family: combine firmware + config + modules -> UF2
-            let firmware_path = PathBuf::from(format!("target/{}/firmware.bin", silicon_id));
+        "rp2" | "bcm" => {
             if !firmware_path.exists() {
                 return Err(Error::Config(format!(
-                    "Firmware not found at {}. Run 'make firmware' first.",
-                    firmware_path.display()
+                    "Firmware not found at {}. Run 'make firmware TARGET={}' first.",
+                    firmware_path.display(),
+                    build_id
                 )));
             }
-            let modules_dir = PathBuf::from(format!("target/{}/modules", silicon_id));
             if !modules_dir.exists() {
                 return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'make modules' first.",
-                    modules_dir.display()
+                    "Modules not found at {}. Run 'make modules TARGET={}' first.",
+                    modules_dir.display(),
+                    build_id
                 )));
             }
             cmd_combine(&firmware_path, &yaml_path.to_path_buf(), &output_path, verbose)?;
         }
-        "bcm" => {
-            // BCM family: pack-image firmware + config + modules -> img
-            let firmware_path = PathBuf::from(format!("target/{}/firmware.bin", silicon_id));
-            if !firmware_path.exists() {
-                return Err(Error::Config(format!(
-                    "Firmware not found at {}. Run 'make firmware' first.",
-                    firmware_path.display()
-                )));
-            }
-            let modules_dir = PathBuf::from(format!("target/{}/modules", silicon_id));
-            if !modules_dir.exists() {
-                return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'make modules' first.",
-                    modules_dir.display()
-                )));
-            }
-            cmd_pack_image(
-                &firmware_path,
-                &yaml_path.to_path_buf(),
-                &[modules_dir],
-                &output_path,
-                verbose,
-            )?;
-        }
         "linux" => {
-            // Linux: generate config.bin + modules.bin in output directory
             let out_dir = output_path
                 .parent()
                 .unwrap_or(std::path::Path::new("target/linux"));
@@ -1801,15 +1630,14 @@ fn build_one(
             let config_bin_path = out_dir.join("config.bin");
             let modules_bin_path = out_dir.join("modules.bin");
 
-            // Use bcm2712 modules for linux (aarch64 compatible).
-            // Search both the standard path and config-relative path.
+            // Linux host reuses the aarch64 PIC modules built for bcm2712.
+            // When fluxor is consumed as a submodule, accept a sibling copy
+            // at ../deps/fluxor/target/bcm2712/modules.
             let modules_dir = PathBuf::from("target/bcm2712/modules");
             let mut fmod_dirs: Vec<PathBuf> = Vec::new();
             if modules_dir.exists() {
                 fmod_dirs.push(modules_dir.clone());
             }
-            // Also search relative to the config file's project root
-            // (e.g., config at /project/configs/foo.yaml → /project/deps/fluxor/target/bcm2712/modules/)
             if let Some(config_parent) = yaml_path.parent().and_then(|p| p.parent()) {
                 let ext_modules = config_parent.join("deps/fluxor/target/bcm2712/modules");
                 if ext_modules.exists() {
@@ -1818,18 +1646,14 @@ fn build_one(
             }
             if fmod_dirs.is_empty() {
                 return Err(Error::Config(
-                    "Modules not found. Run 'make modules TARGET=bcm2712' first.".into()
+                    "Modules not found at target/bcm2712/modules. Run 'make modules TARGET=bcm2712' first.".into()
                 ));
             }
-
-            // Generate modules.bin (mktable-config)
             cmd_mktable_config(
                 &yaml_path.to_path_buf(),
                 &fmod_dirs,
                 &modules_bin_path,
             )?;
-
-            // Generate config.bin (binary config)
             cmd_generate(
                 &yaml_path.to_path_buf(),
                 Some(config_bin_path.as_path()),
