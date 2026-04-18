@@ -5,11 +5,14 @@
 //! `hw/nvme_trace/baseline/` for the reference trace this module is
 //! written against (Biwin CE430T5D100-512G on the rig, 2026-04-16).
 //!
-//! # Current status
+//! # Current shape
 //!
-//! Phase 3: Reset → ConfigQueues → Enable → IdentifyController
-//! implemented. Logs VID/SN/MN/FR from the Identify response.
-//! Phase 4 (IdentifyNamespace + I/O queues) + Phase 5+ still stubs.
+//! Polled, single I/O queue. State machine runs Reset → ConfigQueues →
+//! Enable → IdentifyController → IdentifyNamespace → Create IO CQ/SQ →
+//! ReadLba0 (proof) → Ready. In Ready we service a byte-stream `blocks`
+//! channel (multi-block reads into `read_buf`, drained to the consumer
+//! 512 B at a time), and a `requests` channel carrying write packets
+//! (header + nlb × 512 B payload into `write_buf`, one SQE per packet).
 //!
 //! # Register map (NVMe 1.4 §3.1)
 //!
@@ -96,6 +99,11 @@ const BLK_PHASE_WRITING: u8 = 2;
 
 const BLOCK_SIZE: u32 = 512;
 
+/// Max NLB per I/O SQE with PRP1 only. PRP1 covers one 4 KB page, so
+/// 8 × 512-byte LBAs. Requests larger than this must be split by the
+/// caller — v1 has no PRP2 / PRP-list support.
+const MAX_NLB: u16 = 8;
+
 // ============================================================================
 // State machine
 // ============================================================================
@@ -109,9 +117,8 @@ const S_IDENTIFY_CONTROLLER: u8 = 5;
 const S_IDENTIFY_NAMESPACE:  u8 = 6;
 const S_CREATE_IO_CQ:        u8 = 7;
 const S_CREATE_IO_SQ:        u8 = 8;
-const S_WRITE_ONCE:          u8 = 9;
-const S_READ_LBA0:           u8 = 10;
-const S_READY:               u8 = 11;
+const S_READ_LBA0:           u8 = 9;
+const S_READY:               u8 = 10;
 const S_FAULT:               u8 = 0xFF;
 
 // NVMe opcodes (NVMe 1.4 §5).
@@ -129,14 +136,7 @@ const CID_IDENTIFY_NS:       u16 = 0x0002;
 const CID_CREATE_IO_CQ:      u16 = 0x0003;
 const CID_CREATE_IO_SQ:      u16 = 0x0004;
 const CID_READ_LBA0:         u16 = 0x0005;
-const CID_WRITE_ONCE:        u16 = 0x0006;
-
-/// Sentinel for `write_lba` disabling the one-shot boot-write.
-const WRITE_LBA_DISABLED:    u32 = 0xFFFF_FFFF;
-
-/// Maximum payload accepted for the one-shot boot-write param. Fits in
-/// one 512-byte LBA; the rest of the block is zero-padded.
-const WRITE_DATA_MAX:        usize = 48;
+const CID_IO_WRITE:          u16 = 0x0006;
 
 // I/O queue sizing. Single QID=1 pair for v1. 64 entries is well
 // within any controller's MQES and more than enough for single-
@@ -161,14 +161,6 @@ struct NvmeState {
     controller_index: u8,
     queue_depth: u16,
     namespace: u32,
-
-    // Phase 6 one-shot boot-write. If `write_lba != WRITE_LBA_DISABLED`,
-    // the state machine writes `write_data[..write_data_len]` (zero-
-    // padded to 512 B) to that LBA between CreateIoSQ and ReadLba0.
-    write_lba:       u32,
-    write_data_len:  u16,
-    _pad_wr:         u16,
-    write_data:      [u8; WRITE_DATA_MAX],
 
     state: u8,
     substate: u8,
@@ -255,6 +247,14 @@ struct NvmeState {
 
     /// Step counter for periodic heartbeat.
     step_count: u32,
+
+    /// Block count of the in-flight read batch (1..=MAX_NLB). The
+    /// streaming loop pushes `blk_nlb * BLOCK_SIZE` bytes per batch
+    /// before advancing `current_block` by the same count.
+    blk_nlb: u16,
+    /// Block count parsed from an incoming write-request header
+    /// (1..=MAX_NLB). Controls payload accumulation size in phase 1.
+    req_nlb: u16,
 }
 
 // ============================================================================
@@ -264,7 +264,7 @@ struct NvmeState {
 mod params_def {
     use super::NvmeState;
     use super::{p_u8, p_u16, p_u32};
-    use super::{SCHEMA_MAX, WRITE_DATA_MAX, WRITE_LBA_DISABLED};
+    use super::SCHEMA_MAX;
 
     define_params! {
         NvmeState;
@@ -277,23 +277,6 @@ mod params_def {
 
         3, queue_depth, u16, 32
             => |s, d, len| { s.queue_depth = p_u16(d, len, 0, 32); };
-
-        // Phase 6 one-shot boot-write. `write_lba == 0xFFFFFFFF`
-        // (default) disables the write; any other value enables it.
-        4, write_lba, u32, 0xFFFFFFFF
-            => |s, d, len| { s.write_lba = p_u32(d, len, 0, WRITE_LBA_DISABLED); };
-
-        5, write_data, str, 0
-            => |s, d, len| {
-                let n = if len > WRITE_DATA_MAX { WRITE_DATA_MAX } else { len };
-                let dst = s.write_data.as_mut_ptr();
-                let mut i = 0usize;
-                while i < n {
-                    *dst.add(i) = *d.add(i);
-                    i += 1;
-                }
-                s.write_data_len = n as u16;
-            };
     }
 }
 
@@ -445,14 +428,8 @@ unsafe fn write_dec3(p: *mut u8, pos: &mut usize, v: u32) {
 }
 
 /// Periodic heartbeat — emitted every ~5 s while the module is live.
-/// Keeps the fields that are continuously meaningful while debugging
-/// admin-command + I/O-queue work: state machine position, fault
-/// code, admin queue indices, current block + block-phase.
-///
-/// Drops the `wlba` / `id[0]` / `cqe3` fields that earlier bring-up
-/// phases used — they show one-shot or quickly-stale values
-/// (write_lba is constant after boot; id[0] and cqe3 are buffer
-/// memory that gets clobbered by the steady-state block-stream loop).
+/// Prints the fields that stay meaningful in steady state: state-machine
+/// position, fault code, admin queue indices, current LBA, block-phase.
 unsafe fn heartbeat(s: &NvmeState) {
     let mut buf = [0u8; 96];
     let p = buf.as_mut_ptr();
@@ -930,7 +907,7 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
             CqeResult::Failed(_) => fault(s, 20, b"[nvme] CreateIoSQ failed\0"),
             CqeResult::Ok => {
                 s.io_sq_tail = 0;
-                s.state = S_WRITE_ONCE;
+                s.state = S_READ_LBA0;
                 s.substate = 0;
                 0
             }
@@ -938,11 +915,15 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
     }
 }
 
-/// Submit a 1-block Write command on the I/O SQ for `lba`, sourcing
-/// DMA from `dma_buf`. Boot-time WRITE_ONCE uses `read_buf`;
-/// consumer-driven writes via `req_in` use `write_buf` so they don't
-/// alias an in-flight read.
-unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, cid: u16, dma_buf: u64) {
+/// Submit an N-block Write on the I/O SQ for `lba`, sourcing DMA from
+/// `dma_buf`. `nlb` is clamped to [1, MAX_NLB] so a single PRP1 covers
+/// the transfer; callers that want more must split.
+///
+/// `dma_buf` must not alias the read-stream buffer — pump_requests uses
+/// `write_buf` precisely so an incoming write payload cannot clobber an
+/// in-flight read whose consumer hasn't finished draining yet.
+unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16, dma_buf: u64) {
+    let nlb = clamp_nlb(nlb);
     let prp1_pci = dma_buf | PCI_DMA_OFFSET;
     let cdw = [
         ((cid as u32) << 16) | (OPC_WRITE as u32),
@@ -953,7 +934,7 @@ unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, cid: u16, dma_buf: u64) {
         0, 0,
         lba as u32,
         (lba >> 32) as u32,
-        0,
+        (nlb - 1) as u32,   // CDW12: NLB-1 (zero-based)
         0, 0, 0,
     ];
     write_sqe(s.io_sq, s.io_sq_tail, cdw);
@@ -962,65 +943,10 @@ unsafe fn submit_io_write(s: &mut NvmeState, lba: u64, cid: u16, dma_buf: u64) {
     s.wait_start_ms = now_ms(s);
 }
 
-/// One-shot boot-time Write. Zero-pads `write_data[..write_data_len]`
-/// into `read_buf` (512 B) and writes it to `write_lba`. Skipped when
-/// `write_lba == WRITE_LBA_DISABLED`. Acceptance: Linux reads the
-/// expected bytes back from that LBA after a power-off → Fluxor →
-/// power-off → Linux cycle.
-unsafe fn step_write_once(s: &mut NvmeState) -> i32 {
-    if s.write_lba == WRITE_LBA_DISABLED {
-        s.state = S_READ_LBA0;
-        s.substate = 0;
-        return 0;
-    }
-    match s.substate {
-        0 => {
-            log_once(s, b"[nvme] WriteOnce\0");
-            // step_read_lba0 normally allocates `read_buf`; we run
-            // before it, so allocate here on demand. Without this,
-            // PRP1 = `0 | PCI_DMA_OFFSET` and the device DMAs from
-            // fabric address 0 (kernel image), writing arbitrary
-            // bytes to the target LBA.
-            let sys = &*s.syscalls;
-            if s.read_buf == 0 {
-                let p = dev_dma_alloc(sys, PAGE, PAGE);
-                if p == 0 { return fault(s, 29, b"[nvme] WriteOnce buf alloc fail\0"); }
-                s.read_buf = p;
-            }
-            // Zero-pad the block, then copy the payload into the
-            // front. Using write_volatile for the zero fill matches
-            // the rest of the module's pattern for device-visible
-            // writes on a non-cacheable page.
-            let buf = s.read_buf as *mut u32;
-            let mut i = 0usize;
-            while i < (BLOCK_SIZE as usize) / 4 {
-                write_volatile(buf.add(i), 0);
-                i += 1;
-            }
-            let bbuf = s.read_buf as *mut u8;
-            let n = s.write_data_len as usize;
-            let mut j = 0usize;
-            while j < n {
-                write_volatile(bbuf.add(j), *s.write_data.as_ptr().add(j));
-                j += 1;
-            }
-            submit_io_write(s, s.write_lba as u64, CID_WRITE_ONCE, s.read_buf);
-            s.substate = 1;
-            0
-        }
-        _ => match poll_io_cqe(s) {
-            CqeResult::Pending => 0,
-            CqeResult::Timeout => fault(s, 27, b"[nvme] WriteOnce CQE timeout\0"),
-            CqeResult::Failed(_) => fault(s, 28, b"[nvme] WriteOnce failed\0"),
-            CqeResult::Ok => {
-                dev_log(&*s.syscalls, 3,
-                    b"[nvme] WriteOnce ok\0".as_ptr(), 19);
-                s.state = S_READ_LBA0;
-                s.substate = 0;
-                0
-            }
-        }
-    }
+/// Clamp a caller-supplied NLB to the driver's single-PRP1 limit.
+#[inline(always)]
+fn clamp_nlb(nlb: u16) -> u16 {
+    if nlb == 0 { 1 } else if nlb > MAX_NLB { MAX_NLB } else { nlb }
 }
 
 /// One-shot read of LBA 0 via the I/O queue; log boot-sector signature
@@ -1036,24 +962,16 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
                 if p == 0 { return fault(s, 21, b"[nvme] read buf alloc fail\0"); }
                 s.read_buf = p;
             }
-            // Prime the buffer with a sentinel pattern before the
-            // read so a zero-returning (blank) LBA can be distinguished
-            // from a failed DMA in the acceptance log.
+            // Prime the buffer with a sentinel pattern so a
+            // zero-returning (blank) LBA is distinguishable from a
+            // failed DMA in the acceptance log.
             let buf = s.read_buf as *mut u32;
             let mut i = 0usize;
             while i < 1024 {
                 write_volatile(buf.add(i), 0xDEAD_BEEF);
                 i += 1;
             }
-            // If the one-shot boot-write ran, read that LBA back so
-            // emit_lba0_info becomes a Phase-6 round-trip check.
-            // Otherwise fall through to LBA 0 (Phase 4 proof).
-            let readback_lba = if s.write_lba != WRITE_LBA_DISABLED {
-                s.write_lba as u64
-            } else {
-                0
-            };
-            submit_io_read(s, readback_lba, CID_READ_LBA0);
+            submit_io_read(s, 0, 1, CID_READ_LBA0);
             s.substate = 1;
             0
         }
@@ -1079,10 +997,10 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
     }
 }
 
-/// Submit a 1-block Read command on the I/O SQ for `lba`. Data lands
-/// at `s.read_buf`. Used by both Phase 4 (LBA 0 one-shot) and Phase 5
-/// (block-streaming loop).
-unsafe fn submit_io_read(s: &mut NvmeState, lba: u64, cid: u16) {
+/// Submit an N-block Read command on the I/O SQ for `lba`. Data lands
+/// at `s.read_buf`. `nlb` is clamped to [1, MAX_NLB].
+unsafe fn submit_io_read(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16) {
+    let nlb = clamp_nlb(nlb);
     let prp1_pci = s.read_buf | PCI_DMA_OFFSET;
     let cdw = [
         ((cid as u32) << 16) | (OPC_READ as u32),
@@ -1093,7 +1011,7 @@ unsafe fn submit_io_read(s: &mut NvmeState, lba: u64, cid: u16) {
         0, 0,
         lba as u32,         // CDW10: SLBA lo
         (lba >> 32) as u32, // CDW11: SLBA hi
-        0,                  // CDW12: NLB-1 = 0 → 1 block
+        (nlb - 1) as u32,   // CDW12: NLB-1 (zero-based)
         0, 0, 0,
     ];
     write_sqe(s.io_sq, s.io_sq_tail, cdw);
@@ -1144,26 +1062,24 @@ unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
 /// on the `blocks` output channel, matching the contract `sd.blocks →
 /// fat32.blocks` uses today: sequential 512 B byte stream with a
 /// consumer-originated seek via `IOCTL_POLL_NOTIFY`.
-/// Phase 6 write-request pump. Drains 528-byte packets off `req_in`
-/// (header + single-block payload) and issues NVMe Writes. Returns
-/// `true` if the pump owns the I/O queue this tick and block-streaming
-/// should stall (so it doesn't submit a concurrent SQE that would
-/// share `read_buf`).
+/// Write-request pump. Drains `16 + nlb*512` byte packets off `req_in`
+/// (header followed by nlb × 512 bytes of payload) and issues one NVMe
+/// Write per packet. Returns `true` if the pump owns the I/O queue this
+/// tick and block-streaming should stall (so it doesn't submit a
+/// concurrent SQE that would share the CQE slot).
 unsafe fn pump_requests(s: &mut NvmeState) -> bool {
     if s.req_in < 0 { return false; }
     let sys = &*s.syscalls;
 
     match s.req_phase {
         0 => {
-            // Accumulate the 16-byte header.
+            // Accumulate the 16-byte header: { op:u32, lba:u64, nlb:u32 }.
             let need = 16 - s.req_fill as usize;
             let dst = s.req_hdr.as_mut_ptr().add(s.req_fill as usize);
             let n = (sys.channel_read)(s.req_in, dst, need);
             if n <= 0 { return false; }
             s.req_fill += n as u16;
             if s.req_fill as usize == 16 {
-                // Parse: op @ 0..4, lba @ 4..12, nlb @ 12..16. v1 only
-                // handles op=1 (WRITE) with nlb=1 (single-block).
                 let op = u32::from_le_bytes([
                     s.req_hdr[0], s.req_hdr[1], s.req_hdr[2], s.req_hdr[3],
                 ]);
@@ -1171,22 +1087,32 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                     s.req_hdr[4],  s.req_hdr[5],  s.req_hdr[6],  s.req_hdr[7],
                     s.req_hdr[8],  s.req_hdr[9],  s.req_hdr[10], s.req_hdr[11],
                 ]);
+                let nlb = u32::from_le_bytes([
+                    s.req_hdr[12], s.req_hdr[13], s.req_hdr[14], s.req_hdr[15],
+                ]);
                 if op != 1 {
-                    // Unknown op — drop and resync. v1 has no other ops.
                     s.req_fill = 0;
                     dev_log(sys, 3, b"[nvme] req: unknown op\0".as_ptr(), 22);
                     return false;
                 }
+                if nlb == 0 || nlb > MAX_NLB as u32 {
+                    // Producer contract: NLB must fit in one PRP1.
+                    // Larger requests must be split before sending.
+                    fault(s, 33, b"[nvme] req: nlb out of range\0");
+                    return true;
+                }
                 s.req_lba = lba;
+                s.req_nlb = nlb as u16;
                 s.req_fill = 0;
                 s.req_phase = 1;
             }
             true
         }
         1 => {
-            // Accumulate 512 bytes of payload into the dedicated
-            // write_buf so the in-flight read pipeline (which owns
-            // read_buf) is unaffected.
+            // Accumulate `req_nlb * 512` bytes of payload into write_buf
+            // so the in-flight read pipeline (which owns read_buf) is
+            // unaffected. write_buf is a full 4 KB page so any NLB up to
+            // MAX_NLB fits.
             if s.write_buf == 0 {
                 let p = dev_dma_alloc(sys, PAGE, PAGE);
                 if p == 0 {
@@ -1195,18 +1121,19 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 }
                 s.write_buf = p;
             }
-            let need = (BLOCK_SIZE - s.req_fill as u32) as usize;
+            let total = (s.req_nlb as u32) * BLOCK_SIZE;
+            let need = (total - s.req_fill as u32) as usize;
             let dst = (s.write_buf as *mut u8).add(s.req_fill as usize);
             let n = (sys.channel_read)(s.req_in, dst, need);
             if n <= 0 { return true; }
             s.req_fill += n as u16;
-            if s.req_fill as u32 >= BLOCK_SIZE {
+            if s.req_fill as u32 >= total {
                 s.req_phase = 2;
             }
             true
         }
         2 => {
-            submit_io_write(s, s.req_lba, CID_WRITE_ONCE, s.write_buf);
+            submit_io_write(s, s.req_lba, s.req_nlb, CID_IO_WRITE, s.write_buf);
             s.req_phase = 3;
             true
         }
@@ -1277,7 +1204,14 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
                 return 0;
             }
-            submit_io_read(s, s.current_block as u64, CID_READ_LBA0);
+            // Read one block per SQE on the stream path. The primitive
+            // supports `nlb` up to MAX_NLB, but fat32 seeks between
+            // metadata sectors (FAT → data → FAT → ...), so any
+            // prefetched blocks beyond the first would be discarded on
+            // the next seek. Batched reads are reserved for future
+            // producers that stream contiguous spans.
+            s.blk_nlb = 1;
+            submit_io_read(s, s.current_block as u64, 1, CID_READ_LBA0);
             s.blk_phase = BLK_PHASE_READING;
             0
         }
@@ -1300,10 +1234,11 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             }
         },
         _ => {
-            // BLK_PHASE_WRITING: push bytes to the output channel, handle
-            // partial writes + backpressure.
+            // BLK_PHASE_WRITING: push the whole batch byte-by-byte to the
+            // output channel, handling partial writes + backpressure.
             let sys = &*s.syscalls;
-            let remaining = BLOCK_SIZE - (s.write_offset as u32);
+            let batch_bytes = (s.blk_nlb as u32) * BLOCK_SIZE;
+            let remaining = batch_bytes - (s.write_offset as u32);
             let src = (s.read_buf as *const u8).add(s.write_offset as usize);
             let n = (sys.channel_write)(s.blk_out, src, remaining as usize);
             if n < 0 {
@@ -1312,8 +1247,8 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             }
             let written = n as u32;
             s.write_offset += written as u16;
-            if s.write_offset as u32 >= BLOCK_SIZE {
-                s.current_block = s.current_block.wrapping_add(1);
+            if s.write_offset as u32 >= batch_bytes {
+                s.current_block = s.current_block.wrapping_add(s.blk_nlb as u32);
                 s.write_offset = 0;
                 s.blk_phase = BLK_PHASE_IDLE;
             }
@@ -1425,7 +1360,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         S_IDENTIFY_NAMESPACE  => step_identify_namespace(s),
         S_CREATE_IO_CQ        => step_create_io_cq(s),
         S_CREATE_IO_SQ        => step_create_io_sq(s),
-        S_WRITE_ONCE          => step_write_once(s),
         S_READ_LBA0           => step_read_lba0(s),
         S_READY               => step_ready(s),
         _                     => step_fault(s),

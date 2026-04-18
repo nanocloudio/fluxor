@@ -39,6 +39,14 @@ use abi::SyscallTable;
 /// Block size (always 512 for SD/FAT32)
 const BLOCK_SIZE: usize = 512;
 
+/// Max sectors per WRITE packet. Matches `nvme::MAX_NLB` (one 4 KB PRP1
+/// page of LBAs). The batcher folds up to this many contiguous data
+/// sectors into a single request so the nvme driver can issue one Write
+/// SQE per packet instead of one per sector. The packet itself is
+/// drained downstream in 512 B chunks (see `drain_packet`) so it fits
+/// any reasonable channel capacity without requiring hints.
+const MAX_WRITE_NLB: u16 = 8;
+
 /// Maximum files to enumerate
 const MAX_FILES: usize = 128;
 
@@ -405,11 +413,19 @@ struct Fat32State {
     // Post-write size patch.
     w_new_size:            u32,
 
-    // Outbound 528-byte packet staging. Filled before transitioning
+    // Outbound packet staging: 16-byte request header + up to
+    // MAX_WRITE_NLB sectors of payload. Filled before transitioning
     // into WS_SendPacket; drained across ticks (channel ring may take
-    // several ticks to accept all 528 bytes under backpressure).
-    w_outbuf:         [u8; 16 + BLOCK_SIZE],
+    // several ticks to accept the full packet under backpressure).
+    w_outbuf:         [u8; 16 + MAX_WRITE_NLB as usize * BLOCK_SIZE],
     w_outbuf_sent:    u16,
+    /// Total bytes in the current packet (16 + nlb * BLOCK_SIZE). Set by
+    /// stage_header and consumed by drain_packet so the drain knows when
+    /// the packet is fully on the wire.
+    w_outbuf_len:     u16,
+    /// NLB of the in-flight data batch. Used by ws_after_sector to
+    /// advance w_bytes_written and w_sector_in_cluster by `nlb` sectors.
+    w_batch_nlb:      u16,
     w_return_state:   u8,  // where to go after w_outbuf drains
     _pad_wo:          u8,
 }
@@ -466,6 +482,8 @@ impl Fat32State {
         self.w_fsinfo_pending = 0;
         self.w_new_size = 0;
         self.w_outbuf_sent = 0;
+        self.w_outbuf_len = 0;
+        self.w_batch_nlb = 0;
         self.w_return_state = WS_DONE;
         // path, pattern, files, write_file, write_data, w_outbuf are
         // zeroed by the kernel allocator.
@@ -1025,50 +1043,68 @@ unsafe fn patch_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) {
 }
 
 /// Write the 16-byte WRITE-request header { op, lba, nlb } at the
-/// start of `w_outbuf` and reset the drain counter.
-unsafe fn stage_header(s: &mut Fat32State, lba: u32) {
+/// start of `w_outbuf`. Also records the full packet length
+/// (16 + nlb * BLOCK_SIZE) so `drain_packet` knows when the packet is
+/// fully on the wire.
+unsafe fn stage_header(s: &mut Fat32State, lba: u32, nlb: u16) {
     let out = s.w_outbuf.as_mut_ptr();
     let op  = REQ_OP_WRITE.to_le_bytes();
     let lb  = (lba as u64).to_le_bytes();
-    let nlb = 1u32.to_le_bytes();
+    let nb  = (nlb as u32).to_le_bytes();
     let mut i = 0usize;
     while i < 4 { *out.add(i) = op[i]; i += 1; }
     i = 0;
     while i < 8 { *out.add(4 + i) = lb[i]; i += 1; }
     i = 0;
-    while i < 4 { *out.add(12 + i) = nlb[i]; i += 1; }
+    while i < 4 { *out.add(12 + i) = nb[i]; i += 1; }
     s.w_outbuf_sent = 0;
+    s.w_outbuf_len = 16 + (nlb as u16) * (BLOCK_SIZE as u16);
 }
 
 /// Stage a 1-sector WRITE whose payload is `payload_src[..BLOCK_SIZE]`.
+/// Used for FAT / dir / FSINFO updates that always target exactly one
+/// sector.
 unsafe fn stage_packet(s: &mut Fat32State, lba: u32, payload_src: *const u8) {
-    stage_header(s, lba);
+    stage_header(s, lba, 1);
     let out = s.w_outbuf.as_mut_ptr();
     core::ptr::copy_nonoverlapping(payload_src, out.add(16), BLOCK_SIZE);
 }
 
-/// Stage a 1-sector WRITE whose payload is `write_data[off..off+n]`,
-/// zero-padded to a full 512-byte sector for the partial last sector.
-unsafe fn stage_data_sector(s: &mut Fat32State, lba: u32, off: usize, n: usize) {
-    stage_header(s, lba);
+/// Stage an N-sector WRITE whose payload is `write_data[off..off+nlb*512]`,
+/// zero-padded past the end of `write_data_len` (for a partial last batch).
+unsafe fn stage_data_batch(s: &mut Fat32State, lba: u32, nlb: u16, off: usize) {
+    stage_header(s, lba, nlb);
     let out = s.w_outbuf.as_mut_ptr();
-    let src = s.write_data.as_ptr().add(off);
-    core::ptr::copy_nonoverlapping(src, out.add(16), n);
-    let mut z = n;
-    while z < BLOCK_SIZE {
+    let total = (nlb as usize) * BLOCK_SIZE;
+    let wdl = s.write_data_len as usize;
+    let avail = wdl.saturating_sub(off).min(total);
+    if avail > 0 {
+        let src = s.write_data.as_ptr().add(off);
+        core::ptr::copy_nonoverlapping(src, out.add(16), avail);
+    }
+    let mut z = avail;
+    while z < total {
         *out.add(16 + z) = 0;
         z += 1;
     }
 }
 
 /// Drain `w_outbuf` through `write_out_chan`. Returns 1 when the
-/// full 528 bytes are sent, 0 when partial (retry next tick), -1 on
-/// channel error (non-E_AGAIN).
+/// full packet (16 + nlb*512 B, tracked in `w_outbuf_len`) is sent,
+/// 0 when partial (retry next tick), -1 on channel error (non-E_AGAIN).
+///
+/// Writes are issued in sector-sized pieces because the kernel ring is
+/// all-or-nothing per call (kernel/ringbuf.rs): a request larger than
+/// the current free space is rejected with E_AGAIN outright. A one-
+/// sector chunk fits inside the default 2 KB channel buffer so the
+/// producer never has to know the downstream channel's capacity.
 unsafe fn drain_packet(s: &mut Fat32State) -> i32 {
-    let total: usize = 16 + BLOCK_SIZE;
+    const DRAIN_CHUNK: usize = BLOCK_SIZE;
+    let total = s.w_outbuf_len as usize;
     let remaining = total - s.w_outbuf_sent as usize;
+    let want = remaining.min(DRAIN_CHUNK);
     let src = s.w_outbuf.as_ptr().add(s.w_outbuf_sent as usize);
-    let rc = (s.sys().channel_write)(s.write_out_chan, src, remaining);
+    let rc = (s.sys().channel_write)(s.write_out_chan, src, want);
     if rc == E_AGAIN {
         return 0;
     }
@@ -1230,32 +1266,46 @@ unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
     2 // burst into first sector send
 }
 
-/// WS_SEND_SECTOR: stage one sector of payload and transition to the
-/// packet-drain state. `w_sector_in_cluster` + `w_current_cluster`
-/// select the LBA; `w_bytes_written` selects the payload slice.
+/// WS_SEND_SECTOR: stage a contiguous run of data sectors into one
+/// packet and transition to the packet-drain state. The run extends
+/// from `w_sector_in_cluster` up to the min of:
+///   - end of current cluster (cluster walk must happen at that boundary)
+///   - MAX_WRITE_NLB (driver's PRP1-only single-SQE limit)
+///   - remaining payload rounded up to whole sectors
+/// `w_batch_nlb` remembers the size so ws_after_sector can advance
+/// counters by the correct amount.
 unsafe fn ws_send_sector(s: &mut Fat32State) -> i32 {
     let lba = s.data_start_sector
         .wrapping_add((s.w_current_cluster - 2) * (s.sectors_per_cluster as u32))
         .wrapping_add(s.w_sector_in_cluster as u32);
 
     let off = s.w_bytes_written as usize;
-    let remaining = (s.write_data_len as usize).saturating_sub(off);
-    let n = if remaining > BLOCK_SIZE { BLOCK_SIZE } else { remaining };
+    let remaining_bytes = (s.write_data_len as usize).saturating_sub(off);
+    let remaining_sectors = (remaining_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let cluster_remaining = (s.sectors_per_cluster - s.w_sector_in_cluster) as usize;
+    let mut nlb = remaining_sectors
+        .min(cluster_remaining)
+        .min(MAX_WRITE_NLB as usize);
+    if nlb == 0 { nlb = 1; }
+    let nlb = nlb as u16;
 
-    stage_data_sector(s, lba, off, n);
+    stage_data_batch(s, lba, nlb, off);
+    s.w_batch_nlb = nlb;
     enter_send_packet(s, WS_AFTER_SECTOR);
     2 // burst
 }
 
-/// WS_AFTER_SECTOR: advance counters + pick the next action:
+/// WS_AFTER_SECTOR: advance counters by `w_batch_nlb` sectors and pick
+/// the next action:
 ///   - more payload + current cluster has sectors left → WS_SEND_SECTOR
 ///   - more payload + cluster exhausted → WS_WALK_FAT_READ (walk chain
 ///     or, if EOC, start an allocation)
 ///   - all payload written → WS_DIR_READ (size-field update) or
 ///     WS_DONE if new_size == old_size
 unsafe fn ws_after_sector(s: &mut Fat32State) -> i32 {
-    s.w_bytes_written = s.w_bytes_written.saturating_add(BLOCK_SIZE as u32);
-    s.w_sector_in_cluster += 1;
+    let nlb = s.w_batch_nlb as u32;
+    s.w_bytes_written = s.w_bytes_written.saturating_add(nlb * BLOCK_SIZE as u32);
+    s.w_sector_in_cluster = s.w_sector_in_cluster.saturating_add(nlb as u8);
 
     let written = s.w_bytes_written;
     let total   = s.write_data_len as u32;
