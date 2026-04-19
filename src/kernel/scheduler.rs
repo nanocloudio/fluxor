@@ -1033,6 +1033,23 @@ pub fn clear_instantiation_state() {
     unsafe { INSTANTIATION_STATE = core::ptr::null_mut(); INSTANTIATION_IDX = usize::MAX; }
 }
 
+/// Persistent per-module state-pointer shadow. The RP path populates
+/// `SCHED.modules` directly, but the bcm2712 domain-instantiator keeps
+/// modules in `DOMAIN_MODULES` and leaves `SCHED.modules` empty — so a
+/// late-bound registration syscall (e.g. `NVME_BACKING_ENABLE` in
+/// `step_ready`, long after `module_new`) can't find the state through
+/// `SCHED.modules`. This shadow is set by both paths and read as the
+/// second-choice source in `get_module_state`.
+static mut MODULE_STATE_PTR: [*mut u8; MAX_MODULES] =
+    [core::ptr::null_mut(); MAX_MODULES];
+
+/// Publish a module's state pointer for later syscall lookups. Callable
+/// from any platform after a module's state has been allocated.
+pub fn set_module_state_ptr(idx: usize, state: *mut u8) {
+    if idx >= MAX_MODULES { return; }
+    unsafe { (*(&raw mut MODULE_STATE_PTR))[idx] = state; }
+}
+
 pub fn get_module_state(idx: usize) -> *mut u8 {
     if idx >= MAX_MODULES {
         return core::ptr::null_mut();
@@ -1044,7 +1061,11 @@ pub fn get_module_state(idx: usize) -> *mut u8 {
         }
         match &SCHED.modules[idx] {
             ModuleSlot::Dynamic(m) => m.state_ptr(),
-            _ => core::ptr::null_mut(),
+            _ => {
+                // Fall back to the shadow array populated by platforms
+                // that don't store modules in SCHED.modules (bcm2712).
+                (*(&raw const MODULE_STATE_PTR))[idx]
+            }
         }
     }
 }
@@ -1373,6 +1394,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     NameArena::reset();
     crate::kernel::blob_store::unregister();
     crate::kernel::graph_slot::unregister();
+    crate::kernel::nvme_backing::unregister();
     sched.reset();
 
     // Store graph-level sample rate from config header
@@ -1469,6 +1491,15 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // These use the global SCHED directly to avoid borrow conflicts with `edges`.
     compute_domain_exec_orders_static(module_count);
     validate_domains_static(module_count, runtime_edge_count);
+
+    // Log DmaOwned edges so operators can confirm the graph declares them.
+    // Today DmaOwned is a metadata annotation — the scheduler doesn't issue
+    // DC CVAC / DC IVAC at edge handoff because channels are copy-FIFO and
+    // the consumer module (nvme) owns its own streaming buffers. Zero-copy
+    // mailbox edges (buffer_group != 0) are where the scheduler will start
+    // driving cache maintenance automatically; this log line pre-stages
+    // the observability.
+    log_dma_owned_edges(runtime_edge_count);
 
     sched.active_module_count = module_count;
 
@@ -2133,6 +2164,57 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
 /// - Warn on empty domains
 /// - Warn on modules without domain assignment when domains are configured
 /// - Validate cross_core edges connect modules in different domains
+/// Log every edge tagged `EdgeClass::DmaOwned` at graph-prepare time.
+///
+/// Pure observability for now: confirms that the YAML-level annotation
+/// reached the scheduler edge table. The scheduler does NOT yet issue
+/// cache maintenance on DmaOwned handoffs — that work lands with zero-
+/// copy mailbox edges, where the payload buffer is actually shared
+/// between producer and consumer. Streaming-arena buffers live inside
+/// the module (see nvme `write_bufs[]`) and do their own DC CVAC via
+/// the `DMA_FLUSH` syscall before device submission.
+pub fn log_dma_owned_edges(edge_count: usize) {
+    let sched = unsafe { &*(&raw const SCHED) };
+    let mut n = 0usize;
+    for i in 0..edge_count {
+        if i >= MAX_CHANNELS { break; }
+        let e = &sched.edges[i];
+        if let crate::kernel::config::EdgeClass::DmaOwned = e.edge_class {
+            log::info!(
+                "[sched] DmaOwned edge {}→{} (group={})",
+                e.from_module, e.to_module, e.buffer_group,
+            );
+            n += 1;
+        }
+    }
+    if n > 0 {
+        log::info!("[sched] {} DmaOwned edges declared (maintenance deferred)", n);
+    }
+}
+
+/// Same intent as `log_dma_owned_edges`, but walks the config's edge
+/// table directly. Used by the bcm2712 graph setup path, which owns
+/// module/edge instantiation itself and never populates `sched.edges`.
+pub fn log_dma_owned_edges_from_config(
+    edges: &[Option<crate::kernel::config::GraphEdge>],
+) {
+    let mut n = 0usize;
+    for slot in edges.iter() {
+        if let Some(edge) = slot {
+            if let crate::kernel::config::EdgeClass::DmaOwned = edge.edge_class {
+                log::info!(
+                    "[sched] DmaOwned edge {}→{} (group={})",
+                    edge.from_id, edge.to_id, edge.buffer_group,
+                );
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        log::info!("[sched] {} DmaOwned edges declared (maintenance deferred)", n);
+    }
+}
+
 fn validate_domains_static(module_count: usize, edge_count: usize) {
     let sched = unsafe { &*(&raw const SCHED) };
 

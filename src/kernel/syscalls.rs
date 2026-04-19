@@ -445,9 +445,35 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
     let module_idx = scheduler::current_module_index();
     let resolved = crate::kernel::loader::resolve_export_for_module(module_idx, hash)
         .unwrap_or(0);
-    if resolved == 0 { return None; }
+    if resolved == 0 {
+        // Diagnostic: log details once-per-hash so provider/store
+        // registration failures aren't silent. Gated by a static
+        // bit so the log ring doesn't flood on retry loops.
+        static mut LOGGED: u64 = 0;
+        let bit = (hash as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
+        let mask = 1u64 << (bit & 63);
+        if (LOGGED & mask) == 0 {
+            LOGGED |= mask;
+            let (_code, tbl, cnt) = scheduler::get_module_exports(module_idx);
+            log::warn!(
+                "[reg] resolve_export failed: hash={:#x} mod={} exp_tbl={:?} exp_cnt={}",
+                hash, module_idx, tbl, cnt,
+            );
+        }
+        return None;
+    }
     let state = scheduler::get_module_state(module_idx);
-    if state.is_null() { return None; }
+    if state.is_null() {
+        static mut LOGGED_NULL_STATE: bool = false;
+        if !LOGGED_NULL_STATE {
+            LOGGED_NULL_STATE = true;
+            log::warn!(
+                "[reg] state-null: hash={:#x} mod={} resolved={:#x}",
+                hash, module_idx, resolved,
+            );
+        }
+        return None;
+    }
     Some((resolved, state))
 }
 
@@ -749,6 +775,19 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         }
         dev_system::BLOB_PUT | dev_system::BLOB_GET | dev_system::BLOB_DELETE => {
             crate::kernel::blob_store::dispatch(opcode, arg, arg_len)
+        }
+
+        // ── NVMe backing store (forwarded to drivers/nvme) ──
+        dev_system::NVME_BACKING_ENABLE => {
+            match unsafe { resolve_register_target(arg, arg_len) } {
+                Some((f, state)) => {
+                    let dispatch: crate::kernel::nvme_backing::NvmeBackingDispatchFn =
+                        unsafe { core::mem::transmute(f) };
+                    unsafe { crate::kernel::nvme_backing::register(dispatch, state); }
+                    0
+                }
+                None => E_INVAL,
+            }
         }
 
         // ── A/B graph slots (forwarded to modules/foundation/graph_slot) ──

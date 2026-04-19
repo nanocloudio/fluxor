@@ -574,6 +574,26 @@ mod mmu {
             ttbr = in(reg) ttbr,
             tmp = out(reg) _,
         );
+
+        // Publish MAIR/TCR/TTBR0 for the secondary-core trampoline in
+        // `bcm2712_cross_domain.rs`, which reads them with MMU off and
+        // needs the values to already be at PoC.
+        let mair_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_MAIR);
+        let tcr_p  = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_TCR);
+        let ttbr_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_TTBR0);
+        core::ptr::write_volatile(mair_p, MAIR_VALUE);
+        core::ptr::write_volatile(tcr_p, TCR_VALUE);
+        core::ptr::write_volatile(ttbr_p, ttbr);
+        core::arch::asm!(
+            "dc cvac, {m}",
+            "dc cvac, {t}",
+            "dc cvac, {b}",
+            "dsb sy",
+            m = in(reg) mair_p,
+            t = in(reg) tcr_p,
+            b = in(reg) ttbr_p,
+            options(nostack),
+        );
     }
 }
 
@@ -813,6 +833,26 @@ static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = [
 ];
 static mut IRQ_BINDING_COUNT: usize = 0;
 
+/// Sentinel event_handle that tells `irq_handler` to fan out via
+/// `pcie::pcie1_msi_dispatch` instead of signalling a single event. Used
+/// by `register_pcie1_msi_spi` so the brcmstb MSI mux can service all
+/// 32 MSI vectors through one GIC SPI.
+const EVENT_HANDLE_PCIE1_MSI: i32 = -2;
+
+/// Enable `spi_irq` in the GIC distributor and route its fires into
+/// `pcie::pcie1_msi_dispatch` (via the `EVENT_HANDLE_PCIE1_MSI`
+/// sentinel). Returns 0 on success, -ENOMEM if the binding table is
+/// full.
+#[cfg(feature = "board-cm5")]
+pub fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
+    irq_bind(spi_irq, EVENT_HANDLE_PCIE1_MSI, 0)
+}
+
+#[cfg(not(feature = "board-cm5"))]
+pub fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
+    fluxor::kernel::errno::ENOSYS
+}
+
 /// Bind an event to a hardware IRQ. Enables the IRQ in the GIC distributor.
 /// `mmio_base`: if nonzero, the ISR reads offset 0x60 (INTERRUPT_STATUS) and
 /// writes offset 0x64 (INTERRUPT_ACK) to ACK virtio-mmio devices.
@@ -1028,12 +1068,12 @@ static CORE_TICKS: [AtomicU32; 4] = [
     AtomicU32::new(0),
 ];
 
-/// Read the current core's MPIDR Aff0 field (core number 0-3).
+/// Current core number (0-3). Pi 5 encodes it in MPIDR Aff1[15:8].
 #[inline(always)]
 fn current_core_id() -> u8 {
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)); }
-    (mpidr & 0xFF) as u8
+    ((mpidr >> 8) & 0xFF) as u8
 }
 
 #[no_mangle]
@@ -1048,7 +1088,7 @@ unsafe extern "C" fn irq_handler() {
         let core_id = {
             let mpidr: u64;
             core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
-            (mpidr & 0xFF) as usize
+            ((mpidr >> 8) & 0xFF) as usize
         };
         CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
     } else {
@@ -1057,15 +1097,23 @@ unsafe extern "C" fn irq_handler() {
         let mut i = 0;
         while i < n {
             let binding = &IRQ_BINDINGS[i];
-            if binding.irq == irq_id && binding.event_handle >= 0 {
-                // ACK device if mmio_base is set (virtio-mmio)
-                if binding.mmio_base != 0 {
-                    let isr = core::ptr::read_volatile((binding.mmio_base + 0x60) as *const u32);
-                    if isr != 0 {
-                        core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
+            if binding.irq == irq_id {
+                if binding.event_handle == EVENT_HANDLE_PCIE1_MSI {
+                    // brcmstb MSI mux: read + clear MSI_INT_STATUS,
+                    // fan out per-vector events. Keeps total ISR
+                    // cost proportional to the number of pending
+                    // MSIs (typically 1).
+                    let _ = fluxor::kernel::pcie::pcie1_msi_dispatch();
+                } else if binding.event_handle >= 0 {
+                    // ACK device if mmio_base is set (virtio-mmio)
+                    if binding.mmio_base != 0 {
+                        let isr = core::ptr::read_volatile((binding.mmio_base + 0x60) as *const u32);
+                        if isr != 0 {
+                            core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
+                        }
                     }
+                    fluxor::kernel::event::event_signal_from_isr(binding.event_handle);
                 }
-                fluxor::kernel::event::event_signal_from_isr(binding.event_handle);
             }
             i += 1;
         }
@@ -1140,10 +1188,10 @@ global_asm!(
     // up — storing to a symbol here would use the virtual link address,
     // which does not map anywhere real with the MMU off.
     "    mov x19, x0",
-    // ---- E3-S7: Check core ID, park secondary cores ----
+    // Core 0 proceeds; 1-3 park. Pi 5 encodes core at Aff1[15:8].
     "    mrs x0, mpidr_el1",
-    "    and x0, x0, #0xFF",     // Aff0 = core ID
-    "    cbnz x0, .Lpark_core",  // core != 0 → park
+    "    ubfx x0, x0, #8, #8",
+    "    cbnz x0, .Lpark_core",
 
     // ---- Primary core (core 0) continues ----
     // Pi 5 firmware hands off at EL2. Our kernel runs as EL1, so we must
@@ -1260,8 +1308,12 @@ global_asm!(
     // Should never return
     "2:  b 2b",
 
-    // ---- Secondary core parking (E3-S7) ----
-    // WFI: secondary cores sleep until woken by IPI from wake_secondary_cores().
+    // Secondary-core fallback park. On Pi 5, ATF holds cores 1-3 in
+    // its own PSCI-managed state and never dispatches them into
+    // `_start`; `wake_secondary_cores` brings them up through PSCI
+    // CPU_ON, which jumps straight into `secondary_core_trampoline`.
+    // This label only matters for firmware variants that hand cores
+    // 1-3 to the kernel image at boot.
     ".Lpark_core:",
     "    wfi",
     "    b .Lpark_core",
@@ -1521,6 +1573,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                                 channel_idx: cross_ch_idx as u8,
                                 local_out_handle: out_ch,
                                 local_in_handle: in_ch,
+                                pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
                             });
                         }
                     }
@@ -1627,6 +1680,14 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 match result {
                     Ok(loader::StartNewResult::Ready(dm)) => {
                         dm_ref.global_idx[mod_idx] = i as u8;
+                        // Publish state pointer into the scheduler's
+                        // per-module shadow so resolve_register_target
+                        // can find us from a step-time registration
+                        // call (e.g. NVME_BACKING_ENABLE). bcm2712
+                        // keeps modules in DOMAIN_MODULES rather than
+                        // SCHED.modules, so without this, get_module_state
+                        // returns null and every registration fails.
+                        fluxor::kernel::scheduler::set_module_state_ptr(i, dm.state_ptr());
                         dm_ref.modules[mod_idx] = Some(dm);
                         dm_ref.count += 1;
                     }
@@ -1636,6 +1697,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                             match unsafe { pending.try_complete() } {
                                 Ok(Some(dm)) => {
                                     dm_ref.global_idx[mod_idx] = i as u8;
+                                    fluxor::kernel::scheduler::set_module_state_ptr(i, dm.state_ptr());
                                     dm_ref.modules[mod_idx] = Some(dm);
                                     dm_ref.count += 1;
                                     break;
@@ -1666,6 +1728,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         }
         fluxor::kernel::scheduler::set_active_module_count(total);
     }
+
+    // Observability for Layer 2 DmaOwned edges. Same intent as the RP
+    // graph path but reads cfg.graph_edges directly because the bcm2712
+    // platform doesn't mirror edges into scheduler::SCHED.edges.
+    fluxor::kernel::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
 
     // Compute per-domain topological execution order (Kahn's algorithm).
     // Must be done after all modules are instantiated so global_idx is populated.
@@ -2001,8 +2068,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 pump_cross_domain(domain_id);
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
-                if domain_id == 0 && tick % 10000 == 0 && tick > 0 {
-                    log::info!("[sched] alive t={} core={}", tick, core_id);
+                if tick % 10000 == 0 && tick > 0 {
+                    log::info!("[sched] alive t={} core={} domain={}", tick, core_id, domain_id);
                 }
                 // Rebuild bridge. On the primary domain, a pending rebuild
                 // request quiesces every non-primary domain (so mutation of
@@ -2063,40 +2130,76 @@ fn domain_step_all(domain_id: usize) {
     }
 }
 
-/// Pump cross-domain channels for a domain.
+/// Move one slot per edge in each direction between local pipe channels
+/// and their cross-domain SPSC ring. Called from `run_domain_loop` on
+/// every tick; producer and consumer sides of each edge each fire on
+/// the tick of their owning domain.
 ///
-/// Each cross-domain edge stores its local channel handles directly.
-/// Producer side: read from local_out_handle, send to SPSC ring.
-/// Consumer side: recv from SPSC ring, write to local_in_handle.
+/// On the consumer side, the local pipe FIFO is peeked via `POLL_OUT`
+/// before consuming from the SPSC ring — `channel_write` can return a
+/// short write when the FIFO is near-full, and SPSC slots are consumed
+/// in whole-message units, so pulling from the ring first and then
+/// writing to a full FIFO would silently drop the tail.
+///
+/// `IOCTL_NOTIFY` sideband (seek requests and the like) is bridged via
+/// `edge.pending_aux`: the consumer-side pump drains the consumer's
+/// local input aux and stores it there; the producer-side pump drains
+/// it and replays it onto the producer's local output aux.
 fn pump_cross_domain(domain_id: usize) {
     let n_cross = cross_domain::cross_edge_count();
     let mut ei = 0;
     while ei < n_cross {
-        if let Some(edge) = cross_domain::get_cross_edge(ei) {
-            if let Some(ch) = cross_domain::get_cross_channel(edge.channel_idx as usize) {
-                // Producer side: this domain owns the output handle
-                if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
-                    let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
-                    let n = unsafe {
-                        fluxor::kernel::channel::channel_read(
-                            edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
-                        )
-                    };
-                    if n > 0 {
-                        let _ = ch.send(&buf[..n as usize]);
+        let Some(edge) = cross_domain::get_cross_edge(ei) else { ei += 1; continue };
+        let Some(ch) = cross_domain::get_cross_channel(edge.channel_idx as usize) else { ei += 1; continue };
+
+        // Producer side.
+        if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
+            let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+            let n = unsafe {
+                fluxor::kernel::channel::channel_read(
+                    edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
+                )
+            };
+            if n > 0 {
+                let _ = ch.send(&buf[..n as usize]);
+            }
+            let aux = edge.pending_aux.swap(u32::MAX, Ordering::AcqRel);
+            if aux != u32::MAX {
+                let mut val = aux;
+                let _ = fluxor::kernel::channel::channel_ioctl(
+                    edge.local_out_handle,
+                    fluxor::kernel::channel::IOCTL_NOTIFY,
+                    &mut val as *mut u32 as *mut u8,
+                );
+            }
+        }
+
+        // Consumer side.
+        if edge.to_domain == domain_id as u8 && edge.local_in_handle >= 0 {
+            let write_ready = fluxor::kernel::channel::channel_poll(
+                edge.local_in_handle,
+                fluxor::kernel::channel::POLL_OUT,
+            );
+            let can_write = write_ready > 0
+                && (write_ready as u32 & fluxor::kernel::channel::POLL_OUT) != 0;
+            if can_write {
+                let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                if let Some(len) = ch.try_recv(&mut buf) {
+                    unsafe {
+                        fluxor::kernel::channel::channel_write(
+                            edge.local_in_handle, buf.as_ptr(), len,
+                        );
                     }
                 }
-                // Consumer side: this domain owns the input handle
-                if edge.to_domain == domain_id as u8 && edge.local_in_handle >= 0 {
-                    let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
-                    if let Some(len) = ch.try_recv(&mut buf) {
-                        unsafe {
-                            fluxor::kernel::channel::channel_write(
-                                edge.local_in_handle, buf.as_ptr(), len,
-                            );
-                        }
-                    }
-                }
+            }
+            let mut val: u32 = 0;
+            let rc = fluxor::kernel::channel::channel_ioctl(
+                edge.local_in_handle,
+                fluxor::kernel::channel::IOCTL_POLL_NOTIFY,
+                &mut val as *mut u32 as *mut u8,
+            );
+            if rc == fluxor::kernel::channel::CHAN_OK && val != u32::MAX {
+                edge.pending_aux.store(val, Ordering::Release);
             }
         }
         ei += 1;
@@ -2135,6 +2238,7 @@ fn secondary_core_main(domain_id: usize) -> ! {
     uart_puts(b"] started, domain=");
     uart_put_u32(domain_id as u32);
     uart_puts(b"\r\n");
+    log::info!("[core{}] started, domain={}", core_id, domain_id);
 
     // Set up GIC CPU interface for this core
     unsafe {
@@ -2187,7 +2291,8 @@ pub fn wake_secondary_cores() {
             uart_puts(b"\r\n");
 
             let entry = entries[(core_id - 1) as usize];
-            if !cross_domain::wake_core(core_id, entry) {
+            let ok = cross_domain::wake_core(core_id, entry);
+            if !ok {
                 uart_puts(b"[wake] FAILED core ");
                 uart_put_u32(core_id as u32);
                 uart_puts(b"\r\n");
@@ -2451,6 +2556,63 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
             0
         }
+        dev_system::DMA_ALLOC_STREAMING => {
+            if arg.is_null() || arg_len < 16 { return -22; }
+            let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            // Streaming arena stays WB-cacheable. Callers must pair writes
+            // with DMA_FLUSH before device-reads and DMA_INVALIDATE before
+            // CPU-reads of device-written regions.
+            let phys = fluxor::kernel::nic_ring::pcie1_dma_alloc_streaming(size as usize, align as usize);
+            if phys == 0 { return -38; }
+            let pb = (phys as u64).to_le_bytes();
+            core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
+            0
+        }
+        dev_system::DMA_FLUSH => {
+            if arg.is_null() || arg_len < 12 { return -22; }
+            let addr = u64::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]);
+            let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            // Clean (but do not invalidate) by VA range. Caller has just
+            // written to a streaming DMA buffer and is about to hand it
+            // to the device. `dc cvac` pushes dirty lines to PoC so the
+            // device reads the up-to-date data; CPU's copy stays valid.
+            let mut ptr = (addr as usize) & !63;
+            let end = ((addr as usize) + size as usize + 63) & !63;
+            while ptr < end {
+                core::arch::asm!("dc cvac, {}", in(reg) ptr, options(nostack));
+                ptr += 64;
+            }
+            core::arch::asm!("dsb sy");
+            0
+        }
+        dev_system::DMA_INVALIDATE => {
+            if arg.is_null() || arg_len < 12 { return -22; }
+            let addr = u64::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]);
+            let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            // Invalidate by VA range. Device has just DMA'd into the
+            // region; drop any speculatively-loaded stale CPU lines so
+            // the next CPU load returns DMA data. `dc ivac` is the
+            // inverse of cvac — it discards without writeback. Use
+            // `dc civac` semantics if the caller can't guarantee the
+            // buffer was clean (we pick invalidate-only deliberately:
+            // streaming DMA buffers are either wholly CPU-owned or
+            // wholly device-owned at handoff).
+            let mut ptr = (addr as usize) & !63;
+            let end = ((addr as usize) + size as usize + 63) & !63;
+            while ptr < end {
+                core::arch::asm!("dc ivac, {}", in(reg) ptr, options(nostack));
+                ptr += 64;
+            }
+            core::arch::asm!("dsb sy");
+            0
+        }
         dev_system::NIC_BAR_MAP => {
             fluxor::kernel::pcie::syscall_bar_map(arg, arg_len)
         }
@@ -2470,6 +2632,94 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             let _ = arg;
             let _ = arg_len;
             fluxor::kernel::pcie::enumerate() as i32
+        }
+        dev_system::PCIE_CFG_READ32 => {
+            fluxor::kernel::pcie::syscall_cfg_read32(arg, arg_len)
+        }
+        dev_system::PCIE_CFG_WRITE32 => {
+            fluxor::kernel::pcie::syscall_cfg_write32(arg, arg_len)
+        }
+        dev_system::PCIE1_MSI_INIT => {
+            // arg = [spi_irq: u32 LE]
+            if arg.is_null() || arg_len < 4 { return -22; }
+            let spi_irq = u32::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+            ]);
+            if !fluxor::kernel::pcie::pcie1_msi_init() {
+                return fluxor::kernel::errno::ENODEV;
+            }
+            register_pcie1_msi_spi(spi_irq)
+        }
+        dev_system::PCIE1_MSI_ALLOC_VECTOR => {
+            if arg.is_null() || arg_len < 20 { return -22; }
+            let event_handle = i32::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+            ]);
+            match fluxor::kernel::pcie::pcie1_msi_alloc_vector(event_handle) {
+                None => -12, // ENOMEM
+                Some((vec, addr, data)) => {
+                    *arg.add(4) = vec;
+                    *arg.add(5) = 0;
+                    *arg.add(6) = 0;
+                    *arg.add(7) = 0;
+                    let ab = addr.to_le_bytes();
+                    for i in 0..8 { *arg.add(8 + i) = ab[i]; }
+                    let db = data.to_le_bytes();
+                    for i in 0..4 { *arg.add(16 + i) = db[i]; }
+                    0
+                }
+            }
+        }
+        dev_system::BACKING_ARENA_REGISTER => {
+            if arg.is_null() || arg_len < 10 { return -22; }
+            let vpages = u32::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+            ]);
+            let rmax = u32::from_le_bytes([
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]);
+            let bt = match *arg.add(8) {
+                0 => fluxor::kernel::backing_store::BackingType::None,
+                1 => fluxor::kernel::backing_store::BackingType::RamDisk,
+                2 => fluxor::kernel::backing_store::BackingType::Nvme,
+                _ => return -22,
+            };
+            let wb = match *arg.add(9) {
+                0 => fluxor::kernel::backing_store::WritebackPolicy::Deferred,
+                1 => fluxor::kernel::backing_store::WritebackPolicy::WriteThrough,
+                _ => return -22,
+            };
+            let idx = fluxor::kernel::scheduler::current_module_index() as u8;
+            fluxor::kernel::backing_store::backing_register(idx, vpages, rmax, bt, wb)
+        }
+        dev_system::BACKING_ARENA_READ => {
+            if arg.is_null() || arg_len < 14 { return -22; }
+            let arena_id = *arg as usize;
+            let vpage = u32::from_le_bytes([
+                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
+            ]);
+            let buf = u64::from_le_bytes([
+                *arg.add(6),  *arg.add(7),  *arg.add(8),  *arg.add(9),
+                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
+            ]) as *mut u8;
+            fluxor::kernel::backing_store::backing_read(arena_id, vpage, buf)
+        }
+        dev_system::BACKING_ARENA_WRITE => {
+            if arg.is_null() || arg_len < 14 { return -22; }
+            let arena_id = *arg as usize;
+            let vpage = u32::from_le_bytes([
+                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
+            ]);
+            let buf = u64::from_le_bytes([
+                *arg.add(6),  *arg.add(7),  *arg.add(8),  *arg.add(9),
+                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
+            ]) as *const u8;
+            fluxor::kernel::backing_store::backing_write(arena_id, vpage, buf)
+        }
+        dev_system::BACKING_ARENA_FLUSH => {
+            if arg.is_null() || arg_len < 1 { return -22; }
+            let arena_id = *arg as usize;
+            fluxor::kernel::backing_store::backing_flush(arena_id)
         }
         _ => -38, // E_NOSYS
     }

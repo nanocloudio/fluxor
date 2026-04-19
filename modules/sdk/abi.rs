@@ -899,6 +899,38 @@ pub mod dev_system {
     /// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0.
     pub const CACHE_FLUSH_RANGE: u32 = 0x0CE7;
 
+    /// Clean (but do not invalidate) a VA range from data cache (`dc cvac`).
+    /// Use before handing a cacheable buffer to a device that will READ it
+    /// — ensures the device sees the CPU's writes.
+    /// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0.
+    pub const DMA_FLUSH: u32 = 0x0CEA;
+
+    /// Invalidate a VA range from data cache (`dc ivac`) without cleaning.
+    /// Use before reading a cacheable buffer that a device has just WRITTEN
+    /// — drops any stale CPU cache lines so the next load returns DMA data.
+    /// handle=-1, arg=[addr:u64 LE, size:u32 LE] (12 bytes). Returns 0.
+    pub const DMA_INVALIDATE: u32 = 0x0CEB;
+
+    /// Allocate physically contiguous DMA memory from a STREAMING (cacheable)
+    /// arena reachable by PCIe1 (aarch64 only). Unlike `DMA_ALLOC_CONTIG`
+    /// which returns Normal-Non-Cacheable memory for simple coherent DMA,
+    /// streaming memory is normal WB-WA — callers MUST pair writes with
+    /// `DMA_FLUSH` before device reads and `DMA_INVALIDATE` before CPU reads
+    /// of device-written regions.
+    /// handle=-1, arg=[size:u32 LE, align:u32 LE] (8 bytes input).
+    /// On success, writes phys_addr:u64 LE to arg[8..16]. Returns 0 or
+    /// negative errno.
+    pub const DMA_ALLOC_STREAMING: u32 = 0x0CEC;
+
+    /// Register an NVMe module as the paged-arena backing store provider.
+    /// handle=-1, arg=[fn_addr:u32 LE] — FNV-1a hash of the exported
+    /// dispatch symbol (or raw function address, resolved module-local).
+    /// The kernel stores `(dispatch, state)` and routes pager read/write
+    /// for arenas registered with `BackingType::Nvme`. Returns 0 or
+    /// negative errno. See `src/kernel/nvme_backing.rs` for the
+    /// dispatch contract (op constants + arg layout).
+    pub const NVME_BACKING_ENABLE: u32 = 0x0CED;
+
     // ── NIC kernel-bypass ────────────────────────────────────────────────
 
     /// Map a PCIe device BAR into kernel virtual address space.
@@ -913,6 +945,37 @@ pub mod dev_system {
     /// platforms where the link trains slowly (Pi 5 NVMe HAT+ PCIe1).
     /// handle=-1, arg=[] (unused). Returns new device count.
     pub const PCIE_RESCAN: u32 = 0x0CF5;
+    /// Read 32-bit word from a discovered device's PCI configuration
+    /// space. handle=-1, arg=[dev_idx:u8, _pad:u8, offset:u16 LE] (4 bytes
+    /// input). On success, writes value:u32 LE to arg[4..8]. Returns 0
+    /// or negative errno.
+    pub const PCIE_CFG_READ32: u32 = 0x0CF6;
+    /// Write 32-bit word to a discovered device's PCI configuration
+    /// space. handle=-1, arg=[dev_idx:u8, _pad:u8, offset:u16 LE,
+    ///                        value:u32 LE] (8 bytes).
+    /// Returns 0 or negative errno.
+    pub const PCIE_CFG_WRITE32: u32 = 0x0CF7;
+
+    /// Register a backing-store arena for the calling module. Module
+    /// index is taken from the scheduler's `current_module_index`; an
+    /// arena id is returned. Used by test modules to exercise the
+    /// `BackingType::Nvme` → `nvme_backing_dispatch` chain without
+    /// needing the full paged-arena config pipeline.
+    /// handle=-1, arg=[virtual_pages:u32 LE, resident_max:u32 LE,
+    ///                 backing_type:u8 (0=None,1=RamDisk,2=Nvme),
+    ///                 writeback:u8 (0=Deferred,1=WriteThrough)] (10 bytes).
+    /// Returns arena_id (>=0) or negative errno.
+    pub const BACKING_ARENA_REGISTER: u32 = 0x0CEE;
+    /// Read one 4 KB page from a registered arena into `buf`.
+    /// handle=-1, arg=[arena_id:u8, _pad:u8, vpage_idx:u32 LE,
+    ///                 buf_ptr:u64 LE] (14 bytes). Returns 0 or errno.
+    pub const BACKING_ARENA_READ: u32 = 0x0CEF;
+    /// Write one 4 KB page from `buf` to a registered arena.
+    /// Same arg shape as BACKING_ARENA_READ.
+    pub const BACKING_ARENA_WRITE: u32 = 0x0CFE;
+    /// Flush any pending writes for a registered arena.
+    /// handle=-1, arg=[arena_id:u8] (1 byte). Returns 0 or errno.
+    pub const BACKING_ARENA_FLUSH: u32 = 0x0CFF;
     /// Create a NIC DMA ring (RX+TX descriptors + buffer pool).
     /// handle=-1, arg=[rx_desc_count:u16, tx_desc_count:u16, buf_size:u16, buf_count:u16] (8 bytes).
     /// Returns ring handle (>=0) or negative errno.
@@ -930,6 +993,22 @@ pub mod dev_system {
     pub const SMMU_UNMAP_DMA: u32 = 0x0CFC;
     /// Check for SMMU faults. handle=-1, arg=unused.
     pub const SMMU_FAULT_CHECK: u32 = 0x0CFD;
+    /// Initialise the brcmstb PCIe1 MSI controller. Idempotent.
+    /// handle=-1, arg=[spi_irq: u32 LE] (4 bytes) — the GIC SPI the
+    /// RC multiplexes all MSIs into. On success the kernel programs
+    /// MSI_TARGET, MSI_DATA, unmasks all 32 vectors, and registers
+    /// an IRQ handler that drains MSI_INT_STATUS per fire and
+    /// forwards to per-vector events registered via
+    /// `PCIE1_MSI_ALLOC_VECTOR`. Returns 0 or negative errno.
+    pub const PCIE1_MSI_INIT: u32 = 0x0CD0;
+    /// Allocate an MSI vector for `event_handle`. Returns, on
+    /// success, the tuple (vector_index, target_addr, data_value)
+    /// the caller writes into its MSI-X table entry.
+    /// handle=-1, arg=[event_handle: i32 LE] (input, 4 bytes). On
+    /// success writes [vector: u8][_pad: u8][_pad: u16][target_addr:
+    /// u64 LE][data: u32 LE] at offset 4 (caller must pass >= 20 B).
+    /// Returns 0 or negative errno.
+    pub const PCIE1_MSI_ALLOC_VECTOR: u32 = 0x0CD1;
 }
 
 /// Flash sideband operation kinds

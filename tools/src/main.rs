@@ -1437,7 +1437,7 @@ fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
 
 fn cmd_mktable_config(config_path: &PathBuf, modules_dirs: &[PathBuf], output: &PathBuf) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
-    let config: serde_json::Value = if config_path
+    let mut config: serde_json::Value = if config_path
         .extension()
         .is_some_and(|ext| ext == "yaml" || ext == "yml")
     {
@@ -1445,6 +1445,13 @@ fn cmd_mktable_config(config_path: &PathBuf, modules_dirs: &[PathBuf], output: &
     } else {
         serde_json::from_str(&content)?
     };
+
+    // Apply platform-stack injection so configs using e.g.
+    // `platform: storage: { media: nvme }` report the full injected
+    // module set — matches the behaviour of `combine` / `validate`.
+    let target_desc = resolve_target(&config, None)?;
+    let project_root = std::env::current_dir().unwrap_or_default();
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     let primary_dir = if modules_dirs.is_empty() {
         return Err(Error::Module("--modules-dir is required".into()));

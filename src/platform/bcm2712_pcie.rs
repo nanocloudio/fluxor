@@ -308,6 +308,41 @@ mod brcm {
     pub const MDIO_WR_DATA:         u64 = 0x1104;
     pub const MDIO_DATA_DONE:       u32 = 1 << 31;
     pub const MDIO_SET_ADDR_OFFSET: u8  = 0x1f;
+
+    // --- brcmstb MSI controller (Linux pcie-brcmstb.c v6.12) ---
+    //
+    // RC-internal registers. A PCIe endpoint write posted to
+    // `MSI_TARGET_ADDR` is intercepted by the RC MSI mux, decoded via
+    // the match pattern in MSI_DATA_CONFIG, and raised as a single
+    // GIC SPI. The low 5 bits of the incoming data select the vector.
+    //
+    // On BCM7712 (Pi 5) the MSI block lives at MSI_INTR2_BASE (0x4500)
+    // with 32 vectors; the legacy INTR2_CPU path is for older silicon
+    // and is not supported here.
+    pub const MSI_BAR_CONFIG_LO:      u64 = 0x4044;
+    pub const MSI_BAR_CONFIG_HI:      u64 = 0x4048;
+    pub const MSI_DATA_CONFIG:        u64 = 0x404c;
+    /// Match-mask (top 16) | match-value (bottom 16).
+    pub const MSI_DATA_CONFIG_VAL_32: u32 = 0xffe0_6540;
+    /// Bit 0 of MSI_BAR_CONFIG_LO doubles as the MSI-Enable bit.
+    pub const MSI_BAR_ENABLE:         u32 = 0x1;
+    /// RC-internal address the endpoint posts MSI writes to (the RC
+    /// intercepts and never forwards to DRAM).
+    pub const MSI_TARGET_ADDR:        u64 = 0x0_FFFF_FFFC;
+
+    /// Offsets inside the MSI intr block: STATUS, CLR, MASK_SET/CLR.
+    pub const MSI_INTR2_BASE:   u64 = 0x4500;
+    pub const MSI_INT_STATUS:   u64 = 0x0;
+    pub const MSI_INT_CLR:      u64 = 0x8;
+    pub const MSI_INT_MASK_SET: u64 = 0x10;
+    pub const MSI_INT_MASK_CLR: u64 = 0x14;
+
+    pub const MSI_VECTOR_COUNT: u32 = 32;
+    pub const MSI_MASK_ALL:     u32 = 0xFFFF_FFFF;
+
+    /// PCIe HW revision register; refuse MSI bring-up below rev 3.3.
+    pub const MISC_REVISION: u64 = 0x406c;
+    pub const HW_REV_33:     u32 = 0x0303;
 }
 
 /// Post-probe target values captured on the rig under Linux
@@ -744,21 +779,16 @@ pub fn enumerate() -> usize {
         // early link-up) can stall the UBUS indefinitely.
         rc_w32(rc, brcm::RC_CFG_RETRY_TIMEOUT, post_probe::RC_CFG_RETRY);
 
-        // Full inbound setup — match Linux brcm_pcie_setup ordering
-        // for BCM2712, writing at boot (after MISC_CTRL, before MDIO /
-        // PERST#). All values from
-        // hw/nvme_trace/baseline/pcie1_rc_post_probe_v3.txt.
+        // Inbound setup — match Linux brcm_pcie_setup ordering for
+        // BCM2712, writing after MISC_CTRL and before MDIO / PERST#.
+        // Values from hw/nvme_trace/baseline/pcie1_rc_post_probe_v3.txt.
         //
-        // Earlier sessions (see pi5_pcie1_bringup_blocker memory)
-        // found that UBUS_CTRL / UBUS_TIMEOUT / AXI_INTF_CTRL /
-        // AXI_READ_ERR_DATA hang the kernel when written at RESCAN
-        // (after the link is trained and UBUS has live traffic).
-        // Writing them here, before MDIO and PERST#, matches Linux
-        // and has not been attempted until this session.
-        //
-        // Without UBUS_CTRL + AXI_INTF_CTRL the inbound BAR2 writes
-        // land in the register but don't open the DMA path — the
-        // device's master TLPs don't MA but also don't land in DRAM.
+        // Writing UBUS_CTRL / UBUS_TIMEOUT / AXI_INTF_CTRL /
+        // AXI_READ_ERR_DATA after the link has trained (e.g. on a
+        // rescan with live UBUS traffic) hangs the kernel, so these
+        // must land during the one-shot bring-up window only. Without
+        // them the inbound BAR2 write path doesn't open — device
+        // master TLPs don't MA but don't reach DRAM either.
         rc_w32(rc, brcm::UBUS_CTRL,         post_probe::UBUS_CTRL);
         rc_w32(rc, brcm::UBUS_TIMEOUT,      post_probe::UBUS_TIMEOUT);
         rc_w32(rc, brcm::AXI_INTF_CTRL,     post_probe::AXI_INTF_CTRL);
@@ -882,6 +912,77 @@ pub fn get_device(idx: usize) -> Option<&'static PcieDevice> {
 
 pub fn device_count() -> usize { unsafe { DEVICE_COUNT } }
 
+/// Read a 32-bit value from a discovered device's PCI configuration
+/// space. `dev_idx` refers to the position in `DEVICES` populated by
+/// the last `enumerate()` call; `offset` is the byte offset within
+/// config space (must be 4-byte aligned; low 2 bits are ignored).
+/// Returns 0xFFFFFFFF on out-of-range arguments (same sentinel a real
+/// PCIe controller returns for a missing responder).
+#[cfg(feature = "board-cm5")]
+pub fn device_cfg_read32(dev_idx: usize, offset: u16) -> u32 {
+    unsafe {
+        let count = *core::ptr::addr_of!(DEVICE_COUNT);
+        if dev_idx >= count {
+            return 0xFFFF_FFFF;
+        }
+        let dev = &DEVICES[dev_idx];
+        let rc = BCM2712_PCIE1_RC_BASE;
+        cfg_r32(rc, dev.bus, dev.dev, dev.func, offset & 0xFFC)
+    }
+}
+
+#[cfg(not(feature = "board-cm5"))]
+pub fn device_cfg_read32(_dev_idx: usize, _offset: u16) -> u32 {
+    0xFFFF_FFFF
+}
+
+/// Write a 32-bit value into a discovered device's PCI configuration
+/// space. Returns 0 on success or `-EINVAL` for an out-of-range
+/// `dev_idx`.
+#[cfg(feature = "board-cm5")]
+pub fn device_cfg_write32(dev_idx: usize, offset: u16, val: u32) -> i32 {
+    unsafe {
+        let count = *core::ptr::addr_of!(DEVICE_COUNT);
+        if dev_idx >= count {
+            return crate::kernel::errno::EINVAL;
+        }
+        let dev = &DEVICES[dev_idx];
+        let rc = BCM2712_PCIE1_RC_BASE;
+        cfg_w32(rc, dev.bus, dev.dev, dev.func, offset & 0xFFC, val);
+        0
+    }
+}
+
+#[cfg(not(feature = "board-cm5"))]
+pub fn device_cfg_write32(_dev_idx: usize, _offset: u16, _val: u32) -> i32 {
+    crate::kernel::errno::ENOSYS
+}
+
+/// Syscall handler for `PCIE_CFG_READ32`. Arg layout:
+///   in:  `[dev_idx: u8][_pad: u8][offset: u16 LE]` (4 bytes)
+///   out: `[value: u32 LE]` appended at offset 4 (caller must pass >= 8 B).
+/// Returns 0 on success, -22 on malformed arg.
+pub unsafe fn syscall_cfg_read32(arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 8 { return -22; }
+    let dev_idx = *arg as usize;
+    let offset = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
+    let val = device_cfg_read32(dev_idx, offset);
+    let vb = val.to_le_bytes();
+    *arg.add(4) = vb[0]; *arg.add(5) = vb[1]; *arg.add(6) = vb[2]; *arg.add(7) = vb[3];
+    0
+}
+
+/// Syscall handler for `PCIE_CFG_WRITE32`. Arg layout:
+///   in:  `[dev_idx: u8][_pad: u8][offset: u16 LE][value: u32 LE]` (8 bytes).
+/// Returns 0 on success, -22 on malformed arg.
+pub unsafe fn syscall_cfg_write32(arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 8 { return -22; }
+    let dev_idx = *arg as usize;
+    let offset = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
+    let val = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+    device_cfg_write32(dev_idx, offset, val)
+}
+
 // ============================================================================
 // BAR mapping
 // ============================================================================
@@ -976,3 +1077,157 @@ pub unsafe fn syscall_bar_unmap(arg: *mut u8, arg_len: usize) -> i32 {
     let virt = u64::from_le_bytes(addr_buf) as usize;
     bar_unmap(virt)
 }
+
+// ============================================================================
+// brcmstb PCIe1 MSI controller
+// ============================================================================
+//
+// Port of `brcm_msi_set_regs` + `brcm_pcie_msi_isr` from Linux
+// drivers/pci/controller/pcie-brcmstb.c v6.12, narrowed to the Pi 5
+// BCM7712 IP variant (rev 0x0500, 32 MSIs, MSI_INTR2_BASE at 0x4500).
+//
+//   `pcie1_msi_init` programs the RC MSI target/data registers and
+//     unmasks all 32 vectors. Idempotent.
+//   `pcie1_msi_alloc_vector` binds a free vector to a caller-owned
+//     event fd and returns `(vector, target_addr, data)` for the
+//     peripheral's MSI-X table entry.
+//   `pcie1_msi_dispatch` reads MSI_INT_STATUS, signals each pending
+//     vector's event, and acks via MSI_INT_CLR. Called from the GIC
+//     SPI handler in `bcm2712.rs`.
+//
+// Nothing here runs unless a driver opts in via `PCIE1_MSI_INIT` +
+// `PCIE1_MSI_ALLOC_VECTOR` syscalls (e.g. nvme with `irq_mode=1`).
+
+#[cfg(feature = "board-cm5")]
+pub const PCIE1_MSI_VECTORS: usize = 32;
+
+#[cfg(feature = "board-cm5")]
+#[derive(Clone, Copy)]
+struct MsiVector {
+    event_handle: i32,
+    active: bool,
+}
+
+#[cfg(feature = "board-cm5")]
+impl MsiVector {
+    const fn empty() -> Self {
+        Self { event_handle: -1, active: false }
+    }
+}
+
+#[cfg(feature = "board-cm5")]
+static mut PCIE1_MSI_VECTORS_TAB: [MsiVector; PCIE1_MSI_VECTORS] =
+    [const { MsiVector::empty() }; PCIE1_MSI_VECTORS];
+
+#[cfg(feature = "board-cm5")]
+static mut PCIE1_MSI_INITIALISED: bool = false;
+
+/// Program the brcmstb PCIe1 MSI controller. Idempotent.
+///
+/// Must run after `enumerate()` — the RC registers don't decode until
+/// PCIe1 reset is released and MISC_CTRL has been programmed. Returns
+/// `false` if the RC is unreadable or reports a HW revision older
+/// than 0x0303 (which would require the legacy MSI path — not
+/// supported, BCM7712 is 0x0500).
+#[cfg(feature = "board-cm5")]
+pub unsafe fn pcie1_msi_init() -> bool {
+    if PCIE1_MSI_INITIALISED {
+        return true;
+    }
+    let rc = BCM2712_PCIE1_RC_BASE;
+
+    let rev = rc_r32(rc, brcm::MISC_REVISION) & 0xFFFF;
+    if rev == 0xFFFF || rev < brcm::HW_REV_33 {
+        return false;
+    }
+
+    let target = brcm::MSI_TARGET_ADDR;
+    let intr = rc + brcm::MSI_INTR2_BASE;
+
+    // Mask everything, clear any stale pending bits.
+    core::ptr::write_volatile((intr + brcm::MSI_INT_MASK_SET) as *mut u32,
+                              brcm::MSI_MASK_ALL);
+    core::ptr::write_volatile((intr + brcm::MSI_INT_CLR) as *mut u32,
+                              brcm::MSI_MASK_ALL);
+
+    // Program the RC's MSI target: low 32 bits have ENABLE bit set.
+    rc_w32(rc, brcm::MSI_BAR_CONFIG_LO,
+           (target as u32) | brcm::MSI_BAR_ENABLE);
+    rc_w32(rc, brcm::MSI_BAR_CONFIG_HI, (target >> 32) as u32);
+
+    // DATA_CONFIG match pattern. Bits [31:16] = match-mask (0xffe0 =
+    // bits [15:5]), bits [15:0] = match-value (0x6540). An incoming
+    // MSI write with data `(0x6540 | vec)` where vec ∈ 0..31 is
+    // recognised and posted on MSI_INT_STATUS bit `vec`.
+    rc_w32(rc, brcm::MSI_DATA_CONFIG, brcm::MSI_DATA_CONFIG_VAL_32);
+
+    // Unmask all 32 vectors. Per-vector masking at the MSI-X table
+    // entry is what actually gates each peripheral's interrupts —
+    // the RC-level mask is global.
+    core::ptr::write_volatile((intr + brcm::MSI_INT_MASK_CLR) as *mut u32,
+                              brcm::MSI_MASK_ALL);
+
+    core::arch::asm!("dsb sy");
+
+    PCIE1_MSI_INITIALISED = true;
+    true
+}
+
+/// Allocate a free MSI vector for `event_handle` and return
+/// `(vector_index, target_addr, data_value)`. The caller writes
+/// `address = target_addr`, `data = data_value` into the peripheral's
+/// MSI-X table entry.
+#[cfg(feature = "board-cm5")]
+pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)> {
+    if !PCIE1_MSI_INITIALISED && !pcie1_msi_init() {
+        return None;
+    }
+    for i in 0..PCIE1_MSI_VECTORS {
+        let slot = &mut *core::ptr::addr_of_mut!(PCIE1_MSI_VECTORS_TAB[i]);
+        if !slot.active {
+            slot.active = true;
+            slot.event_handle = event_handle;
+            let data = (brcm::MSI_DATA_CONFIG_VAL_32 & 0xFFFF) | (i as u32);
+            return Some((i as u8, brcm::MSI_TARGET_ADDR, data));
+        }
+    }
+    None
+}
+
+/// Drain pending MSI vectors. Called from the GIC SPI handler when
+/// the PCIe1 MSI SPI fires. Returns the number of events signalled.
+#[cfg(feature = "board-cm5")]
+pub unsafe fn pcie1_msi_dispatch() -> u32 {
+    if !PCIE1_MSI_INITIALISED {
+        return 0;
+    }
+    let intr = BCM2712_PCIE1_RC_BASE + brcm::MSI_INTR2_BASE;
+    let status = core::ptr::read_volatile((intr + brcm::MSI_INT_STATUS) as *const u32);
+    if status == 0 {
+        return 0;
+    }
+    // Ack the snapshot before fanning out so MSIs that arrive during
+    // dispatch accumulate on the next pass instead of being lost.
+    core::ptr::write_volatile((intr + brcm::MSI_INT_CLR) as *mut u32, status);
+
+    let mut signalled = 0u32;
+    let mut bits = status;
+    while bits != 0 {
+        let v = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        if v >= PCIE1_MSI_VECTORS { continue; }
+        let slot = &*core::ptr::addr_of!(PCIE1_MSI_VECTORS_TAB[v]);
+        if slot.active && slot.event_handle >= 0 {
+            crate::kernel::event::event_signal_from_isr(slot.event_handle);
+            signalled += 1;
+        }
+    }
+    signalled
+}
+
+#[cfg(not(feature = "board-cm5"))]
+pub unsafe fn pcie1_msi_init() -> bool { false }
+#[cfg(not(feature = "board-cm5"))]
+pub unsafe fn pcie1_msi_alloc_vector(_e: i32) -> Option<(u8, u64, u32)> { None }
+#[cfg(not(feature = "board-cm5"))]
+pub unsafe fn pcie1_msi_dispatch() -> u32 { 0 }

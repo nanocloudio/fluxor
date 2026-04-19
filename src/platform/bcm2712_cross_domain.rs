@@ -255,13 +255,14 @@ impl CrossDomainChannel {
     }
 }
 
-/// Read MPIDR Aff0 (core number) inline for SPSC enforcement.
+/// Read MPIDR core number inline for SPSC enforcement. Pi 5 encodes
+/// the core ID in Aff1 (bits [15:8]); Aff0 is 0 on every core.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn current_core_id_inline() -> u32 {
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)); }
-    (mpidr & 0xFF) as u32
+    ((mpidr >> 8) & 0xFF) as u32
 }
 
 // Static channel pool
@@ -292,48 +293,56 @@ pub fn get_cross_channel(idx: usize) -> Option<&'static CrossDomainChannel> {
 }
 
 // ============================================================================
-// Secondary core wake — Pi 5 mailbox addresses
+// Secondary core wake
 // ============================================================================
-
-/// Pi 5 (BCM2712) spin-table mailbox addresses for secondary cores.
-/// The ARM stub parks cores 1-3 in a WFE loop polling these addresses.
-/// Writing a non-zero function pointer wakes the core.
-#[cfg(feature = "board-cm5")]
-const PI5_MAILBOX: [usize; 3] = [
-    0xd8, // Core 1
-    0xe0, // Core 2
-    0xe8, // Core 3
-];
 
 /// Per-core stack size (16 KB each).
 pub const CORE_STACK_SIZE: usize = 16 * 1024;
 
-/// Stack storage for secondary cores. Each core gets its own stack region.
-/// Aligned to 16 bytes (AArch64 SP alignment requirement).
+/// Stack storage for secondary cores. 16-byte aligned per AArch64 SP
+/// alignment requirement.
 #[repr(C, align(16))]
 struct CoreStacks([[u8; CORE_STACK_SIZE]; MAX_SECONDARY_CORES]);
 static mut CORE_STACKS: CoreStacks = CoreStacks([[0u8; CORE_STACK_SIZE]; MAX_SECONDARY_CORES]);
 
-/// Per-core entry function pointers, set by `wake_core()` before writing mailbox.
+/// Per-core entry function pointer, set by `wake_core` and invoked by
+/// the trampoline after it finishes CPU bring-up.
 static mut CORE_ENTRIES: [Option<fn() -> !>; MAX_SECONDARY_CORES] = [None; MAX_SECONDARY_CORES];
 
-/// Status: whether each secondary core has started.
+/// 1 once the secondary has reached `secondary_core_entry`. Cleared
+/// to 0 on boot.
 static CORE_STARTED: [AtomicU32; MAX_SECONDARY_CORES] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
 ];
 
-/// Wake a secondary core on Pi 5 (BCM2712).
+/// Last PSCI CPU_ON return code per core — surfaced by the primary
+/// scheduler heartbeat as `[wake] core=N psci_rc=R` so a rig log
+/// records the ATF response without needing UART access.
+/// `i32::MAX` means the core was never woken.
+static LAST_PSCI_RET: [core::sync::atomic::AtomicI32; MAX_SECONDARY_CORES] = [
+    core::sync::atomic::AtomicI32::new(i32::MAX),
+    core::sync::atomic::AtomicI32::new(i32::MAX),
+    core::sync::atomic::AtomicI32::new(i32::MAX),
+];
+
+pub fn last_psci_ret(core_id: u8) -> i32 {
+    if core_id == 0 || core_id > 3 { return i32::MAX; }
+    LAST_PSCI_RET[(core_id - 1) as usize].load(Ordering::Relaxed)
+}
+
+/// Wake a secondary core on Pi 5 (BCM2712) via PSCI CPU_ON.
 ///
-/// Writes the trampoline address to the spin-table mailbox for the given core.
-/// The trampoline sets up the stack, enables NEON, and calls the entry function.
+/// Pi 5 firmware ships ATF at EL3 with PSCI configured for SMC. The
+/// kernel runs at EL1, SMC traps to EL3, and ATF jumps the target core
+/// to `entry_point` with MMU off at EL2. `target_cpu` must be the
+/// MPIDR of the requested core — Pi 5 encodes the core ID in Aff1
+/// (bits [15:8]), so for core N we pass `N << 8`.
 ///
 /// `core_id`: 1, 2, or 3 (core 0 is the boot core).
-/// `entry`: function that the secondary core will execute (never returns).
-///
-/// On QEMU virt, secondary cores use PSCI CPU_ON — this is a stub there.
-/// Returns `true` if the wake was issued, `false` if invalid core_id or already started.
+/// `entry`: function the secondary core will execute (never returns).
+/// Returns `true` if PSCI accepted the request.
 #[cfg(feature = "board-cm5")]
 pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     if core_id == 0 || core_id > 3 {
@@ -341,33 +350,37 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     }
     let idx = (core_id - 1) as usize;
 
-    // Don't wake a core that's already started
     if CORE_STARTED[idx].load(Ordering::Acquire) != 0 {
         return false;
     }
 
-    // Store entry point for the trampoline to pick up
     unsafe { CORE_ENTRIES[idx] = Some(entry); }
 
-    // Write trampoline address to the spin-table mailbox
-    let trampoline_addr = secondary_core_trampoline as usize as u64;
-    let mailbox_addr = PI5_MAILBOX[idx] as *mut u64;
+    let psci_cpu_on: u64 = 0xC4000003;
+    let target_cpu: u64 = (core_id as u64) << 8;
+    let entry_point: u64 = secondary_core_trampoline as usize as u64;
+    let context_id: u64 = 0;
+
+    // Publish CORE_ENTRIES before the woken core reads it.
+    unsafe { core::arch::asm!("dsb sy", options(nomem, nostack)); }
+
+    let ret: u64;
     unsafe {
-        // Data barrier before writing mailbox — ensure CORE_ENTRIES is visible
-        core::arch::asm!("dmb ish", options(nomem, nostack));
-        core::ptr::write_volatile(mailbox_addr, trampoline_addr);
-        // SEV to wake the parked core from WFE
-        core::arch::asm!("dsb sy", "sev", options(nomem, nostack));
+        core::arch::asm!(
+            "smc #0",
+            inout("x0") psci_cpu_on => ret,
+            in("x1") target_cpu,
+            in("x2") entry_point,
+            in("x3") context_id,
+            options(nomem, nostack),
+        );
     }
 
-    true
+    LAST_PSCI_RET[idx].store(ret as i32, Ordering::Relaxed);
+    ret == 0
 }
 
-/// Wake a secondary core on QEMU virt using PSCI CPU_ON (HVC).
-///
-/// PSCI CPU_ON function ID: 0xC4000003 (SMC64/HVC64).
-/// target_cpu: MPIDR of the core to wake.
-/// entry_point: physical address of the entry function.
+/// Wake a secondary core on QEMU virt via PSCI CPU_ON (HVC).
 #[cfg(not(feature = "board-cm5"))]
 pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     if core_id == 0 || core_id > 3 {
@@ -403,65 +416,127 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     ret == 0
 }
 
-/// Trampoline for secondary cores.
+/// Secondary-core entry stub. PSCI (ATF) drops the core here at EL2
+/// with MMU off. The trampoline drops to EL1h, installs core 0's
+/// page tables (so the secondary participates in inner-shareable
+/// cache coherency), enables MMU/caches/NEON, sets up its per-core
+/// stack + exception vectors, and jumps into `secondary_core_entry`.
 ///
-/// Called by the firmware stub (Pi 5) or PSCI (QEMU) after core wake.
-/// Sets up per-core stack, enables NEON/FP, installs exception vectors,
-/// and calls the Rust entry function.
+/// Sharing core 0's TTBR0/MAIR/TCR is what makes cross-core signals
+/// (CORE_STARTED, channel rings, atomics on kernel statics) visible
+/// across cores — without it the secondary's writes would bypass the
+/// coherency protocol and never invalidate core 0's D-cache lines.
 #[no_mangle]
 #[unsafe(naked)]
 unsafe extern "C" fn secondary_core_trampoline() -> ! {
     core::arch::naked_asm!(
-        // Read MPIDR_EL1 to determine which core we are
+        // core_id in x0 = MPIDR_EL1 Aff1.
         "mrs x0, mpidr_el1",
-        "and x0, x0, #0xFF",    // Aff0 = core number (0-3)
+        "lsr x0, x0, #8",
+        "and x0, x0, #0xFF",
 
-        // Enable NEON/FP: CPACR_EL1.FPEN = 0b11
+        // Drop EL2 → EL1h if the firmware handed us off at EL2.
+        "mrs x9, CurrentEL",
+        "cmp x9, #(2 << 2)",
+        "b.ne 2f",
+        "mrs x9, sctlr_el2",
+        "bic x9, x9, #(1 << 0)",
+        "bic x9, x9, #(1 << 2)",
+        "bic x9, x9, #(1 << 12)",
+        "msr sctlr_el2, x9",
+        "isb",
+        "mrs x9, hcr_el2",
+        "mov x10, #(1 << 31)",
+        "orr x9, x9, x10",
+        "msr hcr_el2, x9",
+        "mrs x9, cnthctl_el2",
+        "orr x9, x9, #(1 << 0)",
+        "orr x9, x9, #(1 << 1)",
+        "msr cnthctl_el2, x9",
+        "msr cntvoff_el2, xzr",
+        "mov x9, #0x3c5",               // DAIF masked, EL1h
+        "msr spsr_el2, x9",
+        "adr x9, 2f",
+        "msr elr_el2, x9",
+        "eret",
+        "2:",
+
+        // Clear any residual EL1 MMU/cache state before reinstalling.
+        "mrs x9, sctlr_el1",
+        "bic x9, x9, #(1 << 0)",
+        "bic x9, x9, #(1 << 2)",
+        "bic x9, x9, #(1 << 12)",
+        "msr sctlr_el1, x9",
+        "isb",
+        "ic iallu",
+        "tlbi vmalle1",
+        "dsb sy",
+        "isb",
+
+        // Install core 0's captured page-table values + enable MMU.
+        "ldr x1, ={mair_ptr}",
+        "ldr x1, [x1]",
+        "msr mair_el1, x1",
+        "ldr x1, ={tcr_ptr}",
+        "ldr x1, [x1]",
+        "msr tcr_el1, x1",
+        "ldr x1, ={ttbr_ptr}",
+        "ldr x1, [x1]",
+        "msr ttbr0_el1, x1",
+        "dsb ish",
+        "isb",
+        "mrs x1, sctlr_el1",
+        "orr x1, x1, #(1 << 0)",        // M
+        "orr x1, x1, #(1 << 2)",        // C
+        "orr x1, x1, #(1 << 12)",       // I
+        "msr sctlr_el1, x1",
+        "isb",
+
+        // CPACR_EL1.FPEN = 0b11 → NEON/FP at EL0/EL1.
         "mov x1, #(3 << 20)",
         "msr cpacr_el1, x1",
         "isb",
 
-        // Compute stack pointer: CORE_STACKS + (core_id - 1) * CORE_STACK_SIZE + CORE_STACK_SIZE
-        // (stack grows downward, so SP = top of the core's stack region)
-        "sub x1, x0, #1",       // idx = core_id - 1
+        "msr SPSel, #1",                // SP_EL1
+        "isb",
+
+        // SP = CORE_STACKS + (core_id - 1) * CORE_STACK_SIZE + CORE_STACK_SIZE
+        "sub x1, x0, #1",
         "ldr x2, ={stack_base}",
         "mov x3, #{stack_size}",
-        "madd x2, x1, x3, x2",  // x2 = base + idx * size
-        "add sp, x2, x3",       // sp = base + idx * size + size (top)
+        "madd x2, x1, x3, x2",
+        "add sp, x2, x3",
 
-        // Install exception vectors (same table as core 0)
         "adr x4, exception_vectors",
         "msr vbar_el1, x4",
 
-        // Call into Rust: secondary_core_entry(core_id)
         "bl {entry}",
-
-        // Should never return, but just in case:
+        // secondary_core_entry is -> !; the park is belt-and-braces.
         "1: wfe",
         "b 1b",
 
         stack_base = sym CORE_STACKS,
         stack_size = const CORE_STACK_SIZE,
         entry = sym secondary_core_entry,
+        mair_ptr = sym crate::kernel::SECONDARY_MMU_MAIR,
+        tcr_ptr = sym crate::kernel::SECONDARY_MMU_TCR,
+        ttbr_ptr = sym crate::kernel::SECONDARY_MMU_TTBR0,
     );
 }
 
-/// Rust entry point for secondary cores. Called by the trampoline with core_id in x0.
+/// Rust entry point for secondary cores. Called by the trampoline
+/// with core_id (Aff1) in x0 once MMU is up with core 0's tables.
 #[no_mangle]
 unsafe extern "C" fn secondary_core_entry(core_id: u64) -> ! {
     let idx = (core_id as usize).wrapping_sub(1);
     if idx >= MAX_SECONDARY_CORES {
         loop { core::arch::asm!("wfe"); }
     }
-
-    // Mark this core as started
     CORE_STARTED[idx].store(1, Ordering::Release);
 
-    // Call the registered entry function
     if let Some(entry) = CORE_ENTRIES[idx] {
         entry()
     } else {
-        // No entry registered — park
         loop { core::arch::asm!("wfe"); }
     }
 }
@@ -878,6 +953,12 @@ pub struct CrossDomainEdge {
     pub local_out_handle: i32,
     /// Local channel handle on the consumer side (module reads from this).
     pub local_in_handle: i32,
+    /// Aux-u32 value posted by the consumer via `IOCTL_NOTIFY` on its
+    /// local input handle, forwarded by the producer-side pump via
+    /// `IOCTL_NOTIFY` on the producer's local output handle. Bridges
+    /// seek-style sideband signals across domain boundaries.
+    /// `u32::MAX` = no aux pending.
+    pub pending_aux: core::sync::atomic::AtomicU32,
 }
 
 impl CrossDomainEdge {
@@ -892,6 +973,7 @@ impl CrossDomainEdge {
             channel_idx: 0,
             local_out_handle: -1,
             local_in_handle: -1,
+            pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 }

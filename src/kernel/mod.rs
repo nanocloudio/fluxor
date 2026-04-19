@@ -1,5 +1,19 @@
 //! Kernel syscall surfaces (minimal).
 
+/// Core 0's MMU attributes, published after the primary has set up
+/// its page tables and referenced by `secondary_core_trampoline` to
+/// enable MMU with identical attributes on cores 1-3 (required so
+/// their accesses participate in inner-shareable cache coherency).
+#[cfg(feature = "chip-bcm2712")]
+#[no_mangle]
+pub static mut SECONDARY_MMU_MAIR: u64 = 0;
+#[cfg(feature = "chip-bcm2712")]
+#[no_mangle]
+pub static mut SECONDARY_MMU_TCR: u64 = 0;
+#[cfg(feature = "chip-bcm2712")]
+#[no_mangle]
+pub static mut SECONDARY_MMU_TTBR0: u64 = 0;
+
 pub mod hal;
 pub mod crypto;
 #[cfg(feature = "chip-bcm2712")]
@@ -8,6 +22,7 @@ pub mod key_vault;
 pub mod syscalls;
 pub mod blob_store;
 pub mod graph_slot;
+pub mod nvme_backing;
 pub mod channel;
 pub mod config;
 pub mod scheduler;

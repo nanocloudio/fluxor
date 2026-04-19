@@ -26,6 +26,7 @@ SECTIONS
         KEEP(*(.text.module_flash_store_dispatch*))
         KEEP(*(.text.module_isr_init*))
         KEEP(*(.text.module_isr_entry*))
+        KEEP(*(.text.nvme_backing_dispatch*))
         *(.text*)
         . = ALIGN(8);
     } > FLASH

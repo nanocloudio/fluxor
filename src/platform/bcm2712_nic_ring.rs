@@ -243,6 +243,74 @@ pub fn pcie1_dma_alloc_contig(size: usize, align: usize) -> usize {
 #[cfg(not(feature = "chip-bcm2712"))]
 pub fn pcie1_dma_alloc_contig(_size: usize, _align: usize) -> usize { 0 }
 
+// ----------------------------------------------------------------------------
+// Streaming (cacheable) PCIe1 DMA arena
+// ----------------------------------------------------------------------------
+//
+// Mirror of PCIE1_DMA_ARENA above, but intentionally NOT flipped to
+// Normal-Non-Cacheable by `init_page_tables`. The enclosing 2 MB L2
+// block stays at its default WB-WA cacheable attributes, so CPU writes
+// hit the cache and must be explicitly flushed (`dc cvac`) to reach
+// PoC before any device DMA reads them. Conversely, after a device
+// writes into a streaming buffer the CPU must `dc ivac` before reading
+// so any stale speculatively-loaded line is dropped.
+//
+// Lives as a BSS-backed static so its physical address is identity-
+// mapped and < 4 GB (PCIe1 inbound ATU only covers PCI 0..0xFFFFFFFF).
+// PCI bus addr == arm_addr | PCI_DMA_OFFSET under the BAR1 inbound
+// UBUS REMAP window programmed by the PCIe platform code.
+
+#[cfg(feature = "chip-bcm2712")]
+pub const PCIE1_STREAM_ARENA_SIZE: usize = 2 * 1024 * 1024;
+
+#[cfg(feature = "chip-bcm2712")]
+#[repr(C, align(2097152))]
+struct Pcie1StreamArena([u8; PCIE1_STREAM_ARENA_SIZE]);
+
+#[cfg(feature = "chip-bcm2712")]
+static mut PCIE1_STREAM_ARENA: Pcie1StreamArena = Pcie1StreamArena([0u8; PCIE1_STREAM_ARENA_SIZE]);
+
+#[cfg(feature = "chip-bcm2712")]
+static PCIE1_STREAM_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+/// Return the streaming PCIe1 DMA arena base address (CPU physical ==
+/// identity-mapped virtual). Unlike `pcie1_dma_arena_base`, this region
+/// stays at its default cacheable MAIR attributes.
+#[cfg(feature = "chip-bcm2712")]
+pub fn pcie1_stream_arena_base() -> usize {
+    (&raw const PCIE1_STREAM_ARENA) as *const _ as usize
+}
+
+#[cfg(not(feature = "chip-bcm2712"))]
+pub fn pcie1_stream_arena_base() -> usize { 0 }
+
+/// Allocate physically contiguous STREAMING (cacheable) memory from the
+/// PCIe1 streaming arena. Returns the physical address or 0 on failure.
+/// Callers MUST flush (`dc cvac`) before device-reads and invalidate
+/// (`dc ivac`) before CPU-reads of device-written regions.
+#[cfg(feature = "chip-bcm2712")]
+pub fn pcie1_dma_alloc_streaming(size: usize, align: usize) -> usize {
+    let a = if align < 16 { 16 } else { align };
+    let cur = PCIE1_STREAM_OFFSET.load(Ordering::Relaxed) as usize;
+    let aligned_start = (cur + a - 1) & !(a - 1);
+    let aligned_size = (size + 15) & !15;
+    let new_end = aligned_start + aligned_size;
+    if new_end > PCIE1_STREAM_ARENA_SIZE {
+        return 0;
+    }
+    let prev = PCIE1_STREAM_OFFSET.compare_exchange(
+        cur as u32, new_end as u32,
+        Ordering::AcqRel, Ordering::Relaxed,
+    );
+    match prev {
+        Ok(_) => pcie1_stream_arena_base() + aligned_start,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(not(feature = "chip-bcm2712"))]
+pub fn pcie1_dma_alloc_streaming(_size: usize, _align: usize) -> usize { 0 }
+
 /// NIC ring slots.
 static mut NIC_RINGS: [NicRing; MAX_NIC_RINGS] = [const { NicRing::empty() }; MAX_NIC_RINGS];
 

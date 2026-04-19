@@ -952,6 +952,212 @@ unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     ])
 }
 
+/// Allocate `size` bytes of STREAMING (cacheable WB-WA) DMA memory from
+/// the kernel's PCIe1 streaming arena. Returns the physical address (==
+/// virtual under identity mapping) or 0 on failure.
+///
+/// Streaming buffers must be paired with explicit cache maintenance at
+/// handoff — see `dev_dma_flush` (before device-reads) and
+/// `dev_dma_invalidate` (before CPU-reads of device-written regions).
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> u64 {
+    let mut buf = [0u8; 16];
+    let bp = buf.as_mut_ptr();
+    let sb = size.to_le_bytes();
+    *bp = sb[0]; *bp.add(1) = sb[1]; *bp.add(2) = sb[2]; *bp.add(3) = sb[3];
+    let ab = align.to_le_bytes();
+    *bp.add(4) = ab[0]; *bp.add(5) = ab[1]; *bp.add(6) = ab[2]; *bp.add(7) = ab[3];
+    let rc = (sys.dev_call)(-1, 0x0CEC, bp, 16);
+    if rc != 0 { return 0; }
+    u64::from_le_bytes([
+        *bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11),
+        *bp.add(12), *bp.add(13), *bp.add(14), *bp.add(15),
+    ])
+}
+
+/// Clean a VA range from the data cache (`dc cvac` + `dsb sy`). Call
+/// after writing into a streaming DMA buffer and before handing it to
+/// a device that will read it — ensures the device sees the CPU's writes.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
+    let mut buf = [0u8; 12];
+    let bp = buf.as_mut_ptr();
+    let ab = addr.to_le_bytes();
+    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    let sb = size.to_le_bytes();
+    *bp.add(8) = sb[0]; *bp.add(9) = sb[1]; *bp.add(10) = sb[2]; *bp.add(11) = sb[3];
+    (sys.dev_call)(-1, 0x0CEA, bp, 12)
+}
+
+/// Invalidate a VA range from the data cache (`dc ivac` + `dsb sy`).
+/// Call before reading from a streaming DMA buffer that a device has
+/// just written — drops any stale CPU cache lines so the next load
+/// returns the device-written data.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
+    let mut buf = [0u8; 12];
+    let bp = buf.as_mut_ptr();
+    let ab = addr.to_le_bytes();
+    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    let sb = size.to_le_bytes();
+    *bp.add(8) = sb[0]; *bp.add(9) = sb[1]; *bp.add(10) = sb[2]; *bp.add(11) = sb[3];
+    (sys.dev_call)(-1, 0x0CEB, bp, 12)
+}
+
+/// Read a 32-bit word from a discovered PCIe device's configuration
+/// space. `dev_idx` is a `pcie_scan` device index (also the handle
+/// nvme's `controller_index` refers to). `offset` is the byte offset
+/// within config space, 4-byte aligned (low 2 bits ignored).
+/// Returns 0xFFFFFFFF when the device index is out of range or the
+/// target function did not respond — the same sentinel real PCIe
+/// config cycles return for a missing responder.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u32 {
+    let mut buf = [0u8; 8];
+    let bp = buf.as_mut_ptr();
+    *bp = dev_idx;
+    *bp.add(1) = 0;
+    let ob = offset.to_le_bytes();
+    *bp.add(2) = ob[0]; *bp.add(3) = ob[1];
+    let rc = (sys.dev_call)(-1, 0x0CF6, bp, 8);
+    if rc != 0 { return 0xFFFF_FFFF; }
+    u32::from_le_bytes([*bp.add(4), *bp.add(5), *bp.add(6), *bp.add(7)])
+}
+
+/// Write a 32-bit value into a discovered device's PCI configuration
+/// space. Returns 0 on success, negative errno on failure.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val: u32) -> i32 {
+    let mut buf = [0u8; 8];
+    let bp = buf.as_mut_ptr();
+    *bp = dev_idx;
+    *bp.add(1) = 0;
+    let ob = offset.to_le_bytes();
+    *bp.add(2) = ob[0]; *bp.add(3) = ob[1];
+    let vb = val.to_le_bytes();
+    *bp.add(4) = vb[0]; *bp.add(5) = vb[1]; *bp.add(6) = vb[2]; *bp.add(7) = vb[3];
+    (sys.dev_call)(-1, 0x0CF7, bp, 8)
+}
+
+/// Initialise the brcmstb PCIe1 MSI controller behind GIC SPI
+/// `spi_irq`. Idempotent. Returns 0 on success, negative errno otherwise.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie1_msi_init(sys: &SyscallTable, spi_irq: u32) -> i32 {
+    let mut buf = spi_irq.to_le_bytes();
+    (sys.dev_call)(-1, 0x0CD0, buf.as_mut_ptr(), 4)
+}
+
+/// Allocate an MSI vector for `event_handle` and retrieve the
+/// (target_addr, data) the caller writes into its MSI-X table entry.
+/// Returns `Some((vector, target_addr, data))` on success.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie1_msi_alloc_vector(
+    sys: &SyscallTable,
+    event_handle: i32,
+) -> Option<(u8, u64, u32)> {
+    let mut buf = [0u8; 20];
+    let bp = buf.as_mut_ptr();
+    let eb = event_handle.to_le_bytes();
+    *bp = eb[0]; *bp.add(1) = eb[1]; *bp.add(2) = eb[2]; *bp.add(3) = eb[3];
+    let rc = (sys.dev_call)(-1, 0x0CD1, bp, 20);
+    if rc != 0 { return None; }
+    let vec = *bp.add(4);
+    let addr = u64::from_le_bytes([
+        *bp.add(8),  *bp.add(9),  *bp.add(10), *bp.add(11),
+        *bp.add(12), *bp.add(13), *bp.add(14), *bp.add(15),
+    ]);
+    let data = u32::from_le_bytes([*bp.add(16), *bp.add(17), *bp.add(18), *bp.add(19)]);
+    Some((vec, addr, data))
+}
+
+/// Register a backing-store arena for the calling module. Returns
+/// arena_id (>=0) or negative errno. `backing_type`: 0=None,
+/// 1=RamDisk, 2=Nvme. `writeback`: 0=Deferred, 1=WriteThrough.
+/// When backing_type=Nvme, the NVMe driver module must be loaded
+/// and have registered its `nvme_backing_dispatch` — otherwise
+/// later read/write calls return ENODEV.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_backing_arena_register(
+    sys: &SyscallTable,
+    virtual_pages: u32,
+    resident_max: u32,
+    backing_type: u8,
+    writeback: u8,
+) -> i32 {
+    let mut buf = [0u8; 10];
+    let bp = buf.as_mut_ptr();
+    let vp = virtual_pages.to_le_bytes();
+    *bp = vp[0]; *bp.add(1) = vp[1]; *bp.add(2) = vp[2]; *bp.add(3) = vp[3];
+    let rm = resident_max.to_le_bytes();
+    *bp.add(4) = rm[0]; *bp.add(5) = rm[1]; *bp.add(6) = rm[2]; *bp.add(7) = rm[3];
+    *bp.add(8) = backing_type;
+    *bp.add(9) = writeback;
+    (sys.dev_call)(-1, 0x0CEE, bp, 10)
+}
+
+/// Write one 4 KB page from `buf` to a previously-registered backing
+/// arena. `buf` must point to at least 4096 bytes of readable memory.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_backing_arena_write(
+    sys: &SyscallTable,
+    arena_id: u8,
+    vpage_idx: u32,
+    buf: *const u8,
+) -> i32 {
+    let mut a = [0u8; 14];
+    let bp = a.as_mut_ptr();
+    *bp = arena_id;
+    *bp.add(1) = 0;
+    let vp = vpage_idx.to_le_bytes();
+    *bp.add(2) = vp[0]; *bp.add(3) = vp[1]; *bp.add(4) = vp[2]; *bp.add(5) = vp[3];
+    let pb = (buf as u64).to_le_bytes();
+    *bp.add(6)  = pb[0]; *bp.add(7)  = pb[1]; *bp.add(8)  = pb[2]; *bp.add(9)  = pb[3];
+    *bp.add(10) = pb[4]; *bp.add(11) = pb[5]; *bp.add(12) = pb[6]; *bp.add(13) = pb[7];
+    (sys.dev_call)(-1, 0x0CFE, bp, 14)
+}
+
+/// Read one 4 KB page from a previously-registered backing arena
+/// into `buf`. `buf` must point to at least 4096 bytes of writable
+/// memory.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_backing_arena_read(
+    sys: &SyscallTable,
+    arena_id: u8,
+    vpage_idx: u32,
+    buf: *mut u8,
+) -> i32 {
+    let mut a = [0u8; 14];
+    let bp = a.as_mut_ptr();
+    *bp = arena_id;
+    *bp.add(1) = 0;
+    let vp = vpage_idx.to_le_bytes();
+    *bp.add(2) = vp[0]; *bp.add(3) = vp[1]; *bp.add(4) = vp[2]; *bp.add(5) = vp[3];
+    let pb = (buf as u64).to_le_bytes();
+    *bp.add(6)  = pb[0]; *bp.add(7)  = pb[1]; *bp.add(8)  = pb[2]; *bp.add(9)  = pb[3];
+    *bp.add(10) = pb[4]; *bp.add(11) = pb[5]; *bp.add(12) = pb[6]; *bp.add(13) = pb[7];
+    (sys.dev_call)(-1, 0x0CEF, bp, 14)
+}
+
+/// Flush any pending writes for a backing arena.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
+    let mut a = [arena_id];
+    (sys.dev_call)(-1, 0x0CFF, a.as_mut_ptr(), 1)
+}
+
 // ============================================================================
 // Network Interface helpers
 // ============================================================================

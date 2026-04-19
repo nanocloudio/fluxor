@@ -807,6 +807,8 @@ pub fn pack_fmod(
         // Provider dispatch (resolved by kernel via export hash)
         "module_provider_dispatch",
         "module_flash_store_dispatch",
+        // NVMe → kernel pager bridge (resolved by NVME_BACKING_ENABLE)
+        "nvme_backing_dispatch",
     ];
 
     let mut exports: Vec<(String, u32, u32)> = Vec::new();
