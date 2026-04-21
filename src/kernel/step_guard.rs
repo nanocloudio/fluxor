@@ -72,7 +72,7 @@ pub mod fault_type {
     pub const DRAIN_TIMEOUT: u8 = 5;
 }
 
-/// Per-module fault statistics (queryable via dev_query).
+/// Per-module fault statistics (queryable via `provider_query`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FaultStats {
@@ -158,7 +158,7 @@ impl ModuleFaultInfo {
         self.restart_count < self.max_restarts
     }
 
-    /// Build a FaultStats snapshot for dev_query.
+    /// Build a FaultStats snapshot for `provider_query`.
     pub fn to_stats(&self, current_tick: u32) -> FaultStats {
         let ticks_since = if self.last_fault_tick > 0 && current_tick >= self.last_fault_tick {
             current_tick - self.last_fault_tick

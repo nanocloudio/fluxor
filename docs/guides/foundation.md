@@ -62,10 +62,10 @@ contract surfaces from drivers:
 - timers and events for coordination
 - net_proto frames for networking (see [../architecture/network.md](../architecture/network.md))
 - block I/O channels for storage
-- filesystem (`dev_fs`) dispatch for VFS-style access
+- filesystem (`FS`) contract for VFS-style access
 
-See [../architecture/device_classes.md](../architecture/device_classes.md)
-for the full list of class-level contracts.
+See [../architecture/abi_layers.md](../architecture/abi_layers.md)
+for the full contract inventory.
 
 ## Configuration Model
 
@@ -100,7 +100,7 @@ Foundation modules should define clear behavior for:
 
 ## Related Documentation
 
-- [../architecture/device_classes.md](../architecture/device_classes.md)
+- [../architecture/abi_layers.md](../architecture/abi_layers.md)
 - [../architecture/pipeline.md](../architecture/pipeline.md)
 - [../architecture/network.md](../architecture/network.md)
 - [../architecture/module_architecture.md](../architecture/module_architecture.md)

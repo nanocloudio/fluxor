@@ -1,22 +1,21 @@
 //! SPI Bus Driver — PIC module provider
 //!
 //! Manages SPI bus access for consumer modules (sd, enc28j60, cyw43, st7701s).
-//! Uses the kernel's thin register bridge (SPI_REG_WRITE/READ, SPI_BUS_INFO)
-//! and raw DMA bridge (DMA_ALLOC/START/BUSY/FREE) for transfers.
+//! Uses the kernel's thin register bridge (`spi_raw::REG_WRITE/READ/BUS_INFO`)
+//! and the PLATFORM_DMA contract's channel family for transfers.
 //!
-//! Same role as the kernel SPI driver in rp_providers.rs, but as a PIC module:
-//! registers as the SPI provider (device class 0x02), handles OPEN/CLOSE/
+//! Registers as the HAL_SPI provider (contract id 0x02); handles OPEN/CLOSE/
 //! CONFIGURE/TRANSFER_START/TRANSFER_POLL for all consumer modules.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Consumer module (sd, enc28j60, ...)
-//!   → dev_call(SPI_OPEN/TRANSFER/...)
-//!     → kernel provider dispatch
-//!       → spi PIC module dispatch function
-//!         → SPI_REG_WRITE (kernel bridge, ~5 lines MMIO)
-//!         → DMA_START (kernel bridge, ~10 lines MMIO)
+//!   → provider_call(spi_handle, SPI_OPEN/TRANSFER/...)
+//!     → kernel provider dispatch (HAL_SPI vtable)
+//!       → spi_pl022 provider_dispatch
+//!         → spi_raw::REG_WRITE (kernel bridge, ~5 lines MMIO)
+//!         → channel::START (kernel bridge, ~10 lines MMIO)
 //! ```
 //!
 //! # Transfer Flow
@@ -71,26 +70,24 @@ const DMA_FLAG_SIZE_8: u8 = 0x00;
 struct SpiHandle {
     in_use: u8,
     bus_id: u8,
-    cs_handle: i16,   // GPIO handle for CS, or -1
-    owner: u8,        // module index that opened this handle
     mode: u8,         // SPI mode (CPOL/CPHA)
-    _pad: [u8; 2],
+    owner: u8,        // module index that opened this handle
+    cs_handle: i32,   // GPIO handle for CS, or -1
     freq_hz: u32,
 }
 
 #[repr(C)]
 struct SpiTransfer {
-    tx_ptr: u32,      // TX buffer address (0 = no TX)
-    rx_ptr: u32,      // RX buffer address (0 = no RX)
-    tx_len: u16,
-    rx_len: u16,
-    fill: u8,         // fill byte for RX-only transfers
-    pending: u8,      // 1 = waiting to start
-    active: u8,       // 1 = DMA in progress
+    tx_ptr: *const u8, // TX buffer (null = drive fill byte)
+    rx_ptr: *mut u8,   // RX buffer (null = discard)
+    len: u32,          // shared length for tx + rx (full-duplex)
+    fill: u8,          // fill byte when tx is null
+    pending: u8,       // 1 = waiting to start
+    active: u8,        // 1 = DMA in progress
     _pad: u8,
-    result: i32,      // >0 = bytes transferred, <0 = error, 0 = not done
-    tx_dma_ch: i8,    // allocated TX DMA channel (-1 = none)
-    rx_dma_ch: i8,    // allocated RX DMA channel (-1 = none)
+    result: i32,       // >0 = bytes transferred, <0 = error, 0 = not done
+    tx_dma_ch: i8,     // allocated TX DMA channel (-1 = none)
+    rx_dma_ch: i8,     // allocated RX DMA channel (-1 = none)
     _pad2: [u8; 2],
 }
 
@@ -123,8 +120,19 @@ struct SpiState {
 }
 
 // ============================================================================
-// Register bridge helpers
+// Contract structs + register bridge helpers (opcodes from layered ABI).
 // ============================================================================
+
+use abi::contracts::hal::spi::{OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs};
+use abi::contracts::hal::gpio as hal_gpio;
+
+use abi::platform::rp::spi_raw::{
+    REG_WRITE as SPI_REG_WRITE,
+    REG_READ as SPI_REG_READ,
+    BUS_INFO as SPI_BUS_INFO,
+    PIN_INIT as SPI_PIN_INIT,
+    SET_ENABLE as SPI_SET_ENABLE,
+};
 
 unsafe fn spi_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     let mut buf = [0u8; 5];
@@ -132,21 +140,21 @@ unsafe fn spi_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     *bp = offset;
     let v = val.to_le_bytes();
     *bp.add(1) = v[0]; *bp.add(2) = v[1]; *bp.add(3) = v[2]; *bp.add(4) = v[3];
-    (sys.dev_call)(bus as i32, 0x0CA0, bp, 5);
+    (sys.provider_call)(bus as i32, SPI_REG_WRITE, bp, 5);
 }
 
 unsafe fn spi_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
-    (sys.dev_call)(bus as i32, 0x0CA1, bp, 5);
+    (sys.provider_call)(bus as i32, SPI_REG_READ, bp, 5);
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 
 unsafe fn spi_bus_info(sys: &SyscallTable, bus: u8, info: &mut BusInfo) {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
-    (sys.dev_call)(bus as i32, 0x0CA2, bp, 12);
+    (sys.provider_call)(bus as i32, SPI_BUS_INFO, bp, 12);
     info.dr_addr = u32::from_le_bytes([*bp, *bp.add(1), *bp.add(2), *bp.add(3)]);
     info.tx_dreq = *bp.add(4);
     info.rx_dreq = *bp.add(5);
@@ -155,42 +163,48 @@ unsafe fn spi_bus_info(sys: &SyscallTable, bus: u8, info: &mut BusInfo) {
 
 unsafe fn spi_set_enable(sys: &SyscallTable, bus: u8, enable: bool) {
     let mut buf = [if enable { 1u8 } else { 0u8 }];
-    (sys.dev_call)(bus as i32, 0x0CA4, buf.as_mut_ptr(), 1);
+    (sys.provider_call)(bus as i32, SPI_SET_ENABLE, buf.as_mut_ptr(), 1);
 }
 
 unsafe fn spi_pin_init(sys: &SyscallTable, bus: u8, clk: u8, mosi: u8, miso: u8) {
     let mut buf = [clk, mosi, miso];
-    (sys.dev_call)(bus as i32, 0x0CA3, buf.as_mut_ptr(), 3);
+    (sys.provider_call)(bus as i32, SPI_PIN_INIT, buf.as_mut_ptr(), 3);
 }
 
-// Raw DMA helpers
+// DMA: channel family only. spi_pl022 allocates a raw DMA channel per
+// direction (tx / rx), manually drives each transfer via channel::START,
+// polls with channel::BUSY. All ops are handle-scoped — the handle is
+// the channel number returned by provider_open(PLATFORM_DMA,
+// channel::ALLOC). See `provider::contract::PLATFORM_DMA` for the
+// channel-vs-fd family distinction.
+use abi::platform::rp::dma_raw::channel as dma_channel;
+
+const PLATFORM_DMA: u32 = 0x0008;
+
 unsafe fn dma_alloc(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, 0x0C80, core::ptr::null_mut(), 0)
+    (sys.provider_open)(PLATFORM_DMA, dma_channel::ALLOC, core::ptr::null(), 0)
 }
 
 unsafe fn dma_free(sys: &SyscallTable, ch: u8) {
-    let mut buf = [ch];
-    (sys.dev_call)(-1, 0x0C81, buf.as_mut_ptr(), 1);
+    (sys.provider_call)(ch as i32, dma_channel::FREE, core::ptr::null_mut(), 0);
 }
 
 unsafe fn dma_start(sys: &SyscallTable, ch: u8, read: u32, write: u32, count: u32, dreq: u8, flags: u8) -> i32 {
-    let mut buf = [0u8; 15];
+    let mut buf = [0u8; 14];
     let bp = buf.as_mut_ptr();
-    *bp = ch;
     let r = read.to_le_bytes();
-    *bp.add(1) = r[0]; *bp.add(2) = r[1]; *bp.add(3) = r[2]; *bp.add(4) = r[3];
+    *bp = r[0]; *bp.add(1) = r[1]; *bp.add(2) = r[2]; *bp.add(3) = r[3];
     let w = write.to_le_bytes();
-    *bp.add(5) = w[0]; *bp.add(6) = w[1]; *bp.add(7) = w[2]; *bp.add(8) = w[3];
+    *bp.add(4) = w[0]; *bp.add(5) = w[1]; *bp.add(6) = w[2]; *bp.add(7) = w[3];
     let c = count.to_le_bytes();
-    *bp.add(9) = c[0]; *bp.add(10) = c[1]; *bp.add(11) = c[2]; *bp.add(12) = c[3];
-    *bp.add(13) = dreq;
-    *bp.add(14) = flags;
-    (sys.dev_call)(-1, 0x0C82, bp, 15)
+    *bp.add(8) = c[0]; *bp.add(9) = c[1]; *bp.add(10) = c[2]; *bp.add(11) = c[3];
+    *bp.add(12) = dreq;
+    *bp.add(13) = flags;
+    (sys.provider_call)(ch as i32, dma_channel::START, bp, 14)
 }
 
 unsafe fn dma_busy(sys: &SyscallTable, ch: u8) -> bool {
-    let mut buf = [ch];
-    (sys.dev_call)(-1, 0x0C83, buf.as_mut_ptr(), 1) != 0
+    (sys.provider_call)(ch as i32, dma_channel::BUSY, core::ptr::null_mut(), 0) != 0
 }
 
 // ============================================================================
@@ -253,9 +267,7 @@ unsafe fn start_transfer(s: &mut SpiState, handle_idx: usize) {
         (*bm).current_mode = (*hp).mode;
     }
 
-    let tx_len = (*tp).tx_len as u32;
-    let rx_len = (*tp).rx_len as u32;
-    let len = if tx_len > rx_len { tx_len } else { rx_len };
+    let len = (*tp).len;
     if len == 0 {
         (*tp).result = 1; // zero-length = immediate success
         (*tp).pending = 0;
@@ -276,25 +288,24 @@ unsafe fn start_transfer(s: &mut SpiState, handle_idx: usize) {
     let dr = (*bi).dr_addr;
 
     // Start RX DMA first (so it's ready when TX pushes data)
-    if (*tp).rx_ptr != 0 {
-        dma_start(sys, rx_ch as u8, dr, (*tp).rx_ptr, len,
+    if !(*tp).rx_ptr.is_null() {
+        dma_start(sys, rx_ch as u8, dr, (*tp).rx_ptr as u32, len,
             (*bi).rx_dreq, DMA_FLAG_INCR_WRITE | DMA_FLAG_SIZE_8);
     } else {
-        // No RX buffer — still drain RX FIFO to dev/null
-        // Use a dummy address that doesn't increment
+        // No RX buffer — still drain RX FIFO to dev/null via a non-incrementing write
         dma_start(sys, rx_ch as u8, dr, dr, len,
-            (*bi).rx_dreq, DMA_FLAG_SIZE_8); // no incr_write
+            (*bi).rx_dreq, DMA_FLAG_SIZE_8);
     }
 
     // Start TX DMA
-    if (*tp).tx_ptr != 0 {
-        dma_start(sys, tx_ch as u8, (*tp).tx_ptr, dr, len,
+    if !(*tp).tx_ptr.is_null() {
+        dma_start(sys, tx_ch as u8, (*tp).tx_ptr as u32, dr, len,
             (*bi).tx_dreq, DMA_FLAG_INCR_READ | DMA_FLAG_SIZE_8);
     } else {
         // TX fill: write same byte repeatedly from fill field address
         let fill_addr = &(*tp).fill as *const u8 as u32;
         dma_start(sys, tx_ch as u8, fill_addr, dr, len,
-            (*bi).tx_dreq, DMA_FLAG_SIZE_8); // no incr_read
+            (*bi).tx_dreq, DMA_FLAG_SIZE_8);
     }
 
     (*tp).pending = 0;
@@ -312,9 +323,7 @@ unsafe fn poll_transfer(s: &mut SpiState, handle_idx: usize) {
     }
 
     // Transfer complete
-    let tx_len = (*tp).tx_len as i32;
-    let rx_len = (*tp).rx_len as i32;
-    (*tp).result = if tx_len > rx_len { tx_len } else { rx_len };
+    (*tp).result = (*tp).len as i32;
     (*tp).active = 0;
 
     // Free DMA channels
@@ -323,10 +332,11 @@ unsafe fn poll_transfer(s: &mut SpiState, handle_idx: usize) {
 }
 
 // ============================================================================
-// Provider dispatch (called by kernel when consumer does dev_call SPI class)
+// Provider dispatch (called by kernel when a consumer does provider_call
+// on a HAL_SPI handle).
 // ============================================================================
 
-// These constants match the SPI dev_call opcodes in abi.rs
+// Must match the HAL_SPI contract opcodes in abi::contracts::hal::spi.
 const SPI_OPEN: u32 = 0x0200;
 const SPI_CLOSE: u32 = 0x0201;
 const SPI_BEGIN: u32 = 0x0202;
@@ -338,6 +348,20 @@ const SPI_TRANSFER_START: u32 = 0x0207;
 const SPI_TRANSFER_POLL: u32 = 0x0208;
 const SPI_POLL_BYTE: u32 = 0x0209;
 const SPI_GET_CAPS: u32 = 0x020A;
+
+/// Resolve an incoming handle to a live slot index. Returns `Some(idx)`
+/// only if the handle is in range AND the slot is currently in use.
+/// Used by every per-handle opcode so stale handles (closed, or never
+/// issued by SPI_OPEN but routed here via class-byte fallback) cannot
+/// mutate bus state.
+#[inline]
+unsafe fn live_handle_idx(s: &SpiState, handle: i32) -> Option<usize> {
+    if handle < 0 { return None; }
+    let idx = handle as usize;
+    if idx >= MAX_HANDLES { return None; }
+    if (*s.handles.as_ptr().add(idx)).in_use == 0 { return None; }
+    Some(idx)
+}
 
 // Provider dispatch — called from kernel via registered function pointer.
 // SAFETY: state is our SpiState, validated at registration time.
@@ -356,13 +380,9 @@ pub unsafe extern "C" fn spi_dispatch(
 
     match opcode {
         SPI_OPEN => {
-            // arg=[bus:u8, cs_handle:i16 LE, freq:u32 LE, mode:u8] (8 bytes)
-            if arg.is_null() || arg_len < 8 { return -22; }
-            let bus = *arg;
-            if bus as usize >= MAX_BUSES { return -22; }
-            let cs = i16::from_le_bytes([*arg.add(1), *arg.add(2)]);
-            let freq = u32::from_le_bytes([*arg.add(3), *arg.add(4), *arg.add(5), *arg.add(6)]);
-            let mode = *arg.add(7);
+            if arg.is_null() || arg_len < core::mem::size_of::<SpiOpenArgs>() { return -22; }
+            let args = &*(arg as *const SpiOpenArgs);
+            if args.bus as usize >= MAX_BUSES { return -22; }
 
             // Find free handle
             let mut i = 0usize;
@@ -371,14 +391,18 @@ pub unsafe extern "C" fn spi_dispatch(
                 let hp = s.handles.as_mut_ptr().add(idx);
                 if (*hp).in_use == 0 {
                     (*hp).in_use = 1;
-                    (*hp).bus_id = bus;
-                    (*hp).cs_handle = cs;
-                    (*hp).freq_hz = freq;
-                    (*hp).mode = mode;
+                    (*hp).bus_id = args.bus;
+                    (*hp).cs_handle = args.cs_handle;
+                    (*hp).freq_hz = args.freq_hz;
+                    (*hp).mode = args.mode;
                     (*hp).owner = 0; // TODO: get caller module index
                     s.next_handle = ((idx + 1) % MAX_HANDLES) as u8;
-                    // Clear transfer state
+                    // Clear transfer state so nothing from a previous owner leaks.
                     let tp = s.transfers.as_mut_ptr().add(idx);
+                    (*tp).tx_ptr = core::ptr::null();
+                    (*tp).rx_ptr = core::ptr::null_mut();
+                    (*tp).len = 0;
+                    (*tp).fill = 0;
                     (*tp).pending = 0;
                     (*tp).active = 0;
                     (*tp).result = 0;
@@ -391,41 +415,54 @@ pub unsafe extern "C" fn spi_dispatch(
             -16 // EBUSY
         }
         SPI_CLOSE => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
             let hp = s.handles.as_mut_ptr().add(idx);
-            if (*hp).in_use == 0 { return -22; }
             // Abort any active transfer
             let tp = s.transfers.as_mut_ptr().add(idx);
             if (*tp).tx_dma_ch >= 0 { dma_free(sys, (*tp).tx_dma_ch as u8); }
             if (*tp).rx_dma_ch >= 0 { dma_free(sys, (*tp).rx_dma_ch as u8); }
             (*tp).pending = 0;
             (*tp).active = 0;
+            // Release the bus if this handle owned it.
+            let bus = (*hp).bus_id as usize;
+            if bus < MAX_BUSES {
+                let bi = s.buses.as_mut_ptr().add(bus);
+                if (*bi).bus_owner == idx as i8 { (*bi).bus_owner = -1; }
+            }
             (*hp).in_use = 0;
             0
         }
-        SPI_BEGIN => {
-            // Claim bus for exclusive access
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
-            let hp = s.handles.as_ptr().add(idx);
-            let bus = (*hp).bus_id as usize;
+        SPI_CLAIM => {
+            // Non-blocking try-claim. arg is a u32 timeout in ms that
+            // callers use to pace their own retry loops; this dispatch
+            // itself just attempts the claim once and returns.
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
+            let bus = (*s.handles.as_ptr().add(idx)).bus_id as usize;
             if bus >= MAX_BUSES { return -22; }
             let bi = s.buses.as_mut_ptr().add(bus);
-            if (*bi).bus_owner >= 0 && (*bi).bus_owner != handle as i8 {
+            if (*bi).bus_owner >= 0 && (*bi).bus_owner != idx as i8 {
                 return -16; // EBUSY
             }
-            (*bi).bus_owner = handle as i8;
+            (*bi).bus_owner = idx as i8;
+            0
+        }
+        SPI_BEGIN => {
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
+            let bus = (*s.handles.as_ptr().add(idx)).bus_id as usize;
+            if bus >= MAX_BUSES { return -22; }
+            let bi = s.buses.as_mut_ptr().add(bus);
+            if (*bi).bus_owner >= 0 && (*bi).bus_owner != idx as i8 {
+                return -16; // EBUSY
+            }
+            (*bi).bus_owner = idx as i8;
             0
         }
         SPI_END => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
-            let hp = s.handles.as_ptr().add(idx);
-            let bus = (*hp).bus_id as usize;
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
+            let bus = (*s.handles.as_ptr().add(idx)).bus_id as usize;
             if bus >= MAX_BUSES { return -22; }
             let bi = s.buses.as_mut_ptr().add(bus);
-            if (*bi).bus_owner == handle as i8 {
+            if (*bi).bus_owner == idx as i8 {
                 (*bi).bus_owner = -1;
             }
             0
@@ -433,50 +470,67 @@ pub unsafe extern "C" fn spi_dispatch(
         SPI_SET_CS => {
             // arg=[level:u8]
             if arg.is_null() || arg_len < 1 { return -22; }
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
-            let hp = s.handles.as_ptr().add(idx);
-            let cs = (*hp).cs_handle;
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
+            let cs = (*s.handles.as_ptr().add(idx)).cs_handle;
             if cs >= 0 {
-                // Toggle CS via GPIO SET_LEVEL
-                let mut buf = [*arg]; // level
-                (sys.dev_call)(cs as i32, 0x0107, buf.as_mut_ptr(), 1); // GPIO_SET_LEVEL
+                let mut buf = [*arg];
+                (sys.provider_call)(cs, hal_gpio::SET_LEVEL, buf.as_mut_ptr(), 1);
             }
             0
         }
         SPI_CONFIGURE => {
             // arg=[freq:u32 LE, mode:u8] (5 bytes)
             if arg.is_null() || arg_len < 5 { return -22; }
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
             let hp = s.handles.as_mut_ptr().add(idx);
             (*hp).freq_hz = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             (*hp).mode = *arg.add(4);
             0
         }
         SPI_TRANSFER_START => {
-            // arg=[tx_ptr:u32, rx_ptr:u32, tx_len:u16, rx_len:u16, fill:u8] (13 bytes)
-            if arg.is_null() || arg_len < 13 { return -22; }
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if arg.is_null() || arg_len < core::mem::size_of::<SpiTransferStartArgs>() { return -22; }
+            let args = &*(arg as *const SpiTransferStartArgs);
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
             let tp = s.transfers.as_mut_ptr().add(idx);
             if (*tp).pending != 0 || (*tp).active != 0 { return -16; }
-            (*tp).tx_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            (*tp).rx_ptr = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            (*tp).tx_len = u16::from_le_bytes([*arg.add(8), *arg.add(9)]);
-            (*tp).rx_len = u16::from_le_bytes([*arg.add(10), *arg.add(11)]);
-            (*tp).fill = *arg.add(12);
+            (*tp).tx_ptr = args.tx;
+            (*tp).rx_ptr = args.rx;
+            (*tp).len = args.len;
+            (*tp).fill = args.fill;
             (*tp).result = 0;
             (*tp).pending = 1;
             0
         }
         SPI_TRANSFER_POLL => {
-            let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
             let tp = s.transfers.as_ptr().add(idx);
             if (*tp).pending != 0 { return 0; }  // not started yet
             if (*tp).active != 0 { return 0; }   // DMA in progress
             (*tp).result  // >0 = done (byte count), <0 = error
+        }
+        SPI_POLL_BYTE => {
+            // Byte-sized poll for single-byte transfers: returns
+            //   0         = no byte available yet (still pending / active)
+            //   0x100|b   = complete, b is the received byte
+            //   < 0       = error
+            let idx = match live_handle_idx(s, handle) { Some(i) => i, None => return -22 };
+            let tp = s.transfers.as_mut_ptr().add(idx);
+            if (*tp).result < 0 {
+                let r = (*tp).result;
+                (*tp).result = 0;
+                return r;
+            }
+            if (*tp).pending != 0 || (*tp).active != 0 { return 0; }
+            if (*tp).result > 0 {
+                let byte = if !(*tp).rx_ptr.is_null() {
+                    *(*tp).rx_ptr
+                } else {
+                    0xFF
+                };
+                (*tp).result = 0; // consume
+                return 0x100 | byte as i32;
+            }
+            0
         }
         SPI_GET_CAPS => {
             if arg.is_null() || arg_len < 8 { return -22; }
@@ -549,19 +603,18 @@ pub extern "C" fn module_new(
             i += 1;
         }
 
-        // Register as SPI provider (device class 0x02)
-        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-        let mut reg_args = [0u8; 8];
-        let rp = reg_args.as_mut_ptr();
-        *rp = 0x02; // device_class = SPI
-        *rp.add(1) = 0; *rp.add(2) = 0; *rp.add(3) = 0;
-        let da = dispatch_hash.to_le_bytes();
-        *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
-        (sys.dev_call)(-1, 0x0C20, rp, 8); // REGISTER_PROVIDER
-
-        dev_log(sys, 3, b"[spi] provider registered".as_ptr(), 24);
+        dev_log(sys, 3, b"[spi] ready".as_ptr(), 10);
         0
     }
+}
+
+/// Loader-driven provider registration: kernel calls this after
+/// module_new() succeeds, reads the contract id, looks up
+/// `module_provider_dispatch` in the export table, and registers us.
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_provides_contract"]
+pub extern "C" fn module_provides_contract() -> u32 {
+    0x0002 // HAL_SPI
 }
 
 #[unsafe(no_mangle)]

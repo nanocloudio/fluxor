@@ -26,11 +26,11 @@ content_type = "OctetStream"
 required = true
 
 [[resources]]
-device_class = "uart"
+requires_contract = "uart"
 access = "exclusive"
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
 ```
 

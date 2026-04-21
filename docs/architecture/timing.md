@@ -19,8 +19,8 @@ Do not try to achieve precise A/V sync using wall clock alone.
 
 For audio pipelines, the authority is the I2S DMA consumption rate.
 
-The kernel exposes timing via `StreamTime` (available through `dev_query` key
-`STREAM_TIME` = 0x0407, or the `stream_time` syscall):
+The kernel exposes timing via `StreamTime` (available through `provider_query` key
+`kernel_abi::STREAM_TIME` = 0x0C30, or the `stream_time` syscall):
 
 ```c
 struct StreamTime {
@@ -87,7 +87,7 @@ For any source -> processors -> sink chain, define a "start of stream" moment:
 
 Practical approach:
 - The kernel captures `t0_micros` automatically on first push (see `StreamTime`).
-- Any module can query `StreamTime` via `dev_query(STREAM_TIME)` and convert
+- Any module can query `StreamTime` via `provider_query(-1, kernel_abi::STREAM_TIME, …)` and convert
   `target_frame` <-> `target_time`:
 
 ```
@@ -139,8 +139,8 @@ If LEDs are not tied to the audio sample clock, they will still have their own o
 
 ## 10) Minimal instrumentation you should implement
 
-The PIO stream service already exposes `StreamTime` via `dev_query(STREAM_TIME)`
-(key 0x0407). It provides everything needed for sync:
+The PIO stream service already exposes `StreamTime` via `provider_query(-1, kernel_abi::STREAM_TIME, …)`
+(key 0x0C30). It provides everything needed for sync:
 
 | Field | Meaning |
 |-------|---------|

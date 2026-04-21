@@ -24,7 +24,8 @@ use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
-use abi::{SyscallTable, SpiOpenArgs, SpiTransferStartArgs};
+use abi::SyscallTable;
+use abi::contracts::hal::spi::{OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs};
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
@@ -121,28 +122,33 @@ mod params_def {
 }
 
 // ============================================================================
-// dev_call helpers
+// Provider helpers — opens go through `provider_open` (handle gets
+// tracked against the HAL contract); subsequent calls go through
+// `provider_call`.
 // ============================================================================
 
-/// Claim a GPIO pin via dev_call
+const HAL_GPIO_CONTRACT: u32 = 0x0001;
+const HAL_SPI_CONTRACT:  u32 = 0x0002;
+
+/// Claim a GPIO pin via provider_open(HAL_GPIO, CLAIM).
 unsafe fn dev_gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.dev_call)(-1, DEV_GPIO_CLAIM, arg.as_mut_ptr(), 1)
+    (sys.provider_open)(HAL_GPIO_CONTRACT, DEV_GPIO_CLAIM, arg.as_mut_ptr(), 1)
 }
 
-/// Set GPIO mode via dev_call (mode: 1=output, initial_level: 0/1)
+/// Set GPIO mode.
 unsafe fn dev_gpio_set_mode(sys: &SyscallTable, handle: i32, mode: u8, initial: u8) -> i32 {
     let mut arg = [mode, initial];
-    (sys.dev_call)(handle, DEV_GPIO_SET_MODE, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(handle, DEV_GPIO_SET_MODE, arg.as_mut_ptr(), 2)
 }
 
-/// Set GPIO level via dev_call
+/// Set GPIO level.
 unsafe fn dev_gpio_set_level(sys: &SyscallTable, handle: i32, level: u8) -> i32 {
     let mut arg = [level];
-    (sys.dev_call)(handle, DEV_GPIO_SET_LEVEL, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(handle, DEV_GPIO_SET_LEVEL, arg.as_mut_ptr(), 1)
 }
 
-/// Open SPI via dev_call
+/// Open SPI via provider_open(HAL_SPI, OPEN).
 unsafe fn dev_spi_open(sys: &SyscallTable, bus: u8, cs_handle: i32, freq_hz: u32, mode: u8) -> i32 {
     let mut args = SpiOpenArgs {
         cs_handle,
@@ -151,11 +157,12 @@ unsafe fn dev_spi_open(sys: &SyscallTable, bus: u8, cs_handle: i32, freq_hz: u32
         mode,
         _pad: [0; 2],
     };
-    (sys.dev_call)(-1, DEV_SPI_OPEN, &mut args as *mut _ as *mut u8,
+    (sys.provider_open)(HAL_SPI_CONTRACT, DEV_SPI_OPEN,
+        &mut args as *mut _ as *mut u8,
         core::mem::size_of::<SpiOpenArgs>())
 }
 
-/// Start SPI transfer via dev_call
+/// Start SPI transfer.
 unsafe fn dev_spi_transfer_start(
     sys: &SyscallTable,
     handle: i32,
@@ -171,18 +178,18 @@ unsafe fn dev_spi_transfer_start(
         fill,
         _pad: [0; 3],
     };
-    (sys.dev_call)(handle, DEV_SPI_TRANSFER_START, &mut args as *mut _ as *mut u8,
+    (sys.provider_call)(handle, DEV_SPI_TRANSFER_START, &mut args as *mut _ as *mut u8,
         core::mem::size_of::<SpiTransferStartArgs>())
 }
 
-/// Poll SPI transfer via dev_call
+/// Poll SPI transfer.
 unsafe fn dev_spi_transfer_poll(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, DEV_SPI_TRANSFER_POLL, core::ptr::null_mut(), 0)
+    (sys.provider_call)(handle, DEV_SPI_TRANSFER_POLL, core::ptr::null_mut(), 0)
 }
 
-/// Poll SPI byte via dev_call
+/// Poll SPI byte.
 unsafe fn dev_spi_poll_byte(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, DEV_SPI_POLL_BYTE, core::ptr::null_mut(), 0)
+    (sys.provider_call)(handle, DEV_SPI_POLL_BYTE, core::ptr::null_mut(), 0)
 }
 
 // ============================================================================
@@ -302,7 +309,7 @@ pub extern "C" fn module_new(
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else if !params.is_null() && params_len >= 2 {
-            // Legacy: spi_bus at [0], cs_pin at [1]
+            // Flat byte layout: spi_bus at [0], cs_pin at [1]
             s.spi_bus = *params;
             s.cs_pin = *params.add(1);
             if params_len >= 3 {
@@ -314,7 +321,7 @@ pub extern "C" fn module_new(
 
         let sys = &*s.syscalls;
 
-        // Claim CS pin as output via dev_call
+        // Claim CS pin as output via provider_call
         let cs_pin = s.cs_pin;
         let cs_handle = dev_gpio_claim(sys, cs_pin);
         if cs_handle < 0 {
@@ -323,7 +330,7 @@ pub extern "C" fn module_new(
         dev_gpio_set_mode(sys, cs_handle, 1, 1); // Output, initially high
         s.cs_handle = cs_handle;
 
-        // Open SPI via dev_call (10MHz, mode 0)
+        // Open SPI via provider_call (10MHz, mode 0)
         let bus = s.spi_bus;
         let spi_handle = dev_spi_open(sys, bus, cs_handle, 10_000_000, 0);
         if spi_handle < 0 {

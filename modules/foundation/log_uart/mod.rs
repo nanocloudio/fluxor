@@ -1,7 +1,7 @@
 //! log_uart — kernel-log forwarder that drives the platform UART.
 //!
-//! Drains the kernel log ring (SYSTEM::LOG_RING_DRAIN 0x0C64) and forwards
-//! each chunk via SYSTEM::UART_WRITE_RAW (0x0C65). Symmetric with log_net
+//! Drains the kernel log ring (LOG_RING_DRAIN (diag) 0x0C64) and forwards
+//! each chunk via UART_WRITE_RAW (diag) (0x0C65). Symmetric with log_net
 //! but targets the local UART wire instead of a UDP socket — use when a
 //! serial cable is available and the overhead of an IP stack isn't wanted.
 //!
@@ -89,7 +89,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let chunk_ptr = s.chunk.as_mut_ptr();
 
         // Drain up to CHUNK_SIZE bytes.
-        let ret = ((*sys_ptr).dev_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
+        let ret = ((*sys_ptr).provider_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
         if ret <= 0 {
             return 0;
         }
@@ -117,14 +117,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 pos += 1;
                 k += 1;
             }
-            let _ = ((*sys_ptr).dev_call)(-1, UART_WRITE_RAW, mark.as_mut_ptr(), pos);
+            let _ = ((*sys_ptr).provider_call)(-1, UART_WRITE_RAW, mark.as_mut_ptr(), pos);
         }
 
         if len > 0 {
             // UART_WRITE_RAW is synchronous — returns bytes written (== len)
             // or a negative errno. Failure here means the platform has no
             // UART, which is a config error, not something to retry.
-            let rc = ((*sys_ptr).dev_call)(-1, UART_WRITE_RAW, chunk_ptr, len);
+            let rc = ((*sys_ptr).provider_call)(-1, UART_WRITE_RAW, chunk_ptr, len);
             if rc > 0 {
                 s.chunks_written = s.chunks_written.wrapping_add(1);
                 s.bytes_written = s.bytes_written.wrapping_add(len as u32);

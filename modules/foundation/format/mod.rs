@@ -398,7 +398,7 @@ pub extern "C" fn module_new(
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else if !params.is_null() && params_len >= 8 {
-            // Legacy format: input_rate(0-3), output_rate(4-7)
+            // Flat byte layout: input_rate(0-3), output_rate(4-7)
             #[inline(always)]
             unsafe fn read_u32_at(ptr: *const u8, offset: usize) -> u32 {
                 let p = ptr.add(offset);

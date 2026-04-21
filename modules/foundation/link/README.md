@@ -35,7 +35,7 @@ direction = "ctrl_input"
 content_type = "FmpMessage"
 
 [[resources]]
-device_class = "uart"
+requires_contract = "uart"
 access = "exclusive"
 ```
 

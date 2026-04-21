@@ -76,7 +76,7 @@ These are not separate Fluxor variants. They are graphs in the same runtime, val
 |                      Driver Modules                              |
 |     cyw43, enc28j60, virtio_net, sd, st7701s, gt911, i2s, ...    |
 +----------------------------------------------------------------+
-                Stable Syscall ABI (dev_call)
+             Stable Syscall ABI (kernel_abi + HAL contracts)
 +----------------------------------------------------------------+
 |                          Kernel                                  |
 |     scheduler  •  channels  •  events  •  loader  •  HAL        |
@@ -256,7 +256,7 @@ Recommended reading path:
 1. [docs/architecture/pipeline.md](docs/architecture/pipeline.md) — graph runner, channels, scheduler, mailbox mode
 2. [docs/architecture/module_architecture.md](docs/architecture/module_architecture.md) — module contract, lifecycle, fault recovery
 3. [docs/architecture/hal_architecture.md](docs/architecture/hal_architecture.md) — kernel/module split and per-silicon HAL
-4. [docs/architecture/device_classes.md](docs/architecture/device_classes.md) — `dev_call` opcode namespace
+4. [docs/architecture/abi_layers.md](docs/architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
 5. [docs/architecture/network.md](docs/architecture/network.md) — channel-based networking and net_proto
 6. [docs/architecture/capability_surface.md](docs/architecture/capability_surface.md) — hardware section and auto-wiring
 7. [docs/vision.md](docs/vision.md) — the longer mesh-native computing argument

@@ -144,18 +144,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let sys = &*s.syscalls;
 
-        // Lazy init: open ADC handle + create timer on first step
+        // Lazy init: open ADC handle + create timer on first step.
+        // Both go through the handle-scoped provider API so the
+        // kernel tracks the returned handles against their contracts.
         if !s.initialized {
             // Open ADC channel 4 (temp sensor)
             let mut ch = [TEMP_CHANNEL];
-            let handle = (sys.dev_call)(-1, 0x0E00, ch.as_mut_ptr(), 1);
+            let handle = (sys.provider_open)(
+                HAL_ADC_CONTRACT, ADC_OPEN, ch.as_mut_ptr(), 1,
+            );
             if handle < 0 {
                 return -3;
             }
             s.adc_handle = handle;
 
             // Create timer fd
-            let timer_fd = (sys.dev_call)(-1, 0x0604, core::ptr::null_mut(), 0);
+            let timer_fd = (sys.provider_open)(
+                TIMER_CONTRACT, TIMER_CREATE, core::ptr::null_mut(), 0,
+            );
             if timer_fd < 0 {
                 return -4;
             }
@@ -163,7 +169,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             // Arm timer for first read
             let mut delay = s.interval_ms.to_le_bytes();
-            (sys.dev_call)(s.timer_fd, 0x0605, delay.as_mut_ptr(), 4);
+            (sys.provider_call)(s.timer_fd, TIMER_SET, delay.as_mut_ptr(), 4);
 
             s.initialized = true;
             return 0;
@@ -176,13 +182,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 return 0;
             }
             // Timer expired — start ADC read
-            (sys.dev_call)(s.adc_handle, 0x0E02, core::ptr::null_mut(), 0);
+            (sys.provider_call)(s.adc_handle, ADC_READ, core::ptr::null_mut(), 0);
             s.reading = true;
             return 0;
         }
 
         // ADC read in progress — poll for result
-        let result = (sys.dev_call)(s.adc_handle, 0x0E02, core::ptr::null_mut(), 0);
+        let result = (sys.provider_call)(s.adc_handle, ADC_READ, core::ptr::null_mut(), 0);
         if result <= 0 {
             return 0; // still pending
         }
@@ -199,12 +205,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Re-arm timer for next read
         let mut delay = s.interval_ms.to_le_bytes();
-        (sys.dev_call)(s.timer_fd, 0x0605, delay.as_mut_ptr(), 4);
+        (sys.provider_call)(s.timer_fd, TIMER_SET, delay.as_mut_ptr(), 4);
         s.reading = false;
 
         0
     }
 }
+
+// Contract ids + opcodes (mirror kernel::provider::contract + abi paths).
+const HAL_ADC_CONTRACT: u32 = 0x000E;
+const TIMER_CONTRACT:   u32 = 0x0006;
+const ADC_OPEN:     u32 = 0x0E00;
+const ADC_READ:     u32 = 0x0E02;
+const TIMER_CREATE: u32 = 0x0604;
+const TIMER_SET:    u32 = 0x0605;
 
 // ============================================================================
 // Channel Hints

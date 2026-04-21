@@ -22,15 +22,15 @@ content_type = "ImageRaw"
 required = false
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
 
 [[resources]]
-device_class = "pio"
+requires_contract = "pio"
 access = "exclusive"
 
 [[resources]]
-device_class = "timer"
+requires_contract = "timer"
 access = "write"
 ```
 

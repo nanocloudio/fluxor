@@ -1632,8 +1632,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 }
                 let mod_idx = dm_ref.count;
 
-                // Set global module index so REGISTER_PROVIDER and syscalls
-                // can identify the calling module during module_new.
+                // Set global module index so syscalls and loader-driven
+                // provider registration can identify the calling module
+                // during module_new.
                 fluxor::kernel::scheduler::set_current_module(i);
 
                 // Populate export table and caps in SCHED so
@@ -1645,7 +1646,12 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 let cap_class = match m.header.module_type {
                     5 => 3, 3 => 1, 4 => 2, _ => 0,
                 };
-                scheduler::set_module_caps(i, cap_class, m.header.required_caps() as u32);
+                scheduler::set_module_caps(
+                    i,
+                    cap_class,
+                    m.header.required_caps() as u32,
+                    m.manifest_permissions(),
+                );
 
                 // Re-apply port registrations for this module from the stored edge
                 // channel table. This keeps SCHED.ports consistent if earlier
@@ -1683,7 +1689,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                         // Publish state pointer into the scheduler's
                         // per-module shadow so resolve_register_target
                         // can find us from a step-time registration
-                        // call (e.g. NVME_BACKING_ENABLE). bcm2712
+                        // call (e.g. BACKING_PROVIDER_ENABLE). bcm2712
                         // keeps modules in DOMAIN_MODULES rather than
                         // SCHED.modules, so without this, get_module_state
                         // returns null and every registration fails.
@@ -2154,7 +2160,7 @@ fn pump_cross_domain(domain_id: usize) {
 
         // Producer side.
         if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
-            let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+            let mut buf = [0u8; cross_domain::SLOT_DATA_SIZE];
             let n = unsafe {
                 fluxor::kernel::channel::channel_read(
                     edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
@@ -2183,7 +2189,7 @@ fn pump_cross_domain(domain_id: usize) {
             let can_write = write_ready > 0
                 && (write_ready as u32 & fluxor::kernel::channel::POLL_OUT) != 0;
             if can_write {
-                let mut buf = [0u8; cross_domain::CHANNEL_DATA_SIZE];
+                let mut buf = [0u8; cross_domain::SLOT_DATA_SIZE];
                 if let Some(len) = ch.try_recv(&mut buf) {
                     unsafe {
                         fluxor::kernel::channel::channel_write(
@@ -2502,9 +2508,10 @@ fn bcm_boot_scan() {}
 fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize { len }
 
 unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use fluxor::abi::dev_system;
+    use fluxor::abi::platform::bcm2712::{mmio_dma, pcie_nic};
+    use fluxor::abi::contracts::storage::paged_arena;
     match opcode {
-        dev_system::MMIO_READ32 => {
+        mmio_dma::MMIO_READ32 => {
             if arg.is_null() || arg_len < 12 { return -22; }
             let addr = u64::from_le_bytes([
                 *arg, *arg.add(1), *arg.add(2), *arg.add(3),
@@ -2516,7 +2523,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             *arg.add(10) = vb[2]; *arg.add(11) = vb[3];
             0
         }
-        dev_system::MMIO_WRITE32 => {
+        mmio_dma::MMIO_WRITE32 => {
             if arg.is_null() || arg_len < 12 { return -22; }
             let addr = u64::from_le_bytes([
                 *arg, *arg.add(1), *arg.add(2), *arg.add(3),
@@ -2526,7 +2533,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::ptr::write_volatile(addr as *mut u32, val);
             0
         }
-        dev_system::CACHE_FLUSH_RANGE => {
+        mmio_dma::CACHE_FLUSH_RANGE => {
             if arg.is_null() || arg_len < 12 { return -22; }
             let addr = u64::from_le_bytes([
                 *arg, *arg.add(1), *arg.add(2), *arg.add(3),
@@ -2543,7 +2550,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::arch::asm!("dsb sy");
             0
         }
-        dev_system::DMA_ALLOC_CONTIG => {
+        mmio_dma::DMA_ALLOC_CONTIG => {
             if arg.is_null() || arg_len < 16 { return -22; }
             let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
@@ -2556,7 +2563,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
             0
         }
-        dev_system::DMA_ALLOC_STREAMING => {
+        mmio_dma::DMA_ALLOC_STREAMING => {
             if arg.is_null() || arg_len < 16 { return -22; }
             let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
@@ -2569,7 +2576,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
             0
         }
-        dev_system::DMA_FLUSH => {
+        mmio_dma::DMA_FLUSH => {
             if arg.is_null() || arg_len < 12 { return -22; }
             let addr = u64::from_le_bytes([
                 *arg, *arg.add(1), *arg.add(2), *arg.add(3),
@@ -2589,7 +2596,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::arch::asm!("dsb sy");
             0
         }
-        dev_system::DMA_INVALIDATE => {
+        mmio_dma::DMA_INVALIDATE => {
             if arg.is_null() || arg_len < 12 { return -22; }
             let addr = u64::from_le_bytes([
                 *arg, *arg.add(1), *arg.add(2), *arg.add(3),
@@ -2613,33 +2620,33 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::arch::asm!("dsb sy");
             0
         }
-        dev_system::NIC_BAR_MAP => {
+        pcie_nic::NIC_BAR_MAP => {
             fluxor::kernel::pcie::syscall_bar_map(arg, arg_len)
         }
-        dev_system::NIC_BAR_UNMAP => {
+        pcie_nic::NIC_BAR_UNMAP => {
             fluxor::kernel::pcie::syscall_bar_unmap(arg, arg_len)
         }
-        dev_system::NIC_RING_CREATE => {
+        pcie_nic::NIC_RING_CREATE => {
             fluxor::kernel::nic_ring::syscall_ring_create(arg, arg_len)
         }
-        dev_system::NIC_RING_DESTROY => {
+        pcie_nic::NIC_RING_DESTROY => {
             fluxor::kernel::nic_ring::syscall_ring_destroy(arg, arg_len)
         }
-        dev_system::NIC_RING_INFO => {
+        pcie_nic::NIC_RING_INFO => {
             fluxor::kernel::nic_ring::syscall_ring_info(_handle, arg, arg_len)
         }
-        dev_system::PCIE_RESCAN => {
+        pcie_nic::PCIE_RESCAN => {
             let _ = arg;
             let _ = arg_len;
             fluxor::kernel::pcie::enumerate() as i32
         }
-        dev_system::PCIE_CFG_READ32 => {
+        pcie_nic::PCIE_CFG_READ32 => {
             fluxor::kernel::pcie::syscall_cfg_read32(arg, arg_len)
         }
-        dev_system::PCIE_CFG_WRITE32 => {
+        pcie_nic::PCIE_CFG_WRITE32 => {
             fluxor::kernel::pcie::syscall_cfg_write32(arg, arg_len)
         }
-        dev_system::PCIE1_MSI_INIT => {
+        pcie_nic::PCIE1_MSI_INIT => {
             // arg = [spi_irq: u32 LE]
             if arg.is_null() || arg_len < 4 { return -22; }
             let spi_irq = u32::from_le_bytes([
@@ -2650,7 +2657,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             }
             register_pcie1_msi_spi(spi_irq)
         }
-        dev_system::PCIE1_MSI_ALLOC_VECTOR => {
+        pcie_nic::PCIE1_MSI_ALLOC_VECTOR => {
             if arg.is_null() || arg_len < 20 { return -22; }
             let event_handle = i32::from_le_bytes([
                 *arg, *arg.add(1), *arg.add(2), *arg.add(3),
@@ -2670,7 +2677,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                 }
             }
         }
-        dev_system::BACKING_ARENA_REGISTER => {
+        paged_arena::ARENA_REGISTER => {
             if arg.is_null() || arg_len < 10 { return -22; }
             let vpages = u32::from_le_bytes([
                 *arg, *arg.add(1), *arg.add(2), *arg.add(3),
@@ -2681,7 +2688,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             let bt = match *arg.add(8) {
                 0 => fluxor::kernel::backing_store::BackingType::None,
                 1 => fluxor::kernel::backing_store::BackingType::RamDisk,
-                2 => fluxor::kernel::backing_store::BackingType::Nvme,
+                2 => fluxor::kernel::backing_store::BackingType::External,
                 _ => return -22,
             };
             let wb = match *arg.add(9) {
@@ -2692,7 +2699,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             let idx = fluxor::kernel::scheduler::current_module_index() as u8;
             fluxor::kernel::backing_store::backing_register(idx, vpages, rmax, bt, wb)
         }
-        dev_system::BACKING_ARENA_READ => {
+        paged_arena::ARENA_READ => {
             if arg.is_null() || arg_len < 14 { return -22; }
             let arena_id = *arg as usize;
             let vpage = u32::from_le_bytes([
@@ -2704,7 +2711,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             ]) as *mut u8;
             fluxor::kernel::backing_store::backing_read(arena_id, vpage, buf)
         }
-        dev_system::BACKING_ARENA_WRITE => {
+        paged_arena::ARENA_WRITE => {
             if arg.is_null() || arg_len < 14 { return -22; }
             let arena_id = *arg as usize;
             let vpage = u32::from_le_bytes([
@@ -2716,7 +2723,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             ]) as *const u8;
             fluxor::kernel::backing_store::backing_write(arena_id, vpage, buf)
         }
-        dev_system::BACKING_ARENA_FLUSH => {
+        paged_arena::ARENA_FLUSH => {
             if arg.is_null() || arg_len < 1 { return -22; }
             let arena_id = *arg as usize;
             fluxor::kernel::backing_store::backing_flush(arena_id)

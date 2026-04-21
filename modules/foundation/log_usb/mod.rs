@@ -1,7 +1,7 @@
 //! log_usb — kernel-log forwarder over the platform's USB CDC-ACM endpoint.
 //!
-//! Drains the kernel log ring (SYSTEM::LOG_RING_DRAIN 0x0C64) and pushes
-//! bytes into the USB TX pipe via SYSTEM::USB_WRITE_RAW (0x0C66). The
+//! Drains the kernel log ring (LOG_RING_DRAIN (diag) 0x0C64) and pushes
+//! bytes into the USB TX pipe via USB_WRITE_RAW (diag) (0x0C66). The
 //! embassy CDC task drains the pipe and writes CDC packets. Use when
 //! running RP hardware with USB attached and no serial cable.
 //!
@@ -57,7 +57,7 @@ unsafe fn flush_pending(s: &mut LogUsbState) -> bool {
     let offset = s.chunk_written as usize;
     let remaining = (s.pending_len as usize) - offset;
     let ptr = s.chunk.as_mut_ptr().add(offset);
-    let rc = ((*sys_ptr).dev_call)(-1, USB_WRITE_RAW, ptr, remaining);
+    let rc = ((*sys_ptr).provider_call)(-1, USB_WRITE_RAW, ptr, remaining);
     if rc <= 0 {
         return false;
     }
@@ -120,7 +120,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let sys_ptr = s.syscalls;
         let chunk_ptr = s.chunk.as_mut_ptr();
-        let ret = ((*sys_ptr).dev_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
+        let ret = ((*sys_ptr).provider_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
         if ret <= 0 {
             return 0;
         }
@@ -152,11 +152,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             // Best-effort: if the pipe can't accept this, we drop the
             // marker (the real data still makes it in).
-            let _ = ((*sys_ptr).dev_call)(-1, USB_WRITE_RAW, mark.as_mut_ptr(), pos);
+            let _ = ((*sys_ptr).provider_call)(-1, USB_WRITE_RAW, mark.as_mut_ptr(), pos);
         }
 
         if len > 0 {
-            let rc = ((*sys_ptr).dev_call)(-1, USB_WRITE_RAW, chunk_ptr, len);
+            let rc = ((*sys_ptr).provider_call)(-1, USB_WRITE_RAW, chunk_ptr, len);
             let written = if rc > 0 { rc as usize } else { 0 };
             if written < len {
                 // Stage the unaccepted tail for next step.

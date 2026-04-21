@@ -27,9 +27,10 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 
-const STEP_HISTOGRAM_QUERY: u32 = 0x0C55;
-const RECONFIGURE_MODULE_COUNT: u32 = 0x0C6B;
-const SYSTEM_LOG: u32 = 0x0C40;
+// Opcodes imported from the layered ABI — no hardcoded 0x0Cxx here.
+use abi::internal::monitor::STEP_HISTOGRAM_QUERY;
+use abi::internal::reconfigure::MODULE_COUNT as RECONFIGURE_MODULE_COUNT;
+use abi::kernel_abi::LOG_WRITE as SYSTEM_LOG;
 
 /// Small stack buffer for building one MON_HIST line. 8 buckets × up to
 /// 10 decimal digits each + key names + mod idx + spaces = ~140 chars max.
@@ -126,7 +127,7 @@ unsafe fn build_mon_hist(
 ) -> usize {
     let mut buckets = [0u32; 8];
     let bp = buckets.as_mut_ptr() as *mut u8;
-    let rc = (sys.dev_call)(mod_idx as i32, STEP_HISTOGRAM_QUERY, bp, 32);
+    let rc = (sys.provider_call)(mod_idx as i32, STEP_HISTOGRAM_QUERY, bp, 32);
     if rc < 0 {
         return 0;
     }
@@ -221,7 +222,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.countdown_ticks = s.round_ticks;
 
         let sys_ptr = s.syscalls;
-        let count = (((*sys_ptr).dev_call)(-1, RECONFIGURE_MODULE_COUNT,
+        let count = (((*sys_ptr).provider_call)(-1, RECONFIGURE_MODULE_COUNT,
                                            core::ptr::null_mut(), 0)) as i32;
         if count <= 0 {
             return 0;
@@ -232,10 +233,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         while idx < count && idx < 64 {
             let n = build_mon_hist(&*sys_ptr, idx as u8, &mut line);
             if n > 0 {
-                // Level 3 = info. dev_call(SYSTEM::LOG) routes through
-                // syscall_log which calls log::info! — bytes land in the
-                // ring and flow out the active transport overlay.
-                ((*sys_ptr).dev_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
+                // Level 3 = info. LOG_WRITE routes through `syscall_log`
+                // which calls `log::info!` — bytes land in the ring and
+                // flow out the active transport overlay.
+                ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
             }
             idx += 1;
         }

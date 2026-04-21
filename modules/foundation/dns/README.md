@@ -14,7 +14,7 @@ version = "1.0.0"
 hardware_targets = ["rp2350"]
 
 [[resources]]
-device_class = "socket"
+requires_contract = "socket"
 access = "write"
 ```
 

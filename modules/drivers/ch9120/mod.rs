@@ -116,7 +116,9 @@ struct Ch9120State {
     uart_handle: i32,
     reset_handle: i32,
     cfg0_handle: i32,
-    netif_handle: i32,
+    // Netif state output port — emits MSG_NETIF_STATE frames when the
+    // driver transitions state. Consumers wire their input port here.
+    netif_state_chan: i32,
     // State machine
     phase: Ch9120Phase,
     config_step: u8,
@@ -220,48 +222,61 @@ mod params_def {
 }
 
 // ============================================================================
-// dev_call Helpers
+// Provider helpers — opens via provider_open (tracked); rest via provider_call.
 // ============================================================================
+
+const HAL_GPIO_CONTRACT: u32 = 0x0001;
+const HAL_UART_CONTRACT: u32 = 0x000D;
 
 unsafe fn dev_gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.dev_call)(-1, DEV_GPIO_CLAIM, arg.as_mut_ptr(), 1)
+    (sys.provider_open)(HAL_GPIO_CONTRACT, DEV_GPIO_CLAIM, arg.as_mut_ptr(), 1)
 }
 
 unsafe fn dev_gpio_set_mode(sys: &SyscallTable, handle: i32, mode: u8, initial: u8) -> i32 {
     let mut arg = [mode, initial];
-    (sys.dev_call)(handle, DEV_GPIO_SET_MODE, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(handle, DEV_GPIO_SET_MODE, arg.as_mut_ptr(), 2)
 }
 
 unsafe fn dev_gpio_set_level(sys: &SyscallTable, handle: i32, level: u8) -> i32 {
     let mut arg = [level];
-    (sys.dev_call)(handle, DEV_GPIO_SET_LEVEL, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(handle, DEV_GPIO_SET_LEVEL, arg.as_mut_ptr(), 1)
 }
 
 unsafe fn dev_uart_open(sys: &SyscallTable, bus: u8) -> i32 {
     let mut arg = [bus];
-    (sys.dev_call)(-1, DEV_UART_OPEN, arg.as_mut_ptr(), 1)
+    (sys.provider_open)(HAL_UART_CONTRACT, DEV_UART_OPEN, arg.as_mut_ptr(), 1)
 }
 
 unsafe fn dev_uart_close(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, DEV_UART_CLOSE, core::ptr::null_mut(), 0)
+    (sys.provider_call)(handle, DEV_UART_CLOSE, core::ptr::null_mut(), 0)
 }
 
 unsafe fn dev_uart_write(sys: &SyscallTable, handle: i32, data: *const u8, len: usize) -> i32 {
-    (sys.dev_call)(handle, DEV_UART_WRITE, data as *mut u8, len)
+    (sys.provider_call)(handle, DEV_UART_WRITE, data as *mut u8, len)
 }
 
 unsafe fn dev_uart_read(sys: &SyscallTable, handle: i32, buf: *mut u8, len: usize) -> i32 {
-    (sys.dev_call)(handle, DEV_UART_READ, buf, len)
+    (sys.provider_call)(handle, DEV_UART_READ, buf, len)
 }
 
 unsafe fn dev_uart_poll(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, DEV_UART_POLL, core::ptr::null_mut(), 0)
+    (sys.provider_call)(handle, DEV_UART_POLL, core::ptr::null_mut(), 0)
 }
 
-unsafe fn dev_netif_open(sys: &SyscallTable, if_type: u8) -> i32 {
-    let mut arg = [if_type];
-    (sys.dev_call)(-1, DEV_NETIF_OPEN, arg.as_mut_ptr(), 1)
+/// Emit an MSG_NETIF_STATE frame on netif_state_chan. No-op if unwired
+/// or the ring is full.
+unsafe fn emit_netif_state(s: &Ch9120State, state: u8) {
+    if s.netif_state_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.netif_state_chan, POLL_OUT);
+    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
+        return;
+    }
+    let payload = [state];
+    msg_write(sys, s.netif_state_chan, MSG_NETIF_STATE, payload.as_ptr(), 1);
 }
 
 // ============================================================================
@@ -553,12 +568,7 @@ unsafe fn step_reopen_uart(s: &mut Ch9120State) -> i32 {
 unsafe fn step_open_netif(s: &mut Ch9120State) -> i32 {
     let sys = &*s.syscalls;
 
-    let handle = dev_netif_open(sys, NETIF_TYPE_ETHERNET);
-    if handle >= 0 {
-        s.netif_handle = handle;
-        dev_netif_set_state(sys, handle, NETIF_STATE_READY);
-    }
-    // Netif registration is optional — don't fail if unavailable
+    emit_netif_state(s, NETIF_STATE_READY);
 
     dev_log(sys, 3, b"[ch9120] running".as_ptr(), 16);
     s.phase = Ch9120Phase::Running;
@@ -656,7 +666,8 @@ pub extern "C" fn module_new(
         s.uart_handle = -1;
         s.reset_handle = -1;
         s.cfg0_handle = -1;
-        s.netif_handle = -1;
+        // Netif state output port (out[1]).
+        s.netif_state_chan = dev_channel_port(&*s.syscalls, 1, 1);
         s.phase = Ch9120Phase::Init;
 
         // Parse params

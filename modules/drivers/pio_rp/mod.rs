@@ -5,14 +5,15 @@
 //!   - **Cmd** (mode 1): bidirectional PIO transfers (gSPI-style)
 //!   - **RX Stream** (mode 2): continuous DMA capture from PIO RX FIFO
 //!
-//! Consumers (i2s, cyw43, st7701s, mic_source) use the same dev_call
-//! opcodes (0x0400-0x0427). This module registers as the PIO provider
-//! (device class 0x04) and dispatches to internal slot management.
+//! Consumers (i2s, cyw43, st7701s, mic_source) call through the HAL_PIO
+//! contract (0x04, opcodes 0x0400-0x0427). This module registers as
+//! the HAL_PIO provider and dispatches to internal slot management.
 //!
 //! All hardware access goes through kernel bridges:
-//!   - PIO register bridge (0x0C70-0x0C7B): SM config, instruction memory
-//!   - DMA FD bridge (0x0C85-0x0C89): DMA channel lifecycle + transfers
-//!   - FD_POLL (0x0C41): non-blocking DMA completion check
+//!   - PIO register bridge (`pio_raw::*`, 0x0C70-0x0C7B): SM config,
+//!     instruction memory
+//!   - PLATFORM_DMA_FD `fd::*` (0x0C85-0x0C89): DMA fd lifecycle + transfers
+//!   - HANDLE_POLL (0x0C41): non-blocking DMA completion check
 
 #![no_std]
 
@@ -77,29 +78,31 @@ const RX_STREAM_FREE: u32 = 0x0425;
 const RX_STREAM_GET_BUFFER: u32 = 0x0426;
 const RX_STREAM_SET_RATE: u32 = 0x0427;
 
-// Kernel bridge opcodes
-const PIO_SM_EXEC: u32 = 0x0C70;
-const PIO_SM_WRITE_REG: u32 = 0x0C71;
-const PIO_SM_READ_REG: u32 = 0x0C72;
-const PIO_SM_ENABLE: u32 = 0x0C73;
-const PIO_INSTR_ALLOC: u32 = 0x0C74;
-const PIO_INSTR_WRITE: u32 = 0x0C75;
-const PIO_INSTR_FREE: u32 = 0x0C76;
-const PIO_PIN_SETUP: u32 = 0x0C77;
+// Kernel bridge opcodes imported from the layered ABI.
+use abi::platform::rp::pio_raw::{
+    SM_EXEC as PIO_SM_EXEC,
+    SM_WRITE_REG as PIO_SM_WRITE_REG,
+    SM_READ_REG as PIO_SM_READ_REG,
+    SM_ENABLE as PIO_SM_ENABLE,
+    INSTR_ALLOC as PIO_INSTR_ALLOC,
+    INSTR_WRITE as PIO_INSTR_WRITE,
+    INSTR_FREE as PIO_INSTR_FREE,
+    PIN_SETUP as PIO_PIN_SETUP,
+    TXF_WRITE as PIO_TXF_WRITE,
+    FSTAT_READ as PIO_FSTAT_READ,
+    SM_RESTART as PIO_SM_RESTART,
+    INPUT_SYNC_BYPASS as PIO_INPUT_SYNC_BYPASS,
+    CMD_TRANSFER as PIO_CMD_XFER,
+};
 #[allow(dead_code)]
-const PIO_GPIOBASE: u32 = 0x0C78;
-const PIO_TXF_WRITE: u32 = 0x0C79;
-const PIO_FSTAT_READ: u32 = 0x0C7A;
-const PIO_SM_RESTART: u32 = 0x0C7B;
-const PIO_INPUT_SYNC_BYPASS: u32 = 0x0C7C;
-const PIO_CMD_XFER: u32 = 0x0C7D;
-
-const DMA_FD_CREATE: u32 = 0x0C85;
-const DMA_FD_START: u32 = 0x0C86;
-const DMA_FD_RESTART: u32 = 0x0C87;
-const DMA_FD_FREE: u32 = 0x0C88;
-const DMA_FD_QUEUE: u32 = 0x0C89;
-const FD_POLL: u32 = 0x0C41;
+use abi::platform::rp::pio_raw::GPIOBASE as PIO_GPIOBASE;
+// pio_rp uses BOTH DMA families:
+//   * `dma_fd::*` for stream transfers (ping-pong queued) — see the
+//     dma_fd_* helpers below.
+//   * `dma_channel::*` for CMD blocking transfers — see raw_dma_* helpers.
+// Both families live under the single PLATFORM_DMA contract.
+use abi::platform::rp::dma_raw::{channel as dma_channel, fd as dma_fd};
+use abi::kernel_abi::HANDLE_POLL as FD_POLL;
 
 // DMA flags
 const DMA_FLAG_INCR_READ: u8 = 0x01;
@@ -257,7 +260,7 @@ unsafe fn pio_sm_exec(sys: &SyscallTable, pio_num: u8, sm: u8, instr: u16) {
     let ib = instr.to_le_bytes();
     *p.add(2) = ib[0];
     *p.add(3) = ib[1];
-    (sys.dev_call)(-1, PIO_SM_EXEC, p, 4);
+    (sys.provider_call)(-1, PIO_SM_EXEC, p, 4);
 }
 
 #[inline(always)]
@@ -269,20 +272,20 @@ unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8, val
     *p.add(2) = reg;
     let vb = value.to_le_bytes();
     *p.add(3) = vb[0]; *p.add(4) = vb[1]; *p.add(5) = vb[2]; *p.add(6) = vb[3];
-    (sys.dev_call)(-1, PIO_SM_WRITE_REG, p, 7);
+    (sys.provider_call)(-1, PIO_SM_WRITE_REG, p, 7);
 }
 
 #[inline(always)]
 unsafe fn pio_sm_read_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8) -> u32 {
     let mut buf = [pio_num, sm, reg, 0, 0, 0, 0];
-    let r = (sys.dev_call)(-1, PIO_SM_READ_REG, buf.as_mut_ptr(), 7);
+    let r = (sys.provider_call)(-1, PIO_SM_READ_REG, buf.as_mut_ptr(), 7);
     if r >= 0 { r as u32 } else { 0 }
 }
 
 #[inline(always)]
 unsafe fn pio_sm_enable(sys: &SyscallTable, pio_num: u8, sm_mask: u8, enable: bool) {
     let mut buf = [pio_num, sm_mask, if enable { 1 } else { 0 }];
-    (sys.dev_call)(-1, PIO_SM_ENABLE, buf.as_mut_ptr(), 3);
+    (sys.provider_call)(-1, PIO_SM_ENABLE, buf.as_mut_ptr(), 3);
 }
 
 unsafe fn pio_instr_alloc(sys: &SyscallTable, pio_num: u8, count: u8) -> (i32, u32) {
@@ -290,7 +293,7 @@ unsafe fn pio_instr_alloc(sys: &SyscallTable, pio_num: u8, count: u8) -> (i32, u
     let p = buf.as_mut_ptr();
     *p = pio_num;
     *p.add(1) = count;
-    let origin = (sys.dev_call)(-1, PIO_INSTR_ALLOC, p, 6);
+    let origin = (sys.provider_call)(-1, PIO_INSTR_ALLOC, p, 6);
     let mask = u32::from_le_bytes([*p.add(2), *p.add(3), *p.add(4), *p.add(5)]);
     (origin, mask)
 }
@@ -303,7 +306,7 @@ unsafe fn pio_instr_write(sys: &SyscallTable, pio_num: u8, addr: u8, instr: u16)
     let ib = instr.to_le_bytes();
     *p.add(2) = ib[0];
     *p.add(3) = ib[1];
-    (sys.dev_call)(-1, PIO_INSTR_WRITE, p, 4);
+    (sys.provider_call)(-1, PIO_INSTR_WRITE, p, 4);
 }
 
 unsafe fn pio_instr_free(sys: &SyscallTable, pio_num: u8, mask: u32) {
@@ -312,22 +315,22 @@ unsafe fn pio_instr_free(sys: &SyscallTable, pio_num: u8, mask: u32) {
     *p = pio_num;
     let mb = mask.to_le_bytes();
     *p.add(1) = mb[0]; *p.add(2) = mb[1]; *p.add(3) = mb[2]; *p.add(4) = mb[3];
-    (sys.dev_call)(-1, PIO_INSTR_FREE, p, 5);
+    (sys.provider_call)(-1, PIO_INSTR_FREE, p, 5);
 }
 
 unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) {
     let mut buf = [pin, pio_num, pull];
-    (sys.dev_call)(-1, PIO_PIN_SETUP, buf.as_mut_ptr(), 3);
+    (sys.provider_call)(-1, PIO_PIN_SETUP, buf.as_mut_ptr(), 3);
 }
 
 unsafe fn pio_fstat_read(sys: &SyscallTable, pio_num: u8) -> u32 {
     let mut buf = [pio_num];
-    (sys.dev_call)(-1, PIO_FSTAT_READ, buf.as_mut_ptr(), 1) as u32
+    (sys.provider_call)(-1, PIO_FSTAT_READ, buf.as_mut_ptr(), 1) as u32
 }
 
 unsafe fn pio_sm_restart(sys: &SyscallTable, pio_num: u8, sm_mask: u8) {
     let mut buf = [pio_num, sm_mask];
-    (sys.dev_call)(-1, PIO_SM_RESTART, buf.as_mut_ptr(), 2);
+    (sys.provider_call)(-1, PIO_SM_RESTART, buf.as_mut_ptr(), 2);
 }
 
 unsafe fn pio_txf_write(sys: &SyscallTable, pio_num: u8, sm: u8, value: u32) {
@@ -337,12 +340,13 @@ unsafe fn pio_txf_write(sys: &SyscallTable, pio_num: u8, sm: u8, value: u32) {
     *p.add(1) = sm;
     let vb = value.to_le_bytes();
     *p.add(2) = vb[0]; *p.add(3) = vb[1]; *p.add(4) = vb[2]; *p.add(5) = vb[3];
-    (sys.dev_call)(-1, PIO_TXF_WRITE, p, 6);
+    (sys.provider_call)(-1, PIO_TXF_WRITE, p, 6);
 }
 
-// DMA FD helpers
+// DMA FD helpers — open against PLATFORM_DMA_FD (0x0011).
 unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, DMA_FD_CREATE, core::ptr::null_mut(), 0)
+    const PLATFORM_DMA_FD: u32 = 0x0011;
+    (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)
 }
 
 unsafe fn dma_fd_start(
@@ -360,7 +364,7 @@ unsafe fn dma_fd_start(
     *p.add(8) = cb[0]; *p.add(9) = cb[1]; *p.add(10) = cb[2]; *p.add(11) = cb[3];
     *p.add(12) = dreq;
     *p.add(13) = flags;
-    (sys.dev_call)(fd, DMA_FD_START, p, 14)
+    (sys.provider_call)(fd, dma_fd::START, p, 14)
 }
 
 unsafe fn dma_fd_queue(
@@ -373,46 +377,49 @@ unsafe fn dma_fd_queue(
     *p = ra[0]; *p.add(1) = ra[1]; *p.add(2) = ra[2]; *p.add(3) = ra[3];
     let cb = count.to_le_bytes();
     *p.add(4) = cb[0]; *p.add(5) = cb[1]; *p.add(6) = cb[2]; *p.add(7) = cb[3];
-    (sys.dev_call)(fd, DMA_FD_QUEUE, p, 8)
+    (sys.provider_call)(fd, dma_fd::QUEUE, p, 8)
 }
 
 unsafe fn dma_fd_free(sys: &SyscallTable, fd: i32) {
-    (sys.dev_call)(fd, DMA_FD_FREE, core::ptr::null_mut(), 0);
+    (sys.provider_call)(fd, dma_fd::FREE, core::ptr::null_mut(), 0);
 }
 
 unsafe fn dma_fd_poll(sys: &SyscallTable, fd: i32) -> bool {
-    let ev = POLL_IN as u8; // dev_call FD_POLL takes 1-byte events arg
-    (sys.dev_call)(fd, FD_POLL, &ev as *const u8 as *mut u8, 1) & (POLL_IN as i32) != 0
+    let ev = POLL_IN as u8; // HANDLE_POLL takes a 1-byte events arg
+    (sys.provider_call)(fd, FD_POLL, &ev as *const u8 as *mut u8, 1) & (POLL_IN as i32) != 0
 }
 
-// Raw DMA helpers (for CMD blocking transfers)
+// Raw DMA helpers (for CMD blocking transfers) — opcodes imported.
 unsafe fn raw_dma_alloc(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, 0x0C80, core::ptr::null_mut(), 0)
+    // DMA_ALLOC returns a channel handle; track via provider_open on
+    // PLATFORM_DMA. Gated by `platform_raw` permission.
+    const PLATFORM_DMA: u32 = 0x0008;
+    (sys.provider_open)(PLATFORM_DMA, dma_channel::ALLOC, core::ptr::null(), 0)
 }
 
+// DMA_FREE / START / BUSY are handle-scoped — the handle is the
+// channel number returned by raw_dma_alloc. Kernel reads the channel
+// from the handle param; arg carries only the per-op payload.
 unsafe fn raw_dma_free(sys: &SyscallTable, ch: u8) {
-    let mut buf = [ch];
-    (sys.dev_call)(-1, 0x0C81, buf.as_mut_ptr(), 1);
+    (sys.provider_call)(ch as i32, dma_channel::FREE, core::ptr::null_mut(), 0);
 }
 
 unsafe fn raw_dma_start(sys: &SyscallTable, ch: u8, read: u32, write: u32, count: u32, dreq: u8, flags: u8) -> i32 {
-    let mut buf = [0u8; 15];
+    let mut buf = [0u8; 14];
     let p = buf.as_mut_ptr();
-    *p = ch;
     let r = read.to_le_bytes();
-    *p.add(1) = r[0]; *p.add(2) = r[1]; *p.add(3) = r[2]; *p.add(4) = r[3];
+    *p = r[0]; *p.add(1) = r[1]; *p.add(2) = r[2]; *p.add(3) = r[3];
     let w = write.to_le_bytes();
-    *p.add(5) = w[0]; *p.add(6) = w[1]; *p.add(7) = w[2]; *p.add(8) = w[3];
+    *p.add(4) = w[0]; *p.add(5) = w[1]; *p.add(6) = w[2]; *p.add(7) = w[3];
     let c = count.to_le_bytes();
-    *p.add(9) = c[0]; *p.add(10) = c[1]; *p.add(11) = c[2]; *p.add(12) = c[3];
-    *p.add(13) = dreq;
-    *p.add(14) = flags;
-    (sys.dev_call)(-1, 0x0C82, p, 15)
+    *p.add(8) = c[0]; *p.add(9) = c[1]; *p.add(10) = c[2]; *p.add(11) = c[3];
+    *p.add(12) = dreq;
+    *p.add(13) = flags;
+    (sys.provider_call)(ch as i32, dma_channel::START, p, 14)
 }
 
 unsafe fn raw_dma_busy(sys: &SyscallTable, ch: u8) -> bool {
-    let mut buf = [ch];
-    (sys.dev_call)(-1, 0x0C83, buf.as_mut_ptr(), 1) != 0
+    (sys.provider_call)(ch as i32, dma_channel::BUSY, core::ptr::null_mut(), 0) != 0
 }
 
 // ============================================================================
@@ -613,7 +620,7 @@ unsafe fn configure_cmd_sm(
         let pin_mask = 1u32 << slot.data_pin;
         let mask_bytes = pin_mask.to_le_bytes();
         let mut buf = [slot.pio_num, mask_bytes[0], mask_bytes[1], mask_bytes[2], mask_bytes[3]];
-        (sys.dev_call)(-1, PIO_INPUT_SYNC_BYPASS, buf.as_mut_ptr(), 5);
+        (sys.provider_call)(-1, PIO_INPUT_SYNC_BYPASS, buf.as_mut_ptr(), 5);
     }
 
     // Jump to entry point (wrap_target for cmd)
@@ -851,10 +858,17 @@ pub unsafe extern "C" fn pio_dispatch(
             if count == 0 || count as usize > STREAM_BUF_WORDS { return -22; }
             // Capture t0 on first push
             if (*sp).t0_lo == 0 && (*sp).t0_hi == 0 {
-                // Get current time via system timer query
-                let mut time_buf = [0u8; 4];
-                let _r = (sys.dev_call)(-1, 0x0C42, time_buf.as_mut_ptr(), 4); // TIME_US_LO
-                (*sp).t0_lo = u32::from_le_bytes(time_buf);
+                // Get current micros via kernel_abi::timer::MICROS.
+                let mut time_buf = [0u8; 8];
+                let _r = (sys.provider_call)(
+                    -1,
+                    abi::kernel_abi::timer::MICROS,
+                    time_buf.as_mut_ptr(),
+                    8,
+                );
+                let us = u64::from_le_bytes(time_buf);
+                (*sp).t0_lo = us as u32;
+                (*sp).t0_hi = (us >> 32) as u32;
             }
             (*sp).queued_units = (*sp).queued_units.wrapping_add(count as u32);
             (*sp).push_pending = 1;
@@ -919,8 +933,23 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         STREAM_TIME => {
             // Write StreamTime to arg: consumed_units:u64, queued_units:u32, rate_q16:u32, t0_micros:u64
+            // handle < 0: caller doesn't own a stream, so return the
+            // first active stream's time (documented "first active PIO
+            // stream" path in kernel_abi::STREAM_TIME).
             if arg.is_null() || arg_len < 24 { return -22; }
-            let idx = handle as usize;
+            let idx = if handle < 0 {
+                let mut found: usize = MAX_STREAM_SLOTS;
+                let mut i = 0usize;
+                while i < MAX_STREAM_SLOTS {
+                    let sp = s.streams.as_ptr().add(i);
+                    if (*sp).state != SLOT_FREE { found = i; break; }
+                    i += 1;
+                }
+                if found >= MAX_STREAM_SLOTS { return -19; } // ENODEV
+                found
+            } else {
+                handle as usize
+            };
             if idx >= MAX_STREAM_SLOTS { return -22; }
             let sp = s.streams.as_ptr().add(idx);
             if (*sp).state == SLOT_FREE { return -5; }
@@ -1122,7 +1151,7 @@ pub unsafe extern "C" fn pio_dispatch(
             *xp.add(20) = ra[0]; *xp.add(21) = ra[1]; *xp.add(22) = ra[2]; *xp.add(23) = ra[3];
             *xp.add(24) = dma_ch_tx;
             *xp.add(25) = dma_ch_rx;
-            (sys.dev_call)(-1, PIO_CMD_XFER, xp, 28);
+            (sys.provider_call)(-1, PIO_CMD_XFER, xp, 28);
 
             // Copy RX to caller (from second half of scratch where RX DMA wrote)
             let mut total_bytes = tx_len as i32;
@@ -1356,20 +1385,16 @@ pub extern "C" fn module_new(
         s.ctrl_chan = ctrl_chan;
         s.step_count = 0;
 
-        // Register as PIO provider (device class 0x04)
         let sys = &*s.syscalls;
-        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-        let mut reg_args = [0u8; 8];
-        let rp = reg_args.as_mut_ptr();
-        *rp = 0x04; // device_class = PIO
-        *rp.add(1) = 0; *rp.add(2) = 0; *rp.add(3) = 0;
-        let da = dispatch_hash.to_le_bytes();
-        *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
-        (sys.dev_call)(-1, 0x0C20, rp, 8); // REGISTER_PROVIDER
-
-        dev_log(sys, 3, b"[pio] provider registered".as_ptr(), 24);
+        dev_log(sys, 3, b"[pio] ready".as_ptr(), 10);
         0
     }
+}
+
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_provides_contract"]
+pub extern "C" fn module_provides_contract() -> u32 {
+    0x0004 // HAL_PIO
 }
 
 #[unsafe(no_mangle)]

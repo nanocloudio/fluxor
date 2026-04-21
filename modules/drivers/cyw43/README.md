@@ -69,17 +69,13 @@ direction = "ctrl_input"
 content_type = "FmpMessage"
 
 [[resources]]
-device_class = "pio"
+requires_contract = "pio"
 access = "exclusive"
 instance = 1
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
-
-[[resources]]
-device_class = "netif"
-access = "exclusive"
 
 [commands]
 accepts = ["connect", "disconnect", "scan"]

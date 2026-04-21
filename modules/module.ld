@@ -23,10 +23,11 @@ SECTIONS
         KEEP(*(.text.module_drain*))
         KEEP(*(.text.module_arena_size*))
         KEEP(*(.text.module_provider_dispatch*))
+        KEEP(*(.text.module_provides_contract*))
         KEEP(*(.text.module_flash_store_dispatch*))
         KEEP(*(.text.module_isr_init*))
         KEEP(*(.text.module_isr_entry*))
-        KEEP(*(.text.nvme_backing_dispatch*))
+        KEEP(*(.text.backing_provider_dispatch*))
         *(.text*)
         . = ALIGN(8);
     } > FLASH

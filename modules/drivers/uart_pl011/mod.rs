@@ -1,7 +1,7 @@
 //! UART Driver — PIC module provider
 //!
 //! Manages UART peripheral access using kernel register bridge.
-//! Registers as UART provider (device class 0x0D).
+//! Registers as the HAL_UART provider (contract id 0x0D).
 //! FIFO-based polling for TX/RX.
 
 #![no_std]
@@ -65,20 +65,22 @@ struct UartState {
     _pad: [u8; 3],
 }
 
+use abi::platform::rp::uart_raw::{REG_WRITE as UART_REG_WRITE, REG_READ as UART_REG_READ};
+
 unsafe fn uart_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
     let v = val.to_le_bytes();
     *bp.add(1) = v[0]; *bp.add(2) = v[1]; *bp.add(3) = v[2]; *bp.add(4) = v[3];
-    (sys.dev_call)(bus as i32, 0x0CC0, bp, 5);
+    (sys.provider_call)(bus as i32, UART_REG_WRITE, bp, 5);
 }
 
 unsafe fn uart_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
-    (sys.dev_call)(bus as i32, 0x0CC1, bp, 5);
+    (sys.provider_call)(bus as i32, UART_REG_READ, bp, 5);
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 
@@ -256,16 +258,15 @@ pub extern "C" fn module_new(
         s.in_chan = in_chan; s.out_chan = out_chan; s.ctrl_chan = ctrl_chan;
 
         let sys = &*s.syscalls;
-        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-        let mut reg = [0u8; 8];
-        let rp = reg.as_mut_ptr();
-        *rp = 0x0D; // UART class
-        let da = dispatch_hash.to_le_bytes();
-        *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
-        (sys.dev_call)(-1, 0x0C20, rp, 8);
-        dev_log(sys, 3, b"[uart] provider registered".as_ptr(), 25);
+        dev_log(sys, 3, b"[uart] ready".as_ptr(), 11);
         0
     }
+}
+
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_provides_contract"]
+pub extern "C" fn module_provides_contract() -> u32 {
+    0x000D // HAL_UART
 }
 
 #[unsafe(no_mangle)]

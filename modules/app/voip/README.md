@@ -45,7 +45,7 @@ direction = "ctrl_input"
 content_type = "FmpMessage"
 
 [[resources]]
-device_class = "socket"
+requires_contract = "socket"
 access = "write"
 ```
 

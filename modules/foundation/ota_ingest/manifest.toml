@@ -11,7 +11,3 @@ required = true
 name = "status"
 direction = "output"
 content_type = "OctetStream"
-
-[[resources]]
-device_class = "system"
-access = "write"

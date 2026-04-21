@@ -9,15 +9,14 @@
 //! shim that forwards PARAM_STORE/DELETE/CLEAR_ALL to the flash module's
 //! registered dispatch function.
 
-use crate::abi::runtime_store;
+use crate::abi::platform::rp::flash_layout;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const XIP_BASE: u32 = 0x1000_0000;
-const STORE_XIP: *const u8 = (XIP_BASE + runtime_store::OFFSET) as *const u8;
-const SECTOR_SIZE: usize = runtime_store::SIZE; // 4096
+const STORE_XIP: *const u8 = (flash_layout::XIP_BASE + flash_layout::PARAM_STORE_OFFSET) as *const u8;
+const SECTOR_SIZE: usize = flash_layout::PARAM_STORE_SIZE; // 4096
 const HEADER_SIZE: usize = 8;
 const ENTRY_HEADER_SIZE: usize = 4; // module_id + tag + flags + value_len
 const PAGE_SIZE: usize = 256;
@@ -134,7 +133,7 @@ pub fn boot_scan() {
 
         // Validate header magic
         let magic = read_u32(STORE_XIP);
-        if magic != runtime_store::MAGIC {
+        if magic != flash_layout::PARAM_STORE_MAGIC {
             // Virgin or corrupt sector — no overrides
             if magic == 0xFFFF_FFFF {
                 // Virgin sector, free_offset stays at start (no header yet)
@@ -144,7 +143,7 @@ pub fn boot_scan() {
         }
 
         let version = *STORE_XIP.add(4);
-        if version != runtime_store::VERSION {
+        if version != flash_layout::PARAM_STORE_VERSION {
             log::warn!("[flash_store] unknown version {}", version);
             return;
         }
@@ -385,31 +384,23 @@ pub unsafe fn merge_runtime_overrides(module_id: u8, param_buf: *mut u8, param_l
 /// bridge. Returns true when `offset` lies within the `size`-byte
 /// region starting at a known-writable sector.
 fn is_writable_sector(offset: u32, size: u32) -> bool {
-    use crate::abi::{blob_store, graph_slot};
     let end = offset.saturating_add(size);
 
     // Runtime parameter store — one sector.
-    if offset >= runtime_store::OFFSET
-        && end <= runtime_store::OFFSET + SECTOR_SIZE as u32
-    {
-        return true;
-    }
-
-    // Blob store — two-sector ping-pong.
-    if offset >= blob_store::OFFSET
-        && end <= blob_store::OFFSET + blob_store::SIZE as u32
+    if offset >= flash_layout::PARAM_STORE_OFFSET
+        && end <= flash_layout::PARAM_STORE_OFFSET + SECTOR_SIZE as u32
     {
         return true;
     }
 
     // Graph slots A and B — OTA-writable bundles.
-    if offset >= graph_slot::SLOT_A_OFFSET
-        && end <= graph_slot::SLOT_A_OFFSET + graph_slot::SLOT_SIZE
+    if offset >= flash_layout::GRAPH_SLOT_A_OFFSET
+        && end <= flash_layout::GRAPH_SLOT_A_OFFSET + flash_layout::GRAPH_SLOT_SIZE
     {
         return true;
     }
-    if offset >= graph_slot::SLOT_B_OFFSET
-        && end <= graph_slot::SLOT_B_OFFSET + graph_slot::SLOT_SIZE
+    if offset >= flash_layout::GRAPH_SLOT_B_OFFSET
+        && end <= flash_layout::GRAPH_SLOT_B_OFFSET + flash_layout::GRAPH_SLOT_SIZE
     {
         return true;
     }

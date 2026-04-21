@@ -1,6 +1,6 @@
 //! log_net — netconsole-style log forwarding.
 //!
-//! Drains the kernel log ring (via SYSTEM::LOG_RING_DRAIN 0x0C64) and
+//! Drains the kernel log ring (via LOG_RING_DRAIN (diag) 0x0C64) and
 //! forwards chunks as UDP datagrams through the IP module. Use this when
 //! the UART is unavailable (HAT blocking GPIO14/15, remote bring-up, etc.).
 //!
@@ -48,7 +48,7 @@ const NET_BUF_SIZE: usize = 600;
 /// Per-datagram log payload budget. Leaves ~72 B of slack vs NET_BUF_SIZE.
 const CHUNK_SIZE: usize = 512;
 
-/// SYSTEM::LOG_RING_DRAIN opcode. Kept local to avoid bumping the SDK
+/// LOG_RING_DRAIN (diag) opcode. Kept local to avoid bumping the SDK
 /// include surface for a single constant.
 const LOG_RING_DRAIN: u32 = 0x0C64;
 
@@ -358,7 +358,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Drain up to CHUNK_SIZE bytes from the ring.
                 let sys_ptr = s.syscalls;
                 let chunk_ptr = s.chunk.as_mut_ptr();
-                let ret = ((*sys_ptr).dev_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
+                let ret = ((*sys_ptr).provider_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
                 if ret <= 0 {
                     return 0;
                 }

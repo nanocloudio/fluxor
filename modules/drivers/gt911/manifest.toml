@@ -8,17 +8,17 @@ content_type = "InputEvent"
 required = true
 
 [[resources]]
-device_class = "i2c"
+requires_contract = "i2c"
 access = "exclusive"
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
 
 [[resources]]
-device_class = "event"
+requires_contract = "event"
 access = "write"
 
 [[resources]]
-device_class = "timer"
+requires_contract = "timer"
 access = "write"

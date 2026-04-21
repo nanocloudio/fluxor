@@ -53,7 +53,11 @@ mod wifi_ops;
 
 use constants::*;
 
-use abi::{dev_gpio, dev_pio, dev_netif};
+use abi::contracts::hal::{gpio as dev_gpio, pio as dev_pio};
+
+// Provider contract ids (mirror kernel::provider::contract::*).
+const HAL_GPIO_CONTRACT: u32 = 0x0001;
+const HAL_PIO_CONTRACT:  u32 = 0x0004;
 
 // ============================================================================
 // Firmware Blobs (in .rodata, read from flash XIP)
@@ -144,8 +148,10 @@ pub struct Cyw43State {
     // Value in ms (or TUs, ~1ms each). 0 = no comeback requested.
     pub comeback_ms: u32,
 
-    // Netif handle
-    pub netif_handle: i32,
+    // Netif state output channel (out[5]) — emits MSG_NETIF_STATE frames
+    // on state transitions. Consumers (wifi, ip) read from their wired
+    // input port.
+    pub netif_state_chan: i32,
 
     // Frame I/O buffer (shared between RX and TX operations)
     pub frame_buf: [u8; MAX_FRAME_SIZE],
@@ -330,6 +336,7 @@ pub extern "C" fn module_new(
         s.scan_bin_chan = dev_channel_port(&*s.syscalls, 1, 2); // out[2]: scan binary
         s.status_chan = dev_channel_port(&*s.syscalls, 1, 3);   // out[3]: status events
         s.bt_out_chan = dev_channel_port(&*s.syscalls, 1, 4);   // out[4]: BT HCI events
+        s.netif_state_chan = dev_channel_port(&*s.syscalls, 1, 5); // out[5]: netif state
 
         // Parse TLV params (sets defaults from schema if not in config)
         if !params.is_null() && params_len > 0 {
@@ -416,7 +423,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
         0 => {
             // Claim power pin (output, initially low = off)
             let mut pwr_arg = [s.pwr_pin];
-            let h = (sys.dev_call)(-1, dev_gpio::SET_OUTPUT, pwr_arg.as_mut_ptr(), 1);
+            let h = (sys.provider_open)(HAL_GPIO_CONTRACT, dev_gpio::SET_OUTPUT, pwr_arg.as_mut_ptr(), 1);
             if h < 0 {
                 log_error(s, b"[cyw43] pwr pin fail");
                 s.phase = Cyw43Phase::Error;
@@ -424,11 +431,11 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             }
             s.pwr_handle = h;
             let mut lvl = [0u8];
-            (sys.dev_call)(h, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+            (sys.provider_call)(h, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
 
             // Claim CS pin (output, initially high = deasserted)
             let mut cs_arg = [s.cs_pin];
-            let h = (sys.dev_call)(-1, dev_gpio::SET_OUTPUT, cs_arg.as_mut_ptr(), 1);
+            let h = (sys.provider_open)(HAL_GPIO_CONTRACT, dev_gpio::SET_OUTPUT, cs_arg.as_mut_ptr(), 1);
             if h < 0 {
                 log_error(s, b"[cyw43] cs pin fail");
                 s.phase = Cyw43Phase::Error;
@@ -436,11 +443,11 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             }
             s.cs_handle = h;
             let mut lvl = [1u8];
-            (sys.dev_call)(h, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+            (sys.provider_call)(h, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
 
-            // Allocate PIO command slot
+            // Allocate PIO command slot — tracked against HAL_PIO.
             let mut alloc_arg = [s.pio_idx, 0u8];
-            let h = (sys.dev_call)(-1, dev_pio::CMD_ALLOC, alloc_arg.as_mut_ptr(), 2);
+            let h = (sys.provider_open)(HAL_PIO_CONTRACT, dev_pio::CMD_ALLOC, alloc_arg.as_mut_ptr(), 2);
             if h < 0 {
                 log_error(s, b"[cyw43] pio alloc fail");
                 s.phase = Cyw43Phase::Error;
@@ -453,7 +460,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
         }
         1 => {
             // Load gSPI PIO program
-            let load_args = abi::PioLoadProgramArgs {
+            let load_args = abi::contracts::hal::pio::LoadProgramArgs {
                 program: GSPI_PIO_PROGRAM.as_ptr(),
                 program_len: GSPI_PIO_PROGRAM.len() as u32,
                 wrap_target: GSPI_PIO_WRAP_TARGET,
@@ -461,11 +468,11 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
                 sideset_bits: GSPI_PIO_SIDESET_BITS,
                 options: 0,
             };
-            let r = (sys.dev_call)(
+            let r = (sys.provider_call)(
                 s.pio_handle,
                 dev_pio::CMD_LOAD_PROGRAM,
                 &load_args as *const _ as *mut u8,
-                core::mem::size_of::<abi::PioLoadProgramArgs>(),
+                core::mem::size_of::<abi::contracts::hal::pio::LoadProgramArgs>(),
             );
             if r < 0 {
                 log_error(s, b"[cyw43] pio prog fail");
@@ -474,17 +481,17 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             }
 
             // Configure PIO pins
-            let cfg_args = abi::PioCmdConfigureArgs {
+            let cfg_args = abi::contracts::hal::pio::CmdConfigureArgs {
                 data_pin: s.dio_pin,
                 clk_pin: s.clk_pin,
                 _pad: [0; 2],
                 clock_div: DEFAULT_CLOCK_DIV,
             };
-            let r = (sys.dev_call)(
+            let r = (sys.provider_call)(
                 s.pio_handle,
                 dev_pio::CMD_CONFIGURE,
                 &cfg_args as *const _ as *mut u8,
-                core::mem::size_of::<abi::PioCmdConfigureArgs>(),
+                core::mem::size_of::<abi::contracts::hal::pio::CmdConfigureArgs>(),
             );
             if r < 0 {
                 log_error(s, b"[cyw43] pio cfg fail");
@@ -513,7 +520,7 @@ unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
         0 => {
             // Assert power (high)
             let mut lvl = [1u8];
-            (sys.dev_call)(s.pwr_handle, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
+            (sys.provider_call)(s.pwr_handle, dev_gpio::SET_LEVEL, lvl.as_mut_ptr(), 1);
             s.last_time_ms = dev_millis(sys);
             s.substep = 1;
             0
@@ -1883,24 +1890,14 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
     }
 }
 
-/// Phase 7: Register as a NetIF frame provider
+/// Phase 7: Signal radio-ready state and transition to Running.
 unsafe fn step_register_netif(s: &mut Cyw43State) -> i32 {
     let sys = &*s.syscalls;
 
     match s.substep {
         0 => {
-            // Open a netif of type WiFi
-            let mut netif_arg = [NETIF_TYPE_WIFI];
-            let handle = (sys.dev_call)(-1, dev_netif::OPEN, netif_arg.as_mut_ptr(), 1);
-            if handle < 0 {
-                log_error(s, b"[cyw43] netif open fail");
-                s.phase = Cyw43Phase::Error;
-                return -1;
-            }
-            s.netif_handle = handle;
-
-            // Signal "radio ready, not connected" so wifi module can proceed
-            dev_netif_set_state(sys, s.netif_handle, NETIF_STATE_NO_LINK);
+            // Emit "radio ready, not connected" so wifi module can proceed.
+            emit_netif_state(s, NETIF_STATE_NO_LINK);
 
             s.phase = Cyw43Phase::Running;
             s.substep = 0;
@@ -2042,9 +2039,8 @@ unsafe fn step_wifi_ops(s: &mut Cyw43State) {
         if result > 0 {
             s.pending_wifi_op = wifi_ops::WifiOp::None;
             s.wifi_substep = 0;
-            if s.netif_handle >= 0 && completed_op == wifi_ops::WifiOp::Disconnect {
-                let sys = &*s.syscalls;
-                dev_netif_set_state(sys, s.netif_handle, NETIF_STATE_DOWN);
+            if completed_op == wifi_ops::WifiOp::Disconnect {
+                emit_netif_state(s, NETIF_STATE_DOWN);
             }
             if completed_op == wifi_ops::WifiOp::Scan && s.scan_out_chan >= 0 {
                 let sys = &*s.syscalls;
@@ -2482,6 +2478,22 @@ unsafe fn emit_status_event(s: &mut Cyw43State, msg_type: u32, payload: &[u8]) {
     msg_write(sys, s.status_chan, msg_type, payload.as_ptr(), payload.len() as u16);
 }
 
+/// Emit an MSG_NETIF_STATE frame on netif_state_chan (out[5]).
+/// Drops silently if the port is unwired or the ring is full; consumers
+/// poll for the next transition.
+unsafe fn emit_netif_state(s: &Cyw43State, state: u8) {
+    if s.netif_state_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.netif_state_chan, POLL_OUT);
+    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
+        return;
+    }
+    let payload = [state];
+    msg_write(sys, s.netif_state_chan, MSG_NETIF_STATE, payload.as_ptr(), 1);
+}
+
 
 // ============================================================================
 // Frame Processing
@@ -2662,11 +2674,11 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                         }
                     }
                     WLC_E_LINK => {
-                        if status == WLC_E_STATUS_SUCCESS && s.netif_handle >= 0 {
+                        if status == WLC_E_STATUS_SUCCESS {
                             s.wifi_state = Cyw43WifiState::Connected;
                             s.assoc_retries = 0;
                             let sys = &*s.syscalls;
-                            dev_netif_set_state(sys, s.netif_handle, NETIF_STATE_NO_ADDRESS);
+                            emit_netif_state(s, NETIF_STATE_NO_ADDRESS);
                             log_info(s, b"[cyw43] link up");
 
                             // Send MAC to IP module via out_chan as a special frame:
@@ -2711,9 +2723,8 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                                 s.wifi_substep = 0;
                                 log_info(s, b"[cyw43] join retry");
                             }
-                        } else if s.netif_handle >= 0 {
-                            let sys = &*s.syscalls;
-                            dev_netif_set_state(sys, s.netif_handle, NETIF_STATE_DOWN);
+                        } else {
+                            emit_netif_state(s, NETIF_STATE_DOWN);
                             s.wifi_state = Cyw43WifiState::Ready;
                             log_error(s, b"[cyw43] link lost");
                             emit_status_event(s, MSG_DISCONNECTED, &[1]); // reason=1 (deauth)

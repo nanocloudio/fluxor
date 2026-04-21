@@ -85,9 +85,6 @@ const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
 const NET_CMD_CONNECT: u8 = 0x13;
 
-/// Netif dev_call opcodes (mirror abi::dev_netif)
-const DEV_NETIF_STATE: u32 = 0x0704;
-
 // ============================================================================
 // Module State
 // ============================================================================
@@ -115,9 +112,6 @@ pub struct IpState {
     ip_configured: bool,
     signaled_ready: bool,
     _ip_pad: [u8; 2],
-
-    // NetIF handle
-    netif_handle: i32,
 
     // ARP table
     arp_table: [arp::ArpEntry; arp::ARP_TABLE_SIZE],
@@ -515,7 +509,6 @@ pub extern "C" fn module_new(
 
         s.use_dhcp = 1;
         s.mac_valid = false;
-        s.netif_handle = -1;
 
         // Initialize ARP table
         let mut i = 0;
@@ -573,20 +566,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         // If still full, return Burst to try again quickly
         if s.pending_tx_len > 0 {
             return 2; // StepOutcome::Burst
-        }
-    }
-
-    // 0b. Lazy-init: find an active netif to push IP config to
-    if s.netif_handle < 0 {
-        let sys = &*s.syscalls;
-        let mut slot = 0i32;
-        while slot < 4 {
-            let st = (sys.dev_call)(slot, DEV_NETIF_STATE, core::ptr::null_mut(), 0);
-            if st >= 0 {
-                s.netif_handle = slot;
-                break;
-            }
-            slot += 1;
         }
     }
 
@@ -1671,8 +1650,6 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                     dev_log(sys, 1, bp, i);
                 }
 
-                // Update netif with IP configuration
-                apply_ip_config(s);
             }
         }
         dhcp::DHCP_NAK => {
@@ -1681,16 +1658,6 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
         }
         _ => {}
     }
-}
-
-/// Signal netif that IP configuration is applied (state → Ready).
-/// All IP config (address, mask, gateway, DNS) is managed locally by this module.
-unsafe fn apply_ip_config(s: &IpState) {
-    if s.netif_handle < 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    dev_netif_set_state(sys, s.netif_handle, NETIF_STATE_READY);
 }
 
 // ============================================================================

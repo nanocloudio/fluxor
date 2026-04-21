@@ -1,12 +1,14 @@
 //! Backing store for demand-paged arenas — thin kernel bridge.
 //!
-//! The full backing store logic (ramdisk, arena management) has been
-//! extracted into the `paging_provider` PIC module.
-//!
-//! This file retains:
-//! - The public API surface (backing_init, backing_register, etc.)
-//! - A built-in ramdisk fallback for configs without the paging module
-//! - Types shared with the pager (BackingType, WritebackPolicy, ArenaBackingInfo)
+//! Storage for demand-paged virtual memory comes from one of:
+//!   - `None`: zero-fill only (no persistence).
+//!   - `RamDisk`: a built-in RAM-resident page array (bring-up default).
+//!   - `External`: a driver module that has registered itself via the
+//!     `BACKING_PROVIDER_ENABLE` syscall (NVMe, SD card, eMMC, raw
+//!     flash, …). The kernel holds no device-specific knowledge — it
+//!     assigns each arena an abstract page-granular `backing_offset`
+//!     and the driver maps that to its own addressing (LBA, sector,
+//!     offset, …) in its dispatch handler.
 
 use crate::kernel::page_pool::PAGE_SIZE;
 
@@ -22,7 +24,8 @@ pub const MAX_RAMDISK_PAGES: usize = 256;
 pub enum BackingType {
     None = 0,
     RamDisk = 1,
-    Nvme = 2,
+    /// Backed by a driver module registered via BACKING_PROVIDER_ENABLE.
+    External = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +65,7 @@ impl ArenaBackingInfo {
 }
 
 // ============================================================================
-// Static state (kernel fallback when paging_provider module not loaded)
+// Static state
 // ============================================================================
 
 #[cfg(feature = "chip-bcm2712")]
@@ -72,6 +75,12 @@ static mut ARENAS: [ArenaBackingInfo; MAX_ARENAS] = [ArenaBackingInfo::empty(); 
 
 #[cfg(feature = "chip-bcm2712")]
 static mut RAMDISK_NEXT_OFFSET: u32 = 0;
+
+/// Running page counter for `External`-backed arenas. Each registration
+/// carves `virtual_pages` from this counter and hands the starting
+/// page index back as `backing_offset`. The driver interprets that
+/// abstract page index in its own addressing (LBA, sector, …).
+static mut EXTERNAL_ARENA_NEXT_PAGE: u32 = 0;
 
 // ============================================================================
 // Public API
@@ -85,21 +94,9 @@ pub fn backing_init() {
         }
         #[cfg(feature = "chip-bcm2712")]
         { *(&raw mut RAMDISK_NEXT_OFFSET) = 0; }
+        *(&raw mut EXTERNAL_ARENA_NEXT_PAGE) = 0;
     }
 }
-
-/// Per-arena LBA layout for NVMe-backed arenas.
-///
-/// Arenas are allocated back-to-back starting at LBA `NVME_ARENA_LBA_BASE`
-/// on namespace 1. Each 4 KB virtual page occupies `PAGE_SIZE / 512 = 8`
-/// LBAs (assuming 512 B LBAs, which is what fat32 also requires). The
-/// low LBA range 0..NVME_ARENA_LBA_BASE is left free for a FAT32
-/// partition header, which is the typical shared-media configuration
-/// (fat32 at the front, paged arenas in the raw tail).
-const NVME_ARENA_LBA_BASE: u64 = 0x0020_0000; // 1 GB in
-const PAGE_SIZE_LBAS:      u64 = (PAGE_SIZE / 512) as u64;
-
-static mut NVME_ARENA_NEXT_LBA: u64 = NVME_ARENA_LBA_BASE;
 
 pub fn backing_register(
     module_idx: u8,
@@ -130,18 +127,17 @@ pub fn backing_register(
                 #[cfg(not(feature = "chip-bcm2712"))]
                 { backing_offset = 0; }
             }
-            BackingType::Nvme => {
-                // NVMe-backed arenas carve an LBA span from the tail of
-                // namespace 1. The offset field stores the arena's
-                // starting LBA divided by PAGE_SIZE_LBAS so it fits in
-                // u32 (vpage granular).
-                let next_lba = &raw mut NVME_ARENA_NEXT_LBA;
-                let base_vpage = (*next_lba / PAGE_SIZE_LBAS) as u32;
-                if (base_vpage as u64 + virtual_pages as u64) > (u32::MAX as u64) {
+            BackingType::External => {
+                // Abstract page-granular allocation — the driver
+                // converts to device-specific addressing in its
+                // dispatch handler.
+                let next = &raw mut EXTERNAL_ARENA_NEXT_PAGE;
+                let base_page = *next;
+                if (base_page as u64 + virtual_pages as u64) > (u32::MAX as u64) {
                     return -1;
                 }
-                *next_lba += (virtual_pages as u64) * PAGE_SIZE_LBAS;
-                backing_offset = base_vpage;
+                *next = base_page + virtual_pages;
+                backing_offset = base_page;
             }
             BackingType::None => { backing_offset = 0; }
         }
@@ -154,17 +150,17 @@ pub fn backing_register(
     }
 }
 
-/// Build the 24-byte arg buffer the nvme_backing dispatch expects:
-///   [arena_lba_base: u64 LE][vpage_idx: u32 LE][buf_ptr: u64 LE][_pad: u32]
+/// Build the 16-byte arg buffer the backing_provider dispatch expects:
+///   [arena_base_page: u32 LE][vpage_idx: u32 LE][buf_ptr: u64 LE]
 #[cfg(feature = "chip-bcm2712")]
-fn build_nvme_arg(arena_lba_base: u64, vpage_idx: u32, buf: u64) -> [u8; 24] {
-    let mut a = [0u8; 24];
-    let b0 = arena_lba_base.to_le_bytes();
-    a[0..8].copy_from_slice(&b0);
+fn build_backing_arg(arena_base_page: u32, vpage_idx: u32, buf: u64) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    let b0 = arena_base_page.to_le_bytes();
+    a[0..4].copy_from_slice(&b0);
     let b1 = vpage_idx.to_le_bytes();
-    a[8..12].copy_from_slice(&b1);
+    a[4..8].copy_from_slice(&b1);
     let b2 = buf.to_le_bytes();
-    a[12..20].copy_from_slice(&b2);
+    a[8..16].copy_from_slice(&b2);
     a
 }
 
@@ -188,17 +184,15 @@ pub fn backing_read(arena_id: usize, vpage_idx: u32, buf: *mut u8) -> i32 {
             }
             0
         }
-        BackingType::Nvme => {
+        BackingType::External => {
             #[cfg(feature = "chip-bcm2712")]
             {
-                if !crate::kernel::nvme_backing::ready() {
+                if !crate::kernel::backing_provider::ready() {
                     return crate::kernel::errno::ENODEV;
                 }
-                let arena_lba_base =
-                    (info.backing_offset as u64) * PAGE_SIZE_LBAS;
-                let mut arg = build_nvme_arg(arena_lba_base, vpage_idx, buf as u64);
-                crate::kernel::nvme_backing::dispatch(
-                    crate::kernel::nvme_backing::op::READ_PAGE,
+                let mut arg = build_backing_arg(info.backing_offset, vpage_idx, buf as u64);
+                crate::kernel::backing_provider::dispatch(
+                    crate::kernel::backing_provider::op::READ_PAGE,
                     arg.as_mut_ptr(),
                     arg.len(),
                 )
@@ -233,17 +227,15 @@ pub fn backing_write(arena_id: usize, vpage_idx: u32, buf: *const u8) -> i32 {
             }
             0
         }
-        BackingType::Nvme => {
+        BackingType::External => {
             #[cfg(feature = "chip-bcm2712")]
             {
-                if !crate::kernel::nvme_backing::ready() {
+                if !crate::kernel::backing_provider::ready() {
                     return crate::kernel::errno::ENODEV;
                 }
-                let arena_lba_base =
-                    (info.backing_offset as u64) * PAGE_SIZE_LBAS;
-                let mut arg = build_nvme_arg(arena_lba_base, vpage_idx, buf as u64);
-                crate::kernel::nvme_backing::dispatch(
-                    crate::kernel::nvme_backing::op::WRITE_PAGE,
+                let mut arg = build_backing_arg(info.backing_offset, vpage_idx, buf as u64);
+                crate::kernel::backing_provider::dispatch(
+                    crate::kernel::backing_provider::op::WRITE_PAGE,
                     arg.as_mut_ptr(),
                     arg.len(),
                 )
@@ -258,9 +250,9 @@ pub fn backing_write(arena_id: usize, vpage_idx: u32, buf: *const u8) -> i32 {
 pub fn backing_flush(_arena_id: usize) -> i32 {
     #[cfg(feature = "chip-bcm2712")]
     {
-        if crate::kernel::nvme_backing::ready() {
-            return crate::kernel::nvme_backing::dispatch(
-                crate::kernel::nvme_backing::op::FLUSH,
+        if crate::kernel::backing_provider::ready() {
+            return crate::kernel::backing_provider::dispatch(
+                crate::kernel::backing_provider::op::FLUSH,
                 core::ptr::null_mut(),
                 0,
             );
@@ -269,20 +261,15 @@ pub fn backing_flush(_arena_id: usize) -> i32 {
     0
 }
 
+/// Mark an arena slot free. Called by the pager when a module tears
+/// down its paged arena. The slot is reusable on the next register;
+/// we do not reclaim the `backing_offset` span (it's bump-allocated
+/// and the driver is free to over-write it on the next registration).
 pub fn backing_release(arena_id: usize) {
     let arenas = &raw mut ARENAS;
     unsafe {
-        if arena_id < MAX_ARENAS { (*arenas)[arena_id] = ArenaBackingInfo::empty(); }
+        if arena_id < MAX_ARENAS {
+            (*arenas)[arena_id] = ArenaBackingInfo::empty();
+        }
     }
 }
-
-pub fn backing_info(arena_id: usize) -> Option<ArenaBackingInfo> {
-    let arenas = &raw const ARENAS;
-    unsafe {
-        if arena_id < MAX_ARENAS && (*arenas)[arena_id].active {
-            Some((*arenas)[arena_id])
-        } else { None }
-    }
-}
-
-pub fn backing_is_clean(_arena_id: usize) -> bool { true }

@@ -12,6 +12,7 @@ Flash Module — BOOTSEL Button + Blob Serving + Runtime Parameter Store
 ```toml
 version = "1.0.0"
 hardware_targets = ["rp2350"]
+permissions = ["flash_raw", "backing_provider"]
 
 [[ports]]
 name = "events"
@@ -26,10 +27,6 @@ content_type = "OctetStream"
 
 [commands]
 emits = ["toggle", "next", "prev", "long_press", "on", "off"]
-
-[[resources]]
-device_class = "system"
-access = "read"
 ```
 
 ## Parameters

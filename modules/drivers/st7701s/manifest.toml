@@ -1,5 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["rp2350"]
+permissions = ["platform_raw"]
 
 [[ports]]
 name = "pixels"
@@ -8,13 +9,17 @@ content_type = "ImageRaw"
 required = false
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
 
 [[resources]]
-device_class = "pio"
+requires_contract = "pio"
 access = "exclusive"
 
 [[resources]]
-device_class = "timer"
+requires_contract = "timer"
 access = "write"
+
+[[resources]]
+requires_contract = "platform_dma_fd"
+access = "exclusive"

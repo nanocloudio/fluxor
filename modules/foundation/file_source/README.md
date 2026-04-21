@@ -20,7 +20,7 @@ content_type = "AudioPcm"
 required = true
 
 [[resources]]
-device_class = "fs"
+requires_contract = "fs"
 access = "read"
 ```
 

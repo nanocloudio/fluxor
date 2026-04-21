@@ -16,7 +16,7 @@
 //! **Output:** Raw audio samples (i16 stereo)
 //!
 //! The module maintains a read buffer and streams data from the filesystem
-//! via dev_call with FS opcodes (0x0900-0x09FF).
+//! via provider_call with FS opcodes (0x0900-0x09FF).
 
 #![no_std]
 
@@ -34,12 +34,9 @@ include!("../../sdk/params.rs");
 // ============================================================================
 
 
-// FS opcodes (from abi::dev_fs)
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
+// FS contract + opcodes from the layered ABI.
+const FS_CONTRACT: u32 = 0x0009; // abi::kernel::provider::contract::FS
+use abi::contracts::storage::fs::{OPEN as FS_OPEN, READ as FS_READ, SEEK as FS_SEEK, CLOSE as FS_CLOSE, STAT as FS_STAT};
 
 /// Read buffer size (must be multiple of 4 for alignment)
 const READ_BUF_SIZE: usize = 512;
@@ -231,7 +228,7 @@ pub unsafe extern "C" fn module_poll(
                 if state.fd >= 0 {
                     // Seek to beginning
                     let mut pos_buf = 0u32.to_le_bytes();
-                    (sys.dev_call)(state.fd, FS_SEEK, pos_buf.as_mut_ptr(), 4);
+                    (sys.provider_call)(state.fd, FS_SEEK, pos_buf.as_mut_ptr(), 4);
                     state.file_pos = 0;
                     state.buf_avail = 0;
                     state.buf_pos = 0;
@@ -254,7 +251,7 @@ pub unsafe extern "C" fn module_poll(
                 // Refill read buffer if needed
                 if state.buf_avail == 0 {
                     if state.fd >= 0 {
-                        let bytes_read = (sys.dev_call)(
+                        let bytes_read = (sys.provider_call)(
                             state.fd,
                             FS_READ,
                             state.read_buf.as_mut_ptr(),
@@ -270,7 +267,7 @@ pub unsafe extern "C" fn module_poll(
                             if state.loop_mode == 1 {
                                 // Loop: seek to beginning
                                 let mut pos_buf = 0u32.to_le_bytes();
-                                (sys.dev_call)(state.fd, FS_SEEK, pos_buf.as_mut_ptr(), 4);
+                                (sys.provider_call)(state.fd, FS_SEEK, pos_buf.as_mut_ptr(), 4);
                                 state.file_pos = 0;
                                 continue;
                             } else {
@@ -373,7 +370,7 @@ pub unsafe extern "C" fn module_drop(
 
     // Close file if open
     if state.fd >= 0 {
-        (sys.dev_call)(state.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(state.fd, FS_CLOSE, core::ptr::null_mut(), 0);
         state.fd = -1;
     }
 }
@@ -385,18 +382,19 @@ pub unsafe extern "C" fn module_drop(
 unsafe fn load_file(state: &mut State, path: &[u8], path_len: usize, sys: &SyscallTable) {
     // Close existing file
     if state.fd >= 0 {
-        (sys.dev_call)(state.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(state.fd, FS_CLOSE, core::ptr::null_mut(), 0);
         state.fd = -1;
     }
 
-    // Open new file
-    let fd = (sys.dev_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path_len);
+    // Open new file (handle-scoped: fd gets tracked against the FS
+    // contract so subsequent FS_* ops route through the FS vtable).
+    let fd = (sys.provider_open)(FS_CONTRACT, FS_OPEN, path.as_ptr(), path_len);
     if fd >= 0 {
         state.fd = fd;
 
         // Get file size (stat returns [size: u32, mtime: u32])
         let mut stat_buf = [0u8; 8];
-        (sys.dev_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+        (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
         let size = u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]]);
         state.file_size = size;
         state.file_pos = 0;

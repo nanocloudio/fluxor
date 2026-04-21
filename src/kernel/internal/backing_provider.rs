@@ -1,22 +1,24 @@
-//! NVMe backing-store dispatch registry.
+//! Generic backing-provider dispatch registry.
 //!
-//! Mirrors the `blob_store` / `graph_slot` pattern: the NVMe PIC
-//! driver module exports a dispatch function which the kernel's
-//! `backing_store::backing_read/write` path calls synchronously when
-//! an arena is registered with `BackingType::Nvme`.
+//! A driver module that provides paged-arena backing storage (NVMe,
+//! SD card, eMMC, raw flash, …) exports a dispatch function which
+//! the kernel's `backing_store::backing_read/write` path calls
+//! synchronously for arenas registered with `BackingType::External`.
+//! Only one backing provider is active at a time — the last one to
+//! register wins.
 //!
-//! Opcodes used by the dispatch fn are declared here so the kernel
-//! side and the module side agree without pulling in ABI constants.
-//! The dispatch fn itself is free to use its own internal CIDs / DMA
-//! buffers; the kernel just cares about the (op, arena_lba, vpage,
-//! buf) → i32 contract.
+//! The dispatch fn receives a page-granular `arena_base_page` from the
+//! kernel (an abstract counter the kernel assigns per registered
+//! arena) plus `vpage_idx` within that arena. The driver converts
+//! these to its device-specific addressing however it wants (LBA,
+//! sector, offset, …) — the kernel has no device-layout knowledge.
 
 /// Op constants for the dispatch fn.
 pub mod op {
     /// Read one page (PAGE_SIZE bytes) from the device into `buf`.
     ///
-    /// arg layout (24 bytes, little-endian):
-    ///   [arena_lba_base: u64][vpage_idx: u32][buf_ptr: u64][_pad: u32]
+    /// arg layout (16 bytes, little-endian):
+    ///   [arena_base_page: u32][vpage_idx: u32][buf_ptr: u64]
     pub const READ_PAGE:  u32 = 0x0001;
     /// Write one page (PAGE_SIZE bytes) from `buf` to the device.
     pub const WRITE_PAGE: u32 = 0x0002;
@@ -26,24 +28,24 @@ pub mod op {
 
 /// Dispatch function signature: `(state, opcode, arg, arg_len) -> i32`.
 /// `i32` is 0 on success, negative errno on failure.
-pub type NvmeBackingDispatchFn =
+pub type BackingProviderDispatchFn =
     unsafe extern "C" fn(state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
 
-static mut DISPATCH: Option<NvmeBackingDispatchFn> = None;
+static mut DISPATCH: Option<BackingProviderDispatchFn> = None;
 static mut STATE: *mut u8 = core::ptr::null_mut();
 
-/// Called from the NVMe PIC module after `Identify Namespace` has
-/// completed, via the `NVME_BACKING_ENABLE` syscall. Records the
+/// Called from the provider PIC module once it's ready to serve page
+/// I/O, via the `BACKING_PROVIDER_ENABLE` syscall. Records the
 /// dispatch fn so `backing_store` can route pager reads/writes.
 ///
 /// # Safety
 /// `dispatch` must be a live function pointer exported by the caller's
 /// module; `state` must point to the caller's state arena and stay
 /// live until the graph tears down.
-pub unsafe fn register(dispatch: NvmeBackingDispatchFn, state: *mut u8) {
+pub unsafe fn register(dispatch: BackingProviderDispatchFn, state: *mut u8) {
     DISPATCH = Some(dispatch);
     STATE = state;
-    log::info!("[nvme_backing] dispatch registered");
+    log::info!("[backing] provider dispatch registered");
 }
 
 /// Clear registration. `scheduler::reset` calls this between graph
@@ -56,7 +58,7 @@ pub fn unregister() {
     }
 }
 
-/// Returns true once an NVMe-backed arena can be used.
+/// Returns true once an External-backed arena can be used.
 pub fn ready() -> bool {
     unsafe { (*(&raw const DISPATCH)).is_some() }
 }

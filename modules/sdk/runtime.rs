@@ -393,7 +393,9 @@ pub const SOCK_TYPE_DGRAM: u8 = 2;
 pub const CHAIN_NEXT: u32 = 0x0001_0000;
 
 // ============================================================================
-// Network Interface State (set via dev_netif_set_state)
+// Network Interface State (emitted as MSG_NETIF_STATE payload byte on the
+// driver's dedicated state output port; consumer modules read from the
+// wired state input port)
 // ============================================================================
 
 pub const NETIF_STATE_DOWN: u8 = 0;
@@ -401,7 +403,6 @@ pub const NETIF_STATE_NO_LINK: u8 = 2;
 pub const NETIF_STATE_NO_ADDRESS: u8 = 4;
 pub const NETIF_STATE_READY: u8 = 5;
 pub const NETIF_STATE_ERROR: u8 = 255;
-pub const NETIF_TYPE_WIFI: u8 = 1;
 
 // ============================================================================
 // Channel Ioctl Commands
@@ -420,6 +421,11 @@ pub const IOCTL_EOF: u32 = 4;
 pub const MSG_RADIO_READY: u32 = fnv1a(b"radio_ready");
 pub const MSG_CONNECTED: u32 = fnv1a(b"connected");
 pub const MSG_DISCONNECTED: u32 = fnv1a(b"disconnected");
+
+// Netif state change. Payload: [state: u8] using NETIF_STATE_* values above.
+// Emitted by drivers (cyw43, ch9120, …) on a dedicated "netif_state" output
+// port; read by consumers (wifi, ip, …) on a wired input port.
+pub const MSG_NETIF_STATE: u32 = fnv1a(b"netif_state");
 pub const MSG_CONNECT: u32 = fnv1a(b"connect");
 pub const MSG_DISCONNECT: u32 = fnv1a(b"disconnect");
 pub const MSG_SCAN: u32 = fnv1a(b"scan");
@@ -596,48 +602,53 @@ pub unsafe fn write_channel_hints(
 }
 
 // ============================================================================
-// dev_call Convenience Helpers
+// provider_call convenience wrappers
 // ============================================================================
+//
+// Thin typed wrappers around common `provider_call(handle=-1, op, ...)`
+// global operations — logging, timing, arena queries, channel ioctl,
+// bridge I/O, flash sideband, paged-arena ops, runtime params.
+// Everything routes through `SyscallTable::provider_call`.
 
-/// Get monotonic time in milliseconds via dev_call (TIMER::MILLIS 0x0602).
+/// Monotonic time in milliseconds (TIMER::MILLIS 0x0602).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
-    (sys.dev_call)(-1, 0x0602, buf.as_mut_ptr(), 8);
+    (sys.provider_call)(-1, 0x0602, buf.as_mut_ptr(), 8);
     u64::from_le_bytes(buf)
 }
 
-/// Log a message via dev_call (SYSTEM::LOG 0x0C40). Level encoded as handle.
+/// Log a message (kernel primitive LOG_WRITE, opcode 0x0C40). Level encoded as handle.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_log(sys: &SyscallTable, level: u8, msg: *const u8, len: usize) {
-    (sys.dev_call)(level as i32, 0x0C40, msg as *mut u8, len);
+    (sys.provider_call)(level as i32, 0x0C40, msg as *mut u8, len);
 }
 
-/// Poll any fd via dev_call (SYSTEM::FD_POLL 0x0C41).
+/// Poll any fd via provider_call (kernel primitive HANDLE_POLL, opcode 0x0C41).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u32) -> i32 {
     let mut buf = [events as u8];
-    (sys.dev_call)(fd, 0x0C41, buf.as_mut_ptr(), 1)
+    (sys.provider_call)(fd, 0x0C41, buf.as_mut_ptr(), 1)
 }
 
-/// Create an event via dev_call (EVENT::CREATE 0x0B00).
+/// Create an event via provider_call (EVENT::CREATE 0x0B00).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_event_create(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, 0x0B00, core::ptr::null_mut(), 0)
+    (sys.provider_call)(-1, 0x0B00, core::ptr::null_mut(), 0)
 }
 
-/// Poll an event via dev_call (EVENT::POLL 0x0B02). Returns 1 if signaled (clears it), 0 if not.
+/// Poll an event via provider_call (EVENT::POLL 0x0B02). Returns 1 if signaled (clears it), 0 if not.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_event_poll(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, 0x0B02, core::ptr::null_mut(), 0)
+    (sys.provider_call)(handle, 0x0B02, core::ptr::null_mut(), 0)
 }
 
-/// Bind an event to a hardware IRQ (SYSTEM::IRQ_BIND 0x0C51).
+/// Bind an event to a hardware IRQ (kernel primitive BIND_IRQ, opcode 0x0C51).
 /// `irq`: GIC interrupt number. `mmio_base`: virtio-mmio base for auto-ACK (0 = none).
 #[allow(dead_code)]
 unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_base: usize) -> i32 {
@@ -649,36 +660,37 @@ unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_bas
     let mb = (mmio_base as u64).to_le_bytes();
     let mut i = 0;
     while i < 8 { *bp.add(4 + i) = mb[i]; i += 1; }
-    (sys.dev_call)(event_handle, 0x0C51, bp, 12)
+    (sys.provider_call)(event_handle, 0x0C51, bp, 12)
 }
 
-/// Query graph-level sample rate via dev_query (SYSTEM::GRAPH_SAMPLE_RATE 0x0C31).
+/// Query graph-level sample rate (kernel primitive GRAPH_SAMPLE_RATE, opcode 0x0C31).
 /// Returns 0 if not configured.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
-    let r = (sys.dev_query)(-1, 0x0C31, buf.as_mut_ptr(), 4);
+    let r = (sys.provider_query)(-1, 0x0C31, buf.as_mut_ptr(), 4);
     if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
 }
 
-/// Query system clock frequency via dev_query (SYSTEM::SYS_CLOCK_HZ 0x0C3B).
+/// Query system clock frequency (kernel primitive SYS_CLOCK_HZ, opcode 0x0C3B).
 /// Returns 0 on error (should not happen in practice).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_sys_clock_hz(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
-    let r = (sys.dev_query)(-1, 0x0C3B, buf.as_mut_ptr(), 4);
+    let r = (sys.provider_query)(-1, 0x0C3B, buf.as_mut_ptr(), 4);
     if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
 }
 
-/// Query PIO stream time via dev_query (SYSTEM::STREAM_TIME 0x0C30).
-/// Returns (consumed_units, queued_units, units_per_sec_q16, t0_micros) or zeros on error.
+/// Query stream time via `provider_query(-1, kernel_abi::STREAM_TIME)`.
+/// Returns the first active PIO stream's (consumed_units, queued_units,
+/// units_per_sec_q16, t0_micros), or zeros if no stream is active.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
     let mut buf = [0u8; 24]; // StreamTime is 24 bytes
-    let r = (sys.dev_query)(-1, 0x0C30, buf.as_mut_ptr(), 24);
+    let r = (sys.provider_query)(-1, abi::kernel_abi::STREAM_TIME, buf.as_mut_ptr(), 24);
     if r < 0 {
         return (0, 0, 0, 0);
     }
@@ -689,37 +701,37 @@ unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
     (consumed, queued, rate_q16, t0)
 }
 
-/// Query downstream latency via dev_query (SYSTEM::DOWNSTREAM_LATENCY 0x0C33).
+/// Query downstream latency (kernel primitive DOWNSTREAM_LATENCY, opcode 0x0C33).
 /// Returns frames of latency downstream from the calling module, or 0.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_downstream_latency(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
-    let r = (sys.dev_query)(-1, 0x0C33, buf.as_mut_ptr(), 4);
+    let r = (sys.provider_query)(-1, 0x0C33, buf.as_mut_ptr(), 4);
     if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
 }
 
-/// Report module's processing latency via dev_call (SYSTEM::REPORT_LATENCY 0x0C50).
+/// Report module's processing latency (kernel primitive REPORT_LATENCY, opcode 0x0C50).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
     let mut buf = frames.to_le_bytes();
-    (sys.dev_call)(-1, 0x0C50, buf.as_mut_ptr(), 4);
+    (sys.provider_call)(-1, 0x0C50, buf.as_mut_ptr(), 4);
 }
 
-/// Discover channel port via dev_call (CHANNEL::PORT 0x050C).
+/// Discover channel port via provider_call (CHANNEL::PORT 0x050C).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 {
     let mut buf = [0u8; 2];
     // Volatile stores: PIC aarch64 otherwise dead-stores the buffer and
-    // dev_call sees zeros on entry.
+    // provider_call sees zeros on entry.
     core::ptr::write_volatile(buf.as_mut_ptr(), port_type);
     core::ptr::write_volatile(buf.as_mut_ptr().add(1), index);
-    (sys.dev_call)(-1, 0x050C, buf.as_mut_ptr(), 2)
+    (sys.provider_call)(-1, 0x050C, buf.as_mut_ptr(), 2)
 }
 
-/// Channel ioctl via dev_call (CHANNEL::IOCTL 0x0506).
+/// Channel ioctl via provider_call (CHANNEL::IOCTL 0x0506).
 /// data: pointer to u32 for SET_U32/GET_U32, or null for FLUSH/SET_HUP.
 #[allow(dead_code)]
 #[inline(always)]
@@ -730,7 +742,7 @@ unsafe fn dev_channel_ioctl(sys: &SyscallTable, handle: i32, cmd: u32, data: *mu
         core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr().add(4), 4);
     }
     let len = if data.is_null() { 4 } else { 8 };
-    let result = (sys.dev_call)(handle, 0x0506, buf.as_mut_ptr(), len);
+    let result = (sys.provider_call)(handle, 0x0506, buf.as_mut_ptr(), len);
     if !data.is_null() {
         core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), data, 4);
     }
@@ -759,7 +771,7 @@ unsafe fn dev_channel_register_ioctl(
         None => 0u64,
     };
     buf[8..16].copy_from_slice(&hfn.to_le_bytes());
-    (sys.dev_call)(handle, 0x0507, buf.as_mut_ptr(), 16)
+    (sys.provider_call)(handle, 0x0507, buf.as_mut_ptr(), 16)
 }
 
 /// Variable-length channel ioctl / query. Identical wire format to
@@ -794,50 +806,50 @@ unsafe fn dev_channel_query(
         if arg.is_null() { return -22; }
         core::ptr::copy_nonoverlapping(arg, buf.as_mut_ptr().add(4), arg_len);
     }
-    let result = (sys.dev_call)(handle, 0x0506, buf.as_mut_ptr(), 4 + arg_len);
+    let result = (sys.provider_call)(handle, 0x0506, buf.as_mut_ptr(), 4 + arg_len);
     if arg_len > 0 {
         core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), arg, arg_len);
     }
     result
 }
 
-/// Acquire write access to mailbox buffer via dev_call (BUFFER::ACQUIRE_WRITE 0x0A00).
+/// Acquire write access to mailbox buffer via provider_call (BUFFER::ACQUIRE_WRITE 0x0A00).
 /// Returns pointer (as *mut u8) or null. capacity_out receives buffer capacity.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_write(sys: &SyscallTable, chan: i32, capacity_out: *mut u32) -> *mut u8 {
-    (sys.dev_call)(chan, 0x0A00, capacity_out as *mut u8, 4) as *mut u8
+    (sys.provider_call)(chan, 0x0A00, capacity_out as *mut u8, 4) as *mut u8
 }
 
-/// Release write buffer via dev_call (BUFFER::RELEASE_WRITE 0x0A01).
+/// Release write buffer via provider_call (BUFFER::RELEASE_WRITE 0x0A01).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_buffer_release_write(sys: &SyscallTable, chan: i32, len: u32) -> i32 {
     let mut buf = len.to_le_bytes();
-    (sys.dev_call)(chan, 0x0A01, buf.as_mut_ptr(), 4)
+    (sys.provider_call)(chan, 0x0A01, buf.as_mut_ptr(), 4)
 }
 
-/// Acquire in-place buffer access via dev_call (BUFFER::ACQUIRE_INPLACE 0x0A04).
+/// Acquire in-place buffer access via provider_call (BUFFER::ACQUIRE_INPLACE 0x0A04).
 /// Returns pointer to existing data or null. len_out receives data length.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_inplace(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *mut u8 {
-    (sys.dev_call)(chan, 0x0A04, len_out as *mut u8, 4) as *mut u8
+    (sys.provider_call)(chan, 0x0A04, len_out as *mut u8, 4) as *mut u8
 }
 
-/// Acquire read access to buffer via dev_call (BUFFER::ACQUIRE_READ 0x0A02).
+/// Acquire read access to buffer via provider_call (BUFFER::ACQUIRE_READ 0x0A02).
 /// Returns pointer to data or null. len_out receives data length.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_read(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *const u8 {
-    (sys.dev_call)(chan, 0x0A02, len_out as *mut u8, 4) as *const u8
+    (sys.provider_call)(chan, 0x0A02, len_out as *mut u8, 4) as *const u8
 }
 
-/// Release read buffer via dev_call (BUFFER::RELEASE_READ 0x0A03).
+/// Release read buffer via provider_call (BUFFER::RELEASE_READ 0x0A03).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
-    (sys.dev_call)(chan, 0x0A03, core::ptr::null_mut(), 0)
+    (sys.provider_call)(chan, 0x0A03, core::ptr::null_mut(), 0)
 }
 
 // ============================================================================
@@ -902,27 +914,12 @@ unsafe fn net_read_frame(
     (msg_type, actual)
 }
 
-/// Register as a provider for a device class.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_register_provider(sys: &SyscallTable, class: u8, dispatch_fn: usize, state: *mut u8) -> i32 {
-    let mut buf = [0u8; 8];
-    buf[0] = class;
-    // dispatch_fn as u32 (function pointer)
-    let fn_bytes = (dispatch_fn as u32).to_le_bytes();
-    buf[4] = fn_bytes[0];
-    buf[5] = fn_bytes[1];
-    buf[6] = fn_bytes[2];
-    buf[7] = fn_bytes[3];
-    (sys.dev_call)(-1, 0x0C20, buf.as_mut_ptr(), 8)
-}
-
 /// Fill buffer with cryptographically secure random bytes.
 /// Returns 0 on success, negative errno on failure.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
-    (sys.dev_call)(-1, 0x0C3C, buf, len)
+    (sys.provider_call)(-1, 0x0C3C, buf, len)
 }
 
 /// Allocate `size` bytes of DMA-coherent memory with `align`-byte alignment
@@ -944,7 +941,7 @@ unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     *bp = sb[0]; *bp.add(1) = sb[1]; *bp.add(2) = sb[2]; *bp.add(3) = sb[3];
     let ab = align.to_le_bytes();
     *bp.add(4) = ab[0]; *bp.add(5) = ab[1]; *bp.add(6) = ab[2]; *bp.add(7) = ab[3];
-    let rc = (sys.dev_call)(-1, 0x0CE6, bp, 16);
+    let rc = (sys.provider_call)(-1, 0x0CE6, bp, 16);
     if rc != 0 { return 0; }
     u64::from_le_bytes([
         *bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11),
@@ -968,7 +965,7 @@ unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> 
     *bp = sb[0]; *bp.add(1) = sb[1]; *bp.add(2) = sb[2]; *bp.add(3) = sb[3];
     let ab = align.to_le_bytes();
     *bp.add(4) = ab[0]; *bp.add(5) = ab[1]; *bp.add(6) = ab[2]; *bp.add(7) = ab[3];
-    let rc = (sys.dev_call)(-1, 0x0CEC, bp, 16);
+    let rc = (sys.provider_call)(-1, 0x0CEC, bp, 16);
     if rc != 0 { return 0; }
     u64::from_le_bytes([
         *bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11),
@@ -989,7 +986,7 @@ unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
     let sb = size.to_le_bytes();
     *bp.add(8) = sb[0]; *bp.add(9) = sb[1]; *bp.add(10) = sb[2]; *bp.add(11) = sb[3];
-    (sys.dev_call)(-1, 0x0CEA, bp, 12)
+    (sys.provider_call)(-1, 0x0CEA, bp, 12)
 }
 
 /// Invalidate a VA range from the data cache (`dc ivac` + `dsb sy`).
@@ -1006,7 +1003,7 @@ unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
     let sb = size.to_le_bytes();
     *bp.add(8) = sb[0]; *bp.add(9) = sb[1]; *bp.add(10) = sb[2]; *bp.add(11) = sb[3];
-    (sys.dev_call)(-1, 0x0CEB, bp, 12)
+    (sys.provider_call)(-1, 0x0CEB, bp, 12)
 }
 
 /// Read a 32-bit word from a discovered PCIe device's configuration
@@ -1025,7 +1022,7 @@ unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u
     *bp.add(1) = 0;
     let ob = offset.to_le_bytes();
     *bp.add(2) = ob[0]; *bp.add(3) = ob[1];
-    let rc = (sys.dev_call)(-1, 0x0CF6, bp, 8);
+    let rc = (sys.provider_call)(-1, 0x0CF6, bp, 8);
     if rc != 0 { return 0xFFFF_FFFF; }
     u32::from_le_bytes([*bp.add(4), *bp.add(5), *bp.add(6), *bp.add(7)])
 }
@@ -1043,7 +1040,7 @@ unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val
     *bp.add(2) = ob[0]; *bp.add(3) = ob[1];
     let vb = val.to_le_bytes();
     *bp.add(4) = vb[0]; *bp.add(5) = vb[1]; *bp.add(6) = vb[2]; *bp.add(7) = vb[3];
-    (sys.dev_call)(-1, 0x0CF7, bp, 8)
+    (sys.provider_call)(-1, 0x0CF7, bp, 8)
 }
 
 /// Initialise the brcmstb PCIe1 MSI controller behind GIC SPI
@@ -1052,7 +1049,12 @@ unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val
 #[inline(always)]
 unsafe fn dev_pcie1_msi_init(sys: &SyscallTable, spi_irq: u32) -> i32 {
     let mut buf = spi_irq.to_le_bytes();
-    (sys.dev_call)(-1, 0x0CD0, buf.as_mut_ptr(), 4)
+    (sys.provider_call)(
+        -1,
+        abi::platform::bcm2712::pcie_nic::PCIE1_MSI_INIT,
+        buf.as_mut_ptr(),
+        4,
+    )
 }
 
 /// Allocate an MSI vector for `event_handle` and retrieve the
@@ -1068,7 +1070,12 @@ unsafe fn dev_pcie1_msi_alloc_vector(
     let bp = buf.as_mut_ptr();
     let eb = event_handle.to_le_bytes();
     *bp = eb[0]; *bp.add(1) = eb[1]; *bp.add(2) = eb[2]; *bp.add(3) = eb[3];
-    let rc = (sys.dev_call)(-1, 0x0CD1, bp, 20);
+    let rc = (sys.provider_call)(
+        -1,
+        abi::platform::bcm2712::pcie_nic::PCIE1_MSI_ALLOC_VECTOR,
+        bp,
+        20,
+    );
     if rc != 0 { return None; }
     let vec = *bp.add(4);
     let addr = u64::from_le_bytes([
@@ -1081,10 +1088,11 @@ unsafe fn dev_pcie1_msi_alloc_vector(
 
 /// Register a backing-store arena for the calling module. Returns
 /// arena_id (>=0) or negative errno. `backing_type`: 0=None,
-/// 1=RamDisk, 2=Nvme. `writeback`: 0=Deferred, 1=WriteThrough.
-/// When backing_type=Nvme, the NVMe driver module must be loaded
-/// and have registered its `nvme_backing_dispatch` — otherwise
-/// later read/write calls return ENODEV.
+/// 1=RamDisk, 2=External. `writeback`: 0=Deferred, 1=WriteThrough.
+/// When backing_type=External, a driver module (NVMe, SD, …) must be
+/// loaded and have registered its `backing_provider_dispatch` via
+/// `BACKING_PROVIDER_ENABLE` — otherwise later read/write calls
+/// return ENODEV.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_backing_arena_register(
@@ -1102,11 +1110,11 @@ unsafe fn dev_backing_arena_register(
     *bp.add(4) = rm[0]; *bp.add(5) = rm[1]; *bp.add(6) = rm[2]; *bp.add(7) = rm[3];
     *bp.add(8) = backing_type;
     *bp.add(9) = writeback;
-    (sys.dev_call)(-1, 0x0CEE, bp, 10)
+    (sys.provider_call)(-1, 0x0CEE, bp, 10)
 }
 
-/// Write one 4 KB page from `buf` to a previously-registered backing
-/// arena. `buf` must point to at least 4096 bytes of readable memory.
+/// Write one 4 KB page from `buf` to a registered backing arena.
+/// `buf` must point to at least 4096 bytes of readable memory.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_backing_arena_write(
@@ -1124,12 +1132,11 @@ unsafe fn dev_backing_arena_write(
     let pb = (buf as u64).to_le_bytes();
     *bp.add(6)  = pb[0]; *bp.add(7)  = pb[1]; *bp.add(8)  = pb[2]; *bp.add(9)  = pb[3];
     *bp.add(10) = pb[4]; *bp.add(11) = pb[5]; *bp.add(12) = pb[6]; *bp.add(13) = pb[7];
-    (sys.dev_call)(-1, 0x0CFE, bp, 14)
+    (sys.provider_call)(-1, 0x0CFE, bp, 14)
 }
 
-/// Read one 4 KB page from a previously-registered backing arena
-/// into `buf`. `buf` must point to at least 4096 bytes of writable
-/// memory.
+/// Read one 4 KB page from a registered backing arena into `buf`.
+/// `buf` must point to at least 4096 bytes of writable memory.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_backing_arena_read(
@@ -1147,7 +1154,7 @@ unsafe fn dev_backing_arena_read(
     let pb = (buf as u64).to_le_bytes();
     *bp.add(6)  = pb[0]; *bp.add(7)  = pb[1]; *bp.add(8)  = pb[2]; *bp.add(9)  = pb[3];
     *bp.add(10) = pb[4]; *bp.add(11) = pb[5]; *bp.add(12) = pb[6]; *bp.add(13) = pb[7];
-    (sys.dev_call)(-1, 0x0CEF, bp, 14)
+    (sys.provider_call)(-1, 0x0CEF, bp, 14)
 }
 
 /// Flush any pending writes for a backing arena.
@@ -1155,21 +1162,7 @@ unsafe fn dev_backing_arena_read(
 #[inline(always)]
 unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
     let mut a = [arena_id];
-    (sys.dev_call)(-1, 0x0CFF, a.as_mut_ptr(), 1)
-}
-
-// ============================================================================
-// Network Interface helpers
-// ============================================================================
-
-/// Set netif state via NETIF::IOCTL (0x0705), cmd=SET_STATE (1).
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_netif_set_state(sys: &SyscallTable, handle: i32, state: u8) {
-    let mut buf = [0u8; 5];
-    buf[0] = 1; // NETIF_IOCTL_SET_STATE
-    buf[4] = state;
-    (sys.dev_call)(handle, 0x0705, buf.as_mut_ptr(), 5);
+    (sys.provider_call)(-1, 0x0CFF, a.as_mut_ptr(), 1)
 }
 
 // ============================================================================
@@ -1193,7 +1186,7 @@ unsafe fn dev_param_store(sys: &SyscallTable, tag: u8, value: *const u8, len: us
         *bp.add(1 + i) = *value.add(i);
         i += 1;
     }
-    (sys.dev_call)(-1, 0x0C34, bp, 1 + copy_len)
+    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::STORE, bp, 1 + copy_len)
 }
 
 /// Store a u8 parameter override.
@@ -1201,7 +1194,7 @@ unsafe fn dev_param_store(sys: &SyscallTable, tag: u8, value: *const u8, len: us
 #[inline(always)]
 unsafe fn dev_param_store_u8(sys: &SyscallTable, tag: u8, val: u8) -> i32 {
     let mut buf = [tag, val];
-    (sys.dev_call)(-1, 0x0C34, buf.as_mut_ptr(), 2)
+    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::STORE, buf.as_mut_ptr(), 2)
 }
 
 /// Store a string parameter override.
@@ -1216,14 +1209,14 @@ unsafe fn dev_param_store_str(sys: &SyscallTable, tag: u8, s: *const u8, len: us
 #[inline(always)]
 unsafe fn dev_param_delete(sys: &SyscallTable, tag: u8) -> i32 {
     let mut buf = [tag];
-    (sys.dev_call)(-1, 0x0C35, buf.as_mut_ptr(), 1)
+    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::DELETE, buf.as_mut_ptr(), 1)
 }
 
 /// Clear all runtime overrides for this module.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, 0x0C36, core::ptr::null_mut(), 0)
+    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::CLEAR_ALL, core::ptr::null_mut(), 0)
 }
 
 /// Get this module's arena allocation (from module_arena_size export).
@@ -1232,7 +1225,7 @@ unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
 #[inline(always)]
 unsafe fn dev_arena_get(sys: &SyscallTable) -> (*mut u8, u32) {
     let mut buf = [0u8; 4];
-    let size = (sys.dev_call)(-1, 0x0C3A, buf.as_mut_ptr(), 4);
+    let size = (sys.provider_call)(-1, abi::kernel_abi::ARENA_GET, buf.as_mut_ptr(), 4);
     let addr = u32::from_le_bytes(buf);
     (addr as *mut u8, if size > 0 { size as u32 } else { 0 })
 }
@@ -1261,7 +1254,7 @@ struct PagedArenaStats {
 #[inline(always)]
 unsafe fn dev_paged_arena_get(sys: &SyscallTable) -> (*mut u8, usize, u32) {
     let mut buf = [0u8; 20];
-    let rc = (sys.dev_call)(-1, 0x0CF8, buf.as_mut_ptr(), 20);
+    let rc = (sys.provider_call)(-1, abi::kernel_abi::PAGED_ARENA_GET, buf.as_mut_ptr(), 20);
     if rc < 0 {
         return (core::ptr::null_mut(), 0, 0);
     }
@@ -1277,7 +1270,7 @@ unsafe fn dev_paged_arena_get(sys: &SyscallTable) -> (*mut u8, usize, u32) {
 unsafe fn dev_paged_arena_stats(sys: &SyscallTable) -> PagedArenaStats {
     let mut stats = PagedArenaStats::default();
     let p = &mut stats as *mut _ as *mut u8;
-    (sys.dev_call)(-1, 0x0CF9, p, core::mem::size_of::<PagedArenaStats>());
+    (sys.provider_call)(-1, abi::internal::monitor::PAGED_ARENA_STATS, p, core::mem::size_of::<PagedArenaStats>());
     stats
 }
 
@@ -1293,7 +1286,7 @@ unsafe fn dev_paged_arena_prefault(sys: &SyscallTable, offset: u32, count: u32) 
     let cb = count.to_le_bytes();
     *bp = ob[0]; *bp.add(1) = ob[1]; *bp.add(2) = ob[2]; *bp.add(3) = ob[3];
     *bp.add(4) = cb[0]; *bp.add(5) = cb[1]; *bp.add(6) = cb[2]; *bp.add(7) = cb[3];
-    let rc = (sys.dev_call)(-1, 0x0CFA, bp, 8);
+    let rc = (sys.provider_call)(-1, abi::kernel_abi::PAGED_ARENA_PREFAULT, bp, 8);
     if rc > 0 { rc as u32 } else { 0 }
 }
 
@@ -1497,9 +1490,9 @@ pub unsafe fn heap_realloc(sys: &SyscallTable, ptr: *mut u8, new_size: u32) -> *
 #[allow(dead_code)]
 #[inline(always)]
 pub unsafe fn heap_stats(sys: &SyscallTable) -> (u32, u32, u16, u16, u32) {
-    // Query via dev_query with HEAP_STATS key (6)
+    // Query via provider_query with HEAP_STATS key (6)
     let mut buf = [0u8; 16];
-    let r = (sys.dev_query)(-1, 6, buf.as_mut_ptr(), 16);
+    let r = (sys.provider_query)(-1, 6, buf.as_mut_ptr(), 16);
     if r < 0 {
         return (0, 0, 0, 0, 0);
     }
@@ -1519,26 +1512,26 @@ pub unsafe fn heap_stats(sys: &SyscallTable) -> (u32, u32, u16, u16, u32) {
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_bridge_write(sys: &SyscallTable, bridge_fd: i32, data: *const u8, len: usize) -> i32 {
-    (sys.dev_call)(bridge_fd, 0x0CE0, data as *mut u8, len)
+    (sys.provider_call)(bridge_fd, 0x0CE0, data as *mut u8, len)
 }
 
 /// Read data from a bridge channel. Returns bytes read, -EAGAIN if empty/no new.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_bridge_read(sys: &SyscallTable, bridge_fd: i32, buf: *mut u8, len: usize) -> i32 {
-    (sys.dev_call)(bridge_fd, 0x0CE1, buf, len)
+    (sys.provider_call)(bridge_fd, 0x0CE1, buf, len)
 }
 
 /// Poll bridge readiness. Returns 1 if readable, 0 if not.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_bridge_poll(sys: &SyscallTable, bridge_fd: i32) -> i32 {
-    (sys.dev_call)(bridge_fd, 0x0CE2, core::ptr::null_mut(), 0)
+    (sys.provider_call)(bridge_fd, 0x0CE2, core::ptr::null_mut(), 0)
 }
 
 /// Get bridge info. Returns 12 bytes: [type, from, to, _, drops:u32, seq:u32].
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_bridge_info(sys: &SyscallTable, bridge_fd: i32, buf: &mut [u8; 12]) -> i32 {
-    (sys.dev_call)(bridge_fd, 0x0CE3, buf.as_mut_ptr(), 12)
+    (sys.provider_call)(bridge_fd, 0x0CE3, buf.as_mut_ptr(), 12)
 }

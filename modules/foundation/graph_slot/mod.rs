@@ -1,30 +1,46 @@
-//! A/B graph slot store (PIC module).
+//! A/B graph slot store (PIC module, channel-served).
 //!
 //! Owns the on-flash format of the two 512 KB OTA slots
-//! (`abi::graph_slot::SLOT_{A,B}_OFFSET`). Each slot holds a full
-//! graph bundle (module table + static config) preceded by a 256-byte
-//! header. The slot with a valid magic and the higher epoch is live;
-//! writes target the other slot and become live when
-//! `GRAPH_SLOT_ACTIVATE` increments the epoch and validates the
-//! SHA-256 recorded in the header.
+//! (`abi::contracts::storage::graph_slot::SLOT_{A,B}_OFFSET`). Each slot
+//! holds a full graph bundle (module table + static config) preceded by
+//! a 256-byte header. The slot with a valid magic and the higher epoch
+//! is live; writes target the other slot and become live when
+//! ACTIVATE increments the epoch and validates the SHA-256 recorded in
+//! the header.
 //!
-//! ## Kernel registration
+//! ## Channel protocol
 //!
-//! Registers `graph_slot_dispatch` via `GRAPH_SLOT_ENABLE` on first
-//! step. The kernel forwards `GRAPH_SLOT_ACTIVE` / `ERASE` / `WRITE` /
-//! `ACTIVATE` / `CONFIG_ADDR` dev_call opcodes here.
+//! graph_slot is a channel-served module — consumers (`ota_ingest`,
+//! `reconfigure`) send FMP-framed requests on `in_chan` and read
+//! FMP-framed responses on `out_chan`. There is no kernel-side
+//! service registry.
 //!
-//! ## Opcodes
+//! Frame format (shared with net_proto / FMP convention):
 //!
-//! - ACTIVE → returns 0 (slot A), 1 (slot B), or -1 if neither valid.
-//! - ERASE → erases the inactive slot's 128 sectors in one pass.
-//! - WRITE(offset, page[256]) → programs one page of the inactive slot.
-//! - ACTIVATE → recomputes SHA-256 over the just-written bundle,
-//!   compares against the header's stored hash, and if it matches
-//!   declares the slot live by virtue of its higher epoch.
-//!   (The caller is expected to have written a header whose epoch
-//!   exceeds the live slot's.) Returns 0 or `-EIO` on hash mismatch.
-//! - CONFIG_ADDR → XIP address of the live slot's config blob.
+//!   `[type: u32 LE][len: u16 LE][payload: len bytes]`
+//!
+//! Request types (FNV-1a hashes of the string names):
+//!
+//! | Request | Type name        | Payload layout              |
+//! |---------|------------------|-----------------------------|
+//! | ERASE   | `gs.erase`       | empty                       |
+//! | WRITE   | `gs.write`       | `[offset:u32 LE][page:256]` |
+//! | ACTIVATE| `gs.activate`    | empty                       |
+//! | ACTIVE  | `gs.query_active`| empty                       |
+//! | CFG     | `gs.query_cfg`   | empty                       |
+//!
+//! Response type `gs.result` (single FNV-1a hash). Payload:
+//!
+//!   `[req_type: u32 LE][value: i32 LE]` (8 bytes)
+//!
+//! `value` is the operation result:
+//! - ERASE / WRITE / ACTIVATE: 0 on success, negative errno on failure.
+//! - ACTIVE: 0 or 1 (live slot index), -1 if neither slot is live.
+//! - CFG: XIP absolute address of the live slot's config blob (u32
+//!   cast to i32), or -1 if neither slot is live.
+//!
+//! The `req_type` echo lets consumers correlate responses to requests
+//! when issuing multiple commands in flight.
 
 #![no_std]
 
@@ -41,35 +57,35 @@ include!("../../sdk/sha256.rs");
 // Constants
 // ============================================================================
 
-const XIP_BASE: u32 = 0x1000_0000;
-const SLOT_A_OFFSET: u32 = abi::graph_slot::SLOT_A_OFFSET;
-const SLOT_B_OFFSET: u32 = abi::graph_slot::SLOT_B_OFFSET;
-const SLOT_SIZE: u32 = abi::graph_slot::SLOT_SIZE;
-const SLOT_MAGIC: u32 = abi::graph_slot::MAGIC;
-const SLOT_VERSION: u8 = abi::graph_slot::VERSION;
+const XIP_BASE: u32 = abi::platform::rp::flash_layout::XIP_BASE;
+const SLOT_A_OFFSET: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_A_OFFSET;
+const SLOT_B_OFFSET: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_B_OFFSET;
+const SLOT_SIZE: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_SIZE;
+const SLOT_MAGIC: u32 = abi::platform::rp::flash_layout::GRAPH_SLOT_MAGIC;
+const SLOT_VERSION: u8 = abi::platform::rp::flash_layout::GRAPH_SLOT_VERSION;
 
 const SECTOR_SIZE: u32 = 4096;
 const PAGE_SIZE: usize = 256;
 
-// Syscall opcodes.
-const SYS_GRAPH_SLOT_ENABLE: u32 = 0x0C90;
-const SYS_GRAPH_SLOT_ACTIVE: u32 = 0x0C91;
-const SYS_GRAPH_SLOT_ERASE: u32 = 0x0C92;
-const SYS_GRAPH_SLOT_WRITE: u32 = 0x0C93;
-const SYS_GRAPH_SLOT_ACTIVATE: u32 = 0x0C94;
-const SYS_GRAPH_SLOT_CONFIG_ADDR: u32 = 0x0C95;
-const SYS_FLASH_RAW_ERASE: u32 = 0x0C38;
-const SYS_FLASH_RAW_PROGRAM: u32 = 0x0C39;
+// Raw flash bridge opcodes imported from the layered ABI.
+use abi::internal::flash::{
+    RAW_ERASE as SYS_FLASH_RAW_ERASE,
+    RAW_PROGRAM as SYS_FLASH_RAW_PROGRAM,
+};
 
 const CONTINUE: i32 = 0;
 const READY: i32 = 3;
 
-// `E_AGAIN` and `E_INVAL` come from the SDK runtime.
 const E_IO: i32 = -5;
-
-/// Sentinel for opcodes that return an index or address: `-1` means
-/// "no live slot" and is not a generic errno.
 const NO_LIVE_SLOT: i32 = -1;
+
+// Channel protocol — defined once in the public contract.
+use abi::contracts::storage::graph_slot::channel::{
+    REQ_ERASE, REQ_WRITE, REQ_ACTIVATE, REQ_ACTIVE, REQ_CFG, RESP_RESULT,
+    FRAME_HDR, REQ_MAX_PAYLOAD, RESP_PAYLOAD, RESP_FRAME_LEN,
+};
+/// Full request frame budget.
+const REQ_FRAME_MAX: usize = FRAME_HDR + REQ_MAX_PAYLOAD;
 
 // ============================================================================
 // State
@@ -78,17 +94,21 @@ const NO_LIVE_SLOT: i32 = -1;
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
-    registered: u8,
+    in_chan: i32,
+    out_chan: i32,
     signaled_ready: u8,
     /// Cached live-slot index: 0 = A, 1 = B, 0xFF = neither valid.
     live_slot: u8,
-    _pad: u8,
+    _pad: [u8; 2],
     /// Cached live-slot epoch (for inactive-slot epoch bump on activate).
     live_epoch: u64,
+    /// Accumulator for partial frames read from `in_chan`.
+    frame_buf: [u8; REQ_FRAME_MAX],
+    frame_fill: u16,
 }
 
 // ============================================================================
-// Header decoding (read-only; the combine tool writes these)
+// Header decoding
 // ============================================================================
 
 struct HeaderFields {
@@ -120,7 +140,6 @@ unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
     let config_offset = read_u32_le(base_xip.add(24));
     let config_size = read_u32_le(base_xip.add(28));
 
-    // Bounds: regions must fit inside the slot.
     if (modules_offset as u64) + (modules_size as u64) > SLOT_SIZE as u64 { return None; }
     if (config_offset as u64) + (config_size as u64) > SLOT_SIZE as u64 { return None; }
 
@@ -161,19 +180,16 @@ fn slot_offset(idx: u8) -> u32 {
 }
 
 fn inactive_slot(live: u8) -> u8 {
-    // Treat "neither live" as: slot B is the inactive write target, so a
-    // first-time provisioning writes to B and promotes it. (Slot A would
-    // collide with the boot image's typical flashing tooling assumption.)
     if live == 1 { 0 } else { 1 }
 }
 
 // ============================================================================
-// Syscall wrappers (raw flash bridge)
+// Raw flash bridge
 // ============================================================================
 
 unsafe fn sys_erase_sector(sys: &SyscallTable, offset: u32) -> i32 {
     let mut arg = offset.to_le_bytes();
-    (sys.dev_call)(-1, SYS_FLASH_RAW_ERASE, arg.as_mut_ptr(), 4)
+    (sys.provider_call)(-1, SYS_FLASH_RAW_ERASE, arg.as_mut_ptr(), 4)
 }
 
 unsafe fn sys_program_page(sys: &SyscallTable, offset: u32, page: *const u8) -> i32 {
@@ -189,97 +205,74 @@ unsafe fn sys_program_page(sys: &SyscallTable, offset: u32, page: *const u8) -> 
         core::ptr::write_volatile(p.add(4 + i), *page.add(i));
         i += 1;
     }
-    (sys.dev_call)(-1, SYS_FLASH_RAW_PROGRAM, buf.as_mut_ptr(), 4 + PAGE_SIZE)
+    (sys.provider_call)(-1, SYS_FLASH_RAW_PROGRAM, buf.as_mut_ptr(), 4 + PAGE_SIZE)
 }
 
 // ============================================================================
-// Dispatch
+// Operation handlers — synchronous within a step; each produces an i32
+// result that gets echoed back on the response channel.
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.graph_slot_dispatch"]
-pub unsafe extern "C" fn graph_slot_dispatch(
-    state: *mut u8,
-    opcode: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
-    if state.is_null() { return E_INVAL; }
-    let s = &mut *(state as *mut State);
-    if s.syscalls.is_null() { return E_INVAL; }
-    let sys = &*s.syscalls;
+unsafe fn do_erase(s: &mut State, sys: &SyscallTable) -> i32 {
+    refresh_live(s);
+    let target = slot_offset(inactive_slot(s.live_slot));
+    let mut off = target;
+    let end = target + SLOT_SIZE;
+    while off < end {
+        let rc = sys_erase_sector(sys, off);
+        if rc < 0 { return rc; }
+        off += SECTOR_SIZE;
+    }
+    0
+}
 
-    match opcode {
-        SYS_GRAPH_SLOT_ACTIVE => {
-            refresh_live(s);
-            if s.live_slot > 1 { NO_LIVE_SLOT } else { s.live_slot as i32 }
-        }
+unsafe fn do_write(s: &mut State, sys: &SyscallTable, payload: *const u8, payload_len: usize) -> i32 {
+    if payload.is_null() || payload_len < 4 + PAGE_SIZE { return E_INVAL; }
+    refresh_live(s);
+    let in_slot_off = read_u32_le(payload);
+    if in_slot_off + PAGE_SIZE as u32 > SLOT_SIZE { return E_INVAL; }
+    let target = slot_offset(inactive_slot(s.live_slot)) + in_slot_off;
+    sys_program_page(sys, target, payload.add(4))
+}
 
-        SYS_GRAPH_SLOT_ERASE => {
-            refresh_live(s);
-            let target = slot_offset(inactive_slot(s.live_slot));
-            let mut off = target;
-            let end = target + SLOT_SIZE;
-            while off < end {
-                let rc = sys_erase_sector(sys, off);
-                if rc < 0 { return rc; }
-                off += SECTOR_SIZE;
-            }
-            0
-        }
+unsafe fn do_activate(s: &mut State) -> i32 {
+    refresh_live(s);
+    let candidate = inactive_slot(s.live_slot);
+    let base_xip = (XIP_BASE + slot_offset(candidate)) as *const u8;
+    let hdr = match decode_header(base_xip) {
+        Some(h) => h,
+        None => return E_IO,
+    };
+    let have_live = s.live_slot <= 1;
+    if have_live && hdr.epoch <= s.live_epoch {
+        return E_AGAIN;
+    }
 
-        SYS_GRAPH_SLOT_WRITE => {
-            if arg.is_null() || arg_len < 4 + PAGE_SIZE { return E_INVAL; }
-            refresh_live(s);
-            let in_slot_off = read_u32_le(arg);
-            if in_slot_off + PAGE_SIZE as u32 > SLOT_SIZE { return E_INVAL; }
-            let target = slot_offset(inactive_slot(s.live_slot)) + in_slot_off;
-            sys_program_page(sys, target, arg.add(4))
-        }
+    let mut hasher = Sha256::new();
+    hash_xip_range(&mut hasher, base_xip, hdr.modules_offset, hdr.modules_size);
+    hash_xip_range(&mut hasher, base_xip, hdr.config_offset, hdr.config_size);
+    let out = hasher.finalize();
+    if !ct_eq32(&out, &hdr.sha256) {
+        return E_IO;
+    }
 
-        SYS_GRAPH_SLOT_ACTIVATE => {
-            refresh_live(s);
-            let candidate = inactive_slot(s.live_slot);
-            let base_xip = (XIP_BASE + slot_offset(candidate)) as *const u8;
-            let hdr = match decode_header(base_xip) {
-                Some(h) => h,
-                None => return E_IO,
-            };
-            // If a live slot already exists, the candidate must carry a
-            // strictly higher epoch. `live_slot > 1` means "no live slot
-            // yet"; any valid candidate can then activate.
-            let have_live = s.live_slot <= 1;
-            if have_live && hdr.epoch <= s.live_epoch {
-                return E_AGAIN;
-            }
+    s.live_slot = candidate;
+    s.live_epoch = hdr.epoch;
+    0
+}
 
-            // Verify SHA-256 over (modules_bytes || config_bytes).
-            // Stream the XIP regions through a 1 KB scratch buffer so we
-            // never hold the whole slot payload on the stack.
-            let mut hasher = Sha256::new();
-            hash_xip_range(&mut hasher, base_xip, hdr.modules_offset, hdr.modules_size);
-            hash_xip_range(&mut hasher, base_xip, hdr.config_offset, hdr.config_size);
-            let out = hasher.finalize();
-            if !ct_eq32(&out, &hdr.sha256) {
-                return E_IO;
-            }
+unsafe fn query_active(s: &mut State) -> i32 {
+    refresh_live(s);
+    if s.live_slot > 1 { NO_LIVE_SLOT } else { s.live_slot as i32 }
+}
 
-            s.live_slot = candidate;
-            s.live_epoch = hdr.epoch;
-            0
-        }
-
-        SYS_GRAPH_SLOT_CONFIG_ADDR => {
-            refresh_live(s);
-            if s.live_slot > 1 { return NO_LIVE_SLOT; }
-            let base = XIP_BASE + slot_offset(s.live_slot);
-            match decode_header(base as *const u8) {
-                Some(h) => (base + h.config_offset) as i32,
-                None => NO_LIVE_SLOT,
-            }
-        }
-
-        _ => E_INVAL,
+unsafe fn query_cfg(s: &mut State) -> i32 {
+    refresh_live(s);
+    if s.live_slot > 1 { return NO_LIVE_SLOT; }
+    let base = XIP_BASE + slot_offset(s.live_slot);
+    match decode_header(base as *const u8) {
+        Some(h) => (base + h.config_offset) as i32,
+        None => NO_LIVE_SLOT,
     }
 }
 
@@ -293,9 +286,6 @@ fn ct_eq32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
-/// Stream `size` bytes starting at `base + off` through the hasher via
-/// a small on-stack scratch. The slot payload can be up to 512 KB; we
-/// never materialise all of it at once.
 unsafe fn hash_xip_range(hasher: &mut Sha256, base: *const u8, off: u32, size: u32) {
     const CHUNK: usize = 1024;
     let mut buf = [0u8; CHUNK];
@@ -311,6 +301,88 @@ unsafe fn hash_xip_range(hasher: &mut Sha256, base: *const u8, off: u32, size: u
         hasher.update(&buf[..n]);
         cursor += n;
         remaining -= n;
+    }
+}
+
+// ============================================================================
+// Request framing — accumulates bytes on `in_chan` into `frame_buf`
+// until one full request is available, dispatches it, emits a response
+// on `out_chan`, and consumes the frame from the accumulator.
+// ============================================================================
+
+fn write_u32_le(dst: &mut [u8], offset: usize, value: u32) {
+    let b = value.to_le_bytes();
+    dst[offset]     = b[0];
+    dst[offset + 1] = b[1];
+    dst[offset + 2] = b[2];
+    dst[offset + 3] = b[3];
+}
+
+fn write_u16_le(dst: &mut [u8], offset: usize, value: u16) {
+    let b = value.to_le_bytes();
+    dst[offset]     = b[0];
+    dst[offset + 1] = b[1];
+}
+
+unsafe fn emit_response(s: &State, sys: &SyscallTable, req_type: u32, value: i32) {
+    if s.out_chan < 0 { return; }
+    let mut frame = [0u8; RESP_FRAME_LEN];
+    write_u32_le(&mut frame, 0, RESP_RESULT);
+    write_u16_le(&mut frame, 4, RESP_PAYLOAD as u16);
+    write_u32_le(&mut frame, FRAME_HDR, req_type);
+    write_u32_le(&mut frame, FRAME_HDR + 4, value as u32);
+    let _ = (sys.channel_write)(s.out_chan, frame.as_ptr(), RESP_FRAME_LEN);
+}
+
+unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
+    if s.in_chan < 0 { return CONTINUE; }
+
+    // Best-effort fill of the request buffer.
+    let room = REQ_FRAME_MAX - s.frame_fill as usize;
+    if room > 0 {
+        let tail = s.frame_buf.as_mut_ptr().add(s.frame_fill as usize);
+        let n = (sys.channel_read)(s.in_chan, tail, room);
+        if n > 0 {
+            s.frame_fill += n as u16;
+        }
+    }
+
+    // Process as many complete frames as we have.
+    loop {
+        if (s.frame_fill as usize) < FRAME_HDR { return CONTINUE; }
+        let ty = read_u32_le(s.frame_buf.as_ptr());
+        let len = u16::from_le_bytes([
+            s.frame_buf[4], s.frame_buf[5],
+        ]) as usize;
+        let total = FRAME_HDR + len;
+        if total > REQ_FRAME_MAX {
+            // Malformed frame — drop the buffer and resync on next fill.
+            s.frame_fill = 0;
+            return CONTINUE;
+        }
+        if (s.frame_fill as usize) < total { return CONTINUE; }
+
+        let payload_ptr = s.frame_buf.as_ptr().add(FRAME_HDR);
+        let rc = match ty {
+            REQ_ERASE    => do_erase(s, sys),
+            REQ_WRITE    => do_write(s, sys, payload_ptr, len),
+            REQ_ACTIVATE => do_activate(s),
+            REQ_ACTIVE   => query_active(s),
+            REQ_CFG      => query_cfg(s),
+            _            => E_INVAL,
+        };
+        emit_response(s, sys, ty, rc);
+
+        // Shift tail down to reclaim the consumed frame.
+        let leftover = s.frame_fill as usize - total;
+        if leftover > 0 {
+            core::ptr::copy(
+                s.frame_buf.as_ptr().add(total),
+                s.frame_buf.as_mut_ptr(),
+                leftover,
+            );
+        }
+        s.frame_fill = leftover as u16;
     }
 }
 
@@ -331,8 +403,8 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[no_mangle]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    _in_chan: i32,
-    _out_chan: i32,
+    in_chan: i32,
+    out_chan: i32,
     _ctrl_chan: i32,
     _params: *const u8,
     _params_len: usize,
@@ -345,10 +417,13 @@ pub extern "C" fn module_new(
         if state_size < core::mem::size_of::<State>() { return -2; }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
-        s.registered = 0;
+        s.in_chan = in_chan;
+        s.out_chan = out_chan;
         s.signaled_ready = 0;
         s.live_slot = 0xFF;
         s.live_epoch = 0;
+        s._pad = [0; 2];
+        s.frame_fill = 0;
         refresh_live(s);
         0
     }
@@ -363,19 +438,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.syscalls.is_null() { return -1; }
         let sys = &*s.syscalls;
 
-        if s.registered == 0 {
-            let hash = fnv1a(b"graph_slot_dispatch");
-            let hb = hash.to_le_bytes();
-            let mut a = [hb[0], hb[1], hb[2], hb[3]];
-            let rc = (sys.dev_call)(-1, SYS_GRAPH_SLOT_ENABLE, a.as_mut_ptr(), 4);
-            if rc < 0 { return rc; }
-            s.registered = 1;
-        }
         if s.signaled_ready == 0 {
             s.signaled_ready = 1;
             return READY;
         }
-        CONTINUE
+        pump_requests(s, sys)
     }
 }
 

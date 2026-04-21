@@ -290,10 +290,9 @@ pub fn read_layout() -> Option<FlashLayout> {
 
 #[cfg(feature = "rp")]
 fn read_layout_from_slots() -> Option<FlashLayout> {
-    use crate::abi::graph_slot;
-    const XIP_BASE: u32 = 0x1000_0000;
-    let slot_a = (XIP_BASE + graph_slot::SLOT_A_OFFSET) as *const u8;
-    let slot_b = (XIP_BASE + graph_slot::SLOT_B_OFFSET) as *const u8;
+    use crate::abi::platform::rp::flash_layout;
+    let slot_a = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_A_OFFSET) as *const u8;
+    let slot_b = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_B_OFFSET) as *const u8;
 
     let a = unsafe { decode_slot_header(slot_a) };
     let b = unsafe { decode_slot_header(slot_b) };
@@ -321,11 +320,11 @@ struct SlotHeader {
 
 #[cfg(feature = "rp")]
 unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
-    use crate::abi::graph_slot;
+    use crate::abi::platform::rp::flash_layout;
     let magic = read_u32(base);
-    if magic != graph_slot::MAGIC { return None; }
+    if magic != flash_layout::GRAPH_SLOT_MAGIC { return None; }
     let version = *base.add(4);
-    if version != graph_slot::VERSION { return None; }
+    if version != flash_layout::GRAPH_SLOT_VERSION { return None; }
     let epoch = read_u64(base.add(8));
     let modules_offset = read_u32(base.add(16));
     let modules_size = read_u32(base.add(20));
@@ -333,10 +332,10 @@ unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
     let config_size = read_u32(base.add(28));
 
     // Both regions must fit inside the slot.
-    if (modules_offset as u64) + (modules_size as u64) > graph_slot::SLOT_SIZE as u64 {
+    if (modules_offset as u64) + (modules_size as u64) > flash_layout::GRAPH_SLOT_SIZE as u64 {
         return None;
     }
-    if (config_offset as u64) + (config_size as u64) > graph_slot::SLOT_SIZE as u64 {
+    if (config_offset as u64) + (config_size as u64) > flash_layout::GRAPH_SLOT_SIZE as u64 {
         return None;
     }
 

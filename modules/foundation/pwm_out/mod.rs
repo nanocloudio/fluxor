@@ -22,7 +22,10 @@ include!("../../sdk/params.rs");
 mod params_def;
 
 // ============================================================================
-// PWM dev_call opcodes (from abi::dev_pwm)
+// HAL_PWM contract id (mirrors `kernel::provider::contract::HAL_PWM`).
+const HAL_PWM_CONTRACT: u32 = 0x000F;
+
+// PWM opcodes (mirror abi::contracts::hal::pwm)
 // ============================================================================
 
 const PWM_OPEN: u32 = 0x0F00;
@@ -111,10 +114,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let sys = &*s.syscalls;
 
-        // Lazy init: open PWM handle on first step
+        // Lazy init: open PWM handle on first step via the handle-scoped
+        // provider API. The kernel tracks the handle against HAL_PWM
+        // so SET_DUTY dispatches through the PWM vtable directly.
         if !s.initialized {
             let mut pin_arg = [s.pin];
-            let handle = (sys.dev_call)(-1, PWM_OPEN, pin_arg.as_mut_ptr(), 1);
+            let handle = (sys.provider_open)(HAL_PWM_CONTRACT, PWM_OPEN, pin_arg.as_mut_ptr(), 1);
             if handle < 0 {
                 return -3; // PWM open failed
             }
@@ -157,7 +162,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         };
 
         let mut duty_bytes = duty.to_le_bytes();
-        (sys.dev_call)(s.pwm_handle, PWM_SET_DUTY, duty_bytes.as_mut_ptr(), 2);
+        (sys.provider_call)(s.pwm_handle, PWM_SET_DUTY, duty_bytes.as_mut_ptr(), 2);
 
         0
     }

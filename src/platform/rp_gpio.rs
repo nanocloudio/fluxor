@@ -436,10 +436,10 @@ fn edge_bit(pin: usize) -> u32 { 1u32 << (pin & 31) }
 static GPIO_EVENT_BINDING: [AtomicI32; MAX_GPIO] = [const { AtomicI32::new(-1) }; MAX_GPIO];
 
 // Edge interest constants — re-exported from abi::gpio_edge.
-pub use crate::abi::gpio_edge::NONE as EDGE_NONE;
-pub use crate::abi::gpio_edge::RISING as EDGE_RISING;
-pub use crate::abi::gpio_edge::FALLING as EDGE_FALLING;
-pub use crate::abi::gpio_edge::BOTH as EDGE_BOTH;
+pub use crate::abi::contracts::hal::gpio::edge::NONE as EDGE_NONE;
+pub use crate::abi::contracts::hal::gpio::edge::RISING as EDGE_RISING;
+pub use crate::abi::contracts::hal::gpio::edge::FALLING as EDGE_FALLING;
+pub use crate::abi::contracts::hal::gpio::edge::BOTH as EDGE_BOTH;
 
 /// Set edge detection interest for a claimed pin.
 /// edge: 0=disable, 1=rising, 2=falling, 3=both

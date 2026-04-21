@@ -8,13 +8,13 @@ use super::constants::*;
 use super::gspi;
 use super::Cyw43State;
 use super::SyscallTable;
-use super::abi::dev_timer;
+use super::abi::kernel_abi::timer as dev_timer;
 
-/// Get monotonic time in milliseconds via dev_call.
+/// Get monotonic time in milliseconds via provider_call.
 unsafe fn get_millis(s: &Cyw43State) -> u64 {
     let sys = &*s.syscalls;
     let mut buf = [0u8; 8];
-    (sys.dev_call)(-1, dev_timer::MILLIS, buf.as_mut_ptr(), 8);
+    (sys.provider_call)(-1, dev_timer::MILLIS, buf.as_mut_ptr(), 8);
     u64::from_le_bytes(buf)
 }
 

@@ -21,7 +21,7 @@ content_type = "OctetStream"
 required = true
 
 [[resources]]
-device_class = "pwm"
+requires_contract = "pwm"
 access = "exclusive"
 ```
 

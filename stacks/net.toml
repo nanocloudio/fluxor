@@ -22,6 +22,7 @@ modules = [
 wiring = [
   "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
   "cyw43.status -> wifi.status",
+  "cyw43.netif_state -> wifi.netif_state",
   "cyw43.frames_rx -> ip.frames_rx",
   "ip.frames_tx -> cyw43.frames_tx",
 ]
@@ -36,6 +37,7 @@ modules = [
 wiring = [
   "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
   "cyw43.status -> wifi.status",
+  "cyw43.netif_state -> wifi.netif_state",
   "cyw43.frames_rx -> ip.frames_rx",
   "ip.frames_tx -> cyw43.frames_tx",
 ]

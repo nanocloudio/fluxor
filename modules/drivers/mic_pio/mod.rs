@@ -24,9 +24,11 @@ include!("../../sdk/params.rs");
 mod pio;
 
 // ============================================================================
-// dev_pio RX opcodes (mirrors abi::dev_pio)
+// Provider contract id + PIO RX opcodes (mirror
+// `kernel::provider::contract::HAL_PIO` and `abi::contracts::hal::pio`).
 // ============================================================================
 
+const HAL_PIO_CONTRACT: u32 = 0x0004;
 const DEV_PIO_RX_STREAM_ALLOC: u32 = 0x0420;
 const DEV_PIO_RX_STREAM_LOAD_PROGRAM: u32 = 0x0421;
 const DEV_PIO_RX_STREAM_CONFIGURE: u32 = 0x0422;
@@ -37,7 +39,7 @@ const DEV_PIO_RX_STREAM_GET_BUFFER: u32 = 0x0426;
 const DEV_PIO_RX_STREAM_SET_RATE: u32 = 0x0427;
 
 // ============================================================================
-// dev_call argument structs
+// HAL_PIO argument structs
 // ============================================================================
 
 #[repr(C)]
@@ -223,10 +225,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
 unsafe fn step_init(s: &mut MicState) -> i32 {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
+    let provider_open = sys.provider_open;
+    let provider_call = sys.provider_call;
 
-    // Allocate PIO RX stream
-    let handle = (dev_call)(-1, DEV_PIO_RX_STREAM_ALLOC, core::ptr::null_mut(), 0);
+    // Allocate PIO RX stream — tracked against HAL_PIO contract.
+    let handle = (provider_open)(
+        HAL_PIO_CONTRACT, DEV_PIO_RX_STREAM_ALLOC, core::ptr::null_mut(), 0,
+    );
     if handle < 0 {
         dev_log(sys, 1, b"[mic] alloc fail".as_ptr(), 16);
         s.phase = MicPhase::Error;
@@ -242,7 +247,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
         sideset_bits: pio::SIDESET_BITS,
         options: pio::OPTIONS,
     };
-    let result = (dev_call)(
+    let result = (provider_call)(
         handle,
         DEV_PIO_RX_STREAM_LOAD_PROGRAM,
         &load_args as *const _ as *mut u8,
@@ -250,7 +255,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
     );
     if result < 0 {
         dev_log(sys, 1, b"[mic] load fail".as_ptr(), 15);
-        (dev_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
+        (provider_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
         s.phase = MicPhase::Error;
         return -1;
     }
@@ -265,7 +270,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
         shift_bits: pio::SHIFT_BITS,
         _pad: 0,
     };
-    let result = (dev_call)(
+    let result = (provider_call)(
         handle,
         DEV_PIO_RX_STREAM_CONFIGURE,
         &cfg_args as *const _ as *mut u8,
@@ -273,7 +278,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
     );
     if result < 0 {
         dev_log(sys, 1, b"[mic] cfg fail".as_ptr(), 14);
-        (dev_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
+        (provider_call)(handle, DEV_PIO_RX_STREAM_FREE, core::ptr::null_mut(), 0);
         s.phase = MicPhase::Error;
         return -1;
     }
@@ -281,7 +286,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
     // Set stream rate (Q16.16)
     let rate_q16 = s.sample_rate << 16;
     let mut rate_arg = rate_q16.to_le_bytes();
-    (dev_call)(handle, DEV_PIO_RX_STREAM_SET_RATE, rate_arg.as_mut_ptr(), 4);
+    (provider_call)(handle, DEV_PIO_RX_STREAM_SET_RATE, rate_arg.as_mut_ptr(), 4);
 
     s.rx_handle = handle;
     s.phase = MicPhase::Running;
@@ -296,7 +301,7 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
 
 unsafe fn step_running(s: &mut MicState) -> i32 {
     let sys = &*s.syscalls;
-    let dev_call = sys.dev_call;
+    let provider_call = sys.provider_call;
     let out_chan = s.out_chan;
     let rx_handle = s.rx_handle;
 
@@ -312,14 +317,14 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
     }
 
     // Check if RX buffer is ready
-    let can_pull = (dev_call)(rx_handle, DEV_PIO_RX_STREAM_CAN_PULL, core::ptr::null_mut(), 0);
+    let can_pull = (provider_call)(rx_handle, DEV_PIO_RX_STREAM_CAN_PULL, core::ptr::null_mut(), 0);
     if can_pull <= 0 {
         return 0;
     }
 
     // Get buffer pointer
     let mut buf_ptr: u32 = 0;
-    let words = (dev_call)(
+    let words = (provider_call)(
         rx_handle,
         DEV_PIO_RX_STREAM_GET_BUFFER,
         &mut buf_ptr as *mut u32 as *mut u8,
@@ -340,7 +345,7 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
     );
 
     // Acknowledge the pull (release buffer for DMA reuse)
-    (dev_call)(rx_handle, DEV_PIO_RX_STREAM_PULL, core::ptr::null_mut(), 0);
+    (provider_call)(rx_handle, DEV_PIO_RX_STREAM_PULL, core::ptr::null_mut(), 0);
 
     // Write to output channel
     let written = (sys.channel_write)(out_chan, s.io_buf.as_ptr(), copy_len);

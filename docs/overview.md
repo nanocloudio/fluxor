@@ -31,7 +31,7 @@ How the system works. These are the authoritative references.
 - [architecture/module_architecture.md](architecture/module_architecture.md) — module lifecycle, step contract, fault recovery, drain protocol
 - [architecture/timing.md](architecture/timing.md) — stream clock vs wall clock, StreamTime, producer scheduling
 - [architecture/hal_architecture.md](architecture/hal_architecture.md) — HAL boundaries, syscall table, kernel/module split, per-silicon HAL
-- [architecture/device_classes.md](architecture/device_classes.md) — device class system, opcode namespaces, `dev_call`/`dev_query`
+- [architecture/abi_layers.md](architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
 - [architecture/events.md](architecture/events.md) — event objects, IRQ binding, scheduler wake, ISR safety contract
 - [architecture/capability_surface.md](architecture/capability_surface.md) — capability resolution, auto-wiring, hardware abstraction
 - [architecture/network.md](architecture/network.md) — channel-based networking, net_proto, drivers, IP module, TLS

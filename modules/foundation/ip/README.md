@@ -31,14 +31,6 @@ name = "frames_tx"
 direction = "output"
 content_type = "EthernetFrame"
 required = true
-
-[[resources]]
-device_class = "netif"
-access = "write"
-
-[[resources]]
-device_class = "socket"
-access = "exclusive"
 ```
 
 ## Parameters

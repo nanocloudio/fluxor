@@ -88,4 +88,4 @@ logic in application modules.
 
 - `docs/guides/input_gestures.md`
 - `docs/architecture/events.md`
-- `docs/architecture/device_classes.md`
+- `docs/architecture/abi_layers.md`

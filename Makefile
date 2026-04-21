@@ -12,24 +12,30 @@
 TARGET ?= rp2350
 
 # Target-to-toolchain lookup (avoids circular dep with tools binary)
+# SILICON_ID: the chip the TARGET runs on. Board targets (e.g. cm5) map to
+# their silicon (bcm2712). Modules are byte-identical across boards that
+# share silicon + module_target, so they live under the silicon id.
 ifeq ($(TARGET),rp2040)
   RUST_TARGET := thumbv6m-none-eabi
   CARGO_FEATURES := chip-rp2040
   MODULE_TARGET := thumbv6m-none-eabi
   MODULE_LD := modules/module.ld
   MODULE_LINKER := arm-none-eabi-ld
+  SILICON_ID := rp2040
 else ifeq ($(TARGET),cm5)
   RUST_TARGET := aarch64-unknown-none
   CARGO_FEATURES := board-cm5
   MODULE_TARGET := aarch64-unknown-none
   MODULE_LD := modules/module.ld
   MODULE_LINKER := rust-lld -flavor gnu
+  SILICON_ID := bcm2712
 else ifeq ($(TARGET),bcm2712)
   RUST_TARGET := aarch64-unknown-none
   CARGO_FEATURES := chip-bcm2712
   MODULE_TARGET := aarch64-unknown-none
   MODULE_LD := modules/module.ld
   MODULE_LINKER := rust-lld -flavor gnu
+  SILICON_ID := bcm2712
 else
   # rp2350, rp2350a, rp2350b: all use the same binary (runtime detection handles A/B)
   RUST_TARGET := thumbv8m.main-none-eabihf
@@ -37,12 +43,13 @@ else
   MODULE_TARGET := thumbv8m.main-none-eabihf
   MODULE_LD := modules/module.ld
   MODULE_LINKER := arm-none-eabi-ld
+  SILICON_ID := rp2350
 endif
 
 RELEASE_DIR := target/$(RUST_TARGET)/release
 FIRMWARE_ELF := $(RELEASE_DIR)/fluxor
 FIRMWARE_BIN := target/$(TARGET)/firmware.bin
-MODULES_OUT := target/$(TARGET)/modules
+MODULES_OUT := target/$(SILICON_ID)/modules
 FLUXOR_TOOL := target/aarch64-unknown-linux-gnu/release/fluxor
 
 # Module source directories under modules/
@@ -54,7 +61,7 @@ ABI_HEADER := $(SDK_DIR)/abi.rs
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,2)))))))))))))
 
-.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash
+.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash hw-test hw-liveness hw-power-on hw-power-off hw-power-cycle hw-console
 
 all: tools firmware-all modules-all linux-bin
 

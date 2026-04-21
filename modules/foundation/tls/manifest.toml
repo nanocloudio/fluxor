@@ -20,7 +20,3 @@ content_type = "OctetStream"
 name = "clear_out"
 direction = "output"
 content_type = "OctetStream"
-
-[[resources]]
-device_class = "system"
-access = "write"

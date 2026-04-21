@@ -22,7 +22,3 @@ content_type = "OctetStream"
 name = "net_in"
 direction = "input"
 content_type = "OctetStream"
-
-[[resources]]
-device_class = "netif"
-access = "write"

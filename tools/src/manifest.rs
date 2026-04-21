@@ -47,30 +47,64 @@ fn content_type_from_str(s: &str) -> Result<u8> {
         .ok_or_else(|| Error::Module(format!("unknown content type: {}", s)))
 }
 
-// ── Device class string→u8 mapping (matches dev_class constants) ────────────
+// ── Contract name → u8 mapping (matches provider::contract constants) ───────
+//
+// The manifest's `requires_contract` field names a contract by its layer
+// name. Module-facing names mirror the layer boundaries documented in
+// `docs/architecture/abi_layers.md`:
+//   - HAL hardware contracts: "gpio", "spi", "i2c", "pio", "uart", "adc", "pwm"
+//   - Stable module contracts: "fs" (plus kernel-provided channel/timer/buffer/event, implicit)
+//   - Platform transport contracts: "platform_nic_ring", "platform_dma",
+//     "platform_dma_fd" (raw register-level surfaces gated by `platform_raw`)
+//
+// Permission names ("internal", "flash_raw", "platform_raw", etc.) are not
+// contracts and belong in the top-level `permissions = [...]` list — they
+// are rejected here with a schema-error pointing at the correct section.
 
-fn device_class_from_str(s: &str) -> Result<u8> {
+/// Parse a contract name from `[[resources]].requires_contract`. Only
+/// public contract names are accepted here — `"internal"` and specific
+/// permission names like `"flash_raw"` or `"platform_raw"` are **not**
+/// contracts and must be declared under the top-level `permissions = [...]`
+/// list instead.
+fn contract_id_from_name(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
-        "gpio" => Ok(0x01),
-        "spi" => Ok(0x02),
-        "i2c" => Ok(0x03),
-        "pio" => Ok(0x04),
-        "channel" => Ok(0x05),
-        "timer" => Ok(0x06),
-        "netif" => Ok(0x07),
-        "socket" => Ok(0x08),
-        "fs" => Ok(0x09),
-        "buffer" => Ok(0x0A),
-        "event" => Ok(0x0B),
-        "system" => Ok(0x0C),
-        "uart" => Ok(0x0D),
-        "adc" => Ok(0x0E),
-        "pwm" => Ok(0x0F),
-        _ => Err(Error::Module(format!("unknown device class: {}", s))),
+        "gpio"               => Ok(0x01),
+        "spi"                => Ok(0x02),
+        "i2c"                => Ok(0x03),
+        "pio"                => Ok(0x04),
+        "channel"            => Ok(0x05),
+        "timer"              => Ok(0x06),
+        "platform_nic_ring"  => Ok(0x07),
+        "platform_dma"       => Ok(0x08),
+        "fs"                 => Ok(0x09),
+        "buffer"             => Ok(0x0A),
+        "event"              => Ok(0x0B),
+        "uart"               => Ok(0x0D),
+        "adc"                => Ok(0x0E),
+        "pwm"                => Ok(0x0F),
+        "platform_dma_fd"    => Ok(0x11),
+        // Anything that looks like a permission name is a manifest
+        // schema error — those go in `permissions = [...]`, not
+        // `[[resources]]`.
+        "internal" | "system" | "reconfigure" | "flash_raw"
+        | "backing_provider" | "platform_raw" | "monitor" | "bridge" => {
+            Err(Error::Module(format!(
+                "`{}` is a permission, not a contract. Declare it in the \
+                 top-level `permissions = [\"{}\", ...]` list, not under \
+                 `[[resources]]`. See docs/architecture/abi_layers.md.",
+                s, s
+            )))
+        }
+        _ => Err(Error::Module(format!(
+            "unknown contract name: {} — expected one of: gpio, spi, i2c, pio, \
+             uart, adc, pwm, fs, platform_nic_ring, platform_dma, platform_dma_fd \
+             (see docs/architecture/abi_layers.md)",
+            s
+        ))),
     }
 }
 
-fn device_class_to_str(class: u8) -> &'static str {
+fn contract_name_to_str(class: u8) -> &'static str {
     match class {
         0x01 => "gpio",
         0x02 => "spi",
@@ -78,15 +112,16 @@ fn device_class_to_str(class: u8) -> &'static str {
         0x04 => "pio",
         0x05 => "channel",
         0x06 => "timer",
-        0x07 => "netif",
-        0x08 => "socket",
+        0x07 => "platform_nic_ring",
+        0x08 => "platform_dma",
         0x09 => "fs",
         0x0A => "buffer",
         0x0B => "event",
-        0x0C => "system",
+        0x0C => "internal",
         0x0D => "uart",
         0x0E => "adc",
         0x0F => "pwm",
+        0x11 => "platform_dma_fd",
         _ => "unknown",
     }
 }
@@ -212,6 +247,52 @@ pub struct CommandVocabulary {
     pub emits: Vec<String>,
 }
 
+/// Fine-grained module permissions. Each category gates a specific
+/// subset of 0x0Cxx orchestration / platform opcodes; a module that
+/// needs only one surface does not implicitly get the others.
+///
+/// Serialised as a u8 bitmap into the manifest binary (reserved byte
+/// at offset 15). Not part of the module header's flags byte — so
+/// that adding a permission does not require a module-header ABI bump.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ManifestPermissions {
+    pub bits: u8,
+}
+
+/// Permission category bits. Keep in sync with the kernel's
+/// `permission` module in `src/kernel/syscalls.rs`.
+pub mod permission {
+    pub const RECONFIGURE:       u8 = 1 << 0; // graph slot commit, boot counter, FMP routing
+    pub const FLASH_RAW:         u8 = 1 << 1; // flash ERASE / PROGRAM
+    pub const BACKING_PROVIDER:  u8 = 1 << 2; // paged-arena / backing-provider registration
+    pub const PLATFORM_RAW:      u8 = 1 << 3; // MMIO/DMA/PCIe/SMMU/NIC, raw peripheral register bridges
+    pub const MONITOR:           u8 = 1 << 4; // fault monitor BIND/WAIT/ACK/REPORT/RAISE
+    pub const BRIDGE:            u8 = 1 << 5; // cross-domain / cross-core dispatch
+
+    pub fn from_name(s: &str) -> Option<u8> {
+        match s {
+            "reconfigure"       => Some(RECONFIGURE),
+            "flash_raw"         => Some(FLASH_RAW),
+            "backing_provider"  => Some(BACKING_PROVIDER),
+            "platform_raw"      => Some(PLATFORM_RAW),
+            "monitor"           => Some(MONITOR),
+            "bridge"            => Some(BRIDGE),
+            _ => None,
+        }
+    }
+
+    pub fn names(bits: u8) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if bits & RECONFIGURE      != 0 { out.push("reconfigure"); }
+        if bits & FLASH_RAW        != 0 { out.push("flash_raw"); }
+        if bits & BACKING_PROVIDER != 0 { out.push("backing_provider"); }
+        if bits & PLATFORM_RAW     != 0 { out.push("platform_raw"); }
+        if bits & MONITOR          != 0 { out.push("monitor"); }
+        if bits & BRIDGE           != 0 { out.push("bridge"); }
+        out
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub module_version: u16,
@@ -219,6 +300,7 @@ pub struct Manifest {
     pub state_size_hint: u16,
     pub ports: Vec<PortSpec>,
     pub resources: Vec<ResourceClaim>,
+    pub permissions: ManifestPermissions,
     pub dependencies: Vec<Dependency>,
     pub integrity_hash: Option<[u8; 32]>,
     /// Ed25519 signature over the integrity hash. Set by the `fluxor sign`
@@ -229,8 +311,9 @@ pub struct Manifest {
     pub signer_fp: Option<[u8; 32]>,
     /// FMP command vocabulary (parsed from TOML, not in binary format)
     pub commands: CommandVocabulary,
-    /// Services this module provides to others (parsed from TOML, not in binary format).
-    /// e.g. pwm provides "pwm". (Legacy: socket routing used this, now replaced by channels.)
+    /// Services this module provides to others (parsed from TOML, not in
+    /// binary format). Used by the config resolver to wire dependencies by
+    /// service name (e.g. `pwm_rp` provides `"pwm"`).
     pub provides: Vec<String>,
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
@@ -245,6 +328,7 @@ impl Default for Manifest {
             state_size_hint: 0,
             ports: Vec::new(),
             resources: Vec::new(),
+            permissions: ManifestPermissions::default(),
             dependencies: Vec::new(),
             integrity_hash: None,
             signature: None,
@@ -257,16 +341,25 @@ impl Default for Manifest {
 }
 
 impl Manifest {
-    /// Compute the required_caps bitmask from resource claims.
-    /// Bit N = device class N is required.
-    pub fn required_caps_mask(&self) -> u16 {
-        let mut mask = 0u16;
+    /// Compute the required_caps bitmask from resource claims. Each
+    /// declared contract id sets the corresponding bit in a u32; contract
+    /// ids must fall in 0..31 to be expressible. Non-contract permissions
+    /// live in `self.permissions` and are serialised separately into
+    /// manifest binary byte 15.
+    pub fn required_caps_mask(&self) -> Result<u32> {
+        let mut mask = 0u32;
         for r in &self.resources {
-            if r.device_class < 16 {
-                mask |= 1 << r.device_class;
+            if r.device_class < 32 {
+                mask |= 1u32 << r.device_class;
+            } else {
+                return Err(Error::Module(format!(
+                    "requires_contract {} (0x{:02x}) is outside the required_caps u32 range (bits 0..31).",
+                    contract_name_to_str(r.device_class),
+                    r.device_class,
+                )));
             }
         }
-        mask
+        Ok(mask)
     }
 
     /// Look up a port by name. Returns (direction, index, content_type).
@@ -348,10 +441,25 @@ impl Manifest {
 
         let mut resources = Vec::new();
         for r in toml_val.resources.unwrap_or_default() {
-            let device_class = device_class_from_str(&r.device_class)?;
+            let cid = contract_id_from_name(&r.device_class)?;
             let access_mode = access_mode_from_str(&r.access)?;
             let instance = r.instance.unwrap_or(0xFF);
-            resources.push(ResourceClaim { device_class, access_mode, instance });
+            resources.push(ResourceClaim { device_class: cid, access_mode, instance });
+        }
+
+        let mut permissions = ManifestPermissions::default();
+        for name in toml_val.permissions.unwrap_or_default() {
+            match permission::from_name(&name) {
+                Some(bit) => permissions.bits |= bit,
+                None => {
+                    return Err(Error::Module(format!(
+                        "unknown permission: {} — expected one of: reconfigure, \
+                         flash_raw, backing_provider, platform_raw, monitor, bridge \
+                         (see docs/architecture/abi_layers.md)",
+                        name,
+                    )));
+                }
+            }
         }
 
         let mut dependencies = Vec::new();
@@ -385,6 +493,7 @@ impl Manifest {
             state_size_hint,
             ports,
             resources,
+            permissions,
             dependencies,
             integrity_hash: None, // set later by caller
             signature: None,
@@ -424,7 +533,9 @@ impl Manifest {
         let flags = (if has_integrity { 1 } else { 0 })
             | (if has_signature { 2 } else { 0 });
         buf.push(flags);
-        buf.push(0); // reserved
+        // byte 15: fine-grained permissions bitmap (see `permission::*`).
+        // The kernel reads this byte directly at module instantiation.
+        buf.push(self.permissions.bits);
 
         // Ports (4 bytes each)
         for p in &self.ports {
@@ -498,6 +609,7 @@ impl Manifest {
         let flags = data[14];
         let has_integrity = (flags & 0x01) != 0;
         let has_signature = version >= 2 && (flags & 0x02) != 0;
+        let permissions_bits = data[15]; // fine-grained permissions bitmap
 
         let expected_size = MANIFEST_HEADER_SIZE
             + port_count * 4
@@ -577,6 +689,7 @@ impl Manifest {
             state_size_hint,
             ports,
             resources,
+            permissions: ManifestPermissions { bits: permissions_bits },
             dependencies,
             integrity_hash,
             signature,
@@ -593,7 +706,10 @@ impl Manifest {
         let mut lines = vec![
             format!("  version: {}.{}.{}", major, minor, patch),
             format!("  hardware_targets: 0x{:04x}", self.hardware_targets),
-            format!("  required_caps: 0x{:04x}", self.required_caps_mask()),
+            match self.required_caps_mask() {
+                Ok(m) => format!("  required_caps: 0x{:08x}", m),
+                Err(e) => format!("  required_caps: <error: {}>", e),
+            },
         ];
         if self.state_size_hint > 0 {
             lines.push(format!("  state_size_hint: {} bytes", self.state_size_hint));
@@ -619,18 +735,24 @@ impl Manifest {
                 if r.instance != 0xFF {
                     lines.push(format!(
                         "    {}[{}] ({})",
-                        device_class_to_str(r.device_class),
+                        contract_name_to_str(r.device_class),
                         r.instance,
                         access_mode_to_str(r.access_mode),
                     ));
                 } else {
                     lines.push(format!(
                         "    {} ({})",
-                        device_class_to_str(r.device_class),
+                        contract_name_to_str(r.device_class),
                         access_mode_to_str(r.access_mode),
                     ));
                 }
             }
+        }
+        if self.permissions.bits != 0 {
+            lines.push(format!(
+                "  permissions: [{}]",
+                permission::names(self.permissions.bits).join(", ")
+            ));
         }
         if !self.dependencies.is_empty() {
             lines.push("  dependencies:".into());
@@ -679,6 +801,10 @@ struct TomlManifest {
     state_size_hint: Option<u16>,
     ports: Option<Vec<TomlPort>>,
     resources: Option<Vec<TomlResource>>,
+    /// Top-level `permissions = ["reconfigure", "flash_raw", …]` list —
+    /// fine-grained non-contract permission categories. Distinct from
+    /// `[[resources]]` (which is for public contract access).
+    permissions: Option<Vec<String>>,
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
     provides: Option<Vec<String>>,
@@ -697,6 +823,10 @@ struct TomlPort {
 
 #[derive(Deserialize)]
 struct TomlResource {
+    /// Public contract this module needs access to. Values: one of
+    /// gpio, spi, i2c, pio, uart, adc, pwm, fs. Non-contract
+    /// permissions go in the top-level `permissions = [...]` list.
+    #[serde(rename = "requires_contract")]
     device_class: String,
     access: String,
     instance: Option<u8>,
@@ -761,6 +891,6 @@ mod tests {
         let mut m = Manifest::default();
         m.resources.push(ResourceClaim { device_class: 0x01, access_mode: 0, instance: 0xFF }); // GPIO
         m.resources.push(ResourceClaim { device_class: 0x04, access_mode: 2, instance: 0xFF }); // PIO
-        assert_eq!(m.required_caps_mask(), (1 << 1) | (1 << 4));
+        assert_eq!(m.required_caps_mask().unwrap(), (1 << 1) | (1 << 4));
     }
 }

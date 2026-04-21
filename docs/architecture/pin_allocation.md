@@ -61,7 +61,7 @@ Hardware resource ownership is explicit and declared, not opportunistic:
 +-------------------------------------------------------------+
 |                        Modules                               |
 |  - Request resources by name/id from config                  |
-|  - Use `dev_call` device classes: GPIO/SPI/I2C               |
+|  - Open HAL contracts via `provider_open`: GPIO/SPI/I2C/…    |
 |  - No knowledge of physical pins                             |
 +-------------------------------------------------------------+
 ```
@@ -360,14 +360,15 @@ async fn main(spawner: Spawner) {
 ### Resource Access Contract
 
 ```rust
-// Modules access GPIO/SPI/I2C via dev_call opcodes (stable ABI classes).
+// Modules access GPIO/SPI/I2C via HAL contracts (contracts/hal/*.rs)
+// dispatched through `provider_open` and `provider_call`.
 // Runtime helpers in modules/pic_runtime.rs provide ergonomic wrappers.
 //
 // Examples:
-// - dev_call(-1, dev_gpio::REQUEST_OUTPUT, ...)
-// - dev_call(-1, dev_gpio::REQUEST_INPUT, ...)
-// - dev_call(-1, dev_spi::OPEN, ...)
-// - dev_call(-1, dev_i2c::OPEN, ...)
+// - provider_open(HAL_GPIO, gpio::SET_OUTPUT, ...)
+// - provider_open(HAL_GPIO, gpio::SET_INPUT, ...)
+// - provider_open(HAL_SPI, spi::OPEN, ...)
+// - provider_open(HAL_I2C, i2c::OPEN, ...)
 ```
 
 ### Module Resource Access Pattern
@@ -389,7 +390,7 @@ pub struct SdSourceParams {
 unsafe fn sd_init_hw(cfg: &SdSourceParams) -> i32 {
     // Request CS pin
     let mut cs_arg = [cfg.cs_pin];
-    CS_HANDLE = (sys().dev_call)(-1, dev_gpio::REQUEST_OUTPUT, cs_arg.as_mut_ptr(), 1);
+    CS_HANDLE = (sys().provider_open)(-1, dev_gpio::REQUEST_OUTPUT, cs_arg.as_mut_ptr(), 1);
     if CS_HANDLE < 0 { return -10; }
 
     // Open SPI on the configured bus
@@ -399,7 +400,7 @@ unsafe fn sd_init_hw(cfg: &SdSourceParams) -> i32 {
         freq_hz: INIT_FREQ,
         mode: 0,
     };
-    SPI_HANDLE = (sys().dev_call)(
+    SPI_HANDLE = (sys().provider_open)(
         -1,
         dev_spi::OPEN,
         &mut spi as *mut _ as *mut u8,

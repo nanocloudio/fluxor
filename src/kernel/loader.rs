@@ -25,6 +25,7 @@ pub mod export_hashes {
     pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03;  // "module_isr_init"
     pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743;  // "module_isr_entry"
     pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76; // "module_provider_dispatch"
+    pub const MODULE_PROVIDES_CONTRACT: u32 = 0x671c57bb; // "module_provides_contract"
     pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
 }
 
@@ -205,6 +206,44 @@ pub type ModuleChannelHintsFn = unsafe extern "C" fn(*mut u8, usize) -> i32;
 #[inline]
 unsafe fn fn_ptr_from_addr<F: Copy>(addr: usize) -> F {
     core::mem::transmute_copy(&addr)
+}
+
+/// Resolved provider-auto-registration hooks for a module.
+///
+/// A PIC module is a provider for a contract when it exports both
+/// `module_provides_contract() -> u32` (returns the contract id) and
+/// `module_provider_dispatch(state, handle, op, arg, len) -> i32` (the
+/// dispatch fn). We resolve both addresses at load time and call
+/// `register_module_provider` after `module_new()` returns Ready.
+/// Modules that aren't providers leave both exports absent and this
+/// whole path is a no-op.
+struct ProviderAutoRegister {
+    contract_fn: unsafe extern "C" fn() -> u32,
+    dispatch_fn: crate::kernel::provider::ModuleProviderDispatchFn,
+}
+
+impl ProviderAutoRegister {
+    /// Look for the `module_provides_contract` + `module_provider_dispatch`
+    /// export pair. Returns None if the module isn't a provider.
+    unsafe fn resolve(module: &LoadedModule) -> Option<Self> {
+        let contract_addr = module.get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACT).ok()?;
+        let dispatch_addr = module.get_export_addr(export_hashes::MODULE_PROVIDER_DISPATCH).ok()?;
+        Some(Self {
+            contract_fn: fn_ptr_from_addr(contract_addr),
+            dispatch_fn: fn_ptr_from_addr(dispatch_addr),
+        })
+    }
+
+    /// Register this module as a provider. Called after module_new() Ready.
+    unsafe fn register(&self, module_idx: u8, state_ptr: *mut u8, name: &'static str) {
+        let contract = (self.contract_fn)() as u16;
+        let rc = crate::kernel::provider::register_module_provider(
+            contract, module_idx, self.dispatch_fn, state_ptr,
+        );
+        if rc != 0 {
+            log::warn!("[inst] {} provider auto-register failed contract=0x{:04x} rc={}", name, contract, rc);
+        }
+    }
 }
 
 /// Count of PIC calls that returned with interrupts disabled.
@@ -498,7 +537,10 @@ pub struct ModuleTableEntry {
     pub reserved: [u8; 2],
 }
 
-/// Module header (68 bytes)
+/// Module header (72 bytes, ABI v3). ABI v2 was 68 bytes with a u16
+/// `required_caps`; v3 widens `required_caps` to u32 at bytes 6..10 so
+/// every contract id in `MAX_CONTRACTS` (0..31) is expressible in the
+/// manifest bitmask.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleHeader {
@@ -514,33 +556,31 @@ pub struct ModuleHeader {
     pub export_count: u16,
     pub export_offset: u16,
     pub name: [u8; 32],
-    pub reserved: [u8; 8],
+    pub reserved: [u8; 12],
 }
 
 impl ModuleHeader {
-    pub const SIZE: usize = 68;
+    pub const SIZE: usize = 72;
 
-    /// ABI v2 reserved layout:
+    /// Reserved layout (ABI v3):
     ///   byte 0: flags
     ///     bit 0: mailbox_safe — module can safely consume from mailbox channels.
-    ///            Required for buffer_group aliasing: the scheduler checks this
-    ///            flag in `open_channels` and skips the alias (falls back to a
-    ///            separate FIFO channel) if the downstream module is not safe.
-    ///            Set for any module that handles mailbox input correctly
-    ///            (via buffer_acquire_read, buffer_acquire_inplace, or
-    ///            transparent channel_read).
-    ///     bit 1: in_place_writer — module uses buffer_acquire_inplace to modify
-    ///            the buffer in place. Used for setup-time validation: at most
-    ///            one in_place_writer per buffer_group is allowed.
+    ///     bit 1: in_place_writer — module uses buffer_acquire_inplace.
     ///     bit 2: deferred_ready — module needs init time before downstream runs.
     ///     bit 3: drain_capable — module exports module_drain for live reconfigure.
-    ///     bit 4: isr_module — module exports module_isr_init / module_isr_entry
-    ///            for Tier 2 ISR execution. Set by pack tool when these exports exist.
-    ///     bits 5-7: reserved (0)
-    ///   byte 1: step_period_ms
-    ///   bytes 2-3: schema_size (u16 LE)
-    ///   bytes 4-5: manifest_size (u16 LE)
-    ///   bytes 6-7: required_caps (u16 LE)
+    ///     bit 4: isr_module — module exports module_isr_init / module_isr_entry.
+    ///     bits 5-7: reserved (0). Fine-grained permissions
+    ///     (reconfigure / flash_raw / platform_raw / backing_provider /
+    ///     monitor / bridge) live in the manifest binary at byte 15,
+    ///     read by `LoadedModule::manifest_permissions()`.
+    ///   byte 1: step_period_ms (0 = every tick, N = every N ms).
+    ///   bytes 2-3: schema_size (u16 LE).
+    ///   bytes 4-5: manifest_size (u16 LE).
+    ///   bytes 6-9: required_caps (u32 LE) — public contract bitmask,
+    ///     bit N = contract id N required in `[[resources]]`. Covers
+    ///     the full 0..31 range of contract ids defined in
+    ///     `provider::contract`.
+    ///   bytes 10-11: reserved (0), available for future ABI extensions.
 
     /// Step period hint from reserved[1]: 0 = every tick, N = every N ms.
     pub fn step_period_ms(&self) -> u8 {
@@ -557,10 +597,14 @@ impl ModuleHeader {
         u16::from_le_bytes([self.reserved[4], self.reserved[5]])
     }
 
-    /// Required device class bitmask from reserved[6..8].
-    /// Bit N set = module requires device class N through dev_call.
-    pub fn required_caps(&self) -> u16 {
-        u16::from_le_bytes([self.reserved[6], self.reserved[7]])
+    /// Required public-contract bitmask from reserved[6..10].
+    /// Bit N set = module declared `requires_contract = "..."` for
+    /// contract id N in its manifest. Full 0..31 range since v3.
+    pub fn required_caps(&self) -> u32 {
+        u32::from_le_bytes([
+            self.reserved[6], self.reserved[7],
+            self.reserved[8], self.reserved[9],
+        ])
     }
 
     /// Whether this module is an ISR module (Tier 2). Flags bit 4.
@@ -620,6 +664,29 @@ impl LoadedModule {
         // in the header's export_offset field for modules > 64KB.
         let offset = self.header.code_size as usize + self.header.data_size as usize;
         unsafe { offset_ptr(self.code_base(), offset) }
+    }
+
+    /// Read the fine-grained permissions bitmap from the manifest section.
+    /// The manifest binary stores this at byte offset 15 (manifest magic
+    /// `FXMF` occupies bytes 0-3). Returns 0 if the manifest is missing
+    /// or too small to contain the permissions byte. See
+    /// `docs/architecture/abi_layers.md` and the `permission` module in
+    /// `src/kernel/syscalls.rs` for the bit layout.
+    pub fn manifest_permissions(&self) -> u8 {
+        let manifest_size = self.header.manifest_size() as usize;
+        if manifest_size < 16 { return 0; }
+        let code_size = self.header.code_size as usize;
+        let data_size = self.header.data_size as usize;
+        let export_size = self.header.export_count as usize * 8;
+        let schema_size = self.header.schema_size() as usize;
+        let manifest_offset = ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        unsafe {
+            let p = offset_ptr(self.base, manifest_offset);
+            // Verify magic before trusting byte 15.
+            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+            if magic != 0x464D5846 { return 0; } // "FXMF"
+            *p.add(15)
+        }
     }
 
     /// Get a function address by hash.
@@ -1152,6 +1219,8 @@ pub struct DynamicModulePending {
     params_len: usize,
     name: &'static str,
     drain_fn: Option<ModuleDrainFn>,
+    auto_register: Option<ProviderAutoRegister>,
+    module_idx: u8,
 }
 
 impl DynamicModulePending {
@@ -1190,6 +1259,8 @@ impl DynamicModulePending {
             params_len,
             name,
             drain_fn: None,
+            auto_register: None,
+            module_idx: 0,
         }
     }
 
@@ -1213,6 +1284,9 @@ impl DynamicModulePending {
         )? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {}", self.name);
+                if let Some(ar) = self.auto_register.as_ref() {
+                    ar.register(self.module_idx, self.state_ptr, self.name);
+                }
                 Ok(Some(DynamicModule {
                     step_fn: self.step_fn,
                     state_ptr: self.state_ptr,
@@ -1321,9 +1395,16 @@ impl DynamicModule {
         // 4. Allocate state from arena (safe)
         let state_ptr = alloc_state(required_size)?;
 
-        // Set instantiation state so REGISTER_PROVIDER can find our state during module_new
+        // Set instantiation state so syscalls made from module_new can
+        // locate the module by index → state pointer.
         let inst_idx = super::scheduler::current_module_index();
         super::scheduler::set_instantiation_state(inst_idx, state_ptr);
+
+        // Resolve optional provider-auto-registration exports. If the
+        // module declares itself a provider, the loader calls
+        // `register_module_provider` as soon as module_new() returns
+        // Ready — module code never touches registration directly.
+        let auto_register = ProviderAutoRegister::resolve(module);
 
         // 4b. If module exports module_arena_size, allocate and init heap
         if let Ok(arena_addr) = module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
@@ -1352,6 +1433,9 @@ impl DynamicModule {
         match invoke_new(exports.new_fn, syscalls, in_chan, out_chan, ctrl_chan, params, params_len, state_ptr, required_size)? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {}", name);
+                if let Some(ar) = auto_register.as_ref() {
+                    ar.register(inst_idx as u8, state_ptr, name);
+                }
                 Ok(StartNewResult::Ready(DynamicModule {
                     step_fn: exports.step_fn,
                     state_ptr,
@@ -1375,6 +1459,8 @@ impl DynamicModule {
                     params_len,
                     name,
                     drain_fn,
+                    auto_register,
+                    module_idx: inst_idx as u8,
                 };
                 log::info!("[inst] pending {}", name);
                 Ok(StartNewResult::Pending(pending))
@@ -1484,13 +1570,16 @@ pub fn find_hint_for_port(
 
 /// Resolve an export hash to an absolute address for a given module.
 ///
-/// Called by the REGISTER_PROVIDER syscall handler. The module passes an
-/// FNV-1a hash of the export name (e.g. 0xc7832e76 for "module_provider_dispatch").
-/// We walk the module's export table to find the matching entry and compute
-/// the absolute address from code_base + offset.
+/// Used by loader-side lookups that bind module exports to kernel-side
+/// function pointers — e.g. the flash-store and NVMe-backing
+/// registration paths pass an FNV-1a hash of an exported symbol name,
+/// and this helper walks the module's export table to get the real
+/// function address (code_base + offset, with the Thumb bit applied
+/// for ARMv7-M/ARMv8-M).
 ///
-/// Returns `Some(absolute_address)` on success, `None` if the hash is not found
-/// in the module's export table (falls back to treating the value as a raw address).
+/// Returns `Some(absolute_address)` on success, `None` if the hash is
+/// not found (caller may then fall back to treating the value as a
+/// raw address).
 pub fn resolve_export_for_module(module_idx: usize, export_hash: u32) -> Option<usize> {
     let (code_base, export_table, export_count) =
         super::scheduler::get_module_exports(module_idx);
@@ -1529,6 +1618,7 @@ mod tests {
         assert_eq!(fnv1a32(b"module_step"), export_hashes::MODULE_STEP);
         assert_eq!(fnv1a32(b"module_channel_hints"), export_hashes::MODULE_CHANNEL_HINTS);
         assert_eq!(fnv1a32(b"module_provider_dispatch"), export_hashes::MODULE_PROVIDER_DISPATCH);
+        assert_eq!(fnv1a32(b"module_provides_contract"), export_hashes::MODULE_PROVIDES_CONTRACT);
         assert_eq!(fnv1a32(b"module_flash_store_dispatch"), export_hashes::MODULE_FLASH_STORE_DISPATCH);
     }
 }

@@ -30,10 +30,6 @@ name = "wifi_ctrl"
 direction = "output"
 content_type = "FmpMessage"
 
-[[resources]]
-device_class = "netif"
-access = "write"
-
 [commands]
 accepts = ["radio_ready", "connected", "disconnected", "scan_done", "scan_result"]
 emits = ["connect", "disconnect", "scan"]

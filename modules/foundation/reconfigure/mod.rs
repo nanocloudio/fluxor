@@ -24,28 +24,34 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 
 // ============================================================================
-// Opcodes (mirror modules/sdk/abi.rs::dev_system)
+// Opcodes — imported from the layered ABI, not hardcoded.
 // ============================================================================
 
-const SYS_RECONFIG_SELF_INDEX: u32      = 0x0C67;
-const SYS_RECONFIG_SET_PHASE: u32       = 0x0C68;
-const SYS_RECONFIG_CALL_DRAIN: u32      = 0x0C69;
-const SYS_RECONFIG_MARK_FINISHED: u32   = 0x0C6A;
-const SYS_RECONFIG_MODULE_COUNT: u32    = 0x0C6B;
-const SYS_RECONFIG_MODULE_INFO: u32     = 0x0C6C;
-const SYS_RECONFIG_TRIGGER_REBUILD: u32 = 0x0C6D;
-const SYS_RECONFIG_MODULE_UPSTREAM: u32 = 0x0C6E;
-const SYS_RECONFIG_MODULE_DONE: u32     = 0x0C6F;
+use abi::internal::reconfigure::{
+    SELF_INDEX as SYS_RECONFIG_SELF_INDEX,
+    SET_PHASE as SYS_RECONFIG_SET_PHASE,
+    CALL_DRAIN as SYS_RECONFIG_CALL_DRAIN,
+    MARK_FINISHED as SYS_RECONFIG_MARK_FINISHED,
+    MODULE_COUNT as SYS_RECONFIG_MODULE_COUNT,
+    MODULE_INFO as SYS_RECONFIG_MODULE_INFO,
+    TRIGGER_REBUILD as SYS_RECONFIG_TRIGGER_REBUILD,
+    MODULE_UPSTREAM as SYS_RECONFIG_MODULE_UPSTREAM,
+    MODULE_DONE as SYS_RECONFIG_MODULE_DONE,
+};
 
 // Optional graph_slot integration. When a graph_slot provider is
-// registered, the reconfigure module activates the staged slot so the
-// post-rebuild boot loads its modules and config.
-const SYS_GRAPH_SLOT_ACTIVATE: u32      = 0x0C94;
+// registered (wire `reconfigure.gs_req` → `graph_slot.in`), the
+// reconfigure module activates the staged slot via the graph_slot
+// channel protocol so the post-rebuild boot loads its modules and
+// config. The activation is fire-and-forget; if graph_slot is not
+// wired or the staged slot fails SHA-256 validation, the rebuild
+// falls back to the current STATIC_CONFIG, which is idempotent.
+use abi::contracts::storage::graph_slot::channel::{REQ_ACTIVATE, FRAME_HDR as GS_FRAME_HDR};
 
 // Fault monitor integration. Raise a fault against a module whose drain
 // exceeded its deadline so the unified fault pipeline (monitor CLI,
 // metrics sinks) records it alongside step-guard and MPU faults.
-const SYS_FAULT_RAISE: u32              = 0x0C56;
+use abi::internal::monitor::FAULT_RAISE as SYS_FAULT_RAISE;
 const FAULT_KIND_DRAIN_TIMEOUT: u8      = 5;
 
 // Phase values mirror scheduler::ReconfigurePhase.
@@ -91,6 +97,8 @@ struct State {
     /// Output channel for structured status events. `-1` when the graph
     /// does not wire an output; events are silently dropped in that case.
     status_chan: i32,
+    /// Output port 1 — graph_slot request channel. `-1` when unwired.
+    gs_req_chan: i32,
     phase: u8,
     self_idx: u8,
     signaled_ready: u8,
@@ -106,27 +114,27 @@ struct State {
 // ============================================================================
 
 unsafe fn sys_self_index(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, SYS_RECONFIG_SELF_INDEX, core::ptr::null_mut(), 0)
+    (sys.provider_call)(-1, SYS_RECONFIG_SELF_INDEX, core::ptr::null_mut(), 0)
 }
 
 unsafe fn sys_set_phase(sys: &SyscallTable, phase: u8) {
     let mut arg = [phase];
-    (sys.dev_call)(-1, SYS_RECONFIG_SET_PHASE, arg.as_mut_ptr(), 1);
+    (sys.provider_call)(-1, SYS_RECONFIG_SET_PHASE, arg.as_mut_ptr(), 1);
 }
 
 unsafe fn sys_call_drain(sys: &SyscallTable, idx: u8) -> i32 {
     let mut arg = [idx];
-    (sys.dev_call)(-1, SYS_RECONFIG_CALL_DRAIN, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(-1, SYS_RECONFIG_CALL_DRAIN, arg.as_mut_ptr(), 1)
 }
 
 unsafe fn sys_mark_finished(sys: &SyscallTable, idx: u8) {
     let mut arg = [idx];
-    (sys.dev_call)(-1, SYS_RECONFIG_MARK_FINISHED, arg.as_mut_ptr(), 1);
+    (sys.provider_call)(-1, SYS_RECONFIG_MARK_FINISHED, arg.as_mut_ptr(), 1);
 }
 
 unsafe fn sys_fault_raise(sys: &SyscallTable, idx: u8, kind: u8) {
     let mut arg = [idx, kind];
-    (sys.dev_call)(-1, SYS_FAULT_RAISE, arg.as_mut_ptr(), 2);
+    (sys.provider_call)(-1, SYS_FAULT_RAISE, arg.as_mut_ptr(), 2);
 }
 
 /// Write a single 8-byte status record to the output channel. Silently
@@ -149,24 +157,24 @@ unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, module_idx: u8, e
 }
 
 unsafe fn sys_module_count(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, SYS_RECONFIG_MODULE_COUNT, core::ptr::null_mut(), 0)
+    (sys.provider_call)(-1, SYS_RECONFIG_MODULE_COUNT, core::ptr::null_mut(), 0)
 }
 
 unsafe fn sys_module_info(sys: &SyscallTable, idx: u8) -> u32 {
     let mut arg = [idx];
-    let rc = (sys.dev_call)(-1, SYS_RECONFIG_MODULE_INFO, arg.as_mut_ptr(), 1);
+    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_INFO, arg.as_mut_ptr(), 1);
     if rc < 0 { 0 } else { rc as u32 }
 }
 
 unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u8) -> u32 {
     let mut arg = [idx];
-    let rc = (sys.dev_call)(-1, SYS_RECONFIG_MODULE_UPSTREAM, arg.as_mut_ptr(), 1);
+    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_UPSTREAM, arg.as_mut_ptr(), 1);
     if rc < 0 { 0 } else { rc as u32 }
 }
 
 unsafe fn sys_module_done(sys: &SyscallTable, idx: u8) -> bool {
     let mut arg = [idx];
-    (sys.dev_call)(-1, SYS_RECONFIG_MODULE_DONE, arg.as_mut_ptr(), 1) == 1
+    (sys.provider_call)(-1, SYS_RECONFIG_MODULE_DONE, arg.as_mut_ptr(), 1) == 1
 }
 
 unsafe fn sys_trigger_rebuild(sys: &SyscallTable, ptr: usize, len: usize) {
@@ -181,7 +189,7 @@ unsafe fn sys_trigger_rebuild(sys: &SyscallTable, ptr: usize, len: usize) {
         core::ptr::write_volatile(buf.as_mut_ptr().add(psz + i), *len_bytes.as_ptr().add(i));
         i += 1;
     }
-    (sys.dev_call)(-1, SYS_RECONFIG_TRIGGER_REBUILD, buf.as_mut_ptr(), psz * 2);
+    (sys.provider_call)(-1, SYS_RECONFIG_TRIGGER_REBUILD, buf.as_mut_ptr(), psz * 2);
 }
 
 // ============================================================================
@@ -311,13 +319,22 @@ unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
     let elapsed = s.tick_count.wrapping_sub(s.drain_start_tick);
     let elapsed_u16 = if elapsed > u16::MAX as u32 { u16::MAX } else { elapsed as u16 };
     emit_status(s, sys, STATUS_MIGRATING_ENTERED, 0, elapsed_u16);
-    // If a graph_slot provider is registered and an activation succeeds,
-    // the kernel's boot-time layout scan will pick the newly-live slot on
-    // the next rebuild. A negative return means no graph_slot is present
-    // (ENOSYS) or the staged slot failed integrity — either way we fall
-    // back to the current STATIC_CONFIG, which is the same image we are
-    // already running. The rebuild path is therefore idempotent on failure.
-    let _ = (sys.dev_call)(-1, SYS_GRAPH_SLOT_ACTIVATE, core::ptr::null_mut(), 0);
+    // If graph_slot is wired and an activation succeeds, the kernel's
+    // boot-time layout scan will pick the newly-live slot on the next
+    // rebuild. Fire-and-forget over the graph_slot request channel —
+    // if nothing is wired, or if the staged slot fails SHA-256, the
+    // rebuild falls back to the running STATIC_CONFIG (idempotent).
+    if s.gs_req_chan >= 0 {
+        let mut frame = [0u8; GS_FRAME_HDR];
+        frame[0] = (REQ_ACTIVATE & 0xFF) as u8;
+        frame[1] = ((REQ_ACTIVATE >> 8) & 0xFF) as u8;
+        frame[2] = ((REQ_ACTIVATE >> 16) & 0xFF) as u8;
+        frame[3] = (REQ_ACTIVATE >> 24) as u8;
+        // len = 0 (bare request)
+        frame[4] = 0;
+        frame[5] = 0;
+        let _ = (sys.channel_write)(s.gs_req_chan, frame.as_ptr(), GS_FRAME_HDR);
+    }
     sys_trigger_rebuild(sys, 0, 0);
 }
 
@@ -358,6 +375,7 @@ pub extern "C" fn module_new(
         s.syscalls = syscalls as *const SyscallTable;
         s.ctrl_chan = ctrl_chan;
         s.status_chan = out_chan;
+        s.gs_req_chan = -1;  // resolved in module_step once syscalls are live
         s.phase = PHASE_RUNNING;
         s.self_idx = SELF_IDX_UNKNOWN;
         s.signaled_ready = 0;
@@ -406,6 +424,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if rc >= 0 && rc < MAX_TRACKED_MODULES as i32 {
                 s.self_idx = rc as u8;
             }
+            // Resolve graph_slot request channel (out port 1). -1 if unwired.
+            let mut port_arg = [1u8, 1u8]; // port_type=1(out), index=1
+            s.gs_req_chan = (sys.provider_call)(
+                -1,
+                abi::kernel_abi::channel::PORT,
+                port_arg.as_mut_ptr(),
+                port_arg.len(),
+            );
             return READY;
         }
 

@@ -41,6 +41,10 @@ pub struct ModuleInfo {
     /// Used by `fluxor info` and `fluxor diff` for transition plan display.
     #[allow(dead_code)]
     pub drain_capable: bool,
+    /// Fine-grained permission bitmap from the manifest. See
+    /// `manifest::permission` for the category bits.
+    #[allow(dead_code)]
+    pub permissions_bits: u8,
     /// Raw param schema bytes (if module uses define_params! macro)
     pub schema: Option<Vec<u8>>,
     /// Module manifest (always present in ABI v2)
@@ -53,10 +57,10 @@ impl ModuleInfo {
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)?;
 
-        if data.len() < 68 {
+        if data.len() < MODULE_HEADER_SIZE {
             return Err(Error::Module(format!(
-                "Module file too small: {} bytes",
-                data.len()
+                "Module file too small: {} bytes (need at least {})",
+                data.len(), MODULE_HEADER_SIZE,
             )));
         }
 
@@ -86,12 +90,13 @@ impl ModuleInfo {
         let in_place_writer = (flags_byte & 0x02) != 0;
         let drain_capable = (flags_byte & 0x08) != 0;
 
-        // ABI v2 reserved layout:
-        //   byte 0 (offset 60): flags (bit 0: mailbox_safe, bit 1: in_place_writer)
+        // ABI v3 reserved layout (in the 72-byte module header):
+        //   byte 0 (offset 60): flags
         //   byte 1 (offset 61): step_period_ms
         //   bytes 2-3 (offset 62-63): schema_size (u16 LE)
         //   bytes 4-5 (offset 64-65): manifest_size (u16 LE)
-        //   bytes 6-7 (offset 66-67): required_caps (u16 LE)
+        //   bytes 6-9 (offset 66-69): required_caps (u32 LE)
+        //   bytes 10-11 (offset 70-71): reserved
         let schema_size = if data.len() > 63 {
             u16::from_le_bytes([data[62], data[63]]) as usize
         } else {
@@ -126,6 +131,8 @@ impl ModuleInfo {
 
         let name_hash = fnv1a_hash(name.as_bytes());
 
+        let permissions_bits = manifest.permissions.bits;
+
         Ok(Self {
             name,
             name_hash,
@@ -133,6 +140,7 @@ impl ModuleInfo {
             mailbox_safe,
             in_place_writer,
             drain_capable,
+            permissions_bits,
             schema,
             manifest,
             data,
@@ -150,21 +158,20 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
         )));
     }
 
-    // Calculate total size (with 4-byte alignment padding between .fmod entries)
+    // Calculate total size (with 4-byte alignment padding between .fmod entries).
     // ARM Thumb code requires 2-byte aligned addresses; we use 4-byte for safety.
-    // Each .fmod's code_base = fmod_start + 68 (header), so if fmod_start is
-    // 4-byte aligned, code_base is also 4-byte aligned (68 = 0x44).
+    // Each .fmod's code_base = fmod_start + MODULE_HEADER_SIZE, so if fmod_start is
+    // 4-byte aligned, code_base is also 4-byte aligned.
     let entries_size = modules.len() * ENTRY_SIZE;
     let mut data_size: usize = 0;
     let mut offsets = Vec::new();
     let mut data_offset = TABLE_HEADER_SIZE + entries_size;
 
     for module in modules {
-        // Align code start (offset + 68 bytes header) to page boundary for aarch64 ADRP.
-        // The .fmod header is 68 bytes, then code follows. ADRP needs code at page boundary.
-        let code_start = data_offset + 68;
+        // Align code start (offset + MODULE_HEADER_SIZE) to page boundary for aarch64 ADRP.
+        let code_start = data_offset + MODULE_HEADER_SIZE;
         let aligned_code = (code_start + 4095) & !4095; // round up to page
-        let padding = aligned_code - 68 - data_offset;
+        let padding = aligned_code - MODULE_HEADER_SIZE - data_offset;
         data_offset += padding;
         data_size += padding;
 
@@ -197,8 +204,8 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
 
     // Module data (with alignment padding — code must start at page boundary)
     for (_i, module) in modules.iter().enumerate() {
-        // Pad so that offset + 68 (header size) is page-aligned
-        while (result.len() + 68) % 4096 != 0 {
+        // Pad so that offset + MODULE_HEADER_SIZE is page-aligned
+        while (result.len() + MODULE_HEADER_SIZE) % 4096 != 0 {
             result.push(0);
         }
         result.extend_from_slice(&module.data);
@@ -434,8 +441,11 @@ pub fn parse_modules_from_config_multi(
 // ELF Parsing and Module Packing
 // =============================================================================
 
-/// Module header size (must match firmware's ModuleHeader::SIZE)
-pub const MODULE_HEADER_SIZE: usize = 68;
+/// Module header size (must match firmware's ModuleHeader::SIZE).
+/// ABI v3: 72 bytes (v2 was 68). The extra 4 bytes widen
+/// `required_caps` from u16 to u32 so every contract id in 0..31 is
+/// expressible in the manifest bitmask.
+pub const MODULE_HEADER_SIZE: usize = 72;
 
 ///// Must match kernel's MODULE_ABI_VERSION in src/kernel/loader.rs
 pub const ABI_VERSION: u8 = 1;
@@ -806,9 +816,12 @@ pub fn pack_fmod(
         "module_isr_entry",
         // Provider dispatch (resolved by kernel via export hash)
         "module_provider_dispatch",
+        // Provider auto-registration (loader reads this to get the
+        // contract id and auto-registers the module as provider).
+        "module_provides_contract",
         "module_flash_store_dispatch",
-        // NVMe → kernel pager bridge (resolved by NVME_BACKING_ENABLE)
-        "nvme_backing_dispatch",
+        // Backing-provider dispatch (resolved by BACKING_PROVIDER_ENABLE)
+        "backing_provider_dispatch",
     ];
 
     let mut exports: Vec<(String, u32, u32)> = Vec::new();
@@ -847,7 +860,7 @@ pub fn pack_fmod(
     let manifest_size = manifest_bytes.len();
     let total_size = MODULE_HEADER_SIZE + code_size + data_size + export_table_size + schema_size + manifest_size;
 
-    // Build header (68 bytes)
+    // Build module header (MODULE_HEADER_SIZE bytes).
     let mut header = Vec::with_capacity(MODULE_HEADER_SIZE);
 
     // Magic (4 bytes)
@@ -882,17 +895,27 @@ pub fn pack_fmod(
     let copy_len = name_slice.len().min(31);
     name_bytes[..copy_len].copy_from_slice(&name_slice[..copy_len]);
     header.extend_from_slice(&name_bytes);
-    // Reserved (8 bytes) — ABI v2 layout:
-    //   byte 0: flags (bit 0: mailbox_safe, bit 1: in_place_writer)
+    // Reserved (12 bytes) — ABI v3 layout:
+    //   byte 0: flags
+    //     bit 0: mailbox_safe
+    //     bit 1: in_place_writer
+    //     bit 2: deferred_ready
+    //     bit 3: drain_capable
+    //     bit 4: isr_module
+    //     bits 5-7: reserved (0)
     //   byte 1: step_period_ms (0 = every tick; set by config, not pack)
     //   bytes 2-3: schema_size (u16 LE)
     //   bytes 4-5: manifest_size (u16 LE)
-    //   bytes 6-7: required_caps (u16 LE)
+    //   bytes 6-9: required_caps (u32 LE) — public contract bitmask, full 0..31 range
+    //   bytes 10-11: reserved (0)
+    //
+    // Fine-grained permissions (flash_raw, platform_raw, …) live in the
+    // manifest binary at byte 15 (written by Manifest::to_bytes).
     let has_in_place_safe = symbols.iter().any(|s| s.bind == 1 && s.name == "module_in_place_safe");
     let has_mailbox_safe = symbols.iter().any(|s| s.bind == 1 && s.name == "module_mailbox_safe");
     let has_deferred_ready = symbols.iter().any(|s| s.bind == 1 && s.name == "module_deferred_ready");
     let has_drain = symbols.iter().any(|s| s.bind == 1 && s.name == "module_drain");
-    let mut reserved = [0u8; 8];
+    let mut reserved = [0u8; 12];
     if has_in_place_safe {
         reserved[0] |= 0x03; // mailbox_safe (bit 0) + in_place_writer (bit 1)
     }
@@ -911,7 +934,7 @@ pub fn pack_fmod(
     }
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
-    reserved[6..8].copy_from_slice(&module_manifest.required_caps_mask().to_le_bytes());
+    reserved[6..10].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
     header.extend_from_slice(&reserved);
 
     assert_eq!(header.len(), MODULE_HEADER_SIZE);

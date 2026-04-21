@@ -7,10 +7,6 @@
 //!   3. Reads it back through the same pointer (proves CPU/arena coherence).
 //!   4. Logs the physical address, size, alignment, and readback value.
 //!
-//! Intended as a bring-up probe for Phase 2 of the NVMe driver RFC. Once
-//! NVMe submission/completion queues are living in this arena, this module
-//! becomes redundant and can be retired.
-//!
 //! **Params:**
 //!   size  (u32, tag 1): bytes to allocate (default 4096)
 //!   align (u32, tag 2): alignment in bytes (default 4096)

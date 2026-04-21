@@ -57,12 +57,14 @@ const PCIE_RESCAN: u32 = 0x0CF5;
 /// `PCIE_CFG_WRITE32` syscall opcode. Mirror of 0x0CF6 (read).
 const PCIE_CFG_WRITE32: u32 = 0x0CF7;
 /// `PCIE1_MSI_INIT` — brings up the brcmstb MSI controller behind
-/// a caller-supplied GIC SPI. Idempotent.
-const PCIE1_MSI_INIT: u32 = 0x0CD0;
+/// a caller-supplied GIC SPI. Idempotent. Mirrors
+/// `abi::platform::bcm2712::pcie_nic::PCIE1_MSI_INIT`.
+const PCIE1_MSI_INIT: u32 = 0x0CD8;
 /// `PCIE1_MSI_ALLOC_VECTOR` — assigns one of the 32 MSI vectors to
-/// a previously-created event fd. Returns (vector, target_addr, data)
-/// for writing into the peripheral's MSI-X table entry.
-const PCIE1_MSI_ALLOC_VECTOR: u32 = 0x0CD1;
+/// an event fd. Returns (vector, target_addr, data) for writing into
+/// the peripheral's MSI-X table entry. Mirrors
+/// `abi::platform::bcm2712::pcie_nic::PCIE1_MSI_ALLOC_VECTOR`.
+const PCIE1_MSI_ALLOC_VECTOR: u32 = 0x0CD9;
 
 /// PCI-bus address offset into BAR1's inbound window on BCM7712 PCIe1.
 /// BAR1 covers PCI bus 0x10_0000_0000..0x20_0000_0000 and is
@@ -136,19 +138,27 @@ const CID_PAGER_WRITE: u16 = 0x0201;
 /// the fault handler blocks for this long on slow-media worst case.
 const PAGER_SUBMIT_BUDGET_MS: u64 = 2000;
 
-/// Opcodes the kernel's `nvme_backing::dispatch` forwards to us.
-/// Must match `src/kernel/nvme_backing.rs::op`.
+/// Opcodes the kernel's `backing_provider::dispatch` forwards to us.
+/// Must match `src/kernel/internal/backing_provider.rs::op`.
 const PAGER_OP_READ:  u32 = 0x0001;
 const PAGER_OP_WRITE: u32 = 0x0002;
 const PAGER_OP_FLUSH: u32 = 0x0003;
 
-/// New syscall opcode: `NVME_BACKING_ENABLE = 0x0CED`.
-const NVME_BACKING_ENABLE: u32 = 0x0CED;
+/// Generic backing-provider registration syscall.
+const BACKING_PROVIDER_ENABLE: u32 = 0x0CED;
 
 /// FNV-1a 32-bit hash of the export symbol name. The kernel
 /// `resolve_register_target` resolves this back to the function
 /// address inside our module image.
-const NVME_BACKING_DISPATCH_HASH: u32 = fnv1a(b"nvme_backing_dispatch");
+const BACKING_PROVIDER_DISPATCH_HASH: u32 = fnv1a(b"backing_provider_dispatch");
+
+/// NVMe-specific: the LBA where the paged-arena region starts on
+/// namespace 1. Kernel-side backing_offset is page-granular and
+/// starts at 0 — this driver adds its own device offset when
+/// converting to LBA. Keeps NVMe specifics out of the kernel.
+/// The low LBA range 0..NVME_ARENA_LBA_BASE is left free for a FAT32
+/// partition header (typical shared-media configuration).
+const NVME_ARENA_LBA_BASE: u64 = 0x0020_0000;
 
 /// Module-registered ioctl on `req_in`: query namespace geometry.
 ///
@@ -392,12 +402,12 @@ struct NvmeState {
     req_nlb: u16,
 
     /// DMA page for synchronous pager I/O (NVMe as paged-arena
-    /// backing store). Lazily allocated from the coherent arena on
-    /// first call into `nvme_backing_dispatch`; coherent rather than
-    /// streaming so the spin-poll path needs no cache maintenance.
+    /// backing provider). Lazily allocated from the coherent arena on
+    /// first call into `backing_provider_dispatch`; coherent rather
+    /// than streaming so the spin-poll path needs no cache maintenance.
     pager_buf: u64,
-    /// 1 once `NVME_BACKING_ENABLE` has succeeded, so S_READY entry
-    /// only registers once.
+    /// 1 once `BACKING_PROVIDER_ENABLE` has succeeded, so S_READY
+    /// entry only registers once.
     pager_registered: u8,
     /// 1 once the PCIe capability walk has cached `msix_cap_offset`.
     msix_walked: u8,
@@ -840,7 +850,7 @@ unsafe fn step_map_bars(s: &mut NvmeState) -> i32 {
     let mut arg = [0u8; 10];
     arg[0] = s.pcie_dev_idx;
     arg[1] = 0;
-    let rc = (sys.dev_call)(-1, NIC_BAR_MAP, arg.as_mut_ptr(), 10);
+    let rc = (sys.provider_call)(-1, NIC_BAR_MAP, arg.as_mut_ptr(), 10);
     if rc <= 0 {
         return fault(s, 1, b"[nvme] BAR map failed\0");
     }
@@ -1908,7 +1918,7 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
 
     // Kernel-side MSI controller bring-up. Idempotent across retries.
     let mut init_arg = s.msi_spi_irq.to_le_bytes();
-    let init_rc = (sys.dev_call)(-1, PCIE1_MSI_INIT, init_arg.as_mut_ptr(), 4);
+    let init_rc = (sys.provider_call)(-1, PCIE1_MSI_INIT, init_arg.as_mut_ptr(), 4);
     if init_rc != 0 {
         dev_log(sys, 2, b"[nvme] msix: PCIE1_MSI_INIT failed\0".as_ptr(), 34);
         return false;
@@ -1981,14 +1991,14 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
 
     // One-shot: register as the paged-arena backing-store provider so
     // the kernel pager can drive synchronous page reads/writes via
-    // `nvme_backing_dispatch`. A configuration without any
-    // BackingType::Nvme arena never triggers the dispatch, so this
-    // registration is free on the hot path. The kernel resolves the
-    // FNV-1a hash to the function address in our module image.
+    // `backing_provider_dispatch`. A configuration without any
+    // `BackingType::External` arena never triggers the dispatch, so
+    // this registration is free on the hot path. The kernel resolves
+    // the FNV-1a hash to the function address in our module image.
     if s.pager_registered == 0 {
         let sys = &*s.syscalls;
-        let mut arg = NVME_BACKING_DISPATCH_HASH.to_le_bytes();
-        let rc = (sys.dev_call)(-1, NVME_BACKING_ENABLE, arg.as_mut_ptr(), arg.len());
+        let mut arg = BACKING_PROVIDER_DISPATCH_HASH.to_le_bytes();
+        let rc = (sys.provider_call)(-1, BACKING_PROVIDER_ENABLE, arg.as_mut_ptr(), arg.len());
         if rc == 0 {
             s.pager_registered = 1;
             dev_log(sys, 3, b"[nvme] pager dispatch registered\0".as_ptr(), 31);
@@ -2114,11 +2124,11 @@ unsafe fn step_fault(s: &mut NvmeState) -> i32 {
     // map and re-enter S_RESET.
     if s.fault_code == 1 && s.step_count % 5000 == 4999 {
         let sys = &*s.syscalls;
-        let rescan = (sys.dev_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
+        let rescan = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
         let mut arg = [0u8; 10];
         arg[0] = s.pcie_dev_idx;
         arg[1] = 0;
-        let rc = (sys.dev_call)(-1, NIC_BAR_MAP, arg.as_mut_ptr(), 10);
+        let rc = (sys.provider_call)(-1, NIC_BAR_MAP, arg.as_mut_ptr(), 10);
 
         if rescan > 0 && rc > 0 {
             s.bar0_virt = u64::from_le_bytes([
@@ -2177,7 +2187,7 @@ unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut 
 //
 // Called SYNCHRONOUSLY from the kernel pager (a page-fault-handler
 // invocation of `backing_store::backing_read/write` for arenas
-// registered with `BackingType::Nvme`). We submit one SQE on the
+// registered with `BackingType::External`). We submit one SQE on the
 // shared I/O SQ and spin-poll `io_cq` for the matching CID. On a
 // single-core cooperative design where the faulting module itself
 // has called into the pager, `step_ready` is not mid-step, so
@@ -2185,10 +2195,12 @@ unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut 
 // CQEs that land get absorbed into the in-flight ring, matching
 // what `poll_io_cqe(s, CID_NONE)` does.
 //
-// Caller's arg layout (see src/kernel/nvme_backing.rs):
-//   offset 0..8   arena_lba_base: u64 LE
-//   offset 8..12  vpage_idx:      u32 LE
-//   offset 12..20 buf_ptr:        u64 LE (caller's page buffer)
+// Caller's arg layout (see src/kernel/internal/backing_provider.rs):
+//   offset 0..4   arena_base_page: u32 LE — kernel's page counter
+//   offset 4..8   vpage_idx:       u32 LE
+//   offset 8..16  buf_ptr:         u64 LE (caller's page buffer)
+// This driver converts to the device's LBA space using its own
+// NVME_ARENA_LBA_BASE offset.
 
 const PAGE_BYTES: u32 = 4096;
 const PAGE_LBAS:  u16 = 8; // 4 KB page = 8 × 512 B LBAs
@@ -2251,8 +2263,8 @@ unsafe fn pager_ensure_buf(s: &mut NvmeState) -> bool {
 }
 
 #[unsafe(no_mangle)]
-#[link_section = ".text.nvme_backing_dispatch"]
-pub unsafe extern "C" fn nvme_backing_dispatch(
+#[link_section = ".text.backing_provider_dispatch"]
+pub unsafe extern "C" fn backing_provider_dispatch(
     state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usize,
 ) -> i32 {
     if state.is_null() { return E_INVAL; }
@@ -2272,23 +2284,27 @@ pub unsafe extern "C" fn nvme_backing_dispatch(
     // I/O queue pair isn't live until CreateIoCQ/CreateIoSQ complete.
     if s.state != S_READY { return E_AGAIN; }
 
-    if arg.is_null() || arg_len < 20 { return E_INVAL; }
-    let arena_lba_base = u64::from_le_bytes([
+    // Arg layout (16 bytes): [arena_base_page: u32][vpage_idx: u32][buf_ptr: u64].
+    // The kernel's backing_offset is abstract page-granular; this
+    // driver converts to the device's LBA space using its own
+    // NVME_ARENA_LBA_BASE offset.
+    if arg.is_null() || arg_len < 16 { return E_INVAL; }
+    let arena_base_page = u32::from_le_bytes([
         *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-        *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
     ]);
     let vpage_idx = u32::from_le_bytes([
-        *arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11),
+        *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
     ]);
     let buf_ptr = u64::from_le_bytes([
+        *arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11),
         *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
-        *arg.add(16), *arg.add(17), *arg.add(18), *arg.add(19),
     ]) as *mut u8;
     if buf_ptr.is_null() { return E_INVAL; }
 
     if !pager_ensure_buf(s) { return E_INVAL; }
 
-    let lba = arena_lba_base + (vpage_idx as u64) * (PAGE_LBAS as u64);
+    let lba = NVME_ARENA_LBA_BASE
+        + ((arena_base_page as u64) + (vpage_idx as u64)) * (PAGE_LBAS as u64);
 
     if opcode == PAGER_OP_WRITE {
         // Stage caller's page into our coherent DMA page.

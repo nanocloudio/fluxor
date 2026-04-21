@@ -41,11 +41,11 @@ include!("../../sdk/params.rs");
 // Constants — BOOTSEL
 // ============================================================================
 
-/// dev_call opcode: FLASH_SIDEBAND
-const FLASH_SIDEBAND: u32 = 0x0C10;
+/// FLASH_SIDEBAND opcode imported from the layered ABI.
+use abi::internal::flash::SIDEBAND as FLASH_SIDEBAND;
 
 /// Flash sideband operation: READ_CS
-const READ_CS: u8 = 0;
+const READ_CS: u8 = abi::internal::flash::sideband_op::READ_CS;
 
 // Click-mapping defaults (same as gesture module)
 const DEFAULT_CLICK: u32 = fnv1a(b"toggle");
@@ -65,17 +65,17 @@ const PARAM_STORE_OP: u32 = 0x0C34;
 const PARAM_DELETE_OP: u32 = 0x0C35;
 const PARAM_CLEAR_ALL_OP: u32 = 0x0C36;
 
-const XIP_BASE: u32 = 0x1000_0000;
-const STORE_OFFSET: u32 = 0x003F_F000;
+const XIP_BASE: u32 = abi::platform::rp::flash_layout::XIP_BASE;
+const STORE_OFFSET: u32 = abi::platform::rp::flash_layout::PARAM_STORE_OFFSET;
 const STORE_XIP: u32 = XIP_BASE + STORE_OFFSET;
-const SECTOR_SIZE: usize = 4096;
+const SECTOR_SIZE: usize = abi::platform::rp::flash_layout::PARAM_STORE_SIZE;
 const HEADER_SIZE: usize = 8;
 const ENTRY_HEADER_SIZE: usize = 4;
 const MAX_VALUE_LEN: usize = 250;
 const PAGE_SIZE: usize = 256;
 
-const STORE_MAGIC: u32 = 0x4650_5846;
-const STORE_VERSION: u8 = 1;
+const STORE_MAGIC: u32 = abi::platform::rp::flash_layout::PARAM_STORE_MAGIC;
+const STORE_VERSION: u8 = abi::platform::rp::flash_layout::PARAM_STORE_VERSION;
 
 const FLAG_TOMBSTONE: u8 = 0x01;
 const FLAG_CLEAR_ALL: u8 = 0x02;
@@ -423,7 +423,7 @@ pub extern "C" fn module_new(
         {
             let sys = &*s.syscalls;
             let mut arg = [READ_CS];
-            let level = (sys.dev_call)(-1, FLASH_SIDEBAND, arg.as_mut_ptr(), 1);
+            let level = (sys.provider_call)(-1, FLASH_SIDEBAND, arg.as_mut_ptr(), 1);
 
             if level >= 0 {
                 // Kernel returns 1=pressed, 0=not pressed
@@ -456,7 +456,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.registered == 0 {
             let dispatch_hash: u32 = 0x2f7172b5; // FNV-1a("module_flash_store_dispatch")
             let mut args = dispatch_hash.to_le_bytes();
-            let result = (sys.dev_call)(-1, FLASH_STORE_ENABLE, args.as_mut_ptr(), 4);
+            let result = (sys.provider_call)(-1, FLASH_STORE_ENABLE, args.as_mut_ptr(), 4);
             if result < 0 {
                 return result;
             }
@@ -475,7 +475,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // ---- Read BOOTSEL via flash sideband ----
 
         let mut arg = [READ_CS];
-        let level = (sys.dev_call)(-1, FLASH_SIDEBAND, arg.as_mut_ptr(), 1);
+        let level = (sys.provider_call)(-1, FLASH_SIDEBAND, arg.as_mut_ptr(), 1);
 
         if level < 0 {
             s.error_count = s.error_count.wrapping_add(1);
@@ -1128,7 +1128,7 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
 /// Call kernel to erase runtime store sector.
 unsafe fn raw_flash_erase(sys: &SyscallTable, offset: u32) -> i32 {
     let mut buf = offset.to_le_bytes();
-    (sys.dev_call)(-1, FLASH_RAW_ERASE, buf.as_mut_ptr(), 4)
+    (sys.provider_call)(-1, FLASH_RAW_ERASE, buf.as_mut_ptr(), 4)
 }
 
 /// Call kernel to program a 256-byte page.
@@ -1147,7 +1147,7 @@ unsafe fn raw_flash_program(sys: &SyscallTable, offset: u32, page: *const u8) ->
         *bp.add(4 + i) = *page.add(i);
         i += 1;
     }
-    (sys.dev_call)(-1, FLASH_RAW_PROGRAM, bp, 260)
+    (sys.provider_call)(-1, FLASH_RAW_PROGRAM, bp, 260)
 }
 
 /// Initialize free_offset by scanning XIP sector.

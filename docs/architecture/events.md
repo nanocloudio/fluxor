@@ -59,7 +59,7 @@ event_signal_from_isr(handle)
 
 ```rust
 // In module_new or module_step:
-let evt = (sys.dev_call)(-1, dev_event::CREATE, core::ptr::null_mut(), 0);
+let evt = (sys.provider_call)(-1, event::CREATE, core::ptr::null_mut(), 0);
 // evt >= 0: event handle
 // evt < 0: error (ENOMEM if pool exhausted)
 ```
@@ -70,7 +70,7 @@ The event is owned by the currently executing module. When signaled, the schedul
 
 ```rust
 // From any module (e.g., module A signaling module B's event):
-let rc = (sys.dev_call)(evt, dev_event::SIGNAL, core::ptr::null_mut(), 0);
+let rc = (sys.provider_call)(evt, event::SIGNAL, core::ptr::null_mut(), 0);
 ```
 
 Sets the signaled flag, marks the owning module for wake, and pokes `SCHEDULER_WAKE`. The owning module will be stepped in the same tick cycle (intra-tick wake).
@@ -79,7 +79,7 @@ Sets the signaled flag, marks the owning module for wake, and pokes `SCHEDULER_W
 
 ```rust
 // In module_step, check if event fired:
-let fired = (sys.dev_call)(evt, dev_event::POLL, core::ptr::null_mut(), 0);
+let fired = (sys.provider_call)(evt, event::POLL, core::ptr::null_mut(), 0);
 // fired == 1: was signaled (now cleared)
 // fired == 0: not signaled
 // fired < 0: error
@@ -91,7 +91,7 @@ Poll is atomic: it clears the signaled flag and returns the previous value. This
 
 ```rust
 // In module cleanup:
-let rc = (sys.dev_call)(evt, dev_event::DESTROY, core::ptr::null_mut(), 0);
+let rc = (sys.provider_call)(evt, event::DESTROY, core::ptr::null_mut(), 0);
 ```
 
 Unbinds any IRQ subscription, clears the slot.
@@ -103,28 +103,35 @@ Events can be bound to hardware IRQ sources. This document shows GPIO edge detec
 ### GPIO Edge Binding
 
 ```rust
-// Subscribe event to GPIO pin 15, rising edge:
-let args: [u8; 3] = [
-    0,    // source_type: GPIO
-    15,   // source_id: pin number
-    1,    // edge: 1=rising, 2=falling, 3=both
-];
-let rc = (sys.dev_call)(evt, dev_event::IRQ_SUBSCRIBE, args.as_ptr() as *mut u8, 3);
+// Bind event to GIC IRQ 187 (example) so the kernel signals the event
+// on fire. The MMIO base is optional (0 = no auto-ACK).
+let mut args = [0u8; 12];
+args[..4].copy_from_slice(&187u32.to_le_bytes());  // IRQ number
+// args[4..12] = MMIO base (u64 LE, zero if not needed)
+let rc = (sys.provider_call)(evt, event::BIND_IRQ, args.as_mut_ptr(), 12);
 ```
 
-After subscribing, the kernel's `poll_gpio_edges()` function automatically signals the event whenever the specified edge is detected on that pin. The module does not need to poll the GPIO pin itself — just poll the event.
+After binding, the kernel's ISR signals the event whenever the IRQ
+fires. The module does not need to poll — just poll the event.
 
-### Unsubscribe
+GPIO edge-triggered wakes go through a different path: the GPIO
+contract's `WATCH_EDGE` opcode binds a specific edge transition on a
+claimed pin to an already-created event handle.
+
+### Release
+
+Destroying the event releases any IRQ binding. There is no separate
+unsubscribe opcode.
 
 ```rust
-let rc = (sys.dev_call)(evt, dev_event::IRQ_UNSUBSCRIBE, core::ptr::null_mut(), 0);
+(sys.provider_call)(evt, event::DESTROY, core::ptr::null_mut(), 0);
 ```
 
 ### Constraints
 
-- The GPIO pin must already be claimed by the module (via `dev_call(pin, dev_gpio::CLAIM, ...)`)
+- For GPIO edge wakes, the pin must already be claimed by the module (via `provider_open(HAL_GPIO, gpio::CLAIM, ...)`)
 - One event per IRQ source (returns `EBUSY` if already bound)
-- One IRQ source per event (call unsubscribe before re-subscribing to a different source)
+- One IRQ source per event (destroy the event and create a new one to re-bind)
 
 ### Lifecycle Hygiene
 
@@ -218,8 +225,7 @@ For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` work
 | `0x0B01` | `SIGNAL` | handle=event | 0 or error |
 | `0x0B02` | `POLL` | handle=event | 1 (was signaled), 0 (not), or error |
 | `0x0B03` | `DESTROY` | handle=event | 0 or error |
-| `0x0B10` | `IRQ_SUBSCRIBE` | handle=event, arg=[source_type, source_id, edge] | 0 or error |
-| `0x0B11` | `IRQ_UNSUBSCRIBE` | handle=event | 0 or error |
+| `0x0C51` | `BIND_IRQ` (kernel_abi::event) | handle=event, arg=[irq:u32 LE, mmio_base:u64 LE] (12B) | 0 or error |
 
 ### Error Codes
 
@@ -260,25 +266,31 @@ fn module_step(state: *mut u8) -> i32 {
     match s.state {
         ST_INIT => {
             // Claim GPIO pin as input with pull-up
-            let rc = (sys.dev_call)(s.gpio_pin as i32, dev_gpio::CLAIM, ...);
+            let rc = (sys.provider_call)(s.gpio_pin as i32, dev_gpio::CLAIM, ...);
             if rc < 0 { return rc; }
             s.state = ST_CREATE_EVENT;
             0
         }
         ST_CREATE_EVENT => {
             // Create an event object
-            let evt = (sys.dev_call)(-1, dev_event::CREATE, core::ptr::null_mut(), 0);
+            let evt = (sys.provider_call)(-1, event::CREATE, core::ptr::null_mut(), 0);
             if evt < 0 { return evt; }
             s.event_handle = evt;
             s.state = ST_SUBSCRIBE;
             0
         }
         ST_SUBSCRIBE => {
-            // Bind event to GPIO pin, both edges
-            let args: [u8; 3] = [0, s.gpio_pin, 3]; // GPIO, pin, both edges
-            let rc = (sys.dev_call)(
-                s.event_handle, dev_event::IRQ_SUBSCRIBE,
-                args.as_ptr() as *mut u8, 3,
+            // Ask GPIO contract to signal our event on either edge of the pin.
+            let args: [u8; 5] = [
+                3, // edge: 1=rising, 2=falling, 3=both
+                (s.event_handle as u32).to_le_bytes()[0],
+                (s.event_handle as u32).to_le_bytes()[1],
+                (s.event_handle as u32).to_le_bytes()[2],
+                (s.event_handle as u32).to_le_bytes()[3],
+            ];
+            let rc = (sys.provider_call)(
+                s.pin_handle, gpio::WATCH_EDGE,
+                args.as_ptr() as *mut u8, 5,
             );
             if rc < 0 { return rc; }
             s.state = ST_RUNNING;
@@ -286,13 +298,13 @@ fn module_step(state: *mut u8) -> i32 {
         }
         ST_RUNNING => {
             // Poll event — only does work when GPIO edge detected
-            let fired = (sys.dev_call)(
-                s.event_handle, dev_event::POLL,
+            let fired = (sys.provider_call)(
+                s.event_handle, event::POLL,
                 core::ptr::null_mut(), 0,
             );
             if fired == 1 {
                 // Edge detected — read current level, emit control event
-                let level = (sys.dev_call)(s.gpio_pin as i32, dev_gpio::GET_LEVEL, ...);
+                let level = (sys.provider_call)(s.gpio_pin as i32, dev_gpio::GET_LEVEL, ...);
                 // ... debounce logic, emit to out_chan ...
             }
             0 // Continue
@@ -323,11 +335,11 @@ The kernel does NOT provide:
 
 | File | Description |
 |------|-------------|
-| `src/kernel/event.rs` | Event pool (32 slots), create/signal/poll/destroy, IRQ subscribe/unsubscribe |
-| `src/kernel/mod.rs` | Module declaration (`pub mod event`) |
-| `src/abi.rs` | `dev_class::EVENT`, `dev_event` opcodes, `dev_gpio::SET_IRQ/POLL_IRQ` |
-| `src/kernel/syscalls.rs` | EVENT class and GPIO IRQ dispatch in `dev_call` |
-| `src/io/gpio.rs` | `GPIO_EVENT_BINDING`, modified `poll_gpio_edges()`, accessors |
+| `src/kernel/event.rs` | Event pool, create/signal/poll/destroy; IRQ binding stored per-event |
+| `modules/sdk/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
+| `modules/sdk/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
+| `src/kernel/syscalls.rs` | EVENT contract vtable + provider dispatch |
+| `src/io/gpio.rs` | `GPIO_EVENT_BINDING`, `poll_gpio_edges()`, accessors (RP) |
 | `src/kernel/scheduler.rs` | `select()` wake, `step_woken_modules()`, `current_module_index()` |
 
 ## Limits

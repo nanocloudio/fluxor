@@ -1,36 +1,368 @@
-//! Provider dispatch — registered handlers for device class operations.
+//! Provider dispatch — registered handlers for contract operations.
 //!
-//! Instead of a monolithic match in `dev_call`, each device class registers
-//! a dispatch function at startup. New bus/device types add a provider
-//! without modifying the central dispatch logic.
+//! ## Routing
 //!
-//! Providers can be:
-//! - Kernel-internal functions (registered at startup via `register()`)
-//! - PIC module exports (registered at runtime via `register_module_provider()`)
+//! A contract is the portable surface a module asks for (HAL GPIO, HAL
+//! SPI, channel, timer, FS, …). Each contract has a `ProviderVTable`
+//! with `call`, optional `query`, and a `default_close_op`. Consumers
+//! call `provider_open(contract, open_op, config, len)` to get a
+//! handle; the kernel records which contract the handle belongs to in
+//! `HANDLE_BINDINGS`, and subsequent `provider_call` / `provider_query`
+//! / `provider_close` route through that contract's vtable.
 //!
-//! Module providers form a chain (stack) per device class. The top-of-chain
-//! provider receives dispatch first. Middleware modules (TLS, compression)
-//! can intercept calls and forward to the next layer via `CHAIN_NEXT`.
+//! Handle resolution order (see `lookup_contract`):
+//!   1. Tagged fds (event / timer / DMA-fd) self-identify via their
+//!      high-bit tag — no tracking entry required.
+//!   2. Handles returned by `provider_open` are looked up in
+//!      `HANDLE_BINDINGS`.
+//!   3. Anything else — `handle = -1` globals and scheduler-assigned
+//!      channel fds — falls through to class-byte routing, where the
+//!      opcode's high byte identifies the contract and
+//!      `dispatch(contract, …)` invokes the registered provider chain.
+//!
+//! ## Registration
+//!
+//! Each contract's call path can come from:
+//! - A kernel-internal function (registered at startup via `register()`).
+//! - A PIC module export (registered by the loader via
+//!   `register_module_provider()` after the module publishes a
+//!   `module_provides_contract` export). Module providers form a chain
+//!   (stack) per contract. The top-of-chain provider receives dispatch
+//!   first. Middleware modules (TLS, compression) intercept calls and
+//!   forward to the layer below via `CHAIN_NEXT`.
 
 use crate::kernel::errno;
 
-/// Function signature for a kernel-internal device class provider.
+/// Stable contract identifier. The vtable registry is indexed by this id;
+/// the same value appears in the opcode's high byte so class-byte routing
+/// (used for `handle = -1` globals) can reach the same vtable.
+pub type ContractId = u16;
+
+pub mod contract {
+    //! Contract ids — the public, stable dispatch surface. Each id
+    //! below maps 1:1 to a contract file under `modules/sdk/contracts/`
+    //! and to a row in the inventory tables in
+    //! `docs/architecture/abi_layers.md`.
+    //!
+    //! The value `0x000C` is intentionally NOT a public contract.
+    //! It is the kernel-internal dispatch bucket for the 0x0Cxx opcode
+    //! range (kernel_abi primitives plus permission-gated orchestration
+    //! ops). Modules must not `provider_open` against it; the kernel
+    //! uses it only for routing. See `INTERNAL_DISPATCH_BUCKET` below.
+    pub const COMMON:      u16 = 0x0000;
+    pub const HAL_GPIO:    u16 = 0x0001;
+    pub const HAL_SPI:     u16 = 0x0002;
+    pub const HAL_I2C:     u16 = 0x0003;
+    pub const HAL_PIO:     u16 = 0x0004;
+    pub const CHANNEL:     u16 = 0x0005;
+    pub const TIMER:       u16 = 0x0006;
+    pub const FS:          u16 = 0x0009;
+    pub const BUFFER:      u16 = 0x000A;
+    pub const EVENT:       u16 = 0x000B;
+    /// NIC ring management (create/destroy/info). Drivers declare
+    /// `requires_contract = "platform_nic_ring"` in their manifest;
+    /// the `platform_raw` permission gates the specific opcodes in
+    /// addition to the contract claim.
+    pub const PLATFORM_NIC_RING: u16 = 0x0007;
+    /// Raw DMA channel allocation. Handle returned by `channel::ALLOC`
+    /// is a raw DMA channel number. Used by drivers that manage their
+    /// own transfer lifecycle (e.g. `spi_pl022`, `pio_rp` CMD
+    /// transfers). The `platform_raw` permission gates the opcodes in
+    /// addition to the contract claim. Kernel-side handle-type
+    /// enforcement is in `is_dma_channel_handle` in
+    /// `src/platform/rp_providers.rs`.
+    pub const PLATFORM_DMA: u16 = 0x0008;
+    /// Async DMA fd with ping-pong queuing. Handle returned by
+    /// `fd::CREATE` is an FD_TAG_DMA-tagged fd. Used by drivers that
+    /// want kernel-managed async DMA (e.g. `pio_rp` streams,
+    /// `st7701s`). Distinct contract from `PLATFORM_DMA` — drivers
+    /// that use both families declare both in `[[resources]]`. The
+    /// `platform_raw` permission gates the opcodes in addition to the
+    /// contract claim. Kernel-side handle-type enforcement is in
+    /// `is_dma_fd_handle` in `src/platform/rp_providers.rs`.
+    pub const PLATFORM_DMA_FD: u16 = 0x0011;
+    pub const HAL_UART:    u16 = 0x000D;
+    pub const HAL_ADC:     u16 = 0x000E;
+    pub const HAL_PWM:     u16 = 0x000F;
+    pub const KEY_VAULT:   u16 = 0x0010;
+
+    /// Kernel-internal dispatch bucket for 0x0Cxx opcodes. NOT a
+    /// public contract. `syscall_provider_open` rejects this id from
+    /// module code; it is only reachable from intra-kernel paths
+    /// (vtable registration, primitive routing).
+    pub const INTERNAL_DISPATCH_BUCKET: u16 = 0x000C;
+
+    // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
+    // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
+    // constants — the alias just drops the prefix for callsite brevity.
+    pub const GPIO: u16 = HAL_GPIO;
+    pub const SPI:  u16 = HAL_SPI;
+    pub const I2C:  u16 = HAL_I2C;
+    pub const PIO:  u16 = HAL_PIO;
+    pub const UART: u16 = HAL_UART;
+    pub const ADC:  u16 = HAL_ADC;
+    pub const PWM:  u16 = HAL_PWM;
+}
+
+/// Function signatures for a contract vtable.
 ///
-/// Arguments match `dev_call`: handle, opcode, arg pointer, arg length.
+/// `call` handles every operation on a handle or global (handle=-1)
+/// op — including open-style ops that return a handle (CLAIM,
+/// SET_INPUT, OPEN, CREATE, …). The caller picks the open-style
+/// opcode; `provider_open` tracks the returned handle against the
+/// contract.
+///
+/// `query` reads introspection state. `default_close_op` is the opcode
+/// `provider_close` invokes to release a handle (e.g. `gpio::RELEASE`,
+/// `channel::CLOSE`). Contracts whose handles don't need a close hook
+/// (BUFFER, some net paths) leave it as 0, in which case
+/// `provider_close` just releases the tracking entry.
+pub type VTableCallFn  = unsafe fn(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32;
+pub type VTableQueryFn = unsafe fn(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32;
+
+/// A contract's dispatch vtable. Registered once at kernel init via
+/// `register_vtable`.
+pub struct ProviderVTable {
+    pub contract: ContractId,
+    pub call:  VTableCallFn,
+    pub query: Option<VTableQueryFn>,
+    /// Opcode used by `provider_close` to release a handle. 0 = none.
+    pub default_close_op: u32,
+}
+
+/// Maximum number of contracts. Contract ids fit in 5 bits today.
+pub const MAX_CONTRACTS: usize = 32;
+
+/// Registered vtables, indexed by contract id.
+static mut VTABLES: [Option<&'static ProviderVTable>; MAX_CONTRACTS] =
+    [const { None }; MAX_CONTRACTS];
+
+/// Register a contract vtable at kernel init. Overwrites any previous
+/// registration for the same contract id. Panics if the contract id is
+/// out of range.
+pub fn register_vtable(vt: &'static ProviderVTable) {
+    let idx = vt.contract as usize;
+    assert!(idx < MAX_CONTRACTS, "contract id out of range");
+    unsafe { VTABLES[idx] = Some(vt); }
+}
+
+/// Look up a contract's vtable by id.
+fn vtable_for(contract: ContractId) -> Option<&'static ProviderVTable> {
+    let idx = contract as usize;
+    if idx >= MAX_CONTRACTS { return None; }
+    unsafe { VTABLES[idx] }
+}
+
+// ── Handle → contract tracking ───────────────────────────────────────
+//
+// Untagged handles returned by `provider_open` (GPIO pin numbers, DMA
+// channel numbers, HAL handles) are recorded here so `provider_call` /
+// `provider_query` / `provider_close` can route by the bound contract
+// instead of inferring from the opcode's class byte. Tagged fds
+// (event / timer / DMA-fd) identify their contract via tag bits and
+// don't consume a slot.
+
+const MAX_TRACKED: usize = 128;
+
+struct HandleBinding {
+    handle: i32,
+    contract: ContractId,
+}
+
+static mut HANDLE_BINDINGS: [HandleBinding; MAX_TRACKED] = [const {
+    HandleBinding { handle: -1, contract: 0 }
+}; MAX_TRACKED];
+
+fn track_handle(handle: i32, contract: ContractId) {
+    if handle < 0 { return; }
+    // Tagged fds (event / timer / dma) are self-identifying — the FD
+    // tag carries the contract id, so `lookup_contract` resolves them
+    // without a tracking table entry. Skip tracking to keep the table
+    // available for untagged handles (GPIO pins, DMA channel numbers,
+    // HAL handles) that genuinely need an entry.
+    if fd_tag_contract(handle).is_some() { return; }
+    unsafe {
+        for slot in (*(&raw mut HANDLE_BINDINGS)).iter_mut() {
+            if slot.handle == -1 {
+                slot.handle = handle;
+                slot.contract = contract;
+                return;
+            }
+        }
+        log::warn!("[provider] handle tracking full, {} untracked", handle);
+    }
+}
+
+/// Public lookup — returns the contract bound to `handle`. Resolution
+/// order: tagged FD (self-identifying via high-bit tag) → tracked
+/// binding from `provider_open` → None.
+pub fn contract_of(handle: i32) -> Option<ContractId> {
+    lookup_contract(handle)
+}
+
+/// Derive a contract from an FD tag, if the handle carries one. This
+/// is the fast path for scheduler-assigned fds (channel / event /
+/// timer) and for tagged-fd opens (DMA fd). Returns `None` for raw
+/// integer handles (GPIO pin numbers, DMA channel numbers, etc.) —
+/// those rely on the `HANDLE_BINDINGS` tracking table populated by
+/// `provider_open`.
+fn fd_tag_contract(handle: i32) -> Option<ContractId> {
+    if handle < 0 { return None; }
+    use crate::kernel::fd;
+    // Tag 0 (FD_TAG_CHANNEL) produces handles indistinguishable from
+    // raw integers because tag 0 doesn't set any high bits. Resolving
+    // channels via tag would clash with e.g. DMA channel numbers
+    // (0..15) that share the same bit pattern. Keep channel handles
+    // on the opcode-class-byte dispatch path — CHANNEL ops all carry
+    // 0x05 in the opcode's high byte so routing is unambiguous. The
+    // explicit tags below (2, 3, 7) have high bits set, so no
+    // collision with raw small integers.
+    let (tag, _slot) = fd::untag_fd(handle);
+    match tag {
+        _t if _t == fd::FD_TAG_EVENT => Some(contract::EVENT),
+        _t if _t == fd::FD_TAG_TIMER => Some(contract::TIMER),
+        _t if _t == fd::FD_TAG_DMA => Some(contract::PLATFORM_DMA_FD),
+        _ => None,
+    }
+}
+
+fn lookup_contract(handle: i32) -> Option<ContractId> {
+    if handle < 0 { return None; }
+    if let Some(c) = fd_tag_contract(handle) { return Some(c); }
+    unsafe {
+        for slot in (*(&raw const HANDLE_BINDINGS)).iter() {
+            if slot.handle == handle {
+                return Some(slot.contract);
+            }
+        }
+    }
+    None
+}
+
+fn release_handle(handle: i32) {
+    if handle < 0 { return; }
+    unsafe {
+        for slot in (*(&raw mut HANDLE_BINDINGS)).iter_mut() {
+            if slot.handle == handle {
+                slot.handle = -1;
+                slot.contract = 0;
+                return;
+            }
+        }
+    }
+}
+
+// ── Handle-scoped dispatch (new API) ─────────────────────────────────
+
+/// Open a handle on the named contract. The caller chooses the
+/// open-style opcode (e.g. `gpio::CLAIM`, `gpio::SET_INPUT`,
+/// `spi::OPEN`, `timer::CREATE`) — `config` / `config_len` are the
+/// operation's arg payload. Returns a handle (>= 0) on success,
+/// negative errno on failure. Successful handles are tracked against
+/// the contract for later `provider_call` routing.
+pub fn provider_open(
+    contract: ContractId,
+    open_op: u32,
+    config: *const u8,
+    config_len: usize,
+) -> i32 {
+    let handle = match vtable_for(contract) {
+        Some(vt) => unsafe { (vt.call)(-1, open_op, config as *mut u8, config_len) },
+        None => {
+            // No vtable — fall back to the contract's registered
+            // chain dispatcher directly.
+            unsafe { dispatch(contract, -1, open_op, config as *mut u8, config_len) }
+        }
+    };
+    if handle >= 0 {
+        track_handle(handle, contract);
+    }
+    handle
+}
+
+/// Invoke an operation on an open handle.
+///
+/// Routing resolution order:
+///   1. `handle >= 0` with an FD tag (event/timer/DMA fd): the tag
+///      self-identifies the contract (`fd_tag_contract`).
+///   2. `handle >= 0` tracked by `provider_open` (`HANDLE_BINDINGS`):
+///      routes through the bound contract's vtable.
+///   3. `handle == -1` (global op) or untagged handle with no tracked
+///      binding (channel fds with tag 0, raw DMA channel numbers,
+///      GPIO pins): the opcode's high byte selects the contract.
+///      Permission gates in `syscall_provider_call` still apply.
+pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    if let Some(contract) = lookup_contract(handle) {
+        if let Some(vt) = vtable_for(contract) {
+            return unsafe { (vt.call)(handle, op, arg, arg_len) };
+        }
+    }
+    let contract = ((op >> 8) & 0xFF) as u16;
+    unsafe { dispatch(contract, handle, op, arg, arg_len) }
+}
+
+/// Query handle state by key.
+pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32 {
+    if let Some(contract) = lookup_contract(handle) {
+        if let Some(vt) = vtable_for(contract) {
+            return match vt.query {
+                Some(f) => unsafe { f(handle, key, out, out_len) },
+                None => errno::ENOSYS,
+            };
+        }
+    }
+    errno::ENOSYS
+}
+
+/// Close an open handle using the contract's default close opcode.
+/// For contracts whose vtable declares `default_close_op = 0`,
+/// `provider_close` only releases the tracking entry and returns 0.
+pub fn provider_close(handle: i32) -> i32 {
+    let result = if let Some(contract) = lookup_contract(handle) {
+        if let Some(vt) = vtable_for(contract) {
+            if vt.default_close_op != 0 {
+                unsafe {
+                    (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0)
+                }
+            } else {
+                0
+            }
+        } else {
+            errno::ENOSYS
+        }
+    } else {
+        errno::ENOSYS
+    };
+    release_handle(handle);
+    result
+}
+
+/// Clear all handle tracking. Called on `scheduler::reset` so new
+/// graphs don't inherit stale handle→contract bindings.
+pub fn reset_handle_tracking() {
+    unsafe {
+        for slot in (*(&raw mut HANDLE_BINDINGS)).iter_mut() {
+            slot.handle = -1;
+            slot.contract = 0;
+        }
+    }
+}
+
+/// Function signature for a kernel-internal contract provider.
+/// Arguments: handle, opcode, arg pointer, arg length.
 /// Returns: result code (0 = success, >0 = bytes/count, <0 = errno).
 pub type ProviderDispatch = unsafe fn(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
 
-/// Function signature for a PIC module device class provider.
-///
-/// First arg is the module's state pointer, remaining match `dev_call`.
-/// Called synchronously from kernel context. MUST NOT block or perform async I/O.
+/// Function signature for a PIC module contract provider. Shape matches
+/// `ProviderDispatch` with the module's state pointer prepended. Called
+/// synchronously from kernel context — must not block or perform async I/O.
 pub type ModuleProviderDispatchFn =
     unsafe extern "C" fn(state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
 
-/// Maximum device classes (matches 5-bit class field extracted from opcode).
+/// Maximum registered contracts (indexed by `ContractId`).
 const MAX_PROVIDERS: usize = 32;
 
-/// Maximum chain depth per device class (kernel + up to 3 middleware modules).
+/// Maximum chain depth per contract (kernel + up to 3 middleware modules).
 pub const MAX_CHAIN_DEPTH: usize = 3;
 
 /// Flag ORed onto opcode to dispatch to the next provider below the caller.
@@ -43,7 +375,7 @@ struct ProviderLayer {
     state: *mut u8,
 }
 
-/// Provider entry — combines kernel and module providers for a single device class.
+/// Provider entry — combines kernel and module providers for a single contract.
 struct ProviderEntry {
     /// Kernel-internal dispatch (None if no kernel provider).
     kernel_dispatch: Option<ProviderDispatch>,
@@ -63,34 +395,66 @@ impl ProviderEntry {
     }
 }
 
-/// Provider table — indexed by device class number (0x00..0x1F).
+/// Provider table — indexed by contract id (0x00..0x1F).
 static mut PROVIDERS: [ProviderEntry; MAX_PROVIDERS] = [const { ProviderEntry::empty() }; MAX_PROVIDERS];
 
-/// Register a kernel-internal provider for a device class. Called at kernel startup.
+/// Register a kernel-internal provider for a contract. Called at
+/// kernel startup.
 ///
-/// Panics if class >= MAX_PROVIDERS (should never happen for valid classes).
-pub fn register(class: u8, dispatch: ProviderDispatch) {
-    let idx = class as usize;
-    assert!(idx < MAX_PROVIDERS, "device class out of range");
+/// Panics if `contract as usize >= MAX_PROVIDERS`.
+pub fn register(contract: ContractId, dispatch: ProviderDispatch) {
+    let idx = contract as usize;
+    assert!(idx < MAX_PROVIDERS, "contract id out of range");
     unsafe {
         PROVIDERS[idx].kernel_dispatch = Some(dispatch);
     }
 }
 
-/// Register a PIC module as provider for a device class.
+/// Contracts a PIC module is allowed to provide. The loader calls
+/// `register_module_provider` after resolving a module's
+/// `module_provides_contract` export — a compromised or mis-built
+/// module could in principle name any contract. We whitelist only
+/// the contracts where it's architecturally legitimate for a module
+/// to be the provider: the HAL peripherals and FS (bare-metal
+/// filesystems). CHANNEL / TIMER / BUFFER / EVENT / KEY_VAULT and
+/// the internal dispatch bucket are kernel-only and must not be
+/// replaceable by a module.
+#[inline]
+fn is_module_providable(contract: ContractId) -> bool {
+    matches!(contract,
+        contract::HAL_GPIO
+        | contract::HAL_SPI
+        | contract::HAL_I2C
+        | contract::HAL_PIO
+        | contract::HAL_UART
+        | contract::HAL_ADC
+        | contract::HAL_PWM
+        | contract::FS
+    )
+}
+
+/// Register a PIC module as provider for a contract.
 ///
 /// Pushes the module onto the top of the chain. Returns 0 on success,
-/// EINVAL if class is out of range or dispatch pointer is outside the
-/// module's code region, EBUSY if chain is full.
+/// EINVAL if `contract` is out of range or not in the module-providable
+/// whitelist, or if the dispatch pointer is outside the module's code
+/// region; EBUSY if chain is full.
 pub fn register_module_provider(
-    class: u8,
+    contract: ContractId,
     module_idx: u8,
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
 ) -> i32 {
-    let idx = class as usize;
+    let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
         return errno::EINVAL;
+    }
+    if !is_module_providable(contract) {
+        log::error!(
+            "[provider] module {} tried to register for non-providable contract 0x{:04x}",
+            module_idx, contract,
+        );
+        return errno::EACCES;
     }
 
     // Validate dispatch function pointer is within the registering module's
@@ -138,7 +502,7 @@ pub fn register_module_provider(
             state,
         });
         entry.depth += 1;
-        log::info!("[provider] module {} registered for class 0x{:02x} at depth {}", module_idx, class, entry.depth);
+        log::info!("[provider] module {} registered for contract 0x{:04x} at depth {}", module_idx, contract, entry.depth);
     }
     0
 }
@@ -175,16 +539,16 @@ pub fn release_module_providers(module_idx: u8) {
     }
 }
 
-/// Dispatch an operation to the registered provider for the given class.
+/// Dispatch an operation to the registered provider for `contract`.
 ///
 /// Module provider chain top takes priority. Falls back to kernel provider.
-/// Returns E_NOSYS if no provider is registered for this class.
+/// Returns E_NOSYS if no provider is registered for this contract.
 ///
 /// # Safety
 /// `arg` must satisfy the aliasing and validity requirements expected by the
-/// registered dispatch handler for the given `class` and `opcode`.
-pub unsafe fn dispatch(class: u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    let idx = class as usize;
+/// registered dispatch handler for the given `contract` and `opcode`.
+pub unsafe fn dispatch(contract: ContractId, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
         return errno::ENOSYS;
     }
@@ -207,7 +571,7 @@ pub unsafe fn dispatch(class: u8, handle: i32, opcode: u32, arg: *mut u8, arg_le
         match entry.kernel_dispatch {
             Some(handler) => handler(handle, opcode, arg, arg_len),
             None => {
-                log::warn!("[provider] class 0x{:02x} op 0x{:04x}: no provider", class, opcode);
+                log::warn!("[provider] contract 0x{:04x} op 0x{:04x}: no provider", contract, opcode);
                 errno::ENOSYS
             }
         }
@@ -224,13 +588,13 @@ pub unsafe fn dispatch(class: u8, handle: i32, opcode: u32, arg: *mut u8, arg_le
 /// Same requirements as `dispatch`.
 pub unsafe fn dispatch_next(
     caller_module: u8,
-    class: u8,
+    contract: ContractId,
     handle: i32,
     opcode: u32,
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    let idx = class as usize;
+    let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
         return errno::ENOSYS;
     }

@@ -29,7 +29,7 @@ direction = "ctrl_input"
 content_type = "OctetStream"
 
 [[resources]]
-device_class = "socket"
+requires_contract = "socket"
 access = "write"
 ```
 

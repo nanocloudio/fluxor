@@ -1,7 +1,7 @@
 //! I2C Bus Driver — PIC module provider
 //!
 //! Manages I2C bus access using kernel register bridge (I2C_REG_WRITE/READ).
-//! Registers as I2C provider (device class 0x03).
+//! Registers as the HAL_I2C provider (contract id 0x03).
 //!
 //! Uses FIFO-based polling (not DMA) — I2C transactions are typically <32 bytes
 //! and run at 100-400 KHz, so polling is efficient and simpler.
@@ -114,20 +114,20 @@ unsafe fn i2c_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     *bp = offset;
     let v = val.to_le_bytes();
     *bp.add(1) = v[0]; *bp.add(2) = v[1]; *bp.add(3) = v[2]; *bp.add(4) = v[3];
-    (sys.dev_call)(bus as i32, 0x0CB0, bp, 5);
+    (sys.provider_call)(bus as i32, 0x0CB0, bp, 5);
 }
 
 unsafe fn i2c_reg_read(sys: &SyscallTable, bus: u8, offset: u8) -> u32 {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
-    (sys.dev_call)(bus as i32, 0x0CB1, bp, 5);
+    (sys.provider_call)(bus as i32, 0x0CB1, bp, 5);
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 
 unsafe fn i2c_set_enable(sys: &SyscallTable, bus: u8, enable: bool) {
     let mut buf = [if enable { 1u8 } else { 0u8 }];
-    (sys.dev_call)(bus as i32, 0x0CB4, buf.as_mut_ptr(), 1);
+    (sys.provider_call)(bus as i32, 0x0CB4, buf.as_mut_ptr(), 1);
 }
 
 // ============================================================================
@@ -443,19 +443,16 @@ pub extern "C" fn module_new(
             bus += 1;
         }
 
-        // Register as I2C provider (device class 0x03)
         let sys = &*s.syscalls;
-        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-        let mut reg = [0u8; 8];
-        let rp = reg.as_mut_ptr();
-        *rp = 0x03;
-        let da = dispatch_hash.to_le_bytes();
-        *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
-        (sys.dev_call)(-1, 0x0C20, rp, 8);
-
-        dev_log(sys, 3, b"[i2c] provider registered".as_ptr(), 24);
+        dev_log(sys, 3, b"[i2c] ready".as_ptr(), 10);
         0
     }
+}
+
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_provides_contract"]
+pub extern "C" fn module_provides_contract() -> u32 {
+    0x0003 // HAL_I2C
 }
 
 #[unsafe(no_mangle)]

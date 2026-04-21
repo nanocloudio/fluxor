@@ -11,7 +11,7 @@
 //! # Controllers (BCM2712 / Pi 5 / CM5)
 //!
 //! - `controller = 0` (default): PCIe2 — the internal x4 link to RP1.
-//!   Historical ECAM value `0xFD50_0000` preserved for back-compat.
+//!   ECAM at `0xFD50_0000` (the VPU-exposed fallback routing).
 //! - `controller = 1`: PCIe1 — the external x1 slot used by the NVMe
 //!   HAT+ and other Pi 5 PCIe peripherals. Requires `pciex1` enabled in
 //!   `config.txt` so VPU trains the link before kernel handoff.
@@ -50,7 +50,7 @@ const NIC_BAR_UNMAP: u32 = 0x0CF1;
 const CTRL_PCIE2: u8 = 0;
 const CTRL_PCIE1: u8 = 1;
 
-/// PCIe2 (RP1, x4) — historical back-compat values.
+/// PCIe2 (RP1, x4) — VPU-exposed fallback routing.
 const ECAM_BASE_PCIE2: u64       = 0xFD50_0000;
 const PCIE_MMIO_BASE_PCIE2: u64  = 0x1F_0000_0000;
 
@@ -146,7 +146,7 @@ unsafe fn mmio_read32(sys: &SyscallTable, addr: u64) -> u32 {
     let ab = addr.to_le_bytes();
     *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
     *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
-    let rc = (sys.dev_call)(-1, MMIO_READ32, bp, 12);
+    let rc = (sys.provider_call)(-1, MMIO_READ32, bp, 12);
     if rc < 0 { return 0xFFFF_FFFF; }
     u32::from_le_bytes([*bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11)])
 }
@@ -159,7 +159,7 @@ unsafe fn mmio_write32(sys: &SyscallTable, addr: u64, val: u32) {
     *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
     let vb = val.to_le_bytes();
     *bp.add(8) = vb[0]; *bp.add(9) = vb[1]; *bp.add(10) = vb[2]; *bp.add(11) = vb[3];
-    (sys.dev_call)(-1, MMIO_WRITE32, bp, 12);
+    (sys.provider_call)(-1, MMIO_WRITE32, bp, 12);
 }
 
 // ============================================================================

@@ -27,8 +27,9 @@ include!("../../sdk/runtime.rs");
 const MMIO_READ32: u32 = 0x0CE4;
 const MMIO_WRITE32: u32 = 0x0CE5;
 
-/// SMMU provider opcodes (custom, within SYSTEM range)
-/// Consumers call dev_call(-1, SMMU_MAP_DMA, ...) which the kernel routes here.
+/// SMMU provider opcodes (0x0CFB..0x0CFD within the 0x0Cxx range).
+/// Consumers call `provider_call(-1, SMMU_MAP_DMA, ...)` and the kernel
+/// routes them here via `system_provider_dispatch`.
 const SMMU_MAP_DMA: u32 = 0x0CFB;
 const SMMU_UNMAP_DMA: u32 = 0x0CFC;
 const SMMU_FAULT_CHECK: u32 = 0x0CFD;
@@ -107,7 +108,7 @@ unsafe fn mmio_read32(sys: &SyscallTable, addr: u64) -> u32 {
     let ab = addr.to_le_bytes();
     *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
     *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
-    let rc = (sys.dev_call)(-1, MMIO_READ32, bp, 12);
+    let rc = (sys.provider_call)(-1, MMIO_READ32, bp, 12);
     if rc < 0 { return 0; }
     u32::from_le_bytes([*bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11)])
 }
@@ -120,7 +121,7 @@ unsafe fn mmio_write32(sys: &SyscallTable, addr: u64, val: u32) {
     *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
     let vb = val.to_le_bytes();
     *bp.add(8) = vb[0]; *bp.add(9) = vb[1]; *bp.add(10) = vb[2]; *bp.add(11) = vb[3];
-    (sys.dev_call)(-1, MMIO_WRITE32, bp, 12);
+    (sys.provider_call)(-1, MMIO_WRITE32, bp, 12);
 }
 
 // ============================================================================

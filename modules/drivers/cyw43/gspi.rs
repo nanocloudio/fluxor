@@ -16,7 +16,8 @@
 
 use super::constants::*;
 use super::Cyw43State;
-use super::abi::{PioCmdTransferArgs, dev_pio, dev_gpio};
+use super::abi::contracts::hal::pio::CmdTransferArgs as PioCmdTransferArgs;
+use super::abi::contracts::hal::{pio as dev_pio, gpio as dev_gpio};
 
 // ============================================================================
 // PIO Word Byte Swap
@@ -164,7 +165,7 @@ pub unsafe fn txn_write(
     let tx_bytes = rx_off + 4;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     // Start PIO transfer (TX only, no RX)
     let transfer_args = PioCmdTransferArgs {
@@ -173,7 +174,7 @@ pub unsafe fn txn_write(
         rx_ptr: core::ptr::null_mut(),
         rx_len: 0,
     };
-    let result = (sys.dev_call)(
+    let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
         &transfer_args as *const _ as *mut u8,
@@ -181,7 +182,7 @@ pub unsafe fn txn_write(
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     if result < 0 {
         return result;
@@ -270,7 +271,7 @@ pub unsafe fn txn_read(
     s.txn_rx_payload_len = read_len as u16;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     // Start PIO transfer (TX cmd+rx_count, RX response+payload)
     let transfer_args = PioCmdTransferArgs {
@@ -279,7 +280,7 @@ pub unsafe fn txn_read(
         rx_ptr: s.rxn_buf.as_mut_ptr(),
         rx_len: rx_bytes as u32,
     };
-    let result = (sys.dev_call)(
+    let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
         &transfer_args as *const _ as *mut u8,
@@ -287,7 +288,7 @@ pub unsafe fn txn_read(
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     if result < 0 {
         return result;
@@ -315,7 +316,7 @@ pub unsafe fn txn_poll(s: &mut Cyw43State) -> i32 {
 pub unsafe fn txn_reset(s: &mut Cyw43State) {
     let sys = &*s.syscalls;
     // Ensure CS is high
-    { let mut _l = [1u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
     s.txn_step = TxnStep::Idle;
     s.txn_len = 0;
 }
@@ -372,7 +373,7 @@ pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u3
     s.txn_buf[12] = 0; s.txn_buf[13] = 0; s.txn_buf[14] = 0; s.txn_buf[15] = 0;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     let transfer_args = PioCmdTransferArgs {
         tx_ptr: s.txn_buf.as_ptr(),
@@ -380,7 +381,7 @@ pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u3
         rx_ptr: core::ptr::null_mut(),
         rx_len: 0,
     };
-    let result = (sys.dev_call)(
+    let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
         &transfer_args as *const _ as *mut u8,
@@ -388,7 +389,7 @@ pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u3
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     if result < 0 {
         return result;
@@ -426,7 +427,7 @@ pub unsafe fn bus_read32_swapped_start(s: &mut Cyw43State, addr: u32) -> i32 {
     s.txn_rx_payload_len = 4;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     let transfer_args = PioCmdTransferArgs {
         tx_ptr: s.txn_buf.as_ptr(),
@@ -434,7 +435,7 @@ pub unsafe fn bus_read32_swapped_start(s: &mut Cyw43State, addr: u32) -> i32 {
         rx_ptr: s.rxn_buf.as_mut_ptr(),
         rx_len: 8, // 2 words * 4 bytes
     };
-    let result = (sys.dev_call)(
+    let result = (sys.provider_call)(
         s.pio_handle,
         dev_pio::CMD_TRANSFER,
         &transfer_args as *const _ as *mut u8,
@@ -442,7 +443,7 @@ pub unsafe fn bus_read32_swapped_start(s: &mut Cyw43State, addr: u32) -> i32 {
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.dev_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
 
     if result < 0 {
         return result;

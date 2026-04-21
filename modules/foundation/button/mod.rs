@@ -131,7 +131,7 @@ pub extern "C" fn module_new(
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else if !params.is_null() && params_len >= 4 {
-            // Legacy: [pin, control_id, active_low, pull]
+            // Flat byte layout: [pin, control_id, active_low, pull]
             s.pin = *params.add(0);
             s.control_id = *params.add(1);
             s.active_low = *params.add(2);
@@ -140,10 +140,18 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        // Request GPIO as input via dev_call
+        // Open a GPIO input handle via provider_open. The returned
+        // handle is the pin number; the kernel tracks it against the
+        // HAL_GPIO contract so GET_LEVEL / RELEASE dispatch routes by
+        // handle rather than opcode class byte.
         let sys = &*s.syscalls;
         let mut gpio_arg = [s.pin, s.pull];
-        let handle = (sys.dev_call)(-1, 0x0107, gpio_arg.as_mut_ptr(), 2);
+        let handle = (sys.provider_open)(
+            GPIO_CONTRACT,
+            GPIO_SET_INPUT,
+            gpio_arg.as_mut_ptr(),
+            2,
+        );
         if handle < 0 {
             return -4;
         }
@@ -152,6 +160,13 @@ pub extern "C" fn module_new(
         0
     }
 }
+
+// Contract id + opcodes mirror `abi::kernel::provider::contract::HAL_GPIO`
+// and `abi::contracts::hal::gpio::*`. Pinned here to keep the PIC
+// module self-contained (no imports into kernel paths).
+const GPIO_CONTRACT:  u32 = 0x0001;
+const GPIO_SET_INPUT: u32 = 0x0107;
+const GPIO_GET_LEVEL: u32 = 0x0105;
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
@@ -170,7 +185,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // ---- Read GPIO + debounce ----
 
-        let level = (sys.dev_call)(s.gpio_handle, 0x0105, core::ptr::null_mut(), 0);
+        let level = (sys.provider_call)(s.gpio_handle, GPIO_GET_LEVEL, core::ptr::null_mut(), 0);
         if level < 0 {
             return 0; // GPIO error, skip
         }

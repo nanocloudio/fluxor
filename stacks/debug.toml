@@ -2,8 +2,8 @@
 name = "debug"
 
 # Opt-in log observability. One `to:` variant selects the transport; the
-# matching log_<transport> PIC module drains the kernel log ring (SYSTEM::
-# LOG_RING_DRAIN) and forwards each chunk over its wire. One log producer
+# matching log_<transport> PIC module drains the kernel log ring
+# (LOG_RING_DRAIN, 0x0C64) and forwards each chunk over its wire. One log producer
 # (kernel log crate) feeds one ring; one consumer drains it. Multiple
 # transports active at once is not supported — variants are mutually
 # exclusive. If that becomes a real need, upgrade the ring to per-consumer

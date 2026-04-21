@@ -19,7 +19,7 @@ direction = "output"
 content_type = "OctetStream"
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "read"
 ```
 

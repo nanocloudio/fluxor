@@ -586,5 +586,5 @@ on which channel pair the connection was opened on.
 - `architecture/pipeline.md` — channel mechanics, mailbox mode, scheduler
 - `architecture/capability_surface.md` — hardware section, driver auto-wiring
 - `architecture/events.md` — IRQ binding for interrupt-driven drivers
-- `architecture/device_classes.md` — bus primitives drivers use to touch hardware
+- `architecture/abi_layers.md` — HAL contracts drivers use to touch hardware
 - `architecture/security.md` — conn_guard, retx buffering, KEY_VAULT, trust model

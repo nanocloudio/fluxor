@@ -400,7 +400,7 @@ pub unsafe extern "C" fn module_new(
     const KV_PROBE: u32 = 0x1000;
     const KV_STORE: u32 = 0x1001;
     if s.key_len >= 32 {
-        let present = (sys.dev_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
+        let present = (sys.provider_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
         if present == 1 {
             let mut raw = [0u8; 32];
             if s.key_len == 32 {
@@ -412,7 +412,7 @@ pub unsafe extern "C" fn module_new(
             store_arg[0] = 1;  // key_type = P-256 scalar
             store_arg[1] = 32; // key_len
             core::ptr::copy_nonoverlapping(raw.as_ptr(), store_arg.as_mut_ptr().add(4), 32);
-            let h = (sys.dev_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
+            let h = (sys.provider_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
             if h >= 0 {
                 s.key_vault_handle = h;
                 // Vault now holds the authoritative copy; wipe the in-module
@@ -1392,7 +1392,7 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
         let mut sign_arg = [0u8; 4 + 32 + 64];
         sign_arg[0] = 32;
         core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(4), 32);
-        let rc = (sys.dev_call)(s.key_vault_handle, KV_SIGN, sign_arg.as_mut_ptr(), sign_arg.len());
+        let rc = (sys.provider_call)(s.key_vault_handle, KV_SIGN, sign_arg.as_mut_ptr(), sign_arg.len());
         if rc == 0 {
             core::ptr::copy_nonoverlapping(sign_arg.as_ptr().add(4 + 32), raw_sig.as_mut_ptr(), 64);
             signed_via_vault = true;

@@ -1,10 +1,10 @@
 //! PWM Provider PIC Module
 //!
-//! Registers as the PWM device class provider (0x0F). Other modules call
-//! PWM::OPEN/SET_DUTY/CONFIGURE/CLOSE through dev_call, which the kernel
-//! routes to this module's dispatch function.
+//! Registers as the HAL_PWM provider (contract id 0x0F). Other modules
+//! call `PWM::OPEN/SET_DUTY/CONFIGURE/CLOSE` through `provider_call` on
+//! a HAL_PWM handle; the kernel routes to this module's dispatch function.
 //!
-//! Uses the kernel's raw PWM register bridge (SYSTEM::PWM_SLICE_WRITE/READ)
+//! Uses the kernel's raw PWM register bridge (PWM_SLICE_WRITE/READ (platform_raw))
 //! and GPIO provider for pin management. All slot tracking and pin-to-slice
 //! mapping lives here, not in the kernel.
 //!
@@ -52,11 +52,8 @@ const REG_CTR: u8 = 2;
 const REG_CC: u8 = 3;
 const REG_TOP: u8 = 4;
 
-// Device class
-const DEV_CLASS_PWM: u8 = 0x0F;
-
-// REGISTER_PROVIDER opcode
-const SYS_REGISTER_PROVIDER: u32 = 0x0C20;
+// Contract id (HAL_PWM).
+const HAL_PWM_CONTRACT: u32 = 0x000F;
 
 // ============================================================================
 // State
@@ -75,9 +72,8 @@ struct PwmSlot {
 #[repr(C)]
 struct PwmState {
     syscalls: *const SyscallTable,
-    registered: bool,
     signaled_ready: bool,
-    _pad: [u8; 2],
+    _pad: [u8; 3],
     slots: [PwmSlot; MAX_SLOTS],
     slice_used: [bool; NUM_SLICES],
 }
@@ -89,26 +85,29 @@ struct PwmState {
 unsafe fn raw_slice_write(sys: &SyscallTable, slice: u8, reg: u8, value: u32) -> i32 {
     let vb = value.to_le_bytes();
     let mut buf = [slice, reg, vb[0], vb[1], vb[2], vb[3]];
-    (sys.dev_call)(-1, SYS_PWM_SLICE_WRITE, buf.as_mut_ptr(), 6)
+    (sys.provider_call)(-1, SYS_PWM_SLICE_WRITE, buf.as_mut_ptr(), 6)
 }
 
 unsafe fn raw_pin_enable(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.dev_call)(-1, SYS_PWM_PIN_ENABLE, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(-1, SYS_PWM_PIN_ENABLE, arg.as_mut_ptr(), 1)
 }
 
 unsafe fn raw_pin_disable(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.dev_call)(-1, SYS_PWM_PIN_DISABLE, arg.as_mut_ptr(), 1)
+    (sys.provider_call)(-1, SYS_PWM_PIN_DISABLE, arg.as_mut_ptr(), 1)
 }
 
 unsafe fn gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
-    let mut arg = [pin];
-    (sys.dev_call)(-1, GPIO_CLAIM, arg.as_mut_ptr(), 1)
+    // GPIO claim returns a handle; route through provider_open so
+    // the kernel binds it to the HAL_GPIO contract.
+    const HAL_GPIO_CONTRACT: u32 = 0x0001;
+    let arg = [pin];
+    (sys.provider_open)(HAL_GPIO_CONTRACT, GPIO_CLAIM, arg.as_ptr(), 1)
 }
 
 unsafe fn gpio_release(sys: &SyscallTable, handle: i32) -> i32 {
-    (sys.dev_call)(handle, GPIO_RELEASE, core::ptr::null_mut(), 0)
+    (sys.provider_call)(handle, GPIO_RELEASE, core::ptr::null_mut(), 0)
 }
 
 // ============================================================================
@@ -151,7 +150,8 @@ unsafe fn get_slot_mut(s: &mut PwmState, handle: i32) -> *mut PwmSlot {
 }
 
 // ============================================================================
-// Provider dispatch — called by kernel when another module does dev_call(PWM)
+// Provider dispatch — called by the kernel when a consumer does
+// provider_call on a HAL_PWM handle.
 // ============================================================================
 
 #[no_mangle]
@@ -396,7 +396,6 @@ pub extern "C" fn module_new(
 
         let s = &mut *(state as *mut PwmState);
         s.syscalls = syscalls as *const SyscallTable;
-        s.registered = false;
         s.signaled_ready = false;
 
         // Slots and slice_used are zero-initialized by kernel's alloc_state()
@@ -418,22 +417,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return -1;
         }
 
-        let sys = &*s.syscalls;
-
-        // Register as PWM provider on first step
-        if !s.registered {
-            // Build RegisterProviderArgs: [class:u8, pad:3, dispatch_hash:u32 LE]
-            let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-            let fn_bytes = dispatch_hash.to_le_bytes();
-            let mut args = [DEV_CLASS_PWM, 0, 0, 0, fn_bytes[0], fn_bytes[1], fn_bytes[2], fn_bytes[3]];
-            let result = (sys.dev_call)(-1, SYS_REGISTER_PROVIDER, args.as_mut_ptr(), 8);
-            if result < 0 {
-                return result;
-            }
-            s.registered = true;
-        }
-
-        // Signal ready (once)
+        // Signal ready (once). Provider registration is handled by the
+        // loader via `module_provides_contract` — no runtime syscall.
         if !s.signaled_ready {
             s.signaled_ready = true;
             return 3; // StepOutcome::Ready
@@ -443,8 +428,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
+#[no_mangle]
+#[link_section = ".text.module_provides_contract"]
+pub extern "C" fn module_provides_contract() -> u32 {
+    HAL_PWM_CONTRACT
+}
+
 // ============================================================================
-// Deferred ready — gates downstream until provider is registered
+// Deferred ready — gates downstream until first step signals Ready
 // ============================================================================
 
 #[no_mangle]

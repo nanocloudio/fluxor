@@ -26,8 +26,9 @@ chain between "I need sockets" and the physical hardware varies wildly:
 | enc28j60 (Ethernet, raw frames) | enc28j60 + ip | 2 |
 | ch9120 (Ethernet, TCP/IP offload) | ch9120 | 1 |
 
-The http_server module is identical in all three cases. It uses kernel sockets
-and never touches frames or drivers. But the YAML config must wire completely
+The http_server module is identical in all three cases. It speaks the
+`contracts/net/net_proto` framing over a channel and never touches
+Ethernet frames or drivers. But the YAML config must wire completely
 different module stacks depending on which board you're building for.
 
 The same problem appears across every hardware domain:

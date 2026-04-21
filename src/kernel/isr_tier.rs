@@ -14,9 +14,9 @@
 //! ## Constraints
 //!
 //! ISR-tier modules (1b and 2) communicate exclusively via bridge channels.
-//! No `dev_call`, no `channel_read`/`channel_write`, no heap operations.
-//! The ISR handler calls the module's step/entry function directly — no syscall
-//! dispatch overhead.
+//! No `provider_call`, no `channel_read` / `channel_write`, no heap
+//! operations. The ISR handler calls the module's step/entry function
+//! directly — no syscall dispatch overhead.
 //!
 //! ## Platform backends
 //!

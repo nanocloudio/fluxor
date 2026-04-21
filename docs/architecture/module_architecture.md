@@ -269,12 +269,22 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 ```
 
-`modules/sdk/abi.rs` is the stable kernel ABI definition. `runtime.rs`
-contains compiler intrinsics and helper functions every PIC module
-needs. `params.rs` provides the `define_params!` macro and parameter
-schema encoding. Modules outside the fluxor tree (such as the Clustor
-project's modules) include the same files via a relative path through
-their git submodule.
+`modules/sdk/abi.rs` is the *assembler* for the layered ABI. The
+actual content lives under `modules/sdk/kernel_abi.rs` (core
+primitives), `modules/sdk/contracts/{hal,net,storage,key_vault}.rs`
+(portable domain contracts), `modules/sdk/internal/*.rs`
+(kernel-private orchestration), and `modules/sdk/platform/{rp,bcm2712}/*.rs`
+(chip-specific raw register bridges). The assembler composes them
+into the `abi` namespace. There is no `dev_*` facade anymore; every
+opcode lives in exactly one layer file and consumers import by its
+real path. See `.context/rfc_ipc_architecture.md` §1.1 for the
+layering rules.
+
+`runtime.rs` contains compiler intrinsics and helper functions every
+PIC module needs. `params.rs` provides the `define_params!` macro and
+parameter schema encoding. Modules outside the fluxor tree (such as
+the Clustor project's modules) include the same files via a relative
+path through their git submodule.
 
 See `src/kernel/loader.rs`, `modules/module.ld`, and `tools/src/modules.rs`
 for the loader, linker script, and pack tool.

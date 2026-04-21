@@ -7,9 +7,8 @@
 //! triggered. Non-printable bytes are replaced with `.` so a binary
 //! file doesn't produce garbled UDP frames.
 //!
-//! Intended use: end of the `nvme → fat32 → file_tap` acceptance chain
-//! for NVMe Phase 5 — prove that a known string on the drive reaches
-//! the log viewer verbatim.
+//! Intended use: end of the `nvme → fat32 → file_tap` chain — prove
+//! that a known string on the drive reaches the log viewer verbatim.
 
 #![no_std]
 

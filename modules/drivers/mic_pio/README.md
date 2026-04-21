@@ -20,7 +20,7 @@ direction = "output"
 content_type = "AudioPcm"
 
 [[resources]]
-device_class = "pio"
+requires_contract = "pio"
 access = "read"
 instance = 0
 ```

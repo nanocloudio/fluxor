@@ -27,25 +27,15 @@ UART even if the log_net module isn't running yet.
 
 ---
 
-## Bring-up checklist
+## References
 
-- [x] Spec identified: NVMe Base Specification 1.4 §7.6.1 (init),
-      §3.1 (registers), §4.2 (SQE), §4.6 (CQE), §5.15.2.1 (Identify
-      Controller), §5.15.2.2 (Identify Namespace).
-- [x] Reference implementations surveyed: SPDK `lib/nvme/nvme_ctrlr.c`;
-      NetBSD `sys/dev/ic/nvme.c`.
-- [x] Baseline trace tool at `hw/nvme_trace/`, captures the init +
-      Identify Controller sequence with ns-accurate timestamps.
-- [x] State machine diagram and per-state documentation (this file).
-- [ ] Rig trace captured and committed as `hw/nvme_trace/trace.csv`.
-- [ ] `mod.rs` scaffolding compiles.
-- [ ] Reset + ConfigQueues states implemented.
-- [ ] Enable state implemented.
-- [ ] IdentifyController state implemented (Phase 3 acceptance).
-- [ ] IdentifyNamespace + CreateIoCQ/SQ (Phase 4 acceptance).
-- [ ] Read LBA 0 (Phase 4 acceptance).
-- [ ] Block channel wiring to `fat32` (Phase 5 acceptance).
-- [ ] Write path (Phase 6 acceptance).
+- NVMe Base Specification 1.4: §7.6.1 (init), §3.1 (registers), §4.2
+  (SQE), §4.6 (CQE), §5.15.2.1 (Identify Controller), §5.15.2.2
+  (Identify Namespace).
+- Reference implementations: SPDK `lib/nvme/nvme_ctrlr.c`;
+  NetBSD `sys/dev/ic/nvme.c`.
+- Baseline trace tool at `hw/nvme_trace/` — captures the init +
+  Identify Controller sequence with ns-accurate timestamps.
 
 ---
 
@@ -89,24 +79,24 @@ UART even if the log_net module isn't running yet.
                     └──────┬────────┘
                            ▼
                     ┌───────────────────┐
-                    │ IdentifyController│  admin 0x06, CNS=1 (Phase 3)
+                    │ IdentifyController│  admin 0x06, CNS=1
                     └──────┬────────────┘
                            ▼
                     ┌───────────────────┐
-                    │ IdentifyNamespace │  admin 0x06, CNS=0 (Phase 4)
+                    │ IdentifyNamespace │  admin 0x06, CNS=0
                     └──────┬────────────┘
                            ▼
                     ┌───────────────┐
-                    │  CreateIoCQ   │  admin 0x05 (Phase 4)
+                    │  CreateIoCQ   │  admin 0x05
                     └──────┬────────┘
                            ▼
                     ┌───────────────┐
-                    │  CreateIoSQ   │  admin 0x01 (Phase 4)
+                    │  CreateIoSQ   │  admin 0x01
                     └──────┬────────┘
                            │ returns Ready(3) here — unblocks fat32
                            ▼
                     ┌───────────────┐
-                    │    Ready      │  serve block I/O (Phase 5/6)
+                    │    Ready      │  serve block I/O
                     └──────┬────────┘
                            │ on error →
                            ▼
@@ -138,7 +128,7 @@ command completion) read once per step and return `Continue`.
 ### `MapBars`
 
 - **Entry:** from `WaitPcie` with `dev_idx` set.
-- **Behaviour:** dev_call `NIC_BAR_MAP(dev_idx, 0)` → `bar0_virt`.
+- **Behaviour:** `provider_call(-1, NIC_BAR_MAP, [dev_idx, 0, …])` → `bar0_virt`.
 - **Exit:** `bar0_virt != 0` → `Reset`; else `Fault`.
 - **Spec:** N/A.
 - **Trace row:** `mmap_bar0`.
@@ -189,7 +179,7 @@ command completion) read once per step and return `Continue`.
 - **Trace rows:** `w32 0x14` (CC.EN=1), `r32 0x1C` loop.
 - **Timing budget:** same as `Reset` (CAP.TO).
 
-### `IdentifyController` (Phase 3 acceptance)
+### `IdentifyController`
 
 - **Entry:** CSTS.RDY = 1.
 - **Behaviour:**
@@ -202,25 +192,25 @@ command completion) read once per step and return `Continue`.
        VID@0, SSVID@2, SN@4 (20B), MN@24 (40B), FR@64 (8B)).
     4. Log model string to UART. Ring CQ0HDBL at `0x1000 + DSTRD`.
        Flip phase.
-- **Exit:** → `IdentifyNamespace` (Phase 4) or `Ready` (Phase 3 stub).
+- **Exit:** → `IdentifyNamespace`.
 - **Spec:** NVMe 1.4 §4.2 SQE; §4.6 CQE; §5.15 Admin Commands;
   §5.15.2.1 Identify Controller.
 - **Trace rows:** `sqe`, `w32 0x1000`, `cqe`, `w32 0x1004`.
 - **Timing budget:** typical < 1 ms between doorbell and completion
   for Identify; poll-once-per-step is fine.
 
-### `IdentifyNamespace` (Phase 4)
+### `IdentifyNamespace`
 
 Same shape as `IdentifyController`, CNS = 0x00, NSID = namespace
 from config param. Response (4 KB) contains NSZE (total LBAs),
 LBAF[] array indicating LBA size (we assume 512 B → LBAF[n].LBADS = 9).
 
-### `CreateIoCQ`, `CreateIoSQ` (Phase 4)
+### `CreateIoCQ`, `CreateIoSQ`
 
 Admin opcodes 0x05 and 0x01. Each needs another 4 KB DMA page for
 the ring. See NVMe 1.4 §5.4, §5.5.
 
-### `Ready` (Phase 5+)
+### `Ready`
 
 Per step:
 1. Try to read 16 B from `requests` channel.

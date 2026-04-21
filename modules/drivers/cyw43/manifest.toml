@@ -49,22 +49,24 @@ direction = "output"
 content_type = "HciMessage"
 
 [[ports]]
+name = "netif_state"
+index = 5
+direction = "output"
+content_type = "FmpMessage"
+
+[[ports]]
 name = "wifi_ctrl"
 direction = "ctrl_input"
 content_type = "FmpMessage"
 
 [[resources]]
-device_class = "pio"
+requires_contract = "pio"
 access = "exclusive"
 instance = 1
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
-
-[[resources]]
-device_class = "netif"
-access = "exclusive"
 
 [commands]
 accepts = ["connect", "disconnect", "scan"]

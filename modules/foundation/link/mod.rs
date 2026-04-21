@@ -447,7 +447,7 @@ pub extern "C" fn module_new(
 
         // Discover out[1] for control forwarding (RX/bidir modes)
         if s.mode == MODE_RX || s.mode == MODE_BIDIR {
-            let dev_call = (*s.syscalls).dev_call;
+            let dev_call = (*s.syscalls).provider_call;
             let mut port_arg = [1u8, 1u8]; // port_type=out, index=1
             s.ctrl_out_chan = (dev_call)(-1, 0x050C, port_arg.as_mut_ptr(), 2);
         }
@@ -481,10 +481,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // ============================================================================
 
 unsafe fn step_init(s: &mut LinkState) -> i32 {
-    let dev_call = (*s.syscalls).dev_call;
+    let dev_call = (*s.syscalls).provider_call;
+    let dev_open = (*s.syscalls).provider_open;
 
-    let mut bus_arg = [s.uart_bus];
-    let tx_h = (dev_call)(-1, DEV_UART_OPEN, bus_arg.as_mut_ptr(), 1);
+    // UART open returns a handle; use provider_open so the kernel
+    // binds it to the HAL_UART contract and subsequent calls on the
+    // handle route through the tracked contract rather than the
+    // class-byte fallback.
+    const HAL_UART_CONTRACT: u32 = 0x000D;
+    let bus_arg = [s.uart_bus];
+    let tx_h = (dev_open)(HAL_UART_CONTRACT, DEV_UART_OPEN, bus_arg.as_ptr(), 1);
     if tx_h < 0 {
         dev_log(&*s.syscalls, 1, b"[link] uart tx fail".as_ptr(), 19);
         s.phase = Phase::Error;
@@ -492,7 +498,7 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
     }
     s.uart_tx_handle = tx_h;
 
-    let rx_h = (dev_call)(-1, DEV_UART_OPEN, bus_arg.as_mut_ptr(), 1);
+    let rx_h = (dev_open)(HAL_UART_CONTRACT, DEV_UART_OPEN, bus_arg.as_ptr(), 1);
     if rx_h < 0 {
         dev_log(&*s.syscalls, 1, b"[link] uart rx fail".as_ptr(), 19);
         s.phase = Phase::Error;
@@ -523,7 +529,7 @@ unsafe fn step_wait_uart(s: &mut LinkState) -> i32 {
 // ============================================================================
 
 unsafe fn step_filling(s: &mut LinkState) -> i32 {
-    let dev_call = (*s.syscalls).dev_call;
+    let dev_call = (*s.syscalls).provider_call;
 
     poll_uart_rx(s, dev_call);
     maybe_send_beacon(s, dev_call);
@@ -554,7 +560,7 @@ unsafe fn step_filling(s: &mut LinkState) -> i32 {
 // ============================================================================
 
 unsafe fn step_running(s: &mut LinkState) -> i32 {
-    let dev_call = (*s.syscalls).dev_call;
+    let dev_call = (*s.syscalls).provider_call;
     let channel_read = (*s.syscalls).channel_read;
     let channel_write = (*s.syscalls).channel_write;
     let channel_poll = (*s.syscalls).channel_poll;
@@ -904,7 +910,7 @@ unsafe fn handle_audio(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const
 unsafe fn handle_sync(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const u8) {
     if (hdr.payload_len as usize) < SYNC_PAYLOAD_SIZE { return; }
 
-    let dev_call = (*s.syscalls).dev_call;
+    let dev_call = (*s.syscalls).provider_call;
     let (consumed, _queued, rate_q16, micros) = sync_beacon_decode(payload);
     s.master_consumed = consumed;
     s.master_micros = micros;
@@ -947,7 +953,7 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
     if s.mode == MODE_TX { return; }
 
     let mut milli_buf = [0u8; 8];
-    (dev_call)(-1, 0x0601, milli_buf.as_mut_ptr(), 8);
+    (dev_call)(-1, abi::kernel_abi::timer::MILLIS, milli_buf.as_mut_ptr(), 8);
     let now_ms = u64::from_le_bytes(milli_buf);
 
     if now_ms.wrapping_sub(s.last_beacon_ms) < BEACON_INTERVAL_MS { return; }
@@ -958,7 +964,7 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
         s.beacon_pending = false;
     }
 
-    let dev_query = (*s.syscalls).dev_query;
+    let dev_query = (*s.syscalls).provider_query;
     let mut st_buf = [0u8; 24];
     let r = (dev_query)(-1, 0x0C30, st_buf.as_mut_ptr(), 24);
     if r < 0 { return; }

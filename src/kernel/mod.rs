@@ -20,14 +20,24 @@ pub mod crypto;
 pub mod dtb;
 pub mod key_vault;
 pub mod syscalls;
-pub mod blob_store;
-pub mod graph_slot;
-pub mod nvme_backing;
+
+/// Kernel-private service registries and orchestration. Mirrors the
+/// `abi::internal::*` layer on the module side — these are the kernel's
+/// implementation of the registration hooks that pic modules invoke.
+pub mod internal {
+    pub mod backing_provider;
+    pub mod bridge;
+}
+
+// Top-level aliases — existing call sites reach `crate::kernel::backing_provider::*`
+// and `crate::kernel::bridge::*`. Both remain kernel-private; the
+// public ABI does not surface them.
+pub use internal::backing_provider;
+pub use internal::bridge;
 pub mod channel;
 pub mod config;
 pub mod scheduler;
 pub mod loader;
-pub mod net;
 pub mod buffer_pool;
 pub mod errno;
 pub mod event;
@@ -61,7 +71,6 @@ pub mod rp_ext;
 pub mod guard;
 pub mod heap;
 pub mod step_guard;
-pub mod bridge;
 pub mod isr_tier;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "../platform/bcm2712_cross_domain.rs"]

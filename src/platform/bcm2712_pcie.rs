@@ -1,13 +1,10 @@
 //! PCIe enumeration and BAR mapping for BCM2712 (CM5) — thin kernel bridge.
 //!
-//! The full PCIe enumeration and BAR management logic has been extracted
-//! into the `pcie_scan` PIC module, which uses MMIO_READ32/WRITE32 bridges.
-//!
-//! This file retains:
-//! - Constants (ECAM base, MMIO base)
-//! - Syscall handler wrappers that delegate to the PIC module when loaded,
-//!   or fall back to the built-in implementation.
-//! - The built-in implementation for backward compatibility.
+//! The public enumeration path is the `pcie_scan` PIC module, which uses
+//! MMIO_READ32/WRITE32 bridges. This file keeps a built-in fallback
+//! implementation for boot-time flows that run before the module loads,
+//! plus the syscall handler wrappers that delegate to whichever is
+//! available.
 
 #![allow(dead_code)]
 
@@ -30,13 +27,13 @@
 //     Requires `pciex1` enabled in `config.txt` so VPU trains the link
 //     and programs the outbound window before kernel handoff.
 //
-// NOTE: `ECAM_BASE` below retains the historical `0xFD50_0000` value for
-// backward compat with the pre-existing built-in enumerator. The PIC
-// `pcie_scan` module uses the `BCM2712_PCIE2_*` values at `0x10_00**_0000`,
-// which is what the Pi 5 SoC actually exposes.
+// The built-in fallback enumerator uses `ECAM_BASE = 0xFD50_0000` (a
+// legacy routing the VPU still exposes). The PIC `pcie_scan` module
+// uses the `BCM2712_PCIE2_*` values at `0x10_00**_0000`, which is
+// where the Pi 5 SoC maps its PCIe controllers post-handoff.
 
-/// BCM2712 PCIe2 (RP1) configuration-space base — historical value used by
-/// the built-in fallback enumerator; kept for back-compat only.
+/// BCM2712 PCIe2 (RP1) configuration-space base for the built-in
+/// fallback enumerator.
 #[cfg(feature = "board-cm5")]
 const ECAM_BASE: usize = 0xFD50_0000;
 

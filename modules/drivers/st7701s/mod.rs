@@ -78,9 +78,10 @@ const PIO_TXF_WRITE: u32 = 0x0C79;
 const PIO_FSTAT_READ: u32 = 0x0C7A;
 const PIO_SM_RESTART: u32 = 0x0C7B;
 
-const DMA_FD_CREATE: u32 = 0x0C85;
-const DMA_FD_START: u32 = 0x0C86;
-const DMA_FD_QUEUE: u32 = 0x0C89;
+// DMA fd family — st7701s uses async DMA for display scan-out. See
+// `dma_raw::fd` in the platform ABI; handles are tagged DMA fds, kernel
+// rejects raw channel numbers on these opcodes.
+use abi::platform::rp::dma_raw::fd as dma_fd;
 
 // 9-bit SPI bit-bang (kernel raw PAC GPIO)
 const SPI9_SEND: u32 = 0x0C90;
@@ -100,9 +101,6 @@ const REG_PINCTRL: u8 = 3;
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
-    ResetPreHigh = 0,
-    ResetLow = 1,
-    ResetHigh = 2,
     InitSeq = 3,
     SleepOut = 4,
     DisplayOn = 5,
@@ -292,7 +290,7 @@ mod params_def {
 }
 
 // ============================================================================
-// 9-bit SPI via kernel raw PAC GPIO (bypasses Embassy/dev_call GPIO path)
+// 9-bit SPI via kernel raw PAC GPIO (bypasses the HAL_GPIO contract)
 // ============================================================================
 
 /// Send a 9-bit SPI command + data to the kernel's raw PAC GPIO SPI handler.
@@ -324,9 +322,9 @@ unsafe fn spi9_send_inner(s: &St7701sState, cmd: u8, data: &[u8], hold_cs: bool)
     let total = 5 + data.len();
     if hold_cs {
         core::ptr::write_volatile(ap.add(total), 1);
-        (sys.dev_call)(-1, SPI9_SEND, ap, total + 1);
+        (sys.provider_call)(-1, SPI9_SEND, ap, total + 1);
     } else {
-        (sys.dev_call)(-1, SPI9_SEND, ap, total);
+        (sys.provider_call)(-1, SPI9_SEND, ap, total);
     }
 }
 
@@ -334,7 +332,7 @@ unsafe fn spi9_send_inner(s: &St7701sState, cmd: u8, data: &[u8], hold_cs: bool)
 unsafe fn spi9_reset(s: &St7701sState) {
     let sys = s.sys();
     let mut arg = [s.rst_pin, s.cs_pin, s.sck_pin, s.sda_pin];
-    (sys.dev_call)(-1, SPI9_RESET, arg.as_mut_ptr(), 4);
+    (sys.provider_call)(-1, SPI9_RESET, arg.as_mut_ptr(), 4);
 }
 
 /// Send one init command from the INIT_SEQ table via kernel SPI.
@@ -347,26 +345,30 @@ unsafe fn spi9_send_init_cmd(s: &St7701sState, cmd: &init_seq::InitCmd) {
 unsafe fn spi9_cs_set(s: &St7701sState, level: u8) {
     let sys = s.sys();
     let mut arg = [s.cs_pin, level];
-    (sys.dev_call)(-1, SPI9_CS_SET, arg.as_mut_ptr(), 2);
+    (sys.provider_call)(-1, SPI9_CS_SET, arg.as_mut_ptr(), 2);
 }
 
 // ============================================================================
 // GPIO / Timer helpers
 // ============================================================================
 
+// Contract ids (mirror kernel::provider::contract::*).
+const HAL_GPIO_CONTRACT: u32 = 0x0001;
+const TIMER_CONTRACT:    u32 = 0x0006;
+
 unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
-    (sys.dev_call)(-1, 0x0106, arg.as_mut_ptr(), 1)
+    (sys.provider_open)(HAL_GPIO_CONTRACT, 0x0106, arg.as_mut_ptr(), 1)
 }
 
 unsafe fn gpio_set(sys: &SyscallTable, handle: i32, level: u8) {
     let mut lvl = [level];
-    (sys.dev_call)(handle, 0x0104, lvl.as_mut_ptr(), 1);
+    (sys.provider_call)(handle, 0x0104, lvl.as_mut_ptr(), 1);
 }
 
 unsafe fn timer_set(sys: &SyscallTable, timer_fd: i32, delay_ms: u32) -> i32 {
     let mut ms_buf = delay_ms.to_le_bytes();
-    (sys.dev_call)(timer_fd, 0x0605, ms_buf.as_mut_ptr(), 4)
+    (sys.provider_call)(timer_fd, 0x0605, ms_buf.as_mut_ptr(), 4)
 }
 
 unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
@@ -379,12 +381,12 @@ unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
 
 unsafe fn pio_gpiobase(sys: &SyscallTable, pio: u8, base16: u8) -> i32 {
     let mut arg = [pio, base16];
-    (sys.dev_call)(-1, PIO_GPIOBASE, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(-1, PIO_GPIOBASE, arg.as_mut_ptr(), 2)
 }
 
 unsafe fn pio_instr_alloc(sys: &SyscallTable, pio: u8, count: u8, mask_out: &mut u32) -> i32 {
     let mut arg = [pio, count, 0, 0, 0, 0];
-    let rc = (sys.dev_call)(-1, PIO_INSTR_ALLOC, arg.as_mut_ptr(), 6);
+    let rc = (sys.provider_call)(-1, PIO_INSTR_ALLOC, arg.as_mut_ptr(), 6);
     if rc >= 0 {
         let p = arg.as_ptr();
         *mask_out = u32::from_le_bytes([
@@ -400,40 +402,40 @@ unsafe fn pio_instr_alloc(sys: &SyscallTable, pio: u8, count: u8, mask_out: &mut
 unsafe fn pio_instr_write(sys: &SyscallTable, pio: u8, addr: u8, instr: u16) -> i32 {
     let bytes = instr.to_le_bytes();
     let mut arg = [pio, addr, bytes[0], bytes[1]];
-    (sys.dev_call)(-1, PIO_INSTR_WRITE, arg.as_mut_ptr(), 4)
+    (sys.provider_call)(-1, PIO_INSTR_WRITE, arg.as_mut_ptr(), 4)
 }
 
 unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio: u8, sm: u8, reg: u8, value: u32) -> i32 {
     let vb = value.to_le_bytes();
     let mut arg = [pio, sm, reg, vb[0], vb[1], vb[2], vb[3]];
-    (sys.dev_call)(-1, PIO_SM_WRITE_REG, arg.as_mut_ptr(), 7)
+    (sys.provider_call)(-1, PIO_SM_WRITE_REG, arg.as_mut_ptr(), 7)
 }
 
 unsafe fn pio_sm_enable(sys: &SyscallTable, pio: u8, mask: u8, enable: u8) -> i32 {
     let mut arg = [pio, mask, enable];
-    (sys.dev_call)(-1, PIO_SM_ENABLE, arg.as_mut_ptr(), 3)
+    (sys.provider_call)(-1, PIO_SM_ENABLE, arg.as_mut_ptr(), 3)
 }
 
 unsafe fn pio_sm_restart(sys: &SyscallTable, pio: u8, mask: u8) -> i32 {
     let mut arg = [pio, mask];
-    (sys.dev_call)(-1, PIO_SM_RESTART, arg.as_mut_ptr(), 2)
+    (sys.provider_call)(-1, PIO_SM_RESTART, arg.as_mut_ptr(), 2)
 }
 
 unsafe fn pio_sm_exec(sys: &SyscallTable, pio: u8, sm: u8, instr: u16) -> i32 {
     let bytes = instr.to_le_bytes();
     let mut arg = [pio, sm, bytes[0], bytes[1]];
-    (sys.dev_call)(-1, PIO_SM_EXEC, arg.as_mut_ptr(), 4)
+    (sys.provider_call)(-1, PIO_SM_EXEC, arg.as_mut_ptr(), 4)
 }
 
 unsafe fn pio_txf_write(sys: &SyscallTable, pio: u8, sm: u8, value: u32) -> i32 {
     let vb = value.to_le_bytes();
     let mut arg = [pio, sm, vb[0], vb[1], vb[2], vb[3]];
-    (sys.dev_call)(-1, PIO_TXF_WRITE, arg.as_mut_ptr(), 6)
+    (sys.provider_call)(-1, PIO_TXF_WRITE, arg.as_mut_ptr(), 6)
 }
 
 unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) -> i32 {
     let mut arg = [pin, pio_num, pull];
-    (sys.dev_call)(-1, PIO_PIN_SETUP, arg.as_mut_ptr(), 3)
+    (sys.provider_call)(-1, PIO_PIN_SETUP, arg.as_mut_ptr(), 3)
 }
 
 // ============================================================================
@@ -441,7 +443,12 @@ unsafe fn pio_pin_setup(sys: &SyscallTable, pin: u8, pio_num: u8, pull: u8) -> i
 // ============================================================================
 
 unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
-    (sys.dev_call)(-1, DMA_FD_CREATE, core::ptr::null_mut(), 0)
+    // fd::CREATE opens against PLATFORM_DMA_FD (0x0011). The kernel
+    // tracks the returned tagged fd against this contract; follow-up
+    // fd::* ops route through PLATFORM_DMA_FD's vtable and reject
+    // handles from the sibling PLATFORM_DMA (channel) surface.
+    const PLATFORM_DMA_FD: u32 = 0x0011;
+    (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)
 }
 
 unsafe fn dma_fd_start(sys: &SyscallTable, fd: i32, read_addr: u32, write_addr: u32, count: u32, dreq: u8, flags: u8) -> i32 {
@@ -454,7 +461,7 @@ unsafe fn dma_fd_start(sys: &SyscallTable, fd: i32, read_addr: u32, write_addr: 
         cnt[0], cnt[1], cnt[2], cnt[3],
         dreq, flags,
     ];
-    (sys.dev_call)(fd, DMA_FD_START, arg.as_mut_ptr(), 14)
+    (sys.provider_call)(fd, dma_fd::START, arg.as_mut_ptr(), 14)
 }
 
 unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, read_addr: u32, count: u32) -> i32 {
@@ -464,7 +471,7 @@ unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, read_addr: u32, count: u32) 
         ra[0], ra[1], ra[2], ra[3],
         cnt[0], cnt[1], cnt[2], cnt[3],
     ];
-    (sys.dev_call)(fd, DMA_FD_QUEUE, arg.as_mut_ptr(), 8)
+    (sys.provider_call)(fd, dma_fd::QUEUE, arg.as_mut_ptr(), 8)
 }
 
 // ============================================================================
@@ -746,7 +753,7 @@ pub extern "C" fn module_new(
     unsafe {
         let sys = &*s.syscalls;
 
-        s.timer_fd = (sys.dev_call)(-1, 0x0604, core::ptr::null_mut(), 0);
+        s.timer_fd = (sys.provider_open)(TIMER_CONTRACT, 0x0604, core::ptr::null_mut(), 0);
         if s.timer_fd < 0 { return -12; }
 
         // BL pin still needs GPIO claim (stays as SIO output after SPI init)
@@ -787,12 +794,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     let sys = unsafe { &*s.syscalls };
 
     match s.phase {
-        Phase::ResetPreHigh | Phase::ResetLow | Phase::ResetHigh => {
-            // These phases are no longer used (reset done in module_new)
-            s.phase = Phase::InitSeq;
-            2
-        }
-
         Phase::InitSeq => {
             // SLEEP_OUT timer (set in module_new after SPI init)
             if !unsafe { timer_expired(sys, s.timer_fd) } { return 0; }

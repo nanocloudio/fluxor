@@ -255,7 +255,7 @@ config.
   pattern.
 - `architecture/network_boot.md` — bundle signing, trust root,
   deployment flow.
-- `architecture/device_classes.md` — device class registry, KEY_VAULT
-  position.
+- `architecture/abi_layers.md` — ABI layer boundaries, contract
+  inventory, KEY_VAULT position.
 - `architecture/hal_architecture.md` — HAL boundaries, OTP and DTB
   hooks.

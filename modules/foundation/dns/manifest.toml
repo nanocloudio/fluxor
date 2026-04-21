@@ -12,5 +12,5 @@ direction = "output"
 content_type = "OctetStream"
 
 [[resources]]
-device_class = "channel"
+requires_contract = "channel"
 access = "read"

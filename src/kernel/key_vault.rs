@@ -7,7 +7,7 @@
 //! ECDH, SIGN and VERIFY run the kernel P-256 primitives directly: the
 //! vault is authoritative for any slot holding P-256 scalar material.
 
-use crate::abi::dev_key_vault;
+use crate::abi::contracts::key_vault as dev_key_vault;
 use crate::abi::errno::{ENOSYS, EINVAL};
 use crate::kernel::crypto::p256;
 
@@ -196,8 +196,8 @@ mod tests {
     use super::*;
 
     /// STORE -> handle returns a valid slot; key bytes are accepted but
-    /// cannot be observed through any inspection API (there is no dev_query
-    /// path that exposes the slot content).
+    /// cannot be observed through any inspection API (no `provider_query`
+    /// path exposes slot content).
     #[test]
     fn store_and_destroy_roundtrip() {
         unsafe { reset_all(); }

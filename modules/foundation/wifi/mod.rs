@@ -39,11 +39,6 @@ include!("../../sdk/params.rs");
 mod constants;
 use constants::*;
 
-/// Netif dev_call opcodes (mirror abi::dev_netif)
-const DEV_NETIF_OPEN: u32 = 0x0700;
-const DEV_NETIF_STATE: u32 = 0x0704;
-
-
 mod params_def {
     use super::*;
 
@@ -101,11 +96,13 @@ struct WifiConnectState {
     in_chan: i32,        // in[0]: status events from cyw43
     out_chan: i32,       // out[0]: commands to cyw43.ctrl
     scan_chan: i32,      // in[1]: binary scan results from cyw43
-    netif_handle: i32,
+    netif_state_chan: i32, // in[2]: netif state transitions from cyw43
+    last_netif_state: u8, // latest MSG_NETIF_STATE payload (0xFF = unseen)
     phase: WifiPhase,
     retry_count: u8,
     radio_ready: bool,
     security: u8,   // 0=WPA2, 1=WPA3, 2=Open
+    _pad_hdr: u8,
     last_time_ms: u64,
     assoc_buf: [u8; ASSOC_BUF_SIZE],
 
@@ -135,6 +132,29 @@ unsafe fn log_msg(s: &WifiConnectState, msg: &[u8]) {
 
 unsafe fn log_err(s: &WifiConnectState, msg: &[u8]) {
     dev_log(s.sys(), 1, msg.as_ptr(), msg.len());
+}
+
+/// Drain all pending MSG_NETIF_STATE frames from netif_state_chan,
+/// caching the last state byte in `s.last_netif_state`.
+unsafe fn drain_netif_state_events(s: &mut WifiConnectState) {
+    if s.netif_state_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let mut one = [0u8; 1];
+    loop {
+        let poll = (sys.channel_poll)(s.netif_state_chan, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            break;
+        }
+        let (ty, len) = msg_read(sys, s.netif_state_chan, one.as_mut_ptr(), 1);
+        if ty == 0 {
+            break;
+        }
+        if ty == MSG_NETIF_STATE && len >= 1 {
+            s.last_netif_state = one[0];
+        }
+    }
 }
 
 /// Drain all pending FMP status events from in_chan.
@@ -299,7 +319,7 @@ pub extern "C" fn module_new(
         s.syscalls = syscalls as *const SyscallTable;
         s.in_chan = in_chan;          // in[0]: status events
         s.out_chan = out_chan;        // out[0]: commands → cyw43.ctrl
-        s.netif_handle = -1;
+        s.last_netif_state = 0xFF;
         s.phase = WifiPhase::Init;
 
         // Require in[0] (status from cyw43) and out[0] (commands to cyw43)
@@ -308,8 +328,10 @@ pub extern "C" fn module_new(
             return -3;
         }
 
-        // Discover secondary input: binary scan results (in[1])
+        // Discover secondary inputs: binary scan results (in[1]) and
+        // netif state transitions (in[2]).
         s.scan_chan = dev_channel_port(&*s.syscalls, 0, 1); // port_type=in, index=1
+        s.netif_state_chan = dev_channel_port(&*s.syscalls, 0, 2); // port_type=in, index=2
 
         // Parse credentials from TLV params
         if !params.is_null() && params_len > 0 {
@@ -334,6 +356,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Always drain status events first (non-blocking)
         drain_status_events(s);
+        drain_netif_state_events(s);
 
         // ════════════════════════════════════════════════════════════════
         // WiFi Phase Transitions (IEEE 802.11 association, simplified)
@@ -368,39 +391,31 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
 
             WifiPhase::NetifOpen => {
-                let mut ntype = [NETIF_TYPE_WIFI];
-                let handle = (sys.dev_call)(-1, DEV_NETIF_OPEN, ntype.as_mut_ptr(), 1);
-                if handle >= 0 {
-                    s.netif_handle = handle;
-                    s.phase = WifiPhase::WaitReady;
-                    log_msg(s, b"[wifi] opened");
-                } else {
-                    if now - s.last_time_ms > RECONNECT_DELAY_MS {
-                        s.last_time_ms = now;
-                        log_err(s, b"[wifi] open fail");
-                    }
-                }
+                s.phase = WifiPhase::WaitReady;
             }
 
             WifiPhase::WaitReady => {
-                // Event-driven: check if we got RADIO_READY event
+                // Event-driven: RADIO_READY event on the status channel is
+                // the primary signal.
                 if s.radio_ready {
                     s.phase = WifiPhase::Associate;
                     return 0;
                 }
-                // Fallback: poll netif state directly
-                let st = (sys.dev_call)(s.netif_handle, DEV_NETIF_STATE, core::ptr::null_mut(), 0);
-                if st as u8 == NETIF_STATE_NO_LINK || st as u8 == NETIF_STATE_NO_ADDRESS || st as u8 == NETIF_STATE_READY {
-                    if st as u8 == NETIF_STATE_NO_ADDRESS || st as u8 == NETIF_STATE_READY {
+                // State-driven fallback: use the latest netif state byte
+                // if the state channel is wired (cyw43.netif_state →
+                // wifi.netif_state).
+                match s.last_netif_state {
+                    NETIF_STATE_NO_LINK => s.phase = WifiPhase::Associate,
+                    NETIF_STATE_NO_ADDRESS | NETIF_STATE_READY => {
                         s.phase = WifiPhase::Connected;
                         log_msg(s, b"[wifi] already up");
-                    } else {
-                        s.phase = WifiPhase::Associate;
                     }
-                } else if st as u8 == NETIF_STATE_ERROR {
-                    log_err(s, b"[wifi] radio err");
-                    s.phase = WifiPhase::Disconnected;
-                    s.last_time_ms = now;
+                    NETIF_STATE_ERROR => {
+                        log_err(s, b"[wifi] radio err");
+                        s.phase = WifiPhase::Disconnected;
+                        s.last_time_ms = now;
+                    }
+                    _ => {}
                 }
             }
 
@@ -468,10 +483,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
 
             WifiPhase::WaitConnected => {
-                // Event-driven path handled by drain_status_events() above
-                // Fallback: poll netif state
-                let st = (sys.dev_call)(s.netif_handle, DEV_NETIF_STATE, core::ptr::null_mut(), 0);
-                if st as u8 == NETIF_STATE_NO_ADDRESS || st as u8 == NETIF_STATE_READY {
+                // Event-driven path handled by drain_status_events() above.
+                // State-driven fallback: the cached netif state byte.
+                let st = s.last_netif_state;
+                if st == NETIF_STATE_NO_ADDRESS || st == NETIF_STATE_READY {
                     s.phase = WifiPhase::Connected;
                     s.retry_count = 0;
                     log_msg(s, b"[wifi] connected");
@@ -489,11 +504,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             WifiPhase::Monitor => {
                 // Event-driven path: DISCONNECTED event handled by drain_status_events()
-                // Fallback: poll netif periodically
+                // State-driven fallback: cached netif state byte.
                 if now - s.last_time_ms >= MONITOR_INTERVAL_MS {
                     s.last_time_ms = now;
-                    let st = (sys.dev_call)(s.netif_handle, DEV_NETIF_STATE, core::ptr::null_mut(), 0);
-                    if st as u8 != NETIF_STATE_NO_ADDRESS && st as u8 != NETIF_STATE_READY {
+                    let st = s.last_netif_state;
+                    if st != NETIF_STATE_NO_ADDRESS && st != NETIF_STATE_READY {
                         log_err(s, b"[wifi] lost");
                         s.phase = WifiPhase::Disconnected;
                         s.last_time_ms = now;

@@ -2,10 +2,8 @@
 //!
 //! This module is only compiled for RP targets (via cfg in mod.rs).
 //! It provides init_rp_providers() and release_rp_handles() called
-//! through the HAL dispatch table.
-//!
-//! Also contains DMA channel allocation and DMA FD operations that
-//! were previously cfg-gated in syscalls.rs and fd.rs.
+//! through the HAL dispatch table, plus the RP-side DMA channel
+//! allocator and DMA fd machinery.
 
 use portable_atomic::{AtomicU16, Ordering, compiler_fence};
 
@@ -330,7 +328,7 @@ pub fn init() {
     init_rp_providers();
     // Register DMA FD poll function with the fd subsystem
     fd::register_dma_fd_poll(dma_fd_poll_ready);
-    // Register dev_query extension for GPIO and SYS_CLOCK_HZ
+    // Register provider_query extension for GPIO and SYS_CLOCK_HZ
     register_dev_query_extension(rp_dev_query_extension);
 }
 

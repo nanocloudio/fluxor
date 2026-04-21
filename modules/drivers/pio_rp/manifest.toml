@@ -1,0 +1,14 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040"]
+permissions = ["platform_raw"]
+
+# pio_rp uses both DMA families:
+#   - platform_dma: raw channels for CMD blocking transfers.
+#   - platform_dma_fd: async fds for streaming workloads.
+[[resources]]
+requires_contract = "platform_dma"
+access = "exclusive"
+
+[[resources]]
+requires_contract = "platform_dma_fd"
+access = "exclusive"

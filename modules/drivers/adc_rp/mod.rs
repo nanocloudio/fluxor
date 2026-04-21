@@ -1,7 +1,7 @@
 //! ADC Driver — PIC module provider
 //!
 //! Manages ADC access using kernel register bridge.
-//! Registers as ADC provider (device class 0x0E).
+//! Registers as the HAL_ADC provider (contract id 0x0E).
 //! Single-shot conversions via register polling.
 
 #![no_std]
@@ -56,20 +56,22 @@ struct AdcState {
     step_count: u32,
 }
 
+use abi::platform::rp::adc_raw::{REG_WRITE as ADC_REG_WRITE, REG_READ as ADC_REG_READ};
+
 unsafe fn adc_reg_write(sys: &SyscallTable, offset: u8, val: u32) {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
     let v = val.to_le_bytes();
     *bp.add(1) = v[0]; *bp.add(2) = v[1]; *bp.add(3) = v[2]; *bp.add(4) = v[3];
-    (sys.dev_call)(-1, 0x0CD0, bp, 5);
+    (sys.provider_call)(-1, ADC_REG_WRITE, bp, 5);
 }
 
 unsafe fn adc_reg_read(sys: &SyscallTable, offset: u8) -> u32 {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
-    (sys.dev_call)(-1, 0x0CD1, bp, 5);
+    (sys.provider_call)(-1, ADC_REG_READ, bp, 5);
     u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)])
 }
 
@@ -110,7 +112,7 @@ pub unsafe extern "C" fn adc_dispatch(
             // Init pin for GPIO channels
             if ch < 4 {
                 let mut pin_buf = [26 + ch];
-                (sys.dev_call)(-1, 0x0CD2, pin_buf.as_mut_ptr(), 1); // ADC_PIN_INIT
+                (sys.provider_call)(-1, abi::platform::rp::adc_raw::PIN_INIT, pin_buf.as_mut_ptr(), 1);
             }
 
             let mut i = 0usize;
@@ -195,16 +197,15 @@ pub extern "C" fn module_new(
         s.in_chan = in_chan; s.out_chan = out_chan; s.ctrl_chan = ctrl_chan;
 
         let sys = &*s.syscalls;
-        let dispatch_hash: u32 = 0xc7832e76; // FNV-1a("module_provider_dispatch")
-        let mut reg = [0u8; 8];
-        let rp = reg.as_mut_ptr();
-        *rp = 0x0E; // ADC class
-        let da = dispatch_hash.to_le_bytes();
-        *rp.add(4) = da[0]; *rp.add(5) = da[1]; *rp.add(6) = da[2]; *rp.add(7) = da[3];
-        (sys.dev_call)(-1, 0x0C20, rp, 8);
-        dev_log(sys, 3, b"[adc] provider registered".as_ptr(), 24);
+        dev_log(sys, 3, b"[adc] ready".as_ptr(), 10);
         0
     }
+}
+
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_provides_contract"]
+pub extern "C" fn module_provides_contract() -> u32 {
+    0x000E // HAL_ADC
 }
 
 #[unsafe(no_mangle)]

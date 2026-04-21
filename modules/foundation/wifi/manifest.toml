@@ -13,13 +13,15 @@ direction = "input"
 content_type = "OctetStream"
 
 [[ports]]
+name = "netif_state"
+index = 2
+direction = "input"
+content_type = "FmpMessage"
+
+[[ports]]
 name = "wifi_ctrl"
 direction = "output"
 content_type = "FmpMessage"
-
-[[resources]]
-device_class = "netif"
-access = "write"
 
 [commands]
 accepts = ["radio_ready", "connected", "disconnected", "scan_done", "scan_result"]

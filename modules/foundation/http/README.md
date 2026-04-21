@@ -20,7 +20,7 @@ content_type = "OctetStream"
 required = true
 
 [[resources]]
-device_class = "socket"
+requires_contract = "socket"
 access = "write"
 ```
 

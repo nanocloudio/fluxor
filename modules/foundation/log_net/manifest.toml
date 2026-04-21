@@ -1,5 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+permissions = ["platform_raw"]
 
 [[ports]]
 name = "net_in"
@@ -12,7 +13,3 @@ name = "net_out"
 direction = "output"
 content_type = "OctetStream"
 required = true
-
-[[resources]]
-device_class = "socket"
-access = "write"

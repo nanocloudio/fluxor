@@ -335,14 +335,19 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
         return false;
     }
 
-    // Create DMA ring
+    // Create NIC DMA ring. PLATFORM_NIC_RING is a first-class contract
+    // for ring management; the kernel binds the returned handle and
+    // routes subsequent calls (NIC_RING_INFO/DESTROY) via that
+    // contract. Access is gated by the module's `platform_raw`
+    // permission.
     let mut ring_arg = [0u8; 8];
     let p = ring_arg.as_mut_ptr();
     write_volatile(p as *mut u16, RX_DESC_COUNT.to_le());
     write_volatile(p.add(2) as *mut u16, TX_DESC_COUNT.to_le());
     write_volatile(p.add(4) as *mut u16, BUF_SIZE.to_le());
     write_volatile(p.add(6) as *mut u16, BUF_COUNT.to_le());
-    let ring_handle = (sys.dev_call)(-1, NIC_RING_CREATE, ring_arg.as_mut_ptr(), 8);
+    const PLATFORM_NIC_RING: u32 = 0x0007;
+    let ring_handle = (sys.provider_open)(PLATFORM_NIC_RING, NIC_RING_CREATE, ring_arg.as_ptr(), 8);
     if ring_handle < 0 {
         log_msg(sys, b"[rp1_gem] RING_CREATE failed");
         return false;
@@ -351,7 +356,7 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
 
     // Get ring info
     let mut info = [0u8; 32];
-    let info_rc = (sys.dev_call)(ring_handle, NIC_RING_INFO, info.as_mut_ptr(), 32);
+    let info_rc = (sys.provider_call)(ring_handle, NIC_RING_INFO, info.as_mut_ptr(), 32);
     if info_rc < 0 {
         log_msg(sys, b"[rp1_gem] RING_INFO failed");
         return false;
@@ -429,7 +434,7 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     // administered address — if the kernel has nothing for us.
     const SYS_GET_HW_ETHERNET_MAC: u32 = 0x0C3D;
     let mut probed = [0u8; 6];
-    s.mac = if (sys.dev_call)(-1, SYS_GET_HW_ETHERNET_MAC, probed.as_mut_ptr(), 6) == 6 {
+    s.mac = if (sys.provider_call)(-1, SYS_GET_HW_ETHERNET_MAC, probed.as_mut_ptr(), 6) == 6 {
         probed
     } else {
         DEFAULT_MAC

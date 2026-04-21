@@ -12,7 +12,7 @@ pub const ENC_BIT_FIELD_SET: u8 = 0x80;
 pub const ENC_BIT_FIELD_CLR: u8 = 0xA0;
 pub const ENC_SOFT_RESET: u8 = 0xFF;
 
-/// dev_call opcodes
+/// HAL contract opcodes
 pub const DEV_GPIO_CLAIM: u32 = 0x0100;
 pub const DEV_GPIO_SET_MODE: u32 = 0x0102;
 pub const DEV_GPIO_SET_LEVEL: u32 = 0x0104;

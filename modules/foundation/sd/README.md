@@ -22,15 +22,15 @@ content_type = "OctetStream"
 required = true
 
 [[resources]]
-device_class = "spi"
+requires_contract = "spi"
 access = "exclusive"
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
 
 [[resources]]
-device_class = "timer"
+requires_contract = "timer"
 access = "write"
 ```
 

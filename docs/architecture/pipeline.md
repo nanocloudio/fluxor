@@ -472,7 +472,7 @@ loader fast.
 ## Related Documentation
 
 - [module_architecture.md](module_architecture.md) — module step contract, principles, ABI
-- [device_classes.md](device_classes.md) — `dev_call` opcodes and provider dispatch
+- [abi_layers.md](abi_layers.md) — ABI layers, contract inventory, provider dispatch
 - [hal_architecture.md](hal_architecture.md) — bus primitives, syscall table, per-silicon HAL
 - [events.md](events.md) — event signals, IRQ binding, intra-tick wake
 - [heap.md](heap.md) — per-module heap allocation

@@ -11,12 +11,17 @@ logic — lives in modules.
 1. **HAL provides primitives, not protocols.** GPIO, SPI, I2C, PIO, UART,
    timers, DMA. Anything more specific (a TFT display controller, an
    audio DAC, a CAN bus chip) is a module that uses these primitives.
+   The portable surface lives under
+   `modules/sdk/contracts/hal/{gpio,spi,i2c,pio,uart,adc,pwm}.rs`;
+   chip-specific raw register bridges live under
+   `modules/sdk/platform/<chip>/*`.
 
-2. **One stable ABI across silicon.** The same `dev_call` opcodes work on
-   RP2040, RP2350, BCM2712, and CM5. The kernel implementation behind
-   each opcode differs per silicon, but a PIC module never sees that
-   difference. A driver compiled for RP2350 and the same driver compiled
-   for BCM2712 use identical syscall sequences.
+2. **One stable contract surface across silicon.** The HAL contract
+   opcodes are identical on RP2040, RP2350, BCM2712, and (planned)
+   ESP32. The kernel implementation behind each opcode differs per
+   silicon, but a PIC module never sees that difference. Adding a new
+   chip is a new `platform/<chip>/*` tree plus HAL backings — it does
+   not change the public ABI.
 
 3. **No hidden state.** Pin assignments, bus configurations, and clock
    settings come from the config binary at boot. The kernel does not
@@ -49,7 +54,7 @@ logic — lives in modules.
 |        cyw43, enc28j60, virtio_net, sd, st7701s, gt911, i2s ...    |
 |                          (PIC modules)                             |
 +--------------------------------------------------------------------+
-                    Stable Syscall ABI (dev_call)
+                    Stable Syscall ABI (provider_open/call/query/close)
 +--------------------------------------------------------------------+
 |                            Kernel                                  |
 |     scheduler  •  channels  •  events  •  loader  •  syscalls      |
@@ -102,10 +107,10 @@ polling.
 ```rust
 // Acquire a pin as an input with pull-up
 let mut arg = [pin_number, GPIO_PULL_UP];
-let handle = (sys.dev_call)(-1, dev_gpio::REQUEST_INPUT, arg.as_mut_ptr(), 2);
+let handle = (sys.provider_open)(HAL_GPIO, gpio::SET_INPUT, arg.as_mut_ptr(), 2);
 
 // Read the level
-let level = (sys.dev_call)(handle, dev_gpio::GET_LEVEL, null, 0);
+let level = (sys.provider_call)(handle, gpio::GET_LEVEL, null, 0);
 ```
 
 The HAL on each target is responsible for the actual MMIO writes that
@@ -120,9 +125,9 @@ configured bus and a CS pin, then issue transfers.
 
 ```rust
 let mut spi = SpiOpenArgs { bus, cs_handle, freq_hz, mode };
-let handle = (sys.dev_call)(-1, dev_spi::OPEN, &mut spi as *mut _ as *mut u8,
+let handle = (sys.provider_open)(HAL_SPI, spi::OPEN, &mut spi as *mut _ as *mut u8,
                             core::mem::size_of::<SpiOpenArgs>());
-(sys.dev_call)(handle, dev_spi::TRANSFER, transfer_args, args_len);
+(sys.provider_call)(handle, spi::TRANSFER, transfer_args, args_len);
 ```
 
 Async transfers use start/poll: the module starts a DMA-backed transfer,
@@ -176,7 +181,7 @@ timer hardware.
 DMA channels are claimed by drivers that need them (PIO, SPI). The HAL
 manages the channel pool per silicon — RP2040 has 12 channels, RP2350
 has 12 + a separate "system DMA" controller, BCM2712 has its own DMA
-engines. Modules see only the abstract `dev_call` operations on PIO and
+engines. Modules see only the abstract `provider_call` operations on PIO and
 SPI; the DMA wiring is hidden.
 
 ### Trust and platform metadata
@@ -196,7 +201,7 @@ stays silicon-oblivious:
 
 On BCM2712, `kernel::dtb::read_ethernet_mac()` walks the firmware-
 provided flattened device tree for the `local-mac-address` property.
-The rp1_gem driver calls this via a SYSTEM syscall
+The rp1_gem driver calls this via a kernel-primitive syscall
 (`GET_HW_ETHERNET_MAC`, `0x0C3D`) and programs the returned MAC into
 the GEM's SA1 register. On silicon without DTB plumbing the syscall
 returns `ENODEV`, and drivers fall back to a locally-administered
@@ -204,32 +209,35 @@ default.
 
 ## Syscall Table
 
-The syscall table (`SyscallTable` in `modules/sdk/abi.rs`) is a
+The syscall table (`SyscallTable` in `modules/sdk/kernel_abi.rs`) is a
 `#[repr(C)]` struct of function pointers passed to each module at
 `module_init`. It is the only ABI surface PIC modules see.
 
-The table contains:
+The table contains exactly:
 
 | Group | Functions |
 |-------|----------|
-| Channels | `channel_open`, `channel_read`, `channel_write`, `channel_poll`, `channel_close`, `channel_ioctl` |
-| Mailbox buffers | `buffer_acquire_write`, `buffer_release_write`, `buffer_acquire_read`, `buffer_release_read`, `buffer_acquire_inplace` |
-| Generic device dispatch | `dev_call(handle, opcode, arg, arg_len)` |
-| Generic device query | `dev_query(handle, key, out, out_len)` |
-| Heap allocation | `heap_alloc`, `heap_free`, `heap_realloc` |
-| Stream time | `stream_time` |
-| Logging | `log` |
+| Channel I/O | `channel_read`, `channel_write`, `channel_poll` |
+| Heap | `heap_alloc`, `heap_free`, `heap_realloc` |
+| Provider dispatch | `provider_open`, `provider_call`, `provider_query`, `provider_close` |
 
-`dev_call` is the extensible entry point for everything else. Most kernel
-services — GPIO, SPI, I2C, PIO, timers, events, buffers, system, UART,
-ADC, PWM, channels (as a class), filesystem dispatch, network interface
-dispatch — are reached through `dev_call` with a class-namespaced opcode.
-See [device_classes.md](device_classes.md) for the full opcode namespace.
+Channel I/O and heap are hot-path typed syscalls. Everything else
+routes through the four `provider_*` entries:
 
-The dedicated entries (`channel_*`, `buffer_*`, `heap_*`) exist for
-operations that are called frequently enough to justify avoiding the
-opcode-dispatch overhead. Functionally, anything in the dedicated entries
-could also be reached via `dev_call` with the corresponding class.
+- `provider_open(contract, open_op, config, len)` returns a handle
+  bound to that contract. The kernel tracks the handle → contract
+  mapping in a per-scheduler-reset table.
+- `provider_call(handle, op, arg, len)` routes through the bound
+  contract's vtable. For handle=-1 global operations and untracked
+  handles, the opcode's high byte carries the contract id and
+  dispatch routes directly through the class chain.
+- `provider_query(handle, key, out, len)` reads introspection state.
+- `provider_close(handle)` invokes the contract's default close
+  opcode (if any) and releases the tracking entry.
+
+There is no `provider_call` surface. The `provider_*` quartet
+is the complete dispatch API. See [abi_layers.md](abi_layers.md)
+for the contract inventory and opcode namespace.
 
 ## What the Kernel Owns vs What Modules Own
 
@@ -243,7 +251,7 @@ The kernel owns:
 - **Bus primitives** — GPIO, SPI, I2C, PIO, UART, timers, DMA
 - **Loader** — module validation, code/rodata layout, syscall table
   injection
-- **Provider dispatch** — `dev_call` routing to registered handlers
+- **Provider dispatch** — `provider_call` routing to registered handlers
   for each device class
 
 The kernel does not own:
@@ -277,17 +285,18 @@ static WS2812_PROGRAM: [u16; 4] = [ /* compiled instructions */ ];
 fn module_new(...) -> i32 {
     // Claim the pin
     let mut pin_arg = [pin, 0];
-    (sys.dev_call)(-1, dev_gpio::REQUEST_OUTPUT, pin_arg.as_mut_ptr(), 2);
+    (sys.provider_open)(HAL_GPIO, gpio::SET_OUTPUT, pin_arg.as_mut_ptr(), 2);
 
-    // Allocate a PIO stream and load the program
-    let stream = (sys.dev_call)(-1, dev_pio::STREAM_ALLOC, null, 0);
-    (sys.dev_call)(stream, dev_pio::LOAD_PROGRAM,
+    // Allocate a PIO stream (provider_open tracks stream → HAL_PIO
+    // so subsequent provider_call(stream, …) routes via the PIO vtable).
+    let stream = (sys.provider_open)(HAL_PIO, pio::STREAM_ALLOC, null, 0);
+    (sys.provider_call)(stream, pio::LOAD_PROGRAM,
                    WS2812_PROGRAM.as_ptr() as *mut u8,
                    WS2812_PROGRAM.len() * 2);
 
     // Configure clock divider, pin, and FIFO mode
     let mut cfg = PioConfig { /* ... */ };
-    (sys.dev_call)(stream, dev_pio::CONFIGURE, &mut cfg as *mut _ as *mut u8,
+    (sys.provider_call)(stream, pio::CONFIGURE, &mut cfg as *mut _ as *mut u8,
                    core::mem::size_of::<PioConfig>());
     0
 }
@@ -296,7 +305,7 @@ fn module_step(state: *mut u8) -> i32 {
     // Read color values from input channel and push to PIO
     let n = (sys.channel_read)(in_chan, color_buf.as_mut_ptr(), buf_max);
     if n > 0 {
-        (sys.dev_call)(stream, dev_pio::PUSH, color_buf.as_ptr(), n as usize);
+        (sys.provider_call)(stream, pio::PUSH, color_buf.as_ptr(), n as usize);
     }
     0
 }
@@ -374,7 +383,7 @@ with the union of every supported peripheral.
 
 ## Related Documentation
 
-- [device_classes.md](device_classes.md) — `dev_call` opcode namespace and class system
+- [abi_layers.md](abi_layers.md) — ABI layers, contract inventory, provider dispatch
 - [pipeline.md](pipeline.md) — graph runner, channel mechanics, scheduler
 - [events.md](events.md) — IRQ binding and interrupt-driven driver pattern
 - [pin_allocation.md](pin_allocation.md) — config-driven pin and bus assignment

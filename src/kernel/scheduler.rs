@@ -812,10 +812,15 @@ pub struct SchedulerState {
     finished: [bool; MAX_MODULES],
     /// Per-module arena allocations
     arenas: [ArenaInfo; MAX_MODULES],
-    /// Per-module capability class (checked by dev_call)
+    /// Per-module capability class (checked on provider dispatch)
     cap_class: [u8; MAX_MODULES],
-    /// Per-module required_caps bitmask from manifest
+    /// Per-module required_caps bitmask from manifest — public contract bits only
     required_caps: [u32; MAX_MODULES],
+    /// Per-module fine-grained permissions bitmap (from manifest binary
+    /// byte 15). Gates privileged 0x0Cxx opcodes by category — see the
+    /// `permission` module in `syscalls.rs`. Separate from `required_caps`
+    /// so non-contract permissions don't overload the contract bitmask.
+    permissions: [u8; MAX_MODULES],
     /// Per-module mailbox_safe flag (header flags bit 0): can consume from mailbox
     mailbox_safe: [bool; MAX_MODULES],
     /// Per-module in_place_writer flag (header flags bit 1): uses acquire_inplace
@@ -895,6 +900,7 @@ impl SchedulerState {
             arenas: [const { ArenaInfo::empty() }; MAX_MODULES],
             cap_class: [0; MAX_MODULES],
             required_caps: [0; MAX_MODULES],
+            permissions: [0; MAX_MODULES],
             mailbox_safe: [false; MAX_MODULES],
             in_place_writer: [false; MAX_MODULES],
             deferred_ready: [false; MAX_MODULES],
@@ -941,6 +947,7 @@ impl SchedulerState {
             self.arenas[i] = ArenaInfo::empty();
             self.cap_class[i] = 0;
             self.required_caps[i] = 0;
+            self.permissions[i] = 0;
             self.mailbox_safe[i] = false;
             self.in_place_writer[i] = false;
             self.deferred_ready[i] = false;
@@ -1019,7 +1026,8 @@ pub fn set_current_module(idx: usize) {
 /// Get the state pointer for a module by index.
 /// Returns null if the slot is empty or not a dynamic module.
 /// State pointer for the module currently being instantiated (set during module_new).
-/// Allows REGISTER_PROVIDER to find the state before the module is stored in SCHED.
+/// Lets syscalls made from inside `module_new()` find the module by
+/// index → state pointer (e.g. heap ops, provider registration).
 static mut INSTANTIATION_STATE: *mut u8 = core::ptr::null_mut();
 static mut INSTANTIATION_IDX: usize = usize::MAX;
 
@@ -1036,7 +1044,7 @@ pub fn clear_instantiation_state() {
 /// Persistent per-module state-pointer shadow. The RP path populates
 /// `SCHED.modules` directly, but the bcm2712 domain-instantiator keeps
 /// modules in `DOMAIN_MODULES` and leaves `SCHED.modules` empty — so a
-/// late-bound registration syscall (e.g. `NVME_BACKING_ENABLE` in
+/// late-bound registration syscall (e.g. `BACKING_PROVIDER_ENABLE` in
 /// `step_ready`, long after `module_new`) can't find the state through
 /// `SCHED.modules`. This shadow is set by both paths and read as the
 /// second-choice source in `get_module_state`.
@@ -1071,17 +1079,27 @@ pub fn get_module_state(idx: usize) -> *mut u8 {
 }
 
 /// Return the capability class of the module currently being stepped.
-/// Used by dev_call to enforce device class access restrictions.
+/// Used by `check_contract_grant` to gate `provider_*` dispatch.
 pub fn current_module_cap_class() -> u8 {
     let idx = current_module_index();
     unsafe { SCHED.cap_class[idx] }
 }
 
 /// Return the required_caps bitmask of the module currently being stepped.
-/// Bit N set = module declared it needs device class N in its manifest.
+/// Bit N set = module declared it needs contract id N in its manifest.
+/// Contract bits only — internal-orchestration permission is in
+/// `current_module_internal_permission`.
 pub fn current_module_required_caps() -> u32 {
     let idx = current_module_index();
     unsafe { SCHED.required_caps[idx] }
+}
+
+/// Return the fine-grained permission bitmap of the module currently
+/// being stepped. Each bit corresponds to a privileged-opcode category
+/// — see the `permission` module in `syscalls.rs`.
+pub fn current_module_permissions() -> u8 {
+    let idx = current_module_index();
+    unsafe { SCHED.permissions[idx] }
 }
 
 /// Return the export table info for a module by index.
@@ -1117,12 +1135,15 @@ pub fn module_code_region(idx: usize) -> (usize, u32) {
     }
 }
 
-/// Set the capability class and required_caps for a module (used by Linux platform loader).
-pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32) {
+/// Set the capability class, required_caps, and permissions bitmap for
+/// a module (used by the Linux / bcm2712 platform loaders when they
+/// stage modules from their embedded images).
+pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permissions: u8) {
     if idx >= MAX_MODULES { return; }
     unsafe {
         SCHED.cap_class[idx] = cap_class;
         SCHED.required_caps[idx] = required_caps;
+        SCHED.permissions[idx] = permissions;
     }
 }
 
@@ -1205,7 +1226,7 @@ pub fn domain_module_count(domain_id: usize) -> usize {
 }
 
 /// Report a module's processing latency in frames.
-/// Called by modules during init via dev_call(SYSTEM::REPORT_LATENCY).
+/// Called by modules during init via the REPORT_LATENCY kernel primitive.
 pub fn report_module_latency(module_idx: usize, frames: u32) {
     if module_idx < MAX_MODULES {
         unsafe { SCHED.module_latency[module_idx] = frames; }
@@ -1263,7 +1284,7 @@ pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
     0
 }
 
-/// Get fault statistics for a module (for dev_query FAULT_STATS).
+/// Get fault statistics for a module (for `provider_query` FAULT_STATS).
 pub fn get_fault_stats(module_idx: usize) -> FaultStats {
     if module_idx >= MAX_MODULES {
         return FaultStats::default();
@@ -1392,9 +1413,8 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     reset_state_arena();
     crate::kernel::buffer_pool::reset_buffer_arena();
     NameArena::reset();
-    crate::kernel::blob_store::unregister();
-    crate::kernel::graph_slot::unregister();
-    crate::kernel::nvme_backing::unregister();
+    crate::kernel::backing_provider::unregister();
+    crate::kernel::provider::reset_handle_tracking();
     sched.reset();
 
     // Store graph-level sample rate from config header
@@ -1923,6 +1943,7 @@ pub fn instantiate_one_module(
             _ => 0,  // Source, Transformer → CAP_SERVICE
         };
         sched.required_caps[instantiated] = found_module.header.required_caps() as u32;
+        sched.permissions[instantiated] = found_module.manifest_permissions();
         // Store export table info for resolve_export_for_module
         sched.module_code_base[instantiated] = found_module.code_base() as usize;
         sched.module_code_size[instantiated] = found_module.header.code_size;
@@ -1980,8 +2001,10 @@ pub fn instantiate_one_module(
         }
     }
 
-    // Full instantiation via start_new
-    // Set current module index so REGISTER_PROVIDER can identify us
+    // Full instantiation via start_new.
+    // Set current module index so any syscall made from inside
+    // module_new() can identify the calling module (state pointer,
+    // heap, required_caps, loader-driven provider registration).
     set_current_module(instantiated);
     let result = unsafe {
         let pb = core::ptr::addr_of!(PARAM_BUFFER);

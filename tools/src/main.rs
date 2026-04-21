@@ -2061,7 +2061,8 @@ fn cmd_sign(input: &PathBuf, key_path: &PathBuf, output: Option<&std::path::Path
 
     let fmod = fs::read(input)
         .map_err(|e| Error::Module(format!("read {}: {}", input.display(), e)))?;
-    if fmod.len() < 68 {
+    use modules::MODULE_HEADER_SIZE;
+    if fmod.len() < MODULE_HEADER_SIZE {
         return Err(Error::Module("fmod file too small".into()));
     }
 
@@ -2073,7 +2074,6 @@ fn cmd_sign(input: &PathBuf, key_path: &PathBuf, output: Option<&std::path::Path
     let schema_size = u16::from_le_bytes([fmod[62], fmod[63]]) as usize;
     let manifest_size = u16::from_le_bytes([fmod[64], fmod[65]]) as usize;
 
-    const MODULE_HEADER_SIZE: usize = 68;
     let manifest_offset = MODULE_HEADER_SIZE + code_size + data_size + export_table_size + schema_size;
     if manifest_offset + manifest_size > fmod.len() {
         return Err(Error::Module("fmod truncated before manifest".into()));

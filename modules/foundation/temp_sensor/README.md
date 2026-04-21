@@ -19,7 +19,7 @@ direction = "output"
 content_type = "OctetStream"
 
 [[resources]]
-device_class = "adc"
+requires_contract = "adc"
 access = "read"
 ```
 

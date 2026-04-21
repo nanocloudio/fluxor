@@ -1,0 +1,7 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "rp2040"]
+permissions = ["platform_raw"]
+
+[[resources]]
+requires_contract = "platform_dma"
+access = "exclusive"

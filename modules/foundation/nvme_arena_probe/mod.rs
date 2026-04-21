@@ -1,11 +1,13 @@
-//! NVMe arena probe — end-to-end test for Phase 4 (`BackingType::Nvme`).
+//! NVMe arena probe — end-to-end test for paged arenas with a
+//! driver-backed external provider (`BackingType::External`).
 //!
-//! Registers a small NVMe-backed arena, writes a deterministic pattern
-//! into each virtual page, flushes, reads the pages back, and compares.
-//! Reports progress + pass/fail via the heartbeat log line.
+//! Registers a small arena (backing_type=External), writes a
+//! deterministic pattern into each virtual page, flushes, reads the
+//! pages back, and compares. Reports progress + pass/fail via the
+//! heartbeat log line.
 //!
 //! Must be wired downstream of the `nvme` module in the graph so that
-//! `nvme_backing_dispatch` is registered before our first `_WRITE`
+//! `backing_provider_dispatch` is registered before our first `_WRITE`
 //! call. Exports `module_deferred_ready` so the scheduler gates our
 //! first step until `nvme` has returned Ready.
 //!
@@ -37,7 +39,7 @@ include!("../../sdk/params.rs");
 const PAGE_BYTES: usize = 4096;
 const PAGE_WORDS: usize = PAGE_BYTES / 4;
 
-const BACKING_NVME: u8 = 2;
+const BACKING_EXTERNAL: u8 = 2;
 const WB_DEFERRED:  u8 = 0;
 
 /// Arena LBA base the kernel carves for the FIRST NVMe-backed arena.
@@ -256,19 +258,20 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
     match s.state {
         ST_INIT => {
-            // Register a fresh Nvme arena. Passing resident_max == pages
-            // is fine; the backing store doesn't actually allocate
-            // physical pages on registration — it just reserves an LBA
-            // span. nvme_backing::ready() is checked at each
-            // backing_read/write call, so if the nvme dispatch isn't
-            // registered yet we'd get ENODEV on the first write — but
-            // since we export module_deferred_ready, the scheduler
-            // should block our step until nvme upstream is Ready.
+            // Register a fresh External-backed arena. Passing
+            // resident_max == pages is fine; the backing store doesn't
+            // actually allocate physical pages on registration — it
+            // just reserves a page span. backing_provider::ready() is
+            // checked at each backing_read/write call, so if the
+            // driver dispatch isn't registered yet we'd get ENODEV on
+            // the first write — but since we export
+            // `module_deferred_ready`, the scheduler should block our
+            // step until the nvme upstream is Ready.
             let rc = dev_backing_arena_register(
                 sys,
                 s.pages as u32,
                 s.pages as u32,
-                BACKING_NVME,
+                BACKING_EXTERNAL,
                 WB_DEFERRED,
             );
             if rc < 0 {

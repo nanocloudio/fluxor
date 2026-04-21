@@ -85,7 +85,7 @@ fn linux_isr_tier_poll() {}
 fn linux_init_providers() {
     // Override the default stub FS provider with one backed by real libc I/O.
     use fluxor::kernel::provider;
-    use fluxor::abi::dev_class;
+    use fluxor::kernel::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
 }
 fn linux_release_module_handles(_module_idx: u8) {}
@@ -235,7 +235,7 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
 /// Same convention as the bare-metal sd module: OPEN returns slot index,
 /// subsequent ops use that slot index as handle.
 unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use fluxor::abi::dev_fs;
+    use fluxor::abi::contracts::storage::fs as dev_fs;
     use fluxor::kernel::errno;
 
     match opcode {
@@ -336,13 +336,24 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }
+            if arg.is_null() || arg_len < 8 {
+                return errno::EINVAL;
+            }
             let mut stat: libc::stat = core::mem::zeroed();
             let ret = libc::fstat(files[slot_idx].fd, &mut stat);
             if ret < 0 {
                 return errno::ERROR;
             }
-            // Return file size (truncated to i32)
-            stat.st_size as i32
+            // Contract: write [size: u32 LE, mtime: u32 LE] into arg.
+            let size = (stat.st_size as u64).min(u32::MAX as u64) as u32;
+            let mtime = stat.st_mtime as u32;
+            let size_b = size.to_le_bytes();
+            let mtime_b = mtime.to_le_bytes();
+            *arg = size_b[0]; *arg.add(1) = size_b[1];
+            *arg.add(2) = size_b[2]; *arg.add(3) = size_b[3];
+            *arg.add(4) = mtime_b[0]; *arg.add(5) = mtime_b[1];
+            *arg.add(6) = mtime_b[2]; *arg.add(7) = mtime_b[3];
+            errno::OK
         }
         dev_fs::FSYNC => {
             let slot_idx = handle as usize;
@@ -865,8 +876,8 @@ fn main() {
     log::info!("[loader] module table loaded");
 
     // Create channels from graph edges and register ports via set_module_port.
-    // This supports multi-port modules (e.g. linux_net.net_out, ip.net_in).
-    // Legacy: also track port-0 in/out/ctrl for DynamicModule::start_new().
+    // Supports multi-port modules (e.g. linux_net.net_out, ip.net_in).
+    // Also tracks port-0 in/out/ctrl for DynamicModule::start_new().
     let mut mod_in: [i32; MAX_MODS] = [-1; MAX_MODS];
     let mut mod_out: [i32; MAX_MODS] = [-1; MAX_MODS];
     let mut mod_ctrl: [i32; MAX_MODS] = [-1; MAX_MODS];
@@ -939,7 +950,12 @@ fn main() {
                 let cap_class = match m.header.module_type {
                     5 => 3, 3 => 1, 4 => 2, _ => 0,
                 };
-                scheduler::set_module_caps(i, cap_class, m.header.required_caps() as u32);
+                scheduler::set_module_caps(
+                    i,
+                    cap_class,
+                    m.header.required_caps() as u32,
+                    m.manifest_permissions(),
+                );
 
                 let result = unsafe {
                     DynamicModule::start_new(

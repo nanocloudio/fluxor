@@ -1,5 +1,6 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "rp2040", "bcm2712"]
+permissions = ["reconfigure", "monitor"]
 
 [[ports]]
 name = "trigger"
@@ -11,7 +12,3 @@ required = true
 name = "status"
 direction = "output"
 content_type = "OctetStream"
-
-[[resources]]
-device_class = "system"
-access = "write"

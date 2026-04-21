@@ -54,5 +54,5 @@ direction = "ctrl_input"
 content_type = "FmpMessage"
 
 [[resources]]
-device_class = "channel"
+requires_contract = "channel"
 access = "read"

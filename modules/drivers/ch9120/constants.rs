@@ -34,7 +34,7 @@ pub const MODE_UDP_SERVER: u8 = 2;
 pub const MODE_UDP_CLIENT: u8 = 3;
 
 // ============================================================================
-// dev_call Opcodes
+// HAL_UART contract opcodes
 // ============================================================================
 
 // GPIO
@@ -48,16 +48,6 @@ pub const DEV_UART_CLOSE: u32 = 0x0D01;
 pub const DEV_UART_WRITE: u32 = 0x0D02;
 pub const DEV_UART_READ: u32 = 0x0D03;
 pub const DEV_UART_POLL: u32 = 0x0D04;
-
-// Netif
-pub const DEV_NETIF_OPEN: u32 = 0x0700;
-pub const DEV_NETIF_IOCTL: u32 = 0x0705;
-
-// ============================================================================
-// Netif Constants
-// ============================================================================
-
-pub const NETIF_TYPE_ETHERNET: u8 = 2;
 
 // ============================================================================
 // Timing

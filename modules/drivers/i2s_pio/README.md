@@ -22,12 +22,12 @@ content_type = "AudioPcm"
 required = true
 
 [[resources]]
-device_class = "pio"
+requires_contract = "pio"
 access = "exclusive"
 instance = 0
 
 [[resources]]
-device_class = "gpio"
+requires_contract = "gpio"
 access = "write"
 ```
 

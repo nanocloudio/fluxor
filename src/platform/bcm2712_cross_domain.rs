@@ -48,9 +48,6 @@ const RING_MASK: u32 = (RING_SLOTS - 1) as u32;
 /// Size of each slot's data payload in bytes.
 pub const SLOT_DATA_SIZE: usize = 60;
 
-/// Legacy alias for max payload size per message.
-pub const CHANNEL_DATA_SIZE: usize = SLOT_DATA_SIZE;
-
 /// Non-cacheable DMA buffer arena size (64 KB).
 pub const DMA_ARENA_SIZE: usize = 64 * 1024;
 
