@@ -50,7 +50,7 @@ const PCIE_MMIO_BASE: usize = 0x4000_0000;
 /// BCM2712 PCIe2 (RP1, x4) controller base — matches mainline DTS node
 /// `pcie@120000` under the soc `ranges = <0 0x10 0 0x80000000>` mapping,
 /// and matches `PCIE_RC_BASE` in `bcm2712.rs`.
-pub const BCM2712_PCIE2_RC_BASE:   u64 = 0x10_0012_0000;
+pub const BCM2712_PCIE2_RC_BASE: u64 = 0x10_0012_0000;
 
 /// BCM2712 PCIe2 outbound MMIO window (RP1 BAR region after VPU
 /// configuration; Linux remaps to `0x1f_0000_0000` post-handoff — the
@@ -59,7 +59,7 @@ pub const BCM2712_PCIE2_MMIO_BASE: u64 = 0x1C_0000_0000;
 
 /// BCM2712 PCIe1 (external x1, NVMe HAT+) controller base — mainline DTS
 /// node `pcie@114000`.
-pub const BCM2712_PCIE1_RC_BASE:   u64 = 0x10_0011_0000;
+pub const BCM2712_PCIE1_RC_BASE: u64 = 0x10_0011_0000;
 
 /// BCM2712 PCIe1 outbound MMIO window base. Verified on Pi 5 base
 /// board (6.12 rpt kernel, 2026-04-16) via `dmesg | grep 1000110000`:
@@ -112,9 +112,14 @@ pub struct PcieDevice {
 impl PcieDevice {
     const fn empty() -> Self {
         Self {
-            bus: 0, dev: 0, func: 0,
-            vendor_id: 0, device_id: 0, class: 0,
-            bars: [0; MAX_BARS], bar_sizes: [0; MAX_BARS],
+            bus: 0,
+            dev: 0,
+            func: 0,
+            vendor_id: 0,
+            device_id: 0,
+            class: 0,
+            bars: [0; MAX_BARS],
+            bar_sizes: [0; MAX_BARS],
             nic_type: PcieNicType::Unknown,
         }
     }
@@ -144,7 +149,13 @@ struct BarMap {
 
 impl BarMap {
     const fn empty() -> Self {
-        Self { bdf: 0, bar_idx: 0, virt_addr: 0, size: 0, active: false }
+        Self {
+            bdf: 0,
+            bar_idx: 0,
+            virt_addr: 0,
+            size: 0,
+            active: false,
+        }
     }
 }
 
@@ -163,16 +174,20 @@ static mut BAR_MAPS: [BarMap; MAX_BAR_MAPS] = [const { BarMap::empty() }; MAX_BA
 #[cfg(feature = "board-cm5")]
 unsafe fn ecam_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
     let addr = ECAM_BASE
-        + ((bus as usize) << 20) + ((dev as usize) << 15)
-        + ((func as usize) << 12) + (offset as usize & 0xFFC);
+        + ((bus as usize) << 20)
+        + ((dev as usize) << 15)
+        + ((func as usize) << 12)
+        + (offset as usize & 0xFFC);
     core::ptr::read_volatile(addr as *const u32)
 }
 
 #[cfg(feature = "board-cm5")]
 unsafe fn ecam_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
     let addr = ECAM_BASE
-        + ((bus as usize) << 20) + ((dev as usize) << 15)
-        + ((func as usize) << 12) + (offset as usize & 0xFFC);
+        + ((bus as usize) << 20)
+        + ((dev as usize) << 15)
+        + ((func as usize) << 12)
+        + (offset as usize & 0xFFC);
     core::ptr::write_volatile(addr as *mut u32, val);
 }
 
@@ -216,14 +231,14 @@ unsafe fn ecam_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
 // at +0x18+0x00, SW_INIT_CLEAR at +0x18+0x04, STATUS at +0x18+0x08.
 
 #[cfg(feature = "board-cm5")]
-const RESCAL_BASE:       u64 = 0x10_0011_9500;
+const RESCAL_BASE: u64 = 0x10_0011_9500;
 #[cfg(feature = "board-cm5")]
-const RESCAL_START:      u64 = 0x00;
+const RESCAL_START: u64 = 0x00;
 #[cfg(feature = "board-cm5")]
-const RESCAL_STATUS:     u64 = 0x08;
+const RESCAL_STATUS: u64 = 0x08;
 
 #[cfg(feature = "board-cm5")]
-const BCM_RESET_BASE:    u64 = 0x10_0150_4318;
+const BCM_RESET_BASE: u64 = 0x10_0150_4318;
 #[cfg(feature = "board-cm5")]
 const BCM_RESET_PCIE1_BANK_OFF: u64 = 0x18;
 #[cfg(feature = "board-cm5")]
@@ -231,80 +246,80 @@ const BCM_RESET_PCIE1_BIT: u32 = 1 << 11;
 
 #[cfg(feature = "board-cm5")]
 mod brcm {
-    pub const EXT_CFG_DATA:       u64 = 0x8000;
-    pub const EXT_CFG_INDEX:      u64 = 0x9000;
+    pub const EXT_CFG_DATA: u64 = 0x8000;
+    pub const EXT_CFG_INDEX: u64 = 0x9000;
 
     /// `PCIE_MISC_MISC_CTRL` — controller-wide behaviour bits. Linux's
     /// `brcm_pcie_setup` writes this early in probe; without SCB_ACCESS_EN
     /// the controller rejects configuration cycles from the CPU.
-    pub const MISC_CTRL:            u64 = 0x4008;
-    pub const CTRL_SCB_ACCESS_EN:   u32 = 1 << 12;
-    pub const CTRL_CFG_READ_UR:     u32 = 1 << 13;
-    pub const CTRL_RCB_MPS_MODE:    u32 = 1 << 10;
-    pub const CTRL_RCB_64B_MODE:    u32 = 1 << 7;
+    pub const MISC_CTRL: u64 = 0x4008;
+    pub const CTRL_SCB_ACCESS_EN: u32 = 1 << 12;
+    pub const CTRL_CFG_READ_UR: u32 = 1 << 13;
+    pub const CTRL_RCB_MPS_MODE: u32 = 1 << 10;
+    pub const CTRL_RCB_64B_MODE: u32 = 1 << 7;
     /// MAX_BURST_SIZE field [21:20]: 0=128B, 1=256B, 2=512B.
-    pub const CTRL_MAX_BURST_512:   u32 = 0x2 << 20;
-    pub const CTRL_MAX_BURST_MASK:  u32 = 0x3 << 20;
+    pub const CTRL_MAX_BURST_512: u32 = 0x2 << 20;
+    pub const CTRL_MAX_BURST_MASK: u32 = 0x3 << 20;
 
-    pub const MEM_WIN0_LO:          u64 = 0x400c;
-    pub const MEM_WIN0_HI:          u64 = 0x4010;
-    pub const MEM_WIN0_BASE_LIMIT:  u64 = 0x4070;
-    pub const MEM_WIN0_BASE_HI:     u64 = 0x4080;
-    pub const MEM_WIN0_LIMIT_HI:    u64 = 0x4084;
+    pub const MEM_WIN0_LO: u64 = 0x400c;
+    pub const MEM_WIN0_HI: u64 = 0x4010;
+    pub const MEM_WIN0_BASE_LIMIT: u64 = 0x4070;
+    pub const MEM_WIN0_BASE_HI: u64 = 0x4080;
+    pub const MEM_WIN0_LIMIT_HI: u64 = 0x4084;
 
     /// RC link-up status register. Bit 4 = PHYLINKUP, bit 5 = DL_ACTIVE.
     /// Both must be set for the link to be usable.
-    pub const MISC_PCIE_STATUS:     u64 = 0x4068;
-    pub const STATUS_PHYLINKUP:     u32 = 1 << 4;
-    pub const STATUS_DL_ACTIVE:     u32 = 1 << 5;
+    pub const MISC_PCIE_STATUS: u64 = 0x4068;
+    pub const STATUS_PHYLINKUP: u32 = 1 << 4;
+    pub const STATUS_DL_ACTIVE: u32 = 1 << 5;
 
     /// Control register. Bit 2 = PCIE_PERSTB (active-high: 1 = PERST#
     /// deasserted / card out of reset). VPU on Pi 5 leaves this clear
     /// for non-Linux kernel handoff — matching brcm_pcie_perst_set_2712,
     /// we set it to release the downstream device.
-    pub const MISC_PCIE_CTRL:       u64 = 0x4064;
-    pub const CTRL_PERSTB:          u32 = 1 << 2;
+    pub const MISC_PCIE_CTRL: u64 = 0x4064;
+    pub const CTRL_PERSTB: u32 = 1 << 2;
 
     /// PCIe1 outbound window: CPU 0x1B_8000_0000..0x1B_FFFF_FFFF (2 GB)
     /// maps to PCI bus addresses 0x8000_0000..0xFFFF_FFFF. Matches what
     /// Linux's brcm-pcie driver programs when `dtparam=pciex1` is active.
-    pub const PCIE1_OUTBOUND_CPU_BASE:  u64 = 0x1B_8000_0000;
+    pub const PCIE1_OUTBOUND_CPU_BASE: u64 = 0x1B_8000_0000;
     pub const PCIE1_OUTBOUND_CPU_LIMIT: u64 = 0x1B_FFFF_FFFF;
-    pub const PCIE1_OUTBOUND_PCI_BASE:  u64 = 0x0000_0000_8000_0000;
+    pub const PCIE1_OUTBOUND_PCI_BASE: u64 = 0x0000_0000_8000_0000;
 
     // Stage-4 (brcm_pcie_setup / post_setup / start_link) registers.
-    pub const HARD_DEBUG:             u64 = 0x4304;
+    pub const HARD_DEBUG: u64 = 0x4304;
     pub const HARD_DEBUG_SERDES_IDDQ: u32 = 1 << 21;
     pub const HARD_DEBUG_CLKREQ_MASK: u32 = (1 << 1) | (1 << 16) | (1 << 20) | (1 << 21);
 
     pub const RC_CFG_RETRY_TIMEOUT: u64 = 0x405c;
-    pub const PL_PHY_CTL_15:        u64 = 0x184c;
-    pub const AXI_INTF_CTRL:        u64 = 0x416c;
-    pub const AXI_READ_ERR_DATA:    u64 = 0x4170;
-    pub const UBUS_CTRL:            u64 = 0x40a4;
-    pub const UBUS_TIMEOUT:         u64 = 0x40a8;
+    pub const PL_PHY_CTL_15: u64 = 0x184c;
+    pub const AXI_INTF_CTRL: u64 = 0x416c;
+    pub const AXI_READ_ERR_DATA: u64 = 0x4170;
+    pub const UBUS_CTRL: u64 = 0x40a4;
+    pub const UBUS_TIMEOUT: u64 = 0x40a8;
 
-    pub const RC_BAR1_CONFIG_LO:    u64 = 0x402c;
-    pub const RC_BAR1_CONFIG_HI:    u64 = 0x4030;
-    pub const RC_BAR2_CONFIG_LO:    u64 = 0x4034;
-    pub const RC_BAR2_CONFIG_HI:    u64 = 0x4038;
+    pub const RC_BAR1_CONFIG_LO: u64 = 0x402c;
+    pub const RC_BAR1_CONFIG_HI: u64 = 0x4030;
+    pub const RC_BAR2_CONFIG_LO: u64 = 0x4034;
+    pub const RC_BAR2_CONFIG_HI: u64 = 0x4038;
     /// Per-BAR UBUS REMAP registers. REMAP_LO bit 0 = ACCESS_EN,
     /// bits[31:12] = cpu_addr[31:12] (fabric). REMAP_HI = cpu_addr high
     /// bits. When ACCESS_EN is set the REMAP value overrides the
     /// cpu_addr that RC_BAR(i)_CONFIG otherwise supplies. This is the
     /// actual DMA-target register on BCM7712 (see upstream
     /// `set_inbound_win_registers` + BCM7712 branch in pcie-brcmstb.c).
-    pub const UBUS_BAR1_REMAP_LO:   u64 = 0x40ac;
-    pub const UBUS_BAR1_REMAP_HI:   u64 = 0x40b0;
-    pub const UBUS_BAR2_REMAP_LO:   u64 = 0x40b4;
-    pub const UBUS_BAR2_REMAP_HI:   u64 = 0x40b8;
+    pub const UBUS_BAR1_REMAP_LO: u64 = 0x40ac;
+    pub const UBUS_BAR1_REMAP_HI: u64 = 0x40b0;
+    pub const UBUS_BAR2_REMAP_LO: u64 = 0x40b4;
+    pub const UBUS_BAR2_REMAP_HI: u64 = 0x40b8;
     pub const UBUS_REMAP_ACCESS_EN: u32 = 1 << 0;
 
     // MDIO indirect register-access protocol (brcm_pcie_mdio_write).
-    pub const MDIO_ADDR:            u64 = 0x1100;
-    pub const MDIO_WR_DATA:         u64 = 0x1104;
-    pub const MDIO_DATA_DONE:       u32 = 1 << 31;
-    pub const MDIO_SET_ADDR_OFFSET: u8  = 0x1f;
+    pub const MDIO_ADDR: u64 = 0x1100;
+    pub const MDIO_WR_DATA: u64 = 0x1104;
+    pub const MDIO_DATA_DONE: u32 = 1 << 31;
+    pub const MDIO_SET_ADDR_OFFSET: u8 = 0x1f;
 
     // --- brcmstb MSI controller (Linux pcie-brcmstb.c v6.12) ---
     //
@@ -316,30 +331,30 @@ mod brcm {
     // On BCM7712 (Pi 5) the MSI block lives at MSI_INTR2_BASE (0x4500)
     // with 32 vectors; the legacy INTR2_CPU path is for older silicon
     // and is not supported here.
-    pub const MSI_BAR_CONFIG_LO:      u64 = 0x4044;
-    pub const MSI_BAR_CONFIG_HI:      u64 = 0x4048;
-    pub const MSI_DATA_CONFIG:        u64 = 0x404c;
+    pub const MSI_BAR_CONFIG_LO: u64 = 0x4044;
+    pub const MSI_BAR_CONFIG_HI: u64 = 0x4048;
+    pub const MSI_DATA_CONFIG: u64 = 0x404c;
     /// Match-mask (top 16) | match-value (bottom 16).
     pub const MSI_DATA_CONFIG_VAL_32: u32 = 0xffe0_6540;
     /// Bit 0 of MSI_BAR_CONFIG_LO doubles as the MSI-Enable bit.
-    pub const MSI_BAR_ENABLE:         u32 = 0x1;
+    pub const MSI_BAR_ENABLE: u32 = 0x1;
     /// RC-internal address the endpoint posts MSI writes to (the RC
     /// intercepts and never forwards to DRAM).
-    pub const MSI_TARGET_ADDR:        u64 = 0x0_FFFF_FFFC;
+    pub const MSI_TARGET_ADDR: u64 = 0x0_FFFF_FFFC;
 
     /// Offsets inside the MSI intr block: STATUS, CLR, MASK_SET/CLR.
-    pub const MSI_INTR2_BASE:   u64 = 0x4500;
-    pub const MSI_INT_STATUS:   u64 = 0x0;
-    pub const MSI_INT_CLR:      u64 = 0x8;
+    pub const MSI_INTR2_BASE: u64 = 0x4500;
+    pub const MSI_INT_STATUS: u64 = 0x0;
+    pub const MSI_INT_CLR: u64 = 0x8;
     pub const MSI_INT_MASK_SET: u64 = 0x10;
     pub const MSI_INT_MASK_CLR: u64 = 0x14;
 
     pub const MSI_VECTOR_COUNT: u32 = 32;
-    pub const MSI_MASK_ALL:     u32 = 0xFFFF_FFFF;
+    pub const MSI_MASK_ALL: u32 = 0xFFFF_FFFF;
 
     /// PCIe HW revision register; refuse MSI bring-up below rev 3.3.
     pub const MISC_REVISION: u64 = 0x406c;
-    pub const HW_REV_33:     u32 = 0x0303;
+    pub const HW_REV_33: u32 = 0x0303;
 }
 
 /// Post-probe target values captured on the rig under Linux
@@ -347,19 +362,19 @@ mod brcm {
 /// these verbatim so the Fluxor state converges on `brcm_pcie_probe`.
 #[cfg(feature = "board-cm5")]
 mod post_probe {
-    pub const MISC_CTRL:          u32 = 0x00263480;
-    pub const RC_CFG_RETRY:       u32 = 0x0ABA0000;
-    pub const PL_PHY_CTL_15:      u32 = 0x4DBC0012;
-    pub const AXI_INTF_CTRL:      u32 = 0x0000004F;
-    pub const AXI_READ_ERR_DATA:  u32 = 0xFFFFFFFF;
-    pub const UBUS_CTRL:          u32 = 0x00082000;
-    pub const UBUS_TIMEOUT:       u32 = 0x0B2D0000;
-    pub const RC_BAR1_LO:           u32 = 0x00000015;
-    pub const RC_BAR1_HI:           u32 = 0x00000010;
-    pub const RC_BAR2_LO:           u32 = 0xFFFFF01C;
-    pub const RC_BAR2_HI:           u32 = 0x000000FF;
-    pub const UBUS_BAR2_REMAP_LO:   u32 = 0x00131001;
-    pub const UBUS_BAR2_REMAP_HI:   u32 = 0x00000010;
+    pub const MISC_CTRL: u32 = 0x00263480;
+    pub const RC_CFG_RETRY: u32 = 0x0ABA0000;
+    pub const PL_PHY_CTL_15: u32 = 0x4DBC0012;
+    pub const AXI_INTF_CTRL: u32 = 0x0000004F;
+    pub const AXI_READ_ERR_DATA: u32 = 0xFFFFFFFF;
+    pub const UBUS_CTRL: u32 = 0x00082000;
+    pub const UBUS_TIMEOUT: u32 = 0x0B2D0000;
+    pub const RC_BAR1_LO: u32 = 0x00000015;
+    pub const RC_BAR1_HI: u32 = 0x00000010;
+    pub const RC_BAR2_LO: u32 = 0xFFFFF01C;
+    pub const RC_BAR2_HI: u32 = 0x000000FF;
+    pub const UBUS_BAR2_REMAP_LO: u32 = 0x00131001;
+    pub const UBUS_BAR2_REMAP_HI: u32 = 0x00000010;
 }
 
 #[cfg(feature = "board-cm5")]
@@ -409,17 +424,20 @@ unsafe fn pcie1_program_outbound() {
 
     // MEM_WIN0_LO/HI: PCI-side base address (low/high 32).
     rc_w32(rc, brcm::MEM_WIN0_LO, brcm::PCIE1_OUTBOUND_PCI_BASE as u32);
-    rc_w32(rc, brcm::MEM_WIN0_HI, (brcm::PCIE1_OUTBOUND_PCI_BASE >> 32) as u32);
+    rc_w32(
+        rc,
+        brcm::MEM_WIN0_HI,
+        (brcm::PCIE1_OUTBOUND_PCI_BASE >> 32) as u32,
+    );
 
     // BASE_LIMIT: CPU-side base+limit in 1 MB units. Bits [15:4] = base_mb,
     // bits [31:20] = limit_mb (both mask to 12 bits — the high bits go into
     // BASE_HI / LIMIT_HI).
-    let base_mb  = (brcm::PCIE1_OUTBOUND_CPU_BASE  >> 20) as u32;
+    let base_mb = (brcm::PCIE1_OUTBOUND_CPU_BASE >> 20) as u32;
     let limit_mb = (brcm::PCIE1_OUTBOUND_CPU_LIMIT >> 20) as u32;
-    let base_limit = ((base_mb  & 0xFFF) <<  4)
-                   | ((limit_mb & 0xFFF) << 20);
+    let base_limit = ((base_mb & 0xFFF) << 4) | ((limit_mb & 0xFFF) << 20);
     rc_w32(rc, brcm::MEM_WIN0_BASE_LIMIT, base_limit);
-    rc_w32(rc, brcm::MEM_WIN0_BASE_HI,  (base_mb  >> 12) as u32);
+    rc_w32(rc, brcm::MEM_WIN0_BASE_HI, (base_mb >> 12) as u32);
     rc_w32(rc, brcm::MEM_WIN0_LIMIT_HI, (limit_mb >> 12) as u32);
 }
 
@@ -443,13 +461,21 @@ unsafe fn pcie1_probe_bar0(rc: u64, bus: u8, dev: u8) -> (bool, bool, u64) {
 
     // Write all-ones; for 64-bit BARs do both halves before reading
     // back so the probe doesn't race hardware aliasing.
-    let original_hi = if is_64b { cfg_r32(rc, bus, dev, 0, 0x14) } else { 0 };
+    let original_hi = if is_64b {
+        cfg_r32(rc, bus, dev, 0, 0x14)
+    } else {
+        0
+    };
     cfg_w32(rc, bus, dev, 0, 0x10, 0xFFFF_FFFF);
     if is_64b {
         cfg_w32(rc, bus, dev, 0, 0x14, 0xFFFF_FFFF);
     }
     let probe_lo = cfg_r32(rc, bus, dev, 0, 0x10);
-    let probe_hi = if is_64b { cfg_r32(rc, bus, dev, 0, 0x14) } else { 0 };
+    let probe_hi = if is_64b {
+        cfg_r32(rc, bus, dev, 0, 0x14)
+    } else {
+        0
+    };
 
     // Restore original BAR contents so we leave the device in its
     // pre-probe state; the caller will rewrite with the chosen
@@ -461,7 +487,7 @@ unsafe fn pcie1_probe_bar0(rc: u64, bus: u8, dev: u8) -> (bool, bool, u64) {
 
     // Size: mask off the low 4 flag bits, invert, +1.
     let size_mask_lo = (probe_lo & 0xFFFF_FFF0) as u64;
-    let size_mask    = if is_64b {
+    let size_mask = if is_64b {
         size_mask_lo | ((probe_hi as u64) << 32)
     } else {
         size_mask_lo | 0xFFFF_FFFF_0000_0000u64
@@ -529,7 +555,10 @@ unsafe fn pcie1_enumerate_bus1() {
         if header_type != 0 {
             log::info!(
                 "[pcie1] bus1 dev{} vid={:04x} did={:04x} (bridge, htype={})",
-                dev_num, vendor_id, device_id, header_type
+                dev_num,
+                vendor_id,
+                device_id,
+                header_type
             );
             cfg_w32(rc, 1, dev_num, 0, 0x04, cmd_before | 0x0006);
             pdev.identify_nic();
@@ -548,7 +577,8 @@ unsafe fn pcie1_enumerate_bus1() {
             if aligned + size > limit {
                 log::warn!(
                     "[pcie1] bus1 dev{} BAR0 size={:#x} exceeds outbound window",
-                    dev_num, size
+                    dev_num,
+                    size
                 );
             } else {
                 let bar_lo_flags = cfg_r32(rc, 1, dev_num, 0, 0x10) & 0xF;
@@ -557,8 +587,8 @@ unsafe fn pcie1_enumerate_bus1() {
                 if is_64b {
                     cfg_w32(rc, 1, dev_num, 0, 0x14, (aligned >> 32) as u32);
                 }
-                pdev.bars[0] = brcm::PCIE1_OUTBOUND_CPU_BASE
-                    + (aligned - brcm::PCIE1_OUTBOUND_PCI_BASE);
+                pdev.bars[0] =
+                    brcm::PCIE1_OUTBOUND_CPU_BASE + (aligned - brcm::PCIE1_OUTBOUND_PCI_BASE);
                 pdev.bar_sizes[0] = size;
                 cursor = aligned + size;
             }
@@ -569,7 +599,11 @@ unsafe fn pcie1_enumerate_bus1() {
 
         log::info!(
             "[pcie1] bus1 dev{} vid={:04x} did={:04x} bar0_cpu={:#x} size={:#x}",
-            dev_num, vendor_id, device_id, pdev.bars[0], pdev.bar_sizes[0]
+            dev_num,
+            vendor_id,
+            device_id,
+            pdev.bars[0],
+            pdev.bar_sizes[0]
         );
 
         pdev.identify_nic();
@@ -585,7 +619,9 @@ unsafe fn pcie1_enumerate_bus1() {
 #[cfg(feature = "board-cm5")]
 unsafe fn record_device(pdev: PcieDevice) {
     let count = *core::ptr::addr_of!(DEVICE_COUNT);
-    if count >= MAX_SCAN_DEVS { return; }
+    if count >= MAX_SCAN_DEVS {
+        return;
+    }
     let slot = core::ptr::addr_of_mut!(DEVICES) as *mut PcieDevice;
     core::ptr::write(slot.add(count), pdev);
     core::ptr::write(core::ptr::addr_of_mut!(DEVICE_COUNT), count + 1);
@@ -640,8 +676,12 @@ unsafe fn pcie1_wait_link_up(max_ms: u64) -> u32 {
 
     loop {
         let status = rc_r32(rc, brcm::MISC_PCIE_STATUS);
-        if status & want == want { return status; }
-        if read_cntpct().wrapping_sub(start) > budget { return status; }
+        if status & want == want {
+            return status;
+        }
+        if read_cntpct().wrapping_sub(start) > budget {
+            return status;
+        }
     }
 }
 
@@ -674,9 +714,7 @@ unsafe fn timer_freq_hz() -> u64 {
 #[cfg(feature = "board-cm5")]
 unsafe fn pcie1_mdio_write(port: u8, regad: u8, wrdata: u16) -> bool {
     let rc = BCM2712_PCIE1_RC_BASE;
-    let pkt = (((port as u32 >> 4) & 1) << 21)
-            | (((port as u32) & 0xf) << 16)
-            | (regad as u32);
+    let pkt = (((port as u32 >> 4) & 1) << 21) | (((port as u32) & 0xf) << 16) | (regad as u32);
     rc_w32(rc, brcm::MDIO_ADDR, pkt);
     let _ = rc_r32(rc, brcm::MDIO_ADDR); // barrier read
     rc_w32(rc, brcm::MDIO_WR_DATA, brcm::MDIO_DATA_DONE | wrdata as u32);
@@ -686,8 +724,12 @@ unsafe fn pcie1_mdio_write(port: u8, regad: u8, wrdata: u16) -> bool {
     let t0 = read_cntpct();
     loop {
         let v = rc_r32(rc, brcm::MDIO_WR_DATA);
-        if v & brcm::MDIO_DATA_DONE == 0 { return true; }
-        if read_cntpct().wrapping_sub(t0) > budget { return false; }
+        if v & brcm::MDIO_DATA_DONE == 0 {
+            return true;
+        }
+        if read_cntpct().wrapping_sub(t0) > budget {
+            return false;
+        }
     }
 }
 
@@ -717,8 +759,13 @@ unsafe fn pcie1_pre_init() -> bool {
     let mut ok = false;
     loop {
         let sts = core::ptr::read_volatile((RESCAL_BASE + RESCAL_STATUS) as *const u32);
-        if sts & 1 != 0 { ok = true; break; }
-        if read_cntpct().wrapping_sub(t0) > budget { break; }
+        if sts & 1 != 0 {
+            ok = true;
+            break;
+        }
+        if read_cntpct().wrapping_sub(t0) > budget {
+            break;
+        }
     }
     // Clear start bit regardless (matches driver behaviour).
     let s2 = core::ptr::read_volatile(RESCAL_BASE as *const u32);
@@ -786,9 +833,9 @@ pub fn enumerate() -> usize {
         // must land during the one-shot bring-up window only. Without
         // them the inbound BAR2 write path doesn't open — device
         // master TLPs don't MA but don't reach DRAM either.
-        rc_w32(rc, brcm::UBUS_CTRL,         post_probe::UBUS_CTRL);
-        rc_w32(rc, brcm::UBUS_TIMEOUT,      post_probe::UBUS_TIMEOUT);
-        rc_w32(rc, brcm::AXI_INTF_CTRL,     post_probe::AXI_INTF_CTRL);
+        rc_w32(rc, brcm::UBUS_CTRL, post_probe::UBUS_CTRL);
+        rc_w32(rc, brcm::UBUS_TIMEOUT, post_probe::UBUS_TIMEOUT);
+        rc_w32(rc, brcm::AXI_INTF_CTRL, post_probe::AXI_INTF_CTRL);
         rc_w32(rc, brcm::AXI_READ_ERR_DATA, post_probe::AXI_READ_ERR_DATA);
 
         // RC BAR1/2 config (PCI-side: pci_offset + size encoding).
@@ -816,7 +863,6 @@ pub fn enumerate() -> usize {
         // DMA path; BAR2 is a 4 KB placeholder in Linux's config).
         rc_w32(rc, brcm::UBUS_BAR2_REMAP_LO, post_probe::UBUS_BAR2_REMAP_LO);
         rc_w32(rc, brcm::UBUS_BAR2_REMAP_HI, post_probe::UBUS_BAR2_REMAP_HI);
-
 
         // Stage 2b: MDIO tuning (brcm_pcie_post_setup_bcm2712).
         // First set the MDIO base address to 0x1600, then write 7
@@ -897,17 +943,27 @@ pub fn enumerate() -> usize {
 pub fn find_by_nic_type(nic_type: PcieNicType) -> Option<usize> {
     unsafe {
         for i in 0..DEVICE_COUNT {
-            if DEVICES[i].nic_type == nic_type { return Some(i); }
+            if DEVICES[i].nic_type == nic_type {
+                return Some(i);
+            }
         }
         None
     }
 }
 
 pub fn get_device(idx: usize) -> Option<&'static PcieDevice> {
-    unsafe { if idx < DEVICE_COUNT { Some(&DEVICES[idx]) } else { None } }
+    unsafe {
+        if idx < DEVICE_COUNT {
+            Some(&DEVICES[idx])
+        } else {
+            None
+        }
+    }
 }
 
-pub fn device_count() -> usize { unsafe { DEVICE_COUNT } }
+pub fn device_count() -> usize {
+    unsafe { DEVICE_COUNT }
+}
 
 /// Read a 32-bit value from a discovered device's PCI configuration
 /// space. `dev_idx` refers to the position in `DEVICES` populated by
@@ -960,12 +1016,17 @@ pub fn device_cfg_write32(_dev_idx: usize, _offset: u16, _val: u32) -> i32 {
 ///   out: `[value: u32 LE]` appended at offset 4 (caller must pass >= 8 B).
 /// Returns 0 on success, -22 on malformed arg.
 pub unsafe fn syscall_cfg_read32(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 { return -22; }
+    if arg.is_null() || arg_len < 8 {
+        return -22;
+    }
     let dev_idx = *arg as usize;
     let offset = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
     let val = device_cfg_read32(dev_idx, offset);
     let vb = val.to_le_bytes();
-    *arg.add(4) = vb[0]; *arg.add(5) = vb[1]; *arg.add(6) = vb[2]; *arg.add(7) = vb[3];
+    *arg.add(4) = vb[0];
+    *arg.add(5) = vb[1];
+    *arg.add(6) = vb[2];
+    *arg.add(7) = vb[3];
     0
 }
 
@@ -973,7 +1034,9 @@ pub unsafe fn syscall_cfg_read32(arg: *mut u8, arg_len: usize) -> i32 {
 ///   in:  `[dev_idx: u8][_pad: u8][offset: u16 LE][value: u32 LE]` (8 bytes).
 /// Returns 0 on success, -22 on malformed arg.
 pub unsafe fn syscall_cfg_write32(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 { return -22; }
+    if arg.is_null() || arg_len < 8 {
+        return -22;
+    }
     let dev_idx = *arg as usize;
     let offset = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
     let val = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
@@ -992,7 +1055,9 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
         if dev_idx >= count || bar_idx >= MAX_BARS {
             log::warn!(
                 "[pcie] bar_map: dev_idx={} count={} bar_idx={} out of range",
-                dev_idx, count, bar_idx
+                dev_idx,
+                count,
+                bar_idx
             );
             return 0;
         }
@@ -1002,7 +1067,10 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
         if phys == 0 || size == 0 {
             log::warn!(
                 "[pcie] bar_map: dev{} bar{} phys={:#x} size={:#x}",
-                dev_idx, bar_idx, phys, size
+                dev_idx,
+                bar_idx,
+                phys,
+                size
             );
             return 0;
         }
@@ -1014,9 +1082,7 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
         // and do invoke this repeatedly (e.g. nvme retry-on-fault) and
         // allocating a fresh slot each time would exhaust MAX_BAR_MAPS.
         for i in 0..MAX_BAR_MAPS {
-            if BAR_MAPS[i].active
-                && BAR_MAPS[i].bdf == bdf
-                && BAR_MAPS[i].bar_idx == bar_idx as u8
+            if BAR_MAPS[i].active && BAR_MAPS[i].bdf == bdf && BAR_MAPS[i].bar_idx == bar_idx as u8
             {
                 return virt;
             }
@@ -1024,11 +1090,22 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
 
         let mut slot = MAX_BAR_MAPS;
         for i in 0..MAX_BAR_MAPS {
-            if !BAR_MAPS[i].active { slot = i; break; }
+            if !BAR_MAPS[i].active {
+                slot = i;
+                break;
+            }
         }
-        if slot >= MAX_BAR_MAPS { return 0; }
+        if slot >= MAX_BAR_MAPS {
+            return 0;
+        }
 
-        BAR_MAPS[slot] = BarMap { bdf, bar_idx: bar_idx as u8, virt_addr: virt, size: size as usize, active: true };
+        BAR_MAPS[slot] = BarMap {
+            bdf,
+            bar_idx: bar_idx as u8,
+            virt_addr: virt,
+            size: size as usize,
+            active: true,
+        };
         virt
     }
 }
@@ -1050,11 +1127,15 @@ pub fn bar_unmap(virt_addr: usize) -> i32 {
 // ============================================================================
 
 pub unsafe fn syscall_bar_map(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 { return crate::kernel::errno::EINVAL; }
+    if arg.is_null() || arg_len < 2 {
+        return crate::kernel::errno::EINVAL;
+    }
     let dev_idx = *arg as usize;
     let bar_idx = *arg.add(1) as usize;
     let virt = bar_map(dev_idx, bar_idx);
-    if virt == 0 { return crate::kernel::errno::ENOMEM; }
+    if virt == 0 {
+        return crate::kernel::errno::ENOMEM;
+    }
     if arg_len >= 10 {
         let addr_bytes = (virt as u64).to_le_bytes();
         core::ptr::copy_nonoverlapping(addr_bytes.as_ptr(), arg.add(2), 8);
@@ -1068,7 +1149,9 @@ pub unsafe fn syscall_bar_map(arg: *mut u8, arg_len: usize) -> i32 {
 }
 
 pub unsafe fn syscall_bar_unmap(arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 { return crate::kernel::errno::EINVAL; }
+    if arg.is_null() || arg_len < 8 {
+        return crate::kernel::errno::EINVAL;
+    }
     let mut addr_buf = [0u8; 8];
     core::ptr::copy_nonoverlapping(arg, addr_buf.as_mut_ptr(), 8);
     let virt = u64::from_le_bytes(addr_buf) as usize;
@@ -1108,7 +1191,10 @@ struct MsiVector {
 #[cfg(feature = "board-cm5")]
 impl MsiVector {
     const fn empty() -> Self {
-        Self { event_handle: -1, active: false }
+        Self {
+            event_handle: -1,
+            active: false,
+        }
     }
 }
 
@@ -1142,14 +1228,18 @@ pub unsafe fn pcie1_msi_init() -> bool {
     let intr = rc + brcm::MSI_INTR2_BASE;
 
     // Mask everything, clear any stale pending bits.
-    core::ptr::write_volatile((intr + brcm::MSI_INT_MASK_SET) as *mut u32,
-                              brcm::MSI_MASK_ALL);
-    core::ptr::write_volatile((intr + brcm::MSI_INT_CLR) as *mut u32,
-                              brcm::MSI_MASK_ALL);
+    core::ptr::write_volatile(
+        (intr + brcm::MSI_INT_MASK_SET) as *mut u32,
+        brcm::MSI_MASK_ALL,
+    );
+    core::ptr::write_volatile((intr + brcm::MSI_INT_CLR) as *mut u32, brcm::MSI_MASK_ALL);
 
     // Program the RC's MSI target: low 32 bits have ENABLE bit set.
-    rc_w32(rc, brcm::MSI_BAR_CONFIG_LO,
-           (target as u32) | brcm::MSI_BAR_ENABLE);
+    rc_w32(
+        rc,
+        brcm::MSI_BAR_CONFIG_LO,
+        (target as u32) | brcm::MSI_BAR_ENABLE,
+    );
     rc_w32(rc, brcm::MSI_BAR_CONFIG_HI, (target >> 32) as u32);
 
     // DATA_CONFIG match pattern. Bits [31:16] = match-mask (0xffe0 =
@@ -1161,8 +1251,10 @@ pub unsafe fn pcie1_msi_init() -> bool {
     // Unmask all 32 vectors. Per-vector masking at the MSI-X table
     // entry is what actually gates each peripheral's interrupts —
     // the RC-level mask is global.
-    core::ptr::write_volatile((intr + brcm::MSI_INT_MASK_CLR) as *mut u32,
-                              brcm::MSI_MASK_ALL);
+    core::ptr::write_volatile(
+        (intr + brcm::MSI_INT_MASK_CLR) as *mut u32,
+        brcm::MSI_MASK_ALL,
+    );
 
     core::arch::asm!("dsb sy");
 
@@ -1212,7 +1304,9 @@ pub unsafe fn pcie1_msi_dispatch() -> u32 {
     while bits != 0 {
         let v = bits.trailing_zeros() as usize;
         bits &= bits - 1;
-        if v >= PCIE1_MSI_VECTORS { continue; }
+        if v >= PCIE1_MSI_VECTORS {
+            continue;
+        }
         let slot = &*core::ptr::addr_of!(PCIE1_MSI_VECTORS_TAB[v]);
         if slot.active && slot.event_handle >= 0 {
             crate::kernel::event::event_signal_from_isr(slot.event_handle);
@@ -1223,8 +1317,14 @@ pub unsafe fn pcie1_msi_dispatch() -> u32 {
 }
 
 #[cfg(not(feature = "board-cm5"))]
-pub unsafe fn pcie1_msi_init() -> bool { false }
+pub unsafe fn pcie1_msi_init() -> bool {
+    false
+}
 #[cfg(not(feature = "board-cm5"))]
-pub unsafe fn pcie1_msi_alloc_vector(_e: i32) -> Option<(u8, u64, u32)> { None }
+pub unsafe fn pcie1_msi_alloc_vector(_e: i32) -> Option<(u8, u64, u32)> {
+    None
+}
 #[cfg(not(feature = "board-cm5"))]
-pub unsafe fn pcie1_msi_dispatch() -> u32 { 0 }
+pub unsafe fn pcie1_msi_dispatch() -> u32 {
+    0
+}

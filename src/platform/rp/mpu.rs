@@ -143,12 +143,12 @@ mod rp2350_impl {
     const SCB_MMFAR: *const u32 = 0xE000_ED34 as *const u32;
 
     // MMFSR bit fields (byte 0 of CFSR)
-    const MMFSR_IACCVIOL: u32 = 1 << 0;   // Instruction access violation
-    const MMFSR_DACCVIOL: u32 = 1 << 1;   // Data access violation
-    const MMFSR_MUNSTKERR: u32 = 1 << 3;  // MemManage fault on unstacking
-    const MMFSR_MSTKERR: u32 = 1 << 4;    // MemManage fault on stacking
-    const MMFSR_MLSPERR: u32 = 1 << 5;    // MemManage fault during FP lazy stacking
-    const MMFSR_MMARVALID: u32 = 1 << 7;  // MMFAR has valid address
+    const MMFSR_IACCVIOL: u32 = 1 << 0; // Instruction access violation
+    const MMFSR_DACCVIOL: u32 = 1 << 1; // Data access violation
+    const MMFSR_MUNSTKERR: u32 = 1 << 3; // MemManage fault on unstacking
+    const MMFSR_MSTKERR: u32 = 1 << 4; // MemManage fault on stacking
+    const MMFSR_MLSPERR: u32 = 1 << 5; // MemManage fault during FP lazy stacking
+    const MMFSR_MMARVALID: u32 = 1 << 7; // MMFAR has valid address
 
     /// Maximum modules we track isolation info for.
     const MAX_MODULES: usize = crate::kernel::scheduler::MAX_MODULES;
@@ -177,10 +177,14 @@ mod rp2350_impl {
     impl ModuleRegions {
         const fn empty() -> Self {
             Self {
-                code_base: 0, code_size: 0,
-                state_base: 0, state_size: 0,
-                heap_base: 0, heap_size: 0,
-                chan_base: 0, chan_size: 0,
+                code_base: 0,
+                code_size: 0,
+                state_base: 0,
+                state_size: 0,
+                heap_base: 0,
+                heap_size: 0,
+                chan_base: 0,
+                chan_size: 0,
             }
         }
     }
@@ -210,7 +214,9 @@ mod rp2350_impl {
     pub unsafe fn init_stack_canary() {
         let base = core::ptr::addr_of_mut!(MODULE_PSP_STACK.0).cast::<u32>();
         for i in 0..STACK_CANARY_CELLS {
-            unsafe { core::ptr::write_volatile(base.add(i), STACK_CANARY_WORD); }
+            unsafe {
+                core::ptr::write_volatile(base.add(i), STACK_CANARY_WORD);
+            }
         }
     }
 
@@ -288,7 +294,10 @@ mod rp2350_impl {
             let mpu_type = core::ptr::read_volatile(MPU_TYPE);
             let num_regions = (mpu_type >> 8) & 0xFF;
             if num_regions < 8 {
-                log::warn!("[mpu] only {} regions, need 8 — isolation disabled", num_regions);
+                log::warn!(
+                    "[mpu] only {} regions, need 8 — isolation disabled",
+                    num_regions
+                );
                 return;
             }
 
@@ -371,8 +380,16 @@ mod rp2350_impl {
                 code_size: align_up_32(code_size),
                 state_base: align_down_32(state_ptr as u32),
                 state_size: align_up_32(state_size as u32),
-                heap_base: if heap_ptr.is_null() { 0 } else { align_down_32(heap_ptr as u32) },
-                heap_size: if heap_ptr.is_null() { 0 } else { align_up_32(heap_size as u32) },
+                heap_base: if heap_ptr.is_null() {
+                    0
+                } else {
+                    align_down_32(heap_ptr as u32)
+                },
+                heap_size: if heap_ptr.is_null() {
+                    0
+                } else {
+                    align_up_32(heap_size as u32)
+                },
                 // Channel buffers are set separately
                 chan_base: 0,
                 chan_size: 0,
@@ -471,7 +488,9 @@ mod rp2350_impl {
 
     /// Enable or disable isolation at runtime.
     pub fn set_enabled(enabled: bool) {
-        unsafe { ISOLATION_ENABLED = enabled; }
+        unsafe {
+            ISOLATION_ENABLED = enabled;
+        }
     }
 
     // ========================================================================
@@ -497,7 +516,9 @@ mod rp2350_impl {
         }
 
         // Set up PSP to top of module stack
-        let psp_top = core::ptr::addr_of!(MODULE_PSP_STACK.0).cast::<u8>().add(MODULE_STACK_SIZE) as u32;
+        let psp_top = core::ptr::addr_of!(MODULE_PSP_STACK.0)
+            .cast::<u8>()
+            .add(MODULE_STACK_SIZE) as u32;
 
         let result: i32;
         core::arch::asm!(
@@ -558,7 +579,9 @@ mod rp2350_impl {
             return result;
         }
 
-        let psp_top = core::ptr::addr_of!(MODULE_PSP_STACK.0).cast::<u8>().add(MODULE_STACK_SIZE) as u32;
+        let psp_top = core::ptr::addr_of!(MODULE_PSP_STACK.0)
+            .cast::<u8>()
+            .add(MODULE_STACK_SIZE) as u32;
 
         let result: i32;
         core::arch::asm!(
@@ -654,7 +677,7 @@ mod rp2350_impl {
     }
 
     // ========================================================================
-    // MemManage Fault Handler (E8-S4)
+    // MemManage fault handler
     // ========================================================================
 
     /// MemManage fault handler.
@@ -680,14 +703,24 @@ mod rp2350_impl {
         let is_data = mmfsr & MMFSR_DACCVIOL != 0;
 
         if is_instruction {
-            log::error!("[mpu] module {} instruction access violation at 0x{:08x}",
-                module_idx, mmfar);
+            log::error!(
+                "[mpu] module {} instruction access violation at 0x{:08x}",
+                module_idx,
+                mmfar
+            );
         } else if is_data {
-            log::error!("[mpu] module {} data access violation at 0x{:08x}",
-                module_idx, mmfar);
+            log::error!(
+                "[mpu] module {} data access violation at 0x{:08x}",
+                module_idx,
+                mmfar
+            );
         } else {
-            log::error!("[mpu] module {} mem fault mmfsr=0x{:02x} mmfar=0x{:08x}",
-                module_idx, mmfsr, mmfar);
+            log::error!(
+                "[mpu] module {} mem fault mmfsr=0x{:02x} mmfar=0x{:08x}",
+                module_idx,
+                mmfsr,
+                mmfar
+            );
         }
 
         // Clear MMFSR bits by writing 1s
@@ -735,13 +768,11 @@ mod rp2350_impl {
     unsafe extern "C" fn fault_trampoline() -> i32 {
         // R0 already contains the error code set by MemoryManagement handler.
         // Just return it. We're back in privileged mode.
-        core::arch::naked_asm!(
-            "bx lr",
-        );
+        core::arch::naked_asm!("bx lr",);
     }
 
     // ========================================================================
-    // SVC gateway stubs for protected syscall table (E8-S2)
+    // SVC gateway stubs for the protected syscall table
     // ========================================================================
 
     /// Build a SyscallTable where each function pointer is a gateway stub
@@ -782,7 +813,9 @@ pub fn init() {
     #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
     {
         rp2350_impl::mpu_init();
-        unsafe { rp2350_impl::init_stack_canary(); }
+        unsafe {
+            rp2350_impl::init_stack_canary();
+        }
     }
 }
 
@@ -793,17 +826,23 @@ pub fn check_stack_canary() -> bool {
     {
         // The canary only guards the unprivileged PSP stack, which is only
         // in use once isolation is enabled.
-        if !rp2350_impl::is_enabled() { return true; }
+        if !rp2350_impl::is_enabled() {
+            return true;
+        }
         unsafe { rp2350_impl::check_stack_canary() }
     }
     #[cfg(any(not(feature = "rp"), feature = "chip-rp2040"))]
-    { true }
+    {
+        true
+    }
 }
 
 /// Re-write the stack canary after an overflow has been recorded.
 pub fn reinit_stack_canary() {
     #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-    unsafe { rp2350_impl::init_stack_canary(); }
+    unsafe {
+        rp2350_impl::init_stack_canary();
+    }
 }
 
 /// Register a module's memory regions for isolation.
@@ -818,10 +857,11 @@ pub fn register_module(
 ) {
     #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
     rp2350_impl::register_module_regions(
-        module_idx, code_base, code_size,
-        state_ptr, state_size, heap_ptr, heap_size,
+        module_idx, code_base, code_size, state_ptr, state_size, heap_ptr, heap_size,
     );
-    let _ = (module_idx, code_base, code_size, state_ptr, state_size, heap_ptr, heap_size);
+    let _ = (
+        module_idx, code_base, code_size, state_ptr, state_size, heap_ptr, heap_size,
+    );
 }
 
 /// Set channel buffer region for a module.

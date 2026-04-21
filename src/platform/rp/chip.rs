@@ -23,12 +23,14 @@ pub fn dma_write_trans_count(ch: &pac::dma::Channel, count: u32) {
 /// Clear pad ISO on RP2350. No-op on RP2040 (field doesn't exist).
 #[cfg(not(feature = "chip-rp2040"))]
 macro_rules! pad_set_iso_false {
-    ($w:expr) => { $w.set_iso(false) };
+    ($w:expr) => {
+        $w.set_iso(false)
+    };
 }
 
 #[cfg(feature = "chip-rp2040")]
 macro_rules! pad_set_iso_false {
-    ($w:expr) => { };
+    ($w:expr) => {};
 }
 
 pub(crate) use pad_set_iso_false;
@@ -37,9 +39,13 @@ pub(crate) use pad_set_iso_false;
 #[inline(always)]
 pub fn timer() -> pac::timer::Timer {
     #[cfg(not(feature = "chip-rp2040"))]
-    { pac::TIMER0 }
+    {
+        pac::TIMER0
+    }
     #[cfg(feature = "chip-rp2040")]
-    { pac::TIMER }
+    {
+        pac::TIMER
+    }
 }
 
 /// Get PAC PIO instance by index.

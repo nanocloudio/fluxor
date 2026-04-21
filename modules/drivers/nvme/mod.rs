@@ -2009,6 +2009,13 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
         // resolvable) and also makes the failure visible in the log —
         // the `pager_registered` flag stays 0, heartbeat will echo it
         // indirectly through the lack of a "dispatch registered" line.
+
+        // Eager-allocate the pager DMA buffer in our own module's step
+        // context so `backing_provider_dispatch` never has to call
+        // DMA_ALLOC_CONTIG from a foreign caller's permission scope —
+        // the allocator requires `platform_raw`, which we hold but
+        // arbitrary backing-provider consumers may not.
+        let _ = pager_ensure_buf(s);
     }
 
     // One-shot PCIe capability walk for observability — the heartbeat

@@ -2,8 +2,8 @@
 
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH6, PIO0, USB};
 use embassy_rp::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH6, PIO0, USB};
 use embassy_rp::pio::InterruptHandler as PioInterruptHandler;
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::{Duration, Timer};
@@ -11,11 +11,11 @@ use {defmt_rtt as _, panic_probe as _};
 
 use fluxor::kernel::pio_util;
 
-use fluxor::kernel::syscalls;
-use fluxor::kernel::scheduler::{self, setup, RunnerConfig, StepResult, MAX_MODULES};
 use fluxor::kernel::config::Hardware;
 use fluxor::kernel::hal;
 use fluxor::kernel::planner::{self, PioRole};
+use fluxor::kernel::scheduler::{self, setup, RunnerConfig, StepResult, MAX_MODULES};
+use fluxor::kernel::syscalls;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
@@ -35,10 +35,11 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     core::ptr::write_volatile(crash, CRASH_MAGIC);
     core::ptr::write_volatile(crash.add(1), ef.pc());
     core::ptr::write_volatile(crash.add(2), ef.lr());
-    core::ptr::write_volatile(crash.add(3),
-        core::ptr::read_volatile(&raw const DBG_STEP_MODULE) as u32);
-    core::ptr::write_volatile(crash.add(4),
-        core::ptr::read_volatile(&raw const DBG_TICK));
+    core::ptr::write_volatile(
+        crash.add(3),
+        core::ptr::read_volatile(&raw const DBG_STEP_MODULE) as u32,
+    );
+    core::ptr::write_volatile(crash.add(4), core::ptr::read_volatile(&raw const DBG_TICK));
     core::ptr::write_volatile(crash.add(5), ef.r0());
     // CFSR: Configurable Fault Status Register — tells us the fault type
     let cfsr = core::ptr::read_volatile(0xE000_ED28 as *const u32);
@@ -50,7 +51,9 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     // Trigger system reset via AIRCR
     let aircr = 0xE000_ED0C as *mut u32;
     core::ptr::write_volatile(aircr, 0x05FA_0004); // VECTKEY | SYSRESETREQ
-    loop { cortex_m::asm::nop(); }
+    loop {
+        cortex_m::asm::nop();
+    }
 }
 
 // ============================================================================
@@ -67,7 +70,9 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
 struct RingLogger;
 
 impl log::Log for RingLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
     fn log(&self, record: &log::Record) {
         use core::fmt::Write;
 
@@ -93,7 +98,10 @@ impl log::Log for RingLogger {
 
         let mut buf = [0u8; 256];
         let written = {
-            let mut w = BufWriter { buf: &mut buf, pos: 0 };
+            let mut w = BufWriter {
+                buf: &mut buf,
+                pos: 0,
+            };
             let _ = core::fmt::write(&mut w, *record.args());
             if w.pos + 2 <= w.buf.len() {
                 w.buf[w.pos] = b'\r';
@@ -129,11 +137,11 @@ fn init_logger() {
 // Pipe is lock-free on the producer side via `try_write` and async on the
 // consumer side — exactly the shape we need for sync-syscall → async-USB.
 
+use embassy_futures::join::join;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pipe::Pipe;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embassy_usb::{Builder, Config as UsbConfig};
-use embassy_futures::join::join;
 use static_cell::StaticCell;
 
 const USB_TX_PIPE_SIZE: usize = 4096;
@@ -211,7 +219,9 @@ async fn main(spawner: Spawner) {
     ));
 
     // Disable watchdog — bootloader may have enabled it, and we don't feed it.
-    unsafe { core::ptr::write_volatile(fluxor::kernel::chip::WATCHDOG_CTRL as *mut u32, 0); }
+    unsafe {
+        core::ptr::write_volatile(fluxor::kernel::chip::WATCHDOG_CTRL as *mut u32, 0);
+    }
 
     // Install the ring-backed log backend. Records go into kernel::log_ring
     // and are consumed by PIC modules (e.g. log_net for UDP netconsole).
@@ -236,7 +246,9 @@ async fn main(spawner: Spawner) {
         Ok(p) => p,
         Err(e) => {
             log::error!("[boot] resource conflict: {:?}", e);
-            loop { Timer::after(Duration::from_millis(1000)).await; }
+            loop {
+                Timer::after(Duration::from_millis(1000)).await;
+            }
         }
     };
     planner::log_plan(&plan);
@@ -256,7 +268,12 @@ async fn main(spawner: Spawner) {
     // --- I2C: mark available buses (PIC module does actual peripheral init) ---
     for i2c_cfg in plan.i2c.iter().flatten() {
         syscalls::mark_i2c_initialized(i2c_cfg.bus);
-        log::info!("[boot] i2c{} sda={} scl={}", i2c_cfg.bus, i2c_cfg.sda, i2c_cfg.scl);
+        log::info!(
+            "[boot] i2c{} sda={} scl={}",
+            i2c_cfg.bus,
+            i2c_cfg.sda,
+            i2c_cfg.scl
+        );
     }
 
     // --- GPIO ---
@@ -275,12 +292,19 @@ async fn main(spawner: Spawner) {
         if entry.extra_pin != 0xFF {
             pio_util::setup_pio_pin(entry.extra_pin, entry.pio_idx, pull);
         }
-        log::info!("[boot] pio{} {:?} data={} clk={} extra={}",
-            entry.pio_idx, entry.role, entry.data_pin, entry.clk_pin, entry.extra_pin);
+        log::info!(
+            "[boot] pio{} {:?} data={} clk={} extra={}",
+            entry.pio_idx,
+            entry.role,
+            entry.data_pin,
+            entry.clk_pin,
+            entry.extra_pin
+        );
     }
 
     // PIO blocks are accessed via raw PAC through the PIO register bridge
-    // (dev_system 0x0C70-0x0C7B). PIC pio_stream module manages SM/DMA at runtime.
+    // (provider_call opcodes 0x0C70-0x0C7B). PIC pio_stream module
+    // manages SM/DMA at runtime.
 
     // --- Setup runner ---
     let config = RunnerConfig {
@@ -290,7 +314,9 @@ async fn main(spawner: Spawner) {
 
     if !setup(&config) {
         log::error!("[boot] setup failed");
-        loop { Timer::after(Duration::from_millis(1000)).await; }
+        loop {
+            Timer::after(Duration::from_millis(1000)).await;
+        }
     }
 
     // Setup / run / rebuild loop. `rp_run_main_loop` returns when the
@@ -300,7 +326,9 @@ async fn main(spawner: Spawner) {
         let module_count = rp_setup_graph_async().await;
         if module_count < 0 {
             log::error!("[boot] graph setup failed");
-            loop { Timer::after(Duration::from_millis(1000)).await; }
+            loop {
+                Timer::after(Duration::from_millis(1000)).await;
+            }
         }
 
         log::info!("[boot] ready modules={}", module_count);
@@ -313,7 +341,9 @@ async fn main(spawner: Spawner) {
             }
             None => {
                 log::info!("[sched] stopped");
-                loop { Timer::after(Duration::from_millis(1000)).await; }
+                loop {
+                    Timer::after(Duration::from_millis(1000)).await;
+                }
             }
         }
     }
@@ -323,8 +353,8 @@ async fn main(spawner: Spawner) {
 // RP HAL Ops — function pointer table for all platform-specific operations
 // ============================================================================
 
-use fluxor::kernel::hal::HalOps;
 use embassy_sync::signal::Signal;
+use fluxor::kernel::hal::HalOps;
 
 /// Scheduler wake signal — Embassy-safe, used by HAL wake_scheduler.
 pub static SCHEDULER_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -371,12 +401,20 @@ fn rp_tick_count() -> u32 {
 const FLASH_BASE: usize = 0x10000000;
 const FLASH_END: usize = 0x11000000;
 
-fn rp_flash_base() -> usize { FLASH_BASE }
-fn rp_flash_end() -> usize { FLASH_END }
-fn rp_apply_code_bit(addr: usize) -> usize { addr | 1 }
+fn rp_flash_base() -> usize {
+    FLASH_BASE
+}
+fn rp_flash_end() -> usize {
+    FLASH_END
+}
+fn rp_apply_code_bit(addr: usize) -> usize {
+    addr | 1
+}
 
 fn rp_validate_fn_addr(addr: usize) -> bool {
-    if addr & 1 == 0 { return false; }
+    if addr & 1 == 0 {
+        return false;
+    }
     let instr_addr = addr & !1;
     instr_addr >= FLASH_BASE && instr_addr < FLASH_END
 }
@@ -407,7 +445,7 @@ fn rp_pic_barrier() {
     }
 }
 
-// rp_step_guard_init/arm/disarm are defined in the included rp_step_guard.rs
+use fluxor::kernel::rp_step_guard as step_guard_backend;
 
 fn rp_step_guard_post_check() {
     // No-op on Cortex-M
@@ -429,11 +467,11 @@ fn rp_isr_tier_init() {
 }
 
 fn rp_isr_tier_start(period_us: u32) {
-    rp_isr_backend_start(period_us);
+    step_guard_backend::rp_isr_backend_start(period_us);
 }
 
 fn rp_isr_tier_stop() {
-    rp_isr_backend_stop();
+    step_guard_backend::rp_isr_backend_stop();
 }
 
 fn rp_isr_tier_poll() {
@@ -441,11 +479,11 @@ fn rp_isr_tier_poll() {
 }
 
 fn rp_init_providers() {
-    fluxor::kernel::rp_ext::init();
+    fluxor::kernel::rp_providers::init();
 }
 
 fn rp_release_module_handles(module_idx: u8) {
-    fluxor::kernel::rp_ext::release_handles(module_idx);
+    fluxor::kernel::rp_providers::release_handles(module_idx);
 }
 
 fn rp_boot_scan() {
@@ -471,9 +509,9 @@ static RP_HAL_OPS: HalOps = HalOps {
     validate_fn_in_code: rp_validate_fn_in_code,
     verify_integrity: rp_verify_integrity,
     pic_barrier: rp_pic_barrier,
-    step_guard_init: rp_step_guard_init,
-    step_guard_arm: rp_step_guard_arm,
-    step_guard_disarm: rp_step_guard_disarm,
+    step_guard_init: step_guard_backend::rp_step_guard_init,
+    step_guard_arm: step_guard_backend::rp_step_guard_arm,
+    step_guard_disarm: step_guard_backend::rp_step_guard_disarm,
     step_guard_post_check: rp_step_guard_post_check,
     read_cycle_count: rp_read_cycle_count,
     isr_tier_init: rp_isr_tier_init,
@@ -515,18 +553,6 @@ fn rp_csprng_fill(buf: *mut u8, len: usize) -> i32 {
 }
 
 // ============================================================================
-// Step guard platform backends (RP2350 / RP2040)
-// ============================================================================
-
-include!("rp_step_guard.rs");
-
-// ============================================================================
-// ISR tier platform backends (RP2350 / RP2040)
-// ============================================================================
-
-include!("rp_isr_tier.rs");
-
-// ============================================================================
 // Async graph setup and main loop (moved from scheduler.rs)
 // ============================================================================
 
@@ -539,9 +565,14 @@ async fn rp_setup_graph_async() -> i32 {
     let loader = unsafe { scheduler::static_loader() };
     let sched = unsafe { scheduler::sched_mut() };
     let result = rp_instantiate_all_modules_async(
-        loader, &module_list, module_count,
-        &mut sched.edges, &mut sched.modules, &mut sched.ports,
-    ).await;
+        loader,
+        &module_list,
+        module_count,
+        &mut sched.edges,
+        &mut sched.modules,
+        &mut sched.ports,
+    )
+    .await;
 
     if result < 0 {
         log::error!("[graph] instantiation failed");
@@ -576,25 +607,29 @@ async fn rp_instantiate_all_modules_async(
 
         scheduler::set_current_module(instantiated);
         match scheduler::instantiate_one_module(
-            loader, entry, module_idx, instantiated, edges, modules, module_ports,
+            loader,
+            entry,
+            module_idx,
+            instantiated,
+            edges,
+            modules,
+            module_ports,
         ) {
             scheduler::InstantiateResult::Done => {}
-            scheduler::InstantiateResult::Pending(mut pending) => {
-                loop {
-                    Timer::after(Duration::from_millis(1)).await;
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dynamic)) => {
-                            modules[instantiated] = scheduler::ModuleSlot::Dynamic(dynamic);
-                            break;
-                        }
-                        Ok(None) => continue,
-                        Err(e) => {
-                            e.log("scheduler");
-                            return -1;
-                        }
+            scheduler::InstantiateResult::Pending(mut pending) => loop {
+                Timer::after(Duration::from_millis(1)).await;
+                match unsafe { pending.try_complete() } {
+                    Ok(Some(dynamic)) => {
+                        modules[instantiated] = scheduler::ModuleSlot::Dynamic(dynamic);
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        e.log("scheduler");
+                        return -1;
                     }
                 }
-            }
+            },
             scheduler::InstantiateResult::Error(e) => {
                 log::error!("[inst] failed module={} error={}", module_idx, e);
                 return e;
@@ -615,7 +650,11 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
     let modules = unsafe { scheduler::sched_modules() };
     let tick_period_us = scheduler::tick_us() as u64;
 
-    log::info!("[sched] running modules={} tick_us={}", module_count, tick_period_us);
+    log::info!(
+        "[sched] running modules={} tick_us={}",
+        module_count,
+        tick_period_us
+    );
 
     loop {
         fluxor::kernel::gpio::poll_gpio_edges();
@@ -646,7 +685,8 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
         embassy_futures::select::select(
             Timer::after(Duration::from_micros(tick_period_us)),
             SCHEDULER_WAKE.wait(),
-        ).await;
+        )
+        .await;
 
         let wake = fluxor::kernel::event::take_wake_pending();
         if wake != 0 {

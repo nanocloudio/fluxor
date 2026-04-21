@@ -1,6 +1,421 @@
+//! RP provider assembly for the kernel namespace.
+//!
+//! This module is only compiled for RP targets (via cfg in mod.rs).
+//! It groups DMA ownership and provider dispatch concerns in
+//! `platform/rp/providers.rs`.
+
+use portable_atomic::{compiler_fence, AtomicU16, Ordering};
+
+use crate::kernel::errno;
+use crate::kernel::fd;
+use crate::kernel::gpio;
+use crate::kernel::syscalls::{register_dev_query_extension, register_system_extension};
+
+const E_INVAL: i32 = errno::EINVAL;
+const E_NOSYS: i32 = errno::ENOSYS;
+const E_NOMEM: i32 = errno::ENOMEM;
+
+// ============================================================================
+// DMA channel allocation
+// ============================================================================
+
+/// Bitmap of allocated DMA channels. CH0-CH7 pre-marked at boot.
+static DMA_CHANNELS_USED: AtomicU16 = AtomicU16::new(0x00FF); // CH0-CH7 reserved
+
+pub(crate) fn dma_alloc_channel() -> i32 {
+    loop {
+        let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
+        let free_mask = !used & 0xFF00;
+        if free_mask == 0 {
+            return E_NOMEM;
+        }
+        let ch = free_mask.trailing_zeros() as u16;
+        let bit = 1u16 << ch;
+        if DMA_CHANNELS_USED
+            .compare_exchange(
+                used,
+                used | bit,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return ch as i32;
+        }
+    }
+}
+
+pub(crate) fn dma_free_channel(ch: u8) -> i32 {
+    if ch < 8 || ch > 15 {
+        return E_INVAL;
+    }
+    let bit = 1u16 << ch;
+    DMA_CHANNELS_USED.fetch_and(!bit, core::sync::atomic::Ordering::Release);
+    0
+}
+
+pub(crate) unsafe fn dma_start_raw(
+    ch: u8,
+    read_addr: u32,
+    write_addr: u32,
+    count: u32,
+    dreq: u8,
+    flags: u8,
+) -> i32 {
+    if ch > 15 {
+        return E_INVAL;
+    }
+    let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
+    if used & (1u16 << ch) == 0 {
+        return E_INVAL;
+    }
+
+    use embassy_rp::pac;
+    let dma_ch = pac::DMA.ch(ch as usize);
+    dma_ch.read_addr().write_value(read_addr);
+    dma_ch.write_addr().write_value(write_addr);
+    super::chip::dma_write_trans_count(&dma_ch, count);
+    compiler_fence(Ordering::SeqCst);
+
+    let incr_read = flags & 0x01 != 0;
+    let incr_write = flags & 0x02 != 0;
+    let data_size = if flags & 0x04 != 0 {
+        pac::dma::vals::DataSize::SIZE_WORD
+    } else {
+        pac::dma::vals::DataSize::SIZE_HALFWORD
+    };
+
+    dma_ch.ctrl_trig().write(|w| {
+        w.set_treq_sel(pac::dma::vals::TreqSel::from(dreq));
+        w.set_data_size(data_size);
+        w.set_incr_read(incr_read);
+        w.set_incr_write(incr_write);
+        w.set_chain_to(ch);
+        w.set_en(true);
+    });
+    compiler_fence(Ordering::SeqCst);
+    0
+}
+
+fn dma_busy(ch: u8) -> i32 {
+    if ch > 15 {
+        return E_INVAL;
+    }
+    use embassy_rp::pac;
+    if pac::DMA.ch(ch as usize).ctrl_trig().read().busy() {
+        1
+    } else {
+        0
+    }
+}
+
+pub(crate) fn dma_abort(ch: u8) -> i32 {
+    if ch > 15 {
+        return E_INVAL;
+    }
+    use embassy_rp::pac;
+    pac::DMA.chan_abort().write(|w| w.0 = 1u32 << ch);
+    while pac::DMA.ch(ch as usize).ctrl_trig().read().busy() {}
+    0
+}
+
+pub(crate) unsafe fn dma_restart_raw(ch: u8, read_addr: u32, count: u32) -> i32 {
+    if ch > 15 {
+        return E_INVAL;
+    }
+    use embassy_rp::pac;
+    let dma_ch = pac::DMA.ch(ch as usize);
+    compiler_fence(Ordering::SeqCst);
+    dma_ch.al3_trans_count().write_value(count);
+    dma_ch.al3_read_addr_trig().write_value(read_addr);
+    compiler_fence(Ordering::SeqCst);
+    0
+}
+
+// ============================================================================
+// DMA FD operations (ping-pong DMA channels as fd)
+// ============================================================================
+
+use portable_atomic::AtomicBool;
+use portable_atomic::AtomicU8;
+
+const MAX_DMA_FDS: usize = 8;
+
+struct DmaFdSlot {
+    allocated: AtomicBool,
+    owner: AtomicU8,
+    channel_a: AtomicU8,
+    channel_b: AtomicU8,
+    active_is_b: AtomicBool,
+    pending: AtomicBool,
+}
+
+impl DmaFdSlot {
+    const fn new() -> Self {
+        Self {
+            allocated: AtomicBool::new(false),
+            owner: AtomicU8::new(0xFF),
+            channel_a: AtomicU8::new(0xFF),
+            channel_b: AtomicU8::new(0xFF),
+            active_is_b: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    fn active_ch(&self) -> u8 {
+        if self.active_is_b.load(Ordering::Acquire) {
+            self.channel_b.load(Ordering::Acquire)
+        } else {
+            self.channel_a.load(Ordering::Acquire)
+        }
+    }
+
+    fn inactive_ch(&self) -> u8 {
+        if self.active_is_b.load(Ordering::Acquire) {
+            self.channel_a.load(Ordering::Acquire)
+        } else {
+            self.channel_b.load(Ordering::Acquire)
+        }
+    }
+}
+
+static DMA_FD_SLOTS: [DmaFdSlot; MAX_DMA_FDS] = [const { DmaFdSlot::new() }; MAX_DMA_FDS];
+
+pub fn dma_fd_create() -> i32 {
+    let ch_a = dma_alloc_channel();
+    if ch_a < 0 {
+        return ch_a;
+    }
+    let ch_b = dma_alloc_channel();
+    if ch_b < 0 {
+        dma_free_channel(ch_a as u8);
+        return ch_b;
+    }
+    let owner = crate::kernel::scheduler::current_module_index() as u8;
+    for i in 0..MAX_DMA_FDS {
+        if DMA_FD_SLOTS[i]
+            .allocated
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            DMA_FD_SLOTS[i].owner.store(owner, Ordering::Release);
+            DMA_FD_SLOTS[i]
+                .channel_a
+                .store(ch_a as u8, Ordering::Release);
+            DMA_FD_SLOTS[i]
+                .channel_b
+                .store(ch_b as u8, Ordering::Release);
+            DMA_FD_SLOTS[i].active_is_b.store(false, Ordering::Release);
+            DMA_FD_SLOTS[i].pending.store(false, Ordering::Release);
+            return fd::tag_fd(fd::FD_TAG_DMA, i as i32);
+        }
+    }
+    dma_free_channel(ch_a as u8);
+    dma_free_channel(ch_b as u8);
+    errno::ENOMEM
+}
+
+pub fn dma_fd_start(
+    fd_handle: i32,
+    read_addr: u32,
+    write_addr: u32,
+    count: u32,
+    dreq: u8,
+    flags: u8,
+) -> i32 {
+    let slot = fd::slot_of(fd_handle);
+    if slot < 0 || slot as usize >= MAX_DMA_FDS {
+        return E_INVAL;
+    }
+    let dma = &DMA_FD_SLOTS[slot as usize];
+    if !dma.allocated.load(Ordering::Acquire) {
+        return E_INVAL;
+    }
+    let ch_a = dma.channel_a.load(Ordering::Acquire);
+    let ch_b = dma.channel_b.load(Ordering::Acquire);
+    let rc = unsafe { dma_start_raw(ch_a, read_addr, write_addr, count, dreq, flags) };
+    if rc < 0 {
+        return rc;
+    }
+    unsafe {
+        dma_preconfigure_inactive(ch_b, write_addr, dreq, flags);
+    }
+    dma.active_is_b.store(false, Ordering::Release);
+    dma.pending.store(false, Ordering::Release);
+    rc
+}
+
+unsafe fn dma_preconfigure_inactive(ch: u8, write_addr: u32, dreq: u8, flags: u8) {
+    use embassy_rp::pac;
+    let dma_ch = pac::DMA.ch(ch as usize);
+    dma_ch.write_addr().write_value(write_addr);
+    let incr_read = flags & 0x01 != 0;
+    let incr_write = flags & 0x02 != 0;
+    let data_size = if flags & 0x04 != 0 {
+        pac::dma::vals::DataSize::SIZE_WORD
+    } else {
+        pac::dma::vals::DataSize::SIZE_HALFWORD
+    };
+    let mut ctrl = pac::dma::regs::CtrlTrig(0);
+    ctrl.set_en(true);
+    ctrl.set_incr_read(incr_read);
+    ctrl.set_incr_write(incr_write);
+    ctrl.set_data_size(data_size);
+    ctrl.set_treq_sel(pac::dma::vals::TreqSel::from(dreq));
+    ctrl.set_chain_to(ch);
+    dma_ch.al1_ctrl().write_value(ctrl.0);
+}
+
+pub fn dma_fd_queue(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
+    let slot = fd::slot_of(fd_handle);
+    if slot < 0 || slot as usize >= MAX_DMA_FDS {
+        return E_INVAL;
+    }
+    let dma = &DMA_FD_SLOTS[slot as usize];
+    if !dma.allocated.load(Ordering::Acquire) {
+        return E_INVAL;
+    }
+    let active = dma.active_ch();
+    let inactive = dma.inactive_ch();
+    {
+        use embassy_rp::pac;
+        let inactive_ch = pac::DMA.ch(inactive as usize);
+        let active_ch = pac::DMA.ch(active as usize);
+        inactive_ch.read_addr().write_value(read_addr);
+        super::chip::dma_write_trans_count(&inactive_ch, count);
+        compiler_fence(Ordering::SeqCst);
+        let mut ctrl = pac::dma::regs::CtrlTrig(active_ch.al1_ctrl().read());
+        ctrl.set_chain_to(inactive);
+        active_ch.al1_ctrl().write_value(ctrl.0);
+        compiler_fence(Ordering::SeqCst);
+        if !active_ch.ctrl_trig().read().busy() {
+            inactive_ch.al3_trans_count().write_value(count);
+            inactive_ch.al3_read_addr_trig().write_value(read_addr);
+            ctrl.set_chain_to(active);
+            active_ch.al1_ctrl().write_value(ctrl.0);
+            dma.active_is_b
+                .store(!dma.active_is_b.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+    dma.pending.store(true, Ordering::Release);
+    0
+}
+
+pub fn dma_fd_restart(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
+    let slot = fd::slot_of(fd_handle);
+    if slot < 0 || slot as usize >= MAX_DMA_FDS {
+        return E_INVAL;
+    }
+    let dma = &DMA_FD_SLOTS[slot as usize];
+    if !dma.allocated.load(Ordering::Acquire) {
+        return E_INVAL;
+    }
+    let ch = dma.active_ch();
+    unsafe { dma_restart_raw(ch, read_addr, count) }
+}
+
+pub fn dma_fd_free(fd_handle: i32) -> i32 {
+    let slot = fd::slot_of(fd_handle);
+    if slot < 0 || slot as usize >= MAX_DMA_FDS {
+        return E_INVAL;
+    }
+    let dma = &DMA_FD_SLOTS[slot as usize];
+    if !dma.allocated.load(Ordering::Acquire) {
+        return E_INVAL;
+    }
+    let ch_a = dma.channel_a.load(Ordering::Acquire);
+    let ch_b = dma.channel_b.load(Ordering::Acquire);
+    dma_abort(ch_a);
+    dma_abort(ch_b);
+    dma_free_channel(ch_a);
+    dma_free_channel(ch_b);
+    dma.channel_a.store(0xFF, Ordering::Release);
+    dma.channel_b.store(0xFF, Ordering::Release);
+    dma.pending.store(false, Ordering::Release);
+    dma.active_is_b.store(false, Ordering::Release);
+    dma.owner.store(0xFF, Ordering::Release);
+    dma.allocated.store(false, Ordering::Release);
+    0
+}
+
+fn dma_fd_poll_ready(slot: i32) -> bool {
+    if slot < 0 || slot as usize >= MAX_DMA_FDS {
+        return false;
+    }
+    let dma = &DMA_FD_SLOTS[slot as usize];
+    if !dma.allocated.load(Ordering::Acquire) {
+        return false;
+    }
+    let active = dma.active_ch();
+    use embassy_rp::pac;
+    if pac::DMA.ch(active as usize).ctrl_trig().read().busy() {
+        return false;
+    }
+    if dma.pending.load(Ordering::Acquire) {
+        let dma_ch = pac::DMA.ch(active as usize);
+        let mut ctrl = pac::dma::regs::CtrlTrig(dma_ch.al1_ctrl().read());
+        ctrl.set_chain_to(active);
+        dma_ch.al1_ctrl().write_value(ctrl.0);
+        dma.active_is_b
+            .store(!dma.active_is_b.load(Ordering::Acquire), Ordering::Release);
+        dma.pending.store(false, Ordering::Release);
+    }
+    true
+}
+
+pub fn release_dma_fds_owned_by(module_idx: u8) {
+    for i in 0..MAX_DMA_FDS {
+        let dma = &DMA_FD_SLOTS[i];
+        if !dma.allocated.load(Ordering::Acquire) {
+            continue;
+        }
+        if dma.owner.load(Ordering::Acquire) != module_idx {
+            continue;
+        }
+        let ch_a = dma.channel_a.load(Ordering::Acquire);
+        let ch_b = dma.channel_b.load(Ordering::Acquire);
+        if ch_a != 0xFF {
+            dma_abort(ch_a);
+            dma_free_channel(ch_a);
+        }
+        if ch_b != 0xFF {
+            dma_abort(ch_b);
+            dma_free_channel(ch_b);
+        }
+        dma.channel_a.store(0xFF, Ordering::Release);
+        dma.channel_b.store(0xFF, Ordering::Release);
+        dma.pending.store(false, Ordering::Release);
+        dma.active_is_b.store(false, Ordering::Release);
+        dma.owner.store(0xFF, Ordering::Release);
+        dma.allocated.store(false, Ordering::Release);
+    }
+}
+
+// ============================================================================
+// RP provider dispatch and registration
+// ============================================================================
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+pub fn init() {
+    init_rp_providers();
+    // Register DMA FD poll function with the fd subsystem
+    fd::register_dma_fd_poll(dma_fd_poll_ready);
+    // Register provider_query extension for GPIO and SYS_CLOCK_HZ
+    register_dev_query_extension(rp_dev_query_extension);
+}
+
+pub fn release_handles(module_idx: u8) {
+    release_rp_handles(module_idx);
+    release_dma_fds_owned_by(module_idx);
+}
+
 // RP-family hardware providers for the syscall system.
 //
-// This file is `include!`d from `src/kernel/syscalls.rs` under `#[cfg(feature = "rp")]`.
+// This file is compiled as `src/platform/rp/providers.rs`
+// under `#[cfg(feature = "rp")]`.
 // All symbols share the `syscalls` module namespace — they can reference E_NOSYS,
 // channel::*, gpio::*, etc. directly.
 //
@@ -21,13 +436,24 @@ pub fn is_gpio_registered(pin_num: u8) -> bool {
 pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     let handle = gpio::gpio_claim(pin_num);
     if handle < 0 {
-        log::error!("[gpio] request_output pin {} claim failed rc={}", pin_num, handle);
+        log::error!(
+            "[gpio] request_output pin {} claim failed rc={}",
+            pin_num,
+            handle
+        );
         return handle;
     }
-    gpio::gpio_set_owner(pin_num, crate::kernel::scheduler::current_module_index() as u8);
+    gpio::gpio_set_owner(
+        pin_num,
+        crate::kernel::scheduler::current_module_index() as u8,
+    );
     let result = gpio::gpio_set_mode(handle, gpio::PinMode::Output, true);
     if result < 0 {
-        log::error!("[gpio] request_output pin {} set_mode failed rc={}", pin_num, result);
+        log::error!(
+            "[gpio] request_output pin {} set_mode failed rc={}",
+            pin_num,
+            result
+        );
         gpio::gpio_release(handle);
         return result;
     }
@@ -51,7 +477,10 @@ pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i3
     if handle < 0 {
         return handle;
     }
-    gpio::gpio_set_owner(pin_num, crate::kernel::scheduler::current_module_index() as u8);
+    gpio::gpio_set_owner(
+        pin_num,
+        crate::kernel::scheduler::current_module_index() as u8,
+    );
     // Set pull configuration
     let pin_pull = match pull {
         1 => gpio::PinPull::Up,
@@ -87,7 +516,9 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
     use crate::abi::contracts::hal::gpio as dev_gpio;
     match opcode {
         dev_gpio::CLAIM => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let result = gpio::syscall_gpio_claim(*arg);
             if result >= 0 {
                 gpio::gpio_set_owner(*arg, crate::kernel::scheduler::current_module_index() as u8);
@@ -95,38 +526,58 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
             result
         }
         dev_gpio::SET_OUTPUT => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             syscall_gpio_request_output(*arg)
         }
         dev_gpio::SET_INPUT => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             syscall_gpio_request_input(*arg, *arg.add(1))
         }
         dev_gpio::RELEASE => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
+            if !gpio::gpio_check_owner(handle) {
+                return E_INVAL;
+            }
             gpio::syscall_gpio_release(handle)
         }
         dev_gpio::SET_MODE => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if !gpio::gpio_check_owner(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             gpio::syscall_gpio_set_mode(handle, *arg, *arg.add(1))
         }
         dev_gpio::SET_PULL => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if !gpio::gpio_check_owner(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             gpio::syscall_gpio_set_pull(handle, *arg)
         }
         dev_gpio::SET_LEVEL => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if !gpio::gpio_check_owner(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             gpio::syscall_gpio_set_level(handle, *arg)
         }
-        dev_gpio::GET_LEVEL => {
-            syscall_gpio_get_level(handle)
-        }
+        dev_gpio::GET_LEVEL => syscall_gpio_get_level(handle),
         dev_gpio::WATCH_EDGE => {
-            if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if !gpio::gpio_check_owner(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let edge = *arg;
             let evt = i32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             gpio::gpio_watch_edge(handle as u8, edge, evt)
@@ -144,7 +595,10 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
 /// Set a pin as SIO output with initial level.
 unsafe fn spi9_pac_gpio_init(pin: u8, high: bool) {
     use embassy_rp::pac;
-    pac::IO_BANK0.gpio(pin as usize).ctrl().write(|w| w.set_funcsel(5));
+    pac::IO_BANK0
+        .gpio(pin as usize)
+        .ctrl()
+        .write(|w| w.set_funcsel(5));
     pac::PADS_BANK0.gpio(pin as usize).write(|w| {
         super::chip::pad_set_iso_false!(w);
         w.set_schmitt(false);
@@ -202,24 +656,32 @@ unsafe fn spi9_pac_delay_ms(ms: u32) {
 unsafe fn spi9_pac_write_word(sck: u8, sda: u8, word: u16) {
     for i in (0..=8i32).rev() {
         spi9_pac_pin_set(sda, (word & (1u16 << i as u32)) != 0);
-        spi9_timer_us(10);   // Data setup time before rising edge
+        spi9_timer_us(10); // Data setup time before rising edge
         spi9_pac_pin_set(sck, true);
-        spi9_pac_delay();     // 100 us SCK high time
+        spi9_pac_delay(); // 100 us SCK high time
         spi9_pac_pin_set(sck, false);
-        spi9_pac_delay();     // 100 us SCK low time
+        spi9_pac_delay(); // 100 us SCK low time
     }
 }
 
 /// Send 9-bit SPI command + data bytes, CS-framed.
-unsafe fn spi9_pac_send(cs: u8, sck: u8, sda: u8, cmd: u8, data: *const u8, data_len: usize, hold_cs: bool) {
+unsafe fn spi9_pac_send(
+    cs: u8,
+    sck: u8,
+    sda: u8,
+    cmd: u8,
+    data: *const u8,
+    data_len: usize,
+    hold_cs: bool,
+) {
     spi9_pac_pin_set(cs, false);
-    spi9_timer_us(5);  // CS setup time before first clock
+    spi9_timer_us(5); // CS setup time before first clock
     spi9_pac_write_word(sck, sda, cmd as u16); // DC=0 for command
     for i in 0..data_len {
         spi9_pac_write_word(sck, sda, 0x0100 | *data.add(i) as u16); // DC=1 for data
     }
     if !hold_cs {
-        spi9_timer_us(5);  // CS hold time after last clock
+        spi9_timer_us(5); // CS hold time after last clock
         spi9_pac_pin_set(cs, true);
     }
 }
@@ -252,30 +714,45 @@ unsafe fn spi9_pac_reset(rst: u8, cs: u8, sck: u8, sda: u8) {
 /// handler rejects wrong-family handles with EINVAL.
 #[inline]
 fn is_dma_channel_handle(h: i32) -> bool {
-    if h < 0 { return false; }
+    if h < 0 {
+        return false;
+    }
     let (tag, _slot) = crate::kernel::fd::untag_fd(h);
     tag == 0
 }
 
 #[inline]
 fn is_dma_fd_handle(h: i32) -> bool {
-    if h < 0 { return false; }
+    if h < 0 {
+        return false;
+    }
     let (tag, _slot) = crate::kernel::fd::untag_fd(h);
     tag == crate::kernel::fd::FD_TAG_DMA
 }
 
-unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::kernel_abi::SYS_CLOCK_HZ;
-    use crate::abi::internal::flash;
+unsafe fn rp_system_extension_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
     use crate::abi::contracts::storage::runtime_params;
+    use crate::abi::internal::flash;
     use crate::abi::internal::provider_registry::FLASH_STORE_ENABLE;
-    use crate::abi::platform::rp::{adc_raw, dma_raw, i2c_raw, pio_raw, pwm_raw, spi_raw, spi9_raw, uart_raw};
+    use crate::abi::kernel_abi::SYS_CLOCK_HZ;
+    use crate::abi::platform::rp::{
+        adc_raw, dma_raw, i2c_raw, pio_raw, pwm_raw, spi9_raw, spi_raw, uart_raw,
+    };
     match opcode {
         // ── Raw PWM register bridge ─────────────────────────────────
         pwm_raw::PIN_ENABLE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let pin = *arg as usize;
-            if pin >= gpio::runtime_max_gpio() as usize { return E_INVAL; }
+            if pin >= gpio::runtime_max_gpio() as usize {
+                return E_INVAL;
+            }
             use embassy_rp::pac;
             pac::IO_BANK0.gpio(pin).ctrl().write(|w| w.set_funcsel(4));
             pac::PADS_BANK0.gpio(pin).modify(|w| {
@@ -286,19 +763,27 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         pwm_raw::PIN_DISABLE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let pin = *arg as usize;
-            if pin >= gpio::runtime_max_gpio() as usize { return E_INVAL; }
+            if pin >= gpio::runtime_max_gpio() as usize {
+                return E_INVAL;
+            }
             use embassy_rp::pac;
             pac::IO_BANK0.gpio(pin).ctrl().write(|w| w.set_funcsel(31));
             0
         }
         pwm_raw::SLICE_WRITE => {
-            if arg.is_null() || arg_len < 6 { return E_INVAL; }
+            if arg.is_null() || arg_len < 6 {
+                return E_INVAL;
+            }
             let slice = *arg as usize;
             let reg = *arg.add(1);
             let value = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            if slice >= 12 { return E_INVAL; }
+            if slice >= 12 {
+                return E_INVAL;
+            }
             use embassy_rp::pac;
             let ch = pac::PWM.ch(slice);
             match reg {
@@ -312,10 +797,14 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         pwm_raw::SLICE_READ => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             let slice = *arg as usize;
             let reg = *arg.add(1);
-            if slice >= 12 { return E_INVAL; }
+            if slice >= 12 {
+                return E_INVAL;
+            }
             use embassy_rp::pac;
             let ch = pac::PWM.ch(slice);
             match reg {
@@ -329,20 +818,31 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         }
         // ── Raw PIO register bridge ───────────────────────────────────
         pio_raw::SM_EXEC => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let sm = *arg.add(1);
-            if pio_num > 2 || sm > 3 { return E_INVAL; }
+            if pio_num > 2 || sm > 3 {
+                return E_INVAL;
+            }
             let instr = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
-            pio_util::pio_pac(pio_num).sm(sm as usize).instr().write(|w| w.set_instr(instr));
+            pio_util::pio_pac(pio_num)
+                .sm(sm as usize)
+                .instr()
+                .write(|w| w.set_instr(instr));
             0
         }
         pio_raw::SM_WRITE_REG => {
-            if arg.is_null() || arg_len < 7 { return E_INVAL; }
+            if arg.is_null() || arg_len < 7 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let sm_idx = *arg.add(1);
             let reg = *arg.add(2);
-            if pio_num > 2 || sm_idx > 3 { return E_INVAL; }
+            if pio_num > 2 || sm_idx > 3 {
+                return E_INVAL;
+            }
             let value = u32::from_le_bytes([*arg.add(3), *arg.add(4), *arg.add(5), *arg.add(6)]);
             let sm = pio_util::pio_pac(pio_num).sm(sm_idx as usize);
             match reg {
@@ -355,11 +855,15 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         pio_raw::SM_READ_REG => {
-            if arg.is_null() || arg_len < 3 { return E_INVAL; }
+            if arg.is_null() || arg_len < 3 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let sm_idx = *arg.add(1);
             let reg = *arg.add(2);
-            if pio_num > 2 || sm_idx > 3 { return E_INVAL; }
+            if pio_num > 2 || sm_idx > 3 {
+                return E_INVAL;
+            }
             let sm = pio_util::pio_pac(pio_num).sm(sm_idx as usize);
             match reg {
                 0 => sm.clkdiv().read().0 as i32,
@@ -371,11 +875,15 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             }
         }
         pio_raw::SM_ENABLE => {
-            if arg.is_null() || arg_len < 3 { return E_INVAL; }
+            if arg.is_null() || arg_len < 3 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let mask = *arg.add(1) & 0x0F;
             let enable = *arg.add(2);
-            if pio_num > 2 { return E_INVAL; }
+            if pio_num > 2 {
+                return E_INVAL;
+            }
             let p = pio_util::pio_pac(pio_num);
             p.ctrl().modify(|w| {
                 if enable != 0 {
@@ -387,10 +895,14 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         pio_raw::INSTR_ALLOC => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let count = *arg.add(1);
-            if pio_num > 2 || count == 0 || count > 32 { return E_INVAL; }
+            if pio_num > 2 || count == 0 || count > 32 {
+                return E_INVAL;
+            }
             match pio_util::alloc_instruction_slots(pio_num, count as usize) {
                 Some((origin, mask)) => {
                     // Write mask back to arg[2..6] so caller can free later
@@ -407,28 +919,42 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             }
         }
         pio_raw::INSTR_WRITE => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let addr = *arg.add(1);
-            if pio_num > 2 || addr > 31 { return E_INVAL; }
+            if pio_num > 2 || addr > 31 {
+                return E_INVAL;
+            }
             let instr = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
-            pio_util::pio_pac(pio_num).instr_mem(addr as usize).write(|w| w.0 = instr as u32);
+            pio_util::pio_pac(pio_num)
+                .instr_mem(addr as usize)
+                .write(|w| w.0 = instr as u32);
             0
         }
         pio_raw::INSTR_FREE => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
-            if pio_num > 2 { return E_INVAL; }
+            if pio_num > 2 {
+                return E_INVAL;
+            }
             let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             pio_util::free_instruction_slots(pio_num, mask);
             0
         }
         pio_raw::PIN_SETUP => {
-            if arg.is_null() || arg_len < 3 { return E_INVAL; }
+            if arg.is_null() || arg_len < 3 {
+                return E_INVAL;
+            }
             let pin = *arg;
             let pio_num = *arg.add(1);
             let pull = *arg.add(2);
-            if pio_num > 2 || pin as usize >= gpio::runtime_max_gpio() as usize { return E_INVAL; }
+            if pio_num > 2 || pin as usize >= gpio::runtime_max_gpio() as usize {
+                return E_INVAL;
+            }
             let pio_pull = match pull {
                 0 => pio_util::PioPull::None,
                 1 => pio_util::PioPull::PullDown,
@@ -442,36 +968,58 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             // PIO GPIOBASE: RP2350 only (register absent on RP2040 PAC)
             #[cfg(not(feature = "chip-rp2040"))]
             {
-                if arg.is_null() || arg_len < 2 { return E_INVAL; }
+                if arg.is_null() || arg_len < 2 {
+                    return E_INVAL;
+                }
                 let pio_num = *arg;
                 let base16 = *arg.add(1);
-                if pio_num > 2 { return E_INVAL; }
-                pio_util::pio_pac(pio_num).gpiobase().write(|w| w.set_gpiobase(base16 != 0));
+                if pio_num > 2 {
+                    return E_INVAL;
+                }
+                pio_util::pio_pac(pio_num)
+                    .gpiobase()
+                    .write(|w| w.set_gpiobase(base16 != 0));
                 0
             }
             #[cfg(feature = "chip-rp2040")]
-            { E_NOSYS }
+            {
+                E_NOSYS
+            }
         }
         pio_raw::TXF_WRITE => {
-            if arg.is_null() || arg_len < 6 { return E_INVAL; }
+            if arg.is_null() || arg_len < 6 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let sm = *arg.add(1);
-            if pio_num > 2 || sm > 3 { return E_INVAL; }
+            if pio_num > 2 || sm > 3 {
+                return E_INVAL;
+            }
             let value = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            pio_util::pio_pac(pio_num).txf(sm as usize).write_value(value);
+            pio_util::pio_pac(pio_num)
+                .txf(sm as usize)
+                .write_value(value);
             0
         }
         pio_raw::FSTAT_READ => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
-            if pio_num > 2 { return E_INVAL; }
+            if pio_num > 2 {
+                return E_INVAL;
+            }
             pio_util::pio_pac(pio_num).fstat().read().0 as i32
         }
         pio_raw::SM_RESTART => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let mask = *arg.add(1) & 0x0F;
-            if pio_num > 2 { return E_INVAL; }
+            if pio_num > 2 {
+                return E_INVAL;
+            }
             let p = pio_util::pio_pac(pio_num);
             p.ctrl().modify(|w| {
                 w.set_sm_restart(mask);
@@ -480,9 +1028,13 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         pio_raw::INPUT_SYNC_BYPASS => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
-            if pio_num > 2 { return E_INVAL; }
+            if pio_num > 2 {
+                return E_INVAL;
+            }
             let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             let p = pio_util::pio_pac(pio_num);
             p.input_sync_bypass().modify(|w| *w |= mask);
@@ -495,17 +1047,26 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             //   [4..8] write_bits (u32 LE), [8..12] read_bits (u32 LE)
             //   [12..16] tx_addr (u32 LE), [16..20] tx_words (u32 LE)
             //   [20..24] rx_addr (u32 LE), [24] dma_ch_tx, [25] dma_ch_rx, [26..28] reserved
-            if arg.is_null() || arg_len < 28 { return E_INVAL; }
+            if arg.is_null() || arg_len < 28 {
+                return E_INVAL;
+            }
             let pio_num = *arg;
             let sm_num = *arg.add(1) as usize;
             let origin = *arg.add(2);
-            if pio_num > 2 || sm_num > 3 { return E_INVAL; }
+            if pio_num > 2 || sm_num > 3 {
+                return E_INVAL;
+            }
 
-            let write_bits = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
-            let read_bits = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            let tx_addr = u32::from_le_bytes([*arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15)]);
-            let tx_words = u32::from_le_bytes([*arg.add(16), *arg.add(17), *arg.add(18), *arg.add(19)]);
-            let rx_addr = u32::from_le_bytes([*arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23)]);
+            let write_bits =
+                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            let read_bits =
+                u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
+            let tx_addr =
+                u32::from_le_bytes([*arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15)]);
+            let tx_words =
+                u32::from_le_bytes([*arg.add(16), *arg.add(17), *arg.add(18), *arg.add(19)]);
+            let rx_addr =
+                u32::from_le_bytes([*arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23)]);
             let ch_tx = *arg.add(24);
             let _ch_rx = *arg.add(25);
 
@@ -514,7 +1075,8 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             let sm_mask = 1u8 << sm_num;
 
             // Disable SM
-            pio.ctrl().modify(|w| w.set_sm_enable(w.sm_enable() & !sm_mask));
+            pio.ctrl()
+                .modify(|w| w.set_sm_enable(w.sm_enable() & !sm_mask));
 
             // Set X = write_bits via TXF + forced OUT X,32
             pio.txf(sm_num).write_value(write_bits);
@@ -543,27 +1105,34 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
 
             // Enable the state machine before DMA so the PIO FIFOs drain
             // as transfers land.
-            pio.ctrl().modify(|w| w.set_sm_enable(w.sm_enable() | sm_mask));
+            pio.ctrl()
+                .modify(|w| w.set_sm_enable(w.sm_enable() | sm_mask));
 
             compiler_fence(Ordering::SeqCst);
 
             // Sequential TX then RX on a single DMA channel. RX must run
             // even for write-only transactions — the PIO program expects
             // the full TX→RX cycle to complete.
-            let rx_words = if read_bits > 0 { (read_bits + 1 + 31) / 32 } else { 1 };
+            let rx_words = if read_bits > 0 {
+                (read_bits + 1 + 31) / 32
+            } else {
+                1
+            };
 
             // TX DMA blocking
             if tx_words > 0 {
-                crate::kernel::rp_ext::dma_start_raw(ch_tx, tx_addr, txf_addr, tx_words, tx_dreq, 0x05);
+                crate::kernel::rp_providers::dma_start_raw(
+                    ch_tx, tx_addr, txf_addr, tx_words, tx_dreq, 0x05,
+                );
                 compiler_fence(Ordering::SeqCst);
-                while crate::kernel::rp_ext::dma_busy(ch_tx) != 0 {}
+                while crate::kernel::rp_providers::dma_busy(ch_tx) != 0 {}
                 compiler_fence(Ordering::SeqCst);
             }
 
             // RX DMA blocking (always — PIO needs full TX→RX cycle)
-            crate::kernel::rp_ext::dma_start_raw(ch_tx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06);
+            crate::kernel::rp_providers::dma_start_raw(ch_tx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06);
             compiler_fence(Ordering::SeqCst);
-            while crate::kernel::rp_ext::dma_busy(ch_tx) != 0 {}
+            while crate::kernel::rp_providers::dma_busy(ch_tx) != 0 {}
             compiler_fence(Ordering::SeqCst);
 
             let total = (tx_words * 4 + rx_words * 4) as i32;
@@ -580,47 +1149,66 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         // (FD_TAG_DMA=7 shifted by TAG_SHIFT=27). `is_dma_channel_handle`
         // refuses any such handle outright — so passing `fd::CREATE`'s
         // return value to `channel::FREE` fails fast with EINVAL.
-        dma_raw::channel::ALLOC => {
-            dma_alloc_channel()
-        }
+        dma_raw::channel::ALLOC => dma_alloc_channel(),
         dma_raw::channel::FREE => {
-            if !is_dma_channel_handle(handle) { return E_INVAL; }
+            if !is_dma_channel_handle(handle) {
+                return E_INVAL;
+            }
             dma_free_channel(handle as u8)
         }
         dma_raw::channel::START => {
-            if !is_dma_channel_handle(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 14 { return E_INVAL; }
+            if !is_dma_channel_handle(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 14 {
+                return E_INVAL;
+            }
             let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let write_addr = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            let write_addr =
+                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             let dreq = *arg.add(12);
             let flags = *arg.add(13);
             dma_start_raw(handle as u8, read_addr, write_addr, count, dreq, flags)
         }
         dma_raw::channel::BUSY => {
-            if !is_dma_channel_handle(handle) { return E_INVAL; }
+            if !is_dma_channel_handle(handle) {
+                return E_INVAL;
+            }
             dma_busy(handle as u8)
         }
         dma_raw::channel::ABORT => {
-            if !is_dma_channel_handle(handle) { return E_INVAL; }
+            if !is_dma_channel_handle(handle) {
+                return E_INVAL;
+            }
             dma_abort(handle as u8)
         }
         spi9_raw::SEND => {
             // 9-bit SPI bit-bang: send command + data using raw PAC GPIO.
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let cs = *arg;
             let sck = *arg.add(1);
             let sda = *arg.add(2);
             let cmd = *arg.add(3);
             let data_len = *arg.add(4) as usize;
-            if arg_len < 5 + data_len { return E_INVAL; }
-            let hold_cs = if arg_len > 5 + data_len { *arg.add(5 + data_len) != 0 } else { false };
+            if arg_len < 5 + data_len {
+                return E_INVAL;
+            }
+            let hold_cs = if arg_len > 5 + data_len {
+                *arg.add(5 + data_len) != 0
+            } else {
+                false
+            };
             spi9_pac_send(cs, sck, sda, cmd, arg.add(5), data_len, hold_cs);
             0
         }
         spi9_raw::RESET => {
             // 9-bit SPI reset: RST high->low->high + init SIO pins
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let rst = *arg;
             let cs = *arg.add(1);
             let sck = *arg.add(2);
@@ -630,7 +1218,9 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         }
         spi9_raw::CS_SET => {
             // Set CS pin level: arg=[cs_pin:u8, level:u8]
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             let cs = *arg;
             let level = *arg.add(1) != 0;
             spi9_pac_pin_set(cs, level);
@@ -639,10 +1229,18 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         // ── Raw SPI peripheral bridge ─────────────────────────────────
         spi_raw::REG_WRITE => {
             // handle=bus_id, arg=[offset:u8, value:u32 LE]
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4008_0000usize } else { 0x4009_0000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4008_0000usize
+            } else {
+                0x4009_0000usize
+            };
             let offset = (*arg as usize) & 0xFC; // 4-byte aligned
             let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             core::ptr::write_volatile((base + offset) as *mut u32, val);
@@ -650,40 +1248,65 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         }
         spi_raw::REG_READ => {
             // handle=bus_id, arg=[offset:u8], returns value in arg[1..5]
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4008_0000usize } else { 0x4009_0000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4008_0000usize
+            } else {
+                0x4009_0000usize
+            };
             let offset = (*arg as usize) & 0xFC;
             let val = core::ptr::read_volatile((base + offset) as *const u32);
             let bytes = val.to_le_bytes();
-            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            *arg.add(1) = bytes[0];
+            *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2];
+            *arg.add(4) = bytes[3];
             0
         }
         spi_raw::BUS_INFO => {
             // handle=bus_id, returns [dr_addr:u32, tx_dreq:u8, rx_dreq:u8, max_freq:u32, pad:u16]
-            if arg.is_null() || arg_len < 12 { return E_INVAL; }
+            if arg.is_null() || arg_len < 12 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
+            if bus > 1 {
+                return E_INVAL;
+            }
             let dr_addr: u32 = if bus == 0 { 0x4008_0008 } else { 0x4009_0008 };
             let tx_dreq: u8 = if bus == 0 { 16 } else { 18 };
             let rx_dreq: u8 = if bus == 0 { 17 } else { 19 };
             let max_freq: u32 = 150_000_000 / 2; // SPI max = Fsys/2 (default 150MHz)
             let dr = dr_addr.to_le_bytes();
-            *arg = dr[0]; *arg.add(1) = dr[1]; *arg.add(2) = dr[2]; *arg.add(3) = dr[3];
+            *arg = dr[0];
+            *arg.add(1) = dr[1];
+            *arg.add(2) = dr[2];
+            *arg.add(3) = dr[3];
             *arg.add(4) = tx_dreq;
             *arg.add(5) = rx_dreq;
             let mf = max_freq.to_le_bytes();
-            *arg.add(6) = mf[0]; *arg.add(7) = mf[1]; *arg.add(8) = mf[2]; *arg.add(9) = mf[3];
-            *arg.add(10) = 0; *arg.add(11) = 0;
+            *arg.add(6) = mf[0];
+            *arg.add(7) = mf[1];
+            *arg.add(8) = mf[2];
+            *arg.add(9) = mf[3];
+            *arg.add(10) = 0;
+            *arg.add(11) = 0;
             0
         }
         spi_raw::PIN_INIT => {
             // handle=bus_id, arg=[clk:u8, mosi:u8, miso:u8]
-            if arg.is_null() || arg_len < 3 { return E_INVAL; }
+            if arg.is_null() || arg_len < 3 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
+            if bus > 1 {
+                return E_INVAL;
+            }
             let funcsel: u32 = 1; // SPI function on RP2350
             let pins = [*arg, *arg.add(1), *arg.add(2)];
             let mut i = 0usize;
@@ -703,42 +1326,71 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         }
         // ── Raw I2C peripheral bridge ──────────────────────────────────
         i2c_raw::REG_WRITE => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4009_0000usize } else { 0x4009_8000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4009_0000usize
+            } else {
+                0x4009_8000usize
+            };
             let offset = (*arg as usize) & 0xFC;
             let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             core::ptr::write_volatile((base + offset) as *mut u32, val);
             0
         }
         i2c_raw::REG_READ => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4009_0000usize } else { 0x4009_8000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4009_0000usize
+            } else {
+                0x4009_8000usize
+            };
             let offset = (*arg as usize) & 0xFC;
             let val = core::ptr::read_volatile((base + offset) as *const u32);
             let bytes = val.to_le_bytes();
-            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            *arg.add(1) = bytes[0];
+            *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2];
+            *arg.add(4) = bytes[3];
             0
         }
         i2c_raw::BUS_INFO => {
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            if arg.is_null() || arg_len < 8 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
+            if bus > 1 {
+                return E_INVAL;
+            }
             let data_cmd: u32 = if bus == 0 { 0x4009_0010 } else { 0x4009_8010 }; // IC_DATA_CMD
             let tx_dreq: u8 = if bus == 0 { 20 } else { 22 }; // I2C0_TX=20, I2C1_TX=22
             let rx_dreq: u8 = if bus == 0 { 21 } else { 23 };
             let dc = data_cmd.to_le_bytes();
-            *arg = dc[0]; *arg.add(1) = dc[1]; *arg.add(2) = dc[2]; *arg.add(3) = dc[3];
-            *arg.add(4) = tx_dreq; *arg.add(5) = rx_dreq;
-            *arg.add(6) = 0; *arg.add(7) = 0;
+            *arg = dc[0];
+            *arg.add(1) = dc[1];
+            *arg.add(2) = dc[2];
+            *arg.add(3) = dc[3];
+            *arg.add(4) = tx_dreq;
+            *arg.add(5) = rx_dreq;
+            *arg.add(6) = 0;
+            *arg.add(7) = 0;
             0
         }
         i2c_raw::PIN_INIT => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             let funcsel: u32 = 3; // I2C function on RP2350
             let pins = [*arg, *arg.add(1)];
             let mut i = 0usize;
@@ -756,39 +1408,67 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         i2c_raw::SET_ENABLE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4009_0000usize } else { 0x4009_8000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4009_0000usize
+            } else {
+                0x4009_8000usize
+            };
             // IC_ENABLE at offset 0x6C
             core::ptr::write_volatile((base + 0x6C) as *mut u32, if *arg != 0 { 1 } else { 0 });
             0
         }
         // ── Raw UART peripheral bridge ─────────────────────────────────
         uart_raw::REG_WRITE => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4007_0000usize } else { 0x4007_8000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4007_0000usize
+            } else {
+                0x4007_8000usize
+            };
             let offset = (*arg as usize) & 0xFC;
             let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
             core::ptr::write_volatile((base + offset) as *mut u32, val);
             0
         }
         uart_raw::REG_READ => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4007_0000usize } else { 0x4007_8000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4007_0000usize
+            } else {
+                0x4007_8000usize
+            };
             let offset = (*arg as usize) & 0xFC;
             let val = core::ptr::read_volatile((base + offset) as *const u32);
             let bytes = val.to_le_bytes();
-            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            *arg.add(1) = bytes[0];
+            *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2];
+            *arg.add(4) = bytes[3];
             0
         }
         uart_raw::PIN_INIT => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             let funcsel: u32 = 2; // UART function on RP2350
             let pins = [*arg, *arg.add(1)];
             let mut i = 0usize;
@@ -805,14 +1485,23 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         uart_raw::SET_ENABLE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4007_0000usize } else { 0x4007_8000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4007_0000usize
+            } else {
+                0x4007_8000usize
+            };
             // UARTCR at offset 0x30
             let cr = core::ptr::read_volatile((base + 0x30) as *const u32);
             if *arg != 0 {
-                core::ptr::write_volatile((base + 0x30) as *mut u32, cr | 0x301); // UARTEN + TXE + RXE
+                core::ptr::write_volatile((base + 0x30) as *mut u32, cr | 0x301);
+            // UARTEN + TXE + RXE
             } else {
                 core::ptr::write_volatile((base + 0x30) as *mut u32, cr & !1); // clear UARTEN
             }
@@ -820,7 +1509,9 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         }
         // ── Raw ADC peripheral bridge ──────────────────────────────────
         adc_raw::REG_WRITE => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let base = 0x400A_0000usize;
             let offset = (*arg as usize) & 0xFC;
             let val = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
@@ -828,19 +1519,27 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
             0
         }
         adc_raw::REG_READ => {
-            if arg.is_null() || arg_len < 5 { return E_INVAL; }
+            if arg.is_null() || arg_len < 5 {
+                return E_INVAL;
+            }
             let base = 0x400A_0000usize;
             let offset = (*arg as usize) & 0xFC;
             let val = core::ptr::read_volatile((base + offset) as *const u32);
             let bytes = val.to_le_bytes();
-            *arg.add(1) = bytes[0]; *arg.add(2) = bytes[1];
-            *arg.add(3) = bytes[2]; *arg.add(4) = bytes[3];
+            *arg.add(1) = bytes[0];
+            *arg.add(2) = bytes[1];
+            *arg.add(3) = bytes[2];
+            *arg.add(4) = bytes[3];
             0
         }
         adc_raw::PIN_INIT => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let pin = *arg;
-            if pin < 26 || pin > 29 { return E_INVAL; }
+            if pin < 26 || pin > 29 {
+                return E_INVAL;
+            }
             let pad_base = 0x4003_8004usize + (pin as usize) * 4;
             // ADC: disable digital input (IE=0), no pulls
             core::ptr::write_volatile(pad_base as *mut u32, 0x80); // ISO=1 (analog mode)
@@ -849,31 +1548,46 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         // ── SPI bridge (continued) ─────────────────────────────────────
         spi_raw::SET_ENABLE => {
             // handle=bus_id, arg=[enable:u8]
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let bus = handle as u8;
-            if bus > 1 { return E_INVAL; }
-            let base = if bus == 0 { 0x4008_0000usize } else { 0x4009_0000usize };
+            if bus > 1 {
+                return E_INVAL;
+            }
+            let base = if bus == 0 {
+                0x4008_0000usize
+            } else {
+                0x4009_0000usize
+            };
             let cr1 = core::ptr::read_volatile((base + 0x04) as *const u32);
             if *arg != 0 {
-                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 | (1 << 1)); // SSE=1
+                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 | (1 << 1));
+            // SSE=1
             } else {
-                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 & !(1 << 1)); // SSE=0
+                core::ptr::write_volatile((base + 0x04) as *mut u32, cr1 & !(1 << 1));
+                // SSE=0
             }
             0
         }
         flash::SIDEBAND => {
             use crate::abi::internal::flash::sideband_op as flash_sideband_op;
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             match *arg {
                 flash_sideband_op::READ_CS => crate::kernel::resource::flash_sideband_read_cs(),
                 flash_sideband_op::XIP_READ => {
-                    if arg_len < 6 { return E_INVAL; }
-                    let offset = u32::from_le_bytes([
-                        *arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4),
-                    ]);
+                    if arg_len < 6 {
+                        return E_INVAL;
+                    }
+                    let offset =
+                        u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
                     const FLASH_SIZE: u32 = 0x0040_0000;
                     let data_len = arg_len - 5;
-                    if offset >= FLASH_SIZE { return E_INVAL; }
+                    if offset >= FLASH_SIZE {
+                        return E_INVAL;
+                    }
                     let avail = (FLASH_SIZE - offset) as usize;
                     let copy_len = if data_len < avail { data_len } else { avail };
                     let xip_src = (0x1000_0000u32 + offset) as *const u8;
@@ -885,55 +1599,77 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         }
         // ── Runtime parameter store ──
         runtime_params::STORE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let module_id = crate::kernel::scheduler::current_module_index() as u8;
             let mut fwd = [0u8; 252];
             fwd[0] = module_id;
             let n = if arg_len > 251 { 251 } else { arg_len };
             core::ptr::copy_nonoverlapping(arg, fwd.as_mut_ptr().add(1), n);
             crate::kernel::flash_store::dispatch_param_op(
-                runtime_params::STORE, fwd.as_mut_ptr(), 1 + n)
+                runtime_params::STORE,
+                fwd.as_mut_ptr(),
+                1 + n,
+            )
         }
         runtime_params::DELETE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let module_id = crate::kernel::scheduler::current_module_index() as u8;
             let mut fwd = [module_id, *arg];
             crate::kernel::flash_store::dispatch_param_op(
-                runtime_params::DELETE, fwd.as_mut_ptr(), 2)
+                runtime_params::DELETE,
+                fwd.as_mut_ptr(),
+                2,
+            )
         }
         runtime_params::CLEAR_ALL => {
             if arg_len >= 1 && !arg.is_null() && *arg == 0xFF {
                 let mut fwd = [0xFFu8];
                 crate::kernel::flash_store::dispatch_param_op(
-                    runtime_params::CLEAR_ALL, fwd.as_mut_ptr(), 1)
+                    runtime_params::CLEAR_ALL,
+                    fwd.as_mut_ptr(),
+                    1,
+                )
             } else {
                 let module_id = crate::kernel::scheduler::current_module_index() as u8;
                 let mut fwd = [module_id];
                 crate::kernel::flash_store::dispatch_param_op(
-                    runtime_params::CLEAR_ALL, fwd.as_mut_ptr(), 1)
+                    runtime_params::CLEAR_ALL,
+                    fwd.as_mut_ptr(),
+                    1,
+                )
             }
         }
         // ── Flash store bridge ──
         FLASH_STORE_ENABLE => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let fn_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let module_idx = crate::kernel::scheduler::current_module_index();
             // Resolve export hash to absolute address (PIC-safe)
-            let resolved_addr = crate::kernel::loader::resolve_export_for_module(
-                module_idx, fn_addr
-            ).unwrap_or(fn_addr as usize);
+            let resolved_addr =
+                crate::kernel::loader::resolve_export_for_module(module_idx, fn_addr)
+                    .unwrap_or(fn_addr as usize);
             let dispatch: crate::kernel::flash_store::FlashStoreDispatchFn =
                 core::mem::transmute(resolved_addr);
             let state = crate::kernel::scheduler::get_module_state(module_idx);
             crate::kernel::flash_store::register_dispatch(dispatch, state)
         }
         flash::RAW_ERASE => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             crate::kernel::flash_store::raw_erase(offset)
         }
         flash::RAW_PROGRAM => {
-            if arg.is_null() || arg_len < 4 + 256 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 + 256 {
+                return E_INVAL;
+            }
             let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             crate::kernel::flash_store::raw_program(offset, arg.add(4))
         }
@@ -944,40 +1680,55 @@ unsafe fn rp_system_extension_dispatch(handle: i32, opcode: u32, arg: *mut u8, a
         // Every follow-up op rejects raw channel numbers via
         // `is_dma_fd_handle` so passing `channel::ALLOC`'s return value
         // to `fd::START` fails fast with EINVAL.
-        dma_raw::fd::CREATE => {
-            dma_fd_create()
-        }
+        dma_raw::fd::CREATE => dma_fd_create(),
         dma_raw::fd::START => {
-            if !is_dma_fd_handle(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 14 { return E_INVAL; }
+            if !is_dma_fd_handle(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 14 {
+                return E_INVAL;
+            }
             let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let write_addr = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            let write_addr =
+                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             let dreq = *arg.add(12);
             let flags = *arg.add(13);
             dma_fd_start(handle, read_addr, write_addr, count, dreq, flags)
         }
         dma_raw::fd::RESTART => {
-            if !is_dma_fd_handle(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            if !is_dma_fd_handle(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 8 {
+                return E_INVAL;
+            }
             let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             dma_fd_restart(handle, read_addr, count)
         }
         dma_raw::fd::FREE => {
-            if !is_dma_fd_handle(handle) { return E_INVAL; }
+            if !is_dma_fd_handle(handle) {
+                return E_INVAL;
+            }
             dma_fd_free(handle)
         }
         dma_raw::fd::QUEUE => {
-            if !is_dma_fd_handle(handle) { return E_INVAL; }
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            if !is_dma_fd_handle(handle) {
+                return E_INVAL;
+            }
+            if arg.is_null() || arg_len < 8 {
+                return E_INVAL;
+            }
             let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             dma_fd_queue(handle, read_addr, count)
         }
         // ── SYS_CLOCK_HZ ──
         SYS_CLOCK_HZ => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             *(arg as *mut u32) = embassy_rp::clocks::clk_sys_freq();
             0
         }
@@ -995,25 +1746,25 @@ unsafe fn rp_dev_query_extension(handle: i32, key: u32, out: *mut u8, out_len: u
     use crate::kernel::provider::contract as dev_class;
     let class = ((key >> 8) & 0xFF) as u16;
     match class {
-        dev_class::GPIO => {
-            match key {
-                dev_gpio::GET_LEVEL => {
-                    if !gpio::gpio_check_owner(handle) { return E_INVAL; }
-                    gpio::gpio_get_level(handle)
+        dev_class::GPIO => match key {
+            dev_gpio::GET_LEVEL => {
+                if !gpio::gpio_check_owner(handle) {
+                    return E_INVAL;
                 }
-                _ => E_NOSYS,
+                gpio::gpio_get_level(handle)
             }
-        }
-        dev_class::INTERNAL_DISPATCH_BUCKET => {
-            match key {
-                SYS_CLOCK_HZ => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
-                    *(out as *mut u32) = embassy_rp::clocks::clk_sys_freq();
-                    0
+            _ => E_NOSYS,
+        },
+        dev_class::INTERNAL_DISPATCH_BUCKET => match key {
+            SYS_CLOCK_HZ => {
+                if out.is_null() || out_len < 4 {
+                    return E_INVAL;
                 }
-                _ => E_NOSYS,
+                *(out as *mut u32) = embassy_rp::clocks::clk_sys_freq();
+                0
             }
-        }
+            _ => E_NOSYS,
+        },
         _ => E_NOSYS,
     }
 }
@@ -1043,7 +1794,7 @@ fn init_rp_providers() {
 static GPIO_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::HAL_GPIO,
-        call:  gpio_provider_dispatch,
+        call: gpio_provider_dispatch,
         query: None,
         default_close_op: crate::abi::contracts::hal::gpio::RELEASE,
     };

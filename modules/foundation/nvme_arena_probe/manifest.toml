@@ -1,0 +1,3 @@
+version = "1.0.0"
+hardware_targets = ["cm5", "bcm2712"]
+permissions = ["backing_provider"]

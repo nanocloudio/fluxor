@@ -70,7 +70,7 @@ pub mod contract {
     /// transfers). The `platform_raw` permission gates the opcodes in
     /// addition to the contract claim. Kernel-side handle-type
     /// enforcement is in `is_dma_channel_handle` in
-    /// `src/platform/rp_providers.rs`.
+    /// `src/platform/rp/providers.rs`.
     pub const PLATFORM_DMA: u16 = 0x0008;
     /// Async DMA fd with ping-pong queuing. Handle returned by
     /// `fd::CREATE` is an FD_TAG_DMA-tagged fd. Used by drivers that
@@ -79,7 +79,7 @@ pub mod contract {
     /// that use both families declare both in `[[resources]]`. The
     /// `platform_raw` permission gates the opcodes in addition to the
     /// contract claim. Kernel-side handle-type enforcement is in
-    /// `is_dma_fd_handle` in `src/platform/rp_providers.rs`.
+    /// `is_dma_fd_handle` in `src/platform/rp/providers.rs`.
     pub const PLATFORM_DMA_FD: u16 = 0x0011;
     pub const HAL_UART:    u16 = 0x000D;
     pub const HAL_ADC:     u16 = 0x000E;

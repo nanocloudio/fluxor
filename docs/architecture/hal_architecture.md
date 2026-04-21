@@ -377,7 +377,7 @@ with the union of every supported peripheral.
 | Scheduler | `src/kernel/scheduler.rs` |
 | Chip abstraction | `src/kernel/chip.rs` (+ generated `chip_generated.rs`) |
 | RP HAL | `src/platform/rp.rs`, `src/io/*.rs` |
-| BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712_*.rs` |
+| BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712/*.rs` |
 | Silicon definitions | `targets/silicon/*.toml` |
 | Board definitions | `targets/boards/*.toml` |
 

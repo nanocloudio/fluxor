@@ -47,16 +47,16 @@ mod bcm2712_impl {
 
     // Descriptor bits
     const DESC_VALID: u64 = 1 << 0;
-    const DESC_TABLE: u64 = 1 << 1;     // L1: table descriptor (not block)
-    const DESC_BLOCK: u64 = 0 << 1;     // L1/L2: block descriptor (with VALID)
+    const DESC_TABLE: u64 = 1 << 1; // L1: table descriptor (not block)
+    const DESC_BLOCK: u64 = 0 << 1; // L1/L2: block descriptor (with VALID)
 
     // Lower attributes (block/page descriptors)
-    const ATTR_IDX_SHIFT: u64 = 2;      // AttrIndx[2:0] at bits [4:2]
-    const ATTR_NS: u64 = 1 << 5;        // Non-secure
-    const AP_SHIFT: u64 = 6;            // AP[2:1] at bits [7:6]
-    const SH_SHIFT: u64 = 8;            // SH[1:0] at bits [9:8]
-    const AF: u64 = 1 << 10;            // Access Flag
-    const _NG: u64 = 1 << 11;            // Not Global (use ASID)
+    const ATTR_IDX_SHIFT: u64 = 2; // AttrIndx[2:0] at bits [4:2]
+    const ATTR_NS: u64 = 1 << 5; // Non-secure
+    const AP_SHIFT: u64 = 6; // AP[2:1] at bits [7:6]
+    const SH_SHIFT: u64 = 8; // SH[1:0] at bits [9:8]
+    const AF: u64 = 1 << 10; // Access Flag
+    const _NG: u64 = 1 << 11; // Not Global (use ASID)
 
     // AP values
     /// EL1 RW, EL0 no access
@@ -69,11 +69,11 @@ mod bcm2712_impl {
     const AP_EL0_RO: u64 = 0b11;
 
     // Shareability
-    const SH_ISH: u64 = 0b11;  // Inner-shareable
+    const SH_ISH: u64 = 0b11; // Inner-shareable
 
     // Upper attributes
-    const PXN: u64 = 1 << 53;           // Privileged Execute-Never
-    const UXN: u64 = 1 << 54;           // Unprivileged Execute-Never (EL0 XN)
+    const PXN: u64 = 1 << 53; // Privileged Execute-Never
+    const UXN: u64 = 1 << 54; // Unprivileged Execute-Never (EL0 XN)
 
     // MAIR attribute indices (must match MAIR_EL1 setup)
     const ATTR_IDX_NORMAL: u64 = 0;
@@ -84,10 +84,9 @@ mod bcm2712_impl {
     /// Attr0: Normal, WB-WA inner+outer (0xFF)
     /// Attr1: Device-nGnRnE (0x00)
     /// Attr2: Normal non-cacheable (0x44)
-    const MAIR_VALUE: u64 =
-        (0xFF << 0) |   // Attr0: Normal memory, WB-WA
+    const MAIR_VALUE: u64 = (0xFF << 0) |   // Attr0: Normal memory, WB-WA
         (0x00 << 8) |   // Attr1: Device-nGnRnE
-        (0x44 << 16);   // Attr2: Normal non-cacheable
+        (0x44 << 16); // Attr2: Normal non-cacheable
 
     /// TCR_EL1 value for 4KB granule, 39-bit VA (512GB), ASID 8-bit.
     /// T0SZ = 25 (64-25=39 bit VA space)
@@ -97,13 +96,12 @@ mod bcm2712_impl {
     /// TG0 = 0b00 (4KB granule)
     /// A1 = 0 (TTBR0 ASID)
     /// AS = 0 (8-bit ASID)
-    const TCR_VALUE: u64 =
-        (25 << 0) |     // T0SZ = 25 → 39-bit VA
+    const TCR_VALUE: u64 = (25 << 0) |     // T0SZ = 25 → 39-bit VA
         (0b01 << 8) |   // IRGN0 = WB-WA
         (0b01 << 10) |  // ORGN0 = WB-WA
         (0b11 << 12) |  // SH0 = Inner-shareable
         (0b00 << 14) |  // TG0 = 4KB granule
-        (0b1 << 23);    // EPD1 = 1 (disable TTBR1 walks)
+        (0b1 << 23); // EPD1 = 1 (disable TTBR1 walks)
 
     // ========================================================================
     // Page table storage
@@ -153,10 +151,14 @@ mod bcm2712_impl {
     impl ModuleRegions {
         const fn empty() -> Self {
             Self {
-                code_base: 0, code_size: 0,
-                state_base: 0, state_size: 0,
-                heap_base: 0, heap_size: 0,
-                chan_base: 0, chan_size: 0,
+                code_base: 0,
+                code_size: 0,
+                state_base: 0,
+                state_size: 0,
+                heap_base: 0,
+                heap_size: 0,
+                chan_base: 0,
+                chan_size: 0,
             }
         }
     }
@@ -250,7 +252,8 @@ mod bcm2712_impl {
                     (i as u64) * L2_BLOCK_SIZE,
                     ATTR_IDX_DEVICE,
                     AP_EL1_RW,
-                    true, true, // No execute
+                    true,
+                    true, // No execute
                 );
             }
 
@@ -262,12 +265,8 @@ mod bcm2712_impl {
             KERNEL_L1.0[0] = make_table_desc(l2_addr);
             // Higher L1 entries: identity map as 1GB blocks for QEMU virt
             // (RAM at 0x4000_0000 = L1 index 1)
-            KERNEL_L1.0[1] = make_block_desc(
-                L1_BLOCK_SIZE,
-                ATTR_IDX_NORMAL,
-                AP_EL1_RW,
-                true, false,
-            );
+            KERNEL_L1.0[1] =
+                make_block_desc(L1_BLOCK_SIZE, ATTR_IDX_NORMAL, AP_EL1_RW, true, false);
 
             // Set MAIR_EL1
             core::arch::asm!("msr mair_el1, {}", in(reg) MAIR_VALUE);
@@ -323,9 +322,9 @@ mod bcm2712_impl {
                         l2.0[idx] = make_block_desc(
                             addr,
                             ATTR_IDX_NORMAL,
-                            AP_EL0_RO,   // EL0 RO
-                            false,       // UXN=0 (EL0 can execute)
-                            true,        // PXN=1 (EL1 shouldn't execute module code)
+                            AP_EL0_RO, // EL0 RO
+                            false,     // UXN=0 (EL0 can execute)
+                            true,      // PXN=1 (EL1 shouldn't execute module code)
                         );
                     }
                     addr += L2_BLOCK_SIZE;
@@ -344,7 +343,8 @@ mod bcm2712_impl {
                             addr,
                             ATTR_IDX_NORMAL,
                             AP_EL0_RW,
-                            true, true, // No execute
+                            true,
+                            true, // No execute
                         );
                     }
                     addr += L2_BLOCK_SIZE;
@@ -359,12 +359,7 @@ mod bcm2712_impl {
                 while addr < end {
                     let idx = l2_index(addr);
                     if idx < TABLE_ENTRIES {
-                        l2.0[idx] = make_block_desc(
-                            addr,
-                            ATTR_IDX_NORMAL,
-                            AP_EL0_RW,
-                            true, true,
-                        );
+                        l2.0[idx] = make_block_desc(addr, ATTR_IDX_NORMAL, AP_EL0_RW, true, true);
                     }
                     addr += L2_BLOCK_SIZE;
                 }
@@ -378,12 +373,7 @@ mod bcm2712_impl {
                 while addr < end {
                     let idx = l2_index(addr);
                     if idx < TABLE_ENTRIES {
-                        l2.0[idx] = make_block_desc(
-                            addr,
-                            ATTR_IDX_NORMAL,
-                            AP_EL0_RW,
-                            true, true,
-                        );
+                        l2.0[idx] = make_block_desc(addr, ATTR_IDX_NORMAL, AP_EL0_RW, true, true);
                     }
                     addr += L2_BLOCK_SIZE;
                 }
@@ -416,8 +406,16 @@ mod bcm2712_impl {
                 code_size,
                 state_base: state_ptr as u64,
                 state_size: state_size as u64,
-                heap_base: if heap_ptr.is_null() { 0 } else { heap_ptr as u64 },
-                heap_size: if heap_ptr.is_null() { 0 } else { heap_size as u64 },
+                heap_base: if heap_ptr.is_null() {
+                    0
+                } else {
+                    heap_ptr as u64
+                },
+                heap_size: if heap_ptr.is_null() {
+                    0
+                } else {
+                    heap_size as u64
+                },
                 chan_base: 0,
                 chan_size: 0,
             };
@@ -436,7 +434,7 @@ mod bcm2712_impl {
     }
 
     // ========================================================================
-    // ASID management (E8-S7)
+    // ASID management
     // ========================================================================
 
     /// Switch TTBR0_EL1 to a module's page table with its ASID.
@@ -484,11 +482,13 @@ mod bcm2712_impl {
 
     /// Enable or disable MMU isolation.
     pub fn set_enabled(enabled: bool) {
-        unsafe { ISOLATION_ENABLED = enabled; }
+        unsafe {
+            ISOLATION_ENABLED = enabled;
+        }
     }
 
     // ========================================================================
-    // EL1/EL0 transitions (E8-S8)
+    // EL1/EL0 transitions
     // ========================================================================
 
     /// Enter EL0 to execute module_step, return to EL1 via SVC.
@@ -515,7 +515,7 @@ mod bcm2712_impl {
         // This gives us memory isolation (the module can only access
         // pages mapped in its page table) without the complexity of
         // full EL0 transition + SVC return.
-        // Full EL0 transition is deferred to E8-S8 follow-up.
+        // Full EL0 transition is left for a follow-up implementation.
         step_fn(state_ptr)
     }
 
@@ -542,7 +542,9 @@ mod bcm2712_impl {
                     Err(e) => {
                         log::error!(
                             "[mmu] pager fault failed for module {} at 0x{:016x}: {:?}",
-                            module_idx, far, e
+                            module_idx,
+                            far,
+                            e
                         );
                         // Fall through to record as MPU fault
                     }
@@ -552,7 +554,10 @@ mod bcm2712_impl {
 
         log::error!(
             "[mmu] module {} data abort at 0x{:016x} ESR=0x{:08x} DFSC=0x{:02x}",
-            module_idx, far, esr, dfsc
+            module_idx,
+            far,
+            esr,
+            dfsc
         );
 
         // Record fault via step_guard
@@ -560,7 +565,7 @@ mod bcm2712_impl {
     }
 
     // ========================================================================
-    // L3 page table support for 4KB demand paging (E10)
+    // L3 page table support for 4KB demand paging
     // ========================================================================
 
     /// L3 page table (512 entries, each maps a 4KB page).
@@ -724,10 +729,11 @@ pub fn register_module(
 ) {
     #[cfg(feature = "chip-bcm2712")]
     bcm2712_impl::register_module_regions(
-        module_idx, code_base, code_size,
-        state_ptr, state_size, heap_ptr, heap_size,
+        module_idx, code_base, code_size, state_ptr, state_size, heap_ptr, heap_size,
     );
-    let _ = (module_idx, code_base, code_size, state_ptr, state_size, heap_ptr, heap_size);
+    let _ = (
+        module_idx, code_base, code_size, state_ptr, state_size, heap_ptr, heap_size,
+    );
 }
 
 /// Set channel buffer region for a module.

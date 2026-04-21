@@ -190,7 +190,7 @@ pub fn release_timers_owned_by(module_idx: u8) {
 
 // DMA FD operations (create, start, queue, restart, free, poll, release)
 // are platform-specific (RP-only, using PAC DMA registers).
-// They remain in syscalls.rs / rp_providers.rs behind the platform include!.
+// They remain in syscalls.rs / rp/providers.rs behind the platform include!.
 // The fd_poll dispatch below routes DMA tags to the platform's dma_fd_poll function.
 
 /// Platform DMA FD poll function pointer — set by RP platform at init.

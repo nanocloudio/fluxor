@@ -1220,7 +1220,7 @@ pub unsafe extern "C" fn syscall_micros() -> u64 {
     hal::now_micros()
 }
 
-// DMA channel allocation and bridge — platform-specific, moved to rp_providers.rs
+// DMA channel allocation and bridge — platform-specific, moved to rp/providers.rs
 
 // ============================================================================
 // Device Query
@@ -1448,4 +1448,4 @@ unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u
 }
 
 // RP platform providers are now registered via HAL (init_providers / release_module_handles).
-// The rp_providers.rs file is included from the rp_hal module instead.
+// The rp/providers.rs file is included from the RP platform entrypoint instead.

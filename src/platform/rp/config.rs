@@ -5,8 +5,8 @@
 //! Pure function: no side effects, no hardware access.
 
 use crate::kernel::config::{
-    HardwareConfig, SpiConfig, I2cConfig, GpioConfig,
-    MAX_SPI_BUSES, MAX_I2C_BUSES, MAX_GPIO_CONFIGS,
+    GpioConfig, HardwareConfig, I2cConfig, SpiConfig, MAX_GPIO_CONFIGS, MAX_I2C_BUSES,
+    MAX_SPI_BUSES,
 };
 
 /// Maximum PIO plan entries (cmd + stream + rx_stream, or up to 3 independent)
@@ -44,13 +44,29 @@ pub struct ResourcePlan {
 /// Conflict error — halts boot with a clear message.
 #[derive(Debug)]
 pub enum PlanError {
-    PinConflict { pin: u8, first: &'static str, second: &'static str },
-    PinOutOfRange { pin: u8, max: u8, label: &'static str },
-    InvalidSpiPins { bus: u8 },
-    InvalidI2cPins { bus: u8 },
-    PioConflict { pio_idx: u8 },
+    PinConflict {
+        pin: u8,
+        first: &'static str,
+        second: &'static str,
+    },
+    PinOutOfRange {
+        pin: u8,
+        max: u8,
+        label: &'static str,
+    },
+    InvalidSpiPins {
+        bus: u8,
+    },
+    InvalidI2cPins {
+        bus: u8,
+    },
+    PioConflict {
+        pio_idx: u8,
+    },
     Pio2OnVariantA,
-    DuplicateRole { role: u8 },
+    DuplicateRole {
+        role: u8,
+    },
 }
 
 /// Per-pin owner tracking for conflict messages.
@@ -62,16 +78,27 @@ struct PinOwners {
 
 impl PinOwners {
     fn new(max_gpio: u8) -> Self {
-        Self { owners: [""; 48], max_gpio }
+        Self {
+            owners: [""; 48],
+            max_gpio,
+        }
     }
 
     fn claim(&mut self, pin: u8, label: &'static str, pin_map: &mut u64) -> Result<(), PlanError> {
         let idx = pin as usize;
         if idx >= 48 {
-            return Err(PlanError::PinOutOfRange { pin, max: self.max_gpio, label });
+            return Err(PlanError::PinOutOfRange {
+                pin,
+                max: self.max_gpio,
+                label,
+            });
         }
         if pin >= self.max_gpio {
-            return Err(PlanError::PinOutOfRange { pin, max: self.max_gpio, label });
+            return Err(PlanError::PinOutOfRange {
+                pin,
+                max: self.max_gpio,
+                label,
+            });
         }
         let mask = 1u64 << idx;
         if *pin_map & mask != 0 {
@@ -218,7 +245,9 @@ pub fn resolve(hw: &HardwareConfig, max_gpio: u8) -> Result<ResourcePlan, PlanEr
     while i < pio_count {
         if let Some(pio) = &hw.pio[i] {
             if pio.pio_idx > 2 {
-                return Err(PlanError::PioConflict { pio_idx: pio.pio_idx });
+                return Err(PlanError::PioConflict {
+                    pio_idx: pio.pio_idx,
+                });
             }
             if pio.pio_idx == 2 && max_gpio < 48 {
                 return Err(PlanError::Pio2OnVariantA);
@@ -267,11 +296,15 @@ pub fn resolve(hw: &HardwareConfig, max_gpio: u8) -> Result<ResourcePlan, PlanEr
         if let Some(entry) = &plan.pio[i] {
             match entry.role {
                 PioRole::Cmd => {
-                    if has_cmd { return Err(PlanError::DuplicateRole { role: 0 }); }
+                    if has_cmd {
+                        return Err(PlanError::DuplicateRole { role: 0 });
+                    }
                     has_cmd = true;
                 }
                 PioRole::Stream => {
-                    if has_stream { return Err(PlanError::DuplicateRole { role: 1 }); }
+                    if has_stream {
+                        return Err(PlanError::DuplicateRole { role: 1 });
+                    }
                     has_stream = true;
                 }
                 PioRole::RxStream => {} // at most one per PIO block (uses SM1)

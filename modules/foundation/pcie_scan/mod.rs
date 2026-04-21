@@ -1,7 +1,7 @@
 //! PCIe Scan — PIC module for PCIe ECAM enumeration and BAR mapping.
 //!
 //! Extracts the PCIe enumeration and BAR management logic from
-//! `bcm2712_pcie.rs` into a PIC module. Uses the kernel's generic
+//! `src/platform/bcm2712/pcie.rs` into a PIC module. Uses the kernel's generic
 //! MMIO_READ32/WRITE32 bridges to access PCIe config space.
 //!
 //! On init (module_new): scans bus 0 of the configured controller and

@@ -112,7 +112,9 @@ struct CacheAlignedU32 {
 
 impl CacheAlignedU32 {
     const fn new(v: u32) -> Self {
-        Self { val: AtomicU32::new(v) }
+        Self {
+            val: AtomicU32::new(v),
+        }
     }
 }
 
@@ -147,13 +149,15 @@ impl CrossDomainChannel {
         {
             let my_core = current_core_id_inline();
             let prev = self.producer_core.compare_exchange(
-                PRODUCER_NONE, my_core,
-                Ordering::Relaxed, Ordering::Relaxed,
+                PRODUCER_NONE,
+                my_core,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             );
             match prev {
-                Ok(_) => {} // We claimed it
+                Ok(_) => {}                          // We claimed it
                 Err(owner) if owner == my_core => {} // Already ours
-                Err(_) => return false, // Different core owns this channel
+                Err(_) => return false,              // Different core owns this channel
             }
         }
 
@@ -258,12 +262,15 @@ impl CrossDomainChannel {
 #[inline(always)]
 fn current_core_id_inline() -> u32 {
     let mpidr: u64;
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
+    }
     ((mpidr >> 8) & 0xFF) as u32
 }
 
 // Static channel pool
-static CROSS_CHANNELS: [CrossDomainChannel; MAX_CROSS_CHANNELS] = [const { CrossDomainChannel::new() }; MAX_CROSS_CHANNELS];
+static CROSS_CHANNELS: [CrossDomainChannel; MAX_CROSS_CHANNELS] =
+    [const { CrossDomainChannel::new() }; MAX_CROSS_CHANNELS];
 
 /// Number of allocated cross-domain channels.
 static CROSS_CHANNEL_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -308,11 +315,8 @@ static mut CORE_ENTRIES: [Option<fn() -> !>; MAX_SECONDARY_CORES] = [None; MAX_S
 
 /// 1 once the secondary has reached `secondary_core_entry`. Cleared
 /// to 0 on boot.
-static CORE_STARTED: [AtomicU32; MAX_SECONDARY_CORES] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
+static CORE_STARTED: [AtomicU32; MAX_SECONDARY_CORES] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 
 /// Last PSCI CPU_ON return code per core — surfaced by the primary
 /// scheduler heartbeat as `[wake] core=N psci_rc=R` so a rig log
@@ -325,7 +329,9 @@ static LAST_PSCI_RET: [core::sync::atomic::AtomicI32; MAX_SECONDARY_CORES] = [
 ];
 
 pub fn last_psci_ret(core_id: u8) -> i32 {
-    if core_id == 0 || core_id > 3 { return i32::MAX; }
+    if core_id == 0 || core_id > 3 {
+        return i32::MAX;
+    }
     LAST_PSCI_RET[(core_id - 1) as usize].load(Ordering::Relaxed)
 }
 
@@ -351,7 +357,9 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
         return false;
     }
 
-    unsafe { CORE_ENTRIES[idx] = Some(entry); }
+    unsafe {
+        CORE_ENTRIES[idx] = Some(entry);
+    }
 
     let psci_cpu_on: u64 = 0xC4000003;
     let target_cpu: u64 = (core_id as u64) << 8;
@@ -359,7 +367,9 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     let context_id: u64 = 0;
 
     // Publish CORE_ENTRIES before the woken core reads it.
-    unsafe { core::arch::asm!("dsb sy", options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("dsb sy", options(nomem, nostack));
+    }
 
     let ret: u64;
     unsafe {
@@ -389,7 +399,9 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
         return false;
     }
 
-    unsafe { CORE_ENTRIES[idx] = Some(entry); }
+    unsafe {
+        CORE_ENTRIES[idx] = Some(entry);
+    }
 
     // PSCI CPU_ON via HVC (QEMU virt uses HVC for PSCI by default)
     let psci_cpu_on: u64 = 0xC4000003; // PSCI CPU_ON (SMC64)
@@ -527,14 +539,18 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
 unsafe extern "C" fn secondary_core_entry(core_id: u64) -> ! {
     let idx = (core_id as usize).wrapping_sub(1);
     if idx >= MAX_SECONDARY_CORES {
-        loop { core::arch::asm!("wfe"); }
+        loop {
+            core::arch::asm!("wfe");
+        }
     }
     CORE_STARTED[idx].store(1, Ordering::Release);
 
     if let Some(entry) = CORE_ENTRIES[idx] {
         entry()
     } else {
-        loop { core::arch::asm!("wfe"); }
+        loop {
+            core::arch::asm!("wfe");
+        }
     }
 }
 
@@ -751,7 +767,9 @@ pub mod rp1_dma {
     /// Addresses must be valid and within RP1-accessible space. Channel must not be in use.
     #[cfg(feature = "board-cm5")]
     pub unsafe fn start_transfer(ch: u8, src: usize, dst: usize, len: usize) {
-        if ch as usize >= NUM_CHANNELS { return; }
+        if ch as usize >= NUM_CHANNELS {
+            return;
+        }
         let base = channel_base(ch);
         // Source address (64-bit)
         core::ptr::write_volatile((base + SAR_LO) as *mut u32, src as u32);
@@ -779,7 +797,9 @@ pub mod rp1_dma {
     /// Returns `true` if the channel is no longer enabled (transfer complete).
     #[cfg(feature = "board-cm5")]
     pub fn poll(ch: u8) -> bool {
-        if ch as usize >= NUM_CHANNELS { return true; }
+        if ch as usize >= NUM_CHANNELS {
+            return true;
+        }
         unsafe {
             let ch_en_addr = super::RP1_DMA_BASE + CH_EN;
             let en_val = core::ptr::read_volatile(ch_en_addr as *const u32);
@@ -802,7 +822,7 @@ pub mod rp1_dma {
 }
 
 // ============================================================================
-// Non-cacheable DMA buffer arena (E6-S5)
+// Non-cacheable DMA buffer arena
 // ============================================================================
 
 /// Non-cacheable DMA buffer arena.
@@ -909,7 +929,8 @@ impl DomainExecState {
 }
 
 /// Global domain execution state, indexed by domain_id (0..MAX_DOMAINS).
-static mut DOMAIN_STATE: [DomainExecState; MAX_DOMAINS] = [const { DomainExecState::new() }; MAX_DOMAINS];
+static mut DOMAIN_STATE: [DomainExecState; MAX_DOMAINS] =
+    [const { DomainExecState::new() }; MAX_DOMAINS];
 
 /// Get mutable reference to domain state.
 ///
@@ -979,7 +1000,8 @@ impl CrossDomainEdge {
 pub const MAX_CROSS_EDGES: usize = 32;
 
 /// Global cross-domain edge table.
-static mut CROSS_EDGES: [CrossDomainEdge; MAX_CROSS_EDGES] = [const { CrossDomainEdge::empty() }; MAX_CROSS_EDGES];
+static mut CROSS_EDGES: [CrossDomainEdge; MAX_CROSS_EDGES] =
+    [const { CrossDomainEdge::empty() }; MAX_CROSS_EDGES];
 static CROSS_EDGE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Register a cross-domain edge. Returns the edge index, or None if full.
@@ -1056,7 +1078,9 @@ pub fn quiesce_requested() -> bool {
 /// and when no quiesce is in flight. Otherwise registers arrival and
 /// WFE-spins until `release_quiesce` clears the flag.
 pub fn park_if_requested(domain_id: usize) {
-    if domain_id == 0 || !quiesce_requested() { return; }
+    if domain_id == 0 || !quiesce_requested() {
+        return;
+    }
     PARKED_COUNT.fetch_add(1, Ordering::AcqRel);
     while quiesce_requested() {
         unsafe { core::arch::asm!("wfe", options(nostack)) };
@@ -1082,7 +1106,9 @@ pub fn non_primary_active_count() -> u32 {
     let mut n = 0u32;
     let mut i = 1usize;
     while i < MAX_DOMAINS {
-        if domain_state_ref(i).active { n += 1; }
+        if domain_state_ref(i).active {
+            n += 1;
+        }
         i += 1;
     }
     n

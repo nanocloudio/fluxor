@@ -43,7 +43,7 @@ const BACKING_EXTERNAL: u8 = 2;
 const WB_DEFERRED:  u8 = 0;
 
 /// Arena LBA base the kernel carves for the FIRST NVMe-backed arena.
-/// Mirrors `NVME_ARENA_LBA_BASE` in `bcm2712_backing_store.rs`. We
+/// Mirrors `NVME_ARENA_LBA_BASE` in `src/platform/bcm2712/memory.rs`. We
 /// surface it in the success line so Linux verification (`dd
 /// if=/dev/nvme0n1 skip=... count=...`) has a clear target.
 const NVME_ARENA_LBA_BASE: u64 = 0x0020_0000;

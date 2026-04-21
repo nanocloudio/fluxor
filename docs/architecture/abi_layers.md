@@ -126,7 +126,7 @@ contract's dispatcher accepts only its own opcodes; passing a handle
 or opcode from the other family routes through the wrong vtable and
 fails at dispatch. On top of that, every handler validates the
 incoming handle shape (`is_dma_channel_handle` and `is_dma_fd_handle`
-in [`src/platform/rp_providers.rs`](../../src/platform/rp_providers.rs))
+in [`src/platform/rp/providers.rs`](../../src/platform/rp/providers.rs))
 so a raw channel number passed to an fd op — or vice versa — returns
 `EINVAL` at the kernel boundary, not an opaque failure downstream.
 

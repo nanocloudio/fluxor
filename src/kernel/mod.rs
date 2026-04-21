@@ -14,10 +14,10 @@ pub static mut SECONDARY_MMU_TCR: u64 = 0;
 #[no_mangle]
 pub static mut SECONDARY_MMU_TTBR0: u64 = 0;
 
-pub mod hal;
 pub mod crypto;
 #[cfg(feature = "chip-bcm2712")]
 pub mod dtb;
+pub mod hal;
 pub mod key_vault;
 pub mod syscalls;
 
@@ -34,69 +34,79 @@ pub mod internal {
 // public ABI does not surface them.
 pub use internal::backing_provider;
 pub use internal::bridge;
+pub mod buffer_pool;
 pub mod channel;
 pub mod config;
-pub mod scheduler;
-pub mod loader;
-pub mod buffer_pool;
 pub mod errno;
 pub mod event;
+pub mod loader;
 pub mod log_ring;
+pub mod scheduler;
 pub mod uart_write;
 pub mod usb_write;
-#[cfg(feature = "rp")]
-#[path = "../platform/rp_resource.rs"]
-pub mod resource;
-pub mod ringbuf;
+
+// RP-family kernel services.
 pub mod fd;
+#[cfg(feature = "rp")]
+#[path = "../platform/rp/config.rs"]
+pub mod planner;
 pub mod provider;
 #[cfg(feature = "rp")]
-#[path = "../platform/rp_planner.rs"]
-pub mod planner;
+#[path = "../platform/rp/flash.rs"]
+mod rp_flash;
 #[cfg(feature = "rp")]
-#[path = "../platform/rp_flash_store.rs"]
-pub mod flash_store;
+pub use rp_flash::store as flash_store;
 #[cfg(feature = "rp")]
-#[path = "../platform/rp_chip.rs"]
+pub use rp_flash::xip_lock as resource;
+pub mod ringbuf;
+
+// Platform-selected chip backend.
+#[cfg(feature = "rp")]
+#[path = "../platform/rp/chip.rs"]
 pub mod chip;
 #[cfg(feature = "chip-bcm2712")]
-#[path = "../platform/bcm2712_chip.rs"]
+#[path = "../platform/bcm2712/chip.rs"]
 pub mod chip;
 #[cfg(feature = "host-linux")]
-#[path = "../platform/linux_chip.rs"]
+#[path = "../platform/linux/chip.rs"]
 pub mod chip;
-#[cfg(feature = "rp")]
-#[path = "../platform/rp_ext.rs"]
-pub mod rp_ext;
+
+#[cfg(feature = "chip-bcm2712")]
+#[path = "../platform/bcm2712/multicore.rs"]
+pub mod multicore;
 pub mod guard;
 pub mod heap;
-pub mod step_guard;
 pub mod isr_tier;
 #[cfg(feature = "chip-bcm2712")]
-#[path = "../platform/bcm2712_cross_domain.rs"]
-pub mod cross_domain;
-#[path = "../platform/rp_mpu.rs"]
+#[path = "../platform/bcm2712/mmu.rs"]
+pub mod mmu;
+#[path = "../platform/rp/mpu.rs"]
 pub mod mpu;
 #[cfg(feature = "chip-bcm2712")]
-#[path = "../platform/bcm2712_mmu.rs"]
-pub mod mmu;
-#[cfg(feature = "chip-bcm2712")]
-#[path = "../platform/bcm2712_pcie.rs"]
+#[path = "../platform/bcm2712/pcie.rs"]
 pub mod pcie;
+#[cfg(feature = "rp")]
+#[path = "../platform/rp/providers.rs"]
+pub mod rp_providers;
+pub mod step_guard;
+#[cfg(feature = "rp")]
+#[path = "../platform/rp/step_guard.rs"]
+pub mod rp_step_guard;
 // SMMU/IOMMU on BCM2712 lives in the `smmu` PIC module
 // (`modules/foundation/smmu/`) via MMIO bridges. CM5 NVMe uses
 // direct UBUS_REMAP inbound-DMA windowing and does not need SMMU.
+#[cfg(feature = "rp")]
+#[path = "../platform/rp/io.rs"]
+mod rp_io;
+#[cfg(feature = "rp")]
+pub use rp_io::gpio;
+#[cfg(feature = "rp")]
+pub use rp_io::pio as pio_util;
+#[path = "../platform/bcm2712/memory.rs"]
+mod bcm_memory;
+pub use bcm_memory::backing_store;
 #[cfg(feature = "chip-bcm2712")]
-#[path = "../platform/bcm2712_nic_ring.rs"]
+#[path = "../platform/bcm2712/net.rs"]
 pub mod nic_ring;
 pub mod page_pool;
-#[path = "../platform/bcm2712_backing_store.rs"]
-pub mod backing_store;
-#[path = "../platform/bcm2712_pager.rs"]
-pub mod pager;
-#[cfg(feature = "rp")]
-#[path = "../platform/rp_gpio.rs"]
-pub mod gpio;
-#[cfg(feature = "rp")]
-#[path = "../platform/rp_pio_util.rs"]
-pub mod pio_util;
+pub use bcm_memory::pager;

@@ -6,7 +6,6 @@
 // Compiler Intrinsics: ARM EABI memclr/memcpy for struct init/assignment.
 // Param Helpers: Safe(r) little-endian reads from a raw params pointer.
 
-
 // ============================================================================
 // Core runtime stubs for slice bounds-checking
 // ============================================================================
@@ -19,7 +18,9 @@
 #[allow(dead_code)]
 mod core_stubs {
     #[inline(never)]
-    pub fn slice_index_trap() -> ! { loop {} }
+    pub fn slice_index_trap() -> ! {
+        loop {}
+    }
 }
 
 // The compiler emits mangled calls into core::slice::index and core::panicking.
@@ -27,29 +28,47 @@ mod core_stubs {
 // extract new hashes: readelf -Ws module.o | grep UND
 // thumbv8m (RP2350):
 #[no_mangle]
-pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h4ded73b0c5f4c0cfE(_: usize, _: usize) -> ! {
+pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h4ded73b0c5f4c0cfE(
+    _: usize,
+    _: usize,
+) -> ! {
     loop {}
 }
 #[no_mangle]
-pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h974ddc284291fde1E(_: usize, _: usize) -> ! {
+pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h974ddc284291fde1E(
+    _: usize,
+    _: usize,
+) -> ! {
     loop {}
 }
 // aarch64 (BCM2712/Linux):
 #[no_mangle]
-pub extern "C" fn _ZN4core5slice5index16slice_index_fail17hf6dd4a5d97b8b298E(_: usize, _: usize) -> ! {
+pub extern "C" fn _ZN4core5slice5index16slice_index_fail17hf6dd4a5d97b8b298E(
+    _: usize,
+    _: usize,
+) -> ! {
     loop {}
 }
 #[no_mangle]
-pub extern "C" fn _ZN4core9panicking18panic_bounds_check17he29bb21320f32a38E(_: usize, _: usize) -> ! {
+pub extern "C" fn _ZN4core9panicking18panic_bounds_check17he29bb21320f32a38E(
+    _: usize,
+    _: usize,
+) -> ! {
     loop {}
 }
 // thumbv6m (RP2040):
 #[no_mangle]
-pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h9ac54fc02d7db528E(_: usize, _: usize) -> ! {
+pub extern "C" fn _ZN4core5slice5index16slice_index_fail17h9ac54fc02d7db528E(
+    _: usize,
+    _: usize,
+) -> ! {
     loop {}
 }
 #[no_mangle]
-pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h1329d9c5a4d8cefbE(_: usize, _: usize) -> ! {
+pub extern "C" fn _ZN4core9panicking18panic_bounds_check17h1329d9c5a4d8cefbE(
+    _: usize,
+    _: usize,
+) -> ! {
     loop {}
 }
 
@@ -105,11 +124,8 @@ pub unsafe extern "C" fn __aeabi_memset8(dest: *mut u8, n: usize, val: i32) {
 
 // Force retention of memset symbols that LTO might otherwise eliminate
 #[used]
-static _KEEP_MEMSET: [unsafe extern "C" fn(*mut u8, usize, i32); 3] = [
-    __aeabi_memset,
-    __aeabi_memset4,
-    __aeabi_memset8,
-];
+static _KEEP_MEMSET: [unsafe extern "C" fn(*mut u8, usize, i32); 3] =
+    [__aeabi_memset, __aeabi_memset4, __aeabi_memset8];
 
 // Use read_volatile/write_volatile in memcpy/memmove too — while LLVM
 // currently doesn't self-recurse these, future compiler versions might.
@@ -164,11 +180,8 @@ pub unsafe extern "C" fn __aeabi_memmove8(dest: *mut u8, src: *const u8, n: usiz
 }
 
 #[used]
-static _KEEP_MEMMOVE: [unsafe extern "C" fn(*mut u8, *const u8, usize); 3] = [
-    __aeabi_memmove,
-    __aeabi_memmove4,
-    __aeabi_memmove8,
-];
+static _KEEP_MEMMOVE: [unsafe extern "C" fn(*mut u8, *const u8, usize); 3] =
+    [__aeabi_memmove, __aeabi_memmove4, __aeabi_memmove8];
 
 // ============================================================================
 // Standard C memory functions (required on aarch64 — no __aeabi_* there)
@@ -220,7 +233,9 @@ pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 /// Unsigned 32-bit division: returns n / d. Returns 0 if d == 0.
 #[no_mangle]
 pub unsafe extern "C" fn __aeabi_uidiv(n: u32, d: u32) -> u32 {
-    if d == 0 { return 0; }
+    if d == 0 {
+        return 0;
+    }
     let mut quotient = 0u32;
     let mut remainder = 0u32;
     let mut i = 32u32;
@@ -246,12 +261,26 @@ pub unsafe extern "C" fn __aeabi_uidivmod(n: u32, d: u32) -> u64 {
 /// Signed 32-bit division: returns n / d (truncates toward zero). Returns 0 if d == 0.
 #[no_mangle]
 pub unsafe extern "C" fn __aeabi_idiv(n: i32, d: i32) -> i32 {
-    if d == 0 { return 0; }
+    if d == 0 {
+        return 0;
+    }
     let neg = (n < 0) != (d < 0);
-    let un = if n < 0 { (n as u32).wrapping_neg() } else { n as u32 };
-    let ud = if d < 0 { (d as u32).wrapping_neg() } else { d as u32 };
+    let un = if n < 0 {
+        (n as u32).wrapping_neg()
+    } else {
+        n as u32
+    };
+    let ud = if d < 0 {
+        (d as u32).wrapping_neg()
+    } else {
+        d as u32
+    };
     let q = __aeabi_uidiv(un, ud);
-    if neg { (q as i32).wrapping_neg() } else { q as i32 }
+    if neg {
+        (q as i32).wrapping_neg()
+    } else {
+        q as i32
+    }
 }
 
 /// Signed division-and-remainder: quotient in low 32 bits (r0), remainder in high 32 bits (r1).
@@ -308,7 +337,9 @@ fn umull32(a: u32, b: u32) -> (u32, u32) {
 pub unsafe extern "C" fn __aeabi_lmul(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> u64 {
     let (ll, lh) = umull32(a_lo, b_lo);
     // Cross terms only affect the high 32 bits of the 64-bit result
-    let cross = a_lo.wrapping_mul(b_hi).wrapping_add(a_hi.wrapping_mul(b_lo));
+    let cross = a_lo
+        .wrapping_mul(b_hi)
+        .wrapping_add(a_hi.wrapping_mul(b_lo));
     let result_hi = lh.wrapping_add(cross);
     (ll as u64) | ((result_hi as u64) << 32)
 }
@@ -317,8 +348,12 @@ pub unsafe extern "C" fn __aeabi_lmul(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32
 /// ARM EABI: r0=v_lo, r1=v_hi, r2=shift → r0:r1 = v << shift.
 #[no_mangle]
 pub unsafe extern "C" fn __aeabi_llsl(v_lo: u32, v_hi: u32, shift: u32) -> u64 {
-    if shift >= 64 { return 0; }
-    if shift == 0 { return (v_lo as u64) | ((v_hi as u64) << 32); }
+    if shift >= 64 {
+        return 0;
+    }
+    if shift == 0 {
+        return (v_lo as u64) | ((v_hi as u64) << 32);
+    }
     if shift >= 32 {
         let hi = v_lo << (shift - 32);
         return (hi as u64) << 32;
@@ -336,7 +371,9 @@ pub unsafe extern "C" fn __aeabi_lasr(v_lo: u32, v_hi: u32, shift: u32) -> u64 {
     if shift >= 64 {
         return (sign_fill as u64) | ((sign_fill as u64) << 32);
     }
-    if shift == 0 { return (v_lo as u64) | ((v_hi as u64) << 32); }
+    if shift == 0 {
+        return (v_lo as u64) | ((v_hi as u64) << 32);
+    }
     if shift >= 32 {
         let lo = ((v_hi as i32) >> (shift - 32)) as u32;
         return (lo as u64) | ((sign_fill as u64) << 32);
@@ -350,8 +387,12 @@ pub unsafe extern "C" fn __aeabi_lasr(v_lo: u32, v_hi: u32, shift: u32) -> u64 {
 /// ARM EABI: r0=v_lo, r1=v_hi, r2=shift → r0:r1 = v >> shift (unsigned).
 #[no_mangle]
 pub unsafe extern "C" fn __aeabi_llsr(v_lo: u32, v_hi: u32, shift: u32) -> u64 {
-    if shift >= 64 { return 0; }
-    if shift == 0 { return (v_lo as u64) | ((v_hi as u64) << 32); }
+    if shift >= 64 {
+        return 0;
+    }
+    if shift == 0 {
+        return (v_lo as u64) | ((v_hi as u64) << 32);
+    }
     if shift >= 32 {
         let lo = v_hi >> (shift - 32);
         return lo as u64;
@@ -531,10 +572,16 @@ pub unsafe fn drain_pending(
     pending_out: &mut u16,
     pending_offset: &mut u16,
 ) -> bool {
-    if *pending_out == 0 { return true; }
+    if *pending_out == 0 {
+        return true;
+    }
     let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
     if out_poll > 0 && (out_poll as u32 & POLL_OUT) != 0 {
-        let written = (sys.channel_write)(out_chan, buf.add(*pending_offset as usize), *pending_out as usize);
+        let written = (sys.channel_write)(
+            out_chan,
+            buf.add(*pending_offset as usize),
+            *pending_out as usize,
+        );
         if written > 0 {
             let w = written as u16;
             *pending_offset += w;
@@ -581,11 +628,7 @@ pub struct ChannelHint {
 /// # Safety
 /// `out` must point to a buffer of at least `max_len` bytes.
 #[inline(always)]
-pub unsafe fn write_channel_hints(
-    out: *mut u8,
-    max_len: usize,
-    hints: &[ChannelHint],
-) -> i32 {
+pub unsafe fn write_channel_hints(out: *mut u8, max_len: usize, hints: &[ChannelHint]) -> i32 {
     let needed = hints.len() * 4; // Each ChannelHint is 4 bytes
     if needed > max_len {
         return -1;
@@ -655,11 +698,16 @@ unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_bas
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
     let irq_bytes = irq.to_le_bytes();
-    *bp = irq_bytes[0]; *bp.add(1) = irq_bytes[1];
-    *bp.add(2) = irq_bytes[2]; *bp.add(3) = irq_bytes[3];
+    *bp = irq_bytes[0];
+    *bp.add(1) = irq_bytes[1];
+    *bp.add(2) = irq_bytes[2];
+    *bp.add(3) = irq_bytes[3];
     let mb = (mmio_base as u64).to_le_bytes();
     let mut i = 0;
-    while i < 8 { *bp.add(4 + i) = mb[i]; i += 1; }
+    while i < 8 {
+        *bp.add(4 + i) = mb[i];
+        i += 1;
+    }
     (sys.provider_call)(event_handle, 0x0C51, bp, 12)
 }
 
@@ -670,7 +718,11 @@ unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_bas
 unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
     let r = (sys.provider_query)(-1, 0x0C31, buf.as_mut_ptr(), 4);
-    if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
+    if r >= 0 {
+        u32::from_le_bytes(buf)
+    } else {
+        0
+    }
 }
 
 /// Query system clock frequency (kernel primitive SYS_CLOCK_HZ, opcode 0x0C3B).
@@ -680,7 +732,11 @@ unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
 unsafe fn dev_sys_clock_hz(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
     let r = (sys.provider_query)(-1, 0x0C3B, buf.as_mut_ptr(), 4);
-    if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
+    if r >= 0 {
+        u32::from_le_bytes(buf)
+    } else {
+        0
+    }
 }
 
 /// Query stream time via `provider_query(-1, kernel_abi::STREAM_TIME)`.
@@ -694,10 +750,14 @@ unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
     if r < 0 {
         return (0, 0, 0, 0);
     }
-    let consumed = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+    let consumed = u64::from_le_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
     let queued = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let rate_q16 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-    let t0 = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
+    let t0 = u64::from_le_bytes([
+        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    ]);
     (consumed, queued, rate_q16, t0)
 }
 
@@ -708,7 +768,11 @@ unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
 unsafe fn dev_downstream_latency(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
     let r = (sys.provider_query)(-1, 0x0C33, buf.as_mut_ptr(), 4);
-    if r >= 0 { u32::from_le_bytes(buf) } else { 0 }
+    if r >= 0 {
+        u32::from_le_bytes(buf)
+    } else {
+        0
+    }
 }
 
 /// Report module's processing latency (kernel primitive REPORT_LATENCY, opcode 0x0C50).
@@ -762,7 +826,9 @@ unsafe fn dev_channel_register_ioctl(
     sys: &SyscallTable,
     handle: i32,
     state: *mut core::ffi::c_void,
-    handler: Option<unsafe extern "C" fn(state: *mut core::ffi::c_void, cmd: u32, arg: *mut u8) -> i32>,
+    handler: Option<
+        unsafe extern "C" fn(state: *mut core::ffi::c_void, cmd: u32, arg: *mut u8) -> i32,
+    >,
 ) -> i32 {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&(state as u64).to_le_bytes());
@@ -803,7 +869,9 @@ unsafe fn dev_channel_query(
     let mut buf = [0u8; 4 + MAX_QUERY_ARG];
     buf[..4].copy_from_slice(&cmd.to_le_bytes());
     if arg_len > 0 {
-        if arg.is_null() { return -22; }
+        if arg.is_null() {
+            return -22;
+        }
         core::ptr::copy_nonoverlapping(arg, buf.as_mut_ptr().add(4), arg_len);
     }
     let result = (sys.provider_call)(handle, 0x0506, buf.as_mut_ptr(), 4 + arg_len);
@@ -817,7 +885,11 @@ unsafe fn dev_channel_query(
 /// Returns pointer (as *mut u8) or null. capacity_out receives buffer capacity.
 #[allow(dead_code)]
 #[inline(always)]
-unsafe fn dev_buffer_acquire_write(sys: &SyscallTable, chan: i32, capacity_out: *mut u32) -> *mut u8 {
+unsafe fn dev_buffer_acquire_write(
+    sys: &SyscallTable,
+    chan: i32,
+    capacity_out: *mut u32,
+) -> *mut u8 {
     (sys.provider_call)(chan, 0x0A00, capacity_out as *mut u8, 4) as *mut u8
 }
 
@@ -873,7 +945,9 @@ unsafe fn net_write_frame(
     scratch_max: usize,
 ) -> usize {
     let total = NET_FRAME_HDR + payload_len;
-    if chan < 0 || total > scratch_max { return 0; }
+    if chan < 0 || total > scratch_max {
+        return 0;
+    }
     // No poll pre-check: channel_write handles full buffers by returning 0.
     let len_le = (payload_len as u16).to_le_bytes();
     *scratch = msg_type;
@@ -899,16 +973,26 @@ unsafe fn net_read_frame(
     buf: *mut u8,
     buf_max: usize,
 ) -> (u8, usize) {
-    if chan < 0 || buf_max < NET_FRAME_HDR { return (0, 0); }
+    if chan < 0 || buf_max < NET_FRAME_HDR {
+        return (0, 0);
+    }
     // Step 1: read just the 3-byte TLV header
     let n = (sys.channel_read)(chan, buf, NET_FRAME_HDR);
-    if n < NET_FRAME_HDR as i32 { return (0, 0); }
+    if n < NET_FRAME_HDR as i32 {
+        return (0, 0);
+    }
     let msg_type = *buf;
     let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
-    if payload_len == 0 { return (msg_type, 0); }
+    if payload_len == 0 {
+        return (msg_type, 0);
+    }
     // Step 2: read exactly payload_len bytes into buf[3..]
     let max_payload = buf_max - NET_FRAME_HDR;
-    let to_read = if payload_len < max_payload { payload_len } else { max_payload };
+    let to_read = if payload_len < max_payload {
+        payload_len
+    } else {
+        max_payload
+    };
     let n2 = (sys.channel_read)(chan, buf.add(NET_FRAME_HDR), to_read);
     let actual = if n2 > 0 { n2 as usize } else { 0 };
     (msg_type, actual)
@@ -928,7 +1012,7 @@ unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
 ///
 /// Buffers returned here are Normal Non-cacheable memory — safe for device
 /// DMA without explicit cache maintenance. See
-/// `src/platform/bcm2712_nic_ring.rs` (the arena implementation) and
+/// `src/platform/bcm2712/net.rs` (the arena implementation) and
 /// `src/platform/bcm2712.rs` `init_page_tables()` (MAIR attr2 = 0x44).
 ///
 /// Bump-only for v1 — there is no matching `dev_dma_free`.
@@ -938,14 +1022,28 @@ unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     let mut buf = [0u8; 16];
     let bp = buf.as_mut_ptr();
     let sb = size.to_le_bytes();
-    *bp = sb[0]; *bp.add(1) = sb[1]; *bp.add(2) = sb[2]; *bp.add(3) = sb[3];
+    *bp = sb[0];
+    *bp.add(1) = sb[1];
+    *bp.add(2) = sb[2];
+    *bp.add(3) = sb[3];
     let ab = align.to_le_bytes();
-    *bp.add(4) = ab[0]; *bp.add(5) = ab[1]; *bp.add(6) = ab[2]; *bp.add(7) = ab[3];
+    *bp.add(4) = ab[0];
+    *bp.add(5) = ab[1];
+    *bp.add(6) = ab[2];
+    *bp.add(7) = ab[3];
     let rc = (sys.provider_call)(-1, 0x0CE6, bp, 16);
-    if rc != 0 { return 0; }
+    if rc != 0 {
+        return 0;
+    }
     u64::from_le_bytes([
-        *bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11),
-        *bp.add(12), *bp.add(13), *bp.add(14), *bp.add(15),
+        *bp.add(8),
+        *bp.add(9),
+        *bp.add(10),
+        *bp.add(11),
+        *bp.add(12),
+        *bp.add(13),
+        *bp.add(14),
+        *bp.add(15),
     ])
 }
 
@@ -962,14 +1060,28 @@ unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> 
     let mut buf = [0u8; 16];
     let bp = buf.as_mut_ptr();
     let sb = size.to_le_bytes();
-    *bp = sb[0]; *bp.add(1) = sb[1]; *bp.add(2) = sb[2]; *bp.add(3) = sb[3];
+    *bp = sb[0];
+    *bp.add(1) = sb[1];
+    *bp.add(2) = sb[2];
+    *bp.add(3) = sb[3];
     let ab = align.to_le_bytes();
-    *bp.add(4) = ab[0]; *bp.add(5) = ab[1]; *bp.add(6) = ab[2]; *bp.add(7) = ab[3];
+    *bp.add(4) = ab[0];
+    *bp.add(5) = ab[1];
+    *bp.add(6) = ab[2];
+    *bp.add(7) = ab[3];
     let rc = (sys.provider_call)(-1, 0x0CEC, bp, 16);
-    if rc != 0 { return 0; }
+    if rc != 0 {
+        return 0;
+    }
     u64::from_le_bytes([
-        *bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11),
-        *bp.add(12), *bp.add(13), *bp.add(14), *bp.add(15),
+        *bp.add(8),
+        *bp.add(9),
+        *bp.add(10),
+        *bp.add(11),
+        *bp.add(12),
+        *bp.add(13),
+        *bp.add(14),
+        *bp.add(15),
     ])
 }
 
@@ -982,10 +1094,19 @@ unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
     let ab = addr.to_le_bytes();
-    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
-    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    *bp = ab[0];
+    *bp.add(1) = ab[1];
+    *bp.add(2) = ab[2];
+    *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4];
+    *bp.add(5) = ab[5];
+    *bp.add(6) = ab[6];
+    *bp.add(7) = ab[7];
     let sb = size.to_le_bytes();
-    *bp.add(8) = sb[0]; *bp.add(9) = sb[1]; *bp.add(10) = sb[2]; *bp.add(11) = sb[3];
+    *bp.add(8) = sb[0];
+    *bp.add(9) = sb[1];
+    *bp.add(10) = sb[2];
+    *bp.add(11) = sb[3];
     (sys.provider_call)(-1, 0x0CEA, bp, 12)
 }
 
@@ -999,10 +1120,19 @@ unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
     let ab = addr.to_le_bytes();
-    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
-    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    *bp = ab[0];
+    *bp.add(1) = ab[1];
+    *bp.add(2) = ab[2];
+    *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4];
+    *bp.add(5) = ab[5];
+    *bp.add(6) = ab[6];
+    *bp.add(7) = ab[7];
     let sb = size.to_le_bytes();
-    *bp.add(8) = sb[0]; *bp.add(9) = sb[1]; *bp.add(10) = sb[2]; *bp.add(11) = sb[3];
+    *bp.add(8) = sb[0];
+    *bp.add(9) = sb[1];
+    *bp.add(10) = sb[2];
+    *bp.add(11) = sb[3];
     (sys.provider_call)(-1, 0x0CEB, bp, 12)
 }
 
@@ -1021,9 +1151,12 @@ unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u
     *bp = dev_idx;
     *bp.add(1) = 0;
     let ob = offset.to_le_bytes();
-    *bp.add(2) = ob[0]; *bp.add(3) = ob[1];
+    *bp.add(2) = ob[0];
+    *bp.add(3) = ob[1];
     let rc = (sys.provider_call)(-1, 0x0CF6, bp, 8);
-    if rc != 0 { return 0xFFFF_FFFF; }
+    if rc != 0 {
+        return 0xFFFF_FFFF;
+    }
     u32::from_le_bytes([*bp.add(4), *bp.add(5), *bp.add(6), *bp.add(7)])
 }
 
@@ -1037,9 +1170,13 @@ unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val
     *bp = dev_idx;
     *bp.add(1) = 0;
     let ob = offset.to_le_bytes();
-    *bp.add(2) = ob[0]; *bp.add(3) = ob[1];
+    *bp.add(2) = ob[0];
+    *bp.add(3) = ob[1];
     let vb = val.to_le_bytes();
-    *bp.add(4) = vb[0]; *bp.add(5) = vb[1]; *bp.add(6) = vb[2]; *bp.add(7) = vb[3];
+    *bp.add(4) = vb[0];
+    *bp.add(5) = vb[1];
+    *bp.add(6) = vb[2];
+    *bp.add(7) = vb[3];
     (sys.provider_call)(-1, 0x0CF7, bp, 8)
 }
 
@@ -1069,18 +1206,29 @@ unsafe fn dev_pcie1_msi_alloc_vector(
     let mut buf = [0u8; 20];
     let bp = buf.as_mut_ptr();
     let eb = event_handle.to_le_bytes();
-    *bp = eb[0]; *bp.add(1) = eb[1]; *bp.add(2) = eb[2]; *bp.add(3) = eb[3];
+    *bp = eb[0];
+    *bp.add(1) = eb[1];
+    *bp.add(2) = eb[2];
+    *bp.add(3) = eb[3];
     let rc = (sys.provider_call)(
         -1,
         abi::platform::bcm2712::pcie_nic::PCIE1_MSI_ALLOC_VECTOR,
         bp,
         20,
     );
-    if rc != 0 { return None; }
+    if rc != 0 {
+        return None;
+    }
     let vec = *bp.add(4);
     let addr = u64::from_le_bytes([
-        *bp.add(8),  *bp.add(9),  *bp.add(10), *bp.add(11),
-        *bp.add(12), *bp.add(13), *bp.add(14), *bp.add(15),
+        *bp.add(8),
+        *bp.add(9),
+        *bp.add(10),
+        *bp.add(11),
+        *bp.add(12),
+        *bp.add(13),
+        *bp.add(14),
+        *bp.add(15),
     ]);
     let data = u32::from_le_bytes([*bp.add(16), *bp.add(17), *bp.add(18), *bp.add(19)]);
     Some((vec, addr, data))
@@ -1105,9 +1253,15 @@ unsafe fn dev_backing_arena_register(
     let mut buf = [0u8; 10];
     let bp = buf.as_mut_ptr();
     let vp = virtual_pages.to_le_bytes();
-    *bp = vp[0]; *bp.add(1) = vp[1]; *bp.add(2) = vp[2]; *bp.add(3) = vp[3];
+    *bp = vp[0];
+    *bp.add(1) = vp[1];
+    *bp.add(2) = vp[2];
+    *bp.add(3) = vp[3];
     let rm = resident_max.to_le_bytes();
-    *bp.add(4) = rm[0]; *bp.add(5) = rm[1]; *bp.add(6) = rm[2]; *bp.add(7) = rm[3];
+    *bp.add(4) = rm[0];
+    *bp.add(5) = rm[1];
+    *bp.add(6) = rm[2];
+    *bp.add(7) = rm[3];
     *bp.add(8) = backing_type;
     *bp.add(9) = writeback;
     (sys.provider_call)(-1, 0x0CEE, bp, 10)
@@ -1128,10 +1282,19 @@ unsafe fn dev_backing_arena_write(
     *bp = arena_id;
     *bp.add(1) = 0;
     let vp = vpage_idx.to_le_bytes();
-    *bp.add(2) = vp[0]; *bp.add(3) = vp[1]; *bp.add(4) = vp[2]; *bp.add(5) = vp[3];
+    *bp.add(2) = vp[0];
+    *bp.add(3) = vp[1];
+    *bp.add(4) = vp[2];
+    *bp.add(5) = vp[3];
     let pb = (buf as u64).to_le_bytes();
-    *bp.add(6)  = pb[0]; *bp.add(7)  = pb[1]; *bp.add(8)  = pb[2]; *bp.add(9)  = pb[3];
-    *bp.add(10) = pb[4]; *bp.add(11) = pb[5]; *bp.add(12) = pb[6]; *bp.add(13) = pb[7];
+    *bp.add(6) = pb[0];
+    *bp.add(7) = pb[1];
+    *bp.add(8) = pb[2];
+    *bp.add(9) = pb[3];
+    *bp.add(10) = pb[4];
+    *bp.add(11) = pb[5];
+    *bp.add(12) = pb[6];
+    *bp.add(13) = pb[7];
     (sys.provider_call)(-1, 0x0CFE, bp, 14)
 }
 
@@ -1150,10 +1313,19 @@ unsafe fn dev_backing_arena_read(
     *bp = arena_id;
     *bp.add(1) = 0;
     let vp = vpage_idx.to_le_bytes();
-    *bp.add(2) = vp[0]; *bp.add(3) = vp[1]; *bp.add(4) = vp[2]; *bp.add(5) = vp[3];
+    *bp.add(2) = vp[0];
+    *bp.add(3) = vp[1];
+    *bp.add(4) = vp[2];
+    *bp.add(5) = vp[3];
     let pb = (buf as u64).to_le_bytes();
-    *bp.add(6)  = pb[0]; *bp.add(7)  = pb[1]; *bp.add(8)  = pb[2]; *bp.add(9)  = pb[3];
-    *bp.add(10) = pb[4]; *bp.add(11) = pb[5]; *bp.add(12) = pb[6]; *bp.add(13) = pb[7];
+    *bp.add(6) = pb[0];
+    *bp.add(7) = pb[1];
+    *bp.add(8) = pb[2];
+    *bp.add(9) = pb[3];
+    *bp.add(10) = pb[4];
+    *bp.add(11) = pb[5];
+    *bp.add(12) = pb[6];
+    *bp.add(13) = pb[7];
     (sys.provider_call)(-1, 0x0CEF, bp, 14)
 }
 
@@ -1186,7 +1358,12 @@ unsafe fn dev_param_store(sys: &SyscallTable, tag: u8, value: *const u8, len: us
         *bp.add(1 + i) = *value.add(i);
         i += 1;
     }
-    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::STORE, bp, 1 + copy_len)
+    (sys.provider_call)(
+        -1,
+        abi::contracts::storage::runtime_params::STORE,
+        bp,
+        1 + copy_len,
+    )
 }
 
 /// Store a u8 parameter override.
@@ -1194,7 +1371,12 @@ unsafe fn dev_param_store(sys: &SyscallTable, tag: u8, value: *const u8, len: us
 #[inline(always)]
 unsafe fn dev_param_store_u8(sys: &SyscallTable, tag: u8, val: u8) -> i32 {
     let mut buf = [tag, val];
-    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::STORE, buf.as_mut_ptr(), 2)
+    (sys.provider_call)(
+        -1,
+        abi::contracts::storage::runtime_params::STORE,
+        buf.as_mut_ptr(),
+        2,
+    )
 }
 
 /// Store a string parameter override.
@@ -1209,14 +1391,24 @@ unsafe fn dev_param_store_str(sys: &SyscallTable, tag: u8, s: *const u8, len: us
 #[inline(always)]
 unsafe fn dev_param_delete(sys: &SyscallTable, tag: u8) -> i32 {
     let mut buf = [tag];
-    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::DELETE, buf.as_mut_ptr(), 1)
+    (sys.provider_call)(
+        -1,
+        abi::contracts::storage::runtime_params::DELETE,
+        buf.as_mut_ptr(),
+        1,
+    )
 }
 
 /// Clear all runtime overrides for this module.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
-    (sys.provider_call)(-1, abi::contracts::storage::runtime_params::CLEAR_ALL, core::ptr::null_mut(), 0)
+    (sys.provider_call)(
+        -1,
+        abi::contracts::storage::runtime_params::CLEAR_ALL,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Get this module's arena allocation (from module_arena_size export).
@@ -1258,8 +1450,12 @@ unsafe fn dev_paged_arena_get(sys: &SyscallTable) -> (*mut u8, usize, u32) {
     if rc < 0 {
         return (core::ptr::null_mut(), 0, 0);
     }
-    let base = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-    let size = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+    let base = u64::from_le_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+    let size = u64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
     let status = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
     (base as *mut u8, size as usize, status)
 }
@@ -1270,7 +1466,12 @@ unsafe fn dev_paged_arena_get(sys: &SyscallTable) -> (*mut u8, usize, u32) {
 unsafe fn dev_paged_arena_stats(sys: &SyscallTable) -> PagedArenaStats {
     let mut stats = PagedArenaStats::default();
     let p = &mut stats as *mut _ as *mut u8;
-    (sys.provider_call)(-1, abi::internal::monitor::PAGED_ARENA_STATS, p, core::mem::size_of::<PagedArenaStats>());
+    (sys.provider_call)(
+        -1,
+        abi::internal::monitor::PAGED_ARENA_STATS,
+        p,
+        core::mem::size_of::<PagedArenaStats>(),
+    );
     stats
 }
 
@@ -1284,10 +1485,20 @@ unsafe fn dev_paged_arena_prefault(sys: &SyscallTable, offset: u32, count: u32) 
     let bp = buf.as_mut_ptr();
     let ob = offset.to_le_bytes();
     let cb = count.to_le_bytes();
-    *bp = ob[0]; *bp.add(1) = ob[1]; *bp.add(2) = ob[2]; *bp.add(3) = ob[3];
-    *bp.add(4) = cb[0]; *bp.add(5) = cb[1]; *bp.add(6) = cb[2]; *bp.add(7) = cb[3];
+    *bp = ob[0];
+    *bp.add(1) = ob[1];
+    *bp.add(2) = ob[2];
+    *bp.add(3) = ob[3];
+    *bp.add(4) = cb[0];
+    *bp.add(5) = cb[1];
+    *bp.add(6) = cb[2];
+    *bp.add(7) = cb[3];
     let rc = (sys.provider_call)(-1, abi::kernel_abi::PAGED_ARENA_PREFAULT, bp, 8);
-    if rc > 0 { rc as u32 } else { 0 }
+    if rc > 0 {
+        rc as u32
+    } else {
+        0
+    }
 }
 
 // ============================================================================
@@ -1328,9 +1539,13 @@ unsafe fn msg_write(
 ) -> i32 {
     let mut hdr = [0u8; MSG_HDR_SIZE];
     let tb = msg_type.to_le_bytes();
-    hdr[0] = tb[0]; hdr[1] = tb[1]; hdr[2] = tb[2]; hdr[3] = tb[3];
+    hdr[0] = tb[0];
+    hdr[1] = tb[1];
+    hdr[2] = tb[2];
+    hdr[3] = tb[3];
     let lb = payload_len.to_le_bytes();
-    hdr[4] = lb[0]; hdr[5] = lb[1];
+    hdr[4] = lb[0];
+    hdr[5] = lb[1];
 
     let written = (sys.channel_write)(chan, hdr.as_ptr(), MSG_HDR_SIZE);
     if written < MSG_HDR_SIZE as i32 {
@@ -1358,12 +1573,7 @@ unsafe fn msg_write_empty(sys: &SyscallTable, chan: i32, msg_type: u32) -> i32 {
 /// Excess payload bytes (beyond buf_cap) are consumed and discarded.
 #[allow(dead_code)]
 #[inline(always)]
-unsafe fn msg_read(
-    sys: &SyscallTable,
-    chan: i32,
-    buf: *mut u8,
-    buf_cap: usize,
-) -> (u32, u16) {
+unsafe fn msg_read(sys: &SyscallTable, chan: i32, buf: *mut u8, buf_cap: usize) -> (u32, u16) {
     let mut hdr = [0u8; MSG_HDR_SIZE];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), MSG_HDR_SIZE);
     if n < MSG_HDR_SIZE as i32 {
@@ -1398,7 +1608,11 @@ unsafe fn msg_read(
 /// Read u8 from params blob at `offset`. Returns `default` if out of bounds.
 #[inline(always)]
 pub unsafe fn p_u8(params: *const u8, len: usize, offset: usize, default: u8) -> u8 {
-    if offset < len { *params.add(offset) } else { default }
+    if offset < len {
+        *params.add(offset)
+    } else {
+        default
+    }
 }
 
 /// Read little-endian u16 from params blob at `offset`. Returns `default` if out of bounds.
@@ -1418,7 +1632,10 @@ pub unsafe fn p_u16(params: *const u8, len: usize, offset: usize, default: u16) 
 pub unsafe fn p_u32(params: *const u8, len: usize, offset: usize, default: u32) -> u32 {
     if offset + 3 < len {
         let p = params.add(offset);
-        (*p as u32) | ((*p.add(1) as u32) << 8) | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+        (*p as u32)
+            | ((*p.add(1) as u32) << 8)
+            | ((*p.add(2) as u32) << 16)
+            | ((*p.add(3) as u32) << 24)
     } else {
         default
     }

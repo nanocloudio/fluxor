@@ -5,10 +5,10 @@
 //   - Pi 5 / CM5 (feature "board-cm5"): PL011 at 0xFE20_1000, GIC-400 at 0xFF84_1000, RAM at 0x8_0000
 //
 // Features:
-//   - E3-S7: Secondary core parking (Pi 5 boots all 4 cores; we park 1-3 in WFE)
-//   - E3-S2: Early MMU init with identity-mapped page tables (cacheable DRAM, device MMIO)
-//   - E3-S4/S5: RP1 peripheral access via PCIe BAR (GPIO, SPI, I2C register bridges)
-//   - E6: Multi-domain execution — modules assigned to domains by config, secondary cores woken
+//   - Secondary core parking (Pi 5 boots all 4 cores; cores 1-3 wait in WFE)
+//   - Early MMU init with identity-mapped page tables (cacheable DRAM, device MMIO)
+//   - RP1 peripheral access via PCIe BAR (GPIO, SPI, I2C register bridges)
+//   - Multi-domain execution with config-driven domain assignment and core wakeup
 //
 // Fully config-driven: the boot image carries trailer, modules.bin, and config.bin
 // after the fixed kernel binary, discovered at runtime via the layout trailer.
@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use fluxor::kernel::scheduler;
 use fluxor::kernel::loader;
-use fluxor::kernel::cross_domain;
+use fluxor::kernel::multicore;
 use fluxor::kernel::config::EdgeClass;
 
 // ============================================================================
@@ -342,7 +342,7 @@ fn uart_put_hex32(val: u32) {
 }
 
 // ============================================================================
-// E3-S2: MMU — Identity-mapped page tables (Pi 5 only)
+// MMU — Identity-mapped page tables (Pi 5 only)
 // ============================================================================
 //
 // 4KB granule, EL1, 2-level (L1 + L2) identity map.
@@ -498,7 +498,7 @@ mod mmu {
 
         // 0x1_0000_0000 .. 0x1_3FFF_FFFF: real DRAM on 8/16 GB Pi 5
         // boards. No longer used as DMA target (see PCIE1_DMA_ARENA
-        // comment in bcm2712_nic_ring.rs) — mapped as regular cacheable
+        // comment in bcm2712/net.rs) — mapped as regular cacheable
         // DRAM in case a future consumer wants it.
         table[4] = dram_block(0x1_0000_0000);
         // 0x1_4000_0000 .. 0x1_7FFF_FFFF: more PCIe space (device)
@@ -576,7 +576,7 @@ mod mmu {
         );
 
         // Publish MAIR/TCR/TTBR0 for the secondary-core trampoline in
-        // `bcm2712_cross_domain.rs`, which reads them with MMU off and
+        // `bcm2712/multicore.rs`, which reads them with MMU off and
         // needs the values to already be at PoC.
         let mair_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_MAIR);
         let tcr_p  = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_TCR);
@@ -605,7 +605,7 @@ mod mmu {
 }
 
 // ============================================================================
-// E3-S4/S5: RP1 HAL — GPIO, SPI, I2C via PCIe BAR (Pi 5 only)
+// RP1 HAL — GPIO, SPI, I2C via PCIe BAR (Pi 5 only)
 // ============================================================================
 //
 // The RP1 chip is a separate silicon die connected to BCM2712 via PCIe x4.
@@ -1121,7 +1121,7 @@ unsafe extern "C" fn irq_handler() {
 }
 
 // ============================================================================
-// Multi-domain module storage (E6)
+// Per-domain module storage
 // ============================================================================
 
 /// Maximum modules per domain on this platform.
@@ -1153,14 +1153,14 @@ impl DomainModules {
 
 /// Per-domain module storage. Indexed by domain_id.
 /// SAFETY: After init, each domain's storage is only accessed by its owning core.
-static mut DOMAIN_MODULES: [DomainModules; cross_domain::MAX_DOMAINS] =
-    [const { DomainModules::new() }; cross_domain::MAX_DOMAINS];
+static mut DOMAIN_MODULES: [DomainModules; multicore::MAX_DOMAINS] =
+    [const { DomainModules::new() }; multicore::MAX_DOMAINS];
 
 /// Signal that domain module storage has been initialized and secondary cores can start.
 static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
-// E3-S7: Entry point with secondary core parking
+// Entry point with secondary core parking
 // ============================================================================
 //
 // Pi 5 GPU firmware boots all 4 Cortex-A76 cores. The _start code checks
@@ -1365,12 +1365,12 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         mmu::enable();
     }
 
-    // E3-S4: Probe RP1 (Pi 5 only — checks PCIe BAR mapping)
+    // Probe RP1 early on Pi 5 to confirm the PCIe BAR mapping is alive.
     rp1::report(uart_puts, uart_put_hex32);
 
-    // E3-S4b: GEM module-ID probe still runs pre-logger since it's used
-    // for UART diagnostics only. Full PCIe enumeration moves below so
-    // its log::info! lines reach the ring (and therefore log_net → UDP).
+    // Keep the GEM module-ID probe pre-logger because it only feeds
+    // UART diagnostics. Full PCIe enumeration runs below so its
+    // log::info! lines reach the ring (and therefore log_net -> UDP).
     #[cfg(feature = "board-cm5")]
     {
         let mid = unsafe { core::ptr::read_volatile(eth::GEM_BASE.wrapping_add(eth::MID) as *const u32) };
@@ -1450,7 +1450,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     let n_modules = cfg.module_count as usize;
     let n_edges = cfg.edge_count as usize;
 
-    // Reconfigure timer tick from config tick_us (E4-S1)
+    // Reconfigure the timer tick from config.tick_us.
     let tick_us = if cfg.header.tick_us > 0 { cfg.header.tick_us as u32 } else { 1000 };
     unsafe {
         // freq is in Hz, so ticks_per_us = freq / 1_000_000
@@ -1558,12 +1558,12 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                     // Allocate a cross-domain channel and register the edge.
                     // The edge stores both local handles directly so pump_cross_domain
                     // can operate per-edge without module-index indirection.
-                    if let Some(cross_ch_idx) = cross_domain::alloc_cross_channel() {
+                    if let Some(cross_ch_idx) = multicore::alloc_cross_channel() {
                         let from_mod_in_domain = domain_local_index(&cfg, from, from_domain, n_modules);
                         let to_mod_in_domain = domain_local_index(&cfg, to, to_domain, n_modules);
 
                         unsafe {
-                            cross_domain::register_cross_edge(cross_domain::CrossDomainEdge {
+                            multicore::register_cross_edge(multicore::CrossDomainEdge {
                                 from_domain,
                                 from_module: from_mod_in_domain as u8,
                                 from_port: edge.from_port_index,
@@ -1613,7 +1613,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     while i < n_modules {
         if let Some(ref entry) = cfg.modules[i] {
             let domain_id = entry.domain_id as usize;
-            if domain_id >= cross_domain::MAX_DOMAINS {
+            if domain_id >= multicore::MAX_DOMAINS {
                 uart_puts(b"[inst] invalid domain_id for module ");
                 uart_put_u32(i as u32);
                 uart_puts(b"\r\n");
@@ -1728,7 +1728,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     unsafe {
         let mut total = 0usize;
         let mut d = 0usize;
-        while d < cross_domain::MAX_DOMAINS {
+        while d < multicore::MAX_DOMAINS {
             total += DOMAIN_MODULES[d].count;
             d += 1;
         }
@@ -1744,7 +1744,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Must be done after all modules are instantiated so global_idx is populated.
     {
         let mut d = 0usize;
-        while d < cross_domain::MAX_DOMAINS {
+        while d < multicore::MAX_DOMAINS {
             let mod_count = unsafe { DOMAIN_MODULES[d].count };
             if mod_count > 0 {
                 compute_domain_topo_order(d, &cfg, n_edges);
@@ -1766,11 +1766,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Set up domain execution state for all domains that have modules.
     let mut d = 0usize;
-    while d < cross_domain::MAX_DOMAINS {
+    while d < multicore::MAX_DOMAINS {
         let mod_count = unsafe { DOMAIN_MODULES[d].count };
         if mod_count > 0 {
             unsafe {
-                let ds = cross_domain::domain_state(d);
+                let ds = multicore::domain_state(d);
                 ds.core_id = d as u8; // Domain N runs on core N
                 ds.module_count = mod_count as u8;
                 ds.active = true;
@@ -1792,7 +1792,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     let total_mods: usize = {
         let mut total = 0usize;
         let mut dd = 0;
-        while dd < cross_domain::MAX_DOMAINS {
+        while dd < multicore::MAX_DOMAINS {
             total += unsafe { DOMAIN_MODULES[dd].count };
             dd += 1;
         }
@@ -1807,9 +1807,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Log cross-domain channel status
     uart_puts(b"[cross] channels=");
-    uart_put_u32(cross_domain::cross_edge_count() as u32);
+    uart_put_u32(multicore::cross_edge_count() as u32);
     uart_puts(b" dma_arena_used=");
-    uart_put_u32(cross_domain::dma_arena_used() as u32);
+    uart_put_u32(multicore::dma_arena_used() as u32);
     uart_puts(b"\r\n");
 
     // Wake secondary cores that have non-empty domains assigned
@@ -1944,14 +1944,14 @@ fn compute_domain_topo_order(
 }
 
 // ============================================================================
-// Domain execution loop (E6)
+// Domain execution loop
 // ============================================================================
 
 /// Run the main loop for a domain. Steps all modules assigned to that domain.
 ///
 /// This function never returns. On core 0 it is called directly from main().
 /// On secondary cores it is called from the secondary_core_main() entry point.
-/// Per-domain metrics (E7b-S3).
+/// Per-domain execution metrics.
 struct DomainMetrics {
     /// Total ticks processed.
     tick_count: u32,
@@ -1973,8 +1973,8 @@ impl DomainMetrics {
     }
 }
 
-static mut DOMAIN_METRICS: [DomainMetrics; cross_domain::MAX_DOMAINS] =
-    [const { DomainMetrics::new() }; cross_domain::MAX_DOMAINS];
+static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
+    [const { DomainMetrics::new() }; multicore::MAX_DOMAINS];
 
 fn run_domain_loop(domain_id: usize) -> ! {
     use fluxor::modules::Module;
@@ -1992,7 +1992,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 scheduler::domain_tick_us(domain_id));
             loop {
                 unsafe { core::arch::asm!("wfi") };
-                cross_domain::park_if_requested(domain_id);
+                multicore::park_if_requested(domain_id);
                 let t0 = read_timer_count();
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
@@ -2017,7 +2017,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
             log::info!("[domain] {} core={} tier=3 poll-mode", domain_id, core_id);
             let freq = bcm_counter_freq();
             loop {
-                cross_domain::park_if_requested(domain_id);
+                multicore::park_if_requested(domain_id);
                 let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
                 let mut any_burst = false;
                 // Step in topological order for correct producer-before-consumer
@@ -2068,7 +2068,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
         _ => {
             loop {
                 unsafe { core::arch::asm!("wfi") };
-                cross_domain::park_if_requested(domain_id);
+                multicore::park_if_requested(domain_id);
                 let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
@@ -2085,14 +2085,14 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // not invoked here; on bcm2712 the request is consumed
                 // without rebuilding, leaving the current graph running.
                 if domain_id == 0 && scheduler::take_rebuild_request().is_some() {
-                    let expected = cross_domain::non_primary_active_count();
-                    cross_domain::request_quiesce();
-                    cross_domain::wait_parked(expected);
+                    let expected = multicore::non_primary_active_count();
+                    multicore::request_quiesce();
+                    multicore::wait_parked(expected);
                     log::warn!("[reconfigure] quiesced {} domains; phase reset", expected);
                     scheduler::set_reconfigure_phase(
                         scheduler::ReconfigurePhase::Running
                     );
-                    cross_domain::release_quiesce();
+                    multicore::release_quiesce();
                 }
             }
         }
@@ -2152,15 +2152,15 @@ fn domain_step_all(domain_id: usize) {
 /// local input aux and stores it there; the producer-side pump drains
 /// it and replays it onto the producer's local output aux.
 fn pump_cross_domain(domain_id: usize) {
-    let n_cross = cross_domain::cross_edge_count();
+    let n_cross = multicore::cross_edge_count();
     let mut ei = 0;
     while ei < n_cross {
-        let Some(edge) = cross_domain::get_cross_edge(ei) else { ei += 1; continue };
-        let Some(ch) = cross_domain::get_cross_channel(edge.channel_idx as usize) else { ei += 1; continue };
+        let Some(edge) = multicore::get_cross_edge(ei) else { ei += 1; continue };
+        let Some(ch) = multicore::get_cross_channel(edge.channel_idx as usize) else { ei += 1; continue };
 
         // Producer side.
         if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
-            let mut buf = [0u8; cross_domain::SLOT_DATA_SIZE];
+            let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
             let n = unsafe {
                 fluxor::kernel::channel::channel_read(
                     edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
@@ -2189,7 +2189,7 @@ fn pump_cross_domain(domain_id: usize) {
             let can_write = write_ready > 0
                 && (write_ready as u32 & fluxor::kernel::channel::POLL_OUT) != 0;
             if can_write {
-                let mut buf = [0u8; cross_domain::SLOT_DATA_SIZE];
+                let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
                 if let Some(len) = ch.try_recv(&mut buf) {
                     unsafe {
                         fluxor::kernel::channel::channel_write(
@@ -2213,7 +2213,7 @@ fn pump_cross_domain(domain_id: usize) {
 }
 
 // ============================================================================
-// Secondary core entry points (E6)
+// Secondary core entry points
 // ============================================================================
 
 /// Entry point for secondary cores after wake.
@@ -2263,7 +2263,7 @@ fn secondary_core_main(domain_id: usize) -> ! {
     }
 
     // Check if this domain is active
-    let ds = cross_domain::domain_state_ref(domain_id);
+    let ds = multicore::domain_state_ref(domain_id);
     if !ds.active || ds.module_count == 0 {
         uart_puts(b"[core");
         uart_put_u32(core_id as u32);
@@ -2288,7 +2288,7 @@ pub fn wake_secondary_cores() {
 
     for core_id in 1u8..=3 {
         let domain_id = core_id as usize;
-        let ds = cross_domain::domain_state_ref(domain_id);
+        let ds = multicore::domain_state_ref(domain_id);
         if ds.active && ds.module_count > 0 {
             uart_puts(b"[wake] core ");
             uart_put_u32(core_id as u32);
@@ -2297,7 +2297,7 @@ pub fn wake_secondary_cores() {
             uart_puts(b"\r\n");
 
             let entry = entries[(core_id - 1) as usize];
-            let ok = cross_domain::wake_core(core_id, entry);
+            let ok = multicore::wake_core(core_id, entry);
             if !ok {
                 uart_puts(b"[wake] FAILED core ");
                 uart_put_u32(core_id as u32);

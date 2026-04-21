@@ -173,7 +173,9 @@ pub fn dma_arena_base() -> usize {
 }
 
 #[cfg(not(feature = "chip-bcm2712"))]
-pub fn dma_arena_base() -> usize { 0 }
+pub fn dma_arena_base() -> usize {
+    0
+}
 
 // ----------------------------------------------------------------------------
 // PCIe1 (external / NVMe HAT+) DMA arena
@@ -214,7 +216,9 @@ pub fn pcie1_dma_arena_base() -> usize {
 }
 
 #[cfg(not(feature = "chip-bcm2712"))]
-pub fn pcie1_dma_arena_base() -> usize { 0 }
+pub fn pcie1_dma_arena_base() -> usize {
+    0
+}
 
 /// Allocate physically contiguous memory from the PCIe1 DMA arena.
 /// Returns the physical address (identity-mapped = CPU virt = PCI bus
@@ -231,8 +235,10 @@ pub fn pcie1_dma_alloc_contig(size: usize, align: usize) -> usize {
         return 0;
     }
     let prev = PCIE1_DMA_OFFSET.compare_exchange(
-        cur as u32, new_end as u32,
-        Ordering::AcqRel, Ordering::Relaxed,
+        cur as u32,
+        new_end as u32,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
     );
     match prev {
         Ok(_) => pcie1_dma_arena_base() + aligned_start,
@@ -241,7 +247,9 @@ pub fn pcie1_dma_alloc_contig(size: usize, align: usize) -> usize {
 }
 
 #[cfg(not(feature = "chip-bcm2712"))]
-pub fn pcie1_dma_alloc_contig(_size: usize, _align: usize) -> usize { 0 }
+pub fn pcie1_dma_alloc_contig(_size: usize, _align: usize) -> usize {
+    0
+}
 
 // ----------------------------------------------------------------------------
 // Streaming (cacheable) PCIe1 DMA arena
@@ -282,7 +290,9 @@ pub fn pcie1_stream_arena_base() -> usize {
 }
 
 #[cfg(not(feature = "chip-bcm2712"))]
-pub fn pcie1_stream_arena_base() -> usize { 0 }
+pub fn pcie1_stream_arena_base() -> usize {
+    0
+}
 
 /// Allocate physically contiguous STREAMING (cacheable) memory from the
 /// PCIe1 streaming arena. Returns the physical address or 0 on failure.
@@ -299,8 +309,10 @@ pub fn pcie1_dma_alloc_streaming(size: usize, align: usize) -> usize {
         return 0;
     }
     let prev = PCIE1_STREAM_OFFSET.compare_exchange(
-        cur as u32, new_end as u32,
-        Ordering::AcqRel, Ordering::Relaxed,
+        cur as u32,
+        new_end as u32,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
     );
     match prev {
         Ok(_) => pcie1_stream_arena_base() + aligned_start,
@@ -309,7 +321,9 @@ pub fn pcie1_dma_alloc_streaming(size: usize, align: usize) -> usize {
 }
 
 #[cfg(not(feature = "chip-bcm2712"))]
-pub fn pcie1_dma_alloc_streaming(_size: usize, _align: usize) -> usize { 0 }
+pub fn pcie1_dma_alloc_streaming(_size: usize, _align: usize) -> usize {
+    0
+}
 
 /// NIC ring slots.
 static mut NIC_RINGS: [NicRing; MAX_NIC_RINGS] = [const { NicRing::empty() }; MAX_NIC_RINGS];
@@ -361,8 +375,10 @@ pub fn dma_alloc_contig(size: usize, align: usize) -> usize {
     }
     // Try to claim this range
     let prev = DMA_ARENA_OFFSET.compare_exchange(
-        cur as u32, new_end as u32,
-        Ordering::AcqRel, Ordering::Relaxed
+        cur as u32,
+        new_end as u32,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
     );
     match prev {
         Ok(_) => dma_arena_ptr(aligned_start) as usize,
@@ -442,8 +458,8 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
         let mut i = 0u16;
         while i < rx_desc_count {
             if (i as usize) < buf_count as usize {
-                let desc_ptr = dma_arena_ptr(rx_off + (i as usize) * desc_size)
-                    as *mut NicRingDescriptor;
+                let desc_ptr =
+                    dma_arena_ptr(rx_off + (i as usize) * desc_size) as *mut NicRingDescriptor;
                 let buf_phys = dma_arena_phys(buf_off + (i as usize) * buf_size as usize);
                 (*desc_ptr).set_phys_addr(buf_phys);
                 (*desc_ptr).length = buf_size as u32;
@@ -477,7 +493,12 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
 
         log::info!(
             "[nic_ring] ring {} created: rx={} tx={} bufs={}x{} total={}",
-            slot, rx_desc_count, tx_desc_count, buf_count, buf_size, total
+            slot,
+            rx_desc_count,
+            tx_desc_count,
+            buf_count,
+            buf_size,
+            total
         );
         slot as i32
     }
