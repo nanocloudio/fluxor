@@ -222,6 +222,7 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
         _t if _t == fd::FD_TAG_EVENT => Some(contract::EVENT),
         _t if _t == fd::FD_TAG_TIMER => Some(contract::TIMER),
         _t if _t == fd::FD_TAG_DMA => Some(contract::PLATFORM_DMA_FD),
+        _t if _t == fd::FD_TAG_KEY_VAULT => Some(contract::KEY_VAULT),
         _ => None,
     }
 }

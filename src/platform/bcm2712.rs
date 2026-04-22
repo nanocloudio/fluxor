@@ -280,8 +280,9 @@ unsafe fn uart_init() {
 }
 
 // Normal kernel log path: push to the log ring only. The wire is driven
-// by the log_uart overlay module via UART_WRITE_RAW. This keeps logs
-// opt-in and orthogonal to the application.
+// by the platform-runtime debug drain (`platform::debug::DebugDrain`)
+// via the `Bcm2712UartSink` below. Keeps logs opt-in and orthogonal to
+// the application.
 fn uart_putc(c: u8) {
     fluxor::kernel::log_ring::push_byte(c);
 }
@@ -290,10 +291,10 @@ fn uart_puts(s: &[u8]) {
     fluxor::kernel::log_ring::push_bytes(s);
 }
 
-// Direct synchronous MMIO path — used by:
-//   (a) `log_uart` module via the UART_WRITE_RAW syscall
-//   (b) the exception/panic handler, which cannot rely on the scheduler
-//       (and therefore cannot rely on any overlay) still being alive.
+// Direct synchronous MMIO path — used only by the exception / panic
+// handler, which cannot rely on the scheduler (or therefore the debug
+// drain) still being alive. Normal-runtime writes go through the non-
+// blocking FIFO-fill path (`uart_nonblocking_write`).
 fn uart_raw_putc(c: u8) {
     unsafe {
         #[cfg(feature = "board-cm5")]
@@ -312,15 +313,69 @@ fn uart_raw_puts(s: &[u8]) {
     }
 }
 
-/// Raw pointer adapter for `kernel::uart_write::install`. Writes all
-/// bytes and returns the count so the caller can report it.
-unsafe fn uart_raw_write_bytes(ptr: *const u8, len: usize) -> usize {
+/// Non-blocking UART FIFO fill. Writes as many bytes as the TX FIFO
+/// will accept right now, then returns the count. Used as the
+/// `DebugTx` backend for the platform debug drain — the drain owns
+/// retry/backpressure state so we never spin here. On QEMU virt
+/// (non-board-cm5) the FR bit isn't meaningful; fall back to writing
+/// all bytes.
+fn uart_nonblocking_write(bytes: &[u8]) -> usize {
+    if UART_READY.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
     let mut i = 0;
-    while i < len {
-        uart_raw_putc(*ptr.add(i));
+    while i < bytes.len() {
+        #[cfg(feature = "board-cm5")]
+        unsafe {
+            if core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {
+                break;
+            }
+        }
+        unsafe { core::ptr::write_volatile(UART_DR, bytes[i] as u32) };
         i += 1;
     }
-    len
+    i
+}
+
+/// Raw u32 decimal printer for panic / exception paths (mirrors
+/// `uart_put_u32` but goes straight to the wire).
+fn uart_raw_put_u32(mut n: u32) {
+    let mut buf = [0u8; 10];
+    let mut i = 0usize;
+    if n == 0 { uart_raw_putc(b'0'); return; }
+    while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
+    while i > 0 { i -= 1; uart_raw_putc(buf[i]); }
+}
+
+// --- Platform debug drain (local UART) ---
+//
+// Normal-runtime path for kernel log output. Drains `log_ring` into
+// the UART via `DebugTx`, called from the core-0 main loop once per
+// scheduler tick (tier 0 / tier 1a). SPSC against the kernel log
+// path — single consumer. Panic / exception handlers do not use this
+// path; they hit the wire directly via `uart_raw_puts`.
+struct Bcm2712UartSink;
+
+impl fluxor::platform::debug::DebugTx for Bcm2712UartSink {
+    fn write(&mut self, bytes: &[u8]) -> usize {
+        uart_nonblocking_write(bytes)
+    }
+}
+
+static mut DEBUG_DRAIN: fluxor::platform::debug::DebugDrain<1024> =
+    fluxor::platform::debug::DebugDrain::new();
+static mut DEBUG_SINK: Bcm2712UartSink = Bcm2712UartSink;
+
+/// Drain queued log bytes to the UART. MUST only be called from core 0.
+#[inline]
+fn debug_drain_poll_core0() {
+    // SAFETY: SPSC consumer on log_ring; only called from core 0 in
+    // the main loop or during boot before secondary cores wake.
+    unsafe {
+        let drain = &mut *(&raw mut DEBUG_DRAIN);
+        let sink = &mut *(&raw mut DEBUG_SINK);
+        drain.poll(sink);
+    }
 }
 
 fn uart_put_u32(mut n: u32) {
@@ -1043,6 +1098,19 @@ unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     uart_raw_puts(b"\r\n  ESR=0x"); exception_dump_hex64(esr);
     uart_raw_puts(b"\r\n  FAR=0x"); exception_dump_hex64(far);
     uart_raw_puts(b"\r\n");
+    // Recent log tail — helps correlate the fault with whatever the
+    // system logged right before it. `read_tail` does not advance
+    // the SPSC tail pointer, so a concurrent drain (if any remains)
+    // still sees the same bytes.
+    let mut buf = [0u8; 1024];
+    let n = fluxor::kernel::log_ring::read_tail(&mut buf);
+    if n > 0 {
+        uart_raw_puts(b"--- log tail (");
+        uart_raw_put_u32(n as u32);
+        uart_raw_puts(b" bytes) ---\r\n");
+        uart_raw_puts(&buf[..n]);
+        uart_raw_puts(b"\r\n--- end ---\r\n");
+    }
 }
 
 /// Hex dump for exception handler. Duplicates uart_put_hex64 but routes
@@ -1158,6 +1226,387 @@ static mut DOMAIN_MODULES: [DomainModules; multicore::MAX_DOMAINS] =
 
 /// Signal that domain module storage has been initialized and secondary cores can start.
 static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
+
+// ── Fan-out pump table ─────────────────────────────────────────────────
+//
+// When a single (module, out_port) has more than one edge on bcm2712,
+// `scheduler::set_module_port` would overwrite the previous channel
+// (last-wiring-wins). Instead we insert an intermediate tee channel:
+// the source module writes to `src_chan`, and the domain loop's
+// `pump_fan_outs` reads from `src_chan` and broadcasts to every
+// `dst_chans` entry each tick. Small fan-out degree + small frames
+// (debug log lines, net_proto frames) keep the pump cheap.
+
+const MAX_FAN_OUTS: usize = 8;
+const MAX_FAN_OUT_DSTS: usize = 4;
+const FAN_BUF_SIZE: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct FanOutEntry {
+    domain: u8,
+    active: bool,
+    /// Identifier of the aliased source port.
+    from_mod: u8,
+    from_port: u8,
+    /// Channel the source module writes to (the tee's input).
+    src_chan: i32,
+    dst_chans: [i32; MAX_FAN_OUT_DSTS],
+    dst_count: u8,
+}
+
+impl FanOutEntry {
+    const fn empty() -> Self {
+        Self {
+            domain: 0,
+            active: false,
+            from_mod: 0,
+            from_port: 0,
+            src_chan: -1,
+            dst_chans: [-1; MAX_FAN_OUT_DSTS],
+            dst_count: 0,
+        }
+    }
+}
+
+static mut FAN_OUTS: [FanOutEntry; MAX_FAN_OUTS] = [const { FanOutEntry::empty() }; MAX_FAN_OUTS];
+static mut FAN_BUF: [u8; FAN_BUF_SIZE] = [0; FAN_BUF_SIZE];
+
+// Fan-in (merge) counterpart to the fan-out table. When a single
+// (module, in_port) has more than one producer edge, we collect the
+// producers into `src_chans` and merge-pump them into `dst_chan` — the
+// channel the consumer module binds to its in port.
+const MAX_FAN_INS: usize = 8;
+const MAX_FAN_IN_SRCS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct FanInEntry {
+    domain: u8,
+    active: bool,
+    to_mod: u8,
+    to_port_type: u8,  // 0 = in, 2 = ctrl
+    to_port: u8,
+    dst_chan: i32,
+    src_chans: [i32; MAX_FAN_IN_SRCS],
+    src_count: u8,
+    next_read_idx: u8,
+}
+
+impl FanInEntry {
+    const fn empty() -> Self {
+        Self {
+            domain: 0,
+            active: false,
+            to_mod: 0,
+            to_port_type: 0,
+            to_port: 0,
+            dst_chan: -1,
+            src_chans: [-1; MAX_FAN_IN_SRCS],
+            src_count: 0,
+            next_read_idx: 0,
+        }
+    }
+}
+
+static mut FAN_INS: [FanInEntry; MAX_FAN_INS] = [const { FanInEntry::empty() }; MAX_FAN_INS];
+
+unsafe fn find_fan_in(to_mod: u8, to_port_type: u8, to_port: u8) -> Option<usize> {
+    for (i, e) in (*(&raw const FAN_INS)).iter().enumerate() {
+        if e.active && e.to_mod == to_mod && e.to_port_type == to_port_type && e.to_port == to_port {
+            return Some(i);
+        }
+    }
+    None
+}
+
+unsafe fn register_fan_in(domain: u8, to_mod: u8, to_port_type: u8, to_port: u8,
+                          first_src: i32) -> i32 {
+    use fluxor::kernel::channel;
+    for e in (*(&raw mut FAN_INS)).iter_mut() {
+        if !e.active {
+            let dst = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+            if dst < 0 { return -1; }
+            e.domain = domain;
+            e.active = true;
+            e.to_mod = to_mod;
+            e.to_port_type = to_port_type;
+            e.to_port = to_port;
+            e.dst_chan = dst;
+            e.src_chans = [-1; MAX_FAN_IN_SRCS];
+            e.src_chans[0] = first_src;
+            e.src_count = 1;
+            e.next_read_idx = 0;
+            FAN_DIAG.fi_active = FAN_DIAG.fi_active.saturating_add(1);
+            if FAN_DIAG.fi_first_dst_chan < 0 {
+                FAN_DIAG.fi_first_dst_chan = dst;
+                FAN_DIAG.fi_first_src0 = first_src;
+            }
+            return dst;
+        }
+    }
+    -1
+}
+
+unsafe fn add_fan_in_src(entry_idx: usize, src: i32) -> bool {
+    let fi = &mut (*(&raw mut FAN_INS))[entry_idx];
+    if (fi.src_count as usize) >= MAX_FAN_IN_SRCS { return false; }
+    fi.src_chans[fi.src_count as usize] = src;
+    if fi.src_count == 1 && FAN_DIAG.fi_first_src1 < 0 {
+        FAN_DIAG.fi_first_src1 = src;
+    }
+    fi.src_count += 1;
+    true
+}
+
+/// Merge round-robin from producer channels into the consumer channel.
+/// One frame per source per tick keeps producers fair without requiring
+/// a per-source buffer.
+unsafe fn pump_fan_ins(domain_id: usize) {
+    use fluxor::kernel::channel::{syscall_channel_poll, syscall_channel_read,
+        syscall_channel_write, POLL_IN, POLL_OUT};
+    let buf = &raw mut FAN_BUF;
+    for e in (*(&raw mut FAN_INS)).iter_mut() {
+        if !e.active || e.domain as usize != domain_id { continue; }
+        // Short-circuit if the consumer channel has no room.
+        if syscall_channel_poll(e.dst_chan, POLL_OUT) & (POLL_OUT as i32) == 0 {
+            FAN_DIAG.fi_skip_consumer_full = FAN_DIAG.fi_skip_consumer_full.wrapping_add(1);
+            continue;
+        }
+        let n = e.src_count as usize;
+        let mut moved = false;
+        let mut tries = 0;
+        while tries < n {
+            let idx = e.next_read_idx as usize;
+            e.next_read_idx = ((idx + 1) % n) as u8;
+            tries += 1;
+            let src = e.src_chans[idx];
+            if syscall_channel_poll(src, POLL_IN) & (POLL_IN as i32) == 0 { continue; }
+            let read = syscall_channel_read(src, (*buf).as_mut_ptr(), FAN_BUF_SIZE);
+            if read <= 0 { continue; }
+            let _ = syscall_channel_write(e.dst_chan, (*buf).as_ptr(), read as usize);
+            FAN_DIAG.fi_frames = FAN_DIAG.fi_frames.wrapping_add(1);
+            FAN_DIAG.fi_bytes = FAN_DIAG.fi_bytes.wrapping_add(read as u32);
+            moved = true;
+            break;
+        }
+        if !moved { FAN_DIAG.fi_skip_no_src = FAN_DIAG.fi_skip_no_src.wrapping_add(1); }
+    }
+    FAN_DIAG.fi_calls = FAN_DIAG.fi_calls.wrapping_add(1);
+}
+
+/// Locate the fan-out entry for (from_mod, from_port), or None.
+unsafe fn find_fan_out(from_mod: u8, from_port: u8) -> Option<usize> {
+    for (i, e) in (*(&raw const FAN_OUTS)).iter().enumerate() {
+        if e.active && e.from_mod == from_mod && e.from_port == from_port {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Allocate and populate a fan-out entry. Returns the tee's source
+/// channel (the one the writer module binds to its out port) or -1 on
+/// capacity failure.
+unsafe fn register_fan_out(domain: u8, from_mod: u8, from_port: u8, first_dst: i32) -> i32 {
+    use fluxor::kernel::channel;
+    for e in (*(&raw mut FAN_OUTS)).iter_mut() {
+        if !e.active {
+            let src = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+            if src < 0 { return -1; }
+            e.domain = domain;
+            e.active = true;
+            e.from_mod = from_mod;
+            e.from_port = from_port;
+            e.src_chan = src;
+            e.dst_chans = [-1; MAX_FAN_OUT_DSTS];
+            e.dst_chans[0] = first_dst;
+            e.dst_count = 1;
+            FAN_DIAG.fo_active = FAN_DIAG.fo_active.saturating_add(1);
+            if FAN_DIAG.fo_first_src_chan < 0 {
+                FAN_DIAG.fo_first_src_chan = src;
+                FAN_DIAG.fo_first_dst0 = first_dst;
+            }
+            return src;
+        }
+    }
+    -1
+}
+
+unsafe fn add_fan_out_dst(entry_idx: usize, dst: i32) -> bool {
+    let fo = &mut (*(&raw mut FAN_OUTS))[entry_idx];
+    if (fo.dst_count as usize) >= MAX_FAN_OUT_DSTS { return false; }
+    fo.dst_chans[fo.dst_count as usize] = dst;
+    if fo.dst_count == 1 && FAN_DIAG.fo_first_dst1 < 0 {
+        FAN_DIAG.fo_first_dst1 = dst;
+    }
+    fo.dst_count += 1;
+    true
+}
+
+/// Drain all fan-out entries that belong to `domain_id`: read one
+/// message from each source channel and write it to every destination.
+/// Backpressures conservatively — if any destination is full the frame
+/// stays in the source channel until the next tick.
+unsafe fn pump_fan_outs(domain_id: usize) {
+    use fluxor::kernel::channel::{syscall_channel_poll, syscall_channel_read,
+        syscall_channel_write, POLL_IN, POLL_OUT};
+    let buf = &raw mut FAN_BUF;
+    for e in (*(&raw mut FAN_OUTS)).iter() {
+        if !e.active || e.domain as usize != domain_id { continue; }
+        if syscall_channel_poll(e.src_chan, POLL_IN) & (POLL_IN as i32) == 0 {
+            FAN_DIAG.fo_skip_input = FAN_DIAG.fo_skip_input.wrapping_add(1);
+            continue;
+        }
+        // Require space in every destination so we don't partial-deliver.
+        let mut all_ready = true;
+        for i in 0..e.dst_count as usize {
+            if syscall_channel_poll(e.dst_chans[i], POLL_OUT) & (POLL_OUT as i32) == 0 {
+                all_ready = false;
+                break;
+            }
+        }
+        if !all_ready {
+            FAN_DIAG.fo_skip_dst_full = FAN_DIAG.fo_skip_dst_full.wrapping_add(1);
+            continue;
+        }
+        let read = syscall_channel_read(e.src_chan, (*buf).as_mut_ptr(), FAN_BUF_SIZE);
+        if read <= 0 { continue; }
+        let len = read as usize;
+        for i in 0..e.dst_count as usize {
+            let _ = syscall_channel_write(e.dst_chans[i], (*buf).as_ptr(), len);
+        }
+        FAN_DIAG.fo_frames += 1;
+        FAN_DIAG.fo_bytes += len as u32;
+    }
+    FAN_DIAG.fo_calls = FAN_DIAG.fo_calls.wrapping_add(1);
+}
+
+// ── Fan-out / fan-in diagnostic counters ──────────────────────────────
+// Exposed via `FAN_DIAG_SNAPSHOT` for inspection through the http
+// `/_fan` diagnostic endpoint. Single-core updates (domain 0), no sync.
+#[repr(C)]
+pub struct FanDiag {
+    pub fo_active: u8,
+    pub fi_active: u8,
+    pub fo_calls: u32,
+    pub fi_calls: u32,
+    pub fo_frames: u32,
+    pub fo_bytes: u32,
+    pub fi_frames: u32,
+    pub fi_bytes: u32,
+    pub fo_skip_input: u32,
+    pub fo_skip_dst_full: u32,
+    pub fi_skip_consumer_full: u32,
+    pub fi_skip_no_src: u32,
+    pub fo_first_src_chan: i32,
+    pub fo_first_dst0: i32,
+    pub fo_first_dst1: i32,
+    pub fi_first_dst_chan: i32,
+    pub fi_first_src0: i32,
+    pub fi_first_src1: i32,
+}
+
+pub static mut FAN_DIAG: FanDiag = FanDiag {
+    fo_active: 0, fi_active: 0,
+    fo_calls: 0, fi_calls: 0,
+    fo_frames: 0, fo_bytes: 0,
+    fi_frames: 0, fi_bytes: 0,
+    fo_skip_input: 0, fo_skip_dst_full: 0,
+    fi_skip_consumer_full: 0, fi_skip_no_src: 0,
+    fo_first_src_chan: -1, fo_first_dst0: -1, fo_first_dst1: -1,
+    fi_first_dst_chan: -1, fi_first_src0: -1, fi_first_src1: -1,
+};
+
+/// Copy FAN_DIAG into a caller-supplied buffer as ASCII text. Returns
+/// number of bytes written.
+pub unsafe fn fan_diag_snapshot(buf: *mut u8, cap: usize) -> i32 {
+    if buf.is_null() || cap == 0 { return 0; }
+    let d = &raw const FAN_DIAG;
+    let d = &*d;
+    // Simple text serializer — no_std, no alloc, no formatter crate.
+    let mut pos = 0usize;
+    macro_rules! emit {
+        ($bytes:expr) => {{
+            let bs: &[u8] = $bytes;
+            let mut k = 0;
+            while k < bs.len() && pos < cap {
+                *buf.add(pos) = bs[k]; pos += 1; k += 1;
+            }
+        }};
+    }
+    let mut numbuf = [0u8; 16];
+    fn u32_to_dec(v: u32, out: &mut [u8; 16]) -> usize {
+        if v == 0 { out[0] = b'0'; return 1; }
+        let mut tmp = [0u8; 16];
+        let mut n = 0;
+        let mut x = v;
+        while x > 0 {
+            tmp[n] = b'0' + (x % 10) as u8;
+            x /= 10;
+            n += 1;
+        }
+        for i in 0..n { out[i] = tmp[n - 1 - i]; }
+        n
+    }
+    fn i32_to_dec(v: i32, out: &mut [u8; 16]) -> usize {
+        if v < 0 {
+            out[0] = b'-';
+            let mut tmp2 = [0u8; 16];
+            let nn = u32_to_dec((-v) as u32, &mut tmp2);
+            for i in 0..nn { out[1 + i] = tmp2[i]; }
+            1 + nn
+        } else {
+            u32_to_dec(v as u32, out)
+        }
+    }
+
+    macro_rules! emit_u32 {
+        ($name:expr, $v:expr) => {{
+            emit!($name);
+            emit!(b"=");
+            let n = u32_to_dec($v, &mut numbuf);
+            let mut i = 0;
+            while i < n && pos < cap { *buf.add(pos) = numbuf[i]; pos += 1; i += 1; }
+            emit!(b" ");
+        }};
+    }
+    macro_rules! emit_i32 {
+        ($name:expr, $v:expr) => {{
+            emit!($name);
+            emit!(b"=");
+            let n = i32_to_dec($v, &mut numbuf);
+            let mut i = 0;
+            while i < n && pos < cap { *buf.add(pos) = numbuf[i]; pos += 1; i += 1; }
+            emit!(b" ");
+        }};
+    }
+
+    emit_u32!(b"fo_active", d.fo_active as u32);
+    emit_u32!(b"fi_active", d.fi_active as u32);
+    emit_u32!(b"fo_calls", d.fo_calls);
+    emit_u32!(b"fi_calls", d.fi_calls);
+    emit_u32!(b"fo_frames", d.fo_frames);
+    emit_u32!(b"fo_bytes", d.fo_bytes);
+    emit_u32!(b"fi_frames", d.fi_frames);
+    emit_u32!(b"fi_bytes", d.fi_bytes);
+    emit_u32!(b"fo_skip_in", d.fo_skip_input);
+    emit_u32!(b"fo_skip_dst", d.fo_skip_dst_full);
+    emit_u32!(b"fi_skip_cons", d.fi_skip_consumer_full);
+    emit_u32!(b"fi_skip_src", d.fi_skip_no_src);
+    emit_i32!(b"fo_src", d.fo_first_src_chan);
+    emit_i32!(b"fo_dst0", d.fo_first_dst0);
+    emit_i32!(b"fo_dst1", d.fo_first_dst1);
+    emit_i32!(b"fi_dst", d.fi_first_dst_chan);
+    emit_i32!(b"fi_src0", d.fi_first_src0);
+    emit_i32!(b"fi_src1", d.fi_first_src1);
+    let (drop_l, drop_n, local_act, net_act) = fluxor::kernel::log_ring::peek_stats();
+    emit_u32!(b"ring_drop_local", drop_l);
+    emit_u32!(b"ring_drop_net", drop_n);
+    emit_u32!(b"ring_local_active", if local_act { 1 } else { 0 });
+    emit_u32!(b"ring_net_active", if net_act { 1 } else { 0 });
+    emit!(b"\n");
+
+    pos as i32
+}
 
 // ============================================================================
 // Entry point with secondary core parking
@@ -1342,10 +1791,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     unsafe { uart_init() };
     UART_READY.store(1, Ordering::Release);
-
-    // Register the raw UART writer so the log_uart overlay (and any
-    // future consumer) can drive the wire via UART_WRITE_RAW syscall.
-    fluxor::kernel::uart_write::install(uart_raw_write_bytes);
+    // UART FIFO is always drained by hardware, so the local log-ring
+    // consumer can activate immediately.
+    fluxor::kernel::log_ring::activate_local();
 
     // Record the DTB pointer now that the MMU is on; later DTB reads
     // dereference `_boot_dtb_ptr`.
@@ -1419,6 +1867,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Initialize syscall table and provider registry
     fluxor::kernel::syscalls::init_syscall_table();
     fluxor::kernel::syscalls::init_providers();
+    fluxor::kernel::syscalls::register_fan_diag_handler(fan_diag_snapshot);
     fluxor::kernel::step_guard::init();
 
     // --- Config-driven module graph ---
@@ -1579,24 +2028,94 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                     }
                 }
             } else {
-                // Same-domain edge: single shared channel
+                // Same-domain edge: allocate channels with fan-out (tee)
+                // on aliased source ports and fan-in (merge) on aliased
+                // destination ports. The raw `ch` is the producer-side
+                // wire in the non-aliased case; fan-in replaces it with
+                // a per-producer tributary.
                 let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
                 if ch >= 0 {
-                    if from < MAX_MODULES && edge.from_port_index == 0 && mod_out[from] < 0 {
-                        mod_out[from] = ch;
-                    }
-                    if to < MAX_MODULES {
-                        if edge.to_port == 0 && edge.to_port_index == 0 && mod_in[to] < 0 {
-                            mod_in[to] = ch;
-                        } else if edge.to_port == 1 && edge.to_port_index == 0 && mod_ctrl[to] < 0 {
-                            mod_ctrl[to] = ch;
+                    let to_port_type = if edge.to_port == 1 { 2u8 } else { 0u8 };
+
+                    // ── Fan-IN: multiple producers → single consumer port.
+                    // Aliasing is detected through the scheduler's per-port
+                    // channel table, which covers every (port_type, index).
+                    let existing_fi = unsafe { find_fan_in(to as u8, to_port_type, edge.to_port_index) };
+                    let producer_ch = if let Some(idx) = existing_fi {
+                        let tributary = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+                        if tributary >= 0 {
+                            unsafe { let _ = add_fan_in_src(idx, tributary); }
+                            tributary
+                        } else { ch }
+                    } else {
+                        let prior_consumer_chan = scheduler::get_module_port(
+                            to, to_port_type, edge.to_port_index);
+                        if prior_consumer_chan >= 0 {
+                            // Second producer for this (module, in_port):
+                            // promote to merge. Tributary #1 is the channel
+                            // the first producer already writes to.
+                            let new_dst = unsafe {
+                                register_fan_in(from_domain, to as u8, to_port_type,
+                                                edge.to_port_index, prior_consumer_chan)
+                            };
+                            if new_dst >= 0 {
+                                // Redirect consumer port to merge's dst.
+                                // Keep mod_in/mod_ctrl in sync when port 0.
+                                if to < MAX_MODULES {
+                                    if edge.to_port == 0 && edge.to_port_index == 0 {
+                                        mod_in[to] = new_dst;
+                                    } else if edge.to_port == 1 && edge.to_port_index == 0 {
+                                        mod_ctrl[to] = new_dst;
+                                    }
+                                }
+                                scheduler::set_module_port(to, to_port_type, edge.to_port_index, new_dst);
+                                let idx = unsafe {
+                                    find_fan_in(to as u8, to_port_type, edge.to_port_index).unwrap()
+                                };
+                                unsafe { let _ = add_fan_in_src(idx, ch); }
+                                ch
+                            } else { ch }
+                        } else {
+                            // First (producer, consumer) pair for this port.
+                            if to < MAX_MODULES {
+                                if edge.to_port == 0 && edge.to_port_index == 0 && mod_in[to] < 0 {
+                                    mod_in[to] = ch;
+                                } else if edge.to_port == 1 && edge.to_port_index == 0 && mod_ctrl[to] < 0 {
+                                    mod_ctrl[to] = ch;
+                                }
+                            }
+                            scheduler::set_module_port(to, to_port_type, edge.to_port_index, ch);
+                            ch
                         }
-                    }
-                    // Populate scheduler port table so dev_channel_port works
-                    scheduler::set_module_port(from, 1, edge.from_port_index, ch); // out port
-                    let to_port_type = if edge.to_port == 1 { 2u8 } else { 0u8 }; // ctrl=2, in=0
-                    scheduler::set_module_port(to, to_port_type, edge.to_port_index, ch);
+                    };
+
                     if e < MAX_EDGE_CHANNELS { edge_channels[e] = ch; }
+
+                    // ── Fan-OUT: single producer → multiple consumers.
+                    // Aliasing is detected the same way as fan-in above,
+                    // via scheduler port lookup.
+                    let src_port_key = (from as u8, edge.from_port_index);
+                    let first_chan_here = scheduler::get_module_port(from, 1, edge.from_port_index);
+                    let existing_fan = unsafe { find_fan_out(src_port_key.0, src_port_key.1) };
+                    if let Some(idx) = existing_fan {
+                        unsafe { let _ = add_fan_out_dst(idx, producer_ch); }
+                    } else if from < MAX_MODULES && first_chan_here >= 0 {
+                        let src = unsafe {
+                            register_fan_out(from_domain, src_port_key.0, src_port_key.1, first_chan_here)
+                        };
+                        if src >= 0 {
+                            unsafe { let _ = add_fan_out_dst(find_fan_out(src_port_key.0, src_port_key.1).unwrap(), producer_ch); }
+                            if from < MAX_MODULES && edge.from_port_index == 0 {
+                                mod_out[from] = src;
+                            }
+                            scheduler::set_module_port(from, 1, edge.from_port_index, src);
+                        }
+                    } else {
+                        if from < MAX_MODULES && edge.from_port_index == 0 && mod_out[from] < 0 {
+                            mod_out[from] = producer_ch;
+                        }
+                        scheduler::set_module_port(from, 1, edge.from_port_index, producer_ch);
+                    }
                 }
             }
         }
@@ -1656,6 +2175,12 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 // Re-apply port registrations for this module from the stored edge
                 // channel table. This keeps SCHED.ports consistent if earlier
                 // instantiation (or provider registration) has perturbed it.
+                //
+                // When a port is fan-out/in'd, the real channel the module
+                // uses is the tee's src (for out) or the merge's dst (for
+                // in), not the raw edge channel. Skip the re-apply for
+                // those ports and fall back to mod_in/out/ctrl, which
+                // track the authoritative post-fan values.
                 {
                     let mut ee = 0usize;
                     while ee < n_edges && ee < MAX_EDGE_CHANNELS {
@@ -1664,15 +2189,31 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                                 let from = edge.from_id as usize;
                                 let to = edge.to_id as usize;
                                 if from == i {
-                                    scheduler::set_module_port(i, 1, edge.from_port_index, edge_channels[ee]);
+                                    let has_fan = unsafe { find_fan_out(i as u8, edge.from_port_index).is_some() };
+                                    if !has_fan {
+                                        scheduler::set_module_port(i, 1, edge.from_port_index, edge_channels[ee]);
+                                    }
                                 }
                                 if to == i {
                                     let tp = if edge.to_port == 1 { 2u8 } else { 0u8 };
-                                    scheduler::set_module_port(i, tp, edge.to_port_index, edge_channels[ee]);
+                                    let has_fan = unsafe { find_fan_in(i as u8, tp, edge.to_port_index).is_some() };
+                                    if !has_fan {
+                                        scheduler::set_module_port(i, tp, edge.to_port_index, edge_channels[ee]);
+                                    }
                                 }
                             }
                         }
                         ee += 1;
+                    }
+                    // Fan-out/in sources of truth: mod_out/mod_in for port 0.
+                    if mod_out[i] >= 0 {
+                        scheduler::set_module_port(i, 1, 0, mod_out[i]);
+                    }
+                    if mod_in[i] >= 0 {
+                        scheduler::set_module_port(i, 0, 0, mod_in[i]);
+                    }
+                    if mod_ctrl[i] >= 0 {
+                        scheduler::set_module_port(i, 2, 0, mod_ctrl[i]);
                     }
                 }
 
@@ -1816,6 +2357,14 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     wake_secondary_cores();
 
     uart_puts(b"[sched] starting domain 0 on core 0\r\n");
+
+    // Flush buffered early-boot log bytes to the UART before we enter
+    // the tick loop. Each poll moves up to the staging size (1 KB),
+    // so a short burst covers typical boot chatter; anything left
+    // over flushes during the first few ticks.
+    for _ in 0..8 {
+        debug_drain_poll_core0();
+    }
 
     // Main loop — domain 0 on core 0
     run_domain_loop(0)
@@ -1996,6 +2545,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let t0 = read_timer_count();
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
+                unsafe { pump_fan_outs(domain_id); pump_fan_ins(domain_id); }
+                if core_id == 0 { debug_drain_poll_core0(); }
                 let elapsed = read_timer_count().wrapping_sub(t0);
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
@@ -2048,6 +2599,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                     pos += 1;
                 }
                 pump_cross_domain(domain_id);
+                unsafe { pump_fan_outs(domain_id); pump_fan_ins(domain_id); }
+                if core_id == 0 { debug_drain_poll_core0(); }
 
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.poll_steps += 1;
@@ -2072,6 +2625,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
+                unsafe { pump_fan_outs(domain_id); pump_fan_ins(domain_id); }
+                if core_id == 0 { debug_drain_poll_core0(); }
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
                 if tick % 10000 == 0 && tick > 0 {
@@ -2847,9 +3402,32 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    uart_puts(b"[fluxor] PANIC on core ");
-    uart_put_u32(current_core_id() as u32);
-    uart_puts(b"\r\n");
+fn panic(info: &PanicInfo) -> ! {
+    // Emergency sink: platform-owned, separate from the normal
+    // DebugTx drain. Writes directly to the UART hardware because
+    // the scheduler is dead and the debug drain won't run again.
+    // Gated on UART_READY so we don't poke the peripheral before
+    // `uart_init` has run.
+    if UART_READY.load(Ordering::Relaxed) != 0 {
+        uart_raw_puts(b"\r\n!!! PANIC on core ");
+        uart_raw_put_u32(current_core_id() as u32);
+        uart_raw_puts(b"\r\n");
+        if let Some(loc) = info.location() {
+            uart_raw_puts(b"  at ");
+            uart_raw_puts(loc.file().as_bytes());
+            uart_raw_putc(b':');
+            uart_raw_put_u32(loc.line());
+            uart_raw_puts(b"\r\n");
+        }
+        let mut buf = [0u8; 1024];
+        let n = fluxor::kernel::log_ring::read_tail(&mut buf);
+        if n > 0 {
+            uart_raw_puts(b"--- log tail (");
+            uart_raw_put_u32(n as u32);
+            uart_raw_puts(b" bytes) ---\r\n");
+            uart_raw_puts(&buf[..n]);
+            uart_raw_puts(b"\r\n--- end ---\r\n");
+        }
+    }
     loop { unsafe { core::arch::asm!("wfi") }; }
 }

@@ -1,3 +1,0 @@
-version = "1.0.0"
-hardware_targets = ["bcm2712"]
-permissions = ["platform_raw"]

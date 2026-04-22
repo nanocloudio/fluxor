@@ -2,27 +2,20 @@
 //
 // Layer: internal (unstable, kernel-private).
 //
-// Consumed by log_ring / log_uart / log_usb overlay modules. Kernel
-// emergency writes (panic handler) use separate internal paths not
-// exposed here.
+// Local debug transports (UART, USB CDC) are owned by the platform
+// runtime's `platform::debug` module — they do not have module-facing
+// opcodes. This module retains only the log-ring drain surface used by
+// graph-time log forwarders such as `log_net`.
 
 /// Drain bytes from the kernel log ring.
 /// handle=-1, arg=output buffer, arg_len=capacity.
 /// Returns bytes copied (0 if empty, never negative). The low 16 bits
-/// of the return value are the payload length; the high 16 bits carry
-/// the overflow-dropped byte count since the last drain (saturating).
+/// of the return value are the payload length; the next 15 bits are
+/// the overflow-dropped byte count since the last drain (saturating at
+/// 0x7FFF). The top bit is always 0.
 pub const LOG_RING_DRAIN: u32 = 0x0C64;
 
-/// Write raw bytes to the platform's primary UART synchronously.
-/// handle=-1, arg=input buffer, arg_len=byte count.
-/// Returns bytes written (== arg_len) on success, or ENOSYS if the
-/// platform has no UART, EINVAL on bad args. Blocking: the call does
-/// not return until all bytes have been flushed to the FIFO.
-pub const UART_WRITE_RAW: u32 = 0x0C65;
-
-/// Enqueue bytes for transmission on the platform's USB CDC endpoint.
-/// handle=-1, arg=input buffer, arg_len=byte count.
-/// Returns bytes enqueued (may be < arg_len if the internal TX pipe is
-/// backpressured), or ENOSYS if the platform has no USB. Non-blocking:
-/// the call does not wait for USB frames to go on the wire.
-pub const USB_WRITE_RAW: u32 = 0x0C66;
+/// Snapshot fan-out / fan-in pump counters as ASCII into a caller buffer.
+/// Returns bytes written. Read-only — no permission required.
+/// handle=-1, arg=output buffer, arg_len=capacity.
+pub const FAN_DIAG_SNAPSHOT: u32 = 0x0C65;

@@ -739,6 +739,20 @@ impl ModulePorts {
     }
 }
 
+/// Read a port channel handle for a module. Mirror of `set_module_port`.
+/// Returns -1 if unset or out of range.
+pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 {
+    if module_idx >= MAX_MODULES { return -1; }
+    let ports = unsafe { &SCHED.ports[module_idx] };
+    let idx = port_index as usize;
+    match port_type {
+        0 => if idx < MAX_PORTS { ports.in_chans[idx] } else { -1 },
+        1 => if idx < MAX_PORTS { ports.out_chans[idx] } else { -1 },
+        2 => if idx < MAX_PORTS { ports.ctrl_chans[idx] } else { -1 },
+        _ => -1,
+    }
+}
+
 /// Set a port channel handle for a module. Used by BCM2712 platform
 /// which doesn't go through the RP-side instantiate_one_module path.
 /// port_type: 0=in, 1=out, 2=ctrl

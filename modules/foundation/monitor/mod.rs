@@ -1,11 +1,10 @@
 //! monitor — emit `MON_HIST` telemetry lines for the `fluxor monitor` CLI.
 //!
 //! Polls the step-timing histogram for every active module on a slow
-//! cadence and emits one `MON_HIST` line per module via `log::info!`. The
-//! kernel already emits `MON_FAULT` on every fault (see
-//! `step_guard::push_fault`), so enabling this module together with a
-//! transport overlay (`debug: { to: uart | usb | net }`) is enough to
-//! feed the host-side dashboard.
+//! cadence and emits one `MON_HIST` line per module via `log::info!`.
+//! The kernel emits `MON_FAULT` directly (see `step_guard::push_fault`),
+//! so enabling this module is enough to feed the host-side dashboard
+//! over whichever log transports are active.
 //!
 //! `MON_STATE` emission is deferred until the kernel exposes module
 //! metadata (name / protection tier / state) through a query opcode —

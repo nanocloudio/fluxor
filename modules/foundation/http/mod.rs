@@ -52,7 +52,7 @@ include!("../../sdk/params.rs");
 // ============================================================================
 
 const SRV_RECV_BUF_SIZE: usize = 256;
-const SRV_SEND_BUF_SIZE: usize = 512;
+const SRV_SEND_BUF_SIZE: usize = 1024;
 const MAX_ROUTES: usize = 4;
 const MAX_PATH: usize = 32;
 const DEFAULT_BODY_POOL_SIZE: usize = 3072;
@@ -1136,6 +1136,33 @@ unsafe fn server_step(s: &mut HttpState) -> i32 {
         ServerPhase::DispatchRoute => {
             if s.srv_legacy_mode == 2 {
                 step_legacy_file_dispatch(s);
+                return 0;
+            }
+
+            // Diagnostic endpoint `/_fan` — calls the kernel
+            // `FAN_DIAG_SNAPSHOT` opcode and serves the resulting ASCII
+            // line (fan-out / fan-in pump counters + log_ring state).
+            // Served by every http instance without route configuration.
+            let req = s.srv_req_path.as_ptr();
+            let plen = s.srv_req_path_len as usize;
+            if plen >= 5
+                && *req == b'/' && *req.add(1) == b'_'
+                && *req.add(2) == b'f' && *req.add(3) == b'a' && *req.add(4) == b'n'
+            {
+                let buf = s.srv_send_buf.as_mut_ptr();
+                let cap = SRV_SEND_BUF_SIZE;
+                let mut off = 0usize;
+                let header = b"HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n";
+                let mut k = 0;
+                while k < header.len() && off < cap {
+                    *buf.add(off) = header[k]; off += 1; k += 1;
+                }
+                let room = cap.saturating_sub(off);
+                let n = ((*s.syscalls).provider_call)(-1, 0x0C65, buf.add(off), room);
+                if n > 0 { off += n as usize; }
+                s.srv_send_offset = 0;
+                s.srv_send_len = off as u16;
+                s.srv_phase = ServerPhase::DrainSend;
                 return 0;
             }
 

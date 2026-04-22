@@ -15,7 +15,9 @@ pub const PROBE: u32 = 0x1000;
 /// arg layout: [key_type:u8][len:u8][_pad:u16][bytes[len]]
 /// - key_type 1 = raw 32-byte P-256 scalar (for ECDSA + ECDH)
 /// - len is the key-material length in bytes
-/// Returns: slot handle (>= 0) or negative errno.
+///
+/// Returns: opaque handle (>= 0) or negative errno. Pass the handle
+/// back unmodified to SIGN / ECDH / DESTROY; do not decode it.
 pub const STORE: u32 = 0x1001;
 
 /// ECDH: derive shared secret. handle = slot.

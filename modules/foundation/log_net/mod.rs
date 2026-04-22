@@ -311,12 +311,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if poll <= 0 || (poll & 0x01) == 0 { return 0; }
                 let buf = s.net_buf.as_mut_ptr();
                 let (msg_type, payload_len) = net_read_frame(&*sys_ptr, in_chan, buf, NET_BUF_SIZE);
-                if msg_type == NET_MSG_BOUND && payload_len >= 1 {
-                    s.conn_id = *buf.add(3);
-                    s.phase = Phase::Serving;
-                    s.bind_attempts = 0;
-                    s.pending_len = 0;
-                    return 2;
+                // MSG_BOUND payload: [conn_id:1][local_port:2 LE]. Match
+                // on local_port so we only claim the conn_id belonging to
+                // our own CMD_BIND — `ip.net_out` may be tee'd to other
+                // consumers with their own binds in flight.
+                if msg_type == NET_MSG_BOUND && payload_len >= 3 {
+                    let bound_port = (*buf.add(4) as u16)
+                        | ((*buf.add(5) as u16) << 8);
+                    if bound_port == s.bind_port {
+                        s.conn_id = *buf.add(3);
+                        s.phase = Phase::Serving;
+                        s.bind_attempts = 0;
+                        s.pending_len = 0;
+                        return 2;
+                    }
                 } else if msg_type == NET_MSG_ERROR {
                     // Transient — back off, then retry from Binding.
                     // Never returns -1: a debug overlay must not kill its own

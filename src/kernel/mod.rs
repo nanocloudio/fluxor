@@ -42,8 +42,6 @@ pub mod event;
 pub mod loader;
 pub mod log_ring;
 pub mod scheduler;
-pub mod uart_write;
-pub mod usb_write;
 
 // RP-family kernel services.
 pub mod fd;

@@ -324,9 +324,22 @@ unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) {
     net_send_short(s, NET_MSG_CLOSED, conn_id);
 }
 
+/// MSG_BOUND payload: `[conn_id:1][local_port:2 LE]`. Consumers that
+/// share `net_out` with other bound peers match on `local_port` so they
+/// only claim a conn_id for their own CMD_BIND.
 #[inline(always)]
-unsafe fn net_send_bound(s: &mut IpState, conn_id: u8) {
-    net_send_short(s, NET_MSG_BOUND, conn_id);
+unsafe fn net_send_bound(s: &mut IpState, conn_id: u8, local_port: u16) {
+    if s.net_out_chan < 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    core::ptr::write_volatile(scratch, NET_MSG_BOUND);
+    core::ptr::write_volatile(scratch.add(1), 3u8);
+    core::ptr::write_volatile(scratch.add(2), 0u8);
+    core::ptr::write_volatile(scratch.add(3), conn_id);
+    let pb = local_port.to_le_bytes();
+    core::ptr::write_volatile(scratch.add(4), pb[0]);
+    core::ptr::write_volatile(scratch.add(5), pb[1]);
+    (sys.channel_write)(s.net_out_chan, scratch, 6);
 }
 
 #[inline(always)]
@@ -1706,7 +1719,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     }
                     if found {
                         log_info(s, b"[ip] net bind");
-                        net_send_bound(s, ci as u8);
+                        net_send_bound(s, ci as u8, port);
                     } else {
                         log_info(s, b"[ip] net bind: no free conn");
                         net_send_error(s, 0, -12); // ENOMEM

@@ -958,6 +958,74 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 /// from the private key and the hash (RFC 6979); the `_random_k` parameter
 /// is retained for API compatibility and ignored. Returns the 64-byte
 /// signature `r || s` in big-endian form, normalised to low-s.
+#[cfg(test)]
+mod test_vectors {
+    use super::*;
+
+    /// Known-answer ECDSA signature for priv = [0x11; 32] over
+    /// sha256("abc"), with deterministic RFC 6979 nonces.
+    #[test]
+    fn ecdsa_sign_kat() {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"abc");
+        let hash = h.finalize();
+        let priv_key = [0x11u8; 32];
+        let sig = ecdsa_sign(&priv_key, hash.as_slice(), &[0u8; 32]);
+        let expected_r: [u8; 32] = [
+            0x1e, 0xb9, 0xd8, 0x5c, 0x94, 0x8e, 0xbe, 0xfe,
+            0x6c, 0xd6, 0x7a, 0xa9, 0x72, 0x0e, 0xda, 0x41,
+            0x29, 0xb7, 0x46, 0x8b, 0xfd, 0x52, 0x32, 0x18,
+            0x47, 0xc5, 0x58, 0x89, 0xf5, 0x02, 0xa0, 0xea,
+        ];
+        let expected_s: [u8; 32] = [
+            0x2e, 0xf9, 0x07, 0x57, 0x40, 0x35, 0x09, 0x59,
+            0x2d, 0xac, 0x12, 0x32, 0xea, 0x05, 0xa1, 0x15,
+            0xda, 0x2c, 0x36, 0x42, 0x96, 0xd6, 0x2b, 0xeb,
+            0x00, 0xa1, 0xf7, 0xf8, 0xa4, 0xa3, 0xe4, 0x23,
+        ];
+        assert_eq!(&sig[..32], &expected_r);
+        assert_eq!(&sig[32..], &expected_s);
+    }
+
+    /// Sign / verify round-trip: the signer and the verifier agree on
+    /// the same (priv_key, hash) input.
+    #[test]
+    fn ecdsa_sign_verify_roundtrip() {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"abc");
+        let hash = h.finalize();
+        let priv_key = [0x11u8; 32];
+        let sig = ecdsa_sign(&priv_key, hash.as_slice(), &[0u8; 32]);
+        let pub_key = public_key_from_scalar(&priv_key);
+        assert!(ecdsa_verify(&pub_key, hash.as_slice(), &sig));
+    }
+
+    /// Public key derivation matches a standards-compliant reference
+    /// (OpenSSL / pyca cryptography) for a fixed scalar.
+    #[test]
+    fn public_key_from_scalar_kat() {
+        let priv_key = [0x11u8; 32];
+        let got = public_key_from_scalar(&priv_key);
+        let expected_x: [u8; 32] = [
+            0x02, 0x17, 0xe6, 0x17, 0xf0, 0xb6, 0x44, 0x39,
+            0x28, 0x27, 0x8f, 0x96, 0x99, 0x9e, 0x69, 0xa2,
+            0x3a, 0x4f, 0x2c, 0x15, 0x2b, 0xdf, 0x6d, 0x6c,
+            0xdf, 0x66, 0xe5, 0xb8, 0x02, 0x82, 0xd4, 0xed,
+        ];
+        let expected_y: [u8; 32] = [
+            0x19, 0x4a, 0x7d, 0xeb, 0xcb, 0x97, 0x71, 0x2d,
+            0x2d, 0xda, 0x3c, 0xa8, 0x5a, 0xa8, 0x76, 0x5a,
+            0x56, 0xf4, 0x5f, 0xc7, 0x58, 0x59, 0x96, 0x52,
+            0xf2, 0x89, 0x7c, 0x65, 0x30, 0x6e, 0x57, 0x94,
+        ];
+        assert_eq!(got[0], 0x04);
+        assert_eq!(&got[1..33], &expected_x);
+        assert_eq!(&got[33..65], &expected_y);
+    }
+}
+
 pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> [u8; 64] {
     let d = u256_from_be(private_key);
     let mut k = rfc6979_nonce(private_key, hash);

@@ -131,11 +131,11 @@ fn init_logger() {
 // USB CDC-ACM bridge — shared pipe drained by an embassy task.
 // ============================================================================
 //
-// The `log_usb` overlay module enqueues bytes through the `USB_WRITE_RAW`
-// syscall, which pushes them into `USB_TX_PIPE`. The CDC task below reads
-// packet-sized chunks out of the pipe and writes them to the CDC endpoint.
-// Pipe is lock-free on the producer side via `try_write` and async on the
-// consumer side — exactly the shape we need for sync-syscall → async-USB.
+// The platform debug drain (`RpUsbSink` below) enqueues bytes into
+// `USB_TX_PIPE`. The CDC task drains the pipe and writes packet-sized
+// chunks to the CDC endpoint. Pipe is lock-free on the producer side
+// via `try_write` and async on the consumer side — exactly the shape
+// we need for sync-drain → async-USB.
 
 use embassy_futures::join::join;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -148,14 +148,38 @@ const USB_TX_PIPE_SIZE: usize = 4096;
 
 static USB_TX_PIPE: Pipe<CriticalSectionRawMutex, USB_TX_PIPE_SIZE> = Pipe::new();
 
-/// Raw adapter for `kernel::usb_write::install`. Non-blocking: writes as
-/// many bytes as fit in the pipe and returns the count. Callers must
-/// handle short writes.
-unsafe fn usb_write_raw(ptr: *const u8, len: usize) -> usize {
-    let bytes = core::slice::from_raw_parts(ptr, len);
-    match USB_TX_PIPE.try_write(bytes) {
-        Ok(n) => n,
-        Err(_) => 0,
+// --- Platform debug drain (local USB CDC) ---
+//
+// Normal-runtime path for kernel log output. Drains `log_ring` into
+// USB_TX_PIPE (the Embassy CDC task reads it and writes packets to
+// the endpoint). Called once per tick from `rp_run_main_loop`. Single-
+// task Embassy executor, so no cross-core coordination is needed.
+// HardFault / panic handlers do not use this path; emergency output
+// goes through panic_probe (RTT) and the uninit-RAM crash area.
+struct RpUsbSink;
+
+impl fluxor::platform::debug::DebugTx for RpUsbSink {
+    fn write(&mut self, bytes: &[u8]) -> usize {
+        match USB_TX_PIPE.try_write(bytes) {
+            Ok(n) => n,
+            Err(_) => 0,
+        }
+    }
+}
+
+static mut DEBUG_DRAIN: fluxor::platform::debug::DebugDrain<256> =
+    fluxor::platform::debug::DebugDrain::new();
+static mut DEBUG_SINK: RpUsbSink = RpUsbSink;
+
+/// Drain queued log bytes into the USB CDC pipe. Embassy main task only.
+#[inline]
+fn debug_drain_poll() {
+    // SAFETY: single consumer of `log_ring`; the Embassy main task is
+    // the only caller (no other tasks or ISRs touch DEBUG_DRAIN).
+    unsafe {
+        let drain = &mut *(&raw mut DEBUG_DRAIN);
+        let sink = &mut *(&raw mut DEBUG_SINK);
+        drain.poll(sink);
     }
 }
 
@@ -193,6 +217,9 @@ async fn usb_cdc_task(driver: Driver<'static, USB>) {
         let mut buf = [0u8; 64];
         loop {
             sender.wait_connection().await;
+            // Host is attached; the local log-ring consumer is free to
+            // flow without stalling the producer.
+            fluxor::kernel::log_ring::activate_local();
             loop {
                 let n = USB_TX_PIPE.read(&mut buf).await;
                 if sender.write_packet(&buf[..n]).await.is_err() {
@@ -203,6 +230,18 @@ async fn usb_cdc_task(driver: Driver<'static, USB>) {
                 if n == 64 && sender.write_packet(&[]).await.is_err() {
                     break;
                 }
+            }
+            // Host disconnected. Stop the local consumer, drop any
+            // bytes staged between the ring and the USB endpoint, and
+            // flush the CDC pipe so the next attach sees "now"-bytes
+            // instead of pre-detach backlog.
+            fluxor::kernel::log_ring::disable_local();
+            USB_TX_PIPE.clear();
+            // SAFETY: the Embassy main task is the only caller that
+            // touches DEBUG_DRAIN; this branch runs inside that task.
+            unsafe {
+                let drain = &mut *(&raw mut DEBUG_DRAIN);
+                drain.reset();
             }
         }
     };
@@ -227,14 +266,13 @@ async fn main(spawner: Spawner) {
     // and are consumed by PIC modules (e.g. log_net for UDP netconsole).
     init_logger();
 
-    // Spawn the USB CDC drain task. It's always running — the `log_usb`
-    // overlay module decides whether anything actually feeds it. If no
-    // overlay is active, the pipe stays empty and the task sits in
-    // `wait_connection`/`read.await`. Installing `usb_write_raw` here
-    // lets the USB_WRITE_RAW syscall work regardless.
+    // Spawn the USB CDC drain task. The platform debug drain
+    // (`RpUsbSink`) feeds bytes into `USB_TX_PIPE`; the task reads
+    // packet-sized chunks and writes them to the CDC endpoint. With no
+    // host connected the task sits in `wait_connection`/`read.await`
+    // and the pipe acts as a small buffer.
     let usb_driver = Driver::new(p.USB, Irqs);
     spawner.spawn(usb_cdc_task(usb_driver).unwrap());
-    fluxor::kernel::usb_write::install(usb_write_raw);
 
     log::info!("[fluxor] starting");
 
@@ -671,6 +709,8 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
                 return None;
             }
         }
+
+        debug_drain_poll();
 
         if let Some(req) = scheduler::take_rebuild_request() {
             return Some(req);

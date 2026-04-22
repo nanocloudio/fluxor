@@ -394,9 +394,9 @@ pub unsafe extern "C" fn module_new(
         }
     }
 
-    // If a kernel KEY_VAULT is available, deposit the identity private key
-    // so CertificateVerify signs through the vault. The in-module `key`
-    // bytes remain as a fallback for SIGN operations the vault declines.
+    // Deposit the private scalar into the kernel KEY_VAULT so that
+    // CertificateVerify signs via `KV_SIGN` and the in-module `s.key`
+    // bytes can be wiped immediately after.
     const KV_PROBE: u32 = 0x1000;
     const KV_STORE: u32 = 0x1001;
     if s.key_len >= 32 {
@@ -415,9 +415,10 @@ pub unsafe extern "C" fn module_new(
             let h = (sys.provider_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
             if h >= 0 {
                 s.key_vault_handle = h;
-                // Vault now holds the authoritative copy; wipe the in-module
-                // key material so pump_send_certificate_verify signs through
-                // the vault (and can't silently fall back to a plaintext key).
+                // Vault now holds the authoritative copy; wipe the
+                // in-module key material so pump_send_certificate_verify
+                // must sign through the vault (and can't silently fall
+                // back to a plaintext key).
                 let mut j = 0;
                 while j < s.key_len {
                     core::ptr::write_volatile(&mut s.key[j], 0);

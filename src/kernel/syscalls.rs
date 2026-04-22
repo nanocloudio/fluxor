@@ -588,6 +588,7 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
         0x0C3A ..= 0x0C3D |
         0x0C40 | 0x0C41 |
         0x0C50 | 0x0C51 |
+        0x0C65 |  // FAN_DIAG_SNAPSHOT (read-only fan counters)
         0x0CE8 |
         0x0CF8 | 0x0CFA => None,
 
@@ -856,9 +857,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             handle_core_primitive(handle, opcode, arg, arg_len)
         }
         // ── Diagnostics / log transport ──
-        diag::LOG_RING_DRAIN
-        | diag::UART_WRITE_RAW
-        | diag::USB_WRITE_RAW => {
+        diag::LOG_RING_DRAIN |
+        diag::FAN_DIAG_SNAPSHOT => {
             handle_diag_op(opcode, arg, arg_len)
         }
         // ── Bridge channel operations ──
@@ -1160,35 +1160,34 @@ unsafe fn handle_diag_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len == 0 { return E_INVAL; }
     match opcode {
         diag::LOG_RING_DRAIN => {
+            // Low 16 bits = payload length, next 15 bits = dropped count
+            // (saturating). Top bit is kept clear so the return is always
+            // a non-negative `i32`.
             let out = core::slice::from_raw_parts_mut(arg, arg_len);
-            let n = crate::kernel::log_ring::drain(out);
-            let dropped = crate::kernel::log_ring::take_dropped();
-            let dropped_sat = if dropped > 0xFFFF { 0xFFFF } else { dropped };
+            let n = crate::kernel::log_ring::drain_net(out);
+            let dropped = crate::kernel::log_ring::take_dropped_net();
+            let dropped_sat = if dropped > 0x7FFF { 0x7FFF } else { dropped };
             ((dropped_sat << 16) | (n as u32 & 0xFFFF)) as i32
         }
-        diag::UART_WRITE_RAW => {
-            // Platform hook — a platform registers its UART writer via
-            // `uart_write::install`. If nothing is installed, the platform
-            // has no UART available to user-space, so we report ENOSYS
-            // rather than silently dropping bytes.
-            let bytes = core::slice::from_raw_parts(arg, arg_len);
-            match crate::kernel::uart_write::write(bytes) {
-                Some(n) => n as i32,
-                None => errno::ENOSYS,
-            }
-        }
-        diag::USB_WRITE_RAW => {
-            // May return short counts when the USB TX pipe is
-            // backpressured — the caller (log_usb) holds the unsent
-            // tail in its staging buffer.
-            let bytes = core::slice::from_raw_parts(arg, arg_len);
-            match crate::kernel::usb_write::write(bytes) {
-                Some(n) => n as i32,
-                None => errno::ENOSYS,
-            }
+        diag::FAN_DIAG_SNAPSHOT => {
+            let f = FAN_DIAG_HANDLER.load(core::sync::atomic::Ordering::Acquire);
+            if f.is_null() { return E_NOSYS; }
+            let handler: unsafe fn(*mut u8, usize) -> i32 =
+                core::mem::transmute(f);
+            handler(arg, arg_len)
         }
         _ => E_NOSYS,
     }
+}
+
+/// Platform-injected handler for `FAN_DIAG_SNAPSHOT`. A null handler
+/// causes the syscall to return ENOSYS, which is the expected behaviour
+/// on platforms that don't expose fan-out / fan-in diagnostics.
+pub static FAN_DIAG_HANDLER: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_fan_diag_handler(f: unsafe fn(*mut u8, usize) -> i32) {
+    FAN_DIAG_HANDLER.store(f as *mut (), core::sync::atomic::Ordering::Release);
 }
 
 unsafe fn handle_service_register(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {

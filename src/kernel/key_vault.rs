@@ -10,6 +10,7 @@
 use crate::abi::contracts::key_vault as dev_key_vault;
 use crate::abi::errno::{ENOSYS, EINVAL};
 use crate::kernel::crypto::p256;
+use crate::kernel::fd;
 
 /// P-256 raw-scalar key type, as passed in the STORE `key_type` byte.
 const KEY_TYPE_P256_SCALAR: u8 = 1;
@@ -67,7 +68,21 @@ unsafe fn zeroise_slot(i: usize) {
 
 /// Provider dispatch function registered against dev_class::KEY_VAULT.
 /// Signature matches the `provider_dispatch` contract.
+///
+/// Slot-bound ops (DESTROY / SIGN / ECDH) take a `FD_TAG_KEY_VAULT`-tagged
+/// handle; PROBE / STORE / VERIFY take `handle=-1`. Tagging keeps KV
+/// handles distinct from other drivers' untagged integer handles in the
+/// kernel's global handle-tracking table.
 pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    let slot_handle = match opcode {
+        dev_key_vault::PROBE | dev_key_vault::STORE | dev_key_vault::VERIFY => handle,
+        _ => {
+            if handle < 0 { return EINVAL; }
+            let (tag, slot) = fd::untag_fd(handle);
+            if tag != fd::FD_TAG_KEY_VAULT { return EINVAL; }
+            slot
+        }
+    };
     match opcode {
         dev_key_vault::PROBE => {
             // Presence indicator — 1 means the vault is available.
@@ -102,19 +117,19 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             // Mark in-use last so partial fills can't be observed.
             SLOTS[idx].flags = FLAG_IN_USE;
-            idx as i32
+            fd::tag_fd(fd::FD_TAG_KEY_VAULT, idx as i32)
         }
 
         dev_key_vault::DESTROY => {
-            if handle < 0 || (handle as usize) >= MAX_SLOTS { return EINVAL; }
-            zeroise_slot(handle as usize);
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS { return EINVAL; }
+            zeroise_slot(slot_handle as usize);
             0
         }
 
         dev_key_vault::SIGN => {
             if arg.is_null() || arg_len < 4 + 32 + 64 { return EINVAL; }
-            if handle < 0 || (handle as usize) >= MAX_SLOTS { return EINVAL; }
-            let slot = &SLOTS[handle as usize];
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS { return EINVAL; }
+            let slot = &SLOTS[slot_handle as usize];
             if (slot.flags & FLAG_IN_USE) == 0
                 || slot.key_type != KEY_TYPE_P256_SCALAR
                 || slot.key_len != 32
@@ -139,8 +154,8 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 
         dev_key_vault::ECDH => {
             if arg.is_null() || arg_len < 4 { return EINVAL; }
-            if handle < 0 || (handle as usize) >= MAX_SLOTS { return EINVAL; }
-            let slot = &SLOTS[handle as usize];
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS { return EINVAL; }
+            let slot = &SLOTS[slot_handle as usize];
             if (slot.flags & FLAG_IN_USE) == 0
                 || slot.key_type != KEY_TYPE_P256_SCALAR
                 || slot.key_len != 32
@@ -211,11 +226,14 @@ mod tests {
             provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len())
         };
         assert!(handle >= 0, "store should succeed, got {}", handle);
+        let (tag, slot_idx) = fd::untag_fd(handle);
+        assert_eq!(tag, fd::FD_TAG_KEY_VAULT);
+        let slot_idx = slot_idx as usize;
 
         // No API path exposes the raw key. Confirm the slot holds our bytes
         // via the private accessor (test-only).
         unsafe {
-            let slot = &SLOTS[handle as usize];
+            let slot = &SLOTS[slot_idx];
             assert_eq!(slot.key_len, 32);
             assert_eq!(slot.key_type, 1);
             for i in 0..32 { assert_eq!(slot.data[i], (i as u8) + 1); }
@@ -225,11 +243,30 @@ mod tests {
         let rc = unsafe { provider_dispatch(handle, dev_key_vault::DESTROY, core::ptr::null_mut(), 0) };
         assert_eq!(rc, 0);
         unsafe {
-            let slot = &SLOTS[handle as usize];
+            let slot = &SLOTS[slot_idx];
             assert_eq!(slot.flags, 0);
             assert_eq!(slot.key_len, 0);
             for i in 0..32 { assert_eq!(slot.data[i], 0, "slot byte {} not wiped", i); }
         }
+    }
+
+    /// Slot-bound ops reject handles that aren't FD_TAG_KEY_VAULT-tagged,
+    /// so a raw integer handle from another contract's allocator cannot
+    /// be misrouted into this dispatcher.
+    #[test]
+    fn untagged_handle_rejected() {
+        unsafe { reset_all(); }
+        let mut sign_arg = [0u8; 4 + 32 + 64];
+        sign_arg[0] = 32;
+        let rc = unsafe {
+            provider_dispatch(0, dev_key_vault::SIGN, sign_arg.as_mut_ptr(), sign_arg.len())
+        };
+        assert_eq!(rc, EINVAL);
+        let foreign = fd::tag_fd(fd::FD_TAG_EVENT, 0);
+        let rc = unsafe {
+            provider_dispatch(foreign, dev_key_vault::SIGN, sign_arg.as_mut_ptr(), sign_arg.len())
+        };
+        assert_eq!(rc, EINVAL);
     }
 
     #[test]

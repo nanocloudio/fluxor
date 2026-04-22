@@ -23,6 +23,7 @@ pub const FD_TAG_TIMER: i32 = 3;
 // Tags 4-6 were PIO stream/cmd/rx (removed — PIC module handles PIO directly)
 pub const FD_TAG_DMA: i32 = 7;
 pub const FD_TAG_BRIDGE: i32 = 8;
+pub const FD_TAG_KEY_VAULT: i32 = 9;
 
 const TAG_SHIFT: u32 = 27;
 const SLOT_MASK: i32 = 0x07FF_FFFF;
