@@ -518,7 +518,7 @@ mod mmu {
         // and PCIe1) can be flipped to Normal Non-Cacheable while the
         // rest stays cacheable. Both arenas must live below 4 GB because
         // the PCIe1 inbound ATU only covers PCI bus 0..0xFFFFFFFF on
-        // Pi 5 (see hw/nvme_trace/baseline/README.md).
+        // Pi 5 (see nvme_trace/baseline/README.md).
         {
             let l2 = &mut *(&raw mut L2_TABLE_0.0);
             // Fill all 512 L2 entries as cacheable DRAM (each 2MB)

@@ -183,7 +183,7 @@ pub fn dma_arena_base() -> usize {
 //
 // The BCM2712 PCIe1 inbound ATU — whether programmed by Linux or left at
 // VPU defaults — only covers PCI bus addresses `0..0xFFFFFFFF` (see
-// `hw/nvme_trace/baseline/README.md`: Linux's userspace nvme_trace fails
+// `nvme_trace/baseline/README.md`: Linux's userspace nvme_trace fails
 // with pagemap addresses above 4 GB, which is why baseline capture cuts
 // off mid-Identify). Any DMA target has to be reachable in that 4 GB
 // window with an identity PCI↔AXI mapping.

@@ -358,7 +358,7 @@ mod brcm {
 }
 
 /// Post-probe target values captured on the rig under Linux
-/// (hw/nvme_trace/baseline/pcie1_rc_post_probe.txt). Stage-4 writes
+/// (nvme_trace/baseline/pcie1_rc_post_probe.txt). Stage-4 writes
 /// these verbatim so the Fluxor state converges on `brcm_pcie_probe`.
 #[cfg(feature = "board-cm5")]
 mod post_probe {
@@ -825,7 +825,7 @@ pub fn enumerate() -> usize {
 
         // Inbound setup — match Linux brcm_pcie_setup ordering for
         // BCM2712, writing after MISC_CTRL and before MDIO / PERST#.
-        // Values from hw/nvme_trace/baseline/pcie1_rc_post_probe_v3.txt.
+        // Values from nvme_trace/baseline/pcie1_rc_post_probe_v3.txt.
         //
         // Writing UBUS_CTRL / UBUS_TIMEOUT / AXI_INTF_CTRL /
         // AXI_READ_ERR_DATA after the link has trained (e.g. on a

@@ -32,3 +32,19 @@ reserved_pins = [14, 15]
 [platform.net]
 phy = "ethernet"
 driver = "rp1_gem"
+
+# Public hardware-rig contract (see .context/rfc_hardware_rig.md §7).
+# Board-level facts only — bench-specific bindings live in private rig
+# profiles under ~/.config/fluxor/labs/. Capability strings are the fully
+# qualified vocabulary from RFC §6 and are matched exactly (no aliases).
+[rig]
+artifact = "kernel8_img"
+deploy = ["deploy.netboot_tftp", "deploy.bootfs_copy", "deploy.sd_image_writer"]
+preferred_deploy = "deploy.netboot_tftp"
+console = ["console.serial"]
+preferred_console = "console.serial"
+telemetry = ["telemetry.monitor_udp"]
+preferred_telemetry = "telemetry.monitor_udp"
+observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream"]
+power = ["power.cycle"]
+default_timeout_s = 30

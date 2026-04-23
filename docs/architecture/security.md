@@ -242,7 +242,7 @@ config.
   production-network hazard. The rig config ships in proxy-DHCP mode —
   dnsmasq advertises PXE/TFTP options only and never hands out leases.
   Do not add a non-proxy `dhcp-range` to any config on a shared
-  interface; see the warning comment at the top of `hw/dnsmasq.conf`.
+  interface; see the safety note in `docs/guides/pi5-bare-metal.md` (§ Dev host setup: dnsmasq).
 - `sudo ip neigh` static entries are host-local and do not leak onto
   the LAN, but they will misdirect traffic on the originating host if
   the target IP is reassigned.

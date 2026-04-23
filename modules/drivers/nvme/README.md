@@ -8,7 +8,7 @@ This is v1 per `.context/future/rfc_nvme_driver.md` — not optimised,
 not interrupt-driven, not multi-queue. The point is correctness.
 
 See also: `docs/guides/driver-bringup.md` for the general methodology
-this module was built against, and `hw/nvme_trace/` for the userspace
+this module was built against, and `nvme_trace/` for the userspace
 trace that defines the expected controller init sequence.
 
 ---
@@ -34,7 +34,7 @@ UART even if the log_net module isn't running yet.
   (Identify Namespace).
 - Reference implementations: SPDK `lib/nvme/nvme_ctrlr.c`;
   NetBSD `sys/dev/ic/nvme.c`.
-- Baseline trace tool at `hw/nvme_trace/` — captures the init +
+- Baseline trace tool at `nvme_trace/` — captures the init +
   Identify Controller sequence with ns-accurate timestamps.
 
 ---

@@ -20,6 +20,7 @@ mod manifest;
 mod modules;
 mod monitor;
 pub mod reconfigure;
+pub mod rig;
 mod schema;
 pub mod target;
 mod uf2;
@@ -235,6 +236,14 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Hardware-rig orchestration (`rig test --scenario …`, `rig power`, …).
+    ///
+    /// Host-side hardware-rig orchestration with a board-agnostic
+    /// contract. See `.context/rfc_hardware_rig.md` for the model; scenarios
+    /// live in `tests/hardware/`, rig profiles live outside the repo in
+    /// `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`.
+    #[command(subcommand_value_name = "RIG_SUBCOMMAND")]
+    Rig(rig::cli::RigArgs),
 }
 
 fn main() {
@@ -284,6 +293,7 @@ fn main() {
         Commands::Monitor { port, baud, refresh_ms, net } => {
             cmd_monitor_dispatch(&port, baud, refresh_ms, net.as_deref())
         }
+        Commands::Rig(args) => rig::cli::dispatch(args),
     };
 
     if let Err(e) = result {

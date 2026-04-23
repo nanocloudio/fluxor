@@ -1,7 +1,7 @@
 //! NVMe block driver — Pi 5 / CM5 PCIe1 external slot.
 //!
 //! See `README.md` for the state-machine contract, spec citations, and
-//! the bring-up checklist. See `hw/nvme_trace/baseline/` for the
+//! the bring-up checklist. See `nvme_trace/baseline/` for the
 //! reference trace this module is written against (Biwin
 //! CE430T5D100-512G).
 //!

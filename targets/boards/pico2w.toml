@@ -31,3 +31,14 @@ reserved_pins = [23, 24, 25, 29]
 [platform.net]
 phy = "wifi"
 driver = "cyw43"
+
+# Public hardware-rig contract (see .context/rfc_hardware_rig.md §7).
+[rig]
+artifact = "uf2"
+deploy = ["deploy.uf2_mount", "deploy.picotool", "deploy.swd"]
+preferred_deploy = "deploy.uf2_mount"
+console = ["console.usb_cdc", "console.serial"]
+preferred_console = "console.usb_cdc"
+observe = ["observe.console_regex", "observe.usb_enumeration"]
+power = ["power.cycle"]
+default_timeout_s = 20
