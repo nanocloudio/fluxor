@@ -1136,13 +1136,129 @@ unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     (sys.provider_call)(-1, 0x0CEB, bp, 12)
 }
 
+/// PCIE_DEVICE contract: open a device by selector.
+///
+/// `selector` is a UTF-8 byte string — either a board-local alias
+/// (e.g. `b"m2_primary"`) or a class match `b"@class=nvme"` that must
+/// resolve to exactly one device. Returns the device handle on
+/// success; on EAGAIN/ENODEV the caller should retry (the PCIe link
+/// may still be training).
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie_device_open(sys: &SyscallTable, selector: &[u8]) -> i32 {
+    (sys.provider_open)(
+        0x0012, // PCIE_DEVICE contract id
+        abi::platform::bcm2712::pcie_device::BIND,
+        selector.as_ptr(),
+        selector.len(),
+    )
+}
+
+/// PCIE_DEVICE contract: read 32-bit config-space word for the bound
+/// handle. Returns 0xFFFFFFFF on any failure (matches real-PCIe sentinel).
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie_device_cfg_read32(sys: &SyscallTable, handle: i32, offset: u16) -> u32 {
+    let mut buf = [0u8; 8];
+    let bp = buf.as_mut_ptr();
+    let ob = offset.to_le_bytes();
+    *bp = ob[0];
+    *bp.add(1) = ob[1];
+    let rc = (sys.provider_call)(
+        handle,
+        abi::platform::bcm2712::pcie_device::CFG_READ32,
+        bp,
+        8,
+    );
+    if rc != 0 {
+        return 0xFFFF_FFFF;
+    }
+    u32::from_le_bytes([*bp.add(4), *bp.add(5), *bp.add(6), *bp.add(7)])
+}
+
+/// PCIE_DEVICE contract: write 32-bit config-space word for the bound
+/// handle. Returns 0 on success, negative errno otherwise.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie_device_cfg_write32(sys: &SyscallTable, handle: i32, offset: u16, val: u32) -> i32 {
+    let mut buf = [0u8; 8];
+    let bp = buf.as_mut_ptr();
+    let ob = offset.to_le_bytes();
+    *bp = ob[0];
+    *bp.add(1) = ob[1];
+    *bp.add(2) = 0;
+    *bp.add(3) = 0;
+    let vb = val.to_le_bytes();
+    for i in 0..4 { *bp.add(4 + i) = vb[i]; }
+    (sys.provider_call)(
+        handle,
+        abi::platform::bcm2712::pcie_device::CFG_WRITE32,
+        bp,
+        8,
+    )
+}
+
+/// PCIE_DEVICE contract: map BAR `bar_idx` for the bound handle,
+/// returning the kernel-visible virt address (or 0 on failure).
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie_device_bar_map(sys: &SyscallTable, handle: i32, bar_idx: u8) -> u64 {
+    let mut buf = [0u8; 10];
+    let bp = buf.as_mut_ptr();
+    *bp = bar_idx;
+    *bp.add(1) = 0;
+    let rc = (sys.provider_call)(
+        handle,
+        abi::platform::bcm2712::pcie_device::BAR_MAP,
+        bp,
+        10,
+    );
+    if rc < 0 { return 0; }
+    u64::from_le_bytes([
+        *bp.add(2), *bp.add(3), *bp.add(4), *bp.add(5),
+        *bp.add(6), *bp.add(7), *bp.add(8), *bp.add(9),
+    ])
+}
+
+/// PCIE_DEVICE contract: allocate an MSI-X vector on the bound
+/// device's root complex, routing fires to `event_handle`. The
+/// kernel brings up the MSI controller lazily on first call.
+/// Returns `Some((vector_idx, target_addr, data))` on success.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_pcie_device_msi_alloc(
+    sys: &SyscallTable,
+    handle: i32,
+    event_handle: i32,
+) -> Option<(u8, u64, u32)> {
+    let mut buf = [0u8; 20];
+    let bp = buf.as_mut_ptr();
+    let eb = event_handle.to_le_bytes();
+    for i in 0..4 { *bp.add(i) = eb[i]; }
+    let rc = (sys.provider_call)(
+        handle,
+        abi::platform::bcm2712::pcie_device::MSI_ALLOC,
+        bp,
+        20,
+    );
+    if rc != 0 { return None; }
+    let vec = *bp.add(4);
+    let addr = u64::from_le_bytes([
+        *bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11),
+        *bp.add(12), *bp.add(13), *bp.add(14), *bp.add(15),
+    ]);
+    let data = u32::from_le_bytes([*bp.add(16), *bp.add(17), *bp.add(18), *bp.add(19)]);
+    Some((vec, addr, data))
+}
+
 /// Read a 32-bit word from a discovered PCIe device's configuration
-/// space. `dev_idx` is a `pcie_scan` device index (also the handle
-/// nvme's `controller_index` refers to). `offset` is the byte offset
-/// within config space, 4-byte aligned (low 2 bits ignored).
-/// Returns 0xFFFFFFFF when the device index is out of range or the
-/// target function did not respond — the same sentinel real PCIe
-/// config cycles return for a missing responder.
+/// space via the global-op path. Used by `pcie_scan`'s diagnostic
+/// enumerator; drivers that hold a PCIE_DEVICE handle should use
+/// `dev_pcie_device_cfg_read32` instead.
+///
+/// `offset` is the byte offset within config space, 4-byte aligned
+/// (low 2 bits ignored). Returns 0xFFFFFFFF when the device index
+/// is out of range or the target function did not respond.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u32 {

@@ -39,13 +39,18 @@ name = "debug"
 #
 # The same ring feeds MON_* monitor lines when the monitor overlay is on.
 
+# `dst_ip` must resolve to a unicast collector — the ip module
+# rejects broadcast at the send path. Resolution order:
+#   1. `platform.debug.dst_ip` in the user YAML (per-config override)
+#   2. `[debug] collector_ip` in `~/.config/fluxor/host.toml` (per-dev)
+#   3. hard-fail with a pointer at the missing field.
 [[variant]]
 match = { to = "net" }
 modules = [
   { name = "log_net", params = {
-      dst_ip    = "user:dst_ip",
-      dst_port  = "user:dst_port",
-      bind_port = "user:bind_port",
+      dst_ip    = "user:dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:dst_port|host:debug.collector_port",
+      bind_port = "user:bind_port|host:debug.bind_port",
   } },
 ]
 wiring = [

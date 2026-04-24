@@ -504,8 +504,11 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
     }
 }
 
-/// Destroy a NIC ring and free its resources.
+/// Destroy a NIC ring and free its resources. Accepts either an
+/// FD_TAG_NIC_RING-tagged handle or a raw slot (legacy callers that
+/// serialise the handle as a payload u8 naturally pass raw).
 pub fn ring_destroy(ring_handle: i32) -> i32 {
+    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return crate::kernel::errno::EINVAL;
     }
@@ -530,6 +533,7 @@ pub fn ring_destroy(ring_handle: i32) -> i32 {
 ///  buf_pool_addr:u64 LE, buf_size:u16 LE, buf_count:u16 LE]
 /// Total: 32 bytes
 pub fn ring_info(ring_handle: i32, out: *mut u8, out_len: usize) -> i32 {
+    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return crate::kernel::errno::EINVAL;
     }
@@ -587,6 +591,7 @@ pub fn ring_info(ring_handle: i32, out: *mut u8, out_len: usize) -> i32 {
 /// completed RX descriptor. Returns (null, 0) if no packets available.
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_acquire_rx(ring_handle: i32) -> (*mut u8, usize) {
+    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return (core::ptr::null_mut(), 0);
     }
@@ -621,6 +626,7 @@ pub fn nic_ring_acquire_rx(ring_handle: i32) -> (*mut u8, usize) {
 /// Release an RX buffer back to NIC ownership.
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_release_rx(ring_handle: i32) {
+    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return;
     }
@@ -649,6 +655,7 @@ pub fn nic_ring_release_rx(ring_handle: i32) {
 /// Acquire an empty TX buffer. Returns (buffer pointer, max_len).
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_acquire_tx(ring_handle: i32) -> (*mut u8, usize) {
+    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return (core::ptr::null_mut(), 0);
     }
@@ -678,6 +685,7 @@ pub fn nic_ring_acquire_tx(ring_handle: i32) -> (*mut u8, usize) {
 /// Submit a TX buffer to the NIC.
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_submit_tx(ring_handle: i32, len: usize) {
+    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS || len == 0 {
         return;
     }

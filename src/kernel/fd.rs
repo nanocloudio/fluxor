@@ -1,8 +1,17 @@
 //! Unified file descriptor table — tagged handles and unified poll.
 //!
 //! Every kernel resource handle (channel, event, PIO, etc.) is encoded
-//! as a tagged i32: bits [30..27] = type tag (4 bits), bits [26..0] = slot index.
-//! Bit 31 is always 0, so tagged fds are positive and error codes (negative) are unambiguous.
+//! as a tagged i32: bits [30..26] = type tag (5 bits → 32 tags),
+//! bits [25..0] = slot index (26 bits → 64M slots per contract).
+//! Bit 31 is always 0, so tagged fds are positive and error codes
+//! (negative) are unambiguous.
+//!
+//! Each non-channel contract carries its own tag, so `fd_tag_contract`
+//! routes every handle to the right vtable without consulting any
+//! shared lookup table — contract handle-spaces are disjoint by bit
+//! pattern. Channel fds are the sole untagged handle class (tag 0,
+//! slot = fd value); they're scheduler-assigned and route by opcode
+//! class byte.
 //!
 //! `fd_poll` provides non-destructive (peek) readiness checks across all handle types.
 //! Modules use `fd_poll` for readiness, then the per-type API for consumption.
@@ -17,16 +26,30 @@ use crate::kernel::hal;
 // Tag constants
 // ============================================================================
 
-pub const FD_TAG_CHANNEL: i32 = 0;
-pub const FD_TAG_EVENT: i32 = 2;
-pub const FD_TAG_TIMER: i32 = 3;
-// Tags 4-6 were PIO stream/cmd/rx (removed — PIC module handles PIO directly)
-pub const FD_TAG_DMA: i32 = 7;
-pub const FD_TAG_BRIDGE: i32 = 8;
-pub const FD_TAG_KEY_VAULT: i32 = 9;
+pub const FD_TAG_CHANNEL:     i32 = 0;
+pub const FD_TAG_EVENT:       i32 = 2;
+pub const FD_TAG_TIMER:       i32 = 3;
+pub const FD_TAG_DMA:         i32 = 7;
+pub const FD_TAG_BRIDGE:      i32 = 8;
+pub const FD_TAG_KEY_VAULT:   i32 = 9;
+pub const FD_TAG_PCIE_DEVICE: i32 = 10;
+pub const FD_TAG_NIC_RING:    i32 = 11;
+pub const FD_TAG_DMA_CHANNEL: i32 = 12;
+pub const FD_TAG_FS:          i32 = 13;
+pub const FD_TAG_BUFFER:      i32 = 14;
+/// HAL contract tags. Applied by the kernel vtable wrapper on the
+/// open-op return, stripped on inbound dispatch — PIC module
+/// providers always see the raw slot.
+pub const FD_TAG_HAL_GPIO:    i32 = 15;
+pub const FD_TAG_HAL_SPI:     i32 = 16;
+pub const FD_TAG_HAL_I2C:     i32 = 17;
+pub const FD_TAG_HAL_UART:    i32 = 18;
+pub const FD_TAG_HAL_ADC:     i32 = 19;
+pub const FD_TAG_HAL_PWM:     i32 = 20;
+pub const FD_TAG_HAL_PIO:     i32 = 21;
 
-const TAG_SHIFT: u32 = 27;
-const SLOT_MASK: i32 = 0x07FF_FFFF;
+const TAG_SHIFT: u32 = 26;
+const SLOT_MASK: i32 = 0x03FF_FFFF;
 
 // ============================================================================
 // Encode / decode
@@ -45,7 +68,7 @@ pub fn tag_fd(tag: i32, slot: i32) -> i32 {
 /// Decode a tagged fd into (tag, slot).
 #[inline]
 pub fn untag_fd(fd: i32) -> (i32, i32) {
-    let tag = (fd >> TAG_SHIFT) & 0xF; // 4 bits
+    let tag = (fd >> TAG_SHIFT) & 0x1F; // 5 bits
     let slot = fd & SLOT_MASK;
     (tag, slot)
 }

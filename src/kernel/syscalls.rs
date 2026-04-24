@@ -103,9 +103,11 @@ unsafe extern "C" fn syscall_provider_call(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    // Contract for capability check: prefer the handle's tracked
-    // contract; fall back to the opcode's class byte for handle=-1
-    // globals and untagged channel fds.
+    // Contract comes from the handle's FD tag (tagged fds resolve
+    // directly via `fd_tag_contract`), falling back to the opcode's
+    // class byte for handle=-1 globals and scheduler-assigned channel
+    // fds. Non-channel contracts hand out tagged fds so `contract_of`
+    // produces an unambiguous result per handle.
     let contract = crate::kernel::provider::contract_of(handle)
         .unwrap_or_else(|| ((op >> 8) & 0xFF) as u16);
     if let Some(rc) = check_contract_grant(contract) {
@@ -259,6 +261,7 @@ pub fn init_providers() {
     provider::register(dev_class::PLATFORM_NIC_RING, system_provider_dispatch);
     provider::register(dev_class::PLATFORM_DMA, system_provider_dispatch);
     provider::register(dev_class::PLATFORM_DMA_FD, system_provider_dispatch);
+    provider::register(dev_class::PCIE_DEVICE, system_provider_dispatch);
     // FS has no kernel-side provider — a PIC filesystem module (fat32,
     // …) or a host platform dispatcher (linux_fs_dispatch) registers
     // itself. If nothing is registered, `provider::dispatch(FS, …)`
@@ -276,6 +279,7 @@ pub fn init_providers() {
     provider::register_vtable(&BUFFER_VTABLE);
     provider::register_vtable(&KEY_VAULT_VTABLE);
     provider::register_vtable(&FS_VTABLE);
+    provider::register_vtable(&PCIE_DEVICE_VTABLE);
 
     // HAL vtables for contracts whose `call` dispatch is supplied by a
     // PIC module (registered by the loader via `module_provides_contract`).
@@ -345,6 +349,18 @@ static KEY_VAULT_VTABLE: crate::kernel::provider::ProviderVTable =
         default_close_op: contracts::key_vault::DESTROY,
     };
 
+// PCIE_DEVICE shares `system_provider_dispatch` (same call path as
+// PLATFORM_NIC_RING / PLATFORM_DMA / PLATFORM_DMA_FD) but needs its
+// own vtable so `provider_close(handle)` dispatches the CLOSE opcode
+// to release per-handle bookkeeping.
+static PCIE_DEVICE_VTABLE: crate::kernel::provider::ProviderVTable =
+    crate::kernel::provider::ProviderVTable {
+        contract: crate::kernel::provider::contract::PCIE_DEVICE,
+        call:  system_provider_dispatch,
+        query: None,
+        default_close_op: crate::abi::platform::bcm2712::pcie_device::CLOSE,
+    };
+
 // FS contract has no built-in kernel implementation — a PIC filesystem
 // module (fat32, …) or a host-side platform dispatcher (linux_fs_dispatch)
 // registers as the provider. The vtable's `call` routes through the
@@ -352,7 +368,10 @@ static KEY_VAULT_VTABLE: crate::kernel::provider::ProviderVTable =
 // registered, same shape as the HAL vtables.
 unsafe fn fs_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    crate::kernel::provider::dispatch(class::FS, handle, op, arg, arg_len)
+    // PIC module providers register on a class byte and operate on
+    // raw slots; strip any FD tag before dispatching inward.
+    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    crate::kernel::provider::dispatch(class::FS, h, op, arg, arg_len)
 }
 
 static FS_VTABLE: crate::kernel::provider::ProviderVTable =
@@ -369,7 +388,8 @@ static FS_VTABLE: crate::kernel::provider::ProviderVTable =
 
 unsafe fn hal_spi_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    crate::kernel::provider::dispatch(class::SPI, handle, op, arg, arg_len)
+    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    crate::kernel::provider::dispatch(class::SPI, h, op, arg, arg_len)
 }
 
 static HAL_SPI_VTABLE: crate::kernel::provider::ProviderVTable =
@@ -382,7 +402,8 @@ static HAL_SPI_VTABLE: crate::kernel::provider::ProviderVTable =
 
 unsafe fn hal_i2c_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    crate::kernel::provider::dispatch(class::I2C, handle, op, arg, arg_len)
+    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    crate::kernel::provider::dispatch(class::I2C, h, op, arg, arg_len)
 }
 
 static HAL_I2C_VTABLE: crate::kernel::provider::ProviderVTable =
@@ -395,7 +416,8 @@ static HAL_I2C_VTABLE: crate::kernel::provider::ProviderVTable =
 
 unsafe fn hal_pio_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    crate::kernel::provider::dispatch(class::PIO, handle, op, arg, arg_len)
+    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    crate::kernel::provider::dispatch(class::PIO, h, op, arg, arg_len)
 }
 
 // PIO contracts open handles via multiple alloc variants (STREAM_ALLOC,
@@ -413,7 +435,8 @@ static HAL_PIO_VTABLE: crate::kernel::provider::ProviderVTable =
 
 unsafe fn hal_uart_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    crate::kernel::provider::dispatch(class::UART, handle, op, arg, arg_len)
+    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    crate::kernel::provider::dispatch(class::UART, h, op, arg, arg_len)
 }
 
 static HAL_UART_VTABLE: crate::kernel::provider::ProviderVTable =
@@ -426,7 +449,8 @@ static HAL_UART_VTABLE: crate::kernel::provider::ProviderVTable =
 
 unsafe fn hal_adc_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    crate::kernel::provider::dispatch(class::ADC, handle, op, arg, arg_len)
+    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    crate::kernel::provider::dispatch(class::ADC, h, op, arg, arg_len)
 }
 
 static HAL_ADC_VTABLE: crate::kernel::provider::ProviderVTable =
@@ -439,7 +463,8 @@ static HAL_ADC_VTABLE: crate::kernel::provider::ProviderVTable =
 
 unsafe fn hal_pwm_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    crate::kernel::provider::dispatch(class::PWM, handle, op, arg, arg_len)
+    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    crate::kernel::provider::dispatch(class::PWM, h, op, arg, arg_len)
 }
 
 static HAL_PWM_VTABLE: crate::kernel::provider::ProviderVTable =
@@ -487,14 +512,15 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     use crate::kernel::provider::contract as ct;
 
     // Tiers mirror `scheduler::current_module_cap_class()` return values.
-    // Bits 7 / 8 / 17 (PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD)
-    // are permitted at every service tier so a driver's `[[resources]]`
-    // declaration is what actually grants access. The `platform_raw`
-    // permission then gates the individual opcodes on top.
+    // Bits 7 / 8 / 17 / 18 (PLATFORM_NIC_RING, PLATFORM_DMA,
+    // PLATFORM_DMA_FD, PCIE_DEVICE) are permitted at every service tier
+    // so a driver's `[[resources]]` declaration is what actually grants
+    // access. The `platform_raw` permission then gates the individual
+    // opcodes on top.
     const CAP_CONTRACT_MASK: [u32; 4] = [
-        0x0003_1FE1, // CAP_SERVICE: infra + FS + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD
-        0x0003_1FF1, // CAP_SERVICE_PIO: service + HAL_PIO
-        0x0003_1FE3, // CAP_SERVICE_GPIO: service + HAL_GPIO
+        0x0007_1FE1, // CAP_SERVICE: infra + FS + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE
+        0x0007_1FF1, // CAP_SERVICE_PIO: service + HAL_PIO
+        0x0007_1FE3, // CAP_SERVICE_GPIO: service + HAL_GPIO
         0xFFFF_FFFF, // CAP_FULL: any contract
     ];
 
@@ -516,9 +542,9 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     // the manifest's `permissions = [...]` bitmap. Bit 12 below is the
     // dispatch bucket for 0x0Cxx routing, not a public contract id.
     //
-    // PLATFORM_NIC_RING, PLATFORM_DMA, and PLATFORM_DMA_FD are public
-    // contracts subject to the same declare-to-use rule as HAL_* —
-    // they are NOT in this list.
+    // PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, and PCIE_DEVICE
+    // are public contracts subject to the same declare-to-use rule as
+    // HAL_* — they are NOT in this list.
     const INFRA_CONTRACTS: u32 =
         (1u32 << 0)              |  // COMMON / cross-class
         (1u32 << ct::CHANNEL)    |

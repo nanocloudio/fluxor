@@ -13,7 +13,7 @@
 //!
 //! | Tag | Name      | Type | Default      | Description                     |
 //! |-----|-----------|------|--------------|---------------------------------|
-//! | 1   | dst_ip    | u32  | 0xFFFFFFFF   | Destination IP (LE; broadcast)  |
+//! | 1   | dst_ip    | u32  | 0 (disabled) | Destination IP (LE). Setting `0` or an L2 broadcast (`0xFFFFFFFF`) leaves the module dormant — broadcast would flood the subnet at tick rate. The stack injection in `stacks/debug.toml` pins `dst_ip` via `|required` against `~/.config/fluxor/host.toml` so a missing collector fails at build time, not at runtime. |
 //! | 2   | dst_port  | u16  | 6666         | UDP destination port            |
 //! | 3   | bind_port | u16  | 6667         | Local UDP source port           |
 //!
@@ -65,6 +65,10 @@ enum Phase {
     Serving = 3,
     /// Bind failed or conn closed. Sleeps `BACKOFF_TICKS` then reruns Binding.
     Backoff = 4,
+    /// `dst_ip` is unset (0) or an L2 broadcast. Terminal dormant
+    /// state with a one-shot warning so the operator sees why UDP
+    /// logging never started.
+    Disabled = 5,
 }
 
 /// Backoff window between retries (in scheduler ticks). At tick_us=100 this
@@ -115,7 +119,9 @@ impl LogNetState {
         self.syscalls = syscalls;
         self.net_in_chan = -1;
         self.net_out_chan = -1;
-        self.dst_ip = 0xFFFFFFFF;
+        // `dst_ip = 0` = not configured. The module stays dormant
+        // until a valid unicast dst_ip is supplied via params.
+        self.dst_ip = 0;
         self.dst_port = 6666;
         self.bind_port = 6667;
         self.phase = Phase::Init;
@@ -141,8 +147,8 @@ mod params_def {
     define_params! {
         LogNetState;
 
-        1, dst_ip, u32, 0xFFFFFFFF
-            => |s, d, len| { s.dst_ip = p_u32(d, len, 0, 0xFFFFFFFF); };
+        1, dst_ip, u32, 0
+            => |s, d, len| { s.dst_ip = p_u32(d, len, 0, 0); };
 
         2, dst_port, u16, 6666
             => |s, d, len| { s.dst_port = p_u16(d, len, 0, 6666); };
@@ -276,8 +282,27 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         match s.phase {
             Phase::Init => {
+                // Refuse to run without a configured unicast dst_ip.
+                // Both unset (0) and L2 broadcast (0xFFFFFFFF) drop
+                // into `Disabled` — broadcast would flood the subnet
+                // at tick rate.
+                if s.dst_ip == 0 || s.dst_ip == 0xFFFF_FFFF {
+                    let sys = &*s.syscalls;
+                    let msg = if s.dst_ip == 0 {
+                        b"[log_net] dst_ip unset; UDP log forwarding disabled\0".as_ref()
+                    } else {
+                        b"[log_net] dst_ip = broadcast rejected; UDP log forwarding disabled\0".as_ref()
+                    };
+                    dev_log(sys, 2, msg.as_ptr(), msg.len() - 1);
+                    s.phase = Phase::Disabled;
+                    return 0;
+                }
                 s.phase = Phase::Binding;
             }
+
+            // Terminal. Returning 0 keeps the scheduler happy and
+            // the module faultless until the next reboot.
+            Phase::Disabled => return 0,
 
             Phase::Binding => {
                 if s.net_out_chan < 0 { return 0; }

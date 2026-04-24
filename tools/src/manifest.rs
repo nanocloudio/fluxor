@@ -55,7 +55,8 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 //   - HAL hardware contracts: "gpio", "spi", "i2c", "pio", "uart", "adc", "pwm"
 //   - Stable module contracts: "fs" (plus kernel-provided channel/timer/buffer/event, implicit)
 //   - Platform transport contracts: "platform_nic_ring", "platform_dma",
-//     "platform_dma_fd" (raw register-level surfaces gated by `platform_raw`)
+//     "platform_dma_fd", "pcie_device" (raw register-level surfaces gated
+//     by `platform_raw`)
 //
 // Permission names ("internal", "flash_raw", "platform_raw", etc.) are not
 // contracts and belong in the top-level `permissions = [...]` list — they
@@ -83,6 +84,7 @@ fn contract_id_from_name(s: &str) -> Result<u8> {
         "adc"                => Ok(0x0E),
         "pwm"                => Ok(0x0F),
         "platform_dma_fd"    => Ok(0x11),
+        "pcie_device"        => Ok(0x12),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -97,8 +99,8 @@ fn contract_id_from_name(s: &str) -> Result<u8> {
         }
         _ => Err(Error::Module(format!(
             "unknown contract name: {} — expected one of: gpio, spi, i2c, pio, \
-             uart, adc, pwm, fs, platform_nic_ring, platform_dma, platform_dma_fd \
-             (see docs/architecture/abi_layers.md)",
+             uart, adc, pwm, fs, platform_nic_ring, platform_dma, platform_dma_fd, \
+             pcie_device (see docs/architecture/abi_layers.md)",
             s
         ))),
     }
@@ -122,6 +124,7 @@ fn contract_name_to_str(class: u8) -> &'static str {
         0x0E => "adc",
         0x0F => "pwm",
         0x11 => "platform_dma_fd",
+        0x12 => "pcie_device",
         _ => "unknown",
     }
 }

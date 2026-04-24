@@ -32,6 +32,7 @@
 //!   forward to the layer below via `CHAIN_NEXT`.
 
 use crate::kernel::errno;
+use crate::kernel::fd;
 
 /// Stable contract identifier. The vtable registry is indexed by this id;
 /// the same value appears in the opcode's high byte so class-byte routing
@@ -81,6 +82,13 @@ pub mod contract {
     /// contract claim. Kernel-side handle-type enforcement is in
     /// `is_dma_fd_handle` in `src/platform/rp/providers.rs`.
     pub const PLATFORM_DMA_FD: u16 = 0x0011;
+    /// Handle-scoped PCIe device binding. `provider_open` takes a
+    /// selector string (board alias like `"m2_primary"` or
+    /// `"@class=nvme"`) and returns a handle that carries all
+    /// subsequent config-space, BAR-map, and MSI-X ops. Drivers
+    /// declare `requires_contract = "pcie_device"`; the
+    /// `platform_raw` permission gates the underlying opcodes.
+    pub const PCIE_DEVICE: u16 = 0x0012;
     pub const HAL_UART:    u16 = 0x000D;
     pub const HAL_ADC:     u16 = 0x000E;
     pub const HAL_PWM:     u16 = 0x000F;
@@ -223,6 +231,18 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
         _t if _t == fd::FD_TAG_TIMER => Some(contract::TIMER),
         _t if _t == fd::FD_TAG_DMA => Some(contract::PLATFORM_DMA_FD),
         _t if _t == fd::FD_TAG_KEY_VAULT => Some(contract::KEY_VAULT),
+        _t if _t == fd::FD_TAG_PCIE_DEVICE => Some(contract::PCIE_DEVICE),
+        _t if _t == fd::FD_TAG_NIC_RING => Some(contract::PLATFORM_NIC_RING),
+        _t if _t == fd::FD_TAG_DMA_CHANNEL => Some(contract::PLATFORM_DMA),
+        _t if _t == fd::FD_TAG_FS => Some(contract::FS),
+        _t if _t == fd::FD_TAG_BUFFER => Some(contract::BUFFER),
+        _t if _t == fd::FD_TAG_HAL_GPIO => Some(contract::HAL_GPIO),
+        _t if _t == fd::FD_TAG_HAL_SPI => Some(contract::HAL_SPI),
+        _t if _t == fd::FD_TAG_HAL_I2C => Some(contract::HAL_I2C),
+        _t if _t == fd::FD_TAG_HAL_UART => Some(contract::HAL_UART),
+        _t if _t == fd::FD_TAG_HAL_ADC => Some(contract::HAL_ADC),
+        _t if _t == fd::FD_TAG_HAL_PWM => Some(contract::HAL_PWM),
+        _t if _t == fd::FD_TAG_HAL_PIO => Some(contract::HAL_PIO),
         _ => None,
     }
 }
@@ -255,12 +275,44 @@ fn release_handle(handle: i32) {
 
 // ── Handle-scoped dispatch (new API) ─────────────────────────────────
 
+/// Contract → FD-tag mapping. Every contract that returns a handle
+/// to a module appears here so `provider_open` can apply the tag
+/// that matches `fd_tag_contract`'s inverse lookup. Contracts
+/// returning `None` don't use tagged fds (CHANNEL is the only one).
+fn contract_to_tag(contract: ContractId) -> Option<i32> {
+    match contract {
+        c if c == contract::EVENT => Some(fd::FD_TAG_EVENT),
+        c if c == contract::TIMER => Some(fd::FD_TAG_TIMER),
+        c if c == contract::PLATFORM_DMA_FD => Some(fd::FD_TAG_DMA),
+        c if c == contract::KEY_VAULT => Some(fd::FD_TAG_KEY_VAULT),
+        c if c == contract::PCIE_DEVICE => Some(fd::FD_TAG_PCIE_DEVICE),
+        c if c == contract::PLATFORM_NIC_RING => Some(fd::FD_TAG_NIC_RING),
+        c if c == contract::PLATFORM_DMA => Some(fd::FD_TAG_DMA_CHANNEL),
+        c if c == contract::FS => Some(fd::FD_TAG_FS),
+        c if c == contract::BUFFER => Some(fd::FD_TAG_BUFFER),
+        c if c == contract::HAL_GPIO => Some(fd::FD_TAG_HAL_GPIO),
+        c if c == contract::HAL_SPI => Some(fd::FD_TAG_HAL_SPI),
+        c if c == contract::HAL_I2C => Some(fd::FD_TAG_HAL_I2C),
+        c if c == contract::HAL_UART => Some(fd::FD_TAG_HAL_UART),
+        c if c == contract::HAL_ADC => Some(fd::FD_TAG_HAL_ADC),
+        c if c == contract::HAL_PWM => Some(fd::FD_TAG_HAL_PWM),
+        c if c == contract::HAL_PIO => Some(fd::FD_TAG_HAL_PIO),
+        _ => None,
+    }
+}
+
 /// Open a handle on the named contract. The caller chooses the
 /// open-style opcode (e.g. `gpio::CLAIM`, `gpio::SET_INPUT`,
 /// `spi::OPEN`, `timer::CREATE`) — `config` / `config_len` are the
 /// operation's arg payload. Returns a handle (>= 0) on success,
-/// negative errno on failure. Successful handles are tracked against
-/// the contract for later `provider_call` routing.
+/// negative errno on failure.
+///
+/// The returned handle carries the contract's FD tag per
+/// `contract_to_tag`. Handlers that self-tag (event, timer, DMA-fd,
+/// key_vault, PCIE_DEVICE) pass through if the tag matches; handlers
+/// that return a raw slot get tagged here. Handlers that return a
+/// mismatched tag are refused with ENOSYS — better to fail loudly
+/// than silently misroute.
 pub fn provider_open(
     contract: ContractId,
     open_op: u32,
@@ -275,28 +327,51 @@ pub fn provider_open(
             unsafe { dispatch(contract, -1, open_op, config as *mut u8, config_len) }
         }
     };
-    if handle >= 0 {
-        track_handle(handle, contract);
+    if handle < 0 {
+        return handle;
     }
-    handle
+    match contract_to_tag(contract) {
+        Some(expected) => {
+            let (actual, slot) = fd::untag_fd(handle);
+            if actual == expected {
+                handle
+            } else if actual == 0 {
+                fd::tag_fd(expected, slot)
+            } else {
+                log::error!(
+                    "[provider] contract {:#x} open returned handle with tag={} (expected {}); refusing",
+                    contract, actual, expected,
+                );
+                errno::ENOSYS
+            }
+        }
+        None => {
+            // Untagged contract (CHANNEL): class-byte dispatch looks
+            // the handle up via HANDLE_BINDINGS.
+            track_handle(handle, contract);
+            handle
+        }
+    }
 }
 
 /// Invoke an operation on an open handle.
 ///
 /// Routing resolution order:
-///   1. `handle >= 0` with an FD tag (event/timer/DMA fd): the tag
-///      self-identifies the contract (`fd_tag_contract`).
-///   2. `handle >= 0` tracked by `provider_open` (`HANDLE_BINDINGS`):
-///      routes through the bound contract's vtable.
-///   3. `handle == -1` (global op) or untagged handle with no tracked
-///      binding (channel fds with tag 0, raw DMA channel numbers,
-///      GPIO pins): the opcode's high byte selects the contract.
-///      Permission gates in `syscall_provider_call` still apply.
+///   1. `handle >= 0` with an FD tag: the tag self-identifies the
+///      contract via `fd_tag_contract`.
+///   2. Channel fds (tag 0) + `handle == -1` globals: HANDLE_BINDINGS
+///      lookup, then class-byte dispatch on the opcode's high byte.
+///
+/// Tagged handles pass through unchanged. Handlers strip with
+/// `slot_of(handle)` at entry when they need the raw slot, or inspect
+/// the tag when they need to reject a wrong-family handle (e.g. a
+/// channel-op handler rejecting a DMA-fd tag).
 pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             return unsafe { (vt.call)(handle, op, arg, arg_len) };
         }
+        return unsafe { dispatch(contract, handle, op, arg, arg_len) };
     }
     let contract = ((op >> 8) & 0xFF) as u16;
     unsafe { dispatch(contract, handle, op, arg, arg_len) }

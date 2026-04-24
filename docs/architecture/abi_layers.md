@@ -80,6 +80,7 @@ Consumers declare the contract in their manifest with
 | `PLATFORM_NIC_RING` | `0x0007` | Kernel (platform) | NIC DMA ring management: `NIC_RING_CREATE` / `INFO` / `DESTROY`. Also requires `platform_raw` permission. |
 | `PLATFORM_DMA` | `0x0008` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. Also requires `platform_raw` permission. |
 | `PLATFORM_DMA_FD` | `0x0011` | Kernel (platform) | Async DMA fd with ping-pong queuing. Handle = tagged fd. Opcodes under `dma_raw::fd::*`. Separate contract from `PLATFORM_DMA`; drivers using both families (e.g. `pio_rp`) declare both in `[[resources]]`. Also requires `platform_raw` permission. |
+| `PCIE_DEVICE` | `0x0012` | Kernel (platform) | Handle-scoped PCIe device binding. `BIND` takes a selector (board alias like `m2_primary` or `@class=<name>`) and returns a handle; subsequent ops (`CFG_READ32` / `WRITE32`, `BAR_MAP`, `MSI_ALLOC`, `INFO`) act on the handle. Board topology lives in `src/platform/<chip>/pcie_aliases.rs`, not in driver code. Also requires `platform_raw` permission. |
 
 Plus channel-served protocols (no contract id — there's nothing to
 dispatch, just message formats):

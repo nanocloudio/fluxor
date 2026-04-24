@@ -1,12 +1,15 @@
-//! PCIe Scan — PIC module for PCIe ECAM enumeration and BAR mapping.
+//! PCIe Scan — diagnostic enumerator for PCIe devices on BCM2712.
 //!
-//! Extracts the PCIe enumeration and BAR management logic from
-//! `src/platform/bcm2712/pcie.rs` into a PIC module. Uses the kernel's generic
-//! MMIO_READ32/WRITE32 bridges to access PCIe config space.
+//! This module is diagnostic-only: drivers bind devices through the
+//! `PCIE_DEVICE` contract
+//! (`provider_open(PCIE_DEVICE, BIND, <selector>)`), which consults
+//! the board-local alias table in `src/platform/<chip>/pcie_aliases.rs`.
+//! Include `pcie_scan` in a config when you want human-readable
+//! enumeration output for bring-up.
 //!
-//! On init (module_new): scans bus 0 of the configured controller and
-//! discovers devices. Registers as a provider so downstream modules can
-//! request BAR maps.
+//! Emits a 16-byte record per discovered device on `devices`:
+//!   `[bus:u8, dev:u8, func:u8, nic_type:u8,
+//!     vendor_id:u16 LE, device_id:u16 LE, bar0:u64 LE]`
 //!
 //! # Controllers (BCM2712 / Pi 5 / CM5)
 //!
@@ -16,12 +19,8 @@
 //!   HAT+ and other Pi 5 PCIe peripherals. Requires `pciex1` enabled in
 //!   `config.txt` so VPU trains the link before kernel handoff.
 //!
-//! # Provider Dispatch (NIC_BAR_MAP/UNMAP subcommands)
-//!
-//! - NIC_BAR_MAP:   arg=[dev_idx:u8, bar_idx:u8], returns mapped address
-//! - NIC_BAR_UNMAP: arg=[virt_addr:u64 LE], returns 0 or error
-//!
-//! Exports module_deferred_ready: downstream waits for scan to complete.
+//! Exports module_deferred_ready: downstream diagnostic consumers wait
+//! for the scan to complete before draining the `devices` channel.
 
 #![no_std]
 
@@ -234,9 +233,9 @@ unsafe fn enumerate(s: &mut PcieScanState) {
         let class_rev = ecam_read32(sys, s.ecam_base, 0, dev_num, 0, 0x08);
         let class_code = class_rev >> 8;
         // NVMe is PCI class 0x01_08_02 (mass-storage / NVM / NVMe).
-        // The nvme driver only attaches to `controller_index` (0 by
-        // default), so any extras are ignored — warn the user once so
-        // the silent selection isn't a surprise.
+        // Tracked so we can warn when more than one is present —
+        // the NVMe driver binds a single device via a PCIE_DEVICE
+        // alias and a silent pick would be confusing.
         if class_code == 0x01_08_02 {
             nvme_count = nvme_count.saturating_add(1);
         }

@@ -41,8 +41,9 @@ UART even if the log_net module isn't running yet.
 
 ## Device overview
 
-- **Bus:** PCIe1 (external x1 slot on CM5). Enumerated by `pcie_scan`
-  with `controller = pcie1` param; class code `0x01_08_02`.
+- **Bus:** PCIe1 (external x1 slot on CM5). Bound via the
+  `PCIE_DEVICE` contract using the `bind:` selector param (default
+  `m2_primary`); class code `0x01_08_02`.
 - **BAR:** BAR0 (memory-mapped). Controller registers NVMe 1.4 §3.1.
 - **DMA:** all queues + PRP data buffers come from `dev_dma_alloc`
   (kernel-owned non-cacheable arena).
@@ -57,12 +58,12 @@ UART even if the log_net module isn't running yet.
 
 ```
                     ┌───────────────┐
-                    │   WaitPcie    │  pcie_scan not Ready yet
+                    │   Bind        │  provider_open(PCIE_DEVICE, BIND, selector)
                     └──────┬────────┘
-                           │ Ready upstream
+                           │ handle ≥ 0
                            ▼
                     ┌───────────────┐
-                    │   MapBars     │  NIC_BAR_MAP via pcie_scan
+                    │   MapBars     │  BAR_MAP via the bound handle
                     └──────┬────────┘
                            │ bar0_virt != 0
                            ▼
@@ -114,21 +115,23 @@ command completion) read once per step and return `Continue`.
 
 ## Per-state contract
 
-### `WaitPcie`
+### `Bind`
 
 - **Entry:** default after `module_new`.
-- **Behaviour:** read `pcie_scan` `devices` channel (or check ready
-  flag); find NVMe device (class `0x01_08_02`); record `dev_idx`.
-- **Exit:** NVMe device found → `MapBars`.
+- **Behaviour:** `provider_open(PCIE_DEVICE, BIND, s.bind_str)`. On
+  success, store the returned handle in `s.pcie_handle`. On failure
+  the PCIe link may still be training; stay in `Bind` and periodically
+  nudge the kernel with `PCIE_RESCAN`.
+- **Exit:** handle ≥ 0 → `MapBars`.
 - **Return:** `Continue` while waiting; `Continue` on transition.
 - **Spec:** N/A (platform-specific).
 - **Trace row:** none (pre-NVMe).
-- **Timing:** depends on PCIe scan; bounded by scheduler ticks.
+- **Timing:** depends on link training; bounded by scheduler ticks.
 
 ### `MapBars`
 
-- **Entry:** from `WaitPcie` with `dev_idx` set.
-- **Behaviour:** `provider_call(-1, NIC_BAR_MAP, [dev_idx, 0, …])` → `bar0_virt`.
+- **Entry:** from `Bind` with `pcie_handle` set.
+- **Behaviour:** `provider_call(pcie_handle, BAR_MAP, [bar_idx=0, …])` → `bar0_virt`.
 - **Exit:** `bar0_virt != 0` → `Reset`; else `Fault`.
 - **Spec:** N/A.
 - **Trace row:** `mmap_bar0`.
@@ -256,11 +259,16 @@ retry on next step. State machine does NOT advance on partial writes.
 
 ## Parameters
 
-| Tag | Name               | Type | Default | Notes                                     |
-|-----|--------------------|------|---------|-------------------------------------------|
-| 1   | controller_index   | u8   | 0       | Which PCIe device from `pcie_scan`        |
-| 2   | namespace          | u32  | 1       | Namespace ID for Identify Namespace / I/O |
-| 3   | queue_depth        | u16  | 32      | I/O queue depth (v1 uses 1 in-flight)     |
+| Tag | Name               | Type | Default      | Notes                                         |
+|-----|--------------------|------|--------------|-----------------------------------------------|
+| 1   | bind               | str  | `m2_primary` | PCIE_DEVICE selector (alias or `@class=nvme`) |
+| 2   | namespace          | u32  | 1            | Namespace ID for Identify Namespace / I/O     |
+| 3   | queue_depth        | u16  | 32           | I/O queue depth (v1 uses 1 in-flight)         |
+| 4   | irq_mode           | u8   | 0            | 0=polled, 1=MSI-X                             |
+| 6   | io_queue_count     | u8   | 1            | I/O queue pairs (1..4)                        |
+
+Board topology (which root complex, which GIC SPI the MSI mux is routed to)
+lives in the platform's PCIe alias table, not in driver YAML.
 
 ---
 

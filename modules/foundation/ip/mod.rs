@@ -157,6 +157,12 @@ pub struct IpState {
     // Ephemeral port counter
     next_ephemeral_port: u16,
     _eph_pad: [u8; 2],
+
+    /// One-shot guard for the "UDP broadcast rejected" log in
+    /// `send_udp_data`. Prevents a tick-rate flood from amplifying
+    /// itself through the log path.
+    bcast_warned: bool,
+    _bcast_pad: [u8; 3],
 }
 
 // ============================================================================
@@ -1392,9 +1398,36 @@ unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, pa
     (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt.wrapping_add(payload_len as u32);
 }
 
-/// Send a UDP datagram.  Used for CMD_SEND on Listen-state (bound) conns where
+/// Return true if `dst` is an IPv4 broadcast address we must not emit
+/// from `send_udp_data`. Catches both forms:
+///   - limited broadcast: 255.255.255.255
+///   - directed broadcast for the local subnet: host bits all-ones
+///
+/// DHCP legitimately sends to 255.255.255.255 but builds its own frame
+/// directly via `dhcp::build_discover` / `build_request` — it does not
+/// route through `send_udp_data`, so this check doesn't affect it.
+#[inline]
+fn is_broadcast_dst(dst: u32, local_ip: u32, netmask: u32) -> bool {
+    if dst == 0xFFFF_FFFF {
+        return true;
+    }
+    if netmask == 0 {
+        return false;
+    }
+    // Directed broadcast: same subnet, host bits all-ones.
+    let host_bits = dst & !netmask;
+    let net_bits = dst & netmask;
+    host_bits == !netmask && net_bits == (local_ip & netmask)
+}
+
+/// Send a UDP datagram. Used for CMD_SEND on Listen-state (bound) conns where
 /// the consumer supplies [dst_ip:4 LE][dst_port:2 LE][payload...], and for
 /// Established (connected) conns where remote_ip/port come from the conn slot.
+///
+/// Broadcast destinations are rejected — a misbehaving producer at
+/// tick rate would flood the L2 domain. Consumers that legitimately
+/// need broadcast (DHCP, future mDNS/NBNS responders) build their
+/// own frame and bypass this path.
 unsafe fn send_udp_data(
     s: &mut IpState,
     dst_ip: u32,
@@ -1404,6 +1437,16 @@ unsafe fn send_udp_data(
     payload_len: usize,
 ) {
     if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
+        return;
+    }
+
+    if is_broadcast_dst(dst_ip, s.local_ip, s.netmask) {
+        if !s.bcast_warned {
+            s.bcast_warned = true;
+            let sys = &*s.syscalls;
+            let msg = b"[ip] UDP broadcast rejected (build-your-own-frame if legitimate)";
+            dev_log(sys, 2, msg.as_ptr(), msg.len());
+        }
         return;
     }
 

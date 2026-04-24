@@ -514,6 +514,9 @@ unsafe extern "C" fn syscall_gpio_get_level(handle: i32) -> i32 {
 
 unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::contracts::hal::gpio as dev_gpio;
+    // Strip FD_TAG_HAL_GPIO so the inner ops see a raw pin number.
+    // No-op on the -1 sentinel for open-style opcodes.
+    let handle = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
     match opcode {
         dev_gpio::CLAIM => {
             if arg.is_null() || arg_len < 1 {
@@ -708,17 +711,19 @@ unsafe fn spi9_pac_reset(rst: u8, cs: u8, sck: u8, sda: u8) {
 // Handles hardware-specific system opcodes (PWM, PIO registers, DMA, SPI9)
 // delegated from system_provider_dispatch's catch-all arm.
 
-/// Handle-family discriminators for `PLATFORM_DMA` (raw channel number,
-/// from `channel::ALLOC`) and `PLATFORM_DMA_FD` (FD_TAG_DMA-tagged fd,
-/// from `fd::CREATE`). The two families never share handles; each
-/// handler rejects wrong-family handles with EINVAL.
+/// Handle-family discriminators for `PLATFORM_DMA` (channel number
+/// tagged with FD_TAG_DMA_CHANNEL, from `channel::ALLOC`) and
+/// `PLATFORM_DMA_FD` (FD_TAG_DMA-tagged fd, from `fd::CREATE`).
+/// The two families have disjoint tag values; handlers reject a
+/// wrong-family handle with EINVAL. A raw untagged slot (tag 0) is
+/// accepted for legacy callers that bypass `provider_open`.
 #[inline]
 fn is_dma_channel_handle(h: i32) -> bool {
     if h < 0 {
         return false;
     }
     let (tag, _slot) = crate::kernel::fd::untag_fd(h);
-    tag == 0
+    tag == crate::kernel::fd::FD_TAG_DMA_CHANNEL || tag == 0
 }
 
 #[inline]
@@ -1154,7 +1159,7 @@ unsafe fn rp_system_extension_dispatch(
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
-            dma_free_channel(handle as u8)
+            dma_free_channel(crate::kernel::fd::slot_of(handle) as u8)
         }
         dma_raw::channel::START => {
             if !is_dma_channel_handle(handle) {
@@ -1163,25 +1168,26 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 14 {
                 return E_INVAL;
             }
+            let ch = crate::kernel::fd::slot_of(handle) as u8;
             let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let write_addr =
                 u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             let dreq = *arg.add(12);
             let flags = *arg.add(13);
-            dma_start_raw(handle as u8, read_addr, write_addr, count, dreq, flags)
+            dma_start_raw(ch, read_addr, write_addr, count, dreq, flags)
         }
         dma_raw::channel::BUSY => {
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
-            dma_busy(handle as u8)
+            dma_busy(crate::kernel::fd::slot_of(handle) as u8)
         }
         dma_raw::channel::ABORT => {
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
-            dma_abort(handle as u8)
+            dma_abort(crate::kernel::fd::slot_of(handle) as u8)
         }
         spi9_raw::SEND => {
             // 9-bit SPI bit-bang: send command + data using raw PAC GPIO.

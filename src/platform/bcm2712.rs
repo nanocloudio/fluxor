@@ -894,6 +894,11 @@ static mut IRQ_BINDING_COUNT: usize = 0;
 /// 32 MSI vectors through one GIC SPI.
 const EVENT_HANDLE_PCIE1_MSI: i32 = -2;
 
+/// One-shot guard for `register_pcie1_msi_spi`. `irq_bind` appends a
+/// row on every call; without this flag a driver that allocates N
+/// MSI-X vectors would exhaust `IRQ_BINDINGS`.
+static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
+
 /// Enable `spi_irq` in the GIC distributor and route its fires into
 /// `pcie::pcie1_msi_dispatch` (via the `EVENT_HANDLE_PCIE1_MSI`
 /// sentinel). Returns 0 on success, -ENOMEM if the binding table is
@@ -3063,7 +3068,7 @@ fn bcm_boot_scan() {}
 fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize { len }
 
 unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use fluxor::abi::platform::bcm2712::{mmio_dma, pcie_nic};
+    use fluxor::abi::platform::bcm2712::{mmio_dma, pcie_device, pcie_nic};
     use fluxor::abi::contracts::storage::paged_arena;
     match opcode {
         mmio_dma::MMIO_READ32 => {
@@ -3231,6 +3236,69 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                     0
                 }
             }
+        }
+        // ── PCIE_DEVICE contract ──────────────────────────────────
+        pcie_device::BIND => {
+            if arg.is_null() || arg_len == 0 { return -22; }
+            let sel = core::slice::from_raw_parts(arg, arg_len);
+            fluxor::kernel::pcie::bind_selector(sel)
+        }
+        pcie_device::CLOSE => {
+            fluxor::kernel::pcie::syscall_device_close(_handle)
+        }
+        pcie_device::CFG_READ32 => {
+            fluxor::kernel::pcie::syscall_device_cfg_read32(_handle, arg, arg_len)
+        }
+        pcie_device::CFG_WRITE32 => {
+            fluxor::kernel::pcie::syscall_device_cfg_write32(_handle, arg, arg_len)
+        }
+        pcie_device::BAR_MAP => {
+            fluxor::kernel::pcie::syscall_device_bar_map(_handle, arg, arg_len)
+        }
+        pcie_device::MSI_ALLOC => {
+            if arg.is_null() || arg_len < 20 || _handle < 0 { return -22; }
+            // The bound handle tells us which root complex's MSI mux
+            // to use. Only PCIe1 is wired today.
+            match fluxor::kernel::pcie::bound_device_root(_handle) {
+                None => return fluxor::kernel::errno::EINVAL,
+                Some(root) => {
+                    use fluxor::kernel::pcie_aliases::PcieRoot;
+                    match root {
+                        PcieRoot::Pcie1 => {
+                            if !fluxor::kernel::pcie::pcie1_msi_init() {
+                                return fluxor::kernel::errno::ENODEV;
+                            }
+                            if !PCIE1_MSI_SPI_REGISTERED {
+                                let _ = register_pcie1_msi_spi(
+                                    fluxor::kernel::pcie::BCM2712_PCIE1_MSI_SPI_IRQ,
+                                );
+                                PCIE1_MSI_SPI_REGISTERED = true;
+                            }
+                            let event_handle = i32::from_le_bytes([
+                                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+                            ]);
+                            match fluxor::kernel::pcie::pcie1_msi_alloc_vector(event_handle) {
+                                None => fluxor::kernel::errno::ENOMEM,
+                                Some((vec, addr, data)) => {
+                                    *arg.add(4) = vec;
+                                    *arg.add(5) = 0;
+                                    *arg.add(6) = 0;
+                                    *arg.add(7) = 0;
+                                    let ab = addr.to_le_bytes();
+                                    for i in 0..8 { *arg.add(8 + i) = ab[i]; }
+                                    let db = data.to_le_bytes();
+                                    for i in 0..4 { *arg.add(16 + i) = db[i]; }
+                                    0
+                                }
+                            }
+                        }
+                        PcieRoot::Pcie2 => fluxor::kernel::errno::ENOSYS,
+                    }
+                }
+            }
+        }
+        pcie_device::INFO => {
+            fluxor::kernel::pcie::syscall_device_info(_handle, arg, arg_len)
         }
         paged_arena::ARENA_REGISTER => {
             if arg.is_null() || arg_len < 10 { return -22; }

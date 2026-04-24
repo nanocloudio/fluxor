@@ -51,20 +51,10 @@ include!("../../sdk/params.rs");
 // Constants
 // ============================================================================
 
-const NIC_BAR_MAP: u32 = 0x0CF0;
+/// Rescan PCIe on the kernel-managed root complex. `handle = -1`,
+/// arg empty. Used as a retry nudge when `PCIE_DEVICE::BIND` fails
+/// because the downstream card hasn't trained yet.
 const PCIE_RESCAN: u32 = 0x0CF5;
-
-/// `PCIE_CFG_WRITE32` syscall opcode. Mirror of 0x0CF6 (read).
-const PCIE_CFG_WRITE32: u32 = 0x0CF7;
-/// `PCIE1_MSI_INIT` — brings up the brcmstb MSI controller behind
-/// a caller-supplied GIC SPI. Idempotent. Mirrors
-/// `abi::platform::bcm2712::pcie_nic::PCIE1_MSI_INIT`.
-const PCIE1_MSI_INIT: u32 = 0x0CD8;
-/// `PCIE1_MSI_ALLOC_VECTOR` — assigns one of the 32 MSI vectors to
-/// an event fd. Returns (vector, target_addr, data) for writing into
-/// the peripheral's MSI-X table entry. Mirrors
-/// `abi::platform::bcm2712::pcie_nic::PCIE1_MSI_ALLOC_VECTOR`.
-const PCIE1_MSI_ALLOC_VECTOR: u32 = 0x0CD9;
 
 /// PCI-bus address offset into BAR1's inbound window on BCM7712 PCIe1.
 /// BAR1 covers PCI bus 0x10_0000_0000..0x20_0000_0000 and is
@@ -177,7 +167,7 @@ const IOCTL_NVME_NS_INFO: u32 = 0x4E56_0001;
 // State machine
 // ============================================================================
 
-const S_WAIT_PCIE:           u8 = 0;
+const S_BIND:                u8 = 0;
 const S_MAP_BARS:            u8 = 1;
 const S_RESET:               u8 = 2;
 const S_CONFIG_QUEUES:       u8 = 3;
@@ -254,21 +244,27 @@ const INS_LBAF0:             usize = 128;   // u32, bits [23:16] = LBADS (log2 o
 struct NvmeState {
     syscalls: *const SyscallTable,
 
-    pcie_in: i32,
     req_in:  i32,
     blk_out: i32,
     ctrl:    i32,
 
-    controller_index: u8,
+    /// Device handle returned by `provider_open(PCIE_DEVICE, BIND, ...)`.
+    /// Carries the per-device context (root complex, BDF, alias) for
+    /// subsequent config-space / BAR-map / MSI-X calls.
+    pcie_handle: i32,
+    /// Selector string from the `bind:` param. Stored so `step_bind`
+    /// can retry until the PCIe link trains.
+    bind_str: [u8; 24],
+    bind_len: u8,
+
     queue_depth: u16,
     namespace: u32,
 
     state: u8,
     substate: u8,
     fault_code: u8,
-    pcie_dev_idx: u8,
     logged_state: u8,
-    _pad0: [u8; 3],
+    _pad0: [u8; 4],
 
     bar0_virt: u64,
     cap: u64,
@@ -428,8 +424,7 @@ struct NvmeState {
     /// Event handle the kernel signals when the allocated MSI vector
     /// fires. Created lazily on the first `irq_mode=1` pass.
     msix_event:      i32,
-    /// GIC SPI routed to the brcmstb MSI mux.
-    msi_spi_irq:     u32,
+    _pad6:           [u8; 4],
 }
 
 // ============================================================================
@@ -444,8 +439,19 @@ mod params_def {
     define_params! {
         NvmeState;
 
-        1, controller_index, u8, 0
-            => |s, d, len| { s.controller_index = p_u8(d, len, 0, 0); };
+        // 1: bind. Selector string for the PCIE_DEVICE contract —
+        //    either a board-local alias (e.g. `m2_primary`) or a
+        //    class selector (`@class=nvme`). See
+        //    `docs/architecture/abi_layers.md`. `module_new` defaults
+        //    to "m2_primary" when unset.
+        1, bind, str, 0
+            => |s, d, len| {
+                let cap = s.bind_str.len();
+                let n = if len > cap { cap } else { len };
+                for i in 0..cap { s.bind_str[i] = 0; }
+                for i in 0..n { s.bind_str[i] = *d.add(i); }
+                s.bind_len = n as u8;
+            };
 
         2, namespace, u32, 1
             => |s, d, len| { s.namespace = p_u32(d, len, 0, 1); };
@@ -457,11 +463,6 @@ mod params_def {
         //    1 = program MSI-X table entry 0 + CreateIoCQ IEN=1 IV=0.
         4, irq_mode, u8, 0
             => |s, d, len| { s.irq_mode = p_u8(d, len, 0, 0); };
-
-        // 5: msi_spi_irq. GIC SPI the brcmstb MSI mux is routed to.
-        //    Default matches the Pi 5 DT `pcie@114000` MSI entry.
-        5, msi_spi_irq, u32, 237
-            => |s, d, len| { s.msi_spi_irq = p_u32(d, len, 0, 237); };
 
         // 6: io_queue_count. Number of I/O queue pairs (1..=4).
         //    Writes stripe across queues; reads stay on queue 0
@@ -828,18 +829,33 @@ unsafe fn zero_page(phys: u64) {
 // States
 // ============================================================================
 
-unsafe fn step_wait_pcie(s: &mut NvmeState) -> i32 {
-    log_once(s, b"[nvme] WaitPcie\0");
-    if s.pcie_in < 0 {
+/// Bind the PCIe device handle via the PCIE_DEVICE contract.
+///
+/// The driver hands a selector string (board alias like `m2_primary`,
+/// or `@class=nvme`) to the kernel, which returns a handle carrying
+/// the device context. If the PCIe link hasn't trained yet the bind
+/// returns a negative errno; we stay in this state and nudge the
+/// kernel to re-enumerate every few thousand ticks until the card
+/// appears.
+unsafe fn step_bind(s: &mut NvmeState) -> i32 {
+    log_once(s, b"[nvme] Bind\0");
+    if s.pcie_handle >= 0 {
         s.state = S_MAP_BARS;
         return 0;
     }
     let sys = &*s.syscalls;
-    let mut rec = [0u8; 16];
-    let n = (sys.channel_read)(s.pcie_in, rec.as_mut_ptr(), 16);
-    if n == 16 {
-        s.pcie_dev_idx = s.controller_index;
+    let sel = &s.bind_str[..s.bind_len as usize];
+    let rc = dev_pcie_device_open(sys, sel);
+    if rc >= 0 {
+        s.pcie_handle = rc;
         s.state = S_MAP_BARS;
+        return 0;
+    }
+    // Link may still be training; periodically force a kernel rescan
+    // so the downstream card's BDF + BAR0 show up in the enumeration
+    // table for the next BIND attempt.
+    if s.step_count % 5000 == 4999 {
+        let _ = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
     }
     0
 }
@@ -847,19 +863,11 @@ unsafe fn step_wait_pcie(s: &mut NvmeState) -> i32 {
 unsafe fn step_map_bars(s: &mut NvmeState) -> i32 {
     log_once(s, b"[nvme] MapBars\0");
     let sys = &*s.syscalls;
-    let mut arg = [0u8; 10];
-    arg[0] = s.pcie_dev_idx;
-    arg[1] = 0;
-    let rc = (sys.provider_call)(-1, NIC_BAR_MAP, arg.as_mut_ptr(), 10);
-    if rc <= 0 {
+    let bar0 = dev_pcie_device_bar_map(sys, s.pcie_handle, 0);
+    if bar0 == 0 {
         return fault(s, 1, b"[nvme] BAR map failed\0");
     }
-    s.bar0_virt = u64::from_le_bytes([
-        arg[2], arg[3], arg[4], arg[5], arg[6], arg[7], arg[8], arg[9],
-    ]);
-    if s.bar0_virt == 0 {
-        return fault(s, 2, b"[nvme] BAR0 virt=0\0");
-    }
+    s.bar0_virt = bar0;
     s.state = S_RESET;
     s.substate = 0;
     0
@@ -1778,19 +1786,19 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
     // Read Status register (offset 0x04, high 16 bits) to check the
     // Capabilities List bit (bit 4). Skip the walk if the function
     // has no cap list at all.
-    let status_cmd = dev_pcie_cfg_read32(sys, s.pcie_dev_idx, 0x04);
+    let status_cmd = dev_pcie_device_cfg_read32(sys, s.pcie_handle, 0x04);
     if status_cmd == 0xFFFF_FFFF || (status_cmd & 0x0010_0000) == 0 {
         dev_log(sys, 2, b"[nvme] cap: no capability list\0".as_ptr(), 30);
         return;
     }
 
     // Cap pointer at 0x34 (u8, low 8 bits of the 32-bit read).
-    let cap_ptr_word = dev_pcie_cfg_read32(sys, s.pcie_dev_idx, 0x34);
+    let cap_ptr_word = dev_pcie_device_cfg_read32(sys, s.pcie_handle, 0x34);
     let mut ptr = (cap_ptr_word & 0xFC) as u16;
 
     let mut guard = 0u32;
     while ptr != 0 && guard < 48 {
-        let w = dev_pcie_cfg_read32(sys, s.pcie_dev_idx, ptr);
+        let w = dev_pcie_device_cfg_read32(sys, s.pcie_handle, ptr);
         if w == 0xFFFF_FFFF {
             break;
         }
@@ -1825,8 +1833,8 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
             }
             let msg_ctrl = ((w >> 16) & 0xFFFF) as u16;
             let table_sz = (msg_ctrl & 0x07FF) + 1;
-            let tbl_bir_word = dev_pcie_cfg_read32(sys, s.pcie_dev_idx, ptr + 4);
-            let pba_bir_word = dev_pcie_cfg_read32(sys, s.pcie_dev_idx, ptr + 8);
+            let tbl_bir_word = dev_pcie_device_cfg_read32(sys, s.pcie_handle, ptr + 4);
+            let pba_bir_word = dev_pcie_device_cfg_read32(sys, s.pcie_handle, ptr + 8);
             let tbl_bir = (tbl_bir_word & 0x7) as u8;
             let tbl_off = tbl_bir_word & !0x7;
             let pba_bir = (pba_bir_word & 0x7) as u8;
@@ -1916,17 +1924,10 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
         s.msix_event = ev;
     }
 
-    // Kernel-side MSI controller bring-up. Idempotent across retries.
-    let mut init_arg = s.msi_spi_irq.to_le_bytes();
-    let init_rc = (sys.provider_call)(-1, PCIE1_MSI_INIT, init_arg.as_mut_ptr(), 4);
-    if init_rc != 0 {
-        dev_log(sys, 2, b"[nvme] msix: PCIE1_MSI_INIT failed\0".as_ptr(), 34);
-        return false;
-    }
-
-    // Vector allocation — returns the target address + data value
-    // we must program into the MSI-X table entry.
-    let (vec, addr, data) = match dev_pcie1_msi_alloc_vector(sys, s.msix_event) {
+    // Vector allocation — the PCIE_DEVICE contract brings up the
+    // root-complex MSI mux on first call and returns the target
+    // address + data value we program into the MSI-X table entry.
+    let (vec, addr, data) = match dev_pcie_device_msi_alloc(sys, s.pcie_handle, s.msix_event) {
         Some(t) => t,
         None => {
             dev_log(sys, 2, b"[nvme] msix: alloc_vector failed\0".as_ptr(), 32);
@@ -1938,7 +1939,7 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     // MSI-X Table Offset + BIR live in the dword at cap+4: low 3 bits
     // are the BIR, upper bits the offset. Only BAR0-hosted tables are
     // supported; refuse anything else explicitly.
-    let tbl_word = dev_pcie_cfg_read32(sys, s.pcie_dev_idx, s.msix_cap_offset + 4);
+    let tbl_word = dev_pcie_device_cfg_read32(sys, s.pcie_handle, s.msix_cap_offset + 4);
     if tbl_word == 0xFFFF_FFFF {
         dev_log(sys, 2, b"[nvme] msix: cap read failed\0".as_ptr(), 29);
         return false;
@@ -1963,15 +1964,14 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
 
     // Flip bit 15 (MSI-X Enable) in the cap's Message Control, which
     // lives in the high half of the dword at `msix_cap_offset` — so
-    // bit 15 of Msg Ctrl is bit 31 of the dword. Read-modify-write
-    // via PCIE_CFG_WRITE32.
-    let cap_word = dev_pcie_cfg_read32(sys, s.pcie_dev_idx, s.msix_cap_offset);
+    // bit 15 of Msg Ctrl is bit 31 of the dword.
+    let cap_word = dev_pcie_device_cfg_read32(sys, s.pcie_handle, s.msix_cap_offset);
     if cap_word == 0xFFFF_FFFF {
         dev_log(sys, 2, b"[nvme] msix: ctrl read failed\0".as_ptr(), 30);
         return false;
     }
     let new_word = cap_word | (1u32 << 31);
-    let w_rc = dev_pcie_cfg_write32(sys, s.pcie_dev_idx, s.msix_cap_offset, new_word);
+    let w_rc = dev_pcie_device_cfg_write32(sys, s.pcie_handle, s.msix_cap_offset, new_word);
     if w_rc != 0 {
         dev_log(sys, 2, b"[nvme] msix: ctrl write failed\0".as_ptr(), 31);
         return false;
@@ -2132,15 +2132,15 @@ unsafe fn step_fault(s: &mut NvmeState) -> i32 {
     if s.fault_code == 1 && s.step_count % 5000 == 4999 {
         let sys = &*s.syscalls;
         let rescan = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
-        let mut arg = [0u8; 10];
-        arg[0] = s.pcie_dev_idx;
-        arg[1] = 0;
-        let rc = (sys.provider_call)(-1, NIC_BAR_MAP, arg.as_mut_ptr(), 10);
+        // Re-attempt BAR map through the bound handle.
+        let bar0 = if s.pcie_handle >= 0 {
+            dev_pcie_device_bar_map(sys, s.pcie_handle, 0)
+        } else {
+            0
+        };
 
-        if rescan > 0 && rc > 0 {
-            s.bar0_virt = u64::from_le_bytes([
-                arg[2], arg[3], arg[4], arg[5], arg[6], arg[7], arg[8], arg[9],
-            ]);
+        if rescan > 0 && bar0 != 0 {
+            s.bar0_virt = bar0;
             s.state = S_RESET;
             s.substate = 0;
             s.fault_code = 0;
@@ -2391,7 +2391,7 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, ctrl_chan: i32,
+    _in_chan: i32, out_chan: i32, ctrl_chan: i32,
     params: *const u8, params_len: usize,
     state: *mut u8, state_size: usize,
     syscalls: *const c_void,
@@ -2403,13 +2403,14 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut NvmeState);
         core::ptr::write_bytes(s as *mut NvmeState as *mut u8, 0, core::mem::size_of::<NvmeState>());
         s.syscalls = syscalls as *const SyscallTable;
-        s.pcie_in = in_chan;
-        // Second input port (`requests`, index 1) carries
-        // write-request packets from fat32 or any other producer.
-        s.req_in  = dev_channel_port(&*s.syscalls, 0, 1);
+        // `requests` (the write-request input from fat32) is the only
+        // input port. Device binding flows through the PCIE_DEVICE
+        // contract, not a channel.
+        s.req_in  = dev_channel_port(&*s.syscalls, 0, 0);
         s.blk_out = out_chan;
         s.ctrl    = ctrl_chan;
-        s.state = S_WAIT_PCIE;
+        s.pcie_handle = -1;
+        s.state = S_BIND;
         s.logged_state = 0xFE;
 
         // Register the NS_INFO ioctl handler on req_in. Consumers
@@ -2433,6 +2434,17 @@ pub extern "C" fn module_new(
             params_def::parse_tlv(s, params, params_len);
         } else {
             params_def::set_defaults(s);
+        }
+
+        // Default selector when `bind:` is unset. Keeping the default
+        // in code (rather than in the stack or YAML) means a bare
+        // `- name: nvme` entry still works.
+        if s.bind_len == 0 {
+            const DEFAULT_BIND: &[u8] = b"m2_primary";
+            for i in 0..DEFAULT_BIND.len() {
+                s.bind_str[i] = DEFAULT_BIND[i];
+            }
+            s.bind_len = DEFAULT_BIND.len() as u8;
         }
 
         // Resolve the in-flight cap after params parse. A queue_depth
@@ -2467,7 +2479,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     }
 
     match s.state {
-        S_WAIT_PCIE           => step_wait_pcie(s),
+        S_BIND                => step_bind(s),
         S_MAP_BARS            => step_map_bars(s),
         S_RESET               => step_reset(s),
         S_CONFIG_QUEUES       => step_config_queues(s),

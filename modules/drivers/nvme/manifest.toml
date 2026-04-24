@@ -1,12 +1,15 @@
-version = "0.1.0"
+version = "0.2.0"
 hardware_targets = ["bcm2712"]
 permissions = ["platform_raw", "backing_provider"]
 
-# Wire: pcie_scan.devices -> nvme.pcie_devices (for controller discovery)
-[[ports]]
-name = "pcie_devices"
-direction = "input"
-content_type = "OctetStream"
+# Bind the NVMe controller via the PCIE_DEVICE contract. The driver
+# supplies a selector (alias string or `@class=nvme`) at module_new
+# time; the kernel resolves it against the board's PCIe alias table
+# and returns a handle carrying the per-device context for subsequent
+# BAR / config-space / MSI-X calls.
+[[resources]]
+requires_contract = "pcie_device"
+access = "exclusive"
 
 # Block I/O request channel (from fat32 or equivalent).
 [[ports]]

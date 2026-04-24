@@ -83,6 +83,9 @@ pub mod mpu;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "../platform/bcm2712/pcie.rs"]
 pub mod pcie;
+#[cfg(feature = "chip-bcm2712")]
+#[path = "../platform/bcm2712/pcie_aliases.rs"]
+pub mod pcie_aliases;
 #[cfg(feature = "rp")]
 #[path = "../platform/rp/providers.rs"]
 pub mod rp_providers;

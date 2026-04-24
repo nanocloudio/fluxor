@@ -19,20 +19,19 @@ wiring = [
   "sd.blocks -> fat32.blocks",
 ]
 
-# ── CM5: NVMe on PCIe1 + FAT32 ──────────────────────────────────────────
-# Injects the full driver stack for the external NVMe HAT on Pi 5 /
-# CM5. `controller = pcie1` targets the x1 slot (PCIe2 is the internal
-# RP1 link). `fat32.block_writes → nvme.requests` is the write path;
-# drop that edge if only reads are needed.
+# ── CM5: NVMe on the external x1 slot + FAT32 ─────────────────────────
+# `bind = "m2_primary"` selects the board-local alias for the external
+# NVMe HAT+. Board topology (root complex, slot, MSI GIC SPI) lives
+# in the platform's PCIe alias table — nothing here or in user YAML
+# names `pcie1` directly. `fat32.block_writes → nvme.requests` is the
+# write path; drop that edge if only reads are needed.
 [[variant]]
 match = { board = "cm5", media = "nvme" }
 modules = [
-  { name = "pcie_scan", params = { controller = "pcie1" } },
-  { name = "nvme" },
+  { name = "nvme", params = { bind = "m2_primary" } },
   { name = "fat32" },
 ]
 wiring = [
-  "pcie_scan.devices -> nvme.pcie_devices",
   "nvme.blocks -> fat32.blocks",
   "fat32.block_writes -> nvme.requests",
 ]

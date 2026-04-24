@@ -84,6 +84,7 @@ pub mod platform {
     pub mod bcm2712 {
         pub mod mmio_dma { include!("platform/bcm2712/mmio_dma.rs"); }
         pub mod pcie_nic { include!("platform/bcm2712/pcie_nic.rs"); }
+        pub mod pcie_device { include!("platform/bcm2712/pcie_device.rs"); }
     }
 }
 
