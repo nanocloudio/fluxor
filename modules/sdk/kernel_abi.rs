@@ -297,6 +297,14 @@ pub const RANDOM_FILL: u32 = 0x0C3C;
 /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).
 pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
 
+/// Query the calling module's own scheduler index. handle=-1, no arg.
+/// Returns u8 (0..MAX_MODULES-1) on success, negative errno on failure.
+/// Used by anchors / workers to render `mod=<idx>` in MON_SESSION
+/// telemetry lines. Distinct from `internal::reconfigure::SELF_INDEX`
+/// (0x0C67), which is gated by the `reconfigure` permission and is
+/// only meant for orchestration modules.
+pub const SELF_INDEX: u32 = 0x0C42;
+
 /// Read the hardware-provisioned ethernet MAC address from platform
 /// sources (on bcm2712, the DTB passed by Pi 5 firmware). handle=-1,
 /// arg=output buffer of exactly 6 bytes. Returns 6 on success, or

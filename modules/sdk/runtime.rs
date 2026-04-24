@@ -424,11 +424,12 @@ pub const E_NOSYS: i32 = -38;
 pub const E_CONNREFUSED: i32 = -111;
 
 // ============================================================================
-// Socket Types
+// Socket Types (net_proto / Stream Surface v1)
 // ============================================================================
 
+/// Stream-oriented socket (TCP). Only valid SOCK_TYPE for NET_CMD_CONNECT
+/// now that datagram traffic has moved to the datagram surface.
 pub const SOCK_TYPE_STREAM: u8 = 1;
-pub const SOCK_TYPE_DGRAM: u8 = 2;
 
 /// Flag ORed onto opcode to dispatch to the next provider below the caller.
 pub const CHAIN_NEXT: u32 = 0x0001_0000;
@@ -1004,6 +1005,291 @@ unsafe fn net_read_frame(
 #[inline(always)]
 unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
     (sys.provider_call)(-1, 0x0C3C, buf, len)
+}
+
+// ============================================================================
+// datagram contract helpers (modules/sdk/contracts/net/datagram.rs)
+// ============================================================================
+
+/// `datagram` IPv4 address-prefix size: `[ep_id:1][af:1][addr:4][port:2]`.
+#[allow(dead_code)]
+const DG_V4_PREFIX: usize = 8;
+
+// datagram opcodes — full set (see modules/sdk/contracts/net/datagram.rs).
+// Provided here so consumers don't redefine them.
+#[allow(dead_code)]
+const DG_CMD_BIND: u8 = 0x20;
+#[allow(dead_code)]
+const DG_CMD_SEND_TO: u8 = 0x21;
+#[allow(dead_code)]
+const DG_CMD_CLOSE: u8 = 0x22;
+#[allow(dead_code)]
+const DG_MSG_BOUND: u8 = 0x40;
+#[allow(dead_code)]
+const DG_MSG_RX_FROM: u8 = 0x41;
+#[allow(dead_code)]
+const DG_MSG_CLOSED: u8 = 0x42;
+#[allow(dead_code)]
+const DG_MSG_ERROR: u8 = 0x43;
+/// `AF_INET` address-family code (matches contracts/net/datagram.rs).
+#[allow(dead_code)]
+const DG_AF_INET: u8 = 4;
+#[allow(dead_code)]
+const DG_AF_INET6: u8 = 6;
+
+/// Build and emit a `CMD_DG_SEND_TO` frame for an IPv4 destination.
+/// Layout:
+///   `[0x21][len:2 LE][ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]`
+///
+/// `dst_ip` is a u32 whose high byte is the first IP octet (i.e.
+/// `192.168.1.1` is stored as `0xC0A80101` so `to_be_bytes()` writes
+/// the wire-order octets). Port is little-endian per contract.
+///
+/// Returns total bytes handed to `channel_write` (NET_FRAME_HDR +
+/// payload_len), or `0` on validation failure (chan < 0, ep_id == 0xFF,
+/// scratch too small for `DG_V4_PREFIX + data_len + NET_FRAME_HDR`).
+///
+/// See `modules/sdk/contracts/net/datagram.rs` for the wire spec.
+#[allow(dead_code)]
+unsafe fn dev_dg_send_to_v4(
+    sys: &SyscallTable,
+    chan: i32,
+    ep_id: u8,
+    dst_ip: u32,
+    dst_port: u16,
+    data: *const u8,
+    data_len: usize,
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
+    if chan < 0 || ep_id == 0xFF { return 0; }
+    let body_len = DG_V4_PREFIX + data_len;
+    let total = NET_FRAME_HDR + body_len;
+    if total > scratch_max { return 0; }
+
+    *scratch = DG_CMD_SEND_TO;
+    let pl = (body_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    *scratch.add(3) = ep_id;
+    *scratch.add(4) = DG_AF_INET;
+    let ip_bytes = dst_ip.to_be_bytes();
+    *scratch.add(5) = ip_bytes[0];
+    *scratch.add(6) = ip_bytes[1];
+    *scratch.add(7) = ip_bytes[2];
+    *scratch.add(8) = ip_bytes[3];
+    let port_bytes = dst_port.to_le_bytes();
+    *scratch.add(9) = port_bytes[0];
+    *scratch.add(10) = port_bytes[1];
+    if data_len > 0 && !data.is_null() {
+        core::ptr::copy_nonoverlapping(data, scratch.add(NET_FRAME_HDR + DG_V4_PREFIX), data_len);
+    }
+    (sys.channel_write)(chan, scratch, total);
+    total
+}
+
+/// Parse a `MSG_DG_RX_FROM` frame's payload as IPv4. Caller passes the
+/// pointer at the start of the *frame* (including the 3-byte TLV
+/// header) plus the `payload_len` returned by `net_read_frame`.
+///
+/// Returns `Some((ep_id, src_ip, src_port, data_ptr, data_len))` on a
+/// well-formed IPv4 datagram_v1 RX frame — `data_ptr` points to the
+/// first byte of the inner datagram payload. Returns `None` if the
+/// frame is too short, has the wrong `af`, or `payload_len` underflows
+/// the prefix.
+#[allow(dead_code)]
+#[inline]
+unsafe fn parse_dg_rx_from_v4(
+    frame_buf: *const u8,
+    payload_len: usize,
+) -> Option<(u8, u32, u16, *const u8, usize)> {
+    if payload_len < DG_V4_PREFIX { return None; }
+    let p = frame_buf.add(NET_FRAME_HDR);
+    let ep_id = *p;
+    let af = *p.add(1);
+    if af != DG_AF_INET { return None; }
+    let src_ip = u32::from_be_bytes([*p.add(2), *p.add(3), *p.add(4), *p.add(5)]);
+    let src_port = u16::from_le_bytes([*p.add(6), *p.add(7)]);
+    let data_ptr = p.add(DG_V4_PREFIX);
+    let data_len = payload_len - DG_V4_PREFIX;
+    Some((ep_id, src_ip, src_port, data_ptr, data_len))
+}
+
+// ============================================================================
+// Self-index + MON_SESSION telemetry
+// ============================================================================
+
+/// Query the calling module's own scheduler index.
+/// See `kernel_abi::SELF_INDEX` (0x0C42). Returns 0..MAX_MODULES-1 on
+/// success, negative errno on failure (e.g. called outside step). Used
+/// by anchors / workers / directories to render the `mod=` field of
+/// `MON_SESSION` telemetry lines.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
+    (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
+}
+
+/// Render `bytes` as lowercase hex into `out`. Caller must ensure
+/// `out.len() >= bytes.len() * 2`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn hex_render(bytes: *const u8, n: usize, out: *mut u8) {
+    let h = b"0123456789abcdef";
+    let mut i = 0;
+    while i < n {
+        let b = *bytes.add(i);
+        *out.add(i * 2) = h[(b >> 4) as usize];
+        *out.add(i * 2 + 1) = h[(b & 0xF) as usize];
+        i += 1;
+    }
+}
+
+/// Render a `mod=<n>` decimal field. `n` is the module's own scheduler
+/// index (from `dev_self_index`); we cap at three digits since the
+/// scheduler's `MAX_MODULES` is well under 1000. Returns bytes written.
+#[allow(dead_code)]
+unsafe fn fmt_u32_dec(mut n: u32, out: *mut u8) -> usize {
+    if n == 0 {
+        *out = b'0';
+        return 1;
+    }
+    let mut buf = [0u8; 10];
+    let mut len = 0usize;
+    while n > 0 && len < buf.len() {
+        buf[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    let mut i = 0;
+    while i < len {
+        *out.add(i) = buf[len - 1 - i];
+        i += 1;
+    }
+    len
+}
+
+/// `MON_SESSION` line buffer size — fits the longest attach event with
+/// all optional fields populated. See `docs/architecture/monitor-protocol.md`.
+const MON_SESSION_BUF_SIZE: usize = 192;
+
+/// `MON_SESSION` event tag codes for `dev_mon_session`. Strings live in
+/// the helper to keep call sites short. Wire format remains the
+/// human-readable name from `monitor-protocol.md`.
+#[allow(dead_code)] pub const MON_EV_ATTACH_REQ: u8 = 1;
+#[allow(dead_code)] pub const MON_EV_ATTACHED: u8 = 2;
+#[allow(dead_code)] pub const MON_EV_ATTACH_FAILED: u8 = 3;
+#[allow(dead_code)] pub const MON_EV_DRAINED: u8 = 4;
+#[allow(dead_code)] pub const MON_EV_EXPORTED: u8 = 5;
+#[allow(dead_code)] pub const MON_EV_IMPORTED: u8 = 6;
+#[allow(dead_code)] pub const MON_EV_RESUMED: u8 = 7;
+#[allow(dead_code)] pub const MON_EV_DETACH_REQ: u8 = 8;
+#[allow(dead_code)] pub const MON_EV_DETACHED: u8 = 9;
+#[allow(dead_code)] pub const MON_EV_RELOCATED: u8 = 10;
+#[allow(dead_code)] pub const MON_EV_REJECTED: u8 = 11;
+#[allow(dead_code)] pub const MON_EV_ERROR: u8 = 12;
+
+/// Map an event code to its on-the-wire string. Empty for unknown codes.
+#[allow(dead_code)]
+fn mon_event_name(ev: u8) -> &'static [u8] {
+    match ev {
+        MON_EV_ATTACH_REQ => b"attach_req",
+        MON_EV_ATTACHED => b"attached",
+        MON_EV_ATTACH_FAILED => b"attach_failed",
+        MON_EV_DRAINED => b"drained",
+        MON_EV_EXPORTED => b"exported",
+        MON_EV_IMPORTED => b"imported",
+        MON_EV_RESUMED => b"resumed",
+        MON_EV_DETACH_REQ => b"detach_req",
+        MON_EV_DETACHED => b"detached",
+        MON_EV_RELOCATED => b"relocated",
+        MON_EV_REJECTED => b"rejected",
+        MON_EV_ERROR => b"error",
+        _ => b"unknown",
+    }
+}
+
+/// Emit a `MON_SESSION` line via `dev_log`. Fields: `mod=<idx>
+/// event=<name> session=<32hex> epoch=<n>` plus any optional
+/// `anchor=<16hex>` / `worker=<16hex>` (pass null pointers to omit).
+/// `reason` is the named DETACH_* reason (or empty `b""` to omit);
+/// `status` is the named STATUS_* code (or empty to omit). The line
+/// is written via the kernel log path so it reaches every active
+/// debug transport (UART, log_net, etc.).
+///
+/// Caller-allocated `scratch` buffer must be at least
+/// `MON_SESSION_BUF_SIZE` bytes — typical state structs have a small
+/// fixed buffer for this. Returns bytes written, or 0 if the buffer
+/// was too small.
+///
+/// See `docs/architecture/monitor-protocol.md` §`MON_SESSION` for the
+/// authoritative line-format spec.
+#[allow(dead_code)]
+unsafe fn dev_mon_session(
+    sys: &SyscallTable,
+    self_idx: u8,
+    event: u8,
+    session_id: *const u8,    // 16 BE bytes
+    epoch: u32,
+    anchor_id: *const u8,     // 8 BE bytes, or null to omit
+    worker_id: *const u8,     // 8 BE bytes, or null to omit
+    reason: &[u8],            // empty to omit
+    status: &[u8],            // empty to omit
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
+    if scratch_max < MON_SESSION_BUF_SIZE { return 0; }
+    let mut pos = 0usize;
+    let mut emit = |bytes: &[u8], pos: &mut usize| {
+        let mut i = 0;
+        while i < bytes.len() && *pos < scratch_max {
+            *scratch.add(*pos) = bytes[i];
+            *pos += 1;
+            i += 1;
+        }
+    };
+
+    emit(b"MON_SESSION mod=", &mut pos);
+    pos += fmt_u32_dec(self_idx as u32, scratch.add(pos));
+
+    emit(b" event=", &mut pos);
+    emit(mon_event_name(event), &mut pos);
+
+    emit(b" session=", &mut pos);
+    if pos + 32 <= scratch_max {
+        hex_render(session_id, 16, scratch.add(pos));
+        pos += 32;
+    }
+
+    emit(b" epoch=", &mut pos);
+    pos += fmt_u32_dec(epoch, scratch.add(pos));
+
+    if !anchor_id.is_null() {
+        emit(b" anchor=", &mut pos);
+        if pos + 16 <= scratch_max {
+            hex_render(anchor_id, 8, scratch.add(pos));
+            pos += 16;
+        }
+    }
+    if !worker_id.is_null() {
+        emit(b" worker=", &mut pos);
+        if pos + 16 <= scratch_max {
+            hex_render(worker_id, 8, scratch.add(pos));
+            pos += 16;
+        }
+    }
+    if !reason.is_empty() {
+        emit(b" reason=", &mut pos);
+        emit(reason, &mut pos);
+    }
+    if !status.is_empty() {
+        emit(b" status=", &mut pos);
+        emit(status, &mut pos);
+    }
+
+    // Severity 3 = info; same as other [echo_anc]/[echo_wkr] lines.
+    dev_log(sys, 3, scratch, pos);
+    pos
 }
 
 /// Allocate `size` bytes of DMA-coherent memory with `align`-byte alignment

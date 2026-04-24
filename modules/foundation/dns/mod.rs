@@ -5,11 +5,22 @@
 //!
 //! # Architecture
 //!
-//! Uses channel-based net protocol through the IP module:
-//! - **Server conn** — CMD_BIND on port 53, receives MSG_DATA with source addressing
-//!   MSG_DATA payload: [conn_id:1][src_ip:4 LE][src_port:2 LE][dns_data...]
-//! - **Upstream conn** — CMD_CONNECT to upstream DNS, receives MSG_DATA (raw)
-//!   MSG_DATA payload: [conn_id:1][dns_data...]
+//! Uses the datagram surface
+//! (see `modules/sdk/contracts/net/datagram.rs` and
+//! `docs/architecture/protocol_surfaces.md`) over the shared `net_in`/
+//! `net_out` channel pair on the IP module:
+//!
+//! - **Server endpoint** — `CMD_DG_BIND` on port 53 allocates `server_ep`;
+//!   inbound client queries arrive as `MSG_DG_RX_FROM` carrying the client
+//!   address; replies go out as `CMD_DG_SEND_TO` to the captured client
+//!   address.
+//! - **Upstream endpoint** — `CMD_DG_BIND` on port 0 (ephemeral) allocates
+//!   `upstream_ep`; forwarded queries go out as `CMD_DG_SEND_TO` to the
+//!   upstream DNS server; upstream responses arrive as `MSG_DG_RX_FROM`.
+//!
+//! Frames share the 3-byte TLV header with net_proto, but datagram
+//! opcodes (`0x20..0x43`) are disjoint from net_proto's (`0x01..0x13`) so
+//! a shared `net_out` channel can carry both contracts unambiguously.
 //!
 //! # Parameters
 //!
@@ -52,20 +63,11 @@ const FLAG_RA: u16 = 0x0080;       // Recursion available
 const FLAG_RD: u16 = 0x0100;       // Recursion desired
 const RCODE_NXDOMAIN: u16 = 0x0003;
 
-/// Net protocol frame constants
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CONNECT: u8 = 0x13;
+// datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
+// modules/sdk/runtime.rs (shared across consumers).
 
-/// Net buffer size (frame header + conn_id + addressing + DNS packet)
+/// Net buffer size (frame header + ep_id + addressing + DNS packet)
 const NET_BUF_SIZE: usize = 600;
-
-/// UDP addressing prefix in MSG_DATA/CMD_SEND for bound conns: [ip:4][port:2]
-const UDP_ADDR_LEN: usize = 6;
 
 /// Maximum local host entries
 const MAX_HOSTS: usize = 16;
@@ -84,10 +86,10 @@ const MAX_NAME_LEN: usize = 63;
 #[derive(Clone, Copy, PartialEq)]
 enum DnsPhase {
     Init = 0,
-    Binding = 1,
-    WaitBound = 2,
-    Connecting = 3,
-    WaitConnect = 4,
+    BindingServer = 1,
+    WaitBoundServer = 2,
+    BindingUpstream = 3,
+    WaitBoundUpstream = 4,
     Serving = 5,
     Error = 255,
 }
@@ -185,9 +187,12 @@ struct DnsState {
     phase: DnsPhase,
     host_count: u8,
 
-    /// Conn IDs assigned by the IP module
-    server_conn_id: u8,
-    upstream_conn_id: u8,
+    /// Endpoint IDs assigned by the IP module via MSG_DG_BOUND.
+    /// `server_ep` is bound to `listen_port`; `upstream_ep` is bound to an
+    /// ephemeral port and used only to send to / receive from the upstream
+    /// DNS server. Both values start as `0xFF` to distinguish unallocated.
+    server_ep: u8,
+    upstream_ep: u8,
 
     // Statistics
     queries_local: u32,
@@ -216,8 +221,8 @@ impl DnsState {
         self.listen_port = 53;
         self.phase = DnsPhase::Init;
         self.host_count = 0;
-        self.server_conn_id = 0;
-        self.upstream_conn_id = 0;
+        self.server_ep = 0xFF;
+        self.upstream_ep = 0xFF;
         self.queries_local = 0;
         self.queries_forwarded = 0;
     }
@@ -670,11 +675,53 @@ unsafe fn build_nxdomain(
     copy_len
 }
 
-/// Send a DNS reply via CMD_SEND on the server conn (bound UDP).
-/// Builds: [CMD_SEND][len:2 LE][conn_id:1][dst_ip:4 LE][dst_port:2 LE][dns_data...]
+/// Emit a datagram CMD_DG_SEND_TO frame from `ep_id` to an IPv4 dst.
 ///
-/// Uses raw state pointer to access net_buf independently of any &mut borrow,
-/// since the received frame data has already been consumed by caller.
+/// Frame layout:
+///   `[0x21][len:2 LE][ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]`
+///
+/// Uses raw state pointer to access net_buf independently of any &mut
+/// borrow, since the received frame data has already been consumed by
+/// caller.
+unsafe fn dg_send_to_v4(
+    state: *mut DnsState,
+    ep_id: u8,
+    dst_ip: u32,
+    dst_port: u16,
+    dns_data: *const u8,
+    dns_len: usize,
+) {
+    let net_out = (*state).net_out_chan;
+    let sys = (*state).syscalls;
+    if net_out < 0 || ep_id == 0xFF { return; }
+    let payload_len = DG_V4_PREFIX + dns_len;
+    let total = NET_FRAME_HDR + payload_len;
+    if total > NET_BUF_SIZE { return; }
+
+    let buf = (*state).net_buf.as_mut_ptr();
+
+    *buf = DG_CMD_SEND_TO;
+    let pl = (payload_len as u16).to_le_bytes();
+    *buf.add(1) = pl[0];
+    *buf.add(2) = pl[1];
+    *buf.add(3) = ep_id;
+    *buf.add(4) = DG_AF_INET;
+    let ip_bytes = dst_ip.to_be_bytes();
+    *buf.add(5) = ip_bytes[0]; *buf.add(6) = ip_bytes[1];
+    *buf.add(7) = ip_bytes[2]; *buf.add(8) = ip_bytes[3];
+    let port_bytes = dst_port.to_le_bytes();
+    *buf.add(9) = port_bytes[0]; *buf.add(10) = port_bytes[1];
+
+    let mut i = 0;
+    while i < dns_len {
+        *buf.add(DG_V4_PREFIX + NET_FRAME_HDR + i) = *dns_data.add(i);
+        i += 1;
+    }
+
+    ((*sys).channel_write)(net_out, buf, total);
+}
+
+/// Send a DNS reply from the server endpoint back to the original client.
 unsafe fn send_server_reply(
     state: *mut DnsState,
     dst_ip: u32,
@@ -682,71 +729,20 @@ unsafe fn send_server_reply(
     dns_data: *const u8,
     dns_len: usize,
 ) {
-    let net_out = (*state).net_out_chan;
-    let conn_id = (*state).server_conn_id;
-    let sys = (*state).syscalls;
-    if net_out < 0 { return; }
-    let payload_len = 1 + UDP_ADDR_LEN + dns_len; // conn_id + addr + data
-    let total = NET_FRAME_HDR + payload_len;
-    if total > NET_BUF_SIZE { return; }
-
-    let buf = (*state).net_buf.as_mut_ptr();
-
-    // Frame header
-    *buf = NET_CMD_SEND;
-    let pl = (payload_len as u16).to_le_bytes();
-    *buf.add(1) = pl[0];
-    *buf.add(2) = pl[1];
-
-    // Payload: conn_id + addressing + DNS data
-    *buf.add(3) = conn_id;
-    let ip_bytes = dst_ip.to_le_bytes();
-    *buf.add(4) = ip_bytes[0]; *buf.add(5) = ip_bytes[1];
-    *buf.add(6) = ip_bytes[2]; *buf.add(7) = ip_bytes[3];
-    let port_bytes = dst_port.to_le_bytes();
-    *buf.add(8) = port_bytes[0]; *buf.add(9) = port_bytes[1];
-
-    let mut i = 0;
-    while i < dns_len {
-        *buf.add(10 + i) = *dns_data.add(i);
-        i += 1;
-    }
-
-    ((*sys).channel_write)(net_out, buf, total);
+    let ep = (*state).server_ep;
+    dg_send_to_v4(state, ep, dst_ip, dst_port, dns_data, dns_len);
 }
 
-/// Send a DNS query via CMD_SEND on the upstream conn (connected UDP).
-/// Builds: [CMD_SEND][len:2 LE][conn_id:1][dns_data...]
-///
-/// Uses raw state pointer to access net_buf independently of any &mut borrow.
+/// Send a DNS query from the upstream endpoint to the configured upstream
+/// DNS server.
 unsafe fn send_upstream_query(
     state: *mut DnsState,
     dns_data: *const u8,
     dns_len: usize,
 ) {
-    let net_out = (*state).net_out_chan;
-    let conn_id = (*state).upstream_conn_id;
-    let sys = (*state).syscalls;
-    if net_out < 0 { return; }
-    let payload_len = 1 + dns_len; // conn_id + data
-    let total = NET_FRAME_HDR + payload_len;
-    if total > NET_BUF_SIZE { return; }
-
-    let buf = (*state).net_buf.as_mut_ptr();
-
-    *buf = NET_CMD_SEND;
-    let pl = (payload_len as u16).to_le_bytes();
-    *buf.add(1) = pl[0];
-    *buf.add(2) = pl[1];
-    *buf.add(3) = conn_id;
-
-    let mut i = 0;
-    while i < dns_len {
-        *buf.add(4 + i) = *dns_data.add(i);
-        i += 1;
-    }
-
-    ((*sys).channel_write)(net_out, buf, total);
+    let ep = (*state).upstream_ep;
+    let upstream_ip = (*state).upstream_ip;
+    dg_send_to_v4(state, ep, upstream_ip, 53, dns_data, dns_len);
 }
 
 /// Store a pending upstream query.
@@ -961,12 +957,12 @@ unsafe fn forward_to_upstream(
     pkt: *const u8,
     pkt_len: usize,
 ) {
-    if s.upstream_conn_id == 0 { return; }
+    if s.upstream_ep == 0xFF { return; }
 
     // Store pending entry
     store_pending(s, dns_id, client_ip, client_port);
 
-    // Send query to upstream via CMD_SEND on connected conn
+    // Send query to upstream via CMD_DG_SEND_TO on the upstream endpoint.
     send_upstream_query(s as *mut DnsState, pkt, pkt_len);
     s.queries_forwarded += 1;
 }
@@ -1047,26 +1043,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         match s.phase {
             DnsPhase::Init => {
-                s.phase = DnsPhase::Binding;
+                s.phase = DnsPhase::BindingServer;
             }
 
-            DnsPhase::Binding => {
-                // Send CMD_BIND for the server port
+            DnsPhase::BindingServer => {
+                // CMD_DG_BIND [port: u16 LE] [flags: u8=0] — server port.
                 if s.net_out_chan < 0 { return 0; }
                 let sys = &*s.syscalls;
                 let buf = s.net_buf.as_mut_ptr();
-                let mut payload = [0u8; 2];
+                let mut payload = [0u8; 3];
                 let pp = payload.as_mut_ptr();
                 let port_bytes = s.listen_port.to_le_bytes();
                 *pp = port_bytes[0];
                 *pp.add(1) = port_bytes[1];
-                let wrote = net_write_frame(sys, s.net_out_chan, NET_CMD_BIND, payload.as_ptr(), 2, buf, NET_BUF_SIZE);
+                *pp.add(2) = 0; // flags
+                let wrote = net_write_frame(
+                    sys, s.net_out_chan, DG_CMD_BIND,
+                    payload.as_ptr(), 3, buf, NET_BUF_SIZE,
+                );
                 if wrote == 0 { return 0; }
-                s.phase = DnsPhase::WaitBound;
+                s.phase = DnsPhase::WaitBoundServer;
                 return 2;
             }
 
-            DnsPhase::WaitBound => {
+            DnsPhase::WaitBoundServer => {
                 if s.net_in_chan < 0 { return 0; }
                 let sys = &*s.syscalls;
                 let chan = s.net_in_chan;
@@ -1075,44 +1075,34 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                 let buf = s.net_buf.as_mut_ptr();
                 let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                if msg_type == NET_MSG_BOUND {
-                    // Extract conn_id from payload
-                    if payload_len >= 1 {
-                        s.server_conn_id = *buf.add(NET_FRAME_HDR);
-                    }
-                    log_info(s, b"[dns] bound");
-                    s.phase = DnsPhase::Connecting;
+                if msg_type == DG_MSG_BOUND && payload_len >= 1 {
+                    s.server_ep = *buf.add(NET_FRAME_HDR);
+                    log_info(s, b"[dns] server bound");
+                    s.phase = DnsPhase::BindingUpstream;
                     return 2;
-                } else if msg_type == NET_MSG_ERROR {
-                    log_err(s, b"[dns] bind failed");
+                } else if msg_type == DG_MSG_ERROR {
+                    log_err(s, b"[dns] server bind failed");
                     s.phase = DnsPhase::Error;
                     return -1;
                 }
             }
 
-            DnsPhase::Connecting => {
-                // Send CMD_CONNECT for the upstream DNS server (UDP)
+            DnsPhase::BindingUpstream => {
+                // CMD_DG_BIND with port=0 asks the IP module to allocate an
+                // ephemeral port for the upstream endpoint.
                 if s.net_out_chan < 0 { return 0; }
                 let sys = &*s.syscalls;
                 let buf = s.net_buf.as_mut_ptr();
-                // CMD_CONNECT payload: [sock_type: u8] [ip: u32 LE] [port: u16 LE]
-                let mut payload = [0u8; 7];
-                let pp = payload.as_mut_ptr();
-                *pp = SOCK_TYPE_DGRAM;
-                let ip_bytes = s.upstream_ip.to_le_bytes();
-                *pp.add(1) = ip_bytes[0];
-                *pp.add(2) = ip_bytes[1];
-                *pp.add(3) = ip_bytes[2];
-                *pp.add(4) = ip_bytes[3];
-                let port_bytes = 53u16.to_le_bytes();
-                *pp.add(5) = port_bytes[0];
-                *pp.add(6) = port_bytes[1];
-                let wrote = net_write_frame(sys, s.net_out_chan, NET_CMD_CONNECT, payload.as_ptr(), 7, buf, NET_BUF_SIZE);
+                let payload = [0u8, 0u8, 0u8]; // port=0, flags=0
+                let wrote = net_write_frame(
+                    sys, s.net_out_chan, DG_CMD_BIND,
+                    payload.as_ptr(), 3, buf, NET_BUF_SIZE,
+                );
                 if wrote == 0 { return 0; }
-                s.phase = DnsPhase::WaitConnect;
+                s.phase = DnsPhase::WaitBoundUpstream;
             }
 
-            DnsPhase::WaitConnect => {
+            DnsPhase::WaitBoundUpstream => {
                 if s.net_in_chan < 0 { return 0; }
                 let sys = &*s.syscalls;
                 let chan = s.net_in_chan;
@@ -1121,13 +1111,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                 let buf = s.net_buf.as_mut_ptr();
                 let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
-                    s.upstream_conn_id = *buf.add(NET_FRAME_HDR);
+                if msg_type == DG_MSG_BOUND && payload_len >= 1 {
+                    s.upstream_ep = *buf.add(NET_FRAME_HDR);
                     log_info(s, b"[dns] serving");
                     s.phase = DnsPhase::Serving;
                     return 2;
-                } else if msg_type == NET_MSG_ERROR {
-                    log_err(s, b"[dns] upstream connect failed");
+                } else if msg_type == DG_MSG_ERROR {
+                    log_err(s, b"[dns] upstream bind failed");
                     s.phase = DnsPhase::Error;
                     return -1;
                 }
@@ -1136,7 +1126,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             DnsPhase::Serving => {
                 let mut did_work = false;
 
-                // Read net protocol frames from net_in channel
+                // Read datagram frames from net_in channel.
                 let chan = s.net_in_chan;
                 if chan < 0 { return 0; }
 
@@ -1146,41 +1136,31 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let buf = s.net_buf.as_mut_ptr();
                     let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
 
-                    if msg_type == NET_MSG_DATA && payload_len >= 1 {
-                        let conn_id = *buf.add(NET_FRAME_HDR);
-                        let server_cid = s.server_conn_id;
-                        let upstream_cid = s.upstream_conn_id;
+                    // MSG_DG_RX_FROM payload:
+                    //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][dns_data...]
+                    if msg_type == DG_MSG_RX_FROM
+                        && payload_len >= DG_V4_PREFIX + DNS_HEADER_LEN
+                    {
+                        let ep_id = *buf.add(NET_FRAME_HDR);
+                        let af = *buf.add(NET_FRAME_HDR + 1);
+                        if af == DG_AF_INET {
+                            let p = buf.add(NET_FRAME_HDR + 2);
+                            let src_ip = u32::from_be_bytes([
+                                *p, *p.add(1), *p.add(2), *p.add(3),
+                            ]);
+                            let src_port = u16::from_le_bytes([
+                                *p.add(4), *p.add(5),
+                            ]);
+                            let dns_data = buf.add(NET_FRAME_HDR + DG_V4_PREFIX) as *const u8;
+                            let dns_len = payload_len - DG_V4_PREFIX;
 
-                        if conn_id == server_cid {
-                            // Server data: [conn_id:1][src_ip:4 LE][src_port:2 LE][dns_data...]
-                            if payload_len >= 1 + UDP_ADDR_LEN + DNS_HEADER_LEN {
-                                let p = buf.add(NET_FRAME_HDR + 1);
-                                let client_ip = u32::from_le_bytes([
-                                    *p, *p.add(1), *p.add(2), *p.add(3)
-                                ]);
-                                let client_port = u16::from_le_bytes([
-                                    *p.add(4), *p.add(5)
-                                ]);
-                                let dns_data = p.add(UDP_ADDR_LEN) as *const u8;
-                                let dns_len = payload_len - 1 - UDP_ADDR_LEN;
-
-                                if dns_len >= DNS_HEADER_LEN {
-                                    handle_query(
-                                        s, client_ip, client_port,
-                                        dns_data, dns_len,
-                                    );
-                                }
-                            }
-                        } else if conn_id == upstream_cid {
-                            // Upstream data: [conn_id:1][dns_data...]
-                            let dns_data = buf.add(NET_FRAME_HDR + 1) as *const u8;
-                            let dns_len = payload_len - 1;
-
-                            if dns_len >= DNS_HEADER_LEN {
+                            if ep_id == s.server_ep {
+                                handle_query(s, src_ip, src_port, dns_data, dns_len);
+                            } else if ep_id == s.upstream_ep {
                                 handle_upstream_response(s, dns_data, dns_len);
                             }
+                            did_work = true;
                         }
-                        did_work = true;
                     }
                 }
 
@@ -1194,11 +1174,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             DnsPhase::Error => {
                 return 1; // Done
-            }
-
-            _ => {
-                s.phase = DnsPhase::Error;
-                return -1;
             }
         }
 

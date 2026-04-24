@@ -1,13 +1,15 @@
 //! log_net — netconsole-style log forwarding.
 //!
 //! Drains the kernel log ring (via LOG_RING_DRAIN (diag) 0x0C64) and
-//! forwards chunks as UDP datagrams through the IP module. Use this when
-//! the UART is unavailable (HAT blocking GPIO14/15, remote bring-up, etc.).
+//! forwards chunks as UDP datagrams through the IP module using the
+//! datagram surface
+//! (see `modules/sdk/contracts/net/datagram.rs`). Use this when the
+//! UART is unavailable (HAT blocking GPIO14/15, remote bring-up, etc.).
 //!
 //! # Wiring
 //!
 //!   ip.net_out  →  log_net.net_in       (inbound frames from ip — discarded)
-//!   log_net.net_out →  ip.net_in        (CMD_BIND + CMD_SEND)
+//!   log_net.net_out →  ip.net_in        (CMD_DG_BIND + CMD_DG_SEND_TO)
 //!
 //! # Parameters
 //!
@@ -37,12 +39,10 @@ include!("../../sdk/params.rs");
 // Constants
 // ============================================================================
 
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_ERROR: u8 = 0x06;
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
+// datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
+// modules/sdk/runtime.rs (shared across consumers).
 
-/// Frame buffer: FRAME_HDR + conn_id + dst_ip + dst_port + log chunk.
+/// Frame buffer: FRAME_HDR + DG_V4_PREFIX + log chunk.
 const NET_BUF_SIZE: usize = 600;
 
 /// Per-datagram log payload budget. Leaves ~72 B of slack vs NET_BUF_SIZE.
@@ -92,7 +92,9 @@ struct LogNetState {
     bind_port: u16,
 
     phase: Phase,
-    conn_id: u8,
+    /// datagram endpoint id assigned by IP via MSG_DG_BOUND.
+    /// `0xFF` = unallocated.
+    ep_id: u8,
 
     /// Backoff countdown (ticks remaining before next bind retry).
     backoff_ticks: u16,
@@ -125,7 +127,7 @@ impl LogNetState {
         self.dst_port = 6666;
         self.bind_port = 6667;
         self.phase = Phase::Init;
-        self.conn_id = 0;
+        self.ep_id = 0xFF;
         self.backoff_ticks = 0;
         self.bind_attempts = 0;
         self.pending_len = 0;
@@ -162,41 +164,41 @@ mod params_def {
 // Helpers
 // ============================================================================
 
-/// Build and emit a CMD_SEND frame carrying `payload` to the configured
-/// broadcast/unicast destination. Returns true iff the channel accepted it.
+/// Build and emit a CMD_DG_SEND_TO frame carrying `payload` to the configured
+/// unicast destination. Returns true iff the channel accepted it.
 ///
-/// Caller must have transitioned to Phase::Serving (conn_id set from MSG_BOUND).
-/// conn_id=0 is a legitimate slot assignment, so we do not gate on it.
+/// Caller must have transitioned to Phase::Serving (ep_id set from MSG_DG_BOUND).
 unsafe fn emit_datagram(s: &mut LogNetState, payload: *const u8, payload_len: usize) -> bool {
-    if s.net_out_chan < 0 { return false; }
-    // NET_CMD_SEND payload: [conn_id:1][dst_ip:4 LE][dst_port:2 LE][data...]
-    let body_len = 1 + 4 + 2 + payload_len;
+    if s.net_out_chan < 0 || s.ep_id == 0xFF { return false; }
+    // CMD_DG_SEND_TO payload: [ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]
+    let body_len = DG_V4_PREFIX + payload_len;
     if body_len + 3 > NET_BUF_SIZE { return false; }
 
     let buf = s.net_buf.as_mut_ptr();
     let out_chan = s.net_out_chan;
-    let conn_id = s.conn_id;
+    let ep_id = s.ep_id;
     let dst_ip = s.dst_ip;
     let dst_port = s.dst_port;
     let sys_ptr = s.syscalls;
 
-    *buf = NET_CMD_SEND;
+    *buf = DG_CMD_SEND_TO;
     let pl = (body_len as u16).to_le_bytes();
     *buf.add(1) = pl[0];
     *buf.add(2) = pl[1];
-    *buf.add(3) = conn_id;
-    let ip = dst_ip.to_le_bytes();
-    *buf.add(4) = ip[0];
-    *buf.add(5) = ip[1];
-    *buf.add(6) = ip[2];
-    *buf.add(7) = ip[3];
+    *buf.add(3) = ep_id;
+    *buf.add(4) = DG_AF_INET;
+    let ip = dst_ip.to_be_bytes();
+    *buf.add(5) = ip[0];
+    *buf.add(6) = ip[1];
+    *buf.add(7) = ip[2];
+    *buf.add(8) = ip[3];
     let port = dst_port.to_le_bytes();
-    *buf.add(8) = port[0];
-    *buf.add(9) = port[1];
+    *buf.add(9) = port[0];
+    *buf.add(10) = port[1];
 
     let mut i = 0;
     while i < payload_len {
-        *buf.add(10 + i) = *payload.add(i);
+        *buf.add(3 + DG_V4_PREFIX + i) = *payload.add(i);
         i += 1;
     }
 
@@ -211,8 +213,9 @@ unsafe fn emit_datagram(s: &mut LogNetState, payload: *const u8, payload_len: us
     }
 }
 
-/// Drain any inbound frame on net_in and discard. The IP module publishes
-/// MSG_DATA for our bound socket — we don't act on remote control input.
+/// Drain any inbound frame on net_in and discard. The IP module may
+/// publish MSG_DG_RX_FROM for our bound endpoint — we don't act on
+/// remote control input.
 unsafe fn discard_net_in(s: &mut LogNetState) {
     if s.net_in_chan < 0 { return; }
     let sys_ptr = s.syscalls;
@@ -313,13 +316,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let sys_ptr = s.syscalls;
                 let out_chan = s.net_out_chan;
                 let buf = s.net_buf.as_mut_ptr();
-                let mut payload = [0u8; 2];
+                // CMD_DG_BIND payload: [port: u16 LE] [flags: u8 = 0]
+                let mut payload = [0u8; 3];
                 let port = s.bind_port.to_le_bytes();
                 payload[0] = port[0];
                 payload[1] = port[1];
+                payload[2] = 0;
                 let wrote = net_write_frame(
-                    &*sys_ptr, out_chan, NET_CMD_BIND,
-                    payload.as_ptr(), 2, buf, NET_BUF_SIZE,
+                    &*sys_ptr, out_chan, DG_CMD_BIND,
+                    payload.as_ptr(), 3, buf, NET_BUF_SIZE,
                 );
                 // Channel full — retry next tick (phase unchanged).
                 if wrote == 0 { return 0; }
@@ -336,21 +341,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if poll <= 0 || (poll & 0x01) == 0 { return 0; }
                 let buf = s.net_buf.as_mut_ptr();
                 let (msg_type, payload_len) = net_read_frame(&*sys_ptr, in_chan, buf, NET_BUF_SIZE);
-                // MSG_BOUND payload: [conn_id:1][local_port:2 LE]. Match
-                // on local_port so we only claim the conn_id belonging to
-                // our own CMD_BIND — `ip.net_out` may be tee'd to other
-                // consumers with their own binds in flight.
-                if msg_type == NET_MSG_BOUND && payload_len >= 3 {
+                // MSG_DG_BOUND payload: [ep_id:1][local_port:2 LE]. Match
+                // on local_port so we only claim the ep_id belonging to
+                // our own CMD_DG_BIND — `ip.net_out` may be tee'd to
+                // other consumers with their own binds in flight.
+                if msg_type == DG_MSG_BOUND && payload_len >= 3 {
                     let bound_port = (*buf.add(4) as u16)
                         | ((*buf.add(5) as u16) << 8);
                     if bound_port == s.bind_port {
-                        s.conn_id = *buf.add(3);
+                        s.ep_id = *buf.add(3);
                         s.phase = Phase::Serving;
                         s.bind_attempts = 0;
                         s.pending_len = 0;
                         return 2;
                     }
-                } else if msg_type == NET_MSG_ERROR {
+                } else if msg_type == DG_MSG_ERROR {
                     // Transient — back off, then retry from Binding.
                     // Never returns -1: a debug overlay must not kill its own
                     // module and trigger the fault monitor.

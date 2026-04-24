@@ -612,9 +612,9 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
         0x0C30 | 0x0C31 | 0x0C33 |
         0x0C34 | 0x0C35 | 0x0C36 |
         0x0C3A ..= 0x0C3D |
-        0x0C40 | 0x0C41 |
+        0x0C40 | 0x0C41 | 0x0C42 |
         0x0C50 | 0x0C51 |
-        0x0C65 |  // FAN_DIAG_SNAPSHOT (read-only fan counters)
+        0x0C65 |
         0x0CE8 |
         0x0CF8 | 0x0CFA => None,
 
@@ -867,12 +867,14 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     use crate::abi::kernel_abi::{
         ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
         PAGED_ARENA_GET, PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY,
+        SELF_INDEX,
     };
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::kernel::scheduler;
     match opcode {
         // ── Core primitives ──
-        ARENA_GET
+        SELF_INDEX
+        | ARENA_GET
         | REPORT_LATENCY
         | LOG_WRITE
         | GET_HW_ETHERNET_MAC
@@ -958,12 +960,15 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::kernel_abi::{
         ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        RANDOM_FILL, REPORT_LATENCY,
+        RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
     };
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::internal::monitor::ISR_METRICS;
     use crate::kernel::scheduler;
     match opcode {
+        SELF_INDEX => {
+            scheduler::current_module_index() as i32
+        }
         ARENA_GET => {
             let mut size_out: u32 = 0;
             let ptr = scheduler::syscall_arena_get(&mut size_out);

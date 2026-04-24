@@ -85,6 +85,10 @@ const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
 const NET_CMD_CONNECT: u8 = 0x13;
 
+// Datagram surface opcodes share the same `net_in` / `net_out` pair as
+// net_proto; the disjoint opcode ranges keep the contracts unambiguous.
+// See `modules/sdk/contracts/net/datagram.rs`.
+
 // ============================================================================
 // Module State
 // ============================================================================
@@ -270,42 +274,6 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len:
     (sys.channel_write)(s.net_out_chan, scratch, total);
 }
 
-/// Send a MSG_DATA frame for a bound UDP conn, prefixed with source addressing:
-/// [msg_type:1][len:2 LE][conn_id:1][src_ip:4 LE][src_port:2 LE][data...]
-#[inline(always)]
-unsafe fn net_send_udp_data(
-    s: &mut IpState,
-    conn_id: u8,
-    src_ip: u32,
-    src_port: u16,
-    data: *const u8,
-    data_len: usize,
-) {
-    if s.net_out_chan < 0 || data_len == 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    let payload_len = 1 + 4 + 2 + data_len; // conn_id + ip + port + data
-    use core::ptr::write_volatile as wv;
-    wv(scratch, NET_MSG_DATA);
-    let pl = (payload_len as u16).to_le_bytes();
-    wv(scratch.add(1), pl[0]);
-    wv(scratch.add(2), pl[1]);
-    wv(scratch.add(3), conn_id);
-    let ip_bytes = src_ip.to_le_bytes();
-    wv(scratch.add(4), ip_bytes[0]);
-    wv(scratch.add(5), ip_bytes[1]);
-    wv(scratch.add(6), ip_bytes[2]);
-    wv(scratch.add(7), ip_bytes[3]);
-    let port_bytes = src_port.to_le_bytes();
-    wv(scratch.add(8), port_bytes[0]);
-    wv(scratch.add(9), port_bytes[1]);
-    core::ptr::copy_nonoverlapping(data, scratch.add(10), data_len);
-    let total = NET_FRAME_HDR + payload_len;
-    (sys.channel_write)(s.net_out_chan, scratch, total);
-}
-
 /// Helper: write a short net-proto frame (MSG_ACCEPTED/CLOSED/BOUND/CONNECTED) to net_out.
 /// All stores use write_volatile to prevent LLVM from eliding them in PIC on aarch64.
 #[inline(always)]
@@ -402,6 +370,95 @@ unsafe fn net_send_ack(s: &mut IpState, conn_id: u8, acked_seq: u32) {
     core::ptr::write_volatile(scratch.add(6), b[2]);
     core::ptr::write_volatile(scratch.add(7), b[3]);
     (sys.channel_write)(s.net_out_chan, scratch, 8);
+}
+
+// ─── datagram emitters ──────────────────────────────────────────
+//
+// See modules/sdk/contracts/net/datagram.rs for the wire shape. All
+// helpers write into `s.net_scratch` and emit on `s.net_out_chan`. IPv4
+// addresses are wire-order big-endian; ports are little-endian (matching
+// the contract spec).
+
+/// MSG_DG_BOUND payload: `[ep_id:1][local_port:2 LE]`.
+#[inline(always)]
+unsafe fn dg_send_bound(s: &mut IpState, ep_id: u8, local_port: u16) {
+    if s.net_out_chan < 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    use core::ptr::write_volatile as wv;
+    wv(scratch, DG_MSG_BOUND);
+    wv(scratch.add(1), 3u8);
+    wv(scratch.add(2), 0u8);
+    wv(scratch.add(3), ep_id);
+    let pb = local_port.to_le_bytes();
+    wv(scratch.add(4), pb[0]);
+    wv(scratch.add(5), pb[1]);
+    (sys.channel_write)(s.net_out_chan, scratch, 6);
+}
+
+/// MSG_DG_RX_FROM (IPv4) payload:
+/// `[ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][data...]`.
+#[inline(always)]
+unsafe fn dg_send_rx_from_v4(
+    s: &mut IpState,
+    ep_id: u8,
+    src_ip: u32,
+    src_port: u16,
+    data: *const u8,
+    data_len: usize,
+) {
+    if s.net_out_chan < 0 || data_len == 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    let payload_len = 1 + 1 + 4 + 2 + data_len; // ep_id + af + addr + port + data
+    let max_copy = s.net_scratch.len() - NET_FRAME_HDR;
+    if payload_len > max_copy { return; }
+    use core::ptr::write_volatile as wv;
+    wv(scratch, DG_MSG_RX_FROM);
+    let pl = (payload_len as u16).to_le_bytes();
+    wv(scratch.add(1), pl[0]);
+    wv(scratch.add(2), pl[1]);
+    wv(scratch.add(3), ep_id);
+    wv(scratch.add(4), DG_AF_INET);
+    let ip_bytes = src_ip.to_be_bytes();
+    wv(scratch.add(5), ip_bytes[0]);
+    wv(scratch.add(6), ip_bytes[1]);
+    wv(scratch.add(7), ip_bytes[2]);
+    wv(scratch.add(8), ip_bytes[3]);
+    let port_bytes = src_port.to_le_bytes();
+    wv(scratch.add(9), port_bytes[0]);
+    wv(scratch.add(10), port_bytes[1]);
+    core::ptr::copy_nonoverlapping(data, scratch.add(11), data_len);
+    (sys.channel_write)(s.net_out_chan, scratch, NET_FRAME_HDR + payload_len);
+}
+
+/// MSG_DG_CLOSED payload: `[ep_id:1]`.
+#[inline(always)]
+unsafe fn dg_send_closed(s: &mut IpState, ep_id: u8) {
+    if s.net_out_chan < 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    use core::ptr::write_volatile as wv;
+    wv(scratch, DG_MSG_CLOSED);
+    wv(scratch.add(1), 1u8);
+    wv(scratch.add(2), 0u8);
+    wv(scratch.add(3), ep_id);
+    (sys.channel_write)(s.net_out_chan, scratch, 4);
+}
+
+/// MSG_DG_ERROR payload: `[ep_id:1][errno:i8]`.
+#[inline(always)]
+unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
+    if s.net_out_chan < 0 { return; }
+    let sys = &*s.syscalls;
+    let scratch = s.net_scratch.as_mut_ptr();
+    use core::ptr::write_volatile as wv;
+    wv(scratch, DG_MSG_ERROR);
+    wv(scratch.add(1), 2u8);
+    wv(scratch.add(2), 0u8);
+    wv(scratch.add(3), ep_id);
+    wv(scratch.add(4), errno as u8);
+    (sys.channel_write)(s.net_out_chan, scratch, 5);
 }
 
 /// Recompute the advertised receive window from consumer-channel backpressure.
@@ -902,29 +959,23 @@ unsafe fn process_udp_packet(
         return;
     }
 
-    // Deliver UDP data to matching conn slot.
-    // Listen-state (bound) conns get framed addressing: [src_ip:4 LE][src_port:2 LE][data]
-    // Established (connected) conns get raw data only.
+    // Deliver UDP data to the matching datagram endpoint. All UDP
+    // consumers now speak datagram (see
+    // modules/sdk/contracts/net/datagram.rs) and receive source
+    // addressing via MSG_DG_RX_FROM.
     let mut i = 0;
     while i < tcp::MAX_TCP_CONNS {
         let conn = &*s.tcp_conns.as_ptr().add(i);
-        if conn.local_port == udp_hdr.dst_port {
-            if conn.state == tcp::TcpState::Listen {
-                // Bound UDP — prefix with source addressing so consumer can reply
-                let payload = data.add(udp_hdr.payload_offset);
-                let addr_len = 6; // 4 bytes IP + 2 bytes port
-                let total = addr_len + udp_hdr.payload_len;
-                net_send_udp_data(s, i as u8, ip_hdr.src_ip, udp_hdr.src_port, payload, udp_hdr.payload_len);
-                return;
-            } else if conn.state == tcp::TcpState::Established
-                && conn.remote_ip == ip_hdr.src_ip
-                && conn.remote_port == udp_hdr.src_port
-            {
-                // Connected UDP — raw data only
-                let payload = data.add(udp_hdr.payload_offset);
-                net_send_data(s, i as u8, payload, udp_hdr.payload_len);
-                return;
-            }
+        if conn.is_datagram
+            && conn.state == tcp::TcpState::Listen
+            && conn.local_port == udp_hdr.dst_port
+        {
+            let payload = data.add(udp_hdr.payload_offset);
+            dg_send_rx_from_v4(
+                s, i as u8, ip_hdr.src_ip, udp_hdr.src_port,
+                payload, udp_hdr.payload_len,
+            );
+            return;
         }
         i += 1;
     }
@@ -954,15 +1005,36 @@ unsafe fn process_tcp_segment(
         Some(i) => i,
         None => {
             // No established connection — accept SYN on a listening socket.
-            // Only accept once the interface is configured; otherwise we
-            // consume a listener slot but cannot send SYN-ACK.
+            // Allocate a fresh slot for the accepted connection (BSD-accept
+            // semantics): the listener stays in Listen state so it can
+            // serve the next SYN. Only accept once the interface is
+            // configured; otherwise we'd consume a slot but couldn't send
+            // SYN-ACK.
             if (tcp_hdr.flags & tcp::SYN) != 0 && (tcp_hdr.flags & tcp::ACK) == 0
                && s.mac_valid && s.local_ip != 0 {
                 if let Some(li) = tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port) {
+                    let mut accept_idx: i32 = -1;
+                    let mut fi = 0;
+                    while fi < tcp::MAX_TCP_CONNS {
+                        let c = &*s.tcp_conns.as_ptr().add(fi);
+                        if c.state == tcp::TcpState::Closed {
+                            accept_idx = fi as i32;
+                            break;
+                        }
+                        fi += 1;
+                    }
+                    if accept_idx < 0 {
+                        // No free slot — drop the SYN silently and let
+                        // the client retransmit.
+                        return;
+                    }
                     log_info(s, b"[ip] tcp syn received");
-                    // Accept incoming connection on the listening socket
+                    let idx = accept_idx as usize;
                     let iss = s.step_count.wrapping_mul(2654435761);
-                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(li);
+                    let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
+                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(idx);
+                    *conn = tcp::TcpConn::new();
+                    conn.local_port = listener_port;
                     conn.remote_ip = ip_hdr.src_ip;
                     conn.remote_port = tcp_hdr.src_port;
                     conn.iss = iss;
@@ -976,7 +1048,7 @@ unsafe fn process_tcp_segment(
                     conn.rto = tcp::RTO_INITIAL;
                     conn.retransmit_timer = 0;
                     conn.state = tcp::TcpState::SynReceived;
-                    send_tcp_control(s, li, tcp::SYN | tcp::ACK);
+                    send_tcp_control(s, idx, tcp::SYN | tcp::ACK);
                     return;
                 }
             }
@@ -998,7 +1070,7 @@ unsafe fn process_tcp_segment(
     const ACTION_SET_CLOSING: u8 = 5;
     const ACTION_RX_DATA: u8 = 6;
     const ACTION_COMPLETE_ACCEPT: u8 = 7;
-    const ACTION_RST_TO_LISTEN: u8 = 8;
+    const ACTION_FREE_SLOT: u8 = 8;
     const ACTION_RETRANSMIT_SYNACK: u8 = 9;
     const ACTION_RX_DATA_FIN: u8 = 10;
 
@@ -1121,11 +1193,9 @@ unsafe fn process_tcp_segment(
             }
             tcp::TcpState::SynReceived => {
                 if (tcp_hdr.flags & tcp::RST) != 0 {
-                    // Connection refused — reset to listen
-                    conn.remote_ip = 0;
-                    conn.remote_port = 0;
-                    conn.state = tcp::TcpState::Listen;
-                    action = ACTION_RST_TO_LISTEN;
+                    // Connection refused — free the slot. The listener
+                    // is on a separate slot and stays put.
+                    action = ACTION_FREE_SLOT;
                 } else if (tcp_hdr.flags & tcp::SYN) != 0 && (tcp_hdr.flags & tcp::ACK) == 0 {
                     // Duplicate SYN — retransmit SYN-ACK
                     conn.retransmit_timer = 0;
@@ -1223,8 +1293,12 @@ unsafe fn process_tcp_segment(
                 send_tcp_control(s, conn_idx, tcp::ACK);
             }
         }
-        ACTION_RST_TO_LISTEN => {
-            // Connection refused during handshake — reset to listen, no notification needed
+        ACTION_FREE_SLOT => {
+            // Reset this slot back to Closed. Used when an accepted
+            // conn never completes the handshake (RST in SynReceived
+            // or 15s timeout).
+            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+            *conn = tcp::TcpConn::new();
         }
         ACTION_RETRANSMIT_SYNACK => {
             send_tcp_control(s, conn_idx, tcp::SYN | tcp::ACK);
@@ -1770,30 +1844,34 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 }
             }
             NET_CMD_CONNECT => {
-                // Payload: [sock_type: u8] [ip: u32 LE] [port: u16 LE]
+                // Stream Surface v1: open a TCP outbound connection.
+                // Payload: [sock_type: u8 = SOCK_TYPE_STREAM] [ip: u32 LE] [port: u16 LE].
+                // Only TCP is accepted here; UDP uses the `datagram`
+                // surface (`CMD_DG_BIND` + `CMD_DG_SEND_TO`).
                 if plen >= 7 {
                     let bp = buf.as_ptr();
                     let sock_type = *bp;
-                    let ip = u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
-                    let port = u16::from_le_bytes([*bp.add(5), *bp.add(6)]);
-
-                    // Find a free conn slot
-                    let mut conn_id: i32 = -1;
-                    let mut ci = 0;
-                    while ci < tcp::MAX_TCP_CONNS {
-                        let conn = &*s.tcp_conns.as_ptr().add(ci);
-                        if conn.state == tcp::TcpState::Closed {
-                            conn_id = ci as i32;
-                            break;
-                        }
-                        ci += 1;
-                    }
-
-                    if conn_id < 0 {
-                        net_send_error(s, 0, -12); // ENOMEM
+                    if sock_type != SOCK_TYPE_STREAM {
+                        net_send_error(s, 0, -22); // EINVAL
                     } else {
-                        let ci = conn_id as usize;
-                        if sock_type == SOCK_TYPE_STREAM {
+                        let ip = u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
+                        let port = u16::from_le_bytes([*bp.add(5), *bp.add(6)]);
+
+                        let mut conn_id: i32 = -1;
+                        let mut ci = 0;
+                        while ci < tcp::MAX_TCP_CONNS {
+                            let conn = &*s.tcp_conns.as_ptr().add(ci);
+                            if conn.state == tcp::TcpState::Closed {
+                                conn_id = ci as i32;
+                                break;
+                            }
+                            ci += 1;
+                        }
+
+                        if conn_id < 0 {
+                            net_send_error(s, 0, -12); // ENOMEM
+                        } else {
+                            let ci = conn_id as usize;
                             let local_port = next_port(s);
                             let iss = s.step_count.wrapping_mul(2654435761);
 
@@ -1809,20 +1887,13 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             conn.retransmit_timer = 0;
 
                             send_tcp_control(s, ci, tcp::SYN);
-                        } else {
-                            // UDP: immediately connected
-                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
-                            conn.state = tcp::TcpState::Established;
-                            conn.remote_ip = ip;
-                            conn.remote_port = port;
-                            conn.local_port = next_port(s);
-                            net_send_connected(s, ci as u8);
                         }
                     }
                 }
             }
             NET_CMD_SEND => {
-                // Payload: [conn_id: u8] [data...]
+                // Stream Surface v1: send TCP payload.
+                // Payload: [conn_id: u8] [data...].
                 if plen >= 2 {
                     let conn_id = *buf.as_ptr() as usize;
                     let data_ptr = buf.as_ptr().add(1);
@@ -1830,36 +1901,18 @@ unsafe fn service_net_channels(s: &mut IpState) {
 
                     if conn_id < tcp::MAX_TCP_CONNS {
                         let conn = &*s.tcp_conns.as_ptr().add(conn_id);
-                        if conn.state == tcp::TcpState::Established {
-                            if conn.rcv_wnd != 0 {
-                                // Effective window is min(peer snd_wnd, cwnd).
-                                let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
-                                let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
-                                let can_send = eff_wnd.saturating_sub(in_flight).min(1400);
-                                let send_len = data_len.min(can_send);
-                                if send_len > 0 {
-                                    let seq = conn.snd_nxt;
-                                    let tick = s.step_count as u16;
-                                    send_tcp_data(s, conn_id, data_ptr, send_len);
-                                    let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
-                                    tcp::rtt_arm(conn2, seq, tick);
-                                }
-                            } else {
-                                // Connected UDP — remote addr from conn slot
-                                send_udp_data(
-                                    s, conn.remote_ip, conn.remote_port,
-                                    conn.local_port, data_ptr, data_len,
-                                );
-                            }
-                        } else if conn.state == tcp::TcpState::Listen {
-                            // Bound UDP — payload: [dst_ip:4 LE][dst_port:2 LE][data...]
-                            if data_len >= 7 {
-                                let dp = data_ptr;
-                                let dst_ip = u32::from_le_bytes([*dp, *dp.add(1), *dp.add(2), *dp.add(3)]);
-                                let dst_port = u16::from_le_bytes([*dp.add(4), *dp.add(5)]);
-                                let udp_data = dp.add(6);
-                                let udp_len = data_len - 6;
-                                send_udp_data(s, dst_ip, dst_port, conn.local_port, udp_data, udp_len);
+                        if conn.state == tcp::TcpState::Established && conn.rcv_wnd != 0 {
+                            // Effective window is min(peer snd_wnd, cwnd).
+                            let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
+                            let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+                            let can_send = eff_wnd.saturating_sub(in_flight).min(1400);
+                            let send_len = data_len.min(can_send);
+                            if send_len > 0 {
+                                let seq = conn.snd_nxt;
+                                let tick = s.step_count as u16;
+                                send_tcp_data(s, conn_id, data_ptr, send_len);
+                                let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+                                tcp::rtt_arm(conn2, seq, tick);
                             }
                         }
                     }
@@ -1898,6 +1951,78 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     }
                 }
             }
+            DG_CMD_BIND => {
+                // datagram bind. Payload: [port: u16 LE] [flags: u8].
+                // Port 0 requests ephemeral allocation. Provider responds
+                // with MSG_DG_BOUND [ep_id, local_port].
+                if plen >= 2 {
+                    let req_port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
+                    let port = if req_port == 0 { next_port(s) } else { req_port };
+                    let mut ep_id: i32 = -1;
+                    let mut ci = 0;
+                    while ci < tcp::MAX_TCP_CONNS {
+                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+                        if conn.state == tcp::TcpState::Closed {
+                            *conn = tcp::TcpConn::new();
+                            conn.state = tcp::TcpState::Listen;
+                            conn.local_port = port;
+                            conn.is_datagram = true;
+                            ep_id = ci as i32;
+                            break;
+                        }
+                        ci += 1;
+                    }
+                    if ep_id >= 0 {
+                        log_info(s, b"[ip] dg bind");
+                        dg_send_bound(s, ep_id as u8, port);
+                    } else {
+                        log_info(s, b"[ip] dg bind: no free conn");
+                        dg_send_error(s, 0, -12); // ENOMEM
+                    }
+                }
+            }
+            DG_CMD_SEND_TO => {
+                // datagram send. IPv4 payload:
+                //   [ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]
+                if plen >= 8 {
+                    let bp = buf.as_ptr();
+                    let ep_id = *bp as usize;
+                    let af = *bp.add(1);
+                    if af == DG_AF_INET && ep_id < tcp::MAX_TCP_CONNS {
+                        let conn = &*s.tcp_conns.as_ptr().add(ep_id);
+                        if conn.is_datagram && conn.state == tcp::TcpState::Listen {
+                            let dst_ip = u32::from_be_bytes(
+                                [*bp.add(2), *bp.add(3), *bp.add(4), *bp.add(5)],
+                            );
+                            let dst_port = u16::from_le_bytes([*bp.add(6), *bp.add(7)]);
+                            let udp_data = bp.add(8);
+                            let udp_len = plen - 8;
+                            send_udp_data(
+                                s, dst_ip, dst_port, conn.local_port,
+                                udp_data, udp_len,
+                            );
+                        } else {
+                            dg_send_error(s, ep_id as u8, -22); // EINVAL
+                        }
+                    } else {
+                        dg_send_error(s, ep_id as u8, -97); // EAFNOSUPPORT
+                    }
+                }
+            }
+            DG_CMD_CLOSE => {
+                // datagram close. Payload: [ep_id: u8].
+                if plen >= 1 {
+                    let ep_id = *buf.as_ptr() as usize;
+                    if ep_id < tcp::MAX_TCP_CONNS {
+                        let conn = &*s.tcp_conns.as_ptr().add(ep_id);
+                        if conn.is_datagram {
+                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ep_id);
+                            *conn = tcp::TcpConn::new();
+                            dg_send_closed(s, ep_id as u8);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         count += 1;
@@ -1928,11 +2053,9 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                 if conn.retransmit_timer % 60 == 0 && conn.retransmit_timer < 300 {
                     send_tcp_control(s, i, tcp::SYN | tcp::ACK);
                 }
-                // Timeout after ~15 seconds — reset to Listen
+                // Timeout after ~15 seconds — free the slot.
                 if conn.retransmit_timer >= 300 {
-                    conn.remote_ip = 0;
-                    conn.remote_port = 0;
-                    conn.state = tcp::TcpState::Listen;
+                    *conn = tcp::TcpConn::new();
                 }
             }
             tcp::TcpState::TimeWait => {

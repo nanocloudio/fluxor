@@ -68,12 +68,22 @@ impl ReorderSlot {
     }
 }
 
-/// TCP connection block (one per socket)
+/// TCP connection block (one per socket).
+///
+/// Also hosts UDP endpoints (`is_datagram = true`, state = Listen for a
+/// bound endpoint). UDP delivery on these slots uses the `datagram`
+/// surface (`MSG_DG_RX_FROM` / `MSG_DG_CLOSED`).
 pub struct TcpConn {
     pub state: TcpState,
     pub local_port: u16,
     pub remote_port: u16,
     pub remote_ip: u32,
+
+    /// When set, this slot is a datagram endpoint. UDP delivery to it
+    /// uses `MSG_DG_RX_FROM` framing (opcodes 0x40..0x43). Always false
+    /// for TCP conns.
+    pub is_datagram: bool,
+    pub _dg_pad: [u8; 3],
 
     // Send sequence variables
     pub snd_una: u32,   // oldest unacknowledged
@@ -124,6 +134,8 @@ impl TcpConn {
             local_port: 0,
             remote_port: 0,
             remote_ip: 0,
+            is_datagram: false,
+            _dg_pad: [0; 3],
             snd_una: 0,
             snd_nxt: 0,
             snd_wnd: 0,
@@ -253,6 +265,10 @@ pub unsafe fn find_conn(
 }
 
 /// Find a listening TCP connection matching the destination port.
+///
+/// Datagram endpoints share the same conn array and also sit in
+/// `Listen` state, so the match excludes `is_datagram` slots — a TCP
+/// SYN must never land on a UDP-bound endpoint.
 pub unsafe fn find_listener(
     conns: &[TcpConn; MAX_TCP_CONNS],
     local_port: u16,
@@ -260,7 +276,10 @@ pub unsafe fn find_listener(
     let mut i = 0;
     while i < MAX_TCP_CONNS {
         let c = &*conns.as_ptr().add(i);
-        if c.state == TcpState::Listen && c.local_port == local_port {
+        if c.state == TcpState::Listen
+            && !c.is_datagram
+            && c.local_port == local_port
+        {
             return Some(i);
         }
         i += 1;

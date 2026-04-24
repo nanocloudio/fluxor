@@ -17,7 +17,6 @@ const MAX_RETRANSMIT: u8 = 7;
 enum SipPhase {
     Init = 0,
     BindWait = 1,
-    ConnectWait = 2,
     Ready = 3,
     Inviting = 4,
     WaitAck = 5,
@@ -34,7 +33,6 @@ unsafe fn step_sip(s: &mut VoipState) {
     match s.sip_state {
         SipPhase::Init => sip_step_init(s),
         SipPhase::BindWait => sip_step_bind_wait(s),
-        SipPhase::ConnectWait => sip_step_connect_wait(s),
         SipPhase::Ready => sip_step_ready(s),
         SipPhase::Inviting => sip_step_inviting(s),
         SipPhase::WaitAck => sip_step_wait_ack(s),
@@ -45,7 +43,7 @@ unsafe fn step_sip(s: &mut VoipState) {
 }
 
 // ============================================================================
-// Init — send CMD_BIND via SIP net channel
+// Init — send CMD_DG_BIND via SIP net channel
 // ============================================================================
 
 unsafe fn sip_step_init(s: &mut VoipState) {
@@ -57,11 +55,12 @@ unsafe fn sip_step_init(s: &mut VoipState) {
         return;
     }
 
-    // CMD_BIND payload: [port: u16 LE]
+    // CMD_DG_BIND payload: [port: u16 LE] [flags: u8 = 0]
     let port_le = s.local_sip_port.to_le_bytes();
+    let payload = [port_le[0], port_le[1], 0u8];
     let wrote = net_write_frame(
-        sys, s.sip_net_out, NET_CMD_BIND,
-        port_le.as_ptr(), 2,
+        sys, s.sip_net_out, DG_CMD_BIND,
+        payload.as_ptr(), 3,
         s.sip_net_buf.as_mut_ptr(), NET_BUF_SIZE,
     );
     if wrote == 0 {
@@ -82,65 +81,22 @@ unsafe fn sip_step_bind_wait(s: &mut VoipState) {
     }
 
     let buf = s.sip_net_buf.as_mut_ptr();
-    let (msg_type, _payload_len) = net_read_frame(sys, s.sip_net_in, buf, NET_BUF_SIZE);
+    let (msg_type, payload_len) = net_read_frame(sys, s.sip_net_in, buf, NET_BUF_SIZE);
 
-    if msg_type == NET_MSG_ERROR {
+    if msg_type == DG_MSG_ERROR {
         dev_log(sys, 1, b"[voip] sip bind fail".as_ptr(), 20);
         s.sip_state = SipPhase::Error;
         return;
     }
-    if msg_type != NET_MSG_BOUND {
+    if msg_type != DG_MSG_BOUND || payload_len < 1 {
         return;
     }
 
-    // Bound — now send CMD_CONNECT: [sock_type: u8][ip: u32 LE][port: u16 LE]
-    let ip_le = s.peer_ip.to_le_bytes();
-    let port_le = s.peer_sip_port.to_le_bytes();
-    let payload = s.sip_net_buf.as_mut_ptr();
-    *payload = SOCK_TYPE_DGRAM;
-    *payload.add(1) = ip_le[0];
-    *payload.add(2) = ip_le[1];
-    *payload.add(3) = ip_le[2];
-    *payload.add(4) = ip_le[3];
-    *payload.add(5) = port_le[0];
-    *payload.add(6) = port_le[1];
-
-    let scratch = s.sip_tx_buf.as_mut_ptr(); // Reuse sip_tx_buf as scratch
-    let wrote = net_write_frame(
-        sys, s.sip_net_out, NET_CMD_CONNECT,
-        payload, 7,
-        scratch, SIP_TX_BUF_SIZE,
-    );
-    if wrote == 0 {
-        return;
-    }
-
-    s.sip_state = SipPhase::ConnectWait;
-}
-
-unsafe fn sip_step_connect_wait(s: &mut VoipState) {
-    let sys = &*s.syscalls;
-
-    if s.sip_net_in < 0 { return; }
-
-    let poll = (sys.channel_poll)(s.sip_net_in, POLL_IN);
-    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-        return;
-    }
-
-    let buf = s.sip_net_buf.as_mut_ptr();
-    let (msg_type, payload_len) = net_read_frame(sys, s.sip_net_in, buf, NET_BUF_SIZE);
-
-    if msg_type == NET_MSG_ERROR {
-        dev_log(sys, 1, b"[voip] sip conn err".as_ptr(), 19);
-        s.sip_state = SipPhase::Error;
-        return;
-    }
-    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
-        s.sip_conn_id = *buf.add(NET_FRAME_HDR);
-        dev_log(sys, 3, b"[voip] sip listening".as_ptr(), 20);
-        s.sip_state = SipPhase::Ready;
-    }
+    // MSG_DG_BOUND payload: [ep_id:1][local_port:2 LE]. datagram has no
+    // connect step — peer addressing is attached to each CMD_DG_SEND_TO.
+    s.sip_ep_id = *buf.add(NET_FRAME_HDR);
+    dev_log(sys, 3, b"[voip] sip listening".as_ptr(), 20);
+    s.sip_state = SipPhase::Ready;
 }
 
 // ============================================================================
@@ -792,19 +748,31 @@ unsafe fn sip_flush_tx(s: &mut VoipState) {
         return;
     }
     let sys = &*s.syscalls;
-    if s.sip_net_out < 0 { return; }
+    if s.sip_net_out < 0 || s.sip_ep_id == 0xFF { return; }
 
-    // Build CMD_SEND frame: [CMD_SEND][len_lo][len_hi][conn_id][sip_data...]
+    // Build CMD_DG_SEND_TO frame:
+    //   [0x21][len:2 LE][ep_id:1][af:1=4][peer_ip:4 BE][peer_port:2 LE][sip_data...]
     let data_len = s.sip_tx_len as usize;
     let scratch = s.sip_net_buf.as_mut_ptr();
-    let frame_payload_len = 1 + data_len; // conn_id + SIP data
+    let frame_payload_len = DG_V4_PREFIX + data_len;
     if frame_payload_len + NET_FRAME_HDR <= NET_BUF_SIZE {
-        *scratch = NET_CMD_SEND;
+        *scratch = DG_CMD_SEND_TO;
         *scratch.add(1) = (frame_payload_len & 0xFF) as u8;
         *scratch.add(2) = ((frame_payload_len >> 8) & 0xFF) as u8;
-        *scratch.add(NET_FRAME_HDR) = s.sip_conn_id;
+        *scratch.add(NET_FRAME_HDR) = s.sip_ep_id;
+        *scratch.add(NET_FRAME_HDR + 1) = DG_AF_INET;
+        let ip_bytes = s.peer_ip.to_be_bytes();
+        *scratch.add(NET_FRAME_HDR + 2) = ip_bytes[0];
+        *scratch.add(NET_FRAME_HDR + 3) = ip_bytes[1];
+        *scratch.add(NET_FRAME_HDR + 4) = ip_bytes[2];
+        *scratch.add(NET_FRAME_HDR + 5) = ip_bytes[3];
+        let port_bytes = s.peer_sip_port.to_le_bytes();
+        *scratch.add(NET_FRAME_HDR + 6) = port_bytes[0];
+        *scratch.add(NET_FRAME_HDR + 7) = port_bytes[1];
         core::ptr::copy_nonoverlapping(
-            s.sip_tx_buf.as_ptr(), scratch.add(NET_FRAME_HDR + 1), data_len,
+            s.sip_tx_buf.as_ptr(),
+            scratch.add(NET_FRAME_HDR + DG_V4_PREFIX),
+            data_len,
         );
         let frame_total = NET_FRAME_HDR + frame_payload_len;
         let sent = (sys.channel_write)(s.sip_net_out, scratch, frame_total);
@@ -828,13 +796,17 @@ unsafe fn sip_try_receive(s: &mut VoipState) {
     let buf = s.sip_net_buf.as_mut_ptr();
     let (msg_type, payload_len) = net_read_frame(sys, s.sip_net_in, buf, NET_BUF_SIZE);
 
-    if msg_type == NET_MSG_DATA && payload_len > 1 {
-        // MSG_DATA payload: [conn_id: u8][data...] — copy data to sip_rx_buf
-        let data_len = payload_len - 1;
+    // MSG_DG_RX_FROM payload:
+    //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][sip_data...]
+    if msg_type == DG_MSG_RX_FROM
+        && payload_len > DG_V4_PREFIX
+        && *buf.add(NET_FRAME_HDR + 1) == DG_AF_INET
+    {
+        let data_len = payload_len - DG_V4_PREFIX;
         let copy_len = if data_len > SIP_RX_BUF_SIZE { SIP_RX_BUF_SIZE } else { data_len };
         __aeabi_memcpy(
             s.sip_rx_buf.as_mut_ptr(),
-            buf.add(NET_FRAME_HDR + 1),
+            buf.add(NET_FRAME_HDR + DG_V4_PREFIX),
             copy_len,
         );
         s.sip_rx_have = copy_len as u16;

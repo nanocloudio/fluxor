@@ -50,6 +50,10 @@ pub mod contracts {
     }
     pub mod net {
         pub mod net_proto { include!("contracts/net/net_proto.rs"); }
+        pub mod datagram { include!("contracts/net/datagram.rs"); }
+        pub mod packet { include!("contracts/net/packet.rs"); }
+        pub mod mux { include!("contracts/net/mux.rs"); }
+        pub mod session_ctrl { include!("contracts/net/session_ctrl.rs"); }
     }
     pub mod storage {
         pub mod graph_slot { include!("contracts/storage/graph_slot.rs"); }

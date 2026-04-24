@@ -7,6 +7,16 @@ stack, TLS, DNS, HTTP, MQTT, and every other protocol live in modules and
 talk to each other through the same channel mechanism that carries audio
 samples or display pixels.
 
+This document describes the current wire format and module layering.
+`architecture/protocol_surfaces.md` defines the forward-looking protocol
+substrate — the four protocol surfaces (stream, datagram, packet,
+multiplexed session), the five session continuity classes, and the
+anchor / worker / directory roles that sit above them. The `net_proto`
+TLV format described below is **Stream Surface v1** in that taxonomy and
+remains unchanged; datagram and packet surfaces will arrive as separate
+content contracts in later phases rather than through evolution of this
+one.
+
 ## Design Principles
 
 1. **Channels are the only IPC.** Every byte that crosses a module boundary
@@ -87,10 +97,25 @@ Every box in this diagram is a PIC module connected by `channel_write`/
 `channel_read`. The kernel sits below this stack, providing the channels,
 the bus primitives the drivers use to touch hardware, and nothing else.
 
-## The net_proto Channel Protocol
+## The net_proto Channel Protocol (Stream Surface v1)
 
 `net_proto` is the framing convention used between the IP module and its
-consumers. It is a TLV format:
+stream consumers. In the protocol-surface taxonomy
+(`architecture/protocol_surfaces.md`), `net_proto` is **Stream Surface v1**:
+its upstream commands and downstream events match the stream surface
+vocabulary directly, and stream consumers (HTTP, MQTT, TLS) use it
+without modification.
+
+Stream only. Datagram traffic (DNS, RTP, VoIP, log_net) uses the
+separate `datagram` contract
+(see `modules/sdk/contracts/net/datagram.rs`), which carries source
+addressing on every RX and destination addressing on every TX. Packet-
+preserving flows (QUIC, DTLS/SRTP) use `packet.rs`. All three contracts
+share the same 3-byte TLV header and disjoint opcode ranges so a single
+`net_in` / `net_out` channel pair can carry multiple contracts without
+ambiguity.
+
+The TLV format is:
 
 ```
 [msg_type: u8] [len: u16 LE] [payload: len bytes]
@@ -583,8 +608,13 @@ on which channel pair the connection was opened on.
 
 ## Related Documentation
 
+- `architecture/protocol_surfaces.md` — four protocol surfaces, five
+  continuity classes, anchor/worker/directory roles
 - `architecture/pipeline.md` — channel mechanics, mailbox mode, scheduler
-- `architecture/capability_surface.md` — hardware section, driver auto-wiring
+- `architecture/capability_surface.md` — hardware section, driver
+  auto-wiring, `transport.*` and `session.*` capability names
 - `architecture/events.md` — IRQ binding for interrupt-driven drivers
 - `architecture/abi_layers.md` — HAL contracts drivers use to touch hardware
-- `architecture/security.md` — conn_guard, retx buffering, KEY_VAULT, trust model
+- `architecture/security.md` — conn_guard, retx buffering, KEY_VAULT,
+  trust model
+- `.context/rfc_protocols.md` — RFC underlying `protocol_surfaces.md`

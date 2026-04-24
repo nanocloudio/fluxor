@@ -33,19 +33,8 @@ include!("../../sdk/params.rs");
 // Constants
 // ============================================================================
 
-// Net protocol frame types (downstream from IP)
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-
-// Net protocol frame types (upstream to IP)
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+// datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
+// modules/sdk/runtime.rs (shared across consumers).
 
 /// Net scratch buffer — enough for RTP header + payload + frame header
 const NET_BUF_SIZE: usize = 512;
@@ -81,7 +70,6 @@ const CTRL_MSG_SIZE: usize = 8;
 enum RtpPhase {
     Init = 0,
     BindWait = 1,
-    ConnectWait = 2,
     Running = 3,
     Error = 4,
     Idle = 5,
@@ -99,7 +87,9 @@ struct RtpState {
     ctrl_chan: i32,
     net_in_chan: i32,
     net_out_chan: i32,
-    conn_id: u8,
+    /// datagram endpoint id assigned by IP module on CMD_DG_BIND.
+    /// `0xFF` means unallocated.
+    ep_id: u8,
     phase: RtpPhase,
     ptime: u8,
     payload_type: u8,
@@ -140,7 +130,7 @@ impl RtpState {
         self.ctrl_chan = -1;
         self.net_in_chan = -1;
         self.net_out_chan = -1;
-        self.conn_id = 0;
+        self.ep_id = 0xFF;
         self.phase = RtpPhase::Init;
         self.ptime = 20;
         self.payload_type = 0; // PCMU
@@ -298,7 +288,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             RtpPhase::Idle => step_idle(s),
             RtpPhase::Init => step_init(s),
             RtpPhase::BindWait => step_bind_wait(s),
-            RtpPhase::ConnectWait => step_connect_wait(s),
             RtpPhase::Running => step_running(s),
             RtpPhase::Error => -1,
             _ => -1,
@@ -346,7 +335,7 @@ unsafe fn step_idle(s: &mut RtpState) -> i32 {
 }
 
 // ============================================================================
-// State: Init — send CMD_BIND via net channel
+// State: Init — send CMD_DG_BIND via net channel
 // ============================================================================
 
 unsafe fn step_init(s: &mut RtpState) -> i32 {
@@ -358,11 +347,12 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
         return -1;
     }
 
-    // CMD_BIND payload: [port: u16 LE]
+    // CMD_DG_BIND payload: [port: u16 LE] [flags: u8 = 0]
     let port_le = s.local_port.to_le_bytes();
+    let payload = [port_le[0], port_le[1], 0u8];
     let wrote = net_write_frame(
-        sys, s.net_out_chan, NET_CMD_BIND,
-        port_le.as_ptr(), 2,
+        sys, s.net_out_chan, DG_CMD_BIND,
+        payload.as_ptr(), 3,
         s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
     );
     if wrote == 0 {
@@ -370,11 +360,14 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
     }
 
     s.phase = RtpPhase::BindWait;
-    2 // Burst — try connect immediately
+    2 // Burst — handle MSG_DG_BOUND immediately
 }
 
 // ============================================================================
-// State: BindWait — wait for MSG_BOUND, then send CMD_CONNECT
+// State: BindWait — wait for MSG_DG_BOUND, then transition to Running.
+// datagram has no "connect" step: CMD_DG_SEND_TO always carries the
+// destination explicitly, so we leave peer_ip / peer_port on the state and
+// attach them to each packet.
 // ============================================================================
 
 unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
@@ -388,73 +381,21 @@ unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
     }
 
     let buf = s.net_buf.as_mut_ptr();
-    let (msg_type, _payload_len) = net_read_frame(sys, s.net_in_chan, buf, NET_BUF_SIZE);
+    let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, buf, NET_BUF_SIZE);
 
-    if msg_type == NET_MSG_ERROR {
+    if msg_type == DG_MSG_ERROR {
         dev_log(sys, 1, b"[rtp] bind fail".as_ptr(), 15);
         s.phase = RtpPhase::Error;
         return -1;
     }
-    if msg_type != NET_MSG_BOUND {
+    if msg_type != DG_MSG_BOUND || payload_len < 1 {
         return 0;
     }
 
-    // Bound — now send CMD_CONNECT: [sock_type: u8][ip: u32 LE][port: u16 LE]
-    let ip_le = s.peer_ip.to_le_bytes();
-    let port_le = s.peer_port.to_le_bytes();
-    let payload = s.net_buf.as_mut_ptr();
-    *payload = SOCK_TYPE_DGRAM;
-    *payload.add(1) = ip_le[0];
-    *payload.add(2) = ip_le[1];
-    *payload.add(3) = ip_le[2];
-    *payload.add(4) = ip_le[3];
-    *payload.add(5) = port_le[0];
-    *payload.add(6) = port_le[1];
-
-    // Write frame using a separate scratch area (offset past payload)
-    let scratch = s.pkt_buf.as_mut_ptr(); // Reuse pkt_buf as scratch
-    let wrote = net_write_frame(
-        sys, s.net_out_chan, NET_CMD_CONNECT,
-        payload, 7,
-        scratch, PKT_BUF_SIZE,
-    );
-    if wrote == 0 {
-        return 0;
-    }
-
-    s.phase = RtpPhase::ConnectWait;
-    2 // Burst — poll connection immediately
-}
-
-// ============================================================================
-// State: ConnectWait — wait for MSG_CONNECTED
-// ============================================================================
-
-unsafe fn step_connect_wait(s: &mut RtpState) -> i32 {
-    let sys = &*s.syscalls;
-
-    if s.net_in_chan < 0 { return 0; }
-
-    let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
-    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-        return 0;
-    }
-
-    let buf = s.net_buf.as_mut_ptr();
-    let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, buf, NET_BUF_SIZE);
-
-    if msg_type == NET_MSG_ERROR {
-        dev_log(sys, 1, b"[rtp] conn fail".as_ptr(), 15);
-        s.phase = RtpPhase::Error;
-        return -1;
-    }
-    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
-        s.conn_id = *buf.add(NET_FRAME_HDR);
-        dev_log(sys, 3, b"[rtp] connected".as_ptr(), 15);
-        s.phase = RtpPhase::Running;
-        return 2; // Burst — start data flow immediately
-    }
-    0
+    s.ep_id = *buf.add(NET_FRAME_HDR);
+    dev_log(sys, 3, b"[rtp] bound".as_ptr(), 11);
+    s.phase = RtpPhase::Running;
+    2 // Burst — start data flow immediately
 }
 
 // ============================================================================
@@ -563,14 +504,18 @@ unsafe fn step_rx(s: &mut RtpState) {
     let buf = s.rx_buf.as_mut_ptr();
     let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, buf, RX_BUF_SIZE);
 
-    if msg_type != NET_MSG_DATA || payload_len < 2 {
+    // MSG_DG_RX_FROM payload:
+    //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][rtp_data...]
+    if msg_type != DG_MSG_RX_FROM || payload_len < DG_V4_PREFIX + RTP_HEADER_SIZE {
+        return;
+    }
+    // Verify address family is IPv4
+    if *buf.add(NET_FRAME_HDR + 1) != DG_AF_INET {
         return;
     }
 
-    // MSG_DATA payload: [conn_id: u8][data...] — skip conn_id byte
-    let pkt_len = payload_len - 1;
-    // Shift data so pkt starts at rx_buf[0] (overwrite the frame header + conn_id)
-    let data_start = NET_FRAME_HDR + 1; // skip frame hdr + conn_id
+    let pkt_len = payload_len - DG_V4_PREFIX;
+    let data_start = NET_FRAME_HDR + DG_V4_PREFIX;
     __aeabi_memmove(s.rx_buf.as_mut_ptr(), s.rx_buf.as_ptr().add(data_start), pkt_len);
 
     let pkt_len = pkt_len;
@@ -628,16 +573,16 @@ unsafe fn step_rx(s: &mut RtpState) {
 // ============================================================================
 
 unsafe fn close_connection(s: &mut RtpState) {
-    if s.net_out_chan >= 0 && s.conn_id != 0 {
+    if s.net_out_chan >= 0 && s.ep_id != 0xFF {
         let sys = &*s.syscalls;
-        let payload = [s.conn_id];
+        let payload = [s.ep_id];
         net_write_frame(
-            sys, s.net_out_chan, NET_CMD_CLOSE,
+            sys, s.net_out_chan, DG_CMD_CLOSE,
             payload.as_ptr(), 1,
             s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
         );
     }
-    s.conn_id = 0;
+    s.ep_id = 0xFF;
     // Reset TX state
     s.seq_num = 0;
     s.timestamp = 0;
@@ -692,18 +637,26 @@ unsafe fn send_rtp_packet(s: &mut RtpState) {
     // Copy payload after header
     __aeabi_memcpy(pkt.add(RTP_HEADER_SIZE), s.acc_buf.as_ptr(), payload_len);
 
-    // Send packet via CMD_SEND frame: [conn_id][rtp_data...]
+    // Send packet via CMD_DG_SEND_TO:
+    //   [0x21][len_lo][len_hi][ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][rtp_packet...]
     let total = RTP_HEADER_SIZE + payload_len;
-    // Build CMD_SEND frame manually in net_buf:
-    // [CMD_SEND][len_lo][len_hi][conn_id][rtp_packet...]
     let scratch = s.net_buf.as_mut_ptr();
-    let frame_payload_len = 1 + total; // conn_id + rtp data
-    if frame_payload_len + NET_FRAME_HDR <= NET_BUF_SIZE {
-        *scratch = NET_CMD_SEND;
+    let frame_payload_len = DG_V4_PREFIX + total;
+    if s.ep_id != 0xFF && frame_payload_len + NET_FRAME_HDR <= NET_BUF_SIZE {
+        *scratch = DG_CMD_SEND_TO;
         *scratch.add(1) = (frame_payload_len & 0xFF) as u8;
         *scratch.add(2) = ((frame_payload_len >> 8) & 0xFF) as u8;
-        *scratch.add(NET_FRAME_HDR) = s.conn_id;
-        core::ptr::copy_nonoverlapping(pkt, scratch.add(NET_FRAME_HDR + 1), total);
+        *scratch.add(NET_FRAME_HDR) = s.ep_id;
+        *scratch.add(NET_FRAME_HDR + 1) = DG_AF_INET;
+        let ip_bytes = s.peer_ip.to_be_bytes();
+        *scratch.add(NET_FRAME_HDR + 2) = ip_bytes[0];
+        *scratch.add(NET_FRAME_HDR + 3) = ip_bytes[1];
+        *scratch.add(NET_FRAME_HDR + 4) = ip_bytes[2];
+        *scratch.add(NET_FRAME_HDR + 5) = ip_bytes[3];
+        let port_bytes = s.peer_port.to_le_bytes();
+        *scratch.add(NET_FRAME_HDR + 6) = port_bytes[0];
+        *scratch.add(NET_FRAME_HDR + 7) = port_bytes[1];
+        core::ptr::copy_nonoverlapping(pkt, scratch.add(NET_FRAME_HDR + DG_V4_PREFIX), total);
         let frame_total = NET_FRAME_HDR + frame_payload_len;
         let sent = (sys.channel_write)(s.net_out_chan, scratch, frame_total);
         if sent < 0 && sent != E_AGAIN {

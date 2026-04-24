@@ -365,6 +365,21 @@ a hierarchical naming scheme matching the capability taxonomy.
 | `file.data` | File byte stream | fat32, littlefs, http, nfs |
 | `frame.ethernet` | Raw ethernet frames | cyw43, enc28j60, ip |
 | `control.fmp` | FMP messages (next/prev/toggle) | button, gesture, bank |
+| `net.stream.cmd.v1` | Stream upstream commands (bind/connect/send/close) | ip, tls, ch9120, session workers |
+| `net.stream.evt.v1` | Stream downstream events (accepted/data/closed/error) | ip, tls, ch9120 |
+| `net.datagram.tx.v1` | Datagram with explicit destination | dns, rtp, log_net |
+| `net.datagram.rx.v1` | Datagram with explicit source | dns, rtp, log_net |
+| `net.packet.v1` | Packet-preserving envelope with ingress metadata | quic, dtls, srtp, packet classifiers |
+| `net.mux.cmd.v1` | Multiplexed session / stream open / close / send | quic, http3, mux transports |
+| `net.mux.evt.v1` | Multiplexed session / stream events and readiness | quic, http3 |
+| `net.session.ctrl.v1` | Control sideband between anchor, worker, directory | transport anchors, session workers, directories |
+
+The `net.*` content types correspond one-to-one with the protocol
+surfaces defined in `architecture/protocol_surfaces.md`. Phase 1 of the
+protocol-surfaces RFC reserves the names; the concrete envelopes land in
+`modules/sdk/contracts/net/` in later phases. Until the split lands, the
+existing TLV format described in `architecture/network.md` continues to
+carry both stream and datagram traffic as Stream Surface v1.
 
 These correspond to the content types in the mesh event system
 (see `architecture/mesh.md`), ensuring on-device channels and cross-device
@@ -866,6 +881,48 @@ display.touch_event — touch coordinates (provided by touch driver)
 selection           — item selection (provided by bank)
 ```
 
+### Protocol Surface Capabilities
+
+Transport surfaces are capabilities, one per surface defined in
+`architecture/protocol_surfaces.md`:
+
+```
+packet.net                       — packet-preserving network surface
+transport.stream                 — byte-stream transport endpoint
+transport.stream.tcp             — TCP byte-stream transport
+transport.stream.secure          — secured byte-stream transport (post-TLS)
+transport.datagram               — datagram transport endpoint
+transport.datagram.udp           — UDP datagram transport
+transport.datagram.secure        — secured datagram transport (post-DTLS)
+transport.mux                    — multiplexed session transport
+transport.mux.quic               — QUIC transport
+security.tls13.stream            — TLS 1.3 stream security layer
+security.dtls13                  — DTLS datagram security layer
+```
+
+`socket` remains as the legacy capability covering the current unified
+`net_proto` contract (TCP+UDP multiplexed). New modules should depend on
+the explicit surface names above.
+
+### Continuity Role Capabilities
+
+Architectural roles from `architecture/protocol_surfaces.md`:
+
+```
+transport.anchor.stream          — stable stream-facing transport anchor
+transport.anchor.stream.secure   — stable secure stream-facing transport anchor
+transport.anchor.datagram        — stable datagram-facing anchor
+transport.anchor.mux             — stable multiplexed-session anchor
+session.worker                   — movable session / application worker
+session.directory                — placement and continuity metadata service
+session.resume                   — resumable session state support
+session.handoff                  — opaque export / import handoff support
+```
+
+These are manifest-level capability names. They do not consume bits in
+the `required_caps` device-class mask; they participate in the same
+string-matched capability resolution as `file.data` or `audio.pcm`.
+
 ### Capability Inheritance
 
 Capabilities form a hierarchy. A requirement for a parent capability is
@@ -876,10 +933,28 @@ frame               — matches frame.wifi, frame.ethernet
 bluetooth           — matches bluetooth.ble, bluetooth.a2dp
 audio.encoded       — matches audio.encoded.mp3, audio.encoded.aac
 display             — matches display.still, display.video
+transport.stream    — matches transport.stream.tcp, transport.stream.secure
+transport.datagram  — matches transport.datagram.udp, transport.datagram.secure
+transport.mux       — matches transport.mux.quic
 ```
 
 The reverse does NOT hold. A module requiring `frame.wifi` specifically
-cannot be satisfied by `frame.ethernet`.
+cannot be satisfied by `frame.ethernet`, and a module requiring
+`transport.stream.secure` is not satisfied by plain `transport.stream`.
+
+**Security is orthogonal.** `transport.stream` is not equivalent to
+`transport.stream.secure`. `tls` upgrades plain stream to secure stream;
+`dtls` upgrades plain datagram to secure datagram. Secure anchors may
+be expressed either as composed stacks (`tls` in front of
+`transport.anchor.stream`) or as explicit secure-anchor capabilities
+(`transport.anchor.stream.secure`) where that makes graph validation
+clearer.
+
+**Selection policy.** Transport insertion and continuity role insertion
+must be explicit. The resolver may auto-wire infrastructure where
+unambiguous, but it must not silently insert TLS/DTLS, silently invent
+anchors, or silently treat `resumable` as `edge_anchored`. Continuity
+behaviour is policy, not incidental broad matching.
 
 ## Relationship to Architecture
 
@@ -892,6 +967,16 @@ field in manifests formalizes that contract.
 
 The NetIF contract (frame channels between drivers and IP) becomes an
 auto-wired infrastructure connection resolved from the hardware section.
+
+### Protocol Surfaces (protocol_surfaces.md)
+
+`protocol_surfaces.md` defines the four protocol surfaces (stream,
+datagram, packet, multiplexed session), the five session continuity
+classes, and the anchor / worker / directory roles. The `transport.*`,
+`session.*`, and `net.*` names in this document are the capability and
+content-type vocabulary that protocol_surfaces.md relies on. Continuity
+classes are declared in graph configs and validated against the
+capabilities declared here.
 
 ### Mesh Architecture (mesh.md)
 

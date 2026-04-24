@@ -42,19 +42,8 @@ include!("jitter.rs");
 // Shared Constants
 // ============================================================================
 
-// Net protocol frame types (downstream from IP)
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-
-// Net protocol frame types (upstream to IP)
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+// datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
+// modules/sdk/runtime.rs (shared across consumers).
 
 /// Net scratch buffer size
 const NET_BUF_SIZE: usize = 600;
@@ -88,16 +77,18 @@ struct VoipState {
     ctrl_chan: i32,        // ctrl: gesture/flash
     out_ctrl_rtp: i32,    // out[4]: ctrl to rtp
 
-    // Net channels (SIP)
+    // Net channels (SIP) — datagram endpoint for SIP signaling.
     sip_net_in: i32,      // in[0]: SIP net from IP
     sip_net_out: i32,     // out[0]: SIP net to IP
-    sip_conn_id: u8,
+    /// datagram endpoint id for SIP (0xFF = unallocated).
+    sip_ep_id: u8,
     _pad_sip_conn: [u8; 3],
 
-    // Net channels (jitter/RTP receive)
+    // Net channels (jitter/RTP receive) — datagram endpoint for RTP ingress.
     jitter_net_in: i32,   // in[1]: jitter net from IP
     jitter_net_out: i32,  // out[1]: jitter net to IP
-    jitter_conn_id: u8,
+    /// datagram endpoint id for RTP (0xFF = unallocated).
+    jitter_ep_id: u8,
     _pad_jitter_conn: [u8; 3],
 
     // SIP config
@@ -193,11 +184,11 @@ impl VoipState {
         self.out_ctrl_rtp = -1;
         self.sip_net_in = -1;
         self.sip_net_out = -1;
-        self.sip_conn_id = 0;
+        self.sip_ep_id = 0xFF;
         self._pad_sip_conn = [0; 3];
         self.jitter_net_in = -1;
         self.jitter_net_out = -1;
-        self.jitter_conn_id = 0;
+        self.jitter_ep_id = 0xFF;
         self._pad_jitter_conn = [0; 3];
         self.local_ip = 0;
         self.peer_ip = 0;
