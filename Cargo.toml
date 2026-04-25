@@ -9,6 +9,11 @@ repository = "https://github.com/nanocloudio/fluxor"
 [[bin]]
 name = "fluxor"
 path = "src/main.rs"
+# `src/main.rs` is `#![no_std]` and resolves its platform from the
+# `rp` / `chip-bcm2712` features. `embedded-platform` is the umbrella
+# any embedded chip feature pulls in; under `host-linux` the bin is
+# skipped so cargo test can compile against the lib alone.
+required-features = ["embedded-platform"]
 
 [[bin]]
 name = "fluxor-linux"
@@ -60,6 +65,11 @@ portable-atomic = { version = "1.13.1", default-features = false, optional = tru
 [features]
 default = ["chip-rp2350b"]
 
+# Umbrella feature pulled in by every embedded chip feature; gates the
+# `#![no_std]` `fluxor` binary so hosted builds can compile against the
+# lib alone.
+embedded-platform = []
+
 # RP-family shared dependencies (pulled in by any chip-rp* feature)
 rp = [
     "embassy-executor", "embassy-time", "embassy-rp", "embassy-usb",
@@ -71,13 +81,13 @@ rp = [
 
 # Single binary for both RP2350A and RP2350B. Always compile with B (superset).
 # Runtime silicon detection (SYSINFO.package_sel) gates pin availability.
-chip-rp2350b = ["rp", "embassy-rp/rp235xb"]
+chip-rp2350b = ["rp", "embassy-rp/rp235xb", "embedded-platform"]
 # RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
-chip-rp2040 = ["rp", "embassy-rp/rp2040"]
+chip-rp2040 = ["rp", "embassy-rp/rp2040", "embedded-platform"]
 
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
 # Minimal — no embassy, no cortex-m. Bare-metal from scratch.
-chip-bcm2712 = ["portable-atomic", "sha2"]
+chip-bcm2712 = ["portable-atomic", "sha2", "embedded-platform"]
 
 # Board-level selection for BCM2712 targets.
 # board-cm5: Real Raspberry Pi 5 / CM5 hardware (kernel loaded at 0x80000).

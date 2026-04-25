@@ -1929,7 +1929,15 @@ const fn fnv1a(s: &[u8]) -> u32 {
 }
 
 /// Write a typed message to a channel.
-/// Returns 0 on success, -1 if the header write failed.
+/// Returns 0 on success, -1 if the write failed.
+///
+/// Composes header + payload into a single stack buffer and emits one
+/// `channel_write` so the channel lock spans the whole message. Two
+/// separate writes would release the lock between them, allowing any
+/// reader on the channel to observe a partial message and interleave
+/// bytes from another producer. The buffer is sized to
+/// `CHANNEL_BUFFER_SIZE` — messages above that cap cannot fit in the
+/// channel anyway.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn msg_write(
@@ -1939,26 +1947,25 @@ unsafe fn msg_write(
     payload: *const u8,
     payload_len: u16,
 ) -> i32 {
-    let mut hdr = [0u8; MSG_HDR_SIZE];
-    let tb = msg_type.to_le_bytes();
-    hdr[0] = tb[0];
-    hdr[1] = tb[1];
-    hdr[2] = tb[2];
-    hdr[3] = tb[3];
-    let lb = payload_len.to_le_bytes();
-    hdr[4] = lb[0];
-    hdr[5] = lb[1];
-
-    let written = (sys.channel_write)(chan, hdr.as_ptr(), MSG_HDR_SIZE);
-    if written < MSG_HDR_SIZE as i32 {
+    const MAX_MSG: usize = crate::abi::CHANNEL_BUFFER_SIZE;
+    let total = MSG_HDR_SIZE + payload_len as usize;
+    if total > MAX_MSG {
         return -1;
     }
+    let mut buf = [0u8; MAX_MSG];
+    let tb = msg_type.to_le_bytes();
+    buf[0] = tb[0];
+    buf[1] = tb[1];
+    buf[2] = tb[2];
+    buf[3] = tb[3];
+    let lb = payload_len.to_le_bytes();
+    buf[4] = lb[0];
+    buf[5] = lb[1];
     if payload_len > 0 && !payload.is_null() {
-        let w2 = (sys.channel_write)(chan, payload, payload_len as usize);
-        if w2 < payload_len as i32 {
-            return -1;
-        }
+        core::ptr::copy_nonoverlapping(payload, buf.as_mut_ptr().add(MSG_HDR_SIZE), payload_len as usize);
     }
+    let w = (sys.channel_write)(chan, buf.as_ptr(), total);
+    if w < total as i32 { return -1; }
     0
 }
 

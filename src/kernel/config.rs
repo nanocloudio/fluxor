@@ -822,24 +822,27 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 /// Format (4 bytes):
 /// - byte 0: from_id (u8)
 /// - byte 1: to_id (u8)
-/// - byte 2: bit 7 = to_port (0=in, 1=ctrl), bits [6:0] = buffer_group (7-bit, 0..127)
-/// - byte 3: bits [7:4] = from_port_index, bits [3:0] = to_port_index
+/// - byte 2: bit 7    = to_port (0=in, 1=ctrl)
+///           bits [6:5] = edge_class (2-bit)
+///           bits [4:0] = buffer_group (5-bit, 0..31)
+/// - byte 3: bits [7:4] = from_port_index (4-bit, 0..15)
+///           bits [3:0] = to_port_index   (4-bit, 0..15)
 ///
-/// The 7-bit buffer_group field limits group IDs to 0..127. Group 0 means no
-/// aliasing. The tools serializer must mask to 7 bits when writing this byte.
+/// Both port indices are 4 bits; the runtime caps both at
+/// `MAX_PORTS = 8` (scheduler.rs). `buffer_group` is 5 bits — group 0
+/// means no aliasing, ids 1..31 mark in-place chains. The tool's
+/// `assign_buffer_groups` enforces the 31 ceiling.
 fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
     unsafe {
         let from_id = *ptr;
         let to_id = *ptr.add(1);
         let byte2 = *ptr.add(2);
-        // to_port is bit 7, buffer_group is bits 0-6
         let to_port = (byte2 >> 7) & 1;
-        let buffer_group = byte2 & 0x7F;
+        let edge_class_raw = (byte2 >> 5) & 0x03;
+        let buffer_group = byte2 & 0x1F;
         let port_byte = *ptr.add(3);
-        // from_port_index: bits [7:6] (max 3), edge_class: bits [5:4], to_port_index: bits [3:0]
-        let from_port_index = (port_byte >> 6) & 0x03;
+        let from_port_index = (port_byte >> 4) & 0x0F;
         let to_port_index = port_byte & 0x0F;
-        let edge_class_raw = (port_byte >> 4) & 0x03;
         let edge_class = match edge_class_raw {
             1 => EdgeClass::DmaOwned,
             2 => EdgeClass::CrossCore,

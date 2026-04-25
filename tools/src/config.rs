@@ -426,10 +426,10 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     let to_id = entry[1];
     let byte2 = entry[2];
     let to_port = (byte2 >> 7) & 1;
-    let buffer_group = byte2 & 0x7F;
+    let edge_class = (byte2 >> 5) & 0x03;
+    let buffer_group = byte2 & 0x1F;
     let port_byte = entry[3];
-    let from_port_index = (port_byte >> 6) & 0x03;
-    let edge_class = (port_byte >> 4) & 0x03;
+    let from_port_index = (port_byte >> 4) & 0x0F;
     let to_port_index = port_byte & 0x0F;
     let mut edge = serde_json::Map::new();
     edge.insert("from_id".into(), json!(from_id));
@@ -1984,7 +1984,7 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     validate_services(config, &module_names, &manifests)?;
 
     // Assign buffer groups for aliasable edge chains
-    let buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps);
+    let buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps)?;
 
     // Resolve per-edge edge_class from wiring entries
     let edge_classes = resolve_edge_classes(config, &module_names, &domain_names);
@@ -1992,8 +1992,15 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     // Graph section (64 bytes)
     // Format: edge_count, flags, reserved[2], edges[N]
     // Edge format: from_id, to_id, byte2, port_byte
-    //   byte2: (to_port << 7) | (buffer_group & 0x7F)
-    //   port_byte: (from_port_index << 6) | (edge_class << 4) | to_port_index
+    //   byte2:     bit 7    = to_port
+    //              bits 6:5 = edge_class (2 bits)
+    //              bits 4:0 = buffer_group (5 bits, 0..31)
+    //   port_byte: bits 7:4 = from_port_index (4 bits, 0..15)
+    //              bits 3:0 = to_port_index   (4 bits, 0..15)
+    // Symmetric 4-bit ports give the same headroom on both sides; the
+    // runtime cap is MAX_PORTS=8 (scheduler.rs). buffer_group narrowed to
+    // 5 bits to fit edge_class into byte 2 — assign_buffer_groups enforces
+    // the 31 ceiling.
     let mut graph_section = Vec::with_capacity(GRAPH_SECTION_SIZE);
     graph_section.push(edges.len() as u8);
     graph_section.extend_from_slice(&[0u8; 3]);
@@ -2002,8 +2009,8 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
         let ec = edge_classes.get(i).copied().unwrap_or(0);
         graph_section.push(*from_id);
         graph_section.push(*to_id);
-        graph_section.push((to_port << 7) | (group & 0x7F));
-        graph_section.push((from_port_index << 6) | ((ec & 0x03) << 4) | (to_port_index & 0x0F));
+        graph_section.push((to_port << 7) | ((ec & 0x03) << 5) | (group & 0x1F));
+        graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
     }
     // Pad edge entries to fixed offset, then write domain metadata
     while graph_section.len() < 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE {
@@ -2056,13 +2063,13 @@ fn assign_buffer_groups(
     edges: &[(u8, u8, u8, u8, u8)],
     module_names: &[String],
     module_caps: &[ModuleCaps],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let n = edges.len();
     let mut groups = vec![0u8; n];
 
     // If no module caps provided, no aliasing possible
     if module_caps.is_empty() {
-        return groups;
+        return Ok(groups);
     }
 
     // Build lookups: module_name -> capability flags
@@ -2117,14 +2124,23 @@ fn assign_buffer_groups(
 
         // This edge feeds an in-place module. Find the output edge from that module.
         if let Some(out_idx) = find_out_edge(to_id) {
-            // Both edges (in to this module, out from this module) should share a group
+            // Both edges (in to this module, out from this module) should share a group.
+            // Buffer group is encoded in 5 bits (0..31) — group 0 means "no aliasing",
+            // so 31 distinct chain ids are available. If a graph somehow needs more,
+            // error instead of silently aliasing chains that should be separate.
             let existing_group = if groups[i] != 0 {
                 groups[i]
             } else if groups[out_idx] != 0 {
                 groups[out_idx]
             } else {
+                if next_group > 31 {
+                    return Err(Error::Config(
+                        "graph has more than 31 in-place chains; buffer_group field is 5 bits"
+                            .into(),
+                    ));
+                }
                 let g = next_group;
-                if next_group < 127 { next_group += 1; }
+                next_group += 1;
                 g
             };
             groups[i] = existing_group;
@@ -2151,7 +2167,7 @@ fn assign_buffer_groups(
         }
     }
 
-    groups
+    Ok(groups)
 }
 
 /// Validate module manifests: check dependencies and resource conflicts.

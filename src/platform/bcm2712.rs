@@ -1194,424 +1194,14 @@ unsafe extern "C" fn irq_handler() {
 }
 
 // ============================================================================
-// Per-domain module storage
+// Multi-core init signaling
 // ============================================================================
 
-/// Maximum modules per domain on this platform.
-const MAX_MODS_PER_DOMAIN: usize = 12;
-
-/// Module storage for each domain. Domain 0 is on core 0, domain 1 on core 1, etc.
-/// Each domain's modules array is only accessed by its owning core after init.
-struct DomainModules {
-    modules: [Option<loader::DynamicModule>; MAX_MODS_PER_DOMAIN],
-    count: usize,
-    /// Topological execution order (domain-local indices).
-    exec_order: [u8; MAX_MODS_PER_DOMAIN],
-    exec_order_count: usize,
-    /// Map from domain-local index to global module index.
-    global_idx: [u8; MAX_MODS_PER_DOMAIN],
-}
-
-impl DomainModules {
-    const fn new() -> Self {
-        Self {
-            modules: [const { None }; MAX_MODS_PER_DOMAIN],
-            count: 0,
-            exec_order: [0; MAX_MODS_PER_DOMAIN],
-            exec_order_count: 0,
-            global_idx: [0; MAX_MODS_PER_DOMAIN],
-        }
-    }
-}
-
-/// Per-domain module storage. Indexed by domain_id.
-/// SAFETY: After init, each domain's storage is only accessed by its owning core.
-static mut DOMAIN_MODULES: [DomainModules; multicore::MAX_DOMAINS] =
-    [const { DomainModules::new() }; multicore::MAX_DOMAINS];
-
-/// Signal that domain module storage has been initialized and secondary cores can start.
+/// Set by core 0 once graph compilation and module instantiation have
+/// finished. Cores 1..3 spin on this in `secondary_core_main` before
+/// entering their domain pump.
 static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
 
-// ── Fan-out pump table ─────────────────────────────────────────────────
-//
-// When a single (module, out_port) has more than one edge on bcm2712,
-// `scheduler::set_module_port` would overwrite the previous channel
-// (last-wiring-wins). Instead we insert an intermediate tee channel:
-// the source module writes to `src_chan`, and the domain loop's
-// `pump_fan_outs` reads from `src_chan` and broadcasts to every
-// `dst_chans` entry each tick. Small fan-out degree + small frames
-// (debug log lines, net_proto frames) keep the pump cheap.
-
-const MAX_FAN_OUTS: usize = 8;
-const MAX_FAN_OUT_DSTS: usize = 4;
-const FAN_BUF_SIZE: usize = 1024;
-
-#[derive(Clone, Copy)]
-struct FanOutEntry {
-    domain: u8,
-    active: bool,
-    /// Identifier of the aliased source port.
-    from_mod: u8,
-    from_port: u8,
-    /// Channel the source module writes to (the tee's input).
-    src_chan: i32,
-    dst_chans: [i32; MAX_FAN_OUT_DSTS],
-    dst_count: u8,
-}
-
-impl FanOutEntry {
-    const fn empty() -> Self {
-        Self {
-            domain: 0,
-            active: false,
-            from_mod: 0,
-            from_port: 0,
-            src_chan: -1,
-            dst_chans: [-1; MAX_FAN_OUT_DSTS],
-            dst_count: 0,
-        }
-    }
-}
-
-static mut FAN_OUTS: [FanOutEntry; MAX_FAN_OUTS] = [const { FanOutEntry::empty() }; MAX_FAN_OUTS];
-static mut FAN_BUF: [u8; FAN_BUF_SIZE] = [0; FAN_BUF_SIZE];
-
-// Fan-in (merge) counterpart to the fan-out table. When a single
-// (module, in_port) has more than one producer edge, we collect the
-// producers into `src_chans` and merge-pump them into `dst_chan` — the
-// channel the consumer module binds to its in port.
-const MAX_FAN_INS: usize = 8;
-const MAX_FAN_IN_SRCS: usize = 4;
-
-#[derive(Clone, Copy)]
-struct FanInEntry {
-    domain: u8,
-    active: bool,
-    to_mod: u8,
-    to_port_type: u8,  // 0 = in, 2 = ctrl
-    to_port: u8,
-    dst_chan: i32,
-    src_chans: [i32; MAX_FAN_IN_SRCS],
-    src_count: u8,
-    next_read_idx: u8,
-}
-
-impl FanInEntry {
-    const fn empty() -> Self {
-        Self {
-            domain: 0,
-            active: false,
-            to_mod: 0,
-            to_port_type: 0,
-            to_port: 0,
-            dst_chan: -1,
-            src_chans: [-1; MAX_FAN_IN_SRCS],
-            src_count: 0,
-            next_read_idx: 0,
-        }
-    }
-}
-
-static mut FAN_INS: [FanInEntry; MAX_FAN_INS] = [const { FanInEntry::empty() }; MAX_FAN_INS];
-
-unsafe fn find_fan_in(to_mod: u8, to_port_type: u8, to_port: u8) -> Option<usize> {
-    for (i, e) in (*(&raw const FAN_INS)).iter().enumerate() {
-        if e.active && e.to_mod == to_mod && e.to_port_type == to_port_type && e.to_port == to_port {
-            return Some(i);
-        }
-    }
-    None
-}
-
-unsafe fn register_fan_in(domain: u8, to_mod: u8, to_port_type: u8, to_port: u8,
-                          first_src: i32) -> i32 {
-    use fluxor::kernel::channel;
-    for e in (*(&raw mut FAN_INS)).iter_mut() {
-        if !e.active {
-            let dst = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-            if dst < 0 { return -1; }
-            e.domain = domain;
-            e.active = true;
-            e.to_mod = to_mod;
-            e.to_port_type = to_port_type;
-            e.to_port = to_port;
-            e.dst_chan = dst;
-            e.src_chans = [-1; MAX_FAN_IN_SRCS];
-            e.src_chans[0] = first_src;
-            e.src_count = 1;
-            e.next_read_idx = 0;
-            FAN_DIAG.fi_active = FAN_DIAG.fi_active.saturating_add(1);
-            if FAN_DIAG.fi_first_dst_chan < 0 {
-                FAN_DIAG.fi_first_dst_chan = dst;
-                FAN_DIAG.fi_first_src0 = first_src;
-            }
-            return dst;
-        }
-    }
-    -1
-}
-
-unsafe fn add_fan_in_src(entry_idx: usize, src: i32) -> bool {
-    let fi = &mut (*(&raw mut FAN_INS))[entry_idx];
-    if (fi.src_count as usize) >= MAX_FAN_IN_SRCS { return false; }
-    fi.src_chans[fi.src_count as usize] = src;
-    if fi.src_count == 1 && FAN_DIAG.fi_first_src1 < 0 {
-        FAN_DIAG.fi_first_src1 = src;
-    }
-    fi.src_count += 1;
-    true
-}
-
-/// Merge round-robin from producer channels into the consumer channel.
-/// One frame per source per tick keeps producers fair without requiring
-/// a per-source buffer.
-unsafe fn pump_fan_ins(domain_id: usize) {
-    use fluxor::kernel::channel::{syscall_channel_poll, syscall_channel_read,
-        syscall_channel_write, POLL_IN, POLL_OUT};
-    let buf = &raw mut FAN_BUF;
-    for e in (*(&raw mut FAN_INS)).iter_mut() {
-        if !e.active || e.domain as usize != domain_id { continue; }
-        // Short-circuit if the consumer channel has no room.
-        if syscall_channel_poll(e.dst_chan, POLL_OUT) & (POLL_OUT as i32) == 0 {
-            FAN_DIAG.fi_skip_consumer_full = FAN_DIAG.fi_skip_consumer_full.wrapping_add(1);
-            continue;
-        }
-        let n = e.src_count as usize;
-        let mut moved = false;
-        let mut tries = 0;
-        while tries < n {
-            let idx = e.next_read_idx as usize;
-            e.next_read_idx = ((idx + 1) % n) as u8;
-            tries += 1;
-            let src = e.src_chans[idx];
-            if syscall_channel_poll(src, POLL_IN) & (POLL_IN as i32) == 0 { continue; }
-            let read = syscall_channel_read(src, (*buf).as_mut_ptr(), FAN_BUF_SIZE);
-            if read <= 0 { continue; }
-            let _ = syscall_channel_write(e.dst_chan, (*buf).as_ptr(), read as usize);
-            FAN_DIAG.fi_frames = FAN_DIAG.fi_frames.wrapping_add(1);
-            FAN_DIAG.fi_bytes = FAN_DIAG.fi_bytes.wrapping_add(read as u32);
-            moved = true;
-            break;
-        }
-        if !moved { FAN_DIAG.fi_skip_no_src = FAN_DIAG.fi_skip_no_src.wrapping_add(1); }
-    }
-    FAN_DIAG.fi_calls = FAN_DIAG.fi_calls.wrapping_add(1);
-}
-
-/// Locate the fan-out entry for (from_mod, from_port), or None.
-unsafe fn find_fan_out(from_mod: u8, from_port: u8) -> Option<usize> {
-    for (i, e) in (*(&raw const FAN_OUTS)).iter().enumerate() {
-        if e.active && e.from_mod == from_mod && e.from_port == from_port {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Allocate and populate a fan-out entry. Returns the tee's source
-/// channel (the one the writer module binds to its out port) or -1 on
-/// capacity failure.
-unsafe fn register_fan_out(domain: u8, from_mod: u8, from_port: u8, first_dst: i32) -> i32 {
-    use fluxor::kernel::channel;
-    for e in (*(&raw mut FAN_OUTS)).iter_mut() {
-        if !e.active {
-            let src = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-            if src < 0 { return -1; }
-            e.domain = domain;
-            e.active = true;
-            e.from_mod = from_mod;
-            e.from_port = from_port;
-            e.src_chan = src;
-            e.dst_chans = [-1; MAX_FAN_OUT_DSTS];
-            e.dst_chans[0] = first_dst;
-            e.dst_count = 1;
-            FAN_DIAG.fo_active = FAN_DIAG.fo_active.saturating_add(1);
-            if FAN_DIAG.fo_first_src_chan < 0 {
-                FAN_DIAG.fo_first_src_chan = src;
-                FAN_DIAG.fo_first_dst0 = first_dst;
-            }
-            return src;
-        }
-    }
-    -1
-}
-
-unsafe fn add_fan_out_dst(entry_idx: usize, dst: i32) -> bool {
-    let fo = &mut (*(&raw mut FAN_OUTS))[entry_idx];
-    if (fo.dst_count as usize) >= MAX_FAN_OUT_DSTS { return false; }
-    fo.dst_chans[fo.dst_count as usize] = dst;
-    if fo.dst_count == 1 && FAN_DIAG.fo_first_dst1 < 0 {
-        FAN_DIAG.fo_first_dst1 = dst;
-    }
-    fo.dst_count += 1;
-    true
-}
-
-/// Drain all fan-out entries that belong to `domain_id`: read one
-/// message from each source channel and write it to every destination.
-/// Backpressures conservatively — if any destination is full the frame
-/// stays in the source channel until the next tick.
-unsafe fn pump_fan_outs(domain_id: usize) {
-    use fluxor::kernel::channel::{syscall_channel_poll, syscall_channel_read,
-        syscall_channel_write, POLL_IN, POLL_OUT};
-    let buf = &raw mut FAN_BUF;
-    for e in (*(&raw mut FAN_OUTS)).iter() {
-        if !e.active || e.domain as usize != domain_id { continue; }
-        if syscall_channel_poll(e.src_chan, POLL_IN) & (POLL_IN as i32) == 0 {
-            FAN_DIAG.fo_skip_input = FAN_DIAG.fo_skip_input.wrapping_add(1);
-            continue;
-        }
-        // Require space in every destination so we don't partial-deliver.
-        let mut all_ready = true;
-        for i in 0..e.dst_count as usize {
-            if syscall_channel_poll(e.dst_chans[i], POLL_OUT) & (POLL_OUT as i32) == 0 {
-                all_ready = false;
-                break;
-            }
-        }
-        if !all_ready {
-            FAN_DIAG.fo_skip_dst_full = FAN_DIAG.fo_skip_dst_full.wrapping_add(1);
-            continue;
-        }
-        let read = syscall_channel_read(e.src_chan, (*buf).as_mut_ptr(), FAN_BUF_SIZE);
-        if read <= 0 { continue; }
-        let len = read as usize;
-        for i in 0..e.dst_count as usize {
-            let _ = syscall_channel_write(e.dst_chans[i], (*buf).as_ptr(), len);
-        }
-        FAN_DIAG.fo_frames += 1;
-        FAN_DIAG.fo_bytes += len as u32;
-    }
-    FAN_DIAG.fo_calls = FAN_DIAG.fo_calls.wrapping_add(1);
-}
-
-// ── Fan-out / fan-in diagnostic counters ──────────────────────────────
-// Exposed via `FAN_DIAG_SNAPSHOT` for inspection through the http
-// `/_fan` diagnostic endpoint. Single-core updates (domain 0), no sync.
-#[repr(C)]
-pub struct FanDiag {
-    pub fo_active: u8,
-    pub fi_active: u8,
-    pub fo_calls: u32,
-    pub fi_calls: u32,
-    pub fo_frames: u32,
-    pub fo_bytes: u32,
-    pub fi_frames: u32,
-    pub fi_bytes: u32,
-    pub fo_skip_input: u32,
-    pub fo_skip_dst_full: u32,
-    pub fi_skip_consumer_full: u32,
-    pub fi_skip_no_src: u32,
-    pub fo_first_src_chan: i32,
-    pub fo_first_dst0: i32,
-    pub fo_first_dst1: i32,
-    pub fi_first_dst_chan: i32,
-    pub fi_first_src0: i32,
-    pub fi_first_src1: i32,
-}
-
-pub static mut FAN_DIAG: FanDiag = FanDiag {
-    fo_active: 0, fi_active: 0,
-    fo_calls: 0, fi_calls: 0,
-    fo_frames: 0, fo_bytes: 0,
-    fi_frames: 0, fi_bytes: 0,
-    fo_skip_input: 0, fo_skip_dst_full: 0,
-    fi_skip_consumer_full: 0, fi_skip_no_src: 0,
-    fo_first_src_chan: -1, fo_first_dst0: -1, fo_first_dst1: -1,
-    fi_first_dst_chan: -1, fi_first_src0: -1, fi_first_src1: -1,
-};
-
-/// Copy FAN_DIAG into a caller-supplied buffer as ASCII text. Returns
-/// number of bytes written.
-pub unsafe fn fan_diag_snapshot(buf: *mut u8, cap: usize) -> i32 {
-    if buf.is_null() || cap == 0 { return 0; }
-    let d = &raw const FAN_DIAG;
-    let d = &*d;
-    // Simple text serializer — no_std, no alloc, no formatter crate.
-    let mut pos = 0usize;
-    macro_rules! emit {
-        ($bytes:expr) => {{
-            let bs: &[u8] = $bytes;
-            let mut k = 0;
-            while k < bs.len() && pos < cap {
-                *buf.add(pos) = bs[k]; pos += 1; k += 1;
-            }
-        }};
-    }
-    let mut numbuf = [0u8; 16];
-    fn u32_to_dec(v: u32, out: &mut [u8; 16]) -> usize {
-        if v == 0 { out[0] = b'0'; return 1; }
-        let mut tmp = [0u8; 16];
-        let mut n = 0;
-        let mut x = v;
-        while x > 0 {
-            tmp[n] = b'0' + (x % 10) as u8;
-            x /= 10;
-            n += 1;
-        }
-        for i in 0..n { out[i] = tmp[n - 1 - i]; }
-        n
-    }
-    fn i32_to_dec(v: i32, out: &mut [u8; 16]) -> usize {
-        if v < 0 {
-            out[0] = b'-';
-            let mut tmp2 = [0u8; 16];
-            let nn = u32_to_dec((-v) as u32, &mut tmp2);
-            for i in 0..nn { out[1 + i] = tmp2[i]; }
-            1 + nn
-        } else {
-            u32_to_dec(v as u32, out)
-        }
-    }
-
-    macro_rules! emit_u32 {
-        ($name:expr, $v:expr) => {{
-            emit!($name);
-            emit!(b"=");
-            let n = u32_to_dec($v, &mut numbuf);
-            let mut i = 0;
-            while i < n && pos < cap { *buf.add(pos) = numbuf[i]; pos += 1; i += 1; }
-            emit!(b" ");
-        }};
-    }
-    macro_rules! emit_i32 {
-        ($name:expr, $v:expr) => {{
-            emit!($name);
-            emit!(b"=");
-            let n = i32_to_dec($v, &mut numbuf);
-            let mut i = 0;
-            while i < n && pos < cap { *buf.add(pos) = numbuf[i]; pos += 1; i += 1; }
-            emit!(b" ");
-        }};
-    }
-
-    emit_u32!(b"fo_active", d.fo_active as u32);
-    emit_u32!(b"fi_active", d.fi_active as u32);
-    emit_u32!(b"fo_calls", d.fo_calls);
-    emit_u32!(b"fi_calls", d.fi_calls);
-    emit_u32!(b"fo_frames", d.fo_frames);
-    emit_u32!(b"fo_bytes", d.fo_bytes);
-    emit_u32!(b"fi_frames", d.fi_frames);
-    emit_u32!(b"fi_bytes", d.fi_bytes);
-    emit_u32!(b"fo_skip_in", d.fo_skip_input);
-    emit_u32!(b"fo_skip_dst", d.fo_skip_dst_full);
-    emit_u32!(b"fi_skip_cons", d.fi_skip_consumer_full);
-    emit_u32!(b"fi_skip_src", d.fi_skip_no_src);
-    emit_i32!(b"fo_src", d.fo_first_src_chan);
-    emit_i32!(b"fo_dst0", d.fo_first_dst0);
-    emit_i32!(b"fo_dst1", d.fo_first_dst1);
-    emit_i32!(b"fi_dst", d.fi_first_dst_chan);
-    emit_i32!(b"fi_src0", d.fi_first_src0);
-    emit_i32!(b"fi_src1", d.fi_first_src1);
-    let (drop_l, drop_n, local_act, net_act) = fluxor::kernel::log_ring::peek_stats();
-    emit_u32!(b"ring_drop_local", drop_l);
-    emit_u32!(b"ring_drop_net", drop_n);
-    emit_u32!(b"ring_local_active", if local_act { 1 } else { 0 });
-    emit_u32!(b"ring_net_active", if net_act { 1 } else { 0 });
-    emit!(b"\n");
-
-    pos as i32
-}
 
 // ============================================================================
 // Entry point with secondary core parking
@@ -1872,35 +1462,65 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Initialize syscall table and provider registry
     fluxor::kernel::syscalls::init_syscall_table();
     fluxor::kernel::syscalls::init_providers();
-    fluxor::kernel::syscalls::register_fan_diag_handler(fan_diag_snapshot);
     fluxor::kernel::step_guard::init();
 
     // --- Config-driven module graph ---
+    //
+    // `scheduler::prepare_graph` compiles the graph (edge decode, fan
+    // module insertion, channel allocation, port-table population). This
+    // platform layers the multi-core concerns on top: cross-domain
+    // edges are bridged with `multicore::register_cross_edge`, and each
+    // core's pump iterates `SCHED.domain_exec_order` via
+    // `scheduler::step_module_outcome`.
     use fluxor::kernel::channel;
-    use fluxor::kernel::config::{self, MAX_MODULES};
+    use fluxor::kernel::config;
 
-    // Parse config from the QEMU side-loaded blob when present; otherwise use
-    // the packaged trailer path (Pi 5 / raw packed image).
-    let mut cfg = config::Config::empty();
-    let cfg_ok = {
+    // Parse config + loader into the kernel's static state. CM5 scans
+    // flash via the trailer; QEMU side-loads a packed blob at a fixed
+    // address. `prepare_graph` reads STATIC_CONFIG / STATIC_LOADER from
+    // there.
+    loader::reset_state_arena();
+    let static_state_ok = {
         #[cfg(not(feature = "board-cm5"))]
         {
             let blob_magic = unsafe { core::ptr::read_volatile(QEMU_CONFIG_BLOB_ADDR as *const u32) };
-            if blob_magic == config::MAGIC_CONFIG {
-                config::read_config_from_ptr(QEMU_CONFIG_BLOB_ADDR as *const u8, &mut cfg)
+            let modules_blob_magic = unsafe {
+                core::ptr::read_volatile(QEMU_MODULES_BLOB_ADDR as *const u32)
+            };
+            if blob_magic == config::MAGIC_CONFIG
+                && modules_blob_magic == loader::MODULE_TABLE_MAGIC
+            {
+                unsafe {
+                    scheduler::populate_static_state(
+                        QEMU_CONFIG_BLOB_ADDR as *const u8,
+                        QEMU_MODULES_BLOB_ADDR as *const u8,
+                    )
+                }
+                .is_ok()
             } else {
-                config::read_config_into(&mut cfg)
+                let loader_ref = unsafe { scheduler::static_loader_mut() };
+                let cfg_ref = unsafe { scheduler::static_config_mut() };
+                let l_ok = loader_ref.init().is_ok();
+                let c_ok = config::read_config_into(cfg_ref);
+                l_ok && c_ok
             }
         }
         #[cfg(feature = "board-cm5")]
         {
-            config::read_config_into(&mut cfg)
+            // Flash-trailer path: the loader scans the packed image for
+            // the module table; the config sits in the same trailer.
+            let loader_ref = unsafe { scheduler::static_loader_mut() };
+            let cfg_ref = unsafe { scheduler::static_config_mut() };
+            let l_ok = loader_ref.init().is_ok();
+            let c_ok = config::read_config_into(cfg_ref);
+            l_ok && c_ok
         }
     };
-    if !cfg_ok {
-        uart_puts(b"[config] parse failed\r\n");
+    if !static_state_ok {
+        uart_puts(b"[config] parse / loader failed\r\n");
         loop { unsafe { core::arch::asm!("wfi") }; }
     }
+    let cfg = unsafe { scheduler::static_config() };
     let n_modules = cfg.module_count as usize;
     let n_edges = cfg.edge_count as usize;
 
@@ -1926,394 +1546,160 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(n_edges as u32);
     uart_puts(b" edges\r\n");
 
-    // Load module table from the QEMU side-loaded blob when present; otherwise
-    // use the packaged trailer path.
-    loader::reset_state_arena();
-    let mut ldr = loader::ModuleLoader::new();
-    let loader_ok = {
-        #[cfg(not(feature = "board-cm5"))]
-        {
-            let blob_magic = unsafe { core::ptr::read_volatile(QEMU_MODULES_BLOB_ADDR as *const u32) };
-            if blob_magic == loader::MODULE_TABLE_MAGIC {
-                ldr.init_from_blob(QEMU_MODULES_BLOB_ADDR as *const u8)
-            } else {
-                ldr.init()
-            }
-        }
-        #[cfg(feature = "board-cm5")]
-        {
-            ldr.init()
+    let (module_list, module_count) = match scheduler::prepare_graph() {
+        Ok(v) => v,
+        Err(_) => {
+            uart_puts(b"[graph] prepare_graph failed\r\n");
+            loop { unsafe { core::arch::asm!("wfi") }; }
         }
     };
-    if loader_ok.is_err() {
-        uart_puts(b"[loader] no modules\r\n");
-        loop { unsafe { core::arch::asm!("wfi") }; }
-    }
 
-    // Create channels from graph edges.
-    // Track per-global-module-index: input, output, ctrl channel handles.
-    let mut mod_in: [i32; MAX_MODULES] = [-1; MAX_MODULES];
-    let mut mod_out: [i32; MAX_MODULES] = [-1; MAX_MODULES];
-    let mut mod_ctrl: [i32; MAX_MODULES] = [-1; MAX_MODULES];
+    // Cross-domain post-process: split every edge whose endpoints live
+    // in different domains into producer-side / consumer-side channels
+    // bridged by a `multicore::CrossDomainChannel` SPSC pump.
+    //
+    // The walk reads `sched.edges` (not `cfg.graph_edges`) so an edge
+    // that is part of both a fan group and a cross-domain hop is seen
+    // through its rewritten endpoints — the bridge lands on the actual
+    // producer/consumer hop, not the original config one.
+    //
+    // For each cross edge, open a fresh consumer-side channel `W2`,
+    // register the SPSC bridge `edge.channel → W2`, and set
+    // `edge.consumer_channel = W2`. `collect_input_channels` honours
+    // `consumer_channel`, so `populate_ports` lifts `W2` into the
+    // consumer's in_chans.
+    {
+        let sched = unsafe { scheduler::sched_mut() };
+        let n_compiled_edges = sched.edge_count;
+        let mut e = 0usize;
+        while e < n_compiled_edges {
+            let edge_snapshot = sched.edges[e];
+            if edge_snapshot.channel < 0 { e += 1; continue; }
 
-    // Remember the channel opened for each edge so the per-module port
-    // registrations can be re-applied immediately before start_new. A later
-    // provider registration or allocation can otherwise disturb the port
-    // table before the module sees it.
-    const MAX_EDGE_CHANNELS: usize = 16;
-    let mut edge_channels: [i32; MAX_EDGE_CHANNELS] = [-1; MAX_EDGE_CHANNELS];
+            let from = edge_snapshot.from_module;
+            let to = edge_snapshot.to_module;
+            let from_domain = scheduler::module_domain_id(from);
+            let to_domain = scheduler::module_domain_id(to);
+            let is_cross = from_domain != to_domain
+                || edge_snapshot.edge_class == EdgeClass::CrossCore;
+            if !is_cross { e += 1; continue; }
 
-    // Track which edges are cross-domain so we can set up CrossDomainChannels.
-    // For cross-domain edges, we still create local pipe channels on each side,
-    // and the domain loop pumps data between the cross-domain ring buffer and
-    // the local channel.
-    let mut e = 0usize;
-    while e < n_edges {
-        if let Some(ref edge) = cfg.graph_edges[e] {
-            let from = edge.from_id as usize;
-            let to = edge.to_id as usize;
-
-            // Determine if this edge crosses domains
-            let from_domain = if from < n_modules {
-                cfg.modules[from].as_ref().map(|m| m.domain_id).unwrap_or(0)
-            } else { 0 };
-            let to_domain = if to < n_modules {
-                cfg.modules[to].as_ref().map(|m| m.domain_id).unwrap_or(0)
-            } else { 0 };
-
-            let is_cross = from_domain != to_domain || edge.edge_class == EdgeClass::CrossCore;
-
-            if is_cross {
-                // Cross-domain edge: create separate local channels on each side
-                // and a CrossDomainChannel to bridge them. Each cross-domain edge
-                // gets its own local channel pair (supports multi-port modules).
-                let out_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-                let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-
-                if out_ch >= 0 && in_ch >= 0 {
-                    // Track in per-module arrays for module instantiation.
-                    // Only port_index==0 sets the module's primary handle (passed to start_new).
-                    // Secondary ports are accessible via dev_channel_port() syscall.
-                    if from < MAX_MODULES && edge.from_port_index == 0 && mod_out[from] < 0 {
-                        mod_out[from] = out_ch;
-                    }
-                    if to < MAX_MODULES {
-                        if edge.to_port == 0 && edge.to_port_index == 0 && mod_in[to] < 0 {
-                            mod_in[to] = in_ch;
-                        } else if edge.to_port == 1 && edge.to_port_index == 0 && mod_ctrl[to] < 0 {
-                            mod_ctrl[to] = in_ch;
-                        }
-                    }
-                    // Populate scheduler port table for cross-domain channels too
-                    scheduler::set_module_port(from, 1, edge.from_port_index, out_ch);
-                    let to_port_type = if edge.to_port == 1 { 2u8 } else { 0u8 };
-                    scheduler::set_module_port(to, to_port_type, edge.to_port_index, in_ch);
-
-                    // Allocate a cross-domain channel and register the edge.
-                    // The edge stores both local handles directly so pump_cross_domain
-                    // can operate per-edge without module-index indirection.
-                    if let Some(cross_ch_idx) = multicore::alloc_cross_channel() {
-                        let from_mod_in_domain = domain_local_index(&cfg, from, from_domain, n_modules);
-                        let to_mod_in_domain = domain_local_index(&cfg, to, to_domain, n_modules);
-
-                        unsafe {
-                            multicore::register_cross_edge(multicore::CrossDomainEdge {
-                                from_domain,
-                                from_module: from_mod_in_domain as u8,
-                                from_port: edge.from_port_index,
-                                to_domain,
-                                to_module: to_mod_in_domain as u8,
-                                to_port: edge.to_port,
-                                channel_idx: cross_ch_idx as u8,
-                                local_out_handle: out_ch,
-                                local_in_handle: in_ch,
-                                pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
-                            });
-                        }
-                    }
+            // Reserve the SPSC ring, the consumer-side channel, and the
+            // edge-table slot before touching `consumer_channel`. If any
+            // reservation fails, halt — rebinding the consumer to a
+            // handle that no pump fills would strand every byte the
+            // producer writes.
+            let cross_ch_idx = match multicore::alloc_cross_channel() {
+                Some(i) => i,
+                None => {
+                    uart_puts(b"[graph] cross-domain SPSC rings exhausted (");
+                    uart_put_u32(multicore::MAX_CROSS_CHANNELS as u32);
+                    uart_puts(b" max); cannot bridge edge ");
+                    uart_put_u32(e as u32);
+                    uart_puts(b"\r\n");
+                    loop { unsafe { core::arch::asm!("wfi") }; }
                 }
-            } else {
-                // Same-domain edge: allocate channels with fan-out (tee)
-                // on aliased source ports and fan-in (merge) on aliased
-                // destination ports. The raw `ch` is the producer-side
-                // wire in the non-aliased case; fan-in replaces it with
-                // a per-producer tributary.
-                let ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-                if ch >= 0 {
-                    let to_port_type = if edge.to_port == 1 { 2u8 } else { 0u8 };
+            };
 
-                    // ── Fan-IN: multiple producers → single consumer port.
-                    // Aliasing is detected through the scheduler's per-port
-                    // channel table, which covers every (port_type, index).
-                    let existing_fi = unsafe { find_fan_in(to as u8, to_port_type, edge.to_port_index) };
-                    let producer_ch = if let Some(idx) = existing_fi {
-                        let tributary = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-                        if tributary >= 0 {
-                            unsafe { let _ = add_fan_in_src(idx, tributary); }
-                            tributary
-                        } else { ch }
-                    } else {
-                        let prior_consumer_chan = scheduler::get_module_port(
-                            to, to_port_type, edge.to_port_index);
-                        if prior_consumer_chan >= 0 {
-                            // Second producer for this (module, in_port):
-                            // promote to merge. Tributary #1 is the channel
-                            // the first producer already writes to.
-                            let new_dst = unsafe {
-                                register_fan_in(from_domain, to as u8, to_port_type,
-                                                edge.to_port_index, prior_consumer_chan)
-                            };
-                            if new_dst >= 0 {
-                                // Redirect consumer port to merge's dst.
-                                // Keep mod_in/mod_ctrl in sync when port 0.
-                                if to < MAX_MODULES {
-                                    if edge.to_port == 0 && edge.to_port_index == 0 {
-                                        mod_in[to] = new_dst;
-                                    } else if edge.to_port == 1 && edge.to_port_index == 0 {
-                                        mod_ctrl[to] = new_dst;
-                                    }
-                                }
-                                scheduler::set_module_port(to, to_port_type, edge.to_port_index, new_dst);
-                                let idx = unsafe {
-                                    find_fan_in(to as u8, to_port_type, edge.to_port_index).unwrap()
-                                };
-                                unsafe { let _ = add_fan_in_src(idx, ch); }
-                                ch
-                            } else { ch }
-                        } else {
-                            // First (producer, consumer) pair for this port.
-                            if to < MAX_MODULES {
-                                if edge.to_port == 0 && edge.to_port_index == 0 && mod_in[to] < 0 {
-                                    mod_in[to] = ch;
-                                } else if edge.to_port == 1 && edge.to_port_index == 0 && mod_ctrl[to] < 0 {
-                                    mod_ctrl[to] = ch;
-                                }
-                            }
-                            scheduler::set_module_port(to, to_port_type, edge.to_port_index, ch);
-                            ch
-                        }
-                    };
-
-                    if e < MAX_EDGE_CHANNELS { edge_channels[e] = ch; }
-
-                    // ── Fan-OUT: single producer → multiple consumers.
-                    // Aliasing is detected the same way as fan-in above,
-                    // via scheduler port lookup.
-                    let src_port_key = (from as u8, edge.from_port_index);
-                    let first_chan_here = scheduler::get_module_port(from, 1, edge.from_port_index);
-                    let existing_fan = unsafe { find_fan_out(src_port_key.0, src_port_key.1) };
-                    if let Some(idx) = existing_fan {
-                        unsafe { let _ = add_fan_out_dst(idx, producer_ch); }
-                    } else if from < MAX_MODULES && first_chan_here >= 0 {
-                        let src = unsafe {
-                            register_fan_out(from_domain, src_port_key.0, src_port_key.1, first_chan_here)
-                        };
-                        if src >= 0 {
-                            unsafe { let _ = add_fan_out_dst(find_fan_out(src_port_key.0, src_port_key.1).unwrap(), producer_ch); }
-                            if from < MAX_MODULES && edge.from_port_index == 0 {
-                                mod_out[from] = src;
-                            }
-                            scheduler::set_module_port(from, 1, edge.from_port_index, src);
-                        }
-                    } else {
-                        if from < MAX_MODULES && edge.from_port_index == 0 && mod_out[from] < 0 {
-                            mod_out[from] = producer_ch;
-                        }
-                        scheduler::set_module_port(from, 1, edge.from_port_index, producer_ch);
-                    }
-                }
+            let in_ch = channel::channel_open(
+                channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+            if in_ch < 0 {
+                uart_puts(b"[graph] consumer-side channel alloc failed for cross-domain edge ");
+                uart_put_u32(e as u32);
+                uart_puts(b"\r\n");
+                loop { unsafe { core::arch::asm!("wfi") }; }
             }
+
+            let to_port_marker: u8 = if edge_snapshot.is_ctrl() { 1 } else { 0 };
+            let registered = unsafe {
+                multicore::register_cross_edge(multicore::CrossDomainEdge {
+                    from_domain,
+                    from_module: from as u8,
+                    from_port: edge_snapshot.from_port_index,
+                    to_domain,
+                    to_module: to as u8,
+                    to_port: to_port_marker,
+                    channel_idx: cross_ch_idx as u8,
+                    local_out_handle: edge_snapshot.channel,
+                    local_in_handle: in_ch,
+                    pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
+                })
+            };
+            if registered.is_none() {
+                uart_puts(b"[graph] cross-domain edge table full (");
+                uart_put_u32(multicore::MAX_CROSS_EDGES as u32);
+                uart_puts(b" max); cannot bridge edge ");
+                uart_put_u32(e as u32);
+                uart_puts(b"\r\n");
+                loop { unsafe { core::arch::asm!("wfi") }; }
+            }
+
+            sched.edges[e].consumer_channel = in_ch;
+            e += 1;
         }
-        e += 1;
     }
 
     // Mask IRQs during module instantiation
     let _inst_guard = fluxor::kernel::guard::KernelGuard::acquire();
 
-    let syscalls = fluxor::kernel::syscalls::get_table_for_module_type(0);
-
-    // Instantiate modules and assign to domains based on entry.domain_id.
-    let mut i = 0usize;
-    while i < n_modules {
-        if let Some(ref entry) = cfg.modules[i] {
-            let domain_id = entry.domain_id as usize;
-            if domain_id >= multicore::MAX_DOMAINS {
-                uart_puts(b"[inst] invalid domain_id for module ");
-                uart_put_u32(i as u32);
-                uart_puts(b"\r\n");
-                i += 1;
-                continue;
+    let loader_ref = unsafe { scheduler::static_loader() };
+    let sched = unsafe { scheduler::sched_mut() };
+    let mut total_mods = 0usize;
+    for module_idx in 0..module_count {
+        let entry = match &module_list[module_idx] {
+            Some(e) => e,
+            None => continue,
+        };
+        if entry.domain_id as usize >= multicore::MAX_DOMAINS {
+            uart_puts(b"[inst] invalid domain_id for module ");
+            uart_put_u32(module_idx as u32);
+            uart_puts(b"\r\n");
+            continue;
+        }
+        scheduler::set_current_module(module_idx);
+        let result = scheduler::instantiate_one_module(
+            loader_ref, entry,
+            module_idx, module_idx,
+            &mut sched.edges,
+            &mut sched.modules,
+            &mut sched.ports,
+        );
+        match result {
+            scheduler::InstantiateResult::Done => {
+                total_mods += 1;
             }
-
-            if let Ok(m) = ldr.find_by_name_hash(entry.name_hash) {
-                let dm_ref = unsafe { &mut DOMAIN_MODULES[domain_id] };
-                if dm_ref.count >= MAX_MODS_PER_DOMAIN {
-                    uart_puts(b"[inst] domain ");
-                    uart_put_u32(domain_id as u32);
-                    uart_puts(b" full\r\n");
-                    i += 1;
-                    continue;
-                }
-                let mod_idx = dm_ref.count;
-
-                // Set global module index so syscalls and loader-driven
-                // provider registration can identify the calling module
-                // during module_new.
-                fluxor::kernel::scheduler::set_current_module(i);
-
-                // Populate export table and caps in SCHED so
-                // resolve_export_for_module works for provider registration.
-                scheduler::set_module_exports(
-                    i, m.code_base() as usize,
-                    m.export_table_ptr(), m.header.export_count,
-                );
-                let cap_class = match m.header.module_type {
-                    5 => 3, 3 => 1, 4 => 2, _ => 0,
-                };
-                scheduler::set_module_caps(
-                    i,
-                    cap_class,
-                    m.header.required_caps() as u32,
-                    m.manifest_permissions(),
-                );
-
-                // Re-apply port registrations for this module from the stored edge
-                // channel table. This keeps SCHED.ports consistent if earlier
-                // instantiation (or provider registration) has perturbed it.
-                //
-                // When a port is fan-out/in'd, the real channel the module
-                // uses is the tee's src (for out) or the merge's dst (for
-                // in), not the raw edge channel. Skip the re-apply for
-                // those ports and fall back to mod_in/out/ctrl, which
-                // track the authoritative post-fan values.
-                {
-                    let mut ee = 0usize;
-                    while ee < n_edges && ee < MAX_EDGE_CHANNELS {
-                        if edge_channels[ee] >= 0 {
-                            if let Some(ref edge) = cfg.graph_edges[ee] {
-                                let from = edge.from_id as usize;
-                                let to = edge.to_id as usize;
-                                if from == i {
-                                    let has_fan = unsafe { find_fan_out(i as u8, edge.from_port_index).is_some() };
-                                    if !has_fan {
-                                        scheduler::set_module_port(i, 1, edge.from_port_index, edge_channels[ee]);
-                                    }
-                                }
-                                if to == i {
-                                    let tp = if edge.to_port == 1 { 2u8 } else { 0u8 };
-                                    let has_fan = unsafe { find_fan_in(i as u8, tp, edge.to_port_index).is_some() };
-                                    if !has_fan {
-                                        scheduler::set_module_port(i, tp, edge.to_port_index, edge_channels[ee]);
-                                    }
-                                }
-                            }
+            scheduler::InstantiateResult::Pending(mut pending) => {
+                let mut loaded = false;
+                for _ in 0..100 {
+                    for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
+                    match unsafe { pending.try_complete() } {
+                        Ok(Some(dm)) => {
+                            scheduler::store_dynamic_module(module_idx, dm);
+                            total_mods += 1;
+                            loaded = true;
+                            break;
                         }
-                        ee += 1;
-                    }
-                    // Fan-out/in sources of truth: mod_out/mod_in for port 0.
-                    if mod_out[i] >= 0 {
-                        scheduler::set_module_port(i, 1, 0, mod_out[i]);
-                    }
-                    if mod_in[i] >= 0 {
-                        scheduler::set_module_port(i, 0, 0, mod_in[i]);
-                    }
-                    if mod_ctrl[i] >= 0 {
-                        scheduler::set_module_port(i, 2, 0, mod_ctrl[i]);
+                        Ok(None) => {}
+                        Err(e) => { e.log("module"); loaded = true; break; }
                     }
                 }
-
-                let result = unsafe {
-                    loader::DynamicModule::start_new(
-                        &m, syscalls,
-                        mod_in[i], mod_out[i], mod_ctrl[i],
-                        entry.params_ptr, entry.params_len, "",
-                    )
-                };
-                match result {
-                    Ok(loader::StartNewResult::Ready(dm)) => {
-                        dm_ref.global_idx[mod_idx] = i as u8;
-                        // Publish state pointer into the scheduler's
-                        // per-module shadow so resolve_register_target
-                        // can find us from a step-time registration
-                        // call (e.g. BACKING_PROVIDER_ENABLE). bcm2712
-                        // keeps modules in DOMAIN_MODULES rather than
-                        // SCHED.modules, so without this, get_module_state
-                        // returns null and every registration fails.
-                        fluxor::kernel::scheduler::set_module_state_ptr(i, dm.state_ptr());
-                        dm_ref.modules[mod_idx] = Some(dm);
-                        dm_ref.count += 1;
-                    }
-                    Ok(loader::StartNewResult::Pending(mut pending)) => {
-                        for _ in 0..100 {
-                            for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
-                            match unsafe { pending.try_complete() } {
-                                Ok(Some(dm)) => {
-                                    dm_ref.global_idx[mod_idx] = i as u8;
-                                    fluxor::kernel::scheduler::set_module_state_ptr(i, dm.state_ptr());
-                                    dm_ref.modules[mod_idx] = Some(dm);
-                                    dm_ref.count += 1;
-                                    break;
-                                }
-                                Ok(None) => {}
-                                Err(e) => { e.log("module"); break; }
-                            }
-                        }
-                    }
-                    Err(e) => e.log("module"),
+                if !loaded {
+                    uart_puts(b"[inst] module ");
+                    uart_put_u32(module_idx as u32);
+                    uart_puts(b" pending timeout\r\n");
                 }
             }
-        }
-        i += 1;
-    }
-
-    // Sum per-domain module counts into SCHED.active_module_count so
-    // queries like RECONFIGURE_MODULE_COUNT (used by the monitor overlay)
-    // see the right number on bcm2712. The domain path instantiates
-    // directly into DOMAIN_MODULES and doesn't go through
-    // `prepare_graph`, which is the RP path that normally sets this.
-    unsafe {
-        let mut total = 0usize;
-        let mut d = 0usize;
-        while d < multicore::MAX_DOMAINS {
-            total += DOMAIN_MODULES[d].count;
-            d += 1;
-        }
-        fluxor::kernel::scheduler::set_active_module_count(total);
-    }
-
-    // Observability for Layer 2 DmaOwned edges. Same intent as the RP
-    // graph path but reads cfg.graph_edges directly because the bcm2712
-    // platform doesn't mirror edges into scheduler::SCHED.edges.
-    fluxor::kernel::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
-
-    // Compute per-domain topological execution order (Kahn's algorithm).
-    // Must be done after all modules are instantiated so global_idx is populated.
-    {
-        let mut d = 0usize;
-        while d < multicore::MAX_DOMAINS {
-            let mod_count = unsafe { DOMAIN_MODULES[d].count };
-            if mod_count > 0 {
-                compute_domain_topo_order(d, &cfg, n_edges);
-                let dm = unsafe { &DOMAIN_MODULES[d] };
-                uart_puts(b"[topo] domain ");
-                uart_put_u32(d as u32);
-                uart_puts(b" order: ");
-                let mut k = 0;
-                while k < dm.exec_order_count {
-                    if k > 0 { uart_puts(b"->"); }
-                    uart_put_u32(dm.exec_order[k] as u32);
-                    k += 1;
-                }
-                uart_puts(b"\r\n");
-            }
-            d += 1;
+            scheduler::InstantiateResult::Error(_) => {}
         }
     }
 
-    // Set up domain execution state for all domains that have modules.
+    // Activate the compiled graph and log per-domain composition.
+    scheduler::set_active_module_count(module_count);
+    fluxor::kernel::scheduler::log_dma_owned_edges(module_count);
+
     let mut d = 0usize;
     while d < multicore::MAX_DOMAINS {
-        let mod_count = unsafe { DOMAIN_MODULES[d].count };
+        let mod_count = scheduler::domain_module_count(d);
         if mod_count > 0 {
             unsafe {
                 let ds = multicore::domain_state(d);
@@ -2327,23 +1713,22 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
             uart_put_u32(mod_count as u32);
             uart_puts(b" modules (core ");
             uart_put_u32(d as u32);
-            uart_puts(b")\r\n");
+            uart_puts(b") order: ");
+            let mut k = 0usize;
+            while k < mod_count {
+                if k > 0 { uart_puts(b"->"); }
+                if let Some(g) = scheduler::domain_exec_order_at(d, k) {
+                    uart_put_u32(g as u32);
+                }
+                k += 1;
+            }
+            uart_puts(b"\r\n");
         }
         d += 1;
     }
 
-    // Re-enable IRQs
     drop(_inst_guard);
 
-    let total_mods: usize = {
-        let mut total = 0usize;
-        let mut dd = 0;
-        while dd < multicore::MAX_DOMAINS {
-            total += unsafe { DOMAIN_MODULES[dd].count };
-            dd += 1;
-        }
-        total
-    };
     uart_puts(b"[inst] ");
     uart_put_u32(total_mods as u32);
     uart_puts(b" modules loaded total\r\n");
@@ -2375,127 +1760,6 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     run_domain_loop(0)
 }
 
-/// Compute domain-local module index for a given global module index.
-/// Counts how many modules with global index < `global_idx` are in the same domain.
-fn domain_local_index(
-    cfg: &fluxor::kernel::config::Config,
-    global_idx: usize,
-    domain_id: u8,
-    n_modules: usize,
-) -> usize {
-    let mut count = 0usize;
-    let mut j = 0;
-    while j < n_modules && j < global_idx {
-        if let Some(ref entry) = cfg.modules[j] {
-            if entry.domain_id == domain_id {
-                count += 1;
-            }
-        }
-        j += 1;
-    }
-    count
-}
-
-/// Compute topological execution order for modules within a single domain.
-///
-/// Uses Kahn's algorithm restricted to intra-domain edges. Edges are identified
-/// by matching global module indices against the domain's global_idx map.
-/// The result is stored in dm.exec_order[] as domain-local indices.
-fn compute_domain_topo_order(
-    domain_id: usize,
-    cfg: &fluxor::kernel::config::Config,
-    n_edges: usize,
-) {
-    let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
-    let n = dm.count;
-    if n == 0 { return; }
-
-    // Build global→local index map for this domain
-    let mut global_to_local = [0xFFu8; fluxor::kernel::config::MAX_MODULES];
-    let mut j = 0;
-    while j < n {
-        let g = dm.global_idx[j] as usize;
-        if g < global_to_local.len() {
-            global_to_local[g] = j as u8;
-        }
-        j += 1;
-    }
-
-    // Compute in-degree for domain-local modules (only intra-domain edges)
-    let mut in_degree = [0u8; MAX_MODS_PER_DOMAIN];
-    let mut e = 0;
-    while e < n_edges {
-        if let Some(ref edge) = cfg.graph_edges[e] {
-            let from_local = global_to_local.get(edge.from_id as usize).copied().unwrap_or(0xFF);
-            let to_local = global_to_local.get(edge.to_id as usize).copied().unwrap_or(0xFF);
-            if from_local != 0xFF && to_local != 0xFF && from_local != to_local {
-                in_degree[to_local as usize] = in_degree[to_local as usize].saturating_add(1);
-            }
-        }
-        e += 1;
-    }
-
-    // BFS: start with zero in-degree modules
-    let mut queue = [0u8; MAX_MODS_PER_DOMAIN];
-    let mut qhead = 0usize;
-    let mut qtail = 0usize;
-    j = 0;
-    while j < n {
-        if in_degree[j] == 0 {
-            queue[qtail] = j as u8;
-            qtail += 1;
-        }
-        j += 1;
-    }
-
-    let mut count = 0usize;
-    while qhead < qtail {
-        let m = queue[qhead] as usize;
-        qhead += 1;
-        dm.exec_order[count] = m as u8;
-        count += 1;
-
-        // Decrement in-degree of successors
-        e = 0;
-        while e < n_edges {
-            if let Some(ref edge) = cfg.graph_edges[e] {
-                let from_local = global_to_local.get(edge.from_id as usize).copied().unwrap_or(0xFF);
-                let to_local = global_to_local.get(edge.to_id as usize).copied().unwrap_or(0xFF);
-                if from_local != 0xFF && to_local != 0xFF
-                    && from_local as usize == m
-                    && (to_local as usize) < n
-                {
-                    in_degree[to_local as usize] -= 1;
-                    if in_degree[to_local as usize] == 0 {
-                        queue[qtail] = to_local;
-                        qtail += 1;
-                    }
-                }
-            }
-            e += 1;
-        }
-    }
-
-    // Append any remaining (isolated or cycle-broken) modules
-    if count < n {
-        j = 0;
-        while j < n {
-            let mut found = false;
-            let mut k = 0;
-            while k < count {
-                if dm.exec_order[k] as usize == j { found = true; }
-                k += 1;
-            }
-            if !found {
-                dm.exec_order[count] = j as u8;
-                count += 1;
-            }
-            j += 1;
-        }
-    }
-
-    dm.exec_order_count = count;
-}
 
 // ============================================================================
 // Domain execution loop
@@ -2531,7 +1795,6 @@ static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
     [const { DomainMetrics::new() }; multicore::MAX_DOMAINS];
 
 fn run_domain_loop(domain_id: usize) -> ! {
-    use fluxor::modules::Module;
     use fluxor::kernel::step_guard;
 
     let exec_mode = scheduler::domain_exec_mode(domain_id);
@@ -2550,7 +1813,6 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let t0 = read_timer_count();
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
-                unsafe { pump_fan_outs(domain_id); pump_fan_ins(domain_id); }
                 if core_id == 0 { debug_drain_poll_core0(); }
                 let elapsed = read_timer_count().wrapping_sub(t0);
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
@@ -2574,37 +1836,29 @@ fn run_domain_loop(domain_id: usize) -> ! {
             let freq = bcm_counter_freq();
             loop {
                 multicore::park_if_requested(domain_id);
-                let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
                 let mut any_burst = false;
-                // Step in topological order for correct producer-before-consumer
-                let n = if dm.exec_order_count > 0 { dm.exec_order_count } else { dm.count };
-                let mut pos = 0;
-                while pos < n {
-                    let j = if dm.exec_order_count > 0 { dm.exec_order[pos] as usize } else { pos };
-                    if let Some(ref mut m) = dm.modules[j] {
-                        let global_idx = dm.global_idx[j] as usize;
-                        fluxor::kernel::scheduler::set_current_module(global_idx);
-                        step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
-                        let t0 = bcm_read_cntpct();
-                        let outcome = m.step();
-                        let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
-                        step_guard::disarm();
-                        step_guard::post_step_check();
-                        if step_guard::check_and_clear_timeout() {
-                            log::warn!("[guard] domain {} module {} timeout", domain_id, j);
-                        }
-                        if freq > 0 {
-                            let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
-                            fluxor::kernel::scheduler::record_step_time(global_idx, elapsed_us);
-                        }
-                        if matches!(outcome, Ok(fluxor::modules::StepOutcome::Burst)) {
-                            any_burst = true;
-                        }
+                let n = scheduler::domain_module_count(domain_id);
+                for pos in 0..n {
+                    let Some(global_idx) = scheduler::domain_exec_order_at(domain_id, pos) else { continue };
+                    scheduler::set_current_module(global_idx);
+                    step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
+                    let t0 = bcm_read_cntpct();
+                    let outcome = scheduler::step_module_outcome(global_idx);
+                    let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
+                    step_guard::disarm();
+                    step_guard::post_step_check();
+                    if step_guard::check_and_clear_timeout() {
+                        log::warn!("[guard] domain {} module {} timeout", domain_id, global_idx);
                     }
-                    pos += 1;
+                    if freq > 0 {
+                        let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
+                        scheduler::record_step_time(global_idx, elapsed_us);
+                    }
+                    if matches!(outcome, Some(Ok(fluxor::modules::StepOutcome::Burst))) {
+                        any_burst = true;
+                    }
                 }
                 pump_cross_domain(domain_id);
-                unsafe { pump_fan_outs(domain_id); pump_fan_ins(domain_id); }
                 if core_id == 0 { debug_drain_poll_core0(); }
 
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
@@ -2630,7 +1884,6 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
-                unsafe { pump_fan_outs(domain_id); pump_fan_ins(domain_id); }
                 if core_id == 0 { debug_drain_poll_core0(); }
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
@@ -2659,40 +1912,32 @@ fn run_domain_loop(domain_id: usize) -> ! {
     }
 }
 
-/// Step all modules in a domain with step guard protection.
-/// Uses topological order when available for correct producer-before-consumer.
+/// Step every module in `domain_id` in topological order under step
+/// guard protection. The iteration walks `SCHED.domain_exec_order` —
+/// the Kahn-sorted order `prepare_graph` partitioned by domain — so
+/// fan modules (`_tee` / `_merge`) run alongside user modules without
+/// a separate pump.
 fn domain_step_all(domain_id: usize) {
-    use fluxor::modules::Module;
     use fluxor::kernel::step_guard;
 
-    // Counter frequency is invariant at runtime — read once per call.
     let freq = bcm_counter_freq();
-    let dm = unsafe { &mut DOMAIN_MODULES[domain_id] };
-    let n = if dm.exec_order_count > 0 { dm.exec_order_count } else { dm.count };
-    let mut pos = 0;
-    while pos < n {
-        let j = if dm.exec_order_count > 0 { dm.exec_order[pos] as usize } else { pos };
-        if let Some(ref mut m) = dm.modules[j] {
-            let global_idx = dm.global_idx[j] as usize;
-            fluxor::kernel::scheduler::set_current_module(global_idx);
-            step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
-            let t0 = bcm_read_cntpct();
-            let _ = m.step();
-            let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
-            step_guard::disarm();
-            step_guard::post_step_check();
-            if step_guard::check_and_clear_timeout() {
-                log::warn!("[guard] domain {} module {} timeout", domain_id, j);
-            }
-            // Feed the step-time histogram so MON_HIST / fluxor monitor
-            // see non-zero buckets. freq != 0 after uart_init, but guard
-            // anyway in case this path runs pre-timer.
-            if freq > 0 {
-                let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
-                fluxor::kernel::scheduler::record_step_time(global_idx, elapsed_us);
-            }
+    let n = scheduler::domain_module_count(domain_id);
+    for pos in 0..n {
+        let Some(global_idx) = scheduler::domain_exec_order_at(domain_id, pos) else { continue };
+        scheduler::set_current_module(global_idx);
+        step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
+        let t0 = bcm_read_cntpct();
+        let _ = scheduler::step_module_outcome(global_idx);
+        let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
+        step_guard::disarm();
+        step_guard::post_step_check();
+        if step_guard::check_and_clear_timeout() {
+            log::warn!("[guard] domain {} module {} timeout", domain_id, global_idx);
         }
-        pos += 1;
+        if freq > 0 {
+            let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
+            scheduler::record_step_time(global_idx, elapsed_us);
+        }
     }
 }
 

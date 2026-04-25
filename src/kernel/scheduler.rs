@@ -97,8 +97,15 @@ pub struct Edge {
     pub to_module: usize,
     /// Destination port name
     pub to_port: &'static str,
-    /// Channel handle (assigned by open_channels)
+    /// Channel handle the producer writes into (assigned by `open_channels`).
     pub channel: i32,
+    /// Optional override for the consumer-side handle. When `>= 0`, the
+    /// destination module's port table is filled with this channel
+    /// instead of `channel`, and a platform-specific bridge moves bytes
+    /// from `channel` into `consumer_channel` (e.g. the BCM2712
+    /// cross-domain SPSC pump). `-1` means the consumer reads `channel`
+    /// directly — every same-domain edge.
+    pub consumer_channel: i32,
     /// Source output port index (0 = primary)
     pub from_port_index: u8,
     /// Destination input/ctrl port index (0 = primary)
@@ -124,6 +131,7 @@ impl Edge {
             to_module,
             to_port,
             channel: -1,
+            consumer_channel: -1,
             from_port_index: 0,
             to_port_index: 0,
             buffer_group: 0,
@@ -146,6 +154,7 @@ impl Edge {
             to_module,
             to_port,
             channel: -1,
+            consumer_channel: -1,
             from_port_index,
             to_port_index,
             buffer_group: 0,
@@ -712,6 +721,50 @@ pub unsafe fn static_loader() -> &'static ModuleLoader {
     &*(&raw const STATIC_LOADER)
 }
 
+/// Mutable access to the static loader for platforms that initialize
+/// it themselves (e.g. CM5 scans flash via the trailer).
+pub unsafe fn static_loader_mut() -> &'static mut ModuleLoader {
+    &mut *(&raw mut STATIC_LOADER)
+}
+
+/// Mutable access to the static config, paired with `static_loader_mut`.
+pub unsafe fn static_config_mut() -> &'static mut Config {
+    &mut *(&raw mut STATIC_CONFIG)
+}
+
+/// Get a reference to the static config. Returns the parsed FXWR header
+/// + module list + edge list that `prepare_graph` consumes.
+pub unsafe fn static_config() -> &'static Config {
+    &*(&raw const STATIC_CONFIG)
+}
+
+/// Install a fully-formed `Config` directly into the static slot. Used
+/// by integration tests that drive `prepare_graph` against a synthetic
+/// graph without round-tripping through the binary serializer.
+pub unsafe fn install_static_config(cfg: Config) {
+    let dst = unsafe { &mut *(&raw mut STATIC_CONFIG) };
+    *dst = cfg;
+}
+
+/// Populate the static config + loader from in-memory blobs.
+///
+/// `config_ptr` points to an FXWR-format config blob; `modules_ptr` to a
+/// module-table blob. The caller must keep both memory ranges mapped
+/// until module instantiation completes. After this returns `Ok`,
+/// `prepare_graph()` is the next step.
+pub unsafe fn populate_static_state(
+    config_ptr: *const u8,
+    modules_ptr: *const u8,
+) -> Result<(), &'static str> {
+    let loader = unsafe { &mut *(&raw mut STATIC_LOADER) };
+    let config = unsafe { &mut *(&raw mut STATIC_CONFIG) };
+    loader.init_from_blob(modules_ptr).map_err(|_| "loader init failed")?;
+    if !crate::kernel::config::read_config_from_ptr(config_ptr, config) {
+        return Err("config parse failed");
+    }
+    Ok(())
+}
+
 /// Maximum ports per direction (in/out/ctrl) per module
 const MAX_PORTS: usize = 8;
 
@@ -816,6 +869,8 @@ impl ArenaInfo {
 pub struct SchedulerState {
     /// Graph edge wiring
     pub edges: [Edge; MAX_CHANNELS],
+    /// Number of populated entries in `edges` (post fan insertion).
+    pub edge_count: usize,
     /// Instantiated module slots
     pub modules: [ModuleSlot; MAX_MODULES],
     /// Per-module port assignments
@@ -907,6 +962,7 @@ impl SchedulerState {
     const fn new() -> Self {
         Self {
             edges: [Edge::simple(0, 0); MAX_CHANNELS],
+            edge_count: 0,
             modules: [const { ModuleSlot::Empty }; MAX_MODULES],
             ports: [ModulePorts::empty(); MAX_MODULES],
             hints: [ModuleHints::empty(); MAX_MODULES],
@@ -953,6 +1009,7 @@ impl SchedulerState {
         for i in 0..MAX_CHANNELS {
             self.edges[i] = Edge::simple(0, 0);
         }
+        self.edge_count = 0;
         for i in 0..MAX_MODULES {
             self.modules[i] = ModuleSlot::Empty;
             self.ports[i] = ModulePorts::empty();
@@ -1161,13 +1218,17 @@ pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permission
     }
 }
 
-/// Step a single module by index (used by Linux platform main loop).
+/// Step a single module by index.
 pub fn step_module(idx: usize) {
-    if idx >= MAX_MODULES { return; }
+    let _ = step_module_outcome(idx);
+}
+
+/// Step a module and return its `StepOutcome`. Tier-3 poll-mode pump
+/// loops re-step on `StepOutcome::Burst`.
+pub fn step_module_outcome(idx: usize) -> Option<Result<StepOutcome, i32>> {
+    if idx >= MAX_MODULES { return None; }
     unsafe {
-        if let Some(m) = SCHED.modules[idx].as_module_mut() {
-            let _ = m.step();
-        }
+        SCHED.modules[idx].as_module_mut().map(|m| m.step())
     }
 }
 
@@ -1237,6 +1298,24 @@ pub fn domain_module_count(domain_id: usize) -> usize {
     } else {
         0
     }
+}
+
+/// Return the global module index at position `i` in `domain_id`'s
+/// topologically-sorted execution order, or `None` if out of range.
+/// Per-core pump loops walk this to drive every module — user modules
+/// and any `_tee` / `_merge` — that lives in their domain.
+pub fn domain_exec_order_at(domain_id: usize, i: usize) -> Option<usize> {
+    if domain_id >= MAX_DOMAINS { return None; }
+    let count = unsafe { SCHED.domain_module_count[domain_id] as usize };
+    if i >= count { return None; }
+    Some(unsafe { SCHED.domain_exec_order[domain_id][i] as usize })
+}
+
+/// Return the domain id assigned to a module, or `0` (the default
+/// domain) for out-of-range indices.
+pub fn module_domain_id(module_idx: usize) -> u8 {
+    if module_idx >= MAX_MODULES { return 0; }
+    unsafe { SCHED.domain_id[module_idx] }
 }
 
 /// Report a module's processing latency in frames.
@@ -1536,6 +1615,19 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     log_dma_owned_edges(runtime_edge_count);
 
     sched.active_module_count = module_count;
+    sched.edge_count = runtime_edge_count;
+
+    // Populate every module's port table from the compiled edges so
+    // `get_module_port` resolves correctly before any module is
+    // instantiated. Built-ins that bypass `instantiate_one_module` and
+    // post-processors (e.g. cross-domain bridging) can read the wired
+    // handles immediately on return.
+    for module_idx in 0..module_count {
+        if !populate_module_ports_from_edges(module_idx, module_idx) {
+            log::error!("[graph] port limit exceeded for module {}", module_idx);
+            return Err(-1);
+        }
+    }
 
     Ok((module_list, module_count))
 }
@@ -1550,8 +1642,8 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
 // ============================================================================
 
 /// Internal module hashes (fnv1a32)
-const INTERNAL_TEE_HASH: u32 = 0x607f045c;   // "_tee"
-const INTERNAL_MERGE_HASH: u32 = 0x8a6bcd3e; // "_merge"
+pub const INTERNAL_TEE_HASH: u32 = 0x607f045c;   // "_tee"
+pub const INTERNAL_MERGE_HASH: u32 = 0x8a6bcd3e; // "_merge"
 
 fn build_module_list(
     config: &Config,
@@ -1637,6 +1729,7 @@ fn push_internal_module(
     module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
     module_count: &mut usize,
     name_hash: u32,
+    domain_id: u8,
 ) -> Option<usize> {
     if *module_count >= MAX_MODULES {
         log::error!("No room for internal module");
@@ -1647,10 +1740,16 @@ fn push_internal_module(
     module_list[idx] = Some(ModuleEntry {
         name_hash,
         id: idx as u8,
-        domain_id: 0,
+        domain_id,
         params_ptr: core::ptr::null(),
         params_len: 0,
     });
+    // Mirror the domain assignment into SCHED so the per-domain
+    // exec-order partitioner sees the inserted slot.
+    if idx < MAX_MODULES {
+        let sched = unsafe { &mut *(&raw mut SCHED) };
+        sched.domain_id[idx] = domain_id;
+    }
     *module_count += 1;
     Some(idx)
 }
@@ -1775,7 +1874,15 @@ fn insert_fan(
                 return false;
             }
 
-            let fan_idx = match push_internal_module(module_list, module_count, internal_hash) {
+            // The tee/merge inherits the fanned-on module's domain so
+            // it runs in the same pump as the fan group it serves.
+            let fan_domain = match &module_list[module_idx] {
+                Some(e) => e.domain_id,
+                None => 0,
+            };
+            let fan_idx = match push_internal_module(
+                module_list, module_count, internal_hash, fan_domain,
+            ) {
                 Some(idx) => idx,
                 None => return false,
             };
@@ -1844,6 +1951,38 @@ fn validate_hardware_requirements(config: &RunnerConfig) -> bool {
     }
 
     valid
+}
+
+/// Populate a module's port table from the compiled `sched.edges`.
+///
+/// Reads every edge touching `module_idx` and writes the resulting
+/// in/out/ctrl channel handles into `sched.ports[instantiated]`.
+/// Returns `false` if the module has more than `MAX_PORTS` channels in
+/// any direction (a config error).
+///
+/// Used by platform setup paths that don't go through
+/// `instantiate_one_module` — e.g. hosted built-ins that aren't in the
+/// loader.
+pub fn populate_module_ports_from_edges(
+    module_idx: usize,
+    instantiated: usize,
+) -> bool {
+    if module_idx >= MAX_MODULES || instantiated >= MAX_MODULES {
+        return false;
+    }
+    let sched = unsafe { &mut *(&raw mut SCHED) };
+    let mut in_chans = [-1i32; MAX_CHANNELS];
+    let mut out_chans = [-1i32; MAX_CHANNELS];
+    let mut ctrl_chans = [-1i32; MAX_CHANNELS];
+    let in_count = collect_input_channels(&sched.edges, module_idx, &mut in_chans);
+    let out_count = collect_output_channels(&sched.edges, module_idx, &mut out_chans);
+    let ctrl_count = collect_ctrl_channels(&sched.edges, module_idx, &mut ctrl_chans);
+    populate_ports(
+        &mut sched.ports[instantiated],
+        &in_chans, in_count,
+        &out_chans, out_count,
+        &ctrl_chans, ctrl_count,
+    )
 }
 
 /// Copy collected channels into ModulePorts.
@@ -3150,17 +3289,29 @@ fn collect_channels(
             FanDirection::Out => edge.from_module == module_idx,
             FanDirection::In => edge.to_module == module_idx && edge.is_ctrl() == ctrl_only,
         };
-        if edge.channel >= 0 && matches {
+        // Producer reads `channel`; consumer reads `consumer_channel`
+        // when a platform bridge has split the edge, otherwise `channel`.
+        let chan_for_side = match direction {
+            FanDirection::Out => edge.channel,
+            FanDirection::In => {
+                if edge.consumer_channel >= 0 {
+                    edge.consumer_channel
+                } else {
+                    edge.channel
+                }
+            }
+        };
+        if chan_for_side >= 0 && matches {
             // Place at port index if it fits, otherwise append
             let port_idx = match direction {
                 FanDirection::Out => edge.from_port_index as usize,
                 FanDirection::In => edge.to_port_index as usize,
             };
             if port_idx < out.len() && out[port_idx] == -1 {
-                out[port_idx] = edge.channel;
+                out[port_idx] = chan_for_side;
                 if port_idx >= count { count = port_idx + 1; }
             } else if count < out.len() {
-                out[count] = edge.channel;
+                out[count] = chan_for_side;
                 count += 1;
             }
         }
