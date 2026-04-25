@@ -313,21 +313,10 @@ pub fn parse_modules_from_config(
 /// Check if a module type is a kernel built-in (has `builtin = true` in its manifest).
 /// Built-in modules don't have .fmod files — they're compiled into the kernel binary.
 fn is_builtin_module(module_type: &str) -> bool {
-    let source_dirs: &[&str] = &[
-        "modules/drivers",
-        "modules/foundation",
-        "modules/app",
-        "modules",
-    ];
-    for dir in source_dirs {
-        let manifest_path = std::path::Path::new(dir).join(module_type).join("manifest.toml");
-        if manifest_path.exists() {
-            if let Ok(m) = manifest::Manifest::from_toml(&manifest_path) {
-                return m.builtin;
-            }
-        }
-    }
-    false
+    matches!(
+        manifest::Manifest::from_source_tree(module_type),
+        Ok(Some(m)) if m.builtin
+    )
 }
 
 /// Resolve a module .fmod file by searching primary dir, then extra dirs in order.

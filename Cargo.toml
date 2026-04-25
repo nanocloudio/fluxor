@@ -62,6 +62,24 @@ embedded-io-async = { version = "0.7.0", optional = true }
 # On thumbv8m (RP2350) this is a zero-cost pass-through.
 portable-atomic = { version = "1.13.1", default-features = false, optional = true }
 
+# ── host-window: linux_display interactive backend ─────────────────────
+# Pure-Rust window stack: winit owns the OS surface, softbuffer blits a
+# CPU framebuffer into it. Both gated behind the `host-window` feature
+# so the default `host-linux` build doesn't pull them in.
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
+# ── host-playback: linux_audio interactive backend ─────────────────────
+# CPAL is the cross-platform audio dep — Linux uses ALSA under the
+# hood. Gated behind `host-playback` so file-mode capture builds stay
+# dep-free.
+cpal = { version = "0.15", optional = true }
+
+# ── host-image: host_image_codec (JPEG/PNG/BMP → RGB565) ───────────────
+# `image` brings every default decoder; trimmed to JPEG/PNG/BMP/GIF
+# below since fluxor's display sinks consume RGB565 from any of them.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif"], optional = true }
+
 [features]
 default = ["chip-rp2350b"]
 
@@ -97,6 +115,21 @@ board-cm5 = ["chip-bcm2712"]
 # Linux hosted (aarch64 userspace). Uses std — no embassy, no cortex-m.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
 host-linux = ["portable-atomic", "sha2", "env_logger", "libc"]
+
+# Optional `linux_display` backend: open a real window via winit and
+# blit each RGB565 frame through softbuffer. Off by default; file +
+# null modes always available.
+host-window = ["host-linux", "winit", "softbuffer"]
+
+# Optional `linux_audio` backend: stream PCM into the host audio
+# device via CPAL. Off by default; wav + raw + null capture always
+# available.
+host-playback = ["host-linux", "cpal"]
+
+# Optional `host_image_codec` built-in: decode JPEG/PNG/BMP/GIF into
+# RGB565 frames, sized to a target width/height. Lets hosted graphs
+# feed real images into the display sink without a board codec.
+host-image = ["host-linux", "image"]
 
 # Require every loaded module to carry a valid Ed25519 signature from the
 # provisioned root-of-trust key (see hal::otp_read_signing_key). When

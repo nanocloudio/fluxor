@@ -829,7 +829,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 ///           bits [3:0] = to_port_index   (4-bit, 0..15)
 ///
 /// Both port indices are 4 bits; the runtime caps both at
-/// `MAX_PORTS = 8` (scheduler.rs). `buffer_group` is 5 bits — group 0
+/// `MAX_PORTS = 16` (scheduler.rs). `buffer_group` is 5 bits — group 0
 /// means no aliasing, ids 1..31 mark in-place chains. The tool's
 /// `assign_buffer_groups` enforces the 31 ceiling.
 fn parse_graph_edge(ptr: *const u8) -> GraphEdge {

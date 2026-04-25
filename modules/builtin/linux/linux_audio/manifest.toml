@@ -1,0 +1,32 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+[[ports]]
+name = "audio"
+direction = "input"
+content_type = "AudioPcm"
+required = true
+
+[[params]]
+name = "mode"
+type = "enum"
+values = ["wav", "raw", "null", "playback"]
+default = "wav"
+
+[[params]]
+name = "path"
+type = "str"
+default = "./target/host-audio/out.wav"
+
+[[params]]
+name = "sample_rate"
+type = "u32"
+default = 48000
+range = [8000, 192000]
+
+[[params]]
+name = "channels"
+type = "u8"
+default = 2
+range = [1, 8]

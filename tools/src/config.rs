@@ -36,24 +36,69 @@ const MAX_HW_PIO: usize = 3;
 
 /// Type mappings
 const SOURCE_TYPES: &[&str] = &[
-    "None", "MqttTopic", "SdCard", "SdCardFile", "GpioInput", "Timer",
-    "UartRx", "I2cRead", "SpiRead", "SpiFrame", "AdcChannel", "TcpSocket", "Playlist", "TestTone",
+    "None",
+    "MqttTopic",
+    "SdCard",
+    "SdCardFile",
+    "GpioInput",
+    "Timer",
+    "UartRx",
+    "I2cRead",
+    "SpiRead",
+    "SpiFrame",
+    "AdcChannel",
+    "TcpSocket",
+    "Playlist",
+    "TestTone",
 ];
 
 const SINK_TYPES: &[&str] = &[
-    "None", "I2sOutput", "MqttPublish", "GpioOutput", "UartTx", "I2cWrite",
-    "SpiWrite", "PwmOutput", "SdCardWrite", "TcpSocket", "Log", "Led",
+    "None",
+    "I2sOutput",
+    "MqttPublish",
+    "GpioOutput",
+    "UartTx",
+    "I2cWrite",
+    "SpiWrite",
+    "PwmOutput",
+    "SdCardWrite",
+    "TcpSocket",
+    "Log",
+    "Led",
 ];
 
 const TRANSFORMER_TYPES: &[&str] = &[
-    "None", "AudioFormat", "Resampler", "GpioToMqtt", "MqttToGpio",
-    "RawToAudio", "Aggregate", "Split", "Passthrough", "Digest",
+    "None",
+    "AudioFormat",
+    "Resampler",
+    "GpioToMqtt",
+    "MqttToGpio",
+    "RawToAudio",
+    "Aggregate",
+    "Split",
+    "Passthrough",
+    "Digest",
 ];
 
 const CONTENT_TYPES: &[&str] = &[
-    "OctetStream", "Cbor", "Json", "AudioPcm", "AudioOpus", "AudioMp3", "AudioAac",
-    "TextPlain", "TextHtml", "ImageRaw", "ImageJpeg", "ImagePng",
-    "MeshEvent", "MeshCommand", "MeshState", "MeshHandle", "InputEvent", "GestureMatch",
+    "OctetStream",
+    "Cbor",
+    "Json",
+    "AudioPcm",
+    "AudioOpus",
+    "AudioMp3",
+    "AudioAac",
+    "TextPlain",
+    "TextHtml",
+    "ImageRaw",
+    "ImageJpeg",
+    "ImagePng",
+    "MeshEvent",
+    "MeshCommand",
+    "MeshState",
+    "MeshHandle",
+    "InputEvent",
+    "GestureMatch",
 ];
 
 const INPUT_CONTROL_TYPES: &[&str] = &["Button", "Range"];
@@ -61,7 +106,15 @@ const INPUT_CONTROL_TYPES: &[&str] = &["Button", "Range"];
 const INPUT_SOURCE_TYPES: &[&str] = &["GpioInput", "AdcChannel", "Touch", "System"];
 
 const GESTURE_PATTERNS: &[&str] = &[
-    "Click", "Long", "Double", "Triple", "Hold", "Release", "Change", "CrossUp", "CrossDown",
+    "Click",
+    "Long",
+    "Double",
+    "Triple",
+    "Hold",
+    "Release",
+    "Change",
+    "CrossUp",
+    "CrossDown",
 ];
 
 /// Read null-terminated string from memory map
@@ -116,10 +169,9 @@ fn format_uuid(bytes: &[u8]) -> String {
 }
 
 fn get_type_name(types: &[&str], id: u8) -> String {
-    types.get(id as usize).map_or_else(
-        || format!("Unknown({})", id),
-        |s| s.to_string(),
-    )
+    types
+        .get(id as usize)
+        .map_or_else(|| format!("Unknown({})", id), |s| s.to_string())
 }
 
 /// Decode source entry from binary (pointer-based format, 16 bytes)
@@ -133,7 +185,10 @@ fn decode_source(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
     result.insert("id".into(), json!(id));
 
     if content_type != 0 {
-        result.insert("content_type".into(), json!(get_type_name(CONTENT_TYPES, content_type)));
+        result.insert(
+            "content_type".into(),
+            json!(get_type_name(CONTENT_TYPES, content_type)),
+        );
     }
 
     let union_data = &entry[4..16];
@@ -142,24 +197,38 @@ fn decode_source(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
         1 => {
             // MqttTopic
             let topic_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
             result.insert("topic".into(), json!(read_string_at(memory, topic_ptr)));
             result.insert("qos".into(), json!(union_data[8]));
         }
         2 => {
             // SdCard
-            let start = u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
-            let count = u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
+            let start =
+                u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
+            let count =
+                u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
             result.insert("start_block".into(), json!(start));
             result.insert("block_count".into(), json!(count));
         }
         3 => {
             // SdCardFile
             let path_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
             result.insert("path".into(), json!(read_string_at(memory, path_ptr)));
         }
@@ -181,14 +250,16 @@ fn decode_source(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
         }
         5 => {
             // Timer
-            let interval = u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
+            let interval =
+                u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
             result.insert("interval_us".into(), json!(interval));
             result.insert("periodic".into(), json!(union_data[4] != 0));
         }
         6 => {
             // UartRx
             result.insert("uart_id".into(), json!(union_data[0]));
-            let baudrate = u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
+            let baudrate =
+                u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
             result.insert("baudrate".into(), json!(baudrate));
         }
         7 => {
@@ -209,25 +280,45 @@ fn decode_source(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
         10 => {
             // AdcChannel
             result.insert("channel".into(), json!(union_data[0]));
-            let rate = u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
+            let rate =
+                u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
             result.insert("sample_rate".into(), json!(rate));
         }
         11 => {
             // TcpSocket
             let host_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
             let port = u16::from_le_bytes([union_data[8], union_data[9]]);
             result.insert("host".into(), json!(read_string_at(memory, host_ptr)));
             result.insert("port".into(), json!(port));
-            result.insert("mode".into(), json!(if union_data[10] != 0 { "server" } else { "client" }));
+            result.insert(
+                "mode".into(),
+                json!(if union_data[10] != 0 {
+                    "server"
+                } else {
+                    "client"
+                }),
+            );
         }
         12 => {
             // Playlist
             let dir_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
             result.insert("directory".into(), json!(read_string_at(memory, dir_ptr)));
             let mode = match union_data[8] {
@@ -241,8 +332,10 @@ fn decode_source(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
         }
         13 => {
             // TestTone
-            let freq = u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
-            let rate = u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
+            let freq =
+                u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
+            let rate =
+                u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
             result.insert("frequency".into(), json!(freq));
             result.insert("sample_rate".into(), json!(rate));
         }
@@ -263,7 +356,10 @@ fn decode_sink(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
     result.insert("id".into(), json!(id));
 
     if content_type != 0 {
-        result.insert("content_type".into(), json!(get_type_name(CONTENT_TYPES, content_type)));
+        result.insert(
+            "content_type".into(),
+            json!(get_type_name(CONTENT_TYPES, content_type)),
+        );
     }
 
     let union_data = &entry[4..16];
@@ -274,14 +370,21 @@ fn decode_sink(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
             result.insert("data_pin".into(), json!(union_data[0]));
             result.insert("clock_pin_base".into(), json!(union_data[1]));
             result.insert("bits".into(), json!(union_data[2]));
-            let rate = u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
+            let rate =
+                u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
             result.insert("sample_rate".into(), json!(rate));
         }
         2 => {
             // MqttPublish
             let topic_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
             result.insert("topic".into(), json!(read_string_at(memory, topic_ptr)));
             result.insert("qos".into(), json!(union_data[8]));
@@ -318,8 +421,14 @@ fn decode_sink(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
         9 => {
             // TcpSocket
             let host_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
             let port = u16::from_le_bytes([union_data[8], union_data[9]]);
             result.insert("host".into(), json!(read_string_at(memory, host_ptr)));
@@ -345,7 +454,10 @@ fn decode_transformer(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
     let id = entry[1];
 
     let mut result = Map::new();
-    result.insert("type".into(), json!(get_type_name(TRANSFORMER_TYPES, type_id)));
+    result.insert(
+        "type".into(),
+        json!(get_type_name(TRANSFORMER_TYPES, type_id)),
+    );
     result.insert("id".into(), json!(id));
 
     let union_data = &entry[4..16];
@@ -360,28 +472,48 @@ fn decode_transformer(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
         }
         2 => {
             // Resampler
-            let in_rate = u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
-            let out_rate = u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
+            let in_rate =
+                u32::from_le_bytes([union_data[0], union_data[1], union_data[2], union_data[3]]);
+            let out_rate =
+                u32::from_le_bytes([union_data[4], union_data[5], union_data[6], union_data[7]]);
             result.insert("input_rate".into(), json!(in_rate));
             result.insert("output_rate".into(), json!(out_rate));
         }
         3 => {
             // GpioToMqtt
             let prefix_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
-            result.insert("topic_prefix".into(), json!(read_string_at(memory, prefix_ptr)));
+            result.insert(
+                "topic_prefix".into(),
+                json!(read_string_at(memory, prefix_ptr)),
+            );
             result.insert("json_format".into(), json!(union_data[8] != 0));
             result.insert("include_timestamp".into(), json!(union_data[9] != 0));
         }
         4 => {
             // MqttToGpio
             let filter_ptr = u64::from_le_bytes([
-                union_data[0], union_data[1], union_data[2], union_data[3],
-                union_data[4], union_data[5], union_data[6], union_data[7],
+                union_data[0],
+                union_data[1],
+                union_data[2],
+                union_data[3],
+                union_data[4],
+                union_data[5],
+                union_data[6],
+                union_data[7],
             ]) as u32;
-            result.insert("topic_filter".into(), json!(read_string_at(memory, filter_ptr)));
+            result.insert(
+                "topic_filter".into(),
+                json!(read_string_at(memory, filter_ptr)),
+            );
             result.insert("json_format".into(), json!(union_data[8] != 0));
         }
         5 => {
@@ -434,7 +566,10 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     let mut edge = serde_json::Map::new();
     edge.insert("from_id".into(), json!(from_id));
     edge.insert("to_id".into(), json!(to_id));
-    edge.insert("to_port".into(), json!(if to_port == 1 { "ctrl" } else { "in" }));
+    edge.insert(
+        "to_port".into(),
+        json!(if to_port == 1 { "ctrl" } else { "in" }),
+    );
     if buffer_group > 0 {
         edge.insert("buffer_group".into(), json!(buffer_group));
     }
@@ -463,8 +598,14 @@ fn decode_control(entry: &[u8]) -> Value {
 
     let mut result = Map::new();
     result.insert("id".into(), json!(id));
-    result.insert("type".into(), json!(get_type_name(INPUT_CONTROL_TYPES, type_id)));
-    result.insert("source".into(), json!(get_type_name(INPUT_SOURCE_TYPES, source_type)));
+    result.insert(
+        "type".into(),
+        json!(get_type_name(INPUT_CONTROL_TYPES, type_id)),
+    );
+    result.insert(
+        "source".into(),
+        json!(get_type_name(INPUT_SOURCE_TYPES, source_type)),
+    );
 
     match source_type {
         0 => {
@@ -513,7 +654,10 @@ fn decode_gesture(entry: &[u8]) -> Value {
 
     let mut result = Map::new();
     result.insert("control".into(), json!(control_id));
-    result.insert("pattern".into(), json!(get_type_name(GESTURE_PATTERNS, pattern)));
+    result.insert(
+        "pattern".into(),
+        json!(get_type_name(GESTURE_PATTERNS, pattern)),
+    );
 
     if param != 0 {
         match pattern {
@@ -607,7 +751,12 @@ fn decode_object(entry: &[u8], memory: &BTreeMap<u32, u8>) -> Value {
 /// Decode current format (FXCF, pointer-based)
 fn decode_current_format(header_data: &[u8], memory: &BTreeMap<u32, u8>) -> Result<Value> {
     // Parse header (64 bytes)
-    let _magic = u32::from_le_bytes([header_data[0], header_data[1], header_data[2], header_data[3]]);
+    let _magic = u32::from_le_bytes([
+        header_data[0],
+        header_data[1],
+        header_data[2],
+        header_data[3],
+    ]);
     let _total_size = u16::from_le_bytes([header_data[4], header_data[5]]);
     let source_count = header_data[6];
     let sink_count = header_data[7];
@@ -618,29 +767,85 @@ fn decode_current_format(header_data: &[u8], memory: &BTreeMap<u32, u8>) -> Resu
     let gesture_count = header_data[12];
 
     // Pointers (at offset 16)
-    let sources_ptr = u32::from_le_bytes([header_data[16], header_data[17], header_data[18], header_data[19]]);
-    let sinks_ptr = u32::from_le_bytes([header_data[20], header_data[21], header_data[22], header_data[23]]);
-    let transformers_ptr = u32::from_le_bytes([header_data[24], header_data[25], header_data[26], header_data[27]]);
-    let pipelines_ptr = u32::from_le_bytes([header_data[28], header_data[29], header_data[30], header_data[31]]);
-    let objects_ptr = u32::from_le_bytes([header_data[32], header_data[33], header_data[34], header_data[35]]);
-    let _strings_ptr = u32::from_le_bytes([header_data[36], header_data[37], header_data[38], header_data[39]]);
+    let sources_ptr = u32::from_le_bytes([
+        header_data[16],
+        header_data[17],
+        header_data[18],
+        header_data[19],
+    ]);
+    let sinks_ptr = u32::from_le_bytes([
+        header_data[20],
+        header_data[21],
+        header_data[22],
+        header_data[23],
+    ]);
+    let transformers_ptr = u32::from_le_bytes([
+        header_data[24],
+        header_data[25],
+        header_data[26],
+        header_data[27],
+    ]);
+    let pipelines_ptr = u32::from_le_bytes([
+        header_data[28],
+        header_data[29],
+        header_data[30],
+        header_data[31],
+    ]);
+    let objects_ptr = u32::from_le_bytes([
+        header_data[32],
+        header_data[33],
+        header_data[34],
+        header_data[35],
+    ]);
+    let _strings_ptr = u32::from_le_bytes([
+        header_data[36],
+        header_data[37],
+        header_data[38],
+        header_data[39],
+    ]);
 
     // Device identity (at offset 48)
-    let device_uuid_ptr = u32::from_le_bytes([header_data[48], header_data[49], header_data[50], header_data[51]]);
-    let device_name_ptr = u32::from_le_bytes([header_data[52], header_data[53], header_data[54], header_data[55]]);
+    let device_uuid_ptr = u32::from_le_bytes([
+        header_data[48],
+        header_data[49],
+        header_data[50],
+        header_data[51],
+    ]);
+    let device_name_ptr = u32::from_le_bytes([
+        header_data[52],
+        header_data[53],
+        header_data[54],
+        header_data[55],
+    ]);
 
     // Controls and gestures (at offset 56)
-    let controls_ptr = u32::from_le_bytes([header_data[56], header_data[57], header_data[58], header_data[59]]);
-    let gestures_ptr = u32::from_le_bytes([header_data[60], header_data[61], header_data[62], header_data[63]]);
+    let controls_ptr = u32::from_le_bytes([
+        header_data[56],
+        header_data[57],
+        header_data[58],
+        header_data[59],
+    ]);
+    let gestures_ptr = u32::from_le_bytes([
+        header_data[60],
+        header_data[61],
+        header_data[62],
+        header_data[63],
+    ]);
 
     let mut result = Map::new();
 
     // Device identity
     if device_uuid_ptr != 0 {
-        result.insert("device_uuid".into(), json!(read_uuid_at(memory, device_uuid_ptr)));
+        result.insert(
+            "device_uuid".into(),
+            json!(read_uuid_at(memory, device_uuid_ptr)),
+        );
     }
     if device_name_ptr != 0 {
-        result.insert("device_name".into(), json!(read_string_at(memory, device_name_ptr)));
+        result.insert(
+            "device_name".into(),
+            json!(read_string_at(memory, device_name_ptr)),
+        );
     }
 
     // Decode sources
@@ -720,7 +925,10 @@ fn decode_legacy_format(data: &[u8]) -> Result<Value> {
     let count_byte_11 = data[11];
 
     let mut result = Map::new();
-    result.insert("format".into(), json!(if version >= 3 { "graph" } else { "legacy" }));
+    result.insert(
+        "format".into(),
+        json!(if version >= 3 { "graph" } else { "legacy" }),
+    );
     result.insert("version".into(), json!(version));
     result.insert("source_count".into(), json!(source_count));
     result.insert("sink_count".into(), json!(sink_count));
@@ -730,7 +938,10 @@ fn decode_legacy_format(data: &[u8]) -> Result<Value> {
     } else {
         result.insert("pipeline_count".into(), json!(count_byte_11));
     }
-    result.insert("note".into(), json!("FXWR format - detailed decoding available for basic types"));
+    result.insert(
+        "note".into(),
+        json!("FXWR format - detailed decoding available for basic types"),
+    );
 
     // Parse sources from legacy format
     let sources_offset = 16; // After header + counts
@@ -749,10 +960,16 @@ fn decode_legacy_format(data: &[u8]) -> Result<Value> {
                 2 => {
                     // SdCard
                     let start = u32::from_le_bytes([
-                        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
                     ]);
                     let count = u32::from_le_bytes([
-                        data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
+                        data[offset + 8],
+                        data[offset + 9],
+                        data[offset + 10],
+                        data[offset + 11],
                     ]);
                     src.insert("start_block".into(), json!(start));
                     src.insert("block_count".into(), json!(count));
@@ -760,7 +977,10 @@ fn decode_legacy_format(data: &[u8]) -> Result<Value> {
                 5 => {
                     // Timer
                     let interval = u32::from_le_bytes([
-                        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
                     ]);
                     src.insert("interval_us".into(), json!(interval));
                     src.insert("periodic".into(), json!(data[offset + 8] != 0));
@@ -791,7 +1011,10 @@ fn decode_legacy_format(data: &[u8]) -> Result<Value> {
                     snk.insert("clock_pin_base".into(), json!(data[offset + 5]));
                     snk.insert("bits".into(), json!(data[offset + 6]));
                     let rate = u32::from_le_bytes([
-                        data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
+                        data[offset + 8],
+                        data[offset + 9],
+                        data[offset + 10],
+                        data[offset + 11],
                     ]);
                     snk.insert("sample_rate".into(), json!(rate));
                 }
@@ -815,34 +1038,59 @@ fn decode_legacy_format(data: &[u8]) -> Result<Value> {
             let type_id = data[offset];
             let id = data[offset + 1];
             let mut xform = Map::new();
-            xform.insert("type".into(), json!(get_type_name(TRANSFORMER_TYPES, type_id)));
+            xform.insert(
+                "type".into(),
+                json!(get_type_name(TRANSFORMER_TYPES, type_id)),
+            );
             xform.insert("id".into(), json!(id));
 
             match type_id {
                 1 => {
                     // AudioFormat: input_rate(4), output_rate(4), input_format(1), output_format(1), gain(2)
                     let in_rate = u32::from_le_bytes([
-                        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
                     ]);
                     let out_rate = u32::from_le_bytes([
-                        data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
+                        data[offset + 8],
+                        data[offset + 9],
+                        data[offset + 10],
+                        data[offset + 11],
                     ]);
                     let in_fmt = data[offset + 12];
                     let out_fmt = data[offset + 13];
                     let gain = u16::from_le_bytes([data[offset + 14], data[offset + 15]]);
                     xform.insert("input_rate".into(), json!(in_rate));
                     xform.insert("output_rate".into(), json!(out_rate));
-                    xform.insert("input_format".into(), json!(if in_fmt == 0 { "u8_mono" } else { "i16_mono" }));
-                    xform.insert("output_format".into(), json!(if out_fmt == 0 { "i16_mono" } else { "i16_stereo" }));
+                    xform.insert(
+                        "input_format".into(),
+                        json!(if in_fmt == 0 { "u8_mono" } else { "i16_mono" }),
+                    );
+                    xform.insert(
+                        "output_format".into(),
+                        json!(if out_fmt == 0 {
+                            "i16_mono"
+                        } else {
+                            "i16_stereo"
+                        }),
+                    );
                     xform.insert("gain".into(), json!(gain));
                 }
                 2 => {
                     // Resampler: input_rate(4), output_rate(4)
                     let in_rate = u32::from_le_bytes([
-                        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
                     ]);
                     let out_rate = u32::from_le_bytes([
-                        data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
+                        data[offset + 8],
+                        data[offset + 9],
+                        data[offset + 10],
+                        data[offset + 11],
                     ]);
                     xform.insert("input_rate".into(), json!(in_rate));
                     xform.insert("output_rate".into(), json!(out_rate));
@@ -906,10 +1154,11 @@ pub fn decode_config(data: &[u8], memory: &BTreeMap<u32, u8>) -> Result<Value> {
             }
             decode_current_format(data, memory)
         }
-        MAGIC_LEGACY => {
-            decode_legacy_format(data)
-        }
-        _ => Err(Error::Config(format!("Unknown config magic: 0x{:08x}", magic))),
+        MAGIC_LEGACY => decode_legacy_format(data),
+        _ => Err(Error::Config(format!(
+            "Unknown config magic: 0x{:08x}",
+            magic
+        ))),
     }
 }
 
@@ -926,7 +1175,6 @@ impl ConfigBuilder {
         Self
     }
 }
-
 
 // =============================================================================
 // Graph Config (Version 3+)
@@ -964,9 +1212,11 @@ const P: usize = MODULE_ENTRY_HEADER_SIZE;
 fn parse_uuid_bytes(s: &str) -> [u8; 16] {
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     let mut out = [0u8; 16];
-    if hex.len() != 32 { return out; }
+    if hex.len() != 32 {
+        return out;
+    }
     for i in 0..16 {
-        out[i] = u8::from_str_radix(&hex[i*2..i*2+2], 16).unwrap_or(0);
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
     }
     out
 }
@@ -974,7 +1224,9 @@ fn parse_uuid_bytes(s: &str) -> [u8; 16] {
 /// Parse IPv4 address string to u32 (network byte order).
 fn parse_ipv4(s: &str) -> u32 {
     let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 { return 0; }
+    if parts.len() != 4 {
+        return 0;
+    }
     let a = parts[0].parse::<u8>().unwrap_or(0);
     let b = parts[1].parse::<u8>().unwrap_or(0);
     let c = parts[2].parse::<u8>().unwrap_or(0);
@@ -986,109 +1238,11 @@ fn parse_ipv4(s: &str) -> u32 {
 fn parse_broker_addr(s: &str) -> (u32, u16) {
     let parts: Vec<&str> = s.splitn(2, ':').collect();
     let ip = parse_ipv4(parts.first().unwrap_or(&""));
-    let port = parts.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(1883);
+    let port = parts
+        .get(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(1883);
     (ip, port)
-}
-
-fn build_mqtt_params(module: &Value, entry: &mut [u8], config: &Value) -> usize {
-    // mqtt params layout:
-    // [0-3]     broker_ip: u32
-    // [4-5]     broker_port: u16 (default 1883)
-    // [6]       keepalive_s: u8 (default 60)
-    // [7]       client_id_len: u8
-    // [8-39]    client_id: [u8; 32]
-    // [40]      subscribe_topic_len: u8
-    // [41]      publish_topic_len: u8
-    // [42-43]   reserved
-    // [44-139]  subscribe_topic: [u8; 96]
-    // [140-235] publish_topic_prefix: [u8; 96]
-
-    // Broker address
-    let (broker_ip, broker_port) = if let Some(s) = module["broker"].as_str() {
-        parse_broker_addr(s)
-    } else {
-        let ip = module["broker_ip"].as_str().map(parse_ipv4).unwrap_or(0);
-        let port = module["broker_port"].as_u64().unwrap_or(1883) as u16;
-        (ip, port)
-    };
-
-    let keepalive = module["keepalive"].as_u64().unwrap_or(60) as u8;
-    let client_id = module["client_id"].as_str().unwrap_or("");
-    let cid_bytes = client_id.as_bytes();
-    let cid_len = cid_bytes.len().min(32);
-
-    entry[P..P+4].copy_from_slice(&broker_ip.to_le_bytes());
-    entry[P+4..P+6].copy_from_slice(&broker_port.to_le_bytes());
-    entry[P+6] = keepalive;
-    entry[P+7] = cid_len as u8;
-
-    for (i, &b) in cid_bytes.iter().take(cid_len).enumerate() {
-        entry[P+8+i] = b;
-    }
-
-    // Build subscribe and publish topics from device_uuid + object UUIDs
-    // Subscribe: "fluxor/{device_hex}/objects/+/commands"
-    // Publish prefix is not stored — mesh_bridge provides full topic per message
-    let device_uuid_str = config.get("device_uuid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let device_uuid = parse_uuid_bytes(device_uuid_str);
-    let device_hex: String = device_uuid.iter().map(|b| format!("{:02x}", b)).collect();
-
-    // Subscribe topic: "fluxor/{device_hex}/objects/+/commands"
-    let sub_topic = if !device_hex.is_empty() && device_uuid != [0u8; 16] {
-        format!("fluxor/{}/objects/+/commands", device_hex)
-    } else if let Some(t) = module["subscribe_topic"].as_str() {
-        t.to_string()
-    } else {
-        String::new()
-    };
-
-    let sub_bytes = sub_topic.as_bytes();
-    let sub_len = sub_bytes.len().min(96);
-    entry[P+40] = sub_len as u8;
-    entry[P+41] = 0; // publish_topic_len (unused — mesh_bridge provides topics)
-
-    for (i, &b) in sub_bytes.iter().take(sub_len).enumerate() {
-        entry[P+44+i] = b;
-    }
-
-    236 // fixed param size
-}
-
-fn build_mesh_bridge_params(module: &Value, entry: &mut [u8], config: &Value) -> usize {
-    // mesh_bridge params layout:
-    // [0-15]  device_uuid: [u8; 16]
-    // [16]    object_count: u8
-    // [17-19] reserved
-    // Per object (24 bytes each, starting at offset 20):
-    //   [0-15]  object_uuid: [u8; 16]
-    //   [16]    control_id: u8
-    //   [17]    ctrl_port_index: u8
-    //   [18-23] reserved
-
-    let device_uuid_str = config.get("device_uuid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let device_uuid = parse_uuid_bytes(device_uuid_str);
-    entry[P..P+16].copy_from_slice(&device_uuid);
-
-    let objects = module["objects"].as_array();
-    let obj_count = objects.map(|a| a.len().min(4)).unwrap_or(0);
-    entry[P+16] = obj_count as u8;
-
-    if let Some(objs) = objects {
-        for (i, obj) in objs.iter().take(4).enumerate() {
-            let offset = P + 20 + i * 24;
-            let uuid_str = obj["uuid"].as_str().unwrap_or("");
-            let uuid_bytes = parse_uuid_bytes(uuid_str);
-            entry[offset..offset+16].copy_from_slice(&uuid_bytes);
-            entry[offset+16] = obj["control_id"].as_u64().unwrap_or(0) as u8;
-            entry[offset+17] = obj["ctrl_port_index"].as_u64().unwrap_or(0) as u8;
-        }
-    }
-
-    20 + obj_count * 24 // variable size
 }
 
 /// Build a variable-length module entry from config.
@@ -1118,16 +1272,381 @@ fn resolve_domain_id(module: &Value, config: &Value) -> u8 {
     }
 
     // Domain name not found in config — treat as domain 0 with a warning
-    eprintln!("warning: module domain '{}' not found in execution.domains, using default", domain_name);
+    eprintln!(
+        "warning: module domain '{}' not found in execution.domains, using default",
+        domain_name
+    );
     0
 }
 
-/// - Bytes 0-1: entry_length (u16) - total size including header
-/// - Bytes 2-5: name_hash (fnv1a32)
-/// - Byte 6: id
-/// - Byte 7: domain_id
-/// - Bytes 8+: params (variable, module-specific)
-fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&Value>, config: &Value, modules_dir: &Path) -> Result<Vec<u8>> {
+/// Load a built-in module's manifest from the source tree and
+/// synthesize a `ParamSchema` from its `[[params]]` declarations.
+/// Returns `None` when the manifest doesn't exist, isn't marked
+/// built-in, or declares no params. Repeated lookups share a
+/// per-process cache via `Manifest::from_source_tree`.
+fn load_builtin_param_schema(
+    module_type: &str,
+) -> Option<(crate::manifest::Manifest, schema::ParamSchema)> {
+    let m = crate::manifest::Manifest::from_source_tree(module_type).ok()??;
+    if !m.builtin {
+        return None;
+    }
+    let s = schema::ParamSchema::from_manifest(&m)?;
+    Some((m, s))
+}
+
+/// Reject any YAML key on a built-in module entry that the schema doesn't
+/// know about. PIC modules currently silently ignore unknown keys; here we
+/// hard-fail because the manifest is the contract and a typo will otherwise
+/// silently use the default. Skips structural metadata (name, type, …).
+/// Top-level YAML keys that are structural metadata, not module params.
+/// Mirrors `schema.rs::SKIP_KEYS` plus the protection/policy/trust tier
+/// fields that `build_module_entry` writes as reserved TLV tags
+/// (0xF0..0xF5) and a few other cross-cutting fields that the config
+/// generator injects.
+const NON_PARAM_KEYS: &[&str] = &[
+    "name",
+    "type",
+    "wiring",
+    "preset",
+    "presets",
+    "voices",
+    "routes",
+    "step_deadline_us",
+    "fault_policy",
+    "max_restarts",
+    "restart_backoff_ms",
+    "trust_tier",
+    "protection",
+    "cert_file",
+    "key_file",
+    "domain",
+    "sample_rate", // injected by graph_sample_rate
+];
+
+/// Reject any YAML key on a module entry that the schema doesn't know
+/// about. Hard-fails for both `.fmod` modules (schema embedded in the
+/// .fmod) and built-ins (schema in `manifest.toml [[params]]`).
+///
+/// The candidate-name check mirrors `build_params_from_schema`'s
+/// flattening: nested objects expand to dotted/underscored variants,
+/// and outer keys ending in a `GROUPING_SUFFIXES` entry can also resolve
+/// to suffix-stripped names. Anything the packer would actually consume
+/// passes; only keys that have no path to any schema param fail here.
+fn validate_yaml_params(
+    module: &Value,
+    schema: &schema::ParamSchema,
+    module_name: &str,
+) -> Result<()> {
+    let obj = match module.as_object() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    for (key, value) in obj {
+        if NON_PARAM_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if schema::SKIP_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+
+        if let Some(inner_obj) = value.as_object() {
+            // `params: { ... }` is a transparent wrapper (see
+            // `schema::build_params_from_schema`): inner keys map to
+            // schema params with no prefix.
+            let transparent = key == "params";
+            for (inner_key, _) in inner_obj {
+                let candidates: Vec<String> = if transparent {
+                    let mut c = vec![inner_key.clone()];
+                    if inner_key.contains('.') {
+                        c.push(inner_key.replace('.', "_"));
+                    }
+                    c
+                } else {
+                    nested_key_candidates(key, inner_key)
+                };
+                if !candidates.iter().any(|c| schema.find(c).is_some()) {
+                    let display = if transparent {
+                        format!("params.{}", inner_key)
+                    } else {
+                        format!("{}.{}", key, inner_key)
+                    };
+                    let suggestion = candidates
+                        .iter()
+                        .filter_map(|c| closest_param_name(c, schema))
+                        .next();
+                    return Err(Error::Config(format!(
+                        "module '{}': unknown param '{}'{}",
+                        module_name,
+                        display,
+                        format_hint(suggestion, schema),
+                    )));
+                }
+            }
+            continue;
+        }
+
+        // Scalar: same-name lookup, with dotted-to-underscored fallback.
+        let mut candidates = vec![key.clone()];
+        if key.contains('.') {
+            candidates.push(key.replace('.', "_"));
+        }
+        if !candidates.iter().any(|c| schema.find(c).is_some()) {
+            let suggestion = candidates
+                .iter()
+                .filter_map(|c| closest_param_name(c, schema))
+                .next();
+            return Err(Error::Config(format!(
+                "module '{}': unknown param '{}'{}",
+                module_name,
+                key,
+                format_hint(suggestion, schema),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Produce the candidate schema-key names a nested YAML pair would
+/// resolve to. Mirrors the flattening logic in
+/// `schema::build_params_from_schema`: dotted, fully underscored, and
+/// (when the outer key ends with a grouping suffix) suffix-stripped.
+fn nested_key_candidates(outer: &str, inner: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(3);
+    let dotted = format!("{}.{}", outer, inner);
+    out.push(dotted.replace('.', "_"));
+    out.push(dotted);
+    for suffix in schema::GROUPING_SUFFIXES {
+        if let Some(prefix) = outer.strip_suffix(suffix) {
+            out.push(format!("{}_{}", prefix, inner));
+        }
+    }
+    out
+}
+
+fn format_hint(suggestion: Option<&str>, schema: &schema::ParamSchema) -> String {
+    if let Some(s) = suggestion {
+        format!(" — did you mean '{}'?", s)
+    } else {
+        let valid: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
+        format!(" — valid params: {}", valid.join(", "))
+    }
+}
+
+/// Fail the build if any param flagged `required = true` is missing or
+/// empty in the YAML entry. Counts both the top-level form
+/// (`path: ...`) and the transparent `params: { path: ... }` wrapper.
+/// "Empty" means the YAML supplied a string that's `""` — for required
+/// string params there is no useful fallback, and silently passing the
+/// empty value through to the runtime would defeat the point of the
+/// flag (e.g. `host_asset_source.path = ""` would land at
+/// `File::open("")`). Defaults aren't a fallback for required params
+/// — by definition there isn't one.
+fn validate_required_params(
+    module: &Value,
+    manifest: &crate::manifest::Manifest,
+    module_name: &str,
+) -> Result<()> {
+    let obj = match module.as_object() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    let inner = obj.get("params").and_then(|v| v.as_object());
+    for p in &manifest.params {
+        if !p.required {
+            continue;
+        }
+        let value = obj
+            .get(&p.name)
+            .or_else(|| inner.and_then(|i| i.get(&p.name)));
+        let Some(v) = value else {
+            return Err(Error::Config(format!(
+                "module '{}': required param '{}' is missing from YAML",
+                module_name, p.name,
+            )));
+        };
+        // Strings (including the enum default representation) must
+        // be non-empty — an empty string here is the same failure
+        // shape as omission, just spelled differently.
+        if let Some(s) = v.as_str() {
+            if s.is_empty() {
+                return Err(Error::Config(format!(
+                    "module '{}': required param '{}' is empty",
+                    module_name, p.name,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Range-check numeric params against the manifest's `range = [min, max]`.
+/// Honors both top-level placement and the transparent `params: {...}`
+/// wrapper so the check stays in lock-step with the packer's view.
+fn validate_param_ranges(
+    module: &Value,
+    manifest: &crate::manifest::Manifest,
+    module_name: &str,
+) -> Result<()> {
+    let obj = match module.as_object() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    let inner = obj.get("params").and_then(|v| v.as_object());
+    for p in &manifest.params {
+        let Some((min, max)) = p.range else {
+            continue;
+        };
+        let Some(v) = obj
+            .get(&p.name)
+            .or_else(|| inner.and_then(|i| i.get(&p.name)))
+            .and_then(|v| v.as_u64())
+        else {
+            continue;
+        };
+        if (v as u32) < min || (v as u32) > max {
+            return Err(Error::Config(format!(
+                "module '{}': param '{}'={} is outside [{}, {}]",
+                module_name, p.name, v, min, max,
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Clone the YAML module entry and fill in any manifest-declared
+/// default that the YAML didn't supply. Honours the transparent
+/// `params: { ... }` wrapper — values inside it are picked up first.
+/// Result: every declared param has a value (YAML override or default),
+/// so the packer emits a TLV entry for each one and built-ins don't
+/// need to re-encode defaults in code.
+fn inject_manifest_defaults(
+    module: &Value,
+    manifest: &crate::manifest::Manifest,
+) -> Value {
+    let mut clone = module.clone();
+    let Some(obj) = clone.as_object_mut() else {
+        return clone;
+    };
+    let inner_present: std::collections::HashSet<String> = obj
+        .get("params")
+        .and_then(|p| p.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    for p in &manifest.params {
+        // Already supplied — top-level form or in the params: wrapper.
+        if obj.contains_key(&p.name) || inner_present.contains(&p.name) {
+            continue;
+        }
+        if p.required {
+            // Required params have no default to inject;
+            // `validate_required_params` raises the user-facing error.
+            continue;
+        }
+        let val = match p.ptype {
+            crate::manifest::ManifestParamType::U8
+            | crate::manifest::ManifestParamType::U16
+            | crate::manifest::ManifestParamType::U32 => json!(p.default_num),
+            crate::manifest::ManifestParamType::Str => json!(p.default_str),
+            crate::manifest::ManifestParamType::Enum => {
+                // Enums pack from string→u8 via the schema, so put the
+                // default name on the YAML side and let the packer
+                // resolve it.
+                json!(p.default_str)
+            }
+        };
+        obj.insert(p.name.clone(), val);
+    }
+    clone
+}
+
+/// Levenshtein-light: pick the schema param name with the smallest edit
+/// distance to `key`, returning it only if the distance is plausibly a typo
+/// (≤ 2 edits, or up to half the key length for short names).
+fn closest_param_name<'a>(key: &str, schema: &'a schema::ParamSchema) -> Option<&'a str> {
+    fn edit_distance(a: &str, b: &str) -> usize {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let m = a.len();
+        let n = b.len();
+        let mut prev: Vec<usize> = (0..=n).collect();
+        let mut curr = vec![0usize; n + 1];
+        for i in 1..=m {
+            curr[0] = i;
+            for j in 1..=n {
+                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+        prev[n]
+    }
+    let threshold = (key.len() / 2).clamp(2, 4);
+    let mut best: Option<(&str, usize)> = None;
+    for p in &schema.params {
+        let d = edit_distance(key, &p.name);
+        if d <= threshold && best.is_none_or(|(_, b)| d < b) {
+            best = Some((p.name.as_str(), d));
+        }
+    }
+    best.map(|(n, _)| n)
+}
+
+/// Expand compound YAML fields that don't map 1:1 to schema params,
+/// returning a clone with the flat fields in place. Pure YAML-level
+/// rewrite — schema lookup runs unchanged afterwards.
+///
+/// Currently handles:
+///   - mqtt `broker: "host:port"` → `broker_ip: u32` + `broker_port: u16`
+///   - mqtt derived `subscribe_topic` from top-level `device_uuid` if
+///     the YAML didn't set one explicitly
+///
+/// Modules whose params can already be expressed as schema entries
+/// (or where `params: { ... }` covers the grouping) don't need an
+/// entry here.
+fn expand_compound_yaml_fields(type_name: &str, module: &Value, config: &Value) -> Value {
+    let mut clone = module.clone();
+    if type_name == "mqtt" {
+        if let Some(obj) = clone.as_object_mut() {
+            // Pull `broker:` out (singular form) and expand into
+            // `broker_ip` / `broker_port` if neither is already set.
+            if let Some(broker) = obj.get("broker").and_then(|v| v.as_str()) {
+                let (ip, port) = parse_broker_addr(broker);
+                if !obj.contains_key("broker_ip") {
+                    obj.insert("broker_ip".into(), json!(ip));
+                }
+                if !obj.contains_key("broker_port") {
+                    obj.insert("broker_port".into(), json!(port));
+                }
+                obj.remove("broker");
+            }
+            // Derive subscribe_topic from top-level device_uuid if the
+            // YAML didn't set one explicitly. mesh-aware mqtt brokers
+            // listen on `fluxor/{device_hex}/objects/+/commands`.
+            if !obj.contains_key("subscribe_topic") {
+                if let Some(uuid_str) = config.get("device_uuid").and_then(|v| v.as_str()) {
+                    let uuid = parse_uuid_bytes(uuid_str);
+                    if uuid != [0u8; 16] {
+                        let hex: String = uuid.iter().map(|b| format!("{:02x}", b)).collect();
+                        obj.insert(
+                            "subscribe_topic".into(),
+                            json!(format!("fluxor/{}/objects/+/commands", hex)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    clone
+}
+
+fn build_module_entry(
+    name: &str,
+    module: &Value,
+    id: u8,
+    data_section: Option<&Value>,
+    config: &Value,
+    modules_dir: &Path,
+) -> Result<Vec<u8>> {
     // Start with max possible size, will truncate to actual used size
     let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + MAX_MODULE_PARAMS_SIZE];
 
@@ -1150,13 +1669,50 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
     // Track actual params length used
     let params_len: usize;
 
-    // Try schema-first: load .fmod schema and use generic packer
+    // Some modules accept compound YAML fields that don't map 1:1 to
+    // schema params (e.g. `broker: "host:port"` in mqtt). Expand them
+    // into the flat fields the schema knows about before packing.
+    let normalized_module = expand_compound_yaml_fields(type_name, module, config);
+    let module = &normalized_module;
+
+    // PIC modules embed their schema in the `.fmod`; built-ins declare
+    // it in `modules/builtin/<platform>/<name>/manifest.toml`. Both
+    // paths produce a `ParamSchema` and feed the same TLV packer, so
+    // the wire format is identical at the kernel boundary.
     if let Some(param_schema) = schema::load_schema_for_module(type_name, modules_dir) {
-        params_len = schema::build_params_from_schema(module, &param_schema, &mut entry, P, data_section, type_name)
-            .map_err(|e| Error::Config(e))?;
+        validate_yaml_params(module, &param_schema, type_name)?;
+        params_len = schema::build_params_from_schema(
+            module,
+            &param_schema,
+            &mut entry,
+            P,
+            data_section,
+            type_name,
+        )
+        .map_err(Error::Config)?;
+    } else if let Some((manifest, param_schema)) = load_builtin_param_schema(type_name) {
+        validate_yaml_params(module, &param_schema, type_name)?;
+        validate_param_ranges(module, &manifest, type_name)?;
+        validate_required_params(module, &manifest, type_name)?;
+        // Inject manifest defaults into a YAML clone so every declared
+        // param produces a TLV entry. The built-in's step function
+        // reads values straight off the wire, with no defaults
+        // duplicated in Rust.
+        let module_with_defaults = inject_manifest_defaults(module, &manifest);
+        params_len = schema::build_params_from_schema(
+            &module_with_defaults,
+            &param_schema,
+            &mut entry,
+            P,
+            data_section,
+            type_name,
+        )
+        .map_err(Error::Config)?;
     } else {
-        // Legacy fallback — module-specific builders (removed once all modules have schemas)
-        params_len = build_legacy_params(type_name, module, &mut entry, data_section, config);
+        // Module type with no schema source — typically a misnamed
+        // YAML entry. Emit an empty params section; downstream
+        // resource and capability checks raise the user-facing error.
+        params_len = 0;
     }
 
     // Append protection/fault policy params as reserved TLV tags (0xF0-0xF3).
@@ -1294,7 +1850,8 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
                     entry[base + extra_len + 1] = 0x00; // extended length marker
                     entry[base + extra_len + 2] = (n >> 8) as u8;
                     entry[base + extra_len + 3] = n as u8;
-                    entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&cert_data);
+                    entry[base + extra_len + 4..base + extra_len + 4 + n]
+                        .copy_from_slice(&cert_data);
                     extra_len += 4 + n;
                     eprintln!("  cert_file: {} ({} bytes)", cert_path, n);
                 }
@@ -1313,7 +1870,8 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
                     entry[base + extra_len + 1] = 0x00; // extended length marker
                     entry[base + extra_len + 2] = (n >> 8) as u8;
                     entry[base + extra_len + 3] = n as u8;
-                    entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&key_data);
+                    entry[base + extra_len + 4..base + extra_len + 4 + n]
+                        .copy_from_slice(&key_data);
                     extra_len += 4 + n;
                     eprintln!("  key_file: {} ({} bytes)", key_path, n);
                 }
@@ -1332,19 +1890,12 @@ fn build_module_entry(name: &str, module: &Value, id: u8, data_section: Option<&
     Ok(entry)
 }
 
-/// Legacy module-specific param builders. Used as fallback when no schema is available.
-fn build_legacy_params(type_name: &str, module: &Value, entry: &mut Vec<u8>, _data_section: Option<&Value>, config: &Value) -> usize {
-    match type_name.to_lowercase().as_str() {
-        // Most modules use embedded .fmod schemas (build_params_from_schema).
-        // Only modules with complex param formats that can't be expressed as
-        // simple TLV schemas need legacy builders here.
-        "mqtt" => build_mqtt_params(module, entry, config),
-        "mesh_bridge" => build_mesh_bridge_params(module, entry, config),
-        _ => 0,
-    }
-}
-
-fn parse_modules_map(modules: &Value, data_section: Option<&Value>, config: &Value, modules_dir: &Path) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
+fn parse_modules_map(
+    modules: &Value,
+    data_section: Option<&Value>,
+    config: &Value,
+    modules_dir: &Path,
+) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
     let mut entries = Vec::new();
     let mut names = Vec::new();
 
@@ -1354,7 +1905,11 @@ fn parse_modules_map(modules: &Value, data_section: Option<&Value>, config: &Val
 
     for (idx, module) in list.iter().enumerate() {
         if idx >= MAX_MODULES {
-            return Err(Error::Config(format!("Too many modules: {} > {}", idx + 1, MAX_MODULES)));
+            return Err(Error::Config(format!(
+                "Too many modules: {} > {}",
+                idx + 1,
+                MAX_MODULES
+            )));
         }
         let name = module["name"].as_str().ok_or_else(|| {
             Error::Config(format!("Module at index {} missing 'name' field", idx))
@@ -1379,13 +1934,22 @@ fn parse_modules_map(modules: &Value, data_section: Option<&Value>, config: &Val
 /// Manifests live in the source `modules/` directory, not `target/modules/`.
 /// Load manifests from both the standard fluxor module directories and
 /// any additional search paths (e.g., relative to the config file).
-pub fn load_module_manifests_with_extra(modules_config: &Value, extra_dirs: &[&std::path::Path]) -> HashMap<String, Manifest> {
+pub fn load_module_manifests_with_extra(
+    modules_config: &Value,
+    extra_dirs: &[&std::path::Path],
+) -> HashMap<String, Manifest> {
     let mut manifests = HashMap::new();
-    // Standard fluxor module directories (relative to CWD = fluxor root)
+    // Standard fluxor module directories (relative to CWD = fluxor root).
+    // Order mirrors `Manifest::from_source_tree` in `tools/src/manifest.rs`.
+    // Built-ins live under `modules/builtin/<platform>/<name>/`.
     let standard: Vec<std::path::PathBuf> = vec![
         "modules/drivers".into(),
         "modules/foundation".into(),
         "modules/app".into(),
+        "modules/builtin/linux".into(),
+        "modules/builtin/host".into(),
+        "modules/builtin/wasm".into(),
+        "modules/builtin/qemu".into(),
         "modules".into(),
     ];
     let list = match modules_config.as_array() {
@@ -1454,26 +2018,42 @@ fn resolve_port_spec<'a>(
 
     // Named port — look up in manifest
     let manifest = manifests.get(module_name).ok_or_else(|| {
-        format!("no manifest found for module '{}' (needed to resolve port name '{}')", module_name, port_part)
+        format!(
+            "no manifest found for module '{}' (needed to resolve port name '{}')",
+            module_name, port_part
+        )
     })?;
 
-    let (direction, index, _content_type) = manifest.find_port_by_name(port_part).ok_or_else(|| {
-        // Build helpful error with available port names
-        let available: Vec<&str> = manifest.ports.iter()
-            .filter_map(|p| p.name.as_deref())
-            .collect();
-        if available.is_empty() {
-            format!("module '{}' has no named ports in its manifest", module_name)
-        } else {
-            format!("module '{}' has no port named '{}'; available: {}", module_name, port_part, available.join(", "))
-        }
-    })?;
+    let (direction, index, _content_type) =
+        manifest.find_port_by_name(port_part).ok_or_else(|| {
+            // Build helpful error with available port names
+            let available: Vec<&str> = manifest
+                .ports
+                .iter()
+                .filter_map(|p| p.name.as_deref())
+                .collect();
+            if available.is_empty() {
+                format!(
+                    "module '{}' has no named ports in its manifest",
+                    module_name
+                )
+            } else {
+                format!(
+                    "module '{}' has no port named '{}'; available: {}",
+                    module_name,
+                    port_part,
+                    available.join(", ")
+                )
+            }
+        })?;
 
     // Validate direction matches context
     if context_is_from && direction != 1 && direction != 3 {
         return Err(format!(
             "port '{}.{}' is {} but used in 'from:' (must be output or ctrl_output)",
-            module_name, port_part, manifest::direction_to_str(direction)
+            module_name,
+            port_part,
+            manifest::direction_to_str(direction)
         ));
     }
     if !context_is_from && direction == 1 {
@@ -1498,7 +2078,8 @@ fn validate_wiring_types(
     // OctetStream content type ID = 0 (first in CONTENT_TYPES list)
     const OCTET_STREAM: u8 = 0;
 
-    for (i, &(from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
+    for (i, &(from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate()
+    {
         if force_flags.get(i).copied().unwrap_or(false) {
             continue;
         }
@@ -1507,10 +2088,12 @@ fn validate_wiring_types(
         let to_name = &module_names[to_id as usize];
 
         // Look up content types from manifests
-        let from_ct = manifests.get(from_name)
+        let from_ct = manifests
+            .get(from_name)
             .and_then(|m| m.find_port(1, from_port_index)); // direction=1 (output)
         let to_direction = if to_port == 1 { 2u8 } else { 0u8 }; // ctrl=2, in=0
-        let to_ct = manifests.get(to_name)
+        let to_ct = manifests
+            .get(to_name)
             .and_then(|m| m.find_port(to_direction, to_port_index));
 
         // Both must be known to validate
@@ -1534,15 +2117,40 @@ fn validate_wiring_types(
     Ok(())
 }
 
+/// Compose a clear "unknown module in wiring" error. For logical sink
+/// names that the platform stack would normally provide, hint at the
+/// missing `platform.<stack>:` block instead of leaving the developer
+/// to guess.
+fn unknown_module_in_wiring(name: &str) -> String {
+    let hint = match name {
+        "display" => Some("did you forget `platform.display:` in your config?"),
+        "audio_out" => Some("did you forget `platform.audio:` in your config?"),
+        _ => None,
+    };
+    match hint {
+        Some(h) => format!("Unknown module in wiring: {} ({})", name, h),
+        None => format!("Unknown module in wiring: {}", name),
+    }
+}
+
 /// Parse wiring edges from YAML config.
 /// Returns Vec of (from_id, to_id, to_port, from_port_index, to_port_index).
 /// to_port: 0 = data input, 1 = control input.
 /// Supports indexed port syntax: "bank.out[1]" → from_port_index=1
 /// Supports named port syntax: "voip.rtp" → resolves via manifest
-fn parse_wiring_edges(wiring: &Value, names: &[String], manifests: &HashMap<String, Manifest>) -> Result<(Vec<(u8, u8, u8, u8, u8)>, Vec<bool>, Vec<String>, Vec<String>)> {
-    let list = wiring.as_array().ok_or_else(|| {
-        Error::Config("wiring must be a list".into())
-    })?;
+fn parse_wiring_edges(
+    wiring: &Value,
+    names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<(
+    Vec<(u8, u8, u8, u8, u8)>,
+    Vec<bool>,
+    Vec<String>,
+    Vec<String>,
+)> {
+    let list = wiring
+        .as_array()
+        .ok_or_else(|| Error::Config("wiring must be a list".into()))?;
 
     let mut edges = Vec::new();
     let mut force_flags = Vec::new();
@@ -1554,18 +2162,25 @@ fn parse_wiring_edges(wiring: &Value, names: &[String], manifests: &HashMap<Stri
         let to = w["to"].as_str().unwrap_or("");
         let force = w["force"].as_bool().unwrap_or(false);
 
-        let (from_name, _from_port_type, from_port_index) = resolve_port_spec(from, true, manifests)
-            .map_err(|e| Error::Config(format!("wiring from '{}': {}", from, e)))?;
+        let (from_name, _from_port_type, from_port_index) =
+            resolve_port_spec(from, true, manifests)
+                .map_err(|e| Error::Config(format!("wiring from '{}': {}", from, e)))?;
         let (to_name, to_port_type, to_port_index) = resolve_port_spec(to, false, manifests)
             .map_err(|e| Error::Config(format!("wiring to '{}': {}", to, e)))?;
 
         // Map destination port type to wire format: in(0)→0, ctrl(2)→1
         let to_port = if to_port_type == 2 { 1u8 } else { 0u8 };
 
-        let from_id = names.iter().position(|n| n == from_name)
-            .ok_or_else(|| Error::Config(format!("Unknown module in wiring: {}", from_name)))? as u8;
-        let to_id = names.iter().position(|n| n == to_name)
-            .ok_or_else(|| Error::Config(format!("Unknown module in wiring: {}", to_name)))? as u8;
+        let from_id = names
+            .iter()
+            .position(|n| n == from_name)
+            .ok_or_else(|| Error::Config(unknown_module_in_wiring(from_name)))?
+            as u8;
+        let to_id = names
+            .iter()
+            .position(|n| n == to_name)
+            .ok_or_else(|| Error::Config(unknown_module_in_wiring(to_name)))?
+            as u8;
 
         edges.push((from_id, to_id, to_port, from_port_index, to_port_index));
         force_flags.push(force);
@@ -1579,7 +2194,10 @@ fn parse_wiring_edges(wiring: &Value, names: &[String], manifests: &HashMap<Stri
 fn validate_gpio_pin(pin: u64, context: &str, max_gpio: u8) -> Result<u8> {
     if pin >= max_gpio as u64 {
         return Err(Error::Config(format!(
-            "{}: GPIO pin {} out of range (0-{})", context, pin, max_gpio - 1
+            "{}: GPIO pin {} out of range (0-{})",
+            context,
+            pin,
+            max_gpio - 1
         )));
     }
     Ok(pin as u8)
@@ -1596,29 +2214,69 @@ fn validate_gpio_pin(pin: u64, context: &str, max_gpio: u8) -> Result<u8> {
 /// - i2c_configs[i2c_count] (8 bytes each): bus, sda, scl, reserved, freq_hz(u32)
 /// - gpio_configs[gpio_count] (5 bytes each): pin, flags, initial, owner_module_id, reserved
 /// - pio_configs[pio_count] (4 bytes each): pio_idx, data_pin, clk_pin, extra_pin
-fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
+fn build_hardware_section(
+    hardware: &Value,
+    module_names: &[String],
+    max_gpio: u8,
+    pio_count: u8,
+) -> Result<Vec<u8>> {
     let mut result = Vec::new();
 
-    let spi_configs = hardware["spi"].as_array().map(|a| a.to_vec()).unwrap_or_default();
-    let i2c_configs = hardware["i2c"].as_array().map(|a| a.to_vec()).unwrap_or_default();
-    let uart_configs = hardware["uart"].as_array().map(|a| a.to_vec()).unwrap_or_default();
-    let gpio_configs = hardware["gpio"].as_array().map(|a| a.to_vec()).unwrap_or_default();
-    let pio_configs = hardware["pio"].as_array().map(|a| a.to_vec()).unwrap_or_default();
+    let spi_configs = hardware["spi"]
+        .as_array()
+        .map(|a| a.to_vec())
+        .unwrap_or_default();
+    let i2c_configs = hardware["i2c"]
+        .as_array()
+        .map(|a| a.to_vec())
+        .unwrap_or_default();
+    let uart_configs = hardware["uart"]
+        .as_array()
+        .map(|a| a.to_vec())
+        .unwrap_or_default();
+    let gpio_configs = hardware["gpio"]
+        .as_array()
+        .map(|a| a.to_vec())
+        .unwrap_or_default();
+    let pio_configs = hardware["pio"]
+        .as_array()
+        .map(|a| a.to_vec())
+        .unwrap_or_default();
 
     if spi_configs.len() > MAX_HW_SPI {
-        return Err(Error::Config(format!("Too many SPI configs: {} > {}", spi_configs.len(), MAX_HW_SPI)));
+        return Err(Error::Config(format!(
+            "Too many SPI configs: {} > {}",
+            spi_configs.len(),
+            MAX_HW_SPI
+        )));
     }
     if i2c_configs.len() > MAX_HW_I2C {
-        return Err(Error::Config(format!("Too many I2C configs: {} > {}", i2c_configs.len(), MAX_HW_I2C)));
+        return Err(Error::Config(format!(
+            "Too many I2C configs: {} > {}",
+            i2c_configs.len(),
+            MAX_HW_I2C
+        )));
     }
     if uart_configs.len() > MAX_HW_UART {
-        return Err(Error::Config(format!("Too many UART configs: {} > {}", uart_configs.len(), MAX_HW_UART)));
+        return Err(Error::Config(format!(
+            "Too many UART configs: {} > {}",
+            uart_configs.len(),
+            MAX_HW_UART
+        )));
     }
     if gpio_configs.len() > MAX_HW_GPIO {
-        return Err(Error::Config(format!("Too many GPIO configs: {} > {}", gpio_configs.len(), MAX_HW_GPIO)));
+        return Err(Error::Config(format!(
+            "Too many GPIO configs: {} > {}",
+            gpio_configs.len(),
+            MAX_HW_GPIO
+        )));
     }
     if pio_configs.len() > MAX_HW_PIO {
-        return Err(Error::Config(format!("Too many PIO configs: {} > {}", pio_configs.len(), MAX_HW_PIO)));
+        return Err(Error::Config(format!(
+            "Too many PIO configs: {} > {}",
+            pio_configs.len(),
+            MAX_HW_PIO
+        )));
     }
 
     // Header: counts + max_gpio + uart_count (6 bytes)
@@ -1632,9 +2290,21 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
     // SPI configs (8 bytes each)
     for (i, spi) in spi_configs.iter().enumerate() {
         let bus = spi["bus"].as_u64().unwrap_or(0) as u8;
-        let miso = validate_gpio_pin(spi["miso"].as_u64().unwrap_or(16), &format!("hardware.spi[{}].miso", i), max_gpio)?;
-        let mosi = validate_gpio_pin(spi["mosi"].as_u64().unwrap_or(19), &format!("hardware.spi[{}].mosi", i), max_gpio)?;
-        let sck = validate_gpio_pin(spi["sck"].as_u64().unwrap_or(18), &format!("hardware.spi[{}].sck", i), max_gpio)?;
+        let miso = validate_gpio_pin(
+            spi["miso"].as_u64().unwrap_or(16),
+            &format!("hardware.spi[{}].miso", i),
+            max_gpio,
+        )?;
+        let mosi = validate_gpio_pin(
+            spi["mosi"].as_u64().unwrap_or(19),
+            &format!("hardware.spi[{}].mosi", i),
+            max_gpio,
+        )?;
+        let sck = validate_gpio_pin(
+            spi["sck"].as_u64().unwrap_or(18),
+            &format!("hardware.spi[{}].sck", i),
+            max_gpio,
+        )?;
         let freq_hz = spi["freq_hz"].as_u64().unwrap_or(400_000) as u32;
 
         result.push(bus);
@@ -1647,8 +2317,16 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
     // I2C configs (8 bytes each)
     for (i, i2c) in i2c_configs.iter().enumerate() {
         let bus = i2c["bus"].as_u64().unwrap_or(0) as u8;
-        let sda = validate_gpio_pin(i2c["sda"].as_u64().unwrap_or(4), &format!("hardware.i2c[{}].sda", i), max_gpio)?;
-        let scl = validate_gpio_pin(i2c["scl"].as_u64().unwrap_or(5), &format!("hardware.i2c[{}].scl", i), max_gpio)?;
+        let sda = validate_gpio_pin(
+            i2c["sda"].as_u64().unwrap_or(4),
+            &format!("hardware.i2c[{}].sda", i),
+            max_gpio,
+        )?;
+        let scl = validate_gpio_pin(
+            i2c["scl"].as_u64().unwrap_or(5),
+            &format!("hardware.i2c[{}].scl", i),
+            max_gpio,
+        )?;
         let freq_hz = i2c["freq_hz"].as_u64().unwrap_or(100_000) as u32;
 
         result.push(bus);
@@ -1661,8 +2339,16 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
     // UART configs (8 bytes each): bus, tx_pin, rx_pin, reserved, baudrate(u32)
     for (i, uart) in uart_configs.iter().enumerate() {
         let bus = uart["bus"].as_u64().unwrap_or(0) as u8;
-        let tx_pin = validate_gpio_pin(uart["tx_pin"].as_u64().unwrap_or(0), &format!("hardware.uart[{}].tx_pin", i), max_gpio)?;
-        let rx_pin = validate_gpio_pin(uart["rx_pin"].as_u64().unwrap_or(1), &format!("hardware.uart[{}].rx_pin", i), max_gpio)?;
+        let tx_pin = validate_gpio_pin(
+            uart["tx_pin"].as_u64().unwrap_or(0),
+            &format!("hardware.uart[{}].tx_pin", i),
+            max_gpio,
+        )?;
+        let rx_pin = validate_gpio_pin(
+            uart["rx_pin"].as_u64().unwrap_or(1),
+            &format!("hardware.uart[{}].rx_pin", i),
+            max_gpio,
+        )?;
         let baudrate = uart["baudrate"].as_u64().unwrap_or(115200) as u32;
 
         result.push(bus);
@@ -1674,7 +2360,11 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
 
     // GPIO configs (5 bytes each): pin, flags, initial, owner_module_id, reserved
     for (i, gpio) in gpio_configs.iter().enumerate() {
-        let pin = validate_gpio_pin(gpio["pin"].as_u64().unwrap_or(0), &format!("hardware.gpio[{}].pin", i), max_gpio)?;
+        let pin = validate_gpio_pin(
+            gpio["pin"].as_u64().unwrap_or(0),
+            &format!("hardware.gpio[{}].pin", i),
+            max_gpio,
+        )?;
 
         // Direction: "output" or "input" (default: output)
         let direction = match gpio["direction"].as_str().unwrap_or("output") {
@@ -1696,9 +2386,17 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
             None => {
                 // Default based on numeric value or true/false
                 if let Some(n) = gpio["initial"].as_u64() {
-                    if n == 0 { 0u8 } else { 1u8 }
+                    if n == 0 {
+                        0u8
+                    } else {
+                        1u8
+                    }
                 } else if let Some(b) = gpio["initial"].as_bool() {
-                    if b { 1u8 } else { 0u8 }
+                    if b {
+                        1u8
+                    } else {
+                        0u8
+                    }
                 } else {
                     1u8 // default high
                 }
@@ -1736,11 +2434,20 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
         let pio_idx = pio["pio_idx"].as_u64().unwrap_or(0) as u8;
         if pio_idx >= pio_count {
             return Err(Error::Config(format!(
-                "hardware.pio[{}].pio_idx {} >= target pio_count {}", i, pio_idx, pio_count
+                "hardware.pio[{}].pio_idx {} >= target pio_count {}",
+                i, pio_idx, pio_count
             )));
         }
-        let data_pin = validate_gpio_pin(pio["data_pin"].as_u64().unwrap_or(0), &format!("hardware.pio[{}].data_pin", i), max_gpio)?;
-        let clk_pin = validate_gpio_pin(pio["clk_pin"].as_u64().unwrap_or(0), &format!("hardware.pio[{}].clk_pin", i), max_gpio)?;
+        let data_pin = validate_gpio_pin(
+            pio["data_pin"].as_u64().unwrap_or(0),
+            &format!("hardware.pio[{}].data_pin", i),
+            max_gpio,
+        )?;
+        let clk_pin = validate_gpio_pin(
+            pio["clk_pin"].as_u64().unwrap_or(0),
+            &format!("hardware.pio[{}].clk_pin", i),
+            max_gpio,
+        )?;
         let extra_pin = pio["extra_pin"].as_u64().unwrap_or(0xFF) as u8;
 
         result.push(pio_idx);
@@ -1760,7 +2467,11 @@ fn build_hardware_section(hardware: &Value, module_names: &[String], max_gpio: u
 /// - "cross_core" → 2
 ///
 /// Also validates: cross_core edges must connect modules in different domains.
-fn resolve_edge_classes(config: &Value, _module_names: &[String], domain_names: &[String]) -> Vec<u8> {
+fn resolve_edge_classes(
+    config: &Value,
+    _module_names: &[String],
+    domain_names: &[String],
+) -> Vec<u8> {
     let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
         Some(w) => w,
         None => return Vec::new(),
@@ -1781,7 +2492,10 @@ fn resolve_edge_classes(config: &Value, _module_names: &[String], domain_names: 
     }
 
     for (i, entry) in wiring.iter().enumerate() {
-        let ec_str = entry.get("edge_class").and_then(|v| v.as_str()).unwrap_or("local");
+        let ec_str = entry
+            .get("edge_class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("local");
         let ec = match ec_str {
             "dma_owned" => 1u8,
             "cross_core" => {
@@ -1830,27 +2544,68 @@ pub struct ModuleCaps {
 }
 
 /// Generate config with extra module search directories (for external projects).
-pub fn generate_config_ext(config: &Value, _template: &ConfigBuilder, module_caps: &[ModuleCaps], modules_dir: &Path, extra_module_dirs: &[&Path], max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
-    generate_config_impl(config, _template, module_caps, modules_dir, extra_module_dirs, max_gpio, pio_count)
+pub fn generate_config_ext(
+    config: &Value,
+    _template: &ConfigBuilder,
+    module_caps: &[ModuleCaps],
+    modules_dir: &Path,
+    extra_module_dirs: &[&Path],
+    max_gpio: u8,
+    pio_count: u8,
+) -> Result<Vec<u8>> {
+    generate_config_impl(
+        config,
+        _template,
+        module_caps,
+        modules_dir,
+        extra_module_dirs,
+        max_gpio,
+        pio_count,
+    )
 }
 
-pub fn generate_config_with_caps(config: &Value, _template: &ConfigBuilder, module_caps: &[ModuleCaps], modules_dir: &Path, max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
-    generate_config_impl(config, _template, module_caps, modules_dir, &[], max_gpio, pio_count)
+pub fn generate_config_with_caps(
+    config: &Value,
+    _template: &ConfigBuilder,
+    module_caps: &[ModuleCaps],
+    modules_dir: &Path,
+    max_gpio: u8,
+    pio_count: u8,
+) -> Result<Vec<u8>> {
+    generate_config_impl(
+        config,
+        _template,
+        module_caps,
+        modules_dir,
+        &[],
+        max_gpio,
+        pio_count,
+    )
 }
 
-fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: &[ModuleCaps], modules_dir: &Path, extra_module_dirs: &[&Path], max_gpio: u8, pio_count: u8) -> Result<Vec<u8>> {
-    let modules = config.get("modules").ok_or_else(|| {
-        Error::Config("modules section required".into())
-    })?;
+fn generate_config_impl(
+    config: &Value,
+    _template: &ConfigBuilder,
+    module_caps: &[ModuleCaps],
+    modules_dir: &Path,
+    extra_module_dirs: &[&Path],
+    max_gpio: u8,
+    pio_count: u8,
+) -> Result<Vec<u8>> {
+    let modules = config
+        .get("modules")
+        .ok_or_else(|| Error::Config("modules section required".into()))?;
 
     // Parse graph-level sample_rate (top-level or under graph: key)
-    let graph_sample_rate: u32 = config.get("sample_rate")
+    let graph_sample_rate: u32 = config
+        .get("sample_rate")
         .or_else(|| config.get("graph").and_then(|g| g.get("sample_rate")))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
     // Parse tick_us (top-level or under execution:)
-    let tick_us: u16 = config.get("tick_us")
+    let tick_us: u16 = config
+        .get("tick_us")
         .or_else(|| config.get("execution").and_then(|e| e.get("tick_us")))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u16;
@@ -1869,7 +2624,10 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     if let Some(exec) = config.get("execution") {
         if let Some(domains) = exec.get("domains").and_then(|d| d.as_array()) {
             for domain in domains {
-                let name = domain.get("name").and_then(|n| n.as_str()).unwrap_or("default");
+                let name = domain
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("default");
                 domain_names.push(name.to_string());
                 let dtick = domain.get("tick_us").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
                 domain_tick_us.push(dtick);
@@ -1880,9 +2638,15 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     // domain_names is still used for edge_class validation below.
 
     // Warn if tick_us < 500 with many modules
-    let module_list = modules.as_array().ok_or_else(|| Error::Config("modules must be a list".into()))?;
+    let module_list = modules
+        .as_array()
+        .ok_or_else(|| Error::Config("modules must be a list".into()))?;
     if tick_us > 0 && tick_us < 500 && module_list.len() > 8 {
-        eprintln!("warning: tick_us={} with {} modules may exceed tick budget", tick_us, module_list.len());
+        eprintln!(
+            "warning: tick_us={} with {} modules may exceed tick budget",
+            tick_us,
+            module_list.len()
+        );
     }
 
     // Inject graph sample_rate into modules that don't declare their own
@@ -1905,7 +2669,8 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     // Get data section for preset resolution
     let data_section = config.get("data");
 
-    let (module_entries, module_names) = parse_modules_map(modules_ref, data_section, config, modules_dir)?;
+    let (module_entries, module_names) =
+        parse_modules_map(modules_ref, data_section, config, modules_dir)?;
 
     // Load manifests for named port resolution and type validation
     let manifests = load_module_manifests_with_extra(modules_ref, extra_module_dirs);
@@ -1917,7 +2682,14 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     };
 
     // Validate content-type compatibility
-    validate_wiring_types(&edges, &force_flags, &module_names, &manifests, &from_specs, &to_specs)?;
+    validate_wiring_types(
+        &edges,
+        &force_flags,
+        &module_names,
+        &manifests,
+        &from_specs,
+        &to_specs,
+    )?;
 
     if edges.len() > MAX_GRAPH_EDGES {
         return Err(Error::Config(format!(
@@ -1927,21 +2699,29 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
         )));
     }
 
-    // Validate per-module port indices against MAX_PORTS.
-    // The kernel's populate_ports() enforces this at runtime, but catching
-    // it here gives a clear build-time error instead of a cryptic boot failure.
-    const MAX_PORTS: u8 = 8;
+    // Validate per-module port indices against `MAX_PORTS`. The
+    // kernel's `populate_ports()` enforces the same bound at module
+    // instantiation; catching it at build time gives a clear error
+    // instead of a cryptic boot failure. Must equal
+    // `src/kernel/scheduler.rs::MAX_PORTS`. The wire encoding
+    // (`port_byte` is two 4-bit fields, indices 0..=15) is the
+    // ultimate ceiling.
+    const MAX_PORTS: u8 = 16;
     for &(from_id, to_id, _to_port, from_port_index, to_port_index) in &edges {
         if from_port_index >= MAX_PORTS {
             return Err(Error::Config(format!(
                 "Module '{}' output port index {} exceeds limit (max {})",
-                module_names[from_id as usize], from_port_index, MAX_PORTS - 1
+                module_names[from_id as usize],
+                from_port_index,
+                MAX_PORTS - 1
             )));
         }
         if to_port_index >= MAX_PORTS {
             return Err(Error::Config(format!(
                 "Module '{}' input port index {} exceeds limit (max {})",
-                module_names[to_id as usize], to_port_index, MAX_PORTS - 1
+                module_names[to_id as usize],
+                to_port_index,
+                MAX_PORTS - 1
             )));
         }
     }
@@ -1997,10 +2777,9 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     //              bits 4:0 = buffer_group (5 bits, 0..31)
     //   port_byte: bits 7:4 = from_port_index (4 bits, 0..15)
     //              bits 3:0 = to_port_index   (4 bits, 0..15)
-    // Symmetric 4-bit ports give the same headroom on both sides; the
-    // runtime cap is MAX_PORTS=8 (scheduler.rs). buffer_group narrowed to
-    // 5 bits to fit edge_class into byte 2 — assign_buffer_groups enforces
-    // the 31 ceiling.
+    // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`
+    // (`src/kernel/scheduler.rs`). The 5-bit `buffer_group` ceiling
+    // (31) is enforced by `assign_buffer_groups`.
     let mut graph_section = Vec::with_capacity(GRAPH_SECTION_SIZE);
     graph_section.push(edges.len() as u8);
     graph_section.extend_from_slice(&[0u8; 3]);
@@ -2020,8 +2799,13 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     for d in 0..4usize {
         let dtick = domain_tick_us.get(d).copied().unwrap_or(0);
         graph_section.extend_from_slice(&dtick.to_le_bytes());
-        let mode = if let Some(domains) = config.get("execution").and_then(|e| e.get("domains")).and_then(|d| d.as_array()) {
-            domains.get(d)
+        let mode = if let Some(domains) = config
+            .get("execution")
+            .and_then(|e| e.get("domains"))
+            .and_then(|d| d.as_array())
+        {
+            domains
+                .get(d)
                 .and_then(|dom| dom.get("exec_mode").and_then(|m| m.as_str()))
                 .map(|m| match m {
                     "high_rate" | "tier1a" => 1u8,
@@ -2041,7 +2825,8 @@ fn generate_config_impl(config: &Value, _template: &ConfigBuilder, module_caps: 
     result.extend_from_slice(&graph_section);
 
     // Hardware section
-    let hw_section = build_hardware_section(&config["hardware"], &module_names, max_gpio, pio_count)?;
+    let hw_section =
+        build_hardware_section(&config["hardware"], &module_names, max_gpio, pio_count)?;
     result.extend_from_slice(&hw_section);
 
     // Compute CRC16-CCITT checksum of body (bytes 8 onwards)
@@ -2075,10 +2860,14 @@ fn assign_buffer_groups(
     // Build lookups: module_name -> capability flags
     let is_chain_interior_capable = |module_id: u8| -> bool {
         let id = module_id as usize;
-        if id >= module_names.len() { return false; }
+        if id >= module_names.len() {
+            return false;
+        }
         let name = &module_names[id];
         // Chain interior requires BOTH: can consume mailbox AND modifies in-place
-        module_caps.iter().any(|c| &c.name == name && c.mailbox_safe && c.in_place_writer)
+        module_caps
+            .iter()
+            .any(|c| &c.name == name && c.mailbox_safe && c.in_place_writer)
     };
 
     // Count data edges per module (only data edges, to_port == 0)
@@ -2088,13 +2877,17 @@ fn assign_buffer_groups(
     for (_, to_id, to_port, _, _) in edges {
         if *to_port == 0 {
             let idx = *to_id as usize;
-            if idx < num_modules { data_in_count[idx] += 1; }
+            if idx < num_modules {
+                data_in_count[idx] += 1;
+            }
         }
         // All edges have an implicit "from out" so count from_id outputs
     }
     for (from_id, _, _, _, _) in edges {
         let idx = *from_id as usize;
-        if idx < num_modules { data_out_count[idx] += 1; }
+        if idx < num_modules {
+            data_out_count[idx] += 1;
+        }
     }
 
     // Chain interior: 1-in, 1-out, mailbox_safe AND in_place_writer.
@@ -2109,7 +2902,9 @@ fn assign_buffer_groups(
 
     // Find the single data-out edge index for a module
     let find_out_edge = |module_id: u8| -> Option<usize> {
-        edges.iter().position(|(from_id, _, _, _, _)| *from_id == module_id)
+        edges
+            .iter()
+            .position(|(from_id, _, _, _, _)| *from_id == module_id)
     };
 
     let mut next_group: u8 = 1;
@@ -2118,16 +2913,20 @@ fn assign_buffer_groups(
     for i in 0..n {
         let (_, to_id, to_port, _, _) = edges[i];
         // Only consider data edges
-        if to_port != 0 { continue; }
+        if to_port != 0 {
+            continue;
+        }
         // Destination must be in-place-safe with 1-in/1-out
-        if !is_chain_interior(to_id) { continue; }
+        if !is_chain_interior(to_id) {
+            continue;
+        }
 
         // This edge feeds an in-place module. Find the output edge from that module.
         if let Some(out_idx) = find_out_edge(to_id) {
-            // Both edges (in to this module, out from this module) should share a group.
-            // Buffer group is encoded in 5 bits (0..31) — group 0 means "no aliasing",
-            // so 31 distinct chain ids are available. If a graph somehow needs more,
-            // error instead of silently aliasing chains that should be separate.
+            // Both edges share a group so the in-place writer aliases
+            // its input/output buffers. Group 0 means "no aliasing", so
+            // 31 distinct chain ids are available before the 5-bit
+            // `buffer_group` field is exhausted.
             let existing_group = if groups[i] != 0 {
                 groups[i]
             } else if groups[out_idx] != 0 {
@@ -2154,10 +2953,16 @@ fn assign_buffer_groups(
     while changed {
         changed = false;
         for i in 0..n {
-            if groups[i] == 0 { continue; }
+            if groups[i] == 0 {
+                continue;
+            }
             let (_, to_id, to_port, _, _) = edges[i];
-            if to_port != 0 { continue; }
-            if !is_chain_interior(to_id) { continue; }
+            if to_port != 0 {
+                continue;
+            }
+            if !is_chain_interior(to_id) {
+                continue;
+            }
             if let Some(out_idx) = find_out_edge(to_id) {
                 if groups[out_idx] != groups[i] {
                     groups[out_idx] = groups[i];
@@ -2251,12 +3056,19 @@ fn validate_services(
 
     let services_map = match services.as_object() {
         Some(m) => m,
-        None => return Err(Error::Config("services must be a mapping of service_name: provider_module".into())),
+        None => {
+            return Err(Error::Config(
+                "services must be a mapping of service_name: provider_module".into(),
+            ))
+        }
     };
 
     for (service_name, provider_val) in services_map {
         let provider = provider_val.as_str().ok_or_else(|| {
-            Error::Config(format!("services.{}: provider must be a string", service_name))
+            Error::Config(format!(
+                "services.{}: provider must be a string",
+                service_name
+            ))
         })?;
 
         // Check provider module exists in config
@@ -2310,15 +3122,18 @@ use std::sync::LazyLock;
 pub static EXAMPLES: LazyLock<HashMap<&'static str, Value>> = LazyLock::new(|| {
     let mut m = HashMap::new();
 
-    m.insert("blinky", json!({
-        "modules": {
-            "timer": {"type": "timer", "interval_us": 1000000, "periodic": true},
-            "led": {"type": "led", "initial": 0}
-        },
-        "wiring": [
-            {"from": "timer.out", "to": "led.in"}
-        ]
-    }));
+    m.insert(
+        "blinky",
+        json!({
+            "modules": {
+                "timer": {"type": "timer", "interval_us": 1000000, "periodic": true},
+                "led": {"type": "led", "initial": 0}
+            },
+            "wiring": [
+                {"from": "timer.out", "to": "led.in"}
+            ]
+        }),
+    );
 
     m.insert("sd-audio", json!({
         "modules": {
@@ -2352,25 +3167,31 @@ pub static EXAMPLES: LazyLock<HashMap<&'static str, Value>> = LazyLock::new(|| {
         ]
     }));
 
-    m.insert("button-led", json!({
-        "modules": {
-            "button": {"type": "button", "pin": 15, "pull": "up", "active_low": 1},
-            "led": {"type": "led", "initial": 0}
-        },
-        "wiring": [
-            {"from": "button.out", "to": "led.in"}
-        ]
-    }));
+    m.insert(
+        "button-led",
+        json!({
+            "modules": {
+                "button": {"type": "button", "pin": 15, "pull": "up", "active_low": 1},
+                "led": {"type": "led", "initial": 0}
+            },
+            "wiring": [
+                {"from": "button.out", "to": "led.in"}
+            ]
+        }),
+    );
 
-    m.insert("button-bootsel", json!({
-        "modules": {
-            "button": {"type": "button"},
-            "led": {"type": "led", "initial": 0}
-        },
-        "wiring": [
-            {"from": "button.out", "to": "led.in"}
-        ]
-    }));
+    m.insert(
+        "button-bootsel",
+        json!({
+            "modules": {
+                "button": {"type": "button"},
+                "led": {"type": "led", "initial": 0}
+            },
+            "wiring": [
+                {"from": "button.out", "to": "led.in"}
+            ]
+        }),
+    );
 
     // HTTP/Icecast streaming - URL configured at runtime via MQTT
     m.insert("http-stream", json!({

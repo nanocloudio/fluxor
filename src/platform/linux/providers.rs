@@ -206,6 +206,13 @@ impl LinuxNetConn {
     };
 }
 
+/// linux_net keeps per-instance state in a `Box<LinuxNetState>` like
+/// every other host built-in. Two `linux_net` modules in one graph
+/// would each get their own connection table and channel handles —
+/// but they would still race for OS-level listen ports and fds. That's
+/// a config-time concern (don't bind two listeners on port 9000), not
+/// a state-aliasing one. Per-instance ownership matches the rest of
+/// the host built-in family and makes the dispatch path uniform.
 struct LinuxNetState {
     net_in: i32,
     net_out: i32,
@@ -213,18 +220,20 @@ struct LinuxNetState {
     cmd_buf: [u8; 2048],
     msg_buf: [u8; 2048],
     recv_buf: [u8; 1500],
-    initialized: bool,
 }
 
-static mut LINUX_NET: LinuxNetState = LinuxNetState {
-    net_in: -1,
-    net_out: -1,
-    conns: [LinuxNetConn::EMPTY; LINUX_NET_MAX_CONNS],
-    cmd_buf: [0u8; 2048],
-    msg_buf: [0u8; 2048],
-    recv_buf: [0u8; 1500],
-    initialized: false,
-};
+impl LinuxNetState {
+    fn new(net_in: i32, net_out: i32) -> Self {
+        Self {
+            net_in,
+            net_out,
+            conns: [LinuxNetConn::EMPTY; LINUX_NET_MAX_CONNS],
+            cmd_buf: [0u8; 2048],
+            msg_buf: [0u8; 2048],
+            recv_buf: [0u8; 1500],
+        }
+    }
+}
 
 unsafe fn set_nonblocking(fd: i32) {
     let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -233,8 +242,7 @@ unsafe fn set_nonblocking(fd: i32) {
     }
 }
 
-unsafe fn linux_net_alloc_conn() -> i32 {
-    let st = &mut *(&raw mut LINUX_NET);
+fn linux_net_alloc_conn(st: &LinuxNetState) -> i32 {
     for i in 0..LINUX_NET_MAX_CONNS {
         if st.conns[i].state == 0 {
             return i as i32;
@@ -243,8 +251,7 @@ unsafe fn linux_net_alloc_conn() -> i32 {
     -1
 }
 
-unsafe fn linux_net_send_msg(data: &[u8]) {
-    let st = &*(&raw const LINUX_NET);
+unsafe fn linux_net_send_msg(st: &LinuxNetState, data: &[u8]) {
     if st.net_out < 0 || data.is_empty() {
         return;
     }
@@ -262,10 +269,8 @@ unsafe fn linux_net_send_msg(data: &[u8]) {
     channel::channel_write(st.net_out, frame.as_ptr(), total);
 }
 
-unsafe fn linux_net_cmd_bind(port: u16) {
-    let st = &mut *(&raw mut LINUX_NET);
-
-    let slot = linux_net_alloc_conn();
+unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
+    let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free slots for listener");
         return;
@@ -318,12 +323,11 @@ unsafe fn linux_net_cmd_bind(port: u16) {
     log::info!("[linux_net] listening on port {} (slot {})", port, idx);
 
     let msg = [MSG_BOUND];
-    linux_net_send_msg(&msg);
+    linux_net_send_msg(st, &msg);
 }
 
-unsafe fn linux_net_cmd_connect(sock_type: u8, ip: u32, port: u16) {
-    let st = &mut *(&raw mut LINUX_NET);
-    let slot = linux_net_alloc_conn();
+unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, port: u16) {
+    let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free connection slots");
         return;
@@ -360,7 +364,7 @@ unsafe fn linux_net_cmd_connect(sock_type: u8, ip: u32, port: u16) {
             log::error!("[linux_net] connect() failed errno={}", errno);
             libc::close(fd);
             let msg = [MSG_ERROR, idx as u8, errno as u8];
-            linux_net_send_msg(&msg);
+            linux_net_send_msg(st, &msg);
             return;
         }
         st.conns[idx] = LinuxNetConn {
@@ -375,12 +379,11 @@ unsafe fn linux_net_cmd_connect(sock_type: u8, ip: u32, port: u16) {
             state: 2,
         };
         let msg = [MSG_CONNECTED, idx as u8];
-        linux_net_send_msg(&msg);
+        linux_net_send_msg(st, &msg);
     }
 }
 
-unsafe fn linux_net_cmd_send(conn_id: u8, data: &[u8]) {
-    let st = &*(&raw const LINUX_NET);
+unsafe fn linux_net_cmd_send(st: &LinuxNetState, conn_id: u8, data: &[u8]) {
     let idx = conn_id as usize;
     if idx >= LINUX_NET_MAX_CONNS || st.conns[idx].state < 2 {
         return;
@@ -397,8 +400,7 @@ unsafe fn linux_net_cmd_send(conn_id: u8, data: &[u8]) {
     );
 }
 
-unsafe fn linux_net_cmd_close(conn_id: u8) {
-    let st = &mut *(&raw mut LINUX_NET);
+unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u8) {
     let idx = conn_id as usize;
     if idx >= LINUX_NET_MAX_CONNS || st.conns[idx].state == 0 {
         return;
@@ -408,11 +410,10 @@ unsafe fn linux_net_cmd_close(conn_id: u8) {
     }
     st.conns[idx] = LinuxNetConn::EMPTY;
     let msg = [MSG_CLOSED, conn_id];
-    linux_net_send_msg(&msg);
+    linux_net_send_msg(st, &msg);
 }
 
-unsafe fn linux_net_poll_accept() -> bool {
-    let st = &mut *(&raw mut LINUX_NET);
+unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
     let mut had_work = false;
 
     for li in 0..LINUX_NET_MAX_CONNS {
@@ -433,7 +434,7 @@ unsafe fn linux_net_poll_accept() -> bool {
             continue;
         }
 
-        let slot = linux_net_alloc_conn();
+        let slot = linux_net_alloc_conn(st);
         if slot < 0 {
             libc::close(client_fd);
             continue;
@@ -446,15 +447,14 @@ unsafe fn linux_net_poll_accept() -> bool {
         };
 
         let msg = [MSG_ACCEPTED, idx as u8];
-        linux_net_send_msg(&msg);
+        linux_net_send_msg(st, &msg);
         log::info!("[linux_net] accepted conn_id={}", idx);
         had_work = true;
     }
     had_work
 }
 
-unsafe fn linux_net_poll_recv() -> bool {
-    let st = &mut *(&raw mut LINUX_NET);
+unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
     let mut had_work = false;
 
     for i in 0..LINUX_NET_MAX_CONNS {
@@ -485,13 +485,13 @@ unsafe fn linux_net_poll_recv() -> bool {
                     if err == 0 {
                         st.conns[i].state = 2;
                         let msg = [MSG_CONNECTED, i as u8];
-                        linux_net_send_msg(&msg);
+                        linux_net_send_msg(st, &msg);
                         had_work = true;
                     } else {
                         libc::close(st.conns[i].fd);
                         st.conns[i] = LinuxNetConn::EMPTY;
                         let msg = [MSG_ERROR, i as u8, err as u8];
-                        linux_net_send_msg(&msg);
+                        linux_net_send_msg(st, &msg);
                     }
                 }
             }
@@ -526,7 +526,7 @@ unsafe fn linux_net_poll_recv() -> bool {
             libc::close(st.conns[i].fd);
             st.conns[i] = LinuxNetConn::EMPTY;
             let msg = [MSG_CLOSED, i as u8];
-            linux_net_send_msg(&msg);
+            linux_net_send_msg(st, &msg);
             had_work = true;
         }
     }
@@ -535,18 +535,7 @@ unsafe fn linux_net_poll_recv() -> bool {
 
 fn linux_net_step(state: *mut u8) -> i32 {
     unsafe {
-        let st = &mut *(&raw mut LINUX_NET);
-
-        if !st.initialized {
-            st.net_in = core::ptr::read(state as *const i32);
-            st.net_out = core::ptr::read(state.add(4) as *const i32);
-            st.initialized = true;
-            log::info!(
-                "[linux_net] init net_in={} net_out={}",
-                st.net_in,
-                st.net_out
-            );
-        }
+        let st = instance_state::<LinuxNetState>(state);
 
         let mut had_work = false;
 
@@ -569,7 +558,7 @@ fn linux_net_step(state: *mut u8) -> i32 {
                 match msg_type {
                     CMD_BIND if payload_len >= 2 => {
                         let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                        linux_net_cmd_bind(port);
+                        linux_net_cmd_bind(st, port);
                         had_work = true;
                     }
                     CMD_CONNECT if payload_len >= 7 => {
@@ -581,7 +570,7 @@ fn linux_net_step(state: *mut u8) -> i32 {
                             st.cmd_buf[4],
                         ]);
                         let port = u16::from_le_bytes([st.cmd_buf[5], st.cmd_buf[6]]);
-                        linux_net_cmd_connect(sock_type, ip, port);
+                        linux_net_cmd_connect(st, sock_type, ip, port);
                         had_work = true;
                     }
                     CMD_SEND if payload_len >= 2 => {
@@ -589,12 +578,12 @@ fn linux_net_step(state: *mut u8) -> i32 {
                         let data_len = payload_len - 1;
                         let data_slice =
                             core::slice::from_raw_parts(st.cmd_buf.as_ptr().add(1), data_len);
-                        linux_net_cmd_send(conn_id, data_slice);
+                        linux_net_cmd_send(st, conn_id, data_slice);
                         had_work = true;
                     }
                     CMD_CLOSE if payload_len >= 1 => {
                         let conn_id = st.cmd_buf[0];
-                        linux_net_cmd_close(conn_id);
+                        linux_net_cmd_close(st, conn_id);
                         had_work = true;
                     }
                     _ => {
@@ -608,10 +597,10 @@ fn linux_net_step(state: *mut u8) -> i32 {
             }
         }
 
-        if linux_net_poll_accept() {
+        if linux_net_poll_accept(st) {
             had_work = true;
         }
-        if linux_net_poll_recv() {
+        if linux_net_poll_recv(st) {
             had_work = true;
         }
 

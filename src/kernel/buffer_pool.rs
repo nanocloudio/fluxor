@@ -60,7 +60,7 @@
 //! first module that produces whole buffers; prior stages use FIFO copy. See
 //! `docs/architecture/pipeline.md` §FIFO→Mailbox for the full pattern.
 
-use portable_atomic::{AtomicU8, AtomicU32, AtomicI8, Ordering};
+use portable_atomic::{AtomicI8, AtomicU32, AtomicU8, Ordering};
 
 use crate::kernel::errno;
 
@@ -70,7 +70,8 @@ use crate::kernel::errno;
 
 /// Maximum number of buffer registry slots.
 /// Must be >= MAX_CHANNELS plus headroom for dynamic allocations.
-pub const MAX_BUFFER_SLOTS: usize = 56;
+/// Bumped from 56 to 256 to fit Quantum's 42-module graph (~110 channels).
+pub const MAX_BUFFER_SLOTS: usize = 256;
 
 /// Default buffer size for channels without hints (audio channels).
 /// Derived from the canonical constant in abi.rs.
@@ -96,11 +97,17 @@ fn alloc_buffer(size: usize) -> Option<*mut u8> {
     unsafe {
         let aligned = (BUFFER_ARENA_OFFSET + 3) & !3;
         if aligned + size > BUFFER_ARENA_SIZE {
-            log::error!("[buf] arena full need={} used={} cap={}",
-                size, aligned, BUFFER_ARENA_SIZE);
+            log::error!(
+                "[buf] arena full need={} used={} cap={}",
+                size,
+                aligned,
+                BUFFER_ARENA_SIZE
+            );
             return None;
         }
-        let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0).cast::<u8>().add(aligned);
+        let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0)
+            .cast::<u8>()
+            .add(aligned);
         core::ptr::write_bytes(ptr, 0, size);
         BUFFER_ARENA_OFFSET = aligned + size;
         Some(ptr)
@@ -221,7 +228,9 @@ impl BufferRegistrySlot {
 
     /// Assign arena-allocated memory to this slot.
     fn assign(&self, ptr: *mut u8, capacity: usize, channel: i8) {
-        unsafe { *self.data_ptr.get() = ptr; }
+        unsafe {
+            *self.data_ptr.get() = ptr;
+        }
         self.capacity.store(capacity as u32, Ordering::Release);
         self.owner_channel.store(channel, Ordering::Release);
         self.len.store(0, Ordering::Release);
@@ -229,24 +238,30 @@ impl BufferRegistrySlot {
 
     /// Try mailbox acquire write (STREAMING -> PRODUCER) — for channel's own buffer
     fn try_mailbox_acquire_write(&self) -> bool {
-        self.state.compare_exchange(
-            STATE_STREAMING,
-            STATE_PRODUCER,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok()
+        self.state
+            .compare_exchange(
+                STATE_STREAMING,
+                STATE_PRODUCER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Try in-place acquire (READY -> PRODUCER) — for aliased buffer chains.
     /// The in-place module reads and modifies the same buffer without
     /// going through CONSUMER -> STREAMING intermediate states.
     fn try_inplace_acquire(&self) -> bool {
-        if self.state.compare_exchange(
-            STATE_READY,
-            STATE_PRODUCER,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok() {
+        if self
+            .state
+            .compare_exchange(
+                STATE_READY,
+                STATE_PRODUCER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
             self.inplace_flag.store(1, Ordering::Release);
             true
         } else {
@@ -265,7 +280,11 @@ impl BufferRegistrySlot {
         let cap = self.capacity.load(Ordering::Acquire);
         self.len.store(data_len.min(cap), Ordering::Release);
         let was_inplace = self.inplace_flag.swap(0, Ordering::AcqRel);
-        let next_state = if was_inplace != 0 { STATE_READY_PROCESSED } else { STATE_READY };
+        let next_state = if was_inplace != 0 {
+            STATE_READY_PROCESSED
+        } else {
+            STATE_READY
+        };
         self.state.store(next_state, Ordering::Release);
         true
     }
@@ -273,18 +292,23 @@ impl BufferRegistrySlot {
     /// Try mailbox acquire read (READY/READY_PROCESSED -> CONSUMER) — ignores channel ownership
     fn try_mailbox_acquire_read(&self) -> bool {
         // Accept both READY (from fresh write) and READY_PROCESSED (from in-place)
-        self.state.compare_exchange(
-            STATE_READY,
-            STATE_CONSUMER,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok()
-        || self.state.compare_exchange(
-            STATE_READY_PROCESSED,
-            STATE_CONSUMER,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok()
+        self.state
+            .compare_exchange(
+                STATE_READY,
+                STATE_CONSUMER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            || self
+                .state
+                .compare_exchange(
+                    STATE_READY_PROCESSED,
+                    STATE_CONSUMER,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
     }
 
     /// Release after reading — return to STREAMING (mailbox) or FREE (pool)
@@ -304,7 +328,9 @@ impl BufferRegistrySlot {
         self.len.store(0, Ordering::Release);
         self.inplace_flag.store(0, Ordering::Release);
         self.producer_module.store(0xFF, Ordering::Release);
-        unsafe { *self.data_ptr.get() = core::ptr::null_mut(); }
+        unsafe {
+            *self.data_ptr.get() = core::ptr::null_mut();
+        }
     }
 }
 
@@ -342,16 +368,21 @@ pub fn alloc_streaming(channel: i8, capacity: usize) -> i32 {
 /// module's buffer.
 pub fn alloc_streaming_for_module(channel: i8, capacity: usize, producer_module: u8) -> i32 {
     for (i, slot) in BUFFER_REGISTRY.iter().enumerate() {
-        if slot.state.compare_exchange(
-            STATE_FREE,
-            STATE_STREAMING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok() {
+        if slot
+            .state
+            .compare_exchange(
+                STATE_FREE,
+                STATE_STREAMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
             match alloc_buffer(capacity) {
                 Some(ptr) => {
                     slot.assign(ptr, capacity, channel);
-                    slot.producer_module.store(producer_module, Ordering::Release);
+                    slot.producer_module
+                        .store(producer_module, Ordering::Release);
                     return i as i32;
                 }
                 None => {
@@ -379,12 +410,22 @@ pub fn compute_module_buffer_range(module_idx: u8) -> (usize, usize) {
             continue;
         }
         let ptr = slot.data_ptr() as usize;
-        if ptr == 0 { continue; }
+        if ptr == 0 {
+            continue;
+        }
         let cap = slot.get_capacity() as usize;
-        if ptr < lo { lo = ptr; }
-        if ptr + cap > hi { hi = ptr + cap; }
+        if ptr < lo {
+            lo = ptr;
+        }
+        if ptr + cap > hi {
+            hi = ptr + cap;
+        }
     }
-    if hi == 0 { (0, 0) } else { (lo, hi - lo) }
+    if hi == 0 {
+        (0, 0)
+    } else {
+        (lo, hi - lo)
+    }
 }
 
 /// Free a streaming buffer slot.
@@ -429,7 +470,11 @@ pub fn is_streaming(slot: i32) -> bool {
 /// Check if a mailbox buffer has data ready for reading (READY or READY_PROCESSED).
 /// Used by channel_poll to report POLL_IN for mailbox channels.
 pub fn mailbox_has_data(slot: i32) -> bool {
-    valid_slot(slot) && matches!(BUFFER_REGISTRY[slot as usize].state(), STATE_READY | STATE_READY_PROCESSED)
+    valid_slot(slot)
+        && matches!(
+            BUFFER_REGISTRY[slot as usize].state(),
+            STATE_READY | STATE_READY_PROCESSED
+        )
 }
 
 /// Check if a mailbox buffer is available for writing (STREAMING state).
@@ -442,7 +487,9 @@ pub fn mailbox_can_write(slot: i32) -> bool {
 /// Used by IOCTL_FLUSH to unstick a mailbox buffer that's in READY/CONSUMER/PRODUCER.
 /// Returns true if the slot was valid and reset.
 pub fn mailbox_flush(slot: i32) -> bool {
-    if !valid_slot(slot) { return false; }
+    if !valid_slot(slot) {
+        return false;
+    }
     let buf = &BUFFER_REGISTRY[slot as usize];
     buf.len.store(0, Ordering::Release);
     buf.inplace_flag.store(0, Ordering::Release);
@@ -540,12 +587,16 @@ pub fn mailbox_cancel_read(slot: i32) -> i32 {
         return BUF_EINVAL;
     }
     let buf = &BUFFER_REGISTRY[slot as usize];
-    if buf.state.compare_exchange(
-        STATE_CONSUMER,
-        STATE_READY,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ).is_ok() {
+    if buf
+        .state
+        .compare_exchange(
+            STATE_CONSUMER,
+            STATE_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
         BUF_OK
     } else {
         BUF_EBUSY
@@ -566,9 +617,9 @@ pub fn get_capacity(slot: i32) -> u32 {
 
 /// Check if a channel has a ready buffer (includes in-place processed buffers)
 pub fn has_ready(channel: i8) -> bool {
-    BUFFER_REGISTRY.iter().any(|s| {
-        s.owner() == channel && matches!(s.state(), STATE_READY | STATE_READY_PROCESSED)
-    })
+    BUFFER_REGISTRY
+        .iter()
+        .any(|s| s.owner() == channel && matches!(s.state(), STATE_READY | STATE_READY_PROCESSED))
 }
 
 /// Check if registry has any free slots

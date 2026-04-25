@@ -75,8 +75,12 @@ pub struct ParamSchema {
 impl ParamSchema {
     /// Parse schema from raw bytes (as embedded in .fmod).
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 4 { return None; }
-        if data[0] != SCHEMA_MAGIC[0] || data[1] != SCHEMA_MAGIC[1] { return None; }
+        if data.len() < 4 {
+            return None;
+        }
+        if data[0] != SCHEMA_MAGIC[0] || data[1] != SCHEMA_MAGIC[1] {
+            return None;
+        }
         let _version = data[2];
         let count = data[3] as usize;
 
@@ -84,39 +88,68 @@ impl ParamSchema {
         let mut pos = 4usize;
 
         for _ in 0..count {
-            if pos + 6 > data.len() { break; }
+            if pos + 6 > data.len() {
+                break;
+            }
 
-            let tag = data[pos]; pos += 1;
-            let ptype = ParamType::from_u8(data[pos])?; pos += 1;
+            let tag = data[pos];
+            pos += 1;
+            let ptype = ParamType::from_u8(data[pos])?;
+            pos += 1;
 
             // Default (4 bytes LE)
-            if pos + 4 > data.len() { break; }
-            let default = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+            if pos + 4 > data.len() {
+                break;
+            }
+            let default =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
 
             // Name
-            if pos >= data.len() { break; }
-            let name_len = data[pos] as usize; pos += 1;
-            if pos + name_len > data.len() { break; }
+            if pos >= data.len() {
+                break;
+            }
+            let name_len = data[pos] as usize;
+            pos += 1;
+            if pos + name_len > data.len() {
+                break;
+            }
             let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
             pos += name_len;
 
             // Enums
-            if pos >= data.len() { break; }
-            let enum_count = data[pos] as usize; pos += 1;
+            if pos >= data.len() {
+                break;
+            }
+            let enum_count = data[pos] as usize;
+            pos += 1;
             let mut enums = HashMap::new();
             for _ in 0..enum_count {
-                if pos >= data.len() { break; }
-                let val = data[pos]; pos += 1;
-                if pos >= data.len() { break; }
-                let ename_len = data[pos] as usize; pos += 1;
-                if pos + ename_len > data.len() { break; }
+                if pos >= data.len() {
+                    break;
+                }
+                let val = data[pos];
+                pos += 1;
+                if pos >= data.len() {
+                    break;
+                }
+                let ename_len = data[pos] as usize;
+                pos += 1;
+                if pos + ename_len > data.len() {
+                    break;
+                }
                 let ename = String::from_utf8_lossy(&data[pos..pos + ename_len]).to_string();
                 pos += ename_len;
                 enums.insert(ename, val);
             }
 
-            params.push(SchemaParam { tag, ptype, name, default, enums });
+            params.push(SchemaParam {
+                tag,
+                ptype,
+                name,
+                default,
+                enums,
+            });
         }
 
         let mut name_map = HashMap::new();
@@ -130,6 +163,44 @@ impl ParamSchema {
     /// Parse schema from an .fmod file's ModuleInfo.
     pub fn from_module_info(info: &ModuleInfo) -> Option<Self> {
         info.schema.as_ref().and_then(|data| Self::from_bytes(data))
+    }
+
+    /// Build a schema from a built-in module's `manifest.toml` `[[params]]`
+    /// section. This lets the same TLV packer used for `.fmod` modules
+    /// produce per-instance params for kernel built-ins (which have no
+    /// `.fmod` to embed schema bytes into).
+    pub fn from_manifest(m: &crate::manifest::Manifest) -> Option<Self> {
+        if m.params.is_empty() {
+            return None;
+        }
+        let mut params = Vec::with_capacity(m.params.len());
+        for mp in &m.params {
+            let ptype = match mp.ptype {
+                crate::manifest::ManifestParamType::U8 => ParamType::U8,
+                crate::manifest::ManifestParamType::U16 => ParamType::U16,
+                crate::manifest::ManifestParamType::U32 => ParamType::U32,
+                crate::manifest::ManifestParamType::Str => ParamType::Str,
+                // Enum maps to U8 on the wire — the manifest's value table
+                // resolves YAML strings to indexed bytes before pack time.
+                crate::manifest::ManifestParamType::Enum => ParamType::U8,
+            };
+            let mut enums = HashMap::new();
+            for (name, val) in &mp.enum_values {
+                enums.insert(name.clone(), *val);
+            }
+            params.push(SchemaParam {
+                tag: mp.tag,
+                ptype,
+                name: mp.name.clone(),
+                default: mp.default_num,
+                enums,
+            });
+        }
+        let mut name_map = HashMap::new();
+        for (i, p) in params.iter().enumerate() {
+            name_map.insert(p.name.clone(), i);
+        }
+        Some(ParamSchema { params, name_map })
     }
 
     /// Look up a param by name.
@@ -154,9 +225,18 @@ impl ParamSchema {
 /// Module-specific keys (pin, data_pin, etc.) are NOT listed here —
 /// the schema itself determines which YAML keys are valid params.
 /// Unknown keys are silently skipped by pack_param().
-const SKIP_KEYS: &[&str] = &[
-    "name", "type", "wiring", "preset", "presets", "voices", "routes",
-    "step_deadline_us", "fault_policy", "max_restarts", "restart_backoff_ms",
+pub(crate) const SKIP_KEYS: &[&str] = &[
+    "name",
+    "type",
+    "wiring",
+    "preset",
+    "presets",
+    "voices",
+    "routes",
+    "step_deadline_us",
+    "fault_policy",
+    "max_restarts",
+    "restart_backoff_ms",
 ];
 
 /// Grouping suffixes that YAML nesting may introduce in outer keys
@@ -164,7 +244,7 @@ const SKIP_KEYS: &[&str] = &[
 /// ends with one of these, a stripped form is also inserted into the
 /// key/value map so that e.g. `filter_envelope.attack_ms` matches
 /// schema param `filter_attack_ms`.
-const GROUPING_SUFFIXES: &[&str] = &["_envelope", "_config", "_settings", "_params"];
+pub(crate) const GROUPING_SUFFIXES: &[&str] = &["_envelope", "_config", "_settings", "_params"];
 
 /// Pack YAML module config into TLV format using schema.
 ///
@@ -214,7 +294,22 @@ pub fn build_params_from_schema(
 
             if value.is_object() {
                 if let Some(inner_obj) = value.as_object() {
+                    // `params: { ... }` is a transparent wrapper — its
+                    // inner keys map directly to schema params with no
+                    // prefix. Idiomatic YAML grouping, used by several
+                    // examples to separate config from wiring metadata.
+                    let transparent = key == "params";
                     for (inner_key, inner_value) in inner_obj {
+                        if transparent {
+                            kv.insert(inner_key.clone(), inner_value.clone());
+                            if inner_key.contains('.') {
+                                kv.insert(
+                                    inner_key.replace('.', "_"),
+                                    inner_value.clone(),
+                                );
+                            }
+                            continue;
+                        }
                         let dotted = format!("{}.{}", key, inner_key);
                         let underscored = dotted.replace('.', "_");
                         kv.insert(dotted, inner_value.clone());
@@ -243,8 +338,10 @@ pub fn build_params_from_schema(
     let mut pos = base_offset;
 
     // TLV header
-    entry[pos] = TLV_MAGIC; pos += 1;
-    entry[pos] = TLV_VERSION; pos += 1;
+    entry[pos] = TLV_MAGIC;
+    pos += 1;
+    entry[pos] = TLV_VERSION;
+    pos += 1;
     let len_pos = pos; // payload length placeholder
     pos += 2;
 
@@ -260,12 +357,16 @@ pub fn build_params_from_schema(
                     if !values.is_empty() {
                         let val_len = values.len() * 2;
                         if pos + 2 + val_len < entry.len() {
-                            entry[pos] = param.tag; pos += 1;
-                            entry[pos] = val_len as u8; pos += 1;
+                            entry[pos] = param.tag;
+                            pos += 1;
+                            entry[pos] = val_len as u8;
+                            pos += 1;
                             for v in &values {
                                 let bytes = v.to_le_bytes();
-                                entry[pos] = bytes[0]; pos += 1;
-                                entry[pos] = bytes[1]; pos += 1;
+                                entry[pos] = bytes[0];
+                                pos += 1;
+                                entry[pos] = bytes[1];
+                                pos += 1;
                             }
                         }
                     }
@@ -279,7 +380,9 @@ pub fn build_params_from_schema(
                 for preset_ref in arr.iter() {
                     let blob = resolve_preset_blob(preset_ref, data_section)
                         .map_err(|e| format!("module '{}': {}", module_name, e))?;
-                    if blob.is_empty() { continue; }
+                    if blob.is_empty() {
+                        continue;
+                    }
                     // Self-delimiting blob: first chunk carries 2-byte LE total
                     // length header. Module uses this to know when one blob ends
                     // and the next begins, without needing a separate boundary tag.
@@ -291,16 +394,23 @@ pub fn build_params_from_schema(
                         let extra = if first { 2 } else { 0 };
                         let max_data = 255 - extra;
                         let chunk = std::cmp::min(max_data, blob.len() - off);
-                        if pos + 2 + extra + chunk >= entry.len() { break; }
-                        entry[pos] = param.tag; pos += 1;
-                        entry[pos] = (extra + chunk) as u8; pos += 1;
+                        if pos + 2 + extra + chunk >= entry.len() {
+                            break;
+                        }
+                        entry[pos] = param.tag;
+                        pos += 1;
+                        entry[pos] = (extra + chunk) as u8;
+                        pos += 1;
                         if first {
-                            entry[pos] = header[0]; pos += 1;
-                            entry[pos] = header[1]; pos += 1;
+                            entry[pos] = header[0];
+                            pos += 1;
+                            entry[pos] = header[1];
+                            pos += 1;
                             first = false;
                         }
                         for i in 0..chunk {
-                            entry[pos] = blob[off + i]; pos += 1;
+                            entry[pos] = blob[off + i];
+                            pos += 1;
                         }
                         off += chunk;
                     }
@@ -321,8 +431,10 @@ pub fn build_params_from_schema(
                 let mut inner = [0u8; 256];
                 let inner_len = pack_voice_inner(&voice_params, schema, &mut inner);
                 if inner_len > 0 && pos + 2 + inner_len < entry.len() {
-                    entry[pos] = 0xFD; pos += 1;
-                    entry[pos] = inner_len as u8; pos += 1;
+                    entry[pos] = 0xFD;
+                    pos += 1;
+                    entry[pos] = inner_len as u8;
+                    pos += 1;
                     entry[pos..pos + inner_len].copy_from_slice(&inner[..inner_len]);
                     pos += inner_len;
                 }
@@ -331,8 +443,10 @@ pub fn build_params_from_schema(
     }
 
     // End marker
-    entry[pos] = TLV_END; pos += 1;
-    entry[pos] = 0x00; pos += 1;
+    entry[pos] = TLV_END;
+    pos += 1;
+    entry[pos] = 0x00;
+    pos += 1;
 
     // Patch payload length
     let payload_len = (pos - payload_start) as u16;
@@ -359,31 +473,44 @@ fn pack_param(
         ParamType::U8 => {
             let val = resolve_u8(value, param);
             if pos + 3 < entry.len() {
-                entry[pos] = param.tag; pos += 1;
-                entry[pos] = 1; pos += 1;
-                entry[pos] = val; pos += 1;
+                entry[pos] = param.tag;
+                pos += 1;
+                entry[pos] = 1;
+                pos += 1;
+                entry[pos] = val;
+                pos += 1;
             }
         }
         ParamType::U16 => {
             let val = resolve_u16(value, param);
             if pos + 4 < entry.len() {
-                entry[pos] = param.tag; pos += 1;
-                entry[pos] = 2; pos += 1;
+                entry[pos] = param.tag;
+                pos += 1;
+                entry[pos] = 2;
+                pos += 1;
                 let bytes = val.to_le_bytes();
-                entry[pos] = bytes[0]; pos += 1;
-                entry[pos] = bytes[1]; pos += 1;
+                entry[pos] = bytes[0];
+                pos += 1;
+                entry[pos] = bytes[1];
+                pos += 1;
             }
         }
         ParamType::U32 => {
             let val = resolve_u32(value, param);
             if pos + 6 < entry.len() {
-                entry[pos] = param.tag; pos += 1;
-                entry[pos] = 4; pos += 1;
+                entry[pos] = param.tag;
+                pos += 1;
+                entry[pos] = 4;
+                pos += 1;
                 let bytes = val.to_le_bytes();
-                entry[pos] = bytes[0]; pos += 1;
-                entry[pos] = bytes[1]; pos += 1;
-                entry[pos] = bytes[2]; pos += 1;
-                entry[pos] = bytes[3]; pos += 1;
+                entry[pos] = bytes[0];
+                pos += 1;
+                entry[pos] = bytes[1];
+                pos += 1;
+                entry[pos] = bytes[2];
+                pos += 1;
+                entry[pos] = bytes[3];
+                pos += 1;
             }
         }
         ParamType::Str => {
@@ -396,11 +523,17 @@ fn pack_param(
                 let mut offset = 0;
                 loop {
                     let remaining = bytes.len() - offset;
-                    if remaining == 0 { break; }
+                    if remaining == 0 {
+                        break;
+                    }
                     let chunk_len = remaining.min(255);
-                    if pos + 2 + chunk_len >= entry.len() { break; }
-                    entry[pos] = param.tag; pos += 1;
-                    entry[pos] = chunk_len as u8; pos += 1;
+                    if pos + 2 + chunk_len >= entry.len() {
+                        break;
+                    }
+                    entry[pos] = param.tag;
+                    pos += 1;
+                    entry[pos] = chunk_len as u8;
+                    pos += 1;
                     entry[pos..pos + chunk_len].copy_from_slice(&bytes[offset..offset + chunk_len]);
                     pos += chunk_len;
                     offset += chunk_len;
@@ -412,8 +545,10 @@ fn pack_param(
                         let bytes = s.as_bytes();
                         let len = bytes.len().min(255);
                         if pos + 2 + len < entry.len() {
-                            entry[pos] = param.tag; pos += 1;
-                            entry[pos] = len as u8; pos += 1;
+                            entry[pos] = param.tag;
+                            pos += 1;
+                            entry[pos] = len as u8;
+                            pos += 1;
                             entry[pos..pos + len].copy_from_slice(&bytes[..len]);
                             pos += len;
                         }
@@ -452,19 +587,29 @@ fn resolve_u8(value: &Value, param: &SchemaParam) -> u8 {
             _ => param.default as u8,
         };
     }
-    if let Some(n) = value.as_u64() { return n as u8; }
-    if let Some(b) = value.as_bool() { return if b { 1 } else { 0 }; }
+    if let Some(n) = value.as_u64() {
+        return n as u8;
+    }
+    if let Some(b) = value.as_bool() {
+        return if b { 1 } else { 0 };
+    }
     param.default as u8
 }
 
 /// Resolve a value to u16.
 fn resolve_u16(value: &Value, param: &SchemaParam) -> u16 {
     if let Some(s) = value.as_str() {
-        if let Some(&v) = param.enums.get(s) { return v as u16; }
-        if let Ok(n) = s.parse::<u16>() { return n; }
+        if let Some(&v) = param.enums.get(s) {
+            return v as u16;
+        }
+        if let Ok(n) = s.parse::<u16>() {
+            return n;
+        }
         return param.default as u16;
     }
-    if let Some(n) = value.as_u64() { return n as u16; }
+    if let Some(n) = value.as_u64() {
+        return n as u16;
+    }
     param.default as u16
 }
 
@@ -473,23 +618,33 @@ fn resolve_u16(value: &Value, param: &SchemaParam) -> u16 {
 /// names to be written as readable strings in YAML (e.g., `click: toggle`).
 fn resolve_u32(value: &Value, param: &SchemaParam) -> u32 {
     if let Some(s) = value.as_str() {
-        if let Some(&v) = param.enums.get(s) { return v as u32; }
-        if let Ok(n) = s.parse::<u32>() { return n; }
+        if let Some(&v) = param.enums.get(s) {
+            return v as u32;
+        }
+        if let Ok(n) = s.parse::<u32>() {
+            return n;
+        }
         // Try dotted-decimal IPv4 (e.g. "192.168.1.1" → network byte order u32)
         if s.contains('.') {
-            if let Some(ip) = parse_ipv4(s) { return ip; }
+            if let Some(ip) = parse_ipv4(s) {
+                return ip;
+            }
         }
         // Hash as FNV-1a — enables FMP message type names in config YAML
         return crate::hash::fnv1a_hash(s.as_bytes());
     }
-    if let Some(n) = value.as_u64() { return n as u32; }
+    if let Some(n) = value.as_u64() {
+        return n as u32;
+    }
     param.default
 }
 
 /// Parse dotted-decimal IPv4 to u32 in network byte order.
 fn parse_ipv4(s: &str) -> Option<u32> {
     let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 { return None; }
+    if parts.len() != 4 {
+        return None;
+    }
     let a = parts[0].parse::<u8>().ok()?;
     let b = parts[1].parse::<u8>().ok()?;
     let c = parts[2].parse::<u8>().ok()?;
@@ -520,10 +675,12 @@ fn builtin_preset(name: &str) -> Option<Vec<u16>> {
     match name {
         "c_major" | "major" => Some(vec![262, 294, 330, 349, 392, 440, 494, 523]),
         "c_minor" | "minor" => Some(vec![262, 294, 311, 349, 392, 415, 466, 523]),
-        "pentatonic"        => Some(vec![262, 294, 330, 392, 440]),
-        "blues"             => Some(vec![262, 311, 349, 370, 392, 466]),
-        "chromatic"         => Some(vec![262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494]),
-        "bass"              => Some(vec![65, 73, 82, 98, 110]),
+        "pentatonic" => Some(vec![262, 294, 330, 392, 440]),
+        "blues" => Some(vec![262, 311, 349, 370, 392, 466]),
+        "chromatic" => Some(vec![
+            262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494,
+        ]),
+        "bass" => Some(vec![65, 73, 82, 98, 110]),
         _ => None,
     }
 }
@@ -531,10 +688,14 @@ fn builtin_preset(name: &str) -> Option<Vec<u16>> {
 /// Resolve preset values from a data section reference, built-in name, or inline array.
 ///
 /// Returns Ok(values) on success, Err(message) if a string name cannot be resolved.
-fn resolve_preset_values(preset_ref: &Value, data_section: Option<&Value>) -> Result<Vec<u16>, String> {
+fn resolve_preset_values(
+    preset_ref: &Value,
+    data_section: Option<&Value>,
+) -> Result<Vec<u16>, String> {
     // Direct array of numbers
     if let Some(arr) = preset_ref.as_array() {
-        return Ok(arr.iter()
+        return Ok(arr
+            .iter()
             .filter_map(|v| v.as_u64().map(|n| n as u16))
             .collect());
     }
@@ -545,7 +706,8 @@ fn resolve_preset_values(preset_ref: &Value, data_section: Option<&Value>) -> Re
             if let Some(entry) = data.get(name) {
                 if let Some(values) = entry.get("values") {
                     if let Some(arr) = values.as_array() {
-                        return Ok(arr.iter()
+                        return Ok(arr
+                            .iter()
                             .filter_map(|v| v.as_u64().map(|n| n as u16))
                             .collect());
                     }
@@ -573,10 +735,14 @@ fn resolve_preset_values(preset_ref: &Value, data_section: Option<&Value>) -> Re
 /// - Inline array of byte values: `[0x42, 0x4D, ...]`
 /// - String reference to data section entry with `hex:` field (hex string)
 /// - String reference to data section entry with `bytes:` field (byte array)
-fn resolve_preset_blob(preset_ref: &Value, data_section: Option<&Value>) -> Result<Vec<u8>, String> {
+fn resolve_preset_blob(
+    preset_ref: &Value,
+    data_section: Option<&Value>,
+) -> Result<Vec<u8>, String> {
     // Direct array of numbers (interpreted as bytes)
     if let Some(arr) = preset_ref.as_array() {
-        return Ok(arr.iter()
+        return Ok(arr
+            .iter()
             .filter_map(|v| v.as_u64().map(|n| n as u8))
             .collect());
     }
@@ -587,12 +753,12 @@ fn resolve_preset_blob(preset_ref: &Value, data_section: Option<&Value>) -> Resu
             if let Some(entry) = data.get(name) {
                 // Try hex string first
                 if let Some(hex_str) = entry.get("hex").and_then(|v| v.as_str()) {
-                    return decode_hex(hex_str)
-                        .map_err(|e| format!("blob '{}': {}", name, e));
+                    return decode_hex(hex_str).map_err(|e| format!("blob '{}': {}", name, e));
                 }
                 // Try bytes array
                 if let Some(bytes_arr) = entry.get("bytes").and_then(|v| v.as_array()) {
-                    return Ok(bytes_arr.iter()
+                    return Ok(bytes_arr
+                        .iter()
                         .filter_map(|v| v.as_u64().map(|n| n as u8))
                         .collect());
                 }
@@ -630,7 +796,11 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 /// Looks up `voice_ref` (a string name) in `data_section`, then extracts
 /// the sub-object for `module_name` (e.g., "synth" or "effects").
 /// Falls back to the voice object itself if no module-specific sub-object.
-fn resolve_voice_params(voice_ref: &Value, data_section: Option<&Value>, module_name: &str) -> Option<Value> {
+fn resolve_voice_params(
+    voice_ref: &Value,
+    data_section: Option<&Value>,
+    module_name: &str,
+) -> Option<Value> {
     let name = voice_ref.as_str()?;
     let data = data_section?;
     let voice_entry = data.get(name)?;
@@ -693,8 +863,10 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
 
     // TLV header
     let mut pos = 0usize;
-    buf[pos] = TLV_MAGIC; pos += 1;
-    buf[pos] = TLV_VERSION; pos += 1;
+    buf[pos] = TLV_MAGIC;
+    pos += 1;
+    buf[pos] = TLV_VERSION;
+    pos += 1;
     let len_pos = pos;
     pos += 2; // payload length placeholder
 
@@ -711,8 +883,10 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
     }
 
     // End marker
-    buf[pos] = TLV_END; pos += 1;
-    buf[pos] = 0x00; pos += 1;
+    buf[pos] = TLV_END;
+    pos += 1;
+    buf[pos] = 0x00;
+    pos += 1;
 
     // Patch payload length
     let payload_len = (pos - payload_start) as u16;
@@ -722,12 +896,11 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
 }
 
 /// Load schema for a module type from the .fmod files directory.
-pub fn load_schema_for_module(
-    module_type: &str,
-    modules_dir: &Path,
-) -> Option<ParamSchema> {
+pub fn load_schema_for_module(module_type: &str, modules_dir: &Path) -> Option<ParamSchema> {
     let fmod_path = modules_dir.join(format!("{}.fmod", module_type));
-    if !fmod_path.exists() { return None; }
+    if !fmod_path.exists() {
+        return None;
+    }
     let info = ModuleInfo::from_file(&fmod_path).ok()?;
     ParamSchema::from_module_info(&info)
 }
@@ -745,13 +918,11 @@ pub fn load_schema_for_module(
 ///   - `body` without → static (0)
 ///   - `source: files` → file (2)
 ///   - `proxy:` → proxy (3)
-fn expand_routes(
-    routes: &[Value],
-    kv: &mut HashMap<String, Value>,
-    data_section: Option<&Value>,
-) {
+fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section: Option<&Value>) {
     for (i, route) in routes.iter().enumerate() {
-        if i >= 4 { break; } // MAX_ROUTES = 4
+        if i >= 4 {
+            break;
+        } // MAX_ROUTES = 4
         let _base = i * 10 + 10; // tags: 10, 20, 30, 40
         let obj = match route.as_object() {
             Some(o) => o,
@@ -781,10 +952,7 @@ fn expand_routes(
                     );
                 } else {
                     // No port — use IP as-is, default port
-                    kv.insert(
-                        format!("route_{}_proxy_ip", i),
-                        proxy_val.clone(),
-                    );
+                    kv.insert(format!("route_{}_proxy_ip", i), proxy_val.clone());
                 }
             }
         } else if obj.get("source").is_some() {
@@ -806,10 +974,7 @@ fn expand_routes(
                 handler = 0; // static
             }
 
-            kv.insert(
-                format!("route_{}_body", i),
-                Value::String(body_str),
-            );
+            kv.insert(format!("route_{}_body", i), Value::String(body_str));
         }
 
         kv.insert(

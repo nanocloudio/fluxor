@@ -10,6 +10,6 @@
 //! a few milliseconds on bcm2712, run at most once per module load, which is
 //! well within the boot budget.
 
-pub mod sha512;
 pub mod ed25519;
 pub mod p256;
+pub mod sha512;

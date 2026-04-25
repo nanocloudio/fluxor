@@ -1,0 +1,37 @@
+# Display stack — provides a `display` sink that consumes RGB565 frames.
+#
+# Logical name: `display`. Apps wire `<producer>.pixels -> display.pixels`
+# without naming a concrete driver. The stack picks the implementation
+# from board / family / driver so the same graph runs on hardware and
+# on the Linux host.
+
+[stack]
+name = "display"
+
+# ── Waveshare LCD4: ST7701S 480×480 RGB panel ────────────────────────────
+[[variant]]
+match = { board = "waveshare-lcd4" }
+modules = [
+  { name = "display", type = "st7701s" },
+]
+wiring = []
+
+# ── Linux: hosted built-in (winit + softbuffer window, or file capture) ─
+# `mode: window` opens a host window via winit + softbuffer (requires
+# `fluxor-linux` built with `--features host-window`; `fluxor build`
+# rejects window mode against a binary lacking the feature). `mode: file`
+# writes PPM frames to `path`; `mode: null` drains for performance tests.
+[[variant]]
+match = { family = "linux", driver = "host" }
+modules = [
+  { name = "display", type = "linux_display",
+    params = {
+      width  = "user:width|480",
+      height = "user:height|480",
+      scale  = "user:scale|1",
+      mode   = "user:mode|window",
+      path   = "user:path|",
+    },
+  },
+]
+wiring = []

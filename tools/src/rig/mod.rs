@@ -42,9 +42,7 @@ pub mod vocab;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-pub use board::{
-    load_board_rig, parse_board_rig_str, resolve_board_rig, BoardRig, BoardSource,
-};
+pub use board::{load_board_rig, parse_board_rig_str, resolve_board_rig, BoardRig, BoardSource};
 pub use events::{DeployEvent, RunEvent};
 pub use lock::{
     acquire as acquire_lock, default_lock_path, AcquireOutcome, LockConflict, LockGuard, LockOwner,
@@ -55,7 +53,9 @@ pub use profile::{
     BindingValue, RigMeta, RigProfile,
 };
 pub use project::{BuildOutput, BuildRecipe, ProjectDescriptor, PROJECT_DESCRIPTOR};
-pub use record::{canonical_profile, hash_artifact_bundle, hash_artifact_file, hash_profile, RunRecord, Verdict};
+pub use record::{
+    canonical_profile, hash_artifact_bundle, hash_artifact_file, hash_profile, RunRecord, Verdict,
+};
 pub use scenario::{load_scenario, parse_scenario_str, ObservationRule, Scenario};
 pub use secret::{resolve as resolve_secret, Secret, REDACTED};
 pub use validate::{validate_scenario_against_board, validate_tags, RigValidation};

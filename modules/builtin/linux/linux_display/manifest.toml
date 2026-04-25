@@ -1,0 +1,38 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+[[ports]]
+name = "pixels"
+direction = "input"
+content_type = "ImageRaw"
+required = true
+
+[[params]]
+name = "mode"
+type = "enum"
+values = ["file", "null", "window"]
+default = "file"
+
+[[params]]
+name = "path"
+type = "str"
+default = "./target/host-display/frame_%04d.ppm"
+
+[[params]]
+name = "width"
+type = "u32"
+default = 480
+range = [1, 4096]
+
+[[params]]
+name = "height"
+type = "u32"
+default = 480
+range = [1, 4096]
+
+[[params]]
+name = "scale"
+type = "u32"
+default = 1
+range = [1, 16]

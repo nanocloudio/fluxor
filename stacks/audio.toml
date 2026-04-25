@@ -1,0 +1,45 @@
+# Audio stack — provides an `audio_out` sink that consumes PCM frames.
+#
+# Logical name: `audio_out`. Apps wire `<producer>.audio -> audio_out.audio`
+# without naming a concrete driver. The stack picks the implementation
+# from family / driver so the same graph runs on hardware DACs and on
+# the Linux host.
+
+[stack]
+name = "audio"
+
+# ── RP2 family: I2S DAC driven by PIO ────────────────────────────────────
+# Pulls in `pio_rp` because i2s_pio claims a PIO state machine.
+[[variant]]
+match = { family = "rp", driver = "i2s_pio" }
+modules = [
+  { name = "pio_rp" },
+  { name = "audio_out", type = "i2s_pio",
+    params = {
+      sample_rate = "user:sample_rate|48000",
+      data_pin    = "user:data_pin|required",
+      clock_base  = "user:clock_base|required",
+    },
+  },
+]
+wiring = []
+
+# ── Linux: hosted built-in (CPAL playback, or WAV / raw capture) ────────
+# `mode: playback` streams to the host audio device via CPAL/ALSA
+# (requires `fluxor-linux` built with `--features host-playback`;
+# `fluxor build` rejects playback mode against a binary lacking the
+# feature). `mode: wav` writes a RIFF/WAVE file; `mode: raw` writes
+# little-endian PCM; `mode: null` drains for backpressure tests.
+[[variant]]
+match = { family = "linux", driver = "host" }
+modules = [
+  { name = "audio_out", type = "linux_audio",
+    params = {
+      sample_rate = "user:sample_rate|48000",
+      channels    = "user:channels|2",
+      mode        = "user:mode|playback",
+      path        = "user:path|",
+    },
+  },
+]
+wiring = []

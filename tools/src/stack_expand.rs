@@ -30,10 +30,10 @@
 //!
 //! See `.context/platform_stacks.md` for the full specification.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use crate::target::TargetDescriptor;
@@ -75,9 +75,7 @@ fn load_host_config() -> Result<HostConfig> {
 }
 
 fn host_config_path() -> Option<PathBuf> {
-    let base = if let Some(xdg) =
-        std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
-    {
+    let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
         Some(PathBuf::from(xdg))
     } else {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
@@ -205,6 +203,13 @@ struct StackInjection {
 #[derive(Deserialize)]
 struct StackModule {
     name: String,
+    /// Implementation selector. When present, the injected module entry
+    /// gets a `type:` field; the graph instance keeps `name`. Used by
+    /// stacks that map a logical name (e.g. `display`, `audio_out`) to
+    /// the concrete driver for the chosen target. Absent means
+    /// `type` falls back to `name` at config-generation time.
+    #[serde(default, rename = "type")]
+    type_name: Option<String>,
     #[serde(default)]
     params: HashMap<String, String>,
 }
@@ -282,9 +287,8 @@ fn load_stack(name: &str, project_root: &std::path::Path) -> Result<StackFile> {
             e
         ))
     })?;
-    toml::from_str(&content).map_err(|e| {
-        Error::Config(format!("Failed to parse {}: {}", path.display(), e))
-    })
+    toml::from_str(&content)
+        .map_err(|e| Error::Config(format!("Failed to parse {}: {}", path.display(), e)))
 }
 
 // ============================================================================
@@ -336,7 +340,9 @@ fn merge_with_board_defaults(
 
     // Inject target metadata (available for matching but not user-set)
     if let Some(ref board) = target.board_id {
-        merged.entry("board".into()).or_insert_with(|| board.clone());
+        merged
+            .entry("board".into())
+            .or_insert_with(|| board.clone());
     }
     merged
         .entry("family".into())
@@ -444,6 +450,9 @@ fn inject_injection(
 
         let mut entry = serde_json::Map::new();
         entry.insert("name".into(), json!(&sm.name));
+        if let Some(ref ty) = sm.type_name {
+            entry.insert("type".into(), json!(ty));
+        }
 
         // Map params: module_param_name <- pipe-chained source list.
         // See `resolve_param_source` for the grammar.
@@ -454,14 +463,10 @@ fn inject_injection(
         // missing field — use this for values where a default would
         // be unsafe (e.g. `log_net` dst_ip).
         for (module_key, source) in &sm.params {
-            let resolved = resolve_param_source(
-                source,
-                merged,
-                host,
-                &sm.name,
-                module_key,
-            )?;
-            let Some(val) = resolved else { continue; };
+            let resolved = resolve_param_source(source, merged, host, &sm.name, module_key)?;
+            let Some(val) = resolved else {
+                continue;
+            };
             let coerced = match val.as_str() {
                 "true" => json!(1),
                 "false" => json!(0),

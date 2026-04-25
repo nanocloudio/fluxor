@@ -286,6 +286,26 @@ parameter schema encoding. Modules outside the fluxor tree (such as
 the Clustor project's modules) include the same files via a relative
 path through their git submodule.
 
+**Built-in modules** (`builtin = true` in their `manifest.toml`) are
+compiled directly into the kernel binary rather than shipped as
+`.fmod` images. Since there is no `.fmod` to embed a `define_params!`
+schema into, built-ins declare their parameter schema in the manifest
+TOML under a `[[params]]` section — same wire format (TLV) as PIC
+modules, but the schema is read off disk at config-build time.
+
+Built-in manifests live under `modules/builtin/<platform>/<name>/`,
+with `linux/` for Linux-host APIs and `host/` for host-OS-agnostic
+pure-Rust modules. The Rust implementation sits in
+`src/platform/<platform>/<name>.rs`. Built-in vs PIC is a
+**deployment** distinction (linked-in vs loaded-at-runtime), not a
+selection one — `stacks/*.toml` route logical surfaces to either kind
+transparently.
+
+See `abi_layers.md` for the schema, validation rules
+(unknown-key/range/required), the runtime-feature cross-check, and
+the full module-categories layout. The kernel itself sees only the
+resulting TLV bytes; built-in vs PIC is invisible at the wire layer.
+
 See `src/kernel/loader.rs`, `modules/module.ld`, and `tools/src/modules.rs`
 for the loader, linker script, and pack tool.
 

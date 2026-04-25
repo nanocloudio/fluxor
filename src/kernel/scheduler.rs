@@ -11,21 +11,23 @@
 
 use core::ptr::null;
 
-use crate::kernel::hal;
-use crate::kernel::config::{
-    read_config_into, Config, ModuleEntry,
-    MAX_MODULES as CONFIG_MAX_MODULES,
-    MAX_GRAPH_EDGES,
-};
-use crate::kernel::loader::{DynamicModule, StartNewResult, ModuleLoader, reset_state_arena, ChannelHint, query_channel_hints, find_hint_for_port};
-use crate::kernel::syscalls::{
-    get_table_for_module_type,
-    is_spi_initialized,
-};
 use crate::kernel::channel;
-use crate::kernel::channel::{POLL_IN, POLL_OUT, POLL_HUP, POLL_ERR, channel_set_flags, channel_set_mailbox};
-use crate::kernel::syscalls as syscalls;
-use crate::kernel::step_guard::{self, ModuleFaultInfo, FaultState, FaultPolicy, FaultStats, FaultRecord, fault_type};
+use crate::kernel::channel::{
+    channel_set_flags, channel_set_mailbox, POLL_ERR, POLL_HUP, POLL_IN, POLL_OUT,
+};
+use crate::kernel::config::{
+    read_config_into, Config, ModuleEntry, MAX_GRAPH_EDGES, MAX_MODULES as CONFIG_MAX_MODULES,
+};
+use crate::kernel::hal;
+use crate::kernel::loader::{
+    find_hint_for_port, query_channel_hints, reset_state_arena, ChannelHint, DynamicModule,
+    ModuleLoader, StartNewResult,
+};
+use crate::kernel::step_guard::{
+    self, fault_type, FaultPolicy, FaultRecord, FaultState, FaultStats, ModuleFaultInfo,
+};
+use crate::kernel::syscalls;
+use crate::kernel::syscalls::{get_table_for_module_type, is_spi_initialized};
 use crate::modules::{Module, StepOutcome};
 
 // ============================================================================
@@ -232,7 +234,9 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
     let mut group_max_size: [u16; 128] = [0; 128];
     for edge in edges.iter() {
         let group = edge.buffer_group as usize;
-        if group == 0 || group >= 128 { continue; }
+        if group == 0 || group >= 128 {
+            continue;
+        }
 
         let from_hints = &module_hints[edge.from_module];
         let from_size = find_hint_for_port(
@@ -305,12 +309,13 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         let chan = if buf_size > 0 {
             let config = buf_size.to_le_bytes();
             channel::channel_open_for_module(
-                channel::CHANNEL_TYPE_PIPE, config.as_ptr(), 2, producer_mod,
+                channel::CHANNEL_TYPE_PIPE,
+                config.as_ptr(),
+                2,
+                producer_mod,
             )
         } else {
-            channel::channel_open_for_module(
-                channel::CHANNEL_TYPE_PIPE, null(), 0, producer_mod,
-            )
+            channel::channel_open_for_module(channel::CHANNEL_TYPE_PIPE, null(), 0, producer_mod)
         };
 
         if chan < 0 {
@@ -343,16 +348,26 @@ pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
     let mut valid = true;
 
     for edge in edges.iter() {
-        if edge.channel < 0 { continue; }
+        if edge.channel < 0 {
+            continue;
+        }
         let group = edge.buffer_group as usize;
-        if group == 0 || group >= 128 { continue; }
-        if edge.is_ctrl() { continue; }
+        if group == 0 || group >= 128 {
+            continue;
+        }
+        if edge.is_ctrl() {
+            continue;
+        }
 
         let to_mod = edge.to_module;
         if to_mod < MAX_MODULES && sched.in_place_writer[to_mod] {
             group_writers[group] += 1;
             if group_writers[group] > 1 {
-                log::error!("[graph] buffer_group={} duplicate in_place_writer module={}", group, to_mod);
+                log::error!(
+                    "[graph] buffer_group={} duplicate in_place_writer module={}",
+                    group,
+                    to_mod
+                );
                 valid = false;
             }
         }
@@ -427,10 +442,10 @@ impl ParamBuffer {
 // ============================================================================
 
 /// Maximum name length (including null terminator space)
-const MAX_NAME_LEN: usize = 16;
+const MAX_NAME_LEN: usize = 32;
 
 /// Maximum number of interned names
-const MAX_NAMES: usize = 16;
+const MAX_NAMES: usize = 64;
 
 /// Static storage for interned names
 static mut NAME_STORAGE: [[u8; MAX_NAME_LEN]; MAX_NAMES] = [[0; MAX_NAME_LEN]; MAX_NAMES];
@@ -450,7 +465,11 @@ impl NameArena {
     fn intern(name: &str) -> &'static str {
         unsafe {
             if NEXT_NAME_SLOT >= MAX_NAMES {
-                log::warn!("NameArena: exhausted ({} slots), cannot intern '{}'", MAX_NAMES, name);
+                log::warn!(
+                    "NameArena: exhausted ({} slots), cannot intern '{}'",
+                    MAX_NAMES,
+                    name
+                );
                 return "?";
             }
 
@@ -460,7 +479,11 @@ impl NameArena {
             let buf = &mut NAME_STORAGE[slot];
             let len = name.len().min(MAX_NAME_LEN - 1);
             if name.len() > MAX_NAME_LEN - 1 {
-                log::warn!("NameArena: '{}' truncated to {} bytes", name, MAX_NAME_LEN - 1);
+                log::warn!(
+                    "NameArena: '{}' truncated to {} bytes",
+                    name,
+                    MAX_NAME_LEN - 1
+                );
             }
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);
             buf[len] = 0;
@@ -471,7 +494,9 @@ impl NameArena {
 
     /// Reset the arena (call when tearing down the graph).
     fn reset() {
-        unsafe { NEXT_NAME_SLOT = 0; }
+        unsafe {
+            NEXT_NAME_SLOT = 0;
+        }
     }
 }
 
@@ -554,7 +579,11 @@ pub struct BuiltInModule {
 
 impl BuiltInModule {
     pub fn new(name: &'static str, step_fn: fn(*mut u8) -> i32) -> Self {
-        Self { name, step_fn, state: [0u8; 64] }
+        Self {
+            name,
+            step_fn,
+            state: [0u8; 64],
+        }
     }
 }
 
@@ -577,16 +606,28 @@ impl Module for BuiltInModule {
 
 pub struct TeeModule {
     in_chan: i32,
-    out_chans: [i32; MAX_CHANNELS],
+    /// Channel handles for each tee output. Sized to `MAX_PORTS` so the
+    /// enum slot stays compact: `populate_ports` already caps any
+    /// module's port count at `MAX_PORTS`, and the `ModuleSlot` enum
+    /// reserves space for its largest variant in every slot regardless
+    /// of which variant is in use.
+    out_chans: [i32; MAX_PORTS],
     out_count: usize,
 }
 
 impl TeeModule {
-    fn new(in_chan: i32, out_chans: [i32; MAX_CHANNELS], out_count: usize) -> Self {
+    fn new(in_chan: i32, out_chans: &[i32; MAX_CHANNELS], out_count: usize) -> Self {
+        let mut chans = [-1i32; MAX_PORTS];
+        let n = out_count.min(MAX_PORTS);
+        let mut i = 0;
+        while i < n {
+            chans[i] = out_chans[i];
+            i += 1;
+        }
         Self {
             in_chan,
-            out_chans,
-            out_count,
+            out_chans: chans,
+            out_count: n,
         }
     }
 }
@@ -602,20 +643,23 @@ impl Module for TeeModule {
         }
 
         for idx in 0..self.out_count {
-            if channel::syscall_channel_poll(self.out_chans[idx], POLL_OUT) & (POLL_OUT as i32) == 0 {
+            if channel::syscall_channel_poll(self.out_chans[idx], POLL_OUT) & (POLL_OUT as i32) == 0
+            {
                 return Ok(StepOutcome::Continue);
             }
         }
 
         let buf = unsafe { &mut *(&raw mut FAN_BUF) };
-        let read = unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), buf.len()) };
+        let read =
+            unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), buf.len()) };
         if read <= 0 {
             return Ok(StepOutcome::Continue);
         }
 
         let len = read as usize;
         for idx in 0..self.out_count {
-            let wrote = unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), len) };
+            let wrote =
+                unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), len) };
             if wrote != read {
                 return Err(-2);
             }
@@ -630,17 +674,26 @@ impl Module for TeeModule {
 }
 
 pub struct MergeModule {
-    in_chans: [i32; MAX_CHANNELS],
+    /// Channel handles for each merge input; see `TeeModule::out_chans`
+    /// for the sizing rationale.
+    in_chans: [i32; MAX_PORTS],
     in_count: usize,
     out_chan: i32,
     next_idx: usize,
 }
 
 impl MergeModule {
-    fn new(in_chans: [i32; MAX_CHANNELS], in_count: usize, out_chan: i32) -> Self {
+    fn new(in_chans: &[i32; MAX_CHANNELS], in_count: usize, out_chan: i32) -> Self {
+        let mut chans = [-1i32; MAX_PORTS];
+        let n = in_count.min(MAX_PORTS);
+        let mut i = 0;
+        while i < n {
+            chans[i] = in_chans[i];
+            i += 1;
+        }
         Self {
-            in_chans,
-            in_count,
+            in_chans: chans,
+            in_count: n,
             out_chan,
             next_idx: 0,
         }
@@ -672,7 +725,9 @@ impl Module for MergeModule {
                 return Ok(StepOutcome::Continue);
             }
 
-            let wrote = unsafe { channel::syscall_channel_write(self.out_chan, buf.as_ptr(), read as usize) };
+            let wrote = unsafe {
+                channel::syscall_channel_write(self.out_chan, buf.as_ptr(), read as usize)
+            };
             if wrote != read {
                 return Err(-2);
             }
@@ -758,35 +813,39 @@ pub unsafe fn populate_static_state(
 ) -> Result<(), &'static str> {
     let loader = unsafe { &mut *(&raw mut STATIC_LOADER) };
     let config = unsafe { &mut *(&raw mut STATIC_CONFIG) };
-    loader.init_from_blob(modules_ptr).map_err(|_| "loader init failed")?;
+    loader
+        .init_from_blob(modules_ptr)
+        .map_err(|_| "loader init failed")?;
     if !crate::kernel::config::read_config_from_ptr(config_ptr, config) {
         return Err("config parse failed");
     }
     Ok(())
 }
 
-/// Maximum ports per direction (in/out/ctrl) per module
-const MAX_PORTS: usize = 8;
+/// Maximum ports per direction (in/out/ctrl) per module.
+/// Bumped from 8 to 16 for Quantum's session_processor which multiplexes
+/// 7 logical input streams across 7 ports with fan-in expansion.
+const MAX_PORTS: usize = 16;
 
 /// Per-module port assignments (replaces old MODULE_CHANNELS tuple)
 #[derive(Clone, Copy)]
 pub struct ModulePorts {
-    in_chans:   [i32; MAX_PORTS],
-    out_chans:  [i32; MAX_PORTS],
+    in_chans: [i32; MAX_PORTS],
+    out_chans: [i32; MAX_PORTS],
     ctrl_chans: [i32; MAX_PORTS],
-    in_count:   u8,
-    out_count:  u8,
+    in_count: u8,
+    out_count: u8,
     ctrl_count: u8,
 }
 
 impl ModulePorts {
     const fn empty() -> Self {
         Self {
-            in_chans:   [-1; MAX_PORTS],
-            out_chans:  [-1; MAX_PORTS],
+            in_chans: [-1; MAX_PORTS],
+            out_chans: [-1; MAX_PORTS],
             ctrl_chans: [-1; MAX_PORTS],
-            in_count:   0,
-            out_count:  0,
+            in_count: 0,
+            out_count: 0,
             ctrl_count: 0,
         }
     }
@@ -795,13 +854,33 @@ impl ModulePorts {
 /// Read a port channel handle for a module. Mirror of `set_module_port`.
 /// Returns -1 if unset or out of range.
 pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 {
-    if module_idx >= MAX_MODULES { return -1; }
+    if module_idx >= MAX_MODULES {
+        return -1;
+    }
     let ports = unsafe { &SCHED.ports[module_idx] };
     let idx = port_index as usize;
     match port_type {
-        0 => if idx < MAX_PORTS { ports.in_chans[idx] } else { -1 },
-        1 => if idx < MAX_PORTS { ports.out_chans[idx] } else { -1 },
-        2 => if idx < MAX_PORTS { ports.ctrl_chans[idx] } else { -1 },
+        0 => {
+            if idx < MAX_PORTS {
+                ports.in_chans[idx]
+            } else {
+                -1
+            }
+        }
+        1 => {
+            if idx < MAX_PORTS {
+                ports.out_chans[idx]
+            } else {
+                -1
+            }
+        }
+        2 => {
+            if idx < MAX_PORTS {
+                ports.ctrl_chans[idx]
+            } else {
+                -1
+            }
+        }
         _ => -1,
     }
 }
@@ -810,22 +889,36 @@ pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 
 /// which doesn't go through the RP-side instantiate_one_module path.
 /// port_type: 0=in, 1=out, 2=ctrl
 pub fn set_module_port(module_idx: usize, port_type: u8, port_index: u8, channel: i32) {
-    if module_idx >= MAX_MODULES { return; }
+    if module_idx >= MAX_MODULES {
+        return;
+    }
     let ports = unsafe { &mut SCHED.ports[module_idx] };
     let idx = port_index as usize;
     match port_type {
-        0 => if idx < MAX_PORTS {
-            ports.in_chans[idx] = channel;
-            if idx as u8 >= ports.in_count { ports.in_count = idx as u8 + 1; }
-        },
-        1 => if idx < MAX_PORTS {
-            ports.out_chans[idx] = channel;
-            if idx as u8 >= ports.out_count { ports.out_count = idx as u8 + 1; }
-        },
-        2 => if idx < MAX_PORTS {
-            ports.ctrl_chans[idx] = channel;
-            if idx as u8 >= ports.ctrl_count { ports.ctrl_count = idx as u8 + 1; }
-        },
+        0 => {
+            if idx < MAX_PORTS {
+                ports.in_chans[idx] = channel;
+                if idx as u8 >= ports.in_count {
+                    ports.in_count = idx as u8 + 1;
+                }
+            }
+        }
+        1 => {
+            if idx < MAX_PORTS {
+                ports.out_chans[idx] = channel;
+                if idx as u8 >= ports.out_count {
+                    ports.out_count = idx as u8 + 1;
+                }
+            }
+        }
+        2 => {
+            if idx < MAX_PORTS {
+                ports.ctrl_chans[idx] = channel;
+                if idx as u8 >= ports.ctrl_count {
+                    ports.ctrl_count = idx as u8 + 1;
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -843,7 +936,11 @@ struct ModuleHints {
 impl ModuleHints {
     const fn empty() -> Self {
         Self {
-            hints: [ChannelHint { port_type: 0, port_index: 0, buffer_size: 0 }; MAX_HINTS_PER_MODULE],
+            hints: [ChannelHint {
+                port_type: 0,
+                port_index: 0,
+                buffer_size: 0,
+            }; MAX_HINTS_PER_MODULE],
             count: 0,
         }
     }
@@ -858,7 +955,10 @@ struct ArenaInfo {
 
 impl ArenaInfo {
     const fn empty() -> Self {
-        Self { ptr: core::ptr::null_mut(), size: 0 }
+        Self {
+            ptr: core::ptr::null_mut(),
+            size: 0,
+        }
     }
 }
 
@@ -1104,12 +1204,18 @@ static mut INSTANTIATION_IDX: usize = usize::MAX;
 
 /// Set the instantiation state pointer (called before module_new).
 pub fn set_instantiation_state(idx: usize, state: *mut u8) {
-    unsafe { INSTANTIATION_STATE = state; INSTANTIATION_IDX = idx; }
+    unsafe {
+        INSTANTIATION_STATE = state;
+        INSTANTIATION_IDX = idx;
+    }
 }
 
 /// Clear the instantiation state pointer (called after module_new).
 pub fn clear_instantiation_state() {
-    unsafe { INSTANTIATION_STATE = core::ptr::null_mut(); INSTANTIATION_IDX = usize::MAX; }
+    unsafe {
+        INSTANTIATION_STATE = core::ptr::null_mut();
+        INSTANTIATION_IDX = usize::MAX;
+    }
 }
 
 /// Persistent per-module state-pointer shadow. The RP path populates
@@ -1119,14 +1225,17 @@ pub fn clear_instantiation_state() {
 /// `step_ready`, long after `module_new`) can't find the state through
 /// `SCHED.modules`. This shadow is set by both paths and read as the
 /// second-choice source in `get_module_state`.
-static mut MODULE_STATE_PTR: [*mut u8; MAX_MODULES] =
-    [core::ptr::null_mut(); MAX_MODULES];
+static mut MODULE_STATE_PTR: [*mut u8; MAX_MODULES] = [core::ptr::null_mut(); MAX_MODULES];
 
 /// Publish a module's state pointer for later syscall lookups. Callable
 /// from any platform after a module's state has been allocated.
 pub fn set_module_state_ptr(idx: usize, state: *mut u8) {
-    if idx >= MAX_MODULES { return; }
-    unsafe { (*(&raw mut MODULE_STATE_PTR))[idx] = state; }
+    if idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        (*(&raw mut MODULE_STATE_PTR))[idx] = state;
+    }
 }
 
 pub fn get_module_state(idx: usize) -> *mut u8 {
@@ -1180,15 +1289,24 @@ pub fn get_module_exports(idx: usize) -> (usize, *const u8, u16) {
         return (0, core::ptr::null(), 0);
     }
     unsafe {
-        (SCHED.module_code_base[idx],
-         SCHED.module_export_table[idx],
-         SCHED.module_export_count[idx])
+        (
+            SCHED.module_code_base[idx],
+            SCHED.module_export_table[idx],
+            SCHED.module_export_count[idx],
+        )
     }
 }
 
 /// Set the export table info for a module (used by Linux platform loader).
-pub fn set_module_exports(idx: usize, code_base: usize, export_table: *const u8, export_count: u16) {
-    if idx >= MAX_MODULES { return; }
+pub fn set_module_exports(
+    idx: usize,
+    code_base: usize,
+    export_table: *const u8,
+    export_count: u16,
+) {
+    if idx >= MAX_MODULES {
+        return;
+    }
     unsafe {
         SCHED.module_code_base[idx] = code_base;
         SCHED.module_export_table[idx] = export_table;
@@ -1201,16 +1319,16 @@ pub fn module_code_region(idx: usize) -> (usize, u32) {
     if idx >= MAX_MODULES {
         return (0, 0);
     }
-    unsafe {
-        (SCHED.module_code_base[idx], SCHED.module_code_size[idx])
-    }
+    unsafe { (SCHED.module_code_base[idx], SCHED.module_code_size[idx]) }
 }
 
 /// Set the capability class, required_caps, and permissions bitmap for
 /// a module (used by the Linux / bcm2712 platform loaders when they
 /// stage modules from their embedded images).
 pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permissions: u8) {
-    if idx >= MAX_MODULES { return; }
+    if idx >= MAX_MODULES {
+        return;
+    }
     unsafe {
         SCHED.cap_class[idx] = cap_class;
         SCHED.required_caps[idx] = required_caps;
@@ -1226,15 +1344,17 @@ pub fn step_module(idx: usize) {
 /// Step a module and return its `StepOutcome`. Tier-3 poll-mode pump
 /// loops re-step on `StepOutcome::Burst`.
 pub fn step_module_outcome(idx: usize) -> Option<Result<StepOutcome, i32>> {
-    if idx >= MAX_MODULES { return None; }
-    unsafe {
-        SCHED.modules[idx].as_module_mut().map(|m| m.step())
+    if idx >= MAX_MODULES {
+        return None;
     }
+    unsafe { SCHED.modules[idx].as_module_mut().map(|m| m.step()) }
 }
 
 /// Store a BuiltInModule in the scheduler's module table (used by Linux platform).
 pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
-    if idx >= MAX_MODULES { return; }
+    if idx >= MAX_MODULES {
+        return;
+    }
     unsafe {
         SCHED.modules[idx] = ModuleSlot::BuiltIn(m);
         SCHED.ready[idx] = true;
@@ -1243,7 +1363,9 @@ pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
 
 /// Store a DynamicModule in the scheduler's module table (used by Linux platform).
 pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
-    if idx >= MAX_MODULES { return; }
+    if idx >= MAX_MODULES {
+        return;
+    }
     unsafe {
         SCHED.modules[idx] = ModuleSlot::Dynamic(dm);
     }
@@ -1256,13 +1378,19 @@ pub fn graph_sample_rate() -> u32 {
 
 /// Set the graph-level sample rate (called from config parsing).
 pub fn set_graph_sample_rate(rate: u32) {
-    unsafe { SCHED.graph_sample_rate = rate; }
+    unsafe {
+        SCHED.graph_sample_rate = rate;
+    }
 }
 
 /// Return the configured tick period in microseconds.
 pub fn tick_us() -> u32 {
     let t = unsafe { SCHED.tick_us };
-    if t == 0 { DEFAULT_TICK_US } else { t }
+    if t == 0 {
+        DEFAULT_TICK_US
+    } else {
+        t
+    }
 }
 
 /// Return the configured tick period for a specific domain.
@@ -1270,7 +1398,9 @@ pub fn tick_us() -> u32 {
 pub fn domain_tick_us(domain_id: usize) -> u32 {
     if domain_id < MAX_DOMAINS {
         let t = unsafe { SCHED.domain_tick_us[domain_id] };
-        if t > 0 { return t; }
+        if t > 0 {
+            return t;
+        }
     }
     tick_us()
 }
@@ -1288,7 +1418,11 @@ pub fn domain_exec_mode(domain_id: usize) -> u8 {
 /// Return the number of configured domains.
 pub fn domain_count() -> usize {
     let c = unsafe { SCHED.domain_count } as usize;
-    if c == 0 { 1 } else { c }
+    if c == 0 {
+        1
+    } else {
+        c
+    }
 }
 
 /// Return the module count for a specific domain.
@@ -1305,16 +1439,22 @@ pub fn domain_module_count(domain_id: usize) -> usize {
 /// Per-core pump loops walk this to drive every module — user modules
 /// and any `_tee` / `_merge` — that lives in their domain.
 pub fn domain_exec_order_at(domain_id: usize, i: usize) -> Option<usize> {
-    if domain_id >= MAX_DOMAINS { return None; }
+    if domain_id >= MAX_DOMAINS {
+        return None;
+    }
     let count = unsafe { SCHED.domain_module_count[domain_id] as usize };
-    if i >= count { return None; }
+    if i >= count {
+        return None;
+    }
     Some(unsafe { SCHED.domain_exec_order[domain_id][i] as usize })
 }
 
 /// Return the domain id assigned to a module, or `0` (the default
 /// domain) for out-of-range indices.
 pub fn module_domain_id(module_idx: usize) -> u8 {
-    if module_idx >= MAX_MODULES { return 0; }
+    if module_idx >= MAX_MODULES {
+        return 0;
+    }
     unsafe { SCHED.domain_id[module_idx] }
 }
 
@@ -1322,7 +1462,9 @@ pub fn module_domain_id(module_idx: usize) -> u8 {
 /// Called by modules during init via the REPORT_LATENCY kernel primitive.
 pub fn report_module_latency(module_idx: usize, frames: u32) {
     if module_idx < MAX_MODULES {
-        unsafe { SCHED.module_latency[module_idx] = frames; }
+        unsafe {
+            SCHED.module_latency[module_idx] = frames;
+        }
     }
 }
 
@@ -1339,19 +1481,30 @@ pub fn downstream_latency(module_idx: usize) -> u32 {
 /// 0: <64, 1: <128, 2: <256, 3: <512, 4: <1024, 5: <2048, 6: <4096, 7: >=4096
 #[inline]
 fn step_bucket(elapsed_us: u32) -> usize {
-    if elapsed_us < 64 { 0 }
-    else if elapsed_us < 128 { 1 }
-    else if elapsed_us < 256 { 2 }
-    else if elapsed_us < 512 { 3 }
-    else if elapsed_us < 1024 { 4 }
-    else if elapsed_us < 2048 { 5 }
-    else if elapsed_us < 4096 { 6 }
-    else { 7 }
+    if elapsed_us < 64 {
+        0
+    } else if elapsed_us < 128 {
+        1
+    } else if elapsed_us < 256 {
+        2
+    } else if elapsed_us < 512 {
+        3
+    } else if elapsed_us < 1024 {
+        4
+    } else if elapsed_us < 2048 {
+        5
+    } else if elapsed_us < 4096 {
+        6
+    } else {
+        7
+    }
 }
 
 /// Record a step's elapsed time into per-module and global histograms.
 pub fn record_step_time(module_idx: usize, elapsed_us: u32) {
-    if module_idx >= MAX_MODULES { return; }
+    if module_idx >= MAX_MODULES {
+        return;
+    }
     let b = step_bucket(elapsed_us);
     unsafe {
         SCHED.step_hist[module_idx][b] = SCHED.step_hist[module_idx][b].saturating_add(1);
@@ -1365,14 +1518,20 @@ pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
     let hist_ptr: *const [u32; 8] = if module_idx == usize::MAX {
         &raw const SCHED.step_hist_global
     } else if module_idx < MAX_MODULES {
-        unsafe { (&raw const SCHED.step_hist).cast::<[u32; 8]>().add(module_idx) }
+        unsafe {
+            (&raw const SCHED.step_hist)
+                .cast::<[u32; 8]>()
+                .add(module_idx)
+        }
     } else {
         return crate::kernel::errno::EINVAL;
     };
     for i in 0..8 {
         let v = unsafe { (*hist_ptr)[i] };
         let bytes = v.to_le_bytes();
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.add(i * 4), 4); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.add(i * 4), 4);
+        }
     }
     0
 }
@@ -1389,8 +1548,15 @@ pub fn get_fault_stats(module_idx: usize) -> FaultStats {
 }
 
 /// Get mutable fault info for a module (for config-time setup).
-pub fn set_module_fault_policy(module_idx: usize, policy: FaultPolicy, max_restarts: u16, backoff_ms: u16) {
-    if module_idx >= MAX_MODULES { return; }
+pub fn set_module_fault_policy(
+    module_idx: usize,
+    policy: FaultPolicy,
+    max_restarts: u16,
+    backoff_ms: u16,
+) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
     unsafe {
         let fi = &mut SCHED.fault_info[module_idx];
         fi.policy = policy;
@@ -1401,7 +1567,9 @@ pub fn set_module_fault_policy(module_idx: usize, policy: FaultPolicy, max_resta
 
 /// Set per-module step deadline (from config).
 pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
-    if module_idx >= MAX_MODULES { return; }
+    if module_idx >= MAX_MODULES {
+        return;
+    }
     unsafe {
         SCHED.fault_info[module_idx].step_deadline_us = deadline_us;
     }
@@ -1414,9 +1582,27 @@ pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
     let cm = current_module_index();
     let ports = unsafe { &SCHED.ports[cm] };
     match port_type {
-        0 => if idx < ports.in_count as usize { ports.in_chans[idx] } else { -1 },
-        1 => if idx < ports.out_count as usize { ports.out_chans[idx] } else { -1 },
-        2 => if idx < ports.ctrl_count as usize { ports.ctrl_chans[idx] } else { -1 },
+        0 => {
+            if idx < ports.in_count as usize {
+                ports.in_chans[idx]
+            } else {
+                -1
+            }
+        }
+        1 => {
+            if idx < ports.out_count as usize {
+                ports.out_chans[idx]
+            } else {
+                -1
+            }
+        }
+        2 => {
+            if idx < ports.ctrl_count as usize {
+                ports.ctrl_chans[idx]
+            } else {
+                -1
+            }
+        }
         _ => -1,
     }
 }
@@ -1518,7 +1704,11 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
 
     // Store tick_us from config header (0 = default 1000us)
     let raw_tick_us = config.header.tick_us as u32;
-    sched.tick_us = if raw_tick_us == 0 { DEFAULT_TICK_US } else { raw_tick_us };
+    sched.tick_us = if raw_tick_us == 0 {
+        DEFAULT_TICK_US
+    } else {
+        raw_tick_us
+    };
     if raw_tick_us != 0 {
         log::info!("[graph] tick_us={}", sched.tick_us);
     }
@@ -1529,10 +1719,16 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         let id = entry.id as usize;
         if id < MAX_MODULES {
             sched.domain_id[id] = entry.domain_id;
-            if entry.domain_id > max_domain { max_domain = entry.domain_id; }
+            if entry.domain_id > max_domain {
+                max_domain = entry.domain_id;
+            }
         }
     }
-    sched.domain_count = if max_domain > 0 { (max_domain + 1).min(MAX_DOMAINS as u8) } else { 0 };
+    sched.domain_count = if max_domain > 0 {
+        (max_domain + 1).min(MAX_DOMAINS as u8)
+    } else {
+        0
+    };
 
     // Populate per-domain tick_us and exec_mode from config
     for d in 0..MAX_DOMAINS {
@@ -1549,14 +1745,23 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
             let to_slot = id_to_slot.get(edge.to_id as usize).copied().unwrap_or(-1);
 
             if from_slot < 0 || to_slot < 0 {
-                log::error!("[graph] edge {} unknown module {}→{}", i, edge.from_id, edge.to_id);
+                log::error!(
+                    "[graph] edge {} unknown module {}→{}",
+                    i,
+                    edge.from_id,
+                    edge.to_id
+                );
                 return Err(-1);
             }
 
             let to_port_name = if edge.to_port == 1 { "ctrl" } else { "in" };
             let mut e = Edge::new_indexed(
-                from_slot as usize, "out", edge.from_port_index,
-                to_slot as usize, to_port_name, edge.to_port_index,
+                from_slot as usize,
+                "out",
+                edge.from_port_index,
+                to_slot as usize,
+                to_port_name,
+                edge.to_port_index,
             );
             e.buffer_group = edge.buffer_group;
             e.edge_class = edge.edge_class;
@@ -1569,10 +1774,20 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
 
     // Insert fan-out (tee) and fan-in (merge) modules
     let mut runtime_edge_count = edge_count;
-    if !insert_fan_out(edges, &mut runtime_edge_count, &mut module_list, &mut module_count) {
+    if !insert_fan_out(
+        edges,
+        &mut runtime_edge_count,
+        &mut module_list,
+        &mut module_count,
+    ) {
         return Err(-1);
     }
-    if !insert_fan_in(edges, &mut runtime_edge_count, &mut module_list, &mut module_count) {
+    if !insert_fan_in(
+        edges,
+        &mut runtime_edge_count,
+        &mut module_list,
+        &mut module_count,
+    ) {
         return Err(-1);
     }
 
@@ -1642,7 +1857,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
 // ============================================================================
 
 /// Internal module hashes (fnv1a32)
-pub const INTERNAL_TEE_HASH: u32 = 0x607f045c;   // "_tee"
+pub const INTERNAL_TEE_HASH: u32 = 0x607f045c; // "_tee"
 pub const INTERNAL_MERGE_HASH: u32 = 0x8a6bcd3e; // "_merge"
 
 fn build_module_list(
@@ -1817,9 +2032,7 @@ fn insert_fan(
         let mut matching = [0usize; MAX_CHANNELS];
         let mut match_count = 0;
         for i in 0..*edge_count {
-            if edge_matches_module(&edges[i], module_idx, direction)
-                && match_count < MAX_CHANNELS
-            {
+            if edge_matches_module(&edges[i], module_idx, direction) && match_count < MAX_CHANNELS {
                 matching[match_count] = i;
                 match_count += 1;
             }
@@ -1843,9 +2056,7 @@ fn insert_fan(
             let mut group = [0usize; MAX_CHANNELS];
             let mut group_count = 0;
             for j in start..match_count {
-                if !processed[j]
-                    && edge_port_key(&edges[matching[j]], direction) == port_key
-                {
+                if !processed[j] && edge_port_key(&edges[matching[j]], direction) == port_key {
                     group[group_count] = matching[j];
                     group_count += 1;
                     processed[j] = true;
@@ -1862,8 +2073,11 @@ fn insert_fan(
             for k in 0..group_count {
                 let ei = group[k];
                 if edges[ei].buffer_group != 0 {
-                    log::error!("[graph] fan module={} buffer_group={} cleared (incompatible)",
-                        module_idx, edges[ei].buffer_group);
+                    log::error!(
+                        "[graph] fan module={} buffer_group={} cleared (incompatible)",
+                        module_idx,
+                        edges[ei].buffer_group
+                    );
                     edges[ei].buffer_group = 0;
                 }
             }
@@ -1880,12 +2094,11 @@ fn insert_fan(
                 Some(e) => e.domain_id,
                 None => 0,
             };
-            let fan_idx = match push_internal_module(
-                module_list, module_count, internal_hash, fan_domain,
-            ) {
-                Some(idx) => idx,
-                None => return false,
-            };
+            let fan_idx =
+                match push_internal_module(module_list, module_count, internal_hash, fan_domain) {
+                    Some(idx) => idx,
+                    None => return false,
+                };
 
             // Add bridge edge: original module ↔ fan module
             let new_edge = match direction {
@@ -1894,7 +2107,11 @@ fn insert_fan(
                     e.from_port_index = port_key;
                     e
                 }
-                FanDirection::In => Edge::simple(fan_idx, module_idx),
+                FanDirection::In => {
+                    let mut e = Edge::simple(fan_idx, module_idx);
+                    e.to_port_index = port_key;
+                    e
+                }
             };
             edges[*edge_count] = new_edge;
             *edge_count += 1;
@@ -1918,7 +2135,13 @@ fn insert_fan_out(
     module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
     module_count: &mut usize,
 ) -> bool {
-    insert_fan(FanDirection::Out, edges, edge_count, module_list, module_count)
+    insert_fan(
+        FanDirection::Out,
+        edges,
+        edge_count,
+        module_list,
+        module_count,
+    )
 }
 
 fn insert_fan_in(
@@ -1927,7 +2150,13 @@ fn insert_fan_in(
     module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
     module_count: &mut usize,
 ) -> bool {
-    insert_fan(FanDirection::In, edges, edge_count, module_list, module_count)
+    insert_fan(
+        FanDirection::In,
+        edges,
+        edge_count,
+        module_list,
+        module_count,
+    )
 }
 
 fn validate_hardware_requirements(config: &RunnerConfig) -> bool {
@@ -1963,10 +2192,7 @@ fn validate_hardware_requirements(config: &RunnerConfig) -> bool {
 /// Used by platform setup paths that don't go through
 /// `instantiate_one_module` — e.g. hosted built-ins that aren't in the
 /// loader.
-pub fn populate_module_ports_from_edges(
-    module_idx: usize,
-    instantiated: usize,
-) -> bool {
+pub fn populate_module_ports_from_edges(module_idx: usize, instantiated: usize) -> bool {
     if module_idx >= MAX_MODULES || instantiated >= MAX_MODULES {
         return false;
     }
@@ -1979,9 +2205,12 @@ pub fn populate_module_ports_from_edges(
     let ctrl_count = collect_ctrl_channels(&sched.edges, module_idx, &mut ctrl_chans);
     populate_ports(
         &mut sched.ports[instantiated],
-        &in_chans, in_count,
-        &out_chans, out_count,
-        &ctrl_chans, ctrl_count,
+        &in_chans,
+        in_count,
+        &out_chans,
+        out_count,
+        &ctrl_chans,
+        ctrl_count,
     )
 }
 
@@ -2001,22 +2230,39 @@ fn populate_ports(
         return false;
     }
     if out_count > MAX_PORTS {
-        log::error!("[inst] output port limit out={} max={}", out_count, MAX_PORTS);
+        log::error!(
+            "[inst] output port limit out={} max={}",
+            out_count,
+            MAX_PORTS
+        );
         return false;
     }
     if ctrl_count > MAX_PORTS {
-        log::error!("[inst] ctrl port limit ctrl={} max={}", ctrl_count, MAX_PORTS);
+        log::error!(
+            "[inst] ctrl port limit ctrl={} max={}",
+            ctrl_count,
+            MAX_PORTS
+        );
         return false;
     }
     ports.in_count = in_count as u8;
     ports.out_count = out_count as u8;
     ports.ctrl_count = ctrl_count as u8;
     let mut i = 0;
-    while i < in_count { ports.in_chans[i] = in_chans[i]; i += 1; }
+    while i < in_count {
+        ports.in_chans[i] = in_chans[i];
+        i += 1;
+    }
     i = 0;
-    while i < out_count { ports.out_chans[i] = out_chans[i]; i += 1; }
+    while i < out_count {
+        ports.out_chans[i] = out_chans[i];
+        i += 1;
+    }
     i = 0;
-    while i < ctrl_count { ports.ctrl_chans[i] = ctrl_chans[i]; i += 1; }
+    while i < ctrl_count {
+        ports.ctrl_chans[i] = ctrl_chans[i];
+        i += 1;
+    }
     true
 }
 
@@ -2054,7 +2300,15 @@ pub fn instantiate_one_module(
     let ctrl_chan = if ctrl_count > 0 { ctrl_chans[0] } else { -1 };
 
     let ports = &mut module_ports[instantiated];
-    if !populate_ports(ports, &in_chans, in_count, &out_chans, out_count, &ctrl_chans, ctrl_count) {
+    if !populate_ports(
+        ports,
+        &in_chans,
+        in_count,
+        &out_chans,
+        out_count,
+        &ctrl_chans,
+        ctrl_count,
+    ) {
         log::error!("[inst] module={} port limit exceeded", entry.id);
         return InstantiateResult::Error(-1);
     }
@@ -2064,21 +2318,26 @@ pub fn instantiate_one_module(
             log::error!("[inst] tee module={} invalid ports", entry.id);
             return InstantiateResult::Error(-1);
         }
-        modules[instantiated] = ModuleSlot::Tee(TeeModule::new(in_chans[0], out_chans, out_count));
+        modules[instantiated] =
+            ModuleSlot::Tee(TeeModule::new(in_chans[0], &out_chans, out_count));
         return InstantiateResult::Done;
     } else if entry.name_hash == INTERNAL_MERGE_HASH {
         if out_count != 1 || in_count == 0 {
             log::error!("[inst] merge module={} invalid ports", entry.id);
             return InstantiateResult::Error(-1);
         }
-        modules[instantiated] = ModuleSlot::Merge(MergeModule::new(in_chans, in_count, out_chans[0]));
+        modules[instantiated] =
+            ModuleSlot::Merge(MergeModule::new(&in_chans, in_count, out_chans[0]));
         return InstantiateResult::Done;
     }
 
     // Loader lookup
     let found_module = match loader.find_by_name_hash(entry.name_hash) {
         Ok(m) => m,
-        Err(e) => { e.log("loader"); return InstantiateResult::Error(-1); }
+        Err(e) => {
+            e.log("loader");
+            return InstantiateResult::Error(-1);
+        }
     };
     let name = found_module.name_str();
     let static_name = NameArena::intern(name);
@@ -2090,10 +2349,10 @@ pub fn instantiate_one_module(
     unsafe {
         let sched = &mut *(&raw mut SCHED);
         sched.cap_class[instantiated] = match found_module.header.module_type {
-            5 => 3,  // Protocol → CAP_FULL
-            3 => 1,  // Sink → CAP_SERVICE_PIO
-            4 => 2,  // EventHandler → CAP_SERVICE_GPIO
-            _ => 0,  // Source, Transformer → CAP_SERVICE
+            5 => 3, // Protocol → CAP_FULL
+            3 => 1, // Sink → CAP_SERVICE_PIO
+            4 => 2, // EventHandler → CAP_SERVICE_GPIO
+            _ => 0, // Source, Transformer → CAP_SERVICE
         };
         sched.required_caps[instantiated] = found_module.header.required_caps() as u32;
         sched.permissions[instantiated] = found_module.manifest_permissions();
@@ -2117,16 +2376,18 @@ pub fn instantiate_one_module(
         let sched = &mut *(&raw mut SCHED);
         let arenas = &mut sched.arenas;
         arenas[instantiated] = ArenaInfo::empty();
-        if let Ok(addr) = found_module.get_export_addr(
-            crate::kernel::loader::export_hashes::MODULE_ARENA_SIZE,
-        ) {
-            let arena_size_fn: unsafe extern "C" fn() -> u32 =
-                core::mem::transmute(addr as usize);
+        if let Ok(addr) =
+            found_module.get_export_addr(crate::kernel::loader::export_hashes::MODULE_ARENA_SIZE)
+        {
+            let arena_size_fn: unsafe extern "C" fn() -> u32 = core::mem::transmute(addr as usize);
             let requested = arena_size_fn() as usize;
             if requested > 0 {
                 match crate::kernel::loader::alloc_state(requested) {
                     Ok(ptr) => {
-                        arenas[instantiated] = ArenaInfo { ptr, size: requested as u32 };
+                        arenas[instantiated] = ArenaInfo {
+                            ptr,
+                            size: requested as u32,
+                        };
                     }
                     Err(e) => {
                         e.log("arena");
@@ -2162,9 +2423,13 @@ pub fn instantiate_one_module(
     let result = unsafe {
         let pb = core::ptr::addr_of!(PARAM_BUFFER);
         DynamicModule::start_new(
-            &found_module, syscalls,
-            in_chan, out_chan, ctrl_chan,
-            (*pb).as_ptr(), (*pb).len(),
+            &found_module,
+            syscalls,
+            in_chan,
+            out_chan,
+            ctrl_chan,
+            (*pb).as_ptr(),
+            (*pb).len(),
             static_name,
         )
     };
@@ -2177,7 +2442,8 @@ pub fn instantiate_one_module(
         Ok(StartNewResult::Pending(pending)) => {
             // Record step period before returning
             unsafe {
-                (*(&raw mut SCHED)).step_period[instantiated] = found_module.header.step_period_ms();
+                (*(&raw mut SCHED)).step_period[instantiated] =
+                    found_module.header.step_period_ms();
             }
             return InstantiateResult::Pending(pending);
         }
@@ -2292,7 +2558,9 @@ fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) {
         }
     }
 
-    unsafe { SCHED.exec_order_count = count; }
+    unsafe {
+        SCHED.exec_order_count = count;
+    }
 }
 
 /// Partition the global exec_order into per-domain execution orders (E4-S4).
@@ -2323,11 +2591,19 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
     }
 
     // Log domain composition
-    let effective_domains = if sched.domain_count > 0 { sched.domain_count as usize } else { 1 };
+    let effective_domains = if sched.domain_count > 0 {
+        sched.domain_count as usize
+    } else {
+        1
+    };
     for d in 0..effective_domains {
         let count = sched.domain_module_count[d];
         if count > 0 || d == 0 {
-            let tick = if sched.domain_tick_us[d] > 0 { sched.domain_tick_us[d] } else { sched.tick_us };
+            let tick = if sched.domain_tick_us[d] > 0 {
+                sched.domain_tick_us[d]
+            } else {
+                sched.tick_us
+            };
             log::info!("[domain] {} modules={} tick_us={}", d, count, tick);
         }
     }
@@ -2353,41 +2629,51 @@ pub fn log_dma_owned_edges(edge_count: usize) {
     let sched = unsafe { &*(&raw const SCHED) };
     let mut n = 0usize;
     for i in 0..edge_count {
-        if i >= MAX_CHANNELS { break; }
+        if i >= MAX_CHANNELS {
+            break;
+        }
         let e = &sched.edges[i];
         if let crate::kernel::config::EdgeClass::DmaOwned = e.edge_class {
             log::info!(
                 "[sched] DmaOwned edge {}→{} (group={})",
-                e.from_module, e.to_module, e.buffer_group,
+                e.from_module,
+                e.to_module,
+                e.buffer_group,
             );
             n += 1;
         }
     }
     if n > 0 {
-        log::info!("[sched] {} DmaOwned edges declared (maintenance deferred)", n);
+        log::info!(
+            "[sched] {} DmaOwned edges declared (maintenance deferred)",
+            n
+        );
     }
 }
 
 /// Same intent as `log_dma_owned_edges`, but walks the config's edge
 /// table directly. Used by the bcm2712 graph setup path, which owns
 /// module/edge instantiation itself and never populates `sched.edges`.
-pub fn log_dma_owned_edges_from_config(
-    edges: &[Option<crate::kernel::config::GraphEdge>],
-) {
+pub fn log_dma_owned_edges_from_config(edges: &[Option<crate::kernel::config::GraphEdge>]) {
     let mut n = 0usize;
     for slot in edges.iter() {
         if let Some(edge) = slot {
             if let crate::kernel::config::EdgeClass::DmaOwned = edge.edge_class {
                 log::info!(
                     "[sched] DmaOwned edge {}→{} (group={})",
-                    edge.from_id, edge.to_id, edge.buffer_group,
+                    edge.from_id,
+                    edge.to_id,
+                    edge.buffer_group,
                 );
                 n += 1;
             }
         }
     }
     if n > 0 {
-        log::info!("[sched] {} DmaOwned edges declared (maintenance deferred)", n);
+        log::info!(
+            "[sched] {} DmaOwned edges declared (maintenance deferred)",
+            n
+        );
     }
 }
 
@@ -2411,8 +2697,12 @@ fn validate_domains_static(module_count: usize, edge_count: usize) {
     for i in 0..module_count {
         let domain = sched.domain_id[i] as usize;
         if domain >= effective_domains && domain != 0 {
-            log::warn!("[domain] module {} assigned to domain {} (max {}), using domain 0",
-                i, domain, effective_domains - 1);
+            log::warn!(
+                "[domain] module {} assigned to domain {} (max {}), using domain 0",
+                i,
+                domain,
+                effective_domains - 1
+            );
         }
     }
 
@@ -2420,11 +2710,23 @@ fn validate_domains_static(module_count: usize, edge_count: usize) {
     for i in 0..edge_count {
         let e = &sched.edges[i];
         if let crate::kernel::config::EdgeClass::CrossCore = e.edge_class {
-            let from_domain = if e.from_module < MAX_MODULES { sched.domain_id[e.from_module] } else { 0 };
-            let to_domain = if e.to_module < MAX_MODULES { sched.domain_id[e.to_module] } else { 0 };
+            let from_domain = if e.from_module < MAX_MODULES {
+                sched.domain_id[e.from_module]
+            } else {
+                0
+            };
+            let to_domain = if e.to_module < MAX_MODULES {
+                sched.domain_id[e.to_module]
+            } else {
+                0
+            };
             if from_domain == to_domain {
-                log::warn!("[domain] cross_core edge {}→{} but both in domain {}",
-                    e.from_module, e.to_module, from_domain);
+                log::warn!(
+                    "[domain] cross_core edge {}→{} but both in domain {}",
+                    e.from_module,
+                    e.to_module,
+                    from_domain
+                );
             }
         }
     }
@@ -2432,10 +2734,18 @@ fn validate_domains_static(module_count: usize, edge_count: usize) {
     // Estimate tick budget: warn if module count exceeds rough budget
     for d in 0..effective_domains {
         let count = sched.domain_module_count[d] as usize;
-        let domain_tick = if sched.domain_tick_us[d] > 0 { sched.domain_tick_us[d] } else { sched.tick_us };
+        let domain_tick = if sched.domain_tick_us[d] > 0 {
+            sched.domain_tick_us[d]
+        } else {
+            sched.tick_us
+        };
         if domain_tick < 500 && count > 8 {
-            log::warn!("[domain] domain {} has {} modules with tick_us={} — may exceed tick budget",
-                d, count, domain_tick);
+            log::warn!(
+                "[domain] domain {} has {} modules with tick_us={} — may exceed tick budget",
+                d,
+                count,
+                domain_tick
+            );
         }
     }
 }
@@ -2451,7 +2761,9 @@ pub fn compute_downstream_latency(sched: &mut SchedulerState, module_count: usiz
     // Walk in reverse exec order: sinks have downstream_latency=0, then work backwards
     for rev_i in 0..sched.exec_order_count {
         let m = sched.exec_order[sched.exec_order_count - 1 - rev_i] as usize;
-        if m >= module_count { continue; }
+        if m >= module_count {
+            continue;
+        }
 
         let mut max_downstream: u32 = 0;
         // Find all outgoing edges from m
@@ -2467,7 +2779,6 @@ pub fn compute_downstream_latency(sched: &mut SchedulerState, module_count: usiz
         }
         sched.downstream_latency[m] = max_downstream;
     }
-
 }
 
 /// Finalize a module after it reports done or error.
@@ -2475,19 +2786,29 @@ pub fn compute_downstream_latency(sched: &mut SchedulerState, module_count: usiz
 /// Sets POLL_HUP (done) or POLL_ERR (error) on all output channels,
 /// releases owned handles, and marks the module finished.
 /// `error_code`: None = module done normally, Some(rc) = error with return code.
-fn finalize_module(
-    module_idx: usize,
-    error_code: Option<i32>,
-    type_name: &str,
-    context: &str,
-) {
+fn finalize_module(module_idx: usize, error_code: Option<i32>, type_name: &str, context: &str) {
     let sched = unsafe { &mut *(&raw mut SCHED) };
 
-    let flag = if error_code.is_some() { POLL_ERR as u8 } else { POLL_HUP as u8 }; // u8: sticky_events is AtomicU8
-    if let Some(rc) = error_code {
-        log::warn!("[sched] module {} ({}) error rc={}{}", module_idx, type_name, rc, context);
+    let flag = if error_code.is_some() {
+        POLL_ERR as u8
     } else {
-        log::info!("[sched] module {} ({}) done{}", module_idx, type_name, context);
+        POLL_HUP as u8
+    }; // u8: sticky_events is AtomicU8
+    if let Some(rc) = error_code {
+        log::warn!(
+            "[sched] module {} ({}) error rc={}{}",
+            module_idx,
+            type_name,
+            rc,
+            context
+        );
+    } else {
+        log::info!(
+            "[sched] module {} ({}) done{}",
+            module_idx,
+            type_name,
+            context
+        );
     }
 
     let ports = &sched.ports[module_idx];
@@ -2565,7 +2886,10 @@ fn parse_protection_config(module_idx: usize, params: &[u8]) {
             0xF0 if len == 4 => {
                 // step_deadline_us (u32 LE)
                 let val = u32::from_le_bytes([
-                    params[pos], params[pos+1], params[pos+2], params[pos+3],
+                    params[pos],
+                    params[pos + 1],
+                    params[pos + 2],
+                    params[pos + 3],
                 ]);
                 fi.step_deadline_us = val;
             }
@@ -2580,11 +2904,11 @@ fn parse_protection_config(module_idx: usize, params: &[u8]) {
             }
             0xF2 if len == 2 => {
                 // max_restarts (u16 LE)
-                fi.max_restarts = u16::from_le_bytes([params[pos], params[pos+1]]);
+                fi.max_restarts = u16::from_le_bytes([params[pos], params[pos + 1]]);
             }
             0xF3 if len == 2 => {
                 // restart_backoff_ms (u16 LE)
-                fi.restart_backoff_ms = u16::from_le_bytes([params[pos], params[pos+1]]);
+                fi.restart_backoff_ms = u16::from_le_bytes([params[pos], params[pos + 1]]);
             }
             0xF4 if len == 1 => {
                 // trust_tier: 0=platform, 1=verified, 2=community, 3=unsigned.
@@ -2619,8 +2943,12 @@ fn handle_step_timeout(
     let tick = unsafe { DBG_TICK };
     let fi = &mut sched.fault_info[module_idx];
     fi.record_fault(fault_type::TIMEOUT, tick);
-    log::warn!("[guard] module {} ({}) step timeout (fault #{})",
-        module_idx, modules[module_idx].type_name(), fi.fault_count);
+    log::warn!(
+        "[guard] module {} ({}) step timeout (fault #{})",
+        module_idx,
+        modules[module_idx].type_name(),
+        fi.fault_count
+    );
     step_guard::push_fault(FaultRecord {
         module_idx: module_idx as u8,
         fault_kind: fault_type::TIMEOUT,
@@ -2635,7 +2963,12 @@ fn handle_step_timeout(
         fi.backoff_remaining = fi.restart_backoff_ms as u32;
     } else {
         fi.state = FaultState::Terminated;
-        finalize_module(module_idx, Some(-110), modules[module_idx].type_name(), " (timeout terminated)");
+        finalize_module(
+            module_idx,
+            Some(-110),
+            modules[module_idx].type_name(),
+            " (timeout terminated)",
+        );
         *active_count -= 1;
     }
 }
@@ -2664,11 +2997,21 @@ fn handle_step_error(
     if fi.can_restart() {
         fi.state = FaultState::Faulted;
         fi.backoff_remaining = fi.restart_backoff_ms as u32;
-        log::warn!("[guard] module {} ({}) error rc={} — will restart (fault #{})",
-            module_idx, modules[module_idx].type_name(), rc, fi.fault_count);
+        log::warn!(
+            "[guard] module {} ({}) error rc={} — will restart (fault #{})",
+            module_idx,
+            modules[module_idx].type_name(),
+            rc,
+            fi.fault_count
+        );
     } else {
         fi.state = FaultState::Terminated;
-        finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), context);
+        finalize_module(
+            module_idx,
+            Some(rc),
+            modules[module_idx].type_name(),
+            context,
+        );
         *active_count -= 1;
     }
 }
@@ -2683,8 +3026,12 @@ fn handle_mpu_fault(
     let tick = unsafe { DBG_TICK };
     let fi = &mut sched.fault_info[module_idx];
     fi.record_fault(fault_type::MPU_FAULT, tick);
-    log::warn!("[mpu] module {} ({}) protection fault (fault #{})",
-        module_idx, modules[module_idx].type_name(), fi.fault_count);
+    log::warn!(
+        "[mpu] module {} ({}) protection fault (fault #{})",
+        module_idx,
+        modules[module_idx].type_name(),
+        fi.fault_count
+    );
     step_guard::push_fault(FaultRecord {
         module_idx: module_idx as u8,
         fault_kind: fault_type::MPU_FAULT,
@@ -2699,7 +3046,12 @@ fn handle_mpu_fault(
         fi.backoff_remaining = fi.restart_backoff_ms as u32;
     } else {
         fi.state = FaultState::Terminated;
-        finalize_module(module_idx, Some(-14), modules[module_idx].type_name(), " (mpu terminated)");
+        finalize_module(
+            module_idx,
+            Some(-14),
+            modules[module_idx].type_name(),
+            " (mpu terminated)",
+        );
         *active_count -= 1;
     }
 }
@@ -2728,9 +3080,12 @@ fn handle_module_restart(
 ) {
     sched.fault_info[module_idx].state = FaultState::Recovering;
     sched.fault_info[module_idx].restart_count += 1;
-    log::info!("[guard] restarting module {} ({}) (restart #{})",
-        module_idx, modules[module_idx].type_name(),
-        sched.fault_info[module_idx].restart_count);
+    log::info!(
+        "[guard] restarting module {} ({}) (restart #{})",
+        module_idx,
+        modules[module_idx].type_name(),
+        sched.fault_info[module_idx].restart_count
+    );
 
     // Release owned handles (events, timers, DMA, providers, etc.)
     syscalls::release_module_handles(module_idx as u8);
@@ -2739,17 +3094,29 @@ fn handle_module_restart(
     let ports = &sched.ports[module_idx];
     for i in 0..ports.in_count as usize {
         if ports.in_chans[i] >= 0 {
-            channel::channel_ioctl(ports.in_chans[i], channel::IOCTL_FLUSH, core::ptr::null_mut());
+            channel::channel_ioctl(
+                ports.in_chans[i],
+                channel::IOCTL_FLUSH,
+                core::ptr::null_mut(),
+            );
         }
     }
     for i in 0..ports.out_count as usize {
         if ports.out_chans[i] >= 0 {
-            channel::channel_ioctl(ports.out_chans[i], channel::IOCTL_FLUSH, core::ptr::null_mut());
+            channel::channel_ioctl(
+                ports.out_chans[i],
+                channel::IOCTL_FLUSH,
+                core::ptr::null_mut(),
+            );
         }
     }
     for i in 0..ports.ctrl_count as usize {
         if ports.ctrl_chans[i] >= 0 {
-            channel::channel_ioctl(ports.ctrl_chans[i], channel::IOCTL_FLUSH, core::ptr::null_mut());
+            channel::channel_ioctl(
+                ports.ctrl_chans[i],
+                channel::IOCTL_FLUSH,
+                core::ptr::null_mut(),
+            );
         }
     }
 
@@ -2778,7 +3145,9 @@ fn handle_module_restart(
 pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepResult {
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let tick = unsafe { DBG_TICK };
-    unsafe { DBG_TICK += 1; }
+    unsafe {
+        DBG_TICK += 1;
+    }
 
     // Periodic heartbeat — confirms scheduler is alive
     if tick % 500 == 0 && tick > 0 {
@@ -2796,8 +3165,14 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
                     let r0 = core::ptr::read_volatile(crash.add(5));
                     let cfsr = core::ptr::read_volatile(crash.add(6));
                     let bfar = core::ptr::read_volatile(crash.add(7));
-                    log::error!("[crash] pc={:08x} lr={:08x} r0={:08x} mod={} t={}",
-                        pc, lr, r0, module, prev_tick);
+                    log::error!(
+                        "[crash] pc={:08x} lr={:08x} r0={:08x} mod={} t={}",
+                        pc,
+                        lr,
+                        r0,
+                        module,
+                        prev_tick
+                    );
                     log::error!("[crash] cfsr={:08x} bfar={:08x}", cfsr, bfar);
                     // Clear marker so it doesn't repeat
                     core::ptr::write_volatile((&raw mut CRASH_DATA) as *mut u32, 0);
@@ -2827,7 +3202,11 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     let exec_count = sched.exec_order_count;
     let n = if exec_count > 0 { exec_count } else { count };
     for order_pos in 0..n {
-        let module_idx = if exec_count > 0 { sched.exec_order[order_pos] as usize } else { order_pos };
+        let module_idx = if exec_count > 0 {
+            sched.exec_order[order_pos] as usize
+        } else {
+            order_pos
+        };
         if module_idx >= count {
             continue;
         }
@@ -2878,7 +3257,12 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
             } else {
                 // Cannot restart — terminate
                 sched.fault_info[module_idx].state = FaultState::Terminated;
-                finalize_module(module_idx, Some(-110), modules[module_idx].type_name(), " (terminated)");
+                finalize_module(
+                    module_idx,
+                    Some(-110),
+                    modules[module_idx].type_name(),
+                    " (terminated)",
+                );
                 active_count -= 1;
                 continue;
             }
@@ -2890,7 +3274,9 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
             // Set current_module so channel_port works during module_step
             set_current_module(module_idx);
             // Track for HardFault diagnosis
-            unsafe { core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8); }
+            unsafe {
+                core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
+            }
 
             // Arm step guard timer
             let deadline = sched.fault_info[module_idx].effective_deadline_us();
@@ -2913,8 +3299,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
                     // bottom of the module stack is clobbered by an overflow.
                     // Re-arm it so the next module starts with a clean band.
                     if !crate::kernel::mpu::check_stack_canary() {
-                        log::error!("[mpu] module {} stack canary violated",
-                            module_idx);
+                        log::error!("[mpu] module {} stack canary violated", module_idx);
                         crate::kernel::mpu::reinit_stack_canary();
                         handle_mpu_fault(sched, modules, module_idx, &mut active_count);
                     }
@@ -2957,12 +3342,24 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
                                     break;
                                 }
                                 Ok(StepOutcome::Done) => {
-                                    finalize_module(module_idx, None, modules[module_idx].type_name(), " (burst)");
+                                    finalize_module(
+                                        module_idx,
+                                        None,
+                                        modules[module_idx].type_name(),
+                                        " (burst)",
+                                    );
                                     active_count -= 1;
                                     break;
                                 }
                                 Err(rc) => {
-                                    handle_step_error(sched, modules, module_idx, rc, &mut active_count, " (burst)");
+                                    handle_step_error(
+                                        sched,
+                                        modules,
+                                        module_idx,
+                                        rc,
+                                        &mut active_count,
+                                        " (burst)",
+                                    );
                                     break;
                                 }
                             }
@@ -3001,17 +3398,17 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 /// Step only modules whose bit is set in `wake_bits`.
 /// Bypasses frequency gating — an event overrides the step period.
 /// Uses topological order to preserve producer-before-consumer invariant.
-pub fn step_woken_modules(
-    modules: &mut [ModuleSlot; MAX_MODULES],
-    count: usize,
-    wake_bits: u64,
-) {
+pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize, wake_bits: u64) {
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let exec_count = sched.exec_order_count;
 
     let n = if exec_count > 0 { exec_count } else { count };
     for order_pos in 0..n {
-        let module_idx = if exec_count > 0 { sched.exec_order[order_pos] as usize } else { order_pos };
+        let module_idx = if exec_count > 0 {
+            sched.exec_order[order_pos] as usize
+        } else {
+            order_pos
+        };
         if module_idx >= count {
             continue;
         }
@@ -3027,7 +3424,9 @@ pub fn step_woken_modules(
         {
             let mut not_ready: u32 = 0;
             for i in 0..count {
-                if !sched.ready[i] { not_ready |= 1u32 << i; }
+                if !sched.ready[i] {
+                    not_ready |= 1u32 << i;
+                }
             }
             if not_ready != 0
                 && !sched.deferred_ready[module_idx]
@@ -3054,7 +3453,8 @@ pub fn step_woken_modules(
                     step_guard::post_step_check();
                     if step_guard::check_and_clear_timeout() {
                         log::warn!("[guard] module {} timeout (event wake)", module_idx);
-                        sched.fault_info[module_idx].record_fault(fault_type::TIMEOUT, unsafe { DBG_TICK });
+                        sched.fault_info[module_idx]
+                            .record_fault(fault_type::TIMEOUT, unsafe { DBG_TICK });
                     }
                 }
                 Ok(StepOutcome::Ready) => {
@@ -3066,7 +3466,12 @@ pub fn step_woken_modules(
                 }
                 Ok(StepOutcome::Done) => {
                     step_guard::disarm();
-                    finalize_module(module_idx, None, modules[module_idx].type_name(), " (event wake)");
+                    finalize_module(
+                        module_idx,
+                        None,
+                        modules[module_idx].type_name(),
+                        " (event wake)",
+                    );
                 }
                 Ok(StepOutcome::Burst) => {
                     step_guard::disarm();
@@ -3089,11 +3494,21 @@ pub fn step_woken_modules(
                                     break;
                                 }
                                 Ok(StepOutcome::Done) => {
-                                    finalize_module(module_idx, None, modules[module_idx].type_name(), " (event wake burst)");
+                                    finalize_module(
+                                        module_idx,
+                                        None,
+                                        modules[module_idx].type_name(),
+                                        " (event wake burst)",
+                                    );
                                     break;
                                 }
                                 Err(rc) => {
-                                    finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), " (event wake burst)");
+                                    finalize_module(
+                                        module_idx,
+                                        Some(rc),
+                                        modules[module_idx].type_name(),
+                                        " (event wake burst)",
+                                    );
                                     break;
                                 }
                             }
@@ -3107,7 +3522,12 @@ pub fn step_woken_modules(
                 }
                 Err(rc) => {
                     step_guard::disarm();
-                    finalize_module(module_idx, Some(rc), modules[module_idx].type_name(), " (event wake)");
+                    finalize_module(
+                        module_idx,
+                        Some(rc),
+                        modules[module_idx].type_name(),
+                        " (event wake)",
+                    );
                 }
             }
         }
@@ -3128,7 +3548,9 @@ pub fn reconfigure_phase() -> ReconfigurePhase {
 
 /// Set the current reconfigure phase.
 pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
-    unsafe { SCHED.reconfigure_phase = phase; }
+    unsafe {
+        SCHED.reconfigure_phase = phase;
+    }
 }
 
 /// Return the number of active modules in the current graph.
@@ -3141,13 +3563,17 @@ pub fn active_module_count() -> usize {
 /// domain-based instantiator) but which still want queries like
 /// `RECONFIGURE_MODULE_COUNT` to report the right value.
 pub fn set_active_module_count(n: usize) {
-    unsafe { SCHED.active_module_count = n; }
+    unsafe {
+        SCHED.active_module_count = n;
+    }
 }
 
 /// Invoke `module_drain()` on module N. Returns the module's return code,
 /// or -1 if the module is not drain-capable or the index is invalid.
 pub fn call_module_drain(module_idx: usize) -> i32 {
-    if module_idx >= MAX_MODULES { return -1; }
+    if module_idx >= MAX_MODULES {
+        return -1;
+    }
     let sched = unsafe { &*(&raw const SCHED) };
     if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
         set_current_module(module_idx);
@@ -3160,7 +3586,9 @@ pub fn call_module_drain(module_idx: usize) -> i32 {
 /// Mark a module as finished so the scheduler skips it in future ticks.
 pub fn mark_module_finished(module_idx: usize) {
     if module_idx < MAX_MODULES {
-        unsafe { SCHED.finished[module_idx] = true; }
+        unsafe {
+            SCHED.finished[module_idx] = true;
+        }
     }
 }
 
@@ -3169,7 +3597,9 @@ pub fn mark_module_finished(module_idx: usize) {
 /// and pushes a record to the global fault ring so subscribers (monitor
 /// CLI, metrics sinks) observe it uniformly with step-guard / MPU faults.
 pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
-    if module_idx >= MAX_MODULES { return; }
+    if module_idx >= MAX_MODULES {
+        return;
+    }
     let sched = unsafe { &mut *(&raw mut SCHED) };
     let tick = unsafe { DBG_TICK };
     sched.fault_info[module_idx].record_fault(fault_kind, tick);
@@ -3190,27 +3620,41 @@ pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
 ///   bit 2: mailbox_safe
 ///   bit 3: in_place_writer
 pub fn module_info_flags(module_idx: usize) -> u32 {
-    if module_idx >= MAX_MODULES { return 0; }
+    if module_idx >= MAX_MODULES {
+        return 0;
+    }
     let sched = unsafe { &*(&raw const SCHED) };
     let mut flags: u32 = 0;
     if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
-        if m.has_drain() { flags |= 0x01; }
+        if m.has_drain() {
+            flags |= 0x01;
+        }
     }
-    if sched.deferred_ready[module_idx] { flags |= 0x02; }
-    if sched.mailbox_safe[module_idx] { flags |= 0x04; }
-    if sched.in_place_writer[module_idx] { flags |= 0x08; }
+    if sched.deferred_ready[module_idx] {
+        flags |= 0x02;
+    }
+    if sched.mailbox_safe[module_idx] {
+        flags |= 0x04;
+    }
+    if sched.in_place_writer[module_idx] {
+        flags |= 0x08;
+    }
     flags
 }
 
 /// Upstream-module bitmask for module N.
 pub fn module_upstream_mask(module_idx: usize) -> u32 {
-    if module_idx >= MAX_MODULES { return 0; }
+    if module_idx >= MAX_MODULES {
+        return 0;
+    }
     unsafe { SCHED.upstream_mask[module_idx] }
 }
 
 /// Whether module N has returned StepOutcome::Done.
 pub fn module_is_finished(module_idx: usize) -> bool {
-    if module_idx >= MAX_MODULES { return false; }
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
     unsafe { SCHED.finished[module_idx] }
 }
 
@@ -3222,7 +3666,9 @@ pub fn module_is_finished(module_idx: usize) -> bool {
 /// until the main loop consumes the request. A null pointer with zero length
 /// signals "reload current STATIC_CONFIG".
 pub unsafe fn request_rebuild(config_ptr: *const u8, config_len: usize) {
-    unsafe { SCHED.rebuild_request = Some((config_ptr, config_len)); }
+    unsafe {
+        SCHED.rebuild_request = Some((config_ptr, config_len));
+    }
 }
 
 /// Consume the pending rebuild request, if any.
@@ -3239,20 +3685,26 @@ pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
 /// need to be replaced. Not called by the atomic reconfigure path,
 /// which uses `reset_state_arena` to drop everything at once.
 pub fn free_module_state(module_idx: usize) {
-    if module_idx >= MAX_MODULES { return; }
+    if module_idx >= MAX_MODULES {
+        return;
+    }
     let sched = unsafe { &mut *(&raw mut SCHED) };
 
     // Heap arena (from module_arena_size export, if any).
     let arena = sched.arenas[module_idx];
     if !arena.ptr.is_null() && arena.size > 0 {
-        unsafe { crate::kernel::loader::free_state_range(arena.ptr, arena.size as usize); }
+        unsafe {
+            crate::kernel::loader::free_state_range(arena.ptr, arena.size as usize);
+        }
     }
     sched.arenas[module_idx] = ArenaInfo::empty();
 
     // State buffer lives inside the DynamicModule; consume the slot.
     let slot = core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty);
     if let ModuleSlot::Dynamic(m) = slot {
-        unsafe { m.free(); }
+        unsafe {
+            m.free();
+        }
     }
 
     // Reset per-module scheduler bookkeeping so reuse is clean.
@@ -3309,7 +3761,9 @@ fn collect_channels(
             };
             if port_idx < out.len() && out[port_idx] == -1 {
                 out[port_idx] = chan_for_side;
-                if port_idx >= count { count = port_idx + 1; }
+                if port_idx >= count {
+                    count = port_idx + 1;
+                }
             } else if count < out.len() {
                 out[count] = chan_for_side;
                 count += 1;
@@ -3399,7 +3853,9 @@ pub fn run_builtin_graph(modules: &[(&'static str, fn(*mut u8) -> i32)]) -> ! {
             core::arch::asm!("wfi"); // Wait for timer tick
         }
 
-        unsafe { DBG_TICK += 1; }
+        unsafe {
+            DBG_TICK += 1;
+        }
         let tick = unsafe { DBG_TICK };
 
         step_modules(&mut sched.modules, count);

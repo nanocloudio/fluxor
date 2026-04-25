@@ -1,0 +1,14 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+[[ports]]
+name = "stream"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[params]]
+name = "path"
+type = "str"
+required = true

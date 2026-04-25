@@ -69,9 +69,6 @@ pub mod chip;
 #[path = "../platform/linux/chip.rs"]
 pub mod chip;
 
-#[cfg(feature = "chip-bcm2712")]
-#[path = "../platform/bcm2712/multicore.rs"]
-pub mod multicore;
 pub mod guard;
 pub mod heap;
 pub mod isr_tier;
@@ -81,6 +78,9 @@ pub mod mmu;
 #[path = "../platform/rp/mpu.rs"]
 pub mod mpu;
 #[cfg(feature = "chip-bcm2712")]
+#[path = "../platform/bcm2712/multicore.rs"]
+pub mod multicore;
+#[cfg(feature = "chip-bcm2712")]
 #[path = "../platform/bcm2712/pcie.rs"]
 pub mod pcie;
 #[cfg(feature = "chip-bcm2712")]
@@ -89,10 +89,10 @@ pub mod pcie_aliases;
 #[cfg(feature = "rp")]
 #[path = "../platform/rp/providers.rs"]
 pub mod rp_providers;
-pub mod step_guard;
 #[cfg(feature = "rp")]
 #[path = "../platform/rp/step_guard.rs"]
 pub mod rp_step_guard;
+pub mod step_guard;
 // SMMU/IOMMU on BCM2712 lives in the `smmu` PIC module
 // (`modules/foundation/smmu/`) via MMIO bridges. CM5 NVMe uses
 // direct UBUS_REMAP inbound-DMA windowing and does not need SMMU.

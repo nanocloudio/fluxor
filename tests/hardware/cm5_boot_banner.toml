@@ -1,0 +1,34 @@
+# CM5 first-boot smoke test.
+#
+# Pass signal: dnsmasq serves our staged kernel image to the DUT. That
+# confirms the bootloader reached the netboot stage, which is the highest
+# signal the rig can produce while UART bring-up is deferred on the Pi 5.
+# When the RP1 UART is working again a follow-up scenario can add a
+# console-regex rule on top of this one.
+#
+# Paths relative to this file (RFC §15.3).
+
+name = "cm5_boot_banner"
+target = "cm5"
+config = "../../examples/cm5/hello_uart.yaml"
+
+requires_tags = ["nvme"]
+
+requires = [
+    "deploy.netboot_tftp",
+    "power.cycle",
+    "observe.netboot_fetch",
+]
+
+# The full boot takes ~20-25 s on a cold start; 90 s accommodates
+# bootloader retries and leaves room for the stale-lock threshold math in
+# RFC §10.5.
+timeout_s = 90
+
+# Pass iff the kernel image we staged is fetched from the TFTP root.
+# The regex matches the *filename as seen by dnsmasq*, which includes the
+# TFTP root's last component. `kernel_2712\.img` is the name the rig
+# profile binds via `[deploy.netboot_tftp].kernel_name`.
+[[pass]]
+source = "observe.netboot_fetch"
+regex = "kernel_2712\\.img$"

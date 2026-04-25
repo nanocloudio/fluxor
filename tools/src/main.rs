@@ -15,23 +15,27 @@ mod config;
 mod crypto;
 mod error;
 mod hash;
-mod stack_expand;
 mod manifest;
 mod modules;
 mod monitor;
 pub mod reconfigure;
 pub mod rig;
 mod schema;
+mod stack_expand;
 pub mod target;
 mod uf2;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::config::{decode_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES};
+use crate::config::{
+    decode_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES,
+};
 use crate::error::{Error, Result};
+use crate::modules::{
+    build_module_table, pack_fmod, parse_modules_from_config, parse_modules_from_config_multi,
+};
 use crate::monitor::cmd_monitor_dispatch;
-use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config, parse_modules_from_config_multi};
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
 /// Flash layout constants
@@ -282,17 +286,26 @@ fn main() {
         Commands::TargetInfo { target, field } => cmd_target_info(&target, field.as_deref()),
         Commands::Targets => cmd_targets(),
         Commands::Mktable { dir, output } => cmd_mktable(&dir, &output),
-        Commands::MktableConfig { config, modules_dir, output } => {
-            cmd_mktable_config(&config, &modules_dir, &output)
-        }
-        Commands::Diff { old_config, new_config, target } => cmd_diff(&old_config, &new_config, target.as_deref()),
+        Commands::MktableConfig {
+            config,
+            modules_dir,
+            output,
+        } => cmd_mktable_config(&config, &modules_dir, &output),
+        Commands::Diff {
+            old_config,
+            new_config,
+            target,
+        } => cmd_diff(&old_config, &new_config, target.as_deref()),
         Commands::Build { path, output } => cmd_build(&path, output.as_deref(), verbose),
         Commands::Run { config } => cmd_run(&config, verbose),
         Commands::Flash { config } => cmd_flash(&config, verbose),
         Commands::Sign { input, key, output } => cmd_sign(&input, &key, output.as_deref(), verbose),
-        Commands::Monitor { port, baud, refresh_ms, net } => {
-            cmd_monitor_dispatch(&port, baud, refresh_ms, net.as_deref())
-        }
+        Commands::Monitor {
+            port,
+            baud,
+            refresh_ms,
+            net,
+        } => cmd_monitor_dispatch(&port, baud, refresh_ms, net.as_deref()),
         Commands::Rig(args) => rig::cli::dispatch(args),
     };
 
@@ -320,7 +333,9 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
             }
         }
         if data.len() < 64 {
-            return Err(error::Error::Config("No config found at expected address".into()));
+            return Err(error::Error::Config(
+                "No config found at expected address".into(),
+            ));
         }
         data
     };
@@ -339,7 +354,10 @@ fn cmd_decode(file: &PathBuf, format: &str) -> Result<()> {
 /// Scans 256-byte aligned addresses looking for TRAILER_MAGIC
 fn find_trailer(memory: &std::collections::BTreeMap<u32, u8>) -> Result<(u32, u32, u32)> {
     // Scan 256-byte aligned addresses for trailer magic
-    let min_addr = *memory.keys().min().ok_or_else(|| error::Error::Config("Empty memory".into()))?;
+    let min_addr = *memory
+        .keys()
+        .min()
+        .ok_or_else(|| error::Error::Config("Empty memory".into()))?;
     let max_addr = *memory.keys().max().unwrap();
 
     let mut addr = (min_addr + 255) & !255; // Start at first 256-byte boundary
@@ -375,8 +393,16 @@ fn cmd_info_fmod(file: &PathBuf) -> Result<()> {
         _ => "Unknown",
     };
     println!("Module: {} ({})", file.display(), m.name);
-    println!("  type: {} ({}), size: {} bytes", type_str, m.module_type, m.data.len());
-    println!("  mailbox_safe: {}, in_place_writer: {}", m.mailbox_safe, m.in_place_writer);
+    println!(
+        "  type: {} ({}), size: {} bytes",
+        type_str,
+        m.module_type,
+        m.data.len()
+    );
+    println!(
+        "  mailbox_safe: {}, in_place_writer: {}",
+        m.mailbox_safe, m.in_place_writer
+    );
     if let Some(schema) = &m.schema {
         println!("  param_schema: {} bytes", schema.len());
     }
@@ -443,7 +469,12 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
 
         // Check config magic
         if let Some(header_data) = uf2::extract_region(&memory, config_addr, 4) {
-            let magic = u32::from_le_bytes([header_data[0], header_data[1], header_data[2], header_data[3]]);
+            let magic = u32::from_le_bytes([
+                header_data[0],
+                header_data[1],
+                header_data[2],
+                header_data[3],
+            ]);
             if magic == config::MAGIC_CONFIG {
                 println!("  Config magic: Valid (0x{:08x})", magic);
             } else {
@@ -453,8 +484,15 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
 
         // Parse and display module table
         if modules_addr != 0 {
-            if let Some(table_header) = uf2::extract_region(&memory, modules_addr, modules::TABLE_HEADER_SIZE) {
-                let table_magic = u32::from_le_bytes([table_header[0], table_header[1], table_header[2], table_header[3]]);
+            if let Some(table_header) =
+                uf2::extract_region(&memory, modules_addr, modules::TABLE_HEADER_SIZE)
+            {
+                let table_magic = u32::from_le_bytes([
+                    table_header[0],
+                    table_header[1],
+                    table_header[2],
+                    table_header[3],
+                ]);
                 if table_magic == modules::MODULE_TABLE_MAGIC {
                     let module_count = table_header[5] as usize;
                     println!("\nModules: {} embedded", module_count);
@@ -463,17 +501,26 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                     let entries_start = modules_addr + modules::TABLE_HEADER_SIZE as u32;
                     for i in 0..module_count {
                         let entry_addr = entries_start + (i as u32 * modules::ENTRY_SIZE as u32);
-                        if let Some(entry) = uf2::extract_region(&memory, entry_addr, modules::ENTRY_SIZE) {
-                            let name_hash = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                            let fmod_offset = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-                            let fmod_size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+                        if let Some(entry) =
+                            uf2::extract_region(&memory, entry_addr, modules::ENTRY_SIZE)
+                        {
+                            let name_hash =
+                                u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                            let fmod_offset =
+                                u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+                            let fmod_size =
+                                u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]])
+                                    as usize;
                             let mod_type = entry[12];
 
                             let fmod_addr = modules_addr + fmod_offset;
-                            if let Some(fmod_header) = uf2::extract_region(&memory, fmod_addr, modules::MODULE_HEADER_SIZE) {
+                            if let Some(fmod_header) =
+                                uf2::extract_region(&memory, fmod_addr, modules::MODULE_HEADER_SIZE)
+                            {
                                 // Extract name from header (offset 28, 32 bytes)
                                 let name_bytes = &fmod_header[28..60];
-                                let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+                                let name_end =
+                                    name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
                                 let name = String::from_utf8_lossy(&name_bytes[..name_end]);
                                 let abi = fmod_header[5];
 
@@ -487,21 +534,48 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                                 };
 
                                 println!("\n  [{}] {} (hash=0x{:08x})", i, name, name_hash);
-                                println!("      type: {} ({}), abi: v{}, size: {} bytes", type_str, mod_type, abi, fmod_size);
+                                println!(
+                                    "      type: {} ({}), abi: v{}, size: {} bytes",
+                                    type_str, mod_type, abi, fmod_size
+                                );
 
                                 // Read manifest from fmod (ABI v2)
                                 if abi >= 2 {
-                                    let code_size = u32::from_le_bytes([fmod_header[8], fmod_header[9], fmod_header[10], fmod_header[11]]) as usize;
-                                    let data_size = u32::from_le_bytes([fmod_header[12], fmod_header[13], fmod_header[14], fmod_header[15]]) as usize;
-                                    let export_count = u16::from_le_bytes([fmod_header[24], fmod_header[25]]) as usize;
-                                    let schema_size = u16::from_le_bytes([fmod_header[62], fmod_header[63]]) as usize;
-                                    let manifest_size = u16::from_le_bytes([fmod_header[64], fmod_header[65]]) as usize;
+                                    let code_size = u32::from_le_bytes([
+                                        fmod_header[8],
+                                        fmod_header[9],
+                                        fmod_header[10],
+                                        fmod_header[11],
+                                    ]) as usize;
+                                    let data_size = u32::from_le_bytes([
+                                        fmod_header[12],
+                                        fmod_header[13],
+                                        fmod_header[14],
+                                        fmod_header[15],
+                                    ]) as usize;
+                                    let export_count =
+                                        u16::from_le_bytes([fmod_header[24], fmod_header[25]])
+                                            as usize;
+                                    let schema_size =
+                                        u16::from_le_bytes([fmod_header[62], fmod_header[63]])
+                                            as usize;
+                                    let manifest_size =
+                                        u16::from_le_bytes([fmod_header[64], fmod_header[65]])
+                                            as usize;
 
-                                    let manifest_offset = modules::MODULE_HEADER_SIZE + code_size + data_size + export_count * 8 + schema_size;
+                                    let manifest_offset = modules::MODULE_HEADER_SIZE
+                                        + code_size
+                                        + data_size
+                                        + export_count * 8
+                                        + schema_size;
                                     let manifest_addr = fmod_addr + manifest_offset as u32;
 
                                     if manifest_size > 0 {
-                                        if let Some(manifest_data) = uf2::extract_region(&memory, manifest_addr, manifest_size) {
+                                        if let Some(manifest_data) = uf2::extract_region(
+                                            &memory,
+                                            manifest_addr,
+                                            manifest_size,
+                                        ) {
                                             match manifest::Manifest::from_bytes(&manifest_data) {
                                                 Ok(m) => println!("{}", m.display()),
                                                 Err(e) => println!("      manifest: error: {}", e),
@@ -543,9 +617,9 @@ fn substitute_env_vars(input: &str) -> Result<String> {
         rest = &rest[pos + 2..];
 
         // Find closing '}'
-        let end = rest.find('}').ok_or_else(|| {
-            crate::error::Error::Config("Unclosed ${} in config".to_string())
-        })?;
+        let end = rest
+            .find('}')
+            .ok_or_else(|| crate::error::Error::Config("Unclosed ${} in config".to_string()))?;
 
         let expr = &rest[..end];
         if expr.is_empty() {
@@ -584,7 +658,12 @@ fn substitute_env_vars(input: &str) -> Result<String> {
     Ok(out)
 }
 
-fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules_dir_override: Option<&std::path::Path>, binary: bool) -> Result<()> {
+fn cmd_generate(
+    config_path: &PathBuf,
+    output: Option<&std::path::Path>,
+    modules_dir_override: Option<&std::path::Path>,
+    binary: bool,
+) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let config: serde_json::Value = if config_path
         .extension()
@@ -602,7 +681,10 @@ fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules
 
     let builder = ConfigBuilder::new();
     if let Some(ref defaults) = target_desc.hardware_defaults {
-        let hw = config.get("hardware").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+        let hw = config
+            .get("hardware")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
         let hw_obj = hw.as_object().cloned().unwrap_or_default();
         let def_obj = defaults.as_object().unwrap();
         let mut merged = hw_obj;
@@ -623,8 +705,13 @@ fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules
     let extra_dirs: Vec<&std::path::Path> = extra_modules_dir.iter().map(|p| p.as_path()).collect();
 
     let binary_data = config::generate_config_ext(
-        &config, &builder, &[], modules_dir, &extra_dirs,
-        target_desc.max_pin + 1, target_desc.pio_count,
+        &config,
+        &builder,
+        &[],
+        modules_dir,
+        &extra_dirs,
+        target_desc.max_pin + 1,
+        target_desc.pio_count,
     )?;
 
     eprintln!("Config size: {} bytes", binary_data.len());
@@ -636,7 +723,7 @@ fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules
             println!("Wrote binary config to {}", output_path.display());
         } else {
             return Err(error::Error::Config(
-                "Standalone config UF2 no longer supported. Use 'combine' command instead.".into()
+                "Standalone config UF2 no longer supported. Use 'combine' command instead.".into(),
             ));
         }
     } else {
@@ -655,7 +742,12 @@ fn cmd_generate(config_path: &PathBuf, output: Option<&std::path::Path>, modules
     Ok(())
 }
 
-fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &PathBuf, verbose: bool) -> Result<()> {
+fn cmd_combine(
+    firmware_path: &PathBuf,
+    config_path: &PathBuf,
+    output_path: &PathBuf,
+    verbose: bool,
+) -> Result<()> {
     // Parse config file (substitute env vars before YAML parse)
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let config: serde_json::Value = if config_path
@@ -670,7 +762,8 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     let mut config = config;
     let target_desc = resolve_target(&config, None)?;
     let project_root = std::env::current_dir().unwrap_or_default();
-    let stack_added = stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let stack_added =
+        stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     if verbose && !stack_added.is_empty() {
         eprintln!("Auto-added from platform: {}", stack_added.join(", "));
     }
@@ -680,34 +773,41 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
 
     // Detect aarch64 targets — they use raw binary output (no UF2).
     // Pi 5 VPU loads kernel as a raw binary to 0x80000.
-    let is_aarch64 = target_desc.build.as_ref()
+    let is_aarch64 = target_desc
+        .build
+        .as_ref()
         .map(|b| b.rust_target.starts_with("aarch64"))
         .unwrap_or(false);
     const AARCH64_LOAD_BASE: u32 = 0x0008_0000;
 
     // Read firmware - keep as UF2 blocks to preserve non-contiguous sections like .end_block
     // Use the target's UF2 family ID so the correct chip accepts the image (e.g. RP2040 vs RP2350).
-    let (firmware_data, firmware_max_addr) = if firmware_path.extension().is_some_and(|ext| ext == "bin") {
-        let data = std::fs::read(firmware_path)?;
-        if is_aarch64 {
-            let end = AARCH64_LOAD_BASE + data.len() as u32;
-            (data, end) // raw binary, not UF2
+    let (firmware_data, firmware_max_addr) =
+        if firmware_path.extension().is_some_and(|ext| ext == "bin") {
+            let data = std::fs::read(firmware_path)?;
+            if is_aarch64 {
+                let end = AARCH64_LOAD_BASE + data.len() as u32;
+                (data, end) // raw binary, not UF2
+            } else {
+                let end = XIP_BASE + data.len() as u32;
+                let family_id = target_desc
+                    .build
+                    .as_ref()
+                    .map(|b| b.uf2_family_id)
+                    .unwrap_or(UF2_FAMILY_RP2350);
+                (create_uf2_blocks(&data, XIP_BASE, family_id), end)
+            }
         } else {
-            let end = XIP_BASE + data.len() as u32;
-            let family_id = target_desc.build.as_ref().map(|b| b.uf2_family_id).unwrap_or(UF2_FAMILY_RP2350);
-            (create_uf2_blocks(&data, XIP_BASE, family_id), end)
-        }
-    } else {
-        // Keep original UF2 blocks intact - they may contain non-contiguous sections
-        // like .end_block that the RP2350 boot ROM requires
-        let uf2_content = std::fs::read(firmware_path)?;
-        let memory = parse_uf2(&uf2_content)?;
+            // Keep original UF2 blocks intact - they may contain non-contiguous sections
+            // like .end_block that the RP2350 boot ROM requires
+            let uf2_content = std::fs::read(firmware_path)?;
+            let memory = parse_uf2(&uf2_content)?;
 
-        // Find the maximum address used (not just contiguous from XIP_BASE)
-        let max_addr = memory.keys().max().copied().unwrap_or(XIP_BASE) + 1;
+            // Find the maximum address used (not just contiguous from XIP_BASE)
+            let max_addr = memory.keys().max().copied().unwrap_or(XIP_BASE) + 1;
 
-        (uf2_content, max_addr)
-    };
+            (uf2_content, max_addr)
+        };
 
     if verbose {
         let fmt = if is_aarch64 { "raw" } else { "UF2" };
@@ -716,7 +816,10 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
 
     // Merge board hardware defaults for sections the YAML doesn't specify
     if let Some(ref defaults) = target_desc.hardware_defaults {
-        let hw = config.get("hardware").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+        let hw = config
+            .get("hardware")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
         let hw_obj = hw.as_object().cloned().unwrap_or_default();
         let def_obj = defaults.as_object().unwrap();
         let mut merged = hw_obj;
@@ -736,7 +839,9 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
         for err in &validation.errors {
             eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
         }
-        return Err(error::Error::Config("Config validation failed for target".into()));
+        return Err(error::Error::Config(
+            "Config validation failed for target".into(),
+        ));
     }
 
     // Parse modules first (needed for in_place_safe caps in config generation)
@@ -745,16 +850,26 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     let modules = parse_modules_from_config(&config, modules_dir)?;
 
     // Build module caps for buffer aliasing and manifest validation
-    let caps: Vec<ModuleCaps> = modules.iter().map(|m| ModuleCaps {
-        name: m.name.clone(),
-        mailbox_safe: m.mailbox_safe,
-        in_place_writer: m.in_place_writer,
-        manifest: m.manifest.clone(),
-    }).collect();
+    let caps: Vec<ModuleCaps> = modules
+        .iter()
+        .map(|m| ModuleCaps {
+            name: m.name.clone(),
+            mailbox_safe: m.mailbox_safe,
+            in_place_writer: m.in_place_writer,
+            manifest: m.manifest.clone(),
+        })
+        .collect();
 
     // Generate config binary (with module capabilities for chain detection)
     let builder = ConfigBuilder::new();
-    let config_data = generate_config_with_caps(&config, &builder, &caps, modules_dir, target_desc.max_pin + 1, target_desc.pio_count)?;
+    let config_data = generate_config_with_caps(
+        &config,
+        &builder,
+        &caps,
+        modules_dir,
+        target_desc.max_pin + 1,
+        target_desc.pio_count,
+    )?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {
@@ -815,14 +930,29 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     }
 
     if verbose {
-        let base_str = if is_aarch64 { AARCH64_LOAD_BASE } else { XIP_BASE };
+        let base_str = if is_aarch64 {
+            AARCH64_LOAD_BASE
+        } else {
+            XIP_BASE
+        };
         eprintln!("Layout:");
-        eprintln!("  Firmware:  0x{:08x} - 0x{:08x}", base_str, firmware_max_addr);
+        eprintln!(
+            "  Firmware:  0x{:08x} - 0x{:08x}",
+            base_str, firmware_max_addr
+        );
         eprintln!("  Trailer:   0x{:08x} (16 bytes)", trailer_addr);
         if let Some(ref mdata) = modules_data {
-            eprintln!("  Modules:   0x{:08x} ({} bytes)", modules_addr, mdata.len());
+            eprintln!(
+                "  Modules:   0x{:08x} ({} bytes)",
+                modules_addr,
+                mdata.len()
+            );
         }
-        eprintln!("  Config:    0x{:08x} ({} bytes)", config_addr, config_data.len());
+        eprintln!(
+            "  Config:    0x{:08x} ({} bytes)",
+            config_addr,
+            config_data.len()
+        );
     }
 
     // Compute CRC-16/XMODEM over the payload (modules + config) for integrity check
@@ -876,15 +1006,20 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
         // UF2 path for RP targets
         let firmware_family_id = {
             if firmware_data.len() >= 32 {
-                u32::from_le_bytes([firmware_data[28], firmware_data[29], firmware_data[30], firmware_data[31]])
+                u32::from_le_bytes([
+                    firmware_data[28],
+                    firmware_data[29],
+                    firmware_data[30],
+                    firmware_data[31],
+                ])
             } else {
                 UF2_FAMILY_RP2350
             }
         };
 
-        let modules_uf2 = modules_data.as_ref().map(|mdata| {
-            create_uf2_blocks(mdata, modules_addr, firmware_family_id)
-        });
+        let modules_uf2 = modules_data
+            .as_ref()
+            .map(|mdata| create_uf2_blocks(mdata, modules_addr, firmware_family_id));
         let trailer_uf2 = create_uf2_blocks(&trailer, trailer_addr, firmware_family_id);
         let config_uf2 = create_uf2_blocks(&config_data, config_addr, firmware_family_id);
 
@@ -913,7 +1048,10 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
         let modules_size = modules_data.as_ref().map(|m| m.len()).unwrap_or(0);
         println!(
             "\x1b[1;32mSuccess\x1b[0m {} fw={}K mod={}K cfg={}K total={}K",
-            output_path.file_name().unwrap_or_default().to_string_lossy(),
+            output_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
             firmware_size / 1024,
             modules_size / 1024,
             config_data.len() / 1024,
@@ -924,7 +1062,10 @@ fn cmd_combine(firmware_path: &PathBuf, config_path: &PathBuf, output_path: &Pat
     Ok(())
 }
 
-fn load_config_with_defaults(config_path: &PathBuf, verbose: bool) -> Result<(serde_json::Value, target::TargetDescriptor)> {
+fn load_config_with_defaults(
+    config_path: &PathBuf,
+    verbose: bool,
+) -> Result<(serde_json::Value, target::TargetDescriptor)> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let config: serde_json::Value = if config_path
         .extension()
@@ -945,7 +1086,8 @@ fn load_config_with_defaults(config_path: &PathBuf, verbose: bool) -> Result<(se
 
     // Expand platform: stacks (TOML-driven)
     let project_root = std::env::current_dir().unwrap_or_default();
-    let stack_added = stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+    let stack_added =
+        stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     if verbose && !stack_added.is_empty() {
         eprintln!("Auto-added from platform: {}", stack_added.join(", "));
     }
@@ -974,7 +1116,9 @@ fn load_config_with_defaults(config_path: &PathBuf, verbose: bool) -> Result<(se
         for err in &validation.errors {
             eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
         }
-        return Err(error::Error::Config("Config validation failed for target".into()));
+        return Err(error::Error::Config(
+            "Config validation failed for target".into(),
+        ));
     }
 
     Ok((config, target_desc))
@@ -1067,7 +1211,10 @@ fn cmd_slot_image(
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     if let Some(ref defaults) = target_desc.hardware_defaults {
-        let hw = config.get("hardware").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+        let hw = config
+            .get("hardware")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
         let hw_obj = hw.as_object().cloned().unwrap_or_default();
         let def_obj = defaults.as_object().unwrap();
         let mut merged = hw_obj;
@@ -1084,16 +1231,17 @@ fn cmd_slot_image(
         for err in &validation.errors {
             eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
         }
-        return Err(error::Error::Config("Config validation failed for target".into()));
+        return Err(error::Error::Config(
+            "Config validation failed for target".into(),
+        ));
     }
 
     let modules_dir_path = format!("target/{}/modules", target_desc.id);
     let modules_dir = std::path::Path::new(&modules_dir_path);
     let (modules_data, config_data) =
         build_packaged_blobs(&config, modules_dir, &[], &target_desc, verbose)?;
-    let modules_data = modules_data.ok_or_else(|| {
-        error::Error::Config("Slot image requires at least one module".into())
-    })?;
+    let modules_data = modules_data
+        .ok_or_else(|| error::Error::Config("Slot image requires at least one module".into()))?;
 
     // Lay out the slot: header | pad → 4KB | modules | pad → 256B | config.
     let modules_offset = ((HEADER_SIZE + MODULES_ALIGN - 1) / MODULES_ALIGN) * MODULES_ALIGN;
@@ -1135,8 +1283,10 @@ fn cmd_slot_image(
     if verbose {
         eprintln!(
             "slot image: modules_off=0x{:x} ({} bytes), config_off=0x{:x} ({} bytes), epoch={}",
-            modules_offset, modules_data.len(),
-            config_offset, config_data.len(),
+            modules_offset,
+            modules_data.len(),
+            config_offset,
+            config_data.len(),
             epoch,
         );
     }
@@ -1198,11 +1348,7 @@ fn cmd_pack(
         // Concise single-line output: name code+data+bss=total
         println!(
             "\x1b[1;32mSuccess\x1b[0m {} {}+{}+{}={} bytes",
-            result.name,
-            result.code_size,
-            result.data_size,
-            result.bss_size,
-            result.total_size
+            result.name, result.code_size, result.data_size, result.bss_size, result.total_size
         );
     }
 
@@ -1210,7 +1356,10 @@ fn cmd_pack(
 }
 
 /// Resolve target from CLI override or config YAML `target:` field.
-fn resolve_target(config: &serde_json::Value, cli_override: Option<&str>) -> Result<target::TargetDescriptor> {
+fn resolve_target(
+    config: &serde_json::Value,
+    cli_override: Option<&str>,
+) -> Result<target::TargetDescriptor> {
     let name = cli_override
         .or_else(|| config.get("target").and_then(|t| t.as_str()))
         .unwrap_or("pico2w");
@@ -1445,7 +1594,11 @@ fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mktable_config(config_path: &PathBuf, modules_dirs: &[PathBuf], output: &PathBuf) -> Result<()> {
+fn cmd_mktable_config(
+    config_path: &PathBuf,
+    modules_dirs: &[PathBuf],
+    output: &PathBuf,
+) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let mut config: serde_json::Value = if config_path
         .extension()
@@ -1468,12 +1621,12 @@ fn cmd_mktable_config(config_path: &PathBuf, modules_dirs: &[PathBuf], output: &
     } else {
         &modules_dirs[0]
     };
-    let extra_dirs: Vec<&std::path::Path> = modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
+    let extra_dirs: Vec<&std::path::Path> =
+        modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
     let modules = parse_modules_from_config_multi(&config, primary_dir, &extra_dirs)?;
-    if modules.is_empty() {
-        return Err(Error::Module("No modules referenced in config".into()));
-    }
-
+    // All-builtin configs (e.g. linux_display + host_image_codec) leave
+    // `modules` empty; emit a valid 16-byte header-only table so the
+    // host loader sees module_count=0 and instantiates only built-ins.
     let table = build_module_table(&modules)?;
     std::fs::write(output, &table)?;
 
@@ -1636,7 +1789,12 @@ fn build_one(
                     build_id
                 )));
             }
-            cmd_combine(&firmware_path, &yaml_path.to_path_buf(), &output_path, verbose)?;
+            cmd_combine(
+                &firmware_path,
+                &yaml_path.to_path_buf(),
+                &output_path,
+                verbose,
+            )?;
         }
         "linux" => {
             let out_dir = output_path
@@ -1666,11 +1824,13 @@ fn build_one(
                     "Modules not found at target/bcm2712/modules. Run 'make modules TARGET=bcm2712' first.".into()
                 ));
             }
-            cmd_mktable_config(
-                &yaml_path.to_path_buf(),
-                &fmod_dirs,
-                &modules_bin_path,
-            )?;
+            // Cross-check the YAML against the linux binary's
+            // compiled-in features (host-image / host-window /
+            // host-playback). A YAML that asks for a backend the
+            // binary can't provide fails here with the matching
+            // `cargo build` command in the error message.
+            validate_linux_runtime_features(&yaml_path.to_path_buf())?;
+            cmd_mktable_config(&yaml_path.to_path_buf(), &fmod_dirs, &modules_bin_path)?;
             cmd_generate(
                 &yaml_path.to_path_buf(),
                 Some(config_bin_path.as_path()),
@@ -1715,20 +1875,13 @@ fn cmd_build(path: &PathBuf, output: Option<&std::path::Path>, verbose: bool) ->
             match build_one(yaml, None, verbose) {
                 Ok(_) => built += 1,
                 Err(e) => {
-                    eprintln!(
-                        "\x1b[1;33mWarn:\x1b[0m {} -- {}",
-                        yaml.display(),
-                        e
-                    );
+                    eprintln!("\x1b[1;33mWarn:\x1b[0m {} -- {}", yaml.display(), e);
                     failed += 1;
                 }
             }
         }
 
-        println!(
-            "\nBuilt {}/{} configs ({} failed)",
-            built, total, failed
-        );
+        println!("\nBuilt {}/{} configs ({} failed)", built, total, failed);
         if failed > 0 && built == 0 {
             return Err(Error::Config("All builds failed".into()));
         }
@@ -1746,11 +1899,135 @@ fn collect_yaml_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
             let p = entry.path();
             if p.is_dir() {
                 collect_yaml_files(&p, out);
-            } else if p.extension().is_some_and(|ext| ext == "yaml" || ext == "yml") {
+            } else if p
+                .extension()
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
+            {
                 out.push(p);
             }
         }
     }
+}
+
+/// Cross-check a Linux YAML config against the `fluxor-linux` binary's
+/// compiled-in features. Module types and per-mode values that need an
+/// optional backend are matched against the feature set the binary
+/// reports via `--print-features`; any mismatch fails the build with
+/// the matching `cargo build` invocation in the error message.
+///
+/// Skipped silently when the binary is absent (`build_one` errors on
+/// that path before we reach here) or when `--print-features` exits
+/// non-zero (the binary is too old to expose its feature set).
+fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
+    let linux_bin = PathBuf::from("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+    if !linux_bin.exists() {
+        return Ok(());
+    }
+
+    let output = std::process::Command::new(&linux_bin)
+        .arg("--print-features")
+        .output()
+        .map_err(|e| {
+            Error::Config(format!(
+                "failed to query features from {}: {}",
+                linux_bin.display(),
+                e
+            ))
+        })?;
+    if !output.status.success() {
+        eprintln!(
+            "warning: {} --print-features failed; skipping feature cross-check",
+            linux_bin.display()
+        );
+        return Ok(());
+    }
+    let features: std::collections::HashSet<String> = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+
+    // Parse the YAML and walk modules. We don't reuse the full
+    // generation pipeline — we just need module type + relevant fields.
+    let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
+    let mut config: serde_json::Value = if yaml_path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+    let target_desc = resolve_target(&config, None)?;
+    let project_root = std::env::current_dir().unwrap_or_default();
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+
+    let modules = match config.get("modules").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    for entry in modules {
+        let name = entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>");
+        let module_type = entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or(name);
+
+        // Module-presence checks: if the YAML uses a module type that
+        // requires a feature absent from the binary, fail.
+        let required_for_type: Option<&str> = match module_type {
+            "host_image_codec" => Some("host-image"),
+            _ => None,
+        };
+        if let Some(feat) = required_for_type {
+            if !features.contains(feat) {
+                return Err(Error::Config(format!(
+                    "module '{}' (type '{}') requires `fluxor-linux` to be built \
+                     with `--features {}` — current binary lacks it. \
+                     Rebuild with: cargo build --release --bin fluxor-linux \
+                     --no-default-features --features {} \
+                     --target aarch64-unknown-linux-gnu",
+                    name, module_type, feat, feat,
+                )));
+            }
+        }
+
+        // Per-mode-value checks for built-ins where the mode picks an
+        // optional backend.
+        let mode_value = entry
+            .get("mode")
+            .or_else(|| {
+                entry
+                    .get("params")
+                    .and_then(|p| p.as_object())
+                    .and_then(|p| p.get("mode"))
+            })
+            .and_then(|v| v.as_str());
+        let required_for_mode: Option<&str> = match (module_type, mode_value) {
+            ("linux_display", Some("window")) => Some("host-window"),
+            ("linux_audio", Some("playback")) => Some("host-playback"),
+            _ => None,
+        };
+        if let Some(feat) = required_for_mode {
+            if !features.contains(feat) {
+                return Err(Error::Config(format!(
+                    "module '{}' (type '{}', mode '{}') requires `fluxor-linux` \
+                     to be built with `--features {}` — current binary lacks it. \
+                     Either change `mode:` or rebuild with: cargo build --release \
+                     --bin fluxor-linux --no-default-features --features {} \
+                     --target aarch64-unknown-linux-gnu",
+                    name,
+                    module_type,
+                    mode_value.unwrap_or(""),
+                    feat,
+                    feat,
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
@@ -1824,8 +2101,13 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                         target_desc.id
                     )));
                 }
-                let (modules_data, config_data) =
-                    build_packaged_blobs(&config, modules_dir.as_path(), &[], &target_desc, verbose)?;
+                let (modules_data, config_data) = build_packaged_blobs(
+                    &config,
+                    modules_dir.as_path(),
+                    &[],
+                    &target_desc,
+                    verbose,
+                )?;
                 let modules_data = modules_data.ok_or_else(|| {
                     Error::Config("QEMU bare-metal run requires at least one module blob".into())
                 })?;
@@ -1836,18 +2118,27 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 let yaml_text = std::fs::read_to_string(config_path)?;
                 let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
                     .map_err(|e| Error::Config(format!("YAML parse: {}", e)))?;
-                let guest_port = yaml.get("modules")
+                let guest_port = yaml
+                    .get("modules")
                     .and_then(|m| m.as_sequence())
-                    .and_then(|mods| mods.iter().find(|m| {
-                        m.get("name").and_then(|n| n.as_str()) == Some("http")
-                    }))
+                    .and_then(|mods| {
+                        mods.iter()
+                            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some("http"))
+                    })
                     .and_then(|http| http.get("port"))
                     .and_then(|p| p.as_u64())
                     .unwrap_or(80);
-                let host_port = if guest_port < 1024 { guest_port + 18000 } else { guest_port };
+                let host_port = if guest_port < 1024 {
+                    guest_port + 18000
+                } else {
+                    guest_port
+                };
                 let hostfwd = format!("user,id=net0,hostfwd=tcp::{}-:{}", host_port, guest_port);
 
-                eprintln!("Running: qemu-system-aarch64 -kernel {}", elf_path.display());
+                eprintln!(
+                    "Running: qemu-system-aarch64 -kernel {}",
+                    elf_path.display()
+                );
                 eprintln!("  Port forward: host {} -> guest {}", host_port, guest_port);
                 eprintln!(
                     "  Side-load: config={} @ 0x{:08x}, modules={} @ 0x{:08x}",
@@ -1858,14 +2149,19 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 );
 
                 let mut qemu_args: Vec<&str> = vec![
-                    "-machine", "virt",
-                    "-cpu", "cortex-a76",
-                    "-smp", "1",
-                    "-m", "256M",
+                    "-machine",
+                    "virt",
+                    "-cpu",
+                    "cortex-a76",
+                    "-smp",
+                    "1",
+                    "-m",
+                    "256M",
                     "-nographic",
                 ];
                 qemu_args.extend_from_slice(&[
-                    "-device", "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
+                    "-device",
+                    "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
                 ]);
                 let hostfwd_ref: &str = &hostfwd;
                 let config_loader = format!(
@@ -1879,9 +2175,12 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                     QEMU_MODULES_BLOB_ADDR
                 );
                 qemu_args.extend_from_slice(&[
-                    "-netdev", hostfwd_ref,
-                    "-device", config_loader.as_str(),
-                    "-device", modules_loader.as_str(),
+                    "-netdev",
+                    hostfwd_ref,
+                    "-device",
+                    config_loader.as_str(),
+                    "-device",
+                    modules_loader.as_str(),
                     "-kernel",
                 ]);
 
@@ -1891,10 +2190,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                     .status()?;
 
                 if !status.success() {
-                    return Err(Error::Config(format!(
-                        "QEMU exited with status {}",
-                        status
-                    )));
+                    return Err(Error::Config(format!("QEMU exited with status {}", status)));
                 }
             } else {
                 eprintln!("Use 'fluxor flash' for hardware targets");
@@ -1971,12 +2267,7 @@ fn cmd_flash(config_path: &PathBuf, verbose: bool) -> Result<()> {
             }
 
             if let Some(ref mp) = mount_point {
-                let dest = mp.join(
-                    result
-                        .output_path
-                        .file_name()
-                        .unwrap_or_default(),
-                );
+                let dest = mp.join(result.output_path.file_name().unwrap_or_default());
                 eprintln!(
                     "Copying {} -> {}",
                     result.output_path.display(),
@@ -1985,7 +2276,11 @@ fn cmd_flash(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 std::fs::copy(&result.output_path, &dest)?;
                 println!(
                     "\x1b[1;32mFlashed\x1b[0m {}",
-                    result.output_path.file_name().unwrap_or_default().to_string_lossy()
+                    result
+                        .output_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
                 );
             } else {
                 // Try picotool as fallback
@@ -1998,7 +2293,11 @@ fn cmd_flash(config_path: &PathBuf, verbose: bool) -> Result<()> {
                     Ok(status) if status.success() => {
                         println!(
                             "\x1b[1;32mFlashed\x1b[0m {} via picotool",
-                            result.output_path.file_name().unwrap_or_default().to_string_lossy()
+                            result
+                                .output_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
                         );
                     }
                     _ => {
@@ -2056,21 +2355,27 @@ fn cmd_flash(config_path: &PathBuf, verbose: bool) -> Result<()> {
 /// Sign a packed .fmod module with an Ed25519 seed, appending a v2 manifest
 /// carrying the signature + signer fingerprint. Writes either in place or to
 /// `output`.
-fn cmd_sign(input: &PathBuf, key_path: &PathBuf, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
+fn cmd_sign(
+    input: &PathBuf,
+    key_path: &PathBuf,
+    output: Option<&std::path::Path>,
+    verbose: bool,
+) -> Result<()> {
     use std::fs;
 
     let seed_bytes = fs::read(key_path)
         .map_err(|e| Error::Module(format!("read key {}: {}", key_path.display(), e)))?;
     if seed_bytes.len() != 32 {
         return Err(Error::Module(format!(
-            "key must be exactly 32 bytes, got {}", seed_bytes.len()
+            "key must be exactly 32 bytes, got {}",
+            seed_bytes.len()
         )));
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
 
-    let fmod = fs::read(input)
-        .map_err(|e| Error::Module(format!("read {}: {}", input.display(), e)))?;
+    let fmod =
+        fs::read(input).map_err(|e| Error::Module(format!("read {}: {}", input.display(), e)))?;
     use modules::MODULE_HEADER_SIZE;
     if fmod.len() < MODULE_HEADER_SIZE {
         return Err(Error::Module("fmod file too small".into()));
@@ -2084,12 +2389,14 @@ fn cmd_sign(input: &PathBuf, key_path: &PathBuf, output: Option<&std::path::Path
     let schema_size = u16::from_le_bytes([fmod[62], fmod[63]]) as usize;
     let manifest_size = u16::from_le_bytes([fmod[64], fmod[65]]) as usize;
 
-    let manifest_offset = MODULE_HEADER_SIZE + code_size + data_size + export_table_size + schema_size;
+    let manifest_offset =
+        MODULE_HEADER_SIZE + code_size + data_size + export_table_size + schema_size;
     if manifest_offset + manifest_size > fmod.len() {
         return Err(Error::Module("fmod truncated before manifest".into()));
     }
 
-    let mut manifest = manifest::Manifest::from_bytes(&fmod[manifest_offset..manifest_offset + manifest_size])?;
+    let mut manifest =
+        manifest::Manifest::from_bytes(&fmod[manifest_offset..manifest_offset + manifest_size])?;
 
     // Re-derive the integrity hash from the file (matches what the kernel
     // computes). Signature covers this hash.
@@ -2127,7 +2434,9 @@ fn cmd_sign(input: &PathBuf, key_path: &PathBuf, output: Option<&std::path::Path
 
     fn hex(b: &[u8]) -> String {
         let mut s = String::with_capacity(b.len() * 2);
-        for &x in b { s.push_str(&format!("{:02x}", x)); }
+        for &x in b {
+            s.push_str(&format!("{:02x}", x));
+        }
         s
     }
 
@@ -2137,8 +2446,12 @@ fn cmd_sign(input: &PathBuf, key_path: &PathBuf, output: Option<&std::path::Path
         println!("  signer_fp: {}", hex(&signer_fp));
     } else {
         let full = hex(&pk);
-        println!("\x1b[1;32mSigned\x1b[0m {} pubkey={}...{}",
-                 out_path.display(), &full[..8], &full[full.len() - 8..]);
+        println!(
+            "\x1b[1;32mSigned\x1b[0m {} pubkey={}...{}",
+            out_path.display(),
+            &full[..8],
+            &full[full.len() - 8..]
+        );
     }
 
     Ok(())

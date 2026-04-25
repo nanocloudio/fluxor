@@ -188,6 +188,82 @@ access = "exclusive"
 name with a parser error. This keeps the two surfaces from collapsing
 back into a single overloaded list.
 
+### Manifest schema — built-in module params (`[[params]]`)
+
+Built-in modules (those with `builtin = true`) declare their parameter
+schema directly in `manifest.toml`:
+
+```toml
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+[[ports]]
+name = "pixels"
+direction = "input"
+content_type = "ImageRaw"
+
+[[params]]
+name = "mode"
+type = "enum"
+values = ["file", "null", "window"]
+default = "file"
+
+[[params]]
+name = "width"
+type = "u32"
+default = 480
+range = [1, 4096]
+
+[[params]]
+name = "path"
+type = "str"
+required = true
+```
+
+Param types: `u8`, `u16`, `u32`, `str`, `enum`. Tags are auto-assigned
+in declaration order starting at 10 — reordering shifts the wire-side
+tags, so `tools/tests/builtin_param_layout.rs` pins each built-in's
+expected order; reorder the manifest and the test, and the matching
+constants in `src/platform/linux/<name>.rs`, together.
+
+Validation runs at config-build time (`fluxor build`):
+
+- **Unknown param**: hard error with a "did you mean…" hint
+  (Levenshtein-based). The packer's flattening rules are mirrored, so
+  nested objects (`eq: { low_freq: 100 }`), the transparent
+  `params: { ... }` wrapper, and `_envelope`/`_config`/`_settings`/
+  `_params` suffix-stripping all resolve correctly.
+- **Range**: `range = [min, max]` checks numeric YAML values;
+  out-of-range values fail the build with the manifest's bounds.
+- **Required**: `required = true` makes YAML omission a hard error —
+  use this for params with no safe default (e.g.
+  `host_asset_source.path`). Mutually exclusive with `default`.
+- **Schema source-of-truth boundary**: `[[params]]` is rejected on
+  non-builtin manifests at parse time. PIC modules carry their schema
+  in the binary via `define_params!`; declaring it again in the
+  manifest would create two sources of truth for the same wire layout.
+
+The wire format is identical to `.fmod` modules — same TLV stream
+(`[0xFE][0x01][len_lo][len_hi][tag][len][value]…`). The tool packs
+manifest defaults explicitly so every declared param shows up in the
+TLV; built-ins don't re-encode defaults in code.
+
+#### Runtime feature cross-check
+
+`fluxor build` (linux family) queries the local `fluxor-linux` binary
+via `--print-features` and rejects YAML that asks for an optional
+backend the binary doesn't provide. Currently checked:
+
+| YAML                                | Required feature  |
+|-------------------------------------|-------------------|
+| `type = "host_image_codec"`         | `host-image`      |
+| `linux_display.mode = "window"`     | `host-window`     |
+| `linux_audio.mode = "playback"`     | `host-playback`   |
+
+The error message names the exact `cargo build` invocation that adds
+the missing feature.
+
 ## Platform layer — not public
 
 Chip-specific register bridges and layout constants (`platform::rp::*`,
@@ -277,8 +353,11 @@ explicitly rather than inherited by default.
 
 ## Module categories
 
-Modules live in one of three directories. The tree enforces where they
-are *allowed* to reach, not what they *happen* to touch.
+Modules live in one of four trees. The tree enforces where they are
+*allowed* to reach, not what they *happen* to touch. `drivers/`,
+`foundation/`, and `app/` hold PIC modules loaded at runtime as
+`.fmod` artefacts; `builtin/<platform>/` holds platform-bound
+built-ins compiled directly into the kernel binary.
 
 ### Drivers — `modules/drivers/`
 
@@ -312,6 +391,38 @@ modules must not take this shape.
 Domain-specific compositions. Free to consume any foundation or
 driver output over channels. Examples: `codec`, `drum`, `effects`,
 `mixer`, `rtp`, `sequencer`, `synth`, `voip`.
+
+### Built-in — `modules/builtin/<platform>/<name>/`
+
+Manifest-only descriptors for kernel-resident built-ins — modules
+whose Rust code is linked into the kernel binary rather than shipped
+as a `.fmod`. Each subdirectory holds `manifest.toml` (read by the
+config tool for validation and TLV packing) and `README.md`. The
+implementation lives under `src/platform/<platform>/<name>.rs`.
+
+The platform subdirectory makes the binding explicit:
+
+| Subtree                 | Binding                                                                                  | Examples                                                |
+|-------------------------|------------------------------------------------------------------------------------------|---------------------------------------------------------|
+| `builtin/linux/`        | Linux-host APIs (winit, CPAL/ALSA, libc syscalls, Wayland/X11)                           | `linux_net`, `linux_display`, `linux_audio`             |
+| `builtin/host/`         | Host-OS-agnostic — pure Rust on `std` plus crates that work on any host (incl. wasm)     | `host_asset_source`, `host_image_codec`                 |
+| `builtin/wasm/` *(future)* | Browser APIs (Canvas, WebAudio, DOM, fetch, IndexedDB) when a wasm-hosted platform lands | `canvas_display`, `web_audio`, `dom_input`, `fetch_asset` |
+| `builtin/qemu/` *(future, rare)* | QEMU-only pseudo-devices that don't fit as a regular driver                          | (typically empty — most QEMU-only code is a driver)     |
+
+Built-in vs PIC is a **deployment** distinction: built-ins compile
+into the kernel because their platform lacks a PIC loader (wasm) or
+sits below it (Linux runtime sinks). Selection is orthogonal —
+`stacks/*.toml` route logical surfaces (`display`, `audio`, `net`) to
+either a PIC driver or a built-in via board/family/platform match
+keys, with no per-stack-file knowledge of the deployment shape. The
+multi-platform model is documented in
+`.context/stress_test_browser_hosted_fluxor_apps.md`.
+
+Built-in manifests carry `builtin = true`. Their `[[params]]` schema
+is read by the config tool and packed into the same TLV stream PIC
+modules use; the kernel's deserialiser is identical for both kinds.
+See "Manifest schema — built-in module params" above for the schema
+language.
 
 ## What the kernel is
 

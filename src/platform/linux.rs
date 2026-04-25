@@ -65,7 +65,22 @@ fn parse_args() -> CliArgs {
                 eprintln!("Options:");
                 eprintln!("  -c, --config <path>   Path to config.bin");
                 eprintln!("  -m, --modules <path>  Path to modules.bin");
+                eprintln!("      --print-features  Print compiled-in host-* features and exit");
                 eprintln!("  -h, --help            Show this help");
+                process::exit(0);
+            }
+            "--print-features" => {
+                // Newline-separated feature list. The tool's `fluxor
+                // run` (config.rs::validate_runtime_features) parses
+                // this to reject configs that need a feature absent
+                // from the binary, e.g. `linux_display.mode = "window"`
+                // without `--features host-window`.
+                #[cfg(feature = "host-window")]
+                println!("host-window");
+                #[cfg(feature = "host-playback")]
+                println!("host-playback");
+                #[cfg(feature = "host-image")]
+                println!("host-image");
                 process::exit(0);
             }
             other => {
@@ -89,6 +104,11 @@ fn parse_args() -> CliArgs {
 }
 
 include!("linux/providers.rs");
+include!("linux/builtin_params.rs");
+include!("linux/host_asset_source.rs");
+include!("linux/linux_display.rs");
+include!("linux/linux_audio.rs");
+include!("linux/host_image_codec.rs");
 
 // ============================================================================
 // Entry point
@@ -163,15 +183,19 @@ fn main() {
     // inserts `_tee` / `_merge` for fan groups, allocates channels, and
     // populates port tables.
     loader::reset_state_arena();
-    if let Err(msg) = unsafe {
-        scheduler::populate_static_state(config_data.as_ptr(), modules_ptr as *const u8)
-    } {
+    if let Err(msg) =
+        unsafe { scheduler::populate_static_state(config_data.as_ptr(), modules_ptr as *const u8) }
+    {
         eprintln!("error: {}", msg);
         process::exit(1);
     }
 
     let cfg_header_tick_us = unsafe { scheduler::static_config().header.tick_us as u32 };
-    let tick_us = if cfg_header_tick_us > 0 { cfg_header_tick_us } else { 1000 };
+    let tick_us = if cfg_header_tick_us > 0 {
+        cfg_header_tick_us
+    } else {
+        1000
+    };
     log::info!("[loader] module table loaded, tick_us={}", tick_us);
 
     let (module_list, module_count) = match scheduler::prepare_graph() {
@@ -203,16 +227,41 @@ fn main() {
             let net_in_ch = scheduler::get_module_port(module_idx, 0, 0);
             let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
             let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            let state = m.state.as_mut_ptr();
-            unsafe {
-                core::ptr::write(state as *mut i32, net_in_ch);
-                core::ptr::write(state.add(4) as *mut i32, net_out_ch);
-            }
+            install_state(&mut m, Box::new(LinuxNetState::new(net_in_ch, net_out_ch)));
             scheduler::store_builtin_module(module_idx, m);
             log::info!(
                 "[inst] module {} = linux_net (built-in) net_in={} net_out={}",
                 module_idx, net_in_ch, net_out_ch
             );
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == HOST_ASSET_SOURCE_HASH {
+            let m = build_host_asset_source(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_DISPLAY_HASH {
+            let m = build_linux_display(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_AUDIO_HASH {
+            let m = build_linux_audio(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        #[cfg(feature = "host-image")]
+        if entry.name_hash == HOST_IMAGE_CODEC_HASH {
+            let m = build_host_image_codec(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;
         }

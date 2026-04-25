@@ -33,10 +33,27 @@ pub const SIGNATURE_BLOCK_SIZE: usize = 96;
 // ── Content type string→u8 mapping (matches config.rs CONTENT_TYPES) ────────
 
 const CONTENT_TYPES: &[&str] = &[
-    "OctetStream", "Cbor", "Json", "AudioPcm", "AudioOpus", "AudioMp3", "AudioAac",
-    "TextPlain", "TextHtml", "ImageRaw", "ImageJpeg", "ImagePng",
-    "MeshEvent", "MeshCommand", "MeshState", "MeshHandle", "InputEvent", "GestureMatch",
-    "FmpMessage", "EthernetFrame", "HciMessage",
+    "OctetStream",
+    "Cbor",
+    "Json",
+    "AudioPcm",
+    "AudioOpus",
+    "AudioMp3",
+    "AudioAac",
+    "TextPlain",
+    "TextHtml",
+    "ImageRaw",
+    "ImageJpeg",
+    "ImagePng",
+    "MeshEvent",
+    "MeshCommand",
+    "MeshState",
+    "MeshHandle",
+    "InputEvent",
+    "GestureMatch",
+    "FmpMessage",
+    "EthernetFrame",
+    "HciMessage",
 ];
 
 fn content_type_from_str(s: &str) -> Result<u8> {
@@ -69,34 +86,32 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 /// list instead.
 fn contract_id_from_name(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
-        "gpio"               => Ok(0x01),
-        "spi"                => Ok(0x02),
-        "i2c"                => Ok(0x03),
-        "pio"                => Ok(0x04),
-        "channel"            => Ok(0x05),
-        "timer"              => Ok(0x06),
-        "platform_nic_ring"  => Ok(0x07),
-        "platform_dma"       => Ok(0x08),
-        "fs"                 => Ok(0x09),
-        "buffer"             => Ok(0x0A),
-        "event"              => Ok(0x0B),
-        "uart"               => Ok(0x0D),
-        "adc"                => Ok(0x0E),
-        "pwm"                => Ok(0x0F),
-        "platform_dma_fd"    => Ok(0x11),
-        "pcie_device"        => Ok(0x12),
+        "gpio" => Ok(0x01),
+        "spi" => Ok(0x02),
+        "i2c" => Ok(0x03),
+        "pio" => Ok(0x04),
+        "channel" => Ok(0x05),
+        "timer" => Ok(0x06),
+        "platform_nic_ring" => Ok(0x07),
+        "platform_dma" => Ok(0x08),
+        "fs" => Ok(0x09),
+        "buffer" => Ok(0x0A),
+        "event" => Ok(0x0B),
+        "uart" => Ok(0x0D),
+        "adc" => Ok(0x0E),
+        "pwm" => Ok(0x0F),
+        "platform_dma_fd" => Ok(0x11),
+        "pcie_device" => Ok(0x12),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
-        "internal" | "system" | "reconfigure" | "flash_raw"
-        | "backing_provider" | "platform_raw" | "monitor" | "bridge" => {
-            Err(Error::Module(format!(
-                "`{}` is a permission, not a contract. Declare it in the \
+        "internal" | "system" | "reconfigure" | "flash_raw" | "backing_provider"
+        | "platform_raw" | "monitor" | "bridge" => Err(Error::Module(format!(
+            "`{}` is a permission, not a contract. Declare it in the \
                  top-level `permissions = [\"{}\", ...]` list, not under \
                  `[[resources]]`. See docs/architecture/abi_layers.md.",
-                s, s
-            )))
-        }
+            s, s
+        ))),
         _ => Err(Error::Module(format!(
             "unknown contract name: {} — expected one of: gpio, spi, i2c, pio, \
              uart, adc, pwm, fs, platform_nic_ring, platform_dma, platform_dma_fd, \
@@ -194,9 +209,15 @@ fn parse_semver(s: &str) -> Result<(u8, u8, u8)> {
     if parts.len() != 3 {
         return Err(Error::Module(format!("invalid semver: {}", s)));
     }
-    let major: u8 = parts[0].parse().map_err(|_| Error::Module(format!("invalid semver major: {}", s)))?;
-    let minor: u8 = parts[1].parse().map_err(|_| Error::Module(format!("invalid semver minor: {}", s)))?;
-    let patch: u8 = parts[2].parse().map_err(|_| Error::Module(format!("invalid semver patch: {}", s)))?;
+    let major: u8 = parts[0]
+        .parse()
+        .map_err(|_| Error::Module(format!("invalid semver major: {}", s)))?;
+    let minor: u8 = parts[1]
+        .parse()
+        .map_err(|_| Error::Module(format!("invalid semver minor: {}", s)))?;
+    let patch: u8 = parts[2]
+        .parse()
+        .map_err(|_| Error::Module(format!("invalid semver patch: {}", s)))?;
     Ok((major, minor, patch))
 }
 
@@ -265,35 +286,85 @@ pub struct ManifestPermissions {
 /// Permission category bits. Keep in sync with the kernel's
 /// `permission` module in `src/kernel/syscalls.rs`.
 pub mod permission {
-    pub const RECONFIGURE:       u8 = 1 << 0; // graph slot commit, boot counter, FMP routing
-    pub const FLASH_RAW:         u8 = 1 << 1; // flash ERASE / PROGRAM
-    pub const BACKING_PROVIDER:  u8 = 1 << 2; // paged-arena / backing-provider registration
-    pub const PLATFORM_RAW:      u8 = 1 << 3; // MMIO/DMA/PCIe/SMMU/NIC, raw peripheral register bridges
-    pub const MONITOR:           u8 = 1 << 4; // fault monitor BIND/WAIT/ACK/REPORT/RAISE
-    pub const BRIDGE:            u8 = 1 << 5; // cross-domain / cross-core dispatch
+    pub const RECONFIGURE: u8 = 1 << 0; // graph slot commit, boot counter, FMP routing
+    pub const FLASH_RAW: u8 = 1 << 1; // flash ERASE / PROGRAM
+    pub const BACKING_PROVIDER: u8 = 1 << 2; // paged-arena / backing-provider registration
+    pub const PLATFORM_RAW: u8 = 1 << 3; // MMIO/DMA/PCIe/SMMU/NIC, raw peripheral register bridges
+    pub const MONITOR: u8 = 1 << 4; // fault monitor BIND/WAIT/ACK/REPORT/RAISE
+    pub const BRIDGE: u8 = 1 << 5; // cross-domain / cross-core dispatch
 
     pub fn from_name(s: &str) -> Option<u8> {
         match s {
-            "reconfigure"       => Some(RECONFIGURE),
-            "flash_raw"         => Some(FLASH_RAW),
-            "backing_provider"  => Some(BACKING_PROVIDER),
-            "platform_raw"      => Some(PLATFORM_RAW),
-            "monitor"           => Some(MONITOR),
-            "bridge"            => Some(BRIDGE),
+            "reconfigure" => Some(RECONFIGURE),
+            "flash_raw" => Some(FLASH_RAW),
+            "backing_provider" => Some(BACKING_PROVIDER),
+            "platform_raw" => Some(PLATFORM_RAW),
+            "monitor" => Some(MONITOR),
+            "bridge" => Some(BRIDGE),
             _ => None,
         }
     }
 
     pub fn names(bits: u8) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if bits & RECONFIGURE      != 0 { out.push("reconfigure"); }
-        if bits & FLASH_RAW        != 0 { out.push("flash_raw"); }
-        if bits & BACKING_PROVIDER != 0 { out.push("backing_provider"); }
-        if bits & PLATFORM_RAW     != 0 { out.push("platform_raw"); }
-        if bits & MONITOR          != 0 { out.push("monitor"); }
-        if bits & BRIDGE           != 0 { out.push("bridge"); }
+        if bits & RECONFIGURE != 0 {
+            out.push("reconfigure");
+        }
+        if bits & FLASH_RAW != 0 {
+            out.push("flash_raw");
+        }
+        if bits & BACKING_PROVIDER != 0 {
+            out.push("backing_provider");
+        }
+        if bits & PLATFORM_RAW != 0 {
+            out.push("platform_raw");
+        }
+        if bits & MONITOR != 0 {
+            out.push("monitor");
+        }
+        if bits & BRIDGE != 0 {
+            out.push("bridge");
+        }
         out
     }
+}
+
+/// Param type categories declared in `[[params]]`. Matches the wire
+/// types used by the runtime TLV packer in `tools/src/schema.rs`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ManifestParamType {
+    U8,
+    U16,
+    U32,
+    Str,
+    Enum,
+}
+
+/// A single `[[params]]` entry from a built-in's `manifest.toml`. The
+/// tag is auto-assigned in declaration order (10..) so manifest authors
+/// don't have to. Defaults are stored as 32-bit unsigned integers when
+/// numeric, or as a string for `str`/`enum`.
+#[derive(Debug, Clone)]
+pub struct ManifestParam {
+    /// TLV tag (auto-assigned: first param = 10, second = 11, ...).
+    /// Tags 0xF0..0xFF are reserved for protection/policy metadata; we
+    /// stay well below.
+    pub tag: u8,
+    pub name: String,
+    pub ptype: ManifestParamType,
+    /// Numeric default for U8/U16/U32; ignored for Str/Enum.
+    pub default_num: u32,
+    /// String default for Str; enum-name default for Enum.
+    pub default_str: String,
+    /// Enum: list of (name, value) mappings. Values are u8.
+    pub enum_values: Vec<(String, u8)>,
+    /// Optional inclusive range for numeric params: [min, max].
+    pub range: Option<(u32, u32)>,
+    /// When true, the YAML must specify this param — build fails if
+    /// missing. Equivalent to "no safe default exists." Set on params
+    /// like `host_asset_source.path` where falling back to a default
+    /// would silently misconfigure the graph.
+    pub required: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +392,10 @@ pub struct Manifest {
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
     pub builtin: bool,
+    /// Built-in parameter declarations from `[[params]]` (toml-only).
+    /// `.fmod` modules carry their schema embedded in the binary; built-ins
+    /// declare it here so the config tool can validate YAML and pack TLV.
+    pub params: Vec<ManifestParam>,
 }
 
 impl Default for Manifest {
@@ -339,6 +414,7 @@ impl Default for Manifest {
             commands: CommandVocabulary::default(),
             provides: Vec::new(),
             builtin: false,
+            params: Vec::new(),
         }
     }
 }
@@ -368,7 +444,10 @@ impl Manifest {
     /// Look up a port by name. Returns (direction, index, content_type).
     pub fn find_port_by_name(&self, name: &str) -> Option<(u8, u8, u8)> {
         self.ports.iter().find_map(|p| {
-            p.name.as_deref().filter(|n| *n == name).map(|_| (p.direction, p.index, p.content_type))
+            p.name
+                .as_deref()
+                .filter(|n| *n == name)
+                .map(|_| (p.direction, p.index, p.content_type))
         })
     }
 
@@ -383,6 +462,53 @@ impl Manifest {
         })
     }
 
+    /// Look up a module's source-tree manifest by type name. Returns
+    /// `Ok(None)` if nothing matches; `Err` only on a parse failure of
+    /// an existing file. Results are cached for the lifetime of the
+    /// process — each module type is parsed at most once per
+    /// invocation, including negative lookups.
+    ///
+    /// Search paths cover both PIC modules (one of `drivers/`,
+    /// `foundation/`, `app/`, or the catch-all `modules/`) and
+    /// kernel-resident built-ins (under
+    /// `modules/builtin/<platform>/<name>/`). See
+    /// `docs/architecture/abi_layers.md` for what each tree is for.
+    pub fn from_source_tree(module_type: &str) -> Result<Option<Self>> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Option<Manifest>>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Some(hit) = cache.lock().unwrap().get(module_type) {
+            return Ok(hit.clone());
+        }
+        const SOURCE_DIRS: &[&str] = &[
+            "modules/drivers",
+            "modules/foundation",
+            "modules/app",
+            "modules/builtin/linux",
+            "modules/builtin/host",
+            "modules/builtin/wasm",
+            "modules/builtin/qemu",
+            "modules",
+        ];
+        let mut found: Option<Manifest> = None;
+        for dir in SOURCE_DIRS {
+            let p = std::path::Path::new(dir)
+                .join(module_type)
+                .join("manifest.toml");
+            if p.exists() {
+                let m = Manifest::from_toml(&p)?;
+                found = Some(m);
+                break;
+            }
+        }
+        cache
+            .lock()
+            .unwrap()
+            .insert(module_type.to_string(), found.clone());
+        Ok(found)
+    }
+
     /// Parse manifest from a TOML file.
     pub fn from_toml(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -393,7 +519,8 @@ impl Manifest {
         let (major, minor, patch) = parse_semver(&toml_val.version)?;
         let module_version = encode_semver(major, minor, patch);
 
-        let hardware_targets = toml_val.hardware_targets
+        let hardware_targets = toml_val
+            .hardware_targets
             .map(|t| hardware_targets_from_list(&t))
             .unwrap_or(0x01);
 
@@ -415,13 +542,12 @@ impl Manifest {
             if let Some(ref name) = p.name {
                 if name == "in" || name == "out" || name == "ctrl" {
                     return Err(Error::Module(format!(
-                        "port name '{}' is a reserved word", name
+                        "port name '{}' is a reserved word",
+                        name
                     )));
                 }
                 if !port_names.insert(name.clone()) {
-                    return Err(Error::Module(format!(
-                        "duplicate port name '{}'", name
-                    )));
+                    return Err(Error::Module(format!("duplicate port name '{}'", name)));
                 }
             }
 
@@ -439,7 +565,13 @@ impl Manifest {
                 idx
             };
 
-            ports.push(PortSpec { direction, content_type, flags, name: p.name, index });
+            ports.push(PortSpec {
+                direction,
+                content_type,
+                flags,
+                name: p.name,
+                index,
+            });
         }
 
         let mut resources = Vec::new();
@@ -447,7 +579,11 @@ impl Manifest {
             let cid = contract_id_from_name(&r.device_class)?;
             let access_mode = access_mode_from_str(&r.access)?;
             let instance = r.instance.unwrap_or(0xFF);
-            resources.push(ResourceClaim { device_class: cid, access_mode, instance });
+            resources.push(ResourceClaim {
+                device_class: cid,
+                access_mode,
+                instance,
+            });
         }
 
         let mut permissions = ManifestPermissions::default();
@@ -474,7 +610,10 @@ impl Manifest {
             } else {
                 0
             };
-            dependencies.push(Dependency { name_hash, min_version });
+            dependencies.push(Dependency {
+                name_hash,
+                min_version,
+            });
         }
 
         let commands = if let Some(cmds) = toml_val.commands {
@@ -490,6 +629,152 @@ impl Manifest {
 
         let builtin = toml_val.builtin.unwrap_or(false);
 
+        let raw_params = toml_val.params.unwrap_or_default();
+        // `[[params]]` belongs to built-ins. PIC (`.fmod`) modules carry
+        // their schema in the binary via the `define_params!` macro;
+        // declaring it again in the manifest would create two sources
+        // of truth for the same wire layout.
+        if !builtin && !raw_params.is_empty() {
+            return Err(Error::Module(format!(
+                "[[params]] is only valid on built-in modules (`builtin = true`). \
+                 PIC modules embed their schema via `define_params!`. \
+                 Got {} param(s) on a non-builtin manifest.",
+                raw_params.len(),
+            )));
+        }
+
+        let mut params: Vec<ManifestParam> = Vec::new();
+        for (i, p) in raw_params.into_iter().enumerate() {
+            let tag = 10u8
+                .checked_add(i as u8)
+                .ok_or_else(|| Error::Module("too many [[params]] entries (max 245)".into()))?;
+            let ptype = match p.ptype.as_str() {
+                "u8" => ManifestParamType::U8,
+                "u16" => ManifestParamType::U16,
+                "u32" => ManifestParamType::U32,
+                "str" | "string" => ManifestParamType::Str,
+                "enum" => ManifestParamType::Enum,
+                other => {
+                    return Err(Error::Module(format!(
+                        "param '{}': unknown type '{}' (expected: u8, u16, u32, str, enum)",
+                        p.name, other,
+                    )));
+                }
+            };
+
+            // Enum: values list is required; each name maps to its index.
+            let mut enum_values: Vec<(String, u8)> = Vec::new();
+            if ptype == ManifestParamType::Enum {
+                let vals = p.values.as_ref().ok_or_else(|| {
+                    Error::Module(format!(
+                        "param '{}': enum requires `values = [...]`",
+                        p.name
+                    ))
+                })?;
+                if vals.is_empty() || vals.len() > 256 {
+                    return Err(Error::Module(format!(
+                        "param '{}': enum needs 1..=256 values",
+                        p.name
+                    )));
+                }
+                for (j, v) in vals.iter().enumerate() {
+                    enum_values.push((v.clone(), j as u8));
+                }
+            } else if p.values.is_some() {
+                return Err(Error::Module(format!(
+                    "param '{}': `values` only applies to type='enum'",
+                    p.name
+                )));
+            }
+
+            // Resolve default. Numeric types accept integers; str/enum
+            // accept strings (enum default must be one of `values`).
+            let mut default_num: u32 = 0;
+            let mut default_str = String::new();
+            match (&ptype, p.default.as_ref()) {
+                (
+                    ManifestParamType::U8 | ManifestParamType::U16 | ManifestParamType::U32,
+                    Some(v),
+                ) => {
+                    let n = v.as_integer().ok_or_else(|| {
+                        Error::Module(format!("param '{}': default must be an integer", p.name))
+                    })?;
+                    if n < 0 {
+                        return Err(Error::Module(format!(
+                            "param '{}': default must be non-negative",
+                            p.name
+                        )));
+                    }
+                    default_num = n as u32;
+                }
+                (ManifestParamType::Str, Some(v)) => {
+                    let s = v.as_str().ok_or_else(|| {
+                        Error::Module(format!("param '{}': default must be a string", p.name))
+                    })?;
+                    default_str = s.to_string();
+                }
+                (ManifestParamType::Enum, Some(v)) => {
+                    let s = v.as_str().ok_or_else(|| {
+                        Error::Module(format!(
+                            "param '{}': default must be one of {:?}",
+                            p.name,
+                            enum_values.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                        ))
+                    })?;
+                    let (_, val) = enum_values.iter().find(|(n, _)| n == s).ok_or_else(|| {
+                        Error::Module(format!(
+                            "param '{}': default '{}' is not in values {:?}",
+                            p.name,
+                            s,
+                            enum_values.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                        ))
+                    })?;
+                    default_num = *val as u32;
+                    default_str = s.to_string();
+                }
+                (_, None) => {} // no default — zero / empty
+            }
+
+            // Validate range bounds.
+            let range = if let Some([min, max]) = p.range {
+                if matches!(ptype, ManifestParamType::Str | ManifestParamType::Enum) {
+                    return Err(Error::Module(format!(
+                        "param '{}': `range` only applies to numeric types",
+                        p.name
+                    )));
+                }
+                if min > max {
+                    return Err(Error::Module(format!(
+                        "param '{}': range min ({}) > max ({})",
+                        p.name, min, max
+                    )));
+                }
+                Some((min, max))
+            } else {
+                None
+            };
+
+            // A `required` param must not also carry a `default` — that
+            // would be contradictory. Catch the schema error early.
+            if p.required && p.default.is_some() {
+                return Err(Error::Module(format!(
+                    "param '{}': `required = true` and `default` are mutually exclusive",
+                    p.name
+                )));
+            }
+
+            params.push(ManifestParam {
+                tag,
+                name: p.name,
+                ptype,
+                default_num,
+                default_str,
+                enum_values,
+                range,
+                required: p.required,
+            });
+        }
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -504,6 +789,7 @@ impl Manifest {
             commands,
             provides,
             builtin,
+            params,
         })
     }
 
@@ -517,7 +803,11 @@ impl Manifest {
             + self.resources.len() * 4
             + self.dependencies.len() * 8
             + if has_integrity { 32 } else { 0 }
-            + if has_signature { SIGNATURE_BLOCK_SIZE } else { 0 };
+            + if has_signature {
+                SIGNATURE_BLOCK_SIZE
+            } else {
+                0
+            };
         let total = MANIFEST_HEADER_SIZE + var_size;
         let mut buf = Vec::with_capacity(total);
 
@@ -533,8 +823,7 @@ impl Manifest {
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
         buf.extend_from_slice(&self.state_size_hint.to_le_bytes());
         // byte 14: bit 0 = has_integrity, bit 1 = has_signature.
-        let flags = (if has_integrity { 1 } else { 0 })
-            | (if has_signature { 2 } else { 0 });
+        let flags = (if has_integrity { 1 } else { 0 }) | (if has_signature { 2 } else { 0 });
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
@@ -585,21 +874,24 @@ impl Manifest {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < MANIFEST_HEADER_SIZE {
             return Err(Error::Module(format!(
-                "manifest too small: {} bytes", data.len()
+                "manifest too small: {} bytes",
+                data.len()
             )));
         }
 
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         if magic != MANIFEST_MAGIC {
             return Err(Error::Module(format!(
-                "invalid manifest magic: 0x{:08x}", magic
+                "invalid manifest magic: 0x{:08x}",
+                magic
             )));
         }
 
         let version = data[4];
         if version != 1 && version != 2 {
             return Err(Error::Module(format!(
-                "unsupported manifest version: {}", version
+                "unsupported manifest version: {}",
+                version
             )));
         }
 
@@ -619,11 +911,17 @@ impl Manifest {
             + resource_count * 4
             + dependency_count * 8
             + if has_integrity { 32 } else { 0 }
-            + if has_signature { SIGNATURE_BLOCK_SIZE } else { 0 };
+            + if has_signature {
+                SIGNATURE_BLOCK_SIZE
+            } else {
+                0
+            };
 
         if data.len() < expected_size {
             return Err(Error::Module(format!(
-                "manifest truncated: {} bytes, expected {}", data.len(), expected_size
+                "manifest truncated: {} bytes, expected {}",
+                data.len(),
+                expected_size
             )));
         }
 
@@ -659,10 +957,16 @@ impl Manifest {
         let mut dependencies = Vec::with_capacity(dependency_count);
         for _ in 0..dependency_count {
             let name_hash = u32::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
             ]);
             let min_version = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
-            dependencies.push(Dependency { name_hash, min_version });
+            dependencies.push(Dependency {
+                name_hash,
+                min_version,
+            });
             offset += 8;
         }
 
@@ -692,7 +996,9 @@ impl Manifest {
             state_size_hint,
             ports,
             resources,
-            permissions: ManifestPermissions { bits: permissions_bits },
+            permissions: ManifestPermissions {
+                bits: permissions_bits,
+            },
             dependencies,
             integrity_hash,
             signature,
@@ -700,6 +1006,7 @@ impl Manifest {
             commands: CommandVocabulary::default(),
             provides: Vec::new(), // not serialized in binary format
             builtin: false,
+            params: Vec::new(), // toml-only, not serialized
         })
     }
 
@@ -720,7 +1027,11 @@ impl Manifest {
         if !self.ports.is_empty() {
             lines.push("  ports:".into());
             for p in &self.ports {
-                let req = if p.flags & 0x01 != 0 { " (required)" } else { "" };
+                let req = if p.flags & 0x01 != 0 {
+                    " (required)"
+                } else {
+                    ""
+                };
                 let name_str = p.name.as_deref().unwrap_or("-");
                 lines.push(format!(
                     "    {}[{}] {} ({}){}",
@@ -770,7 +1081,10 @@ impl Manifest {
         if !self.commands.accepts.is_empty() || !self.commands.emits.is_empty() {
             lines.push("  commands:".into());
             if !self.commands.accepts.is_empty() {
-                lines.push(format!("    accepts: [{}]", self.commands.accepts.join(", ")));
+                lines.push(format!(
+                    "    accepts: [{}]",
+                    self.commands.accepts.join(", ")
+                ));
             }
             if !self.commands.emits.is_empty() {
                 lines.push(format!("    emits: [{}]", self.commands.emits.join(", ")));
@@ -813,6 +1127,30 @@ struct TomlManifest {
     provides: Option<Vec<String>>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,
+    /// `[[params]]` declarations — built-in modules only. PIC modules
+    /// embed schema in their .fmod and these are ignored.
+    params: Option<Vec<TomlParam>>,
+}
+
+#[derive(Deserialize)]
+struct TomlParam {
+    name: String,
+    /// One of: u8, u16, u32, str, enum
+    #[serde(rename = "type")]
+    ptype: String,
+    /// TOML may parse the default as int, string, or enum-name; capture
+    /// raw and resolve in `Manifest::from_toml`.
+    default: Option<toml::Value>,
+    /// Required for `type = "enum"`: list of legal value names. Each maps
+    /// to its index (0..len-1) on the wire.
+    values: Option<Vec<String>>,
+    /// Optional inclusive `[min, max]` for numeric types.
+    range: Option<[u32; 2]>,
+    /// `required = true` makes YAML omission a build error. Implies no
+    /// safe default exists for this param — falling back would
+    /// silently misconfigure the graph.
+    #[serde(default)]
+    required: bool,
 }
 
 #[derive(Deserialize)]
@@ -873,9 +1211,22 @@ mod tests {
     #[test]
     fn manifest_with_integrity_roundtrip() {
         let mut m = Manifest::default();
-        m.ports.push(PortSpec { direction: 0, content_type: 3, flags: 1, name: None, index: 0 });
-        m.resources.push(ResourceClaim { device_class: 0x04, access_mode: 2, instance: 0xFF });
-        m.dependencies.push(Dependency { name_hash: 0x12345678, min_version: encode_semver(1, 0, 0) });
+        m.ports.push(PortSpec {
+            direction: 0,
+            content_type: 3,
+            flags: 1,
+            name: None,
+            index: 0,
+        });
+        m.resources.push(ResourceClaim {
+            device_class: 0x04,
+            access_mode: 2,
+            instance: 0xFF,
+        });
+        m.dependencies.push(Dependency {
+            name_hash: 0x12345678,
+            min_version: encode_semver(1, 0, 0),
+        });
         m.integrity_hash = Some([0xAB; 32]);
 
         let bytes = m.to_bytes();
@@ -892,8 +1243,124 @@ mod tests {
     #[test]
     fn required_caps_mask() {
         let mut m = Manifest::default();
-        m.resources.push(ResourceClaim { device_class: 0x01, access_mode: 0, instance: 0xFF }); // GPIO
-        m.resources.push(ResourceClaim { device_class: 0x04, access_mode: 2, instance: 0xFF }); // PIO
+        m.resources.push(ResourceClaim {
+            device_class: 0x01,
+            access_mode: 0,
+            instance: 0xFF,
+        }); // GPIO
+        m.resources.push(ResourceClaim {
+            device_class: 0x04,
+            access_mode: 2,
+            instance: 0xFF,
+        }); // PIO
         assert_eq!(m.required_caps_mask().unwrap(), (1 << 1) | (1 << 4));
+    }
+
+    fn parse_toml(src: &str) -> Result<Manifest> {
+        // Use a unique scratch path per call so parallel tests don't
+        // race on the same file.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fluxor-manifest-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.toml");
+        std::fs::write(&path, src).unwrap();
+        Manifest::from_toml(&path)
+    }
+
+    #[test]
+    fn rejects_params_on_non_builtin_manifest() {
+        let src = r#"
+version = "1.0.0"
+hardware_targets = ["linux"]
+
+[[ports]]
+name = "stream"
+direction = "output"
+content_type = "OctetStream"
+
+[[params]]
+name = "x"
+type = "u32"
+default = 1
+"#;
+        let err = parse_toml(src).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("[[params]] is only valid on built-in modules"),
+            "unexpected message: {msg}",
+        );
+    }
+
+    #[test]
+    fn accepts_params_on_builtin_manifest() {
+        let src = r#"
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+[[ports]]
+name = "stream"
+direction = "output"
+content_type = "OctetStream"
+
+[[params]]
+name = "width"
+type = "u32"
+default = 480
+range = [1, 4096]
+
+[[params]]
+name = "scale_mode"
+type = "enum"
+values = ["fit", "stretch"]
+default = "fit"
+
+[[params]]
+name = "path"
+type = "str"
+required = true
+"#;
+        let m = parse_toml(src).expect("parse");
+        assert!(m.builtin);
+        assert_eq!(m.params.len(), 3);
+        // Tag auto-assignment starts at 10 in declaration order.
+        assert_eq!(m.params[0].tag, 10);
+        assert_eq!(m.params[1].tag, 11);
+        assert_eq!(m.params[2].tag, 12);
+        // Range honored.
+        assert_eq!(m.params[0].range, Some((1, 4096)));
+        // Enum value table.
+        assert_eq!(m.params[1].enum_values.len(), 2);
+        assert_eq!(m.params[1].enum_values[0].1, 0); // fit -> 0
+        assert_eq!(m.params[1].enum_values[1].1, 1); // stretch -> 1
+        assert_eq!(m.params[1].default_num, 0); // fit
+        // required honored.
+        assert!(m.params[2].required);
+        assert!(!m.params[0].required);
+    }
+
+    #[test]
+    fn rejects_required_with_default() {
+        let src = r#"
+version = "1.0.0"
+builtin = true
+
+[[params]]
+name = "path"
+type = "str"
+default = "/tmp/foo"
+required = true
+"#;
+        let err = parse_toml(src).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("mutually exclusive"),
+            "unexpected: {msg}"
+        );
     }
 }
