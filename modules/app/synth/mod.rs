@@ -597,6 +597,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 v.freq_inc = new_freq_inc;
                                 v.target_freq_inc = new_freq_inc;
                                 v.glide_rate = 0;
+                                v.phase = 0;
+                                v.sub_phase = 0;
+                                v.filter_low = 0;
+                                v.filter_band = 0;
                             }
 
                             v.note_on = 1;

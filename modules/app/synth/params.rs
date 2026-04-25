@@ -5,25 +5,31 @@
 // - Legacy: fixed 45-byte blob with hardcoded offsets (backward compat)
 
 use super::constants::*;
-use super::state::SynthState;
 use super::params_def;
+use super::state::SynthState;
 use super::tlv;
-use super::{p_u8, p_u16, p_u32};
+use super::{p_u16, p_u32, p_u8};
 
 #[inline(always)]
 pub fn ms_to_env_rate(ms: u16, sample_rate: u32) -> u16 {
-    if ms == 0 { return 65535; }
-    let sr_k = if sample_rate >= 1000 { sample_rate / 1000 } else { 1 };
+    if ms == 0 {
+        return 65535;
+    }
+    let sr_k = if sample_rate >= 1000 {
+        sample_rate / 1000
+    } else {
+        1
+    };
     let samples = (sr_k * (ms as u32)).max(1);
     (65535u32 / samples).clamp(1, 65535) as u16
 }
 
 #[inline(always)]
 pub fn freq_to_inc(freq: u16, sample_rate: u32) -> u32 {
-    if freq == 0 || sample_rate == 0 { return 0; }
-    let sr_256 = if sample_rate >= 256 { sample_rate / 256 } else { 1 };
-    let scale = (65536u32 / sr_256.max(1)) * 256;
-    (freq as u32).wrapping_mul(scale)
+    if freq == 0 || sample_rate == 0 {
+        return 0;
+    }
+    (((freq as u64) << 32) / sample_rate as u64) as u32
 }
 
 /// Apply all parameters from the stored params blob to runtime state.
@@ -37,13 +43,7 @@ pub unsafe fn apply_params(s: &mut SynthState) {
     let len = s.params_len as usize;
 
     if tlv::is_tlv(p, len) {
-        if len >= 2 && *p.add(1) == 0x02 {
-            // TLV v2: per-param tags (schema-driven)
-            params_def::parse_tlv(s, p, len);
-        } else {
-            // TLV v1: grouped tags (legacy)
-            tlv::parse_tlv(s);
-        }
+        params_def::parse_tlv(s, p, len);
     } else {
         apply_legacy_params(s);
     }

@@ -10,9 +10,9 @@
 
 #[cfg(feature = "host-playback")]
 mod playback_backend {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     /// CPAL output stream owned by the linux_audio step. Samples are
     /// pushed into a shared queue; CPAL's data callback pulls from
@@ -26,7 +26,8 @@ mod playback_backend {
     impl PlaybackBackend {
         pub fn spawn(sample_rate: u32, channels: u16) -> Result<Self, String> {
             let host = cpal::default_host();
-            let device = host.default_output_device()
+            let device = host
+                .default_output_device()
                 .ok_or_else(|| "no default audio output device".to_string())?;
             let config = cpal::StreamConfig {
                 channels,
@@ -58,8 +59,8 @@ mod playback_backend {
                             for s in &mut out[filled..] {
                                 *s = 0;
                             }
-                            let prev = underrun_for_cb
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let prev =
+                                underrun_for_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if prev == 0 || prev % 1000 == 0 {
                                 log::warn!(
                                     "[linux_audio] underrun (silenced {} sample(s); count={})",
@@ -73,9 +74,7 @@ mod playback_backend {
                     None,
                 )
                 .map_err(|e| format!("cpal build_output_stream: {}", e))?;
-            stream
-                .play()
-                .map_err(|e| format!("cpal play: {}", e))?;
+            stream.play().map_err(|e| format!("cpal play: {}", e))?;
             log::info!(
                 "[linux_audio] cpal stream started ({}Hz {}ch on '{}')",
                 sample_rate,
@@ -106,6 +105,23 @@ mod playback_backend {
 use std::io::{Seek, SeekFrom};
 
 const LINUX_AUDIO_HASH: u32 = 0xF62EA500; // fnv1a32("linux_audio")
+const PIO_STREAM_TIME: u32 = 0x0407;
+
+struct LinuxAudioClock {
+    started: bool,
+    start_micros: u64,
+    sample_rate: u32,
+    channels: u16,
+    bytes_written: u64,
+}
+
+static mut LINUX_AUDIO_CLOCK: LinuxAudioClock = LinuxAudioClock {
+    started: false,
+    start_micros: 0,
+    sample_rate: 0,
+    channels: 0,
+    bytes_written: 0,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum AudioMode {
@@ -121,6 +137,7 @@ struct LinuxAudioState {
     failed: bool,
     mode: AudioMode,
     file: Option<std::fs::File>,
+    start_micros: u64,
     sample_rate: u32,
     channels: u16,
     bytes_written: u32,
@@ -174,7 +191,12 @@ fn resolve_audio_mode(raw: u8) -> AudioMode {
     }
 }
 
-fn write_wav_header(f: &mut std::fs::File, sample_rate: u32, channels: u16, data_len: u32) -> std::io::Result<()> {
+fn write_wav_header(
+    f: &mut std::fs::File,
+    sample_rate: u32,
+    channels: u16,
+    data_len: u32,
+) -> std::io::Result<()> {
     f.seek(SeekFrom::Start(0))?;
     let bits_per_sample: u16 = 16;
     let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
@@ -183,8 +205,8 @@ fn write_wav_header(f: &mut std::fs::File, sample_rate: u32, channels: u16, data
     f.write_all(&(36u32 + data_len).to_le_bytes())?;
     f.write_all(b"WAVE")?;
     f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?;       // PCM fmt chunk size
-    f.write_all(&1u16.to_le_bytes())?;        // PCM format
+    f.write_all(&16u32.to_le_bytes())?; // PCM fmt chunk size
+    f.write_all(&1u16.to_le_bytes())?; // PCM format
     f.write_all(&channels.to_le_bytes())?;
     f.write_all(&sample_rate.to_le_bytes())?;
     f.write_all(&byte_rate.to_le_bytes())?;
@@ -195,6 +217,59 @@ fn write_wav_header(f: &mut std::fs::File, sample_rate: u32, channels: u16, data
     Ok(())
 }
 
+unsafe fn linux_stream_time_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    if opcode != PIO_STREAM_TIME {
+        return fluxor::kernel::errno::ENOSYS;
+    }
+    if handle >= 0 {
+        return fluxor::kernel::errno::EINVAL;
+    }
+    if arg.is_null() || arg_len < 24 {
+        return fluxor::kernel::errno::EINVAL;
+    }
+
+    let clock = &*(&raw const LINUX_AUDIO_CLOCK);
+    if !clock.started || clock.sample_rate == 0 || clock.channels == 0 {
+        return fluxor::kernel::errno::ENODEV;
+    }
+
+    let bytes_per_frame = clock.channels as u64 * 2;
+    let consumed = if bytes_per_frame > 0 {
+        clock.bytes_written / bytes_per_frame
+    } else {
+        0
+    };
+    let queued: u32 = 0;
+    let rate_q16 = clock.sample_rate << 16;
+
+    let out = core::slice::from_raw_parts_mut(arg, 24);
+    out[0..8].copy_from_slice(&consumed.to_le_bytes());
+    out[8..12].copy_from_slice(&queued.to_le_bytes());
+    out[12..16].copy_from_slice(&rate_q16.to_le_bytes());
+    out[16..24].copy_from_slice(&clock.start_micros.to_le_bytes());
+
+    0
+}
+
+fn linux_audio_due_bytes(st: &LinuxAudioState) -> usize {
+    let bytes_per_frame = st.channels as u64 * 2;
+    let byte_rate = st.sample_rate as u64 * bytes_per_frame;
+    if byte_rate == 0 || bytes_per_frame == 0 {
+        return 0;
+    }
+
+    let elapsed_us = linux_now_micros().saturating_sub(st.start_micros);
+    let target_bytes = elapsed_us.saturating_mul(byte_rate) / 1_000_000;
+    let due = target_bytes.saturating_sub(st.bytes_written as u64);
+    let aligned_due = due - (due % bytes_per_frame);
+    aligned_due.min(4096) as usize
+}
+
 fn linux_audio_step(state: *mut u8) -> i32 {
     let st = unsafe { instance_state::<LinuxAudioState>(state) };
 
@@ -203,11 +278,35 @@ fn linux_audio_step(state: *mut u8) -> i32 {
     }
 
     let mut buf = [0u8; 4096];
-    let n = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), buf.len()) };
-    if n <= 0 {
+    let max_read = match st.mode {
+        AudioMode::Null => buf.len(),
+        #[cfg(feature = "host-playback")]
+        AudioMode::Playback => buf.len(),
+        AudioMode::Raw | AudioMode::Wav => linux_audio_due_bytes(st),
+    };
+    if max_read == 0 {
         return 0;
     }
-    let n = n as usize;
+
+    let read = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), max_read) };
+    if read <= 0 {
+        match st.mode {
+            AudioMode::Raw | AudioMode::Wav => {
+                buf[..max_read].fill(0);
+            }
+            _ => return 0,
+        }
+    }
+    let n = match st.mode {
+        AudioMode::Raw | AudioMode::Wav => {
+            if read > 0 {
+                read as usize
+            } else {
+                max_read
+            }
+        }
+        _ => read as usize,
+    };
 
     match st.mode {
         AudioMode::Null => {
@@ -227,6 +326,10 @@ fn linux_audio_step(state: *mut u8) -> i32 {
                     return 0;
                 }
                 st.bytes_written = st.bytes_written.saturating_add(n as u32);
+                unsafe {
+                    let clock = &mut *(&raw mut LINUX_AUDIO_CLOCK);
+                    clock.bytes_written = st.bytes_written as u64;
+                }
                 st.bytes_since_flush = st.bytes_since_flush.saturating_add(n as u32);
                 if matches!(st.mode, AudioMode::Wav) && st.bytes_since_flush >= st.flush_interval {
                     let total = st.bytes_written;
@@ -259,6 +362,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
         _ => {}
     });
     let mode = resolve_audio_mode(mode_raw);
+    let start_micros = linux_now_micros();
 
     // Flush header roughly once per second of audio.
     let flush_interval = sample_rate * channels as u32 * 2;
@@ -299,8 +403,19 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
     };
     log::info!(
         "[linux_audio] mode={} {}Hz {}ch path='{}'",
-        mode_str, sample_rate, channels, path,
+        mode_str,
+        sample_rate,
+        channels,
+        path,
     );
+    unsafe {
+        let clock = &mut *(&raw mut LINUX_AUDIO_CLOCK);
+        clock.started = true;
+        clock.start_micros = start_micros;
+        clock.sample_rate = sample_rate;
+        clock.channels = channels;
+        clock.bytes_written = 0;
+    }
 
     #[cfg(feature = "host-playback")]
     let (playback, playback_cap_samples) = if matches!(mode, AudioMode::Playback) {
@@ -329,6 +444,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
             failed,
             mode,
             file,
+            start_micros,
             sample_rate,
             channels,
             bytes_written: 0,
@@ -342,7 +458,8 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
     );
     log::info!(
         "[inst] module {} = linux_audio (built-in) in={}",
-        module_idx, in_chan
+        module_idx,
+        in_chan
     );
     m
 }

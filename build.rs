@@ -78,9 +78,24 @@ fn generate_chip_rs(k: &KernelConfig, is_rp2040: bool) -> String {
     emit_hex_const(&mut g, "BOOT2_SRC", &k.boot2_src);
     g.push('\n');
 
-    emit_const(&mut g, "STATE_ARENA_SIZE", "usize", &format!("{}", k.state_arena_kb * 1024));
-    emit_const(&mut g, "BUFFER_ARENA_SIZE", "usize", &format!("{}", k.buffer_arena_kb * 1024));
-    emit_const(&mut g, "MAX_MODULE_CONFIG_SIZE", "usize", &format!("{}", k.config_buffer_kb * 1024));
+    emit_const(
+        &mut g,
+        "STATE_ARENA_SIZE",
+        "usize",
+        &format!("{}", k.state_arena_kb * 1024),
+    );
+    emit_const(
+        &mut g,
+        "BUFFER_ARENA_SIZE",
+        "usize",
+        &format!("{}", k.buffer_arena_kb * 1024),
+    );
+    emit_const(
+        &mut g,
+        "MAX_MODULE_CONFIG_SIZE",
+        "usize",
+        &format!("{}", k.config_buffer_kb * 1024),
+    );
     g.push('\n');
 
     emit_hex_const(&mut g, "FLASH_ERASE_BLOCK_SIZE", &k.flash_erase_block_size);
@@ -89,10 +104,24 @@ fn generate_chip_rs(k: &KernelConfig, is_rp2040: bool) -> String {
     g.push('\n');
 
     let b = &k.bootsel;
-    emit_const(&mut g, "BOOTSEL_DMA_CH_COUNT", "usize", &format!("{}", b.dma_ch_count));
-    emit_const(&mut g, "BOOTSEL_QSPI_SS_BIT", "u32", &format!("{}", b.qspi_ss_bit));
+    emit_const(
+        &mut g,
+        "BOOTSEL_DMA_CH_COUNT",
+        "usize",
+        &format!("{}", b.dma_ch_count),
+    );
+    emit_const(
+        &mut g,
+        "BOOTSEL_QSPI_SS_BIT",
+        "u32",
+        &format!("{}", b.qspi_ss_bit),
+    );
     emit_hex_const(&mut g, "BOOTSEL_FLASH_RELEASE_ADDR", &b.flash_release_addr);
-    emit_hex_const(&mut g, "BOOTSEL_FLASH_RELEASE_VALUE", &b.flash_release_value);
+    emit_hex_const(
+        &mut g,
+        "BOOTSEL_FLASH_RELEASE_VALUE",
+        &b.flash_release_value,
+    );
     emit_hex_const(&mut g, "BOOTSEL_PAD_ADDR", &b.pad_addr);
     emit_hex_const(&mut g, "BOOTSEL_PAD_VALUE", &b.pad_value);
     emit_hex_const(&mut g, "BOOTSEL_CTRL_ADDR", &b.ctrl_addr);
@@ -101,7 +130,12 @@ fn generate_chip_rs(k: &KernelConfig, is_rp2040: bool) -> String {
     emit_hex_const(&mut g, "BOOTSEL_GPIO_HI_ADDR", &b.gpio_hi_addr);
     g.push('\n');
 
-    emit_const(&mut g, "IS_RP2040", "bool", if is_rp2040 { "true" } else { "false" });
+    emit_const(
+        &mut g,
+        "IS_RP2040",
+        "bool",
+        if is_rp2040 { "true" } else { "false" },
+    );
 
     g
 }
@@ -157,11 +191,12 @@ fn main() {
     } else {
         "targets/silicon/rp2350a.toml"
     };
-    let content = fs::read_to_string(toml_path)
-        .unwrap_or_else(|e| panic!("Failed to read {toml_path}: {e}"));
-    let silicon: SiliconToml = toml::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse {toml_path}: {e}"));
-    let kernel = silicon.kernel
+    let content =
+        fs::read_to_string(toml_path).unwrap_or_else(|e| panic!("Failed to read {toml_path}: {e}"));
+    let silicon: SiliconToml =
+        toml::from_str(&content).unwrap_or_else(|e| panic!("Failed to parse {toml_path}: {e}"));
+    let kernel = silicon
+        .kernel
         .unwrap_or_else(|| panic!("{toml_path} missing [kernel] section"));
 
     let generated = generate_chip_rs(&kernel, is_rp2040);

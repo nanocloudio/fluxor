@@ -86,6 +86,7 @@ fn linux_init_providers() {
     use fluxor::kernel::provider;
     use fluxor::kernel::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
+    provider::register(dev_class::HAL_PIO, linux_stream_time_dispatch);
 }
 fn linux_release_module_handles(_module_idx: u8) {}
 fn linux_boot_scan() {}

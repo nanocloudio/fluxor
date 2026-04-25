@@ -1970,10 +1970,7 @@ fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("<unnamed>");
-        let module_type = entry
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or(name);
+        let module_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or(name);
 
         // Module-presence checks: if the YAML uses a module type that
         // requires a feature absent from the binary, fail.
