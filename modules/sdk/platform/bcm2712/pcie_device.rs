@@ -29,9 +29,10 @@
 
 /// Open-style op (issued via `provider_open`). Payload is a UTF-8
 /// selector string:
-///   - plain name              → board alias lookup (e.g. "m2_primary")
-///   - "@class=<name>"         → PCI-class match, must resolve to
-///                                exactly one device (e.g. "@class=nvme")
+///   - plain name      → board alias lookup (e.g. "m2_primary")
+///   - "@class=<name>" → PCI-class match, must resolve to exactly
+///     one device (e.g. "@class=nvme")
+///
 /// Returns a non-negative device handle on success or a negative errno
 /// (ENODEV if unresolved, EAGAIN if the link hasn't trained yet,
 /// EBUSY if a class selector matches more than one device).

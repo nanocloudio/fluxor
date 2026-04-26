@@ -26,7 +26,10 @@ pub enum RunEvent {
     /// A transport exited unexpectedly. The matcher keeps running (another
     /// signal may still decide the verdict); the orchestrator logs this
     /// for the run record.
-    TransportClosed { source: &'static str, reason: String },
+    TransportClosed {
+        source: &'static str,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]

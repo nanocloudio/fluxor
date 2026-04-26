@@ -61,7 +61,7 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicI8, AtomicPtr, Ordering};
+use portable_atomic::{AtomicBool, AtomicI8, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 use crate::kernel::buffer_pool::{self, BUFFER_SIZE};
 use crate::kernel::config::MAX_GRAPH_EDGES;
@@ -80,11 +80,11 @@ pub const MAX_CHANNELS: usize = MAX_GRAPH_EDGES;
 pub const CHANNEL_TYPE_PIPE: u8 = 3;
 
 // Poll flags — re-exported from abi::poll for kernel-internal use.
-pub use crate::abi::poll::IN as POLL_IN;
-pub use crate::abi::poll::OUT as POLL_OUT;
+pub use crate::abi::poll::CONN as POLL_CONN;
 pub use crate::abi::poll::ERR as POLL_ERR;
 pub use crate::abi::poll::HUP as POLL_HUP;
-pub use crate::abi::poll::CONN as POLL_CONN;
+pub use crate::abi::poll::IN as POLL_IN;
+pub use crate::abi::poll::OUT as POLL_OUT;
 
 // ============================================================================
 // Ioctl Commands (stable ABI values — modules hardcode these)
@@ -216,12 +216,12 @@ impl ChannelSlot {
             .is_ok()
         {
             // Allocate an arena-backed buffer of the requested size
-            let buf_slot = buffer_pool::alloc_streaming_for_module(
-                idx as i8, buf_capacity, producer_module,
-            );
+            let buf_slot =
+                buffer_pool::alloc_streaming_for_module(idx as i8, buf_capacity, producer_module);
             if buf_slot < 0 {
                 // No buffer available, rollback
-                self.state.store(ChannelState::Free as u8, Ordering::Release);
+                self.state
+                    .store(ChannelState::Free as u8, Ordering::Release);
                 return false;
             }
             self.buffer_slot.store(buf_slot as i8, Ordering::Release);
@@ -243,14 +243,17 @@ impl ChannelSlot {
         if buf_slot >= 0 {
             buffer_pool::free_streaming(buf_slot as i32);
         }
-        self.state.store(ChannelState::Free as u8, Ordering::Release);
+        self.state
+            .store(ChannelState::Free as u8, Ordering::Release);
         self.chan_type.store(0, Ordering::Release);
         self.sticky_events.store(0, Ordering::Release);
         self.hup_flag.store(false, Ordering::Release);
         self.mailbox.store(false, Ordering::Release);
         self.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
-        self.ioctl_handler.store(core::ptr::null_mut(), Ordering::Release);
-        self.ioctl_state.store(core::ptr::null_mut(), Ordering::Release);
+        self.ioctl_handler
+            .store(core::ptr::null_mut(), Ordering::Release);
+        self.ioctl_state
+            .store(core::ptr::null_mut(), Ordering::Release);
         unsafe {
             *self.fifo.get() = FifoState::new();
         }
@@ -283,7 +286,9 @@ impl ChannelSlot {
             spins += 1;
             if spins > 256 {
                 #[cfg(target_arch = "aarch64")]
-                unsafe { core::arch::asm!("yield", options(nomem, nostack)); }
+                unsafe {
+                    core::arch::asm!("yield", options(nomem, nostack));
+                }
                 spins = 0;
             }
             core::hint::spin_loop();
@@ -325,10 +330,8 @@ pub fn channel_open_for_module(
     // Requested size comes as 2 LE bytes in `config`. Round up to a power of
     // two so the ring buffer can wrap with a bitwise AND instead of modulo.
     let buf_capacity = if !config.is_null() && config_len >= 2 {
-        let size = unsafe {
-            u16::from_le_bytes([*config, *config.add(1)]) as usize
-        };
-        size.max(64).min(4096).next_power_of_two()
+        let size = unsafe { u16::from_le_bytes([*config, *config.add(1)]) as usize };
+        size.clamp(64, 4096).next_power_of_two()
     } else {
         BUFFER_SIZE
     };
@@ -337,7 +340,10 @@ pub fn channel_open_for_module(
         if slot.try_allocate(idx, buf_capacity, producer_module) {
             slot.state
                 .store(ChannelState::Connected as u8, Ordering::Release);
-            debug!("channel_open: allocated channel {} buf_size={}", idx, buf_capacity);
+            debug!(
+                "channel_open: allocated channel {} buf_size={}",
+                idx, buf_capacity
+            );
             return idx as i32;
         }
     }
@@ -355,6 +361,11 @@ pub fn channel_close(handle: i32) {
     CHANNELS[idx].reset();
 }
 
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes (or null, which is
+/// rejected). The function performs a `copy_nonoverlapping` of up to
+/// `len` bytes into `buf` — the destination region must not alias any
+/// kernel state observed via shared references.
 pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
     if buf.is_null() {
         return CHAN_EINVAL;
@@ -410,6 +421,11 @@ pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
     }
 }
 
+/// # Safety
+/// `data` must be valid for reads of `len` bytes (or null, which is
+/// rejected). The function reads through `data` into the channel's
+/// FIFO/mailbox storage; the source region must remain initialised for
+/// the duration of the call.
 pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     if data.is_null() {
         return CHAN_EINVAL;
@@ -494,9 +510,8 @@ pub fn channel_poll(handle: i32, events: u32) -> i32 {
         }
     } else {
         // FIFO channels: check ring buffer occupancy
-        let (readable, writable) = slot.with_lock(|fifo, _storage| {
-            (fifo.is_readable(), fifo.is_writable())
-        });
+        let (readable, writable) =
+            slot.with_lock(|fifo, _storage| (fifo.is_readable(), fifo.is_writable()));
         if (events & POLL_IN) != 0 && readable {
             ready |= POLL_IN;
         }
@@ -519,7 +534,9 @@ pub fn channel_poll(handle: i32, events: u32) -> i32 {
     }
     trace!(
         "chan_poll h={} events=0x{:02x} ready=0x{:02x}",
-        handle, events, ready
+        handle,
+        events,
+        ready
     );
     ready as i32
 }
@@ -557,7 +574,9 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             if val == NO_AUX_PENDING {
                 CHAN_EAGAIN
             } else {
-                unsafe { *(arg as *mut u32) = val; }
+                unsafe {
+                    *(arg as *mut u32) = val;
+                }
                 debug!("chan_ioctl h={} POLL_NOTIFY val={}", handle, val);
                 CHAN_OK
             }
@@ -598,8 +617,7 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
                 return CHAN_ENOSYS;
             }
             let state = slot.ioctl_state.load(Ordering::Acquire);
-            let handler: ChannelIoctlHandler =
-                unsafe { core::mem::transmute(h) };
+            let handler: ChannelIoctlHandler = unsafe { core::mem::transmute(h) };
             unsafe { handler(state as *mut c_void, cmd, arg) }
         }
     }
@@ -640,9 +658,7 @@ pub fn channel_register_ioctl_handler(
     // must already be visible.
     slot.ioctl_state.store(state as *mut (), Ordering::Release);
     match handler {
-        Some(h) => slot
-            .ioctl_handler
-            .store(h as *mut (), Ordering::Release),
+        Some(h) => slot.ioctl_handler.store(h as *mut (), Ordering::Release),
         None => slot
             .ioctl_handler
             .store(core::ptr::null_mut(), Ordering::Release),
@@ -670,20 +686,32 @@ pub fn channel_set_mailbox(handle: i32) {
 
 /// Return readable bytes in channel's ring buffer (0 for invalid/mailbox/empty).
 pub fn channel_readable_bytes(handle: i32) -> usize {
-    if handle < 0 { return 0; }
+    if handle < 0 {
+        return 0;
+    }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS { return 0; }
+    if idx >= MAX_CHANNELS {
+        return 0;
+    }
     let slot = &CHANNELS[idx];
-    if !slot.is_pipe() { return 0; }
-    if slot.mailbox.load(Ordering::Acquire) { return 0; }
+    if !slot.is_pipe() {
+        return 0;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        return 0;
+    }
     slot.with_lock(|fifo, _| fifo.len())
 }
 
 /// Return true if channel is in mailbox mode.
 pub fn channel_is_mailbox(handle: i32) -> bool {
-    if handle < 0 { return false; }
+    if handle < 0 {
+        return false;
+    }
     let idx = handle as usize;
-    if idx >= MAX_CHANNELS { return false; }
+    if idx >= MAX_CHANNELS {
+        return false;
+    }
     CHANNELS[idx].mailbox.load(Ordering::Acquire)
 }
 
@@ -712,11 +740,7 @@ pub fn channel_set_flags(handle: i32, flags: u8) {
 // ============================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn syscall_channel_open(
-    chan_type: u8,
-    config: *const u8,
-    config_len: usize,
-) -> i32 {
+pub extern "C" fn syscall_channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
     channel_open(chan_type, config, config_len)
 }
 
@@ -725,11 +749,17 @@ pub extern "C" fn syscall_channel_close(handle: i32) {
     channel_close(handle);
 }
 
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes (or null, which is
+/// rejected by `channel_read`). See [`channel_read`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
     channel_read(handle, buf, len)
 }
 
+/// # Safety
+/// `data` must be valid for reads of `len` bytes (or null, which is
+/// rejected by `channel_write`). See [`channel_write`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     channel_write(handle, data, len)
@@ -786,10 +816,22 @@ pub extern "C" fn syscall_channel_register_ioctl_handler(
 /// The mailbox flag is set by the scheduler for aliased channels (buffer_group != 0).
 /// This prevents producers from accidentally using mailbox mode on FIFO channels,
 /// which would cause data loss (FIFO reads check ring buffer head/tail, not buffer state).
+///
+/// # Safety
+/// `capacity_out` must either be null or a valid `*mut u32` — the kernel
+/// writes the buffer capacity (or 0 on error) through it. The returned
+/// `*mut u8` is owned by the caller until matched with
+/// `syscall_buffer_release_write`; aliasing it past the release breaks
+/// the mailbox state machine.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn syscall_buffer_acquire_write(chan: i32, capacity_out: *mut u32) -> *mut u8 {
+pub unsafe extern "C" fn syscall_buffer_acquire_write(
+    chan: i32,
+    capacity_out: *mut u32,
+) -> *mut u8 {
     if chan < 0 || chan as usize >= MAX_CHANNELS {
-        if !capacity_out.is_null() { *capacity_out = 0; }
+        if !capacity_out.is_null() {
+            *capacity_out = 0;
+        }
         return core::ptr::null_mut();
     }
 
@@ -797,13 +839,17 @@ pub unsafe extern "C" fn syscall_buffer_acquire_write(chan: i32, capacity_out: *
 
     // Only allow mailbox writes on channels explicitly marked for mailbox mode
     if !channel.mailbox.load(Ordering::Acquire) {
-        if !capacity_out.is_null() { *capacity_out = 0; }
+        if !capacity_out.is_null() {
+            *capacity_out = 0;
+        }
         return core::ptr::null_mut();
     }
 
     let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
     if buf_slot < 0 {
-        if !capacity_out.is_null() { *capacity_out = 0; }
+        if !capacity_out.is_null() {
+            *capacity_out = 0;
+        }
         return core::ptr::null_mut();
     }
 
@@ -828,6 +874,12 @@ pub unsafe extern "C" fn syscall_buffer_acquire_write(chan: i32, capacity_out: *
 }
 
 /// Release buffer after writing (mailbox mode: PRODUCER → READY).
+///
+/// # Safety
+/// Must be paired with a prior successful `syscall_buffer_acquire_write`
+/// on the same `chan`. `len` must be `<=` the capacity returned by the
+/// acquire; the corresponding write region must not be accessed after
+/// this call returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_buffer_release_write(chan: i32, len: u32) -> i32 {
     if chan < 0 || chan as usize >= MAX_CHANNELS {
@@ -846,6 +898,12 @@ pub unsafe extern "C" fn syscall_buffer_release_write(chan: i32, len: u32) -> i3
 /// Acquire read access to the channel's buffer (mailbox mode: READY → CONSUMER).
 ///
 /// Returns pointer to buffer data, or null if no message ready.
+///
+/// # Safety
+/// `len_out` must either be null or a valid `*mut u32`. The returned
+/// `*const u8` is borrowed for read-only access until matched with
+/// `syscall_buffer_release_read`; mutation through this pointer or
+/// access after release breaks the mailbox state machine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_buffer_acquire_read(chan: i32, len_out: *mut u32) -> *const u8 {
     if chan < 0 || chan as usize >= MAX_CHANNELS {
@@ -870,6 +928,11 @@ pub unsafe extern "C" fn syscall_buffer_acquire_read(chan: i32, len_out: *mut u3
 }
 
 /// Release buffer after reading (mailbox mode: CONSUMER → STREAMING).
+///
+/// # Safety
+/// Must be paired with a prior successful `syscall_buffer_acquire_read`
+/// on the same `chan`. The pointer returned by acquire must not be
+/// accessed after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_buffer_release_read(chan: i32) -> i32 {
     if chan < 0 || chan as usize >= MAX_CHANNELS {
@@ -891,6 +954,12 @@ pub unsafe extern "C" fn syscall_buffer_release_read(chan: i32) -> i32 {
 /// the upstream module's output buffer directly. Returns a mutable pointer
 /// to the existing data. After processing, call buffer_release_write to
 /// transition back to READY for the next module in the chain.
+///
+/// # Safety
+/// `len_out` must either be null or a valid `*mut u32`. The returned
+/// `*mut u8` is borrowed mutably until matched with
+/// `syscall_buffer_release_write`; concurrent access from another
+/// module (or another core) violates the single-writer invariant.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_buffer_acquire_inplace(chan: i32, len_out: *mut u32) -> *mut u8 {
     if chan < 0 || chan as usize >= MAX_CHANNELS {

@@ -70,10 +70,18 @@ fn apply_line(rows: &mut BTreeMap<u8, ModuleRow>, line: &str) {
     let row = rows.entry(module_idx).or_default();
     match tag {
         "MON_STATE" => {
-            if let Some(n) = kv.get("name") { row.name = n.clone(); }
-            if let Some(p) = kv.get("prot") { row.protection = p.clone(); }
-            if let Some(t) = kv.get("tier") { row.tier = t.clone(); }
-            if let Some(s) = kv.get("state") { row.state = s.clone(); }
+            if let Some(n) = kv.get("name") {
+                row.name = n.clone();
+            }
+            if let Some(p) = kv.get("prot") {
+                row.protection = p.clone();
+            }
+            if let Some(t) = kv.get("tier") {
+                row.tier = t.clone();
+            }
+            if let Some(s) = kv.get("state") {
+                row.state = s.clone();
+            }
         }
         "MON_FAULT" => {
             if let Some(v) = kv.get("kind").and_then(|s| s.parse::<u8>().ok()) {
@@ -119,14 +127,24 @@ fn render(rows: &BTreeMap<u8, ModuleRow>) {
             row.fault_count,
             row.restart_count,
             fault_kind_str(row.last_fault_kind),
-            row.hist[0], row.hist[1], row.hist[2], row.hist[3],
-            row.hist[4], row.hist[5], row.hist[6], row.hist[7],
+            row.hist[0],
+            row.hist[1],
+            row.hist[2],
+            row.hist[3],
+            row.hist[4],
+            row.hist[5],
+            row.hist[6],
+            row.hist[7],
         );
     }
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max.saturating_sub(1)]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
 }
 
 /// Dispatcher — choose transport based on whether --net was set.
@@ -202,8 +220,10 @@ pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 // idle tick — fall through to render
             }
             Err(e) => return Err(Error::Config(format!("udp recv: {}", e))),
@@ -222,7 +242,10 @@ mod tests {
     #[test]
     fn parse_fault_line() {
         let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
-        apply_line(&mut rows, "MON_FAULT mod=3 kind=1 fault_count=2 restart_count=1 tick=500");
+        apply_line(
+            &mut rows,
+            "MON_FAULT mod=3 kind=1 fault_count=2 restart_count=1 tick=500",
+        );
         let r = &rows[&3];
         assert_eq!(r.last_fault_kind, 1);
         assert_eq!(r.fault_count, 2);
@@ -232,7 +255,10 @@ mod tests {
     #[test]
     fn parse_hist_line() {
         let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
-        apply_line(&mut rows, "MON_HIST mod=0 b0=10 b1=5 b2=1 b3=0 b4=0 b5=0 b6=0 b7=0");
+        apply_line(
+            &mut rows,
+            "MON_HIST mod=0 b0=10 b1=5 b2=1 b3=0 b4=0 b5=0 b6=0 b7=0",
+        );
         assert_eq!(rows[&0].hist, [10, 5, 1, 0, 0, 0, 0, 0]);
     }
 

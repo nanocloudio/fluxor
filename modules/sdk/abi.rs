@@ -40,55 +40,125 @@ pub mod kernel_abi {
 
 pub mod contracts {
     pub mod hal {
-        pub mod gpio { include!("contracts/hal/gpio.rs"); }
-        pub mod spi { include!("contracts/hal/spi.rs"); }
-        pub mod i2c { include!("contracts/hal/i2c.rs"); }
-        pub mod pio { include!("contracts/hal/pio.rs"); }
-        pub mod uart { include!("contracts/hal/uart.rs"); }
-        pub mod adc { include!("contracts/hal/adc.rs"); }
-        pub mod pwm { include!("contracts/hal/pwm.rs"); }
+        pub mod gpio {
+            include!("contracts/hal/gpio.rs");
+        }
+        pub mod spi {
+            include!("contracts/hal/spi.rs");
+        }
+        pub mod i2c {
+            include!("contracts/hal/i2c.rs");
+        }
+        pub mod pio {
+            include!("contracts/hal/pio.rs");
+        }
+        pub mod uart {
+            include!("contracts/hal/uart.rs");
+        }
+        pub mod adc {
+            include!("contracts/hal/adc.rs");
+        }
+        pub mod pwm {
+            include!("contracts/hal/pwm.rs");
+        }
     }
     pub mod net {
-        pub mod net_proto { include!("contracts/net/net_proto.rs"); }
-        pub mod datagram { include!("contracts/net/datagram.rs"); }
-        pub mod packet { include!("contracts/net/packet.rs"); }
-        pub mod mux { include!("contracts/net/mux.rs"); }
-        pub mod session_ctrl { include!("contracts/net/session_ctrl.rs"); }
+        pub mod net_proto {
+            include!("contracts/net/net_proto.rs");
+        }
+        pub mod datagram {
+            include!("contracts/net/datagram.rs");
+        }
+        pub mod packet {
+            include!("contracts/net/packet.rs");
+        }
+        pub mod mux {
+            include!("contracts/net/mux.rs");
+        }
+        pub mod session_ctrl {
+            include!("contracts/net/session_ctrl.rs");
+        }
     }
     pub mod storage {
-        pub mod graph_slot { include!("contracts/storage/graph_slot.rs"); }
-        pub mod runtime_params { include!("contracts/storage/runtime_params.rs"); }
-        pub mod paged_arena { include!("contracts/storage/paged_arena.rs"); }
-        pub mod fs { include!("contracts/storage/fs.rs"); }
+        pub mod graph_slot {
+            include!("contracts/storage/graph_slot.rs");
+        }
+        pub mod runtime_params {
+            include!("contracts/storage/runtime_params.rs");
+        }
+        pub mod paged_arena {
+            include!("contracts/storage/paged_arena.rs");
+        }
+        pub mod fs {
+            include!("contracts/storage/fs.rs");
+        }
     }
-    pub mod key_vault { include!("contracts/key_vault.rs"); }
+    pub mod key_vault {
+        include!("contracts/key_vault.rs");
+    }
 }
 
 pub mod internal {
-    pub mod provider_registry { include!("internal/provider_registry.rs"); }
-    pub mod reconfigure { include!("internal/reconfigure.rs"); }
-    pub mod monitor { include!("internal/monitor.rs"); }
-    pub mod bridge { include!("internal/bridge.rs"); }
-    pub mod diag { include!("internal/diag.rs"); }
-    pub mod flash { include!("internal/flash.rs"); }
+    pub mod provider_registry {
+        include!("internal/provider_registry.rs");
+    }
+    pub mod reconfigure {
+        include!("internal/reconfigure.rs");
+    }
+    pub mod monitor {
+        include!("internal/monitor.rs");
+    }
+    pub mod bridge {
+        include!("internal/bridge.rs");
+    }
+    pub mod diag {
+        include!("internal/diag.rs");
+    }
+    pub mod flash {
+        include!("internal/flash.rs");
+    }
 }
 
 pub mod platform {
     pub mod rp {
-        pub mod pwm_raw { include!("platform/rp/pwm_raw.rs"); }
-        pub mod pio_raw { include!("platform/rp/pio_raw.rs"); }
-        pub mod dma_raw { include!("platform/rp/dma_raw.rs"); }
-        pub mod spi9_raw { include!("platform/rp/spi9_raw.rs"); }
-        pub mod spi_raw { include!("platform/rp/spi_raw.rs"); }
-        pub mod i2c_raw { include!("platform/rp/i2c_raw.rs"); }
-        pub mod uart_raw { include!("platform/rp/uart_raw.rs"); }
-        pub mod adc_raw { include!("platform/rp/adc_raw.rs"); }
-        pub mod flash_layout { include!("platform/rp/flash_layout.rs"); }
+        pub mod pwm_raw {
+            include!("platform/rp/pwm_raw.rs");
+        }
+        pub mod pio_raw {
+            include!("platform/rp/pio_raw.rs");
+        }
+        pub mod dma_raw {
+            include!("platform/rp/dma_raw.rs");
+        }
+        pub mod spi9_raw {
+            include!("platform/rp/spi9_raw.rs");
+        }
+        pub mod spi_raw {
+            include!("platform/rp/spi_raw.rs");
+        }
+        pub mod i2c_raw {
+            include!("platform/rp/i2c_raw.rs");
+        }
+        pub mod uart_raw {
+            include!("platform/rp/uart_raw.rs");
+        }
+        pub mod adc_raw {
+            include!("platform/rp/adc_raw.rs");
+        }
+        pub mod flash_layout {
+            include!("platform/rp/flash_layout.rs");
+        }
     }
     pub mod bcm2712 {
-        pub mod mmio_dma { include!("platform/bcm2712/mmio_dma.rs"); }
-        pub mod pcie_nic { include!("platform/bcm2712/pcie_nic.rs"); }
-        pub mod pcie_device { include!("platform/bcm2712/pcie_device.rs"); }
+        pub mod mmio_dma {
+            include!("platform/bcm2712/mmio_dma.rs");
+        }
+        pub mod pcie_nic {
+            include!("platform/bcm2712/pcie_nic.rs");
+        }
+        pub mod pcie_device {
+            include!("platform/bcm2712/pcie_device.rs");
+        }
     }
 }
 
@@ -101,7 +171,5 @@ pub mod platform {
 // lives in its layer file and is accessed by its full path.
 
 pub use self::kernel_abi::{
-    ABI_VERSION, CHANNEL_BUFFER_SIZE,
-    ChannelAddr, StreamTime, SyscallTable,
-    errno, poll,
+    errno, poll, ChannelAddr, StreamTime, SyscallTable, ABI_VERSION, CHANNEL_BUFFER_SIZE,
 };

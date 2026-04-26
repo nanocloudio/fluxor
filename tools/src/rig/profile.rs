@@ -147,9 +147,8 @@ struct RigMetaToml {
 }
 
 pub fn load_profile(path: &Path) -> Result<RigProfile> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        Error::Config(format!("rig: reading profile {}: {}", path.display(), e))
-    })?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("rig: reading profile {}: {}", path.display(), e)))?;
     parse_profile_str(&raw, path)
 }
 
@@ -197,12 +196,8 @@ fn load_surface_map(
     let mut out = BTreeMap::new();
     for (key, value) in table {
         let qualified = format!("{}.{key}", expected.as_str());
-        let cap = Capability::parse(&qualified).map_err(|e| {
-            Error::Config(format!(
-                "{ctx} [{}.{key}]: {e}",
-                expected.as_str()
-            ))
-        })?;
+        let cap = Capability::parse(&qualified)
+            .map_err(|e| Error::Config(format!("{ctx} [{}.{key}]: {e}", expected.as_str())))?;
         let inner = match value {
             toml::Value::Table(t) => t,
             other => {

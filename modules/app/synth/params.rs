@@ -29,7 +29,39 @@ pub fn freq_to_inc(freq: u16, sample_rate: u32) -> u32 {
     if freq == 0 || sample_rate == 0 {
         return 0;
     }
-    (((freq as u64) << 32) / sample_rate as u64) as u32
+    // Compute the low 32 bits of `(freq << 32) / sample_rate` without
+    // invoking `__aeabi_uldivmod` — PIC modules can't link the 64-bit
+    // divide intrinsic. Long division over the 48-bit numerator
+    // `(freq << 32)`: 16 high-bit iterations build the remainder out of
+    // freq's bits (their quotient bits live above bit 31 and are
+    // discarded — matches the original `as u32` truncation when
+    // freq ≥ sample_rate), then 32 low-bit iterations process the
+    // trailing zeros and accumulate the result.
+    let freq_u32 = freq as u32;
+    let mut rem = 0u32;
+    let mut k = 16i32;
+    while k > 0 {
+        k -= 1;
+        let bit = (freq_u32 >> k) & 1;
+        let carry = rem >> 31;
+        rem = (rem << 1) | bit;
+        if carry != 0 || rem >= sample_rate {
+            rem = rem.wrapping_sub(sample_rate);
+        }
+    }
+    let mut quotient = 0u32;
+    let mut i = 0;
+    while i < 32 {
+        let carry = rem >> 31;
+        rem <<= 1;
+        quotient <<= 1;
+        if carry != 0 || rem >= sample_rate {
+            rem = rem.wrapping_sub(sample_rate);
+            quotient |= 1;
+        }
+        i += 1;
+    }
+    quotient
 }
 
 /// Apply all parameters from the stored params blob to runtime state.

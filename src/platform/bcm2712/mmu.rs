@@ -84,8 +84,9 @@ mod bcm2712_impl {
     /// Attr0: Normal, WB-WA inner+outer (0xFF)
     /// Attr1: Device-nGnRnE (0x00)
     /// Attr2: Normal non-cacheable (0x44)
-    const MAIR_VALUE: u64 = (0xFF << 0) |   // Attr0: Normal memory, WB-WA
-        (0x00 << 8) |   // Attr1: Device-nGnRnE
+    // Attr1 (Device-nGnRnE) encodes as 0x00, so its slot contributes nothing
+    // to the bitmask; only Attr0 and Attr2 are spelled out below.
+    const MAIR_VALUE: u64 = 0xFF |          // Attr0: Normal memory, WB-WA
         (0x44 << 16); // Attr2: Normal non-cacheable
 
     /// TCR_EL1 value for 4KB granule, 39-bit VA (512GB), ASID 8-bit.
@@ -96,11 +97,12 @@ mod bcm2712_impl {
     /// TG0 = 0b00 (4KB granule)
     /// A1 = 0 (TTBR0 ASID)
     /// AS = 0 (8-bit ASID)
-    const TCR_VALUE: u64 = (25 << 0) |     // T0SZ = 25 → 39-bit VA
+    // TG0 (4KB granule) encodes as 0b00, so its slot contributes nothing to
+    // the bitmask; only the non-zero fields are spelled out below.
+    const TCR_VALUE: u64 = 25 |             // T0SZ = 25 → 39-bit VA
         (0b01 << 8) |   // IRGN0 = WB-WA
         (0b01 << 10) |  // ORGN0 = WB-WA
         (0b11 << 12) |  // SH0 = Inner-shareable
-        (0b00 << 14) |  // TG0 = 4KB granule
         (0b1 << 23); // EPD1 = 1 (disable TTBR1 walks)
 
     // ========================================================================
@@ -535,19 +537,19 @@ mod bcm2712_impl {
 
         // Check if this is a translation fault in a paged arena (DFSC 0x04-0x07 = translation fault)
         let is_translation_fault = (dfsc & 0x3C) == 0x04;
-        if is_translation_fault {
-            if crate::kernel::pager::is_paged_arena_fault(module_idx, far as usize) {
-                match crate::kernel::pager::handle_page_fault(module_idx, far as usize) {
-                    Ok(()) => return, // Page loaded, retry faulting instruction
-                    Err(e) => {
-                        log::error!(
-                            "[mmu] pager fault failed for module {} at 0x{:016x}: {:?}",
-                            module_idx,
-                            far,
-                            e
-                        );
-                        // Fall through to record as MPU fault
-                    }
+        if is_translation_fault
+            && crate::kernel::pager::is_paged_arena_fault(module_idx, far as usize)
+        {
+            match crate::kernel::pager::handle_page_fault(module_idx, far as usize) {
+                Ok(()) => return, // Page loaded, retry faulting instruction
+                Err(e) => {
+                    log::error!(
+                        "[mmu] pager fault failed for module {} at 0x{:016x}: {:?}",
+                        module_idx,
+                        far,
+                        e
+                    );
+                    // Fall through to record as MPU fault
                 }
             }
         }
@@ -628,24 +630,25 @@ mod bcm2712_impl {
             MODULE_PAGED_SIZE[module_idx] = size;
 
             // Compute number of L3 tables needed (each covers 2MB)
-            let l3_count = ((size + L2_BLOCK_SIZE - 1) / L2_BLOCK_SIZE) as usize;
+            let l3_count = size.div_ceil(L2_BLOCK_SIZE) as usize;
             let l3_count = l3_count.min(MAX_L3_PER_MODULE);
             MODULE_L3_COUNT[module_idx] = l3_count as u8;
 
             // Initialize all L3 entries as invalid (unmapped)
-            for t in 0..l3_count {
-                for e in 0..TABLE_ENTRIES {
-                    MODULE_L3[module_idx][t].0[e] = 0; // Invalid = fault
+            let module_l3_p = &raw mut MODULE_L3;
+            for table in (*module_l3_p)[module_idx].iter_mut().take(l3_count) {
+                for e in table.0.iter_mut() {
+                    *e = 0; // Invalid = fault
                 }
             }
 
             // Wire L2 entries to point to L3 tables instead of 2MB blocks
             let l2 = &mut MODULE_L2[module_idx];
-            for t in 0..l3_count {
+            for (t, table) in (*module_l3_p)[module_idx].iter().enumerate().take(l3_count) {
                 let va = base_va + (t as u64) * L2_BLOCK_SIZE;
                 let idx = l2_index(va);
                 if idx < TABLE_ENTRIES {
-                    let l3_addr = &MODULE_L3[module_idx][t] as *const _ as u64;
+                    let l3_addr = table as *const _ as u64;
                     // L2 table descriptor pointing to L3 table
                     l2.0[idx] = (l3_addr & !0xFFF) | DESC_VALID | DESC_TABLE;
                 }
@@ -764,6 +767,13 @@ pub fn switch_to_kernel() {
 }
 
 /// Execute module_step with MMU isolation.
+///
+/// # Safety
+/// `step_fn` must be the genuine `module_step` export of the module whose
+/// state lives at `state_ptr`. `state_ptr` must remain valid for the duration
+/// of the call (the EL0 trampoline keeps it pinned in x0 across the ERET).
+/// Caller must run on the module's owning core so MMU isolation targets the
+/// correct per-module L2/L3 page tables installed via `setup_paged_arena`.
 pub unsafe fn protected_step(
     step_fn: crate::kernel::loader::ModuleStepFn,
     state_ptr: *mut u8,
@@ -792,6 +802,13 @@ pub fn set_enabled(enabled: bool) {
 }
 
 /// Handle a data abort from module context (called from exception vector).
+///
+/// # Safety
+/// Must only be invoked from the EL1 synchronous-exception vector while the
+/// faulting module's translation regime (TTBR0_EL1, ASID, MAIR) is still
+/// installed. Reads `FAR_EL1`/`ESR_EL1` of the live exception frame and may
+/// touch the current module's paged-arena L3 tables, so the scheduler's
+/// `current_module_index()` must still identify the faulting module.
 pub unsafe fn handle_data_abort() {
     #[cfg(feature = "chip-bcm2712")]
     bcm2712_impl::handle_data_abort();

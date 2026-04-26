@@ -70,9 +70,8 @@ struct RuleToml {
 }
 
 pub fn load_scenario(path: &Path) -> Result<Scenario> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        Error::Config(format!("rig: reading scenario {}: {}", path.display(), e))
-    })?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("rig: reading scenario {}: {}", path.display(), e)))?;
     let scenario_dir = path
         .parent()
         .map(Path::to_path_buf)

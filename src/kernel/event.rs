@@ -11,7 +11,7 @@
 //! The scheduler checks `EVENT_WAKE_PENDING` and steps only the affected
 //! modules via `step_woken_modules()`, providing intra-tick wake response.
 
-use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use portable_atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use crate::kernel::errno;
 use crate::kernel::hal;
@@ -83,14 +83,14 @@ fn check_event_access(handle: i32) -> Result<&'static EventSlot, i32> {
 /// Returns event handle (slot index, >=0) or negative errno.
 pub fn event_create() -> i32 {
     let owner = crate::kernel::scheduler::current_module_index() as u8;
-    for i in 0..MAX_EVENTS {
-        if EVENT_SLOTS[i]
+    for (i, slot) in EVENT_SLOTS.iter().enumerate() {
+        if slot
             .allocated
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            EVENT_SLOTS[i].signaled.store(false, Ordering::Release);
-            EVENT_SLOTS[i].owner.store(owner, Ordering::Release);
+            slot.signaled.store(false, Ordering::Release);
+            slot.owner.store(owner, Ordering::Release);
             return i as i32;
         }
     }
@@ -193,8 +193,7 @@ pub fn take_wake_pending() -> u64 {
 /// Note: Device providers (GPIO etc.) clean up their own bindings via
 /// their own release_owned_by — this only frees event slots.
 pub fn release_owned_by(module_idx: u8) {
-    for i in 0..MAX_EVENTS {
-        let slot = &EVENT_SLOTS[i];
+    for slot in EVENT_SLOTS.iter() {
         if !slot.allocated.load(Ordering::Acquire) {
             continue;
         }
@@ -210,8 +209,7 @@ pub fn release_owned_by(module_idx: u8) {
 /// Clear all event slots. Called on graph teardown / reload.
 /// Device providers must clear their own bindings before calling this.
 pub fn reset_all() {
-    for i in 0..MAX_EVENTS {
-        let slot = &EVENT_SLOTS[i];
+    for slot in EVENT_SLOTS.iter() {
         if slot.allocated.load(Ordering::Acquire) {
             slot.signaled.store(false, Ordering::Release);
             slot.owner.store(0xFF, Ordering::Release);

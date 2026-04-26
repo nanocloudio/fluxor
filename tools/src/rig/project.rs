@@ -109,9 +109,7 @@ impl ProjectDescriptor {
 /// Walk upward from `start` looking for a directory containing `.git`.
 /// The first match is the project root.
 fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let mut cursor = start
-        .canonicalize()
-        .unwrap_or_else(|_| start.to_path_buf());
+    let mut cursor = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     if cursor.is_file() {
         cursor.pop();
     }
@@ -127,9 +125,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 
 /// Walk upward from `start` looking for an in-tree descriptor.
 fn find_in_tree_descriptor(start: &Path) -> Option<PathBuf> {
-    let mut cursor = start
-        .canonicalize()
-        .unwrap_or_else(|_| start.to_path_buf());
+    let mut cursor = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     if cursor.is_file() {
         cursor.pop();
     }
@@ -236,7 +232,8 @@ mod tests {
             command = ["cargo", "build", "--release"]
             artifact = "target/thumbv8m.main-none-eabihf/release/firmware.uf2"
         "#;
-        let p = parse_project_str(src, Path::new("/home/me/proj"), "proj/.fluxor-rig.toml").unwrap();
+        let p =
+            parse_project_str(src, Path::new("/home/me/proj"), "proj/.fluxor-rig.toml").unwrap();
         assert_eq!(p.builds.len(), 2);
 
         let cm5 = p.recipe("cm5").unwrap();

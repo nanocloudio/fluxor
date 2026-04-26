@@ -1339,7 +1339,7 @@ required = true
         assert_eq!(m.params[1].enum_values[0].1, 0); // fit -> 0
         assert_eq!(m.params[1].enum_values[1].1, 1); // stretch -> 1
         assert_eq!(m.params[1].default_num, 0); // fit
-        // required honored.
+                                                // required honored.
         assert!(m.params[2].required);
         assert!(!m.params[0].required);
     }
@@ -1358,9 +1358,6 @@ required = true
 "#;
         let err = parse_toml(src).unwrap_err();
         let msg = format!("{}", err);
-        assert!(
-            msg.contains("mutually exclusive"),
-            "unexpected: {msg}"
-        );
+        assert!(msg.contains("mutually exclusive"), "unexpected: {msg}");
     }
 }

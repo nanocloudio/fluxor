@@ -37,7 +37,9 @@ pub fn validate_scenario_against_board(s: &Scenario, board: &BoardRig) -> RigVal
                 "scenario '{}': requires[{}] = '{}' — board does not declare this capability \
                  in its [rig] section. Either the scenario is wrong about what this board can do, \
                  or the board descriptor needs to be extended.",
-                s.name, i, cap.as_str()
+                s.name,
+                i,
+                cap.as_str()
             ));
         }
     }
@@ -108,7 +110,10 @@ fn check_rules(
                  vocabulary but the matcher has no evaluator for it yet. Supported rule \
                  sources: any `console.*` (regex on the console byte stream) and \
                  `observe.netboot_fetch`.",
-                s.name, kind, i, r.source.as_str(),
+                s.name,
+                kind,
+                i,
+                r.source.as_str(),
             ));
             continue;
         }
@@ -320,8 +325,8 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let scenario = load_scenario(&workspace.join("tests/hardware/cm5_boot_banner.toml"))
             .expect("load scenario");
-        let (board, _source) = resolve_board_rig(&scenario.target, Some(workspace))
-            .expect("resolve board");
+        let (board, _source) =
+            resolve_board_rig(&scenario.target, Some(workspace)).expect("resolve board");
         let board = board.expect("cm5 should declare [rig]");
         let v = validate_scenario_against_board(&scenario, &board);
         assert!(v.is_ok(), "errors: {:?}", v.errors);

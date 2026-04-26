@@ -70,9 +70,8 @@ struct BoardRigToml {
 /// yet declare one. Returns `Err` for malformed capability names or artifact
 /// classes so contract drift surfaces at load time, not at run time.
 pub fn load_board_rig(path: &Path) -> Result<Option<BoardRig>> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        Error::Config(format!("rig: reading {}: {}", path.display(), e))
-    })?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("rig: reading {}: {}", path.display(), e)))?;
     parse_board_rig_str(&raw, &path.display().to_string())
 }
 
@@ -99,9 +98,15 @@ const EMBEDDED_BOARDS: &[(&str, &str)] = &[
     ("cm5", include_str!("../../../targets/boards/cm5.toml")),
     ("linux", include_str!("../../../targets/boards/linux.toml")),
     ("pico", include_str!("../../../targets/boards/pico.toml")),
-    ("pico2w", include_str!("../../../targets/boards/pico2w.toml")),
+    (
+        "pico2w",
+        include_str!("../../../targets/boards/pico2w.toml"),
+    ),
     ("picow", include_str!("../../../targets/boards/picow.toml")),
-    ("qemu-virt", include_str!("../../../targets/boards/qemu-virt.toml")),
+    (
+        "qemu-virt",
+        include_str!("../../../targets/boards/qemu-virt.toml"),
+    ),
     (
         "waveshare-lcd4",
         include_str!("../../../targets/boards/waveshare-lcd4.toml"),
@@ -172,19 +177,24 @@ pub fn resolve_board_rig(
         user_override_board_path(board_id)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unresolved $HOME>".to_string()),
-        EMBEDDED_BOARDS.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        EMBEDDED_BOARDS
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
     )))
 }
 
 fn user_override_board_path(board_id: &str) -> Option<PathBuf> {
-    let base = if let Some(xdg) =
-        std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
-    {
+    let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
         Some(PathBuf::from(xdg))
     } else {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
     };
-    base.map(|b| b.join("fluxor").join("boards").join(format!("{board_id}.toml")))
+    base.map(|b| {
+        b.join("fluxor")
+            .join("boards")
+            .join(format!("{board_id}.toml"))
+    })
 }
 
 fn parse_rig(t: BoardRigToml, ctx: &str) -> Result<BoardRig> {
@@ -199,10 +209,20 @@ fn parse_rig(t: BoardRigToml, ctx: &str) -> Result<BoardRig> {
     let observe = parse_cap_list(t.observe, Surface::Observe, ctx, "observe")?;
     let power = parse_cap_list(t.power, Surface::Power, ctx, "power")?;
 
-    let preferred_deploy =
-        parse_preferred(t.preferred_deploy, &deploy, Surface::Deploy, ctx, "preferred_deploy")?;
-    let preferred_console =
-        parse_preferred(t.preferred_console, &console, Surface::Console, ctx, "preferred_console")?;
+    let preferred_deploy = parse_preferred(
+        t.preferred_deploy,
+        &deploy,
+        Surface::Deploy,
+        ctx,
+        "preferred_deploy",
+    )?;
+    let preferred_console = parse_preferred(
+        t.preferred_console,
+        &console,
+        Surface::Console,
+        ctx,
+        "preferred_console",
+    )?;
     let preferred_telemetry = parse_preferred(
         t.preferred_telemetry,
         &telemetry,
@@ -260,8 +280,8 @@ fn parse_preferred(
     let Some(s) = value else {
         return Ok(None);
     };
-    let cap = Capability::parse(&s)
-        .map_err(|e| Error::Config(format!("{ctx}: [rig].{field}: {e}")))?;
+    let cap =
+        Capability::parse(&s).map_err(|e| Error::Config(format!("{ctx}: [rig].{field}: {e}")))?;
     if cap.surface() != expect {
         return Err(Error::Config(format!(
             "{ctx}: [rig].{field}: '{s}' is a '{}' capability, expected '{}'",
@@ -307,11 +327,9 @@ mod tests {
 
     #[test]
     fn missing_rig_section_returns_none() {
-        assert!(
-            parse_board_rig_str("[board]\nid = \"x\"\n", "x.toml")
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_board_rig_str("[board]\nid = \"x\"\n", "x.toml")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

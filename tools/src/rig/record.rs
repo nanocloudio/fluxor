@@ -144,19 +144,15 @@ pub fn hash_artifact_bundle(root: &Path) -> Result<String> {
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).map_err(|e| {
-        Error::Config(format!("run record: reading dir {}: {e}", dir.display()))
-    })? {
-        let entry = entry.map_err(|e| {
-            Error::Config(format!("run record: reading dir entry: {e}"))
-        })?;
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| Error::Config(format!("run record: reading dir {}: {e}", dir.display())))?
+    {
+        let entry =
+            entry.map_err(|e| Error::Config(format!("run record: reading dir entry: {e}")))?;
         let path = entry.path();
-        let meta = entry.metadata().map_err(|e| {
-            Error::Config(format!(
-                "run record: stat {}: {e}",
-                path.display()
-            ))
-        })?;
+        let meta = entry
+            .metadata()
+            .map_err(|e| Error::Config(format!("run record: stat {}: {e}", path.display())))?;
         if meta.file_type().is_symlink() {
             continue;
         }
@@ -199,20 +195,13 @@ fn hash_scenario_file(scenario: &Scenario) -> Result<String> {
 
 fn hash_file_bytes(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    let mut f = std::fs::File::open(path).map_err(|e| {
-        Error::Config(format!(
-            "run record: hashing {}: {e}",
-            path.display()
-        ))
-    })?;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| Error::Config(format!("run record: hashing {}: {e}", path.display())))?;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = f.read(&mut buf).map_err(|e| {
-            Error::Config(format!(
-                "run record: reading {}: {e}",
-                path.display()
-            ))
-        })?;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| Error::Config(format!("run record: reading {}: {e}", path.display())))?;
         if n == 0 {
             break;
         }
@@ -356,10 +345,7 @@ regex = "kernel\\.img$"
 
     #[test]
     fn bundle_hash_is_stable_across_dir_walk_order() {
-        let tmp = std::env::temp_dir().join(format!(
-            "fluxor-rig-bundle-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("fluxor-rig-bundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
         std::fs::write(tmp.join("a.bin"), b"aaa").unwrap();
@@ -430,10 +416,8 @@ regex = "kernel\\.img$"
 
     #[test]
     fn artifact_file_hash_matches_sha256() {
-        let tmp = std::env::temp_dir().join(format!(
-            "fluxor-rig-artifact-{}.bin",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("fluxor-rig-artifact-{}.bin", std::process::id()));
         std::fs::write(&tmp, b"hello").unwrap();
         let h = hash_artifact_file(&tmp).unwrap();
         // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824

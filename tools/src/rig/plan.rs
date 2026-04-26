@@ -118,20 +118,16 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
     let board = inputs.board;
     let profile = inputs.profile;
 
-    let effective_timeout_s = scenario
-        .timeout_s
-        .or(board.default_timeout_s)
-        .unwrap_or(30);
+    let effective_timeout_s = scenario.timeout_s.or(board.default_timeout_s).unwrap_or(30);
 
     let deploy = pick_deploy(scenario, board, profile)?;
     let consoles = pick_consoles(scenario, board, profile)?;
-    let telemetry =
-        pick_single_surface(
-            Surface::Telemetry,
-            &board.telemetry,
-            board.preferred_telemetry,
-            &profile.telemetry,
-        );
+    let telemetry = pick_single_surface(
+        Surface::Telemetry,
+        &board.telemetry,
+        board.preferred_telemetry,
+        &profile.telemetry,
+    );
 
     let power_required = scenario
         .requires
@@ -258,7 +254,10 @@ fn pick_deploy(
              ({:?}); pin exactly one — the harness only runs a single deploy adapter \
              per run.",
             scenario.name,
-            required_deploys.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            required_deploys
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>(),
         )));
     }
 
@@ -310,7 +309,11 @@ fn pick_deploy(
          declares (board deploy: {:?}, profile deploy: {:?})",
         profile.rig.id,
         board.deploy.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-        profile.deploy.keys().map(|c| c.as_str()).collect::<Vec<_>>(),
+        profile
+            .deploy
+            .keys()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
     )))
 }
 
@@ -568,12 +571,20 @@ impl fmt::Display for Plan {
         }
 
         match &self.artifact {
-            ArtifactPlan::File { command, project_root, path } => {
+            ArtifactPlan::File {
+                command,
+                project_root,
+                path,
+            } => {
                 writeln!(f, "  artifact          file {}", path.display())?;
                 writeln!(f, "  build cwd         {}", project_root.display())?;
                 writeln!(f, "  build             {}", shell_render(command))?;
             }
-            ArtifactPlan::Bundle { command, project_root, root } => {
+            ArtifactPlan::Bundle {
+                command,
+                project_root,
+                root,
+            } => {
                 writeln!(f, "  artifact          bundle {}", root.display())?;
                 writeln!(f, "  build cwd         {}", project_root.display())?;
                 writeln!(f, "  build             {}", shell_render(command))?;
@@ -694,7 +705,12 @@ mod tests {
     fn load() -> (BoardRig, RigProfile, Scenario, ProjectDescriptor) {
         let board = parse_board_rig_str(CM5_BOARD, "cm5.toml").unwrap().unwrap();
         let profile = parse_profile_str(PROFILE, std::path::Path::new("/tmp/pi5-a.toml")).unwrap();
-        let scenario = parse_scenario_str(SCENARIO, std::path::Path::new("/repo/tests/hardware"), "s.toml").unwrap();
+        let scenario = parse_scenario_str(
+            SCENARIO,
+            std::path::Path::new("/repo/tests/hardware"),
+            "s.toml",
+        )
+        .unwrap();
         let project = parse_project_str(PROJECT, std::path::Path::new("/repo"), "p").unwrap();
         (board, profile, scenario, project)
     }
@@ -739,7 +755,12 @@ mod tests {
         "#;
         let board = parse_board_rig_str(CM5_BOARD, "cm5.toml").unwrap().unwrap();
         let profile = parse_profile_str(profile_src, std::path::Path::new("/tmp/p.toml")).unwrap();
-        let scenario = parse_scenario_str(SCENARIO, std::path::Path::new("/repo/tests/hardware"), "s.toml").unwrap();
+        let scenario = parse_scenario_str(
+            SCENARIO,
+            std::path::Path::new("/repo/tests/hardware"),
+            "s.toml",
+        )
+        .unwrap();
         let p = build_plan(PlanInputs {
             lab: "default",
             scenario: &scenario,
@@ -856,9 +877,10 @@ mod tests {
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml").unwrap().unwrap();
-        let profile =
-            parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let board = parse_board_rig_str(board_toml, "cm5.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
             parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
         let p = build_plan(PlanInputs {
@@ -904,9 +926,10 @@ mod tests {
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml").unwrap().unwrap();
-        let profile =
-            parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let board = parse_board_rig_str(board_toml, "cm5.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
             parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
         let err = build_plan(PlanInputs {
@@ -953,9 +976,10 @@ mod tests {
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml").unwrap().unwrap();
-        let profile =
-            parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let board = parse_board_rig_str(board_toml, "cm5.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
             parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
         let err = build_plan(PlanInputs {
@@ -1006,9 +1030,10 @@ mod tests {
             source = "console.serial"
             regex = "ok"
         "#;
-        let board = parse_board_rig_str(board_toml, "pico2w.toml").unwrap().unwrap();
-        let profile =
-            parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let board = parse_board_rig_str(board_toml, "pico2w.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
             parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
         let p = build_plan(PlanInputs {
@@ -1070,9 +1095,10 @@ mod tests {
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "pico2w.toml").unwrap().unwrap();
-        let profile =
-            parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let board = parse_board_rig_str(board_toml, "pico2w.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
             parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
         let p = build_plan(PlanInputs {
@@ -1129,9 +1155,10 @@ mod tests {
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml").unwrap().unwrap();
-        let profile =
-            parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let board = parse_board_rig_str(board_toml, "cm5.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
             parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
         let p = build_plan(PlanInputs {
@@ -1237,9 +1264,10 @@ mod tests {
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml").unwrap().unwrap();
-        let profile =
-            parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
+        let board = parse_board_rig_str(board_toml, "cm5.toml")
+            .unwrap()
+            .unwrap();
+        let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario =
             parse_scenario_str(scenario_toml, std::path::Path::new("/repo"), "s.toml").unwrap();
         let p = build_plan(PlanInputs {

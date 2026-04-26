@@ -11,31 +11,97 @@
 // ============================================================================
 
 const K: [u64; 80] = [
-    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
-    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
-    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
-    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
-    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
-    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
-    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
-    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
-    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
-    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
-    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
-    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
-    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
-    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
-    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
-    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
-    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
-    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
-    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
-    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+    0x428a2f98d728ae22,
+    0x7137449123ef65cd,
+    0xb5c0fbcfec4d3b2f,
+    0xe9b5dba58189dbbc,
+    0x3956c25bf348b538,
+    0x59f111f1b605d019,
+    0x923f82a4af194f9b,
+    0xab1c5ed5da6d8118,
+    0xd807aa98a3030242,
+    0x12835b0145706fbe,
+    0x243185be4ee4b28c,
+    0x550c7dc3d5ffb4e2,
+    0x72be5d74f27b896f,
+    0x80deb1fe3b1696b1,
+    0x9bdc06a725c71235,
+    0xc19bf174cf692694,
+    0xe49b69c19ef14ad2,
+    0xefbe4786384f25e3,
+    0x0fc19dc68b8cd5b5,
+    0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275,
+    0x4a7484aa6ea6e483,
+    0x5cb0a9dcbd41fbd4,
+    0x76f988da831153b5,
+    0x983e5152ee66dfab,
+    0xa831c66d2db43210,
+    0xb00327c898fb213f,
+    0xbf597fc7beef0ee4,
+    0xc6e00bf33da88fc2,
+    0xd5a79147930aa725,
+    0x06ca6351e003826f,
+    0x142929670a0e6e70,
+    0x27b70a8546d22ffc,
+    0x2e1b21385c26c926,
+    0x4d2c6dfc5ac42aed,
+    0x53380d139d95b3df,
+    0x650a73548baf63de,
+    0x766a0abb3c77b2a8,
+    0x81c2c92e47edaee6,
+    0x92722c851482353b,
+    0xa2bfe8a14cf10364,
+    0xa81a664bbc423001,
+    0xc24b8b70d0f89791,
+    0xc76c51a30654be30,
+    0xd192e819d6ef5218,
+    0xd69906245565a910,
+    0xf40e35855771202a,
+    0x106aa07032bbd1b8,
+    0x19a4c116b8d2d0c8,
+    0x1e376c085141ab53,
+    0x2748774cdf8eeb99,
+    0x34b0bcb5e19b48a8,
+    0x391c0cb3c5c95a63,
+    0x4ed8aa4ae3418acb,
+    0x5b9cca4f7763e373,
+    0x682e6ff3d6b2b8a3,
+    0x748f82ee5defb2fc,
+    0x78a5636f43172f60,
+    0x84c87814a1f0ab72,
+    0x8cc702081a6439ec,
+    0x90befffa23631e28,
+    0xa4506cebde82bde9,
+    0xbef9a3f7b2c67915,
+    0xc67178f2e372532b,
+    0xca273eceea26619c,
+    0xd186b8c721c0c207,
+    0xeada7dd6cde0eb1e,
+    0xf57d4f7fee6ed178,
+    0x06f067aa72176fba,
+    0x0a637dc5a2c898a6,
+    0x113f9804bef90dae,
+    0x1b710b35131c471b,
+    0x28db77f523047d84,
+    0x32caab7b40c72493,
+    0x3c9ebe0a15c9bebc,
+    0x431d67c49c100d4c,
+    0x4cc5d4becb3e42b6,
+    0x597f299cfc657e2a,
+    0x5fcb6fab3ad6faec,
+    0x6c44198c4a475817,
 ];
 
 const H0: [u64; 8] = [
-    0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
-    0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+    0x6a09e667f3bcc908,
+    0xbb67ae8584caa73b,
+    0x3c6ef372fe94f82b,
+    0xa54ff53a5f1d36f1,
+    0x510e527fade682d1,
+    0x9b05688c2b3e6c1f,
+    0x1f83d9abfb41bd6b,
+    0x5be0cd19137e2179,
 ];
 
 pub struct Sha512 {
@@ -47,7 +113,12 @@ pub struct Sha512 {
 
 impl Sha512 {
     pub fn new() -> Self {
-        Self { h: H0, buf: [0; 128], buf_len: 0, bit_len: 0 }
+        Self {
+            h: H0,
+            buf: [0; 128],
+            buf_len: 0,
+            bit_len: 0,
+        }
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
@@ -80,12 +151,16 @@ impl Sha512 {
         let pad_start = self.buf_len;
         self.buf[pad_start] = 0x80;
         if pad_start + 1 > 112 {
-            for i in (pad_start + 1)..128 { self.buf[i] = 0; }
+            for i in (pad_start + 1)..128 {
+                self.buf[i] = 0;
+            }
             let block = self.buf;
             self.compress(&block);
             self.buf = [0; 128];
         } else {
-            for i in (pad_start + 1)..112 { self.buf[i] = 0; }
+            for i in (pad_start + 1)..112 {
+                self.buf[i] = 0;
+            }
         }
         self.buf[112..128].copy_from_slice(&bit_len.to_be_bytes());
         let block = self.buf;
@@ -98,41 +173,83 @@ impl Sha512 {
     }
 
     fn compress(&mut self, block: &[u8; 128]) {
-        #[inline] fn ch(x: u64, y: u64, z: u64) -> u64 { (x & y) ^ (!x & z) }
-        #[inline] fn maj(x: u64, y: u64, z: u64) -> u64 { (x & y) ^ (x & z) ^ (y & z) }
-        #[inline] fn big_s0(x: u64) -> u64 { x.rotate_right(28) ^ x.rotate_right(34) ^ x.rotate_right(39) }
-        #[inline] fn big_s1(x: u64) -> u64 { x.rotate_right(14) ^ x.rotate_right(18) ^ x.rotate_right(41) }
-        #[inline] fn small_s0(x: u64) -> u64 { x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7) }
-        #[inline] fn small_s1(x: u64) -> u64 { x.rotate_right(19) ^ x.rotate_right(61) ^ (x >> 6) }
+        #[inline]
+        fn ch(x: u64, y: u64, z: u64) -> u64 {
+            (x & y) ^ (!x & z)
+        }
+        #[inline]
+        fn maj(x: u64, y: u64, z: u64) -> u64 {
+            (x & y) ^ (x & z) ^ (y & z)
+        }
+        #[inline]
+        fn big_s0(x: u64) -> u64 {
+            x.rotate_right(28) ^ x.rotate_right(34) ^ x.rotate_right(39)
+        }
+        #[inline]
+        fn big_s1(x: u64) -> u64 {
+            x.rotate_right(14) ^ x.rotate_right(18) ^ x.rotate_right(41)
+        }
+        #[inline]
+        fn small_s0(x: u64) -> u64 {
+            x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7)
+        }
+        #[inline]
+        fn small_s1(x: u64) -> u64 {
+            x.rotate_right(19) ^ x.rotate_right(61) ^ (x >> 6)
+        }
 
         let mut w = [0u64; 80];
         for i in 0..16 {
             let off = i * 8;
             w[i] = u64::from_be_bytes([
-                block[off], block[off + 1], block[off + 2], block[off + 3],
-                block[off + 4], block[off + 5], block[off + 6], block[off + 7],
+                block[off],
+                block[off + 1],
+                block[off + 2],
+                block[off + 3],
+                block[off + 4],
+                block[off + 5],
+                block[off + 6],
+                block[off + 7],
             ]);
         }
         for i in 16..80 {
-            w[i] = small_s1(w[i - 2]).wrapping_add(w[i - 7])
-                .wrapping_add(small_s0(w[i - 15])).wrapping_add(w[i - 16]);
+            w[i] = small_s1(w[i - 2])
+                .wrapping_add(w[i - 7])
+                .wrapping_add(small_s0(w[i - 15]))
+                .wrapping_add(w[i - 16]);
         }
-        let mut a = self.h[0]; let mut b = self.h[1]; let mut c = self.h[2];
-        let mut d = self.h[3]; let mut e = self.h[4]; let mut f = self.h[5];
-        let mut g = self.h[6]; let mut h = self.h[7];
+        let mut a = self.h[0];
+        let mut b = self.h[1];
+        let mut c = self.h[2];
+        let mut d = self.h[3];
+        let mut e = self.h[4];
+        let mut f = self.h[5];
+        let mut g = self.h[6];
+        let mut h = self.h[7];
         for i in 0..80 {
-            let t1 = h.wrapping_add(big_s1(e)).wrapping_add(ch(e, f, g))
-                .wrapping_add(K[i]).wrapping_add(w[i]);
+            let t1 = h
+                .wrapping_add(big_s1(e))
+                .wrapping_add(ch(e, f, g))
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
             let t2 = big_s0(a).wrapping_add(maj(a, b, c));
-            h = g; g = f; f = e;
+            h = g;
+            g = f;
+            f = e;
             e = d.wrapping_add(t1);
-            d = c; c = b; b = a;
+            d = c;
+            c = b;
+            b = a;
             a = t1.wrapping_add(t2);
         }
-        self.h[0] = self.h[0].wrapping_add(a); self.h[1] = self.h[1].wrapping_add(b);
-        self.h[2] = self.h[2].wrapping_add(c); self.h[3] = self.h[3].wrapping_add(d);
-        self.h[4] = self.h[4].wrapping_add(e); self.h[5] = self.h[5].wrapping_add(f);
-        self.h[6] = self.h[6].wrapping_add(g); self.h[7] = self.h[7].wrapping_add(h);
+        self.h[0] = self.h[0].wrapping_add(a);
+        self.h[1] = self.h[1].wrapping_add(b);
+        self.h[2] = self.h[2].wrapping_add(c);
+        self.h[3] = self.h[3].wrapping_add(d);
+        self.h[4] = self.h[4].wrapping_add(e);
+        self.h[5] = self.h[5].wrapping_add(f);
+        self.h[6] = self.h[6].wrapping_add(g);
+        self.h[7] = self.h[7].wrapping_add(h);
     }
 }
 
@@ -159,37 +276,46 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 type Gf = [i64; 16];
 
 const GF0: Gf = [0; 16];
-const GF1: Gf = { let mut g = [0i64; 16]; g[0] = 1; g };
+const GF1: Gf = {
+    let mut g = [0i64; 16];
+    g[0] = 1;
+    g
+};
 
 const D2: Gf = [
-    0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0,
-    0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406,
+    0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e,
+    0xfce7, 0x56df, 0xd9dc, 0x2406,
 ];
 const D: Gf = [
-    0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070,
-    0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203,
+    0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070, 0xe898, 0x7779, 0x4079, 0x8cc7,
+    0xfe73, 0x2b6f, 0x6cee, 0x5203,
 ];
 const SQRT_M1: Gf = [
-    0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43,
-    0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83,
+    0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43, 0xd7a7, 0x3dfb, 0x0099, 0x2b4d,
+    0xdf0b, 0x4fc1, 0x2480, 0x2b83,
 ];
 const BX: Gf = [
-    0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c,
-    0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169,
+    0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4,
+    0x53fe, 0xcd6e, 0x36d3, 0x2169,
 ];
 const BY: Gf = [
-    0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
-    0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
+    0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
+    0x6666, 0x6666, 0x6666, 0x6666,
 ];
 
-fn set(r: &mut Gf, a: &Gf) { for i in 0..16 { r[i] = a[i]; } }
+fn set(r: &mut Gf, a: &Gf) {
+    r.copy_from_slice(a);
+}
 
 fn car25519(o: &mut Gf) {
     for i in 0..16 {
         o[i] = o[i].wrapping_add(1i64 << 16);
         let c = o[i] >> 16;
-        if i < 15 { o[i + 1] = o[i + 1].wrapping_add(c - 1); }
-        else { o[0] = o[0].wrapping_add(38 * (c - 1)); }
+        if i < 15 {
+            o[i + 1] = o[i + 1].wrapping_add(c - 1);
+        } else {
+            o[0] = o[0].wrapping_add(38 * (c - 1));
+        }
         o[i] = o[i].wrapping_sub(c << 16);
     }
 }
@@ -198,13 +324,17 @@ fn sel25519(p: &mut Gf, q: &mut Gf, b: i64) {
     let c = !(b - 1);
     for i in 0..16 {
         let t = c & (p[i] ^ q[i]);
-        p[i] ^= t; q[i] ^= t;
+        p[i] ^= t;
+        q[i] ^= t;
     }
 }
 
 fn pack25519(o: &mut [u8; 32], n: &Gf) {
-    let mut t: Gf = [0; 16]; set(&mut t, n);
-    car25519(&mut t); car25519(&mut t); car25519(&mut t);
+    let mut t: Gf = [0; 16];
+    set(&mut t, n);
+    car25519(&mut t);
+    car25519(&mut t);
+    car25519(&mut t);
     for _ in 0..2 {
         let mut m: Gf = [0; 16];
         m[0] = t[0] - 0xffed;
@@ -224,38 +354,66 @@ fn pack25519(o: &mut [u8; 32], n: &Gf) {
 }
 
 fn neq25519(a: &Gf, b: &Gf) -> bool {
-    let mut c = [0u8; 32]; let mut d = [0u8; 32];
-    pack25519(&mut c, a); pack25519(&mut d, b);
+    let mut c = [0u8; 32];
+    let mut d = [0u8; 32];
+    pack25519(&mut c, a);
+    pack25519(&mut d, b);
     c != d
 }
 
 fn par25519(a: &Gf) -> u8 {
-    let mut d = [0u8; 32]; pack25519(&mut d, a); d[0] & 1
+    let mut d = [0u8; 32];
+    pack25519(&mut d, a);
+    d[0] & 1
 }
 
 fn unpack25519(o: &mut Gf, n: &[u8; 32]) {
-    for i in 0..16 { o[i] = (n[2 * i] as i64) + ((n[2 * i + 1] as i64) << 8); }
+    for i in 0..16 {
+        o[i] = (n[2 * i] as i64) + ((n[2 * i + 1] as i64) << 8);
+    }
     o[15] &= 0x7fff;
 }
 
-fn gf_a(o: &mut Gf, a: &Gf, b: &Gf) { for i in 0..16 { o[i] = a[i] + b[i]; } }
-fn gf_z(o: &mut Gf, a: &Gf, b: &Gf) { for i in 0..16 { o[i] = a[i] - b[i]; } }
+fn gf_a(o: &mut Gf, a: &Gf, b: &Gf) {
+    for i in 0..16 {
+        o[i] = a[i] + b[i];
+    }
+}
+fn gf_z(o: &mut Gf, a: &Gf, b: &Gf) {
+    for i in 0..16 {
+        o[i] = a[i] - b[i];
+    }
+}
 
 fn gf_m(o: &mut Gf, a: &Gf, b: &Gf) {
     let mut t: [i64; 31] = [0; 31];
-    for i in 0..16 { for j in 0..16 { t[i + j] += a[i] * b[j]; } }
-    for i in 0..15 { t[i] += 38 * t[i + 16]; }
-    for i in 0..16 { o[i] = t[i]; }
-    car25519(o); car25519(o);
+    for i in 0..16 {
+        for j in 0..16 {
+            t[i + j] += a[i] * b[j];
+        }
+    }
+    for i in 0..15 {
+        t[i] += 38 * t[i + 16];
+    }
+    o.copy_from_slice(&t[..16]);
+    car25519(o);
+    car25519(o);
 }
 
-fn gf_s(o: &mut Gf, a: &Gf) { let ac = *a; gf_m(o, &ac, &ac); }
+fn gf_s(o: &mut Gf, a: &Gf) {
+    let ac = *a;
+    gf_m(o, &ac, &ac);
+}
 
 fn inv25519(o: &mut Gf, i: &Gf) {
     let mut c: Gf = *i;
     for a in (0..=253i32).rev() {
-        let c_copy = c; gf_s(&mut c, &c_copy);
-        if a != 2 && a != 4 { let c_copy = c; gf_m(&mut c, &c_copy, i); }
+        let c_copy = c;
+        gf_s(&mut c, &c_copy);
+        if a != 2 && a != 4 {
+            let c_copy = c;
+            gf_m(&mut c, &c_copy, i);
+        }
     }
     *o = c;
 }
@@ -263,8 +421,12 @@ fn inv25519(o: &mut Gf, i: &Gf) {
 fn pow2523(o: &mut Gf, i: &Gf) {
     let mut c: Gf = *i;
     for a in (0..=250i32).rev() {
-        let c_copy = c; gf_s(&mut c, &c_copy);
-        if a != 1 { let c_copy = c; gf_m(&mut c, &c_copy, i); }
+        let c_copy = c;
+        gf_s(&mut c, &c_copy);
+        if a != 1 {
+            let c_copy = c;
+            gf_m(&mut c, &c_copy, i);
+        }
     }
     *o = c;
 }
@@ -272,34 +434,50 @@ fn pow2523(o: &mut Gf, i: &Gf) {
 type Point = [Gf; 4];
 
 fn point_add(p: &mut Point, q: &Point) {
-    let mut a: Gf = [0; 16]; let mut b: Gf = [0; 16];
-    let mut c: Gf = [0; 16]; let mut d: Gf = [0; 16];
-    let mut t: Gf = [0; 16]; let mut e: Gf = [0; 16];
-    let mut f: Gf = [0; 16]; let mut g: Gf = [0; 16];
+    let mut a: Gf = [0; 16];
+    let mut b: Gf = [0; 16];
+    let mut c: Gf = [0; 16];
+    let mut d: Gf = [0; 16];
+    let mut t: Gf = [0; 16];
+    let mut e: Gf = [0; 16];
+    let mut f: Gf = [0; 16];
+    let mut g: Gf = [0; 16];
     let mut h: Gf = [0; 16];
     gf_z(&mut a, &p[1], &p[0]);
     gf_z(&mut t, &q[1], &q[0]);
-    let ac = a; gf_m(&mut a, &ac, &t);
+    let ac = a;
+    gf_m(&mut a, &ac, &t);
     gf_a(&mut b, &p[0], &p[1]);
     gf_a(&mut t, &q[0], &q[1]);
-    let bc = b; gf_m(&mut b, &bc, &t);
+    let bc = b;
+    gf_m(&mut b, &bc, &t);
     gf_m(&mut c, &p[3], &q[3]);
-    let cc = c; gf_m(&mut c, &cc, &D2);
+    let cc = c;
+    gf_m(&mut c, &cc, &D2);
     gf_m(&mut d, &p[2], &q[2]);
-    let dc = d; gf_a(&mut d, &dc, &dc);
-    gf_z(&mut e, &b, &a); gf_z(&mut f, &d, &c);
-    gf_a(&mut g, &d, &c); gf_a(&mut h, &b, &a);
-    gf_m(&mut p[0], &e, &f); gf_m(&mut p[1], &h, &g);
-    gf_m(&mut p[2], &g, &f); gf_m(&mut p[3], &e, &h);
+    let dc = d;
+    gf_a(&mut d, &dc, &dc);
+    gf_z(&mut e, &b, &a);
+    gf_z(&mut f, &d, &c);
+    gf_a(&mut g, &d, &c);
+    gf_a(&mut h, &b, &a);
+    gf_m(&mut p[0], &e, &f);
+    gf_m(&mut p[1], &h, &g);
+    gf_m(&mut p[2], &g, &f);
+    gf_m(&mut p[3], &e, &h);
 }
 
 fn cswap(p: &mut Point, q: &mut Point, b: u8) {
     let bi = b as i64;
-    for i in 0..4 { sel25519(&mut p[i], &mut q[i], bi); }
+    for i in 0..4 {
+        sel25519(&mut p[i], &mut q[i], bi);
+    }
 }
 
 fn pack_point(r: &mut [u8; 32], p: &Point) {
-    let mut zi: Gf = [0; 16]; let mut tx: Gf = [0; 16]; let mut ty: Gf = [0; 16];
+    let mut zi: Gf = [0; 16];
+    let mut tx: Gf = [0; 16];
+    let mut ty: Gf = [0; 16];
     inv25519(&mut zi, &p[2]);
     gf_m(&mut tx, &p[0], &zi);
     gf_m(&mut ty, &p[1], &zi);
@@ -308,62 +486,86 @@ fn pack_point(r: &mut [u8; 32], p: &Point) {
 }
 
 fn scalarmult(p: &mut Point, q_in: &Point, s: &[u8; 32]) {
-    p[0] = GF0; p[1] = GF1; p[2] = GF1; p[3] = GF0;
+    p[0] = GF0;
+    p[1] = GF1;
+    p[2] = GF1;
+    p[3] = GF0;
     let mut q: Point = *q_in;
     for i in (0..=255).rev() {
         let b = (s[i / 8] >> (i & 7)) & 1;
         cswap(p, &mut q, b);
         point_add(&mut q, p);
-        let pc = *p; point_add(p, &pc);
+        let pc = *p;
+        point_add(p, &pc);
         cswap(p, &mut q, b);
     }
 }
 
 fn scalarbase(p: &mut Point, s: &[u8; 32]) {
     let mut q: Point = [GF0; 4];
-    set(&mut q[0], &BX); set(&mut q[1], &BY); set(&mut q[2], &GF1);
+    set(&mut q[0], &BX);
+    set(&mut q[1], &BY);
+    set(&mut q[2], &GF1);
     gf_m(&mut q[3], &BX, &BY);
     scalarmult(p, &q, s);
 }
 
 fn unpack_neg(r: &mut Point, p: &[u8; 32]) -> bool {
-    let mut t: Gf = [0; 16]; let mut chk: Gf = [0; 16];
-    let mut num: Gf = [0; 16]; let mut den: Gf = [0; 16];
-    let mut den2: Gf = [0; 16]; let mut den4: Gf = [0; 16]; let mut den6: Gf = [0; 16];
+    let mut t: Gf = [0; 16];
+    let mut chk: Gf = [0; 16];
+    let mut num: Gf = [0; 16];
+    let mut den: Gf = [0; 16];
+    let mut den2: Gf = [0; 16];
+    let mut den4: Gf = [0; 16];
+    let mut den6: Gf = [0; 16];
     set(&mut r[2], &GF1);
     unpack25519(&mut r[1], p);
     gf_s(&mut num, &r[1]);
     gf_m(&mut den, &num, &D);
-    let nc = num; gf_z(&mut num, &nc, &r[2]);
-    let dc = den; gf_a(&mut den, &r[2], &dc);
-    gf_s(&mut den2, &den); gf_s(&mut den4, &den2);
+    let nc = num;
+    gf_z(&mut num, &nc, &r[2]);
+    let dc = den;
+    gf_a(&mut den, &r[2], &dc);
+    gf_s(&mut den2, &den);
+    gf_s(&mut den4, &den2);
     gf_m(&mut den6, &den4, &den2);
     gf_m(&mut t, &den6, &num);
-    let tc = t; gf_m(&mut t, &tc, &den);
-    let tc = t; pow2523(&mut t, &tc);
-    let tc = t; gf_m(&mut t, &tc, &num);
-    let tc = t; gf_m(&mut t, &tc, &den);
-    let tc = t; gf_m(&mut t, &tc, &den);
+    let tc = t;
+    gf_m(&mut t, &tc, &den);
+    let tc = t;
+    pow2523(&mut t, &tc);
+    let tc = t;
+    gf_m(&mut t, &tc, &num);
+    let tc = t;
+    gf_m(&mut t, &tc, &den);
+    let tc = t;
+    gf_m(&mut t, &tc, &den);
     gf_m(&mut r[0], &t, &den);
     gf_s(&mut chk, &r[0]);
-    let cc = chk; gf_m(&mut chk, &cc, &den);
+    let cc = chk;
+    gf_m(&mut chk, &cc, &den);
     if neq25519(&chk, &num) {
-        let r0c = r[0]; gf_m(&mut r[0], &r0c, &SQRT_M1);
+        let r0c = r[0];
+        gf_m(&mut r[0], &r0c, &SQRT_M1);
     }
     gf_s(&mut chk, &r[0]);
-    let cc = chk; gf_m(&mut chk, &cc, &den);
-    if neq25519(&chk, &num) { return false; }
-    if par25519(&r[0]) == (p[31] >> 7) {
-        let r0c = r[0]; gf_z(&mut r[0], &GF0, &r0c);
+    let cc = chk;
+    gf_m(&mut chk, &cc, &den);
+    if neq25519(&chk, &num) {
+        return false;
     }
-    let r0c = r[0]; let r1c = r[1];
+    if par25519(&r[0]) == (p[31] >> 7) {
+        let r0c = r[0];
+        gf_z(&mut r[0], &GF0, &r0c);
+    }
+    let r0c = r[0];
+    let r1c = r[1];
     gf_m(&mut r[3], &r0c, &r1c);
     true
 }
 
 const L: [i64; 32] = [
-    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
-    0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
 ];
 
@@ -386,7 +588,9 @@ fn mod_l(r: &mut [u8; 32], x: &mut [i64; 64]) {
         carry = x[j] >> 8;
         x[j] &= 255;
     }
-    for j in 0..32 { x[j] -= carry * L[j]; }
+    for j in 0..32 {
+        x[j] -= carry * L[j];
+    }
     for i in 0..32 {
         x[i + 1] += x[i] >> 8;
         r[i] = (x[i] & 255) as u8;
@@ -395,7 +599,9 @@ fn mod_l(r: &mut [u8; 32], x: &mut [i64; 64]) {
 
 fn reduce(r: &mut [u8; 64]) -> [u8; 32] {
     let mut x: [i64; 64] = [0; 64];
-    for i in 0..64 { x[i] = r[i] as i64; }
+    for i in 0..64 {
+        x[i] = r[i] as i64;
+    }
     let mut out = [0u8; 32];
     mod_l(&mut out, &mut x);
     out
@@ -403,7 +609,9 @@ fn reduce(r: &mut [u8; 64]) -> [u8; 32] {
 
 pub fn verify(public_key: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
     let mut q: Point = [GF0; 4];
-    if !unpack_neg(&mut q, public_key) { return false; }
+    if !unpack_neg(&mut q, public_key) {
+        return false;
+    }
     let mut hasher = Sha512::new();
     hasher.update(&signature[..32]);
     hasher.update(public_key);
@@ -449,7 +657,9 @@ pub fn sign(seed: &[u8; 32], msg: &[u8]) -> ([u8; 32], [u8; 64]) {
     let h = sha512(seed);
     let mut a = [0u8; 32];
     a.copy_from_slice(&h[..32]);
-    a[0] &= 248; a[31] &= 127; a[31] |= 64;
+    a[0] &= 248;
+    a[31] &= 127;
+    a[31] |= 64;
     let prefix = &h[32..64];
 
     // A = [a]B, pk = compress(A)
@@ -483,7 +693,9 @@ pub fn sign(seed: &[u8; 32], msg: &[u8]) -> ([u8; 32], [u8; 64]) {
     // Place k*a (little-endian product) + r_scalar into a 64-byte x,
     // then reduce.
     let mut x: [i64; 64] = [0; 64];
-    for i in 0..32 { x[i] = r_scalar[i] as i64; }
+    for i in 0..32 {
+        x[i] = r_scalar[i] as i64;
+    }
     for i in 0..32 {
         for j in 0..32 {
             x[i + j] += (k_scalar[i] as i64) * (a[j] as i64);
@@ -507,21 +719,37 @@ mod tests {
         let bytes = s.as_bytes();
         let mut i = 0;
         while i + 1 < bytes.len() {
-            let hi = match bytes[i] { b'0'..=b'9' => bytes[i] - b'0', b'a'..=b'f' => bytes[i] - b'a' + 10, _ => panic!() };
-            let lo = match bytes[i+1] { b'0'..=b'9' => bytes[i+1] - b'0', b'a'..=b'f' => bytes[i+1] - b'a' + 10, _ => panic!() };
+            let hi = match bytes[i] {
+                b'0'..=b'9' => bytes[i] - b'0',
+                b'a'..=b'f' => bytes[i] - b'a' + 10,
+                _ => panic!(),
+            };
+            let lo = match bytes[i + 1] {
+                b'0'..=b'9' => bytes[i + 1] - b'0',
+                b'a'..=b'f' => bytes[i + 1] - b'a' + 10,
+                _ => panic!(),
+            };
             out.push((hi << 4) | lo);
             i += 2;
         }
         out
     }
 
-    fn arr32(v: &[u8]) -> [u8; 32] { let mut a = [0u8; 32]; a.copy_from_slice(v); a }
+    fn arr32(v: &[u8]) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(v);
+        a
+    }
 
     #[test]
     fn rfc_vector_1_signing() {
         // RFC 8032 TEST 1: seed, pk, signature, empty msg.
-        let seed = arr32(&parse_hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"));
-        let expected_pk = arr32(&parse_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"));
+        let seed = arr32(&parse_hex(
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        ));
+        let expected_pk = arr32(&parse_hex(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        ));
         let expected_sig = parse_hex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
         let (pk, sig) = sign(&seed, b"");
         assert_eq!(pk, expected_pk);

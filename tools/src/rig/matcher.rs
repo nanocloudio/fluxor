@@ -63,7 +63,9 @@ pub enum MatcherOutcome {
     /// the rule that completed the pass set (i.e. the last pass rule to
     /// flip from unmatched to matched) — the one whose match finally
     /// produced the verdict, not the one that happened to be listed first.
-    Passed { primary_source: Capability },
+    Passed {
+        primary_source: Capability,
+    },
     /// A fail rule fired. `primary_source` is the capability of that
     /// specific rule, not of the first fail rule in the scenario list.
     Failed {
@@ -206,11 +208,14 @@ impl Matcher {
                     continue;
                 }
                 if rule_matches_text(rule, &text) {
-                    self.fail_hit = Some((idx, format!(
-                        "console fail on {}: {:?}",
-                        source.as_str(),
-                        rule.pattern.as_deref().unwrap_or("<no regex>"),
-                    )));
+                    self.fail_hit = Some((
+                        idx,
+                        format!(
+                            "console fail on {}: {:?}",
+                            source.as_str(),
+                            rule.pattern.as_deref().unwrap_or("<no regex>"),
+                        ),
+                    ));
                     return;
                 }
             }
@@ -255,10 +260,8 @@ impl Matcher {
                         }
                         RuleKind::Fail => {
                             if self.fail_hit.is_none() {
-                                self.fail_hit = Some((
-                                    idx,
-                                    format!("netboot_fetch fail: {filename}"),
-                                ));
+                                self.fail_hit =
+                                    Some((idx, format!("netboot_fetch fail: {filename}")));
                             }
                         }
                     }
@@ -296,9 +299,10 @@ impl Matcher {
 
 fn compile_rule(rule: &ObservationRule, kind: RuleKind) -> Result<CompiledRule> {
     let regex = match &rule.regex {
-        Some(p) => Some(Regex::new(p).map_err(|e| {
-            Error::Config(format!("rig rule: invalid regex {p:?}: {e}"))
-        })?),
+        Some(p) => Some(
+            Regex::new(p)
+                .map_err(|e| Error::Config(format!("rig rule: invalid regex {p:?}: {e}")))?,
+        ),
         None => None,
     };
     Ok(CompiledRule {
@@ -358,11 +362,7 @@ mod tests {
 
     #[test]
     fn console_fail_wins_even_when_pass_also_matches() {
-        let mut m = Matcher::new(
-            &[console_rule("ok")],
-            &[console_rule("PANIC")],
-        )
-        .unwrap();
+        let mut m = Matcher::new(&[console_rule("ok")], &[console_rule("PANIC")]).unwrap();
         let r = m.observe(&serial_bytes(b"ok but also PANIC\n"));
         assert!(matches!(r, MatcherOutcome::Failed { .. }), "{r:?}");
     }
@@ -378,11 +378,7 @@ mod tests {
 
     #[test]
     fn all_pass_rules_required() {
-        let mut m = Matcher::new(
-            &[console_rule("stage1"), console_rule("stage2")],
-            &[],
-        )
-        .unwrap();
+        let mut m = Matcher::new(&[console_rule("stage1"), console_rule("stage2")], &[]).unwrap();
         let r = m.observe(&serial_bytes(b"stage1 done"));
         assert!(matches!(r, MatcherOutcome::InProgress));
         let r = m.observe(&serial_bytes(b"...stage2 done"));

@@ -18,22 +18,43 @@ pub struct RingBufState {
     cap_mask: usize,
 }
 
+impl Default for RingBufState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RingBufState {
     /// Create a zero-capacity state (must call `init` before use).
     pub const fn new() -> Self {
-        Self { head: 0, tail: 0, len: 0, cap: 0, cap_mask: 0 }
+        Self {
+            head: 0,
+            tail: 0,
+            len: 0,
+            cap: 0,
+            cap_mask: 0,
+        }
     }
 
     /// Create a state with known capacity (for inline buffers).
     /// `cap` must be a power of two.
     pub const fn with_capacity(cap: usize) -> Self {
-        Self { head: 0, tail: 0, len: 0, cap, cap_mask: if cap > 0 { cap - 1 } else { 0 } }
+        Self {
+            head: 0,
+            tail: 0,
+            len: 0,
+            cap,
+            cap_mask: if cap > 0 { cap - 1 } else { 0 },
+        }
     }
 
     /// (Re-)initialise with a given capacity and reset pointers.
     /// `cap` must be a power of two.
     pub fn init(&mut self, cap: usize) {
-        debug_assert!(cap == 0 || cap.is_power_of_two(), "ring buffer cap must be power of 2");
+        debug_assert!(
+            cap == 0 || cap.is_power_of_two(),
+            "ring buffer cap must be power of 2"
+        );
         self.head = 0;
         self.tail = 0;
         self.len = 0;
@@ -44,13 +65,19 @@ impl RingBufState {
     /// Write `data` into `storage`, returning bytes written.
     pub fn write(&mut self, storage: &mut [u8], data: &[u8]) -> usize {
         let cap = self.cap;
-        if cap == 0 { return 0; }
+        if cap == 0 {
+            return 0;
+        }
         let avail = cap - self.len;
         // All-or-nothing: partial writes corrupt byte-stream framing
         // (e.g. net_proto between NIC driver and IP module).
-        if data.len() > avail { return 0; }
+        if data.len() > avail {
+            return 0;
+        }
         let total = data.len();
-        if total == 0 { return 0; }
+        if total == 0 {
+            return 0;
+        }
 
         let first = total.min(cap - self.tail);
         storage[self.tail..self.tail + first].copy_from_slice(&data[..first]);
@@ -66,9 +93,13 @@ impl RingBufState {
     /// Read into `out` from `storage`, returning bytes read.
     pub fn read(&mut self, storage: &[u8], out: &mut [u8]) -> usize {
         let cap = self.cap;
-        if cap == 0 { return 0; }
+        if cap == 0 {
+            return 0;
+        }
         let total = out.len().min(self.len);
-        if total == 0 { return 0; }
+        if total == 0 {
+            return 0;
+        }
 
         let first = total.min(cap - self.head);
         out[..first].copy_from_slice(&storage[self.head..self.head + first]);
@@ -85,6 +116,12 @@ impl RingBufState {
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// True when no bytes are available to read.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Buffer capacity.
@@ -115,7 +152,6 @@ impl RingBufState {
         self.tail = 0;
         self.len = 0;
     }
-
 }
 
 #[cfg(test)]

@@ -26,7 +26,7 @@ pub mod target;
 mod uf2;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{
     decode_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES,
@@ -382,7 +382,7 @@ fn read_trailer_config_addr(memory: &std::collections::BTreeMap<u32, u8>) -> Res
     Ok(config_addr)
 }
 
-fn cmd_info_fmod(file: &PathBuf) -> Result<()> {
+fn cmd_info_fmod(file: &Path) -> Result<()> {
     let m = modules::ModuleInfo::from_file(file)?;
     let type_str = match m.module_type {
         1 => "Source",
@@ -659,7 +659,7 @@ fn substitute_env_vars(input: &str) -> Result<String> {
 }
 
 fn cmd_generate(
-    config_path: &PathBuf,
+    config_path: &Path,
     output: Option<&std::path::Path>,
     modules_dir_override: Option<&std::path::Path>,
     binary: bool,
@@ -1244,9 +1244,9 @@ fn cmd_slot_image(
         .ok_or_else(|| error::Error::Config("Slot image requires at least one module".into()))?;
 
     // Lay out the slot: header | pad → 4KB | modules | pad → 256B | config.
-    let modules_offset = ((HEADER_SIZE + MODULES_ALIGN - 1) / MODULES_ALIGN) * MODULES_ALIGN;
+    let modules_offset = HEADER_SIZE.div_ceil(MODULES_ALIGN) * MODULES_ALIGN;
     let modules_end = modules_offset + modules_data.len();
-    let config_offset = ((modules_end + SECTION_ALIGN - 1) / SECTION_ALIGN) * SECTION_ALIGN;
+    let config_offset = modules_end.div_ceil(SECTION_ALIGN) * SECTION_ALIGN;
     let config_end = config_offset + config_data.len();
     if config_end > SLOT_SIZE {
         return Err(error::Error::Config(format!(
@@ -1313,8 +1313,8 @@ fn cmd_example(name: &str) -> Result<()> {
 }
 
 fn cmd_pack(
-    input: &PathBuf,
-    output: &PathBuf,
+    input: &Path,
+    output: &Path,
     name: Option<String>,
     module_type: u8,
     manifest: Option<PathBuf>,
@@ -1595,9 +1595,9 @@ fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
 }
 
 fn cmd_mktable_config(
-    config_path: &PathBuf,
+    config_path: &Path,
     modules_dirs: &[PathBuf],
-    output: &PathBuf,
+    output: &Path,
 ) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let mut config: serde_json::Value = if config_path
@@ -1697,10 +1697,7 @@ fn build_one(
     verbose: bool,
 ) -> Result<BuildResult> {
     // Load and parse config
-    let content = match substitute_env_vars(&std::fs::read_to_string(yaml_path)?) {
-        Ok(c) => c,
-        Err(e) => return Err(e),
-    };
+    let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
     let config: serde_json::Value = if yaml_path
         .extension()
         .is_some_and(|ext| ext == "yaml" || ext == "yml")
@@ -1829,10 +1826,10 @@ fn build_one(
             // host-playback). A YAML that asks for a backend the
             // binary can't provide fails here with the matching
             // `cargo build` command in the error message.
-            validate_linux_runtime_features(&yaml_path.to_path_buf())?;
-            cmd_mktable_config(&yaml_path.to_path_buf(), &fmod_dirs, &modules_bin_path)?;
+            validate_linux_runtime_features(yaml_path)?;
+            cmd_mktable_config(yaml_path, &fmod_dirs, &modules_bin_path)?;
             cmd_generate(
-                &yaml_path.to_path_buf(),
+                yaml_path,
                 Some(config_bin_path.as_path()),
                 Some(modules_dir.as_path()),
                 true,
@@ -1853,7 +1850,7 @@ fn build_one(
     })
 }
 
-fn cmd_build(path: &PathBuf, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
+fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
     if path.is_dir() {
         // Glob for all YAML files recursively
         let mut yamls: Vec<PathBuf> = Vec::new();
@@ -2213,7 +2210,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_flash(config_path: &PathBuf, verbose: bool) -> Result<()> {
+fn cmd_flash(config_path: &Path, verbose: bool) -> Result<()> {
     let result = build_one(config_path, None, verbose)?;
 
     match result.family.as_str() {

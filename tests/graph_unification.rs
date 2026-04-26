@@ -14,9 +14,7 @@
 
 use std::sync::Mutex;
 
-use fluxor::kernel::config::{
-    Config, ConfigHeader, EdgeClass, GraphEdge, ModuleEntry,
-};
+use fluxor::kernel::config::{Config, ConfigHeader, EdgeClass, GraphEdge, ModuleEntry};
 use fluxor::kernel::loader;
 use fluxor::kernel::scheduler;
 
@@ -54,14 +52,7 @@ fn add_module(cfg: &mut Config, idx: usize, id: u8, name_hash: u32) {
     cfg.module_count = cfg.module_count.max(idx as u8 + 1);
 }
 
-fn add_edge(
-    cfg: &mut Config,
-    idx: usize,
-    from_id: u8,
-    from_port: u8,
-    to_id: u8,
-    to_port: u8,
-) {
+fn add_edge(cfg: &mut Config, idx: usize, from_id: u8, from_port: u8, to_id: u8, to_port: u8) {
     cfg.graph_edges[idx] = Some(GraphEdge {
         from_id,
         to_id,
@@ -103,8 +94,14 @@ fn one_to_one_graph_inserts_no_fan_modules() {
 
     let (modules, count) = install_and_prepare(cfg);
     assert_eq!(count, 2, "no fan inserts expected for 1:1 graph");
-    assert_eq!(count_internal(&modules, count, scheduler::INTERNAL_TEE_HASH), 0);
-    assert_eq!(count_internal(&modules, count, scheduler::INTERNAL_MERGE_HASH), 0);
+    assert_eq!(
+        count_internal(&modules, count, scheduler::INTERNAL_TEE_HASH),
+        0
+    );
+    assert_eq!(
+        count_internal(&modules, count, scheduler::INTERNAL_MERGE_HASH),
+        0
+    );
 }
 
 #[test]
@@ -121,7 +118,10 @@ fn fan_out_inserts_tee_module() {
 
     let (modules, count) = install_and_prepare(cfg);
     let tees = count_internal(&modules, count, scheduler::INTERNAL_TEE_HASH);
-    assert_eq!(tees, 1, "exactly one tee should be inserted for one fan-out group");
+    assert_eq!(
+        tees, 1,
+        "exactly one tee should be inserted for one fan-out group"
+    );
     assert!(count > 4, "module list should grow by the inserted tee");
 }
 
@@ -139,7 +139,10 @@ fn fan_in_inserts_merge_module() {
 
     let (modules, count) = install_and_prepare(cfg);
     let merges = count_internal(&modules, count, scheduler::INTERNAL_MERGE_HASH);
-    assert_eq!(merges, 1, "exactly one merge should be inserted for one fan-in group");
+    assert_eq!(
+        merges, 1,
+        "exactly one merge should be inserted for one fan-in group"
+    );
 }
 
 #[test]
@@ -155,7 +158,10 @@ fn distinct_source_ports_do_not_fan() {
 
     let (modules, count) = install_and_prepare(cfg);
     assert_eq!(count, 3, "no fan inserts when ports are distinct");
-    assert_eq!(count_internal(&modules, count, scheduler::INTERNAL_TEE_HASH), 0);
+    assert_eq!(
+        count_internal(&modules, count, scheduler::INTERNAL_TEE_HASH),
+        0
+    );
 }
 
 /// A direct edge `A.out[p] -> B.in[q]` must resolve to the same

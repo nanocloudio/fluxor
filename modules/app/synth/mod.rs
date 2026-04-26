@@ -813,9 +813,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let drive_scale = 256 + drive * 3;
                 let x = (sum_l * drive_scale) >> 8;
                 let x_clamped = x.clamp(-32768, 32767);
-                let x_norm = x_clamped as i64;
-                let x_cubed = (x_norm * x_norm * x_norm) >> 30;
-                sum_l = (x_norm - (x_cubed / 3)) as i32;
+                // Soft-clip x - x^3 / 3 with the cube scaled by 2^30 to stay
+                // within i32. PIC modules can't link `__aeabi_ldivmod`, so
+                // i64 math is off-limits here.
+                //   x_sq    = (x * x)    >> 15  ∈ [0, 2^15]
+                //   x_cubed = (x_sq * x) >> 15  = x^3 >> 30, fits i32
+                let x_sq = (x_clamped * x_clamped) >> 15;
+                let x_cubed = (x_sq * x_clamped) >> 15;
+                sum_l = x_clamped - x_cubed / 3;
                 sum_r = sum_l;
             }
 

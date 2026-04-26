@@ -45,7 +45,7 @@ mod rp2350_impl {
     const MPU_BASE: u32 = 0xE000_ED90;
 
     /// MPU Type Register — reports number of regions
-    const MPU_TYPE: *const u32 = (MPU_BASE + 0x00) as *const u32;
+    const MPU_TYPE: *const u32 = MPU_BASE as *const u32;
     /// MPU Control Register
     const MPU_CTRL: *mut u32 = (MPU_BASE + 0x04) as *mut u32;
     /// MPU Region Number Register
@@ -747,7 +747,7 @@ mod rp2350_impl {
 
         // Set the stacked PC to the fault_trampoline which returns
         // an error code to the scheduler.
-        let trampoline_addr = fault_trampoline as u32 | 1; // Thumb bit
+        let trampoline_addr = (fault_trampoline as usize | 1) as u32; // Thumb bit
         core::ptr::write_volatile((psp as *mut u32).add(6), trampoline_addr);
 
         // Set R0 in stacked frame to the error code
@@ -880,6 +880,12 @@ pub fn configure_for_module(module_idx: usize) {
 
 /// Execute module_step in unprivileged mode with MPU protection.
 /// Falls through to direct call if isolation is not enabled.
+///
+/// # Safety
+/// `step_fn` must be the genuine `module_step` export of the module
+/// whose state lives at `state_ptr`. `state_ptr` must remain valid for
+/// the duration of the call (single-step burst or the unprivileged
+/// trampoline). Caller must run on the module's owning core.
 pub unsafe fn protected_step(
     step_fn: crate::kernel::loader::ModuleStepFn,
     state_ptr: *mut u8,
@@ -893,6 +899,12 @@ pub unsafe fn protected_step(
 }
 
 /// Execute burst trampoline in unprivileged mode.
+///
+/// # Safety
+/// Same constraints as [`protected_step`]: `step_fn` must be the
+/// module's real `module_step` export and `state_ptr` must remain
+/// valid for the duration of the burst (up to `max_burst`
+/// consecutive invocations).
 pub unsafe fn protected_burst(
     step_fn: crate::kernel::loader::ModuleStepFn,
     state_ptr: *mut u8,

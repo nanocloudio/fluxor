@@ -160,10 +160,7 @@ struct RpUsbSink;
 
 impl fluxor::platform::debug::DebugTx for RpUsbSink {
     fn write(&mut self, bytes: &[u8]) -> usize {
-        match USB_TX_PIPE.try_write(bytes) {
-            Ok(n) => n,
-            Err(_) => 0,
-        }
+        USB_TX_PIPE.try_write(bytes).unwrap_or_default()
     }
 }
 
@@ -177,8 +174,10 @@ fn debug_drain_poll() {
     // SAFETY: single consumer of `log_ring`; the Embassy main task is
     // the only caller (no other tasks or ISRs touch DEBUG_DRAIN).
     unsafe {
-        let drain = &mut *(&raw mut DEBUG_DRAIN);
-        let sink = &mut *(&raw mut DEBUG_SINK);
+        let drain_p = &raw mut DEBUG_DRAIN;
+        let sink_p = &raw mut DEBUG_SINK;
+        let drain = &mut *drain_p;
+        let sink = &mut *sink_p;
         drain.poll(sink);
     }
 }
@@ -240,7 +239,8 @@ async fn usb_cdc_task(driver: Driver<'static, USB>) {
             // SAFETY: the Embassy main task is the only caller that
             // touches DEBUG_DRAIN; this branch runs inside that task.
             unsafe {
-                let drain = &mut *(&raw mut DEBUG_DRAIN);
+                let drain_p = &raw mut DEBUG_DRAIN;
+                let drain = &mut *drain_p;
                 drain.reset();
             }
         }
@@ -454,11 +454,11 @@ fn rp_validate_fn_addr(addr: usize) -> bool {
         return false;
     }
     let instr_addr = addr & !1;
-    instr_addr >= FLASH_BASE && instr_addr < FLASH_END
+    (FLASH_BASE..FLASH_END).contains(&instr_addr)
 }
 
 fn rp_validate_module_base(addr: usize) -> bool {
-    addr >= FLASH_BASE && addr < FLASH_END
+    (FLASH_BASE..FLASH_END).contains(&addr)
 }
 
 fn rp_validate_fn_in_code(addr: usize, code_base: usize, code_size: u32) -> bool {
@@ -637,8 +637,8 @@ async fn rp_instantiate_all_modules_async(
 ) -> i32 {
     let mut instantiated = 0;
 
-    for module_idx in 0..module_count {
-        let entry = match &module_list[module_idx] {
+    for (module_idx, entry_opt) in module_list.iter().take(module_count).enumerate() {
+        let entry = match entry_opt {
             Some(entry) => entry,
             None => continue,
         };

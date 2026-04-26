@@ -109,9 +109,8 @@ pub fn attach(
             ))
         })?;
 
-    let json = serde_json::to_string(invocation).map_err(|e| {
-        Error::Config(format!("rig backend: serialising invocation: {e}"))
-    })?;
+    let json = serde_json::to_string(invocation)
+        .map_err(|e| Error::Config(format!("rig backend: serialising invocation: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(json.as_bytes());
         let _ = stdin.write_all(b"\n");
@@ -288,11 +287,7 @@ mod tests {
         name: &str,
         surface: Surface,
         script: &str,
-    ) -> (
-        PathBuf,
-        BackendRef,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
+    ) -> (PathBuf, BackendRef, std::sync::MutexGuard<'static, ()>) {
         let guard = crate::rig::test_utils::lock_exec_spawn();
         let tmp = crate::rig::test_utils::unique_tmp_dir(&format!("transport-{name}"));
         let slug = format!("{}-{}", surface.as_str(), name);

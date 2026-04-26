@@ -50,16 +50,16 @@ pub mod contract {
     //! range (kernel_abi primitives plus permission-gated orchestration
     //! ops). Modules must not `provider_open` against it; the kernel
     //! uses it only for routing. See `INTERNAL_DISPATCH_BUCKET` below.
-    pub const COMMON:      u16 = 0x0000;
-    pub const HAL_GPIO:    u16 = 0x0001;
-    pub const HAL_SPI:     u16 = 0x0002;
-    pub const HAL_I2C:     u16 = 0x0003;
-    pub const HAL_PIO:     u16 = 0x0004;
-    pub const CHANNEL:     u16 = 0x0005;
-    pub const TIMER:       u16 = 0x0006;
-    pub const FS:          u16 = 0x0009;
-    pub const BUFFER:      u16 = 0x000A;
-    pub const EVENT:       u16 = 0x000B;
+    pub const COMMON: u16 = 0x0000;
+    pub const HAL_GPIO: u16 = 0x0001;
+    pub const HAL_SPI: u16 = 0x0002;
+    pub const HAL_I2C: u16 = 0x0003;
+    pub const HAL_PIO: u16 = 0x0004;
+    pub const CHANNEL: u16 = 0x0005;
+    pub const TIMER: u16 = 0x0006;
+    pub const FS: u16 = 0x0009;
+    pub const BUFFER: u16 = 0x000A;
+    pub const EVENT: u16 = 0x000B;
     /// NIC ring management (create/destroy/info). Drivers declare
     /// `requires_contract = "platform_nic_ring"` in their manifest;
     /// the `platform_raw` permission gates the specific opcodes in
@@ -89,10 +89,10 @@ pub mod contract {
     /// declare `requires_contract = "pcie_device"`; the
     /// `platform_raw` permission gates the underlying opcodes.
     pub const PCIE_DEVICE: u16 = 0x0012;
-    pub const HAL_UART:    u16 = 0x000D;
-    pub const HAL_ADC:     u16 = 0x000E;
-    pub const HAL_PWM:     u16 = 0x000F;
-    pub const KEY_VAULT:   u16 = 0x0010;
+    pub const HAL_UART: u16 = 0x000D;
+    pub const HAL_ADC: u16 = 0x000E;
+    pub const HAL_PWM: u16 = 0x000F;
+    pub const KEY_VAULT: u16 = 0x0010;
 
     /// Kernel-internal dispatch bucket for 0x0Cxx opcodes. NOT a
     /// public contract. `syscall_provider_open` rejects this id from
@@ -104,12 +104,12 @@ pub mod contract {
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
     // constants — the alias just drops the prefix for callsite brevity.
     pub const GPIO: u16 = HAL_GPIO;
-    pub const SPI:  u16 = HAL_SPI;
-    pub const I2C:  u16 = HAL_I2C;
-    pub const PIO:  u16 = HAL_PIO;
+    pub const SPI: u16 = HAL_SPI;
+    pub const I2C: u16 = HAL_I2C;
+    pub const PIO: u16 = HAL_PIO;
     pub const UART: u16 = HAL_UART;
-    pub const ADC:  u16 = HAL_ADC;
-    pub const PWM:  u16 = HAL_PWM;
+    pub const ADC: u16 = HAL_ADC;
+    pub const PWM: u16 = HAL_PWM;
 }
 
 /// Function signatures for a contract vtable.
@@ -125,14 +125,14 @@ pub mod contract {
 /// `channel::CLOSE`). Contracts whose handles don't need a close hook
 /// (BUFFER, some net paths) leave it as 0, in which case
 /// `provider_close` just releases the tracking entry.
-pub type VTableCallFn  = unsafe fn(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32;
+pub type VTableCallFn = unsafe fn(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32;
 pub type VTableQueryFn = unsafe fn(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32;
 
 /// A contract's dispatch vtable. Registered once at kernel init via
 /// `register_vtable`.
 pub struct ProviderVTable {
     pub contract: ContractId,
-    pub call:  VTableCallFn,
+    pub call: VTableCallFn,
     pub query: Option<VTableQueryFn>,
     /// Opcode used by `provider_close` to release a handle. 0 = none.
     pub default_close_op: u32,
@@ -151,13 +151,17 @@ static mut VTABLES: [Option<&'static ProviderVTable>; MAX_CONTRACTS] =
 pub fn register_vtable(vt: &'static ProviderVTable) {
     let idx = vt.contract as usize;
     assert!(idx < MAX_CONTRACTS, "contract id out of range");
-    unsafe { VTABLES[idx] = Some(vt); }
+    unsafe {
+        VTABLES[idx] = Some(vt);
+    }
 }
 
 /// Look up a contract's vtable by id.
 fn vtable_for(contract: ContractId) -> Option<&'static ProviderVTable> {
     let idx = contract as usize;
-    if idx >= MAX_CONTRACTS { return None; }
+    if idx >= MAX_CONTRACTS {
+        return None;
+    }
     unsafe { VTABLES[idx] }
 }
 
@@ -178,19 +182,27 @@ struct HandleBinding {
 }
 
 static mut HANDLE_BINDINGS: [HandleBinding; MAX_TRACKED] = [const {
-    HandleBinding { handle: -1, contract: 0 }
+    HandleBinding {
+        handle: -1,
+        contract: 0,
+    }
 }; MAX_TRACKED];
 
 fn track_handle(handle: i32, contract: ContractId) {
-    if handle < 0 { return; }
+    if handle < 0 {
+        return;
+    }
     // Tagged fds (event / timer / dma) are self-identifying — the FD
     // tag carries the contract id, so `lookup_contract` resolves them
     // without a tracking table entry. Skip tracking to keep the table
     // available for untagged handles (GPIO pins, DMA channel numbers,
     // HAL handles) that genuinely need an entry.
-    if fd_tag_contract(handle).is_some() { return; }
+    if fd_tag_contract(handle).is_some() {
+        return;
+    }
     unsafe {
-        for slot in (*(&raw mut HANDLE_BINDINGS)).iter_mut() {
+        let p = &raw mut HANDLE_BINDINGS;
+        for slot in (*p).iter_mut() {
             if slot.handle == -1 {
                 slot.handle = handle;
                 slot.contract = contract;
@@ -215,7 +227,9 @@ pub fn contract_of(handle: i32) -> Option<ContractId> {
 /// those rely on the `HANDLE_BINDINGS` tracking table populated by
 /// `provider_open`.
 fn fd_tag_contract(handle: i32) -> Option<ContractId> {
-    if handle < 0 { return None; }
+    if handle < 0 {
+        return None;
+    }
     use crate::kernel::fd;
     // Tag 0 (FD_TAG_CHANNEL) produces handles indistinguishable from
     // raw integers because tag 0 doesn't set any high bits. Resolving
@@ -248,10 +262,15 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
 }
 
 fn lookup_contract(handle: i32) -> Option<ContractId> {
-    if handle < 0 { return None; }
-    if let Some(c) = fd_tag_contract(handle) { return Some(c); }
+    if handle < 0 {
+        return None;
+    }
+    if let Some(c) = fd_tag_contract(handle) {
+        return Some(c);
+    }
     unsafe {
-        for slot in (*(&raw const HANDLE_BINDINGS)).iter() {
+        let p = &raw const HANDLE_BINDINGS;
+        for slot in (*p).iter() {
             if slot.handle == handle {
                 return Some(slot.contract);
             }
@@ -261,9 +280,12 @@ fn lookup_contract(handle: i32) -> Option<ContractId> {
 }
 
 fn release_handle(handle: i32) {
-    if handle < 0 { return; }
+    if handle < 0 {
+        return;
+    }
     unsafe {
-        for slot in (*(&raw mut HANDLE_BINDINGS)).iter_mut() {
+        let p = &raw mut HANDLE_BINDINGS;
+        for slot in (*p).iter_mut() {
             if slot.handle == handle {
                 slot.handle = -1;
                 slot.contract = 0;
@@ -397,9 +419,7 @@ pub fn provider_close(handle: i32) -> i32 {
     let result = if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             if vt.default_close_op != 0 {
-                unsafe {
-                    (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0)
-                }
+                unsafe { (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0) }
             } else {
                 0
             }
@@ -417,7 +437,8 @@ pub fn provider_close(handle: i32) -> i32 {
 /// graphs don't inherit stale handle→contract bindings.
 pub fn reset_handle_tracking() {
     unsafe {
-        for slot in (*(&raw mut HANDLE_BINDINGS)).iter_mut() {
+        let p = &raw mut HANDLE_BINDINGS;
+        for slot in (*p).iter_mut() {
             slot.handle = -1;
             slot.contract = 0;
         }
@@ -427,13 +448,19 @@ pub fn reset_handle_tracking() {
 /// Function signature for a kernel-internal contract provider.
 /// Arguments: handle, opcode, arg pointer, arg length.
 /// Returns: result code (0 = success, >0 = bytes/count, <0 = errno).
-pub type ProviderDispatch = unsafe fn(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
+pub type ProviderDispatch =
+    unsafe fn(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
 
 /// Function signature for a PIC module contract provider. Shape matches
 /// `ProviderDispatch` with the module's state pointer prepended. Called
 /// synchronously from kernel context — must not block or perform async I/O.
-pub type ModuleProviderDispatchFn =
-    unsafe extern "C" fn(state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32;
+pub type ModuleProviderDispatchFn = unsafe extern "C" fn(
+    state: *mut u8,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32;
 
 /// Maximum registered contracts (indexed by `ContractId`).
 const MAX_PROVIDERS: usize = 32;
@@ -472,7 +499,8 @@ impl ProviderEntry {
 }
 
 /// Provider table — indexed by contract id (0x00..0x1F).
-static mut PROVIDERS: [ProviderEntry; MAX_PROVIDERS] = [const { ProviderEntry::empty() }; MAX_PROVIDERS];
+static mut PROVIDERS: [ProviderEntry; MAX_PROVIDERS] =
+    [const { ProviderEntry::empty() }; MAX_PROVIDERS];
 
 /// Register a kernel-internal provider for a contract. Called at
 /// kernel startup.
@@ -497,15 +525,16 @@ pub fn register(contract: ContractId, dispatch: ProviderDispatch) {
 /// replaceable by a module.
 #[inline]
 fn is_module_providable(contract: ContractId) -> bool {
-    matches!(contract,
+    matches!(
+        contract,
         contract::HAL_GPIO
-        | contract::HAL_SPI
-        | contract::HAL_I2C
-        | contract::HAL_PIO
-        | contract::HAL_UART
-        | contract::HAL_ADC
-        | contract::HAL_PWM
-        | contract::FS
+            | contract::HAL_SPI
+            | contract::HAL_I2C
+            | contract::HAL_PIO
+            | contract::HAL_UART
+            | contract::HAL_ADC
+            | contract::HAL_PWM
+            | contract::FS
     )
 }
 
@@ -528,7 +557,8 @@ pub fn register_module_provider(
     if !is_module_providable(contract) {
         log::error!(
             "[provider] module {} tried to register for non-providable contract 0x{:04x}",
-            module_idx, contract,
+            module_idx,
+            contract,
         );
         return errno::EACCES;
     }
@@ -541,14 +571,23 @@ pub fn register_module_provider(
     if code_base != 0 && code_size != 0 {
         let code_end = code_base + code_size as usize;
         if fn_addr < code_base || fn_addr >= code_end {
-            log::error!("[provider] module {} fn_ptr 0x{:08x} outside code region 0x{:08x}..0x{:08x}",
-                module_idx, fn_addr, code_base, code_end);
+            log::error!(
+                "[provider] module {} fn_ptr 0x{:08x} outside code region 0x{:08x}..0x{:08x}",
+                module_idx,
+                fn_addr,
+                code_base,
+                code_end
+            );
             return errno::EINVAL;
         }
         // On Cortex-M (Thumb mode): verify LSB is set
         #[cfg(target_arch = "arm")]
         if fn_addr & 1 == 0 {
-            log::error!("[provider] module {} fn_ptr 0x{:08x} missing Thumb bit", module_idx, fn_addr);
+            log::error!(
+                "[provider] module {} fn_ptr 0x{:08x} missing Thumb bit",
+                module_idx,
+                fn_addr
+            );
             return errno::EINVAL;
         }
     }
@@ -578,7 +617,12 @@ pub fn register_module_provider(
             state,
         });
         entry.depth += 1;
-        log::info!("[provider] module {} registered for contract 0x{:04x} at depth {}", module_idx, contract, entry.depth);
+        log::info!(
+            "[provider] module {} registered for contract 0x{:04x} at depth {}",
+            module_idx,
+            contract,
+            entry.depth
+        );
     }
     0
 }
@@ -588,7 +632,8 @@ pub fn register_module_provider(
 /// Compacts chains to maintain stack ordering.
 pub fn release_module_providers(module_idx: u8) {
     unsafe {
-        let providers = &mut *(&raw mut PROVIDERS);
+        let p = &raw mut PROVIDERS;
+        let providers = &mut *p;
         for entry in providers.iter_mut() {
             // Compact: remove layers belonging to this module
             let mut write = 0usize;
@@ -623,7 +668,13 @@ pub fn release_module_providers(module_idx: u8) {
 /// # Safety
 /// `arg` must satisfy the aliasing and validity requirements expected by the
 /// registered dispatch handler for the given `contract` and `opcode`.
-pub unsafe fn dispatch(contract: ContractId, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+pub unsafe fn dispatch(
+    contract: ContractId,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
     let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
         return errno::ENOSYS;
@@ -647,7 +698,11 @@ pub unsafe fn dispatch(contract: ContractId, handle: i32, opcode: u32, arg: *mut
         match entry.kernel_dispatch {
             Some(handler) => handler(handle, opcode, arg, arg_len),
             None => {
-                log::warn!("[provider] contract 0x{:04x} op 0x{:04x}: no provider", contract, opcode);
+                log::warn!(
+                    "[provider] contract 0x{:04x} op 0x{:04x}: no provider",
+                    contract,
+                    opcode
+                );
                 errno::ENOSYS
             }
         }

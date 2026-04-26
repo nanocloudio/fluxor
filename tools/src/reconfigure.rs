@@ -80,23 +80,38 @@ pub enum ReconfigureMode {
 
 impl TransitionPlan {
     pub fn survive_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.action == ModuleAction::Survive).count()
+        self.entries
+            .iter()
+            .filter(|e| e.action == ModuleAction::Survive)
+            .count()
     }
 
     pub fn drain_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.action == ModuleAction::Drain).count()
+        self.entries
+            .iter()
+            .filter(|e| e.action == ModuleAction::Drain)
+            .count()
     }
 
     pub fn terminate_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.action == ModuleAction::Terminate).count()
+        self.entries
+            .iter()
+            .filter(|e| e.action == ModuleAction::Terminate)
+            .count()
     }
 
     pub fn add_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.action == ModuleAction::Add).count()
+        self.entries
+            .iter()
+            .filter(|e| e.action == ModuleAction::Add)
+            .count()
     }
 
     pub fn remove_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.action == ModuleAction::Remove).count()
+        self.entries
+            .iter()
+            .filter(|e| e.action == ModuleAction::Remove)
+            .count()
     }
 }
 
@@ -181,16 +196,18 @@ fn extract_identities(config: &Value) -> Vec<ModuleIdentity> {
         None => return identities,
     };
 
-    let wiring = config.get("wiring").cloned().unwrap_or(Value::Array(Vec::new()));
+    let wiring = config
+        .get("wiring")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
 
     for module in modules {
-        let name = module.get("type")
+        let name = module
+            .get("type")
             .and_then(|t| t.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let id = module.get("id")
-            .and_then(|i| i.as_u64())
-            .unwrap_or(0) as u8;
+        let id = module.get("id").and_then(|i| i.as_u64()).unwrap_or(0) as u8;
         let name_hash = fnv1a_hash(name.as_bytes());
         let config_hash = compute_config_hash(module);
         let wiring_hash = compute_wiring_hash(&name, &wiring);
@@ -234,7 +251,8 @@ fn is_drain_capable(module_name: &str, modules_dir: &Path) -> bool {
 
 /// Parse reconfigure settings from config.
 fn parse_reconfigure_settings(config: &Value) -> (ReconfigureMode, u32) {
-    let reconfig = config.get("reconfigure")
+    let reconfig = config
+        .get("reconfigure")
         .or_else(|| config.get("graph").and_then(|g| g.get("reconfigure")));
 
     let mode = reconfig
@@ -247,8 +265,7 @@ fn parse_reconfigure_settings(config: &Value) -> (ReconfigureMode, u32) {
         .unwrap_or(ReconfigureMode::Atomic);
 
     let drain_timeout = reconfig
-        .and_then(|r| r.get("drain_timeout_ms")
-            .or_else(|| r.get("drain_timeout")))
+        .and_then(|r| r.get("drain_timeout_ms").or_else(|| r.get("drain_timeout")))
         .and_then(|t| t.as_u64())
         .unwrap_or(5000) as u32;
 
@@ -257,7 +274,8 @@ fn parse_reconfigure_settings(config: &Value) -> (ReconfigureMode, u32) {
 
 /// Parse per-module drain timeout from config.
 fn parse_module_drain_timeout(module: &Value) -> u32 {
-    module.get("drain")
+    module
+        .get("drain")
         .and_then(|d| d.get("timeout"))
         .and_then(|t| t.as_u64())
         .unwrap_or(0) as u32
@@ -265,7 +283,8 @@ fn parse_module_drain_timeout(module: &Value) -> u32 {
 
 /// Parse per-module drain policy from config.
 fn parse_module_drain_policy(module: &Value) -> Option<&str> {
-    module.get("drain")
+    module
+        .get("drain")
         .and_then(|d| d.get("policy"))
         .and_then(|p| p.as_str())
 }
@@ -283,21 +302,19 @@ pub fn compute_transition_plan(
     let (mode, drain_timeout_ms) = parse_reconfigure_settings(new_config);
 
     // Build lookup by (name_hash, id) for old modules
-    let old_by_id: HashMap<u8, &ModuleIdentity> = old_ids.iter()
-        .map(|m| (m.id, m))
-        .collect();
+    let old_by_id: HashMap<u8, &ModuleIdentity> = old_ids.iter().map(|m| (m.id, m)).collect();
 
-    let new_by_id: HashMap<u8, &ModuleIdentity> = new_ids.iter()
-        .map(|m| (m.id, m))
-        .collect();
+    let new_by_id: HashMap<u8, &ModuleIdentity> = new_ids.iter().map(|m| (m.id, m)).collect();
 
     // Get new config modules for per-module settings
-    let new_modules: Vec<&Value> = new_config.get("modules")
+    let new_modules: Vec<&Value> = new_config
+        .get("modules")
         .and_then(|m| m.as_array())
         .map(|a| a.iter().collect())
         .unwrap_or_default();
 
-    let new_module_by_id: HashMap<u8, &Value> = new_modules.iter()
+    let new_module_by_id: HashMap<u8, &Value> = new_modules
+        .iter()
         .filter_map(|m| {
             let id = m.get("id").and_then(|i| i.as_u64())? as u8;
             Some((id, *m))
@@ -326,10 +343,12 @@ pub fn compute_transition_plan(
             } else {
                 // Module changed — check if drain-capable
                 let drain_capable = is_drain_capable(&new_mod.name, modules_dir);
-                let policy = new_module_by_id.get(&new_mod.id)
+                let policy = new_module_by_id
+                    .get(&new_mod.id)
                     .and_then(|m| parse_module_drain_policy(m));
                 let forced_immediate = policy == Some("immediate");
-                let per_module_timeout = new_module_by_id.get(&new_mod.id)
+                let per_module_timeout = new_module_by_id
+                    .get(&new_mod.id)
                     .map(|m| parse_module_drain_timeout(m))
                     .unwrap_or(0);
 
@@ -370,7 +389,11 @@ pub fn compute_transition_plan(
                 name: old_mod.name.clone(),
                 old_id: Some(old_mod.id),
                 new_id: None,
-                action: if drain_capable { ModuleAction::Drain } else { ModuleAction::Remove },
+                action: if drain_capable {
+                    ModuleAction::Drain
+                } else {
+                    ModuleAction::Remove
+                },
                 drain_capable,
                 drain_timeout_ms: 0,
             });
@@ -413,7 +436,9 @@ pub fn format_plan(plan: &TransitionPlan) -> String {
 
     // Entries
     for entry in &plan.entries {
-        let id_str = entry.new_id.or(entry.old_id)
+        let id_str = entry
+            .new_id
+            .or(entry.old_id)
             .map(|id| format!("{}", id))
             .unwrap_or_else(|| "-".to_string());
 
@@ -426,14 +451,20 @@ pub fn format_plan(plan: &TransitionPlan) -> String {
                 }
             }
             ModuleAction::Survive => "n/a".to_string(),
-            _ => {
-                if entry.drain_capable { "capable" } else { "none" }.to_string()
+            _ => if entry.drain_capable {
+                "capable"
+            } else {
+                "none"
             }
+            .to_string(),
         };
 
         out.push_str(&format!(
             "{:<4}  {:<16}  {:<12}  {:<8}\n",
-            id_str, entry.name, entry.action.label(), drain_str
+            id_str,
+            entry.name,
+            entry.action.label(),
+            drain_str
         ));
     }
 

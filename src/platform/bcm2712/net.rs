@@ -417,16 +417,11 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
         }
 
         // Find free slot
-        let mut slot = MAX_NIC_RINGS;
-        for i in 0..MAX_NIC_RINGS {
-            if !NIC_RINGS[i].active {
-                slot = i;
-                break;
-            }
-        }
-        if slot >= MAX_NIC_RINGS {
-            return crate::kernel::errno::ENOMEM;
-        }
+        let nic_rings_p = &raw const NIC_RINGS;
+        let slot = match (*nic_rings_p).iter().position(|r| !r.active) {
+            Some(s) => s,
+            None => return crate::kernel::errno::ENOMEM,
+        };
 
         // Calculate sizes
         let desc_size = core::mem::size_of::<NicRingDescriptor>();
@@ -757,6 +752,11 @@ unsafe fn cache_invalidate(addr: *mut u8, size: usize) {
 // ============================================================================
 
 /// NIC_RING_CREATE: arg=[rx_desc_count:u16, tx_desc_count:u16, buf_size:u16, buf_count:u16] (8 bytes).
+///
+/// # Safety
+/// `arg` must point to a readable buffer of at least 8 bytes for the
+/// duration of the call. Touches the global `NIC_RINGS` table; caller
+/// must hold the platform_nic_ring permission gate.
 pub unsafe fn syscall_ring_create(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return crate::kernel::errno::EINVAL;
@@ -769,6 +769,11 @@ pub unsafe fn syscall_ring_create(arg: *mut u8, arg_len: usize) -> i32 {
 }
 
 /// NIC_RING_DESTROY: arg=[ring_handle:u8] (1 byte).
+///
+/// # Safety
+/// `arg` must point to a readable byte for the duration of the call.
+/// Frees DMA arena allocations associated with the ring; caller must
+/// hold the platform_nic_ring permission gate.
 pub unsafe fn syscall_ring_destroy(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 1 {
         return crate::kernel::errno::EINVAL;
@@ -777,6 +782,10 @@ pub unsafe fn syscall_ring_destroy(arg: *mut u8, arg_len: usize) -> i32 {
 }
 
 /// NIC_RING_INFO: arg=output buffer (32 bytes). handle=ring_handle.
+///
+/// # Safety
+/// `arg` must point to a writable 32-byte buffer for the duration of
+/// the call.
 pub unsafe fn syscall_ring_info(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     ring_info(handle, arg, arg_len)
 }

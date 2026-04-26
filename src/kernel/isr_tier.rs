@@ -148,7 +148,8 @@ unsafe extern "C" fn empty_step(_state: *mut u8) -> i32 {
 
 /// ISR-specific init function type.
 /// Called once during setup (non-ISR context) to initialize ISR-tier state.
-pub type ModuleIsrInitFn = unsafe extern "C" fn(state: *mut u8, syscalls: *const crate::abi::SyscallTable) -> i32;
+pub type ModuleIsrInitFn =
+    unsafe extern "C" fn(state: *mut u8, syscalls: *const crate::abi::SyscallTable) -> i32;
 
 /// ISR-specific entry function type.
 /// Called from the IRQ handler. Returns i32 status (0 = ok, <0 = error).
@@ -203,13 +204,15 @@ unsafe extern "C" fn empty_isr_entry(_state: *mut u8) -> i32 {
 // ============================================================================
 
 /// Tier 1b module slots — accessed from timer ISR.
-static mut ISR_SLOTS: [IsrModule; MAX_ISR_MODULES] = [const { IsrModule::empty() }; MAX_ISR_MODULES];
+static mut ISR_SLOTS: [IsrModule; MAX_ISR_MODULES] =
+    [const { IsrModule::empty() }; MAX_ISR_MODULES];
 
 /// Number of active Tier 1b modules.
 static mut ISR_COUNT: u8 = 0;
 
 /// Tier 2 module slots — accessed from IRQ handlers.
-static mut ISR_T2_SLOTS: [IsrModuleTier2; MAX_ISR_T2_MODULES] = [const { IsrModuleTier2::empty() }; MAX_ISR_T2_MODULES];
+static mut ISR_T2_SLOTS: [IsrModuleTier2; MAX_ISR_T2_MODULES] =
+    [const { IsrModuleTier2::empty() }; MAX_ISR_T2_MODULES];
 
 /// Number of active Tier 2 modules.
 static mut ISR_T2_COUNT: u8 = 0;
@@ -262,37 +265,52 @@ pub fn register_tier1b_module(
 
         // Copy bridge indices
         for i in 0..MAX_ISR_BRIDGES {
-            slot.in_bridges[i] = if i < in_bridges.len() { in_bridges[i] } else { -1 };
-            slot.out_bridges[i] = if i < out_bridges.len() { out_bridges[i] } else { -1 };
+            slot.in_bridges[i] = if i < in_bridges.len() {
+                in_bridges[i]
+            } else {
+                -1
+            };
+            slot.out_bridges[i] = if i < out_bridges.len() {
+                out_bridges[i]
+            } else {
+                -1
+            };
         }
 
         slot.active = true;
         ISR_COUNT = count as u8 + 1;
 
-        log::info!("[isr] tier1b registered slot={} mod={} budget={}cy",
-            count, module_index, budget_cycles);
+        log::info!(
+            "[isr] tier1b registered slot={} mod={} budget={}cy",
+            count,
+            module_index,
+            budget_cycles
+        );
         count as i32
     }
 }
 
 /// Register a module for Tier 2 (IRQ-owned) execution.
 ///
+/// Tier-2 ISR module registration parameters.
+pub struct Tier2Registration<'a> {
+    pub isr_entry: ModuleIsrEntryFn,
+    pub state_ptr: *mut u8,
+    pub irq_number: u16,
+    pub module_index: u8,
+    pub budget_cycles: u32,
+    pub uses_fpu: bool,
+    pub in_bridges: &'a [i8],
+    pub out_bridges: &'a [i8],
+}
+
 /// Returns the slot index on success, or -1 if full.
 ///
 /// # Safety
-/// - `isr_entry` must be a valid function pointer for the module's lifetime
-/// - `state_ptr` must be a valid state buffer for the module's lifetime
+/// - `reg.isr_entry` must be a valid function pointer for the module's lifetime
+/// - `reg.state_ptr` must be a valid state buffer for the module's lifetime
 /// - Must be called before enabling the IRQ
-pub fn register_tier2_module(
-    isr_entry: ModuleIsrEntryFn,
-    state_ptr: *mut u8,
-    irq_number: u16,
-    module_index: u8,
-    budget_cycles: u32,
-    uses_fpu: bool,
-    in_bridges: &[i8],
-    out_bridges: &[i8],
-) -> i32 {
+pub fn register_tier2_module(reg: Tier2Registration<'_>) -> i32 {
     unsafe {
         let count = ISR_T2_COUNT as usize;
         if count >= MAX_ISR_T2_MODULES {
@@ -301,24 +319,38 @@ pub fn register_tier2_module(
         }
 
         let slot = &mut ISR_T2_SLOTS[count];
-        slot.isr_entry = isr_entry;
-        slot.state_ptr = state_ptr;
-        slot.irq_number = irq_number;
-        slot.module_index = module_index;
-        slot.uses_fpu = uses_fpu;
+        slot.isr_entry = reg.isr_entry;
+        slot.state_ptr = reg.state_ptr;
+        slot.irq_number = reg.irq_number;
+        slot.module_index = reg.module_index;
+        slot.uses_fpu = reg.uses_fpu;
         slot.metrics = IsrMetrics::new();
-        slot.metrics.budget_cycles = budget_cycles;
+        slot.metrics.budget_cycles = reg.budget_cycles;
 
         for i in 0..MAX_ISR_BRIDGES {
-            slot.in_bridges[i] = if i < in_bridges.len() { in_bridges[i] } else { -1 };
-            slot.out_bridges[i] = if i < out_bridges.len() { out_bridges[i] } else { -1 };
+            slot.in_bridges[i] = if i < reg.in_bridges.len() {
+                reg.in_bridges[i]
+            } else {
+                -1
+            };
+            slot.out_bridges[i] = if i < reg.out_bridges.len() {
+                reg.out_bridges[i]
+            } else {
+                -1
+            };
         }
 
         slot.active = true;
         ISR_T2_COUNT = count as u8 + 1;
 
-        log::info!("[isr] tier2 registered slot={} mod={} irq={} budget={}cy fpu={}",
-            count, module_index, irq_number, budget_cycles, uses_fpu);
+        log::info!(
+            "[isr] tier2 registered slot={} mod={} irq={} budget={}cy fpu={}",
+            count,
+            reg.module_index,
+            reg.irq_number,
+            reg.budget_cycles,
+            reg.uses_fpu
+        );
         count as i32
     }
 }
@@ -327,12 +359,14 @@ pub fn register_tier2_module(
 pub fn reset_all() {
     stop_tier1b();
     unsafe {
-        for i in 0..MAX_ISR_MODULES {
-            ISR_SLOTS[i] = IsrModule::empty();
+        let slots = &raw mut ISR_SLOTS;
+        for slot in (*slots).iter_mut() {
+            *slot = IsrModule::empty();
         }
         ISR_COUNT = 0;
-        for i in 0..MAX_ISR_T2_MODULES {
-            ISR_T2_SLOTS[i] = IsrModuleTier2::empty();
+        let t2_slots = &raw mut ISR_T2_SLOTS;
+        for slot in (*t2_slots).iter_mut() {
+            *slot = IsrModuleTier2::empty();
         }
         ISR_T2_COUNT = 0;
         TIER1B_PERIOD_US = 0;
@@ -358,8 +392,8 @@ pub unsafe fn isr_tier1b_handler() {
     TIER1B_TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let count = ISR_COUNT as usize;
-    for i in 0..count {
-        let slot = &mut ISR_SLOTS[i];
+    let slots = &raw mut ISR_SLOTS;
+    for slot in (*slots).iter_mut().take(count) {
         if !slot.active {
             continue;
         }
@@ -388,8 +422,8 @@ pub unsafe fn isr_tier1b_handler() {
 /// Called from ISR context.
 pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
     let count = ISR_T2_COUNT as usize;
-    for i in 0..count {
-        let slot = &mut ISR_T2_SLOTS[i];
+    let slots = &raw mut ISR_T2_SLOTS;
+    for slot in (*slots).iter_mut().take(count) {
         if !slot.active || slot.irq_number != irq_number {
             continue;
         }
@@ -468,7 +502,9 @@ pub fn tier1b_period_us() -> u32 {
 
 /// Set the Tier 1b period in microseconds (called by platform start).
 pub fn set_tier1b_period_us(period_us: u32) {
-    unsafe { TIER1B_PERIOD_US = period_us; }
+    unsafe {
+        TIER1B_PERIOD_US = period_us;
+    }
 }
 
 // ============================================================================

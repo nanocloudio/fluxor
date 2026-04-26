@@ -10,21 +10,37 @@ pub fn env_trigger(env: &mut EnvState) {
 
 #[inline(always)]
 pub fn env_release(env: &mut EnvState) {
-    if env.phase != EnvPhase::Idle { env.phase = EnvPhase::Release; }
+    if env.phase != EnvPhase::Idle {
+        env.phase = EnvPhase::Release;
+    }
 }
 
 #[inline(always)]
 fn scale_rate(rate: u16, loop_scale: u8) -> u16 {
-    if loop_scale == 100 { return rate; }
+    if loop_scale == 100 {
+        return rate;
+    }
     let scaled = ((rate as u32) * (loop_scale as u32) / 100).clamp(1, 65535);
     scaled as u16
 }
 
 #[inline(always)]
 pub fn env_process_loop(env: &mut EnvState, loop_mode: u8, loop_scale: u8) -> u16 {
-    let attack_rate = if loop_mode != 0 { scale_rate(env.attack_rate, loop_scale) } else { env.attack_rate };
-    let decay_rate = if loop_mode != 0 { scale_rate(env.decay_rate, loop_scale) } else { env.decay_rate };
-    let release_rate = if loop_mode != 0 { scale_rate(env.release_rate, loop_scale) } else { env.release_rate };
+    let attack_rate = if loop_mode != 0 {
+        scale_rate(env.attack_rate, loop_scale)
+    } else {
+        env.attack_rate
+    };
+    let decay_rate = if loop_mode != 0 {
+        scale_rate(env.decay_rate, loop_scale)
+    } else {
+        env.decay_rate
+    };
+    let release_rate = if loop_mode != 0 {
+        scale_rate(env.release_rate, loop_scale)
+    } else {
+        env.release_rate
+    };
 
     match env.phase {
         EnvPhase::Attack => {
@@ -63,7 +79,9 @@ pub fn env_process_loop(env: &mut EnvState, loop_mode: u8, loop_scale: u8) -> u1
                 }
             }
         }
-        EnvPhase::Sustain => { env.level = env.sustain_level; }
+        EnvPhase::Sustain => {
+            env.level = env.sustain_level;
+        }
         EnvPhase::Release => {
             if env.level <= release_rate {
                 env.level = 0;
@@ -76,7 +94,9 @@ pub fn env_process_loop(env: &mut EnvState, loop_mode: u8, loop_scale: u8) -> u1
                 env.level -= release_rate;
             }
         }
-        _ => { env.level = 0; }
+        _ => {
+            env.level = 0;
+        }
     }
     env.level
 }

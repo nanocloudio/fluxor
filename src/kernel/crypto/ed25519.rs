@@ -19,38 +19,42 @@ use super::sha512::Sha512;
 type Gf = [i64; 16];
 
 const GF0: Gf = [0; 16];
-const GF1: Gf = { let mut g = [0i64; 16]; g[0] = 1; g };
+const GF1: Gf = {
+    let mut g = [0i64; 16];
+    g[0] = 1;
+    g
+};
 
 // d2 = 2 * d mod p, with d = -121665/121666.
 const D2: Gf = [
-    0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0,
-    0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406,
+    0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e,
+    0xfce7, 0x56df, 0xd9dc, 0x2406,
 ];
 
 // d = -121665/121666.
 const D: Gf = [
-    0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070,
-    0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203,
+    0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070, 0xe898, 0x7779, 0x4079, 0x8cc7,
+    0xfe73, 0x2b6f, 0x6cee, 0x5203,
 ];
 
 // √(-1) mod p.
 const SQRT_M1: Gf = [
-    0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43,
-    0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83,
+    0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43, 0xd7a7, 0x3dfb, 0x0099, 0x2b4d,
+    0xdf0b, 0x4fc1, 0x2480, 0x2b83,
 ];
 
 // Basepoint coordinates (X, Y).
 const BX: Gf = [
-    0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c,
-    0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169,
+    0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4,
+    0x53fe, 0xcd6e, 0x36d3, 0x2169,
 ];
 const BY: Gf = [
-    0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
-    0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
+    0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
+    0x6666, 0x6666, 0x6666, 0x6666,
 ];
 
 fn set(r: &mut Gf, a: &Gf) {
-    for i in 0..16 { r[i] = a[i]; }
+    r.copy_from_slice(a);
 }
 
 fn car25519(o: &mut Gf) {
@@ -121,11 +125,15 @@ fn unpack25519(o: &mut Gf, n: &[u8; 32]) {
 }
 
 fn gf_a(o: &mut Gf, a: &Gf, b: &Gf) {
-    for i in 0..16 { o[i] = a[i] + b[i]; }
+    for i in 0..16 {
+        o[i] = a[i] + b[i];
+    }
 }
 
 fn gf_z(o: &mut Gf, a: &Gf, b: &Gf) {
-    for i in 0..16 { o[i] = a[i] - b[i]; }
+    for i in 0..16 {
+        o[i] = a[i] - b[i];
+    }
 }
 
 fn gf_m(o: &mut Gf, a: &Gf, b: &Gf) {
@@ -138,7 +146,7 @@ fn gf_m(o: &mut Gf, a: &Gf, b: &Gf) {
     for i in 0..15 {
         t[i] += 38 * t[i + 16];
     }
-    for i in 0..16 { o[i] = t[i]; }
+    o.copy_from_slice(&t[..16]);
     car25519(o);
     car25519(o);
 }
@@ -335,10 +343,8 @@ fn unpack_neg(r: &mut Point, p: &[u8; 32]) -> bool {
 // ============================================================================
 
 const L: [i64; 32] = [
-    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
-    0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
-    0,    0,    0,    0,    0,    0,    0,    0,
-    0,    0,    0,    0,    0,    0,    0,    0x10,
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
 ];
 
 fn mod_l(r: &mut [u8; 32], x: &mut [i64; 64]) {
@@ -371,7 +377,9 @@ fn mod_l(r: &mut [u8; 32], x: &mut [i64; 64]) {
 
 fn reduce(r: &mut [u8; 64]) -> [u8; 32] {
     let mut x: [i64; 64] = [0; 64];
-    for i in 0..64 { x[i] = r[i] as i64; }
+    for i in 0..64 {
+        x[i] = r[i] as i64;
+    }
     let mut out = [0u8; 32];
     mod_l(&mut out, &mut x);
     out
@@ -383,7 +391,9 @@ fn reduce(r: &mut [u8; 64]) -> [u8; 32] {
 
 fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let mut d: u8 = 0;
-    for i in 0..32 { d |= a[i] ^ b[i]; }
+    for i in 0..32 {
+        d |= a[i] ^ b[i];
+    }
     d == 0
 }
 
@@ -396,8 +406,8 @@ pub fn verify(public_key: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
 
     // h = SHA-512(R || A || M), reduced mod L.
     let mut hasher = Sha512::new();
-    hasher.update(&signature[..32]);   // R
-    hasher.update(public_key);         // A
+    hasher.update(&signature[..32]); // R
+    hasher.update(public_key); // A
     hasher.update(msg);
     let mut h = hasher.finalize();
     let h_reduced = reduce(&mut h);
@@ -433,27 +443,47 @@ mod tests {
         let bytes = s.as_bytes();
         let mut i = 0;
         while i + 1 < bytes.len() {
-            let hi = match bytes[i] { b'0'..=b'9' => bytes[i] - b'0', b'a'..=b'f' => bytes[i] - b'a' + 10, _ => panic!() };
-            let lo = match bytes[i+1] { b'0'..=b'9' => bytes[i+1] - b'0', b'a'..=b'f' => bytes[i+1] - b'a' + 10, _ => panic!() };
+            let hi = match bytes[i] {
+                b'0'..=b'9' => bytes[i] - b'0',
+                b'a'..=b'f' => bytes[i] - b'a' + 10,
+                _ => panic!(),
+            };
+            let lo = match bytes[i + 1] {
+                b'0'..=b'9' => bytes[i + 1] - b'0',
+                b'a'..=b'f' => bytes[i + 1] - b'a' + 10,
+                _ => panic!(),
+            };
             out.push((hi << 4) | lo);
             i += 2;
         }
         out
     }
 
-    fn arr32(v: &[u8]) -> [u8; 32] { let mut a = [0u8; 32]; a.copy_from_slice(v); a }
-    fn arr64(v: &[u8]) -> [u8; 64] { let mut a = [0u8; 64]; a.copy_from_slice(v); a }
+    fn arr32(v: &[u8]) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(v);
+        a
+    }
+    fn arr64(v: &[u8]) -> [u8; 64] {
+        let mut a = [0u8; 64];
+        a.copy_from_slice(v);
+        a
+    }
 
     #[test]
     fn rfc_8032_vector_1() {
-        let pk = arr32(&parse_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"));
+        let pk = arr32(&parse_hex(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        ));
         let sig = arr64(&parse_hex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"));
         assert!(verify(&pk, b"", &sig));
     }
 
     #[test]
     fn rfc_8032_vector_2() {
-        let pk = arr32(&parse_hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"));
+        let pk = arr32(&parse_hex(
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        ));
         let msg = parse_hex("72");
         let sig = arr64(&parse_hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"));
         assert!(verify(&pk, &msg, &sig));
@@ -461,7 +491,9 @@ mod tests {
 
     #[test]
     fn rfc_8032_vector_3() {
-        let pk = arr32(&parse_hex("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"));
+        let pk = arr32(&parse_hex(
+            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+        ));
         let msg = parse_hex("af82");
         let sig = arr64(&parse_hex("6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"));
         assert!(verify(&pk, &msg, &sig));
@@ -469,7 +501,9 @@ mod tests {
 
     #[test]
     fn rejects_tampered_message() {
-        let pk = arr32(&parse_hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"));
+        let pk = arr32(&parse_hex(
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        ));
         let msg = parse_hex("73");
         let sig = arr64(&parse_hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"));
         assert!(!verify(&pk, &msg, &sig));
@@ -477,7 +511,9 @@ mod tests {
 
     #[test]
     fn rejects_tampered_signature() {
-        let pk = arr32(&parse_hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"));
+        let pk = arr32(&parse_hex(
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        ));
         let msg = parse_hex("72");
         let mut sig_bytes = parse_hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
         sig_bytes[0] ^= 0x01;

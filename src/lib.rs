@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "host-linux"), no_std)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 #[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux"))]
 #[path = "../modules/sdk/abi.rs"]

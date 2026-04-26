@@ -19,11 +19,11 @@ pub mod op {
     ///
     /// arg layout (16 bytes, little-endian):
     ///   [arena_base_page: u32][vpage_idx: u32][buf_ptr: u64]
-    pub const READ_PAGE:  u32 = 0x0001;
+    pub const READ_PAGE: u32 = 0x0001;
     /// Write one page (PAGE_SIZE bytes) from `buf` to the device.
     pub const WRITE_PAGE: u32 = 0x0002;
     /// Flush the driver's in-flight writeback (no-op if synchronous).
-    pub const FLUSH:      u32 = 0x0003;
+    pub const FLUSH: u32 = 0x0003;
 }
 
 /// Dispatch function signature: `(state, opcode, arg, arg_len) -> i32`.
@@ -60,7 +60,10 @@ pub fn unregister() {
 
 /// Returns true once an External-backed arena can be used.
 pub fn ready() -> bool {
-    unsafe { (*(&raw const DISPATCH)).is_some() }
+    unsafe {
+        let p = &raw const DISPATCH;
+        (*p).is_some()
+    }
 }
 
 /// Forward an opcode to the registered dispatch. `-ENOSYS` when no

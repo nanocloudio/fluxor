@@ -132,18 +132,10 @@ pub enum AcquireOutcome {
     Held(LockConflict),
 }
 
-pub fn acquire(
-    lock_path: &Path,
-    owner: &LockOwner,
-    force: bool,
-) -> Result<AcquireOutcome> {
+pub fn acquire(lock_path: &Path, owner: &LockOwner, force: bool) -> Result<AcquireOutcome> {
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::Config(format!(
-                "rig lock: creating {}: {e}",
-                parent.display()
-            ))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Config(format!("rig lock: creating {}: {e}", parent.display())))?;
     }
 
     // Atomic create-exclusive. If the file exists, we read the existing
@@ -180,10 +172,7 @@ pub fn acquire(
                     .mode(0o600)
                     .open(lock_path)
                     .map_err(|e| {
-                        Error::Config(format!(
-                            "rig lock: recreating {}: {e}",
-                            lock_path.display()
-                        ))
+                        Error::Config(format!("rig lock: recreating {}: {e}", lock_path.display()))
                     })?;
                 write_owner(&f, owner)?;
                 f.sync_all().ok();
@@ -224,9 +213,8 @@ pub fn default_lock_path(lab: &str, rig: &str) -> Option<PathBuf> {
 fn write_owner(mut f: &std::fs::File, owner: &LockOwner) -> Result<()> {
     let json = serde_json::to_string_pretty(owner)
         .map_err(|e| Error::Config(format!("rig lock: serialising owner: {e}")))?;
-    f.write_all(json.as_bytes()).map_err(|e| {
-        Error::Config(format!("rig lock: writing owner: {e}"))
-    })?;
+    f.write_all(json.as_bytes())
+        .map_err(|e| Error::Config(format!("rig lock: writing owner: {e}")))?;
     f.write_all(b"\n").ok();
     Ok(())
 }
@@ -265,9 +253,7 @@ fn unix_hostname() -> std::io::Result<String> {
     let mut buf = [0u8; 256];
     // SAFETY: libc::gethostname takes a writable buffer and nul-terminates
     // within len. We then read up to the first nul via CStr::from_bytes_until_nul.
-    let rc = unsafe {
-        libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
-    };
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }

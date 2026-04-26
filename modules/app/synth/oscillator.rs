@@ -11,20 +11,31 @@ pub fn gen_saw(phase: u32) -> i16 {
 
 #[inline(always)]
 pub fn gen_square(phase: u32) -> i16 {
-    if phase < 0x80000000 { 32767 } else { -32768 }
+    if phase < 0x80000000 {
+        32767
+    } else {
+        -32768
+    }
 }
 
 #[inline(always)]
 pub fn gen_triangle(phase: u32) -> i16 {
     let p = (phase >> 16) as i32;
-    if p < 32768 { (p * 2 - 32768) as i16 }
-    else { (32767 - (p - 32768) * 2) as i16 }
+    if p < 32768 {
+        (p * 2 - 32768) as i16
+    } else {
+        (32767 - (p - 32768) * 2) as i16
+    }
 }
 
 #[inline(always)]
 pub fn gen_pulse(phase: u32, width: u8) -> i16 {
     let threshold = (width as u32) << 24;
-    if phase < threshold { 32767 } else { -32768 }
+    if phase < threshold {
+        32767
+    } else {
+        -32768
+    }
 }
 
 #[inline(always)]
@@ -47,22 +58,38 @@ pub fn gen_sine(phase: u32) -> i16 {
         let (a, b) = match quadrant {
             0 => {
                 let a = *ptr.add(idx) as i32;
-                let b = if idx < 255 { *ptr.add(idx + 1) as i32 } else { 32767 };
+                let b = if idx < 255 {
+                    *ptr.add(idx + 1) as i32
+                } else {
+                    32767
+                };
                 (a, b)
             }
             1 => {
                 let a = *ptr.add(255 - idx) as i32;
-                let b = if idx < 255 { *ptr.add(254 - idx) as i32 } else { 0 };
+                let b = if idx < 255 {
+                    *ptr.add(254 - idx) as i32
+                } else {
+                    0
+                };
                 (a, b)
             }
             2 => {
                 let a = -(*ptr.add(idx) as i32);
-                let b = if idx < 255 { -(*ptr.add(idx + 1) as i32) } else { -32767 };
+                let b = if idx < 255 {
+                    -(*ptr.add(idx + 1) as i32)
+                } else {
+                    -32767
+                };
                 (a, b)
             }
             _ => {
                 let a = -(*ptr.add(255 - idx) as i32);
-                let b = if idx < 255 { -(*ptr.add(254 - idx) as i32) } else { 0 };
+                let b = if idx < 255 {
+                    -(*ptr.add(254 - idx) as i32)
+                } else {
+                    0
+                };
                 (a, b)
             }
         };
@@ -98,7 +125,9 @@ pub fn trigger_pluck(v: &mut VoiceState, velocity: u8) {
     while i < len {
         let noise = gen_noise(lfsr);
         let scaled = ((noise as i32 * amplitude) >> 15) as i16;
-        unsafe { *buf_ptr.add(i) = scaled; }
+        unsafe {
+            *buf_ptr.add(i) = scaled;
+        }
         i += 1;
     }
     v.pluck_read_pos = 0;

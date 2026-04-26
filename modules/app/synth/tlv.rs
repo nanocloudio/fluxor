@@ -8,7 +8,7 @@
 
 use super::constants::*;
 use super::state::SynthState;
-use super::{p_u8, p_u16, p_u32};
+use super::{p_u16, p_u32, p_u8};
 
 pub const TLV_MAGIC: u8 = 0xFE;
 pub const TLV_VERSION: u8 = 0x01;
@@ -40,7 +40,9 @@ pub unsafe fn parse_tlv(s: &mut SynthState) {
     // Set defaults first
     set_defaults(s);
 
-    if len < TLV_HEADER_SIZE { return; }
+    if len < TLV_HEADER_SIZE {
+        return;
+    }
 
     let _version = *p.add(1);
     let total_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
@@ -52,7 +54,9 @@ pub unsafe fn parse_tlv(s: &mut SynthState) {
         let tag = *p.add(offset);
         let entry_len = *p.add(offset + 1) as usize;
         offset += 2;
-        if offset + entry_len > end { break; }
+        if offset + entry_len > end {
+            break;
+        }
 
         let d = p.add(offset);
         match tag {
@@ -191,5 +195,9 @@ unsafe fn parse_polyphony(s: &mut SynthState, d: *const u8, len: usize) {
 #[inline(always)]
 unsafe fn parse_voice_nav(s: &mut SynthState, d: *const u8, len: usize) {
     let vc = p_u8(d, len, 0, 0);
-    s.voice_count = if vc > MAX_VOICES as u8 { MAX_VOICES as u8 } else { vc };
+    s.voice_count = if vc > MAX_VOICES as u8 {
+        MAX_VOICES as u8
+    } else {
+        vc
+    };
 }

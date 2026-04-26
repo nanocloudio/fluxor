@@ -28,10 +28,10 @@
 
 use core::ptr::null_mut;
 
+use crate::abi::{SyscallTable, ABI_VERSION};
 use crate::kernel::channel;
 use crate::kernel::errno;
 use crate::kernel::hal;
-use crate::abi::{SyscallTable, ABI_VERSION};
 // ============================================================================
 // Error Codes (Linux errno values)
 // ============================================================================
@@ -48,7 +48,9 @@ const E_NOMEM: i32 = errno::ENOMEM;
 static mut SYSCALL_TABLE: SyscallTable = SyscallTable::empty();
 
 pub fn set_syscall_table(table: SyscallTable) {
-    unsafe { SYSCALL_TABLE = table; }
+    unsafe {
+        SYSCALL_TABLE = table;
+    }
 }
 
 pub fn init_syscall_table() {
@@ -108,8 +110,8 @@ unsafe extern "C" fn syscall_provider_call(
     // class byte for handle=-1 globals and scheduler-assigned channel
     // fds. Non-channel contracts hand out tagged fds so `contract_of`
     // produces an unambiguous result per handle.
-    let contract = crate::kernel::provider::contract_of(handle)
-        .unwrap_or_else(|| ((op >> 8) & 0xFF) as u16);
+    let contract =
+        crate::kernel::provider::contract_of(handle).unwrap_or(((op >> 8) & 0xFF) as u16);
     if let Some(rc) = check_contract_grant(contract) {
         return rc;
     }
@@ -126,8 +128,8 @@ unsafe extern "C" fn syscall_provider_query(
     out: *mut u8,
     out_len: usize,
 ) -> i32 {
-    let contract = crate::kernel::provider::contract_of(handle)
-        .unwrap_or_else(|| ((key >> 8) & 0xFF) as u16);
+    let contract =
+        crate::kernel::provider::contract_of(handle).unwrap_or(((key >> 8) & 0xFF) as u16);
     if let Some(rc) = check_contract_grant(contract) {
         return rc;
     }
@@ -155,7 +157,10 @@ unsafe extern "C" fn syscall_provider_close(handle: i32) -> i32 {
 }
 
 fn syscall_table() -> &'static SyscallTable {
-    unsafe { &*(&raw const SYSCALL_TABLE) }
+    unsafe {
+        let p = &raw const SYSCALL_TABLE;
+        &*p
+    }
 }
 
 /// Get a reference to the full (unfiltered) syscall table for passing to PIC modules
@@ -223,21 +228,33 @@ use crate::kernel::config::HardwareContext;
 static mut HARDWARE_CONTEXT: HardwareContext = HardwareContext::new();
 
 pub fn mark_spi_initialized(bus: u8) {
-    unsafe { (*(&raw mut HARDWARE_CONTEXT)).mark_spi_initialized(bus) }
+    unsafe {
+        let p = &raw mut HARDWARE_CONTEXT;
+        (*p).mark_spi_initialized(bus)
+    }
 }
 
 /// Check if an SPI bus has been initialized
 pub fn is_spi_initialized(bus: u8) -> bool {
-    unsafe { (*(&raw const HARDWARE_CONTEXT)).is_spi_initialized(bus) }
+    unsafe {
+        let p = &raw const HARDWARE_CONTEXT;
+        (*p).is_spi_initialized(bus)
+    }
 }
 
 pub fn mark_i2c_initialized(bus: u8) {
-    unsafe { (*(&raw mut HARDWARE_CONTEXT)).mark_i2c_initialized(bus) }
+    unsafe {
+        let p = &raw mut HARDWARE_CONTEXT;
+        (*p).mark_i2c_initialized(bus)
+    }
 }
 
 /// Check if an I2C bus has been initialized
 pub fn is_i2c_initialized(bus: u8) -> bool {
-    unsafe { (*(&raw const HARDWARE_CONTEXT)).is_i2c_initialized(bus) }
+    unsafe {
+        let p = &raw const HARDWARE_CONTEXT;
+        (*p).is_i2c_initialized(bus)
+    }
 }
 
 // ============================================================================
@@ -247,12 +264,15 @@ pub fn is_i2c_initialized(bus: u8) -> bool {
 /// Register all built-in device class providers.
 /// Called once at startup after init_syscall_table().
 pub fn init_providers() {
-    use crate::kernel::provider::contract as dev_class;
     use crate::kernel::provider;
+    use crate::kernel::provider::contract as dev_class;
     provider::register(dev_class::CHANNEL, channel_provider_dispatch);
     provider::register(dev_class::TIMER, timer_provider_dispatch);
     provider::register(dev_class::EVENT, event_provider_dispatch);
-    provider::register(dev_class::INTERNAL_DISPATCH_BUCKET, system_provider_dispatch);
+    provider::register(
+        dev_class::INTERNAL_DISPATCH_BUCKET,
+        system_provider_dispatch,
+    );
     // PLATFORM_NIC_RING / PLATFORM_DMA / PLATFORM_DMA_FD expose disjoint
     // handle types to drivers (NIC ring, raw DMA channel number, tagged
     // DMA fd). They share `system_provider_dispatch` because dispatch is
@@ -306,13 +326,13 @@ pub fn init_providers() {
 // opcode `provider_close` invokes to release a handle. Contracts that
 // don't need a close hook leave it as 0.
 
-use crate::abi::kernel_abi;
 use crate::abi::contracts;
+use crate::abi::kernel_abi;
 
 static CHANNEL_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::CHANNEL,
-        call:  channel_provider_dispatch,
+        call: channel_provider_dispatch,
         query: None,
         default_close_op: kernel_abi::channel::CLOSE,
     };
@@ -320,7 +340,7 @@ static CHANNEL_VTABLE: crate::kernel::provider::ProviderVTable =
 static TIMER_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::TIMER,
-        call:  timer_provider_dispatch,
+        call: timer_provider_dispatch,
         query: None,
         default_close_op: kernel_abi::timer::DESTROY,
     };
@@ -328,7 +348,7 @@ static TIMER_VTABLE: crate::kernel::provider::ProviderVTable =
 static EVENT_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::EVENT,
-        call:  event_provider_dispatch,
+        call: event_provider_dispatch,
         query: None,
         default_close_op: kernel_abi::event::DESTROY,
     };
@@ -336,7 +356,7 @@ static EVENT_VTABLE: crate::kernel::provider::ProviderVTable =
 static BUFFER_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::BUFFER,
-        call:  buffer_provider_dispatch,
+        call: buffer_provider_dispatch,
         query: None,
         default_close_op: 0, // buffers released by explicit RELEASE opcodes
     };
@@ -344,7 +364,7 @@ static BUFFER_VTABLE: crate::kernel::provider::ProviderVTable =
 static KEY_VAULT_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::KEY_VAULT,
-        call:  key_vault_provider_dispatch,
+        call: key_vault_provider_dispatch,
         query: None,
         default_close_op: contracts::key_vault::DESTROY,
     };
@@ -356,7 +376,7 @@ static KEY_VAULT_VTABLE: crate::kernel::provider::ProviderVTable =
 static PCIE_DEVICE_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::PCIE_DEVICE,
-        call:  system_provider_dispatch,
+        call: system_provider_dispatch,
         query: None,
         default_close_op: crate::abi::platform::bcm2712::pcie_device::CLOSE,
     };
@@ -370,14 +390,18 @@ unsafe fn fs_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
     // PIC module providers register on a class byte and operate on
     // raw slots; strip any FD tag before dispatching inward.
-    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     crate::kernel::provider::dispatch(class::FS, h, op, arg, arg_len)
 }
 
 static FS_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::FS,
-        call:  fs_call,
+        call: fs_call,
         query: None,
         default_close_op: contracts::storage::fs::CLOSE,
     };
@@ -388,35 +412,47 @@ static FS_VTABLE: crate::kernel::provider::ProviderVTable =
 
 unsafe fn hal_spi_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     crate::kernel::provider::dispatch(class::SPI, h, op, arg, arg_len)
 }
 
 static HAL_SPI_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::HAL_SPI,
-        call:  hal_spi_call,
+        call: hal_spi_call,
         query: None,
         default_close_op: contracts::hal::spi::CLOSE,
     };
 
 unsafe fn hal_i2c_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     crate::kernel::provider::dispatch(class::I2C, h, op, arg, arg_len)
 }
 
 static HAL_I2C_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::HAL_I2C,
-        call:  hal_i2c_call,
+        call: hal_i2c_call,
         query: None,
         default_close_op: contracts::hal::i2c::CLOSE,
     };
 
 unsafe fn hal_pio_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     crate::kernel::provider::dispatch(class::PIO, h, op, arg, arg_len)
 }
 
@@ -428,55 +464,72 @@ unsafe fn hal_pio_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i3
 static HAL_PIO_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::HAL_PIO,
-        call:  hal_pio_call,
+        call: hal_pio_call,
         query: None,
         default_close_op: contracts::hal::pio::STREAM_FREE,
     };
 
 unsafe fn hal_uart_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     crate::kernel::provider::dispatch(class::UART, h, op, arg, arg_len)
 }
 
 static HAL_UART_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::HAL_UART,
-        call:  hal_uart_call,
+        call: hal_uart_call,
         query: None,
         default_close_op: contracts::hal::uart::CLOSE,
     };
 
 unsafe fn hal_adc_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     crate::kernel::provider::dispatch(class::ADC, h, op, arg, arg_len)
 }
 
 static HAL_ADC_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::HAL_ADC,
-        call:  hal_adc_call,
+        call: hal_adc_call,
         query: None,
         default_close_op: contracts::hal::adc::CLOSE,
     };
 
 unsafe fn hal_pwm_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::provider::contract as class;
-    let h = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     crate::kernel::provider::dispatch(class::PWM, h, op, arg, arg_len)
 }
 
 static HAL_PWM_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::HAL_PWM,
-        call:  hal_pwm_call,
+        call: hal_pwm_call,
         query: None,
         default_close_op: contracts::hal::pwm::CLOSE,
     };
 
 /// KEY_VAULT provider adapter — forwards to the kernel key_vault module.
-unsafe fn key_vault_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+unsafe fn key_vault_provider_dispatch(
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
     crate::kernel::key_vault::provider_dispatch(handle, opcode, arg, arg_len)
 }
 
@@ -545,8 +598,7 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     // PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, and PCIE_DEVICE
     // are public contracts subject to the same declare-to-use rule as
     // HAL_* — they are NOT in this list.
-    const INFRA_CONTRACTS: u32 =
-        (1u32 << 0)              |  // COMMON / cross-class
+    const INFRA_CONTRACTS: u32 = (1u32 << 0)              |  // COMMON / cross-class
         (1u32 << ct::CHANNEL)    |
         (1u32 << ct::TIMER)      |
         (1u32 << ct::BUFFER)     |
@@ -574,22 +626,22 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
 ///
 /// Bit layout is shared with `tools/src/manifest.rs` — keep in sync.
 pub mod permission {
-    pub const RECONFIGURE:       u8 = 1 << 0;
-    pub const FLASH_RAW:         u8 = 1 << 1;
-    pub const BACKING_PROVIDER:  u8 = 1 << 2;
-    pub const PLATFORM_RAW:      u8 = 1 << 3;
-    pub const MONITOR:           u8 = 1 << 4;
-    pub const BRIDGE:            u8 = 1 << 5;
+    pub const RECONFIGURE: u8 = 1 << 0;
+    pub const FLASH_RAW: u8 = 1 << 1;
+    pub const BACKING_PROVIDER: u8 = 1 << 2;
+    pub const PLATFORM_RAW: u8 = 1 << 3;
+    pub const MONITOR: u8 = 1 << 4;
+    pub const BRIDGE: u8 = 1 << 5;
 
     pub fn name(bit: u8) -> &'static str {
         match bit {
-            RECONFIGURE      => "reconfigure",
-            FLASH_RAW        => "flash_raw",
+            RECONFIGURE => "reconfigure",
+            FLASH_RAW => "flash_raw",
             BACKING_PROVIDER => "backing_provider",
-            PLATFORM_RAW     => "platform_raw",
-            MONITOR          => "monitor",
-            BRIDGE           => "bridge",
-            _                => "<unknown>",
+            PLATFORM_RAW => "platform_raw",
+            MONITOR => "monitor",
+            BRIDGE => "bridge",
+            _ => "<unknown>",
         }
     }
 }
@@ -602,38 +654,47 @@ pub mod permission {
 /// restrictive, avoiding accidental privilege leakage).
 fn privileged_op_permission(op: u32) -> Option<u8> {
     use permission::*;
-    if op < 0x0C00 || op > 0x0CFF { return None; }
+    if !(0x0C00..=0x0CFF).contains(&op) {
+        return None;
+    }
     match op {
         // ── Implicit primitives (no permission needed) ──────────────────
         // kernel_abi primitives: STREAM_TIME, GRAPH queries, ISR metrics,
         // runtime-params store/delete/clear (per-module-scoped),
         // ARENA_GET / BIND_IRQ / REPORT_LATENCY family, LOG_WRITE,
         // HANDLE_POLL, RANDOM_FILL, SYS_CLOCK_HZ, paged-arena GET/PREFAULT.
-        0x0C30 | 0x0C31 | 0x0C33 |
-        0x0C34 | 0x0C35 | 0x0C36 |
-        0x0C3A ..= 0x0C3D |
-        0x0C40 | 0x0C41 | 0x0C42 |
-        0x0C50 | 0x0C51 |
-        0x0C65 |
-        0x0CE8 |
-        0x0CF8 | 0x0CFA => None,
+        0x0C30
+        | 0x0C31
+        | 0x0C33
+        | 0x0C34
+        | 0x0C35
+        | 0x0C36
+        | 0x0C3A..=0x0C3D
+        | 0x0C40
+        | 0x0C41
+        | 0x0C42
+        | 0x0C50
+        | 0x0C51
+        | 0x0C65
+        | 0x0CE8
+        | 0x0CF8
+        | 0x0CFA => None,
 
         // ── flash_raw: flash ERASE / PROGRAM / sideband / store enable ──
         0x0C10 | 0x0C37 | 0x0C38 | 0x0C39 => Some(FLASH_RAW),
 
         // ── monitor: FAULT_MONITOR_*, STEP_HISTOGRAM, PAGED_ARENA_STATS ─
-        0x0C52 ..= 0x0C5F | 0x0CF9 => Some(MONITOR),
+        0x0C52..=0x0C5F | 0x0CF9 => Some(MONITOR),
 
         // ── reconfigure: graph slot commit, boot counter, FMP routing ──
-        0x0C67 ..= 0x0C6F => Some(RECONFIGURE),
+        0x0C67..=0x0C6F => Some(RECONFIGURE),
 
         // ── bridge: cross-domain WRITE/READ/POLL/INFO ──────────────────
-        0x0CE0 ..= 0x0CE3 => Some(BRIDGE),
+        0x0CE0..=0x0CE3 => Some(BRIDGE),
 
         // ── backing_provider: BACKING_PROVIDER_ENABLE, ARENA_REGISTER, ─
         //     ARENA_READ, SMMU map/unmap/fault-check. ────────────────────
-        0x0CED | 0x0CEE | 0x0CEF |
-        0x0CFB ..= 0x0CFF => Some(BACKING_PROVIDER),
+        0x0CED | 0x0CEE | 0x0CEF | 0x0CFB..=0x0CFF => Some(BACKING_PROVIDER),
 
         // ── platform_raw: everything else in 0x0Cxx ────────────────────
         // Explicit coverage for clarity:
@@ -657,12 +718,11 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
 /// bit in its manifest's `permissions = [...]` list. The only bypass is
 /// `CAP_FULL` tier (module_type = Protocol, kernel-trusted).
 unsafe fn check_privileged_internal_op(op: u32) -> Option<i32> {
-    let required = match privileged_op_permission(op) {
-        Some(bit) => bit,
-        None => return None, // implicit primitive
-    };
+    let required = privileged_op_permission(op)?;
     let cap = crate::kernel::scheduler::current_module_cap_class();
-    if cap == 3 { return None; } // CAP_FULL (kernel-trusted, module_type=Protocol)
+    if cap == 3 {
+        return None;
+    } // CAP_FULL (kernel-trusted, module_type=Protocol)
     let held = crate::kernel::scheduler::current_module_permissions();
     if held & required == 0 {
         log::warn!(
@@ -684,41 +744,74 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
     use crate::kernel::channel;
     match opcode {
         dev_channel::OPEN => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             channel::syscall_channel_open(*arg, arg.add(1), arg_len - 1)
         }
-        dev_channel::CLOSE => { channel::syscall_channel_close(handle); 0 }
+        dev_channel::CLOSE => {
+            channel::syscall_channel_close(handle);
+            0
+        }
         dev_channel::READ => {
-            if arg.is_null() { return E_INVAL; }
+            if arg.is_null() {
+                return E_INVAL;
+            }
             channel::syscall_channel_read(handle, arg, arg_len)
         }
         dev_channel::WRITE => {
-            if arg.is_null() { return E_INVAL; }
+            if arg.is_null() {
+                return E_INVAL;
+            }
             channel::syscall_channel_write(handle, arg as *const u8, arg_len)
         }
         dev_channel::POLL => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             channel::syscall_channel_poll(handle, *arg as u32)
         }
         dev_channel::PORT => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             syscall_channel_port(*arg, *arg.add(1))
         }
         dev_channel::IOCTL => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let cmd = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let data_ptr = if arg_len >= 8 { arg.add(4) } else { core::ptr::null_mut() };
+            let data_ptr = if arg_len >= 8 {
+                arg.add(4)
+            } else {
+                core::ptr::null_mut()
+            };
             channel::syscall_channel_ioctl(handle, cmd, data_ptr)
         }
         dev_channel::REGISTER_IOCTL => {
-            if arg.is_null() || arg_len < 16 { return E_INVAL; }
+            if arg.is_null() || arg_len < 16 {
+                return E_INVAL;
+            }
             let state = u64::from_le_bytes([
-                *arg,        *arg.add(1), *arg.add(2), *arg.add(3),
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                *arg,
+                *arg.add(1),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
             ]) as *mut core::ffi::c_void;
             let handler = u64::from_le_bytes([
-                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
-                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+                *arg.add(8),
+                *arg.add(9),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
+                *arg.add(14),
+                *arg.add(15),
             ]) as *mut ();
             channel::syscall_channel_register_ioctl_handler(handle, state, handler)
         }
@@ -731,22 +824,36 @@ unsafe fn buffer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     use crate::kernel::channel;
     match opcode {
         dev_buffer::ACQUIRE_WRITE => {
-            let cap_out = if !arg.is_null() && arg_len >= 4 { arg as *mut u32 } else { core::ptr::null_mut() };
+            let cap_out = if !arg.is_null() && arg_len >= 4 {
+                arg as *mut u32
+            } else {
+                core::ptr::null_mut()
+            };
             channel::syscall_buffer_acquire_write(handle, cap_out) as i32
         }
         dev_buffer::RELEASE_WRITE => {
             let len = if !arg.is_null() && arg_len >= 4 {
                 u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)])
-            } else { 0 };
+            } else {
+                0
+            };
             channel::syscall_buffer_release_write(handle, len)
         }
         dev_buffer::ACQUIRE_READ => {
-            let len_out = if !arg.is_null() && arg_len >= 4 { arg as *mut u32 } else { core::ptr::null_mut() };
+            let len_out = if !arg.is_null() && arg_len >= 4 {
+                arg as *mut u32
+            } else {
+                core::ptr::null_mut()
+            };
             channel::syscall_buffer_acquire_read(handle, len_out) as i32
         }
         dev_buffer::RELEASE_READ => channel::syscall_buffer_release_read(handle),
         dev_buffer::ACQUIRE_INPLACE => {
-            let len_out = if !arg.is_null() && arg_len >= 4 { arg as *mut u32 } else { core::ptr::null_mut() };
+            let len_out = if !arg.is_null() && arg_len >= 4 {
+                arg as *mut u32
+            } else {
+                core::ptr::null_mut()
+            };
             channel::syscall_buffer_acquire_inplace(handle, len_out) as i32
         }
         _ => E_NOSYS,
@@ -758,20 +865,26 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
     use crate::kernel::fd;
     match opcode {
         dev_timer::MILLIS => {
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            if arg.is_null() || arg_len < 8 {
+                return E_INVAL;
+            }
             let ms = syscall_millis();
             core::ptr::write_unaligned(arg as *mut u64, ms);
             0
         }
         dev_timer::MICROS => {
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            if arg.is_null() || arg_len < 8 {
+                return E_INVAL;
+            }
             let us = syscall_micros();
             core::ptr::write_unaligned(arg as *mut u64, us);
             0
         }
         dev_timer::CREATE => fd::timer_create(),
         dev_timer::SET => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let ms = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             fd::timer_set(handle, ms)
         }
@@ -799,11 +912,16 @@ unsafe fn event_provider_dispatch(handle: i32, opcode: u32, _arg: *mut u8, _arg_
 // System Provider Dispatch (portable opcodes + extension point)
 // ============================================================================
 
-/// Extension point for platform-specific system opcodes (PWM, PIO, DMA, SPI9, etc.)
-static mut SYSTEM_EXTENSION: Option<unsafe fn(i32, u32, *mut u8, usize) -> i32> = None;
+/// Platform-extension dispatch entry: `(handle, opcode, arg_ptr, arg_len) -> i32`.
+pub type ExtensionFn = unsafe fn(i32, u32, *mut u8, usize) -> i32;
 
-pub fn register_system_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
-    unsafe { SYSTEM_EXTENSION = Some(f); }
+/// Extension point for platform-specific system opcodes (PWM, PIO, DMA, SPI9, etc.)
+static mut SYSTEM_EXTENSION: Option<ExtensionFn> = None;
+
+pub fn register_system_extension(f: ExtensionFn) {
+    unsafe {
+        SYSTEM_EXTENSION = Some(f);
+    }
 }
 
 /// Extension point for platform-specific provider-query entries.
@@ -812,10 +930,12 @@ pub fn register_system_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) 
 /// to expose chip-specific introspection (SYS_CLOCK_HZ, GPIO::GET_LEVEL
 /// for untracked handles, …).
 #[allow(dead_code)]
-static mut DEV_QUERY_EXTENSION: Option<unsafe fn(i32, u32, *mut u8, usize) -> i32> = None;
+static mut DEV_QUERY_EXTENSION: Option<ExtensionFn> = None;
 
-pub fn register_dev_query_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i32) {
-    unsafe { DEV_QUERY_EXTENSION = Some(f); }
+pub fn register_dev_query_extension(f: ExtensionFn) {
+    unsafe {
+        DEV_QUERY_EXTENSION = Some(f);
+    }
 }
 
 /// Shared helper for *_ENABLE registration syscalls. Validates that
@@ -824,11 +944,12 @@ pub fn register_dev_query_extension(f: unsafe fn(i32, u32, *mut u8, usize) -> i3
 /// Returns `None` on any validation failure.
 unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize, *mut u8)> {
     use crate::kernel::scheduler;
-    if arg.is_null() || arg_len < 4 { return None; }
+    if arg.is_null() || arg_len < 4 {
+        return None;
+    }
     let hash = core::ptr::read_unaligned(arg as *const u32);
     let module_idx = scheduler::current_module_index();
-    let resolved = crate::kernel::loader::resolve_export_for_module(module_idx, hash)
-        .unwrap_or(0);
+    let resolved = crate::kernel::loader::resolve_export_for_module(module_idx, hash).unwrap_or(0);
     if resolved == 0 {
         // Diagnostic: log details once-per-hash so provider/store
         // registration failures aren't silent. Gated by a static
@@ -841,7 +962,10 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
             let (_code, tbl, cnt) = scheduler::get_module_exports(module_idx);
             log::warn!(
                 "[reg] resolve_export failed: hash={:#x} mod={} exp_tbl={:?} exp_cnt={}",
-                hash, module_idx, tbl, cnt,
+                hash,
+                module_idx,
+                tbl,
+                cnt,
             );
         }
         return None;
@@ -853,7 +977,9 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
             LOGGED_NULL_STATE = true;
             log::warn!(
                 "[reg] state-null: hash={:#x} mod={} resolved={:#x}",
-                hash, module_idx, resolved,
+                hash,
+                module_idx,
+                resolved,
             );
         }
         return None;
@@ -862,14 +988,13 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
 }
 
 unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
     use crate::abi::internal::diag;
-    use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        PAGED_ARENA_GET, PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY,
-        SELF_INDEX,
-    };
+    use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
     use crate::abi::kernel_abi::event::BIND_IRQ;
+    use crate::abi::kernel_abi::{
+        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, PAGED_ARENA_GET,
+        PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
+    };
     use crate::kernel::scheduler;
     match opcode {
         // ── Core primitives ──
@@ -881,26 +1006,20 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | BIND_IRQ
         | HANDLE_POLL
         | RANDOM_FILL
-        | monitor::ISR_METRICS => {
-            handle_core_primitive(handle, opcode, arg, arg_len)
-        }
+        | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
         // ── Diagnostics / log transport ──
-        diag::LOG_RING_DRAIN |
-        diag::FAN_DIAG_SNAPSHOT => {
-            handle_diag_op(opcode, arg, arg_len)
-        }
+        diag::LOG_RING_DRAIN | diag::FAN_DIAG_SNAPSHOT => handle_diag_op(opcode, arg, arg_len),
         // ── Bridge channel operations ──
-        bridge::WRITE | bridge::READ |
-        bridge::POLL | bridge::INFO => {
+        bridge::WRITE | bridge::READ | bridge::POLL | bridge::INFO => {
             let bridge_op = opcode - bridge::WRITE; // 0=write, 1=read, 2=poll, 3=info
             let slot = crate::kernel::fd::slot_of(handle);
-            if slot < 0 { return E_INVAL; }
+            if slot < 0 {
+                return E_INVAL;
+            }
             crate::kernel::bridge::bridge_dispatch(slot as usize, bridge_op, arg, arg_len)
         }
         // ── Paged arena ──
-        PAGED_ARENA_GET
-        | monitor::PAGED_ARENA_STATS
-        | PAGED_ARENA_PREFAULT => {
+        PAGED_ARENA_GET | monitor::PAGED_ARENA_STATS | PAGED_ARENA_PREFAULT => {
             handle_paged_arena_op(opcode, arg, arg_len)
         }
         // ── Fault monitor ──
@@ -908,9 +1027,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | monitor::FAULT_MONITOR_POP
         | monitor::FAULT_STATS_QUERY
         | monitor::FAULT_RAISE
-        | monitor::STEP_HISTOGRAM_QUERY => {
-            handle_fault_monitor_op(handle, opcode, arg, arg_len)
-        }
+        | monitor::STEP_HISTOGRAM_QUERY => handle_fault_monitor_op(handle, opcode, arg, arg_len),
 
         // ── Live Reconfigure primitives (consumed by modules/reconfigure) ──
         reconfigure::SELF_INDEX
@@ -920,22 +1037,23 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | reconfigure::MODULE_COUNT
         | reconfigure::MODULE_INFO
         | reconfigure::MODULE_UPSTREAM
-        | reconfigure::MODULE_DONE => {
-            handle_reconfigure_op(opcode, arg, arg_len)
-        }
+        | reconfigure::MODULE_DONE => handle_reconfigure_op(opcode, arg, arg_len),
         // ── NVMe paged-arena backing registration (kernel-private
         //    dispatch registry for a private backing interface) ──
-        provider_registry::BACKING_PROVIDER_ENABLE => {
-            handle_service_register(opcode, arg, arg_len)
-        }
+        provider_registry::BACKING_PROVIDER_ENABLE => handle_service_register(opcode, arg, arg_len),
 
         reconfigure::TRIGGER_REBUILD => {
             // arg = [config_ptr:usize, config_len:usize] (platform pointer size)
             let ptr_size = core::mem::size_of::<usize>();
-            if arg.is_null() || arg_len < 2 * ptr_size { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 * ptr_size {
+                return E_INVAL;
+            }
             let config_ptr = unsafe { core::ptr::read_unaligned(arg as *const usize) } as *const u8;
-            let config_len = unsafe { core::ptr::read_unaligned(arg.add(ptr_size) as *const usize) };
-            unsafe { scheduler::request_rebuild(config_ptr, config_len); }
+            let config_len =
+                unsafe { core::ptr::read_unaligned(arg.add(ptr_size) as *const usize) };
+            unsafe {
+                scheduler::request_rebuild(config_ptr, config_len);
+            }
             0
         }
 
@@ -958,17 +1076,15 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // so the top-level match stays readable and each concern is local.
 
 unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
-        RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
-    };
-    use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::internal::monitor::ISR_METRICS;
+    use crate::abi::kernel_abi::event::BIND_IRQ;
+    use crate::abi::kernel_abi::{
+        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, RANDOM_FILL, REPORT_LATENCY,
+        SELF_INDEX,
+    };
     use crate::kernel::scheduler;
     match opcode {
-        SELF_INDEX => {
-            scheduler::current_module_index() as i32
-        }
+        SELF_INDEX => scheduler::current_module_index() as i32,
         ARENA_GET => {
             let mut size_out: u32 = 0;
             let ptr = scheduler::syscall_arena_get(&mut size_out);
@@ -982,7 +1098,9 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             size_out as i32
         }
         REPORT_LATENCY => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let frames = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let idx = scheduler::current_module_index();
             scheduler::report_module_latency(idx, frames);
@@ -993,44 +1111,67 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             0
         }
         GET_HW_ETHERNET_MAC => {
-            if arg.is_null() || arg_len < 6 { return E_INVAL; }
+            if arg.is_null() || arg_len < 6 {
+                return E_INVAL;
+            }
             #[cfg(feature = "chip-bcm2712")]
             {
                 match crate::kernel::dtb::read_ethernet_mac() {
                     Some(mac) => {
-                        for i in 0..6 { *arg.add(i) = mac[i]; }
+                        for (i, byte) in mac.iter().enumerate() {
+                            *arg.add(i) = *byte;
+                        }
                         6
                     }
                     None => errno::ENODEV,
                 }
             }
             #[cfg(not(feature = "chip-bcm2712"))]
-            { let _ = arg; errno::ENODEV }
+            {
+                let _ = arg;
+                errno::ENODEV
+            }
         }
         BIND_IRQ => {
-            if arg.is_null() || arg_len < 4 { return E_INVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
             let irq = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let mmio_base = if arg_len >= 12 {
                 u64::from_le_bytes([
-                    *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
-                    *arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11),
+                    *arg.add(4),
+                    *arg.add(5),
+                    *arg.add(6),
+                    *arg.add(7),
+                    *arg.add(8),
+                    *arg.add(9),
+                    *arg.add(10),
+                    *arg.add(11),
                 ]) as usize
-            } else { 0 };
+            } else {
+                0
+            };
             let event_slot = crate::kernel::fd::slot_of(handle);
-            if event_slot < 0 { return E_INVAL; }
+            if event_slot < 0 {
+                return E_INVAL;
+            }
             hal::irq_bind(irq, event_slot, mmio_base)
         }
         HANDLE_POLL => {
-            let events = if !arg.is_null() && arg_len >= 1 { *arg } else { 0xFF };
+            let events = if !arg.is_null() && arg_len >= 1 {
+                *arg
+            } else {
+                0xFF
+            };
             crate::kernel::fd::fd_poll(handle, events)
         }
         RANDOM_FILL => {
-            if arg.is_null() || arg_len == 0 { return E_INVAL; }
+            if arg.is_null() || arg_len == 0 {
+                return E_INVAL;
+            }
             hal::csprng_fill(arg, arg_len)
         }
-        ISR_METRICS => {
-            crate::kernel::isr_tier::isr_metrics_dispatch(arg, arg_len)
-        }
+        ISR_METRICS => crate::kernel::isr_tier::isr_metrics_dispatch(arg, arg_len),
         _ => E_NOSYS,
     }
 }
@@ -1039,11 +1180,11 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
     use crate::abi::internal::reconfigure;
     use crate::kernel::scheduler;
     match opcode {
-        reconfigure::SELF_INDEX => {
-            scheduler::current_module_index() as i32
-        }
+        reconfigure::SELF_INDEX => scheduler::current_module_index() as i32,
         reconfigure::SET_PHASE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let phase_byte = core::ptr::read(arg);
             let phase = match phase_byte {
                 0 => scheduler::ReconfigurePhase::Running,
@@ -1055,33 +1196,45 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
             0
         }
         reconfigure::CALL_DRAIN => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let idx = core::ptr::read(arg) as usize;
             scheduler::call_module_drain(idx)
         }
         reconfigure::MARK_FINISHED => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let idx = core::ptr::read(arg) as usize;
             scheduler::mark_module_finished(idx);
             0
         }
-        reconfigure::MODULE_COUNT => {
-            scheduler::active_module_count() as i32
-        }
+        reconfigure::MODULE_COUNT => scheduler::active_module_count() as i32,
         reconfigure::MODULE_INFO => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let idx = core::ptr::read(arg) as usize;
             scheduler::module_info_flags(idx) as i32
         }
         reconfigure::MODULE_UPSTREAM => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let idx = core::ptr::read(arg) as usize;
             scheduler::module_upstream_mask(idx) as i32
         }
         reconfigure::MODULE_DONE => {
-            if arg.is_null() || arg_len < 1 { return E_INVAL; }
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
             let idx = core::ptr::read(arg) as usize;
-            if scheduler::module_is_finished(idx) { 1 } else { 0 }
+            if scheduler::module_is_finished(idx) {
+                1
+            } else {
+                0
+            }
         }
         _ => E_NOSYS,
     }
@@ -1096,13 +1249,17 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 crate::kernel::step_guard::subscribe(-1)
             } else {
                 let slot = crate::kernel::fd::slot_of(handle);
-                if slot < 0 { return E_INVAL; }
+                if slot < 0 {
+                    return E_INVAL;
+                }
                 crate::kernel::step_guard::subscribe(slot)
             }
         }
         monitor::FAULT_MONITOR_POP => {
             use crate::kernel::step_guard::FaultRecord;
-            if arg.is_null() || arg_len < FaultRecord::SIZE { return E_INVAL; }
+            if arg.is_null() || arg_len < FaultRecord::SIZE {
+                return E_INVAL;
+            }
             let mut rec = FaultRecord::default();
             let got = crate::kernel::step_guard::pop_fault(&mut rec);
             if got == 1 {
@@ -1116,7 +1273,9 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
             if handle < 0 || handle as usize >= crate::kernel::config::MAX_MODULES {
                 return E_INVAL;
             }
-            if arg.is_null() || arg_len < core::mem::size_of::<FaultStats>() { return E_INVAL; }
+            if arg.is_null() || arg_len < core::mem::size_of::<FaultStats>() {
+                return E_INVAL;
+            }
             let stats = scheduler::get_fault_stats(handle as usize);
             core::ptr::copy_nonoverlapping(
                 &stats as *const FaultStats as *const u8,
@@ -1126,15 +1285,23 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
             0
         }
         monitor::FAULT_RAISE => {
-            if arg.is_null() || arg_len < 2 { return E_INVAL; }
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
             let idx = core::ptr::read(arg) as usize;
             let kind = core::ptr::read(arg.add(1));
             scheduler::raise_module_fault(idx, kind);
             0
         }
         monitor::STEP_HISTOGRAM_QUERY => {
-            if arg.is_null() || arg_len < 32 { return E_INVAL; }
-            let idx = if handle < 0 { usize::MAX } else { handle as usize };
+            if arg.is_null() || arg_len < 32 {
+                return E_INVAL;
+            }
+            let idx = if handle < 0 {
+                usize::MAX
+            } else {
+                handle as usize
+            };
             scheduler::query_step_histogram(idx, arg)
         }
         _ => E_NOSYS,
@@ -1142,16 +1309,24 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
 }
 
 unsafe fn handle_paged_arena_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::kernel_abi::{PAGED_ARENA_GET, PAGED_ARENA_PREFAULT};
     use crate::abi::internal::monitor::PAGED_ARENA_STATS;
+    use crate::abi::kernel_abi::{PAGED_ARENA_GET, PAGED_ARENA_PREFAULT};
     use crate::kernel::scheduler;
     match opcode {
         PAGED_ARENA_GET => {
             let idx = scheduler::current_module_index();
             let config = crate::kernel::pager::get_config(idx);
             if !arg.is_null() && arg_len >= 20 {
-                let base = if config.active { config.base_vaddr as u64 } else { 0 };
-                let size = if config.active { config.virtual_size as u64 } else { 0 };
+                let base = if config.active {
+                    config.base_vaddr as u64
+                } else {
+                    0
+                };
+                let size = if config.active {
+                    config.virtual_size as u64
+                } else {
+                    0
+                };
                 let status: u32 = if config.active { 1 } else { 0 };
                 let p = arg;
                 let base_bytes = base.to_le_bytes();
@@ -1161,7 +1336,11 @@ unsafe fn handle_paged_arena_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
                 core::ptr::copy_nonoverlapping(size_bytes.as_ptr(), p.add(8), 8);
                 core::ptr::copy_nonoverlapping(status_bytes.as_ptr(), p.add(16), 4);
             }
-            if config.active { 0 } else { E_NOSYS }
+            if config.active {
+                0
+            } else {
+                E_NOSYS
+            }
         }
         PAGED_ARENA_STATS => {
             let idx = scheduler::current_module_index();
@@ -1176,7 +1355,9 @@ unsafe fn handle_paged_arena_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
             }
         }
         PAGED_ARENA_PREFAULT => {
-            if arg.is_null() || arg_len < 8 { return E_INVAL; }
+            if arg.is_null() || arg_len < 8 {
+                return E_INVAL;
+            }
             let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let count = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             let idx = scheduler::current_module_index();
@@ -1188,7 +1369,9 @@ unsafe fn handle_paged_arena_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
 
 unsafe fn handle_diag_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::internal::diag;
-    if arg.is_null() || arg_len == 0 { return E_INVAL; }
+    if arg.is_null() || arg_len == 0 {
+        return E_INVAL;
+    }
     match opcode {
         diag::LOG_RING_DRAIN => {
             // Low 16 bits = payload length, next 15 bits = dropped count
@@ -1202,9 +1385,10 @@ unsafe fn handle_diag_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
         }
         diag::FAN_DIAG_SNAPSHOT => {
             let f = FAN_DIAG_HANDLER.load(core::sync::atomic::Ordering::Acquire);
-            if f.is_null() { return E_NOSYS; }
-            let handler: unsafe fn(*mut u8, usize) -> i32 =
-                core::mem::transmute(f);
+            if f.is_null() {
+                return E_NOSYS;
+            }
+            let handler: unsafe fn(*mut u8, usize) -> i32 = core::mem::transmute(f);
             handler(arg, arg_len)
         }
         _ => E_NOSYS,
@@ -1242,10 +1426,18 @@ unsafe fn handle_service_register(opcode: u32, arg: *mut u8, arg_len: usize) -> 
 // Timer (millis / micros) — delegates to platform
 // ============================================================================
 
+/// # Safety
+/// `extern "C"` syscall ABI shim: takes no pointers and is safe to call
+/// from any context that has the kernel timer initialised. Marked
+/// `unsafe` only to match the `SyscallTable` signature.
 pub unsafe extern "C" fn syscall_millis() -> u64 {
     hal::now_millis()
 }
 
+/// # Safety
+/// `extern "C"` syscall ABI shim: takes no pointers and is safe to call
+/// from any context that has the kernel timer initialised. Marked
+/// `unsafe` only to match the `SyscallTable` signature.
 pub unsafe extern "C" fn syscall_micros() -> u64 {
     hal::now_micros()
 }
@@ -1263,21 +1455,18 @@ pub unsafe extern "C" fn syscall_micros() -> u64 {
 ///  - cross-class common keys (`query_key::*`) applicable to any handle
 ///  - per-contract defaults (SPI GET_CAPS, I2C GET_CAPS, …)
 ///  - SYSTEM-contract introspection (ARENA_USAGE, GRAPH_SAMPLE_RATE, …)
-unsafe fn kernel_query_dispatch(
-    handle: i32,
-    key: u32,
-    out: *mut u8,
-    out_len: usize,
-) -> i32 {
-    use crate::kernel::provider::contract as dev_class;
+unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32 {
     use crate::abi::kernel_abi::query_key as dev_query_key;
     use crate::kernel::fd;
+    use crate::kernel::provider::contract as dev_class;
 
     // Handle cross-class common queries (0x0000-0x00FF)
     if key < 0x0100 {
         return match key {
             dev_query_key::CLASS => {
-                if out.is_null() || out_len < 1 { return E_INVAL; }
+                if out.is_null() || out_len < 1 {
+                    return E_INVAL;
+                }
                 let (tag, _) = fd::untag_fd(handle);
                 let class = match tag {
                     fd::FD_TAG_CHANNEL => dev_class::CHANNEL,
@@ -1288,13 +1477,13 @@ unsafe fn kernel_query_dispatch(
                 *out = class as u8;
                 0
             }
-            dev_query_key::STATE => {
-                E_NOSYS
-            }
+            dev_query_key::STATE => E_NOSYS,
             dev_query_key::HEAP_STATS => {
                 // Return heap stats for the calling module
                 let stats_size = core::mem::size_of::<crate::kernel::heap::HeapStats>();
-                if out.is_null() || out_len < stats_size { return E_INVAL; }
+                if out.is_null() || out_len < stats_size {
+                    return E_INVAL;
+                }
                 let idx = crate::kernel::scheduler::current_module_index();
                 let stats = crate::kernel::heap::heap_stats(idx);
                 *(out as *mut crate::kernel::heap::HeapStats) = stats;
@@ -1303,7 +1492,9 @@ unsafe fn kernel_query_dispatch(
             dev_query_key::FAULT_STATS => {
                 use crate::kernel::step_guard::FaultStats;
                 let stats_size = core::mem::size_of::<FaultStats>();
-                if out.is_null() || out_len < stats_size { return E_INVAL; }
+                if out.is_null() || out_len < stats_size {
+                    return E_INVAL;
+                }
                 let module_idx = if handle == -1 {
                     crate::kernel::scheduler::current_module_index()
                 } else {
@@ -1311,7 +1502,9 @@ unsafe fn kernel_query_dispatch(
                 };
                 let stats = crate::kernel::scheduler::get_fault_stats(module_idx);
                 core::ptr::copy_nonoverlapping(
-                    &stats as *const FaultStats as *const u8, out, stats_size,
+                    &stats as *const FaultStats as *const u8,
+                    out,
+                    stats_size,
                 );
                 stats_size as i32
             }
@@ -1325,7 +1518,9 @@ unsafe fn kernel_query_dispatch(
             use crate::abi::contracts::hal::spi as dev_spi;
             match key {
                 dev_spi::GET_CAPS => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
+                    if out.is_null() || out_len < 4 {
+                        return E_INVAL;
+                    }
                     // Return SPI capabilities: bit 0 = DMA, bit 1 = async
                     *(out as *mut u32) = 0x03;
                     0
@@ -1337,7 +1532,9 @@ unsafe fn kernel_query_dispatch(
             use crate::abi::contracts::hal::i2c as dev_i2c;
             match key {
                 dev_i2c::GET_CAPS => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
+                    if out.is_null() || out_len < 4 {
+                        return E_INVAL;
+                    }
                     // I2C capabilities: bit 0 = async bridge, bit 1 = multi-handle
                     *(out as *mut u32) = 0x03;
                     0
@@ -1353,7 +1550,9 @@ unsafe fn kernel_query_dispatch(
             match key {
                 0x0C00 => {
                     // Get kernel ABI version
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
+                    if out.is_null() || out_len < 4 {
+                        return E_INVAL;
+                    }
                     *(out as *mut u32) = ABI_VERSION;
                     0
                 }
@@ -1366,22 +1565,32 @@ unsafe fn kernel_query_dispatch(
                     use crate::kernel::provider;
                     const PIO_STREAM_TIME: u32 = 0x0407;
                     provider::dispatch(
-                        provider::contract::HAL_PIO, handle, PIO_STREAM_TIME, out, out_len,
+                        provider::contract::HAL_PIO,
+                        handle,
+                        PIO_STREAM_TIME,
+                        out,
+                        out_len,
                     )
                 }
                 ARENA_USAGE => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
+                    if out.is_null() || out_len < 4 {
+                        return E_INVAL;
+                    }
                     let (used, total) = crate::kernel::loader::arena_usage();
                     *(out as *mut u32) = ((used as u32) << 16) | (total as u32 & 0xFFFF);
                     0
                 }
                 GRAPH_SAMPLE_RATE => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
+                    if out.is_null() || out_len < 4 {
+                        return E_INVAL;
+                    }
                     *(out as *mut u32) = scheduler::graph_sample_rate();
                     0
                 }
                 DOWNSTREAM_LATENCY => {
-                    if out.is_null() || out_len < 4 { return E_INVAL; }
+                    if out.is_null() || out_len < 4 {
+                        return E_INVAL;
+                    }
                     let idx = scheduler::current_module_index();
                     *(out as *mut u32) = scheduler::downstream_latency(idx);
                     0
@@ -1444,16 +1653,49 @@ pub fn release_module_handles(module_idx: u8) {
     crate::kernel::provider::release_module_providers(module_idx);
 }
 
-unsafe extern "C" fn stub_channel_read(_handle: i32, _buf: *mut u8, _len: usize) -> i32 { E_NOSYS }
-unsafe extern "C" fn stub_channel_write(_handle: i32, _data: *const u8, _len: usize) -> i32 { E_NOSYS }
-unsafe extern "C" fn stub_channel_poll(_handle: i32, _events: u32) -> i32 { E_NOSYS }
-unsafe extern "C" fn stub_heap_alloc(_size: u32) -> *mut u8 { null_mut() }
+unsafe extern "C" fn stub_channel_read(_handle: i32, _buf: *mut u8, _len: usize) -> i32 {
+    E_NOSYS
+}
+unsafe extern "C" fn stub_channel_write(_handle: i32, _data: *const u8, _len: usize) -> i32 {
+    E_NOSYS
+}
+unsafe extern "C" fn stub_channel_poll(_handle: i32, _events: u32) -> i32 {
+    E_NOSYS
+}
+unsafe extern "C" fn stub_heap_alloc(_size: u32) -> *mut u8 {
+    null_mut()
+}
 unsafe extern "C" fn stub_heap_free(_ptr: *mut u8) {}
-unsafe extern "C" fn stub_heap_realloc(_ptr: *mut u8, _new_size: u32) -> *mut u8 { null_mut() }
-unsafe extern "C" fn stub_provider_open(_contract: u32, _op: u32, _config: *const u8, _config_len: usize) -> i32 { E_NOSYS }
-unsafe extern "C" fn stub_provider_call(_handle: i32, _op: u32, _arg: *mut u8, _arg_len: usize) -> i32 { E_NOSYS }
-unsafe extern "C" fn stub_provider_query(_handle: i32, _key: u32, _out: *mut u8, _out_len: usize) -> i32 { E_NOSYS }
-unsafe extern "C" fn stub_provider_close(_handle: i32) -> i32 { E_NOSYS }
+unsafe extern "C" fn stub_heap_realloc(_ptr: *mut u8, _new_size: u32) -> *mut u8 {
+    null_mut()
+}
+unsafe extern "C" fn stub_provider_open(
+    _contract: u32,
+    _op: u32,
+    _config: *const u8,
+    _config_len: usize,
+) -> i32 {
+    E_NOSYS
+}
+unsafe extern "C" fn stub_provider_call(
+    _handle: i32,
+    _op: u32,
+    _arg: *mut u8,
+    _arg_len: usize,
+) -> i32 {
+    E_NOSYS
+}
+unsafe extern "C" fn stub_provider_query(
+    _handle: i32,
+    _key: u32,
+    _out: *mut u8,
+    _out_len: usize,
+) -> i32 {
+    E_NOSYS
+}
+unsafe extern "C" fn stub_provider_close(_handle: i32) -> i32 {
+    E_NOSYS
+}
 
 // ============================================================================
 // Heap Syscall Implementations

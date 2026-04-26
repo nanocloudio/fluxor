@@ -22,9 +22,9 @@
 //! step guard is advisory — it records the timeout but relies on cooperative
 //! return).
 
-use portable_atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicI32, Ordering};
-use core::cell::UnsafeCell;
 use crate::kernel::hal;
+use core::cell::UnsafeCell;
+use portable_atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 
 // ============================================================================
 // Fault state machine
@@ -113,6 +113,12 @@ pub struct ModuleFaultInfo {
     pub backoff_remaining: u32,
     /// Step deadline in microseconds (0 = use default).
     pub step_deadline_us: u32,
+}
+
+impl Default for ModuleFaultInfo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ModuleFaultInfo {
@@ -334,14 +340,16 @@ struct FaultRing {
 unsafe impl Sync for FaultRing {}
 
 static FAULT_RING: FaultRing = FaultRing {
-    records: UnsafeCell::new([FaultRecord {
-        module_idx: 0,
-        fault_kind: 0,
-        _reserved: 0,
-        tick: 0,
-        fault_count: 0,
-        restart_count: 0,
-    }; FAULT_RING_CAP]),
+    records: UnsafeCell::new(
+        [FaultRecord {
+            module_idx: 0,
+            fault_kind: 0,
+            _reserved: 0,
+            tick: 0,
+            fault_count: 0,
+            restart_count: 0,
+        }; FAULT_RING_CAP],
+    ),
     head: AtomicU16::new(0),
     tail: AtomicU16::new(0),
     dropped: AtomicU16::new(0),
@@ -365,14 +373,20 @@ pub fn push_fault(rec: FaultRecord) {
     // faults without a second channel.
     log::info!(
         "MON_FAULT mod={} kind={} fault_count={} restart_count={} tick={}",
-        rec.module_idx, rec.fault_kind, rec.fault_count, rec.restart_count, rec.tick,
+        rec.module_idx,
+        rec.fault_kind,
+        rec.fault_count,
+        rec.restart_count,
+        rec.tick,
     );
     let head = FAULT_RING.head.load(Ordering::Relaxed);
     let tail = FAULT_RING.tail.load(Ordering::Acquire);
     let next = head.wrapping_add(1);
     if (next as usize) % FAULT_RING_CAP == (tail as usize) % FAULT_RING_CAP {
         // Ring full: drop the oldest by advancing the tail.
-        FAULT_RING.tail.store(tail.wrapping_add(1), Ordering::Release);
+        FAULT_RING
+            .tail
+            .store(tail.wrapping_add(1), Ordering::Release);
         FAULT_RING.dropped.fetch_add(1, Ordering::Relaxed);
     }
     unsafe {
@@ -401,7 +415,9 @@ pub fn pop_fault(out: &mut FaultRecord) -> i32 {
         let slot = &(*FAULT_RING.records.get())[(tail as usize) % FAULT_RING_CAP];
         *out = *slot;
     }
-    FAULT_RING.tail.store(tail.wrapping_add(1), Ordering::Release);
+    FAULT_RING
+        .tail
+        .store(tail.wrapping_add(1), Ordering::Release);
     1
 }
 

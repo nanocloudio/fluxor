@@ -41,9 +41,8 @@ pub fn invoke(
             ))
         })?;
 
-    let json = serde_json::to_string(invocation).map_err(|e| {
-        Error::Config(format!("rig backend: serialising invocation: {e}"))
-    })?;
+    let json = serde_json::to_string(invocation)
+        .map_err(|e| Error::Config(format!("rig backend: serialising invocation: {e}")))?;
 
     // Stdin write + close is best-effort — a backend that ignores stdin
     // and just does its job based on argv is legal.
@@ -138,11 +137,7 @@ mod tests {
     fn fixture_backend(
         name: &str,
         script: &str,
-    ) -> (
-        PathBuf,
-        BackendRef,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
+    ) -> (PathBuf, BackendRef, std::sync::MutexGuard<'static, ()>) {
         let guard = crate::rig::test_utils::lock_exec_spawn();
         let tmp = crate::rig::test_utils::unique_tmp_dir(&format!("actuator-{name}"));
         let exe = tmp.join(format!("power-{name}"));
@@ -183,7 +178,13 @@ mod tests {
             "ok",
             "#!/bin/sh\nread input\nprintf '{\"ok\":true,\"info\":\"did it\"}\\n'\n",
         );
-        let r = invoke(&backend, "cycle", &sample_invocation(), Duration::from_secs(5)).unwrap();
+        let r = invoke(
+            &backend,
+            "cycle",
+            &sample_invocation(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
         assert!(r.ok);
         assert_eq!(r.info.as_deref(), Some("did it"));
         std::fs::remove_dir_all(dir).ok();
@@ -192,19 +193,28 @@ mod tests {
     #[test]
     fn empty_stdout_is_treated_as_ok() {
         let (dir, backend, _exec_guard) = fixture_backend("quiet", "#!/bin/sh\nexit 0\n");
-        let r = invoke(&backend, "cycle", &sample_invocation(), Duration::from_secs(5)).unwrap();
+        let r = invoke(
+            &backend,
+            "cycle",
+            &sample_invocation(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
         assert!(r.ok);
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn nonzero_exit_is_error_with_stderr_surfaced() {
-        let (dir, backend, _exec_guard) = fixture_backend(
-            "fail",
-            "#!/bin/sh\necho 'kasa unreachable' >&2\nexit 7\n",
-        );
-        let err = invoke(&backend, "cycle", &sample_invocation(), Duration::from_secs(5))
-            .unwrap_err();
+        let (dir, backend, _exec_guard) =
+            fixture_backend("fail", "#!/bin/sh\necho 'kasa unreachable' >&2\nexit 7\n");
+        let err = invoke(
+            &backend,
+            "cycle",
+            &sample_invocation(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("exited 7"), "{msg}");
         assert!(msg.contains("kasa unreachable"), "{msg}");
@@ -213,12 +223,15 @@ mod tests {
 
     #[test]
     fn malformed_stdout_surfaces_as_error() {
-        let (dir, backend, _exec_guard) = fixture_backend(
-            "bad_json",
-            "#!/bin/sh\nprintf 'not json'\n",
-        );
-        let err = invoke(&backend, "cycle", &sample_invocation(), Duration::from_secs(5))
-            .unwrap_err();
+        let (dir, backend, _exec_guard) =
+            fixture_backend("bad_json", "#!/bin/sh\nprintf 'not json'\n");
+        let err = invoke(
+            &backend,
+            "cycle",
+            &sample_invocation(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("malformed JSON"), "{msg}");
         std::fs::remove_dir_all(dir).ok();
@@ -226,12 +239,14 @@ mod tests {
 
     #[test]
     fn soft_timeout_kills_hung_backend() {
-        let (dir, backend, _exec_guard) = fixture_backend(
-            "hang",
-            "#!/bin/sh\nsleep 30\n",
-        );
-        let err = invoke(&backend, "cycle", &sample_invocation(), Duration::from_millis(300))
-            .unwrap_err();
+        let (dir, backend, _exec_guard) = fixture_backend("hang", "#!/bin/sh\nsleep 30\n");
+        let err = invoke(
+            &backend,
+            "cycle",
+            &sample_invocation(),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("did not exit"));
         std::fs::remove_dir_all(dir).ok();
     }

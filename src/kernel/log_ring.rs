@@ -113,10 +113,18 @@ pub fn push_byte(b: u8) {
         return;
     }
 
-    let lag = if lag_local > lag_net { lag_local } else { lag_net };
+    let lag = if lag_local > lag_net {
+        lag_local
+    } else {
+        lag_net
+    };
     if lag >= CAPACITY {
-        if local_active { DROPPED_LOCAL.fetch_add(1, Ordering::Relaxed); }
-        if net_active { DROPPED_NET.fetch_add(1, Ordering::Relaxed); }
+        if local_active {
+            DROPPED_LOCAL.fetch_add(1, Ordering::Relaxed);
+        }
+        if net_active {
+            DROPPED_NET.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     }
     unsafe {

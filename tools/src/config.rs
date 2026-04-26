@@ -1520,10 +1520,7 @@ fn validate_param_ranges(
 /// Result: every declared param has a value (YAML override or default),
 /// so the packer emits a TLV entry for each one and built-ins don't
 /// need to re-encode defaults in code.
-fn inject_manifest_defaults(
-    module: &Value,
-    manifest: &crate::manifest::Manifest,
-) -> Value {
+fn inject_manifest_defaults(module: &Value, manifest: &crate::manifest::Manifest) -> Value {
     let mut clone = module.clone();
     let Some(obj) = clone.as_object_mut() else {
         return clone;
@@ -2133,21 +2130,22 @@ fn unknown_module_in_wiring(name: &str) -> String {
     }
 }
 
+/// One entry per wire: `(from_id, to_id, to_port, from_port_index, to_port_index)`.
+/// `to_port`: 0 = data input, 1 = control input.
+type WireTuple = (u8, u8, u8, u8, u8);
+
+/// Result bundle from `parse_wiring_edges`: tuples, force flags,
+/// and the original source/destination spec strings (parallel arrays).
+type WiringEdges = (Vec<WireTuple>, Vec<bool>, Vec<String>, Vec<String>);
+
 /// Parse wiring edges from YAML config.
-/// Returns Vec of (from_id, to_id, to_port, from_port_index, to_port_index).
-/// to_port: 0 = data input, 1 = control input.
 /// Supports indexed port syntax: "bank.out[1]" → from_port_index=1
 /// Supports named port syntax: "voip.rtp" → resolves via manifest
 fn parse_wiring_edges(
     wiring: &Value,
     names: &[String],
     manifests: &HashMap<String, Manifest>,
-) -> Result<(
-    Vec<(u8, u8, u8, u8, u8)>,
-    Vec<bool>,
-    Vec<String>,
-    Vec<String>,
-)> {
+) -> Result<WiringEdges> {
     let list = wiring
         .as_array()
         .ok_or_else(|| Error::Config("wiring must be a list".into()))?;
@@ -2533,6 +2531,7 @@ fn resolve_edge_classes(
 /// - Module entries (variable length each)
 /// - Graph section (64 bytes): edge_count, flags, reserved[2], edges[15]
 /// - Hardware section: spi_count, i2c_count, gpio_count, reserved, configs...
+///
 /// Module capability info for buffer aliasing and manifest validation.
 pub struct ModuleCaps {
     pub name: String,
@@ -2611,7 +2610,7 @@ fn generate_config_impl(
         .unwrap_or(0) as u16;
 
     // Validate tick_us range
-    if tick_us > 0 && (tick_us < 100 || tick_us > 50000) {
+    if tick_us > 0 && !(100..=50000).contains(&tick_us) {
         return Err(Error::Config(format!(
             "tick_us {} out of range (valid: 100-50000, or 0 for default 1000)",
             tick_us

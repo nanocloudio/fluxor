@@ -61,7 +61,7 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: fluxor-linux --config <config.bin> --modules <modules.bin>");
-                eprintln!("");
+                eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -c, --config <path>   Path to config.bin");
                 eprintln!("  -m, --modules <path>  Path to modules.bin");
@@ -216,8 +216,8 @@ fn main() {
     let sched = unsafe { scheduler::sched_mut() };
     let mut loaded_count = 0usize;
 
-    for module_idx in 0..module_count {
-        let entry = match &module_list[module_idx] {
+    for (module_idx, entry) in module_list.iter().enumerate().take(module_count) {
+        let entry = match entry {
             Some(e) => e,
             None => continue,
         };
@@ -231,7 +231,9 @@ fn main() {
             scheduler::store_builtin_module(module_idx, m);
             log::info!(
                 "[inst] module {} = linux_net (built-in) net_in={} net_out={}",
-                module_idx, net_in_ch, net_out_ch
+                module_idx,
+                net_in_ch,
+                net_out_ch
             );
             loaded_count += 1;
             continue;
@@ -331,7 +333,7 @@ fn main() {
 
         tick += 1;
 
-        if tick_us > 0 && tick % (10_000_000 / tick_us as u64) == 0 {
+        if tick_us > 0 && tick.is_multiple_of(10_000_000 / tick_us as u64) {
             log::info!("[sched] alive t={} elapsed_ms={}", tick, linux_now_millis());
         }
 

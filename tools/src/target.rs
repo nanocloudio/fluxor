@@ -172,7 +172,8 @@ pub struct TargetDescriptor {
     /// Board-level hardware defaults (merged when YAML omits a section)
     pub hardware_defaults: Option<serde_json::Value>,
     /// Platform stack defaults from board TOML (e.g. net → {phy: wifi, driver: cyw43})
-    pub platform_defaults: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    pub platform_defaults:
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// State arena size in KB (from [kernel] section, default 256)
     pub state_arena_kb: u32,
     /// Number of MPU regions available (0 = no MPU, e.g. Cortex-M0+)
@@ -342,12 +343,10 @@ pub fn list_targets(project_root: &Path) -> Vec<String> {
 // ── Internal loading ────────────────────────────────────────────────────────
 
 fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        Error::Config(format!("Failed to read {}: {}", path.display(), e))
-    })?;
-    let silicon: TomlSiliconFile = toml::from_str(&content).map_err(|e| {
-        Error::Config(format!("Failed to parse {}: {}", path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("Failed to read {}: {}", path.display(), e)))?;
+    let silicon: TomlSiliconFile = toml::from_str(&content)
+        .map_err(|e| Error::Config(format!("Failed to parse {}: {}", path.display(), e)))?;
 
     let build = silicon.build.map(|b| {
         let uf2_id = parse_hex_u32(&b.uf2_family_id).unwrap_or(0);
@@ -391,25 +390,29 @@ fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
         memory,
         hardware_defaults: None,
         platform_defaults: std::collections::HashMap::new(),
-        state_arena_kb: silicon.kernel.as_ref()
+        state_arena_kb: silicon
+            .kernel
+            .as_ref()
             .and_then(|k| k.state_arena_kb)
             .unwrap_or(256),
-        mpu_regions: silicon.isolation.as_ref()
+        mpu_regions: silicon
+            .isolation
+            .as_ref()
             .and_then(|i| i.mpu_regions)
             .unwrap_or(0),
-        has_mmu: silicon.isolation.as_ref()
+        has_mmu: silicon
+            .isolation
+            .as_ref()
             .and_then(|i| i.has_mmu)
             .unwrap_or(false),
     })
 }
 
 fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDescriptor> {
-    let content = std::fs::read_to_string(board_path).map_err(|e| {
-        Error::Config(format!("Failed to read {}: {}", board_path.display(), e))
-    })?;
-    let board: TomlBoardFile = toml::from_str(&content).map_err(|e| {
-        Error::Config(format!("Failed to parse {}: {}", board_path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(board_path)
+        .map_err(|e| Error::Config(format!("Failed to read {}: {}", board_path.display(), e)))?;
+    let board: TomlBoardFile = toml::from_str(&content)
+        .map_err(|e| Error::Config(format!("Failed to parse {}: {}", board_path.display(), e)))?;
 
     // Load referenced silicon target
     let silicon_path = targets_dir
@@ -447,15 +450,17 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
     if let Some(hw) = board.hardware {
         let mut map = serde_json::Map::new();
         if let Some(spi) = hw.spi {
-            let arr: Vec<serde_json::Value> = spi.iter().filter_map(|v| {
-                serde_json::to_value(v).ok()
-            }).collect();
+            let arr: Vec<serde_json::Value> = spi
+                .iter()
+                .filter_map(|v| serde_json::to_value(v).ok())
+                .collect();
             map.insert("spi".into(), serde_json::Value::Array(arr));
         }
         if let Some(pio) = hw.pio {
-            let arr: Vec<serde_json::Value> = pio.iter().filter_map(|v| {
-                serde_json::to_value(v).ok()
-            }).collect();
+            let arr: Vec<serde_json::Value> = pio
+                .iter()
+                .filter_map(|v| serde_json::to_value(v).ok())
+                .collect();
             map.insert("pio".into(), serde_json::Value::Array(arr));
         }
         if !map.is_empty() {
@@ -500,10 +505,7 @@ fn build_spi_tables(p: &TomlPeripherals) -> Vec<PinTable> {
 }
 
 fn build_i2c_tables(p: &TomlPeripherals) -> Vec<PinTable> {
-    vec![
-        convert_pin_table(&p.i2c0),
-        convert_pin_table(&p.i2c1),
-    ]
+    vec![convert_pin_table(&p.i2c0), convert_pin_table(&p.i2c1)]
 }
 
 fn convert_pin_table(entry: &Option<TomlPinTableEntry>) -> PinTable {

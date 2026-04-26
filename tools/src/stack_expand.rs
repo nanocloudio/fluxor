@@ -312,7 +312,7 @@ fn merge_with_board_defaults(
     // Check if user overrides phy (clears board driver)
     let user_overrides_phy = user_fields
         .as_object()
-        .map_or(false, |o| o.contains_key("phy"));
+        .is_some_and(|o| o.contains_key("phy"));
 
     // User fields override
     if let Some(obj) = user_fields.as_object() {
@@ -333,7 +333,7 @@ fn merge_with_board_defaults(
     if user_overrides_phy
         && !user_fields
             .as_object()
-            .map_or(false, |o| o.contains_key("driver"))
+            .is_some_and(|o| o.contains_key("driver"))
     {
         merged.remove("driver");
     }
@@ -410,9 +410,9 @@ fn injection_matches(
     match_keys.iter().all(|(k, expected)| {
         let actual = merged.get(k);
         if expected == "*" {
-            actual.map_or(false, |v| !v.is_empty() && v != "false" && v != "0")
+            actual.is_some_and(|v| !v.is_empty() && v != "false" && v != "0")
         } else {
-            actual.map_or(false, |v| v == expected)
+            actual == Some(expected)
         }
     })
 }

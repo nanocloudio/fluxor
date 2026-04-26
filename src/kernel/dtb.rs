@@ -78,22 +78,39 @@ pub fn read_ethernet_mac() -> Option<[u8; 6]> {
 
         let mut i = 0usize;
         while i + 4 <= structs.len() {
-            let tok = u32::from_be_bytes([structs[i], structs[i + 1], structs[i + 2], structs[i + 3]]);
+            let tok =
+                u32::from_be_bytes([structs[i], structs[i + 1], structs[i + 2], structs[i + 3]]);
             i += 4;
             match tok {
                 FDT_BEGIN_NODE => {
                     // Node name is a null-terminated string, padded to 4.
                     let mut j = i;
-                    while j < structs.len() && structs[j] != 0 { j += 1; }
+                    while j < structs.len() && structs[j] != 0 {
+                        j += 1;
+                    }
                     i = (j + 1 + 3) & !3; // include NUL, align up
                 }
                 FDT_END_NODE | FDT_NOP => {}
                 FDT_PROP => {
-                    if i + 8 > structs.len() { return None; }
-                    let len = u32::from_be_bytes([structs[i], structs[i+1], structs[i+2], structs[i+3]]) as usize;
-                    let nameoff = u32::from_be_bytes([structs[i+4], structs[i+5], structs[i+6], structs[i+7]]) as usize;
+                    if i + 8 > structs.len() {
+                        return None;
+                    }
+                    let len = u32::from_be_bytes([
+                        structs[i],
+                        structs[i + 1],
+                        structs[i + 2],
+                        structs[i + 3],
+                    ]) as usize;
+                    let nameoff = u32::from_be_bytes([
+                        structs[i + 4],
+                        structs[i + 5],
+                        structs[i + 6],
+                        structs[i + 7],
+                    ]) as usize;
                     i += 8;
-                    if i + len > structs.len() { return None; }
+                    if i + len > structs.len() {
+                        return None;
+                    }
 
                     // Check the property name.
                     if nameoff < strings.len() {
@@ -135,7 +152,7 @@ mod tests {
         // BEGIN_NODE "" (root)
         structs.extend_from_slice(&FDT_BEGIN_NODE.to_be_bytes());
         structs.extend_from_slice(b"\0\0\0\0"); // empty name padded to 4
-        // BEGIN_NODE "eth"
+                                                // BEGIN_NODE "eth"
         structs.extend_from_slice(&FDT_BEGIN_NODE.to_be_bytes());
         structs.extend_from_slice(b"eth\0");
         // PROP local-mac-address len=6
@@ -144,7 +161,7 @@ mod tests {
         structs.extend_from_slice(&name_off.to_be_bytes());
         structs.extend_from_slice(&mac);
         structs.extend_from_slice(&[0, 0]); // pad to 4
-        // END_NODE
+                                            // END_NODE
         structs.extend_from_slice(&FDT_END_NODE.to_be_bytes());
         // END_NODE (root)
         structs.extend_from_slice(&FDT_END_NODE.to_be_bytes());
@@ -195,24 +212,41 @@ mod tests {
             let mut i = 0usize;
             let mut found: Option<[u8; 6]> = None;
             while i + 4 <= structs.len() {
-                let tok = u32::from_be_bytes([structs[i], structs[i+1], structs[i+2], structs[i+3]]);
+                let tok = u32::from_be_bytes([
+                    structs[i],
+                    structs[i + 1],
+                    structs[i + 2],
+                    structs[i + 3],
+                ]);
                 i += 4;
                 match tok {
                     FDT_BEGIN_NODE => {
                         let mut j = i;
-                        while j < structs.len() && structs[j] != 0 { j += 1; }
+                        while j < structs.len() && structs[j] != 0 {
+                            j += 1;
+                        }
                         i = (j + 1 + 3) & !3;
                     }
                     FDT_END_NODE | FDT_NOP => {}
                     FDT_PROP => {
-                        let len = u32::from_be_bytes([structs[i], structs[i+1], structs[i+2], structs[i+3]]) as usize;
-                        let nameoff = u32::from_be_bytes([structs[i+4], structs[i+5], structs[i+6], structs[i+7]]) as usize;
+                        let len = u32::from_be_bytes([
+                            structs[i],
+                            structs[i + 1],
+                            structs[i + 2],
+                            structs[i + 3],
+                        ]) as usize;
+                        let nameoff = u32::from_be_bytes([
+                            structs[i + 4],
+                            structs[i + 5],
+                            structs[i + 6],
+                            structs[i + 7],
+                        ]) as usize;
                         i += 8;
                         let name = &strings[nameoff..];
                         let name_end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
                         if &name[..name_end] == b"local-mac-address" && len == 6 {
                             let mut m = [0u8; 6];
-                            m.copy_from_slice(&structs[i..i+6]);
+                            m.copy_from_slice(&structs[i..i + 6]);
                             found = Some(m);
                             break;
                         }

@@ -59,11 +59,7 @@ impl Default for RunOptions {
     }
 }
 
-pub fn execute_plan(
-    plan: &Plan,
-    profile: &RigProfile,
-    options: &RunOptions,
-) -> Result<RunOutcome> {
+pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> Result<RunOutcome> {
     // Step 1 — claim the rig.
     let lock_path = plan
         .lock_path
@@ -318,11 +314,7 @@ pub fn execute_plan(
         ))
     })?;
 
-    eprintln!(
-        "[rig] verdict: {:?}  run={}",
-        verdict,
-        run_dir.display(),
-    );
+    eprintln!("[rig] verdict: {:?}  run={}", verdict, run_dir.display(),);
 
     // Step 9 — implicit: LockGuard drops on return.
     Ok(RunOutcome { record, run_dir })
@@ -340,16 +332,16 @@ fn run_build(plan: &Plan, options: &RunOptions) -> Result<Option<ArtifactOutput>
         return Ok(plan_artifact_to_output(plan));
     }
     let (command, project_root, out) = match &plan.artifact {
-        ArtifactPlan::File { command, project_root, path } => (
+        ArtifactPlan::File {
             command,
             project_root,
-            ArtifactOutput::File(path.clone()),
-        ),
-        ArtifactPlan::Bundle { command, project_root, root } => (
+            path,
+        } => (command, project_root, ArtifactOutput::File(path.clone())),
+        ArtifactPlan::Bundle {
             command,
             project_root,
-            ArtifactOutput::Bundle(root.clone()),
-        ),
+            root,
+        } => (command, project_root, ArtifactOutput::Bundle(root.clone())),
         ArtifactPlan::Unresolved { reason } => {
             return Err(Error::Config(format!(
                 "rig run: cannot build — artifact is unresolved: {reason}"
@@ -361,16 +353,20 @@ fn run_build(plan: &Plan, options: &RunOptions) -> Result<Option<ArtifactOutput>
             "rig run: empty build command in project descriptor".into(),
         ));
     }
-    eprintln!("[rig] build ({}): {}", project_root.display(), shell_render(command));
+    eprintln!(
+        "[rig] build ({}): {}",
+        project_root.display(),
+        shell_render(command)
+    );
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
     // §15.3: project build commands run with the project root as CWD so
     // relative paths in the recipe resolve against the same anchor as the
     // artifact output.
     cmd.current_dir(project_root);
-    let status = cmd.status().map_err(|e| {
-        Error::Config(format!("rig run: spawning build `{}`: {e}", &command[0]))
-    })?;
+    let status = cmd
+        .status()
+        .map_err(|e| Error::Config(format!("rig run: spawning build `{}`: {e}", &command[0])))?;
     if !status.success() {
         return Err(Error::Config(format!(
             "rig run: build command exited with status {status}"
@@ -396,7 +392,7 @@ fn deploy_binding_for<'a>(plan: &'a Plan, profile: &'a RigProfile) -> Result<&'a
     })
 }
 
-fn console_binding_for<'a>(profile: &'a RigProfile, cap: Capability) -> Result<&'a BindingTable> {
+fn console_binding_for(profile: &RigProfile, cap: Capability) -> Result<&BindingTable> {
     profile.console.get(&cap).ok_or_else(|| {
         Error::Config(format!(
             "rig run: plan chose {} but profile has no [console.*] binding",
@@ -436,14 +432,12 @@ fn verdict_and_source_if_final(
     outcome: &matcher::MatcherOutcome,
 ) -> Option<(Verdict, Option<String>)> {
     match outcome {
-        matcher::MatcherOutcome::Passed { primary_source } => Some((
-            Verdict::Passed,
-            Some(primary_source.as_str().to_string()),
-        )),
-        matcher::MatcherOutcome::Failed { primary_source, .. } => Some((
-            Verdict::Failed,
-            Some(primary_source.as_str().to_string()),
-        )),
+        matcher::MatcherOutcome::Passed { primary_source } => {
+            Some((Verdict::Passed, Some(primary_source.as_str().to_string())))
+        }
+        matcher::MatcherOutcome::Failed { primary_source, .. } => {
+            Some((Verdict::Failed, Some(primary_source.as_str().to_string())))
+        }
         matcher::MatcherOutcome::TimedOut => Some((Verdict::TimedOut, None)),
         matcher::MatcherOutcome::InProgress => None,
     }

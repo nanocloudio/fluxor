@@ -46,7 +46,7 @@ pub(crate) fn dma_alloc_channel() -> i32 {
 }
 
 pub(crate) fn dma_free_channel(ch: u8) -> i32 {
-    if ch < 8 || ch > 15 {
+    if !(8..=15).contains(&ch) {
         return E_INVAL;
     }
     let bit = 1u16 << ch;
@@ -192,21 +192,17 @@ pub fn dma_fd_create() -> i32 {
         return ch_b;
     }
     let owner = crate::kernel::scheduler::current_module_index() as u8;
-    for i in 0..MAX_DMA_FDS {
-        if DMA_FD_SLOTS[i]
+    for (i, dma) in DMA_FD_SLOTS.iter().enumerate() {
+        if dma
             .allocated
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            DMA_FD_SLOTS[i].owner.store(owner, Ordering::Release);
-            DMA_FD_SLOTS[i]
-                .channel_a
-                .store(ch_a as u8, Ordering::Release);
-            DMA_FD_SLOTS[i]
-                .channel_b
-                .store(ch_b as u8, Ordering::Release);
-            DMA_FD_SLOTS[i].active_is_b.store(false, Ordering::Release);
-            DMA_FD_SLOTS[i].pending.store(false, Ordering::Release);
+            dma.owner.store(owner, Ordering::Release);
+            dma.channel_a.store(ch_a as u8, Ordering::Release);
+            dma.channel_b.store(ch_b as u8, Ordering::Release);
+            dma.active_is_b.store(false, Ordering::Release);
+            dma.pending.store(false, Ordering::Release);
             return fd::tag_fd(fd::FD_TAG_DMA, i as i32);
         }
     }
@@ -364,8 +360,7 @@ fn dma_fd_poll_ready(slot: i32) -> bool {
 }
 
 pub fn release_dma_fds_owned_by(module_idx: u8) {
-    for i in 0..MAX_DMA_FDS {
-        let dma = &DMA_FD_SLOTS[i];
+    for dma in DMA_FD_SLOTS.iter() {
         if !dma.allocated.load(Ordering::Acquire) {
             continue;
         }
@@ -433,6 +428,12 @@ pub fn is_gpio_registered(pin_num: u8) -> bool {
 
 /// Convenience syscall: claim + configure as output
 /// Returns handle on success, <0 on error
+///
+/// # Safety
+/// `extern "C"` syscall ABI shim invoked by PIC modules. Takes no
+/// pointers; marked `unsafe` only to match the syscall-table signature.
+/// All side effects route through the GPIO submodule's own checked
+/// claim/release/set_mode paths.
 pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     let handle = gpio::gpio_claim(pin_num);
     if handle < 0 {
@@ -468,6 +469,11 @@ const USER_BUTTON_HANDLE: i32 = 0xFF;
 /// pull: 0=none, 1=up, 2=down
 /// Pin 0xFF = board user button (BOOTSEL on Pico)
 /// Returns handle on success, <0 on error
+///
+/// # Safety
+/// `extern "C"` syscall ABI shim invoked by PIC modules. Takes no
+/// pointers; marked `unsafe` only to match the syscall-table signature.
+/// `pin_num == 0xFF` is intercepted as the virtual user-button handle.
 pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i32 {
     if pin_num == 0xFF {
         // Board user button — return virtual handle
@@ -516,7 +522,11 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
     use crate::abi::contracts::hal::gpio as dev_gpio;
     // Strip FD_TAG_HAL_GPIO so the inner ops see a raw pin number.
     // No-op on the -1 sentinel for open-style opcodes.
-    let handle = if handle >= 0 { crate::kernel::fd::slot_of(handle) } else { handle };
+    let handle = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
     match opcode {
         dev_gpio::CLAIM => {
             if arg.is_null() || arg_len < 1 {
@@ -1119,7 +1129,7 @@ unsafe fn rp_system_extension_dispatch(
             // even for write-only transactions — the PIO program expects
             // the full TX→RX cycle to complete.
             let rx_words = if read_bits > 0 {
-                (read_bits + 1 + 31) / 32
+                (read_bits + 1).div_ceil(32)
             } else {
                 1
             };
@@ -1135,13 +1145,15 @@ unsafe fn rp_system_extension_dispatch(
             }
 
             // RX DMA blocking (always — PIO needs full TX→RX cycle)
-            crate::kernel::rp_providers::dma_start_raw(ch_tx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06);
+            crate::kernel::rp_providers::dma_start_raw(
+                ch_tx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06,
+            );
             compiler_fence(Ordering::SeqCst);
             while crate::kernel::rp_providers::dma_busy(ch_tx) != 0 {}
             compiler_fence(Ordering::SeqCst);
 
-            let total = (tx_words * 4 + rx_words * 4) as i32;
-            total
+            
+            (tx_words * 4 + rx_words * 4) as i32
         }
         // ── PLATFORM_DMA: channel family ──────────────────────────────
         //
@@ -1543,7 +1555,7 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let pin = *arg;
-            if pin < 26 || pin > 29 {
+            if !(26..=29).contains(&pin) {
                 return E_INVAL;
             }
             let pad_base = 0x4003_8004usize + (pin as usize) * 4;

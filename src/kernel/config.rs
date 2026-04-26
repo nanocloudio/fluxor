@@ -189,6 +189,12 @@ pub struct HardwareContext {
     i2c_initialized: [bool; MAX_I2C_BUSES],
 }
 
+impl Default for HardwareContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HardwareContext {
     pub const fn new() -> Self {
         Self {
@@ -298,7 +304,11 @@ fn read_layout_from_slots() -> Option<FlashLayout> {
     let b = unsafe { decode_slot_header(slot_b) };
     let (base, hdr) = match (a, b) {
         (Some(ha), Some(hb)) => {
-            if ha.epoch >= hb.epoch { (slot_a, ha) } else { (slot_b, hb) }
+            if ha.epoch >= hb.epoch {
+                (slot_a, ha)
+            } else {
+                (slot_b, hb)
+            }
         }
         (Some(ha), None) => (slot_a, ha),
         (None, Some(hb)) => (slot_b, hb),
@@ -322,9 +332,13 @@ struct SlotHeader {
 unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
     use crate::abi::platform::rp::flash_layout;
     let magic = read_u32(base);
-    if magic != flash_layout::GRAPH_SLOT_MAGIC { return None; }
+    if magic != flash_layout::GRAPH_SLOT_MAGIC {
+        return None;
+    }
     let version = *base.add(4);
-    if version != flash_layout::GRAPH_SLOT_VERSION { return None; }
+    if version != flash_layout::GRAPH_SLOT_VERSION {
+        return None;
+    }
     let epoch = read_u64(base.add(8));
     let modules_offset = read_u32(base.add(16));
     let modules_size = read_u32(base.add(20));
@@ -339,7 +353,11 @@ unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
         return None;
     }
 
-    Some(SlotHeader { epoch, modules_offset, config_offset })
+    Some(SlotHeader {
+        epoch,
+        modules_offset,
+        config_offset,
+    })
 }
 
 #[cfg(feature = "rp")]
@@ -630,7 +648,6 @@ pub fn read_config_at_into(config_addr: u32, config: &mut Config) -> bool {
 ///
 /// Works with any memory-mapped config blob (flash on RP, embedded blob on aarch64).
 pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
-
     // Read header (16 bytes)
     let header = unsafe {
         let magic = read_u32(flash_ptr);
@@ -682,20 +699,31 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
     let body_before_hw = 8 + (4 + section_size) + GRAPH_SECTION_SIZE;
     let hw_header_ptr = unsafe { modules_base.add(4 + section_size + GRAPH_SECTION_SIZE) };
     let (spi_n, i2c_n, gpio_n, pio_n, uart_n) = unsafe {
-        ((*hw_header_ptr) as usize, (*hw_header_ptr.add(1)) as usize,
-         (*hw_header_ptr.add(2)) as usize, (*hw_header_ptr.add(3)) as usize,
-         (*hw_header_ptr.add(5)) as usize)
+        (
+            (*hw_header_ptr) as usize,
+            (*hw_header_ptr.add(1)) as usize,
+            (*hw_header_ptr.add(2)) as usize,
+            (*hw_header_ptr.add(3)) as usize,
+            (*hw_header_ptr.add(5)) as usize,
+        )
     };
-    let hw_size = 6 + spi_n * SPI_CONFIG_BIN_SIZE + i2c_n * I2C_CONFIG_BIN_SIZE
+    let hw_size = 6
+        + spi_n * SPI_CONFIG_BIN_SIZE
+        + i2c_n * I2C_CONFIG_BIN_SIZE
         + uart_n * UART_CONFIG_BIN_SIZE
-        + gpio_n * GPIO_CONFIG_BIN_SIZE + pio_n * PIO_CONFIG_BIN_SIZE;
+        + gpio_n * GPIO_CONFIG_BIN_SIZE
+        + pio_n * PIO_CONFIG_BIN_SIZE;
     let body_size = body_before_hw + hw_size;
 
     // Sanity-check total config size against flash bounds
     let total_size = 8 + body_size;
     const MAX_CONFIG_SIZE: usize = 16384;
     if total_size > MAX_CONFIG_SIZE {
-        log::error!("[config] too large size={} max={}", total_size, MAX_CONFIG_SIZE);
+        log::error!(
+            "[config] too large size={} max={}",
+            total_size,
+            MAX_CONFIG_SIZE
+        );
         return false;
     }
 
@@ -705,7 +733,8 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         if computed != header.checksum {
             log::warn!(
                 "[config] checksum mismatch stored=0x{:04x} computed=0x{:04x}",
-                header.checksum, computed
+                header.checksum,
+                computed
             );
             return false;
         }
@@ -713,7 +742,11 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
     // Bounds-check: module section size should be reasonable
     const MAX_MODULE_SECTION: usize = 16384;
     if section_size > MAX_MODULE_SECTION {
-        log::error!("[config] module section too large size={} max={}", section_size, MAX_MODULE_SECTION);
+        log::error!(
+            "[config] module section too large size={} max={}",
+            section_size,
+            MAX_MODULE_SECTION
+        );
         return false;
     }
 
@@ -822,11 +855,11 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 /// Format (4 bytes):
 /// - byte 0: from_id (u8)
 /// - byte 1: to_id (u8)
-/// - byte 2: bit 7    = to_port (0=in, 1=ctrl)
-///           bits [6:5] = edge_class (2-bit)
-///           bits [4:0] = buffer_group (5-bit, 0..31)
+/// - byte 2: bit 7      = to_port (0=in, 1=ctrl)
+///   bits [6:5] = edge_class (2-bit)
+///   bits [4:0] = buffer_group (5-bit, 0..31)
 /// - byte 3: bits [7:4] = from_port_index (4-bit, 0..15)
-///           bits [3:0] = to_port_index   (4-bit, 0..15)
+///   bits [3:0] = to_port_index   (4-bit, 0..15)
 ///
 /// Both port indices are 4 bits; the runtime caps both at
 /// `MAX_PORTS = 16` (scheduler.rs). `buffer_group` is 5 bits — group 0
@@ -849,7 +882,15 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
             3 => EdgeClass::NicRing,
             _ => EdgeClass::Local,
         };
-        GraphEdge { from_id, to_id, to_port, from_port_index, to_port_index, buffer_group, edge_class }
+        GraphEdge {
+            from_id,
+            to_id,
+            to_port,
+            from_port_index,
+            to_port_index,
+            buffer_group,
+            edge_class,
+        }
     }
 }
 
@@ -1089,7 +1130,9 @@ impl Hardware {
 
     /// Get SPI configuration
     pub fn spi(&self) -> SpiConfig {
-        self.config.spi[0].or(self.config.spi[1]).unwrap_or(DEFAULT_SPI)
+        self.config.spi[0]
+            .or(self.config.spi[1])
+            .unwrap_or(DEFAULT_SPI)
     }
 
     /// Get SPI bus number
@@ -1099,7 +1142,10 @@ impl Hardware {
 
     /// Get CS pin number (first output GPIO)
     pub fn cs_pin(&self) -> u8 {
-        self.config.gpio.iter().flatten()
+        self.config
+            .gpio
+            .iter()
+            .flatten()
             .find(|g| g.direction == GpioDirection::Output)
             .map(|g| g.pin)
             .unwrap_or(17)
@@ -1107,7 +1153,9 @@ impl Hardware {
 
     /// Get I2C configuration (first configured bus or default)
     pub fn i2c(&self) -> I2cConfig {
-        self.config.i2c[0].or(self.config.i2c[1]).unwrap_or(DEFAULT_I2C)
+        self.config.i2c[0]
+            .or(self.config.i2c[1])
+            .unwrap_or(DEFAULT_I2C)
     }
 
     /// Get PIO cmd configuration (slot 0: bidirectional gSPI for cyw43)

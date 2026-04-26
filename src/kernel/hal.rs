@@ -101,7 +101,9 @@ static mut HAL_OPS: Option<&'static HalOps> = None;
 /// # Safety
 /// Must be called exactly once before any kernel code runs.
 pub fn init(ops: &'static HalOps) {
-    unsafe { HAL_OPS = Some(ops); }
+    unsafe {
+        HAL_OPS = Some(ops);
+    }
 }
 
 /// Get the HAL ops table. Panics if not initialized (boot bug).

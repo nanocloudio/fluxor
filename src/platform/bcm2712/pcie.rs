@@ -437,8 +437,8 @@ unsafe fn pcie1_program_outbound() {
     let limit_mb = (brcm::PCIE1_OUTBOUND_CPU_LIMIT >> 20) as u32;
     let base_limit = ((base_mb & 0xFFF) << 4) | ((limit_mb & 0xFFF) << 20);
     rc_w32(rc, brcm::MEM_WIN0_BASE_LIMIT, base_limit);
-    rc_w32(rc, brcm::MEM_WIN0_BASE_HI, (base_mb >> 12) as u32);
-    rc_w32(rc, brcm::MEM_WIN0_LIMIT_HI, (limit_mb >> 12) as u32);
+    rc_w32(rc, brcm::MEM_WIN0_BASE_HI, base_mb >> 12);
+    rc_w32(rc, brcm::MEM_WIN0_LIMIT_HI, limit_mb >> 12);
 }
 
 /// Probe BAR0 size using the standard PCI write-ones / read-back
@@ -942,12 +942,11 @@ pub fn enumerate() -> usize {
 
 pub fn find_by_nic_type(nic_type: PcieNicType) -> Option<usize> {
     unsafe {
-        for i in 0..DEVICE_COUNT {
-            if DEVICES[i].nic_type == nic_type {
-                return Some(i);
-            }
-        }
-        None
+        let devices_p = &raw const DEVICES;
+        (*devices_p)
+            .iter()
+            .take(DEVICE_COUNT)
+            .position(|d| d.nic_type == nic_type)
     }
 }
 
@@ -1015,6 +1014,11 @@ pub fn device_cfg_write32(_dev_idx: usize, _offset: u16, _val: u32) -> i32 {
 ///   in:  `[dev_idx: u8][_pad: u8][offset: u16 LE]` (4 bytes)
 ///   out: `[value: u32 LE]` appended at offset 4 (caller must pass >= 8 B).
 /// Returns 0 on success, -22 on malformed arg.
+///
+/// # Safety
+/// `arg` must point to a writable buffer of at least `arg_len` bytes that
+/// outlives the call; the kernel's syscall trampoline guarantees this when
+/// invoking handlers, but direct callers must uphold the same invariant.
 pub unsafe fn syscall_cfg_read32(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return -22;
@@ -1033,6 +1037,11 @@ pub unsafe fn syscall_cfg_read32(arg: *mut u8, arg_len: usize) -> i32 {
 /// Syscall handler for `PCIE_CFG_WRITE32`. Arg layout:
 ///   in:  `[dev_idx: u8][_pad: u8][offset: u16 LE][value: u32 LE]` (8 bytes).
 /// Returns 0 on success, -22 on malformed arg.
+///
+/// # Safety
+/// `arg` must point to a readable buffer of at least `arg_len` bytes that
+/// outlives the call. Writing to PCIe config space can affect device state
+/// and BAR placement; caller must hold the right contract permission.
 pub unsafe fn syscall_cfg_write32(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return -22;
@@ -1081,23 +1090,17 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
         // Re-use an existing slot for the same BDF+bar_idx — callers can
         // and do invoke this repeatedly (e.g. nvme retry-on-fault) and
         // allocating a fresh slot each time would exhaust MAX_BAR_MAPS.
-        for i in 0..MAX_BAR_MAPS {
-            if BAR_MAPS[i].active && BAR_MAPS[i].bdf == bdf && BAR_MAPS[i].bar_idx == bar_idx as u8
-            {
+        let bar_maps_p = &raw const BAR_MAPS;
+        for m in (*bar_maps_p).iter() {
+            if m.active && m.bdf == bdf && m.bar_idx == bar_idx as u8 {
                 return virt;
             }
         }
 
-        let mut slot = MAX_BAR_MAPS;
-        for i in 0..MAX_BAR_MAPS {
-            if !BAR_MAPS[i].active {
-                slot = i;
-                break;
-            }
-        }
-        if slot >= MAX_BAR_MAPS {
-            return 0;
-        }
+        let slot = match (*bar_maps_p).iter().position(|m| !m.active) {
+            Some(s) => s,
+            None => return 0,
+        };
 
         BAR_MAPS[slot] = BarMap {
             bdf,
@@ -1112,9 +1115,10 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
 
 pub fn bar_unmap(virt_addr: usize) -> i32 {
     unsafe {
-        for i in 0..MAX_BAR_MAPS {
-            if BAR_MAPS[i].active && BAR_MAPS[i].virt_addr == virt_addr {
-                BAR_MAPS[i].active = false;
+        let bar_maps_p = &raw mut BAR_MAPS;
+        for m in (*bar_maps_p).iter_mut() {
+            if m.active && m.virt_addr == virt_addr {
+                m.active = false;
                 return 0;
             }
         }
@@ -1126,6 +1130,13 @@ pub fn bar_unmap(virt_addr: usize) -> i32 {
 // Syscall handlers
 // ============================================================================
 
+/// Syscall handler for `PCIE_BAR_MAP`. Arg in: `[dev_idx][bar_idx]`,
+/// out: 8-byte LE virt address at offset 2 when `arg_len >= 10`.
+///
+/// # Safety
+/// `arg` must point to a writable buffer of at least `arg_len` bytes
+/// for the duration of the call. The kernel syscall trampoline upholds
+/// this when invoking the handler.
 pub unsafe fn syscall_bar_map(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 2 {
         return crate::kernel::errno::EINVAL;
@@ -1148,6 +1159,11 @@ pub unsafe fn syscall_bar_map(arg: *mut u8, arg_len: usize) -> i32 {
     1
 }
 
+/// Syscall handler for `PCIE_BAR_UNMAP`. Arg: 8-byte LE virt address.
+///
+/// # Safety
+/// `arg` must point to a readable buffer of at least 8 bytes for the
+/// duration of the call.
 pub unsafe fn syscall_bar_unmap(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return crate::kernel::errno::EINVAL;
@@ -1205,6 +1221,11 @@ static mut BOUND_DEVICES: [BoundDevice; MAX_SCAN_DEVS] =
 
 /// Parse a selector and return the bound device handle, or a negative
 /// errno. Invoked by the kernel dispatcher on `PCIE_DEVICE::BIND`.
+///
+/// # Safety
+/// `sel` must be a valid byte slice readable for the duration of the call.
+/// On match, the caller takes ownership of the returned device handle and
+/// is responsible for releasing it via `PCIE_DEVICE::CLOSE`.
 #[cfg(feature = "board-cm5")]
 pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
     let s = match core::str::from_utf8(sel) {
@@ -1225,9 +1246,10 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
             }
         };
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
+        let devs = &raw const DEVICES;
         let mut hit: Option<usize> = None;
-        for i in 0..count {
-            if DEVICES[i].class == code {
+        for (i, d) in (*devs).iter().take(count).enumerate() {
+            if d.class == code {
                 if hit.is_some() {
                     log::warn!(
                         "[pcie_device] class selector '@class={}' matches multiple devices",
@@ -1255,18 +1277,18 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
     match alias.root {
         crate::kernel::pcie_aliases::PcieRoot::Pcie1 => {
             let count = *core::ptr::addr_of!(DEVICE_COUNT);
-            for i in 0..count {
-                let d = &DEVICES[i];
-                if d.bus == alias.bus
-                    && d.dev == alias.dev
-                    && d.func == alias.func
-                {
+            let devs = &raw const DEVICES;
+            for (i, d) in (*devs).iter().take(count).enumerate() {
+                if d.bus == alias.bus && d.dev == alias.dev && d.func == alias.func {
                     return finalize_bind(i, alias.root, s);
                 }
             }
             log::warn!(
                 "[pcie_device] alias '{}' ({}:{}.{}) not present in enumeration",
-                s, alias.bus, alias.dev, alias.func,
+                s,
+                alias.bus,
+                alias.dev,
+                alias.func,
             );
             crate::kernel::errno::ENODEV
         }
@@ -1294,12 +1316,12 @@ unsafe fn finalize_bind(
     slot.active = true;
     slot.root = root;
     slot.alias_len = 0;
-    for b in slot.alias.iter_mut() { *b = 0; }
+    for b in slot.alias.iter_mut() {
+        *b = 0;
+    }
     let bytes = alias.as_bytes();
     let n = core::cmp::min(bytes.len(), slot.alias.len() - 1);
-    for i in 0..n {
-        slot.alias[i] = bytes[i];
-    }
+    slot.alias[..n].copy_from_slice(&bytes[..n]);
     slot.alias_len = n as u8;
     crate::kernel::fd::tag_fd(crate::kernel::fd::FD_TAG_PCIE_DEVICE, dev_idx as i32)
 }
@@ -1308,19 +1330,29 @@ unsafe fn finalize_bind(
 /// FD_TAG_PCIE_DEVICE-tagged form (from `BIND`) and a raw slot.
 #[cfg(feature = "board-cm5")]
 fn decode_handle(handle: i32) -> Option<usize> {
-    if handle < 0 { return None; }
+    if handle < 0 {
+        return None;
+    }
     let (tag, slot) = crate::kernel::fd::untag_fd(handle);
     if tag != 0 && tag != crate::kernel::fd::FD_TAG_PCIE_DEVICE {
         return None;
     }
     let idx = slot as usize;
-    if idx >= MAX_SCAN_DEVS { return None; }
+    if idx >= MAX_SCAN_DEVS {
+        return None;
+    }
     Some(idx)
 }
 
 #[cfg(not(feature = "board-cm5"))]
-fn decode_handle(_handle: i32) -> Option<usize> { None }
+fn decode_handle(_handle: i32) -> Option<usize> {
+    None
+}
 
+/// PCIE_DEVICE `BIND` (QEMU stub). Always reports ENOSYS.
+///
+/// # Safety
+/// `_sel` is a valid byte slice; this stub does not touch hardware.
 #[cfg(not(feature = "board-cm5"))]
 pub unsafe fn bind_selector(_sel: &[u8]) -> i32 {
     crate::kernel::errno::ENOSYS
@@ -1329,6 +1361,11 @@ pub unsafe fn bind_selector(_sel: &[u8]) -> i32 {
 /// PCIE_DEVICE `CLOSE`: release per-handle bookkeeping. BAR maps
 /// created via `BAR_MAP` are ref-counted by BDF+bar_idx in
 /// `bar_map` and persist until explicit `NIC_BAR_UNMAP` or reboot.
+///
+/// # Safety
+/// `handle` must be a value previously returned from `bind_selector` or
+/// the untagged slot index. Touches global `BOUND_DEVICES`; caller must
+/// not run concurrently with another close on the same handle.
 #[cfg(feature = "board-cm5")]
 pub unsafe fn syscall_device_close(handle: i32) -> i32 {
     let idx = match decode_handle(handle) {
@@ -1341,11 +1378,23 @@ pub unsafe fn syscall_device_close(handle: i32) -> i32 {
     0
 }
 
+/// PCIE_DEVICE `CLOSE` (QEMU stub). No-op.
+///
+/// # Safety
+/// No invariants beyond receiving an i32 — the stub does not touch
+/// hardware or globals.
 #[cfg(not(feature = "board-cm5"))]
-pub unsafe fn syscall_device_close(_handle: i32) -> i32 { 0 }
+pub unsafe fn syscall_device_close(_handle: i32) -> i32 {
+    0
+}
 
 /// PCIE_DEVICE `CFG_READ32`. arg = [offset:u16 LE] at bytes 0..2;
 /// writes value:u32 LE to arg[4..8]. Caller must pass >= 8 bytes.
+///
+/// # Safety
+/// `arg` must point to a writable buffer of at least `arg_len` bytes for
+/// the duration of the call. `handle` must be one previously bound for
+/// this contract.
 pub unsafe fn syscall_device_cfg_read32(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return crate::kernel::errno::EINVAL;
@@ -1357,12 +1406,19 @@ pub unsafe fn syscall_device_cfg_read32(handle: i32, arg: *mut u8, arg_len: usiz
     let offset = u16::from_le_bytes([*arg, *arg.add(1)]);
     let val = device_cfg_read32(idx, offset);
     let b = val.to_le_bytes();
-    for i in 0..4 { *arg.add(4 + i) = b[i]; }
+    for (i, byte) in b.iter().enumerate() {
+        *arg.add(4 + i) = *byte;
+    }
     0
 }
 
 /// PCIE_DEVICE `CFG_WRITE32`. arg = [offset:u16 LE, _pad:u16,
 /// value:u32 LE] (8 bytes).
+///
+/// # Safety
+/// `arg` must point to a readable buffer of at least 8 bytes for the
+/// duration of the call. Writing config space mutates device state, so
+/// `handle` must hold the right contract permission.
 pub unsafe fn syscall_device_cfg_write32(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return crate::kernel::errno::EINVAL;
@@ -1380,6 +1436,10 @@ pub unsafe fn syscall_device_cfg_write32(handle: i32, arg: *mut u8, arg_len: usi
 /// virt_addr:u64 LE to arg[2..10]. Caller must pass >= 10 bytes.
 /// Returns 0 on success, -errno on failure — success is signalled
 /// by the written address, not the return value.
+///
+/// # Safety
+/// `arg` must point to a writable buffer of at least 10 bytes for the
+/// duration of the call. `handle` must be a bound PCIE_DEVICE handle.
 pub unsafe fn syscall_device_bar_map(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 10 {
         return crate::kernel::errno::EINVAL;
@@ -1394,7 +1454,9 @@ pub unsafe fn syscall_device_bar_map(handle: i32, arg: *mut u8, arg_len: usize) 
         return crate::kernel::errno::ENOMEM;
     }
     let ab = (virt as u64).to_le_bytes();
-    for i in 0..8 { *arg.add(2 + i) = ab[i]; }
+    for (i, byte) in ab.iter().enumerate() {
+        *arg.add(2 + i) = *byte;
+    }
     0
 }
 
@@ -1402,19 +1464,28 @@ pub unsafe fn syscall_device_bar_map(handle: i32, arg: *mut u8, arg_len: usize) 
 /// The `MSI_ALLOC` dispatcher in `src/platform/bcm2712.rs` uses
 /// this to pick the right MSI mux + GIC SPI IRQ before delegating
 /// to `pcie1_msi_alloc_vector`.
+///
+/// # Safety
+/// `handle` must be a value returned by `bind_selector`. Reads from
+/// global `BOUND_DEVICES`; caller must not concurrently mutate that
+/// slot via `syscall_device_close`.
 #[cfg(feature = "board-cm5")]
-pub unsafe fn bound_device_root(handle: i32)
-    -> Option<crate::kernel::pcie_aliases::PcieRoot>
-{
+pub unsafe fn bound_device_root(handle: i32) -> Option<crate::kernel::pcie_aliases::PcieRoot> {
     let idx = decode_handle(handle)?;
     let slot = &*core::ptr::addr_of!(BOUND_DEVICES[idx]);
-    if !slot.active { None } else { Some(slot.root) }
+    if !slot.active {
+        None
+    } else {
+        Some(slot.root)
+    }
 }
 
+/// QEMU stub — no PCIe enumeration table available, always returns None.
+///
+/// # Safety
+/// No invariants; this stub does not dereference any state.
 #[cfg(not(feature = "board-cm5"))]
-pub unsafe fn bound_device_root(_handle: i32)
-    -> Option<crate::kernel::pcie_aliases::PcieRoot>
-{
+pub unsafe fn bound_device_root(_handle: i32) -> Option<crate::kernel::pcie_aliases::PcieRoot> {
     None
 }
 
@@ -1423,6 +1494,10 @@ pub unsafe fn bound_device_root(_handle: i32)
 ///     bus:u8, dev:u8, func:u8, _pad:u8,
 ///     alias:[u8; 20] null-terminated ]
 /// Returns 32 on success or -errno.
+///
+/// # Safety
+/// `arg` must point to a writable 32-byte buffer for the duration of
+/// the call. `handle` must be a bound PCIE_DEVICE handle.
 pub unsafe fn syscall_device_info(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 32 {
         return crate::kernel::errno::EINVAL;
@@ -1443,7 +1518,9 @@ pub unsafe fn syscall_device_info(handle: i32, arg: *mut u8, arg_len: usize) -> 
     *arg.add(1) = vid[1];
     *arg.add(2) = did[0];
     *arg.add(3) = did[1];
-    for i in 0..4 { *arg.add(4 + i) = cls[i]; }
+    for (i, byte) in cls.iter().enumerate() {
+        *arg.add(4 + i) = *byte;
+    }
     *arg.add(8) = dev.bus;
     *arg.add(9) = dev.dev;
     *arg.add(10) = dev.func;
@@ -1451,11 +1528,15 @@ pub unsafe fn syscall_device_info(handle: i32, arg: *mut u8, arg_len: usize) -> 
     #[cfg(feature = "board-cm5")]
     {
         let slot = &*core::ptr::addr_of!(BOUND_DEVICES[idx]);
-        for i in 0..20 { *arg.add(12 + i) = slot.alias[i]; }
+        for i in 0..20 {
+            *arg.add(12 + i) = slot.alias[i];
+        }
     }
     #[cfg(not(feature = "board-cm5"))]
     {
-        for i in 0..20 { *arg.add(12 + i) = 0; }
+        for i in 0..20 {
+            *arg.add(12 + i) = 0;
+        }
     }
     32
 }
@@ -1519,6 +1600,12 @@ static mut PCIE1_MSI_INITIALISED: bool = false;
 /// `false` if the RC is unreadable or reports a HW revision older
 /// than 0x0303 (which would require the legacy MSI path — not
 /// supported, BCM7712 is 0x0500).
+///
+/// # Safety
+/// The PCIe1 RC at `BCM2712_PCIE1_RC_BASE` must be reset, mapped, and
+/// have MISC_CTRL programmed (done by `enumerate()`). Mutates
+/// `PCIE1_MSI_INITIALISED` and the RC MSI registers; must run from a
+/// single core during init or while interrupts are masked.
 #[cfg(feature = "board-cm5")]
 pub unsafe fn pcie1_msi_init() -> bool {
     if PCIE1_MSI_INITIALISED {
@@ -1573,13 +1660,19 @@ pub unsafe fn pcie1_msi_init() -> bool {
 /// `(vector_index, target_addr, data_value)`. The caller writes
 /// `address = target_addr`, `data = data_value` into the peripheral's
 /// MSI-X table entry.
+///
+/// # Safety
+/// `event_handle` must reference a kernel event handle that outlives
+/// the allocated MSI vector (released only on reboot — there is no
+/// per-vector free path today). Mutates `PCIE1_MSI_VECTORS_TAB`;
+/// caller must serialize with other allocators on the same root.
 #[cfg(feature = "board-cm5")]
 pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)> {
     if !PCIE1_MSI_INITIALISED && !pcie1_msi_init() {
         return None;
     }
-    for i in 0..PCIE1_MSI_VECTORS {
-        let slot = &mut *core::ptr::addr_of_mut!(PCIE1_MSI_VECTORS_TAB[i]);
+    let tab = &raw mut PCIE1_MSI_VECTORS_TAB;
+    for (i, slot) in (*tab).iter_mut().take(PCIE1_MSI_VECTORS).enumerate() {
         if !slot.active {
             slot.active = true;
             slot.event_handle = event_handle;
@@ -1592,6 +1685,13 @@ pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)
 
 /// Drain pending MSI vectors. Called from the GIC SPI handler when
 /// the PCIe1 MSI SPI fires. Returns the number of events signalled.
+///
+/// # Safety
+/// Must run in IRQ context with `PCIE1_MSI_INITIALISED == true` and the
+/// PCIe1 RC mapped. Reads `PCIE1_MSI_VECTORS_TAB` non-atomically — relies
+/// on allocators not freeing slots concurrently. Acks the MSI snapshot
+/// before fanning out so writes to STATUS during dispatch accumulate
+/// instead of being lost.
 #[cfg(feature = "board-cm5")]
 pub unsafe fn pcie1_msi_dispatch() -> u32 {
     if !PCIE1_MSI_INITIALISED {
@@ -1623,14 +1723,26 @@ pub unsafe fn pcie1_msi_dispatch() -> u32 {
     signalled
 }
 
+/// QEMU stub — no PCIe RC, MSI init always reports unsupported.
+///
+/// # Safety
+/// No invariants; this stub does not touch hardware or globals.
 #[cfg(not(feature = "board-cm5"))]
 pub unsafe fn pcie1_msi_init() -> bool {
     false
 }
+/// QEMU stub — no PCIe MSI vector pool, allocation always fails.
+///
+/// # Safety
+/// No invariants; this stub does not touch hardware or globals.
 #[cfg(not(feature = "board-cm5"))]
 pub unsafe fn pcie1_msi_alloc_vector(_e: i32) -> Option<(u8, u64, u32)> {
     None
 }
+/// QEMU stub — no PCIe MSI mux, dispatch always reports zero events.
+///
+/// # Safety
+/// No invariants; this stub does not touch hardware or globals.
 #[cfg(not(feature = "board-cm5"))]
 pub unsafe fn pcie1_msi_dispatch() -> u32 {
     0

@@ -30,7 +30,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             if arg.is_null() || arg_len == 0 {
                 return errno::EINVAL;
             }
-            let files = &mut *(&raw mut LINUX_FILES);
+            let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
             let slot_idx = files.iter().position(|s| !s.in_use);
             let slot_idx = match slot_idx {
                 Some(i) => i,
@@ -64,7 +64,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         }
         dev_fs::READ => {
             let slot_idx = handle as usize;
-            let files = &*(&raw const LINUX_FILES);
+            let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }
@@ -80,7 +80,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         }
         dev_fs::WRITE => {
             let slot_idx = handle as usize;
-            let files = &*(&raw const LINUX_FILES);
+            let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }
@@ -96,7 +96,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         }
         dev_fs::SEEK => {
             let slot_idx = handle as usize;
-            let files = &*(&raw const LINUX_FILES);
+            let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }
@@ -113,7 +113,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         }
         dev_fs::CLOSE => {
             let slot_idx = handle as usize;
-            let files = &mut *(&raw mut LINUX_FILES);
+            let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }
@@ -124,7 +124,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         }
         dev_fs::STAT => {
             let slot_idx = handle as usize;
-            let files = &*(&raw const LINUX_FILES);
+            let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }
@@ -152,7 +152,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         }
         dev_fs::FSYNC => {
             let slot_idx = handle as usize;
-            let files = &*(&raw const LINUX_FILES);
+            let files = &*core::ptr::addr_of!(LINUX_FILES);
             if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
                 return errno::EINVAL;
             }

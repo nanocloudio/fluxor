@@ -118,6 +118,12 @@ impl CacheAlignedU32 {
     }
 }
 
+impl Default for CrossDomainChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CrossDomainChannel {
     /// Create a new empty channel.
     pub const fn new() -> Self {
@@ -676,6 +682,13 @@ pub mod dma40 {
     }
 
     /// Start a DMA40 transfer (QEMU stub — performs memcpy immediately).
+    ///
+    /// # Safety
+    /// `src` and `dst` must point to valid, non-overlapping memory regions
+    /// of at least `len` bytes that are not aliased by any other reference
+    /// for the duration of the call. Same contract as the real hardware
+    /// path: this stub completes synchronously, but callers gate on `poll`
+    /// for parity with `board-cm5`.
     #[cfg(not(feature = "board-cm5"))]
     pub unsafe fn start_transfer(ch: u8, src: usize, dst: usize, len: usize) {
         let _ = ch;
@@ -808,6 +821,13 @@ pub mod rp1_dma {
     }
 
     /// Start an RP1 DMA transfer (QEMU stub — performs memcpy immediately).
+    ///
+    /// # Safety
+    /// `src` and `dst` must point to valid, non-overlapping memory regions
+    /// of at least `len` bytes, not aliased by any other reference for the
+    /// duration of the call. Mirrors the `board-cm5` hardware path's
+    /// contract — this stub completes synchronously, callers still gate on
+    /// `poll` for shared scheduling logic.
     #[cfg(not(feature = "board-cm5"))]
     pub unsafe fn start_transfer(ch: u8, src: usize, dst: usize, len: usize) {
         let _ = ch;
@@ -925,6 +945,12 @@ impl DomainExecState {
             active: false,
             tick: 0,
         }
+    }
+}
+
+impl Default for DomainExecState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

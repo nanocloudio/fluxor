@@ -61,7 +61,7 @@ mod playback_backend {
                             }
                             let prev =
                                 underrun_for_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if prev == 0 || prev % 1000 == 0 {
+                            if prev == 0 || prev.is_multiple_of(1000) {
                                 log::warn!(
                                     "[linux_audio] underrun (silenced {} sample(s); count={})",
                                     out.len() - filled,
@@ -233,7 +233,7 @@ unsafe fn linux_stream_time_dispatch(
         return fluxor::kernel::errno::EINVAL;
     }
 
-    let clock = &*(&raw const LINUX_AUDIO_CLOCK);
+    let clock = &*core::ptr::addr_of!(LINUX_AUDIO_CLOCK);
     if !clock.started || clock.sample_rate == 0 || clock.channels == 0 {
         return fluxor::kernel::errno::ENODEV;
     }
@@ -327,7 +327,7 @@ fn linux_audio_step(state: *mut u8) -> i32 {
                 }
                 st.bytes_written = st.bytes_written.saturating_add(n as u32);
                 unsafe {
-                    let clock = &mut *(&raw mut LINUX_AUDIO_CLOCK);
+                    let clock = &mut *core::ptr::addr_of_mut!(LINUX_AUDIO_CLOCK);
                     clock.bytes_written = st.bytes_written as u64;
                 }
                 st.bytes_since_flush = st.bytes_since_flush.saturating_add(n as u32);
@@ -409,7 +409,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
         path,
     );
     unsafe {
-        let clock = &mut *(&raw mut LINUX_AUDIO_CLOCK);
+        let clock = &mut *core::ptr::addr_of_mut!(LINUX_AUDIO_CLOCK);
         clock.started = true;
         clock.start_micros = start_micros;
         clock.sample_rate = sample_rate;

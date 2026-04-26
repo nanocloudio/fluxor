@@ -36,14 +36,26 @@ pub struct PcieAlias {
     /// Expected PCI (bus, dev, func) of the device on `root`. The
     /// binder scans the enumeration table for a device with this
     /// exact triple; stable across enumeration reorders.
-    pub bus:  u8,
-    pub dev:  u8,
+    pub bus: u8,
+    pub dev: u8,
     pub func: u8,
 }
 
 pub const ALIASES: &[PcieAlias] = &[
-    PcieAlias { name: "m2_primary", root: PcieRoot::Pcie1, bus: 1, dev: 0, func: 0 },
-    PcieAlias { name: "rp1",        root: PcieRoot::Pcie2, bus: 1, dev: 0, func: 0 },
+    PcieAlias {
+        name: "m2_primary",
+        root: PcieRoot::Pcie1,
+        bus: 1,
+        dev: 0,
+        func: 0,
+    },
+    PcieAlias {
+        name: "rp1",
+        root: PcieRoot::Pcie2,
+        bus: 1,
+        dev: 0,
+        func: 0,
+    },
 ];
 
 /// Look up an alias by name. Case-sensitive — aliases are
@@ -61,7 +73,7 @@ pub fn resolve(name: &str) -> Option<&'static PcieAlias> {
 /// errors rather than silently matching nothing.
 pub fn class_code(name: &str) -> Option<u32> {
     match name {
-        "nvme"     => Some(0x01_08_02), // storage / NVM / NVMe
+        "nvme" => Some(0x01_08_02),     // storage / NVM / NVMe
         "ethernet" => Some(0x02_00_00), // network / ethernet
         _ => None,
     }

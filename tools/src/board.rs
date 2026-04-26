@@ -56,7 +56,8 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
     }
 
     // Validate reconfigure section if present
-    if let Some(reconfig) = config.get("reconfigure")
+    if let Some(reconfig) = config
+        .get("reconfigure")
         .or_else(|| config.get("graph").and_then(|g| g.get("reconfigure")))
     {
         validate_reconfigure_section(reconfig, config, &mut result);
@@ -83,9 +84,14 @@ pub fn validate_config(config: &Value, target: &TargetDescriptor) -> Result<Vali
 
 /// Validate bridge channel declarations.
 fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationResult) {
-    let module_names: Vec<String> = config.get("modules")
+    let module_names: Vec<String> = config
+        .get("modules")
         .and_then(|m| m.as_array())
-        .map(|arr| arr.iter().filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let valid_types = ["snapshot", "ring", "command"];
@@ -96,7 +102,10 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
         // Required: type
         let btype = bridge.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if !valid_types.contains(&btype) {
-            result.add_error(format!("{}: invalid type '{}' (must be snapshot, ring, or command)", prefix, btype));
+            result.add_error(format!(
+                "{}: invalid type '{}' (must be snapshot, ring, or command)",
+                prefix, btype
+            ));
         }
 
         // Required: from and to (module.port format)
@@ -104,7 +113,10 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
             if let Some(spec) = bridge.get(*field).and_then(|v| v.as_str()) {
                 let module_name = spec.split('.').next().unwrap_or("");
                 if !module_names.contains(&module_name.to_string()) {
-                    result.add_error(format!("{}.{}: module '{}' not found", prefix, field, module_name));
+                    result.add_error(format!(
+                        "{}.{}: module '{}' not found",
+                        prefix, field, module_name
+                    ));
                 }
             } else {
                 result.add_error(format!("{}: missing '{}'", prefix, field));
@@ -114,19 +126,28 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
         // Type-specific validation
         match btype {
             "snapshot" => {
-                let size = bridge.get("data_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                let size = bridge
+                    .get("data_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if size == 0 || size > 56 {
                     result.add_error(format!("{}: data_size must be 1-56 (got {})", prefix, size));
                 }
             }
             "ring" => {
-                let elem = bridge.get("elem_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                let elem = bridge
+                    .get("elem_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if elem == 0 || elem > 56 {
                     result.add_error(format!("{}: elem_size must be 1-56 (got {})", prefix, elem));
                 }
             }
             "command" => {
-                let size = bridge.get("data_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                let size = bridge
+                    .get("data_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if size == 0 || size > 56 {
                     result.add_error(format!("{}: data_size must be 1-56 (got {})", prefix, size));
                 }
@@ -142,7 +163,10 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
     }
 
     if bridges.len() > 16 {
-        result.add_error(format!("bridges: too many bridges ({}, max 16)", bridges.len()));
+        result.add_error(format!(
+            "bridges: too many bridges ({}, max 16)",
+            bridges.len()
+        ));
     }
 }
 
@@ -152,7 +176,11 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
 /// - A valid `trust` level ("platform" required for ISR execution)
 /// - A `max_cycles` budget that fits within the declared `rate_hz` period
 /// - Combined Tier 1b + Tier 2 ISR budget does not exceed configurable limit
-fn validate_isr_modules(modules: &[Value], _target: &TargetDescriptor, result: &mut ValidationResult) {
+fn validate_isr_modules(
+    modules: &[Value],
+    _target: &TargetDescriptor,
+    result: &mut ValidationResult,
+) {
     // Default to 150MHz (RP2350). Config can override via execution.clock_hz.
     let clock_hz: u64 = 150_000_000;
 
@@ -168,7 +196,10 @@ fn validate_isr_modules(modules: &[Value], _target: &TargetDescriptor, result: &
 
         isr_module_count += 1;
         let prefix = format!("modules[{}]", i);
-        let name = module.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+        let name = module
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("unknown");
 
         // Trust level validation
         let trust = module.get("trust").and_then(|t| t.as_str()).unwrap_or("");
@@ -180,7 +211,10 @@ fn validate_isr_modules(modules: &[Value], _target: &TargetDescriptor, result: &
         }
 
         // Cycle budget validation
-        let max_cycles = module.get("max_cycles").and_then(|c| c.as_u64()).unwrap_or(0);
+        let max_cycles = module
+            .get("max_cycles")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
         if max_cycles == 0 {
             result.add_error(format!(
                 "{} ({}): ISR tier '{}' requires max_cycles declaration",
@@ -213,7 +247,11 @@ fn validate_isr_modules(modules: &[Value], _target: &TargetDescriptor, result: &
             total_tier1b_budget += max_cycles;
 
             // FPU usage warning
-            if module.get("uses_fpu").and_then(|f| f.as_bool()).unwrap_or(false) {
+            if module
+                .get("uses_fpu")
+                .and_then(|f| f.as_bool())
+                .unwrap_or(false)
+            {
                 result.add_warning(format!(
                     "{} ({}): FPU in Tier 1b ISR adds 33 cycle lazy stacking overhead on Cortex-M33",
                     prefix, name
@@ -254,35 +292,35 @@ fn validate_isr_modules(modules: &[Value], _target: &TargetDescriptor, result: &
 }
 
 /// Validate reconfigure section parameters.
-fn validate_reconfigure_section(
-    reconfig: &Value,
-    config: &Value,
-    result: &mut ValidationResult,
-) {
+fn validate_reconfigure_section(reconfig: &Value, config: &Value, result: &mut ValidationResult) {
     // Validate mode
     if let Some(mode) = reconfig.get("mode").and_then(|m| m.as_str()) {
         match mode {
             "live" | "atomic" => {}
             _ => result.add_error(format!(
-                "reconfigure.mode: invalid value '{}' (must be 'live' or 'atomic')", mode
+                "reconfigure.mode: invalid value '{}' (must be 'live' or 'atomic')",
+                mode
             )),
         }
     }
 
     // Validate drain_timeout_ms range
-    let global_timeout = reconfig.get("drain_timeout_ms")
+    let global_timeout = reconfig
+        .get("drain_timeout_ms")
         .or_else(|| reconfig.get("drain_timeout"))
         .and_then(|t| t.as_u64());
 
     if let Some(timeout) = global_timeout {
         if timeout < 100 {
             result.add_error(format!(
-                "reconfigure.drain_timeout_ms: {} too low (minimum 100ms)", timeout
+                "reconfigure.drain_timeout_ms: {} too low (minimum 100ms)",
+                timeout
             ));
         }
         if timeout > 30000 {
             result.add_error(format!(
-                "reconfigure.drain_timeout_ms: {} too high (maximum 30000ms)", timeout
+                "reconfigure.drain_timeout_ms: {} too high (maximum 30000ms)",
+                timeout
             ));
         }
     }
@@ -293,7 +331,10 @@ fn validate_reconfigure_section(
     if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
         for module in modules {
             if let Some(drain) = module.get("drain") {
-                let module_name = module.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                let module_name = module
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
 
                 // Validate per-module drain timeout <= global
                 if let Some(per_timeout) = drain.get("timeout").and_then(|t| t.as_u64()) {
@@ -326,7 +367,8 @@ fn validate_reconfigure_section(
         // This is a warning, not an error — the config is valid but pointless
         result.add_warning(
             "reconfigure.mode=live: ensure at least one module exports module_drain, \
-             otherwise live mode provides no benefit over atomic".to_string()
+             otherwise live mode provides no benefit over atomic"
+                .to_string(),
         );
     }
 }
@@ -459,7 +501,10 @@ fn check_reserved_pin(
             "{}: Pin {} is reserved on {} ({})",
             context,
             pin,
-            target.board_description.as_deref().unwrap_or(&target.description),
+            target
+                .board_description
+                .as_deref()
+                .unwrap_or(&target.description),
             reason
         ));
     }
@@ -573,12 +618,7 @@ fn validate_sink_pins(
                 let pin = cs_pin as u8;
                 check_pin_range(pin, &format!("sinks[{}]", index), target, result);
                 check_reserved_pin(pin, &format!("sinks[{}]", index), target, result);
-                check_pin_conflict(
-                    pin,
-                    &format!("sinks[{}].cs_pin", index),
-                    used_pins,
-                    result,
-                );
+                check_pin_conflict(pin, &format!("sinks[{}].cs_pin", index), used_pins, result);
             }
         }
         _ => {}
@@ -590,11 +630,7 @@ fn validate_sink_pins(
 /// Checks that `protection: isolated` is only set on targets that have
 /// an MPU (RP2350, 8 regions) or MMU (BCM2712). RP2040 (Cortex-M0+) has
 /// no MPU and cannot support hardware isolation.
-fn validate_isolation(
-    config: &Value,
-    target: &TargetDescriptor,
-    result: &mut ValidationResult,
-) {
+fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut ValidationResult) {
     // Check for protection setting in config (can be at top level or in graph)
     let protection = config
         .get("protection")
@@ -646,7 +682,10 @@ fn validate_isolation(
             }
             // A community/unsigned tier without an explicit protection override
             // implies isolation — catch targets that can't provide it.
-            let tier = m.get("trust_tier").and_then(|v| v.as_str()).unwrap_or("platform");
+            let tier = m
+                .get("trust_tier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("platform");
             let explicit_prot = m.get("protection").and_then(|v| v.as_str());
             if explicit_prot.is_none()
                 && (tier == "community" || tier == "unsigned")
@@ -667,11 +706,7 @@ fn validate_isolation(
 ///
 /// Checks that paged_arena is only used on targets with MMU support (BCM2712).
 /// Validates resident_max_mb sum fits within reasonable pool limits.
-fn validate_paged_arenas(
-    config: &Value,
-    target: &TargetDescriptor,
-    result: &mut ValidationResult,
-) {
+fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut ValidationResult) {
     let modules = match config.get("modules").and_then(|m| m.as_array()) {
         Some(m) => m,
         None => return,
@@ -687,24 +722,35 @@ fn validate_paged_arenas(
         };
         has_paged_arena = true;
 
-        let name = module.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+        let name = module
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("unknown");
         let prefix = format!("modules[{}] ({})", i, name);
 
         // Validate virtual_size_mb
-        let virtual_mb = pa.get("virtual_size_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+        let virtual_mb = pa
+            .get("virtual_size_mb")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         if virtual_mb == 0 {
             result.add_error(format!(
-                "{}: paged_arena.virtual_size_mb must be > 0", prefix
+                "{}: paged_arena.virtual_size_mb must be > 0",
+                prefix
             ));
         }
         if virtual_mb > 4096 {
             result.add_error(format!(
-                "{}: paged_arena.virtual_size_mb {} exceeds 4GB limit", prefix, virtual_mb
+                "{}: paged_arena.virtual_size_mb {} exceeds 4GB limit",
+                prefix, virtual_mb
             ));
         }
 
         // Validate resident_max_mb
-        let resident_mb = pa.get("resident_max_mb").and_then(|v| v.as_u64()).unwrap_or(1);
+        let resident_mb = pa
+            .get("resident_max_mb")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
         if resident_mb > virtual_mb {
             result.add_warning(format!(
                 "{}: paged_arena.resident_max_mb ({}) > virtual_size_mb ({}), clamped",
@@ -714,7 +760,10 @@ fn validate_paged_arenas(
         total_resident_mb += resident_mb;
 
         // Validate backing type
-        let backing = pa.get("backing").and_then(|v| v.as_str()).unwrap_or("ramdisk");
+        let backing = pa
+            .get("backing")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ramdisk");
         match backing {
             "ramdisk" | "nvme" => {}
             _ => {
@@ -726,7 +775,10 @@ fn validate_paged_arenas(
         }
 
         // Validate writeback policy
-        let writeback = pa.get("writeback").and_then(|v| v.as_str()).unwrap_or("deferred");
+        let writeback = pa
+            .get("writeback")
+            .and_then(|v| v.as_str())
+            .unwrap_or("deferred");
         match writeback {
             "deferred" | "write_through" => {}
             _ => {

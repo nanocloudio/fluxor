@@ -40,13 +40,13 @@ fn hmac_sha256(key: &[u8], msg: &[u8], out: &mut [u8; HMAC_OUT]) {
     }
 
     let mut inner = Sha256::new();
-    inner.update(&ipad);
+    inner.update(ipad);
     inner.update(msg);
     let inner_digest = inner.finalize();
 
     let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(&inner_digest);
+    outer.update(opad);
+    outer.update(inner_digest);
     let d = outer.finalize();
     out.copy_from_slice(&d);
 }
@@ -54,36 +54,46 @@ fn hmac_sha256(key: &[u8], msg: &[u8], out: &mut [u8; HMAC_OUT]) {
 /// Load P-256 prime.
 #[inline(never)]
 fn load_p() -> U256 {
-    pic_u256(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
-             0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF)
+    pic_u256([
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
+        0xFFFFFFFF,
+    ])
 }
 
 /// Load P-256 order n.
 #[inline(never)]
 fn load_n() -> U256 {
-    pic_u256(0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD,
-             0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF)
+    pic_u256([
+        0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
+        0xFFFFFFFF,
+    ])
 }
 
 /// Load generator point Gx.
 #[inline(never)]
 fn load_gx() -> U256 {
-    pic_u256(0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81,
-             0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2)
+    pic_u256([
+        0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81, 0x63A440F2, 0xF8BCE6E5, 0xE12C4247,
+        0x6B17D1F2,
+    ])
 }
 
 /// Load generator point Gy.
 #[inline(never)]
 fn load_gy() -> U256 {
-    pic_u256(0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357,
-             0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2)
+    pic_u256([
+        0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357, 0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B,
+        0x4FE342E2,
+    ])
 }
 
 /// Load N/2 for low-s normalisation.
 #[inline(never)]
 fn load_n_half() -> U256 {
-    pic_u256(0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737556,
-             0xFFFFFFFF, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF)
+    pic_u256([
+        0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737556, 0xFFFFFFFF, 0xFFFFFFFF, 0x80000000,
+        0x7FFFFFFF,
+    ])
 }
 
 // ============================================================================
@@ -108,10 +118,15 @@ fn pic_u64(lo: u32, hi: u32) -> u64 {
     v
 }
 
-/// Build a U256 from 8 u32 halves.
+/// Build a U256 from 8 u32 halves: `[lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3]`.
 #[inline(never)]
-fn pic_u256(lo0: u32, hi0: u32, lo1: u32, hi1: u32, lo2: u32, hi2: u32, lo3: u32, hi3: u32) -> U256 {
-    [pic_u64(lo0, hi0), pic_u64(lo1, hi1), pic_u64(lo2, hi2), pic_u64(lo3, hi3)]
+fn pic_u256(words: [u32; 8]) -> U256 {
+    [
+        pic_u64(words[0], words[1]),
+        pic_u64(words[2], words[3]),
+        pic_u64(words[4], words[5]),
+        pic_u64(words[6], words[7]),
+    ]
 }
 
 /// a + b, returns (result, carry)
@@ -136,11 +151,19 @@ fn u256_sub(a: &U256, b: &U256) -> (U256, u64) {
     let mut borrow = 0u64;
     let mut i = 0;
     while i < 4 {
-        let diff = (a[i] as u128).wrapping_sub(b[i] as u128).wrapping_sub(borrow as u128);
+        let diff = (a[i] as u128)
+            .wrapping_sub(b[i] as u128)
+            .wrapping_sub(borrow as u128);
         r[i] = diff as u64;
-        borrow = if diff > (a[i] as u128) + (!borrow as u128) + 1 { 1 } else {
+        borrow = if diff > (a[i] as u128) + (!borrow as u128) + 1 {
+            1
+        } else {
             // Check if borrow occurred: if a < b + prev_borrow
-            if (a[i] as u128) < (b[i] as u128) + (borrow as u128) { 1 } else { 0 }
+            if (a[i] as u128) < (b[i] as u128) + (borrow as u128) {
+                1
+            } else {
+                0
+            }
         };
         i += 1;
     }
@@ -175,7 +198,11 @@ fn u256_is_zero(a: &U256) -> bool {
 fn mod_p(a: &U256) -> U256 {
     let p = load_p();
     let (r, borrow) = u256_sub(a, &p);
-    if borrow == 0 { r } else { *a }
+    if borrow == 0 {
+        r
+    } else {
+        *a
+    }
 }
 
 /// Modular addition: (a + b) mod p
@@ -259,10 +286,14 @@ fn fp_reduce(t: &[u64; 8]) -> U256 {
     let mut acc = [0i64; 8];
 
     // s1
-    acc[0] += s[0] as i64; acc[1] += s[1] as i64;
-    acc[2] += s[2] as i64; acc[3] += s[3] as i64;
-    acc[4] += s[4] as i64; acc[5] += s[5] as i64;
-    acc[6] += s[6] as i64; acc[7] += s[7] as i64;
+    acc[0] += s[0] as i64;
+    acc[1] += s[1] as i64;
+    acc[2] += s[2] as i64;
+    acc[3] += s[3] as i64;
+    acc[4] += s[4] as i64;
+    acc[5] += s[5] as i64;
+    acc[6] += s[6] as i64;
+    acc[7] += s[7] as i64;
 
     // s2 * 2: (s15, s14, s13, s12, s11, 0, 0, 0)
     acc[3] += 2 * s[11] as i64;
@@ -365,7 +396,9 @@ fn fp_reduce(t: &[u64; 8]) -> U256 {
     // Final reduction
     while u256_gte(&result, &p) != 0 {
         let (r, borrow) = u256_sub(&result, &p);
-        if borrow != 0 { break; }
+        if borrow != 0 {
+            break;
+        }
         result = r;
     }
 
@@ -443,10 +476,10 @@ fn fp_inv(a: &U256) -> U256 {
     let mut base = *a;
 
     // Simple right-to-left binary method on p-2
-    let p_minus_2 = pic_u256(
-        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
-        0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF,
-    );
+    let p_minus_2 = pic_u256([
+        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
+        0xFFFFFFFF,
+    ]);
 
     let mut i = 0;
     while i < 4 {
@@ -471,7 +504,9 @@ fn mod_n_reduce(a: &U256) -> U256 {
     let n = load_n();
     if u256_gte(a, &n) != 0 {
         let (r, borrow) = u256_sub(a, &n);
-        if borrow == 0 { return r; }
+        if borrow == 0 {
+            return r;
+        }
     }
     *a
 }
@@ -497,13 +532,15 @@ fn fn_mul(a: &U256, b: &U256) -> U256 {
 fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     // Reduce 512-bit value t mod n using iterative: t_hi * R + t_lo
     // R = 2^256 - n (small, ~128 bits)
-    let r_mod = pic_u256(
-        0x039CDAAF, 0x0C46353D, 0x58E8617B, 0x43190552,
-        0x00000000, 0x00000000, 0xFFFFFFFF, 0x00000000,
-    );
+    let r_mod = pic_u256([
+        0x039CDAAF, 0x0C46353D, 0x58E8617B, 0x43190552, 0x00000000, 0x00000000, 0xFFFFFFFF,
+        0x00000000,
+    ]);
 
     let mut acc = [0u64; 8];
-    unsafe { core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8);
+    }
 
     // Each iteration: acc = acc_lo + acc_hi * R
     // Convergence: ~128 bits per iteration (R is ~128 bits)
@@ -541,12 +578,7 @@ fn fn_inv(a: &U256) -> U256 {
     let mut base = *a;
 
     let n = load_n();
-    let n_minus_2: U256 = [
-        n[0] - 2,
-        n[1],
-        n[2],
-        n[3],
-    ];
+    let n_minus_2: U256 = [n[0] - 2, n[1], n[2], n[3]];
 
     let mut i = 0;
     while i < 4 {
@@ -573,7 +605,9 @@ fn fn_inv(a: &U256) -> U256 {
 fn zeroize(buf: &mut [u8]) {
     let mut i = 0;
     while i < buf.len() {
-        unsafe { core::ptr::write_volatile(buf.as_mut_ptr().add(i), 0); }
+        unsafe {
+            core::ptr::write_volatile(buf.as_mut_ptr().add(i), 0);
+        }
         i += 1;
     }
 }
@@ -583,7 +617,9 @@ fn zeroize(buf: &mut [u8]) {
 fn zeroize_u256(v: &mut U256) {
     let mut i = 0;
     while i < 4 {
-        unsafe { core::ptr::write_volatile(v.as_mut_ptr().add(i), 0); }
+        unsafe {
+            core::ptr::write_volatile(v.as_mut_ptr().add(i), 0);
+        }
         i += 1;
     }
 }
@@ -619,7 +655,11 @@ fn ct_swap(a: &mut JacobianPoint, b: &mut JacobianPoint, condition: u8) {
 
 impl JacobianPoint {
     const fn identity() -> Self {
-        Self { x: ZERO, y: ONE, z: ZERO }
+        Self {
+            x: ZERO,
+            y: ONE,
+            z: ZERO,
+        }
     }
 
     fn is_identity(&self) -> bool {
@@ -627,7 +667,11 @@ impl JacobianPoint {
     }
 
     fn from_affine(x: &U256, y: &U256) -> Self {
-        Self { x: *x, y: *y, z: ONE }
+        Self {
+            x: *x,
+            y: *y,
+            z: ONE,
+        }
     }
 
     fn to_affine(&self) -> (U256, U256) {
@@ -652,7 +696,7 @@ impl JacobianPoint {
         let s = fp_mul(&self.y, &self.y);
         let mut m = fp_mul(&self.x, &self.x);
         m = fp_add(&fp_add(&m, &m), &m); // 3 * x^2
-        // For P-256, a = -3, so add a*z^4
+                                         // For P-256, a = -3, so add a*z^4
         let z2 = fp_sqr(&self.z);
         let z4 = fp_sqr(&z2);
         // -3 * z^4 = p - 3*z^4
@@ -661,19 +705,23 @@ impl JacobianPoint {
 
         let xy2 = fp_mul(&self.x, &s);
         let t = fp_add(&xy2, &xy2); // 2 * x * y^2
-        let t2 = fp_add(&t, &t);    // 4 * x * y^2
+        let t2 = fp_add(&t, &t); // 4 * x * y^2
 
         let x3 = fp_sub(&fp_sqr(&m), &fp_add(&t2, &t2)); // m^2 - 8*x*y^2
 
-        let y2_4 = fp_add(&s, &s);  // 2*y^2
-        let y4_8 = fp_sqr(&y2_4);   // 4*y^4
+        let y2_4 = fp_add(&s, &s); // 2*y^2
+        let y4_8 = fp_sqr(&y2_4); // 4*y^4
         let y4_8_2 = fp_add(&y4_8, &y4_8); // 8*y^4
 
         let y3 = fp_sub(&fp_mul(&m, &fp_sub(&t2, &x3)), &y4_8_2);
 
         let z3 = fp_mul(&fp_add(&self.y, &self.y), &self.z);
 
-        JacobianPoint { x: x3, y: y3, z: z3 }
+        JacobianPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
     }
 
     /// Point addition (mixed: Q is affine with Z=1)
@@ -704,17 +752,29 @@ impl JacobianPoint {
         let y3 = fp_sub(&fp_mul(&r, &fp_sub(&v, &x3)), &fp_mul(&self.y, &hhh));
         let z3 = fp_mul(&self.z, &h);
 
-        JacobianPoint { x: x3, y: y3, z: z3 }
+        JacobianPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
     }
 
     /// Full Jacobian-Jacobian point addition (both points in Jacobian coords).
     /// Required for constant-time Montgomery ladder.
     fn add_jacobian(&self, other: &JacobianPoint) -> Self {
         if self.is_identity() {
-            return JacobianPoint { x: other.x, y: other.y, z: other.z };
+            return JacobianPoint {
+                x: other.x,
+                y: other.y,
+                z: other.z,
+            };
         }
         if other.is_identity() {
-            return JacobianPoint { x: self.x, y: self.y, z: self.z };
+            return JacobianPoint {
+                x: self.x,
+                y: self.y,
+                z: self.z,
+            };
         }
 
         let z1z1 = fp_sqr(&self.z);
@@ -742,7 +802,11 @@ impl JacobianPoint {
         let y3 = fp_sub(&fp_mul(&r, &fp_sub(&v, &x3)), &fp_mul(&s1, &hhh));
         let z3 = fp_mul(&fp_mul(&self.z, &other.z), &h);
 
-        JacobianPoint { x: x3, y: y3, z: z3 }
+        JacobianPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
     }
 }
 
@@ -752,7 +816,11 @@ impl JacobianPoint {
 fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
     let p_jac = JacobianPoint::from_affine(px, py);
     let mut r0 = JacobianPoint::identity();
-    let mut r1 = JacobianPoint { x: p_jac.x, y: p_jac.y, z: p_jac.z };
+    let mut r1 = JacobianPoint {
+        x: p_jac.x,
+        y: p_jac.y,
+        z: p_jac.z,
+    };
 
     let mut i: i32 = 3;
     while i >= 0 {
@@ -791,14 +859,18 @@ fn scalar_mul(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
 fn u256_from_be(bytes: &[u8]) -> U256 {
     // Input: 32 bytes big-endian
     let mut r = [0u64; 4];
-    r[3] = u64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                bytes[4], bytes[5], bytes[6], bytes[7]]);
-    r[2] = u64::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11],
-                                bytes[12], bytes[13], bytes[14], bytes[15]]);
-    r[1] = u64::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19],
-                                bytes[20], bytes[21], bytes[22], bytes[23]]);
-    r[0] = u64::from_be_bytes([bytes[24], bytes[25], bytes[26], bytes[27],
-                                bytes[28], bytes[29], bytes[30], bytes[31]]);
+    r[3] = u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    r[2] = u64::from_be_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ]);
+    r[1] = u64::from_be_bytes([
+        bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+    ]);
+    r[0] = u64::from_be_bytes([
+        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+    ]);
     r
 }
 
@@ -826,7 +898,9 @@ fn u256_to_be(a: &U256) -> [u8; 32] {
 pub fn public_key_from_scalar(private_key: &[u8; 32]) -> [u8; 65] {
     let mut d = u256_from_be(private_key);
     d = mod_n_reduce(&d);
-    if u256_is_zero(&d) { d = ONE; }
+    if u256_is_zero(&d) {
+        d = ONE;
+    }
     let point = scalar_mul_base(&d);
     let (x, y) = point.to_affine();
     let mut pk = [0u8; 65];
@@ -841,7 +915,13 @@ pub fn public_key_from_scalar(private_key: &[u8; 32]) -> [u8; 65] {
 /// ECDH shared secret: scalar_mult(my_private, peer_public).x
 /// peer_pub should be 65 bytes (0x04 || X || Y) or 64 bytes (X || Y)
 pub fn ecdh_shared_secret(my_private: &[u8; 32], peer_pub: &[u8]) -> Option<[u8; 32]> {
-    let offset = if peer_pub.len() == 65 && peer_pub[0] == 0x04 { 1 } else if peer_pub.len() == 64 { 0 } else { return None; };
+    let offset = if peer_pub.len() == 65 && peer_pub[0] == 0x04 {
+        1
+    } else if peer_pub.len() == 64 {
+        0
+    } else {
+        return None;
+    };
 
     let px = u256_from_be(&peer_pub[offset..offset + 32]);
     let py = u256_from_be(&peer_pub[offset + 32..offset + 64]);
@@ -866,10 +946,14 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     // Truncate/pad hash to 32 bytes
     let mut h1 = [0u8; 32];
     if hash.len() >= 32 {
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr(), 32); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr(), 32);
+        }
     } else {
         let offset = 32 - hash.len();
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr().add(offset), hash.len()); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr().add(offset), hash.len());
+        }
     }
 
     // Step a: h1 = Hash(message) — already have it
@@ -939,7 +1023,9 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 
         // Retry: K = HMAC(K, V || 0x00), V = HMAC(K, V)
         let mut retry = [0u8; 33];
-        unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), retry.as_mut_ptr(), 32); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(v.as_ptr(), retry.as_mut_ptr(), 32);
+        }
         retry[32] = 0x00;
         {
             let mut tmp = [0u8; 32];
@@ -973,16 +1059,14 @@ mod test_vectors {
         let priv_key = [0x11u8; 32];
         let sig = ecdsa_sign(&priv_key, hash.as_slice(), &[0u8; 32]);
         let expected_r: [u8; 32] = [
-            0x1e, 0xb9, 0xd8, 0x5c, 0x94, 0x8e, 0xbe, 0xfe,
-            0x6c, 0xd6, 0x7a, 0xa9, 0x72, 0x0e, 0xda, 0x41,
-            0x29, 0xb7, 0x46, 0x8b, 0xfd, 0x52, 0x32, 0x18,
-            0x47, 0xc5, 0x58, 0x89, 0xf5, 0x02, 0xa0, 0xea,
+            0x1e, 0xb9, 0xd8, 0x5c, 0x94, 0x8e, 0xbe, 0xfe, 0x6c, 0xd6, 0x7a, 0xa9, 0x72, 0x0e,
+            0xda, 0x41, 0x29, 0xb7, 0x46, 0x8b, 0xfd, 0x52, 0x32, 0x18, 0x47, 0xc5, 0x58, 0x89,
+            0xf5, 0x02, 0xa0, 0xea,
         ];
         let expected_s: [u8; 32] = [
-            0x2e, 0xf9, 0x07, 0x57, 0x40, 0x35, 0x09, 0x59,
-            0x2d, 0xac, 0x12, 0x32, 0xea, 0x05, 0xa1, 0x15,
-            0xda, 0x2c, 0x36, 0x42, 0x96, 0xd6, 0x2b, 0xeb,
-            0x00, 0xa1, 0xf7, 0xf8, 0xa4, 0xa3, 0xe4, 0x23,
+            0x2e, 0xf9, 0x07, 0x57, 0x40, 0x35, 0x09, 0x59, 0x2d, 0xac, 0x12, 0x32, 0xea, 0x05,
+            0xa1, 0x15, 0xda, 0x2c, 0x36, 0x42, 0x96, 0xd6, 0x2b, 0xeb, 0x00, 0xa1, 0xf7, 0xf8,
+            0xa4, 0xa3, 0xe4, 0x23,
         ];
         assert_eq!(&sig[..32], &expected_r);
         assert_eq!(&sig[32..], &expected_s);
@@ -1009,16 +1093,14 @@ mod test_vectors {
         let priv_key = [0x11u8; 32];
         let got = public_key_from_scalar(&priv_key);
         let expected_x: [u8; 32] = [
-            0x02, 0x17, 0xe6, 0x17, 0xf0, 0xb6, 0x44, 0x39,
-            0x28, 0x27, 0x8f, 0x96, 0x99, 0x9e, 0x69, 0xa2,
-            0x3a, 0x4f, 0x2c, 0x15, 0x2b, 0xdf, 0x6d, 0x6c,
-            0xdf, 0x66, 0xe5, 0xb8, 0x02, 0x82, 0xd4, 0xed,
+            0x02, 0x17, 0xe6, 0x17, 0xf0, 0xb6, 0x44, 0x39, 0x28, 0x27, 0x8f, 0x96, 0x99, 0x9e,
+            0x69, 0xa2, 0x3a, 0x4f, 0x2c, 0x15, 0x2b, 0xdf, 0x6d, 0x6c, 0xdf, 0x66, 0xe5, 0xb8,
+            0x02, 0x82, 0xd4, 0xed,
         ];
         let expected_y: [u8; 32] = [
-            0x19, 0x4a, 0x7d, 0xeb, 0xcb, 0x97, 0x71, 0x2d,
-            0x2d, 0xda, 0x3c, 0xa8, 0x5a, 0xa8, 0x76, 0x5a,
-            0x56, 0xf4, 0x5f, 0xc7, 0x58, 0x59, 0x96, 0x52,
-            0xf2, 0x89, 0x7c, 0x65, 0x30, 0x6e, 0x57, 0x94,
+            0x19, 0x4a, 0x7d, 0xeb, 0xcb, 0x97, 0x71, 0x2d, 0x2d, 0xda, 0x3c, 0xa8, 0x5a, 0xa8,
+            0x76, 0x5a, 0x56, 0xf4, 0x5f, 0xc7, 0x58, 0x59, 0x96, 0x52, 0xf2, 0x89, 0x7c, 0x65,
+            0x30, 0x6e, 0x57, 0x94,
         ];
         assert_eq!(got[0], 0x04);
         assert_eq!(&got[1..33], &expected_x);
@@ -1040,7 +1122,13 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
         u256_from_be(&hash[..32])
     } else {
         let mut buf = [0u8; 32];
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), buf.as_mut_ptr().add(32 - hash.len()), hash.len()); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                hash.as_ptr(),
+                buf.as_mut_ptr().add(32 - hash.len()),
+                hash.len(),
+            );
+        }
         u256_from_be(&buf)
     };
     let z = mod_n_reduce(&z);
@@ -1074,8 +1162,16 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
 /// ECDSA verify: check (r, s) over message hash with public key
 /// sig: 64 bytes (r || s), pub_key: 65 bytes (0x04 || X || Y)
 pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
-    if sig.len() < 64 { return false; }
-    let offset = if pub_key.len() == 65 && pub_key[0] == 0x04 { 1 } else if pub_key.len() == 64 { 0 } else { return false; };
+    if sig.len() < 64 {
+        return false;
+    }
+    let offset = if pub_key.len() == 65 && pub_key[0] == 0x04 {
+        1
+    } else if pub_key.len() == 64 {
+        0
+    } else {
+        return false;
+    };
 
     let r = u256_from_be(&sig[..32]);
     let s = u256_from_be(&sig[32..64]);
@@ -1084,15 +1180,27 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
 
     // Check r, s in [1, n-1]
     let n = load_n();
-    if u256_is_zero(&r) || u256_is_zero(&s) { return false; }
-    if u256_gte(&r, &n) != 0 { return false; }
-    if u256_gte(&s, &n) != 0 { return false; }
+    if u256_is_zero(&r) || u256_is_zero(&s) {
+        return false;
+    }
+    if u256_gte(&r, &n) != 0 {
+        return false;
+    }
+    if u256_gte(&s, &n) != 0 {
+        return false;
+    }
 
     let z = if hash.len() >= 32 {
         u256_from_be(&hash[..32])
     } else {
         let mut buf = [0u8; 32];
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), buf.as_mut_ptr().add(32 - hash.len()), hash.len()); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                hash.as_ptr(),
+                buf.as_mut_ptr().add(32 - hash.len()),
+                hash.len(),
+            );
+        }
         u256_from_be(&buf)
     };
     let z = mod_n_reduce(&z);
@@ -1109,7 +1217,9 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     let (p2x, p2y) = p2.to_affine();
     let sum = p1.add_affine(&p2x, &p2y);
 
-    if sum.is_identity() { return false; }
+    if sum.is_identity() {
+        return false;
+    }
     let (rx, _) = sum.to_affine();
     let rx_mod_n = mod_n_reduce(&rx);
 
@@ -1126,19 +1236,30 @@ fn copy_be_padded(src: &[u8], dst: &mut [u8]) {
         start += 1;
     }
     let effective = &src[start..];
-    if effective.len() > dst.len() { return; }
+    if effective.len() > dst.len() {
+        return;
+    }
     let offset = dst.len() - effective.len();
     // Zero-fill prefix
     let mut i = 0;
-    while i < offset { dst[i] = 0; i += 1; }
+    while i < offset {
+        dst[i] = 0;
+        i += 1;
+    }
     unsafe {
-        core::ptr::copy_nonoverlapping(effective.as_ptr(), dst.as_mut_ptr().add(offset), effective.len());
+        core::ptr::copy_nonoverlapping(
+            effective.as_ptr(),
+            dst.as_mut_ptr().add(offset),
+            effective.len(),
+        );
     }
 }
 
 /// Encode raw (r,s) signature into DER format
 fn skip_leading_zeros(data: &[u8]) -> usize {
     let mut i = 0;
-    while i < data.len() - 1 && data[i] == 0 { i += 1; }
+    while i < data.len() - 1 && data[i] == 0 {
+        i += 1;
+    }
     i
 }

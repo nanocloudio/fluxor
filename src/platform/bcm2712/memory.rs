@@ -98,9 +98,9 @@ pub mod backing_store {
             }
             #[cfg(feature = "chip-bcm2712")]
             {
-                *(&raw mut RAMDISK_NEXT_OFFSET) = 0;
+                RAMDISK_NEXT_OFFSET = 0;
             }
-            *(&raw mut EXTERNAL_ARENA_NEXT_PAGE) = 0;
+            EXTERNAL_ARENA_NEXT_PAGE = 0;
         }
     }
 
@@ -340,6 +340,18 @@ pub mod pager {
     // Per-module pager state
     // ============================================================================
 
+    /// Caller-supplied arena layout passed to `pager::configure_arena`.
+    #[derive(Clone, Copy)]
+    pub struct ArenaSpec {
+        pub base_vaddr: usize,
+        pub virtual_size_bytes: usize,
+        pub resident_max_pages: u32,
+        pub backing_type: backing_store::BackingType,
+        pub writeback: backing_store::WritebackPolicy,
+        pub max_faults_per_step: u16,
+        pub prefault_pages: u16,
+    }
+
     /// Per-module paged arena configuration.
     #[derive(Clone, Copy)]
     pub struct PagedArenaConfig {
@@ -395,6 +407,12 @@ pub mod pager {
         pub writebacks: u32,
     }
 
+    impl Default for PagerStats {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl PagerStats {
         pub const fn new() -> Self {
             Self {
@@ -437,7 +455,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return false;
         }
-        let config = unsafe { (*(&raw const PAGER_CONFIG))[module_idx] };
+        let config = unsafe { PAGER_CONFIG[module_idx] };
         if !config.active {
             return false;
         }
@@ -456,7 +474,7 @@ pub mod pager {
             return Err(FaultError::InvalidModule);
         }
 
-        let config = unsafe { (*(&raw const PAGER_CONFIG))[module_idx] };
+        let config = unsafe { PAGER_CONFIG[module_idx] };
         if !config.active {
             return Err(FaultError::NotPagedArena);
         }
@@ -469,7 +487,7 @@ pub mod pager {
         let vpage_idx = ((fault_vaddr - config.base_vaddr) / PAGE_SIZE) as u32;
 
         // Check fault budget
-        let stats = unsafe { &mut (*(&raw mut PAGER_STATS))[module_idx] };
+        let stats = unsafe { &mut PAGER_STATS[module_idx] };
         if stats.faults_this_step >= config.max_faults_per_step {
             return Err(FaultError::BudgetExceeded);
         }
@@ -544,7 +562,7 @@ pub mod pager {
                 // Continue anyway — data loss on this page
             }
 
-            let stats = unsafe { &mut (*(&raw mut PAGER_STATS))[desc.owner_module as usize] };
+            let stats = unsafe { &mut PAGER_STATS[desc.owner_module as usize] };
             stats.writebacks += 1;
         }
 
@@ -552,7 +570,10 @@ pub mod pager {
         #[cfg(feature = "chip-bcm2712")]
         {
             let old_module = desc.owner_module as usize;
-            let old_config = unsafe { &(*(&raw const PAGER_CONFIG))[old_module] };
+            let old_config = unsafe {
+                let p = &raw const PAGER_CONFIG;
+                &(*p)[old_module]
+            };
             if old_config.active {
                 let old_vaddr = old_config.base_vaddr + (desc.vpage_idx as usize) * PAGE_SIZE;
                 unmap_page_in_table(old_module, old_vaddr);
@@ -562,7 +583,7 @@ pub mod pager {
 
         // Update eviction stats for the old owner
         {
-            let owner_stats = unsafe { &mut (*(&raw mut PAGER_STATS))[desc.owner_module as usize] };
+            let owner_stats = unsafe { &mut PAGER_STATS[desc.owner_module as usize] };
             owner_stats.evictions += 1;
         }
 
@@ -618,7 +639,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return 0;
         }
-        let config = unsafe { &(*(&raw const PAGER_CONFIG))[module_idx] };
+        let config = unsafe { &PAGER_CONFIG[module_idx] };
         if !config.active {
             return 0;
         }
@@ -647,7 +668,7 @@ pub mod pager {
                     d.flags &= !page_flags::DIRTY;
                     written += 1;
 
-                    let stats = unsafe { &mut (*(&raw mut PAGER_STATS))[module_idx] };
+                    let stats = unsafe { &mut PAGER_STATS[module_idx] };
                     stats.writebacks += 1;
                 }
             }
@@ -670,7 +691,7 @@ pub mod pager {
     pub fn reset_step_faults(module_idx: usize) {
         if module_idx < MAX_MODULES {
             unsafe {
-                (*(&raw mut PAGER_STATS))[module_idx].faults_this_step = 0;
+                PAGER_STATS[module_idx].faults_this_step = 0;
             }
         }
     }
@@ -681,55 +702,46 @@ pub mod pager {
     /// Allocates backing store and sets up the arena virtual range.
     ///
     /// Returns 0 on success, negative on error.
-    pub fn configure_arena(
-        module_idx: usize,
-        base_vaddr: usize,
-        virtual_size_bytes: usize,
-        resident_max_pages: u32,
-        backing_type: backing_store::BackingType,
-        writeback: backing_store::WritebackPolicy,
-        max_faults_per_step: u16,
-        prefault_pages: u16,
-    ) -> i32 {
+    pub fn configure_arena(module_idx: usize, spec: ArenaSpec) -> i32 {
         if module_idx >= MAX_MODULES {
             return -22;
         }
 
-        let virtual_pages = (virtual_size_bytes / PAGE_SIZE) as u32;
+        let virtual_pages = (spec.virtual_size_bytes / PAGE_SIZE) as u32;
 
         // Register with backing store
         let arena_id = backing_store::backing_register(
             module_idx as u8,
             virtual_pages,
-            resident_max_pages,
-            backing_type,
-            writeback,
+            spec.resident_max_pages,
+            spec.backing_type,
+            spec.writeback,
         );
         if arena_id < 0 {
             return arena_id;
         }
 
         unsafe {
-            (*(&raw mut PAGER_CONFIG))[module_idx] = PagedArenaConfig {
+            PAGER_CONFIG[module_idx] = PagedArenaConfig {
                 active: true,
-                base_vaddr,
-                virtual_size: virtual_size_bytes,
+                base_vaddr: spec.base_vaddr,
+                virtual_size: spec.virtual_size_bytes,
                 arena_id: arena_id as u8,
-                max_faults_per_step,
-                resident_max_pages,
-                prefault_pages,
-                writeback,
+                max_faults_per_step: spec.max_faults_per_step,
+                resident_max_pages: spec.resident_max_pages,
+                prefault_pages: spec.prefault_pages,
+                writeback: spec.writeback,
             };
-            (*(&raw mut PAGER_STATS))[module_idx] = PagerStats::new();
+            PAGER_STATS[module_idx] = PagerStats::new();
         }
 
         log::info!(
             "[pager] module {} arena: vaddr=0x{:x} size={}KB vpages={} resident_max={} backing={}",
             module_idx,
-            base_vaddr,
-            virtual_size_bytes / 1024,
+            spec.base_vaddr,
+            spec.virtual_size_bytes / 1024,
             virtual_pages,
-            resident_max_pages,
+            spec.resident_max_pages,
             arena_id
         );
 
@@ -743,7 +755,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return 0;
         }
-        let config = unsafe { (*(&raw const PAGER_CONFIG))[module_idx] };
+        let config = unsafe { PAGER_CONFIG[module_idx] };
         if !config.active {
             return 0;
         }
@@ -804,7 +816,7 @@ pub mod pager {
             return;
         }
 
-        let config = unsafe { &(*(&raw const PAGER_CONFIG))[module_idx] };
+        let config = unsafe { &PAGER_CONFIG[module_idx] };
         if !config.active {
             return;
         }
@@ -820,8 +832,8 @@ pub mod pager {
 
         // Clear config
         unsafe {
-            (*(&raw mut PAGER_CONFIG))[module_idx] = PagedArenaConfig::empty();
-            (*(&raw mut PAGER_STATS))[module_idx] = PagerStats::new();
+            PAGER_CONFIG[module_idx] = PagedArenaConfig::empty();
+            PAGER_STATS[module_idx] = PagerStats::new();
         }
     }
 
@@ -830,7 +842,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return PagedArenaConfig::empty();
         }
-        unsafe { (*(&raw const PAGER_CONFIG))[module_idx] }
+        unsafe { PAGER_CONFIG[module_idx] }
     }
 
     /// Get pager stats for a module.
@@ -838,7 +850,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return PagerStats::new();
         }
-        unsafe { (*(&raw const PAGER_STATS))[module_idx] }
+        unsafe { PAGER_STATS[module_idx] }
     }
 
     /// Stats struct returned to modules via syscall.
@@ -867,11 +879,11 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return PagedArenaStats::default();
         }
-        let config = unsafe { &(*(&raw const PAGER_CONFIG))[module_idx] };
+        let config = unsafe { &PAGER_CONFIG[module_idx] };
         if !config.active {
             return PagedArenaStats::default();
         }
-        let stats = unsafe { &(*(&raw const PAGER_STATS))[module_idx] };
+        let stats = unsafe { &PAGER_STATS[module_idx] };
 
         let resident = page_pool::pool_resident_count(module_idx as u8) as u32;
         let dirty = page_pool::pool_dirty_count(module_idx as u8) as u32;

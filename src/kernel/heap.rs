@@ -212,7 +212,8 @@ impl ModuleHeap {
                     // Split: create new free block after this allocation
                     let new_free_offset = cur_offset + HEADER_SIZE as u32 + aligned_size as u32;
                     let new_free_data = remainder - HEADER_SIZE;
-                    let new_hdr_ptr = unsafe { self.base.add(new_free_offset as usize) as *mut BlockHeader };
+                    let new_hdr_ptr =
+                        unsafe { self.base.add(new_free_offset as usize) as *mut BlockHeader };
                     unsafe {
                         (*new_hdr_ptr).set_free(new_free_data, next_free);
                         (*hdr_ptr).set_allocated(aligned_size);
@@ -222,19 +223,27 @@ impl ModuleHeap {
                     if prev_offset == u32::MAX {
                         self.first_free_offset = new_free_offset;
                     } else {
-                        let prev_hdr = unsafe { self.base.add(prev_offset as usize) as *mut BlockHeader };
-                        unsafe { (*prev_hdr).next_or_magic = new_free_offset; }
+                        let prev_hdr =
+                            unsafe { self.base.add(prev_offset as usize) as *mut BlockHeader };
+                        unsafe {
+                            (*prev_hdr).next_or_magic = new_free_offset;
+                        }
                     }
                 } else {
                     // Use entire block (no split — remainder too small)
-                    unsafe { (*hdr_ptr).set_allocated(block_data_size); }
+                    unsafe {
+                        (*hdr_ptr).set_allocated(block_data_size);
+                    }
 
                     // Remove from free list
                     if prev_offset == u32::MAX {
                         self.first_free_offset = next_free;
                     } else {
-                        let prev_hdr = unsafe { self.base.add(prev_offset as usize) as *mut BlockHeader };
-                        unsafe { (*prev_hdr).next_or_magic = next_free; }
+                        let prev_hdr =
+                            unsafe { self.base.add(prev_offset as usize) as *mut BlockHeader };
+                        unsafe {
+                            (*prev_hdr).next_or_magic = next_free;
+                        }
                     }
                 }
 
@@ -346,7 +355,8 @@ impl ModuleHeap {
         // Try to extend in place by checking if next block is free and adjacent
         let next_block_offset = (ptr_addr - base_addr + old_size) as u32;
         if (next_block_offset as usize) + HEADER_SIZE <= self.size as usize {
-            let next_hdr = unsafe { *(self.base.add(next_block_offset as usize) as *const BlockHeader) };
+            let next_hdr =
+                unsafe { *(self.base.add(next_block_offset as usize) as *const BlockHeader) };
             if !next_hdr.is_allocated() {
                 let combined = old_size + HEADER_SIZE + next_hdr.data_size();
                 if combined >= aligned_new {
@@ -356,16 +366,23 @@ impl ModuleHeap {
                     let remainder = combined - aligned_new;
                     if remainder >= HEADER_SIZE + MIN_ALLOC {
                         // Split: resize current, create new free block
-                        unsafe { (*hdr_ptr).set_allocated(aligned_new); }
+                        unsafe {
+                            (*hdr_ptr).set_allocated(aligned_new);
+                        }
                         let new_free_off = (ptr_addr - base_addr + aligned_new) as u32;
                         let new_free_size = remainder - HEADER_SIZE;
-                        let new_free_hdr = unsafe { self.base.add(new_free_off as usize) as *mut BlockHeader };
-                        unsafe { (*new_free_hdr).set_free(new_free_size, 0); }
+                        let new_free_hdr =
+                            unsafe { self.base.add(new_free_off as usize) as *mut BlockHeader };
+                        unsafe {
+                            (*new_free_hdr).set_free(new_free_size, 0);
+                        }
                         self.insert_free_and_coalesce(new_free_off, new_free_size);
                         self.allocated += (aligned_new - old_size) as u32;
                     } else {
                         // Use all combined space
-                        unsafe { (*hdr_ptr).set_allocated(combined); }
+                        unsafe {
+                            (*hdr_ptr).set_allocated(combined);
+                        }
                         self.allocated += (combined - old_size) as u32;
                     }
                     if self.allocated > self.high_water {
@@ -468,20 +485,30 @@ impl ModuleHeap {
         // Find insertion point: the free block just before this offset
         if self.first_free_offset > offset || !self.has_free_blocks() {
             // Insert at head
-            let old_first = if self.has_free_blocks() { self.first_free_offset } else { 0 };
-            unsafe { (*hdr_ptr).set_free(data_size, old_first); }
+            let old_first = if self.has_free_blocks() {
+                self.first_free_offset
+            } else {
+                0
+            };
+            unsafe {
+                (*hdr_ptr).set_free(data_size, old_first);
+            }
             self.first_free_offset = offset;
         } else {
             // Find the free block that should precede this one
             let mut prev = self.first_free_offset;
             let mut iterations = 0u32;
             loop {
-                if iterations >= 1000 { break; }
+                if iterations >= 1000 {
+                    break;
+                }
                 let prev_hdr = unsafe { &mut *(self.base.add(prev as usize) as *mut BlockHeader) };
                 let next = prev_hdr.next_or_magic;
                 if next == 0 || next > offset {
                     // Insert between prev and next
-                    unsafe { (*hdr_ptr).set_free(data_size, next); }
+                    unsafe {
+                        (*hdr_ptr).set_free(data_size, next);
+                    }
                     prev_hdr.next_or_magic = offset;
                     break;
                 }
@@ -491,7 +518,7 @@ impl ModuleHeap {
         }
 
         // Coalesce forward: merge with next block if adjacent
-        let hdr = unsafe { &mut *(hdr_ptr as *mut BlockHeader) };
+        let hdr = unsafe { &mut *hdr_ptr };
         let end_of_this = offset as usize + HEADER_SIZE + hdr.data_size();
         let next_off = hdr.next_or_magic;
         if next_off != 0 && end_of_this == next_off as usize {
@@ -512,14 +539,17 @@ impl ModuleHeap {
                     let end_of_prev = scan as usize + HEADER_SIZE + scan_hdr.data_size();
                     if end_of_prev == offset as usize {
                         // Adjacent — merge
-                        let cur_hdr = unsafe { *(self.base.add(offset as usize) as *const BlockHeader) };
+                        let cur_hdr =
+                            unsafe { *(self.base.add(offset as usize) as *const BlockHeader) };
                         let merged_size = scan_hdr.data_size() + HEADER_SIZE + cur_hdr.data_size();
                         scan_hdr.set_free(merged_size, cur_hdr.next_or_magic);
                     }
                     break;
                 }
                 let next = scan_hdr.next_or_magic;
-                if next == 0 { break; }
+                if next == 0 {
+                    break;
+                }
                 scan = next;
                 iterations += 1;
             }
@@ -554,7 +584,11 @@ pub fn init_module_heap(module_idx: usize, arena_ptr: *mut u8, arena_size: usize
         MODULE_HEAPS[module_idx] = ModuleHeap::init(arena_ptr, arena_size);
     }
     if arena_size > 0 {
-        log::debug!("[heap] module {} heap init {} bytes", module_idx, arena_size);
+        log::debug!(
+            "[heap] module {} heap init {} bytes",
+            module_idx,
+            arena_size
+        );
     }
 }
 
@@ -570,8 +604,11 @@ pub fn reset_module_heap(module_idx: usize) {
 
 /// Reset all module heaps.
 pub fn reset_all() {
-    for i in 0..MAX_MODULES {
-        unsafe { MODULE_HEAPS[i] = ModuleHeap::empty(); }
+    unsafe {
+        let heaps = &raw mut MODULE_HEAPS;
+        for slot in (*heaps).iter_mut() {
+            *slot = ModuleHeap::empty();
+        }
     }
 }
 

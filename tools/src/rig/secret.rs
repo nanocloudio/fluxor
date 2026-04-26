@@ -135,11 +135,8 @@ fn resolve_file(path: &str, ctx: &str, raw: &str) -> Result<Secret> {
             "{ctx}: ${{file:…}} requires an absolute path (got '{path}' in '{raw}')"
         )));
     }
-    let contents = std::fs::read_to_string(path).map_err(|e| {
-        Error::Config(format!(
-            "{ctx}: reading '{path}' for '{raw}': {e}"
-        ))
-    })?;
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("{ctx}: reading '{path}' for '{raw}': {e}")))?;
     // Trim a single trailing newline — a `.token` file typically has one.
     let trimmed = contents
         .strip_suffix('\n')
@@ -187,10 +184,7 @@ mod tests {
     #[test]
     fn file_indirection_reads_and_trims_newline() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "fluxor-rig-secret-{}.tok",
-            std::process::id()
-        ));
+        let path = dir.join(format!("fluxor-rig-secret-{}.tok", std::process::id()));
         std::fs::write(&path, "abc123\n").unwrap();
         let raw = format!("${{file:{}}}", path.display());
         let s = resolve(&raw, "x").unwrap();

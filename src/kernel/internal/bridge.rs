@@ -93,6 +93,12 @@ impl CacheAlignedSlot {
     }
 }
 
+impl Default for SnapshotBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SnapshotBridge {
     pub const fn new() -> Self {
         Self {
@@ -107,7 +113,11 @@ impl SnapshotBridge {
 
     /// Initialize with a fixed data size.
     pub fn init(&mut self, data_size: usize) {
-        let sz = if data_size > MAX_BRIDGE_DATA { MAX_BRIDGE_DATA } else { data_size };
+        let sz = if data_size > MAX_BRIDGE_DATA {
+            MAX_BRIDGE_DATA
+        } else {
+            data_size
+        };
         self.data_size = sz as u32;
         self.active.store(0, Ordering::Release);
         self.sequence.store(0, Ordering::Release);
@@ -130,8 +140,8 @@ impl SnapshotBridge {
             &self.buf1.data as *const [u8; MAX_BRIDGE_DATA] as *mut u8
         };
         unsafe {
-            for i in 0..len {
-                core::ptr::write_volatile(dst.add(i), src[i]);
+            for (i, &b) in src.iter().take(len).enumerate() {
+                core::ptr::write_volatile(dst.add(i), b);
             }
         }
 
@@ -156,8 +166,8 @@ impl SnapshotBridge {
             &self.buf1.data as *const [u8; MAX_BRIDGE_DATA] as *const u8
         };
         unsafe {
-            for i in 0..len {
-                dst[i] = core::ptr::read_volatile(src.add(i));
+            for (i, slot) in dst.iter_mut().take(len).enumerate() {
+                *slot = core::ptr::read_volatile(src.add(i));
             }
         }
         (len, seq)
@@ -198,6 +208,12 @@ pub struct RingBridge {
     data: [u8; RING_CAPACITY * MAX_BRIDGE_DATA],
 }
 
+impl Default for RingBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RingBridge {
     pub const fn new() -> Self {
         Self {
@@ -214,7 +230,11 @@ impl RingBridge {
 
     /// Initialize with a fixed element size.
     pub fn init(&mut self, elem_size: usize) {
-        let sz = if elem_size > MAX_BRIDGE_DATA { MAX_BRIDGE_DATA } else { elem_size };
+        let sz = if elem_size > MAX_BRIDGE_DATA {
+            MAX_BRIDGE_DATA
+        } else {
+            elem_size
+        };
         self.elem_size = sz as u32;
         self.head.store(0, Ordering::Release);
         self.tail.store(0, Ordering::Release);
@@ -241,8 +261,8 @@ impl RingBridge {
 
         let dst = &self.data as *const [u8; RING_CAPACITY * MAX_BRIDGE_DATA] as *mut u8;
         unsafe {
-            for i in 0..len {
-                core::ptr::write_volatile(dst.add(offset + i), src[i]);
+            for (i, &b) in src.iter().take(len).enumerate() {
+                core::ptr::write_volatile(dst.add(offset + i), b);
             }
             // Zero remaining bytes if src is shorter
             for i in len..sz {
@@ -272,8 +292,8 @@ impl RingBridge {
 
         let src = &self.data as *const [u8; RING_CAPACITY * MAX_BRIDGE_DATA] as *const u8;
         unsafe {
-            for i in 0..len {
-                dst[i] = core::ptr::read_volatile(src.add(offset + i));
+            for (i, slot) in dst.iter_mut().take(len).enumerate() {
+                *slot = core::ptr::read_volatile(src.add(offset + i));
             }
         }
 
@@ -287,7 +307,9 @@ impl RingBridge {
     /// Returns the number of elements popped.
     pub fn pop_batch(&self, dst: &mut [u8], max: usize) -> usize {
         let sz = self.elem_size as usize;
-        if sz == 0 { return 0; }
+        if sz == 0 {
+            return 0;
+        }
 
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
@@ -321,6 +343,11 @@ impl RingBridge {
         head.wrapping_sub(tail) as usize
     }
 
+    /// True when no elements are queued in the ring.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Return the total number of dropped elements.
     pub fn drops(&self) -> u32 {
         self.drop_count.load(Ordering::Relaxed)
@@ -349,6 +376,12 @@ pub struct CommandBridge {
     _pad1: [u8; CACHE_LINE - 4],
 }
 
+impl Default for CommandBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommandBridge {
     pub const fn new() -> Self {
         Self {
@@ -363,7 +396,11 @@ impl CommandBridge {
 
     /// Initialize with a fixed data size.
     pub fn init(&mut self, data_size: usize) {
-        let sz = if data_size > MAX_BRIDGE_DATA { MAX_BRIDGE_DATA } else { data_size };
+        let sz = if data_size > MAX_BRIDGE_DATA {
+            MAX_BRIDGE_DATA
+        } else {
+            data_size
+        };
         self.data_size = sz as u32;
         self.write_seq.store(0, Ordering::Release);
         self.read_seq.store(0, Ordering::Release);
@@ -379,8 +416,8 @@ impl CommandBridge {
 
         let dst = &self.data.data as *const [u8; MAX_BRIDGE_DATA] as *mut u8;
         unsafe {
-            for i in 0..len {
-                core::ptr::write_volatile(dst.add(i), src[i]);
+            for (i, &b) in src.iter().take(len).enumerate() {
+                core::ptr::write_volatile(dst.add(i), b);
             }
         }
 
@@ -404,8 +441,8 @@ impl CommandBridge {
 
         let src = &self.data.data as *const [u8; MAX_BRIDGE_DATA] as *const u8;
         unsafe {
-            for i in 0..len {
-                dst[i] = core::ptr::read_volatile(src.add(i));
+            for (i, slot) in dst.iter_mut().take(len).enumerate() {
+                *slot = core::ptr::read_volatile(src.add(i));
             }
         }
 
@@ -419,8 +456,8 @@ impl CommandBridge {
         let len = if dst.len() < sz { dst.len() } else { sz };
         let src = &self.data.data as *const [u8; MAX_BRIDGE_DATA] as *const u8;
         unsafe {
-            for i in 0..len {
-                dst[i] = core::ptr::read_volatile(src.add(i));
+            for (i, slot) in dst.iter_mut().take(len).enumerate() {
+                *slot = core::ptr::read_volatile(src.add(i));
             }
         }
         len
@@ -461,6 +498,13 @@ pub struct BridgeSlot {
 
 /// Union-like storage for bridge variants. We use an enum rather than a
 /// raw union to stay safe while keeping the size predictable.
+///
+/// `Ring` is intentionally the largest variant: it embeds a fixed-capacity
+/// ring buffer inline because the kernel runs `no_std` without a heap, so
+/// every `BridgeSlot` in the static `BRIDGES` array must hold the maximum
+/// size at rest. `clippy::large_enum_variant` is silenced here for that
+/// reason — boxing isn't an option in this context.
+#[allow(clippy::large_enum_variant)]
 enum BridgeInner {
     None,
     Snapshot(SnapshotBridge),
@@ -547,8 +591,9 @@ static mut BRIDGES: [BridgeSlot; MAX_BRIDGES] = [const { BridgeSlot::new() }; MA
 /// Allocate a bridge slot. Returns slot index or -1 if full.
 pub fn bridge_alloc() -> i32 {
     unsafe {
-        for i in 0..MAX_BRIDGES {
-            if let BridgeType::None = BRIDGES[i].bridge_type {
+        let bridges = &raw const BRIDGES;
+        for (i, slot) in (*bridges).iter().enumerate() {
+            if let BridgeType::None = slot.bridge_type {
                 return i as i32;
             }
         }
@@ -558,7 +603,9 @@ pub fn bridge_alloc() -> i32 {
 
 /// Get a mutable reference to a bridge slot.
 pub fn bridge_get_mut(idx: usize) -> Option<&'static mut BridgeSlot> {
-    if idx >= MAX_BRIDGES { return None; }
+    if idx >= MAX_BRIDGES {
+        return None;
+    }
     unsafe {
         if let BridgeType::None = BRIDGES[idx].bridge_type {
             return None;
@@ -569,7 +616,9 @@ pub fn bridge_get_mut(idx: usize) -> Option<&'static mut BridgeSlot> {
 
 /// Get a shared reference to a bridge slot.
 pub fn bridge_get(idx: usize) -> Option<&'static BridgeSlot> {
-    if idx >= MAX_BRIDGES { return None; }
+    if idx >= MAX_BRIDGES {
+        return None;
+    }
     unsafe {
         if let BridgeType::None = BRIDGES[idx].bridge_type {
             return None;
@@ -580,15 +629,18 @@ pub fn bridge_get(idx: usize) -> Option<&'static BridgeSlot> {
 
 /// Get a mutable reference to an uninitialized bridge slot for setup.
 pub fn bridge_slot_mut(idx: usize) -> Option<&'static mut BridgeSlot> {
-    if idx >= MAX_BRIDGES { return None; }
+    if idx >= MAX_BRIDGES {
+        return None;
+    }
     unsafe { Some(&mut BRIDGES[idx]) }
 }
 
 /// Reset all bridge slots.
 pub fn bridge_reset_all() {
     unsafe {
-        for i in 0..MAX_BRIDGES {
-            BRIDGES[i].reset();
+        let bridges = &raw mut BRIDGES;
+        for slot in (*bridges).iter_mut() {
+            slot.reset();
         }
     }
 }
@@ -619,9 +671,21 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
             }
             let data = unsafe { core::slice::from_raw_parts(arg, arg_len) };
             match &bridge.inner {
-                BridgeInner::Snapshot(b) => { b.write(data); 0 }
-                BridgeInner::Ring(b) => if b.push(data) { 0 } else { -crate::kernel::errno::EAGAIN }
-                BridgeInner::Command(b) => { b.write(data); 0 }
+                BridgeInner::Snapshot(b) => {
+                    b.write(data);
+                    0
+                }
+                BridgeInner::Ring(b) => {
+                    if b.push(data) {
+                        0
+                    } else {
+                        -crate::kernel::errno::EAGAIN
+                    }
+                }
+                BridgeInner::Command(b) => {
+                    b.write(data);
+                    0
+                }
                 BridgeInner::None => -crate::kernel::errno::EINVAL,
             }
         }
@@ -638,14 +702,16 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
                 }
                 BridgeInner::Ring(b) => {
                     let n = b.pop(data);
-                    if n > 0 { n as i32 } else { -crate::kernel::errno::EAGAIN }
-                }
-                BridgeInner::Command(b) => {
-                    match b.read_if_new(data) {
-                        Some(n) => n as i32,
-                        None => -crate::kernel::errno::EAGAIN,
+                    if n > 0 {
+                        n as i32
+                    } else {
+                        -crate::kernel::errno::EAGAIN
                     }
                 }
+                BridgeInner::Command(b) => match b.read_if_new(data) {
+                    Some(n) => n as i32,
+                    None => -crate::kernel::errno::EAGAIN,
+                },
                 BridgeInner::None => -crate::kernel::errno::EINVAL,
             }
         }
@@ -653,8 +719,20 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
         2 => {
             match &bridge.inner {
                 BridgeInner::Snapshot(_) => 1, // always readable
-                BridgeInner::Ring(b) => if b.len() > 0 { 1 } else { 0 },
-                BridgeInner::Command(b) => if b.has_new() { 1 } else { 0 },
+                BridgeInner::Ring(b) => {
+                    if b.is_empty() {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                BridgeInner::Command(b) => {
+                    if b.has_new() {
+                        1
+                    } else {
+                        0
+                    }
+                }
                 BridgeInner::None => -crate::kernel::errno::EINVAL,
             }
         }

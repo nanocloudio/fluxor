@@ -108,7 +108,8 @@ pub fn create_uf2_blocks(data: &[u8], base_addr: u32, family_id: u32) -> Vec<u8>
         block[0..4].copy_from_slice(&UF2_MAGIC_START0.to_le_bytes());
         block[4..8].copy_from_slice(&UF2_MAGIC_START1.to_le_bytes());
         block[8..12].copy_from_slice(&UF2_FLAGS_FAMILY.to_le_bytes());
-        block[12..16].copy_from_slice(&(base_addr + (block_no * payload_size) as u32).to_le_bytes());
+        block[12..16]
+            .copy_from_slice(&(base_addr + (block_no * payload_size) as u32).to_le_bytes());
         block[16..20].copy_from_slice(&(payload_size as u32).to_le_bytes());
         block[20..24].copy_from_slice(&(block_no as u32).to_le_bytes());
         block[24..28].copy_from_slice(&(num_blocks as u32).to_le_bytes());

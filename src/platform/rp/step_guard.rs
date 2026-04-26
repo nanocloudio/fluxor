@@ -135,12 +135,22 @@ pub fn rp_step_guard_disarm() {
 
 // ── ISR vector entry points ───────────────────────────────────────────
 
+/// # Safety
+/// ISR vector entry — invoked by the NVIC, never directly. Runs in
+/// interrupt context with interrupts disabled at this priority; must
+/// not block, allocate, or touch non-`#[no_mangle]` cross-module
+/// state. Acks the timer interrupt and dispatches the step-guard
+/// fault path.
 #[cfg(not(feature = "chip-rp2040"))]
 #[no_mangle]
 pub unsafe extern "C" fn TIMER1_IRQ_0() {
     rp2350_guard::on_timer_irq();
 }
 
+/// # Safety
+/// ISR vector entry — invoked by the NVIC, never directly. Same
+/// constraints as the RP2350 variant: runs in interrupt context,
+/// must not block.
 #[cfg(feature = "chip-rp2040")]
 #[no_mangle]
 pub unsafe extern "C" fn TIMER_IRQ_3() {
@@ -273,12 +283,19 @@ pub fn rp_isr_backend_stop() {
 
 // ── ISR vector entry points ───────────────────────────────────────────
 
+/// # Safety
+/// ISR vector entry — invoked by the NVIC, never directly. Drives
+/// the Tier-1B periodic ISR backend; must not block or touch
+/// non-ISR-safe state.
 #[cfg(not(feature = "chip-rp2040"))]
 #[no_mangle]
 pub unsafe extern "C" fn TIMER1_IRQ_1() {
     rp2350_isr::on_timer_irq();
 }
 
+/// # Safety
+/// ISR vector entry — invoked by the NVIC, never directly. RP2040
+/// counterpart of `TIMER1_IRQ_1`; same ISR-context constraints.
 #[cfg(feature = "chip-rp2040")]
 #[no_mangle]
 pub unsafe extern "C" fn TIMER_IRQ_2() {

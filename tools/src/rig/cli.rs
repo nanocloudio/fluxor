@@ -26,12 +26,12 @@ use crate::rig::backend::{
     invoke_actuator, resolve as resolve_backend, wire_binding, BackendContext, BackendInvocation,
 };
 use crate::rig::lock::{acquire as acquire_lock, default_lock_path, AcquireOutcome, LockOwner};
-use crate::rig::run::{execute_plan, RunOptions};
 use crate::rig::record::Verdict;
+use crate::rig::run::{execute_plan, RunOptions};
 use crate::rig::vocab::Surface;
 use crate::rig::{
-    build_plan, default_profile_path, enumerate_rigs, load_profile, resolve_board_rig,
-    load_scenario, validate_scenario_against_board, validate_tags, PlanInputs,
+    build_plan, default_profile_path, enumerate_rigs, load_profile, load_scenario,
+    resolve_board_rig, validate_scenario_against_board, validate_tags, PlanInputs,
     ProjectDescriptor,
 };
 
@@ -149,12 +149,14 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     // that has no `targets/boards/` tree of its own.
     let project_root_for_boards = locate_workspace(&scenario_path).ok();
     let (board, board_source) = {
-        let (rig, source) = resolve_board_rig(&scenario.target, project_root_for_boards.as_deref())?;
+        let (rig, source) =
+            resolve_board_rig(&scenario.target, project_root_for_boards.as_deref())?;
         let rig = rig.ok_or_else(|| {
             Error::Config(format!(
                 "rig test: board '{}' has no [rig] section ({}); add one or pick \
                  a target that does",
-                scenario.target, source.display(),
+                scenario.target,
+                source.display(),
             ))
         })?;
         (rig, source)
@@ -198,9 +200,8 @@ fn cmd_test(args: TestArgs) -> Result<()> {
         }
     };
 
-    let profile_path = default_profile_path(&lab, &rig_id).ok_or_else(|| {
-        Error::Config("rig test: cannot resolve $HOME for profile lookup".into())
-    })?;
+    let profile_path = default_profile_path(&lab, &rig_id)
+        .ok_or_else(|| Error::Config("rig test: cannot resolve $HOME for profile lookup".into()))?;
     if !profile_path.is_file() {
         return Err(Error::Config(format!(
             "rig test: profile not found at {} — create one per RFC §9 \
@@ -257,18 +258,20 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     let outcome = execute_plan(&plan, &profile, &options)?;
     match outcome.record.verdict {
         Verdict::Passed => Ok(()),
-        Verdict::Failed | Verdict::TimedOut | Verdict::Aborted | Verdict::Pending | Verdict::Planned => {
-            Err(Error::Config(format!(
-                "rig test: {} — see {}",
-                match outcome.record.verdict {
-                    Verdict::Failed => "FAIL",
-                    Verdict::TimedOut => "TIMEOUT",
-                    Verdict::Aborted => "ABORTED",
-                    _ => "INCOMPLETE",
-                },
-                outcome.run_dir.display()
-            )))
-        }
+        Verdict::Failed
+        | Verdict::TimedOut
+        | Verdict::Aborted
+        | Verdict::Pending
+        | Verdict::Planned => Err(Error::Config(format!(
+            "rig test: {} — see {}",
+            match outcome.record.verdict {
+                Verdict::Failed => "FAIL",
+                Verdict::TimedOut => "TIMEOUT",
+                Verdict::Aborted => "ABORTED",
+                _ => "INCOMPLETE",
+            },
+            outcome.run_dir.display()
+        ))),
     }
 }
 
@@ -337,14 +340,13 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
         .ok()
         .and_then(|cwd| locate_workspace(&cwd).ok());
     let (board, board_source) = {
-        let (rig, source) = crate::rig::resolve_board_rig(
-            &profile.rig.board,
-            project_root_for_boards.as_deref(),
-        )?;
+        let (rig, source) =
+            crate::rig::resolve_board_rig(&profile.rig.board, project_root_for_boards.as_deref())?;
         let rig = rig.ok_or_else(|| {
             Error::Config(format!(
                 "rig power: board '{}' has no [rig] section ({})",
-                profile.rig.board, source.display(),
+                profile.rig.board,
+                source.display(),
             ))
         })?;
         (rig, source)
@@ -379,8 +381,16 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
         println!("rig power {action}");
         println!("  lab        {lab}");
         println!("  rig        {}", profile.rig.id);
-        println!("  board      {} ({})", profile.rig.board, board_source.display());
-        println!("  backend    {} ({})", backend.slug(), backend.executable.display());
+        println!(
+            "  board      {} ({})",
+            profile.rig.board,
+            board_source.display()
+        );
+        println!(
+            "  backend    {} ({})",
+            backend.slug(),
+            backend.executable.display()
+        );
         print!("  binding   ");
         for (k, v) in power_binding.iter() {
             print!(" {k}=");
@@ -443,9 +453,8 @@ fn validate_power_verb_on_board(
     board_id: &str,
 ) -> Result<()> {
     let qualified = format!("power.{verb}");
-    let cap = crate::rig::vocab::Capability::parse(&qualified).map_err(|e| {
-        Error::Config(format!("rig power: deriving capability: {e}"))
-    })?;
+    let cap = crate::rig::vocab::Capability::parse(&qualified)
+        .map_err(|e| Error::Config(format!("rig power: deriving capability: {e}")))?;
     if !board.supports(cap) {
         let declared: Vec<&str> = board.power.iter().map(|c| c.as_str()).collect();
         return Err(Error::Config(format!(

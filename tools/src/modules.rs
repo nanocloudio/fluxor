@@ -60,7 +60,8 @@ impl ModuleInfo {
         if data.len() < MODULE_HEADER_SIZE {
             return Err(Error::Module(format!(
                 "Module file too small: {} bytes (need at least {})",
-                data.len(), MODULE_HEADER_SIZE,
+                data.len(),
+                MODULE_HEADER_SIZE,
             )));
         }
 
@@ -110,7 +111,8 @@ impl ModuleInfo {
 
         // Compute section offsets from header fields
         let code_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-        let data_section_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+        let data_section_size =
+            u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
         let export_count = u16::from_le_bytes([data[24], data[25]]) as usize;
         let export_table_size = export_count * 8;
         let schema_offset = MODULE_HEADER_SIZE + code_size + data_section_size + export_table_size;
@@ -203,9 +205,9 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     }
 
     // Module data (with alignment padding — code must start at page boundary)
-    for (_i, module) in modules.iter().enumerate() {
+    for module in modules.iter() {
         // Pad so that offset + MODULE_HEADER_SIZE is page-aligned
-        while (result.len() + MODULE_HEADER_SIZE) % 4096 != 0 {
+        while !(result.len() + MODULE_HEADER_SIZE).is_multiple_of(4096) {
             result.push(0);
         }
         result.extend_from_slice(&module.data);
@@ -320,7 +322,11 @@ fn is_builtin_module(module_type: &str) -> bool {
 }
 
 /// Resolve a module .fmod file by searching primary dir, then extra dirs in order.
-fn resolve_fmod(module_type: &str, primary_dir: &Path, extra_dirs: &[&Path]) -> Option<std::path::PathBuf> {
+fn resolve_fmod(
+    module_type: &str,
+    primary_dir: &Path,
+    extra_dirs: &[&Path],
+) -> Option<std::path::PathBuf> {
     let filename = format!("{}.fmod", module_type);
     let p = primary_dir.join(&filename);
     if p.exists() {
@@ -484,7 +490,9 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
 
     let elf64 = data[4] == 2;
     if data[4] != 1 && data[4] != 2 {
-        return Err(Error::Module("Unknown ELF class (expected 32 or 64)".into()));
+        return Err(Error::Module(
+            "Unknown ELF class (expected 32 or 64)".into(),
+        ));
     }
 
     // Little-endian check
@@ -514,14 +522,32 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
     // Helper: read section header fields (offset, size, addr differ for ELF32/64)
     let sh_offset_size_addr = |sh_off: usize| -> (usize, usize, usize) {
         if elf64 {
-            let addr = u64::from_le_bytes(data[sh_off+16..sh_off+24].try_into().unwrap()) as usize;
-            let off = u64::from_le_bytes(data[sh_off+24..sh_off+32].try_into().unwrap()) as usize;
-            let sz = u64::from_le_bytes(data[sh_off+32..sh_off+40].try_into().unwrap()) as usize;
+            let addr =
+                u64::from_le_bytes(data[sh_off + 16..sh_off + 24].try_into().unwrap()) as usize;
+            let off =
+                u64::from_le_bytes(data[sh_off + 24..sh_off + 32].try_into().unwrap()) as usize;
+            let sz =
+                u64::from_le_bytes(data[sh_off + 32..sh_off + 40].try_into().unwrap()) as usize;
             (off, sz, addr)
         } else {
-            let addr = u32::from_le_bytes([data[sh_off+12], data[sh_off+13], data[sh_off+14], data[sh_off+15]]) as usize;
-            let off = u32::from_le_bytes([data[sh_off+16], data[sh_off+17], data[sh_off+18], data[sh_off+19]]) as usize;
-            let sz = u32::from_le_bytes([data[sh_off+20], data[sh_off+21], data[sh_off+22], data[sh_off+23]]) as usize;
+            let addr = u32::from_le_bytes([
+                data[sh_off + 12],
+                data[sh_off + 13],
+                data[sh_off + 14],
+                data[sh_off + 15],
+            ]) as usize;
+            let off = u32::from_le_bytes([
+                data[sh_off + 16],
+                data[sh_off + 17],
+                data[sh_off + 18],
+                data[sh_off + 19],
+            ]) as usize;
+            let sz = u32::from_le_bytes([
+                data[sh_off + 20],
+                data[sh_off + 21],
+                data[sh_off + 22],
+                data[sh_off + 23],
+            ]) as usize;
             (off, sz, addr)
         }
     };
@@ -538,15 +564,27 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
 
     for i in 0..e_shnum {
         let sh_off = e_shoff + i * e_shentsize;
-        let sh_name_idx = u32::from_le_bytes([data[sh_off], data[sh_off + 1],
-                                              data[sh_off + 2], data[sh_off + 3]]) as usize;
-        let sh_type = u32::from_le_bytes([data[sh_off + 4], data[sh_off + 5],
-                                          data[sh_off + 6], data[sh_off + 7]]);
+        let sh_name_idx = u32::from_le_bytes([
+            data[sh_off],
+            data[sh_off + 1],
+            data[sh_off + 2],
+            data[sh_off + 3],
+        ]) as usize;
+        let sh_type = u32::from_le_bytes([
+            data[sh_off + 4],
+            data[sh_off + 5],
+            data[sh_off + 6],
+            data[sh_off + 7],
+        ]);
         let (sh_offset, sh_size, sh_addr) = sh_offset_size_addr(sh_off);
 
         // Get section name
-        let name_end = shstrtab[sh_name_idx..].iter().position(|&b| b == 0).unwrap_or(0);
-        let name = String::from_utf8_lossy(&shstrtab[sh_name_idx..sh_name_idx + name_end]).to_string();
+        let name_end = shstrtab[sh_name_idx..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(0);
+        let name =
+            String::from_utf8_lossy(&shstrtab[sh_name_idx..sh_name_idx + name_end]).to_string();
 
         // Track symtab and strtab indices
         if sh_type == 2 {
@@ -588,17 +626,17 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
 
             let (st_name, st_value, st_size, st_info, st_shndx) = if elf64 {
                 // ELF64: name(4), info(1), other(1), shndx(2), value(8), size(8)
-                let name = u32::from_le_bytes(symtab[i..i+4].try_into().unwrap()) as usize;
+                let name = u32::from_le_bytes(symtab[i..i + 4].try_into().unwrap()) as usize;
                 let info = symtab[i + 4];
                 let shndx = u16::from_le_bytes([symtab[i + 6], symtab[i + 7]]);
-                let value = u64::from_le_bytes(symtab[i+8..i+16].try_into().unwrap()) as u32;
-                let size = u64::from_le_bytes(symtab[i+16..i+24].try_into().unwrap()) as u32;
+                let value = u64::from_le_bytes(symtab[i + 8..i + 16].try_into().unwrap()) as u32;
+                let size = u64::from_le_bytes(symtab[i + 16..i + 24].try_into().unwrap()) as u32;
                 (name, value, size, info, shndx)
             } else {
                 // ELF32: name(4), value(4), size(4), info(1), other(1), shndx(2)
-                let name = u32::from_le_bytes(symtab[i..i+4].try_into().unwrap()) as usize;
-                let value = u32::from_le_bytes(symtab[i+4..i+8].try_into().unwrap());
-                let size = u32::from_le_bytes(symtab[i+8..i+12].try_into().unwrap());
+                let name = u32::from_le_bytes(symtab[i..i + 4].try_into().unwrap()) as usize;
+                let value = u32::from_le_bytes(symtab[i + 4..i + 8].try_into().unwrap());
+                let size = u32::from_le_bytes(symtab[i + 8..i + 12].try_into().unwrap());
                 let info = symtab[i + 12];
                 let shndx = u16::from_le_bytes([symtab[i + 14], symtab[i + 15]]);
                 (name, value, size, info, shndx)
@@ -607,7 +645,8 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
             // Get symbol name
             if st_name < strtab.len() {
                 let name_end = strtab[st_name..].iter().position(|&b| b == 0).unwrap_or(0);
-                let name = String::from_utf8_lossy(&strtab[st_name..st_name + name_end]).to_string();
+                let name =
+                    String::from_utf8_lossy(&strtab[st_name..st_name + name_end]).to_string();
 
                 symbols.push(ElfSymbol {
                     name,
@@ -647,7 +686,9 @@ pub fn pack_fmod(
     let rodata_data = rodata_section.map(|s| &s.data[..]).unwrap_or(&[]);
     let text_addr = text_section.map(|s| s.addr).unwrap_or(0);
     let rodata_addr = rodata_section.map(|s| s.addr).unwrap_or(0);
-    let data_data = find_section(&sections, ".data").map(|s| &s.data[..]).unwrap_or(&[]);
+    let data_data = find_section(&sections, ".data")
+        .map(|s| &s.data[..])
+        .unwrap_or(&[]);
     let bss_size = find_section(&sections, ".bss").map(|s| s.size).unwrap_or(0);
 
     // Extract param schema (optional — only present if module uses define_params!)
@@ -661,17 +702,25 @@ pub fn pack_fmod(
                     // Find actual end by scanning past all entries
                     let mut pos = 4usize;
                     for _ in 0..count {
-                        if pos + 6 >= data.len() { break; }
+                        if pos + 6 >= data.len() {
+                            break;
+                        }
                         pos += 6; // tag + type + default(4)
                         let name_len = data[pos] as usize;
                         pos += 1 + name_len;
-                        if pos >= data.len() { break; }
+                        if pos >= data.len() {
+                            break;
+                        }
                         let enum_count = data[pos] as usize;
                         pos += 1;
                         for _ in 0..enum_count {
-                            if pos >= data.len() { break; }
+                            if pos >= data.len() {
+                                break;
+                            }
                             pos += 1; // val
-                            if pos >= data.len() { break; }
+                            if pos >= data.len() {
+                                break;
+                            }
                             let ename_len = data[pos] as usize;
                             pos += 1 + ename_len;
                         }
@@ -827,7 +876,10 @@ pub fn pack_fmod(
         Manifest::from_toml(mp)?
     } else {
         // Auto-detect: look for manifest.toml next to the input ELF
-        let auto_path = input.parent().unwrap_or(Path::new(".")).join("manifest.toml");
+        let auto_path = input
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("manifest.toml");
         if auto_path.exists() {
             Manifest::from_toml(&auto_path)?
         } else {
@@ -842,12 +894,17 @@ pub fn pack_fmod(
 
     // Calculate sizes
     let export_table_size = exports.len() * 8; // 4 bytes hash + 4 bytes offset
-    // Export table is stored immediately after code + data in the file.
-    // BSS is not stored, so it must not be included here.
+                                               // Export table is stored immediately after code + data in the file.
+                                               // BSS is not stored, so it must not be included here.
     let mem_export_offset = code_size + data_size;
     let schema_size = schema_data.len();
     let manifest_size = manifest_bytes.len();
-    let total_size = MODULE_HEADER_SIZE + code_size + data_size + export_table_size + schema_size + manifest_size;
+    let total_size = MODULE_HEADER_SIZE
+        + code_size
+        + data_size
+        + export_table_size
+        + schema_size
+        + manifest_size;
 
     // Build module header (MODULE_HEADER_SIZE bytes).
     let mut header = Vec::with_capacity(MODULE_HEADER_SIZE);
@@ -900,10 +957,18 @@ pub fn pack_fmod(
     //
     // Fine-grained permissions (flash_raw, platform_raw, …) live in the
     // manifest binary at byte 15 (written by Manifest::to_bytes).
-    let has_in_place_safe = symbols.iter().any(|s| s.bind == 1 && s.name == "module_in_place_safe");
-    let has_mailbox_safe = symbols.iter().any(|s| s.bind == 1 && s.name == "module_mailbox_safe");
-    let has_deferred_ready = symbols.iter().any(|s| s.bind == 1 && s.name == "module_deferred_ready");
-    let has_drain = symbols.iter().any(|s| s.bind == 1 && s.name == "module_drain");
+    let has_in_place_safe = symbols
+        .iter()
+        .any(|s| s.bind == 1 && s.name == "module_in_place_safe");
+    let has_mailbox_safe = symbols
+        .iter()
+        .any(|s| s.bind == 1 && s.name == "module_mailbox_safe");
+    let has_deferred_ready = symbols
+        .iter()
+        .any(|s| s.bind == 1 && s.name == "module_deferred_ready");
+    let has_drain = symbols
+        .iter()
+        .any(|s| s.bind == 1 && s.name == "module_drain");
     let mut reserved = [0u8; 12];
     if has_in_place_safe {
         reserved[0] |= 0x03; // mailbox_safe (bit 0) + in_place_writer (bit 1)
@@ -917,7 +982,9 @@ pub fn pack_fmod(
     if has_drain {
         reserved[0] |= 0x08; // drain_capable (bit 3)
     }
-    let has_isr_entry = symbols.iter().any(|s| s.bind == 1 && s.name == "module_isr_entry");
+    let has_isr_entry = symbols
+        .iter()
+        .any(|s| s.bind == 1 && s.name == "module_isr_entry");
     if has_isr_entry {
         reserved[0] |= 0x10; // isr_module (bit 4)
     }

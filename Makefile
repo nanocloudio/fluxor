@@ -7,6 +7,9 @@
 #   make modules TARGET=rp2040    Build PIC modules for a specific target
 #   make modules-all               Build modules for all targets
 #   make targets                   List available targets
+#   make fmt                      Apply rustfmt across the workspace
+#   make lint                      Run clippy across every kernel target + tools
+#                                  with `-D warnings` (CI-equivalent)
 
 # Default target silicon (override: make firmware TARGET=rp2040)
 TARGET ?= rp2350
@@ -61,7 +64,7 @@ ABI_HEADER := $(SDK_DIR)/abi.rs
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,2)))))))))))))
 
-.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash
+.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint
 
 all: tools firmware-all modules-all linux-bin
 
@@ -147,6 +150,44 @@ linux-bin: tools
 
 init:
 	git submodule update --init --recursive
+
+fmt:
+	@cargo fmt --all
+
+# Run clippy on every kernel target the firmware ships for, plus the host
+# tools and the Linux harness. Each invocation uses `-D warnings` so any
+# new lint becomes a CI failure rather than a passive warning. Targets
+# share most of the kernel source, but each enables a different set of
+# `chip-*` / `board-*` features that gate platform code, so all of them
+# must be checked. The leading `touch src/lib.rs` invalidates clippy's
+# incremental cache so warnings re-emit even when the prior compile was
+# silent on a sibling target.
+lint:
+	@echo "==> linting fluxor-tools (host + integration tests) ..."
+	@cd tools && cargo clippy --all-targets --all-features -- -D warnings
+	@echo "==> linting fluxor-linux (host-image, host-window, host-playback) ..."
+	@touch src/lib.rs
+	@cargo clippy --release --bin fluxor-linux \
+		--no-default-features \
+		--features "host-linux host-image host-window host-playback" \
+		--target aarch64-unknown-linux-gnu -- -D warnings
+	@echo "==> linting firmware (rp2350b) ..."
+	@touch src/lib.rs
+	@cargo clippy --release --target thumbv8m.main-none-eabihf \
+		--no-default-features --features chip-rp2350b -- -D warnings
+	@echo "==> linting firmware (rp2040) ..."
+	@touch src/lib.rs
+	@cargo clippy --release --target thumbv6m-none-eabi \
+		--no-default-features --features chip-rp2040 -- -D warnings
+	@echo "==> linting firmware (bcm2712) ..."
+	@touch src/lib.rs
+	@cargo clippy --release --target aarch64-unknown-none \
+		--no-default-features --features chip-bcm2712 -- -D warnings
+	@echo "==> linting firmware (board-cm5) ..."
+	@touch src/lib.rs
+	@cargo clippy --release --target aarch64-unknown-none \
+		--no-default-features --features board-cm5 -- -D warnings
+	@echo "lint: clean"
 
 clean:
 	cargo clean

@@ -303,10 +303,7 @@ pub fn build_params_from_schema(
                         if transparent {
                             kv.insert(inner_key.clone(), inner_value.clone());
                             if inner_key.contains('.') {
-                                kv.insert(
-                                    inner_key.replace('.', "_"),
-                                    inner_value.clone(),
-                                );
+                                kv.insert(inner_key.replace('.', "_"), inner_value.clone());
                             }
                             continue;
                         }
@@ -777,7 +774,7 @@ fn resolve_preset_blob(
 /// Decode a hex string (with optional spaces) into bytes.
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let hex: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("hex string must have even number of characters".into());
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);

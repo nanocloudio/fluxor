@@ -70,7 +70,8 @@ pub mod store {
     /// Register the flash module's dispatch function. Called via FLASH_STORE_ENABLE.
     pub fn register_dispatch(dispatch: FlashStoreDispatchFn, state: *mut u8) -> i32 {
         unsafe {
-            if (*&raw const STORE_DISPATCH).is_some() {
+            let p = &raw const STORE_DISPATCH;
+            if (*p).is_some() {
                 return crate::kernel::errno::EBUSY;
             }
             STORE_DISPATCH = Some(dispatch);
@@ -195,12 +196,19 @@ pub mod store {
             }
 
             FREE_OFFSET = off;
-            BOOT_OVERRIDES.valid = true;
+            {
+                let p = &raw mut BOOT_OVERRIDES;
+                (*p).valid = true;
+            }
 
-            if (*&raw const BOOT_OVERRIDES).count > 0 {
+            let count = {
+                let p = &raw const BOOT_OVERRIDES;
+                (*p).count
+            };
+            if count > 0 {
                 log::info!(
                     "[flash_store] {} active overrides, free={}",
-                    (*&raw const BOOT_OVERRIDES).count,
+                    count,
                     SECTOR_SIZE - FREE_OFFSET
                 );
             }
@@ -669,7 +677,7 @@ pub mod xip_lock {
         static CACHED_RESULT: AtomicU8 = AtomicU8::new(0);
 
         let count = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count % BOOTSEL_POLL_DIVISOR != 0 {
+        if !count.is_multiple_of(BOOTSEL_POLL_DIVISOR) {
             return CACHED_RESULT.load(Ordering::Relaxed) as i32;
         }
 

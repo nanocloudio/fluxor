@@ -16,14 +16,14 @@ use crate::modules::{Module, StepOutcome};
 /// Pre-computed export hashes for standard module interface
 pub mod export_hashes {
     pub const MODULE_STATE_SIZE: u32 = 0x74f40805; // "module_state_size"
-    pub const MODULE_INIT: u32 = 0xfb8dc9bc;       // "module_init"
-    pub const MODULE_NEW: u32 = 0xe6d4ac90;        // "module_new"
-    pub const MODULE_STEP: u32 = 0xc7ea2db4;       // "module_step"
+    pub const MODULE_INIT: u32 = 0xfb8dc9bc; // "module_init"
+    pub const MODULE_NEW: u32 = 0xe6d4ac90; // "module_new"
+    pub const MODULE_STEP: u32 = 0xc7ea2db4; // "module_step"
     pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
-    pub const MODULE_DRAIN: u32 = 0xc4c5636c;      // "module_drain"
-    pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03;  // "module_isr_init"
-    pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743;  // "module_isr_entry"
+    pub const MODULE_DRAIN: u32 = 0xc4c5636c; // "module_drain"
+    pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03; // "module_isr_init"
+    pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743; // "module_isr_entry"
     pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76; // "module_provider_dispatch"
     pub const MODULE_PROVIDES_CONTRACT: u32 = 0x671c57bb; // "module_provides_contract"
     pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
@@ -110,12 +110,14 @@ impl LoaderError {
             Self::StatePoolExhausted => log::error!("[loader] {}: state arena full", context),
             Self::InitFailed(code) => log::error!("[loader] {}: init failed rc={}", context, code),
             Self::NewFailed(code) => log::warn!("[loader] {}: new failed rc={}", context, code),
-            Self::AbiVersionMismatch { expected, found } =>
-                log::error!("[loader] {}: abi mismatch expected={} found={}", context, expected, found),
-            Self::IntegrityMismatch =>
-                log::error!("[loader] {}: integrity hash mismatch", context),
-            Self::SignatureInvalid =>
-                log::error!("[loader] {}: signature invalid", context),
+            Self::AbiVersionMismatch { expected, found } => log::error!(
+                "[loader] {}: abi mismatch expected={} found={}",
+                context,
+                expected,
+                found
+            ),
+            Self::IntegrityMismatch => log::error!("[loader] {}: integrity hash mismatch", context),
+            Self::SignatureInvalid => log::error!("[loader] {}: signature invalid", context),
         }
     }
 }
@@ -187,7 +189,16 @@ pub type ModuleInitFn = unsafe extern "C" fn(*const SyscallTable);
 
 /// Function pointer type for module_new export
 /// Signature: module_new(in_chan, out_chan, ctrl_chan, params, params_len, state, state_size, syscalls) -> i32
-pub type ModuleNewFn = unsafe extern "C" fn(i32, i32, i32, *const u8, usize, *mut u8, usize, *const SyscallTable) -> i32;
+pub type ModuleNewFn = unsafe extern "C" fn(
+    i32,
+    i32,
+    i32,
+    *const u8,
+    usize,
+    *mut u8,
+    usize,
+    *const SyscallTable,
+) -> i32;
 
 /// Function pointer type for module_step export
 pub type ModuleStepFn = unsafe extern "C" fn(*mut u8) -> i32;
@@ -226,8 +237,12 @@ impl ProviderAutoRegister {
     /// Look for the `module_provides_contract` + `module_provider_dispatch`
     /// export pair. Returns None if the module isn't a provider.
     unsafe fn resolve(module: &LoadedModule) -> Option<Self> {
-        let contract_addr = module.get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACT).ok()?;
-        let dispatch_addr = module.get_export_addr(export_hashes::MODULE_PROVIDER_DISPATCH).ok()?;
+        let contract_addr = module
+            .get_export_addr(export_hashes::MODULE_PROVIDES_CONTRACT)
+            .ok()?;
+        let dispatch_addr = module
+            .get_export_addr(export_hashes::MODULE_PROVIDER_DISPATCH)
+            .ok()?;
         Some(Self {
             contract_fn: fn_ptr_from_addr(contract_addr),
             dispatch_fn: fn_ptr_from_addr(dispatch_addr),
@@ -238,10 +253,18 @@ impl ProviderAutoRegister {
     unsafe fn register(&self, module_idx: u8, state_ptr: *mut u8, name: &'static str) {
         let contract = (self.contract_fn)() as u16;
         let rc = crate::kernel::provider::register_module_provider(
-            contract, module_idx, self.dispatch_fn, state_ptr,
+            contract,
+            module_idx,
+            self.dispatch_fn,
+            state_ptr,
         );
         if rc != 0 {
-            log::warn!("[inst] {} provider auto-register failed contract=0x{:04x} rc={}", name, contract, rc);
+            log::warn!(
+                "[inst] {} provider auto-register failed contract=0x{:04x} rc={}",
+                name,
+                contract,
+                rc
+            );
         }
     }
 }
@@ -251,7 +274,9 @@ static mut PIC_IRQ_DISABLED_COUNT: u32 = 0;
 
 /// Increment the IRQ-disabled counter (called by HAL pic_barrier).
 pub fn increment_irq_disabled_count() {
-    unsafe { PIC_IRQ_DISABLED_COUNT += 1; }
+    unsafe {
+        PIC_IRQ_DISABLED_COUNT += 1;
+    }
 }
 
 /// Flush pipeline, synchronize, and restore interrupts after PIC call.
@@ -276,20 +301,51 @@ unsafe fn call_init(f: ModuleInitFn, syscalls: *const SyscallTable) {
     pic_barrier();
 }
 
+/// Channel handles wired to a module instance: data input, data output,
+/// and the optional control input.
+#[derive(Copy, Clone)]
+pub struct ChannelHandles {
+    pub in_chan: i32,
+    pub out_chan: i32,
+    pub ctrl_chan: i32,
+}
+
+/// Pointer + length pair for a packed `module_new` parameter blob.
+#[derive(Copy, Clone)]
+pub struct ParamSlice {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+/// Inputs to a `module_new` call. Bundled to keep the kernel call sites
+/// readable when the wire-level signature would otherwise need 7+ args.
+pub struct ModuleInitArgs {
+    pub in_chan: i32,
+    pub out_chan: i32,
+    pub ctrl_chan: i32,
+    pub params: *const u8,
+    pub params_len: usize,
+    pub state_ptr: *mut u8,
+    pub state_size: usize,
+}
+
 /// Call module_new export.
 #[inline]
 unsafe fn call_new(
     f: ModuleNewFn,
-    in_chan: i32,
-    out_chan: i32,
-    ctrl_chan: i32,
-    params: *const u8,
-    params_len: usize,
-    state: *mut u8,
-    state_size: usize,
+    args: &ModuleInitArgs,
     syscalls: *const SyscallTable,
 ) -> i32 {
-    let r = f(in_chan, out_chan, ctrl_chan, params, params_len, state, state_size, syscalls);
+    let r = f(
+        args.in_chan,
+        args.out_chan,
+        args.ctrl_chan,
+        args.params,
+        args.params_len,
+        args.state_ptr,
+        args.state_size,
+        syscalls,
+    );
     pic_barrier();
     r
 }
@@ -420,8 +476,12 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
         // 2. Bump from the high-water mark.
         let aligned = align_up(STATE_ARENA_OFFSET);
         if aligned + need > STATE_ARENA_SIZE {
-            log::error!("[loader] state arena full need={} used={} cap={}",
-                need, aligned, STATE_ARENA_SIZE);
+            log::error!(
+                "[loader] state arena full need={} used={} cap={}",
+                need,
+                aligned,
+                STATE_ARENA_SIZE
+            );
             return Err(LoaderError::StatePoolExhausted);
         }
         let ptr = core::ptr::addr_of_mut!(STATE_ARENA.0)
@@ -447,7 +507,9 @@ pub fn arena_usage() -> (usize, usize) {
 /// # Safety
 /// `ptr` must have been returned by `alloc_state` and not already freed.
 pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 { return; }
+    if ptr.is_null() || size == 0 {
+        return;
+    }
     let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>();
     let offset = ptr as usize - base as usize;
     let need = align_up(size);
@@ -491,10 +553,16 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     // Otherwise record in the free list; if full, the region is leaked
     // until the next full reset.
     if FREE_COUNT < MAX_FREE_REGIONS {
-        (*free_list)[FREE_COUNT] = FreeRegion { offset: new_offset, size: new_size };
+        (*free_list)[FREE_COUNT] = FreeRegion {
+            offset: new_offset,
+            size: new_size,
+        };
         FREE_COUNT += 1;
     } else {
-        log::warn!("[loader] free list full; leaking {} bytes until reset", new_size);
+        log::warn!(
+            "[loader] free list full; leaking {} bytes until reset",
+            new_size
+        );
     }
 }
 
@@ -520,8 +588,8 @@ pub struct ModuleTableHeader {
     pub magic: u32,
     pub version: u8,
     pub module_count: u8,
-    pub total_size_lo: u16,   // low 16 bits (backward compat)
-    pub total_size_hi: u16,   // high 16 bits (uses first 2 reserved bytes)
+    pub total_size_lo: u16, // low 16 bits (backward compat)
+    pub total_size_hi: u16, // high 16 bits (uses first 2 reserved bytes)
     pub reserved: [u8; 6],
 }
 
@@ -581,7 +649,6 @@ impl ModuleHeader {
     ///     the full 0..31 range of contract ids defined in
     ///     `provider::contract`.
     ///   bytes 10-11: reserved (0), available for future ABI extensions.
-
     /// Step period hint from reserved[1]: 0 = every tick, N = every N ms.
     pub fn step_period_ms(&self) -> u8 {
         self.reserved[1]
@@ -602,8 +669,10 @@ impl ModuleHeader {
     /// contract id N in its manifest. Full 0..31 range since v3.
     pub fn required_caps(&self) -> u32 {
         u32::from_le_bytes([
-            self.reserved[6], self.reserved[7],
-            self.reserved[8], self.reserved[9],
+            self.reserved[6],
+            self.reserved[7],
+            self.reserved[8],
+            self.reserved[9],
         ])
     }
 
@@ -674,17 +743,22 @@ impl LoadedModule {
     /// `src/kernel/syscalls.rs` for the bit layout.
     pub fn manifest_permissions(&self) -> u8 {
         let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 16 { return 0; }
+        if manifest_size < 16 {
+            return 0;
+        }
         let code_size = self.header.code_size as usize;
         let data_size = self.header.data_size as usize;
         let export_size = self.header.export_count as usize * 8;
         let schema_size = self.header.schema_size() as usize;
-        let manifest_offset = ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        let manifest_offset =
+            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
         unsafe {
             let p = offset_ptr(self.base, manifest_offset);
             // Verify magic before trusting byte 15.
             let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
-            if magic != 0x464D5846 { return 0; } // "FXMF"
+            if magic != 0x464D5846 {
+                return 0;
+            } // "FXMF"
             *p.add(15)
         }
     }
@@ -717,8 +791,7 @@ impl LoadedModule {
     }
 
     /// Log header info for debugging (minimal to avoid buffer overflow)
-    pub fn log_header_info(&self) {
-    }
+    pub fn log_header_info(&self) {}
 }
 
 // ============================================================================
@@ -731,6 +804,12 @@ pub struct ModuleLoader {
     header: Option<ModuleTableHeader>,
     /// Skip integrity checks (for embedded blob modules)
     pub skip_integrity: bool,
+}
+
+impl Default for ModuleLoader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ModuleLoader {
@@ -928,7 +1007,11 @@ fn validate_fn_addr(addr: usize, name: &str) -> Result<(), LoaderError> {
 pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderError> {
     // Check base is in valid memory range
     if !hal::validate_module_base(module.base as usize) {
-        log::error!("[loader] {}: invalid base addr=0x{:08x}", name, module.base as usize);
+        log::error!(
+            "[loader] {}: invalid base addr=0x{:08x}",
+            name,
+            module.base as usize
+        );
         return Err(LoaderError::InvalidModuleBase);
     }
 
@@ -936,7 +1019,9 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
     if module.header.abi_version != MODULE_ABI_VERSION {
         log::error!(
             "[loader] {}: abi version={} expected={}",
-            name, module.header.abi_version, MODULE_ABI_VERSION
+            name,
+            module.header.abi_version,
+            MODULE_ABI_VERSION
         );
         return Err(LoaderError::AbiVersionMismatch {
             expected: MODULE_ABI_VERSION,
@@ -946,7 +1031,11 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
 
     // Check code_size is reasonable (< 384KB — protocol modules may bundle firmware+NVRAM)
     if module.header.code_size > 393216 {
-        log::error!("[loader] {}: code too large size={}", name, module.header.code_size);
+        log::error!(
+            "[loader] {}: code too large size={}",
+            name,
+            module.header.code_size
+        );
         return Err(LoaderError::CodeSizeTooLarge);
     }
 
@@ -968,13 +1057,17 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
         let data_size = module.header.data_size as usize;
         let export_size = module.header.export_count as usize * 8;
         let schema_size = module.header.schema_size() as usize;
-        let manifest_offset = ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        let manifest_offset =
+            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
         let manifest_ptr = unsafe { offset_ptr(module.base, manifest_offset) };
-        let manifest_data = unsafe {
-            core::slice::from_raw_parts(manifest_ptr, manifest_size)
-        };
+        let manifest_data = unsafe { core::slice::from_raw_parts(manifest_ptr, manifest_size) };
         if manifest_size >= 16 {
-            let magic = u32::from_le_bytes([manifest_data[0], manifest_data[1], manifest_data[2], manifest_data[3]]);
+            let magic = u32::from_le_bytes([
+                manifest_data[0],
+                manifest_data[1],
+                manifest_data[2],
+                manifest_data[3],
+            ]);
             if magic == 0x464D5846 {
                 let version = manifest_data[4];
                 let flags = manifest_data[14];
@@ -995,14 +1088,15 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     }
                     let stored_hash = &manifest_data[hash_offset..hash_offset + 32];
 
-                    use sha2::{Sha256, Digest};
+                    use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::new();
                     let code_ptr = module.code_base();
                     let code_data = unsafe { core::slice::from_raw_parts(code_ptr, code_size) };
                     hasher.update(code_data);
                     if data_size > 0 {
                         let data_ptr = unsafe { offset_ptr(code_ptr, code_size) };
-                        let data_section = unsafe { core::slice::from_raw_parts(data_ptr, data_size) };
+                        let data_section =
+                            unsafe { core::slice::from_raw_parts(data_ptr, data_size) };
                         hasher.update(data_section);
                     }
                     let computed = hasher.finalize();
@@ -1149,23 +1243,15 @@ pub enum NewStatus {
 ///
 /// # Safety
 /// `new_fn` must be a valid, validated module entrypoint.
-/// `params` must point to `params_len` readable bytes (or be null if `params_len == 0`).
-/// `state_ptr` must point to `state_size` writable bytes, zeroed and exclusively owned.
+/// `args.params` must point to `args.params_len` readable bytes (or be null if zero-length).
+/// `args.state_ptr` must point to `args.state_size` writable bytes, zeroed and exclusively owned.
 pub unsafe fn invoke_new(
     new_fn: ModuleNewFn,
     syscalls: &SyscallTable,
-    in_chan: i32,
-    out_chan: i32,
-    ctrl_chan: i32,
-    params: *const u8,
-    params_len: usize,
-    state_ptr: *mut u8,
-    state_size: usize,
+    args: &ModuleInitArgs,
 ) -> Result<NewStatus, LoaderError> {
     // SAFETY: new_fn validated in lookup_exports, params/state from caller
-    let result = unsafe {
-        call_new(new_fn, in_chan, out_chan, ctrl_chan, params, params_len, state_ptr, state_size, syscalls)
-    };
+    let result = unsafe { call_new(new_fn, args, syscalls) };
 
     if result < 0 {
         Err(LoaderError::NewFailed(result))
@@ -1225,38 +1311,38 @@ pub struct DynamicModulePending {
 
 impl DynamicModulePending {
     /// Get step function pointer (for force-completing a pending module).
-    pub fn step_fn_ptr(&self) -> ModuleStepFn { self.step_fn }
+    pub fn step_fn_ptr(&self) -> ModuleStepFn {
+        self.step_fn
+    }
     /// Get state pointer (for force-completing a pending module).
-    pub fn state_ptr(&self) -> *mut u8 { self.state_ptr }
+    pub fn state_ptr(&self) -> *mut u8 {
+        self.state_ptr
+    }
 
     /// Create from pre-validated parts (for debug stepping through instantiation).
     ///
     /// # Safety
-    /// `params` must remain valid for the lifetime of the returned pending state.
+    /// `args.params` must remain valid for the lifetime of the returned
+    /// pending state; `args.state_ptr` must point to `args.state_size`
+    /// writable bytes.
     pub fn new(
         step_fn: ModuleStepFn,
         new_fn: ModuleNewFn,
-        state_ptr: *mut u8,
-        state_size: usize,
         syscalls: &SyscallTable,
-        in_chan: i32,
-        out_chan: i32,
-        ctrl_chan: i32,
-        params: *const u8,
-        params_len: usize,
+        args: &ModuleInitArgs,
         name: &'static str,
     ) -> Self {
         Self {
             step_fn,
             new_fn,
-            state_ptr,
-            state_size,
+            state_ptr: args.state_ptr,
+            state_size: args.state_size,
             syscalls: syscalls as *const _,
-            in_chan,
-            out_chan,
-            ctrl_chan,
-            params_ptr: params,
-            params_len,
+            in_chan: args.in_chan,
+            out_chan: args.out_chan,
+            ctrl_chan: args.ctrl_chan,
+            params_ptr: args.params,
+            params_len: args.params_len,
             name,
             drain_fn: None,
             auto_register: None,
@@ -1270,18 +1356,23 @@ impl DynamicModulePending {
     /// - `Ok(Some(module))` - initialization complete
     /// - `Ok(None)` - still pending, call again after yielding
     /// - `Err(e)` - initialization failed
+    ///
+    /// # Safety
+    /// The pending state's `state_ptr`, `params_ptr`, `syscalls`, and
+    /// channel handles must still be valid (the underlying allocations
+    /// must not have been freed since `start_new` returned `Pending`).
+    /// Re-entrancy on the same `DynamicModulePending` is unsound.
     pub unsafe fn try_complete(&mut self) -> Result<Option<DynamicModule>, LoaderError> {
-        match invoke_new(
-            self.new_fn,
-            &*self.syscalls,
-            self.in_chan,
-            self.out_chan,
-            self.ctrl_chan,
-            self.params_ptr,
-            self.params_len,
-            self.state_ptr,
-            self.state_size,
-        )? {
+        let args = ModuleInitArgs {
+            in_chan: self.in_chan,
+            out_chan: self.out_chan,
+            ctrl_chan: self.ctrl_chan,
+            params: self.params_ptr,
+            params_len: self.params_len,
+            state_ptr: self.state_ptr,
+            state_size: self.state_size,
+        };
+        match invoke_new(self.new_fn, &*self.syscalls, &args)? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {}", self.name);
                 if let Some(ar) = self.auto_register.as_ref() {
@@ -1300,6 +1391,12 @@ impl DynamicModulePending {
 
     /// Release this pending module's state buffer back to the pool.
     /// Consumes the pending state. Use when dropping without completing.
+    ///
+    /// # Safety
+    /// The state buffer must not be referenced anywhere after this call
+    /// — `module_new` must not have stashed `state_ptr` into a global
+    /// (e.g. via a successful provider registration). Aborting only
+    /// makes sense for a `Pending` that has not transitioned to Ready.
     pub unsafe fn abort(self) {
         free_state_range(self.state_ptr, self.state_size);
     }
@@ -1321,7 +1418,12 @@ impl DynamicModule {
 
     /// Create from pre-validated parts (for debug stepping through instantiation).
     pub fn from_parts(step_fn: ModuleStepFn, state_ptr: *mut u8, state_size: u32) -> Self {
-        Self { step_fn, state_ptr, state_size, drain_fn: None }
+        Self {
+            step_fn,
+            state_ptr,
+            state_size,
+            drain_fn: None,
+        }
     }
 
     /// Release this module's state buffer back to the pool. Consumes the
@@ -1339,6 +1441,13 @@ impl DynamicModule {
 
     /// Call module_drain if the module exports it.
     /// Returns the drain function's return code, or -1 if not drain-capable.
+    ///
+    /// # Safety
+    /// `self.state_ptr` must still point at the module's live state and
+    /// the module's code must remain mapped — i.e. the `DynamicModule`
+    /// has not been `free()`d and the underlying `LoadedModule` has not
+    /// been unloaded. Drain may invoke arbitrary syscalls on the
+    /// module's behalf and must run on the module's owning core.
     pub unsafe fn call_drain(&self) -> i32 {
         match self.drain_fn {
             Some(f) => call_drain(f, self.state_ptr),
@@ -1369,17 +1478,14 @@ impl DynamicModule {
     /// pending state until it returns Ready.
     ///
     /// # Safety
-    /// - `params` must be valid for `params_len` bytes
+    /// - `params.ptr` must be valid for `params.len` bytes
     /// - `module` must remain valid for the module's lifetime
     #[inline(never)]
     pub unsafe fn start_new(
         module: &LoadedModule,
         syscalls: &SyscallTable,
-        in_chan: i32,
-        out_chan: i32,
-        ctrl_chan: i32,
-        params: *const u8,
-        params_len: usize,
+        channels: ChannelHandles,
+        params: ParamSlice,
         name: &'static str,
     ) -> Result<StartNewResult, LoaderError> {
         // 1. Validate module header (safe)
@@ -1413,7 +1519,7 @@ impl DynamicModule {
             if arena_size > 0 {
                 if let Ok(arena_ptr) = alloc_state(arena_size) {
                     let module_idx = super::scheduler::current_module_index();
-                    super::heap::init_module_heap(module_idx as usize, arena_ptr, arena_size);
+                    super::heap::init_module_heap(module_idx, arena_ptr, arena_size);
                 }
             }
         }
@@ -1425,12 +1531,22 @@ impl DynamicModule {
         }
 
         // 5b. Resolve optional module_drain export
-        let drain_fn: Option<ModuleDrainFn> = module.get_export_addr(export_hashes::MODULE_DRAIN)
+        let drain_fn: Option<ModuleDrainFn> = module
+            .get_export_addr(export_hashes::MODULE_DRAIN)
             .ok()
             .map(|addr| fn_ptr_from_addr(addr));
 
         // 6. Try to create instance (may return pending)
-        match invoke_new(exports.new_fn, syscalls, in_chan, out_chan, ctrl_chan, params, params_len, state_ptr, required_size)? {
+        let init_args = ModuleInitArgs {
+            in_chan: channels.in_chan,
+            out_chan: channels.out_chan,
+            ctrl_chan: channels.ctrl_chan,
+            params: params.ptr,
+            params_len: params.len,
+            state_ptr,
+            state_size: required_size,
+        };
+        match invoke_new(exports.new_fn, syscalls, &init_args)? {
             NewStatus::Ready => {
                 log::info!("[inst] loaded {}", name);
                 if let Some(ar) = auto_register.as_ref() {
@@ -1452,11 +1568,11 @@ impl DynamicModule {
                     state_ptr,
                     state_size: required_size,
                     syscalls: syscalls as *const _,
-                    in_chan,
-                    out_chan,
-                    ctrl_chan,
-                    params_ptr: params,
-                    params_len,
+                    in_chan: channels.in_chan,
+                    out_chan: channels.out_chan,
+                    ctrl_chan: channels.ctrl_chan,
+                    params_ptr: params.ptr,
+                    params_len: params.len,
                     name,
                     drain_fn,
                     auto_register,
@@ -1512,7 +1628,11 @@ const MAX_HINTS_PER_MODULE: usize = 8;
 /// `module_channel_hints`. This is optional — modules without the export
 /// get default 2048-byte buffers on all ports.
 pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PER_MODULE], usize) {
-    let mut hints = [ChannelHint { port_type: 0, port_index: 0, buffer_size: 0 }; MAX_HINTS_PER_MODULE];
+    let mut hints = [ChannelHint {
+        port_type: 0,
+        port_index: 0,
+        buffer_size: 0,
+    }; MAX_HINTS_PER_MODULE];
 
     // Look up the optional export
     let addr = match module.get_export_addr(export_hashes::MODULE_CHANNEL_HINTS) {
@@ -1536,9 +1656,9 @@ pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PE
     }
 
     let count = (count as usize).min(MAX_HINTS_PER_MODULE);
-    for i in 0..count {
+    for (i, hint) in hints.iter_mut().take(count).enumerate() {
         let offset = i * 4;
-        hints[i] = ChannelHint {
+        *hint = ChannelHint {
             port_type: buf[offset],
             port_index: buf[offset + 1],
             buffer_size: u16::from_le_bytes([buf[offset + 2], buf[offset + 3]]),
@@ -1551,11 +1671,7 @@ pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PE
 /// Look up buffer size hint for a specific port.
 ///
 /// Returns the requested buffer size, or 0 if no hint exists (use default).
-pub fn find_hint_for_port(
-    hints: &[ChannelHint],
-    port_type: u8,
-    port_index: u8,
-) -> u16 {
+pub fn find_hint_for_port(hints: &[ChannelHint], port_type: u8, port_index: u8) -> u16 {
     for hint in hints {
         if hint.port_type == port_type && hint.port_index == port_index {
             return hint.buffer_size;
@@ -1581,8 +1697,7 @@ pub fn find_hint_for_port(
 /// not found (caller may then fall back to treating the value as a
 /// raw address).
 pub fn resolve_export_for_module(module_idx: usize, export_hash: u32) -> Option<usize> {
-    let (code_base, export_table, export_count) =
-        super::scheduler::get_module_exports(module_idx);
+    let (code_base, export_table, export_count) = super::scheduler::get_module_exports(module_idx);
 
     if export_table.is_null() || export_count == 0 || code_base == 0 {
         return None;
@@ -1612,13 +1727,28 @@ mod tests {
 
     #[test]
     fn test_export_hashes() {
-        assert_eq!(fnv1a32(b"module_state_size"), export_hashes::MODULE_STATE_SIZE);
+        assert_eq!(
+            fnv1a32(b"module_state_size"),
+            export_hashes::MODULE_STATE_SIZE
+        );
         assert_eq!(fnv1a32(b"module_init"), export_hashes::MODULE_INIT);
         assert_eq!(fnv1a32(b"module_new"), export_hashes::MODULE_NEW);
         assert_eq!(fnv1a32(b"module_step"), export_hashes::MODULE_STEP);
-        assert_eq!(fnv1a32(b"module_channel_hints"), export_hashes::MODULE_CHANNEL_HINTS);
-        assert_eq!(fnv1a32(b"module_provider_dispatch"), export_hashes::MODULE_PROVIDER_DISPATCH);
-        assert_eq!(fnv1a32(b"module_provides_contract"), export_hashes::MODULE_PROVIDES_CONTRACT);
-        assert_eq!(fnv1a32(b"module_flash_store_dispatch"), export_hashes::MODULE_FLASH_STORE_DISPATCH);
+        assert_eq!(
+            fnv1a32(b"module_channel_hints"),
+            export_hashes::MODULE_CHANNEL_HINTS
+        );
+        assert_eq!(
+            fnv1a32(b"module_provider_dispatch"),
+            export_hashes::MODULE_PROVIDER_DISPATCH
+        );
+        assert_eq!(
+            fnv1a32(b"module_provides_contract"),
+            export_hashes::MODULE_PROVIDES_CONTRACT
+        );
+        assert_eq!(
+            fnv1a32(b"module_flash_store_dispatch"),
+            export_hashes::MODULE_FLASH_STORE_DISPATCH
+        );
     }
 }

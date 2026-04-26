@@ -8,7 +8,7 @@
 //! vault is authoritative for any slot holding P-256 scalar material.
 
 use crate::abi::contracts::key_vault as dev_key_vault;
-use crate::abi::errno::{ENOSYS, EINVAL};
+use crate::abi::errno::{EINVAL, ENOSYS};
 use crate::kernel::crypto::p256;
 use crate::kernel::fd;
 
@@ -36,18 +36,36 @@ struct Slot {
 
 impl Slot {
     const fn empty() -> Self {
-        Self { flags: 0, key_type: 0, key_len: 0, _pad: 0, data: [0; MAX_KEY_BYTES] }
+        Self {
+            flags: 0,
+            key_type: 0,
+            key_len: 0,
+            _pad: 0,
+            data: [0; MAX_KEY_BYTES],
+        }
     }
 }
 
 // Static slot table. Access is serialised via the scheduler's single-core
 // cooperative model; no explicit lock needed.
 static mut SLOTS: [Slot; MAX_SLOTS] = [
-    Slot::empty(), Slot::empty(), Slot::empty(), Slot::empty(),
-    Slot::empty(), Slot::empty(), Slot::empty(), Slot::empty(),
+    Slot::empty(),
+    Slot::empty(),
+    Slot::empty(),
+    Slot::empty(),
+    Slot::empty(),
+    Slot::empty(),
+    Slot::empty(),
+    Slot::empty(),
 ];
 
 /// Zeroise every slot. Called on scheduler reset / graph reconfigure.
+///
+/// # Safety
+/// Must be called from kernel context with exclusive access to `SLOTS`
+/// (i.e. while no module is mid-`provider_dispatch`). Wipes all key
+/// material in place via volatile writes; concurrent SIGN/ECDH would
+/// observe partially-zeroed keys.
 pub unsafe fn reset_all() {
     for i in 0..MAX_SLOTS {
         zeroise_slot(i);
@@ -55,7 +73,9 @@ pub unsafe fn reset_all() {
 }
 
 unsafe fn zeroise_slot(i: usize) {
-    if i >= MAX_SLOTS { return; }
+    if i >= MAX_SLOTS {
+        return;
+    }
     // Volatile writes so the compiler doesn't optimise the wipe away.
     let p = (&raw mut SLOTS[i].data) as *mut u8;
     for j in 0..MAX_KEY_BYTES {
@@ -73,13 +93,22 @@ unsafe fn zeroise_slot(i: usize) {
 /// handle; PROBE / STORE / VERIFY take `handle=-1`. Tagging keeps KV
 /// handles distinct from other drivers' untagged integer handles in the
 /// kernel's global handle-tracking table.
+///
+/// # Safety
+/// `arg` must be valid for `arg_len` bytes for both reads (input fields
+/// per the opcode's TLV layout) and writes (signature / shared-secret
+/// output regions). Caller must not retain `arg` after return.
 pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     let slot_handle = match opcode {
         dev_key_vault::PROBE | dev_key_vault::STORE | dev_key_vault::VERIFY => handle,
         _ => {
-            if handle < 0 { return EINVAL; }
+            if handle < 0 {
+                return EINVAL;
+            }
             let (tag, slot) = fd::untag_fd(handle);
-            if tag != fd::FD_TAG_KEY_VAULT { return EINVAL; }
+            if tag != fd::FD_TAG_KEY_VAULT {
+                return EINVAL;
+            }
             slot
         }
     };
@@ -91,7 +120,9 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 
         dev_key_vault::STORE => {
             // arg layout: [key_type:u8][len:u8][pad:u16][bytes[len]]
-            if arg.is_null() || arg_len < 4 { return EINVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return EINVAL;
+            }
             let key_type = *arg;
             let key_len = *arg.add(1) as usize;
             if key_len == 0 || key_len > MAX_KEY_BYTES || 4 + key_len > arg_len {
@@ -100,13 +131,16 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 
             // Find a free slot.
             let mut slot_idx: isize = -1;
-            for i in 0..MAX_SLOTS {
-                if (SLOTS[i].flags & FLAG_IN_USE) == 0 {
+            let slots_ptr = &raw const SLOTS;
+            for (i, s) in (*slots_ptr).iter().enumerate() {
+                if (s.flags & FLAG_IN_USE) == 0 {
                     slot_idx = i as isize;
                     break;
                 }
             }
-            if slot_idx < 0 { return crate::abi::errno::ENOMEM; }
+            if slot_idx < 0 {
+                return crate::abi::errno::ENOMEM;
+            }
             let idx = slot_idx as usize;
 
             SLOTS[idx].key_type = key_type;
@@ -121,14 +155,20 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         }
 
         dev_key_vault::DESTROY => {
-            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS { return EINVAL; }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
             zeroise_slot(slot_handle as usize);
             0
         }
 
         dev_key_vault::SIGN => {
-            if arg.is_null() || arg_len < 4 + 32 + 64 { return EINVAL; }
-            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS { return EINVAL; }
+            if arg.is_null() || arg_len < 4 + 32 + 64 {
+                return EINVAL;
+            }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
             let slot = &SLOTS[slot_handle as usize];
             if (slot.flags & FLAG_IN_USE) == 0
                 || slot.key_type != KEY_TYPE_P256_SCALAR
@@ -142,19 +182,25 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             let hash = core::slice::from_raw_parts(arg.add(4), hash_len);
             let mut priv_key = [0u8; 32];
-            for i in 0..32 { priv_key[i] = slot.data[i]; }
+            priv_key.copy_from_slice(&slot.data[..32]);
             // RFC 6979 derives its nonce deterministically; the `_random` arg
             // on ecdsa_sign is unused.
             let sig = p256::ecdsa_sign(&priv_key, hash, &[0u8; 32]);
-            for i in 0..32 { core::ptr::write_volatile(&mut priv_key[i], 0); }
+            for byte in priv_key.iter_mut() {
+                core::ptr::write_volatile(byte as *mut u8, 0);
+            }
             let out = arg.add(4 + hash_len);
-            for i in 0..64 { *out.add(i) = sig[i]; }
+            core::ptr::copy_nonoverlapping(sig.as_ptr(), out, 64);
             0
         }
 
         dev_key_vault::ECDH => {
-            if arg.is_null() || arg_len < 4 { return EINVAL; }
-            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS { return EINVAL; }
+            if arg.is_null() || arg_len < 4 {
+                return EINVAL;
+            }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
             let slot = &SLOTS[slot_handle as usize];
             if (slot.flags & FLAG_IN_USE) == 0
                 || slot.key_type != KEY_TYPE_P256_SCALAR
@@ -168,13 +214,15 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             let peer = core::slice::from_raw_parts(arg.add(4), peer_len);
             let mut priv_key = [0u8; 32];
-            for i in 0..32 { priv_key[i] = slot.data[i]; }
+            priv_key.copy_from_slice(&slot.data[..32]);
             let result = p256::ecdh_shared_secret(&priv_key, peer);
-            for i in 0..32 { core::ptr::write_volatile(&mut priv_key[i], 0); }
+            for byte in priv_key.iter_mut() {
+                core::ptr::write_volatile(byte as *mut u8, 0);
+            }
             match result {
                 Some(shared) => {
                     let out = arg.add(4 + peer_len);
-                    for i in 0..32 { *out.add(i) = shared[i]; }
+                    core::ptr::copy_nonoverlapping(shared.as_ptr(), out, 32);
                     0
                 }
                 None => crate::abi::errno::EINVAL,
@@ -187,11 +235,15 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // We accept: [hash_len:u16][sig_len:u16][pub_len:u16][pad:u16]
             //            [hash][sig][pub]. For backward compatibility with a
             //            simpler call (no pub embedded), fall back to ENOSYS.
-            if arg.is_null() || arg_len < 8 { return EINVAL; }
+            if arg.is_null() || arg_len < 8 {
+                return EINVAL;
+            }
             let hash_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
             let sig_len = u16::from_le_bytes([*arg.add(2), *arg.add(3)]) as usize;
             let pub_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]) as usize;
-            if hash_len == 0 || sig_len != 64 || pub_len < 64
+            if hash_len == 0
+                || sig_len != 64
+                || pub_len < 64
                 || 8 + hash_len + sig_len + pub_len > arg_len
             {
                 return EINVAL;
@@ -199,7 +251,11 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let hash = core::slice::from_raw_parts(arg.add(8), hash_len);
             let sig = core::slice::from_raw_parts(arg.add(8 + hash_len), sig_len);
             let pk = core::slice::from_raw_parts(arg.add(8 + hash_len + sig_len), pub_len);
-            if p256::ecdsa_verify(pk, hash, sig) { 1 } else { 0 }
+            if p256::ecdsa_verify(pk, hash, sig) {
+                1
+            } else {
+                0
+            }
         }
 
         _ => ENOSYS,
@@ -215,16 +271,19 @@ mod tests {
     /// path exposes slot content).
     #[test]
     fn store_and_destroy_roundtrip() {
-        unsafe { reset_all(); }
+        unsafe {
+            reset_all();
+        }
 
         let mut buf = [0u8; 4 + 32];
         buf[0] = 1; // key_type = P-256 scalar
         buf[1] = 32; // key_len
-        for i in 0..32 { buf[4 + i] = i as u8 + 1; }
+        for i in 0..32 {
+            buf[4 + i] = i as u8 + 1;
+        }
 
-        let handle = unsafe {
-            provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len())
-        };
+        let handle =
+            unsafe { provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len()) };
         assert!(handle >= 0, "store should succeed, got {}", handle);
         let (tag, slot_idx) = fd::untag_fd(handle);
         assert_eq!(tag, fd::FD_TAG_KEY_VAULT);
@@ -236,17 +295,22 @@ mod tests {
             let slot = &SLOTS[slot_idx];
             assert_eq!(slot.key_len, 32);
             assert_eq!(slot.key_type, 1);
-            for i in 0..32 { assert_eq!(slot.data[i], (i as u8) + 1); }
+            for i in 0..32 {
+                assert_eq!(slot.data[i], (i as u8) + 1);
+            }
         }
 
         // Destroy wipes the bytes.
-        let rc = unsafe { provider_dispatch(handle, dev_key_vault::DESTROY, core::ptr::null_mut(), 0) };
+        let rc =
+            unsafe { provider_dispatch(handle, dev_key_vault::DESTROY, core::ptr::null_mut(), 0) };
         assert_eq!(rc, 0);
         unsafe {
             let slot = &SLOTS[slot_idx];
             assert_eq!(slot.flags, 0);
             assert_eq!(slot.key_len, 0);
-            for i in 0..32 { assert_eq!(slot.data[i], 0, "slot byte {} not wiped", i); }
+            for i in 0..32 {
+                assert_eq!(slot.data[i], 0, "slot byte {} not wiped", i);
+            }
         }
     }
 
@@ -255,59 +319,73 @@ mod tests {
     /// be misrouted into this dispatcher.
     #[test]
     fn untagged_handle_rejected() {
-        unsafe { reset_all(); }
+        unsafe {
+            reset_all();
+        }
         let mut sign_arg = [0u8; 4 + 32 + 64];
         sign_arg[0] = 32;
         let rc = unsafe {
-            provider_dispatch(0, dev_key_vault::SIGN, sign_arg.as_mut_ptr(), sign_arg.len())
+            provider_dispatch(
+                0,
+                dev_key_vault::SIGN,
+                sign_arg.as_mut_ptr(),
+                sign_arg.len(),
+            )
         };
         assert_eq!(rc, EINVAL);
         let foreign = fd::tag_fd(fd::FD_TAG_EVENT, 0);
         let rc = unsafe {
-            provider_dispatch(foreign, dev_key_vault::SIGN, sign_arg.as_mut_ptr(), sign_arg.len())
+            provider_dispatch(
+                foreign,
+                dev_key_vault::SIGN,
+                sign_arg.as_mut_ptr(),
+                sign_arg.len(),
+            )
         };
         assert_eq!(rc, EINVAL);
     }
 
     #[test]
     fn slots_exhaust() {
-        unsafe { reset_all(); }
+        unsafe {
+            reset_all();
+        }
         let mut buf = [0u8; 4 + 4];
         buf[0] = 1;
         buf[1] = 4;
         let mut handles = [0i32; MAX_SLOTS];
         for i in 0..MAX_SLOTS {
-            handles[i] = unsafe {
-                provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len())
-            };
+            handles[i] =
+                unsafe { provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len()) };
             assert!(handles[i] >= 0);
         }
         // Next store must fail with ENOMEM.
-        let over = unsafe {
-            provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len())
-        };
+        let over =
+            unsafe { provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len()) };
         assert_eq!(over, crate::abi::errno::ENOMEM);
 
         // Free one, confirm a new store fits.
-        let rc = unsafe { provider_dispatch(handles[0], dev_key_vault::DESTROY, core::ptr::null_mut(), 0) };
-        assert_eq!(rc, 0);
-        let again = unsafe {
-            provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len())
+        let rc = unsafe {
+            provider_dispatch(handles[0], dev_key_vault::DESTROY, core::ptr::null_mut(), 0)
         };
+        assert_eq!(rc, 0);
+        let again =
+            unsafe { provider_dispatch(-1, dev_key_vault::STORE, buf.as_mut_ptr(), buf.len()) };
         assert!(again >= 0);
     }
 
     #[test]
     fn sign_then_verify_roundtrip() {
         use crate::kernel::crypto::p256;
-        unsafe { reset_all(); }
+        unsafe {
+            reset_all();
+        }
 
         // Deterministic test private key.
         let priv_key: [u8; 32] = [
-            0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
-            0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6, 0x93,
-            0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12,
-            0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f, 0x67, 0x21,
+            0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16, 0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1,
+            0xd6, 0x93, 0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12, 0x7b, 0x8a, 0x62, 0x2b,
+            0x12, 0x0f, 0x67, 0x21,
         ];
 
         let mut store_arg = [0u8; 4 + 32];
@@ -315,7 +393,12 @@ mod tests {
         store_arg[1] = 32;
         store_arg[4..4 + 32].copy_from_slice(&priv_key);
         let handle = unsafe {
-            provider_dispatch(-1, dev_key_vault::STORE, store_arg.as_mut_ptr(), store_arg.len())
+            provider_dispatch(
+                -1,
+                dev_key_vault::STORE,
+                store_arg.as_mut_ptr(),
+                store_arg.len(),
+            )
         };
         assert!(handle >= 0);
 
@@ -328,7 +411,12 @@ mod tests {
         sign_arg[0] = 32;
         sign_arg[4..4 + 32].copy_from_slice(&hash);
         let rc = unsafe {
-            provider_dispatch(handle, dev_key_vault::SIGN, sign_arg.as_mut_ptr(), sign_arg.len())
+            provider_dispatch(
+                handle,
+                dev_key_vault::SIGN,
+                sign_arg.as_mut_ptr(),
+                sign_arg.len(),
+            )
         };
         assert_eq!(rc, 0);
         let mut sig = [0u8; 64];
@@ -337,7 +425,9 @@ mod tests {
         // Cross-check with the kernel verify path.
         assert!(p256::ecdsa_verify(&pk, &hash, &sig));
 
-        unsafe { provider_dispatch(handle, dev_key_vault::DESTROY, core::ptr::null_mut(), 0); }
+        unsafe {
+            provider_dispatch(handle, dev_key_vault::DESTROY, core::ptr::null_mut(), 0);
+        }
     }
 
     #[test]

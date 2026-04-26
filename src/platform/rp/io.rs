@@ -192,9 +192,11 @@ pub mod gpio {
     }
 
     /// Check if the current module owns the given GPIO handle.
+    ///
     /// Returns true if:
     ///   - the pin is kernel-owned (owner == 0xFF) — allows kernel internal use
     ///   - the pin is owned by the currently executing module
+    ///
     /// Returns false otherwise (another module owns this pin).
     pub fn gpio_check_owner(handle: i32) -> bool {
         if handle < 0 || handle as usize >= MAX_GPIO {
@@ -376,11 +378,20 @@ pub mod gpio {
     // ============================================================================
 
     /// Syscall: claim GPIO pin
+    ///
+    /// # Safety
+    /// `extern "C"` syscall ABI shim. Takes no pointers; marked
+    /// `unsafe` only to match the syscall-table signature.
     pub unsafe extern "C" fn syscall_gpio_claim(pin_num: u8) -> i32 {
         gpio_claim(pin_num)
     }
 
     /// Syscall: release GPIO pin
+    ///
+    /// # Safety
+    /// `extern "C"` syscall ABI shim. Takes no pointers; marked
+    /// `unsafe` only to match the syscall-table signature. The
+    /// underlying `gpio_release` checks ownership before unmapping.
     pub unsafe extern "C" fn syscall_gpio_release(handle: i32) -> i32 {
         gpio_release(handle)
     }
@@ -388,6 +399,10 @@ pub mod gpio {
     /// Syscall: set pin mode
     /// mode: 1=input, 2=output
     /// initial_level: for outputs, 0=low, 1=high
+    ///
+    /// # Safety
+    /// `extern "C"` syscall ABI shim. Takes no pointers; marked
+    /// `unsafe` only to match the syscall-table signature.
     pub unsafe extern "C" fn syscall_gpio_set_mode(
         handle: i32,
         mode: u8,
@@ -403,6 +418,10 @@ pub mod gpio {
 
     /// Syscall: set pull configuration
     /// pull: 0=none, 1=up, 2=down
+    ///
+    /// # Safety
+    /// `extern "C"` syscall ABI shim. Takes no pointers; marked
+    /// `unsafe` only to match the syscall-table signature.
     pub unsafe extern "C" fn syscall_gpio_set_pull(handle: i32, pull: u8) -> i32 {
         let pin_pull = match pull {
             0 => PinPull::None,
@@ -414,11 +433,19 @@ pub mod gpio {
     }
 
     /// Syscall: set output level
+    ///
+    /// # Safety
+    /// `extern "C"` syscall ABI shim. Takes no pointers; marked
+    /// `unsafe` only to match the syscall-table signature.
     pub unsafe extern "C" fn syscall_gpio_set_level(handle: i32, high: u8) -> i32 {
         gpio_set_level(handle, high != 0)
     }
 
     /// Syscall: get input level
+    ///
+    /// # Safety
+    /// `extern "C"` syscall ABI shim. Takes no pointers; marked
+    /// `unsafe` only to match the syscall-table signature.
     pub unsafe extern "C" fn syscall_gpio_get_level(handle: i32) -> i32 {
         gpio_get_level(handle)
     }
@@ -535,8 +562,8 @@ pub mod gpio {
     /// Uses a bitmask to skip pins without edge detection — O(active pins) not O(MAX_GPIO).
     pub fn poll_gpio_edges() {
         unsafe {
-            for word in 0..EDGE_ACTIVE_MASK.len() {
-                let mut mask = EDGE_ACTIVE_MASK[word].load(Ordering::Acquire);
+            for (word, mask_atomic) in EDGE_ACTIVE_MASK.iter().enumerate() {
+                let mut mask = mask_atomic.load(Ordering::Acquire);
                 while mask != 0 {
                     let bit_pos = mask.trailing_zeros() as usize;
                     mask &= mask - 1; // clear lowest set bit

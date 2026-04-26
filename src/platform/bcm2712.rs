@@ -372,9 +372,9 @@ fn debug_drain_poll_core0() {
     // SAFETY: SPSC consumer on log_ring; only called from core 0 in
     // the main loop or during boot before secondary cores wake.
     unsafe {
-        let drain = &mut *(&raw mut DEBUG_DRAIN);
-        let sink = &mut *(&raw mut DEBUG_SINK);
-        drain.poll(sink);
+        let drain_p = &raw mut DEBUG_DRAIN;
+        let sink_p = &raw mut DEBUG_SINK;
+        (*drain_p).poll(&mut *sink_p);
     }
 }
 
@@ -459,12 +459,13 @@ mod mmu {
     // T0SZ=25 → 39-bit VA (512 GB). Translation starts at L1 (no L0 needed).
     // Each L1 entry covers 1 GB. 512 entries covers the full 512 GB space.
     // RP1 BAR at 0x1f_xxxx_xxxx (~133 GB) fits within 512 GB.
+    // TG0 = 0b00 (4KB) is encoded as zero — the bit field is intentionally
+    // omitted from the OR chain so it stays zero without a no-effect shift.
     pub const TCR_VALUE: u64 =
         25                 // T0SZ = 25 → 39-bit VA (512 GB)
         | (0b01 << 8)     // IRGN0: WB-WA
         | (0b01 << 10)    // ORGN0: WB-WA
         | (0b11 << 12)    // SH0: inner shareable
-        | (0b00 << 14)    // TG0: 4KB
         | (1 << 23)       // EPD1: disable TTBR1_EL1 walks (kernel-only, no upper VA)
         | (0b010u64 << 32); // IPS = 0b010 → 40-bit PA (1TB, covers RP1 BAR at 0x1f_xxxx_xxxx)
 
@@ -511,7 +512,8 @@ mod mmu {
     /// Fill the L1 page table with identity mappings.
     /// Must be called before enabling the MMU.
     pub unsafe fn init_page_tables() {
-        let table = &mut *(&raw mut L1_TABLE.0);
+        let l1_ptr = &raw mut L1_TABLE.0;
+        let table = &mut *l1_ptr;
 
         // 0x0_0000_0000 .. 0x0_3FFF_FFFF (1 GB): DRAM with L2 table so
         // the 2 MB blocks enclosing the BSS-backed DMA arenas (NIC ring
@@ -520,7 +522,8 @@ mod mmu {
         // the PCIe1 inbound ATU only covers PCI bus 0..0xFFFFFFFF on
         // Pi 5 (see nvme_trace/baseline/README.md).
         {
-            let l2 = &mut *(&raw mut L2_TABLE_0.0);
+            let l2_ptr = &raw mut L2_TABLE_0.0;
+            let l2 = &mut *l2_ptr;
             // Fill all 512 L2 entries as cacheable DRAM (each 2MB)
             let mut i = 0usize;
             while i < 512 {
@@ -583,7 +586,7 @@ mod mmu {
         table[112] = device_block(0x1c_0000_0000);
         table[113] = device_block(0x1c_4000_0000);
         table[114] = device_block(0x1c_8000_0000);
-        table[115] = device_block(0x1c_C000_0000);
+        table[115] = device_block(0x1c_c000_0000);
 
         // PCIe1 (external x1 slot, NVMe HAT+) outbound MMIO window at
         // 0x18_0000_0000..0x1b_ffff_ffff (16 GB total) — verified
@@ -1645,8 +1648,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     let loader_ref = unsafe { scheduler::static_loader() };
     let sched = unsafe { scheduler::sched_mut() };
     let mut total_mods = 0usize;
-    for module_idx in 0..module_count {
-        let entry = match &module_list[module_idx] {
+    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
+        let entry = match slot {
             Some(e) => e,
             None => continue,
         };
@@ -1887,7 +1890,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 if core_id == 0 { debug_drain_poll_core0(); }
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
-                if tick % 10000 == 0 && tick > 0 {
+                if tick.is_multiple_of(10000) && tick > 0 {
                     log::info!("[sched] alive t={} core={} domain={}", tick, core_id, domain_id);
                 }
                 // Rebuild bridge. On the primary domain, a pending rebuild
@@ -2475,9 +2478,9 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                     *arg.add(6) = 0;
                     *arg.add(7) = 0;
                     let ab = addr.to_le_bytes();
-                    for i in 0..8 { *arg.add(8 + i) = ab[i]; }
+                    for (i, byte) in ab.iter().enumerate() { *arg.add(8 + i) = *byte; }
                     let db = data.to_le_bytes();
-                    for i in 0..4 { *arg.add(16 + i) = db[i]; }
+                    for (i, byte) in db.iter().enumerate() { *arg.add(16 + i) = *byte; }
                     0
                 }
             }
@@ -2505,7 +2508,7 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             // The bound handle tells us which root complex's MSI mux
             // to use. Only PCIe1 is wired today.
             match fluxor::kernel::pcie::bound_device_root(_handle) {
-                None => return fluxor::kernel::errno::EINVAL,
+                None => fluxor::kernel::errno::EINVAL,
                 Some(root) => {
                     use fluxor::kernel::pcie_aliases::PcieRoot;
                     match root {
@@ -2530,9 +2533,9 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                                     *arg.add(6) = 0;
                                     *arg.add(7) = 0;
                                     let ab = addr.to_le_bytes();
-                                    for i in 0..8 { *arg.add(8 + i) = ab[i]; }
+                                    for (i, byte) in ab.iter().enumerate() { *arg.add(8 + i) = *byte; }
                                     let db = data.to_le_bytes();
-                                    for i in 0..4 { *arg.add(16 + i) = db[i]; }
+                                    for (i, byte) in db.iter().enumerate() { *arg.add(16 + i) = *byte; }
                                     0
                                 }
                             }
@@ -2631,7 +2634,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     init_gpio: |_| 0, // no GPIO init on aarch64 (handled by PIC modules)
     csprng_fill: bcm_csprng_fill,
     core_id: || current_core_id() as usize,
-    irq_bind: irq_bind,
+    irq_bind,
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000
@@ -2639,7 +2642,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
 #[cfg(feature = "board-cm5")]
 const RNG200_BASE: usize = 0x10_7d20_8000;
 #[cfg(feature = "board-cm5")]
-const RNG200_CTRL: *mut u32 = (RNG200_BASE + 0x00) as *mut u32;
+const RNG200_CTRL: *mut u32 = RNG200_BASE as *mut u32;
 #[cfg(feature = "board-cm5")]
 #[allow(dead_code)]
 const RNG200_STATUS: *const u32 = (RNG200_BASE + 0x04) as *const u32;

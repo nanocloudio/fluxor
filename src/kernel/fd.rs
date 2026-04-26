@@ -16,7 +16,7 @@
 //! `fd_poll` provides non-destructive (peek) readiness checks across all handle types.
 //! Modules use `fd_poll` for readiness, then the per-type API for consumption.
 
-use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use portable_atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use crate::kernel::channel::{self, POLL_IN};
 use crate::kernel::errno;
@@ -26,27 +26,27 @@ use crate::kernel::hal;
 // Tag constants
 // ============================================================================
 
-pub const FD_TAG_CHANNEL:     i32 = 0;
-pub const FD_TAG_EVENT:       i32 = 2;
-pub const FD_TAG_TIMER:       i32 = 3;
-pub const FD_TAG_DMA:         i32 = 7;
-pub const FD_TAG_BRIDGE:      i32 = 8;
-pub const FD_TAG_KEY_VAULT:   i32 = 9;
+pub const FD_TAG_CHANNEL: i32 = 0;
+pub const FD_TAG_EVENT: i32 = 2;
+pub const FD_TAG_TIMER: i32 = 3;
+pub const FD_TAG_DMA: i32 = 7;
+pub const FD_TAG_BRIDGE: i32 = 8;
+pub const FD_TAG_KEY_VAULT: i32 = 9;
 pub const FD_TAG_PCIE_DEVICE: i32 = 10;
-pub const FD_TAG_NIC_RING:    i32 = 11;
+pub const FD_TAG_NIC_RING: i32 = 11;
 pub const FD_TAG_DMA_CHANNEL: i32 = 12;
-pub const FD_TAG_FS:          i32 = 13;
-pub const FD_TAG_BUFFER:      i32 = 14;
+pub const FD_TAG_FS: i32 = 13;
+pub const FD_TAG_BUFFER: i32 = 14;
 /// HAL contract tags. Applied by the kernel vtable wrapper on the
 /// open-op return, stripped on inbound dispatch — PIC module
 /// providers always see the raw slot.
-pub const FD_TAG_HAL_GPIO:    i32 = 15;
-pub const FD_TAG_HAL_SPI:     i32 = 16;
-pub const FD_TAG_HAL_I2C:     i32 = 17;
-pub const FD_TAG_HAL_UART:    i32 = 18;
-pub const FD_TAG_HAL_ADC:     i32 = 19;
-pub const FD_TAG_HAL_PWM:     i32 = 20;
-pub const FD_TAG_HAL_PIO:     i32 = 21;
+pub const FD_TAG_HAL_GPIO: i32 = 15;
+pub const FD_TAG_HAL_SPI: i32 = 16;
+pub const FD_TAG_HAL_I2C: i32 = 17;
+pub const FD_TAG_HAL_UART: i32 = 18;
+pub const FD_TAG_HAL_ADC: i32 = 19;
+pub const FD_TAG_HAL_PWM: i32 = 20;
+pub const FD_TAG_HAL_PIO: i32 = 21;
 
 const TAG_SHIFT: u32 = 26;
 const SLOT_MASK: i32 = 0x03FF_FFFF;
@@ -115,15 +115,15 @@ fn now_ms() -> u32 {
 /// Returns tagged fd or negative errno.
 pub fn timer_create() -> i32 {
     let owner = crate::kernel::scheduler::current_module_index() as u8;
-    for i in 0..MAX_TIMERS {
-        if TIMER_SLOTS[i]
+    for (i, timer) in TIMER_SLOTS.iter().enumerate() {
+        if timer
             .allocated
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            TIMER_SLOTS[i].active.store(false, Ordering::Release);
-            TIMER_SLOTS[i].owner.store(owner, Ordering::Release);
-            TIMER_SLOTS[i].deadline_ms.store(0, Ordering::Release);
+            timer.active.store(false, Ordering::Release);
+            timer.owner.store(owner, Ordering::Release);
+            timer.deadline_ms.store(0, Ordering::Release);
             return tag_fd(FD_TAG_TIMER, i as i32);
         }
     }
@@ -194,8 +194,7 @@ fn timer_is_expired(slot: i32) -> bool {
 
 /// Release all timer slots owned by a specific module. Called on module finish.
 pub fn release_timers_owned_by(module_idx: u8) {
-    for i in 0..MAX_TIMERS {
-        let timer = &TIMER_SLOTS[i];
+    for timer in TIMER_SLOTS.iter() {
         if !timer.allocated.load(Ordering::Acquire) {
             continue;
         }
@@ -222,7 +221,9 @@ static mut DMA_FD_POLL_FN: Option<fn(i32) -> bool> = None;
 
 /// Register a platform DMA FD poll function (called from platform init).
 pub fn register_dma_fd_poll(f: fn(i32) -> bool) {
-    unsafe { DMA_FD_POLL_FN = Some(f); }
+    unsafe {
+        DMA_FD_POLL_FN = Some(f);
+    }
 }
 
 // ============================================================================
@@ -279,8 +280,15 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
         FD_TAG_BRIDGE => {
             let mut ready = 0u32;
             if (ev & POLL_IN) != 0 {
-                let poll = crate::kernel::bridge::bridge_dispatch(slot as usize, 2, core::ptr::null_mut(), 0);
-                if poll > 0 { ready |= POLL_IN; }
+                let poll = crate::kernel::bridge::bridge_dispatch(
+                    slot as usize,
+                    2,
+                    core::ptr::null_mut(),
+                    0,
+                );
+                if poll > 0 {
+                    ready |= POLL_IN;
+                }
             }
             ready as i32
         }

@@ -8,10 +8,10 @@
 // (if present) override with user values using the correct SR.
 
 use super::constants::*;
-use super::state::SynthState;
-use super::{p_u8, p_u16, p_u32};
 use super::params::ms_to_env_rate;
+use super::state::SynthState;
 use super::SCHEMA_MAX;
+use super::{p_u16, p_u32, p_u8};
 
 define_params! {
     SynthState;

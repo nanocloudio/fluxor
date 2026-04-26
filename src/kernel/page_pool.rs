@@ -4,7 +4,6 @@
 //! tracking its owner, state, virtual page index, and LRU counter.
 //! Eviction uses the clock (second-chance) algorithm.
 
-
 /// Page size in bytes (4KB, matching AArch64 granule).
 pub const PAGE_SIZE: usize = 4096;
 
@@ -117,6 +116,12 @@ pub struct PagePool {
     clock_hand: usize,
     /// Whether the pool has been initialized.
     initialized: bool,
+}
+
+impl Default for PagePool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PagePool {
@@ -349,9 +354,7 @@ impl PagePool {
         let mut count = 0;
         let mut i = 0;
         while i < self.page_count {
-            if self.descriptors[i].owner_module == module_idx
-                && self.descriptors[i].is_mapped()
-            {
+            if self.descriptors[i].owner_module == module_idx && self.descriptors[i].is_mapped() {
                 count += 1;
             }
             i += 1;
@@ -364,9 +367,7 @@ impl PagePool {
         let mut count = 0;
         let mut i = 0;
         while i < self.page_count {
-            if self.descriptors[i].owner_module == module_idx
-                && self.descriptors[i].is_dirty()
-            {
+            if self.descriptors[i].owner_module == module_idx && self.descriptors[i].is_dirty() {
                 count += 1;
             }
             i += 1;
@@ -429,7 +430,9 @@ fn pool() -> *mut PagePool {
 
 /// Initialize the global page pool.
 pub fn pool_init(base_addr: usize, page_count: usize) {
-    unsafe { (*pool()).init(base_addr, page_count); }
+    unsafe {
+        (*pool()).init(base_addr, page_count);
+    }
 }
 
 /// Allocate a page for a module.
@@ -439,7 +442,9 @@ pub fn pool_alloc(module_idx: u8) -> Option<usize> {
 
 /// Free a page.
 pub fn pool_free(page_idx: usize) {
-    unsafe { (*pool()).free(page_idx); }
+    unsafe {
+        (*pool()).free(page_idx);
+    }
 }
 
 /// Evict using clock algorithm, preferring pages from the given module.
@@ -449,22 +454,30 @@ pub fn pool_evict_clock(module_idx: u8) -> Option<usize> {
 
 /// Mark a page as mapped after loading.
 pub fn pool_mark_mapped(page_idx: usize, vpage_idx: u32) {
-    unsafe { (*pool()).mark_mapped(page_idx, vpage_idx); }
+    unsafe {
+        (*pool()).mark_mapped(page_idx, vpage_idx);
+    }
 }
 
 /// Mark a page as dirty.
 pub fn pool_mark_dirty(page_idx: usize) {
-    unsafe { (*pool()).mark_dirty(page_idx); }
+    unsafe {
+        (*pool()).mark_dirty(page_idx);
+    }
 }
 
 /// Mark a page as accessed.
 pub fn pool_mark_accessed(page_idx: usize) {
-    unsafe { (*pool()).mark_accessed(page_idx); }
+    unsafe {
+        (*pool()).mark_accessed(page_idx);
+    }
 }
 
 /// Free all pages for a module.
 pub fn pool_free_module(module_idx: u8) {
-    unsafe { (*pool()).free_module_pages(module_idx); }
+    unsafe {
+        (*pool()).free_module_pages(module_idx);
+    }
 }
 
 /// Count resident pages for a module.
@@ -514,15 +527,26 @@ pub fn pool_descriptor(page_idx: usize) -> PageDescriptor {
 
 /// Pin a page.
 pub fn pool_pin(page_idx: usize) {
-    unsafe { (*pool()).pin(page_idx); }
+    unsafe {
+        (*pool()).pin(page_idx);
+    }
 }
 
 /// Unpin a page.
 pub fn pool_unpin(page_idx: usize) {
-    unsafe { (*pool()).unpin(page_idx); }
+    unsafe {
+        (*pool()).unpin(page_idx);
+    }
 }
 
 /// Get mutable reference to the global pool (for pager use).
+///
+/// # Safety
+/// Returns an aliasing `&mut` to the static `POOL`. Caller must ensure
+/// no other reference to `POOL` is live for the returned reference's
+/// lifetime — in practice this is only sound from the pager / kernel
+/// init path running on the boot core before any module is stepped.
 pub unsafe fn pool_mut() -> &'static mut PagePool {
-    &mut *(&raw mut POOL)
+    let p = &raw mut POOL;
+    &mut *p
 }
