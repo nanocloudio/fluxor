@@ -18,7 +18,7 @@ hardware_targets = ["rp2350"]
 [[ports]]
 name = "pixels"
 direction = "input"
-content_type = "ImageRaw"
+content_type = "VideoRaster"
 required = false
 
 [[resources]]

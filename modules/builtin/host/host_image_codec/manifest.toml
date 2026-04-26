@@ -11,7 +11,7 @@ required = true
 [[ports]]
 name = "pixels"
 direction = "output"
-content_type = "ImageRaw"
+content_type = "VideoRaster"
 required = true
 
 [[params]]

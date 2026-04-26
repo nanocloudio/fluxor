@@ -1,11 +1,14 @@
 version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
+# Host display: file mode is a sink for raster; window mode adds scanout.
+# Reports both since the actual mode is selected by `mode` param.
+capabilities = ["video.raster", "video.scanout", "display.scanout", "presentation.clock"]
 
 [[ports]]
 name = "pixels"
 direction = "input"
-content_type = "ImageRaw"
+content_type = "VideoRaster"
 required = true
 
 [[params]]

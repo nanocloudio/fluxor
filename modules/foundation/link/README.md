@@ -17,12 +17,12 @@ hardware_targets = ["rp2350"]
 [[ports]]
 name = "audio_in"
 direction = "input"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 
 [[ports]]
 name = "audio_out"
 direction = "output"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 
 [[ports]]
 name = "ctrl_fwd"

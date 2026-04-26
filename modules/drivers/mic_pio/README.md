@@ -17,7 +17,7 @@ hardware_targets = ["rp2350"]
 [[ports]]
 name = "audio"
 direction = "output"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 
 [[resources]]
 requires_contract = "pio"

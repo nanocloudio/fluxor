@@ -31,18 +31,35 @@ pub const MANIFEST_HEADER_SIZE: usize = 16;
 pub const SIGNATURE_BLOCK_SIZE: usize = 96;
 
 // ── Content type string→u8 mapping (matches config.rs CONTENT_TYPES) ────────
+//
+// Position in this table is the on-wire content_type byte; appending is
+// always safe, reordering is not. Manifest authors reference these names
+// in `[[ports]].content_type`.
+//
+// AV surface family:
+//   - AudioSample  — decoded sample-domain audio
+//   - AudioEncoded — codec-domain audio access units (Opus/MP3/AAC/G.711/...)
+//   - VideoEncoded — codec-domain video access units (H.264/H.265/AV1/...)
+//   - VideoDraw    — retained/replayable draw lists (UI, browser, dashboards)
+//   - VideoRaster  — pixel-domain frames
+//   - VideoScanout — present-ready output to a paced display sink
+//   - MediaMuxed   — deliberate combined AV/timing/container streams
+//
+// AudioOpus / AudioMp3 / AudioAac / ImageJpeg / ImagePng are codec-tagged
+// variants kept distinct from the generic AudioEncoded / VideoEncoded
+// surfaces so `content_type` can carry codec identity without sideband.
 
 const CONTENT_TYPES: &[&str] = &[
     "OctetStream",
     "Cbor",
     "Json",
-    "AudioPcm",
+    "AudioSample",
     "AudioOpus",
     "AudioMp3",
     "AudioAac",
     "TextPlain",
     "TextHtml",
-    "ImageRaw",
+    "VideoRaster",
     "ImageJpeg",
     "ImagePng",
     "MeshEvent",
@@ -54,6 +71,11 @@ const CONTENT_TYPES: &[&str] = &[
     "FmpMessage",
     "EthernetFrame",
     "HciMessage",
+    "AudioEncoded",
+    "VideoEncoded",
+    "VideoDraw",
+    "VideoScanout",
+    "MediaMuxed",
 ];
 
 fn content_type_from_str(s: &str) -> Result<u8> {
@@ -142,6 +164,67 @@ fn contract_name_to_str(class: u8) -> &'static str {
         0x12 => "pcie_device",
         _ => "unknown",
     }
+}
+
+/// Whitelist of AV / presentation capability names accepted in a
+/// manifest's top-level `capabilities = [...]` list. Two tiers:
+/// hardware-facing (the role the module plays — paced scanout, group
+/// clock, protected output) and service-level (the surface a producer
+/// or consumer carries). Unknown names are rejected at parse time so
+/// `display.scaneout` and friends fail the build rather than silently
+/// dropping out.
+///
+/// Documented in `docs/architecture/av_capability_surface.md`.
+const AV_CAPABILITY_NAMES: &[&str] = &[
+    // Hardware-facing
+    "display.scanout",
+    "display.multihead",
+    "display.protected_scanout",
+    "video.decode",
+    "video.encode",
+    "video.protected_decode",
+    "audio.protected_out",
+    "audio.rate_trim",
+    "gpu.render",
+    "presentation.clock",
+    // Service-level (mirror the canonical content-type surface family)
+    "audio.sample",
+    "audio.encoded",
+    "video.encoded",
+    "video.draw",
+    "video.raster",
+    "video.scanout",
+    "media.muxed",
+    "media.protected_path",
+    "presentation.group",
+];
+
+/// Validate capability names against the whitelist and canonicalize each
+/// entry to its lowercase form in place. Downstream consumers — the
+/// presentation-group validator, telemetry, doc dumps — can then use
+/// exact string comparison instead of paying for case-insensitive
+/// matching at every callsite.
+fn validate_capability_names(caps: &mut [String]) -> Result<()> {
+    for c in caps {
+        match AV_CAPABILITY_NAMES
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(c))
+        {
+            Some(canonical) => {
+                if c.as_str() != *canonical {
+                    *c = canonical.to_string();
+                }
+            }
+            None => {
+                return Err(Error::Module(format!(
+                    "unknown capability `{}`. Expected one of: {}.",
+                    c,
+                    AV_CAPABILITY_NAMES.join(", "),
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn access_mode_from_str(s: &str) -> Result<u8> {
@@ -389,6 +472,12 @@ pub struct Manifest {
     /// binary format). Used by the config resolver to wire dependencies by
     /// service name (e.g. `pwm_rp` provides `"pwm"`).
     pub provides: Vec<String>,
+    /// AV / presentation capabilities this module declares (parsed from
+    /// TOML, not serialized to the binary `.fmod`). The whitelist lives
+    /// in `AV_CAPABILITY_NAMES`; the config validator consults this
+    /// field to enforce presentation-group rules. See
+    /// `docs/architecture/av_capability_surface.md`.
+    pub capabilities: Vec<String>,
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
     pub builtin: bool,
@@ -413,6 +502,7 @@ impl Default for Manifest {
             signer_fp: None,
             commands: CommandVocabulary::default(),
             provides: Vec::new(),
+            capabilities: Vec::new(),
             builtin: false,
             params: Vec::new(),
         }
@@ -626,6 +716,8 @@ impl Manifest {
         };
 
         let provides = toml_val.provides.unwrap_or_default();
+        let mut capabilities = toml_val.capabilities.unwrap_or_default();
+        validate_capability_names(&mut capabilities)?;
 
         let builtin = toml_val.builtin.unwrap_or(false);
 
@@ -788,6 +880,7 @@ impl Manifest {
             signer_fp: None,
             commands,
             provides,
+            capabilities,
             builtin,
             params,
         })
@@ -1005,6 +1098,7 @@ impl Manifest {
             signer_fp,
             commands: CommandVocabulary::default(),
             provides: Vec::new(), // not serialized in binary format
+            capabilities: Vec::new(), // not serialized in binary format
             builtin: false,
             params: Vec::new(), // toml-only, not serialized
         })
@@ -1125,6 +1219,9 @@ struct TomlManifest {
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
     provides: Option<Vec<String>>,
+    /// AV / presentation capability strings. Whitelisted by
+    /// `AV_CAPABILITY_NAMES`; validated and canonicalized at parse time.
+    capabilities: Option<Vec<String>>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,
     /// `[[params]]` declarations — built-in modules only. PIC modules

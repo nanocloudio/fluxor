@@ -10,9 +10,9 @@ required = true
 [[ports]]
 name = "audio"
 direction = "output"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 
 [[ports]]
 name = "pixels"
 direction = "output"
-content_type = "OctetStream"
+content_type = "VideoRaster"

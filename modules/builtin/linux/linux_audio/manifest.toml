@@ -1,11 +1,13 @@
 version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
+# Host playback can act as a sink-authored clock under `playback` mode.
+capabilities = ["audio.sample", "presentation.clock"]
 
 [[ports]]
 name = "audio"
 direction = "input"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 required = true
 
 [[params]]

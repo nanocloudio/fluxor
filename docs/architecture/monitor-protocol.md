@@ -135,6 +135,75 @@ Operators grep `MON_SESSION ... session=44454d4f2d413031000000000000000a`
 to follow one session's lifecycle across anchor / worker / directory
 emitters.
 
+### `MON_PRESENTATION`
+
+AV presentation-group observability. Emitted by clock authorities,
+presentation anchors, and group coordinators on every state change so
+operators can trace lip-sync drift, sink join / leave, anchor rebind,
+and missed present / audio boundaries on the same telemetry channel as
+session continuity.
+
+The line format is part of the public observability surface defined by
+`architecture/av_capability_surface.md`. Implementing modules emit one
+line per state transition.
+
+```
+MON_PRESENTATION mod=<idx> event=<e> group=<id> [member=<name>] [authority=<name>] [latency_ms=<n>] [skew_us=<n>] [epoch=<n>] [reason=<r>] [status=<s>]
+```
+
+| Field        | Meaning                                                                       |
+|--------------|-------------------------------------------------------------------------------|
+| `mod`        | Module index of the emitter (clock authority, anchor, or coordinator).        |
+| `event`      | Transition label; see event table below.                                      |
+| `group`      | `presentation_group.id` from YAML config (e.g. `living_room`).                |
+| `member`     | Module name of the member the event applies to. Omit for whole-group events.  |
+| `authority`  | Module name of the current clock authority. Present on `epoch_advance`.       |
+| `latency_ms` | Group latency budget consumed; reported on `latency_report`.                  |
+| `skew_us`    | Inter-member skew in microseconds; reported on `skew_report`.                 |
+| `epoch`      | Presentation epoch as decimal u32. Bumps on cutover.                          |
+| `reason`     | Cause; e.g. `cutover`, `clock_loss`, `member_drop`, `degraded_mode`.          |
+| `status`     | Status code; e.g. `ok`, `underflow`, `overflow`, `missed_present`.            |
+
+#### Events
+
+| Event             | Emitter(s)         | When                                                                       |
+|-------------------|--------------------|----------------------------------------------------------------------------|
+| `group_active`    | coordinator/anchor | Group reached steady state. `authority=<name>`.                            |
+| `member_joined`   | coordinator        | Sink admitted into group. `member=<name>`.                                 |
+| `member_left`     | coordinator        | Sink departed (planned or fault). `member=<name> reason=<r>`.              |
+| `epoch_advance`   | clock authority    | Presentation epoch bumped at a media boundary. `epoch=<n> reason=cutover`. |
+| `anchor_rebind`   | anchor             | Stable sink attachment moved (anchor-preserved continuity).                |
+| `clock_lost`      | clock authority    | Authority lost timing reference. `reason=clock_loss`.                      |
+| `clock_recovered` | clock authority    | Authority regained timing.                                                 |
+| `latency_report`  | any                | Periodic latency report; `latency_ms=<n>`.                                 |
+| `skew_report`     | coordinator        | Periodic inter-member skew report; `skew_us=<n>`.                          |
+| `underflow`       | sink               | Sink starved at the boundary. `status=underflow`.                          |
+| `overflow`        | sink               | Sink dropped frames/samples. `status=overflow`.                            |
+| `missed_present`  | scanout sink       | Frame missed its target vsync. `status=missed_present`.                    |
+| `degraded_mode`   | coordinator        | Group entered/left degraded mode. `reason=<r> status=<s>`.                 |
+
+Reasons (for emit/report cleanliness): `cutover`, `clock_loss`,
+`member_drop`, `degraded_mode`, `member_recovered`, `protected_required`,
+`format_change`.
+
+Status codes: `ok`, `underflow`, `overflow`, `missed_present`,
+`drift_corrected`, `protected_denied`.
+
+#### Example
+
+```
+MON_PRESENTATION mod=2 event=group_active group=living_room authority=hdmi_audio
+MON_PRESENTATION mod=4 event=member_joined group=living_room member=lcd_panel
+MON_PRESENTATION mod=2 event=epoch_advance group=living_room epoch=4 reason=cutover
+MON_PRESENTATION mod=4 event=skew_report group=living_room skew_us=320
+MON_PRESENTATION mod=4 event=underflow group=living_room member=hdmi_audio status=underflow
+```
+
+Operators grep `MON_PRESENTATION ... group=living_room` to follow one
+group's lifecycle across emitters. The format is forward-compatible —
+unknown event names and unknown keys are ignored, so new transitions can
+be added without breaking older monitor builds.
+
 ## Kernel support
 
 - `FAULT_MONITOR_SUBSCRIBE` (`0x0C52`) — bind an event handle that the

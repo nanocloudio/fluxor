@@ -16,7 +16,7 @@ content_type = "OctetStream"
 name = "mic"
 index = 2
 direction = "input"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 
 [[ports]]
 name = "sip_net_out"
@@ -33,7 +33,7 @@ content_type = "OctetStream"
 name = "audio"
 index = 2
 direction = "output"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 required = true
 
 [[ports]]

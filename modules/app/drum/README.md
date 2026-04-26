@@ -22,7 +22,7 @@ content_type = "OctetStream"
 [[ports]]
 name = "audio"
 direction = "output"
-content_type = "AudioPcm"
+content_type = "AudioSample"
 required = true
 ```
 

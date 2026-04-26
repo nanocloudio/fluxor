@@ -193,11 +193,11 @@ class MeshBridge : public Object {
   "device_uuid": "11111111-1111-1111-1111-111111111111",
   "device_name": "pico-living-room",
   "sources": [
-    {"type": "Playlist", "id": 0, "content_type": "AudioPcm",
+    {"type": "Playlist", "id": 0, "content_type": "AudioSample",
      "directory": "/audio", "mode": 2, "auto_start": true}
   ],
   "sinks": [
-    {"type": "I2sOutput", "id": 0, "content_type": "AudioPcm",
+    {"type": "I2sOutput", "id": 0, "content_type": "AudioSample",
      "data_pin": 9, "clock_pin_base": 10, "bits": 16, "sample_rate": 44100}
   ],
   "pipelines": [
@@ -207,7 +207,7 @@ class MeshBridge : public Object {
     {
       "uuid": "550e8400-e29b-41d4-a716-446655440000",
       "name": "speaker",
-      "accepts": [{"content_type": "AudioPcm", "pipeline_id": 0}],
+      "accepts": [{"content_type": "AudioSample", "pipeline_id": 0}],
       "emits": [{"content_type": "MeshState", "pipeline_id": 0}],
       "enabled": true
     }
@@ -418,7 +418,7 @@ Each object has its own identity for addressing and capability management. Devic
 **Rationale:** Events are the universal transport mechanism. The `content_type` field describes how to interpret the payload bytes. `MeshCommand` means "this payload is a command to be executed." `MeshEvent` means "this payload is a mesh-native event notification."
 
 This separation allows:
-- Audio data to flow as Events with `content_type: AudioPcm`
+- Audio data to flow as Events with `content_type: AudioSample`
 - Commands to flow as Events with `content_type: MeshCommand`
 - Same transport, different semantics
 
@@ -434,7 +434,7 @@ struct ContentBinding {
 ```
 
 **Rationale:** This bridges the mesh abstraction to fluxor's hardware pipeline system. When an object "accepts audio/pcm", it means:
-1. Incoming Events with `content_type: AudioPcm` are valid
+1. Incoming Events with `content_type: AudioSample` are valid
 2. The data is routed to `pipeline_id` for processing
 3. That pipeline connects to hardware (I2S sink, etc.)
 

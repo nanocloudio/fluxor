@@ -1389,7 +1389,36 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         target_desc.display_name()
     );
 
-    let result = board::validate_config(&config, &target_desc)?;
+    let mut result = board::validate_config(&config, &target_desc)?;
+
+    // Validate the `presentation_groups` block here as well as in the
+    // build path so `fluxor validate` catches authority / multihead /
+    // protected-path errors without compiling. The module-search dirs
+    // mirror `cmd_build`'s derivation so a project-local manifest
+    // reachable from `fluxor build` is also reachable from `fluxor
+    // validate`.
+    if let Some(modules) = config.get("modules") {
+        let module_names: Vec<String> = modules
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let extra_modules_dir = config_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("modules"));
+        let extra_dirs: Vec<&std::path::Path> =
+            extra_modules_dir.iter().map(|p| p.as_path()).collect();
+        let manifests = crate::config::load_module_manifests_with_extra(modules, &extra_dirs);
+        if let Err(e) =
+            crate::config::validate_presentation_groups(&config, &module_names, &manifests)
+        {
+            result.add_error(e.to_string());
+        }
+    }
 
     // Print warnings (yellow)
     for warning in &result.warnings {

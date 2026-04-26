@@ -389,7 +389,7 @@ Modules exchange data through named ports declared in each module manifest.
 ### Content Contracts
 
 Port `content_type` is the semantic contract for graph wiring and validation.
-Examples include `OctetStream`, `AudioPcm`, `ImageRaw`, and `FmpMessage`.
+Examples include `OctetStream`, `AudioSample`, `VideoRaster`, and `FmpMessage`.
 
 The runtime transports bytes, while config-time validation enforces type compatibility.
 

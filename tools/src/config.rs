@@ -80,17 +80,21 @@ const TRANSFORMER_TYPES: &[&str] = &[
     "Digest",
 ];
 
+// Mirror of `tools/src/manifest.rs::CONTENT_TYPES`. Used here only for
+// human-readable rendering when decoding compiled-config dumps. Stays
+// positionally identical to the manifest table — content_type IDs are
+// the on-wire byte; appending here is safe, reordering is not.
 const CONTENT_TYPES: &[&str] = &[
     "OctetStream",
     "Cbor",
     "Json",
-    "AudioPcm",
+    "AudioSample",
     "AudioOpus",
     "AudioMp3",
     "AudioAac",
     "TextPlain",
     "TextHtml",
-    "ImageRaw",
+    "VideoRaster",
     "ImageJpeg",
     "ImagePng",
     "MeshEvent",
@@ -99,6 +103,14 @@ const CONTENT_TYPES: &[&str] = &[
     "MeshHandle",
     "InputEvent",
     "GestureMatch",
+    "FmpMessage",
+    "EthernetFrame",
+    "HciMessage",
+    "AudioEncoded",
+    "VideoEncoded",
+    "VideoDraw",
+    "VideoScanout",
+    "MediaMuxed",
 ];
 
 const INPUT_CONTROL_TYPES: &[&str] = &["Button", "Range"];
@@ -2114,6 +2126,253 @@ fn validate_wiring_types(
     Ok(())
 }
 
+const CUTOVER_POLICIES: &[&str] = &["boundary_cut", "resumable", "anchor_preserved"];
+const CONTINUITY_POLICIES: &[&str] = &["drain", "anchor_preserved"];
+const MIRROR_POLICIES: &[&str] = &["independent", "strict_mirror", "partition"];
+const AUDIO_SINK_CAPS: &[&str] = &["audio.sample", "audio.encoded"];
+const VIDEO_SINK_CAPS: &[&str] = &["video.raster", "video.scanout", "video.encoded"];
+const VIDEO_PROTECTED_CAPS: &[&str] =
+    &["display.protected_scanout", "video.protected_decode"];
+
+/// Maximum value (in ms) accepted for `latency_budget_ms` /
+/// `skew_budget_ms`. Beyond this the value almost certainly indicates a
+/// unit confusion (microseconds, frames) rather than an honest budget.
+const MAX_PRESENTATION_BUDGET_MS: u64 = 10_000;
+
+fn json_kind(v: &Value) -> &'static str {
+    if v.is_string() {
+        "string"
+    } else if v.is_number() {
+        "number"
+    } else if v.is_boolean() {
+        "boolean"
+    } else if v.is_null() {
+        "null"
+    } else if v.is_array() {
+        "array"
+    } else {
+        "object"
+    }
+}
+
+fn check_enum(field: &str, value: &str, allowed: &[&str], group_id: &str) -> Result<()> {
+    if !allowed.contains(&value) {
+        return Err(Error::Config(format!(
+            "presentation_group `{}`: {} `{}` is invalid (expected {})",
+            group_id,
+            field,
+            value,
+            allowed.join(" | ")
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the optional top-level `presentation_groups` block. Members,
+/// clock authority, and policy fields are checked against the manifest
+/// capabilities of each named module. Presentation groups are
+/// compile-time only — there is no binary representation in the
+/// compiled config.
+///
+/// Schema and capability semantics live in
+/// `docs/architecture/av_capability_surface.md`. In short:
+///
+/// ```yaml
+/// presentation_groups:
+///   - id: living_room
+///     clock_authority: hdmi_audio
+///     members: [hdmi_audio, lcd_panel]
+///     latency_budget_ms: 40
+///     skew_budget_ms: 8
+///     cutover_policy: boundary_cut
+///     continuity_policy: drain
+///     mirror_policy: independent
+///     protected: false
+///     multihead: false
+/// ```
+pub fn validate_presentation_groups(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    let groups = match config.get("presentation_groups") {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let list = groups
+        .as_array()
+        .ok_or_else(|| Error::Config("presentation_groups must be a list".into()))?;
+
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (gi, g) in list.iter().enumerate() {
+        let id = g
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "presentation_groups[{}]: required field `id` missing",
+                    gi
+                ))
+            })?
+            .to_string();
+        if !seen_ids.insert(id.clone()) {
+            return Err(Error::Config(format!(
+                "presentation_groups: duplicate id `{}`",
+                id
+            )));
+        }
+
+        let clock_authority = g
+            .get("clock_authority")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "presentation_group `{}`: required field `clock_authority` missing",
+                    id
+                ))
+            })?
+            .to_string();
+
+        let members_raw = g
+            .get("members")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "presentation_group `{}`: required field `members` missing",
+                    id
+                ))
+            })?;
+        let mut members: Vec<String> = Vec::with_capacity(members_raw.len());
+        for (mi, raw) in members_raw.iter().enumerate() {
+            let s = raw.as_str().ok_or_else(|| {
+                Error::Config(format!(
+                    "presentation_group `{}`: members[{}] must be a string (got {})",
+                    id,
+                    mi,
+                    json_kind(raw)
+                ))
+            })?;
+            members.push(s.to_string());
+        }
+        if members.is_empty() {
+            return Err(Error::Config(format!(
+                "presentation_group `{}`: `members` is empty",
+                id
+            )));
+        }
+        for m in &members {
+            if !module_names.iter().any(|n| n == m) {
+                return Err(Error::Config(format!(
+                    "presentation_group `{}`: unknown member `{}`",
+                    id, m
+                )));
+            }
+        }
+        if !members.iter().any(|m| m == &clock_authority) {
+            return Err(Error::Config(format!(
+                "presentation_group `{}`: clock_authority `{}` is not in members {:?}",
+                id, clock_authority, members
+            )));
+        }
+
+        let manifest_caps = |name: &str| -> &[String] {
+            manifests
+                .get(name)
+                .map(|m| m.capabilities.as_slice())
+                .unwrap_or(&[])
+        };
+        let has_cap =
+            |caps: &[String], wanted: &str| -> bool { caps.iter().any(|c| c == wanted) };
+        let has_any_cap = |caps: &[String], wanted: &[&str]| -> bool {
+            caps.iter().any(|c| wanted.contains(&c.as_str()))
+        };
+
+        if !has_cap(manifest_caps(&clock_authority), "presentation.clock") {
+            return Err(Error::Config(format!(
+                "presentation_group `{}`: clock_authority `{}` does not declare \
+                 capability `presentation.clock` (add it to the module's manifest, \
+                 or pick an authority that does)",
+                id, clock_authority
+            )));
+        }
+
+        if let Some(cp) = g.get("cutover_policy").and_then(|v| v.as_str()) {
+            check_enum("cutover_policy", cp, CUTOVER_POLICIES, &id)?;
+        }
+        if let Some(cp) = g.get("continuity_policy").and_then(|v| v.as_str()) {
+            check_enum("continuity_policy", cp, CONTINUITY_POLICIES, &id)?;
+        }
+        if let Some(mp) = g.get("mirror_policy").and_then(|v| v.as_str()) {
+            check_enum("mirror_policy", mp, MIRROR_POLICIES, &id)?;
+        }
+
+        // Protected playback: every audio sink must declare
+        // `audio.protected_out`; every video sink must declare either
+        // `display.protected_scanout` or `video.protected_decode`. A
+        // protected path is end-to-end or it isn't a protected path.
+        if g.get("protected").and_then(|v| v.as_bool()).unwrap_or(false) {
+            for m in &members {
+                let caps = manifest_caps(m);
+                if has_any_cap(caps, AUDIO_SINK_CAPS)
+                    && !has_cap(caps, "audio.protected_out")
+                {
+                    return Err(Error::Config(format!(
+                        "presentation_group `{}`: protected=true but audio member \
+                         `{}` does not declare `audio.protected_out`",
+                        id, m
+                    )));
+                }
+                if has_any_cap(caps, VIDEO_SINK_CAPS)
+                    && !has_any_cap(caps, VIDEO_PROTECTED_CAPS)
+                {
+                    return Err(Error::Config(format!(
+                        "presentation_group `{}`: protected=true but video member \
+                         `{}` does not declare `display.protected_scanout` or \
+                         `video.protected_decode`",
+                        id, m
+                    )));
+                }
+            }
+        }
+
+        // Multihead: at least two members must be independently bindable
+        // paced display outputs.
+        if g.get("multihead").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let scanout_count = members
+                .iter()
+                .filter(|m| has_cap(manifest_caps(m), "display.scanout"))
+                .count();
+            if scanout_count < 2 {
+                return Err(Error::Config(format!(
+                    "presentation_group `{}`: multihead=true but only {} member(s) \
+                     declare `display.scanout` (need ≥2)",
+                    id, scanout_count
+                )));
+            }
+        }
+
+        for k in &["latency_budget_ms", "skew_budget_ms"] {
+            if let Some(v) = g.get(*k) {
+                let n = v.as_u64().ok_or_else(|| {
+                    Error::Config(format!(
+                        "presentation_group `{}`: `{}` must be an unsigned integer (ms)",
+                        id, k
+                    ))
+                })?;
+                if n > MAX_PRESENTATION_BUDGET_MS {
+                    return Err(Error::Config(format!(
+                        "presentation_group `{}`: `{}` = {} ms exceeds the {} ms \
+                         sanity bound (typical lip-sync budgets are ≤ 100 ms)",
+                        id, k, n, MAX_PRESENTATION_BUDGET_MS
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compose a clear "unknown module in wiring" error. For logical sink
 /// names that the platform stack would normally provide, hint at the
 /// missing `platform.<stack>:` block instead of leaving the developer
@@ -2689,6 +2948,8 @@ fn generate_config_impl(
         &from_specs,
         &to_specs,
     )?;
+
+    validate_presentation_groups(config, &module_names, &manifests)?;
 
     if edges.len() > MAX_GRAPH_EDGES {
         return Err(Error::Config(format!(

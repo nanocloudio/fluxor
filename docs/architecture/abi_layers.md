@@ -201,7 +201,7 @@ builtin = true
 [[ports]]
 name = "pixels"
 direction = "input"
-content_type = "ImageRaw"
+content_type = "VideoRaster"
 
 [[params]]
 name = "mode"
