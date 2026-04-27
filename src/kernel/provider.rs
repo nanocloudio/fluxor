@@ -696,7 +696,17 @@ pub unsafe fn dispatch(
 
         // Fall back to kernel provider
         match entry.kernel_dispatch {
-            Some(handler) => handler(handle, opcode, arg, arg_len),
+            Some(handler) => {
+                let rc = handler(handle, opcode, arg, arg_len);
+                if rc == errno::ENOSYS {
+                    log::debug!(
+                        "[provider] contract 0x{:04x} op 0x{:04x}: kernel handler returned ENOSYS",
+                        contract,
+                        opcode
+                    );
+                }
+                rc
+            }
             None => {
                 log::warn!(
                     "[provider] contract 0x{:04x} op 0x{:04x}: no provider",

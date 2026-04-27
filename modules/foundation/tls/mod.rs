@@ -22,11 +22,11 @@ include!("../../sdk/params.rs");
 
 // Crypto primitives
 include!("../../sdk/sha256.rs");
-include!("sha384.rs");
-include!("hmac.rs");
-include!("chacha20.rs");
-include!("aes_gcm.rs");
-include!("p256.rs");
+include!("../../sdk/sha384.rs");
+include!("../../sdk/hmac.rs");
+include!("../../sdk/chacha20.rs");
+include!("../../sdk/aes_gcm.rs");
+include!("../../sdk/p256.rs");
 include!("x509.rs");
 
 // TLS protocol
@@ -153,6 +153,12 @@ struct TlsSession {
 
     // Handshake scratch (for building messages)
     scratch: [u8; SCRATCH_SIZE],
+
+    // ALPN protocol selected from the client's ALPN extension. Empty
+    // (`alpn_selected_len == 0`) means no ALPN extension was sent or
+    // none of the offered protocols matched the server config.
+    alpn_selected: [u8; 16],
+    alpn_selected_len: u8,
 }
 
 impl TlsSession {
@@ -192,6 +198,8 @@ impl TlsSession {
             server_finished_hash: [0; 48],
             hs_accum_len: 0,
             scratch: [0; SCRATCH_SIZE],
+            alpn_selected: [0; 16],
+            alpn_selected_len: 0,
         }
     }
 
@@ -1026,6 +1034,28 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
         sess.transcript = Some(Transcript::new(sess.suite.hash_alg()));
     }
 
+    // ALPN selection (RFC 7301 + RFC 8446 §4.6.1). The server's
+    // preference order is `h2` then `http/1.1`; if the client's ALPN
+    // extension overlaps with that list, we record the chosen
+    // protocol so the EncryptedExtensions builder can echo it back.
+    sess.alpn_selected_len = 0;
+    if let Some(list) = ch.alpn_protos {
+        for offered in alpn_iter(list) {
+            if offered == b"h2" || offered == b"http/1.1" {
+                let n = offered.len();
+                if n <= sess.alpn_selected.len() {
+                    core::ptr::copy_nonoverlapping(
+                        offered.as_ptr(),
+                        sess.alpn_selected.as_mut_ptr(),
+                        n,
+                    );
+                    sess.alpn_selected_len = n as u8;
+                    break;
+                }
+            }
+        }
+    }
+
     match ch.key_share {
         Some((_, key_data)) if key_data.len() <= 65 => {
             core::ptr::copy_nonoverlapping(key_data.as_ptr(), sess.peer_key_share.as_mut_ptr(), key_data.len());
@@ -1326,7 +1356,13 @@ unsafe fn pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> bool {
     let msg_len;
     {
         let sess = &mut s.sessions[idx];
-        msg_len = build_encrypted_extensions(&mut sess.scratch);
+        let alpn_len = sess.alpn_selected_len as usize;
+        let alpn = if alpn_len > 0 {
+            core::slice::from_raw_parts(sess.alpn_selected.as_ptr(), alpn_len)
+        } else {
+            &[][..]
+        };
+        msg_len = build_encrypted_extensions(&mut sess.scratch, alpn);
         if let Some(ref mut t) = sess.transcript {
             t.update(&sess.scratch[..msg_len]);
         }

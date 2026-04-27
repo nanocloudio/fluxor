@@ -1942,6 +1942,61 @@ fn parse_modules_map(
 /// `modules/button/manifest.toml` and stores it under key `btn_melody`).
 /// Manifests live in the source `modules/` directory, not `target/modules/`.
 /// Load manifests from both the standard fluxor module directories and
+/// Extract the manifest-source search paths a config wants the build tool
+/// to consult, in priority order. The returned list is the union of:
+///
+/// 1. Any explicit `module_search_paths: [..]` entries declared at the
+///    top level of the YAML config. Each entry is resolved relative to
+///    the config file's directory (so `module_search_paths:
+///    [../../clustor/modules]` in `quantum/configs/*.yaml` points at
+///    `clustor/modules` regardless of where the tool is invoked from).
+///
+/// 2. The implicit `<config-parent>/../modules` default (e.g.
+///    `quantum/modules` for a config in `quantum/configs/*.yaml`).
+///    Kept for backward compatibility; new graphs should prefer the
+///    explicit `module_search_paths:` key so the substrate / app split
+///    is visible at the config layer.
+///
+/// Both manifest discovery (`load_module_manifests_with_extra`) and
+/// graph parsing should consult this list. Non-existent entries are
+/// kept (the consumer skips them) so an env-specific path that's
+/// missing doesn't silently shadow other entries.
+pub fn extract_module_search_paths(
+    config: &Value,
+    config_path: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+
+    if let Some(arr) = config
+        .get("module_search_paths")
+        .and_then(|v| v.as_array())
+    {
+        for entry in arr {
+            if let Some(s) = entry.as_str() {
+                let joined = config_dir.join(s);
+                let canon = joined.canonicalize().unwrap_or(joined);
+                paths.push(canon);
+            }
+        }
+    }
+
+    if let Some(default) = config_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("modules"))
+    {
+        // Avoid duplicating the default if the YAML already pointed at
+        // the same place.
+        let canon = default.canonicalize().unwrap_or(default);
+        if !paths.iter().any(|p| p == &canon) {
+            paths.push(canon);
+        }
+    }
+
+    paths
+}
+
 /// any additional search paths (e.g., relative to the config file).
 pub fn load_module_manifests_with_extra(
     modules_config: &Value,

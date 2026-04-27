@@ -16,6 +16,7 @@ const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
 const EXT_COOKIE: u16 = 44;
+const EXT_ALPN: u16 = 16;
 
 /// Named group for P-256
 const GROUP_SECP256R1: u16 = 0x0017;
@@ -153,6 +154,10 @@ pub fn build_client_hello(
     pos = write_ext_key_share_client(out, pos, pub_key);
     // signature_algorithms
     pos = write_ext_signature_algorithms(out, pos);
+    // ALPN — offer h2 then http/1.1 so an h2-capable peer can pick the
+    // upgrade. RFC 7301 §3.1 wire format: ext_type=16, ext_len(u16),
+    // list_len(u16), [proto_len(u8), proto_bytes]+
+    pos = write_ext_alpn_client(out, pos);
 
     // Fill extension length
     let ext_len = pos - ext_start;
@@ -349,15 +354,53 @@ pub fn build_certificate_request(out: &mut [u8]) -> usize {
     }
 }
 
-/// Build EncryptedExtensions (empty — no extensions needed)
-pub fn build_encrypted_extensions(out: &mut [u8]) -> usize {
+/// Build EncryptedExtensions. If `alpn` is non-empty, includes an ALPN
+/// extension (RFC 7301 + RFC 8446 §4.6.1) selecting the named
+/// protocol. `alpn` should be a single protocol name like `b"h2"` or
+/// `b"http/1.1"` — pass an empty slice to omit ALPN.
+pub fn build_encrypted_extensions(out: &mut [u8], alpn: &[u8]) -> usize {
     unsafe {
         let p = out.as_mut_ptr();
+        // Handshake header: type(1) + length(3) — back-filled.
         *p.add(0) = HT_ENCRYPTED_EXTENSIONS;
-        *p.add(1) = 0; *p.add(2) = 0; *p.add(3) = 2;
-        *p.add(4) = 0; *p.add(5) = 0;
+        let mut pos = 4;
+
+        // Extensions block — 2-byte total length, back-filled.
+        let ext_len_pos = pos;
+        pos += 2;
+        let ext_start = pos;
+
+        if !alpn.is_empty() && alpn.len() <= 255 {
+            //   ext_type   = 16 (ALPN)
+            //   ext_data_len   = 2 + 1 + name_len      (u16)
+            //     list_len     = 1 + name_len           (u16)
+            //       name_len   = name.len()             (u8)
+            //       name       = alpn bytes
+            let nlen = alpn.len();
+            let ext_data_len: u16 = (2 + 1 + nlen) as u16;
+            let list_len: u16 = (1 + nlen) as u16;
+            *p.add(pos) = 0;
+            *p.add(pos + 1) = 16;
+            *p.add(pos + 2) = (ext_data_len >> 8) as u8;
+            *p.add(pos + 3) = ext_data_len as u8;
+            *p.add(pos + 4) = (list_len >> 8) as u8;
+            *p.add(pos + 5) = list_len as u8;
+            *p.add(pos + 6) = nlen as u8;
+            core::ptr::copy_nonoverlapping(alpn.as_ptr(), p.add(pos + 7), nlen);
+            pos += 7 + nlen;
+        }
+
+        let ext_len = (pos - ext_start) as u16;
+        *p.add(ext_len_pos) = (ext_len >> 8) as u8;
+        *p.add(ext_len_pos + 1) = ext_len as u8;
+
+        let body_len = (pos - 4) as u32;
+        *p.add(1) = (body_len >> 16) as u8;
+        *p.add(2) = (body_len >> 8) as u8;
+        *p.add(3) = body_len as u8;
+
+        pos
     }
-    6
 }
 
 /// Build Certificate message with a single cert.
@@ -455,6 +498,47 @@ pub struct ClientHello<'a> {
     pub cipher_suites: &'a [u8], // raw bytes
     pub key_share: Option<(u16, &'a [u8])>, // (group, key_exchange)
     pub supported_versions: Option<u16>,
+    /// Raw ALPN ProtocolNameList payload (RFC 7301 §3.1):
+    ///
+    ///   `[2-byte total length][1-byte name length][name bytes]…`
+    ///
+    /// Use `alpn_iter` to walk the list. `None` if the client did not
+    /// send the ALPN extension.
+    pub alpn_protos: Option<&'a [u8]>,
+}
+
+/// Iterator over an ALPN ProtocolNameList. Yields each protocol name
+/// as a byte slice. Skips malformed entries; returns nothing if the
+/// outer length prefix is short.
+pub fn alpn_iter(list: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let inner = if list.len() >= 2 {
+        let n = ((list[0] as usize) << 8) | (list[1] as usize);
+        let end = (2 + n).min(list.len());
+        &list[2..end]
+    } else {
+        &[][..]
+    };
+    AlpnIter { rem: inner }
+}
+
+struct AlpnIter<'a> {
+    rem: &'a [u8],
+}
+
+impl<'a> Iterator for AlpnIter<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.rem.is_empty() {
+            return None;
+        }
+        let n = self.rem[0] as usize;
+        if n == 0 || 1 + n > self.rem.len() {
+            return None;
+        }
+        let name = &self.rem[1..1 + n];
+        self.rem = &self.rem[1 + n..];
+        Some(name)
+    }
 }
 
 /// Parse ClientHello from handshake message body (after type+length)
@@ -490,6 +574,7 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
         // Extensions
         let mut key_share: Option<(u16, &[u8])> = None;
         let mut supported_versions: Option<u16> = None;
+        let mut alpn_protos: Option<&[u8]> = None;
 
         if pos + 2 <= dlen {
             let ext_len = get_u16(data, pos) as usize; pos += 2;
@@ -530,6 +615,11 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
                             }
                         }
                     }
+                    EXT_ALPN => {
+                        // Surface the raw payload; the server picks a
+                        // protocol via `alpn_iter`.
+                        alpn_protos = Some(ext_data);
+                    }
                     _ => {}
                 }
                 pos += ext_data_len;
@@ -542,6 +632,7 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
             cipher_suites,
             key_share,
             supported_versions,
+            alpn_protos,
         })
     }
 }
@@ -701,6 +792,44 @@ fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
     put_u16(out, pos, 4); pos += 2; // ext data length
     put_u16(out, pos, 2); pos += 2; // list length
     put_u16(out, pos, SIG_ECDSA_SECP256R1_SHA256); pos += 2;
+    pos
+}
+
+/// Offer ALPN protocols `h2` and `http/1.1` (in that preference
+/// order) — the http module's only consumer wants those two.
+/// Raw pointer writes for PIC aarch64 safety.
+fn write_ext_alpn_client(out: &mut [u8], mut pos: usize) -> usize {
+    unsafe {
+        let p = out.as_mut_ptr();
+        // ext_type = 16 (ALPN)
+        *p.add(pos) = 0;
+        *p.add(pos + 1) = 16;
+        pos += 2;
+        // protocol list — encoded once so we can compute lengths.
+        // [name_len=2, "h2", name_len=8, "http/1.1"]  → 13 bytes
+        let list_len: u16 = 1 + 2 + 1 + 8;
+        let ext_data_len: u16 = 2 + list_len;
+        *p.add(pos) = (ext_data_len >> 8) as u8;
+        *p.add(pos + 1) = ext_data_len as u8;
+        pos += 2;
+        *p.add(pos) = (list_len >> 8) as u8;
+        *p.add(pos + 1) = list_len as u8;
+        pos += 2;
+        *p.add(pos) = 2;
+        *p.add(pos + 1) = b'h';
+        *p.add(pos + 2) = b'2';
+        pos += 3;
+        *p.add(pos) = 8;
+        *p.add(pos + 1) = b'h';
+        *p.add(pos + 2) = b't';
+        *p.add(pos + 3) = b't';
+        *p.add(pos + 4) = b'p';
+        *p.add(pos + 5) = b'/';
+        *p.add(pos + 6) = b'1';
+        *p.add(pos + 7) = b'.';
+        *p.add(pos + 8) = b'1';
+        pos += 9;
+    }
     pos
 }
 

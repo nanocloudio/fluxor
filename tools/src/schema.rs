@@ -934,7 +934,10 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
         // Determine handler type and body
         let mut handler: u8 = 0;
 
-        if let Some(proxy_val) = obj.get("proxy") {
+        if obj.get("websocket").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // WebSocket handler — accepts the Upgrade and echoes frames.
+            handler = 4;
+        } else if let Some(proxy_val) = obj.get("proxy") {
             // Proxy handler
             handler = 3;
             if let Some(proxy_str) = proxy_val.as_str() {

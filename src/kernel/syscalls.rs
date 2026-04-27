@@ -615,6 +615,11 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
         && (INFRA_CONTRACTS & (1u32 << contract)) == 0
         && (req & (1u32 << contract)) == 0
     {
+        log::debug!(
+            "[syscalls] contract 0x{:04x}: manifest gate denied — required_caps=0x{:08x} (declare `[[resources]]` requires_contract for this contract)",
+            contract,
+            req,
+        );
         return Some(E_NOSYS);
     }
     None

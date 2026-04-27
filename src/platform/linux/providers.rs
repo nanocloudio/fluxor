@@ -43,6 +43,18 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             path_buf[..plen].copy_from_slice(&path_bytes[..plen]);
             path_buf[plen] = 0;
 
+            // O_CREAT creates the file but not its parent directories.
+            // Multi-Raft uses paths like `wal/p<id>/seg_<n>` and
+            // `raft/p<id>/meta`; idempotently mkdir -p the parent so a
+            // first-boot or first-partition write doesn't ENOENT.
+            if let Ok(path_str) = core::str::from_utf8(&path_bytes[..plen]) {
+                if let Some(parent) = std::path::Path::new(path_str).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+            }
+
             let fd_raw = libc::open(
                 path_buf.as_ptr() as *const libc::c_char,
                 libc::O_RDWR | libc::O_CREAT,

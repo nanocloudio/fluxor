@@ -178,7 +178,7 @@ RFC-compliant behaviour and are described at the top of `tcp.rs`.
 
 The TLS module's P-256 scalar multiplication is broken into chunks so a
 single handshake cannot block a second concurrent handshake for the full
-duration of its ladder. `modules/foundation/tls/p256.rs::ScalarMulState`
+duration of its ladder. `modules/sdk/p256.rs::ScalarMulState`
 tracks `bit_index` and `bits_per_step`; `pump_derive_handshake_keys`
 initialises on first entry, advances `bits_per_step` ladder bits per
 pump tick, and finalises once the ladder completes. The `tls` module

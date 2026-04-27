@@ -698,11 +698,11 @@ fn cmd_generate(
     let modules_dir_default = format!("target/{}/modules", target_desc.id);
     let modules_dir = modules_dir_override.unwrap_or(std::path::Path::new(&modules_dir_default));
 
-    // Derive extra module search path from the config file's directory.
-    // If config is at /project/configs/foo.yaml, search /project/modules/ for manifests.
-    let config_parent = config_path.parent().and_then(|p| p.parent());
-    let extra_modules_dir = config_parent.map(|p| p.join("modules"));
-    let extra_dirs: Vec<&std::path::Path> = extra_modules_dir.iter().map(|p| p.as_path()).collect();
+    // Manifest search paths: explicit `module_search_paths:` from the
+    // YAML plus the implicit <config-parent>/../modules default. See
+    // `config::extract_module_search_paths` for ordering.
+    let search_paths = config::extract_module_search_paths(&config, config_path);
+    let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
 
     let binary_data = config::generate_config_ext(
         &config,
@@ -1406,12 +1406,10 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
                     .collect()
             })
             .unwrap_or_default();
-        let extra_modules_dir = config_path
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("modules"));
+        let search_paths =
+            crate::config::extract_module_search_paths(&config, config_path);
         let extra_dirs: Vec<&std::path::Path> =
-            extra_modules_dir.iter().map(|p| p.as_path()).collect();
+            search_paths.iter().map(|p| p.as_path()).collect();
         let manifests = crate::config::load_module_manifests_with_extra(modules, &extra_dirs);
         if let Err(e) =
             crate::config::validate_presentation_groups(&config, &module_names, &manifests)
