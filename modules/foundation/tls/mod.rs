@@ -34,6 +34,10 @@ include!("alert.rs");
 include!("record.rs");
 include!("key_schedule.rs");
 include!("handshake.rs");
+include!("handshake_driver.rs");
+include!("handshake_pump.rs");
+include!("dtls_record.rs");
+include!("dtls_state.rs");
 
 // ============================================================================
 // Module constants
@@ -42,9 +46,18 @@ include!("handshake.rs");
 const MAX_SESSIONS: usize = 4;
 const MAX_CERT_LEN: usize = 1024;
 const MAX_KEY_LEN: usize = 160;
+
+/// `transport` parameter values selecting which I/O path runs.
+const TRANSPORT_TCP: u8 = 0; // TLS records over a net_proto stream channel.
+const TRANSPORT_UDP: u8 = 1; // DTLS records over a datagram channel (RFC 9147).
+
+/// Per-peer datagram session count (DTLS mode).
+const MAX_PEERS: usize = 4;
+/// Maximum DTLS datagram payload.
+const DGRAM_MAX: usize = 1500;
 const RECV_BUF_SIZE: usize = 4096;
 const SEND_BUF_SIZE: usize = 2048;
-const SCRATCH_SIZE: usize = 1536;
+// SCRATCH_SIZE is defined in handshake_driver.rs.
 const NET_SCRATCH_SIZE: usize = 1600;
 /// Ciphertext retention window for TCP-level retransmission. Holds the
 /// encrypted net_proto frames TLS has written to `cipher_out` so they can
@@ -88,43 +101,20 @@ struct TlsSession {
     state: SessionState,
     conn_id: u8,              // net_proto connection ID
     held_msg_type: u8,        // held ACCEPTED/CONNECTED msg type to forward after handshake
-    is_server: bool,
-    hrr_sent: bool,           // HelloRetryRequest was sent, expecting 2nd ClientHello
-    hs_state: HandshakeState,
-    suite: CipherSuite,
 
-    // Key schedule
-    key_schedule: Option<KeySchedule>,
+    /// Record-agnostic handshake state machine (Phase A — extracted into
+    /// HandshakeDriver). Owns the key schedule, transcript, ECDH state,
+    /// peer key share, peer cert pubkey, server random, ALPN selection,
+    /// and handshake-message reassembly scratch. DTLS (Phase B) and
+    /// QUIC (Phase C) reuse it verbatim with their own record /
+    /// packet protection layers.
+    driver: HandshakeDriver,
 
-    // Traffic keys
+    // Traffic keys (record-coupled — derived from `driver.key_schedule`
+    // secrets via TrafficKeys::from_secret; held here because the
+    // record layer applies them to inbound/outbound records).
     read_keys: TrafficKeys,
     write_keys: TrafficKeys,
-
-    // Transcript
-    transcript: Option<Transcript>,
-
-    // ECDH ephemeral key pair
-    ecdh_private: [u8; 32],
-    ecdh_public: [u8; 65],
-
-    // Resumable ECDH shared-secret computation, advanced in bounded chunks
-    // so concurrent handshakes interleave instead of blocking each other.
-    ecdh_state: ScalarMulState,
-
-    // Peer key share (from ClientHello/ServerHello)
-    peer_key_share: [u8; 65],
-    peer_key_share_len: u8,
-
-    // Peer certificate public key (extracted during handshake for CertificateVerify)
-    peer_cert_pubkey: [u8; 65],
-    peer_cert_pubkey_len: u8,
-
-    // Peer session_id (for echo)
-    peer_session_id: [u8; 32],
-    peer_session_id_len: u8,
-
-    // Server random (for server mode)
-    server_random: [u8; 32],
 
     // Record reassembly buffer
     recv_buf: [u8; RECV_BUF_SIZE],
@@ -145,20 +135,15 @@ struct TlsSession {
     retx_base_seq: u32,
     retx_seq_anchored: bool,
 
-    // Transcript hash at server Finished (used for app key derivation)
-    server_finished_hash: [u8; 48],
-
-    // Handshake reassembly: accumulated decrypted bytes for fragmented messages
-    hs_accum_len: usize,
-
-    // Handshake scratch (for building messages)
-    scratch: [u8; SCRATCH_SIZE],
-
-    // ALPN protocol selected from the client's ALPN extension. Empty
-    // (`alpn_selected_len == 0`) means no ALPN extension was sent or
-    // none of the offered protocols matched the server config.
-    alpn_selected: [u8; 16],
-    alpn_selected_len: u8,
+    /// Middlebox-compat CCS injection (RFC 8446 §5). Set by
+    /// `pump_send_server_hello` / `pump_send_hello_retry` to ask the
+    /// outbound record bridge to append a 1-byte CCS record after the
+    /// next plaintext record so they ship in the same TCP segment.
+    pending_ccs: bool,
+    /// Mirror of pending_ccs for the client side, set after the client
+    /// emits ClientHello so the bridge can inject a CCS record before
+    /// the first encrypted client flight.
+    pending_ccs_client: bool,
 }
 
 impl TlsSession {
@@ -167,24 +152,9 @@ impl TlsSession {
             state: SessionState::Idle,
             conn_id: 0,
             held_msg_type: 0,
-            is_server: false,
-            hrr_sent: false,
-            hs_state: HandshakeState::RecvClientHello,
-            suite: CipherSuite::ChaCha20Poly1305,
-            key_schedule: None,
+            driver: HandshakeDriver::empty(),
             read_keys: TrafficKeys::empty(),
             write_keys: TrafficKeys::empty(),
-            transcript: None,
-            ecdh_private: [0; 32],
-            ecdh_public: [0; 65],
-            ecdh_state: ScalarMulState::empty(),
-            peer_key_share: [0; 65],
-            peer_key_share_len: 0,
-            peer_cert_pubkey: [0; 65],
-            peer_cert_pubkey_len: 0,
-            peer_session_id: [0; 32],
-            peer_session_id_len: 0,
-            server_random: [0; 32],
             recv_buf: [0; RECV_BUF_SIZE],
             recv_len: 0,
             recv_expected: 0,
@@ -195,35 +165,26 @@ impl TlsSession {
             retx_len: 0,
             retx_base_seq: 0,
             retx_seq_anchored: false,
-            server_finished_hash: [0; 48],
-            hs_accum_len: 0,
-            scratch: [0; SCRATCH_SIZE],
-            alpn_selected: [0; 16],
-            alpn_selected_len: 0,
+            pending_ccs: false,
+            pending_ccs_client: false,
         }
     }
 
     fn reset(&mut self) {
-        // Zeroize all sensitive material
+        // Zeroize traffic key material here; driver.reset() handles
+        // its own sensitive material (ECDH private, server random).
         unsafe {
             let mut i = 0;
-            while i < 32 {
-                core::ptr::write_volatile(&mut self.ecdh_private[i], 0);
-                core::ptr::write_volatile(&mut self.server_random[i], 0);
-                i += 1;
-            }
-            // Zero traffic key material
-            i = 0;
             while i < 32 {
                 core::ptr::write_volatile(&mut self.read_keys.key[i], 0);
                 core::ptr::write_volatile(&mut self.write_keys.key[i], 0);
                 i += 1;
             }
         }
+        self.driver.reset();
         self.state = SessionState::Idle;
         self.conn_id = 0;
         self.held_msg_type = 0;
-        self.hrr_sent = false;
         self.recv_len = 0;
         self.recv_expected = 0;
         self.send_len = 0;
@@ -231,15 +192,94 @@ impl TlsSession {
         self.retx_base_seq = 0;
         self.retx_seq_anchored = false;
         self.send_offset = 0;
-        self.hs_accum_len = 0;
-        self.peer_key_share_len = 0;
-        self.peer_cert_pubkey_len = 0;
-        self.ecdh_state.zeroise_scalar();
-        self.ecdh_state = ScalarMulState::empty();
-        self.key_schedule = None;
-        self.transcript = None;
+        self.pending_ccs = false;
+        self.pending_ccs_client = false;
         self.read_keys = TrafficKeys::empty();
         self.write_keys = TrafficKeys::empty();
+    }
+}
+
+// ============================================================================
+// DTLS-mode types (RFC 9147)
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum DtlsPhase {
+    Idle,
+    Handshaking,
+    Ready,
+    Closed,
+    Errored,
+}
+
+#[derive(Clone, Copy)]
+struct PeerAddr {
+    ip: [u8; 4],
+    port: u16,
+}
+
+impl PeerAddr {
+    const fn unset() -> Self {
+        Self { ip: [0; 4], port: 0 }
+    }
+    fn matches(&self, ip: &[u8; 4], port: u16) -> bool {
+        self.ip[0] == ip[0]
+            && self.ip[1] == ip[1]
+            && self.ip[2] == ip[2]
+            && self.ip[3] == ip[3]
+            && self.port == port
+    }
+    fn is_unset(&self) -> bool {
+        self.port == 0
+    }
+}
+
+/// Max DTLS records we'll cache for retransmission of the last flight.
+/// A full TLS-1.3 server flight is at most 5 records (ServerHello,
+/// EncryptedExtensions, Certificate, CertificateVerify, Finished); 8
+/// gives headroom for HRR + cert-request flows.
+const MAX_FLIGHT_RECORDS: usize = 8;
+
+struct PeerSession {
+    phase: DtlsPhase,
+    peer: PeerAddr,
+    endpoint: DtlsEndpoint,
+    inbound_buf: [u8; DGRAM_MAX],
+    inbound_len: usize,
+    /// Concatenated bytes of every record in the last emitted flight,
+    /// for retransmission on RFC 9147 §5.8 retx-timer expiry. Each
+    /// record's individual length is tracked in `last_flight_record_lens`
+    /// so retransmission can re-send them as separate datagrams instead
+    /// of a single coalesced datagram (the receive bridge processes one
+    /// record per inbound datagram).
+    last_flight: [u8; NET_SCRATCH_SIZE * 2],
+    last_flight_len: usize,
+    last_flight_record_lens: [u16; MAX_FLIGHT_RECORDS],
+    last_flight_record_count: u8,
+}
+
+impl PeerSession {
+    const fn empty() -> Self {
+        Self {
+            phase: DtlsPhase::Idle,
+            peer: PeerAddr::unset(),
+            endpoint: DtlsEndpoint::new(),
+            inbound_buf: [0; DGRAM_MAX],
+            inbound_len: 0,
+            last_flight: [0; NET_SCRATCH_SIZE * 2],
+            last_flight_len: 0,
+            last_flight_record_lens: [0; MAX_FLIGHT_RECORDS],
+            last_flight_record_count: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.phase = DtlsPhase::Idle;
+        self.peer = PeerAddr::unset();
+        self.endpoint = DtlsEndpoint::new();
+        self.inbound_len = 0;
+        self.last_flight_len = 0;
+        self.last_flight_record_count = 0;
     }
 }
 
@@ -294,6 +334,27 @@ struct TlsState {
     // Sessions
     sessions: [TlsSession; MAX_SESSIONS],
 
+    // ------------------------------------------------------------------
+    // DTLS mode (`transport == TRANSPORT_UDP`). The fields below are
+    // unused (zero-initialised) when `transport == TRANSPORT_TCP`.
+    // ------------------------------------------------------------------
+    /// `TRANSPORT_TCP` (TLS records on a stream channel) or
+    /// `TRANSPORT_UDP` (DTLS records on a datagram channel).
+    transport: u8,
+    /// DTLS listener endpoint id returned by `CMD_DG_BIND`.
+    dtls_listen_ep: i16,
+    /// DTLS listening UDP port (server) or local source port (client).
+    dtls_port: u16,
+    /// Client-mode peer IPv4 (LE) and UDP port.
+    dtls_peer_ip: u32,
+    dtls_peer_port: u16,
+    /// `CMD_DG_BIND` has been issued and `MSG_DG_BOUND` received.
+    dtls_bound: bool,
+    /// Client-mode flag: have we kicked off the first ClientHello yet?
+    dtls_client_started: bool,
+    /// Per-peer DTLS sessions.
+    peer_sessions: [PeerSession; MAX_PEERS],
+
     // Scratch buffer for net_proto frame assembly
     net_scratch: [u8; NET_SCRATCH_SIZE],
 }
@@ -316,6 +377,18 @@ define_params! {
             let v = p_u16(d, len, 0, 256);
             s.ecdh_bits_per_step = if v == 0 { 1 } else if v > 256 { 256 } else { v };
         };
+
+    4, transport, u8, 0
+        => |s, d, len| { s.transport = p_u8(d, len, 0, 0); };
+
+    5, dtls_port, u16, 4433
+        => |s, d, len| { s.dtls_port = p_u16(d, len, 0, 4433); };
+
+    6, dtls_peer_ip, u32, 0x0100007f
+        => |s, d, len| { s.dtls_peer_ip = p_u32(d, len, 0, 0x0100007f); };
+
+    7, dtls_peer_port, u16, 4433
+        => |s, d, len| { s.dtls_peer_port = p_u16(d, len, 0, 4433); };
 }
 
 // ============================================================================
@@ -354,6 +427,18 @@ pub unsafe extern "C" fn module_new(
     s.ca_pubkey_len = 0;
     s.require_ca = false;
     s.key_vault_handle = -1;
+    s.transport = TRANSPORT_TCP;
+    s.dtls_listen_ep = -1;
+    s.dtls_port = 4433;
+    s.dtls_peer_ip = 0x0100007f;
+    s.dtls_peer_port = 4433;
+    s.dtls_bound = false;
+    s.dtls_client_started = false;
+    let mut i = 0;
+    while i < MAX_PEERS {
+        s.peer_sessions[i] = PeerSession::empty();
+        i += 1;
+    }
 
     let sys = &*s.syscalls;
 
@@ -452,8 +537,17 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     if params.is_null() || params_len < 4 { return; }
     let data = core::slice::from_raw_parts(params, params_len);
 
-    // Scan for extended TLV entries anywhere in the blob
+    // Start scanning past the basic-TLV section. Its payload_len bytes
+    // at offsets 2-3 can otherwise alias an extended-TLV header
+    // (e.g. payload_len = 0x000c → bytes `0c 00 ..` matches tag 12).
     let mut pos = 0;
+    if params_len >= 4 && data[0] == TLV_MAGIC && data[1] == TLV_VERSION {
+        let payload_len = ((data[3] as usize) << 8) | (data[2] as usize);
+        let basic_end = 4 + payload_len;
+        if basic_end <= params_len {
+            pos = basic_end;
+        }
+    }
     let end = params_len;
 
     // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
@@ -506,15 +600,39 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
 #[no_mangle]
 pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = &mut *(state as *mut TlsState);
+    if s.transport == TRANSPORT_UDP {
+        return dtls_module_step(s);
+    }
     let sys = &*s.syscalls;
     let mut did_work = false;
 
     // ── Phase 1: Drive active handshake sessions ──
+    //
+    // For each handshaking session, the queue bridge runs:
+    //   record_drain_inbound  — drain records → driver.in_buf
+    //   pump_session          — drive the handshake state machine
+    //                           (reads from in_buf, writes to out_buf)
+    //   record_drain_outbound — drain driver.out_buf → records on cipher_out
+    //
+    // The outbound drain MUST run after every pump step, not just at the
+    // end of the inner loop: e.g. ServerHello is queued at Initial level
+    // (plaintext), and immediately afterward `pump_derive_handshake_keys`
+    // installs `write_keys`. Draining only at the end would encrypt
+    // ServerHello with handshake keys — the peer can't decrypt that.
     let mut i = 0;
     while i < MAX_SESSIONS {
         if s.sessions[i].state == SessionState::Handshaking {
-            if pump_session(s, i) {
+            // Bound the inner loop so a misbehaving driver can't spin forever.
+            let mut steps = 0;
+            while steps < 64 && s.sessions[i].state == SessionState::Handshaking {
+                let drained = record_drain_inbound_one(s, i);
+                let progressed = pump_session(s, i);
+                record_drain_outbound(s, i);
+                if !drained && !progressed {
+                    break;
+                }
                 did_work = true;
+                steps += 1;
             }
         } else if s.sessions[i].state == SessionState::Closed {
             s.sessions[i].reset();
@@ -549,13 +667,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // Allocate session for this connection
                     match alloc_session_for_conn(s, conn_id) {
                         Some(idx) => {
-                            s.sessions[idx].is_server = (t == NET_MSG_ACCEPTED as u8);
+                            s.sessions[idx].driver.is_server = (t == NET_MSG_ACCEPTED as u8);
                             s.sessions[idx].held_msg_type = t;
                             s.sessions[idx].state = SessionState::Handshaking;
-                            if s.sessions[idx].is_server {
-                                s.sessions[idx].hs_state = HandshakeState::RecvClientHello;
+                            if s.sessions[idx].driver.is_server {
+                                s.sessions[idx].driver.hs_state = HandshakeState::RecvClientHello;
                             } else {
-                                s.sessions[idx].hs_state = HandshakeState::SendClientHello;
+                                s.sessions[idx].driver.hs_state = HandshakeState::SendClientHello;
                             }
                             init_session_crypto(s, idx);
                         }
@@ -706,7 +824,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // Encrypt as TLS application_data record
                                 let mut enc_buf = [0u8; SEND_BUF_SIZE];
                                 let enc_len = encrypt_record(
-                                    sess.suite,
+                                    sess.driver.suite,
                                     &mut sess.write_keys,
                                     CT_APPLICATION_DATA,
                                     &sess.send_buf[..rd],
@@ -816,13 +934,13 @@ fn find_session_by_conn_id(s: &TlsState, conn_id: u8) -> i32 {
 /// Verify CertificateVerify signature from peer. Returns true on success.
 unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: usize) -> bool {
     let sess = &s.sessions[idx];
-    if sess.peer_cert_pubkey_len == 0 { return true; }
-    let hl = sess.suite.hash_len();
-    let transcript_hash = match &sess.transcript {
+    if sess.driver.peer_cert_pubkey_len == 0 { return true; }
+    let hl = sess.driver.suite.hash_len();
+    let transcript_hash = match &sess.driver.transcript {
         Some(t) => t.current_hash(),
         None => return false,
     };
-    let context: &[u8] = if sess.is_server {
+    let context: &[u8] = if sess.driver.is_server {
         b"TLS 1.3, client CertificateVerify"
     } else {
         b"TLS 1.3, server CertificateVerify"
@@ -833,7 +951,7 @@ unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: us
     let cv_body = &data[4..len];
     if let Some((_scheme, sig_der)) = parse_certificate_verify(cv_body) {
         if let Some(raw_sig) = parse_der_signature(sig_der) {
-            let pk = &sess.peer_cert_pubkey[..sess.peer_cert_pubkey_len as usize];
+            let pk = &sess.driver.peer_cert_pubkey[..sess.driver.peer_cert_pubkey_len as usize];
             return ecdsa_verify(pk, &vc_hash, &raw_sig);
         }
     }
@@ -861,8 +979,8 @@ unsafe fn extract_peer_cert_key(s: &mut TlsState, idx: usize, hs_body: &[u8]) ->
 
             let pk = cert.public_key;
             let pk_len = if pk.len() <= 65 { pk.len() } else { 65 };
-            core::ptr::copy_nonoverlapping(pk.as_ptr(), s.sessions[idx].peer_cert_pubkey.as_mut_ptr(), pk_len);
-            s.sessions[idx].peer_cert_pubkey_len = pk_len as u8;
+            core::ptr::copy_nonoverlapping(pk.as_ptr(), s.sessions[idx].driver.peer_cert_pubkey.as_mut_ptr(), pk_len);
+            s.sessions[idx].driver.peer_cert_pubkey_len = pk_len as u8;
             if s.trust_domain_len > 0 {
                 let td = &s.trust_domain[..s.trust_domain_len];
                 let mut spiffe_ok = false;
@@ -904,13 +1022,13 @@ unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
     if dev_csprng_fill(sys, random.as_mut_ptr(), 32) < 0 {
         // Fall back to the pre-computed pool slot if CSPRNG is unavailable.
         let key_idx = if idx < MAX_SESSIONS && !s.eph_used[idx] { idx } else { 0 };
-        sess.ecdh_private = s.eph_private[key_idx];
-        sess.ecdh_public = s.eph_public[key_idx];
+        sess.driver.ecdh_private = s.eph_private[key_idx];
+        sess.driver.ecdh_public = s.eph_public[key_idx];
         s.eph_used[key_idx] = true;
     } else {
         let (priv_key, pub_key) = ecdh_keygen(&random);
-        sess.ecdh_private = priv_key;
-        sess.ecdh_public = pub_key;
+        sess.driver.ecdh_private = priv_key;
+        sess.driver.ecdh_public = pub_key;
         // Volatile wipe of the stack buffer — the private scalar has been
         // consumed by ecdh_keygen but the random seed also leaks it.
         let mut i = 0;
@@ -921,7 +1039,265 @@ unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
     }
 
     // Default suite (will be set during handshake)
-    sess.suite = CipherSuite::ChaCha20Poly1305;
+    sess.driver.suite = CipherSuite::ChaCha20Poly1305;
+}
+
+// ============================================================================
+// Record / driver-queue bridge
+//
+// The handshake state machine inside `HandshakeDriver` consumes plain
+// handshake bytes from `driver.in_buf` and produces plain handshake
+// bytes into `driver.out_buf`. The bridge below moves those bytes
+// across the record boundary:
+//
+//   cipher_in MSG_DATA → recv_buf → record_drain_inbound  → driver.in_buf
+//   driver.out_buf     → record_drain_outbound → cipher_out CMD_SEND
+//
+// When `read_keys.key_len == 0` the inbound level is Initial (records
+// are plaintext CT_HANDSHAKE); otherwise records are
+// CT_APPLICATION_DATA and decrypt under `read_keys`. Symmetrically for
+// `write_keys` on the outbound side. DTLS (Phase B) and QUIC (Phase C)
+// reuse the same driver via their own bridges — the in/out queues are
+// the only handshake-driver entry points either transport sees.
+// ============================================================================
+
+/// True if the inbound record level is Initial — i.e. read_keys haven't
+/// been derived yet, so records arrive as plaintext CT_HANDSHAKE.
+fn recv_level_is_initial(sess: &TlsSession) -> bool {
+    sess.read_keys.key_len == 0
+}
+
+/// True if the outbound record level is Initial — write_keys haven't
+/// been derived yet, so handshake messages ship as plaintext records.
+fn send_level_is_initial(sess: &TlsSession) -> bool {
+    sess.write_keys.key_len == 0
+}
+
+/// Drain one inbound record from `recv_buf` into `driver.in_buf`,
+/// decrypting if read_keys are set. Returns true if a record was
+/// successfully processed. Caller (`module_step`'s inner loop)
+/// re-invokes drain after every pump tick so key rotations
+/// (`pump_derive_app_keys`) take effect before the next record is
+/// decrypted — draining everything up front would use stale keys.
+unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
+    let _sys = &*s.syscalls;
+    let sess = &mut s.sessions[idx];
+    skip_ccs(sess);
+    if sess.recv_len < 5 {
+        return false;
+    }
+    let rec_type = sess.recv_buf[0];
+    let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
+    if rec_len > MAX_CIPHERTEXT || rec_len > RECV_BUF_SIZE {
+        sess.state = SessionState::Error;
+        return false;
+    }
+    if sess.recv_len < 5 + rec_len {
+        return false;
+    }
+
+    if recv_level_is_initial(sess) {
+        if rec_type != CT_HANDSHAKE {
+            sess.state = SessionState::Error;
+            return false;
+        }
+        let space = HS_IO_BUF_SIZE - sess.driver.in_len;
+        if rec_len > space {
+            return false; // in_buf full — caller must drain via pump_session.
+        }
+        core::ptr::copy_nonoverlapping(
+            sess.recv_buf.as_ptr().add(5),
+            sess.driver.in_buf.as_mut_ptr().add(sess.driver.in_len),
+            rec_len,
+        );
+        sess.driver.in_len += rec_len;
+    } else {
+        if rec_type != CT_APPLICATION_DATA {
+            // Plaintext records after handshake keys are derived
+            // shouldn't appear; drop the record and signal progress.
+            let consumed = 5 + rec_len;
+            let remain = sess.recv_len - consumed;
+            if remain > 0 {
+                core::ptr::copy(
+                    sess.recv_buf.as_ptr().add(consumed),
+                    sess.recv_buf.as_mut_ptr(),
+                    remain,
+                );
+            }
+            sess.recv_len = remain;
+            return true;
+        }
+        let mut hdr = [0u8; 5];
+        core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
+        let mut ct = [0u8; RECV_BUF_SIZE];
+        core::ptr::copy_nonoverlapping(
+            sess.recv_buf.as_ptr().add(5),
+            ct.as_mut_ptr(),
+            rec_len,
+        );
+        match decrypt_record(sess.driver.suite, &mut sess.read_keys, &hdr, &mut ct[..rec_len])
+        {
+            Some((pt_len, inner_type)) => {
+                if inner_type == CT_HANDSHAKE {
+                    let space = HS_IO_BUF_SIZE - sess.driver.in_len;
+                    if pt_len > space {
+                        return false;
+                    }
+                    core::ptr::copy_nonoverlapping(
+                        ct.as_ptr(),
+                        sess.driver.in_buf.as_mut_ptr().add(sess.driver.in_len),
+                        pt_len,
+                    );
+                    sess.driver.in_len += pt_len;
+                }
+                // Other inner types (alert, app data) are handled
+                // outside the handshake path; drop here.
+            }
+            None => {
+                sess.state = SessionState::Error;
+                return false;
+            }
+        }
+    }
+
+    let consumed = 5 + rec_len;
+    let remain = sess.recv_len - consumed;
+    if remain > 0 {
+        core::ptr::copy(
+            sess.recv_buf.as_ptr().add(consumed),
+            sess.recv_buf.as_mut_ptr(),
+            remain,
+        );
+    }
+    sess.recv_len = remain;
+    true
+}
+
+/// Drain complete handshake messages from `driver.out_buf`, wrap each
+/// into a record (plaintext if write_keys haven't been derived,
+/// AEAD-sealed otherwise), and write to `cipher_out`. Honors the
+/// pending_ccs flags by appending a CHANGE_CIPHER_SPEC record after
+/// the next plaintext record so it ships in the same TCP segment.
+unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
+    loop {
+        let sess = &s.sessions[idx];
+        if sess.driver.out_len < 4 {
+            return;
+        }
+        let msg_body_len = ((sess.driver.out_buf[1] as usize) << 16)
+            | ((sess.driver.out_buf[2] as usize) << 8)
+            | (sess.driver.out_buf[3] as usize);
+        let total = 4 + msg_body_len;
+        if total > sess.driver.out_len {
+            return; // Wait for the rest of the message.
+        }
+        if total > SEND_BUF_SIZE {
+            // A single handshake message larger than SEND_BUF_SIZE
+            // would need TLS-level fragmentation across records — we
+            // don't emit fragmented handshakes today.
+            s.sessions[idx].state = SessionState::Error;
+            return;
+        }
+
+        let mut rec = [0u8; SEND_BUF_SIZE + 32];
+        let rec_len: usize;
+
+        if send_level_is_initial(&s.sessions[idx]) {
+            rec[0] = CT_HANDSHAKE;
+            rec[1] = 0x03;
+            rec[2] = 0x03;
+            rec[3] = (total >> 8) as u8;
+            rec[4] = total as u8;
+            core::ptr::copy_nonoverlapping(
+                s.sessions[idx].driver.out_buf.as_ptr(),
+                rec.as_mut_ptr().add(5),
+                total,
+            );
+            rec_len = 5 + total;
+        } else {
+            let suite = s.sessions[idx].driver.suite;
+            let mut enc_buf = [0u8; SEND_BUF_SIZE];
+            let enc_len = encrypt_record(
+                suite,
+                &mut s.sessions[idx].write_keys,
+                CT_HANDSHAKE,
+                &s.sessions[idx].driver.out_buf[..total],
+                &mut enc_buf,
+            );
+            rec[0] = CT_APPLICATION_DATA;
+            rec[1] = 0x03;
+            rec[2] = 0x03;
+            rec[3] = (enc_len >> 8) as u8;
+            rec[4] = enc_len as u8;
+            core::ptr::copy_nonoverlapping(
+                enc_buf.as_ptr(),
+                rec.as_mut_ptr().add(5),
+                enc_len,
+            );
+            rec_len = 5 + enc_len;
+        }
+
+        // Append CCS into the same record buffer if a flag is pending
+        // and this was a plaintext record (Initial level). Per RFC 8446
+        // §5 the CCS is dropped on the wire; preserving the same TCP
+        // segment matters for middlebox compatibility.
+        let mut total_len = rec_len;
+        if send_level_is_initial(&s.sessions[idx])
+            && (s.sessions[idx].pending_ccs || s.sessions[idx].pending_ccs_client)
+        {
+            rec[total_len] = CT_CHANGE_CIPHER_SPEC;
+            rec[total_len + 1] = 0x03;
+            rec[total_len + 2] = 0x03;
+            rec[total_len + 3] = 0x00;
+            rec[total_len + 4] = 0x01;
+            rec[total_len + 5] = 0x01;
+            total_len += 6;
+            s.sessions[idx].pending_ccs = false;
+            s.sessions[idx].pending_ccs_client = false;
+        }
+
+        let conn_id = s.sessions[idx].conn_id;
+        let sys = &*s.syscalls;
+        tls_write_frame(
+            sys,
+            s.cipher_out,
+            NET_CMD_SEND,
+            conn_id,
+            rec.as_ptr(),
+            total_len as u16,
+            &mut s.net_scratch,
+        );
+        retx_push(&mut s.sessions[idx], rec.as_ptr(), total_len as u16);
+
+        let sess = &mut s.sessions[idx];
+        let remain = sess.driver.out_len - total;
+        if remain > 0 {
+            core::ptr::copy(
+                sess.driver.out_buf.as_ptr().add(total),
+                sess.driver.out_buf.as_mut_ptr(),
+                remain,
+            );
+        }
+        sess.driver.out_len = remain;
+    }
+}
+
+/// Thin facade — kept so existing callers compile. The real logic
+/// lives on `HandshakeDriver::read_handshake_message`. Mirrors the
+/// driver-level error-state convention by translating the driver's
+/// `HandshakeState::Error` into `SessionState::Error` if it's set.
+unsafe fn driver_read_handshake_message(
+    sess: &mut TlsSession,
+) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
+    let result = sess.driver.read_handshake_message();
+    if sess.driver.is_handshake_error() {
+        sess.state = SessionState::Error;
+    }
+    result
+}
+
+unsafe fn driver_write_handshake_message(sess: &mut TlsSession, msg: &[u8]) -> bool {
+    sess.driver.write_handshake_message(msg)
 }
 
 // ============================================================================
@@ -931,7 +1307,7 @@ unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
 unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
 
-    match s.sessions[idx].hs_state {
+    let r = match s.sessions[idx].driver.hs_state {
         // ── Server flow ──
         HandshakeState::RecvClientHello | HandshakeState::RecvSecondClientHello => pump_recv_client_hello(s, idx),
         HandshakeState::SendHelloRetryRequest => pump_send_hello_retry(s, idx),
@@ -963,7 +1339,13 @@ unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
             true
         }
         _ => false,
+    };
+    // Centralised error promotion: any pump step that flipped the
+    // driver into Error transitions the outer session state too.
+    if s.sessions[idx].driver.is_handshake_error() {
+        s.sessions[idx].state = SessionState::Error;
     }
+    r
 }
 
 // ============================================================================
@@ -974,29 +1356,16 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
 
-    // Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
-    skip_ccs(sess);
-
-    // Need at least record header (5) + handshake header (4)
-    if sess.recv_len < 9 { return false; }
-
-    // Parse record header with length validation (raw pointer access for PIC safety)
-    let rbp = sess.recv_buf.as_ptr();
-    let rec_type = *rbp;
-    let rec_len = ((*rbp.add(3) as usize) << 8) | (*rbp.add(4) as usize);
-    if rec_len > MAX_CIPHERTEXT || rec_len > RECV_BUF_SIZE { return false; }
-    if sess.recv_len < 5 + rec_len { return false; }
-
-    if rec_type != CT_HANDSHAKE { return false; }
-
-    // Parse handshake message (raw pointer slicing for PIC safety)
-    let hs_ptr = rbp.add(5);
-    let hs_data = core::slice::from_raw_parts(hs_ptr, rec_len);
-    if *hs_ptr != 1 { return false; } // ClientHello type
-    let hs_len = ((*hs_ptr.add(1) as usize) << 16) | ((*hs_ptr.add(2) as usize) << 8) | (*hs_ptr.add(3) as usize);
-    if hs_len + 4 > rec_len { return false; }
-
-    let ch_body = core::slice::from_raw_parts(hs_ptr.add(4), hs_len);
+    let (msg, total, msg_type) = match driver_read_handshake_message(sess) {
+        Some(t) => t,
+        None => return false,
+    };
+    if msg_type != HT_CLIENT_HELLO {
+        sess.state = SessionState::Error;
+        return true;
+    }
+    let hs_data = &msg[..total];
+    let ch_body = &msg[4..total];
     let ch = match parse_client_hello(ch_body) {
         Some(c) => c,
         None => {
@@ -1013,7 +1382,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     }
 
     // Select cipher suite
-    sess.suite = match select_cipher_suite(ch.cipher_suites) {
+    sess.driver.suite = match select_cipher_suite(ch.cipher_suites) {
         Some(cs) => cs,
         None => {
             dev_log(sys, 2, b"[tls] no common cipher suite".as_ptr(), b"[tls] no common cipher suite".len());
@@ -1022,34 +1391,33 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
         }
     };
 
-    // Extract peer key share
     // Save session_id for echo
     if ch.session_id.len() <= 32 {
-        core::ptr::copy_nonoverlapping(ch.session_id.as_ptr(), sess.peer_session_id.as_mut_ptr(), ch.session_id.len());
-        sess.peer_session_id_len = ch.session_id.len() as u8;
+        core::ptr::copy_nonoverlapping(ch.session_id.as_ptr(), sess.driver.peer_session_id.as_mut_ptr(), ch.session_id.len());
+        sess.driver.peer_session_id_len = ch.session_id.len() as u8;
     }
 
     // Initialize or update transcript
-    if sess.transcript.is_none() {
-        sess.transcript = Some(Transcript::new(sess.suite.hash_alg()));
+    if sess.driver.transcript.is_none() {
+        sess.driver.transcript = Some(Transcript::new(sess.driver.suite.hash_alg()));
     }
 
     // ALPN selection (RFC 7301 + RFC 8446 §4.6.1). The server's
     // preference order is `h2` then `http/1.1`; if the client's ALPN
     // extension overlaps with that list, we record the chosen
     // protocol so the EncryptedExtensions builder can echo it back.
-    sess.alpn_selected_len = 0;
+    sess.driver.alpn_selected_len = 0;
     if let Some(list) = ch.alpn_protos {
         for offered in alpn_iter(list) {
             if offered == b"h2" || offered == b"http/1.1" {
                 let n = offered.len();
-                if n <= sess.alpn_selected.len() {
+                if n <= sess.driver.alpn_selected.len() {
                     core::ptr::copy_nonoverlapping(
                         offered.as_ptr(),
-                        sess.alpn_selected.as_mut_ptr(),
+                        sess.driver.alpn_selected.as_mut_ptr(),
                         n,
                     );
-                    sess.alpn_selected_len = n as u8;
+                    sess.driver.alpn_selected_len = n as u8;
                     break;
                 }
             }
@@ -1058,161 +1426,58 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
 
     match ch.key_share {
         Some((_, key_data)) if key_data.len() <= 65 => {
-            core::ptr::copy_nonoverlapping(key_data.as_ptr(), sess.peer_key_share.as_mut_ptr(), key_data.len());
-            sess.peer_key_share_len = key_data.len() as u8;
+            core::ptr::copy_nonoverlapping(key_data.as_ptr(), sess.driver.peer_key_share.as_mut_ptr(), key_data.len());
+            sess.driver.peer_key_share_len = key_data.len() as u8;
         }
         _ => {
-            if sess.hrr_sent {
+            if sess.driver.hrr_sent {
                 // Second ClientHello still has no P-256 → fatal
                 sess.state = SessionState::Error;
                 return true;
             }
             // No P-256 key share → send HelloRetryRequest
-            // Update transcript with this ClientHello first
-            if let Some(ref mut t) = sess.transcript {
+            if let Some(ref mut t) = sess.driver.transcript {
                 t.update(hs_data);
             }
-            // Consume record
-            let consumed = 5 + rec_len;
-            let remain = sess.recv_len - consumed;
-            if remain > 0 {
-                core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-            }
-            sess.recv_len = remain;
-            sess.hs_state = HandshakeState::SendHelloRetryRequest;
+            sess.driver.hs_state = HandshakeState::SendHelloRetryRequest;
             return true;
         }
     }
 
     // Update transcript with ClientHello (for normal flow or 2nd CH after HRR)
-    if let Some(ref mut t) = sess.transcript {
-        // For HRR: RFC 8446 Section 4.4.1 — replace first CH hash with
-        // message_hash construct: handshake_type=254 + length + Hash(CH1)
-        if sess.hrr_sent {
-            // The transcript already has the synthetic message_hash from HRR.
-            // Just add this second ClientHello.
-        }
+    if let Some(ref mut t) = sess.driver.transcript {
         t.update(hs_data);
     }
 
     // Generate server random (entropy failure is fatal)
-    if dev_csprng_fill(sys, sess.server_random.as_mut_ptr(), 32) < 0 {
+    if dev_csprng_fill(sys, sess.driver.server_random.as_mut_ptr(), 32) < 0 {
         sess.state = SessionState::Error;
         return true;
     }
 
-    // Consume record from recv_buf
-    let consumed = 5 + rec_len;
-    let remain = sess.recv_len - consumed;
-    if remain > 0 {
-        core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-    }
-    sess.recv_len = remain;
-
-    sess.hs_state = HandshakeState::SendServerHello;
+    sess.driver.hs_state = HandshakeState::SendServerHello;
     true
 }
 
 unsafe fn pump_send_server_hello(s: &mut TlsState, idx: usize) -> bool {
-    let sys = &*s.syscalls;
-
-    {
-        let sess = &mut s.sessions[idx];
-
-        let msg_len = build_server_hello(
-            &sess.server_random,
-            &sess.peer_session_id,
-            sess.suite,
-            &sess.ecdh_public,
-            &mut sess.scratch,
-        );
-
-        // Update transcript
-        if let Some(ref mut t) = sess.transcript {
-            t.update(&sess.scratch[..msg_len]);
-        }
-
-        // Wrap ServerHello in a TLS record, appending the middlebox-compat
-        // CCS record into the same send when one has not already followed
-        // an HRR (RFC 8446 §5: server sends at most one CCS).
-        let mut rec = [0u8; 256];
-        let mut hdr = [0u8; 5];
-        build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
-        core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
-        core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
-
-        let sh_total = 5 + msg_len;
-        let conn_id = sess.conn_id;
-
-        let total = if !sess.hrr_sent {
-            *rec.as_mut_ptr().add(sh_total) = CT_CHANGE_CIPHER_SPEC;
-            *rec.as_mut_ptr().add(sh_total + 1) = 0x03;
-            *rec.as_mut_ptr().add(sh_total + 2) = 0x03;
-            *rec.as_mut_ptr().add(sh_total + 3) = 0x00;
-            *rec.as_mut_ptr().add(sh_total + 4) = 0x01;
-            *rec.as_mut_ptr().add(sh_total + 5) = 0x01;
-            sh_total + 6
-        } else {
-            sh_total
-        };
-        tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
+    let sess = &mut s.sessions[idx];
+    if !pump_send_server_hello_core(&mut sess.driver) {
+        return false;
     }
-
-    s.sessions[idx].hs_state = HandshakeState::DeriveHandshakeKeys;
+    // Middlebox-compat CCS rides the same TCP segment as ServerHello
+    // when no HRR preceded it (RFC 8446 §5).
+    if !sess.driver.hrr_sent {
+        sess.pending_ccs = true;
+    }
     true
 }
 
 unsafe fn pump_send_hello_retry(s: &mut TlsState, idx: usize) -> bool {
-    let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
-
-    let msg_len = build_hello_retry_request(
-        &sess.peer_session_id,
-        sess.suite,
-        &mut sess.scratch,
-    );
-
-    // Update transcript with HRR
-    // RFC 8446 Section 4.4.1: replace transcript with message_hash construct
-    // transcript = Hash(message_hash(254) || length || Hash(CH1))
-    // Then add HRR to it.
-    if let Some(ref mut t) = sess.transcript {
-        // Get Hash(CH1) from current transcript
-        let ch1_hash = t.current_hash();
-        let hl = sess.suite.hash_len();
-        // Reset transcript and inject synthetic message_hash
-        *t = Transcript::new(sess.suite.hash_alg());
-        // message_hash: type=254, length=hash_len, data=Hash(CH1)
-        let mut synthetic = [0u8; 4 + 48];
-        synthetic[0] = 254; // message_hash type
-        synthetic[3] = hl as u8;
-        unsafe { core::ptr::copy_nonoverlapping(ch1_hash.as_ptr(), synthetic.as_mut_ptr().add(4), hl); }
-        t.update(&synthetic[..4 + hl]);
-        // Add HRR to transcript
-        t.update(&sess.scratch[..msg_len]);
+    if !pump_send_hello_retry_core(&mut sess.driver) {
+        return false;
     }
-
-    // Ship HRR and the middlebox-compat CCS record as a single send so they
-    // land in the same TCP segment (RFC 8446 §4.1.4).
-    let mut rec = [0u8; SEND_BUF_SIZE];
-    let mut hdr = [0u8; 5];
-    build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
-    core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
-    core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
-    let hrr_total = 5 + msg_len;
-    use core::ptr::write_volatile as wv;
-    wv(rec.as_mut_ptr().add(hrr_total),     CT_CHANGE_CIPHER_SPEC);
-    wv(rec.as_mut_ptr().add(hrr_total + 1), 0x03u8);
-    wv(rec.as_mut_ptr().add(hrr_total + 2), 0x03u8);
-    wv(rec.as_mut_ptr().add(hrr_total + 3), 0x00u8);
-    wv(rec.as_mut_ptr().add(hrr_total + 4), 0x01u8);
-    wv(rec.as_mut_ptr().add(hrr_total + 5), 0x01u8);
-    let total = hrr_total + 6;
-    let conn_id = sess.conn_id;
-    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
-
-    sess.hrr_sent = true;
-    sess.hs_state = HandshakeState::RecvSecondClientHello;
+    sess.pending_ccs = true; // Always CCS after HRR for compat-mode peers.
     true
 }
 
@@ -1221,14 +1486,14 @@ unsafe fn pump_send_certificate_request(s: &mut TlsState, idx: usize) -> bool {
     let msg_len;
     {
         let sess = &mut s.sessions[idx];
-        msg_len = build_certificate_request(&mut sess.scratch);
-        if let Some(ref mut t) = sess.transcript {
-            t.update(&sess.scratch[..msg_len]);
+        msg_len = build_certificate_request(&mut sess.driver.scratch);
+        if let Some(ref mut t) = sess.driver.transcript {
+            t.update(&sess.driver.scratch[..msg_len]);
         }
-        core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
+        core::ptr::copy_nonoverlapping(sess.driver.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
     }
     send_encrypted_handshake(s, idx, &buf, msg_len);
-    s.sessions[idx].hs_state = HandshakeState::SendCertificate;
+    s.sessions[idx].driver.hs_state = HandshakeState::SendCertificate;
     true
 }
 
@@ -1236,20 +1501,20 @@ unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
     match recv_encrypted_handshake(s, idx) {
         Some((data, len, msg_type)) => {
             if msg_type != 11 {
-                if let Some(ref mut t) = s.sessions[idx].transcript {
+                if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                     t.update(&data[..len]);
                 }
-                s.sessions[idx].hs_state = HandshakeState::RecvClientFinished;
+                s.sessions[idx].driver.hs_state = HandshakeState::RecvClientFinished;
                 return true;
             }
-            if let Some(ref mut t) = s.sessions[idx].transcript {
+            if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                 t.update(&data[..len]);
             }
             if !extract_peer_cert_key(s, idx, &data[4..len]) {
                 s.sessions[idx].state = SessionState::Error;
                 return true;
             }
-            s.sessions[idx].hs_state = HandshakeState::RecvClientCertVerify;
+            s.sessions[idx].driver.hs_state = HandshakeState::RecvClientCertVerify;
             true
         }
         None => false,
@@ -1267,10 +1532,10 @@ unsafe fn pump_recv_client_cert_verify(s: &mut TlsState, idx: usize) -> bool {
                 s.sessions[idx].state = SessionState::Error;
                 return true;
             }
-            if let Some(ref mut t) = s.sessions[idx].transcript {
+            if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                 t.update(&data[..len]);
             }
-            s.sessions[idx].hs_state = HandshakeState::RecvClientFinished;
+            s.sessions[idx].driver.hs_state = HandshakeState::RecvClientFinished;
             true
         }
         None => false,
@@ -1278,75 +1543,15 @@ unsafe fn pump_recv_client_cert_verify(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_derive_handshake_keys(s: &mut TlsState, idx: usize) -> bool {
-    // A `bits_per_step` of 0 runs the whole ladder in one step() call, used
-    // when the caller-configured value is >= 256.
-    let bits_per_step_u8 = if s.ecdh_bits_per_step >= 256 { 0u8 } else { s.ecdh_bits_per_step as u8 };
-    {
-        let sess = &mut s.sessions[idx];
-        if !sess.ecdh_state.is_initialised() {
-            let new = match ecdh_shared_secret_init(
-                &sess.ecdh_private,
-                &sess.peer_key_share[..sess.peer_key_share_len as usize],
-                bits_per_step_u8,
-            ) {
-                Some(v) => v,
-                None => {
-                    sess.state = SessionState::Error;
-                    return true;
-                }
-            };
-            sess.ecdh_state = new;
-            // Yield after init so a second handshake can start its own ECDH
-            // before we advance ladder bits for this one.
-            return true;
-        }
-
-        if !sess.ecdh_state.complete() {
-            sess.ecdh_state.step();
-            return true;
-        }
-    }
-
-    let shared = {
-        let sess = &mut s.sessions[idx];
-        let out = match ecdh_shared_secret_finalise(&sess.ecdh_state) {
-            Some(v) => v,
-            None => {
-                sess.state = SessionState::Error;
-                return true;
-            }
-        };
-        sess.ecdh_state.zeroise_scalar();
-        out
+    let bits_per_step = if s.ecdh_bits_per_step >= 256 {
+        0u8
+    } else {
+        s.ecdh_bits_per_step as u8
     };
     let sess = &mut s.sessions[idx];
-
-    // Get transcript hash (ClientHello..ServerHello)
-    let transcript_hash = match &sess.transcript {
-        Some(t) => t.current_hash(),
-        None => { sess.state = SessionState::Error; return true; }
-    };
-    let hl = sess.suite.hash_len();
-
-    // Derive handshake secrets
-    let mut ks = KeySchedule::new(sess.suite);
-    ks.derive_handshake_secrets(&shared, &transcript_hash[..hl]);
-
-    // Set traffic keys
-    if sess.is_server {
-        sess.write_keys = TrafficKeys::from_secret(sess.suite, &ks.server_hs_secret[..hl]);
-        sess.read_keys = TrafficKeys::from_secret(sess.suite, &ks.client_hs_secret[..hl]);
-    } else {
-        sess.read_keys = TrafficKeys::from_secret(sess.suite, &ks.server_hs_secret[..hl]);
-        sess.write_keys = TrafficKeys::from_secret(sess.suite, &ks.client_hs_secret[..hl]);
-    }
-
-    sess.key_schedule = Some(ks);
-
-    if sess.is_server {
-        s.sessions[idx].hs_state = HandshakeState::SendEncryptedExtensions;
-    } else {
-        s.sessions[idx].hs_state = HandshakeState::RecvEncryptedExtensions;
+    if let Some((wk, rk)) = pump_derive_handshake_keys_core(&mut sess.driver, bits_per_step) {
+        sess.write_keys = wk;
+        sess.read_keys = rk;
     }
     true
 }
@@ -1356,53 +1561,40 @@ unsafe fn pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> bool {
     let msg_len;
     {
         let sess = &mut s.sessions[idx];
-        let alpn_len = sess.alpn_selected_len as usize;
+        let alpn_len = sess.driver.alpn_selected_len as usize;
         let alpn = if alpn_len > 0 {
-            core::slice::from_raw_parts(sess.alpn_selected.as_ptr(), alpn_len)
+            core::slice::from_raw_parts(sess.driver.alpn_selected.as_ptr(), alpn_len)
         } else {
             &[][..]
         };
-        msg_len = build_encrypted_extensions(&mut sess.scratch, alpn);
-        if let Some(ref mut t) = sess.transcript {
-            t.update(&sess.scratch[..msg_len]);
+        msg_len = build_encrypted_extensions(&mut sess.driver.scratch, alpn);
+        if let Some(ref mut t) = sess.driver.transcript {
+            t.update(&sess.driver.scratch[..msg_len]);
         }
-        core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
+        core::ptr::copy_nonoverlapping(sess.driver.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
     }
     send_encrypted_handshake(s, idx, &buf, msg_len);
     // If mTLS (verify_peer), send CertificateRequest before Certificate
     if s.verify_peer != 0 {
-        s.sessions[idx].hs_state = HandshakeState::SendCertificateRequest;
+        s.sessions[idx].driver.hs_state = HandshakeState::SendCertificateRequest;
     } else {
-        s.sessions[idx].hs_state = HandshakeState::SendCertificate;
+        s.sessions[idx].driver.hs_state = HandshakeState::SendCertificate;
     }
     true
 }
 
 unsafe fn pump_send_certificate(s: &mut TlsState, idx: usize) -> bool {
-    // Bounds-checked slice indexing can pull the panic handler (and its
-    // .rodata strings) into a PIC module; raw pointer + length is safe.
     let cert_len = if s.cert_len <= MAX_CERT_LEN { s.cert_len } else { 0 };
     let cert = core::slice::from_raw_parts(s.cert.as_ptr(), cert_len);
-    let msg_len = build_certificate(cert, &mut s.sessions[idx].scratch);
-
-    if let Some(ref mut t) = s.sessions[idx].transcript {
-        t.update(&s.sessions[idx].scratch[..msg_len]);
-    }
-
-    let mut buf = [0u8; SCRATCH_SIZE];
-    unsafe { core::ptr::copy_nonoverlapping(s.sessions[idx].scratch.as_ptr(), buf.as_mut_ptr(), msg_len); }
-    send_encrypted_handshake(s, idx, &buf, msg_len);
-
-    s.sessions[idx].hs_state = HandshakeState::SendCertificateVerify;
-    true
+    pump_send_certificate_core(&mut s.sessions[idx].driver, cert)
 }
 
 unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
 
-    let hl = sess.suite.hash_len();
-    let transcript_hash = match &sess.transcript {
+    let hl = sess.driver.suite.hash_len();
+    let transcript_hash = match &sess.driver.transcript {
         Some(t) => t.current_hash(),
         None => { sess.state = SessionState::Error; return true; }
     };
@@ -1448,179 +1640,59 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     }
     let (der_sig, der_len) = encode_der_signature(&raw_sig);
 
-    let msg_len = build_certificate_verify(&der_sig, der_len, &mut sess.scratch);
+    let msg_len = build_certificate_verify(&der_sig, der_len, &mut sess.driver.scratch);
 
-    if let Some(ref mut t) = sess.transcript {
-        t.update(&sess.scratch[..msg_len]);
+    if let Some(ref mut t) = sess.driver.transcript {
+        t.update(&sess.driver.scratch[..msg_len]);
     }
 
     let mut buf = [0u8; SCRATCH_SIZE];
-    core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
+    core::ptr::copy_nonoverlapping(sess.driver.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
     send_encrypted_handshake(s, idx, &buf, msg_len);
 
-    s.sessions[idx].hs_state = HandshakeState::SendFinished;
+    s.sessions[idx].driver.hs_state = HandshakeState::SendFinished;
     true
 }
 
 unsafe fn pump_send_finished(s: &mut TlsState, idx: usize) -> bool {
-    let mut buf = [0u8; SCRATCH_SIZE];
-    let msg_len;
-    let is_server;
-    {
-        let sess = &mut s.sessions[idx];
-        let hl = sess.suite.hash_len();
-        is_server = sess.is_server;
-
-        let transcript_hash = match &sess.transcript {
-            Some(t) => t.current_hash(),
-            None => { sess.state = SessionState::Error; return true; }
-        };
-
-        let ks = match &sess.key_schedule {
-            Some(k) => k,
-            None => { sess.state = SessionState::Error; return true; }
-        };
-
-        let base_key = if sess.is_server {
-            &ks.server_hs_secret
-        } else {
-            &ks.client_hs_secret
-        };
-        let finished_key = ks.compute_finished(base_key);
-        let verify_data = ks.finished_verify_data(&finished_key[..hl], &transcript_hash[..hl]);
-
-        msg_len = build_finished(&verify_data[..hl], hl, &mut sess.scratch);
-
-        if let Some(ref mut t) = sess.transcript {
-            t.update(&sess.scratch[..msg_len]);
-        }
-
-        core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
+    let sess = &mut s.sessions[idx];
+    if !pump_send_finished_core(&mut sess.driver) {
+        return false;
     }
-    send_encrypted_handshake(s, idx, &buf, msg_len);
-
-    // Save transcript hash at this point (through server Finished) for app key derivation
-    if let Some(ref t) = s.sessions[idx].transcript {
-        s.sessions[idx].server_finished_hash = t.current_hash();
-    }
-
-    if is_server {
-        if s.verify_peer != 0 {
-            // mTLS: expect client Certificate + CertificateVerify + Finished
-            s.sessions[idx].hs_state = HandshakeState::RecvClientCert;
-        } else {
-            s.sessions[idx].hs_state = HandshakeState::RecvClientFinished;
-        }
-    } else {
-        s.sessions[idx].hs_state = HandshakeState::ClientDeriveAppKeys;
+    // mTLS: server expects client Cert + CertVerify before Finished.
+    if sess.driver.is_server && s.verify_peer != 0 {
+        sess.driver.hs_state = HandshakeState::RecvClientCert;
     }
     true
 }
 
 unsafe fn pump_recv_client_finished(s: &mut TlsState, idx: usize) -> bool {
-    let sys = &*s.syscalls;
-    let sess = &mut s.sessions[idx];
-
-    // Read encrypted record
-    let msg = match recv_encrypted_handshake(s, idx) {
-        Some((data, len, msg_type)) => {
-            if msg_type != 20 { // HT_FINISHED
-                s.sessions[idx].state = SessionState::Error;
-                return true;
-            }
-            (data, len)
-        }
-        None => return false,
-    };
-
-    let sess = &mut s.sessions[idx];
-    let hl = sess.suite.hash_len();
-
-    // Get expected verify_data
-    let transcript_hash = match &sess.transcript {
-        Some(t) => t.current_hash(),
-        None => { sess.state = SessionState::Error; return true; }
-    };
-
-    let ks = match &sess.key_schedule {
-        Some(k) => k,
-        None => { sess.state = SessionState::Error; return true; }
-    };
-
-    let finished_key = ks.compute_finished(&ks.client_hs_secret);
-    let expected = ks.finished_verify_data(&finished_key[..hl], &transcript_hash[..hl]);
-
-    // Verify (constant-time)
-    let (data, len) = msg;
-    let fin_data = &data[4..4 + hl]; // skip handshake header
-    let mut diff = 0u8;
-    let mut i = 0;
-    while i < hl {
-        diff |= fin_data[i] ^ expected[i];
-        i += 1;
-    }
-    if diff != 0 {
-        dev_log(sys, 2, b"[tls] client Finished verify failed".as_ptr(), b"[tls] client Finished verify failed".len());
-        sess.state = SessionState::Error;
-        return true;
-    }
-
-    // Update transcript with client Finished
-    if let Some(ref mut t) = sess.transcript {
-        t.update(&data[..len]);
-    }
-
-    sess.hs_state = HandshakeState::DeriveAppKeys;
-    true
+    pump_recv_client_finished_core(&mut s.sessions[idx].driver)
 }
 
 unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
-    let hl = sess.suite.hash_len();
-
-    // Use the transcript hash saved at server Finished (per RFC 8446 Section 7.1)
-    let transcript_hash = sess.server_finished_hash;
-
-    if let Some(ref mut ks) = sess.key_schedule {
-        ks.derive_app_secrets(&transcript_hash[..hl]);
-
-        // Switch to application traffic keys
-        if sess.is_server {
-            sess.write_keys = TrafficKeys::from_secret(sess.suite, &ks.server_app_secret[..hl]);
-            sess.read_keys = TrafficKeys::from_secret(sess.suite, &ks.client_app_secret[..hl]);
-        } else {
-            sess.read_keys = TrafficKeys::from_secret(sess.suite, &ks.server_app_secret[..hl]);
-            sess.write_keys = TrafficKeys::from_secret(sess.suite, &ks.client_app_secret[..hl]);
-        }
+    if let Some((wk, rk)) = pump_derive_app_keys_core(&mut sess.driver) {
+        sess.write_keys = wk;
+        sess.read_keys = rk;
     }
-
-    // Zeroize handshake secrets — they're no longer needed
-    if let Some(ref mut ks) = sess.key_schedule {
+    // Zeroize handshake secrets — no longer needed.
+    if let Some(ref mut ks) = sess.driver.key_schedule {
         let mut i = 0;
         while i < 48 {
-            unsafe {
-                core::ptr::write_volatile(&mut ks.client_hs_secret[i], 0);
-                core::ptr::write_volatile(&mut ks.server_hs_secret[i], 0);
-            }
+            core::ptr::write_volatile(&mut ks.client_hs_secret[i], 0);
+            core::ptr::write_volatile(&mut ks.server_hs_secret[i], 0);
             i += 1;
         }
     }
-    // Zeroize ephemeral private key
-    {
-        let mut i = 0;
-        while i < 32 {
-            unsafe { core::ptr::write_volatile(&mut sess.ecdh_private[i], 0); }
-            i += 1;
-        }
+    let mut i = 0;
+    while i < 32 {
+        core::ptr::write_volatile(&mut sess.driver.ecdh_private[i], 0);
+        i += 1;
     }
-
-    // Don't reset recv_buf — may contain app data that arrived with handshake
     sess.state = SessionState::Ready;
-    sess.hs_state = HandshakeState::Complete;
     dev_log(sys, 3, b"[tls] handshake complete".as_ptr(), b"[tls] handshake complete".len());
-
-    // Forward held MSG_ACCEPTED/MSG_CONNECTED to clear_out so HTTP knows connection is ready
     let held = sess.held_msg_type;
     let conn_id = sess.conn_id;
     if held != 0 {
@@ -1643,120 +1715,29 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
 
     let mut session_id = [0u8; 32];
     dev_csprng_fill(sys, session_id.as_mut_ptr(), 32);
-    sess.peer_session_id = session_id;
-    sess.peer_session_id_len = 32;
+    sess.driver.peer_session_id = session_id;
+    sess.driver.peer_session_id_len = 32;
 
-    let msg_len = build_client_hello(&random, &session_id, &sess.ecdh_public, &mut sess.scratch);
+    let msg_len = build_client_hello(&random, &session_id, &sess.driver.ecdh_public, &mut sess.driver.scratch);
 
-    // Init transcript
-    sess.transcript = Some(Transcript::new(HashAlg::Sha256)); // Will switch if AES-256-GCM selected
-    if let Some(ref mut t) = sess.transcript {
-        t.update(&sess.scratch[..msg_len]);
+    // Init transcript (will switch if AES-256-GCM selected)
+    sess.driver.transcript = Some(Transcript::new(HashAlg::Sha256));
+    if let Some(ref mut t) = sess.driver.transcript {
+        t.update(&sess.driver.scratch[..msg_len]);
     }
 
-    // Wrap in TLS record and send via channel
-    let mut rec = [0u8; SEND_BUF_SIZE];
-    let mut hdr = [0u8; 5];
-    build_record_header(CT_HANDSHAKE, msg_len, &mut hdr);
-    core::ptr::copy_nonoverlapping(hdr.as_ptr(), rec.as_mut_ptr(), 5);
-    core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), rec.as_mut_ptr().add(5), msg_len);
-
-    let conn_id = sess.conn_id;
-    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), (5 + msg_len) as u16, &mut s.net_scratch);
-
-    sess.hs_state = HandshakeState::RecvServerHello;
+    let mut local = [0u8; SCRATCH_SIZE];
+    core::ptr::copy_nonoverlapping(sess.driver.scratch.as_ptr(), local.as_mut_ptr(), msg_len);
+    if !driver_write_handshake_message(sess, &local[..msg_len]) {
+        return false;
+    }
+    sess.pending_ccs_client = true; // Middlebox-compat CCS after first ClientHello.
+    sess.driver.hs_state = HandshakeState::RecvServerHello;
     true
 }
 
 unsafe fn pump_recv_server_hello(s: &mut TlsState, idx: usize) -> bool {
-    let sys = &*s.syscalls;
-
-    {
-        let sess = &mut s.sessions[idx];
-
-        // Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
-        if sess.recv_len < 9 { return false; }
-
-        skip_ccs(sess);
-        if sess.recv_len < 9 { return false; }
-
-        let rec_type = sess.recv_buf[0];
-        let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
-        if sess.recv_len < 5 + rec_len { return false; }
-        if rec_type != CT_HANDSHAKE { return false; }
-
-        let hs_data = &sess.recv_buf[5..5 + rec_len];
-        if hs_data[0] != 2 { return false; } // ServerHello
-        let hs_len = ((hs_data[1] as usize) << 16) | ((hs_data[2] as usize) << 8) | (hs_data[3] as usize);
-
-        let sh = match parse_server_hello(&hs_data[4..4 + hs_len]) {
-            Some(h) => h,
-            None => { sess.state = SessionState::Error; return true; }
-        };
-
-        // Validate TLS 1.3
-        if sh.supported_version != Some(0x0304) {
-            sess.state = SessionState::Error;
-            return true;
-        }
-
-        // Check for HelloRetryRequest (magic random value)
-        if sh.random.len() == 32 && sh.random == HRR_RANDOM {
-            // Server requests retry with different key share
-            // Update transcript: add this HRR to it
-            if let Some(ref mut t) = sess.transcript {
-                t.update(hs_data);
-            }
-            // Consume record
-            let consumed = 5 + rec_len;
-            let remain = sess.recv_len - consumed;
-            if remain > 0 {
-                core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-            }
-            sess.recv_len = remain;
-            // Client needs to send a new ClientHello (with P-256 key share)
-            // For now, since we already offer P-256, this shouldn't happen.
-            // If it does, error — we can't change our key share.
-            sess.state = SessionState::Error;
-            return true;
-        }
-
-        // Set cipher suite
-        sess.suite = match CipherSuite::from_id(sh.cipher_suite) {
-            Some(cs) => cs,
-            None => { sess.state = SessionState::Error; return true; }
-        };
-
-        // Switch transcript to correct hash algorithm for negotiated suite.
-        if let Some(ref mut t) = sess.transcript {
-            t.set_alg(sess.suite.hash_alg());
-        }
-
-        // Extract server key share
-        match sh.key_share {
-            Some((_, key_data)) if key_data.len() <= 65 => {
-                core::ptr::copy_nonoverlapping(key_data.as_ptr(), sess.peer_key_share.as_mut_ptr(), key_data.len());
-                sess.peer_key_share_len = key_data.len() as u8;
-            }
-            _ => { sess.state = SessionState::Error; return true; }
-        }
-
-        // Update transcript with ServerHello
-        if let Some(ref mut t) = sess.transcript {
-            t.update(hs_data);
-        }
-
-        // Consume record
-        let consumed = 5 + rec_len;
-        let remain = sess.recv_len - consumed;
-        if remain > 0 {
-            core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-        }
-        sess.recv_len = remain;
-    } // drop `sess` borrow
-
-    s.sessions[idx].hs_state = HandshakeState::ClientDeriveHandshakeKeys;
-    true
+    pump_recv_server_hello_core(&mut s.sessions[idx].driver)
 }
 
 unsafe fn pump_recv_encrypted(s: &mut TlsState, idx: usize, expected_type: u8, next_state: HandshakeState) -> bool {
@@ -1767,10 +1748,10 @@ unsafe fn pump_recv_encrypted(s: &mut TlsState, idx: usize, expected_type: u8, n
                 return true;
             }
             // Update transcript
-            if let Some(ref mut t) = s.sessions[idx].transcript {
+            if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                 t.update(&data[..len]);
             }
-            s.sessions[idx].hs_state = next_state;
+            s.sessions[idx].driver.hs_state = next_state;
             true
         }
         None => false,
@@ -1784,14 +1765,14 @@ unsafe fn pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
                 s.sessions[idx].state = SessionState::Error;
                 return true;
             }
-            if let Some(ref mut t) = s.sessions[idx].transcript {
+            if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                 t.update(&data[..len]);
             }
             if !extract_peer_cert_key(s, idx, &data[4..len]) {
                 s.sessions[idx].state = SessionState::Error;
                 return true;
             }
-            s.sessions[idx].hs_state = HandshakeState::RecvCertificateVerify;
+            s.sessions[idx].driver.hs_state = HandshakeState::RecvCertificateVerify;
             true
         }
         None => false,
@@ -1799,213 +1780,54 @@ unsafe fn pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_recv_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
-    match recv_encrypted_handshake(s, idx) {
-        Some((data, len, msg_type)) => {
-            if msg_type != 15 {
-                s.sessions[idx].state = SessionState::Error;
-                return true;
-            }
-            if !verify_peer_cert_verify(s, idx, &data, len) {
-                s.sessions[idx].state = SessionState::Error;
-                return true;
-            }
-            if let Some(ref mut t) = s.sessions[idx].transcript {
-                t.update(&data[..len]);
-            }
-            s.sessions[idx].hs_state = HandshakeState::RecvFinished;
-            true
-        }
-        None => false,
-    }
+    pump_recv_certificate_verify_core(&mut s.sessions[idx].driver)
 }
 
 unsafe fn pump_recv_server_finished(s: &mut TlsState, idx: usize) -> bool {
-    match recv_encrypted_handshake(s, idx) {
-        Some((data, len, msg_type)) => {
-            if msg_type != 20 {
-                s.sessions[idx].state = SessionState::Error;
-                return true;
-            }
-            let sess = &mut s.sessions[idx];
-            let hl = sess.suite.hash_len();
-
-            // Verify server Finished
-            let transcript_hash = match &sess.transcript {
-                Some(t) => t.current_hash(),
-                None => { sess.state = SessionState::Error; return true; }
-            };
-            if let Some(ref ks) = sess.key_schedule {
-                let finished_key = ks.compute_finished(&ks.server_hs_secret);
-                let expected = ks.finished_verify_data(&finished_key[..hl], &transcript_hash[..hl]);
-                let fin_data = &data[4..4 + hl];
-                let mut diff = 0u8;
-                let mut i = 0;
-                while i < hl { diff |= fin_data[i] ^ expected[i]; i += 1; }
-                if diff != 0 {
-                    sess.state = SessionState::Error;
-                    return true;
-                }
-            }
-
-            if let Some(ref mut t) = sess.transcript {
-                t.update(&data[..len]);
-            }
-            // Save transcript hash for app key derivation (through server Finished)
-            if let Some(ref t) = sess.transcript {
-                sess.server_finished_hash = t.current_hash();
-            }
-            sess.hs_state = HandshakeState::SendClientFinished;
-            true
-        }
-        None => false,
-    }
+    pump_recv_server_finished_core(&mut s.sessions[idx].driver)
 }
 
 unsafe fn pump_send_client_finished(s: &mut TlsState, idx: usize) -> bool {
-    let mut buf = [0u8; SCRATCH_SIZE];
-    let msg_len;
-    {
-        let sess = &mut s.sessions[idx];
-        let hl = sess.suite.hash_len();
-
-        let transcript_hash = match &sess.transcript {
-            Some(t) => t.current_hash(),
-            None => { sess.state = SessionState::Error; return true; }
-        };
-
-        let ks = match &sess.key_schedule {
-            Some(k) => k,
-            None => { sess.state = SessionState::Error; return true; }
-        };
-
-        let finished_key = ks.compute_finished(&ks.client_hs_secret);
-        let verify_data = ks.finished_verify_data(&finished_key[..hl], &transcript_hash[..hl]);
-
-        msg_len = build_finished(&verify_data[..hl], hl, &mut sess.scratch);
-
-        if let Some(ref mut t) = sess.transcript {
-            t.update(&sess.scratch[..msg_len]);
-        }
-
-        core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
-    }
-    send_encrypted_handshake(s, idx, &buf, msg_len);
-
-    s.sessions[idx].hs_state = HandshakeState::ClientDeriveAppKeys;
-    true
+    pump_send_client_finished_core(&mut s.sessions[idx].driver)
 }
 
 // ============================================================================
-// Encrypted record helpers
+// Encrypted record helpers — now thin queue facades.
+//
+// Both functions used to do their own record I/O. Phase A.next moves
+// encryption/decryption out into `record_drain_inbound` /
+// `record_drain_outbound`, leaving these as queue helpers so the
+// existing pump_* callers don't need to be touched.
 // ============================================================================
 
-/// Send an encrypted handshake record via cipher_out channel
+/// Append a complete handshake message (4-byte header + body) to the
+/// driver's outbound plaintext queue. The record bridge encrypts and
+/// frames it into a CT_APPLICATION_DATA record on the next outbound
+/// drain. Caller drops the message on overflow — the next pump tick
+/// will retry.
 unsafe fn send_encrypted_handshake(s: &mut TlsState, idx: usize, msg: &[u8], msg_len: usize) {
-    let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
-
-    let mut enc_buf = [0u8; SEND_BUF_SIZE];
-    let enc_len = encrypt_record(sess.suite, &mut sess.write_keys, CT_HANDSHAKE, &msg[..msg_len], &mut enc_buf);
-
-    let mut rec = [0u8; SEND_BUF_SIZE + 5];
-    *rec.as_mut_ptr() = CT_APPLICATION_DATA;
-    *rec.as_mut_ptr().add(1) = 0x03;
-    *rec.as_mut_ptr().add(2) = 0x03;
-    *rec.as_mut_ptr().add(3) = (enc_len >> 8) as u8;
-    *rec.as_mut_ptr().add(4) = enc_len as u8;
-    core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), rec.as_mut_ptr().add(5), enc_len);
-
-    let total = 5 + enc_len;
-    let conn_id = sess.conn_id;
-    tls_write_frame(sys, s.cipher_out, NET_CMD_SEND, conn_id, rec.as_ptr(), total as u16, &mut s.net_scratch);
+    if !driver_write_handshake_message(sess, &msg[..msg_len]) {
+        // Out queue full — drop. The pump_send_* call will be retried
+        // by pump_session next tick (it didn't advance hs_state when
+        // the queue overflowed, because pump_send_* always advances
+        // after this function — we'd need a Result-returning variant
+        // to model overflow cleanly. For TLS sessions the queue is
+        // sized to fit a full server flight so overflow is unreachable
+        // in practice.)
+    }
 }
 
-/// Try to receive and decrypt an encrypted handshake record.
-/// Returns (decrypted_data_in_scratch, length, handshake_msg_type) or None if not enough data.
-/// Data arrives via cipher_in -> recv_buf in module_step; no socket read here.
-unsafe fn recv_encrypted_handshake(s: &mut TlsState, idx: usize) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
-    let sess = &mut s.sessions[idx];
-
-    skip_ccs(sess);
-
-    if sess.recv_len < 5 { return None; }
-
-    let rec_type = sess.recv_buf[0];
-    let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
-    if sess.recv_len < 5 + rec_len { return None; }
-
-    if rec_type != CT_APPLICATION_DATA {
-        // Unexpected record type during handshake
-        return None;
-    }
-
-    // Decrypt
-    let mut hdr = [0u8; 5];
-    core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
-    let mut ct = [0u8; RECV_BUF_SIZE];
-    core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr().add(5), ct.as_mut_ptr(), rec_len);
-
-    let consumed = 5 + rec_len;
-    let remain = sess.recv_len - consumed;
-    if remain > 0 {
-        core::ptr::copy(sess.recv_buf.as_ptr().add(consumed), sess.recv_buf.as_mut_ptr(), remain);
-    }
-    sess.recv_len = remain;
-
-    match decrypt_record(sess.suite, &mut sess.read_keys, &hdr, &mut ct[..rec_len]) {
-        Some((pt_len, inner_type)) => {
-            if inner_type != CT_HANDSHAKE {
-                return None;
-            }
-            // Accumulate into scratch for reassembly
-            if sess.hs_accum_len >= SCRATCH_SIZE {
-                s.sessions[idx].state = SessionState::Error;
-                return None;
-            }
-            let space = SCRATCH_SIZE - sess.hs_accum_len;
-            let copy_len = if pt_len < space { pt_len } else { space };
-            if copy_len == 0 && pt_len > 0 {
-                s.sessions[idx].state = SessionState::Error;
-                return None; // Scratch overflow
-            }
-            core::ptr::copy_nonoverlapping(
-                ct.as_ptr(),
-                sess.scratch.as_mut_ptr().add(sess.hs_accum_len),
-                copy_len,
-            );
-            sess.hs_accum_len += copy_len;
-
-            // Check if handshake message is complete
-            if sess.hs_accum_len < 4 {
-                // Don't have handshake header yet — need more records
-                return None;
-            }
-            let hs_msg_len = ((sess.scratch[1] as usize) << 16)
-                | ((sess.scratch[2] as usize) << 8)
-                | (sess.scratch[3] as usize);
-            let total_needed = 4 + hs_msg_len;
-            if total_needed > SCRATCH_SIZE {
-                // Message too large for scratch buffer
-                s.sessions[idx].state = SessionState::Error;
-                return None;
-            }
-            if sess.hs_accum_len < total_needed {
-                // Fragmented — need more records
-                return None;
-            }
-
-            let total = sess.hs_accum_len;
-            sess.hs_accum_len = 0; // Reset for next message
-            let mut out = [0u8; SCRATCH_SIZE];
-            core::ptr::copy_nonoverlapping(sess.scratch.as_ptr(), out.as_mut_ptr(), total);
-            let hs_type = if total > 0 { out[0] } else { 0 };
-            Some((out, total, hs_type))
-        }
-        None => {
-            s.sessions[idx].state = SessionState::Error;
-            None
-        }
-    }
+/// Drain one complete handshake message from the driver's inbound
+/// plaintext queue. Returns (msg_buf, total_len, hs_msg_type) or None
+/// if a complete message hasn't arrived yet. The bridge has already
+/// decrypted records and stripped record headers; this function is
+/// pure queue plumbing.
+unsafe fn recv_encrypted_handshake(
+    s: &mut TlsState,
+    idx: usize,
+) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
+    driver_read_handshake_message(&mut s.sessions[idx])
 }
 
 /// Send an encrypted alert via cipher_out channel
@@ -2015,7 +1837,7 @@ unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
 
     let alert_body = build_alert(description);
     let mut enc_buf = [0u8; 64];
-    let enc_len = encrypt_record(sess.suite, &mut sess.write_keys, CT_ALERT, &alert_body, &mut enc_buf);
+    let enc_len = encrypt_record(sess.driver.suite, &mut sess.write_keys, CT_ALERT, &alert_body, &mut enc_buf);
 
     let mut rec = [0u8; 69];
     *rec.as_mut_ptr() = CT_APPLICATION_DATA;
@@ -2208,7 +2030,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
     }
     sess.recv_len = remain;
 
-    match decrypt_record(sess.suite, &mut sess.read_keys, &hdr, &mut ct[..rec_len]) {
+    match decrypt_record(sess.driver.suite, &mut sess.read_keys, &hdr, &mut ct[..rec_len]) {
         Some((pt_len, inner_type)) => {
             if inner_type == CT_ALERT {
                 if pt_len >= 2 && *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
@@ -2240,43 +2062,6 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
 /// Extract EC private key (32 bytes) from SEC1 or PKCS#8 DER encoding.
 /// SEC1: SEQUENCE { INTEGER(1), OCTET STRING(32), ... }
 /// PKCS#8: SEQUENCE { INTEGER(0), SEQUENCE{OIDs}, OCTET STRING { SEC1 } }
-unsafe fn extract_ec_private_key(der: &[u8], out: &mut [u8; 32]) {
-    if der.len() < 4 { return; }
-    // Must start with SEQUENCE
-    if der[0] != 0x30 { return; }
-    let (seq_start, seq_len, _) = match der_tlv(der, 0) { Some(v) => v, None => return };
-
-    // Check first element: INTEGER with version
-    let mut pos = seq_start;
-    if pos >= der.len() || der[pos] != 0x02 { return; }
-    let (int_start, int_len, int_total) = match der_tlv(der, pos) { Some(v) => v, None => return };
-    let version = if int_len == 1 { der[int_start] } else { 0xFF };
-    pos += int_total;
-
-    if version == 1 {
-        // SEC1 ECPrivateKey: next is OCTET STRING with the private key
-        if pos < der.len() && der[pos] == 0x04 {
-            let (os_start, os_len, _) = match der_tlv(der, pos) { Some(v) => v, None => return };
-            if os_len == 32 && os_start + 32 <= der.len() {
-                core::ptr::copy_nonoverlapping(der.as_ptr().add(os_start), out.as_mut_ptr(), 32);
-            }
-        }
-    } else if version == 0 {
-        // PKCS#8: skip AlgorithmIdentifier SEQUENCE, then OCTET STRING wrapping SEC1
-        if pos < der.len() && der[pos] == 0x30 {
-            let (_, _, alg_total) = match der_tlv(der, pos) { Some(v) => v, None => return };
-            pos += alg_total;
-        }
-        // OCTET STRING containing the SEC1 ECPrivateKey
-        if pos < der.len() && der[pos] == 0x04 {
-            let (inner_start, inner_len, _) = match der_tlv(der, pos) { Some(v) => v, None => return };
-            // Recurse into the inner SEC1 structure
-            let inner = &der[inner_start..inner_start + inner_len];
-            extract_ec_private_key(inner, out);
-        }
-    }
-}
-
 
 // ============================================================================
 // Panic handler

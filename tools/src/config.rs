@@ -1332,6 +1332,8 @@ const NON_PARAM_KEYS: &[&str] = &[
     "protection",
     "cert_file",
     "key_file",
+    "trust_cert_file",
+    "verify_hostname",
     "domain",
     "sample_rate", // injected by graph_sample_rate
 ];
@@ -1886,6 +1888,41 @@ fn build_module_entry(
                 }
             }
             Err(e) => eprintln!("  warn: key_file: could not read '{}': {}", key_path, e),
+        }
+    }
+
+    // Tag 12: trust_cert_file (DER blob, extended TLV).
+    if let Some(path) = module.get("trust_cert_file").and_then(|v| v.as_str()) {
+        match std::fs::read(path) {
+            Ok(data) => {
+                let n = data.len();
+                if n > 0 && base + extra_len + 4 + n < entry.len() {
+                    entry[base + extra_len] = 12;
+                    entry[base + extra_len + 1] = 0x00;
+                    entry[base + extra_len + 2] = (n >> 8) as u8;
+                    entry[base + extra_len + 3] = n as u8;
+                    entry[base + extra_len + 4..base + extra_len + 4 + n]
+                        .copy_from_slice(&data);
+                    extra_len += 4 + n;
+                    eprintln!("  trust_cert_file: {} ({} bytes)", path, n);
+                }
+            }
+            Err(e) => eprintln!("  warn: trust_cert_file: could not read '{}': {}", path, e),
+        }
+    }
+
+    // Tag 13: verify_hostname (ASCII string, extended TLV).
+    if let Some(name) = module.get("verify_hostname").and_then(|v| v.as_str()) {
+        let bytes = name.as_bytes();
+        let n = bytes.len();
+        if n > 0 && n < 256 && base + extra_len + 4 + n < entry.len() {
+            entry[base + extra_len] = 13;
+            entry[base + extra_len + 1] = 0x00;
+            entry[base + extra_len + 2] = (n >> 8) as u8;
+            entry[base + extra_len + 3] = n as u8;
+            entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
+            extra_len += 4 + n;
+            eprintln!("  verify_hostname: {}", name);
         }
     }
 

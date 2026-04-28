@@ -6,9 +6,9 @@ pub struct KeySchedule {
     pub suite: CipherSuite,
     pub alg: HashAlg,
     pub hash_len: usize,
-    early_secret: [u8; 48],
-    handshake_secret: [u8; 48],
-    master_secret: [u8; 48],
+    pub early_secret: [u8; 48],
+    pub handshake_secret: [u8; 48],
+    pub master_secret: [u8; 48],
     pub client_hs_secret: [u8; 48],
     pub server_hs_secret: [u8; 48],
     pub client_app_secret: [u8; 48],
@@ -114,6 +114,70 @@ impl KeySchedule {
         let mut out = [0u8; 48];
         hmac(self.alg, &finished_key[..hl], transcript_hash, &mut out[..hl]);
         out
+    }
+}
+
+/// 0-RTT / resumption key schedule additions (RFC 8446 §7.1).
+///
+/// The early secret is HKDF-Extract(0, PSK). For non-resumed handshakes
+/// PSK = 0^hash_len; for resumed handshakes it's the per-ticket PSK
+/// derived from the resumption_master_secret + ticket_nonce.
+impl KeySchedule {
+    /// Re-seed the early secret using an external PSK. Call this BEFORE
+    /// `derive_handshake_secrets` on a resumption attempt; the PSK
+    /// becomes part of the key schedule chain.
+    pub fn seed_psk(&mut self, psk: &[u8]) {
+        let alg = self.alg;
+        let hl = self.hash_len;
+        // Early Secret = HKDF-Extract(salt=0, IKM=PSK)
+        hkdf_extract(alg, &[], psk, &mut self.early_secret[..hl]);
+    }
+
+    /// Derive `client_early_traffic_secret` from the early secret +
+    /// transcript hash through the truncated ClientHello (i.e. up to
+    /// but not including the binders array, RFC 8446 §4.2.11.2).
+    pub fn derive_client_early_traffic(
+        &self,
+        ch_truncated_hash: &[u8],
+        out: &mut [u8],
+    ) {
+        let alg = self.alg;
+        let hl = self.hash_len;
+        derive_secret(alg, &self.early_secret[..hl], b"c e traffic", ch_truncated_hash, &mut out[..hl]);
+    }
+
+    /// Compute the PSK binder. binder = HMAC(finished_key,
+    /// hash(truncated CH)) where finished_key =
+    /// HKDF-Expand-Label(binder_key, "finished", "", hash_len) and
+    /// binder_key = Derive-Secret(early_secret, "res binder", hash("")).
+    pub fn psk_binder(&self, ch_truncated_hash: &[u8]) -> [u8; 48] {
+        let alg = self.alg;
+        let hl = self.hash_len;
+        let mut empty_hash = [0u8; 48];
+        hash_empty(alg, &mut empty_hash[..hl]);
+        let mut binder_key = [0u8; 48];
+        derive_secret(alg, &self.early_secret[..hl], b"res binder", &empty_hash[..hl], &mut binder_key[..hl]);
+        let mut finished_key = [0u8; 48];
+        hkdf_expand_label(alg, &binder_key[..hl], b"finished", &[], &mut finished_key[..hl]);
+        let mut out = [0u8; 48];
+        hmac(alg, &finished_key[..hl], ch_truncated_hash, &mut out[..hl]);
+        out
+    }
+
+    /// Derive resumption_master_secret from master_secret + transcript
+    /// hash through client Finished (RFC 8446 §7.1).
+    pub fn derive_resumption_master(&self, transcript_hash: &[u8], out: &mut [u8]) {
+        let alg = self.alg;
+        let hl = self.hash_len;
+        derive_secret(alg, &self.master_secret[..hl], b"res master", transcript_hash, &mut out[..hl]);
+    }
+
+    /// Derive a PSK from RMS + ticket_nonce (RFC 8446 §4.6.1):
+    /// PSK = HKDF-Expand-Label(RMS, "resumption", ticket_nonce, hash_len)
+    pub fn ticket_psk(&self, rms: &[u8], ticket_nonce: &[u8], out: &mut [u8]) {
+        let alg = self.alg;
+        let hl = self.hash_len;
+        hkdf_expand_label(alg, &rms[..hl], b"resumption", ticket_nonce, &mut out[..hl]);
     }
 }
 

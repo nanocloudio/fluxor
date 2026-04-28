@@ -316,6 +316,38 @@ impl Drop for AesKey {
     }
 }
 
+/// Public AES-ECB primitive — encrypts a single 16-byte block under
+/// `key`. Used by QUIC header protection (RFC 9001 §5.4) and other
+/// places that need a raw single-block primitive without GHASH state.
+/// The function inlines the round-key expansion each call; callers
+/// who do header protection per-packet should cache the expanded key
+/// in `Aes128Hp` instead.
+#[allow(dead_code)]
+pub fn aes128_ecb_encrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
+    let aes = AesKey::expand_128(key);
+    aes.encrypt_block(block);
+}
+
+/// Cached AES-128 encryption context for repeated single-block
+/// encryption (header protection's hot path). Stores the expanded
+/// round keys once per epoch.
+pub struct Aes128Hp {
+    aes: AesKey,
+}
+
+#[allow(dead_code)]
+impl Aes128Hp {
+    pub fn new(key: &[u8; 16]) -> Self {
+        Self { aes: AesKey::expand_128(key) }
+    }
+
+    /// Encrypt one 16-byte block in place. Used to compute the
+    /// header-protection mask from a 16-byte ciphertext sample.
+    pub fn encrypt_block(&self, block: &mut [u8; 16]) {
+        self.aes.encrypt_block(block);
+    }
+}
+
 impl Drop for AesGcm {
     fn drop(&mut self) {
         zeroize(&mut self.h);

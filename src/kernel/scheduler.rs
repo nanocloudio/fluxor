@@ -2224,11 +2224,27 @@ fn insert_fan(
             edges[*edge_count] = new_edge;
             *edge_count += 1;
 
-            // Rewire group edges to go through the fan module
+            // Rewire group edges to go through the fan module. The
+            // port indices on the rewritten edges must repack from 0
+            // (one slot per fanned consumer/producer) because the
+            // tee/merge module has only a single logical input/output
+            // port — `collect_channels` places channels at
+            // `from_port_index` / `to_port_index`, and if the original
+            // edges all carried the same source-side port index (e.g.
+            // every fan-out edge inheriting peer_router.raft_rpc's
+            // index 3) they would land in the same slot and overwrite,
+            // leaving the tee/merge with `out_chans[0..k] = -1` so its
+            // poll loop bails before it does any work.
             for k in 0..group_count {
                 match direction {
-                    FanDirection::Out => edges[group[k]].from_module = fan_idx,
-                    FanDirection::In => edges[group[k]].to_module = fan_idx,
+                    FanDirection::Out => {
+                        edges[group[k]].from_module = fan_idx;
+                        edges[group[k]].from_port_index = k as u8;
+                    }
+                    FanDirection::In => {
+                        edges[group[k]].to_module = fan_idx;
+                        edges[group[k]].to_port_index = k as u8;
+                    }
                 }
             }
         }

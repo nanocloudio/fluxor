@@ -1,0 +1,31 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# QUIC v1 (RFC 9000 + RFC 9001). Drives the same TLS 1.3
+# `HandshakeDriver` the TLS / DTLS modules use, with QUIC's CRYPTO
+# frames instead of records. RFC 9001 §A.1 Initial-keys derivation
+# is self-checked at module_new and logged on success/failure.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "app_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "app_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "channel"
+access = "read"

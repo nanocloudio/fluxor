@@ -72,10 +72,13 @@ mod client;
 mod client_h2;
 mod connection;
 mod h2;
+mod h3;
 mod hpack;
+mod qpack;
 mod server;
 mod wire_h1;
 mod wire_h2;
+mod wire_h3;
 mod wire_ws;
 
 use client::ClientState;

@@ -200,6 +200,21 @@ const CMD_SEND: u8 = 0x11;
 const CMD_CLOSE: u8 = 0x12;
 const CMD_CONNECT: u8 = 0x13;
 
+// Datagram surface (modules/sdk/contracts/net/datagram.rs, opcodes
+// 0x20..0x43). Disjoint from net_proto so the same channel can carry
+// both contracts.
+const DG_CMD_BIND: u8 = 0x20;
+const DG_CMD_SEND_TO: u8 = 0x21;
+const DG_CMD_CLOSE: u8 = 0x22;
+const DG_MSG_BOUND: u8 = 0x40;
+const DG_MSG_RX_FROM: u8 = 0x41;
+const DG_MSG_CLOSED: u8 = 0x42;
+#[allow(dead_code)]
+const DG_MSG_ERROR: u8 = 0x43;
+const DG_AF_INET: u8 = 4;
+
+const CONN_TYPE_UDP_BOUND: u8 = 2;
+
 const LINUX_NET_MAX_CONNS: usize = 24;
 
 #[derive(Clone, Copy)]
@@ -270,7 +285,12 @@ unsafe fn linux_net_send_msg(st: &LinuxNetState, data: &[u8]) {
     let msg_type = data[0];
     let payload = &data[1..];
     let payload_len = payload.len() as u16;
-    let mut frame = [0u8; 512];
+    // Sized to fit a max-payload UDP datagram (1500 MTU) + the
+    // datagram-surface header overhead (1 op + 2 len + 9 ep/AF/port/ip).
+    let mut frame = [0u8; 1600];
+    if 3 + payload.len() > frame.len() {
+        return;
+    }
     frame[0] = msg_type;
     frame[1] = payload_len as u8;
     frame[2] = (payload_len >> 8) as u8;
@@ -336,6 +356,165 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
 
     let msg = [MSG_BOUND];
     linux_net_send_msg(st, &msg);
+}
+
+// ----------------------------------------------------------------------
+// Datagram surface — UDP bind / send_to / recvfrom on the same channel
+// ----------------------------------------------------------------------
+
+unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16) {
+    let slot = linux_net_alloc_conn(st);
+    if slot < 0 {
+        log::error!("[linux_net] no free slots for UDP bind");
+        return;
+    }
+
+    let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+    if fd < 0 {
+        log::error!("[linux_net] UDP socket() failed");
+        return;
+    }
+    let opt: i32 = 1;
+    libc::setsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_REUSEADDR,
+        &opt as *const i32 as *const libc::c_void,
+        4,
+    );
+
+    let mut addr: libc::sockaddr_in = core::mem::zeroed();
+    addr.sin_family = libc::AF_INET as u16;
+    addr.sin_port = port.to_be();
+    addr.sin_addr.s_addr = 0;
+
+    if libc::bind(
+        fd,
+        &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+        core::mem::size_of::<libc::sockaddr_in>() as u32,
+    ) < 0
+    {
+        log::error!("[linux_net] UDP bind() failed on port {}", port);
+        libc::close(fd);
+        return;
+    }
+    set_nonblocking(fd);
+    let idx = slot as usize;
+    st.conns[idx] = LinuxNetConn {
+        fd,
+        conn_type: CONN_TYPE_UDP_BOUND,
+        state: 3,
+    };
+    log::info!("[linux_net] UDP bound port {} (slot {})", port, idx);
+
+    // MSG_DG_BOUND payload (datagram contract):
+    //   [ep_id: u8] [local_port: u16 LE].
+    let mut msg = [0u8; 1 + 3];
+    msg[0] = DG_MSG_BOUND;
+    msg[1] = idx as u8;
+    msg[2] = (port & 0xFF) as u8;
+    msg[3] = (port >> 8) as u8;
+    linux_net_send_msg(st, &msg);
+}
+
+unsafe fn linux_net_dg_cmd_send_to(
+    st: &LinuxNetState,
+    ep: i16,
+    ip: [u8; 4],
+    port: u16,
+    data: &[u8],
+) {
+    if ep < 0 || (ep as usize) >= LINUX_NET_MAX_CONNS {
+        return;
+    }
+    let idx = ep as usize;
+    let conn = st.conns[idx];
+    if conn.state != 3 || conn.conn_type != CONN_TYPE_UDP_BOUND || conn.fd < 0 {
+        return;
+    }
+    let mut addr: libc::sockaddr_in = core::mem::zeroed();
+    addr.sin_family = libc::AF_INET as u16;
+    addr.sin_port = port.to_be();
+    addr.sin_addr.s_addr = u32::from_le_bytes([ip[0], ip[1], ip[2], ip[3]]);
+    libc::sendto(
+        conn.fd,
+        data.as_ptr() as *const libc::c_void,
+        data.len(),
+        libc::MSG_NOSIGNAL,
+        &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+        core::mem::size_of::<libc::sockaddr_in>() as u32,
+    );
+}
+
+unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16) {
+    if ep < 0 || (ep as usize) >= LINUX_NET_MAX_CONNS {
+        return;
+    }
+    let idx = ep as usize;
+    if st.conns[idx].fd >= 0 && st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND {
+        libc::close(st.conns[idx].fd);
+    }
+    st.conns[idx] = LinuxNetConn::EMPTY;
+
+    let mut msg = [0u8; 3];
+    msg[0] = DG_MSG_CLOSED;
+    let ep_b = ep.to_le_bytes();
+    msg[1] = ep_b[0];
+    msg[2] = ep_b[1];
+    linux_net_send_msg(st, &msg);
+}
+
+unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
+    let mut had_work = false;
+    let mut i = 0;
+    while i < LINUX_NET_MAX_CONNS {
+        if st.conns[i].conn_type == CONN_TYPE_UDP_BOUND
+            && st.conns[i].state == 3
+            && st.conns[i].fd >= 0
+        {
+            let mut from: libc::sockaddr_in = core::mem::zeroed();
+            let mut from_len: libc::socklen_t =
+                core::mem::size_of::<libc::sockaddr_in>() as u32;
+            let n = libc::recvfrom(
+                st.conns[i].fd,
+                st.recv_buf.as_mut_ptr() as *mut libc::c_void,
+                st.recv_buf.len(),
+                0,
+                &mut from as *mut libc::sockaddr_in as *mut libc::sockaddr,
+                &mut from_len,
+            );
+            if n > 0 {
+                let n = n as usize;
+                let port = u16::from_be(from.sin_port);
+                let ip_b = from.sin_addr.s_addr.to_le_bytes();
+                // MSG_DG_RX_FROM IPv4 payload (datagram contract):
+                //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][data...].
+                let payload_len = 1 + 1 + 4 + 2 + n;
+                if 1 + payload_len > st.msg_buf.len() {
+                    i += 1;
+                    continue;
+                }
+                st.msg_buf[0] = DG_MSG_RX_FROM;
+                st.msg_buf[1] = i as u8;
+                st.msg_buf[2] = DG_AF_INET;
+                st.msg_buf[3] = ip_b[0];
+                st.msg_buf[4] = ip_b[1];
+                st.msg_buf[5] = ip_b[2];
+                st.msg_buf[6] = ip_b[3];
+                st.msg_buf[7] = (port & 0xFF) as u8;
+                st.msg_buf[8] = (port >> 8) as u8;
+                core::ptr::copy_nonoverlapping(
+                    st.recv_buf.as_ptr(),
+                    st.msg_buf.as_mut_ptr().add(9),
+                    n,
+                );
+                linux_net_send_msg(st, &st.msg_buf[..1 + payload_len]);
+                had_work = true;
+            }
+        }
+        i += 1;
+    }
+    had_work
 }
 
 unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, port: u16) {
@@ -598,6 +777,38 @@ fn linux_net_step(state: *mut u8) -> i32 {
                         linux_net_cmd_close(st, conn_id);
                         had_work = true;
                     }
+                    DG_CMD_BIND if payload_len >= 3 => {
+                        // Payload (modules/sdk/contracts/net/datagram.rs):
+                        //   [port: u16 LE] [flags: u8].
+                        let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                        linux_net_dg_cmd_bind(st, port);
+                        had_work = true;
+                    }
+                    DG_CMD_SEND_TO if payload_len >= 8 => {
+                        // IPv4 payload (datagram contract):
+                        //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...].
+                        let ep = st.cmd_buf[0] as i16;
+                        let ip = [
+                            st.cmd_buf[2],
+                            st.cmd_buf[3],
+                            st.cmd_buf[4],
+                            st.cmd_buf[5],
+                        ];
+                        let port = u16::from_le_bytes([st.cmd_buf[6], st.cmd_buf[7]]);
+                        let data_len = payload_len - 8;
+                        let data = core::slice::from_raw_parts(
+                            st.cmd_buf.as_ptr().add(8),
+                            data_len,
+                        );
+                        linux_net_dg_cmd_send_to(st, ep, ip, port, data);
+                        had_work = true;
+                    }
+                    DG_CMD_CLOSE if payload_len >= 1 => {
+                        // Payload: [ep_id: u8].
+                        let ep = st.cmd_buf[0] as i16;
+                        linux_net_dg_cmd_close(st, ep);
+                        had_work = true;
+                    }
                     _ => {
                         log::warn!(
                             "[linux_net] unknown cmd 0x{:02x} pl={}",
@@ -613,6 +824,9 @@ fn linux_net_step(state: *mut u8) -> i32 {
             had_work = true;
         }
         if linux_net_poll_recv(st) {
+            had_work = true;
+        }
+        if linux_net_dg_poll_recv(st) {
             had_work = true;
         }
 
