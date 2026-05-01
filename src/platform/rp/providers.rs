@@ -1152,7 +1152,6 @@ unsafe fn rp_system_extension_dispatch(
             while crate::kernel::rp_providers::dma_busy(ch_tx) != 0 {}
             compiler_fence(Ordering::SeqCst);
 
-            
             (tx_words * 4 + rx_words * 4) as i32
         }
         // ── PLATFORM_DMA: channel family ──────────────────────────────

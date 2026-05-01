@@ -8,4 +8,4 @@
 // consume ~1.5 MB of state.
 pub const STATE_ARENA_SIZE: usize = 4 * 1024 * 1024;
 pub const BUFFER_ARENA_SIZE: usize = 1024 * 1024;
-pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
+pub const MAX_MODULE_CONFIG_SIZE: usize = 32 * 1024;

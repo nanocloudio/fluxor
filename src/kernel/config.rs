@@ -431,7 +431,7 @@ pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + 16
 pub const MAX_MODULE_PARAMS_LEN: usize = 16384;
 
 /// Config arena size for storing variable-length module params
-pub const CONFIG_ARENA_SIZE: usize = 16384;
+pub const CONFIG_ARENA_SIZE: usize = 64 * 1024;
 
 /// Static arena for module params storage
 static mut CONFIG_ARENA: [u8; CONFIG_ARENA_SIZE] = [0; CONFIG_ARENA_SIZE];
@@ -717,7 +717,7 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
 
     // Sanity-check total config size against flash bounds
     let total_size = 8 + body_size;
-    const MAX_CONFIG_SIZE: usize = 16384;
+    const MAX_CONFIG_SIZE: usize = 32 * 1024;
     if total_size > MAX_CONFIG_SIZE {
         log::error!(
             "[config] too large size={} max={}",
@@ -740,7 +740,7 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         }
     }
     // Bounds-check: module section size should be reasonable
-    const MAX_MODULE_SECTION: usize = 16384;
+    const MAX_MODULE_SECTION: usize = 32 * 1024;
     if section_size > MAX_MODULE_SECTION {
         log::error!(
             "[config] module section too large size={} max={}",

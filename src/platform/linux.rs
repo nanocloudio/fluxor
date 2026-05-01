@@ -106,6 +106,7 @@ fn parse_args() -> CliArgs {
 include!("linux/providers.rs");
 include!("linux/builtin_params.rs");
 include!("linux/host_asset_source.rs");
+include!("linux/host_asset_index.rs");
 include!("linux/linux_display.rs");
 include!("linux/linux_audio.rs");
 include!("linux/host_image_codec.rs");
@@ -241,6 +242,13 @@ fn main() {
 
         if entry.name_hash == HOST_ASSET_SOURCE_HASH {
             let m = build_host_asset_source(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == HOST_ASSET_INDEX_HASH {
+            let m = build_host_asset_index(module_idx, entry.params());
             scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;

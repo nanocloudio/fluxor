@@ -76,6 +76,21 @@ const CONTENT_TYPES: &[&str] = &[
     "VideoDraw",
     "VideoScanout",
     "MediaMuxed",
+    // WebSocket frame surface — header `{conn_id u32, opcode u8, fin u8,
+    // payload_len u16}` followed by `payload_len` bytes. Carried on a port
+    // when foundation/http (or another transport gateway) is configured to
+    // fan out upgraded connections to a downstream module instead of
+    // handling frames internally.
+    "WsFrame",
+    // Input surface primitive (see input_capability_surface.md §6).
+    "InputBinaryState",
+    // Zedex-private event timelines bridging the emulator core to the
+    // platform-specific renderer modules. Carry video/audio events with
+    // t-state timestamps; consumed only by zedex's spectrum_video /
+    // spectrum_audio. May be replaced by a generic EventTimeline if one
+    // lands later.
+    "ZedexVideoEvents",
+    "ZedexAudioEvents",
 ];
 
 fn content_type_from_str(s: &str) -> Result<u8> {
@@ -166,15 +181,17 @@ fn contract_name_to_str(class: u8) -> &'static str {
     }
 }
 
-/// Whitelist of AV / presentation capability names accepted in a
-/// manifest's top-level `capabilities = [...]` list. Two tiers:
+/// Whitelist of AV / presentation / input capability names accepted in
+/// a manifest's top-level `capabilities = [...]` list. Two tiers:
 /// hardware-facing (the role the module plays — paced scanout, group
-/// clock, protected output) and service-level (the surface a producer
-/// or consumer carries). Unknown names are rejected at parse time so
-/// `display.scaneout` and friends fail the build rather than silently
-/// dropping out.
+/// clock, protected output, mapper) and service-level (the surface a
+/// producer or consumer carries). Unknown names are rejected at parse
+/// time so `display.scaneout` and friends fail the build rather than
+/// silently dropping out.
 ///
-/// Documented in `docs/architecture/av_capability_surface.md`.
+/// AV names are documented in `docs/architecture/av_capability_surface.md`.
+/// Input names are documented in `docs/architecture/input_capability_surface.md`
+/// and added one at a time as a real module declares them.
 const AV_CAPABILITY_NAMES: &[&str] = &[
     // Hardware-facing
     "display.scanout",
@@ -197,6 +214,11 @@ const AV_CAPABILITY_NAMES: &[&str] = &[
     "media.muxed",
     "media.protected_path",
     "presentation.group",
+    // Input (added as modules declare them; see input_capability_surface.md §5)
+    "input.mapper",
+    "input.gamepad",
+    "input.virtual",
+    "input.remote",
 ];
 
 /// Validate capability names against the whitelist and canonicalize each
@@ -1097,7 +1119,7 @@ impl Manifest {
             signature,
             signer_fp,
             commands: CommandVocabulary::default(),
-            provides: Vec::new(), // not serialized in binary format
+            provides: Vec::new(),     // not serialized in binary format
             capabilities: Vec::new(), // not serialized in binary format
             builtin: false,
             params: Vec::new(), // toml-only, not serialized

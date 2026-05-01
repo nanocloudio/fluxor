@@ -1213,7 +1213,7 @@ const MAX_MODULES: usize = 64;
 const MODULE_ENTRY_HEADER_SIZE: usize = 8;
 
 /// Maximum module params size (allows for wavetables, large sequences, etc.)
-const MAX_MODULE_PARAMS_SIZE: usize = 16384;
+const MAX_MODULE_PARAMS_SIZE: usize = 32 * 1024;
 
 /// Param base offset within a module entry (= header size = 8)
 const P: usize = MODULE_ENTRY_HEADER_SIZE;
@@ -1901,8 +1901,7 @@ fn build_module_entry(
                     entry[base + extra_len + 1] = 0x00;
                     entry[base + extra_len + 2] = (n >> 8) as u8;
                     entry[base + extra_len + 3] = n as u8;
-                    entry[base + extra_len + 4..base + extra_len + 4 + n]
-                        .copy_from_slice(&data);
+                    entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&data);
                     extra_len += 4 + n;
                     eprintln!("  trust_cert_file: {} ({} bytes)", path, n);
                 }
@@ -2005,10 +2004,7 @@ pub fn extract_module_search_paths(
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
 
-    if let Some(arr) = config
-        .get("module_search_paths")
-        .and_then(|v| v.as_array())
-    {
+    if let Some(arr) = config.get("module_search_paths").and_then(|v| v.as_array()) {
         for entry in arr {
             if let Some(s) = entry.as_str() {
                 let joined = config_dir.join(s);
@@ -2223,8 +2219,7 @@ const CONTINUITY_POLICIES: &[&str] = &["drain", "anchor_preserved"];
 const MIRROR_POLICIES: &[&str] = &["independent", "strict_mirror", "partition"];
 const AUDIO_SINK_CAPS: &[&str] = &["audio.sample", "audio.encoded"];
 const VIDEO_SINK_CAPS: &[&str] = &["video.raster", "video.scanout", "video.encoded"];
-const VIDEO_PROTECTED_CAPS: &[&str] =
-    &["display.protected_scanout", "video.protected_decode"];
+const VIDEO_PROTECTED_CAPS: &[&str] = &["display.protected_scanout", "video.protected_decode"];
 
 /// Maximum value (in ms) accepted for `latency_budget_ms` /
 /// `skew_budget_ms`. Beyond this the value almost certainly indicates a
@@ -2326,15 +2321,12 @@ pub fn validate_presentation_groups(
             })?
             .to_string();
 
-        let members_raw = g
-            .get("members")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "presentation_group `{}`: required field `members` missing",
-                    id
-                ))
-            })?;
+        let members_raw = g.get("members").and_then(|v| v.as_array()).ok_or_else(|| {
+            Error::Config(format!(
+                "presentation_group `{}`: required field `members` missing",
+                id
+            ))
+        })?;
         let mut members: Vec<String> = Vec::with_capacity(members_raw.len());
         for (mi, raw) in members_raw.iter().enumerate() {
             let s = raw.as_str().ok_or_else(|| {
@@ -2374,8 +2366,7 @@ pub fn validate_presentation_groups(
                 .map(|m| m.capabilities.as_slice())
                 .unwrap_or(&[])
         };
-        let has_cap =
-            |caps: &[String], wanted: &str| -> bool { caps.iter().any(|c| c == wanted) };
+        let has_cap = |caps: &[String], wanted: &str| -> bool { caps.iter().any(|c| c == wanted) };
         let has_any_cap = |caps: &[String], wanted: &[&str]| -> bool {
             caps.iter().any(|c| wanted.contains(&c.as_str()))
         };
@@ -2403,21 +2394,20 @@ pub fn validate_presentation_groups(
         // `audio.protected_out`; every video sink must declare either
         // `display.protected_scanout` or `video.protected_decode`. A
         // protected path is end-to-end or it isn't a protected path.
-        if g.get("protected").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if g.get("protected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             for m in &members {
                 let caps = manifest_caps(m);
-                if has_any_cap(caps, AUDIO_SINK_CAPS)
-                    && !has_cap(caps, "audio.protected_out")
-                {
+                if has_any_cap(caps, AUDIO_SINK_CAPS) && !has_cap(caps, "audio.protected_out") {
                     return Err(Error::Config(format!(
                         "presentation_group `{}`: protected=true but audio member \
                          `{}` does not declare `audio.protected_out`",
                         id, m
                     )));
                 }
-                if has_any_cap(caps, VIDEO_SINK_CAPS)
-                    && !has_any_cap(caps, VIDEO_PROTECTED_CAPS)
-                {
+                if has_any_cap(caps, VIDEO_SINK_CAPS) && !has_any_cap(caps, VIDEO_PROTECTED_CAPS) {
                     return Err(Error::Config(format!(
                         "presentation_group `{}`: protected=true but video member \
                          `{}` does not declare `display.protected_scanout` or \
@@ -2430,7 +2420,10 @@ pub fn validate_presentation_groups(
 
         // Multihead: at least two members must be independently bindable
         // paced display outputs.
-        if g.get("multihead").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if g.get("multihead")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             let scanout_count = members
                 .iter()
                 .filter(|m| has_cap(manifest_caps(m), "display.scanout"))

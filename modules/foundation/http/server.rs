@@ -25,10 +25,34 @@ use super::{
 // ── Sizes / capacities ─────────────────────────────────────────────────────
 
 pub(crate) const RECV_BUF_SIZE: usize = 2048;
-pub(crate) const SEND_BUF_SIZE: usize = 1024;
+/// Depth of the in-flight accept queue (`ServerState::pending_accept`).
+/// Each entry costs one byte of state and bounds the number of
+/// short-lived HTTP requests that can land in parallel without
+/// dropping. 4 is comfortable for a typical browser session
+/// (HTML + favicon + a couple of racing reloads).
+pub(crate) const PENDING_ACCEPT_DEPTH: usize = 4;
+/// Per-queued-slot inbound buffer size. Matches `RECV_BUF_SIZE` so the
+/// truncation point is the same whether a request lands while its conn
+/// is queued or while it is current — otherwise large requests on
+/// queued conns would silently overflow this smaller buffer while the
+/// same requests on the current conn would parse fine. Overflow is
+/// handled by closing the connection cleanly (see
+/// `pending_data_append`); silent truncation is not safe because
+/// `linux_net` has already drained those bytes from the socket.
+pub(crate) const PENDING_DATA_BYTES: usize = RECV_BUF_SIZE;
+// Sized to hold one full-size WS frame: a `WsFrame`-sourced payload of up
+// to `CHANNEL_BUFFER_SIZE - WS_FRAME_HDR` (= 2040) bytes plus the 4-byte
+// extended-length WS header. Smaller HTTP responses share the same buffer.
+pub(crate) const SEND_BUF_SIZE: usize = 2048;
 pub(crate) const MAX_ROUTES: usize = 4;
 pub(crate) const MAX_PATH: usize = 32;
-pub(crate) const DEFAULT_BODY_POOL_SIZE: usize = 3072;
+// Sized to comfortably hold a single page-sized response body. Apps that
+// only ever serve short replies (status, JSON, small HTML) waste some
+// memory; apps that need larger bodies (e.g. a UI's index.html embedded
+// via `body:`, especially one that inlines a browser-side runtime + an
+// app profile) can rely on this default rather than wiring up a file
+// source module. Capped by `body_pool_cap: u16` at ~64 KiB.
+pub(crate) const DEFAULT_BODY_POOL_SIZE: usize = 48 * 1024;
 pub(crate) const MAX_VARS: usize = 16;
 pub(crate) const MAX_VAR_VALUE: usize = 16;
 pub(crate) const MAX_CACHE: usize = 4;
@@ -40,6 +64,13 @@ pub(crate) const HANDLER_TEMPLATE: u8 = 1;
 pub(crate) const HANDLER_FILE: u8 = 2;
 pub(crate) const HANDLER_PROXY: u8 = 3;
 pub(crate) const HANDLER_WEBSOCKET: u8 = 4;
+/// Like `HANDLER_WEBSOCKET` (101 upgrade and full RFC 6455 framing), but
+/// instead of echoing data frames internally, route them to the module's
+/// `ws_out` port as `WsFrame` records and queue outbound frames from the
+/// `ws_in` port. Lets a downstream module own application-level WS
+/// semantics (chat, command stream, raster bridge, …) while this module
+/// keeps owning HTTP and the WS protocol envelope.
+pub(crate) const HANDLER_WEBSOCKET_FANOUT: u8 = 5;
 
 const CACHE_VALID: u8 = 0x01;
 const CACHE_COMPLETE: u8 = 0x02;
@@ -165,6 +196,14 @@ pub(crate) struct ServerState {
     pub(crate) var_chan: i32,
     pub(crate) file_chan: i32,
     pub(crate) out_chan: i32,
+    /// Output channel for `ws_out` (manifest port out[2]). Carries
+    /// `WsFrame` records when a route uses `HANDLER_WEBSOCKET_FANOUT`.
+    /// `-1` if the port is unwired.
+    pub(crate) ws_out_chan: i32,
+    /// Input channel for `ws_in` (manifest port in[3]). Carries
+    /// `WsFrame` records to be queued back as outbound WS frames.
+    /// `-1` if the port is unwired.
+    pub(crate) ws_in_chan: i32,
     pub(crate) conn_id: u8,
     _conn_pad: [u8; 3],
 
@@ -197,7 +236,43 @@ pub(crate) struct ServerState {
     pub(crate) body_pool: *mut u8,
     pub(crate) body_pool_cap: u16,
     pub(crate) draining: u8,
-    _pad: [u8; 1],
+    /// Set to 1 when the matched route uses `HANDLER_WEBSOCKET_FANOUT` and
+    /// the upgrade has succeeded. Drives `ws_process_inbound` to route
+    /// frames to `ws_out` instead of echoing, and the outbound drain
+    /// path to read from `ws_in`. Cleared when the connection closes.
+    pub(crate) ws_fan_out: u8,
+    /// Set to 1 when an inbound `NET_MSG_CLOSED` triggered the
+    /// transition to `Phase::CloseConn`. The peer has already closed
+    /// and the IP module's slot is empty (or — under fast slot reuse —
+    /// already re-allocated to a fresh connection). Either way, sending
+    /// our own `NET_CMD_CLOSE` for `conn_id` would be wrong: a no-op in
+    /// the empty case, a wrong-target close in the reused case. The
+    /// flag tells `reset_connection` to skip that command and just
+    /// re-bind. Cleared whenever a fresh connection is accepted.
+    pub(crate) peer_closed: u8,
+    /// FIFO of `MSG_ACCEPTED` slot ids consumed during phases that
+    /// can't service them (WsActive, RecvRequest, mid-DrainSend, …).
+    /// The next `WaitAccept` pops the head and adopts that
+    /// connection. Without this queue, a short-lived parallel browser
+    /// request that arrives while the prior one is still mid-flight
+    /// gets its accept silently dropped — leaving the peer with no
+    /// response and the user's "browser tab refresh" experience
+    /// unreliable. 4 is enough for typical browsers (HTML + favicon +
+    /// 1-2 racing reloads) without inflating state.
+    pub(crate) pending_accept: [u8; PENDING_ACCEPT_DEPTH],
+    /// Number of valid entries at the head of `pending_accept`.
+    pub(crate) pending_accept_count: u8,
+    /// Per-queued-slot inbound HTTP data buffer, parallel to
+    /// `pending_accept`. When a `MSG_DATA` arrives while we're still
+    /// processing a different connection, linux_net has already drained
+    /// the bytes from the kernel socket buffer — we *cannot* leave
+    /// them on the wire to be re-read later. Stash them here so the
+    /// queued connection's eventual `RecvRequest` finds its request
+    /// already buffered. Sized for a typical short HTTP request line +
+    /// headers; longer payloads will arrive as additional `MSG_DATA`
+    /// in subsequent ticks once the conn becomes current.
+    pub(crate) pending_data: [[u8; PENDING_DATA_BYTES]; PENDING_ACCEPT_DEPTH],
+    pub(crate) pending_data_len: [u16; PENDING_ACCEPT_DEPTH],
 
     /// HTTP/2 connection state. Only meaningful while `phase ==
     /// Phase::H2Active`; zero-valued otherwise.
@@ -261,6 +336,11 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.var_chan = -1;
     s.server.file_chan = -1;
     s.server.out_chan = -1;
+    s.server.ws_out_chan = -1;
+    s.server.ws_in_chan = -1;
+    s.server.ws_fan_out = 0;
+    s.server.peer_closed = 0;
+    s.server.pending_accept_count = 0;
     s.server.port = 80;
     s.server.file_index = -1;
     s.server.matched_route = -1;
@@ -279,10 +359,14 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     // Discover additional ports:
     //   in[1]  = variable updates  (FmpMessage)
     //   in[2]  = file data         (OctetStream)
+    //   in[3]  = ws_in             (WsFrame, fan-out only)
     //   out[1] = file ctrl         (OctetStream)
+    //   out[2] = ws_out            (WsFrame, fan-out only)
     s.server.var_chan = dev_channel_port(sys, 0, 1);
     s.server.file_chan = dev_channel_port(sys, 0, 2);
+    s.server.ws_in_chan = dev_channel_port(sys, 0, 3);
     s.server.out_chan = dev_channel_port(sys, 1, 1);
+    s.server.ws_out_chan = dev_channel_port(sys, 1, 2);
 
     if s.server.route_count == 0 {
         let r0 = &mut *s.server.routes.as_mut_ptr().add(0);
@@ -317,31 +401,207 @@ unsafe fn log(s: &HttpState, msg: &[u8]) {
 }
 
 unsafe fn reset_connection(s: &mut HttpState) {
-    if s.server.phase as u8 > Phase::WaitAccept as u8 && s.net_out_chan >= 0 {
-        let sys = &*s.syscalls;
-        let chan = s.net_out_chan;
-        let buf = s.net_buf.as_mut_ptr();
-        let mut payload = [0u8; 1];
-        payload[0] = s.server.conn_id;
-        net_write_frame(sys, chan, NET_CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
+    // Skip CMD_CLOSE if the peer already closed (`peer_closed` flag).
+    // Otherwise the IP module would either no-op (empty slot) OR — much
+    // worse, under fast slot reuse — close the next browser connection
+    // that just landed on the same slot index. That misroute is the
+    // root cause of "only handles a single connection then falls over"
+    // in remote-play sessions.
+    if s.server.peer_closed == 0
+        && s.server.phase as u8 > Phase::WaitAccept as u8
+        && s.net_out_chan >= 0
+    {
+        close_net_conn(s, s.server.conn_id);
     }
+    s.server.peer_closed = 0;
+    // Discard any per-session buffered state — without this, leftover
+    // WS frames from the prior session can leak onto the next
+    // (non-WS) connection's response stream, scrambling the HTTP
+    // body the browser expects.
+    s.server.send_offset = 0;
+    s.server.send_len = 0;
+    s.server.recv_len = 0;
+    s.server.recv_parsed = 0;
+    s.server.ws_fan_out = 0;
+    s.server.matched_route = -1;
+    s.server.tmpl_pos = 0;
+    s.server.file_index = -1;
     // The IP module resets the listener slot to Closed when a connection
     // completes, so we must send a fresh CMD_BIND to re-listen.
     s.server.phase = Phase::Binding;
+}
+
+/// Push a queued accept onto the FIFO. Drops silently when full —
+/// linux_net's slot is left in state=2 and python/browser will time
+/// out cleanly. 4 entries is enough for a typical browser's racing
+/// HTML+favicon+reloads.
+unsafe fn pending_accept_push(s: &mut HttpState, conn_id: u8) {
+    let n = s.server.pending_accept_count as usize;
+    if n >= PENDING_ACCEPT_DEPTH {
+        return;
+    }
+    s.server.pending_accept[n] = conn_id;
+    s.server.pending_data_len[n] = 0;
+    s.server.pending_accept_count = (n + 1) as u8;
+}
+
+/// Pop the oldest queued accept and copy its buffered HTTP request
+/// bytes into `recv_buf`. Returns `Some(conn_id)` if a queued accept
+/// was popped, plus the number of bytes pre-loaded into `recv_buf`.
+unsafe fn pending_accept_pop(s: &mut HttpState) -> Option<u8> {
+    let n = s.server.pending_accept_count as usize;
+    if n == 0 {
+        return None;
+    }
+    let conn_id = s.server.pending_accept[0];
+    let buffered = s.server.pending_data_len[0] as usize;
+    if buffered > 0 {
+        let space = RECV_BUF_SIZE - s.server.recv_len as usize;
+        let to_copy = buffered.min(space);
+        if to_copy > 0 {
+            let src = s.server.pending_data[0].as_ptr();
+            let dst = s
+                .server
+                .recv_buf
+                .as_mut_ptr()
+                .add(s.server.recv_len as usize);
+            core::ptr::copy_nonoverlapping(src, dst, to_copy);
+            s.server.recv_len += to_copy as u16;
+        }
+    }
+    // Shift the queue down (and parallel data buffers).
+    let mut i = 1;
+    while i < n {
+        s.server.pending_accept[i - 1] = s.server.pending_accept[i];
+        s.server.pending_data_len[i - 1] = s.server.pending_data_len[i];
+        let src_ptr = s.server.pending_data[i].as_ptr();
+        let dst_ptr = s.server.pending_data[i - 1].as_mut_ptr();
+        core::ptr::copy_nonoverlapping(
+            src_ptr, dst_ptr, PENDING_DATA_BYTES,
+        );
+        i += 1;
+    }
+    s.server.pending_accept_count = (n - 1) as u8;
+    s.server.pending_data_len[(n - 1).max(0)] = 0;
+    Some(conn_id)
+}
+
+/// Append data to a queued connection's pending buffer. Caller must
+/// have already verified the conn is in the FIFO via
+/// `pending_accept_index(s, conn_id)`. If the request exceeds
+/// `PENDING_DATA_BYTES`, the connection is closed cleanly: `linux_net`
+/// has already drained those bytes from the socket so silent
+/// truncation would hang the parser or corrupt the parse — a clean
+/// close lets the peer see a normal disconnect and retry.
+unsafe fn pending_data_append(s: &mut HttpState, idx: usize, data: *const u8, data_len: usize) {
+    if idx >= PENDING_ACCEPT_DEPTH {
+        return;
+    }
+    let cur = s.server.pending_data_len[idx] as usize;
+    let space = PENDING_DATA_BYTES - cur;
+    let to_copy = data_len.min(space);
+    if to_copy > 0 {
+        let dst = s.server.pending_data[idx].as_mut_ptr().add(cur);
+        core::ptr::copy_nonoverlapping(data, dst, to_copy);
+        s.server.pending_data_len[idx] = (cur + to_copy) as u16;
+    }
+    if to_copy < data_len {
+        let conn_id = s.server.pending_accept[idx];
+        close_net_conn(s, conn_id);
+        let _ = pending_accept_remove(s, conn_id);
+    }
+}
+
+/// Find the FIFO index of `conn_id`, or `None` if not queued.
+unsafe fn pending_accept_index(s: &HttpState, conn_id: u8) -> Option<usize> {
+    let n = s.server.pending_accept_count as usize;
+    for i in 0..n {
+        if s.server.pending_accept[i] == conn_id {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Remove a queued conn_id from the FIFO (e.g. on `MSG_CLOSED`). No-op
+/// if not present. Without this, a parallel/orphan accept that closes
+/// before its turn in the queue would still be adopted by a later
+/// `WaitAccept`, stranding the server waiting on data that the dead
+/// peer can never send.
+unsafe fn pending_accept_remove(s: &mut HttpState, conn_id: u8) -> bool {
+    let n = s.server.pending_accept_count as usize;
+    let mut idx_opt: Option<usize> = None;
+    for i in 0..n {
+        if s.server.pending_accept[i] == conn_id {
+            idx_opt = Some(i);
+            break;
+        }
+    }
+    let Some(idx) = idx_opt else {
+        return false;
+    };
+    let mut i = idx + 1;
+    while i < n {
+        s.server.pending_accept[i - 1] = s.server.pending_accept[i];
+        s.server.pending_data_len[i - 1] = s.server.pending_data_len[i];
+        let src_ptr = s.server.pending_data[i].as_ptr();
+        let dst_ptr = s.server.pending_data[i - 1].as_mut_ptr();
+        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, PENDING_DATA_BYTES);
+        i += 1;
+    }
+    s.server.pending_accept_count = (n - 1) as u8;
+    if n - 1 < PENDING_ACCEPT_DEPTH {
+        s.server.pending_data_len[n - 1] = 0;
+    }
+    true
+}
+
+unsafe fn close_net_conn(s: &mut HttpState, conn_id: u8) {
+    if s.net_out_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let chan = s.net_out_chan;
+    let buf = s.net_buf.as_mut_ptr();
+    let mut payload = [0u8; 1];
+    payload[0] = conn_id;
+    net_write_frame(
+        sys,
+        chan,
+        NET_CMD_CLOSE,
+        payload.as_ptr(),
+        1,
+        buf,
+        NET_BUF_SIZE,
+    );
 }
 
 pub(crate) unsafe fn match_route(s: &HttpState) -> i8 {
     let req = s.server.req_path.as_ptr();
     let plen = s.server.req_path_len as usize;
 
+    // Routes are exact-match by default. A route that ends in '/' is
+    // treated as a prefix match (so `/api/` matches `/api/foo`), but a
+    // bare `/` is exact-only — otherwise it would swallow every
+    // unmatched path including `/favicon.ico`, returning the wrong
+    // body on requests that should have 404'd. Among prefix-eligible
+    // candidates the longest-matching wins; ties resolve to the lower
+    // index. Returns -1 when no route matches → caller returns 404.
+    let mut best: i8 = -1;
+    let mut best_len: usize = 0;
     let mut i = 0u8;
     while (i as usize) < s.server.route_count as usize {
         let route = &*s.server.routes.as_ptr().add(i as usize);
         let rlen = route.path_len as usize;
-        if rlen > 0 && plen >= rlen {
+        if rlen == 0 {
+            i += 1;
+            continue;
+        }
+        let path_ptr = route.path.as_ptr();
+        // Exact match wins outright.
+        if rlen == plen {
             let mut j = 0;
             let mut ok = true;
-            let path_ptr = route.path.as_ptr();
             while j < rlen {
                 if *req.add(j) != *path_ptr.add(j) {
                     ok = false;
@@ -353,9 +613,27 @@ pub(crate) unsafe fn match_route(s: &HttpState) -> i8 {
                 return i as i8;
             }
         }
+        // Prefix match: requires the route path to end with '/' AND
+        // the request to be strictly longer. Skips short root '/'.
+        let route_is_prefix = rlen >= 2 && *path_ptr.add(rlen - 1) == b'/';
+        if route_is_prefix && plen > rlen && rlen > best_len {
+            let mut j = 0;
+            let mut ok = true;
+            while j < rlen {
+                if *req.add(j) != *path_ptr.add(j) {
+                    ok = false;
+                    break;
+                }
+                j += 1;
+            }
+            if ok {
+                best = i as i8;
+                best_len = rlen;
+            }
+        }
         i += 1;
     }
-    -1
+    best
 }
 
 unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type: &[u8]) {
@@ -370,12 +648,7 @@ unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type: &[u8]) {
 }
 
 unsafe fn build_error(s: &mut HttpState, code: &[u8], body: &[u8]) {
-    let len = h1::write_error_response(
-        s.server.send_buf.as_mut_ptr(),
-        SEND_BUF_SIZE,
-        code,
-        body,
-    );
+    let len = h1::write_error_response(s.server.send_buf.as_mut_ptr(), SEND_BUF_SIZE, code, body);
     s.server.send_offset = 0;
     s.server.send_len = len as u16;
 }
@@ -608,7 +881,11 @@ pub(crate) unsafe fn render_static_into(
     dst: *mut u8,
     cap: usize,
 ) -> (usize, bool) {
-    let route = &*s.server.routes.as_ptr().add(s.server.matched_route as usize);
+    let route = &*s
+        .server
+        .routes
+        .as_ptr()
+        .add(s.server.matched_route as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
     let pos = body_start + s.server.tmpl_pos as usize;
@@ -629,7 +906,11 @@ pub(crate) unsafe fn render_template_into(
     dst: *mut u8,
     cap: usize,
 ) -> (usize, bool) {
-    let route = &*s.server.routes.as_ptr().add(s.server.matched_route as usize);
+    let route = &*s
+        .server
+        .routes
+        .as_ptr()
+        .add(s.server.matched_route as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
     let pool = s.server.body_pool as *const u8;
@@ -645,9 +926,7 @@ pub(crate) unsafe fn render_template_into(
             let saved_pos = pos;
             pos += 2;
             let mut hash: u32 = 0x811c9dc5;
-            while pos + 1 < body_end
-                && !(*pool.add(pos) == b'}' && *pool.add(pos + 1) == b'}')
-            {
+            while pos + 1 < body_end && !(*pool.add(pos) == b'}' && *pool.add(pos + 1) == b'}') {
                 let c = *pool.add(pos);
                 if c != b' ' {
                     hash ^= c as u32;
@@ -742,7 +1021,11 @@ unsafe fn render_template_chunk(s: &mut HttpState) -> bool {
 
 pub(crate) unsafe fn parse_file_index(s: &HttpState) -> i16 {
     let buf = s.server.req_path.as_ptr();
-    let route = &*s.server.routes.as_ptr().add(s.server.matched_route as usize);
+    let route = &*s
+        .server
+        .routes
+        .as_ptr()
+        .add(s.server.matched_route as usize);
     let suffix_start = route.path_len as usize;
     let path_end = s.server.req_path_len as usize;
 
@@ -780,7 +1063,12 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpState) {
         if s.server.file_chan >= 0 {
             let mut count: u32 = 0;
             let count_ptr = &mut count as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_POLL_NOTIFY, count_ptr);
+            let r = dev_channel_ioctl(
+                &*s.syscalls,
+                s.server.file_chan,
+                IOCTL_POLL_NOTIFY,
+                count_ptr,
+            );
             if r >= 0 {
                 s.server.file_count = count as u16;
             }
@@ -816,7 +1104,12 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpState) {
         s.server.file_index = idx as i16;
         s.server.matched_route = -1;
         if s.server.file_chan >= 0 {
-            dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_FLUSH, core::ptr::null_mut());
+            dev_channel_ioctl(
+                &*s.syscalls,
+                s.server.file_chan,
+                IOCTL_FLUSH,
+                core::ptr::null_mut(),
+            );
             let mut pos = idx as u32;
             let pos_ptr = &mut pos as *mut u32 as *mut u8;
             let r = dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr);
@@ -895,10 +1188,23 @@ unsafe fn begin_ws_upgrade(s: &mut HttpState) -> bool {
 
 /// Build an unmasked server-to-client WebSocket frame in `send_buf`.
 unsafe fn ws_queue_frame(s: &mut HttpState, opcode: u8, payload: *const u8, payload_len: usize) {
+    ws_queue_frame_fin(s, opcode, true, payload, payload_len);
+}
+
+/// Variant that lets the caller control the FIN bit. Used by the fan-out
+/// outbound path where a single application-level message may span multiple
+/// WS frames (BINARY/fin=0, CONTINUATION/fin=0, ..., CONTINUATION/fin=1).
+unsafe fn ws_queue_frame_fin(
+    s: &mut HttpState,
+    opcode: u8,
+    fin: bool,
+    payload: *const u8,
+    payload_len: usize,
+) {
     let written = ws::write_frame(
         s.server.send_buf.as_mut_ptr(),
         SEND_BUF_SIZE,
-        true,
+        fin,
         opcode,
         payload,
         payload_len,
@@ -915,6 +1221,102 @@ unsafe fn ws_begin_close(s: &mut HttpState, code: u16) {
     s.server.phase = Phase::WsClose;
 }
 
+// ── WebSocket fan-out helpers ─────────────────────────────────────────────
+//
+// Wire format on the `ws_out` / `ws_in` ports (content type `WsFrame`):
+//   [conn_id : u32 LE]   bytes 0..4
+//   [opcode  : u8]       byte  4   (RFC 6455 opcode: text/binary/cont)
+//   [fin     : u8]       byte  5   (1 = final frame in WS message)
+//   [payload_len : u16 LE] bytes 6..8
+//   [payload : payload_len bytes]
+//
+// One mailbox-style write per frame, capped at CHANNEL_BUFFER_SIZE.
+
+const WS_FRAME_HDR: usize = 8;
+
+/// Emit a single inbound WS data frame on the `ws_out` port. Drops the
+/// frame silently if the port isn't wired or the payload exceeds the
+/// channel buffer — both are misconfiguration cases the downstream
+/// consumer can't recover the lost data from anyway.
+unsafe fn ws_emit_fanout_frame(
+    s: &mut HttpState,
+    opcode: u8,
+    fin: u8,
+    payload: *const u8,
+    payload_len: usize,
+) {
+    if s.server.ws_out_chan < 0 {
+        return;
+    }
+    if WS_FRAME_HDR + payload_len > super::abi::CHANNEL_BUFFER_SIZE {
+        return;
+    }
+    let mut frame_buf = [0u8; super::abi::CHANNEL_BUFFER_SIZE];
+    let conn_id = s.server.conn_id as u32;
+    frame_buf[0..4].copy_from_slice(&conn_id.to_le_bytes());
+    frame_buf[4] = opcode;
+    frame_buf[5] = fin;
+    let plen = payload_len as u16;
+    frame_buf[6..8].copy_from_slice(&plen.to_le_bytes());
+    if payload_len > 0 {
+        core::ptr::copy_nonoverlapping(
+            payload,
+            frame_buf.as_mut_ptr().add(WS_FRAME_HDR),
+            payload_len,
+        );
+    }
+    let total = WS_FRAME_HDR + payload_len;
+    let sys = &*s.syscalls;
+    let _ = (sys.channel_write)(s.server.ws_out_chan, frame_buf.as_ptr(), total);
+}
+
+/// Try to read one outbound WsFrame from `ws_in` and queue it as a WS
+/// frame in `send_buf`. Returns true if a frame was queued, false if no
+/// data was available or the frame couldn't fit.
+///
+/// Caller must guarantee `send_buf` is empty before calling — this
+/// function unconditionally overwrites it.
+unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
+    if s.server.ws_in_chan < 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let chan = s.server.ws_in_chan;
+    let poll = (sys.channel_poll)(chan, POLL_IN);
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+        return false;
+    }
+
+    let mut frame_buf = [0u8; super::abi::CHANNEL_BUFFER_SIZE];
+    // mailbox-mode read pulls a complete WsFrame in one shot.
+    let n = (sys.channel_read)(
+        chan,
+        frame_buf.as_mut_ptr(),
+        super::abi::CHANNEL_BUFFER_SIZE,
+    );
+    if n < WS_FRAME_HDR as i32 {
+        return false;
+    }
+    let payload_len = u16::from_le_bytes([frame_buf[6], frame_buf[7]]) as usize;
+    let total = WS_FRAME_HDR + payload_len;
+    if (n as usize) < total {
+        return false;
+    }
+    let opcode = frame_buf[4];
+    let fin = frame_buf[5] != 0;
+    // For now the gateway forwards conn_id as advisory; with a single
+    // active connection per http instance we ignore it. Multi-connection
+    // session routing arrives when the gateway gains an explicit table.
+    ws_queue_frame_fin(
+        s,
+        opcode,
+        fin,
+        frame_buf.as_ptr().add(WS_FRAME_HDR),
+        payload_len,
+    );
+    true
+}
+
 /// Process WebSocket frames buffered in `recv_buf`. Returns `true` if a
 /// frame was processed (caller should re-enter the step loop), `false`
 /// if more data is needed.
@@ -926,6 +1328,10 @@ unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
         Ok(Some(f)) => f,
         Ok(None) => return false,
         Err(()) => {
+            // Drop everything buffered so the bad bytes don't get re-
+            // parsed on every future tick — that would re-enter
+            // `ws_begin_close` until the loop's progress signal flipped.
+            s.server.recv_len = 0;
             ws_begin_close(s, ws::CLOSE_PROTOCOL_ERROR);
             return true;
         }
@@ -967,16 +1373,28 @@ unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
             // Unsolicited pongs are valid keep-alives — drop silently.
         }
         ws::OP_TEXT | ws::OP_BINARY | ws::OP_CONTINUATION => {
-            // Echo: send back as the same data opcode. Continuation
-            // frames keep the original opcode the peer chose; the echo
-            // pattern doesn't need to track fragmented messages because
-            // we mirror them frame-for-frame.
-            let echo_op = if frame.opcode == ws::OP_CONTINUATION {
-                ws::OP_CONTINUATION
+            if s.server.ws_fan_out != 0 {
+                // Fan out: emit a WsFrame record on `ws_out` and let the
+                // downstream module decide what to do with the payload.
+                ws_emit_fanout_frame(
+                    s,
+                    frame.opcode,
+                    if frame.fin { 1 } else { 0 },
+                    payload_ptr,
+                    frame.payload_len as usize,
+                );
             } else {
-                frame.opcode
-            };
-            ws_queue_frame(s, echo_op, payload_ptr, frame.payload_len as usize);
+                // Echo: send back as the same data opcode. Continuation
+                // frames keep the original opcode the peer chose; the
+                // echo pattern doesn't need to track fragmented messages
+                // because we mirror them frame-for-frame.
+                let echo_op = if frame.opcode == ws::OP_CONTINUATION {
+                    ws::OP_CONTINUATION
+                } else {
+                    frame.opcode
+                };
+                ws_queue_frame(s, echo_op, payload_ptr, frame.payload_len as usize);
+            }
         }
         _ => {
             ws_begin_close(s, ws::CLOSE_PROTOCOL_ERROR);
@@ -1035,7 +1453,11 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
 // ── Body-send phase helpers ───────────────────────────────────────────────
 
 unsafe fn step_send_static(s: &mut HttpState) -> i32 {
-    let route = &*s.server.routes.as_ptr().add(s.server.matched_route as usize);
+    let route = &*s
+        .server
+        .routes
+        .as_ptr()
+        .add(s.server.matched_route as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
     let pos = body_start + s.server.tmpl_pos as usize;
@@ -1059,7 +1481,11 @@ unsafe fn step_send_static(s: &mut HttpState) -> i32 {
 unsafe fn step_send_template(s: &mut HttpState) -> i32 {
     if s.server.send_offset < s.server.send_len {
         let remaining = (s.server.send_len - s.server.send_offset) as usize;
-        let ptr = s.server.send_buf.as_ptr().add(s.server.send_offset as usize);
+        let ptr = s
+            .server
+            .send_buf
+            .as_ptr()
+            .add(s.server.send_offset as usize);
         let sent = net_send(s, ptr, remaining);
         if sent > 0 {
             s.server.send_offset += sent as u16;
@@ -1105,7 +1531,11 @@ unsafe fn step_send_index(s: &mut HttpState) -> i32 {
     }
 
     let remaining = (s.server.send_len - s.server.send_offset) as usize;
-    let ptr = s.server.send_buf.as_ptr().add(s.server.send_offset as usize);
+    let ptr = s
+        .server
+        .send_buf
+        .as_ptr()
+        .add(s.server.send_offset as usize);
     let sent = net_send(s, ptr, remaining);
     if sent > 0 {
         s.server.send_offset += sent as u16;
@@ -1134,7 +1564,11 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
     }
 
     let remaining = (s.server.send_len - s.server.send_offset) as usize;
-    let ptr = s.server.send_buf.as_ptr().add(s.server.send_offset as usize);
+    let ptr = s
+        .server
+        .send_buf
+        .as_ptr()
+        .add(s.server.send_offset as usize);
     let sent = net_send(s, ptr, remaining);
     if sent > 0 {
         s.server.send_offset += sent as u16;
@@ -1159,7 +1593,15 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             let mut payload = [0u8; 2];
             payload[0] = (s.server.port & 0xFF) as u8;
             payload[1] = (s.server.port >> 8) as u8;
-            let wrote = net_write_frame(sys, chan, NET_CMD_BIND, payload.as_ptr(), 2, buf, NET_BUF_SIZE);
+            let wrote = net_write_frame(
+                sys,
+                chan,
+                NET_CMD_BIND,
+                payload.as_ptr(),
+                2,
+                buf,
+                NET_BUF_SIZE,
+            );
             if wrote == 0 {
                 return 0;
             }
@@ -1179,20 +1621,96 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             let buf = s.net_buf.as_mut_ptr();
-            let (msg_type, _payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-            if msg_type == NET_MSG_BOUND {
-                log(s, b"[http] bound, waiting for connections");
-                s.server.phase = Phase::WaitAccept;
-                return 2;
-            } else if msg_type == NET_MSG_ERROR {
-                s.server.phase = Phase::Error;
-                return -1;
+            let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+            match msg_type {
+                NET_MSG_BOUND => {
+                    log(s, b"[http] bound, waiting for connections");
+                    s.server.phase = Phase::WaitAccept;
+                    return 2;
+                }
+                NET_MSG_ERROR => {
+                    s.server.phase = Phase::Error;
+                    return -1;
+                }
+                NET_MSG_ACCEPTED if payload_len >= 1 => {
+                    // A connection accepted by linux_net while we were
+                    // re-binding. Queue it on the FIFO so the imminent
+                    // WaitAccept (and as many subsequent ones as needed)
+                    // can adopt them in arrival order.
+                    pending_accept_push(
+                        s,
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    );
+                    return 2;
+                }
+                NET_MSG_DATA if payload_len > 1 => {
+                    // Data on a slot we'll adopt soon (head of the
+                    // pending FIFO). Append to recv_buf so RecvRequest
+                    // can parse the request without a round-trip back
+                    // to the wire. Only pre-buffers data for the FIRST
+                    // pending accept — later ones get their data on
+                    // their own RecvRequest tick from the channel.
+                    let incoming_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                    let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                    let data_len = payload_len - 1;
+                    // Head of the FIFO is the connection we'll adopt
+                    // first — it gets pre-buffered into recv_buf.
+                    // Other queued conns get their data tucked into
+                    // their per-slot pending buffer so it isn't lost
+                    // when their slot becomes current.
+                    if s.server.pending_accept_count > 0
+                        && incoming_conn == s.server.pending_accept[0]
+                    {
+                        let space = RECV_BUF_SIZE - s.server.recv_len as usize;
+                        let to_copy = data_len.min(space);
+                        if to_copy > 0 {
+                            let dst = s
+                                .server
+                                .recv_buf
+                                .as_mut_ptr()
+                                .add(s.server.recv_len as usize);
+                            core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
+                            s.server.recv_len += to_copy as u16;
+                        }
+                    } else if let Some(idx) =
+                        pending_accept_index(s, incoming_conn)
+                    {
+                        pending_data_append(s, idx, data_ptr, data_len);
+                    }
+                    // Any other case (orphan slot, already-adopted
+                    // conn, etc.) is dropped silently.
+                    return 2;
+                }
+                NET_MSG_CLOSED if payload_len >= 1 => {
+                    // Drop dead conn from queue — otherwise WaitAccept
+                    // will try to adopt a corpse and the next real
+                    // request gets queued behind it.
+                    let closed_conn =
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                    pending_accept_remove(s, closed_conn);
+                    return 2;
+                }
+                _ => return 2,
             }
         }
 
         Phase::WaitAccept => {
             if s.server.draining != 0 {
                 return 1;
+            }
+            // If parallel accepts were buffered while we were busy on
+            // a previous connection, pop the oldest and adopt it now
+            // without going back to the channel — those accept events
+            // have already been consumed and won't be re-emitted.
+            // Preserve `recv_len`/`recv_parsed`: WaitBound may have
+            // already accumulated the head connection's HTTP request
+            // into `recv_buf` from out-of-order channel messages, and
+            // clearing it here would strand the request.
+            if let Some(conn) = pending_accept_pop(s) {
+                s.server.conn_id = conn;
+                s.server.peer_closed = 0;
+                s.server.phase = Phase::RecvRequest;
+                return 2;
             }
             if s.net_in_chan < 0 {
                 return 0;
@@ -1210,6 +1728,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 s.server.conn_id = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
                 s.server.recv_len = 0;
                 s.server.recv_parsed = 0;
+                s.server.peer_closed = 0;
                 s.server.phase = Phase::RecvRequest;
             }
         }
@@ -1220,31 +1739,79 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
             let sys = &*s.syscalls;
             let chan = s.net_in_chan;
+            // Drain any pending channel data into recv_buf, but always
+            // fall through to the parse step afterwards — the buffer
+            // may have been pre-populated by `WaitBound` when adopting
+            // a buffered `pending_accept`, in which case the request
+            // is already complete and no further channel poll is
+            // needed. Returning early here is what stranded those
+            // adopted connections.
             let poll = (sys.channel_poll)(chan, POLL_IN);
-            if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
-                return 0;
-            }
+            if poll > 0 && (poll as u32 & POLL_IN) != 0 {
+                let buf = s.net_buf.as_mut_ptr();
+                let (msg_type, payload_len) =
+                    net_read_frame(sys, chan, buf, NET_BUF_SIZE);
 
-            let buf = s.net_buf.as_mut_ptr();
-            let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-
-            if msg_type == NET_MSG_CLOSED {
-                s.server.phase = Phase::CloseConn;
-                return 0;
-            }
-
-            if msg_type == NET_MSG_DATA && payload_len > 1 {
-                let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                let data_len = payload_len - 1;
-
-                let space = RECV_BUF_SIZE - s.server.recv_len as usize;
-                let to_copy = data_len.min(space);
-                if to_copy > 0 {
-                    let dst = s.server.recv_buf.as_mut_ptr().add(s.server.recv_len as usize);
-                    core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
-                    s.server.recv_len += to_copy as u16;
+                if msg_type == NET_MSG_CLOSED {
+                    if payload_len >= 1 {
+                        let closed_conn =
+                            *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                        if closed_conn != s.server.conn_id {
+                            // Drop dead conn from queue if queued.
+                            pending_accept_remove(s, closed_conn);
+                            return 2;
+                        }
+                    }
+                    s.server.peer_closed = 1;
+                    s.server.phase = Phase::CloseConn;
+                    return 0;
                 }
-            } else {
+
+                if msg_type == NET_MSG_ACCEPTED && payload_len >= 1 {
+                    // A new connection arrived while we're parsing the
+                    // current request. Queue it for after this one
+                    // closes; never silently drop.
+                    pending_accept_push(
+                        s,
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    );
+                    return 2;
+                }
+
+                if msg_type == NET_MSG_DATA && payload_len > 1 {
+                    let incoming_conn =
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                    let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                    let data_len = payload_len - 1;
+                    if incoming_conn != s.server.conn_id {
+                        // Bytes for a queued conn or orphan slot.
+                        // linux_net has already consumed them from the
+                        // socket buffer — leaving them on the wire to
+                        // be re-read isn't an option. Stash into the
+                        // queued conn's pending buffer (or drop if not
+                        // tracked).
+                        if let Some(idx) =
+                            pending_accept_index(s, incoming_conn)
+                        {
+                            pending_data_append(s, idx, data_ptr, data_len);
+                        }
+                        return 2;
+                    }
+                    let space = RECV_BUF_SIZE - s.server.recv_len as usize;
+                    let to_copy = data_len.min(space);
+                    if to_copy > 0 {
+                        let dst = s
+                            .server
+                            .recv_buf
+                            .as_mut_ptr()
+                            .add(s.server.recv_len as usize);
+                        core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
+                        s.server.recv_len += to_copy as u16;
+                    }
+                }
+            } else if s.server.recv_len == 0 {
+                // No buffered bytes to parse and nothing on the wire —
+                // genuinely idle. Try again next tick.
                 return 0;
             }
 
@@ -1332,8 +1899,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if scan_len >= 4 {
                     let mut i = 0;
                     while i + 3 < scan_len {
-                        if *ptr.add(i) == b'\r' && *ptr.add(i + 1) == b'\n'
-                            && *ptr.add(i + 2) == b'\r' && *ptr.add(i + 3) == b'\n'
+                        if *ptr.add(i) == b'\r'
+                            && *ptr.add(i + 1) == b'\n'
+                            && *ptr.add(i + 2) == b'\r'
+                            && *ptr.add(i + 3) == b'\n'
                         {
                             found = true;
                             break;
@@ -1371,13 +1940,17 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             let req = s.server.req_path.as_ptr();
             let plen = s.server.req_path_len as usize;
             if plen >= 5
-                && *req == b'/' && *req.add(1) == b'_'
-                && *req.add(2) == b'f' && *req.add(3) == b'a' && *req.add(4) == b'n'
+                && *req == b'/'
+                && *req.add(1) == b'_'
+                && *req.add(2) == b'f'
+                && *req.add(3) == b'a'
+                && *req.add(4) == b'n'
             {
                 let buf = s.server.send_buf.as_mut_ptr();
                 let cap = SEND_BUF_SIZE;
                 let mut off = 0usize;
-                let header = b"HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n";
+                let header =
+                    b"HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n";
                 let mut k = 0;
                 while k < header.len() && off < cap {
                     *buf.add(off) = header[k];
@@ -1430,7 +2003,12 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             );
                             let mut pos = src_idx as u32;
                             let pos_ptr = &mut pos as *mut u32 as *mut u8;
-                            dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr);
+                            dev_channel_ioctl(
+                                &*s.syscalls,
+                                s.server.file_chan,
+                                IOCTL_NOTIFY,
+                                pos_ptr,
+                            );
                             s.server.phase = Phase::FetchContent;
                         }
                     } else {
@@ -1497,9 +2075,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
                     s.server.phase = Phase::DrainSend;
                 }
-                HANDLER_WEBSOCKET => {
+                HANDLER_WEBSOCKET | HANDLER_WEBSOCKET_FANOUT => {
                     if begin_ws_upgrade(s) {
                         s.server.phase = Phase::WsHandshake;
+                        s.server.ws_fan_out = if handler == HANDLER_WEBSOCKET_FANOUT {
+                            1
+                        } else {
+                            0
+                        };
                     }
                     // begin_ws_upgrade has already populated send_buf
                     // and switched phase on the failure path.
@@ -1515,7 +2098,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             let remaining = (s.server.send_len - s.server.send_offset) as usize;
             if remaining == 0 {
                 let handler = if s.server.matched_route >= 0 {
-                    (*s.server.routes.as_ptr().add(s.server.matched_route as usize)).handler
+                    (*s.server
+                        .routes
+                        .as_ptr()
+                        .add(s.server.matched_route as usize))
+                    .handler
                 } else {
                     HANDLER_FILE
                 };
@@ -1532,7 +2119,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
             let sent = net_send(
                 s,
-                s.server.send_buf.as_ptr().add(s.server.send_offset as usize),
+                s.server
+                    .send_buf
+                    .as_ptr()
+                    .add(s.server.send_offset as usize),
                 remaining,
             );
             if sent > 0 {
@@ -1542,7 +2132,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
         Phase::SendBody => {
             let handler = if s.server.matched_route >= 0 {
-                (*s.server.routes.as_ptr().add(s.server.matched_route as usize)).handler
+                (*s.server
+                    .routes
+                    .as_ptr()
+                    .add(s.server.matched_route as usize))
+                .handler
             } else {
                 HANDLER_FILE
             };
@@ -1575,7 +2169,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
             let sent = net_send(
                 s,
-                s.server.send_buf.as_ptr().add(s.server.send_offset as usize),
+                s.server
+                    .send_buf
+                    .as_ptr()
+                    .add(s.server.send_offset as usize),
                 remaining,
             );
             if sent > 0 {
@@ -1665,7 +2262,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
             let sent = net_send(
                 s,
-                s.server.send_buf.as_ptr().add(s.server.send_offset as usize),
+                s.server
+                    .send_buf
+                    .as_ptr()
+                    .add(s.server.send_offset as usize),
                 remaining,
             );
             if sent > 0 {
@@ -1674,27 +2274,66 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         }
 
         Phase::WsActive => {
-            // Flush any pending outbound frame first; readers may emit
-            // data faster than the network can drain.
-            if s.server.send_len > 0 && s.server.send_offset < s.server.send_len {
-                let remaining = (s.server.send_len - s.server.send_offset) as usize;
-                let sent = net_send(
-                    s,
-                    s.server.send_buf.as_ptr().add(s.server.send_offset as usize),
-                    remaining,
-                );
-                if sent > 0 {
-                    s.server.send_offset += sent as u16;
+            // Loop within this tick alternating between flushing send_buf
+            // to net_out and draining the next outbound frame from
+            // ws_in / recv_buf. This keeps the pipeline saturated under
+            // heavy producer load (spectrum_video chunking ~50 WsFrames
+            // per video frame would otherwise take ~50 ticks to emit).
+            // Exits as soon as no work can be done on either side.
+            let mut did_any = false;
+            loop {
+                let mut progress = false;
+
+                // Flush as much of send_buf as net_out will accept.
+                if s.server.send_len > 0 && s.server.send_offset < s.server.send_len {
+                    let remaining = (s.server.send_len - s.server.send_offset) as usize;
+                    let sent = net_send(
+                        s,
+                        s.server
+                            .send_buf
+                            .as_ptr()
+                            .add(s.server.send_offset as usize),
+                        remaining,
+                    );
+                    if sent > 0 {
+                        s.server.send_offset += sent as u16;
+                        progress = true;
+                    }
+                    if s.server.send_offset >= s.server.send_len {
+                        s.server.send_offset = 0;
+                        s.server.send_len = 0;
+                    }
                 }
-                if s.server.send_offset >= s.server.send_len {
-                    s.server.send_offset = 0;
-                    s.server.send_len = 0;
+
+                // Drain a WsFrame from ws_in if send_buf is now empty.
+                // ws_drain_fanout_input writes one WsFrame's worth into
+                // send_buf and returns true on success.
+                if s.server.send_len == 0 && s.server.ws_fan_out != 0 && ws_drain_fanout_input(s) {
+                    progress = true;
                 }
-                return 2;
+
+                // Process any pre-buffered inbound frame from the network.
+                // In echo mode this writes to send_buf (skip if non-empty);
+                // in fan-out mode it writes to ws_out and is always safe.
+                if s.server.send_len == 0 && ws_process_inbound(s) {
+                    progress = true;
+                }
+
+                if !progress {
+                    break;
+                }
+                did_any = true;
+                // ws_process_inbound may have transitioned to WsClose
+                // (peer sent CLOSE, or we initiated CLOSE on protocol
+                // error). Exit the loop so the next tick handles the
+                // outgoing CLOSE frame from the WsClose arm rather than
+                // continuing to drain ws_in / parse stale recv_buf.
+                if !matches!(s.server.phase, Phase::WsActive) {
+                    break;
+                }
             }
 
-            // No pending output — try to drive a frame out of recv_buf.
-            if ws_process_inbound(s) {
+            if did_any {
                 return 2;
             }
 
@@ -1711,17 +2350,50 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
             let buf = s.net_buf.as_mut_ptr();
             let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+            if msg_type == NET_MSG_ACCEPTED && payload_len >= 1 {
+                // A new connection arrived while we were busy in the
+                // WS session. Queue it on the FIFO; close out the
+                // current conn so the next `WaitAccept` cycle pops the
+                // queue. If `incoming_conn == server.conn_id`, the
+                // slot was reused (linux_net rebound the same slot id
+                // to a fresh peer); the queue captures it the same
+                // way — the next WaitAccept adopts it.
+                let incoming_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                pending_accept_push(s, incoming_conn);
+                s.server.peer_closed = 1;
+                s.server.phase = Phase::CloseConn;
+                return 0;
+            }
             if msg_type == NET_MSG_CLOSED {
+                if payload_len >= 1 {
+                    let closed_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                    if closed_conn != s.server.conn_id {
+                        pending_accept_remove(s, closed_conn);
+                        return 2;
+                    }
+                }
+                s.server.peer_closed = 1;
                 s.server.phase = Phase::CloseConn;
                 return 0;
             }
             if msg_type == NET_MSG_DATA && payload_len > 1 {
+                let incoming_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                if incoming_conn != s.server.conn_id {
+                    // Data from a connection we aren't tracking — drop
+                    // the data, but don't close the conn (same reason
+                    // as MSG_ACCEPTED above).
+                    return 2;
+                }
                 let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
                 let data_len = payload_len - 1;
                 let space = RECV_BUF_SIZE - s.server.recv_len as usize;
                 let to_copy = data_len.min(space);
                 if to_copy > 0 {
-                    let dst = s.server.recv_buf.as_mut_ptr().add(s.server.recv_len as usize);
+                    let dst = s
+                        .server
+                        .recv_buf
+                        .as_mut_ptr()
+                        .add(s.server.recv_len as usize);
                     core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
                     s.server.recv_len += to_copy as u16;
                 }
@@ -1740,7 +2412,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
             let sent = net_send(
                 s,
-                s.server.send_buf.as_ptr().add(s.server.send_offset as usize),
+                s.server
+                    .send_buf
+                    .as_ptr()
+                    .add(s.server.send_offset as usize),
                 remaining,
             );
             if sent > 0 {
@@ -1782,12 +2457,7 @@ pub(crate) unsafe fn set_route_proxy_ip(s: &mut HttpState, idx: usize, d: *const
 }
 
 #[inline]
-pub(crate) unsafe fn set_route_proxy_port(
-    s: &mut HttpState,
-    idx: usize,
-    d: *const u8,
-    len: usize,
-) {
+pub(crate) unsafe fn set_route_proxy_port(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
     if idx < MAX_ROUTES {
         (*s.server.routes.as_mut_ptr().add(idx)).proxy_port = p_u16(d, len, 0, 0);
     }
@@ -1796,7 +2466,6 @@ pub(crate) unsafe fn set_route_proxy_port(
 #[inline]
 pub(crate) unsafe fn set_route_source(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
     if idx < MAX_ROUTES {
-        (*s.server.routes.as_mut_ptr().add(idx)).source_index =
-            p_u16(d, len, 0, 0xFFFF) as i16;
+        (*s.server.routes.as_mut_ptr().add(idx)).source_index = p_u16(d, len, 0, 0xFFFF) as i16;
     }
 }

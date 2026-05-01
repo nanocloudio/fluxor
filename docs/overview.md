@@ -34,6 +34,7 @@ How the system works. These are the authoritative references.
 - [architecture/abi_layers.md](architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
 - [architecture/events.md](architecture/events.md) — event objects, IRQ binding, scheduler wake, ISR safety contract
 - [architecture/capability_surface.md](architecture/capability_surface.md) — capability resolution, auto-wiring, hardware abstraction
+- [architecture/input_capability_surface.md](architecture/input_capability_surface.md) — input surfaces, capabilities, interaction groups
 - [architecture/network.md](architecture/network.md) — channel-based networking, net_proto, drivers, IP module, TLS
 - [architecture/heap.md](architecture/heap.md) — per-module heap allocation
 - [architecture/reconfigure.md](architecture/reconfigure.md) — live graph reconfigure, drain protocol

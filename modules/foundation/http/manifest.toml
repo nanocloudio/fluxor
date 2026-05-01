@@ -29,6 +29,23 @@ index = 1
 direction = "output"
 content_type = "OctetStream"
 
+# WebSocket fan-out — populated only when a route uses
+# HANDLER_WEBSOCKET_FANOUT (handler value 5). On such routes the upgraded
+# connection's frames are routed externally as WsFrame records on these
+# ports instead of being echoed internally. Routes that use the existing
+# HANDLER_WEBSOCKET (4) ignore these channels and keep echoing.
+[[ports]]
+name = "ws_out"
+index = 2
+direction = "output"
+content_type = "WsFrame"
+
+[[ports]]
+name = "ws_in"
+index = 3
+direction = "input"
+content_type = "WsFrame"
+
 [[resources]]
 requires_contract = "channel"
 access = "read"

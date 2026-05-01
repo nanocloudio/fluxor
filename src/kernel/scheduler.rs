@@ -268,20 +268,19 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
     for edge in edges.iter_mut() {
         // Check for buffer group aliasing
         let group = edge.buffer_group as usize;
-        if group > 0 && group < 128
-            && group_channels[group] >= 0 {
-                // Verify destination module can safely consume from mailbox
-                let safe = unsafe { SCHED.mailbox_safe[edge.to_module] };
-                if safe {
-                    // Alias: reuse existing channel for this group
-                    edge.channel = group_channels[group];
-                    // aliased to existing group channel
-                    continue;
-                } else {
-                    // skip alias — module not mailbox_safe
-                    // Fall through to create separate channel
-                }
+        if group > 0 && group < 128 && group_channels[group] >= 0 {
+            // Verify destination module can safely consume from mailbox
+            let safe = unsafe { SCHED.mailbox_safe[edge.to_module] };
+            if safe {
+                // Alias: reuse existing channel for this group
+                edge.channel = group_channels[group];
+                // aliased to existing group channel
+                continue;
+            } else {
+                // skip alias — module not mailbox_safe
+                // Fall through to create separate channel
             }
+        }
 
         // Determine buffer size: grouped edges use pre-computed max,
         // ungrouped edges use per-edge hint lookup.
@@ -2574,8 +2573,7 @@ pub fn instantiate_one_module(
         Ok(StartNewResult::Pending(pending)) => {
             // Record step period before returning
             unsafe {
-                SCHED.step_period[instantiated] =
-                    found_module.header.step_period_ms();
+                SCHED.step_period[instantiated] = found_module.header.step_period_ms();
             }
             return InstantiateResult::Pending(pending);
         }

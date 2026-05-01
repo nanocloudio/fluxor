@@ -216,6 +216,13 @@ const DG_AF_INET: u8 = 4;
 const CONN_TYPE_UDP_BOUND: u8 = 2;
 
 const LINUX_NET_MAX_CONNS: usize = 24;
+/// Per-connection write backlog. Sized to hold a full Spectrum video
+/// frame's worth of WS fragments (~98 KB) so a slow peer (mobile
+/// browser, congested LAN, etc.) can absorb one frame's transmission
+/// pause without causing upstream pressure to dump bytes. 128 KB gives
+/// generous headroom while keeping LinuxNetState bounded (24 × 128 KB
+/// ≈ 3 MB).
+const LINUX_NET_WRITE_BUF: usize = 128 * 1024;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -223,6 +230,11 @@ struct LinuxNetConn {
     fd: i32,
     conn_type: u8,
     state: u8,
+    /// Bytes already drained from `write_buf`.
+    write_offset: u32,
+    /// Total valid bytes in `write_buf` (drained slice is `[offset..len]`).
+    write_len: u32,
+    write_buf: [u8; LINUX_NET_WRITE_BUF],
 }
 
 impl LinuxNetConn {
@@ -230,6 +242,9 @@ impl LinuxNetConn {
         fd: -1,
         conn_type: 0,
         state: 0,
+        write_offset: 0,
+        write_len: 0,
+        write_buf: [0u8; LINUX_NET_WRITE_BUF],
     };
 }
 
@@ -247,6 +262,12 @@ struct LinuxNetState {
     cmd_buf: [u8; 2048],
     msg_buf: [u8; 2048],
     recv_buf: [u8; 1500],
+    /// Next slot to consider when allocating a connection. Used to
+    /// allocate round-robin instead of "first free", so a slot freed
+    /// in step T isn't immediately reused in step T+1 — that race lets
+    /// stale `CMD_SEND` bytes from the previous session land on the
+    /// fresh connection's fd, scrambling its response stream.
+    next_alloc: u8,
 }
 
 impl LinuxNetState {
@@ -258,6 +279,9 @@ impl LinuxNetState {
             cmd_buf: [0u8; 2048],
             msg_buf: [0u8; 2048],
             recv_buf: [0u8; 1500],
+            // Skip slot 0 in initial rotation — it's almost always the
+            // TCP listener bound by the first CMD_BIND.
+            next_alloc: 1,
         }
     }
 }
@@ -269,9 +293,17 @@ unsafe fn set_nonblocking(fd: i32) {
     }
 }
 
-fn linux_net_alloc_conn(st: &LinuxNetState) -> i32 {
-    for i in 0..LINUX_NET_MAX_CONNS {
+fn linux_net_alloc_conn(st: &mut LinuxNetState) -> i32 {
+    // Round-robin from `next_alloc`. After allocating slot N, advance
+    // `next_alloc` to N+1 so the same slot isn't picked again until the
+    // table has cycled — by that time any stale CMD_SEND bytes for the
+    // previous occupant have been drained and harmlessly dropped (they
+    // hit `state == 0` and exit early).
+    let start = st.next_alloc as usize;
+    for off in 0..LINUX_NET_MAX_CONNS {
+        let i = (start + off) % LINUX_NET_MAX_CONNS;
         if st.conns[i].state == 0 {
+            st.next_alloc = ((i + 1) % LINUX_NET_MAX_CONNS) as u8;
             return i as i32;
         }
     }
@@ -302,6 +334,24 @@ unsafe fn linux_net_send_msg(st: &LinuxNetState, data: &[u8]) {
 }
 
 unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
+    // Embedded IP modules close their listener after each accepted
+    // connection; their TCP/IP servers re-issue CMD_BIND between
+    // requests. On Linux the listening fd persists, so a re-bind on
+    // the same port would fail with EADDRINUSE. Acknowledge the
+    // re-bind with MSG_BOUND immediately when the existing listener
+    // is alive — preserving the protocol contract — and skip the
+    // socket(2)/bind(2) syscalls entirely.
+    for c in st.conns.iter() {
+        if c.state == 3 && c.conn_type == 1 && c.fd >= 0 {
+            // Treat any existing TCP listener as "still bound" — Linux
+            // platform binds one port per LinuxNetState and the http
+            // module is the only producer of CMD_BIND.
+            let msg = [MSG_BOUND];
+            linux_net_send_msg(st, &msg);
+            return;
+        }
+    }
+
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free slots for listener");
@@ -351,6 +401,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         fd,
         conn_type: 1,
         state: 3,
+        ..LinuxNetConn::EMPTY
     };
     log::info!("[linux_net] listening on port {} (slot {})", port, idx);
 
@@ -404,6 +455,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16) {
         fd,
         conn_type: CONN_TYPE_UDP_BOUND,
         state: 3,
+        ..LinuxNetConn::EMPTY
     };
     log::info!("[linux_net] UDP bound port {} (slot {})", port, idx);
 
@@ -562,33 +614,159 @@ unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, 
             fd,
             conn_type: sock_type,
             state: 1,
+            ..LinuxNetConn::EMPTY
         };
     } else {
         st.conns[idx] = LinuxNetConn {
             fd,
             conn_type: sock_type,
             state: 2,
+            ..LinuxNetConn::EMPTY
         };
         let msg = [MSG_CONNECTED, idx as u8];
         linux_net_send_msg(st, &msg);
     }
 }
 
-unsafe fn linux_net_cmd_send(st: &LinuxNetState, conn_id: u8, data: &[u8]) {
+/// Send `data` on `conn_id`. The fd is non-blocking, so libc::send may
+/// return short or EAGAIN when the kernel buffer is full — anything that
+/// doesn't go out immediately gets stashed in the per-connection
+/// `write_buf` and drained by `linux_net_drain_writes` on subsequent
+/// steps. Caller (linux_net_step) gates further channel reads while any
+/// connection still has pending bytes, propagating back-pressure to the
+/// upstream channel buffer instead of dropping data.
+unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u8, data: &[u8]) {
     let idx = conn_id as usize;
     if idx >= LINUX_NET_MAX_CONNS || st.conns[idx].state < 2 {
         return;
     }
-    let fd = st.conns[idx].fd;
-    if fd < 0 {
+    let conn = &mut st.conns[idx];
+    if conn.fd < 0 {
         return;
     }
-    libc::send(
-        fd,
-        data.as_ptr() as *const libc::c_void,
-        data.len(),
-        libc::MSG_NOSIGNAL,
-    );
+
+    let mut sent_now: usize = 0;
+    if conn.write_len == conn.write_offset {
+        // No backlog: try a direct send. If it goes out fully, no
+        // buffering is needed — common case on fast networks / loopback.
+        let n = libc::send(
+            conn.fd,
+            data.as_ptr() as *const libc::c_void,
+            data.len(),
+            libc::MSG_NOSIGNAL,
+        );
+        if n > 0 {
+            sent_now = n as usize;
+        } else if n < 0 {
+            // Hard send error → peer is gone (EPIPE, ECONNRESET, …).
+            // Don't buffer bytes for a dead socket; drop the conn so
+            // `linux_net_drain_writes` doesn't sit on it forever and
+            // gate the channel reader.
+            let err = *libc::__errno_location();
+            if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
+                let fd = conn.fd;
+                st.conns[idx] = LinuxNetConn::EMPTY;
+                libc::close(fd);
+                let msg = [MSG_CLOSED, conn_id];
+                linux_net_send_msg(st, &msg);
+                return;
+            }
+        }
+    }
+
+    let remaining = data.len().saturating_sub(sent_now);
+    if remaining == 0 {
+        return;
+    }
+
+    // Compact any drained prefix so the new tail starts at offset 0.
+    let already = (conn.write_len - conn.write_offset) as usize;
+    if conn.write_offset > 0 && already > 0 {
+        conn.write_buf
+            .copy_within(conn.write_offset as usize..conn.write_len as usize, 0);
+    }
+    conn.write_len = already as u32;
+    conn.write_offset = 0;
+
+    if already + remaining > conn.write_buf.len() {
+        // Backlog overflow: upstream produced data faster than our
+        // sized backlog can absorb. Drop the connection cleanly so
+        // the peer fails fast rather than waiting on a stalled stream.
+        log::warn!(
+            "[linux_net] write backlog overflow on conn {} ({} pending + {} new > {})",
+            conn_id,
+            already,
+            remaining,
+            conn.write_buf.len()
+        );
+        let fd = conn.fd;
+        st.conns[idx] = LinuxNetConn::EMPTY;
+        libc::close(fd);
+        let msg = [MSG_CLOSED, conn_id];
+        linux_net_send_msg(st, &msg);
+        return;
+    }
+
+    let dst = &mut conn.write_buf[already..already + remaining];
+    dst.copy_from_slice(&data[sent_now..]);
+    conn.write_len = (already + remaining) as u32;
+}
+
+/// Try to drain any per-connection write backlog. Returns true if any
+/// connection still has *substantial* pending bytes after the pass
+/// (more than half its `write_buf`) — the caller uses this as a soft
+/// hint to defer further `CMD_SEND` consumption so the upstream channel
+/// applies back-pressure. Lighter backlogs don't gate, so commands like
+/// `CMD_CLOSE` for parallel/orphan connections still flow through.
+///
+/// Connections whose `libc::send` returns a hard error (EPIPE,
+/// ECONNRESET, EBADF, …) — i.e. the peer is gone — are torn down here
+/// rather than left pending forever. Without this the gating signal
+/// would stay true, blocking every subsequent channel read and making
+/// the server unable to handle a second connection.
+unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
+    let mut heavy_pending = false;
+    let threshold = LINUX_NET_WRITE_BUF / 2;
+    for i in 0..LINUX_NET_MAX_CONNS {
+        let c = &mut st.conns[i];
+        if c.fd < 0 || c.write_len == c.write_offset {
+            continue;
+        }
+        let to_send = (c.write_len - c.write_offset) as usize;
+        let p = c.write_buf.as_ptr().add(c.write_offset as usize);
+        let n = libc::send(
+            c.fd,
+            p as *const libc::c_void,
+            to_send,
+            libc::MSG_NOSIGNAL,
+        );
+        if n > 0 {
+            c.write_offset = c.write_offset.saturating_add(n as u32);
+        } else if n < 0 {
+            // EAGAIN / EWOULDBLOCK = "kernel buffer full, retry". Any
+            // other errno is a dead socket — drop it now so the slot
+            // can be reused and `heavy_pending` clears.
+            let err = *libc::__errno_location();
+            if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
+                let fd = c.fd;
+                let conn_id = i as u8;
+                st.conns[i] = LinuxNetConn::EMPTY;
+                libc::close(fd);
+                let msg = [MSG_CLOSED, conn_id];
+                linux_net_send_msg(st, &msg);
+                continue;
+            }
+        }
+        let still_pending = (c.write_len - c.write_offset) as usize;
+        if still_pending > threshold {
+            heavy_pending = true;
+        }
+        if c.write_offset >= c.write_len {
+            c.write_offset = 0;
+            c.write_len = 0;
+        }
+    }
+    heavy_pending
 }
 
 unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u8) {
@@ -625,6 +803,45 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
             continue;
         }
 
+        // Enable application-friendly TCP keepalive so a silently-dead
+        // peer (laptop suspended, NAT timeout without RST) is detected
+        // within ~30 s instead of the kernel default ~2 h. Without
+        // this, a paused-emulator/idle stream wouldn't trigger the
+        // outbound-write cleanup path (no data → no EPIPE) and the
+        // slot would stay live until OS keepalive fired.
+        let one: i32 = 1;
+        libc::setsockopt(
+            client_fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &one as *const i32 as *const libc::c_void,
+            4,
+        );
+        let idle_secs: i32 = 15;
+        libc::setsockopt(
+            client_fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            &idle_secs as *const i32 as *const libc::c_void,
+            4,
+        );
+        let intvl_secs: i32 = 5;
+        libc::setsockopt(
+            client_fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            &intvl_secs as *const i32 as *const libc::c_void,
+            4,
+        );
+        let probes: i32 = 3;
+        libc::setsockopt(
+            client_fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            &probes as *const i32 as *const libc::c_void,
+            4,
+        );
+
         let slot = linux_net_alloc_conn(st);
         if slot < 0 {
             libc::close(client_fd);
@@ -635,6 +852,7 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
             fd: client_fd,
             conn_type: 1,
             state: 2,
+            ..LinuxNetConn::EMPTY
         };
 
         let msg = [MSG_ACCEPTED, idx as u8];
@@ -719,6 +937,23 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             let msg = [MSG_CLOSED, i as u8];
             linux_net_send_msg(st, &msg);
             had_work = true;
+        } else {
+            // n < 0. EAGAIN / EWOULDBLOCK / EINTR is "no data right
+            // now"; everything else (ECONNRESET, EPIPE, EBADF, …) is a
+            // dead socket. Treat it like a peer-FIN: free the slot and
+            // emit MSG_CLOSED. Without this, an RST'd connection
+            // (browser tab closed, force-close, route flap) leaks its
+            // slot forever and the 24-slot table eventually fills up,
+            // after which all new accepts queue and the server appears
+            // to "fall over after one connection".
+            let err = *libc::__errno_location();
+            if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
+                libc::close(st.conns[i].fd);
+                st.conns[i] = LinuxNetConn::EMPTY;
+                let msg = [MSG_CLOSED, i as u8];
+                linux_net_send_msg(st, &msg);
+                had_work = true;
+            }
         }
     }
     had_work
@@ -730,7 +965,17 @@ fn linux_net_step(state: *mut u8) -> i32 {
 
         let mut had_work = false;
 
-        if st.net_in >= 0 {
+        // Drain per-connection write backlogs first. If any connection
+        // is sitting on more than half a buffer of unsent bytes, defer
+        // pulling new commands off the channel — the upstream channel
+        // buffer is the back-pressure point for `CMD_SEND`. Lighter
+        // backlogs don't gate, so parallel `CMD_CLOSE` etc. still flow.
+        let heavy_pending = linux_net_drain_writes(st);
+        if heavy_pending {
+            had_work = true;
+        }
+
+        if !heavy_pending && st.net_in >= 0 {
             loop {
                 let mut hdr = [0u8; 3];
                 let n = channel::channel_read(st.net_in, hdr.as_mut_ptr(), 3);

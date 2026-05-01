@@ -1,0 +1,34 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# Host-side built-in module that holds N file paths and streams them on
+# demand. Mirrors the fat32 streaming pattern but without a filesystem
+# layer — suitable for small static assets (JS, HTML, images) co-located
+# with the host fluxor binary, so a foundation/http route can fetch them
+# at runtime instead of inlining bytes into config.bin.
+#
+# Wiring (downstream is foundation/http or any HANDLER_FILE consumer):
+#   - from: web_assets.stream
+#     to: http.file_data
+#   - from: http.file_ctrl
+#     to: web_assets.seek
+#
+# Foundation/http selects which asset by sending IOCTL_NOTIFY(idx) on
+# its file_ctrl output, where idx matches the route's source_index.
+
+[[ports]]
+name = "stream"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "seek"
+direction = "ctrl_input"
+content_type = "OctetStream"
+
+[[params]]
+name = "paths"
+type = "str"
+required = true

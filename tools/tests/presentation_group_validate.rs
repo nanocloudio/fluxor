@@ -437,7 +437,10 @@ presentation_groups:
 "#,
     );
     let (ok, out) = run_validate(&yaml);
-    assert!(!ok, "expected multihead-violation to fail, got success:\n{out}");
+    assert!(
+        !ok,
+        "expected multihead-violation to fail, got success:\n{out}"
+    );
     assert!(
         out.contains("only 1 member(s) declare `display.scanout`"),
         "expected multihead-count error, got:\n{out}"
@@ -454,10 +457,7 @@ fn fluxor_validate_resolves_config_relative_modules() {
     if skip_if_unconfigured() {
         return;
     }
-    let proj = std::env::temp_dir().join(format!(
-        "fluxor-pg-localmod-{}",
-        std::process::id()
-    ));
+    let proj = std::env::temp_dir().join(format!("fluxor-pg-localmod-{}", std::process::id()));
     let mod_dir = proj.join("modules").join("local_clock");
     std::fs::create_dir_all(&mod_dir).unwrap();
     std::fs::write(
@@ -522,10 +522,7 @@ fn capability_names_are_case_insensitive_at_parse() {
     if skip_if_unconfigured() {
         return;
     }
-    let proj = std::env::temp_dir().join(format!(
-        "fluxor-pg-mixedcase-{}",
-        std::process::id()
-    ));
+    let proj = std::env::temp_dir().join(format!("fluxor-pg-mixedcase-{}", std::process::id()));
     let mod_dir = proj.join("modules").join("mixed_case_clock");
     std::fs::create_dir_all(&mod_dir).unwrap();
     std::fs::write(

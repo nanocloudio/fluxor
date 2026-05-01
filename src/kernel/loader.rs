@@ -331,11 +331,7 @@ pub struct ModuleInitArgs {
 
 /// Call module_new export.
 #[inline]
-unsafe fn call_new(
-    f: ModuleNewFn,
-    args: &ModuleInitArgs,
-    syscalls: *const SyscallTable,
-) -> i32 {
+unsafe fn call_new(f: ModuleNewFn, args: &ModuleInitArgs, syscalls: *const SyscallTable) -> i32 {
     let r = f(
         args.in_chan,
         args.out_chan,

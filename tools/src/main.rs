@@ -658,6 +658,57 @@ fn substitute_env_vars(input: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Walk every module's `routes:` array and rewrite `body_file: <path>`
+/// into `body: <contents>`. Paths are resolved relative to the YAML's
+/// directory, so a config can reference a runtime asset by path without
+/// the human-edited YAML containing a copy of that asset's bytes. This
+/// is the inclusion primitive that lets one runtime file feed many
+/// configs.
+fn inline_route_body_files(
+    config: &mut serde_json::Value,
+    yaml_dir: &std::path::Path,
+) -> Result<()> {
+    let modules = match config.get_mut("modules").and_then(|v| v.as_array_mut()) {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    for module in modules.iter_mut() {
+        let routes = match module
+            .get_mut("routes")
+            .and_then(|v| v.as_array_mut())
+        {
+            Some(r) => r,
+            None => continue,
+        };
+        for route in routes.iter_mut() {
+            let route_obj = match route.as_object_mut() {
+                Some(o) => o,
+                None => continue,
+            };
+            let body_file = match route_obj.remove("body_file") {
+                Some(serde_json::Value::String(s)) => s,
+                Some(other) => {
+                    return Err(Error::Config(format!(
+                        "route body_file must be a string path, got {}",
+                        other
+                    )));
+                }
+                None => continue,
+            };
+            let resolved = yaml_dir.join(&body_file);
+            let contents = std::fs::read_to_string(&resolved).map_err(|e| {
+                Error::Config(format!(
+                    "route body_file {}: {}",
+                    resolved.display(),
+                    e
+                ))
+            })?;
+            route_obj.insert("body".to_string(), serde_json::Value::String(contents));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_generate(
     config_path: &Path,
     output: Option<&std::path::Path>,
@@ -675,6 +726,10 @@ fn cmd_generate(
     };
 
     let mut config = config;
+    let yaml_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    inline_route_body_files(&mut config, yaml_dir)?;
     let target_desc = resolve_target(&config, None)?;
     let project_root = std::env::current_dir().unwrap_or_default();
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
@@ -760,6 +815,10 @@ fn cmd_combine(
     };
 
     let mut config = config;
+    let yaml_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    inline_route_body_files(&mut config, yaml_dir)?;
     let target_desc = resolve_target(&config, None)?;
     let project_root = std::env::current_dir().unwrap_or_default();
     let stack_added =
@@ -1406,10 +1465,8 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
                     .collect()
             })
             .unwrap_or_default();
-        let search_paths =
-            crate::config::extract_module_search_paths(&config, config_path);
-        let extra_dirs: Vec<&std::path::Path> =
-            search_paths.iter().map(|p| p.as_path()).collect();
+        let search_paths = crate::config::extract_module_search_paths(&config, config_path);
+        let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
         let manifests = crate::config::load_module_manifests_with_extra(modules, &extra_dirs);
         if let Err(e) =
             crate::config::validate_presentation_groups(&config, &module_names, &manifests)
@@ -1621,11 +1678,7 @@ fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mktable_config(
-    config_path: &Path,
-    modules_dirs: &[PathBuf],
-    output: &Path,
-) -> Result<()> {
+fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Path) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let mut config: serde_json::Value = if config_path
         .extension()
@@ -1635,6 +1688,10 @@ fn cmd_mktable_config(
     } else {
         serde_json::from_str(&content)?
     };
+    let yaml_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    inline_route_body_files(&mut config, yaml_dir)?;
 
     // Apply platform-stack injection so configs using e.g.
     // `platform: storage: { media: nvme }` report the full injected

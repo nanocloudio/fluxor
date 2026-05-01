@@ -934,7 +934,20 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
         // Determine handler type and body
         let mut handler: u8 = 0;
 
-        if obj.get("websocket").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if obj
+            .get("websocket_fanout")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            // WebSocket handler with external fan-out — accepts the
+            // Upgrade then routes inbound frames to the http module's
+            // ws_out port and reads outbound frames from ws_in.
+            handler = 5;
+        } else if obj
+            .get("websocket")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             // WebSocket handler — accepts the Upgrade and echoes frames.
             handler = 4;
         } else if let Some(proxy_val) = obj.get("proxy") {
@@ -956,8 +969,28 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
                 }
             }
         } else if obj.get("source").is_some() {
-            // File handler
-            handler = 2;
+            // The `source` value is informational (typically the
+            // upstream port name); the actual wiring is declared in
+            // the `wiring:` block.
+            //
+            //  - `source:` alone → HANDLER_FILE: URL-derived index
+            //    (fat32-style `/file/<N>` picks the N-th file).
+            //  - `source:` + `source_index:` → HANDLER_STATIC with
+            //    `source_index >= 0`: a fixed-index fetch through
+            //    `http.file_data` that caches as a static body. Used
+            //    for indexed asset banks like `host_asset_index` where
+            //    each route serves one specific asset.
+            if let Some(idx_val) = obj.get("source_index") {
+                if let Some(idx) = idx_val.as_u64() {
+                    handler = 0; // HANDLER_STATIC, body fetched via file_chan
+                    kv.insert(
+                        format!("route_{}_source", i),
+                        Value::Number(serde_json::Number::from(idx)),
+                    );
+                }
+            } else {
+                handler = 2; // HANDLER_FILE
+            }
         } else if let Some(body_val) = obj.get("body") {
             // Static or template handler — resolve body through data section
             let body_str = if let Some(s) = body_val.as_str() {
