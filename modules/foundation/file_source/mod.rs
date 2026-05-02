@@ -432,3 +432,8 @@ pub unsafe extern "C" fn file_source_set_path(
     state.pending_path_len = copy_len as u8;
     state.pending_load = true;
 }
+
+// `wasm_entry.rs` is not included here: this module uses a
+// non-canonical lifecycle (`module_poll(in, out, ...)` rather than
+// `module_step(state)`, no `module_state_size` export) that the
+// canonical PIC ABI loader cannot drive.

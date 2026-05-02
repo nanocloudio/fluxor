@@ -1,0 +1,30 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser WebSocket client. Connects to a configured WS URL on the
+# host page; pumps bytes from the input channel out to the WS, and
+# bytes received from the WS into the output channel.
+#
+# This is the transport carrier for the "browser tab joins a larger
+# Fluxor graph via remote channels" deployment shape. The actual
+# remote-channel framing (which channel a byte stream belongs to,
+# multi-channel multiplexing) is a separate module that uses this as
+# its underlying transport — same pattern as `tls` over `net_proto`.
+
+[[ports]]
+name = "tx"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "rx"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[params]]
+name = "url"
+type = "str"
+required = true

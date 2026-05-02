@@ -433,7 +433,7 @@ unsafe fn emit_alert(s: &mut RulesState, sys: &SyscallTable, rule_idx: usize, va
 // Panic Handler
 // ============================================================================
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// Wasm entry-point wrappers — no-op on non-wasm targets. See
+// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// module_step_wasm definitions.
+include!("../../sdk/wasm_entry.rs");

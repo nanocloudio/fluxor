@@ -84,13 +84,16 @@ const CONTENT_TYPES: &[&str] = &[
     "WsFrame",
     // Input surface primitive (see input_capability_surface.md §6).
     "InputBinaryState",
-    // Zedex-private event timelines bridging the emulator core to the
-    // platform-specific renderer modules. Carry video/audio events with
-    // t-state timestamps; consumed only by zedex's spectrum_video /
-    // spectrum_audio. May be replaced by a generic EventTimeline if one
-    // lands later.
-    "ZedexVideoEvents",
-    "ZedexAudioEvents",
+    // Generic event-timeline surfaces — variable-size packets carrying
+    // event records with stream-time / t-state timestamps. Used to
+    // bridge a compute core (e.g. an emulator core) to platform-
+    // specific renderer modules without leaking the producer's
+    // domain-specific identity. Receivers parse the inner packet
+    // shape; the surface itself only declares "frame-aligned event
+    // stream, video flavour" or "frame-aligned event stream, audio
+    // flavour".
+    "EventTimelineVideo",
+    "EventTimelineAudio",
 ];
 
 fn content_type_from_str(s: &str) -> Result<u8> {

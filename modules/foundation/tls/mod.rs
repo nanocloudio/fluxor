@@ -2054,20 +2054,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
     }
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Extract raw EC private key from SEC1 or PKCS#8 DER encoding
-/// Extract EC private key (32 bytes) from SEC1 or PKCS#8 DER encoding.
-/// SEC1: SEQUENCE { INTEGER(1), OCTET STRING(32), ... }
-/// PKCS#8: SEQUENCE { INTEGER(0), SEQUENCE{OIDs}, OCTET STRING { SEC1 } }
-
-// ============================================================================
-// Panic handler
-// ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// Wasm entry-point wrappers — no-op on non-wasm targets. See
+// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// module_step_wasm definitions.
+include!("../../sdk/wasm_entry.rs");

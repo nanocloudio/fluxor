@@ -1,0 +1,17 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser DOM input source. Listens on the host page for keyboard
+# events and emits Fluxor `InputBinaryState` snapshots on the output
+# port. The host shim normalises DOM event quirks (focus / blur,
+# repeat, sticky keys) before passing events to the kernel.
+#
+# Pointer / touch / gamepad sources are planned and will surface as
+# additional output ports when their downstream consumers need them.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "InputBinaryState"
+required = true

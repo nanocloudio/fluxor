@@ -1,0 +1,26 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser HTTP fetch source. Opens the configured URL on first
+# step (via the host shim's `host_fetch_open` import), then drains
+# the response body as it arrives and emits the bytes on the
+# `bytes` output port. On EOF the shim returns -1; the module
+# closes the channel with IOCTL_SET_HUP so downstream consumers
+# (e.g. `media_loader.rom`) can finalise.
+#
+# Used in the WASM browser-host deployment as the analogue of
+# `host_asset_source` on Linux: a way to bind external static
+# assets (ROMs, snapshots, image data) into a graph without baking
+# them into the bundle.
+
+[[ports]]
+name = "bytes"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[params]]
+name = "url"
+type = "str"
+required = true

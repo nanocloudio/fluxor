@@ -305,6 +305,21 @@ pub const SYS_CLOCK_HZ: u32 = 0x0C3B;
 /// only meant for orchestration modules.
 pub const SELF_INDEX: u32 = 0x0C42;
 
+/// Copy the calling module's per-instance params blob into `out`.
+/// handle=-1; arg=output buffer of size `out_len`. Returns the number
+/// of bytes written (≤ out_len) on success, or negative errno. Calling
+/// with `arg=null` or `out_len=0` returns the natural size without
+/// copying — used to size a buffer before the read. The blob shape
+/// is the manifest TLV: `[0xFE 0x01 len_lo len_hi {tag len value}*
+/// 0xFF]`.
+///
+/// Native PIC modules receive params as direct call arguments to
+/// `module_new` (the loader copies from the .fmod params section).
+/// Wasm modules pull params through this query, since the kernel /
+/// module memory split rules out the direct path. The opcode is
+/// honoured on every target.
+pub const MODULE_INSTANCE_PARAMS: u32 = 0x0C43;
+
 /// Read the hardware-provisioned ethernet MAC address from platform
 /// sources (on bcm2712, the DTB passed by Pi 5 firmware). handle=-1,
 /// arg=output buffer of exactly 6 bytes. Returns 6 on success, or

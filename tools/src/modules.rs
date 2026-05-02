@@ -1024,6 +1024,138 @@ pub fn pack_fmod(
     })
 }
 
+/// Pack a wasm32 module into a `.fmod` envelope.
+///
+/// Same envelope layout as `pack_fmod`, but the code payload is the
+/// raw `.wasm` bytes verbatim (no ELF parsing, no section concat, no
+/// symbol-table walk). The resulting `.fmod` is suitable for
+/// inclusion in `modules.bin` for a `target: wasm` build, where the
+/// kernel reads the code section, calls `host_instantiate_module` on
+/// the wasm bytes, then resolves `module_init` / `module_new` /
+/// `module_step` by export name via `host_invoke_module`.
+///
+/// Differences vs `pack_fmod`:
+///   - `data_size = 0`, `bss_size = 0` — wasm modules manage their
+///     own linear memory; the host engine handles allocation at
+///     instantiation.
+///   - `init_offset = 0` — sentinel meaning "use export-name lookup,
+///     not symbol-table-offset jump". The kernel's wasm loader
+///     dispatches by name through `host_invoke_module`.
+///   - Empty export table — wasm payload's exports are discovered via
+///     the engine after instantiation, not stored in the envelope.
+///   - Header reserved byte 0 bit 5 set — `wasm_payload` flag the
+///     kernel checks to dispatch via `host_instantiate_module`
+///     instead of PIC-load semantics.
+///
+/// Manifest, schema, and integrity hash are preserved unchanged.
+pub fn pack_fmod_wasm(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    module_type: u8,
+    manifest_path: Option<&Path>,
+) -> Result<PackResult> {
+    let wasm_data = std::fs::read(input)?;
+
+    // Sanity check that the input is a wasm binary. The first 8 bytes
+    // are the wasm magic (`\0asm`) plus version 1 (LE).
+    if wasm_data.len() < 8 || &wasm_data[..4] != b"\0asm" {
+        return Err(Error::Module(format!(
+            "{}: not a wasm binary (missing \\0asm magic at offset 0)",
+            input.display()
+        )));
+    }
+
+    // Param schema lives in the manifest for wasm modules. PIC
+    // modules carry a `.param_schema` section emitted via
+    // `define_params!`; wasm has no equivalent custom-section
+    // convention, so the packed `.fmod` schema slot stays empty
+    // and tools read schema from the manifest TOML directly.
+    let schema_data: &[u8] = &[];
+
+    // Load or create manifest.
+    let mut module_manifest = if let Some(mp) = manifest_path {
+        Manifest::from_toml(mp)?
+    } else {
+        let auto_path = input
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("manifest.toml");
+        if auto_path.exists() {
+            Manifest::from_toml(&auto_path)?
+        } else {
+            Manifest::default()
+        }
+    };
+
+    // Integrity hash over the wasm code payload. Empty data section.
+    module_manifest.integrity_hash = Some(manifest::compute_integrity(&wasm_data, &[]));
+
+    let manifest_bytes = module_manifest.to_bytes();
+
+    // Layout: header + wasm code + (no data) + (no exports) + schema + manifest
+    let code_size = wasm_data.len();
+    let data_size = 0usize;
+    let bss_size = 0usize;
+    let init_offset = 0u32;
+    let mem_export_offset = code_size + data_size; // 0 exports follow at this offset
+    let schema_size = schema_data.len();
+    let manifest_size = manifest_bytes.len();
+    let total_size = MODULE_HEADER_SIZE + code_size + schema_size + manifest_size;
+
+    let mut header = Vec::with_capacity(MODULE_HEADER_SIZE);
+    header.extend_from_slice(&MODULE_MAGIC.to_le_bytes());
+    header.push(TABLE_VERSION);
+    header.push(ABI_VERSION);
+    header.push(module_type);
+    header.push(0);
+    header.extend_from_slice(&(code_size as u32).to_le_bytes());
+    header.extend_from_slice(&(data_size as u32).to_le_bytes());
+    header.extend_from_slice(&(bss_size as u32).to_le_bytes());
+    header.extend_from_slice(&init_offset.to_le_bytes());
+    header.extend_from_slice(&0u16.to_le_bytes()); // export_count = 0
+    let export_offset_u16 = if mem_export_offset > u16::MAX as usize {
+        0xFFFFu16
+    } else {
+        mem_export_offset as u16
+    };
+    header.extend_from_slice(&export_offset_u16.to_le_bytes());
+    let mut name_bytes = [0u8; 32];
+    let name_slice = name.as_bytes();
+    let copy_len = name_slice.len().min(31);
+    name_bytes[..copy_len].copy_from_slice(&name_slice[..copy_len]);
+    header.extend_from_slice(&name_bytes);
+
+    // Reserved bytes — same layout as PIC modules but with the
+    // `wasm_payload` flag set in byte 0 bit 5.
+    let mut reserved = [0u8; 12];
+    reserved[0] |= 0x20; // bit 5: wasm_payload
+    reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
+    reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
+    reserved[6..10].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
+    header.extend_from_slice(&reserved);
+
+    assert_eq!(header.len(), MODULE_HEADER_SIZE);
+
+    let mut output_data = Vec::with_capacity(total_size);
+    output_data.extend_from_slice(&header);
+    output_data.extend_from_slice(&wasm_data);
+    output_data.extend_from_slice(schema_data);
+    output_data.extend_from_slice(&manifest_bytes);
+
+    std::fs::write(output, &output_data)?;
+
+    Ok(PackResult {
+        name: name.to_string(),
+        code_size,
+        data_size,
+        bss_size,
+        init_offset,
+        exports: Vec::new(),
+        total_size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

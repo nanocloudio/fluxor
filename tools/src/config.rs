@@ -111,6 +111,10 @@ const CONTENT_TYPES: &[&str] = &[
     "VideoDraw",
     "VideoScanout",
     "MediaMuxed",
+    "WsFrame",
+    "InputBinaryState",
+    "EventTimelineVideo",
+    "EventTimelineAudio",
 ];
 
 const INPUT_CONTROL_TYPES: &[&str] = &["Button", "Range"];

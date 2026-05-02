@@ -224,12 +224,18 @@ const LINUX_NET_MAX_CONNS: usize = 24;
 /// ≈ 3 MB).
 const LINUX_NET_WRITE_BUF: usize = 128 * 1024;
 
-#[derive(Clone, Copy)]
+// Intentionally NOT Copy: this struct holds a 128 KiB inline buffer.
+// Implicit copies (`let conn = st.conns[idx];`) would push that whole
+// buffer onto the stack on every read. References / field-access only.
 #[allow(dead_code)]
 struct LinuxNetConn {
     fd: i32,
     conn_type: u8,
     state: u8,
+    /// For TCP listeners (`conn_type == 1, state == 3`): the port the
+    /// listener is bound to. Used by `linux_net_cmd_bind` to recognise
+    /// re-binds on the same port. Zero for non-listener slots.
+    port: u16,
     /// Bytes already drained from `write_buf`.
     write_offset: u32,
     /// Total valid bytes in `write_buf` (drained slice is `[offset..len]`).
@@ -242,6 +248,7 @@ impl LinuxNetConn {
         fd: -1,
         conn_type: 0,
         state: 0,
+        port: 0,
         write_offset: 0,
         write_len: 0,
         write_buf: [0u8; LINUX_NET_WRITE_BUF],
@@ -338,14 +345,11 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
     // connection; their TCP/IP servers re-issue CMD_BIND between
     // requests. On Linux the listening fd persists, so a re-bind on
     // the same port would fail with EADDRINUSE. Acknowledge the
-    // re-bind with MSG_BOUND immediately when the existing listener
-    // is alive — preserving the protocol contract — and skip the
-    // socket(2)/bind(2) syscalls entirely.
+    // re-bind with MSG_BOUND immediately when an existing listener
+    // is alive *for the same port* — preserving the protocol contract
+    // — and skip the socket(2)/bind(2) syscalls entirely.
     for c in st.conns.iter() {
-        if c.state == 3 && c.conn_type == 1 && c.fd >= 0 {
-            // Treat any existing TCP listener as "still bound" — Linux
-            // platform binds one port per LinuxNetState and the http
-            // module is the only producer of CMD_BIND.
+        if c.state == 3 && c.conn_type == 1 && c.fd >= 0 && c.port == port {
             let msg = [MSG_BOUND];
             linux_net_send_msg(st, &msg);
             return;
@@ -401,6 +405,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         fd,
         conn_type: 1,
         state: 3,
+        port,
         ..LinuxNetConn::EMPTY
     };
     log::info!("[linux_net] listening on port {} (slot {})", port, idx);
@@ -480,7 +485,7 @@ unsafe fn linux_net_dg_cmd_send_to(
         return;
     }
     let idx = ep as usize;
-    let conn = st.conns[idx];
+    let conn = &st.conns[idx];
     if conn.state != 3 || conn.conn_type != CONN_TYPE_UDP_BOUND || conn.fd < 0 {
         return;
     }

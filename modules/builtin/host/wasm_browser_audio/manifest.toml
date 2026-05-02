@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser audio sink. Consumes `AudioSample` (signed 16-bit PCM)
+# blocks on the input port and forwards them to the host shim's
+# `host_audio_play` import, which schedules playback through
+# WebAudio.
+#
+# Wire format: signed 16-bit interleaved PCM at the configured
+# sample rate. The shim handles WebAudio context unlock (user
+# gesture required) and i16 → f32 conversion.
+
+[[ports]]
+name = "samples"
+direction = "input"
+content_type = "AudioSample"
+required = true
+
+[[params]]
+name = "sample_rate"
+type = "u32"
+required = true
+
+[[params]]
+name = "channels"
+type = "u8"
+default = 1

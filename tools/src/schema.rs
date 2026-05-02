@@ -536,18 +536,59 @@ fn pack_param(
                     offset += chunk_len;
                 }
             } else if let Some(arr) = value.as_array() {
-                // String array: emit one TLV entry per list item (same tag)
-                for item in arr {
-                    if let Some(s) = item.as_str() {
-                        let bytes = s.as_bytes();
-                        let len = bytes.len().min(255);
-                        if pos + 2 + len < entry.len() {
-                            entry[pos] = param.tag;
-                            pos += 1;
-                            entry[pos] = len as u8;
-                            pos += 1;
-                            entry[pos..pos + len].copy_from_slice(&bytes[..len]);
-                            pos += len;
+                // Two array shapes are supported here:
+                //   - String array: one item per list entry, each
+                //     emits its own TLV entry with the same tag.
+                //     Used by params with multiple textual values.
+                //   - Byte array: every item is a `Value::Number`
+                //     in `0..=255`. Concatenate into a single byte
+                //     buffer and emit as TLV-chunked binary, same as
+                //     the UTF-8 string path above. Used for binary
+                //     `body_file` payloads (`.wasm`, images, ...) so
+                //     the bytes never round-trip through a Rust
+                //     `String` (which would require valid UTF-8).
+                let all_bytes = arr.iter().all(|v| {
+                    v.as_u64()
+                        .map(|n| n <= 255)
+                        .unwrap_or(false)
+                });
+                if all_bytes && !arr.is_empty() {
+                    let bytes: Vec<u8> = arr
+                        .iter()
+                        .map(|v| v.as_u64().unwrap() as u8)
+                        .collect();
+                    let mut offset = 0;
+                    loop {
+                        let remaining = bytes.len() - offset;
+                        if remaining == 0 {
+                            break;
+                        }
+                        let chunk_len = remaining.min(255);
+                        if pos + 2 + chunk_len >= entry.len() {
+                            break;
+                        }
+                        entry[pos] = param.tag;
+                        pos += 1;
+                        entry[pos] = chunk_len as u8;
+                        pos += 1;
+                        entry[pos..pos + chunk_len]
+                            .copy_from_slice(&bytes[offset..offset + chunk_len]);
+                        pos += chunk_len;
+                        offset += chunk_len;
+                    }
+                } else {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            let bytes = s.as_bytes();
+                            let len = bytes.len().min(255);
+                            if pos + 2 + len < entry.len() {
+                                entry[pos] = param.tag;
+                                pos += 1;
+                                entry[pos] = len as u8;
+                                pos += 1;
+                                entry[pos..pos + len].copy_from_slice(&bytes[..len]);
+                                pos += len;
+                            }
                         }
                     }
                 }
@@ -637,6 +678,39 @@ fn resolve_u32(value: &Value, param: &SchemaParam) -> u32 {
 }
 
 /// Parse dotted-decimal IPv4 to u32 in network byte order.
+/// Decode a base64-encoded body payload. Returns None on any
+/// invalid input; callers fall back to an empty body. Standard
+/// alphabet, accepts and ignores padding, rejects whitespace.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn lookup(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in bytes {
+        if c == b'=' {
+            break;
+        }
+        let v = lookup(c)?;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
 fn parse_ipv4(s: &str) -> Option<u32> {
     let parts: Vec<&str> = s.split('.').collect();
     if parts.len() != 4 {
@@ -980,9 +1054,19 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             //    `http.file_data` that caches as a static body. Used
             //    for indexed asset banks like `host_asset_index` where
             //    each route serves one specific asset.
+            //  - `source:` + `source_index:` + `stream: true` →
+            //    HANDLER_STREAM: same fixed-index fetch but the
+            //    bytes pipe straight from `file_chan` into the
+            //    socket without staging in `body_pool`. Use for
+            //    multi-MiB payloads that exceed the body-pool cap
+            //    (WASM bundles, large media).
+            let stream = obj
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if let Some(idx_val) = obj.get("source_index") {
                 if let Some(idx) = idx_val.as_u64() {
-                    handler = 0; // HANDLER_STATIC, body fetched via file_chan
+                    handler = if stream { 6 } else { 0 };
                     kv.insert(
                         format!("route_{}_source", i),
                         Value::Number(serde_json::Number::from(idx)),
@@ -992,27 +1076,65 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
                 handler = 2; // HANDLER_FILE
             }
         } else if let Some(body_val) = obj.get("body") {
-            // Static or template handler — resolve body through data section
-            let body_str = if let Some(s) = body_val.as_str() {
+            // Static or template handler — resolve body through data section.
+            //
+            // Bodies starting with the `base64:` sentinel are binary
+            // payloads inlined from a `body_file` whose bytes weren't
+            // valid UTF-8 (e.g. `.wasm`, images). Decode to bytes and
+            // store as `Value::Array` of `Value::Number(u8)` so the
+            // bytes flow through `pack_param`'s `Str` arm without
+            // ever passing through a Rust `String` — `String::from_utf8_unchecked`
+            // on arbitrary binary is undefined behaviour. UTF-8 text
+            // bodies stay as `Value::String`.
+            let body_value: Value = if let Some(s) = body_val.as_str() {
                 let resolved = resolve_str_content(s, data_section);
-                resolved.to_string()
+                if let Some(payload) = resolved.strip_prefix("base64:") {
+                    match base64_decode(payload) {
+                        Some(bytes) => Value::Array(
+                            bytes
+                                .into_iter()
+                                .map(|b| Value::Number(b.into()))
+                                .collect(),
+                        ),
+                        None => {
+                            // Decode failure is unrecoverable; emit
+                            // empty so the build doesn't silently
+                            // ship a corrupted payload, but don't
+                            // halt the whole pipeline.
+                            Value::String(String::new())
+                        }
+                    }
+                } else {
+                    Value::String(resolved.to_string())
+                }
             } else {
-                String::new()
+                Value::String(String::new())
             };
 
-            // Auto-detect template if body contains {{ }}
-            if body_str.contains("{{") {
-                handler = 1; // template
-            } else {
-                handler = 0; // static
-            }
+            // Auto-detect template if body contains {{ }} (text bodies
+            // only — binary byte arrays can't be templated).
+            handler = match &body_value {
+                Value::String(s) if s.contains("{{") => 1, // template
+                _ => 0,                                    // static
+            };
 
-            kv.insert(format!("route_{}_body", i), Value::String(body_str));
+            kv.insert(format!("route_{}_body", i), body_value);
         }
 
         kv.insert(
             format!("route_{}_handler", i),
             Value::Number(serde_json::Number::from(handler)),
         );
+
+        // Per-route Content-Type (optional). Common values: text/html
+        // (default), application/wasm, application/json,
+        // application/octet-stream. The http module clamps to
+        // MAX_CONTENT_TYPE bytes; longer values are truncated.
+        if let Some(ct_val) = obj.get("content_type").and_then(|v| v.as_str()) {
+            kv.insert(
+                format!("route_{}_content_type", i),
+                Value::String(ct_val.to_string()),
+            );
+        }
     }
 }

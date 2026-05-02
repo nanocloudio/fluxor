@@ -1,0 +1,40 @@
+# WASM target — runs the kernel as a wasm32-unknown-unknown module
+# instantiated by a host (browser, wasmtime, edge runtime).
+#
+# See `docs/architecture/wasm_platform.md` for the platform contract.
+# The same `<config>.wasm` runs on any host that implements the
+# host-import surface; per-host built-ins live in their own host docs.
+
+[target]
+id = "wasm"
+family = "wasm"
+description = "WASM (wasm32, host-instantiated)"
+
+[build]
+rust_target = "wasm32-unknown-unknown"
+cargo_features = ["host-wasm"]
+uf2_family_id = "0x00000000"
+module_target = "wasm32-unknown-unknown"
+
+[gpio]
+max_pin = 0
+
+[peripherals]
+spi_count = 0
+i2c_count = 0
+uart_count = 0
+adc_channels = 0
+pwm_slices = 0
+pio_count = 0
+pio_state_machines = 0
+dma_channels = 0
+
+[kernel]
+state_arena_kb = 4096
+buffer_arena_kb = 1024
+
+[memory]
+ram_base = "0x00000000"
+ram_size = "0x00000000"
+flash_base = "0x00000000"
+flash_size = "0x00000000"

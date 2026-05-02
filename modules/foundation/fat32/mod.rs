@@ -2462,7 +2462,7 @@ unsafe fn stream_step(s: &mut Fat32State) -> i32 {
     }
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// Wasm entry-point wrappers — no-op on non-wasm targets. See
+// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// module_step_wasm definitions.
+include!("../../sdk/wasm_entry.rs");

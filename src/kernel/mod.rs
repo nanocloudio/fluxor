@@ -68,6 +68,9 @@ pub mod chip;
 #[cfg(feature = "host-linux")]
 #[path = "../platform/linux/chip.rs"]
 pub mod chip;
+#[cfg(feature = "host-wasm")]
+#[path = "../platform/wasm/chip.rs"]
+pub mod chip;
 
 pub mod guard;
 pub mod heap;

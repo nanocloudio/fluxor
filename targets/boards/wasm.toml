@@ -1,0 +1,14 @@
+# WASM hosted "board" — the kernel runs as a wasm32 module under a
+# host shim (browser, wasmtime, edge runtime). Hosts differ in their
+# built-in module set; see the per-host docs for specifics.
+
+[board]
+id = "wasm"
+silicon = "wasm"
+description = "WASM (host-instantiated)"
+
+[gpio]
+reserved_pins = []
+
+[platform.net]
+provider = "host"

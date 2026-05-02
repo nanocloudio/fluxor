@@ -24,6 +24,7 @@ mod schema;
 mod stack_expand;
 pub mod target;
 mod uf2;
+mod wasm_bundle;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -658,6 +659,38 @@ fn substitute_env_vars(input: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Tiny base64 encoder for binary `body_file` payloads. Avoids
+/// pulling in a base64 crate just for this single call site.
+fn base64_encode(bytes: &[u8], out: &mut String) {
+    const CHARS: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let v = ((bytes[i] as u32) << 16)
+            | ((bytes[i + 1] as u32) << 8)
+            | (bytes[i + 2] as u32);
+        out.push(CHARS[((v >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((v >> 12) & 0x3F) as usize] as char);
+        out.push(CHARS[((v >> 6) & 0x3F) as usize] as char);
+        out.push(CHARS[(v & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let v = (bytes[i] as u32) << 16;
+        out.push(CHARS[((v >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((v >> 12) & 0x3F) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let v = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(CHARS[((v >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((v >> 12) & 0x3F) as usize] as char);
+        out.push(CHARS[((v >> 6) & 0x3F) as usize] as char);
+        out.push('=');
+    }
+}
+
 /// Walk every module's `routes:` array and rewrite `body_file: <path>`
 /// into `body: <contents>`. Paths are resolved relative to the YAML's
 /// directory, so a config can reference a runtime asset by path without
@@ -696,14 +729,26 @@ fn inline_route_body_files(
                 None => continue,
             };
             let resolved = yaml_dir.join(&body_file);
-            let contents = std::fs::read_to_string(&resolved).map_err(|e| {
+            let bytes = std::fs::read(&resolved).map_err(|e| {
                 Error::Config(format!(
                     "route body_file {}: {}",
                     resolved.display(),
                     e
                 ))
             })?;
-            route_obj.insert("body".to_string(), serde_json::Value::String(contents));
+            // JSON strings only carry valid UTF-8. For binary bodies
+            // (e.g. `.wasm`) we encode as base64 with a "base64:"
+            // sentinel; the schema-side body decoder strips it and
+            // restores the bytes.
+            let body_value = match core::str::from_utf8(&bytes) {
+                Ok(text) => text.to_string(),
+                Err(_) => {
+                    let mut encoded = String::from("base64:");
+                    base64_encode(&bytes, &mut encoded);
+                    encoded
+                }
+            };
+            route_obj.insert("body".to_string(), serde_json::Value::String(body_value));
         }
     }
     Ok(())
@@ -1389,7 +1434,17 @@ fn cmd_pack(
     });
 
     let manifest_path = manifest.as_deref();
-    let result = pack_fmod(input, output, &module_name, module_type, manifest_path)?;
+    // Detect a wasm payload by the wasm magic at the file start. Wasm
+    // modules go through `pack_fmod_wasm`, which skips ELF parsing and
+    // wraps the wasm bytes verbatim as the .fmod code payload.
+    let is_wasm = std::fs::read(input)
+        .map(|bytes| bytes.len() >= 4 && &bytes[..4] == b"\0asm")
+        .unwrap_or(false);
+    let result = if is_wasm {
+        modules::pack_fmod_wasm(input, output, &module_name, module_type, manifest_path)?
+    } else {
+        pack_fmod(input, output, &module_name, module_type, manifest_path)?
+    };
 
     if verbose {
         println!("\x1b[1;32mPacked module:\x1b[0m {}", output.display());
@@ -1841,6 +1896,14 @@ fn build_one(
                 p.push("config.bin");
                 p
             }
+            "wasm" => {
+                let mut p = PathBuf::from(format!("target/{}/wasm", build_id));
+                if !subdir.is_empty() {
+                    p.push(&subdir);
+                }
+                p.push(format!("{}.wasm", name));
+                p
+            }
             _ => {
                 return Err(Error::Config(format!(
                     "Unsupported target family '{}' for build",
@@ -1918,6 +1981,66 @@ fn build_one(
                 Some(modules_dir.as_path()),
                 true,
             )?;
+        }
+        "wasm" => {
+            // wasm produces one self-contained `.wasm` file: the
+            // kernel `firmware.wasm` with its embedded modules-blob
+            // and config-blob placeholders rewritten in-place. See
+            // `docs/architecture/wasm_platform.md` and the
+            // `wasm_bundle` module for the rewrite mechanics.
+            let kernel_wasm_path =
+                PathBuf::from(format!("target/{}/firmware.wasm", build_id));
+            if !kernel_wasm_path.exists() {
+                return Err(Error::Config(format!(
+                    "Kernel wasm not found at {}. Run 'make firmware TARGET=wasm' first.",
+                    kernel_wasm_path.display()
+                )));
+            }
+            if !modules_dir.exists() {
+                return Err(Error::Config(format!(
+                    "Modules not found at {}. Run 'make modules TARGET=wasm' first.",
+                    modules_dir.display()
+                )));
+            }
+
+            // Build modules.bin and config.bin in a workspace dir so
+            // intermediate artifacts are inspectable but don't
+            // pollute the final output path.
+            let work_dir = output_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(format!("target/{}/wasm", build_id)));
+            std::fs::create_dir_all(&work_dir)?;
+            let modules_bin_path = work_dir.join(format!("{}.modules.bin", name));
+            let config_bin_path = work_dir.join(format!("{}.config.bin", name));
+
+            let extra_dirs: Vec<PathBuf> = Vec::new();
+            let fmod_dirs: Vec<PathBuf> = std::iter::once(modules_dir.clone())
+                .chain(extra_dirs.into_iter())
+                .collect();
+            cmd_mktable_config(yaml_path, &fmod_dirs, &modules_bin_path)?;
+            cmd_generate(
+                yaml_path,
+                Some(config_bin_path.as_path()),
+                Some(modules_dir.as_path()),
+                true,
+            )?;
+
+            let kernel_bytes = std::fs::read(&kernel_wasm_path)?;
+            let modules_bin = std::fs::read(&modules_bin_path)?;
+            let config_bin = std::fs::read(&config_bin_path)?;
+            let bundled =
+                wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
+            std::fs::write(&output_path, &bundled)?;
+
+            if verbose {
+                eprintln!(
+                    "wasm bundle: {} bytes (modules={} config={})",
+                    bundled.len(),
+                    modules_bin.len(),
+                    config_bin.len()
+                );
+            }
         }
         _ => {
             return Err(Error::Config(format!(

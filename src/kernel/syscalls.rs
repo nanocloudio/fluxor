@@ -678,6 +678,7 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
         | 0x0C40
         | 0x0C41
         | 0x0C42
+        | 0x0C43
         | 0x0C50
         | 0x0C51
         | 0x0C65
@@ -1084,12 +1085,31 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     use crate::abi::internal::monitor::ISR_METRICS;
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, RANDOM_FILL, REPORT_LATENCY,
-        SELF_INDEX,
+        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_INSTANCE_PARAMS,
+        RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
     };
     use crate::kernel::scheduler;
     match opcode {
         SELF_INDEX => scheduler::current_module_index() as i32,
+        MODULE_INSTANCE_PARAMS => {
+            let idx = scheduler::current_module_index();
+            let (src, len) = scheduler::module_params(idx);
+            if src.is_null() || len == 0 {
+                return 0;
+            }
+            // Size query: `arg=null` or `arg_len=0` returns the full
+            // param length without copying, so callers can size the
+            // buffer before allocating. A real buffer gets
+            // `min(len, arg_len)` bytes.
+            if arg.is_null() || arg_len == 0 {
+                return len as i32;
+            }
+            let copy_len = len.min(arg_len);
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, arg, copy_len);
+            }
+            copy_len as i32
+        }
         ARENA_GET => {
             let mut size_out: u32 = 0;
             let ptr = scheduler::syscall_arena_get(&mut size_out);

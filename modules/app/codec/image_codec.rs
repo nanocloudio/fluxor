@@ -826,8 +826,3 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
 // ============================================================================
 // Panic Handler
 // ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}

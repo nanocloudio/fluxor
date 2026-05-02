@@ -472,3 +472,8 @@ pub unsafe extern "C" fn module_arena_size() -> u32 {
     // On BCM2712, the paged arena is used instead.
     65536
 }
+
+// `wasm_entry.rs` is not included here: this module has
+// `module_init` / `module_new` / `module_step` but no
+// `module_state_size` export, which the canonical PIC ABI loader
+// requires.

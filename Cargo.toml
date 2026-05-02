@@ -22,6 +22,11 @@ required-features = ["host-linux"]
 
 [lib]
 path = "src/lib.rs"
+# `cdylib` is needed under `host-wasm` to produce a `.wasm` artifact
+# the host shim can instantiate. `rlib` keeps cargo-test and the
+# embedded targets working — both `lib` and `cdylib` are emitted; the
+# unused one is discarded by the linker on each build.
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 # --- RP-family dependencies (Cortex-M targets) ---
@@ -115,6 +120,15 @@ board-cm5 = ["chip-bcm2712"]
 # Linux hosted (aarch64 userspace). Uses std — no embassy, no cortex-m.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
 host-linux = ["portable-atomic", "sha2", "env_logger", "libc"]
+
+# WASM target. Builds the kernel as a wasm32-unknown-unknown library.
+# A small bootstrap shim (browser, wasmtime, edge) provides the host
+# imports defined in docs/architecture/wasm_platform.md. See also
+# docs/architecture/wasm_browser_host.md for the browser host shape.
+# This feature gates the kernel into the same code paths as
+# `host-linux` for std/no-std purposes, except `no_std` and without
+# Linux-specific deps.
+host-wasm = ["portable-atomic", "sha2"]
 
 # Optional `linux_display` backend: open a real window via winit and
 # blit each RGB565 frame through softbuffer. Off by default; file +

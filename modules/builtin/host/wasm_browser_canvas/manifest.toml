@@ -1,0 +1,27 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser canvas raster sink. Consumes `VideoRaster` frames on the
+# input port and presents them to a `<canvas>` element through the
+# host shim's `host_canvas_present` import.
+#
+# Pixel format is RGB565 little-endian (matches `st7701s` and
+# `linux_display`). Other formats are added by extending the host
+# import.
+
+[[ports]]
+name = "raster"
+direction = "input"
+content_type = "VideoRaster"
+required = true
+
+[[params]]
+name = "width"
+type = "u16"
+required = true
+
+[[params]]
+name = "height"
+type = "u16"
+required = true

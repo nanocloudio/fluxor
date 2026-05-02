@@ -175,6 +175,8 @@ mod params_def {
             => |s, d, len| { server::set_route_proxy_port(s, 0, d, len); };
         15, route_0_source, u16, 0xFFFF
             => |s, d, len| { server::set_route_source(s, 0, d, len); };
+        16, route_0_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 0, d, len); };
 
         20, route_1_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 1, d, len); };
@@ -188,6 +190,8 @@ mod params_def {
             => |s, d, len| { server::set_route_proxy_port(s, 1, d, len); };
         25, route_1_source, u16, 0xFFFF
             => |s, d, len| { server::set_route_source(s, 1, d, len); };
+        26, route_1_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 1, d, len); };
 
         30, route_2_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 2, d, len); };
@@ -201,6 +205,8 @@ mod params_def {
             => |s, d, len| { server::set_route_proxy_port(s, 2, d, len); };
         35, route_2_source, u16, 0xFFFF
             => |s, d, len| { server::set_route_source(s, 2, d, len); };
+        36, route_2_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 2, d, len); };
 
         40, route_3_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 3, d, len); };
@@ -214,6 +220,8 @@ mod params_def {
             => |s, d, len| { server::set_route_proxy_port(s, 3, d, len); };
         45, route_3_source, u16, 0xFFFF
             => |s, d, len| { server::set_route_source(s, 3, d, len); };
+        46, route_3_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 3, d, len); };
     }
 }
 
@@ -346,7 +354,7 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     unsafe { write_channel_hints(out, max_len, &hints) }
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// Wasm entry-point wrappers — no-op on non-wasm targets. See
+// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// module_step_wasm definitions.
+include!("../../sdk/wasm_entry.rs");

@@ -71,6 +71,13 @@ pub(crate) const HANDLER_WEBSOCKET: u8 = 4;
 /// semantics (chat, command stream, raster bridge, …) while this module
 /// keeps owning HTTP and the WS protocol envelope.
 pub(crate) const HANDLER_WEBSOCKET_FANOUT: u8 = 5;
+/// Like `HANDLER_FILE` but with a config-time fixed `source_index`
+/// instead of one parsed from the URL. Streams the asset's bytes
+/// straight through `send_buf` without staging them in `body_pool`,
+/// so multi-MiB payloads (WASM bundles, large media) aren't capped
+/// by the body-pool size. Used for routes declared with
+/// `source: <port>` + `source_index: N` + `stream: true` in YAML.
+pub(crate) const HANDLER_STREAM: u8 = 6;
 
 const CACHE_VALID: u8 = 0x01;
 const CACHE_COMPLETE: u8 = 0x02;
@@ -117,6 +124,12 @@ pub(crate) enum Phase {
 
 // ── Route + cache + variable types ────────────────────────────────────────
 
+/// Maximum length of a per-route `Content-Type` value. Generous for
+/// MIME types like `application/wasm`, `application/json`,
+/// `image/png; charset=utf-8`, etc. — the longest we expect to ship
+/// in routes.
+pub(crate) const MAX_CONTENT_TYPE: usize = 32;
+
 #[repr(C)]
 pub(crate) struct Route {
     pub(crate) proxy_ip: u32,
@@ -126,8 +139,10 @@ pub(crate) struct Route {
     pub(crate) path_len: u8,
     pub(crate) handler: u8,
     pub(crate) source_index: i16,
-    _route_pad: [u8; 2],
+    pub(crate) content_type_len: u8,
+    _route_pad: [u8; 1],
     pub(crate) path: [u8; MAX_PATH],
+    pub(crate) content_type: [u8; MAX_CONTENT_TYPE],
 }
 
 impl Route {
@@ -140,8 +155,23 @@ impl Route {
             path_len: 0,
             handler: 0,
             source_index: -1,
-            _route_pad: [0; 2],
+            content_type_len: 0,
+            _route_pad: [0; 1],
             path: [0; MAX_PATH],
+            content_type: [0; MAX_CONTENT_TYPE],
+        }
+    }
+
+    /// Per-route Content-Type bytes if the route declared one,
+    /// otherwise the supplied default. Static-body routes typically
+    /// pass `b"text/html"` as the default to preserve the historical
+    /// behavior.
+    pub(crate) fn content_type_or<'a>(&'a self, default: &'a [u8]) -> &'a [u8] {
+        let n = self.content_type_len as usize;
+        if n == 0 || n > MAX_CONTENT_TYPE {
+            default
+        } else {
+            &self.content_type[..n]
         }
     }
 }
@@ -1990,7 +2020,15 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             let r = &mut *s.server.routes.as_mut_ptr().add(ri as usize);
                             r.body_offset = ce.arena_offset;
                             r.body_len = ce.length;
-                            build_header(s, b"200 OK", b"text/html");
+                            // Borrow the route's content_type before
+                            // calling build_header (which takes &mut s).
+                            let mut ct = [0u8; MAX_CONTENT_TYPE];
+                            let ct_len = r.content_type_len as usize;
+                            if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
+                                ct[..ct_len].copy_from_slice(&r.content_type[..ct_len]);
+                            }
+                            let ct_slice: &[u8] = if ct_len == 0 { b"text/html" } else { &ct[..ct_len] };
+                            build_header(s, b"200 OK", ct_slice);
                             s.server.tmpl_pos = 0;
                             s.server.phase = Phase::SendHeaders;
                         } else {
@@ -2012,7 +2050,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             s.server.phase = Phase::FetchContent;
                         }
                     } else {
-                        build_header(s, b"200 OK", b"text/html");
+                        let mut ct = [0u8; MAX_CONTENT_TYPE];
+                        let ct_len = route.content_type_len as usize;
+                        if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
+                            ct[..ct_len].copy_from_slice(&route.content_type[..ct_len]);
+                        }
+                        let ct_slice: &[u8] = if ct_len == 0 { b"text/html" } else { &ct[..ct_len] };
+                        build_header(s, b"200 OK", ct_slice);
                         s.server.tmpl_pos = 0;
                         s.server.phase = Phase::SendHeaders;
                     }
@@ -2071,6 +2115,49 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         return 0;
                     }
                 }
+                HANDLER_STREAM => {
+                    let route = &*s
+                        .server
+                        .routes
+                        .as_ptr()
+                        .add(s.server.matched_route as usize);
+                    let src_idx = route.source_index;
+                    if src_idx < 0 || s.server.file_chan < 0 {
+                        build_error(s, b"500 Internal Server Error", b"Stream handler missing source\n");
+                        s.server.phase = Phase::DrainSend;
+                        return 0;
+                    }
+                    // Snapshot the per-route content_type before we
+                    // pass `&mut s` to build_header.
+                    let mut ct = [0u8; MAX_CONTENT_TYPE];
+                    let ct_len = route.content_type_len as usize;
+                    if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
+                        ct[..ct_len].copy_from_slice(&route.content_type[..ct_len]);
+                    }
+                    let ct_slice: &[u8] =
+                        if ct_len == 0 { b"application/octet-stream" } else { &ct[..ct_len] };
+                    dev_channel_ioctl(
+                        &*s.syscalls,
+                        s.server.file_chan,
+                        IOCTL_FLUSH,
+                        core::ptr::null_mut(),
+                    );
+                    let mut pos = src_idx as u32;
+                    let pos_ptr = &mut pos as *mut u32 as *mut u8;
+                    let r = dev_channel_ioctl(
+                        &*s.syscalls,
+                        s.server.file_chan,
+                        IOCTL_NOTIFY,
+                        pos_ptr,
+                    );
+                    if r < 0 {
+                        build_error(s, b"500 Internal Server Error", b"Stream NOTIFY failed\n");
+                        s.server.phase = Phase::DrainSend;
+                        return 0;
+                    }
+                    build_header(s, b"200 OK", ct_slice);
+                    s.server.phase = Phase::SendHeaders;
+                }
                 HANDLER_PROXY => {
                     build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
                     s.server.phase = Phase::DrainSend;
@@ -2108,7 +2195,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 };
 
                 match handler {
-                    HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE => {
+                    HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE | HANDLER_STREAM => {
                         s.server.phase = Phase::SendBody;
                     }
                     _ => {
@@ -2154,6 +2241,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     } else {
                         return step_send_file(s);
                     }
+                }
+                HANDLER_STREAM => {
+                    return step_send_file(s);
                 }
                 _ => {
                     s.server.phase = Phase::CloseConn;
@@ -2226,7 +2316,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let r = &mut *s.server.routes.as_mut_ptr().add(ri);
                 r.body_offset = ce.arena_offset;
                 r.body_len = ce.length;
-                build_header(s, b"200 OK", b"text/html");
+                let mut ct = [0u8; MAX_CONTENT_TYPE];
+                let ct_len = r.content_type_len as usize;
+                if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
+                    ct[..ct_len].copy_from_slice(&r.content_type[..ct_len]);
+                }
+                let ct_slice: &[u8] = if ct_len == 0 { b"text/html" } else { &ct[..ct_len] };
+                build_header(s, b"200 OK", ct_slice);
                 s.server.tmpl_pos = 0;
                 s.server.phase = Phase::SendHeaders;
                 return 2;
@@ -2454,6 +2550,26 @@ pub(crate) unsafe fn set_route_proxy_ip(s: &mut HttpState, idx: usize, d: *const
     if idx < MAX_ROUTES {
         (*s.server.routes.as_mut_ptr().add(idx)).proxy_ip = p_u32(d, len, 0, 0);
     }
+}
+
+#[inline]
+pub(crate) unsafe fn parse_route_content_type(
+    s: &mut HttpState,
+    idx: usize,
+    d: *const u8,
+    len: usize,
+) {
+    if idx >= MAX_ROUTES {
+        return;
+    }
+    let r = &mut *s.server.routes.as_mut_ptr().add(idx);
+    let n = len.min(MAX_CONTENT_TYPE);
+    let mut i = 0;
+    while i < n {
+        r.content_type[i] = *d.add(i);
+        i += 1;
+    }
+    r.content_type_len = n as u8;
 }
 
 #[inline]

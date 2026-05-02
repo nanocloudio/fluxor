@@ -216,3 +216,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let _ = state;
     0
 }
+
+// Wasm entry-point wrappers — no-op on non-wasm targets. See
+// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// module_step_wasm definitions.
+include!("../../sdk/wasm_entry.rs");

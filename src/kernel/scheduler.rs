@@ -1044,6 +1044,14 @@ pub struct SchedulerState {
     /// `permission` module in `syscalls.rs`. Separate from `required_caps`
     /// so non-contract permissions don't overload the contract bitmask.
     permissions: [u8; MAX_MODULES],
+    /// Per-module instance-params blob pointer + length. Populated
+    /// by platform loaders that have access to the source bytes —
+    /// the wasm loader uses this so modules can fetch their own
+    /// params via the `MODULE_INSTANCE_PARAMS` provider_query opcode
+    /// across the kernel/module memory split. Native PIC loaders pass
+    /// params directly to `module_new` and leave these null.
+    module_params_ptr: [*const u8; MAX_MODULES],
+    module_params_len: [usize; MAX_MODULES],
     /// Per-module mailbox_safe flag (header flags bit 0): can consume from mailbox
     mailbox_safe: [bool; MAX_MODULES],
     /// Per-module in_place_writer flag (header flags bit 1): uses acquire_inplace
@@ -1125,6 +1133,8 @@ impl SchedulerState {
             cap_class: [0; MAX_MODULES],
             required_caps: [0; MAX_MODULES],
             permissions: [0; MAX_MODULES],
+            module_params_ptr: [core::ptr::null(); MAX_MODULES],
+            module_params_len: [0; MAX_MODULES],
             mailbox_safe: [false; MAX_MODULES],
             in_place_writer: [false; MAX_MODULES],
             deferred_ready: [false; MAX_MODULES],
@@ -1407,6 +1417,34 @@ pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permission
         SCHED.required_caps[idx] = required_caps;
         SCHED.permissions[idx] = permissions;
     }
+}
+
+/// Register a module's per-instance params blob so the
+/// `MODULE_INSTANCE_PARAMS` provider_query opcode can return it.
+///
+/// The pointer must remain valid for the life of the graph — for
+/// native loaders this means the params live in the mmap'd / flashed
+/// modules image, for wasm it means the embedded config blob in the
+/// kernel `.wasm`. Both are stable.
+///
+/// # Safety
+/// `ptr` must point at `len` readable bytes that outlive the module's
+/// scheduler entry.
+pub unsafe fn set_module_params(idx: usize, ptr: *const u8, len: usize) {
+    if idx >= MAX_MODULES {
+        return;
+    }
+    SCHED.module_params_ptr[idx] = ptr;
+    SCHED.module_params_len[idx] = len;
+}
+
+/// Look up the params blob registered via `set_module_params`. Returns
+/// `(ptr, len)` — `(null, 0)` if the loader didn't register any.
+pub fn module_params(idx: usize) -> (*const u8, usize) {
+    if idx >= MAX_MODULES {
+        return (core::ptr::null(), 0);
+    }
+    unsafe { (SCHED.module_params_ptr[idx], SCHED.module_params_len[idx]) }
 }
 
 /// Step a single module by index.
@@ -4026,9 +4064,16 @@ pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
 
     // Synchronous main loop
     loop {
+        // `wfi` halts the core until an interrupt; only valid on Arm
+        // bare-metal targets. On wasm32 the host drives ticks
+        // externally via `kernel_step()`, so this loop is unreachable
+        // there — gate the asm so wasm32 compiles cleanly.
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         unsafe {
             core::arch::asm!("wfi"); // Wait for timer tick
         }
+        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+        core::hint::spin_loop();
 
         unsafe {
             DBG_TICK += 1;
