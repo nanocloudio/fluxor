@@ -234,7 +234,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
     // Pre-scan: compute max buffer size per group across all edges.
     // This ensures the channel is large enough for the most demanding
     // consumer (e.g. I2S requiring exactly 2048 bytes).
-    let mut group_max_size: [u16; 128] = [0; 128];
+    let mut group_max_size: [u32; 128] = [0; 128];
     for edge in edges.iter() {
         let group = edge.buffer_group as usize;
         if group == 0 || group >= 128 {
@@ -312,7 +312,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             channel::channel_open_for_module(
                 channel::CHANNEL_TYPE_PIPE,
                 config.as_ptr(),
-                2,
+                4,
                 producer_mod,
             )
         } else {
@@ -509,9 +509,17 @@ impl NameArena {
 // ============================================================================
 
 /// Shared scratch buffer for tee/merge fan modules.
-/// Sized to match the channel buffer so atomic messages are never fragmented.
-/// Safe to share because modules are stepped sequentially (single-core cooperative).
-const FAN_BUF_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
+///
+/// Sized independently of `CHANNEL_BUFFER_SIZE`: fan-out is a byte-stream
+/// forwarder (channels don't preserve write boundaries), so this is purely
+/// a per-step throughput knob, not a message-atomicity guarantee. Producers
+/// that need larger atomic transfers should connect peers directly rather
+/// than routing through tee/merge. 2 KiB matches typical streaming chunks
+/// and keeps `.bss` small on Cortex-M targets.
+///
+/// Safe to share because modules are stepped sequentially (single-core
+/// cooperative).
+const FAN_BUF_SIZE: usize = 2048;
 static mut FAN_BUF: [u8; FAN_BUF_SIZE] = [0u8; FAN_BUF_SIZE];
 
 /// Module slot - holds an instantiated module

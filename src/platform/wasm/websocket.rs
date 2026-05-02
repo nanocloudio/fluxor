@@ -146,13 +146,12 @@ fn ws_step(state: *mut u8) -> i32 {
                 }
                 let n = n as usize;
                 let sent = host_ws_send(st.handle, st.tx.as_ptr(), n);
-                if sent < 0 {
-                    // WS error; drop this batch and bail.
-                    break;
-                }
-                let s = (sent as usize).min(n);
+                // Treat any non-positive return as a 0-byte partial
+                // send and stash the tail — the bytes were already
+                // pulled from `in_chan`, so dropping on back-pressure
+                // would lose stream data.
+                let s = if sent > 0 { (sent as usize).min(n) } else { 0 };
                 if s < n {
-                    // Stash unsent tail for next tick.
                     st.tx_pending_len = shift_consume(st.tx.as_mut_ptr(), n, s);
                     break;
                 }
@@ -182,10 +181,11 @@ fn ws_step(state: *mut u8) -> i32 {
                 }
                 let n = n as usize;
                 let written = channel::channel_write(st.out_chan, st.rx.as_ptr(), n);
-                if written < 0 {
-                    break;
-                }
-                let w = (written as usize).min(n);
+                // Treat any non-positive return (CHAN_EAGAIN, error)
+                // as a 0-byte partial write and stash the tail. The
+                // bytes were already pulled from the JS rxQueue, so
+                // dropping on back-pressure would lose stream data.
+                let w = if written > 0 { (written as usize).min(n) } else { 0 };
                 if w < n {
                     // Stash unwritten tail.
                     st.rx_pending_len = shift_consume(st.rx.as_mut_ptr(), n, w);

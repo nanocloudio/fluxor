@@ -422,7 +422,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let hints = [
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: (SLOT_SIZE * 4) as u16 },
+        ChannelHint { port_type: 1, port_index: 0, buffer_size: (SLOT_SIZE * 4) as u32 },
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }

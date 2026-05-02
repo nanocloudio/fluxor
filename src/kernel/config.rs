@@ -427,11 +427,10 @@ pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + 16
 // Graph Config (Version 1: Variable-Length Module Entries)
 // ============================================================================
 
-/// Maximum module params size (for stack buffer during init)
-pub const MAX_MODULE_PARAMS_LEN: usize = 16384;
-
-/// Config arena size for storing variable-length module params
-pub const CONFIG_ARENA_SIZE: usize = 64 * 1024;
+/// Config arena size for storing variable-length module params across all
+/// modules in the loaded graph. Per-chip so embedded targets don't carry a
+/// host-class arena in `.bss`. See each platform's `chip` module.
+pub const CONFIG_ARENA_SIZE: usize = super::chip::CONFIG_ARENA_SIZE;
 
 /// Static arena for module params storage
 static mut CONFIG_ARENA: [u8; CONFIG_ARENA_SIZE] = [0; CONFIG_ARENA_SIZE];

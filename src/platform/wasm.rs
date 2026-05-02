@@ -616,6 +616,35 @@ unsafe fn load_embedded_modules() -> usize {
             }
         };
 
+        // Allocate a per-module kernel-side scratch heap. The wasm
+        // host shim routes every PIC syscall that crosses linear-memory
+        // boundaries (`channel_read`/`channel_write`/`provider_call`)
+        // through `kernel_heap_alloc`, which reads `MODULE_HEAPS[idx]`.
+        // Without this initialisation the alloc returns null and every
+        // such syscall silently fails with -1. Sized at 256 KiB so a
+        // single read up to 64 KiB (e.g. media_loader's snapshot poll)
+        // fits even after the heap's per-block header + alignment
+        // slack, and tolerates a few in-flight syscalls per step.
+        const PIC_KERNEL_SCRATCH_BYTES: usize = 256 * 1024;
+        match crate::kernel::loader::alloc_state(PIC_KERNEL_SCRATCH_BYTES) {
+            Ok(arena_ptr) => {
+                crate::kernel::heap::init_module_heap(
+                    module_idx,
+                    arena_ptr,
+                    PIC_KERNEL_SCRATCH_BYTES,
+                );
+            }
+            Err(_) => {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    ": kernel scratch arena alloc failed",
+                    0,
+                );
+            }
+        }
+
         // `module_init_wasm` is the wasm-only entry point each PIC
         // module exports from `modules/sdk/wasm_entry.rs`. It owns
         // state allocation (via the module's bump heap) and calls

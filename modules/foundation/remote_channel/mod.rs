@@ -35,7 +35,11 @@ const N_CHANNELS: usize = 4;
 const FRAME_MAGIC: u8 = 0xFC;
 const HEADER_BYTES: usize = 4;
 /// Maximum payload bytes per frame. Must fit in u16 length field.
-const MAX_PAYLOAD: usize = 1024;
+/// Sized so any chunky single message (e.g. a ZX Spectrum ZVFF packet
+/// at 6924 B) fits in one fragment — atomic framing keeps the
+/// downstream parser locked to message boundaries instead of having
+/// to resync across split payloads.
+const MAX_PAYLOAD: usize = 8192;
 const FRAME_TOTAL_MAX: usize = HEADER_BYTES + MAX_PAYLOAD;
 /// Parse buffer for partial inbound frames. Sized to hold one max
 /// frame plus a little slack for resync.
@@ -181,11 +185,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let written = unsafe {
                     (sys.channel_write)(transport_tx, s.out_pending.as_ptr(), total)
                 };
-                if written < 0 {
-                    // Transport error — drop this frame and stop.
-                    break;
-                }
-                let w = (written as usize).min(total);
+                // CHAN_EAGAIN (negative return) is back-pressure, not
+                // an error: the bytes have already been pulled from
+                // `in_chan`, so dropping them would shred the framed
+                // stream. Treat as a 0-byte partial write and stash
+                // the whole frame in `out_pending` for the next step.
+                let w = if written > 0 {
+                    (written as usize).min(total)
+                } else {
+                    0
+                };
                 if w < total {
                     s.out_pending_len = unsafe {
                         shift_consume(s.out_pending.as_mut_ptr(), total, w)
@@ -257,7 +266,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let ch = s.parse_buf[1] as usize;
                 let len = (s.parse_buf[2] as usize) | ((s.parse_buf[3] as usize) << 8);
-                if len > MAX_PAYLOAD {
+                if len > MAX_PAYLOAD || ch >= N_CHANNELS {
                     s.parse_len = unsafe {
                         shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, 1)
                     };
@@ -266,6 +275,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let total = HEADER_BYTES + len;
                 if s.parse_len < total {
                     break;
+                }
+                // Frame-boundary sanity: a real frame is immediately
+                // followed by another FRAME_MAGIC (or by no buffered
+                // bytes). Reject candidates that fail this check so
+                // a stray `0xFC` byte inside payload data doesn't
+                // latch as a header and corrupt the parse stream.
+                if s.parse_len > total && s.parse_buf[total] != FRAME_MAGIC {
+                    s.parse_len = unsafe {
+                        shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, 1)
+                    };
+                    continue;
                 }
 
                 if ch < N_CHANNELS && len > 0 {

@@ -26,6 +26,7 @@ struct KernelConfig {
     state_arena_kb: u32,
     buffer_arena_kb: u32,
     config_buffer_kb: u32,
+    config_arena_kb: u32,
     flash_erase_block_size: String,
     flash_erase_cmd: String,
     bootsel: BootselConfig,
@@ -95,6 +96,12 @@ fn generate_chip_rs(k: &KernelConfig, is_rp2040: bool) -> String {
         "MAX_MODULE_CONFIG_SIZE",
         "usize",
         &format!("{}", k.config_buffer_kb * 1024),
+    );
+    emit_const(
+        &mut g,
+        "CONFIG_ARENA_SIZE",
+        "usize",
+        &format!("{}", k.config_arena_kb * 1024),
     );
     g.push('\n');
 

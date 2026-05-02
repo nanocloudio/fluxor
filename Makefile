@@ -81,7 +81,16 @@ all: tools firmware-all modules-all linux-bin
 
 firmware:
 	@echo "Building firmware for $(TARGET) ($(RUST_TARGET))..."
+ifeq ($(TARGET),wasm)
+	@# wasm needs cdylib output for the host shim to instantiate.
+	@# `cargo rustc --crate-type=cdylib` requests it on the side so
+	@# Cargo.toml's default `crate-type = ["rlib"]` stays clean for
+	@# every other target (avoids the "dropping unsupported crate
+	@# type cdylib" warning on embedded builds).
+	cargo rustc --release --target $(RUST_TARGET) --no-default-features --features $(CARGO_FEATURES) --lib --crate-type=cdylib
+else
 	cargo build --release --target $(RUST_TARGET) --no-default-features --features $(CARGO_FEATURES)
+endif
 	@mkdir -p target/$(TARGET)
 ifeq ($(TARGET),wasm)
 	@# The wasm build emits `fluxor.wasm` directly — no objcopy step.
@@ -276,6 +285,9 @@ lint:
 		--no-default-features --features board-cm5 -- -D warnings
 	@echo "==> linting firmware (wasm) ..."
 	@touch src/lib.rs
+	@# Lint the lib as rlib — type/borrow checks don't differ between
+	@# rlib and cdylib, and `cargo clippy` doesn't accept `--crate-type`.
+	@# The cdylib artifact itself is produced by `make firmware TARGET=wasm`.
 	@cargo clippy --release --target wasm32-unknown-unknown \
 		--no-default-features --features host-wasm -- -D warnings
 	@echo "lint: clean"

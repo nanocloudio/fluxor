@@ -192,10 +192,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     payload_len,
                 )
             };
-            if written < 0 {
-                continue;
-            }
-            let w = (written as usize).min(payload_len);
+            // CHAN_EAGAIN (negative return) is back-pressure, not
+            // an error. The payload was already pulled from rx_in,
+            // so treat any non-positive return as a 0-byte partial
+            // write and stash the tail in `rx_pending` for the
+            // next step rather than dropping bytes.
+            let w = if written > 0 { (written as usize).min(payload_len) } else { 0 };
             if w < payload_len {
                 // Stash unwritten tail in retry buffer.
                 let tail = payload_len - w;
@@ -215,7 +217,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     // ── Outbound: tx_in (OctetStream) → tx_out (WsFrame) ──
-    if s.has_conn && s.tx_in >= 0 && s.tx_out >= 0 {
+    //
+    // No `has_conn` gate: the http gateway ignores conn_id when only
+    // one client is active (server.rs ws_drain_fanout_input), and
+    // bundles like zedex-pi5-split push data outbound before the
+    // browser sends anything inbound. Stamping conn_id = 0 until we
+    // observe a real inbound frame is harmless under that semantic
+    // and unblocks the producer-first flow.
+    if s.tx_in >= 0 && s.tx_out >= 0 {
         // Drain the pending framed message first.
         if s.tx_pending_len > 0 {
             let written = unsafe {
@@ -256,7 +265,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let written =
                 unsafe { (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), total) };
             if written < 0 {
-                continue;
+                // tx_out back-pressured. Stash the whole frame and
+                // break — looping back to read more from tx_in would
+                // shred the stream.
+                s.tx_pending_len = total;
+                break;
             }
             let w = (written as usize).min(total);
             if w < total {

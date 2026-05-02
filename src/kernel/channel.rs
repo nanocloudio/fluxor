@@ -327,11 +327,21 @@ pub fn channel_open_for_module(
     if chan_type != CHANNEL_TYPE_PIPE {
         return CHAN_EINVAL;
     }
-    // Requested size comes as 2 LE bytes in `config`. Round up to a power of
-    // two so the ring buffer can wrap with a bitwise AND instead of modulo.
-    let buf_capacity = if !config.is_null() && config_len >= 2 {
+    // Requested size comes as a little-endian integer in `config`: 4 bytes
+    // (u32) for the modern path, falling back to 2 bytes (u16) for legacy
+    // callers. Round up to a power of two so the ring buffer can wrap with
+    // a bitwise AND instead of modulo. The 256 KiB ceiling sizes a full
+    // RGB565 spectrum frame (98,304 B) plus headroom while still leaving
+    // room for ~4 max-size channels in the 1 MiB arena.
+    const MAX_CHAN_BYTES: usize = 256 * 1024;
+    let buf_capacity = if !config.is_null() && config_len >= 4 {
+        let size = unsafe {
+            u32::from_le_bytes([*config, *config.add(1), *config.add(2), *config.add(3)]) as usize
+        };
+        size.clamp(64, MAX_CHAN_BYTES).next_power_of_two()
+    } else if !config.is_null() && config_len >= 2 {
         let size = unsafe { u16::from_le_bytes([*config, *config.add(1)]) as usize };
-        size.clamp(64, 4096).next_power_of_two()
+        size.clamp(64, MAX_CHAN_BYTES).next_power_of_two()
     } else {
         BUFFER_SIZE
     };

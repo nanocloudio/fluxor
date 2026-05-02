@@ -2016,7 +2016,7 @@ fn build_one(
 
             let extra_dirs: Vec<PathBuf> = Vec::new();
             let fmod_dirs: Vec<PathBuf> = std::iter::once(modules_dir.clone())
-                .chain(extra_dirs.into_iter())
+                .chain(extra_dirs)
                 .collect();
             cmd_mktable_config(yaml_path, &fmod_dirs, &modules_bin_path)?;
             cmd_generate(

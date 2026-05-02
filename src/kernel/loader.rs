@@ -1611,9 +1611,14 @@ pub struct ChannelHint {
     pub port_type: u8,
     /// Port index within that direction
     pub port_index: u8,
-    /// Requested buffer size in bytes (0 = use default)
-    pub buffer_size: u16,
+    /// Requested buffer size in bytes (0 = use default).
+    /// 2 bytes of natural alignment padding precede this field.
+    pub buffer_size: u32,
 }
+
+/// Wire size of one `ChannelHint` slot — must match
+/// `modules::sdk::runtime::CHANNEL_HINT_WIRE_BYTES`.
+pub const CHANNEL_HINT_WIRE_BYTES: usize = 8;
 
 /// Maximum number of hints we can collect per module
 const MAX_HINTS_PER_MODULE: usize = 8;
@@ -1622,7 +1627,7 @@ const MAX_HINTS_PER_MODULE: usize = 8;
 ///
 /// Returns a slice of hints, or an empty slice if the module doesn't export
 /// `module_channel_hints`. This is optional — modules without the export
-/// get default 2048-byte buffers on all ports.
+/// get default kernel buffer sizes on all ports.
 pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PER_MODULE], usize) {
     let mut hints = [ChannelHint {
         port_type: 0,
@@ -1643,8 +1648,8 @@ pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PE
 
     // Call the export: module_channel_hints(out: *mut u8, max_len: usize) -> i32
     let hints_fn: ModuleChannelHintsFn = unsafe { fn_ptr_from_addr(addr) };
-    let buf_size = MAX_HINTS_PER_MODULE * 4; // 4 bytes per ChannelHint
-    let mut buf = [0u8; MAX_HINTS_PER_MODULE * 4];
+    let buf_size = MAX_HINTS_PER_MODULE * CHANNEL_HINT_WIRE_BYTES;
+    let mut buf = [0u8; MAX_HINTS_PER_MODULE * CHANNEL_HINT_WIRE_BYTES];
     let count = unsafe { hints_fn(buf.as_mut_ptr(), buf_size) };
 
     if count <= 0 {
@@ -1653,11 +1658,16 @@ pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PE
 
     let count = (count as usize).min(MAX_HINTS_PER_MODULE);
     for (i, hint) in hints.iter_mut().take(count).enumerate() {
-        let offset = i * 4;
+        let offset = i * CHANNEL_HINT_WIRE_BYTES;
         *hint = ChannelHint {
             port_type: buf[offset],
             port_index: buf[offset + 1],
-            buffer_size: u16::from_le_bytes([buf[offset + 2], buf[offset + 3]]),
+            buffer_size: u32::from_le_bytes([
+                buf[offset + 4],
+                buf[offset + 5],
+                buf[offset + 6],
+                buf[offset + 7],
+            ]),
         };
     }
 
@@ -1667,7 +1677,7 @@ pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PE
 /// Look up buffer size hint for a specific port.
 ///
 /// Returns the requested buffer size, or 0 if no hint exists (use default).
-pub fn find_hint_for_port(hints: &[ChannelHint], port_type: u8, port_index: u8) -> u16 {
+pub fn find_hint_for_port(hints: &[ChannelHint], port_type: u8, port_index: u8) -> u32 {
     for hint in hints {
         if hint.port_type == port_type && hint.port_index == port_index {
             return hint.buffer_size;

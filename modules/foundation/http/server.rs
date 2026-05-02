@@ -41,9 +41,9 @@ pub(crate) const PENDING_ACCEPT_DEPTH: usize = 4;
 /// `linux_net` has already drained those bytes from the socket.
 pub(crate) const PENDING_DATA_BYTES: usize = RECV_BUF_SIZE;
 // Sized to hold one full-size WS frame: a `WsFrame`-sourced payload of up
-// to `CHANNEL_BUFFER_SIZE - WS_FRAME_HDR` (= 2040) bytes plus the 4-byte
-// extended-length WS header. Smaller HTTP responses share the same buffer.
-pub(crate) const SEND_BUF_SIZE: usize = 2048;
+// to `CHANNEL_BUFFER_SIZE - WS_FRAME_HDR` bytes plus the 4-byte extended-
+// length WS header. Smaller HTTP responses share the same buffer.
+pub(crate) const SEND_BUF_SIZE: usize = super::abi::CHANNEL_BUFFER_SIZE + 4;
 pub(crate) const MAX_ROUTES: usize = 4;
 pub(crate) const MAX_PATH: usize = 32;
 // Sized to comfortably hold a single page-sized response body. Apps that

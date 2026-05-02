@@ -22,11 +22,13 @@ required-features = ["host-linux"]
 
 [lib]
 path = "src/lib.rs"
-# `cdylib` is needed under `host-wasm` to produce a `.wasm` artifact
-# the host shim can instantiate. `rlib` keeps cargo-test and the
-# embedded targets working — both `lib` and `cdylib` are emitted; the
-# unused one is discarded by the linker on each build.
-crate-type = ["rlib", "cdylib"]
+# Default to `rlib` only — that's what every embedded target and
+# cargo-test consume. The wasm build requests `cdylib` on the side
+# via `cargo rustc --crate-type=cdylib` (see the wasm branches of
+# `firmware` and `lint` in the Makefile). Listing `cdylib` here
+# unconditionally would emit a `dropping unsupported crate type`
+# warning from cargo on every embedded build.
+crate-type = ["rlib"]
 
 [dependencies]
 # --- RP-family dependencies (Cortex-M targets) ---

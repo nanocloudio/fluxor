@@ -19,8 +19,14 @@ pub const ABI_VERSION: u32 = 1;
 
 /// Default channel buffer size in bytes.
 /// Referenced by kernel (buffer_pool, scheduler fan buffer) and modules
-/// (I2S input buffer, mixer sample buffer) to stay in sync.
-pub const CHANNEL_BUFFER_SIZE: usize = 2048;
+/// (I2S input buffer, mixer sample buffer) to stay in sync. Sized to
+/// hold one ZX Spectrum ZVFF packet (6924 B) plus framing in a single
+/// channel write — byte-stream parsers see message boundaries at fixed
+/// offsets rather than scrambling across fragments. Embedded targets
+/// (rp2040 16 KiB arena, rp2350 32 KiB) constrain the upper bound;
+/// channels needing more should request it via `module_channel_hints`
+/// rather than raising this default.
+pub const CHANNEL_BUFFER_SIZE: usize = 8192;
 
 /// Generic stream timing information (domain-neutral).
 ///

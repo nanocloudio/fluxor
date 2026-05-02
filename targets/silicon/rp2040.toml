@@ -51,6 +51,7 @@ boot2_src = "0x10000000"
 state_arena_kb = 64
 buffer_arena_kb = 16
 config_buffer_kb = 8
+config_arena_kb = 8
 flash_erase_block_size = "0x1000"
 flash_erase_cmd = "0x20"
 
