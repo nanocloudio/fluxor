@@ -442,8 +442,10 @@ pub fn parse_modules_from_config_multi(
 /// expressible in the manifest bitmask.
 pub const MODULE_HEADER_SIZE: usize = 72;
 
-///// Must match kernel's MODULE_ABI_VERSION in src/kernel/loader.rs
-pub const ABI_VERSION: u8 = 1;
+/// ABI version byte stamped into every packed module header. Sourced
+/// from `crate::wire` so the pack tool, the kernel loader, and the
+/// SDK agree.
+pub use crate::wire::ABI_VERSION;
 
 /// Result of packing a module
 #[derive(Debug)]

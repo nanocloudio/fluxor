@@ -159,7 +159,7 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
     let power_actions = derive_power_actions(scenario, power.is_some());
 
     let observers = observers_from_rules(scenario, board, profile);
-    let artifact = pick_artifact(scenario.target.as_str(), board, inputs.project);
+    let artifact = pick_artifact(scenario, board, inputs.project)?;
     let lock_path = default_lock_path(inputs.lab, &profile.rig.id);
 
     // Artifact digests require on-disk bytes; the plan stops at the
@@ -449,59 +449,67 @@ fn describe_rule_source(source: Capability, profile: &RigProfile) -> String {
 }
 
 fn pick_artifact(
-    board_id: &str,
+    scenario: &Scenario,
     board: &BoardRig,
     project: Option<&ProjectDescriptor>,
-) -> ArtifactPlan {
+) -> Result<ArtifactPlan> {
+    let board_id = scenario.target.as_str();
     let Some(project) = project else {
-        return ArtifactPlan::Unresolved {
+        return Ok(ArtifactPlan::Unresolved {
             reason: format!(
                 "no project descriptor found — add a [build.{board_id}] recipe to \
                  ~/.config/fluxor/projects/<name>/rig.toml (or to an in-tree \
                  .fluxor-rig.toml)"
             ),
-        };
+        });
     };
     let Some(recipe) = project.recipe(board_id) else {
-        return ArtifactPlan::Unresolved {
+        return Ok(ArtifactPlan::Unresolved {
             reason: format!(
                 "project descriptor at {} has no [build.{board_id}] recipe",
                 project.project_root.display()
             ),
-        };
+        });
     };
-    match &recipe.output {
+    // Resolve `${scenario.*}` placeholders in the recipe so the same
+    // recipe can build different workloads for different scenarios.
+    // Recipes that contain no placeholders pass through unchanged.
+    // Unknown or unsafe placeholders fail here rather than at exec time.
+    let command = crate::rig::template::substitute_command(&recipe.command, scenario)?;
+    Ok(match &recipe.output {
         BuildOutput::File(path) => {
             // Single-file artifacts only make sense when the board
             // declares a single-file artifact class.
             if matches!(board.artifact.as_deref(), Some("boot_bundle")) {
-                return ArtifactPlan::Unresolved {
+                ArtifactPlan::Unresolved {
                     reason: "board artifact class is 'boot_bundle' but the project \
                              recipe produces a single file — use 'artifact_bundle_dir'"
                         .to_string(),
-                };
-            }
-            ArtifactPlan::File {
-                command: recipe.command.clone(),
-                project_root: project.project_root.clone(),
-                path: path.clone(),
+                }
+            } else {
+                ArtifactPlan::File {
+                    command,
+                    project_root: project.project_root.clone(),
+                    path: path.clone(),
+                }
             }
         }
         BuildOutput::Bundle(root) => {
             if matches!(board.artifact.as_deref(), Some("uf2")) {
-                return ArtifactPlan::Unresolved {
+                ArtifactPlan::Unresolved {
                     reason: "board artifact class is 'uf2' but the project recipe \
                              produces a bundle — use 'artifact' (single file)"
                         .to_string(),
-                };
-            }
-            ArtifactPlan::Bundle {
-                command: recipe.command.clone(),
-                project_root: project.project_root.clone(),
-                root: root.clone(),
+                }
+            } else {
+                ArtifactPlan::Bundle {
+                    command,
+                    project_root: project.project_root.clone(),
+                    root: root.clone(),
+                }
             }
         }
-    }
+    })
 }
 
 /// Compact human-readable summary of a binding. Values go through `Display`

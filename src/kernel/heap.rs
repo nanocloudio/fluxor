@@ -9,6 +9,13 @@
 //! 8-byte header per block, 16-byte minimum allocation granularity.
 //!
 //! See `.context/rfc-per-module-heap-allocation.md` for the full design.
+//!
+//! ## Concurrency
+//!
+//! Each `MODULE_HEAPS[i]` entry is owned by module `i`, which steps on
+//! a single assigned core, so an individual heap is touched by one
+//! core at a time and needs no cross-core synchronisation. See
+//! `docs/architecture/concurrency.md`.
 
 use crate::kernel::scheduler::MAX_MODULES;
 

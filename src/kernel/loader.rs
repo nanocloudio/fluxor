@@ -2,6 +2,13 @@
 //!
 //! Loads and resolves modules from the flash-resident module table.
 //! Modules are position-independent code that execute directly from flash (XIP).
+//!
+//! ## Concurrency
+//!
+//! Every `static mut` in this file is a boot-only datum: written by
+//! core 0 during `prepare_graph` / `instantiate_one_module`, then read
+//! only via `state_arena_usage()`. Reconfigure parks secondary cores
+//! before re-entering this code. See `docs/architecture/concurrency.md`.
 
 use crate::abi::SyscallTable;
 use crate::fnv1a32;
@@ -53,8 +60,10 @@ const STATE_ARENA_SIZE: usize = super::chip::STATE_ARENA_SIZE;
 // Error types
 // ============================================================================
 
-/// Expected module ABI version (must match tools/src/modules.rs ABI_VERSION).
-pub const MODULE_ABI_VERSION: u8 = 1;
+/// Expected module ABI version. The on-disk byte every module
+/// header must carry; sourced from `abi::wire` so the kernel, the
+/// SDK, and the host pack tool agree.
+pub use crate::abi::wire::ABI_VERSION as MODULE_ABI_VERSION;
 
 /// Errors that can occur during module loading and instantiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +580,16 @@ pub fn reset_state_arena() {
         FREE_COUNT = 0;
         // Content is not zeroed; alloc_state zeros each allocation.
     }
+}
+
+/// Current state-arena occupancy: `(used_bytes, total_bytes)`. The
+/// "used" figure is the bump high-water mark — it doesn't subtract
+/// holes the free list could re-use, so it overestimates live bytes
+/// when modules have been freed (which only happens at full
+/// `reset_state_arena`). Read by `scheduler::log_arena_summary` for
+/// post-instantiation telemetry.
+pub fn state_arena_usage() -> (usize, usize) {
+    unsafe { (STATE_ARENA_OFFSET, STATE_ARENA_SIZE) }
 }
 
 // ============================================================================
@@ -1616,9 +1635,9 @@ pub struct ChannelHint {
     pub buffer_size: u32,
 }
 
-/// Wire size of one `ChannelHint` slot — must match
-/// `modules::sdk::runtime::CHANNEL_HINT_WIRE_BYTES`.
-pub const CHANNEL_HINT_WIRE_BYTES: usize = 8;
+/// Wire size of one `ChannelHint` slot. Sourced from `abi::wire` so
+/// the kernel reader and the SDK writer agree on the layout.
+pub use crate::abi::wire::CHANNEL_HINT_WIRE_BYTES;
 
 /// Maximum number of hints we can collect per module
 const MAX_HINTS_PER_MODULE: usize = 8;

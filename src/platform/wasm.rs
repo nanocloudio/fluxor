@@ -248,19 +248,7 @@ fn init_tick_demo() {
 /// Mirrors `tools/src/modules.rs::pack_fmod_wasm` (sets reserved[0] |= 0x20).
 const FLAG_WASM_PAYLOAD: u8 = 0x20;
 
-/// FNV-1a 32-bit hash, matching `tools/src/hash.rs::fnv1a_hash`. Used
-/// to compare module name_hash values from the config table against
-/// known built-in module names.
-const fn fnv1a32(s: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    let mut i = 0;
-    while i < s.len() {
-        h ^= s[i] as u32;
-        h = h.wrapping_mul(0x01000193);
-        i += 1;
-    }
-    h
-}
+use crate::abi::wire::fnv1a32;
 
 const WASM_BROWSER_CANVAS_HASH: u32 = fnv1a32(b"wasm_browser_canvas");
 const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
@@ -764,16 +752,12 @@ pub extern "C" fn kernel_init() -> i32 {
     let _ = log::set_logger(&WASM_LOGGER);
     log::set_max_level(log::LevelFilter::Info);
 
-    // Register the WASM HAL ops table. WASM is single-threaded with
-    // no flash / interrupts / step-guard hardware, so most ops are
-    // no-ops; time + crypto bridge to host imports.
-    crate::kernel::hal::init(&hal::WASM_HAL_OPS);
-
-    // Populate the kernel-internal SyscallTable, then register the
-    // built-in provider dispatchers (CHANNEL, TIMER, EVENT, BUFFER,
-    // …) that module syscalls route through.
-    crate::kernel::syscalls::init_syscall_table();
-    crate::kernel::syscalls::init_providers();
+    // Register the WASM HAL ops table and bring up the SyscallTable +
+    // built-in provider dispatchers (CHANNEL, TIMER, EVENT, BUFFER, …).
+    // WASM is single-threaded with no flash / interrupts / step-guard
+    // hardware, so most HAL ops are no-ops; time + crypto bridge to
+    // host imports.
+    crate::kernel::boot(&hal::WASM_HAL_OPS);
 
     // Walk the embedded modules blob (rewritten in-place by the
     // bundle tool when building a `<config>.wasm`) and instantiate
@@ -797,6 +781,7 @@ pub extern "C" fn kernel_init() -> i32 {
             " bundled modules",
             0,
         );
+        scheduler::log_arena_summary();
     }
 
     // Smoke-test the host_instantiate_module / host_invoke_module

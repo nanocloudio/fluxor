@@ -12,7 +12,6 @@ use {defmt_rtt as _, panic_probe as _};
 use fluxor::kernel::pio_util;
 
 use fluxor::kernel::config::Hardware;
-use fluxor::kernel::hal;
 use fluxor::kernel::planner::{self, PioRole};
 use fluxor::kernel::scheduler::{self, setup, RunnerConfig, StepResult, MAX_MODULES};
 use fluxor::kernel::syscalls;
@@ -291,12 +290,9 @@ async fn main(spawner: Spawner) {
     };
     planner::log_plan(&plan);
 
-    // Initialize HAL with RP platform ops
-    hal::init(&RP_HAL_OPS);
-
-    // Initialize syscall table and providers (before any bus init)
-    syscalls::init_syscall_table();
-    syscalls::init_providers();
+    // HAL ops, syscall table, providers — must run before any bus
+    // init so module syscalls reach a populated dispatch table.
+    fluxor::kernel::boot(&RP_HAL_OPS);
 
     // --- SPI: mark available buses (PIC module does actual peripheral init) ---
     for spi_cfg in plan.spi.iter().flatten() {
@@ -370,6 +366,7 @@ async fn main(spawner: Spawner) {
         }
 
         log::info!("[boot] ready modules={}", module_count);
+        scheduler::log_arena_summary();
 
         match rp_run_main_loop(module_count as usize).await {
             Some(_rebuild) => {

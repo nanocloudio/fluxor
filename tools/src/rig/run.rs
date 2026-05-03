@@ -353,6 +353,7 @@ fn run_build(plan: &Plan, options: &RunOptions) -> Result<Option<ArtifactOutput>
             "rig run: empty build command in project descriptor".into(),
         ));
     }
+    eprintln!("[rig] scenario.config: {}", plan.config_path.display());
     eprintln!(
         "[rig] build ({}): {}",
         project_root.display(),

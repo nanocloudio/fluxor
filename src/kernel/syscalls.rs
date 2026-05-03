@@ -4,6 +4,16 @@
 //! PIC modules call these functions through function pointers to access
 //! hardware resources (SPI, GPIO, timers, etc.).
 //!
+//! ## Concurrency
+//!
+//! `SYSCALL_TABLE`, `HARDWARE_CONTEXT`, `SYSTEM_EXTENSION`, and
+//! `DEV_QUERY_EXTENSION` are written once by `init_syscall_table` /
+//! `init_providers` on core 0, then read from every core during
+//! steady-state syscall traffic. The function-local `LOGGED` /
+//! `LOGGED_NULL_STATE` debounce flags can race across cores; the
+//! worst case is a duplicate log line per process lifetime. See
+//! `docs/architecture/concurrency.md`.
+//!
 //! # Architecture
 //!
 //! Portable kernel code lives in this file. Platform-specific hardware drivers

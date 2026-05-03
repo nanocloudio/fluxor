@@ -21,6 +21,21 @@ pub mod hal;
 pub mod key_vault;
 pub mod syscalls;
 
+/// Bring up the platform-agnostic kernel services: HAL ops table,
+/// syscall table, provider dispatchers. Every platform must call this
+/// exactly once on core 0 before `scheduler::populate_static_state` and
+/// `scheduler::prepare_graph`.
+///
+/// Step-guard initialisation is intentionally not included — RP wires
+/// it through HAL ops, wasm has nothing to guard, linux and bcm2712
+/// call `step_guard::init()` themselves.
+#[inline]
+pub fn boot(ops: &'static hal::HalOps) {
+    hal::init(ops);
+    syscalls::init_syscall_table();
+    syscalls::init_providers();
+}
+
 /// Kernel-private service registries and orchestration. Mirrors the
 /// `abi::internal::*` layer on the module side — these are the kernel's
 /// implementation of the registration hooks that pic modules invoke.

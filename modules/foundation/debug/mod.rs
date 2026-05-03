@@ -28,10 +28,6 @@ include!("../../sdk/params.rs");
 /// Input size: 2 blocks (1024 bytes) to match fluxor.test
 const INPUT_SIZE: usize = 1024;
 
-/// FNV-1a parameters
-const FNV_OFFSET: u32 = 0x811c9dc5;
-const FNV_PRIME: u32 = 0x01000193;
-
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
 // ============================================================================
@@ -87,19 +83,6 @@ mod params_def {
         2, mode, u8, 0, enum { hash=0, plaintext=1 }
             => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
     }
-}
-
-// ============================================================================
-// FNV-1a hash
-// ============================================================================
-
-fn fnv1a32(data: &[u8]) -> u32 {
-    let mut hash = FNV_OFFSET;
-    for &byte in data {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
 }
 
 // ============================================================================

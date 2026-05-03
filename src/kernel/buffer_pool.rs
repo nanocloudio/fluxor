@@ -7,6 +7,13 @@
 //!
 //! Each channel gets exactly the buffer size its module requests via channel hints.
 //!
+//! ## Concurrency
+//!
+//! `BUFFER_ARENA` and `BUFFER_ARENA_OFFSET` are boot-only (channel
+//! allocation happens in `prepare_graph` on core 0). Each
+//! `BUFFER_REGISTRY` slot is touched on every step from any core, so
+//! its fields are atomic. See `docs/architecture/concurrency.md`.
+//!
 //! ## Buffer Modes
 //!
 //! Each buffer supports two usage modes:

@@ -26,6 +26,17 @@ pub mod target;
 mod uf2;
 mod wasm_bundle;
 
+/// Wire-format constants — path-mounted from `modules/sdk/wire.rs` so
+/// the host tools see the exact same `ABI_VERSION` byte and `fnv1a32`
+/// implementation the kernel uses. The lib facade in `tools/src/lib.rs`
+/// mounts the same file for integration tests. `#[allow(dead_code)]`
+/// because tools only need a subset of the constants (e.g.
+/// `CHANNEL_HINT_WIRE_BYTES` is kernel-side only) but the file is
+/// shared verbatim.
+#[allow(dead_code)]
+#[path = "../../modules/sdk/wire.rs"]
+mod wire;
+
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 

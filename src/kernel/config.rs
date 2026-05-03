@@ -6,6 +6,12 @@
 //! - Runtime hardware context tracking
 //! - Hardware manager for initialization
 //!
+//! ## Concurrency
+//!
+//! `CONFIG_ARENA` and `ARENA_OFFSET` are boot-only: written by
+//! `populate_static_state` on core 0, then read by every core via the
+//! parsed `Config`. See `docs/architecture/concurrency.md`.
+//!
 //! ## Flash Layout
 //!
 //! The flash layout is dynamic, controlled by a 16-byte trailer placed
@@ -427,9 +433,10 @@ pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + 16
 // Graph Config (Version 1: Variable-Length Module Entries)
 // ============================================================================
 
-/// Config arena size for storing variable-length module params across all
-/// modules in the loaded graph. Per-chip so embedded targets don't carry a
-/// host-class arena in `.bss`. See each platform's `chip` module.
+/// Config arena size for storing variable-length module params across
+/// all modules in the loaded graph. Sized per chip so embedded targets
+/// don't carry a host-class arena in `.bss`. See each platform's
+/// `chip` module.
 pub const CONFIG_ARENA_SIZE: usize = super::chip::CONFIG_ARENA_SIZE;
 
 /// Static arena for module params storage
@@ -454,6 +461,13 @@ fn arena_reset() {
     unsafe {
         ARENA_OFFSET = 0;
     }
+}
+
+/// Current config-arena occupancy: `(used_bytes, total_bytes)`. Read
+/// by `scheduler::log_arena_summary` so silicon-TOML sizing decisions
+/// can be validated against real workloads.
+pub fn config_arena_usage() -> (usize, usize) {
+    unsafe { (ARENA_OFFSET, CONFIG_ARENA_SIZE) }
 }
 
 /// Parsed module entry with variable-length params

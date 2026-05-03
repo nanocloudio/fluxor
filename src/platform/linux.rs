@@ -16,11 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fluxor::kernel::channel;
-use fluxor::kernel::hal::{self, HalOps};
+use fluxor::kernel::hal::HalOps;
 use fluxor::kernel::loader;
 use fluxor::kernel::scheduler;
 use fluxor::kernel::step_guard;
-use fluxor::kernel::syscalls;
 
 include!("linux/runtime.rs");
 
@@ -171,12 +170,8 @@ fn main() {
         modules_ptr
     );
 
-    // Initialize HAL
-    hal::init(&LINUX_HAL_OPS);
-
-    // Initialize syscall table and providers
-    syscalls::init_syscall_table();
-    syscalls::init_providers();
+    // HAL ops, syscall table, providers, then the step guard.
+    fluxor::kernel::boot(&LINUX_HAL_OPS);
     step_guard::init();
 
     // Populate the kernel's static config + loader from our mmap'd blobs
@@ -326,6 +321,7 @@ fn main() {
         log::warn!("[sched] no modules loaded, nothing to do");
         process::exit(0);
     }
+    scheduler::log_arena_summary();
 
     log::info!("[sched] starting main loop, tick_us={}", tick_us);
     let tick_duration = Duration::from_micros(tick_us as u64);

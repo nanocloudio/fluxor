@@ -11,11 +11,10 @@
 //
 // This file is `include!`'d by `abi.rs` into `pub mod kernel_abi`.
 
-/// ABI version number. Single version — there is no backwards
-/// compatibility layer. Every module is built against the current
-/// `SyscallTable` shape, which is `channel_*` + `heap_*` +
-/// `provider_open`/`call`/`query`/`close`.
-pub const ABI_VERSION: u32 = 1;
+/// ABI version exposed via `SyscallTable.version` (u32 for layout
+/// reasons). Widened from the on-disk `wire::ABI_VERSION` byte so
+/// every consumer sees the same value.
+pub const ABI_VERSION: u32 = super::wire::ABI_VERSION as u32;
 
 /// Default channel buffer size in bytes.
 /// Referenced by kernel (buffer_pool, scheduler fan buffer) and modules

@@ -6,6 +6,11 @@
 // Compiler Intrinsics: ARM EABI memclr/memcpy for struct init/assignment.
 // Param Helpers: Safe(r) little-endian reads from a raw params pointer.
 
+// Wire-format constants (ABI_VERSION, CHANNEL_HINT_WIRE_BYTES,
+// fnv1a32). Brought into the PIC module's top-level namespace; the
+// kernel reaches the same values via `abi::wire::*`.
+include!("wire.rs");
+
 // ============================================================================
 // Core runtime stubs for slice bounds-checking
 // ============================================================================
@@ -614,8 +619,8 @@ pub fn track_pending(written: i32, total: usize, pending_out: &mut u16, pending_
 /// kernel how large each port's channel buffer should be. Without hints,
 /// all ports get the default kernel buffer size.
 ///
-/// `buffer_size` is `u32` (was `u16`) so chunky producers — e.g. a full
-/// 256x192 RGB565 frame at 98,304 B — can request more than 64 KiB. The
+/// `buffer_size` is `u32` so chunky producers — e.g. a full 256x192
+/// RGB565 frame at 98,304 B — can request more than 64 KiB. The
 /// natural `#[repr(C)]` alignment of `u32` inserts 2 bytes of padding
 /// between `port_index` and `buffer_size`, giving an 8-byte struct;
 /// `write_channel_hints` zero-fills those bytes on the wire.
@@ -628,12 +633,6 @@ pub struct ChannelHint {
     /// Requested buffer size in bytes (0 = use default).
     pub buffer_size: u32,
 }
-
-/// Wire size of one `ChannelHint` slot when serialised by
-/// `write_channel_hints` / decoded by `query_channel_hints`. Kept
-/// explicit so the writer and reader agree even if the in-memory
-/// repr ever changes.
-pub const CHANNEL_HINT_WIRE_BYTES: usize = 8;
 
 /// Write channel hints to output buffer. Returns number of hints written,
 /// or -1 if the buffer is too small.

@@ -34,6 +34,13 @@
 
 // ─── Layered structure ───────────────────────────────────────────────
 
+/// Wire-format constants — ABI version byte, channel-hint stride,
+/// `fnv1a32` name hash. Imported by every consumer that needs to
+/// agree on these bytes.
+pub mod wire {
+    include!("wire.rs");
+}
+
 pub mod kernel_abi {
     include!("kernel_abi.rs");
 }

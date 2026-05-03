@@ -36,6 +36,7 @@ pub mod record;
 pub mod run;
 pub mod scenario;
 pub mod secret;
+pub mod template;
 pub mod validate;
 pub mod vocab;
 

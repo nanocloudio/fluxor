@@ -5,6 +5,13 @@
 //! it at boot via `hal::init()`. This eliminates all `#[cfg]` blocks from
 //! kernel code — platform differences are resolved through a single function
 //! pointer indirection.
+//!
+//! ## Concurrency
+//!
+//! `HAL_OPS` is assigned once during `kernel::boot(...)` on core 0
+//! before any secondary core is released. Subsequent reads from any
+//! core see the same `&'static HalOps`. See
+//! `docs/architecture/concurrency.md`.
 
 /// Function-pointer table for all platform-specific operations.
 ///

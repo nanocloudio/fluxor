@@ -1459,12 +1459,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     uart_puts(b"[gic] initialized, IRQs enabled\r\n");
 
-    // Initialize HAL with BCM2712 platform ops
-    fluxor::kernel::hal::init(&BCM2712_HAL_OPS);
-
-    // Initialize syscall table and provider registry
-    fluxor::kernel::syscalls::init_syscall_table();
-    fluxor::kernel::syscalls::init_providers();
+    // HAL ops, syscall table, providers, then the BCM2712
+    // generic-timer-backed step guard.
+    fluxor::kernel::boot(&BCM2712_HAL_OPS);
     fluxor::kernel::step_guard::init();
 
     // --- Config-driven module graph ---
@@ -1735,6 +1732,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_puts(b"[inst] ");
     uart_put_u32(total_mods as u32);
     uart_puts(b" modules loaded total\r\n");
+
+    fluxor::kernel::scheduler::log_arena_summary();
 
     // Signal init complete — secondary cores can start
     INIT_COMPLETE.store(1, Ordering::Release);

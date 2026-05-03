@@ -41,7 +41,11 @@ driver = "rp1_gem"
 artifact = "kernel8_img"
 deploy = ["deploy.netboot_tftp", "deploy.bootfs_copy", "deploy.sd_image_writer"]
 preferred_deploy = "deploy.netboot_tftp"
-console = ["console.serial"]
+# `console.netconsole` reads the `platform.debug.to: net` UDP
+# broadcast — the kernel's `log_ring` contents on ethernet rather
+# than the wire UART. Graphs that enable `debug.to: net` can validate
+# `[nvme] / [fat32] / [ip] / [sched]` markers without a serial cable.
+console = ["console.serial", "console.netconsole"]
 preferred_console = "console.serial"
 telemetry = ["telemetry.monitor_udp"]
 preferred_telemetry = "telemetry.monitor_udp"

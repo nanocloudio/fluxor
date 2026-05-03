@@ -19,11 +19,7 @@ pub mod platform;
 #[path = "platform/wasm.rs"]
 pub mod wasm_entry;
 
-pub fn fnv1a32(data: &[u8]) -> u32 {
-    let mut hash = 0x811C9DC5u32;
-    for &b in data {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
+// Top-level re-export so kernel call sites can reach the canonical
+// FNV-1a hash as `crate::fnv1a32`. Implementation lives in `abi::wire`.
+#[cfg(any(feature = "rp", feature = "chip-bcm2712", feature = "host-linux", feature = "host-wasm"))]
+pub use abi::wire::fnv1a32;
