@@ -33,3 +33,18 @@ pub const ARENA_WRITE: u32 = 0x0CFE;
 /// Flush any pending writes for a registered arena.
 /// handle=-1, arg=[arena_id:u8] (1 byte). Returns 0 or errno.
 pub const ARENA_FLUSH: u32 = 0x0CFF;
+
+/// Bulk multi-page read/write against a registered arena. The kernel
+/// forwards this to the backing-provider driver as a single bulk
+/// dispatch — drivers that support multi-block transfers (NVMe with
+/// PRP-lists, SD/eMMC multi-block writes) issue one device command,
+/// amortizing the per-command roundtrip across all `count` pages.
+///
+/// handle=-1, arg=[arena_id:u8, op:u8 (0=WRITE,1=READ), vpage_start:u32 LE,
+///                 count:u32 LE, buf_ptr:u64 LE] (18 bytes).
+/// `buf_ptr` must point to `count * 4096` readable (op=WRITE) or
+/// writable (op=READ) bytes.
+/// Returns 0 or errno.
+pub const ARENA_BULK: u32 = 0x0CE9;
+pub const ARENA_BULK_OP_WRITE: u8 = 0;
+pub const ARENA_BULK_OP_READ:  u8 = 1;

@@ -94,19 +94,10 @@ enum Fat32InitPhase {
     Done = 12,
 }
 
-/// FAT32 file streaming phases.
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-enum Fat32ModPhase {
-    Idle = 0,
-    SeekSd = 1,
-    WaitSeek = 2,
-    ReadBlock = 3,
-    WaitBlock = 4,
-    WriteData = 5,
-    ReadFat = 6,
-    WaitFat = 7,
-}
+// Reads flow through the synchronous FS_CONTRACT dispatch
+// (`fat32_fs_dispatch`) and the per-FD scratch in `OpenFile` — there
+// is no per-step read state machine; the dispatch call walks the FAT
+// chain in-line via `IOCTL_BLOCKS_READ_LBAS_SYNC`.
 
 // ============================================================================
 // Write state machine discriminants (stored in `Fat32State::write_state`).
@@ -236,8 +227,8 @@ mod params_def {
                 }
             };
 
-        // Phase 6: write_file as a user-friendly "name.ext" (e.g.
-        // "boot.txt"). We convert to FAT 8.3 short-name form (8 name
+        // `write_file` accepts a user-friendly "name.ext" string (e.g.
+        // "boot.txt"). Converted to FAT 8.3 short-name form (8 name
         // bytes + 3 extension bytes, space-padded, uppercased) so a
         // raw 11-byte compare against FileEntry.short_name finds it.
         3, write_file, str, 0
@@ -296,6 +287,23 @@ mod params_def {
 
         5, namespace, u32, 1
             => |s, d, len| { s.namespace = p_u32(d, len, 0, 1); };
+
+        // When non-zero, overrides `write_data_len` as the total
+        // payload length to write. Used together with `seed_pattern=1`
+        // to lay down a multi-MB file from a deterministic synthesizer
+        // (no inline buffer required). When `seed_pattern=0` and
+        // `write_size > write_data_len`, the trailing region is
+        // zero-filled by `stage_data_batch`'s existing pad path.
+        6, write_size, u32, 0
+            => |s, d, len| { s.write_size = p_u32(d, len, 0, 0); };
+
+        // 0 = inline `write_data` source (used by short test fixtures).
+        // 1 = synthetic pattern source (`byte_at(off) = (off & 0xFF)`),
+        //     enabling multi-MB writes without inflating module state.
+        //     Caller must also set `write_size` to the desired byte
+        //     count; `write_data_len` is ignored.
+        7, seed_pattern, u8, 0
+            => |s, d, len| { s.seed_pattern = super::p_u8(d, len, 0, 0); };
     }
 }
 
@@ -319,8 +327,8 @@ struct FileEntry {
     /// Byte offset of the 32-byte entry inside `dir_lba`.
     dir_offset: u16,
     /// Short 8.3 name as stored in the directory entry: 8 name bytes
-    /// padded with spaces, then 3 extension bytes. Used by the
-    /// Phase 6 write path to locate a file by name.
+    /// padded with spaces, then 3 extension bytes. Used by the write
+    /// path to locate a file by name.
     short_name: [u8; 11],
     _pad:       u8,
 }
@@ -338,6 +346,57 @@ impl FileEntry {
     }
 }
 
+/// Maximum concurrent FDs the FS_CONTRACT dispatch can hand out.
+/// HTTP serving N parallel files needs at least N slots; 8 covers
+/// typical deployments (HTML + WASM + range-reads + headroom).
+const MAX_OPEN_FILES: usize = 8;
+
+/// Per-FD state for the FS_CONTRACT dispatch path. Scratch holds the
+/// last 512 B sector served, so successive small `FS_READ` calls
+/// don't re-fetch the same sector. The FAT walk fields (cluster +
+/// sector_in_cluster) advance together with `offset`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OpenFile {
+    /// 1 = slot in use; 0 = free.
+    in_use: u8,
+    /// Sector index within current_cluster (0..sectors_per_cluster).
+    sector_in_cluster: u8,
+    _pad: [u8; 2],
+    /// Cluster currently being read (FAT chain walk position).
+    current_cluster: u32,
+    /// Read offset within the file (bytes). 0..size.
+    offset: u32,
+    /// Total file size in bytes (cached at OPEN).
+    size: u32,
+    /// Starting cluster of the file (used for SEEK rewinds).
+    start_cluster: u32,
+    /// Bytes remaining in `scratch_block` from the most recent read.
+    /// 0 means the next FS_READ must fetch a fresh sector.
+    scratch_avail: u16,
+    /// Read offset within `scratch_block` (= 512 - scratch_avail).
+    scratch_pos: u16,
+    /// Most recently fetched 512-byte sector for this FD.
+    scratch_block: [u8; BLOCK_SIZE],
+}
+
+impl OpenFile {
+    const fn empty() -> Self {
+        Self {
+            in_use: 0,
+            sector_in_cluster: 0,
+            _pad: [0; 2],
+            current_cluster: 0,
+            offset: 0,
+            size: 0,
+            start_cluster: 0,
+            scratch_avail: 0,
+            scratch_pos: 0,
+            scratch_block: [0u8; BLOCK_SIZE],
+        }
+    }
+}
+
 // ============================================================================
 // Module State
 // ============================================================================
@@ -345,8 +404,11 @@ impl FileEntry {
 #[repr(C)]
 struct Fat32State {
     syscalls: *const SyscallTable,
+    /// Channel handle for the upstream block source (nvme.blocks /
+    /// sd.blocks). Every sector read — init MBR/boot/dir, write-path
+    /// FAT walks, FS_CONTRACT sync block reads — flows through this
+    /// channel via ioctls on the producer side.
     in_chan: i32,
-    out_chan: i32,
 
     // FAT32 geometry (from boot sector)
     bytes_per_sector: u16,
@@ -366,9 +428,11 @@ struct Fat32State {
 
     // State machine
     init_phase: Fat32InitPhase,
-    mod_phase: Fat32ModPhase,
 
-    // File enumeration
+    // File enumeration — populated at init when `path:` is non-empty
+    // so the write path (`WS_SCAN`) can locate `write_file:` by 8.3
+    // short name. The FS_CONTRACT read path walks the directory tree
+    // on demand and does not consult `files`.
     file_count: u16,
     files: [FileEntry; MAX_FILES],
 
@@ -376,21 +440,17 @@ struct Fat32State {
     path: [u8; 64],
     pattern: [u8; 16],
 
-    // Directory enumeration state
+    // Directory enumeration state — read by `init_step` to populate
+    // `s.files[]`. Idle in steady state.
     dir_cluster: u32,
     dir_sector_in_cluster: u8,
     dir_entry_in_sector: u8,
     dir_mode: u8,
     path_pos: u8,
 
-    // Current file streaming state
-    current_file: u16,
-    current_cluster: u32,
-    current_sector_in_cluster: u8,
-    file_offset: u32,
-    file_size: u32,
-
-    // Block I/O state
+    // Block I/O state — single shared `block_buf` for init walks
+    // and the write path's FAT/dir reads. The FS dispatch maintains
+    // its own per-FD scratch in `OpenFile`.
     pending_block: u32,
     block_offset: u16,
     read_fill: u16,
@@ -401,7 +461,7 @@ struct Fat32State {
     /// after `log_net` starts streaming.
     tick_count: u32,
 
-    // ── Phase 6 write state machine ────────────────────────────────
+    // ── Write state machine ────────────────────────────────────────
     //
     // After init completes and the target file is located (by short
     // 8.3 name), fat32 overwrites the file starting at offset 0 with
@@ -427,12 +487,26 @@ struct Fat32State {
     namespace:         u32,
     write_state:       u8,   // current WS_* discriminant
     write_file_len:    u8,   // 0 = disabled (no `write_file` param given)
-    _pad_w0:           u16,
+    /// 0 = inline `write_data` source (default, capped at `WRITE_DATA_MAX`).
+    /// 1 = synthetic pattern source for `seed_byte_at(off)`. Combined
+    /// with a non-zero `write_size`, lets a single fat32 instance lay
+    /// down a multi-MB file without inflating module state past
+    /// `WRITE_DATA_MAX`. Verifier on the read-back side recomputes
+    /// the same pattern to confirm byte-exact write fidelity.
+    seed_pattern:      u8,
+    _pad_w0:           u8,
     write_file:        [u8; 11],
     _pad_w1:           u8,
     write_data_len:    u16,
     _pad_w2:           u16,
     write_data:        [u8; WRITE_DATA_MAX],
+
+    /// When > 0, the write loop walks this many bytes total instead
+    /// of `write_data_len`. The bytes come from `seed_byte_at` if
+    /// `seed_pattern == 1` or from `write_data` (zero-padded past
+    /// `write_data_len`) otherwise. Caps at `u32::MAX`; practical
+    /// values are bounded by free-cluster availability on the disk.
+    write_size:        u32,
 
     // Target file (resolved once during WS_Scan).
     w_target_first_cluster: u32,
@@ -474,14 +548,33 @@ struct Fat32State {
     /// advance w_bytes_written and w_sector_in_cluster by `nlb` sectors.
     w_batch_nlb:      u16,
     w_return_state:   u8,  // where to go after w_outbuf drains
-    _pad_wo:          u8,
+    _pad_w_ret:       u8,
+
+    /// Open-file slots backing the FS_CONTRACT dispatch path. Each
+    /// slot is independent — multiple consumers can open multiple
+    /// files concurrently (HTTP parallel range reads, etc.). Block
+    /// I/O is shared (single nvme.blocks channel) but the FS_READ
+    /// path uses `IOCTL_BLOCKS_READ_LBAS_SYNC` which is fully
+    /// synchronous and serializes within each dispatch call.
+    open_files: [OpenFile; MAX_OPEN_FILES],
+
+    /// Hot-path counters emitted as `[fat32] tlm dt=… rx=… tx=… idle=… bp=…`
+    /// every `FAT32_TLM_PERIOD` steps. `rx` is bytes consumed from
+    /// the upstream blocks channel (init walks + write-path FAT/dir
+    /// reads); `tx` and `bp` are unused on this path because reads
+    /// flow through the synchronous FS_CONTRACT dispatch.
+    tlm: TlmCounters,
+    tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
 }
+
+/// Cadence for the `[fat32] tlm` line. Matches the `hb` heartbeat
+/// period so the two can be correlated by the host parser.
+const FAT32_TLM_PERIOD: u32 = 5000;
 
 impl Fat32State {
     fn init(&mut self, syscalls: *const SyscallTable) {
         self.syscalls = syscalls;
         self.in_chan = -1;
-        self.out_chan = -1;
         self.bytes_per_sector = 512;
         self.sectors_per_cluster = 0;
         self.reserved_sectors = 0;
@@ -493,18 +586,12 @@ impl Fat32State {
         self.partition_lba = 0;
         self.fsinfo_sector = 0;
         self.init_phase = Fat32InitPhase::Idle;
-        self.mod_phase = Fat32ModPhase::Idle;
         self.file_count = 0;
         self.dir_cluster = 0;
         self.dir_sector_in_cluster = 0;
         self.dir_entry_in_sector = 0;
         self.dir_mode = 0;
         self.path_pos = 0;
-        self.current_file = 0xFFFF;
-        self.current_cluster = 0;
-        self.current_sector_in_cluster = 0;
-        self.file_offset = 0;
-        self.file_size = 0;
         self.pending_block = 0;
         self.block_offset = 0;
         self.read_fill = 0;
@@ -514,6 +601,8 @@ impl Fat32State {
         self.write_state = WS_IDLE;
         self.write_file_len = 0;
         self.write_data_len = 0;
+        self.write_size = 0;
+        self.seed_pattern = 0;
         self.w_target_first_cluster = 0;
         self.w_target_old_size = 0;
         self.w_target_dir_lba = 0;
@@ -533,6 +622,11 @@ impl Fat32State {
         self.w_outbuf_len = 0;
         self.w_batch_nlb = 0;
         self.w_return_state = WS_DONE;
+        let mut i = 0usize;
+        while i < MAX_OPEN_FILES {
+            self.open_files[i] = OpenFile::empty();
+            i += 1;
+        }
         // path, pattern, files, write_file, write_data, w_outbuf are
         // zeroed by the kernel allocator.
     }
@@ -607,22 +701,6 @@ unsafe fn seek_sd(s: &Fat32State, block: u32) -> i32 {
 #[inline]
 unsafe fn flush_input(s: &Fat32State) -> i32 {
     dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut())
-}
-
-/// Check for pending seek request from downstream
-#[inline]
-unsafe fn check_seek_request(s: &Fat32State) -> u32 {
-    if s.out_chan < 0 {
-        return u32::MAX;
-    }
-    let mut seek_pos: u32 = 0;
-    let seek_ptr = &mut seek_pos as *mut u32 as *mut u8;
-    let res = dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_POLL_NOTIFY, seek_ptr);
-    if res == 0 {
-        seek_pos
-    } else {
-        u32::MAX
-    }
 }
 
 // ============================================================================
@@ -722,6 +800,7 @@ unsafe fn try_read_block(s: &mut Fat32State) -> i32 {
     if read < 0 {
         return -1;
     }
+    s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(read as u32);
     s.read_fill += read as u16;
     if (s.read_fill as usize) < BLOCK_SIZE {
         return 0;
@@ -885,8 +964,8 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
         (*file_ptr).start_cluster = cluster;
         (*file_ptr).size = size;
         // Capture the directory-sector LBA + entry offset so the
-        // Phase 6 write path can re-read this exact sector when it
-        // needs to patch the size field.
+        // write path can re-read this exact sector when it needs to
+        // patch the size field.
         (*file_ptr).dir_lba =
             cluster_to_sector(s, s.dir_cluster) + (s.dir_sector_in_cluster as u32);
         (*file_ptr).dir_offset = entry_offset as u16;
@@ -901,6 +980,406 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
     }
 
     true
+}
+
+// ============================================================================
+// FS_CONTRACT dispatch — fat32 as the bare-metal FS provider.
+// ============================================================================
+//
+// Bare-metal counterpart to `linux_fs_dispatch`. Sector reads issue
+// `IOCTL_BLOCKS_READ_LBAS_SYNC` against whatever block source is
+// wired to `s.in_chan` (nvme, sd, …). Up to MAX_OPEN_FILES concurrent
+// opens; per-FD state lives in `OpenFile`. Random-access read latency
+// is bounded by the producer's per-command device latency since the
+// block read is fully synchronous inside the dispatch call.
+
+// FS opcodes from the layered ABI.
+const FS_OPEN:  u32 = 0x0900;
+const FS_READ:  u32 = 0x0901;
+const FS_SEEK:  u32 = 0x0902;
+const FS_CLOSE: u32 = 0x0903;
+const FS_STAT:  u32 = 0x0904;
+
+/// Synchronously fetch a 512-byte sector at `lba` into `out`. Returns
+/// 0 on success, negative errno otherwise. The block source must
+/// implement `IOCTL_BLOCKS_READ_LBAS_SYNC` — nvme does; sd does not.
+unsafe fn fs_sync_read_sector(s: &Fat32State, lba: u32, out: *mut u8) -> i32 {
+    let mut arg = [0u8; 16];
+    let lba_b = lba.to_le_bytes();
+    arg[0] = lba_b[0]; arg[1] = lba_b[1]; arg[2] = lba_b[2]; arg[3] = lba_b[3];
+    arg[4] = 1; arg[5] = 0; // nlb = 1
+    let buf_b = (out as u64).to_le_bytes();
+    let mut i = 0usize;
+    while i < 8 {
+        arg[8 + i] = buf_b[i];
+        i += 1;
+    }
+    dev_channel_ioctl(
+        s.sys(),
+        s.in_chan,
+        IOCTL_BLOCKS_READ_LBAS_SYNC,
+        arg.as_mut_ptr(),
+    )
+}
+
+/// Read one FAT entry synchronously; returns the next cluster
+/// number (28-bit) or `FAT32_EOC` on chain end / error.
+unsafe fn fs_read_fat_entry(s: &mut Fat32State, cluster: u32) -> u32 {
+    let fat_lba = fat_sector_for_cluster(s, cluster);
+    let mut buf = [0u8; BLOCK_SIZE];
+    let rc = fs_sync_read_sector(s, fat_lba, buf.as_mut_ptr());
+    if rc != 0 { return FAT32_EOC; }
+    let off = fat_offset_for_cluster(s, cluster);
+    if off + 4 > BLOCK_SIZE { return FAT32_EOC; }
+    let raw = u32::from_le_bytes([
+        buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
+    ]) & FAT32_MASK;
+    if raw == 0 || raw >= FAT32_EOC { FAT32_EOC } else { raw }
+}
+
+/// Convert a path component to a FAT 8.3 short name (11 bytes,
+/// space-padded, uppercase). Returns true on success.
+fn fs_path_to_short_name(name: &[u8], out: &mut [u8; 11]) -> bool {
+    *out = [b' '; 11];
+    if name.is_empty() || name.len() > 12 { return false; }
+    let mut dot: usize = name.len();
+    let mut i = 0usize;
+    while i < name.len() {
+        if name[i] == b'.' { dot = i; break; }
+        i += 1;
+    }
+    let n_len = if dot > 8 { 8 } else { dot };
+    let mut j = 0usize;
+    while j < n_len {
+        let c = name[j];
+        out[j] = if (b'a'..=b'z').contains(&c) { c - 32 } else { c };
+        j += 1;
+    }
+    if dot < name.len() {
+        let ext = &name[dot + 1..];
+        let e_len = if ext.len() > 3 { 3 } else { ext.len() };
+        let mut k = 0usize;
+        while k < e_len {
+            let c = ext[k];
+            out[8 + k] = if (b'a'..=b'z').contains(&c) { c - 32 } else { c };
+            k += 1;
+        }
+    }
+    true
+}
+
+/// Result of a successful path resolution.
+#[derive(Clone, Copy)]
+struct ResolvedFile {
+    start_cluster: u32,
+    size: u32,
+}
+
+/// Search the directory rooted at `dir_first_cluster` for an entry
+/// matching the 8.3 short name `want`. Walks every sector of every
+/// cluster in the dir's chain, fetching synchronously via the
+/// `IOCTL_BLOCKS_READ_LBAS_SYNC` block-source ioctl. Returns the
+/// matched entry's (start_cluster, size, attr) — caller checks
+/// `attr & ATTR_DIRECTORY` to decide whether to descend or stop.
+unsafe fn fs_dir_lookup(
+    s: &mut Fat32State,
+    dir_first_cluster: u32,
+    want: &[u8; 11],
+) -> Option<(u32, u32, u8)> {
+    if dir_first_cluster < 2 { return None; }
+    let entries_per_sector = BLOCK_SIZE / DIR_ENTRY_SIZE;
+    let spc = s.sectors_per_cluster as u32;
+    if spc == 0 { return None; }
+    let mut cur_cluster = dir_first_cluster;
+    let mut buf = [0u8; BLOCK_SIZE];
+
+    loop {
+        let cluster_first_sector = cluster_to_sector(s, cur_cluster);
+        let mut sec = 0u32;
+        while sec < spc {
+            let lba = cluster_first_sector + sec;
+            if fs_sync_read_sector(s, lba, buf.as_mut_ptr()) != 0 {
+                return None;
+            }
+            let mut e = 0usize;
+            while e < entries_per_sector {
+                let off = e * DIR_ENTRY_SIZE;
+                let first = buf[off];
+                if first == 0x00 {
+                    // End-of-directory marker — no further entries
+                    // anywhere in the chain.
+                    return None;
+                }
+                // 0xE5 = deleted; LFN entries set attr == 0x0F; volume
+                // labels carry the VOLUME_ID bit. Skip all three.
+                if first != 0xE5 {
+                    let attr = buf[off + 11];
+                    if attr != ATTR_LONG_NAME && (attr & ATTR_VOLUME_ID) == 0 {
+                        let mut name = [0u8; 11];
+                        name.copy_from_slice(&buf[off..off + 11]);
+                        if &name == want {
+                            let cluster_hi = read_u16_le(&buf, off + 20) as u32;
+                            let cluster_lo = read_u16_le(&buf, off + 26) as u32;
+                            let start_cluster = (cluster_hi << 16) | cluster_lo;
+                            let size = read_u32_le(&buf, off + 28);
+                            return Some((start_cluster, size, attr));
+                        }
+                    }
+                }
+                e += 1;
+            }
+            sec += 1;
+        }
+        // Cluster exhausted — follow FAT chain to next cluster.
+        let next = fs_read_fat_entry(s, cur_cluster);
+        if next >= FAT32_EOC { return None; }
+        cur_cluster = next;
+    }
+}
+
+/// Resolve an absolute FAT32 path (e.g. `/web/INDEX.HTM`) to its
+/// `(start_cluster, size)`. Walks each path component synchronously
+/// through `fs_dir_lookup`. Returns None on ENOENT or malformed
+/// path. Path components must already be in 8.3-compatible form
+/// (case-folded internally by `fs_path_to_short_name`).
+unsafe fn fs_resolve_path(s: &mut Fat32State, path: &[u8]) -> Option<ResolvedFile> {
+    if s.init_phase != Fat32InitPhase::Done { return None; }
+    if s.root_cluster < 2 { return None; }
+    if path.is_empty() { return None; }
+    // Walk past leading slashes.
+    let mut pos = 0usize;
+    while pos < path.len() && path[pos] == b'/' { pos += 1; }
+    if pos >= path.len() { return None; } // bare "/"
+
+    let mut cur_cluster = s.root_cluster;
+    loop {
+        // Extract the next component up to the next '/' or end-of-string.
+        let start = pos;
+        while pos < path.len() && path[pos] != b'/' { pos += 1; }
+        let comp = &path[start..pos];
+        if comp.is_empty() { return None; }
+        let mut want = [b' '; 11];
+        if !fs_path_to_short_name(comp, &mut want) { return None; }
+        let (sc, sz, attr) = fs_dir_lookup(s, cur_cluster, &want)?;
+        // Skip trailing slashes.
+        while pos < path.len() && path[pos] == b'/' { pos += 1; }
+        let is_final = pos >= path.len();
+        if is_final {
+            // The terminal component must be a regular file —
+            // directories aren't openable through FS_OPEN.
+            if (attr & ATTR_DIRECTORY) != 0 { return None; }
+            return Some(ResolvedFile { start_cluster: sc, size: sz });
+        }
+        // Intermediate component must be a directory.
+        if (attr & ATTR_DIRECTORY) == 0 { return None; }
+        cur_cluster = sc;
+    }
+}
+
+/// FS_OPEN: resolve the absolute path through the FAT32 tree
+/// (`fs_resolve_path` walks the dir chain synchronously via
+/// `IOCTL_BLOCKS_READ_LBAS_SYNC`), then allocate an `OpenFile` slot
+/// populated with the file's `start_cluster` + `size`. Returns the
+/// slot index as the FD, or a negative errno.
+unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len == 0 { return E_INVAL; }
+    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    let path = core::slice::from_raw_parts(arg, arg_len);
+    let resolved = match fs_resolve_path(s, path) {
+        Some(r) => r,
+        None => return -2, // ENOENT
+    };
+    // Allocate slot.
+    let mut slot: i32 = -1;
+    let mut k = 0usize;
+    while k < MAX_OPEN_FILES {
+        if s.open_files[k].in_use == 0 {
+            slot = k as i32;
+            break;
+        }
+        k += 1;
+    }
+    if slot < 0 { return -23; } // ENFILE
+    let of = &mut s.open_files[slot as usize];
+    of.in_use = 1;
+    of.start_cluster = resolved.start_cluster;
+    of.current_cluster = resolved.start_cluster;
+    of.size = resolved.size;
+    of.offset = 0;
+    of.sector_in_cluster = 0;
+    of.scratch_avail = 0;
+    of.scratch_pos = 0;
+    slot
+}
+
+/// FS_READ: drain `scratch_block` first, then synchronously fetch
+/// the next sector (walking the FAT chain when crossing a cluster
+/// boundary). Returns bytes read on success; 0 at EOF; negative
+/// errno on error.
+unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len == 0 { return E_INVAL; }
+    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    let slot_idx = handle as usize;
+    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
+    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    let bps = s.bytes_per_sector as u32;
+    let spc = s.sectors_per_cluster as u32;
+    if bps == 0 || spc == 0 { return E_AGAIN; }
+
+    let mut written: usize = 0;
+    let max = arg_len;
+    while written < max {
+        let of = &mut s.open_files[slot_idx];
+        let remaining_in_file = of.size.saturating_sub(of.offset);
+        if remaining_in_file == 0 { break; }
+        if of.scratch_avail == 0 {
+            // Fetch the current sector.
+            let sector = cluster_to_sector(s, s.open_files[slot_idx].current_cluster)
+                + (s.open_files[slot_idx].sector_in_cluster as u32);
+            let buf_ptr = s.open_files[slot_idx].scratch_block.as_mut_ptr();
+            let rc = fs_sync_read_sector(s, sector, buf_ptr);
+            if rc != 0 { return rc; }
+            let of2 = &mut s.open_files[slot_idx];
+            of2.scratch_avail = bps as u16;
+            of2.scratch_pos = 0;
+        }
+        let of3 = &mut s.open_files[slot_idx];
+        let avail = of3.scratch_avail as u32;
+        let want = (max - written) as u32;
+        let cap = if remaining_in_file < want { remaining_in_file } else { want };
+        let take = if avail < cap { avail } else { cap } as usize;
+        // Copy from scratch_block into caller's buffer.
+        core::ptr::copy_nonoverlapping(
+            of3.scratch_block.as_ptr().add(of3.scratch_pos as usize),
+            arg.add(written),
+            take,
+        );
+        of3.scratch_pos = of3.scratch_pos.wrapping_add(take as u16);
+        of3.scratch_avail = of3.scratch_avail.wrapping_sub(take as u16);
+        of3.offset = of3.offset.wrapping_add(take as u32);
+        written += take;
+        if of3.scratch_avail == 0 {
+            // Advance to the next sector / cluster.
+            of3.sector_in_cluster = of3.sector_in_cluster.wrapping_add(1);
+            if (of3.sector_in_cluster as u32) >= spc {
+                of3.sector_in_cluster = 0;
+                let cur = of3.current_cluster;
+                let next = fs_read_fat_entry(s, cur);
+                let of4 = &mut s.open_files[slot_idx];
+                if next >= FAT32_EOC {
+                    // No more clusters; file ends here. Cap offset to size
+                    // and let the next iteration exit on remaining_in_file == 0.
+                    of4.offset = of4.size;
+                } else {
+                    of4.current_cluster = next;
+                }
+            }
+        }
+    }
+    written as i32
+}
+
+/// FS_SEEK: rewind to start_cluster, walk forward to the target
+/// cluster, set sector + scratch position. `arg` is `[offset: i32 LE]`
+/// (matching the Linux FS dispatch). Returns the resulting offset on
+/// success or negative errno.
+unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 4 { return E_INVAL; }
+    let slot_idx = handle as usize;
+    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
+    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    let raw = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+    if raw < 0 { return E_INVAL; }
+    let target = raw as u32;
+    let bps = s.bytes_per_sector as u32;
+    let spc = s.sectors_per_cluster as u32;
+    if bps == 0 || spc == 0 { return E_AGAIN; }
+    let cluster_bytes = bps * spc;
+    let target_cluster_idx = target / cluster_bytes;
+    let target_sector = ((target % cluster_bytes) / bps) as u8;
+
+    let start = s.open_files[slot_idx].start_cluster;
+    let mut cluster = start;
+    let mut walked = 0u32;
+    while walked < target_cluster_idx {
+        let next = fs_read_fat_entry(s, cluster);
+        if next >= FAT32_EOC {
+            // Seeking past EOF — clamp the offset to the file size.
+            // POSIX lseek allows seeking past end, but the FS dispatch
+            // contract caps reads at `size`, so this stays consistent.
+            let size = s.open_files[slot_idx].size;
+            let of = &mut s.open_files[slot_idx];
+            of.offset = size;
+            of.scratch_avail = 0;
+            of.scratch_pos = 0;
+            return size as i32;
+        }
+        cluster = next;
+        walked += 1;
+    }
+    let of = &mut s.open_files[slot_idx];
+    of.current_cluster = cluster;
+    of.sector_in_cluster = target_sector;
+    of.offset = target;
+    // scratch is reset; the next FS_READ fetches the target sector.
+    of.scratch_avail = 0;
+    of.scratch_pos = 0;
+    target as i32
+}
+
+/// FS_CLOSE: free the OpenFile slot.
+unsafe fn fs_op_close(s: &mut Fat32State, handle: i32) -> i32 {
+    let slot_idx = handle as usize;
+    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
+    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    s.open_files[slot_idx] = OpenFile::empty();
+    0
+}
+
+/// FS_STAT: write `[size: u32 LE, mtime: u32 LE]` (8 bytes) into
+/// `arg`. mtime is reported as 0 — fat32 does not surface modification
+/// times through this dispatch.
+unsafe fn fs_op_stat(s: &Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 8 { return E_INVAL; }
+    let slot_idx = handle as usize;
+    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
+    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    let size = s.open_files[slot_idx].size;
+    let s_b = size.to_le_bytes();
+    *arg = s_b[0];
+    *arg.add(1) = s_b[1];
+    *arg.add(2) = s_b[2];
+    *arg.add(3) = s_b[3];
+    *arg.add(4) = 0; *arg.add(5) = 0; *arg.add(6) = 0; *arg.add(7) = 0;
+    0
+}
+
+#[no_mangle]
+#[link_section = ".text.module_provider_dispatch"]
+#[export_name = "module_provider_dispatch"]
+pub unsafe extern "C" fn fat32_fs_dispatch(
+    state: *mut u8,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    if state.is_null() { return E_INVAL; }
+    let s = &mut *(state as *mut Fat32State);
+    match opcode {
+        FS_OPEN  => fs_op_open(s, arg as *const u8, arg_len),
+        FS_READ  => fs_op_read(s, handle, arg, arg_len),
+        FS_SEEK  => fs_op_seek(s, handle, arg as *const u8, arg_len),
+        FS_CLOSE => fs_op_close(s, handle),
+        FS_STAT  => fs_op_stat(s, handle, arg, arg_len),
+        _ => -38, // ENOSYS
+    }
+}
+
+#[no_mangle]
+#[link_section = ".text.module_provides_contract"]
+pub extern "C" fn module_provides_contract() -> u32 {
+    0x0009 // FS
 }
 
 // ============================================================================
@@ -921,7 +1400,7 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
-    out_chan: i32,
+    _out_chan: i32,
     _ctrl_chan: i32,
     params: *const u8,
     params_len: usize,
@@ -941,12 +1420,10 @@ pub extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
 
         s.in_chan = in_chan;
-        s.out_chan = out_chan;
-        // Second output port (`block_writes`, index 1) carries Phase 6
-        // write requests. When the YAML wires it to nvme.requests the
-        // lookup returns a valid handle; otherwise it stays -1 and the
-        // write logic is inert.
-        s.write_out_chan = dev_channel_port(&*s.syscalls, 1, 1);
+        // `block_writes` (output port 0) carries write requests to the
+        // upstream block source; the wiring stays inert when the YAML
+        // doesn't connect it.
+        s.write_out_chan = dev_channel_port(&*s.syscalls, 1, 0);
 
         // Parse params
         let is_tlv = !params.is_null() && params_len >= 4
@@ -985,12 +1462,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             *p.add(pos)     = b'0' + (ip / 10);
             *p.add(pos + 1) = b'0' + (ip % 10);
             pos += 2;
-            let mp_tag = b" mod=";
-            core::ptr::copy_nonoverlapping(mp_tag.as_ptr(), p.add(pos), mp_tag.len());
-            pos += mp_tag.len();
-            let mp = s.mod_phase as u8;
-            *p.add(pos) = b'0' + mp;
-            pos += 1;
             let fc_tag = b" files=";
             core::ptr::copy_nonoverlapping(fc_tag.as_ptr(), p.add(pos), fc_tag.len());
             pos += fc_tag.len();
@@ -1016,41 +1487,56 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_log(s.sys(), 3, p, pos);
         }
 
-        // Run initialization if not done
-        if s.init_phase != Fat32InitPhase::Done {
-            return init_step(s);
-        }
+        let rx_pre = s.tlm.bytes_in;
+        let tx_pre = s.tlm.bytes_out;
+        let bp_pre = s.tlm.bp_steps;
 
-        // Phase 6: if a one-shot write is configured, run it before
-        // serving file-reads so the write lands before downstream
-        // consumers start fighting over the blocks channel. Enter the
-        // state machine at WS_SCAN on first entry; stay until WS_DONE.
-        if s.write_file_len > 0 && s.write_state != WS_DONE {
-            if s.write_state == WS_IDLE {
-                s.write_state = WS_NS_CHECK;
-            }
-            return write_step(s);
-        }
+        let rc = step_inner(s);
 
-        // Check for seek request from downstream
-        if s.mod_phase == Fat32ModPhase::Idle {
-            let seek_idx = check_seek_request(s);
-            if seek_idx != u32::MAX && (seek_idx as u16) < s.file_count {
-                // Start streaming file at index (use pointer arithmetic, no bounds check)
-                let idx = seek_idx as usize;
-                let file_ptr = s.files.as_ptr().add(idx);
-                s.current_file = seek_idx as u16;
-                s.current_cluster = (*file_ptr).start_cluster;
-                s.current_sector_in_cluster = 0;
-                s.file_offset = 0;
-                s.file_size = (*file_ptr).size;
-                s.mod_phase = Fat32ModPhase::SeekSd;
-            }
-        }
-
-        // File streaming state machine
-        stream_step(s)
+        tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+        // Borrow `syscalls` raw so the emit helper can hold `&mut s.tlm`
+        // alongside.
+        let sys = &*s.syscalls;
+        let scratch_ptr = s.tlm_scratch.as_mut_ptr();
+        let scratch_len = s.tlm_scratch.len();
+        let tick = s.tick_count;
+        dev_tlm_maybe_emit(
+            sys,
+            b"[fat32]",
+            &mut s.tlm,
+            tick,
+            FAT32_TLM_PERIOD,
+            scratch_ptr,
+            scratch_len,
+        );
+        rc
     }
+}
+
+/// Per-tick scheduler entry. Factored out so `module_step` can wrap
+/// the call with telemetry capture; every early return inside still
+/// passes through the tlm emit path.
+unsafe fn step_inner(s: &mut Fat32State) -> i32 {
+    // Run initialization if not done
+    if s.init_phase != Fat32InitPhase::Done {
+        return init_step(s);
+    }
+
+    // If a one-shot write is configured, run it before serving any
+    // FS_CONTRACT reads so the write lands before downstream consumers
+    // start fighting over the blocks channel. Enter the state machine
+    // at WS_SCAN on first entry and stay until WS_DONE.
+    if s.write_file_len > 0 && s.write_state != WS_DONE {
+        if s.write_state == WS_IDLE {
+            s.write_state = WS_NS_CHECK;
+        }
+        return write_step(s);
+    }
+
+    // Reads are served entirely by the FS_CONTRACT dispatch
+    // (`fat32_fs_dispatch` exported below); the per-step path is idle
+    // once init + the one-shot write are done.
+    0
 }
 
 // ============================================================================
@@ -1121,23 +1607,59 @@ unsafe fn stage_packet(s: &mut Fat32State, lba: u32, payload_src: *const u8) {
     core::ptr::copy_nonoverlapping(payload_src, out.add(REQ_HDR_SIZE), BLOCK_SIZE);
 }
 
-/// Stage an N-sector WRITE whose payload is `write_data[off..off+nlb*512]`,
-/// zero-padded past the end of `write_data_len` (for a partial last batch).
+/// Stage an N-sector WRITE whose payload starts at byte `off` of the
+/// write source. Source selection:
+///
+///   * `seed_pattern == 1` — synthesize each byte via [`seed_byte_at`]
+///     (deterministic, position-only), so the source is unbounded and
+///     no inline buffer is needed for multi-MB writes.
+///   * `seed_pattern == 0` — copy from `write_data[off..off+nlb*512]`,
+///     zero-pad past `write_data_len` (the inline-buffer mode used by
+///     short-fixture writes).
 unsafe fn stage_data_batch(s: &mut Fat32State, lba: u32, nlb: u16, off: usize) {
     stage_header(s, lba, nlb);
     let out = s.w_outbuf.as_mut_ptr();
     let total = (nlb as usize) * BLOCK_SIZE;
-    let wdl = s.write_data_len as usize;
-    let avail = wdl.saturating_sub(off).min(total);
-    if avail > 0 {
-        let src = s.write_data.as_ptr().add(off);
-        core::ptr::copy_nonoverlapping(src, out.add(REQ_HDR_SIZE), avail);
+    let dst = out.add(REQ_HDR_SIZE);
+
+    if s.seed_pattern != 0 {
+        // Synthetic pattern. Deterministic so a verifier (or fat32
+        // read-back) can recompute and confirm byte-exact fidelity.
+        let mut i = 0usize;
+        while i < total {
+            *dst.add(i) = seed_byte_at(off + i);
+            i += 1;
+        }
+    } else {
+        let wdl = s.write_data_len as usize;
+        let avail = wdl.saturating_sub(off).min(total);
+        if avail > 0 {
+            let src = s.write_data.as_ptr().add(off);
+            core::ptr::copy_nonoverlapping(src, dst, avail);
+        }
+        let mut z = avail;
+        while z < total {
+            *dst.add(z) = 0;
+            z += 1;
+        }
     }
-    let mut z = avail;
-    while z < total {
-        *out.add(REQ_HDR_SIZE + z) = 0;
-        z += 1;
-    }
+}
+
+/// Deterministic synthetic byte sequence. Encodes the byte offset
+/// into both low and mid bits so a host-side verifier reading back
+/// `N` bytes can recompute and compare byte-exact. Cheap (one xor +
+/// shift per byte) so it doesn't dominate the write-stage path.
+#[inline(always)]
+const fn seed_byte_at(off: usize) -> u8 {
+    ((off as u32) ^ ((off as u32) >> 8)) as u8
+}
+
+/// Total payload length for the current write — `write_size` if set,
+/// else the inline `write_data` length. Used by the write state
+/// machine for both the loop bound and the new-size computation.
+#[inline(always)]
+fn effective_write_size(s: &Fat32State) -> u32 {
+    if s.write_size > 0 { s.write_size } else { s.write_data_len as u32 }
 }
 
 /// Drain `w_outbuf` through `write_out_chan`. Returns 1 when the
@@ -1197,10 +1719,10 @@ fn enter_send_packet(s: &mut Fat32State, resume_state: u8) {
 // Write state machine
 // ============================================================================
 
-/// Phase 6 write state machine. Overwrites the contents of the named
-/// file starting at offset 0 with `write_data[..write_data_len]`.
-/// Extends the file (new size > old size → dir-entry size update +
-/// potentially cluster allocation to grow the FAT chain).
+/// Write state machine. Overwrites the contents of the named file
+/// starting at offset 0 with `write_data[..write_data_len]`. Extends
+/// the file when new size > old size (dir-entry size update + cluster
+/// allocation to grow the FAT chain when needed).
 ///
 /// See `WS_*` constants for state semantics. Each state does at most
 /// one I/O action (seek, block-read, or packet emission) per tick.
@@ -1293,9 +1815,10 @@ unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
 
     // POSIX-style overwrite: extend the file if the write is longer
     // than the existing size, but keep the existing tail on shorter
-    // writes (no truncation).
+    // writes (no truncation). `effective_write_size` honours
+    // `write_size` (synth-pattern path) over the inline buffer length.
     let old_size = s.w_target_old_size;
-    let wdl      = s.write_data_len as u32;
+    let wdl      = effective_write_size(s);
     s.w_new_size = if wdl > old_size { wdl } else { old_size };
 
     // Initial cluster-walk state.
@@ -1315,7 +1838,7 @@ unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
             * (s.sectors_per_cluster as u32));
     log_lba(s, b"[fat32] write lba=", first_lba);
 
-    if s.write_data_len == 0 {
+    if effective_write_size(s) == 0 {
         // No payload at all — nothing to emit. (Size field would
         // already match, so dir-update is moot.)
         log_info(s, b"[fat32] write: empty payload");
@@ -1347,7 +1870,8 @@ unsafe fn ws_send_sector(s: &mut Fat32State) -> i32 {
         .wrapping_add(s.w_sector_in_cluster as u32);
 
     let off = s.w_bytes_written as usize;
-    let remaining_bytes = (s.write_data_len as usize).saturating_sub(off);
+    let total = effective_write_size(s) as usize;
+    let remaining_bytes = total.saturating_sub(off);
     let remaining_sectors = (remaining_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
     let cluster_remaining = (s.sectors_per_cluster - s.w_sector_in_cluster) as usize;
     let mut nlb = remaining_sectors
@@ -1375,7 +1899,7 @@ unsafe fn ws_after_sector(s: &mut Fat32State) -> i32 {
     s.w_sector_in_cluster = s.w_sector_in_cluster.saturating_add(nlb as u8);
 
     let written = s.w_bytes_written;
-    let total   = s.write_data_len as u32;
+    let total   = effective_write_size(s);
 
     if written >= total {
         // All payload pushed. Decide whether a dir-entry update is
@@ -2320,147 +2844,6 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
     }
 }
 
-/// File streaming state machine
-unsafe fn stream_step(s: &mut Fat32State) -> i32 {
-    match s.mod_phase {
-        Fat32ModPhase::Idle => 0,
-
-        Fat32ModPhase::SeekSd => {
-            let sector = cluster_to_sector(s, s.current_cluster)
-                + (s.current_sector_in_cluster as u32);
-            flush_input(s);
-            if seek_sd(s, sector) < 0 {
-                return -1;
-            }
-            s.read_fill = 0;
-            s.mod_phase = Fat32ModPhase::WaitBlock;
-            s.block_offset = 0;
-            0
-        }
-
-        Fat32ModPhase::WaitBlock => {
-            let res = try_read_block(s);
-            if res < 0 {
-                log_info(s, b"[fat32] blk read fail");
-                s.mod_phase = Fat32ModPhase::Idle;
-                return 0;
-            }
-            if res == 0 { return 0; }
-
-            s.mod_phase = Fat32ModPhase::WriteData;
-            2 // Burst — write data immediately
-        }
-
-        Fat32ModPhase::WriteData => {
-            // Write block data to output, respecting file size
-            let remaining_in_file = s.file_size.saturating_sub(s.file_offset);
-            if remaining_in_file == 0 {
-                // File complete — signal EOF to downstream
-                if s.out_chan >= 0 {
-                    dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_EOF, core::ptr::null_mut());
-                }
-                s.mod_phase = Fat32ModPhase::Idle;
-                s.current_file = 0xFFFF;
-                return 0;
-            }
-
-            // How much of this block belongs to the file?
-            let offset = s.block_offset as usize;
-            let remaining_in_block = BLOCK_SIZE - offset;
-            let to_write = core::cmp::min(remaining_in_block as u32, remaining_in_file) as usize;
-
-            if s.out_chan < 0 {
-                // No output channel, just advance
-                s.file_offset += to_write as u32;
-                s.block_offset += to_write as u16;
-            } else {
-                // Check if output is ready
-                let poll = (s.sys().channel_poll)(s.out_chan, POLL_OUT);
-                if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
-                    return 0;
-                }
-
-                let src = s.block_buf.as_ptr().add(offset);
-                let written = (s.sys().channel_write)(s.out_chan, src, to_write);
-                if written == E_AGAIN {
-                    return 0;
-                }
-                if written < 0 {
-                    s.mod_phase = Fat32ModPhase::Idle;
-                    return -1;
-                }
-
-                s.file_offset += written as u32;
-                s.block_offset += written as u16;
-
-            }
-
-            // Check if we need more data
-            if s.block_offset as usize >= BLOCK_SIZE {
-                // Move to next sector
-                s.block_offset = 0;
-                s.current_sector_in_cluster += 1;
-
-                if s.current_sector_in_cluster >= s.sectors_per_cluster {
-                    // Need next cluster - read FAT
-                    s.mod_phase = Fat32ModPhase::ReadFat;
-                } else {
-                    // Same cluster, next sector
-                    s.mod_phase = Fat32ModPhase::SeekSd;
-                }
-                return 2; // Burst — seek next block immediately
-            }
-
-            0
-        }
-
-        Fat32ModPhase::ReadFat => {
-            let fat_sector = fat_sector_for_cluster(s, s.current_cluster);
-            flush_input(s);
-            if seek_sd(s, fat_sector) < 0 {
-                return -1;
-            }
-            s.read_fill = 0;
-            s.mod_phase = Fat32ModPhase::WaitFat;
-            0
-        }
-
-        Fat32ModPhase::WaitFat => {
-            let res = try_read_block(s);
-            if res < 0 {
-                log_info(s, b"[fat32] fat read fail");
-                s.mod_phase = Fat32ModPhase::Idle;
-                return 0;
-            }
-            if res == 0 { return 0; }
-
-            let offset = fat_offset_for_cluster(s, s.current_cluster);
-            if offset + 4 > BLOCK_SIZE {
-                s.mod_phase = Fat32ModPhase::Idle;
-                return 0;
-            }
-            let next_cluster = read_u32_le(&s.block_buf, offset) & FAT32_MASK;
-
-            if next_cluster >= FAT32_EOC {
-                // End of file — signal EOF to downstream
-                if s.out_chan >= 0 {
-                    dev_channel_ioctl(s.sys(), s.out_chan, IOCTL_EOF, core::ptr::null_mut());
-                }
-                s.mod_phase = Fat32ModPhase::Idle;
-                s.current_file = 0xFFFF;
-                return 0;
-            }
-
-            // Continue with next cluster
-            s.current_cluster = next_cluster;
-            s.current_sector_in_cluster = 0;
-            s.mod_phase = Fat32ModPhase::SeekSd;
-            2 // Burst — seek next cluster immediately
-        }
-
-        _ => -1,
-    }
-}
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /

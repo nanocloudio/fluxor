@@ -709,8 +709,8 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
         0x0CE0..=0x0CE3 => Some(BRIDGE),
 
         // ── backing_provider: BACKING_PROVIDER_ENABLE, ARENA_REGISTER, ─
-        //     ARENA_READ, SMMU map/unmap/fault-check. ────────────────────
-        0x0CED | 0x0CEE | 0x0CEF | 0x0CFB..=0x0CFF => Some(BACKING_PROVIDER),
+        //     ARENA_READ, SMMU map/unmap/fault-check, ARENA_BULK. ───────
+        0x0CE9 | 0x0CED | 0x0CEE | 0x0CEF | 0x0CFB..=0x0CFF => Some(BACKING_PROVIDER),
 
         // ── platform_raw: everything else in 0x0Cxx ────────────────────
         // Explicit coverage for clarity:

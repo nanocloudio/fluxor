@@ -1,5 +1,11 @@
-version = "1.0.0"
+version = "2.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
+
+# FAT32 filesystem provider. Random-access reads go through the
+# FS_CONTRACT (`provider_call(-1, FS_OPEN, …)`); the kernel routes
+# the dispatch to fat32 via `module_provides_contract = FS`. Writes
+# are emitted as block-write requests on the `block_writes` output
+# port (typically wired to `nvme.requests`).
 
 [[ports]]
 name = "blocks"
@@ -7,18 +13,10 @@ direction = "input"
 content_type = "OctetStream"
 required = true
 
-[[ports]]
-name = "files"
-direction = "output"
-content_type = "OctetStream"
-required = true
-
+# Block-write output: connects to a block-source's write input
+# (e.g. `nvme.requests`). The `write_file:` / `write_data:` params
+# drive a one-shot write at boot.
 [[ports]]
 name = "block_writes"
 direction = "output"
-content_type = "OctetStream"
-
-[[ports]]
-name = "seek"
-direction = "ctrl_input"
 content_type = "OctetStream"

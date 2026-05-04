@@ -1042,6 +1042,14 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
                     kv.insert(format!("route_{}_proxy_ip", i), proxy_val.clone());
                 }
             }
+        } else if let Some(fs_path_val) = obj.get("fs_path") {
+            // FS_CONTRACT-served file: `fs_path: "/web/INDEX.HTM"`.
+            // The http module opens the file via `provider_call(-1,
+            // FS_OPEN, ...)` against whichever module registered as
+            // the FS provider (`fat32` on bare-metal, `linux_fs_dispatch`
+            // on the host).
+            handler = 7; // HANDLER_FS_FILE
+            kv.insert(format!("route_{}_fs_path", i), fs_path_val.clone());
         } else if obj.get("source").is_some() {
             // The `source` value is informational (typically the
             // upstream port name); the actual wiring is declared in

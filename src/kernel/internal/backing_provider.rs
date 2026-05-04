@@ -24,6 +24,22 @@ pub mod op {
     pub const WRITE_PAGE: u32 = 0x0002;
     /// Flush the driver's in-flight writeback (no-op if synchronous).
     pub const FLUSH: u32 = 0x0003;
+    /// Read N contiguous pages from the device into `buf`. Drivers
+    /// that support multi-block transfers (e.g. NVMe with PRP lists)
+    /// translate this to a single device command — amortizing the
+    /// per-command roundtrip over many pages. `buf` covers
+    /// `count * PAGE_SIZE` contiguous bytes; pages land at offsets
+    /// 0, PAGE_SIZE, 2*PAGE_SIZE, ….
+    ///
+    /// arg layout (24 bytes, little-endian):
+    ///   [arena_base_page: u32][vpage_idx_start: u32][count: u32][_pad: u32][buf_ptr: u64]
+    pub const READ_PAGES: u32 = 0x0004;
+    /// Write N contiguous pages from `buf` to the device. Same arg
+    /// layout as `READ_PAGES`. Drivers MAY split into multiple device
+    /// commands internally; the dispatch must not return until all
+    /// pages have been queued (with deferred-writeback semantics)
+    /// or persisted (write-through).
+    pub const WRITE_PAGES: u32 = 0x0005;
 }
 
 /// Dispatch function signature: `(state, opcode, arg, arg_len) -> i32`.

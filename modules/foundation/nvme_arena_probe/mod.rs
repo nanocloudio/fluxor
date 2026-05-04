@@ -19,10 +19,11 @@
 //!                         (default 0xA55A)
 //!
 //! **Acceptance:** heartbeat emits
-//!   `[nap] state=done pass=1 pages=NN verify_ok=NN lba=0xXXXXXXXX`
-//! when everything matches. `pass=0` or `verify_ok < pages` means a
-//! mismatch — the pattern is deterministic so Linux can reproduce it
-//! post-reboot by `dd`ing the same LBA range.
+//!   `[nap] state=4 pass=1 pages=NN ok=NN cur=NN err=0 lba=0xXXXXXXXX`
+//! when everything matches, followed by a `[nap] perf …` line with
+//! per-phase timings. `pass=0` or `ok < pages` means a mismatch — the
+//! pattern is deterministic so Linux can reproduce it post-reboot by
+//! `dd`ing the same LBA range.
 
 #![no_std]
 
@@ -38,6 +39,13 @@ include!("../../sdk/params.rs");
 
 const PAGE_BYTES: usize = 4096;
 const PAGE_WORDS: usize = PAGE_BYTES / 4;
+
+/// Pages per bulk write/read syscall. Each bulk syscall translates
+/// to exactly one NVMe command (multi-block write/read with PRP-list).
+/// Larger amortizes the per-command roundtrip more aggressively;
+/// 32 pages = 128 KB matches the driver's `MAX_BULK_PAGES`.
+const BULK_PAGES: usize = 32;
+const BULK_WORDS: usize = BULK_PAGES * PAGE_WORDS;
 
 const BACKING_EXTERNAL: u8 = 2;
 const WB_DEFERRED:  u8 = 0;
@@ -81,11 +89,21 @@ struct NapState {
     /// Tick counter for heartbeat cadence.
     step_count: u32,
 
-    /// 4 KB page-sized scratch buffer. Written out for each vpage on
-    /// the write pass, then compared against the read-back on the
-    /// verify pass. Aligned with `align(64)` to avoid straddling
-    /// cache lines inside the state arena.
-    scratch: [u32; PAGE_WORDS],
+    /// Microsecond timestamps captured at the start and end of the
+    /// write and verify phases (`dev_micros`). The DONE perf line
+    /// emits the deltas so the host parser can compute throughput
+    /// as `pages × 4096 / elapsed` per phase.
+    write_start_ms:  u64,
+    verify_start_ms: u64,
+    write_done_ms:   u64,
+    verify_done_ms:  u64,
+
+    /// Bulk-sized scratch buffer (`BULK_PAGES × 4 KB`). Filled with
+    /// the deterministic pattern for the next batch of vpages and
+    /// passed in one shot to the bulk write/read syscall — the
+    /// driver issues exactly one NVMe command per batch, so this
+    /// buffer's size sets the per-command transfer width.
+    scratch: [u32; BULK_WORDS],
 }
 
 mod params_def {
@@ -111,23 +129,26 @@ fn pattern_word(seed: u32, vpage: u16, word_idx: u32) -> u32 {
     seed ^ vp ^ word_idx
 }
 
-/// Fill `scratch` with the deterministic pattern for `vpage`.
-unsafe fn fill_page(s: &mut NapState, vpage: u16) {
+/// Fill the slot for `slot_idx` (within scratch) with the
+/// deterministic pattern for `vpage`.
+unsafe fn fill_slot(s: &mut NapState, slot_idx: usize, vpage: u16) {
     let seed = s.seed as u32;
+    let base = slot_idx * PAGE_WORDS;
     let mut i = 0usize;
     while i < PAGE_WORDS {
-        s.scratch[i] = pattern_word(seed, vpage, i as u32);
+        s.scratch[base + i] = pattern_word(seed, vpage, i as u32);
         i += 1;
     }
 }
 
-/// Compare `scratch` (which was just read from the arena) against the
-/// expected pattern for `vpage`. Returns true iff all 1024 words match.
-unsafe fn compare_page(s: &NapState, vpage: u16) -> bool {
+/// Compare scratch[slot_idx] against the expected pattern for `vpage`.
+/// Returns true iff all 1024 words match.
+unsafe fn compare_slot(s: &NapState, slot_idx: usize, vpage: u16) -> bool {
     let seed = s.seed as u32;
+    let base = slot_idx * PAGE_WORDS;
     let mut i = 0usize;
     while i < PAGE_WORDS {
-        if s.scratch[i] != pattern_word(seed, vpage, i as u32) {
+        if s.scratch[base + i] != pattern_word(seed, vpage, i as u32) {
             return false;
         }
         i += 1;
@@ -165,8 +186,40 @@ fn write_dec(out: *mut u8, pos: &mut usize, mut v: u32) {
     }
 }
 
-unsafe fn emit_heartbeat(s: &NapState) {
+/// One-shot performance line emitted at ST_DONE. Format:
+///   `[nap] perf pages=N write_us=W read_us=R bytes=N*4096`
+unsafe fn emit_perf(s: &NapState) {
     let mut buf = [0u8; 96];
+    let p = buf.as_mut_ptr();
+    let mut pos = 0usize;
+    let prefix = b"[nap] perf pages=";
+    core::ptr::copy_nonoverlapping(prefix.as_ptr(), p.add(pos), prefix.len());
+    pos += prefix.len();
+    write_dec(p, &mut pos, s.pages as u32);
+
+    let t = b" write_us=";
+    core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
+    pos += t.len();
+    let write_us = s.write_done_ms.saturating_sub(s.write_start_ms) as u32;
+    write_dec(p, &mut pos, write_us);
+
+    let t = b" read_us=";
+    core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
+    pos += t.len();
+    let read_us = s.verify_done_ms.saturating_sub(s.verify_start_ms) as u32;
+    write_dec(p, &mut pos, read_us);
+
+    let t = b" bytes=";
+    core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
+    pos += t.len();
+    let bytes = (s.pages as u32).wrapping_mul(4096);
+    write_dec(p, &mut pos, bytes);
+
+    dev_log(&*s.syscalls, 3, p, pos);
+}
+
+unsafe fn emit_heartbeat(s: &NapState) {
+    let mut buf = [0u8; 128];
     let p = buf.as_mut_ptr();
     let mut pos = 0usize;
 
@@ -189,6 +242,17 @@ unsafe fn emit_heartbeat(s: &NapState) {
     core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
     pos += t.len();
     write_dec(p, &mut pos, s.verify_ok as u32);
+
+    let t = b" cur=";
+    core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
+    pos += t.len();
+    write_dec(p, &mut pos, s.cursor as u32);
+
+    let t = b" err=";
+    core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
+    pos += t.len();
+    let neg_err = if s.err < 0 { (-s.err) as u32 } else { 0 };
+    write_dec(p, &mut pos, neg_err);
 
     let t = b" lba=0x";
     core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
@@ -283,87 +347,149 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.arena_id = rc as u8;
             s.cursor = 0;
             s.state = ST_WRITE;
+            s.write_start_ms = dev_micros(sys);
             emit_heartbeat(s);
             0
         }
         ST_WRITE => {
-            // One page per tick so the scheduler stays responsive.
+            // One bulk write per scheduler step — each syscall maps to
+            // a single NVMe multi-block write command, so the per-step
+            // wall time tracks device latency for `BULK_PAGES` of data.
+            // Returning Burst (2) keeps the pipeline full instead of
+            // draining one tick per command.
+            //
+            // `write_done_ms` is captured AFTER the flush in ST_FLUSH:
+            // the bulk syscall only queues work to NVMe, so capturing
+            // here would measure submission rate, not disk throughput.
             if s.cursor >= s.pages {
                 s.state = ST_FLUSH;
-                return 0;
+                return 2;
             }
-            fill_page(s, s.cursor);
-            let rc = dev_backing_arena_write(
+            let remaining = (s.pages - s.cursor) as usize;
+            let chunk = if remaining < BULK_PAGES { remaining } else { BULK_PAGES };
+            // Fill all slots for this batch with the deterministic pattern.
+            let mut slot = 0usize;
+            while slot < chunk {
+                fill_slot(s, slot, s.cursor + slot as u16);
+                slot += 1;
+            }
+            let rc = dev_backing_arena_write_pages(
                 sys,
                 s.arena_id,
                 s.cursor as u32,
+                chunk as u32,
                 s.scratch.as_ptr() as *const u8,
             );
             if rc < 0 {
-                // ENODEV means nvme hasn't registered its dispatch yet.
-                // Our deferred_ready flag gates on a direct upstream edge,
-                // and this yaml has none — so we poll. Every other error
-                // code is terminal.
+                // ENODEV (-19): backing provider not yet registered —
+                // retry next tick. EAGAIN (-11): driver pushed back —
+                // also retry. Anything else is fatal.
                 if rc == -19 {
-                    // Stay in ST_WRITE; retry next tick.
                     s.err = rc;
+                    return 0;
+                }
+                if rc == -11 {
                     return 0;
                 }
                 s.err = rc;
                 s.state = ST_ERR;
-                dev_log(sys, 1, b"[nap] write failed\0".as_ptr(), 18);
+                let mut buf = [0u8; 64];
+                let p = buf.as_mut_ptr();
+                let prefix = b"[nap] write fail rc=";
+                core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+                let mut pos = prefix.len();
+                let neg_rc = (-rc) as u32;
+                write_dec(p, &mut pos, neg_rc);
+                let t = b" cur=";
+                core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
+                pos += t.len();
+                write_dec(p, &mut pos, s.cursor as u32);
+                dev_log(sys, 3, p, pos);
                 return 0;
             }
-            s.cursor += 1;
-            0
+            s.cursor += chunk as u16;
+            2 // Burst — keep stepping
         }
         ST_FLUSH => {
             let _ = dev_backing_arena_flush(sys, s.arena_id);
+            s.write_done_ms = dev_micros(sys);
             s.cursor = 0;
             s.state = ST_VERIFY;
+            s.verify_start_ms = dev_micros(sys);
             0
         }
         ST_VERIFY => {
+            // Bulk reads — one syscall maps to one NVMe multi-block
+            // read of `BULK_PAGES`. Each slot is compared against the
+            // expected pattern in-place.
             if s.cursor >= s.pages {
                 s.pass = if s.verify_ok == s.pages { 1 } else { 0 };
                 s.state = ST_DONE;
-                emit_heartbeat(s);
+                s.verify_done_ms = dev_micros(sys);
+                emit_perf(s);
                 return 3; // Ready — downstream may now use us
             }
-            // Clear scratch then read into it so stale-data bugs show
-            // up as verify_ok mismatch instead of silently passing.
+            let remaining = (s.pages - s.cursor) as usize;
+            let chunk = if remaining < BULK_PAGES { remaining } else { BULK_PAGES };
+            // Pre-zero the slice we'll read into so a partial fill is
+            // visible as a verify miss rather than masquerading as success.
             let mut i = 0usize;
-            while i < PAGE_WORDS {
+            while i < chunk * PAGE_WORDS {
                 s.scratch[i] = 0;
                 i += 1;
             }
-            let rc = dev_backing_arena_read(
+            let rc = dev_backing_arena_read_pages(
                 sys,
                 s.arena_id,
                 s.cursor as u32,
+                chunk as u32,
                 s.scratch.as_mut_ptr() as *mut u8,
             );
             if rc < 0 {
+                if rc == -11 {
+                    return 0;
+                }
                 s.err = rc;
                 s.state = ST_ERR;
-                dev_log(sys, 1, b"[nap] read failed\0".as_ptr(), 17);
+                let mut buf = [0u8; 64];
+                let p = buf.as_mut_ptr();
+                let prefix = b"[nap] read fail rc=";
+                core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+                let mut pos = prefix.len();
+                let neg_rc = (-rc) as u32;
+                write_dec(p, &mut pos, neg_rc);
+                let t = b" cur=";
+                core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
+                pos += t.len();
+                write_dec(p, &mut pos, s.cursor as u32);
+                dev_log(sys, 1, p, pos);
                 return 0;
             }
-            if compare_page(s, s.cursor) {
-                s.verify_ok += 1;
+            let mut slot = 0usize;
+            while slot < chunk {
+                if compare_slot(s, slot, s.cursor + slot as u16) {
+                    s.verify_ok += 1;
+                }
+                slot += 1;
             }
-            s.cursor += 1;
-            0
+            s.cursor += chunk as u16;
+            2 // Burst — keep stepping
         }
         ST_DONE => {
-            // Steady state — re-emit status periodically so the log
-            // viewer can capture it after log_net starts streaming.
-            emit_heartbeat(s);
+            // Re-emit hb + perf every ~5 s so a late-attaching log
+            // observer eventually catches the success line. The cadence
+            // matches the rest of the project's heartbeat period.
+            if s.step_count % 5000 == 0 {
+                emit_heartbeat(s);
+                emit_perf(s);
+            }
             0
         }
         _ => {
-            // ST_ERR — re-emit state (err value in state field).
-            emit_heartbeat(s);
+            // ST_ERR — re-emit failure state on the same cadence.
+            if s.step_count % 5000 == 0 {
+                emit_heartbeat(s);
+            }
             0
         }
     }

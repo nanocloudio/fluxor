@@ -2197,8 +2197,25 @@ fn bcm_wake_scheduler() {
     unsafe { core::arch::asm!("sev") };
 }
 
-fn bcm_now_millis() -> u64 { 0 }
-fn bcm_now_micros() -> u64 { 0 }
+/// Monotonic milliseconds since boot. Reads the ARM generic timer
+/// (`CNTPCT_EL0`) and scales by `cntfrq_el0 / 1000`. Backs
+/// `dev_millis` / `syscall_millis` for module-side timing such as
+/// NVMe arena probe perf measurement and TCP RTT estimation.
+fn bcm_now_millis() -> u64 {
+    let counter = bcm_read_cntpct();
+    let freq = bcm_counter_freq();
+    if freq == 0 { return 0; }
+    counter.wrapping_mul(1000) / freq
+}
+
+/// Monotonic microseconds since boot. Same source as
+/// `bcm_now_millis`, scaled to µs for sub-millisecond profiling.
+fn bcm_now_micros() -> u64 {
+    let counter = bcm_read_cntpct();
+    let freq = bcm_counter_freq();
+    if freq == 0 { return 0; }
+    counter.wrapping_mul(1_000_000) / freq
+}
 fn bcm_tick_count() -> u32 {
     fluxor::kernel::scheduler::tick_count()
 }
@@ -2597,6 +2614,30 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             if arg.is_null() || arg_len < 1 { return -22; }
             let arena_id = *arg as usize;
             fluxor::kernel::backing_store::backing_flush(arena_id)
+        }
+        paged_arena::ARENA_BULK => {
+            if arg.is_null() || arg_len < 18 { return -22; }
+            let arena_id = *arg as usize;
+            let op = *arg.add(1);
+            let vpage = u32::from_le_bytes([
+                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
+            ]);
+            let count = u32::from_le_bytes([
+                *arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9),
+            ]);
+            let buf_u64 = u64::from_le_bytes([
+                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
+                *arg.add(14), *arg.add(15), *arg.add(16), *arg.add(17),
+            ]);
+            match op {
+                paged_arena::ARENA_BULK_OP_WRITE => fluxor::kernel::backing_store::backing_write_pages(
+                    arena_id, vpage, count, buf_u64 as *const u8,
+                ),
+                paged_arena::ARENA_BULK_OP_READ => fluxor::kernel::backing_store::backing_read_pages(
+                    arena_id, vpage, count, buf_u64 as *mut u8,
+                ),
+                _ => -22,
+            }
         }
         _ => -38, // E_NOSYS
     }

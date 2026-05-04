@@ -1,0 +1,12 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# Diagnostic FS consumer. Opens the configured `path:` via FS_CONTRACT
+# (`fat32` on bare-metal, `linux_fs_dispatch` on the host), reads the
+# whole file, and logs the bytes as text on `[fs_tap] <text>` lines.
+# Used to verify that a known string on disk reaches the log viewer
+# verbatim (e.g. at the end of a `nvme → fat32 → fs_tap` chain).
+
+[[resources]]
+requires_contract = "fs"
+access = "read"

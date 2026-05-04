@@ -460,6 +460,32 @@ pub const IOCTL_POLL_NOTIFY: u32 = 2;
 pub const IOCTL_FLUSH: u32 = 3;
 pub const IOCTL_EOF: u32 = 4;
 
+/// Block-source ioctl on a 512-byte sector channel: request a multi-
+/// sector read in a single device command. Producers that support
+/// it (currently `nvme`) parse `arg = [lba: u32 LE, nlb: u16 LE,
+/// _pad: u16]` (8 bytes), submit one Read with `nlb` LBAs, and
+/// stream `nlb * 512` bytes back-to-back on the channel without
+/// further IOCTLs. Consumers (fat32) use this to amortize the per-
+/// command roundtrip across a whole cluster of sectors. `nlb` is
+/// clamped on the producer side; ENOSYS from the producer means
+/// the consumer should fall back to per-sector `IOCTL_NOTIFY`.
+pub const IOCTL_BLOCKS_READ_NLB: u32 = 0x4E56_0002;
+
+/// Block-source ioctl: synchronously read `nlb` sectors at `lba`
+/// directly into the caller-supplied buffer. The producer submits
+/// the device command, spin-polls completion, and copies the data
+/// out before returning — no channel involvement. Used by
+/// synchronous file-system providers (`fat32`'s FS_CONTRACT
+/// dispatch) where the consumer needs bytes immediately and cannot
+/// participate in the channel state machine.
+///
+/// arg layout (16 bytes, little-endian):
+///   [lba: u32][nlb: u16][_pad: u16][buf_ptr: u64]
+/// `buf_ptr` must point to ≥ `nlb * 512` writable bytes. `nlb` is
+/// clamped to the producer's per-command sector limit (NVMe MAX_NLB).
+/// Returns 0 on success, negative errno on submit / completion error.
+pub const IOCTL_BLOCKS_READ_LBAS_SYNC: u32 = 0x4E56_0003;
+
 // ============================================================================
 // FMP Well-Known Message Types (pre-computed FNV-1a hashes)
 // ============================================================================
@@ -863,6 +889,16 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
 unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
     (sys.provider_call)(-1, 0x0602, buf.as_mut_ptr(), 8);
+    u64::from_le_bytes(buf)
+}
+
+/// Monotonic time in microseconds (TIMER::MICROS 0x0603). Useful for
+/// per-phase profiling at sub-millisecond granularity.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
+    let mut buf = [0u8; 8];
+    (sys.provider_call)(-1, 0x0603, buf.as_mut_ptr(), 8);
     u64::from_le_bytes(buf)
 }
 
@@ -2071,6 +2107,62 @@ unsafe fn dev_backing_arena_read(
 unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
     let mut a = [arena_id];
     (sys.provider_call)(-1, 0x0CFF, a.as_mut_ptr(), 1)
+}
+
+/// Write `count` contiguous 4 KB pages from `buf` to a registered
+/// backing arena. `buf` must point to `count * 4096` readable bytes.
+/// Drivers that support multi-block transfers (NVMe with PRP-lists)
+/// translate this to a single device command — far higher sustained
+/// throughput than per-page writes.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_backing_arena_write_pages(
+    sys: &SyscallTable,
+    arena_id: u8,
+    vpage_start: u32,
+    count: u32,
+    buf: *const u8,
+) -> i32 {
+    dev_backing_arena_bulk(sys, arena_id, 0, vpage_start, count, buf as u64)
+}
+
+/// Read `count` contiguous 4 KB pages from a registered backing arena
+/// into `buf`. `buf` must point to `count * 4096` writable bytes.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn dev_backing_arena_read_pages(
+    sys: &SyscallTable,
+    arena_id: u8,
+    vpage_start: u32,
+    count: u32,
+    buf: *mut u8,
+) -> i32 {
+    dev_backing_arena_bulk(sys, arena_id, 1, vpage_start, count, buf as u64)
+}
+
+/// Internal helper — both bulk read and bulk write share one syscall
+/// (ARENA_BULK = 0x0CE9) with `op` in arg byte 1 (0=WRITE, 1=READ).
+#[inline(always)]
+unsafe fn dev_backing_arena_bulk(
+    sys: &SyscallTable,
+    arena_id: u8,
+    op: u8,
+    vpage_start: u32,
+    count: u32,
+    buf_u64: u64,
+) -> i32 {
+    let mut a = [0u8; 18];
+    let bp = a.as_mut_ptr();
+    *bp = arena_id;
+    *bp.add(1) = op;
+    let vp = vpage_start.to_le_bytes();
+    *bp.add(2) = vp[0]; *bp.add(3) = vp[1]; *bp.add(4) = vp[2]; *bp.add(5) = vp[3];
+    let c = count.to_le_bytes();
+    *bp.add(6) = c[0]; *bp.add(7) = c[1]; *bp.add(8) = c[2]; *bp.add(9) = c[3];
+    let pb = buf_u64.to_le_bytes();
+    *bp.add(10) = pb[0]; *bp.add(11) = pb[1]; *bp.add(12) = pb[2]; *bp.add(13) = pb[3];
+    *bp.add(14) = pb[4]; *bp.add(15) = pb[5]; *bp.add(16) = pb[6]; *bp.add(17) = pb[7];
+    (sys.provider_call)(-1, 0x0CE9, bp, 18)
 }
 
 // ============================================================================

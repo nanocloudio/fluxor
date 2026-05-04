@@ -119,10 +119,33 @@ const REQ_HDR_SIZE: usize = 20;
 
 /// CIDs for synchronous pager I/O. Outside all other
 /// ranges (admin 0x0001..=0x000F, block-read CID_READ_LBA0=0x0005,
-/// inflight writes CID_IO_WRITE_BASE..=CID_IO_WRITE_BASE+7 i.e.
-/// 0x0100..=0x0107) so `poll_io_cqe` routines can't mistake them.
+/// inflight writes 0x0100..=0x017F on aarch64 / 0x0100..=0x011F on
+/// embedded — see `CID_IO_WRITE_BASE` / `CID_SLOT_BITS`) so
+/// `poll_io_cqe` routines can't mistake them.
 const CID_PAGER_READ:  u16 = 0x0200;
+/// Synchronous single-page pager-write CID. One in-flight at a time;
+/// used by the per-page `PAGER_OP_WRITE` dispatch path.
 const CID_PAGER_WRITE: u16 = 0x0201;
+
+/// Number of in-flight async bulk-write slots. Each slot owns
+/// `MAX_BULK_PAGES` DMA pages plus a 4 KB PRP-list page. With
+/// MAX_BULK_PAGES=32 and ASYNC_BULK_SLOTS=8, the total coherent-DMA
+/// footprint is 8 × (32+1) × 4 KB ≈ 1 MB — within the 2 MB PCIe1
+/// arena, with headroom for other consumers. Pipelining multiple
+/// bulks at once hides the per-command device latency on drives
+/// whose controller can dispatch multiple commands in parallel.
+const ASYNC_BULK_SLOTS: usize = 8;
+
+/// Total pre-allocated coherent DMA pages: one set of MAX_BULK_PAGES
+/// per async-bulk slot. Layout is flat — slot `i`'s pages live at
+/// `pager_write_bufs[i*MAX_BULK_PAGES .. (i+1)*MAX_BULK_PAGES]`.
+const PAGER_WRITE_SLOTS: usize = ASYNC_BULK_SLOTS * (MAX_BULK_PAGES as usize);
+
+/// Base CID for async bulk writes. CIDs occupy
+/// `CID_BULK_WRITE_BASE..(BASE + ASYNC_BULK_SLOTS)` — currently
+/// 0x0400..=0x0403 — disjoint from every other CID range.
+/// The completion path uses cid - BASE to identify the slot.
+const CID_BULK_WRITE_BASE: u16 = 0x0400;
 
 /// Budget for the pager's synchronous spin-poll (ms). Generous —
 /// the fault handler blocks for this long on slow-media worst case.
@@ -133,6 +156,22 @@ const PAGER_SUBMIT_BUDGET_MS: u64 = 2000;
 const PAGER_OP_READ:  u32 = 0x0001;
 const PAGER_OP_WRITE: u32 = 0x0002;
 const PAGER_OP_FLUSH: u32 = 0x0003;
+const PAGER_OP_READ_BULK:  u32 = 0x0004;
+const PAGER_OP_WRITE_BULK: u32 = 0x0005;
+
+/// Synchronous bulk-read CID. Reads stay strictly QD=1 — the caller
+/// owns the destination buffer and we copy into it before returning,
+/// so async would require per-slot copy-out scaffolding. Writes use
+/// `CID_BULK_WRITE_BASE` instead and are async (multiple in-flight).
+const CID_PAGER_READ_BULK:  u16 = 0x0300;
+
+/// Maximum pages per bulk transfer. Bounded by the count of pre-
+/// allocated coherent DMA buffers (`PAGER_WRITE_SLOTS`) and by the
+/// controller's MDTS. NVMe NLB field caps at 65536 LBAs (≈32 MB at
+/// 4 KB pages) — well above any realistic value. 32 pages = 128 KB =
+/// 256 LBAs per command — comfortably under any drive's MDTS and
+/// big enough for the device's multi-block fast path.
+const MAX_BULK_PAGES: u32 = 32;
 
 /// Generic backing-provider registration syscall.
 const BACKING_PROVIDER_ENABLE: u32 = 0x0CED;
@@ -162,6 +201,10 @@ const NVME_ARENA_LBA_BASE: u64 = 0x0020_0000;
 /// match the controller's active namespace (the driver serves only
 /// the namespace configured via the `namespace` parameter).
 const IOCTL_NVME_NS_INFO: u32 = 0x4E56_0001;
+
+// IOCTL_BLOCKS_READ_NLB (the multi-sector batch-read ioctl on
+// `blk_out`) is defined in the SDK at `IOCTL_BLOCKS_READ_NLB` —
+// re-imported via the runtime include and used unqualified below.
 
 // ============================================================================
 // State machine
@@ -212,20 +255,39 @@ const MAX_IO_QUEUES:         usize = 4;
 
 /// Maximum write requests per queue the driver keeps in flight at
 /// once. Each in-flight slot owns a 4 KB DMA buffer, so this caps
-/// per-instance DMA-arena usage at
-/// `MAX_IO_QUEUES * MAX_INFLIGHT * 4 KB = 128 KB` on top of the
-/// fixed admin/read/identify pages. The effective bound is also
-/// clamped at module_new time by the `queue_depth` param and by
-/// `IO_Q_ENTRIES-1` (always keep one SQE slot free so the ring
-/// never looks full-empty ambiguous).
+/// per-instance DMA-arena usage at `MAX_IO_QUEUES * MAX_INFLIGHT * 4 KB`.
+/// The effective bound is also clamped at module_new time by the
+/// `queue_depth` param and by `IO_Q_ENTRIES-1` (always keep one SQE
+/// slot free so the ring never looks full-empty ambiguous).
+///
+/// **aarch64** — 32 (`4 × 32 × 4 KB = 512 KB` DMA), pipelining 128
+/// total in-flight commands across queues. CID layout shifts to
+/// `(q << 5) | slot` (5 slot bits) to match.
+///
+/// **rp2350 / rp2040 / wasm32** — 8 (`128 KB` DMA, original budget).
+/// CID layout stays at `(q << 3) | slot` for ABI compatibility.
+#[cfg(target_arch = "aarch64")]
+const MAX_INFLIGHT:          usize = 32;
+#[cfg(not(target_arch = "aarch64"))]
 const MAX_INFLIGHT:          usize = 8;
 
+/// Slot-bits shift in the write-CID encoding. Caller-supplied so the
+/// queue-id occupies the high bits and the slot-id the low bits. Tied
+/// to `MAX_INFLIGHT` — keep the two in sync.
+#[cfg(target_arch = "aarch64")]
+const CID_SLOT_BITS:         u32 = 5;
+#[cfg(not(target_arch = "aarch64"))]
+const CID_SLOT_BITS:         u32 = 3;
+
+const CID_SLOT_MASK:         u16 = (1 << CID_SLOT_BITS) - 1;
+
 /// Base CID for pipelined write SQEs. With multi-queue, the CID is
-/// `CID_IO_WRITE_BASE | (q_idx << 3) | slot_idx`:
-///   q_idx   ∈ 0..MAX_IO_QUEUES (2 bits)
-///   slot_idx∈ 0..MAX_INFLIGHT  (3 bits)
-/// Range: 0x0100..=0x011F (32 unique CIDs across 4 queues × 8 slots),
-/// disjoint from admin CIDs 0x0001..=0x000F.
+/// `CID_IO_WRITE_BASE | (q_idx << CID_SLOT_BITS) | slot_idx`:
+///   slot_idx∈ 0..MAX_INFLIGHT (`CID_SLOT_BITS` bits)
+///   q_idx   ∈ 0..MAX_IO_QUEUES
+/// On aarch64 (slot_bits=5, 4 queues): 0x0100..=0x017F (128 CIDs).
+/// On embedded (slot_bits=3, 4 queues): 0x0100..=0x011F (32 CIDs).
+/// Both ranges stay disjoint from admin CIDs 0x0001..=0x000F.
 const CID_IO_WRITE_BASE:     u16 = 0x0100;
 
 /// Sentinel for `poll_io_cqe(_, CID_NONE)` — harvest-only mode.
@@ -323,6 +385,18 @@ struct NvmeState {
     blk_phase:        u8,
     discard_cqe:      u8,
 
+    /// Pending batch read queued by an `IOCTL_BLOCKS_READ_NLB` call
+    /// on `blk_out`. The next `BLK_PHASE_IDLE` tick consumes it,
+    /// submits a single multi-block Read with `nlb` LBAs, and
+    /// streams `nlb * 512` bytes back-to-back to the consumer.
+    /// `pending_batch_valid == 0` means no batch is queued; the IDLE
+    /// tick falls back to the per-sector path driven by
+    /// `IOCTL_NOTIFY` / `current_block`.
+    pending_batch_lba:   u32,
+    pending_batch_nlb:   u16,
+    pending_batch_valid: u8,
+    _pad_pb:             u8,
+
     // Incoming write-request pipeline. Producers push a REQ_HDR_SIZE
     // header `{ op:u32, lba:u64, nlb:u32, nsid:u32 }` followed by
     // nlb * 512 bytes of payload onto `req_in`. `req_phase` walks:
@@ -397,11 +471,35 @@ struct NvmeState {
     /// (1..=MAX_NLB). Controls payload accumulation size in phase 1.
     req_nlb: u16,
 
-    /// DMA page for synchronous pager I/O (NVMe as paged-arena
-    /// backing provider). Lazily allocated from the coherent arena on
-    /// first call into `backing_provider_dispatch`; coherent rather
-    /// than streaming so the spin-poll path needs no cache maintenance.
+    /// DMA page used for the single-page pager READ/WRITE path
+    /// (`PAGER_OP_READ` / `PAGER_OP_WRITE`). Lazy-allocated in
+    /// `step_ready` so the foreign caller's permission scope is
+    /// irrelevant — the allocation lands in our own module context.
     pager_buf: u64,
+    /// DMA buffer (4 KB) for synchronous block reads issued via the
+    /// `IOCTL_BLOCKS_READ_LBAS_SYNC` channel ioctl. fat32's FS dispatch
+    /// uses this path to fetch sectors inside a `provider_call`
+    /// without yielding to the scheduler. Caps each call at 1 page
+    /// (8 sectors @ 512 B); larger transfers are split by the caller.
+    sync_blk_buf: u64,
+    /// Async bulk-write slot pool. Slot `i` owns DMA pages
+    /// `pager_write_bufs[i*MAX_BULK_PAGES..(i+1)*MAX_BULK_PAGES]` and
+    /// PRP-list page `bulk_prp_list_bufs[i]`. `bulk_head` / `bulk_tail`
+    /// form a circular ring across `ASYNC_BULK_SLOTS` slots;
+    /// `bulk_count` is the in-flight depth. When the ring fills,
+    /// the next submit spin-polls the oldest slot's CQE.
+    /// `bulk_drain_writes` waits until `bulk_count == 0` for FLUSH.
+    pager_write_bufs:    [u64; PAGER_WRITE_SLOTS],
+    bulk_prp_list_bufs:  [u64; ASYNC_BULK_SLOTS],
+    bulk_head:           u8,
+    bulk_tail:           u8,
+    bulk_count:          u8,
+    bulk_depth_peak:     u8,
+    /// Latched on async-bulk CQE failure so the next FLUSH (or
+    /// next bulk submit) can surface the error to the caller. The
+    /// original async submit has already returned 0 by the time the
+    /// CQE arrives, so propagating sync is the only option.
+    bulk_err:            i32,
     /// 1 once `BACKING_PROVIDER_ENABLE` has succeeded, so S_READY
     /// entry only registers once.
     pager_registered: u8,
@@ -425,7 +523,19 @@ struct NvmeState {
     /// fires. Created lazily on the first `irq_mode=1` pass.
     msix_event:      i32,
     _pad6:           [u8; 4],
+
+    /// Hot-path counters emitted as `[nvme] tlm dt=… rx=… tx=… idle=… bp=…`
+    /// every `NVME_TLM_PERIOD` steps. `rx` is bytes pulled off `req_in`
+    /// (write-payload bytes); `tx` is bytes pushed onto `blk_out`
+    /// (read-stream bytes delivered to the consumer). `idle` counts
+    /// steps where neither side moved data; `bp` counts steps blocked
+    /// on a full `blk_out` channel.
+    tlm: TlmCounters,
+    tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
 }
+
+/// Cadence for the `[nvme] tlm` line.
+const NVME_TLM_PERIOD: u32 = 5000;
 
 // ============================================================================
 // Parameters
@@ -678,7 +788,9 @@ unsafe fn heartbeat(s: &mut NvmeState) {
     pos += q.len();
     write_dec3(p, &mut pos, s.io_q_count as u32);
 
-    // `pg` = pager dispatch registered; `mx` = MSI-X enabled.
+    // `pg` = pager dispatch registered; `mx` = MSI-X enabled;
+    // `bd` = peak async-bulk pipeline depth observed since boot
+    // (ASYNC_BULK_SLOTS is the ceiling).
     let pg = b" pg=";
     core::ptr::copy_nonoverlapping(pg.as_ptr(), p.add(pos), pg.len());
     pos += pg.len();
@@ -689,6 +801,10 @@ unsafe fn heartbeat(s: &mut NvmeState) {
     pos += mx.len();
     *p.add(pos) = b'0' + s.msix_enabled;
     pos += 1;
+    let bd = b" bd=";
+    core::ptr::copy_nonoverlapping(bd.as_ptr(), p.add(pos), bd.len());
+    pos += bd.len();
+    write_dec3(p, &mut pos, s.bulk_depth_peak as u32);
 
     dev_log(&*s.syscalls, 3, p, pos);
 
@@ -1405,15 +1521,16 @@ unsafe fn consume_io_cqe(s: &mut NvmeState, q: usize) {
 }
 
 /// Decode queue index from a write CID. Layout:
-/// `CID_IO_WRITE_BASE | (q_idx << 3) | slot_idx` — q_idx in bits[4:3].
+/// `CID_IO_WRITE_BASE | (q_idx << CID_SLOT_BITS) | slot_idx` —
+/// q_idx occupies bits above slot.
 #[inline(always)]
 fn write_cid_queue(cid: u16) -> usize {
-    ((cid - CID_IO_WRITE_BASE) >> 3) as usize
+    ((cid - CID_IO_WRITE_BASE) >> CID_SLOT_BITS) as usize
 }
 
 #[inline(always)]
 fn write_cid_slot(cid: u16) -> usize {
-    ((cid - CID_IO_WRITE_BASE) & 0x7) as usize
+    ((cid - CID_IO_WRITE_BASE) & CID_SLOT_MASK) as usize
 }
 
 #[inline(always)]
@@ -1563,6 +1680,10 @@ unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
     if res == 0 {
         s.current_block = seek;
         s.write_offset = 0;
+        // A per-sector seek supersedes any not-yet-submitted batch
+        // — fat32 alternates batch reads with single-sector FAT
+        // walks, so the FAT seek must override a stale batch.
+        s.pending_batch_valid = 0;
         true
     } else {
         false
@@ -1720,6 +1841,7 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 let dst = (buf as *mut u8).add(s.req_fill as usize);
                 let n = (sys.channel_read)(s.req_in, dst, need);
                 if n <= 0 { break; }
+                s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(n as u32);
                 s.req_fill += n as u16;
                 if s.req_fill as u32 >= total {
                     s.req_phase = 2;
@@ -1741,7 +1863,7 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 let row = (*s.write_bufs.as_ptr().add(q)).as_ptr();
                 let buf = *row.add(tail);
                 let cid = CID_IO_WRITE_BASE
-                    | ((q as u16) << 3)
+                    | ((q as u16) << CID_SLOT_BITS)
                     | (tail as u16);
                 let payload_bytes = (s.req_nlb as u32) * BLOCK_SIZE;
                 dev_dma_flush(sys, buf, payload_bytes);
@@ -2010,12 +2132,31 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
         // the `pager_registered` flag stays 0, heartbeat will echo it
         // indirectly through the lack of a "dispatch registered" line.
 
-        // Eager-allocate the pager DMA buffer in our own module's step
-        // context so `backing_provider_dispatch` never has to call
-        // DMA_ALLOC_CONTIG from a foreign caller's permission scope —
-        // the allocator requires `platform_raw`, which we hold but
-        // arbitrary backing-provider consumers may not.
+        // Allocate every DMA buffer the backing-provider dispatch
+        // path can need, in our own module's step context. The
+        // dispatch is invoked from the caller's permission scope
+        // (e.g. a probe with only `backing_provider` permission)
+        // which would be denied DMA_ALLOC_CONTIG — pre-allocating
+        // here side-steps that.
+        //
+        // - `pager_buf`            : single-page sync pager scratch
+        // - `sync_blk_buf`         : single-page sync block-read scratch
+        //                            for fat32's FS dispatch
+        // - `pager_write_bufs[..]` : ASYNC_BULK_SLOTS × MAX_BULK_PAGES
+        //                            per-slot DMA pages (= PAGER_WRITE_SLOTS)
+        // - `bulk_prp_list_bufs[]` : one PRP-list page per async slot
         let _ = pager_ensure_buf(s);
+        let _ = sync_blk_ensure_buf(s);
+        let mut i: u32 = 0;
+        while (i as usize) < PAGER_WRITE_SLOTS {
+            let _ = pager_ensure_write_buf(s, i as usize);
+            i += 1;
+        }
+        let mut s_idx: usize = 0;
+        while s_idx < ASYNC_BULK_SLOTS {
+            let _ = pager_ensure_prp_list(s, s_idx);
+            s_idx += 1;
+        }
     }
 
     // One-shot PCIe capability walk for observability — the heartbeat
@@ -2068,16 +2209,33 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             let sys = &*s.syscalls;
             let poll = (sys.channel_poll)(s.blk_out, POLL_OUT);
             if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
+                s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
                 return 0;
             }
-            // Read one block per SQE on the stream path. The primitive
-            // supports `nlb` up to MAX_NLB, but fat32 seeks between
-            // metadata sectors (FAT → data → FAT → ...), so any
-            // prefetched blocks beyond the first would be discarded on
-            // the next seek. Batched reads are reserved for future
-            // producers that stream contiguous spans.
-            s.blk_nlb = 1;
-            submit_io_read(s, s.current_block as u64, 1, CID_READ_LBA0);
+            // Two paths into IDLE:
+            //  1. Per-sector seek via `IOCTL_NOTIFY(lba)` —
+            //     `current_block` was set by `apply_pending_seek`;
+            //     `blk_nlb = 1`. One Read SQE per IOCTL.
+            //  2. Multi-sector batch via `IOCTL_BLOCKS_READ_NLB` —
+            //     `pending_batch_*` populated by the module ioctl
+            //     handler; `blk_nlb = nlb`. One Read SQE for `nlb`
+            //     contiguous LBAs, response streamed back-to-back.
+            //
+            // The batch path is what fat32 uses for cluster-scale
+            // reads; it collapses `sectors_per_cluster` round-trips
+            // into a single device command. Per-sector reads (FAT
+            // walks, dir parses, boot sector) take the first path.
+            let (lba, nlb) = if s.pending_batch_valid != 0 {
+                let n = s.pending_batch_nlb;
+                let l = s.pending_batch_lba;
+                s.pending_batch_valid = 0;
+                s.current_block = l;
+                (l, n)
+            } else {
+                (s.current_block, 1u16)
+            };
+            s.blk_nlb = nlb;
+            submit_io_read(s, lba as u64, nlb, CID_READ_LBA0);
             s.blk_phase = BLK_PHASE_READING;
             0
         }
@@ -2092,11 +2250,14 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
                     // seeked LBA on the next tick.
                     s.discard_cqe = 0;
                     s.blk_phase = BLK_PHASE_IDLE;
+                    0
                 } else {
                     s.write_offset = 0;
                     s.blk_phase = BLK_PHASE_WRITING;
+                    // Burst: the data is in `read_buf`, no point sleeping
+                    // a tick before pushing it to the output channel.
+                    2
                 }
-                0
             }
         },
         _ => {
@@ -2112,13 +2273,23 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
                 return fault(s, 26, b"[nvme] blocks channel write err\0");
             }
             let written = n as u32;
+            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(written);
             s.write_offset += written as u16;
             if s.write_offset as u32 >= batch_bytes {
                 s.current_block = s.current_block.wrapping_add(s.blk_nlb as u32);
                 s.write_offset = 0;
                 s.blk_phase = BLK_PHASE_IDLE;
+                // Burst: kick straight into IDLE so a queued NOTIFY (or
+                // already-bumped `current_block` for a sequential
+                // consumer) submits the next read this tick instead of
+                // waiting one tick per block.
+                2
+            } else {
+                // Partial write — channel filled. Yield until the next
+                // tick so the consumer can drain.
+                s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+                0
             }
-            0
         }
     }
 }
@@ -2188,6 +2359,49 @@ unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut 
     0
 }
 
+/// Services block-device ioctls on `blk_out`:
+///
+/// * [`IOCTL_BLOCKS_READ_NLB`] — async batch read. Records
+///   (lba, nlb) into `pending_batch_*` so the next BLK_PHASE_IDLE
+///   tick submits a single multi-block Read; bytes stream back on
+///   the channel.
+/// * [`IOCTL_BLOCKS_READ_LBAS_SYNC`] — synchronous read directly
+///   into a caller-supplied buffer. Submits + spin-polls inside
+///   the dispatch call; no channel involvement. Used by file-system
+///   providers (`fat32` FS_CONTRACT path) that need bytes immediately.
+unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+    if state.is_null() || arg.is_null() { return E_INVAL; }
+    let s = &mut *(state as *mut NvmeState);
+    match cmd {
+        IOCTL_BLOCKS_READ_NLB => {
+            let lba = u32::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+            ]);
+            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
+            if nlb_raw == 0 { return E_INVAL; }
+            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
+            s.pending_batch_lba = lba;
+            s.pending_batch_nlb = nlb;
+            s.pending_batch_valid = 1;
+            0
+        }
+        IOCTL_BLOCKS_READ_LBAS_SYNC => {
+            let lba = u32::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+            ]);
+            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
+            if nlb_raw == 0 { return E_INVAL; }
+            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
+            let buf_u64 = u64::from_le_bytes([
+                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
+                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+            ]);
+            sync_blk_read(s, lba as u64, nlb, buf_u64 as *mut u8)
+        }
+        _ => E_NOSYS,
+    }
+}
+
 // ============================================================================
 // Pager backing-store dispatch
 // ============================================================================
@@ -2245,6 +2459,22 @@ unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
                     continue;
                 }
 
+                if is_bulk_write_cid(cid) {
+                    // Async bulk-write completion. The caller has
+                    // already returned 0 to its consumer; we just
+                    // advance the ring head and latch any error so
+                    // the next FLUSH (or submit) can surface it.
+                    if s.bulk_count > 0 {
+                        s.bulk_count -= 1;
+                        s.bulk_head =
+                            (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
+                    }
+                    if sc != 0 && s.bulk_err == 0 {
+                        s.bulk_err = E_INVAL;
+                    }
+                    continue;
+                }
+
                 // Any other CID is a surprise — log + keep spinning.
                 dev_log(&*s.syscalls, 2, b"[nvme] pager: stray cqe\0".as_ptr(), 22);
             }
@@ -2255,6 +2485,112 @@ unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
             }
         }
     }
+}
+
+/// True iff `cid` belongs to the async bulk-write CID range.
+#[inline(always)]
+fn is_bulk_write_cid(cid: u16) -> bool {
+    cid >= CID_BULK_WRITE_BASE
+        && cid < CID_BULK_WRITE_BASE + (ASYNC_BULK_SLOTS as u16)
+}
+
+/// Acquire the next free async bulk-write slot. If the ring is full,
+/// spin-polls CQEs until at least one in-flight slot retires. Returns
+/// the slot index, or a negative errno on timeout.
+unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
+    if (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
+        let start = now_ms(s);
+        while (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
+            let mut progress = false;
+            let n = s.io_q_count as usize;
+            for q in 0..n {
+                while let Some((cid, sc)) = peek_io_cqe(s, q) {
+                    consume_io_cqe(s, q);
+                    progress = true;
+                    if is_bulk_write_cid(cid) {
+                        if s.bulk_count > 0 {
+                            s.bulk_count -= 1;
+                            s.bulk_head =
+                                (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
+                        }
+                        if sc != 0 && s.bulk_err == 0 {
+                            s.bulk_err = E_INVAL;
+                        }
+                    } else if is_write_cid(cid) {
+                        let cnt = *s.inflight_count.as_ptr().add(q);
+                        if cnt > 0 {
+                            let head = *s.inflight_head.as_ptr().add(q) as usize;
+                            let new_head = (head + 1) % MAX_INFLIGHT;
+                            *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
+                            *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
+                        }
+                    }
+                }
+            }
+            if !progress {
+                if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
+                    return Err(E_AGAIN);
+                }
+            }
+        }
+    }
+    Ok(s.bulk_tail as usize)
+}
+
+/// Drain every in-flight async bulk-write slot. Used by PAGER_OP_FLUSH
+/// so a caller's "all writes durable" contract is honoured even when
+/// individual writes returned 0 (queued, not yet completed). Returns
+/// any latched error from a previous failed CQE; clears it on read.
+unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
+    let start = now_ms(s);
+    while s.bulk_count > 0 {
+        let mut progress = false;
+        let n = s.io_q_count as usize;
+        for q in 0..n {
+            while let Some((cid, sc)) = peek_io_cqe(s, q) {
+                consume_io_cqe(s, q);
+                progress = true;
+                if is_bulk_write_cid(cid) {
+                    if s.bulk_count > 0 {
+                        s.bulk_count -= 1;
+                        s.bulk_head =
+                            (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
+                    }
+                    if sc != 0 && s.bulk_err == 0 {
+                        s.bulk_err = E_INVAL;
+                    }
+                } else if is_write_cid(cid) {
+                    let cnt = *s.inflight_count.as_ptr().add(q);
+                    if cnt > 0 {
+                        let head = *s.inflight_head.as_ptr().add(q) as usize;
+                        let new_head = (head + 1) % MAX_INFLIGHT;
+                        *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
+                        *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
+                    }
+                }
+            }
+        }
+        if !progress {
+            if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
+                return E_AGAIN;
+            }
+        }
+    }
+    let err = s.bulk_err;
+    s.bulk_err = 0;
+    err
+}
+
+/// Ensure the ring slot at index `idx` has its 4 KB coherent DMA
+/// buffer allocated. Lazy so a graph that never writes pays no
+/// arena cost.
+unsafe fn pager_ensure_write_buf(s: &mut NvmeState, idx: usize) -> bool {
+    if idx >= PAGER_WRITE_SLOTS { return false; }
+    if s.pager_write_bufs[idx] != 0 { return true; }
+    let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
+    if p == 0 { return false; }
+    s.pager_write_bufs[idx] = p;
+    true
 }
 
 /// Ensure `pager_buf` has a 4 KB DMA page allocated. Uses the
@@ -2269,6 +2605,247 @@ unsafe fn pager_ensure_buf(s: &mut NvmeState) -> bool {
     true
 }
 
+/// Ensure `sync_blk_buf` has a 4 KB DMA page allocated. Backs the
+/// `IOCTL_BLOCKS_READ_LBAS_SYNC` path used by fat32's FS dispatch.
+/// Same coherent-arena tradeoff as `pager_buf`.
+unsafe fn sync_blk_ensure_buf(s: &mut NvmeState) -> bool {
+    if s.sync_blk_buf != 0 { return true; }
+    let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
+    if p == 0 { return false; }
+    s.sync_blk_buf = p;
+    true
+}
+
+/// Synchronous block read: submit one Read SQE on queue 0 for `nlb`
+/// LBAs starting at `lba`, spin-poll for completion, copy out into
+/// the caller's buffer. Used by `IOCTL_BLOCKS_READ_LBAS_SYNC`. The
+/// dedicated `sync_blk_buf` lives outside the streaming-read path so
+/// fat32's FS dispatch never aliases the existing `read_buf`-driven
+/// channel pipeline. Returns 0 on success, negative errno otherwise.
+unsafe fn sync_blk_read(
+    s: &mut NvmeState,
+    lba: u64,
+    nlb: u16,
+    out_buf: *mut u8,
+) -> i32 {
+    if s.state != S_READY { return E_AGAIN; }
+    if nlb == 0 || nlb > MAX_NLB { return E_INVAL; }
+    if out_buf.is_null() { return E_INVAL; }
+    if !sync_blk_ensure_buf(s) { return E_INVAL; }
+
+    let pager_q: usize = 0;
+    let prp1_pci = s.sync_blk_buf | PCI_DMA_OFFSET;
+    let cdw = [
+        ((CID_PAGER_READ as u32) << 16) | (OPC_READ as u32),
+        s.namespace,
+        0, 0,
+        0, 0,
+        prp1_pci as u32, (prp1_pci >> 32) as u32,
+        0, 0,
+        lba as u32, (lba >> 32) as u32,
+        (nlb as u32) - 1,
+        0, 0, 0,
+    ];
+    let sq_base = *s.io_sq.as_ptr().add(pager_q);
+    let tail = *s.io_sq_tail.as_ptr().add(pager_q);
+    write_sqe(sq_base, tail, cdw);
+    let new_tail = (tail + 1) % IO_Q_ENTRIES;
+    *s.io_sq_tail.as_mut_ptr().add(pager_q) = new_tail;
+    reg_w32(s, sq_doorbell(s, IO_QID as u32 + pager_q as u32), new_tail);
+    let rc = pager_spin_poll_cqe(s, CID_PAGER_READ);
+    if rc != 0 { return rc; }
+    let bytes = (nlb as usize) * (BLOCK_SIZE as usize);
+    let mut i = 0usize;
+    while i < bytes {
+        write_volatile(
+            out_buf.add(i),
+            read_volatile((s.sync_blk_buf as *const u8).add(i)),
+        );
+        i += 1;
+    }
+    0
+}
+
+/// Ensure the PRP-list page for async bulk slot `slot` is allocated.
+/// One per slot — the slot's outstanding command points at it while
+/// in flight, so they cannot share.
+unsafe fn pager_ensure_prp_list(s: &mut NvmeState, slot: usize) -> bool {
+    if slot >= ASYNC_BULK_SLOTS { return false; }
+    if s.bulk_prp_list_bufs[slot] != 0 { return true; }
+    let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
+    if p == 0 { return false; }
+    s.bulk_prp_list_bufs[slot] = p;
+    true
+}
+
+/// Build and submit a bulk read or write SQE on queue 0 spanning
+/// `count` 4 KB pages, using slot `slot`'s DMA buffers and PRP-list.
+/// PRP setup follows NVMe 1.4 §4.3:
+///   - PRP1 = slot's first DMA page bus addr
+///   - count == 1: PRP2 = 0
+///   - count == 2: PRP2 = slot's second DMA page bus addr
+///   - count >= 3: PRP2 = slot's PRP-list bus addr; list = pages 1..count-1
+///
+/// Slot `slot`'s DMA pages live at
+/// `pager_write_bufs[slot*MAX_BULK_PAGES..(slot+1)*MAX_BULK_PAGES]`
+/// and PRP-list at `bulk_prp_list_bufs[slot]`. Caller is responsible
+/// for populating the DMA pages (writes) before calling.
+/// Returns 0 on submit OK; caller must spin-poll for the CQE (sync
+/// reads) or rely on async harvest (writes).
+unsafe fn submit_bulk_op(
+    s: &mut NvmeState,
+    is_write: bool,
+    lba: u64,
+    count: u32,
+    cid: u16,
+    slot: usize,
+) -> i32 {
+    // Stripe submissions across I/O queues so successive async-bulk
+    // writes hit different controller-side schedulers. Reads always
+    // use queue 0 — the read path is sync and doesn't benefit from
+    // queue-level fan-out.
+    let pager_q: usize = if is_write && s.io_q_count > 0 {
+        slot % (s.io_q_count as usize)
+    } else {
+        0
+    };
+    let opcode = if is_write { OPC_WRITE } else { OPC_READ };
+
+    // Total LBAs across all pages. NLB field is zero-based.
+    let nlb = count * (PAGE_LBAS as u32);
+    if nlb == 0 || nlb > 65536 { return E_INVAL; }
+    if slot >= ASYNC_BULK_SLOTS { return E_INVAL; }
+
+    let base = slot * (MAX_BULK_PAGES as usize);
+    let prp1_pci = s.pager_write_bufs[base] | PCI_DMA_OFFSET;
+    let (prp2_lo, prp2_hi): (u32, u32) = if count == 1 {
+        (0, 0)
+    } else if count == 2 {
+        let p2 = s.pager_write_bufs[base + 1] | PCI_DMA_OFFSET;
+        (p2 as u32, (p2 >> 32) as u32)
+    } else {
+        // Build PRP-list with pages 1..count-1 (count-1 entries).
+        let list = s.bulk_prp_list_bufs[slot] as *mut u64;
+        let mut i: u32 = 1;
+        let mut idx: usize = 0;
+        while i < count {
+            let entry = s.pager_write_bufs[base + i as usize] | PCI_DMA_OFFSET;
+            write_volatile(list.add(idx), entry);
+            idx += 1;
+            i += 1;
+        }
+        let plist = s.bulk_prp_list_bufs[slot] | PCI_DMA_OFFSET;
+        (plist as u32, (plist >> 32) as u32)
+    };
+
+    let cdw = [
+        ((cid as u32) << 16) | (opcode as u32),
+        s.namespace,
+        0, 0,
+        0, 0,
+        prp1_pci as u32, (prp1_pci >> 32) as u32,
+        prp2_lo, prp2_hi,
+        lba as u32, (lba >> 32) as u32,
+        nlb - 1,
+        0, 0, 0,
+    ];
+    let sq_base = *s.io_sq.as_ptr().add(pager_q);
+    let tail = *s.io_sq_tail.as_ptr().add(pager_q);
+    write_sqe(sq_base, tail, cdw);
+    let new_tail = (tail + 1) % IO_Q_ENTRIES;
+    *s.io_sq_tail.as_mut_ptr().add(pager_q) = new_tail;
+    reg_w32(s, sq_doorbell(s, IO_QID as u32 + pager_q as u32), new_tail);
+    0
+}
+
+/// Bulk pager handler. Writes are async (submit-don't-wait): the
+/// data is staged into a free slot's DMA buffers and a CQE is left
+/// for `bulk_drain_writes` (FLUSH) or the next slot acquisition to
+/// harvest. Reads are sync: they drain any outstanding writes first
+/// (so the read sees a coherent device state) then issue a single
+/// blocking command. Returns 0 on success, negative errno on failure.
+unsafe fn handle_pager_bulk(
+    s: &mut NvmeState,
+    is_write: bool,
+    arena_base_page: u32,
+    vpage_start: u32,
+    count: u32,
+    user_buf: *mut u8,
+) -> i32 {
+    if count == 0 { return E_INVAL; }
+    if count > MAX_BULK_PAGES { return E_INVAL; }
+
+    let lba = NVME_ARENA_LBA_BASE
+        + ((arena_base_page as u64) + (vpage_start as u64)) * (PAGE_LBAS as u64);
+
+    if is_write {
+        // Acquire next free async-bulk slot (drains an in-flight one
+        // if the ring is full). Buffers + PRP-list are pre-alloc'd in
+        // `step_ready`; `pager_ensure_*` is a fast-path no-op here.
+        let slot = match bulk_acquire_slot(s) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if !pager_ensure_prp_list(s, slot) { return E_INVAL; }
+        let base = slot * (MAX_BULK_PAGES as usize);
+        let mut i: u32 = 0;
+        while i < count {
+            if !pager_ensure_write_buf(s, base + i as usize) { return E_INVAL; }
+            i += 1;
+        }
+        // Stage every page from caller's buffer into the slot's DMA
+        // pages. Once the memcpy returns, the caller is free to reuse
+        // its source buffer — the device DMA reads from our staging.
+        let mut p: u32 = 0;
+        while p < count {
+            let src = user_buf.add((p as usize) * (PAGE_BYTES as usize)) as *const u8;
+            let dst = s.pager_write_bufs[base + p as usize] as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, PAGE_BYTES as usize);
+            p += 1;
+        }
+        let cid = CID_BULK_WRITE_BASE + (slot as u16);
+        let rc = submit_bulk_op(s, true, lba, count, cid, slot);
+        if rc != 0 { return rc; }
+        // Update ring before returning so the next call sees the
+        // slot as in-flight even before the CQE arrives.
+        s.bulk_tail = (s.bulk_tail + 1) % (ASYNC_BULK_SLOTS as u8);
+        s.bulk_count += 1;
+        if s.bulk_count > s.bulk_depth_peak {
+            s.bulk_depth_peak = s.bulk_count;
+        }
+        // Surface any error that landed on a previous async submit.
+        let err = s.bulk_err;
+        s.bulk_err = 0;
+        return err;
+    }
+
+    // READ — drain any in-flight writes so the device state is
+    // coherent before we read it. Then borrow slot 0's buffers and
+    // PRP-list (no async writes can be using them post-drain).
+    let drain_rc = bulk_drain_writes(s);
+    if drain_rc != 0 { return drain_rc; }
+    let slot: usize = 0;
+    if !pager_ensure_prp_list(s, slot) { return E_INVAL; }
+    let base = slot * (MAX_BULK_PAGES as usize);
+    let mut i: u32 = 0;
+    while i < count {
+        if !pager_ensure_write_buf(s, base + i as usize) { return E_INVAL; }
+        i += 1;
+    }
+    let rc = submit_bulk_op(s, false, lba, count, CID_PAGER_READ_BULK, slot);
+    if rc != 0 { return rc; }
+    let pr = pager_spin_poll_cqe(s, CID_PAGER_READ_BULK);
+    if pr != 0 { return pr; }
+    let mut p: u32 = 0;
+    while p < count {
+        let src = s.pager_write_bufs[base + p as usize] as *const u8;
+        let dst = user_buf.add((p as usize) * (PAGE_BYTES as usize));
+        core::ptr::copy_nonoverlapping(src, dst, PAGE_BYTES as usize);
+        p += 1;
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.backing_provider_dispatch"]
 pub unsafe extern "C" fn backing_provider_dispatch(
@@ -2278,18 +2855,63 @@ pub unsafe extern "C" fn backing_provider_dispatch(
     let s = &mut *(state as *mut NvmeState);
 
     if opcode == PAGER_OP_FLUSH {
-        // NVMe writes are synchronous (we spin-poll each one), so
-        // nothing is queued at the kernel side. Could be extended to
-        // issue a real Flush (0x00) in the future.
-        return 0;
+        // Drain every in-flight async bulk write so the caller's
+        // "all writes durable" contract holds — `bulk_drain_writes`
+        // returns once `bulk_count == 0`. Note: the device's write
+        // cache may still have pages pending NAND commit; surfacing
+        // that requires issuing an NVMe Flush (opcode 0x00).
+        return bulk_drain_writes(s);
     }
-    if opcode != PAGER_OP_READ && opcode != PAGER_OP_WRITE {
+    if opcode != PAGER_OP_READ
+        && opcode != PAGER_OP_WRITE
+        && opcode != PAGER_OP_READ_BULK
+        && opcode != PAGER_OP_WRITE_BULK
+    {
         return E_NOSYS;
     }
 
     // The module must be in S_READY before pager I/O is legal — the
     // I/O queue pair isn't live until CreateIoCQ/CreateIoSQ complete.
     if s.state != S_READY { return E_AGAIN; }
+
+    // Bulk multi-page transfers. Arg layout (24 bytes):
+    //   [arena_base_page: u32][vpage_start: u32][count: u32][_pad: u32][buf_ptr: u64]
+    if opcode == PAGER_OP_READ_BULK || opcode == PAGER_OP_WRITE_BULK {
+        if arg.is_null() || arg_len < 24 { return E_INVAL; }
+        let arena_base_page = u32::from_le_bytes([
+            *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+        ]);
+        let vpage_start = u32::from_le_bytes([
+            *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+        ]);
+        let count = u32::from_le_bytes([
+            *arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11),
+        ]);
+        let buf_ptr = u64::from_le_bytes([
+            *arg.add(16), *arg.add(17), *arg.add(18), *arg.add(19),
+            *arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23),
+        ]) as *mut u8;
+        if buf_ptr.is_null() { return E_INVAL; }
+        // Drive in MAX_BULK_PAGES-sized batches so callers can pass
+        // any contiguous count without us needing to allocate per-
+        // batch state. Each batch is one NVMe command.
+        let mut done: u32 = 0;
+        while done < count {
+            let chunk = (count - done).min(MAX_BULK_PAGES);
+            let user = buf_ptr.add((done as usize) * (PAGE_BYTES as usize));
+            let rc = handle_pager_bulk(
+                s,
+                opcode == PAGER_OP_WRITE_BULK,
+                arena_base_page,
+                vpage_start + done,
+                chunk,
+                user,
+            );
+            if rc != 0 { return rc; }
+            done += chunk;
+        }
+        return 0;
+    }
 
     // Arg layout (16 bytes): [arena_base_page: u32][vpage_idx: u32][buf_ptr: u64].
     // The kernel's backing_offset is abstract page-granular; this
@@ -2314,18 +2936,14 @@ pub unsafe extern "C" fn backing_provider_dispatch(
         + ((arena_base_page as u64) + (vpage_idx as u64)) * (PAGE_LBAS as u64);
 
     if opcode == PAGER_OP_WRITE {
-        // Stage caller's page into our coherent DMA page.
-        let mut i = 0usize;
-        while i < PAGE_BYTES as usize {
-            write_volatile(
-                (s.pager_buf as *mut u8).add(i),
-                read_volatile(buf_ptr.add(i)),
-            );
-            i += 1;
-        }
-        // Pager always uses queue 0 (pinned). CID_PAGER_WRITE (0x0201)
-        // is outside the 0x0100..0x011F inflight window, so it won't
-        // be mis-classified as a pipelined write.
+        // Single-page synchronous WRITE — submit then spin for
+        // completion. Throughput is capped at the device's QD=1
+        // latency floor; multi-page producers should use
+        // `PAGER_OP_WRITE_BULK` (async, multiple in flight) for the
+        // high-throughput path. This branch serves the kernel's
+        // demand-page writeback, which is intrinsically per-page.
+        if !pager_ensure_buf(s) { return E_INVAL; }
+        core::ptr::copy_nonoverlapping(buf_ptr, s.pager_buf as *mut u8, PAGE_BYTES as usize);
         submit_io_write(s, 0, lba, PAGE_LBAS, CID_PAGER_WRITE, s.namespace, s.pager_buf);
         let rc = pager_spin_poll_cqe(s, CID_PAGER_WRITE);
         return rc;
@@ -2427,6 +3045,18 @@ pub extern "C" fn module_new(
                 Some(nvme_ioctl_handler),
             );
         }
+        // Register the BLK_READ_NLB ioctl handler on blk_out. Consumers
+        // (fat32 in particular) issue a multi-sector read via this
+        // ioctl to amortize per-command roundtrips across a whole
+        // cluster of sectors.
+        if s.blk_out >= 0 {
+            dev_channel_register_ioctl(
+                &*s.syscalls,
+                s.blk_out,
+                state as *mut c_void,
+                Some(nvme_blocks_ioctl_handler),
+            );
+        }
 
         let is_tlv = !params.is_null() && params_len >= 4
             && *params == 0xFE && *params.add(1) == 0x01;
@@ -2478,7 +3108,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         heartbeat(s);
     }
 
-    match s.state {
+    // Snapshot data-flow counters so we can detect "this step moved
+    // no bytes and wasn't blocked" → idle. Only counted in S_READY;
+    // pre-ready states are setup-only and shouldn't skew the idle
+    // ratio.
+    let rx_pre = s.tlm.bytes_in;
+    let tx_pre = s.tlm.bytes_out;
+    let bp_pre = s.tlm.bp_steps;
+
+    let rc = match s.state {
         S_BIND                => step_bind(s),
         S_MAP_BARS            => step_map_bars(s),
         S_RESET               => step_reset(s),
@@ -2491,7 +3129,26 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         S_READ_LBA0           => step_read_lba0(s),
         S_READY               => step_ready(s),
         _                     => step_fault(s),
+    };
+
+    if s.state == S_READY {
+        tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
     }
+
+    let sys = &*s.syscalls;
+    let scratch_ptr = s.tlm_scratch.as_mut_ptr();
+    let scratch_len = s.tlm_scratch.len();
+    dev_tlm_maybe_emit(
+        sys,
+        b"[nvme]",
+        &mut s.tlm,
+        s.step_count,
+        NVME_TLM_PERIOD,
+        scratch_ptr,
+        scratch_len,
+    );
+
+    rc
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

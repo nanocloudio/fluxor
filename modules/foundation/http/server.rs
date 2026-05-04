@@ -109,6 +109,17 @@ pub(crate) const HANDLER_WEBSOCKET_FANOUT: u8 = 5;
 /// by the body-pool size. Used for routes declared with
 /// `source: <port>` + `source_index: N` + `stream: true` in YAML.
 pub(crate) const HANDLER_STREAM: u8 = 6;
+/// Serve a file by path through the FS_CONTRACT provider (fat32 on
+/// bare-metal, linux_fs_dispatch on the host). The route declares an
+/// absolute `fs_path:` and the http module opens it via
+/// `provider_call(-1, FS_OPEN, …)`, queries `FS_STAT` for the
+/// Content-Length, then streams the body via `FS_READ` chunks
+/// directly into `send_buf`.
+pub(crate) const HANDLER_FS_FILE: u8 = 7;
+
+/// Maximum length of a per-route `fs_path` value. Sized for typical
+/// FAT32 deployments with one or two levels of directory nesting.
+pub(crate) const MAX_FS_PATH: usize = 64;
 
 const CACHE_VALID: u8 = 0x01;
 const CACHE_COMPLETE: u8 = 0x02;
@@ -171,9 +182,12 @@ pub(crate) struct Route {
     pub(crate) handler: u8,
     pub(crate) source_index: i16,
     pub(crate) content_type_len: u8,
-    _route_pad: [u8; 1],
+    pub(crate) fs_path_len: u8,
     pub(crate) path: [u8; MAX_PATH],
     pub(crate) content_type: [u8; MAX_CONTENT_TYPE],
+    /// Absolute filesystem path served by `HANDLER_FS_FILE`. Populated
+    /// by `set_route_fs_path` when the YAML declares `fs_path:`.
+    pub(crate) fs_path: [u8; MAX_FS_PATH],
 }
 
 impl Route {
@@ -187,9 +201,10 @@ impl Route {
             handler: 0,
             source_index: -1,
             content_type_len: 0,
-            _route_pad: [0; 1],
+            fs_path_len: 0,
             path: [0; MAX_PATH],
             content_type: [0; MAX_CONTENT_TYPE],
+            fs_path: [0; MAX_FS_PATH],
         }
     }
 
@@ -277,6 +292,14 @@ pub(crate) struct ServerState {
     pub(crate) file_index: i16,
     pub(crate) file_count: u16,
     pub(crate) index_pos: u16,
+
+    /// FS_CONTRACT-served-route state. `fs_fd >= 0` while a file is
+    /// open via `provider_call(-1, FS_OPEN, …)`; `-1` between
+    /// requests. `fs_total` is the file size from `FS_STAT`,
+    /// `fs_sent` advances as bytes go out on the wire.
+    pub(crate) fs_fd:    i32,
+    pub(crate) fs_total: u32,
+    pub(crate) fs_sent:  u32,
 
     pub(crate) phase: Phase,
     pub(crate) route_count: u8,
@@ -405,6 +428,9 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.port = 80;
     s.server.file_index = -1;
     s.server.matched_route = -1;
+    s.server.fs_fd = -1;
+    s.server.fs_total = 0;
+    s.server.fs_sent = 0;
     s.server.phase = Phase::Init;
 
     let pool = heap_alloc(&*sys, DEFAULT_BODY_POOL_SIZE as u32);
@@ -487,6 +513,20 @@ unsafe fn reset_connection(s: &mut HttpState) {
     s.server.matched_route = -1;
     s.server.tmpl_pos = 0;
     s.server.file_index = -1;
+    // Close any FS_CONTRACT FD left open by a previous response. The
+    // FS dispatch handles CLOSE on a mid-stream slot, so this is safe
+    // even if the connection dropped before we reached EOF.
+    if s.server.fs_fd >= 0 {
+        ((*s.syscalls).provider_call)(
+            s.server.fs_fd,
+            0x0903, // FS_CLOSE
+            core::ptr::null_mut(),
+            0,
+        );
+        s.server.fs_fd = -1;
+    }
+    s.server.fs_total = 0;
+    s.server.fs_sent = 0;
     // The IP module resets the listener slot to Closed when a connection
     // completes, so we must send a fresh CMD_BIND to re-listen.
     s.server.phase = Phase::Binding;
@@ -843,6 +883,68 @@ unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type: &[u8]) {
     );
     s.server.send_offset = 0;
     s.server.send_len = len as u16;
+}
+
+/// Like `build_header` but also emits a `Content-Length: <n>` header.
+/// Used for responses whose body length is known up-front (e.g. the
+/// FS_CONTRACT path queries `FS_STAT` for the file size before
+/// streaming).
+unsafe fn build_header_with_len(
+    s: &mut HttpState,
+    status: &[u8],
+    content_type: &[u8],
+    content_length: u32,
+) {
+    // Write the standard status line (which terminates with \r\n\r\n)
+    // then strip the trailing blank line, append the Content-Length
+    // header, and re-terminate.
+    let mut off = h1::write_status_line(
+        s.server.send_buf.as_mut_ptr(),
+        SEND_BUF_SIZE,
+        status,
+        content_type,
+    );
+    if off >= 4 {
+        off -= 4;
+    }
+    let dst = s.server.send_buf.as_mut_ptr();
+    let prefix: &[u8] = b"\r\nContent-Length: ";
+    let mut k = 0usize;
+    while k < prefix.len() && off < SEND_BUF_SIZE {
+        *dst.add(off) = prefix[k];
+        off += 1;
+        k += 1;
+    }
+    // Decimal Content-Length value (max 10 digits for u32).
+    let mut digits = [0u8; 10];
+    let mut n = 0usize;
+    let mut v = content_length;
+    if v == 0 {
+        digits[0] = b'0';
+        n = 1;
+    } else {
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        if off < SEND_BUF_SIZE {
+            *dst.add(off) = digits[n];
+            off += 1;
+        }
+    }
+    let suffix: &[u8] = b"\r\n\r\n";
+    let mut k = 0usize;
+    while k < suffix.len() && off < SEND_BUF_SIZE {
+        *dst.add(off) = suffix[k];
+        off += 1;
+        k += 1;
+    }
+    s.server.send_offset = 0;
+    s.server.send_len = off as u16;
 }
 
 unsafe fn build_error(s: &mut HttpState, code: &[u8], body: &[u8]) {
@@ -1799,6 +1901,71 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
     0
 }
 
+/// HANDLER_FS_FILE body streamer. Drains `send_buf` to net_out;
+/// when empty, calls `FS_READ` for the next chunk. Closes the FD and
+/// transitions to `CloseConn` when `fs_sent == fs_total` (or FS_READ
+/// returns ≤ 0).
+unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
+    if s.server.fs_fd < 0 {
+        s.server.phase = Phase::CloseConn;
+        return 0;
+    }
+    if s.server.send_offset >= s.server.send_len {
+        // All bytes sent? Close out cleanly.
+        if s.server.fs_sent >= s.server.fs_total {
+            let sys = &*s.syscalls;
+            (sys.provider_call)(
+                s.server.fs_fd,
+                0x0903, // FS_CLOSE
+                core::ptr::null_mut(),
+                0,
+            );
+            s.server.fs_fd = -1;
+            s.server.phase = Phase::CloseConn;
+            return 0;
+        }
+        // Refill from the FS provider.
+        let sys = &*s.syscalls;
+        let want = SEND_BUF_SIZE as u32;
+        let remaining = s.server.fs_total.saturating_sub(s.server.fs_sent);
+        let cap = if remaining < want { remaining } else { want } as usize;
+        let n = (sys.provider_call)(
+            s.server.fs_fd,
+            0x0901, // FS_READ
+            s.server.send_buf.as_mut_ptr(),
+            cap,
+        );
+        if n <= 0 {
+            // EOF or error — close and finish.
+            (sys.provider_call)(
+                s.server.fs_fd,
+                0x0903, // FS_CLOSE
+                core::ptr::null_mut(),
+                0,
+            );
+            s.server.fs_fd = -1;
+            s.server.phase = Phase::CloseConn;
+            return 0;
+        }
+        s.server.send_offset = 0;
+        s.server.send_len = n as u16;
+    }
+
+    let remaining = (s.server.send_len - s.server.send_offset) as usize;
+    let ptr = s
+        .server
+        .send_buf
+        .as_ptr()
+        .add(s.server.send_offset as usize);
+    let sent = net_send(s, ptr, remaining);
+    if sent > 0 {
+        s.server.send_offset += sent as u16;
+        s.server.fs_sent = s.server.fs_sent.wrapping_add(sent as u32);
+        return 2;
+    }
+    0
+}
+
 // ── Per-tick step machine ──────────────────────────────────────────────────
 
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
@@ -2368,6 +2535,68 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     build_header(s, b"200 OK", ct_slice);
                     s.server.phase = Phase::SendHeaders;
                 }
+                HANDLER_FS_FILE => {
+                    let route = &*s
+                        .server
+                        .routes
+                        .as_ptr()
+                        .add(s.server.matched_route as usize);
+                    let n = route.fs_path_len as usize;
+                    if n == 0 || n > MAX_FS_PATH {
+                        build_error(s, b"500 Internal Server Error", b"FS route missing path\n");
+                        s.server.phase = Phase::DrainSend;
+                        return 0;
+                    }
+                    // Snapshot per-route fields before borrowing &mut s
+                    // for header construction.
+                    let mut fs_path = [0u8; MAX_FS_PATH];
+                    fs_path[..n].copy_from_slice(&route.fs_path[..n]);
+                    let mut ct = [0u8; MAX_CONTENT_TYPE];
+                    let ct_len = route.content_type_len as usize;
+                    if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
+                        ct[..ct_len].copy_from_slice(&route.content_type[..ct_len]);
+                    }
+                    let ct_slice: &[u8] = if ct_len == 0 {
+                        b"application/octet-stream"
+                    } else {
+                        &ct[..ct_len]
+                    };
+
+                    let sys = &*s.syscalls;
+                    // FS_OPEN(-1, path, len) → fd or negative errno.
+                    // Dispatched through the kernel's FS_VTABLE to
+                    // whichever module registered as the FS provider
+                    // (fat32 on bare-metal, linux_fs_dispatch on host).
+                    let fd = (sys.provider_call)(
+                        -1,
+                        0x0900, // FS_OPEN
+                        fs_path.as_mut_ptr(),
+                        n,
+                    );
+                    if fd < 0 {
+                        build_error(s, b"404 Not Found", b"Not Found\n");
+                        s.server.phase = Phase::DrainSend;
+                        return 0;
+                    }
+                    // FS_STAT(fd, [size:u32, mtime:u32]).
+                    let mut stat = [0u8; 8];
+                    let st = (sys.provider_call)(
+                        fd,
+                        0x0904, // FS_STAT
+                        stat.as_mut_ptr(),
+                        stat.len(),
+                    );
+                    let size: u32 = if st >= 0 {
+                        u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]])
+                    } else {
+                        0
+                    };
+                    s.server.fs_fd = fd;
+                    s.server.fs_total = size;
+                    s.server.fs_sent = 0;
+                    build_header_with_len(s, b"200 OK", ct_slice, size);
+                    s.server.phase = Phase::SendHeaders;
+                }
                 HANDLER_PROXY => {
                     build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
                     s.server.phase = Phase::DrainSend;
@@ -2405,7 +2634,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 };
 
                 match handler {
-                    HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE | HANDLER_STREAM => {
+                    HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE | HANDLER_STREAM
+                    | HANDLER_FS_FILE => {
                         s.server.phase = Phase::SendBody;
                     }
                     _ => {
@@ -2454,6 +2684,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 }
                 HANDLER_STREAM => {
                     return step_send_file(s);
+                }
+                HANDLER_FS_FILE => {
+                    return step_send_fs_file(s);
                 }
                 _ => {
                     s.server.phase = Phase::CloseConn;
@@ -2807,5 +3040,24 @@ pub(crate) unsafe fn set_route_proxy_port(s: &mut HttpState, idx: usize, d: *con
 pub(crate) unsafe fn set_route_source(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
     if idx < MAX_ROUTES {
         (*s.server.routes.as_mut_ptr().add(idx)).source_index = p_u16(d, len, 0, 0xFFFF) as i16;
+    }
+}
+
+/// Set a route's `fs_path` (filesystem path served via FS_CONTRACT).
+/// Also flips the handler to `HANDLER_FS_FILE` so a route with
+/// `fs_path:` configured serves through the FS provider without any
+/// other YAML setup.
+pub(crate) unsafe fn set_route_fs_path(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
+    if idx >= MAX_ROUTES { return; }
+    let r = &mut *s.server.routes.as_mut_ptr().add(idx);
+    let n = if len > MAX_FS_PATH { MAX_FS_PATH } else { len };
+    let mut i = 0usize;
+    while i < n {
+        r.fs_path[i] = *d.add(i);
+        i += 1;
+    }
+    r.fs_path_len = n as u8;
+    if n > 0 {
+        r.handler = HANDLER_FS_FILE;
     }
 }

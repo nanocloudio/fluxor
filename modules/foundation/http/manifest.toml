@@ -49,3 +49,10 @@ content_type = "WsFrame"
 [[resources]]
 requires_contract = "channel"
 access = "read"
+
+# HANDLER_FS_FILE routes serve files by path through the FS_CONTRACT
+# (`fat32` on bare-metal, `linux_fs_dispatch` on the host). Granting
+# `fs` enables `provider_call(-1, FS_OPEN, ...)`.
+[[resources]]
+requires_contract = "fs"
+access = "read"

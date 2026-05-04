@@ -5,11 +5,11 @@
 #   Domain 0 (core 0): virtio_net <-> ip <-> http
 #   Domain 1 (core 1): debug (logging module)
 #
-# Cross-domain edge connects http's file control output to the debug
-# logger, bridged by a lock-free SPSC ring buffer (CrossDomainChannel). The
-# domain 0 loop reads http's output channel and sends messages into the
-# ring. The domain 1 loop receives from the ring and writes to debug's input
-# channel.
+# Each domain runs its own scheduler step loop on a dedicated core; cross-
+# domain edges (when wired) bridge channels via a lock-free SPSC ring
+# buffer (CrossDomainChannel). This config keeps the two domains
+# independent — the network stack drives http on core 0 while debug
+# logging runs on core 1.
 #
 # Usage:
 #   1. make vm VM_CONFIG=examples/qemu-virt/multi_domain.yaml
@@ -65,7 +65,6 @@ wiring:
   - from: http.net_out
     to: ip.net_in
 
-  # Cross-domain edge: http file_ctrl output -> debug input
-  - from: http.file_ctrl
-    to: debug.data
-    edge_class: cross_core
+  # For a cross-domain trace of HTTP activity, route a `[http] tlm`
+  # log line via log_net or attach the monitor module from the
+  # `compute` domain.
