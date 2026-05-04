@@ -327,12 +327,29 @@ fn main() {
     let tick_duration = Duration::from_micros(tick_us as u64);
     let mut tick: u64 = 0;
 
+    // Burst-step bound: matches the bcm2712 pump. A module returning
+    // `StepOutcome::Burst` is asking to be re-stepped immediately
+    // because it has more synchronous work to do (e.g. http's
+    // `step_send_file` consumed one MSS and has more to push). The
+    // cap defends against a runaway module that never returns
+    // anything else.
+    const MAX_BURST_STEPS: usize = 16384;
+
     loop {
         let t0 = Instant::now();
 
         for i in 0..module_count {
             scheduler::set_current_module(i);
-            scheduler::step_module(i);
+            if let Some(Ok(fluxor::modules::StepOutcome::Burst)) =
+                scheduler::step_module_outcome(i)
+            {
+                for _ in 0..MAX_BURST_STEPS {
+                    match scheduler::step_module_outcome(i) {
+                        Some(Ok(fluxor::modules::StepOutcome::Burst)) => continue,
+                        _ => break,
+                    }
+                }
+            }
         }
 
         tick += 1;
@@ -341,8 +358,22 @@ fn main() {
             log::info!("[sched] alive t={} elapsed_ms={}", tick, linux_now_millis());
         }
 
+        // Tick pacing. `thread::sleep` for sub-millisecond targets
+        // has a ~50-150 µs floor on Linux (timer-tick granularity +
+        // scheduler wake latency), so for hot cadences we busy-spin
+        // instead and only fall back to sleep at coarse settings:
+        //
+        //   * tick_us == 0   → pure busy-loop, no pacing.
+        //   * tick_us <= 200 → spin until `tick_duration` elapses.
+        //   * tick_us > 200  → sleep for the remainder.
         let elapsed = t0.elapsed();
-        if elapsed < tick_duration {
+        if tick_us == 0 {
+            // Pure busy-loop — recheck immediately.
+        } else if tick_us <= 200 {
+            while t0.elapsed() < tick_duration {
+                core::hint::spin_loop();
+            }
+        } else if elapsed < tick_duration {
             thread::sleep(tick_duration - elapsed);
         }
     }

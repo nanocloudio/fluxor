@@ -108,8 +108,8 @@ fn check_rules(
             v.errors.push(format!(
                 "scenario '{}': [[{}]][{}] source = '{}' — this capability is in the \
                  vocabulary but the matcher has no evaluator for it yet. Supported rule \
-                 sources: any `console.*` (regex on the console byte stream) and \
-                 `observe.netboot_fetch`.",
+                 sources: any `console.*` or `telemetry.*` (regex on the per-source \
+                 byte stream) and `observe.netboot_fetch`.",
                 s.name,
                 kind,
                 i,
@@ -247,21 +247,23 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_rule_source_fails_at_plan_time() {
-        // Same gate as the observe.monitor_stream case — telemetry
-        // sources aren't evaluated by the matcher.
+    fn telemetry_rule_source_is_supported() {
+        // `telemetry.*` shares the byte-stream evaluator with `console.*`
+        // (the transport tags incoming bytes with the qualified
+        // capability). A scenario whose pass rule names a telemetry
+        // capability the board declares must validate cleanly.
         let s = scn(r#"
             name = "telemetry_scenario"
             target = "cm5"
             config = "a.yaml"
+            requires = ["deploy.netboot_tftp", "power.cycle", "telemetry.monitor_udp"]
 
             [[pass]]
             source = "telemetry.monitor_udp"
             regex = "."
         "#);
         let v = validate_scenario_against_board(&s, &load_cm5());
-        assert!(!v.is_ok());
-        assert!(v.errors[0].contains("matcher has no evaluator"));
+        assert!(v.is_ok(), "errors: {:?}", v.errors);
     }
 
     #[test]

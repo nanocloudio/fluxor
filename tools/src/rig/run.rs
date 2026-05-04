@@ -89,8 +89,10 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     // Resolve backends up front so missing-binary errors surface before we
     // touch the rig. Deploy is mandatory; consoles are the set of console
     // capabilities the plan decided we need to attach (one per scenario
-    // rule source, or one default for log capture); power is mandatory iff
-    // the scenario said so, optional otherwise.
+    // rule source, or one default for log capture); telemetry is at most
+    // one binding (the board's preferred telemetry adapter) and is
+    // attached when the board declares it; power is mandatory iff the
+    // scenario said so, optional otherwise.
     let deploy_backend = resolve_backend(Surface::Deploy, capability_name(plan.deploy.capability))?;
     let console_backends: Vec<(Capability, BackendRef)> = plan
         .consoles
@@ -100,6 +102,14 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
                 .map(|b| (c.capability, b))
         })
         .collect::<Result<Vec<_>>>()?;
+    let telemetry_backend: Option<(Capability, BackendRef)> = plan
+        .telemetry
+        .as_ref()
+        .map(|t| {
+            resolve_backend(Surface::Telemetry, capability_name(t.capability))
+                .map(|b| (t.capability, b))
+        })
+        .transpose()?;
     let power_backend = profile
         .power
         .as_ref()
@@ -129,23 +139,30 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     // Step 3 — build / resolve artifacts.
     let artifact_path_for_record = run_build(plan, options)?;
 
-    // One log file per console source the plan attached. Names are
-    // `console.<suffix>.log` (e.g. `console.serial.log`); keeping the
-    // streams separate matches the matcher's per-source buffers and
-    // avoids interleaved byte streams on multi-console runs.
-    let mut console_logs: std::collections::BTreeMap<Capability, std::fs::File> =
+    // One log file per byte-stream source the plan attached. File name
+    // is `<capability>.log` (e.g. `console.serial.log`,
+    // `telemetry.monitor_udp.log`); keeping the streams separate matches
+    // the matcher's per-source buffers and avoids interleaved byte
+    // streams when multiple sources are wired in the same run.
+    let mut byte_logs: std::collections::BTreeMap<Capability, std::fs::File> =
         std::collections::BTreeMap::new();
-    for sel in &plan.consoles {
-        let cap_str = sel.capability.as_str();
-        // `console.serial` -> `console.serial.log`
-        let path = run_dir.join(format!("{cap_str}.log"));
+    let mut byte_log_caps: Vec<Capability> = plan
+        .consoles
+        .iter()
+        .map(|c| c.capability)
+        .collect();
+    if let Some(t) = &plan.telemetry {
+        byte_log_caps.push(t.capability);
+    }
+    for cap in byte_log_caps {
+        let path = run_dir.join(format!("{}.log", cap.as_str()));
         let f = std::fs::File::create(&path).map_err(|e| {
             Error::Config(format!(
-                "rig run: opening console log {}: {e}",
+                "rig run: opening byte-stream log {}: {e}",
                 path.display()
             ))
         })?;
-        console_logs.insert(sel.capability, f);
+        byte_logs.insert(cap, f);
     }
 
     // Step 4 — attach transports.
@@ -168,7 +185,8 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     // default log-capture console when the scenario names none). Each
     // transport's bytes are source-tagged so the matcher evaluates rules
     // only against bytes from the capability they declared.
-    let mut _console_transports: Vec<_> = Vec::with_capacity(console_backends.len());
+    let mut _byte_stream_transports: Vec<_> =
+        Vec::with_capacity(console_backends.len() + telemetry_backend.iter().count());
     for (cap, backend) in console_backends {
         let binding = console_binding_for(profile, cap)?;
         let invocation = BackendInvocation {
@@ -178,7 +196,24 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         };
         let handle = attach_transport(backend, "attach", &invocation, tx.clone())?;
         eprintln!("[rig] console attached: {}", handle.backend().slug());
-        _console_transports.push(handle);
+        _byte_stream_transports.push(handle);
+    }
+
+    // Same shape for telemetry: the board declares at most one telemetry
+    // adapter; if the plan picked it, attach it now. Telemetry bytes are
+    // tagged with the qualified `telemetry.<name>` capability by the
+    // transport layer, so scenario rules naming a telemetry source see
+    // them through the same matcher path as console bytes.
+    if let Some((cap, backend)) = telemetry_backend {
+        let binding = telemetry_binding_for(profile, cap)?;
+        let invocation = BackendInvocation {
+            binding: wire_binding(binding),
+            context: context_from_plan(plan, &run_dir),
+            artifact: None,
+        };
+        let handle = attach_transport(backend, "attach", &invocation, tx.clone())?;
+        eprintln!("[rig] telemetry attached: {}", handle.backend().slug());
+        _byte_stream_transports.push(handle);
     }
 
     // Step 5 — deploy artifact (actuator).
@@ -249,7 +284,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
             Ok(event) => {
                 match &event {
                     RunEvent::ConsoleBytes { source, bytes } => {
-                        if let Some(f) = console_logs.get_mut(source) {
+                        if let Some(f) = byte_logs.get_mut(source) {
                             let _ = f.write_all(bytes);
                         }
                     }
@@ -288,7 +323,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         }
     };
 
-    for f in console_logs.values_mut() {
+    for f in byte_logs.values_mut() {
         let _ = f.flush();
     }
 
@@ -397,6 +432,15 @@ fn console_binding_for(profile: &RigProfile, cap: Capability) -> Result<&Binding
     profile.console.get(&cap).ok_or_else(|| {
         Error::Config(format!(
             "rig run: plan chose {} but profile has no [console.*] binding",
+            cap.as_str()
+        ))
+    })
+}
+
+fn telemetry_binding_for(profile: &RigProfile, cap: Capability) -> Result<&BindingTable> {
+    profile.telemetry.get(&cap).ok_or_else(|| {
+        Error::Config(format!(
+            "rig run: plan chose {} but profile has no [telemetry.*] binding",
             cap.as_str()
         ))
     })

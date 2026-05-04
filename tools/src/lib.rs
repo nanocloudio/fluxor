@@ -1,15 +1,14 @@
 //! Library facade for `fluxor-tools`.
 //!
 //! Exposes the small subset of the tool's modules that integration
-//! tests under `tools/tests/` need to import. The CLI lives in
-//! `src/main.rs`; this surface is intentionally narrow — only
-//! `manifest` is public, with `error` reachable because
-//! `Manifest::from_toml -> Result<Self>` names `error::Error` in its
-//! return type.
+//! tests under `tools/tests/` and the auxiliary backend binaries under
+//! `src/bin/` import. The main CLI lives in `src/main.rs`; this
+//! surface is intentionally narrow.
 
 pub mod error;
 mod hash;
 pub mod manifest;
+pub mod monitor;
 
 /// Wire-format constants (ABI version byte, channel-hint stride,
 /// `fnv1a32`). Path-mounted from `modules/sdk/wire.rs` so the host

@@ -24,12 +24,43 @@ use super::{
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
 
+/// Per-conn inbound buffer for request bytes (HTTP request line +
+/// headers + any pre-body POST payload, WS handshake, HTTP/2
+/// SETTINGS). Sized to hold a comfortable real-world request without
+/// truncation.
+///
+/// **aarch64** — 8 KiB. Covers Chrome with extensive cookies + heavy
+/// referer chains + WS upgrade headers, plus speculative pipelined
+/// requests stashed on a queued conn. Total stash cost is
+/// `RECV_BUF_SIZE × PENDING_ACCEPT_DEPTH` = 8 × 128 = 1 MiB per
+/// server instance — tolerable on Pi 5 host RAM.
+///
+/// **wasm32** — 4 KiB. Browser hosts have looser memory budgets than
+/// embedded but still benefit from staying compact.
+///
+/// **rp2350 / rp2040** — 2 KiB. Original embedded budget; ample for
+/// the embedded use cases the firmware was originally designed for.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const RECV_BUF_SIZE: usize = 8192;
+#[cfg(target_arch = "wasm32")]
+pub(crate) const RECV_BUF_SIZE: usize = 4096;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
 pub(crate) const RECV_BUF_SIZE: usize = 2048;
 /// Depth of the in-flight accept queue (`ServerState::pending_accept`).
-/// Each entry costs one byte of state and bounds the number of
-/// short-lived HTTP requests that can land in parallel without
-/// dropping. 4 is comfortable for a typical browser session
-/// (HTML + favicon + a couple of racing reloads).
+/// Bounds the number of short-lived HTTP requests that can land in
+/// parallel without dropping while the server is mid-response on a
+/// long-running transfer (e.g. a multi-MB wasm asset taking ~30 s).
+/// Each slot carries one conn id plus a `PENDING_DATA_BYTES`
+/// (= `RECV_BUF_SIZE` = 2 KiB) stash buffer for early-arriving
+/// request bytes. Tiered the same way as `tcp::MAX_TCP_CONNS`:
+/// host-class targets get generous headroom for Chrome's 6-parallel
+/// per-origin behaviour plus speculative retries; embedded keeps
+/// the original cost.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const PENDING_ACCEPT_DEPTH: usize = 128;
+#[cfg(target_arch = "wasm32")]
+pub(crate) const PENDING_ACCEPT_DEPTH: usize = 32;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
 pub(crate) const PENDING_ACCEPT_DEPTH: usize = 4;
 /// Per-queued-slot inbound buffer size. Matches `RECV_BUF_SIZE` so the
 /// truncation point is the same whether a request lands while its conn
@@ -461,13 +492,17 @@ unsafe fn reset_connection(s: &mut HttpState) {
     s.server.phase = Phase::Binding;
 }
 
-/// Push a queued accept onto the FIFO. Drops silently when full —
-/// linux_net's slot is left in state=2 and python/browser will time
-/// out cleanly. 4 entries is enough for a typical browser's racing
-/// HTML+favicon+reloads.
+/// Push a queued accept onto the FIFO. When full, actively close the
+/// peer's connection rather than dropping silently — leaving the IP
+/// module's slot in `Established` until the per-conn timeout
+/// orphans it for ~30 s, exhausting `MAX_TCP_CONNS` under any
+/// non-trivial load. A clean close lets the browser reconnect
+/// promptly and frees the slot (after TIME_WAIT) for the next
+/// request.
 unsafe fn pending_accept_push(s: &mut HttpState, conn_id: u8) {
     let n = s.server.pending_accept_count as usize;
     if n >= PENDING_ACCEPT_DEPTH {
+        close_net_conn(s, conn_id);
         return;
     }
     s.server.pending_accept[n] = conn_id;
@@ -604,6 +639,139 @@ unsafe fn close_net_conn(s: &mut HttpState, conn_id: u8) {
         buf,
         NET_BUF_SIZE,
     );
+}
+
+/// Drain the network module's inbound metadata messages
+/// (MSG_ACCEPTED / MSG_CLOSED / non-WS MSG_DATA) while the server
+/// is in `WsActive`. Mirrors `drain_background_messages` but is
+/// called explicitly from the WS handler so it can flip the phase
+/// to `CloseConn` when the current conn closes — the background
+/// helper just sets `peer_closed=1` and waits for the per-phase
+/// path to notice. Returns true if it consumed at least one frame.
+unsafe fn ws_pump_inbound_meta(s: &mut HttpState) -> bool {
+    if s.net_in_chan < 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let chan = s.net_in_chan;
+    let mut handled = false;
+    for _ in 0..4 {
+        let poll = (sys.channel_poll)(chan, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            return handled;
+        }
+        let buf = s.net_buf.as_mut_ptr();
+        let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+        match msg_type {
+            NET_MSG_ACCEPTED if payload_len >= 1 => {
+                let incoming_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                pending_accept_push(s, incoming_conn);
+                handled = true;
+            }
+            NET_MSG_CLOSED if payload_len >= 1 => {
+                let closed_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                if closed_conn == s.server.conn_id {
+                    s.server.peer_closed = 1;
+                    s.server.phase = Phase::CloseConn;
+                    return true;
+                } else {
+                    pending_accept_remove(s, closed_conn);
+                    handled = true;
+                }
+            }
+            NET_MSG_DATA if payload_len > 1 => {
+                // MSG_DATA arriving while we're in WsActive feeds the
+                // per-frame logic below; copy into recv_buf for the
+                // current conn or stash on the queued conn's buffer
+                // so the bytes aren't lost when this helper consumed
+                // the frame off the channel.
+                let incoming_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                let data_len = payload_len - 1;
+                if incoming_conn == s.server.conn_id {
+                    let space = RECV_BUF_SIZE - s.server.recv_len as usize;
+                    let to_copy = data_len.min(space);
+                    if to_copy > 0 {
+                        let dst = s
+                            .server
+                            .recv_buf
+                            .as_mut_ptr()
+                            .add(s.server.recv_len as usize);
+                        core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
+                        s.server.recv_len += to_copy as u16;
+                    }
+                    handled = true;
+                } else if let Some(idx) = pending_accept_index(s, incoming_conn) {
+                    pending_data_append(s, idx, data_ptr, data_len);
+                    handled = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    handled
+}
+
+/// Drain inbound network messages while the server is busy on a
+/// long-running phase (sending a response, fetching cache content,
+/// etc.). Without this, `MSG_ACCEPTED` from racing browser
+/// connections piles up in `net_in_chan` until the channel buffer
+/// fills, which back-pressures the network module so it stops
+/// `accept()`ing — TCP wedges to the outside even though the http
+/// state machine is healthy. Equivalent in scope to the inbound
+/// processing in `Phase::RecvRequest` (queue accepts, stash data on
+/// queued conns, handle closes), minus anything that affects the
+/// current send: data for the current conn during a response is
+/// silently dropped (HTTP/1.1 GET has no body after the request
+/// line) and `MSG_CLOSED` for the current conn flips `peer_closed`
+/// without immediately interrupting the in-flight send — the
+/// `CloseConn` transition happens when the send completes.
+unsafe fn drain_background_messages(s: &mut HttpState) {
+    if s.net_in_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let chan = s.net_in_chan;
+    // Process up to a small batch per call so this stays bounded —
+    // the next step() call picks up wherever we left off.
+    for _ in 0..4 {
+        let poll = (sys.channel_poll)(chan, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            return;
+        }
+        let buf = s.net_buf.as_mut_ptr();
+        let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+        match msg_type {
+            NET_MSG_ACCEPTED if payload_len >= 1 => {
+                let incoming_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                pending_accept_push(s, incoming_conn);
+            }
+            NET_MSG_CLOSED if payload_len >= 1 => {
+                let closed_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                if closed_conn == s.server.conn_id {
+                    s.server.peer_closed = 1;
+                } else {
+                    pending_accept_remove(s, closed_conn);
+                }
+            }
+            NET_MSG_DATA if payload_len > 1 => {
+                let incoming_conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                let data_len = payload_len - 1;
+                if incoming_conn == s.server.conn_id {
+                    // Bytes for the connection we're currently sending
+                    // a response on — HTTP/1.1 GET has no request body
+                    // after the headers, so anything here is either
+                    // pipelined garbage or a stale write. Drop.
+                } else if let Some(idx) = pending_accept_index(s, incoming_conn) {
+                    pending_data_append(s, idx, data_ptr, data_len);
+                }
+                // Else: orphan slot — drop. Same reasoning as the
+                // existing RecvRequest path.
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) unsafe fn match_route(s: &HttpState) -> i8 {
@@ -877,6 +1045,7 @@ pub(crate) unsafe fn cache_fetch_step(s: &mut HttpState) -> CacheStepResult {
         let n = ((*s.syscalls).channel_read)(s.server.file_chan, dst, to_read);
         if n > 0 {
             ce.length += n as u16;
+            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(n as u32);
         }
     }
 
@@ -1010,6 +1179,7 @@ pub(crate) unsafe fn render_file_into(
     }
     let n = ((*s.syscalls).channel_read)(s.server.file_chan, dst, cap);
     if n > 0 {
+        s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(n as u32);
         return (n as usize, true);
     }
     let poll = ((*s.syscalls).channel_poll)(s.server.file_chan, POLL_IN | POLL_HUP);
@@ -1455,8 +1625,28 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
     if s.net_out_chan < 0 {
         return 0;
     }
-    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
-    let to_send = len.min(max_data);
+    // Per-call payload sizing depends on the downstream:
+    //
+    //  * `linux_net` (Linux host) → `libc::send()` into the kernel TCP
+    //    stack. The kernel handles segmentation (TSO, etc.), so a
+    //    large CMD_SEND amortises channel-write + syscall cost across
+    //    many MSSes.
+    //
+    //  * fluxor's `ip` module (bcm2712 bare metal, …) → emits one TCP
+    //    segment per CMD_SEND and drops anything in the chunk that
+    //    overflows the effective send window. Capping at one MSS
+    //    keeps the module from losing data when the IP send queue
+    //    is tight.
+    //
+    // Both paths build for aarch64-unknown-none in PIC, so the cap is
+    // a module-local runtime field set from the `host_tcp` param.
+    let frame_cap = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+    let per_call_cap = if s.host_tcp != 0 {
+        frame_cap
+    } else {
+        1460usize // single MSS — safe with fluxor IP segmenter
+    };
+    let to_send = len.min(per_call_cap).min(frame_cap);
     if to_send == 0 {
         return 0;
     }
@@ -1474,8 +1664,10 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
     let total = NET_FRAME_HDR + payload_len;
     let written = (sys.channel_write)(chan, scratch, total);
     if written >= total as i32 {
+        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(to_send as u32);
         to_send as i32
     } else {
+        s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
         0
     }
 }
@@ -1611,6 +1803,24 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
 
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     drain_variables(s);
+
+    // Background-drain inbound network messages during phases that
+    // don't already poll `net_in_chan` themselves. Without this the
+    // channel buffer fills up while the server is mid-response and
+    // the upstream network module stops `accept()`ing new TCP
+    // connections — TCP wedges from the outside even though the
+    // scheduler keeps ticking. WaitBound / WaitAccept / RecvRequest /
+    // WsActive are excluded because their per-phase handlers consume
+    // the same channel directly with phase-specific semantics.
+    match s.server.phase {
+        Phase::Init
+        | Phase::Binding
+        | Phase::WaitBound
+        | Phase::WaitAccept
+        | Phase::RecvRequest
+        | Phase::WsActive => {}
+        _ => drain_background_messages(s),
+    }
 
     match s.server.phase {
         Phase::Init | Phase::Binding => {
@@ -2370,13 +2580,27 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         }
 
         Phase::WsActive => {
+            // Pump inbound MSG_ACCEPTED / MSG_CLOSED first so a peer
+            // close arrives promptly even when the producer side is
+            // saturated. Without this poll, a busy ws_in (e.g. a
+            // sustained ZVFF/ZAFF stream from z80_core) keeps the
+            // outbound-drain loop below permanently `progress=true`
+            // and the post-loop net_in poll never fires; MSG_CLOSED
+            // accumulates in `net_in_chan`, the channel buffer
+            // fills, the IP module back-pressures, and TCP wedges
+            // for new connections even though the WS itself is fine.
+            let inbound_handled = ws_pump_inbound_meta(s);
+            if !matches!(s.server.phase, Phase::WsActive) {
+                return 2;
+            }
+
             // Loop within this tick alternating between flushing send_buf
             // to net_out and draining the next outbound frame from
             // ws_in / recv_buf. This keeps the pipeline saturated under
             // heavy producer load (spectrum_video chunking ~50 WsFrames
             // per video frame would otherwise take ~50 ticks to emit).
             // Exits as soon as no work can be done on either side.
-            let mut did_any = false;
+            let mut did_any = inbound_handled;
             loop {
                 let mut progress = false;
 

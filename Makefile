@@ -73,9 +73,9 @@ SDK_DIR := modules/sdk
 ABI_HEADER := $(SDK_DIR)/abi.rs
 
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
-mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,2)))))))))))))
+mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,$(if $(filter synth_source,$(1)),1,2))))))))))))))
 
-.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint
+.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint install-rig-backends
 
 all: tools firmware-all modules-all linux-bin
 
@@ -115,6 +115,23 @@ firmware-all:
 tools:
 	@echo "Building tools..."
 	cargo build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
+
+# Symlink rig backend executables into the discovery path used by
+# `fluxor rig …`. Run after `make tools`.
+RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
+RIG_BACKENDS := telemetry-monitor_udp
+install-rig-backends: tools
+	@mkdir -p $(RIG_BACKEND_DIR)
+	@for b in $(RIG_BACKENDS); do \
+		src=$(CURDIR)/target/aarch64-unknown-linux-gnu/release/$$b; \
+		dst=$(RIG_BACKEND_DIR)/$$b; \
+		if [ ! -x "$$src" ]; then \
+			echo "install-rig-backends: $$src not built — run 'make tools' first" >&2; \
+			exit 1; \
+		fi; \
+		ln -snf "$$src" "$$dst"; \
+		echo "install-rig-backends: $$dst -> $$src"; \
+	done
 
 modules: tools
 ifeq ($(TARGET),wasm)

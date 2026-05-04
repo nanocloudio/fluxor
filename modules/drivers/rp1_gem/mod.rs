@@ -656,7 +656,8 @@ unsafe fn poll_tx(s: &mut GemState) {
     if s.in_chan < 0 || s.tx_desc_count == 0 { return; }
     let sys = &*s.syscalls;
 
-    // Reclaim completed TX descriptors
+    // Reclaim completed TX descriptors. Single pass at the top of
+    // the step covers descriptors retired since last poll.
     while s.tx_tail != s.tx_head {
         let idx = (s.tx_tail % s.tx_desc_count) as usize;
         let desc_base = s.tx_desc_addr as usize + idx * 16;
@@ -668,56 +669,66 @@ unsafe fn poll_tx(s: &mut GemState) {
         s.tx_tail = s.tx_tail.wrapping_add(1);
     }
 
-    // Submit new TX frames from input channel
-    let used = s.tx_head.wrapping_sub(s.tx_tail);
-    if used >= s.tx_desc_count {
-        return; // Ring full
+    // Submit new TX frames in a tight loop — one frame per descriptor
+    // until the ring fills, the input channel runs dry, or the
+    // per-step batch limit is reached. Per-step cap matches
+    // `tx_desc_count`: a full ring's worth in one go keeps the MAC's
+    // DMA engine pipelined, after which the tick yields so IP can
+    // process ACKs and rx.
+    let mut started = false;
+    let batch_cap = s.tx_desc_count as u32;
+    let mut emitted: u32 = 0;
+    while emitted < batch_cap {
+        // tx_head can outpace tx_tail by at most tx_desc_count - 1
+        // before a wraparound would clobber a slot the GEM still
+        // owns; re-check on every iteration.
+        let used = s.tx_head.wrapping_sub(s.tx_tail);
+        if used >= s.tx_desc_count {
+            break;
+        }
+
+        let idx = (s.tx_head % s.tx_desc_count) as usize;
+        let buf_idx = s.rx_desc_count as usize + idx;
+        if buf_idx >= s.buf_count as usize { break; }
+        let buf_arm = s.buf_pool_addr as usize + buf_idx * s.buf_size as usize;
+        let buf_dma = buf_arm as u64 + DMA_OFFSET;
+        let buf_ptr = buf_arm as *mut u8;
+
+        // Length-prefixed framing matches the symmetric write path
+        // in the IP module; the loop exits cleanly when the channel
+        // has no header to deliver.
+        let mut hdr = [0u8; 2];
+        let hn = (sys.channel_read)(s.in_chan, hdr.as_mut_ptr(), 2);
+        if hn < 2 { break; }
+        let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
+        if frame_len == 0 || frame_len > MAX_FRAME { break; }
+        let n = (sys.channel_read)(s.in_chan, buf_ptr, frame_len) as i32;
+        if n <= 0 { break; }
+
+        let desc_base = s.tx_desc_addr as usize + idx * 16;
+        write_volatile(desc_base as *mut u32, buf_dma as u32);
+        write_volatile((desc_base + 8) as *mut u32, (buf_dma >> 32) as u32);
+        let mut word1 = (n as u32) & TX_DESC_LEN_MASK;
+        word1 |= TX_DESC_LAST;
+        if idx == (s.tx_desc_count - 1) as usize {
+            word1 |= TX_DESC_WRAP;
+        }
+        write_volatile((desc_base + 4) as *mut u32, word1);
+
+        s.tx_head = s.tx_head.wrapping_add(1);
+        s.tx_packets = s.tx_packets.wrapping_add(1);
+        emitted += 1;
+        started = true;
     }
 
-    let idx = (s.tx_head % s.tx_desc_count) as usize;
-    // TX buffers come from the second half of the buffer pool
-    let buf_idx = s.rx_desc_count as usize + idx;
-    if buf_idx >= s.buf_count as usize { return; }
-    // CPU accesses buffer at ARM physical address; GEM uses DMA address
-    let buf_arm = s.buf_pool_addr as usize + buf_idx * s.buf_size as usize;
-    let buf_dma = buf_arm as u64 + DMA_OFFSET;
-    let buf_ptr = buf_arm as *mut u8;
-
-    // Length-prefixed framing: IP writes [len:u16 LE][frame...].
-    // Read the 2-byte header first, then exactly that many payload bytes.
-    let mut hdr = [0u8; 2];
-    let hn = (sys.channel_read)(s.in_chan, hdr.as_mut_ptr(), 2);
-    if hn < 2 { return; }
-    let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
-    if frame_len == 0 || frame_len > MAX_FRAME { return; }
-    let n = (sys.channel_read)(s.in_chan, buf_ptr, frame_len) as i32;
-    if n <= 0 { return; }
-
-    // Program TX descriptor in GEM format (use DMA addresses)
-    let desc_base = s.tx_desc_addr as usize + idx * 16;
-
-    // Word 0: buffer DMA address low
-    write_volatile(desc_base as *mut u32, buf_dma as u32);
-
-    // Word 2: buffer DMA address high (write before word 1 to avoid race)
-    write_volatile((desc_base + 8) as *mut u32, (buf_dma >> 32) as u32);
-
-    // Word 1: length [13:0], last [15], wrap [30], used=0 (GEM-owned)
-    let mut word1 = (n as u32) & TX_DESC_LEN_MASK;
-    word1 |= TX_DESC_LAST; // single-buffer frame
-    if idx == (s.tx_desc_count - 1) as usize {
-        word1 |= TX_DESC_WRAP;
+    // One STARTTX kick at the end of the batch covers every
+    // descriptor just programmed — the MAC walks the ring once
+    // started, so a single doorbell write per batch suffices.
+    if started {
+        let base = s.gem_base;
+        let ctrl = gem_read(base, GEM_NWCTRL);
+        gem_write(base, GEM_NWCTRL, ctrl | NWCTRL_STARTTX);
     }
-    // Note: used bit (31) is 0 → owned by GEM for transmission
-    write_volatile((desc_base + 4) as *mut u32, word1);
-
-    // Trigger TX start
-    let base = s.gem_base;
-    let ctrl = gem_read(base, GEM_NWCTRL);
-    gem_write(base, GEM_NWCTRL, ctrl | NWCTRL_STARTTX);
-
-    s.tx_head = s.tx_head.wrapping_add(1);
-    s.tx_packets = s.tx_packets.wrapping_add(1);
 }
 
 /// Poll link status. Assumes link up after PHY auto-negotiation settle time.

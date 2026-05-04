@@ -28,18 +28,19 @@ use crate::rig::vocab::{Capability, Surface};
 /// rather than silently timing out at run time.
 ///
 /// Supported:
-///   * any `console.*` capability (matched against the console byte stream)
+///   * any `console.*` capability (matched against the per-source byte stream)
+///   * any `telemetry.*` capability (same byte-stream evaluator; the
+///     transport layer tags incoming bytes with the qualified
+///     `telemetry.<name>` source, which the matcher buckets the same
+///     way it does console bytes)
 ///   * `observe.netboot_fetch` (satisfied by a DeployEvent::ArtifactFetched)
 ///
 /// Not yet supported (need transport attachment + matcher wiring):
-///   * `telemetry.*`
 ///   * `observe.monitor_stream`
 ///   * `observe.usb_enumeration`
 pub fn supports_rule_source(cap: Capability) -> bool {
-    if cap.surface() == Surface::Console {
-        return true;
-    }
-    cap.as_str() == "observe.netboot_fetch"
+    matches!(cap.surface(), Surface::Console | Surface::Telemetry)
+        || cap.as_str() == "observe.netboot_fetch"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

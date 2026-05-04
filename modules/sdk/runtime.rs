@@ -1495,6 +1495,137 @@ unsafe fn dev_mon_session(
     pos
 }
 
+// ============================================================================
+// Per-module telemetry counters (`[<mod>] tlm …`)
+// ============================================================================
+//
+// Modules on a hot path (storage, ip, http, fat32, …) embed `TlmCounters`
+// in their state and bump `bytes_in` / `bytes_out` at every data-flow seam
+// and `bp_steps` whenever a step was held up by a full downstream channel
+// (back-pressure). `idle_steps` is derived at end-of-step using
+// `tlm_idle_if_unchanged` — a step counts as idle only when no bytes
+// moved AND it wasn't a back-pressure step. The two counters are
+// therefore mutually exclusive, so every step lands in exactly one of
+// {data-moved, idle, back-pressured} buckets and the three add up to
+// `dt`. Every `period_steps` ticks `dev_tlm_maybe_emit` formats a
+// single line and resets the deltas:
+//
+//     [<mod>] tlm dt=<step_delta> rx=<bytes> tx=<bytes> idle=<steps> bp=<steps>
+//
+// The host-side rig parser converts to bytes/sec by dividing by
+// `dt * tick_us / 1_000_000`. Deltas (not cumulative totals) avoid u32
+// wraparound at sustained gigabit rates and make rate computation a single
+// subtraction-free divide.
+//
+// Worst-case line length: tag (≤16 chars) + `" tlm "` + 5 fields × `field=4294967295`
+// + 4 separators ≈ 90 chars. Callers should pass a 128-byte scratch buffer.
+
+/// One-line emit budget for a `[<mod>] tlm …` line. Caller-allocated
+/// scratch must be at least this long.
+#[allow(dead_code)]
+pub const TLM_LINE_BUF_SIZE: usize = 128;
+
+/// Per-module hot-path counters. Modules embed this in state and bump
+/// individual fields at data-flow points. `last_emit_step` tracks the
+/// step count at which the previous line was emitted so the helper can
+/// compute the delta. Initialise with `TlmCounters::new()`.
+#[allow(dead_code)]
+pub struct TlmCounters {
+    pub bytes_in: u32,
+    pub bytes_out: u32,
+    pub idle_steps: u32,
+    pub bp_steps: u32,
+    pub last_emit_step: u32,
+}
+
+#[allow(dead_code)]
+impl TlmCounters {
+    pub const fn new() -> Self {
+        Self { bytes_in: 0, bytes_out: 0, idle_steps: 0, bp_steps: 0, last_emit_step: 0 }
+    }
+}
+
+/// Caller-side end-of-step idle accounting. Bumps `idle_steps` iff
+/// the step moved no bytes and didn't bump `bp_steps`. Pass the
+/// `bytes_in / bytes_out / bp_steps` snapshots taken at the top of
+/// `module_step`. Keeps idle and bp mutually exclusive — without
+/// this, a step that polled a full downstream channel was
+/// double-counted as both back-pressured and idle (idle_steps and
+/// bp_steps each → period_steps for a steady-state stalled module).
+#[allow(dead_code)]
+#[inline(always)]
+fn tlm_idle_if_unchanged(
+    tlm: &mut TlmCounters,
+    rx_pre: u32,
+    tx_pre: u32,
+    bp_pre: u32,
+) {
+    if tlm.bytes_in == rx_pre && tlm.bytes_out == tx_pre && tlm.bp_steps == bp_pre {
+        tlm.idle_steps = tlm.idle_steps.wrapping_add(1);
+    }
+}
+
+/// If at least `period_steps` ticks have elapsed since the last emit,
+/// format and emit a `[<prefix>] tlm dt=… rx=… tx=… idle=… bp=…` line
+/// and reset the deltas. Returns the number of bytes written, or 0 if
+/// nothing was emitted (cadence not yet reached) or the scratch buffer
+/// was too small.
+///
+/// `prefix` is the bracketed module tag without trailing space, e.g.
+/// `b"[ip]"` or `b"[nvme]"`. `step_count` is the module's own per-step
+/// monotonic counter (any module that already increments one for
+/// existing periodic logs can reuse it). `scratch` must point to at
+/// least `TLM_LINE_BUF_SIZE` writable bytes.
+#[allow(dead_code)]
+unsafe fn dev_tlm_maybe_emit(
+    sys: &SyscallTable,
+    prefix: &[u8],
+    tlm: &mut TlmCounters,
+    step_count: u32,
+    period_steps: u32,
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
+    if scratch_max < TLM_LINE_BUF_SIZE {
+        return 0;
+    }
+    let dt = step_count.wrapping_sub(tlm.last_emit_step);
+    if dt < period_steps {
+        return 0;
+    }
+
+    let mut pos = 0usize;
+    let mut emit = |bytes: &[u8], pos: &mut usize| {
+        let mut i = 0;
+        while i < bytes.len() && *pos < scratch_max {
+            *scratch.add(*pos) = bytes[i];
+            *pos += 1;
+            i += 1;
+        }
+    };
+
+    emit(prefix, &mut pos);
+    emit(b" tlm dt=", &mut pos);
+    pos += fmt_u32_dec(dt, scratch.add(pos));
+    emit(b" rx=", &mut pos);
+    pos += fmt_u32_dec(tlm.bytes_in, scratch.add(pos));
+    emit(b" tx=", &mut pos);
+    pos += fmt_u32_dec(tlm.bytes_out, scratch.add(pos));
+    emit(b" idle=", &mut pos);
+    pos += fmt_u32_dec(tlm.idle_steps, scratch.add(pos));
+    emit(b" bp=", &mut pos);
+    pos += fmt_u32_dec(tlm.bp_steps, scratch.add(pos));
+
+    dev_log(sys, 3, scratch, pos);
+
+    tlm.bytes_in = 0;
+    tlm.bytes_out = 0;
+    tlm.idle_steps = 0;
+    tlm.bp_steps = 0;
+    tlm.last_emit_step = step_count;
+    pos
+}
+
 /// Allocate `size` bytes of DMA-coherent memory with `align`-byte alignment
 /// from the kernel's non-cacheable DMA arena. Returns the physical address
 /// (== virtual address under identity mapping) or 0 on failure.

@@ -96,7 +96,14 @@ const MODE_CLIENT: u8 = 1;
 struct HttpState {
     syscalls: *const SyscallTable,
     mode: u8,
-    _mode_pad: [u8; 3],
+    /// 0 (default) — downstream is fluxor's `ip` module. `net_send`
+    /// caps each `CMD_SEND` at one MSS so the IP segmenter never
+    /// has to drop data past the effective send window.
+    /// 1 — downstream is `linux_net` (Linux host). Kernel TCP
+    /// handles segmentation, so we ship up to `NET_BUF_SIZE` per
+    /// `CMD_SEND` and amortise the channel-write + syscall cost.
+    host_tcp: u8,
+    _mode_pad: [u8; 2],
 
     // Network channels are shared by both modes (in[0] = net_in,
     // out[0] = net_out). The IP module sees one client per http
@@ -105,9 +112,22 @@ struct HttpState {
     net_out_chan: i32,
     net_buf: [u8; NET_BUF_SIZE],
 
+    /// Monotonic step counter feeding the tlm cadence.
+    step_count: u32,
+    /// Hot-path counters emitted as `[http] tlm dt=… rx=… tx=… idle=… bp=…`
+    /// every `HTTP_TLM_PERIOD` steps. `rx` counts MSG_DATA payload
+    /// bytes drained off `net_in_chan`; `tx` counts response bytes
+    /// pushed onto `net_out_chan` from the send-file / send-response
+    /// paths. `bp` increments when `step_send_file` short-writes.
+    tlm: TlmCounters,
+    tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
+
     server: ServerState,
     client: ClientState,
 }
+
+/// Cadence for the `[http] tlm` line.
+const HTTP_TLM_PERIOD: u32 = 5000;
 
 // ── Parameter schema ───────────────────────────────────────────────────────
 //
@@ -162,6 +182,14 @@ mod params_def {
 
         7, websocket, u8, 0
             => |s, d, len| { s.client.websocket = p_u8(d, len, 0, 0); };
+
+        // 0 (default) = downstream is fluxor's `ip` module — cap each
+        // CMD_SEND at one MSS so the IP segmenter never drops past
+        // cwnd. 1 = downstream is `linux_net` — kernel TCP handles
+        // segmentation, so push the full per-call buffer to amortise
+        // overhead across many MSSes.
+        8, host_tcp, u8, 0
+            => |s, d, len| { s.host_tcp = p_u8(d, len, 0, 0); };
 
         10, route_0_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 0, d, len); };
@@ -311,7 +339,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return -1;
         }
 
-        if s.mode == MODE_CLIENT {
+        s.step_count = s.step_count.wrapping_add(1);
+        let rx_pre = s.tlm.bytes_in;
+        let tx_pre = s.tlm.bytes_out;
+        let bp_pre = s.tlm.bp_steps;
+
+        let rc = if s.mode == MODE_CLIENT {
             if s.client.protocol == 1 {
                 client_h2::step(s)
             } else {
@@ -319,7 +352,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         } else {
             server::step(s)
-        }
+        };
+
+        tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+        let sys = &*s.syscalls;
+        let scratch_ptr = s.tlm_scratch.as_mut_ptr();
+        let scratch_len = s.tlm_scratch.len();
+        dev_tlm_maybe_emit(
+            sys,
+            b"[http]",
+            &mut s.tlm,
+            s.step_count,
+            HTTP_TLM_PERIOD,
+            scratch_ptr,
+            scratch_len,
+        );
+        rc
     }
 }
 
@@ -344,12 +392,32 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
 #[no_mangle]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
+    // net_in / net_out / file_data sized to absorb 8 KiB CMD_SEND
+    // payloads (the staging cap on aarch64) plus a couple of frames
+    // worth of in-flight headroom. Channel writes are all-or-nothing
+    // on the kernel ring, so the buffer must be ≥ the largest single
+    // write the producer ever attempts.
+    //
+    // **aarch64**: 16 KiB net rings + 16 KiB file_data — tracks
+    // `NET_BUF_SIZE = 8192` and gives ~2× pipelined frames.
+    //
+    // **rp2350 / wasm32 / rp2040**: 2 KiB legacy budget; embedded
+    // workloads stage 1600-byte payloads.
+    #[cfg(target_arch = "aarch64")]
+    let net_ring: u32 = 16384;
+    #[cfg(target_arch = "aarch64")]
+    let file_ring: u32 = 16384;
+    #[cfg(not(target_arch = "aarch64"))]
+    let net_ring: u32 = 2048;
+    #[cfg(not(target_arch = "aarch64"))]
+    let file_ring: u32 = 2048;
+
     let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 2048 }, // in[0]: net_in (from IP)
-        ChannelHint { port_type: 0, port_index: 1, buffer_size: 256 },  // in[1]: var updates
-        ChannelHint { port_type: 0, port_index: 2, buffer_size: 2048 }, // in[2]: file data
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 2048 }, // out[0]: net_out (to IP)
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: 256 },  // out[1]: file ctrl
+        ChannelHint { port_type: 0, port_index: 0, buffer_size: net_ring }, // in[0]: net_in (from IP)
+        ChannelHint { port_type: 0, port_index: 1, buffer_size: 256 },      // in[1]: var updates
+        ChannelHint { port_type: 0, port_index: 2, buffer_size: file_ring }, // in[2]: file data
+        ChannelHint { port_type: 1, port_index: 0, buffer_size: net_ring }, // out[0]: net_out (to IP)
+        ChannelHint { port_type: 1, port_index: 1, buffer_size: 256 },      // out[1]: file ctrl
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }

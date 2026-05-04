@@ -266,9 +266,15 @@ struct LinuxNetState {
     net_in: i32,
     net_out: i32,
     conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
-    cmd_buf: [u8; 2048],
-    msg_buf: [u8; 2048],
-    recv_buf: [u8; 1500],
+    /// Sized to absorb a full multi-MSS `CMD_SEND` payload. The
+    /// upstream HTTP module stages up to `NET_BUF_SIZE` bytes per
+    /// call (8 KiB on aarch64); a smaller cmd_buf would silently
+    /// truncate the second `channel_read` and corrupt the next
+    /// frame's header parse. Sized at 16 KiB to leave headroom for
+    /// any future raise in `NET_BUF_SIZE` without re-sync.
+    cmd_buf: [u8; 16384],
+    msg_buf: [u8; 16384],
+    recv_buf: [u8; 16384],
     /// Next slot to consider when allocating a connection. Used to
     /// allocate round-robin instead of "first free", so a slot freed
     /// in step T isn't immediately reused in step T+1 — that race lets
@@ -283,9 +289,9 @@ impl LinuxNetState {
             net_in,
             net_out,
             conns: [LinuxNetConn::EMPTY; LINUX_NET_MAX_CONNS],
-            cmd_buf: [0u8; 2048],
-            msg_buf: [0u8; 2048],
-            recv_buf: [0u8; 1500],
+            cmd_buf: [0u8; 16384],
+            msg_buf: [0u8; 16384],
+            recv_buf: [0u8; 16384],
             // Skip slot 0 in initial rotation — it's almost always the
             // TCP listener bound by the first CMD_BIND.
             next_alloc: 1,
@@ -820,6 +826,44 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
             libc::SOL_SOCKET,
             libc::SO_KEEPALIVE,
             &one as *const i32 as *const libc::c_void,
+            4,
+        );
+
+        // TCP_NODELAY disables Nagle's algorithm, which would
+        // otherwise hold small sends until either the kernel ACKs the
+        // previous outbound packet or a 200 ms timer fires. Fluxor
+        // already does its own segmentation/coalescing per `CMD_SEND`,
+        // so Nagle only adds latency. With NODELAY the throughput
+        // ceiling is set by `SO_SNDBUF` instead.
+        libc::setsockopt(
+            client_fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &one as *const i32 as *const libc::c_void,
+            4,
+        );
+        // SO_SNDBUF and SO_RCVBUF: 1 MiB each. The kernel default of
+        // 16 KiB on `tcp_wmem` (sysctl) was chosen for memory-constrained
+        // hosts and creates a tight per-segment ACK loop on loopback —
+        // each `send()` blocks at the 16 KiB watermark and the
+        // application waits for the receiver to drain. 1 MiB keeps
+        // the pipe full across one HTTP response (the synth-source
+        // workload pushes 1 MiB at a time). Linux clamps this against
+        // `wmem_max` / `rmem_max`; if the sysctl is lower, the kernel
+        // silently caps without erroring.
+        let buf_bytes: i32 = 1 << 20; // 1 MiB
+        libc::setsockopt(
+            client_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_bytes as *const i32 as *const libc::c_void,
+            4,
+        );
+        libc::setsockopt(
+            client_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_bytes as *const i32 as *const libc::c_void,
             4,
         );
         let idle_secs: i32 = 15;

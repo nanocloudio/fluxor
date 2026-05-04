@@ -41,12 +41,11 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    decode_config, generate_config_with_caps, ConfigBuilder, ModuleCaps, EXAMPLES,
+    decode_config, generate_config_ext, generate_config_with_caps, ConfigBuilder, ModuleCaps,
+    EXAMPLES,
 };
 use crate::error::{Error, Result};
-use crate::modules::{
-    build_module_table, pack_fmod, parse_modules_from_config, parse_modules_from_config_multi,
-};
+use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config_multi};
 use crate::monitor::cmd_monitor_dispatch;
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
@@ -959,10 +958,17 @@ fn cmd_combine(
         ));
     }
 
-    // Parse modules first (needed for in_place_safe caps in config generation)
+    // Parse modules first (needed for in_place_safe caps in config generation).
+    // External-app configs (e.g. zedex) live outside fluxor's modules/ tree
+    // and either declare `module_search_paths:` or rely on the implicit
+    // `<config-parent>/../modules` default — same mechanism the linux build
+    // path uses (`cmd_generate`). Without this, fan modules like
+    // media_loader fail port-name resolution.
     let modules_dir_path = format!("target/{}/modules", target_desc.id);
     let modules_dir = std::path::Path::new(&modules_dir_path);
-    let modules = parse_modules_from_config(&config, modules_dir)?;
+    let search_paths = config::extract_module_search_paths(&config, config_path);
+    let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
+    let modules = parse_modules_from_config_multi(&config, modules_dir, &extra_dirs)?;
 
     // Build module caps for buffer aliasing and manifest validation
     let caps: Vec<ModuleCaps> = modules
@@ -977,11 +983,12 @@ fn cmd_combine(
 
     // Generate config binary (with module capabilities for chain detection)
     let builder = ConfigBuilder::new();
-    let config_data = generate_config_with_caps(
+    let config_data = generate_config_ext(
         &config,
         &builder,
         &caps,
         modules_dir,
+        &extra_dirs,
         target_desc.max_pin + 1,
         target_desc.pio_count,
     )?;

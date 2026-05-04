@@ -188,20 +188,36 @@ pub fn cmd_monitor(port: &str, _baud: u32, refresh_ms: u64) -> Result<()> {
     Ok(())
 }
 
-/// Consume MON_* lines from UDP netconsole datagrams. Each datagram may
-/// carry multiple newline-framed log lines (the device batches them).
-pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
+/// Bind a UDP listener for kernel-side `log_net` datagrams.
+///
+/// `bind_spec` accepts either a `host:port` string or a leading-colon
+/// `:port` shorthand (binds `0.0.0.0:<port>`). `read_timeout` is
+/// applied so the caller's loop wakes periodically for cooperative
+/// idle work (rendering a dashboard, polling for shutdown, etc.); pass
+/// `None` to block indefinitely on `recv_from`.
+pub fn bind_udp_listener(
+    bind_spec: &str,
+    read_timeout: Option<Duration>,
+) -> Result<std::net::UdpSocket> {
     use std::net::UdpSocket;
-    let normalized = if bind.starts_with(':') {
-        format!("0.0.0.0{}", bind)
+    let normalized = if bind_spec.starts_with(':') {
+        format!("0.0.0.0{}", bind_spec)
     } else {
-        bind.to_string()
+        bind_spec.to_string()
     };
     let sock = UdpSocket::bind(&normalized)
         .map_err(|e| Error::Config(format!("bind {}: {}", normalized, e)))?;
-    sock.set_read_timeout(Some(Duration::from_millis(refresh_ms)))
-        .ok();
-    eprintln!("fluxor monitor: listening on {} (UDP)", normalized);
+    if let Some(t) = read_timeout {
+        sock.set_read_timeout(Some(t)).ok();
+    }
+    Ok(sock)
+}
+
+/// Consume MON_* lines from UDP netconsole datagrams. Each datagram may
+/// carry multiple newline-framed log lines (the device batches them).
+pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
+    let sock = bind_udp_listener(bind, Some(Duration::from_millis(refresh_ms)))?;
+    eprintln!("fluxor monitor: listening on {} (UDP)", sock.local_addr().map_or_else(|_| bind.to_string(), |a| a.to_string()));
 
     let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
     let mut last_render = Instant::now();

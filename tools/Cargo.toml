@@ -10,10 +10,18 @@ description = "Host-side tools for Fluxor firmware configuration"
 name = "fluxor"
 path = "src/main.rs"
 
-# Library target — gives integration tests under `tools/tests/`
-# access to individual tool modules (manifest parsing, for the
-# schema-layout assertions). `src/main.rs` remains the CLI entry
-# point; `src/lib.rs` re-exports a curated subset.
+# Rig backend executables. Discovered by name (`<surface>-<name>`)
+# on the rig backend search path; the Makefile's `install-rig-backends`
+# target symlinks them into `$XDG_DATA_HOME/fluxor/backends/` after a
+# release build.
+[[bin]]
+name = "telemetry-monitor_udp"
+path = "src/bin/telemetry_monitor_udp.rs"
+
+# Library target — gives integration tests under `tools/tests/` and
+# the auxiliary backend binaries under `src/bin/` access to individual
+# tool modules. `src/main.rs` remains the CLI entry point;
+# `src/lib.rs` re-exports a curated subset.
 [lib]
 name = "fluxor_tools"
 path = "src/lib.rs"

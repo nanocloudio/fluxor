@@ -27,6 +27,22 @@ pub(crate) const NET_CMD_CONNECT: u8 = 0x13;
 /// Scratch buffer size for assembling outbound and reading inbound
 /// frames. Must be ≥ the IP module's largest single MSG_DATA payload
 /// (linux_net writes up to 1500 + framing) — otherwise channel reads
-/// truncate mid-MSG and h2 frame parsing breaks. 1600 = 1500 TCP read
-/// budget + 4 MSG header + slack.
+/// truncate mid-MSG and h2 frame parsing breaks.
+///
+/// Also caps the per-`net_send` outbound payload (one CMD_SEND
+/// header + one conn_id + N data bytes). The IP module segments
+/// internally on receipt, so a single 8 KiB CMD_SEND emits up to
+/// 5 × MSS-sized TCP segments per IP step — gigabit-class
+/// throughput on a single connection.
+///
+/// **aarch64** — 8 KiB. Lets `net_send` push up to ~5 MSS-worth of
+/// payload per call, multiplying per-tick segment output by ~5×
+/// over the embedded path.
+///
+/// **rp2350 / rp2040 / wasm32** — 1600 (legacy). Embedded targets
+/// rarely sustain MSS-class flows, and a 1600-byte stack buffer
+/// fits inside the constrained per-step budget.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const NET_BUF_SIZE: usize = 8192;
+#[cfg(not(target_arch = "aarch64"))]
 pub(crate) const NET_BUF_SIZE: usize = 1600;

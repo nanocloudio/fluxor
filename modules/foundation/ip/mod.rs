@@ -167,7 +167,21 @@ pub struct IpState {
     /// itself through the log path.
     bcast_warned: bool,
     _bcast_pad: [u8; 3],
+
+    /// Hot-path counters emitted as `[ip] tlm dt=… rx=… tx=… idle=… bp=…`
+    /// every `IP_TLM_PERIOD` steps. `rx`/`tx` are ethernet-frame bytes
+    /// (length prefix excluded for rx, included for tx since that's what
+    /// hits the channel). `idle` counts steps where no frame moved either
+    /// way; `bp` counts steps where `send_frame` couldn't flush because
+    /// `out_chan` was full.
+    tlm: TlmCounters,
+    /// One-line scratch for the tlm emit, sized at `TLM_LINE_BUF_SIZE`.
+    tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
 }
+
+/// Cadence for the `[ip] tlm` line — every 5000 module steps.
+/// At `tick_us=1000` that's 5 s; at `tick_us=100` it's 500 ms.
+const IP_TLM_PERIOD: u32 = 5000;
 
 // ============================================================================
 // Parameter Definitions
@@ -515,8 +529,10 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
             let plen = s.pending_tx_len as usize;
             (sys.channel_write)(s.out_chan, s.pending_tx_buf.as_ptr(), plen);
             s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
+            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(plen as u32);
             s.pending_tx_len = 0;
         } else {
+            s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
             return; // still full; drop new frame — TCP will retransmit
         }
     }
@@ -532,8 +548,10 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
     if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
         (sys.channel_write)(s.out_chan, pbuf, total);
         s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
+        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(total as u32);
     } else {
         s.pending_tx_len = total as u16;
+        s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
     }
 }
 
@@ -629,6 +647,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut IpState);
     s.step_count = s.step_count.wrapping_add(1);
 
+    // Snapshot rx/tx/bp counters so we can decide at end-of-step
+    // whether *anything* moved (= work happened) or this was an
+    // idle tick. Cheaper than threading a `did_work` flag through
+    // every helper.
+    let rx_pre = s.tlm.bytes_in;
+    let tx_pre = s.tlm.bytes_out;
+    let bp_pre = s.tlm.bp_steps;
+
     // 0a. Flush any pending TX frame from previous step.
     if s.pending_tx_len > 0 && s.out_chan >= 0 {
         let sys = &*s.syscalls;
@@ -722,6 +748,19 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         step_tcp_timers(s);
     }
 
+    // Tally idle steps and emit the periodic `[ip] tlm …` line.
+    // "Idle" excludes back-pressure steps (so idle + bp + active = dt)
+    // and excludes pure-timer steps (DHCP/ARP/TCP timer fired but no
+    // data moved), which is what we want for the bottleneck view: the
+    // question is whether the data path is starved.
+    tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+    {
+        let sys = &*s.syscalls;
+        let scratch_ptr = s.tlm_scratch.as_mut_ptr();
+        let scratch_len = s.tlm_scratch.len();
+        dev_tlm_maybe_emit(sys, b"[ip]", &mut s.tlm, s.step_count, IP_TLM_PERIOD, scratch_ptr, scratch_len);
+    }
+
     // Signal Ready once IP is configured (DHCP bound or static)
     if s.ip_configured && !s.signaled_ready {
         s.signaled_ready = true;
@@ -734,11 +773,31 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
+    // Channel ring sizes are the per-tick burst budget for the IP
+    // pipeline. Default 2-4 KiB caps single-connection throughput
+    // at ~1-2 MSS / step; gigabit-class workloads need 8-16 KiB so
+    // the segmentation loop in NET_CMD_SEND can stage many MSS
+    // frames per step before back-pressuring the producer.
+    //
+    // **aarch64**: 32 KiB ETH rings (~21 MSS) + 16 KiB net rings
+    // (matches http's per-call stage). Roughly 1-cycle of cwnd at
+    // 1 ms RTT.
+    //
+    // **rp2350 / rp2040 / wasm32**: legacy 4 / 2 KiB.
+    #[cfg(target_arch = "aarch64")]
+    let eth_ring: u32 = 32768;
+    #[cfg(target_arch = "aarch64")]
+    let net_ring: u32 = 16384;
+    #[cfg(not(target_arch = "aarch64"))]
+    let eth_ring: u32 = 4096;
+    #[cfg(not(target_arch = "aarch64"))]
+    let net_ring: u32 = 2048;
+
     let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 4096 }, // in[0]: RX ethernet frames
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 4096 }, // out[0]: TX ethernet frames
-        ChannelHint { port_type: 0, port_index: 1, buffer_size: 2048 }, // in[1]: net commands from consumer
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: 2048 }, // out[1]: net messages to consumer
+        ChannelHint { port_type: 0, port_index: 0, buffer_size: eth_ring }, // in[0]: RX ethernet frames
+        ChannelHint { port_type: 1, port_index: 0, buffer_size: eth_ring }, // out[0]: TX ethernet frames
+        ChannelHint { port_type: 0, port_index: 1, buffer_size: net_ring }, // in[1]: net commands from consumer
+        ChannelHint { port_type: 1, port_index: 1, buffer_size: net_ring }, // out[1]: net messages to consumer
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }
@@ -762,8 +821,12 @@ unsafe fn process_rx_frames(s: &mut IpState) {
     if s.in_chan < 0 { return; }
     let sys = &*s.syscalls;
 
+    // Drain up to 32 RX frames per IP step. A fast peer can deliver
+    // 8-16 ACKs per millisecond on a gigabit link, and the
+    // cwnd-growth feedback loop needs each one promptly to keep
+    // the segmentation path supplied with credit.
     let mut count = 0;
-    while count < 4 {
+    while count < 32 {
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 { break; }
 
@@ -776,6 +839,7 @@ unsafe fn process_rx_frames(s: &mut IpState) {
         let r = (sys.channel_read)(s.in_chan, s.rx_frame.as_mut_ptr(), frame_len) as i32;
         if r <= 0 { break; }
 
+        s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(r as u32);
         process_frame(s, r as usize);
         count += 1;
     }
@@ -1043,7 +1107,7 @@ unsafe fn process_tcp_segment(
                     conn.rcv_nxt = tcp_hdr.seq_num.wrapping_add(1);
                     conn.snd_wnd = tcp_hdr.window;
                     conn.rcv_wnd = tcp::INITIAL_RCV_WND;
-                    conn.cwnd = tcp::MSS;
+                    conn.cwnd = tcp::INITIAL_CWND;
                     conn.ssthresh = 0xFFFF;
                     conn.rto = tcp::RTO_INITIAL;
                     conn.retransmit_timer = 0;
@@ -1800,12 +1864,20 @@ unsafe fn service_net_channels(s: &mut IpState) {
     if s.net_in_chan < 0 { return; }
     let sys = &*s.syscalls;
 
-    // Process up to 4 commands per step.
-    // Skip channel_poll — it returns wrong results from PIC modules on aarch64.
-    // ip_net_read_frame returns (0,0) when the channel is empty.
+    // Process up to 32 commands per step. Producers (http, etc.)
+    // stage many MSS-sized CMD_SENDs in a single tick; a small batch
+    // limit caps single-connection throughput at one MSS per command.
+    // 32 sits well below the burst-iteration limit on aarch64 yet is
+    // enough to keep the back-pressure point past gigabit saturation.
+    //
+    // `buf` must be ≥ the largest single CMD_SEND payload (NET_BUF_SIZE
+    // + framing). `ip_net_read_frame` caps the second `channel_read`
+    // at `buf_max - NET_FRAME_HDR`; an undersized buffer truncates the
+    // payload and leaves the tail in the kernel ring, where it
+    // corrupts the next frame's header parse.
     let mut count = 0;
-    while count < 4 {
-        let mut buf = [0u8; 580]; // enough for MTU payload
+    while count < 32 {
+        let mut buf = [0u8; 4096];
         let (msg_type, payload_len) = ip_net_read_frame(sys, s.net_in_chan, buf.as_mut_ptr(), buf.len());
         if msg_type == 0 {
             break;
@@ -1894,25 +1966,49 @@ unsafe fn service_net_channels(s: &mut IpState) {
             NET_CMD_SEND => {
                 // Stream Surface v1: send TCP payload.
                 // Payload: [conn_id: u8] [data...].
+                //
+                // A single CMD_SEND can carry many MSS of data — the
+                // caller stages up to `net_buf` worth at a time. Split
+                // into MSS-sized TCP segments and emit each one while
+                // the effective send window has room.
                 if plen >= 2 {
                     let conn_id = *buf.as_ptr() as usize;
-                    let data_ptr = buf.as_ptr().add(1);
-                    let data_len = plen - 1;
+                    let mut data_off = 1usize;
+                    let total_len = plen;
 
                     if conn_id < tcp::MAX_TCP_CONNS {
-                        let conn = &*s.tcp_conns.as_ptr().add(conn_id);
-                        if conn.state == tcp::TcpState::Established && conn.rcv_wnd != 0 {
-                            // Effective window is min(peer snd_wnd, cwnd).
-                            let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
-                            let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
-                            let can_send = eff_wnd.saturating_sub(in_flight).min(1400);
-                            let send_len = data_len.min(can_send);
-                            if send_len > 0 {
+                        // Skip the whole CMD_SEND payload if the conn
+                        // isn't Established or rcv_wnd is zero — TCP
+                        // would otherwise mis-sequence it.
+                        let active = {
+                            let conn = &*s.tcp_conns.as_ptr().add(conn_id);
+                            conn.state == tcp::TcpState::Established && conn.rcv_wnd != 0
+                        };
+                        if active {
+                            while data_off < total_len {
+                                let conn = &*s.tcp_conns.as_ptr().add(conn_id);
+                                let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
+                                let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+                                let avail_wnd = eff_wnd.saturating_sub(in_flight);
+                                if avail_wnd == 0 {
+                                    // Window exhausted: drop the
+                                    // remainder rather than queue it.
+                                    // The caller is responsible for
+                                    // pacing against ACKs; partial
+                                    // delivery is preferable to
+                                    // mis-sequencing the stream.
+                                    break;
+                                }
+                                let chunk = (total_len - data_off)
+                                    .min(tcp::MSS as usize)
+                                    .min(avail_wnd);
+                                if chunk == 0 { break; }
                                 let seq = conn.snd_nxt;
                                 let tick = s.step_count as u16;
-                                send_tcp_data(s, conn_id, data_ptr, send_len);
+                                send_tcp_data(s, conn_id, buf.as_ptr().add(data_off), chunk);
                                 let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
                                 tcp::rtt_arm(conn2, seq, tick);
+                                data_off += chunk;
                             }
                         }
                     }

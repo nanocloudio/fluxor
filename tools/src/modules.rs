@@ -218,100 +218,6 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Parse modules from config YAML/JSON
-///
-/// Modules can be specified as:
-///   - Just a name: `- format` (looks in modules_dir)
-///   - Object with name: `- name: format`
-pub fn parse_modules_from_config(
-    config: &serde_json::Value,
-    modules_dir: &Path,
-) -> Result<Vec<ModuleInfo>> {
-    let mut modules = Vec::new();
-
-    if let Some(modules_array) = config["modules"].as_array() {
-        // Track which module types we've already loaded (avoid duplicates)
-        let mut loaded_types = std::collections::HashSet::new();
-
-        for module_entry in modules_array {
-            // Get module name - either string directly or from "name" field
-            let module_name = if let Some(name) = module_entry.as_str() {
-                // Simple form: `- format`
-                name.to_string()
-            } else if let Some(name) = module_entry["name"].as_str() {
-                // Object form: `- name: format`
-                name.to_string()
-            } else {
-                return Err(Error::Module(
-                    "Module entry must be a name string or object with 'name' field".into(),
-                ));
-            };
-
-            // Use "type" field for .fmod lookup if present, otherwise use "name"
-            let module_type = module_entry["type"].as_str().unwrap_or(&module_name);
-
-            // Skip if we've already loaded this module type
-            if !loaded_types.insert(module_type.to_string()) {
-                continue;
-            }
-
-            // Build path: modules_dir/<type>.fmod
-            let module_path = modules_dir.join(format!("{}.fmod", module_type));
-
-            if !module_path.exists() {
-                // Check if this is a built-in module (no .fmod needed)
-                if is_builtin_module(module_type) {
-                    continue;
-                }
-                return Err(Error::Module(format!(
-                    "Module '{}' (type '{}') not found at: {}\nRun 'make pack-modules' to build modules.",
-                    module_name,
-                    module_type,
-                    module_path.display()
-                )));
-            }
-
-            let module_info = ModuleInfo::from_file(&module_path)?;
-            modules.push(module_info);
-        }
-    } else if let Some(modules_map) = config["modules"].as_object() {
-        // Track which module types we've already loaded (avoid duplicates)
-        let mut loaded_types = std::collections::HashSet::new();
-
-        for (instance_name, module_def) in modules_map {
-            // Use the "type" field to find the .fmod file, falling back to instance name
-            let module_type = module_def["type"]
-                .as_str()
-                .unwrap_or(instance_name.as_str());
-
-            // Skip if we've already loaded this module type
-            if !loaded_types.insert(module_type.to_string()) {
-                continue;
-            }
-
-            let module_path = modules_dir.join(format!("{}.fmod", module_type));
-
-            if !module_path.exists() {
-                // Check if this is a built-in module (no .fmod needed)
-                if is_builtin_module(module_type) {
-                    continue;
-                }
-                return Err(Error::Module(format!(
-                    "Module '{}' (type '{}') not found at: {}\nRun 'make pack-modules' to build modules.",
-                    instance_name,
-                    module_type,
-                    module_path.display()
-                )));
-            }
-
-            let module_info = ModuleInfo::from_file(&module_path)?;
-            modules.push(module_info);
-        }
-    }
-
-    Ok(modules)
-}
-
 /// Check if a module type is a kernel built-in (has `builtin = true` in its manifest).
 /// Built-in modules don't have .fmod files — they're compiled into the kernel binary.
 fn is_builtin_module(module_type: &str) -> bool {
@@ -341,7 +247,12 @@ fn resolve_fmod(
     None
 }
 
-/// Like `parse_modules_from_config` but searches multiple directories.
+/// Parse modules from config YAML/JSON, resolving each `.fmod` against
+/// `modules_dir` first and then falling back to `extra_dirs` in order.
+///
+/// Modules can be specified as:
+///   - Just a name: `- format` (looks in modules_dir)
+///   - Object with name: `- name: format`
 pub fn parse_modules_from_config_multi(
     config: &serde_json::Value,
     modules_dir: &Path,

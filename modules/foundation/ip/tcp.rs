@@ -144,7 +144,7 @@ impl TcpConn {
             iss: 0,
             retransmit_timer: 0,
             timewait_timer: 0,
-            cwnd: MSS,
+            cwnd: INITIAL_CWND,
             ssthresh: 0xFFFF,
             dup_ack_count: 0,
             in_recovery: false,
@@ -170,10 +170,32 @@ impl TcpConn {
 /// Path MSS used for cwnd accounting (conservative lower bound below Ethernet MTU).
 pub const MSS: u16 = 1460;
 
+/// Initial congestion window. RFC 6928 raised the initial cwnd from
+/// 1 segment (the historical RFC 2581 value) to ~10 MSS (≈14 KB) so
+/// short flows can fill a typical residential BDP within one RTT
+/// instead of slow-start-clipping the first ~100 ms of every
+/// connection. Linux uses this default since 3.0; matching it
+/// brings sub-RTT HTTP responses into the same ballpark.
+pub const INITIAL_CWND: u16 = 10 * MSS;
+
 /// Starting receive window. Grows dynamically up to MAX_RCV_WND.
 pub const INITIAL_RCV_WND: u16 = 2048;
 
-/// Upper bound on the advertised receive window.
+/// Upper bound on the advertised receive window. Bounds how many bytes
+/// the peer may have in flight to us.
+///
+/// **aarch64** — 32 KiB. Tracks BDP at 1 Gb/s × ~250 µs RTT (intra-LAN
+/// to a DUT). Stays under u16::MAX so we don't need TCP window scaling
+/// (RFC 1323), and is comfortably above the existing 8 KiB
+/// `CHANNEL_BUFFER_SIZE` so `update_rcv_wnd`'s self-throttle still
+/// keeps in-flight bounded by consumer-drain rate.
+///
+/// **rp2350 / rp2040 / wasm32** — 8 KiB. Original embedded budget;
+/// bumping further would inflate per-`TcpConn` reorder bookkeeping
+/// past the 16 KiB stack budget.
+#[cfg(target_arch = "aarch64")]
+pub const MAX_RCV_WND: u16 = 32768;
+#[cfg(not(target_arch = "aarch64"))]
 pub const MAX_RCV_WND: u16 = 8192;
 
 /// Initial retransmission timeout in step ticks (≈1 s at 1 kHz).
@@ -183,8 +205,33 @@ pub const RTO_INITIAL: u16 = 1000;
 pub const RTO_MIN: u16 = 200;
 pub const RTO_MAX: u16 = 6000;
 
-/// Maximum TCP connections
-pub const MAX_TCP_CONNS: usize = 8;
+/// Maximum TCP connections (incl. LISTEN, ESTABLISHED, FIN_WAIT_*,
+/// TIME_WAIT). Each `TcpConn` is ~2.1 KiB (reorder_buf dominates),
+/// so the scale lives in three target tiers.
+///
+/// **aarch64 (bcm2712 bare-metal, host-linux on Pi 5)** — 1024 slots
+/// (~2.1 MiB). Comfortable on 8/16 GiB hosts; leaves ample headroom
+/// for browser-class workloads (Chrome opens 6 parallel conns per
+/// origin, page reloads race, long-running WS keep slots, TIME_WAIT
+/// holds 30 s of recently-closed conns). Sub-Linux somaxconn (default
+/// 4096) but well above any single-app scenario we run.
+///
+/// **wasm32 (browser host)** — 256 slots (~540 KiB). Browser
+/// linear-memory budgets are looser than embedded but tighter than
+/// host RAM; 256 covers every realistic in-browser workload.
+///
+/// **thumbv6m / thumbv7m / thumbv8m (rp2040 / rp2350)** — 16 slots.
+/// rp2350's 32 KiB buffer arena and rp2040's 16 KiB constrain the
+/// per-module state heap; 16 × 2.1 KiB ≈ 34 KiB of conn state is
+/// already a stretch on those targets, but it's enough for the
+/// embedded use cases (a single client at a time, perhaps with a
+/// monitoring conn).
+#[cfg(target_arch = "aarch64")]
+pub const MAX_TCP_CONNS: usize = 1024;
+#[cfg(target_arch = "wasm32")]
+pub const MAX_TCP_CONNS: usize = 256;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+pub const MAX_TCP_CONNS: usize = 16;
 
 /// Parsed TCP header
 pub struct TcpHeader {
