@@ -46,6 +46,7 @@ fn add_module(cfg: &mut Config, idx: usize, id: u8, name_hash: u32) {
         name_hash,
         id,
         domain_id: 0,
+        frame_kind: 0,
         params_ptr: core::ptr::null(),
         params_len: 0,
     });
@@ -61,6 +62,7 @@ fn add_edge(cfg: &mut Config, idx: usize, from_id: u8, from_port: u8, to_id: u8,
         to_port_index: to_port,
         buffer_group: 0,
         edge_class: EdgeClass::Local,
+        buffer_bytes: 0,
     });
     cfg.edge_count = cfg.edge_count.max(idx as u8 + 1);
 }
@@ -209,4 +211,25 @@ fn direct_edge_shares_handle_on_both_ports() {
         sched.edges[0].consumer_channel, -1,
         "single-domain direct edge should not have a separate consumer channel",
     );
+}
+
+/// `port_frame_kind_from_content_type` maps the manifest content_type
+/// byte to a fan frame kind. The two values worth pinning are
+/// `EthernetFrame` (NIC ↔ IP) and `NetProto` (IP/TLS ↔ consumers) —
+/// when a module manifest carries either on a fanned port, the
+/// inserted tee/merge MUST run in frame-aware mode. Anything else
+/// remains raw byte-stream forwarding.
+#[test]
+fn content_type_byte_maps_to_expected_frame_kind() {
+    use fluxor::kernel::scheduler::module_types::{
+        CONTENT_TYPE_ETHERNET_FRAME, CONTENT_TYPE_NET_PROTO, FRAME_KIND_ETH, FRAME_KIND_NET,
+        FRAME_KIND_NONE,
+    };
+    use fluxor::kernel::scheduler::port_frame_kind_from_content_type as map_kind;
+
+    assert_eq!(map_kind(CONTENT_TYPE_ETHERNET_FRAME), FRAME_KIND_ETH);
+    assert_eq!(map_kind(CONTENT_TYPE_NET_PROTO), FRAME_KIND_NET);
+    // OctetStream (0) and any unrecognised byte fall through to NONE.
+    assert_eq!(map_kind(0), FRAME_KIND_NONE);
+    assert_eq!(map_kind(255), FRAME_KIND_NONE);
 }

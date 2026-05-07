@@ -126,6 +126,12 @@ pub struct Edge {
     pub buffer_group: u8,
     /// Edge class metadata (Local, DmaOwned, CrossCore). Pure metadata on single-core.
     pub edge_class: crate::kernel::config::EdgeClass,
+    /// Per-edge ring-buffer size override in bytes (from
+    /// `wiring[i].buffer_bytes` in the YAML config). `0` defers to
+    /// `module_channel_hints`; non-zero is combined with module hints
+    /// via `max(...)` in `open_channels`. See
+    /// `kernel::config::GraphEdge::buffer_bytes`.
+    pub buffer_bytes: u32,
 }
 
 impl Edge {
@@ -147,6 +153,7 @@ impl Edge {
             to_port_index: 0,
             buffer_group: 0,
             edge_class: crate::kernel::config::EdgeClass::Local,
+            buffer_bytes: 0,
         }
     }
 
@@ -170,6 +177,7 @@ impl Edge {
             to_port_index,
             buffer_group: 0,
             edge_class: crate::kernel::config::EdgeClass::Local,
+            buffer_bytes: 0,
         }
     }
 
@@ -240,23 +248,18 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         &(*p).hints
     };
 
-    // Pre-scan: compute max buffer size per group across all edges.
-    // This ensures the channel is large enough for the most demanding
-    // consumer (e.g. I2S requiring exactly 2048 bytes).
-    let mut group_max_size: [u32; 128] = [0; 128];
-    for edge in edges.iter() {
-        let group = edge.buffer_group as usize;
-        if group == 0 || group >= 128 {
-            continue;
-        }
-
+    // Resolve the per-edge buffer-size signal. Combines the
+    // producer/consumer `module_channel_hints` with the YAML
+    // `buffer_bytes` override via `max(...)` — module hints express
+    // a per-port-type minimum, the YAML field expresses a graph-
+    // level bandwidth requirement, so the larger always wins.
+    let edge_min_size = |edge: &Edge| -> u32 {
         let from_hints = &module_hints[edge.from_module];
         let from_size = find_hint_for_port(
             &from_hints.hints[..from_hints.count],
             1, // port_type = out
             edge.from_port_index,
         );
-
         let to_hints = &module_hints[edge.to_module];
         let to_port_type = if edge.is_ctrl() { 2 } else { 0 };
         let to_size = find_hint_for_port(
@@ -264,8 +267,20 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             to_port_type,
             edge.to_port_index,
         );
+        from_size.max(to_size).max(edge.buffer_bytes)
+    };
 
-        let edge_max = from_size.max(to_size);
+    // Pre-scan: compute max buffer size per group across all edges.
+    // This ensures the shared channel is large enough for the most
+    // demanding consumer (e.g. I2S requiring exactly 2048 bytes) and
+    // for any sized YAML override on a member edge.
+    let mut group_max_size: [u32; 128] = [0; 128];
+    for edge in edges.iter() {
+        let group = edge.buffer_group as usize;
+        if group == 0 || group >= 128 {
+            continue;
+        }
+        let edge_max = edge_min_size(edge);
         if edge_max > group_max_size[group] {
             group_max_size[group] = edge_max;
         }
@@ -292,27 +307,11 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         }
 
         // Determine buffer size: grouped edges use pre-computed max,
-        // ungrouped edges use per-edge hint lookup.
+        // ungrouped edges use the same combined signal directly.
         let buf_size = if group > 0 && group < 128 && group_max_size[group] > 0 {
             group_max_size[group]
         } else {
-            let from_hints = &module_hints[edge.from_module];
-            let hint_size = find_hint_for_port(
-                &from_hints.hints[..from_hints.count],
-                1, // port_type = out
-                edge.from_port_index,
-            );
-            if hint_size > 0 {
-                hint_size
-            } else {
-                let to_hints = &module_hints[edge.to_module];
-                let to_port_type = if edge.is_ctrl() { 2 } else { 0 };
-                find_hint_for_port(
-                    &to_hints.hints[..to_hints.count],
-                    to_port_type,
-                    edge.to_port_index,
-                )
-            }
+            edge_min_size(edge)
         };
 
         let producer_mod = edge.from_module as u8;
@@ -517,7 +516,7 @@ impl NameArena {
 // Module Slots
 // ============================================================================
 
-mod module_types;
+pub mod module_types;
 pub use module_types::{BuiltInModule, DummyModule, MergeModule, ModuleSlot, TeeModule};
 
 // ============================================================================
@@ -1673,6 +1672,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
             );
             e.buffer_group = edge.buffer_group;
             e.edge_class = edge.edge_class;
+            e.buffer_bytes = edge.buffer_bytes;
             edges[i] = e;
         } else {
             log::error!("[graph] edge {} missing", i);
@@ -1687,6 +1687,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         &mut runtime_edge_count,
         &mut module_list,
         &mut module_count,
+        loader,
     ) {
         return Err(-1);
     }
@@ -1695,6 +1696,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         &mut runtime_edge_count,
         &mut module_list,
         &mut module_count,
+        loader,
     ) {
         return Err(-1);
     }
@@ -1872,6 +1874,7 @@ fn push_internal_module(
     module_count: &mut usize,
     name_hash: u32,
     domain_id: u8,
+    frame_kind: u8,
 ) -> Option<usize> {
     if *module_count >= MAX_MODULES {
         log::error!("No room for internal module");
@@ -1883,6 +1886,7 @@ fn push_internal_module(
         name_hash,
         id: idx as u8,
         domain_id,
+        frame_kind,
         params_ptr: core::ptr::null(),
         params_len: 0,
     });
@@ -1908,6 +1912,61 @@ fn is_internal_module(entry: &ModuleEntry) -> bool {
 enum FanDirection {
     Out,
     In,
+}
+
+/// Map a port's manifest `content_type` byte to a `FRAME_KIND_*`
+/// discriminant. Auto-inserted tee/merge fans must not split frames
+/// mid-payload — the consumer parser would read the body tail as a
+/// bogus header — so when this returns a non-NONE kind the fan
+/// switches to frame-aware transfer (peek length, drain full frame,
+/// write atomically to all outputs).
+pub fn port_frame_kind_from_content_type(content_type: u8) -> u8 {
+    use module_types::{
+        CONTENT_TYPE_ETHERNET_FRAME, CONTENT_TYPE_NET_PROTO, FRAME_KIND_ETH, FRAME_KIND_NET,
+        FRAME_KIND_NONE,
+    };
+    match content_type {
+        CONTENT_TYPE_ETHERNET_FRAME => FRAME_KIND_ETH,
+        CONTENT_TYPE_NET_PROTO => FRAME_KIND_NET,
+        _ => FRAME_KIND_NONE,
+    }
+}
+
+/// Convert a `FanDirection` + ctrl bit into the manifest direction
+/// byte (0=input, 1=output, 2=ctrl_input). Mirrors the encoding
+/// produced by the manifest packer in `tools/src/manifest.rs`.
+fn manifest_direction_byte(dir: FanDirection, port_key: u8) -> u8 {
+    match dir {
+        FanDirection::Out => 1,
+        FanDirection::In => {
+            if (port_key & 0x10) != 0 {
+                2
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Look up a module's port content_type by its `name_hash`. Returns
+/// `FRAME_KIND_NONE` when the module isn't in the loader table (host
+/// built-in without a packed manifest) or the manifest doesn't
+/// describe a port at the requested direction+index.
+fn fanned_port_frame_kind(
+    loader: &ModuleLoader,
+    name_hash: u32,
+    dir: FanDirection,
+    port_key: u8,
+) -> u8 {
+    use module_types::FRAME_KIND_NONE;
+    let direction_byte = manifest_direction_byte(dir, port_key);
+    let index = port_key & 0x0F;
+    if let Ok(module) = loader.find_by_name_hash(name_hash) {
+        if let Some(ct) = module.port_content_type(direction_byte, index) {
+            return port_frame_kind_from_content_type(ct);
+        }
+    }
+    FRAME_KIND_NONE
 }
 
 /// Compute port grouping key for fan insertion.
@@ -1945,6 +2004,7 @@ fn insert_fan(
     edge_count: &mut usize,
     module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
     module_count: &mut usize,
+    loader: &ModuleLoader,
 ) -> bool {
     let original_count = *module_count;
     let (internal_hash, name) = match direction {
@@ -2019,15 +2079,63 @@ fn insert_fan(
 
             // The tee/merge inherits the fanned-on module's domain so
             // it runs in the same pump as the fan group it serves.
-            let fan_domain = match &module_list[module_idx] {
-                Some(e) => e.domain_id,
-                None => 0,
+            let (fan_domain, fan_name_hash) = match &module_list[module_idx] {
+                Some(e) => (e.domain_id, e.name_hash),
+                None => (0, 0),
             };
-            let fan_idx =
-                match push_internal_module(module_list, module_count, internal_hash, fan_domain) {
-                    Some(idx) => idx,
-                    None => return false,
-                };
+            // Detect the fanned port's wire format from the module's
+            // manifest content_type. If the fanned module is a host
+            // built-in (no manifest), fall back to checking any peer's
+            // manifest across the fan — both ends of an edge must
+            // declare a compatible content_type, so peer-side gives
+            // the same answer.
+            let mut fan_kind = fanned_port_frame_kind(
+                loader,
+                fan_name_hash,
+                direction,
+                port_key,
+            );
+            if fan_kind == module_types::FRAME_KIND_NONE {
+                for k in 0..group_count {
+                    let edge = &edges[group[k]];
+                    let (peer_idx, peer_dir, peer_port_key) = match direction {
+                        FanDirection::Out => (
+                            edge.to_module,
+                            FanDirection::In,
+                            if edge.is_ctrl() { 0x10 } else { 0x00 } | edge.to_port_index,
+                        ),
+                        FanDirection::In => (
+                            edge.from_module,
+                            FanDirection::Out,
+                            edge.from_port_index,
+                        ),
+                    };
+                    let peer_hash = match &module_list[peer_idx] {
+                        Some(e) => e.name_hash,
+                        None => continue,
+                    };
+                    let peer_kind = fanned_port_frame_kind(
+                        loader,
+                        peer_hash,
+                        peer_dir,
+                        peer_port_key,
+                    );
+                    if peer_kind != module_types::FRAME_KIND_NONE {
+                        fan_kind = peer_kind;
+                        break;
+                    }
+                }
+            }
+            let fan_idx = match push_internal_module(
+                module_list,
+                module_count,
+                internal_hash,
+                fan_domain,
+                fan_kind,
+            ) {
+                Some(idx) => idx,
+                None => return false,
+            };
 
             // Add bridge edge: original module ↔ fan module
             let new_edge = match direction {
@@ -2079,6 +2187,7 @@ fn insert_fan_out(
     edge_count: &mut usize,
     module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
     module_count: &mut usize,
+    loader: &ModuleLoader,
 ) -> bool {
     insert_fan(
         FanDirection::Out,
@@ -2086,6 +2195,7 @@ fn insert_fan_out(
         edge_count,
         module_list,
         module_count,
+        loader,
     )
 }
 
@@ -2094,6 +2204,7 @@ fn insert_fan_in(
     edge_count: &mut usize,
     module_list: &mut [Option<ModuleEntry>; MAX_MODULES],
     module_count: &mut usize,
+    loader: &ModuleLoader,
 ) -> bool {
     insert_fan(
         FanDirection::In,
@@ -2101,6 +2212,7 @@ fn insert_fan_in(
         edge_count,
         module_list,
         module_count,
+        loader,
     )
 }
 
@@ -2270,8 +2382,13 @@ pub fn instantiate_one_module(
         // out-of-range `domain_id` slips past
         // `compute_domain_exec_orders_static`.
         let domain = (entry.domain_id as usize).min(MAX_DOMAINS - 1) as u8;
-        modules[instantiated] =
-            ModuleSlot::Tee(TeeModule::new(in_chans[0], &out_chans, out_count, domain));
+        modules[instantiated] = ModuleSlot::Tee(TeeModule::new(
+            in_chans[0],
+            &out_chans,
+            out_count,
+            domain,
+            entry.frame_kind,
+        ));
         return InstantiateResult::Done;
     } else if entry.name_hash == INTERNAL_MERGE_HASH {
         if out_count != 1 || in_count == 0 {
@@ -2279,8 +2396,13 @@ pub fn instantiate_one_module(
             return InstantiateResult::Error(-1);
         }
         let domain = (entry.domain_id as usize).min(MAX_DOMAINS - 1) as u8;
-        modules[instantiated] =
-            ModuleSlot::Merge(MergeModule::new(&in_chans, in_count, out_chans[0], domain));
+        modules[instantiated] = ModuleSlot::Merge(MergeModule::new(
+            &in_chans,
+            in_count,
+            out_chans[0],
+            domain,
+            entry.frame_kind,
+        ));
         return InstantiateResult::Done;
     }
 

@@ -694,13 +694,13 @@ unsafe fn log_info(s: &Fat32State, msg: &[u8]) {
 unsafe fn seek_sd(s: &Fat32State, block: u32) -> i32 {
     let mut pos = block;
     let pos_ptr = &mut pos as *mut u32 as *mut u8;
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_NOTIFY, pos_ptr)
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_NOTIFY, pos_ptr, 4)
 }
 
 /// Flush SD's output buffer (our input)
 #[inline]
 unsafe fn flush_input(s: &Fat32State) -> i32 {
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut())
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0)
 }
 
 // ============================================================================
@@ -1019,6 +1019,7 @@ unsafe fn fs_sync_read_sector(s: &Fat32State, lba: u32, out: *mut u8) -> i32 {
         s.in_chan,
         IOCTL_BLOCKS_READ_LBAS_SYNC,
         arg.as_mut_ptr(),
+        16,
     )
 }
 
@@ -2419,7 +2420,7 @@ unsafe fn ws_ns_check(s: &mut Fat32State) -> i32 {
     // on. `scratch` is sized for the {ns_size:u64 + ns_lbads:u8}
     // response; the 4-byte nsid input sits in the first 4 bytes.
     let mut scratch = [0u8; 13];
-    let rc = dev_channel_query(
+    let rc = dev_channel_ioctl(
         s.sys(),
         s.write_out_chan,
         IOCTL_NVME_NS_INFO,

@@ -425,8 +425,21 @@ pub const UART_CONFIG_BIN_SIZE: usize = 8;
 pub const GPIO_CONFIG_BIN_SIZE: usize = 5;
 pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 
-/// Graph section binary format sizes
-pub const GRAPH_EDGE_SIZE: usize = 4;
+/// Graph section binary format sizes.
+///
+/// Edge layout (8 bytes):
+///   byte 0:    from_id
+///   byte 1:    to_id
+///   byte 2:    bit 7    = to_port (0 = data, 1 = ctrl)
+///              bits 6:5 = edge_class
+///              bits 4:0 = buffer_group
+///   byte 3:    bits 7:4 = from_port_index
+///              bits 3:0 = to_port_index
+///   bytes 4-7: buffer_bytes (u32 LE) — explicit ring-buffer size.
+///              `0` falls back to module hints / `BUFFER_SIZE`.
+///              Otherwise `max(module_hint, buffer_bytes)` is the
+///              size requested from `channel_open_for_module`.
+pub const GRAPH_EDGE_SIZE: usize = 8;
 pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + 16; // header + edges + domain metadata
 
 // ============================================================================
@@ -484,6 +497,13 @@ pub struct ModuleEntry {
     pub id: u8,
     /// Execution domain ID (0 = default domain)
     pub domain_id: u8,
+    /// Tee/merge framing mode (`FRAME_KIND_*` from `module_types`).
+    /// `FRAME_KIND_NONE` (0) is best-effort byte-stream forwarding;
+    /// `FRAME_KIND_ETH` (1) parses `[len:u16][payload]`;
+    /// `FRAME_KIND_NET` (2) parses `[msg_type:u8][len:u16][payload]`.
+    /// Set by `insert_fan` for ports that carry framed protocols;
+    /// ignored for any other module type.
+    pub frame_kind: u8,
     /// Pointer to params in arena (stable for lifetime of config)
     pub params_ptr: *const u8,
     /// Length of params
@@ -507,6 +527,7 @@ impl Default for ModuleEntry {
             name_hash: 0,
             id: 0,
             domain_id: 0,
+            frame_kind: 0,
             params_ptr: core::ptr::null(),
             params_len: 0,
         }
@@ -552,12 +573,20 @@ pub struct GraphEdge {
     /// (header flags bit 0) set. Incompatible with tee/merge — `insert_fan` clears
     /// `buffer_group` on fan edges.
     ///
-    /// Binary encoding: 7 bits (0..127) in byte 2 bits [6:0] of the graph edge
-    /// (bit 7 of byte 2 is `to_port`). See `parse_graph_edge`.
+    /// Binary encoding: 5 bits (0..31) in byte 2 bits [4:0] of the graph edge.
+    /// See `parse_graph_edge`.
     pub buffer_group: u8,
     /// Edge class metadata (Local, DmaOwned, CrossCore).
     /// Encoded in bits [5:4] of byte 3. Pure metadata on single-core; no runtime cost.
     pub edge_class: EdgeClass,
+    /// Per-edge ring-buffer size override in bytes. `0` defers to the
+    /// producer/consumer module hints (`module_channel_hints`) and the
+    /// global `BUFFER_SIZE` fallback. Non-zero requests at least this
+    /// many bytes; the scheduler combines it with module hints via
+    /// `max(module_hint, buffer_bytes)` and `channel_open_for_module`
+    /// clamps to `MAX_CHAN_BYTES = 256 KiB` and rounds up to a power
+    /// of two. Encoded as a u32 LE in bytes 4-7 of the edge record.
+    pub buffer_bytes: u32,
 }
 
 // ============================================================================
@@ -692,6 +721,9 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
     config.header = header;
     arena_reset();
 
+    // Kernel and tools always ship together, so any mismatch is an
+    // upgrade-skipped or toolchain-mismatch bug rather than a
+    // graceful path.
     if header.version != 1 {
         log::error!("[config] unsupported version={}", header.version);
         return false;
@@ -844,6 +876,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
                 name_hash,
                 id,
                 domain_id,
+                frame_kind: 0,
                 params_ptr: core::ptr::null(),
                 params_len: 0,
             });
@@ -857,6 +890,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
             name_hash,
             id,
             domain_id,
+            frame_kind: 0,
             params_ptr: arena_buf.as_ptr(),
             params_len,
         })
@@ -865,14 +899,15 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 
 /// Parse graph edge from binary
 ///
-/// Format (4 bytes):
-/// - byte 0: from_id (u8)
-/// - byte 1: to_id (u8)
-/// - byte 2: bit 7      = to_port (0=in, 1=ctrl)
+/// Format (8 bytes):
+/// - byte 0:    from_id (u8)
+/// - byte 1:    to_id (u8)
+/// - byte 2:    bit 7      = to_port (0=in, 1=ctrl)
 ///   bits [6:5] = edge_class (2-bit)
 ///   bits [4:0] = buffer_group (5-bit, 0..31)
-/// - byte 3: bits [7:4] = from_port_index (4-bit, 0..15)
+/// - byte 3:    bits [7:4] = from_port_index (4-bit, 0..15)
 ///   bits [3:0] = to_port_index   (4-bit, 0..15)
+/// - bytes 4-7: buffer_bytes (u32 LE, 0 = no override)
 ///
 /// Both port indices are 4 bits; the runtime caps both at
 /// `MAX_PORTS = 16` (scheduler.rs). `buffer_group` is 5 bits — group 0
@@ -889,6 +924,12 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
         let port_byte = *ptr.add(3);
         let from_port_index = (port_byte >> 4) & 0x0F;
         let to_port_index = port_byte & 0x0F;
+        let buffer_bytes = u32::from_le_bytes([
+            *ptr.add(4),
+            *ptr.add(5),
+            *ptr.add(6),
+            *ptr.add(7),
+        ]);
         let edge_class = match edge_class_raw {
             1 => EdgeClass::DmaOwned,
             2 => EdgeClass::CrossCore,
@@ -903,6 +944,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
             to_port_index,
             buffer_group,
             edge_class,
+            buffer_bytes,
         }
     }
 }

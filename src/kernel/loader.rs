@@ -778,6 +778,52 @@ impl LoadedModule {
         }
     }
 
+    /// Look up a port's `content_type` byte by direction and the
+    /// per-direction index resolved at manifest-pack time.
+    ///
+    /// `direction`: 0 = input, 1 = output, 2 = ctrl_input, 3 = ctrl_output.
+    /// `index`: matches `PortSpec.index` in `tools::manifest` — the
+    /// resolved index that respects explicit `index = N` declarations
+    /// on the manifest TOML. The packed manifest stores it in byte 3
+    /// of each port record.
+    ///
+    /// Returns `None` if the manifest is missing/truncated or no port
+    /// matches. Consumers (e.g. `port_frame_kind_from_content_type`)
+    /// match the byte against the `CONTENT_TYPES` table in
+    /// `tools::manifest`.
+    pub fn port_content_type(&self, direction: u8, index: u8) -> Option<u8> {
+        let manifest_size = self.header.manifest_size() as usize;
+        if manifest_size < 16 {
+            return None;
+        }
+        let code_size = self.header.code_size as usize;
+        let data_size = self.header.data_size as usize;
+        let export_size = self.header.export_count as usize * 8;
+        let schema_size = self.header.schema_size() as usize;
+        let manifest_offset =
+            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        unsafe {
+            let p = offset_ptr(self.base, manifest_offset);
+            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+            if magic != 0x464D5846 {
+                return None;
+            } // "FXMF"
+            let port_count = *p.add(5) as usize;
+            // Header is 16 bytes, each port record is 4 bytes:
+            // [direction, content_type, flags, index].
+            if manifest_size < 16 + port_count * 4 {
+                return None;
+            }
+            for i in 0..port_count {
+                let entry = p.add(16 + i * 4);
+                if *entry == direction && *entry.add(3) == index {
+                    return Some(*entry.add(1));
+                }
+            }
+            None
+        }
+    }
+
     /// Get a function address by hash.
     /// On Cortex-M: returns u32 with Thumb bit set.
     /// On aarch64: returns usize (64-bit address, no Thumb bit).

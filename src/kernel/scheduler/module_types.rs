@@ -26,7 +26,7 @@
 //! own buffer. See `docs/architecture/concurrency.md`.
 
 use super::{MAX_CHANNELS, MAX_DOMAINS, MAX_PORTS};
-use crate::kernel::channel::{self, POLL_IN, POLL_OUT};
+use crate::kernel::channel;
 use crate::kernel::loader::DynamicModule;
 use crate::modules::{Module, StepOutcome};
 
@@ -34,22 +34,34 @@ use crate::modules::{Module, StepOutcome};
 // FAN_BUFS — per-domain scratch for Tee / Merge
 // ============================================================================
 
-/// Per-domain scratch buffer for tee/merge fan modules.
-///
-/// Sized independently of `CHANNEL_BUFFER_SIZE`: fan-out is a byte-stream
-/// forwarder (channels don't preserve write boundaries), so this is a
-/// per-step throughput knob, not a message-atomicity guarantee.
-/// Producers that need larger atomic transfers should connect peers
-/// directly rather than routing through tee/merge. 2 KiB matches
-/// typical streaming chunks and keeps `.bss` small on Cortex-M targets.
+/// Per-domain scratch buffer for tee/merge fan modules. Caps the
+/// per-step bytes a fan can shuttle from one input ring to its
+/// output(s); a throughput knob, not a correctness invariant —
+/// raw-byte fan-out splits at this cap, frame-aware fan-out (see
+/// `step_framed`) defers a frame whose total exceeds it.
 ///
 /// One entry per domain because tee/merge inherit their fan group's
 /// `domain_id` (see `push_internal_module`); on multicore platforms a
 /// domain runs on exactly one core, so indexing by `domain_id` keeps
-/// each core on its own buffer. RP and wasm pin everything to domain 0
-/// — total footprint is 4 entries × 2 KiB = 8 KiB on every target,
-/// acceptable even on rp2040.
+/// each core on its own buffer.
+///
+///   * **aarch64** — 32 KiB. ETH rings can hit 32 KiB on Pi-class
+///     targets; one step drains a full ring.
+///   * **chip-rp2040 / chip-rp2350b** — 2 KiB. RP chips have tight
+///     `.bss` budgets; audio fan-out (~1 KiB chunks) and the log_net
+///     merge stay well below this.
+///   * **wasm32 / linux host** — 8 KiB, matching the default
+///     `CHANNEL_BUFFER_SIZE`.
+#[cfg(target_arch = "aarch64")]
+const FAN_BUF_SIZE: usize = 32768;
+#[cfg(any(feature = "chip-rp2040", feature = "chip-rp2350b"))]
 const FAN_BUF_SIZE: usize = 2048;
+#[cfg(all(
+    not(target_arch = "aarch64"),
+    not(feature = "chip-rp2040"),
+    not(feature = "chip-rp2350b"),
+))]
+const FAN_BUF_SIZE: usize = 8192;
 static mut FAN_BUFS: [[u8; FAN_BUF_SIZE]; MAX_DOMAINS] =
     [[0u8; FAN_BUF_SIZE]; MAX_DOMAINS];
 
@@ -159,6 +171,26 @@ impl Module for BuiltInModule {
 // TeeModule
 // ============================================================================
 
+/// Wire format of frames flowing through a fan module's input port.
+/// `port_frame_kind_from_content_type` (in `scheduler::mod`) maps a
+/// fanned port's manifest `content_type` byte to one of these
+/// values; the fan reads the per-frame length prefix accordingly so
+/// a transfer covers one whole frame and preserves producer
+/// atomic-write boundaries.
+pub const FRAME_KIND_NONE: u8 = 0;
+/// `[len:u16 LE][payload:len]` — content_type `EthernetFrame`
+/// (NIC ↔ IP).
+pub const FRAME_KIND_ETH: u8 = 1;
+/// `[msg_type:u8][len:u16 LE][payload:len]` — content_type
+/// `NetProto` (IP / TLS / QUIC ↔ consumer ports). msg_type at
+/// byte 0, little-endian length at bytes 1..3.
+pub const FRAME_KIND_NET: u8 = 2;
+
+/// Manifest `content_type` byte values that map to a non-NONE
+/// `FRAME_KIND_*`. Position must match `tools::manifest::CONTENT_TYPES`.
+pub const CONTENT_TYPE_ETHERNET_FRAME: u8 = 19;
+pub const CONTENT_TYPE_NET_PROTO: u8 = 30;
+
 pub struct TeeModule {
     in_chan: i32,
     /// Channel handles for each tee output. Sized to `MAX_PORTS` so the
@@ -172,6 +204,11 @@ pub struct TeeModule {
     /// `step` body uses so concurrent fan modules on different cores
     /// don't share a scratch buffer.
     domain: u8,
+    /// Wire format of the input frames. `FRAME_KIND_NONE` keeps the
+    /// best-effort byte-stream forwarder (audio fan-out, log_net
+    /// merge); `FRAME_KIND_ETH` / `FRAME_KIND_NET` switch to
+    /// frame-aware transfer.
+    frame_kind: u8,
 }
 
 impl TeeModule {
@@ -180,6 +217,7 @@ impl TeeModule {
         out_chans: &[i32; MAX_CHANNELS],
         out_count: usize,
         domain: u8,
+        frame_kind: u8,
     ) -> Self {
         let mut chans = [-1i32; MAX_PORTS];
         let n = out_count.min(MAX_PORTS);
@@ -193,6 +231,7 @@ impl TeeModule {
             out_chans: chans,
             out_count: n,
             domain,
+            frame_kind,
         }
     }
 }
@@ -203,23 +242,39 @@ impl Module for TeeModule {
             return Err(-1);
         }
 
-        if channel::syscall_channel_poll(self.in_chan, POLL_IN) & (POLL_IN as i32) == 0 {
-            return Ok(StepOutcome::Continue);
+        if self.frame_kind != FRAME_KIND_NONE {
+            return unsafe { self.step_framed() };
         }
 
-        for idx in 0..self.out_count {
-            if channel::syscall_channel_poll(self.out_chans[idx], POLL_OUT) & (POLL_OUT as i32) == 0
-            {
-                return Ok(StepOutcome::Continue);
-            }
+        // Raw byte-stream fan-out: shift up to `min(in_len,
+        // FAN_BUF_SIZE, min_out_space)` bytes from the input to every
+        // output, then return. Producer atomic-write boundaries can
+        // split here; ports that need frame preservation route through
+        // `step_framed` via `port_frame_kind`.
+        let in_len = channel::channel_readable_bytes(self.in_chan);
+        if in_len == 0 {
+            return Ok(StepOutcome::Continue);
         }
 
         let buf = unsafe {
             let p = &raw mut FAN_BUFS[self.domain as usize];
             &mut *p
         };
-        let read =
-            unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), buf.len()) };
+
+        let mut read_amount = in_len.min(buf.len());
+        for idx in 0..self.out_count {
+            let out_space = channel::channel_writable_bytes(self.out_chans[idx]);
+            if out_space < read_amount {
+                read_amount = out_space;
+            }
+        }
+        if read_amount == 0 {
+            return Ok(StepOutcome::Continue);
+        }
+
+        let read = unsafe {
+            channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), read_amount)
+        };
         if read <= 0 {
             return Ok(StepOutcome::Continue);
         }
@@ -229,6 +284,8 @@ impl Module for TeeModule {
             let wrote =
                 unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), len) };
             if wrote != read {
+                // Output space was pre-checked; a short write would
+                // mean the kernel's atomic-FIFO contract was broken.
                 return Err(-2);
             }
         }
@@ -238,6 +295,106 @@ impl Module for TeeModule {
 
     fn name(&self) -> &'static str {
         "tee"
+    }
+}
+
+impl TeeModule {
+    /// Frame-aware step body. Inspects the input ring's length-prefixed
+    /// header via `channel_peek` (no consume), validates that every
+    /// output ring has space for the full frame, then commits the
+    /// read and writes atomically. Because nothing is consumed from
+    /// the input until all outputs can absorb the frame, the per-
+    /// domain `FAN_BUFS` scratch is only ever used within a single
+    /// step — no stash race between fans in the same domain.
+    unsafe fn step_framed(&mut self) -> Result<StepOutcome, i32> {
+        let avail = channel::channel_readable_bytes(self.in_chan);
+        let hdr_len = frame_kind_hdr_len(self.frame_kind);
+        if avail < hdr_len {
+            return Ok(StepOutcome::Continue);
+        }
+
+        // Peek just enough bytes to read the length field — no
+        // consume yet, so a backpressured output doesn't strand the
+        // header in our scratch.
+        let mut hdr = [0u8; 3];
+        let peeked = unsafe {
+            channel::channel_peek(self.in_chan, hdr.as_mut_ptr(), hdr_len)
+        };
+        if peeked != hdr_len as i32 {
+            return Err(-3);
+        }
+        let frame_len = decode_frame_len(self.frame_kind, &hdr);
+        let total = hdr_len + frame_len;
+
+        let buf = unsafe {
+            let p = &raw mut FAN_BUFS[self.domain as usize];
+            &mut *p
+        };
+        // Zero-length payload is fatal for ETH (eth frames always carry
+        // ≥ 1 byte) but valid for NET — net_proto control frames carry
+        // a header alone (e.g. CMD_BIND with no payload). Reject only
+        // the truly anomalous cases.
+        if total > buf.len() {
+            // Frame doesn't fit FAN_BUFS scratch — a config-time
+            // topology error.
+            return Err(-4);
+        }
+        if frame_len == 0 && self.frame_kind == FRAME_KIND_ETH {
+            return Err(-4);
+        }
+
+        // Full frame must already be present (atomic FIFO write
+        // commits header + body together) and every output ring must
+        // have room for it. If any precondition fails, defer without
+        // consuming — the input bytes stay in the ring for the next
+        // tick to retry.
+        if avail < total {
+            return Ok(StepOutcome::Continue);
+        }
+        for idx in 0..self.out_count {
+            if channel::channel_writable_bytes(self.out_chans[idx]) < total {
+                return Ok(StepOutcome::Continue);
+            }
+        }
+
+        let read = unsafe {
+            channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), total)
+        };
+        if read != total as i32 {
+            return Err(-5);
+        }
+        for idx in 0..self.out_count {
+            let wrote = unsafe {
+                channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), total)
+            };
+            if wrote != total as i32 {
+                return Err(-2);
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+}
+
+/// Bytes in the wire-format header for each frame kind. Returned
+/// length determines how many bytes `channel_peek` reads to inspect
+/// the length field before the fan commits to a full frame transfer.
+#[inline(always)]
+pub(super) fn frame_kind_hdr_len(kind: u8) -> usize {
+    match kind {
+        FRAME_KIND_ETH => 2,
+        FRAME_KIND_NET => 3,
+        _ => 0,
+    }
+}
+
+/// Decode the payload length out of a peeked header.
+#[inline(always)]
+pub(super) fn decode_frame_len(kind: u8, hdr: &[u8; 3]) -> usize {
+    match kind {
+        FRAME_KIND_ETH => (hdr[0] as usize) | ((hdr[1] as usize) << 8),
+        // net_proto: msg_type at hdr[0], len at hdr[1..3].
+        FRAME_KIND_NET => (hdr[1] as usize) | ((hdr[2] as usize) << 8),
+        _ => 0,
     }
 }
 
@@ -255,6 +412,8 @@ pub struct MergeModule {
     /// Domain this merge runs in. Selects which `FAN_BUFS` entry the
     /// `step` body uses; see `TeeModule::domain`.
     domain: u8,
+    /// Wire format of the input frames. See `TeeModule::frame_kind`.
+    frame_kind: u8,
 }
 
 impl MergeModule {
@@ -263,6 +422,7 @@ impl MergeModule {
         in_count: usize,
         out_chan: i32,
         domain: u8,
+        frame_kind: u8,
     ) -> Self {
         let mut chans = [-1i32; MAX_PORTS];
         let n = in_count.min(MAX_PORTS);
@@ -277,6 +437,7 @@ impl MergeModule {
             out_chan,
             next_idx: 0,
             domain,
+            frame_kind,
         }
     }
 }
@@ -287,16 +448,22 @@ impl Module for MergeModule {
             return Err(-1);
         }
 
-        if channel::syscall_channel_poll(self.out_chan, POLL_OUT) & (POLL_OUT as i32) == 0 {
-            return Ok(StepOutcome::Continue);
+        if self.frame_kind != FRAME_KIND_NONE {
+            return unsafe { self.step_framed() };
         }
 
+        // Raw byte-stream fan-in (mirror of `TeeModule::step` raw
+        // path): round-robin across inputs, copy `min(in_len,
+        // FAN_BUF_SIZE, out_space)` bytes from the first non-empty
+        // source into the output. Producer atomic-write boundaries
+        // can split; framed ports route through `step_framed`.
         for _ in 0..self.in_count {
             let idx = self.next_idx % self.in_count;
             self.next_idx = (self.next_idx + 1) % self.in_count;
             let chan = self.in_chans[idx];
 
-            if channel::syscall_channel_poll(chan, POLL_IN) & (POLL_IN as i32) == 0 {
+            let in_len = channel::channel_readable_bytes(chan);
+            if in_len == 0 {
                 continue;
             }
 
@@ -304,15 +471,25 @@ impl Module for MergeModule {
                 let p = &raw mut FAN_BUFS[self.domain as usize];
                 &mut *p
             };
-            let read = unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), buf.len()) };
+            let out_space = channel::channel_writable_bytes(self.out_chan);
+            let read_amount = in_len.min(buf.len()).min(out_space);
+            if read_amount == 0 {
+                continue;
+            }
+
+            let read = unsafe {
+                channel::syscall_channel_read(chan, buf.as_mut_ptr(), read_amount)
+            };
             if read <= 0 {
-                return Ok(StepOutcome::Continue);
+                continue;
             }
 
             let wrote = unsafe {
                 channel::syscall_channel_write(self.out_chan, buf.as_ptr(), read as usize)
             };
             if wrote != read {
+                // Output space was pre-checked; a short write would
+                // mean the kernel's atomic-FIFO contract was broken.
                 return Err(-2);
             }
 
@@ -324,5 +501,70 @@ impl Module for MergeModule {
 
     fn name(&self) -> &'static str {
         "merge"
+    }
+}
+
+impl MergeModule {
+    /// Frame-aware step body. Round-robins across inputs; the first
+    /// one with a complete frame whose entire size fits in the output
+    /// ring gets transferred atomically. Like `TeeModule::step_framed`
+    /// the input is only consumed after every precondition passes,
+    /// so the per-domain `FAN_BUFS` scratch is never held across
+    /// step calls.
+    unsafe fn step_framed(&mut self) -> Result<StepOutcome, i32> {
+        let buf = unsafe {
+            let p = &raw mut FAN_BUFS[self.domain as usize];
+            &mut *p
+        };
+        let hdr_len = frame_kind_hdr_len(self.frame_kind);
+
+        for _ in 0..self.in_count {
+            let idx = self.next_idx % self.in_count;
+            self.next_idx = (self.next_idx + 1) % self.in_count;
+            let chan = self.in_chans[idx];
+
+            let avail = channel::channel_readable_bytes(chan);
+            if avail < hdr_len {
+                continue;
+            }
+
+            let mut hdr = [0u8; 3];
+            let peeked = unsafe {
+                channel::channel_peek(chan, hdr.as_mut_ptr(), hdr_len)
+            };
+            if peeked != hdr_len as i32 {
+                return Err(-3);
+            }
+            let frame_len = decode_frame_len(self.frame_kind, &hdr);
+            let total = hdr_len + frame_len;
+            if total > buf.len() {
+                return Err(-4);
+            }
+            if frame_len == 0 && self.frame_kind == FRAME_KIND_ETH {
+                return Err(-4);
+            }
+            if avail < total {
+                continue;
+            }
+            if channel::channel_writable_bytes(self.out_chan) < total {
+                continue;
+            }
+
+            let read = unsafe {
+                channel::syscall_channel_read(chan, buf.as_mut_ptr(), total)
+            };
+            if read != total as i32 {
+                return Err(-5);
+            }
+            let wrote = unsafe {
+                channel::syscall_channel_write(self.out_chan, buf.as_ptr(), total)
+            };
+            if wrote != total as i32 {
+                return Err(-2);
+            }
+            return Ok(StepOutcome::Continue);
+        }
+
+        Ok(StepOutcome::Continue)
     }
 }

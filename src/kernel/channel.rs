@@ -343,6 +343,11 @@ pub fn channel_open_for_module(
         let size = unsafe { u16::from_le_bytes([*config, *config.add(1)]) as usize };
         size.clamp(64, MAX_CHAN_BYTES).next_power_of_two()
     } else {
+        // No-hint channels share `BUFFER_SIZE`; raising the default
+        // would consume the global arena and cap the channel count
+        // (wasm only has 2 MiB to spend). Bandwidth-hungry edges
+        // (raster fan-out, etc.) must declare a per-edge size hint
+        // through the 4-byte config path above.
         BUFFER_SIZE
     };
 
@@ -428,6 +433,55 @@ pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
         CHAN_EAGAIN
     } else {
         read
+    }
+}
+
+/// Copy up to `len` bytes from the head of the channel's FIFO ring
+/// into `buf` WITHOUT advancing the read pointer. Returns the number
+/// of bytes copied (0 if the ring is empty), or a negative errno.
+///
+/// Used by frame-aware fan modules (tee/merge) to inspect a length-
+/// prefixed header before deciding whether to consume the full frame
+/// — the read is committed only when every output ring has space,
+/// so producer atomic-write boundaries survive even when the fan
+/// outputs are temporarily backpressured. Mailbox channels are not
+/// peekable; the call returns CHAN_EINVAL on those.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `len` bytes (or null, which is
+/// rejected with `CHAN_EINVAL`). The function writes `n <= len` bytes
+/// through `buf`; the caller owns the buffer and is responsible for
+/// its lifetime and aliasing.
+pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    if buf.is_null() {
+        return CHAN_EINVAL;
+    }
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        // Mailbox channels deliver an opaque buffer reference, not a
+        // byte stream — no meaningful peek semantics.
+        return CHAN_EINVAL;
+    }
+    let out = core::slice::from_raw_parts_mut(buf, len);
+    let n = slot.with_lock(|fifo, storage| {
+        let Some(storage) = storage else { return -1i32 };
+        fifo.peek(storage, out) as i32
+    });
+    if n < 0 {
+        CHAN_EINVAL
+    } else {
+        n
     }
 }
 
@@ -711,6 +765,26 @@ pub fn channel_readable_bytes(handle: i32) -> usize {
         return 0;
     }
     slot.with_lock(|fifo, _| fifo.len())
+}
+
+/// Return free space (writable bytes) in channel's ring buffer.
+/// 0 for invalid/mailbox/full channels.
+pub fn channel_writable_bytes(handle: i32) -> usize {
+    if handle < 0 {
+        return 0;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return 0;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return 0;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        return 0;
+    }
+    slot.with_lock(|fifo, _| fifo.space())
 }
 
 /// Return true if channel is in mailbox mode.

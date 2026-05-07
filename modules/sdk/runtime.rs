@@ -1036,19 +1036,40 @@ unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 
 }
 
 /// Channel ioctl via provider_call (CHANNEL::IOCTL 0x0506).
-/// data: pointer to u32 for SET_U32/GET_U32, or null for FLUSH/SET_HUP.
+///
+/// Wire format is `[cmd:u32 LE][arg:arg_len bytes]`. Built-in cmds
+/// (`IOCTL_NOTIFY`, `IOCTL_POLL_NOTIFY` — `arg_len = 4`; `IOCTL_FLUSH`,
+/// `IOCTL_EOF` — `arg_len = 0`) are handled in the kernel. Any other
+/// `cmd` is forwarded to a module-registered handler bound via
+/// [`dev_channel_register_ioctl`]; that handler reads up to `arg_len`
+/// bytes from `arg` and may write back into the same buffer.
+///
+/// On return the first `arg_len` bytes of `arg` carry the handler's
+/// response. Pass `arg = null` and `arg_len = 0` for arg-less cmds.
 #[allow(dead_code)]
 #[inline(always)]
-unsafe fn dev_channel_ioctl(sys: &SyscallTable, handle: i32, cmd: u32, data: *mut u8) -> i32 {
-    let mut buf = [0u8; 8];
-    buf[..4].copy_from_slice(&cmd.to_le_bytes());
-    if !data.is_null() {
-        core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr().add(4), 4);
+unsafe fn dev_channel_ioctl(
+    sys: &SyscallTable,
+    handle: i32,
+    cmd: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    const MAX_IOCTL_ARG: usize = 64;
+    if arg_len > MAX_IOCTL_ARG {
+        return -22;
     }
-    let len = if data.is_null() { 4 } else { 8 };
-    let result = (sys.provider_call)(handle, 0x0506, buf.as_mut_ptr(), len);
-    if !data.is_null() {
-        core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), data, 4);
+    let mut buf = [0u8; 4 + MAX_IOCTL_ARG];
+    buf[..4].copy_from_slice(&cmd.to_le_bytes());
+    if arg_len > 0 {
+        if arg.is_null() {
+            return -22;
+        }
+        core::ptr::copy_nonoverlapping(arg, buf.as_mut_ptr().add(4), arg_len);
+    }
+    let result = (sys.provider_call)(handle, 0x0506, buf.as_mut_ptr(), 4 + arg_len);
+    if arg_len > 0 {
+        core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), arg, arg_len);
     }
     result
 }
@@ -1078,47 +1099,6 @@ unsafe fn dev_channel_register_ioctl(
     };
     buf[8..16].copy_from_slice(&hfn.to_le_bytes());
     (sys.provider_call)(handle, 0x0507, buf.as_mut_ptr(), 16)
-}
-
-/// Variable-length channel ioctl / query. Identical wire format to
-/// [`dev_channel_ioctl`] — 4-byte cmd prefix followed by `arg_len`
-/// bytes of payload — but accepts an arbitrary payload size. Used for
-/// module-registered handlers (see [`dev_channel_register_ioctl`])
-/// that exchange structured data larger than 4 bytes.
-///
-/// The caller provides a scratch buffer large enough to hold both the
-/// 4-byte cmd header and `arg_len` payload bytes, and supplies the
-/// payload via `arg`/`arg_len`. On return the first `arg_len` bytes of
-/// `arg` are the handler's response (copied back from the scratch).
-///
-/// Returns the handler's i32 result, or `-22` (EINVAL) if `arg` is
-/// null and `arg_len > 0`.
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dev_channel_query(
-    sys: &SyscallTable,
-    handle: i32,
-    cmd: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
-    const MAX_QUERY_ARG: usize = 64;
-    if arg_len > MAX_QUERY_ARG {
-        return -22;
-    }
-    let mut buf = [0u8; 4 + MAX_QUERY_ARG];
-    buf[..4].copy_from_slice(&cmd.to_le_bytes());
-    if arg_len > 0 {
-        if arg.is_null() {
-            return -22;
-        }
-        core::ptr::copy_nonoverlapping(arg, buf.as_mut_ptr().add(4), arg_len);
-    }
-    let result = (sys.provider_call)(handle, 0x0506, buf.as_mut_ptr(), 4 + arg_len);
-    if arg_len > 0 {
-        core::ptr::copy_nonoverlapping(buf.as_ptr().add(4), arg, arg_len);
-    }
-    result
 }
 
 /// Acquire write access to mailbox buffer via provider_call (BUFFER::ACQUIRE_WRITE 0x0A00).
@@ -1173,7 +1153,10 @@ const NET_FRAME_HDR: usize = 3;
 
 /// Write a net protocol frame: [msg_type: u8] [len: u16 LE] [payload].
 /// The frame is assembled in `scratch` and written atomically.
-/// Returns total bytes written, or 0 if channel not ready.
+/// Returns `total` bytes only when the kernel committed the full
+/// frame; returns 0 on backpressure (channel ring full or atomic
+/// FIFO write rejected) so callers can retry rather than treat a
+/// dropped frame as committed.
 #[allow(dead_code)]
 unsafe fn net_write_frame(
     sys: &SyscallTable,
@@ -1188,7 +1171,6 @@ unsafe fn net_write_frame(
     if chan < 0 || total > scratch_max {
         return 0;
     }
-    // No poll pre-check: channel_write handles full buffers by returning 0.
     let len_le = (payload_len as u16).to_le_bytes();
     *scratch = msg_type;
     *scratch.add(1) = len_le[0];
@@ -1196,8 +1178,8 @@ unsafe fn net_write_frame(
     if payload_len > 0 && !payload.is_null() {
         core::ptr::copy_nonoverlapping(payload, scratch.add(NET_FRAME_HDR), payload_len);
     }
-    (sys.channel_write)(chan, scratch, total);
-    total
+    let n = (sys.channel_write)(chan, scratch, total);
+    if n == total as i32 { total } else { 0 }
 }
 
 /// Read a net protocol frame from channel into buf.

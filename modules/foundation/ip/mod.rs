@@ -63,6 +63,16 @@ mod dhcp;
 /// Maximum ethernet frame size
 const MAX_FRAME_SIZE: usize = 1536;
 
+/// CMD_SEND stash capacity. Must match the largest single-frame
+/// payload an upstream consumer can write — `NET_BUF_SIZE` per
+/// target. Anything smaller would truncate `ip_net_read_frame`'s
+/// body, leaving tail bytes in the ring that the next header parse
+/// would mistake for a frame.
+#[cfg(target_arch = "aarch64")]
+const PENDING_CMD_BUF_SIZE: usize = 8192;
+#[cfg(not(target_arch = "aarch64"))]
+const PENDING_CMD_BUF_SIZE: usize = 1600;
+
 // NET_FRAME_HDR (3 bytes: msg_type + len u16 LE) defined in pic_runtime.rs
 
 /// Net protocol: downstream messages (IP → consumer)
@@ -150,6 +160,29 @@ pub struct IpState {
     pending_tx_len: u16,
     _ptx_pad: [u8; 2],
     pending_tx_buf: [u8; MAX_FRAME_SIZE + 2],
+
+    /// Stash for a CMD_SEND tail that couldn't be drained in one tick
+    /// (peer window closed mid-frame, or NIC out_chan rejected a
+    /// segment). `service_net_channels` resumes from `pending_cmd_off`
+    /// on the next tick before touching `net_in_chan`; while the
+    /// stash is occupied we never read new frames, so backpressure
+    /// propagates back to the consumer through its own
+    /// `channel_write` to `net_in_chan`.
+    pending_cmd_valid: u8,
+    pending_cmd_conn:  u8,
+    pending_cmd_off:   u16,
+    pending_cmd_len:   u16,
+    _pcmd_pad:         [u8; 2],
+    pending_cmd_buf:   [u8; PENDING_CMD_BUF_SIZE],
+
+    /// Deferred CMD_CLOSE slot. Set when CMD_CLOSE arrives while a
+    /// `pending_cmd_*` stash is still draining (RFC 793 §3.5 — CLOSE
+    /// transmits all queued SENDs first), or when the FIN frame
+    /// itself was rejected by the NIC. Cleared once `process_cmd_close`
+    /// confirms the FIN is queued.
+    pending_close_valid: u8,
+    pending_close_conn:  u8,
+    _pcls_pad:           [u8; 2],
 
     // Step counter for timers
     step_count: u32,
@@ -244,9 +277,11 @@ unsafe fn ip_net_write_frame(
     if written < total as i32 { -1 } else { 0 }
 }
 
-/// Read a net_proto frame header + payload. Module-local variant that reads
-/// header and payload in two channel_read calls so the payload goes directly
-/// into the caller's buffer without an intermediate copy.
+/// Read a net_proto frame (header + payload) into the caller's buffer.
+/// Returns `(msg_type, payload_len)` on success, or `(0, 0)` if no
+/// header is available, the body is short-read, or the body exceeds
+/// `buf_cap`. In the oversize case the whole body is drained from
+/// the ring so the next read aligns to the next frame.
 #[inline(always)]
 unsafe fn ip_net_read_frame(
     sys: &SyscallTable,
@@ -254,17 +289,33 @@ unsafe fn ip_net_read_frame(
     buf: *mut u8,
     buf_cap: usize,
 ) -> (u8, u16) {
-    // Read 3-byte header first, then payload
     let mut hdr = [0u8; 3];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), 3);
-    if n < 3 { return (0, 0); }
+    if n < 3 {
+        return (0, 0);
+    }
     let msg_type = *hdr.as_ptr();
     let payload_len = (*hdr.as_ptr().add(1) as u16) | ((*hdr.as_ptr().add(2) as u16) << 8);
-    if payload_len > 0 && buf_cap > 0 {
-        let to_read = (payload_len as usize).min(buf_cap);
-        (sys.channel_read)(chan, buf, to_read);
+    if payload_len == 0 || buf_cap == 0 {
+        return (msg_type, payload_len);
     }
-    (msg_type, payload_len)
+    if (payload_len as usize) <= buf_cap {
+        let body_n = (sys.channel_read)(chan, buf, payload_len as usize);
+        if body_n != payload_len as i32 {
+            return (0, 0);
+        }
+        return (msg_type, payload_len);
+    }
+    // Body too large for the caller's buffer — drain it in chunks so
+    // the next header parse doesn't read into the leftover body.
+    let mut remaining = payload_len as usize;
+    while remaining > 0 {
+        let chunk = remaining.min(buf_cap);
+        let drained = (sys.channel_read)(chan, buf, chunk);
+        if drained <= 0 { break; }
+        remaining -= drained as usize;
+    }
+    (0, 0)
 }
 
 /// Send a MSG_DATA frame to the net consumer channel.
@@ -511,15 +562,18 @@ fn next_port(s: &mut IpState) -> u16 {
     port
 }
 
-/// Send a raw ethernet frame via out_chan.
+/// Send a raw ethernet frame via `out_chan`. Frames are length-prefixed
+/// (`[len:u16 LE][payload]`) so the byte-stream FIFO to the NIC driver
+/// preserves frame boundaries; writes are atomic (all 2+N bytes or
+/// nothing). If the channel is full the frame is staged in
+/// `pending_tx_buf` and retried on the next step.
 ///
-/// Frames are prefixed with a 2-byte little-endian length so the byte-stream
-/// FIFO to the NIC driver preserves frame boundaries. Writes are atomic
-/// (all 2+N bytes or nothing), so a partial frame cannot reach the driver.
-/// If the channel is full, the frame is staged in pending_tx_buf and
-/// flushed on the next step.
-unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
-    if s.out_chan < 0 || len == 0 || len > MAX_FRAME_SIZE - 2 { return; }
+/// Returns `true` iff the frame is safely queued (committed to the
+/// ring or stashed for retry). On `false` the caller MUST NOT advance
+/// state that assumes the bytes are on the wire (`snd_nxt`, etc.) —
+/// TCP retransmit / pending-cmd stash logic relies on this.
+unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
+    if s.out_chan < 0 || len == 0 || len > MAX_FRAME_SIZE - 2 { return false; }
     let sys = &*s.syscalls;
 
     // Flush any frame pending from a previous step before writing a new one.
@@ -527,13 +581,20 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
         let p = (sys.channel_poll)(s.out_chan, POLL_OUT);
         if p > 0 && (p as u32 & POLL_OUT) != 0 {
             let plen = s.pending_tx_len as usize;
-            (sys.channel_write)(s.out_chan, s.pending_tx_buf.as_ptr(), plen);
+            let n = (sys.channel_write)(s.out_chan, s.pending_tx_buf.as_ptr(), plen);
+            if n != plen as i32 {
+                // Ring had room reported by POLL_OUT but not enough
+                // for the full frame; atomic-FIFO write rejected.
+                // Keep the stash; caller must not advance state.
+                s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+                return false;
+            }
             s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
             s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(plen as u32);
             s.pending_tx_len = 0;
         } else {
             s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
-            return; // still full; drop new frame — TCP will retransmit
+            return false;
         }
     }
 
@@ -546,12 +607,21 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) {
 
     let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
     if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-        (sys.channel_write)(s.out_chan, pbuf, total);
-        s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
-        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(total as u32);
+        let n = (sys.channel_write)(s.out_chan, pbuf, total);
+        if n == total as i32 {
+            s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
+            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(total as u32);
+            return true;
+        }
+        // POLL_OUT reported space but the atomic write didn't fit —
+        // bytes are already in `pbuf`, so stash for the next tick.
+        s.pending_tx_len = total as u16;
+        s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+        true
     } else {
         s.pending_tx_len = total as u16;
         s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+        true
     }
 }
 
@@ -655,19 +725,28 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let tx_pre = s.tlm.bytes_out;
     let bp_pre = s.tlm.bp_steps;
 
-    // 0a. Flush any pending TX frame from previous step.
+    // 0a. Flush any pending TX frame from previous step. Atomic-FIFO
+    // writes are all-or-nothing — only clear `pending_tx_len` when
+    // the full frame committed; otherwise leave it stashed for the
+    // next tick.
     if s.pending_tx_len > 0 && s.out_chan >= 0 {
         let sys = &*s.syscalls;
         let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
         if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
             let len = s.pending_tx_len as usize;
-            (sys.channel_write)(s.out_chan, s.pending_tx_buf.as_ptr(), len);
-            s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
-            s.pending_tx_len = 0;
+            let n = (sys.channel_write)(s.out_chan, s.pending_tx_buf.as_ptr(), len);
+            if n == len as i32 {
+                s.tx_frame_count = s.tx_frame_count.wrapping_add(1);
+                s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(len as u32);
+                s.pending_tx_len = 0;
+            } else {
+                s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+            }
         }
-        // If still full, return Burst to try again quickly
+        // Yield rather than re-step: returning Burst would loop IP up
+        // to 16384 times before the NIC driver gets to drain its ring.
         if s.pending_tx_len > 0 {
-            return 2; // StepOutcome::Burst
+            return 0; // StepOutcome::Continue
         }
     }
 
@@ -1112,7 +1191,7 @@ unsafe fn process_tcp_segment(
                     conn.rto = tcp::RTO_INITIAL;
                     conn.retransmit_timer = 0;
                     conn.state = tcp::TcpState::SynReceived;
-                    send_tcp_control(s, idx, tcp::SYN | tcp::ACK);
+                    send_tcp_control(s, idx, tcp::SYN | tcp::ACK, false);
                     return;
                 }
             }
@@ -1288,10 +1367,10 @@ unsafe fn process_tcp_segment(
     // Execute deferred actions
     match action {
         ACTION_SEND_ACK => {
-            send_tcp_control(s, conn_idx, tcp::ACK);
+            send_tcp_control(s, conn_idx, tcp::ACK, false);
         }
         ACTION_COMPLETE_CONNECT => {
-            send_tcp_control(s, conn_idx, tcp::ACK);
+            send_tcp_control(s, conn_idx, tcp::ACK, false);
             net_send_connected(s, conn_idx as u8);
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
@@ -1309,7 +1388,7 @@ unsafe fn process_tcp_segment(
             *conn = tcp::TcpConn::new();
         }
         ACTION_SET_CLOSING => {
-            send_tcp_control(s, conn_idx, tcp::ACK);
+            send_tcp_control(s, conn_idx, tcp::ACK, false);
             net_send_closed(s, conn_idx as u8);
         }
         ACTION_RX_DATA | ACTION_RX_DATA_FIN => {
@@ -1340,7 +1419,7 @@ unsafe fn process_tcp_segment(
                 }
             }
             update_rcv_wnd(s, conn_idx);
-            send_tcp_control(s, conn_idx, tcp::ACK);
+            send_tcp_control(s, conn_idx, tcp::ACK, false);
             if action == ACTION_RX_DATA_FIN {
                 net_send_closed(s, conn_idx as u8);
             }
@@ -1354,7 +1433,7 @@ unsafe fn process_tcp_segment(
                 let payload = data.add(rx_payload_offset);
                 net_send_data(s, conn_idx as u8, payload, rx_payload_len);
                 (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt.wrapping_add(rx_payload_len as u32);
-                send_tcp_control(s, conn_idx, tcp::ACK);
+                send_tcp_control(s, conn_idx, tcp::ACK, false);
             }
         }
         ACTION_FREE_SLOT => {
@@ -1365,7 +1444,7 @@ unsafe fn process_tcp_segment(
             *conn = tcp::TcpConn::new();
         }
         ACTION_RETRANSMIT_SYNACK => {
-            send_tcp_control(s, conn_idx, tcp::SYN | tcp::ACK);
+            send_tcp_control(s, conn_idx, tcp::SYN | tcp::ACK, true);
         }
         _ => {}
     }
@@ -1435,33 +1514,61 @@ unsafe fn send_tcp_rst(
     send_frame(s, s.tx_frame.as_ptr(), total);
 }
 
-/// Send a TCP control segment (SYN, ACK, FIN, RST) for a connection.
-unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8) {
+/// Send a TCP control segment (SYN / ACK / FIN / RST).
+///
+/// SYN and FIN each consume one sequence number — RFC 793 §3.3.
+/// Sequence-space accounting is driven off `snd_una` rather than the
+/// `retransmit` flag so the bookkeeping survives a failed initial
+/// attempt followed by a successful retry:
+///
+///   * Fresh send: `seq = snd_nxt` and (since the byte is uncredited)
+///     `snd_nxt == seq`, so `snd_nxt` advances by one on success.
+///   * Retransmit after a successful original: `seq = snd_una`,
+///     `snd_nxt > snd_una`, so `snd_nxt` is unchanged.
+///   * Retransmit after a failed original (e.g. ARP miss returned
+///     before the first attempt could queue): `seq = snd_una` and
+///     `snd_nxt == snd_una`, so the byte is credited the first time
+///     it actually reaches the wire.
+///
+/// ACK-only segments don't consume sequence space, so the flag has
+/// no effect on them. Returns `true` iff the frame was queued; the
+/// caller defers state transitions on backpressured SYN/FIN.
+unsafe fn send_tcp_control(
+    s: &mut IpState,
+    conn_idx: usize,
+    flags: u8,
+    retransmit: bool,
+) -> bool {
     if !s.mac_valid || s.local_ip == 0 {
-        return;
+        return false;
     }
 
-    // Extract conn fields to avoid borrow conflicts
-    let remote_ip = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).remote_ip;
-    let local_port = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).local_port;
-    let remote_port = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).remote_port;
-    let snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt;
-    let rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt;
-    let rcv_wnd = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_wnd;
+    let conn = &*s.tcp_conns.as_ptr().add(conn_idx);
+    let remote_ip = conn.remote_ip;
+    let local_port = conn.local_port;
+    let remote_port = conn.remote_port;
+    let rcv_nxt = conn.rcv_nxt;
+    let rcv_wnd = conn.rcv_wnd;
+    let consumes_seq = (flags & (tcp::SYN | tcp::FIN)) != 0;
+    let seq = if retransmit && consumes_seq {
+        conn.snd_una
+    } else {
+        conn.snd_nxt
+    };
 
     let dst_mac = resolve_mac(s, remote_ip);
     let dst_mac = match dst_mac {
         Some(m) => m,
         None => {
             log_info(s, b"[ip] tcp ctrl: arp pending");
-            return;
+            return false;
         }
     };
 
     let tcp_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
     tcp::build_tcp_header(
         tcp_start,
-        local_port, remote_port, snd_nxt, rcv_nxt,
+        local_port, remote_port, seq, rcv_nxt,
         flags, rcv_wnd,
     );
 
@@ -1475,19 +1582,35 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8) {
     tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, s.local_ip, remote_ip);
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
-    send_frame(s, s.tx_frame.as_ptr(), total);
-
-    // Update snd_nxt for SYN/FIN (they consume sequence space)
-    if (flags & tcp::SYN) != 0 || (flags & tcp::FIN) != 0 {
-        (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt.wrapping_add(1);
+    if !send_frame(s, s.tx_frame.as_ptr(), total) {
+        return false;
     }
+    if consumes_seq {
+        let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+        // Advance only if this byte hasn't already been credited.
+        // `snd_nxt == seq` is true for a fresh send and for the first
+        // successful retry after a failed initial attempt; it's false
+        // once an earlier attempt has already advanced `snd_nxt` past
+        // the SYN/FIN byte.
+        if conn.snd_nxt == seq {
+            conn.snd_nxt = conn.snd_nxt.wrapping_add(1);
+        }
+    }
+    true
 }
 
-/// Send TCP data segment for a connection.
+/// Send a TCP data segment. Returns `true` iff the frame was queued;
+/// on `false` `snd_nxt` is unchanged and the bytes remain the caller's
+/// responsibility (the upstream stash in `pending_cmd_*`).
 #[inline(never)]
-unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, payload_len: usize) {
+unsafe fn send_tcp_data(
+    s: &mut IpState,
+    conn_idx: usize,
+    payload: *const u8,
+    payload_len: usize,
+) -> bool {
     if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
-        return;
+        return false;
     }
 
     // Extract conn fields
@@ -1501,7 +1624,7 @@ unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, pa
     let dst_mac = resolve_mac(s, remote_ip);
     let dst_mac = match dst_mac {
         Some(m) => m,
-        None => return,
+        None => return false,
     };
 
     let hdr_offset = eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN;
@@ -1530,10 +1653,12 @@ unsafe fn send_tcp_data(s: &mut IpState, conn_idx: usize, payload: *const u8, pa
     );
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
-    send_frame(s, s.tx_frame.as_ptr(), total);
-
-    // Advance snd_nxt
-    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt.wrapping_add(payload_len as u32);
+    if !send_frame(s, s.tx_frame.as_ptr(), total) {
+        return false;
+    }
+    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt =
+        (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt.wrapping_add(payload_len as u32);
+    true
 }
 
 /// Return true if `dst` is an IPv4 broadcast address we must not emit
@@ -1858,26 +1983,175 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
 // Net Protocol Channel Service
 // ============================================================================
 
+/// True iff the connection state allows queueing new outbound data.
+/// Established: normal full-duplex. CloseWait: peer FIN'd but our
+/// half is still open per RFC 793 — we can keep sending until our
+/// own FIN. Anything else (FinWait1+/Closing/LastAck/TimeWait/Closed)
+/// has either already sent FIN or has no socket to deliver to.
+#[inline(always)]
+fn state_allows_send(state: tcp::TcpState) -> bool {
+    matches!(state, tcp::TcpState::Established | tcp::TcpState::CloseWait)
+}
+
+/// Apply the CLOSE half-handshake for `conn_id`. Returns `true` iff
+/// the action completed (FIN queued AND state advanced, or the
+/// listening / already-closed branches that don't need a frame).
+/// Returns `false` only when the FIN couldn't be queued — the caller
+/// (CMD_CLOSE arm or pending_close retry) must keep the close
+/// pending and re-fire next tick.
+///
+/// Mirrors RFC 793 §3.5: from Established → FIN_WAIT_1 (we initiate
+/// close); from CloseWait → LAST_ACK (peer FIN'd first). State only
+/// advances on successful FIN queue, so a backpressured FIN doesn't
+/// strand the conn in FinWait1 with no frame on the wire.
+unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
+    if conn_id >= tcp::MAX_TCP_CONNS { return true; }
+    let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
+    match conn_state {
+        tcp::TcpState::Established => {
+            if !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false) {
+                return false;
+            }
+            (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::FinWait1;
+            true
+        }
+        tcp::TcpState::CloseWait => {
+            if !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false) {
+                return false;
+            }
+            (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::LastAck;
+            true
+        }
+        tcp::TcpState::Listen => {
+            // Close a listening socket
+            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+            *conn = tcp::TcpConn::new();
+            net_send_closed(s, conn_id as u8);
+            true
+        }
+        _ => {
+            // Already closing/closed — reset and notify
+            let remote_ip = (*s.tcp_conns.as_ptr().add(conn_id)).remote_ip;
+            if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
+            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+            *conn = tcp::TcpConn::new();
+            net_send_closed(s, conn_id as u8);
+            true
+        }
+    }
+}
+
+/// Drain a buffered CMD_SEND payload starting at byte `start_off`
+/// (where byte 0 is `conn_id` and bytes 1.. are the data). Emits up
+/// to `MSS` bytes per TCP segment, capped by the peer's effective
+/// send window. Returns the new data offset.
+///
+/// Three terminal cases:
+///   * `data_off == payload_len`: fully drained. Caller clears stash.
+///   * `data_off < payload_len` AND state still allows send: peer
+///     window or NIC backpressure stalled the drain. Caller stashes
+///     (or leaves stash) for retry.
+///   * `data_off < payload_len` AND state no longer allows send:
+///     conn went Closed/RST/FinWait* mid-drain. Returns `payload_len`
+///     so the caller clears the stash — the remaining bytes are
+///     unrecoverable (peer is gone or our FIN already shipped).
+unsafe fn try_send_cmd_payload(
+    s: &mut IpState,
+    conn_id: usize,
+    payload: *const u8,
+    payload_len: usize,
+    start_off: usize,
+) -> usize {
+    let mut data_off = start_off;
+    while data_off < payload_len {
+        let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
+        if !state_allows_send(conn_state) {
+            return payload_len;
+        }
+        let conn = &*s.tcp_conns.as_ptr().add(conn_id);
+        let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
+        let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+        let avail_wnd = eff_wnd.saturating_sub(in_flight);
+        if avail_wnd == 0 {
+            // Peer's window closed — stash and wait for an ACK to open it.
+            return data_off;
+        }
+        let chunk = (payload_len - data_off)
+            .min(tcp::MSS as usize)
+            .min(avail_wnd);
+        if chunk == 0 { return data_off; }
+        let seq = conn.snd_nxt;
+        let tick = s.step_count as u16;
+        let ok = send_tcp_data(s, conn_id, payload.add(data_off), chunk);
+        if !ok {
+            // NIC out_chan full or ARP miss. snd_nxt was NOT advanced —
+            // stash the unsent tail and retry next tick.
+            return data_off;
+        }
+        let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
+        tcp::rtt_arm(conn2, seq, tick);
+        data_off += chunk;
+    }
+    data_off
+}
+
 /// Read and dispatch net protocol commands from the consumer channel.
-/// Replaces the old socket-based service_sockets().
 unsafe fn service_net_channels(s: &mut IpState) {
     if s.net_in_chan < 0 { return; }
     let sys = &*s.syscalls;
 
+    // Resume a stashed CMD_SEND tail before touching `net_in_chan`.
+    // Holding off on the read propagates backpressure to the consumer
+    // (its `channel_write` into `net_in_chan` stalls when the ring
+    // fills).
+    if s.pending_cmd_valid != 0 {
+        let conn_id = s.pending_cmd_conn as usize;
+        let total_len = s.pending_cmd_len as usize;
+        let off = s.pending_cmd_off as usize;
+        let new_off = try_send_cmd_payload(
+            s,
+            conn_id,
+            s.pending_cmd_buf.as_ptr(),
+            total_len,
+            off,
+        );
+        if new_off >= total_len {
+            s.pending_cmd_valid = 0;
+            s.pending_cmd_off = 0;
+            s.pending_cmd_len = 0;
+        } else {
+            s.pending_cmd_off = new_off as u16;
+            return;
+        }
+    }
+
+    // RFC 793 §3.5: CLOSE transmits all queued SENDs first. With the
+    // stash drained, fire any deferred FIN before reading new frames.
+    // If `process_cmd_close` couldn't queue the FIN, leave the slot
+    // valid and retry next tick — state stays sendable until the FIN
+    // is actually on the wire.
+    if s.pending_close_valid != 0 {
+        let conn_id = s.pending_close_conn as usize;
+        if process_cmd_close(s, conn_id) {
+            s.pending_close_valid = 0;
+        } else {
+            return;
+        }
+    }
+
     // Process up to 32 commands per step. Producers (http, etc.)
-    // stage many MSS-sized CMD_SENDs in a single tick; a small batch
-    // limit caps single-connection throughput at one MSS per command.
-    // 32 sits well below the burst-iteration limit on aarch64 yet is
-    // enough to keep the back-pressure point past gigabit saturation.
+    // stage many MSS-sized CMD_SENDs in a single tick; this batch
+    // limit caps single-connection throughput at one MSS per command,
+    // sitting well below the burst-iteration limit on aarch64 yet
+    // high enough to saturate gigabit.
     //
-    // `buf` must be ≥ the largest single CMD_SEND payload (NET_BUF_SIZE
-    // + framing). `ip_net_read_frame` caps the second `channel_read`
-    // at `buf_max - NET_FRAME_HDR`; an undersized buffer truncates the
-    // payload and leaves the tail in the kernel ring, where it
-    // corrupts the next frame's header parse.
+    // `buf` must be ≥ the largest single CMD_SEND payload — the
+    // upstream cap is `NET_BUF_SIZE`, matched here by
+    // `PENDING_CMD_BUF_SIZE`. An undersized buffer would truncate
+    // the payload and corrupt the next frame's header parse.
     let mut count = 0;
     while count < 32 {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; PENDING_CMD_BUF_SIZE];
         let (msg_type, payload_len) = ip_net_read_frame(sys, s.net_in_chan, buf.as_mut_ptr(), buf.len());
         if msg_type == 0 {
             break;
@@ -1958,91 +2232,70 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             conn.rcv_wnd = 512;
                             conn.retransmit_timer = 0;
 
-                            send_tcp_control(s, ci, tcp::SYN);
+                            send_tcp_control(s, ci, tcp::SYN, false);
                         }
                     }
                 }
             }
             NET_CMD_SEND => {
                 // Stream Surface v1: send TCP payload.
-                // Payload: [conn_id: u8] [data...].
-                //
-                // A single CMD_SEND can carry many MSS of data — the
-                // caller stages up to `net_buf` worth at a time. Split
-                // into MSS-sized TCP segments and emit each one while
-                // the effective send window has room.
+                // Payload: [conn_id: u8] [data...]. A single CMD_SEND
+                // can carry many MSS; `try_send_cmd_payload` segments
+                // into MSS-sized writes against the peer window, and
+                // any unsent tail goes into `pending_cmd_*` for the
+                // next tick.
                 if plen >= 2 {
                     let conn_id = *buf.as_ptr() as usize;
-                    let mut data_off = 1usize;
                     let total_len = plen;
-
-                    if conn_id < tcp::MAX_TCP_CONNS {
-                        // Skip the whole CMD_SEND payload if the conn
-                        // isn't Established or rcv_wnd is zero — TCP
-                        // would otherwise mis-sequence it.
-                        let active = {
-                            let conn = &*s.tcp_conns.as_ptr().add(conn_id);
-                            conn.state == tcp::TcpState::Established && conn.rcv_wnd != 0
-                        };
-                        if active {
-                            while data_off < total_len {
-                                let conn = &*s.tcp_conns.as_ptr().add(conn_id);
-                                let eff_wnd = tcp::effective_snd_wnd(conn) as usize;
-                                let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
-                                let avail_wnd = eff_wnd.saturating_sub(in_flight);
-                                if avail_wnd == 0 {
-                                    // Window exhausted: drop the
-                                    // remainder rather than queue it.
-                                    // The caller is responsible for
-                                    // pacing against ACKs; partial
-                                    // delivery is preferable to
-                                    // mis-sequencing the stream.
-                                    break;
-                                }
-                                let chunk = (total_len - data_off)
-                                    .min(tcp::MSS as usize)
-                                    .min(avail_wnd);
-                                if chunk == 0 { break; }
-                                let seq = conn.snd_nxt;
-                                let tick = s.step_count as u16;
-                                send_tcp_data(s, conn_id, buf.as_ptr().add(data_off), chunk);
-                                let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
-                                tcp::rtt_arm(conn2, seq, tick);
-                                data_off += chunk;
+                    if conn_id < tcp::MAX_TCP_CONNS
+                        && total_len <= PENDING_CMD_BUF_SIZE
+                    {
+                        let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
+                        if state_allows_send(conn_state) {
+                            let new_off = try_send_cmd_payload(
+                                s,
+                                conn_id,
+                                buf.as_ptr(),
+                                total_len,
+                                1,
+                            );
+                            if new_off < total_len {
+                                // Stash the buffer verbatim (conn_id
+                                // at byte 0) so the resume path uses
+                                // the same offsets, and stop reading
+                                // — backpressure must propagate to
+                                // the consumer.
+                                core::ptr::copy_nonoverlapping(
+                                    buf.as_ptr(),
+                                    s.pending_cmd_buf.as_mut_ptr(),
+                                    total_len,
+                                );
+                                s.pending_cmd_conn = conn_id as u8;
+                                s.pending_cmd_off = new_off as u16;
+                                s.pending_cmd_len = total_len as u16;
+                                s.pending_cmd_valid = 1;
+                                return;
                             }
                         }
+                        // Conn not in a sendable state — drop. Upstream
+                        // owns re-delivery (CMD_CLOSE raced CMD_SEND,
+                        // or peer RST'd before delivery).
                     }
                 }
             }
             NET_CMD_CLOSE => {
-                // Payload: [conn_id: u8]
+                // Payload: [conn_id: u8]. Defer the FIN if there's
+                // stashed CMD_SEND data still draining (RFC 793 §3.5:
+                // CLOSE waits for queued SENDs to be transmitted) or
+                // if the FIN frame itself can't be queued; the prelude
+                // retry path resumes once the precondition clears.
                 if plen >= 1 {
                     let conn_id = *buf.as_ptr() as usize;
                     if conn_id < tcp::MAX_TCP_CONNS {
-                        let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
-                        match conn_state {
-                            tcp::TcpState::Established => {
-                                send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK);
-                                (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::FinWait1;
-                            }
-                            tcp::TcpState::CloseWait => {
-                                send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK);
-                                (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::LastAck;
-                            }
-                            tcp::TcpState::Listen => {
-                                // Close a listening socket
-                                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
-                                *conn = tcp::TcpConn::new();
-                                net_send_closed(s, conn_id as u8);
-                            }
-                            _ => {
-                                // Already closing/closed — reset and notify
-                                let remote_ip = (*s.tcp_conns.as_ptr().add(conn_id)).remote_ip;
-                                if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
-                                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
-                                *conn = tcp::TcpConn::new();
-                                net_send_closed(s, conn_id as u8);
-                            }
+                        if s.pending_cmd_valid != 0 || !process_cmd_close(s, conn_id) {
+                            s.pending_close_valid = 1;
+                            s.pending_close_conn = conn_id as u8;
+                            return;
                         }
                     }
                 }
@@ -2140,14 +2393,14 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                 // Retransmit SYN after ~3 seconds (60 ticks at 50ms period)
                 if conn.retransmit_timer > 60 {
                     conn.retransmit_timer = 0;
-                    send_tcp_control(s, i, tcp::SYN);
+                    send_tcp_control(s, i, tcp::SYN, true);
                 }
             }
             tcp::TcpState::SynReceived => {
                 conn.retransmit_timer += 1;
                 // Retransmit SYN-ACK every ~3 seconds (timer doesn't reset)
                 if conn.retransmit_timer % 60 == 0 && conn.retransmit_timer < 300 {
-                    send_tcp_control(s, i, tcp::SYN | tcp::ACK);
+                    send_tcp_control(s, i, tcp::SYN | tcp::ACK, true);
                 }
                 // Timeout after ~15 seconds — free the slot.
                 if conn.retransmit_timer >= 300 {

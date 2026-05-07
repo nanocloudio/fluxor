@@ -729,7 +729,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if (in_poll as u32) & POLL_HUP != 0
                 && ((in_poll as u32) & POLL_IN) == 0
             {
-                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut());
+                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
                 dev_log(sys, 3, b"[img] rst".as_ptr(), 9);
                 reset_decoder(s);
                 return 0;

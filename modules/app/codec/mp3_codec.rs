@@ -2300,7 +2300,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
                 *rb.add(1) = (sr >> 8) as u8;
                 *rb.add(2) = (sr >> 16) as u8;
                 *rb.add(3) = (sr >> 24) as u8;
-                dev_channel_ioctl(sys, out_chan, IOCTL_NOTIFY, rb);
+                dev_channel_ioctl(sys, out_chan, IOCTL_NOTIFY, rb, 4);
                 s.last_sent_rate = s.sample_rate;
             }
 

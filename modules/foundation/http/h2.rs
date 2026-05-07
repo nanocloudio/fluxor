@@ -1572,7 +1572,7 @@ unsafe fn begin_file_response(s: &mut HttpState, slot_idx: i8, matched_route: i8
         if s.server.file_chan >= 0 {
             let mut count: u32 = 0;
             let count_ptr = &mut count as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_POLL_NOTIFY, count_ptr);
+            let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_POLL_NOTIFY, count_ptr, 4);
             if r >= 0 {
                 s.server.file_count = count as u16;
             }
@@ -1586,10 +1586,10 @@ unsafe fn begin_file_response(s: &mut HttpState, slot_idx: i8, matched_route: i8
             free_slot(s, slot_idx);
             return;
         }
-        dev_channel_ioctl(sys, s.server.file_chan, IOCTL_FLUSH, core::ptr::null_mut());
+        dev_channel_ioctl(sys, s.server.file_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
         let mut pos = fi as u32;
         let pos_ptr = &mut pos as *mut u32 as *mut u8;
-        let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_NOTIFY, pos_ptr);
+        let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
         if r < 0 {
             emit_response(s, stream_id, b"404", b"text/plain", b"Not Found\n");
             free_slot(s, slot_idx);

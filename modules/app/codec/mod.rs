@@ -362,7 +362,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let in_poll = (sys.channel_poll)(s.in_chan, POLL_IN | POLL_HUP);
             if (in_poll as u32) & POLL_HUP != 0 {
                 // Flush our input: clears old encoded data and the eof_flag
-                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut());
+                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
                 dev_log(sys, 3, b"[dec] rst".as_ptr(), 9);
                 reset_to_detect(s);
                 return 0;

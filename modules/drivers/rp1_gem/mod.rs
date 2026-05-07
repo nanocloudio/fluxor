@@ -59,6 +59,7 @@ const GEM_DCFG2: usize = 0x284;         // Design config 2
 // most Cadence GEM revisions; treat reads as monotonic deltas between
 // heartbeats without assuming persistence across reads.
 const GEM_FRAMES_RX:     usize = 0x0158; // frames received OK
+const GEM_FRAMES_TX:     usize = 0x0108; // frames transmitted OK
 const GEM_RX_RESOURCE:   usize = 0x01A0; // RX resource errors (BNA)
 const GEM_RX_OVERRUN:    usize = 0x01A4; // RX overrun errors
 
@@ -66,6 +67,17 @@ const GEM_RX_OVERRUN:    usize = 0x01A4; // RX overrun errors
 const RSR_BNA:           u32 = 1 << 0;   // buffer not available on RX
 const RSR_FRMREC:        u32 = 1 << 1;   // frame received
 const RSR_RXOVR:         u32 = 1 << 2;   // RX overrun
+
+// TX status register bits (TXSR @ 0x014). All sticky (RW1C). The
+// drop-causing bits (URUN/RLE/LCOL/HRESP) accumulate into
+// `txsr_sticky` so silent TX loss is visible in the heartbeat.
+const TXSR_USED:         u32 = 1 << 0;   // descriptor USED=1 (no work)
+const TXSR_COL:          u32 = 1 << 1;   // collision
+const TXSR_RLE:          u32 = 1 << 2;   // retry limit exceeded — frame DROPPED
+const TXSR_HRESP:        u32 = 1 << 4;   // AHB transfer error — frame DROPPED
+const TXSR_TXCOMPL:      u32 = 1 << 5;   // TX complete
+const TXSR_URUN:         u32 = 1 << 6;   // TX FIFO under-run — frame ABORTED
+const TXSR_LCOL:         u32 = 1 << 7;   // late collision — frame ABORTED
 
 // Upper base address registers (64-bit DMA)
 const GEM_RBQPH: usize = 0x04D4;        // RX queue base addr high
@@ -181,6 +193,22 @@ struct GemState {
     /// Cumulative RX frames at hardware level (may exceed
     /// `rx_packets` if some frames couldn't be forwarded upstream).
     rx_frames_hw_total: u32,
+    /// Cumulative TX frames at the hardware level (`GEM_FRAMES_TX`).
+    /// `tx_packets - tx_frames_hw_total` is the silent-loss count —
+    /// frames the driver queued but the MAC never emitted.
+    tx_frames_hw_total: u32,
+    /// OR-accumulated TXSR bits since boot. Surfaces transient
+    /// URUN/RLE/LCOL events that the per-heartbeat snapshot might
+    /// miss between polls.
+    txsr_sticky: u32,
+    /// Times the submit loop bailed because the TX descriptor ring
+    /// was full (`used >= tx_desc_count`). Sustained growth means
+    /// reclaim is stuck on a USED bit GEM never set.
+    tx_ring_full_breaks: u32,
+    /// Times a TX-frame body read returned fewer bytes than the
+    /// 2-byte length header advertised. Should stay zero — atomic
+    /// channel writes prevent torn frames in normal operation.
+    tx_short_reads: u32,
     /// Staging buffer for RX length-prefixed frames. Each frame is copied
     /// out of the DMA pool with a 2-byte LE length header so the byte-stream
     /// channel to the IP module preserves frame boundaries.
@@ -217,54 +245,84 @@ unsafe fn append_dec_field(p: *mut u8, pos: &mut usize, tag: &[u8], val: u32) {
     *pos += fmt_u32_raw(p.add(*pos), val);
 }
 
-/// Periodic heartbeat: emits `[rp1_gem] rx=N tx=M rsr=0xHH bna=K ovr=J
-/// hwrx=H` once every ~5 s in phase 2. `bna` is the cumulative
-/// RX_RESOURCE error count (buffer not available — a non-zero value
-/// means poll_rx fell behind the controller); `ovr` is cumulative
-/// RX overruns; `hwrx` is what the HW counted vs. `rx` which is
-/// what the module forwarded upstream.
+/// Append `tag=0xHHHHHHHH` (8 hex nibbles) to `p[*pos..]` and advance.
+unsafe fn append_hex32_field(p: *mut u8, pos: &mut usize, tag: &[u8], val: u32) {
+    core::ptr::copy_nonoverlapping(tag.as_ptr(), p.add(*pos), tag.len());
+    *pos += tag.len();
+    let mut n = 0u32;
+    while n < 8 {
+        let nib = ((val >> (28 - n * 4)) & 0xF) as u8;
+        *p.add(*pos) = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        *pos += 1;
+        n += 1;
+    }
+}
+
+/// Periodic heartbeat (~5 s in phase 2). Emits two lines:
 ///
-/// RSR (network status) is a snapshot at heartbeat time. The
-/// known-interesting sticky bits are write-1-cleared at the bottom
-/// so the next window starts fresh.
+///   `[rp1_gem] rx=N tx=M rsr=0xHH bna=K ovr=J hwrx=H hwtx=T`
+///   `[rp1_gem] th=H tt=T u=U rfb=F shr=S txsr=0xHH txstk=0xHH`
+///
+/// `tx` vs `hwtx` is the silent-loss signal: every frame the driver
+/// counted as queued (`tx_packets`) but the MAC never emitted
+/// (`GEM_FRAMES_TX`). Line two adds TX descriptor-ring state plus
+/// TXSR (current window + OR-sticky since boot) so MAC-level error
+/// bits (URUN, RLE, …) surface even if they cleared between snapshots.
+///
+/// Read-clear status registers are cleared at the bottom of the
+/// heartbeat; module-side sticky accumulators survive.
 unsafe fn heartbeat(s: &mut GemState) {
     let base = s.gem_base;
     let rsr = gem_read(base, GEM_RXSTATUS);
+    let txsr = gem_read(base, GEM_TXSTATUS);
+    s.txsr_sticky |= txsr;
+
     // HW stat registers are RW1C on read (Cadence convention); each
     // read returns the delta since the last read. Sum into state so
     // the heartbeat shows a monotonic total over the run.
     s.rx_resource_total  = s.rx_resource_total.wrapping_add(gem_read(base, GEM_RX_RESOURCE));
     s.rx_overrun_total   = s.rx_overrun_total.wrapping_add(gem_read(base, GEM_RX_OVERRUN));
     s.rx_frames_hw_total = s.rx_frames_hw_total.wrapping_add(gem_read(base, GEM_FRAMES_RX));
+    s.tx_frames_hw_total = s.tx_frames_hw_total.wrapping_add(gem_read(base, GEM_FRAMES_TX));
 
-    let mut msg = [0u8; 96];
-    let p = msg.as_mut_ptr();
-    let prefix = b"[rp1_gem] rx=";
-    core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
-    let mut pos = prefix.len();
-    pos += fmt_u32_raw(p.add(pos), s.rx_packets);
-    append_dec_field(p, &mut pos, b" tx=", s.tx_packets);
-
-    // rsr is 8 hex nibbles.
-    let rsr_tag = b" rsr=0x";
-    core::ptr::copy_nonoverlapping(rsr_tag.as_ptr(), p.add(pos), rsr_tag.len());
-    pos += rsr_tag.len();
-    let mut n = 0u32;
-    while n < 8 {
-        let nib = ((rsr >> (28 - n * 4)) & 0xF) as u8;
-        *p.add(pos) = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
-        pos += 1;
-        n += 1;
+    {
+        let mut msg = [0u8; 96];
+        let p = msg.as_mut_ptr();
+        let prefix = b"[rp1_gem] rx=";
+        core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+        let mut pos = prefix.len();
+        pos += fmt_u32_raw(p.add(pos), s.rx_packets);
+        append_dec_field(p, &mut pos, b" tx=", s.tx_packets);
+        append_hex32_field(p, &mut pos, b" rsr=0x", rsr);
+        append_dec_field(p, &mut pos, b" bna=",  s.rx_resource_total);
+        append_dec_field(p, &mut pos, b" ovr=",  s.rx_overrun_total);
+        append_dec_field(p, &mut pos, b" hwrx=", s.rx_frames_hw_total);
+        append_dec_field(p, &mut pos, b" hwtx=", s.tx_frames_hw_total);
+        dev_log(&*s.syscalls, 3, p, pos);
     }
 
-    append_dec_field(p, &mut pos, b" bna=",  s.rx_resource_total);
-    append_dec_field(p, &mut pos, b" ovr=",  s.rx_overrun_total);
-    append_dec_field(p, &mut pos, b" hwrx=", s.rx_frames_hw_total);
-    dev_log(&*s.syscalls, 3, p, pos);
+    {
+        let mut msg = [0u8; 96];
+        let p = msg.as_mut_ptr();
+        let prefix = b"[rp1_gem] th=";
+        core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+        let mut pos = prefix.len();
+        pos += fmt_u32_raw(p.add(pos), s.tx_head as u32);
+        append_dec_field(p, &mut pos, b" tt=", s.tx_tail as u32);
+        let used = s.tx_head.wrapping_sub(s.tx_tail) as u32;
+        append_dec_field(p, &mut pos, b" u=", used);
+        append_dec_field(p, &mut pos, b" rfb=", s.tx_ring_full_breaks);
+        append_dec_field(p, &mut pos, b" shr=", s.tx_short_reads);
+        append_hex32_field(p, &mut pos, b" txsr=0x", txsr);
+        append_hex32_field(p, &mut pos, b" txstk=0x", s.txsr_sticky);
+        dev_log(&*s.syscalls, 3, p, pos);
+    }
 
     // Write-1-clear the bits we interpret so the next heartbeat sees
     // a fresh window. Unrelated bits we don't touch stay as-is.
     gem_write(base, GEM_RXSTATUS, rsr & (RSR_BNA | RSR_FRMREC | RSR_RXOVR));
+    gem_write(base, GEM_TXSTATUS, txsr & (TXSR_USED | TXSR_COL | TXSR_RLE
+        | TXSR_HRESP | TXSR_TXCOMPL | TXSR_URUN | TXSR_LCOL));
 }
 
 // ============================================================================
@@ -684,6 +742,7 @@ unsafe fn poll_tx(s: &mut GemState) {
         // owns; re-check on every iteration.
         let used = s.tx_head.wrapping_sub(s.tx_tail);
         if used >= s.tx_desc_count {
+            s.tx_ring_full_breaks = s.tx_ring_full_breaks.wrapping_add(1);
             break;
         }
 
@@ -699,11 +758,22 @@ unsafe fn poll_tx(s: &mut GemState) {
         // has no header to deliver.
         let mut hdr = [0u8; 2];
         let hn = (sys.channel_read)(s.in_chan, hdr.as_mut_ptr(), 2);
-        if hn < 2 { break; }
+        if hn < 2 {
+            // Partial-header reads shouldn't happen (IP writes header
+            // + body atomically); count any that do for diagnostics.
+            if hn > 0 { s.tx_short_reads = s.tx_short_reads.wrapping_add(1); }
+            break;
+        }
         let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
         if frame_len == 0 || frame_len > MAX_FRAME { break; }
         let n = (sys.channel_read)(s.in_chan, buf_ptr, frame_len) as i32;
         if n <= 0 { break; }
+        if (n as usize) < frame_len {
+            // Body shorter than the header advertised — make the
+            // anomaly visible in the heartbeat. The descriptor still
+            // TXes whatever bytes did arrive.
+            s.tx_short_reads = s.tx_short_reads.wrapping_add(1);
+        }
 
         let desc_base = s.tx_desc_addr as usize + idx * 16;
         write_volatile(desc_base as *mut u32, buf_dma as u32);

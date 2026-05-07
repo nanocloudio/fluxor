@@ -251,7 +251,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let sys = &*s.syscalls;
                     let mut rate_val = [0u8; 4];
                     let rv = rate_val.as_mut_ptr();
-                    let res = dev_channel_ioctl(sys, s.in_chan, IOCTL_POLL_NOTIFY, rv);
+                    let res = dev_channel_ioctl(sys, s.in_chan, IOCTL_POLL_NOTIFY, rv, 4);
                     if res == 0 {
                         let new_rate = u32::from_le_bytes(rate_val);
                         if new_rate > 0 {
@@ -403,7 +403,7 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
     {
         let mut rate_val = [0u8; 4];
         let rv = rate_val.as_mut_ptr();
-        let res = dev_channel_ioctl(syscalls, in_chan, IOCTL_POLL_NOTIFY, rv);
+        let res = dev_channel_ioctl(syscalls, in_chan, IOCTL_POLL_NOTIFY, rv, 4);
         if res == 0 {
             let new_rate = u32::from_le_bytes(rate_val);
             if new_rate > 0 {

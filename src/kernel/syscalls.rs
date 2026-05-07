@@ -798,7 +798,28 @@ unsafe fn channel_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
                 return E_INVAL;
             }
             let cmd = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let data_ptr = if arg_len >= 8 {
+            let payload_len = arg_len - 4;
+            // Built-in cmds have fixed-size args. The kernel handlers
+            // deref the arg pointer at a fixed width, so reject any
+            // mismatched length here rather than letting them read
+            // out-of-bounds bytes from the caller's buffer.
+            match cmd {
+                channel::IOCTL_NOTIFY | channel::IOCTL_POLL_NOTIFY => {
+                    if payload_len != 4 {
+                        return E_INVAL;
+                    }
+                }
+                channel::IOCTL_FLUSH | channel::IOCTL_SET_HUP => {
+                    if payload_len != 0 {
+                        return E_INVAL;
+                    }
+                }
+                _ => {
+                    // Module-registered handler — length is part of
+                    // the per-cmd contract, validated by the handler.
+                }
+            }
+            let data_ptr = if payload_len > 0 {
                 arg.add(4)
             } else {
                 core::ptr::null_mut()

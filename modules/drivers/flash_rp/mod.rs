@@ -613,7 +613,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // Poll for seek request from downstream (bank)
                     let mut seek_pos: u32 = 0;
                     let seek_ptr = &mut seek_pos as *mut u32 as *mut u8;
-                    let res = dev_channel_ioctl(sys, s.stream_chan, IOCTL_POLL_NOTIFY, seek_ptr);
+                    let res = dev_channel_ioctl(sys, s.stream_chan, IOCTL_POLL_NOTIFY, seek_ptr, 4);
                     if res == 0 && (seek_pos as u8) < s.blob_count {
                         s.current_blob = seek_pos as u8;
                         s.blob_write_pos = 0;
@@ -635,7 +635,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                     if pos >= blob_len {
                         // Done — send EOF and return to idle
-                        dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut());
+                        dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut(), 0);
                         s.stream_phase = StreamPhase::Idle;
                         return 0;
                     }
@@ -651,7 +651,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                     // Check if we finished
                     if s.blob_write_pos as usize >= blob_len {
-                        dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut());
+                        dev_channel_ioctl(sys, s.stream_chan, IOCTL_EOF, core::ptr::null_mut(), 0);
                         s.stream_phase = StreamPhase::Idle;
                         return 0;
                     }

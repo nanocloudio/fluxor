@@ -1676,6 +1676,7 @@ unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
         &*s.syscalls, s.blk_out,
         IOCTL_POLL_NOTIFY,
         &mut seek as *mut u32 as *mut u8,
+        4,
     );
     if res == 0 {
         s.current_block = seek;

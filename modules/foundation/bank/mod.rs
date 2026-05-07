@@ -270,7 +270,7 @@ unsafe fn fs_open_index(s: &mut BankState, idx: u16) -> bool {
 #[inline]
 unsafe fn signal_stream_eof(s: &BankState) {
     if s.out_chans[0] >= 0 {
-        dev_channel_ioctl(s.sys(), s.out_chans[0], IOCTL_EOF, core::ptr::null_mut());
+        dev_channel_ioctl(s.sys(), s.out_chans[0], IOCTL_EOF, core::ptr::null_mut(), 0);
     }
 }
 

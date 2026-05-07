@@ -335,12 +335,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         {
             let mut rate_val = [0u8; 4];
             let rv = rate_val.as_mut_ptr();
-            let res = dev_channel_ioctl(sys, s.in_chan, IOCTL_POLL_NOTIFY, rv);
+            let res = dev_channel_ioctl(sys, s.in_chan, IOCTL_POLL_NOTIFY, rv, 4);
             if res == 0 {
                 let new_rate = u32::from_le_bytes(rate_val);
                 if new_rate > 0 {
                     s.sample_rate = new_rate;
-                    dev_channel_ioctl(sys, s.out_chan, IOCTL_NOTIFY, rv);
+                    dev_channel_ioctl(sys, s.out_chan, IOCTL_NOTIFY, rv, 4);
                 }
             }
         }

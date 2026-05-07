@@ -358,6 +358,13 @@ pub(crate) struct ServerState {
     pub(crate) pending_data: [[u8; PENDING_DATA_BYTES]; PENDING_ACCEPT_DEPTH],
     pub(crate) pending_data_len: [u16; PENDING_ACCEPT_DEPTH],
 
+    /// Consecutive `WsActive` ticks during which queued
+    /// `pending_accept` connections see no observed WS progress.
+    /// Used to preempt a stale WS (browser reload that didn't send
+    /// WS-Close or FIN) so queued connections get served instead of
+    /// waiting on the TCP keepalive timeout.
+    pub(crate) ws_pending_stuck_ticks: u32,
+
     /// HTTP/2 connection state. Only meaningful while `phase ==
     /// Phase::H2Active`; zero-valued otherwise.
     pub(crate) h2: super::h2::H2State,
@@ -425,6 +432,7 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.ws_fan_out = 0;
     s.server.peer_closed = 0;
     s.server.pending_accept_count = 0;
+    s.server.ws_pending_stuck_ticks = 0;
     s.server.port = 80;
     s.server.file_index = -1;
     s.server.matched_route = -1;
@@ -471,7 +479,7 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     if s.server.file_chan >= 0 {
         let mut count: u32 = 0;
         let count_ptr = &mut count as *mut u32 as *mut u8;
-        let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_POLL_NOTIFY, count_ptr);
+        let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_POLL_NOTIFY, count_ptr, 4);
         if r >= 0 {
             s.server.file_count = count as u16;
         }
@@ -489,11 +497,9 @@ unsafe fn log(s: &HttpState, msg: &[u8]) {
 
 unsafe fn reset_connection(s: &mut HttpState) {
     // Skip CMD_CLOSE if the peer already closed (`peer_closed` flag).
-    // Otherwise the IP module would either no-op (empty slot) OR — much
+    // Otherwise the IP module would either no-op (empty slot) OR —
     // worse, under fast slot reuse — close the next browser connection
-    // that just landed on the same slot index. That misroute is the
-    // root cause of "only handles a single connection then falls over"
-    // in remote-play sessions.
+    // that just landed on the same slot index.
     if s.server.peer_closed == 0
         && s.server.phase as u8 > Phase::WaitAccept as u8
         && s.net_out_chan >= 0
@@ -501,6 +507,7 @@ unsafe fn reset_connection(s: &mut HttpState) {
         close_net_conn(s, s.server.conn_id);
     }
     s.server.peer_closed = 0;
+    s.server.ws_pending_stuck_ticks = 0;
     // Discard any per-session buffered state — without this, leftover
     // WS frames from the prior session can leak onto the next
     // (non-WS) connection's response stream, scrambling the HTTP
@@ -1113,10 +1120,11 @@ pub(crate) unsafe fn cache_try_or_fetch(s: &mut HttpState, route_idx: i8) -> Cac
         s.server.file_chan,
         IOCTL_FLUSH,
         core::ptr::null_mut(),
+        0,
     );
     let mut pos = src_idx as u32;
     let pos_ptr = &mut pos as *mut u32 as *mut u8;
-    dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr);
+    dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
     CacheLookup::Pending
 }
 
@@ -1370,6 +1378,7 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpState) {
                 s.server.file_chan,
                 IOCTL_POLL_NOTIFY,
                 count_ptr,
+                4,
             );
             if r >= 0 {
                 s.server.file_count = count as u16;
@@ -1411,10 +1420,11 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpState) {
                 s.server.file_chan,
                 IOCTL_FLUSH,
                 core::ptr::null_mut(),
+                0,
             );
             let mut pos = idx as u32;
             let pos_ptr = &mut pos as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr);
+            let r = dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
             if r < 0 {
                 build_error(s, b"404 Not Found", b"Not Found\n");
                 s.server.phase = Phase::DrainSend;
@@ -1765,10 +1775,11 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
     core::ptr::copy_nonoverlapping(data, scratch.add(4), to_send);
     let total = NET_FRAME_HDR + payload_len;
     let written = (sys.channel_write)(chan, scratch, total);
-    if written >= total as i32 {
+    if written == total as i32 {
         s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(to_send as u32);
         to_send as i32
     } else {
+        // Atomic FIFO write rejected — treat as backpressure.
         s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
         0
     }
@@ -1987,6 +1998,35 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         | Phase::RecvRequest
         | Phase::WsActive => {}
         _ => drain_background_messages(s),
+    }
+
+    // If MSG_CLOSED has fired for the current conn, any outbound-write
+    // phase will spin against a closed slot — IP accepts CMD_SEND on
+    // CloseWait but the bytes never reach the wire, so `send_offset`
+    // never advances. Short-circuit to CloseConn so WaitAccept gets
+    // ticks again.
+    if s.server.peer_closed != 0 {
+        match s.server.phase {
+            Phase::SendHeaders
+            | Phase::SendBody
+            | Phase::DrainSend
+            | Phase::FetchContent
+            | Phase::CacheStream
+            | Phase::WsHandshake
+            | Phase::WsClose => {
+                if s.server.fs_fd >= 0 {
+                    ((*s.syscalls).provider_call)(
+                        s.server.fs_fd,
+                        0x0903, // FS_CLOSE
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    s.server.fs_fd = -1;
+                }
+                s.server.phase = Phase::CloseConn;
+            }
+            _ => {}
+        }
     }
 
     match s.server.phase {
@@ -2415,6 +2455,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                                 s.server.file_chan,
                                 IOCTL_FLUSH,
                                 core::ptr::null_mut(),
+                                0,
                             );
                             let mut pos = src_idx as u32;
                             let pos_ptr = &mut pos as *mut u32 as *mut u8;
@@ -2423,6 +2464,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                                 s.server.file_chan,
                                 IOCTL_NOTIFY,
                                 pos_ptr,
+                                4,
                             );
                             s.server.phase = Phase::FetchContent;
                         }
@@ -2450,6 +2492,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                                 s.server.file_chan,
                                 IOCTL_POLL_NOTIFY,
                                 count_ptr,
+                                4,
                             );
                             if r >= 0 {
                                 s.server.file_count = count as u16;
@@ -2465,6 +2508,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                                 s.server.file_chan,
                                 IOCTL_FLUSH,
                                 core::ptr::null_mut(),
+                                0,
                             );
                             let mut pos = fi as u32;
                             let pos_ptr = &mut pos as *mut u32 as *mut u8;
@@ -2473,6 +2517,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                                 s.server.file_chan,
                                 IOCTL_NOTIFY,
                                 pos_ptr,
+                                4,
                             );
                             if r < 0 {
                                 build_error(s, b"404 Not Found", b"Not Found\n");
@@ -2518,6 +2563,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.server.file_chan,
                         IOCTL_FLUSH,
                         core::ptr::null_mut(),
+                        0,
                     );
                     let mut pos = src_idx as u32;
                     let pos_ptr = &mut pos as *mut u32 as *mut u8;
@@ -2526,6 +2572,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.server.file_chan,
                         IOCTL_NOTIFY,
                         pos_ptr,
+                        4,
                     );
                     if r < 0 {
                         build_error(s, b"500 Internal Server Error", b"Stream NOTIFY failed\n");
@@ -2865,10 +2912,18 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     progress = true;
                 }
 
-                // Process any pre-buffered inbound frame from the network.
-                // In echo mode this writes to send_buf (skip if non-empty);
-                // in fan-out mode it writes to ws_out and is always safe.
-                if s.server.send_len == 0 && ws_process_inbound(s) {
+                // Process any pre-buffered inbound frame. In echo mode
+                // this writes to send_buf (skip if non-empty); in
+                // fan-out mode it writes to ws_out and is always safe.
+                // A peer CLOSE frame is parsed even with send_buf
+                // occupied: we're transitioning to WsClose anyway, and
+                // a saturated ws_in feed (e.g. 50 fps fan-out) would
+                // otherwise keep send_buf permanently refilled and
+                // the CLOSE would never get parsed.
+                let peer_close_pending =
+                    s.server.recv_len > 0 && s.server.recv_buf[0] == 0x88;
+                let can_process = s.server.send_len == 0 || peer_close_pending;
+                if can_process && ws_process_inbound(s) {
                     progress = true;
                 }
 
@@ -2884,6 +2939,27 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if !matches!(s.server.phase, Phase::WsActive) {
                     break;
                 }
+            }
+
+            // Stale-WS preemption. New TCP connections accepted during
+            // WsActive queue in `pending_accept`; a browser-driven
+            // navigate normally drains the queue (CLOSE frame or FIN).
+            // Some clients (notably Chrome on Cmd-R) drop the JS
+            // context but leave the underlying TCP ACKing — the WS
+            // never closes. After ~1 s of `pending_accept_count > 0`
+            // with no observed WS progress, force-close so the queued
+            // reload connections get served. Resetting on `did_any`
+            // keeps an actually-busy WS connected indefinitely.
+            if s.server.pending_accept_count > 0 && !did_any {
+                s.server.ws_pending_stuck_ticks =
+                    s.server.ws_pending_stuck_ticks.wrapping_add(1);
+                if s.server.ws_pending_stuck_ticks > 4000 {
+                    s.server.ws_pending_stuck_ticks = 0;
+                    s.server.phase = Phase::CloseConn;
+                    return 2;
+                }
+            } else {
+                s.server.ws_pending_stuck_ticks = 0;
             }
 
             if did_any {
@@ -2973,6 +3049,17 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             );
             if sent > 0 {
                 s.server.send_offset += sent as u16;
+                if s.server.send_offset >= s.server.send_len {
+                    s.server.phase = Phase::CloseConn;
+                    return 0;
+                }
+            } else {
+                // CLOSE-echo is best-effort: the peer initiated the
+                // close, so they aren't waiting on our reply. If
+                // `net_send` rejects (TCP send buffer full, slot gone,
+                // zero peer window) free the slot rather than spin.
+                s.server.phase = Phase::CloseConn;
+                return 0;
             }
         }
 

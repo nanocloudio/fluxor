@@ -115,6 +115,7 @@ const CONTENT_TYPES: &[&str] = &[
     "InputBinaryState",
     "EventTimelineVideo",
     "EventTimelineAudio",
+    "NetProto",
 ];
 
 const INPUT_CONTROL_TYPES: &[&str] = &["Button", "Range"];
@@ -579,6 +580,8 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     let port_byte = entry[3];
     let from_port_index = (port_byte >> 4) & 0x0F;
     let to_port_index = port_byte & 0x0F;
+    // bytes 4-7: buffer_bytes u32 LE.
+    let buffer_bytes = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
     let mut edge = serde_json::Map::new();
     edge.insert("from_id".into(), json!(from_id));
     edge.insert("to_id".into(), json!(to_id));
@@ -601,6 +604,9 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
             _ => "local",
         };
         edge.insert("edge_class".into(), json!(ec_name));
+    }
+    if buffer_bytes != 0 {
+        edge.insert("buffer_bytes".into(), json!(buffer_bytes));
     }
     Value::Object(edge)
 }
@@ -1196,8 +1202,10 @@ impl ConfigBuilder {
 // Graph Config (Version 3+)
 // =============================================================================
 
-/// Graph edge size in bytes
-const GRAPH_EDGE_SIZE: usize = 4;
+/// Graph edge size in bytes (8 = 4-byte fixed header + 4-byte
+/// `buffer_bytes` u32 LE override). Mirrors
+/// `kernel::config::GRAPH_EDGE_SIZE`; the layout is documented there.
+const GRAPH_EDGE_SIZE: usize = 8;
 /// Maximum number of graph edges. Raised from 64 to 128 to fit the
 /// Quantum graph (114 edges).
 const MAX_GRAPH_EDGES: usize = 128;
@@ -2870,6 +2878,53 @@ fn resolve_edge_classes(
     classes
 }
 
+/// Resolve `buffer_bytes` for each wiring entry.
+///
+/// Reads the optional `buffer_bytes` field on each `wiring[]` entry.
+/// `0` (or missing) means "use module hints / default". Non-zero
+/// values are clamped to `[64, MAX_CHAN_BYTES = 256 KiB]`; the kernel
+/// rounds up to the next power of two at channel-open time, so the
+/// encoded value is the lower bound the producer needs.
+///
+/// Per-edge sizing matters when edge bandwidth depends on graph
+/// composition rather than module type — e.g. a `spectrum_video →
+/// wasm_browser_canvas` raster edge that must carry 98 KiB per
+/// frame at 50 fps doesn't share a default with a low-rate
+/// telemetry edge from the same producer.
+fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
+    const MAX_CHAN_BYTES: u32 = 256 * 1024;
+    let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(wiring.len());
+    for (i, entry) in wiring.iter().enumerate() {
+        let raw = entry
+            .get("buffer_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let clamped = if raw == 0 {
+            0
+        } else if raw < 64 {
+            eprintln!(
+                "warning: wiring[{}] buffer_bytes={} below minimum 64; rounding up",
+                i, raw
+            );
+            64
+        } else if raw > MAX_CHAN_BYTES as u64 {
+            eprintln!(
+                "warning: wiring[{}] buffer_bytes={} exceeds MAX_CHAN_BYTES={}; clamping",
+                i, raw, MAX_CHAN_BYTES
+            );
+            MAX_CHAN_BYTES
+        } else {
+            raw as u32
+        };
+        out.push(clamped);
+    }
+    out
+}
+
 /// Generate binary config in FXWR format (version 1)
 ///
 /// Layout:
@@ -3075,7 +3130,9 @@ fn generate_config_impl(
         }
     }
 
-    // Version 1 (variable-length module entries)
+    // Mirrors `kernel::config`'s version check; bumped only when the
+    // kernel parser breaks compatibility, not for additive wire-
+    // format extensions like the per-edge `buffer_bytes` override.
     let version: u16 = 1;
 
     let mut result = Vec::new();
@@ -3117,28 +3174,40 @@ fn generate_config_impl(
 
     // Resolve per-edge edge_class from wiring entries
     let edge_classes = resolve_edge_classes(config, &module_names, &domain_names);
+    // Resolve per-edge `buffer_bytes` overrides from wiring entries.
+    // Parallel array; entries default to 0 ("use module hints").
+    let edge_buffer_bytes = resolve_edge_buffer_bytes(config);
 
-    // Graph section (64 bytes)
-    // Format: edge_count, flags, reserved[2], edges[N]
-    // Edge format: from_id, to_id, byte2, port_byte
-    //   byte2:     bit 7    = to_port
+    // Graph section.
+    //   header (4 bytes): edge_count, flags, reserved[2]
+    //   edges  (MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE bytes)
+    //   domain metadata (DOMAIN_META_SIZE bytes)
+    //
+    // Edge format (8 bytes; mirrors `kernel::config::parse_graph_edge`):
+    //   byte 0:    from_id
+    //   byte 1:    to_id
+    //   byte 2:    bit 7    = to_port
     //              bits 6:5 = edge_class (2 bits)
     //              bits 4:0 = buffer_group (5 bits, 0..31)
-    //   port_byte: bits 7:4 = from_port_index (4 bits, 0..15)
+    //   byte 3:    bits 7:4 = from_port_index (4 bits, 0..15)
     //              bits 3:0 = to_port_index   (4 bits, 0..15)
-    // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`
-    // (`src/kernel/scheduler.rs`). The 5-bit `buffer_group` ceiling
-    // (31) is enforced by `assign_buffer_groups`.
+    //   bytes 4-7: buffer_bytes (u32 LE; 0 = use module hints)
+    //
+    // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`. The
+    // 5-bit `buffer_group` ceiling (31) is enforced by
+    // `assign_buffer_groups`.
     let mut graph_section = Vec::with_capacity(GRAPH_SECTION_SIZE);
     graph_section.push(edges.len() as u8);
     graph_section.extend_from_slice(&[0u8; 3]);
     for (i, (from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
         let group = buffer_groups.get(i).copied().unwrap_or(0);
         let ec = edge_classes.get(i).copied().unwrap_or(0);
+        let buffer_bytes = edge_buffer_bytes.get(i).copied().unwrap_or(0);
         graph_section.push(*from_id);
         graph_section.push(*to_id);
         graph_section.push((to_port << 7) | ((ec & 0x03) << 5) | (group & 0x1F));
         graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
+        graph_section.extend_from_slice(&buffer_bytes.to_le_bytes());
     }
     // Pad edge entries to fixed offset, then write domain metadata
     while graph_section.len() < 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE {

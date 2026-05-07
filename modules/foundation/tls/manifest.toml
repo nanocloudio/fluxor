@@ -4,19 +4,19 @@ hardware_targets = ["rp2350", "bcm2712"]
 [[ports]]
 name = "cipher_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "clear_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "cipher_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "clear_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"

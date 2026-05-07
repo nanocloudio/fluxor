@@ -4,12 +4,12 @@ hardware_targets = ["rp2350", "bcm2712"]
 [[ports]]
 name = "net_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[ports]]
 name = "net_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "NetProto"
 
 [[resources]]
 requires_contract = "channel"

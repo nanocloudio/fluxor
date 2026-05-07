@@ -112,6 +112,29 @@ impl RingBufState {
         total
     }
 
+    /// Copy up to `out.len()` bytes from the head of the ring into
+    /// `out` WITHOUT advancing the read pointer. Used by frame-aware
+    /// fan modules to inspect a length-prefixed header before
+    /// committing to consume the full frame. Returns bytes copied.
+    pub fn peek(&self, storage: &[u8], out: &mut [u8]) -> usize {
+        let cap = self.cap;
+        if cap == 0 {
+            return 0;
+        }
+        let total = out.len().min(self.len);
+        if total == 0 {
+            return 0;
+        }
+
+        let first = total.min(cap - self.head);
+        out[..first].copy_from_slice(&storage[self.head..self.head + first]);
+        if first < total {
+            let second = total - first;
+            out[first..first + second].copy_from_slice(&storage[..second]);
+        }
+        total
+    }
+
     /// Bytes available to read.
     #[inline]
     pub fn len(&self) -> usize {

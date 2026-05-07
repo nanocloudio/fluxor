@@ -16,13 +16,24 @@ use crate::hash::fnv1a_hash;
 /// Manifest section magic: "FXMF"
 pub const MANIFEST_MAGIC: u32 = 0x464D5846;
 
-/// Current manifest format version. v1 = unsigned (integrity hash optional).
-/// v2 adds an optional Ed25519 signature block after the integrity hash:
-///   [ed25519_signature: 64B][signer_pubkey_fingerprint: 32B]
-/// The signature covers the 32-byte SHA-256 integrity hash (not the full
-/// module bytes directly) — integrity hash is still the anchor; the
-/// signature authenticates it.
-pub const MANIFEST_VERSION: u8 = 2;
+/// Manifest format version. Kept at v1 by policy — the kernel and
+/// tools always ship together, so additive wire-format extensions
+/// ride within v1 rather than bumping the integer. The current
+/// layout is:
+///
+/// - 16-byte header (magic, version, port/resource/dependency
+///   counts, module_version, hardware_targets, state_size_hint,
+///   flags, fine-grained permissions byte).
+/// - Port records (4 bytes each): `[direction, content_type, flags,
+///   index]`. Byte 3 is the resolved per-direction `PortSpec.index`,
+///   matching what the config compiler wires against.
+/// - Resource records (4 bytes each).
+/// - Dependency records (8 bytes each).
+/// - Optional 32-byte SHA-256 integrity hash (flags bit 0).
+/// - Optional `[ed25519_signature: 64B][signer_pubkey_fingerprint:
+///   32B]` block (flags bit 1). The signature covers the integrity
+///   hash, not the full module bytes.
+pub const MANIFEST_VERSION: u8 = 1;
 
 /// Manifest header size (fixed portion before variable sections)
 pub const MANIFEST_HEADER_SIZE: usize = 16;
@@ -94,6 +105,13 @@ const CONTENT_TYPES: &[&str] = &[
     // flavour".
     "EventTimelineVideo",
     "EventTimelineAudio",
+    // Net protocol framing — `[msg_type:u8][len:u16 LE][payload]`
+    // delivered atomically on a byte-stream channel. Used between
+    // network stacks (IP, TLS, QUIC) and their consumers. Distinct
+    // from `OctetStream` because consumers cannot parse it without
+    // the per-frame TLV; auto-inserted tee/merge modules need this
+    // discriminant to preserve frame boundaries during fan-out.
+    "NetProto",
 ];
 
 fn content_type_from_str(s: &str) -> Result<u8> {
@@ -929,11 +947,11 @@ impl Manifest {
         let total = MANIFEST_HEADER_SIZE + var_size;
         let mut buf = Vec::with_capacity(total);
 
-        // Header (16 bytes). Emit v2 only when a signature block is
-        // actually present; unsigned manifests stay at v1.
-        let version = if has_signature { MANIFEST_VERSION } else { 1 };
+        // Header (16 bytes). Signed and unsigned manifests share the
+        // same port-record layout; signature presence is signalled by
+        // flag bit 1 (byte 14), not by a version split.
         buf.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
-        buf.push(version);
+        buf.push(MANIFEST_VERSION);
         buf.push(self.ports.len() as u8);
         buf.push(self.resources.len() as u8);
         buf.push(self.dependencies.len() as u8);
@@ -947,12 +965,17 @@ impl Manifest {
         // The kernel reads this byte directly at module instantiation.
         buf.push(self.permissions.bits);
 
-        // Ports (4 bytes each)
+        // Ports (4 bytes each: direction, content_type, flags, index).
+        // Byte 3 is the per-direction port index (0..15) the TOML
+        // resolver computed in `parse_toml` — manifests may pin
+        // explicit indices via `index = N`, so the binary must carry
+        // the resolved value rather than re-derive it from source
+        // order on the read side.
         for p in &self.ports {
             buf.push(p.direction);
             buf.push(p.content_type);
             buf.push(p.flags);
-            buf.push(0); // reserved
+            buf.push(p.index);
         }
 
         // Resources (4 bytes each)
@@ -1006,7 +1029,7 @@ impl Manifest {
         }
 
         let version = data[4];
-        if version != 1 && version != 2 {
+        if version != MANIFEST_VERSION {
             return Err(Error::Module(format!(
                 "unsupported manifest version: {}",
                 version
@@ -1021,7 +1044,7 @@ impl Manifest {
         let state_size_hint = u16::from_le_bytes([data[12], data[13]]);
         let flags = data[14];
         let has_integrity = (flags & 0x01) != 0;
-        let has_signature = version >= 2 && (flags & 0x02) != 0;
+        let has_signature = (flags & 0x02) != 0;
         let permissions_bits = data[15]; // fine-grained permissions bitmap
 
         let expected_size = MANIFEST_HEADER_SIZE
@@ -1046,18 +1069,13 @@ impl Manifest {
         let mut offset = MANIFEST_HEADER_SIZE;
 
         let mut ports = Vec::with_capacity(port_count);
-        let mut next_index = [0u8; 4];
         for _ in 0..port_count {
-            let direction = data[offset];
-            let dir_idx = (direction as usize).min(3);
-            let index = next_index[dir_idx];
-            next_index[dir_idx] = index + 1;
             ports.push(PortSpec {
-                direction,
+                direction: data[offset],
                 content_type: data[offset + 1],
                 flags: data[offset + 2],
                 name: None,
-                index,
+                index: data[offset + 3],
             });
             offset += 4;
         }
