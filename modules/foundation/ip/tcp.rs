@@ -120,6 +120,15 @@ pub struct TcpConn {
     pub delivered_bytes: u32,
     pub consumed_bytes: u32,
 
+    /// Latched when a close notification (`MSG_CLOSED` / `MSG_ERROR`)
+    /// can't be queued because both `net_out_chan` and the IP-side
+    /// fallback queue are full. The slot is held in its current state
+    /// until `step_tcp_timers` retries successfully; without the
+    /// latch a queue-full at the moment of close would lose the
+    /// consumer event entirely.
+    pub pending_close_notify: u8,
+    _close_pad: [u8; 3],
+
     // Bounded reorder buffer (§4.1). Per-slot payload storage lives in
     // `reorder_buf`; metadata in `reorder_slots`.
     pub reorder_slots: [ReorderSlot; REORDER_SLOTS],
@@ -157,6 +166,8 @@ impl TcpConn {
             rtt_active: false,
             delivered_bytes: 0,
             consumed_bytes: 0,
+            pending_close_notify: 0,
+            _close_pad: [0; 3],
             reorder_slots: [EMPTY; REORDER_SLOTS],
             reorder_buf: [0u8; REORDER_SLOTS * REORDER_SLOT_BYTES],
         }
@@ -494,6 +505,40 @@ pub unsafe fn reorder_take_next<'a>(conn: &'a mut TcpConn, rcv_nxt: u32) -> Opti
         i += 1;
     }
     None
+}
+
+/// Borrow the next contiguous reorder slot without consuming it.
+/// The caller must call `reorder_consume_at(seq)` after the bytes
+/// reach the consumer; if delivery is rejected (channel full) the
+/// slot stays valid for the next retry. The returned slice is valid
+/// until the next `reorder_insert` / `reorder_take_next` /
+/// `reorder_consume_at`.
+pub unsafe fn reorder_peek_next<'a>(conn: &'a TcpConn, rcv_nxt: u32) -> Option<(&'a [u8], u32)> {
+    let mut i = 0;
+    while i < REORDER_SLOTS {
+        if conn.reorder_slots[i].valid && conn.reorder_slots[i].seq == rcv_nxt {
+            let len = conn.reorder_slots[i].len as usize;
+            let off = i * REORDER_SLOT_BYTES;
+            let next_seq = rcv_nxt.wrapping_add(len as u32);
+            let slice = core::slice::from_raw_parts(conn.reorder_buf.as_ptr().add(off), len);
+            return Some((slice, next_seq));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Clear the reorder slot at `seq`. Pairs with `reorder_peek_next`
+/// after the bytes have been delivered downstream.
+pub unsafe fn reorder_consume_at(conn: &mut TcpConn, seq: u32) {
+    let mut i = 0;
+    while i < REORDER_SLOTS {
+        if conn.reorder_slots[i].valid && conn.reorder_slots[i].seq == seq {
+            conn.reorder_slots[i].valid = false;
+            return;
+        }
+        i += 1;
+    }
 }
 
 // ============================================================================

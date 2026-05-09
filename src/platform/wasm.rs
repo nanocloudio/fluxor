@@ -28,6 +28,9 @@ mod websocket;
 #[path = "wasm/fetch.rs"]
 mod fetch;
 
+#[path = "wasm/fs.rs"]
+mod fs;
+
 #[path = "wasm/hal.rs"]
 mod hal;
 
@@ -523,6 +526,24 @@ unsafe fn load_embedded_modules() -> usize {
             );
             continue;
         }
+
+        // The wasm platform's `host_instantiate_module` loop bypasses
+        // `scheduler::instantiate_one_module`, so cap metadata has to
+        // be staged explicitly — otherwise `check_contract_grant`
+        // rejects every non-infra contract the module declares.
+        let cap_class: u8 = match header.module_type {
+            5 => 3, // Protocol → CAP_FULL
+            3 => 1, // Sink → CAP_SERVICE_PIO
+            4 => 2, // EventHandler → CAP_SERVICE_GPIO
+            _ => 0, // Source / Transformer → CAP_SERVICE
+        };
+        scheduler::set_module_caps(
+            module_idx,
+            cap_class,
+            header.required_caps(),
+            loaded.manifest_permissions(),
+        );
+
         let code_size = header.code_size as usize;
         let code_ptr = loaded.code_base();
 
@@ -631,6 +652,20 @@ unsafe fn load_embedded_modules() -> usize {
                     0,
                 );
             }
+        }
+
+        // wasm32 imports are scalar-only, so the per-instance params
+        // blob can't ride along on `module_init_wasm` the way it does
+        // on Linux / bare metal. Register it here so the module can
+        // pull it via `MODULE_INSTANCE_PARAMS` instead. The blob
+        // borrows from the `'static` embedded-modules section.
+        let params_slice = entry.params();
+        unsafe {
+            scheduler::set_module_params(
+                module_idx,
+                params_slice.as_ptr(),
+                params_slice.len(),
+            );
         }
 
         // `module_init_wasm` is the wasm-only entry point each PIC

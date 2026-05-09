@@ -492,9 +492,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 track_pending(written, n as usize, &mut s.pending_out, &mut s.pending_offset);
                 return 2; // Burst — keep stepping while there's data.
             }
-            // FS_READ <= 0: either EOF (n == 0) or error (n < 0). Either
-            // way, the current file is done — close, then either
-            // auto-advance or pause depending on policy.
+            // EAGAIN: provider has no bytes ready but the file isn't
+            // finished (async FS provider). Yield and re-read next
+            // tick rather than treating "not ready" as EOF.
+            if n == -11 {
+                return 0;
+            }
+            // EOF (n == 0) or hard error (n < 0): close and either
+            // auto-advance or pause per policy.
             fs_close_current(s);
             signal_stream_eof(s);
             if s.auto_advance != 0 {

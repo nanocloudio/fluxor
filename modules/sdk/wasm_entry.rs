@@ -76,11 +76,12 @@ mod __wasm_entry {
             wasm_heap_init(state_size, arena_size as usize);
         }
 
-        // Two-phase params fetch: query size with `out=null`, then
-        // allocate and query into the real buffer. Avoids a fixed
-        // truncation cap.
+        // Two-phase params fetch: size query with `arg=null`, then
+        // pull into the buffer. MODULE_INSTANCE_PARAMS is dispatched
+        // through `handle_core_primitive`, so it goes through
+        // `provider_call` rather than the read-only query path.
         let params_size = unsafe {
-            (sys.provider_query)(-1, OP_MODULE_INSTANCE_PARAMS, core::ptr::null_mut(), 0)
+            (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, core::ptr::null_mut(), 0)
         };
         let (params_ptr, params_len): (*const u8, usize) = if params_size > 0 {
             let n = params_size as usize;
@@ -89,7 +90,7 @@ mod __wasm_entry {
                 return -1;
             }
             let got =
-                unsafe { (sys.provider_query)(-1, OP_MODULE_INSTANCE_PARAMS, buf, n) };
+                unsafe { (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, buf, n) };
             if got < 0 || (got as usize) != n {
                 return -1;
             }

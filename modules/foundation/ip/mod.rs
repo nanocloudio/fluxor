@@ -99,6 +99,37 @@ const NET_CMD_CONNECT: u8 = 0x13;
 // net_proto; the disjoint opcode ranges keep the contracts unambiguous.
 // See `modules/sdk/contracts/net/datagram.rs`.
 
+/// Max bytes per queued outbound control frame. Sized for the
+/// largest short frame `net_send_*` produces (MSG_RETRANSMIT /
+/// MSG_ACK at 8 bytes). MSG_DATA goes through its own per-conn
+/// backpressure path.
+const NET_OUT_FRAME_MAX: usize = 8;
+const NET_OUT_QUEUE_SLOTS: usize = 32;
+
+/// `TcpConn::pending_close_notify` codes — non-zero values identify
+/// which helper `step_tcp_timers` retries once `net_out_chan` has
+/// space.
+const NOTIFY_NONE: u8 = 0;
+const NOTIFY_CLOSED: u8 = 1;
+const NOTIFY_ERROR_REFUSED: u8 = 2;
+
+/// A TCP-conn slot is free for re-allocation only when it's `Closed`
+/// AND no close-notification latch is still pending — reusing a
+/// latched slot would strand the consumer's `MSG_CLOSED` /
+/// `MSG_ERROR`.
+#[inline(always)]
+fn slot_is_free(conn: &tcp::TcpConn) -> bool {
+    conn.state == tcp::TcpState::Closed && conn.pending_close_notify == NOTIFY_NONE
+}
+
+/// Inbound RX / command processing pauses when the outbound control
+/// queue has fewer than this many free slots. Each accepted segment
+/// or command typically synthesises one outbound control event, so
+/// pulling more in while the queue is near-full would just risk
+/// overflow. The pause propagates backpressure to the upstream
+/// producer.
+const NET_OUT_QUEUE_HEADROOM: usize = 4;
+
 // ============================================================================
 // Module State
 // ============================================================================
@@ -184,8 +215,28 @@ pub struct IpState {
     pending_close_conn:  u8,
     _pcls_pad:           [u8; 2],
 
+    /// Outbound control-frame queue (MSG_BOUND / MSG_ACCEPTED /
+    /// MSG_CLOSED / MSG_CONNECTED / MSG_ERROR / MSG_RETRANSMIT).
+    /// `net_out_chan` writes are atomic-FIFO and reject when full;
+    /// queueing here lets a momentarily-full consumer channel apply
+    /// backpressure without losing the control event. Drained at the
+    /// top of each `module_step`. MSG_DATA bypasses this and uses its
+    /// own per-conn path because it's variable-length and large.
+    pending_net_out_frames: [[u8; NET_OUT_FRAME_MAX]; NET_OUT_QUEUE_SLOTS],
+    pending_net_out_lens:   [u8; NET_OUT_QUEUE_SLOTS],
+    pending_net_out_head:   u8,
+    pending_net_out_tail:   u8,
+    pending_net_out_count:  u8,
+    _pno_pad:               u8,
+
     // Step counter for timers
     step_count: u32,
+
+    /// Wallclock millis at which `step_tcp_timers` last advanced.
+    /// `retransmit_timer` / `timewait_timer` thresholds are defined
+    /// in 50 ms ticks; gating on wallclock keeps them meaningful
+    /// regardless of the host scheduler's `tick_us`.
+    last_tcp_timer_ms: u64,
 
     // Diagnostic counters
     rx_frame_count: u32,
@@ -318,17 +369,24 @@ unsafe fn ip_net_read_frame(
     (0, 0)
 }
 
-/// Send a MSG_DATA frame to the net consumer channel.
+/// Send a MSG_DATA frame to the net consumer channel. Returns
+/// `true` when the bytes were accepted (atomic-FIFO, so partial
+/// writes are impossible). Callers MUST gate `rcv_nxt` /
+/// `delivered_bytes` advancement and the outbound ACK on the return:
+/// ACKing data the consumer never received makes the peer think it
+/// landed and stop retransmitting, permanently losing payload.
 #[inline(always)]
-unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len: usize) {
+unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len: usize) -> bool {
     if s.net_out_chan < 0 || data_len == 0 {
-        return;
+        return true;
     }
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 1 + data_len; // conn_id + data
     let max_copy = s.net_scratch.len() - NET_FRAME_HDR;
-    if data_len > max_copy { return; } // safety: don't overflow scratch
+    if data_len > max_copy {
+        return false;
+    }
     core::ptr::write_volatile(scratch, NET_MSG_DATA);
     let pl = (payload_len as u16).to_le_bytes();
     core::ptr::write_volatile(scratch.add(1), pl[0]);
@@ -336,31 +394,97 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len:
     core::ptr::write_volatile(scratch.add(3), conn_id);
     core::ptr::copy_nonoverlapping(data, scratch.add(4), data_len);
     let total = NET_FRAME_HDR + payload_len;
-    (sys.channel_write)(s.net_out_chan, scratch, total);
+    let n = (sys.channel_write)(s.net_out_chan, scratch, total);
+    n == total as i32
 }
 
-/// Helper: write a short net-proto frame (MSG_ACCEPTED/CLOSED/BOUND/CONNECTED) to net_out.
-/// All stores use write_volatile to prevent LLVM from eliding them in PIC on aarch64.
-#[inline(always)]
-unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u8) {
-    if s.net_out_chan < 0 { return; }
+/// Send a short control frame to `net_out_chan`, queueing when the
+/// channel is full rather than dropping. Returns `true` when
+/// delivered or queued; `false` only when the local queue is itself
+/// full. Callers MUST gate any state transition the consumer needs
+/// to learn about on this return.
+unsafe fn net_send_or_queue(s: &mut IpState, frame: &[u8]) -> bool {
+    if s.net_out_chan < 0 {
+        return true;
+    }
+    if frame.is_empty() || frame.len() > NET_OUT_FRAME_MAX {
+        return false;
+    }
     let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    core::ptr::write_volatile(scratch, msg_type);
-    core::ptr::write_volatile(scratch.add(1), 1u8);
-    core::ptr::write_volatile(scratch.add(2), 0u8);
-    core::ptr::write_volatile(scratch.add(3), conn_id);
-    (sys.channel_write)(s.net_out_chan, scratch, 4);
+    // Drain anything already queued first so FIFO ordering is
+    // preserved across senders and across step boundaries.
+    drain_pending_net_out_inner(s, sys);
+    if s.pending_net_out_count == 0 {
+        let n = (sys.channel_write)(s.net_out_chan, frame.as_ptr(), frame.len());
+        if n == frame.len() as i32 {
+            return true;
+        }
+    }
+    if s.pending_net_out_count as usize >= NET_OUT_QUEUE_SLOTS {
+        log_info(s, b"[ip] net out queue full");
+        return false;
+    }
+    let slot = s.pending_net_out_tail as usize;
+    let dst = &mut s.pending_net_out_frames[slot];
+    let n = frame.len();
+    dst[..n].copy_from_slice(frame);
+    s.pending_net_out_lens[slot] = n as u8;
+    s.pending_net_out_tail = ((slot + 1) % NET_OUT_QUEUE_SLOTS) as u8;
+    s.pending_net_out_count += 1;
+    true
+}
+
+unsafe fn drain_pending_net_out_inner(s: &mut IpState, sys: &SyscallTable) {
+    while s.pending_net_out_count > 0 && s.net_out_chan >= 0 {
+        let slot = s.pending_net_out_head as usize;
+        let len = s.pending_net_out_lens[slot] as usize;
+        let n = (sys.channel_write)(
+            s.net_out_chan,
+            s.pending_net_out_frames[slot].as_ptr(),
+            len,
+        );
+        if n != len as i32 {
+            return;
+        }
+        s.pending_net_out_head = ((slot + 1) % NET_OUT_QUEUE_SLOTS) as u8;
+        s.pending_net_out_count -= 1;
+    }
+}
+
+unsafe fn drain_pending_net_out(s: &mut IpState) {
+    if s.pending_net_out_count == 0 || s.net_out_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    drain_pending_net_out_inner(s, sys);
+}
+
+/// Helper: write a short net-proto frame (MSG_ACCEPTED/CLOSED/BOUND/
+/// CONNECTED) to `net_out`. All stores use `write_volatile` to keep
+/// LLVM from eliding them in PIC on aarch64. Returns whether the
+/// frame was delivered or queued; callers MUST hold off on any state
+/// transition the consumer needs to learn about when this returns
+/// false.
+#[inline(always)]
+#[must_use]
+unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u8) -> bool {
+    let mut frame = [0u8; 4];
+    core::ptr::write_volatile(frame.as_mut_ptr(), msg_type);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 1u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    net_send_or_queue(s, &frame)
 }
 
 #[inline(always)]
-unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) {
-    net_send_short(s, NET_MSG_ACCEPTED, conn_id);
+#[must_use]
+unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) -> bool {
+    net_send_short(s, NET_MSG_ACCEPTED, conn_id)
 }
 
 #[inline(always)]
-unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) {
-    net_send_short(s, NET_MSG_CLOSED, conn_id);
+unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) -> bool {
+    net_send_short(s, NET_MSG_CLOSED, conn_id)
 }
 
 /// MSG_BOUND payload: `[conn_id:1][local_port:2 LE]`. Consumers that
@@ -368,17 +492,15 @@ unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) {
 /// only claim a conn_id for their own CMD_BIND.
 #[inline(always)]
 unsafe fn net_send_bound(s: &mut IpState, conn_id: u8, local_port: u16) {
-    if s.net_out_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    core::ptr::write_volatile(scratch, NET_MSG_BOUND);
-    core::ptr::write_volatile(scratch.add(1), 3u8);
-    core::ptr::write_volatile(scratch.add(2), 0u8);
-    core::ptr::write_volatile(scratch.add(3), conn_id);
+    let mut frame = [0u8; 6];
+    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_BOUND);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
     let pb = local_port.to_le_bytes();
-    core::ptr::write_volatile(scratch.add(4), pb[0]);
-    core::ptr::write_volatile(scratch.add(5), pb[1]);
-    (sys.channel_write)(s.net_out_chan, scratch, 6);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), pb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[1]);
+    net_send_or_queue(s, &frame);
 }
 
 #[inline(always)]
@@ -386,55 +508,51 @@ unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) {
     net_send_short(s, NET_MSG_CONNECTED, conn_id);
 }
 
-/// Send a MSG_ERROR frame to the net consumer channel.
+/// Send a MSG_ERROR frame. Returns whether the frame was delivered
+/// or queued; callers latching `pending_close_notify` on connect /
+/// accept failure use the bool to know whether the latch is needed.
 #[inline(always)]
-unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8) {
-    if s.net_out_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    core::ptr::write_volatile(scratch, NET_MSG_ERROR);
-    core::ptr::write_volatile(scratch.add(1), 2u8);
-    core::ptr::write_volatile(scratch.add(2), 0u8);
-    core::ptr::write_volatile(scratch.add(3), conn_id);
-    core::ptr::write_volatile(scratch.add(4), errno as u8);
-    (sys.channel_write)(s.net_out_chan, scratch, 5);
+unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8) -> bool {
+    let mut frame = [0u8; 5];
+    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ERROR);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 2u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), errno as u8);
+    net_send_or_queue(s, &frame)
 }
 
 /// Emit a MSG_RETRANSMIT frame. Payload: [conn_id:1][from_seq:4 LE].
 #[inline(always)]
 unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u8, from_seq: u32) {
-    if s.net_out_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    core::ptr::write_volatile(scratch, NET_MSG_RETRANSMIT);
-    core::ptr::write_volatile(scratch.add(1), 5u8);
-    core::ptr::write_volatile(scratch.add(2), 0u8);
-    core::ptr::write_volatile(scratch.add(3), conn_id);
+    let mut frame = [0u8; 8];
+    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_RETRANSMIT);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 5u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
     let b = from_seq.to_le_bytes();
-    core::ptr::write_volatile(scratch.add(4), b[0]);
-    core::ptr::write_volatile(scratch.add(5), b[1]);
-    core::ptr::write_volatile(scratch.add(6), b[2]);
-    core::ptr::write_volatile(scratch.add(7), b[3]);
-    (sys.channel_write)(s.net_out_chan, scratch, 8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), b[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[2]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[3]);
+    net_send_or_queue(s, &frame);
 }
 
 /// Emit a MSG_ACK frame. Payload: [conn_id:1][acked_seq:4 LE].
 #[inline(always)]
 #[allow(dead_code)]
 unsafe fn net_send_ack(s: &mut IpState, conn_id: u8, acked_seq: u32) {
-    if s.net_out_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
-    core::ptr::write_volatile(scratch, NET_MSG_ACK);
-    core::ptr::write_volatile(scratch.add(1), 5u8);
-    core::ptr::write_volatile(scratch.add(2), 0u8);
-    core::ptr::write_volatile(scratch.add(3), conn_id);
+    let mut frame = [0u8; 8];
+    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACK);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 5u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
     let b = acked_seq.to_le_bytes();
-    core::ptr::write_volatile(scratch.add(4), b[0]);
-    core::ptr::write_volatile(scratch.add(5), b[1]);
-    core::ptr::write_volatile(scratch.add(6), b[2]);
-    core::ptr::write_volatile(scratch.add(7), b[3]);
-    (sys.channel_write)(s.net_out_chan, scratch, 8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), b[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[2]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[3]);
+    net_send_or_queue(s, &frame);
 }
 
 // ─── datagram emitters ──────────────────────────────────────────
@@ -447,18 +565,16 @@ unsafe fn net_send_ack(s: &mut IpState, conn_id: u8, acked_seq: u32) {
 /// MSG_DG_BOUND payload: `[ep_id:1][local_port:2 LE]`.
 #[inline(always)]
 unsafe fn dg_send_bound(s: &mut IpState, ep_id: u8, local_port: u16) {
-    if s.net_out_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
+    let mut frame = [0u8; 6];
     use core::ptr::write_volatile as wv;
-    wv(scratch, DG_MSG_BOUND);
-    wv(scratch.add(1), 3u8);
-    wv(scratch.add(2), 0u8);
-    wv(scratch.add(3), ep_id);
+    wv(frame.as_mut_ptr(), DG_MSG_BOUND);
+    wv(frame.as_mut_ptr().add(1), 3u8);
+    wv(frame.as_mut_ptr().add(2), 0u8);
+    wv(frame.as_mut_ptr().add(3), ep_id);
     let pb = local_port.to_le_bytes();
-    wv(scratch.add(4), pb[0]);
-    wv(scratch.add(5), pb[1]);
-    (sys.channel_write)(s.net_out_chan, scratch, 6);
+    wv(frame.as_mut_ptr().add(4), pb[0]);
+    wv(frame.as_mut_ptr().add(5), pb[1]);
+    net_send_or_queue(s, &frame);
 }
 
 /// MSG_DG_RX_FROM (IPv4) payload:
@@ -500,30 +616,26 @@ unsafe fn dg_send_rx_from_v4(
 /// MSG_DG_CLOSED payload: `[ep_id:1]`.
 #[inline(always)]
 unsafe fn dg_send_closed(s: &mut IpState, ep_id: u8) {
-    if s.net_out_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
+    let mut frame = [0u8; 4];
     use core::ptr::write_volatile as wv;
-    wv(scratch, DG_MSG_CLOSED);
-    wv(scratch.add(1), 1u8);
-    wv(scratch.add(2), 0u8);
-    wv(scratch.add(3), ep_id);
-    (sys.channel_write)(s.net_out_chan, scratch, 4);
+    wv(frame.as_mut_ptr(), DG_MSG_CLOSED);
+    wv(frame.as_mut_ptr().add(1), 1u8);
+    wv(frame.as_mut_ptr().add(2), 0u8);
+    wv(frame.as_mut_ptr().add(3), ep_id);
+    net_send_or_queue(s, &frame);
 }
 
 /// MSG_DG_ERROR payload: `[ep_id:1][errno:i8]`.
 #[inline(always)]
 unsafe fn dg_send_error(s: &mut IpState, ep_id: u8, errno: i8) {
-    if s.net_out_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let scratch = s.net_scratch.as_mut_ptr();
+    let mut frame = [0u8; 5];
     use core::ptr::write_volatile as wv;
-    wv(scratch, DG_MSG_ERROR);
-    wv(scratch.add(1), 2u8);
-    wv(scratch.add(2), 0u8);
-    wv(scratch.add(3), ep_id);
-    wv(scratch.add(4), errno as u8);
-    (sys.channel_write)(s.net_out_chan, scratch, 5);
+    wv(frame.as_mut_ptr(), DG_MSG_ERROR);
+    wv(frame.as_mut_ptr().add(1), 2u8);
+    wv(frame.as_mut_ptr().add(2), 0u8);
+    wv(frame.as_mut_ptr().add(3), ep_id);
+    wv(frame.as_mut_ptr().add(4), errno as u8);
+    net_send_or_queue(s, &frame);
 }
 
 /// Recompute the advertised receive window from consumer-channel backpressure.
@@ -750,6 +862,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
 
+    // 0b. Flush any control frames left queued by a congested
+    // `net_out_chan` before producing new events; FIFO order matters.
+    drain_pending_net_out(s);
+
     // 1. Receive and process incoming frames
     let mac_was_valid = s.mac_valid;
     process_rx_frames(s);
@@ -822,9 +938,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         arp::age_entries(&mut s.arp_table);
     }
 
-    // 5. TCP timers
-    if s.step_count % 50 == 0 {
-        step_tcp_timers(s);
+    // 5. TCP timers — wallclock-driven so the 50 ms-tick thresholds
+    // hold across schedulers with different `tick_us`.
+    {
+        let sys = &*s.syscalls;
+        let now_ms = dev_millis(sys);
+        if now_ms.saturating_sub(s.last_tcp_timer_ms) >= 50 {
+            s.last_tcp_timer_ms = now_ms;
+            step_tcp_timers(s);
+        }
     }
 
     // Tally idle steps and emit the periodic `[ip] tlm …` line.
@@ -906,6 +1028,13 @@ unsafe fn process_rx_frames(s: &mut IpState) {
     // the segmentation path supplied with credit.
     let mut count = 0;
     while count < 32 {
+        // Each iteration may synthesise a control event (SYN →
+        // MSG_ACCEPTED, FIN → MSG_CLOSED), so re-check headroom
+        // every loop rather than once up-front. The peer's TCP
+        // retransmit covers segments dropped while we're paused.
+        if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
+            break;
+        }
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 { break; }
 
@@ -1160,7 +1289,7 @@ unsafe fn process_tcp_segment(
                     let mut fi = 0;
                     while fi < tcp::MAX_TCP_CONNS {
                         let c = &*s.tcp_conns.as_ptr().add(fi);
-                        if c.state == tcp::TcpState::Closed {
+                        if slot_is_free(c) {
                             accept_idx = fi as i32;
                             break;
                         }
@@ -1286,11 +1415,17 @@ unsafe fn process_tcp_segment(
                         action = ACTION_SEND_ACK; // duplicate ACK
                     }
                     if (tcp_hdr.flags & tcp::FIN) != 0 {
-                        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
-                        conn.state = tcp::TcpState::CloseWait;
                         if action == ACTION_RX_DATA {
+                            // Data + FIN: defer the FIN bookkeeping
+                            // to the handler so it only commits if
+                            // the payload was delivered. Advancing
+                            // up-front would strand the segment if
+                            // delivery is backpressure-rejected —
+                            // CloseWait doesn't re-process data.
                             action = ACTION_RX_DATA_FIN;
                         } else {
+                            conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+                            conn.state = tcp::TcpState::CloseWait;
                             action = ACTION_SET_CLOSING;
                         }
                     }
@@ -1376,64 +1511,125 @@ unsafe fn process_tcp_segment(
             arp::pin(&mut s.arp_table, remote_ip);
         }
         ACTION_COMPLETE_REFUSED => {
-            net_send_error(s, conn_idx as u8, -111i8);
+            let delivered = net_send_error(s, conn_idx as u8, -111i8);
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
-            *conn = tcp::TcpConn::new();
+            if delivered {
+                *conn = tcp::TcpConn::new();
+            } else {
+                // Latch the slot until `step_tcp_timers` retries so
+                // the consumer learns of the refusal — dropping the
+                // event would strand any consumer waiting on the
+                // connect outcome.
+                conn.state = tcp::TcpState::Closed;
+                conn.pending_close_notify = NOTIFY_ERROR_REFUSED;
+            }
         }
         ACTION_SET_CLOSED => {
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
-            if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
-            net_send_closed(s, conn_idx as u8);
+            let delivered = net_send_closed(s, conn_idx as u8);
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
-            *conn = tcp::TcpConn::new();
+            if delivered {
+                if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
+                *conn = tcp::TcpConn::new();
+            } else {
+                // ARP unpin is deferred until the slot actually frees
+                // so a retry storm doesn't churn the table.
+                conn.state = tcp::TcpState::Closed;
+                conn.pending_close_notify = NOTIFY_CLOSED;
+            }
         }
         ACTION_SET_CLOSING => {
             send_tcp_control(s, conn_idx, tcp::ACK, false);
-            net_send_closed(s, conn_idx as u8);
+            if !net_send_closed(s, conn_idx as u8) {
+                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                conn.pending_close_notify = NOTIFY_CLOSED;
+            }
         }
         ACTION_RX_DATA | ACTION_RX_DATA_FIN => {
             let payload = data.add(rx_payload_offset);
-            // Deliver in-order data via net protocol channel.
-            net_send_data(s, conn_idx as u8, payload, rx_payload_len);
+            // Channel writes are atomic-FIFO: rejected outright when
+            // the consumer is full. We MUST NOT advance rcv_nxt /
+            // ACK on a rejection — the peer would treat the data as
+            // delivered and stop retransmitting. Closing the window
+            // (rcv_wnd = 0) and emitting a duplicate ACK lets the
+            // peer's retransmit re-deliver once the consumer drains.
+            let delivered = net_send_data(s, conn_idx as u8, payload, rx_payload_len);
+            if !delivered {
+                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                conn.rcv_wnd = 0;
+                send_tcp_control(s, conn_idx, tcp::ACK, false);
+                return;
+            }
             {
                 let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                 conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
                 conn.delivered_bytes = conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
             }
-            // Drain any reorder slots that are now contiguous.
+            // Drain any reorder slots that are now contiguous. Peek
+            // first so a mid-loop channel-full leaves the payload in
+            // the slot for the next retry — only consume after a
+            // successful `net_send_data`.
             loop {
-                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                let conn = &*s.tcp_conns.as_ptr().add(conn_idx);
                 let rcv_nxt = conn.rcv_nxt;
-                let taken = tcp::reorder_take_next(conn, rcv_nxt);
-                match taken {
+                let peeked = tcp::reorder_peek_next(conn, rcv_nxt);
+                match peeked {
                     Some((slice, next_seq)) => {
-                        // Copy slice to stable pointer (slice aliases reorder_buf).
                         let ptr = slice.as_ptr();
                         let len = slice.len();
-                        net_send_data(s, conn_idx as u8, ptr, len);
+                        if !net_send_data(s, conn_idx as u8, ptr, len) {
+                            break;
+                        }
                         let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                        tcp::reorder_consume_at(conn2, rcv_nxt);
                         conn2.rcv_nxt = next_seq;
                         conn2.delivered_bytes = conn2.delivered_bytes.wrapping_add(len as u32);
                     }
                     None => break,
                 }
             }
+            // FIN bookkeeping is deferred to here so it only commits
+            // if the payload reached the consumer; the state advance
+            // happens before the ACK so the ACK carries the correct
+            // ack_num.
+            if action == ACTION_RX_DATA_FIN {
+                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+                conn.state = tcp::TcpState::CloseWait;
+            }
             update_rcv_wnd(s, conn_idx);
             send_tcp_control(s, conn_idx, tcp::ACK, false);
             if action == ACTION_RX_DATA_FIN {
-                net_send_closed(s, conn_idx as u8);
+                if !net_send_closed(s, conn_idx as u8) {
+                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                    conn.pending_close_notify = NOTIFY_CLOSED;
+                }
             }
         }
         ACTION_COMPLETE_ACCEPT => {
+            // RX is gated on NET_OUT_QUEUE_HEADROOM, so the queue
+            // always has space for MSG_ACCEPTED here. The `_` discard
+            // documents the contract: callers MUST have queue
+            // headroom before progressing past Established.
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
-            net_send_accepted(s, conn_idx as u8);
-            // Deliver piggybacked data (e.g. HTTP GET in same segment as ACK)
+            let _ = net_send_accepted(s, conn_idx as u8);
+            // Piggybacked data (e.g. HTTP GET on the third handshake
+            // ACK). Same gate as the regular RX_DATA path: don't ACK
+            // payload the consumer didn't receive.
             if rx_payload_len > 0 {
                 let payload = data.add(rx_payload_offset);
-                net_send_data(s, conn_idx as u8, payload, rx_payload_len);
-                (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt.wrapping_add(rx_payload_len as u32);
-                send_tcp_control(s, conn_idx, tcp::ACK, false);
+                if net_send_data(s, conn_idx as u8, payload, rx_payload_len) {
+                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                    conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
+                    conn.delivered_bytes =
+                        conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
+                    send_tcp_control(s, conn_idx, tcp::ACK, false);
+                } else {
+                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                    conn.rcv_wnd = 0;
+                    send_tcp_control(s, conn_idx, tcp::ACK, false);
+                }
             }
         }
         ACTION_FREE_SLOT => {
@@ -2100,6 +2296,15 @@ unsafe fn service_net_channels(s: &mut IpState) {
     if s.net_in_chan < 0 { return; }
     let sys = &*s.syscalls;
 
+    // Pause command intake when outbound headroom is low: each
+    // BIND / CONNECT / CLOSE produces a matching control event, and
+    // reading more while we can't queue the responses just risks
+    // overflow. The pause propagates backpressure into the
+    // consumer's write to `net_in_chan`.
+    if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
+        return;
+    }
+
     // Resume a stashed CMD_SEND tail before touching `net_in_chan`.
     // Holding off on the read propagates backpressure to the consumer
     // (its `channel_write` into `net_in_chan` stalls when the ring
@@ -2151,6 +2356,12 @@ unsafe fn service_net_channels(s: &mut IpState) {
     // the payload and corrupt the next frame's header parse.
     let mut count = 0;
     while count < 32 {
+        // Headroom check has to repeat every iteration: each command
+        // synthesises a control event, and a once-per-call gate would
+        // let a burst run the queue dry mid-loop.
+        if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
+            break;
+        }
         let mut buf = [0u8; PENDING_CMD_BUF_SIZE];
         let (msg_type, payload_len) = ip_net_read_frame(sys, s.net_in_chan, buf.as_mut_ptr(), buf.len());
         if msg_type == 0 {
@@ -2164,28 +2375,55 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 // Payload: [port: u16 LE]
                 if plen >= 2 {
                     let port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    // Find a free tcp_conn and set it to Listen
-                    let mut found = false;
-                    let mut ci = 0;
-                    while ci < tcp::MAX_TCP_CONNS {
-                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
-                        if conn.state == tcp::TcpState::Closed {
-                            conn.state = tcp::TcpState::Listen;
-                            conn.local_port = port;
-                            conn.remote_ip = 0;
-                            conn.remote_port = 0;
-                            conn.retransmit_timer = 0;
-                            found = true;
+                    // Idempotent bind: if a TCP listener for `port`
+                    // already exists, re-emit MSG_BOUND for it. The
+                    // BSD-accept path keeps the listener in `Listen`
+                    // across accepted connections, so a defensive
+                    // re-bind from a caller would otherwise grow a
+                    // duplicate listener every cycle and exhaust
+                    // MAX_TCP_CONNS.
+                    let mut existing: Option<usize> = None;
+                    let mut li = 0;
+                    while li < tcp::MAX_TCP_CONNS {
+                        let conn = &*s.tcp_conns.as_ptr().add(li);
+                        // `tcp::find_listener` excludes datagram
+                        // slots, so a UDP slot on the same port must
+                        // not satisfy a TCP bind here either.
+                        if conn.state == tcp::TcpState::Listen
+                            && !conn.is_datagram
+                            && conn.local_port == port
+                        {
+                            existing = Some(li);
                             break;
                         }
-                        ci += 1;
+                        li += 1;
                     }
-                    if found {
-                        log_info(s, b"[ip] net bind");
-                        net_send_bound(s, ci as u8, port);
+                    if let Some(idx) = existing {
+                        log_info(s, b"[ip] net bind: existing listener");
+                        net_send_bound(s, idx as u8, port);
                     } else {
-                        log_info(s, b"[ip] net bind: no free conn");
-                        net_send_error(s, 0, -12); // ENOMEM
+                        let mut found = false;
+                        let mut ci = 0;
+                        while ci < tcp::MAX_TCP_CONNS {
+                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+                            if slot_is_free(conn) {
+                                conn.state = tcp::TcpState::Listen;
+                                conn.local_port = port;
+                                conn.remote_ip = 0;
+                                conn.remote_port = 0;
+                                conn.retransmit_timer = 0;
+                                found = true;
+                                break;
+                            }
+                            ci += 1;
+                        }
+                        if found {
+                            log_info(s, b"[ip] net bind");
+                            net_send_bound(s, ci as u8, port);
+                        } else {
+                            log_info(s, b"[ip] net bind: no free conn");
+                            net_send_error(s, 0, -12); // ENOMEM
+                        }
                     }
                 }
             }
@@ -2207,7 +2445,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         let mut ci = 0;
                         while ci < tcp::MAX_TCP_CONNS {
                             let conn = &*s.tcp_conns.as_ptr().add(ci);
-                            if conn.state == tcp::TcpState::Closed {
+                            if slot_is_free(conn) {
                                 conn_id = ci as i32;
                                 break;
                             }
@@ -2311,7 +2549,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     let mut ci = 0;
                     while ci < tcp::MAX_TCP_CONNS {
                         let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
-                        if conn.state == tcp::TcpState::Closed {
+                        if slot_is_free(conn) {
                             *conn = tcp::TcpConn::new();
                             conn.state = tcp::TcpState::Listen;
                             conn.local_port = port;
@@ -2384,6 +2622,40 @@ unsafe fn service_net_channels(s: &mut IpState) {
 
 /// Process TCP timers (retransmit, time-wait).
 unsafe fn step_tcp_timers(s: &mut IpState) {
+    // Retry pending close-notifications first. Terminal slots
+    // (`state == Closed`) are freed on successful retry; non-terminal
+    // slots (`CloseWait`, `LastAck`) carried peer-FIN news to the
+    // consumer but the local side may still send data, so the latch
+    // is dropped without disturbing TCP state — the slot frees
+    // naturally when the local side closes.
+    {
+        let mut i = 0;
+        while i < tcp::MAX_TCP_CONNS {
+            let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+            let kind = conn.pending_close_notify;
+            if kind != NOTIFY_NONE {
+                let delivered = match kind {
+                    NOTIFY_CLOSED => net_send_closed(s, i as u8),
+                    NOTIFY_ERROR_REFUSED => net_send_error(s, i as u8, -111i8),
+                    _ => true, // unknown code → drop the latch
+                };
+                if delivered {
+                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                    if conn.state == tcp::TcpState::Closed {
+                        let remote_ip = conn.remote_ip;
+                        if remote_ip != 0 {
+                            arp::unpin(&mut s.arp_table, remote_ip);
+                        }
+                        *conn = tcp::TcpConn::new();
+                    } else {
+                        conn.pending_close_notify = NOTIFY_NONE;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
     let mut i = 0;
     while i < tcp::MAX_TCP_CONNS {
         let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
@@ -2409,13 +2681,18 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
             }
             tcp::TcpState::TimeWait => {
                 conn.timewait_timer += 1;
-                // Exit time-wait after ~30 seconds
+                // Exit time-wait after ~30 seconds, but only if the
+                // outbound MSG_CLOSED can be delivered or queued —
+                // losing the close event would strand any consumer
+                // state machine waiting for it.
                 if conn.timewait_timer > 600 {
                     let remote_ip = conn.remote_ip;
-                    if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
-                    conn.state = tcp::TcpState::Closed;
-                    net_send_closed(s, i as u8);
-                    *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                    if net_send_closed(s, i as u8) {
+                        if remote_ip != 0 {
+                            arp::unpin(&mut s.arp_table, remote_ip);
+                        }
+                        *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                    }
                 }
             }
             tcp::TcpState::Established => {

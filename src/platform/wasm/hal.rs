@@ -99,7 +99,12 @@ fn wasm_isr_tier_start(_us: u32) {}
 fn wasm_isr_tier_stop() {}
 fn wasm_isr_tier_poll() {}
 
-fn wasm_init_providers() {}
+fn wasm_init_providers() {
+    // Browser-fetch FS provider — wasm analog of `fat32` (bare metal)
+    // and `linux_fs_dispatch` (host). Backs FS_CONTRACT for any
+    // module that opens assets through `provider_call(-1, FS_OPEN, …)`.
+    super::fs::register();
+}
 fn wasm_release_module_handles(_id: u8) {}
 fn wasm_boot_scan() {}
 fn wasm_merge_runtime_overrides(

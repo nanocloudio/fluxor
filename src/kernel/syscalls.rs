@@ -1029,8 +1029,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, PAGED_ARENA_GET,
-        PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
+        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_INSTANCE_PARAMS,
+        PAGED_ARENA_GET, PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
     };
     use crate::kernel::scheduler;
     match opcode {
@@ -1043,6 +1043,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | BIND_IRQ
         | HANDLE_POLL
         | RANDOM_FILL
+        | MODULE_INSTANCE_PARAMS
         | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
         // ── Diagnostics / log transport ──
         diag::LOG_RING_DRAIN | diag::FAN_DIAG_SNAPSHOT => handle_diag_op(opcode, arg, arg_len),

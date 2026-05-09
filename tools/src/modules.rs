@@ -979,12 +979,12 @@ pub fn pack_fmod_wasm(
         )));
     }
 
-    // Param schema lives in the manifest for wasm modules. PIC
-    // modules carry a `.param_schema` section emitted via
-    // `define_params!`; wasm has no equivalent custom-section
-    // convention, so the packed `.fmod` schema slot stays empty
-    // and tools read schema from the manifest TOML directly.
-    let schema_data: &[u8] = &[];
+    // wasm32 `#[link_section]` lands bytes in unnamed data segments,
+    // so the named-section lookup ELF PIC builds use doesn't apply.
+    // Scan for the SP-magic header `define_params!` emits and
+    // structurally validate the trailing entries instead.
+    let schema_owned = find_param_schema_in_wasm(&wasm_data).unwrap_or_default();
+    let schema_data: &[u8] = &schema_owned;
 
     // Load or create manifest.
     let mut module_manifest = if let Some(mp) = manifest_path {
@@ -1067,6 +1067,99 @@ pub fn pack_fmod_wasm(
         exports: Vec::new(),
         total_size,
     })
+}
+
+/// Scan `wasm` for the embedded `define_params!` schema buffer.
+///
+/// The macro emits a `[u8; SCHEMA_MAX]` static beginning with the
+/// 4-byte header `[0x53 'S', 0x50 'P', version=1, count]` followed by
+/// `count` variable-length param entries. On wasm32 the bytes land in
+/// an unnamed data segment, so we recover them by searching for the
+/// header and structurally validating the trailing entries.
+///
+/// Validation walks each declared entry — type byte must be a known
+/// `ParamType` id, name and enum lengths must fit in the surrounding
+/// bytes, name bytes must be ASCII identifier characters. Any
+/// candidate that fails these checks is skipped, so the first
+/// remaining match is the real schema (the linker may emit one or two
+/// byte-identical copies; either is correct).
+///
+/// Returns `None` for modules built without `define_params!` (no
+/// header to find).
+fn find_param_schema_in_wasm(wasm: &[u8]) -> Option<Vec<u8>> {
+    let mut i = 0usize;
+    while i + 4 <= wasm.len() {
+        if wasm[i] == 0x53 && wasm[i + 1] == 0x50 && wasm[i + 2] == 0x01 {
+            if let Some(end) = validate_param_schema(wasm, i) {
+                return Some(wasm[i..end].to_vec());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Walk a candidate schema starting at `start`, returning the
+/// one-past-end offset on success or `None` if any entry is malformed.
+fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
+    if start + 4 > data.len() {
+        return None;
+    }
+    let count = data[start + 3] as usize;
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let mut pos = start + 4;
+    for _ in 0..count {
+        // tag(1) + type(1) + default(4)
+        if pos + 6 > data.len() {
+            return None;
+        }
+        let ptype = data[pos + 1];
+        // ParamType ids: 0=u8, 1=u16, 2=u32, 3=str, 4=u16_array, 5=blob.
+        if ptype > 5 {
+            return None;
+        }
+        pos += 6;
+        // name_len + name_bytes
+        if pos >= data.len() {
+            return None;
+        }
+        let name_len = data[pos] as usize;
+        pos += 1;
+        if pos + name_len > data.len() {
+            return None;
+        }
+        for j in 0..name_len {
+            let b = data[pos + j];
+            if !(b == b'_' || b.is_ascii_alphanumeric()) {
+                return None;
+            }
+        }
+        pos += name_len;
+        // enum_count + (val + ename_len + ename_bytes) * enum_count
+        if pos >= data.len() {
+            return None;
+        }
+        let enum_count = data[pos] as usize;
+        pos += 1;
+        if enum_count > 32 {
+            return None;
+        }
+        for _ in 0..enum_count {
+            if pos + 2 > data.len() {
+                return None;
+            }
+            pos += 1; // value byte
+            let ename_len = data[pos] as usize;
+            pos += 1;
+            if pos + ename_len > data.len() {
+                return None;
+            }
+            pos += ename_len;
+        }
+    }
+    Some(pos)
 }
 
 #[cfg(test)]

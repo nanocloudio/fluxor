@@ -19,6 +19,10 @@ extern "C" {
     /// `> 0` bytes written; `= 0` pending (no chunk yet, more may come);
     /// `= -1` EOF (response complete); `< -1` error.
     fn host_fetch_recv(handle: i32, buf: *mut u8, len: usize) -> i32;
+
+    /// Cancel the in-flight body reader and drop the host-side handle.
+    /// Idempotent on unknown / already-closed handles.
+    fn host_fetch_close(handle: i32) -> i32;
 }
 
 const RX_BUF_BYTES: usize = 4096;
@@ -143,9 +147,13 @@ fn fetch_step(state: *mut u8) -> i32 {
                 return 0;
             }
             if n < 0 {
-                // EOF or error. Signal HUP so the consumer can
-                // finalize.
+                // EOF or error. Signal HUP and release the host-side
+                // fetch handle — no more recvs on this stream.
                 st.eof = true;
+                if st.handle >= 0 {
+                    host_fetch_close(st.handle);
+                    st.handle = -1;
+                }
                 let _ = channel::channel_ioctl(
                     st.out_chan,
                     channel::IOCTL_SET_HUP,

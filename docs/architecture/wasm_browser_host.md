@@ -159,13 +159,37 @@ host_ws_open(url_ptr: *const u8, url_len: usize) -> i32          // socket handl
 host_ws_send(handle: i32, data: *const u8, len: usize) -> i32    // bytes accepted
 host_ws_recv(handle: i32, buf: *mut u8, len: usize) -> i32       // bytes written
 
-// HTTP fetch transport.
+// HTTP fetch transport. Backs the `host_browser_fetch` channel
+// source and the wasm-target FS provider (`src/platform/wasm/fs.rs`),
+// which fronts FS_CONTRACT (FS_OPEN / FS_READ / FS_CLOSE) on top of
+// `fetch()` so any module that uses the FS contract on bare-metal
+// (media_loader, foundation/http file routes, …) works on wasm
+// without channel plumbing for asset ingest.
 host_fetch_open(url_ptr: *const u8, url_len: usize) -> i32       // request handle
 host_fetch_recv(handle: i32, buf: *mut u8, len: usize) -> i32    // bytes written
+host_fetch_size(handle: i32) -> i32                               // Content-Length four-state: see below
+host_fetch_close(handle: i32) -> i32                              // 0 on success, idempotent on unknown handles
 
 // Cryptographic random (delegates to crypto.getRandomValues).
 host_csprng_fill(buf: *mut u8, len: usize) -> i32                // bytes written
 ```
+
+`host_fetch_size` is a four-state code — its return drives the
+wasm-target FS provider's `FS_STAT` translation, which in turn
+drives length-aware HTTP serving (`HANDLER_FS_FILE`):
+
+| Return | Meaning                                                       | FS_STAT  | HTTP commits |
+|--------|---------------------------------------------------------------|----------|--------------|
+| `>= 0` | Content-Length received                                       | `OK`     | `200 OK` with `Content-Length`             |
+| `-1`   | Headers received, no Content-Length (chunked / unknown)       | `ENOSYS` | streaming `200 OK` (body ends on close)    |
+| `-2`   | Hard failure — `fetch()` rejected, response status not OK     | `ENODEV` | `502 Bad Gateway`                          |
+| `-3`   | Headers not yet received (`fetch()` promise unresolved)       | `EAGAIN` | keep polling — never commit on this state  |
+
+The four-way split lets HTTP wait for an outcome before committing
+a response code, so a slow `fetch()` failure surfaces as `502`
+rather than a truncated `200 OK`. Polling is cheap (cached state,
+no fetch progress) and idempotent.
+
 
 Each import lives in the module file that uses it (file paths
 follow the `BuiltInModule` registration sites under

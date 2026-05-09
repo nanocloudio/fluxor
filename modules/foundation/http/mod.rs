@@ -375,6 +375,52 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             scratch_ptr,
             scratch_len,
         );
+
+        // Phase-machine snapshot — fires every tlm period so when the
+        // server appears unresponsive we can see exactly which Phase
+        // it sat in (e.g. ph=19 = WsActive, pca>0 = stale WS holding
+        // queued accepts). The structured tlm line shows bytes/idle
+        // but doesn't surface the FSM state, and the wedge surface
+        // recurs often enough that having this on by default is the
+        // only cheap way to characterise the next regression without
+        // round-tripping a redeploy.
+        if s.mode == MODE_SERVER && s.step_count % HTTP_TLM_PERIOD == 0 {
+            let mut buf = [0u8; 128];
+            let p = buf.as_mut_ptr();
+            let prefix = b"[http] state ph=";
+            let mut q = 0usize;
+            while q < prefix.len() { *p.add(q) = prefix[q]; q += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.phase as u32);
+            let mc = b" conn=";
+            let mut t = 0usize;
+            while t < mc.len() { *p.add(q) = mc[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.conn_id as u32);
+            let mca = b" pca=";
+            let mut t = 0usize;
+            while t < mca.len() { *p.add(q) = mca[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.pending_accept_count as u32);
+            let mpc = b" pc=";
+            let mut t = 0usize;
+            while t < mpc.len() { *p.add(q) = mpc[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.peer_closed as u32);
+            let mrl = b" rl=";
+            let mut t = 0usize;
+            while t < mrl.len() { *p.add(q) = mrl[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.recv_len as u32);
+            let mso = b" so=";
+            let mut t = 0usize;
+            while t < mso.len() { *p.add(q) = mso[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.send_offset as u32);
+            let msl = b" sl=";
+            let mut t = 0usize;
+            while t < msl.len() { *p.add(q) = msl[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.send_len as u32);
+            let mst = b" stk=";
+            let mut t = 0usize;
+            while t < mst.len() { *p.add(q) = mst[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.server.ws_pending_stuck_ticks);
+            dev_log(sys, 3, p, q);
+        }
         rc
     }
 }

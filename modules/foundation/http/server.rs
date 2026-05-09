@@ -161,6 +161,16 @@ pub(crate) enum Phase {
     /// in `ServerState.h2`.
     H2Active = 21,
 
+    /// HANDLER_FS_FILE: file is open but the FS provider hasn't yet
+    /// resolved length / final status (wasm browser-fetch with
+    /// response headers in flight). Polls `FS_STAT` each step until
+    /// it returns OK (length known → `SendHeaders` with
+    /// Content-Length), ENOSYS (no Content-Length → streaming
+    /// `SendHeaders`), ENODEV (`DrainSend` 502), or stays EAGAIN
+    /// past the poll-timeout (`DrainSend` 504). No response bytes
+    /// hit the wire until the outcome is known.
+    AwaitFsStat = 22,
+
     Error = 255,
 }
 
@@ -300,6 +310,13 @@ pub(crate) struct ServerState {
     pub(crate) fs_fd:    i32,
     pub(crate) fs_total: u32,
     pub(crate) fs_sent:  u32,
+    /// EAGAIN-tick counter for `Phase::AwaitFsStat`. Synchronous FS
+    /// providers (bare-metal, linux) resolve on the first poll;
+    /// async providers (wasm browser-fetch) may return EAGAIN until
+    /// response headers arrive. Past `FS_STAT_PROBE_TIMEOUT_TICKS`
+    /// the response becomes a 504 Gateway Timeout.
+    pub(crate) fs_stat_ticks: u16,
+    _fs_stat_pad: [u8; 2],
 
     pub(crate) phase: Phase,
     pub(crate) route_count: u8,
@@ -439,6 +456,8 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.fs_fd = -1;
     s.server.fs_total = 0;
     s.server.fs_sent = 0;
+    s.server.fs_stat_ticks = 0;
+    s.server._fs_stat_pad = [0; 2];
     s.server.phase = Phase::Init;
 
     let pool = heap_alloc(&*sys, DEFAULT_BODY_POOL_SIZE as u32);
@@ -534,9 +553,11 @@ unsafe fn reset_connection(s: &mut HttpState) {
     }
     s.server.fs_total = 0;
     s.server.fs_sent = 0;
-    // The IP module resets the listener slot to Closed when a connection
-    // completes, so we must send a fresh CMD_BIND to re-listen.
-    s.server.phase = Phase::Binding;
+    s.server.fs_stat_ticks = 0;
+    // The IP module's BSD-accept path keeps the listener in
+    // `Listen` across accepted connections, so re-binding here
+    // would just create a duplicate listener on the same port.
+    s.server.phase = Phase::WaitAccept;
 }
 
 /// Push a queued accept onto the FIFO. When full, actively close the
@@ -1922,8 +1943,11 @@ unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
         return 0;
     }
     if s.server.send_offset >= s.server.send_len {
-        // All bytes sent? Close out cleanly.
-        if s.server.fs_sent >= s.server.fs_total {
+        // `fs_total == u32::MAX` is the streaming sentinel — read
+        // until FS_READ signals EOF below. Otherwise close out once
+        // the declared content length is reached.
+        let length_known = s.server.fs_total != u32::MAX;
+        if length_known && s.server.fs_sent >= s.server.fs_total {
             let sys = &*s.syscalls;
             (sys.provider_call)(
                 s.server.fs_fd,
@@ -1935,19 +1959,30 @@ unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
             s.server.phase = Phase::CloseConn;
             return 0;
         }
-        // Refill from the FS provider.
+        // Refill: streaming reads a full SEND_BUF; length-known caps
+        // at the remaining bytes so we never over-read.
         let sys = &*s.syscalls;
         let want = SEND_BUF_SIZE as u32;
-        let remaining = s.server.fs_total.saturating_sub(s.server.fs_sent);
-        let cap = if remaining < want { remaining } else { want } as usize;
+        let cap = if length_known {
+            let remaining = s.server.fs_total.saturating_sub(s.server.fs_sent);
+            (if remaining < want { remaining } else { want }) as usize
+        } else {
+            want as usize
+        };
         let n = (sys.provider_call)(
             s.server.fs_fd,
             0x0901, // FS_READ
             s.server.send_buf.as_mut_ptr(),
             cap,
         );
+        // EAGAIN: provider has no bytes ready but the stream isn't
+        // done. Yield; the next step re-polls. Distinguishing this
+        // from EOF matters — closing on a not-yet-ready read would
+        // truncate every async-backed file.
+        if n == -11 {
+            return 0;
+        }
         if n <= 0 {
-            // EOF or error — close and finish.
             (sys.provider_call)(
                 s.server.fs_fd,
                 0x0903, // FS_CLOSE
@@ -2013,7 +2048,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             | Phase::FetchContent
             | Phase::CacheStream
             | Phase::WsHandshake
-            | Phase::WsClose => {
+            | Phase::WsClose
+            | Phase::AwaitFsStat => {
                 if s.server.fs_fd >= 0 {
                     ((*s.syscalls).provider_call)(
                         s.server.fs_fd,
@@ -2594,26 +2630,19 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.server.phase = Phase::DrainSend;
                         return 0;
                     }
-                    // Snapshot per-route fields before borrowing &mut s
-                    // for header construction.
+                    // Snapshot the path before borrowing &mut s for
+                    // header construction. Content-type is re-derived
+                    // from `matched_route` in `Phase::AwaitFsStat`
+                    // once the response code is decided.
                     let mut fs_path = [0u8; MAX_FS_PATH];
                     fs_path[..n].copy_from_slice(&route.fs_path[..n]);
-                    let mut ct = [0u8; MAX_CONTENT_TYPE];
-                    let ct_len = route.content_type_len as usize;
-                    if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
-                        ct[..ct_len].copy_from_slice(&route.content_type[..ct_len]);
-                    }
-                    let ct_slice: &[u8] = if ct_len == 0 {
-                        b"application/octet-stream"
-                    } else {
-                        &ct[..ct_len]
-                    };
 
                     let sys = &*s.syscalls;
                     // FS_OPEN(-1, path, len) → fd or negative errno.
                     // Dispatched through the kernel's FS_VTABLE to
                     // whichever module registered as the FS provider
-                    // (fat32 on bare-metal, linux_fs_dispatch on host).
+                    // (fat32 on bare-metal, linux_fs_dispatch on host,
+                    // browser-fetch on wasm).
                     let fd = (sys.provider_call)(
                         -1,
                         0x0900, // FS_OPEN
@@ -2625,24 +2654,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.server.phase = Phase::DrainSend;
                         return 0;
                     }
-                    // FS_STAT(fd, [size:u32, mtime:u32]).
-                    let mut stat = [0u8; 8];
-                    let st = (sys.provider_call)(
-                        fd,
-                        0x0904, // FS_STAT
-                        stat.as_mut_ptr(),
-                        stat.len(),
-                    );
-                    let size: u32 = if st >= 0 {
-                        u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]])
-                    } else {
-                        0
-                    };
+                    // FS_STAT may pend for async providers, so the
+                    // response-line decision happens in
+                    // `Phase::AwaitFsStat` once the outcome is known.
                     s.server.fs_fd = fd;
-                    s.server.fs_total = size;
                     s.server.fs_sent = 0;
-                    build_header_with_len(s, b"200 OK", ct_slice, size);
-                    s.server.phase = Phase::SendHeaders;
+                    s.server.fs_total = 0;
+                    s.server.fs_stat_ticks = 0;
+                    s.server.phase = Phase::AwaitFsStat;
                 }
                 HANDLER_PROXY => {
                     build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
@@ -2665,6 +2684,105 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     s.server.phase = Phase::DrainSend;
                 }
             }
+        }
+
+        Phase::AwaitFsStat => {
+            // Poll FS_STAT until the four-state code resolves:
+            //   OK     → known length; commit Content-Length.
+            //   ENOSYS → no Content-Length; commit streaming 200 OK.
+            //            `fs_total = u32::MAX` is the streaming
+            //            sentinel that `step_send_fs_file` reads to
+            //            avoid gating on `fs_sent >= fs_total`.
+            //   ENODEV → fetch failed; commit 502.
+            //   EAGAIN → headers pending; keep polling up to
+            //            `FS_STAT_PROBE_TIMEOUT_TICKS`, then 504.
+            const E_NODEV: i32 = -19;
+            const E_NOSYS: i32 = -38;
+            const E_AGAIN: i32 = -11;
+            const FS_STAT_PROBE_TIMEOUT_TICKS: u16 = 1500; // ~30 s on cm5 4 kHz
+            let sys = &*s.syscalls;
+            let mut stat = [0u8; 8];
+            let st = (sys.provider_call)(
+                s.server.fs_fd,
+                0x0904, // FS_STAT
+                stat.as_mut_ptr(),
+                stat.len(),
+            );
+
+            let ct_owner: Option<&Route> = if s.server.matched_route >= 0 {
+                Some(&*s.server.routes.as_ptr().add(s.server.matched_route as usize))
+            } else {
+                None
+            };
+            let ct_len = ct_owner.map(|r| r.content_type_len as usize).unwrap_or(0);
+            let mut ct_buf = [0u8; MAX_CONTENT_TYPE];
+            if let Some(r) = ct_owner {
+                if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
+                    ct_buf[..ct_len].copy_from_slice(&r.content_type[..ct_len]);
+                }
+            }
+            let ct_slice: &[u8] = if ct_len == 0 {
+                b"application/octet-stream"
+            } else {
+                &ct_buf[..ct_len]
+            };
+
+            if st == E_NODEV {
+                (sys.provider_call)(
+                    s.server.fs_fd,
+                    0x0903, // FS_CLOSE
+                    core::ptr::null_mut(),
+                    0,
+                );
+                s.server.fs_fd = -1;
+                build_error(s, b"502 Bad Gateway", b"Upstream fetch failed\n");
+                s.server.phase = Phase::DrainSend;
+                return 2;
+            }
+            if st >= 0 {
+                let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]);
+                s.server.fs_total = size;
+                build_header_with_len(s, b"200 OK", ct_slice, size);
+                s.server.phase = Phase::SendHeaders;
+                return 2;
+            }
+            if st == E_NOSYS {
+                s.server.fs_total = u32::MAX;
+                build_header(s, b"200 OK", ct_slice);
+                s.server.phase = Phase::SendHeaders;
+                return 2;
+            }
+            if st == E_AGAIN {
+                s.server.fs_stat_ticks = s.server.fs_stat_ticks.saturating_add(1);
+                if s.server.fs_stat_ticks >= FS_STAT_PROBE_TIMEOUT_TICKS {
+                    (sys.provider_call)(
+                        s.server.fs_fd,
+                        0x0903, // FS_CLOSE
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    s.server.fs_fd = -1;
+                    build_error(
+                        s,
+                        b"504 Gateway Timeout",
+                        b"Upstream fetch did not respond\n",
+                    );
+                    s.server.phase = Phase::DrainSend;
+                    return 2;
+                }
+                return 0;
+            }
+            // Unknown FS_STAT error — treat as a fetch failure.
+            (sys.provider_call)(
+                s.server.fs_fd,
+                0x0903, // FS_CLOSE
+                core::ptr::null_mut(),
+                0,
+            );
+            s.server.fs_fd = -1;
+            build_error(s, b"502 Bad Gateway", b"Upstream fetch failed\n");
+            s.server.phase = Phase::DrainSend;
+            return 2;
         }
 
         Phase::SendHeaders => {
@@ -2946,14 +3064,21 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             // navigate normally drains the queue (CLOSE frame or FIN).
             // Some clients (notably Chrome on Cmd-R) drop the JS
             // context but leave the underlying TCP ACKing — the WS
-            // never closes. After ~1 s of `pending_accept_count > 0`
-            // with no observed WS progress, force-close so the queued
-            // reload connections get served. Resetting on `did_any`
-            // keeps an actually-busy WS connected indefinitely.
-            if s.server.pending_accept_count > 0 && !did_any {
+            // appears alive server-side because outbound data still
+            // gets ACKed by the kernel even with no JS to receive it.
+            // After ~1 s of `pending_accept_count > 0` we kick.
+            //
+            // Earlier this guard was `&& !did_any` to avoid kicking a
+            // genuinely busy WS, but `did_any` is *outbound progress*
+            // (z80_core feeding ws_in keeps it true continuously) so
+            // the counter never climbed and the kick never fired. The
+            // right liveness signal is *inbound data from the current
+            // peer*; until we wire that in, plain pca-stuck timer.
+            if s.server.pending_accept_count > 0 {
                 s.server.ws_pending_stuck_ticks =
                     s.server.ws_pending_stuck_ticks.wrapping_add(1);
                 if s.server.ws_pending_stuck_ticks > 4000 {
+                    log(s, b"[http] WsActive stale w/ pending -> CloseConn");
                     s.server.ws_pending_stuck_ticks = 0;
                     s.server.phase = Phase::CloseConn;
                     return 2;
