@@ -12,13 +12,22 @@
 include!("wire.rs");
 
 // ============================================================================
-// Core runtime stubs for slice bounds-checking
+// PIC-only runtime intrinsics
 // ============================================================================
+//
+// Everything in `_pic_intrinsics` below exists to resolve symbols the
+// compiler emits in PIC builds where libcore's panic / EABI runtime
+// is not linked. On a hosted target (Linux, macOS) the compiler
+// emits calls into libcore / libc directly, and emitting these
+// `#[no_mangle]` symbols ourselves would either collide with libc
+// (`memset` / `memcpy`) or be unused dead code.
+//
+// `target_os = "none"` covers ARM bare-metal and aarch64 bare-metal
+// (rp2040 / rp2350 / bcm2712); `target_arch = "wasm32"` covers the
+// browser host (no libc, but still needs ABI helpers).
 
-// Bounds-checked slice indexing (`&data[a..b]`) emits calls to these core
-// functions. In freestanding PIC modules, core's panic infrastructure isn't
-// linked. We provide the actual Rust functions so the compiler resolves them.
-// These trap (same as the panic handler) — only reached on actual OOB access.
+#[cfg(any(target_os = "none", target_arch = "wasm32"))]
+mod _pic_intrinsics {
 
 #[allow(dead_code)]
 mod core_stubs {
@@ -407,6 +416,15 @@ pub unsafe extern "C" fn __aeabi_llsr(v_lo: u32, v_hi: u32, shift: u32) -> u64 {
     (lo as u64) | ((hi as u64) << 32)
 }
 
+} // mod _pic_intrinsics — end of PIC-only block
+
+// Re-export the PIC intrinsics at the includer's top-level scope so
+// module code that calls `__aeabi_memcpy` etc. by name keeps working.
+// Gated identically — on host the symbols don't exist.
+#[cfg(any(target_os = "none", target_arch = "wasm32"))]
+#[allow(unused_imports)]
+use _pic_intrinsics::*;
+
 // ============================================================================
 // Channel Poll Constants
 // ============================================================================
@@ -699,6 +717,7 @@ pub unsafe fn write_channel_hints(out: *mut u8, max_len: usize, hints: &[Channel
 // have to declare their own. Module faults are detected and restarted
 // by the kernel, so the trap loop never needs to return usefully.
 
+#[cfg(any(target_os = "none", target_arch = "wasm32"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
@@ -725,6 +744,7 @@ mod wasm_syscalls {
         pub fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32;
         pub fn channel_write(handle: i32, data: *const u8, len: usize) -> i32;
         pub fn channel_poll(handle: i32, events: u32) -> i32;
+        pub fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32;
         pub fn provider_open(
             contract: u32,
             open_op: u32,
@@ -867,6 +887,7 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
     provider_call: wasm_syscalls::provider_call,
     provider_query: wasm_syscalls::provider_query,
     provider_close: wasm_syscalls::provider_close,
+    channel_peek: wasm_syscalls::channel_peek,
 };
 
 // On wasm32 `module_init_wasm` (in `modules/sdk/wasm_entry.rs`)

@@ -47,9 +47,7 @@
 //! The staging buffer sits entirely inside the drain struct; place the
 //! static in `.bss` via `static mut` or a suitable lock pattern on the
 //! board side.
-
 use crate::kernel::log_ring;
-
 /// Write raw bytes to a local debug transport.
 ///
 /// # Semantics
@@ -64,19 +62,16 @@ use crate::kernel::log_ring;
 pub trait DebugTx {
     fn write(&mut self, bytes: &[u8]) -> usize;
 }
-
 /// A sink that discards everything. Use on boards with no local debug
 /// transport; paired with a running drain, the local tail still advances
 /// and the ring does not fill on the local side.
 pub struct NullTx;
-
 impl DebugTx for NullTx {
     #[inline]
     fn write(&mut self, bytes: &[u8]) -> usize {
         bytes.len()
     }
 }
-
 /// Drains `kernel::log_ring` into a [`DebugTx`] sink with single-tail
 /// staging. See module docs for the backpressure policy.
 pub struct DebugDrain<const N: usize> {
@@ -84,7 +79,6 @@ pub struct DebugDrain<const N: usize> {
     pending_len: u16,
     pending_off: u16,
 }
-
 impl<const N: usize> DebugDrain<N> {
     pub const fn new() -> Self {
         const {
@@ -96,7 +90,6 @@ impl<const N: usize> DebugDrain<N> {
             pending_off: 0,
         }
     }
-
     /// Perform one drain poll. Idempotent when there is nothing to do.
     ///
     /// Caller supplies the sink so the drain state can be static and
@@ -115,7 +108,6 @@ impl<const N: usize> DebugDrain<N> {
             self.pending_len = 0;
             self.pending_off = 0;
         }
-
         let n = log_ring::drain_local(&mut self.staging);
         if n == 0 {
             return;
@@ -126,14 +118,12 @@ impl<const N: usize> DebugDrain<N> {
             self.pending_off = written as u16;
         }
     }
-
     /// Bytes currently staged but not yet accepted by the sink. Useful
     /// for telemetry / heartbeat.
     #[inline]
     pub fn pending(&self) -> usize {
         (self.pending_len - self.pending_off) as usize
     }
-
     /// Discard any bytes staged but not yet accepted by the sink. Called
     /// by the platform runtime when the sink goes offline (e.g. USB CDC
     /// host detaches) so the next attach does not replay pre-detach
@@ -144,62 +134,8 @@ impl<const N: usize> DebugDrain<N> {
         self.pending_off = 0;
     }
 }
-
 impl<const N: usize> Default for DebugDrain<N> {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Sink that accepts the first `accept` bytes of every write and
-    /// rejects the rest, so the drain is forced to stage a pending tail.
-    struct Partial {
-        accept: usize,
-    }
-    impl DebugTx for Partial {
-        fn write(&mut self, bytes: &[u8]) -> usize {
-            core::cmp::min(bytes.len(), self.accept)
-        }
-    }
-
-    /// After `reset`, a drain that had a non-empty pending tail must
-    /// behave like a fresh drain: its next `poll` does not replay the
-    /// pre-reset bytes, and `pending()` reports zero.
-    #[test]
-    fn reset_discards_pending_tail() {
-        // Normalise ring state: disable + re-activate seeds the local
-        // tail to the current HEAD, so the bytes pushed below are the
-        // only ones this drain can see.
-        crate::kernel::log_ring::disable_local();
-        crate::kernel::log_ring::activate_local();
-
-        // Push more bytes than the sink will accept in one call so the
-        // drain is forced to stage a pending tail.
-        for _ in 0..10 {
-            crate::kernel::log_ring::push_byte(b'P');
-        }
-
-        let mut drain: DebugDrain<16> = DebugDrain::new();
-        let mut sink = Partial { accept: 4 };
-        drain.poll(&mut sink);
-        assert!(
-            drain.pending() > 0,
-            "expected pending tail after short sink write (pending={})",
-            drain.pending()
-        );
-
-        drain.reset();
-        assert_eq!(drain.pending(), 0);
-
-        // With nothing staged and no fresh ring bytes, a subsequent
-        // poll against a fully-accepting sink is a no-op — the pre-reset
-        // bytes must not be replayed.
-        let mut accepting = Partial { accept: usize::MAX };
-        drain.poll(&mut accepting);
-        assert_eq!(drain.pending(), 0);
     }
 }

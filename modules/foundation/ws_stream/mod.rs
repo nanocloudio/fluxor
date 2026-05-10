@@ -44,7 +44,7 @@
 //! upstream channel back-pressure applies normally if the retry
 //! buffer is held full for a sustained period.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
 
@@ -82,17 +82,17 @@ struct State {
     scratch: [u8; FRAME_BUF_BYTES],
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<State>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     _in_chan: i32,
@@ -115,7 +115,14 @@ pub extern "C" fn module_new(
     s.rx_in = unsafe { dev_channel_port(sys_ref, 0, 1) };
     s.tx_out = unsafe { dev_channel_port(sys_ref, 1, 0) };
     s.rx_out = unsafe { dev_channel_port(sys_ref, 1, 1) };
-    s.active_conn_id = 0;
+    // `u32::MAX` is the "unclaimed" sentinel: stamped on outbound
+    // envelopes when no inbound frame has arrived yet. The HTTP
+    // server's `ws_drain_fanout_input` recognises this sentinel and
+    // delivers to the first ws-fan-out slot rather than routing by
+    // a default-0 conn_id (which would collide with whatever
+    // connection happens to occupy slot 0). Real conn_ids fit in
+    // u8 (0..255), so u32::MAX is unambiguously distinguishable.
+    s.active_conn_id = u32::MAX;
     s.has_conn = false;
     s.tx_pending = [0u8; FRAME_BUF_BYTES];
     s.tx_pending_len = 0;
@@ -137,7 +144,7 @@ unsafe fn shift_consume(buf: *mut u8, len: usize, consumed: usize) -> usize {
     remaining
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
@@ -218,12 +225,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // ── Outbound: tx_in (OctetStream) → tx_out (WsFrame) ──
     //
-    // No `has_conn` gate: the http gateway ignores conn_id when only
-    // one client is active (server.rs ws_drain_fanout_input), and
-    // bundles like zedex-pi5-split push data outbound before the
-    // browser sends anything inbound. Stamping conn_id = 0 until we
-    // observe a real inbound frame is harmless under that semantic
-    // and unblocks the producer-first flow.
+    // No `has_conn` gate: producer-first bundles push data outbound
+    // before the browser sends anything inbound. Until we observe
+    // an inbound frame, `active_conn_id` carries the `u32::MAX`
+    // sentinel and the HTTP server's `ws_drain_fanout_input`
+    // delivers those envelopes to the first ws-fan-out slot rather
+    // than routing by a real id (0 would alias slot 0, which is
+    // typically the IP listener and never a fan-out target).
     if s.tx_in >= 0 && s.tx_out >= 0 {
         // Drain the pending framed message first.
         if s.tx_pending_len > 0 {
@@ -285,7 +293,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 pub extern "C" fn module_arena_size() -> u32 {
     0
 }

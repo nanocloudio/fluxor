@@ -217,32 +217,13 @@ pub const RTO_MIN: u16 = 200;
 pub const RTO_MAX: u16 = 6000;
 
 /// Maximum TCP connections (incl. LISTEN, ESTABLISHED, FIN_WAIT_*,
-/// TIME_WAIT). Each `TcpConn` is ~2.1 KiB (reorder_buf dominates),
-/// so the scale lives in three target tiers.
+/// TIME_WAIT). Each `TcpConn` is ~2.1 KiB (reorder_buf dominates).
 ///
-/// **aarch64 (bcm2712 bare-metal, host-linux on Pi 5)** — 1024 slots
-/// (~2.1 MiB). Comfortable on 8/16 GiB hosts; leaves ample headroom
-/// for browser-class workloads (Chrome opens 6 parallel conns per
-/// origin, page reloads race, long-running WS keep slots, TIME_WAIT
-/// holds 30 s of recently-closed conns). Sub-Linux somaxconn (default
-/// 4096) but well above any single-app scenario we run.
-///
-/// **wasm32 (browser host)** — 256 slots (~540 KiB). Browser
-/// linear-memory budgets are looser than embedded but tighter than
-/// host RAM; 256 covers every realistic in-browser workload.
-///
-/// **thumbv6m / thumbv7m / thumbv8m (rp2040 / rp2350)** — 16 slots.
-/// rp2350's 32 KiB buffer arena and rp2040's 16 KiB constrain the
-/// per-module state heap; 16 × 2.1 KiB ≈ 34 KiB of conn state is
-/// already a stretch on those targets, but it's enough for the
-/// embedded use cases (a single client at a time, perhaps with a
-/// monitoring conn).
-#[cfg(target_arch = "aarch64")]
-pub const MAX_TCP_CONNS: usize = 1024;
-#[cfg(target_arch = "wasm32")]
-pub const MAX_TCP_CONNS: usize = 256;
-#[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
-pub const MAX_TCP_CONNS: usize = 16;
+/// Tiered with the rest of the system: see `abi::config::ip` for
+/// the per-board profile. Tied to `http::MAX_CONCURRENT_CONNS` —
+/// the http module's slot count must not exceed this (compile-time
+/// invariant in `modules/sdk/config.rs`).
+pub use super::abi::config::ip::MAX_TCP_CONNS;
 
 /// Parsed TCP header
 pub struct TcpHeader {

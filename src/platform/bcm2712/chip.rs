@@ -1,10 +1,13 @@
 //! Chip abstraction layer — BCM2712 (aarch64) target.
 //!
-//! Provides equivalent constants to the RP generated chip_generated.rs.
+//! Capacity tunables are centralised in `abi::config::kernel`;
+//! per-board profiles live there, not here. This file used to
+//! shadow them with locally-defined values; that pattern caused
+//! the cm5 silent-fail in the multi-conn refactor when the http
+//! module's arena demand outgrew an out-of-date local
+//! `STATE_ARENA_SIZE` here. Re-exporting from one source of truth
+//! prevents the recurrence.
 
-// BCM2712 (CM5): generous arena to fit large application modules
-// like Quantum's session_processor (~440KB) and topic_engine (~570KB).
-pub const STATE_ARENA_SIZE: usize = 4 * 1024 * 1024;
-pub const BUFFER_ARENA_SIZE: usize = 1024 * 1024;
-pub const MAX_MODULE_CONFIG_SIZE: usize = 32 * 1024;
-pub const CONFIG_ARENA_SIZE: usize = 64 * 1024;
+pub use crate::abi::config::kernel::{
+    BUFFER_ARENA_SIZE, CONFIG_ARENA_SIZE, MAX_MODULE_CONFIG_SIZE, STATE_ARENA_SIZE,
+};

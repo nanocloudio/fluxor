@@ -2,7 +2,6 @@
 //!
 //! Standalone implementation. No external dependencies. Used as the inner hash
 //! for Ed25519 signature verification.
-
 const K: [u64; 80] = [
     0x428a2f98d728ae22,
     0x7137449123ef65cd,
@@ -85,7 +84,6 @@ const K: [u64; 80] = [
     0x5fcb6fab3ad6faec,
     0x6c44198c4a475817,
 ];
-
 const H0: [u64; 8] = [
     0x6a09e667f3bcc908,
     0xbb67ae8584caa73b,
@@ -96,55 +94,45 @@ const H0: [u64; 8] = [
     0x1f83d9abfb41bd6b,
     0x5be0cd19137e2179,
 ];
-
 #[inline]
 fn rotr(x: u64, n: u32) -> u64 {
     x.rotate_right(n)
 }
-
 #[inline]
 fn ch(x: u64, y: u64, z: u64) -> u64 {
     (x & y) ^ (!x & z)
 }
-
 #[inline]
 fn maj(x: u64, y: u64, z: u64) -> u64 {
     (x & y) ^ (x & z) ^ (y & z)
 }
-
 #[inline]
 fn big_sigma0(x: u64) -> u64 {
     rotr(x, 28) ^ rotr(x, 34) ^ rotr(x, 39)
 }
-
 #[inline]
 fn big_sigma1(x: u64) -> u64 {
     rotr(x, 14) ^ rotr(x, 18) ^ rotr(x, 41)
 }
-
 #[inline]
 fn small_sigma0(x: u64) -> u64 {
     rotr(x, 1) ^ rotr(x, 8) ^ (x >> 7)
 }
-
 #[inline]
 fn small_sigma1(x: u64) -> u64 {
     rotr(x, 19) ^ rotr(x, 61) ^ (x >> 6)
 }
-
 pub struct Sha512 {
     h: [u64; 8],
     buf: [u8; 128],
     buf_len: usize,
     bit_len: u128,
 }
-
 impl Default for Sha512 {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl Sha512 {
     pub fn new() -> Self {
         Self {
@@ -154,10 +142,8 @@ impl Sha512 {
             bit_len: 0,
         }
     }
-
     pub fn update(&mut self, mut data: &[u8]) {
         self.bit_len = self.bit_len.wrapping_add((data.len() as u128) << 3);
-
         if self.buf_len > 0 {
             let take = core::cmp::min(128 - self.buf_len, data.len());
             self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
@@ -169,20 +155,17 @@ impl Sha512 {
                 self.buf_len = 0;
             }
         }
-
         while data.len() >= 128 {
             let mut block = [0u8; 128];
             block.copy_from_slice(&data[..128]);
             self.compress(&block);
             data = &data[128..];
         }
-
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);
             self.buf_len = data.len();
         }
     }
-
     pub fn finalize(mut self) -> [u8; 64] {
         // Append 0x80, pad with zeros until length ≡ 112 (mod 128), then 16-byte length.
         let bit_len = self.bit_len;
@@ -203,14 +186,12 @@ impl Sha512 {
         self.buf[112..128].copy_from_slice(&bit_len.to_be_bytes());
         let block = self.buf;
         self.compress(&block);
-
         let mut out = [0u8; 64];
         for (i, w) in self.h.iter().enumerate() {
             out[i * 8..(i + 1) * 8].copy_from_slice(&w.to_be_bytes());
         }
         out
     }
-
     fn compress(&mut self, block: &[u8; 128]) {
         let mut w = [0u64; 80];
         for (i, w_i) in w.iter_mut().take(16).enumerate() {
@@ -232,7 +213,6 @@ impl Sha512 {
                 .wrapping_add(small_sigma0(w[i - 15]))
                 .wrapping_add(w[i - 16]);
         }
-
         let mut a = self.h[0];
         let mut b = self.h[1];
         let mut c = self.h[2];
@@ -241,7 +221,6 @@ impl Sha512 {
         let mut f = self.h[5];
         let mut g = self.h[6];
         let mut h = self.h[7];
-
         for i in 0..80 {
             let t1 = h
                 .wrapping_add(big_sigma1(e))
@@ -258,7 +237,6 @@ impl Sha512 {
             b = a;
             a = t1.wrapping_add(t2);
         }
-
         self.h[0] = self.h[0].wrapping_add(a);
         self.h[1] = self.h[1].wrapping_add(b);
         self.h[2] = self.h[2].wrapping_add(c);
@@ -269,54 +247,9 @@ impl Sha512 {
         self.h[7] = self.h[7].wrapping_add(h);
     }
 }
-
 /// One-shot helper: SHA-512 of a single byte string.
 pub fn sha512(data: &[u8]) -> [u8; 64] {
     let mut h = Sha512::new();
     h.update(data);
     h.finalize()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hex(b: &[u8]) -> alloc::string::String {
-        let mut s = alloc::string::String::new();
-        for &x in b {
-            s.push_str(&alloc::format!("{:02x}", x));
-        }
-        s
-    }
-
-    extern crate alloc;
-
-    #[test]
-    fn empty() {
-        // FIPS 180-4 test vector: SHA-512 of empty string.
-        let h = sha512(b"");
-        let expect = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
-                      47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
-        assert_eq!(hex(&h), expect);
-    }
-
-    #[test]
-    fn abc() {
-        let h = sha512(b"abc");
-        let expect = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
-                      2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
-        assert_eq!(hex(&h), expect);
-    }
-
-    #[test]
-    fn long() {
-        // 1024 bytes of 'a' — exercises multiple-block path.
-        let data = vec![b'a'; 1024];
-        let h = sha512(&data);
-        let mut h2 = Sha512::new();
-        for chunk in data.chunks(13) {
-            h2.update(chunk);
-        }
-        assert_eq!(h, h2.finalize());
-    }
 }

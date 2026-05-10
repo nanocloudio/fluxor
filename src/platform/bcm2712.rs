@@ -1610,6 +1610,20 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 loop { unsafe { core::arch::asm!("wfi") }; }
             }
 
+            // Mirror the producer-side channel's mailbox flag onto the
+            // consumer-side bridge channel. Without this, typed-envelope
+            // edges (WsFrame, FmpMessage, etc.) shred their framing at
+            // this seam: the pump writes back-to-back atomic frames into
+            // a FIFO ring, the consumer's next `channel_read` returns
+            // multiple envelopes coalesced, and only the first parses
+            // cleanly. POLL_IN also stays latched on the leftover bytes,
+            // driving the consumer module to spin on phantom reads. See
+            // `tests/ws.rs::cross_domain_pump_*` for the host-side
+            // regression coverage.
+            if channel::channel_is_mailbox(edge_snapshot.channel) {
+                channel::channel_set_mailbox(in_ch);
+            }
+
             let to_port_marker: u8 = if edge_snapshot.is_ctrl() { 1 } else { 0 };
             let registered = unsafe {
                 multicore::register_cross_edge(multicore::CrossDomainEdge {

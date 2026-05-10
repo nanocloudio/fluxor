@@ -1,15 +1,9 @@
 //! Chip abstraction layer — Linux hosted target.
 //!
-//! Provides equivalent constants to the RP generated chip_generated.rs
-//! and the BCM2712 chip module. No real hardware — generous arena sizes.
+//! Capacity tunables are centralised in `abi::config::kernel`;
+//! per-board profiles live there. This file is a thin re-export
+//! shim so platform code can keep its existing import paths.
 
-// Linux host: generous arenas for application graphs. Quantum's
-// session_processor + topic_engine + consumer_group_coordinator alone
-// consume ~1.5 MB of state.
-pub const STATE_ARENA_SIZE: usize = 16 * 1024 * 1024;
-// 8 MiB lets high-throughput graphs size individual channels at
-// 16-64 KiB without exhausting the arena; smaller rings flap
-// back-pressure under sustained gigabit-class loads.
-pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
-pub const MAX_MODULE_CONFIG_SIZE: usize = 32 * 1024;
-pub const CONFIG_ARENA_SIZE: usize = 64 * 1024;
+pub use crate::abi::config::kernel::{
+    BUFFER_ARENA_SIZE, CONFIG_ARENA_SIZE, MAX_MODULE_CONFIG_SIZE, STATE_ARENA_SIZE,
+};

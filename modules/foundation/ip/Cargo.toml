@@ -1,0 +1,28 @@
+[package]
+name = "fluxor-mod-ip"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Bare-metal IP / TCP / UDP / DHCP / ARP / ICMP module — host-test build"
+
+# This file lets the bare-metal `ip` module crate also build as a
+# host rlib so the test harness can link it as a normal Rust
+# library. The PIC firmware build invokes `rustc` directly against
+# `mod.rs` (see `Makefile :: modules`) and does NOT consult this
+# file, so the cargo build path is purely additive.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+# `host-test` switches the module away from `#![no_std]` and lets
+# the host harness link it. PIC builds never set this feature.
+default = []
+host-test = []
+
+[dependencies]
+# Tests run against the same `SyscallTable` / opcode constants the
+# kernel exposes, ensuring the harness sees byte-identical types.
+fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }

@@ -18,3 +18,13 @@ vm/
 .claude/
 .context/
 .codex
+
+# Local-only test artefacts at the repo root. Nothing under `/tests`
+# is committed: `tests/harness` is an independent sub-workspace
+# (its own Cargo.toml `[workspace]`) for host integration tests,
+# and `tests/hardware` holds rig configs that depend on operator
+# environment. The main build does not depend on anything here.
+# The leading `/` anchors the pattern to the repo root so
+# `tools/tests/` (cargo integration tests for the host tools) is
+# not affected.
+/tests/

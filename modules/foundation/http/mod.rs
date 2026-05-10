@@ -57,7 +57,7 @@
 //! | 4     | host_ip     | u32  | 0       | Target IP (client mode)                             |
 //! | 10-45 | route_N_*   | —    | —       | Route params (server mode)                          |
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
 
@@ -73,13 +73,24 @@ mod client_h2;
 mod connection;
 mod h2;
 mod h3;
-mod hpack;
-mod qpack;
 mod server;
-mod wire_h1;
-mod wire_h2;
-mod wire_h3;
-mod wire_ws;
+
+// Wire codecs are pure-byte and useful for host tests of the
+// h1 / h2 / h3 / ws / hpack / qpack layers. Stay private outside
+// the host-test feature so the firmware's symbol surface is
+// unchanged.
+#[cfg(not(feature = "host-test"))] mod hpack;
+#[cfg(feature = "host-test")] pub mod hpack;
+#[cfg(not(feature = "host-test"))] mod qpack;
+#[cfg(feature = "host-test")] pub mod qpack;
+#[cfg(not(feature = "host-test"))] mod wire_h1;
+#[cfg(feature = "host-test")] pub mod wire_h1;
+#[cfg(not(feature = "host-test"))] mod wire_h2;
+#[cfg(feature = "host-test")] pub mod wire_h2;
+#[cfg(not(feature = "host-test"))] mod wire_h3;
+#[cfg(feature = "host-test")] pub mod wire_h3;
+#[cfg(not(feature = "host-test"))] mod wire_ws;
+#[cfg(feature = "host-test")] pub mod wire_ws;
 
 use client::ClientState;
 use connection::NET_BUF_SIZE;
@@ -263,25 +274,58 @@ mod params_def {
 
 // ── Exported PIC interface ────────────────────────────────────────────────
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<HttpState>() as u32
 }
 
-/// Heap arena size. The server's body pool is allocated from this
-/// arena.
-#[no_mangle]
+/// Heap arena size — sized for the **working set**, not the slot
+/// table ceiling. The slot table (`MAX_CONCURRENT_CONNS`) is the
+/// architectural cap on simultaneous in-flight connections; the
+/// arena (`ARENA_WORKING_SET_CONNS`) is the realistic peak number
+/// of *active* connections the system serves at once. When the
+/// arena fills, `alloc_free_slot` returns `None` and the demux
+/// closes the new conn cleanly — graceful overload behaviour, no
+/// silent drops.
+///
+/// Decoupling these means a 1024-slot table on aarch64 doesn't
+/// require 16+ MiB of pre-reserved arena that's idle 99% of the
+/// time. The arena holds:
+///   - the server's body pool (initial `DEFAULT_BODY_POOL_SIZE`,
+///     grown via `heap_realloc` doubling — accounted for by
+///     doubling the body budget here),
+///   - per-active-conn `recv_buf` + `send_buf` allocated on accept,
+///   - per-active-conn `H2State` (~3 KB) allocated lazily on the
+///     h2c preface,
+///   - allocator overhead.
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
-    (server::DEFAULT_BODY_POOL_SIZE + 64) as u32
+    // Reserve room for the body pool plus headroom for `heap_realloc`
+    // doubling under big inline-template configurations.
+    let body_budget = (server::DEFAULT_BODY_POOL_SIZE as u32).saturating_mul(2);
+    let per_slot_buffers = (server::RECV_BUF_SIZE + server::SEND_BUF_SIZE) as u32;
+    let working_set = server::ARENA_WORKING_SET_CONNS as u32;
+    let conns_buffers = per_slot_buffers.saturating_mul(working_set);
+    let h2_state_size = core::mem::size_of::<h2::H2State>() as u32;
+    let h2_buffers = h2_state_size.saturating_mul(working_set);
+    // 16 bytes of allocator overhead per heap_alloc call (8-byte
+    // header + alignment padding). Up to 3 allocs per active conn
+    // (recv_buf, send_buf, h2).
+    let alloc_overhead = (16u32 * 3).saturating_mul(working_set);
+    body_budget
+        .saturating_add(conns_buffers)
+        .saturating_add(h2_buffers)
+        .saturating_add(alloc_overhead)
+        .saturating_add(2048) // slack for body_pool resize + headers
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -335,7 +379,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
@@ -390,35 +434,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let prefix = b"[http] state ph=";
             let mut q = 0usize;
             while q < prefix.len() { *p.add(q) = prefix[q]; q += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.phase as u32);
+            q += fmt_u32_raw(p.add(q), server::cur_phase(s) as u32);
             let mc = b" conn=";
             let mut t = 0usize;
             while t < mc.len() { *p.add(q) = mc[t]; q += 1; t += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.conn_id as u32);
-            let mca = b" pca=";
-            let mut t = 0usize;
-            while t < mca.len() { *p.add(q) = mca[t]; q += 1; t += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.pending_accept_count as u32);
+            q += fmt_u32_raw(p.add(q), server::cur_conn_id(s) as u32);
             let mpc = b" pc=";
             let mut t = 0usize;
             while t < mpc.len() { *p.add(q) = mpc[t]; q += 1; t += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.peer_closed as u32);
+            let peer_closed = server::cur_slot(s).map(|c| c.peer_closed).unwrap_or(0);
+            q += fmt_u32_raw(p.add(q), peer_closed as u32);
             let mrl = b" rl=";
             let mut t = 0usize;
             while t < mrl.len() { *p.add(q) = mrl[t]; q += 1; t += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.recv_len as u32);
+            q += fmt_u32_raw(p.add(q), server::cur_recv_len(s) as u32);
             let mso = b" so=";
             let mut t = 0usize;
             while t < mso.len() { *p.add(q) = mso[t]; q += 1; t += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.send_offset as u32);
+            q += fmt_u32_raw(p.add(q), server::cur_send_offset(s) as u32);
             let msl = b" sl=";
             let mut t = 0usize;
             while t < msl.len() { *p.add(q) = msl[t]; q += 1; t += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.send_len as u32);
-            let mst = b" stk=";
+            q += fmt_u32_raw(p.add(q), server::cur_send_len(s) as u32);
+            let mac = b" act=";
             let mut t = 0usize;
-            while t < mst.len() { *p.add(q) = mst[t]; q += 1; t += 1; }
-            q += fmt_u32_raw(p.add(q), s.server.ws_pending_stuck_ticks);
+            while t < mac.len() { *p.add(q) = mac[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), server::active_slot_count(s) as u32);
             dev_log(sys, 3, p, q);
         }
         rc
@@ -428,7 +469,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Drain marks the server for graceful shutdown — the next time it
 /// returns to `WaitAccept` it reports done instead of looping. Client
 /// mode is one-shot and ignores drain.
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_drain"]
 pub extern "C" fn module_drain(state: *mut u8) -> i32 {
     if state.is_null() {
@@ -437,13 +478,16 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut HttpState);
         if s.mode == MODE_SERVER {
+            // `server::step` checks the drain flag at the top of
+            // every tick and returns 1 once no in-flight conns
+            // remain, so no specific slot needs to be poked.
             s.server.draining = 1;
         }
     }
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     // net_in / net_out / file_data sized to absorb 8 KiB CMD_SEND

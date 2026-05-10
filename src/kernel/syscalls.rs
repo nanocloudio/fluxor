@@ -76,7 +76,12 @@ pub fn init_syscall_table() {
         provider_call: syscall_provider_call,
         provider_query: syscall_provider_query,
         provider_close: syscall_provider_close,
+        channel_peek: syscall_channel_peek,
     });
+}
+
+unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    channel::channel_peek(handle, buf, len)
 }
 
 // ── v2 syscalls: handle-scoped provider dispatch ────────────────────
@@ -1689,8 +1694,13 @@ impl SyscallTable {
             provider_call: stub_provider_call,
             provider_query: stub_provider_query,
             provider_close: stub_provider_close,
+            channel_peek: stub_channel_peek,
         }
     }
+}
+
+unsafe extern "C" fn stub_channel_peek(_handle: i32, _buf: *mut u8, _len: usize) -> i32 {
+    -1
 }
 
 // ============================================================================

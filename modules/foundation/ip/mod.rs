@@ -30,7 +30,7 @@
 //! |-----|----------|------|---------|----------------------------|
 //! | 1   | use_dhcp | u8   | 1       | Enable DHCP (1=yes, 0=no) |
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
 
@@ -741,21 +741,21 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_deferred_ready"]
 pub extern "C" fn module_deferred_ready() -> u32 { 1 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<IpState>()
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -823,7 +823,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut IpState);
@@ -971,7 +971,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     // Channel ring sizes are the per-tick burst budget for the IP
@@ -1003,7 +1003,7 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     unsafe { write_channel_hints(out, max_len, &hints) }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_in_place_safe"]
 pub extern "C" fn module_in_place_safe() -> u32 {
     0
@@ -2717,6 +2717,65 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
             _ => {}
         }
         i += 1;
+    }
+}
+
+// ============================================================================
+// Test helpers (host-test feature only)
+// ============================================================================
+
+#[cfg(feature = "host-test")]
+pub mod test_helpers {
+    //! Helpers for host-side test harnesses. Not compiled into PIC
+    //! firmware.
+    //!
+    //! These give tests a way to bypass the DHCP / ARP bootstrap
+    //! sequence so the TCP / UDP behavioural surfaces can be
+    //! exercised directly. Using them outside of `cfg(test)` is a
+    //! contract violation — the kernel should never need them.
+
+    use super::{tcp, IpState};
+
+    /// Force the IP stack into a "configured" state with the given
+    /// MAC and IP. Skips DHCP entirely. Tests that exercise DHCP
+    /// itself should not call this.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `IpState` (i.e.
+    /// `module_new` has already returned).
+    pub unsafe fn force_configured(
+        state: *mut u8,
+        mac: [u8; 6],
+        local_ip: u32,
+        netmask: u32,
+        gateway: u32,
+    ) {
+        let s = &mut *(state as *mut IpState);
+        s.mac_addr = mac;
+        s.mac_valid = true;
+        s.local_ip = local_ip;
+        s.netmask = netmask;
+        s.gateway = gateway;
+        s.ip_configured = true;
+        s.use_dhcp = 0;
+    }
+
+    /// Inspect the local IP currently held by the IP stack.
+    pub unsafe fn local_ip(state: *const u8) -> u32 {
+        (*(state as *const IpState)).local_ip
+    }
+
+    /// Borrow the connection table for assertion. Returns the slot
+    /// count `(used, total)`.
+    pub unsafe fn conn_count(state: *const u8) -> (usize, usize) {
+        let s = &*(state as *const IpState);
+        let mut used = 0;
+        for c in s.tcp_conns.iter() {
+            if c.state != tcp::TcpState::Closed {
+                used += 1;
+            }
+        }
+        (used, tcp::MAX_TCP_CONNS)
     }
 }
 

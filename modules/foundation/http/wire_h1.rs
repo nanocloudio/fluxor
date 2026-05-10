@@ -61,10 +61,16 @@ pub unsafe fn parse_request_line(src: *const u8, src_len: usize, dst: *mut u8, d
     Some(plen)
 }
 
-/// Write a minimal HTTP/1.0 response status line plus `Connection:
+/// Write a minimal HTTP/1.1 response status line plus `Connection:
 /// close` and a `Content-Type` header into `dst`, terminated by the
 /// blank line that ends the head. Returns the number of bytes written
 /// (capped at `dst_cap`).
+///
+/// RFC 9110 §6.6 requires the response version to be `<=` the
+/// request version; emitting 1.0 in reply to a 1.1 request forces
+/// clients into 1.0 keep-alive semantics. We always include
+/// `Connection: close`, so the connection still closes after each
+/// response — but the version now matches modern requests.
 pub unsafe fn write_status_line(
     dst: *mut u8,
     dst_cap: usize,
@@ -85,7 +91,7 @@ pub unsafe fn write_status_line(
         };
     }
 
-    put!(b"HTTP/1.0 ");
+    put!(b"HTTP/1.1 ");
     put!(status);
     put!(b"\r\nConnection: close\r\nContent-Type: ");
     put!(content_type);
@@ -94,7 +100,7 @@ pub unsafe fn write_status_line(
     off
 }
 
-/// Write a minimal HTTP/1.0 error response (status line + Connection:
+/// Write a minimal HTTP/1.1 error response (status line + Connection:
 /// close + blank line + body) into `dst`. Returns total bytes written.
 pub unsafe fn write_error_response(
     dst: *mut u8,
@@ -116,7 +122,7 @@ pub unsafe fn write_error_response(
         };
     }
 
-    put!(b"HTTP/1.0 ");
+    put!(b"HTTP/1.1 ");
     put!(code);
     put!(b"\r\nConnection: close\r\n\r\n");
     put!(body);

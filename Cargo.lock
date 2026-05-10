@@ -1366,6 +1366,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxor-mod-http"
+version = "0.1.0"
+dependencies = [
+ "fluxor",
+]
+
+[[package]]
+name = "fluxor-mod-ip"
+version = "0.1.0"
+dependencies = [
+ "fluxor",
+]
+
+[[package]]
+name = "fluxor-mod-ws-stream"
+version = "0.1.0"
+dependencies = [
+ "fluxor",
+]
+
+[[package]]
 name = "fluxor-tools"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,27 @@
+[package]
+name = "fluxor-mod-ws-stream"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "WsFrame ↔ OctetStream adapter — host-test build"
+
+# This file lets the bare-metal `ws_stream` module crate also build
+# as a host rlib so the test harness can link it as a normal Rust
+# library. The PIC firmware build invokes `rustc` directly against
+# `mod.rs` and ignores Cargo.toml, so this addition is purely
+# additive — see `modules/foundation/ip/Cargo.toml` for the same
+# pattern.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+# `host-test` switches the module away from `#![no_std]` and lets
+# the host harness link it. PIC builds never set this feature.
+host-test = []
+
+[dependencies]
+fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }

@@ -36,6 +36,33 @@ fn modules_dir() -> PathBuf {
     project_root().join("target/bcm2712/modules")
 }
 
+fn linux_runtime_binary() -> PathBuf {
+    project_root().join("target/aarch64-unknown-linux-gnu/release/fluxor-linux")
+}
+
+/// Probe whether `fluxor-linux` is present and was compiled with the
+/// listed features. The build pipeline cross-checks YAML modules
+/// against the runtime's compiled features and rejects the build
+/// when a required feature is missing — without that feature
+/// present, every YAML in this file (which all use
+/// `host_image_codec`) would fail at validation rather than
+/// exercising the parts of the pipeline these tests cover.
+fn linux_runtime_has_features(required: &[&str]) -> bool {
+    let bin = linux_runtime_binary();
+    if !bin.exists() {
+        return false;
+    }
+    let out = match Command::new(&bin).arg("--print-features").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let features: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    required.iter().all(|f| features.contains(*f))
+}
+
 fn skip_if_unconfigured() -> bool {
     if !fluxor_binary().exists() {
         eprintln!("skip: fluxor binary not at {}", fluxor_binary().display());
@@ -45,6 +72,16 @@ fn skip_if_unconfigured() -> bool {
         eprintln!(
             "skip: bcm2712 modules not at {} — run `make modules TARGET=bcm2712`",
             modules_dir().display()
+        );
+        return true;
+    }
+    if !linux_runtime_has_features(&["host-image"]) {
+        eprintln!(
+            "skip: {} missing or built without `host-image` — \
+             rebuild with: cargo build --release --bin fluxor-linux \
+             --no-default-features --features host-linux,host-image \
+             --target aarch64-unknown-linux-gnu",
+            linux_runtime_binary().display()
         );
         return true;
     }

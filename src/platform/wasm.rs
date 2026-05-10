@@ -1231,6 +1231,15 @@ pub unsafe extern "C" fn channel_poll(handle: i32, events: u32) -> i32 {
     (table.channel_poll)(handle, events)
 }
 
+/// Channel peek. Bridge supplies a kernel-memory `buf`; the bridge
+/// copies bytes back into the child's memory if peek succeeded.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    let table = crate::kernel::syscalls::get_syscall_table();
+    (table.channel_peek)(handle, buf, len)
+}
+
 /// Heap alloc — child-module-scoped arenas. Each instantiated module
 /// has its own arena; the kernel's scheduler tracks which module is
 /// the current caller via `set_current_module` (called by the bridge

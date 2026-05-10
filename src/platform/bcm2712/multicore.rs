@@ -14,9 +14,17 @@
 //! ## SPSC ring buffer
 //!
 //! Each `CrossDomainChannel` is a single-producer, single-consumer (SPSC) ring
-//! buffer with 8 slots of 64 bytes each (512 bytes total data). The head index
-//! is owned by the producer, the tail by the consumer. Both are cache-line
-//! aligned to avoid false sharing. The ring drops messages when full.
+//! buffer with `RING_SLOTS` slots, each sized to hold one full mailbox payload
+//! (`SLOT_DATA_SIZE = abi::CHANNEL_BUFFER_SIZE`). The head index is owned by
+//! the producer, the tail by the consumer. Both are cache-line aligned to
+//! avoid false sharing. The ring drops messages when full.
+//!
+//! Slots match `CHANNEL_BUFFER_SIZE` so any frame a producer-side mailbox
+//! can hold also fits in a cross-domain slot — anything smaller would
+//! make `pump_cross_domain`'s `channel_read` return EINVAL on
+//! mailbox channels carrying larger envelopes, leaving the producer
+//! mailbox stuck in READY and every subsequent `channel_write`
+//! returning EAGAIN.
 //!
 //! ## Signaling pattern
 //!
@@ -45,8 +53,12 @@ pub const RING_SLOTS: usize = 8;
 /// Mask for wrapping ring indices (RING_SLOTS - 1).
 const RING_MASK: u32 = (RING_SLOTS - 1) as u32;
 
-/// Size of each slot's data payload in bytes.
-pub const SLOT_DATA_SIZE: usize = 60;
+/// Size of each slot's data payload in bytes. Sized to match
+/// `abi::CHANNEL_BUFFER_SIZE` so any payload the producer-side mailbox
+/// can hold also fits in a cross-domain SPSC slot — undersizing this
+/// stalls the producer mailbox at READY (the pump's `channel_read`
+/// returns EINVAL, the frame is never consumed).
+pub const SLOT_DATA_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
 
 /// Non-cacheable DMA buffer arena size (64 KB).
 pub const DMA_ARENA_SIZE: usize = 64 * 1024;
@@ -55,7 +67,9 @@ pub const DMA_ARENA_SIZE: usize = 64 * 1024;
 // CrossDomainChannel — lock-free SPSC ring buffer
 // ============================================================================
 
-/// A single slot in the ring buffer: 4-byte length + 60-byte data = 64 bytes.
+/// A single slot in the ring buffer: 4-byte length + `SLOT_DATA_SIZE`
+/// bytes of payload. `SLOT_DATA_SIZE` mirrors `abi::CHANNEL_BUFFER_SIZE`
+/// so a producer-side mailbox payload always fits in a slot.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct RingSlot {
@@ -79,8 +93,9 @@ const PRODUCER_NONE: u32 = 0xFFFF_FFFF;
 
 /// Lock-free SPSC ring buffer for cross-core communication.
 ///
-/// The ring has 8 slots of 64 bytes each (512 bytes total data).
-/// Head and tail indices are on separate cache lines to avoid false sharing.
+/// The ring has `RING_SLOTS` slots, each sized to hold one full mailbox
+/// payload (`SLOT_DATA_SIZE` bytes). Head and tail indices are on
+/// separate cache lines to avoid false sharing.
 ///
 /// The `producer_core` field enforces SPSC: the first core to call `send()`
 /// claims the channel. Subsequent sends from a different core are rejected.

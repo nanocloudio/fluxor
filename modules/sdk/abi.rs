@@ -41,6 +41,15 @@ pub mod wire {
     include!("wire.rs");
 }
 
+/// Capacity / sizing tunables — one coherent envelope per board
+/// profile. Picked up by both the kernel and PIC modules so a
+/// single edit moves the whole system in lockstep. See
+/// `modules/sdk/config.rs` for the full layout and
+/// cross-subsystem invariants.
+pub mod config {
+    include!("config.rs");
+}
+
 pub mod kernel_abi {
     include!("kernel_abi.rs");
 }

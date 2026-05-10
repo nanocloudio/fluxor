@@ -75,7 +75,7 @@ ABI_HEADER := $(SDK_DIR)/abi.rs
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,$(if $(filter synth_source,$(1)),1,2))))))))))))))
 
-.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint install-rig-backends
+.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint test install-rig-backends
 
 all: tools firmware-all modules-all linux-bin
 
@@ -308,6 +308,28 @@ lint:
 	@cargo clippy --release --target wasm32-unknown-unknown \
 		--no-default-features --features host-wasm -- -D warnings
 	@echo "lint: clean"
+
+# Host-side test suite.
+#  - fluxor-tools workspace tests
+#  - fluxor-test-harness sub-workspace (in `tests/harness/`):
+#      - harness self-tests (mock channel/provider/syscall table)
+#      - integration tests under `tests/harness/tests/*.rs`
+#        (graph_unification, ip, http, ws, kernel_*, perf_http,
+#        platform_debug, http3 — the network-stack matrix)
+#
+# `tests/` is a sub-workspace independent of the main one. The main
+# tree builds without it; `make test` runs the harness from inside
+# its own directory.
+test:
+	@echo "==> testing fluxor-tools ..."
+	@cd tools && cargo test --all-targets --all-features
+	@if [ -d tests/harness ]; then \
+		echo "==> testing fluxor-test-harness (sub-workspace) ..." && \
+		cd tests/harness && cargo test --target aarch64-unknown-linux-gnu --no-fail-fast; \
+	else \
+		echo "==> tests/harness not present; skipping integration tests"; \
+	fi
+	@echo "test: complete (any failures listed above are real and must be addressed)"
 
 clean:
 	cargo clean

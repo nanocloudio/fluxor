@@ -127,6 +127,23 @@ pub struct SyscallTable {
 
     /// Release a handle, invoking the contract's close hook if any.
     pub provider_close: unsafe extern "C" fn(handle: i32) -> i32,
+
+    /// Copy up to `len` bytes from the head of a FIFO channel into
+    /// `buf` WITHOUT advancing the read pointer. Returns the number
+    /// of bytes copied (0 if empty), or a negative errno (`EINVAL`
+    /// for null buf, mailbox channels, or invalid handles).
+    ///
+    /// Used by frame-aware consumers that need to inspect a header
+    /// (e.g. message type + payload length + conn_id) before
+    /// committing to consume the frame. Lets the consumer leave a
+    /// non-deliverable frame on the channel so the producer's
+    /// flow-control kicks in instead of the consumer silently
+    /// dropping bytes.
+    ///
+    /// Mailbox channels are not peekable (the payload is delivered
+    /// as an opaque buffer reference, not a byte stream); peek
+    /// returns `EINVAL` on those.
+    pub channel_peek: unsafe extern "C" fn(handle: i32, buf: *mut u8, len: usize) -> i32,
 }
 
 /// Poll event flags (used with `handle_poll` / `channel_poll`).

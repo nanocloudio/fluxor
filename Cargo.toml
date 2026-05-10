@@ -167,4 +167,10 @@ debug = 2
 opt-level = 1
 
 [workspace]
-members = ["tools"]
+members = ["tools", "modules/foundation/ip", "modules/foundation/http", "modules/foundation/ws_stream"]
+# `tests/harness` is a self-contained sub-workspace (its Cargo.toml
+# declares its own `[workspace]`) that depends on the crates above
+# via path. It is intentionally not a member here — host integration
+# tests are run from inside `tests/harness` so the rest of the tree
+# builds without them present.
+exclude = ["tests"]
