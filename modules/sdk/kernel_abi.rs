@@ -176,6 +176,10 @@ pub mod errno {
     pub const EAGAIN: i32 = -11;
     /// Cannot allocate memory / no free slots.
     pub const ENOMEM: i32 = -12;
+    /// Argument list / output buffer too long — caller should retry
+    /// with a larger buffer. Used by FS_READDIR when one entry
+    /// doesn't fit and no progress could be made.
+    pub const E2BIG: i32 = -7;
     /// Resource busy.
     pub const EBUSY: i32 = -16;
     /// No such device.

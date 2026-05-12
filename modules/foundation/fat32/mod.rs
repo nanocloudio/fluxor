@@ -362,7 +362,16 @@ struct OpenFile {
     in_use: u8,
     /// Sector index within current_cluster (0..sectors_per_cluster).
     sector_in_cluster: u8,
-    _pad: [u8; 2],
+    /// 0 = regular file (FS_OPEN); 1 = directory (FS_OPENDIR).
+    /// File slots use the OpenFile fields below for byte-level READ;
+    /// dir slots reuse `current_cluster` + `sector_in_cluster` as the
+    /// enumeration cursor and `offset` as the within-sector entry
+    /// index. The shared slot pool means FS_CLOSE works uniformly.
+    is_dir: u8,
+    /// For dir slots only: 1 once the end-of-directory (0x00 entry)
+    /// marker has been seen, so subsequent READDIR calls return 0
+    /// without re-walking the FAT chain.
+    dir_eof: u8,
     /// Cluster currently being read (FAT chain walk position).
     current_cluster: u32,
     /// Read offset within the file (bytes). 0..size.
@@ -385,7 +394,8 @@ impl OpenFile {
         Self {
             in_use: 0,
             sector_in_cluster: 0,
-            _pad: [0; 2],
+            is_dir: 0,
+            dir_eof: 0,
             current_cluster: 0,
             offset: 0,
             size: 0,
@@ -994,11 +1004,13 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
 // block read is fully synchronous inside the dispatch call.
 
 // FS opcodes from the layered ABI.
-const FS_OPEN:  u32 = 0x0900;
-const FS_READ:  u32 = 0x0901;
-const FS_SEEK:  u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT:  u32 = 0x0904;
+const FS_OPEN:    u32 = 0x0900;
+const FS_READ:    u32 = 0x0901;
+const FS_SEEK:    u32 = 0x0902;
+const FS_CLOSE:   u32 = 0x0903;
+const FS_STAT:    u32 = 0x0904;
+const FS_OPENDIR: u32 = 0x0907;
+const FS_READDIR: u32 = 0x0908;
 
 /// Synchronously fetch a 512-byte sector at `lba` into `out`. Returns
 /// 0 on success, negative errno otherwise. The block source must
@@ -1355,6 +1367,219 @@ unsafe fn fs_op_stat(s: &Fat32State, handle: i32, arg: *mut u8, arg_len: usize) 
     0
 }
 
+/// Same component walk as `fs_resolve_path`, but the terminal name
+/// must be a *directory* (or the path may be the bare root `/`).
+/// Returns the directory's first cluster on success, or `None` for
+/// ENOENT / ENOTDIR. Used exclusively by `fs_op_opendir`.
+unsafe fn fs_resolve_dir_path(s: &mut Fat32State, path: &[u8]) -> Option<u32> {
+    if s.init_phase != Fat32InitPhase::Done { return None; }
+    if s.root_cluster < 2 { return None; }
+    // Strip leading + trailing slashes; bare "/" → root.
+    let mut start = 0usize;
+    while start < path.len() && path[start] == b'/' { start += 1; }
+    let mut end = path.len();
+    while end > start && path[end - 1] == b'/' { end -= 1; }
+    if start >= end { return Some(s.root_cluster); }
+
+    let mut cur_cluster = s.root_cluster;
+    let mut pos = start;
+    loop {
+        let comp_start = pos;
+        while pos < end && path[pos] != b'/' { pos += 1; }
+        let comp = &path[comp_start..pos];
+        if comp.is_empty() { return None; }
+        let mut want = [b' '; 11];
+        if !fs_path_to_short_name(comp, &mut want) { return None; }
+        let (sc, _sz, attr) = fs_dir_lookup(s, cur_cluster, &want)?;
+        // Every intermediate AND the terminal component must be a dir.
+        if (attr & ATTR_DIRECTORY) == 0 { return None; }
+        cur_cluster = sc;
+        while pos < end && path[pos] == b'/' { pos += 1; }
+        if pos >= end { return Some(cur_cluster); }
+    }
+}
+
+/// FS_OPENDIR: resolve the absolute path to a directory's first
+/// cluster, then allocate a slot in `open_files` flagged as a dir.
+/// The dir-cursor (`current_cluster`, `sector_in_cluster`, `offset` =
+/// entry index within sector) starts at the first entry of the
+/// first cluster.
+unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len == 0 { return E_INVAL; }
+    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    let path = core::slice::from_raw_parts(arg, arg_len);
+    let dir_cluster = match fs_resolve_dir_path(s, path) {
+        Some(c) => c,
+        None => return -2, // ENOENT
+    };
+    let mut slot: i32 = -1;
+    let mut k = 0usize;
+    while k < MAX_OPEN_FILES {
+        if s.open_files[k].in_use == 0 {
+            slot = k as i32;
+            break;
+        }
+        k += 1;
+    }
+    if slot < 0 { return -23; } // ENFILE
+    let of = &mut s.open_files[slot as usize];
+    of.in_use = 1;
+    of.is_dir = 1;
+    of.dir_eof = 0;
+    of.start_cluster = dir_cluster;
+    of.current_cluster = dir_cluster;
+    of.sector_in_cluster = 0;
+    of.offset = 0; // entry index within current sector (0..entries_per_sector)
+    of.size = 0;
+    of.scratch_avail = 0;
+    of.scratch_pos = 0;
+    slot
+}
+
+/// FS_READDIR: walk dir entries from the cursor, emit one byte
+/// stream of `[count:u16][name_len:u8][type:u8][name…]` records,
+/// stop when the output buffer can't fit another entry. `.` and
+/// `..` are skipped. LFN companion entries (attr == 0x0F), deleted
+/// entries (first byte 0xE5), volume labels (attr & 0x08), hidden +
+/// system entries (attr & 0x06) are all skipped at this layer so the
+/// caller only sees user-visible files + directories.
+///
+/// On end-of-directory the function returns 0 and latches `dir_eof`
+/// so subsequent calls keep returning 0 without re-walking the chain.
+unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 2 { return E_INVAL; }
+    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    let slot_idx = handle as usize;
+    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
+    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    if s.open_files[slot_idx].is_dir == 0 { return E_INVAL; }
+    if s.open_files[slot_idx].dir_eof != 0 { return 0; }
+
+    let spc = s.sectors_per_cluster as u32;
+    if spc == 0 { return E_AGAIN; }
+    let entries_per_sector = BLOCK_SIZE / DIR_ENTRY_SIZE;
+
+    // Reserve 2 bytes for the count header; entries start at offset 2.
+    let mut out_pos: usize = 2;
+    let mut count: u16 = 0;
+    let mut buf = [0u8; BLOCK_SIZE];
+
+    loop {
+        let cur_cluster = s.open_files[slot_idx].current_cluster;
+        if cur_cluster < 2 {
+            s.open_files[slot_idx].dir_eof = 1;
+            break;
+        }
+        let cluster_first_sector = cluster_to_sector(s, cur_cluster);
+        let sec = s.open_files[slot_idx].sector_in_cluster as u32;
+        if sec >= spc {
+            // Cluster exhausted — walk the FAT chain.
+            let next = fs_read_fat_entry(s, cur_cluster);
+            if next >= FAT32_EOC {
+                s.open_files[slot_idx].dir_eof = 1;
+                break;
+            }
+            s.open_files[slot_idx].current_cluster = next;
+            s.open_files[slot_idx].sector_in_cluster = 0;
+            s.open_files[slot_idx].offset = 0;
+            continue;
+        }
+        let lba = cluster_first_sector + sec;
+        if fs_sync_read_sector(s, lba, buf.as_mut_ptr()) != 0 {
+            // I/O error reading directory sector — surface ENOENT-ish
+            // and don't advance so the caller can retry / give up.
+            return -5; // EIO
+        }
+        let mut e = s.open_files[slot_idx].offset as usize;
+        while e < entries_per_sector {
+            let off = e * DIR_ENTRY_SIZE;
+            let first = buf[off];
+            if first == 0x00 {
+                // End-of-directory marker.
+                s.open_files[slot_idx].dir_eof = 1;
+                let cnt_le = count.to_le_bytes();
+                *arg = cnt_le[0];
+                *arg.add(1) = cnt_le[1];
+                return out_pos as i32;
+            }
+            if first == 0xE5 { e += 1; continue; }
+            let attr = buf[off + 11];
+            // Skip LFN companion entries (attr == 0x0F), volume label
+            // (0x08), hidden (0x02), system (0x04). Regular files +
+            // dirs have neither of those four bits set in the lower
+            // nibble combinations we filter.
+            if attr == ATTR_LONG_NAME { e += 1; continue; }
+            if (attr & (ATTR_VOLUME_ID | 0x02 | 0x04)) != 0 { e += 1; continue; }
+            // Decode 8.3 short name back into "NAME.EXT" form.
+            let raw = &buf[off..off + 11];
+            // Skip "." and ".." pseudo-entries.
+            if raw[0] == b'.' {
+                let is_dot    = raw[1] == b' ' && raw[2] == b' ';
+                let is_dotdot = raw[1] == b'.' && raw[2] == b' ';
+                if is_dot || is_dotdot { e += 1; continue; }
+            }
+            // Trim trailing spaces from name (0..8) and ext (8..11).
+            let mut nlen = 8usize;
+            while nlen > 0 && raw[nlen - 1] == b' ' { nlen -= 1; }
+            let mut elen = 3usize;
+            while elen > 0 && raw[8 + elen - 1] == b' ' { elen -= 1; }
+            let total = nlen + if elen > 0 { 1 + elen } else { 0 };
+            // Per-entry overhead: name_len(1) + type(1) + bytes.
+            let need = 2 + total;
+            if out_pos + need > arg_len {
+                // Buffer full: stop here, don't advance cursor past
+                // this entry. Next READDIR call will resume from `e`.
+                if count == 0 {
+                    // Even one entry didn't fit — caller's buffer is
+                    // too small. Signal E2BIG without advancing.
+                    return -7; // E2BIG
+                }
+                s.open_files[slot_idx].offset = e as u32;
+                let cnt_le = count.to_le_bytes();
+                *arg = cnt_le[0];
+                *arg.add(1) = cnt_le[1];
+                return out_pos as i32;
+            }
+            *arg.add(out_pos)     = total as u8;
+            *arg.add(out_pos + 1) = if (attr & ATTR_DIRECTORY) != 0 { 1 } else { 0 };
+            let mut wp = out_pos + 2;
+            // Copy name (lower-cased for cleaner display).
+            let mut i = 0usize;
+            while i < nlen {
+                let c = raw[i];
+                let lc = if (b'A'..=b'Z').contains(&c) { c + 32 } else { c };
+                *arg.add(wp) = lc;
+                wp += 1;
+                i += 1;
+            }
+            if elen > 0 {
+                *arg.add(wp) = b'.';
+                wp += 1;
+                let mut k = 0usize;
+                while k < elen {
+                    let c = raw[8 + k];
+                    let lc = if (b'A'..=b'Z').contains(&c) { c + 32 } else { c };
+                    *arg.add(wp) = lc;
+                    wp += 1;
+                    k += 1;
+                }
+            }
+            out_pos = wp;
+            count += 1;
+            e += 1;
+        }
+        // Finished the sector — advance to the next one in this cluster
+        // (or cluster boundary will be handled on the next loop iter).
+        s.open_files[slot_idx].sector_in_cluster += 1;
+        s.open_files[slot_idx].offset = 0;
+    }
+
+    let cnt_le = count.to_le_bytes();
+    *arg = cnt_le[0];
+    *arg.add(1) = cnt_le[1];
+    out_pos as i32
+}
+
 #[no_mangle]
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
@@ -1368,11 +1593,13 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     if state.is_null() { return E_INVAL; }
     let s = &mut *(state as *mut Fat32State);
     match opcode {
-        FS_OPEN  => fs_op_open(s, arg as *const u8, arg_len),
-        FS_READ  => fs_op_read(s, handle, arg, arg_len),
-        FS_SEEK  => fs_op_seek(s, handle, arg as *const u8, arg_len),
-        FS_CLOSE => fs_op_close(s, handle),
-        FS_STAT  => fs_op_stat(s, handle, arg, arg_len),
+        FS_OPEN    => fs_op_open(s, arg as *const u8, arg_len),
+        FS_READ    => fs_op_read(s, handle, arg, arg_len),
+        FS_SEEK    => fs_op_seek(s, handle, arg as *const u8, arg_len),
+        FS_CLOSE   => fs_op_close(s, handle),
+        FS_STAT    => fs_op_stat(s, handle, arg, arg_len),
+        FS_OPENDIR => fs_op_opendir(s, arg as *const u8, arg_len),
+        FS_READDIR => fs_op_readdir(s, handle, arg, arg_len),
         _ => -38, // ENOSYS
     }
 }

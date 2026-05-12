@@ -56,6 +56,7 @@ How to build things with the system. Domain-specific patterns and recipes.
 - [guides/displays.md](guides/displays.md) — display/touch configuration and pixel pipeline
 - [guides/foundation.md](guides/foundation.md) — foundation layer, driver/foundation boundary, contract patterns
 - [guides/compute_heavy_modules.md](guides/compute_heavy_modules.md) — patterns for emulators, codecs, and compute-intensive workloads
+- [guides/codec_porting.md](guides/codec_porting.md) — workflow for porting audio codecs to sample-accurate parity (reference C decoder + standalone Rust replica + layer probes)
 
 ## Modules
 

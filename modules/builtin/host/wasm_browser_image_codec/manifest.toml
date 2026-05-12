@@ -1,0 +1,50 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser image decoder. Reads an entire encoded image (JPEG, PNG,
+# WebP, BMP, GIF — whatever the browser's createImageBitmap can
+# decode) from `encoded`, hands it to the host shim's
+# `host_image_decode_*` imports, and emits a single RGB565
+# little-endian frame on `pixels` at the configured width/height.
+#
+# Browser-side decode delegates to `createImageBitmap` + an
+# `OffscreenCanvas` for the resize/RGB565 conversion; the kernel
+# never sees the encoded bytes' interior. This is the wasm-browser
+# analogue of `host_image_codec` on the linux host (which uses the
+# `image` crate) — different host, same surface contract.
+#
+# The `pixels` port matches `wasm_browser_canvas`'s input, so
+# wiring source → codec → canvas is a trivial 2-edge graph.
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "pixels"
+direction = "output"
+content_type = "VideoRaster"
+required = true
+
+[[params]]
+# tag 10 — matches wasm_browser_canvas's `width` for symmetry.
+name = "width"
+type = "u16"
+required = true
+
+[[params]]
+# tag 11 — matches wasm_browser_canvas's `height` for symmetry.
+name = "height"
+type = "u16"
+required = true
+
+[[params]]
+# tag 12 — encoded ingest cap. Larger than host_image_codec's
+# default to handle the test-harness 6.2 MB top-down BMP.
+name = "max_bytes"
+type = "u32"
+default = 16777216
+range = [1024, 67108864]

@@ -100,9 +100,23 @@ mod profile_host {
         /// headers, and small request bodies. Heap-allocated on
         /// accept, freed on close.
         pub const RECV_BUF_SIZE: usize = 8192;
-        /// Per-conn outbound buffer. Sized to hold one full WS
-        /// frame plus protocol framing.
+        /// Per-conn outbound buffer. Sized to hold one full WS wire
+        /// frame for a ws_stream-produced envelope: ws_stream caps
+        /// payloads at 4096 bytes/emit (see `modules/foundation/ws_stream`),
+        /// so a 4096-byte payload + 4-byte WS server-to-client header
+        /// fits exactly in 4100. Anything larger than this on `ws_in`
+        /// — only reachable when something bypasses ws_stream — falls
+        /// through to the RFC 6455 §5.4 fragmentation path in
+        /// `ws_drain_fanout_input`.
         pub const SEND_BUF_SIZE: usize = 4100;
+        // NOTE: bumping this ceiling alone has no effect — the http
+        // module's TLV parameter table in `modules/foundation/http/mod.rs`
+        // only declares per-route tags for indices 0..3 (tags 10..47).
+        // Adding more routes requires adding matching `define_params!`
+        // entries (route_4_path/body/handler/proxy_ip/proxy_port/source/
+        // content_type/fs_path = 8 tags per route) plus matching
+        // setters. Until that lift, host config.bin can only carry 4
+        // routes per http instance.
         pub const MAX_ROUTES: usize = 4;
         pub const MAX_PATH: usize = 32;
         pub const MAX_CONTENT_TYPE: usize = 32;
@@ -135,7 +149,11 @@ mod profile_host {
 #[cfg(target_arch = "wasm32")]
 mod profile_wasm {
     pub mod kernel {
-        pub const STATE_ARENA_SIZE: usize = 8 * 1024 * 1024;
+        // Bumped from 8 MiB to 32 MiB to comfortably hold a graph
+        // that ingests a multi-MB encoded image (browser image-codec
+        // built-in). Browser tabs have ample memory headroom; the
+        // arena is paged in lazily by `memory.grow`.
+        pub const STATE_ARENA_SIZE: usize = 32 * 1024 * 1024;
         pub const BUFFER_ARENA_SIZE: usize = 2 * 1024 * 1024;
         pub const MAX_MODULES: usize = 32;
         pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;

@@ -244,8 +244,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     unsafe { shift_consume(s.tx_pending.as_mut_ptr(), s.tx_pending_len, w) };
             }
         }
-        // Pull new input only when pending drained.
-        let max_payload = FRAME_BUF_BYTES - WS_FRAME_HDR;
+        // Pull new input only when pending drained. Cap per-step reads at
+        // 4096 so each WS BINARY envelope handed to the http server fits
+        // in a single fast-path send_buf slot (SEND_BUF_SIZE = 4100 in
+        // `modules/sdk/config.rs` accommodates a 4096-byte payload + the
+        // 4-byte server-to-client WS header). Allowing larger payloads
+        // works on a quiescent network but drops chunks under sustained
+        // load — we measured ~2 KiB lost per ~10 ms emit interval at
+        // 192 kbps audio rates because the http server's send_buf
+        // couldn't atomically queue the full envelope.
+        let max_payload = (FRAME_BUF_BYTES - WS_FRAME_HDR).min(4096);
         while s.tx_pending_len == 0 {
             let n = unsafe {
                 (sys.channel_read)(

@@ -63,6 +63,17 @@ pub(crate) const HANDLER_STREAM: u8 = 6;
 /// Content-Length, then streams the body via `FS_READ` chunks
 /// directly into `send_buf`.
 pub(crate) const HANDLER_FS_FILE: u8 = 7;
+/// Directory listing as JSON, served via the FS provider's
+/// `FS_OPENDIR` / `FS_READDIR` ops. The route's `fs_path` holds the
+/// directory path; `fs_filter` (optional) holds a comma-separated
+/// case-insensitive extension list (`.mp3,.wav,.aac`) — empty means
+/// every regular file is listed. The response is a one-shot JSON
+/// payload (`{"items":["song1.mp3","song2.wav",…]}`) built into
+/// `send_buf` at request time so new files dropped into the directory
+/// appear on the next GET. Subdirectories are skipped. Used by the
+/// browser-side image_viewer / audio_player launchers to enumerate
+/// the asset bank without bespoke handler code.
+pub(crate) const HANDLER_FS_LIST: u8 = 8;
 
 const CACHE_VALID: u8 = 0x01;
 const CACHE_COMPLETE: u8 = 0x02;
@@ -133,11 +144,18 @@ pub(crate) struct Route {
     pub(crate) source_index: i16,
     pub(crate) content_type_len: u8,
     pub(crate) fs_path_len: u8,
+    /// Length of `fs_filter`; 0 means accept every entry returned by
+    /// `FS_READDIR`. Comma-separated, case-insensitive extension list.
+    pub(crate) fs_filter_len: u8,
     pub(crate) path: [u8; MAX_PATH],
     pub(crate) content_type: [u8; MAX_CONTENT_TYPE],
-    /// Absolute filesystem path served by `HANDLER_FS_FILE`. Populated
-    /// by `set_route_fs_path` when the YAML declares `fs_path:`.
+    /// Absolute filesystem path served by `HANDLER_FS_FILE` (a single
+    /// file) or `HANDLER_FS_LIST` (a directory to enumerate as JSON).
+    /// Populated by `set_route_fs_path` / `set_route_fs_list`.
     pub(crate) fs_path: [u8; MAX_FS_PATH],
+    /// Extension filter for `HANDLER_FS_LIST` (e.g. `.mp3,.wav,.aac`).
+    /// Compared case-insensitively against each filename's tail.
+    pub(crate) fs_filter: [u8; 64],
 }
 
 impl Route {
@@ -152,9 +170,11 @@ impl Route {
             source_index: -1,
             content_type_len: 0,
             fs_path_len: 0,
+            fs_filter_len: 0,
             path: [0; MAX_PATH],
             content_type: [0; MAX_CONTENT_TYPE],
             fs_path: [0; MAX_FS_PATH],
+            fs_filter: [0; 64],
         }
     }
 
@@ -3479,6 +3499,155 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                     if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::AwaitFsStat; }
                 }
+                HANDLER_FS_LIST => {
+                    // One-shot JSON directory listing. Builds the
+                    // entire response (status line + headers + body)
+                    // in `send_buf` and transitions to SendHeaders,
+                    // which streams the buffer to the client and on
+                    // drain proceeds straight to CloseConn (no
+                    // separate body phase).
+                    let route = &*s
+                        .server
+                        .routes
+                        .as_ptr()
+                        .add(cur_matched_route(s) as usize);
+                    let n = route.fs_path_len as usize;
+                    if n == 0 || n > MAX_FS_PATH {
+                        build_error(s, b"500 Internal Server Error", b"FS_LIST route missing path\n");
+                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        return 0;
+                    }
+                    // Snapshot path + filter so the FS calls + body
+                    // build don't borrow `s` immutably while we later
+                    // need it mutable to write send_buf.
+                    let mut fs_path = [0u8; MAX_FS_PATH];
+                    fs_path[..n].copy_from_slice(&route.fs_path[..n]);
+                    let filter_len = route.fs_filter_len as usize;
+                    let mut filter = [0u8; 64];
+                    filter[..filter_len].copy_from_slice(&route.fs_filter[..filter_len]);
+
+                    let sys = &*s.syscalls;
+                    let dir_fd = (sys.provider_call)(
+                        -1, 0x0907 /* FS_OPENDIR */, fs_path.as_mut_ptr(), n,
+                    );
+                    if dir_fd < 0 {
+                        build_error(s, b"404 Not Found", b"Directory not found\n");
+                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        return 0;
+                    }
+
+                    // Build JSON body into a local scratch then write
+                    // headers + body into send_buf together (we need
+                    // body_len for Content-Length before writing).
+                    let mut body = [0u8; 2048];
+                    let mut bp = 0usize;
+                    // Opening `{"items":[`.
+                    let prefix: &[u8] = b"{\"items\":[";
+                    while bp < prefix.len() && bp < body.len() {
+                        body[bp] = prefix[bp]; bp += 1;
+                    }
+                    let mut first = true;
+                    let mut readdir_buf = [0u8; 1024];
+                    loop {
+                        let nb = (sys.provider_call)(
+                            dir_fd, 0x0908 /* FS_READDIR */,
+                            readdir_buf.as_mut_ptr(), readdir_buf.len(),
+                        );
+                        if nb <= 0 { break; }
+                        let nb = nb as usize;
+                        if nb < 2 { break; }
+                        let count = u16::from_le_bytes([readdir_buf[0], readdir_buf[1]]) as usize;
+                        // Belt-and-braces: some providers may return
+                        // `nb=2 count=0` at end-of-dir; honour either.
+                        if count == 0 { break; }
+                        let mut pos = 2usize;
+                        let mut emitted = 0usize;
+                        while emitted < count && pos + 2 <= nb {
+                            let name_len = readdir_buf[pos] as usize;
+                            let entry_type = readdir_buf[pos + 1];
+                            pos += 2;
+                            if pos + name_len > nb { break; }
+                            let name = &readdir_buf[pos..pos + name_len];
+                            pos += name_len;
+                            emitted += 1;
+                            // Skip subdirectories.
+                            if entry_type == 1 { continue; }
+                            // Extension filter (case-insensitive).
+                            if filter_len > 0 {
+                                let mut ok = false;
+                                let mut fi = 0usize;
+                                while fi < filter_len {
+                                    let start = fi;
+                                    while fi < filter_len && filter[fi] != b',' { fi += 1; }
+                                    let elen = fi - start;
+                                    if elen > 0 && elen <= name.len() {
+                                        let tail = &name[name.len() - elen..];
+                                        let mut m = true;
+                                        let mut k = 0usize;
+                                        while k < elen {
+                                            let a = tail[k]; let b = filter[start + k];
+                                            let al = if (b'A'..=b'Z').contains(&a) { a + 32 } else { a };
+                                            let bl = if (b'A'..=b'Z').contains(&b) { b + 32 } else { b };
+                                            if al != bl { m = false; break; }
+                                            k += 1;
+                                        }
+                                        if m { ok = true; break; }
+                                    }
+                                    if fi < filter_len && filter[fi] == b',' { fi += 1; }
+                                }
+                                if !ok { continue; }
+                            }
+                            // Comma separator between items.
+                            if !first {
+                                if bp < body.len() { body[bp] = b','; bp += 1; }
+                            }
+                            first = false;
+                            // Opening quote.
+                            if bp < body.len() { body[bp] = b'"'; bp += 1; }
+                            // Name bytes (escape `"` and `\`; everything else
+                            // pass-through — filenames are ASCII-ish in practice).
+                            let mut k = 0usize;
+                            while k < name.len() && bp + 2 < body.len() {
+                                let c = name[k];
+                                if c == b'"' || c == b'\\' {
+                                    body[bp] = b'\\'; bp += 1;
+                                }
+                                body[bp] = c; bp += 1;
+                                k += 1;
+                            }
+                            // Closing quote.
+                            if bp < body.len() { body[bp] = b'"'; bp += 1; }
+                        }
+                    }
+                    (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+                    // Closing `]}`.
+                    let suffix: &[u8] = b"]}";
+                    let mut si = 0usize;
+                    while si < suffix.len() && bp < body.len() {
+                        body[bp] = suffix[si]; bp += 1; si += 1;
+                    }
+                    let body_len = bp as u32;
+
+                    // Write status line + Content-Length headers, then
+                    // the body bytes, all into send_buf.
+                    build_header_with_len(s, b"200 OK", b"application/json", body_len);
+                    // After build_header_with_len, send_len is the
+                    // header length. Append the body bytes.
+                    let header_end = cur_send_len(s) as usize;
+                    let dst = cur_send_buf_mut_ptr(s);
+                    let body_ptr = body.as_ptr();
+                    let max_total = SEND_BUF_SIZE.min(header_end + bp);
+                    let mut k = 0usize;
+                    while header_end + k < max_total {
+                        *dst.add(header_end + k) = *body_ptr.add(k);
+                        k += 1;
+                    }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.send_len = (header_end + k) as u16;
+                        cur.send_offset = 0;
+                        cur.phase = Phase::SendHeaders;
+                    }
+                }
                 HANDLER_PROXY => {
                     build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
                     if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
@@ -3627,6 +3796,13 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE | HANDLER_STREAM
                     | HANDLER_FS_FILE => {
                         if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendBody; }
+                    }
+                    HANDLER_FS_LIST => {
+                        // FS_LIST's response (status + headers + JSON
+                        // body) is already fully in `send_buf` and has
+                        // drained — there's no separate body phase to
+                        // run. Close the connection.
+                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
                     }
                     _ => {
                         if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
@@ -4028,4 +4204,41 @@ pub(crate) unsafe fn set_route_fs_path(s: &mut HttpState, idx: usize, d: *const 
     if n > 0 {
         r.handler = HANDLER_FS_FILE;
     }
+}
+
+/// Set a route's `fs_list` directory path. Storage shares the `fs_path`
+/// field with `set_route_fs_path` (they're mutually exclusive at the
+/// route level — `fs_list:` lists a directory as JSON, `fs_path:`
+/// streams a single file). Flips the handler to `HANDLER_FS_LIST` so
+/// a GET against the route returns a fresh `FS_READDIR`-built JSON
+/// payload.
+pub(crate) unsafe fn set_route_fs_list(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
+    if idx >= MAX_ROUTES { return; }
+    let r = &mut *s.server.routes.as_mut_ptr().add(idx);
+    let n = if len > MAX_FS_PATH { MAX_FS_PATH } else { len };
+    let mut i = 0usize;
+    while i < n {
+        r.fs_path[i] = *d.add(i);
+        i += 1;
+    }
+    r.fs_path_len = n as u8;
+    if n > 0 {
+        r.handler = HANDLER_FS_LIST;
+    }
+}
+
+/// Set the per-route extension filter consumed by `HANDLER_FS_LIST`.
+/// Comma-separated, case-insensitive. Empty = list every regular
+/// file the FS provider returns. No-op when the route isn't an
+/// `fs_list:` route.
+pub(crate) unsafe fn set_route_fs_filter(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
+    if idx >= MAX_ROUTES { return; }
+    let r = &mut *s.server.routes.as_mut_ptr().add(idx);
+    let n = if len > 64 { 64 } else { len };
+    let mut i = 0usize;
+    while i < n {
+        r.fs_filter[i] = *d.add(i);
+        i += 1;
+    }
+    r.fs_filter_len = n as u8;
 }

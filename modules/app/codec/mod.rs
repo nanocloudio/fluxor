@@ -57,6 +57,14 @@ const DETECT_BUF_SIZE: usize = 16;
 /// IO buffer for detection phase reads
 const DETECT_IO_SIZE: usize = 256;
 
+/// Number of consecutive scheduler ticks with `POLL_IN` clear and
+/// `POLL_HUP` set that the decoder waits before resetting to format-
+/// detection mode. Sized to cover the codec emitting at most one
+/// full AAC frame's PCM out of its internal output buffer
+/// (1024 stereo i16 = 4096 B, emitted in one channel_write per tick
+/// in the current AAC IO_BUF_SIZE) plus a small safety margin.
+const HUP_QUIESCE_TICKS: u8 = 64;
+
 /// Codec state buffer size — must be >= largest codec state
 const CODEC_STATE_SIZE: usize = {
     let wav_size = core::mem::size_of::<wav_codec::WavState>();
@@ -74,6 +82,17 @@ const CODEC_STATE_SIZE: usize = {
 // State
 // ============================================================================
 
+/// Wrapper guaranteeing 8-byte alignment of the codec state buffer.
+///
+/// AacState/Mp3State/WavState all start with `*const SyscallTable`,
+/// which on aarch64 / wasm32 / x86_64 needs 8-byte alignment for the
+/// load. A bare `[u8; N]` field has alignment 1, so reinterpreting it
+/// as one of those structs at an arbitrary `[u8]` offset SIGBUSes on
+/// strict-alignment targets (aarch64). The `align(8)` newtype forces
+/// the buffer to land on an 8-byte boundary inside `DecoderState`.
+#[repr(C, align(8))]
+struct CodecBuf([u8; CODEC_STATE_SIZE]);
+
 #[repr(C)]
 struct DecoderState {
     syscalls: *const SyscallTable,
@@ -85,13 +104,22 @@ struct DecoderState {
     detect_len: u8,
     /// Consecutive empty reads (for stream-end detection)
     empty_reads: u8,
-    _pad: u8,
+    /// Consecutive ticks observed with `HUP set & POLL_IN clear` since
+    /// the upstream signalled EOF. Reset is deferred until this counter
+    /// reaches `HUP_QUIESCE_TICKS` so the codec gets a chance to finish
+    /// emitting any PCM that was already decoded but hadn't been
+    /// channel_write'd to its consumer yet. Without this delay, the
+    /// browser harness lost ~250 ms of audio (last 2 notes of the
+    /// 8-note scale) because `host_browser_fetch` HUPs as soon as the
+    /// response body is fully drained — even though the channel ring
+    /// still had ~10 AAC frames buffered for the codec to decode.
+    hup_quiet_ticks: u8,
     /// Header accumulation buffer for format detection
     detect_buf: [u8; DETECT_BUF_SIZE],
     /// IO buffer used during detection phase
     detect_io: [u8; DETECT_IO_SIZE],
     /// Codec state — overlay for WavState/Mp3State/AacState
-    codec: [u8; CODEC_STATE_SIZE],
+    codec: CodecBuf,
 }
 
 impl DecoderState {
@@ -102,17 +130,17 @@ impl DecoderState {
 
     #[inline(always)]
     unsafe fn wav(&mut self) -> &mut wav_codec::WavState {
-        &mut *(self.codec.as_mut_ptr() as *mut wav_codec::WavState)
+        &mut *(self.codec.0.as_mut_ptr() as *mut wav_codec::WavState)
     }
 
     #[inline(always)]
     unsafe fn mp3(&mut self) -> &mut mp3_codec::Mp3State {
-        &mut *(self.codec.as_mut_ptr() as *mut mp3_codec::Mp3State)
+        &mut *(self.codec.0.as_mut_ptr() as *mut mp3_codec::Mp3State)
     }
 
     #[inline(always)]
     unsafe fn aac(&mut self) -> &mut aac_codec::AacState {
-        &mut *(self.codec.as_mut_ptr() as *mut aac_codec::AacState)
+        &mut *(self.codec.0.as_mut_ptr() as *mut aac_codec::AacState)
     }
 }
 
@@ -192,8 +220,9 @@ unsafe fn reset_to_detect(s: &mut DecoderState) {
     s.format = FMT_DETECTING;
     s.detect_len = 0;
     s.empty_reads = 0;
+    s.hup_quiet_ticks = 0;
     // Zero the codec state
-    __aeabi_memclr(s.codec.as_mut_ptr(), CODEC_STATE_SIZE);
+    __aeabi_memclr(s.codec.0.as_mut_ptr(), CODEC_STATE_SIZE);
 }
 
 /// Initialize the detected codec and feed it the detection bytes.
@@ -204,7 +233,7 @@ unsafe fn init_codec(s: &mut DecoderState) {
     let detect_len = s.detect_len as usize;
     // Take raw pointer to detect_buf before borrowing codec via &mut
     let detect_ptr = s.detect_buf.as_ptr();
-    let codec_ptr = s.codec.as_mut_ptr();
+    let codec_ptr = s.codec.0.as_mut_ptr();
 
     match s.format {
         FMT_WAV => {
@@ -356,16 +385,43 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Active codec phase
         // ----------------------------------------------------------------
 
-        // Check for stream reset signal (EOF from bank on file switch)
+        // Check for stream reset signal (EOF from bank on file switch
+        // OR end-of-asset from host_browser_fetch). Reset must be
+        // deferred until BOTH:
+        //   1. The input channel has actually drained (POLL_IN clear).
+        //      `host_browser_fetch` sets HUP as soon as the response
+        //      body has been fully read from the JS side, but the
+        //      kernel's channel ring may still hold ~10 AAC frames
+        //      that the codec hasn't decoded yet. Flushing those
+        //      bytes via IOCTL_FLUSH was costing the wasm browser
+        //      harness ~250 ms of trailing audio (last 2 notes of
+        //      the 8-note cmajor scale).
+        //   2. The codec has been quiescent for HUP_QUIESCE_TICKS
+        //      consecutive ticks after (1). Each codec keeps a
+        //      bounded internal buffer of decoded PCM that it
+        //      drip-feeds to its consumer one chunk per tick; the
+        //      quiesce window lets it finish that drain before we
+        //      wipe its state.
         {
-            let sys = s.sys();
-            let in_poll = (sys.channel_poll)(s.in_chan, POLL_IN | POLL_HUP);
-            if (in_poll as u32) & POLL_HUP != 0 {
-                // Flush our input: clears old encoded data and the eof_flag
-                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
-                dev_log(sys, 3, b"[dec] rst".as_ptr(), 9);
-                reset_to_detect(s);
-                return 0;
+            let sys_ptr = s.syscalls;
+            let in_chan = s.in_chan;
+            let in_poll = ((*sys_ptr).channel_poll)(in_chan, POLL_IN | POLL_HUP);
+            let has_hup = (in_poll as u32) & POLL_HUP != 0;
+            let has_in  = (in_poll as u32) & POLL_IN  != 0;
+            if has_hup && !has_in {
+                s.hup_quiet_ticks = s.hup_quiet_ticks.saturating_add(1);
+                if s.hup_quiet_ticks >= HUP_QUIESCE_TICKS {
+                    // Codec genuinely idle on a closed input — safe to
+                    // flush + reset for the next stream.
+                    dev_channel_ioctl(&*sys_ptr, in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                    dev_log(&*sys_ptr, 3, b"[dec] rst".as_ptr(), 9);
+                    reset_to_detect(s);
+                    return 0;
+                }
+            } else {
+                // Either fresh input arrived or HUP cleared (bank
+                // started a new file); restart the quiesce window.
+                s.hup_quiet_ticks = 0;
             }
         }
 
@@ -383,15 +439,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // Channel Hints
 // ============================================================================
 
-/// Request larger output buffer for MP3 decode expansion.
-/// One MP3 frame (576 bytes) → 2304 stereo i16 samples (4608 bytes).
-/// Request 8192 bytes (≈2 frames) so downstream always has data during decode.
+/// Request a generous output buffer so a 4-second test asset's worth of
+/// PCM (≈720 KB) can buffer through to a slow consumer (e.g. a WS client
+/// that connects ~2 s after the source pipeline starts). With the default
+/// 8 KB buffer the codec backpressures within ~2 frames; downstream
+/// (`ws_stream` → `http`) would then either drop pre-connect bytes at the
+/// no-fan-out gate or stall. 1 MiB fits any single-asset test plus several
+/// seconds of live decode at typical bitrates.
 #[no_mangle]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(hints: *mut ChannelHint, max_hints: usize) -> usize {
     if hints.is_null() || max_hints == 0 { return 0; }
     unsafe {
-        *hints = ChannelHint { port_type: 1, port_index: 0, buffer_size: 8192 };
+        *hints = ChannelHint { port_type: 1, port_index: 0, buffer_size: 1048576 };
     }
     1
 }

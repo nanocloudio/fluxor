@@ -223,6 +223,11 @@ else
 			out="$(MODULES_OUT)/$$mod.fmod"; \
 			newest=$$(find "$$mod_dir" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
 			if [ -f "$$mod_dir/module.ld" ]; then ld_script="$$mod_dir/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
+			if [ -f "$$mod_dir/manifest.toml" ] && grep -q "^hardware_targets" "$$mod_dir/manifest.toml"; then \
+				if ! grep "^hardware_targets" "$$mod_dir/manifest.toml" | grep -q "\"$(TARGET)\""; then \
+					continue; \
+				fi; \
+			fi; \
 			if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(SDK_DIR)/runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULE_LD)" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
 				rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
 				$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
@@ -260,6 +265,43 @@ targets:
 
 linux-bin: tools
 	@cargo build --release --bin fluxor-linux --no-default-features --features host-linux --target aarch64-unknown-linux-gnu
+
+# Closed-loop iteration cycle for the embedded MP3 codec:
+# rebuild → capture-via-ws → diff vs ffmpeg reference. Use after
+# touching modules/app/codec/mp3_codec.rs to see whether your change
+# regressed or fixed the per-step metrics. With MP3_PROBE=1 set, the
+# codec also dumps per-layer state for .context/mp3_bisect/probe_mp3.py
+# to diff against the minimp3 ground truth at
+# .context/mp3_bisect/minimp3_layers. The bisection harness is
+# untracked (.context/ is gitignored) — build it on demand with
+# `make minimp3-ref`; see .context/mp3_bisect/README.md for the
+# workflow.
+#
+# Usage:
+#   make mp3-iterate                     # cmajor.mp3 (128 kbps stereo)
+#   make mp3-iterate MP3=cmajor_192k.mp3 # cross-validation bitrate
+#   MP3_PROBE=1 make mp3-iterate         # also emit [probe] dumps
+mp3-iterate:
+	@cd $(CURDIR) && touch modules/app/codec/mp3_codec.rs
+	@MP3_PROBE=$(MP3_PROBE) $(MAKE) modules TARGET=bcm2712
+	@bash /tmp/run_mp3.sh
+	@python3 examples/test_harness/diff_mp3.py
+	@if [ -n "$(MP3_PROBE)" ]; then \
+		python3 .context/mp3_bisect/probe_mp3.py /tmp/h.log \
+		    $${REF_LAYERS:-/tmp/ref_192k.layers} $${LO:-85} $${HI:-110}; \
+	fi
+
+# Build the minimp3 reference bisection binaries from .context/mp3_bisect/.
+# Pure debug tooling — only needed when chasing an MP3 codec regression
+# via `MP3_PROBE=1 make mp3-iterate`. Sources are CC0 (lieff/minimp3).
+.PHONY: minimp3-ref
+minimp3-ref: .context/mp3_bisect/minimp3_dump .context/mp3_bisect/minimp3_layers
+
+.context/mp3_bisect/minimp3_dump: .context/mp3_bisect/minimp3_dump.c .context/mp3_bisect/minimp3.h
+	@gcc -O2 -o $@ $< -lm
+
+.context/mp3_bisect/minimp3_layers: .context/mp3_bisect/minimp3_layers.c .context/mp3_bisect/minimp3_probe.h
+	@gcc -O2 -o $@ $< -lm
 
 init:
 	git submodule update --init --recursive

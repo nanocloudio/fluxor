@@ -88,6 +88,9 @@ Common Fluxor audio patterns:
 
 ## Related Documentation
 
+- `docs/guides/codec_porting.md` — workflow for porting / validating audio
+  codecs against an upstream reference decoder (sample-accurate parity,
+  layer-by-layer probing, standalone Rust replica pattern)
 - `docs/guides/music_player.md`
 - `docs/guides/midi.md`
 - `docs/architecture/pipeline.md`

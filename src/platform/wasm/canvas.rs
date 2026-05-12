@@ -18,19 +18,25 @@ extern "C" {
     fn host_canvas_present(ptr: *const u8, len: usize, width: u32, height: u32);
 }
 
-/// QVGA RGB565: 320 × 240 × 2 bytes = 153.6 KiB. Sized to fit ZX
-/// Spectrum (256 × 192) plus headroom; larger frames need a bigger
-/// buffer (or producer-side downscale).
-const FRAME_BUF_BYTES: usize = 320 * 240 * 2;
-
+// CanvasState's frame buffer is heap-allocated separately (sized
+// to `width * height * 2`) so the State struct stays small. A
+// 1080p RGB565 frame is 4 MiB — far too big to inline, and even
+// a 540p frame (~1 MiB) would push the per-module heap past
+// arena-friendly sizes when more than one canvas instance exists.
 #[repr(C)]
 pub(crate) struct CanvasState {
     pub in_chan: i32,
-    pub width: u16,
-    pub height: u16,
-    pub frames: u32,
+    pub width:   u16,
+    pub height:  u16,
+    pub frames:  u32,
     pub buf_len: u32,
-    pub buf: [u8; FRAME_BUF_BYTES],
+    pub buf_cap: u32,
+    pub buf_ptr: *mut u8,
+}
+
+/// Public — used by `wasm.rs` to size the per-module heap.
+pub(crate) fn heap_size_for(width: u16, height: u16) -> usize {
+    core::mem::size_of::<CanvasState>() + (width as usize) * (height as usize) * 2 + 256
 }
 
 /// Allocate a `CanvasState` on the kernel heap and return its raw
@@ -38,12 +44,16 @@ pub(crate) struct CanvasState {
 /// buffer; `step` recovers it via pointer-deref.
 unsafe fn alloc_state(in_chan: i32, width: u16, height: u16) -> *mut CanvasState {
     let table = syscalls::get_syscall_table();
-    let size = core::mem::size_of::<CanvasState>() as u32;
-    let raw = (table.heap_alloc)(size) as *mut CanvasState;
+    let state_size = core::mem::size_of::<CanvasState>() as u32;
+    let raw = (table.heap_alloc)(state_size) as *mut CanvasState;
     if raw.is_null() {
         return core::ptr::null_mut();
     }
-    // Initialise fields explicitly — heap_alloc returns uninitialised memory.
+    let buf_cap = (width as u32) * (height as u32) * 2;
+    let buf_ptr = (table.heap_alloc)(buf_cap);
+    if buf_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
     core::ptr::write(
         raw,
         CanvasState {
@@ -52,7 +62,8 @@ unsafe fn alloc_state(in_chan: i32, width: u16, height: u16) -> *mut CanvasState
             height,
             frames: 0,
             buf_len: 0,
-            buf: [0u8; FRAME_BUF_BYTES],
+            buf_cap,
+            buf_ptr,
         },
     );
     raw
@@ -68,11 +79,11 @@ fn canvas_step(state: *mut u8) -> i32 {
             return -1;
         }
         let st = &mut *st_ptr;
-        if st.in_chan < 0 {
+        if st.in_chan < 0 || st.buf_ptr.is_null() {
             return 0;
         }
         let frame_size = (st.width as usize) * (st.height as usize) * 2;
-        if frame_size == 0 || frame_size > st.buf.len() {
+        if frame_size == 0 || frame_size > st.buf_cap as usize {
             return -1;
         }
 
@@ -80,7 +91,7 @@ fn canvas_step(state: *mut u8) -> i32 {
             let cur = st.buf_len as usize;
             if cur >= frame_size {
                 host_canvas_present(
-                    st.buf.as_ptr(),
+                    st.buf_ptr,
                     frame_size,
                     st.width as u32,
                     st.height as u32,
@@ -88,17 +99,15 @@ fn canvas_step(state: *mut u8) -> i32 {
                 st.frames = st.frames.wrapping_add(1);
                 let residual = cur - frame_size;
                 if residual > 0 {
-                    let src = st.buf.as_ptr();
-                    let dst = st.buf.as_mut_ptr();
-                    core::ptr::copy(src.add(frame_size), dst, residual);
+                    core::ptr::copy(st.buf_ptr.add(frame_size), st.buf_ptr, residual);
                 }
                 st.buf_len = residual as u32;
                 continue;
             }
             let n = channel::channel_read(
                 st.in_chan,
-                st.buf.as_mut_ptr().add(cur),
-                st.buf.len() - cur,
+                st.buf_ptr.add(cur),
+                st.buf_cap as usize - cur,
             );
             if n <= 0 {
                 break;

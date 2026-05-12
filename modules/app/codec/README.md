@@ -53,7 +53,28 @@ content_type = "VideoRaster"
 
 - No TLV parameter tags detected in module source.
 
+## Porting / validating a new sub-codec
+
+When extending this module with a new essence decoder (or rewriting an
+existing one — `mp3_codec.rs` was rewritten as an f32 port of
+`lieff/minimp3` in May 2026), follow the workflow in
+[`docs/guides/codec_porting.md`](../../../docs/guides/codec_porting.md).
+The short version:
+
+1. Get a byte-exact upstream reference (e.g. `minimp3` for MP3,
+   `faad2` for AAC) building locally with intermediate-spectrum dumps.
+2. Build a standalone Rust replica of this module's DSP under `/tmp/`
+   that drives `decode_frame()` from a `std` `main()` — same code,
+   no Fluxor runtime.
+3. Diff per-layer probes (post-huffman, post-stereo, post-IMDCT,
+   overlap state) against the C reference until correlation = 1.0000.
+4. Only then run the WS-streaming harness; bring up the end-to-end
+   pipeline against `ffmpeg` reference PCM.
+
+The guide also documents the `SEND_BUF_SIZE` / `ws_stream` cap / codec
+output `buffer_size` tunings the harness expects.
+
 ## Notes
 
 - Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-03-01
+- Last refreshed: 2026-05-11

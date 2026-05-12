@@ -990,10 +990,16 @@ pub fn load_schema_for_module(module_type: &str, modules_dir: &Path) -> Option<P
 ///   - `source: files` → file (2)
 ///   - `proxy:` → proxy (3)
 fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section: Option<&Value>) {
+    // Must stay in sync with `modules/sdk/config.rs::http::MAX_ROUTES`
+    // for the host profile (target_arch=aarch64). Embedded/wasm
+    // profiles share the same ceiling here — the http module silently
+    // truncates anything past its own MAX_ROUTES, so the tool's 16
+    // never produces a buffer overrun, only "this route was ignored".
+    const TOOL_MAX_ROUTES: usize = 16;
     for (i, route) in routes.iter().enumerate() {
-        if i >= 4 {
+        if i >= TOOL_MAX_ROUTES {
             break;
-        } // MAX_ROUTES = 4
+        }
         let _base = i * 10 + 10; // tags: 10, 20, 30, 40
         let obj = match route.as_object() {
             Some(o) => o,
@@ -1050,6 +1056,19 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             // on the host).
             handler = 7; // HANDLER_FS_FILE
             kv.insert(format!("route_{}_fs_path", i), fs_path_val.clone());
+        } else if let Some(fs_list_val) = obj.get("fs_list") {
+            // FS_CONTRACT-served directory listing as JSON. The http
+            // module calls `FS_OPENDIR` + `FS_READDIR` against the
+            // configured directory each request and emits
+            // `{"items":["a","b",…]}`. Optional `fs_filter:` (case-
+            // insensitive comma-separated extension list) narrows the
+            // result. Used by the browser image_viewer / audio_player
+            // launchers to enumerate the asset bank.
+            handler = 8; // HANDLER_FS_LIST
+            kv.insert(format!("route_{}_fs_list", i), fs_list_val.clone());
+            if let Some(fs_filter_val) = obj.get("fs_filter") {
+                kv.insert(format!("route_{}_fs_filter", i), fs_filter_val.clone());
+            }
         } else if obj.get("source").is_some() {
             // The `source` value is informational (typically the
             // upstream port name); the actual wiring is declared in

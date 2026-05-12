@@ -1,16 +1,19 @@
 // MP3 codec kernel for unified decoder.
 //
-// Extracted from mp3.rs — contains state struct, decode pipeline, and
-// init/step functions. No module boilerplate.
+// Pipeline (mirrors minimp3.h, lieff/minimp3, CC0):
+//   bitstream → frame buffer → side info → main_data → scalefactors
+//   → huffman → requantize (f32) → MS-stereo → reorder → antialias
+//   → IMDCT (long/short) → change_sign → DCT-II → synthesis → PCM i16
 //
-// Used by: modules/decoder/mod.rs (unified decoder)
-// Standalone: modules/mp3.rs (unchanged, still builds independently)
+// DSP layer uses f32 throughout to match minimp3's reference behaviour
+// bit-for-bit (modulo rounding). All targets (rp2350 / bcm2712 / wasm32)
+// have hardware f32 FPU; no soft-float overhead.
 
 use super::abi::SyscallTable;
 use super::{POLL_IN, POLL_OUT, E_AGAIN, IOCTL_NOTIFY, drain_pending, track_pending, dev_log, dev_channel_ioctl, fmt_u32_raw, fmt_i16_raw};
 
 // ============================================================================
-// Section 1: Constants, Q15 helpers, BitReader
+// Section 1: Constants, BitReader
 // ============================================================================
 
 const IO_BUF_SIZE: usize = 256;
@@ -25,49 +28,6 @@ enum Mp3Phase {
     Sync = 0,
     Frame = 1,
     Decode = 2,
-}
-
-// --- Q15 fixed-point helpers ---
-
-#[inline(always)]
-fn q15_mul(a: i16, b: i16) -> i16 {
-    let product = (a as i32) * (b as i32);
-    let rounded = (product + 0x4000) >> 15;
-    rounded.clamp(-32768, 32767) as i16
-}
-
-#[inline(always)]
-fn q15_sat_add(a: i16, b: i16) -> i16 {
-    (a as i32 + b as i32).clamp(-32768, 32767) as i16
-}
-
-#[inline(always)]
-fn q15_sat_sub(a: i16, b: i16) -> i16 {
-    (a as i32 - b as i32).clamp(-32768, 32767) as i16
-}
-
-// Q30 accumulator helper
-#[inline(always)]
-fn q30_mac(acc: i32, a: i16, b: i16) -> i32 {
-    acc.saturating_add((a as i32) * (b as i32))
-}
-
-#[inline(always)]
-fn q30_to_q15(val: i32) -> i16 {
-    let rounded = (val + 0x4000) >> 15;
-    rounded.clamp(-32768, 32767) as i16
-}
-
-/// Clamp i64 to i32 range (used throughout IMDCT/synthesis to avoid overflow).
-#[inline(always)]
-fn clamp_i32(v: i64) -> i32 {
-    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
-}
-
-/// Clamp i64 to i16 range (used by scale_pcm and similar).
-#[inline(always)]
-fn clamp_i16(v: i64) -> i16 {
-    v.clamp(-32768, 32767) as i16
 }
 
 // --- BitReader (pointer-based, no slices) ---
@@ -173,16 +133,13 @@ fn parse_header(
         let b2 = *ptr.add(2);
         let b3 = *ptr.add(3);
 
-        // Sync check
         if b0 != 0xFF || (b1 & 0xE0) != 0xE0 { return -1; }
 
         let version_bits = (b1 >> 3) & 0x03;
         let layer_bits = (b1 >> 1) & 0x03;
         let protection_bit = b1 & 0x01;
 
-        // MPEG1 only
         if version_bits != 3 { return -8; }
-        // Layer III only
         if layer_bits != 1 { return -8; }
 
         let bitrate_index = ((b2 >> 4) & 0x0F) as usize;
@@ -226,7 +183,7 @@ static LINBITS: [u8; 32] = [
     4, 5, 6, 7, 8, 9, 11, 13,
 ];
 
-// Packed Huffman tree (CC0 public domain)
+// Packed Huffman tree (CC0 public domain, identical to minimp3's tabs[])
 #[rustfmt::skip]
 static TABS: [i16; 2164] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -268,8 +225,6 @@ static TAB33: [u8; 16] = [
 // Section 3b: Cached bitstream reader + tree-based Huffman decode
 // ============================================================================
 
-/// Cached bitstream reader.
-/// Peeks N bits from a 32-bit cache without consuming, then flushes.
 #[repr(C)]
 struct BsCached {
     cache: u32,
@@ -282,7 +237,6 @@ fn bs_cached_new(data: *const u8, byte_offset: usize, data_len: usize) -> BsCach
     unsafe {
         let start = data.add(byte_offset);
         let limit = data.add(data_len);
-        // Initialize cache from first 4 bytes (big-endian)
         let mut cache: u32 = 0;
         let avail = if data_len > byte_offset { data_len - byte_offset } else { 0 };
         let init_bytes = if avail > 4 { 4 } else { avail };
@@ -292,28 +246,23 @@ fn bs_cached_new(data: *const u8, byte_offset: usize, data_len: usize) -> BsCach
             i += 1;
         }
         let next = start.add(init_bytes);
-        // Convention: sh = (bit_offset & 7) - 8 after loading 4 bytes
-        // sh < 0 means cache is full; sh >= 0 triggers CHECK (load more bytes)
-        let sh = 24 - (init_bytes as i32) * 8; // 4 bytes → -8, 3 → 0, etc.
+        let sh = 24 - (init_bytes as i32) * 8;
         BsCached { cache, sh, next, limit }
     }
 }
 
 impl BsCached {
-    /// Peek at the top N bits of the cache (1..=32). Does NOT consume.
     #[inline(always)]
     fn peek(&self, n: u32) -> u32 {
         self.cache >> (32 - n)
     }
 
-    /// Consume N bits from the cache.
     #[inline(always)]
     fn flush(&mut self, n: u32) {
         self.cache <<= n;
         self.sh += n as i32;
     }
 
-    /// Refill the cache from the byte stream.
     #[inline(always)]
     fn check(&mut self) {
         unsafe {
@@ -324,32 +273,6 @@ impl BsCached {
                 }
                 self.sh -= 8;
             }
-        }
-    }
-
-    /// Return current bit position relative to start (for part2_3 boundary check).
-    #[inline(always)]
-    fn bits_consumed(&self, data: *const u8, byte_offset: usize) -> usize {
-        unsafe {
-            let bytes_read = self.next.offset_from(data.add(byte_offset)) as usize;
-            // bytes_read * 8 is total bytes consumed as bits
-            // sh starts negative, goes positive as bits are consumed
-            // actual position = bytes_read*8 - (bits still in cache)
-            // bits still in cache = -(sh + 8) when sh < 0, but simpler:
-            // bits_consumed = bytes_read * 8 + sh + 32 - 32 ...
-            // Actually: after init, sh = init_bytes*8 - 32
-            // After consuming N bits total via flush, sh increases by N
-            // So bits consumed = (bytes_read*8 - 32) - initial_sh ... no.
-            // BSPOS formula: (bs_next_ptr - start)*8 - 24 + bs_sh
-            let byte_dist = bytes_read;
-            // total bits available = byte_dist * 8
-            // bits remaining in cache = -(self.sh) - 8  ... no
-            // sh after init with 4 bytes = 4*8 - 32 = 0
-            // after flushing 5 bits, sh = 5, then check refills:
-            //   reads 1 byte, sh = 5-8 = -3. cache has 32-5+8 = 35 bits? no, 32.
-            // Let me think again. sh tracks how many bits we've consumed beyond
-            // BSPOS = (next - buf_start)*8 - 24 + sh
-            (byte_dist * 8).wrapping_add(self.sh as usize).wrapping_sub(8)
         }
     }
 }
@@ -368,8 +291,6 @@ fn decode_pair_tree(bs: &mut BsCached, tab_num: u8, linbits: u8) -> (i32, i32) {
         }
         bs.flush((leaf >> 8) as u32);
 
-        // Lower nibble first (j=0), then upper nibble (j=1).
-        // Sign/linbits bits must be consumed in this order.
         let mut vals = [leaf & 0x0F, (leaf >> 4) & 0x0F];
         let mut j: usize = 0;
         while j < 2 {
@@ -410,23 +331,10 @@ fn decode_quad_tree(bs: &mut BsCached, use_table_b: bool) -> (i32, i32, i32, i32
         let mut x: i32 = 0;
         let mut y: i32 = 0;
 
-        // bits 7..4 encode v,w,x,y presence
-        if (leaf & 128) != 0 {
-            v = if (bs.cache >> 31) != 0 { -1 } else { 1 };
-            bs.flush(1);
-        }
-        if (leaf & 64) != 0 {
-            w = if (bs.cache >> 31) != 0 { -1 } else { 1 };
-            bs.flush(1);
-        }
-        if (leaf & 32) != 0 {
-            x = if (bs.cache >> 31) != 0 { -1 } else { 1 };
-            bs.flush(1);
-        }
-        if (leaf & 16) != 0 {
-            y = if (bs.cache >> 31) != 0 { -1 } else { 1 };
-            bs.flush(1);
-        }
+        if (leaf & 128) != 0 { v = if (bs.cache >> 31) != 0 { -1 } else { 1 }; bs.flush(1); }
+        if (leaf & 64)  != 0 { w = if (bs.cache >> 31) != 0 { -1 } else { 1 }; bs.flush(1); }
+        if (leaf & 32)  != 0 { x = if (bs.cache >> 31) != 0 { -1 } else { 1 }; bs.flush(1); }
+        if (leaf & 16)  != 0 { y = if (bs.cache >> 31) != 0 { -1 } else { 1 }; bs.flush(1); }
 
         bs.check();
         (v, w, x, y)
@@ -437,7 +345,69 @@ fn decode_quad_tree(bs: &mut BsCached, use_table_b: bool) -> (i32, i32, i32, i32
 // Section 4: Spectral data decoding (tree-based Huffman)
 // ============================================================================
 
+/// Compute the line boundary covered by the first `n_sfb_windows` entries of
+/// the granule's sfbtab. For long blocks the sfbtab is the long-band table
+/// (one entry per SFB). For pure short, each SFB has 3 windows of the same
+/// width. For mixed, the first 8 SFBs are long widths, then short widths × 3
+/// starting at SFB index 3.
+fn region_boundary_lines(
+    n_sfb_windows: usize,
+    block_type: u8,
+    mixed: bool,
+    sample_rate: u32,
+) -> usize {
+    unsafe {
+        if block_type != 2 {
+            let t = get_sfb_table(sample_rate);
+            let i = n_sfb_windows.min(22);
+            return *t.add(i);
+        }
+        if !mixed {
+            let widths = get_sfb_short_widths(sample_rate);
+            let mut lines = 0usize;
+            let mut walked = 0usize;
+            let mut sfb = 0usize;
+            while walked < n_sfb_windows && sfb < 13 {
+                let w = *widths.add(sfb) as usize;
+                if w == 0 { break; }
+                let mut win = 0;
+                while win < 3 && walked < n_sfb_windows {
+                    lines += w;
+                    walked += 1;
+                    win += 1;
+                }
+                sfb += 1;
+            }
+            return lines;
+        }
+        // Mixed: first 8 long SFBs (MPEG-1), then short × 3 starting at sfb=3.
+        let t = get_sfb_table(sample_rate);
+        let n_long: usize = 8;
+        if n_sfb_windows <= n_long {
+            return *t.add(n_sfb_windows);
+        }
+        let mut lines = *t.add(n_long);
+        let widths = get_sfb_short_widths(sample_rate);
+        let mut walked = n_long;
+        let mut sfb = 3usize;
+        while walked < n_sfb_windows && sfb < 13 {
+            let w = *widths.add(sfb) as usize;
+            if w == 0 { break; }
+            let mut win = 0;
+            while win < 3 && walked < n_sfb_windows {
+                lines += w;
+                walked += 1;
+                win += 1;
+            }
+            sfb += 1;
+        }
+        lines
+    }
+}
+
 /// Decode all spectral data for one granule/channel using tree-based Huffman.
+/// Output is raw signed integer quanta (sign(is) * |is|). pow_4_3 and gain are
+/// applied later in requantize().
 fn decode_spectral_data(
     reader: &mut BitReader,
     big_values: u16,
@@ -447,39 +417,33 @@ fn decode_spectral_data(
     count1table_select: bool,
     part2_3_length: u16,
     output: *mut i32,
-    sfb_table: *const usize,
+    block_type: u8,
+    mixed: bool,
+    sample_rate: u32,
 ) -> i32 {
     unsafe {
-        // Zero output first
         let mut i: usize = 0;
-        while i < 576 {
-            *output.add(i) = 0;
-            i += 1;
-        }
+        while i < 576 { *output.add(i) = 0; i += 1; }
 
-        // Region boundaries from scalefactor band table (ISO 11172-3 2.4.2.7)
-        let r0_idx = (region0_count as usize + 1).min(22);
-        let r1_idx = (region0_count as usize + region1_count as usize + 2).min(22);
-        let region0_end_raw = *sfb_table.add(r0_idx);
+        // Region boundaries: minimp3 walks `region_count[i] + 1` SFB-windows
+        // per region. The line boundary depends on the block type's sfbtab.
+        let region0_end_raw = region_boundary_lines(
+            region0_count as usize + 1, block_type, mixed, sample_rate);
+        let region1_end_raw = region_boundary_lines(
+            region0_count as usize + region1_count as usize + 2, block_type, mixed, sample_rate);
         let region0_end = if region0_end_raw < big_values as usize * 2 { region0_end_raw } else { big_values as usize * 2 };
-        let region1_end_raw = *sfb_table.add(r1_idx);
         let region1_end = if region1_end_raw < big_values as usize * 2 { region1_end_raw } else { big_values as usize * 2 };
         let big_values_end = big_values as usize * 2;
 
         let start_bit = br_bit_position(reader);
         let part2_3_end = start_bit + part2_3_length as usize;
 
-        // Build a cached bitstream reader from the current BitReader position
         let byte_off = reader.byte_pos;
         let bit_off = reader.bit_pos as u32;
         let mut bs = bs_cached_new(reader.data, byte_off, reader.data_len);
-        // Align: skip the bit_pos bits already consumed within the current byte
-        if bit_off > 0 {
-            bs.flush(bit_off);
-        }
+        if bit_off > 0 { bs.flush(bit_off); }
         bs.check();
 
-        // Decode big_values pairs across three regions
         let regions: [(usize, usize, u8); 3] = [
             (0, region0_end, *table_select.add(0)),
             (region0_end, region1_end, *table_select.add(1)),
@@ -502,14 +466,11 @@ fn decode_spectral_data(
             ri += 1;
         }
 
-        // Count1 region: decode quads until we hit the part2_3 boundary
         let mut pos = big_values_end;
-        // Compute how many bits the cached BS has consumed so far
         let bs_byte_dist = bs.next.offset_from(reader.data.add(byte_off)) as usize;
         let mut bits_used = (bs_byte_dist * 8) as i32 + bs.sh + 8 + bit_off as i32;
 
         while pos + 3 < 576 {
-            // Check part2_3 boundary
             if (start_bit as i32 + bits_used as i32) >= part2_3_end as i32 { break; }
 
             let (v, w, x, y) = decode_quad_tree(&mut bs, count1table_select);
@@ -519,12 +480,10 @@ fn decode_spectral_data(
             *output.add(pos + 3) = y;
             pos += 4;
 
-            // Recompute bits used
             let bd2 = bs.next.offset_from(reader.data.add(byte_off)) as usize;
             bits_used = (bd2 * 8) as i32 + bs.sh + 8 + bit_off as i32;
         }
 
-        // Advance the original BitReader to part2_3_end
         let consumed_total = part2_3_length as usize;
         reader.byte_pos = (start_bit + consumed_total) >> 3;
         reader.bit_pos = ((start_bit + consumed_total) & 7) as u8;
@@ -533,36 +492,70 @@ fn decode_spectral_data(
     }
 }
 
-// (old TABLE_5 through TABLE_B, get_huff_table, decode_pair_from_table,
-//  decode_quad_from_table, decode_big_values, decode_count1, and
-//  old decode_spectral_data all removed — replaced by tree-based Huffman above)
-
-
 // ============================================================================
-// Section 5: Requantize tables and function
+// Section 5: Requantize tables (float, mirrors minimp3 L3_pow_43 / g_pow43)
 // ============================================================================
 
-static POW_4_3: [i32; 256] = [
-    0, 1, 3, 4, 6, 9, 11, 13, 16, 19, 22, 24, 27, 31, 34, 37,
-    40, 44, 47, 51, 54, 58, 62, 65, 69, 73, 77, 81, 85, 89, 93, 97,
-    102, 106, 110, 114, 119, 123, 128, 132, 137, 141, 146, 151, 155, 160, 165, 170,
-    174, 179, 184, 189, 194, 199, 204, 209, 214, 219, 225, 230, 235, 240, 245, 251,
-    256, 261, 267, 272, 278, 283, 288, 294, 300, 305, 311, 316, 322, 328, 333, 339,
-    345, 350, 356, 362, 368, 374, 380, 386, 391, 397, 403, 409, 415, 421, 427, 433,
-    440, 446, 452, 458, 464, 470, 477, 483, 489, 495, 502, 508, 514, 521, 527, 533,
-    540, 546, 553, 559, 566, 572, 579, 585, 592, 598, 605, 612, 618, 625, 632, 638,
-    645, 652, 659, 665, 672, 679, 686, 693, 699, 706, 713, 720, 727, 734, 741, 748,
-    755, 762, 769, 776, 783, 790, 797, 804, 811, 818, 825, 833, 840, 847, 854, 861,
-    869, 876, 883, 890, 898, 905, 912, 920, 927, 934, 942, 949, 957, 964, 971, 979,
-    986, 994, 1001, 1009, 1016, 1024, 1031, 1039, 1047, 1054, 1062, 1069, 1077, 1085, 1092, 1100,
-    1108, 1115, 1123, 1131, 1139, 1146, 1154, 1162, 1170, 1177, 1185, 1193, 1201, 1209, 1217, 1225,
-    1232, 1240, 1248, 1256, 1264, 1272, 1280, 1288, 1296, 1304, 1312, 1320, 1328, 1336, 1344, 1352,
-    1360, 1368, 1377, 1385, 1393, 1401, 1409, 1417, 1426, 1434, 1442, 1450, 1458, 1467, 1475, 1483,
-    1491, 1500, 1508, 1516, 1525, 1533, 1541, 1550, 1558, 1567, 1575, 1583, 1592, 1600, 1609, 1617,
+// g_pow43[129+16] from minimp3.h — table holds [-16..-1, 0..128] values of x^(4/3).
+// Indexed as G_POW43[16 + lsb] for lsb in [-16..128].
+static G_POW43: [f32; 145] = [
+    0.0,-1.0,-2.519842,-4.326749,-6.349604,-8.549880,-10.902724,-13.390518,
+    -16.000000,-18.720754,-21.544347,-24.463781,-27.473142,-30.567351,-33.741992,-36.993181,
+    0.0,1.0,2.519842,4.326749,6.349604,8.549880,10.902724,13.390518,
+    16.000000,18.720754,21.544347,24.463781,27.473142,30.567351,33.741992,36.993181,
+    40.317474,43.711787,47.173345,50.699631,54.288352,57.937408,61.644865,65.408941,
+    69.227979,73.100443,77.024898,81.000000,85.024491,89.097188,93.216975,97.382800,
+    101.593667,105.848633,110.146801,114.487321,118.869381,123.292209,127.755065,132.257246,
+    136.798076,141.376907,145.993119,150.646117,155.335327,160.060199,164.820202,169.614826,
+    174.443577,179.305980,184.201575,189.129918,194.090580,199.083145,204.107210,209.162385,
+    214.248292,219.364564,224.510845,229.686789,234.892058,240.126328,245.389280,250.680604,
+    256.000000,261.347174,266.721841,272.123723,277.552547,283.008049,288.489971,293.998060,
+    299.532071,305.091761,310.676898,316.287249,321.922592,327.582707,333.267377,338.976394,
+    344.709550,350.466646,356.247482,362.051866,367.879608,373.730522,379.604427,385.501143,
+    391.420496,397.362314,403.326427,409.312672,415.320884,421.350905,427.402579,433.475750,
+    439.570269,445.685987,451.822757,457.980436,464.158883,470.357960,476.577530,482.817459,
+    489.077615,495.357868,501.658090,507.978156,514.317941,520.677324,527.056184,533.454404,
+    539.871867,546.308458,552.764065,559.238575,565.731879,572.243870,578.774440,585.323483,
+    591.890898,598.476581,605.080431,611.702349,618.342238,625.000000,631.675540,638.368763,645.079578,
 ];
 
-static POW2_QUARTER: [i32; 4] = [32768, 38968, 46341, 55109];
+/// L3_pow_43 from minimp3.h, ported verbatim. Returns x^(4/3) for non-negative x.
+#[inline]
+fn l3_pow_43(x: i32) -> f32 {
+    if x < 129 { return unsafe { *G_POW43.as_ptr().add((16 + x) as usize) }; }
+    let mut mult: f32 = 256.0;
+    let mut xv = x;
+    if xv < 1024 { mult = 16.0; xv <<= 3; }
+    // sign tracks the rounding direction for the lookup index
+    let sign = (2i32.wrapping_mul(xv) & 64) as i32;
+    let num = (xv & 63) - sign;
+    let den = (xv & !63) + sign;
+    let frac = (num as f32) / (den as f32);
+    let idx = (16 + ((xv + sign) >> 6)) as usize;
+    let lookup = unsafe { *G_POW43.as_ptr().add(idx) };
+    lookup * (1.0 + frac * ((4.0 / 3.0) + frac * (2.0 / 9.0))) * mult
+}
 
+/// L3_ldexp_q2: y * 2^(exp_q2 / 4) using float arithmetic, no float pow().
+/// Mirrors minimp3's L3_ldexp_q2.
+fn l3_ldexp_q2(mut y: f32, mut exp_q2: i32) -> f32 {
+    const G_EXPFRAC: [f32; 4] = [9.31322575e-10, 7.83145814e-10, 6.58544508e-10, 5.53767716e-10];
+    loop {
+        let e = if exp_q2 > 30 * 4 { 30 * 4 } else { exp_q2 };
+        let pow_part = (1u32 << 30) >> ((e >> 2) as u32);
+        y *= unsafe { *G_EXPFRAC.as_ptr().add((e & 3) as usize) } * pow_part as f32;
+        exp_q2 -= e;
+        if exp_q2 <= 0 { break; }
+    }
+    y
+}
+
+// ============================================================================
+// Section 6: Scalefactor band tables
+// ============================================================================
+
+/// Long-block scalefactor band boundaries (line offsets). 23 entries; 0 and 576
+/// are sentinels.
 static SFB_LONG_44100: [usize; 23] = [
     0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418, 576,
 ];
@@ -579,9 +572,8 @@ fn get_sfb_table(sample_rate: u32) -> *const usize {
     else { SFB_LONG_44100.as_ptr() }
 }
 
-// SFB widths for short blocks (per window), zero-terminated.
-// Each entry is the width of one scalefactor band for one short window.
-// Total per table sums to 192 (= 576 / 3 windows).
+// Short-block scalefactor band widths (13 entries, zero-terminated). Each entry
+// is the width of ONE window (multiplied by 3 windows total).
 static SFB_SHORT_W_48000: [u8; 14] = [4,4,4,4,6,6,10,12,14,16,20,26,66, 0];
 static SFB_SHORT_W_44100: [u8; 14] = [4,4,4,4,6,8,10,12,14,18,22,30,56, 0];
 static SFB_SHORT_W_32000: [u8; 14] = [4,4,4,4,6,8,12,16,20,26,34,42,12, 0];
@@ -592,168 +584,318 @@ fn get_sfb_short_widths(sample_rate: u32) -> *const u8 {
     else { SFB_SHORT_W_44100.as_ptr() }
 }
 
-/// Reorder short-block spectral values from SFB-sequential to window-interleaved.
-/// After reorder, each group of 18 values (one subband) has 3 windows interleaved
-/// at stride 3, so L3_imdct_short can extract each window's 6 values.
-/// Uses `scratch` as temporary buffer (must be >= 576 i32).
-fn reorder_short(grbuf: *mut i32, scratch: *mut i32, sample_rate: u32) {
+/// Compute long-block SFB widths from the boundary table (22 widths).
+fn long_sfb_widths(sample_rate: u32, out: &mut [u8; 22]) {
+    let t = get_sfb_table(sample_rate);
+    let mut i: usize = 0;
+    while i < 22 {
+        let a = unsafe { *t.add(i) };
+        let b = unsafe { *t.add(i + 1) };
+        out[i] = (b - a) as u8;
+        i += 1;
+    }
+}
+
+// ============================================================================
+// Section 7: Requantize (f32 output, per-band gain * pow_4_3)
+//
+// Mirrors minimp3 L3_decode_scalefactors gain-exp arithmetic, applied to our
+// existing scalefactor decode (`Mp3State::scalefactors`). The output `freq` is
+// signed float; sign comes from the integer quanta sign.
+// ============================================================================
+
+/// Apply requantization to the 576 spectral samples of one granule/channel.
+///
+/// - `is`: signed integer quanta from huffman (size 576)
+/// - `freq`: output f32 spectral samples (size 576)
+/// - `scf`: 39 scalefactor bytes for this granule/channel (already includes the
+///   raw `iscf` values from the bitstream; preflag/pretab and subblock_gain are
+///   added here)
+/// - `global_gain`, `scalefac_scale`, `preflag`: from side info
+/// - `block_type` ∈ {0,1,3} long-like, 2 short (pure or mixed)
+/// - `mixed`: mixed_block_flag (only meaningful when block_type==2)
+/// - `subblock_gain[3]`: short-block per-window gain (block_type==2)
+/// - `sample_rate`, `ms_stereo`: needed for gain adjustment
+fn requantize(
+    is: *const i32,
+    freq: *mut f32,
+    scf: *const u8,
+    global_gain: u8,
+    scalefac_scale: bool,
+    block_type: u8,
+    mixed: bool,
+    subblock_gain: *const u8,
+    preflag: bool,
+    sample_rate: u32,
+    ms_stereo: bool,
+) {
     unsafe {
-        let sfb_w = get_sfb_short_widths(sample_rate);
+        // gain_exp = global_gain + BITS_DEQUANTIZER_OUT*4 - 210 - (MS?2:0)
+        //          = global_gain - 4 - 210 - (MS?2:0)
+        // BITS_DEQUANTIZER_OUT = -1 in minimp3 → factor of 1/2 in output domain.
+        let ms_adj: i32 = if ms_stereo { 2 } else { 0 };
+        let gain_exp = global_gain as i32 - 4 - 210 - ms_adj;
+        // MAX_SCF = 255 + BITS_DEQUANTIZER_OUT*4 - 210 = 41
+        // MAX_SCFI = (MAX_SCF + 3) & ~3 = 44 (rounded UP to multiple of 4)
+        // gain = ldexp_q2(1 << (MAX_SCFI/4), MAX_SCFI - gain_exp) = ldexp_q2(2^11, 44 - gain_exp)
+        let gain_base = l3_ldexp_q2((1u32 << 11) as f32, 44 - gain_exp);
+
+        let scf_shift = if scalefac_scale { 2u32 } else { 1u32 };
+
+        if block_type == 2 && !mixed {
+            // PURE SHORT BLOCK
+            // 13 short SFBs × 3 windows. SFB index → scf slot = sfb*3 + win.
+            // Widths: SFB_SHORT_W_RATE[sfb] for each window.
+            let widths = get_sfb_short_widths(sample_rate);
+            let mut pos: usize = 0;
+            let mut sfb: usize = 0;
+            while sfb < 13 {
+                let w = *widths.add(sfb) as usize;
+                if w == 0 { break; }
+                let mut win: usize = 0;
+                while win < 3 {
+                    let scf_slot = sfb * 3 + win;
+                    let sf_val: i32 = if scf_slot < 39 { *scf.add(scf_slot) as i32 } else { 0 };
+                    // subblock_gain folded via *8 in the exponent.
+                    let sbg = *subblock_gain.add(win) as i32 * 8;
+                    let exp_q2 = ((sf_val as i32) << scf_shift) + sbg;
+                    let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                    let mut k: usize = 0;
+                    while k < w {
+                        let q = *is.add(pos + k);
+                        if q == 0 {
+                            *freq.add(pos + k) = 0.0;
+                        } else if q > 0 {
+                            *freq.add(pos + k) = band_gain * l3_pow_43(q);
+                        } else {
+                            *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
+                        }
+                        k += 1;
+                    }
+                    pos += w;
+                    win += 1;
+                }
+                sfb += 1;
+            }
+            while pos < GRANULE_SAMPLES { *freq.add(pos) = 0.0; pos += 1; }
+        } else if block_type == 2 && mixed {
+            // MIXED BLOCK — long bands 0..7 (lines 0..35 for 44.1/48k; 0..71 for 32k),
+            // then short SFBs starting where long bands end.
+            // For 32 kHz the spec uses 4 long bands (8 SFBs at this rate produce
+            // 4 polyphase subbands × 18 lines = 72 lines); for 44.1/48 it's 2
+            // subbands × 18 = 36 lines.
+            //
+            // We compute "long_sfb_count" = number of long SFBs covered by the
+            // mixed long-portion: 8 for 44.1/48, and per minimp3 for 32 kHz
+            // the first 4 polyphase subbands cover SFBs 0..11 (72 lines).
+            // Look up the actual boundary at line `n_long_lines` to find the
+            // matching SFB count.
+            let long_table = get_sfb_table(sample_rate);
+            let n_long_subbands = if sample_rate == 32000 { 4 } else { 2 };
+            let n_long_lines = n_long_subbands * 18;
+            // Find long_sfb_count such that long_table[long_sfb_count] == n_long_lines
+            let mut long_sfb_count: usize = 0;
+            while long_sfb_count < 22 {
+                if *long_table.add(long_sfb_count + 1) >= n_long_lines { break; }
+                long_sfb_count += 1;
+            }
+            long_sfb_count += 1; // make it count, not last-index
+
+            // Pass A: long bands 0..long_sfb_count-1
+            let mut pos: usize = 0;
+            let mut sfb: usize = 0;
+            while sfb < long_sfb_count {
+                let a = *long_table.add(sfb);
+                let b = *long_table.add(sfb + 1);
+                let w = b - a;
+                let sf_val: i32 = if sfb < 39 { *scf.add(sfb) as i32 } else { 0 };
+                // Note: mixed blocks do NOT use preflag (only pure long blocks do).
+                let exp_q2 = (sf_val as i32) << scf_shift;
+                let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                let mut k: usize = 0;
+                while k < w {
+                    let q = *is.add(pos + k);
+                    if q == 0 {
+                        *freq.add(pos + k) = 0.0;
+                    } else if q > 0 {
+                        *freq.add(pos + k) = band_gain * l3_pow_43(q);
+                    } else {
+                        *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
+                    }
+                    k += 1;
+                }
+                pos += w;
+                sfb += 1;
+            }
+
+            // Pass B: short SFBs starting at the same line position (`pos`).
+            // For 44.1/48k: long covers 36 lines (SFBs 0..7); short SFBs cover
+            // remaining 540 lines, indexed sfb_short = 3..12. For 32k: similar but
+            // long covers 72 lines.
+            //
+            // Scalefactor slot mapping for short part in mixed (matches
+            // decode_scalefactors): scf[long_sfb_count + (sfb_short - first_short)*3 + win].
+            //
+            // first_short = sfb index of the first short band beyond the long
+            // portion. For 44.1/48k long covers up to line 36 = SFB_SHORT[0..2]*3
+            // = 4*3+4*3+4*3 = 36 ✓ — so first_short = 3.
+            // For 32k long covers 72 lines = SFB_SHORT[0..5]*3 = 4+4+4+4+6+8 wait
+            // let me check: SFB_SHORT_W_32000[0..5] = [4,4,4,4,6,8]. Sum = 30
+            // × 3 windows = 90 — doesn't match 72. So 32k mixed doesn't cleanly
+            // map this way; minimp3 punts and rebases sfbtab at sfb_short = 3
+            // regardless. Match that.
+            let widths = get_sfb_short_widths(sample_rate);
+            let first_short: usize = 3;
+            let mut sfb_short: usize = first_short;
+            let mut scf_base: usize = long_sfb_count;
+            while sfb_short < 13 {
+                let w = *widths.add(sfb_short) as usize;
+                if w == 0 { break; }
+                let mut win: usize = 0;
+                while win < 3 {
+                    let scf_slot = scf_base + win;
+                    let sf_val: i32 = if scf_slot < 39 { *scf.add(scf_slot) as i32 } else { 0 };
+                    let sbg = *subblock_gain.add(win) as i32 * 8;
+                    let exp_q2 = ((sf_val as i32) << scf_shift) + sbg;
+                    let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                    let mut k: usize = 0;
+                    while k < w {
+                        if pos + k >= GRANULE_SAMPLES { break; }
+                        let q = *is.add(pos + k);
+                        if q == 0 {
+                            *freq.add(pos + k) = 0.0;
+                        } else if q > 0 {
+                            *freq.add(pos + k) = band_gain * l3_pow_43(q);
+                        } else {
+                            *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
+                        }
+                        k += 1;
+                    }
+                    pos += w;
+                    win += 1;
+                }
+                scf_base += 3;
+                sfb_short += 1;
+            }
+            while pos < GRANULE_SAMPLES { *freq.add(pos) = 0.0; pos += 1; }
+        } else {
+            // LONG BLOCK (block_type 0/1/3 with no mixed flag).
+            let long_table = get_sfb_table(sample_rate);
+            let mut pos: usize = 0;
+            let mut sfb: usize = 0;
+            while sfb < 22 {
+                let a = *long_table.add(sfb);
+                let b = *long_table.add(sfb + 1);
+                let w = b - a;
+                let sf_val: i32 = if sfb < 39 { *scf.add(sfb) as i32 } else { 0 };
+                let sf_eff = if preflag && sfb < 21 {
+                    sf_val + *PRETAB.as_ptr().add(sfb)
+                } else {
+                    sf_val
+                };
+                let exp_q2 = (sf_eff as i32) << scf_shift;
+                let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                let mut k: usize = 0;
+                while k < w {
+                    if pos + k >= GRANULE_SAMPLES { break; }
+                    let q = *is.add(pos + k);
+                    if q == 0 {
+                        *freq.add(pos + k) = 0.0;
+                    } else if q > 0 {
+                        *freq.add(pos + k) = band_gain * l3_pow_43(q);
+                    } else {
+                        *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
+                    }
+                    k += 1;
+                }
+                pos += w;
+                sfb += 1;
+            }
+            while pos < GRANULE_SAMPLES { *freq.add(pos) = 0.0; pos += 1; }
+        }
+    }
+}
+
+// ============================================================================
+// Section 8: MS stereo (just add/subtract; the 1/sqrt(2) is in the gain_exp)
+// ============================================================================
+
+fn process_ms_stereo(freq_lines: *mut f32) {
+    unsafe {
+        let right = freq_lines.add(GRANULE_SAMPLES);
+        let mut i: usize = 0;
+        while i < GRANULE_SAMPLES {
+            let m = *freq_lines.add(i);
+            let s = *right.add(i);
+            *freq_lines.add(i) = m + s;
+            *right.add(i) = m - s;
+            i += 1;
+        }
+    }
+}
+
+// ============================================================================
+// Section 9: Reorder short blocks (window-interleave at stride 3)
+// ============================================================================
+
+/// Reorder short-block spectral values from SFB-sequential to window-interleaved.
+/// Uses `scratch` as temporary (must be ≥ 540 f32 / 576 to be safe).
+fn reorder_short(grbuf: *mut f32, scratch: *mut f32, sfb_widths: *const u8, nbands_to_reorder: usize) {
+    unsafe {
         let mut src = grbuf;
-        let mut dst_idx: usize = 0;
+        let mut dst_count: usize = 0;
         let mut wi: usize = 0;
+        let mut samples_left = nbands_to_reorder * 18; // safety bound
         loop {
-            let len = *sfb_w.add(wi) as usize;
+            let len = *sfb_widths.add(wi) as usize;
             if len == 0 { break; }
+            if dst_count + 3 * len > samples_left { break; }
             let mut i: usize = 0;
             while i < len {
-                *scratch.add(dst_idx) = *src.add(i);
-                *scratch.add(dst_idx + 1) = *src.add(len + i);
-                *scratch.add(dst_idx + 2) = *src.add(2 * len + i);
-                dst_idx += 3;
+                *scratch.add(dst_count) = *src.add(i);
+                *scratch.add(dst_count + 1) = *src.add(len + i);
+                *scratch.add(dst_count + 2) = *src.add(2 * len + i);
+                dst_count += 3;
                 i += 1;
             }
             src = src.add(3 * len);
             wi += 1;
         }
-        // Copy back
         let mut i: usize = 0;
-        while i < dst_idx {
-            *grbuf.add(i) = *scratch.add(i);
-            i += 1;
-        }
-    }
-}
-
-/// Requantize spectral values for one granule/channel.
-/// Output is Q15 stored in i32 (will become Q30 after IMDCT accumulation).
-fn requantize(
-    input: *const i32,
-    output: *mut i32,
-    scalefactors: *const u8,
-    global_gain: u8,
-    scalefac_scale: bool,
-    block_type: u8,
-    subblock_gain: *const u8,
-    preflag: bool,
-    sample_rate: u32,
-    norm_shift: i32,
-) {
-    unsafe {
-        let sfb_table = get_sfb_table(sample_rate);
-        let gain_exp = global_gain as i32 - 210;
-        let sf_shift: i32 = if scalefac_scale { 1 } else { 0 };
-
-        let mut sfb: usize = 0;
-        let mut i: usize = 0;
-        while i < GRANULE_SAMPLES {
-            // Advance SFB
-            while sfb + 1 < 23 {
-                let next_boundary = *sfb_table.add(sfb + 1);
-                if i < next_boundary { break; }
-                sfb += 1;
-            }
-
-            let is_val = *input.add(i);
-            if is_val == 0 {
-                *output.add(i) = 0;
-                i += 1;
-                continue;
-            }
-
-            let sf_raw = if sfb < 39 { *scalefactors.add(sfb) as i32 } else { 0 };
-            // Add pretab to scalefactor (ISO 11172-3 §2.4.3.4)
-            let sf = if preflag && block_type != 2 && sfb < 22 {
-                sf_raw + *PRETAB.as_ptr().add(sfb)
-            } else {
-                sf_raw
-            };
-
-            // |x|^(4/3)
-            let magnitude = if is_val < 0 { -is_val } else { is_val };
-            let pow_result = if magnitude < 256 {
-                *POW_4_3.as_ptr().add(magnitude as usize)
-            } else {
-                let base = *POW_4_3.as_ptr().add(255);
-                let scaled = magnitude / 256;
-                base * scaled / 4
-            };
-
-            // Subblock gain for short blocks
-            let sbg = if block_type == 2 {
-                let window = (i / 6) - ((i / 6) / 3) * 3; // i/6 mod 3 without %
-                *subblock_gain.add(window) as i32 * 8
-            } else {
-                0
-            };
-
-            let total_exp = gain_exp - (sf << sf_shift) - sbg;
-
-            // Decompose 2^(total_exp/4) = 2^(int_shift) * 2^(frac/4)
-            // Using arithmetic right shift: works correctly for negative values
-            let int_shift = total_exp >> 2;
-            let frac_idx = (total_exp & 3) as usize;
-            let frac_idx_safe = if frac_idx >= 4 { 0 } else { frac_idx };
-            // pow_result(Q0) × POW2_QUARTER(Q15) = Q15
-            let scaled_q15 = pow_result as i64 * *POW2_QUARTER.as_ptr().add(frac_idx_safe) as i64;
-
-            // Apply int_shift minus per-granule norm_shift to prevent i32 overflow
-            // in downstream IMDCT/DCT-II. Compensated post-synthesis by <<norm_shift.
-            let total_shift = int_shift - norm_shift;
-            let result = if total_shift >= 0 {
-                let ts = total_shift as u32;
-                if ts > 30 { i32::MAX as i64 }
-                else { (scaled_q15 << ts).min(i32::MAX as i64) }
-            } else {
-                let rs = (-total_shift) as u32;
-                if rs > 45 { 0i64 } else { scaled_q15 >> rs }
-            };
-
-            let signed_result = if is_val < 0 { -(result as i32) } else { result as i32 };
-            *output.add(i) = signed_result;
-            i += 1;
-        }
-
-        // Preflag is now integrated into the scalefactor in the main loop above
+        while i < dst_count { *grbuf.add(i) = *scratch.add(i); i += 1; }
     }
 }
 
 // ============================================================================
-// Section 6: Stereo processing (MS stereo, intensity stereo)
+// Section 10: Antialiasing butterflies (ISO 11172-3 §2.4.3.4)
 // ============================================================================
 
-/// Process MS stereo: convert mid/side to left/right
-/// freq_lines layout: [ch0: 576 i16][ch1: 576 i16]
-// ISO 11172-3 Table B.9: Antialiasing butterfly coefficients in Q15
-// cs[i] = cos(atan(ca_float[i]/cs_float[i])) scaled to Q15
-// ca[i] = sin(atan(ca_float[i]/cs_float[i])) scaled to Q15
-// ISO 11172-3 Table B.9: Antialiasing butterfly coefficients in Q15
-static ANTIALIAS_CS: [i16; 8] = [
-    28098, 28893, 31117, 32221, 32621, 32740, 32765, 32767,
+// minimp3 g_aa[0] = cs (positive cosine coefs), g_aa[1] = ca (positive sine).
+static AA_CS: [f32; 8] = [
+    0.85749293, 0.88174200, 0.94962865, 0.98331459, 0.99551782, 0.99916056, 0.99989920, 0.99999316,
 ];
-static ANTIALIAS_CA: [i16; 8] = [
-    -16859, -15458, -10269, -5961, -3099, -1342, -465, -121,
+static AA_CA: [f32; 8] = [
+    0.51449576, 0.47173197, 0.31337745, 0.18191320, 0.09457419, 0.04096558, 0.01419856, 0.00369997,
 ];
 
-/// Antialiasing butterfly reduction between adjacent subbands (ISO 11172-3 §2.4.3.4).
-/// Applied to long blocks only, before IMDCT. For mixed blocks, sb_limit=1.
-fn antialias_butterflies(freq: *mut i32, sb_limit: usize) {
+fn antialias_butterflies(freq: *mut f32, nbands: usize) {
+    // nbands = number of butterfly pairs to perform.
+    // Pair n acts on subband seam between subband n and n+1 (lines 17±i, 18+i).
     unsafe {
         let mut sb: usize = 0;
-        while sb < sb_limit {
+        while sb < nbands {
+            let base = sb * 18;
             let mut i: usize = 0;
             while i < 8 {
-                let upper = sb * 18 + 17 - i;
-                let lower = sb * 18 + 18 + i;
-                if lower >= GRANULE_SAMPLES { break; }
-                let a = *freq.add(upper) as i64;
-                let b = *freq.add(lower) as i64;
-                let cs = *ANTIALIAS_CS.as_ptr().add(i) as i64;
-                let ca = *ANTIALIAS_CA.as_ptr().add(i) as i64;
-                let new_a = ((a * cs) >> 15) - ((b * ca) >> 15);
-                let new_b = ((b * cs) >> 15) + ((a * ca) >> 15);
-                *freq.add(upper) = new_a as i32;
-                *freq.add(lower) = new_b as i32;
+                let upper_idx = base + 17 - i;  // d in minimp3
+                let lower_idx = base + 18 + i;  // u in minimp3
+                if lower_idx >= GRANULE_SAMPLES { break; }
+                let u = *freq.add(lower_idx);
+                let d = *freq.add(upper_idx);
+                let cs = *AA_CS.as_ptr().add(i);
+                let ca = *AA_CA.as_ptr().add(i);
+                *freq.add(lower_idx) = u * cs - d * ca;
+                *freq.add(upper_idx) = u * ca + d * cs;
                 i += 1;
             }
             sb += 1;
@@ -761,600 +903,586 @@ fn antialias_butterflies(freq: *mut i32, sb_limit: usize) {
     }
 }
 
-fn process_ms_stereo(freq_lines: *mut i32) {
+// ============================================================================
+// Section 11: IMDCT (long-36 and short-12)
+// ============================================================================
+
+// minimp3 g_twid9
+static G_TWID9: [f32; 18] = [
+    0.73727734, 0.79335334, 0.84339145, 0.88701083, 0.92387953, 0.95371695,
+    0.97629601, 0.99144486, 0.99904822, 0.67559021, 0.60876143, 0.53729961,
+    0.46174861, 0.38268343, 0.30070580, 0.21643961, 0.13052619, 0.04361938,
+];
+
+// minimp3 g_mdct_window[0] = long block window
+static MDCT_WIN_LONG: [f32; 18] = [
+    0.99904822, 0.99144486, 0.97629601, 0.95371695, 0.92387953, 0.88701083,
+    0.84339145, 0.79335334, 0.73727734, 0.04361938, 0.13052619, 0.21643961,
+    0.30070580, 0.38268343, 0.46174861, 0.53729961, 0.60876143, 0.67559021,
+];
+
+// minimp3 g_mdct_window[1] = stop block window (block_type == 3)
+static MDCT_WIN_STOP: [f32; 18] = [
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    0.99144486, 0.92387953, 0.79335334,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.13052619, 0.38268343, 0.60876143,
+];
+
+/// 9-point DCT-III used by IMDCT-36. Mirrors minimp3 L3_dct3_9.
+#[inline]
+fn l3_dct3_9(y: *mut f32) {
     unsafe {
-        let inv_sqrt2: i64 = 23170; // 1/sqrt(2) in Q15
-        let right = freq_lines.add(GRANULE_SAMPLES);
-        let mut i: usize = 0;
-        while i < GRANULE_SAMPLES {
-            let m = *freq_lines.add(i) as i64;
-            let s = *right.add(i) as i64;
-            *freq_lines.add(i) = (((m + s) * inv_sqrt2) >> 15) as i32;
-            *right.add(i) = (((m - s) * inv_sqrt2) >> 15) as i32;
-            i += 1;
-        }
+        let mut s0 = *y.add(0);
+        let s2 = *y.add(2);
+        let mut s4 = *y.add(4);
+        let mut s6 = *y.add(6);
+        let mut s8 = *y.add(8);
+
+        let t0 = s0 + s6 * 0.5;
+        s0 -= s6;
+        let t4 = (s4 + s2) * 0.93969262;
+        let t2 = (s8 + s2) * 0.76604444;
+        s6 = (s4 - s8) * 0.17364818;
+        s4 += s8 - s2;
+
+        let s2_new = s0 - s4 * 0.5;
+        *y.add(4) = s4 + s0;
+        s8 = t0 - t2 + s6;
+        s0 = t0 - t4 + t2;
+        s4 = t0 + t4 - s6;
+
+        let s1 = *y.add(1);
+        let mut s3 = *y.add(3);
+        let s5 = *y.add(5);
+        let s7 = *y.add(7);
+
+        s3 *= 0.86602540;
+        let t0b = (s5 + s1) * 0.98480775;
+        let t4b = (s5 - s7) * 0.34202014;
+        let t2b = (s1 + s7) * 0.64278761;
+        let s1_new = (s1 - s5 - s7) * 0.86602540;
+
+        let s5_new = t0b - s3 - t2b;
+        let s7_new = t4b - s3 - t0b;
+        let s3_new = t4b + s3 - t2b;
+
+        *y.add(0) = s4 - s7_new;
+        *y.add(1) = s2_new + s1_new;
+        *y.add(2) = s0 - s3_new;
+        *y.add(3) = s8 + s5_new;
+        *y.add(5) = s8 - s5_new;
+        *y.add(6) = s0 + s3_new;
+        *y.add(7) = s2_new - s1_new;
+        *y.add(8) = s4 + s7_new;
     }
 }
 
-/// Process intensity stereo (simplified)
-fn process_intensity_stereo(freq_lines: *mut i32, right_big_values: u16) {
+/// IMDCT-36 with overlap-add and windowing. Mirrors minimp3 L3_imdct36.
+fn l3_imdct36(grbuf: *mut f32, overlap: *mut f32, window: *const f32, nbands: usize) {
     unsafe {
-        let is_start = (right_big_values as usize * 2).min(GRANULE_SAMPLES);
-        if is_start >= GRANULE_SAMPLES { return; }
-
-        let left_ptr = freq_lines;
-        let right_ptr = freq_lines.add(GRANULE_SAMPLES);
-        // Use center ratio as default
-        let left_ratio: i64 = 23170;
-        let right_ratio: i64 = 23170;
-
-        let mut i = is_start;
-        while i < GRANULE_SAMPLES {
-            let left_val = *left_ptr.add(i) as i64;
-            *left_ptr.add(i) = ((left_val * left_ratio) >> 15) as i32;
-            *right_ptr.add(i) = ((left_val * right_ratio) >> 15) as i32;
-            i += 1;
-        }
-    }
-}
-
-// ============================================================================
-// Section 7: IMDCT (window tables, imdct_36, imdct_12, process_imdct)
-// ============================================================================
-
-const IMDCT_LONG: usize = 36;
-const IMDCT_SHORT: usize = 12;
-const IMDCT_LONG_IN: usize = 18;
-const IMDCT_SHORT_IN: usize = 6;
-
-// IMDCT via 9-point DCT-III decomposition + twiddle factors
-
-#[inline(always)]
-fn q15_mul_i32(a: i32, b: i16) -> i32 {
-    ((a as i64 * b as i64) >> 15) as i32
-}
-
-static TWID9: [i16; 18] = [
-    24159, 25997, 27636, 29066, 30274, 31251, 31991, 32488, 32737,
-    22138, 19948, 17606, 15131, 12540,  9854,  7092,  4277,  1429,
-];
-
-static MDCT_WIN0: [i16; 18] = [
-    32737, 32488, 31991, 31251, 30274, 29066, 27636, 25997, 24159,
-     1429,  4277,  7092,  9854, 12540, 15131, 17606, 19948, 22138,
-];
-
-static MDCT_WIN1: [i16; 18] = [
-    32767, 32767, 32767, 32767, 32767, 32767, 32488, 30274, 25997,
-        0,     0,     0,     0,     0,     0,  4277, 12540, 19948,
-]; // Note: 1.0 in Q15 is 32768 but clamped to 32767 (i16 max). Error < 0.003%.
-
-const DCT3_HALF: i16 = 16384;
-const DCT3_C1: i16 = 30792;   // 0.93969262
-const DCT3_C2: i16 = 25102;   // 0.76604444
-const DCT3_C3: i16 = 5690;    // 0.17364818
-const DCT3_C4: i16 = 28378;   // 0.86602540
-const DCT3_C5: i16 = 32270;   // 0.98480775
-const DCT3_C6: i16 = 11207;   // 0.34202014
-const DCT3_C7: i16 = 21063;   // 0.64278761
-
-/// 9-point DCT-III (in-place)
-unsafe fn mp3_dct3_9(y: *mut i32) {
-    let mut s0 = *y.add(0);
-    let s2 = *y.add(2);
-    let mut s4 = *y.add(4);
-    let mut s6 = *y.add(6);
-    let mut s8 = *y.add(8);
-
-    let t0 = s0 + q15_mul_i32(s6, DCT3_HALF);
-    s0 = s0 - s6;
-    let t4 = q15_mul_i32(s4 + s2, DCT3_C1);
-    let t2 = q15_mul_i32(s8 + s2, DCT3_C2);
-    s6 = q15_mul_i32(s4 - s8, DCT3_C3);
-    s4 = s4 + s8 - s2;
-    let s2_new = s0 - q15_mul_i32(s4, DCT3_HALF);
-    *y.add(4) = s4 + s0;
-    s8 = t0 - t2 + s6;
-    s0 = t0 - t4 + t2;
-    s4 = t0 + t4 - s6;
-
-    let s1 = *y.add(1);
-    let mut s3 = *y.add(3);
-    let s5 = *y.add(5);
-    let s7 = *y.add(7);
-
-    s3 = q15_mul_i32(s3, DCT3_C4);
-    let t0b = q15_mul_i32(s5 + s1, DCT3_C5);
-    let t4b = q15_mul_i32(s5 - s7, DCT3_C6);
-    let t2b = q15_mul_i32(s1 + s7, DCT3_C7);
-    let s1_new = q15_mul_i32(s1 - s5 - s7, DCT3_C4);
-    let s5_new = t0b - s3 - t2b;
-    let s7_new = t4b - s3 - t0b;
-    let s3_new = t4b + s3 - t2b;
-
-    *y.add(0) = s4 - s7_new;
-    *y.add(1) = s2_new + s1_new;
-    *y.add(2) = s0 - s3_new;
-    *y.add(3) = s8 + s5_new;
-    *y.add(5) = s8 - s5_new;
-    *y.add(6) = s0 + s3_new;
-    *y.add(7) = s2_new - s1_new;
-    *y.add(8) = s4 + s7_new;
-}
-
-/// IMDCT-36 with overlap-add (ISO 11172-3 §2.4.3.4).
-/// grbuf: 18 values per subband (modified in-place to output).
-/// overlap: 9 values per subband (persistent state).
-/// window: 18-entry Q15 window (MDCT_WIN0 or MDCT_WIN1).
-unsafe fn mp3_imdct36(grbuf: *mut i32, overlap: *mut i32, window: *const i16, nbands: usize) {
-    let mut gr = grbuf;
-    let mut ov = overlap;
-    let twid = TWID9.as_ptr();
-
-    let mut j: usize = 0;
-    while j < nbands {
-        let mut co: [i32; 9] = [0; 9];
-        let mut si: [i32; 9] = [0; 9];
-
-        *co.as_mut_ptr().add(0) = -(*gr.add(0));
-        *si.as_mut_ptr().add(0) = *gr.add(17);
-
-        let mut i: usize = 0;
-        while i < 4 {
-            let i4 = i << 2;
-            *si.as_mut_ptr().add(8 - (i << 1)) = *gr.add(i4 + 1) - *gr.add(i4 + 2);
-            *co.as_mut_ptr().add(1 + (i << 1)) = *gr.add(i4 + 1) + *gr.add(i4 + 2);
-            *si.as_mut_ptr().add(7 - (i << 1)) = *gr.add(i4 + 4) - *gr.add(i4 + 3);
-            *co.as_mut_ptr().add(2 + (i << 1)) = -(*gr.add(i4 + 3) + *gr.add(i4 + 4));
-            i += 1;
-        }
-
-        mp3_dct3_9(co.as_mut_ptr());
-        mp3_dct3_9(si.as_mut_ptr());
-
-        let sip = si.as_mut_ptr();
-        *sip.add(1) = -(*sip.add(1));
-        *sip.add(3) = -(*sip.add(3));
-        *sip.add(5) = -(*sip.add(5));
-        *sip.add(7) = -(*sip.add(7));
-
-        let cop = co.as_ptr();
-
-        let mut i: usize = 0;
-        while i < 9 {
-            let ovl = *ov.add(i);
-            let co_i = *cop.add(i);
-            let si_i = *sip.add(i);
-            let tw_cos = *twid.add(9 + i);
-            let tw_sin = *twid.add(i);
-            let win_i = *window.add(i);
-            let win_9i = *window.add(9 + i);
-
-            let sum = q15_mul_i32(co_i, tw_cos) + q15_mul_i32(si_i, tw_sin);
-            *ov.add(i) = q15_mul_i32(co_i, tw_sin) - q15_mul_i32(si_i, tw_cos);
-            *gr.add(i) = q15_mul_i32(ovl, win_i) - q15_mul_i32(sum, win_9i);
-            *gr.add(17 - i) = q15_mul_i32(ovl, win_9i) + q15_mul_i32(sum, win_i);
-            i += 1;
-        }
-
-        gr = gr.add(18);
-        ov = ov.add(9);
-        j += 1;
-    }
-}
-
-// --- Short block IMDCT (ISO 11172-3 §2.4.3.4, 12-point transform) ---
-
-/// Twiddle factors for 12-point IMDCT decomposition (Q15).
-/// [cos0, cos1, cos2, sin0, sin1, sin2] — same values as the short window shape.
-static TWID3: [i16; 6] = [25997, 19948, 4277, 32488, 12540, 30274];
-
-/// 3-point DCT-III (in-place on 3 values).
-unsafe fn mp3_dct3_3(y: *mut i32) {
-    let s0 = *y.add(0);
-    let s1 = *y.add(1);
-    let s2 = *y.add(2);
-    let t0 = s0 + q15_mul_i32(s2, DCT3_HALF);
-    *y.add(0) = t0 + q15_mul_i32(s1, DCT3_C4);
-    *y.add(1) = s0 - s2;
-    *y.add(2) = t0 - q15_mul_i32(s1, DCT3_C4);
-}
-
-/// 12-point IMDCT via 3-point DCT-III decomposition.
-/// Reads 6 frequency values at `stride` from `x`.
-/// Writes 6 time-domain output samples to `dst`.
-/// Reads and updates 3 overlap values at `overlap`.
-unsafe fn mp3_imdct12(x: *const i32, stride: usize, dst: *mut i32, overlap: *mut i32) {
-    let x0 = *x.add(0 * stride);
-    let x1 = *x.add(1 * stride);
-    let x2 = *x.add(2 * stride);
-    let x3 = *x.add(3 * stride);
-    let x4 = *x.add(4 * stride);
-    let x5 = *x.add(5 * stride);
-
-    // Prepare co[3] and si[3] (even/odd decomposition, same pattern as imdct36)
-    let mut co = [0i32; 3];
-    let mut si = [0i32; 3];
-    *co.as_mut_ptr().add(0) = -(x0);
-    *si.as_mut_ptr().add(0) = x5;
-    *si.as_mut_ptr().add(2) = x1 - x2;
-    *co.as_mut_ptr().add(1) = x1 + x2;
-    *si.as_mut_ptr().add(1) = x4 - x3;
-    *co.as_mut_ptr().add(2) = -(x3 + x4);
-
-    // 3-point DCT-III
-    mp3_dct3_3(co.as_mut_ptr());
-    mp3_dct3_3(si.as_mut_ptr());
-
-    // Negate odd si values (DCT-III sign convention)
-    *si.as_mut_ptr().add(1) = -(*si.as_ptr().add(1));
-
-    // Twiddle + window + overlap-add
-    let twid = TWID3.as_ptr();
-    let mut i: usize = 0;
-    while i < 3 {
-        let ovl = *overlap.add(i);
-        let co_i = *co.as_ptr().add(i);
-        let si_i = *si.as_ptr().add(i);
-        let tw_cos = *twid.add(3 + i) as i64;
-        let tw_sin = *twid.add(i) as i64;
-        let win_a = *twid.add(2 - i) as i64;
-        let win_b = *twid.add(5 - i) as i64;
-
-        let sum = ((co_i as i64 * tw_cos) >> 15) as i32
-                + ((si_i as i64 * tw_sin) >> 15) as i32;
-        *overlap.add(i) = ((co_i as i64 * tw_sin) >> 15) as i32
-                        - ((si_i as i64 * tw_cos) >> 15) as i32;
-        *dst.add(i) = ((ovl as i64 * win_a) >> 15) as i32
-                    - ((sum as i64 * win_b) >> 15) as i32;
-        *dst.add(5 - i) = ((ovl as i64 * win_b) >> 15) as i32
-                         + ((sum as i64 * win_a) >> 15) as i32;
-        i += 1;
-    }
-}
-
-/// Short-block IMDCT for all subbands (3 × 12-point windows per subband).
-/// Input must be reordered (window-interleaved at stride 3).
-/// Per-subband overlap layout: [0..5] inter-granule carry, [6..8] inter-window carry.
-unsafe fn mp3_imdct_short(grbuf: *mut i32, overlap: *mut i32, nbands: usize) {
-    let mut gr = grbuf;
-    let mut ov = overlap;
-    let mut j: usize = 0;
-    while j < nbands {
-        // Save input (output overwrites grbuf in-place)
-        let mut tmp = [0i32; 18];
-        let mut i: usize = 0;
-        while i < 18 { *tmp.as_mut_ptr().add(i) = *gr.add(i); i += 1; }
-
-        // Output[0..5] = previous inter-granule overlap
-        i = 0;
-        while i < 6 { *gr.add(i) = *ov.add(i); i += 1; }
-
-        // 3 short windows chain through inter-window overlap (ov[6..8])
-        mp3_imdct12(tmp.as_ptr(),       3, gr.add(6),  ov.add(6)); // win 0 → output[6..11]
-        mp3_imdct12(tmp.as_ptr().add(1), 3, gr.add(12), ov.add(6)); // win 1 → output[12..17]
-        mp3_imdct12(tmp.as_ptr().add(2), 3, ov,         ov.add(6)); // win 2 → overlap[0..5]
-
-        gr = gr.add(18);
-        ov = ov.add(9);
-        j += 1;
-    }
-}
-
-/// Process IMDCT for one granule/channel (ISO 11172-3 §2.4.3.4).
-/// freq_lines: 576 values (32 subbands × 18). Modified in-place to time-domain output.
-/// overlap: 288 values (32 subbands × 9). Persistent state.
-fn process_imdct(
-    freq_lines: *mut i32,
-    overlap: *mut i32,
-    block_type: u8,
-    _mixed_block: bool,
-) {
-    unsafe {
-        if block_type == 2 {
-            // Short blocks: 3 × 12-point IMDCT per subband
-            mp3_imdct_short(freq_lines, overlap, SUBBANDS);
-        } else if block_type == 3 {
-            // Stop block
-            mp3_imdct36(freq_lines, overlap, MDCT_WIN1.as_ptr(), SUBBANDS);
-        } else if block_type == 1 {
-            // Start block — use WIN1 reversed? For now use WIN0
-            mp3_imdct36(freq_lines, overlap, MDCT_WIN0.as_ptr(), SUBBANDS);
-        } else {
-            // Long blocks (normal)
-            mp3_imdct36(freq_lines, overlap, MDCT_WIN0.as_ptr(), SUBBANDS);
-        }
-    }
-}
-
-// Precomputed IMDCT-36 cosines: cos(π/72 × (2n+19) × (2k+1)), indexed [n*18+k]
-#[rustfmt::skip]
-static IMDCT_COS_36: [i16; 648] = [
-    22138,-25997,-17606,29066,12540,-31251,-7092,32488,1429,-32737,4277,31991,-9854,-30274,15131,27636,-19948,-24159,
-    19948,-30274,-4277,32488,-12540,-25997,25997,12540,-32488,4277,30274,-19948,-19948,30274,4277,-32488,12540,25997,
-    17606,-32488,9854,24159,-30274,1429,29066,-25997,-7092,31991,-19948,-15131,32737,-12540,-22138,31251,-4277,-27636,
-    15131,-32488,22138,7092,-30274,27636,-1429,-25997,31251,-9854,-19948,32737,-17606,-12540,31991,-24159,-4277,29066,
-    12540,-30274,30274,-12540,-12540,30274,-30274,12540,12540,-30274,30274,-12540,-12540,30274,-30274,12540,12540,-30274,
-    9854,-25997,32737,-27636,12540,7092,-24159,32488,-29066,15131,4277,-22138,31991,-30274,17606,1429,-19948,31251,
-    7092,-19948,29066,-32737,30274,-22138,9854,4277,-17606,27636,-32488,31251,-24159,12540,1429,-15131,25997,-31991,
-    4277,-12540,19948,-25997,30274,-32488,32488,-30274,25997,-19948,12540,-4277,-4277,12540,-19948,25997,-30274,32488,
-    1429,-4277,7092,-9854,12540,-15131,17606,-19948,22138,-24159,25997,-27636,29066,-30274,31251,-31991,32488,-32737,
-    -1429,4277,-7092,9854,-12540,15131,-17606,19948,-22138,24159,-25997,27636,-29066,30274,-31251,31991,-32488,32737,
-    -4277,12540,-19948,25997,-30274,32488,-32488,30274,-25997,19948,-12540,4277,4277,-12540,19948,-25997,30274,-32488,
-    -7092,19948,-29066,32737,-30274,22138,-9854,-4277,17606,-27636,32488,-31251,24159,-12540,-1429,15131,-25997,31991,
-    -9854,25997,-32737,27636,-12540,-7092,24159,-32488,29066,-15131,-4277,22138,-31991,30274,-17606,-1429,19948,-31251,
-    -12540,30274,-30274,12540,12540,-30274,30274,-12540,-12540,30274,-30274,12540,12540,-30274,30274,-12540,-12540,30274,
-    -15131,32488,-22138,-7092,30274,-27636,1429,25997,-31251,9854,19948,-32737,17606,12540,-31991,24159,4277,-29066,
-    -17606,32488,-9854,-24159,30274,-1429,-29066,25997,7092,-31991,19948,15131,-32737,12540,22138,-31251,4277,27636,
-    -19948,30274,4277,-32488,12540,25997,-25997,-12540,32488,-4277,-30274,19948,19948,-30274,-4277,32488,-12540,-25997,
-    -22138,25997,17606,-29066,-12540,31251,7092,-32488,-1429,32737,-4277,-31991,9854,30274,-15131,-27636,19948,24159,
-    -24159,19948,27636,-15131,-30274,9854,31991,-4277,-32737,-1429,32488,7092,-31251,-12540,29066,17606,-25997,-22138,
-    -25997,12540,32488,4277,-30274,-19948,19948,30274,-4277,-32488,-12540,25997,25997,-12540,-32488,-4277,30274,19948,
-    -27636,4277,31251,22138,-12540,-32737,-15131,19948,31991,7092,-25997,-29066,1429,30274,24159,-9854,-32488,-17606,
-    -29066,-4277,24159,31991,12540,-17606,-32737,-19948,9854,31251,25997,-1429,-27636,-30274,-7092,22138,32488,15131,
-    -30274,-12540,12540,30274,30274,12540,-12540,-30274,-30274,-12540,12540,30274,30274,12540,-12540,-30274,-30274,-12540,
-    -31251,-19948,-1429,17606,30274,31991,22138,4277,-15131,-29066,-32488,-24159,-7092,12540,27636,32737,25997,9854,
-    -31991,-25997,-15131,-1429,12540,24159,31251,32488,27636,17606,4277,-9854,-22138,-30274,-32737,-29066,-19948,-7092,
-    -32488,-30274,-25997,-19948,-12540,-4277,4277,12540,19948,25997,30274,32488,32488,30274,25997,19948,12540,4277,
-    -32737,-32488,-31991,-31251,-30274,-29066,-27636,-25997,-24159,-22138,-19948,-17606,-15131,-12540,-9854,-7092,-4277,-1429,
-    -32737,-32488,-31991,-31251,-30274,-29066,-27636,-25997,-24159,-22138,-19948,-17606,-15131,-12540,-9854,-7092,-4277,-1429,
-    -32488,-30274,-25997,-19948,-12540,-4277,4277,12540,19948,25997,30274,32488,32488,30274,25997,19948,12540,4277,
-    -31991,-25997,-15131,-1429,12540,24159,31251,32488,27636,17606,4277,-9854,-22138,-30274,-32737,-29066,-19948,-7092,
-    -31251,-19948,-1429,17606,30274,31991,22138,4277,-15131,-29066,-32488,-24159,-7092,12540,27636,32737,25997,9854,
-    -30274,-12540,12540,30274,30274,12540,-12540,-30274,-30274,-12540,12540,30274,30274,12540,-12540,-30274,-30274,-12540,
-    -29066,-4277,24159,31991,12540,-17606,-32737,-19948,9854,31251,25997,-1429,-27636,-30274,-7092,22138,32488,15131,
-    -27636,4277,31251,22138,-12540,-32737,-15131,19948,31991,7092,-25997,-29066,1429,30274,24159,-9854,-32488,-17606,
-    -25997,12540,32488,4277,-30274,-19948,19948,30274,-4277,-32488,-12540,25997,25997,-12540,-32488,-4277,30274,19948,
-    -24159,19948,27636,-15131,-30274,9854,31991,-4277,-32737,-1429,32488,7092,-31251,-12540,29066,17606,-25997,-22138,
-];
-
-fn imdct_cos_36(n: usize, k: usize) -> i16 {
-    unsafe { *IMDCT_COS_36.as_ptr().add(n * 18 + k) }
-}
-
-// ============================================================================
-// Section 8: Synthesis filterbank (ISO 11172-3 §2.4.3.5)
-// ============================================================================
-
-/// g_sec[24] in Q12 for DCT-II butterfly
-static G_SEC: [i32; 24] = [
-    41738,  2051,  2058, 13955,  2071,  2141,
-     8429,  2112,  2322,  6079,  2176,  2650,
-     4790,  2266,  3228,  3984,  2388,  4344,
-     3439,  2550,  7056,  3050,  2764, 20898,
-];
-
-/// g_win[240] — synthesis window coefficients (integer, no Q scaling)
-#[rustfmt::skip]
-static G_WIN: [i32; 240] = [
-    -1,26,-31,208,218,401,-519,2063,2000,4788,-5517,7134,5959,35640,-39336,74992,
-    -1,24,-35,202,222,347,-581,2080,1952,4425,-5879,7640,5288,33791,-41176,74856,
-    -1,21,-38,196,225,294,-645,2087,1893,4063,-6237,8092,4561,31947,-43006,74630,
-    -1,19,-41,190,227,244,-711,2085,1822,3705,-6589,8492,3776,30112,-44821,74313,
-    -1,17,-45,183,228,197,-779,2075,1739,3351,-6935,8840,2935,28289,-46617,73908,
-    -1,16,-49,176,228,153,-848,2057,1644,3004,-7271,9139,2037,26482,-48390,73415,
-    -2,14,-53,169,227,111,-919,2032,1535,2663,-7597,9389,1082,24694,-50137,72835,
-    -2,13,-58,161,224,72,-991,2001,1414,2330,-7910,9592,70,22929,-51853,72169,
-    -2,11,-63,154,221,36,-1064,1962,1280,2006,-8209,9750,-998,21189,-53534,71420,
-    -2,10,-68,147,215,2,-1137,1919,1131,1692,-8491,9863,-2122,19478,-55178,70590,
-    -3,9,-73,139,208,-29,-1210,1870,970,1388,-8755,9935,-3300,17799,-56778,69679,
-    -3,8,-79,132,200,-57,-1283,1817,794,1095,-8998,9966,-4533,16155,-58333,68692,
-    -4,7,-85,125,189,-83,-1356,1759,605,814,-9219,9959,-5818,14548,-59838,67629,
-    -4,7,-91,117,177,-106,-1428,1698,402,545,-9416,9916,-7154,12980,-61289,66494,
-    -5,6,-97,111,163,-127,-1498,1634,185,288,-9585,9838,-8540,11455,-62684,65290,
-];
-
-const DCT_INV_SQRT2: i32 = 23170;
-const DCT_B0: i32 = 6518;
-const DCT_B1: i32 = 12540;
-const DCT_S1: i32 = 16703;
-const DCT_S2: i32 = 17734;
-const DCT_S3: i32 = 19705;
-const DCT_S5: i32 = 29491;
-const DCT_S6: i32 = 42813;
-const DCT_S7: i32 = 83982;
-
-#[inline(always)]
-fn mul_q12(a: i32, b: i32) -> i32 { ((a as i64 * b as i64) >> 12) as i32 }
-#[inline(always)]
-fn mul_q15_i32(a: i32, b: i32) -> i32 { ((a as i64 * b as i64) >> 15) as i32 }
-#[inline(always)]
-/// Convert synthesis i64 accumulator to i16 PCM.
-/// `shift` = 15 - norm_shift: compensates for the per-granule normalization
-/// applied in requantize. When norm_shift=0 (quiet frames), shift=15.
-/// When norm_shift>0 (loud frames), shift<15 so the synthesis output is
-/// amplified to restore correct level — all in i64 space, no overflow possible.
-#[inline(always)]
-fn mp3d_scale_pcm(a: i64, shift: u32) -> i16 {
-    clamp_i16(a >> shift)
-}
-
-/// In-place DCT-II on granule buffer (32-subband polyphase analysis)
-unsafe fn mp3d_dct_ii(grbuf: *mut i32, n: usize) {
-    let mut t: [i32; 32] = [0i32; 32];
-    let mut k: usize = 0;
-    while k < n {
-        let y = grbuf.add(k);
-        let x = t.as_mut_ptr();
-        let mut i: usize = 0;
-        while i < 8 {
-            let x0 = *y.add(i * 18);
-            let x1 = *y.add((15 - i) * 18);
-            let x2 = *y.add((16 + i) * 18);
-            let x3 = *y.add((31 - i) * 18);
-            let t0 = x0.saturating_add(x3);
-            let t1 = x1.saturating_add(x2);
-            let sp = G_SEC.as_ptr().add(3 * i);
-            let t2 = mul_q12(x1.saturating_sub(x2), *sp);
-            let t3 = mul_q12(x0.saturating_sub(x3), *sp.add(1));
-            *x.add(i) = t0.saturating_add(t1);
-            *x.add(i + 8) = mul_q12(t0.saturating_sub(t1), *sp.add(2));
-            *x.add(i + 16) = t3.saturating_add(t2);
-            *x.add(i + 24) = mul_q12(t3.saturating_sub(t2), *sp.add(2));
-            i += 1;
-        }
+        let mut gr = grbuf;
+        let mut ov = overlap;
         let mut j: usize = 0;
-        while j < 4 {
-            let xp = x.add(j * 8);
-            let mut x0=*xp; let mut x1=*xp.add(1); let mut x2=*xp.add(2); let mut x3=*xp.add(3);
-            let mut x4=*xp.add(4); let mut x5=*xp.add(5); let mut x6=*xp.add(6); let mut x7=*xp.add(7);
-            let mut xt: i32;
-            xt=x0.saturating_sub(x7); x0=x0.saturating_add(x7);
-            x7=x1.saturating_sub(x6); x1=x1.saturating_add(x6);
-            x6=x2.saturating_sub(x5); x2=x2.saturating_add(x5);
-            x5=x3.saturating_sub(x4); x3=x3.saturating_add(x4);
-            x4=x0.saturating_sub(x3); x0=x0.saturating_add(x3);
-            x3=x1.saturating_sub(x2); x1=x1.saturating_add(x2);
-            *xp = x0.saturating_add(x1);
-            *xp.add(4) = mul_q15_i32(x0.saturating_sub(x1), DCT_INV_SQRT2);
-            x5=x5.saturating_add(x6); x6=mul_q15_i32(x6.saturating_add(x7), DCT_INV_SQRT2); x7=x7.saturating_add(xt);
-            x3=mul_q15_i32(x3.saturating_add(x4), DCT_INV_SQRT2);
-            x5=x5.saturating_sub(mul_q15_i32(x7, DCT_B0)); x7=x7.saturating_add(mul_q15_i32(x5, DCT_B1)); x5=x5.saturating_sub(mul_q15_i32(x7, DCT_B0));
-            x0=xt.saturating_sub(x6); xt=xt.saturating_add(x6);
-            *xp.add(1)=mul_q15_i32(xt.saturating_add(x7),DCT_S1); *xp.add(2)=mul_q15_i32(x4.saturating_add(x3),DCT_S2);
-            *xp.add(3)=mul_q15_i32(x0.saturating_sub(x5),DCT_S3); *xp.add(5)=mul_q15_i32(x0.saturating_add(x5),DCT_S5);
-            *xp.add(6)=mul_q15_i32(x4.saturating_sub(x3),DCT_S6); *xp.add(7)=mul_q15_i32(xt.saturating_sub(x7),DCT_S7);
+        while j < nbands {
+            let mut co = [0f32; 9];
+            let mut si = [0f32; 9];
+
+            *co.as_mut_ptr().add(0) = -(*gr.add(0));
+            *si.as_mut_ptr().add(0) = *gr.add(17);
+            let mut i: usize = 0;
+            while i < 4 {
+                let i4 = i << 2;
+                *si.as_mut_ptr().add(8 - (i << 1)) = *gr.add(i4 + 1) - *gr.add(i4 + 2);
+                *co.as_mut_ptr().add(1 + (i << 1)) = *gr.add(i4 + 1) + *gr.add(i4 + 2);
+                *si.as_mut_ptr().add(7 - (i << 1)) = *gr.add(i4 + 4) - *gr.add(i4 + 3);
+                *co.as_mut_ptr().add(2 + (i << 1)) = -(*gr.add(i4 + 3) + *gr.add(i4 + 4));
+                i += 1;
+            }
+
+            l3_dct3_9(co.as_mut_ptr());
+            l3_dct3_9(si.as_mut_ptr());
+
+            *si.as_mut_ptr().add(1) = -*si.as_ptr().add(1);
+            *si.as_mut_ptr().add(3) = -*si.as_ptr().add(3);
+            *si.as_mut_ptr().add(5) = -*si.as_ptr().add(5);
+            *si.as_mut_ptr().add(7) = -*si.as_ptr().add(7);
+
+            let twid = G_TWID9.as_ptr();
+            let mut i: usize = 0;
+            while i < 9 {
+                let ovl = *ov.add(i);
+                let co_i = *co.as_ptr().add(i);
+                let si_i = *si.as_ptr().add(i);
+                let sum = co_i * *twid.add(9 + i) + si_i * *twid.add(i);
+                *ov.add(i) = co_i * *twid.add(i) - si_i * *twid.add(9 + i);
+                *gr.add(i)        = ovl * *window.add(i)         - sum * *window.add(9 + i);
+                *gr.add(17 - i)   = ovl * *window.add(9 + i)     + sum * *window.add(i);
+                i += 1;
+            }
+
+            gr = gr.add(18);
+            ov = ov.add(9);
             j += 1;
         }
-        let mut yp = y;
+    }
+}
+
+/// 3-point IDCT used by IMDCT-12 (mirrors minimp3 L3_idct3).
+#[inline]
+fn l3_idct3(x0: f32, x1: f32, x2: f32, dst: *mut f32) {
+    unsafe {
+        let m1 = x1 * 0.86602540;
+        let a1 = x0 - x2 * 0.5;
+        *dst.add(1) = x0 + x2;
+        *dst.add(0) = a1 + m1;
+        *dst.add(2) = a1 - m1;
+    }
+}
+
+/// IMDCT-12 (one short window). Mirrors minimp3 L3_imdct12. Reads spectral
+/// values at indices 0,3,6,9,12,15 (stride 3) of x and writes 6 output samples.
+fn l3_imdct12(x: *const f32, dst: *mut f32, overlap: *mut f32) {
+    unsafe {
+        // minimp3 g_twid3 = {0.79335334, 0.92387953, 0.99144486, 0.60876143, 0.38268343, 0.13052619}
+        const TW0: f32 = 0.79335334;
+        const TW1: f32 = 0.92387953;
+        const TW2: f32 = 0.99144486;
+        const TW3: f32 = 0.60876143;
+        const TW4: f32 = 0.38268343;
+        const TW5: f32 = 0.13052619;
+
+        let mut co = [0f32; 3];
+        let mut si = [0f32; 3];
+
+        l3_idct3(-*x.add(0), *x.add(6) + *x.add(3), *x.add(12) + *x.add(9), co.as_mut_ptr());
+        l3_idct3(*x.add(15), *x.add(12) - *x.add(9), *x.add(6) - *x.add(3), si.as_mut_ptr());
+        *si.as_mut_ptr().add(1) = -*si.as_ptr().add(1);
+
+        let twid = [TW0, TW1, TW2, TW3, TW4, TW5];
         let mut i: usize = 0;
-        while i < 7 {
-            *yp.add(0*18)=*x.add(i);
-            *yp.add(1*18)=(*x.add(16+i)).saturating_add(*x.add(24+i)).saturating_add(*x.add(24+i+1));
-            *yp.add(2*18)=(*x.add(8+i)).saturating_add(*x.add(8+i+1));
-            *yp.add(3*18)=(*x.add(16+i+1)).saturating_add(*x.add(24+i)).saturating_add(*x.add(24+i+1));
-            yp = yp.add(4 * 18);
+        while i < 3 {
+            let ovl = *overlap.add(i);
+            let co_i = *co.as_ptr().add(i);
+            let si_i = *si.as_ptr().add(i);
+            let sum = co_i * *twid.as_ptr().add(3 + i) + si_i * *twid.as_ptr().add(i);
+            *overlap.add(i) = co_i * *twid.as_ptr().add(i) - si_i * *twid.as_ptr().add(3 + i);
+            *dst.add(i)     = ovl * *twid.as_ptr().add(2 - i) - sum * *twid.as_ptr().add(5 - i);
+            *dst.add(5 - i) = ovl * *twid.as_ptr().add(5 - i) + sum * *twid.as_ptr().add(2 - i);
             i += 1;
         }
-        *yp.add(0*18)=*x.add(7);
-        *yp.add(1*18)=(*x.add(16+7)).saturating_add(*x.add(24+7));
-        *yp.add(2*18)=*x.add(8+7);
-        *yp.add(3*18)=*x.add(24+7);
-        k += 1;
     }
 }
 
-unsafe fn mp3d_synth_pair(pcm: *mut i16, nch: usize, z: *const i32, shift: u32) {
-    let mut a: i64;
-    a  = (*z.add(14*64) as i64 - *z.add(0) as i64) * 29;
-    a += (*z.add(1*64) as i64 + *z.add(13*64) as i64) * 213;
-    a += (*z.add(12*64) as i64 - *z.add(2*64) as i64) * 459;
-    a += (*z.add(3*64) as i64 + *z.add(11*64) as i64) * 2037;
-    a += (*z.add(10*64) as i64 - *z.add(4*64) as i64) * 5153;
-    a += (*z.add(5*64) as i64 + *z.add(9*64) as i64) * 6574;
-    a += (*z.add(8*64) as i64 - *z.add(6*64) as i64) * 37489;
-    a += *z.add(7*64) as i64 * 75038;
-    *pcm = mp3d_scale_pcm(a, shift);
-    let z2 = z.add(2);
-    a  = *z2.add(14*64) as i64 * 104;
-    a += *z2.add(12*64) as i64 * 1567;
-    a += *z2.add(10*64) as i64 * 9727;
-    a += *z2.add(8*64) as i64 * 64019;
-    a += *z2.add(6*64) as i64 * -9975;
-    a += *z2.add(4*64) as i64 * -45;
-    a += *z2.add(2*64) as i64 * 146;
-    a += *z2.add(0*64) as i64 * -5;
-    *pcm.add(16 * nch) = mp3d_scale_pcm(a, shift);
-}
-
-unsafe fn mp3d_synth(xl: *mut i32, dstl: *mut i16, nch: usize, lins: *mut i32, shift: u32) {
-    let xr = xl.add(576 * (nch - 1));
-    let dstr = dstl.add(nch - 1);
-    let zlin = lins.add(15 * 64);
-    let w = G_WIN.as_ptr();
-
-    *zlin.add(4*15) = *xl.add(18*16); *zlin.add(4*15+1) = *xr.add(18*16);
-    *zlin.add(4*15+2) = *xl; *zlin.add(4*15+3) = *xr;
-    *zlin.add(4*31) = *xl.add(1+18*16); *zlin.add(4*31+1) = *xr.add(1+18*16);
-    *zlin.add(4*31+2) = *xl.add(1); *zlin.add(4*31+3) = *xr.add(1);
-
-    mp3d_synth_pair(dstr, nch, lins.add(4*15+1), shift);
-    mp3d_synth_pair(dstr.add(32*nch), nch, lins.add(4*15+64+1), shift);
-    mp3d_synth_pair(dstl, nch, lins.add(4*15), shift);
-    mp3d_synth_pair(dstl.add(32*nch), nch, lins.add(4*15+64), shift);
-
-    let mut i: isize = 14;
-    while i >= 0 {
-        let iu = i as usize;
-        *zlin.add(4*iu) = *xl.add(18*(31-iu)); *zlin.add(4*iu+1) = *xr.add(18*(31-iu));
-        *zlin.add(4*iu+2) = *xl.add(1+18*(31-iu)); *zlin.add(4*iu+3) = *xr.add(1+18*(31-iu));
-        *zlin.add(4*(iu+16)) = *xl.add(1+18*(1+iu)); *zlin.add(4*(iu+16)+1) = *xr.add(1+18*(1+iu));
-        let neg_off = zlin.offset(4*(i-16)+2);
-        *neg_off = *xl.add(18*(1+iu)); *neg_off.add(1) = *xr.add(18*(1+iu));
-
-        let mut a: [i64; 4] = [0; 4];
-        let mut b: [i64; 4] = [0; 4];
-        let wp = w.add((14 - iu) * 16);
-        let mut kk: usize = 0;
-        while kk < 8 {
-            let w0 = *wp.add(kk * 2) as i64;
-            let w1 = *wp.add(kk * 2 + 1) as i64;
-            let vz = zlin.offset(4*i - (kk as isize)*64);
-            let vy = zlin.offset(4*i - (15 - kk as isize)*64);
-            let mut jj: usize = 0;
-            while jj < 4 {
-                let vzj = *vz.add(jj) as i64;
-                let vyj = *vy.add(jj) as i64;
-                let bterm = vzj * w1 + vyj * w0;
-                if kk == 0 {
-                    *b.as_mut_ptr().add(jj) = bterm;
-                    *a.as_mut_ptr().add(jj) = vzj * w0 - vyj * w1;
-                } else if (kk & 1) == 1 {
-                    *b.as_mut_ptr().add(jj) += bterm;
-                    *a.as_mut_ptr().add(jj) += vyj * w1 - vzj * w0;
-                } else {
-                    *b.as_mut_ptr().add(jj) += bterm;
-                    *a.as_mut_ptr().add(jj) += vzj * w0 - vyj * w1;
-                }
-                jj += 1;
-            }
-            kk += 1;
+/// IMDCT short for `nbands` subbands. Mirrors minimp3 L3_imdct_short.
+fn l3_imdct_short(grbuf: *mut f32, overlap: *mut f32, nbands: usize) {
+    unsafe {
+        let mut gr = grbuf;
+        let mut ov = overlap;
+        let mut j: usize = 0;
+        while j < nbands {
+            let mut tmp = [0f32; 18];
+            let mut i: usize = 0;
+            while i < 18 { *tmp.as_mut_ptr().add(i) = *gr.add(i); i += 1; }
+            // First 6 dst samples are taken from previous granule's overlap[0..5]
+            i = 0;
+            while i < 6 { *gr.add(i) = *ov.add(i); i += 1; }
+            // Three short windows chain through inter-window overlap (ov[6..8]).
+            l3_imdct12(tmp.as_ptr(),         gr.add(6),  ov.add(6));
+            l3_imdct12(tmp.as_ptr().add(1),  gr.add(12), ov.add(6));
+            l3_imdct12(tmp.as_ptr().add(2),  ov,         ov.add(6));
+            gr = gr.add(18);
+            ov = ov.add(9);
+            j += 1;
         }
-        *dstr.add((15-iu)*nch) = mp3d_scale_pcm(*a.as_ptr().add(1), shift);
-        *dstr.add((17+iu)*nch) = mp3d_scale_pcm(*b.as_ptr().add(1), shift);
-        *dstl.add((15-iu)*nch) = mp3d_scale_pcm(*a.as_ptr().add(0), shift);
-        *dstl.add((17+iu)*nch) = mp3d_scale_pcm(*b.as_ptr().add(0), shift);
-        *dstr.add((47-iu)*nch) = mp3d_scale_pcm(*a.as_ptr().add(3), shift);
-        *dstr.add((49+iu)*nch) = mp3d_scale_pcm(*b.as_ptr().add(3), shift);
-        *dstl.add((47-iu)*nch) = mp3d_scale_pcm(*a.as_ptr().add(2), shift);
-        *dstl.add((49+iu)*nch) = mp3d_scale_pcm(*b.as_ptr().add(2), shift);
-        i -= 1;
     }
 }
 
-/// Full granule synthesis for mono or stereo.
-/// grbuf: 576 values for ch0, followed by 576 for ch1 if nch==2 (contiguous).
-/// pcm: interleaved output (L,R,L,R... for stereo; mono samples for nch=1).
-unsafe fn mp3d_synth_granule(
-    qmf_state: *mut i32,
-    grbuf: *mut i32,
+/// Apply IMDCT to one granule (mirrors minimp3 L3_imdct_gr). Long bands first,
+/// then short for short/mixed.
+fn process_imdct(freq: *mut f32, overlap: *mut f32, block_type: u8, n_long_bands: usize) {
+    unsafe {
+        if n_long_bands > 0 {
+            l3_imdct36(freq, overlap, MDCT_WIN_LONG.as_ptr(), n_long_bands);
+        }
+        let remaining = SUBBANDS - n_long_bands;
+        if remaining == 0 { return; }
+        let gr2 = freq.add(18 * n_long_bands);
+        let ov2 = overlap.add(9 * n_long_bands);
+        if block_type == 2 {
+            l3_imdct_short(gr2, ov2, remaining);
+        } else if block_type == 3 {
+            l3_imdct36(gr2, ov2, MDCT_WIN_STOP.as_ptr(), remaining);
+        } else {
+            // block_type 0 or 1 (start). Both use the long window.
+            l3_imdct36(gr2, ov2, MDCT_WIN_LONG.as_ptr(), remaining);
+        }
+    }
+}
+
+/// L3_change_sign — negate every other sample of every other band, starting
+/// from band 1 sample 1. Required by the polyphase synthesis filterbank.
+fn l3_change_sign(grbuf: *mut f32) {
+    unsafe {
+        let mut b: usize = 1;
+        while b < 32 {
+            let base = b * 18;
+            let mut i: usize = 1;
+            while i < 18 {
+                *grbuf.add(base + i) = -*grbuf.add(base + i);
+                i += 2;
+            }
+            b += 2;
+        }
+    }
+}
+
+// ============================================================================
+// Section 12: Synthesis filterbank (mirrors minimp3 mp3d_DCT_II / mp3d_synth*)
+// ============================================================================
+
+static G_SEC: [f32; 24] = [
+    10.19000816, 0.50060302, 0.50241929, 3.40760851, 0.50547093, 0.52249861,
+    2.05778098,  0.51544732, 0.56694406, 1.48416460, 0.53104258, 0.64682180,
+    1.16943991,  0.55310392, 0.78815460, 0.97256821, 0.58293498, 1.06067765,
+    0.83934963,  0.62250412, 1.72244716, 0.74453628, 0.67480832, 5.10114861,
+];
+
+#[rustfmt::skip]
+static G_WIN_SYNTH: [f32; 240] = [
+    -1.0,26.0,-31.0,208.0,218.0,401.0,-519.0,2063.0,2000.0,4788.0,-5517.0,7134.0,5959.0,35640.0,-39336.0,74992.0,
+    -1.0,24.0,-35.0,202.0,222.0,347.0,-581.0,2080.0,1952.0,4425.0,-5879.0,7640.0,5288.0,33791.0,-41176.0,74856.0,
+    -1.0,21.0,-38.0,196.0,225.0,294.0,-645.0,2087.0,1893.0,4063.0,-6237.0,8092.0,4561.0,31947.0,-43006.0,74630.0,
+    -1.0,19.0,-41.0,190.0,227.0,244.0,-711.0,2085.0,1822.0,3705.0,-6589.0,8492.0,3776.0,30112.0,-44821.0,74313.0,
+    -1.0,17.0,-45.0,183.0,228.0,197.0,-779.0,2075.0,1739.0,3351.0,-6935.0,8840.0,2935.0,28289.0,-46617.0,73908.0,
+    -1.0,16.0,-49.0,176.0,228.0,153.0,-848.0,2057.0,1644.0,3004.0,-7271.0,9139.0,2037.0,26482.0,-48390.0,73415.0,
+    -2.0,14.0,-53.0,169.0,227.0,111.0,-919.0,2032.0,1535.0,2663.0,-7597.0,9389.0,1082.0,24694.0,-50137.0,72835.0,
+    -2.0,13.0,-58.0,161.0,224.0,72.0,-991.0,2001.0,1414.0,2330.0,-7910.0,9592.0,70.0,22929.0,-51853.0,72169.0,
+    -2.0,11.0,-63.0,154.0,221.0,36.0,-1064.0,1962.0,1280.0,2006.0,-8209.0,9750.0,-998.0,21189.0,-53534.0,71420.0,
+    -2.0,10.0,-68.0,147.0,215.0,2.0,-1137.0,1919.0,1131.0,1692.0,-8491.0,9863.0,-2122.0,19478.0,-55178.0,70590.0,
+    -3.0,9.0,-73.0,139.0,208.0,-29.0,-1210.0,1870.0,970.0,1388.0,-8755.0,9935.0,-3300.0,17799.0,-56778.0,69679.0,
+    -3.0,8.0,-79.0,132.0,200.0,-57.0,-1283.0,1817.0,794.0,1095.0,-8998.0,9966.0,-4533.0,16155.0,-58333.0,68692.0,
+    -4.0,7.0,-85.0,125.0,189.0,-83.0,-1356.0,1759.0,605.0,814.0,-9219.0,9959.0,-5818.0,14548.0,-59838.0,67629.0,
+    -4.0,7.0,-91.0,117.0,177.0,-106.0,-1428.0,1698.0,402.0,545.0,-9416.0,9916.0,-7154.0,12980.0,-61289.0,66494.0,
+    -5.0,6.0,-97.0,111.0,163.0,-127.0,-1498.0,1634.0,185.0,288.0,-9585.0,9838.0,-8540.0,11455.0,-62684.0,65290.0,
+];
+
+/// DCT-II on grbuf (in-place). Mirrors minimp3 mp3d_DCT_II non-SIMD path.
+fn mp3d_dct_ii(grbuf: *mut f32, n: usize) {
+    unsafe {
+        let mut k: usize = 0;
+        while k < n {
+            let y = grbuf.add(k);
+            // t is [4][8]: 4 rows × 8 cols of f32 (after restructure).
+            let mut t = [[0f32; 8]; 4];
+
+            let mut i: usize = 0;
+            while i < 8 {
+                let x0 = *y.add(i * 18);
+                let x1 = *y.add((15 - i) * 18);
+                let x2 = *y.add((16 + i) * 18);
+                let x3 = *y.add((31 - i) * 18);
+                let t0 = x0 + x3;
+                let t1 = x1 + x2;
+                let t2 = (x1 - x2) * *G_SEC.as_ptr().add(3 * i + 0);
+                let t3 = (x0 - x3) * *G_SEC.as_ptr().add(3 * i + 1);
+                t[0][i] = t0 + t1;
+                t[1][i] = (t0 - t1) * *G_SEC.as_ptr().add(3 * i + 2);
+                t[2][i] = t3 + t2;
+                t[3][i] = (t3 - t2) * *G_SEC.as_ptr().add(3 * i + 2);
+                i += 1;
+            }
+
+            // 4 rounds of butterflies, one per row "block" of 8 values.
+            let mut row: usize = 0;
+            while row < 4 {
+                let x = &mut t[row];
+                let mut x0 = x[0]; let mut x1 = x[1]; let mut x2 = x[2]; let mut x3 = x[3];
+                let mut x4 = x[4]; let mut x5 = x[5]; let mut x6 = x[6]; let mut x7 = x[7];
+                let mut xt;
+                xt = x0 - x7; x0 += x7;
+                x7 = x1 - x6; x1 += x6;
+                x6 = x2 - x5; x2 += x5;
+                x5 = x3 - x4; x3 += x4;
+                x4 = x0 - x3; x0 += x3;
+                x3 = x1 - x2; x1 += x2;
+                x[0] = x0 + x1;
+                x[4] = (x0 - x1) * 0.70710677;
+                x5 = x5 + x6;
+                x6 = (x6 + x7) * 0.70710677;
+                x7 = x7 + xt;
+                x3 = (x3 + x4) * 0.70710677;
+                x5 = x5 - x7 * 0.198912367; // rotate by PI/8
+                x7 = x7 + x5 * 0.382683432;
+                x5 = x5 - x7 * 0.198912367;
+                let x0b = xt - x6;
+                xt = xt + x6;
+                x[1] = (xt + x7) * 0.50979561;
+                x[2] = (x4 + x3) * 0.54119611;
+                x[3] = (x0b - x5) * 0.60134488;
+                x[5] = (x0b + x5) * 0.89997619;
+                x[6] = (x4 - x3) * 1.30656302;
+                x[7] = (xt - x7) * 2.56291556;
+                row += 1;
+            }
+
+            // Write back in the bit-reversed layout minimp3 uses.
+            let mut yp = y;
+            let mut i: usize = 0;
+            while i < 7 {
+                *yp.add(0 * 18) = t[0][i];
+                *yp.add(1 * 18) = t[2][i] + t[3][i] + t[3][i + 1];
+                *yp.add(2 * 18) = t[1][i] + t[1][i + 1];
+                *yp.add(3 * 18) = t[2][i + 1] + t[3][i] + t[3][i + 1];
+                yp = yp.add(4 * 18);
+                i += 1;
+            }
+            *yp.add(0 * 18) = t[0][7];
+            *yp.add(1 * 18) = t[2][7] + t[3][7];
+            *yp.add(2 * 18) = t[1][7];
+            *yp.add(3 * 18) = t[3][7];
+
+            k += 1;
+        }
+    }
+}
+
+#[inline]
+fn mp3d_scale_pcm(sample: f32) -> i16 {
+    // minimp3 "away from zero" rounding to int16.
+    if sample >= 32766.5 { return 32767; }
+    if sample <= -32767.5 { return -32768; }
+    let s = (sample + 0.5) as i32;
+    // minimp3 does `s -= (s < 0)` — only subtract from values already
+    // truncated to a negative int, not based on the float sign.
+    let s = if s < 0 { s - 1 } else { s };
+    s as i16
+}
+
+fn mp3d_synth_pair(pcm: *mut i16, nch: usize, z: *const f32) {
+    unsafe {
+        let mut a: f32;
+        a  = (*z.add(14 * 64) - *z.add(0))             * 29.0;
+        a += (*z.add( 1 * 64) + *z.add(13 * 64))       * 213.0;
+        a += (*z.add(12 * 64) - *z.add( 2 * 64))       * 459.0;
+        a += (*z.add( 3 * 64) + *z.add(11 * 64))       * 2037.0;
+        a += (*z.add(10 * 64) - *z.add( 4 * 64))       * 5153.0;
+        a += (*z.add( 5 * 64) + *z.add( 9 * 64))       * 6574.0;
+        a += (*z.add( 8 * 64) - *z.add( 6 * 64))       * 37489.0;
+        a +=  *z.add( 7 * 64)                          * 75038.0;
+        *pcm = mp3d_scale_pcm(a);
+
+        let z2 = z.add(2);
+        a  = *z2.add(14 * 64) * 104.0;
+        a += *z2.add(12 * 64) * 1567.0;
+        a += *z2.add(10 * 64) * 9727.0;
+        a += *z2.add( 8 * 64) * 64019.0;
+        a += *z2.add( 6 * 64) * -9975.0;
+        a += *z2.add( 4 * 64) * -45.0;
+        a += *z2.add( 2 * 64) * 146.0;
+        a += *z2.add( 0 * 64) * -5.0;
+        *pcm.add(16 * nch) = mp3d_scale_pcm(a);
+    }
+}
+
+fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
+    unsafe {
+        let xr = xl.add(576 * (nch - 1));
+        let dstr = dstl.add(nch - 1);
+        let zlin = lins.add(15 * 64);
+        let w = G_WIN_SYNTH.as_ptr();
+
+        *zlin.add(4*15)     = *xl.add(18 * 16);
+        *zlin.add(4*15 + 1) = *xr.add(18 * 16);
+        *zlin.add(4*15 + 2) = *xl;
+        *zlin.add(4*15 + 3) = *xr;
+        *zlin.add(4*31)     = *xl.add(1 + 18 * 16);
+        *zlin.add(4*31 + 1) = *xr.add(1 + 18 * 16);
+        *zlin.add(4*31 + 2) = *xl.add(1);
+        *zlin.add(4*31 + 3) = *xr.add(1);
+
+        mp3d_synth_pair(dstr, nch, lins.add(4 * 15 + 1));
+        mp3d_synth_pair(dstr.add(32 * nch), nch, lins.add(4 * 15 + 64 + 1));
+        mp3d_synth_pair(dstl, nch, lins.add(4 * 15));
+        mp3d_synth_pair(dstl.add(32 * nch), nch, lins.add(4 * 15 + 64));
+
+        let mut i: isize = 14;
+        let mut wp = w; // walking pointer into G_WIN_SYNTH
+        while i >= 0 {
+            let iu = i as usize;
+            *zlin.add(4 * iu)         = *xl.add(18 * (31 - iu));
+            *zlin.add(4 * iu + 1)     = *xr.add(18 * (31 - iu));
+            *zlin.add(4 * iu + 2)     = *xl.add(1 + 18 * (31 - iu));
+            *zlin.add(4 * iu + 3)     = *xr.add(1 + 18 * (31 - iu));
+            *zlin.add(4 * (iu + 16))      = *xl.add(1 + 18 * (1 + iu));
+            *zlin.add(4 * (iu + 16) + 1)  = *xr.add(1 + 18 * (1 + iu));
+            *zlin.offset(4 * (i - 16) + 2) = *xl.add(18 * (1 + iu));
+            *zlin.offset(4 * (i - 16) + 3) = *xr.add(18 * (1 + iu));
+
+            let mut a = [0f32; 4];
+            let mut b = [0f32; 4];
+
+            // 8 unrolled stages (S0, S2, S1, S2, S1, S2, S1, S2)
+            macro_rules! load_k {
+                ($k:expr) => {{
+                    let w0 = *wp; let w1 = *wp.add(1);
+                    let vz = zlin.offset(4 * i - ($k as isize) * 64);
+                    let vy = zlin.offset(4 * i - (15 - $k as isize) * 64);
+                    wp = wp.add(2);
+                    (w0, w1, vz, vy)
+                }};
+            }
+
+            // S0(0): initial assign (b = vz*w1 + vy*w0, a = vz*w0 - vy*w1)
+            {
+                let (w0, w1, vz, vy) = load_k!(0);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] = vzj * w1 + vyj * w0;
+                    a[j] = vzj * w0 - vyj * w1;
+                    j += 1;
+                }
+            }
+            // S2(1): b += vz*w1 + vy*w0; a += vy*w1 - vz*w0
+            {
+                let (w0, w1, vz, vy) = load_k!(1);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] += vzj * w1 + vyj * w0;
+                    a[j] += vyj * w1 - vzj * w0;
+                    j += 1;
+                }
+            }
+            // S1(2): b += vz*w1 + vy*w0; a += vz*w0 - vy*w1
+            {
+                let (w0, w1, vz, vy) = load_k!(2);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] += vzj * w1 + vyj * w0;
+                    a[j] += vzj * w0 - vyj * w1;
+                    j += 1;
+                }
+            }
+            // S2(3)
+            {
+                let (w0, w1, vz, vy) = load_k!(3);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] += vzj * w1 + vyj * w0;
+                    a[j] += vyj * w1 - vzj * w0;
+                    j += 1;
+                }
+            }
+            // S1(4)
+            {
+                let (w0, w1, vz, vy) = load_k!(4);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] += vzj * w1 + vyj * w0;
+                    a[j] += vzj * w0 - vyj * w1;
+                    j += 1;
+                }
+            }
+            // S2(5)
+            {
+                let (w0, w1, vz, vy) = load_k!(5);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] += vzj * w1 + vyj * w0;
+                    a[j] += vyj * w1 - vzj * w0;
+                    j += 1;
+                }
+            }
+            // S1(6)
+            {
+                let (w0, w1, vz, vy) = load_k!(6);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] += vzj * w1 + vyj * w0;
+                    a[j] += vzj * w0 - vyj * w1;
+                    j += 1;
+                }
+            }
+            // S2(7)
+            {
+                let (w0, w1, vz, vy) = load_k!(7);
+                let mut j: usize = 0;
+                while j < 4 {
+                    let vzj = *vz.add(j);
+                    let vyj = *vy.add(j);
+                    b[j] += vzj * w1 + vyj * w0;
+                    a[j] += vyj * w1 - vzj * w0;
+                    j += 1;
+                }
+            }
+
+            *dstr.add((15 - iu) * nch) = mp3d_scale_pcm(a[1]);
+            *dstr.add((17 + iu) * nch) = mp3d_scale_pcm(b[1]);
+            *dstl.add((15 - iu) * nch) = mp3d_scale_pcm(a[0]);
+            *dstl.add((17 + iu) * nch) = mp3d_scale_pcm(b[0]);
+            *dstr.add((47 - iu) * nch) = mp3d_scale_pcm(a[3]);
+            *dstr.add((49 + iu) * nch) = mp3d_scale_pcm(b[3]);
+            *dstl.add((47 - iu) * nch) = mp3d_scale_pcm(a[2]);
+            *dstl.add((49 + iu) * nch) = mp3d_scale_pcm(b[2]);
+
+            i -= 1;
+        }
+    }
+}
+
+fn mp3d_synth_granule(
+    qmf_state: *mut f32,
+    grbuf: *mut f32,
+    nbands: usize,
     nch: usize,
     pcm: *mut i16,
-    lins: *mut i32,
-    pcm_shift: u32,
+    lins: *mut f32,
 ) {
-    let nbands: usize = 18;
-    // DCT-II on each channel
-    mp3d_dct_ii(grbuf, nbands);
-    if nch == 2 {
-        mp3d_dct_ii(grbuf.add(576), nbands);
+    unsafe {
+        let mut ch: usize = 0;
+        while ch < nch {
+            mp3d_dct_ii(grbuf.add(576 * ch), nbands);
+            ch += 1;
+        }
+
+        let mut idx: usize = 0;
+        while idx < 15 * 64 { *lins.add(idx) = *qmf_state.add(idx); idx += 1; }
+
+        let mut i: usize = 0;
+        while i < nbands {
+            mp3d_synth(grbuf.add(i), pcm.add(32 * nch * i), nch, lins.add(i * 64));
+            i += 2;
+        }
+
+        if nch == 1 {
+            let mut k: usize = 0;
+            while k < 15 * 64 {
+                *qmf_state.add(k) = *lins.add(nbands * 64 + k);
+                k += 2;
+            }
+        } else {
+            let mut k: usize = 0;
+            while k < 15 * 64 { *qmf_state.add(k) = *lins.add(nbands * 64 + k); k += 1; }
+        }
     }
-    // Copy qmf history into working buffer
-    let mut idx: usize = 0;
-    while idx < 15 * 64 { *lins.add(idx) = *qmf_state.add(idx); idx += 1; }
-    // Synthesis: produces 32*nch PCM samples per band pair
-    let mut band: usize = 0;
-    while band < nbands {
-        mp3d_synth(grbuf.add(band), pcm.add(32 * nch * band), nch, lins.add(band * 64), pcm_shift);
-        band += 2;
-    }
-    // Save updated qmf history
-    let src = lins.add(nbands * 64);
-    idx = 0;
-    while idx < 15 * 64 { *qmf_state.add(idx) = *src.add(idx); idx += 1; }
 }
 
-// Section 9: Mp3State struct definition
+// ============================================================================
+// Section 13: Mp3State struct + helpers
 // ============================================================================
 
 #[repr(C)]
@@ -1375,23 +1503,20 @@ pub struct Mp3State {
     // Audio info
     sample_rate: u32,
     channels: u8,
-    channel_mode: u8,  // 0=stereo, 1=joint, 2=dual, 3=mono
+    channel_mode: u8,
     mode_extension: u8,
     has_crc: u8,
 
     // State machine
     phase: Mp3Phase,
-    /// Per-granule normalization shift (reduces requantize output to prevent i32 overflow)
-    norm_shift: u8,
-    /// Bytes remaining to skip (ID3 tag)
     id3_skip: u32,
 
-    // Side info (flat)
+    // Side info
     si_main_data_begin: u16,
     si_private_bits: u8,
-    si_scfsi: [u8; 8],  // [ch][band] flattened, using u8 as bool
+    si_scfsi: [u8; 8],
 
-    // Granule info: [gr][ch] flattened as [4] (gr0ch0, gr0ch1, gr1ch0, gr1ch1)
+    // Granule info: [gr][ch] flattened
     gi_part2_3_length: [u16; 4],
     gi_big_values: [u16; 4],
     gi_global_gain: [u8; 4],
@@ -1399,91 +1524,175 @@ pub struct Mp3State {
     gi_window_switching: [u8; 4],
     gi_block_type: [u8; 4],
     gi_mixed_block: [u8; 4],
-    gi_table_select: [u8; 12],  // [4][3]
-    gi_subblock_gain: [u8; 12], // [4][3]
+    gi_table_select: [u8; 12],
+    gi_subblock_gain: [u8; 12],
     gi_region0_count: [u8; 4],
     gi_region1_count: [u8; 4],
     gi_preflag: [u8; 4],
     gi_scalefac_scale: [u8; 4],
     gi_count1table_select: [u8; 4],
 
-    // Scalefactors: [2][2][39] flattened = 156
+    // Scalefactors: [2 granules][2 channels][39 bands] flattened = 156
     scalefactors: [u8; 156],
 
-    // Huffman decoded values
+    // Huffman decoded integer values (per granule/channel, reused)
     huff_values: [i32; 576],
 
-    // Frequency lines after requantization: [2][576] flattened (Q30 i32)
-    freq_lines: [i32; 1152],
+    // Frequency lines after requantization: [2 channels][576] flattened (f32)
+    freq_lines: [f32; 1152],
 
-    // IMDCT overlap buffer: [2][576] flattened (Q30 i32)
-    overlap: [i32; 1152],
+    // IMDCT overlap buffer: [2 channels][32 subbands × 9] = [2][288] = 576 f32
+    overlap: [f32; 576],
 
-    // Synthesis QMF state: [2][960] (15*64 per channel)
-    qmf_state: [i32; 1920],
-    // Synthesis working buffer: (18+15)*64 = 2112
-    lins: [i32; 2112],
+    // Synthesis QMF history (shared across channels in mp3d_synth interleave)
+    qmf_state: [f32; 960],
+    // Synthesis working buffer: (18+15)*64 = 2112 f32
+    lins: [f32; 2112],
 
     // Output buffer: stereo interleaved
-    out_buf: [i16; 2304], // SAMPLES_PER_FRAME * 2
+    out_buf: [i16; 2304],
     out_pos: u16,
     out_len: u16,
 
-    // Diagnostic
     frame_count: u32,
 
     // Bit reservoir
     main_data: [u8; 2048],
     main_data_len: u16,
     main_data_bit_pos: u16,
-
-    // Saved reservoir: last `reservoir_len` bytes of previous frame's main_data
-    // Kept separate because main_data tail gets externally corrupted (DMA/other module)
     reservoir: [u8; 512],
     reservoir_len: u16,
 
-    // Last sample rate sent via IOCTL (0 = not yet sent)
     last_sent_rate: u32,
-
-    // Diagnostic: input channel underrun counter (times we needed data but channel empty)
     underrun_count: u32,
 }
 
-// Helper to get granule info index: gr*2+ch
 #[inline(always)]
 fn gi_idx(gr: usize, ch: usize) -> usize { gr * 2 + ch }
 
-// Helper to get scalefactor index: gr*78 + ch*39 + band
 #[inline(always)]
 fn sf_idx(gr: usize, ch: usize, band: usize) -> usize { gr * 78 + ch * 39 + band }
 
 // ============================================================================
-// Section 11: Internal decode functions
+// Section 13b: Layer probe (compile-time gated; off in shipped builds)
+//
+// Set MP3_PROBE=1 at codec build time to emit [probe] dev_log lines that
+// dump per-granule layer state at each MP3 pipeline boundary. The harness
+// (.context/mp3_bisect/probe_mp3.py) parses these against a minimp3
+// ground-truth dump (.context/mp3_bisect/minimp3_layers; build via
+// `make minimp3-ref`) to locate the first layer / first frame where
+// our codec disagrees with the reference. The bisection toolchain is
+// gitignored under .context/ — see .context/mp3_bisect/README.md.
 // ============================================================================
 
-/// Decode a complete MP3 frame. Returns number of interleaved samples or negative error.
+// Compile-time gate: `MP3_PROBE=1 make modules TARGET=bcm2712` enables.
+// Default off — zero cost when unset.
+const MP3_PROBE: bool = option_env!("MP3_PROBE").is_some();
+const MP3_PROBE_FRAME_LO: u32 = 0;
+const MP3_PROBE_FRAME_HI: u32 = 200;
+
+#[inline]
+fn probe_active(frame_count: u32) -> bool {
+    MP3_PROBE && frame_count >= MP3_PROBE_FRAME_LO && frame_count <= MP3_PROBE_FRAME_HI
+}
+
+/// Float-to-decimal with 6 significant digits, sign + dot. Avoids float
+/// formatting deps; used only in probe build.
+unsafe fn fmt_f32_probe(dst: *mut u8, val: f32) -> usize {
+    if val.is_nan() {
+        *dst = b'N'; *dst.add(1) = b'a'; *dst.add(2) = b'N';
+        return 3;
+    }
+    let mut p = 0usize;
+    let mut v = val;
+    if v < 0.0 { *dst.add(p) = b'-'; p += 1; v = -v; }
+    if v == 0.0 { *dst.add(p) = b'0'; return p + 1; }
+    // Find exponent
+    let mut exp: i32 = 0;
+    let mut mant = v;
+    while mant >= 10.0 { mant /= 10.0; exp += 1; }
+    while mant < 1.0  { mant *= 10.0; exp -= 1; }
+    // Emit 6 digits with decimal point after the first digit, then 'e' + exp
+    let mut digits = [0u8; 7];
+    let mut m = mant;
+    for i in 0..7 {
+        let d = m as u32;
+        digits[i] = b'0' + (d as u8 % 10);
+        m = (m - d as f32) * 10.0;
+    }
+    *dst.add(p) = digits[0]; p += 1;
+    *dst.add(p) = b'.'; p += 1;
+    for i in 1..7 { *dst.add(p) = digits[i]; p += 1; }
+    *dst.add(p) = b'e'; p += 1;
+    if exp < 0 { *dst.add(p) = b'-'; p += 1; }
+    p += fmt_u32_raw(dst.add(p), exp.unsigned_abs());
+    p
+}
+
+/// Emit one probe line. tag is at most 6 chars.
+unsafe fn probe_emit(
+    sys: &SyscallTable,
+    tag: &[u8],
+    frame: u32,
+    gr: u8, ch: u8,
+    head_label: &[u8],
+    head_val: i32,
+    floats: *const f32,
+    n_floats: usize,
+) {
+    let mut buf = [0u8; 256];
+    let bp = buf.as_mut_ptr();
+    let mut p = 0usize;
+    // tag (left-padded with spaces, fixed 6 chars)
+    let mut t = 0;
+    while t < tag.len() && t < 6 { *bp.add(p) = tag[t]; p += 1; t += 1; }
+    while p < 6 { *bp.add(p) = b' '; p += 1; }
+    *bp.add(p) = b' '; p += 1;
+    *bp.add(p) = b'f'; p += 1;
+    p += fmt_u32_raw(bp.add(p), frame);
+    *bp.add(p) = b' '; p += 1;
+    *bp.add(p) = b'g'; p += 1;
+    p += fmt_u32_raw(bp.add(p), gr as u32);
+    *bp.add(p) = b' '; p += 1;
+    *bp.add(p) = b'c'; p += 1;
+    p += fmt_u32_raw(bp.add(p), ch as u32);
+    if !head_label.is_empty() {
+        *bp.add(p) = b' '; p += 1;
+        let mut k = 0; while k < head_label.len() { *bp.add(p) = head_label[k]; p += 1; k += 1; }
+        p += fmt_u32_raw(bp.add(p), head_val as u32);
+    }
+    if !floats.is_null() && n_floats > 0 {
+        let mut i = 0usize;
+        while i < n_floats && p + 16 < 256 {
+            *bp.add(p) = b' '; p += 1;
+            p += fmt_f32_probe(bp.add(p), *floats.add(i));
+            i += 1;
+        }
+    }
+    dev_log(sys, 3, bp, p);
+}
+
+// ============================================================================
+// Section 14: Frame decoder
+// ============================================================================
+
 fn decode_frame(s: &mut Mp3State) -> i32 {
     unsafe {
         let frame_ptr = s.frame_buf.as_ptr();
         let frame_len = s.frame_pos;
 
-        // Parse side information
         let data_start = 4 + if s.has_crc != 0 { 2usize } else { 0 };
         let side_info_size = if s.channels == 1 { 17usize } else { 32 };
 
         if frame_len < data_start + side_info_size { return -6; }
 
-        // Parse side info
         let si_ret = parse_side_info(s, frame_ptr.add(data_start), side_info_size);
         if si_ret < 0 { return si_ret; }
 
-        // Handle bit reservoir (uses saved reservoir immune to main_data corruption)
         let frame_data_start = data_start + side_info_size;
         let frame_data_len = if frame_len > frame_data_start { frame_len - frame_data_start } else { 0 };
-        let reservoir_before = s.reservoir_len;
         accumulate_main_data(s, frame_ptr.add(frame_data_start), frame_data_len);
 
-        // Set bit position
         let keep = s.si_main_data_begin as usize;
         let main_data_start = if keep + frame_data_len <= s.main_data_len as usize {
             s.main_data_len as usize - keep - frame_data_len
@@ -1492,191 +1701,191 @@ fn decode_frame(s: &mut Mp3State) -> i32 {
         };
         s.main_data_bit_pos = (main_data_start * 8) as u16;
 
-        // PROBE 1: Reservoir satisfaction — log when frame needs more reservoir
-        // data than was available (would cause Huffman to decode wrong bits)
-        if keep > reservoir_before as usize {
-            let sys = &*s.syscalls;
-            let mut lb = [0u8; 64];
-            let bp = lb.as_mut_ptr();
-            let tag = b"[mp3] reservoir short f=";
-            let mut p = 0usize;
-            let mut t = 0usize;
-            while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
-            p += fmt_u32_raw(bp.add(p), s.frame_count);
-            let tag2 = b" need=";
-            t = 0; while t < tag2.len() { *bp.add(p) = *tag2.as_ptr().add(t); p += 1; t += 1; }
-            p += fmt_u32_raw(bp.add(p), keep as u32);
-            let tag3 = b" have=";
-            t = 0; while t < tag3.len() { *bp.add(p) = *tag3.as_ptr().add(t); p += 1; t += 1; }
-            p += fmt_u32_raw(bp.add(p), reservoir_before as u32);
-            dev_log(sys, 2, bp, p);
-        }
-
         let num_channels = s.channels as usize;
         let num_granules: usize = 2;
+        let ms_stereo = s.channel_mode == 1 && (s.mode_extension & 0x02) != 0;
 
-        // Decode granules
         let mut gr: usize = 0;
-
         while gr < num_granules {
-            // Per-granule normalization: compute how much to reduce requantize
-            // output to prevent i32 overflow in IMDCT/DCT-II pipeline.
-            // max_int_shift is the worst-case shift for this granule (sf=0).
-            // We allow int_shift up to 1 safely; anything above is deferred.
-            {
-                let g0 = *s.gi_global_gain.as_ptr().add(gi_idx(gr, 0)) as i32;
-                let g1 = if num_channels > 1 {
-                    *s.gi_global_gain.as_ptr().add(gi_idx(gr, 1)) as i32
-                } else { g0 };
-                let max_gain = if g0 > g1 { g0 } else { g1 };
-                let max_exp = max_gain - 210;
-                let max_int_shift = max_exp >> 2;
-                let ns = max_int_shift - 1;
-                s.norm_shift = if ns > 0 { ns as u8 } else { 0 };
-            }
-
             let mut ch: usize = 0;
             while ch < num_channels {
-                let ret = decode_granule_channel(s, gr, ch);
+                let ret = decode_granule_channel(s, gr, ch, ms_stereo);
                 if ret < 0 { return ret; }
+                if probe_active(s.frame_count) {
+                    let sys = &*s.syscalls;
+                    let idx = gi_idx(gr, ch);
+                    // side-info probe (compact)
+                    probe_emit(sys, b"side", s.frame_count, gr as u8, ch as u8,
+                        b"bt=", *s.gi_block_type.as_ptr().add(idx) as i32,
+                        core::ptr::null(), 0);
+                    probe_emit(sys, b"side2", s.frame_count, gr as u8, ch as u8,
+                        b"big=", *s.gi_big_values.as_ptr().add(idx) as i32,
+                        core::ptr::null(), 0);
+                    probe_emit(sys, b"side3", s.frame_count, gr as u8, ch as u8,
+                        b"gg=", *s.gi_global_gain.as_ptr().add(idx) as i32,
+                        core::ptr::null(), 0);
+                    probe_emit(sys, b"side4", s.frame_count, gr as u8, ch as u8,
+                        b"p23=", *s.gi_part2_3_length.as_ptr().add(idx) as i32,
+                        core::ptr::null(), 0);
+                    let fl_probe = s.freq_lines.as_ptr().add(ch * GRANULE_SAMPLES);
+                    probe_emit(sys, b"reqz", s.frame_count, gr as u8, ch as u8,
+                        b"", 0, fl_probe, 16);
+                }
                 ch += 1;
             }
 
-            // Joint stereo processing
-            if s.channel_mode == 1 {
-                // MS stereo
+            // Joint stereo: MS first, then intensity (if needed). For cmajor.mp3
+            // there's no intensity-stereo content; we leave the placeholder.
+            if num_channels == 2 && s.channel_mode == 1 {
                 if (s.mode_extension & 0x02) != 0 {
                     process_ms_stereo(s.freq_lines.as_mut_ptr());
                 }
-                // Intensity stereo
-                if (s.mode_extension & 0x01) != 0 {
-                    let idx1 = gi_idx(gr, 1);
-                    process_intensity_stereo(s.freq_lines.as_mut_ptr(), *s.gi_big_values.as_ptr().add(idx1));
-                }
+                // Intensity stereo NYI (lame/most encoders use MS for non-extreme
+                // content; cmajor.mp3 uses MS). If a stream needs IS, this is the
+                // hook point.
             }
 
-            // Antialiasing butterflies + IMDCT for each channel
+            // Antialias + reorder + IMDCT + change_sign per channel
             ch = 0;
             while ch < num_channels {
                 let idx = gi_idx(gr, ch);
                 let bt = *s.gi_block_type.as_ptr().add(idx);
                 let mb = *s.gi_mixed_block.as_ptr().add(idx) != 0;
 
-                // Antialiasing butterflies (ISO 11172-3 §2.4.3.4)
-                if bt != 2 {
-                    let fl = s.freq_lines.as_mut_ptr().add(ch * GRANULE_SAMPLES);
-                    let sb_limit: usize = if mb { 1 } else { 31 };
-                    antialias_butterflies(fl, sb_limit);
+                let fl = s.freq_lines.as_mut_ptr().add(ch * GRANULE_SAMPLES);
+
+                if probe_active(s.frame_count) {
+                    let sys = &*s.syscalls;
+                    probe_emit(sys, b"reqms", s.frame_count, gr as u8, ch as u8,
+                        b"", 0, fl, 16);
                 }
 
-                // Reorder short-block spectral values to window-interleaved layout.
-                // Uses huff_values as scratch (576 i32, free at this point).
+                // n_long_bands: subbands at granule start that use LONG-block
+                // IMDCT (matching minimp3 L3_decode). Only mixed short blocks
+                // need this > 0; everything else (pure long/start/stop/short)
+                // lets process_imdct's else-branch handle all 32 subbands with
+                // the appropriate window. Treating bt != 2 as "n_long_bands=32"
+                // would wrongly force LONG window for STOP blocks.
+                let n_long_bands: usize = if bt == 2 && mb {
+                    if s.sample_rate == 32000 { 4 } else { 2 }
+                } else {
+                    0
+                };
+
+                // Antialias (matches minimp3): default 31 seams for long-like
+                // blocks; for short/mixed blocks limit to n_long_bands - 1 so
+                // we never butterfly across the long→short seam.
+                let aa_bands = if bt == 2 {
+                    if n_long_bands == 0 { 0 } else { n_long_bands - 1 }
+                } else {
+                    31
+                };
+                if aa_bands > 0 {
+                    antialias_butterflies(fl, aa_bands);
+                }
+
+                // Reorder short-block portion (window-interleave).
                 if bt == 2 {
-                    reorder_short(
-                        s.freq_lines.as_mut_ptr().add(ch * GRANULE_SAMPLES),
-                        s.huff_values.as_mut_ptr(),
-                        s.sample_rate,
-                    );
+                    let widths_ptr = get_sfb_short_widths(s.sample_rate);
+                    let scratch = s.huff_values.as_mut_ptr() as *mut f32;
+                    let short_start = fl.add(n_long_bands * 18);
+                    let nbands_short = 32 - n_long_bands;
+                    reorder_short(short_start, scratch, widths_ptr, nbands_short);
                 }
 
-                // IMDCT with overlap-add (9 values per subband = 288 per channel)
-                process_imdct(
-                    s.freq_lines.as_mut_ptr().add(ch * GRANULE_SAMPLES),
-                    s.overlap.as_mut_ptr().add(ch * 288),
-                    bt,
-                    mb,
-                );
+                if probe_active(s.frame_count) {
+                    let sys = &*s.syscalls;
+                    probe_emit(sys, b"aaaz", s.frame_count, gr as u8, ch as u8,
+                        b"", 0, fl, 16);
+                    // Also dump samples from band 1 (post-antialias seams visible here)
+                    probe_emit(sys, b"aaaz1", s.frame_count, gr as u8, ch as u8,
+                        b"", 0, fl.add(18), 16);
+                }
 
-                // L3_change_sign: negate odd-indexed samples in odd-numbered subbands
-                // Required by the polyphase synthesis filter (ISO 11172-3)
-                {
-                    let fl = s.freq_lines.as_mut_ptr().add(ch * GRANULE_SAMPLES);
-                    let mut sb: usize = 1;
-                    while sb < 32 {
-                        let base = sb * 18;
-                        let mut ti: usize = 1;
-                        while ti < 18 {
-                            let idx = base + ti;
-                            *fl.add(idx) = -(*fl.add(idx));
-                            ti += 2;
-                        }
-                        sb += 2;
-                    }
+                // IMDCT (handles long+short split internally based on n_long_bands).
+                process_imdct(fl, s.overlap.as_mut_ptr().add(ch * 288), bt, n_long_bands);
+
+                // L3_change_sign: required for polyphase synthesis.
+                l3_change_sign(fl);
+
+                if probe_active(s.frame_count) {
+                    let sys = &*s.syscalls;
+                    probe_emit(sys, b"imdct", s.frame_count, gr as u8, ch as u8,
+                        b"", 0, fl, 16);
+                    // Band 1 region — exposes change_sign flips
+                    probe_emit(sys, b"imdct1", s.frame_count, gr as u8, ch as u8,
+                        b"", 0, fl.add(18), 16);
+                    // Band 11 region — exposes deeper synthesis state
+                    probe_emit(sys, b"imdct11", s.frame_count, gr as u8, ch as u8,
+                        b"", 0, fl.add(198), 16);
                 }
 
                 ch += 1;
             }
 
-            // Synthesis: operates on all channels simultaneously.
-            // pcm_shift = 15 - norm_shift: compensates for the per-granule normalization
-            // inside the i64 synthesis accumulator (no overflow, no post-synthesis clipping).
+            // Synthesis: emits 18 polyphase output blocks × 32 samples × nch.
             let output_offset = gr * GRANULE_SAMPLES * num_channels;
-            let pcm_shift = 15u32 - s.norm_shift as u32;
             mp3d_synth_granule(
                 s.qmf_state.as_mut_ptr(),
                 s.freq_lines.as_mut_ptr(),
+                18,
                 num_channels,
                 s.out_buf.as_mut_ptr().add(output_offset),
                 s.lins.as_mut_ptr(),
-                pcm_shift,
             );
 
-            // PROBE 2: Discontinuity detector — count sign flips in first 48 L-channel
-            // samples. Normal audio has <10 flips; decoded garbage has 20+.
-            {
-                let pcm = s.out_buf.as_ptr().add(output_offset);
-                let step = num_channels; // stride for L-channel (1=mono, 2=stereo)
-                let check_count: usize = 48;
-                let mut flips: u32 = 0;
-                let mut prev_sign: i32 = 0; // 0=unset
-                let mut ci: usize = 0;
-                while ci < check_count {
-                    let v = *pcm.add(ci * step);
-                    let sign = if v > 0 { 1i32 } else if v < 0 { -1i32 } else { prev_sign };
-                    if prev_sign != 0 && sign != 0 && sign != prev_sign {
-                        flips += 1;
-                    }
-                    if sign != 0 { prev_sign = sign; }
-                    ci += 1;
-                }
-                if flips > 20 {
-                    let sys = &*s.syscalls;
-                    let mut lb = [0u8; 64];
-                    let bp = lb.as_mut_ptr();
-                    let tag = b"[mp3] glitch f=";
+            if probe_active(s.frame_count) {
+                let sys = &*s.syscalls;
+                // Dump PCM samples at 3 strategic offsets in this granule.
+                let mut pcm_buf = [0u8; 256];
+                let bp = pcm_buf.as_mut_ptr();
+                let nch = num_channels;
+                let emit_at = |bp: *mut u8, label: &[u8], gr_val: usize, sample_off: usize| -> usize {
                     let mut p = 0usize;
-                    let mut t = 0usize;
-                    while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
-                    p += fmt_u32_raw(bp.add(p), s.frame_count);
-                    let tag2 = b" gr=";
-                    t = 0; while t < tag2.len() { *bp.add(p) = *tag2.as_ptr().add(t); p += 1; t += 1; }
-                    p += fmt_u32_raw(bp.add(p), gr as u32);
-                    let tag3 = b" flips=";
-                    t = 0; while t < tag3.len() { *bp.add(p) = *tag3.as_ptr().add(t); p += 1; t += 1; }
-                    p += fmt_u32_raw(bp.add(p), flips);
-                    let tag4 = b" bt=";
-                    t = 0; while t < tag4.len() { *bp.add(p) = *tag4.as_ptr().add(t); p += 1; t += 1; }
-                    p += fmt_u32_raw(bp.add(p), *s.gi_block_type.as_ptr().add(gi_idx(gr, 0)) as u32);
-                    *bp.add(p) = b'/'; p += 1;
-                    p += fmt_u32_raw(bp.add(p), if num_channels > 1 {
-                        *s.gi_block_type.as_ptr().add(gi_idx(gr, 1)) as u32
-                    } else { 0 });
-                    dev_log(sys, 2, bp, p);
-                }
+                    let mut t = 0; while t < label.len() && p < 6 { unsafe { *bp.add(p) = label[t]; } p += 1; t += 1; }
+                    while p < 6 { unsafe { *bp.add(p) = b' '; } p += 1; }
+                    unsafe { *bp.add(p) = b' '; } p += 1;
+                    unsafe { *bp.add(p) = b'f'; } p += 1;
+                    p += unsafe { fmt_u32_raw(bp.add(p), s.frame_count) };
+                    unsafe { *bp.add(p) = b' '; } p += 1;
+                    unsafe { *bp.add(p) = b'g'; } p += 1;
+                    p += unsafe { fmt_u32_raw(bp.add(p), gr_val as u32) };
+                    let mut k = 0;
+                    while k < 16 {
+                        unsafe { *bp.add(p) = b' '; } p += 1;
+                        let sample = unsafe { *s.out_buf.as_ptr().add(output_offset + (sample_off + k) * nch) };
+                        p += unsafe { fmt_i16_raw(bp.add(p), sample) };
+                        k += 1;
+                    }
+                    p
+                };
+
+                // sample 0 (head of granule)
+                let p = emit_at(bp, b"pcmL", gr, 0);
+                dev_log(sys, 3, bp, p);
+                // sample 248 (middle of granule)
+                let p = emit_at(bp, b"pcm248", gr, 248);
+                dev_log(sys, 3, bp, p);
+                // sample 448 (where bin diverges from minimp3 at frame 0)
+                let p = emit_at(bp, b"pcm448", gr, 448);
+                dev_log(sys, 3, bp, p);
+                // sample 560 (near end of granule)
+                let p = emit_at(bp, b"pcm560", gr, 560);
+                dev_log(sys, 3, bp, p);
             }
 
             gr += 1;
         }
 
-        // If mono, spread to stereo interleaved (process backwards to avoid overwrites)
+        // Mono → stereo expansion (interleave)
         if num_channels == 1 {
-            let mut i: usize = SAMPLES_PER_FRAME; // 1152
+            let mut i: usize = SAMPLES_PER_FRAME;
             while i > 0 {
                 i -= 1;
-                let mono_sample = *s.out_buf.as_ptr().add(i);
-                let stereo_idx = i * 2;
-                *s.out_buf.as_mut_ptr().add(stereo_idx) = mono_sample;     // L
-                *s.out_buf.as_mut_ptr().add(stereo_idx + 1) = mono_sample; // R
+                let mono = *s.out_buf.as_ptr().add(i);
+                let st_idx = i * 2;
+                *s.out_buf.as_mut_ptr().add(st_idx) = mono;
+                *s.out_buf.as_mut_ptr().add(st_idx + 1) = mono;
             }
         }
 
@@ -1703,7 +1912,6 @@ fn parse_side_info(s: &mut Mp3State, data: *const u8, len: usize) -> i32 {
             s.si_private_bits = pb as u8;
         }
 
-        // SCFSI
         let mut ch: usize = 0;
         while ch < num_channels {
             let mut band: usize = 0;
@@ -1716,7 +1924,6 @@ fn parse_side_info(s: &mut Mp3State, data: *const u8, len: usize) -> i32 {
             ch += 1;
         }
 
-        // Granule info
         let mut gr: usize = 0;
         while gr < 2 {
             ch = 0;
@@ -1739,7 +1946,6 @@ fn parse_side_info(s: &mut Mp3State, data: *const u8, len: usize) -> i32 {
                 *s.gi_window_switching.as_mut_ptr().add(idx) = v as u8;
 
                 if v != 0 {
-                    // Window switching flag set
                     let bt = br_read_bits(&mut reader, 2); if bt < 0 { return -6; }
                     *s.gi_block_type.as_mut_ptr().add(idx) = bt as u8;
 
@@ -1801,13 +2007,9 @@ fn parse_side_info(s: &mut Mp3State, data: *const u8, len: usize) -> i32 {
 fn accumulate_main_data(s: &mut Mp3State, frame_data: *const u8, frame_data_len: usize) {
     unsafe {
         let keep = s.si_main_data_begin as usize;
-
-        // Build main_data = saved_reservoir + new_frame_data
-        // Use the saved reservoir (immune to external corruption of main_data tail)
         let reservoir_avail = s.reservoir_len as usize;
         let reservoir_use = if keep <= reservoir_avail { keep } else { reservoir_avail };
 
-        // Copy reservoir to front of main_data
         if reservoir_use > 0 {
             let src_start = reservoir_avail - reservoir_use;
             let mut i: usize = 0;
@@ -1818,7 +2020,6 @@ fn accumulate_main_data(s: &mut Mp3State, frame_data: *const u8, frame_data_len:
         }
         s.main_data_len = reservoir_use as u16;
 
-        // Append frame data
         let space = 2048 - s.main_data_len as usize;
         let copy_len = if frame_data_len < space { frame_data_len } else { space };
         let dst_offset = s.main_data_len as usize;
@@ -1829,8 +2030,6 @@ fn accumulate_main_data(s: &mut Mp3State, frame_data: *const u8, frame_data_len:
         }
         s.main_data_len += copy_len as u16;
 
-        // Save the tail of main_data as reservoir for next frame
-        // (main_data may get corrupted between frames, but reservoir won't)
         let total = s.main_data_len as usize;
         let save_len = if total < 512 { total } else { 512 };
         let save_start = total - save_len;
@@ -1843,10 +2042,9 @@ fn accumulate_main_data(s: &mut Mp3State, frame_data: *const u8, frame_data_len:
     }
 }
 
-fn decode_granule_channel(s: &mut Mp3State, gr: usize, ch: usize) -> i32 {
+fn decode_granule_channel(s: &mut Mp3State, gr: usize, ch: usize, ms_stereo: bool) -> i32 {
     unsafe {
         let idx = gi_idx(gr, ch);
-        let _num_channels = s.channels as usize;
 
         let byte_start = s.main_data_bit_pos as usize / 8;
         let bit_offset = s.main_data_bit_pos as usize - byte_start * 8;
@@ -1854,11 +2052,9 @@ fn decode_granule_channel(s: &mut Mp3State, gr: usize, ch: usize) -> i32 {
         let data_len = s.main_data_len as usize;
         if byte_start >= data_len { return -6; }
 
-        // Decode scalefactors
         let scalefac_bits = decode_scalefactors(s, gr, ch, byte_start, bit_offset);
         if scalefac_bits < 0 { return scalefac_bits; }
 
-        // Huffman decode
         {
             let reader_start = byte_start;
             let total_skip = bit_offset + scalefac_bits as usize;
@@ -1883,12 +2079,13 @@ fn decode_granule_channel(s: &mut Mp3State, gr: usize, ch: usize) -> i32 {
                 *s.gi_count1table_select.as_ptr().add(idx) != 0,
                 huff_bits,
                 s.huff_values.as_mut_ptr(),
-                get_sfb_table(s.sample_rate),
+                *s.gi_block_type.as_ptr().add(idx),
+                *s.gi_mixed_block.as_ptr().add(idx) != 0,
+                s.sample_rate,
             );
             if ret < 0 { return ret; }
         }
 
-        // Requantize (norm_shift reduces output to prevent i32 overflow downstream)
         requantize(
             s.huff_values.as_ptr(),
             s.freq_lines.as_mut_ptr().add(ch * GRANULE_SAMPLES),
@@ -1896,15 +2093,14 @@ fn decode_granule_channel(s: &mut Mp3State, gr: usize, ch: usize) -> i32 {
             *s.gi_global_gain.as_ptr().add(idx),
             *s.gi_scalefac_scale.as_ptr().add(idx) != 0,
             *s.gi_block_type.as_ptr().add(idx),
+            *s.gi_mixed_block.as_ptr().add(idx) != 0,
             s.gi_subblock_gain.as_ptr().add(idx * 3),
             *s.gi_preflag.as_ptr().add(idx) != 0,
             s.sample_rate,
-            s.norm_shift as i32,
+            ms_stereo,
         );
 
-        // Advance bit position
         s.main_data_bit_pos += *s.gi_part2_3_length.as_ptr().add(idx);
-
         0
     }
 }
@@ -1912,7 +2108,6 @@ fn decode_granule_channel(s: &mut Mp3State, gr: usize, ch: usize) -> i32 {
 fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize, bit_offset: usize) -> i32 {
     unsafe {
         let idx = gi_idx(gr, ch);
-        let num_channels = s.channels as usize;
         let data_len = s.main_data_len as usize;
 
         let mut reader = br_new(
@@ -1933,9 +2128,13 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
         let mixed = *s.gi_mixed_block.as_ptr().add(idx) != 0;
         let sf_base = sf_idx(gr, ch, 0);
 
+        // Zero the destination range first so unused slots are deterministic 0.
+        let mut z: usize = 0;
+        while z < 39 { *s.scalefactors.as_mut_ptr().add(sf_base + z) = 0; z += 1; }
+
         if block_type == 2 {
             if mixed {
-                // Mixed block: long bands 0-7
+                // 44.1/48 kHz mixed: 8 long bands [0..7] + short bands sfb=3..11 × 3 wins
                 let mut band: usize = 0;
                 while band < 8 {
                     if slen1 > 0 {
@@ -1943,12 +2142,10 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                         if v < 0 { return -6; }
                         *s.scalefactors.as_mut_ptr().add(sf_base + band) = v as u8;
                         bits_read += slen1 as usize;
-                    } else {
-                        *s.scalefactors.as_mut_ptr().add(sf_base + band) = 0;
                     }
                     band += 1;
                 }
-                // Short bands 3-5
+                // Short bands sfb=3..5 (slen1)
                 let mut sfb: usize = 3;
                 while sfb < 6 {
                     let mut win: usize = 0;
@@ -1959,14 +2156,12 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                             if v < 0 { return -6; }
                             *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = v as u8;
                             bits_read += slen1 as usize;
-                        } else {
-                            *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = 0;
                         }
                         win += 1;
                     }
                     sfb += 1;
                 }
-                // Short bands 6-11
+                // Short bands sfb=6..11 (slen2)
                 sfb = 6;
                 while sfb < 12 {
                     let mut win: usize = 0;
@@ -1977,15 +2172,13 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                             if v < 0 { return -6; }
                             *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = v as u8;
                             bits_read += slen2 as usize;
-                        } else {
-                            *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = 0;
                         }
                         win += 1;
                     }
                     sfb += 1;
                 }
             } else {
-                // Pure short blocks
+                // Pure short: 12 SFBs × 3 wins
                 let mut sfb: usize = 0;
                 while sfb < 6 {
                     let mut win: usize = 0;
@@ -1996,8 +2189,6 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                             if v < 0 { return -6; }
                             *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = v as u8;
                             bits_read += slen1 as usize;
-                        } else {
-                            *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = 0;
                         }
                         win += 1;
                     }
@@ -2013,8 +2204,6 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                             if v < 0 { return -6; }
                             *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = v as u8;
                             bits_read += slen2 as usize;
-                        } else {
-                            *s.scalefactors.as_mut_ptr().add(sf_base + band_idx) = 0;
                         }
                         win += 1;
                     }
@@ -2022,8 +2211,7 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                 }
             }
         } else {
-            // Long blocks
-            // Group 0: bands 0-5, Group 1: 6-10, Group 2: 11-15, Group 3: 16-20
+            // Long block: 22 SFBs in 4 groups, with SCFSI reuse for gr=1.
             let group_starts: [usize; 4] = [0, 6, 11, 16];
             let group_ends: [usize; 4] = [6, 11, 16, 21];
 
@@ -2037,7 +2225,6 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                 let mut sfb = start;
                 while sfb < end {
                     if reuse {
-                        // Copy from previous granule
                         let prev_base = sf_idx(0, ch, 0);
                         *s.scalefactors.as_mut_ptr().add(sf_base + sfb) = *s.scalefactors.as_ptr().add(prev_base + sfb);
                     } else if slen > 0 {
@@ -2045,8 +2232,6 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
                         if v < 0 { return -6; }
                         *s.scalefactors.as_mut_ptr().add(sf_base + sfb) = v as u8;
                         bits_read += slen as usize;
-                    } else {
-                        *s.scalefactors.as_mut_ptr().add(sf_base + sfb) = 0;
                     }
                     sfb += 1;
                 }
@@ -2058,12 +2243,10 @@ fn decode_scalefactors(s: &mut Mp3State, gr: usize, ch: usize, byte_start: usize
     }
 }
 
-
 // ============================================================================
-// Codec API (called by decoder.rs)
+// Section 15: Codec API
 // ============================================================================
 
-/// Initialize MP3 codec state.
 pub unsafe fn mp3_init(
     s: &mut Mp3State,
     syscalls: *const SyscallTable,
@@ -2091,37 +2274,33 @@ pub unsafe fn mp3_init(
     s.main_data_bit_pos = 0;
     s.reservoir_len = 0;
     s.last_sent_rate = 0;
+    s.underrun_count = 0;
 
-    // Zero synth state
     let mut i: usize = 0;
-    while i < 1920 { *s.qmf_state.as_mut_ptr().add(i) = 0; i += 1; }
-
-    // Zero overlap
+    while i < 960 { *s.qmf_state.as_mut_ptr().add(i) = 0.0; i += 1; }
     i = 0;
-    while i < 1152 { *s.overlap.as_mut_ptr().add(i) = 0; i += 1; }
+    while i < 576 { *s.overlap.as_mut_ptr().add(i) = 0.0; i += 1; }
+    i = 0;
+    while i < 2112 { *s.lins.as_mut_ptr().add(i) = 0.0; i += 1; }
+    i = 0;
+    while i < 1152 { *s.freq_lines.as_mut_ptr().add(i) = 0.0; i += 1; }
 
     let sys = &*s.syscalls;
     dev_log(sys, 3, b"[mp3] init".as_ptr(), 10);
 }
 
-/// Feed initial detection bytes into MP3 codec.
-/// Handles ID3v2 tag skipping and direct sync word detection.
 pub unsafe fn mp3_feed_detect(s: &mut Mp3State, buf: *const u8, len: usize) {
     s.frame_pos = 0;
     s.id3_skip = 0;
 
-    // Check for ID3v2 tag: "ID3" + version(2) + flags(1) + size(4) = 10 bytes
     if len >= 3 && *buf == b'I' && *buf.add(1) == b'D' && *buf.add(2) == b'3' {
         if len >= 10 {
-            // Parse synchsafe integer size from bytes 6-9
             let s6 = *buf.add(6) as u32;
             let s7 = *buf.add(7) as u32;
             let s8 = *buf.add(8) as u32;
             let s9 = *buf.add(9) as u32;
             let tag_body_size = (s6 << 21) | (s7 << 14) | (s8 << 7) | s9;
             let total_tag_size = 10 + tag_body_size;
-            // We already consumed `len` bytes from the channel during detection.
-            // Skip the rest of the tag.
             if total_tag_size > len as u32 {
                 s.id3_skip = total_tag_size - len as u32;
             }
@@ -2129,7 +2308,6 @@ pub unsafe fn mp3_feed_detect(s: &mut Mp3State, buf: *const u8, len: usize) {
         return;
     }
 
-    // Non-ID3 detect bytes (0xFF sync word) — do inline sync
     if len >= 4 && *buf == 0xFF && (*buf.add(1) & 0xE0) == 0xE0 {
         let mut sr: u32 = 0;
         let mut ch: u8 = 0;
@@ -2161,16 +2339,12 @@ pub unsafe fn mp3_feed_detect(s: &mut Mp3State, buf: *const u8, len: usize) {
     }
 }
 
-/// Step the MP3 codec. Returns 0 on success.
 pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     if s.syscalls.is_null() { return -1; }
     let sys = &*s.syscalls;
     let in_chan = s.in_chan;
     let out_chan = s.out_chan;
 
-    // 1. Drain decoded PCM directly from out_buf to output channel.
-    // Write directly — no intermediate io_buf_out copy.
-    // Cap at 2048 bytes per write (matches channel buffer sizes).
     if s.out_pos < s.out_len {
         let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
         if out_poll > 0 && ((out_poll as u32) & POLL_OUT) != 0 {
@@ -2182,10 +2356,8 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
                 s.out_pos += (written as usize / 2) as u16;
             }
         }
-        // Fall through to input processing (separate io_buf)
     }
 
-    // 3. Skip ID3 tag data before sync search
     if s.id3_skip > 0 {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 { return 0; }
@@ -2197,7 +2369,6 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         return 0;
     }
 
-    // 4. State machine for input processing
     if s.phase == Mp3Phase::Sync {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 { return 0; }
@@ -2254,8 +2425,6 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     if s.phase == Mp3Phase::Frame {
         let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
-            // Only count as underrun when output is also drained (i2s will starve).
-            // Normal pipeline latency (waiting for SD read) is not an underrun.
             if s.out_pos >= s.out_len {
                 s.underrun_count += 1;
             }
@@ -2284,14 +2453,13 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     }
 
     if s.phase == Mp3Phase::Decode && s.out_pos >= s.out_len {
-        // Only decode when previous output is fully drained
         let result = decode_frame(s);
         if result >= 0 {
             s.out_pos = 0;
             s.out_len = result as u16;
             s.frame_count = s.frame_count.wrapping_add(1);
 
-            // Propagate sample rate downstream when it changes
+
             if s.sample_rate != s.last_sent_rate && s.sample_rate > 0 {
                 let mut rate_buf = [0u8; 4];
                 let rb = rate_buf.as_mut_ptr();
@@ -2304,7 +2472,6 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
                 s.last_sent_rate = s.sample_rate;
             }
 
-            // Health probe: log accumulated underrun count (every 64th frame)
             if s.frame_count & 63 == 0 && s.underrun_count > 0 {
                 let mut lb = [0u8; 48];
                 let bp = lb.as_mut_ptr();
@@ -2320,7 +2487,6 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
                 s.underrun_count = 0;
             }
         } else {
-            // Log error code + all 4 big_values + first table_select per gc
             let mut lb = [0u8; 48];
             let bp = lb.as_mut_ptr();
             let tag = b"[mp3] err ";
@@ -2349,7 +2515,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         s.frame_pos = 0;
         s.frame_size = 0;
         s.phase = Mp3Phase::Sync;
-        return 2; // Burst — start draining output immediately
+        return 2;
     }
 
     0

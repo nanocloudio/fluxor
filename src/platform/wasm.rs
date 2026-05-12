@@ -28,6 +28,9 @@ mod websocket;
 #[path = "wasm/fetch.rs"]
 mod fetch;
 
+#[path = "wasm/image_codec.rs"]
+mod image_codec;
+
 #[path = "wasm/fs.rs"]
 mod fs;
 
@@ -258,6 +261,7 @@ const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
 const WASM_BROWSER_AUDIO_HASH: u32 = fnv1a32(b"wasm_browser_audio");
 const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
 const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
+const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 
 /// Initialise a per-module heap sized for one `State` struct plus
 /// alignment slack. Each built-in's `alloc_state` makes one
@@ -265,7 +269,13 @@ const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
 /// to grow. Returns false if the shared STATE_ARENA is full; caller
 /// logs and skips the module.
 fn init_builtin_heap<S>(module_idx: usize) -> bool {
-    let bytes = core::mem::size_of::<S>() + 32;
+    init_builtin_heap_sized(module_idx, core::mem::size_of::<S>() + 32)
+}
+
+/// Variant for built-ins whose runtime heap need exceeds their
+/// State struct (e.g. `wasm_browser_image_codec` heap-allocs a
+/// max_bytes-sized encoded buffer alongside its small State).
+fn init_builtin_heap_sized(module_idx: usize, bytes: usize) -> bool {
     match crate::kernel::loader::alloc_state(bytes) {
         Ok(arena_ptr) => {
             crate::kernel::heap::init_module_heap(module_idx, arena_ptr, bytes);
@@ -339,16 +349,9 @@ unsafe fn load_embedded_modules() -> usize {
         // own State struct (plus alignment slack) before calling
         // `build()`.
         if entry.name_hash == WASM_BROWSER_CANVAS_HASH {
-            if !init_builtin_heap::<canvas::CanvasState>(module_idx) {
-                log_fmt2(
-                    3,
-                    "[wasm-kernel] module ",
-                    module_idx as u64,
-                    " = wasm_browser_canvas: STATE_ARENA full, skipping",
-                    0,
-                );
-                continue;
-            }
+            // Width/height first — the per-module heap holds the
+            // RGB565 frame buffer (width * height * 2), so heap
+            // sizing depends on the params.
             let mut width = 0u16;
             let mut height = 0u16;
             walk_tlv(entry.params(), |tag, value| match tag {
@@ -356,6 +359,17 @@ unsafe fn load_embedded_modules() -> usize {
                 11 => height = tlv_u32(value) as u16,
                 _ => {}
             });
+            let heap_bytes = canvas::heap_size_for(width, height);
+            if !init_builtin_heap_sized(module_idx, heap_bytes) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_canvas: STATE_ARENA full, skipping",
+                    heap_bytes as u64,
+                );
+                continue;
+            }
             let in_chan = scheduler::get_module_port(module_idx, 0, 0);
             let m = canvas::build(width, height, in_chan);
             scheduler::store_builtin_module(module_idx, m);
@@ -491,6 +505,44 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = host_browser_fetch (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_IMAGE_CODEC_HASH {
+            // Read params first — `max_bytes` determines per-module
+            // heap size (State + encoded buffer + slack).
+            let mut width = 0u16;
+            let mut height = 0u16;
+            let mut max_bytes = 8u32 * 1024 * 1024;
+            walk_tlv(entry.params(), |tag, value| match tag {
+                10 => width = tlv_u32(value) as u16,
+                11 => height = tlv_u32(value) as u16,
+                12 => max_bytes = tlv_u32(value),
+                _ => {}
+            });
+            let heap_bytes = image_codec::heap_size_for(max_bytes);
+            if !init_builtin_heap_sized(module_idx, heap_bytes) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_image_codec: STATE_ARENA full, skipping",
+                    heap_bytes as u64,
+                );
+                continue;
+            }
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = image_codec::build(in_chan, out_chan, width, height, max_bytes);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_image_codec (built-in)",
                 0,
             );
             continue;

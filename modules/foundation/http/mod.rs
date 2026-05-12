@@ -218,6 +218,10 @@ mod params_def {
             => |s, d, len| { server::parse_route_content_type(s, 0, d, len); };
         17, route_0_fs_path, str, 0
             => |s, d, len| { server::set_route_fs_path(s, 0, d, len); };
+        18, route_0_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 0, d, len); };
+        19, route_0_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 0, d, len); };
 
         20, route_1_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 1, d, len); };
@@ -235,6 +239,10 @@ mod params_def {
             => |s, d, len| { server::parse_route_content_type(s, 1, d, len); };
         27, route_1_fs_path, str, 0
             => |s, d, len| { server::set_route_fs_path(s, 1, d, len); };
+        28, route_1_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 1, d, len); };
+        29, route_1_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 1, d, len); };
 
         30, route_2_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 2, d, len); };
@@ -252,6 +260,10 @@ mod params_def {
             => |s, d, len| { server::parse_route_content_type(s, 2, d, len); };
         37, route_2_fs_path, str, 0
             => |s, d, len| { server::set_route_fs_path(s, 2, d, len); };
+        38, route_2_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 2, d, len); };
+        39, route_2_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 2, d, len); };
 
         40, route_3_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 3, d, len); };
@@ -269,6 +281,10 @@ mod params_def {
             => |s, d, len| { server::parse_route_content_type(s, 3, d, len); };
         47, route_3_fs_path, str, 0
             => |s, d, len| { server::set_route_fs_path(s, 3, d, len); };
+        48, route_3_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 3, d, len); };
+        49, route_3_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 3, d, len); };
     }
 }
 

@@ -34,6 +34,16 @@ SECTIONS
 
     .rodata : {
         *(.rodata*)
+        /* LLVM emits switch-table dispatch tables to `.data.rel.ro` when
+         * a `match` over a small enum of references is large enough to
+         * be jump-tableable. These tables hold pointers into .rodata
+         * that the kernel module loader must relocate at load time —
+         * they're conceptually rodata, not .data, so funnel them here
+         * (the .data output section is `_data_size = 0` and would
+         * otherwise be discarded at load). Without this the dispatch
+         * tables land in a discarded section and the first call
+         * SIGSEGVs (seen in aac_codec's huffman_2step_pair/quad). */
+        *(.data.rel.ro*)
         . = ALIGN(8);
         _code_end = .;
     } > FLASH

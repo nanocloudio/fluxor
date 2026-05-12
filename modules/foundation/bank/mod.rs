@@ -80,9 +80,11 @@ const MAX_PATH_LEN: usize = 64;
 const MODE_LOOP: u8 = 1;
 
 /// FS opcodes (mirror of `abi::contracts::storage::fs`).
-const FS_OPEN:  u32 = 0x0900;
-const FS_READ:  u32 = 0x0901;
-const FS_CLOSE: u32 = 0x0903;
+const FS_OPEN:    u32 = 0x0900;
+const FS_READ:    u32 = 0x0901;
+const FS_CLOSE:   u32 = 0x0903;
+const FS_OPENDIR: u32 = 0x0907;
+const FS_READDIR: u32 = 0x0908;
 
 // ============================================================================
 // State Machine
@@ -133,10 +135,26 @@ struct BankState {
     out_count: u8,
     _pad0: [u8; 3],
 
-    /// Number of path slots populated. Derived from `path_*` params.
-    /// When 0, bank runs in preset-selector mode (no FS reads).
+    /// Number of path slots populated. Derived from `path_*` params or
+    /// from a successful `dir:` scan. When 0, bank runs in
+    /// preset-selector mode (no FS reads).
     path_count: u8,
-    _pad1: [u8; 3],
+    /// 1 once `dir`-mode init has completed (success or failure) so we
+    /// don't re-scan on every tick if the FS isn't ready yet.
+    dir_scanned: u8,
+    /// Length of `dir_path`; 0 means dir-scan mode is disabled and the
+    /// bank uses enumerated `path_*` params.
+    dir_path_len: u8,
+    /// Length of `formats`; 0 means accept every file in `dir_path`.
+    formats_len: u8,
+    /// Absolute directory path to enumerate at init via
+    /// `FS_OPENDIR`/`FS_READDIR`. Up to MAX_PATHS entries with names
+    /// matching `formats` get copied into `paths[]`.
+    dir_path: [u8; MAX_PATH_LEN],
+    /// Comma-separated extension filter, e.g. `".mp3,.wav,.aac"` or
+    /// `".png,.jpg,.gif,.bmp"`. Empty = accept all. Matching is
+    /// case-insensitive (input filenames lowered by the FS provider).
+    formats: [u8; 64],
     /// Length of each path in `paths`; 0 means slot empty.
     path_lens: [u8; MAX_PATHS],
     /// Path bytes, one slot per index.
@@ -222,6 +240,32 @@ mod params_def {
         23, path_13, str, 0 => |s, d, len| { set_path(s, 13, d, len); };
         24, path_14, str, 0 => |s, d, len| { set_path(s, 14, d, len); };
         25, path_15, str, 0 => |s, d, len| { set_path(s, 15, d, len); };
+
+        // Directory-scan mode — auto-populates `paths[]` from a live
+        // FS_READDIR walk at init. Use this for `standard` examples
+        // where the user just drops files into `/audio` or `/images`
+        // on the SD card (or under cwd on Linux); the bank discovers
+        // them on its first tick and cycles through whatever's there.
+        // `dir` and `path_*` are mutually exclusive: if both are set
+        // the directory scan wins (paths from `dir` overwrite any
+        // explicit `path_*`).
+        26, dir, str, 0 => |s, d, len| {
+            let n = if len > super::MAX_PATH_LEN { super::MAX_PATH_LEN } else { len };
+            let mut i = 0usize;
+            while i < n { s.dir_path[i] = *d.add(i); i += 1; }
+            s.dir_path_len = n as u8;
+        };
+        // Comma-separated case-insensitive extension filter (e.g.
+        // `.mp3,.wav,.aac`). Leave unset (empty) to accept every
+        // regular file the FS provider returns. Each entry must start
+        // with `.`; lists are tried in order against the trailing
+        // bytes of each filename.
+        27, formats, str, 0 => |s, d, len| {
+            let n = if len > 64 { 64 } else { len };
+            let mut i = 0usize;
+            while i < n { s.formats[i] = *d.add(i); i += 1; }
+            s.formats_len = n as u8;
+        };
     }
 }
 
@@ -262,6 +306,170 @@ unsafe fn fs_open_index(s: &mut BankState, idx: u16) -> bool {
     s.pending_out = 0;
     s.pending_offset = 0;
     true
+}
+
+/// Lowercase ASCII helper (case-insensitive extension match).
+#[inline(always)]
+fn to_lower(c: u8) -> u8 {
+    if (b'A'..=b'Z').contains(&c) { c + 32 } else { c }
+}
+
+/// Does `name[..nlen]` end with one of the comma-separated extensions
+/// listed in `s.formats[..s.formats_len]`? Case-insensitive. Returns
+/// `true` when the formats list is empty (= accept everything).
+unsafe fn matches_format(s: &BankState, name: &[u8]) -> bool {
+    let flen = s.formats_len as usize;
+    if flen == 0 { return true; }
+    // Walk comma-separated entries.
+    let mut i = 0usize;
+    while i < flen {
+        // Find this entry's slice [i..end).
+        let start = i;
+        while i < flen && s.formats[i] != b',' { i += 1; }
+        let entry_len = i - start;
+        if entry_len > 0 && entry_len <= name.len() {
+            let name_tail = &name[name.len() - entry_len..];
+            let mut ok = true;
+            let mut k = 0usize;
+            while k < entry_len {
+                if to_lower(name_tail[k]) != to_lower(s.formats[start + k]) {
+                    ok = false;
+                    break;
+                }
+                k += 1;
+            }
+            if ok { return true; }
+        }
+        // Skip the comma.
+        if i < flen && s.formats[i] == b',' { i += 1; }
+    }
+    false
+}
+
+/// Append `parent/name` into the next free `paths[]` slot. Returns
+/// `true` if the slot was added (or `false` if `paths[]` is full).
+unsafe fn append_path(s: &mut BankState, parent: &[u8], name: &[u8]) -> bool {
+    let count = s.path_count as usize;
+    if count >= MAX_PATHS { return false; }
+    let mut total = parent.len();
+    // Insert separator unless parent already ends with '/'.
+    let need_sep = !parent.is_empty() && *parent.last().unwrap() != b'/';
+    if need_sep { total += 1; }
+    total += name.len();
+    if total > MAX_PATH_LEN { return false; }
+    let mut p = 0usize;
+    let mut i = 0usize;
+    while i < parent.len() { s.paths[count][p] = parent[i]; p += 1; i += 1; }
+    if need_sep { s.paths[count][p] = b'/'; p += 1; }
+    let mut j = 0usize;
+    while j < name.len() { s.paths[count][p] = name[j]; p += 1; j += 1; }
+    s.path_lens[count] = p as u8;
+    s.path_count = (count + 1) as u8;
+    true
+}
+
+/// One-shot directory scan via FS_OPENDIR + FS_READDIR (repeat until
+/// empty) + FS_CLOSE. Populates `paths[]` with files under `dir_path`
+/// whose names match `formats`. Subdirectories are skipped. Called
+/// once during `BankPhase::Init`; failures (provider not ready,
+/// directory missing) just leave `path_count == 0`.
+unsafe fn fs_scan_dir(s: &mut BankState) {
+    if s.dir_path_len == 0 { return; }
+    let dlen = s.dir_path_len as usize;
+    // Snapshot dir_path into a local so append_path's mutable borrow
+    // doesn't clash with reading it back inside the readdir loop.
+    let mut dir_path = [0u8; MAX_PATH_LEN];
+    dir_path[..dlen].copy_from_slice(&s.dir_path[..dlen]);
+    let dir_fd = (s.sys().provider_call)(-1, FS_OPENDIR, dir_path.as_mut_ptr(), dlen);
+    if dir_fd < 0 {
+        log_info(s, b"[bank] OPENDIR fail");
+        return;
+    }
+    // Reset path table — the scan owns it.
+    s.path_count = 0;
+    let mut i = 0;
+    while i < MAX_PATHS {
+        s.path_lens[i] = 0;
+        i += 1;
+    }
+    let mut full = false;
+    loop {
+        // Use `s.buf` as the readdir output buffer; bank's working
+        // buffer is unused during init.
+        let n = (s.sys().provider_call)(
+            dir_fd, FS_READDIR, s.buf.as_mut_ptr(), BUF_SIZE,
+        );
+        if n <= 0 { break; }
+        let n = n as usize;
+        if n < 2 { break; }
+        let count = u16::from_le_bytes([s.buf[0], s.buf[1]]) as usize;
+        let mut pos = 2usize;
+        let mut emitted = 0usize;
+        while emitted < count && pos + 2 <= n {
+            let name_len = s.buf[pos] as usize;
+            let entry_type = s.buf[pos + 1];
+            pos += 2;
+            if pos + name_len > n { break; }
+            let name = core::slice::from_raw_parts(s.buf.as_ptr().add(pos), name_len);
+            pos += name_len;
+            emitted += 1;
+            // Skip subdirectories; bank doesn't recurse.
+            if entry_type == 1 { continue; }
+            if !matches_format(s, name) { continue; }
+            if !append_path(s, &dir_path[..dlen], name) {
+                full = true;
+                break;
+            }
+        }
+        if full { break; }
+        // Provider returned 0 entries with bytes < BUF_SIZE means it
+        // just signalled "drained" — leave the loop.
+        if count == 0 { break; }
+    }
+    (s.sys().provider_call)(dir_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+
+    // Sort paths case-insensitively so playback order is stable
+    // across FS providers (Linux `readdir` returns inode order, FAT32
+    // returns insertion order, neither is human-friendly). Bubble sort
+    // is fine — `MAX_PATHS = 16`, so at most 120 comparisons.
+    let n = s.path_count as usize;
+    let mut i = 0usize;
+    while i + 1 < n {
+        let mut j = 0usize;
+        while j + 1 < n - i {
+            // Compare paths[j] vs paths[j+1] case-insensitively.
+            let a_len = s.path_lens[j] as usize;
+            let b_len = s.path_lens[j + 1] as usize;
+            let m = if a_len < b_len { a_len } else { b_len };
+            let mut k = 0usize;
+            let mut swap = false;
+            let mut decided = false;
+            while k < m {
+                let ac = to_lower(s.paths[j][k]);
+                let bc = to_lower(s.paths[j + 1][k]);
+                if ac > bc { swap = true; decided = true; break; }
+                if ac < bc { decided = true; break; }
+                k += 1;
+            }
+            if !decided && a_len > b_len { swap = true; }
+            if swap {
+                let tmp_buf = s.paths[j];
+                s.paths[j] = s.paths[j + 1];
+                s.paths[j + 1] = tmp_buf;
+                let tmp_len = s.path_lens[j];
+                s.path_lens[j] = s.path_lens[j + 1];
+                s.path_lens[j + 1] = tmp_len;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+
+    // If the user didn't set `item_count`/`file_count`, derive it
+    // from however many paths the scan populated.
+    if s.count == 0 {
+        s.count = s.path_count as u16;
+    }
 }
 
 /// Flag the consumer that the current stream has ended (so a decoder
@@ -399,8 +607,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut BankState);
         if s.syscalls.is_null() { return -1; }
 
-        // One-shot: open the initial path (if any) + emit first status.
+        // One-shot: scan the configured directory (if any), open the
+        // initial path, emit first status.
         if s.phase == BankPhase::Init {
+            // `dir:` mode — enumerate the directory and override any
+            // explicit `path_*` entries. Runs once; failure (FS not
+            // ready, missing dir) is silent — `path_count` stays 0
+            // and the consumer just sees EOF.
+            if s.dir_path_len > 0 && s.dir_scanned == 0 {
+                fs_scan_dir(s);
+                s.dir_scanned = 1;
+            }
             if s.path_count > 0 && s.count > 0 {
                 fs_open_index(s, s.index);
             }
