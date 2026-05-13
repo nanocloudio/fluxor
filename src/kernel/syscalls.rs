@@ -84,7 +84,7 @@ unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize)
     channel::channel_peek(handle, buf, len)
 }
 
-// ── v2 syscalls: handle-scoped provider dispatch ────────────────────
+// ── Handle-scoped provider dispatch ─────────────────────────────────
 
 unsafe extern "C" fn syscall_provider_open(
     contract: u32,
@@ -549,7 +549,7 @@ unsafe fn key_vault_provider_dispatch(
 }
 
 // ============================================================================
-// Generic Device Call / Query (ABI v3)
+// Generic Device Call / Query
 // ============================================================================
 
 /// Generic device call — dispatches to per-class implementations via opcode.
@@ -1281,11 +1281,22 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
             scheduler::module_info_flags(idx) as i32
         }
         reconfigure::MODULE_UPSTREAM => {
-            if arg.is_null() || arg_len < 1 {
+            // Arg layout: in `[module_idx:u8]`, out `[mask:u64 LE]`.
+            // Caller must pass `arg_len >= 9` (1 byte for the input
+            // index + 8 bytes the kernel overwrites with the bitmask).
+            // A 64-bit mask is required so the full
+            // `MAX_MODULES = 64` index range (aarch64) is
+            // representable. Returns 0 on success.
+            if arg.is_null() || arg_len < 9 {
                 return E_INVAL;
             }
             let idx = core::ptr::read(arg) as usize;
-            scheduler::module_upstream_mask(idx) as i32
+            let mask = scheduler::module_upstream_mask(idx);
+            let bytes = mask.to_le_bytes();
+            for (i, b) in bytes.iter().enumerate() {
+                *arg.add(1 + i) = *b;
+            }
+            0
         }
         reconfigure::MODULE_DONE => {
             if arg.is_null() || arg_len < 1 {
@@ -1718,6 +1729,11 @@ pub fn release_module_handles(module_idx: u8) {
     crate::kernel::fd::release_timers_owned_by(module_idx);
     // Release module provider registrations
     crate::kernel::provider::release_module_providers(module_idx);
+    // Clear channel ioctl handlers registered by this module so a
+    // finalised module's function pointer cannot survive in the
+    // channel table — the next `channel_ioctl` cmd on a bound
+    // channel would otherwise call into freed code.
+    crate::kernel::channel::release_module_handlers(module_idx);
 }
 
 unsafe extern "C" fn stub_channel_read(_handle: i32, _buf: *mut u8, _len: usize) -> i32 {

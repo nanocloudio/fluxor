@@ -11,7 +11,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use fluxor::kernel::pio_util;
 
-use fluxor::kernel::config::Hardware;
+use fluxor::kernel::planner::Hardware;
 use fluxor::kernel::planner::{self, PioRole};
 use fluxor::kernel::scheduler::{self, setup, RunnerConfig, StepResult, MAX_MODULES};
 use fluxor::kernel::syscalls;
@@ -433,14 +433,32 @@ fn rp_tick_count() -> u32 {
     embassy_time::Instant::now().as_millis() as u32
 }
 
-const FLASH_BASE: usize = 0x10000000;
-const FLASH_END: usize = 0x11000000;
+// Flash bounds come from linker symbols declared in
+// `memory-rp2350.x` / `memory-rp2040.x` (`__flash_start__` /
+// `__flash_end__`) rather than being hardcoded. The linker's view is
+// the authoritative one — RP2350 ships with a 4 MiB flash region and
+// RP2040 with 2 MiB, so any constant baked into the kernel would
+// either be permissive (admitting tampered addresses past the real
+// end) or fragile across silicon variants.
+extern "C" {
+    static __flash_start__: u8;
+    static __flash_end__: u8;
+}
+
+#[inline(always)]
+fn flash_start() -> usize {
+    unsafe { &__flash_start__ as *const u8 as usize }
+}
+#[inline(always)]
+fn flash_end_addr() -> usize {
+    unsafe { &__flash_end__ as *const u8 as usize }
+}
 
 fn rp_flash_base() -> usize {
-    FLASH_BASE
+    flash_start()
 }
 fn rp_flash_end() -> usize {
-    FLASH_END
+    flash_end_addr()
 }
 fn rp_apply_code_bit(addr: usize) -> usize {
     addr | 1
@@ -451,11 +469,11 @@ fn rp_validate_fn_addr(addr: usize) -> bool {
         return false;
     }
     let instr_addr = addr & !1;
-    (FLASH_BASE..FLASH_END).contains(&instr_addr)
+    (flash_start()..flash_end_addr()).contains(&instr_addr)
 }
 
 fn rp_validate_module_base(addr: usize) -> bool {
-    (FLASH_BASE..FLASH_END).contains(&addr)
+    (flash_start()..flash_end_addr()).contains(&addr)
 }
 
 fn rp_validate_fn_in_code(addr: usize, code_base: usize, code_size: u32) -> bool {
@@ -611,11 +629,6 @@ async fn rp_setup_graph_async() -> i32 {
 
     if result < 0 {
         log::error!("[graph] instantiation failed");
-        return -1;
-    }
-
-    if !scheduler::validate_buffer_groups(&sched.edges) {
-        log::error!("[graph] buffer group validation failed");
         return -1;
     }
 

@@ -105,14 +105,21 @@ fn wasm_init_providers() {
     // module that opens assets through `provider_call(-1, FS_OPEN, …)`.
     super::fs::register();
 }
-fn wasm_release_module_handles(_id: u8) {}
+/// Platform-specific per-module cleanup for WASM host..
+///
+/// **Currently a no-op.** Browser-side resources (Canvas2D contexts,
+/// AudioContext nodes, WebSocket handles, HTMLImageElement decoders)
+/// are owned by JavaScript on the other side of the WASM boundary —
+/// the kernel module index does not address any host-allocated
+/// resource directly. Per-handle cleanup happens through
+/// `provider_close` / the channel HUP path; this hook would only
+/// matter if WASM ever grew kernel-side per-module bookkeeping.
+fn wasm_release_module_handles(_id: u8) {
+    // See docstring — no kernel-side resources to release on the
+    // WASM target. The browser shim owns its own lifetimes.
+}
 fn wasm_boot_scan() {}
-fn wasm_merge_runtime_overrides(
-    _module_id: u16,
-    _buf: *mut u8,
-    len: usize,
-    _max: usize,
-) -> usize {
+fn wasm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize {
     len
 }
 fn wasm_init_gpio(_gpio: &[Option<GpioConfig>]) -> usize {

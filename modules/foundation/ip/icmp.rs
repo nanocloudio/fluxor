@@ -15,11 +15,7 @@ pub const ICMP_ECHO_REQUEST: u8 = 8;
 /// # Safety
 /// `data` must point to at least `len` bytes of ICMP payload (after IP header).
 /// `reply_buf` must point to at least `len` writable bytes.
-pub unsafe fn handle_icmp(
-    data: *const u8,
-    len: usize,
-    reply_buf: *mut u8,
-) -> usize {
+pub unsafe fn handle_icmp(data: *const u8, len: usize, reply_buf: *mut u8) -> usize {
     if len < ICMP_HEADER_LEN {
         return 0;
     }

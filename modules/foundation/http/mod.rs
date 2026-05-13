@@ -79,18 +79,30 @@ mod server;
 // h1 / h2 / h3 / ws / hpack / qpack layers. Stay private outside
 // the host-test feature so the firmware's symbol surface is
 // unchanged.
-#[cfg(not(feature = "host-test"))] mod hpack;
-#[cfg(feature = "host-test")] pub mod hpack;
-#[cfg(not(feature = "host-test"))] mod qpack;
-#[cfg(feature = "host-test")] pub mod qpack;
-#[cfg(not(feature = "host-test"))] mod wire_h1;
-#[cfg(feature = "host-test")] pub mod wire_h1;
-#[cfg(not(feature = "host-test"))] mod wire_h2;
-#[cfg(feature = "host-test")] pub mod wire_h2;
-#[cfg(not(feature = "host-test"))] mod wire_h3;
-#[cfg(feature = "host-test")] pub mod wire_h3;
-#[cfg(not(feature = "host-test"))] mod wire_ws;
-#[cfg(feature = "host-test")] pub mod wire_ws;
+#[cfg(not(feature = "host-test"))]
+mod hpack;
+#[cfg(feature = "host-test")]
+pub mod hpack;
+#[cfg(not(feature = "host-test"))]
+mod qpack;
+#[cfg(feature = "host-test")]
+pub mod qpack;
+#[cfg(not(feature = "host-test"))]
+mod wire_h1;
+#[cfg(feature = "host-test")]
+pub mod wire_h1;
+#[cfg(not(feature = "host-test"))]
+mod wire_h2;
+#[cfg(feature = "host-test")]
+pub mod wire_h2;
+#[cfg(not(feature = "host-test"))]
+mod wire_h3;
+#[cfg(feature = "host-test")]
+pub mod wire_h3;
+#[cfg(not(feature = "host-test"))]
+mod wire_ws;
+#[cfg(feature = "host-test")]
+pub mod wire_ws;
 
 use client::ClientState;
 use connection::NET_BUF_SIZE;
@@ -152,8 +164,8 @@ mod params_def {
     use super::client::MAX_PATH_LEN;
     use super::server;
     use super::HttpState;
-    use super::{p_u16, p_u32, p_u8};
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u32, p_u8};
 
     define_params! {
         HttpState;
@@ -375,10 +387,8 @@ pub extern "C" fn module_new(
         server::init(s);
         client::init(s);
 
-        let is_tlv = !params.is_null()
-            && params_len >= 4
-            && *params == 0xFE
-            && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -449,32 +459,59 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let p = buf.as_mut_ptr();
             let prefix = b"[http] state ph=";
             let mut q = 0usize;
-            while q < prefix.len() { *p.add(q) = prefix[q]; q += 1; }
+            while q < prefix.len() {
+                *p.add(q) = prefix[q];
+                q += 1;
+            }
             q += fmt_u32_raw(p.add(q), server::cur_phase(s) as u32);
             let mc = b" conn=";
             let mut t = 0usize;
-            while t < mc.len() { *p.add(q) = mc[t]; q += 1; t += 1; }
+            while t < mc.len() {
+                *p.add(q) = mc[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), server::cur_conn_id(s) as u32);
             let mpc = b" pc=";
             let mut t = 0usize;
-            while t < mpc.len() { *p.add(q) = mpc[t]; q += 1; t += 1; }
+            while t < mpc.len() {
+                *p.add(q) = mpc[t];
+                q += 1;
+                t += 1;
+            }
             let peer_closed = server::cur_slot(s).map(|c| c.peer_closed).unwrap_or(0);
             q += fmt_u32_raw(p.add(q), peer_closed as u32);
             let mrl = b" rl=";
             let mut t = 0usize;
-            while t < mrl.len() { *p.add(q) = mrl[t]; q += 1; t += 1; }
+            while t < mrl.len() {
+                *p.add(q) = mrl[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), server::cur_recv_len(s) as u32);
             let mso = b" so=";
             let mut t = 0usize;
-            while t < mso.len() { *p.add(q) = mso[t]; q += 1; t += 1; }
+            while t < mso.len() {
+                *p.add(q) = mso[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), server::cur_send_offset(s) as u32);
             let msl = b" sl=";
             let mut t = 0usize;
-            while t < msl.len() { *p.add(q) = msl[t]; q += 1; t += 1; }
+            while t < msl.len() {
+                *p.add(q) = msl[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), server::cur_send_len(s) as u32);
             let mac = b" act=";
             let mut t = 0usize;
-            while t < mac.len() { *p.add(q) = mac[t]; q += 1; t += 1; }
+            while t < mac.len() {
+                *p.add(q) = mac[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), server::active_slot_count(s) as u32);
             dev_log(sys, 3, p, q);
         }
@@ -527,11 +564,31 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let file_ring: u32 = 2048;
 
     let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: net_ring }, // in[0]: net_in (from IP)
-        ChannelHint { port_type: 0, port_index: 1, buffer_size: 256 },      // in[1]: var updates
-        ChannelHint { port_type: 0, port_index: 2, buffer_size: file_ring }, // in[2]: file data
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: net_ring }, // out[0]: net_out (to IP)
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: 256 },      // out[1]: file ctrl
+        ChannelHint {
+            port_type: 0,
+            port_index: 0,
+            buffer_size: net_ring,
+        }, // in[0]: net_in (from IP)
+        ChannelHint {
+            port_type: 0,
+            port_index: 1,
+            buffer_size: 256,
+        }, // in[1]: var updates
+        ChannelHint {
+            port_type: 0,
+            port_index: 2,
+            buffer_size: file_ring,
+        }, // in[2]: file data
+        ChannelHint {
+            port_type: 1,
+            port_index: 0,
+            buffer_size: net_ring,
+        }, // out[0]: net_out (to IP)
+        ChannelHint {
+            port_type: 1,
+            port_index: 1,
+            buffer_size: 256,
+        }, // out[1]: file ctrl
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }

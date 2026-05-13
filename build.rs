@@ -6,7 +6,7 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -151,37 +151,122 @@ fn generate_chip_rs(k: &KernelConfig, is_rp2040: bool) -> String {
 // Main
 // ============================================================================
 
+/// Exactly one supported target family per build invocation. Resolved from
+/// cargo feature flags. Anything that doesn't match maps to a clear error so
+/// silent fall-through (e.g. wasm builds picking up RP linker artifacts) can't
+/// occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    HostLinux,
+    HostWasm,
+    Bcm2712,
+    Rp2040,
+    Rp2350,
+}
+
+fn detect_platform() -> Platform {
+    let rp2040 = env::var("CARGO_FEATURE_CHIP_RP2040").is_ok();
+    let rp2350b = env::var("CARGO_FEATURE_CHIP_RP2350B").is_ok();
+    let bcm = env::var("CARGO_FEATURE_CHIP_BCM2712").is_ok();
+    let host_linux = env::var("CARGO_FEATURE_HOST_LINUX").is_ok();
+    let host_wasm = env::var("CARGO_FEATURE_HOST_WASM").is_ok();
+
+    let active: Vec<&str> = [
+        ("chip-rp2040", rp2040),
+        ("chip-rp2350b", rp2350b),
+        ("chip-bcm2712", bcm),
+        ("host-linux", host_linux),
+        ("host-wasm", host_wasm),
+    ]
+    .iter()
+    .filter_map(|(n, on)| if *on { Some(*n) } else { None })
+    .collect();
+
+    match active.as_slice() {
+        ["chip-rp2040"] => Platform::Rp2040,
+        ["chip-rp2350b"] => Platform::Rp2350,
+        ["chip-bcm2712"] => Platform::Bcm2712,
+        ["host-linux"] => Platform::HostLinux,
+        ["host-wasm"] => Platform::HostWasm,
+        // Zero active features means the workspace default kicked in.
+        // The default in Cargo.toml is `chip-rp2350b`, but emitting a
+        // deterministic error here is friendlier than a Cortex-M linker
+        // arg surprising a host build.
+        [] => panic!(
+            "build.rs: no platform feature selected. Pass exactly one of \
+             chip-rp2040 / chip-rp2350b / chip-bcm2712 / host-linux / host-wasm \
+             with --no-default-features --features <name>. See `make targets`."
+        ),
+        _ => panic!(
+            "build.rs: multiple conflicting platform features active: {:?}. \
+             Pass exactly one.",
+            active,
+        ),
+    }
+}
+
 fn main() {
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let is_rp2040 = env::var("CARGO_FEATURE_CHIP_RP2040").is_ok();
-    let is_bcm2712 = env::var("CARGO_FEATURE_CHIP_BCM2712").is_ok();
-    let is_host_linux = env::var("CARGO_FEATURE_HOST_LINUX").is_ok();
+    let platform = detect_platform();
+    // Always emit the rerun guard so changing build.rs itself re-triggers.
+    println!("cargo:rerun-if-changed=build.rs");
+    // Re-run if any platform feature toggles, so a feature change forces
+    // re-detection rather than picking up a stale artifact.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CHIP_RP2040");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CHIP_RP2350B");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CHIP_BCM2712");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_HOST_LINUX");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_HOST_WASM");
+    // Downstream Rust code can match on this cfg to assert platform identity
+    // (e.g. a `#[cfg(fluxor_platform = "wasm")]` block that statically rejects
+    // a stray RP-only `include!` ever reaching the wasm crate graph).
+    let platform_str = match platform {
+        Platform::HostLinux => "host-linux",
+        Platform::HostWasm => "host-wasm",
+        Platform::Bcm2712 => "bcm2712",
+        Platform::Rp2040 => "rp2040",
+        Platform::Rp2350 => "rp2350",
+    };
+    println!("cargo:rustc-check-cfg=cfg(fluxor_platform, values(\"host-linux\", \"host-wasm\", \"bcm2712\", \"rp2040\", \"rp2350\"))");
+    println!("cargo:rustc-cfg=fluxor_platform=\"{platform_str}\"");
 
-    if is_host_linux {
-        // --- Linux hosted (aarch64 userspace) ---
-        // No linker script, no chip generation. Standard Linux toolchain.
-        println!("cargo:rerun-if-changed=build.rs");
-        return;
+    match platform {
+        Platform::HostLinux | Platform::HostWasm => {
+            // Hosted targets: capacity tunables come from
+            // `abi::config::kernel` (per-profile, selected at compile
+            // time via `cfg(target_arch)` in `modules/sdk/config.rs`).
+            // No linker script, no chip_generated.rs.
+        }
+        Platform::Bcm2712 => emit_bcm2712(out),
+        Platform::Rp2040 => emit_rp(out, Rp::Rp2040),
+        Platform::Rp2350 => emit_rp(out, Rp::Rp2350),
     }
+}
 
-    if is_bcm2712 {
-        // --- BCM2712 (aarch64 bare-metal) ---
-        // Single linker script with board-dependent RAM origin via --defsym.
-        let is_cm5 = env::var("CARGO_FEATURE_BOARD_CM5").is_ok();
-        let ram_origin = if is_cm5 { "0x80000" } else { "0x40080000" };
-        File::create(out.join("memory-bcm2712.x"))
-            .unwrap()
-            .write_all(include_bytes!("memory-bcm2712.x"))
-            .unwrap();
-        println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
-        println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={}", ram_origin);
-        println!("cargo:rerun-if-changed=memory-bcm2712.x");
-        println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
-        println!("cargo:rerun-if-changed=build.rs");
-        return;
-    }
+fn emit_bcm2712(out: &Path) {
+    // BCM2712 / CM5: single linker script with board-dependent RAM origin
+    // via --defsym. Capacity constants come from the centralised
+    // `abi::config::kernel::profile_host`; `targets/silicon/bcm2712.toml`
+    // carries non-capacity metadata only.
+    let is_cm5 = env::var("CARGO_FEATURE_BOARD_CM5").is_ok();
+    let ram_origin = if is_cm5 { "0x80000" } else { "0x40080000" };
+    File::create(out.join("memory-bcm2712.x"))
+        .unwrap()
+        .write_all(include_bytes!("memory-bcm2712.x"))
+        .unwrap();
+    println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
+    println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={}", ram_origin);
+    println!("cargo:rerun-if-changed=memory-bcm2712.x");
+    println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
+}
 
-    // --- RP family (Cortex-M) ---
+enum Rp {
+    Rp2040,
+    Rp2350,
+}
+
+fn emit_rp(out: &Path, family: Rp) {
+    let is_rp2040 = matches!(family, Rp::Rp2040);
     let linker_script = if is_rp2040 {
         include_bytes!("memory-rp2040.x") as &[u8]
     } else {
@@ -192,7 +277,6 @@ fn main() {
         .write_all(linker_script)
         .unwrap();
 
-    // --- Chip constants from silicon TOML ---
     let toml_path = if is_rp2040 {
         "targets/silicon/rp2040.toml"
     } else {
@@ -212,12 +296,10 @@ fn main() {
         .write_all(generated.as_bytes())
         .unwrap();
 
-    // --- Rerun triggers ---
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory-rp2350.x");
     println!("cargo:rerun-if-changed=memory-rp2040.x");
     println!("cargo:rerun-if-changed=targets/silicon/rp2040.toml");
     println!("cargo:rerun-if-changed=targets/silicon/rp2350a.toml");
     println!("cargo:rerun-if-changed=targets/silicon/rp2350b.toml");
-    println!("cargo:rerun-if-changed=build.rs");
 }

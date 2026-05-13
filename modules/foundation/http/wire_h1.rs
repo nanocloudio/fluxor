@@ -36,7 +36,12 @@ pub unsafe fn find_header_end(buf: &[u8], len: usize) -> Option<usize> {
 ///
 /// GET is the only method this server accepts; non-GET requests fall
 /// through to a 400 reply.
-pub unsafe fn parse_request_line(src: *const u8, src_len: usize, dst: *mut u8, dst_cap: usize) -> Option<usize> {
+pub unsafe fn parse_request_line(
+    src: *const u8,
+    src_len: usize,
+    dst: *mut u8,
+    dst_cap: usize,
+) -> Option<usize> {
     if src_len < 14 {
         return None;
     }

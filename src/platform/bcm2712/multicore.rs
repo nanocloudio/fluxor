@@ -60,6 +60,87 @@ const RING_MASK: u32 = (RING_SLOTS - 1) as u32;
 /// returns EINVAL, the frame is never consumed).
 pub const SLOT_DATA_SIZE: usize = crate::abi::CHANNEL_BUFFER_SIZE;
 
+// ── Cross-domain telemetry ────────────────────────────────────────────────
+//
+// Operators need to see when the bridge is dropping data so that an
+// overloaded destination can be diagnosed without a kernel rebuild.
+// Three global aggregate counters:
+//
+// * `CROSS_DOMAIN_DROPS` — producer-side `ch.send` failed (SPSC ring
+//   full). The producer frame is **lost**; the producer-side mailbox
+//   has already had its payload consumed by `channel_read` by the time
+//   we get here, so this is a real drop, not just backpressure.
+// * `CROSS_DOMAIN_BACKPRESSURE` — consumer side could not call
+//   `channel_write` because the local consumer channel reported
+//   `!POLL_OUT`. Data stays in the cross-domain ring until next pump,
+//   no loss, but a sustained nonzero rate means the destination is
+//   under-served.
+// * `SIDEBAND_AUX_OVERWRITES` — `pending_aux` had a fresh value
+//   replaced by a newer one before the producer pump retrieved it. The
+//   sideband path uses a single `AtomicU32` slot and is intentionally
+//   coalescing for notifications like "seek to position N" — later
+//   wins. Counter exists so a sustained nonzero rate is visible.
+//
+// All three are read via `cross_domain_stats()` and reset via
+// `cross_domain_stats_reset()`.
+
+use portable_atomic::AtomicU64;
+
+pub static CROSS_DOMAIN_DROPS: AtomicU64 = AtomicU64::new(0);
+pub static CROSS_DOMAIN_BACKPRESSURE: AtomicU64 = AtomicU64::new(0);
+pub static SIDEBAND_AUX_OVERWRITES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the three cross-domain counters.
+/// Returns `(drops, backpressure, sideband_overwrites)`.
+pub fn cross_domain_stats() -> (u64, u64, u64) {
+    use portable_atomic::Ordering;
+    (
+        CROSS_DOMAIN_DROPS.load(Ordering::Relaxed),
+        CROSS_DOMAIN_BACKPRESSURE.load(Ordering::Relaxed),
+        SIDEBAND_AUX_OVERWRITES.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset the three cross-domain counters. Used by the test harness and
+/// diagnostic windows; production code should treat these as
+/// monotonically-increasing.
+pub fn cross_domain_stats_reset() {
+    use portable_atomic::Ordering;
+    CROSS_DOMAIN_DROPS.store(0, Ordering::Relaxed);
+    CROSS_DOMAIN_BACKPRESSURE.store(0, Ordering::Relaxed);
+    SIDEBAND_AUX_OVERWRITES.store(0, Ordering::Relaxed);
+}
+
+/// Per-domain queue depth, indexed by destination `domain_id`. The
+/// aggregate counters in `cross_domain_stats()` give totals but not
+/// "which domain is starved"; this snapshot answers that. Walks every
+/// registered `CrossDomainEdge` and adds the source ring's
+/// pending-message count to its destination domain's slot. Cheap:
+/// O(cross_edge_count) atomic loads, no locks; safe to call from
+/// diagnostics on any core.
+///
+/// Reading uses `count()` which is the SPSC `head - tail` (relaxed
+/// for head, acquire for tail) — for diagnostics, not strict
+/// correctness. The returned array is the snapshot at this call's
+/// last load and may be stale by the time it returns.
+pub fn cross_domain_queue_depths() -> [u32; MAX_DOMAINS] {
+    let mut out = [0u32; MAX_DOMAINS];
+    let n = cross_edge_count();
+    let mut i = 0usize;
+    while i < n {
+        if let Some(edge) = get_cross_edge(i) {
+            let dst = edge.to_domain as usize;
+            if dst < MAX_DOMAINS {
+                if let Some(ch) = get_cross_channel(edge.channel_idx as usize) {
+                    out[dst] = out[dst].saturating_add(ch.count());
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Non-cacheable DMA buffer arena size (64 KB).
 pub const DMA_ARENA_SIZE: usize = 64 * 1024;
 
@@ -154,16 +235,21 @@ impl CrossDomainChannel {
     /// Send data through the channel (producer side).
     ///
     /// Returns `true` if the data was enqueued, `false` if the ring is full,
-    /// the channel is closed, or a different core is trying to produce.
-    ///
-    /// SPSC enforcement: the first call to `send()` records the calling core as
-    /// the producer. Subsequent calls from a different core return `false`.
+    /// the channel is closed, a different core is trying to produce, or
+    /// the source frame exceeds `SLOT_DATA_SIZE` (cross-domain slots are
+    /// fixed-size; oversized frames are rejected with no silent
+    /// truncation — every producer-side local mailbox is sized to the
+    /// same `CHANNEL_BUFFER_SIZE`, so an oversized push is a wiring bug
+    /// or a corrupted frame, never a normal condition).
     pub fn send(&self, src: &[u8]) -> bool {
         if self.closed.load(Ordering::Acquire) != 0 {
             return false;
         }
 
-        let len = src.len().min(SLOT_DATA_SIZE);
+        if src.len() > SLOT_DATA_SIZE {
+            return false;
+        }
+        let len = src.len();
 
         // SPSC enforcement: claim or verify producer core
         #[cfg(target_arch = "aarch64")]
@@ -209,6 +295,25 @@ impl CrossDomainChannel {
         }
 
         true
+    }
+
+    /// Peek the length of the head slot without consuming it.
+    /// `None` = ring is empty. Used by the cross-domain pump to
+    /// distinguish "no data" from "data present but consumer
+    /// backpressuring" so the backpressure counter can only fire on
+    /// the latter.
+    pub fn try_peek_len(&self) -> Option<usize> {
+        let tail = self.tail.val.load(Ordering::Relaxed);
+        let head = self.head.val.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        let slot_idx = (tail & RING_MASK) as usize;
+        let len = unsafe {
+            let slot_ptr = &self.slots[slot_idx] as *const RingSlot;
+            core::ptr::read_volatile(core::ptr::addr_of!((*slot_ptr).len)) as usize
+        };
+        Some(len)
     }
 
     /// Try to receive data from the channel (consumer side).

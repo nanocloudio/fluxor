@@ -241,11 +241,7 @@ pub(crate) unsafe fn encode_string(
 /// connection setup. Dynamic-table-size-update directives (§6.3) are
 /// still parsed and discarded so non-conforming peers see a clean
 /// accept.
-pub(crate) unsafe fn decode_block<F>(
-    buf: *const u8,
-    len: usize,
-    mut sink: F,
-) -> Result<(), ()>
+pub(crate) unsafe fn decode_block<F>(buf: *const u8, len: usize, mut sink: F) -> Result<(), ()>
 where
     F: FnMut(&[u8], &[u8]),
 {
@@ -294,8 +290,7 @@ where
 
     let mut name_huffman = false;
     let (name_buf, name_off, name_len): (*const u8, usize, usize) = if name_idx == 0 {
-        let (off, sl, total, h) =
-            decode_string(buf.add(start + consumed), len - start - consumed)?;
+        let (off, sl, total, h) = decode_string(buf.add(start + consumed), len - start - consumed)?;
         let raw = buf.add(start + consumed);
         consumed += total;
         name_huffman = h;

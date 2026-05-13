@@ -63,8 +63,7 @@ fn audio_step(state: *mut u8) -> i32 {
         }
 
         loop {
-            let n =
-                channel::channel_read(st.in_chan, st.buf.as_mut_ptr(), st.buf.len());
+            let n = channel::channel_read(st.in_chan, st.buf.as_mut_ptr(), st.buf.len());
             if n <= 0 {
                 break;
             }

@@ -74,8 +74,7 @@ fn dom_input_step(state: *mut u8) -> i32 {
             st.seq = st.seq.wrapping_add(1);
 
             let n = n as usize;
-            let written =
-                channel::channel_write(st.out_chan, st.buf.as_ptr(), n.min(st.buf.len()));
+            let written = channel::channel_write(st.out_chan, st.buf.as_ptr(), n.min(st.buf.len()));
             if written <= 0 {
                 // Channel full — drop the event rather than backing
                 // up. Input is latency-sensitive; queueing stale

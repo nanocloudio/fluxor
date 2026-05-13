@@ -660,14 +660,14 @@ pub fn bridge_reset_all() {
 pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     let bridge = match bridge_get(slot) {
         Some(b) => b,
-        None => return -crate::kernel::errno::EINVAL,
+        None => return crate::kernel::errno::EINVAL,
     };
 
     match op {
         // BRIDGE_WRITE = 0
         0 => {
             if arg.is_null() || arg_len == 0 {
-                return -crate::kernel::errno::EINVAL;
+                return crate::kernel::errno::EINVAL;
             }
             let data = unsafe { core::slice::from_raw_parts(arg, arg_len) };
             match &bridge.inner {
@@ -679,20 +679,20 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
                     if b.push(data) {
                         0
                     } else {
-                        -crate::kernel::errno::EAGAIN
+                        crate::kernel::errno::EAGAIN
                     }
                 }
                 BridgeInner::Command(b) => {
                     b.write(data);
                     0
                 }
-                BridgeInner::None => -crate::kernel::errno::EINVAL,
+                BridgeInner::None => crate::kernel::errno::EINVAL,
             }
         }
         // BRIDGE_READ = 1
         1 => {
             if arg.is_null() || arg_len == 0 {
-                return -crate::kernel::errno::EINVAL;
+                return crate::kernel::errno::EINVAL;
             }
             let data = unsafe { core::slice::from_raw_parts_mut(arg, arg_len) };
             match &bridge.inner {
@@ -705,14 +705,14 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
                     if n > 0 {
                         n as i32
                     } else {
-                        -crate::kernel::errno::EAGAIN
+                        crate::kernel::errno::EAGAIN
                     }
                 }
                 BridgeInner::Command(b) => match b.read_if_new(data) {
                     Some(n) => n as i32,
-                    None => -crate::kernel::errno::EAGAIN,
+                    None => crate::kernel::errno::EAGAIN,
                 },
-                BridgeInner::None => -crate::kernel::errno::EINVAL,
+                BridgeInner::None => crate::kernel::errno::EINVAL,
             }
         }
         // BRIDGE_POLL = 2
@@ -733,13 +733,13 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
                         0
                     }
                 }
-                BridgeInner::None => -crate::kernel::errno::EINVAL,
+                BridgeInner::None => crate::kernel::errno::EINVAL,
             }
         }
         // BRIDGE_INFO = 3: return [type:u8, from:u8, to:u8, reserved:u8, drops:u32, seq:u32]
         3 => {
             if arg.is_null() || arg_len < 12 {
-                return -crate::kernel::errno::EINVAL;
+                return crate::kernel::errno::EINVAL;
             }
             let out = unsafe { core::slice::from_raw_parts_mut(arg, 12) };
             out[0] = bridge.bridge_type as u8;
@@ -759,6 +759,6 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
             out[8..12].copy_from_slice(&seq.to_le_bytes());
             12
         }
-        _ => -crate::kernel::errno::ENOSYS,
+        _ => crate::kernel::errno::ENOSYS,
     }
 }

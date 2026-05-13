@@ -146,11 +146,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     // streams when multiple sources are wired in the same run.
     let mut byte_logs: std::collections::BTreeMap<Capability, std::fs::File> =
         std::collections::BTreeMap::new();
-    let mut byte_log_caps: Vec<Capability> = plan
-        .consoles
-        .iter()
-        .map(|c| c.capability)
-        .collect();
+    let mut byte_log_caps: Vec<Capability> = plan.consoles.iter().map(|c| c.capability).collect();
     if let Some(t) = &plan.telemetry {
         byte_log_caps.push(t.capability);
     }

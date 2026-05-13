@@ -22,36 +22,59 @@ use fluxor::kernel::loader;
 use fluxor::kernel::multicore;
 use fluxor::kernel::config::EdgeClass;
 
+// ── Boot-time submodules (binary-private; not exposed via fluxor::kernel) ──
+//
+// Boot-only support code (UART driver, GIC distributor, ARM Generic
+// Timer, RP1 HAL, exception vectors, boot-time MMU page tables,
+// kernel `log` backend) is factored into focused submodules under
+// `src/platform/bcm2712/` and consumed by `main()`, the domain
+// loops, and the BCM HAL ops table.
+//
+// Submodules that hold shared kernel state (PCIe enumeration,
+// runtime MMU isolation, cross-domain channels, NIC DMA arena, paged
+// memory) are declared in `src/kernel/mod.rs` and reachable as
+// `fluxor::kernel::{pcie, mmu, multicore, nic_ring, …}`. They are
+// **not** redeclared here — a loaded module's kernel-facing surface
+// is the `fluxor::kernel` namespace, never `src/platform/*`.
+#[path = "bcm2712/timer.rs"]
+mod timer;
+#[path = "bcm2712/boot_mmu.rs"]
+mod boot_mmu;
+#[path = "bcm2712/uart.rs"]
+mod uart;
+#[path = "bcm2712/logger.rs"]
+mod logger;
+#[path = "bcm2712/gic.rs"]
+mod gic;
+#[path = "bcm2712/rp1.rs"]
+mod rp1;
+#[path = "bcm2712/exception.rs"]
+mod exception;
+
+// Bring UART + GIC + exception names into the binary's namespace so
+// existing callsites (`uart_puts(b"…")`, `irq_bind(…)`, `GICD_BASE`,
+// `IRQ_BINDING_COUNT`, `TICKS_PER_TICK`, `CORE_TICKS`,
+// `current_core_id()`, …) stay unchanged. The submodules own the MMIO
+// registers, log-ring drain, debug-tx sink, GIC distributor + CPU
+// interface init, IRQ binding state, exception vectors, and the IRQ
+// dispatch path.
+use uart::*;
+use logger::RingLogger;
+use gic::*;
+use exception::*;
+
 // ============================================================================
 // Platform address constants (compile-time board selection)
 // ============================================================================
 
-// UART (PL011)
-#[cfg(not(feature = "board-cm5"))]
-const UART_BASE: usize = 0x0900_0000; // QEMU virt PL011
-#[cfg(feature = "board-cm5")]
-const UART_BASE: usize = 0x1c_0003_0000; // Pi 5 RP1 UART0 on GPIO14/15
-// RP1 is mapped at 0x1c_0000_0000 by VPU firmware (PCIe outbound window).
-// Requires enable_uart=1, enable_rp1_uart=1, and pciex4_reset=0 in config.txt.
+// UART (PL011) — see `bcm2712/uart.rs` for the driver. The `use uart::*`
+// in the submodule block above brings UART_BASE/UART_DR/UART_FR/etc.
+// into this file's namespace alongside the read/write functions.
 
-// GIC
-#[cfg(not(feature = "board-cm5"))]
-const GICD_BASE: usize = 0x0800_0000; // QEMU virt GICv2 distributor
-#[cfg(not(feature = "board-cm5"))]
-const GICC_BASE: usize = 0x0801_0000; // QEMU virt GICv2 CPU interface
-#[cfg(feature = "board-cm5")]
-const GICD_BASE: usize = 0x10_7fff_9000; // Pi 5 GIC-400 distributor
-#[cfg(feature = "board-cm5")]
-const GICC_BASE: usize = 0x10_7fff_a000; // Pi 5 GIC-400 CPU interface
-
-const GICC_IAR: *mut u32 = (GICC_BASE + 0x00C) as *mut u32;
-const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32;
-// Pi 5 (board-cm5): physical timer PPI 30 — no hypervisor, direct access.
-// QEMU: virtual timer PPI 27 — avoids KVM trap overhead on physical timer.
-#[cfg(feature = "board-cm5")]
-const TIMER_PPI: u32 = 30;
-#[cfg(not(feature = "board-cm5"))]
-const TIMER_PPI: u32 = 27;
+// GIC base addresses, IAR/EOIR pointers, and TIMER_PPI live in
+// `bcm2712/gic.rs` (brought in via `use gic::*` near the top of this
+// file). The constants stay name-identical so existing references in
+// the boot path resolve through the glob import unchanged.
 #[cfg(not(feature = "board-cm5"))]
 const QEMU_CONFIG_BLOB_ADDR: usize = 0x4100_0000;
 #[cfg(not(feature = "board-cm5"))]
@@ -74,15 +97,7 @@ global_asm!(
     "__package_source_start:",
 );
 
-// ============================================================================
-// PL011 UART registers (full register set for Pi 5 init)
-// ============================================================================
-
-const UART_DR: *mut u32 = UART_BASE as *mut u32;
-#[cfg(feature = "board-cm5")]
-const UART_FR: *const u32 = (UART_BASE + 0x18) as *const u32;
-#[cfg(feature = "board-cm5")]
-const UART_FR_TXFF: u32 = 1 << 5;
+// PL011 UART registers + driver moved to `bcm2712/uart.rs`.
 
 // ============================================================================
 // BCM2712 PCIe Root Complex
@@ -234,967 +249,12 @@ mod eth {
     }
 }
 
-// ============================================================================
-// UART driver
-// ============================================================================
 
-/// Initialize PL011 UART for Pi 5 (RP1 UART0 at 0x1c_0003_0000).
-///
-/// Depends on `rp1_clocks_init()` having run first to ungate the PL011
-/// reference clock. Values are the ones a running Linux kernel programs
-/// (captured via devmem) for 115200 baud at RP1's 50 MHz UART ref clock.
-///
-///   +0x24 IBRD = 0x1B  (27)     -> 50 MHz ref / (16 * (27 + 8/64)) = 115200 baud
-///   +0x28 FBRD = 0x08  (8)
-///   +0x2c LCRH = 0x70           -> 8N1, FIFO enabled
-///   +0x30 CR   = 0x301          -> UARTEN | TXE | RXE (no hardware flow control)
-#[cfg(feature = "board-cm5")]
-unsafe fn uart_init() {
-    // VPU firmware (with enable_rp1_uart=1) fully configures PL011 at
-    // 115200 8N1 before kernel handoff. We just reprogram to be sure.
-    let fr   = (UART_BASE + 0x18) as *const u32;
-    let ibrd = (UART_BASE + 0x24) as *mut u32;
-    let fbrd = (UART_BASE + 0x28) as *mut u32;
-    let lcrh = (UART_BASE + 0x2c) as *mut u32;
-    let cr   = (UART_BASE + 0x30) as *mut u32;
-    let imsc = (UART_BASE + 0x38) as *mut u32;
-    let icr  = (UART_BASE + 0x44) as *mut u32;
 
-    core::ptr::write_volatile(cr, 0);
-    let mut retries = 0u32;
-    while retries < 10_000 {
-        if core::ptr::read_volatile(fr) & (1 << 3) == 0 { break; }
-        retries += 1;
-    }
-    core::ptr::write_volatile(imsc, 0);
-    core::ptr::write_volatile(icr, 0x7FF);
-    core::ptr::write_volatile(ibrd, 27);
-    core::ptr::write_volatile(fbrd, 8);
-    core::ptr::write_volatile(lcrh, 0x70);
-    core::ptr::write_volatile(cr, 0x301);
-}
-
-#[cfg(not(feature = "board-cm5"))]
-unsafe fn uart_init() {
-    // QEMU virt: UART is already configured, nothing to do
-}
-
-// Normal kernel log path: push to the log ring only. The wire is driven
-// by the platform-runtime debug drain (`platform::debug::DebugDrain`)
-// via the `Bcm2712UartSink` below. Keeps logs opt-in and orthogonal to
-// the application.
-fn uart_putc(c: u8) {
-    fluxor::kernel::log_ring::push_byte(c);
-}
-
-fn uart_puts(s: &[u8]) {
-    fluxor::kernel::log_ring::push_bytes(s);
-}
-
-// Direct synchronous MMIO path — used only by the exception / panic
-// handler, which cannot rely on the scheduler (or therefore the debug
-// drain) still being alive. Normal-runtime writes go through the non-
-// blocking FIFO-fill path (`uart_nonblocking_write`).
-fn uart_raw_putc(c: u8) {
-    unsafe {
-        #[cfg(feature = "board-cm5")]
-        {
-            while core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {}
-        }
-        core::ptr::write_volatile(UART_DR, c as u32);
-    }
-}
-
-fn uart_raw_puts(s: &[u8]) {
-    let mut i = 0;
-    while i < s.len() {
-        uart_raw_putc(s[i]);
-        i += 1;
-    }
-}
-
-/// Non-blocking UART FIFO fill. Writes as many bytes as the TX FIFO
-/// will accept right now, then returns the count. Used as the
-/// `DebugTx` backend for the platform debug drain — the drain owns
-/// retry/backpressure state so we never spin here. On QEMU virt
-/// (non-board-cm5) the FR bit isn't meaningful; fall back to writing
-/// all bytes.
-fn uart_nonblocking_write(bytes: &[u8]) -> usize {
-    if UART_READY.load(Ordering::Relaxed) == 0 {
-        return 0;
-    }
-    let mut i = 0;
-    while i < bytes.len() {
-        #[cfg(feature = "board-cm5")]
-        unsafe {
-            if core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {
-                break;
-            }
-        }
-        unsafe { core::ptr::write_volatile(UART_DR, bytes[i] as u32) };
-        i += 1;
-    }
-    i
-}
-
-/// Raw u32 decimal printer for panic / exception paths (mirrors
-/// `uart_put_u32` but goes straight to the wire).
-fn uart_raw_put_u32(mut n: u32) {
-    let mut buf = [0u8; 10];
-    let mut i = 0usize;
-    if n == 0 { uart_raw_putc(b'0'); return; }
-    while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-    while i > 0 { i -= 1; uart_raw_putc(buf[i]); }
-}
-
-// --- Platform debug drain (local UART) ---
-//
-// Normal-runtime path for kernel log output. Drains `log_ring` into
-// the UART via `DebugTx`, called from the core-0 main loop once per
-// scheduler tick (tier 0 / tier 1a). SPSC against the kernel log
-// path — single consumer. Panic / exception handlers do not use this
-// path; they hit the wire directly via `uart_raw_puts`.
-struct Bcm2712UartSink;
-
-impl fluxor::platform::debug::DebugTx for Bcm2712UartSink {
-    fn write(&mut self, bytes: &[u8]) -> usize {
-        uart_nonblocking_write(bytes)
-    }
-}
-
-static mut DEBUG_DRAIN: fluxor::platform::debug::DebugDrain<1024> =
-    fluxor::platform::debug::DebugDrain::new();
-static mut DEBUG_SINK: Bcm2712UartSink = Bcm2712UartSink;
-
-/// Drain queued log bytes to the UART. MUST only be called from core 0.
-#[inline]
-fn debug_drain_poll_core0() {
-    // SAFETY: SPSC consumer on log_ring; only called from core 0 in
-    // the main loop or during boot before secondary cores wake.
-    unsafe {
-        let drain_p = &raw mut DEBUG_DRAIN;
-        let sink_p = &raw mut DEBUG_SINK;
-        (*drain_p).poll(&mut *sink_p);
-    }
-}
-
-fn uart_put_u32(mut n: u32) {
-    let mut buf = [0u8; 10];
-    let mut i = 0usize;
-    if n == 0 { uart_putc(b'0'); return; }
-    while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-    while i > 0 { i -= 1; uart_putc(buf[i]); }
-}
-
-fn uart_put_hex32(val: u32) {
-    let hex = b"0123456789abcdef";
-    uart_puts(b"0x");
-    let mut i = 28i32;
-    while i >= 0 {
-        uart_putc(hex[((val >> i as u32) & 0xf) as usize]);
-        i -= 4;
-    }
-}
-
-// ============================================================================
-// MMU — Identity-mapped page tables (Pi 5 only)
-// ============================================================================
-//
-// 4KB granule, EL1, 2-level (L1 + L2) identity map.
-// L1 covers 512 entries x 1GB each = 512 GB address space.
-// L2 covers 512 entries x 2MB each = 1 GB per L1 entry.
-//
-// MAIR indices:
-//   0 = Normal Cacheable (Write-Back, Write-Allocate, inner+outer)
-//   1 = Device-nGnRnE (strongly ordered device memory)
-//   2 = Normal Non-cacheable
-//
-// Memory map:
-//   0x0000_0000 .. 0x3FFF_FFFF  (1 GB)  — DRAM, Normal Cacheable
-//   0x4000_0000 .. 0x7FFF_FFFF  (1 GB)  — DRAM, Normal Cacheable
-//   0x8000_0000 .. 0xBFFF_FFFF  (1 GB)  — DRAM, Normal Cacheable
-//   0xC000_0000 .. 0xFFFF_FFFF  (1 GB)  — DRAM, Normal Cacheable
-//   0x1_0000_0000 .. onwards    — Device (PCIe, RP1, GIC, BCM2712 peripherals)
-//
-// On QEMU virt, the memory map is different but we use 1GB blocks which is
-// coarse enough to work. The key device regions (0x08000000 GIC, 0x09000000 UART)
-// fall in the first 1GB which we map as device memory.
-
-#[cfg(feature = "board-cm5")]
-#[allow(dead_code)]
-mod mmu {
-    // Page table attributes for block descriptors (2MB or 1GB)
-    const VALID: u64 = 1;        // bit 0: valid
-    const TABLE: u64 = 1 << 1;   // bit 1: table descriptor (vs block for L1 1GB)
-    const BLOCK: u64 = 0;        // bit 1=0: block descriptor
-
-    // Lower attributes (bits [11:2])
-    const ATTR_IDX_SHIFT: u64 = 2;
-    const NS: u64 = 1 << 5;      // Non-secure
-    const AP_RW: u64 = 0 << 6;   // AP[2:1] = 00: EL1 RW
-    const SH_INNER: u64 = 3 << 8; // Inner shareable
-    const AF: u64 = 1 << 10;     // Access flag (must set or we get fault)
-
-    // Upper attributes
-    const PXN: u64 = 1 << 53;    // Privileged execute-never
-    const UXN: u64 = 1 << 54;    // Unprivileged execute-never
-
-    // MAIR_EL1 encoding
-    // Attr0: Normal, Write-Back Write-Allocate (inner+outer) = 0xFF
-    // Attr1: Device-nGnRE = 0x04 (per RP1 datasheet §3.3.1.2: recommended
-    //        AArch64 mapping for the RP1 PCIe peripheral region is nGnRE,
-    //        not nGnRnE — nGnRnE forces the CPU to wait for writes to be
-    //        "observable" before proceeding, which stalls on PCIe Posted
-    //        writes that never return explicit completions)
-    // Attr2: Normal Non-cacheable = 0x44
-    pub const MAIR_VALUE: u64 =
-        0xFF              // index 0: Normal WB-WA
-        | (0x04 << 8)    // index 1: Device-nGnRE
-        | (0x44 << 16);  // index 2: Normal Non-cacheable
-
-    // TCR_EL1: 48-bit VA (T0SZ=16), 4KB granule, inner+outer WB-WA cacheable
-    // TG0 = 0b00 (4KB), SH0 = 0b11 (inner shareable)
-    // ORGN0 = 0b01 (WB-WA), IRGN0 = 0b01 (WB-WA)
-    // T0SZ = 16 (48-bit)
-    // T0SZ=25 → 39-bit VA (512 GB). Translation starts at L1 (no L0 needed).
-    // Each L1 entry covers 1 GB. 512 entries covers the full 512 GB space.
-    // RP1 BAR at 0x1f_xxxx_xxxx (~133 GB) fits within 512 GB.
-    // TG0 = 0b00 (4KB) is encoded as zero — the bit field is intentionally
-    // omitted from the OR chain so it stays zero without a no-effect shift.
-    pub const TCR_VALUE: u64 =
-        25                 // T0SZ = 25 → 39-bit VA (512 GB)
-        | (0b01 << 8)     // IRGN0: WB-WA
-        | (0b01 << 10)    // ORGN0: WB-WA
-        | (0b11 << 12)    // SH0: inner shareable
-        | (1 << 23)       // EPD1: disable TTBR1_EL1 walks (kernel-only, no upper VA)
-        | (0b010u64 << 32); // IPS = 0b010 → 40-bit PA (1TB, covers RP1 BAR at 0x1f_xxxx_xxxx)
-
-    // Block descriptor for DRAM: Normal Cacheable, RW, Inner Shareable
-    const fn dram_block(addr: u64) -> u64 {
-        addr | VALID | BLOCK | (0 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF
-    }
-
-    // Block descriptor for Device memory: Device-nGnRnE, RW, no exec
-    const fn device_block(addr: u64) -> u64 {
-        addr | VALID | BLOCK | (1 << ATTR_IDX_SHIFT) | AP_RW | AF | PXN | UXN
-    }
-
-    // Block descriptor for DMA memory: Normal Non-Cacheable, RW, Inner Shareable
-    // Used for NIC DMA arena so hardware DMA and CPU see coherent data without
-    // explicit cache maintenance. MAIR index 2 = 0x44 (Normal Non-cacheable).
-    const fn dma_block(addr: u64) -> u64 {
-        addr | VALID | BLOCK | (2 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | UXN
-    }
-
-    // Table descriptor: points L1 entry to an L2 table (for 2MB granularity)
-    const fn table_desc(l2_addr: u64) -> u64 {
-        l2_addr | VALID | TABLE
-    }
-
-    /// Static L1 page table (512 entries, 4KB aligned, in BSS).
-    /// Each entry covers 1 GB.
-    #[repr(C, align(4096))]
-    pub struct PageTable([u64; 512]);
-
-    #[link_section = ".bss"]
-    pub static mut L1_TABLE: PageTable = PageTable([0; 512]);
-
-    /// L2 page table for the first 1GB of DRAM (0x0 - 0x3FFFFFFF).
-    /// This allows the NIC DMA arena (2MB-aligned in BSS) to be mapped
-    /// as non-cacheable while the rest of DRAM stays cacheable.
-    /// Each entry covers 2MB.
-    #[repr(C, align(4096))]
-    struct L2Table([u64; 512]);
-
-    #[link_section = ".bss"]
-    static mut L2_TABLE_0: L2Table = L2Table([0; 512]);
-
-    /// Fill the L1 page table with identity mappings.
-    /// Must be called before enabling the MMU.
-    pub unsafe fn init_page_tables() {
-        let l1_ptr = &raw mut L1_TABLE.0;
-        let table = &mut *l1_ptr;
-
-        // 0x0_0000_0000 .. 0x0_3FFF_FFFF (1 GB): DRAM with L2 table so
-        // the 2 MB blocks enclosing the BSS-backed DMA arenas (NIC ring
-        // and PCIe1) can be flipped to Normal Non-Cacheable while the
-        // rest stays cacheable. Both arenas must live below 4 GB because
-        // the PCIe1 inbound ATU only covers PCI bus 0..0xFFFFFFFF on
-        // Pi 5 (see nvme_trace/baseline/README.md).
-        {
-            let l2_ptr = &raw mut L2_TABLE_0.0;
-            let l2 = &mut *l2_ptr;
-            // Fill all 512 L2 entries as cacheable DRAM (each 2MB)
-            let mut i = 0usize;
-            while i < 512 {
-                l2[i] = dram_block((i as u64) * 0x20_0000);
-                i += 1;
-            }
-            // Flip each BSS DMA arena's enclosing 2 MB to Normal
-            // Non-Cacheable (MAIR index 2). Hardware DMA and CPU see
-            // coherent memory by construction — no DC CVAC / IVAC on
-            // the fast path.
-            let dma_addr = fluxor::kernel::nic_ring::dma_arena_base();
-            if dma_addr != 0 && dma_addr < 0x4000_0000 {
-                let l2_idx = dma_addr >> 21;
-                l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
-            }
-            let pcie1_dma = fluxor::kernel::nic_ring::pcie1_dma_arena_base();
-            if pcie1_dma != 0 && pcie1_dma < 0x4000_0000 {
-                let l2_idx = pcie1_dma >> 21;
-                l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
-            }
-            // Point L1[0] to our L2 table
-            table[0] = table_desc(&raw const L2_TABLE_0 as u64);
-        }
-        // 0x0_4000_0000 .. 0x0_7FFF_FFFF (1 GB): DRAM
-        table[1] = dram_block(0x0_4000_0000);
-        // 0x0_8000_0000 .. 0x0_BFFF_FFFF (1 GB): DRAM
-        table[2] = dram_block(0x0_8000_0000);
-        // 0x0_C000_0000 .. 0x0_FFFF_FFFF (1 GB): DRAM
-        table[3] = dram_block(0x0_C000_0000);
-
-        // 0x1_0000_0000 .. 0x1_3FFF_FFFF: real DRAM on 8/16 GB Pi 5
-        // boards. No longer used as DMA target (see PCIE1_DMA_ARENA
-        // comment in bcm2712/net.rs) — mapped as regular cacheable
-        // DRAM in case a future consumer wants it.
-        table[4] = dram_block(0x1_0000_0000);
-        // 0x1_4000_0000 .. 0x1_7FFF_FFFF: more PCIe space (device)
-        table[5] = device_block(0x1_4000_0000);
-        // 0x1_8000_0000 .. 0x1_BFFF_FFFF: PCIe range (device)
-        table[6] = device_block(0x1_8000_0000);
-        // 0x1_C000_0000 .. 0x1_FFFF_FFFF: PCIe range (device)
-        table[7] = device_block(0x1_C000_0000);
-
-        // BCM2712 peripheral space at 0xFE000000-0xFFFFFFFF (GIC, UART, etc.)
-        // falls in the 4th GB (0xC000_0000..0xFFFF_FFFF). Map as device memory.
-        // This loses 1GB of DRAM addressability (3GB usable), which is fine for
-        // a bare-metal kernel that uses < 1MB.
-        table[3] = device_block(0x0_C000_0000);
-
-        // BCM2712 SoC peripheral aperture at 0x10_0000_0000..0x10_8000_0000 (2 GB).
-        // This covers the legacy peripherals block that device tree exposes under
-        // `soc@107c000000 { ranges = <0x00 0x10 0x00 0x80000000>; }`, including
-        // GIC-400 at 0x10_7fff_9000/a000 and the BCM7271 UART, pinctrl, etc.
-        // L1 index = 0x10_0000_0000 / 0x4000_0000 = 64. Two 1GB blocks = 64, 65.
-        table[64] = device_block(0x10_0000_0000);
-        table[65] = device_block(0x10_4000_0000);
-
-        // RP1 PCIe BAR region at 0x1c_0000_0000 (VPU firmware window).
-        // L1 index = 0x1c_0000_0000 / 0x4000_0000 = 112.
-        // Map 4 GB of device space covering the full RP1 BAR range.
-        table[112] = device_block(0x1c_0000_0000);
-        table[113] = device_block(0x1c_4000_0000);
-        table[114] = device_block(0x1c_8000_0000);
-        table[115] = device_block(0x1c_c000_0000);
-
-        // PCIe1 (external x1 slot, NVMe HAT+) outbound MMIO window at
-        // 0x18_0000_0000..0x1b_ffff_ffff (16 GB total) — verified
-        // against the Pi 5 base-board 6.12 rpt kernel `dmesg` ranges
-        // for the 1000110000.pcie controller (two ranges: mem1 at
-        // 0x1800_0000_00 prefetchable, mem0 at 0x1b80_0000_00).
-        // L1 indices 96..111, one 1 GB block each.
-        let mut pcie1_idx = 96usize;
-        while pcie1_idx < 112 {
-            let addr = (pcie1_idx as u64) * 0x4000_0000;
-            table[pcie1_idx] = device_block(addr);
-            pcie1_idx += 1;
-        }
-    }
-
-    /// Enable the MMU with the identity-mapped page tables.
-    ///
-    /// # Safety
-    /// Must be called once, early in boot, before accessing any memory that
-    /// requires cacheability attributes.
-    pub unsafe fn enable() {
-        let ttbr = &raw const L1_TABLE as u64;
-
-        core::arch::asm!(
-            // Set MAIR_EL1
-            "msr mair_el1, {mair}",
-            // Set TCR_EL1
-            "msr tcr_el1, {tcr}",
-            // Set TTBR0_EL1
-            "msr ttbr0_el1, {ttbr}",
-            // Barrier: ensure all table writes are visible
-            "dsb ish",
-            "isb",
-            // Enable MMU (SCTLR_EL1: M=1, C=1, I=1)
-            "mrs {tmp}, sctlr_el1",
-            "orr {tmp}, {tmp}, #(1 << 0)",  // M: MMU enable
-            "orr {tmp}, {tmp}, #(1 << 2)",  // C: Data cache enable
-            "orr {tmp}, {tmp}, #(1 << 12)", // I: Instruction cache enable
-            "msr sctlr_el1, {tmp}",
-            "isb",
-            mair = in(reg) MAIR_VALUE,
-            tcr = in(reg) TCR_VALUE,
-            ttbr = in(reg) ttbr,
-            tmp = out(reg) _,
-        );
-
-        // Publish MAIR/TCR/TTBR0 for the secondary-core trampoline in
-        // `bcm2712/multicore.rs`, which reads them with MMU off and
-        // needs the values to already be at PoC.
-        let mair_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_MAIR);
-        let tcr_p  = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_TCR);
-        let ttbr_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_TTBR0);
-        core::ptr::write_volatile(mair_p, MAIR_VALUE);
-        core::ptr::write_volatile(tcr_p, TCR_VALUE);
-        core::ptr::write_volatile(ttbr_p, ttbr);
-        core::arch::asm!(
-            "dc cvac, {m}",
-            "dc cvac, {t}",
-            "dc cvac, {b}",
-            "dsb sy",
-            m = in(reg) mair_p,
-            t = in(reg) tcr_p,
-            b = in(reg) ttbr_p,
-            options(nostack),
-        );
-    }
-}
-
-// On QEMU virt, no MMU setup needed (identity mapped by QEMU firmware).
-#[cfg(not(feature = "board-cm5"))]
-mod mmu {
-    pub unsafe fn init_page_tables() {}
-    pub unsafe fn enable() {}
-}
-
-// ============================================================================
-// RP1 HAL — GPIO, SPI, I2C via PCIe BAR (Pi 5 only)
-// ============================================================================
-//
-// The RP1 chip is a separate silicon die connected to BCM2712 via PCIe x4.
-// GPU firmware configures PCIe and maps RP1 into the ARM's physical address space.
-// With `pciex4_reset=0` in config.txt, these mappings survive kernel handoff.
-//
-// RP1 BAR base address (set by GPU firmware, confirmed via /proc/iomem on Linux):
-//   0x1c_0000_0000 (typical, may vary)
-//
-// RP1 peripheral offsets from BAR base:
-//   GPIO bank0: BAR + 0xd0000
-//   SPI0:       BAR + 0x50000
-//   I2C0:       BAR + 0x70000
-//   I2C1:       BAR + 0x74000
-
-#[cfg(feature = "board-cm5")]
-#[allow(dead_code)]
-mod rp1 {
-    /// RP1 PCIe BAR base address as mapped by GPU firmware.
-    /// This is the standard address on Pi 5 with stock firmware.
-    const RP1_BAR_BASE: usize = 0x1c_0000_d000;
-
-    // RP1 GPIO bank0 registers (offset 0xd0000 from RP1 BAR)
-    // But RP1_BAR_BASE already includes the offset to the peripheral aperture.
-    // The actual layout from rp1-peripherals.pdf:
-    //   GPIO bank0 base = RP1 BAR + 0x0_d0000
-    // The BAR itself is at 0x1c_0000_0000, so GPIO is at 0x1c_000d_0000.
-
-    /// RP1 peripheral base (start of RP1 address space on PCIe BAR)
-    const RP1_PERI_BASE: usize = 0x1c_0000_0000;
-
-    /// GPIO bank0 base within RP1 peripheral space
-    const RP1_GPIO_BASE: usize = RP1_PERI_BASE + 0xd_0000;
-
-    /// SYS_RIO0 base — register I/O for GPIO bank0
-    const RP1_SYS_RIO0_BASE: usize = RP1_PERI_BASE + 0xe_0000;
-
-    /// GPIO register offsets (per-pin)
-    const GPIO_STATUS: usize = 0x00; // 8 bytes per GPIO: status @ +0, ctrl @ +4
-    const GPIO_CTRL: usize = 0x04;
-
-    /// RIO register offsets
-    const RIO_OUT: usize = 0x00;       // Output value
-    const RIO_OE: usize = 0x04;        // Output enable
-    const RIO_IN: usize = 0x08;        // Input value
-    // Atomic set/clr/xor at +0x2000/+0x3000/+0x1000
-
-    const RIO_SET_OFFSET: usize = 0x2000;
-    const RIO_CLR_OFFSET: usize = 0x3000;
-    const RIO_XOR_OFFSET: usize = 0x1000;
-
-    // FUNCSEL values for GPIO_CTRL
-    const FUNCSEL_SYS_RIO: u32 = 5;   // Connect GPIO to SYS_RIO (software-controlled)
-    const FUNCSEL_NULL: u32 = 31;      // Disconnect (high-Z)
-
-    /// Probe RP1: try reading the GPIO bank0 status register for pin 0.
-    /// Returns true if the read succeeds (non-0xFFFFFFFF / non-fault).
-    pub fn probe() -> bool {
-        let val = unsafe { core::ptr::read_volatile(RP1_GPIO_BASE as *const u32) };
-        // If PCIe is not mapped, reads return 0xFFFFFFFF (bus error → all-ones)
-        val != 0xFFFF_FFFF
-    }
-
-    /// Read the raw value of RP1 SYS_RIO0 input register.
-    /// Returns the GPIO pin states as a bitmask.
-    pub fn gpio_read_all() -> u32 {
-        unsafe { core::ptr::read_volatile((RP1_SYS_RIO0_BASE + RIO_IN) as *const u32) }
-    }
-
-    /// Set a GPIO pin as output via RP1 SYS_RIO.
-    /// Sets FUNCSEL to SYS_RIO and enables output.
-    pub fn gpio_set_output(pin: u8) {
-        if pin > 27 { return; }
-        unsafe {
-            // Set FUNCSEL to SYS_RIO (5)
-            let ctrl_addr = (RP1_GPIO_BASE + (pin as usize) * 8 + GPIO_CTRL) as *mut u32;
-            core::ptr::write_volatile(ctrl_addr, FUNCSEL_SYS_RIO);
-
-            // Enable output (set OE bit)
-            let oe_set = (RP1_SYS_RIO0_BASE + RIO_OE + RIO_SET_OFFSET) as *mut u32;
-            core::ptr::write_volatile(oe_set, 1u32 << pin);
-        }
-    }
-
-    /// Set a GPIO pin as input via RP1 SYS_RIO.
-    pub fn gpio_set_input(pin: u8) {
-        if pin > 27 { return; }
-        unsafe {
-            // Set FUNCSEL to SYS_RIO (5)
-            let ctrl_addr = (RP1_GPIO_BASE + (pin as usize) * 8 + GPIO_CTRL) as *mut u32;
-            core::ptr::write_volatile(ctrl_addr, FUNCSEL_SYS_RIO);
-
-            // Disable output (clear OE bit)
-            let oe_clr = (RP1_SYS_RIO0_BASE + RIO_OE + RIO_CLR_OFFSET) as *mut u32;
-            core::ptr::write_volatile(oe_clr, 1u32 << pin);
-        }
-    }
-
-    /// Set GPIO pin output high.
-    pub fn gpio_set_high(pin: u8) {
-        if pin > 27 { return; }
-        unsafe {
-            let out_set = (RP1_SYS_RIO0_BASE + RIO_OUT + RIO_SET_OFFSET) as *mut u32;
-            core::ptr::write_volatile(out_set, 1u32 << pin);
-        }
-    }
-
-    /// Set GPIO pin output low.
-    pub fn gpio_set_low(pin: u8) {
-        if pin > 27 { return; }
-        unsafe {
-            let out_clr = (RP1_SYS_RIO0_BASE + RIO_OUT + RIO_CLR_OFFSET) as *mut u32;
-            core::ptr::write_volatile(out_clr, 1u32 << pin);
-        }
-    }
-
-    /// Toggle GPIO pin output.
-    pub fn gpio_toggle(pin: u8) {
-        if pin > 27 { return; }
-        unsafe {
-            let out_xor = (RP1_SYS_RIO0_BASE + RIO_OUT + RIO_XOR_OFFSET) as *mut u32;
-            core::ptr::write_volatile(out_xor, 1u32 << pin);
-        }
-    }
-
-    /// Read a single GPIO pin input state.
-    pub fn gpio_read(pin: u8) -> bool {
-        if pin > 27 { return false; }
-        (gpio_read_all() >> pin) & 1 != 0
-    }
-
-    // ==========================================================================
-    // RP1 SPI register bridge
-    // ==========================================================================
-
-    const RP1_SPI0_BASE: usize = RP1_PERI_BASE + 0x5_0000;
-    const RP1_SPI1_BASE: usize = RP1_PERI_BASE + 0x5_4000;
-
-    fn spi_base(idx: u8) -> usize {
-        match idx {
-            0 => RP1_SPI0_BASE,
-            _ => RP1_SPI1_BASE,
-        }
-    }
-
-    /// Write a 32-bit value to an RP1 SPI register.
-    pub fn spi_reg_write(spi_idx: u8, offset: u16, value: u32) {
-        let addr = spi_base(spi_idx) + offset as usize;
-        unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
-    }
-
-    /// Read a 32-bit value from an RP1 SPI register.
-    pub fn spi_reg_read(spi_idx: u8, offset: u16) -> u32 {
-        let addr = spi_base(spi_idx) + offset as usize;
-        unsafe { core::ptr::read_volatile(addr as *const u32) }
-    }
-
-    // ==========================================================================
-    // RP1 I2C register bridge
-    // ==========================================================================
-
-    const RP1_I2C0_BASE: usize = RP1_PERI_BASE + 0x7_0000;
-    const RP1_I2C1_BASE: usize = RP1_PERI_BASE + 0x7_4000;
-
-    fn i2c_base(idx: u8) -> usize {
-        match idx {
-            0 => RP1_I2C0_BASE,
-            _ => RP1_I2C1_BASE,
-        }
-    }
-
-    /// Write a 32-bit value to an RP1 I2C register.
-    pub fn i2c_reg_write(i2c_idx: u8, offset: u16, value: u32) {
-        let addr = i2c_base(i2c_idx) + offset as usize;
-        unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
-    }
-
-    /// Read a 32-bit value from an RP1 I2C register.
-    pub fn i2c_reg_read(i2c_idx: u8, offset: u16) -> u32 {
-        let addr = i2c_base(i2c_idx) + offset as usize;
-        unsafe { core::ptr::read_volatile(addr as *const u32) }
-    }
-
-    /// Print RP1 probe results to UART.
-    pub fn report(uart_puts_fn: fn(&[u8]), uart_put_hex32_fn: fn(u32)) {
-        if probe() {
-            uart_puts_fn(b"[rp1] detected, GPIO bank0 accessible\r\n");
-            let rio_in = gpio_read_all();
-            uart_puts_fn(b"[rp1] SYS_RIO0 IN=");
-            uart_put_hex32_fn(rio_in);
-            uart_puts_fn(b"\r\n");
-        } else {
-            uart_puts_fn(b"[rp1] NOT detected (PCIe BAR read failed)\r\n");
-            uart_puts_fn(b"[rp1] ensure config.txt has: pciex4_reset=0\r\n");
-        }
-    }
-}
-
-// Stub RP1 module for QEMU (no PCIe)
-#[cfg(not(feature = "board-cm5"))]
-mod rp1 {
-    #[allow(dead_code)]
-    pub fn probe() -> bool { false }
-    pub fn report(_uart_puts_fn: fn(&[u8]), _uart_put_hex32_fn: fn(u32)) {}
-}
-
-// ============================================================================
-// GICv2
-// ============================================================================
-
-/// IRQ-to-event binding table. When a bound IRQ fires, the kernel signals the
-/// associated event via event_signal_from_isr (ISR-safe, lock-free).
-/// Up to 4 bindings (virtio devices, GPIO, etc.).
-const MAX_IRQ_BINDINGS: usize = 4;
-struct IrqBinding {
-    irq: u32,           // GIC interrupt ID (e.g. 48 for virtio SPI 16)
-    event_handle: i32,  // Fluxor event handle to signal
-    mmio_base: usize,   // If nonzero, ACK device by reading INTERRUPT_STATUS and writing INTERRUPT_ACK
-}
-static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = [
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
-];
-static mut IRQ_BINDING_COUNT: usize = 0;
-
-/// Sentinel event_handle that tells `irq_handler` to fan out via
-/// `pcie::pcie1_msi_dispatch` instead of signalling a single event. Used
-/// by `register_pcie1_msi_spi` so the brcmstb MSI mux can service all
-/// 32 MSI vectors through one GIC SPI.
-const EVENT_HANDLE_PCIE1_MSI: i32 = -2;
-
-/// One-shot guard for `register_pcie1_msi_spi`. `irq_bind` appends a
-/// row on every call; without this flag a driver that allocates N
-/// MSI-X vectors would exhaust `IRQ_BINDINGS`.
-static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
-
-/// Enable `spi_irq` in the GIC distributor and route its fires into
-/// `pcie::pcie1_msi_dispatch` (via the `EVENT_HANDLE_PCIE1_MSI`
-/// sentinel). Returns 0 on success, -ENOMEM if the binding table is
-/// full.
-#[cfg(feature = "board-cm5")]
-pub fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
-    irq_bind(spi_irq, EVENT_HANDLE_PCIE1_MSI, 0)
-}
-
-#[cfg(not(feature = "board-cm5"))]
-pub fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
-    fluxor::kernel::errno::ENOSYS
-}
-
-/// Bind an event to a hardware IRQ. Enables the IRQ in the GIC distributor.
-/// `mmio_base`: if nonzero, the ISR reads offset 0x60 (INTERRUPT_STATUS) and
-/// writes offset 0x64 (INTERRUPT_ACK) to ACK virtio-mmio devices.
-///
-/// Returns 0 on success, negative errno on failure.
-pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
-    unsafe {
-        if IRQ_BINDING_COUNT >= MAX_IRQ_BINDINGS {
-            return fluxor::kernel::errno::ENOMEM;
-        }
-        let idx = IRQ_BINDING_COUNT;
-        IRQ_BINDINGS[idx] = IrqBinding { irq, event_handle, mmio_base };
-        IRQ_BINDING_COUNT = idx + 1;
-
-        // Enable the SPI in the GIC distributor
-        // SPIs start at IRQ 32. ISENABLER register: base + 0x100 + (irq/32)*4, bit = irq%32
-        let reg = GICD_BASE + 0x100 + (irq as usize / 32) * 4;
-        let bit = 1u32 << (irq % 32);
-        core::ptr::write_volatile(reg as *mut u32,
-            core::ptr::read_volatile(reg as *const u32) | bit);
-        // Set priority to 0 (highest)
-        core::ptr::write_volatile((GICD_BASE + 0x400 + irq as usize) as *mut u8, 0);
-        // Target CPU 0
-        core::ptr::write_volatile((GICD_BASE + 0x800 + irq as usize) as *mut u8, 1);
-
-        log::info!("[irq] bind irq={} event={} mmio={:#x}", irq, event_handle, mmio_base);
-    }
-    0
-}
-
-unsafe fn gic_init() {
-    core::ptr::write_volatile(GICD_BASE as *mut u32, 1); // GICD_CTLR: enable
-    core::ptr::write_volatile((GICD_BASE + 0x100) as *mut u32, 1u32 << TIMER_PPI); // ISENABLER0
-    core::ptr::write_volatile((GICD_BASE + 0x400 + TIMER_PPI as usize) as *mut u8, 0); // priority 0 (highest)
-    core::ptr::write_volatile((GICC_BASE + 0x004) as *mut u32, 0xFF); // PMR: allow all
-    core::ptr::write_volatile(GICC_BASE as *mut u32, 1); // GICC_CTLR: enable
-}
-
-/// Initialize GIC CPU interface on a secondary core.
-/// Each core needs its own GICC setup for PPIs (like the timer).
-unsafe fn gic_init_secondary() {
-    core::ptr::write_volatile((GICC_BASE + 0x004) as *mut u32, 0xFF); // PMR
-    core::ptr::write_volatile(GICC_BASE as *mut u32, 1); // GICC_CTLR
-    // Enable timer PPI for this core
-    core::ptr::write_volatile((GICD_BASE + 0x100) as *mut u32, 1u32 << TIMER_PPI);
-}
-
-// ============================================================================
-// ARM Generic Timer
-// ============================================================================
-
-fn timer_freq() -> u64 {
-    let freq: u64;
-    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
-    freq
-}
-
-/// Read the timer counter for cycle-accurate timing.
-/// Pi 5: physical counter (CNTPCT_EL0) — direct hardware access.
-/// QEMU: virtual counter (CNTVCT_EL0) — no KVM trap overhead.
-fn read_timer_count() -> u32 {
-    let val: u64;
-    #[cfg(feature = "board-cm5")]
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
-    #[cfg(not(feature = "board-cm5"))]
-    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
-    val as u32
-}
-
-unsafe fn timer_set(ticks: u32) {
-    #[cfg(feature = "board-cm5")]
-    core::arch::asm!(
-        "msr cntp_tval_el0, {val}",
-        "mov {ctl}, #1",
-        "msr cntp_ctl_el0, {ctl}",
-        val = in(reg) ticks as u64,
-        ctl = out(reg) _,
-    );
-    #[cfg(not(feature = "board-cm5"))]
-    core::arch::asm!(
-        "msr cntv_tval_el0, {val}",
-        "mov {ctl}, #1",
-        "msr cntv_ctl_el0, {ctl}",
-        val = in(reg) ticks as u64,
-        ctl = out(reg) _,
-    );
-}
-
-// ============================================================================
-// Exception vectors
-// ============================================================================
-
-global_asm!(
-    ".section .text",
-    ".balign 2048",
-    ".global exception_vectors",
-    "exception_vectors:",
-    // Current EL with SP_EL0 (4 entries)
-    ".balign 128", "b unhandled_exception",  // Synchronous
-    ".balign 128", "b unhandled_exception",  // IRQ
-    ".balign 128", "b unhandled_exception",  // FIQ
-    ".balign 128", "b unhandled_exception",  // SError
-    // Current EL with SP_ELx (4 entries)
-    ".balign 128", "b unhandled_exception",  // Synchronous
-    // IRQ handler — save all caller-saved registers
-    ".balign 128",
-    "sub sp, sp, #256",
-    "stp x0,  x1,  [sp, #0]",
-    "stp x2,  x3,  [sp, #16]",
-    "stp x4,  x5,  [sp, #32]",
-    "stp x6,  x7,  [sp, #48]",
-    "stp x8,  x9,  [sp, #64]",
-    "stp x10, x11, [sp, #80]",
-    "stp x12, x13, [sp, #96]",
-    "stp x14, x15, [sp, #112]",
-    "stp x16, x17, [sp, #128]",
-    "stp x18, x19, [sp, #144]",
-    "stp x29, x30, [sp, #160]",
-    "bl irq_handler",
-    "ldp x0,  x1,  [sp, #0]",
-    "ldp x2,  x3,  [sp, #16]",
-    "ldp x4,  x5,  [sp, #32]",
-    "ldp x6,  x7,  [sp, #48]",
-    "ldp x8,  x9,  [sp, #64]",
-    "ldp x10, x11, [sp, #80]",
-    "ldp x12, x13, [sp, #96]",
-    "ldp x14, x15, [sp, #112]",
-    "ldp x16, x17, [sp, #128]",
-    "ldp x18, x19, [sp, #144]",
-    "ldp x29, x30, [sp, #160]",
-    "add sp, sp, #256",
-    "eret",
-    ".balign 128", "b unhandled_exception",  // FIQ
-    ".balign 128", "b unhandled_exception",  // SError
-    // Lower EL using AArch64 (4 entries)
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    // Lower EL using AArch32 (4 entries)
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    "unhandled_exception:",
-    "stp x29, x30, [sp, #-16]!",
-    "stp x0, x1, [sp, #-16]!",
-    "mrs x0, elr_el1",
-    "mrs x1, esr_el1",
-    "mrs x2, far_el1",
-    "bl exception_dump",
-    "ldp x0, x1, [sp], #16",
-    "ldp x29, x30, [sp], #16",
-    // Spin on exception — no recovery, keep CPU in diagnosable state.
-    "1: b 1b",
-);
-
-/// Guard against recursive exceptions in exception_dump.
-static EXCEPTION_DEPTH: AtomicU32 = AtomicU32::new(0);
-/// Set to 1 after UART is initialised — exception_dump won't touch UART before this.
-static UART_READY: AtomicU32 = AtomicU32::new(0);
-
-#[no_mangle]
-unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
-    // Prevent recursive exception storms — if we fault inside the handler,
-    // just spin silently rather than faulting again.
-    if EXCEPTION_DEPTH.fetch_add(1, Ordering::Relaxed) > 0 {
-        return;
-    }
-    // Always store exception state at a fixed address for QEMU monitor inspection.
-    // Read with: (qemu) xp /4gx 0x40070000
-    // Useful when UART is not yet initialized (early boot / KVM).
-    core::ptr::write_volatile(0x4007_0000 as *mut u64, elr);
-    core::ptr::write_volatile(0x4007_0008 as *mut u64, esr);
-    core::ptr::write_volatile(0x4007_0010 as *mut u64, far);
-    core::ptr::write_volatile(0x4007_0018 as *mut u64, 0xDEAD_BEEF_CAFE_BABE);
-
-    // Don't touch UART if it hasn't been initialised yet (early boot / KVM)
-    if UART_READY.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    // Exception path writes directly to the UART hardware. The ring
-    // is unusable here — the scheduler may be dead, the log_uart
-    // overlay won't drain, and even the heap allocator might be
-    // poisoned. Raw MMIO is the only thing we can trust.
-    uart_raw_puts(b"\r\n!!! EXCEPTION\r\n");
-    uart_raw_puts(b"  ELR=0x"); exception_dump_hex64(elr);
-    uart_raw_puts(b"\r\n  ESR=0x"); exception_dump_hex64(esr);
-    uart_raw_puts(b"\r\n  FAR=0x"); exception_dump_hex64(far);
-    uart_raw_puts(b"\r\n");
-    // Recent log tail — helps correlate the fault with whatever the
-    // system logged right before it. `read_tail` does not advance
-    // the SPSC tail pointer, so a concurrent drain (if any remains)
-    // still sees the same bytes.
-    let mut buf = [0u8; 1024];
-    let n = fluxor::kernel::log_ring::read_tail(&mut buf);
-    if n > 0 {
-        uart_raw_puts(b"--- log tail (");
-        uart_raw_put_u32(n as u32);
-        uart_raw_puts(b" bytes) ---\r\n");
-        uart_raw_puts(&buf[..n]);
-        uart_raw_puts(b"\r\n--- end ---\r\n");
-    }
-}
-
-/// Hex dump for exception handler. Duplicates uart_put_hex64 but routes
-/// through uart_raw_putc — see exception_dump rationale.
-fn exception_dump_hex64(val: u64) {
-    let hex = b"0123456789abcdef";
-    let mut i = 60i32;
-    while i >= 0 {
-        uart_raw_putc(hex[((val >> i as u64) & 0xf) as usize]);
-        i -= 4;
-    }
-}
-
-/// Timer ticks per scheduler tick (set from tick_us config or default 1ms)
-static mut TICKS_PER_TICK: u32 = 0;
-
-/// Per-core tick counters. Core 0 uses DBG_TICK for backward compatibility.
-/// Secondary cores use this array.
-static CORE_TICKS: [AtomicU32; 4] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-
-/// Current core number (0-3). Pi 5 encodes it in MPIDR Aff1[15:8].
-#[inline(always)]
-fn current_core_id() -> u8 {
-    let mpidr: u64;
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)); }
-    ((mpidr >> 8) & 0xFF) as u8
-}
-
-#[no_mangle]
-unsafe extern "C" fn irq_handler() {
-    let iar = core::ptr::read_volatile(GICC_IAR);
-    let irq_id = iar & 0x3FF;
-    core::ptr::write_volatile(GICC_EOIR, iar);
-
-    if irq_id == TIMER_PPI {
-        // Timer tick — reload and count
-        timer_set(TICKS_PER_TICK);
-        let core_id = {
-            let mpidr: u64;
-            core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
-            ((mpidr >> 8) & 0xFF) as usize
-        };
-        CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
-    } else {
-        // Check IRQ bindings (virtio, etc.)
-        let n = IRQ_BINDING_COUNT;
-        let mut i = 0;
-        while i < n {
-            let binding = &IRQ_BINDINGS[i];
-            if binding.irq == irq_id {
-                if binding.event_handle == EVENT_HANDLE_PCIE1_MSI {
-                    // brcmstb MSI mux: read + clear MSI_INT_STATUS,
-                    // fan out per-vector events. Keeps total ISR
-                    // cost proportional to the number of pending
-                    // MSIs (typically 1).
-                    let _ = fluxor::kernel::pcie::pcie1_msi_dispatch();
-                } else if binding.event_handle >= 0 {
-                    // ACK device if mmio_base is set (virtio-mmio)
-                    if binding.mmio_base != 0 {
-                        let isr = core::ptr::read_volatile((binding.mmio_base + 0x60) as *const u32);
-                        if isr != 0 {
-                            core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
-                        }
-                    }
-                    fluxor::kernel::event::event_signal_from_isr(binding.event_handle);
-                }
-            }
-            i += 1;
-        }
-    }
-}
+// Timer driver lives in `src/platform/bcm2712/timer.rs` — see
+// the `#[path = "bcm2712/timer.rs"] mod timer;` declaration at the
+// top of this file. Public surface: `timer::{timer_freq,
+// read_timer_count, timer_set}`.
 
 // ============================================================================
 // Multi-core init signaling
@@ -1283,7 +343,7 @@ global_asm!(
     "    isb",
 
     // Make sure EL1 MMU/caches are off. We enable them ourselves in
-    // mmu::enable() after setting up page tables; any residual VPU state
+    // boot_mmu::enable() after setting up page tables; any residual VPU state
     // needs to be cleared so our setup actually takes effect.
     "    mrs x0, sctlr_el1",
     "    bic x0, x0, #(1 << 0)", // M
@@ -1382,8 +442,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     //      it configured, but we set our own baud/params).
     #[cfg(feature = "board-cm5")]
     unsafe {
-        mmu::init_page_tables();
-        mmu::enable();
+        boot_mmu::init_page_tables();
+        boot_mmu::enable();
         rp1_pcie_disable_aspm();
     }
 
@@ -1407,8 +467,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // QEMU virt: MMU init happens here (Pi 5 did it earlier, before PCIe).
     #[cfg(not(feature = "board-cm5"))]
     unsafe {
-        mmu::init_page_tables();
-        mmu::enable();
+        boot_mmu::init_page_tables();
+        boot_mmu::enable();
     }
 
     // Probe RP1 early on Pi 5 to confirm the PCIe BAR mapping is alive.
@@ -1442,7 +502,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     }
 
     // Report timer frequency
-    let freq = timer_freq();
+    let freq = timer::timer_freq();
     uart_puts(b"[timer] freq=");
     uart_put_u32(freq as u32);
     uart_puts(b" Hz\r\n");
@@ -1453,7 +513,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     unsafe {
         gic_init();
         TICKS_PER_TICK = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
-        timer_set(TICKS_PER_TICK);
+        timer::timer_set(TICKS_PER_TICK);
         core::arch::asm!("msr daifclr, #2"); // enable IRQs
     }
 
@@ -1470,8 +530,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // module insertion, channel allocation, port-table population). This
     // platform layers the multi-core concerns on top: cross-domain
     // edges are bridged with `multicore::register_cross_edge`, and each
-    // core's pump iterates `SCHED.domain_exec_order` via
-    // `scheduler::step_module_outcome`.
+    // core's run loop drives `scheduler::step_domain_modules` (or
+    // `step_domain_modules_poll` for Tier 3) through the shared
+    // `step_one_module` body.
     use fluxor::kernel::channel;
     use fluxor::kernel::config;
 
@@ -1491,8 +552,14 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 && modules_blob_magic == loader::MODULE_TABLE_MAGIC
             {
                 unsafe {
+                    // Cap the declared length to MAX_CONFIG_SIZE so the
+                    // parser slice doesn't span the full 16 MB gap
+                    // between QEMU_CONFIG_BLOB_ADDR and the modules
+                    // blob; the parser will reject any header that
+                    // declares more.
                     scheduler::populate_static_state(
                         QEMU_CONFIG_BLOB_ADDR as *const u8,
+                        config::MAX_CONFIG_SIZE,
                         QEMU_MODULES_BLOB_ADDR as *const u8,
                     )
                 }
@@ -1534,7 +601,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         } else {
             62500 * tick_us / 1000
         };
-        timer_set(TICKS_PER_TICK);
+        timer::timer_set(TICKS_PER_TICK);
     }
     uart_puts(b"[timer] tick_us=");
     uart_put_u32(tick_us);
@@ -1708,8 +775,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     }
 
     // Activate the compiled graph and log per-domain composition.
+    // BCM doesn't populate `sched.edges`, so DMA-owned edges are
+    // logged by walking the config's edge slice directly via
+    // `log_dma_owned_edges_from_config`.
     scheduler::set_active_module_count(module_count);
-    fluxor::kernel::scheduler::log_dma_owned_edges(module_count);
+    fluxor::kernel::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
 
     let mut d = 0usize;
     while d < multicore::MAX_DOMAINS {
@@ -1811,8 +881,6 @@ static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
     [const { DomainMetrics::new() }; multicore::MAX_DOMAINS];
 
 fn run_domain_loop(domain_id: usize) -> ! {
-    use fluxor::kernel::step_guard;
-
     let exec_mode = scheduler::domain_exec_mode(domain_id);
     let core_id = current_core_id() as usize;
 
@@ -1826,16 +894,16 @@ fn run_domain_loop(domain_id: usize) -> ! {
             loop {
                 unsafe { core::arch::asm!("wfi") };
                 multicore::park_if_requested(domain_id);
-                let t0 = read_timer_count();
+                let t0 = timer::read_timer_count();
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
                 if core_id == 0 { debug_drain_poll_core0(); }
-                let elapsed = read_timer_count().wrapping_sub(t0);
+                let elapsed = timer::read_timer_count().wrapping_sub(t0);
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
                 if elapsed > metrics.worst_step_ticks { metrics.worst_step_ticks = elapsed; }
                 // Track busy ticks (step work exceeded 50% of tick budget)
-                let freq = timer_freq() as u32;
+                let freq = timer::timer_freq() as u32;
                 let budget_ticks = if freq > 0 { (scheduler::domain_tick_us(domain_id) as u64 * freq as u64 / 1_000_000) as u32 } else { 62500 };
                 if elapsed > budget_ticks / 2 { metrics.busy_ticks += 1; }
                 // Report every ~10s (at domain tick rate)
@@ -1846,34 +914,20 @@ fn run_domain_loop(domain_id: usize) -> ! {
             }
         }
         // ── Tier 3: Poll-mode (continuous stepping) ──
-        // Module step returns Burst → re-step immediately. WFE when all idle.
+        // Continuous stepping through the shared scheduler body. The
+        // pass runs every module in the domain once via
+        // `step_domain_modules_poll`, which is identical to
+        // `step_domain_modules` except it also reports whether any
+        // module returned `StepOutcome::Burst` during the pass. When
+        // no module bursted (and there's no other pending work) the
+        // core WFEs.
         3 => {
             log::info!("[domain] {} core={} tier=3 poll-mode", domain_id, core_id);
-            let freq = bcm_counter_freq();
             loop {
                 multicore::park_if_requested(domain_id);
-                let mut any_burst = false;
-                let n = scheduler::domain_module_count(domain_id);
-                for pos in 0..n {
-                    let Some(global_idx) = scheduler::domain_exec_order_at(domain_id, pos) else { continue };
-                    scheduler::set_current_module(global_idx);
-                    step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
-                    let t0 = bcm_read_cntpct();
-                    let outcome = scheduler::step_module_outcome(global_idx);
-                    let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
-                    step_guard::disarm();
-                    step_guard::post_step_check();
-                    if step_guard::check_and_clear_timeout() {
-                        log::warn!("[guard] domain {} module {} timeout", domain_id, global_idx);
-                    }
-                    if freq > 0 {
-                        let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
-                        scheduler::record_step_time(global_idx, elapsed_us);
-                    }
-                    if matches!(outcome, Some(Ok(fluxor::modules::StepOutcome::Burst))) {
-                        any_burst = true;
-                    }
-                }
+                let sched = unsafe { scheduler::sched_mut() };
+                let (_result, any_burst) =
+                    scheduler::step_domain_modules_poll(&mut sched.modules, domain_id);
                 pump_cross_domain(domain_id);
                 if core_id == 0 { debug_drain_poll_core0(); }
 
@@ -1928,33 +982,16 @@ fn run_domain_loop(domain_id: usize) -> ! {
     }
 }
 
-/// Step every module in `domain_id` in topological order under step
-/// guard protection. The iteration walks `SCHED.domain_exec_order` —
-/// the Kahn-sorted order `prepare_graph` partitioned by domain — so
-/// fan modules (`_tee` / `_merge`) run alongside user modules without
-/// a separate pump.
+/// Step every module in `domain_id` via the shared per-domain
+/// scheduler path. Routes through `scheduler::step_domain_modules`
+/// (same `step_one_module` body single-domain platforms use), so
+/// every BCM-domain step honours period gating, upstream-ready
+/// gating, `Done` finalisation, the fault state machine, and the
+/// `Burst` loop identically to RP/Linux/WASM. See
+/// `.context/scheduler_domain_api.md`.
 fn domain_step_all(domain_id: usize) {
-    use fluxor::kernel::step_guard;
-
-    let freq = bcm_counter_freq();
-    let n = scheduler::domain_module_count(domain_id);
-    for pos in 0..n {
-        let Some(global_idx) = scheduler::domain_exec_order_at(domain_id, pos) else { continue };
-        scheduler::set_current_module(global_idx);
-        step_guard::arm(step_guard::DEFAULT_STEP_DEADLINE_US);
-        let t0 = bcm_read_cntpct();
-        let _ = scheduler::step_module_outcome(global_idx);
-        let elapsed_ticks = bcm_read_cntpct().wrapping_sub(t0);
-        step_guard::disarm();
-        step_guard::post_step_check();
-        if step_guard::check_and_clear_timeout() {
-            log::warn!("[guard] domain {} module {} timeout", domain_id, global_idx);
-        }
-        if freq > 0 {
-            let elapsed_us = (elapsed_ticks.saturating_mul(1_000_000) / freq) as u32;
-            scheduler::record_step_time(global_idx, elapsed_us);
-        }
-    }
+    let sched = unsafe { scheduler::sched_mut() };
+    let _ = scheduler::step_domain_modules(&mut sched.modules, domain_id);
 }
 
 /// Move one slot per edge in each direction between local pipe channels
@@ -1979,16 +1016,32 @@ fn pump_cross_domain(domain_id: usize) {
         let Some(edge) = multicore::get_cross_edge(ei) else { ei += 1; continue };
         let Some(ch) = multicore::get_cross_channel(edge.channel_idx as usize) else { ei += 1; continue };
 
-        // Producer side.
+        // Producer side. Check remote SPSC space first — `channel_read`
+        // commits the local mailbox frame, so consuming the producer's
+        // frame before knowing the SPSC ring has room would be a real
+        // drop. If the ring is full we leave the frame in the producer
+        // mailbox; the producer module sees back-pressure on its output
+        // and the pump retries next tick.
         if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
-            let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
-            let n = unsafe {
-                fluxor::kernel::channel::channel_read(
-                    edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
-                )
-            };
-            if n > 0 {
-                let _ = ch.send(&buf[..n as usize]);
+            if ch.is_full() {
+                multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
+                let n = unsafe {
+                    fluxor::kernel::channel::channel_read(
+                        edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
+                    )
+                };
+                if n > 0 {
+                    // The ring had space when we checked, but a parallel
+                    // consumer-side close (or an oversized frame, which
+                    // `ch.send` rejects) can still cause a refusal. Bump
+                    // the cross-domain drop counter so operator-side
+                    // telemetry sees it.
+                    if !ch.send(&buf[..n as usize]) {
+                        multicore::CROSS_DOMAIN_DROPS.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             let aux = edge.pending_aux.swap(u32::MAX, Ordering::AcqRel);
             if aux != u32::MAX {
@@ -2018,6 +1071,12 @@ fn pump_cross_domain(domain_id: usize) {
                         );
                     }
                 }
+            } else if ch.try_peek_len().is_some() {
+                // Cross-domain ring has data but the local consumer
+                // can't accept right now. No drop — the data stays
+                // queued until the next pump — but a sustained nonzero
+                // rate here means the consumer is under-served.
+                multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
             }
             let mut val: u32 = 0;
             let rc = fluxor::kernel::channel::channel_ioctl(
@@ -2026,7 +1085,16 @@ fn pump_cross_domain(domain_id: usize) {
                 &mut val as *mut u32 as *mut u8,
             );
             if rc == fluxor::kernel::channel::CHAN_OK && val != u32::MAX {
-                edge.pending_aux.store(val, Ordering::Release);
+                // `pending_aux` is single-slot — a fresh notification
+                // overwrites any prior one that the producer pump
+                // hadn't yet drained. The single-slot design is
+                // intentionally coalescing (later writes win); the
+                // overwrite counter below makes the rate of coalesced
+                // events visible without changing the wire shape.
+                let prev = edge.pending_aux.swap(val, Ordering::AcqRel);
+                if prev != u32::MAX {
+                    multicore::SIDEBAND_AUX_OVERWRITES.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         ei += 1;
@@ -2072,13 +1140,13 @@ fn secondary_core_main(domain_id: usize) -> ! {
         gic_init_secondary();
         // Set per-domain timer rate (Tier 1a may run faster than global tick)
         let domain_tick = scheduler::domain_tick_us(domain_id);
-        let freq = timer_freq();
+        let freq = timer::timer_freq();
         let ticks_for_domain = if freq > 0 {
             ((domain_tick as u64) * freq / 1_000_000) as u32
         } else {
             TICKS_PER_TICK
         };
-        timer_set(ticks_for_domain);
+        timer::timer_set(ticks_for_domain);
         // Enable IRQs (not needed for Tier 3 poll-mode, but harmless)
         core::arch::asm!("msr daifclr, #2");
     }
@@ -2128,55 +1196,6 @@ pub fn wake_secondary_cores() {
     }
 }
 
-// ============================================================================
-// log crate backend — formats records into the kernel log ring.
-// ============================================================================
-//
-// Parallel to the RingLogger on RP platforms: both routes funnel every
-// `log::info!` etc. into `kernel::log_ring::push_bytes`. Wire output is
-// driven by an opt-in overlay module (log_uart / log_usb / log_net).
-
-struct RingLogger;
-
-impl log::Log for RingLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
-    fn log(&self, record: &log::Record) {
-        use core::fmt::Write;
-        // Format into a stack buffer first, then push the whole record
-        // (plus CRLF) into the ring in a single call. Incremental
-        // write_str pushes let a preempting ISR or cross-core producer
-        // interleave bytes with our message; per-record staging prevents
-        // that on both single-core and multi-core boots.
-        struct BufWriter<'a> {
-            buf: &'a mut [u8],
-            pos: usize,
-        }
-        impl<'a> Write for BufWriter<'a> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                let bytes = s.as_bytes();
-                let remaining = self.buf.len().saturating_sub(self.pos);
-                let take = bytes.len().min(remaining);
-                self.buf[self.pos..self.pos + take].copy_from_slice(&bytes[..take]);
-                self.pos += take;
-                Ok(())
-            }
-        }
-
-        let mut buf = [0u8; 256];
-        let written = {
-            let mut w = BufWriter { buf: &mut buf, pos: 0 };
-            let _ = core::fmt::write(&mut w, *record.args());
-            if w.pos + 2 <= w.buf.len() {
-                w.buf[w.pos] = b'\r';
-                w.buf[w.pos + 1] = b'\n';
-                w.pos += 2;
-            }
-            w.pos
-        };
-        fluxor::kernel::log_ring::push_bytes(&buf[..written]);
-    }
-    fn flush(&self) {}
-}
 
 // ============================================================================
 // BCM2712 HAL Ops
@@ -2237,9 +1256,28 @@ fn bcm_tick_count() -> u32 {
 fn bcm_flash_base() -> usize { 0 }
 fn bcm_flash_end() -> usize { 0 }
 fn bcm_apply_code_bit(addr: usize) -> usize { addr }
-fn bcm_validate_fn_addr(addr: usize) -> bool { addr != 0 }
-fn bcm_validate_module_base(addr: usize) -> bool { addr != 0 }
-fn bcm_validate_fn_in_code(_addr: usize, _code_base: usize, _code_size: u32) -> bool { true }
+// BCM address-validation hooks. aarch64 instructions are 4-byte
+// aligned and module headers / code bases are also 4-byte aligned on
+// bare-metal, so requiring `addr & 0x3 == 0` catches ABI corruption
+// and the "manifest claims an offset that lands mid-instruction"
+// failure mode before the kernel calls into a bad fn pointer.
+fn bcm_validate_fn_addr(addr: usize) -> bool {
+    addr != 0 && (addr & 0x3) == 0
+}
+fn bcm_validate_module_base(addr: usize) -> bool {
+    addr != 0 && (addr & 0x3) == 0
+}
+fn bcm_validate_fn_in_code(addr: usize, code_base: usize, code_size: u32) -> bool {
+    // Belt-and-braces check against `[code_base, code_base + code_size)`.
+    // `get_export_addr` already rejects manifests claiming offsets past
+    // `code_size`, but the platform-side check runs uniformly and
+    // mirrors `linux_validate_fn_in_code`.
+    if code_base == 0 || code_size == 0 {
+        return false;
+    }
+    let end = code_base.saturating_add(code_size as usize);
+    addr >= code_base && addr < end
+}
 fn bcm_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     computed.len() == expected.len() && computed == expected
 }
@@ -2341,7 +1379,24 @@ fn bcm_init_providers() {
     fluxor::kernel::syscalls::register_system_extension(bcm_system_extension_dispatch);
 }
 
-fn bcm_release_module_handles(_module_idx: u8) {}
+/// Platform-specific per-module cleanup for BCM2712.
+///
+/// **Intentional no-op.** BCM platform resources (NIC rings, PCIe
+/// BARs, DMA arena allocations, MSI vectors) do **not** record their
+/// owning module index — the `nic_ring`, `pcie`, and
+/// `cross_domain_*` tables allocate by sequence, not by owner. A
+/// single faulted module cannot release just its slice of these
+/// resources because the kernel doesn't know which slice is its.
+/// BCM-side resource reclaim relies on the kernel-wide reset that
+/// `prepare_graph` performs on every reconfigure
+/// (`channel::reset_all` + `provider::reset_handle_tracking` +
+/// `buffer_pool::reset_all`). A meaningful per-module release would
+/// require adding `owner_module: u8` to each of those tables; until
+/// then the empty body is deliberate, not a TODO.
+fn bcm_release_module_handles(_module_idx: u8) {
+    // See docstring above — intentional no-op pending per-resource
+    // ownership tracking in nic_ring / pcie / dma arenas.
+}
 fn bcm_boot_scan() {}
 fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize { len }
 

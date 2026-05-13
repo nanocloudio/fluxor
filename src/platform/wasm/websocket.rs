@@ -163,11 +163,8 @@ fn ws_step(state: *mut u8) -> i32 {
         if st.out_chan >= 0 {
             // Drain pending retry buffer first.
             if st.rx_pending_len > 0 {
-                let written = channel::channel_write(
-                    st.out_chan,
-                    st.rx.as_ptr(),
-                    st.rx_pending_len,
-                );
+                let written =
+                    channel::channel_write(st.out_chan, st.rx.as_ptr(), st.rx_pending_len);
                 if written > 0 {
                     let w = (written as usize).min(st.rx_pending_len);
                     st.rx_pending_len = shift_consume(st.rx.as_mut_ptr(), st.rx_pending_len, w);
@@ -185,7 +182,11 @@ fn ws_step(state: *mut u8) -> i32 {
                 // as a 0-byte partial write and stash the tail. The
                 // bytes were already pulled from the JS rxQueue, so
                 // dropping on back-pressure would lose stream data.
-                let w = if written > 0 { (written as usize).min(n) } else { 0 };
+                let w = if written > 0 {
+                    (written as usize).min(n)
+                } else {
+                    0
+                };
                 if w < n {
                     // Stash unwritten tail.
                     st.rx_pending_len = shift_consume(st.rx.as_mut_ptr(), n, w);

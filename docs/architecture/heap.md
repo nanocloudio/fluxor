@@ -52,7 +52,7 @@ receive no heap.
 
 ## Syscall API
 
-Three new entries in the SyscallTable (appended, backward-compatible):
+Three entries in the SyscallTable:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|

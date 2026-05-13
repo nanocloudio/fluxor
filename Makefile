@@ -75,7 +75,7 @@ ABI_HEADER := $(SDK_DIR)/abi.rs
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,$(if $(filter synth_source,$(1)),1,2))))))))))))))
 
-.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint test install-rig-backends
+.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint check-no-inline-tests check-no-historical-abi check-wasm-no-rp-residue check-build-matrix check-stable test install-rig-backends
 
 all: tools firmware-all modules-all linux-bin
 
@@ -317,7 +317,68 @@ fmt:
 # must be checked. The leading `touch src/lib.rs` invalidates clippy's
 # incremental cache so warnings re-emit even when the prior compile was
 # silent on a sibling target.
-lint:
+# Guard: production `src/` must stay free of inline `#[cfg(test)]`
+# modules. Tests for `src/` live under `tests/harness/tests/` so the
+# kernel build matrix never compiles test code into firmware.
+check-no-inline-tests:
+	@echo "==> checking src/ for inline #[cfg(test)] modules ..."
+	@if rg -l '#\[cfg\(test\)\]' src/ >/dev/null 2>&1; then \
+		echo "ERROR: inline tests detected under src/ — move them to tests/harness/" >&2; \
+		rg -l '#\[cfg\(test\)\]' src/ >&2; \
+		exit 1; \
+	fi
+
+# Guard: the ABI is single-version v1. Historical "ABI v2 / ABI v3"
+# wording in source comments or architecture docs implies a migration
+# path and misleads implementers.
+check-no-historical-abi:
+	@echo "==> checking source + docs for historical ABI v2/v3 wording ..."
+	@if rg -n 'ABI v2|ABI v3|v2 manifest|v3 manifest|planned for v2|planned for v3|backward-compatible' docs/architecture src modules/sdk >/dev/null 2>&1; then \
+		echo "ERROR: historical ABI v2/v3 wording detected — describe the current shape as v1" >&2; \
+		rg -n 'ABI v2|ABI v3|v2 manifest|v3 manifest|planned for v2|planned for v3|backward-compatible' docs/architecture src modules/sdk >&2; \
+		exit 1; \
+	fi
+
+# Guard: a wasm build must not pick up RP-family linker artifacts —
+# one platform per build, and wasm-ld silently ignoring a Cortex-M
+# `memory.x` shouldn't hide an upstream `build.rs` fall-through.
+check-wasm-no-rp-residue: target/wasm/firmware.wasm
+	@echo "==> checking wasm binary for RP-family residue ..."
+	@if strings target/wasm/firmware.wasm | grep -iE 'cortex_m|embassy_rp|rp2350|rp2040|msplim|memory-rp' >/dev/null 2>&1; then \
+		echo "ERROR: target/wasm/firmware.wasm contains RP-family symbols; build.rs is falling through to the RP arm again" >&2; \
+		strings target/wasm/firmware.wasm | grep -iE 'cortex_m|embassy_rp|rp2350|rp2040|msplim|memory-rp' | head -5 >&2; \
+		exit 1; \
+	fi
+
+target/wasm/firmware.wasm:
+	$(MAKE) firmware TARGET=wasm
+
+# Guard: every supported platform must build clean. Kernels only —
+# module builds run through their own matrix.
+check-build-matrix:
+	@echo "==> build matrix ..."
+	$(MAKE) linux-bin
+	$(MAKE) firmware TARGET=wasm
+	$(MAKE) firmware TARGET=rp2350
+	$(MAKE) firmware TARGET=cm5
+	$(MAKE) check-wasm-no-rp-residue
+	@echo "==> build matrix: all 4 platforms green"
+
+# Umbrella pre-commit / pre-release gate. Runs every static guard
+# plus the test suite. Use this in CI and before tagging a v1
+# candidate.
+check-stable: check-no-inline-tests check-no-historical-abi check-build-matrix test
+	@echo ""
+	@echo "================================================================"
+	@echo "  Release gate green:"
+	@echo "    * no inline tests under src/"
+	@echo "    * no historical ABI v2/v3 wording in docs or source"
+	@echo "    * linux + wasm + rp2350 + cm5 all build clean"
+	@echo "    * wasm binary has no RP-family residue"
+	@echo "    * make test passing (tools + harness)"
+	@echo "================================================================"
+
+lint: check-no-inline-tests check-no-historical-abi
 	@echo "==> linting fluxor-tools (host + integration tests) ..."
 	@cd tools && cargo clippy --all-targets --all-features -- -D warnings
 	@echo "==> linting fluxor-linux (host-image, host-window, host-playback) ..."

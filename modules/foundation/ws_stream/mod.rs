@@ -160,9 +160,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if s.rx_in >= 0 && s.rx_out >= 0 {
         // Drain the pending retry buffer first.
         if s.rx_pending_len > 0 {
-            let written = unsafe {
-                (sys.channel_write)(s.rx_out, s.rx_pending.as_ptr(), s.rx_pending_len)
-            };
+            let written =
+                unsafe { (sys.channel_write)(s.rx_out, s.rx_pending.as_ptr(), s.rx_pending_len) };
             if written > 0 {
                 let w = (written as usize).min(s.rx_pending_len);
                 s.rx_pending_len =
@@ -171,14 +170,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         // Pull new frames only when retry buffer drained.
         while s.rx_pending_len == 0 {
-            let n = unsafe {
-                (sys.channel_read)(s.rx_in, s.scratch.as_mut_ptr(), s.scratch.len())
-            };
+            let n = unsafe { (sys.channel_read)(s.rx_in, s.scratch.as_mut_ptr(), s.scratch.len()) };
             if n < WS_FRAME_HDR as i32 {
                 break;
             }
             let n = n as usize;
-            let conn_id = u32::from_le_bytes([s.scratch[0], s.scratch[1], s.scratch[2], s.scratch[3]]);
+            let conn_id =
+                u32::from_le_bytes([s.scratch[0], s.scratch[1], s.scratch[2], s.scratch[3]]);
             let opcode = s.scratch[4];
             let _fin = s.scratch[5];
             let payload_len = u16::from_le_bytes([s.scratch[6], s.scratch[7]]) as usize;
@@ -193,18 +191,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             // Try to write directly first.
             let written = unsafe {
-                (sys.channel_write)(
-                    s.rx_out,
-                    s.scratch.as_ptr().add(WS_FRAME_HDR),
-                    payload_len,
-                )
+                (sys.channel_write)(s.rx_out, s.scratch.as_ptr().add(WS_FRAME_HDR), payload_len)
             };
             // CHAN_EAGAIN (negative return) is back-pressure, not
             // an error. The payload was already pulled from rx_in,
             // so treat any non-positive return as a 0-byte partial
             // write and stash the tail in `rx_pending` for the
             // next step rather than dropping bytes.
-            let w = if written > 0 { (written as usize).min(payload_len) } else { 0 };
+            let w = if written > 0 {
+                (written as usize).min(payload_len)
+            } else {
+                0
+            };
             if w < payload_len {
                 // Stash unwritten tail in retry buffer.
                 let tail = payload_len - w;
@@ -235,9 +233,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if s.tx_in >= 0 && s.tx_out >= 0 {
         // Drain the pending framed message first.
         if s.tx_pending_len > 0 {
-            let written = unsafe {
-                (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), s.tx_pending_len)
-            };
+            let written =
+                unsafe { (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), s.tx_pending_len) };
             if written > 0 {
                 let w = (written as usize).min(s.tx_pending_len);
                 s.tx_pending_len =
@@ -278,8 +275,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.tx_pending[7] = plen_le[1];
             let total = WS_FRAME_HDR + payload_len;
             // Try direct write first.
-            let written =
-                unsafe { (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), total) };
+            let written = unsafe { (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), total) };
             if written < 0 {
                 // tx_out back-pressured. Stash the whole frame and
                 // break — looping back to read more from tx_in would
@@ -290,8 +286,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let w = (written as usize).min(total);
             if w < total {
                 // Hold tail; tx_pending_len remembers what's left.
-                s.tx_pending_len =
-                    unsafe { shift_consume(s.tx_pending.as_mut_ptr(), total, w) };
+                s.tx_pending_len = unsafe { shift_consume(s.tx_pending.as_mut_ptr(), total, w) };
                 break;
             }
             // Fully sent; loop reads more.

@@ -29,9 +29,12 @@ pio_count = 0
 pio_state_machines = 0
 dma_channels = 0
 
-[kernel]
-state_arena_kb = 4096
-buffer_arena_kb = 1024
+# [kernel] capacity tunables for the WASM target live in
+# `modules/sdk/config.rs::profile_wasm` (selected at compile time via
+# `cfg(target_arch = "wasm32")`). build.rs takes the early-return path
+# for `host-wasm`; STATE_ARENA / BUFFER_ARENA / CONFIG_ARENA come from
+# `src/platform/wasm/chip.rs` re-exporting `abi::config::kernel`. Edit
+# `modules/sdk/config.rs::profile_wasm::kernel` to change capacities.
 
 [memory]
 ram_base = "0x00000000"

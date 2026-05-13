@@ -547,16 +547,11 @@ fn pack_param(
                 //     `body_file` payloads (`.wasm`, images, ...) so
                 //     the bytes never round-trip through a Rust
                 //     `String` (which would require valid UTF-8).
-                let all_bytes = arr.iter().all(|v| {
-                    v.as_u64()
-                        .map(|n| n <= 255)
-                        .unwrap_or(false)
-                });
+                let all_bytes = arr
+                    .iter()
+                    .all(|v| v.as_u64().map(|n| n <= 255).unwrap_or(false));
                 if all_bytes && !arr.is_empty() {
-                    let bytes: Vec<u8> = arr
-                        .iter()
-                        .map(|v| v.as_u64().unwrap() as u8)
-                        .collect();
+                    let bytes: Vec<u8> = arr.iter().map(|v| v.as_u64().unwrap() as u8).collect();
                     let mut offset = 0;
                     loop {
                         let remaining = bytes.len() - offset;
@@ -1087,10 +1082,7 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             //    socket without staging in `body_pool`. Use for
             //    multi-MiB payloads that exceed the body-pool cap
             //    (WASM bundles, large media).
-            let stream = obj
-                .get("stream")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
             if let Some(idx_val) = obj.get("source_index") {
                 if let Some(idx) = idx_val.as_u64() {
                     handler = if stream { 6 } else { 0 };
@@ -1118,10 +1110,7 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
                 if let Some(payload) = resolved.strip_prefix("base64:") {
                     match base64_decode(payload) {
                         Some(bytes) => Value::Array(
-                            bytes
-                                .into_iter()
-                                .map(|b| Value::Number(b.into()))
-                                .collect(),
+                            bytes.into_iter().map(|b| Value::Number(b.into())).collect(),
                         ),
                         None => {
                             // Decode failure is unrecoverable; emit

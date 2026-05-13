@@ -106,13 +106,7 @@ pub(crate) unsafe fn parse_header(buf: *const u8, len: usize) -> Option<Header> 
 /// Write a 9-byte frame header into `dst`. Caller is responsible for
 /// `length` ≤ peer's `SETTINGS_MAX_FRAME_SIZE` (we never exceed 16384,
 /// the protocol minimum, so this is safe by construction).
-pub(crate) unsafe fn write_header(
-    dst: *mut u8,
-    length: u32,
-    ftype: u8,
-    flags: u8,
-    stream_id: u32,
-) {
+pub(crate) unsafe fn write_header(dst: *mut u8, length: u32, ftype: u8, flags: u8, stream_id: u32) {
     *dst = ((length >> 16) & 0xFF) as u8;
     *dst.add(1) = ((length >> 8) & 0xFF) as u8;
     *dst.add(2) = (length & 0xFF) as u8;
@@ -136,10 +130,7 @@ pub(crate) unsafe fn write_settings_ack(dst: *mut u8) -> usize {
 /// Each setting is 6 bytes (id u16 + value u32), packed into the frame
 /// payload; the frame header carries the total payload length. Up to
 /// 6 settings fit in `dst`.
-pub(crate) unsafe fn write_settings(
-    dst: *mut u8,
-    settings: &[(u16, u32)],
-) -> usize {
+pub(crate) unsafe fn write_settings(dst: *mut u8, settings: &[(u16, u32)]) -> usize {
     let payload_len = settings.len() * 6;
     write_header(dst, payload_len as u32, FRAME_SETTINGS, 0, 0);
     let mut o = FRAME_HEADER_LEN;
@@ -190,11 +181,7 @@ pub(crate) unsafe fn write_data_frame_header(
 /// Write a WINDOW_UPDATE frame (§6.9). `stream_id == 0` updates the
 /// connection-level window; non-zero updates a single stream's window.
 /// `delta` must be 1..=2^31-1 (the spec rejects 0 with PROTOCOL_ERROR).
-pub(crate) unsafe fn write_window_update(
-    dst: *mut u8,
-    stream_id: u32,
-    delta: u32,
-) -> usize {
+pub(crate) unsafe fn write_window_update(dst: *mut u8, stream_id: u32, delta: u32) -> usize {
     write_header(dst, 4, FRAME_WINDOW_UPDATE, 0, stream_id);
     *dst.add(FRAME_HEADER_LEN) = ((delta >> 24) & 0x7F) as u8;
     *dst.add(FRAME_HEADER_LEN + 1) = ((delta >> 16) & 0xFF) as u8;
@@ -216,11 +203,7 @@ pub(crate) unsafe fn write_rst_stream(dst: *mut u8, stream_id: u32, error_code: 
 
 /// Write a GOAWAY frame (§6.8). Tells the peer we're tearing the
 /// connection down at or after `last_stream_id`. No debug data.
-pub(crate) unsafe fn write_goaway(
-    dst: *mut u8,
-    last_stream_id: u32,
-    error_code: u32,
-) -> usize {
+pub(crate) unsafe fn write_goaway(dst: *mut u8, last_stream_id: u32, error_code: u32) -> usize {
     write_header(dst, 8, FRAME_GOAWAY, 0, 0);
     let mut o = FRAME_HEADER_LEN;
     *dst.add(o) = ((last_stream_id >> 24) & 0x7F) as u8;

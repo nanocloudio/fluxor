@@ -30,24 +30,23 @@ The rest is covered below.
 
 ## Trust Root and Module Admission
 
-Every PIC module carries a manifest section (`magic = "FXMF"`). Two
-versions exist:
-
-- **v1** — 16-byte header, ports, resources, dependencies, and an
-  optional 32-byte SHA-256 integrity hash over code+data.
-- **v2** — same as v1 plus a 64-byte Ed25519 signature over the integrity
-  hash and a 32-byte signer public-key fingerprint.
+Every PIC module carries a manifest section (`magic = "FXMF"`)
+containing a 16-byte header, ports, resources, dependencies, a 32-byte
+SHA-256 integrity hash over code+data, an optional 64-byte Ed25519
+signature, and an optional 32-byte signer public-key fingerprint. The
+signature/fingerprint pair is filled in by `fluxor sign`; an unsigned
+manifest has those fields zeroed.
 
 The loader path, implemented in `src/kernel/loader.rs::validate_module`:
 
 1. Recompute SHA-256 over the in-image code and data sections.
 2. Compare against the manifest's stored hash via
    `hal::verify_integrity`. Mismatch → `IntegrityMismatch`.
-3. If the manifest is v2, read the Ed25519 signature + signer
-   fingerprint. Fetch the device's signing public key via
-   `hal::otp_read_signing_key`. Run the kernel's hand-rolled Ed25519
-   verify (`src/kernel/crypto/ed25519.rs`) against the integrity hash.
-   Mismatch → `SignatureInvalid`.
+3. If the manifest carries a signature (non-zero), read it together
+   with the signer fingerprint. Fetch the device's signing public key
+   via `hal::otp_read_signing_key`. Run the kernel's hand-rolled
+   Ed25519 verify (`src/kernel/crypto/ed25519.rs`) against the
+   integrity hash. Mismatch → `SignatureInvalid`.
 4. If the `enforce_signatures` cargo feature is set and the module is
    unsigned or the device has no provisioned pubkey, reject.
 
@@ -56,6 +55,27 @@ comes from the `FLUXOR_SIGNING_PUBKEY_HEX` build-time environment
 variable (baked into the kernel image); future boards are expected to
 read it from an on-silicon OTP bank, and the HAL keeps the loader
 oblivious to which mechanism is in use.
+
+### Load-source trust profiles
+
+The loader carries a typed `LoadSource` (`Flash` vs `Embedded`) that
+records where the module table came from. The loader/platform
+combination implements four trust profiles that are useful to reason
+about explicitly:
+
+| Profile | Source | Integrity check | Signature check | Used by |
+|---|---|---|---|---|
+| **Trusted built-in** | Compiled-in `BuiltInModule` (e.g. `linux_net`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM host built-ins; bypass the loader entirely |
+| **Signed flash image** | RP / CM5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | If signature present, Ed25519 verify; if absent and `enforce_signatures` set, reject | Production RP2350 + CM5 firmware images |
+| **Embedded blob** | WASM `EMBEDDED_MODULES_BLOB`, Linux `mmap`'d `.fmod` file | `hal::verify_integrity` byte-compares SHA-256 on every platform (Linux/WASM/BCM/RP all match) | Same as flash image when present | Linux dev runs, WASM bundles |
+| **Network / staged** | TFTP / OTA delivered image into a staging area then promoted | Same as flash image once promoted | Same | Future scope; `.context/rfc_graph_reconfigure.md` discusses the staged-image flow |
+
+The loader does not currently distinguish "host development file" from
+"network/staged image" — both flow through `init_from_blob` and the
+same `hal::verify_integrity` hook. A typed `LoadSource` would let the
+loader apply per-source policy (e.g. always require signature on
+"network/staged", never on "trusted built-in"); today that distinction
+lives in the platform-side code that calls `init_from_blob`.
 
 ### Signing Tool
 

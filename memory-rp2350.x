@@ -71,3 +71,9 @@ SECTIONS {
 
 PROVIDE(start_to_end = __end_block_addr - __start_block_addr);
 PROVIDE(end_to_start = __start_block_addr - __end_block_addr);
+
+/* Expose flash bounds to platform code so `validate_fn_addr` reads
+ * the authoritative size from the linker rather than a hardcoded
+ * constant. */
+PROVIDE(__flash_start__ = ORIGIN(FLASH));
+PROVIDE(__flash_end__ = ORIGIN(FLASH) + LENGTH(FLASH));

@@ -329,3 +329,148 @@ pub fn resolve(hw: &HardwareConfig, max_gpio: u8) -> Result<ResourcePlan, PlanEr
 
 /// Log the resolved plan for debugging.
 pub fn log_plan(_plan: &ResourcePlan) {}
+
+// ============================================================================
+// Hardware Manager (Pico-flavoured defaults)
+// ============================================================================
+//
+// `Hardware::new()` overlays the parsed `HardwareConfig` with Pico
+// 2 W defaults (SPI on GPIO 16/19/18, I2C on 20/21, PIO0/1 for cyw43
+// gSPI + I2S) when a field is absent. The defaults are
+// RP-platform-specific and live here rather than in the kernel —
+// platform-neutral parsing types (`HardwareConfig`, `SpiConfig`, …)
+// stay in `kernel::config` so non-RP targets (BCM, Linux, WASM)
+// never pick up RP hardware assumptions.
+
+use crate::kernel::config::{self as kernel_config, GpioDirection, PioConfig};
+
+/// Default SPI configuration (Pico 2 W SD card pins).
+pub const DEFAULT_SPI: SpiConfig = SpiConfig {
+    bus: 0,
+    miso: 16,
+    mosi: 19,
+    sck: 18,
+    freq_hz: 400_000,
+};
+
+/// Default I2C configuration (Pico 2 W: I2C0 on GPIO 20/21).
+pub const DEFAULT_I2C: I2cConfig = I2cConfig {
+    bus: 0,
+    sda: 20,
+    scl: 21,
+    freq_hz: 400_000,
+};
+
+/// Default PIO cmd configuration (Pico 2 W: PIO1, cyw43 gSPI DIO=24, CLK=29).
+pub const DEFAULT_PIO_CMD: PioConfig = PioConfig {
+    pio_idx: 1,
+    data_pin: 24,
+    clk_pin: 29,
+    extra_pin: 0xFF,
+};
+
+/// Default PIO stream configuration (Pico 2 W: PIO0, I2S data=28, bclk=26, lrclk=27).
+pub const DEFAULT_PIO_STREAM: PioConfig = PioConfig {
+    pio_idx: 0,
+    data_pin: 28,
+    clk_pin: 26,
+    extra_pin: 27,
+};
+
+/// Hardware manager — RP-platform-specific accessor that overlays the
+/// parsed `HardwareConfig` with Pico defaults when no explicit
+/// declaration is present. Used only by `src/platform/rp.rs`.
+pub struct Hardware {
+    config: HardwareConfig,
+}
+
+impl Hardware {
+    /// Create hardware manager, reading config from flash or using
+    /// Pico defaults when no config blob is present.
+    pub fn new() -> Self {
+        let config = match kernel_config::read_config() {
+            Some(c) => {
+                let mut hw = c.hardware.clone();
+                if hw.spi[0].is_none() && hw.spi[1].is_none() {
+                    hw.spi[0] = Some(DEFAULT_SPI);
+                }
+                hw
+            }
+            None => {
+                // No config blob — bare firmware boot (Pico 2 W defaults).
+                let mut hw = HardwareConfig::new();
+                hw.spi[0] = Some(DEFAULT_SPI);
+                hw.pio[0] = Some(DEFAULT_PIO_CMD);
+                hw.pio[1] = Some(DEFAULT_PIO_STREAM);
+                hw
+            }
+        };
+        Self { config }
+    }
+
+    /// Get SPI configuration.
+    pub fn spi(&self) -> SpiConfig {
+        self.config.spi[0]
+            .or(self.config.spi[1])
+            .unwrap_or(DEFAULT_SPI)
+    }
+
+    /// Get SPI bus number.
+    pub fn spi_bus(&self) -> u8 {
+        self.spi().bus
+    }
+
+    /// Get CS pin number (first output GPIO).
+    pub fn cs_pin(&self) -> u8 {
+        self.config
+            .gpio
+            .iter()
+            .flatten()
+            .find(|g| g.direction == GpioDirection::Output)
+            .map(|g| g.pin)
+            .unwrap_or(17)
+    }
+
+    /// Get I2C configuration (first configured bus or default).
+    pub fn i2c(&self) -> I2cConfig {
+        self.config.i2c[0]
+            .or(self.config.i2c[1])
+            .unwrap_or(DEFAULT_I2C)
+    }
+
+    /// Get PIO cmd configuration (slot 0: bidirectional gSPI for cyw43).
+    pub fn pio_cmd(&self) -> PioConfig {
+        self.config.pio[0].unwrap_or(DEFAULT_PIO_CMD)
+    }
+
+    /// Get PIO stream configuration (slot 1: I2S output).
+    pub fn pio_stream(&self) -> PioConfig {
+        self.config.pio[1].unwrap_or(DEFAULT_PIO_STREAM)
+    }
+
+    /// Get GPIO config for a specific pin.
+    pub fn gpio(&self, pin: u8) -> Option<&crate::kernel::config::GpioConfig> {
+        self.config.gpio.iter().flatten().find(|g| g.pin == pin)
+    }
+
+    /// Get raw GPIO configs.
+    pub fn gpio_configs(&self) -> &[Option<crate::kernel::config::GpioConfig>; MAX_GPIO_CONFIGS] {
+        &self.config.gpio
+    }
+
+    /// Get raw hardware config for the planner.
+    pub fn raw_config(&self) -> &HardwareConfig {
+        &self.config
+    }
+
+    /// Initialize all GPIO pins from config.
+    pub fn init_gpio(&self) -> usize {
+        (crate::kernel::hal::init_gpio)(&self.config.gpio)
+    }
+}
+
+impl Default for Hardware {
+    fn default() -> Self {
+        Self::new()
+    }
+}

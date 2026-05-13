@@ -45,12 +45,7 @@ extern "C" {
     /// success, or a negative error. Decode kicks off asynchronously
     /// — the kernel polls `host_image_decode_size` to wait for it
     /// to complete.
-    fn host_image_decode_open(
-        enc_ptr: *const u8,
-        enc_len: usize,
-        width: u32,
-        height: u32,
-    ) -> i32;
+    fn host_image_decode_open(enc_ptr: *const u8, enc_len: usize, width: u32, height: u32) -> i32;
 
     /// Returns the decoded RGB565 buffer length once the decode
     /// has completed. While the decode is still in flight, returns
@@ -88,10 +83,10 @@ const RX_CHUNK_BYTES: usize = 4096;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Collecting = 0,
-    Decoding   = 1,
+    Decoding = 1,
     Outputting = 2,
-    Done       = 3,
-    Error      = 4,
+    Done = 3,
+    Error = 4,
 }
 
 /// Codec state — small, fixed-size. The encoded ingest buffer is
@@ -99,20 +94,20 @@ enum Phase {
 /// struct can stay tiny and not blow past the per-module heap.
 #[repr(C)]
 pub(crate) struct ImageCodecState {
-    pub in_chan:     i32,
-    pub out_chan:    i32,
-    pub width:       u16,
-    pub height:      u16,
-    pub max_bytes:   u32,
+    pub in_chan: i32,
+    pub out_chan: i32,
+    pub width: u16,
+    pub height: u16,
+    pub max_bytes: u32,
 
-    pub phase:       u8,        // Phase
-    pub _pad:        [u8; 3],
+    pub phase: u8, // Phase
+    pub _pad: [u8; 3],
 
-    pub handle:      i32,
+    pub handle: i32,
     pub encoded_len: u32,
 
     /// Per-tick read scratch from `host_image_decode_recv`.
-    pub rx:          [u8; RX_CHUNK_BYTES],
+    pub rx: [u8; RX_CHUNK_BYTES],
     /// Bytes pulled from the shim but not yet accepted by
     /// `channel_write` (back-pressure). `[pending_pos..pending_len)`
     /// of `rx` is queued.
@@ -185,7 +180,7 @@ fn step(state: *mut u8) -> i32 {
 
         match st.phase {
             x if x == Phase::Collecting as u8 => collect_step(st),
-            x if x == Phase::Decoding as u8   => decoding_step(st),
+            x if x == Phase::Decoding as u8 => decoding_step(st),
             x if x == Phase::Outputting as u8 => outputting_step(st),
             _ => 0,
         }
@@ -208,11 +203,7 @@ unsafe fn collect_step(st: &mut ImageCodecState) -> i32 {
             transition_to_decode(st);
             return 0;
         }
-        let n = channel::channel_read(
-            st.in_chan,
-            st.encoded_ptr.add(used),
-            cap - used,
-        );
+        let n = channel::channel_read(st.in_chan, st.encoded_ptr.add(used), cap - used);
         if n > 0 {
             st.encoded_len = (used + n as usize) as u32;
             continue;
@@ -249,11 +240,7 @@ unsafe fn transition_to_decode(st: &mut ImageCodecState) {
     );
     if h < 0 {
         st.phase = Phase::Error as u8;
-        let _ = channel::channel_ioctl(
-            st.out_chan,
-            channel::IOCTL_SET_HUP,
-            core::ptr::null_mut(),
-        );
+        let _ = channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
         return;
     }
     st.handle = h;
@@ -276,11 +263,8 @@ unsafe fn decoding_step(st: &mut ImageCodecState) -> i32 {
             st.phase = Phase::Error as u8;
             let _ = host_image_decode_close(st.handle);
             st.handle = -1;
-            let _ = channel::channel_ioctl(
-                st.out_chan,
-                channel::IOCTL_SET_HUP,
-                core::ptr::null_mut(),
-            );
+            let _ =
+                channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
         }
     }
     0
@@ -298,11 +282,7 @@ unsafe fn outputting_step(st: &mut ImageCodecState) -> i32 {
             let start = st.pending_pos as usize;
             let remaining = (st.pending_len - st.pending_pos) as usize;
             let want = remaining.min(WRITE_CHUNK_BYTES);
-            let written = channel::channel_write(
-                st.out_chan,
-                st.rx.as_ptr().add(start),
-                want,
-            );
+            let written = channel::channel_write(st.out_chan, st.rx.as_ptr().add(start), want);
             if written <= 0 {
                 return 0;
             }
@@ -319,33 +299,23 @@ unsafe fn outputting_step(st: &mut ImageCodecState) -> i32 {
             let _ = host_image_decode_close(st.handle);
             st.handle = -1;
             st.phase = Phase::Done as u8;
-            let _ = channel::channel_ioctl(
-                st.out_chan,
-                channel::IOCTL_SET_HUP,
-                core::ptr::null_mut(),
-            );
+            let _ =
+                channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
             return 0;
         }
         if n < 0 {
             st.phase = Phase::Error as u8;
             let _ = host_image_decode_close(st.handle);
             st.handle = -1;
-            let _ = channel::channel_ioctl(
-                st.out_chan,
-                channel::IOCTL_SET_HUP,
-                core::ptr::null_mut(),
-            );
+            let _ =
+                channel::channel_ioctl(st.out_chan, channel::IOCTL_SET_HUP, core::ptr::null_mut());
             return 0;
         }
         let total = n as usize;
         let mut off = 0usize;
         while off < total {
             let want = (total - off).min(WRITE_CHUNK_BYTES);
-            let written = channel::channel_write(
-                st.out_chan,
-                st.rx.as_ptr().add(off),
-                want,
-            );
+            let written = channel::channel_write(st.out_chan, st.rx.as_ptr().add(off), want);
             if written <= 0 {
                 st.pending_pos = off as u32;
                 st.pending_len = total as u32;

@@ -47,11 +47,12 @@
 //! `decode_frame` produce / consume the same bytes that go in the
 //! payload of an h3 DATA frame.
 
-use super::wire_h3::{H3Frame, parse_h3_frame, build_h3_frame_header,
-    H3_FRAME_DATA, H3_FRAME_HEADERS, H3_FRAME_SETTINGS,
-    H3_UNI_STREAM_CONTROL, H3_UNI_STREAM_QPACK_ENCODER,
-    H3_UNI_STREAM_QPACK_DECODER};
 use super::qpack;
+use super::wire_h3::{
+    build_h3_frame_header, parse_h3_frame, H3Frame, H3_FRAME_DATA, H3_FRAME_HEADERS,
+    H3_FRAME_SETTINGS, H3_UNI_STREAM_CONTROL, H3_UNI_STREAM_QPACK_DECODER,
+    H3_UNI_STREAM_QPACK_ENCODER,
+};
 
 /// Maximum concurrent h3 request streams handled per connection.
 /// Mirrors h2's `MAX_STREAMS = 4` so the slot table size is unchanged.
@@ -167,11 +168,13 @@ pub fn is_request_stream_frame(frame_type: u64) -> bool {
 
 /// Identify whether `frame` is a control-stream-legal frame type.
 pub fn is_control_stream_frame(frame_type: u64) -> bool {
-    matches!(frame_type,
-        H3_FRAME_SETTINGS |
-        super::wire_h3::H3_FRAME_GOAWAY |
-        super::wire_h3::H3_FRAME_MAX_PUSH_ID |
-        super::wire_h3::H3_FRAME_CANCEL_PUSH)
+    matches!(
+        frame_type,
+        H3_FRAME_SETTINGS
+            | super::wire_h3::H3_FRAME_GOAWAY
+            | super::wire_h3::H3_FRAME_MAX_PUSH_ID
+            | super::wire_h3::H3_FRAME_CANCEL_PUSH
+    )
 }
 
 /// Suppress dead-code warnings for items reserved for the live pump

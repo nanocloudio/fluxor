@@ -10,7 +10,7 @@ pub const PROTO_UDP: u8 = 17;
 
 /// Parsed IPv4 header fields
 pub struct Ipv4Header {
-    pub ihl: u8,          // header length in 32-bit words
+    pub ihl: u8, // header length in 32-bit words
     pub total_len: u16,
     pub identification: u16,
     pub flags_frag: u16,
@@ -53,12 +53,8 @@ pub unsafe fn parse_ipv4(data: *const u8, len: usize) -> Option<Ipv4Header> {
     let ttl = *data.add(8);
     let protocol = *data.add(9);
 
-    let src_ip = u32::from_be_bytes([
-        *data.add(12), *data.add(13), *data.add(14), *data.add(15),
-    ]);
-    let dst_ip = u32::from_be_bytes([
-        *data.add(16), *data.add(17), *data.add(18), *data.add(19),
-    ]);
+    let src_ip = u32::from_be_bytes([*data.add(12), *data.add(13), *data.add(14), *data.add(15)]);
+    let dst_ip = u32::from_be_bytes([*data.add(16), *data.add(17), *data.add(18), *data.add(19)]);
 
     // Verify header checksum
     let cksum = checksum(data, header_len);

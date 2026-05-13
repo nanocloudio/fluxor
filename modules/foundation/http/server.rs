@@ -17,10 +17,10 @@ use super::wire_h2;
 use super::wire_ws as ws;
 use super::HttpState;
 use super::{
-    dev_channel_ioctl, dev_channel_port, dev_log, dev_millis as _, fmt_u32_raw,
-    heap_alloc, heap_free, heap_realloc,
-    msg_read, net_read_frame, net_write_frame, p_u16, p_u32, p_u8, IOCTL_FLUSH, IOCTL_NOTIFY,
-    IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN, POLL_OUT,
+    dev_channel_ioctl, dev_channel_port, dev_log, dev_millis as _, fmt_u32_raw, heap_alloc,
+    heap_free, heap_realloc, msg_read, net_read_frame, net_write_frame, p_u16, p_u32, p_u8,
+    IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN,
+    POLL_OUT,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -344,8 +344,7 @@ impl ConnSlot {
     /// slots have null buffers — their heap allocations have been
     /// returned to the arena.
     pub(crate) fn is_free(&self) -> bool {
-        self.conn_id < 0
-            && matches!(self.phase, Phase::Init | Phase::WaitAccept)
+        self.conn_id < 0 && matches!(self.phase, Phase::Init | Phase::WaitAccept)
     }
 }
 
@@ -543,7 +542,6 @@ unsafe fn ready_set(s: &mut HttpState, idx: usize) {
         s.server.ready_bits[idx / 64] |= 1u64 << (idx % 64);
     }
 }
-
 
 #[inline(always)]
 unsafe fn ready_clear(s: &mut HttpState, idx: usize) {
@@ -782,25 +780,33 @@ pub(crate) unsafe fn ensure_h2_state(s: &mut HttpState) -> bool {
 /// next `alloc_free_slot`).
 #[inline(always)]
 pub(crate) unsafe fn cur_recv_buf_ptr(s: &HttpState) -> *const u8 {
-    cur_slot(s).map(|c| c.recv_buf as *const u8).unwrap_or(core::ptr::null())
+    cur_slot(s)
+        .map(|c| c.recv_buf as *const u8)
+        .unwrap_or(core::ptr::null())
 }
 
 /// Active slot's `recv_buf` mut pointer; null when no slot.
 #[inline(always)]
 pub(crate) unsafe fn cur_recv_buf_mut_ptr(s: &mut HttpState) -> *mut u8 {
-    cur_slot(s).map(|c| c.recv_buf).unwrap_or(core::ptr::null_mut())
+    cur_slot(s)
+        .map(|c| c.recv_buf)
+        .unwrap_or(core::ptr::null_mut())
 }
 
 /// Active slot's `send_buf` const pointer; null when no slot.
 #[inline(always)]
 pub(crate) unsafe fn cur_send_buf_ptr(s: &HttpState) -> *const u8 {
-    cur_slot(s).map(|c| c.send_buf as *const u8).unwrap_or(core::ptr::null())
+    cur_slot(s)
+        .map(|c| c.send_buf as *const u8)
+        .unwrap_or(core::ptr::null())
 }
 
 /// Active slot's `send_buf` mut pointer; null when no slot.
 #[inline(always)]
 pub(crate) unsafe fn cur_send_buf_mut_ptr(s: &mut HttpState) -> *mut u8 {
-    cur_slot(s).map(|c| c.send_buf).unwrap_or(core::ptr::null_mut())
+    cur_slot(s)
+        .map(|c| c.send_buf)
+        .unwrap_or(core::ptr::null_mut())
 }
 
 /// Active slot's `conn_id` as u8. The slot stores conn_id as i16
@@ -916,9 +922,15 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.ws_out_chan = -1;
     s.server.ws_in_chan = -1;
     s.server.port = 80;
-    if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = -1; }
-    if let Some(cur) = cur_slot_mut(s) { cur.fs_total = 0; }
-    if let Some(cur) = cur_slot_mut(s) { cur.fs_sent = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.fs_fd = -1;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.fs_total = 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.fs_sent = 0;
+    }
     // `matched_route`, `file_index`, `peer_closed`, `ws_fan_out`, and
     // `ws_pending_stuck_ticks` live in `ConnSlot`; the slot reset
     // below (`ConnSlot::reset`) zero-initializes them for every slot.
@@ -940,7 +952,9 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.step_cursor = 0;
     s.server.ready_bits = [0u64; READY_BITS_WORDS];
     ready_set(s, 0);
-    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::Init; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.phase = Phase::Init;
+    }
 
     let pool = heap_alloc(&*sys, DEFAULT_BODY_POOL_SIZE as u32);
     if !pool.is_null() {
@@ -1062,10 +1076,7 @@ unsafe fn reset_connection(s: &mut HttpState) {
     // worse, under fast slot reuse — close the next browser connection
     // that just landed on the same slot index.
     let peer_closed = cur_slot(s).map(|c| c.peer_closed).unwrap_or(0);
-    if peer_closed == 0
-        && cur_phase(s) as u8 > Phase::WaitAccept as u8
-        && s.net_out_chan >= 0
-    {
+    if peer_closed == 0 && cur_phase(s) as u8 > Phase::WaitAccept as u8 && s.net_out_chan >= 0 {
         close_net_conn(s, cur_conn_id(s));
     }
     // Close any FS_CONTRACT FD left open by a previous response. The
@@ -1138,11 +1149,7 @@ pub(crate) unsafe fn match_route(s: &HttpState) -> i8 {
 /// the same matching rules dispatch will apply but is called
 /// before the active slot is committed to a particular stream's
 /// path). Returns the route index, or -1 if no route matches.
-pub(crate) unsafe fn match_route_path(
-    s: &HttpState,
-    req: *const u8,
-    plen: usize,
-) -> i8 {
+pub(crate) unsafe fn match_route_path(s: &HttpState, req: *const u8, plen: usize) -> i8 {
     // Routes are exact-match by default. A route that ends in '/' is
     // treated as a prefix match (so `/api/` matches `/api/foo`), but a
     // bare `/` is exact-only — otherwise it would swallow every
@@ -1200,14 +1207,13 @@ pub(crate) unsafe fn match_route_path(
 }
 
 unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type: &[u8]) {
-    let len = h1::write_status_line(
-        cur_send_buf_mut_ptr(s),
-        SEND_BUF_SIZE,
-        status,
-        content_type,
-    );
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = len as u16; }
+    let len = h1::write_status_line(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, status, content_type);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = len as u16;
+    }
 }
 
 /// Like `build_header` but also emits a `Content-Length: <n>` header.
@@ -1223,12 +1229,8 @@ unsafe fn build_header_with_len(
     // Write the standard status line (which terminates with \r\n\r\n)
     // then strip the trailing blank line, append the Content-Length
     // header, and re-terminate.
-    let mut off = h1::write_status_line(
-        cur_send_buf_mut_ptr(s),
-        SEND_BUF_SIZE,
-        status,
-        content_type,
-    );
+    let mut off =
+        h1::write_status_line(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, status, content_type);
     if off >= 4 {
         off -= 4;
     }
@@ -1268,14 +1270,22 @@ unsafe fn build_header_with_len(
         off += 1;
         k += 1;
     }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = off as u16; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = off as u16;
+    }
 }
 
 unsafe fn build_error(s: &mut HttpState, code: &[u8], body: &[u8]) {
     let len = h1::write_error_response(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, code, body);
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = len as u16; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = len as u16;
+    }
 }
 
 // ── Variable cache (drained from in[1] each tick) ──────────────────────────
@@ -1646,11 +1656,7 @@ pub(crate) unsafe fn render_static_into(
         Some(c) => c as *mut ConnSlot,
         None => return (0, false),
     };
-    let route = &*s
-        .server
-        .routes
-        .as_ptr()
-        .add(cur_matched_route(s) as usize);
+    let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
     let pos = body_start + (*cur_ptr).tmpl_pos as usize;
@@ -1675,11 +1681,7 @@ pub(crate) unsafe fn render_template_into(
         Some(c) => c as *mut ConnSlot,
         None => return (0, false),
     };
-    let route = &*s
-        .server
-        .routes
-        .as_ptr()
-        .add(cur_matched_route(s) as usize);
+    let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
     let pool = s.server.body_pool as *const u8;
@@ -1787,8 +1789,12 @@ pub(crate) unsafe fn render_index_into(
 unsafe fn render_template_chunk(s: &mut HttpState) -> bool {
     let buf = cur_send_buf_mut_ptr(s);
     let (n, more) = render_template_into(s, buf, SEND_BUF_SIZE);
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = n as u16;
+    }
     more
 }
 
@@ -1800,11 +1806,7 @@ pub(crate) unsafe fn parse_file_index(s: &HttpState) -> i16 {
         None => return -1,
     };
     let buf = cur.req_path.as_ptr();
-    let route = &*s
-        .server
-        .routes
-        .as_ptr()
-        .add(cur_matched_route(s) as usize);
+    let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
     let suffix_start = route.path_len as usize;
     let path_end = cur.req_path_len as usize;
 
@@ -1874,7 +1876,9 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpState) -> bool {
             cur.file_index = -1;
             cur.matched_route = -1;
         }
-        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::SendHeaders;
+        }
     } else if plen >= 2 && *buf == b'/' {
         let mut idx: i32 = 0;
         let mut i = 1usize;
@@ -1894,7 +1898,9 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpState) -> bool {
         }
         if !valid {
             build_error(s, b"400 Bad Request", b"Bad Request\n");
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::DrainSend;
+            }
             return true;
         }
 
@@ -1921,19 +1927,27 @@ unsafe fn step_legacy_file_dispatch(s: &mut HttpState) -> bool {
             let r = dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
             if r < 0 {
                 build_error(s, b"404 Not Found", b"Not Found\n");
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::DrainSend;
+                }
                 return true;
             }
             build_header(s, b"200 OK", b"application/octet-stream");
         } else {
             build_error(s, b"404 Not Found", b"Not Found\n");
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::DrainSend;
+            }
             return true;
         }
-        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::SendHeaders;
+        }
     } else {
         build_error(s, b"400 Bad Request", b"Bad Request\n");
-        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::DrainSend;
+        }
     }
     true
 }
@@ -1973,7 +1987,9 @@ unsafe fn begin_ws_upgrade(s: &mut HttpState) -> bool {
         Some(v) if upgrade_ok && connection_ok && version_ok => v,
         _ => {
             build_error(s, b"400 Bad Request", b"Bad Request\n");
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::DrainSend;
+            }
             return false;
         }
     };
@@ -1981,14 +1997,17 @@ unsafe fn begin_ws_upgrade(s: &mut HttpState) -> bool {
     let mut accept = [0u8; 28];
     ws::compute_accept(buf.add(key_off), key_len, accept.as_mut_ptr());
 
-    let written = ws::write_handshake_response(
-        cur_send_buf_mut_ptr(s),
-        SEND_BUF_SIZE,
-        accept.as_ptr(),
-    );
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = written as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.recv_len = 0; }
+    let written =
+        ws::write_handshake_response(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, accept.as_ptr());
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = written as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.recv_len = 0;
+    }
     if let Some(cur) = cur_slot_mut(s) {
         cur.recv_parsed = 0;
     }
@@ -2018,8 +2037,12 @@ unsafe fn ws_queue_frame_fin(
         payload,
         payload_len,
     );
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = written as u16; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = written as u16;
+    }
 }
 
 /// Build a CLOSE frame carrying `code` (network-byte-order u16) and
@@ -2027,7 +2050,9 @@ unsafe fn ws_queue_frame_fin(
 unsafe fn ws_begin_close(s: &mut HttpState, code: u16) {
     let payload = [(code >> 8) as u8, (code & 0xFF) as u8];
     ws_queue_frame(s, ws::OP_CLOSE, payload.as_ptr(), 2);
-    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::WsClose; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.phase = Phase::WsClose;
+    }
 }
 
 // ── WebSocket fan-out helpers ─────────────────────────────────────────────
@@ -2166,9 +2191,7 @@ unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     // no slot owns the requested id (the conn may have closed
     // between the producer's write and our read), so it doubles
     // as the validity check.
-    let conn_u32 = u32::from_le_bytes([
-        frame_buf[0], frame_buf[1], frame_buf[2], frame_buf[3],
-    ]);
+    let conn_u32 = u32::from_le_bytes([frame_buf[0], frame_buf[1], frame_buf[2], frame_buf[3]]);
     let target_idx = if conn_u32 == u32::MAX {
         match find_first_ws_fanout_slot(s) {
             Some(i) => i,
@@ -2245,11 +2268,7 @@ unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
         s.server.cur_slot = saved_cur;
         return false;
     }
-    core::ptr::copy_nonoverlapping(
-        frame_buf.as_ptr().add(WS_FRAME_HDR),
-        frag_buf,
-        payload_len,
-    );
+    core::ptr::copy_nonoverlapping(frame_buf.as_ptr().add(WS_FRAME_HDR), frag_buf, payload_len);
 
     // Stamp slot fragmentation state BEFORE queuing the first
     // fragment so a panic between the two leaves slot state
@@ -2273,7 +2292,9 @@ unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
 unsafe fn ws_emit_next_fragment(s: &mut HttpState) -> bool {
     let max_chunk = SEND_BUF_SIZE.saturating_sub(WS_FRAG_HDR_RESERVE);
     let (buf, total, offset, orig_fin) = {
-        let Some(cur) = cur_slot(s) else { return false; };
+        let Some(cur) = cur_slot(s) else {
+            return false;
+        };
         (
             cur.ws_frag_buf,
             cur.ws_frag_total as usize,
@@ -2322,7 +2343,9 @@ unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
             // Drop everything buffered so the bad bytes don't get re-
             // parsed on every future tick — that would re-enter
             // `ws_begin_close` until the loop's progress signal flipped.
-            if let Some(cur) = cur_slot_mut(s) { cur.recv_len = 0; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.recv_len = 0;
+            }
             ws_begin_close(s, ws::CLOSE_PROTOCOL_ERROR);
             return true;
         }
@@ -2355,7 +2378,9 @@ unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
             // they sent an empty body).
             let pl = frame.payload_len as usize;
             ws_queue_frame(s, ws::OP_CLOSE, payload_ptr, pl);
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::WsClose; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::WsClose;
+            }
         }
         ws::OP_PING => {
             ws_queue_frame(s, ws::OP_PONG, payload_ptr, frame.payload_len as usize);
@@ -2403,7 +2428,9 @@ unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
             i += 1;
         }
     }
-    if let Some(cur) = cur_slot_mut(s) { cur.recv_len = leftover as u16; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.recv_len = leftover as u16;
+    }
     true
 }
 
@@ -2471,17 +2498,15 @@ unsafe fn step_send_static(s: &mut HttpState) -> i32 {
         Some(c) => c as *mut ConnSlot,
         None => return 0,
     };
-    let route = &*s
-        .server
-        .routes
-        .as_ptr()
-        .add(cur_matched_route(s) as usize);
+    let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
     let body_start = route.body_offset as usize;
     let body_end = body_start + route.body_len as usize;
     let pos = body_start + (*cur_ptr).tmpl_pos as usize;
 
     if pos >= body_end {
-        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::CloseConn;
+        }
         return 0;
     }
 
@@ -2499,11 +2524,12 @@ unsafe fn step_send_static(s: &mut HttpState) -> i32 {
 unsafe fn step_send_template(s: &mut HttpState) -> i32 {
     if cur_send_offset(s) < cur_send_len(s) {
         let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
-        let ptr = cur_send_buf_ptr(s)
-            .add(cur_send_offset(s) as usize);
+        let ptr = cur_send_buf_ptr(s).add(cur_send_offset(s) as usize);
         let sent = net_send(s, ptr, remaining);
         if sent > 0 {
-            if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset += sent as u16;
+            }
         }
         return 0;
     }
@@ -2513,13 +2539,17 @@ unsafe fn step_send_template(s: &mut HttpState) -> i32 {
         let ptr = cur_send_buf_ptr(s);
         let sent = net_send(s, ptr, cur_send_len(s) as usize);
         if sent > 0 {
-            if let Some(cur) = cur_slot_mut(s) { cur.send_offset = sent as u16; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset = sent as u16;
+            }
         }
         return if has_more { 2 } else { 0 };
     }
 
     if !has_more {
-        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::CloseConn;
+        }
     }
     0
 }
@@ -2530,7 +2560,9 @@ unsafe fn step_send_index(s: &mut HttpState) -> i32 {
         None => return 0,
     };
     if (*cur_ptr).index_pos >= (*cur_ptr).file_count {
-        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::CloseConn;
+        }
         return 0;
     }
 
@@ -2545,17 +2577,22 @@ unsafe fn step_send_index(s: &mut HttpState) -> i32 {
             off += 1;
             idx += 1;
         }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_len = off as u16; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = off as u16;
+        }
         (*cur_ptr).index_pos = idx;
     }
 
     let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
-    let ptr = cur_send_buf_ptr(s)
-        .add(cur_send_offset(s) as usize);
+    let ptr = cur_send_buf_ptr(s).add(cur_send_offset(s) as usize);
     let sent = net_send(s, ptr, remaining);
     if sent > 0 {
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset += sent as u16;
+        }
         return 2;
     }
     0
@@ -2569,23 +2606,30 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
             SEND_BUF_SIZE,
         );
         if n > 0 {
-            if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-            if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset = 0;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_len = n as u16;
+            }
         } else {
             let chan_poll = ((*s.syscalls).channel_poll)(s.server.file_chan, POLL_IN | POLL_HUP);
             if chan_poll > 0 && (chan_poll as u32 & POLL_HUP) != 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
             }
             return 0;
         }
     }
 
     let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
-    let ptr = cur_send_buf_ptr(s)
-        .add(cur_send_offset(s) as usize);
+    let ptr = cur_send_buf_ptr(s).add(cur_send_offset(s) as usize);
     let sent = net_send(s, ptr, remaining);
     if sent > 0 {
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset += sent as u16;
+        }
         return 2;
     }
     0
@@ -2597,7 +2641,9 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
 /// returns ≤ 0).
 unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
     if cur_fs_fd(s) < 0 {
-        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::CloseConn;
+        }
         return 0;
     }
     if cur_send_offset(s) >= cur_send_len(s) {
@@ -2613,8 +2659,12 @@ unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
                 core::ptr::null_mut(),
                 0,
             );
-            if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = -1; }
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.fs_fd = -1;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::CloseConn;
+            }
             return 0;
         }
         // Refill: streaming reads a full SEND_BUF; length-known caps
@@ -2647,21 +2697,32 @@ unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
                 core::ptr::null_mut(),
                 0,
             );
-            if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = -1; }
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.fs_fd = -1;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::CloseConn;
+            }
             return 0;
         }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = n as u16;
+        }
     }
 
     let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
-    let ptr = cur_send_buf_ptr(s)
-        .add(cur_send_offset(s) as usize);
+    let ptr = cur_send_buf_ptr(s).add(cur_send_offset(s) as usize);
     let sent = net_send(s, ptr, remaining);
     if sent > 0 {
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
-        if let Some(cur) = cur_slot_mut(s) { cur.fs_sent = cur.fs_sent.wrapping_add(sent as u32); }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset += sent as u16;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.fs_sent = cur.fs_sent.wrapping_add(sent as u32);
+        }
         return 2;
     }
     0
@@ -2718,8 +2779,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
             return;
         }
         let peeked_msg = hdr[0];
-        let peeked_payload_len =
-            u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+        let peeked_payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
         if peeked_msg == NET_MSG_DATA && peeked_payload_len > 1 {
             // Need at least the conn_id byte to find the target.
             if peeked < NET_FRAME_HDR as i32 + 1 {
@@ -2789,8 +2849,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                         let dst = slot.recv_buf.add(slot.recv_len as usize);
                         core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
                         slot.recv_len += to_copy as u16;
-                        s.tlm.bytes_in =
-                            s.tlm.bytes_in.wrapping_add(to_copy as u32);
+                        s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(to_copy as u32);
                     }
                 }
                 // Else: orphan — slot already closed; drop the data.
@@ -2831,10 +2890,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // slot-agnostic on purpose — slot 0 is reused for connections
     // after bind, so it's not always the listener slot when drain
     // is requested.
-    if s.server.draining != 0
-        && s.server.bound != 0
-        && active_slot_count(s) == 0
-    {
+    if s.server.draining != 0 && s.server.bound != 0 && active_slot_count(s) == 0 {
         return 1;
     }
 
@@ -2934,9 +2990,13 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         core::ptr::null_mut(),
                         0,
                     );
-                    if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = -1; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.fs_fd = -1;
+                    }
                 }
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
             }
             _ => {}
         }
@@ -2965,7 +3025,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             if wrote == 0 {
                 return 0;
             }
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::WaitBound; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::WaitBound;
+            }
             return 2;
         }
 
@@ -2985,7 +3047,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             match msg_type {
                 NET_MSG_BOUND => {
                     log(s, b"[http] bound, waiting for connections");
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::WaitAccept; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::WaitAccept;
+                    }
                     // Slot 0's bind-sequence work is done; demux now
                     // owns its lifecycle like any other slot. Drop
                     // it from the ready bitmap so idle ticks are
@@ -2998,7 +3062,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     return 2;
                 }
                 NET_MSG_ERROR => {
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::Error; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::Error;
+                    }
                     return -1;
                 }
                 NET_MSG_ACCEPTED if payload_len >= 1 => {
@@ -3096,7 +3162,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         *p.add(j) = *p.add(pre + j);
                         j += 1;
                     }
-                    if let Some(cur) = cur_slot_mut(s) { cur.recv_len = leftover as u16; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.recv_len = leftover as u16;
+                    }
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.recv_parsed = 0;
                     }
@@ -3107,7 +3175,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                         return 0;
                     }
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::H2Active; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::H2Active;
+                    }
                     return 2;
                 }
                 // Not the preface; fall through to h1 parsing.
@@ -3146,13 +3216,17 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                         None => {
                             build_error(s, b"400 Bad Request", b"Bad Request\n");
-                            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
                             return 0;
                         }
                     }
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {
                     build_error(s, b"400 Bad Request", b"Bad Request\n");
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DrainSend;
+                    }
                     return 0;
                 }
             }
@@ -3178,7 +3252,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
 
                 if found {
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DispatchRoute; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DispatchRoute;
+                    }
                     return 2;
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {
                     let l = cur_recv_len(s) as usize;
@@ -3187,7 +3263,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         *p = *p.add(l - 3);
                         *p.add(1) = *p.add(l - 2);
                         *p.add(2) = *p.add(l - 1);
-                        if let Some(cur) = cur_slot_mut(s) { cur.recv_len = 3; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.recv_len = 3;
+                        }
                     }
                 }
             }
@@ -3232,16 +3310,24 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if n > 0 {
                     off += n as usize;
                 }
-                if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-                if let Some(cur) = cur_slot_mut(s) { cur.send_len = off as u16; }
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset = 0;
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_len = off as u16;
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::DrainSend;
+                }
                 return 0;
             }
 
             let ri = match_route(s);
             if ri < 0 {
                 build_error(s, b"404 Not Found", b"Not Found\n");
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::DrainSend;
+                }
                 return 0;
             }
             if let Some(cur) = cur_slot_mut(s) {
@@ -3272,13 +3358,19 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
                                 ct[..ct_len].copy_from_slice(&r.content_type[..ct_len]);
                             }
-                            let ct_slice: &[u8] = if ct_len == 0 { b"text/html" } else { &ct[..ct_len] };
+                            let ct_slice: &[u8] = if ct_len == 0 {
+                                b"text/html"
+                            } else {
+                                &ct[..ct_len]
+                            };
                             build_header(s, b"200 OK", ct_slice);
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.tmpl_pos = 0;
                                 cur.cache_retained = 1;
                             }
-                            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::SendHeaders;
+                            }
                         } else {
                             // Cache miss → file_chan fetch. Serialise
                             // across slots so concurrent template
@@ -3314,7 +3406,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 pos_ptr,
                                 4,
                             );
-                            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::FetchContent; }
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::FetchContent;
+                            }
                         }
                     } else {
                         let mut ct = [0u8; MAX_CONTENT_TYPE];
@@ -3322,12 +3416,18 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
                             ct[..ct_len].copy_from_slice(&route.content_type[..ct_len]);
                         }
-                        let ct_slice: &[u8] = if ct_len == 0 { b"text/html" } else { &ct[..ct_len] };
+                        let ct_slice: &[u8] = if ct_len == 0 {
+                            b"text/html"
+                        } else {
+                            &ct[..ct_len]
+                        };
                         build_header(s, b"200 OK", ct_slice);
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.tmpl_pos = 0;
                         }
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::SendHeaders;
+                        }
                     }
                 }
                 HANDLER_FILE => {
@@ -3356,7 +3456,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.index_pos = 0;
                         }
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::SendHeaders;
+                        }
                     } else if fi >= 0 {
                         if s.server.file_chan >= 0 {
                             // Serialise: concurrent HANDLER_FILE
@@ -3384,32 +3486,42 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             );
                             if r < 0 {
                                 build_error(s, b"404 Not Found", b"Not Found\n");
-                                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                                if let Some(cur) = cur_slot_mut(s) {
+                                    cur.phase = Phase::DrainSend;
+                                }
                                 return 0;
                             }
                             build_header(s, b"200 OK", b"application/octet-stream");
                         } else {
                             build_error(s, b"404 Not Found", b"Not Found\n");
-                            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
                             return 0;
                         }
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::SendHeaders;
+                        }
                     } else {
                         build_error(s, b"400 Bad Request", b"Bad Request\n");
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                         return 0;
                     }
                 }
                 HANDLER_STREAM => {
-                    let route = &*s
-                        .server
-                        .routes
-                        .as_ptr()
-                        .add(cur_matched_route(s) as usize);
+                    let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
                     let src_idx = route.source_index;
                     if src_idx < 0 || s.server.file_chan < 0 {
-                        build_error(s, b"500 Internal Server Error", b"Stream handler missing source\n");
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        build_error(
+                            s,
+                            b"500 Internal Server Error",
+                            b"Stream handler missing source\n",
+                        );
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                         return 0;
                     }
                     // Snapshot the per-route content_type before we
@@ -3419,8 +3531,11 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
                         ct[..ct_len].copy_from_slice(&route.content_type[..ct_len]);
                     }
-                    let ct_slice: &[u8] =
-                        if ct_len == 0 { b"application/octet-stream" } else { &ct[..ct_len] };
+                    let ct_slice: &[u8] = if ct_len == 0 {
+                        b"application/octet-stream"
+                    } else {
+                        &ct[..ct_len]
+                    };
                     // Serialise: HANDLER_STREAM body-send reads from
                     // file_chan across multiple step()s. Without this
                     // gate a sibling slot's IOCTL_FLUSH would wipe
@@ -3446,22 +3561,24 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     );
                     if r < 0 {
                         build_error(s, b"500 Internal Server Error", b"Stream NOTIFY failed\n");
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                         return 0;
                     }
                     build_header(s, b"200 OK", ct_slice);
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::SendHeaders;
+                    }
                 }
                 HANDLER_FS_FILE => {
-                    let route = &*s
-                        .server
-                        .routes
-                        .as_ptr()
-                        .add(cur_matched_route(s) as usize);
+                    let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
                     let n = route.fs_path_len as usize;
                     if n == 0 || n > MAX_FS_PATH {
                         build_error(s, b"500 Internal Server Error", b"FS route missing path\n");
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                         return 0;
                     }
                     // Snapshot the path before borrowing &mut s for
@@ -3485,19 +3602,29 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     );
                     if fd < 0 {
                         build_error(s, b"404 Not Found", b"Not Found\n");
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                         return 0;
                     }
                     // FS_STAT may pend for async providers, so the
                     // response-line decision happens in
                     // `Phase::AwaitFsStat` once the outcome is known.
-                    if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = fd; }
-                    if let Some(cur) = cur_slot_mut(s) { cur.fs_sent = 0; }
-                    if let Some(cur) = cur_slot_mut(s) { cur.fs_total = 0; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.fs_fd = fd;
+                    }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.fs_sent = 0;
+                    }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.fs_total = 0;
+                    }
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.fs_stat_ticks = 0;
                     }
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::AwaitFsStat; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::AwaitFsStat;
+                    }
                 }
                 HANDLER_FS_LIST => {
                     // One-shot JSON directory listing. Builds the
@@ -3506,15 +3633,17 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // which streams the buffer to the client and on
                     // drain proceeds straight to CloseConn (no
                     // separate body phase).
-                    let route = &*s
-                        .server
-                        .routes
-                        .as_ptr()
-                        .add(cur_matched_route(s) as usize);
+                    let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
                     let n = route.fs_path_len as usize;
                     if n == 0 || n > MAX_FS_PATH {
-                        build_error(s, b"500 Internal Server Error", b"FS_LIST route missing path\n");
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        build_error(
+                            s,
+                            b"500 Internal Server Error",
+                            b"FS_LIST route missing path\n",
+                        );
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                         return 0;
                     }
                     // Snapshot path + filter so the FS calls + body
@@ -3528,11 +3657,16 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
 
                     let sys = &*s.syscalls;
                     let dir_fd = (sys.provider_call)(
-                        -1, 0x0907 /* FS_OPENDIR */, fs_path.as_mut_ptr(), n,
+                        -1,
+                        0x0907, /* FS_OPENDIR */
+                        fs_path.as_mut_ptr(),
+                        n,
                     );
                     if dir_fd < 0 {
                         build_error(s, b"404 Not Found", b"Directory not found\n");
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                         return 0;
                     }
 
@@ -3544,87 +3678,139 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // Opening `{"items":[`.
                     let prefix: &[u8] = b"{\"items\":[";
                     while bp < prefix.len() && bp < body.len() {
-                        body[bp] = prefix[bp]; bp += 1;
+                        body[bp] = prefix[bp];
+                        bp += 1;
                     }
                     let mut first = true;
                     let mut readdir_buf = [0u8; 1024];
                     loop {
                         let nb = (sys.provider_call)(
-                            dir_fd, 0x0908 /* FS_READDIR */,
-                            readdir_buf.as_mut_ptr(), readdir_buf.len(),
+                            dir_fd,
+                            0x0908, /* FS_READDIR */
+                            readdir_buf.as_mut_ptr(),
+                            readdir_buf.len(),
                         );
-                        if nb <= 0 { break; }
+                        if nb <= 0 {
+                            break;
+                        }
                         let nb = nb as usize;
-                        if nb < 2 { break; }
+                        if nb < 2 {
+                            break;
+                        }
                         let count = u16::from_le_bytes([readdir_buf[0], readdir_buf[1]]) as usize;
                         // Belt-and-braces: some providers may return
                         // `nb=2 count=0` at end-of-dir; honour either.
-                        if count == 0 { break; }
+                        if count == 0 {
+                            break;
+                        }
                         let mut pos = 2usize;
                         let mut emitted = 0usize;
                         while emitted < count && pos + 2 <= nb {
                             let name_len = readdir_buf[pos] as usize;
                             let entry_type = readdir_buf[pos + 1];
                             pos += 2;
-                            if pos + name_len > nb { break; }
+                            if pos + name_len > nb {
+                                break;
+                            }
                             let name = &readdir_buf[pos..pos + name_len];
                             pos += name_len;
                             emitted += 1;
                             // Skip subdirectories.
-                            if entry_type == 1 { continue; }
+                            if entry_type == 1 {
+                                continue;
+                            }
                             // Extension filter (case-insensitive).
                             if filter_len > 0 {
                                 let mut ok = false;
                                 let mut fi = 0usize;
                                 while fi < filter_len {
                                     let start = fi;
-                                    while fi < filter_len && filter[fi] != b',' { fi += 1; }
+                                    while fi < filter_len && filter[fi] != b',' {
+                                        fi += 1;
+                                    }
                                     let elen = fi - start;
                                     if elen > 0 && elen <= name.len() {
                                         let tail = &name[name.len() - elen..];
                                         let mut m = true;
                                         let mut k = 0usize;
                                         while k < elen {
-                                            let a = tail[k]; let b = filter[start + k];
-                                            let al = if (b'A'..=b'Z').contains(&a) { a + 32 } else { a };
-                                            let bl = if (b'A'..=b'Z').contains(&b) { b + 32 } else { b };
-                                            if al != bl { m = false; break; }
+                                            let a = tail[k];
+                                            let b = filter[start + k];
+                                            let al = if (b'A'..=b'Z').contains(&a) {
+                                                a + 32
+                                            } else {
+                                                a
+                                            };
+                                            let bl = if (b'A'..=b'Z').contains(&b) {
+                                                b + 32
+                                            } else {
+                                                b
+                                            };
+                                            if al != bl {
+                                                m = false;
+                                                break;
+                                            }
                                             k += 1;
                                         }
-                                        if m { ok = true; break; }
+                                        if m {
+                                            ok = true;
+                                            break;
+                                        }
                                     }
-                                    if fi < filter_len && filter[fi] == b',' { fi += 1; }
+                                    if fi < filter_len && filter[fi] == b',' {
+                                        fi += 1;
+                                    }
                                 }
-                                if !ok { continue; }
+                                if !ok {
+                                    continue;
+                                }
                             }
                             // Comma separator between items.
                             if !first {
-                                if bp < body.len() { body[bp] = b','; bp += 1; }
+                                if bp < body.len() {
+                                    body[bp] = b',';
+                                    bp += 1;
+                                }
                             }
                             first = false;
                             // Opening quote.
-                            if bp < body.len() { body[bp] = b'"'; bp += 1; }
+                            if bp < body.len() {
+                                body[bp] = b'"';
+                                bp += 1;
+                            }
                             // Name bytes (escape `"` and `\`; everything else
                             // pass-through — filenames are ASCII-ish in practice).
                             let mut k = 0usize;
                             while k < name.len() && bp + 2 < body.len() {
                                 let c = name[k];
                                 if c == b'"' || c == b'\\' {
-                                    body[bp] = b'\\'; bp += 1;
+                                    body[bp] = b'\\';
+                                    bp += 1;
                                 }
-                                body[bp] = c; bp += 1;
+                                body[bp] = c;
+                                bp += 1;
                                 k += 1;
                             }
                             // Closing quote.
-                            if bp < body.len() { body[bp] = b'"'; bp += 1; }
+                            if bp < body.len() {
+                                body[bp] = b'"';
+                                bp += 1;
+                            }
                         }
                     }
-                    (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+                    (sys.provider_call)(
+                        dir_fd,
+                        0x0903, /* FS_CLOSE */
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     // Closing `]}`.
                     let suffix: &[u8] = b"]}";
                     let mut si = 0usize;
                     while si < suffix.len() && bp < body.len() {
-                        body[bp] = suffix[si]; bp += 1; si += 1;
+                        body[bp] = suffix[si];
+                        bp += 1;
+                        si += 1;
                     }
                     let body_len = bp as u32;
 
@@ -3650,12 +3836,20 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
                 HANDLER_PROXY => {
                     build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DrainSend;
+                    }
                 }
                 HANDLER_WEBSOCKET | HANDLER_WEBSOCKET_FANOUT => {
                     if begin_ws_upgrade(s) {
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::WsHandshake; }
-                        let fan = if handler == HANDLER_WEBSOCKET_FANOUT { 1 } else { 0 };
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::WsHandshake;
+                        }
+                        let fan = if handler == HANDLER_WEBSOCKET_FANOUT {
+                            1
+                        } else {
+                            0
+                        };
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.ws_fan_out = fan;
                         }
@@ -3665,7 +3859,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
                 _ => {
                     build_error(s, b"500 Internal Server Error", b"Unknown handler\n");
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DrainSend;
+                    }
                 }
             }
         }
@@ -3718,22 +3914,34 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     core::ptr::null_mut(),
                     0,
                 );
-                if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = -1; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.fs_fd = -1;
+                }
                 build_error(s, b"502 Bad Gateway", b"Upstream fetch failed\n");
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::DrainSend;
+                }
                 return 2;
             }
             if st >= 0 {
                 let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]);
-                if let Some(cur) = cur_slot_mut(s) { cur.fs_total = size; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.fs_total = size;
+                }
                 build_header_with_len(s, b"200 OK", ct_slice, size);
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::SendHeaders;
+                }
                 return 2;
             }
             if st == E_NOSYS {
-                if let Some(cur) = cur_slot_mut(s) { cur.fs_total = u32::MAX; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.fs_total = u32::MAX;
+                }
                 build_header(s, b"200 OK", ct_slice);
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::SendHeaders;
+                }
                 return 2;
             }
             if st == E_AGAIN {
@@ -3755,13 +3963,17 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         core::ptr::null_mut(),
                         0,
                     );
-                    if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = -1; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.fs_fd = -1;
+                    }
                     build_error(
                         s,
                         b"504 Gateway Timeout",
                         b"Upstream fetch did not respond\n",
                     );
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DrainSend;
+                    }
                     return 2;
                 }
                 return 0;
@@ -3773,9 +3985,13 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 core::ptr::null_mut(),
                 0,
             );
-            if let Some(cur) = cur_slot_mut(s) { cur.fs_fd = -1; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.fs_fd = -1;
+            }
             build_error(s, b"502 Bad Gateway", b"Upstream fetch failed\n");
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::DrainSend;
+            }
             return 2;
         }
 
@@ -3783,11 +3999,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
                 let handler = if cur_matched_route(s) >= 0 {
-                    (*s.server
-                        .routes
-                        .as_ptr()
-                        .add(cur_matched_route(s) as usize))
-                    .handler
+                    (*s.server.routes.as_ptr().add(cur_matched_route(s) as usize)).handler
                 } else {
                     HANDLER_FILE
                 };
@@ -3795,39 +4007,42 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 match handler {
                     HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE | HANDLER_STREAM
                     | HANDLER_FS_FILE => {
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendBody; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::SendBody;
+                        }
                     }
                     HANDLER_FS_LIST => {
                         // FS_LIST's response (status + headers + JSON
                         // body) is already fully in `send_buf` and has
                         // drained — there's no separate body phase to
                         // run. Close the connection.
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
                     }
                     _ => {
-                        if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::CloseConn;
+                        }
                     }
                 }
                 return 2;
             }
             let sent = net_send(
                 s,
-                cur_send_buf_ptr(s)
-                    .add(cur_send_offset(s) as usize),
+                cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
                 remaining,
             );
             if sent > 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset += sent as u16;
+                }
             }
         }
 
         Phase::SendBody => {
             let handler = if cur_matched_route(s) >= 0 {
-                (*s.server
-                    .routes
-                    .as_ptr()
-                    .add(cur_matched_route(s) as usize))
-                .handler
+                (*s.server.routes.as_ptr().add(cur_matched_route(s) as usize)).handler
             } else {
                 HANDLER_FILE
             };
@@ -3854,7 +4069,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     return step_send_fs_file(s);
                 }
                 _ => {
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::CloseConn;
+                    }
                 }
             }
         }
@@ -3883,36 +4100,45 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
                 return 0;
             }
             let sent = net_send(
                 s,
-                cur_send_buf_ptr(s)
-                    .add(cur_send_offset(s) as usize),
+                cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
                 remaining,
             );
             if sent > 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset += sent as u16;
+                }
             }
         }
 
         Phase::FetchContent => {
             if s.server.file_chan < 0 {
                 build_error(s, b"500 Internal Server Error", b"No content source\n");
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::DrainSend;
+                }
                 return 0;
             }
             let poll = ((*s.syscalls).channel_poll)(s.server.file_chan, POLL_IN | POLL_HUP);
             if poll > 0 && ((poll as u32 & POLL_IN) != 0 || (poll as u32 & POLL_HUP) != 0) {
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CacheStream; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CacheStream;
+                }
                 return 2;
             }
         }
 
         Phase::CacheStream => {
             if s.server.cache_count == 0 || s.server.file_chan < 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
                 return 0;
             }
             let ce_idx = 0usize;
@@ -3953,13 +4179,19 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
                     ct[..ct_len].copy_from_slice(&r.content_type[..ct_len]);
                 }
-                let ct_slice: &[u8] = if ct_len == 0 { b"text/html" } else { &ct[..ct_len] };
+                let ct_slice: &[u8] = if ct_len == 0 {
+                    b"text/html"
+                } else {
+                    &ct[..ct_len]
+                };
                 build_header(s, b"200 OK", ct_slice);
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.tmpl_pos = 0;
                     cur.cache_retained = 1;
                 }
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::SendHeaders; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::SendHeaders;
+                }
                 return 2;
             }
 
@@ -3979,26 +4211,35 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         | Phase::ProxyRelayHeaders
         | Phase::ProxyRelayBody => {
             build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
-            if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::DrainSend; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::DrainSend;
+            }
         }
 
         Phase::WsHandshake => {
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
                 log(s, b"[http] websocket upgraded");
-                if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-                if let Some(cur) = cur_slot_mut(s) { cur.send_len = 0; }
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::WsActive; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset = 0;
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_len = 0;
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::WsActive;
+                }
                 return 2;
             }
             let sent = net_send(
                 s,
-                cur_send_buf_ptr(s)
-                    .add(cur_send_offset(s) as usize),
+                cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
                 remaining,
             );
             if sent > 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset += sent as u16;
+                }
             }
         }
 
@@ -4023,17 +4264,22 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
                     let sent = net_send(
                         s,
-                        cur_send_buf_ptr(s)
-                            .add(cur_send_offset(s) as usize),
+                        cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
                         remaining,
                     );
                     if sent > 0 {
-                        if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.send_offset += sent as u16;
+                        }
                         progress = true;
                     }
                     if cur_send_offset(s) >= cur_send_len(s) {
-                        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-                        if let Some(cur) = cur_slot_mut(s) { cur.send_len = 0; }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.send_offset = 0;
+                        }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.send_len = 0;
+                        }
                     }
                 }
 
@@ -4052,8 +4298,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 // a saturated ws_in feed (e.g. 50 fps fan-out) would
                 // otherwise keep send_buf permanently refilled and
                 // the CLOSE would never get parsed.
-                let peer_close_pending =
-                    cur_recv_len(s) > 0 && *cur_recv_buf_ptr(s) == 0x88;
+                let peer_close_pending = cur_recv_len(s) > 0 && *cur_recv_buf_ptr(s) == 0x88;
                 let can_process = cur_send_len(s) == 0 || peer_close_pending;
                 if can_process && ws_process_inbound(s) {
                     progress = true;
@@ -4087,7 +4332,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // and `peer_closed` is set there too — no per-slot
             // channel poll needed.
             if cur_slot(s).map(|c| c.peer_closed).unwrap_or(0) != 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
                 return 0;
             }
         }
@@ -4095,19 +4342,24 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         Phase::WsClose => {
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
                 return 0;
             }
             let sent = net_send(
                 s,
-                cur_send_buf_ptr(s)
-                    .add(cur_send_offset(s) as usize),
+                cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
                 remaining,
             );
             if sent > 0 {
-                if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset += sent as u16;
+                }
                 if cur_send_offset(s) >= cur_send_len(s) {
-                    if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::CloseConn;
+                    }
                     return 0;
                 }
             } else {
@@ -4115,7 +4367,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 // close, so they aren't waiting on our reply. If
                 // `net_send` rejects (TCP send buffer full, slot gone,
                 // zero peer window) free the slot rather than spin.
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
                 return 0;
             }
         }
@@ -4123,7 +4377,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         Phase::H2Active => {
             let r = h2::step(s);
             if r == 1 {
-                if let Some(cur) = cur_slot_mut(s) { cur.phase = Phase::CloseConn; }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
                 return 0;
             }
             return r;
@@ -4192,7 +4448,9 @@ pub(crate) unsafe fn set_route_source(s: &mut HttpState, idx: usize, d: *const u
 /// `fs_path:` configured serves through the FS provider without any
 /// other YAML setup.
 pub(crate) unsafe fn set_route_fs_path(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
-    if idx >= MAX_ROUTES { return; }
+    if idx >= MAX_ROUTES {
+        return;
+    }
     let r = &mut *s.server.routes.as_mut_ptr().add(idx);
     let n = if len > MAX_FS_PATH { MAX_FS_PATH } else { len };
     let mut i = 0usize;
@@ -4213,7 +4471,9 @@ pub(crate) unsafe fn set_route_fs_path(s: &mut HttpState, idx: usize, d: *const 
 /// a GET against the route returns a fresh `FS_READDIR`-built JSON
 /// payload.
 pub(crate) unsafe fn set_route_fs_list(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
-    if idx >= MAX_ROUTES { return; }
+    if idx >= MAX_ROUTES {
+        return;
+    }
     let r = &mut *s.server.routes.as_mut_ptr().add(idx);
     let n = if len > MAX_FS_PATH { MAX_FS_PATH } else { len };
     let mut i = 0usize;
@@ -4232,7 +4492,9 @@ pub(crate) unsafe fn set_route_fs_list(s: &mut HttpState, idx: usize, d: *const 
 /// file the FS provider returns. No-op when the route isn't an
 /// `fs_list:` route.
 pub(crate) unsafe fn set_route_fs_filter(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
-    if idx >= MAX_ROUTES { return; }
+    if idx >= MAX_ROUTES {
+        return;
+    }
     let r = &mut *s.server.routes.as_mut_ptr().add(idx);
     let n = if len > 64 { 64 } else { len };
     let mut i = 0usize;

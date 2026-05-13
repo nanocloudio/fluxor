@@ -64,7 +64,11 @@ pub struct ReorderSlot {
 
 impl ReorderSlot {
     pub const fn empty() -> Self {
-        Self { seq: 0, len: 0, valid: false }
+        Self {
+            seq: 0,
+            len: 0,
+            valid: false,
+        }
     }
 }
 
@@ -86,24 +90,24 @@ pub struct TcpConn {
     pub _dg_pad: [u8; 3],
 
     // Send sequence variables
-    pub snd_una: u32,   // oldest unacknowledged
-    pub snd_nxt: u32,   // next to send
-    pub snd_wnd: u16,   // peer's advertised receive window
+    pub snd_una: u32, // oldest unacknowledged
+    pub snd_nxt: u32, // next to send
+    pub snd_wnd: u16, // peer's advertised receive window
 
     // Receive sequence variables
-    pub rcv_nxt: u32,   // next expected
-    pub rcv_wnd: u16,   // our receive window advertisement
+    pub rcv_nxt: u32, // next expected
+    pub rcv_wnd: u16, // our receive window advertisement
 
     pub iss: u32,
     pub retransmit_timer: u16,
     pub timewait_timer: u16,
 
     // NewReno congestion control (§4.2)
-    pub cwnd: u16,              // congestion window (bytes)
-    pub ssthresh: u16,          // slow-start threshold
-    pub dup_ack_count: u8,      // consecutive duplicate ACKs
+    pub cwnd: u16,         // congestion window (bytes)
+    pub ssthresh: u16,     // slow-start threshold
+    pub dup_ack_count: u8, // consecutive duplicate ACKs
     pub in_recovery: bool,
-    pub recover_seq: u32,       // snd_nxt at recovery entry
+    pub recover_seq: u32, // snd_nxt at recovery entry
 
     // Jacobson/Karn RTT estimation (RFC 6298). Values are in step ticks
     // using a 3-bit fixed-point shift (srtt = RTT * 8).
@@ -249,12 +253,8 @@ pub unsafe fn parse_tcp(data: *const u8, len: usize) -> Option<TcpHeader> {
 
     let src_port = (*data as u16) << 8 | (*data.add(1) as u16);
     let dst_port = (*data.add(2) as u16) << 8 | (*data.add(3) as u16);
-    let seq_num = u32::from_be_bytes([
-        *data.add(4), *data.add(5), *data.add(6), *data.add(7),
-    ]);
-    let ack_num = u32::from_be_bytes([
-        *data.add(8), *data.add(9), *data.add(10), *data.add(11),
-    ]);
+    let seq_num = u32::from_be_bytes([*data.add(4), *data.add(5), *data.add(6), *data.add(7)]);
+    let ack_num = u32::from_be_bytes([*data.add(8), *data.add(9), *data.add(10), *data.add(11)]);
     let data_offset_raw = *data.add(12);
     let data_offset = ((data_offset_raw >> 4) as usize) * 4;
     let flags = *data.add(13);
@@ -308,17 +308,11 @@ pub unsafe fn find_conn(
 /// Datagram endpoints share the same conn array and also sit in
 /// `Listen` state, so the match excludes `is_datagram` slots — a TCP
 /// SYN must never land on a UDP-bound endpoint.
-pub unsafe fn find_listener(
-    conns: &[TcpConn; MAX_TCP_CONNS],
-    local_port: u16,
-) -> Option<usize> {
+pub unsafe fn find_listener(conns: &[TcpConn; MAX_TCP_CONNS], local_port: u16) -> Option<usize> {
     let mut i = 0;
     while i < MAX_TCP_CONNS {
         let c = &*conns.as_ptr().add(i);
-        if c.state == TcpState::Listen
-            && !c.is_datagram
-            && c.local_port == local_port
-        {
+        if c.state == TcpState::Listen && !c.is_datagram && c.local_port == local_port {
             return Some(i);
         }
         i += 1;
@@ -399,7 +393,11 @@ pub unsafe fn compute_tcp_checksum(
     let mut i: usize = 0;
     while i < tcp_seg_len {
         let b = rv(tcp_start.add(i)) as u32;
-        if (i & 1) == 0 { sum += b << 8; } else { sum += b; }
+        if (i & 1) == 0 {
+            sum += b << 8;
+        } else {
+            sum += b;
+        }
         i += 1;
     }
 
@@ -429,7 +427,9 @@ pub fn seq_lt(a: u32, b: u32) -> bool {
 /// Store an out-of-order segment in the reorder buffer. Returns true if the
 /// segment was buffered, false if there is no slot (caller drops it).
 pub unsafe fn reorder_insert(conn: &mut TcpConn, seq: u32, payload: *const u8, len: usize) -> bool {
-    if len == 0 || len > REORDER_SLOT_BYTES { return false; }
+    if len == 0 || len > REORDER_SLOT_BYTES {
+        return false;
+    }
     // Reject duplicates and overlaps — overlap detection defends against
     // reassembly-based injection.
     let mut i = 0;
@@ -453,7 +453,10 @@ pub unsafe fn reorder_insert(conn: &mut TcpConn, seq: u32, payload: *const u8, l
     let mut slot_idx: Option<usize> = None;
     i = 0;
     while i < REORDER_SLOTS {
-        if !conn.reorder_slots[i].valid { slot_idx = Some(i); break; }
+        if !conn.reorder_slots[i].valid {
+            slot_idx = Some(i);
+            break;
+        }
         i += 1;
     }
     let si = match slot_idx {
@@ -472,7 +475,10 @@ pub unsafe fn reorder_insert(conn: &mut TcpConn, seq: u32, payload: *const u8, l
 /// Pop the next in-order segment from the reorder buffer if its seq matches
 /// `rcv_nxt`. Returns (ptr, len) on hit, None otherwise. The returned pointer
 /// is valid until the next `reorder_insert` or `reorder_take_next`.
-pub unsafe fn reorder_take_next<'a>(conn: &'a mut TcpConn, rcv_nxt: u32) -> Option<(&'a [u8], u32)> {
+pub unsafe fn reorder_take_next<'a>(
+    conn: &'a mut TcpConn,
+    rcv_nxt: u32,
+) -> Option<(&'a [u8], u32)> {
     let mut i = 0;
     while i < REORDER_SLOTS {
         if conn.reorder_slots[i].valid && conn.reorder_slots[i].seq == rcv_nxt {
@@ -528,7 +534,9 @@ pub unsafe fn reorder_consume_at(conn: &mut TcpConn, seq: u32) {
 
 /// Minimum useful cwnd per RFC 5681 after a loss event.
 #[inline]
-pub fn cwnd_min() -> u16 { 2 * MSS }
+pub fn cwnd_min() -> u16 {
+    2 * MSS
+}
 
 /// Handler for a new ACK that advances snd_una. Grows cwnd in slow start
 /// or congestion avoidance per RFC 5681.
@@ -594,7 +602,11 @@ pub fn rtt_update(conn: &mut TcpConn, sample_ticks: u16) {
         conn.rttvar = (r << 2) as u16;
     } else {
         let srtt_shifted = (conn.srtt >> 3) as u32;
-        let delta = if r > srtt_shifted { r - srtt_shifted } else { srtt_shifted - r };
+        let delta = if r > srtt_shifted {
+            r - srtt_shifted
+        } else {
+            srtt_shifted - r
+        };
         // rttvar = rttvar - (rttvar >> 2) + delta
         conn.rttvar = (conn.rttvar as u32)
             .wrapping_sub((conn.rttvar as u32) >> 2)

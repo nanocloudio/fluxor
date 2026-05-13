@@ -155,11 +155,9 @@ extern "C" {
 ///   export sec: 07 0a | 01 06 a n s w e r 00 00     ; "answer" -> func 0
 ///   code sec:   0a 06 | 01 04 00 41 2a 0b           ; const 42, end
 const MINIMAL_WASM_ANSWER: &[u8] = &[
-    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
-    0x03, 0x02, 0x01, 0x00,
-    0x07, 0x0a, 0x01, 0x06, b'a', b'n', b's', b'w', b'e', b'r', 0x00, 0x00,
-    0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, 0x03,
+    0x02, 0x01, 0x00, 0x07, 0x0a, 0x01, 0x06, b'a', b'n', b's', b'w', b'e', b'r', 0x00, 0x00, 0x0a,
+    0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
 ];
 
 // ── Log forwarding ───────────────────────────────────────────────────
@@ -247,7 +245,10 @@ fn init_tick_demo() {
     unsafe {
         MODULE_COUNT = 2;
     }
-    log_str(2, b"[wasm-kernel] tick demo: 2 builtins (tick_source -> tick_sink)");
+    log_str(
+        2,
+        b"[wasm-kernel] tick demo: 2 builtins (tick_source -> tick_sink)",
+    );
 }
 
 /// Bit 5 of the FXMD reserved[0] flags byte = wasm-payload module.
@@ -305,9 +306,12 @@ unsafe fn load_embedded_modules() -> usize {
     // embedded blobs and compile the graph. `prepare_graph` builds
     // the per-module port table, allocates channels, and returns the
     // resolved module list keyed by name_hash.
-    let cfg_ptr = EMBEDDED_CONFIG_BLOB.data.as_ptr();
+    // Length-aware: `config_used` is the actual content size inside the
+    // statically-allocated CONFIG_BLOB_CAPACITY-sized array. Bounded slice
+    // construction makes the parser reject any section that overruns it.
+    let cfg_slice = core::slice::from_raw_parts(EMBEDDED_CONFIG_BLOB.data.as_ptr(), config_used);
     let mod_ptr = EMBEDDED_MODULES_BLOB.data.as_ptr();
-    if let Err(msg) = scheduler::populate_static_state(cfg_ptr, mod_ptr) {
+    if let Err(msg) = scheduler::populate_static_state_with_len(cfg_slice, mod_ptr) {
         log_str(4, b"[wasm-kernel] populate_static_state failed:");
         log_str(4, msg.as_bytes());
         return 0;
@@ -579,6 +583,24 @@ unsafe fn load_embedded_modules() -> usize {
             continue;
         }
 
+        // Run the same admission pipeline native modules go through:
+        // ABI-version, code-size, manifest-integrity, signature, and
+        // `enforce_signatures` gates all apply to hosted WASM modules
+        // identically to RP/BCM. The wasm payload itself goes through
+        // the host's wasmtime/browser instantiation below — the
+        // kernel can't verify wasm32 instructions itself — but the
+        // `.fmod` envelope is verified here.
+        if let Err(_e) = crate::kernel::loader::validate_module(&loaded, "wasm-child") {
+            log_fmt2(
+                3,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                ": validate_module rejected the .fmod envelope",
+                0,
+            );
+            continue;
+        }
+
         // The wasm platform's `host_instantiate_module` loop bypasses
         // `scheduler::instantiate_one_module`, so cap metadata has to
         // be staged explicitly — otherwise `check_contract_grant`
@@ -651,11 +673,8 @@ unsafe fn load_embedded_modules() -> usize {
         // absent.
         let arena_size: u32 = {
             let arena_export = b"module_arena_size";
-            let exists = host_module_export_exists(
-                handle,
-                arena_export.as_ptr(),
-                arena_export.len(),
-            );
+            let exists =
+                host_module_export_exists(handle, arena_export.as_ptr(), arena_export.len());
             if exists == 1 {
                 let mut arena_ret = [0u8; 4];
                 let arena_rc = host_invoke_module(
@@ -713,11 +732,7 @@ unsafe fn load_embedded_modules() -> usize {
         // borrows from the `'static` embedded-modules section.
         let params_slice = entry.params();
         unsafe {
-            scheduler::set_module_params(
-                module_idx,
-                params_slice.as_ptr(),
-                params_slice.len(),
-            );
+            scheduler::set_module_params(module_idx, params_slice.as_ptr(), params_slice.len());
         }
 
         // `module_init_wasm` is the wasm-only entry point each PIC
@@ -787,7 +802,23 @@ unsafe fn load_embedded_modules() -> usize {
         );
     }
 
-    registered
+    // Return the `prepare_graph` module count, not `registered`.
+    // Modules that failed to register (e.g. STATE_ARENA full) are
+    // left at their original slot index; the scheduler's
+    // `step_modules` tolerates `ModuleSlot::Empty` gracefully via
+    // `as_module_mut().is_some()`. Returning `registered` here would
+    // shrink `MODULE_COUNT` and silently skip later,
+    // successfully-registered modules at the tail.
+    if registered < module_count {
+        log_fmt2(
+            3,
+            "[wasm-kernel] partial bring-up: ",
+            registered as u64,
+            " of N modules registered (slots with failures will be skipped per-tick)",
+            module_count as u64,
+        );
+    }
+    module_count
 }
 
 /// BuiltInModule step function for a wasm-instantiated module. Reads
@@ -930,15 +961,18 @@ pub extern "C" fn kernel_init() -> i32 {
 /// Drive one scheduler tick. Returns a hint (in milliseconds) for how
 /// long the host can wait before the next call. 0 means run again
 /// immediately.
+///
+/// Uses the shared `step_modules` path — the same one RP and Linux
+/// call — so topological execution order, every `StepOutcome`
+/// variant (including `Burst`'s cap and `Ready` signal propagation),
+/// fault transitions, step-period gating, and diagnostics are
+/// identical across platforms.
+///
 #[no_mangle]
 pub extern "C" fn kernel_step() -> u32 {
     let count = unsafe { MODULE_COUNT };
-    let mut i = 0usize;
-    while i < count {
-        scheduler::set_current_module(i);
-        scheduler::step_module(i);
-        i += 1;
-    }
+    let sched = unsafe { scheduler::sched_mut() };
+    let _ = scheduler::step_modules(&mut sched.modules, count);
     16 // ~60 Hz hint
 }
 
@@ -1331,12 +1365,7 @@ pub unsafe extern "C" fn provider_open(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-pub unsafe extern "C" fn provider_call(
-    handle: i32,
-    op: u32,
-    arg: *mut u8,
-    arg_len: usize,
-) -> i32 {
+pub unsafe extern "C" fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     let table = crate::kernel::syscalls::get_syscall_table();
     (table.provider_call)(handle, op, arg, arg_len)
 }

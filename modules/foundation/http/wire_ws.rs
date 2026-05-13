@@ -558,8 +558,7 @@ impl Sha1 {
 
 // ── Base64 encoder (RFC 4648, exactly 20 input bytes → 28 output bytes) ──
 
-const B64: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 unsafe fn base64_encode_20(input: &[u8; 20], out: *mut u8) {
     // 20 bytes = 6 full triples + 1 leftover pair → 6*4 + 4 = 28 chars.
@@ -584,7 +583,10 @@ unsafe fn base64_encode_20(input: &[u8; 20], out: *mut u8) {
 
 #[inline]
 fn is_valid_opcode(op: u8) -> bool {
-    matches!(op, OP_CONTINUATION | OP_TEXT | OP_BINARY | OP_CLOSE | OP_PING | OP_PONG)
+    matches!(
+        op,
+        OP_CONTINUATION | OP_TEXT | OP_BINARY | OP_CLOSE | OP_PING | OP_PONG
+    )
 }
 
 #[inline]

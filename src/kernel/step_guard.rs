@@ -50,7 +50,12 @@ pub enum FaultState {
 pub enum FaultPolicy {
     /// Terminate module, graph continues without it.
     Skip = 0,
-    /// Zero state, reset heap, drain channels, call module_new() again.
+    /// **v1 limitation — partial restart**: channels are flushed and the
+    /// fault state machine moves back to `Running`, but state is *not*
+    /// zeroed and `module_new()` is *not* re-called. See
+    /// `scheduler::handle_module_restart` for the exact behaviour. Safe
+    /// for stateless / idempotent modules; modules with stateful invariants
+    /// should use `Skip` and rely on the graph operator to drain+reload.
     Restart = 1,
     /// Tear down and re-instantiate entire graph.
     RestartGraph = 2,
@@ -192,66 +197,110 @@ pub const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 /// Burst multiplier — burst deadline = step_deadline * this.
 pub const BURST_MULTIPLIER: u32 = 8;
 
-/// Global flag: set by timer ISR when a step times out.
-/// Checked by scheduler after each step() call.
-static STEP_TIMED_OUT: AtomicBool = AtomicBool::new(false);
+/// Maximum cores the step-guard state arrays size for. Matches
+/// `scheduler::MAX_DOMAINS` (4); on single-core platforms (RP /
+/// Linux / WASM) only index 0 is used. Every step-guard atomic is
+/// indexed by `hal::core_id()` so two cores arming their own steps
+/// in parallel cannot clobber each other's guarded-module / timeout
+/// / MPU-fault state.
+pub const MAX_STEP_GUARD_CORES: usize = 4;
 
-/// Module index that the guard is armed for (for ISR context).
-static GUARDED_MODULE: AtomicU8 = AtomicU8::new(0xFF);
+/// Per-core flag: set by timer ISR when a step times out.
+/// Checked by the scheduler running on that core after each step()
+/// call.
+static STEP_TIMED_OUT: [AtomicBool; MAX_STEP_GUARD_CORES] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
-/// Whether the step guard is currently armed.
-static GUARD_ARMED: AtomicBool = AtomicBool::new(false);
+/// Per-core module index that the guard is armed for (for ISR
+/// context). `0xFF` means no module is currently guarded on that core.
+static GUARDED_MODULE: [AtomicU8; MAX_STEP_GUARD_CORES] = [
+    AtomicU8::new(0xFF),
+    AtomicU8::new(0xFF),
+    AtomicU8::new(0xFF),
+    AtomicU8::new(0xFF),
+];
 
-/// Flag: set by MPU/MMU fault handler when a memory protection violation occurs.
-static MPU_FAULT_PENDING: AtomicBool = AtomicBool::new(false);
+/// Per-core armed flag. The platform `step_guard_arm` sets this
+/// before reading `GUARDED_MODULE`; `step_guard_disarm` clears it.
+static GUARD_ARMED: [AtomicBool; MAX_STEP_GUARD_CORES] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
-/// Check if the last step timed out (and clear the flag).
+/// Per-core MPU/MMU fault flag, set by the protection-fault handler
+/// on the offending core.
+static MPU_FAULT_PENDING: [AtomicBool; MAX_STEP_GUARD_CORES] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+#[inline(always)]
+fn cur_core() -> usize {
+    let id = crate::kernel::hal::core_id();
+    if id < MAX_STEP_GUARD_CORES {
+        id
+    } else {
+        0
+    }
+}
+
+/// Check if the last step timed out on the current core (and clear
+/// the flag).
 #[inline]
 pub fn check_and_clear_timeout() -> bool {
-    STEP_TIMED_OUT.swap(false, Ordering::AcqRel)
+    STEP_TIMED_OUT[cur_core()].swap(false, Ordering::AcqRel)
 }
 
-/// Record an MPU/MMU fault for the current module.
+/// Record an MPU/MMU fault for the current module on the current core.
 /// Called from the MemManage (Cortex-M) or Data Abort (aarch64) handler.
 pub fn record_mpu_fault(module_idx: usize) {
-    MPU_FAULT_PENDING.store(true, Ordering::Release);
-    GUARDED_MODULE.store(module_idx as u8, Ordering::Release);
+    let c = cur_core();
+    MPU_FAULT_PENDING[c].store(true, Ordering::Release);
+    GUARDED_MODULE[c].store(module_idx as u8, Ordering::Release);
 }
 
-/// Check if an MPU fault is pending (and clear the flag).
+/// Check if an MPU fault is pending on the current core (and clear).
 #[inline]
 pub fn check_and_clear_mpu_fault() -> bool {
-    MPU_FAULT_PENDING.swap(false, Ordering::AcqRel)
+    MPU_FAULT_PENDING[cur_core()].swap(false, Ordering::AcqRel)
 }
 
-/// Check if a timeout is pending without clearing.
+/// Check if a timeout is pending on the current core without clearing.
 #[inline]
 pub fn is_timed_out() -> bool {
-    STEP_TIMED_OUT.load(Ordering::Acquire)
+    STEP_TIMED_OUT[cur_core()].load(Ordering::Acquire)
 }
 
 // ============================================================================
 // Platform backend entry points (called by HAL implementations)
 // ============================================================================
 
-/// Set the timeout flag. Called by platform timer ISR.
+/// Set the timeout flag for the current core. Called by platform timer ISR.
 pub fn set_timed_out() {
-    STEP_TIMED_OUT.store(true, Ordering::Release);
+    STEP_TIMED_OUT[cur_core()].store(true, Ordering::Release);
 }
 
-/// Clear the timeout flag. Called by platform arm.
+/// Clear the timeout flag for the current core. Called by platform arm.
 pub fn clear_timed_out() {
-    STEP_TIMED_OUT.store(false, Ordering::Release);
+    STEP_TIMED_OUT[cur_core()].store(false, Ordering::Release);
 }
 
-/// Set the armed flag. Called by platform arm.
+/// Set the armed flag for the current core. Called by platform arm.
 pub fn set_armed(armed: bool) {
-    GUARD_ARMED.store(armed, Ordering::Release);
+    GUARD_ARMED[cur_core()].store(armed, Ordering::Release);
 }
 
-/// Check if armed. Called by platform disarm/post-check.
+/// Check if armed on the current core. Called by platform disarm/post-check.
 pub fn is_armed() -> bool {
-    GUARD_ARMED.load(Ordering::Acquire)
+    GUARD_ARMED[cur_core()].load(Ordering::Acquire)
 }
 
 // ============================================================================
@@ -263,10 +312,13 @@ pub fn init() {
     hal::step_guard_init();
 }
 
-/// Arm the step guard with a deadline in microseconds.
+/// Arm the step guard with a deadline in microseconds. Records the
+/// guarded module index on the current core's slot so the timer ISR
+/// / MPU fault handler can identify which module timed out without
+/// stepping on another core's guarded module.
 #[inline]
 pub fn arm(deadline_us: u32) {
-    GUARDED_MODULE.store(
+    GUARDED_MODULE[cur_core()].store(
         crate::kernel::scheduler::current_module_index() as u8,
         Ordering::Release,
     );

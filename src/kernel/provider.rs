@@ -188,9 +188,13 @@ static mut HANDLE_BINDINGS: [HandleBinding; MAX_TRACKED] = [const {
     }
 }; MAX_TRACKED];
 
-fn track_handle(handle: i32, contract: ContractId) {
+/// Result of `track_handle`. `Ok(())` = a tracking slot was claimed (or none
+/// was needed because the handle is self-identifying via FD tag).
+/// `Err(())` = the tracking table was full; the caller must release the
+/// underlying handle and propagate an error to the module.
+fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
     if handle < 0 {
-        return;
+        return Ok(());
     }
     // Tagged fds (event / timer / dma) are self-identifying — the FD
     // tag carries the contract id, so `lookup_contract` resolves them
@@ -198,7 +202,7 @@ fn track_handle(handle: i32, contract: ContractId) {
     // available for untagged handles (GPIO pins, DMA channel numbers,
     // HAL handles) that genuinely need an entry.
     if fd_tag_contract(handle).is_some() {
-        return;
+        return Ok(());
     }
     unsafe {
         let p = &raw mut HANDLE_BINDINGS;
@@ -206,10 +210,17 @@ fn track_handle(handle: i32, contract: ContractId) {
             if slot.handle == -1 {
                 slot.handle = handle;
                 slot.contract = contract;
-                return;
+                return Ok(());
             }
         }
-        log::warn!("[provider] handle tracking full, {} untracked", handle);
+        log::error!(
+            "[provider] HANDLE_BINDINGS exhausted (MAX_TRACKED={}); refusing to leak \
+             untracked handle {} for contract {:#x}",
+            MAX_TRACKED,
+            handle,
+            contract,
+        );
+        Err(())
     }
 }
 
@@ -369,9 +380,30 @@ pub fn provider_open(
         }
         None => {
             // Untagged contract (CHANNEL): class-byte dispatch looks
-            // the handle up via HANDLE_BINDINGS.
-            track_handle(handle, contract);
-            handle
+            // the handle up via HANDLE_BINDINGS. If tracking fails
+            // (table full), close the resource we just opened and
+            // refuse the open — fail-closed; never return an
+            // untracked handle.
+            match track_handle(handle, contract) {
+                Ok(()) => handle,
+                Err(()) => {
+                    // Release the underlying resource. Use the same
+                    // dispatch path provider_close uses so contracts
+                    // without a vtable still get the default-close op
+                    // delivered.
+                    if let Some(vt) = vtable_for(contract) {
+                        if vt.default_close_op != 0 {
+                            unsafe {
+                                (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0);
+                            }
+                        }
+                    }
+                    // Use ENOMEM: tracking table is a finite kernel
+                    // resource and the caller exhausted it. Same class
+                    // as STATE_ARENA exhaustion in the loader.
+                    errno::ENOMEM
+                }
+            }
         }
     }
 }
@@ -442,6 +474,35 @@ pub fn reset_handle_tracking() {
             slot.handle = -1;
             slot.contract = 0;
         }
+    }
+}
+
+/// Snapshot of provider tracking-table usage. Used by diagnostics and
+/// harness tests that need to assert tracking-table state without
+/// reading the private `HANDLE_BINDINGS` static directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandleTrackingStats {
+    /// Slots currently bound to an open handle.
+    pub in_use: usize,
+    /// Total slots in the tracking table.
+    pub capacity: usize,
+}
+
+/// Return current usage of the provider handle tracking table.
+/// Cheap: walks `MAX_TRACKED` entries once with relaxed ordering.
+pub fn handle_tracking_stats() -> HandleTrackingStats {
+    let mut in_use = 0usize;
+    unsafe {
+        let p = &raw const HANDLE_BINDINGS;
+        for slot in (*p).iter() {
+            if slot.handle != -1 {
+                in_use += 1;
+            }
+        }
+    }
+    HandleTrackingStats {
+        in_use,
+        capacity: MAX_TRACKED,
     }
 }
 

@@ -25,9 +25,12 @@ pio_count = 0
 pio_state_machines = 0
 dma_channels = 0
 
-[kernel]
-state_arena_kb = 256
-buffer_arena_kb = 32
+# [kernel] capacity tunables for the Linux host live in
+# `modules/sdk/config.rs::profile_host` (selected at compile time via
+# `cfg(target_arch = "aarch64")`). build.rs takes the early-return path
+# for `host-linux`; STATE_ARENA / BUFFER_ARENA / CONFIG_ARENA come from
+# `src/platform/linux/chip.rs` re-exporting `abi::config::kernel`. Edit
+# `modules/sdk/config.rs::profile_host::kernel` to change capacities.
 
 [memory]
 ram_base = "0x00000000"

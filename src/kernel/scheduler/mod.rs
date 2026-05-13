@@ -22,6 +22,8 @@
 
 use core::ptr::null;
 
+use portable_atomic::{AtomicBool, Ordering};
+
 use crate::kernel::channel;
 use crate::kernel::channel::{channel_set_flags, channel_set_mailbox, POLL_ERR, POLL_HUP};
 use crate::kernel::config::{
@@ -45,6 +47,17 @@ use crate::modules::StepOutcome;
 
 /// Maximum number of modules in a graph.
 pub const MAX_MODULES: usize = CONFIG_MAX_MODULES;
+
+// Compile-time gate: readiness, upstream, event-wake, and domain-step
+// bitmaps in this module store one bit per module in a `u64`. Widening
+// `MAX_MODULES` past 64 must come with a matching bitmap rewrite — until
+// then this assert blocks the configuration drift that would let
+// `1u64 << module_idx` overflow at runtime.
+const _: () = assert!(
+    MAX_MODULES <= 64,
+    "MAX_MODULES > 64 requires widening every scheduler bitmap (upstream_mask, \
+     not_ready, wake_bits, event-wake) past u64."
+);
 
 /// Maximum number of channels (edges) in a graph.
 /// Matches MAX_GRAPH_EDGES from config to support fan-in/out expansion.
@@ -316,7 +329,17 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
 
         let producer_mod = edge.from_module as u8;
         let chan = if buf_size > 0 {
-            let config = buf_size.to_le_bytes();
+            // `channel_open` accepts only an exact 4-byte LE u32 that
+            // is already a power of two and in `[64, 256 KiB]`. Module
+            // hints and YAML overrides arrive as arbitrary `u32`s, so
+            // the scheduler is the place that normalises before the
+            // syscall sees them.
+            const MIN_CHAN_BYTES: u32 = 64;
+            const MAX_CHAN_BYTES: u32 = 256 * 1024;
+            let normalised = buf_size
+                .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
+                .next_power_of_two();
+            let config = normalised.to_le_bytes();
             channel::channel_open_for_module(
                 channel::CHANNEL_TYPE_PIPE,
                 config.as_ptr(),
@@ -614,6 +637,14 @@ pub unsafe fn install_static_config(cfg: Config) {
 /// until module instantiation completes. After this returns `Ok`,
 /// `prepare_graph()` is the next step.
 ///
+/// **Length-aware variant**: callers that know the config blob length
+/// (hosted targets reading from a file, wasm reading from a static
+/// `[u8; N]` blob) should prefer [`populate_static_state_with_len`] so
+/// the parser can reject sections that would extend past the mapped
+/// range. The pointer-only entry continues to delegate to a strict
+/// path internally with a 32 KiB upper bound — the historical
+/// `MAX_CONFIG_SIZE`.
+///
 /// # Safety
 /// `config_ptr` and `modules_ptr` must each point at a valid blob whose
 /// internal length fields stay within the mapped range. Both ranges
@@ -623,6 +654,49 @@ pub unsafe fn install_static_config(cfg: Config) {
 /// has started stepping modules.
 pub unsafe fn populate_static_state(
     config_ptr: *const u8,
+    config_len: usize,
+    modules_ptr: *const u8,
+) -> Result<(), &'static str> {
+    // `config_len` is the platform's declared upper bound on the
+    // config blob's mapped region. QEMU virt passes the gap between
+    // QEMU_CONFIG_BLOB_ADDR and QEMU_MODULES_BLOB_ADDR; other
+    // bare-metal paths use the slot size from their flash trailer.
+    let loader = unsafe {
+        let p = &raw mut STATIC_LOADER;
+        &mut *p
+    };
+    let config = unsafe {
+        let p = &raw mut STATIC_CONFIG;
+        &mut *p
+    };
+    loader
+        .init_from_blob(modules_ptr)
+        .map_err(|_| "loader init failed")?;
+    if !unsafe {
+        crate::kernel::config::read_config_from_ptr_with_len(config_ptr, config_len, config)
+    } {
+        return Err("config parse failed");
+    }
+    Ok(())
+}
+
+/// Length-aware counterpart to `populate_static_state`.
+///
+/// `config_blob` is the entire config region as a byte slice; its length
+/// is the hard upper bound the parser uses when validating section
+/// offsets. Hosted targets (Linux: `Vec<u8>` from disk; WASM: a static
+/// `[u8; CONFIG_BLOB_CAPACITY]`) call this variant so a malformed
+/// header that claims a body larger than the actual blob fails
+/// deterministically rather than wandering past the mapping.
+///
+/// # Safety
+/// `modules_ptr` must point at a valid module-table blob whose internal
+/// length fields stay within the mapped range. `config_blob` may be
+/// any slice the caller has a valid reference for. Mutates the static
+/// config + loader; not safe to call after the scheduler has started
+/// stepping modules.
+pub unsafe fn populate_static_state_with_len(
+    config_blob: &[u8],
     modules_ptr: *const u8,
 ) -> Result<(), &'static str> {
     let loader = unsafe {
@@ -636,7 +710,7 @@ pub unsafe fn populate_static_state(
     loader
         .init_from_blob(modules_ptr)
         .map_err(|_| "loader init failed")?;
-    if !crate::kernel::config::read_config_from_ptr(config_ptr, config) {
+    if !crate::kernel::config::read_config_from_slice(config_blob, config) {
         return Err("config parse failed");
     }
     Ok(())
@@ -829,7 +903,7 @@ pub struct SchedulerState {
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
     ready: [bool; MAX_MODULES],
     /// Per-module upstream dependency bitmask (precomputed from edges)
-    upstream_mask: [u32; MAX_MODULES],
+    upstream_mask: [u64; MAX_MODULES],
     /// Per-module step period (0 = every tick, N = every N ms)
     step_period: [u8; MAX_MODULES],
     /// Per-module step counter (counts ticks toward period)
@@ -1215,20 +1289,6 @@ pub fn module_params(idx: usize) -> (*const u8, usize) {
     unsafe { (SCHED.module_params_ptr[idx], SCHED.module_params_len[idx]) }
 }
 
-/// Step a single module by index.
-pub fn step_module(idx: usize) {
-    let _ = step_module_outcome(idx);
-}
-
-/// Step a module and return its `StepOutcome`. Tier-3 poll-mode pump
-/// loops re-step on `StepOutcome::Burst`.
-pub fn step_module_outcome(idx: usize) -> Option<Result<StepOutcome, i32>> {
-    if idx >= MAX_MODULES {
-        return None;
-    }
-    unsafe { SCHED.modules[idx].as_module_mut().map(|m| m.step()) }
-}
-
 /// Store a BuiltInModule in the scheduler's module table (used by Linux platform).
 pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
     if idx >= MAX_MODULES {
@@ -1253,6 +1313,51 @@ pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
 /// Return the graph-level sample rate (0 = not configured).
 pub fn graph_sample_rate() -> u32 {
     unsafe { SCHED.graph_sample_rate }
+}
+
+/// Snapshot of the currently-loaded graph's top-level identity. Used by
+/// diagnostics and
+/// by tools that need to fingerprint a running configuration without
+/// re-reading the binary blob (e.g. to skip a reconfigure when the
+/// proposed graph hash matches what's already loaded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphSnapshot {
+    /// CRC16-CCITT over the binary config body — same value the loader
+    /// validates against `header.checksum`. `0` means the producer
+    /// didn't include a checksum.
+    pub config_checksum: u16,
+    /// Active module count in the compiled graph.
+    pub module_count: u8,
+    /// Compiled edge count.
+    pub edge_count: u8,
+    /// Tick interval in microseconds (`0` = default `DEFAULT_TICK_US`).
+    pub tick_us: u32,
+    /// Graph-level sample rate (`0` = not configured).
+    pub sample_rate: u32,
+    /// Number of modules in `exec_order` (post-topological-sort length).
+    pub exec_order_count: usize,
+}
+
+/// Build a `GraphSnapshot` from the current `STATIC_CONFIG` and `SCHED`.
+/// Safe to call after `populate_static_state` + `prepare_graph` have run;
+/// before that returns a zero-filled snapshot (every field 0).
+pub fn graph_snapshot() -> GraphSnapshot {
+    let cfg = unsafe {
+        let p = &raw const STATIC_CONFIG;
+        &*p
+    };
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    GraphSnapshot {
+        config_checksum: cfg.header.checksum,
+        module_count: cfg.header.module_count,
+        edge_count: cfg.header.edge_count,
+        tick_us: cfg.header.tick_us as u32,
+        sample_rate: sched.graph_sample_rate,
+        exec_order_count: sched.exec_order_count,
+    }
 }
 
 /// Set the graph-level sample rate (called from config parsing).
@@ -1459,6 +1564,151 @@ pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
     }
 }
 
+/// Set per-module step period (every N ticks). `0` = step every tick.
+/// Used by the loader's manifest-driven setup and by conformance tests
+/// that exercise the period-gating path in `step_one_module`.
+pub fn set_module_step_period(module_idx: usize, period: u8) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        SCHED.step_period[module_idx] = period;
+        // Resetting the counter keeps period semantics predictable: the
+        // next tick is the first measured tick of the new period.
+        SCHED.step_counter[module_idx] = 0;
+    }
+}
+
+/// Read the current fault state of a module. Test-facing query so
+/// scheduler conformance tests can assert fault transitions without
+/// reaching into `SCHED` directly.
+pub fn module_fault_state(module_idx: usize) -> FaultState {
+    if module_idx >= MAX_MODULES {
+        return FaultState::Running;
+    }
+    unsafe { SCHED.fault_info[module_idx].state }
+}
+
+/// Read `finished[module_idx]`. Test-facing query for terminate /
+/// done assertions.
+pub fn module_finished(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
+    unsafe { SCHED.finished[module_idx] }
+}
+
+/// Mark a module as "deferred-ready". Deferred-ready modules step
+/// freely even when their upstream peers haven't signaled `Ready` yet
+/// — they need to run to reach Ready themselves (typical for
+/// infrastructure like `linux_net` that sets `Ready` only after the
+/// network is up).
+pub fn set_module_deferred_ready(module_idx: usize, deferred: bool) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        SCHED.deferred_ready[module_idx] = deferred;
+    }
+}
+
+/// Set the upstream-readiness mask for a module. Each bit i in `mask`
+/// means "this module depends on module i being Ready before it can
+/// step". Used by loader manifest plumbing and by conformance tests
+/// that exercise ready-signal gating without a real graph.
+pub fn set_module_upstream_mask(module_idx: usize, mask: u64) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        SCHED.upstream_mask[module_idx] = mask;
+    }
+}
+
+/// Clear the per-module ready bit. Test-facing helper so a fresh
+/// graph can be wired into a state where downstream modules are
+/// gated waiting on a not-yet-Ready upstream.
+pub fn clear_module_ready(module_idx: usize) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        SCHED.ready[module_idx] = false;
+    }
+}
+
+/// Read the per-module ready bit.
+pub fn module_is_ready(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
+    unsafe { SCHED.ready[module_idx] }
+}
+
+/// Snapshot of a single module's scheduler-visible state. Used by
+/// diagnostics 
+/// and by operator-facing introspection.
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleStateSnapshot {
+    /// Module slot index in the scheduler's `modules` array.
+    pub idx: u8,
+    /// `true` if the module's slot is non-empty in the scheduler.
+    pub present: bool,
+    /// Whether the module has signaled `StepOutcome::Ready`.
+    pub ready: bool,
+    /// Whether the module has finalised (`Done` / terminated).
+    pub finished: bool,
+    /// Capability tier (Driver/Service/Protocol — see scheduler docs).
+    pub cap_class: u8,
+    /// Permission bitmap (per `syscalls::permission` bits).
+    pub permissions: u8,
+    /// Per-module fault state machine state.
+    pub fault_state: FaultState,
+    /// Step-period gate (every N ticks; 0 = every tick).
+    pub step_period: u8,
+    /// Restart count to date.
+    pub restart_count: u16,
+    /// Domain the module is assigned to (0 = default).
+    pub domain_id: u8,
+}
+
+/// Build a `ModuleStateSnapshot` for `module_idx`. Returns a
+/// `present: false` placeholder if the slot is empty or out of range
+/// so callers can iterate `0..MAX_MODULES` uniformly.
+pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
+    if module_idx >= MAX_MODULES {
+        return ModuleStateSnapshot {
+            idx: 0,
+            present: false,
+            ready: false,
+            finished: false,
+            cap_class: 0,
+            permissions: 0,
+            fault_state: FaultState::Running,
+            step_period: 0,
+            restart_count: 0,
+            domain_id: 0,
+        };
+    }
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let present = !matches!(sched.modules[module_idx], ModuleSlot::Empty);
+    ModuleStateSnapshot {
+        idx: module_idx as u8,
+        present,
+        ready: sched.ready[module_idx],
+        finished: sched.finished[module_idx],
+        cap_class: sched.cap_class[module_idx],
+        permissions: sched.permissions[module_idx],
+        fault_state: sched.fault_info[module_idx].state,
+        step_period: sched.step_period[module_idx],
+        restart_count: sched.fault_info[module_idx].restart_count,
+        domain_id: sched.domain_id[module_idx],
+    }
+}
+
 /// Lookup a channel port for the currently-executing module.
 /// Called from the channel_port syscall implementation.
 pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
@@ -1582,7 +1832,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(-1);
     }
 
-    let (mut module_list, mut module_count, id_to_slot) = build_module_list(config);
+    let (mut module_list, mut module_count, id_to_slot) = build_module_list(config)?;
     if module_count == 0 {
         log::error!("[graph] no usable modules");
         return Err(-1);
@@ -1595,8 +1845,18 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         &mut *p
     };
 
-    // Reset all scheduler state, state arena, and name arena
+    // Reset all scheduler state, state arena, and name arena.
+    //
+    // also wipe channel slots and buffer registry slots
+    // so a previous graph's claims don't accumulate. Before this, the
+    // bump-allocator-only `reset_buffer_arena` and per-channel
+    // `channel_close` left slot metadata in `Allocated` state across
+    // reconfigures — each reconfigure ate slots that `try_allocate`
+    // then skipped, eventually exhausting `MAX_CHANNELS` / `MAX_BUFFER_SLOTS`
+    // even with otherwise well-sized graphs.
     reset_state_arena();
+    crate::kernel::channel::reset_all();
+    crate::kernel::buffer_pool::reset_all();
     crate::kernel::buffer_pool::reset_buffer_arena();
     NameArena::reset();
     crate::kernel::backing_provider::unregister();
@@ -1708,6 +1968,19 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(-1);
     }
 
+    // validate buffer-group constraints
+    // uniformly across every platform. Previously this was wired only
+    // from `src/platform/rp.rs`; Linux / WASM / BCM platforms skipped
+    // the check, so graphs that pinned two in-place writers into the
+    // same buffer group ran with undefined producer ownership on
+    // those platforms. The function runs after `collect_module_hints`
+    // (which populates `in_place_writer`) and `open_channels` (which
+    // sets `edge.channel >= 0` for the live edges).
+    if !validate_buffer_groups(&edges[..runtime_edge_count]) {
+        log::error!("[graph] buffer group validation failed");
+        return Err(crate::kernel::errno::EINVAL);
+    }
+
     // Register each module's channel-buffer range with the MPU/MMU so an
     // isolated module sees only its own buffers through region 6.
     for i in 0..module_count {
@@ -1719,8 +1992,22 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         }
     }
 
-    // Compute topological execution order
-    compute_exec_order(edges, runtime_edge_count, module_count);
+    // Compute topological execution order.:
+    // a graph with cycles is rejected here. Previously `prepare_graph`
+    // discarded the cycle count via `_cycle_count` and ran the
+    // best-effort topological prefix plus the cyclic remainder, which
+    // produced a *different* graph than the author declared. Typed
+    // feedback edges with explicit buffering will get their own ABI
+    // shape ; until then any cycle means the graph
+    // is malformed and must be regenerated.
+    let cycle_count = compute_exec_order(edges, runtime_edge_count, module_count);
+    if cycle_count > 0 {
+        log::error!(
+            "[graph] {} module(s) involved in cycles — graph rejected",
+            cycle_count
+        );
+        return Err(crate::kernel::errno::EINVAL);
+    }
 
     // Compute upstream dependency masks for ready-signal gating
     compute_upstream_mask(edges, runtime_edge_count);
@@ -1768,7 +2055,12 @@ pub fn log_arena_summary() {
     let (buf_used, buf_cap) = crate::kernel::buffer_pool::buffer_arena_usage();
     log::info!(
         "[arena] state={}/{} cfg={}/{} buf={}/{}",
-        state_used, state_cap, cfg_used, cfg_cap, buf_used, buf_cap
+        state_used,
+        state_cap,
+        cfg_used,
+        cfg_cap,
+        buf_used,
+        buf_cap
     );
 }
 
@@ -1785,28 +2077,48 @@ pub fn log_arena_summary() {
 pub const INTERNAL_TEE_HASH: u32 = 0x607f045c; // "_tee"
 pub const INTERNAL_MERGE_HASH: u32 = 0x8a6bcd3e; // "_merge"
 
-fn build_module_list(
-    config: &Config,
-) -> ([Option<ModuleEntry>; MAX_MODULES], usize, [i8; MAX_MODULES]) {
+/// Build the dense module list from the validated config.
+///
+/// Fail-closed on every malformation:
+///   * Modules with `id >= MAX_MODULES` → `Err(EINVAL)`.
+///   * Duplicate ids → `Err(EINVAL)`.
+///   * Modules exceeding the per-graph `MAX_MODULES` ceiling →
+///     `Err(EINVAL)`.
+///
+/// The error code is the bare `i32` negative-errno that
+/// `prepare_graph` already propagates.
+type ModuleList = ([Option<ModuleEntry>; MAX_MODULES], usize, [i8; MAX_MODULES]);
+
+fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
     let mut module_list: [Option<ModuleEntry>; MAX_MODULES] = [None; MAX_MODULES];
     let mut id_to_slot: [i8; MAX_MODULES] = [-1; MAX_MODULES];
     let mut count = 0;
 
     for entry in config.modules.iter().flatten() {
         if count >= MAX_MODULES {
-            log::error!("[graph] module limit reached");
-            break;
+            log::error!(
+                "[graph] module count exceeds MAX_MODULES={} — graph rejected",
+                MAX_MODULES
+            );
+            return Err(crate::kernel::errno::EINVAL);
         }
 
         let id = entry.id as usize;
         if id >= MAX_MODULES {
-            log::warn!("[graph] module id={} out of range", entry.id);
-            continue;
+            log::error!(
+                "[graph] module id={} out of range (MAX_MODULES={}) — graph rejected",
+                entry.id,
+                MAX_MODULES
+            );
+            return Err(crate::kernel::errno::EINVAL);
         }
 
         if id_to_slot[id] >= 0 {
-            log::warn!("[graph] duplicate id={} ignored", entry.id);
-            continue;
+            log::error!(
+                "[graph] duplicate module id={} — graph rejected",
+                entry.id
+            );
+            return Err(crate::kernel::errno::EINVAL);
         }
 
         id_to_slot[id] = count as i8;
@@ -1814,7 +2126,7 @@ fn build_module_list(
         count += 1;
     }
 
-    (module_list, count, id_to_slot)
+    Ok((module_list, count, id_to_slot))
 }
 
 /// Query channel hints for all modules in the list.
@@ -2089,12 +2401,7 @@ fn insert_fan(
             // manifest across the fan — both ends of an edge must
             // declare a compatible content_type, so peer-side gives
             // the same answer.
-            let mut fan_kind = fanned_port_frame_kind(
-                loader,
-                fan_name_hash,
-                direction,
-                port_key,
-            );
+            let mut fan_kind = fanned_port_frame_kind(loader, fan_name_hash, direction, port_key);
             if fan_kind == module_types::FRAME_KIND_NONE {
                 for k in 0..group_count {
                     let edge = &edges[group[k]];
@@ -2104,22 +2411,16 @@ fn insert_fan(
                             FanDirection::In,
                             if edge.is_ctrl() { 0x10 } else { 0x00 } | edge.to_port_index,
                         ),
-                        FanDirection::In => (
-                            edge.from_module,
-                            FanDirection::Out,
-                            edge.from_port_index,
-                        ),
+                        FanDirection::In => {
+                            (edge.from_module, FanDirection::Out, edge.from_port_index)
+                        }
                     };
                     let peer_hash = match &module_list[peer_idx] {
                         Some(e) => e.name_hash,
                         None => continue,
                     };
-                    let peer_kind = fanned_port_frame_kind(
-                        loader,
-                        peer_hash,
-                        peer_dir,
-                        peer_port_key,
-                    );
+                    let peer_kind =
+                        fanned_port_frame_kind(loader, peer_hash, peer_dir, peer_port_key);
                     if peer_kind != module_types::FRAME_KIND_NONE {
                         fan_kind = peer_kind;
                         break;
@@ -2568,7 +2869,7 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
         let from = edge.from_module;
         let to = edge.to_module;
         if from < MAX_MODULES && to < MAX_MODULES {
-            sched.upstream_mask[to] |= 1u32 << from;
+            sched.upstream_mask[to] |= 1u64 << from;
         }
     }
 }
@@ -2578,10 +2879,20 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
 /// data flows through an entire chain (e.g. sequencer → synth → effects → i2s)
 /// rather than propagating one hop per tick.
 ///
-/// Modules not reachable via edges (isolated) are appended at the end.
-/// Cycles (which shouldn't occur in a valid graph) are broken by appending
-/// remaining modules in index order.
-fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) {
+/// Modules with no incoming edges (sources and isolated modules) are picked
+/// up by the BFS start; modules that remain unordered after BFS imply a
+/// graph cycle.
+///
+/// **Cycle policy**:
+/// v1 has no typed feedback-edge concept, so cycles are appended at the end
+/// in index order AND a loud `log::error!` line is emitted so the cycle is
+/// visible in operator output. The fail-load path is owned by
+/// `prepare_graph` (which checks the returned `cycle_count`); silently
+/// shipping the post-cycle order would propagate non-deterministic stepping
+/// behaviour, and crashing the kernel on a valid-but-cyclic example graph
+/// loses the diagnostic. Returns the number of modules that could NOT be
+/// topologically ordered (0 = no cycles).
+fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) -> usize {
     let exec_order = unsafe {
         let p = &raw mut SCHED;
         &mut (*p).exec_order
@@ -2625,8 +2936,14 @@ fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) {
         }
     }
 
-    // Append any remaining modules (cycle-breaker or isolated modules)
-    if count < module_count {
+    // Cycle handling. Any module still unordered after BFS is in a cycle.
+    // Surface the cycle through both a loud log line (so it shows up in any
+    // host runtime's output) and a non-zero return value (so `prepare_graph`
+    // can decide between reject / accept-with-warning). Isolated modules
+    // never reach this branch — their `in_degree == 0` makes them BFS roots.
+    let cycle_count = module_count - count;
+    if cycle_count > 0 {
+        let mut first_unordered: i32 = -1;
         for i in 0..module_count {
             let mut found = false;
             for &m in exec_order.iter().take(count) {
@@ -2636,15 +2953,26 @@ fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) {
                 }
             }
             if !found {
+                if first_unordered < 0 {
+                    first_unordered = i as i32;
+                }
                 exec_order[count] = i as u8;
                 count += 1;
             }
         }
+        log::error!(
+            "[scheduler] graph has {} module(s) in a cycle (first unordered idx={}); \
+             v1 has no typed feedback edges — cycles are appended at the end but \
+             stepping order within the cycle is undefined",
+            cycle_count,
+            first_unordered,
+        );
     }
 
     unsafe {
         SCHED.exec_order_count = count;
     }
+    cycle_count
 }
 
 /// Partition the global exec_order into per-domain execution orders (E4-S4).
@@ -3156,21 +3484,28 @@ fn handle_mpu_fault(
 
 /// Attempt to restart a faulted module.
 ///
-/// Restart procedure:
-/// 1. Mark as Recovering
-/// 2. Release all handles
-/// 3. Drain/flush connected channels
-/// 4. Zero module state block
-/// 5. Reset ready signal (re-gate downstream)
-/// 6. Call module_new() with original params (via step_fn reinit)
-/// 7. Resume stepping
+/// **v1 partial-restart contract**:
 ///
-/// Note: Full restart (re-calling module_new) requires stored params and
-/// loader state. For v1, we do a simplified restart: zero state + re-call
-/// module_new is deferred to a future iteration. Instead, we zero state
-/// and let the module re-initialize on next step (works for stateless modules).
-/// For stateful modules, the module will see zeroed state and should handle
-/// it gracefully (same as fresh boot).
+/// 1. `syscalls::release_module_handles` releases events, timers, DMA, and
+///    tracked provider handles owned by the module.
+/// 2. Every connected channel (in / out / ctrl) is `IOCTL_FLUSH`'d.
+/// 3. If the module was `deferred_ready`, its ready bit is reset.
+/// 4. Fault state moves back to `Running`; `finished[idx]` is cleared.
+///
+/// What is **not** done in v1, and would be needed for a full restart:
+///   - State memory is **not** zeroed — the module observes whatever state
+///     it had when it faulted. Safe for stateless / idempotent modules.
+///   - `module_new()` is **not** re-called. Stored params + loader state to
+///     drive a fresh init aren't plumbed through the restart path yet.
+///   - Channel ioctl handlers registered by the module are **not** cleared.
+///     Today this matches behaviour (no `module_new` re-call means no
+///     re-register), but a full restart implementation must clear them
+///     before re-init to avoid stale handler pointers.
+///
+/// Modules whose invariants do not survive "saw faulted state and got
+/// re-stepped" should use `FaultPolicy::Skip` and rely on the operator to
+/// drain+reload via the reconfigure module
+/// (`.context/rfc_graph_reconfigure.md`).
 fn handle_module_restart(
     sched: &mut SchedulerState,
     modules: &mut [ModuleSlot; MAX_MODULES],
@@ -3218,17 +3553,15 @@ fn handle_module_restart(
         }
     }
 
-    // Zero the module's state block
-    if let ModuleSlot::Dynamic(m) = &modules[module_idx] {
-        let state = m.state_ptr();
-        if !state.is_null() {
-            // We don't know state_size from DynamicModule alone, but the arena
-            // allocator zeroed it at alloc time. We'll zero a conservative amount
-            // based on the arena info (if available).
-            // For now, just leave state as-is — module will see previous state.
-            // Full restart with module_new re-call is a future enhancement.
-        }
-    }
+    // **v1 partial-restart**: state is intentionally NOT zeroed — the
+    // `DynamicModule` doesn't carry its `state_size`, and zeroing a
+    // conservative range could overrun adjacent module state in the
+    // shared arena. The module will see whatever state it had at fault
+    // time; this matches the docstring above. Full restart (state zero
+    // + `module_new` re-call) needs stored params and loader state
+    // plumbed through this path. Modules that can't safely
+    // resume from faulted state must opt out of `Restart` (use `Skip`).
+    let _ = &modules[module_idx];
 
     // Reset ready signal if module was deferred_ready
     if sched.deferred_ready[module_idx] {
@@ -3292,14 +3625,17 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     }
 
     // Compute not-ready bitmask for upstream gating
-    let mut not_ready: u32 = 0;
+    let mut not_ready: u64 = 0;
     for i in 0..count {
         if !sched.ready[i] {
-            not_ready |= 1u32 << i;
+            not_ready |= 1u64 << i;
         }
     }
 
-    // Step modules in topological order so producers run before consumers
+    // Step modules in topological order so producers run before consumers.
+    // The per-module step body is in `step_one_module` so the upcoming
+    // domain-scoped `step_domain_modules` reuses the exact
+    // same semantics — see `.context/scheduler_domain_api.md`.
     let exec_count = sched.exec_order_count;
     let n = if exec_count > 0 { exec_count } else { count };
     for order_pos in 0..n {
@@ -3311,182 +3647,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         if module_idx >= count {
             continue;
         }
-
-        // Skip already finished modules
-        if sched.finished[module_idx] {
-            continue;
-        }
-
-        // Step frequency gating: skip if counter hasn't reached period
-        let period = sched.step_period[module_idx];
-        if period > 0 {
-            sched.step_counter[module_idx] = sched.step_counter[module_idx].wrapping_add(1);
-            if sched.step_counter[module_idx] < period {
-                continue;
-            }
-            sched.step_counter[module_idx] = 0;
-        }
-
-        // Note: we intentionally step ALL non-finished modules every tick.
-        // Stateful generators (e.g. synth) produce continuous output from
-        // internal state, not just in response to input data. Gating on
-        // input readiness starves audio pipelines.
-
-        // Ready-signal gating: skip if any upstream module hasn't signaled Ready.
-        // Deferred-ready modules (infrastructure) are exempt while initializing —
-        // they must step freely to reach Ready even if upstream peers aren't ready.
-        // Only non-deferred (application) modules are gated by upstream readiness.
-        if not_ready != 0
-            && !sched.deferred_ready[module_idx]
-            && (sched.upstream_mask[module_idx] & not_ready) != 0
-        {
-            continue;
-        }
-
-        // Skip faulted/terminated modules
-        let fault_state = sched.fault_info[module_idx].state;
-        if fault_state == FaultState::Faulted {
-            // Check if backoff has elapsed → attempt restart
-            if sched.fault_info[module_idx].backoff_remaining > 0 {
-                sched.fault_info[module_idx].backoff_remaining -= 1;
-                continue;
-            }
-            if sched.fault_info[module_idx].can_restart() {
-                handle_module_restart(sched, modules, module_idx);
-                // After restart attempt, skip this tick (module will run next tick)
-                continue;
-            } else {
-                // Cannot restart — terminate
-                sched.fault_info[module_idx].state = FaultState::Terminated;
-                finalize_module(
-                    module_idx,
-                    Some(-110),
-                    modules[module_idx].type_name(),
-                    " (terminated)",
-                );
-                active_count -= 1;
-                continue;
-            }
-        } else if fault_state == FaultState::Terminated || fault_state == FaultState::Recovering {
-            continue;
-        }
-
-        if let Some(m) = modules[module_idx].as_module_mut() {
-            // Set current_module so channel_port works during module_step
-            set_current_module(module_idx);
-            // Track for HardFault diagnosis
-            unsafe {
-                core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
-            }
-
-            // Arm step guard timer
-            let deadline = sched.fault_info[module_idx].effective_deadline_us();
-            step_guard::arm(deadline);
-            let step_t0 = crate::kernel::hal::now_micros();
-
-            match m.step() {
-                Ok(StepOutcome::Continue) => {
-                    step_guard::disarm();
-                    let elapsed = (crate::kernel::hal::now_micros() - step_t0) as u32;
-                    record_step_time(module_idx, elapsed);
-                    step_guard::post_step_check();
-                    if step_guard::check_and_clear_timeout() {
-                        handle_step_timeout(sched, modules, module_idx, &mut active_count);
-                    }
-                    if step_guard::check_and_clear_mpu_fault() {
-                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
-                    }
-                    // PSP stack overflow detection: the canary word at the
-                    // bottom of the module stack is clobbered by an overflow.
-                    // Re-arm it so the next module starts with a clean band.
-                    if !crate::kernel::mpu::check_stack_canary() {
-                        log::error!("[mpu] module {} stack canary violated", module_idx);
-                        crate::kernel::mpu::reinit_stack_canary();
-                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
-                    }
-                }
-                Ok(StepOutcome::Ready) => {
-                    step_guard::disarm();
-                    if !sched.ready[module_idx] {
-                        sched.ready[module_idx] = true;
-                        log::info!("{}: ready", modules[module_idx].type_name());
-                    }
-                }
-                Ok(StepOutcome::Done) => {
-                    step_guard::disarm();
-                    finalize_module(module_idx, None, modules[module_idx].type_name(), "");
-                    active_count -= 1;
-                }
-                Ok(StepOutcome::Burst) => {
-                    // Keep timer armed for entire burst with extended deadline
-                    step_guard::disarm();
-                    let burst_deadline = deadline.saturating_mul(step_guard::BURST_MULTIPLIER);
-                    step_guard::arm(burst_deadline);
-
-                    for _ in 0..MAX_BURST_STEPS {
-                        // Check timeout between burst iterations
-                        if step_guard::is_timed_out() {
-                            step_guard::disarm();
-                            step_guard::check_and_clear_timeout();
-                            handle_step_timeout(sched, modules, module_idx, &mut active_count);
-                            break;
-                        }
-                        if let Some(m) = modules[module_idx].as_module_mut() {
-                            match m.step() {
-                                Ok(StepOutcome::Burst) => continue,
-                                Ok(StepOutcome::Continue) => break,
-                                Ok(StepOutcome::Ready) => {
-                                    if !sched.ready[module_idx] {
-                                        sched.ready[module_idx] = true;
-                                        log::info!("{}: ready", modules[module_idx].type_name());
-                                    }
-                                    break;
-                                }
-                                Ok(StepOutcome::Done) => {
-                                    finalize_module(
-                                        module_idx,
-                                        None,
-                                        modules[module_idx].type_name(),
-                                        " (burst)",
-                                    );
-                                    active_count -= 1;
-                                    break;
-                                }
-                                Err(rc) => {
-                                    handle_step_error(
-                                        sched,
-                                        modules,
-                                        module_idx,
-                                        rc,
-                                        &mut active_count,
-                                        " (burst)",
-                                    );
-                                    break;
-                                }
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    step_guard::disarm();
-                    step_guard::post_step_check();
-                    // Check if burst as a whole timed out
-                    if step_guard::check_and_clear_timeout() {
-                        handle_step_timeout(sched, modules, module_idx, &mut active_count);
-                    }
-                    if step_guard::check_and_clear_mpu_fault() {
-                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
-                    }
-                }
-                Err(rc) => {
-                    step_guard::disarm();
-                    handle_step_error(sched, modules, module_idx, rc, &mut active_count, "");
-                    if step_guard::check_and_clear_mpu_fault() {
-                        handle_mpu_fault(sched, modules, module_idx, &mut active_count);
-                    }
-                }
-            }
-        }
+        step_one_module(modules, sched, module_idx, not_ready, &mut active_count, false);
     }
 
     if active_count == 0 {
@@ -3496,16 +3657,331 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     }
 }
 
-/// Step only modules whose bit is set in `wake_bits`.
-/// Bypasses frequency gating — an event overrides the step period.
-/// Uses topological order to preserve producer-before-consumer invariant.
+/// Step every module assigned to `domain_id` in the per-domain
+/// topological order. Multi-domain counterpart to [`step_modules`];
+/// both share the same per-module body (`step_one_module`) so semantics
+/// match exactly — step-period gating, ready-signal gating, fault
+/// transitions, `StepOutcome::{Continue, Ready, Done, Burst}`,
+/// step-guard arm/disarm, step-time recording.
+///
+/// Returns `StepResult::Done` when every active module across the
+/// whole graph is finalised (the active_count is global to v1; see
+/// `.context/scheduler_domain_api.md` §4). Sibling domains can keep
+/// stepping independently; callers should decide global shutdown
+/// based on every domain returning `Done`.
+///
+/// `domain_id` >= `MAX_DOMAINS` returns `StepResult::Done` immediately
+/// (no-op, no error). The caller should guarantee this never happens —
+/// `multicore::MAX_DOMAINS` already caps assignment.
+///
+/// Set inside `step_one_module` whenever a module returns `Burst` from
+/// `m.step()`, and read by the Tier 3 poll-mode wrapper
+/// (`step_domain_modules_poll`) to decide whether the domain has more
+/// work pending or can WFE. Each `step_domain_modules_poll` call
+/// clears the flag before the pass.
+static BURST_SEEN_THIS_PASS: AtomicBool = AtomicBool::new(false);
+
+/// Variant of [`step_domain_modules`] for platforms running a
+/// continuous-poll execution tier (e.g. BCM2712 Tier 3): runs one full
+/// pass through the domain's modules via the shared `step_one_module`
+/// body, then returns `(StepResult, burst_seen)` where `burst_seen`
+/// indicates whether any module returned `StepOutcome::Burst` during
+/// the pass. Poll-mode callers use that bit to decide whether to spin
+/// (more work pending) or WFE (idle).
+pub fn step_domain_modules_poll(
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    domain_id: usize,
+) -> (StepResult, bool) {
+    BURST_SEEN_THIS_PASS.store(false, Ordering::Relaxed);
+    let result = step_domain_modules(modules, domain_id);
+    let burst = BURST_SEEN_THIS_PASS.swap(false, Ordering::Relaxed);
+    (result, burst)
+}
+
+pub fn step_domain_modules(
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    domain_id: usize,
+) -> StepResult {
+    if domain_id >= MAX_DOMAINS {
+        return StepResult::Done;
+    }
+    let sched = unsafe {
+        let p = &raw mut SCHED;
+        &mut *p
+    };
+
+    // Recompute active_count and not_ready once per tick (cheap; same
+    // as `step_modules`). active_count is global; a domain-only count
+    // would need per-domain `finished[]` tracking// per the design memo.
+    let count = sched.active_module_count;
+    let mut active_count: usize = 0;
+    for i in 0..count {
+        if !sched.finished[i] {
+            active_count += 1;
+        }
+    }
+    let mut not_ready: u64 = 0;
+    for i in 0..count {
+        if !sched.ready[i] {
+            not_ready |= 1u64 << i;
+        }
+    }
+
+    let n = sched.domain_module_count[domain_id] as usize;
+    for pos in 0..n {
+        let module_idx = sched.domain_exec_order[domain_id][pos] as usize;
+        if module_idx >= count {
+            continue;
+        }
+        step_one_module(modules, sched, module_idx, not_ready, &mut active_count, false);
+    }
+
+    if active_count == 0 {
+        StepResult::Done
+    } else {
+        StepResult::Continue
+    }
+}
+
+/// Per-module step body shared between `step_modules` (flat,
+/// single-domain), `step_domain_modules` (per-domain), and
+/// `step_woken_modules` (event wake). Encapsulates the full
+/// `StepOutcome` handling — period gating, ready gating, fault state
+/// machine, burst loop, finalisation — so every caller gets identical
+/// semantics. See `.context/scheduler_domain_api.md` for the full
+/// design.
+///
+/// `event_wake = true` bypasses step-period gating (an event overrides
+/// the per-module period) but keeps every other invariant: upstream-
+/// ready gating, fault transitions, step-time recording, step-guard
+/// arm/disarm, stack-canary check, and burst MPU-fault handling all
+/// fire identically. `active_count` is decremented on finalisation.
+///
+/// Caller passes its current `active_count`; this function decrements
+/// it when a module finalises (Done / terminate / fault-without-restart).
+#[inline]
+fn step_one_module(
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    sched: &mut SchedulerState,
+    module_idx: usize,
+    not_ready: u64,
+    active_count: &mut usize,
+    event_wake: bool,
+) {
+    // Skip already finished modules
+    if sched.finished[module_idx] {
+        return;
+    }
+
+    // Step frequency gating: skip if counter hasn't reached period.
+    // Event-wake bypasses the period — the event is the trigger.
+    if !event_wake {
+        let period = sched.step_period[module_idx];
+        if period > 0 {
+            sched.step_counter[module_idx] = sched.step_counter[module_idx].wrapping_add(1);
+            if sched.step_counter[module_idx] < period {
+                return;
+            }
+            sched.step_counter[module_idx] = 0;
+        }
+    }
+
+    // Note: we intentionally step ALL non-finished modules every tick.
+    // Stateful generators (e.g. synth) produce continuous output from
+    // internal state, not just in response to input data. Gating on
+    // input readiness starves audio pipelines.
+
+    // Ready-signal gating: skip if any upstream module hasn't signaled Ready.
+    // Deferred-ready modules (infrastructure) are exempt while initializing —
+    // they must step freely to reach Ready even if upstream peers aren't ready.
+    // Only non-deferred (application) modules are gated by upstream readiness.
+    if not_ready != 0
+        && !sched.deferred_ready[module_idx]
+        && (sched.upstream_mask[module_idx] & not_ready) != 0
+    {
+        return;
+    }
+
+    // Skip faulted/terminated modules
+    let fault_state = sched.fault_info[module_idx].state;
+    if fault_state == FaultState::Faulted {
+        // Check if backoff has elapsed → attempt restart
+        if sched.fault_info[module_idx].backoff_remaining > 0 {
+            sched.fault_info[module_idx].backoff_remaining -= 1;
+            return;
+        }
+        if sched.fault_info[module_idx].can_restart() {
+            handle_module_restart(sched, modules, module_idx);
+            // After restart attempt, skip this tick (module will run next tick)
+            return;
+        } else {
+            // Cannot restart — terminate
+            sched.fault_info[module_idx].state = FaultState::Terminated;
+            finalize_module(
+                module_idx,
+                Some(-110),
+                modules[module_idx].type_name(),
+                " (terminated)",
+            );
+            *active_count -= 1;
+            return;
+        }
+    } else if fault_state == FaultState::Terminated || fault_state == FaultState::Recovering {
+        return;
+    }
+
+    if let Some(m) = modules[module_idx].as_module_mut() {
+        // Set current_module so channel_port works during module_step
+        set_current_module(module_idx);
+        // Track for HardFault diagnosis
+        unsafe {
+            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
+        }
+
+        // Arm step guard timer
+        let deadline = sched.fault_info[module_idx].effective_deadline_us();
+        step_guard::arm(deadline);
+        let step_t0 = crate::kernel::hal::now_micros();
+
+        match m.step() {
+            Ok(StepOutcome::Continue) => {
+                step_guard::disarm();
+                let elapsed = (crate::kernel::hal::now_micros() - step_t0) as u32;
+                record_step_time(module_idx, elapsed);
+                step_guard::post_step_check();
+                if step_guard::check_and_clear_timeout() {
+                    handle_step_timeout(sched, modules, module_idx, active_count);
+                }
+                if step_guard::check_and_clear_mpu_fault() {
+                    handle_mpu_fault(sched, modules, module_idx, active_count);
+                }
+                // PSP stack overflow detection: the canary word at the
+                // bottom of the module stack is clobbered by an overflow.
+                // Re-arm it so the next module starts with a clean band.
+                if !crate::kernel::mpu::check_stack_canary() {
+                    log::error!("[mpu] module {} stack canary violated", module_idx);
+                    crate::kernel::mpu::reinit_stack_canary();
+                    handle_mpu_fault(sched, modules, module_idx, active_count);
+                }
+            }
+            Ok(StepOutcome::Ready) => {
+                step_guard::disarm();
+                if !sched.ready[module_idx] {
+                    sched.ready[module_idx] = true;
+                    log::info!("{}: ready", modules[module_idx].type_name());
+                }
+            }
+            Ok(StepOutcome::Done) => {
+                step_guard::disarm();
+                finalize_module(module_idx, None, modules[module_idx].type_name(), "");
+                *active_count -= 1;
+            }
+            Ok(StepOutcome::Burst) => {
+                // Record that this pass saw a Burst — poll-mode callers
+                // (`step_domain_modules_poll`) read this to decide
+                // whether to spin or WFE.
+                BURST_SEEN_THIS_PASS.store(true, Ordering::Relaxed);
+                // Keep timer armed for entire burst with extended deadline
+                step_guard::disarm();
+                let burst_deadline = deadline.saturating_mul(step_guard::BURST_MULTIPLIER);
+                step_guard::arm(burst_deadline);
+
+                for _ in 0..MAX_BURST_STEPS {
+                    // Check timeout between burst iterations
+                    if step_guard::is_timed_out() {
+                        step_guard::disarm();
+                        step_guard::check_and_clear_timeout();
+                        handle_step_timeout(sched, modules, module_idx, active_count);
+                        break;
+                    }
+                    if let Some(m) = modules[module_idx].as_module_mut() {
+                        match m.step() {
+                            Ok(StepOutcome::Burst) => continue,
+                            Ok(StepOutcome::Continue) => break,
+                            Ok(StepOutcome::Ready) => {
+                                if !sched.ready[module_idx] {
+                                    sched.ready[module_idx] = true;
+                                    log::info!("{}: ready", modules[module_idx].type_name());
+                                }
+                                break;
+                            }
+                            Ok(StepOutcome::Done) => {
+                                finalize_module(
+                                    module_idx,
+                                    None,
+                                    modules[module_idx].type_name(),
+                                    " (burst)",
+                                );
+                                *active_count -= 1;
+                                break;
+                            }
+                            Err(rc) => {
+                                handle_step_error(
+                                    sched,
+                                    modules,
+                                    module_idx,
+                                    rc,
+                                    active_count,
+                                    " (burst)",
+                                );
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                step_guard::disarm();
+                step_guard::post_step_check();
+                // Check if burst as a whole timed out
+                if step_guard::check_and_clear_timeout() {
+                    handle_step_timeout(sched, modules, module_idx, active_count);
+                }
+                if step_guard::check_and_clear_mpu_fault() {
+                    handle_mpu_fault(sched, modules, module_idx, active_count);
+                }
+            }
+            Err(rc) => {
+                step_guard::disarm();
+                handle_step_error(sched, modules, module_idx, rc, active_count, "");
+                if step_guard::check_and_clear_mpu_fault() {
+                    handle_mpu_fault(sched, modules, module_idx, active_count);
+                }
+            }
+        }
+    }
+}
+
+/// Step only modules whose bit is set in `wake_bits`. Walks the
+/// topological execution order so producer modules still run before
+/// their consumers within a single wake pass, then delegates each
+/// per-module step to `step_one_module` with `event_wake = true`.
+/// Event-wake bypasses step-period gating but inherits every other
+/// scheduler invariant — upstream-ready gating, fault state machine,
+/// step-time recording, step-guard arm/disarm, stack-canary check,
+/// burst MPU-fault handling — from the shared body.
 pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize, wake_bits: u64) {
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
     };
-    let exec_count = sched.exec_order_count;
 
+    // Compute current readiness mask once per wake pass, matching the
+    // flat/domain stepping paths.
+    let mut not_ready: u64 = 0;
+    for i in 0..count {
+        if !sched.ready[i] {
+            not_ready |= 1u64 << i;
+        }
+    }
+    let mut active_count: usize = 0;
+    for i in 0..count {
+        if !sched.finished[i] {
+            active_count += 1;
+        }
+    }
+
+    let exec_count = sched.exec_order_count;
     let n = if exec_count > 0 { exec_count } else { count };
     for order_pos in 0..n {
         let module_idx = if exec_count > 0 {
@@ -3516,125 +3992,10 @@ pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize,
         if module_idx >= count {
             continue;
         }
-        if sched.finished[module_idx] {
-            continue;
-        }
-        // Only step modules with pending events
         if (wake_bits & (1u64 << module_idx)) == 0 {
             continue;
         }
-        // Ready-signal gating: skip if any upstream module hasn't signaled Ready.
-        // Deferred-ready modules are exempt while initializing.
-        {
-            let mut not_ready: u32 = 0;
-            for i in 0..count {
-                if !sched.ready[i] {
-                    not_ready |= 1u32 << i;
-                }
-            }
-            if not_ready != 0
-                && !sched.deferred_ready[module_idx]
-                && (sched.upstream_mask[module_idx] & not_ready) != 0
-            {
-                continue;
-            }
-        }
-        // Skip faulted/terminated modules
-        let fault_state = sched.fault_info[module_idx].state;
-        if fault_state != FaultState::Running {
-            continue;
-        }
-
-        if let Some(m) = modules[module_idx].as_module_mut() {
-            set_current_module(module_idx);
-
-            let deadline = sched.fault_info[module_idx].effective_deadline_us();
-            step_guard::arm(deadline);
-
-            match m.step() {
-                Ok(StepOutcome::Continue) => {
-                    step_guard::disarm();
-                    step_guard::post_step_check();
-                    if step_guard::check_and_clear_timeout() {
-                        log::warn!("[guard] module {} timeout (event wake)", module_idx);
-                        sched.fault_info[module_idx]
-                            .record_fault(fault_type::TIMEOUT, unsafe { DBG_TICK });
-                    }
-                }
-                Ok(StepOutcome::Ready) => {
-                    step_guard::disarm();
-                    if !sched.ready[module_idx] {
-                        sched.ready[module_idx] = true;
-                        log::info!("{}: ready", modules[module_idx].type_name());
-                    }
-                }
-                Ok(StepOutcome::Done) => {
-                    step_guard::disarm();
-                    finalize_module(
-                        module_idx,
-                        None,
-                        modules[module_idx].type_name(),
-                        " (event wake)",
-                    );
-                }
-                Ok(StepOutcome::Burst) => {
-                    step_guard::disarm();
-                    let burst_deadline = deadline.saturating_mul(step_guard::BURST_MULTIPLIER);
-                    step_guard::arm(burst_deadline);
-
-                    for _ in 0..MAX_BURST_STEPS {
-                        if step_guard::is_timed_out() {
-                            break;
-                        }
-                        if let Some(m) = modules[module_idx].as_module_mut() {
-                            match m.step() {
-                                Ok(StepOutcome::Burst) => continue,
-                                Ok(StepOutcome::Continue) => break,
-                                Ok(StepOutcome::Ready) => {
-                                    if !sched.ready[module_idx] {
-                                        sched.ready[module_idx] = true;
-                                        log::info!("{}: ready", modules[module_idx].type_name());
-                                    }
-                                    break;
-                                }
-                                Ok(StepOutcome::Done) => {
-                                    finalize_module(
-                                        module_idx,
-                                        None,
-                                        modules[module_idx].type_name(),
-                                        " (event wake burst)",
-                                    );
-                                    break;
-                                }
-                                Err(rc) => {
-                                    finalize_module(
-                                        module_idx,
-                                        Some(rc),
-                                        modules[module_idx].type_name(),
-                                        " (event wake burst)",
-                                    );
-                                    break;
-                                }
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    step_guard::disarm();
-                    step_guard::post_step_check();
-                    step_guard::check_and_clear_timeout(); // Clear without action for woken path
-                }
-                Err(rc) => {
-                    step_guard::disarm();
-                    finalize_module(
-                        module_idx,
-                        Some(rc),
-                        modules[module_idx].type_name(),
-                        " (event wake)",
-                    );
-                }
-            }
-        }
+        step_one_module(modules, sched, module_idx, not_ready, &mut active_count, true);
     }
 }
 
@@ -3660,6 +4021,15 @@ pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
 /// Return the number of active modules in the current graph.
 pub fn active_module_count() -> usize {
     unsafe { SCHED.active_module_count }
+}
+
+/// Return the number of modules currently in `exec_order` (the
+/// topologically-sorted list `step_modules` iterates). Exposed so tests
+/// and diagnostics can confirm `prepare_graph` populated it. Equals
+/// `active_module_count` after a clean graph prepare; >0 once any module
+/// has been ordered.
+pub fn exec_order_count() -> usize {
+    unsafe { SCHED.exec_order_count }
 }
 
 /// Platform hook: set the active module count. Called by platforms whose
@@ -3757,7 +4127,7 @@ pub fn module_info_flags(module_idx: usize) -> u32 {
 }
 
 /// Upstream-module bitmask for module N.
-pub fn module_upstream_mask(module_idx: usize) -> u32 {
+pub fn module_upstream_mask(module_idx: usize) -> u64 {
     if module_idx >= MAX_MODULES {
         return 0;
     }

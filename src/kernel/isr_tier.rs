@@ -566,7 +566,7 @@ pub fn poll_tier1b() {
 /// Returns bytes written on success, or negative errno.
 pub fn isr_metrics_dispatch(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 2 {
-        return -crate::kernel::errno::EINVAL;
+        return crate::kernel::errno::EINVAL;
     }
 
     let tier = unsafe { *arg };
@@ -576,7 +576,7 @@ pub fn isr_metrics_dispatch(arg: *mut u8, arg_len: usize) -> i32 {
         Some(metrics) => {
             let out_size = core::mem::size_of::<IsrMetrics>();
             if arg_len < out_size {
-                return -crate::kernel::errno::EINVAL;
+                return crate::kernel::errno::EINVAL;
             }
             unsafe {
                 let src = &metrics as *const IsrMetrics as *const u8;
@@ -584,6 +584,6 @@ pub fn isr_metrics_dispatch(arg: *mut u8, arg_len: usize) -> i32 {
             }
             out_size as i32
         }
-        None => -crate::kernel::errno::EINVAL,
+        None => crate::kernel::errno::EINVAL,
     }
 }

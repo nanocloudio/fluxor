@@ -57,6 +57,7 @@ How to build things with the system. Domain-specific patterns and recipes.
 - [guides/foundation.md](guides/foundation.md) — foundation layer, driver/foundation boundary, contract patterns
 - [guides/compute_heavy_modules.md](guides/compute_heavy_modules.md) — patterns for emulators, codecs, and compute-intensive workloads
 - [guides/codec_porting.md](guides/codec_porting.md) — workflow for porting audio codecs to sample-accurate parity (reference C decoder + standalone Rust replica + layer probes)
+- [guides/examples.md](guides/examples.md) — canonical playback families (`image_viewer`, `audio_player`) and their four-variant deployment matrix
 
 ## Modules
 

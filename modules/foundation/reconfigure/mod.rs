@@ -166,10 +166,20 @@ unsafe fn sys_module_info(sys: &SyscallTable, idx: u8) -> u32 {
     if rc < 0 { 0 } else { rc as u32 }
 }
 
-unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u8) -> u32 {
-    let mut arg = [idx];
-    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_UPSTREAM, arg.as_mut_ptr(), 1);
-    if rc < 0 { 0 } else { rc as u32 }
+unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u8) -> u64 {
+    // Arg layout: arg[0] = module idx in, arg[1..9] = u64 LE mask
+    // out. A 64-bit mask covers the full `MAX_MODULES = 64`
+    // (aarch64) index range.
+    let mut arg = [0u8; 9];
+    arg[0] = idx;
+    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_UPSTREAM, arg.as_mut_ptr(), 9);
+    if rc < 0 {
+        0
+    } else {
+        u64::from_le_bytes([
+            arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7], arg[8],
+        ])
+    }
 }
 
 unsafe fn sys_module_done(sys: &SyscallTable, idx: u8) -> bool {
@@ -280,7 +290,7 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
                 let mut j = 0;
                 while j < count {
                     if j != i
-                        && (upstream & (1u32 << j)) != 0
+                        && (upstream & (1u64 << j)) != 0
                         && ds_get(s, j) == DS_DRAINING
                     {
                         upstream_ok = false;

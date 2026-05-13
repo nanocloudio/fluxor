@@ -217,7 +217,11 @@ pub fn bind_udp_listener(
 /// carry multiple newline-framed log lines (the device batches them).
 pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
     let sock = bind_udp_listener(bind, Some(Duration::from_millis(refresh_ms)))?;
-    eprintln!("fluxor monitor: listening on {} (UDP)", sock.local_addr().map_or_else(|_| bind.to_string(), |a| a.to_string()));
+    eprintln!(
+        "fluxor monitor: listening on {} (UDP)",
+        sock.local_addr()
+            .map_or_else(|_| bind.to_string(), |a| a.to_string())
+    );
 
     let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
     let mut last_render = Instant::now();

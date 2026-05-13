@@ -672,13 +672,10 @@ fn substitute_env_vars(input: &str) -> Result<String> {
 /// Tiny base64 encoder for binary `body_file` payloads. Avoids
 /// pulling in a base64 crate just for this single call site.
 fn base64_encode(bytes: &[u8], out: &mut String) {
-    const CHARS: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut i = 0;
     while i + 3 <= bytes.len() {
-        let v = ((bytes[i] as u32) << 16)
-            | ((bytes[i + 1] as u32) << 8)
-            | (bytes[i + 2] as u32);
+        let v = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
         out.push(CHARS[((v >> 18) & 0x3F) as usize] as char);
         out.push(CHARS[((v >> 12) & 0x3F) as usize] as char);
         out.push(CHARS[((v >> 6) & 0x3F) as usize] as char);
@@ -716,10 +713,7 @@ fn inline_route_body_files(
         None => return Ok(()),
     };
     for module in modules.iter_mut() {
-        let routes = match module
-            .get_mut("routes")
-            .and_then(|v| v.as_array_mut())
-        {
+        let routes = match module.get_mut("routes").and_then(|v| v.as_array_mut()) {
             Some(r) => r,
             None => continue,
         };
@@ -740,11 +734,7 @@ fn inline_route_body_files(
             };
             let resolved = yaml_dir.join(&body_file);
             let bytes = std::fs::read(&resolved).map_err(|e| {
-                Error::Config(format!(
-                    "route body_file {}: {}",
-                    resolved.display(),
-                    e
-                ))
+                Error::Config(format!("route body_file {}: {}", resolved.display(), e))
             })?;
             // JSON strings only carry valid UTF-8. For binary bodies
             // (e.g. `.wasm`) we encode as base64 with a "base64:"
@@ -2006,8 +1996,7 @@ fn build_one(
             // and config-blob placeholders rewritten in-place. See
             // `docs/architecture/wasm_platform.md` and the
             // `wasm_bundle` module for the rewrite mechanics.
-            let kernel_wasm_path =
-                PathBuf::from(format!("target/{}/firmware.wasm", build_id));
+            let kernel_wasm_path = PathBuf::from(format!("target/{}/firmware.wasm", build_id));
             if !kernel_wasm_path.exists() {
                 return Err(Error::Config(format!(
                     "Kernel wasm not found at {}. Run 'make firmware TARGET=wasm' first.",
@@ -2047,8 +2036,7 @@ fn build_one(
             let kernel_bytes = std::fs::read(&kernel_wasm_path)?;
             let modules_bin = std::fs::read(&modules_bin_path)?;
             let config_bin = std::fs::read(&config_bin_path)?;
-            let bundled =
-                wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
+            let bundled = wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
             std::fs::write(&output_path, &bundled)?;
 
             if verbose {

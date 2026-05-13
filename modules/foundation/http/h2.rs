@@ -366,10 +366,8 @@ unsafe fn drive_cache_fetch(s: &mut HttpState) -> bool {
     // lock + issues IOCTLs and transitions us to the normal
     // Pending → Ready flow.
     if me >= 0 && s.server.file_chan_owner != me as i16 {
-        let matched =
-            (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).matched_route;
-        let handler =
-            (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).body_handler;
+        let matched = (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).matched_route;
+        let handler = (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).body_handler;
         match cache_try_or_fetch(s, matched) {
             CacheLookup::Hit | CacheLookup::NoSource => {
                 arm_slot_for_emission(s, slot_idx, handler, -1, matched);
@@ -395,10 +393,8 @@ unsafe fn drive_cache_fetch(s: &mut HttpState) -> bool {
     match cache_fetch_step(s) {
         CacheStepResult::Pending => false,
         CacheStepResult::Ready => {
-            let handler =
-                (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).body_handler;
-            let matched =
-                (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).matched_route;
+            let handler = (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).body_handler;
+            let matched = (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).matched_route;
             arm_slot_for_emission(s, slot_idx, handler, -1, matched);
             // Cache is filled; subsequent emission reads from the
             // in-memory body_pool (not file_chan). Release the
@@ -449,13 +445,19 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             remaining,
         );
         if sent > 0 {
-            if let Some(cur) = cur_slot_mut(s) { cur.send_offset += sent as u16; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset += sent as u16;
+            }
         }
         if cur_send_offset(s) < cur_send_len(s) {
             return 0;
         }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_len = 0; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = 0;
+        }
         if cur_h2_mut(s).sub == Sub::Closing {
             return 1;
         }
@@ -472,7 +474,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     (h2w::SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
                 ],
             );
-            if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_len = n as u16;
+            }
             cur_h2_mut(s).sub = Sub::Active;
             return 0;
         }
@@ -577,8 +581,7 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
                 return 2;
             }
         }
-        let refreshed_stream =
-            (*cur_h2(s).streams.as_ptr().add(emit_idx as usize)).send_window;
+        let refreshed_stream = (*cur_h2(s).streams.as_ptr().add(emit_idx as usize)).send_window;
         avail = cur_h2(s).send_window.min(refreshed_stream);
         if avail <= 0 {
             return 0;
@@ -624,8 +627,12 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
     }
 
     h2w::write_data_frame_header(buf, n, slot_id, !more);
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = (h2w::FRAME_HEADER_LEN + n) as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = (h2w::FRAME_HEADER_LEN + n) as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
     cur_h2_mut(s).send_window = cur_h2(s).send_window.saturating_sub(n as i32);
     if more {
         let slot_mut = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(emit_idx as usize);
@@ -677,8 +684,12 @@ unsafe fn emit_slot_headers(
     o += super::hpack::encode_header(buf.add(o), cap - o, b"content-type", content_type);
     let block_len = o - block_start;
     h2w::write_headers_frame_header(buf, block_len, stream_id, false, true);
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = o as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = o as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
 }
 
 // ── Active loop ───────────────────────────────────────────────────────────
@@ -785,7 +796,7 @@ unsafe fn process_one_frame(s: &mut HttpState) -> i32 {
         h2w::FRAME_HEADERS => handle_headers(s, &hdr, payload_ptr),
         h2w::FRAME_DATA => handle_data(s, &hdr, payload_ptr),
         h2w::FRAME_WINDOW_UPDATE => handle_window_update(s, &hdr, payload_ptr),
-        h2w::FRAME_PRIORITY => Ok(()),      // ignored — no priority enforcement
+        h2w::FRAME_PRIORITY => Ok(()), // ignored — no priority enforcement
         h2w::FRAME_RST_STREAM => {
             let idx = slot_for_id(s, stream_id);
             if idx >= 0 {
@@ -834,7 +845,9 @@ unsafe fn process_one_frame(s: &mut HttpState) -> i32 {
             i += 1;
         }
     }
-    if let Some(cur) = cur_slot_mut(s) { cur.recv_len = leftover as u16; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.recv_len = leftover as u16;
+    }
 
     if let Err(code) = result {
         queue_goaway(s, code);
@@ -845,7 +858,11 @@ unsafe fn process_one_frame(s: &mut HttpState) -> i32 {
 
 // ── Per-frame handlers ────────────────────────────────────────────────────
 
-unsafe fn handle_settings(s: &mut HttpState, hdr: &h2w::Header, payload: *const u8) -> Result<(), u32> {
+unsafe fn handle_settings(
+    s: &mut HttpState,
+    hdr: &h2w::Header,
+    payload: *const u8,
+) -> Result<(), u32> {
     if hdr.stream_id != 0 {
         return Err(h2w::ERR_PROTOCOL_ERROR);
     }
@@ -880,8 +897,12 @@ unsafe fn handle_settings(s: &mut HttpState, hdr: &h2w::Header, payload: *const 
         i += 6;
     }
     let n = h2w::write_settings_ack(cur_send_buf_mut_ptr(s));
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = n as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
     Ok(())
 }
 
@@ -949,8 +970,12 @@ unsafe fn handle_ping(s: &mut HttpState, hdr: &h2w::Header, payload: *const u8) 
         return Ok(()); // peer ack'd our (nonexistent) ping; ignore
     }
     let n = h2w::write_ping_ack(cur_send_buf_mut_ptr(s), payload);
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = n as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
     Ok(())
 }
 
@@ -980,8 +1005,12 @@ unsafe fn handle_headers(
             hdr.stream_id,
             h2w::ERR_REFUSED_STREAM,
         );
-        if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = n as u16;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+        }
         return Ok(());
     }
 
@@ -1052,8 +1081,12 @@ unsafe fn handle_headers(
             hdr.stream_id,
             h2w::ERR_PROTOCOL_ERROR,
         );
-        if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = n as u16;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+        }
         free_slot(s, slot_idx);
         return Ok(());
     }
@@ -1065,10 +1098,18 @@ unsafe fn handle_headers(
             let n = h2w::write_rst_stream(
                 cur_send_buf_mut_ptr(s),
                 hdr.stream_id,
-                if end_stream { h2w::ERR_PROTOCOL_ERROR } else { h2w::ERR_REFUSED_STREAM },
+                if end_stream {
+                    h2w::ERR_PROTOCOL_ERROR
+                } else {
+                    h2w::ERR_REFUSED_STREAM
+                },
             );
-            if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-            if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_len = n as u16;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset = 0;
+            }
             free_slot(s, slot_idx);
             return Ok(());
         }
@@ -1118,8 +1159,12 @@ unsafe fn handle_data(s: &mut HttpState, hdr: &h2w::Header, payload: *const u8) 
             hdr.stream_id,
             h2w::ERR_STREAM_CLOSED,
         );
-        if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = n as u16;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+        }
         return Ok(());
     }
 
@@ -1174,10 +1219,7 @@ unsafe fn any_stream_window_pending(s: &HttpState) -> bool {
     let mut i = 0u8;
     while (i as usize) < MAX_STREAMS {
         let slot = &*cur_h2(s).streams.as_ptr().add(i as usize);
-        if slot.id != 0
-            && slot.window_update_pending != 0
-            && slot.state != SlotState::Idle
-        {
+        if slot.id != 0 && slot.window_update_pending != 0 && slot.state != SlotState::Idle {
             return true;
         }
         i += 1;
@@ -1195,8 +1237,12 @@ unsafe fn queue_window_update(s: &mut HttpState) {
         let delta = (RECV_WINDOW_INITIAL - cur_h2(s).recv_window) as u32;
         if delta != 0 {
             let n = h2w::write_window_update(cur_send_buf_mut_ptr(s), 0, delta);
-            if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-            if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_len = n as u16;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset = 0;
+            }
             cur_h2_mut(s).recv_window = RECV_WINDOW_INITIAL;
         }
         cur_h2_mut(s).window_update_pending = 0;
@@ -1206,16 +1252,16 @@ unsafe fn queue_window_update(s: &mut HttpState) {
     let mut i = 0u8;
     while (i as usize) < MAX_STREAMS {
         let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(i as usize);
-        if slot.id != 0
-            && slot.window_update_pending != 0
-            && slot.state != SlotState::Idle
-        {
+        if slot.id != 0 && slot.window_update_pending != 0 && slot.state != SlotState::Idle {
             let delta = (RECV_WINDOW_INITIAL - slot.recv_window) as u32;
             if delta != 0 {
-                let n =
-                    h2w::write_window_update(cur_send_buf_mut_ptr(s), slot.id, delta);
-                if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-                if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+                let n = h2w::write_window_update(cur_send_buf_mut_ptr(s), slot.id, delta);
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_len = n as u16;
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset = 0;
+                }
                 slot.recv_window = RECV_WINDOW_INITIAL;
             }
             slot.window_update_pending = 0;
@@ -1276,8 +1322,12 @@ unsafe fn accept_ws_upgrade(s: &mut HttpState, slot_idx: i8) {
     o += super::hpack::encode_header(buf.add(o), cap - o, b":status", b"200");
     let block_len = o - block_start;
     h2w::write_headers_frame_header(buf, block_len, stream_id, false, true);
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = o as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = o as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
 
     cur_h2_mut(s).ws_active = 1;
     cur_h2_mut(s).ws_stream_id = stream_id;
@@ -1293,11 +1343,7 @@ unsafe fn ws_handle_data(s: &mut HttpState, hdr: &h2w::Header, payload: *const u
         return;
     }
     if plen > 0 {
-        core::ptr::copy_nonoverlapping(
-            payload,
-            cur_h2_mut(s).ws_buf.as_mut_ptr().add(cur),
-            plen,
-        );
+        core::ptr::copy_nonoverlapping(payload, cur_h2_mut(s).ws_buf.as_mut_ptr().add(cur), plen);
         cur_h2_mut(s).ws_buf_len = (cur + plen) as u16;
     }
     ws_drain_buf(s);
@@ -1308,10 +1354,7 @@ unsafe fn ws_handle_data(s: &mut HttpState, hdr: &h2w::Header, payload: *const u
 /// or (b) `send_buf` is busy with a queued echo (next tick will retry
 /// after the wire drains).
 pub(crate) unsafe fn ws_drain_buf(s: &mut HttpState) {
-    while cur_h2(s).ws_active != 0
-        && cur_send_len(s) == 0
-        && cur_h2(s).ws_buf_len > 0
-    {
+    while cur_h2(s).ws_active != 0 && cur_send_len(s) == 0 && cur_h2(s).ws_buf_len > 0 {
         let buflen = cur_h2(s).ws_buf_len as usize;
         let frame = match ws::parse_frame(cur_h2(s).ws_buf.as_ptr(), buflen) {
             Ok(Some(f)) => f,
@@ -1332,7 +1375,10 @@ pub(crate) unsafe fn ws_drain_buf(s: &mut HttpState) {
             return;
         }
 
-        let pl_ptr = cur_h2_mut(s).ws_buf.as_mut_ptr().add(frame.header_len as usize);
+        let pl_ptr = cur_h2_mut(s)
+            .ws_buf
+            .as_mut_ptr()
+            .add(frame.header_len as usize);
         ws::unmask(pl_ptr, frame.payload_len, &frame.mask_key);
 
         let mut consume_only = false;
@@ -1349,23 +1395,11 @@ pub(crate) unsafe fn ws_drain_buf(s: &mut HttpState) {
                 return;
             }
             ws::OP_PING => {
-                queue_ws_frame(
-                    s,
-                    ws::OP_PONG,
-                    pl_ptr,
-                    frame.payload_len as usize,
-                    false,
-                );
+                queue_ws_frame(s, ws::OP_PONG, pl_ptr, frame.payload_len as usize, false);
             }
             ws::OP_PONG => consume_only = true, // drop silently
             ws::OP_TEXT | ws::OP_BINARY | ws::OP_CONTINUATION => {
-                queue_ws_frame(
-                    s,
-                    frame.opcode,
-                    pl_ptr,
-                    frame.payload_len as usize,
-                    false,
-                );
+                queue_ws_frame(s, frame.opcode, pl_ptr, frame.payload_len as usize, false);
             }
             _ => {
                 queue_ws_close(s, ws::CLOSE_PROTOCOL_ERROR);
@@ -1407,8 +1441,12 @@ unsafe fn queue_ws_frame(
     let dst_cap = SEND_BUF_SIZE - h2w::FRAME_HEADER_LEN;
     let written = ws::write_frame(dst, dst_cap, true, opcode, payload, payload_len);
     h2w::write_data_frame_header(buf, written, stream_id, end_stream);
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = (h2w::FRAME_HEADER_LEN + written) as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = (h2w::FRAME_HEADER_LEN + written) as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
 }
 
 unsafe fn queue_ws_close(s: &mut HttpState, code: u16) {
@@ -1484,14 +1522,12 @@ unsafe fn needs_exclusive_for_request(s: &HttpState, slot_idx: i8) -> bool {
     }
     let r = &*s.server.routes.as_ptr().add(matched as usize);
     r.handler == HANDLER_FILE
-        || ((r.handler == HANDLER_STATIC || r.handler == HANDLER_TEMPLATE)
-            && r.source_index >= 0)
+        || ((r.handler == HANDLER_STATIC || r.handler == HANDLER_TEMPLATE) && r.source_index >= 0)
 }
 
 unsafe fn dispatch_request(s: &mut HttpState, slot_idx: i8) {
     let stream_id = (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).id;
-    let plen =
-        (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).req_path_len as usize;
+    let plen = (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).req_path_len as usize;
 
     // Copy the slot's request path into the active conn slot's req_path
     // scratch — the route matcher and file-index parser both read from
@@ -1651,7 +1687,13 @@ unsafe fn begin_file_response(s: &mut HttpState, slot_idx: i8, matched_route: i8
             free_slot(s, slot_idx);
             return;
         }
-        dev_channel_ioctl(sys, s.server.file_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+        dev_channel_ioctl(
+            sys,
+            s.server.file_chan,
+            IOCTL_FLUSH,
+            core::ptr::null_mut(),
+            0,
+        );
         let mut pos = fi as u32;
         let pos_ptr = &mut pos as *mut u32 as *mut u8;
         let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
@@ -1710,8 +1752,12 @@ unsafe fn emit_response(
         // Body too large for our send buffer in this slice — close the
         // stream rather than emit a malformed frame.
         let n = h2w::write_rst_stream(buf, stream_id, h2w::ERR_INTERNAL_ERROR);
-        if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-        if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = n as u16;
+        }
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+        }
         return;
     }
 
@@ -1719,20 +1765,24 @@ unsafe fn emit_response(
     if !body.is_empty() {
         core::ptr::copy_nonoverlapping(body.as_ptr(), buf.add(data_off), body.len());
     }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = (data_off + body.len()) as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = (data_off + body.len()) as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
 }
 
 // ── Connection-level error path ───────────────────────────────────────────
 
 unsafe fn queue_goaway(s: &mut HttpState, code: u32) {
-    let n = h2w::write_goaway(
-        cur_send_buf_mut_ptr(s),
-        cur_h2(s).last_stream_id,
-        code,
-    );
-    if let Some(cur) = cur_slot_mut(s) { cur.send_len = n as u16; }
-    if let Some(cur) = cur_slot_mut(s) { cur.send_offset = 0; }
+    let n = h2w::write_goaway(cur_send_buf_mut_ptr(s), cur_h2(s).last_stream_id, code);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = n as u16;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+    }
     cur_h2_mut(s).sub = Sub::Closing;
 }
 

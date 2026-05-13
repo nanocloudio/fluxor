@@ -56,12 +56,7 @@ pub unsafe fn src_mac(data: *const u8) -> [u8; 6] {
 ///
 /// # Safety
 /// `dst` must point to at least 14 writable bytes.
-pub unsafe fn build_eth_header(
-    dst: *mut u8,
-    dst_mac: &[u8; 6],
-    src_mac: &[u8; 6],
-    ethertype: u16,
-) {
+pub unsafe fn build_eth_header(dst: *mut u8, dst_mac: &[u8; 6], src_mac: &[u8; 6], ethertype: u16) {
     use core::ptr::{read_volatile, write_volatile};
     let mut i = 0;
     while i < 6 {

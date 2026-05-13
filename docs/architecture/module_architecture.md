@@ -245,12 +245,12 @@ The runtime loader enforces a concrete module binary contract:
   byte (`reserved[0]`), and required capability bits
 - Parameter schema and manifest payloads are embedded in the `.fmod` image
 - The manifest section (`FXMF`) carries a SHA-256 integrity hash over
-  code+data plus, in v2, an Ed25519 signature over that hash and the
-  signer's public-key fingerprint. The loader recomputes the hash at
-  admission time and rejects any module whose bytes drift from the
-  manifest (`IntegrityMismatch`); with the `enforce_signatures` feature
-  set, unsigned modules and bad signatures are rejected
-  (`SignatureInvalid`). `fluxor sign` produces v2 manifests; see
+  code+data, an Ed25519 signature over that hash, and the signer's
+  public-key fingerprint. The loader recomputes the hash at admission
+  time and rejects any module whose bytes drift from the manifest
+  (`IntegrityMismatch`); with the `enforce_signatures` feature set,
+  unsigned modules and bad signatures are rejected
+  (`SignatureInvalid`). `fluxor sign` produces signed manifests; see
   `security.md` for the trust chain and `network_boot.md` for the
   deployment-time use of the same signing key.
 

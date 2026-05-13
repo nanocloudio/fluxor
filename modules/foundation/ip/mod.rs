@@ -42,19 +42,19 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 
 #[allow(dead_code)]
-mod eth;
-#[allow(dead_code)]
 mod arp;
 #[allow(dead_code)]
-mod ipv4;
+mod dhcp;
+#[allow(dead_code)]
+mod eth;
 #[allow(dead_code)]
 mod icmp;
 #[allow(dead_code)]
-mod udp;
+mod ipv4;
 #[allow(dead_code)]
 mod tcp;
 #[allow(dead_code)]
-mod dhcp;
+mod udp;
 
 // ============================================================================
 // Constants
@@ -200,11 +200,11 @@ pub struct IpState {
     /// propagates back to the consumer through its own
     /// `channel_write` to `net_in_chan`.
     pending_cmd_valid: u8,
-    pending_cmd_conn:  u8,
-    pending_cmd_off:   u16,
-    pending_cmd_len:   u16,
-    _pcmd_pad:         [u8; 2],
-    pending_cmd_buf:   [u8; PENDING_CMD_BUF_SIZE],
+    pending_cmd_conn: u8,
+    pending_cmd_off: u16,
+    pending_cmd_len: u16,
+    _pcmd_pad: [u8; 2],
+    pending_cmd_buf: [u8; PENDING_CMD_BUF_SIZE],
 
     /// Deferred CMD_CLOSE slot. Set when CMD_CLOSE arrives while a
     /// `pending_cmd_*` stash is still draining (RFC 793 §3.5 — CLOSE
@@ -212,8 +212,8 @@ pub struct IpState {
     /// itself was rejected by the NIC. Cleared once `process_cmd_close`
     /// confirms the FIN is queued.
     pending_close_valid: u8,
-    pending_close_conn:  u8,
-    _pcls_pad:           [u8; 2],
+    pending_close_conn: u8,
+    _pcls_pad: [u8; 2],
 
     /// Outbound control-frame queue (MSG_BOUND / MSG_ACCEPTED /
     /// MSG_CLOSED / MSG_CONNECTED / MSG_ERROR / MSG_RETRANSMIT).
@@ -223,11 +223,11 @@ pub struct IpState {
     /// top of each `module_step`. MSG_DATA bypasses this and uses its
     /// own per-conn path because it's variable-length and large.
     pending_net_out_frames: [[u8; NET_OUT_FRAME_MAX]; NET_OUT_QUEUE_SLOTS],
-    pending_net_out_lens:   [u8; NET_OUT_QUEUE_SLOTS],
-    pending_net_out_head:   u8,
-    pending_net_out_tail:   u8,
-    pending_net_out_count:  u8,
-    _pno_pad:               u8,
+    pending_net_out_lens: [u8; NET_OUT_QUEUE_SLOTS],
+    pending_net_out_head: u8,
+    pending_net_out_tail: u8,
+    pending_net_out_count: u8,
+    _pno_pad: u8,
 
     // Step counter for timers
     step_count: u32,
@@ -325,7 +325,11 @@ unsafe fn ip_net_write_frame(
     }
     let total = NET_FRAME_HDR + payload_len;
     let written = (sys.channel_write)(chan, scratch, total);
-    if written < total as i32 { -1 } else { 0 }
+    if written < total as i32 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Read a net_proto frame (header + payload) into the caller's buffer.
@@ -363,7 +367,9 @@ unsafe fn ip_net_read_frame(
     while remaining > 0 {
         let chunk = remaining.min(buf_cap);
         let drained = (sys.channel_read)(chan, buf, chunk);
-        if drained <= 0 { break; }
+        if drained <= 0 {
+            break;
+        }
         remaining -= drained as usize;
     }
     (0, 0)
@@ -438,11 +444,7 @@ unsafe fn drain_pending_net_out_inner(s: &mut IpState, sys: &SyscallTable) {
     while s.pending_net_out_count > 0 && s.net_out_chan >= 0 {
         let slot = s.pending_net_out_head as usize;
         let len = s.pending_net_out_lens[slot] as usize;
-        let n = (sys.channel_write)(
-            s.net_out_chan,
-            s.pending_net_out_frames[slot].as_ptr(),
-            len,
-        );
+        let n = (sys.channel_write)(s.net_out_chan, s.pending_net_out_frames[slot].as_ptr(), len);
         if n != len as i32 {
             return;
         }
@@ -588,12 +590,16 @@ unsafe fn dg_send_rx_from_v4(
     data: *const u8,
     data_len: usize,
 ) {
-    if s.net_out_chan < 0 || data_len == 0 { return; }
+    if s.net_out_chan < 0 || data_len == 0 {
+        return;
+    }
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
     let payload_len = 1 + 1 + 4 + 2 + data_len; // ep_id + af + addr + port + data
     let max_copy = s.net_scratch.len() - NET_FRAME_HDR;
-    if payload_len > max_copy { return; }
+    if payload_len > max_copy {
+        return;
+    }
     use core::ptr::write_volatile as wv;
     wv(scratch, DG_MSG_RX_FROM);
     let pl = (payload_len as u16).to_le_bytes();
@@ -685,7 +691,9 @@ fn next_port(s: &mut IpState) -> u16 {
 /// state that assumes the bytes are on the wire (`snd_nxt`, etc.) —
 /// TCP retransmit / pending-cmd stash logic relies on this.
 unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
-    if s.out_chan < 0 || len == 0 || len > MAX_FRAME_SIZE - 2 { return false; }
+    if s.out_chan < 0 || len == 0 || len > MAX_FRAME_SIZE - 2 {
+        return false;
+    }
     let sys = &*s.syscalls;
 
     // Flush any frame pending from a previous step before writing a new one.
@@ -743,7 +751,9 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
@@ -809,8 +819,8 @@ pub extern "C" fn module_new(
 
         // Discover net protocol channels
         let sys = &*s.syscalls;
-        s.net_in_chan = dev_channel_port(sys, 0, 1);   // in[1]: net commands from consumer
-        s.net_out_chan = dev_channel_port(sys, 1, 1);   // out[1]: net messages to consumer
+        s.net_in_chan = dev_channel_port(sys, 0, 1); // in[1]: net commands from consumer
+        s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
 
         // Parse TLV params
         if !params.is_null() && params_len > 0 {
@@ -875,7 +885,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         let mut buf = [0u8; 40];
         let prefix = b"[ip] mac learned ";
         let mut i = 0;
-        while i < prefix.len() { buf[i] = prefix[i]; i += 1; }
+        while i < prefix.len() {
+            buf[i] = prefix[i];
+            i += 1;
+        }
         // Format MAC as hex
         let hex = b"0123456789abcdef";
         let bp = buf.as_mut_ptr();
@@ -887,7 +900,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             *bp.add(p) = *hp.add((byte >> 4) as usize);
             *bp.add(p + 1) = *hp.add((byte & 0x0F) as usize);
             p += 2;
-            if m < 5 && p < 40 { *bp.add(p) = b':'; p += 1; }
+            if m < 5 && p < 40 {
+                *bp.add(p) = b':';
+                p += 1;
+            }
             m += 1;
         }
         let sl = core::slice::from_raw_parts(bp, p);
@@ -912,11 +928,18 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 let bp = buf.as_mut_ptr();
                 let prefix = b"[ip] rx=";
                 let mut p = 0usize;
-                while p < prefix.len() { *bp.add(p) = prefix[p]; p += 1; }
+                while p < prefix.len() {
+                    *bp.add(p) = prefix[p];
+                    p += 1;
+                }
                 p += fmt_u32_raw(bp.add(p), s.rx_frame_count);
                 let mid = b" tx=";
                 let mut m = 0usize;
-                while m < mid.len() { *bp.add(p) = mid[m]; p += 1; m += 1; }
+                while m < mid.len() {
+                    *bp.add(p) = mid[m];
+                    p += 1;
+                    m += 1;
+                }
                 p += fmt_u32_raw(bp.add(p), s.tx_frame_count);
                 let sl = core::slice::from_raw_parts(bp, p);
                 log_info(s, sl);
@@ -959,7 +982,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         let sys = &*s.syscalls;
         let scratch_ptr = s.tlm_scratch.as_mut_ptr();
         let scratch_len = s.tlm_scratch.len();
-        dev_tlm_maybe_emit(sys, b"[ip]", &mut s.tlm, s.step_count, IP_TLM_PERIOD, scratch_ptr, scratch_len);
+        dev_tlm_maybe_emit(
+            sys,
+            b"[ip]",
+            &mut s.tlm,
+            s.step_count,
+            IP_TLM_PERIOD,
+            scratch_ptr,
+            scratch_len,
+        );
     }
 
     // Signal Ready once IP is configured (DHCP bound or static)
@@ -995,10 +1026,26 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let net_ring: u32 = 2048;
 
     let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: eth_ring }, // in[0]: RX ethernet frames
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: eth_ring }, // out[0]: TX ethernet frames
-        ChannelHint { port_type: 0, port_index: 1, buffer_size: net_ring }, // in[1]: net commands from consumer
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: net_ring }, // out[1]: net messages to consumer
+        ChannelHint {
+            port_type: 0,
+            port_index: 0,
+            buffer_size: eth_ring,
+        }, // in[0]: RX ethernet frames
+        ChannelHint {
+            port_type: 1,
+            port_index: 0,
+            buffer_size: eth_ring,
+        }, // out[0]: TX ethernet frames
+        ChannelHint {
+            port_type: 0,
+            port_index: 1,
+            buffer_size: net_ring,
+        }, // in[1]: net commands from consumer
+        ChannelHint {
+            port_type: 1,
+            port_index: 1,
+            buffer_size: net_ring,
+        }, // out[1]: net messages to consumer
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }
@@ -1019,7 +1066,9 @@ pub extern "C" fn module_in_place_safe() -> u32 {
 /// We read the 2-byte header first, then exactly `len` bytes so back-to-back
 /// frames in the byte-stream channel don't concatenate into one giant "frame".
 unsafe fn process_rx_frames(s: &mut IpState) {
-    if s.in_chan < 0 { return; }
+    if s.in_chan < 0 {
+        return;
+    }
     let sys = &*s.syscalls;
 
     // Drain up to 32 RX frames per IP step. A fast peer can deliver
@@ -1036,16 +1085,24 @@ unsafe fn process_rx_frames(s: &mut IpState) {
             break;
         }
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll <= 0 || (poll as u32 & POLL_IN) == 0 { break; }
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            break;
+        }
 
         let mut hdr = [0u8; 2];
         let hn = (sys.channel_read)(s.in_chan, hdr.as_mut_ptr(), 2);
-        if hn < 2 { break; }
+        if hn < 2 {
+            break;
+        }
         let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
-        if frame_len == 0 || frame_len > MAX_FRAME_SIZE { break; }
+        if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+            break;
+        }
 
         let r = (sys.channel_read)(s.in_chan, s.rx_frame.as_mut_ptr(), frame_len) as i32;
-        if r <= 0 { break; }
+        if r <= 0 {
+            break;
+        }
 
         s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(r as u32);
         process_frame(s, r as usize);
@@ -1150,7 +1207,12 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
     if ip_hdr.src_ip != 0 && ip_hdr.src_ip != 0xFFFFFFFF {
         let src_mac = eth::src_mac(s.rx_frame.as_ptr());
         if (src_mac[0] | src_mac[1] | src_mac[2] | src_mac[3] | src_mac[4] | src_mac[5]) != 0 {
-            arp::insert(&mut s.arp_table, ip_hdr.src_ip, src_mac, s.step_count as u16);
+            arp::insert(
+                &mut s.arp_table,
+                ip_hdr.src_ip,
+                src_mac,
+                s.step_count as u16,
+            );
         }
     }
 
@@ -1179,18 +1241,16 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
 }
 
 /// Process ICMP packet (echo request → reply).
-unsafe fn process_icmp(
-    s: &mut IpState,
-    ip_hdr: &ipv4::Ipv4Header,
-    data: *const u8,
-    len: usize,
-) {
+unsafe fn process_icmp(s: &mut IpState, ip_hdr: &ipv4::Ipv4Header, data: *const u8, len: usize) {
     if !s.mac_valid || s.local_ip == 0 {
         return;
     }
 
     // Build reply in tx_frame (after eth + ip headers)
-    let icmp_dst = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
+    let icmp_dst = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
     let reply_len = icmp::handle_icmp(data, len, icmp_dst);
     if reply_len == 0 {
         return;
@@ -1203,10 +1263,22 @@ unsafe fn process_icmp(
     let ip_total = (ipv4::IPV4_HEADER_LEN + reply_len) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
     s.ip_id = s.ip_id.wrapping_add(1);
-    ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_ICMP, s.local_ip, ip_hdr.src_ip, s.ip_id);
+    ipv4::build_ipv4_header(
+        ip_start,
+        ip_total,
+        ipv4::PROTO_ICMP,
+        s.local_ip,
+        ip_hdr.src_ip,
+        s.ip_id,
+    );
 
     // Build ethernet header
-    eth::build_eth_header(s.tx_frame.as_mut_ptr(), &src_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+    eth::build_eth_header(
+        s.tx_frame.as_mut_ptr(),
+        &src_mac,
+        &s.mac_addr,
+        eth::ETHERTYPE_IPV4,
+    );
 
     let total_len = eth::ETH_HEADER_LEN + ip_total as usize;
     send_frame(s, s.tx_frame.as_ptr(), total_len);
@@ -1244,8 +1316,12 @@ unsafe fn process_udp_packet(
         {
             let payload = data.add(udp_hdr.payload_offset);
             dg_send_rx_from_v4(
-                s, i as u8, ip_hdr.src_ip, udp_hdr.src_port,
-                payload, udp_hdr.payload_len,
+                s,
+                i as u8,
+                ip_hdr.src_ip,
+                udp_hdr.src_port,
+                payload,
+                udp_hdr.payload_len,
             );
             return;
         }
@@ -1282,8 +1358,11 @@ unsafe fn process_tcp_segment(
             // serve the next SYN. Only accept once the interface is
             // configured; otherwise we'd consume a slot but couldn't send
             // SYN-ACK.
-            if (tcp_hdr.flags & tcp::SYN) != 0 && (tcp_hdr.flags & tcp::ACK) == 0
-               && s.mac_valid && s.local_ip != 0 {
+            if (tcp_hdr.flags & tcp::SYN) != 0
+                && (tcp_hdr.flags & tcp::ACK) == 0
+                && s.mac_valid
+                && s.local_ip != 0
+            {
                 if let Some(li) = tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port) {
                     let mut accept_idx: i32 = -1;
                     let mut fi = 0;
@@ -1326,7 +1405,13 @@ unsafe fn process_tcp_segment(
             }
             // No listener either — send RST if not RST
             if (tcp_hdr.flags & tcp::RST) == 0 && s.mac_valid && s.local_ip != 0 {
-                send_tcp_rst(s, ip_hdr.src_ip, tcp_hdr.src_port, tcp_hdr.dst_port, &tcp_hdr);
+                send_tcp_rst(
+                    s,
+                    ip_hdr.src_ip,
+                    tcp_hdr.src_port,
+                    tcp_hdr.dst_port,
+                    &tcp_hdr,
+                );
             }
             return;
         }
@@ -1383,7 +1468,8 @@ unsafe fn process_tcp_segment(
                 } else {
                     if (tcp_hdr.flags & tcp::ACK) != 0 {
                         let prev_una = conn.snd_una;
-                        if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1)) {
+                        if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1))
+                        {
                             conn.snd_una = tcp_hdr.ack_num;
                         }
                         conn.snd_wnd = tcp_hdr.window;
@@ -1405,7 +1491,13 @@ unsafe fn process_tcp_segment(
                         rx_payload_offset = tcp_hdr.payload_offset;
                         rx_payload_len = tcp_hdr.payload_len;
                         action = ACTION_RX_DATA;
-                    } else if tcp_hdr.payload_len > 0 && seq_between(conn.rcv_nxt, tcp_hdr.seq_num, conn.rcv_nxt.wrapping_add(conn.rcv_wnd as u32)) {
+                    } else if tcp_hdr.payload_len > 0
+                        && seq_between(
+                            conn.rcv_nxt,
+                            tcp_hdr.seq_num,
+                            conn.rcv_nxt.wrapping_add(conn.rcv_wnd as u32),
+                        )
+                    {
                         // Out-of-order segment within the receive window —
                         // buffer for reassembly and send a duplicate ACK.
                         reorder_pending = true;
@@ -1529,7 +1621,9 @@ unsafe fn process_tcp_segment(
             let delivered = net_send_closed(s, conn_idx as u8);
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
             if delivered {
-                if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
+                if remote_ip != 0 {
+                    arp::unpin(&mut s.arp_table, remote_ip);
+                }
                 *conn = tcp::TcpConn::new();
             } else {
                 // ARP unpin is deferred until the slot actually frees
@@ -1622,8 +1716,7 @@ unsafe fn process_tcp_segment(
                 if net_send_data(s, conn_idx as u8, payload, rx_payload_len) {
                     let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                     conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
-                    conn.delivered_bytes =
-                        conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
+                    conn.delivered_bytes = conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
                     send_tcp_control(s, conn_idx, tcp::ACK, false);
                 } else {
                     let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
@@ -1654,7 +1747,11 @@ unsafe fn process_tcp_segment(
 
     // Fast retransmit — signal the consumer to resend from `snd_una`.
     if net_send_fast_retransmit {
-        net_send_retransmit(s, net_send_fast_retransmit_conn, net_send_fast_retransmit_seq);
+        net_send_retransmit(
+            s,
+            net_send_fast_retransmit_conn,
+            net_send_fast_retransmit_seq,
+        );
     }
 }
 
@@ -1691,18 +1788,30 @@ unsafe fn send_tcp_rst(
         None => return,
     };
 
-    let tcp_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
-    tcp::build_tcp_header(
-        tcp_start, local_port, remote_port,
-        seq, ack, flags, 0,
-    );
+    let tcp_start = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
+    tcp::build_tcp_header(tcp_start, local_port, remote_port, seq, ack, flags, 0);
 
     let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
     s.ip_id = s.ip_id.wrapping_add(1);
-    ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_TCP, s.local_ip, remote_ip, s.ip_id);
+    ipv4::build_ipv4_header(
+        ip_start,
+        ip_total,
+        ipv4::PROTO_TCP,
+        s.local_ip,
+        remote_ip,
+        s.ip_id,
+    );
 
-    eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+    eth::build_eth_header(
+        s.tx_frame.as_mut_ptr(),
+        &dst_mac,
+        &s.mac_addr,
+        eth::ETHERTYPE_IPV4,
+    );
 
     tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, s.local_ip, remote_ip);
 
@@ -1729,12 +1838,7 @@ unsafe fn send_tcp_rst(
 /// ACK-only segments don't consume sequence space, so the flag has
 /// no effect on them. Returns `true` iff the frame was queued; the
 /// caller defers state transitions on backpressured SYN/FIN.
-unsafe fn send_tcp_control(
-    s: &mut IpState,
-    conn_idx: usize,
-    flags: u8,
-    retransmit: bool,
-) -> bool {
+unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransmit: bool) -> bool {
     if !s.mac_valid || s.local_ip == 0 {
         return false;
     }
@@ -1761,19 +1865,38 @@ unsafe fn send_tcp_control(
         }
     };
 
-    let tcp_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
+    let tcp_start = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
     tcp::build_tcp_header(
         tcp_start,
-        local_port, remote_port, seq, rcv_nxt,
-        flags, rcv_wnd,
+        local_port,
+        remote_port,
+        seq,
+        rcv_nxt,
+        flags,
+        rcv_wnd,
     );
 
     let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
     s.ip_id = s.ip_id.wrapping_add(1);
-    ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_TCP, s.local_ip, remote_ip, s.ip_id);
+    ipv4::build_ipv4_header(
+        ip_start,
+        ip_total,
+        ipv4::PROTO_TCP,
+        s.local_ip,
+        remote_ip,
+        s.ip_id,
+    );
 
-    eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+    eth::build_eth_header(
+        s.tx_frame.as_mut_ptr(),
+        &dst_mac,
+        &s.mac_addr,
+        eth::ETHERTYPE_IPV4,
+    );
 
     tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, s.local_ip, remote_ip);
 
@@ -1828,8 +1951,12 @@ unsafe fn send_tcp_data(
 
     tcp::build_tcp_header(
         tcp_start,
-        local_port, remote_port, snd_nxt, rcv_nxt,
-        tcp::ACK | tcp::PSH, rcv_wnd,
+        local_port,
+        remote_port,
+        snd_nxt,
+        rcv_nxt,
+        tcp::ACK | tcp::PSH,
+        rcv_wnd,
     );
 
     // Copy payload after TCP header
@@ -1839,21 +1966,36 @@ unsafe fn send_tcp_data(
     let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN + payload_len) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
     s.ip_id = s.ip_id.wrapping_add(1);
-    ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_TCP, s.local_ip, remote_ip, s.ip_id);
+    ipv4::build_ipv4_header(
+        ip_start,
+        ip_total,
+        ipv4::PROTO_TCP,
+        s.local_ip,
+        remote_ip,
+        s.ip_id,
+    );
 
-    eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+    eth::build_eth_header(
+        s.tx_frame.as_mut_ptr(),
+        &dst_mac,
+        &s.mac_addr,
+        eth::ETHERTYPE_IPV4,
+    );
 
     tcp::compute_tcp_checksum(
-        tcp_start, tcp::TCP_HEADER_LEN + payload_len,
-        s.local_ip, remote_ip,
+        tcp_start,
+        tcp::TCP_HEADER_LEN + payload_len,
+        s.local_ip,
+        remote_ip,
     );
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     if !send_frame(s, s.tx_frame.as_ptr(), total) {
         return false;
     }
-    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt =
-        (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt.wrapping_add(payload_len as u32);
+    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx))
+        .snd_nxt
+        .wrapping_add(payload_len as u32);
     true
 }
 
@@ -1926,14 +2068,34 @@ unsafe fn send_udp_data(
         i += 1;
     }
 
-    udp::build_udp_header(udp_start, src_port, dst_port, payload_len, s.local_ip, dst_ip, payload_dst);
+    udp::build_udp_header(
+        udp_start,
+        src_port,
+        dst_port,
+        payload_len,
+        s.local_ip,
+        dst_ip,
+        payload_dst,
+    );
 
     let ip_total = (ipv4::IPV4_HEADER_LEN + udp::UDP_HEADER_LEN + payload_len) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
     s.ip_id = s.ip_id.wrapping_add(1);
-    ipv4::build_ipv4_header(ip_start, ip_total, ipv4::PROTO_UDP, s.local_ip, dst_ip, s.ip_id);
+    ipv4::build_ipv4_header(
+        ip_start,
+        ip_total,
+        ipv4::PROTO_UDP,
+        s.local_ip,
+        dst_ip,
+        s.ip_id,
+    );
 
-    eth::build_eth_header(s.tx_frame.as_mut_ptr(), &dst_mac, &s.mac_addr, eth::ETHERTYPE_IPV4);
+    eth::build_eth_header(
+        s.tx_frame.as_mut_ptr(),
+        &dst_mac,
+        &s.mac_addr,
+        eth::ETHERTYPE_IPV4,
+    );
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     send_frame(s, s.tx_frame.as_ptr(), total);
@@ -1948,7 +2110,11 @@ unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
 
     // Use gateway if destination is off-subnet
     let target_ip = if s.netmask != 0 && (ip & s.netmask) != (s.local_ip & s.netmask) {
-        if s.gateway != 0 { s.gateway } else { ip }
+        if s.gateway != 0 {
+            s.gateway
+        } else {
+            ip
+        }
     } else {
         ip
     };
@@ -2004,7 +2170,9 @@ unsafe fn step_dhcp(s: &mut IpState) {
                     s.dhcp.xid = s.step_count.wrapping_mul(2654435761).wrapping_add(1);
                 } else {
                     s.dhcp.xid = u32::from_le_bytes(xid_bytes);
-                    if s.dhcp.xid == 0 { s.dhcp.xid = 1; }
+                    if s.dhcp.xid == 0 {
+                        s.dhcp.xid = 1;
+                    }
                 }
             }
             s.dhcp.retries = 0;
@@ -2128,9 +2296,14 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
             // Accept ACK in either Requesting or Discovering state.
             // Some DHCP servers (e.g. QEMU SLIRP) may send ACK directly.
             if s.dhcp.state == dhcp::DhcpState::Requesting
-                || s.dhcp.state == dhcp::DhcpState::Discovering {
+                || s.dhcp.state == dhcp::DhcpState::Discovering
+            {
                 s.local_ip = offered_ip;
-                s.netmask = if subnet_mask != 0 { subnet_mask } else { 0xFFFFFF00 };
+                s.netmask = if subnet_mask != 0 {
+                    subnet_mask
+                } else {
+                    0xFFFFFF00
+                };
                 s.gateway = gateway;
                 s.dns_server = dns;
                 s.ip_configured = true;
@@ -2154,17 +2327,25 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                     let bp = buf.as_mut_ptr();
                     let prefix = b"[ip] dhcp bound ";
                     let mut i = 0;
-                    while i < prefix.len() { *bp.add(i) = prefix[i]; i += 1; }
+                    while i < prefix.len() {
+                        *bp.add(i) = prefix[i];
+                        i += 1;
+                    }
                     i += fmt_ip_raw(bp.add(i), s.local_ip);
                     let mid = b" T+";
                     let mut m = 0;
-                    while m < mid.len() { *bp.add(i) = mid[m]; i += 1; m += 1; }
+                    while m < mid.len() {
+                        *bp.add(i) = mid[m];
+                        i += 1;
+                        m += 1;
+                    }
                     i += fmt_u32_raw(bp.add(i), ms as u32);
-                    *bp.add(i) = b'm'; i += 1;
-                    *bp.add(i) = b's'; i += 1;
+                    *bp.add(i) = b'm';
+                    i += 1;
+                    *bp.add(i) = b's';
+                    i += 1;
                     dev_log(sys, 1, bp, i);
                 }
-
             }
         }
         dhcp::DHCP_NAK => {
@@ -2201,7 +2382,9 @@ fn state_allows_send(state: tcp::TcpState) -> bool {
 /// advances on successful FIN queue, so a backpressured FIN doesn't
 /// strand the conn in FinWait1 with no frame on the wire.
 unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
-    if conn_id >= tcp::MAX_TCP_CONNS { return true; }
+    if conn_id >= tcp::MAX_TCP_CONNS {
+        return true;
+    }
     let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
     match conn_state {
         tcp::TcpState::Established => {
@@ -2228,7 +2411,9 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
         _ => {
             // Already closing/closed — reset and notify
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_id)).remote_ip;
-            if remote_ip != 0 { arp::unpin(&mut s.arp_table, remote_ip); }
+            if remote_ip != 0 {
+                arp::unpin(&mut s.arp_table, remote_ip);
+            }
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
             *conn = tcp::TcpConn::new();
             net_send_closed(s, conn_id as u8);
@@ -2275,7 +2460,9 @@ unsafe fn try_send_cmd_payload(
         let chunk = (payload_len - data_off)
             .min(tcp::MSS as usize)
             .min(avail_wnd);
-        if chunk == 0 { return data_off; }
+        if chunk == 0 {
+            return data_off;
+        }
         let seq = conn.snd_nxt;
         let tick = s.step_count as u16;
         let ok = send_tcp_data(s, conn_id, payload.add(data_off), chunk);
@@ -2293,7 +2480,9 @@ unsafe fn try_send_cmd_payload(
 
 /// Read and dispatch net protocol commands from the consumer channel.
 unsafe fn service_net_channels(s: &mut IpState) {
-    if s.net_in_chan < 0 { return; }
+    if s.net_in_chan < 0 {
+        return;
+    }
     let sys = &*s.syscalls;
 
     // Pause command intake when outbound headroom is low: each
@@ -2313,13 +2502,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
         let conn_id = s.pending_cmd_conn as usize;
         let total_len = s.pending_cmd_len as usize;
         let off = s.pending_cmd_off as usize;
-        let new_off = try_send_cmd_payload(
-            s,
-            conn_id,
-            s.pending_cmd_buf.as_ptr(),
-            total_len,
-            off,
-        );
+        let new_off = try_send_cmd_payload(s, conn_id, s.pending_cmd_buf.as_ptr(), total_len, off);
         if new_off >= total_len {
             s.pending_cmd_valid = 0;
             s.pending_cmd_off = 0;
@@ -2363,7 +2546,8 @@ unsafe fn service_net_channels(s: &mut IpState) {
             break;
         }
         let mut buf = [0u8; PENDING_CMD_BUF_SIZE];
-        let (msg_type, payload_len) = ip_net_read_frame(sys, s.net_in_chan, buf.as_mut_ptr(), buf.len());
+        let (msg_type, payload_len) =
+            ip_net_read_frame(sys, s.net_in_chan, buf.as_mut_ptr(), buf.len());
         if msg_type == 0 {
             break;
         }
@@ -2438,7 +2622,8 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     if sock_type != SOCK_TYPE_STREAM {
                         net_send_error(s, 0, -22); // EINVAL
                     } else {
-                        let ip = u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
+                        let ip =
+                            u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
                         let port = u16::from_le_bytes([*bp.add(5), *bp.add(6)]);
 
                         let mut conn_id: i32 = -1;
@@ -2485,18 +2670,11 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 if plen >= 2 {
                     let conn_id = *buf.as_ptr() as usize;
                     let total_len = plen;
-                    if conn_id < tcp::MAX_TCP_CONNS
-                        && total_len <= PENDING_CMD_BUF_SIZE
-                    {
+                    if conn_id < tcp::MAX_TCP_CONNS && total_len <= PENDING_CMD_BUF_SIZE {
                         let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
                         if state_allows_send(conn_state) {
-                            let new_off = try_send_cmd_payload(
-                                s,
-                                conn_id,
-                                buf.as_ptr(),
-                                total_len,
-                                1,
-                            );
+                            let new_off =
+                                try_send_cmd_payload(s, conn_id, buf.as_ptr(), total_len, 1);
                             if new_off < total_len {
                                 // Stash the buffer verbatim (conn_id
                                 // at byte 0) so the resume path uses
@@ -2544,7 +2722,11 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 // with MSG_DG_BOUND [ep_id, local_port].
                 if plen >= 2 {
                     let req_port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    let port = if req_port == 0 { next_port(s) } else { req_port };
+                    let port = if req_port == 0 {
+                        next_port(s)
+                    } else {
+                        req_port
+                    };
                     let mut ep_id: i32 = -1;
                     let mut ci = 0;
                     while ci < tcp::MAX_TCP_CONNS {
@@ -2578,16 +2760,16 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     if af == DG_AF_INET && ep_id < tcp::MAX_TCP_CONNS {
                         let conn = &*s.tcp_conns.as_ptr().add(ep_id);
                         if conn.is_datagram && conn.state == tcp::TcpState::Listen {
-                            let dst_ip = u32::from_be_bytes(
-                                [*bp.add(2), *bp.add(3), *bp.add(4), *bp.add(5)],
-                            );
+                            let dst_ip = u32::from_be_bytes([
+                                *bp.add(2),
+                                *bp.add(3),
+                                *bp.add(4),
+                                *bp.add(5),
+                            ]);
                             let dst_port = u16::from_le_bytes([*bp.add(6), *bp.add(7)]);
                             let udp_data = bp.add(8);
                             let udp_len = plen - 8;
-                            send_udp_data(
-                                s, dst_ip, dst_port, conn.local_port,
-                                udp_data, udp_len,
-                            );
+                            send_udp_data(s, dst_ip, dst_port, conn.local_port, udp_data, udp_len);
                         } else {
                             dg_send_error(s, ep_id as u8, -22); // EINVAL
                         }

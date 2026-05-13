@@ -189,7 +189,12 @@ pub mod backing_store {
     /// Build the 24-byte arg buffer the bulk backing_provider ops use:
     ///   [arena_base_page: u32][vpage_idx_start: u32][count: u32][_pad: u32][buf_ptr: u64]
     #[cfg(feature = "chip-bcm2712")]
-    fn build_backing_arg_bulk(arena_base_page: u32, vpage_start: u32, count: u32, buf: u64) -> [u8; 24] {
+    fn build_backing_arg_bulk(
+        arena_base_page: u32,
+        vpage_start: u32,
+        count: u32,
+        buf: u64,
+    ) -> [u8; 24] {
         let mut a = [0u8; 24];
         a[0..4].copy_from_slice(&arena_base_page.to_le_bytes());
         a[4..8].copy_from_slice(&vpage_start.to_le_bytes());
@@ -347,9 +352,8 @@ pub mod backing_store {
                     if !crate::kernel::backing_provider::ready() {
                         return crate::kernel::errno::ENODEV;
                     }
-                    let mut arg = build_backing_arg_bulk(
-                        info.backing_offset, vpage_start, count, buf as u64,
-                    );
+                    let mut arg =
+                        build_backing_arg_bulk(info.backing_offset, vpage_start, count, buf as u64);
                     crate::kernel::backing_provider::dispatch(
                         crate::kernel::backing_provider::op::READ_PAGES,
                         arg.as_mut_ptr(),
@@ -357,14 +361,18 @@ pub mod backing_store {
                     )
                 }
                 #[cfg(not(feature = "chip-bcm2712"))]
-                { -38 }
+                {
+                    -38
+                }
             }
             _ => {
                 let mut i: u32 = 0;
                 while i < count {
                     let dst = unsafe { buf.add((i as usize) * PAGE_SIZE) };
                     let rc = backing_read(arena_id, vpage_start + i, dst);
-                    if rc != 0 { return rc; }
+                    if rc != 0 {
+                        return rc;
+                    }
                     i += 1;
                 }
                 0
@@ -376,7 +384,12 @@ pub mod backing_store {
     /// `count * PAGE_SIZE` readable bytes) to a registered arena.
     /// External-backed arenas pass through to a single bulk
     /// `WRITE_PAGES` dispatch.
-    pub fn backing_write_pages(arena_id: usize, vpage_start: u32, count: u32, buf: *const u8) -> i32 {
+    pub fn backing_write_pages(
+        arena_id: usize,
+        vpage_start: u32,
+        count: u32,
+        buf: *const u8,
+    ) -> i32 {
         if buf.is_null() || count == 0 {
             return -22;
         }
@@ -398,9 +411,8 @@ pub mod backing_store {
                     if !crate::kernel::backing_provider::ready() {
                         return crate::kernel::errno::ENODEV;
                     }
-                    let mut arg = build_backing_arg_bulk(
-                        info.backing_offset, vpage_start, count, buf as u64,
-                    );
+                    let mut arg =
+                        build_backing_arg_bulk(info.backing_offset, vpage_start, count, buf as u64);
                     crate::kernel::backing_provider::dispatch(
                         crate::kernel::backing_provider::op::WRITE_PAGES,
                         arg.as_mut_ptr(),
@@ -408,14 +420,18 @@ pub mod backing_store {
                     )
                 }
                 #[cfg(not(feature = "chip-bcm2712"))]
-                { -38 }
+                {
+                    -38
+                }
             }
             _ => {
                 let mut i: u32 = 0;
                 while i < count {
                     let src = unsafe { buf.add((i as usize) * PAGE_SIZE) };
                     let rc = backing_write(arena_id, vpage_start + i, src);
-                    if rc != 0 { return rc; }
+                    if rc != 0 {
+                        return rc;
+                    }
                     i += 1;
                 }
                 0

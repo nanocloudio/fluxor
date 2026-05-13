@@ -126,11 +126,7 @@ fn fetch_step(state: *mut u8) -> i32 {
                 let start = st.pending_pos as usize;
                 let remaining = (st.pending_len - st.pending_pos) as usize;
                 let want = remaining.min(WRITE_CHUNK_BYTES);
-                let written = channel::channel_write(
-                    st.out_chan,
-                    st.rx.as_ptr().add(start),
-                    want,
-                );
+                let written = channel::channel_write(st.out_chan, st.rx.as_ptr().add(start), want);
                 if written <= 0 {
                     // Still no room — try again next tick.
                     return 0;
@@ -168,11 +164,7 @@ fn fetch_step(state: *mut u8) -> i32 {
             let mut offset = 0usize;
             while offset < total {
                 let want = (total - offset).min(WRITE_CHUNK_BYTES);
-                let written = channel::channel_write(
-                    st.out_chan,
-                    st.rx.as_ptr().add(offset),
-                    want,
-                );
+                let written = channel::channel_write(st.out_chan, st.rx.as_ptr().add(offset), want);
                 if written <= 0 {
                     st.pending_pos = offset as u32;
                     st.pending_len = total as u32;

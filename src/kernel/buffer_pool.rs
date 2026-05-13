@@ -67,7 +67,7 @@
 //! first module that produces whole buffers; prior stages use FIFO copy. See
 //! `docs/architecture/pipeline.md` §FIFO→Mailbox for the full pattern.
 
-use portable_atomic::{AtomicI8, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicI16, AtomicU32, AtomicU8, Ordering};
 
 use crate::kernel::errno;
 
@@ -79,6 +79,19 @@ use crate::kernel::errno;
 /// Must be >= MAX_CHANNELS plus headroom for dynamic allocations.
 /// Bumped from 56 to 256 to fit Quantum's 42-module graph (~110 channels).
 pub const MAX_BUFFER_SLOTS: usize = 256;
+
+// Buffer slot ids are stored in `i16` fields on the channel side
+// (`ChannelSlot.buffer_slot`) with `-1` reserved as the unallocated
+// sentinel; the valid range is therefore `[0, i16::MAX]`. Widening
+// `MAX_BUFFER_SLOTS` past this range requires widening
+// `ChannelSlot.buffer_slot` and `BufferRegistrySlot.owner_channel`
+// together; the assert below fails the build if that invariant is
+// broken.
+const _: () = assert!(
+    MAX_BUFFER_SLOTS <= i16::MAX as usize + 1,
+    "MAX_BUFFER_SLOTS exceeds i16 sentinel-aware range; widen ChannelSlot.buffer_slot \
+     and BufferRegistrySlot.owner_channel storage before increasing this limit"
+);
 
 /// Default buffer size for channels without hints (audio channels).
 /// Derived from the canonical constant in abi.rs.
@@ -189,8 +202,9 @@ struct BufferRegistrySlot {
     len: AtomicU32,
     /// Buffer state (FREE/PRODUCER/READY/CONSUMER/STREAMING/READY_PROCESSED)
     state: AtomicU8,
-    /// Owner channel handle (-1 if not associated)
-    owner_channel: AtomicI8,
+    /// Owner channel handle (-1 if not associated). Stored as `i16` so the
+    /// full configured `MAX_CHANNELS` range fits without silent narrowing.
+    owner_channel: AtomicI16,
     /// Set when current PRODUCER was acquired via in-place (not fresh write)
     inplace_flag: AtomicU8,
     /// Producer module index (0xFF if unknown). The scheduler reads this to
@@ -207,7 +221,7 @@ impl BufferRegistrySlot {
             capacity: AtomicU32::new(0),
             len: AtomicU32::new(0),
             state: AtomicU8::new(STATE_FREE),
-            owner_channel: AtomicI8::new(-1),
+            owner_channel: AtomicI16::new(-1),
             inplace_flag: AtomicU8::new(0),
             producer_module: AtomicU8::new(0xFF),
         }
@@ -219,7 +233,7 @@ impl BufferRegistrySlot {
     }
 
     #[inline]
-    fn owner(&self) -> i8 {
+    fn owner(&self) -> i16 {
         self.owner_channel.load(Ordering::Acquire)
     }
 
@@ -234,7 +248,7 @@ impl BufferRegistrySlot {
     }
 
     /// Assign arena-allocated memory to this slot.
-    fn assign(&self, ptr: *mut u8, capacity: usize, channel: i8) {
+    fn assign(&self, ptr: *mut u8, capacity: usize, channel: i16) {
         unsafe {
             *self.data_ptr.get() = ptr;
         }
@@ -280,12 +294,21 @@ impl BufferRegistrySlot {
     ///
     /// If the current PRODUCER was acquired via in-place, releases to
     /// READY_PROCESSED to prevent another in-place module from re-processing.
+    ///
+    /// Oversized writes (`data_len > capacity`) are rejected by returning
+    /// `false` and leaving the slot in `STATE_PRODUCER`; callers translate
+    /// to `EINVAL`. Sizing each write to fit the buffer is a caller
+    /// contract — silently truncating would drop the tail of the writer's
+    /// data and corrupt the consumer's view.
     fn release_write(&self, data_len: u32) -> bool {
         if self.state.load(Ordering::Acquire) != STATE_PRODUCER {
             return false;
         }
         let cap = self.capacity.load(Ordering::Acquire);
-        self.len.store(data_len.min(cap), Ordering::Release);
+        if data_len > cap {
+            return false;
+        }
+        self.len.store(data_len, Ordering::Release);
         let was_inplace = self.inplace_flag.swap(0, Ordering::AcqRel);
         let next_state = if was_inplace != 0 {
             STATE_READY_PROCESSED
@@ -361,7 +384,7 @@ fn valid_slot(slot: i32) -> bool {
 ///
 /// `capacity` specifies the buffer size in bytes (e.g. 2048 for audio, 256 for events).
 /// Returns buffer slot index, or -1 if no slot or arena space available.
-pub fn alloc_streaming(channel: i8, capacity: usize) -> i32 {
+pub fn alloc_streaming(channel: i16, capacity: usize) -> i32 {
     alloc_streaming_for_module(channel, capacity, 0xFF)
 }
 
@@ -373,7 +396,7 @@ pub fn alloc_streaming(channel: i8, capacity: usize) -> i32 {
 /// per-module MPU/MMU region. Interleaved allocations widen the reported
 /// range into a conservative superset — still safe, but may include a peer
 /// module's buffer.
-pub fn alloc_streaming_for_module(channel: i8, capacity: usize, producer_module: u8) -> i32 {
+pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module: u8) -> i32 {
     for (i, slot) in BUFFER_REGISTRY.iter().enumerate() {
         if slot
             .state
@@ -623,7 +646,7 @@ pub fn get_capacity(slot: i32) -> u32 {
 }
 
 /// Check if a channel has a ready buffer (includes in-place processed buffers)
-pub fn has_ready(channel: i8) -> bool {
+pub fn has_ready(channel: i16) -> bool {
     BUFFER_REGISTRY
         .iter()
         .any(|s| s.owner() == channel && matches!(s.state(), STATE_READY | STATE_READY_PROCESSED))
@@ -634,26 +657,51 @@ pub fn has_free() -> bool {
     BUFFER_REGISTRY.iter().any(|s| s.state() == STATE_FREE)
 }
 
-/// Get pool statistics (free, producer, ready, consumer, streaming counts)
-pub fn stats() -> (u8, u8, u8, u8, u8) {
-    let mut free = 0u8;
-    let mut producer = 0u8;
-    let mut ready = 0u8;
-    let mut consumer = 0u8;
-    let mut streaming = 0u8;
+/// Snapshot of buffer-pool slot occupancy. Counters are `usize` so a
+/// fully-occupied 256-slot pool fits without overflow; the `capacity`
+/// field equals `MAX_BUFFER_SLOTS` and lets callers sanity-check the
+/// sum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferPoolStats {
+    /// Slots in `STATE_FREE` — available for `alloc_streaming`.
+    pub free: usize,
+    /// Slots in `STATE_PRODUCER` — mailbox writer holds an exclusive
+    /// acquire.
+    pub producer: usize,
+    /// Slots in `STATE_READY` or `STATE_READY_PROCESSED` — data is
+    /// queued for the consumer.
+    pub ready: usize,
+    /// Slots in `STATE_CONSUMER` — mailbox reader holds the slot.
+    pub consumer: usize,
+    /// Slots in `STATE_STREAMING` — FIFO-style pipe channel buffers.
+    pub streaming: usize,
+    /// Total slots in the registry (== `MAX_BUFFER_SLOTS`).
+    pub capacity: usize,
+}
+
+/// Get pool statistics for diagnostics.
+pub fn stats() -> BufferPoolStats {
+    let mut s = BufferPoolStats {
+        free: 0,
+        producer: 0,
+        ready: 0,
+        consumer: 0,
+        streaming: 0,
+        capacity: MAX_BUFFER_SLOTS,
+    };
 
     for slot in BUFFER_REGISTRY.iter() {
         match slot.state() {
-            STATE_FREE => free += 1,
-            STATE_PRODUCER => producer += 1,
-            STATE_READY | STATE_READY_PROCESSED => ready += 1,
-            STATE_CONSUMER => consumer += 1,
-            STATE_STREAMING => streaming += 1,
+            STATE_FREE => s.free += 1,
+            STATE_PRODUCER => s.producer += 1,
+            STATE_READY | STATE_READY_PROCESSED => s.ready += 1,
+            STATE_CONSUMER => s.consumer += 1,
+            STATE_STREAMING => s.streaming += 1,
             _ => {}
         }
     }
 
-    (free, producer, ready, consumer, streaming)
+    s
 }
 
 /// Reset all buffer slots (for testing/cleanup).

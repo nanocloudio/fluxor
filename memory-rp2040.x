@@ -48,3 +48,11 @@ SECTIONS {
         __end_block_addr = .;
     } > FLASH
 } INSERT AFTER .uninit;
+
+/* Expose flash bounds to platform code so `validate_fn_addr` reads
+ * the authoritative size from the linker rather than a hardcoded
+ * constant. RP2040 flash includes the BOOT2 region — runtime
+ * validation starts from BOOT2 ORIGIN so the boot loader code is
+ * also covered. */
+PROVIDE(__flash_start__ = ORIGIN(BOOT2));
+PROVIDE(__flash_end__ = ORIGIN(FLASH) + LENGTH(FLASH));

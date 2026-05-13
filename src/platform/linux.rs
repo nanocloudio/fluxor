@@ -179,8 +179,10 @@ fn main() {
     // inserts `_tee` / `_merge` for fan groups, allocates channels, and
     // populates port tables.
     loader::reset_state_arena();
+    // Length-aware: pass the file's exact byte count so the parser can
+    // reject any section that would extend past the actual blob.
     if let Err(msg) =
-        unsafe { scheduler::populate_static_state(config_data.as_ptr(), modules_ptr as *const u8) }
+        unsafe { scheduler::populate_static_state_with_len(&config_data, modules_ptr as *const u8) }
     {
         eprintln!("error: {}", msg);
         process::exit(1);
@@ -327,29 +329,23 @@ fn main() {
     let tick_duration = Duration::from_micros(tick_us as u64);
     let mut tick: u64 = 0;
 
-    // Burst-step bound: matches the bcm2712 pump. A module returning
-    // `StepOutcome::Burst` is asking to be re-stepped immediately
-    // because it has more synchronous work to do (e.g. http's
-    // `step_send_file` consumed one MSS and has more to push). The
-    // cap defends against a runaway module that never returns
-    // anything else.
-    const MAX_BURST_STEPS: usize = 16384;
-
     loop {
         let t0 = Instant::now();
 
-        for i in 0..module_count {
-            scheduler::set_current_module(i);
-            if let Some(Ok(fluxor::modules::StepOutcome::Burst)) =
-                scheduler::step_module_outcome(i)
-            {
-                for _ in 0..MAX_BURST_STEPS {
-                    match scheduler::step_module_outcome(i) {
-                        Some(Ok(fluxor::modules::StepOutcome::Burst)) => continue,
-                        _ => break,
-                    }
-                }
-            }
+        // Use the shared scheduler stepping path — same one RP and BCM
+        // (via its per-domain wrapper) call. Centralises topological
+        // execution order, `StepOutcome::{Continue, Ready, Done, Burst}`,
+        // burst-cap enforcement, deferred-ready gating, step-period
+        // counters, fault transitions, and diagnostics. The previous
+        // Linux loop only handled `Burst` and stepped in raw index order
+        // — non-trivially divergent from the reference path.
+        //
+        let sched = unsafe { scheduler::sched_mut() };
+        let result = scheduler::step_modules(&mut sched.modules, module_count);
+
+        if matches!(result, fluxor::kernel::scheduler::StepResult::Done) {
+            log::info!("[sched] all modules complete, exiting");
+            process::exit(0);
         }
 
         tick += 1;

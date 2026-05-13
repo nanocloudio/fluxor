@@ -113,10 +113,18 @@ pub fn init(ops: &'static HalOps) {
     }
 }
 
-/// Get the HAL ops table. Panics if not initialized (boot bug).
+/// Get the HAL ops table. Boot order guarantees `init()` runs before
+/// any kernel code that touches the HAL; calling `ops()` before
+/// `init()` panics with a useful diagnostic so a misordered
+/// refactor fails loudly instead of trapping as undefined behaviour.
 #[inline(always)]
 fn ops() -> &'static HalOps {
-    unsafe { HAL_OPS.unwrap_unchecked() }
+    unsafe {
+        match HAL_OPS {
+            Some(ops) => ops,
+            None => panic!("hal::ops() called before hal::init() — boot ordering bug"),
+        }
+    }
 }
 
 // ── Interrupt control ─────────────────────────────────────────────────

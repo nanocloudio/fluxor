@@ -214,9 +214,9 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         dev_key_vault::VERIFY => {
             // VERIFY is independent of the stored key — it takes a
             // caller-supplied public key in the peer field of the argument.
-            // We accept: [hash_len:u16][sig_len:u16][pub_len:u16][pad:u16]
-            //            [hash][sig][pub]. For backward compatibility with a
-            //            simpler call (no pub embedded), fall back to ENOSYS.
+            // Layout: `[hash_len:u16][sig_len:u16][pub_len:u16][pad:u16]
+            // [hash][sig][pub]`. v1 has only this shape; shorter
+            // payloads are rejected as EINVAL.
             if arg.is_null() || arg_len < 8 {
                 return EINVAL;
             }

@@ -413,10 +413,30 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
 
 /// Maximum counts.
 ///
-/// MAX_MODULES=64 accommodates graphs like Quantum (42 modules). The event
-/// wake bitmap in `kernel/event.rs` is u64 to match.
-pub const MAX_MODULES: usize = 64;
+/// `MAX_MODULES` is re-exported from `abi::config::kernel` (per-target
+/// profile in `modules/sdk/config.rs`) so kernel-side static arrays match
+/// what the SDK promises modules. Bumping it on aarch64-host accommodates
+/// graphs like Quantum (42 modules); the wasm/embedded profiles run with
+/// 32. The event-wake bitmap in `kernel/event.rs` is u64, so any profile
+/// value up to 64 is safe; >64 needs the bitmap widened first.
+pub use crate::abi::config::kernel::MAX_MODULES;
+
+// The event-wake bitmap in `kernel/event.rs` is u64, so MAX_MODULES > 64
+// would silently lose wake notifications for the higher-numbered modules.
+// Catch any future profile bump that would violate this at compile time.
+const _: () = assert!(
+    MAX_MODULES <= 64,
+    "MAX_MODULES > 64 requires widening kernel/event.rs wake_bits beyond u64"
+);
+
 pub const MAX_GRAPH_EDGES: usize = 128;
+
+/// Hard ceiling on the on-disk config blob size. Set to 32 KiB by design —
+/// the parser refuses any larger blob, and the pointer-based entry point
+/// caps caller-supplied lengths to this value before constructing the
+/// reader slice. Bumping this number requires re-validating every
+/// platform's mapped config region and the trailer's `config_size` field.
+pub const MAX_CONFIG_SIZE: usize = 32 * 1024;
 
 /// Hardware section binary format sizes
 pub const SPI_CONFIG_BIN_SIZE: usize = 8;
@@ -576,8 +596,10 @@ pub struct GraphEdge {
     /// Binary encoding: 5 bits (0..31) in byte 2 bits [4:0] of the graph edge.
     /// See `parse_graph_edge`.
     pub buffer_group: u8,
-    /// Edge class metadata (Local, DmaOwned, CrossCore).
-    /// Encoded in bits [5:4] of byte 3. Pure metadata on single-core; no runtime cost.
+    /// Edge class metadata (Local, DmaOwned, CrossCore, NicRing).
+    /// Encoded in bits [6:5] of byte 2 of the on-wire edge record (see
+    /// `parse_graph_edge` for the full byte layout). Pure metadata on
+    /// single-core; no runtime cost.
     pub edge_class: EdgeClass,
     /// Per-edge ring-buffer size override in bytes. `0` defers to the
     /// producer/consumer module hints (`module_channel_hints`) and the
@@ -683,13 +705,62 @@ pub fn read_config_at(config_addr: u32) -> Option<Config> {
 /// Returns true if config was read successfully, false otherwise.
 /// This avoids allocating a large Config struct on the stack.
 pub fn read_config_at_into(config_addr: u32, config: &mut Config) -> bool {
-    read_config_from_ptr(config_addr as *const u8, config)
+    // Bare-metal flash-trailer path: the trailer reader already
+    // validates `config_offset + config_size <= GRAPH_SLOT_SIZE` in
+    // `read_slot_header`, so passing the parser's `MAX_CONFIG_SIZE`
+    // cap here is safe — the underlying flash region is guaranteed
+    // by the slot layout (`flash_layout::GRAPH_SLOT_SIZE` is 64 KiB
+    // on RP, well above the 32 KiB cap).
+    unsafe { read_config_from_ptr_with_len(config_addr as *const u8, MAX_CONFIG_SIZE, config) }
 }
 
-/// Read config from a memory pointer directly into provided destination.
+/// Read config from a raw pointer plus caller-supplied length. The
+/// caller (platform boot path / flash trailer reader) must pass the
+/// mapped region size; the slice is constructed with
+/// `from_raw_parts(ptr, len)`. `len = 0` is rejected; `len`
+/// exceeding `MAX_CONFIG_SIZE` is rejected outright rather than
+/// silently narrowed — a source that promises more than the parser's
+/// logical maximum is either a tooling bug or a malformed blob.
 ///
-/// Works with any memory-mapped config blob (flash on RP, embedded blob on aarch64).
-pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
+/// # Safety
+/// `flash_ptr..flash_ptr.add(len)` must be a valid, contiguous,
+/// readable memory region for the duration of the call.
+pub unsafe fn read_config_from_ptr_with_len(
+    flash_ptr: *const u8,
+    len: usize,
+    config: &mut Config,
+) -> bool {
+    if flash_ptr.is_null() || len == 0 {
+        log::error!("[config] null pointer or zero length");
+        return false;
+    }
+    if len > MAX_CONFIG_SIZE {
+        log::error!(
+            "[config] source len={} exceeds MAX_CONFIG_SIZE={}",
+            len,
+            MAX_CONFIG_SIZE
+        );
+        return false;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(flash_ptr, len) };
+    read_config_from_slice(blob, config)
+}
+
+/// Read config from a caller-provided byte slice into `config`. The slice's
+/// length is the hard upper bound: any section that would extend past
+/// `blob.len()` causes a deterministic rejection with a logged error, no
+/// silent truncation. Module / edge counts exceeding `MAX_MODULES` /
+/// `MAX_GRAPH_EDGES` are rejected, not clamped.
+pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
+    let flash_ptr = blob.as_ptr();
+    let blob_len = blob.len();
+
+    // Header must fit before we even consider parsing.
+    const HEADER_SIZE: usize = 16;
+    if blob_len < HEADER_SIZE {
+        log::error!("[config] blob too short: {} < {}", blob_len, HEADER_SIZE);
+        return false;
+    }
     // Read header (16 bytes)
     let header = unsafe {
         let magic = read_u32(flash_ptr);
@@ -729,19 +800,62 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         return false;
     }
 
-    config.module_count = header.module_count.min(MAX_MODULES as u8);
-    config.edge_count = header.edge_count.min(MAX_GRAPH_EDGES as u8);
+    // Reject oversized counts deterministically instead of clamping. A
+    // header that promises more modules/edges than the kernel can hold is
+    // either a tool-version mismatch or a malformed blob — either way the
+    // right answer is to refuse the load with a clear log line.
+    if header.module_count as usize > MAX_MODULES {
+        log::error!(
+            "[config] module_count={} exceeds MAX_MODULES={}",
+            header.module_count,
+            MAX_MODULES
+        );
+        return false;
+    }
+    if header.edge_count as usize > MAX_GRAPH_EDGES {
+        log::error!(
+            "[config] edge_count={} exceeds MAX_GRAPH_EDGES={}",
+            header.edge_count,
+            MAX_GRAPH_EDGES
+        );
+        return false;
+    }
+    config.module_count = header.module_count;
+    config.edge_count = header.edge_count;
 
     // Parse modules - variable-length entries
     let modules_base = unsafe { flash_ptr.add(16) };
 
-    // Module section header: module_count (u8), reserved (u8), section_size (u16)
+    // Module section header: module_count (u8), reserved (u8), section_size (u16).
+    // Check the header sits inside the blob before reading.
+    if blob_len < HEADER_SIZE + 4 {
+        log::error!(
+            "[config] blob too short for module section header: {} < {}",
+            blob_len,
+            HEADER_SIZE + 4
+        );
+        return false;
+    }
     let section_size = unsafe { read_u16(modules_base.add(2)) } as usize;
 
     // Validate CRC16-CCITT checksum over body (bytes 8 onwards).
     // Body = header tail (8) + module section (4+section_size) + graph (64) + hw (variable).
     // We read hw counts to compute total size.
     let body_before_hw = 8 + (4 + section_size) + GRAPH_SECTION_SIZE;
+
+    // Hardware section header (6 bytes: spi/i2c/gpio/pio/_/uart) must fit
+    // inside the blob too. `body_before_hw` is measured from `flash_ptr+8`,
+    // so the absolute offset of the hw header is `8 + body_before_hw`.
+    let hw_header_offset = 8 + body_before_hw;
+    if blob_len < hw_header_offset + 6 {
+        log::error!(
+            "[config] section_size={} pushes hw header past blob_len={} (need {})",
+            section_size,
+            blob_len,
+            hw_header_offset + 6
+        );
+        return false;
+    }
     let hw_header_ptr = unsafe { modules_base.add(4 + section_size + GRAPH_SECTION_SIZE) };
     let (spi_n, i2c_n, gpio_n, pio_n, uart_n) = unsafe {
         (
@@ -760,14 +874,23 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         + pio_n * PIO_CONFIG_BIN_SIZE;
     let body_size = body_before_hw + hw_size;
 
-    // Sanity-check total config size against flash bounds
+    // Sanity-check total config size against (a) the existing hard MAX
+    // and (b) the caller-provided slice length. The caller's length is the
+    // physical upper bound — exceeding it would read past the mapped blob.
     let total_size = 8 + body_size;
-    const MAX_CONFIG_SIZE: usize = 32 * 1024;
     if total_size > MAX_CONFIG_SIZE {
         log::error!(
             "[config] too large size={} max={}",
             total_size,
             MAX_CONFIG_SIZE
+        );
+        return false;
+    }
+    if total_size > blob_len {
+        log::error!(
+            "[config] body size={} exceeds caller blob length={}",
+            total_size,
+            blob_len
         );
         return false;
     }
@@ -795,30 +918,57 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         return false;
     }
 
-    // Parse variable-length entries
+    // Parse variable-length entries. A malformed module section
+    // (truncation, undersized entry length, out-of-bounds extent,
+    // out-of-range id, arena-alloc failure) rejects the whole config
+    // — partial graphs are never accepted.
     let mut offset = 4usize; // Skip section header
-    for _ in 0..config.module_count as usize {
-        if offset >= section_size + 4 {
-            log::warn!("[config] module section truncated");
-            break;
+    for i in 0..config.module_count as usize {
+        // Every entry's 16-bit length prefix must fit inside the
+        // declared section.
+        if offset + 2 > section_size + 4 {
+            log::error!(
+                "[config] module entry {} length prefix past section end (offset={}, section_size={})",
+                i, offset, section_size
+            );
+            return false;
         }
 
         let entry_ptr = unsafe { modules_base.add(offset) };
         let entry_len = unsafe { read_u16(entry_ptr) } as usize;
 
         if entry_len < 8 {
-            log::warn!("[config] bad entry length={}", entry_len);
-            break;
+            log::error!("[config] module entry {} bad length={}", i, entry_len);
+            return false;
         }
 
-        let entry = parse_module_entry(entry_ptr, entry_len);
-        if let Some(e) = entry {
-            if e.id < MAX_MODULES as u8 {
-                config.modules[e.id as usize] = Some(e);
-            } else {
-                log::warn!("[config] module id={} out of range", e.id);
-            }
+        // The whole entry payload must also fit inside the section.
+        if offset + entry_len > section_size + 4 {
+            log::error!(
+                "[config] module entry {} extends past section end (offset={}, entry_len={}, section_size={})",
+                i, offset, entry_len, section_size
+            );
+            return false;
         }
+
+        let entry = match parse_module_entry(entry_ptr, entry_len) {
+            Some(e) => e,
+            None => {
+                log::error!(
+                    "[config] module entry {} parse failed (arena allocation exhausted)",
+                    i
+                );
+                return false;
+            }
+        };
+        if (entry.id as usize) >= MAX_MODULES {
+            log::error!(
+                "[config] module entry {} id={} out of range (MAX_MODULES={})",
+                i, entry.id, MAX_MODULES
+            );
+            return false;
+        }
+        config.modules[entry.id as usize] = Some(entry);
 
         offset += entry_len;
     }
@@ -845,9 +995,17 @@ pub fn read_config_from_ptr(flash_ptr: *const u8, config: &mut Config) -> bool {
         }
     }
 
-    // Hardware section starts after graph section (80 bytes)
+    // Hardware section starts after graph section (80 bytes). Any
+    // oversized hardware count (spi/i2c/gpio/pio/uart) causes the
+    // whole config to be rejected rather than silently truncating.
     let hw_base = unsafe { section_base.add(GRAPH_SECTION_SIZE) };
-    config.hardware = parse_hardware_section(hw_base);
+    config.hardware = match parse_hardware_section(hw_base) {
+        Some(hw) => hw,
+        None => {
+            log::error!("[config] hardware section rejected (oversized counts)");
+            return false;
+        }
+    };
 
     true
 }
@@ -924,12 +1082,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
         let port_byte = *ptr.add(3);
         let from_port_index = (port_byte >> 4) & 0x0F;
         let to_port_index = port_byte & 0x0F;
-        let buffer_bytes = u32::from_le_bytes([
-            *ptr.add(4),
-            *ptr.add(5),
-            *ptr.add(6),
-            *ptr.add(7),
-        ]);
+        let buffer_bytes = u32::from_le_bytes([*ptr.add(4), *ptr.add(5), *ptr.add(6), *ptr.add(7)]);
         let edge_class = match edge_class_raw {
             1 => EdgeClass::DmaOwned,
             2 => EdgeClass::CrossCore,
@@ -973,16 +1126,68 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
 ///           - pio_idx (u8), data_pin (u8), clk_pin (u8), extra_pin (u8)
 ///           - extra_pin: 0xFF = unused
 /// ```
-fn parse_hardware_section(ptr: *const u8) -> HardwareConfig {
+/// Hardware-count fields are rejected, not clamped: any `*_count`
+/// value exceeding the corresponding `MAX_*` constant returns `None`
+/// so the enclosing parser fails the whole graph. Silent truncation
+/// would let a config asking for 10 SPI buses on a 2-bus platform
+/// parse 2 and drop the other 8 without surfacing the mismatch.
+fn parse_hardware_section(ptr: *const u8) -> Option<HardwareConfig> {
     let mut hw = HardwareConfig::default();
 
     unsafe {
-        let spi_count = (*ptr).min(MAX_SPI_BUSES as u8) as usize;
-        let i2c_count = (*ptr.add(1)).min(MAX_I2C_BUSES as u8) as usize;
-        let gpio_count = (*ptr.add(2)).min(MAX_GPIO_CONFIGS as u8) as usize;
-        let pio_count = (*ptr.add(3)).min(MAX_PIO_CONFIGS as u8) as usize;
+        let spi_count_raw = *ptr;
+        let i2c_count_raw = *ptr.add(1);
+        let gpio_count_raw = *ptr.add(2);
+        let pio_count_raw = *ptr.add(3);
         let max_gpio = *ptr.add(4);
-        let uart_count = (*ptr.add(5)).min(MAX_UART_BUSES as u8) as usize;
+        let uart_count_raw = *ptr.add(5);
+
+        if spi_count_raw as usize > MAX_SPI_BUSES {
+            log::error!(
+                "[config] spi_count={} exceeds MAX_SPI_BUSES={}",
+                spi_count_raw,
+                MAX_SPI_BUSES
+            );
+            return None;
+        }
+        if i2c_count_raw as usize > MAX_I2C_BUSES {
+            log::error!(
+                "[config] i2c_count={} exceeds MAX_I2C_BUSES={}",
+                i2c_count_raw,
+                MAX_I2C_BUSES
+            );
+            return None;
+        }
+        if gpio_count_raw as usize > MAX_GPIO_CONFIGS {
+            log::error!(
+                "[config] gpio_count={} exceeds MAX_GPIO_CONFIGS={}",
+                gpio_count_raw,
+                MAX_GPIO_CONFIGS
+            );
+            return None;
+        }
+        if pio_count_raw as usize > MAX_PIO_CONFIGS {
+            log::error!(
+                "[config] pio_count={} exceeds MAX_PIO_CONFIGS={}",
+                pio_count_raw,
+                MAX_PIO_CONFIGS
+            );
+            return None;
+        }
+        if uart_count_raw as usize > MAX_UART_BUSES {
+            log::error!(
+                "[config] uart_count={} exceeds MAX_UART_BUSES={}",
+                uart_count_raw,
+                MAX_UART_BUSES
+            );
+            return None;
+        }
+
+        let spi_count = spi_count_raw as usize;
+        let i2c_count = i2c_count_raw as usize;
+        let gpio_count = gpio_count_raw as usize;
+        let pio_count = pio_count_raw as usize;
+        let uart_count = uart_count_raw as usize;
         if max_gpio > 0 {
             hw.max_gpio = max_gpio;
         }
@@ -1077,7 +1282,7 @@ fn parse_hardware_section(ptr: *const u8) -> HardwareConfig {
         }
     }
 
-    hw
+    Some(hw)
 }
 
 // ============================================================================
@@ -1118,134 +1323,3 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
     crc
 }
 
-// ============================================================================
-// Hardware Manager
-// ============================================================================
-
-/// Default SPI configuration (Pico 2 W SD card pins)
-const DEFAULT_SPI: SpiConfig = SpiConfig {
-    bus: 0,
-    miso: 16,
-    mosi: 19,
-    sck: 18,
-    freq_hz: 400_000,
-};
-
-/// Default I2C configuration (Pico 2 W: I2C0 on GPIO 20/21)
-const DEFAULT_I2C: I2cConfig = I2cConfig {
-    bus: 0,
-    sda: 20,
-    scl: 21,
-    freq_hz: 400_000,
-};
-
-/// Default PIO cmd configuration (Pico 2 W: PIO1, cyw43 gSPI DIO=24, CLK=29)
-const DEFAULT_PIO_CMD: PioConfig = PioConfig {
-    pio_idx: 1,
-    data_pin: 24,
-    clk_pin: 29,
-    extra_pin: 0xFF,
-};
-
-/// Default PIO stream configuration (Pico 2 W: PIO0, I2S data=28, bclk=26, lrclk=27)
-const DEFAULT_PIO_STREAM: PioConfig = PioConfig {
-    pio_idx: 0,
-    data_pin: 28,
-    clk_pin: 26,
-    extra_pin: 27,
-};
-
-/// Hardware manager - reads config and provides initialization helpers
-pub struct Hardware {
-    config: HardwareConfig,
-}
-
-impl Hardware {
-    /// Create hardware manager, reading config from flash or using defaults
-    pub fn new() -> Self {
-        let config = match read_config() {
-            Some(c) => {
-                let mut hw = c.hardware.clone();
-                if hw.spi[0].is_none() && hw.spi[1].is_none() {
-                    hw.spi[0] = Some(DEFAULT_SPI);
-                }
-                hw
-            }
-            None => {
-                // No config blob — bare firmware boot (Pico 2 W defaults)
-                let mut hw = HardwareConfig::new();
-                hw.spi[0] = Some(DEFAULT_SPI);
-                hw.pio[0] = Some(DEFAULT_PIO_CMD);
-                hw.pio[1] = Some(DEFAULT_PIO_STREAM);
-                hw
-            }
-        };
-        Self { config }
-    }
-
-    /// Get SPI configuration
-    pub fn spi(&self) -> SpiConfig {
-        self.config.spi[0]
-            .or(self.config.spi[1])
-            .unwrap_or(DEFAULT_SPI)
-    }
-
-    /// Get SPI bus number
-    pub fn spi_bus(&self) -> u8 {
-        self.spi().bus
-    }
-
-    /// Get CS pin number (first output GPIO)
-    pub fn cs_pin(&self) -> u8 {
-        self.config
-            .gpio
-            .iter()
-            .flatten()
-            .find(|g| g.direction == GpioDirection::Output)
-            .map(|g| g.pin)
-            .unwrap_or(17)
-    }
-
-    /// Get I2C configuration (first configured bus or default)
-    pub fn i2c(&self) -> I2cConfig {
-        self.config.i2c[0]
-            .or(self.config.i2c[1])
-            .unwrap_or(DEFAULT_I2C)
-    }
-
-    /// Get PIO cmd configuration (slot 0: bidirectional gSPI for cyw43)
-    pub fn pio_cmd(&self) -> PioConfig {
-        self.config.pio[0].unwrap_or(DEFAULT_PIO_CMD)
-    }
-
-    /// Get PIO stream configuration (slot 1: I2S output)
-    pub fn pio_stream(&self) -> PioConfig {
-        self.config.pio[1].unwrap_or(DEFAULT_PIO_STREAM)
-    }
-
-    /// Get GPIO config for a specific pin
-    pub fn gpio(&self, pin: u8) -> Option<&GpioConfig> {
-        self.config.gpio.iter().flatten().find(|g| g.pin == pin)
-    }
-
-    /// Get raw GPIO configs
-    pub fn gpio_configs(&self) -> &[Option<GpioConfig>; MAX_GPIO_CONFIGS] {
-        &self.config.gpio
-    }
-
-    /// Get raw hardware config for the planner
-    pub fn raw_config(&self) -> &HardwareConfig {
-        &self.config
-    }
-
-    /// Initialize all GPIO pins from config
-    pub fn init_gpio(&self) -> usize {
-        (crate::kernel::hal::init_gpio)(&self.config.gpio)
-    }
-}
-
-impl Default for Hardware {
-    fn default() -> Self {
-        Self::new()
-    }
-}

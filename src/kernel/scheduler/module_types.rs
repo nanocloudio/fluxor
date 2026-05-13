@@ -62,8 +62,7 @@ const FAN_BUF_SIZE: usize = 2048;
     not(feature = "chip-rp2350b"),
 ))]
 const FAN_BUF_SIZE: usize = 8192;
-static mut FAN_BUFS: [[u8; FAN_BUF_SIZE]; MAX_DOMAINS] =
-    [[0u8; FAN_BUF_SIZE]; MAX_DOMAINS];
+static mut FAN_BUFS: [[u8; FAN_BUF_SIZE]; MAX_DOMAINS] = [[0u8; FAN_BUF_SIZE]; MAX_DOMAINS];
 
 // ============================================================================
 // ModuleSlot
@@ -272,9 +271,8 @@ impl Module for TeeModule {
             return Ok(StepOutcome::Continue);
         }
 
-        let read = unsafe {
-            channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), read_amount)
-        };
+        let read =
+            unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), read_amount) };
         if read <= 0 {
             return Ok(StepOutcome::Continue);
         }
@@ -317,9 +315,7 @@ impl TeeModule {
         // consume yet, so a backpressured output doesn't strand the
         // header in our scratch.
         let mut hdr = [0u8; 3];
-        let peeked = unsafe {
-            channel::channel_peek(self.in_chan, hdr.as_mut_ptr(), hdr_len)
-        };
+        let peeked = unsafe { channel::channel_peek(self.in_chan, hdr.as_mut_ptr(), hdr_len) };
         if peeked != hdr_len as i32 {
             return Err(-3);
         }
@@ -357,16 +353,13 @@ impl TeeModule {
             }
         }
 
-        let read = unsafe {
-            channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), total)
-        };
+        let read = unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), total) };
         if read != total as i32 {
             return Err(-5);
         }
         for idx in 0..self.out_count {
-            let wrote = unsafe {
-                channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), total)
-            };
+            let wrote =
+                unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), total) };
             if wrote != total as i32 {
                 return Err(-2);
             }
@@ -477,9 +470,8 @@ impl Module for MergeModule {
                 continue;
             }
 
-            let read = unsafe {
-                channel::syscall_channel_read(chan, buf.as_mut_ptr(), read_amount)
-            };
+            let read =
+                unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), read_amount) };
             if read <= 0 {
                 continue;
             }
@@ -529,9 +521,7 @@ impl MergeModule {
             }
 
             let mut hdr = [0u8; 3];
-            let peeked = unsafe {
-                channel::channel_peek(chan, hdr.as_mut_ptr(), hdr_len)
-            };
+            let peeked = unsafe { channel::channel_peek(chan, hdr.as_mut_ptr(), hdr_len) };
             if peeked != hdr_len as i32 {
                 return Err(-3);
             }
@@ -550,15 +540,12 @@ impl MergeModule {
                 continue;
             }
 
-            let read = unsafe {
-                channel::syscall_channel_read(chan, buf.as_mut_ptr(), total)
-            };
+            let read = unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), total) };
             if read != total as i32 {
                 return Err(-5);
             }
-            let wrote = unsafe {
-                channel::syscall_channel_write(self.out_chan, buf.as_ptr(), total)
-            };
+            let wrote =
+                unsafe { channel::syscall_channel_write(self.out_chan, buf.as_ptr(), total) };
             if wrote != total as i32 {
                 return Err(-2);
             }

@@ -175,5 +175,8 @@ wiring: []
     // Code starts at offset 72 (FXMD header size). Verify it begins
     // with the wasm magic.
     let code = &fmod[72..76];
-    assert_eq!(code, b"\0asm", "module code section doesn't start with wasm magic");
+    assert_eq!(
+        code, b"\0asm",
+        "module code section doesn't start with wasm magic"
+    );
 }

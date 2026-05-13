@@ -444,7 +444,7 @@ Each device has a trust root — an Ed25519 public key surfaced through
   `FLUXOR_SIGNING_PUBKEY_HEX` build environment variable; production
   deployments swap this for an on-silicon OTP bank.
 
-Each PIC module carries a v2 manifest with a 64-byte Ed25519 signature
+Each PIC module carries a signed manifest with a 64-byte Ed25519 signature
 over its SHA-256 integrity hash plus a 32-byte signer fingerprint. The
 loader recomputes the hash at admission, verifies the signature
 against the provisioned pubkey, and — with `enforce_signatures` set —

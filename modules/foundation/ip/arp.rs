@@ -113,8 +113,13 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
             let entry = &*table.as_ptr().add(i);
             if !entry.valid {
                 *table.as_mut_ptr().add(i) = ArpEntry {
-                    ip, mac, valid: true, age: 0,
-                    pinned: false, pin_count: 0, last_update: step_count,
+                    ip,
+                    mac,
+                    valid: true,
+                    age: 0,
+                    pinned: false,
+                    pin_count: 0,
+                    last_update: step_count,
                 };
                 return;
             }
@@ -135,8 +140,13 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
         }
         if oldest_idx < ARP_TABLE_SIZE {
             *table.as_mut_ptr().add(oldest_idx) = ArpEntry {
-                ip, mac, valid: true, age: 0,
-                pinned: false, pin_count: 0, last_update: step_count,
+                ip,
+                mac,
+                valid: true,
+                age: 0,
+                pinned: false,
+                pin_count: 0,
+                last_update: step_count,
             };
         }
         // If all entries are pinned, drop the new entry (defence: don't evict pinned)
@@ -253,14 +263,12 @@ pub unsafe fn parse_arp(data: *const u8, len: usize) -> Option<(u16, u32, [u8; 6
     }
 
     // Sender protocol address (IP) at offset 14
-    let sender_ip = u32::from_be_bytes([
-        *data.add(14), *data.add(15), *data.add(16), *data.add(17),
-    ]);
+    let sender_ip =
+        u32::from_be_bytes([*data.add(14), *data.add(15), *data.add(16), *data.add(17)]);
 
     // Target protocol address (IP) at offset 24
-    let target_ip = u32::from_be_bytes([
-        *data.add(24), *data.add(25), *data.add(26), *data.add(27),
-    ]);
+    let target_ip =
+        u32::from_be_bytes([*data.add(24), *data.add(25), *data.add(26), *data.add(27)]);
 
     Some((opcode, sender_ip, sender_mac, target_ip))
 }
@@ -279,7 +287,11 @@ pub unsafe fn build_arp(
     dst_ip: u32,
 ) -> usize {
     // Ethernet header
-    let eth_dst = if opcode == ARP_REQUEST { &eth::BROADCAST_MAC } else { dst_mac };
+    let eth_dst = if opcode == ARP_REQUEST {
+        &eth::BROADCAST_MAC
+    } else {
+        dst_mac
+    };
     eth::build_eth_header(buf, eth_dst, src_mac, eth::ETHERTYPE_ARP);
 
     let p = buf.add(eth::ETH_HEADER_LEN);
@@ -304,7 +316,10 @@ pub unsafe fn build_arp(
     // Sender hardware address
     let mut i = 0;
     while i < 6 {
-        write_volatile(p.add(8 + i), core::ptr::read_volatile(src_mac.as_ptr().add(i)));
+        write_volatile(
+            p.add(8 + i),
+            core::ptr::read_volatile(src_mac.as_ptr().add(i)),
+        );
         i += 1;
     }
 
@@ -318,7 +333,10 @@ pub unsafe fn build_arp(
     // Target hardware address
     i = 0;
     while i < 6 {
-        write_volatile(p.add(18 + i), core::ptr::read_volatile(dst_mac.as_ptr().add(i)));
+        write_volatile(
+            p.add(18 + i),
+            core::ptr::read_volatile(dst_mac.as_ptr().add(i)),
+        );
         i += 1;
     }
 

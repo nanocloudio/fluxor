@@ -110,9 +110,7 @@ fn attach(invocation: &Value) -> Result<(), u8> {
 
     emit(&json!({"kind": "ready"}));
     match &client_ip {
-        Some(ip) => eprintln!(
-            "telemetry-monitor_udp: bound udp://{bind_spec}, filter src={ip}"
-        ),
+        Some(ip) => eprintln!("telemetry-monitor_udp: bound udp://{bind_spec}, filter src={ip}"),
         None => eprintln!("telemetry-monitor_udp: bound udp://{bind_spec}"),
     }
 

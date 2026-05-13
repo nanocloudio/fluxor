@@ -82,8 +82,14 @@ pub fn qpack_static_lookup(idx: u32) -> Option<(&'static [u8], &'static [u8])> {
         54 => (b"content-type", b"text/plain;charset=utf-8"),
         55 => (b"range", b"bytes=0-"),
         56 => (b"strict-transport-security", b"max-age=31536000"),
-        57 => (b"strict-transport-security", b"max-age=31536000; includesubdomains"),
-        58 => (b"strict-transport-security", b"max-age=31536000; includesubdomains; preload"),
+        57 => (
+            b"strict-transport-security",
+            b"max-age=31536000; includesubdomains",
+        ),
+        58 => (
+            b"strict-transport-security",
+            b"max-age=31536000; includesubdomains; preload",
+        ),
         59 => (b"vary", b"accept-encoding"),
         60 => (b"vary", b"origin"),
         61 => (b"x-content-type-options", b"nosniff"),
@@ -110,7 +116,10 @@ pub fn qpack_static_lookup(idx: u32) -> Option<(&'static [u8], &'static [u8])> {
         82 => (b"access-control-request-method", b"post"),
         83 => (b"alt-svc", b"clear"),
         84 => (b"authorization", b""),
-        85 => (b"content-security-policy", b"script-src 'none'; object-src 'none'; base-uri 'none'"),
+        85 => (
+            b"content-security-policy",
+            b"script-src 'none'; object-src 'none'; base-uri 'none'",
+        ),
         86 => (b"early-data", b"1"),
         87 => (b"expect-ct", b""),
         88 => (b"forwarded", b""),
@@ -301,11 +310,7 @@ pub fn qpack_encode_field(name: &[u8], value: &[u8], out: &mut [u8]) -> usize {
             return 0;
         }
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                value.as_ptr(),
-                out.as_mut_ptr().add(pos),
-                value.len(),
-            );
+            core::ptr::copy_nonoverlapping(value.as_ptr(), out.as_mut_ptr().add(pos), value.len());
         }
         pos += value.len();
         return pos;
@@ -320,11 +325,7 @@ pub fn qpack_encode_field(name: &[u8], value: &[u8], out: &mut [u8]) -> usize {
         return 0;
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            out.as_mut_ptr().add(pos),
-            name.len(),
-        );
+        core::ptr::copy_nonoverlapping(name.as_ptr(), out.as_mut_ptr().add(pos), name.len());
     }
     pos += name.len();
     let n = qpack_encode_int(value.len() as u64, 7, 0x00, &mut out[pos..]);
@@ -336,11 +337,7 @@ pub fn qpack_encode_field(name: &[u8], value: &[u8], out: &mut [u8]) -> usize {
         return 0;
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            value.as_ptr(),
-            out.as_mut_ptr().add(pos),
-            value.len(),
-        );
+        core::ptr::copy_nonoverlapping(value.as_ptr(), out.as_mut_ptr().add(pos), value.len());
     }
     pos + value.len()
 }
@@ -386,9 +383,7 @@ pub fn qpack_decode_block_prefix(block: &[u8]) -> Option<usize> {
 /// representations covered: Indexed (static), Literal With Name Ref
 /// (static), Literal Without Name Ref. Anything dynamic-table-bound
 /// returns None.
-pub fn qpack_decode_field<'a>(
-    block: &'a [u8],
-) -> Option<(QpackName<'a>, QpackValue<'a>, usize)> {
+pub fn qpack_decode_field<'a>(block: &'a [u8]) -> Option<(QpackName<'a>, QpackValue<'a>, usize)> {
     if block.is_empty() {
         return None;
     }

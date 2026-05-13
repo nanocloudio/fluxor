@@ -61,7 +61,7 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use portable_atomic::{AtomicBool, AtomicI8, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicI16, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 use crate::kernel::buffer_pool::{self, BUFFER_SIZE};
 use crate::kernel::config::MAX_GRAPH_EDGES;
@@ -75,6 +75,18 @@ use log::{debug, trace};
 
 /// Maximum channels matches max graph edges to support fan-in/out expansion
 pub const MAX_CHANNELS: usize = MAX_GRAPH_EDGES;
+
+// Channel ids are stored in `i16`-typed fields (notably
+// `BufferRegistrySlot.owner_channel`) with `-1` reserved as the
+// no-owner sentinel; the valid range is `[0, i16::MAX]`. Widening
+// `MAX_CHANNELS` past this requires widening the owner-channel
+// storage; the assert below fails the build if that invariant is
+// broken.
+const _: () = assert!(
+    MAX_CHANNELS <= i16::MAX as usize + 1,
+    "MAX_CHANNELS exceeds i16 sentinel-aware range; widen ChannelSlot.buffer_slot \
+     and BufferRegistrySlot.owner_channel storage before increasing this limit"
+);
 
 /// Pipe channel type (FIFO buffer) - the only channel type
 pub const CHANNEL_TYPE_PIPE: u8 = 3;
@@ -170,8 +182,10 @@ struct ChannelSlot {
     /// Auxiliary u32 value (module-defined: seek position, file index, etc.)
     /// NO_AUX_PENDING if none pending.
     aux_u32: AtomicU32,
-    /// Index into buffer registry (-1 if no buffer allocated)
-    buffer_slot: AtomicI8,
+    /// Index into buffer registry (-1 if no buffer allocated). Stored
+    /// as `i16` so all `MAX_BUFFER_SLOTS = 256` registry slots fit
+    /// without silent wrap to negative.
+    buffer_slot: AtomicI16,
     /// FIFO state for circular buffer operations
     fifo: UnsafeCell<FifoState>,
     /// Optional module-registered ioctl handler. When non-null, any
@@ -183,6 +197,14 @@ struct ChannelSlot {
     /// Opaque module state pointer passed as the first argument to
     /// `ioctl_handler`. See `channel_register_ioctl_handler`.
     ioctl_state: AtomicPtr<()>,
+    /// Module index that registered the current `ioctl_handler`, or
+    /// `u8::MAX` if no handler is set. Recorded at registration so the
+    /// kernel can clear the handler on
+    /// `release_module_handlers(module_idx)` — without per-slot owner
+    /// tracking, a module's function and state pointers would survive
+    /// module unload / restart / finalisation and point into freed
+    /// memory.
+    ioctl_owner: AtomicU8,
 }
 
 unsafe impl Sync for ChannelSlot {}
@@ -197,10 +219,11 @@ impl ChannelSlot {
             hup_flag: AtomicBool::new(false),
             mailbox: AtomicBool::new(false),
             aux_u32: AtomicU32::new(NO_AUX_PENDING),
-            buffer_slot: AtomicI8::new(-1),
+            buffer_slot: AtomicI16::new(-1),
             fifo: UnsafeCell::new(FifoState::new()),
             ioctl_handler: AtomicPtr::new(core::ptr::null_mut()),
             ioctl_state: AtomicPtr::new(core::ptr::null_mut()),
+            ioctl_owner: AtomicU8::new(u8::MAX),
         }
     }
 
@@ -217,14 +240,14 @@ impl ChannelSlot {
         {
             // Allocate an arena-backed buffer of the requested size
             let buf_slot =
-                buffer_pool::alloc_streaming_for_module(idx as i8, buf_capacity, producer_module);
+                buffer_pool::alloc_streaming_for_module(idx as i16, buf_capacity, producer_module);
             if buf_slot < 0 {
                 // No buffer available, rollback
                 self.state
                     .store(ChannelState::Free as u8, Ordering::Release);
                 return false;
             }
-            self.buffer_slot.store(buf_slot as i8, Ordering::Release);
+            self.buffer_slot.store(buf_slot as i16, Ordering::Release);
             self.chan_type.store(CHANNEL_TYPE_PIPE, Ordering::Release);
             self.sticky_events.store(0, Ordering::Release);
             // Initialize FIFO with the allocated capacity
@@ -252,6 +275,7 @@ impl ChannelSlot {
         self.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
         self.ioctl_handler
             .store(core::ptr::null_mut(), Ordering::Release);
+        self.ioctl_owner.store(u8::MAX, Ordering::Release);
         self.ioctl_state
             .store(core::ptr::null_mut(), Ordering::Release);
         unsafe {
@@ -327,28 +351,40 @@ pub fn channel_open_for_module(
     if chan_type != CHANNEL_TYPE_PIPE {
         return CHAN_EINVAL;
     }
-    // Requested size comes as a little-endian integer in `config`: 4 bytes
-    // (u32) for the modern path, falling back to 2 bytes (u16) for legacy
-    // callers. Round up to a power of two so the ring buffer can wrap with
-    // a bitwise AND instead of modulo. The 256 KiB ceiling sizes a full
-    // RGB565 spectrum frame (98,304 B) plus headroom while still leaving
-    // room for ~4 max-size channels in the 1 MiB arena.
+    // The v1 channel-open request shape is exactly:
+    //   * `config = NULL && config_len == 0` → caller wants the
+    //     default capacity (`BUFFER_SIZE`).
+    //   * `config != NULL && config_len == 4` → the 4 bytes are a
+    //     little-endian `u32` carrying the desired ring capacity in
+    //     bytes. The capacity must already be within
+    //     `[MIN_CHAN_BYTES, MAX_CHAN_BYTES]` and a power of two —
+    //     anything else is rejected with `CHAN_EINVAL`.
+    //
+    // Every other shape (non-null pointer with the wrong length, null
+    // pointer with non-zero length, capacity outside the range, non-
+    // power-of-two capacity) is a wiring bug and gets a deterministic
+    // rejection.
+    const MIN_CHAN_BYTES: usize = 64;
     const MAX_CHAN_BYTES: usize = 256 * 1024;
-    let buf_capacity = if !config.is_null() && config_len >= 4 {
+    let buf_capacity = if config.is_null() {
+        if config_len != 0 {
+            return CHAN_EINVAL;
+        }
+        BUFFER_SIZE
+    } else {
+        if config_len != 4 {
+            return CHAN_EINVAL;
+        }
         let size = unsafe {
             u32::from_le_bytes([*config, *config.add(1), *config.add(2), *config.add(3)]) as usize
         };
-        size.clamp(64, MAX_CHAN_BYTES).next_power_of_two()
-    } else if !config.is_null() && config_len >= 2 {
-        let size = unsafe { u16::from_le_bytes([*config, *config.add(1)]) as usize };
-        size.clamp(64, MAX_CHAN_BYTES).next_power_of_two()
-    } else {
-        // No-hint channels share `BUFFER_SIZE`; raising the default
-        // would consume the global arena and cap the channel count
-        // (wasm only has 2 MiB to spend). Bandwidth-hungry edges
-        // (raster fan-out, etc.) must declare a per-edge size hint
-        // through the 4-byte config path above.
-        BUFFER_SIZE
+        if !(MIN_CHAN_BYTES..=MAX_CHAN_BYTES).contains(&size) {
+            return CHAN_EINVAL;
+        }
+        if !size.is_power_of_two() {
+            return CHAN_EINVAL;
+        }
+        size
     };
 
     for (idx, slot) in CHANNELS.iter().enumerate() {
@@ -374,6 +410,97 @@ pub fn channel_close(handle: i32) {
         return;
     }
     CHANNELS[idx].reset();
+}
+
+/// Snapshot of channel slot table usage. Used by diagnostics and
+/// harness tests that need to assert slot-table state without
+/// reaching into the private `CHANNELS` static.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelStats {
+    /// Slots in `ChannelState::Free` — available for `channel_open`.
+    pub free: usize,
+    /// Slots in `ChannelState::Allocated` — claimed but not yet bound
+    /// to a producer/consumer pair (transient state during graph setup).
+    pub allocated: usize,
+    /// Slots in `ChannelState::Connected` — actively wired in the graph.
+    pub connected: usize,
+    /// Total slots in the channel table.
+    pub capacity: usize,
+}
+
+/// Return current occupancy of the channel slot table. Snapshots are
+/// non-atomic — under concurrent load the sum of `free + allocated +
+/// connected` equals `capacity` only at quiescent moments. Intended
+/// for diagnostics, not for steady-state correctness reasoning.
+pub fn stats() -> ChannelStats {
+    let mut free = 0usize;
+    let mut allocated = 0usize;
+    let mut connected = 0usize;
+    for slot in CHANNELS.iter() {
+        let s = slot.state.load(Ordering::Acquire);
+        if s == ChannelState::Free as u8 {
+            free += 1;
+        } else if s == ChannelState::Allocated as u8 {
+            allocated += 1;
+        } else if s == ChannelState::Connected as u8 {
+            connected += 1;
+        }
+    }
+    ChannelStats {
+        free,
+        allocated,
+        connected,
+        capacity: MAX_CHANNELS,
+    }
+}
+
+/// Close every channel slot. Used at graph-reconfigure boundaries so a
+/// previous graph's slot claims don't accumulate across calls to
+/// `scheduler::prepare_graph` — without this, repeated reconfigures
+/// would gradually exhaust `MAX_CHANNELS` even when each individual
+/// graph fits well within the slot budget.
+///
+/// **DMA-owned edge contract**: callers must ensure any device with
+/// outstanding DMA against a streaming buffer attached to a channel
+/// has been quiesced (descriptors retired, device idle) before
+/// invoking `reset_all`. The kernel does not issue `DMA_INVALIDATE`
+/// on the buffer memory here — the streaming arena's bump allocator
+/// may reuse the underlying pages for the next graph immediately,
+/// and a still-active device would corrupt the new occupant.
+/// Platforms whose drivers hold DMA descriptors (NIC RX rings, NVMe
+/// submission queues, PIO DMA streams) are responsible for tearing
+/// the device down via their module's `module_drain` /
+/// `module_state_export` exports before the kernel reaches this
+/// point. See `.context/rfc_graph_reconfigure.md` for the
+/// operator-visible drain flow.
+pub fn reset_all() {
+    for slot in CHANNELS.iter() {
+        slot.reset();
+    }
+}
+
+/// Clear every ioctl handler whose `ioctl_owner` matches `module_idx`.
+///
+/// Called from `syscalls::release_module_handles(module_idx)` on
+/// module unload, finalisation, or restart so a module's
+/// `module_drain` / `module_state_export` exit cannot leave function
+/// and state pointers in the channel table pointing at memory the
+/// loader has reclaimed.
+///
+/// Only the handler triple (`ioctl_handler`, `ioctl_state`,
+/// `ioctl_owner`) is reset; the slot's `chan_type` and lifecycle
+/// state are left intact. Full slot teardown happens later through
+/// `reset_all` on graph rebuild.
+pub fn release_module_handlers(module_idx: u8) {
+    for slot in CHANNELS.iter() {
+        if slot.ioctl_owner.load(Ordering::Acquire) == module_idx {
+            slot.ioctl_handler
+                .store(core::ptr::null_mut(), Ordering::Release);
+            slot.ioctl_state
+                .store(core::ptr::null_mut(), Ordering::Release);
+            slot.ioctl_owner.store(u8::MAX, Ordering::Release);
+        }
+    }
 }
 
 /// # Safety
@@ -721,6 +848,22 @@ pub fn channel_register_ioctl_handler(
     // handler first (Acquire) — if it sees non-null, `ioctl_state`
     // must already be visible.
     slot.ioctl_state.store(state as *mut (), Ordering::Release);
+    // Record the current module as the owner so
+    // `release_module_handlers(module_idx)` can clear stale handlers
+    // when the module is finalised / restarted / torn down. Cleared
+    // on `handler == None` so a module can voluntarily unregister
+    // without taking ownership of an empty slot.
+    if handler.is_some() {
+        let owner = crate::kernel::scheduler::current_module_index();
+        let owner_u8 = if owner < u8::MAX as usize {
+            owner as u8
+        } else {
+            u8::MAX
+        };
+        slot.ioctl_owner.store(owner_u8, Ordering::Release);
+    } else {
+        slot.ioctl_owner.store(u8::MAX, Ordering::Release);
+    }
     match handler {
         Some(h) => slot.ioctl_handler.store(h as *mut (), Ordering::Release),
         None => slot

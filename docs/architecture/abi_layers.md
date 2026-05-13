@@ -131,9 +131,10 @@ in [`src/platform/rp/providers.rs`](../../src/platform/rp/providers.rs))
 so a raw channel number passed to an fd op — or vice versa — returns
 `EINVAL` at the kernel boundary, not an opaque failure downstream.
 
-`required_caps` is a u32 bitmask (ABI v3), so both bits 8 and 17 are
-expressible in the manifest bitmask — neither contract is
-infra-implicit and neither relies on a special-case fallback.
+`required_caps` is a u32 bitmask in the module header at bytes 6..10,
+so both bits 8 and 17 are expressible in the manifest bitmask —
+neither contract is infra-implicit and neither relies on a
+special-case fallback.
 
 ## Internal orchestration — `internal` layer
 
@@ -263,6 +264,47 @@ backend the binary doesn't provide. Currently checked:
 
 The error message names the exact `cargo build` invocation that adds
 the missing feature.
+
+## Capacity profiles — `abi::config`
+
+Cross-cutting capacity tunables live in
+[`modules/sdk/config.rs`](../../modules/sdk/config.rs), re-exported
+through `abi::config::*` so the kernel and every PIC module read from
+one source. The file is organised as three `profile_*` modules, exactly
+one of which is selected at compile time via `cfg(target_arch)`:
+
+| Profile | Selected for | Sample sizes |
+|---|---|---|
+| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `STATE_ARENA = 32 MiB`, `BUFFER_ARENA = 8 MiB`, `MAX_MODULES = 64`, http `MAX_CONCURRENT_CONNS = 256` |
+| `profile_wasm` | `target_arch = "wasm32"` | `STATE_ARENA = 32 MiB`, `BUFFER_ARENA = 2 MiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 32` |
+| `profile_embedded` | anything else (`thumbv*`) | `STATE_ARENA = 256 KiB`, `BUFFER_ARENA = 64 KiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 1` |
+
+This is *not* a YAML overlay or a TOML-driven build artefact — it is a
+Rust file the SDK compiles into both the kernel and every module.
+`src/platform/{linux,wasm,bcm2712}/chip.rs` are thin `pub use` shims
+that re-export these constants under the platform's `super::chip::*`
+path so older import sites compile unchanged.
+
+The previous TOML-based per-target `[kernel]` sections in
+`targets/silicon/{linux,bcm2712,wasm}.toml` were stale (a 128× drift
+versus the compiled profile values on BCM/Linux); those sections have
+been removed and replaced with comments pointing here. Only RP-family
+chips still take chip constants from `targets/silicon/rp2*.toml` —
+build.rs reads the `[kernel]` section and emits `chip_generated.rs`,
+which `src/platform/rp/chip.rs` `include!`s.
+
+Cross-subsystem invariants are enforced at compile time at the bottom of
+[`modules/sdk/config.rs`](../../modules/sdk/config.rs), e.g.
+`http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS`. Adding a tunable
+means adding it to every `profile_*` module; the `pub use ...::*`
+re-export is wildcarded so no extra plumbing is required at the call
+site.
+
+`src/kernel/config.rs::MAX_MODULES` is a `pub use` re-export of
+`abi::config::kernel::MAX_MODULES`, so the kernel's static module-slot
+arrays match what the SDK promises. A compile-time `const _: () =
+assert!(MAX_MODULES <= 64, …)` catches future bumps that would outgrow
+the `u64` event-wake bitmap in `kernel/event.rs`.
 
 ## Platform layer — not public
 

@@ -27,19 +27,19 @@
 //!   module wrapping the cleartext channel.
 
 use super::client::{
-    Phase as H1Phase, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED,
-    RECV_BUF_SIZE, REQUEST_BUF_SIZE,
+    Phase as H1Phase, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
+    REQUEST_BUF_SIZE,
 };
 use super::connection::{
-    NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED,
-    NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
+    NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
+    NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::wire_h2 as h2w;
 use super::wire_ws as ws;
 use super::HttpState;
 use super::{
-    dev_csprng_fill, dev_log, dev_millis, net_read_frame, net_write_frame, E_AGAIN,
-    NET_FRAME_HDR, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    dev_csprng_fill, dev_log, dev_millis, net_read_frame, net_write_frame, E_AGAIN, NET_FRAME_HDR,
+    POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
 };
 
 const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -57,12 +57,12 @@ enum H2Phase {
     Init = 0,
     Connecting = 1,
     WaitConnect = 2,
-    SendPreface = 3,   // request_buf holds preface + SETTINGS, drain to net_out
-    WaitSettings = 4,  // receive server SETTINGS, ack, then queue HEADERS
-    SendRequest = 5,   // request_buf holds (ACK +) HEADERS, draining
-    SendBody = 6,      // POST body — frame `request_body` into DATA frames
-    WaitResponse = 7,  // peek h2 frames out of recv_buf; HEADERS / DATA / control
-    Writing = 8,       // current DATA frame's payload is being forwarded to out_chan
+    SendPreface = 3,  // request_buf holds preface + SETTINGS, drain to net_out
+    WaitSettings = 4, // receive server SETTINGS, ack, then queue HEADERS
+    SendRequest = 5,  // request_buf holds (ACK +) HEADERS, draining
+    SendBody = 6,     // POST body — frame `request_body` into DATA frames
+    WaitResponse = 7, // peek h2 frames out of recv_buf; HEADERS / DATA / control
+    Writing = 8,      // current DATA frame's payload is being forwarded to out_chan
     /// WebSocket-over-h2 active. After the server's 200 HEADERS the
     /// stream tunnels RFC 6455 frames inside h2 DATA frames. The
     /// minimal client sends `request_body` once as a TEXT frame, waits
@@ -191,8 +191,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         return E_CONNECT_FAILED;
                     }
                 }
-                if dev_millis(sys).wrapping_sub(s.client.connect_start_ms) >= CONNECT_TIMEOUT_MS
-                {
+                if dev_millis(sys).wrapping_sub(s.client.connect_start_ms) >= CONNECT_TIMEOUT_MS {
                     log(s, b"[http] connect timeout");
                     set_phase(s, H2Phase::Error);
                     return E_CONNECT_FAILED;
@@ -241,8 +240,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // For WS, `request_body` is the initial WS message and
                 // is sent later by `WsActive` after the upgrade — we
                 // skip the h2 SendBody path here.
-                let has_h2_body =
-                    s.client.request_body_len > 0 && s.client.websocket == 0;
+                let has_h2_body = s.client.request_body_len > 0 && s.client.websocket == 0;
                 if has_h2_body {
                     log(s, b"[http] sending request body (h2c)");
                     s.client.request_body_sent = 0;
@@ -418,7 +416,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     set_phase(s, H2Phase::WaitResponse);
                     continue;
                 }
-                let src = s.client
+                let src = s
+                    .client
                     .recv_buf
                     .as_ptr()
                     .add(h2w::FRAME_HEADER_LEN + pending);
@@ -728,7 +727,8 @@ unsafe fn build_body_frame(s: &mut HttpState) {
     let chunk = body_remaining.min(max_chunk);
     let end_stream = s.client.request_body_sent + chunk as u16 >= s.client.request_body_len;
 
-    let src = s.client
+    let src = s
+        .client
         .request_body
         .as_ptr()
         .add(s.client.request_body_sent as usize);
@@ -922,7 +922,11 @@ unsafe fn drain_request_buf(s: &mut HttpState) -> bool {
         *scratch.add(1) = (payload_len & 0xFF) as u8;
         *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
         *scratch.add(3) = conn_id;
-        let src = s.client.request_buf.as_ptr().add(s.client.request_sent as usize);
+        let src = s
+            .client
+            .request_buf
+            .as_ptr()
+            .add(s.client.request_sent as usize);
         core::ptr::copy_nonoverlapping(src, scratch.add(4), to_send);
         let total = NET_FRAME_HDR + payload_len;
         let written = (sys.channel_write)(out_chan, scratch, total);
@@ -971,11 +975,7 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
     let space = RECV_BUF_SIZE - cur;
     let to_copy = data_len.min(space);
     if to_copy > 0 {
-        core::ptr::copy_nonoverlapping(
-            data_ptr,
-            s.client.recv_buf.as_mut_ptr().add(cur),
-            to_copy,
-        );
+        core::ptr::copy_nonoverlapping(data_ptr, s.client.recv_buf.as_mut_ptr().add(cur), to_copy);
         s.client.recv_len += to_copy as u16;
     }
     true
@@ -1017,6 +1017,14 @@ unsafe fn send_close_frame(s: &mut HttpState) {
     let buf = s.net_buf.as_mut_ptr();
     let mut payload = [0u8; 1];
     payload[0] = s.client.conn_id;
-    net_write_frame(sys, chan, NET_CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
+    net_write_frame(
+        sys,
+        chan,
+        NET_CMD_CLOSE,
+        payload.as_ptr(),
+        1,
+        buf,
+        NET_BUF_SIZE,
+    );
     s.client.conn_id = 0;
 }

@@ -32,7 +32,12 @@ pub const MODULE_INFO: u32 = 0x0C6C;
 /// Returns 0.
 pub const TRIGGER_REBUILD: u32 = 0x0C6D;
 /// Query the upstream-module bitmask for module N (for topological drain ordering).
-/// handle=-1, arg=[module_idx:u8]. Returns upstream mask as i32 (cast from u32).
+/// handle=-1, arg layout: in `[module_idx:u8]`, out `[mask:u64 LE]`
+/// (caller MUST pass `arg_len >= 9`: 1 byte in, 8 bytes the kernel
+/// overwrites with the bitmask). Returns 0 on success, -EINVAL if the
+/// arg is null / too short. Bit `i` set means "module `i` is upstream
+/// of module `module_idx`". On aarch64 (`MAX_MODULES = 64`) this needs
+/// the full u64 width — the previous `i32`-return shape truncated.
 pub const MODULE_UPSTREAM: u32 = 0x0C6E;
 /// Query whether module N has returned StepOutcome::Done (finished).
 /// handle=-1, arg=[module_idx:u8]. Returns 1 if finished, 0 otherwise.

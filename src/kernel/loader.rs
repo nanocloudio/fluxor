@@ -36,6 +36,16 @@ pub mod export_hashes {
 pub const MODULE_TABLE_MAGIC: u32 = 0x544D5846;
 /// Module magic: "FXMD"
 pub const MODULE_MAGIC: u32 = 0x444D5846;
+
+/// Hard ceiling on the size of the on-disk modules blob (the FXMT
+/// module table + every module payload concatenated). Used by
+/// `init_from_blob` to reject a tampered table header that claims
+/// more than this. Set to 8 MiB — comfortably above the largest
+/// realistic firmware bundle (largest protocol modules sit at ~300
+/// KB; even a hundred of those + the table would not exceed 4 MB).
+/// Bumping this requires re-validating the platform's mapped modules
+/// region against the new ceiling.
+pub const MAX_MODULES_BLOB_SIZE: usize = 8 * 1024 * 1024;
 /// Total arena size for module state buffers.
 /// Bump-allocated per module at runtime — each module gets exactly what
 /// module_state_size() reports. Reset on graph reconfigure.
@@ -543,8 +553,8 @@ pub struct ModuleTableHeader {
     pub magic: u32,
     pub version: u8,
     pub module_count: u8,
-    pub total_size_lo: u16, // low 16 bits (backward compat)
-    pub total_size_hi: u16, // high 16 bits (uses first 2 reserved bytes)
+    pub total_size_lo: u16, // low 16 bits of total blob size
+    pub total_size_hi: u16, // high 16 bits — combined value = full FXMT blob length
     pub reserved: [u8; 6],
 }
 /// Module table entry (16 bytes)
@@ -558,8 +568,7 @@ pub struct ModuleTableEntry {
     pub flags: u8,
     pub reserved: [u8; 2],
 }
-/// Module header (72 bytes, ABI v3). ABI v2 was 68 bytes with a u16
-/// `required_caps`; v3 widens `required_caps` to u32 at bytes 6..10 so
+/// Module header (72 bytes). `required_caps` is a u32 at bytes 6..10 so
 /// every contract id in `MAX_CONTRACTS` (0..31) is expressible in the
 /// manifest bitmask.
 #[repr(C)]
@@ -581,7 +590,7 @@ pub struct ModuleHeader {
 }
 impl ModuleHeader {
     pub const SIZE: usize = 72;
-    /// Reserved layout (ABI v3):
+    /// Reserved layout:
     ///   byte 0: flags
     ///     bit 0: mailbox_safe — module can safely consume from mailbox channels.
     ///     bit 1: in_place_writer — module uses buffer_acquire_inplace.
@@ -614,7 +623,7 @@ impl ModuleHeader {
     }
     /// Required public-contract bitmask from reserved[6..10].
     /// Bit N set = module declared `requires_contract = "..."` for
-    /// contract id N in its manifest. Full 0..31 range since v3.
+    /// contract id N in its manifest. Full 0..31 contract id range.
     pub fn required_caps(&self) -> u32 {
         u32::from_le_bytes([
             self.reserved[6],
@@ -749,11 +758,21 @@ impl LoadedModule {
     /// Get a function address by hash.
     /// On Cortex-M: returns u32 with Thumb bit set.
     /// On aarch64: returns usize (64-bit address, no Thumb bit).
+    ///
+    /// Export-offset validation: an offset that doesn't fit inside the
+    /// module's `code_size` is rejected at the manifest boundary,
+    /// before any platform-specific address validation. A tampered
+    /// manifest claiming `offset > code_size` would otherwise produce
+    /// an `fn_addr` outside the module's code region and only fail
+    /// (or not) when `hal::validate_fn_addr` was hit. The check below
+    /// is independent of the platform integrity hook so every loader
+    /// path catches it the same way.
     pub fn get_export_addr(&self, hash: u32) -> Result<usize, LoaderError> {
         let export_count = self.header.export_count as usize;
         if export_count == 0 {
             return Err(LoaderError::ExportNotFound);
         }
+        let code_size = self.header.code_size;
         let code_base = self.code_base();
         let export_table = self.export_table_ptr();
         for i in 0..export_count {
@@ -761,6 +780,15 @@ impl LoadedModule {
             let entry = unsafe { read_export_entry(export_table, i) };
             if entry.hash == hash {
                 let offset = entry.offset & !1;
+                if offset >= code_size {
+                    log::error!(
+                        "[loader] export offset {:#x} >= code_size {:#x} (hash={:#x}); rejecting",
+                        offset,
+                        code_size,
+                        hash,
+                    );
+                    return Err(LoaderError::ExportNotFound);
+                }
                 let fn_addr = (code_base as usize).wrapping_add(offset as usize);
                 let fn_addr = hal::apply_code_bit(fn_addr);
                 return Ok(fn_addr);
@@ -774,12 +802,39 @@ impl LoadedModule {
 // ============================================================================
 // Module loader
 // ============================================================================
-/// Module loader - reads from flash module table
+/// Where a module table came from. Determines the trust profile the
+/// loader applies — see `docs/architecture/security.md` §"Load-source
+/// trust profiles".
+///
+/// `Flash`     — signed flash image (RP / CM5 production). Integrity hash
+///               + signature checks via `hal::verify_integrity` and the
+///               `enforce_signatures` feature gate.
+/// `Embedded`  — built-in static blob (WASM `EMBEDDED_MODULES_BLOB`, Linux
+///               `mmap`'d `.fmod` file). The typed value lets a future
+///               policy treat host-development builds differently from
+///               network-staged images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadSource {
+    /// Module table sits in flash, mapped by the platform's flash layout.
+    Flash,
+    /// Module table is an in-memory blob compiled or staged into the
+    /// kernel image. WASM `EMBEDDED_MODULES_BLOB`, Linux dev `.fmod`.
+    Embedded,
+}
+
+/// Module loader — reads from a flash module table or an in-memory
+/// blob. Trust is recorded as a typed `LoadSource` (Flash vs.
+/// Embedded), and integrity policy lives in two places: the
+/// platform's `hal::verify_integrity` (varies by source — see
+/// `docs/architecture/security.md`), and `cfg!(feature =
+/// "enforce_signatures")` which gates the Ed25519 path.
 pub struct ModuleLoader {
     table_base: *const u8,
     header: Option<ModuleTableHeader>,
-    /// Skip integrity checks (for embedded blob modules)
-    pub skip_integrity: bool,
+    /// Source the module table was loaded from. `Flash` by default
+    /// (matches the bare-metal `init` path); `init_from_blob` sets
+    /// it to `Embedded`. Read-only after init.
+    source: LoadSource,
 }
 impl Default for ModuleLoader {
     fn default() -> Self {
@@ -792,8 +847,17 @@ impl ModuleLoader {
         Self {
             table_base: core::ptr::null(),
             header: None,
-            skip_integrity: false,
+            // Default to Flash; `init_from_blob` overrides to Embedded.
+            // Platforms whose primary load path is the flash trailer
+            // (RP, CM5) never re-set this; hosted targets calling
+            // `init_from_blob` get the right value automatically.
+            source: LoadSource::Flash,
         }
+    }
+
+    /// Return the source this loader was initialised from.
+    pub fn source(&self) -> LoadSource {
+        self.source
     }
     /// Initialize the loader by reading the layout trailer and module table header
     pub fn init(&mut self) -> Result<(), LoaderError> {
@@ -815,6 +879,7 @@ impl ModuleLoader {
             layout.modules_addr
         );
         self.header = Some(header);
+        self.source = LoadSource::Flash;
         Ok(())
     }
     /// Get number of modules in table
@@ -878,15 +943,73 @@ impl ModuleLoader {
         })
     }
     /// Initialize from an in-memory module table blob (no flash layout needed).
-    /// Skips integrity checks since the blob was embedded at compile time.
+    /// Embedded blobs come from the build (host-linux Vec, wasm static
+    /// `EMBEDDED_MODULES_BLOB`, …) and the platform's `hal::verify_integrity`
+    /// owns whether the SHA-256 comparison decides admission. Every platform
+    /// (RP / BCM / Linux / WASM) byte-compares the recomputed digest against
+    /// the manifest-stored value; the test harness can override the verdict
+    /// via `set_verify_integrity_mode`.
     pub fn init_from_blob(&mut self, blob: *const u8) -> Result<(), LoaderError> {
         let header = unsafe { read_table_header(blob) };
         if header.magic != MODULE_TABLE_MAGIC {
             return Err(LoaderError::InvalidTableMagic);
         }
+
+        // Validate the table header's declared size and every entry's
+        // offset/size against a hard upper bound before trusting any
+        // byte past the header. A tampered table — module_count =
+        // 0xFF, entry.offset = 0xFFFF_FFFF — would otherwise produce
+        // out-of-bounds pointer reads downstream.
+        //
+        // Hard cap: the on-disk modules blob never exceeds
+        // `MAX_MODULES_BLOB_SIZE`. Any header claiming more is
+        // rejected as malformed before the table walk.
+        let total_size = ((header.total_size_hi as u32) << 16) | (header.total_size_lo as u32);
+        if (total_size as usize) > MAX_MODULES_BLOB_SIZE {
+            log::error!(
+                "[loader] modules blob size {} exceeds MAX_MODULES_BLOB_SIZE={}",
+                total_size,
+                MAX_MODULES_BLOB_SIZE
+            );
+            return Err(LoaderError::InvalidTableMagic);
+        }
+        // Table header (16 bytes) + N × 16-byte entries must fit
+        // within total_size.
+        let table_size = 16usize.saturating_add((header.module_count as usize) * 16);
+        if table_size > total_size as usize {
+            log::error!(
+                "[loader] module-table size {} > total_size {}",
+                table_size,
+                total_size
+            );
+            return Err(LoaderError::InvalidTableMagic);
+        }
+        // Every entry's [offset, offset+size) must land inside
+        // [table_size, total_size). Walking the table once here gives
+        // every downstream pointer dereference a positive bounds
+        // proof.
+        let entries_base = unsafe { offset_ptr(blob, 16) };
+        for i in 0..header.module_count as usize {
+            let entry = unsafe { read_table_entry(entries_base, i) };
+            let off = entry.offset as usize;
+            let sz = entry.size as usize;
+            let end = off.saturating_add(sz);
+            if off < table_size || end > total_size as usize {
+                log::error!(
+                    "[loader] entry {} bounds offset={} size={} outside table_size={} total_size={}",
+                    i,
+                    off,
+                    sz,
+                    table_size,
+                    total_size
+                );
+                return Err(LoaderError::InvalidTableMagic);
+            }
+        }
+
         self.table_base = blob;
         self.header = Some(header);
-        self.skip_integrity = true;
+        self.source = LoadSource::Embedded;
         log::info!("[loader] {} modules from blob", header.module_count);
         Ok(())
     }
@@ -987,9 +1110,28 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
             return Err(LoaderError::CodeOutOfBounds);
         }
     }
-    // Verify integrity hash from manifest section (ABI v2)
+    // Verify integrity hash from manifest section. Every short- or
+    // bad-magic manifest hits an explicit rejection arm before any
+    // byte read so `enforce_signatures` can never be bypassed by an
+    // undersized manifest.
     let manifest_size = module.header.manifest_size() as usize;
-    if manifest_size >= 48 {
+    if manifest_size < 48 {
+        // Manifest is absent or too small to carry the integrity
+        // hash (16-byte header + 32-byte SHA-256 minimum). Under
+        // signature enforcement, reject. Without enforcement, treat
+        // as "no integrity declared" and proceed (matches the
+        // unsigned-module path with `flags & 0x01 == 0`).
+        if cfg!(feature = "enforce_signatures") {
+            log::error!(
+                "[loader] {}: manifest size {} below minimum (48) under enforce_signatures",
+                name,
+                manifest_size
+            );
+            return Err(LoaderError::SignatureInvalid);
+        }
+        return Ok(());
+    }
+    {
         let code_size = module.header.code_size as usize;
         let data_size = module.header.data_size as usize;
         let export_size = module.header.export_count as usize * 8;
@@ -998,14 +1140,32 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
             ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
         let manifest_ptr = unsafe { offset_ptr(module.base, manifest_offset) };
         let manifest_data = unsafe { core::slice::from_raw_parts(manifest_ptr, manifest_size) };
-        if manifest_size >= 16 {
+        // `manifest_size >= 48` was checked above, so `>= 16` is trivially
+        // true — keep the explicit assertion-style read but reject any
+        // tampered manifest header explicitly under enforcement.
+        {
             let magic = u32::from_le_bytes([
                 manifest_data[0],
                 manifest_data[1],
                 manifest_data[2],
                 manifest_data[3],
             ]);
-            if magic == 0x464D5846 {
+            if magic != 0x464D5846 {
+                if cfg!(feature = "enforce_signatures") {
+                    log::error!(
+                        "[loader] {}: bad manifest magic 0x{:08x} under enforce_signatures",
+                        name,
+                        magic
+                    );
+                    return Err(LoaderError::SignatureInvalid);
+                }
+                // Without enforcement, an unrecognised manifest magic
+                // is treated as "no manifest" — the integrity /
+                // signature work below is skipped because it can't
+                // trust the byte layout.
+                return Ok(());
+            }
+            {
                 let version = manifest_data[4];
                 let flags = manifest_data[14];
                 let has_integrity = (flags & 0x01) != 0;
@@ -1081,7 +1241,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                 }
             }
         }
-    } // if manifest_size >= 48
+    }
     Ok(())
 }
 /// Check if function address is within module's code section.
@@ -1601,18 +1761,39 @@ pub fn find_hint_for_port(hints: &[ChannelHint], port_type: u8, port_index: u8) 
 /// function address (code_base + offset, with the Thumb bit applied
 /// for ARMv7-M/ARMv8-M).
 ///
+/// The export offset is bounds-checked against the module's stored
+/// `code_size`; an entry whose offset falls outside the code range is
+/// rejected (returns `None`) rather than producing an address that
+/// could redirect dispatch into module data or off-module memory.
+///
 /// Returns `Some(absolute_address)` on success, `None` if the hash is
-/// not found (caller may then fall back to treating the value as a
-/// raw address).
+/// not found, or the entry is malformed.
 pub fn resolve_export_for_module(module_idx: usize, export_hash: u32) -> Option<usize> {
     let (code_base, export_table, export_count) = super::scheduler::get_module_exports(module_idx);
     if export_table.is_null() || export_count == 0 || code_base == 0 {
+        return None;
+    }
+    let (_, code_size) = super::scheduler::module_code_region(module_idx);
+    if code_size == 0 {
         return None;
     }
     for i in 0..export_count as usize {
         let entry = unsafe { read_export_entry(export_table, i) };
         if entry.hash == export_hash {
             let offset = entry.offset & !1;
+            // Require the masked offset to land strictly inside the
+            // module's code range. `>=` rather than `>` so a zero-byte
+            // entry at the boundary is rejected too.
+            if (offset as u64) >= code_size as u64 {
+                log::warn!(
+                    "[loader] resolve_export: module {} export 0x{:08x} offset {} out of code_size {}",
+                    module_idx,
+                    export_hash,
+                    offset,
+                    code_size
+                );
+                return None;
+            }
             let fn_addr = code_base.wrapping_add(offset as usize);
             let fn_addr = hal::apply_code_bit(fn_addr);
             return Some(fn_addr);

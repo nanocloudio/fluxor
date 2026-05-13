@@ -13,8 +13,8 @@ use super::connection::{
 use super::wire_h1 as h1;
 use super::HttpState;
 use super::{
-    dev_channel_port, dev_log, dev_millis, net_read_frame, net_write_frame, E_AGAIN,
-    NET_FRAME_HDR, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    dev_channel_port, dev_log, dev_millis, net_read_frame, net_write_frame, E_AGAIN, NET_FRAME_HDR,
+    POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -180,7 +180,15 @@ unsafe fn send_close_frame(s: &mut HttpState) {
     let buf = s.net_buf.as_mut_ptr();
     let mut payload = [0u8; 1];
     payload[0] = s.client.conn_id;
-    net_write_frame(sys, chan, NET_CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
+    net_write_frame(
+        sys,
+        chan,
+        NET_CMD_CLOSE,
+        payload.as_ptr(),
+        1,
+        buf,
+        NET_BUF_SIZE,
+    );
     s.client.conn_id = 0;
 }
 
@@ -213,7 +221,15 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 payload[4] = ip_bytes[3];
                 payload[5] = (s.client.port & 0xFF) as u8;
                 payload[6] = (s.client.port >> 8) as u8;
-                let wrote = net_write_frame(sys, chan, NET_CMD_CONNECT, payload.as_ptr(), 7, buf, NET_BUF_SIZE);
+                let wrote = net_write_frame(
+                    sys,
+                    chan,
+                    NET_CMD_CONNECT,
+                    payload.as_ptr(),
+                    7,
+                    buf,
+                    NET_BUF_SIZE,
+                );
                 if wrote == 0 {
                     return 0;
                 }
@@ -260,7 +276,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let out_chan = s.net_out_chan;
                 let conn_id = s.client.conn_id;
                 let remaining = (s.client.request_len - s.client.request_sent) as usize;
-                let data_ptr = s.client.request_buf.as_ptr().add(s.client.request_sent as usize);
+                let data_ptr = s
+                    .client
+                    .request_buf
+                    .as_ptr()
+                    .add(s.client.request_sent as usize);
 
                 let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
                 let to_send = remaining.min(max_data);

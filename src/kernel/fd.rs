@@ -237,6 +237,17 @@ pub fn register_dma_fd_poll(f: fn(i32) -> bool) {
 ///
 /// Unlike per-type polls (e.g. `event_poll` which clears the signal),
 /// `fd_poll` is peek-only — it never consumes state.
+///
+/// `fd_poll` is **universal by FD tag** — every supported handle family
+/// (channel, event, timer, DMA, bridge) is dispatched explicitly in the
+/// match below. Unknown tags return `EINVAL`. The provider vtable is
+/// **not** consulted: poll doesn't go through `provider::dispatch`. This
+/// keeps the hot path branchless and avoids forcing every contract that
+/// just wants polling to register a poll handler.
+///
+/// Adding a new pollable handle family means: (1) define an FD tag, (2)
+/// add a match arm here. Both reads are non-destructive — `fd_poll`
+/// must never mutate slot state.
 pub fn fd_poll(fd: i32, events: u8) -> i32 {
     if fd < 0 {
         return errno::EINVAL;

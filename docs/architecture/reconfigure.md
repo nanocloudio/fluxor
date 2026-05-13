@@ -86,14 +86,16 @@ Arena compaction (moving surviving module state blocks) is deferred to v2:
 - **A/B fallback** on migration failure (full destructive reconfigure from old config)
 - **Build-time transition plan preview** via `fluxor diff old.yaml new.yaml`
 
-### What V1 Does NOT Deliver
+### Out of scope for the current reconfigure path
 
 - State preservation for surviving modules (all state is reset)
 - Channel preservation between surviving modules
 - Arena compaction (selective module replacement without full reset)
 - Socket handoff to new module instances
 
-These are planned for v2.
+These are out of scope for the current drain-then-reset model and would
+require a future preservation-aware reconfigure path. None of the listed
+items are needed for the supported reconfigure semantics.
 
 ## CLI: Transition Plan Preview
 
@@ -129,7 +131,7 @@ If the drain deadline is exceeded, all still-draining modules are force-terminat
 Their in-flight work is lost — equivalent to the current atomic reconfigure for
 those specific modules.
 
-## Header Flag Layout (ABI v2 reserved[0])
+## Header Flag Layout (module header `reserved[0]`)
 
 | Bit | Name | Description |
 |-----|------|-------------|

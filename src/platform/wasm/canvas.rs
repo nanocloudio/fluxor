@@ -26,9 +26,9 @@ extern "C" {
 #[repr(C)]
 pub(crate) struct CanvasState {
     pub in_chan: i32,
-    pub width:   u16,
-    pub height:  u16,
-    pub frames:  u32,
+    pub width: u16,
+    pub height: u16,
+    pub frames: u32,
     pub buf_len: u32,
     pub buf_cap: u32,
     pub buf_ptr: *mut u8,
@@ -90,12 +90,7 @@ fn canvas_step(state: *mut u8) -> i32 {
         loop {
             let cur = st.buf_len as usize;
             if cur >= frame_size {
-                host_canvas_present(
-                    st.buf_ptr,
-                    frame_size,
-                    st.width as u32,
-                    st.height as u32,
-                );
+                host_canvas_present(st.buf_ptr, frame_size, st.width as u32, st.height as u32);
                 st.frames = st.frames.wrapping_add(1);
                 let residual = cur - frame_size;
                 if residual > 0 {
@@ -104,11 +99,8 @@ fn canvas_step(state: *mut u8) -> i32 {
                 st.buf_len = residual as u32;
                 continue;
             }
-            let n = channel::channel_read(
-                st.in_chan,
-                st.buf_ptr.add(cur),
-                st.buf_cap as usize - cur,
-            );
+            let n =
+                channel::channel_read(st.in_chan, st.buf_ptr.add(cur), st.buf_cap as usize - cur);
             if n <= 0 {
                 break;
             }

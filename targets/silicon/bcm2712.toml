@@ -32,9 +32,13 @@ dma_channels = 16
 [isolation]
 has_mmu = true
 
-[kernel]
-state_arena_kb = 256
-buffer_arena_kb = 32
+# [kernel] capacity tunables for BCM2712 live in
+# `modules/sdk/config.rs::profile_host` (selected at compile time via
+# `cfg(target_arch = "aarch64")`). build.rs does not emit a
+# `chip_generated.rs` for BCM; STATE_ARENA / BUFFER_ARENA / CONFIG_ARENA
+# are re-exported through `src/platform/bcm2712/chip.rs`. Editing values
+# in a [kernel] section here would have no effect — edit
+# `modules/sdk/config.rs::profile_host::kernel` instead.
 
 [memory]
 # QEMU virt: RAM at 0x4000_0000, 2 GB

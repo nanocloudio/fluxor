@@ -2,9 +2,9 @@
 //!
 //! Implements DISCOVER → OFFER → REQUEST → ACK flow.
 
+use super::eth;
 use super::ipv4;
 use super::udp;
-use super::eth;
 
 /// DHCP ports
 pub const DHCP_CLIENT_PORT: u16 = 68;
@@ -156,9 +156,9 @@ pub unsafe fn build_dhcp_message(
 
     // BOOTP header
     *d = BOOTREQUEST; // op
-    *d.add(1) = 1;    // htype (Ethernet)
-    *d.add(2) = 6;    // hlen (MAC = 6)
-    *d.add(3) = 0;    // hops
+    *d.add(1) = 1; // htype (Ethernet)
+    *d.add(2) = 6; // hlen (MAC = 6)
+    *d.add(3) = 0; // hops
 
     // XID (transaction ID)
     let xid_bytes = xid.to_be_bytes();
@@ -179,10 +179,10 @@ pub unsafe fn build_dhcp_message(
     }
 
     // Magic cookie at offset 236 (inline to avoid PIC rodata issues)
-    *d.add(236) = 99;   // 0x63
-    *d.add(237) = 130;  // 0x82
-    *d.add(238) = 83;   // 0x53
-    *d.add(239) = 99;   // 0x63
+    *d.add(236) = 99; // 0x63
+    *d.add(237) = 130; // 0x82
+    *d.add(238) = 83; // 0x53
+    *d.add(239) = 99; // 0x63
 
     // DHCP options
     let mut opt = 240;
@@ -222,9 +222,9 @@ pub unsafe fn build_dhcp_message(
     // Option 55: Parameter Request List
     *d.add(opt) = 55;
     *d.add(opt + 1) = 3;
-    *d.add(opt + 2) = 1;  // Subnet Mask
-    *d.add(opt + 3) = 3;  // Router
-    *d.add(opt + 4) = 6;  // DNS
+    *d.add(opt + 2) = 1; // Subnet Mask
+    *d.add(opt + 3) = 3; // Router
+    *d.add(opt + 4) = 6; // DNS
     opt += 5;
 
     // End option
@@ -232,7 +232,7 @@ pub unsafe fn build_dhcp_message(
     opt += 1;
 
     let dhcp_len = DHCP_HEADER_LEN + 4 + (opt - 240); // header + magic + options
-    // Pad to minimum 300 bytes
+                                                      // Pad to minimum 300 bytes
     let dhcp_len = if dhcp_len < 300 { 300 } else { dhcp_len };
 
     // Build UDP header manually (the checksum computation in build_udp_header
@@ -258,7 +258,10 @@ pub unsafe fn build_dhcp_message(
     let mut j = 0usize;
     while j < 6 {
         core::ptr::write_volatile(buf.add(j), 0xFFu8);
-        core::ptr::write_volatile(buf.add(6 + j), core::ptr::read_volatile(mac.as_ptr().add(j)));
+        core::ptr::write_volatile(
+            buf.add(6 + j),
+            core::ptr::read_volatile(mac.as_ptr().add(j)),
+        );
         j += 1;
     }
     core::ptr::write_volatile(buf.add(12), 0x08u8);
@@ -315,17 +318,14 @@ pub unsafe fn parse_dhcp_reply(
     }
 
     // Check XID
-    let xid = u32::from_be_bytes([
-        *data.add(4), *data.add(5), *data.add(6), *data.add(7),
-    ]);
+    let xid = u32::from_be_bytes([*data.add(4), *data.add(5), *data.add(6), *data.add(7)]);
     if xid != expected_xid {
         return None;
     }
 
     // yiaddr (your IP address) at offset 16
-    let offered_ip = u32::from_be_bytes([
-        *data.add(16), *data.add(17), *data.add(18), *data.add(19),
-    ]);
+    let offered_ip =
+        u32::from_be_bytes([*data.add(16), *data.add(17), *data.add(18), *data.add(19)]);
 
     // Check magic cookie (inline constants to avoid PIC rodata issues)
     // Expected: 0x63(99), 0x82(130), 0x53(83), 0x63(99)
@@ -423,5 +423,13 @@ pub unsafe fn parse_dhcp_reply(
         return None;
     }
 
-    Some((msg_type, offered_ip, server_ip, subnet_mask, gateway, dns, lease_time))
+    Some((
+        msg_type,
+        offered_ip,
+        server_ip,
+        subnet_mask,
+        gateway,
+        dns,
+        lease_time,
+    ))
 }
