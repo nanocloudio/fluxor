@@ -43,8 +43,10 @@
 //! FS_CLOSE calls `host_fetch_close`, cancelling any in-flight body
 //! reader and dropping the host-side handle entry.
 
+use crate::abi::contracts::fence as dev_fence;
 use crate::abi::contracts::storage::fs as dev_fs;
 use crate::kernel::errno;
+use crate::kernel::fd::{tag_fd, FD_TAG_FS};
 
 const MAX_OPEN_FILES: usize = 16;
 
@@ -107,6 +109,26 @@ pub fn register() {
 }
 
 unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // The wasm fetch model has no fsync path and no replication, so
+    // every successful op is `Fence::Volatile`. Contract errno rule
+    // (see `fence.rs::QUERY_OP`): `EINVAL` for malformed buffer,
+    // `ENOSYS` for handles this provider does not own — closed,
+    // stale, or out-of-range slots fall in the ENOSYS bucket.
+    if opcode == dev_fence::QUERY_OP {
+        if arg.is_null() || arg_len < dev_fence::WIRE_MAX_LEN {
+            return errno::EINVAL;
+        }
+        let slot_idx = handle as usize;
+        let files = &*core::ptr::addr_of!(FETCH_FILES);
+        if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+            return errno::ENOSYS;
+        }
+        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
+        return match dev_fence::Fence::Volatile.encode(buf) {
+            Some(n) => n as i32,
+            None => errno::EINVAL,
+        };
+    }
     match opcode {
         dev_fs::OPEN => fs_open(arg, arg_len),
         dev_fs::READ => fs_read(handle, arg, arg_len),
@@ -131,7 +153,9 @@ unsafe fn fs_open(path_ptr: *mut u8, path_len: usize) -> i32 {
     }
     files[slot_idx].host_handle = host_handle;
     files[slot_idx].in_use = true;
-    slot_idx as i32
+    // FS handles carry their contract in the tag; the vtable wrapper
+    // strips it on re-entry so inbound ops see the raw slot.
+    tag_fd(FD_TAG_FS, slot_idx as i32)
 }
 
 unsafe fn fs_read(handle: i32, buf: *mut u8, len: usize) -> i32 {

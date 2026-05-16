@@ -170,6 +170,12 @@ fn contract_id_from_name(s: &str) -> Result<u8> {
         "pwm" => Ok(0x0F),
         "platform_dma_fd" => Ok(0x11),
         "pcie_device" => Ok(0x12),
+        // Storage capability surfaces (see
+        // docs/architecture/storage_capability_surface.md). Both are
+        // module-providable contracts; class bytes match the kernel
+        // `provider::contract::STORAGE_*` constants.
+        "storage.namespace" | "namespace" => Ok(0x13),
+        "storage.object" | "object" => Ok(0x14),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -182,7 +188,8 @@ fn contract_id_from_name(s: &str) -> Result<u8> {
         ))),
         _ => Err(Error::Module(format!(
             "unknown contract name: {} — expected one of: gpio, spi, i2c, pio, \
-             uart, adc, pwm, fs, platform_nic_ring, platform_dma, platform_dma_fd, \
+             uart, adc, pwm, fs, storage.namespace, storage.object, \
+             platform_nic_ring, platform_dma, platform_dma_fd, \
              pcie_device (see docs/architecture/abi_layers.md)",
             s
         ))),

@@ -1222,7 +1222,10 @@ unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 
     of.sector_in_cluster = 0;
     of.scratch_avail = 0;
     of.scratch_pos = 0;
-    slot
+    // FS handles carry their contract in the tag; the vtable
+    // wrapper strips it on re-entry so inbound ops see the raw
+    // slot.
+    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot)
 }
 
 /// FS_READ: drain `scratch_block` first, then synchronously fetch
@@ -1433,7 +1436,7 @@ unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i
     of.size = 0;
     of.scratch_avail = 0;
     of.scratch_pos = 0;
-    slot
+    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot)
 }
 
 /// FS_READDIR: walk dir entries from the cursor, emit one byte
@@ -1592,6 +1595,25 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
 ) -> i32 {
     if state.is_null() { return E_INVAL; }
     let s = &mut *(state as *mut Fat32State);
+    // `contracts::fence::QUERY_OP` — fence introspection. fat32 is
+    // read-only and has no fsync or replication path, so every op
+    // is `Fence::Volatile`. The handle is validated like every
+    // other op: `EINVAL` for malformed buffer, `ENOSYS` for handles
+    // this provider does not own (closed, stale, or out-of-range).
+    if opcode == abi::contracts::fence::QUERY_OP {
+        if arg.is_null() || arg_len < abi::contracts::fence::WIRE_MAX_LEN {
+            return E_INVAL;
+        }
+        let slot_idx = handle as usize;
+        if slot_idx >= MAX_OPEN_FILES || s.open_files[slot_idx].in_use == 0 {
+            return E_NOSYS;
+        }
+        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
+        return match abi::contracts::fence::Fence::Volatile.encode(buf) {
+            Some(n) => n as i32,
+            None => E_INVAL,
+        };
+    }
     match opcode {
         FS_OPEN    => fs_op_open(s, arg as *const u8, arg_len),
         FS_READ    => fs_op_read(s, handle, arg, arg_len),

@@ -314,6 +314,8 @@ pub fn init_providers() {
     provider::register_vtable(&BUFFER_VTABLE);
     provider::register_vtable(&KEY_VAULT_VTABLE);
     provider::register_vtable(&FS_VTABLE);
+    provider::register_vtable(&STORAGE_NAMESPACE_VTABLE);
+    provider::register_vtable(&STORAGE_OBJECT_VTABLE);
     provider::register_vtable(&PCIE_DEVICE_VTABLE);
 
     // HAL vtables for contracts whose `call` dispatch is supplied by a
@@ -419,6 +421,49 @@ static FS_VTABLE: crate::kernel::provider::ProviderVTable =
         call: fs_call,
         query: None,
         default_close_op: contracts::storage::fs::CLOSE,
+    };
+
+// STORAGE_NAMESPACE / STORAGE_OBJECT vtables. Same shape as FS: the
+// kernel ships no built-in provider; a PIC module (loam, clustor,
+// the s3-adapter) registers via `module_provides_contract` and is
+// routed through the class-byte dispatch chain. The vtable carries
+// `default_close_op` so `provider_close` releases tracked handles
+// uniformly.
+
+unsafe fn storage_namespace_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::kernel::provider::contract as class;
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
+    crate::kernel::provider::dispatch(class::STORAGE_NAMESPACE, h, op, arg, arg_len)
+}
+
+static STORAGE_NAMESPACE_VTABLE: crate::kernel::provider::ProviderVTable =
+    crate::kernel::provider::ProviderVTable {
+        contract: crate::kernel::provider::contract::STORAGE_NAMESPACE,
+        call: storage_namespace_call,
+        query: None,
+        default_close_op: contracts::storage::namespace::CLOSE,
+    };
+
+unsafe fn storage_object_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::kernel::provider::contract as class;
+    let h = if handle >= 0 {
+        crate::kernel::fd::slot_of(handle)
+    } else {
+        handle
+    };
+    crate::kernel::provider::dispatch(class::STORAGE_OBJECT, h, op, arg, arg_len)
+}
+
+static STORAGE_OBJECT_VTABLE: crate::kernel::provider::ProviderVTable =
+    crate::kernel::provider::ProviderVTable {
+        contract: crate::kernel::provider::contract::STORAGE_OBJECT,
+        call: storage_object_call,
+        query: None,
+        default_close_op: contracts::storage::object::CLOSE,
     };
 
 // HAL contracts whose `call` dispatch is a PIC module provider. The
@@ -1521,6 +1566,27 @@ pub unsafe extern "C" fn syscall_micros() -> u64 {
 // Device Query
 // ============================================================================
 
+/// Answer `query_key::LAST_FENCE` for any handle whose contract
+/// implements `contracts::fence::QUERY_OP` in its dispatch.
+///
+/// Routes through `provider::provider_call` so the contract's
+/// vtable resolves from the handle's FD tag and strips the tag
+/// before the provider sees the slot. Handle=-1 and untracked
+/// handles return `E_NOSYS`; one-shot ops without a handle (object
+/// `PUT`, namespace `RENAME`, …) carry an explicit `fence_out_ptr`
+/// in their arg layout instead — see the storage contract files.
+unsafe fn last_fence_query(handle: i32, out: *mut u8, out_len: usize) -> i32 {
+    use crate::abi::contracts::fence::{QUERY_OP, WIRE_MAX_LEN};
+
+    if out.is_null() || out_len < WIRE_MAX_LEN {
+        return E_INVAL;
+    }
+    if crate::kernel::provider::contract_of(handle).is_none() {
+        return E_NOSYS;
+    }
+    crate::kernel::provider::provider_call(handle, QUERY_OP, out, out_len)
+}
+
 /// Kernel-side cross-class query dispatcher.
 ///
 /// Fallback path invoked by `syscall_provider_query` when the handle's
@@ -1581,6 +1647,7 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
                 );
                 stats_size as i32
             }
+            dev_query_key::LAST_FENCE => last_fence_query(handle, out, out_len),
             _ => E_NOSYS,
         };
     }

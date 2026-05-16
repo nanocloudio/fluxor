@@ -28,3 +28,4 @@ vm/
 # `tools/tests/` (cargo integration tests for the host tools) is
 # not affected.
 /tests/
+/tools/tests/

@@ -383,6 +383,88 @@ pub mod query_key {
     /// Fault statistics (returns FaultStats struct, 12 bytes).
     /// handle=-1 queries the calling module, handle=N queries module N.
     pub const FAULT_STATS: u32 = 7;
+
+    /// Most recent `contracts::fence::Fence` advertised on this
+    /// handle. Cross-class: any storage / file / namespace / object
+    /// provider answers this for handles it owns. The output buffer
+    /// must be at least `abi::contracts::fence::WIRE_MAX_LEN` bytes;
+    /// the provider writes the prefix-tagged encoding documented in
+    /// `contracts/fence.rs` and returns the byte count, or `ENOSYS`
+    /// for handles whose contract has no fence concept (HAL
+    /// peripherals, channels, timers). Consumers decode via
+    /// `Fence::decode` — an unknown tag is not promoted to
+    /// `Volatile`; it means the provider did not advertise a
+    /// recognised fence and the consumer refuses to proceed.
+    pub const LAST_FENCE: u32 = 8;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// File-descriptor tagging
+// ─────────────────────────────────────────────────────────────────────
+//
+// Every handle Fluxor hands back to a module is encoded as a tagged
+// i32: bits [30..26] = 5-bit type tag, bits [25..0] = 26-bit slot.
+// Bit 31 is always 0 so tagged fds stay positive and unambiguous
+// against negative errno values.
+//
+// The kernel resolves `(handle) -> contract_id` from the tag rather
+// than from a shared lookup table — contract handle-spaces are
+// disjoint by bit pattern. PIC module providers (fat32, loam, …)
+// self-tag the handles they return from open-style ops; the
+// kernel-side `fd.rs` re-exports from this module so the bit layout
+// has a single source of truth.
+pub mod fd {
+    pub const FD_TAG_CHANNEL: i32 = 0;
+    pub const FD_TAG_EVENT: i32 = 2;
+    pub const FD_TAG_TIMER: i32 = 3;
+    pub const FD_TAG_DMA: i32 = 7;
+    pub const FD_TAG_BRIDGE: i32 = 8;
+    pub const FD_TAG_KEY_VAULT: i32 = 9;
+    pub const FD_TAG_PCIE_DEVICE: i32 = 10;
+    pub const FD_TAG_NIC_RING: i32 = 11;
+    pub const FD_TAG_DMA_CHANNEL: i32 = 12;
+    pub const FD_TAG_FS: i32 = 13;
+    pub const FD_TAG_BUFFER: i32 = 14;
+    pub const FD_TAG_HAL_GPIO: i32 = 15;
+    pub const FD_TAG_HAL_SPI: i32 = 16;
+    pub const FD_TAG_HAL_I2C: i32 = 17;
+    pub const FD_TAG_HAL_UART: i32 = 18;
+    pub const FD_TAG_HAL_ADC: i32 = 19;
+    pub const FD_TAG_HAL_PWM: i32 = 20;
+    pub const FD_TAG_HAL_PIO: i32 = 21;
+    pub const FD_TAG_STORAGE_NAMESPACE: i32 = 22;
+    pub const FD_TAG_STORAGE_OBJECT: i32 = 23;
+
+    pub const TAG_SHIFT: u32 = 26;
+    pub const SLOT_MASK: i32 = 0x03FF_FFFF;
+
+    /// Encode a type tag and slot index into a tagged fd. A negative
+    /// `slot` passes through unchanged so PIC provider open-ops can
+    /// pipe an errno through `tag_fd(TAG, errno)` without altering
+    /// the error code.
+    #[inline]
+    pub const fn tag_fd(tag: i32, slot: i32) -> i32 {
+        if slot < 0 {
+            return slot;
+        }
+        (tag << TAG_SHIFT) | (slot & SLOT_MASK)
+    }
+
+    /// Decode a tagged fd into `(tag, slot)`.
+    #[inline]
+    pub const fn untag_fd(fd: i32) -> (i32, i32) {
+        let tag = (fd >> TAG_SHIFT) & 0x1F;
+        let slot = fd & SLOT_MASK;
+        (tag, slot)
+    }
+
+    /// Strip the tag and return only the slot index. Used at typed
+    /// inbound entry points that receive a tagged handle from a
+    /// chained caller.
+    #[inline]
+    pub const fn slot_of(fd: i32) -> i32 {
+        fd & SLOT_MASK
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

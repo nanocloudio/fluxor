@@ -363,6 +363,8 @@ a hierarchical naming scheme matching the capability taxonomy.
 | `display.touch_event` | Touch coordinates and gestures | xpt2046, ft6236 |
 | `storage.block` | Raw block I/O (512-byte sectors) | sd, flash |
 | `file.data` | File byte stream | fat32, littlefs, http, nfs |
+| `storage.namespace` | Directory-like name-keyed addressing (lookup, list, rename, delete, subscribe) | fat32, loam (dir), clustor (metadata), s3-adapter |
+| `storage.object` | Whole-blob byte-addressed put / get / range_get / head | loam (cas), clustor (replicated), s3-adapter, http-as-fs |
 | `frame.ethernet` | Raw ethernet frames | cyw43, enc28j60, ip |
 | `control.fmp` | FMP messages (next/prev/toggle) | button, gesture, bank |
 | `net.stream.cmd.v1` | Stream upstream commands (bind/connect/send/close) | ip, tls, ch9120, session workers |
@@ -874,12 +876,59 @@ uart                — UART serial access
 socket              — TCP/UDP networking (provided by ip, ch9120, w5500)
 link.wifi           — WiFi connection management (provided by wifi)
 file.data           — file byte stream (provided by fat32, littlefs, http)
+storage.namespace   — directory-like name-keyed surface (provided by fat32, loam, clustor)
+storage.object      — whole-blob byte-addressed surface (provided by loam, clustor, s3-adapter)
 audio.pcm           — raw PCM audio samples (provided by synth, decoder, mic)
 audio.encoded       — compressed audio stream (provided by file reader, http)
 display.draw        — drawing commands / framebuffer (provided by renderer)
 display.touch_event — touch coordinates (provided by touch driver)
 selection           — item selection (provided by bank)
 ```
+
+### Storage Capability Surfaces
+
+Storage capability is decomposed into four canonical surfaces plus
+one orthogonal axis. The full architecture is in
+`storage_capability_surface.md`; the names belong in this taxonomy:
+
+```
+storage.block       — raw block I/O (512-byte sectors). Drivers
+                      (sd, flash, nvme) provide; filesystems consume.
+file.data           — byte-stream file access (open, read, seek,
+                      stat, write, fsync). fat32 / linux_fs / http
+                      provide; player / viewer modules consume.
+storage.namespace   — name-keyed directory surface (lookup, stat,
+                      list, rename, delete, subscribe(prefix)).
+                      fat32 provides readonly; loam / clustor full.
+storage.object      — whole-blob byte-addressed surface (put, get,
+                      head, range_get, delete). Multipart upload
+                      composes via the event.log pattern rather
+                      than living in the surface itself.
+```
+
+The orthogonal axis is `contracts::fence::Fence` — every storage op
+that completes successfully returns the strongest fence it actually
+achieved: `Volatile`, `LocalDurable { device_id }`,
+`ReplicatedDurable { source, commit_index, epoch, quorum, witness }`,
+`ContentHashed { algorithm, digest }`,
+`RevisionMonotone { source, revision }`,
+`ViewConsistent { source, revision }`. Source-tagged variants make
+revision and commit_index comparisons honest — revision 10 of
+namespace A does not dominate revision 5 of namespace B because the
+sources differ. `ReplicatedDurable.commit_index` carries the
+monotone log position within an epoch, and `witness` equality
+distinguishes forks at the same `(source, epoch, commit_index)`.
+Providers may share a surface name and differ in fence strength;
+the fence is what makes substitution honest. See
+`storage_capability_surface.md` for the full rationale and the
+leased-`Handle` contract.
+
+The `event.log` content-type pattern (not a surface) reuses these
+primitives: a `storage.namespace` entry resolves to an Event stream
+with monotone per-source sequence (mesh.md §5) and the appropriate
+fence (`ReplicatedDurable` for cluster-committed entries). Loam's
+WAL, Clustor's commit log, and generic append logs all reduce to
+this pattern without a separate capability surface.
 
 ### Protocol Surface Capabilities
 

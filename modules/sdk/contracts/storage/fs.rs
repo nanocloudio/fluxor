@@ -12,6 +12,15 @@
 //
 // STAT output buffer layout (8 bytes): `[size: u32 LE, mtime: u32 LE]`.
 // Both `fat32` and `linux_fs_dispatch` populate it per this shape.
+//
+// ## Handle identity
+//
+// `OPEN` and `OPENDIR` return a tagged FD: providers encode the
+// returned slot via `kernel_abi::fd::tag_fd(FD_TAG_FS, slot)`. The
+// kernel's FS vtable wrapper strips the tag before re-entering the
+// provider, so inbound ops see a raw slot. The tag is what lets
+// `provider_call` and `provider_query` (including `LAST_FENCE`)
+// resolve the contract from the handle through `fd_tag_contract`.
 
 pub const OPEN: u32 = 0x0900;
 pub const READ: u32 = 0x0901;

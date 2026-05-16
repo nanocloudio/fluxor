@@ -26,59 +26,17 @@ use crate::kernel::hal;
 // Tag constants
 // ============================================================================
 
-pub const FD_TAG_CHANNEL: i32 = 0;
-pub const FD_TAG_EVENT: i32 = 2;
-pub const FD_TAG_TIMER: i32 = 3;
-pub const FD_TAG_DMA: i32 = 7;
-pub const FD_TAG_BRIDGE: i32 = 8;
-pub const FD_TAG_KEY_VAULT: i32 = 9;
-pub const FD_TAG_PCIE_DEVICE: i32 = 10;
-pub const FD_TAG_NIC_RING: i32 = 11;
-pub const FD_TAG_DMA_CHANNEL: i32 = 12;
-pub const FD_TAG_FS: i32 = 13;
-pub const FD_TAG_BUFFER: i32 = 14;
-/// HAL contract tags. Applied by the kernel vtable wrapper on the
-/// open-op return, stripped on inbound dispatch — PIC module
-/// providers always see the raw slot.
-pub const FD_TAG_HAL_GPIO: i32 = 15;
-pub const FD_TAG_HAL_SPI: i32 = 16;
-pub const FD_TAG_HAL_I2C: i32 = 17;
-pub const FD_TAG_HAL_UART: i32 = 18;
-pub const FD_TAG_HAL_ADC: i32 = 19;
-pub const FD_TAG_HAL_PWM: i32 = 20;
-pub const FD_TAG_HAL_PIO: i32 = 21;
-
-const TAG_SHIFT: u32 = 26;
-const SLOT_MASK: i32 = 0x03FF_FFFF;
-
-// ============================================================================
-// Encode / decode
-// ============================================================================
-
-/// Encode a type tag and slot index into a tagged fd.
-/// Only call on success (slot >= 0). Error codes pass through unchanged.
-#[inline]
-pub fn tag_fd(tag: i32, slot: i32) -> i32 {
-    if slot < 0 {
-        return slot; // error code, don't tag
-    }
-    (tag << TAG_SHIFT) | (slot & SLOT_MASK)
-}
-
-/// Decode a tagged fd into (tag, slot).
-#[inline]
-pub fn untag_fd(fd: i32) -> (i32, i32) {
-    let tag = (fd >> TAG_SHIFT) & 0x1F; // 5 bits
-    let slot = fd & SLOT_MASK;
-    (tag, slot)
-}
-
-/// Strip the tag from a handle, returning just the slot index.
-/// Use at typed syscall entry points to accept both tagged and raw handles.
-#[inline]
-pub fn slot_of(fd: i32) -> i32 {
-    fd & SLOT_MASK
-}
+// Tag constants and encode / decode helpers are single-sourced in
+// `abi::kernel_abi::fd` so PIC providers self-tag with the same bit
+// layout the kernel decodes. Re-exported here for callsites that
+// reach through `crate::kernel::fd::FD_TAG_*`.
+pub use crate::abi::kernel_abi::fd::{
+    slot_of, tag_fd, untag_fd, FD_TAG_BRIDGE, FD_TAG_BUFFER, FD_TAG_CHANNEL, FD_TAG_DMA,
+    FD_TAG_DMA_CHANNEL, FD_TAG_EVENT, FD_TAG_FS, FD_TAG_HAL_ADC, FD_TAG_HAL_GPIO, FD_TAG_HAL_I2C,
+    FD_TAG_HAL_PIO, FD_TAG_HAL_PWM, FD_TAG_HAL_SPI, FD_TAG_HAL_UART, FD_TAG_KEY_VAULT,
+    FD_TAG_NIC_RING, FD_TAG_PCIE_DEVICE, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT,
+    FD_TAG_TIMER,
+};
 
 // ============================================================================
 // Timer-as-fd

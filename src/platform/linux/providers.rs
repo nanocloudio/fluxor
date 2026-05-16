@@ -2,6 +2,13 @@
 // Linux FS Provider — real file I/O via libc
 // ============================================================================
 
+use fluxor::abi::contracts::fence::{DeviceId, Fence};
+
+/// Stable device id for the Linux host's local filesystem. One
+/// logical backing store from Fluxor's point of view, so a single
+/// constant suffices.
+const LINUX_FS_DEVICE_ID: DeviceId = 0x6c69_6e75_785f_6673; // "linux_fs"
+
 /// File handle table mapping Fluxor handles to libc fds (for files) or
 /// libc DIR* (for OPENDIR'd directories). Slot index is the Fluxor
 /// handle the caller passes back through subsequent FS_READ /
@@ -17,6 +24,11 @@ struct LinuxFileSlot {
     /// inspecting this field.
     dir_ptr: usize,
     in_use: bool,
+    /// Strongest `Fence` the most recent successful op on this slot
+    /// achieved. Each dispatcher arm writes this before returning
+    /// success; `provider_query(handle, query_key::LAST_FENCE, …)`
+    /// reads it back and encodes it on the wire.
+    last_fence: Fence,
 }
 
 static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
@@ -24,16 +36,72 @@ static mut LINUX_FILES: [LinuxFileSlot; MAX_OPEN_FILES] = {
         fd: -1,
         dir_ptr: 0,
         in_use: false,
+        last_fence: Fence::Volatile,
     };
     [EMPTY; MAX_OPEN_FILES]
 };
 
-/// FS provider dispatch — handle values are direct slot indices (no FD tagging).
-/// Same convention as the bare-metal sd module: OPEN returns slot index,
-/// subsequent ops use that slot index as handle.
+/// Record the strongest `Fence` the provider just achieved for
+/// `slot`. The dispatcher's i32 return carries errno / count; the
+/// fence is surfaced per-handle and read back via
+/// `provider_query(handle, query_key::LAST_FENCE, …)`. Every op
+/// writes its fence on success — `Volatile` reads overwrite a prior
+/// `LocalDurable` so the slot never reports a stale durability
+/// claim.
+unsafe fn record_slot_fence(slot: usize, fence: Fence) {
+    if slot >= MAX_OPEN_FILES {
+        return;
+    }
+    let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
+    files[slot].last_fence = fence;
+}
+
+/// Read back the fence advertised for `slot`'s most recent
+/// successful op. Returns `None` for unbound slots; the kernel
+/// introspection path treats that as `E_NOSYS`.
+pub fn slot_fence(slot: i32) -> Option<Fence> {
+    if slot < 0 || (slot as usize) >= MAX_OPEN_FILES {
+        return None;
+    }
+    unsafe {
+        let files = &*core::ptr::addr_of!(LINUX_FILES);
+        if !files[slot as usize].in_use {
+            return None;
+        }
+        Some(files[slot as usize].last_fence)
+    }
+}
+
+/// FS provider dispatch.
+///
+/// `OPEN` and `OPENDIR` self-tag their returns with `FD_TAG_FS` so
+/// the kernel resolves the contract from the handle via
+/// `fd_tag_contract`. Inbound ops arrive with the tag stripped by
+/// the FS vtable wrapper, so `handle` here is the raw slot index.
 unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use fluxor::abi::contracts::fence as dev_fence;
     use fluxor::abi::contracts::storage::fs as dev_fs;
     use fluxor::kernel::errno;
+    use fluxor::kernel::fd::{tag_fd, FD_TAG_FS};
+
+    // Cross-cutting fence-introspection opcode. Public surface:
+    // `provider_query(handle, query_key::LAST_FENCE, …)`. The
+    // kernel forwards it as `provider_call(handle, QUERY_OP, …)`
+    // so the FS vtable wrapper strips the FD tag before this
+    // dispatcher sees the slot.
+    if opcode == dev_fence::QUERY_OP {
+        if arg.is_null() || arg_len < dev_fence::WIRE_MAX_LEN {
+            return errno::EINVAL;
+        }
+        let Some(fence) = slot_fence(handle) else {
+            return errno::ENOSYS;
+        };
+        let buf = core::slice::from_raw_parts_mut(arg, arg_len);
+        return match fence.encode(buf) {
+            Some(n) => n as i32,
+            None => errno::EINVAL,
+        };
+    }
 
     match opcode {
         dev_fs::OPEN => {
@@ -80,11 +148,15 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
                 }
                 files[slot_idx].fd = fd_raw;
                 files[slot_idx].in_use = true;
-                return slot_idx as i32;
+                files[slot_idx].last_fence = Fence::Volatile;
+                // FS handles carry their contract in the tag; the
+                // vtable wrapper strips it on re-entry.
+                return tag_fd(FD_TAG_FS, slot_idx as i32);
             }
             files[slot_idx].fd = fd_raw;
             files[slot_idx].in_use = true;
-            slot_idx as i32
+            files[slot_idx].last_fence = Fence::Volatile;
+            tag_fd(FD_TAG_FS, slot_idx as i32)
         }
         dev_fs::READ => {
             let slot_idx = handle as usize;
@@ -99,6 +171,10 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             if n < 0 {
                 errno::ERROR
             } else {
+                // Reads reflect the kernel page cache; no
+                // durability claim. Recording overwrites any prior
+                // `LocalDurable` so the slot's fence stays honest.
+                record_slot_fence(slot_idx, Fence::Volatile);
                 n as i32
             }
         }
@@ -115,6 +191,8 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             if n < 0 {
                 errno::ERROR
             } else {
+                // Page-cache hand-off; not durable until FSYNC.
+                record_slot_fence(slot_idx, Fence::Volatile);
                 n as i32
             }
         }
@@ -132,6 +210,10 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             if pos < 0 {
                 errno::ERROR
             } else {
+                // Seek doesn't change durability, but it's a
+                // successful op on this handle — record Volatile so
+                // the slot fence describes the latest op.
+                record_slot_fence(slot_idx, Fence::Volatile);
                 pos as i32
             }
         }
@@ -152,6 +234,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
                 files[slot_idx].fd = -1;
             }
             files[slot_idx].in_use = false;
+            files[slot_idx].last_fence = Fence::Volatile;
             errno::OK
         }
         dev_fs::STAT => {
@@ -180,6 +263,8 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             *arg.add(5) = mtime_b[1];
             *arg.add(6) = mtime_b[2];
             *arg.add(7) = mtime_b[3];
+            // Metadata read; no durability claim.
+            record_slot_fence(slot_idx, Fence::Volatile);
             errno::OK
         }
         dev_fs::FSYNC => {
@@ -192,6 +277,17 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             if ret < 0 {
                 errno::ERROR
             } else {
+                // `fsync(2)` has flushed bytes + metadata to the
+                // host device, so the strongest honest fence is
+                // `LocalDurable` against the FS device id.
+                // Cross-host durability needs a replicating
+                // provider layered on top.
+                record_slot_fence(
+                    slot_idx,
+                    Fence::LocalDurable {
+                        device_id: LINUX_FS_DEVICE_ID,
+                    },
+                );
                 errno::OK
             }
         }
@@ -217,7 +313,8 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             files[slot_idx].fd = -1;
             files[slot_idx].dir_ptr = dir as usize;
             files[slot_idx].in_use = true;
-            slot_idx as i32
+            files[slot_idx].last_fence = Fence::Volatile;
+            tag_fd(FD_TAG_FS, slot_idx as i32)
         }
         dev_fs::READDIR => {
             let slot_idx = handle as usize;
@@ -301,11 +398,13 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             // caller can break the readdir loop on a single sentinel
             // instead of having to inspect the count header.
             if count == 0 {
+                record_slot_fence(slot_idx, Fence::Volatile);
                 0
             } else {
                 let cnt_le = count.to_le_bytes();
                 *arg = cnt_le[0];
                 *arg.add(1) = cnt_le[1];
+                record_slot_fence(slot_idx, Fence::Volatile);
                 out_pos as i32
             }
         }

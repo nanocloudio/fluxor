@@ -100,6 +100,15 @@ pub mod contract {
     /// (vtable registration, primitive routing).
     pub const INTERNAL_DISPATCH_BUCKET: u16 = 0x000C;
 
+    /// Directory-like name-keyed storage surface — opcode class 0x13xx.
+    /// See `modules/sdk/contracts/storage/namespace.rs` and
+    /// `docs/architecture/storage_capability_surface.md`.
+    pub const STORAGE_NAMESPACE: u16 = 0x0013;
+    /// Whole-blob byte-addressed storage surface — opcode class 0x14xx.
+    /// See `modules/sdk/contracts/storage/object.rs` and
+    /// `docs/architecture/storage_capability_surface.md`.
+    pub const STORAGE_OBJECT: u16 = 0x0014;
+
     // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
     // constants — the alias just drops the prefix for callsite brevity.
@@ -267,6 +276,8 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
         _t if _t == fd::FD_TAG_HAL_UART => Some(contract::HAL_UART),
         _t if _t == fd::FD_TAG_HAL_ADC => Some(contract::HAL_ADC),
         _t if _t == fd::FD_TAG_HAL_PWM => Some(contract::HAL_PWM),
+        _t if _t == fd::FD_TAG_STORAGE_NAMESPACE => Some(contract::STORAGE_NAMESPACE),
+        _t if _t == fd::FD_TAG_STORAGE_OBJECT => Some(contract::STORAGE_OBJECT),
         _t if _t == fd::FD_TAG_HAL_PIO => Some(contract::HAL_PIO),
         _ => None,
     }
@@ -330,6 +341,8 @@ fn contract_to_tag(contract: ContractId) -> Option<i32> {
         c if c == contract::HAL_ADC => Some(fd::FD_TAG_HAL_ADC),
         c if c == contract::HAL_PWM => Some(fd::FD_TAG_HAL_PWM),
         c if c == contract::HAL_PIO => Some(fd::FD_TAG_HAL_PIO),
+        c if c == contract::STORAGE_NAMESPACE => Some(fd::FD_TAG_STORAGE_NAMESPACE),
+        c if c == contract::STORAGE_OBJECT => Some(fd::FD_TAG_STORAGE_OBJECT),
         _ => None,
     }
 }
@@ -596,6 +609,8 @@ fn is_module_providable(contract: ContractId) -> bool {
             | contract::HAL_ADC
             | contract::HAL_PWM
             | contract::FS
+            | contract::STORAGE_NAMESPACE
+            | contract::STORAGE_OBJECT
     )
 }
 

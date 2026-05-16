@@ -98,7 +98,10 @@ fn linux_isr_tier_stop() {}
 fn linux_isr_tier_poll() {}
 
 fn linux_init_providers() {
-    // Override the default stub FS provider with one backed by real libc I/O.
+    // Override the default stub FS provider with one backed by real
+    // libc I/O. The dispatcher also answers
+    // `contracts::fence::QUERY_OP`, surfacing the per-handle fence
+    // through `provider_query(handle, query_key::LAST_FENCE, …)`.
     use fluxor::kernel::provider;
     use fluxor::kernel::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);

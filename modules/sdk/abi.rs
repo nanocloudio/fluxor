@@ -95,6 +95,11 @@ pub mod contracts {
             include!("contracts/net/session_ctrl.rs");
         }
     }
+    /// Per-op durability / ordering advertisement. Lives at the
+    /// contracts root because every storage surface returns one.
+    pub mod fence {
+        include!("contracts/fence.rs");
+    }
     pub mod storage {
         pub mod graph_slot {
             include!("contracts/storage/graph_slot.rs");
@@ -107,6 +112,19 @@ pub mod contracts {
         }
         pub mod fs {
             include!("contracts/storage/fs.rs");
+        }
+        /// Directory-like name-keyed surface
+        /// (see `storage_capability_surface.md`).
+        pub mod namespace {
+            include!("contracts/storage/namespace.rs");
+        }
+        /// Whole-blob byte-addressed surface.
+        pub mod object {
+            include!("contracts/storage/object.rs");
+        }
+        /// Leased mesh Handle specialised for storage surfaces.
+        pub mod handle {
+            include!("contracts/storage/handle.rs");
         }
     }
     pub mod key_vault {
