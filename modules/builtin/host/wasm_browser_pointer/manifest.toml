@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser pointer input source. Subscribes to DOM PointerEvents on
+# the host page (mouse, touch, stylus unified) and emits
+# `input::pointer::MSG_EVENT` records on the output port. Multi-
+# pointer is supported: each contact has its own pointer_id; the
+# host shim multiplexes them into a single event stream.
+#
+# Used by the `pointer` platform stack (stacks/pointer.toml) to
+# resolve `platform.pointer: {}` on wasm targets. Pointer-to-gamepad
+# overlay transformers (commit 3) consume this port to render
+# virtual DPAD/button widgets driven by touch.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "PointerEvents"
+required = true

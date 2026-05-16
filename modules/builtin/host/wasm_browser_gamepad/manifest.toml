@@ -1,0 +1,21 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser gamepad input source. Polls navigator.getGamepads() each
+# requestAnimationFrame in the host shim and emits
+# `input::gamepad::MSG_STATE` / `MSG_CONNECTION` records on the
+# output port. W3C-standard mapping is preserved byte-for-byte so
+# the button bits in MSG_STATE match `Gamepad.buttons[i].pressed`.
+#
+# Used by the `gamepad` platform stack (stacks/gamepad.toml) to
+# resolve `platform.gamepad: {}` on wasm targets. Consumers (games,
+# emulators) wire to this port and receive the same wire shape they
+# would from a USB-HID gamepad on pico2w or libinput on linux — the
+# capability surface is target-portable.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "GamepadEvents"
+required = true

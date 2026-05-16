@@ -1,0 +1,42 @@
+# Platform stack: pointer — pointer / touch input capability surface
+#
+# Resolves `platform.pointer: {}` in a graph YAML to the right
+# per-target pointer producer. Every variant emits the
+# `input::pointer` contract on a `pointer.events` output port.
+#
+# Consumers include direct pointer-driven graphs (drawing,
+# pointer-controlled games) and pointer-to-other transformers
+# (touch_gamepad_overlay maps virtual on-screen buttons to gamepad
+# events; touch_keyboard_overlay similarly for keyboard).
+#
+# Contract wire shape: `modules/sdk/contracts/input/pointer.rs` —
+# W3C Pointer Events (down/up/move/cancel + 5 button flags +
+# pressure + modifiers).
+
+[stack]
+name = "pointer"
+
+# ── Browser: DOM PointerEvents
+[[variant]]
+match = { family = "wasm" }
+modules = [{ name = "pointer", type = "wasm_browser_pointer" }]
+wiring = []
+
+# ── Linux host: libinput / evdev pointer device
+[[variant]]
+match = { family = "linux" }
+modules = [{ name = "pointer", type = "linux_input_pointer" }]
+wiring = []
+
+# ── BCM2712 with touchscreen: i2c / spi capacitive controller.
+#    Concrete drivers vary by panel; the platform stack ships a
+#    placeholder that fails-with-diagnostic until a real driver
+#    matches the panel.
+[[variant]]
+match = { board = "cm5" }
+modules = [{ name = "pointer", type = "bcm2712_touch_panel" }]
+wiring = []
+
+# ── Embedded boards with no built-in pointer device declare
+#    nothing here. Graphs that need pointer input on those boards
+#    can wire in a specific driver module manually.

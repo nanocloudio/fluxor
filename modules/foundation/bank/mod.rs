@@ -135,6 +135,19 @@ struct BankState {
     out_count: u8,
     _pad0: [u8; 3],
 
+    /// Inter-cycle pause in milliseconds. After hitting EOF on the
+    /// current file with `auto_advance` on, bank waits this long
+    /// before opening the next file. `0` (the default) preserves
+    /// legacy back-to-back streaming. Useful for slideshow-style
+    /// graphs where a downstream codec needs time to decode/present
+    /// the buffered frame before the next one arrives — without it,
+    /// bank cycles the directory at channel-write speed (many MB/s)
+    /// and consumers exceed their max-bytes ceilings.
+    interval_ms: u32,
+    /// Absolute monotonic-ms deadline that the next auto-advance is
+    /// gated on. `0` means no cooldown active.
+    next_advance_ms: u64,
+
     /// Number of path slots populated. Derived from `path_*` params or
     /// from a successful `dir:` scan. When 0, bank runs in
     /// preset-selector mode (no FS reads).
@@ -171,6 +184,9 @@ struct BankState {
     buf: [u8; BUF_SIZE],
     /// Scratch for FMP message payloads (commands).
     msg_buf: [u8; 16],
+
+    /// Tick counter for periodic diagnostics. Wraps freely.
+    tick_count: u32,
 }
 
 impl BankState {
@@ -186,7 +202,7 @@ impl BankState {
 
 mod params_def {
     use super::BankState;
-    use super::{p_u8, p_u16};
+    use super::{p_u8, p_u16, p_u32};
     use super::SCHEMA_MAX;
 
     /// Copy a path string into slot `idx` of `s.paths`. Bumps
@@ -223,6 +239,8 @@ mod params_def {
             => |s, d, len| { s.auto_advance = p_u8(d, len, 0, 1); };
         5, item_count, u16, 0
             => |s, d, len| { s.count = p_u16(d, len, 0, 0); };
+        6, interval_ms, u32, 0
+            => |s, d, len| { s.interval_ms = p_u32(d, len, 0, 0); };
 
         10, path_0, str, 0 => |s, d, len| { set_path(s, 0, d, len); };
         11, path_1, str, 0 => |s, d, len| { set_path(s, 1, d, len); };
@@ -296,15 +314,36 @@ unsafe fn fs_open_index(s: &mut BankState, idx: u16) -> bool {
     fs_close_current(s);
     if (idx as usize) >= MAX_PATHS { return false; }
     let n = s.path_lens[idx as usize] as usize;
-    if n == 0 { return false; }
+    if n == 0 {
+        return false;
+    }
     let mut path = [0u8; MAX_PATH_LEN];
     path[..n].copy_from_slice(&s.paths[idx as usize][..n]);
     let fd = (s.sys().provider_call)(-1, FS_OPEN, path.as_mut_ptr(), n);
-    if fd < 0 { return false; }
+    if fd < 0 {
+        return false;
+    }
     s.fs_fd = fd;
     // Fresh open → reset any stale pending writes from the previous file.
     s.pending_out = 0;
     s.pending_offset = 0;
+    // Clear any HUP flag left on the output channel by the previous
+    // file's `signal_stream_eof` (which sends IOCTL_SET_HUP to signal
+    // end-of-file to the consumer). Without this, subsequent
+    // channel_writes to the HUP'd channel fail and bank's auto-
+    // advanced second-cycle stream never reaches the consumer. The
+    // channel reset clears HUP/ERR/sticky flags and the ring; aux
+    // state is also wiped, which is fine because each file is a
+    // fresh logical stream.
+    if s.out_chans[0] >= 0 {
+        dev_channel_ioctl(
+            s.sys(),
+            s.out_chans[0],
+            IOCTL_FLUSH,
+            core::ptr::null_mut(),
+            0,
+        );
+    }
     true
 }
 
@@ -382,7 +421,13 @@ unsafe fn fs_scan_dir(s: &mut BankState) {
     dir_path[..dlen].copy_from_slice(&s.dir_path[..dlen]);
     let dir_fd = (s.sys().provider_call)(-1, FS_OPENDIR, dir_path.as_mut_ptr(), dlen);
     if dir_fd < 0 {
-        log_info(s, b"[bank] OPENDIR fail");
+        // E_AGAIN is the transient "FS provider not yet Done" reply
+        // from fat32 during boot; the retry block re-invokes us so
+        // logging it would flood log_net. Real errors (ENOENT,
+        // ENFILE, …) still surface.
+        if dir_fd != -11 {
+            log_info(s, b"[bank] OPENDIR fail");
+        }
         return;
     }
     // Reset path table — the scan owns it.
@@ -607,6 +652,40 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut BankState);
         if s.syscalls.is_null() { return -1; }
 
+        // Periodic heartbeat — `[bank] init` is a one-shot that can
+        // get lost in the early-boot log ring before `log_net` starts
+        // draining over UDP (DHCP isn't bound yet). The heartbeat
+        // surfaces bank's state once per 5000 ticks (~500 ms at
+        // tick_us=100) so the cm5 rig telemetry sees it indefinitely.
+        // Same cadence + format as `[fat32] hb`.
+        s.tick_count = s.tick_count.wrapping_add(1);
+        if s.tick_count % 5000 == 0 {
+            let mut buf = [0u8; 96];
+            let p = buf.as_mut_ptr();
+            let pfx = b"[bank] hb phase=";
+            let mut q = 0usize;
+            let mut t = 0;
+            while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.phase as u32);
+            let pc = b" path_count=";
+            let mut t = 0;
+            while t < pc.len() { *p.add(q) = pc[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.path_count as u32);
+            let cn = b" count=";
+            let mut t = 0;
+            while t < cn.len() { *p.add(q) = cn[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.count as u32);
+            let ix = b" idx=";
+            let mut t = 0;
+            while t < ix.len() { *p.add(q) = ix[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.index as u32);
+            let fd = b" fd=";
+            let mut t = 0;
+            while t < fd.len() { *p.add(q) = fd[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.fs_fd as u32);
+            dev_log(s.sys(), 3, p, q);
+        }
+
         // One-shot: scan the configured directory (if any), open the
         // initial path, emit first status.
         if s.phase == BankPhase::Init {
@@ -627,6 +706,34 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
 
+        // Lazy retry — on bare-metal targets the FS provider (fat32)
+        // reads the boot sector + GPT entries + FAT chain before
+        // reaching `Done`, which can take several hundred ms. Bank's
+        // `Init` may fire before fat32 is ready; FS_OPEN / FS_OPENDIR
+        // returns E_AGAIN, fs_fd stays -1 and path_count stays 0.
+        // Without retry the bank sits idle forever waiting for a nav
+        // command that never comes. Retry every 500 ticks (~50 ms at
+        // tick_us=100) until we get a real fd / path list.
+        if s.tick_count % 500 == 0 {
+            // Dir-mode retry: re-scan the configured directory until
+            // it returns at least one entry. `dir_scanned` is reset
+            // here to force a fresh OPENDIR/READDIR pass — the prior
+            // failed scan latched it to 1.
+            if s.dir_path_len > 0 && s.path_count == 0 {
+                s.dir_scanned = 0;
+                fs_scan_dir(s);
+                s.dir_scanned = 1;
+                if s.count == 0 && s.path_count > 0 {
+                    s.count = s.path_count as u16;
+                }
+            }
+            // Path-mode retry: re-open the selected index when fs_fd
+            // is unset and we have at least one configured path.
+            if s.fs_fd < 0 && s.path_count > 0 && s.count > 0 {
+                fs_open_index(s, s.index);
+            }
+        }
+
         // Process FMP commands from ctrl_chan.
         if s.ctrl_chan >= 0 {
             let sys = &*s.syscalls;
@@ -639,12 +746,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         emit_notification(s);
                     }
                     MSG_NEXT => {
+                        log_info(s, b"[bank] MSG_NEXT");
                         if navigate(s, 1) {
                             s.paused = 0;
                             select_index(s);
+                        } else {
+                            log_info(s, b"[bank] navigate denied");
                         }
                     }
                     MSG_PREV => {
+                        log_info(s, b"[bank] MSG_PREV");
                         if navigate(s, -1) {
                             s.paused = 0;
                             select_index(s);
@@ -661,6 +772,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Wake from inter-cycle pause: if the cooldown deadline has
+        // passed, advance to the next file and resume streaming.
+        // Bank stays paused until the deadline so downstream
+        // consumers have unstrained channel time to drain the
+        // previously-buffered bytes.
+        if s.paused != 0 && s.next_advance_ms > 0 {
+            let now = dev_millis(s.sys());
+            if now >= s.next_advance_ms {
+                s.next_advance_ms = 0;
+                s.paused = 0;
+                if navigate(s, 1) {
+                    select_index(s);
+                    log_info(s, b"[bank] auto (paced)");
                 }
             }
         }
@@ -720,7 +848,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             fs_close_current(s);
             signal_stream_eof(s);
             if s.auto_advance != 0 {
-                if navigate(s, 1) {
+                // Optional inter-cycle pause — gives downstream
+                // consumers (image codec, audio decoder) time to
+                // drain the buffered file's bytes before bank pushes
+                // the next file. Without this, bank streams at
+                // channel-write speed and consumers can exceed their
+                // max-bytes ceilings (see host_image_codec's 16 MiB
+                // limit). `interval_ms = 0` keeps legacy back-to-back
+                // behaviour.
+                if s.interval_ms > 0 {
+                    let now = dev_millis(s.sys());
+                    s.next_advance_ms = now.saturating_add(s.interval_ms as u64);
+                    s.paused = 1;
+                } else if navigate(s, 1) {
                     select_index(s);
                     log_info(s, b"[bank] auto");
                 }

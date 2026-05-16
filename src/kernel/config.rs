@@ -642,7 +642,25 @@ pub struct Config {
     pub domain_tick_us: [u16; 4],
     /// Per-domain execution mode: 0=cooperative, 1=high_rate/Tier1a, 3=poll/Tier3.
     pub domain_exec_mode: [u8; 4],
+    /// Graph-level flags byte (graph section header byte 1).
+    ///   bit 0: ACCEPT_CYCLES — author has explicitly attested that
+    ///          any cycles in the graph are bidirectional feedback
+    ///          pairs (e.g. `http <-> linux_net`) and safe to step
+    ///          in best-effort declaration order. Without this bit,
+    ///          `prepare_graph` rejects cycles (v1 strict invariant).
+    /// bits 1-7: reserved (must be 0).
+    ///
+    /// See `.context/rfc_deployment_scenarios.md` §13 ("Known issue
+    /// blocking PR 3 end-to-end") for the design rationale.
+    pub graph_flags: u8,
 }
+
+/// `graph_flags` bit 0: accept cycles in the dataflow graph. The
+/// canonical use case is bidirectional `http <-> linux_net` feedback
+/// pairs in linux http examples. Typed feedback edges are the
+/// long-term answer (see scheduler comment near `compute_exec_order`);
+/// this flag is the transitional accommodation.
+pub const GRAPH_FLAG_ACCEPT_CYCLES: u8 = 0x01;
 
 impl Config {
     /// Create an empty config
@@ -664,6 +682,7 @@ impl Config {
             hardware: HardwareConfig::new(),
             domain_tick_us: [0; 4],
             domain_exec_mode: [0; 4],
+            graph_flags: 0,
         }
     }
 }
@@ -977,6 +996,14 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     let section_base = unsafe { modules_base.add(4 + section_size) };
 
     let edge_count = config.edge_count as usize;
+
+    // Graph section header layout (4 bytes, see tools/src/config.rs):
+    //   byte 0: edge_count (redundant with config.edge_count above;
+    //           tools writes both so we read the authoritative one
+    //           from the counts block)
+    //   byte 1: graph_flags — see `GRAPH_FLAG_*` constants
+    //   bytes 2-3: reserved (must be 0; future use)
+    config.graph_flags = unsafe { *section_base.add(1) };
 
     // Edges start at offset 4 within graph section
     let edges_base = unsafe { section_base.add(4) };

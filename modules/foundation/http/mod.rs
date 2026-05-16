@@ -297,6 +297,90 @@ mod params_def {
             => |s, d, len| { server::set_route_fs_list(s, 3, d, len); };
         49, route_3_fs_filter, str, 0
             => |s, d, len| { server::set_route_fs_filter(s, 3, d, len); };
+
+        50, route_4_path, str, 0
+            => |s, d, len| { server::parse_route_path(s, 4, d, len); };
+        51, route_4_body, str, 0
+            => |s, d, len| { server::parse_route_body(s, 4, d, len); };
+        52, route_4_handler, u8, 0
+            => |s, d, len| { server::set_route_handler(s, 4, d, len); };
+        53, route_4_proxy_ip, u32, 0
+            => |s, d, len| { server::set_route_proxy_ip(s, 4, d, len); };
+        54, route_4_proxy_port, u16, 0
+            => |s, d, len| { server::set_route_proxy_port(s, 4, d, len); };
+        55, route_4_source, u16, 0xFFFF
+            => |s, d, len| { server::set_route_source(s, 4, d, len); };
+        56, route_4_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 4, d, len); };
+        57, route_4_fs_path, str, 0
+            => |s, d, len| { server::set_route_fs_path(s, 4, d, len); };
+        58, route_4_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 4, d, len); };
+        59, route_4_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 4, d, len); };
+
+        60, route_5_path, str, 0
+            => |s, d, len| { server::parse_route_path(s, 5, d, len); };
+        61, route_5_body, str, 0
+            => |s, d, len| { server::parse_route_body(s, 5, d, len); };
+        62, route_5_handler, u8, 0
+            => |s, d, len| { server::set_route_handler(s, 5, d, len); };
+        63, route_5_proxy_ip, u32, 0
+            => |s, d, len| { server::set_route_proxy_ip(s, 5, d, len); };
+        64, route_5_proxy_port, u16, 0
+            => |s, d, len| { server::set_route_proxy_port(s, 5, d, len); };
+        65, route_5_source, u16, 0xFFFF
+            => |s, d, len| { server::set_route_source(s, 5, d, len); };
+        66, route_5_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 5, d, len); };
+        67, route_5_fs_path, str, 0
+            => |s, d, len| { server::set_route_fs_path(s, 5, d, len); };
+        68, route_5_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 5, d, len); };
+        69, route_5_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 5, d, len); };
+
+        70, route_6_path, str, 0
+            => |s, d, len| { server::parse_route_path(s, 6, d, len); };
+        71, route_6_body, str, 0
+            => |s, d, len| { server::parse_route_body(s, 6, d, len); };
+        72, route_6_handler, u8, 0
+            => |s, d, len| { server::set_route_handler(s, 6, d, len); };
+        73, route_6_proxy_ip, u32, 0
+            => |s, d, len| { server::set_route_proxy_ip(s, 6, d, len); };
+        74, route_6_proxy_port, u16, 0
+            => |s, d, len| { server::set_route_proxy_port(s, 6, d, len); };
+        75, route_6_source, u16, 0xFFFF
+            => |s, d, len| { server::set_route_source(s, 6, d, len); };
+        76, route_6_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 6, d, len); };
+        77, route_6_fs_path, str, 0
+            => |s, d, len| { server::set_route_fs_path(s, 6, d, len); };
+        78, route_6_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 6, d, len); };
+        79, route_6_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 6, d, len); };
+
+        80, route_7_path, str, 0
+            => |s, d, len| { server::parse_route_path(s, 7, d, len); };
+        81, route_7_body, str, 0
+            => |s, d, len| { server::parse_route_body(s, 7, d, len); };
+        82, route_7_handler, u8, 0
+            => |s, d, len| { server::set_route_handler(s, 7, d, len); };
+        83, route_7_proxy_ip, u32, 0
+            => |s, d, len| { server::set_route_proxy_ip(s, 7, d, len); };
+        84, route_7_proxy_port, u16, 0
+            => |s, d, len| { server::set_route_proxy_port(s, 7, d, len); };
+        85, route_7_source, u16, 0xFFFF
+            => |s, d, len| { server::set_route_source(s, 7, d, len); };
+        86, route_7_content_type, str, 0
+            => |s, d, len| { server::parse_route_content_type(s, 7, d, len); };
+        87, route_7_fs_path, str, 0
+            => |s, d, len| { server::set_route_fs_path(s, 7, d, len); };
+        88, route_7_fs_list, str, 0
+            => |s, d, len| { server::set_route_fs_list(s, 7, d, len); };
+        89, route_7_fs_filter, str, 0
+            => |s, d, len| { server::set_route_fs_filter(s, 7, d, len); };
     }
 }
 
@@ -421,6 +505,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let rx_pre = s.tlm.bytes_in;
         let tx_pre = s.tlm.bytes_out;
         let bp_pre = s.tlm.bp_steps;
+
+        // Retention idle-tick: bumped every step; reset to 0 in
+        // `ws_drain_fanout_input` on a fresh capture. Lets the next
+        // captured envelope decide whether to wipe the buffer (idle
+        // gap exceeded → new producer state) or append (still
+        // streaming the same burst). Server-mode only — client mode
+        // never enters the retention path.
+        if s.mode == MODE_SERVER {
+            s.server.retained_idle_ticks = s.server.retained_idle_ticks.saturating_add(1);
+        }
 
         let rc = if s.mode == MODE_CLIENT {
             if s.client.protocol == 1 {
@@ -563,6 +657,18 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     #[cfg(not(target_arch = "aarch64"))]
     let file_ring: u32 = 2048;
 
+    // ws_in carries `WsFrame` envelopes from `ws_stream`:
+    //   [conn_id u32 LE][opcode u8][fin u8][payload_len u16 LE][payload]
+    // payload_len is u16 = up to 65535 bytes; full envelope ~65 KiB.
+    // Channel writes are all-or-nothing — a 2 KiB default buffer
+    // silently rejects every envelope and ws_drain_fanout_input sits
+    // on an empty channel forever. Size to one full envelope plus
+    // header slack; mailbox mode would be ideal but a sufficiently
+    // large FIFO works for single-producer single-consumer.
+    #[cfg(target_arch = "aarch64")]
+    let ws_in_ring: u32 = 131072; // 128 KiB — 2 full envelopes pipelined
+    #[cfg(not(target_arch = "aarch64"))]
+    let ws_in_ring: u32 = 65600; // exactly one envelope + header
     let hints = [
         ChannelHint {
             port_type: 0,
@@ -579,6 +685,11 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
             port_index: 2,
             buffer_size: file_ring,
         }, // in[2]: file data
+        ChannelHint {
+            port_type: 0,
+            port_index: 3,
+            buffer_size: ws_in_ring,
+        }, // in[3]: ws_in (WsFrame envelopes from ws_stream)
         ChannelHint {
             port_type: 1,
             port_index: 0,

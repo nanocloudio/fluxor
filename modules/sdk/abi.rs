@@ -112,6 +112,17 @@ pub mod contracts {
     pub mod key_vault {
         include!("contracts/key_vault.rs");
     }
+    pub mod input {
+        pub mod gamepad {
+            include!("contracts/input/gamepad.rs");
+        }
+        pub mod pointer {
+            include!("contracts/input/pointer.rs");
+        }
+        pub mod key {
+            include!("contracts/input/key.rs");
+        }
+    }
 }
 
 pub mod internal {

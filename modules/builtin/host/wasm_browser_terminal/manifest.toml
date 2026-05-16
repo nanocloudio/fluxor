@@ -1,0 +1,23 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+permissions = ["platform_raw"]
+
+# Browser DOM scrollback terminal. Drains the kernel log ring via the
+# diag-contract LOG_RING_DRAIN opcode and renders each chunk into a
+# `<pre>` widget in the page via the host shim's host_terminal_emit.
+# Same wire shape and consumer pattern as `log_net` on embedded
+# targets — the ring is multi-consumer, so wiring a terminal
+# alongside an active `log_net` or a browser-console host_log path
+# does not steal bytes from any other consumer.
+#
+# `presentation:` role: `terminal`. The synthesised wasm runtime
+# shell renders a `<div class="surface" data-role="terminal">`
+# containing a scrollback `<pre>`; the shim's host_terminal_emit
+# appends to it.
+#
+# No data ports — the module pulls log bytes directly from the ring
+# and writes to the DOM. Pair with `platform.debug: { to: terminal }`
+# in `stacks/debug.toml` to wire it in declaratively.
+
+# (no ports)

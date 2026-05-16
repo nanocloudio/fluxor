@@ -39,6 +39,12 @@ mod mp3_codec;
 
 mod aac_codec;
 
+mod image_codec;
+mod image_deflate;
+mod image_gif;
+mod image_jpeg;
+mod image_png;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -48,7 +54,15 @@ const FMT_DETECTING: u8 = 0;
 const FMT_WAV: u8 = 1;
 const FMT_MP3: u8 = 2;
 const FMT_AAC: u8 = 3;
-const FMT_IMAGE: u8 = 4;
+const FMT_BMP: u8 = 4;
+const FMT_GIF: u8 = 5;
+const FMT_PNG: u8 = 6;
+const FMT_JPEG: u8 = 7;
+
+#[inline(always)]
+fn is_image_format(fmt: u8) -> bool {
+    matches!(fmt, FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG)
+}
 
 
 /// Detection buffer size — enough to identify any format
@@ -70,10 +84,12 @@ const CODEC_STATE_SIZE: usize = {
     let wav_size = core::mem::size_of::<wav_codec::WavState>();
     let mp3_size = core::mem::size_of::<mp3_codec::Mp3State>();
     let aac_size = core::mem::size_of::<aac_codec::AacState>();
-    // Manual max of three values (const context)
+    let img_size = core::mem::size_of::<image_codec::ImageState>();
+    // Manual max of four values (const context)
     let mut max = wav_size;
     if mp3_size > max { max = mp3_size; }
     if aac_size > max { max = aac_size; }
+    if img_size > max { max = img_size; }
     // Align up to 4 bytes
     (max + 3) & !3
 };
@@ -97,8 +113,15 @@ struct CodecBuf([u8; CODEC_STATE_SIZE]);
 struct DecoderState {
     syscalls: *const SyscallTable,
     in_chan: i32,
+    /// `out_chan` is the FIRST output port from `module_new` — the
+    /// audio sink for audio formats. `pixels_chan` is looked up
+    /// separately at module_new via `dev_channel_port(.., 1, 1)`
+    /// because the BMP/image path emits VideoRaster on the second
+    /// output port. Unwired ports return `-1`; the dispatch checks
+    /// before writing.
     out_chan: i32,
-    /// Active format: 0=detecting, 1=wav, 2=mp3, 3=aac
+    pixels_chan: i32,
+    /// Active format: 0=detecting, 1=wav, 2=mp3, 3=aac, 4=bmp
     format: u8,
     /// Number of bytes in detect_buf
     detect_len: u8,
@@ -114,12 +137,34 @@ struct DecoderState {
     /// response body is fully drained — even though the channel ring
     /// still had ~10 AAC frames buffered for the codec to decode.
     hup_quiet_ticks: u8,
+    _pad_tc: [u8; 1],
+    /// Tick counter for the per-codec heartbeat (every 5000 ticks).
+    /// Drives the `[img] decoded (heartbeat)` re-emit + the sticky
+    /// `last_err` replay, both of which exist because a one-shot
+    /// dev_log from inside `decode_buffer` can be lost in the
+    /// early-boot log ring before log_net's UDP stream is fully
+    /// draining.
+    tick_count: u32,
     /// Header accumulation buffer for format detection
     detect_buf: [u8; DETECT_BUF_SIZE],
     /// IO buffer used during detection phase
     detect_io: [u8; DETECT_IO_SIZE],
-    /// Codec state — overlay for WavState/Mp3State/AacState
+    /// Codec state — overlay for WavState/Mp3State/AacState/ImageState
     codec: CodecBuf,
+
+    // ── Image-format staging ──
+    //
+    // BMP format isn't detected until the first two bytes arrive, by
+    // which time the ImageState lives inside the `codec` union. We
+    // stage the YAML-driven params here at module_new time and copy
+    // them into `ImageState` from `init_codec` once the format is
+    // known. Default-zero fields use `image_codec`'s own defaults
+    // (480×480 stretch, 8 MiB max).
+    image_dst_w: u16,
+    image_dst_h: u16,
+    image_scale_mode: u8,
+    _image_pad: u8,
+    image_max_bytes: u32,
 }
 
 impl DecoderState {
@@ -142,6 +187,11 @@ impl DecoderState {
     unsafe fn aac(&mut self) -> &mut aac_codec::AacState {
         &mut *(self.codec.0.as_mut_ptr() as *mut aac_codec::AacState)
     }
+
+    #[inline(always)]
+    unsafe fn img(&mut self) -> &mut image_codec::ImageState {
+        &mut *(self.codec.0.as_mut_ptr() as *mut image_codec::ImageState)
+    }
 }
 
 // ============================================================================
@@ -151,9 +201,25 @@ impl DecoderState {
 mod params_def {
     use super::DecoderState;
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u32, p_u8};
 
+    // Image params (1-4). Audio formats have no per-format params
+    // today (everything is auto-detected from the bitstream); when
+    // they do, append at tag 10+.
     define_params! {
         DecoderState;
+
+        1, width, u16, 480
+            => |s, d, len| { s.image_dst_w = p_u16(d, len, 0, 480); };
+
+        2, height, u16, 480
+            => |s, d, len| { s.image_dst_h = p_u16(d, len, 0, 480); };
+
+        3, scale_mode, u8, 0, enum { stretch=0, fit=1, fill=2 }
+            => |s, d, len| { s.image_scale_mode = p_u8(d, len, 0, 0); };
+
+        4, max_bytes, u32, 8388608
+            => |s, d, len| { s.image_max_bytes = p_u32(d, len, 0, 8388608); };
     }
 }
 
@@ -167,6 +233,28 @@ fn detect_format(buf: &[u8; DETECT_BUF_SIZE], len: u8) -> u8 {
     let n = len as usize;
     if n < 2 {
         return FMT_DETECTING;
+    }
+
+    // BMP — `BM` magic at offset 0. Two bytes is enough to commit.
+    if buf[0] == image_codec::BMP_MAGIC[0] && buf[1] == image_codec::BMP_MAGIC[1] {
+        return FMT_BMP;
+    }
+
+    // GIF — `GIF8` is shared by both GIF87a and GIF89a.
+    if n >= 4 && buf[..4] == *image_codec::GIF_MAGIC {
+        return FMT_GIF;
+    }
+
+    // PNG — 8-byte signature `89 50 4E 47 0D 0A 1A 0A`.
+    if n >= 8 && buf[..8] == *image_codec::PNG_MAGIC {
+        return FMT_PNG;
+    }
+
+    // JPEG — SOI (FF D8) followed by another marker byte (FF xx);
+    // the first segment is always FF E0 (APP0/JFIF) or similar, so
+    // three bytes are enough to commit.
+    if n >= 3 && buf[..3] == *image_codec::JPEG_MAGIC {
+        return FMT_JPEG;
     }
 
     // Check for RIFF/WAV (4 bytes)
@@ -254,6 +342,40 @@ unsafe fn init_codec(s: &mut DecoderState) {
             aac_codec::aac_feed_detect(a, detect_ptr, detect_len);
             dev_log(&*syscalls, 3, b"[dec] aac".as_ptr(), 9);
         }
+        FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG => {
+            // Image path emits on `pixels` (output port 1), not the
+            // audio `out_chan` (output port 0). The parent looks
+            // `pixels_chan` up via `dev_channel_port(.., 1, 1)` in
+            // module_new and stashes it on `DecoderState`.
+            let pix_chan = s.pixels_chan;
+            let (dw, dh, sm, mb) = (
+                s.image_dst_w,
+                s.image_dst_h,
+                s.image_scale_mode,
+                s.image_max_bytes,
+            );
+            let img = &mut *(codec_ptr as *mut image_codec::ImageState);
+            // Stage params + format discriminant before image_init.
+            img.dst_w = if dw == 0 { 480 } else { dw };
+            img.dst_h = if dh == 0 { 480 } else { dh };
+            img.scale_mode = sm;
+            img.max_bytes = if mb == 0 { 8 * 1024 * 1024 } else { mb };
+            img.image_format = match s.format {
+                FMT_GIF => image_codec::ImageFormat::Gif,
+                FMT_PNG => image_codec::ImageFormat::Png,
+                FMT_JPEG => image_codec::ImageFormat::Jpeg,
+                _ => image_codec::ImageFormat::Bmp,
+            };
+            image_codec::image_init(img, syscalls, in_chan, pix_chan);
+            image_codec::image_feed_detect(img, detect_ptr, detect_len);
+            let tag: &[u8] = match s.format {
+                FMT_GIF => b"[dec] gif",
+                FMT_PNG => b"[dec] png",
+                FMT_JPEG => b"[dec] jpeg",
+                _ => b"[dec] bmp",
+            };
+            dev_log(&*syscalls, 3, tag.as_ptr(), tag.len());
+        }
         _ => {}
     }
 }
@@ -266,6 +388,16 @@ unsafe fn init_codec(s: &mut DecoderState) {
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<DecoderState>() as u32
+}
+
+/// Per-module heap budget. Sized for the image path's worst case
+/// (8 MiB encoded BMP accumulator + 2 MiB decoded RGB565 slack); the
+/// audio paths use ~32 KB at most. Same budget covers any format
+/// since only one is active at a time per module instance.
+#[no_mangle]
+#[link_section = ".text.module_arena_size"]
+pub extern "C" fn module_arena_size() -> u32 {
+    10 * 1024 * 1024
 }
 
 #[no_mangle]
@@ -299,6 +431,10 @@ pub extern "C" fn module_new(
         s.syscalls = syscalls as *const SyscallTable;
         s.in_chan = in_chan;
         s.out_chan = out_chan;
+        // pixels port: output index 1 in the manifest (audio is
+        // output index 0 = `out_chan` above). Unwired = -1; the
+        // image path checks before writing.
+        s.pixels_chan = dev_channel_port(&*s.syscalls, 1, 1);
         s.format = FMT_DETECTING;
         s.detect_len = 0;
         s.empty_reads = 0;
@@ -327,6 +463,40 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut DecoderState);
         if s.syscalls.is_null() {
             return -1;
+        }
+
+        // Once-per-heartbeat re-emit of `[img] decoded` while the
+        // image path holds a successfully-decoded frame
+        // (Phase::Decoded or Phase::Draining — NOT Phase::Error
+        // which would be a false positive). The one-shot log fired
+        // inside `decode_buffer` can be lost in the early-boot log
+        // ring if it lands before log_net's UDP stream is fully
+        // draining — same pattern fat32/nvme use for their `init=`
+        // / `st=` heartbeats so a viewer connecting mid-run still
+        // sees the proof line.
+        s.tick_count = s.tick_count.wrapping_add(1);
+        if s.tick_count % 5000 == 0 && is_image_format(s.format) {
+            let img = &*(s.codec.0.as_ptr() as *const image_codec::ImageState);
+            let ph = img.phase as u32;
+            if ph == image_codec::Phase::Decoded as u32
+                || ph == image_codec::Phase::Draining as u32
+            {
+                let msg = b"[img] decoded (heartbeat)";
+                dev_log(s.sys(), 3, msg.as_ptr(), msg.len());
+            }
+            // Sticky error replay: format decoders write the reason
+            // into `last_err` on every failure path. Surface it once
+            // per heartbeat so the rig telemetry sees the diagnosis
+            // even when the one-shot dev_log from inside
+            // `decode_buffer` was dropped by log_net at boot.
+            if img.last_err_len > 0 {
+                dev_log(
+                    s.sys(),
+                    3,
+                    img.last_err.as_ptr(),
+                    img.last_err_len as usize,
+                );
+            }
         }
 
         // ----------------------------------------------------------------
@@ -402,7 +572,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //      drip-feeds to its consumer one chunk per tick; the
         //      quiesce window lets it finish that drain before we
         //      wipe its state.
-        {
+        // Audio-side HUP-quiesce reset. Image formats own their own
+        // EOF / drain / reset cycle inside `image_codec.rs`'s phase
+        // machine and would be torn out from under their own drain
+        // by this 64-tick reset (a 1 MiB RGB565 frame takes ~1000
+        // ticks to drain at WRITE_CHUNK = 1024 B/tick). Image
+        // formats also auto-reset to Phase::Ingest after drain so
+        // the next file's bytes pick up cleanly without a
+        // codec-state wipe.
+        if !is_image_format(s.format) {
             let sys_ptr = s.syscalls;
             let in_chan = s.in_chan;
             let in_poll = ((*sys_ptr).channel_poll)(in_chan, POLL_IN | POLL_HUP);
@@ -430,6 +608,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             FMT_WAV => wav_codec::wav_step(s.wav()),
             FMT_MP3 => mp3_codec::mp3_step(s.mp3()),
             FMT_AAC => aac_codec::aac_step(s.aac()),
+            FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG => image_codec::image_step(s.img()),
             _ => 0,
         }
     }
@@ -452,6 +631,14 @@ pub extern "C" fn module_channel_hints(hints: *mut ChannelHint, max_hints: usize
     if hints.is_null() || max_hints == 0 { return 0; }
     unsafe {
         *hints = ChannelHint { port_type: 1, port_index: 0, buffer_size: 1048576 };
+        if max_hints > 1 {
+            // Input encoded stream — bank writes 1024 bytes per tick;
+            // size for a healthy lead so writes don't stall when the
+            // BMP path is in Phase::Draining (not reading from in_chan
+            // for ~1000 ticks while emitting the decoded frame).
+            *hints.add(1) = ChannelHint { port_type: 0, port_index: 0, buffer_size: 65536 };
+            return 2;
+        }
     }
     1
 }

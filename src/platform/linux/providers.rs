@@ -53,24 +53,26 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             path_buf[..plen].copy_from_slice(&path_bytes[..plen]);
             path_buf[plen] = 0;
 
-            // O_CREAT creates the file but not its parent directories.
-            // Multi-Raft uses paths like `wal/p<id>/seg_<n>` and
-            // `raft/p<id>/meta`; idempotently mkdir -p the parent so a
-            // first-boot or first-partition write doesn't ENOENT.
-            if let Ok(path_str) = core::str::from_utf8(&path_bytes[..plen]) {
-                if let Some(parent) = std::path::Path::new(path_str).parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                }
-            }
-
+            // Open policy: read-write on existing files, never auto-
+            // create. The kernel's `FS_OPEN` opcode has no flags
+            // argument today — there's no way for the caller to
+            // signal "I need to write" vs "I'm just reading". A
+            // previous rev tried `O_RDWR|O_CREAT` first to support
+            // write-side callers, but that silently 200-OK'd missing
+            // files (a typo'd `GET /api/list/nope.png` would create
+            // an empty file and persist it on disk). Now: if the
+            // file doesn't exist, return ENODEV → the http handler
+            // emits 404 cleanly. Future write-side callers can use
+            // a new `FS_OPEN_CREATE` opcode or pass flags in the
+            // path-extension slot once the ABI grows that knob.
             let fd_raw = libc::open(
                 path_buf.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_CREAT,
-                0o644,
+                libc::O_RDWR,
+                0,
             );
             if fd_raw < 0 {
+                // Fall back to read-only (covers files we can read
+                // but not write, e.g. read-only-mounted assets).
                 let fd_raw =
                     libc::open(path_buf.as_ptr() as *const libc::c_char, libc::O_RDONLY, 0);
                 if fd_raw < 0 {

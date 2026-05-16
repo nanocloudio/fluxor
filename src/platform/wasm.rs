@@ -16,8 +16,52 @@ use crate::kernel::{channel, scheduler};
 #[path = "wasm/canvas.rs"]
 mod canvas;
 
+#[path = "wasm/ws_source.rs"]
+mod ws_source;
+
 #[path = "wasm/dom_input.rs"]
 mod dom_input;
+
+// Per-class input modules (capability-surface model). Each emits one
+// of the `modules/sdk/contracts/input/*` contracts; see the matching
+// `stacks/{gamepad,pointer,keyboard}.toml` for how `platform.gamepad:
+// {}` etc. select the right producer per-target. The legacy
+// `dom_input` above multiplexes keyboard events on a single channel;
+// new graphs wire one of the per-class modules below via a
+// `platform.<class>: {}` stack reference instead.
+#[path = "wasm/keyboard.rs"]
+mod keyboard;
+
+#[path = "wasm/pointer.rs"]
+mod pointer;
+
+#[path = "wasm/gamepad.rs"]
+mod gamepad;
+
+// DOM terminal — kernel-log-ring scrollback rendered into the page.
+// Drains via the same LOG_RING_DRAIN opcode (0x0C64) that
+// `log_net` uses on bcm2712/rp; multi-consumer-safe, so wiring a
+// terminal alongside `log_net` doesn't steal bytes.
+#[path = "wasm/terminal.rs"]
+mod terminal;
+
+// Touch-overlay-to-gamepad transformer. Consumes pointer events,
+// emits gamepad MSG_STATE based on which on-screen region each
+// active pointer hits. Visual overlay (DPAD + face-button divs) is
+// rendered by the runtime shell from the same canonical region
+// table the module hit-tests against.
+#[path = "wasm/touch_gamepad_overlay.rs"]
+pub(crate) mod touch_gamepad_overlay;
+
+// Click → FMP `next`/`prev` transformer. Browser-side analogue of
+// a hardware navigation button: KIND_UP with primary button → next,
+// KIND_UP with secondary button → prev. Wires the same FMP wire
+// the foundation/bank module accepts on its `commands` ctrl port,
+// either locally (pure-wasm) or across a WebSocket (split via
+// wasm_browser_websocket → http.ws_out → ws_stream.rx_out →
+// bank.commands).
+#[path = "wasm/click_command.rs"]
+mod click_command;
 
 #[path = "wasm/audio.rs"]
 mod audio;
@@ -259,10 +303,18 @@ use crate::abi::wire::fnv1a32;
 
 const WASM_BROWSER_CANVAS_HASH: u32 = fnv1a32(b"wasm_browser_canvas");
 const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
+const WASM_BROWSER_KEYBOARD_HASH: u32 = fnv1a32(b"wasm_browser_keyboard");
+const WASM_BROWSER_POINTER_HASH: u32 = fnv1a32(b"wasm_browser_pointer");
+const WASM_BROWSER_GAMEPAD_HASH: u32 = fnv1a32(b"wasm_browser_gamepad");
 const WASM_BROWSER_AUDIO_HASH: u32 = fnv1a32(b"wasm_browser_audio");
 const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
+const WASM_BROWSER_WS_SOURCE_HASH: u32 = fnv1a32(b"wasm_browser_ws_source");
 const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
 const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
+const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
+const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 =
+    fnv1a32(b"wasm_browser_touch_gamepad_overlay");
+const WASM_BROWSER_CLICK_COMMAND_HASH: u32 = fnv1a32(b"wasm_browser_click_command");
 
 /// Initialise a per-module heap sized for one `State` struct plus
 /// alignment slack. Each built-in's `alloc_state` makes one
@@ -413,6 +465,55 @@ unsafe fn load_embedded_modules() -> usize {
             continue;
         }
 
+        // Per-class input modules — capability-surface partition of
+        // the old dom_input. Each emits its corresponding
+        // `modules/sdk/contracts/input/*` contract on its single
+        // output port (port idx 0 — input modules are sources).
+        if entry.name_hash == WASM_BROWSER_KEYBOARD_HASH {
+            if !init_builtin_heap::<keyboard::KeyboardState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_keyboard: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = keyboard::build(out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_keyboard (built-in)", 0);
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_POINTER_HASH {
+            if !init_builtin_heap::<pointer::PointerState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_pointer: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = pointer::build(out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_pointer (built-in)", 0);
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_GAMEPAD_HASH {
+            if !init_builtin_heap::<gamepad::GamepadState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_gamepad: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = gamepad::build(out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_gamepad (built-in)", 0);
+            continue;
+        }
+
         if entry.name_hash == WASM_BROWSER_AUDIO_HASH {
             if !init_builtin_heap::<audio::AudioState>(module_idx) {
                 log_fmt2(
@@ -475,6 +576,42 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_websocket (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_WS_SOURCE_HASH {
+            if !init_builtin_heap::<ws_source::WsSourceState>(module_idx) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_ws_source: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let mut url_buf = [0u8; 256];
+            let mut url_len = 0usize;
+            walk_tlv(entry.params(), |tag, value| {
+                if tag == 10 {
+                    let n = value.len().min(url_buf.len());
+                    url_buf[..n].copy_from_slice(&value[..n]);
+                    url_len = n;
+                }
+            });
+            // RX-only: no input port. Output port `bytes` is index 0
+            // on direction=1 (output) by manifest declaration order.
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = ws_source::build(&url_buf[..url_len], out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_ws_source (built-in)",
                 0,
             );
             continue;
@@ -549,6 +686,65 @@ unsafe fn load_embedded_modules() -> usize {
                 " = wasm_browser_image_codec (built-in)",
                 0,
             );
+            continue;
+        }
+
+        // DOM scrollback terminal — drains the kernel log ring into
+        // a `<pre>` widget in the page. No data ports; the module
+        // pulls from the log ring via the diag-contract drain
+        // opcode same as `log_net` on embedded.
+        if entry.name_hash == WASM_BROWSER_TERMINAL_HASH {
+            if !init_builtin_heap::<terminal::TerminalState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_terminal: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let m = terminal::build();
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_terminal (built-in)", 0);
+            continue;
+        }
+
+        // Touch-overlay → gamepad transformer. PointerEvents in,
+        // GamepadEvents out. The runtime shell renders the visual
+        // overlay buttons (DPAD cross + face-button diamond) from
+        // the same canonical region table the module hit-tests
+        // against — see `touch_gamepad_overlay::REGIONS`.
+        if entry.name_hash == WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH {
+            if !init_builtin_heap::<touch_gamepad_overlay::OverlayState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_touch_gamepad_overlay: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let in_chan  = scheduler::get_module_port(module_idx, 0, 0);
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = touch_gamepad_overlay::build(in_chan, out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_touch_gamepad_overlay (built-in)", 0);
+            continue;
+        }
+
+        // Click → FMP `next`/`prev`: KIND_UP pointer events become
+        // canonical bank navigation commands. Same module powers
+        // pure-wasm (wired to local bank) and split (wired to
+        // wasm_browser_websocket.tx_in → /ws → linux bank).
+        if entry.name_hash == WASM_BROWSER_CLICK_COMMAND_HASH {
+            if !init_builtin_heap::<click_command::ClickCommandState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_click_command: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let in_chan  = scheduler::get_module_port(module_idx, 0, 0);
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = click_command::build(in_chan, out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_click_command (built-in)", 0);
             continue;
         }
 
@@ -973,6 +1169,11 @@ pub extern "C" fn kernel_step() -> u32 {
     let count = unsafe { MODULE_COUNT };
     let sched = unsafe { scheduler::sched_mut() };
     let _ = scheduler::step_modules(&mut sched.modules, count);
+    // Heartbeat opt-out on wasm: the browser tab is a single-step
+    // animation-frame loop and tab-side `console.log` already
+    // surfaces liveness via the scenario shell's status updates. A
+    // `log::info!` call from kernel_step on every frame thrashes
+    // the host-shim console handler — leave the heartbeat off here.
     16 // ~60 Hz hint
 }
 

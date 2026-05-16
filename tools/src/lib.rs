@@ -5,6 +5,7 @@
 //! `src/bin/` import. The main CLI lives in `src/main.rs`; this
 //! surface is intentionally narrow.
 
+pub mod asset_bank;
 pub mod error;
 mod hash;
 pub mod manifest;

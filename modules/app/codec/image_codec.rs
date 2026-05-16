@@ -1,828 +1,483 @@
-//! Image Decoder PIC Module
-//!
-//! Detects image format from stream header and decodes to RGB565 for display.
-//! Supports BMP (24-bit uncompressed, top-down) and JPEG (baseline, 1/8 IDCT).
-//!
-//! # Format Detection
-//!
-//! First bytes of input determine codec:
-//! - `BM` (2 bytes) → BMP
-//! - `0xFF 0xD8` → JPEG baseline (1/8 IDCT DC-only decode)
-//!
-//! # Stream Reset
-//!
-//! When bank switches files (EOF signal), the decoder resets to format
-//! detection for the next image. Follows the same pattern as audio decoder.
-//!
-//! # Parameters
-//!
-//! - `width`: output width in pixels (default 480)
-//! - `height`: output height in pixels (default 480)
-//! - `scale_mode`: 0=fit (letterbox), 1=fill (center-crop)
-//! - `bg_color`: letterbox fill color, RGB565 (default 0x0000 = black)
+// Image codec kernel — unified dispatcher for all bare-metal image
+// formats. Same shape as the audio codecs (init / feed_detect /
+// step), no module boilerplate — the parent `mod.rs` owns the PIC
+// entry points and the detect_format dispatch.
+//
+// Format dispatch is internal: `ImageState::image_format` selects
+// the per-format decompressor inside `decode_buffer`. Each format
+// lives in its own file alongside this one — BMP inline below
+// (smallest, no decompression), GIF in `image_gif.rs` (LZW), PNG
+// in `image_png.rs` (DEFLATE + filters), JPEG in `image_jpeg.rs`
+// (Huffman + IDCT + YCbCr). The Phase machine, channel I/O,
+// nearest-neighbour scaling, and RGB565 output path are shared.
+//
+// Memory layout (heap, via syscalls.heap_alloc):
+//   * encoded[]  — accumulator for the encoded source bytes
+//                  (up to `max_bytes`, 8 MiB default = 1920×1080 24-bit + slack)
+//   * pending[]  — decoded RGB565 LE frame (width × height × 2)
+// Both freed and re-allocated when dimensions change; allocated
+// lazily on first byte / first decode so audio-only deployments
+// don't pay the cost. Per-format scratch (LZW dictionary, DEFLATE
+// window, JPEG tables, etc.) is heap_alloc'd inside the decoder
+// and freed before return.
 
-#![no_std]
+use super::abi::SyscallTable;
+use super::dev_log;
 
-use core::ffi::c_void;
-
-#[path = "../../sdk/abi.rs"]
-mod abi;
-use abi::SyscallTable;
-
-include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
-
-pub mod scale;
-mod bmp_codec;
-pub mod jpeg_codec;
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// Format tags
-const FMT_DETECTING: u8 = 0;
-const FMT_BMP: u8 = 1;
-const FMT_JPEG: u8 = 2;
-
-/// IO read buffer for detection / row feeding
-const IO_BUF_SIZE: usize = 512;
-
-/// Codec state buffer size — must be >= largest codec state.
-/// Uses union overlay pattern (same as audio decoder).
-const CODEC_STATE_SIZE: usize = {
-    let bmp_size = core::mem::size_of::<bmp_codec::BmpState>();
-    let jpeg_size = core::mem::size_of::<jpeg_codec::JpegState>();
-    let mut max = bmp_size;
-    if jpeg_size > max { max = jpeg_size; }
-    // Align up to 4 bytes
-    (max + 3) & !3
-};
-
-// ============================================================================
-// Module phases
-// ============================================================================
+// ── Format dispatch ───────────────────────────────────────────────────────
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
-enum DecodePhase {
-    /// Accumulating header bytes for format detection
-    Detecting = 0,
-    /// Active codec decoding
-    Active = 1,
-    /// Image fully decoded, output complete
-    Done = 2,
+pub enum ImageFormat {
+    Bmp = 0,
+    Gif = 1,
+    Png = 2,
+    Jpeg = 3,
 }
 
-// ============================================================================
-// State
-// ============================================================================
+// ── Format magics ─────────────────────────────────────────────────────────
+//
+// Used by the parent's `detect_format` to identify the stream from
+// the first few bytes. Each format-specific decoder re-checks the
+// magic at the top of its `*_decode` function — `detect_format` is
+// a fast happy-path commit, not a security boundary.
+
+pub const BMP_MAGIC: &[u8; 2] = b"BM";
+pub const GIF_MAGIC: &[u8; 4] = b"GIF8";              // GIF87a / GIF89a
+pub const PNG_MAGIC: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+pub const JPEG_MAGIC: &[u8; 3] = b"\xff\xd8\xff";     // SOI (FF D8) + first segment marker (FF xx)
+
+// Back-compat aliases so the BMP submodule (still inline below) can
+// reference the magic bytes by their historical names.
+pub const BMP_MAGIC_0: u8 = BMP_MAGIC[0];
+pub const BMP_MAGIC_1: u8 = BMP_MAGIC[1];
+
+const BMP_HEADER_LEN: usize = 54;
+const IN_CHUNK: usize = 1024;
+const WRITE_CHUNK: usize = 1024;
+const EOF_TICKS: u32 = 200;
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum Phase {
+    Ingest = 0,
+    Decoded = 1,
+    Draining = 2,
+    Error = 3,
+}
+
+// ── State ─────────────────────────────────────────────────────────────────
 
 #[repr(C)]
-struct ImgDecodeState {
+pub struct ImageState {
+    pub syscalls: *const SyscallTable,
+    pub in_chan: i32,
+    pub out_chan: i32, // pixels port
+
+    // params (parent walks TLV into these before calling image_init)
+    pub dst_w: u16,
+    pub dst_h: u16,
+    pub scale_mode: u8,
+    _pad0: u8,
+    pub max_bytes: u32,
+
+    // accumulator
+    pub(super) encoded: *mut u8,
+    pub encoded_used: u32,
+    encoded_cap: u32,
+
+    // decoded RGB565 LE
+    pub(super) pending: *mut u8,
+    pub(super) pending_size: u32,
+    pub(super) pending_pos: u32,
+
+    // state
+    pub phase: Phase,
+    /// Set by the parent before `image_init` so `decode_buffer` knows
+    /// which decompressor to dispatch to. Defaults to Bmp (0) so
+    /// existing BMP fixtures keep working without explicit init.
+    pub image_format: ImageFormat,
+    /// Number of bytes in `last_err` (0 = no recorded error).
+    pub(super) last_err_len: u8,
+    _pad1: u8,
+    /// Last decode-failure reason — sticky, surfaced via the parent's
+    /// heartbeat so the rig telemetry sees the diagnosis even when
+    /// log_net dropped the one-shot dev_log fired from inside
+    /// `decode_buffer`.
+    pub(super) last_err: [u8; 48],
+    quiet_ticks: u32,
+}
+
+// ── Lifecycle ─────────────────────────────────────────────────────────────
+
+pub unsafe fn image_init(
+    s: &mut ImageState,
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
-
-    phase: DecodePhase,
-    format: u8,
-    detect_pos: u16,
-
-    // Config
-    dst_w: u16,
-    dst_h: u16,
-    scale_mode: u8,
-    decode_scale: u8,   // JPEG IDCT scale: 0=auto(1/8), 1=eighth, 2=quarter(future)
-    bg_color: u16,
-
-    // IO buffer (used during detection and BMP row feeding)
-    io_buf: [u8; IO_BUF_SIZE],
-
-    // Codec state overlay (BmpState or JpegState)
-    codec: [u8; CODEC_STATE_SIZE],
+) {
+    s.syscalls = syscalls;
+    s.in_chan = in_chan;
+    s.out_chan = out_chan;
+    // params (dst_w / dst_h / scale_mode / max_bytes) are written by
+    // the parent's TLV walker before image_init is called; we leave
+    // them alone here. Buffers + phase are reset though.
+    s.encoded = core::ptr::null_mut();
+    s.encoded_used = 0;
+    s.encoded_cap = 0;
+    s.pending = core::ptr::null_mut();
+    s.pending_size = 0;
+    s.pending_pos = 0;
+    s.phase = Phase::Ingest;
+    s.quiet_ticks = 0;
+    // `image_format` is staged by the parent's `init_codec` BEFORE
+    // `image_init` is called, so we leave it untouched here.
+    dev_log(&*syscalls, 3, b"[dec] image".as_ptr(), 11);
 }
 
-impl ImgDecodeState {
-    #[inline(always)]
-    unsafe fn sys(&self) -> &SyscallTable {
-        &*self.syscalls
+/// Replay the bytes the parent consumed during format detection so
+/// the BMP header parser sees them. The parent feeds the
+/// `detect_buf` bytes here before the first `image_step` call.
+pub unsafe fn image_feed_detect(s: &mut ImageState, buf: *const u8, len: usize) {
+    if !ensure_encoded(s) {
+        s.phase = Phase::Error;
+        return;
     }
-
-    #[inline(always)]
-    unsafe fn bmp(&mut self) -> &mut bmp_codec::BmpState {
-        &mut *(self.codec.as_mut_ptr() as *mut bmp_codec::BmpState)
+    if s.encoded_used as usize + len > s.encoded_cap as usize {
+        log(s, b"[img] detect bytes overflow");
+        s.phase = Phase::Error;
+        return;
     }
-
-    #[inline(always)]
-    unsafe fn jpeg(&mut self) -> &mut jpeg_codec::JpegState {
-        &mut *(self.codec.as_mut_ptr() as *mut jpeg_codec::JpegState)
-    }
+    core::ptr::copy_nonoverlapping(buf, s.encoded.add(s.encoded_used as usize), len);
+    s.encoded_used += len as u32;
 }
 
-// ============================================================================
-// Parameters
-// ============================================================================
-
-mod params_def {
-    use super::ImgDecodeState;
-    use super::{p_u8, p_u16};
-    use super::SCHEMA_MAX;
-
-    define_params! {
-        ImgDecodeState;
-
-        1, width, u16, 480
-            => |s, d, len| { s.dst_w = p_u16(d, len, 0, 480); };
-
-        2, height, u16, 480
-            => |s, d, len| { s.dst_h = p_u16(d, len, 0, 480); };
-
-        3, scale_mode, u8, 0, enum { fit=0, fill=1, stretch=2 }
-            => |s, d, len| { s.scale_mode = p_u8(d, len, 0, 0); };
-
-        4, bg_color, u16, 0
-            => |s, d, len| { s.bg_color = p_u16(d, len, 0, 0); };
-
-        5, decode_scale, u8, 0, enum { auto=0, eighth=1, quarter=2 }
-            => |s, d, len| { s.decode_scale = p_u8(d, len, 0, 0); };
-    }
+#[allow(dead_code)]
+pub unsafe fn image_is_done(s: &ImageState) -> bool {
+    matches!(s.phase, Phase::Error)
+        || (matches!(s.phase, Phase::Draining) && s.pending_pos >= s.pending_size)
 }
 
-// ============================================================================
-// Reset
-// ============================================================================
+// ── Step ──────────────────────────────────────────────────────────────────
 
-/// Reset decoder state for next image
-unsafe fn reset_decoder(s: &mut ImgDecodeState) {
-    s.phase = DecodePhase::Detecting;
-    s.format = FMT_DETECTING;
-    s.detect_pos = 0;
-
-    // Zero codec union (all codec initial states want zeros)
-    let cp = s.codec.as_mut_ptr();
-    let mut i = 0usize;
-    while i < CODEC_STATE_SIZE {
-        core::ptr::write_volatile(cp.add(i), 0);
-        i += 1;
-    }
-}
-
-// ============================================================================
-// BMP step function
-// ============================================================================
-
-/// Run one step of BMP decoding. Returns StepOutcome value.
-/// Uses raw pointer for syscalls to avoid borrow conflicts.
-unsafe fn bmp_step(s: *mut ImgDecodeState) -> i32 {
-    let sys = &*(*s).syscalls;
-    let in_chan = (*s).in_chan;
-    let out_chan = (*s).out_chan;
-    let dst_w = (*s).dst_w;
-    let dst_h = (*s).dst_h;
-    let scale_mode = (*s).scale_mode;
-    let bg_color = (*s).bg_color;
-    let bmp = &mut *((*s).codec.as_mut_ptr() as *mut bmp_codec::BmpState);
-    let io_buf = (*s).io_buf.as_mut_ptr();
-
-    match bmp.phase {
-        bmp_codec::BmpPhase::Header => {
-            // Need more header bytes
-            if bmp.hdr_len as usize >= bmp_codec::BMP_HDR_SIZE {
-                // Header complete — parse it
-                let rc = bmp_codec::parse_header(bmp, dst_w, dst_h, scale_mode);
-                if rc < 0 {
-                    dev_log(sys, 1, b"[img] bmp hdr err".as_ptr(), 17);
-                    bmp.phase = bmp_codec::BmpPhase::Error;
-                    return 0;
-                }
-                if bmp.top_down == 0 {
-                    dev_log(sys, 1, b"[img] bmp bottom-up unsup".as_ptr(), 25);
-                    bmp.phase = bmp_codec::BmpPhase::Error;
-                    return 0;
-                }
-                // Skip to pixel data
-                let already = bmp.hdr_len as u32;
-                bmp.bytes_skipped = already;
-                if already >= bmp.data_offset {
-                    bmp.phase = bmp_codec::BmpPhase::Decoding;
+pub unsafe fn image_step(s: &mut ImageState) -> i32 {
+    match s.phase {
+        Phase::Error => {
+            // A bad header is permanent for the current encoded
+            // buffer — there's nothing the codec can do to recover
+            // from a malformed file by re-running the parser. Stay
+            // in Error until the upstream serves NEW bytes (= bank
+            // advanced to the next file), at which point reset to
+            // Ingest and start accumulating again. The freshly-read
+            // bytes are replayed into the encoded buffer so they
+            // become the head of the next image.
+            let mut scratch = [0u8; IN_CHUNK];
+            let n = ((*s.syscalls).channel_read)(s.in_chan, scratch.as_mut_ptr(), scratch.len());
+            if n > 0 {
+                s.encoded_used = 0;
+                s.quiet_ticks = 0;
+                s.phase = Phase::Ingest;
+                if !ensure_encoded(s) {
+                    s.phase = Phase::Error;
                 } else {
-                    bmp.phase = bmp_codec::BmpPhase::SkipToData;
+                    let nn = n as usize;
+                    if s.encoded_used + nn as u32 <= s.encoded_cap {
+                        core::ptr::copy_nonoverlapping(
+                            scratch.as_ptr(),
+                            s.encoded.add(s.encoded_used as usize),
+                            nn,
+                        );
+                        s.encoded_used += nn as u32;
+                    }
                 }
-                dev_log(sys, 3, b"[img] bmp ok".as_ptr(), 12);
-                return 2; // Burst
-            }
-
-            // Read more header data
-            let poll = (sys.channel_poll)(in_chan, POLL_IN);
-            if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-                return 0;
-            }
-            let to_read = bmp_codec::BMP_HDR_SIZE - bmp.hdr_len as usize;
-            let cap = if to_read > IO_BUF_SIZE { IO_BUF_SIZE } else { to_read };
-            let n = (sys.channel_read)(in_chan, io_buf, cap);
-            if n > 0 {
-                bmp_codec::feed_header(bmp, io_buf as *const u8, n as usize);
             }
             0
         }
 
-        bmp_codec::BmpPhase::SkipToData => {
-            let poll = (sys.channel_poll)(in_chan, POLL_IN);
-            if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-                return 0;
-            }
-            let need = (bmp.data_offset - bmp.bytes_skipped) as usize;
-            let cap = if need > IO_BUF_SIZE { IO_BUF_SIZE } else { need };
-            let n = (sys.channel_read)(in_chan, io_buf, cap);
-            if n > 0 {
-                bmp.bytes_skipped += n as u32;
-            }
-            if bmp.bytes_skipped >= bmp.data_offset {
-                bmp.phase = bmp_codec::BmpPhase::Decoding;
-                return 2; // Burst
-            }
-            0
-        }
-
-        bmp_codec::BmpPhase::Decoding => {
-            // Check if we're done (all destination rows output)
-            if bmp.dst_row >= dst_h {
-                bmp.phase = bmp_codec::BmpPhase::Done;
-                (*s).phase = DecodePhase::Done;
-                dev_log(sys, 3, b"[img] done".as_ptr(), 10);
-                return 0;
-            }
-
-            // Top/bottom letterbox rows
-            let out_y = bmp.scale.out_y;
-            let out_h = bmp.scale.out_h;
-            if bmp.dst_row < out_y || bmp.dst_row >= out_y + out_h {
-                // Letterbox row — output solid bg_color
-                bmp_codec::letterbox_row(bmp, bg_color);
-                bmp.phase = bmp_codec::BmpPhase::Flushing;
-                return 2; // Burst
-            }
-
-            // Determine which source row we need for this destination row
-            let needed_src_y = bmp.scale.crop_y + scale::v_step(&mut bmp.scale);
-
-            // Do we need to skip source rows to reach the needed one?
-            while bmp.src_rows_read < needed_src_y {
-                // Need to consume source rows we don't need
-                let poll = (sys.channel_poll)(in_chan, POLL_IN);
-                if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-                    return 0; // Wait for input
-                }
-                let stride = bmp.row_stride as usize;
-                let pos = bmp.src_row_pos as usize;
-                let need = stride - pos;
-                let cap = if need > IO_BUF_SIZE { IO_BUF_SIZE } else { need };
-                let n = (sys.channel_read)(in_chan, io_buf, cap);
-                if n <= 0 {
-                    return 0;
-                }
-                bmp.src_row_pos += n as u32;
-                if bmp.src_row_pos >= stride as u32 {
-                    bmp.src_row_pos = 0;
-                    bmp.src_rows_read += 1;
-                }
-            }
-
-            // Now read the actual source row we need
-            if bmp.src_rows_read == needed_src_y {
-                // Need to accumulate this row
-                if bmp.row_ready == 0 {
-                    let poll = (sys.channel_poll)(in_chan, POLL_IN);
-                    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-                        return 0;
-                    }
-                    let stride = bmp.row_stride as usize;
-                    let pos = bmp.src_row_pos as usize;
-                    let need = stride - pos;
-                    let cap = if need > IO_BUF_SIZE { IO_BUF_SIZE } else { need };
-                    let n = (sys.channel_read)(in_chan, io_buf, cap);
-                    if n > 0 {
-                        bmp_codec::feed_row(bmp, io_buf as *const u8, n as usize);
-                    }
-                    if bmp.row_ready == 0 {
-                        return 0; // Need more data
-                    }
-                }
-            }
-
-            // Source row is ready (either fresh or reused for upscaling)
-            // Scale it and prepare output
-            bmp_codec::scale_row(bmp, bg_color);
-
-            // Diagnostic: dump first 8 pixels of first output row
-            if bmp.dst_row == 0 && bmp.last_src_y == 0 {
-                bmp.last_src_y = 0xFFFF; // one-shot
-                let hex = b"0123456789abcdef";
-                // Source row bytes (first 24 = 8 pixels × 3 bytes)
-                let mut lb = [0u8; 80];
-                let bp = lb.as_mut_ptr();
-                let tag = b"[img] src: ";
-                let mut p = 0usize;
-                let mut t = 0usize;
-                while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
-                let mut i = 0usize;
-                while i < 24 {
-                    let b = *bmp.src_row.as_ptr().add(i);
-                    *bp.add(p) = *hex.as_ptr().add((b >> 4) as usize); p += 1;
-                    *bp.add(p) = *hex.as_ptr().add((b & 0xf) as usize); p += 1;
-                    i += 1;
-                }
-                dev_log(sys, 3, bp, p);
-
-                // Output row bytes (first 16 pixels = 32 bytes RGB565)
-                let mut lb2 = [0u8; 80];
-                let bp2 = lb2.as_mut_ptr();
-                let tag2 = b"[img] out: ";
-                p = 0;
-                t = 0;
-                while t < tag2.len() { *bp2.add(p) = *tag2.as_ptr().add(t); p += 1; t += 1; }
-                i = 0;
-                while i < 32 {
-                    let b = *bmp.out_row.as_ptr().add(i);
-                    *bp2.add(p) = *hex.as_ptr().add((b >> 4) as usize); p += 1;
-                    *bp2.add(p) = *hex.as_ptr().add((b & 0xf) as usize); p += 1;
-                    i += 1;
-                }
-                dev_log(sys, 3, bp2, p);
-
-                // Log scale params
-                let mut lb3 = [0u8; 64];
-                let bp3 = lb3.as_mut_ptr();
-                let tag3 = b"[img] sc cw=";
-                p = 0;
-                t = 0;
-                while t < tag3.len() { *bp3.add(p) = *tag3.as_ptr().add(t); p += 1; t += 1; }
-                p += fmt_u32_raw(bp3.add(p), bmp.scale.crop_w as u32);
-                let s1 = b" ow=";
-                t = 0;
-                while t < s1.len() { *bp3.add(p) = *s1.as_ptr().add(t); p += 1; t += 1; }
-                p += fmt_u32_raw(bp3.add(p), bmp.scale.out_w as u32);
-                let s2 = b" ox=";
-                t = 0;
-                while t < s2.len() { *bp3.add(p) = *s2.as_ptr().add(t); p += 1; t += 1; }
-                p += fmt_u32_raw(bp3.add(p), bmp.scale.out_x as u32);
-                let s3 = b" cx=";
-                t = 0;
-                while t < s3.len() { *bp3.add(p) = *s3.as_ptr().add(t); p += 1; t += 1; }
-                p += fmt_u32_raw(bp3.add(p), bmp.scale.crop_x as u32);
-                dev_log(sys, 3, bp3, p);
-            }
-
-            bmp.row_ready = 0;
-            bmp.phase = bmp_codec::BmpPhase::Flushing;
-            2 // Burst
-        }
-
-        bmp_codec::BmpPhase::Flushing => {
-            // Write output row to channel
-            let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-            if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
-                return 0; // Wait for output space
-            }
-
-            let row_bytes = (dst_w as usize) * 2;
-            let pos = bmp.out_pos as usize;
-            let remaining = row_bytes - pos;
-
-            let src_ptr = bmp.out_row.as_ptr().add(pos);
-            let written = (sys.channel_write)(out_chan, src_ptr, remaining);
-            if written > 0 {
-                bmp.out_pos += written as u16;
-            }
-
-            if bmp.out_pos as usize >= row_bytes {
-                // Row fully output
-                bmp.out_pos = 0;
-                bmp.dst_row += 1;
-                bmp.phase = bmp_codec::BmpPhase::Decoding;
-                return 0; // Yield — let display module drain channel
-            }
-            0
-        }
-
-        bmp_codec::BmpPhase::Done => 0,
-        bmp_codec::BmpPhase::Error => 0,
-        _ => 0,
-    }
-}
-
-// ============================================================================
-// JPEG step function
-// ============================================================================
-
-/// Run one step of JPEG decoding. Returns StepOutcome value.
-unsafe fn jpeg_step(s: *mut ImgDecodeState) -> i32 {
-    let sys = &*(*s).syscalls;
-    let in_chan = (*s).in_chan;
-    let out_chan = (*s).out_chan;
-    let dst_w = (*s).dst_w;
-    let dst_h = (*s).dst_h;
-    let bg_color = (*s).bg_color;
-    let jpeg = &mut *((*s).codec.as_mut_ptr() as *mut jpeg_codec::JpegState);
-    let io_buf = (*s).io_buf.as_mut_ptr();
-
-    match jpeg.phase {
-        jpeg_codec::JpegPhase::Markers => {
-            // Read more data and feed to marker parser
-            let poll = (sys.channel_poll)(in_chan, POLL_IN);
-            if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-                return 0;
-            }
-            let n = (sys.channel_read)(in_chan, io_buf, IO_BUF_SIZE);
-            if n <= 0 { return 0; }
-
-            // One-shot: dump first 64 bytes of file data
-            let sos = jpeg_codec::feed_markers(jpeg, io_buf as *const u8, n as usize);
-            if sos {
-                // SOS parsed — initialize scan decoding
-                if jpeg.sof_seen == 0 {
-                    dev_log(sys, 1, b"[img] jpeg no sof".as_ptr(), 17);
-                    jpeg.phase = jpeg_codec::JpegPhase::Error;
-                    return 0;
-                }
-                jpeg_codec::init_scan(jpeg, dst_w, dst_h, (*s).scale_mode);
-                if jpeg.phase == jpeg_codec::JpegPhase::Error {
-                    dev_log(sys, 1, b"[img] jpeg init err".as_ptr(), 19);
-                    return 0;
-                }
-                jpeg.phase = jpeg_codec::JpegPhase::ScanData;
-                return 2; // Burst
-            }
-            if jpeg.phase == jpeg_codec::JpegPhase::Error {
-                dev_log(sys, 1, b"[img] jpeg hdr err".as_ptr(), 18);
-                return 0;
-            }
-            0
-        }
-
-        jpeg_codec::JpegPhase::ScanData => {
-            // Check if all output rows done
-            if jpeg.dst_row >= dst_h {
-                jpeg.phase = jpeg_codec::JpegPhase::Done;
-                (*s).phase = DecodePhase::Done;
-                dev_log(sys, 3, b"[img] done".as_ptr(), 10);
-                return 0;
-            }
-
-            // Letterbox rows (top/bottom)
-            let out_y = jpeg.scale.out_y;
-            let out_h = jpeg.scale.out_h;
-            if jpeg.dst_row < out_y || jpeg.dst_row >= out_y + out_h {
-                scale::fill_row_rgb565(jpeg.out_row.as_mut_ptr(), dst_w, bg_color);
-                jpeg.out_pos = 0;
-                jpeg.phase = jpeg_codec::JpegPhase::FlushRow;
-                return 2;
-            }
-
-            // Compute needed reduced-resolution row for this output row
-            if jpeg.need_computed == 0 {
-                jpeg.needed_y = jpeg.scale.crop_y + scale::v_step(&mut jpeg.scale);
-                jpeg.need_computed = 1;
-            }
-
-            // Decode MCUs until the needed reduced row is available
-            if jpeg.needed_y >= jpeg.reduced_y {
-                // Need more decoded data — try to refill input buffer
-                if (jpeg.in_len - jpeg.in_pos) < 128 {
-                    jpeg_codec::refill_input(jpeg, sys, in_chan);
-                }
-                if jpeg.in_len <= jpeg.in_pos {
-                    return 0; // No input data available
-                }
-
-                // Decode MCUs in a batch until MCU row completes or input runs low
-                let mut decoded = 0u16;
-                while jpeg.needed_y >= jpeg.reduced_y {
-                    if (jpeg.in_len - jpeg.in_pos) < 64 {
-                        // Input running low, refill
-                        jpeg_codec::refill_input(jpeg, sys, in_chan);
-                        if jpeg.in_len <= jpeg.in_pos {
-                            break; // No more input
-                        }
-                    }
-
-                    if !jpeg_codec::decode_mcu(jpeg) {
-                        if jpeg.eof_seen != 0 {
-                            jpeg.phase = jpeg_codec::JpegPhase::Done;
-                            (*s).phase = DecodePhase::Done;
-                            return 0;
-                        }
-                        // Log MCU decode failure (one-time: only when no MCUs decoded yet)
-                        if decoded == 0 && jpeg.mcu_fail_log == 0 {
-                            jpeg.mcu_fail_log = 1;
-                            let mut lb = [0u8; 48];
-                            let bp = lb.as_mut_ptr();
-                            let tag = b"[img] mcu fail x=";
-                            let mut p = 0usize;
-                            let mut t = 0usize;
-                            while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
-                            p += fmt_u32_raw(bp.add(p), jpeg.mcu_x as u32);
-                            *bp.add(p) = b' '; p += 1;
-                            *bp.add(p) = b'y'; p += 1;
-                            *bp.add(p) = b'='; p += 1;
-                            p += fmt_u32_raw(bp.add(p), jpeg.mcu_y as u32);
-                            *bp.add(p) = b' '; p += 1;
-                            *bp.add(p) = b'b'; p += 1;
-                            *bp.add(p) = b'='; p += 1;
-                            p += fmt_u32_raw(bp.add(p), jpeg.bits_left as u32);
-                            *bp.add(p) = b' '; p += 1;
-                            *bp.add(p) = b'i'; p += 1;
-                            *bp.add(p) = b'='; p += 1;
-                            p += fmt_u32_raw(bp.add(p), (jpeg.in_len - jpeg.in_pos) as u32);
-                            dev_log(sys, 1, bp, p);
-                        }
-                        break; // Error or need more data
-                    }
-
-                    decoded += 1;
-
-                    // Check if MCU row completed (mcu_x wrapped to 0)
-                    if jpeg.mcu_x == 0 {
-                        jpeg.reduced_y += jpeg.row_h as u16;
-                    }
-
-                    // Limit batch size — yield to scheduler to prevent
-                    // watchdog timeout on large images (252 MCUs/row for 4K)
-                    if decoded >= 8 {
-                        return 0; // Yield
-                    }
-                }
-
-                if jpeg.needed_y >= jpeg.reduced_y {
-                    return 0; // Yield — need more MCU data
-                }
-            }
-
-            // Needed reduced row is now available in row_buf.
-            // Determine which sub-row within the MCU row.
-            let row_h = jpeg.row_h as u16;
-            let sub_row = jpeg.needed_y - (jpeg.reduced_y - row_h);
-            let row_offset = (sub_row as usize) * (jpeg.row_w as usize) * 2;
-            let src = jpeg.row_buf.as_ptr().add(row_offset);
-
-            // Horizontal scaling with letterboxing
-            let p_out_x = jpeg.scale.out_x;
-            let p_out_w = jpeg.scale.out_w;
-            let p_crop_x = jpeg.scale.crop_x;
-            let p_crop_w = jpeg.scale.crop_w;
-
-            // Left letterbox
-            if p_out_x > 0 {
-                scale::fill_row_rgb565(jpeg.out_row.as_mut_ptr(), p_out_x, bg_color);
-            }
-
-            // Scaled content
-            scale::h_scale_row_rgb565(
-                src,
-                p_crop_x, p_crop_w,
-                jpeg.out_row.as_mut_ptr().add((p_out_x as usize) * 2),
-                p_out_w,
-            );
-
-            // Right letterbox
-            let right_start = p_out_x + p_out_w;
-            if right_start < dst_w {
-                let right_count = dst_w - right_start;
-                scale::fill_row_rgb565(
-                    jpeg.out_row.as_mut_ptr().add((right_start as usize) * 2),
-                    right_count,
-                    bg_color,
+        Phase::Draining => {
+            if s.pending_pos < s.pending_size {
+                let take = (s.pending_size - s.pending_pos).min(WRITE_CHUNK as u32);
+                let w = ((*s.syscalls).channel_write)(
+                    s.out_chan,
+                    s.pending.add(s.pending_pos as usize),
+                    take as usize,
                 );
-            }
-
-            jpeg.out_pos = 0;
-            jpeg.need_computed = 0;
-            jpeg.phase = jpeg_codec::JpegPhase::FlushRow;
-            2 // Burst
-        }
-
-        jpeg_codec::JpegPhase::FlushRow => {
-            let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-            if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
+                if w > 0 {
+                    s.pending_pos += w as u32;
+                }
                 return 0;
             }
-
-            let row_bytes = (dst_w as usize) * 2;
-            let pos = jpeg.out_pos as usize;
-            let remaining = row_bytes - pos;
-
-            let src_ptr = jpeg.out_row.as_ptr().add(pos);
-            let written = (sys.channel_write)(out_chan, src_ptr, remaining);
-            if written > 0 {
-                jpeg.out_pos += written as u16;
-            }
-
-            if jpeg.out_pos as usize >= row_bytes {
-                jpeg.out_pos = 0;
-                jpeg.dst_row += 1;
-                jpeg.phase = jpeg_codec::JpegPhase::ScanData;
-                return 0; // Yield — let display module drain channel
-            }
+            // Fully drained — reset for the next image. Bank's
+            // IOCTL_FLUSH on the next file lines this up.
+            s.pending_pos = 0;
+            s.encoded_used = 0;
+            s.quiet_ticks = 0;
+            s.phase = Phase::Ingest;
             0
         }
 
-        jpeg_codec::JpegPhase::Done => 0,
-        jpeg_codec::JpegPhase::Error => 0,
-        _ => 0,
-    }
-}
-
-// ============================================================================
-// Module API
-// ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ImgDecodeState>() as u32
-}
-
-#[no_mangle]
-#[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
-
-#[no_mangle]
-#[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32,
-    out_chan: i32,
-    _ctrl_chan: i32,
-    params: *const u8,
-    params_len: usize,
-    state: *mut u8,
-    state_size: usize,
-    syscalls: *const c_void,
-) -> i32 {
-    unsafe {
-        if syscalls.is_null() || state.is_null() {
-            return -1;
-        }
-        if state_size < core::mem::size_of::<ImgDecodeState>() {
-            return -2;
+        Phase::Decoded => {
+            s.phase = Phase::Draining;
+            0
         }
 
-        let s = &mut *(state as *mut ImgDecodeState);
-        s.syscalls = syscalls as *const SyscallTable;
-        s.in_chan = in_chan;
-        s.out_chan = out_chan;
-        s.phase = DecodePhase::Detecting;
-        s.format = FMT_DETECTING;
-        s.detect_pos = 0;
-
-        // Defaults
-        s.dst_w = 480;
-        s.dst_h = 480;
-        s.scale_mode = 0;
-        s.decode_scale = 0;
-        s.bg_color = 0;
-
-        // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
-
-        if is_tlv {
-            params_def::parse_tlv(s, params, params_len);
-        } else {
-            params_def::set_defaults(s);
-        }
-
-        // Validate scale_mode (0=fit, 1=fill, 2=stretch)
-        if s.scale_mode > 2 {
-            dev_log(&*s.syscalls, 2, b"[img] unknown scale_mode, using fit".as_ptr(), 37);
-            s.scale_mode = 0;
-        }
-
-        // Validate decode_scale (0=auto, 1=eighth — higher not yet implemented)
-        if s.decode_scale >= 2 {
-            dev_log(&*s.syscalls, 2,
-                b"[img] decode_scale not yet available, using auto".as_ptr(), 48);
-            s.decode_scale = 0;
-        }
-
-        0
-    }
-}
-
-#[no_mangle]
-#[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    unsafe {
-        if state.is_null() {
-            return -1;
-        }
-        let s = &mut *(state as *mut ImgDecodeState);
-        if s.syscalls.is_null() || s.in_chan < 0 || s.out_chan < 0 {
-            return 0;
-        }
-
-        let sys = &*s.syscalls;
-
-        // Check for stream reset (EOF from bank on file switch)
-        // Only reset if HUP *and* no more readable data in channel
-        if s.phase != DecodePhase::Detecting {
-            let in_poll = (sys.channel_poll)(s.in_chan, POLL_IN | POLL_HUP);
-            if (in_poll as u32) & POLL_HUP != 0
-                && ((in_poll as u32) & POLL_IN) == 0
-            {
-                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
-                dev_log(sys, 3, b"[img] rst".as_ptr(), 9);
-                reset_decoder(s);
+        Phase::Ingest => {
+            let mut chunk = [0u8; IN_CHUNK];
+            let n = ((*s.syscalls).channel_read)(s.in_chan, chunk.as_mut_ptr(), chunk.len());
+            if n > 0 {
+                let n = n as usize;
+                if !ensure_encoded(s) {
+                    s.phase = Phase::Error;
+                    return 0;
+                }
+                if s.encoded_used + n as u32 > s.encoded_cap {
+                    log(s, b"[img] encoded buffer overflow");
+                    s.phase = Phase::Error;
+                    return 0;
+                }
+                core::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    s.encoded.add(s.encoded_used as usize),
+                    n,
+                );
+                s.encoded_used += n as u32;
+                s.quiet_ticks = 0;
                 return 0;
             }
-        }
-
-        match s.phase {
-            DecodePhase::Detecting => {
-                let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-                if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-                    return 0;
-                }
-
-                // Read a small amount for format detection (max 8 bytes)
-                let pos = s.detect_pos as usize;
-                let want = if 8 > pos { 8 - pos } else { 0 };
-                if want == 0 {
-                    dev_log(sys, 1, b"[img] unknown fmt".as_ptr(), 17);
-                    s.phase = DecodePhase::Done;
-                    return 0;
-                }
-
-                let n = (sys.channel_read)(s.in_chan, s.io_buf.as_mut_ptr().add(pos), want);
-                if n <= 0 { return 0; }
-                s.detect_pos += n as u16;
-
-                if s.detect_pos < 2 { return 0; }
-
-                let b0 = *s.io_buf.as_ptr();
-                let b1 = *s.io_buf.as_ptr().add(1);
-
-                // Capture values before codec accessor borrows s
-                let io_ptr = s.io_buf.as_ptr();
-                let det_len = s.detect_pos as usize;
-
-                if b0 == 0x42 && b1 == 0x4D {
-                    // BMP detected
-                    s.format = FMT_BMP;
-                    s.phase = DecodePhase::Active;
-                    let bmp = s.bmp();
-                    bmp.phase = bmp_codec::BmpPhase::Header;
-                    bmp.hdr_len = 0;
-                    bmp_codec::feed_header(bmp, io_ptr, det_len);
-                    dev_log(sys, 3, b"[img] fmt=bmp".as_ptr(), 13);
-                    return 2; // Burst — start BMP decode
-                }
-
-                if b0 == 0xFF && b1 == 0xD8 {
-                    // JPEG detected
-                    s.format = FMT_JPEG;
-                    s.phase = DecodePhase::Active;
-                    let jpeg = s.jpeg();
-                    jpeg.phase = jpeg_codec::JpegPhase::Markers;
-                    jpeg.mk_state = jpeg_codec::MarkerState::Search;
-                    jpeg_codec::feed_markers(jpeg, io_ptr, det_len);
-                    dev_log(sys, 3, b"[img] fmt=jpeg".as_ptr(), 14);
-                    return 2; // Burst — start JPEG marker parsing
-                }
-
-                if s.detect_pos >= 8 {
-                    dev_log(sys, 1, b"[img] unknown fmt".as_ptr(), 17);
-                    s.phase = DecodePhase::Done;
-                }
-                0
+            if s.encoded_used == 0 {
+                return 0;
             }
-
-            DecodePhase::Active => {
-                match s.format {
-                    FMT_BMP => bmp_step(s as *mut ImgDecodeState),
-                    FMT_JPEG => jpeg_step(s as *mut ImgDecodeState),
-                    _ => 0,
-                }
+            // EOF heuristic: `EOF_TICKS` of upstream quiet → batch decode.
+            s.quiet_ticks = s.quiet_ticks.saturating_add(1);
+            if s.quiet_ticks < EOF_TICKS {
+                return 0;
             }
-
-            DecodePhase::Done => 0,
+            if !decode_buffer(s) {
+                s.phase = Phase::Error;
+                return 0;
+            }
+            s.phase = Phase::Decoded;
+            0
         }
     }
 }
 
-// ============================================================================
-// Channel Hints
-// ============================================================================
+// ── Decode helpers ───────────────────────────────────────────────────────
+//
+// `pub(super)` so the sibling format files (`image_gif.rs`, `image_png.rs`,
+// `image_jpeg.rs`) can share the encoded/pending/scaling chassis.
 
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        // Request larger input buffer for pixel data throughput
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 4096 },
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
+pub(super) unsafe fn ensure_encoded(s: &mut ImageState) -> bool {
+    if !s.encoded.is_null() {
+        return true;
+    }
+    let cap = if s.max_bytes == 0 { 8 * 1024 * 1024 } else { s.max_bytes };
+    let p = ((*s.syscalls).heap_alloc)(cap);
+    if p.is_null() {
+        log(s, b"[img] encoded alloc failed");
+        return false;
+    }
+    s.encoded = p;
+    s.encoded_cap = cap;
+    true
 }
 
-// ============================================================================
-// Panic Handler
-// ============================================================================
+#[inline(always)]
+pub(super) fn le_u16(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([b[off], b[off + 1]])
+}
+
+#[inline(always)]
+pub(super) fn le_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+#[inline(always)]
+fn le_i32(b: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+#[inline(always)]
+pub(super) fn be_u16(b: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([b[off], b[off + 1]])
+}
+
+#[inline(always)]
+pub(super) fn be_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+/// Allocate or re-allocate `s.pending` to fit `dst_w × dst_h × 2`
+/// bytes (RGB565 LE). Format decoders call this once per decode after
+/// they have parsed their dimensions. Re-uses the buffer when the
+/// size matches the previous decode.
+pub(super) unsafe fn ensure_pending(s: &mut ImageState, dst_w: usize, dst_h: usize) -> bool {
+    let dst_bytes = dst_w * dst_h * 2;
+    if s.pending.is_null() || s.pending_size as usize != dst_bytes {
+        if !s.pending.is_null() {
+            ((*s.syscalls).heap_free)(s.pending);
+        }
+        let p = ((*s.syscalls).heap_alloc)(dst_bytes as u32);
+        if p.is_null() {
+            log(s, b"[img] pending alloc failed");
+            return false;
+        }
+        s.pending = p;
+        s.pending_size = dst_bytes as u32;
+    }
+    s.pending_pos = 0;
+    true
+}
+
+/// Pack a (r,g,b) triple (each 0..=255) into RGB565 little-endian
+/// at `dst[off..off+2]`.
+#[inline(always)]
+pub(super) unsafe fn store_rgb565(dst: *mut u8, off: usize, r: u8, g: u8, b: u8) {
+    let v = (((r as u16) >> 3) << 11) | (((g as u16) >> 2) << 5) | ((b as u16) >> 3);
+    *dst.add(off)     = (v & 0xFF) as u8;
+    *dst.add(off + 1) = (v >> 8) as u8;
+}
+
+/// Decode `s.encoded[..s.encoded_used]` into `s.pending` (RGB565 LE).
+/// Dispatch by `s.image_format`; format-specific decoders live in
+/// their own files (`image_gif.rs`, `image_png.rs`, `image_jpeg.rs`)
+/// and write straight into `s.pending` via the shared helpers below.
+/// Returns false on any parse / format failure.
+unsafe fn decode_buffer(s: &mut ImageState) -> bool {
+    match s.image_format {
+        ImageFormat::Bmp => bmp_decode(s),
+        ImageFormat::Gif => super::image_gif::gif_decode(s),
+        ImageFormat::Png => super::image_png::png_decode(s),
+        ImageFormat::Jpeg => super::image_jpeg::jpeg_decode(s),
+    }
+}
+
+/// BMP-specific decoder (24-bit uncompressed BI_RGB only).
+unsafe fn bmp_decode(s: &mut ImageState) -> bool {
+    let buf = core::slice::from_raw_parts(s.encoded, s.encoded_used as usize);
+    if buf.len() < BMP_HEADER_LEN {
+        log(s, b"[img] truncated header");
+        return false;
+    }
+    if buf[0] != BMP_MAGIC_0 || buf[1] != BMP_MAGIC_1 {
+        log(s, b"[img] missing BM magic");
+        return false;
+    }
+    let pixel_offset = le_u32(buf, 10) as usize;
+    let src_w = le_i32(buf, 18);
+    let src_h_signed = le_i32(buf, 22);
+    let bpp = le_u16(buf, 28);
+    let compression = le_u32(buf, 30);
+
+    if src_w <= 0 || src_h_signed == 0 {
+        log(s, b"[img] invalid dimensions");
+        return false;
+    }
+    if bpp != 24 {
+        log(s, b"[img] only 24-bit BMP supported");
+        return false;
+    }
+    if compression != 0 {
+        log(s, b"[img] only uncompressed BI_RGB supported");
+        return false;
+    }
+    let src_w = src_w as usize;
+    let src_h = src_h_signed.unsigned_abs() as usize;
+    let bottom_up = src_h_signed > 0;
+    let row_stride = (src_w * 3 + 3) & !3;
+    let needed = pixel_offset + row_stride * src_h;
+    if needed > buf.len() {
+        log(s, b"[img] pixel data truncated");
+        return false;
+    }
+
+    let dst_w = s.dst_w as usize;
+    let dst_h = s.dst_h as usize;
+    if !ensure_pending(s, dst_w, dst_h) {
+        return false;
+    }
+
+    let pixel_data = &buf[pixel_offset..pixel_offset + row_stride * src_h];
+
+    let _ = s.scale_mode; // stretch / fit / fill — only stretch in v1
+
+    // Precompute src_x for each dst_x to keep the divide out of the hot loop.
+    let xmap_bytes = dst_w * core::mem::size_of::<u32>();
+    let xmap_raw = ((*s.syscalls).heap_alloc)(xmap_bytes as u32) as *mut u32;
+    if xmap_raw.is_null() {
+        log(s, b"[img] xmap alloc failed");
+        return false;
+    }
+    let xmap = core::slice::from_raw_parts_mut(xmap_raw, dst_w);
+    for dx in 0..dst_w {
+        xmap[dx] = (((dx as u32) * 2 + 1) * src_w as u32) / (dst_w as u32 * 2);
+    }
+
+    for dy in 0..dst_h {
+        let sy_raw = (((dy as u32) * 2 + 1) * src_h as u32) / (dst_h as u32 * 2);
+        let sy = if bottom_up {
+            (src_h - 1).saturating_sub(sy_raw as usize)
+        } else {
+            sy_raw as usize
+        };
+        let row = &pixel_data[sy * row_stride..sy * row_stride + src_w * 3];
+        let dst_row_off = dy * dst_w * 2;
+        for dx in 0..dst_w {
+            let sx = xmap[dx] as usize;
+            let b = row[sx * 3];
+            let g = row[sx * 3 + 1];
+            let r = row[sx * 3 + 2];
+            store_rgb565(s.pending, dst_row_off + dx * 2, r, g, b);
+        }
+    }
+
+    ((*s.syscalls).heap_free)(xmap_raw as *mut u8);
+    log_dims(s, b"[img] decoded ", src_w as u32, src_h as u32, dst_w as u32, dst_h as u32);
+    true
+}
+
+// ── Logging helpers ──────────────────────────────────────────────────────
+
+/// Emit a log line AND record it in `last_err` so the parent's
+/// heartbeat can resurface the reason later. Used by per-format
+/// decoders on every error branch — the original one-shot
+/// `dev_log` from inside `decode_buffer` is often dropped by
+/// log_net during early boot before its UDP stream is fully
+/// draining, so the sticky copy is the reliable diagnosis path.
+#[inline]
+pub(super) unsafe fn log(s: &mut ImageState, msg: &[u8]) {
+    dev_log(&*s.syscalls, 3, msg.as_ptr(), msg.len());
+    let n = msg.len().min(s.last_err.len());
+    for i in 0..n {
+        s.last_err[i] = msg[i];
+    }
+    s.last_err_len = n as u8;
+}
+
+pub(super) unsafe fn log_dims(s: &ImageState, prefix: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) {
+    let mut buf = [0u8; 96];
+    let p = buf.as_mut_ptr();
+    let mut q = 0usize;
+    let mut t = 0;
+    while t < prefix.len() {
+        *p.add(q) = prefix[t];
+        q += 1;
+        t += 1;
+    }
+    q += super::fmt_u32_raw(p.add(q), sw);
+    *p.add(q) = b'x';
+    q += 1;
+    q += super::fmt_u32_raw(p.add(q), sh);
+    let arrow = b" -> ";
+    let mut t = 0;
+    while t < arrow.len() {
+        *p.add(q) = arrow[t];
+        q += 1;
+        t += 1;
+    }
+    q += super::fmt_u32_raw(p.add(q), dw);
+    *p.add(q) = b'x';
+    q += 1;
+    q += super::fmt_u32_raw(p.add(q), dh);
+    dev_log(&*s.syscalls, 3, p, q);
+}

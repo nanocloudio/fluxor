@@ -41,7 +41,7 @@ every column; only the deployment target changes.
 | --------------- | ----------------- | ------------------------------- | ----------------------------- | ------------------------------------------------------------ |
 | inline          | `rp2350` (lcd-4)  | two BMPs baked into config       | ST7701S 480×480 RGB parallel  | [`examples/waveshare-lcd4/image_viewer_inline.yaml`](../../examples/waveshare-lcd4/image_viewer_inline.yaml) |
 | canonical SD    | `rp2350` (lcd-4)  | SPI SD card, `/images/*`         | ST7701S 480×480 RGB parallel  | [`examples/waveshare-lcd4/image_viewer.yaml`](../../examples/waveshare-lcd4/image_viewer.yaml) |
-| split           | `cm5` + browser   | NVMe FAT32, `/images/*` on pi5   | browser `<canvas>` via WS     | [`examples/cm5/image_viewer_split.yaml`](../../examples/cm5/image_viewer_split.yaml) |
+| split           | `cm5` + browser   | NVMe FAT32, `/images/*` on pi5   | browser `<canvas>` via WS     | [`examples/cm5/image_viewer.yaml`](../../examples/cm5/image_viewer.yaml) |
 | full browser    | `wasm`            | `host_browser_fetch` over HTTP   | browser `<canvas>`            | [`examples/wasm/image_viewer.yaml`](../../examples/wasm/image_viewer.yaml) + [`viewer.html`](../../examples/wasm/viewer.html) |
 
 ### audio_player

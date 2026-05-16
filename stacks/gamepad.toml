@@ -1,0 +1,47 @@
+# Platform stack: gamepad — input capability surface
+#
+# Resolves `platform.gamepad: {}` in a graph YAML to the right
+# per-target gamepad producer module. Every variant emits the
+# `input::gamepad` contract on a uniformly-named output port
+# (`gamepad.events`), so any consumer (game, emulator,
+# input-handler module) wiring to `gamepad.events` is target-
+# portable: `from: gamepad.events` resolves to USB-HID on pico2w,
+# libinput on linux, Web Gamepad API in the browser, etc.
+#
+# The contract wire shape lives at
+# `modules/sdk/contracts/input/gamepad.rs` — W3C-mapped 16-button,
+# 4-axis snapshots with optional rumble.
+
+[stack]
+name = "gamepad"
+
+# ── Browser: Web Gamepad API (polled per requestAnimationFrame)
+[[variant]]
+match = { family = "wasm" }
+modules = [{ name = "gamepad", type = "wasm_browser_gamepad" }]
+wiring = []
+
+# ── Linux host: libinput / evdev passthrough
+[[variant]]
+match = { family = "linux" }
+modules = [{ name = "gamepad", type = "linux_input_gamepad" }]
+wiring = []
+
+# ── Pico W / Pico 2W: USB HID host (when the board's USB port runs
+#    as host, not device). Same shape on both RP silicon revs.
+[[variant]]
+match = { board = "pico2w" }
+modules = [{ name = "gamepad", type = "usb_hid_gamepad", params = { usb_bus = "0" } }]
+wiring = []
+
+[[variant]]
+match = { board = "picow" }
+modules = [{ name = "gamepad", type = "usb_hid_gamepad", params = { usb_bus = "0" } }]
+wiring = []
+
+# ── BCM2712 (CM5 / Pi 5 bare-metal): USB HID via the rp1 root
+#    complex. Bus 0 is the host-side bus on cm5.
+[[variant]]
+match = { board = "cm5" }
+modules = [{ name = "gamepad", type = "usb_hid_gamepad", params = { usb_bus = "0" } }]
+wiring = []

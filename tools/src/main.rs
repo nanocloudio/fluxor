@@ -17,9 +17,11 @@ mod error;
 mod hash;
 mod manifest;
 mod modules;
+mod asset_bank;
 mod monitor;
 pub mod reconfigure;
 pub mod rig;
+mod scenario;
 mod schema;
 mod stack_expand;
 pub mod target;
@@ -202,10 +204,47 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Build and run a config (Linux or QEMU targets)
+    /// Build and run a config (Linux or QEMU targets), or run a
+    /// deployment scenario (`kind: scenario`).
+    ///
+    /// Scenario flags (see `.context/rfc_deployment_scenarios.md`):
+    ///   --print-synthesised      dump the synthesised host graph YAML
+    ///                            and exit (no spawning).
+    ///   --print-merged <comp>    dump the binding-augmented config
+    ///                            for the named component and exit
+    ///                            (PR 2; reports not-yet-impl in PR 1).
+    ///   --validate-only          parse, validate, exit (CI-friendly).
+    ///   --list [dir]             enumerate scenario files in `dir`
+    ///                            (or CWD) and exit. `<config>` may be
+    ///                            omitted.
+    ///   --graph                  emit Graphviz DOT of the scenario
+    ///                            (nodes = components, edges = bindings).
     Run {
-        /// Config file (YAML)
-        config: PathBuf,
+        /// Config file (YAML).  Optional only when `--list` is given.
+        config: Option<PathBuf>,
+        /// Scenario only: dump the synthesised host graph YAML and exit.
+        #[arg(long)]
+        print_synthesised: bool,
+        /// Scenario only: dump the binding-augmented config for the
+        /// named component and exit (PR 2; PR 1 errors not-yet-impl).
+        #[arg(long, value_name = "COMPONENT")]
+        print_merged: Option<String>,
+        /// Scenario only: parse + validate the scenario, exit without
+        /// spawning anything.
+        #[arg(long)]
+        validate_only: bool,
+        /// Scenario only: emit Graphviz DOT of the scenario.
+        #[arg(long)]
+        graph: bool,
+        /// List scenarios in the given directory (default: CWD) and
+        /// exit.  When set, `<config>` is ignored.
+        #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = ".")]
+        list: Option<PathBuf>,
+        /// Scenario only: after the readiness probe fires, launch the
+        /// system browser (`xdg-open` on linux, `open` on macOS) on
+        /// the synthesised-host URL.
+        #[arg(long)]
+        open: bool,
     },
     /// Build and flash a config to hardware
     Flash {
@@ -308,7 +347,26 @@ fn main() {
             target,
         } => cmd_diff(&old_config, &new_config, target.as_deref()),
         Commands::Build { path, output } => cmd_build(&path, output.as_deref(), verbose),
-        Commands::Run { config } => cmd_run(&config, verbose),
+        Commands::Run {
+            config,
+            print_synthesised,
+            print_merged,
+            validate_only,
+            graph,
+            list,
+            open,
+        } => cmd_run_dispatch(
+            config.as_ref(),
+            RunFlags {
+                print_synthesised,
+                print_merged,
+                validate_only,
+                graph,
+                list,
+                open,
+            },
+            verbose,
+        ),
         Commands::Flash { config } => cmd_flash(&config, verbose),
         Commands::Sign { input, key, output } => cmd_sign(&input, &key, output.as_deref(), verbose),
         Commands::Monitor {
@@ -2036,15 +2094,29 @@ fn build_one(
             let kernel_bytes = std::fs::read(&kernel_wasm_path)?;
             let modules_bin = std::fs::read(&modules_bin_path)?;
             let config_bin = std::fs::read(&config_bin_path)?;
-            let bundled = wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
+            let mut bundled =
+                wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
+
+            // Asset bank: bake graph-declared assets into the wasm via
+            // a `fluxor.assets` custom section. Off when no `assets:`
+            // block is present. Resolves paths relative to the graph
+            // YAML's directory so demos can use `../../assets/foo.png`.
+            let assets = extract_asset_pairs(&config, yaml_path)?;
+            let asset_count = assets.len();
+            let entries = asset_bank::load_assets(&assets)?;
+            let asset_bytes: usize = entries.iter().map(|e| e.bytes.len()).sum();
+            asset_bank::append_asset_bank(&mut bundled, &entries)?;
+
             std::fs::write(&output_path, &bundled)?;
 
             if verbose {
                 eprintln!(
-                    "wasm bundle: {} bytes (modules={} config={})",
+                    "wasm bundle: {} bytes (modules={} config={} assets={}/{} bytes)",
                     bundled.len(),
                     modules_bin.len(),
-                    config_bin.len()
+                    config_bin.len(),
+                    asset_count,
+                    asset_bytes,
                 );
             }
         }
@@ -2061,6 +2133,73 @@ fn build_one(
         family,
         board_id,
     })
+}
+
+/// Pull `assets:` out of a graph YAML and return resolved `(name, path)`
+/// pairs the asset-bank builder can consume. Two shapes are accepted:
+///
+/// 1. Bare string — `assets: [assets/test_harness/spiral.png, ...]`.
+///    The asset's logical name is the basename. Paths resolve
+///    relative to the graph YAML's directory.
+/// 2. Per-entry map — `assets: [{ path: ..., name: spiral.png }, ...]`.
+///    Explicit name override is useful when two folders ship files
+///    with the same basename.
+///
+/// Returns an empty vec when the YAML has no `assets:` field. Errors
+/// on schema mismatch or a relative-path traversal trying to escape
+/// the workspace via excessive `..` segments.
+fn extract_asset_pairs(
+    config: &serde_json::Value,
+    yaml_path: &std::path::Path,
+) -> Result<Vec<(String, PathBuf)>> {
+    let Some(arr) = config.get("assets").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+
+    let base_dir = yaml_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let (raw_path, override_name) = match entry {
+            serde_json::Value::String(s) => (s.clone(), None),
+            serde_json::Value::Object(m) => {
+                let p = m
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "graph `{}`: assets[{}] missing `path:` field",
+                            yaml_path.display(),
+                            i
+                        ))
+                    })?
+                    .to_string();
+                let n = m.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                (p, n)
+            }
+            _ => {
+                return Err(Error::Config(format!(
+                    "graph `{}`: assets[{}] must be a string or a map with `path:`",
+                    yaml_path.display(),
+                    i
+                )));
+            }
+        };
+
+        let resolved = base_dir.join(&raw_path);
+        let name = override_name.unwrap_or_else(|| {
+            std::path::Path::new(&raw_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&raw_path)
+                .to_string()
+        });
+        out.push((name, resolved));
+    }
+    Ok(out)
 }
 
 fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
@@ -2235,6 +2374,797 @@ fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Optional flags accepted by `fluxor run` for scenario YAMLs. For
+/// graph YAMLs they are all ignored (and we error out if the user
+/// passed one alongside a graph — see [`cmd_run_dispatch`]).
+struct RunFlags {
+    print_synthesised: bool,
+    print_merged: Option<String>,
+    validate_only: bool,
+    graph: bool,
+    /// `Some(dir)` if `--list[=DIR]` was set on the command line.
+    list: Option<PathBuf>,
+    open: bool,
+}
+
+impl RunFlags {
+    /// True when at least one scenario-only flag was set.  `--open`
+    /// counts here too — but unlike the dump flags it does NOT
+    /// short-circuit the spawn (it triggers after readiness fires).
+    fn any_scenario_flag(&self) -> bool {
+        self.print_synthesised
+            || self.print_merged.is_some()
+            || self.validate_only
+            || self.graph
+            || self.list.is_some()
+            || self.open
+    }
+}
+
+/// Top-level dispatch for `fluxor run`. Sniffs the YAML's `kind:`
+/// field; routes graph YAMLs to [`cmd_run`] (unchanged from
+/// pre-scenario behaviour) and scenario YAMLs to [`cmd_run_scenario`].
+fn cmd_run_dispatch(
+    config_path: Option<&PathBuf>,
+    flags: RunFlags,
+    verbose: bool,
+) -> Result<()> {
+    // `--list` short-circuits: enumerate, print, exit.
+    if let Some(dir) = &flags.list {
+        let scenarios = scenario::list_scenarios(dir)?;
+        if scenarios.is_empty() {
+            eprintln!("(no *.scenario.yaml files in {})", dir.display());
+        } else {
+            for (path, name) in scenarios {
+                println!("{}\t{}", path.display(), name);
+            }
+        }
+        return Ok(());
+    }
+
+    let config_path = config_path.ok_or_else(|| {
+        Error::Config(
+            "fluxor run: missing <CONFIG> argument (omit only with --list)".into(),
+        )
+    })?;
+
+    if scenario::is_scenario_file(config_path) {
+        return cmd_run_scenario(config_path, &flags, verbose);
+    }
+
+    // Inline-scenario fast path: the graph YAML may carry a top-level
+    // `scenario:` block (orchestration baked into the same file as the
+    // graph). When present, synthesise a `Scenario` in memory and
+    // dispatch through the regular scenario flow — same code path as
+    // an explicit `*.scenario.yaml`, one less file per example.
+    if let Some(synth) = scenario::synthesize_from_graph(config_path)? {
+        return cmd_run_inline_scenario(synth, config_path, &flags, verbose);
+    }
+
+    // Bare graph YAML — every scenario-only flag is a user error.
+    if flags.any_scenario_flag() {
+        return Err(Error::Config(format!(
+            "fluxor run {}: the supplied YAML is a graph (no `kind: scenario`); \
+             scenario-only flags (--print-synthesised, --print-merged, --validate-only, \
+             --graph) require a scenario YAML or an inline `scenario:` block on the graph.",
+            config_path.display()
+        )));
+    }
+
+    cmd_run(config_path, verbose)
+}
+
+/// Scenario flow for an in-memory `Scenario` synthesised from a graph
+/// YAML's inline `scenario:` block. Mirrors `cmd_run_scenario` but
+/// skips the file parse (the caller has already done it). `host_path`
+/// is the graph YAML — used by `revalidate_all` for path resolution
+/// (companion graph references resolve relative to it) and by error
+/// messages.
+fn cmd_run_inline_scenario(
+    s: scenario::Scenario,
+    host_path: &Path,
+    flags: &RunFlags,
+    verbose: bool,
+) -> Result<()> {
+    scenario::validate(&s, host_path)?;
+
+    if flags.validate_only {
+        scenario::revalidate_all(&s, host_path)?;
+        println!(
+            "graph {} (inline scenario): validation passed ({} component(s), {} binding(s); \
+             merged-config re-validation green).",
+            host_path.display(),
+            s.components.len(),
+            s.bindings.len()
+        );
+        return Ok(());
+    }
+    if flags.print_synthesised {
+        match scenario::render_synthesised_host(&s, host_path)? {
+            Some(yaml) => print!("{}", yaml),
+            None => eprintln!(
+                "graph {}: no synthesised host (every binding has an explicit `on:` and no \
+                 `host:` block is declared).",
+                host_path.display()
+            ),
+        }
+        return Ok(());
+    }
+    if let Some(comp) = &flags.print_merged {
+        print!("{}", scenario::render_merged_component(comp, &s, host_path)?);
+        return Ok(());
+    }
+    if flags.graph {
+        print!("{}", scenario::render_graphviz(&s));
+        return Ok(());
+    }
+
+    spawn_scenario(&s, host_path, flags, verbose)
+}
+
+/// Scenario dispatcher.  PR 1 implements the dump-only flags and
+/// validation; spawning lands in PR 3.
+fn cmd_run_scenario(
+    scenario_path: &Path,
+    flags: &RunFlags,
+    _verbose: bool,
+) -> Result<()> {
+    let s = scenario::parse(scenario_path)?;
+    scenario::validate(&s, scenario_path)?;
+
+    if flags.validate_only {
+        scenario::revalidate_all(&s, scenario_path)?;
+        println!(
+            "scenario {}: validation passed ({} component(s), {} binding(s); \
+             merged-config re-validation green).",
+            scenario_path.display(),
+            s.components.len(),
+            s.bindings.len()
+        );
+        return Ok(());
+    }
+
+    if flags.print_synthesised {
+        match scenario::render_synthesised_host(&s, scenario_path)? {
+            Some(yaml) => print!("{}", yaml),
+            None => {
+                eprintln!(
+                    "scenario {}: no synthesised host (every binding has an explicit `on:` \
+                     and no `host:` block is declared).",
+                    scenario_path.display()
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(comp) = &flags.print_merged {
+        print!("{}", scenario::render_merged_component(comp, &s, scenario_path)?);
+        return Ok(());
+    }
+
+    if flags.graph {
+        print!("{}", scenario::render_graphviz(&s));
+        return Ok(());
+    }
+
+    // Real spawn (PR 3 single-component + PR 4 multi-component &
+    // sequential mode).
+    spawn_scenario(&s, scenario_path, flags, _verbose)
+}
+
+/// PR 3 + PR 4: spawn a scenario.
+///
+/// Single-component scenarios (`is_single_component` true) take the
+/// PR 3 path: build component → write synth host → build host → spawn
+/// fluxor-linux → readiness probe → wait → propagate exit.
+///
+/// Multi-component scenarios take the PR 4 path: build every wasm
+/// component (passive — bundles served as static artefacts) and every
+/// non-wasm component (active — gets a fluxor-linux process each),
+/// plus the synth host if `host:` is declared. Then:
+///
+///   - `sequential: true` runs active components one at a time in
+///     declaration order, propagating the first non-zero exit and
+///     enforcing per-component `duration:` (SIGTERM → SIGKILL after
+///     2 s). This is the codec-test-harness mode.
+///   - Otherwise spawn all actives in parallel, wait for any to exit,
+///     SIGTERM the rest, and propagate the first exit.
+///
+/// In both cases Ctrl-C in the terminal sends SIGINT to the
+/// foreground process group; each spawned `fluxor-linux` inherits it
+/// and dies, and our `.wait()` returns the propagated exit status.
+fn spawn_scenario(
+    scenario: &scenario::Scenario,
+    scenario_path: &Path,
+    flags: &RunFlags,
+    verbose: bool,
+) -> Result<()> {
+    scenario::revalidate_all(scenario, scenario_path)?;
+
+    let scenario_dir = scenario_path
+        .parent()
+        .ok_or_else(|| Error::Config("scenario path has no parent dir".into()))?;
+
+    let linux_bin = PathBuf::from("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+    if !linux_bin.exists() {
+        return Err(Error::Config(format!(
+            "fluxor-linux binary not found at {}. Run `make linux` first.",
+            linux_bin.display()
+        )));
+    }
+
+    // --- 1: build every component, classified by effective target. ---
+    let mut actives: Vec<ActiveComponent> = Vec::new();
+    for (comp_name, comp) in &scenario.components {
+        let target = scenario::effective_target(scenario_path, comp);
+        if target == "wasm" {
+            // Passive: build the bundle into the canonical location
+            // the synthesised host's fs_path: route already points at.
+            let graph_rel = comp.graph.as_ref().ok_or_else(|| {
+                Error::Config(format!("component `{}` has no `graph:`", comp_name))
+            })?;
+            let graph_abs = scenario_dir.join(graph_rel);
+            let bundle_target = scenario::wasm_bundle_target_path(comp_name, comp)?;
+            eprintln!(
+                "[scenario] {}: building component `{}` (wasm, {}) → {}",
+                scenario.name,
+                comp_name,
+                graph_abs.display(),
+                bundle_target.display()
+            );
+            build_one(&graph_abs, Some(&bundle_target), verbose)?;
+            continue;
+        }
+
+        // Active: merge bindings into the component's graph, write to
+        // disk, build, and queue for spawn.
+        let merged_yaml = scenario::write_merged_component_yaml(comp_name, scenario, scenario_path)?;
+        eprintln!(
+            "[scenario] {}: building component `{}` ({}) → {}",
+            scenario.name, comp_name, target, merged_yaml.display()
+        );
+        let build = build_one(&merged_yaml, None, verbose)?;
+        if build.family != "linux" {
+            return Err(Error::Config(format!(
+                "scenario {}: component `{}` built for family {:?}; PR 3-4 only spawn linux \
+                 components (use `runtime_override: linux` for cm5 graphs).",
+                scenario_path.display(),
+                comp_name,
+                build.family
+            )));
+        }
+        let dir = build.output_path.parent().ok_or_else(|| {
+            Error::Config(format!("component `{}` build has no output parent", comp_name))
+        })?;
+        let merged_config: serde_json::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&merged_yaml)?)
+                .map_err(|e| Error::Config(format!("parse merged yaml: {}", e)))?;
+        let port = scenario::extract_http_port(&merged_config);
+        actives.push(ActiveComponent {
+            display: comp_name.clone(),
+            config_bin: dir.join("config.bin"),
+            modules_bin: dir.join("modules.bin"),
+            port,
+            url: port.map(|p| format!("http://localhost:{}/", p)),
+            duration: comp.duration.map(|d| std::time::Duration::from_secs(d as u64)),
+        });
+    }
+
+    // --- 2: synthesised host (acts like another active component). ---
+    if let Some(host_yaml) = scenario::write_synthesised_host_yaml(scenario, scenario_path)? {
+        eprintln!(
+            "[scenario] {}: synthesised host written to {}",
+            scenario.name,
+            host_yaml.display()
+        );
+        let host_build = build_one(&host_yaml, None, verbose)?;
+        if host_build.family != "linux" {
+            return Err(Error::Config(format!(
+                "scenario {}: synthesised host built for family {:?}; expected linux",
+                scenario_path.display(),
+                host_build.family
+            )));
+        }
+        let dir = host_build
+            .output_path
+            .parent()
+            .ok_or_else(|| Error::Config("host build has no output parent".into()))?;
+        actives.push(ActiveComponent {
+            display: "host".into(),
+            config_bin: dir.join("config.bin"),
+            modules_bin: dir.join("modules.bin"),
+            port: scenario::synthesised_host_port(scenario),
+            url: scenario::synthesised_host_url(scenario),
+            duration: None,
+        });
+    }
+
+    if actives.is_empty() {
+        return Err(Error::Config(format!(
+            "scenario {}: no active components to spawn (every component is wasm and no \
+             `host:` block is declared).",
+            scenario_path.display()
+        )));
+    }
+
+    // --- 3: spawn — sequential or parallel. ---
+    if scenario.sequential {
+        run_actives_sequential(&scenario.name, &linux_bin, actives, flags, scenario_path)
+    } else {
+        run_actives_parallel(&scenario.name, &linux_bin, actives, flags, scenario_path)
+    }
+}
+
+/// One active (= spawned-as-a-kernel-process) component in a
+/// scenario. Built ahead of the spawn loop; the spawn loop just
+/// invokes `fluxor-linux` with the config / modules pair.
+struct ActiveComponent {
+    /// Display name — the scenario component name, or `"host"` for
+    /// the synthesised host.
+    display: String,
+    config_bin: PathBuf,
+    modules_bin: PathBuf,
+    /// http listen port (sniffed from the merged config). `None` for
+    /// headless components — the readiness probe degrades to "child
+    /// still alive after a startup grace period".
+    port: Option<u16>,
+    url: Option<String>,
+    duration: Option<std::time::Duration>,
+}
+
+/// Sequential mode: run actives one at a time. First non-zero exit
+/// aborts the scenario.
+fn run_actives_sequential(
+    name: &str,
+    linux_bin: &Path,
+    actives: Vec<ActiveComponent>,
+    flags: &RunFlags,
+    scenario_path: &Path,
+) -> Result<()> {
+    for (i, a) in actives.into_iter().enumerate() {
+        eprintln!(
+            "[scenario] {}: [sequential {}/N] starting `{}`",
+            name,
+            i + 1,
+            a.display
+        );
+        let status = spawn_and_wait_one(name, linux_bin, &a, flags, scenario_path)?;
+        eprintln!(
+            "[scenario] {}: [sequential {}/N] `{}` exit {}",
+            name,
+            i + 1,
+            a.display,
+            status
+        );
+        if !status.success() {
+            return Err(Error::Config(format!(
+                "scenario {}: sequential mode aborted — `{}` exited with status {}",
+                scenario_path.display(),
+                a.display,
+                status
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parallel mode: spawn every active, race them for exit. First to
+/// exit propagates its status; the rest get SIGTERMed (then SIGKILL
+/// after 2 s if they linger).
+fn run_actives_parallel(
+    name: &str,
+    linux_bin: &Path,
+    actives: Vec<ActiveComponent>,
+    flags: &RunFlags,
+    scenario_path: &Path,
+) -> Result<()> {
+    let mut spawned: Vec<SpawnedActive> = Vec::new();
+    for a in actives {
+        eprintln!(
+            "[scenario] {}: spawning `{}` (config={}, modules={})",
+            name,
+            a.display,
+            a.config_bin.display(),
+            a.modules_bin.display()
+        );
+        let s = spawn_one(linux_bin, &a, scenario_path)?;
+        spawned.push(s);
+    }
+
+    // Run readiness probes for each spawned child in parallel.
+    let deadline_per_child = std::time::Duration::from_secs(5);
+    let mut probe_error: Option<(String, ReadyOutcome)> = None;
+    for s in spawned.iter_mut() {
+        let outcome = race_probe(&mut s.child, &s.probe, s.port, deadline_per_child);
+        match outcome {
+            ReadyOutcome::Ready => {
+                if let Some(u) = &s.url {
+                    eprintln!("[scenario] {}: ready — `{}` at {}", name, s.display, u);
+                }
+            }
+            other => {
+                let disp = s.display.clone();
+                probe_error = Some((disp, other));
+                break;
+            }
+        }
+    }
+    if let Some((disp, outcome)) = probe_error {
+        match outcome {
+            ReadyOutcome::ChildExited(status) => {
+                eprintln!(
+                    "[scenario] {}: `{}` exited during startup ({})",
+                    name, disp, status
+                );
+                teardown_remaining(&mut spawned);
+                return Err(Error::Config(format!(
+                    "scenario {}: component `{}` exited before its http listener bound \
+                     (status {}). The kernel's diagnostic appears above.",
+                    scenario_path.display(),
+                    disp,
+                    status
+                )));
+            }
+            ReadyOutcome::Timeout => {
+                eprintln!(
+                    "[scenario] {}: `{}` did not bind within 5 s",
+                    name, disp
+                );
+                teardown_remaining(&mut spawned);
+                return Err(Error::Config(format!(
+                    "scenario {}: component `{}` did not bind its http listener within 5 s.",
+                    scenario_path.display(),
+                    disp
+                )));
+            }
+            ReadyOutcome::Ready => unreachable!(),
+        }
+    }
+
+    // Optional --open: launch the browser on the first non-host URL,
+    // falling back to the synth host URL.
+    if flags.open {
+        if let Some(s) = spawned
+            .iter()
+            .find(|s| s.url.is_some() && s.display != "host")
+            .or_else(|| spawned.iter().find(|s| s.url.is_some()))
+        {
+            launch_browser(s.url.as_ref().unwrap());
+        }
+    }
+
+    // Wait for any spawned child to exit; tear down the rest.
+    let first_exit = wait_first_exit(&mut spawned);
+    teardown_remaining(&mut spawned);
+    if !first_exit.success() {
+        return Err(Error::Config(format!(
+            "scenario {}: one component exited with status {}",
+            scenario_path.display(),
+            first_exit
+        )));
+    }
+    eprintln!("[scenario] {}: terminated cleanly", name);
+    Ok(())
+}
+
+/// Spawn one active and wait for it, honouring `duration:` if set.
+fn spawn_and_wait_one(
+    name: &str,
+    linux_bin: &Path,
+    active: &ActiveComponent,
+    flags: &RunFlags,
+    scenario_path: &Path,
+) -> Result<std::process::ExitStatus> {
+    let mut s = spawn_one(linux_bin, active, scenario_path)?;
+    let outcome = race_probe(&mut s.child, &s.probe, s.port, std::time::Duration::from_secs(5));
+    match outcome {
+        ReadyOutcome::Ready => {
+            if let Some(u) = &s.url {
+                eprintln!("[scenario] {}: ready — `{}` at {}", name, s.display, u);
+            }
+            if flags.open {
+                if let Some(u) = &s.url {
+                    launch_browser(u);
+                }
+            }
+        }
+        ReadyOutcome::ChildExited(status) => {
+            if let Some(p) = s.probe.take() { p.join(); }
+            return Err(Error::Config(format!(
+                "scenario {}: component `{}` exited before its http listener bound \
+                 (status {}). The kernel's diagnostic appears above.",
+                scenario_path.display(),
+                s.display,
+                status
+            )));
+        }
+        ReadyOutcome::Timeout => {
+            let _ = s.child.kill();
+            let _ = s.child.wait();
+            if let Some(p) = s.probe.take() { p.join(); }
+            return Err(Error::Config(format!(
+                "scenario {}: component `{}` did not bind its http listener within 5 s.",
+                scenario_path.display(),
+                s.display
+            )));
+        }
+    }
+
+    let outcome = if let Some(d) = active.duration {
+        wait_with_duration(&mut s.child, d)
+    } else {
+        let status = s.child
+            .wait()
+            .map_err(|e| Error::Config(format!("waiting for {}: {}", s.display, e)))?;
+        DurationOutcome::NaturalExit(status)
+    };
+    if let Some(p) = s.probe.take() { p.join(); }
+    Ok(match outcome {
+        // Natural exit on its own → caller decides based on status.
+        DurationOutcome::NaturalExit(s) => s,
+        // Duration expired → component ran for as long as the
+        // scenario asked. Treat as success regardless of the signal
+        // we used to wind it down.
+        DurationOutcome::DurationExpired => synthetic_success_exit_status(),
+    })
+}
+
+/// Outcome of [`wait_with_duration`]. Distinguishes "child exited on
+/// its own" (caller decides based on the status) from "we killed it
+/// because its `duration:` expired" (sequential mode treats that as
+/// success — the scenario specified that wall-clock budget).
+enum DurationOutcome {
+    NaturalExit(std::process::ExitStatus),
+    DurationExpired,
+}
+
+fn synthetic_success_exit_status() -> std::process::ExitStatus {
+    // Build a "exit 0" ExitStatus.  Unix-only; PR 3+4 spawn paths are
+    // Linux/macOS only by construction.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+    #[cfg(not(unix))]
+    {
+        unimplemented!("scenario runner is unix-only");
+    }
+}
+
+struct SpawnedActive {
+    display: String,
+    child: std::process::Child,
+    probe: Option<scenario_readiness_probe::Probe>,
+    port: Option<u16>,
+    url: Option<String>,
+}
+
+fn spawn_one(
+    linux_bin: &Path,
+    active: &ActiveComponent,
+    _scenario_path: &Path,
+) -> Result<SpawnedActive> {
+    let mut child = std::process::Command::new(linux_bin)
+        .arg("--config")
+        .arg(&active.config_bin)
+        .arg("--modules")
+        .arg(&active.modules_bin)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            Error::Config(format!("spawning fluxor-linux for `{}`: {}", active.display, e))
+        })?;
+    let stderr_pipe = child.stderr.take().ok_or_else(|| {
+        Error::Config(format!("`{}`: fluxor-linux has no stderr pipe", active.display))
+    })?;
+    let probe = scenario_readiness_probe::Probe::start(stderr_pipe, active.port.unwrap_or(0));
+    Ok(SpawnedActive {
+        display: active.display.clone(),
+        child,
+        probe: Some(probe),
+        port: active.port,
+        url: active.url.clone(),
+    })
+}
+
+fn race_probe(
+    child: &mut std::process::Child,
+    probe: &Option<scenario_readiness_probe::Probe>,
+    port: Option<u16>,
+    deadline: std::time::Duration,
+) -> ReadyOutcome {
+    let probe = probe.as_ref().expect("probe must exist while spawned");
+    let start = std::time::Instant::now();
+    // For headless components (no port) the probe never fires; we
+    // grant a short startup grace period then declare "ready" if the
+    // child is still alive.
+    let headless_grace = std::time::Duration::from_millis(500);
+    loop {
+        if probe.ready() {
+            return ReadyOutcome::Ready;
+        }
+        if let Some(status) = child.try_wait().ok().flatten() {
+            return ReadyOutcome::ChildExited(status);
+        }
+        let elapsed = start.elapsed();
+        if port.is_none() && elapsed >= headless_grace {
+            return ReadyOutcome::Ready;
+        }
+        if elapsed >= deadline {
+            return ReadyOutcome::Timeout;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Wait up to `duration` for the child to exit on its own. After
+/// the deadline, SIGTERM; after another 2 s, SIGKILL. Returns
+/// [`DurationOutcome::NaturalExit`] iff the child died on its own,
+/// otherwise [`DurationOutcome::DurationExpired`].
+fn wait_with_duration(
+    child: &mut std::process::Child,
+    duration: std::time::Duration,
+) -> DurationOutcome {
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline {
+        if let Some(s) = child.try_wait().ok().flatten() {
+            return DurationOutcome::NaturalExit(s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Duration expired — wind the child down. SIGTERM, 2 s grace,
+    // SIGKILL. We treat all of these as "duration expired", not
+    // failure — the scenario asked for this wall-clock budget.
+    let _ = child.kill();
+    let grace = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < grace {
+        if child.try_wait().ok().flatten().is_some() {
+            return DurationOutcome::DurationExpired;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.wait();
+    DurationOutcome::DurationExpired
+}
+
+fn wait_first_exit(spawned: &mut [SpawnedActive]) -> std::process::ExitStatus {
+    loop {
+        for s in spawned.iter_mut() {
+            if let Some(status) = s.child.try_wait().ok().flatten() {
+                return status;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn teardown_remaining(spawned: &mut [SpawnedActive]) {
+    for s in spawned.iter_mut() {
+        if s.child.try_wait().ok().flatten().is_none() {
+            let _ = s.child.kill();
+        }
+    }
+    // Grace period.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for s in spawned.iter_mut() {
+        let _ = s.child.wait();
+    }
+    for s in spawned.iter_mut() {
+        if let Some(probe) = s.probe.take() {
+            probe.join();
+        }
+    }
+}
+
+fn launch_browser(url: &str) {
+    let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    match std::process::Command::new(cmd).arg(url).spawn() {
+        Ok(_) => eprintln!("[scenario]   --open: launched `{}` on {}", cmd, url),
+        Err(e) => eprintln!(
+            "[scenario]   --open: WARNING failed to launch `{}` ({}); open {} manually",
+            cmd, e, url
+        ),
+    }
+}
+
+
+/// Outcome of racing the readiness probe against the spawned
+/// fluxor-linux's exit status.  Used by
+/// [`spawn_single_component_scenario`].
+enum ReadyOutcome {
+    Ready,
+    ChildExited(std::process::ExitStatus),
+    Timeout,
+}
+
+/// Readiness-probe machinery for the scenario runner.  The probe
+/// runs one thread:
+///
+///   - **stderr tee**: reads `fluxor-linux`'s stderr line-by-line,
+///     forwards each line to our own stderr (so the user still sees
+///     kernel logs in real time), and signals "ready" the first time
+///     it sees `[linux_net] listening on port <PORT>`.
+///
+/// PR 3 deliberately drops the port-poll fallback referenced in RFC
+/// §9 — TCP connect-success false-positives when another process
+/// already holds the port (e.g. a stale `python3 -m http.server`
+/// from a prior debugging session).  The kernel's
+/// `linux_net::cmd_bind` log line is reliable, so the stderr signal
+/// is sufficient on its own.  Re-introduce the fallback only if we
+/// hit a runtime where stderr is muted by default.
+mod scenario_readiness_probe {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    pub struct Probe {
+        ready: Arc<AtomicBool>,
+        tee_handle: Option<std::thread::JoinHandle<()>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Probe {
+        pub fn start<R: Read + Send + 'static>(stderr: R, _port: u16) -> Self {
+            let ready = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let tee_ready = ready.clone();
+            let tee_handle = std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    // Tee: forward to our own stderr so users see logs.
+                    eprintln!("{}", line);
+                    if line.contains("[linux_net] listening on port") {
+                        tee_ready.store(true, Ordering::Release);
+                    }
+                }
+            });
+
+            Self {
+                ready,
+                tee_handle: Some(tee_handle),
+                stop,
+            }
+        }
+
+        /// Block until the probe fires or `timeout` elapses.  Returns
+        /// `true` iff the probe fired.  Kept for the non-racing case;
+        /// the scenario runner usually polls [`ready`] in its own loop
+        /// alongside `child.try_wait()` so a child crash short-circuits
+        /// the 5 s wait.
+        #[allow(dead_code)]
+        pub fn wait(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if self.ready.load(Ordering::Acquire) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            self.ready.load(Ordering::Acquire)
+        }
+
+        /// Non-blocking: has the probe signalled "ready"?
+        pub fn ready(&self) -> bool {
+            self.ready.load(Ordering::Acquire)
+        }
+
+        /// Tear down the probe.  The stderr tee thread terminates on
+        /// EOF, which happens when fluxor-linux's stderr closes (i.e.
+        /// when the child exits).
+        pub fn join(mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.tee_handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {

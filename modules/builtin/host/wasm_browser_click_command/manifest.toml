@@ -1,0 +1,45 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Pointer-event → FMP-command transformer. Consumes `input::pointer`
+# events and emits canonical `bank` navigation commands (`next` /
+# `prev`) on its output. Drops every other event kind.
+#
+# Mapping:
+#   * `KIND_UP` with `buttons & BTN_SECONDARY` (right-click /
+#     two-finger touch)  →  `prev`
+#   * `KIND_UP` otherwise (primary click / primary touch up)  →
+#     `next`
+#   * `KIND_DOWN` / `KIND_MOVE` / `KIND_CANCEL` / `KIND_ENTER` /
+#     `KIND_LEAVE`  →  drop
+#
+# Wiring shape:
+#
+#   pure-wasm:  pointer → click_command → bank.commands (local)
+#   split:      pointer → click_command → wasm_browser_websocket.tx_in
+#                                                 │
+#                                                 ▼   /ws (UP)
+#                                         linux http.ws_out
+#                                                 ▼
+#                                         ws_stream.rx_out → bank.commands
+#
+# Same module, same FMP wire on the output. The producer side
+# (bank → codec → display) is identical between scenarios; only the
+# location of `bank` differs.
+#
+# A future revision can add double-click → `prev` (220 ms window),
+# long-press → `toggle`, etc. without changing the manifest or
+# wiring — the contract is "FMP commands out, pointer events in".
+
+[[ports]]
+name = "events"
+direction = "input"
+content_type = "PointerEvents"
+required = true
+
+[[ports]]
+name = "commands"
+direction = "output"
+content_type = "FmpMessage"
+required = true

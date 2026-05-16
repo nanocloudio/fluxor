@@ -32,6 +32,10 @@ pub(crate) const OP_PONG: u8 = 0xA;
 // ── Close codes (RFC 6455 §7.4) ──────────────────────────────────────────
 
 pub(crate) const CLOSE_NORMAL: u16 = 1000;
+/// Server-initiated close: "this conn was displaced by a newer
+/// fan-out client and will not be reused. Clients that see this code
+/// should NOT auto-reconnect — `last connection wins` is the intent."
+pub(crate) const CLOSE_GOING_AWAY: u16 = 1001;
 pub(crate) const CLOSE_PROTOCOL_ERROR: u16 = 1002;
 pub(crate) const CLOSE_UNSUPPORTED_DATA: u16 = 1003;
 pub(crate) const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;

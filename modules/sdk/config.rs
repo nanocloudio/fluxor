@@ -109,18 +109,31 @@ mod profile_host {
         /// through to the RFC 6455 §5.4 fragmentation path in
         /// `ws_drain_fanout_input`.
         pub const SEND_BUF_SIZE: usize = 4100;
-        // NOTE: bumping this ceiling alone has no effect — the http
-        // module's TLV parameter table in `modules/foundation/http/mod.rs`
-        // only declares per-route tags for indices 0..3 (tags 10..47).
-        // Adding more routes requires adding matching `define_params!`
-        // entries (route_4_path/body/handler/proxy_ip/proxy_port/source/
-        // content_type/fs_path = 8 tags per route) plus matching
-        // setters. Until that lift, host config.bin can only carry 4
-        // routes per http instance.
-        pub const MAX_ROUTES: usize = 4;
+        // The http module's TLV parameter table in
+        // `modules/foundation/http/mod.rs` declares 10 tags per route
+        // (path, body, handler, proxy_ip, proxy_port, source,
+        // content_type, fs_path, fs_list, fs_filter) at tag offsets
+        // 10 + 10*i .. 10 + 10*(i+1). Bumping this ceiling REQUIRES
+        // adding matching `define_params!` entries for the new
+        // routes; tools/tests/http_route_tlv_coverage.rs locks the
+        // invariant. The host profile is currently sized for 8
+        // routes (tags 10..89) — enough for the scenario synth host
+        // (runtime.html, fluxor.wasm, host_shims.js, /scenario.json,
+        // /api/list, plus 3 spare for user/scenario route merges).
+        pub const MAX_ROUTES: usize = 8;
         pub const MAX_PATH: usize = 32;
         pub const MAX_CONTENT_TYPE: usize = 32;
-        pub const MAX_FS_PATH: usize = 64;
+        /// Per-route absolute filesystem path budget on host targets.
+        /// Bumped 64 → 256 in PR 6+ to fit realistic absolute paths
+        /// like `/home/<user>/Development/<project>/examples/.../viewer.html`
+        /// that the scenario synthesiser emits — at 64, paths were
+        /// silently truncated, causing `linux_fs_dispatch` to OPEN
+        /// the wrong filename (often creating an empty file via the
+        /// `O_CREAT` fallback) and FS_STAT to return `st_size = 0`,
+        /// surfacing as 200-OK-with-0-byte-body responses for
+        /// `fs_path:` routes. Embedded/wasm profiles keep 64 — their
+        /// fs_path values are short on-flash paths like `/web/INDEX.HTM`.
+        pub const MAX_FS_PATH: usize = 256;
         pub const MAX_VARS: usize = 16;
         pub const MAX_VAR_VALUE: usize = 16;
         pub const MAX_CACHE: usize = 4;

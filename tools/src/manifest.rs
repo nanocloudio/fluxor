@@ -112,6 +112,16 @@ const CONTENT_TYPES: &[&str] = &[
     // the per-frame TLV; auto-inserted tee/merge modules need this
     // discriminant to preserve frame boundaries during fan-out.
     "NetProto",
+    // Per-class input event surfaces (see
+    // docs/architecture/input_capability_surface.md). Each carries a
+    // packed C-repr record on the wire — pointer/key/gamepad shapes
+    // documented in `modules/sdk/contracts/input/*.rs`. The legacy
+    // generic "InputEvent" stays in the table for back-compat with
+    // older modules, but new graphs wire one of the per-class names
+    // below so the kernel and shell stay narrow.
+    "PointerEvents",
+    "KeyEvents",
+    "GamepadEvents",
 ];
 
 fn content_type_from_str(s: &str) -> Result<u8> {

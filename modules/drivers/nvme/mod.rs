@@ -395,7 +395,13 @@ struct NvmeState {
     pending_batch_lba:   u32,
     pending_batch_nlb:   u16,
     pending_batch_valid: u8,
-    _pad_pb:             u8,
+    /// Set to 1 by `apply_pending_seek` when an IOCTL_NOTIFY-driven
+    /// seek lands. Cleared by the next BLK_PHASE_IDLE submission. Used
+    /// to scope the per-sector async-stream path to "consumer just
+    /// asked for an LBA" — without this gate the IDLE branch loops
+    /// sequentially through the disk forever, which on cm5 silicon
+    /// eventually misses a CQE (fault code 24).
+    stream_armed:        u8,
 
     // Incoming write-request pipeline. Producers push a REQ_HDR_SIZE
     // header `{ op:u32, lba:u64, nlb:u32, nsid:u32 }` followed by
@@ -2187,7 +2193,9 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
     // mid-read or mid-write must abort the in-flight block so the
     // next bytes the consumer reads are from the seeked LBA, not
     // from whatever happened to be in flight.
-    if apply_pending_seek(s) {
+    let seek_now = apply_pending_seek(s);
+    if seek_now {
+        s.stream_armed = 1;
         match s.blk_phase {
             BLK_PHASE_READING => {
                 // CQE still outstanding; we must harvest it to free
@@ -2213,6 +2221,21 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
                 s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
                 return 0;
             }
+            // Gate auto-streaming: only submit a Read SQE when there is
+            // explicit consumer demand (a queued batch or a seek that
+            // just landed). Otherwise idle silently. This prevents the
+            // legacy "sequential current_block + 1" loop from running
+            // forever after a fat32 consumer transitions to FS_CONTRACT
+            // SYNC ioctls and stops draining the streaming channel —
+            // that loop was the root cause of `block read CQE timeout`
+            // fault code 24 on cm5 silicon (the controller eventually
+            // misses a CQE when reads queue up faster than fat32 can
+            // drain via the now-unused async path).
+            if s.pending_batch_valid == 0 && s.stream_armed == 0 {
+                s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+                return 0;
+            }
+            s.stream_armed = 0;
             // Two paths into IDLE:
             //  1. Per-sector seek via `IOCTL_NOTIFY(lba)` —
             //     `current_block` was set by `apply_pending_seek`;

@@ -1992,21 +1992,46 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         }
     }
 
-    // Compute topological execution order.:
-    // a graph with cycles is rejected here. Previously `prepare_graph`
-    // discarded the cycle count via `_cycle_count` and ran the
-    // best-effort topological prefix plus the cyclic remainder, which
-    // produced a *different* graph than the author declared. Typed
-    // feedback edges with explicit buffering will get their own ABI
-    // shape ; until then any cycle means the graph
-    // is malformed and must be regenerated.
+    // Compute topological execution order.
+    //
+    // A graph with cycles is normally rejected here: previously
+    // `prepare_graph` discarded the cycle count via `_cycle_count`
+    // and ran the best-effort topological prefix plus the cyclic
+    // remainder, which produced a *different* graph than the
+    // author declared. Typed feedback edges with explicit buffering
+    // will get their own ABI shape; until then a cycle is malformed
+    // by default and must be regenerated.
+    //
+    // **Opt-in escape hatch** (`graph_flags & ACCEPT_CYCLES`): the
+    // config blob's graph-section flags byte can carry an explicit
+    // author attestation that any cycles are bidirectional feedback
+    // pairs (canonically `http <-> linux_net` in any linux http
+    // example). When the flag is set, cycle members are appended to
+    // exec_order in declaration order — the same best-effort
+    // behaviour the old code had — and a loud `log::warn!` line is
+    // emitted so the choice is visible in operator output.
+    //
+    // See `.context/rfc_deployment_scenarios.md` §13 "Known issue
+    // blocking PR 3 end-to-end" for the design discussion.
     let cycle_count = compute_exec_order(edges, runtime_edge_count, module_count);
     if cycle_count > 0 {
-        log::error!(
-            "[graph] {} module(s) involved in cycles — graph rejected",
+        let accept = (config.graph_flags
+            & crate::kernel::config::GRAPH_FLAG_ACCEPT_CYCLES)
+            != 0;
+        if !accept {
+            log::error!(
+                "[graph] {} module(s) involved in cycles — graph rejected. \
+                 Set `scheduler: {{ accept_cycles: true }}` in the graph YAML \
+                 if these cycles are bidirectional feedback pairs.",
+                cycle_count
+            );
+            return Err(crate::kernel::errno::EINVAL);
+        }
+        log::warn!(
+            "[graph] accepting {} cycle module(s) under graph_flags.ACCEPT_CYCLES \
+             — stepping order within the cycle is best-effort, declaration order.",
             cycle_count
         );
-        return Err(crate::kernel::errno::EINVAL);
     }
 
     // Compute upstream dependency masks for ready-signal gating
@@ -2962,8 +2987,9 @@ fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) ->
         }
         log::error!(
             "[scheduler] graph has {} module(s) in a cycle (first unordered idx={}); \
-             v1 has no typed feedback edges — cycles are appended at the end but \
-             stepping order within the cycle is undefined",
+             v1 has no typed feedback edges — cycles are appended at the end in \
+             declaration order, and `prepare_graph` decides whether to accept or \
+             reject the resulting graph based on `graph_flags.ACCEPT_CYCLES`",
             cycle_count,
             first_unordered,
         );
@@ -3252,6 +3278,39 @@ pub static mut DBG_TICK: u32 = 0;
 /// Current tick count (milliseconds since boot). Used by timer FDs on aarch64.
 pub fn tick_count() -> u32 {
     unsafe { DBG_TICK }
+}
+
+/// Wallclock-paced scheduler heartbeat. Platforms call this once per
+/// tick from their outer loop; this is the single canonical emit
+/// point for `[sched] alive` across linux / wasm / rp / bcm — the
+/// per-platform and step_modules-internal copies that used to live
+/// here have all been collapsed into this function.
+///
+/// Cadence: every 30 wallclock seconds at the active `tick_us` for
+/// the given domain (or the global `tick_us` for the default domain
+/// / single-domain platforms). `hal::now_millis()` provides the
+/// `elapsed_ms` suffix — every supported platform's HAL implements
+/// it.
+///
+/// `domain_id == None` is the flat / single-domain case (linux,
+/// wasm, rp, qemu): no `domain=` field is emitted. `Some(d)` is the
+/// multi-domain case (bcm2712): the field is appended so per-core
+/// logs are distinguishable.
+pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
+    if tick == 0 {
+        return;
+    }
+    let d = domain_id.unwrap_or(0);
+    let tick_us = domain_tick_us(d).max(1) as u64;
+    let period = (30_000_000u64 / tick_us).max(1);
+    if !tick.is_multiple_of(period) {
+        return;
+    }
+    let ms = crate::kernel::hal::now_millis();
+    match domain_id {
+        Some(d) => log::info!("[sched] alive t={} elapsed_ms={} domain={}", tick, ms, d),
+        None => log::info!("[sched] alive t={} elapsed_ms={}", tick, ms),
+    }
 }
 /// Last module index attempted before a crash — readable by HardFault handler
 #[no_mangle]
@@ -3583,37 +3642,38 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         DBG_TICK += 1;
     }
 
-    // Periodic heartbeat — confirms scheduler is alive
-    if tick % 500 == 0 && tick > 0 {
-        // Check for crash info from previous run (in .uninit RAM, set by HardFault handler)
-        // Done at t=500 so USB serial is definitely connected.
-        if tick == 500 {
-            unsafe {
-                let crash = (&raw const CRASH_DATA) as *const u32;
-                let magic = core::ptr::read_volatile(crash);
-                if magic == CRASH_MAGIC {
-                    let pc = core::ptr::read_volatile(crash.add(1));
-                    let lr = core::ptr::read_volatile(crash.add(2));
-                    let module = core::ptr::read_volatile(crash.add(3));
-                    let prev_tick = core::ptr::read_volatile(crash.add(4));
-                    let r0 = core::ptr::read_volatile(crash.add(5));
-                    let cfsr = core::ptr::read_volatile(crash.add(6));
-                    let bfar = core::ptr::read_volatile(crash.add(7));
-                    log::error!(
-                        "[crash] pc={:08x} lr={:08x} r0={:08x} mod={} t={}",
-                        pc,
-                        lr,
-                        r0,
-                        module,
-                        prev_tick
-                    );
-                    log::error!("[crash] cfsr={:08x} bfar={:08x}", cfsr, bfar);
-                    // Clear marker so it doesn't repeat
-                    core::ptr::write_volatile((&raw mut CRASH_DATA) as *mut u32, 0);
-                }
+    // Crash-info one-shot: at first opportunity after boot, check the
+    // .uninit CRASH_DATA RAM that a HardFault handler may have left
+    // behind from the previous run, and clear the marker so it
+    // doesn't repeat. Tick threshold chosen so USB serial is
+    // definitely connected (≈ first scheduler-heartbeat slot at the
+    // active tick rate). The `[sched] alive` log itself is emitted
+    // by the platform's outer loop via `maybe_emit_alive`.
+    let crash_check_tick = (30_000_000u32 / sched.tick_us.max(1)).max(1);
+    if tick == crash_check_tick {
+        unsafe {
+            let crash = (&raw const CRASH_DATA) as *const u32;
+            let magic = core::ptr::read_volatile(crash);
+            if magic == CRASH_MAGIC {
+                let pc = core::ptr::read_volatile(crash.add(1));
+                let lr = core::ptr::read_volatile(crash.add(2));
+                let module = core::ptr::read_volatile(crash.add(3));
+                let prev_tick = core::ptr::read_volatile(crash.add(4));
+                let r0 = core::ptr::read_volatile(crash.add(5));
+                let cfsr = core::ptr::read_volatile(crash.add(6));
+                let bfar = core::ptr::read_volatile(crash.add(7));
+                log::error!(
+                    "[crash] pc={:08x} lr={:08x} r0={:08x} mod={} t={}",
+                    pc,
+                    lr,
+                    r0,
+                    module,
+                    prev_tick
+                );
+                log::error!("[crash] cfsr={:08x} bfar={:08x}", cfsr, bfar);
+                core::ptr::write_volatile((&raw mut CRASH_DATA) as *mut u32, 0);
             }
         }
-        log::info!("[sched] alive t={}", tick);
     }
     // Count active (non-finished) modules upfront so step-period gating
     // doesn't falsely produce active_count==0 → StepResult::Done.
@@ -4370,8 +4430,10 @@ pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
             step_woken_modules(&mut sched.modules, count, wake);
         }
 
-        if tick % 500 == 0 {
-            log::info!("[sched] alive t={}", tick);
-        }
+        // Built-in-graph platforms (qemu / rp) don't have a separate
+        // outer-loop heartbeat module; emit through the canonical
+        // helper so cadence + message shape matches every other
+        // platform.
+        maybe_emit_alive(tick as u64, None);
     }
 }

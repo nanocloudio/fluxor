@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Fluxor — WASM runtime</title>
+  <style>
+    :root {
+      --fg: #f2f2e9;
+      --fg-dim: #c0c0b8;
+      --fg-faint: #8a8a8a;
+      --bg: #0e120e;
+      --bg-card: #161916;
+      --bg-canvas: #060806;
+      --border: #2a2c2a;
+      --accent: #4a9a4a;
+      --accent-strong: #3a7a3a;
+      --err: #ff8080;
+      --info: #c8f2c8;
+    }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: var(--bg);
+      color: var(--fg);
+      margin: 0;
+      padding: 16px;
+      max-width: 1100px;
+    }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    p  { font-size: 12px; line-height: 1.55; margin: 4px 0; color: var(--fg-dim); }
+    .small { color: var(--fg-faint); font-size: 11px; }
+    #status { font-size: 11.5px; margin: 6px 0; color: var(--info); }
+    /* Each presentation surface gets its own container. The generic
+       shell creates one per `presentation.surfaces[]` entry. Layout
+       defaults to vertical stack; per-graph CSS may override via the
+       layout: hint. */
+    .surface {
+      margin: 12px 0;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-canvas);
+      overflow: hidden;
+    }
+    .surface[data-role="display"] {
+      min-height: 200px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      user-select: none;
+    }
+    .surface[data-role="display"] canvas { display: block; max-width: 100%; height: auto; }
+    .surface[data-role="terminal"] {
+      padding: 8px 10px;
+      max-height: 30vh;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--fg-faint);
+    }
+    .surface[data-role="terminal"] .err  { color: var(--err); }
+    .surface[data-role="terminal"] .info { color: var(--info); }
+    .surface[data-role="player"] {
+      padding: 16px 18px;
+      cursor: pointer;
+      user-select: none;
+    }
+    /* Touch-gamepad overlay surface.
+       Fixed 960×540 virtual coordinate space — same units the
+       wasm_browser_touch_gamepad_overlay module hit-tests against.
+       Each child .overlay-btn is absolutely positioned in that
+       space; the shell installs pointer listeners on this surface
+       that translate clientX/clientY to surface-local coords before
+       pushing into the global pointer queue, so the regions in JS
+       and the regions in Rust agree by construction. */
+    .surface[data-role="gamepad-overlay"] {
+      position: relative;
+      width: 960px;
+      max-width: 100%;
+      height: 540px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.05));
+      touch-action: none;        /* suppress scroll / zoom on touch */
+      user-select: none;
+    }
+    .overlay-btn {
+      position: absolute;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: rgba(74, 154, 74, 0.18);
+      color: var(--fg-dim);
+      font-size: 11px;
+      text-align: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;       /* hit-testing happens on the parent */
+    }
+    .overlay-btn.bumper { border-radius: 4px; }
+    .surface[data-role="gamepad-overlay"]:active { background: rgba(74, 154, 74, 0.06); }
+    .player-row { display: flex; align-items: center; gap: 12px; }
+    .player-icon {
+      flex: 0 0 auto;
+      width: 38px; height: 38px;
+      border-radius: 50%;
+      background: var(--accent-strong);
+      color: var(--fg);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+    .player-icon.paused { background: var(--accent-strong); opacity: 0.6; }
+    .player-title {
+      flex: 1 1 auto;
+      font-size: 13px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .player-count { color: var(--fg-faint); font-size: 11px; }
+    .player-bar {
+      margin-top: 12px;
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .player-bar > .fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 120ms linear;
+    }
+    #log {
+      white-space: pre-wrap; font-size: 11px; line-height: 1.4;
+      max-height: 20vh; overflow-y: auto;
+      padding: 6px 8px; background: var(--bg-canvas);
+      border: 1px solid var(--border); border-radius: 4px;
+      color: var(--fg-faint);
+      margin-top: 12px;
+    }
+    .err  { color: var(--err); }
+    .info { color: var(--info); }
+  </style>
+</head>
+<body>
+  <h1 id="scenarioTitle">Fluxor — WASM</h1>
+  <p class="small" id="scenarioCaption">Loading scenario…</p>
+  <div id="status">idle</div>
+
+  <!-- The generic shell composes the surface DOM from the
+       `presentation:` block of the running scenario's wasm component
+       graph. Anything in here at page-load time gets replaced once
+       the scenario JSON resolves. -->
+  <div id="surfaces"></div>
+
+  <div id="log"></div>
+
+  <!-- Mount-aware bootstrap.
+       The synthesiser may mount this shell at any URL prefix:
+         pure-wasm scenarios → /
+         split scenarios (via on:-binding) → /viewer (or any user prefix)
+       Both `host_shims.js` and `scenario.json` are siblings of this
+       page on whichever prefix is in use. We compute the base path
+       from window.location once and use it for every dependent fetch.
+       Computing dynamically (rather than baking absolute paths into
+       the HTML at synthesis time) keeps runtime.html byte-identical
+       across scenarios so the host-FS route can serve the same file
+       in every deployment. -->
+  <script type="module">
+    function computeFluxorBase() {
+      // Three mount shapes to handle:
+      //   /            → base /            (pure-wasm)
+      //   /viewer      → base /viewer/     (split — http module's
+      //                                     implicit prefix-match
+      //                                     serves both /viewer and
+      //                                     /viewer/<file>)
+      //   /index.html  → base /            (file-like last segment)
+      const p = window.location.pathname;
+      if (p.endsWith('/')) return p;
+      const lastSlash = p.lastIndexOf('/');
+      const lastSegment = p.slice(lastSlash + 1);
+      // A `.` in the last segment means it looks like a file (e.g.
+      // /foo.html), so base is the directory that holds it.
+      if (lastSegment.includes('.')) return p.slice(0, lastSlash + 1);
+      // Otherwise it's a directory-style mount — append the slash.
+      return p + '/';
+    }
+    window.__fluxorBase = computeFluxorBase();
+
+    function loadHostShims(base) {
+      return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = base + 'host_shims.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('host_shims.js failed to load from ' + s.src));
+        document.head.appendChild(s);
+      });
+    }
+    window.__fluxorShimReady = loadHostShims(window.__fluxorBase);
+  </script>
+
+  <script type="module">
+    const logEl    = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+    const surfacesEl = document.getElementById('surfaces');
+    const titleEl  = document.getElementById('scenarioTitle');
+    const captionEl = document.getElementById('scenarioCaption');
+
+    function append(text, cls = '') {
+      const span = document.createElement('span');
+      if (cls) span.className = cls;
+      span.textContent = text + '\n';
+      logEl.appendChild(span);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function setStatus(t) { statusEl.textContent = t; }
+
+    // ---------------------------------------------------------------
+    // Scenario introspection
+    //
+    // The scenario synthesiser auto-mounts `/scenario.json` with the
+    // active wasm component's metadata: scenario name, the
+    // `presentation:` block (surfaces + layout), bundle URL, playlist
+    // source. The shell composes the DOM from this then drives the
+    // kernel.
+    //
+    // Schema:
+    //   {
+    //     "scenario": "image_viewer",
+    //     "bundle":   "/fluxor.wasm",
+    //     "playlist": {
+    //       "source": "/api/list",
+    //       "filter": "image",              // image | audio | any
+    //       "loop":   true
+    //     },
+    //     "presentation": {
+    //       "layout": "stacked",            // future: grid, absolute
+    //       "surfaces": [
+    //         { "module": "display",  "role": "display",  "id": "main" },
+    //         { "module": "terminal", "role": "terminal", "id": "log",
+    //           "rows": 12 }
+    //       ]
+    //     }
+    //   }
+    //
+    // Per-role DOM construction is encapsulated in `buildSurface()`.
+    // Surface IDs become DOM ids; the shim consults them to know
+    // where to mount canvas / blit pixels / route input events.
+    // ---------------------------------------------------------------
+
+    async function loadScenario() {
+      append(`[shell] base path: ${window.__fluxorBase}`, 'info');
+      append('[shell] awaiting host_shims.js …', 'info');
+      try { await window.__fluxorShimReady; }
+      catch (err) { append(`[shell] shim load failed: ${err.message}`, 'err'); throw err; }
+      append('[shell] shim ready; fetching scenario.json', 'info');
+      const r = await fetch(window.__fluxorBase + 'scenario.json');
+      append(`[shell] scenario.json → HTTP ${r.status}`, r.ok ? 'info' : 'err');
+      if (!r.ok) throw new Error(`fetch /scenario.json: ${r.status}`);
+      return r.json();
+    }
+
+    // Canonical touch-gamepad-overlay region table. MUST match
+    // `src/platform/wasm/touch_gamepad_overlay.rs::REGIONS`
+    // byte-for-byte — the module hit-tests against the Rust copy;
+    // this JS copy drives the visual overlay. The coverage test
+    // at `tools/tests/wasm_touch_overlay_layout.rs` parses both
+    // sources and asserts row-for-row identity, so this comment
+    // can stay terse: drift fails `make test`.
+    const TOUCH_OVERLAY_REGIONS = [
+      // { btn name → label, x, y, w, h, class }
+      { btn: 'DPAD_UP',    label: '▲',  x: 100, y: 290, w: 60, h: 60 },
+      { btn: 'DPAD_LEFT',  label: '◀',  x:  40, y: 350, w: 60, h: 60 },
+      { btn: 'DPAD_RIGHT', label: '▶',  x: 160, y: 350, w: 60, h: 60 },
+      { btn: 'DPAD_DOWN',  label: '▼',  x: 100, y: 410, w: 60, h: 60 },
+      { btn: 'Y',          label: 'Y',  x: 800, y: 290, w: 60, h: 60 },
+      { btn: 'X',          label: 'X',  x: 740, y: 350, w: 60, h: 60 },
+      { btn: 'B',          label: 'B',  x: 860, y: 350, w: 60, h: 60 },
+      { btn: 'A',          label: 'A',  x: 800, y: 410, w: 60, h: 60 },
+      { btn: 'L1',         label: 'L1', x:   0, y:   0, w: 200, h: 40, cls: 'bumper' },
+      { btn: 'R1',         label: 'R1', x: 760, y:   0, w: 200, h: 40, cls: 'bumper' },
+      { btn: 'SELECT',     label: 'SEL', x: 380, y:  10, w:  90, h: 30 },
+      { btn: 'START',      label: 'START', x: 490, y:  10, w:  90, h: 30 },
+    ];
+
+    // Install W3C PointerEvent listeners on `el` and push records
+    // into `window.__fluxor_pointer_queue` for `wasm_browser_pointer`
+    // to drain via `host_pointer_pop`. Coords are surface-local in
+    // the canonical 960×540 space (matches every graph's display
+    // module / touch-overlay region table). Called for any surface
+    // that the wasm graph can consume input from — display, player,
+    // gamepad-overlay. The gamepad-overlay path also renders visual
+    // button DOM on top via `buildOverlayButtons()`.
+    function installPointerListeners(el) {
+      const queue = window.__fluxor_pointer_queue
+        || (window.__fluxor_pointer_queue = []);
+      function localCoords(ev) {
+        const rect = el.getBoundingClientRect();
+        // Scale page→surface if the surface is shrunk by max-width.
+        const scaleX = 960 / rect.width;
+        const scaleY = 540 / rect.height;
+        return {
+          x: Math.round((ev.clientX - rect.left) * scaleX),
+          y: Math.round((ev.clientY - rect.top)  * scaleY),
+        };
+      }
+      function push(ev, kind) {
+        const { x, y } = localCoords(ev);
+        queue.push({
+          pointerId: ev.pointerId & 0xFF,
+          kind,
+          buttons: ev.buttons & 0xFF,
+          modifiers:
+            (ev.shiftKey ? 0x01 : 0) | (ev.ctrlKey  ? 0x02 : 0) |
+            (ev.altKey   ? 0x04 : 0) | (ev.metaKey  ? 0x08 : 0),
+          pressure: Math.round((ev.pressure || (kind === 1 ? 0.5 : 0)) * 1023),
+          x, y,
+        });
+      }
+      // input::pointer::KIND_*  →  1=DOWN, 2=UP, 3=MOVE, 4=CANCEL
+      el.addEventListener('pointerdown',   (e) => { el.setPointerCapture(e.pointerId); push(e, 1); });
+      el.addEventListener('pointerup',     (e) => { push(e, 2); el.releasePointerCapture(e.pointerId); });
+      el.addEventListener('pointermove',   (e) => { if (e.buttons || e.pressure > 0) push(e, 3); });
+      el.addEventListener('pointercancel', (e) => { push(e, 4); });
+      // Suppress the browser context menu so right-click reaches the
+      // wasm graph as `BTN_SECONDARY` (which click_command maps to
+      // FMP `prev`) instead of opening the OS menu.
+      el.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+    }
+
+    function buildOverlayButtons(el) {
+      // Render the canonical region table as labelled buttons. The
+      // hit-testing happens in the wasm_browser_touch_gamepad_overlay
+      // module against an identical region table on the Rust side;
+      // these DOM elements are purely visual landmarks.
+      for (const r of TOUCH_OVERLAY_REGIONS) {
+        const b = document.createElement('div');
+        b.className = 'overlay-btn' + (r.cls ? (' ' + r.cls) : '');
+        b.style.left   = r.x + 'px';
+        b.style.top    = r.y + 'px';
+        b.style.width  = r.w + 'px';
+        b.style.height = r.h + 'px';
+        b.textContent  = r.label;
+        b.dataset.btn  = r.btn;
+        el.appendChild(b);
+      }
+    }
+
+    function buildSurface(spec) {
+      const el = document.createElement('div');
+      el.className = 'surface';
+      el.id = 'surface-' + spec.id;
+      el.dataset.role = spec.role;
+      el.dataset.module = spec.module;
+      if (spec.role === 'player') {
+        el.title = 'click = next, right-click = previous';
+        el.innerHTML = `
+          <div class="player-row">
+            <div class="player-icon paused" data-icon>▶</div>
+            <div style="flex:1;min-width:0">
+              <div class="player-title" data-title>—</div>
+              <div class="player-count small" data-count>0 / 0</div>
+            </div>
+          </div>
+          <div class="player-bar"><div class="fill" data-fill></div></div>`;
+      } else if (spec.role === 'display') {
+        el.title = 'click = next, right-click = previous';
+      } else if (spec.role === 'gamepad-overlay') {
+        buildOverlayButtons(el);
+      }
+      // Interactive surfaces forward PointerEvents to the wasm graph
+      // via `__fluxor_pointer_queue`. The graph's own modules
+      // (`wasm_browser_pointer` → `wasm_browser_click_command` →
+      // `bank.commands` or `ws.tx`) decide what each event means —
+      // the JS shell stays a dumb pipe. Old JS-driven kernel-reboot
+      // cycling is gone (image_viewer, audio_player, … all use the
+      // bank + click_command pattern now).
+      if (spec.role === 'display' ||
+          spec.role === 'player'  ||
+          spec.role === 'gamepad-overlay') {
+        installPointerListeners(el);
+      }
+      return el;
+    }
+
+    function composeDom(scenario) {
+      titleEl.textContent = `Fluxor — ${scenario.scenario}`;
+      captionEl.textContent = scenario.caption ||
+        `WASM kernel running ${scenario.scenario}. Playlist driven by ${scenario.playlist?.source || '(none)'}.`;
+      surfacesEl.replaceChildren();
+      const byRole = new Map();
+      for (const spec of scenario.presentation.surfaces) {
+        const el = buildSurface(spec);
+        surfacesEl.appendChild(el);
+        byRole.set(spec.role, el);
+      }
+      return byRole;
+    }
+
+    // ---------------------------------------------------------------
+    // Playlist + navigation
+    //
+    // Reads /api/list, filters by extension class, builds URLs that
+    // hit the dual-mode FS_LIST file-serve (PR 9). Per-role nav:
+    // display surfaces use single-click = next / double-click = prev;
+    // player surfaces use single-click = play/pause, double-click =
+    // next.
+    // ---------------------------------------------------------------
+
+    const EXT_FILTERS = {
+      image: /\.(png|jpe?g|gif|bmp|webp)$/i,
+      audio: /\.(wav|mp3|aac|ogg|flac)$/i,
+      any:   /./,
+    };
+
+    async function loadPlaylist(spec) {
+      try {
+        const r = await fetch(spec.source);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        const filter = EXT_FILTERS[spec.filter] || EXT_FILTERS.any;
+        const names = (j.items || []).filter(n => filter.test(n));
+        if (!names.length) throw new Error('list empty');
+        const urls = names.map(n => `${spec.source}/${n}`);
+        append(`[playlist] ${spec.source} → ${urls.length} entries`, 'info');
+        return urls;
+      } catch (err) {
+        append(`[playlist] ${spec.source} failed (${err.message})`, 'err');
+        return [];
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Kernel lifecycle
+    // ---------------------------------------------------------------
+
+    let kernel = null;
+    let loopHandle = null;
+    let currentAssetUrl = null;
+
+    // Asset bank: bundle-level (one Map<name, Uint8Array> shared across
+    // every kernel boot). We compile the bundle once with
+    // WebAssembly.compile(), extract the `fluxor.assets` custom
+    // section, and reuse the resulting WebAssembly.Module for every
+    // subsequent instantiate() call. Saves re-parsing 2-10 MB of wasm
+    // every time the user clicks "next image".
+    let bundleModule = null;
+    let bundleAssetBank = new Map();
+
+    async function loadBundleOnce(scenario) {
+      if (bundleModule) return;
+      setStatus(`fetching ${scenario.bundle}`);
+      const bundleResp = await fetch(scenario.bundle);
+      if (!bundleResp.ok) throw new Error(`bundle fetch ${bundleResp.status}`);
+      const bundleBytes = await bundleResp.arrayBuffer();
+      bundleModule = await WebAssembly.compile(bundleBytes);
+      // Extract the asset bank, if any. customSections returns an
+      // array of ArrayBuffers; we take the first (the appender only
+      // ever emits one).
+      const sections = WebAssembly.Module.customSections(bundleModule, 'fluxor.assets');
+      if (sections.length > 0) {
+        try {
+          bundleAssetBank = window.fluxor.parseAssetBank(sections[0]);
+          append(`[bundle] asset bank: ${bundleAssetBank.size} entries`, 'info');
+        } catch (err) {
+          append(`[bundle] asset bank parse failed: ${err.message}`, 'err');
+          bundleAssetBank = new Map();
+        }
+      }
+    }
+
+    function teardownKernel() {
+      if (loopHandle) { cancelAnimationFrame(loopHandle); loopHandle = null; }
+      kernel = null;
+    }
+
+    async function bootKernel(scenario, surfacesByRole, assetUrl) {
+      teardownKernel();
+      await loadBundleOnce(scenario);
+      setStatus(`booting ${assetUrl || '(no asset)'}`);
+      currentAssetUrl = assetUrl;
+
+      // Container resolution: canvas modules render into the display
+      // surface; everything else (audio, input) doesn't need a DOM
+      // mount but the shim accepts the display container as a fallback
+      // for any module that decides to mount its own widget.
+      const displayEl = surfacesByRole.get('display') || surfacesByRole.get('player') || document.body;
+
+      const imports = window.fluxor.buildHostImports({
+        getKernel: () => kernel,
+        onLog: (level, msg) => append(`[wasm] ${msg}`, level >= 3 ? 'err' : ''),
+        onPanic: (msg) => {
+          append(`[wasm PANIC] ${msg}`, 'err');
+          teardownKernel();
+        },
+        onCanvasFrame: (w, h) => setStatus(`rendered ${w}×${h}`),
+        canvasContainer: displayEl,
+        fetchUrlOverride: (req) => currentAssetUrl || req,
+        assetBank: bundleAssetBank,
+      });
+
+      const instance = await WebAssembly.instantiate(bundleModule, imports);
+      kernel = instance;
+
+      const kInit = kernel.exports.kernel_init;
+      const kStep = kernel.exports.kernel_step;
+      if (typeof kInit !== 'function' || typeof kStep !== 'function') {
+        const have = Object.keys(kernel.exports).filter(k => k.startsWith('kernel_')).join(', ');
+        const msg = `kernel exports missing: need kernel_init + kernel_step, have [${have}]`;
+        append(`[wasm] ${msg}`, 'err');
+        throw new Error(msg);
+      }
+      append(`[wasm] kernel exports: ${Object.keys(kernel.exports).filter(k => k.startsWith('kernel_')).join(', ')}`, 'info');
+      const initRet = kInit();
+      append(`[wasm] kernel_init() → ${initRet}`, 'info');
+
+      let ticked = 0;
+      function frame() {
+        for (let i = 0; i < 32; i++) {
+          try { kStep(); ticked++; }
+          catch (err) {
+            append(`[wasm] kernel_step trapped after ${ticked} ticks: ${err.message || err}`, 'err');
+            return;
+          }
+        }
+        loopHandle = requestAnimationFrame(frame);
+      }
+      loopHandle = requestAnimationFrame(frame);
+    }
+
+    // ---------------------------------------------------------------
+    // Per-role interaction wiring
+    // ---------------------------------------------------------------
+
+    function fileName(url) {
+      const i = url.lastIndexOf('/');
+      return i >= 0 ? url.slice(i + 1) : url;
+    }
+
+    // Navigation is handled by wasm-side modules now
+    // (wasm_browser_pointer → wasm_browser_click_command →
+    // bank.commands), so the JS shell just boots the kernel ONCE
+    // and lets pointer events flow through `installPointerListeners`
+    // → `__fluxor_pointer_queue` → `host_pointer_pop`. No more JS-
+    // driven kernel reboots; bank's cursor + commands input handle
+    // the cycle natively, identical across pure-wasm / linux-split /
+    // cm5-split.
+    function wireDisplayNavigation(el, scenario, surfacesByRole, _playlist) {
+      if (!el) return;
+      bootKernel(scenario, surfacesByRole, null).catch(err =>
+        append(`[boot] ${err.message}`, 'err'));
+    }
+
+    function wirePlayerNavigation(el, scenario, surfacesByRole, _playlist) {
+      if (!el) return;
+      bootKernel(scenario, surfacesByRole, null).catch(err =>
+        append(`[boot] ${err.message}`, 'err'));
+    }
+
+    // ---------------------------------------------------------------
+    // Boot
+    // ---------------------------------------------------------------
+
+    // Resolve the playlist for this run. Three sources, tried in
+    // order:
+    //   1. The bundle's embedded asset bank (`fluxor.assets` custom
+    //      section) — preferred when present because it's self-
+    //      contained and has no network dependency.
+    //   2. `scenario.playlist.source` HTTP listing — the classic
+    //      path; used by scenarios that mount a host-FS gallery via
+    //      a `list:` binding.
+    //   3. Empty — single-asset / headless scenarios fall through
+    //      to a boot with no asset URL.
+    //
+    // The asset bank requires the bundle to already be loaded so the
+    // custom section can be read; we pre-warm via loadBundleOnce.
+    async function resolvePlaylist(scenario) {
+      // Pre-load the bundle so the asset bank is available even if
+      // we never end up calling bootKernel (single-asset path).
+      await loadBundleOnce(scenario);
+
+      const filter = (scenario.playlist && EXT_FILTERS[scenario.playlist.filter])
+        || EXT_FILTERS.any;
+
+      if (bundleAssetBank.size > 0) {
+        const names = Array.from(bundleAssetBank.keys()).filter(n => filter.test(n));
+        if (names.length === 0) {
+          append(`[playlist] asset bank has ${bundleAssetBank.size} entries, none match filter`, 'err');
+          return [];
+        }
+        names.sort();
+        append(`[playlist] asset bank → ${names.length} entries`, 'info');
+        return names.map(n => `asset://${n}`);
+      }
+
+      if (scenario.playlist) {
+        return loadPlaylist(scenario.playlist);
+      }
+      return [];
+    }
+
+    (async () => {
+      try {
+        const scenario = await loadScenario();
+        const surfacesByRole = composeDom(scenario);
+        const playlistUrls = await resolvePlaylist(scenario);
+
+        // Hand off to the role-specific navigator. We pick the
+        // "primary" surface by role priority: display > player.
+        // Future: scenarios can name a primary explicitly via
+        // `presentation.primary: <module>`.
+        const display = surfacesByRole.get('display');
+        const player  = surfacesByRole.get('player');
+        if (display) {
+          wireDisplayNavigation(display, scenario, surfacesByRole, playlistUrls);
+        } else if (player) {
+          wirePlayerNavigation(player, scenario, surfacesByRole, playlistUrls);
+        } else {
+          // Headless wasm — boot once with no asset.
+          bootKernel(scenario, surfacesByRole, null).catch(err =>
+            append(`[boot] ${err.message}`, 'err'));
+        }
+      } catch (err) {
+        append(`[shell] ${err.message}`, 'err');
+        setStatus('shell failed — see log');
+      }
+    })();
+  </script>
+</body>
+</html>

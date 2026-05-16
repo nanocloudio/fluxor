@@ -957,9 +957,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 if core_id == 0 { debug_drain_poll_core0(); }
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
-                if tick.is_multiple_of(10000) && tick > 0 {
-                    log::info!("[sched] alive t={} core={} domain={}", tick, core_id, domain_id);
-                }
+                scheduler::maybe_emit_alive(tick as u64, Some(domain_id));
                 // Rebuild bridge. On the primary domain, a pending rebuild
                 // request quiesces every non-primary domain (so mutation of
                 // global scheduler state is race-free), then clears the

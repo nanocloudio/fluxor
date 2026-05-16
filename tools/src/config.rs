@@ -116,6 +116,9 @@ const CONTENT_TYPES: &[&str] = &[
     "EventTimelineVideo",
     "EventTimelineAudio",
     "NetProto",
+    "PointerEvents",
+    "KeyEvents",
+    "GamepadEvents",
 ];
 
 const INPUT_CONTROL_TYPES: &[&str] = &["Button", "Range"];
@@ -3169,8 +3172,26 @@ fn generate_config_impl(
     // Validate service dependencies from YAML `services:` section
     validate_services(config, &module_names, &manifests)?;
 
-    // Assign buffer groups for aliasable edge chains
-    let buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps)?;
+    // Assign buffer groups for aliasable edge chains, then apply
+    // per-edge YAML overrides. The auto-assign pass only groups
+    // edges where the destination is an in-place-safe chain interior
+    // — it can't see "this edge needs mailbox semantics for transport
+    // atomicity" (e.g. WsFrame envelopes between ws_stream and http).
+    // A non-zero `buffer_group:` field on a wiring entry enables
+    // mailbox mode on that channel (see
+    // `src/kernel/scheduler/mod.rs::open_channels` — mailbox flag is
+    // set when buffer_group != 0). Without this, the channel is a
+    // byte-streaming FIFO and structured envelopes get fragmented.
+    let mut buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps)?;
+    if let Some(wiring) = config.get("wiring").and_then(|w| w.as_array()) {
+        for (i, entry) in wiring.iter().enumerate() {
+            if let Some(g) = entry.get("buffer_group").and_then(|v| v.as_u64()) {
+                if g > 0 && g <= 31 && i < buffer_groups.len() {
+                    buffer_groups[i] = g as u8;
+                }
+            }
+        }
+    }
 
     // Resolve per-edge edge_class from wiring entries
     let edge_classes = resolve_edge_classes(config, &module_names, &domain_names);
@@ -3196,9 +3217,22 @@ fn generate_config_impl(
     // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`. The
     // 5-bit `buffer_group` ceiling (31) is enforced by
     // `assign_buffer_groups`.
+    // Graph section header layout — must agree with the parser at
+    // `src/kernel/config.rs::read_config_at_into` (graph_flags read).
+    //   byte 0: edge_count
+    //   byte 1: graph_flags (bit 0 = ACCEPT_CYCLES; bits 1-7 reserved)
+    //   bytes 2-3: reserved (must be 0)
+    let accept_cycles = config
+        .get("scheduler")
+        .and_then(|s| s.get("accept_cycles"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let graph_flags: u8 = if accept_cycles { 0x01 } else { 0x00 };
+
     let mut graph_section = Vec::with_capacity(GRAPH_SECTION_SIZE);
     graph_section.push(edges.len() as u8);
-    graph_section.extend_from_slice(&[0u8; 3]);
+    graph_section.push(graph_flags);
+    graph_section.extend_from_slice(&[0u8; 2]);
     for (i, (from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
         let group = buffer_groups.get(i).copied().unwrap_or(0);
         let ec = edge_classes.get(i).copied().unwrap_or(0);

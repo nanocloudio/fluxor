@@ -1,0 +1,109 @@
+# Image Viewer — linux producer half of the split scenario.
+#
+# Linux-native counterpart to `../cm5/image_viewer.yaml`. The
+# producer pipeline (bank → codec → ws → http) is identical in
+# shape; the WebSocket bridges between the linux kernel and the
+# browser. The pure-wasm form (`../wasm/image_viewer.yaml`) is the
+# same shape collapsed into a single kernel.
+#
+# Shape:
+#
+#   browser  : pointer → click_command → ws_websocket.tx
+#                                            │ WS up   /ws  (FMP next/prev)
+#                                            ▼
+#   linux    : http.ws_out → ws_stream.rx → bank.commands
+#                                            │
+#                                            ▼
+#              bank.stream → codec.encoded → codec.pixels → ws_stream.tx_in
+#                                            │ WS down /ws  (RGB565)
+#                                            ▼
+#   browser  : ws.rx → canvas
+#
+# The host `codec` here is `host_image_codec`, the libimage-backed
+# sibling of the unified cm5 / wasm `codec` module. It decodes the
+# same formats (BMP / GIF / PNG / JPEG with all variants) via the
+# `image` crate. Requires `fluxor-linux --features host-image`.
+
+target: linux
+tick_us: 100
+
+# Inline scenario — `fluxor run examples/linux/image_viewer.yaml`
+# orchestrates this graph plus the thin wasm viewer at `/viewer/`.
+# Same shape as the cm5 split, just with the linux host_image_codec
+# instead of the cm5 PIC image codec.
+scenario:
+  name: image_viewer_linux
+  companions:
+    viewer: ../wasm/image_viewer_thin.yaml
+  bindings:
+    - serve: viewer
+      on: main.http
+      prefix: /viewer
+
+# Bidirectional feedback at http ↔ ws_stream + http ↔ linux_net.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+
+modules:
+  # Asset bank. Reads from `/tmp/spirals/` on the linux host; cycle
+  # via `next`/`prev` FMP commands arriving on `bank.commands` from
+  # the browser-side click_command module over the WebSocket.
+  - name: bank
+    dir: "/tmp/spirals"
+    formats: ".bmp,.gif,.png,.jpg,.jpeg"
+    mode: loop
+    auto_advance: 0
+
+  - name: codec
+    type: host_image_codec
+    width: 960
+    height: 540
+    scale_mode: fit
+    max_bytes: 16777216
+
+  - name: ws
+    type: ws_stream
+
+  - name: http
+    port: 9090
+    routes:
+      - path: "/ws"
+        websocket_fanout: true
+
+wiring:
+  # Producer: bank → codec → ws.tx_out → http.ws_in → browser.
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.pixels
+    to: ws.tx_in
+  # WsFrame envelopes carry an 8-byte header + variable payload.
+  # `buffer_group:` flips the channel to mailbox mode so the http
+  # module reads a full envelope per atomic read (FIFO byte rings
+  # would silently fragment envelopes — see
+  # `tools/src/config.rs::assign_buffer_groups` + scheduler mailbox
+  # flag handling).
+  - from: ws.tx_out
+    to: http.ws_in
+    buffer_group: 1
+
+  # Consumer: browser → http.ws_out → ws.rx → bank.commands.
+  # `ws.rx_out` is OctetStream (raw bytes the browser sent); those
+  # bytes ARE FMP messages. OctetStream → FmpMessage is allowed
+  # because OctetStream is universal-compatible
+  # (`tools/src/config.rs::validate_wiring_types`).
+  - from: http.ws_out
+    to: ws.rx_in
+    buffer_group: 2
+  - from: ws.rx_out
+    to: bank.commands
+
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in

@@ -1,0 +1,19 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser keyboard input source. Listens for DOM keydown/keyup
+# events on the host page and emits `input::key::MSG_EVENT` records
+# on the output port. The host shim normalises DOM event quirks
+# (focus / blur transitions, sticky keys, repeat) before forwarding.
+#
+# Replaces the legacy `wasm_browser_dom_input` for keyboard input —
+# split per-class as part of the capability-surface model. Used by
+# the `keyboard` platform stack (stacks/keyboard.toml) to resolve
+# `platform.keyboard: {}` on wasm targets.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "KeyEvents"
+required = true

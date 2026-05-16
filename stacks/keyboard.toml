@@ -1,0 +1,40 @@
+# Platform stack: keyboard — keyboard input capability surface
+#
+# Resolves `platform.keyboard: {}` in a graph YAML to the right
+# per-target keyboard producer. Every variant emits the
+# `input::key` contract on a `keyboard.events` output port.
+#
+# Contract wire shape: `modules/sdk/contracts/input/key.rs` —
+# W3C KeyboardEvent shape with key_code (logical, post-keymap) +
+# scan_code (physical) + modifier bits + autorepeat flag.
+
+[stack]
+name = "keyboard"
+
+# ── Browser: DOM keyboard events
+[[variant]]
+match = { family = "wasm" }
+modules = [{ name = "keyboard", type = "wasm_browser_keyboard" }]
+wiring = []
+
+# ── Linux host: libinput keyboard
+[[variant]]
+match = { family = "linux" }
+modules = [{ name = "keyboard", type = "linux_input_keyboard" }]
+wiring = []
+
+# ── USB HID keyboard host on pico2w / picow / cm5
+[[variant]]
+match = { board = "pico2w" }
+modules = [{ name = "keyboard", type = "usb_hid_keyboard", params = { usb_bus = "0" } }]
+wiring = []
+
+[[variant]]
+match = { board = "picow" }
+modules = [{ name = "keyboard", type = "usb_hid_keyboard", params = { usb_bus = "0" } }]
+wiring = []
+
+[[variant]]
+match = { board = "cm5" }
+modules = [{ name = "keyboard", type = "usb_hid_keyboard", params = { usb_bus = "0" } }]
+wiring = []

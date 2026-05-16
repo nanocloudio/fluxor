@@ -986,10 +986,13 @@ pub fn load_schema_for_module(module_type: &str, modules_dir: &Path) -> Option<P
 ///   - `proxy:` → proxy (3)
 fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section: Option<&Value>) {
     // Must stay in sync with `modules/sdk/config.rs::http::MAX_ROUTES`
-    // for the host profile (target_arch=aarch64). Embedded/wasm
-    // profiles share the same ceiling here — the http module silently
-    // truncates anything past its own MAX_ROUTES, so the tool's 16
-    // never produces a buffer overrun, only "this route was ignored".
+    // for the host profile (target_arch=aarch64; currently 8 routes,
+    // tags 10..89). Embedded/wasm profiles share the same TLV table
+    // — the http module silently drops routes whose tags don't have
+    // matching `define_params!` entries in
+    // `modules/foundation/http/mod.rs`. The tool's 16 here is
+    // headroom; bumping MAX_ROUTES past 8 requires extending the TLV
+    // table at the kernel side first.
     const TOOL_MAX_ROUTES: usize = 16;
     for (i, route) in routes.iter().enumerate() {
         if i >= TOOL_MAX_ROUTES {

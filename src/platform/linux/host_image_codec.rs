@@ -170,10 +170,19 @@ fn host_image_step(state: *mut u8) -> i32 {
         }
     }
     if st.decoded {
-        // Frame already emitted in full — nothing else to do.
+        // Return 0 (Continue), NOT 1 (Done). The scheduler treats
+        // `StepOutcome::Done` (return value 1) as "module permanently
+        // finished — stop stepping it." That kills cycling — bank's
+        // next paced advance writes new bytes to in_chan, but codec
+        // never gets a step to read them. See `modules/mod.rs`
+        // `StepOutcome` for the enum mapping.
+        log::info!("[host_image] frame drained; reset for next cycle");
         st.pending.clear();
+        st.pending.shrink_to_fit();
         st.pending_pos = 0;
-        return 1;
+        st.decoded = false;
+        st.quiet_ticks = 0;
+        return 0;
     }
 
     let mut buf = [0u8; 4096];

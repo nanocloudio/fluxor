@@ -350,9 +350,7 @@ fn main() {
 
         tick += 1;
 
-        if tick_us > 0 && tick.is_multiple_of(10_000_000 / tick_us as u64) {
-            log::info!("[sched] alive t={} elapsed_ms={}", tick, linux_now_millis());
-        }
+        scheduler::maybe_emit_alive(tick, None);
 
         // Tick pacing. `thread::sleep` for sub-millisecond targets
         // has a ~50-150 µs floor on Linux (timer-tick granularity +

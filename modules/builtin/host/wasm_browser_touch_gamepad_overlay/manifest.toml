@@ -1,0 +1,39 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Touch-overlay → gamepad transformer. Consumes PointerEvents from a
+# wired input port and emits GamepadEvents (MSG_STATE) on a wired
+# output port. Each active touch contact hits one region in the
+# module's canonical layout (DPAD cross at left, face-button diamond
+# at right, bumpers along top, SELECT/START centred); the
+# corresponding W3C-standard button bit becomes part of the
+# composite state until the pointer releases.
+#
+# The visual overlay (the DOM divs the user actually touches) is
+# rendered by the wasm runtime shell from the same canonical region
+# table — see `src/platform/wasm/touch_gamepad_overlay.rs::REGIONS`.
+# Shell and module agree on regions by sharing the table; no per-
+# graph config drift.
+#
+# Pair with:
+#   - `platform.pointer: {}` (any source of input::pointer events)
+#   - a consumer that reads `input::gamepad::MSG_STATE`
+#   - a `presentation: surface { role: gamepad-overlay }` so the
+#     runtime shell knows to render the visual overlay
+
+[[ports]]
+name = "events_in"
+direction = "input"
+content_type = "PointerEvents"
+required = true
+
+[[ports]]
+name = "events_out"
+direction = "output"
+content_type = "GamepadEvents"
+# Not required: a smoke-test scenario can run the overlay without a
+# downstream consumer (events just queue in the channel). Real
+# games / emulators wire this port and the kernel's compile-time
+# validation ensures the wiring matches the GamepadEvents contract.
+required = false

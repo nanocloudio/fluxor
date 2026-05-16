@@ -1,0 +1,77 @@
+# Image Viewer — Waveshare RP2350-Touch-LCD-4, SD-backed.
+#
+# Same overall shape as the cm5 / linux / wasm variants:
+#
+#   storage → bank → codec → display
+#   input → bank.commands  (cycle next / prev)
+#
+# Concretely on this board the storage is an SD card on SPI1, the
+# display is the ST7701S 480×480 panel, and the input is the BOOTSEL
+# button mapped to gesture events by `flash_rp` (single click = next,
+# double click = prev). The codec auto-detects BMP / GIF / PNG / JPEG
+# and emits RGB565 LE.
+#
+# SD card requirements:
+#   * FAT32 (MBR or GPT)
+#   * Drop image files under `/images/`
+#   * 8.3 short names recommended; long file names are auto-folded
+#
+# Sibling variants (same interaction model — tap / click / press to
+# cycle, single decoder pipeline):
+#   examples/waveshare-lcd4/image_viewer_inline.yaml — bake-in test
+#                                                     pattern; no SD
+#   examples/cm5/image_viewer.yaml                   — cm5 decodes, browser displays
+#   examples/linux/image_viewer.yaml                 — linux decodes, browser displays
+#   examples/wasm/image_viewer.yaml                  — full browser
+target: waveshare-lcd4
+
+hardware:
+  spi:
+    - bus: 1
+      sck: 10
+      mosi: 11
+      miso: 12
+
+modules:
+  # SD card on SPI1 (Waveshare LCD-4 SDIO pins).
+  - name: sd
+    spi_bus: 1
+    cs_pin: 15
+    start_block: 0
+    block_count: 0
+
+  - name: fat32
+
+  # BOOTSEL gestures: single = next, double = prev. Same FMP message
+  # bytes the wasm_browser_click_command emits in the browser-side
+  # scenarios; bank doesn't know (or care) which input source produced
+  # them.
+  - name: flash_rp
+    click: next
+    double_click: prev
+
+  - name: bank
+    dir: "/images"
+    formats: ".bmp,.gif,.png,.jpg,.jpeg"
+    mode: loop
+    auto_advance: 0
+
+  # Unified codec — auto-detects BMP / GIF / PNG / JPEG from the
+  # first bytes and dispatches to the matching sub-codec. Scales the
+  # decoded frame to the panel's native 480×480 in RGB565 LE.
+  - name: codec
+    width: 480
+    height: 480
+    scale_mode: fit
+
+  - name: st7701s
+
+wiring:
+  - from: sd.blocks
+    to: fat32.blocks
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.pixels
+    to: st7701s.pixels
+  - from: flash_rp.events
+    to: bank.commands

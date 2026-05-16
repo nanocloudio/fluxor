@@ -1,0 +1,37 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser-side WebSocket source. Opens a WS to the configured URL,
+# pulls binary messages via the `host_ws_*` shim, and forwards the
+# bytes on the `bytes` output port as a `VideoRaster` stream.
+#
+# This is the thin half of the split-deployment image-viewer
+# pipeline (see `examples/wasm/image_viewer_thin.yaml` +
+# `examples/cm5/image_viewer.yaml`):
+#
+#   pi5: bank → host_image_codec → ws_stream → http(/ws)
+#                                                |    ↓ WS BINARY frames
+#   wasm:                              ws_source → wasm_browser_canvas
+#
+# `wasm_browser_canvas` accumulates raw bytes into a `width*height*2`
+# RGB565 buffer and presents each completed frame; the wire shape on
+# this edge is the same as `wasm_browser_image_codec → canvas` in the
+# pure-wasm graph, so the canvas module doesn't care where the bytes
+# came from.
+#
+# Relative URLs (`url: /ws`) are resolved against the page's origin
+# by the host shim, so the same graph works from any port / host
+# combination — the scenario synthesiser doesn't need to template
+# the URL.
+
+[[params]]
+name = "url"
+type = "string"
+required = true
+
+[[ports]]
+name = "bytes"
+direction = "output"
+content_type = "VideoRaster"
+required = true

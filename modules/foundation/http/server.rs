@@ -35,6 +35,25 @@ pub(crate) use super::abi::config::http::{
     SEND_BUF_SIZE,
 };
 
+// ── Retention buffer sizing ───────────────────────────────────────────────
+
+/// Server-wide retention buffer capacity. Sized for one decoded
+/// 800×480 RGB565 frame (~750 KiB) plus headroom for envelope
+/// headers and a small margin; multi-MiB images won't fit and will
+/// reset capture mid-stream — that's fine for the demo (single
+/// fan-out producer + browser size cap), and the value can grow on
+/// large-host profiles when a richer use case lands.
+const RETAINED_BUF_CAP: usize = 2 * 1024 * 1024;
+/// Per-envelope header in `retained_buf`:
+/// `[opcode:u8][fin:u8][payload_len:u16 LE]`.
+const RETAINED_ENVELOPE_HDR: usize = 4;
+/// Ticks of `module_step` quiescence on `ws_in` before the next
+/// captured envelope wipes the buffer and starts fresh. At a typical
+/// 100µs tick the threshold is ~50 ms — much longer than the gap
+/// between chunks of one decoded frame, much shorter than any
+/// reasonable producer-side state change.
+const RETAIN_RESET_TICKS: u16 = 500;
+
 // ── Route handler kinds (stored in Route.handler) ─────────────────────────
 
 pub(crate) const HANDLER_STATIC: u8 = 0;
@@ -337,6 +356,29 @@ pub(crate) struct ConnSlot {
     /// `OP_CONT (0x0)`.
     pub(crate) ws_frag_opcode: u8,
     _slot_pad1: [u8; 3],
+
+    // ── Retention replay state ─────────────────────────────────────
+    //
+    // When a slot enters `WsActive` (fresh client connect on a
+    // fan-out route), it first drains any envelopes captured in the
+    // server-wide `retained_buf` so that reloads see the producer's
+    // most recent snapshot without the producer having to re-emit.
+    // `retained_replay_offset` walks the retain buffer one envelope
+    // at a time, bounded by `retained_replay_target` (snapshot of
+    // `retained_used` taken on the slot's first WsActive tick). New
+    // live envelopes captured during replay grow `retained_used` past
+    // the target — replay must NOT cross that boundary or the new
+    // subscriber would receive them twice (once via live queue, once
+    // via replay walk). `retained_replay_done` flips to 1 when offset
+    // hits the target (caught up; normal live flow resumes).
+    pub(crate) retained_replay_offset: u32,
+    pub(crate) retained_replay_target: u32,
+    pub(crate) retained_replay_done: u8,
+    /// 1 once the replay-start snapshot has been captured for this
+    /// slot. Zero on slot reset → first WsActive tick stamps
+    /// `retained_replay_target = retained_used` and flips this bit.
+    pub(crate) retained_replay_started: u8,
+    _slot_pad2: [u8; 2],
 }
 
 impl ConnSlot {
@@ -372,6 +414,12 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
     // matches the right owner check.
     if s.server.file_chan_owner == idx as i16 {
         s.server.file_chan_owner = -1;
+    }
+    // If this slot was the current fan-out winner, clear the
+    // pointer so the next subscriber doesn't immediately self-close
+    // against a stale index.
+    if s.server.latest_fanout_slot == idx as i32 {
+        s.server.latest_fanout_slot = -1;
     }
     // If this slot was retaining a body-cache entry (mid-emission
     // close), release the retain so the entry can be evicted.
@@ -530,6 +578,45 @@ pub(crate) struct ServerState {
     /// transition clears it. This makes per-tick cost O(active)
     /// instead of O(MAX_CONCURRENT_CONNS).
     pub(crate) ready_bits: [u64; READY_BITS_WORDS],
+
+    // ── Retention buffer ──────────────────────────────────────────
+    //
+    // Server-wide capture of the most recent burst of WsFrame
+    // envelopes seen on `ws_in`. Each envelope is encoded as
+    // `[opcode:u8][fin:u8][payload_len:u16 LE][payload:N]` and
+    // appended to `retained_buf`. When a NEW connection enters
+    // `WsActive` with `ws_fan_out=1`, its first `retained_used`
+    // bytes' worth of replay drains this buffer envelope-by-envelope
+    // into `send_buf` before live envelopes resume.
+    //
+    // Single subscriber by design: the producer emits once per state
+    // change; the server retains the latest "complete" snapshot
+    // (defined by an idle gap > `RETAIN_RESET_TICKS`). New connects
+    // see the snapshot immediately; live envelopes mid-capture also
+    // see the live stream via the normal `ws_drain_fanout_input`
+    // path.
+    pub(crate) retained_buf: *mut u8,
+    pub(crate) retained_cap: u32,
+    pub(crate) retained_used: u32,
+    pub(crate) retained_envelope_count: u16,
+    /// Ticks since the last `ws_in` envelope was captured. Reset to
+    /// 0 on capture; saturating-incremented every step. When it
+    /// exceeds `RETAIN_RESET_TICKS` the next captured envelope
+    /// triggers a wipe of `retained_used` so the buffer holds the
+    /// fresh post-idle snapshot instead of growing without bound.
+    pub(crate) retained_idle_ticks: u16,
+    _retained_pad: [u8; 2],
+
+    /// Last-connection-wins: index of the slot that most recently
+    /// completed a fan-out WS upgrade, or `-1` when no fan-out
+    /// subscriber is active. Every other slot whose `ws_fan_out=1`
+    /// self-closes (CLOSE 1001) on its next `WsActive` tick. The
+    /// fan-out routes are inherently single-subscriber — image
+    /// viewers, raster bridges, telemetry feeds — so a second tab
+    /// connecting must displace the first cleanly, and a displaced
+    /// tab must NOT auto-reconnect (the WS source built-in and the
+    /// canonical runtime shell both have no reconnect logic).
+    pub(crate) latest_fanout_slot: i32,
 }
 
 /// Number of `u64` words needed to cover `MAX_CONCURRENT_CONNS`
@@ -921,6 +1008,7 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.out_chan = -1;
     s.server.ws_out_chan = -1;
     s.server.ws_in_chan = -1;
+    s.server.latest_fanout_slot = -1;
     s.server.port = 80;
     if let Some(cur) = cur_slot_mut(s) {
         cur.fs_fd = -1;
@@ -960,6 +1048,19 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     if !pool.is_null() {
         s.server.body_pool = pool;
         s.server.body_pool_cap = DEFAULT_BODY_POOL_SIZE as u32;
+    }
+
+    // Retention buffer: server-wide snapshot of the most recent
+    // burst on `ws_in`. Best-effort — if STATE_ARENA can't satisfy
+    // a 2 MiB request we leave `retained_buf` null and the capture /
+    // replay paths short-circuit (retention silently degrades to off,
+    // producers must re-emit on every connect just like before).
+    let retained = heap_alloc(&*sys, RETAINED_BUF_CAP as u32);
+    if !retained.is_null() {
+        s.server.retained_buf = retained;
+        s.server.retained_cap = RETAINED_BUF_CAP as u32;
+    } else {
+        log(s, b"[http] retention disabled (no heap)");
     }
 }
 
@@ -1201,9 +1302,105 @@ pub(crate) unsafe fn match_route_path(s: &HttpState, req: *const u8, plen: usize
                 best_len = rlen;
             }
         }
+        // HANDLER_FS_LIST routes implicitly serve individual files at
+        // `<route_path>/<filename>` (in addition to the JSON listing
+        // they serve at the exact route path). The implicit-prefix
+        // matcher fires only when the route path does NOT already
+        // end in '/' (otherwise the explicit-prefix branch above
+        // covers it) and the next byte after the prefix is '/'
+        // (the listing-vs-file separator). The handler decides the
+        // listing-vs-file split based on whether req == route_path.
+        if !route_is_prefix
+            && route.handler == HANDLER_FS_LIST
+            && plen > rlen + 1
+            && rlen > best_len
+            && *req.add(rlen) == b'/'
+        {
+            let mut j = 0;
+            let mut ok = true;
+            while j < rlen {
+                if *req.add(j) != *path_ptr.add(j) {
+                    ok = false;
+                    break;
+                }
+                j += 1;
+            }
+            if ok {
+                best = i as i8;
+                best_len = rlen;
+            }
+        }
         i += 1;
     }
     best
+}
+
+/// Map a request path's file-extension suffix to a MIME type.
+/// Returns an empty slice when no extension is recognised — caller
+/// falls back to `application/octet-stream`.
+///
+/// Used by the AwaitFsStat content-type resolver when the matched
+/// route has no explicit `content_type:` (HANDLER_FS_LIST file-serve
+/// path — see the dual-mode dispatch). Recognises the common image
+/// / audio / web mime types the scenario host pages serve plus a
+/// few generic text formats. Anything outside this small whitelist
+/// falls through to octet-stream — sniffing arbitrary bytes is a
+/// bigger ABI question we don't take a position on here.
+unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'static [u8] {
+    // Find the last '.' in the path (after the last '/').
+    let mut dot: Option<usize> = None;
+    let mut last_slash: usize = 0;
+    let mut i = 0;
+    while i < plen {
+        let b = *path.add(i);
+        if b == b'/' {
+            last_slash = i + 1;
+            dot = None;
+        } else if b == b'.' {
+            dot = Some(i);
+        }
+        i += 1;
+    }
+    let start = match dot {
+        Some(d) if d + 1 > last_slash => d + 1,
+        _ => return &[],
+    };
+    let ext_len = plen - start;
+    if ext_len == 0 || ext_len > 8 {
+        return &[];
+    }
+    // ASCII-lowercase scratch.
+    let mut buf = [0u8; 8];
+    for k in 0..ext_len {
+        let mut b = *path.add(start + k);
+        if (b'A'..=b'Z').contains(&b) {
+            b += 32;
+        }
+        buf[k] = b;
+    }
+    let ext = &buf[..ext_len];
+    match ext {
+        b"html" | b"htm" => b"text/html",
+        b"css" => b"text/css",
+        b"js" | b"mjs" => b"application/javascript",
+        b"json" => b"application/json",
+        b"wasm" => b"application/wasm",
+        b"png" => b"image/png",
+        b"jpg" | b"jpeg" => b"image/jpeg",
+        b"gif" => b"image/gif",
+        b"bmp" => b"image/bmp",
+        b"webp" => b"image/webp",
+        b"svg" => b"image/svg+xml",
+        b"ico" => b"image/x-icon",
+        b"wav" => b"audio/wav",
+        b"mp3" => b"audio/mpeg",
+        b"aac" => b"audio/aac",
+        b"ogg" => b"audio/ogg",
+        b"mp4" => b"video/mp4",
+        b"txt" => b"text/plain",
+        b"xml" => b"application/xml",
+        _ => &[],
+    }
 }
 
 unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type: &[u8]) {
@@ -2241,38 +2438,65 @@ unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     let saved_cur = s.server.cur_slot;
     s.server.cur_slot = target_idx as i32;
 
-    // Single-frame fast path: payload fits in send_buf with header
-    // reserve. Common case for chat-text, audio chunks, small media
-    // tiles.
-    let max_chunk = SEND_BUF_SIZE.saturating_sub(WS_FRAG_HDR_RESERVE);
-    if payload_len <= max_chunk {
-        ws_queue_frame_fin(
-            s,
-            opcode,
-            fin,
-            frame_buf.as_ptr().add(WS_FRAME_HDR),
-            payload_len,
-        );
-        s.server.cur_slot = saved_cur;
-        return true;
-    }
-
-    // Fragment the source payload: copy it into the target slot's
-    // heap buffer that survives across step() iterations, then queue
-    // the first fragment with the original opcode and fin=0.
-    let frag_buf = heap_alloc(sys, payload_len as u32);
-    if frag_buf.is_null() {
-        // Out of memory — drop the source frame. The producer side
-        // will retry the next message; meanwhile no fragment leaks
-        // and no slot state was mutated.
-        s.server.cur_slot = saved_cur;
+    let queued = ws_queue_envelope_on_active(
+        s,
+        opcode,
+        fin,
+        frame_buf.as_ptr().add(WS_FRAME_HDR),
+        payload_len,
+    );
+    s.server.cur_slot = saved_cur;
+    if !queued {
         return false;
     }
-    core::ptr::copy_nonoverlapping(frame_buf.as_ptr().add(WS_FRAME_HDR), frag_buf, payload_len);
 
-    // Stamp slot fragmentation state BEFORE queuing the first
-    // fragment so a panic between the two leaves slot state
-    // recoverable on the next close cycle.
+    // Capture: append this envelope to the retention buffer so a
+    // future fan-out connect can replay the producer's snapshot
+    // without the producer re-emitting. Idle-gap reset wipes the
+    // buffer on the first envelope after a long quiet period so we
+    // hold the *latest* state, not an unbounded history.
+    retain_capture_envelope(
+        s,
+        opcode,
+        fin,
+        frame_buf.as_ptr().add(WS_FRAME_HDR),
+        payload_len,
+    );
+
+    true
+}
+
+/// Queue one logical envelope on the currently-active slot. Single-
+/// frame fast path if the payload fits within `SEND_BUF_SIZE -
+/// WS_FRAG_HDR_RESERVE`; otherwise stamps the slot's `ws_frag_*`
+/// fields and emits the first fragment, with subsequent
+/// continuations driven by `ws_emit_next_fragment` on later ticks.
+///
+/// Caller guarantees:
+///   * the active slot's `send_buf` is empty
+///   * no fragmentation is currently in flight on the active slot
+///
+/// Returns `false` on heap-alloc failure (only possible for the
+/// fragmentation path); the caller must treat that as "this envelope
+/// is dropped and the producer must retry."
+unsafe fn ws_queue_envelope_on_active(
+    s: &mut HttpState,
+    opcode: u8,
+    fin: bool,
+    payload: *const u8,
+    payload_len: usize,
+) -> bool {
+    let max_chunk = SEND_BUF_SIZE.saturating_sub(WS_FRAG_HDR_RESERVE);
+    if payload_len <= max_chunk {
+        ws_queue_frame_fin(s, opcode, fin, payload, payload_len);
+        return true;
+    }
+    let sys = &*s.syscalls;
+    let frag_buf = heap_alloc(sys, payload_len as u32);
+    if frag_buf.is_null() {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(payload, frag_buf, payload_len);
     if let Some(cur) = cur_slot_mut(s) {
         cur.ws_frag_buf = frag_buf;
         cur.ws_frag_total = payload_len as u16;
@@ -2280,10 +2504,56 @@ unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
         cur.ws_frag_opcode = opcode;
         cur.ws_frag_orig_fin = if fin { 1 } else { 0 };
     }
-
     ws_queue_frame_fin(s, opcode, false, frag_buf, max_chunk);
-    s.server.cur_slot = saved_cur;
     true
+}
+
+/// Append a captured envelope to the server-wide retention buffer.
+/// Idle-gap reset: if `retained_idle_ticks > RETAIN_RESET_TICKS`,
+/// wipe the buffer first so the captured snapshot reflects only the
+/// *new* burst (avoids unbounded growth across producer state
+/// changes). Envelopes that won't fit even after a reset are
+/// dropped silently — retention is best-effort.
+unsafe fn retain_capture_envelope(
+    s: &mut HttpState,
+    opcode: u8,
+    fin: bool,
+    payload: *const u8,
+    payload_len: usize,
+) {
+    if s.server.retained_buf.is_null() || s.server.retained_cap == 0 {
+        return;
+    }
+    if payload_len > u16::MAX as usize {
+        return;
+    }
+    let needed = RETAINED_ENVELOPE_HDR + payload_len;
+    if s.server.retained_idle_ticks > RETAIN_RESET_TICKS {
+        s.server.retained_used = 0;
+        s.server.retained_envelope_count = 0;
+    }
+    if s.server.retained_used as usize + needed > s.server.retained_cap as usize {
+        // No room — wipe and try once. If a single envelope still
+        // can't fit, retention is misconfigured (cap too small for
+        // this workload); drop and let the live path serve it.
+        s.server.retained_used = 0;
+        s.server.retained_envelope_count = 0;
+        if needed > s.server.retained_cap as usize {
+            return;
+        }
+    }
+    let dst = s.server.retained_buf.add(s.server.retained_used as usize);
+    *dst = opcode;
+    *dst.add(1) = if fin { 1 } else { 0 };
+    let len_bytes = (payload_len as u16).to_le_bytes();
+    *dst.add(2) = len_bytes[0];
+    *dst.add(3) = len_bytes[1];
+    if payload_len > 0 {
+        core::ptr::copy_nonoverlapping(payload, dst.add(RETAINED_ENVELOPE_HDR), payload_len);
+    }
+    s.server.retained_used += needed as u32;
+    s.server.retained_envelope_count = s.server.retained_envelope_count.saturating_add(1);
+    s.server.retained_idle_ticks = 0;
 }
 
 /// Emit the next continuation fragment from the active slot's
@@ -3627,13 +3897,123 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                 }
                 HANDLER_FS_LIST => {
-                    // One-shot JSON directory listing. Builds the
-                    // entire response (status line + headers + body)
-                    // in `send_buf` and transitions to SendHeaders,
-                    // which streams the buffer to the client and on
-                    // drain proceeds straight to CloseConn (no
-                    // separate body phase).
+                    // Dual-mode: when the request path exactly matches
+                    // the route path → emit the JSON directory listing
+                    // (the original FS_LIST behaviour). When the
+                    // request path is `<route>/<filename>` (matched
+                    // via the implicit-prefix rule in
+                    // `match_route_path`) → open `<fs_path>/<filename>`
+                    // and stream it like HANDLER_FS_FILE.  This dual
+                    // mode lets one route serve both the listing AND
+                    // every file in the dir, which is what the
+                    // scenario synthesiser's `list:` binding emits
+                    // (the canonical case is `/api/list` + the gallery
+                    // files the host page navigates between).
+                    //
+                    // The dispatch into the file-serve path falls
+                    // through to the HANDLER_FS_FILE Phase::AwaitFsStat
+                    // machinery below by setting `cur.fs_fd` after
+                    // FS_OPEN-ing the composed path and transitioning
+                    // straight to AwaitFsStat — no code duplication.
                     let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
+                    let route_path_len = route.path_len as usize;
+                    let (req_path_ptr_local, req_path_len) = match cur_slot(s) {
+                        Some(c) => (c.req_path.as_ptr(), c.req_path_len as usize),
+                        None => (core::ptr::null(), 0usize),
+                    };
+                    let is_file_request = req_path_len > route_path_len + 1;
+
+                    if is_file_request {
+                        // Compose `<fs_path>/<suffix>`. The suffix
+                        // already includes its leading '/' (the
+                        // separator between route path and filename),
+                        // which lets us concat without inserting one.
+                        let mut composed = [0u8; MAX_FS_PATH];
+                        let dir_len = route.fs_path_len as usize;
+                        let suffix_len = req_path_len - route_path_len;
+                        let total = dir_len + suffix_len;
+                        if dir_len == 0 || total > MAX_FS_PATH {
+                            build_error(
+                                s,
+                                b"500 Internal Server Error",
+                                b"FS_LIST file path too long\n",
+                            );
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
+                            return 0;
+                        }
+                        composed[..dir_len].copy_from_slice(&route.fs_path[..dir_len]);
+                        let req_path_ptr = req_path_ptr_local;
+                        for k in 0..suffix_len {
+                            // Path-traversal guard: reject `..` segments
+                            // and embedded null bytes outright. Any
+                            // non-printable / control byte also rejected.
+                            let b = *req_path_ptr.add(route_path_len + k);
+                            if b == 0 || b == b'\\' {
+                                build_error(s, b"400 Bad Request", b"bad path\n");
+                                if let Some(cur) = cur_slot_mut(s) {
+                                    cur.phase = Phase::DrainSend;
+                                }
+                                return 0;
+                            }
+                            composed[dir_len + k] = b;
+                        }
+                        // Reject `..` traversal: scan for `/../`,
+                        // trailing `/..`, leading `../`, or bare `..`.
+                        // Cheap byte-window check rather than a full
+                        // canonicaliser — we're guarding the suffix
+                        // (already validated for nulls/backslashes
+                        // above), and the suffix is provided by the
+                        // request URL which we don't trust.
+                        let suffix_start = dir_len;
+                        let suffix_end = total;
+                        let mut k = suffix_start;
+                        while k + 1 < suffix_end {
+                            if composed[k] == b'.' && composed[k + 1] == b'.' {
+                                let before_ok = k == suffix_start || composed[k - 1] == b'/';
+                                let after_ok = (k + 2) == suffix_end
+                                    || composed[k + 2] == b'/';
+                                if before_ok && after_ok {
+                                    build_error(
+                                        s,
+                                        b"400 Bad Request",
+                                        b"path traversal rejected\n",
+                                    );
+                                    if let Some(cur) = cur_slot_mut(s) {
+                                        cur.phase = Phase::DrainSend;
+                                    }
+                                    return 0;
+                                }
+                            }
+                            k += 1;
+                        }
+
+                        let sys = &*s.syscalls;
+                        let fd = (sys.provider_call)(
+                            -1,
+                            0x0900, // FS_OPEN
+                            composed.as_mut_ptr(),
+                            total,
+                        );
+                        if fd < 0 {
+                            build_error(s, b"404 Not Found", b"Not Found\n");
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
+                            return 0;
+                        }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.fs_fd = fd;
+                            cur.fs_sent = 0;
+                            cur.fs_total = 0;
+                            cur.fs_stat_ticks = 0;
+                            cur.phase = Phase::AwaitFsStat;
+                        }
+                        return 0;
+                    }
+
+                    // Fall through: exact-match listing path.
                     let n = route.fs_path_len as usize;
                     if n == 0 || n > MAX_FS_PATH {
                         build_error(
@@ -3901,10 +4281,30 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     ct_buf[..ct_len].copy_from_slice(&r.content_type[..ct_len]);
                 }
             }
-            let ct_slice: &[u8] = if ct_len == 0 {
-                b"application/octet-stream"
+            // Content-Type resolution order:
+            //   1. Route's explicit `content_type:` (e.g. HANDLER_FS_FILE
+            //      with `content_type: "text/html"`).
+            //   2. Sniffed from the request path's extension. Covers
+            //      the HANDLER_FS_LIST file-serve path where the route
+            //      has no fixed content_type — the request URL is the
+            //      only source of mime info we have without a content
+            //      sniff.
+            //   3. Fallback `application/octet-stream`.
+            let sniffed = if ct_len == 0 {
+                let (req_p, req_l) = match cur_slot(s) {
+                    Some(c) => (c.req_path.as_ptr(), c.req_path_len as usize),
+                    None => (core::ptr::null(), 0usize),
+                };
+                content_type_from_path(req_p, req_l)
             } else {
+                &[][..]
+            };
+            let ct_slice: &[u8] = if ct_len > 0 {
                 &ct_buf[..ct_len]
+            } else if !sniffed.is_empty() {
+                sniffed
+            } else {
+                b"application/octet-stream"
             };
 
             if st == E_NODEV {
@@ -4012,12 +4412,24 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                     }
                     HANDLER_FS_LIST => {
-                        // FS_LIST's response (status + headers + JSON
-                        // body) is already fully in `send_buf` and has
-                        // drained — there's no separate body phase to
-                        // run. Close the connection.
+                        // FS_LIST is dual-mode:
+                        //   - exact-match listing: the JSON body is
+                        //     already in `send_buf` and has drained;
+                        //     close.
+                        //   - file-serve (prefix `<route>/<file>`):
+                        //     AwaitFsStat opened a real fd and only
+                        //     emitted the status line + headers into
+                        //     `send_buf`; the body still needs to be
+                        //     streamed via FS_READ → SendBody. The fd
+                        //     state (`fs_fd >= 0` after AwaitFsStat
+                        //     committed) is the discriminator.
+                        let has_open_fd = cur_fs_fd(s) >= 0;
                         if let Some(cur) = cur_slot_mut(s) {
-                            cur.phase = Phase::DrainSend;
+                            cur.phase = if has_open_fd {
+                                Phase::SendBody
+                            } else {
+                                Phase::DrainSend
+                            };
                         }
                     }
                     _ => {
@@ -4066,6 +4478,16 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     return step_send_file(s);
                 }
                 HANDLER_FS_FILE => {
+                    return step_send_fs_file(s);
+                }
+                HANDLER_FS_LIST => {
+                    // Dual-mode FS_LIST in file-serve mode reuses the
+                    // FS_FILE streamer wholesale — same fs_fd / fs_sent
+                    // / fs_total state machine, same FS_READ chunked
+                    // drain. SendHeaders only forwards us here when
+                    // `cur_fs_fd >= 0` (i.e. AwaitFsStat opened a real
+                    // file handle), so the FS_LIST listing path
+                    // (single-shot send_buf) never reaches SendBody.
                     return step_send_fs_file(s);
                 }
                 _ => {
@@ -4229,6 +4651,21 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::WsActive;
                 }
+                // Last-connection-wins: stamp this slot as the
+                // current fan-out subscriber. Every other slot whose
+                // `ws_fan_out=1` will self-close (CLOSE 1001) on its
+                // next `WsActive` tick — see the displacement check
+                // at the top of the WsActive arm. Doing it that way
+                // (rather than walking the table here and queuing
+                // CLOSE on busy slots) avoids the race where the
+                // displaced slot is mid-flush of a big payload and
+                // skipped because its `send_buf` is non-empty:
+                // the per-slot check re-fires every tick until the
+                // flush drains, at which point the close cleanly
+                // takes over.
+                if cur_ws_fan_out(s) != 0 {
+                    s.server.latest_fanout_slot = s.server.cur_slot;
+                }
                 return 2;
             }
             let sent = net_send(
@@ -4249,6 +4686,148 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // to the right slot, so the per-tick handler here only
             // has to drain ws_in / recv_buf.
             //
+            // Peer-closed fast path: if `linux_net` has signalled
+            // MSG_CLOSED for this conn, the slot's TCP socket is
+            // gone — sending any more bytes is wasted work, and
+            // leaving `ws_fan_out=1` on the slot makes
+            // `find_first_ws_fanout_slot` hand new producers a dead
+            // delivery target. Transition straight to CloseConn so
+            // `slot_release_buffers` clears the fanout flag and
+            // frees the slot for a new live client. Without this
+            // gate, a reloaded browser tab leaves its old slot
+            // hogging the fanout target indefinitely (lower slot
+            // index always wins find_first), and the reloaded tab's
+            // new slot never gets a single envelope.
+            if cur_slot(s).map(|c| c.peer_closed).unwrap_or(0) != 0 {
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.ws_fan_out = 0;
+                    cur.phase = Phase::CloseConn;
+                }
+                return 0;
+            }
+
+            // Last-connection-wins self-check: if a newer fan-out
+            // upgrade has stamped `latest_fanout_slot` to a different
+            // slot, this slot has been displaced. Queue a graceful
+            // CLOSE 1001 the moment `send_buf` is clear and no
+            // fragmentation is in flight; otherwise let the in-flight
+            // flush complete and re-check on the next tick. Skipping
+            // retention replay + ws_in drain here is intentional —
+            // we don't want a being-displaced slot to consume more
+            // envelopes that the new slot should be receiving.
+            let me_idx = s.server.cur_slot;
+            let displaced = cur_ws_fan_out(s) != 0
+                && s.server.latest_fanout_slot >= 0
+                && s.server.latest_fanout_slot != me_idx;
+            if displaced {
+                let send_empty = cur_send_len(s) == 0;
+                let no_frag = cur_slot(s)
+                    .map(|c| c.ws_frag_buf.is_null())
+                    .unwrap_or(true);
+                if send_empty && no_frag {
+                    ws_begin_close(s, ws::CLOSE_GOING_AWAY);
+                    return 2;
+                }
+                // Mid-flush: drain remaining bytes then re-check.
+                if cur_send_len(s) > 0 && cur_send_offset(s) < cur_send_len(s) {
+                    let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
+                    let sent = net_send(
+                        s,
+                        cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
+                        remaining,
+                    );
+                    if sent > 0 {
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.send_offset += sent as u16;
+                        }
+                        if cur_send_offset(s) >= cur_send_len(s) {
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.send_offset = 0;
+                                cur.send_len = 0;
+                            }
+                        }
+                    }
+                }
+                return 0;
+            }
+
+            // Retention replay: a freshly upgraded fan-out slot drains
+            // any envelopes still held in `retained_buf` (the producer's
+            // most recent snapshot) before joining the live fan-out
+            // path. Single envelope per loop iteration so the existing
+            // flush + fragmentation machinery handles each one
+            // identically to a live ws_in arrival. Once `retained_used`
+            // is exhausted (or the buffer has been reset mid-replay by
+            // a fresh producer burst), `retained_replay_done` flips and
+            // subsequent ticks fall through to the normal flow.
+            let needs_replay = cur_slot(s)
+                .map(|c| {
+                    c.ws_fan_out != 0
+                        && c.retained_replay_done == 0
+                        && c.ws_frag_buf.is_null()
+                })
+                .unwrap_or(false);
+            if needs_replay && cur_send_len(s) == 0 && !s.server.retained_buf.is_null() {
+                // First tick in this slot: stamp the replay target
+                // to the current `retained_used`. The replay walks
+                // only up to that boundary, so envelopes captured
+                // *after* the slot enters WsActive (which are also
+                // queued live) don't get re-delivered through replay.
+                let started = cur_slot(s)
+                    .map(|c| c.retained_replay_started)
+                    .unwrap_or(0);
+                if started == 0 {
+                    let snapshot = s.server.retained_used;
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.retained_replay_target = snapshot;
+                        cur.retained_replay_started = 1;
+                    }
+                }
+                let (offset, target) = (
+                    cur_slot(s).map(|c| c.retained_replay_offset).unwrap_or(0),
+                    cur_slot(s).map(|c| c.retained_replay_target).unwrap_or(0),
+                );
+                // If the buffer was reset since replay started
+                // (retained_used dropped below the snapshot target),
+                // the bytes the slot was about to read are
+                // partially overwritten — abort cleanly.
+                let buf_reset = s.server.retained_used < target;
+                if offset >= target || buf_reset {
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.retained_replay_done = 1;
+                    }
+                } else if (offset as usize) + RETAINED_ENVELOPE_HDR <= target as usize {
+                    let buf = s.server.retained_buf.add(offset as usize);
+                    let r_op = *buf;
+                    let r_fin = *buf.add(1) != 0;
+                    let r_len = u16::from_le_bytes([*buf.add(2), *buf.add(3)]) as usize;
+                    let envelope_total = RETAINED_ENVELOPE_HDR + r_len;
+                    if (offset as usize) + envelope_total > target as usize {
+                        // Truncated tail (retained_buf reset mid-walk
+                        // by a fresh burst). Bail out of replay; live
+                        // path resumes next iteration.
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.retained_replay_done = 1;
+                        }
+                    } else {
+                        let payload_ptr = buf.add(RETAINED_ENVELOPE_HDR);
+                        if ws_queue_envelope_on_active(s, r_op, r_fin, payload_ptr, r_len) {
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.retained_replay_offset =
+                                    cur.retained_replay_offset.saturating_add(envelope_total as u32);
+                            }
+                        } else {
+                            // Heap-alloc failure on fragmentation —
+                            // give up on replay, let live producer
+                            // re-emit if/when it can.
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.retained_replay_done = 1;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Loop within this tick alternating between flushing send_buf
             // to net_out and draining the next outbound frame from
             // ws_in / recv_buf. This keeps the pipeline saturated under

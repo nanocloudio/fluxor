@@ -44,8 +44,10 @@ name = "debug"
 #   1. `platform.debug.dst_ip` in the user YAML (per-config override)
 #   2. `[debug] collector_ip` in `~/.config/fluxor/host.toml` (per-dev)
 #   3. hard-fail with a pointer at the missing field.
+# ── Silicon families: `ip` module produced by `stacks/net.toml` ──
+# rp2 / bcm / qemu-virt wire the netconsole alongside their IP stack.
 [[variant]]
-match = { to = "net" }
+match = { to = "net", family = "rp2" }
 modules = [
   { name = "log_net", params = {
       dst_ip    = "user:dst_ip|host:debug.collector_ip|required",
@@ -58,9 +60,77 @@ wiring = [
   "log_net.net_out -> ip.net_in",
 ]
 
+[[variant]]
+match = { to = "net", family = "bcm" }
+modules = [
+  { name = "log_net", params = {
+      dst_ip    = "user:dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:dst_port|host:debug.collector_port",
+      bind_port = "user:bind_port|host:debug.bind_port",
+  } },
+]
+wiring = [
+  "ip.net_out -> log_net.net_in",
+  "log_net.net_out -> ip.net_in",
+]
+
+# ── Linux family: `stacks/net.toml`'s `family = "linux"` variant
+# provides `linux_net` (no separate `ip` module). When a silicon
+# graph is run via `runtime_override: linux`, the net stack expands
+# to linux_net but the debug overlay still expects a NetProto-
+# producing module — point it at linux_net by the same shape. The
+# wire format on both endpoints is `NetProto`, identical to the
+# `ip`-fronted variants above.
+[[variant]]
+match = { to = "net", family = "linux" }
+modules = [
+  { name = "log_net", params = {
+      dst_ip    = "user:dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:dst_port|host:debug.collector_port",
+      bind_port = "user:bind_port|host:debug.bind_port",
+  } },
+]
+wiring = [
+  "linux_net.net_out -> log_net.net_in",
+  "log_net.net_out -> linux_net.net_in",
+]
+
 # ----------------------------------------------------------------------------
 # Overlays — additive switches that layer on top of the chosen transport.
 # ----------------------------------------------------------------------------
+
+# ── wasm: browser-console sink ──────────────────────────────────────────
+#
+# `platform.debug: { to: console }` is the wasm-family default. The
+# kernel's `log::*` macros are already routed to `host_log` on the
+# wasm platform (see `src/platform/wasm.rs::WASM_LOGGER`), which the
+# JS shim implements by writing to `console.log` / `.warn` / `.error`
+# (level 0..4). So `to: console` is a no-module variant — it just
+# declares the intent so the validator knows what the user asked for
+# and refuses combinations that wouldn't fire (e.g. `to: console`
+# with a non-wasm target would be a mismatch).
+[[variant]]
+match = { family = "wasm", to = "console" }
+modules = []
+wiring = []
+
+# ── wasm: DOM scrollback terminal sink ──────────────────────────────────
+#
+# `platform.debug: { to: terminal }` adds an in-page `<pre>`
+# scrollback widget that the kernel's log ring drains into. Same
+# multi-consumer log ring as `log_net` on embedded targets, so this
+# composes with `to: console` (both can be enabled via successive
+# overlay invocations, or by toggling).
+#
+# The terminal renders inside a `presentation: surface` with
+# `role: terminal`. The synthesised wasm runtime shell auto-renders
+# the surface based on the graph YAML's presentation block.
+[[variant]]
+match = { family = "wasm", to = "terminal" }
+modules = [
+  { name = "log_terminal", type = "wasm_browser_terminal" },
+]
+wiring = []
 
 # Monitor telemetry: periodic `MON_HIST` lines for the `fluxor monitor` CLI
 # (per-module step-time histogram). Orthogonal to `to:` — the monitor
