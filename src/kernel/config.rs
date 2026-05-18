@@ -431,11 +431,18 @@ const _: () = assert!(
 
 pub const MAX_GRAPH_EDGES: usize = 128;
 
-/// Hard ceiling on the on-disk config blob size. Set to 32 KiB by design —
-/// the parser refuses any larger blob, and the pointer-based entry point
-/// caps caller-supplied lengths to this value before constructing the
-/// reader slice. Bumping this number requires re-validating every
-/// platform's mapped config region and the trailer's `config_size` field.
+/// Hard ceiling on the on-disk config blob size. Per-platform:
+/// - Embedded targets (rp/bcm) cap at 32 KiB — fits in their
+///   statically-sized flash regions; bumping requires re-validating
+///   the mapped config region + trailer's `config_size` field.
+/// - Host targets (linux/wasm) cap at 128 KiB — the synthesised
+///   wasm-scenario host inlines the canonical browser shell
+///   (runtime.html + host_shims.js, ~60 KiB combined) as `body:`
+///   routes so the orchestrator stays self-contained per the
+///   shared-infra-in-orchestrator partition principle.
+#[cfg(any(target_os = "linux", target_arch = "wasm32"))]
+pub const MAX_CONFIG_SIZE: usize = 128 * 1024;
+#[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
 pub const MAX_CONFIG_SIZE: usize = 32 * 1024;
 
 /// Hardware section binary format sizes
@@ -845,22 +852,26 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // Parse modules - variable-length entries
     let modules_base = unsafe { flash_ptr.add(16) };
 
-    // Module section header: module_count (u8), reserved (u8), section_size (u16).
-    // Check the header sits inside the blob before reading.
-    if blob_len < HEADER_SIZE + 4 {
+    // Module section header: module_count (u8), reserved (u8),
+    // section_size (u32). u32 lets multi-component scenarios (split
+    // deployments where producer + viewer/player both embed the
+    // canonical wasm shell as http body routes) clear 64 KiB without
+    // overflowing the section size; embedded targets (rp/bcm) still
+    // fit in the low 16 bits in practice.
+    if blob_len < HEADER_SIZE + 6 {
         log::error!(
             "[config] blob too short for module section header: {} < {}",
             blob_len,
-            HEADER_SIZE + 4
+            HEADER_SIZE + 6
         );
         return false;
     }
-    let section_size = unsafe { read_u16(modules_base.add(2)) } as usize;
+    let section_size = unsafe { read_u32(modules_base.add(2)) } as usize;
 
     // Validate CRC16-CCITT checksum over body (bytes 8 onwards).
-    // Body = header tail (8) + module section (4+section_size) + graph (64) + hw (variable).
+    // Body = header tail (8) + module section (6+section_size) + graph (64) + hw (variable).
     // We read hw counts to compute total size.
-    let body_before_hw = 8 + (4 + section_size) + GRAPH_SECTION_SIZE;
+    let body_before_hw = 8 + (6 + section_size) + GRAPH_SECTION_SIZE;
 
     // Hardware section header (6 bytes: spi/i2c/gpio/pio/_/uart) must fit
     // inside the blob too. `body_before_hw` is measured from `flash_ptr+8`,
@@ -875,7 +886,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         );
         return false;
     }
-    let hw_header_ptr = unsafe { modules_base.add(4 + section_size + GRAPH_SECTION_SIZE) };
+    let hw_header_ptr = unsafe { modules_base.add(6 + section_size + GRAPH_SECTION_SIZE) };
     let (spi_n, i2c_n, gpio_n, pio_n, uart_n) = unsafe {
         (
             (*hw_header_ptr) as usize,
@@ -926,7 +937,14 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             return false;
         }
     }
-    // Bounds-check: module section size should be reasonable
+    // Bounds-check: module section size should be reasonable.
+    // Linux/wasm get a larger ceiling so the wasm-scenario synth
+    // host can carry the inlined browser shell (~60 KiB of
+    // runtime.html + host_shims.js as http route bodies) — same
+    // partition principle as `MAX_CONFIG_SIZE` above.
+    #[cfg(any(target_os = "linux", target_arch = "wasm32"))]
+    const MAX_MODULE_SECTION: usize = 128 * 1024;
+    #[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
     const MAX_MODULE_SECTION: usize = 32 * 1024;
     if section_size > MAX_MODULE_SECTION {
         log::error!(
@@ -941,11 +959,11 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // (truncation, undersized entry length, out-of-bounds extent,
     // out-of-range id, arena-alloc failure) rejects the whole config
     // — partial graphs are never accepted.
-    let mut offset = 4usize; // Skip section header
+    let mut offset = 6usize; // Skip 6-byte section header (count, reserved, section_size u32)
     for i in 0..config.module_count as usize {
-        // Every entry's 16-bit length prefix must fit inside the
+        // Every entry's 32-bit length prefix must fit inside the
         // declared section.
-        if offset + 2 > section_size + 4 {
+        if offset + 4 > section_size + 6 {
             log::error!(
                 "[config] module entry {} length prefix past section end (offset={}, section_size={})",
                 i, offset, section_size
@@ -954,15 +972,15 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         }
 
         let entry_ptr = unsafe { modules_base.add(offset) };
-        let entry_len = unsafe { read_u16(entry_ptr) } as usize;
+        let entry_len = unsafe { read_u32(entry_ptr) } as usize;
 
-        if entry_len < 8 {
+        if entry_len < 10 {
             log::error!("[config] module entry {} bad length={}", i, entry_len);
             return false;
         }
 
         // The whole entry payload must also fit inside the section.
-        if offset + entry_len > section_size + 4 {
+        if offset + entry_len > section_size + 6 {
             log::error!(
                 "[config] module entry {} extends past section end (offset={}, entry_len={}, section_size={})",
                 i, offset, entry_len, section_size
@@ -992,8 +1010,8 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         offset += entry_len;
     }
 
-    // Section base is after module section (header + entries)
-    let section_base = unsafe { modules_base.add(4 + section_size) };
+    // Section base is after module section (6-byte header + entries)
+    let section_base = unsafe { modules_base.add(6 + section_size) };
 
     let edge_count = config.edge_count as usize;
 
@@ -1043,19 +1061,22 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
 
 /// Parse variable-length module entry
 ///
-/// Format:
-/// - Bytes 0-1: entry_length (u16)
-/// - Bytes 2-5: name_hash (u32)
-/// - Byte 6: id
-/// - Byte 7: reserved
-/// - Bytes 8+: params
+/// Format (10-byte header — entry_length widened to u32 to allow
+/// per-module params >64 KiB, needed by the synth host's http
+/// module when both halves of a split scenario inline their wasm
+/// shells as body routes):
+/// - Bytes 0-3: entry_length (u32)
+/// - Bytes 4-7: name_hash (u32)
+/// - Byte 8: id
+/// - Byte 9: reserved/domain_id
+/// - Bytes 10+: params
 fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
     unsafe {
-        let name_hash = read_u32(ptr.add(2));
-        let id = *ptr.add(6);
-        let domain_id = *ptr.add(7);
+        let name_hash = read_u32(ptr.add(4));
+        let id = *ptr.add(8);
+        let domain_id = *ptr.add(9);
 
-        let params_len = entry_len.saturating_sub(8);
+        let params_len = entry_len.saturating_sub(10);
         if params_len == 0 {
             return Some(ModuleEntry {
                 name_hash,
@@ -1069,7 +1090,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 
         // Allocate space in arena and copy params
         let arena_buf = arena_alloc(params_len)?;
-        core::ptr::copy_nonoverlapping(ptr.add(8), arena_buf.as_mut_ptr(), params_len);
+        core::ptr::copy_nonoverlapping(ptr.add(10), arena_buf.as_mut_ptr(), params_len);
 
         Some(ModuleEntry {
             name_hash,

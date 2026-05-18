@@ -117,15 +117,11 @@ graph today — `fluxor run <yaml>` for linux/qemu, `make firmware`
 then flash for embedded.
 
 The **WASM** and **split** variants need an HTTP origin to host the
-browser side, which is a separate Fluxor graph. The declarative
-answer is the deployment-scenario primitive proposed in
-[`../../.context/rfc_deployment_scenarios.md`](../../.context/rfc_deployment_scenarios.md)
-— a `*.scenario.yaml` that names the participating component graphs
-and how they bind to each other, run by `fluxor run <scenario>`.
-That RFC unifies the wasm-hosting and split-orchestration cases
-into one primitive and removes every shell/Python wrapper currently
-needed to coordinate them.
-
-Until scenarios land, run wasm bundles by building them
-(`fluxor build <yaml> -o target/wasm/<name>.wasm`) and serving the
-output next to the host HTML page from any static HTTP server.
+browser side, which is a separate Fluxor graph. The deployment-
+scenario primitive ([RFC](../../.context/rfc_deployment_scenarios.md))
+solves this declaratively. Single-graph orchestration carries the
+`scenario:` block inline on the graph YAML (see
+`examples/cm5/image_viewer.yaml`); multi-graph harnesses use a
+standalone YAML with `kind: scenario` at the top
+(see `examples/test_harness/audio_codecs.yaml`). Either form is
+run by `fluxor run <yaml>`.

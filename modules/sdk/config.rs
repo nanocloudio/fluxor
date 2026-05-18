@@ -68,8 +68,23 @@ mod profile_host {
         /// the arena under sustained gigabit-class loads.
         pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
         pub const MAX_MODULES: usize = 64;
-        pub const MAX_MODULE_CONFIG_SIZE: usize = 32 * 1024;
-        pub const CONFIG_ARENA_SIZE: usize = 64 * 1024;
+        // 128 KiB so the synth host can carry the inlined wasm
+        // browser shell (runtime.html + host_shims.js, ~60 KiB
+        // combined) as http `body:` routes. Smaller values
+        // silently truncate the http module's params blob (the
+        // kernel-side ParamBuffer copies up to this many bytes
+        // before passing to module_new), which manifested as
+        // host_shims.js getting served at 1275 bytes instead of
+        // its full ~32 KiB. Aligned with `MAX_CONFIG_SIZE`,
+        // `MAX_MODULE_PARAMS_SIZE` (tools), and the http module
+        // section cap.
+        pub const MAX_MODULE_CONFIG_SIZE: usize = 128 * 1024;
+        // 256 KiB so split scenarios where both halves' http modules
+        // inline the canonical wasm shell as body routes
+        // (~95 KiB per http module) leave enough headroom for the
+        // other modules' params (codec, bank, ws_stream, ...).
+        // Was 64 KiB pre-shell-bundling.
+        pub const CONFIG_ARENA_SIZE: usize = 256 * 1024;
         /// Capacity of the in-memory log ring (`kernel::log_ring`).
         /// Sized for moderate trace volume.
         pub const LOG_RING_CAPACITY: usize = 65536;

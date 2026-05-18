@@ -1,0 +1,116 @@
+# Audio Player — cm5 producer half of the split deployment.
+#
+# Pairs with `../wasm/audio_player_thin.yaml` (the browser-side
+# audio_out + gesture chain) via the inline `scenario:` block
+# below — `fluxor run` orchestrates both halves. The cm5 graph runs
+# everything except the audio sink: bank cycles the FAT32 audio
+# library on the cm5's NVMe partition, the unified `codec` module
+# decodes WAV/MP3/AAC to i16 LE PCM, and the http server fans the
+# samples out to any browser tab that opens `/player/`. Tap or
+# click on the player surface posts an FMP `toggle`/`next`/`prev`
+# back over the same WebSocket; bank advances on the producer side
+# and streams the next track.
+#
+# Shape:
+#
+#   fat32 → bank → codec → ws.tx_out → http.ws_in → browser audio_out
+#   browser pointer → pointer_to_button → gesture → ws.tx (FMP)
+#                                                    ↓
+#                                    ws.rx_out → bank.commands
+#
+# Storage layout (set up once on the Pi 5 host before booting fluxor):
+#   sudo mkfs.vfat -F 32 -s 8 -n FLUXORNV /dev/nvme0n1p1
+#   sudo mount /dev/nvme0n1p1 /mnt/nvme
+#   sudo mkdir -p /mnt/nvme/audio
+#   sudo cp ~/music/*.{wav,mp3,aac} /mnt/nvme/audio/
+#   sudo umount /mnt/nvme
+
+target: cm5
+tick_us: 100
+
+# Inline scenario — `fluxor run examples/cm5/audio_player_split.yaml`
+# orchestrates this graph plus the thin wasm player at `/player/`.
+# Same shape as the cm5 image_viewer scenario: producer-side
+# graph is the synthesised scenario's `main` component; the wasm
+# thin player is the `player` companion.
+#
+# `runtime_override: linux` is the dev-iteration knob — it builds
+# and runs the cm5-targeted graph as a linux process on the
+# workstation so the bcm2712-compiled PIC modules are exercised
+# end-to-end without real silicon. Drop the override for a real
+# cm5 deployment.
+scenario:
+  name: audio_player_cm5
+  runtime_override: linux
+  companions:
+    player: ../wasm/audio_player_thin.yaml
+  bindings:
+    - serve: player
+      on: main.http
+      prefix: /player
+
+# Bidirectional feedback at http ↔ ws_stream (WS framing) and
+# http ↔ ip (TX-after-RX ack-pacing). The v1 scheduler rejects
+# cycles unless the graph opts in.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+  storage: { media: nvme }
+  debug:
+    to: net
+    monitor: true
+
+modules:
+  - name: fat32
+
+  # Enumerates /audio on the FAT32 volume, sorted alphabetically.
+  # `auto_advance: 1` rolls over on EOF — unattended sessions keep
+  # playing; an explicit `toggle` from the browser pauses.
+  - name: bank
+    dir: "/audio"
+    formats: ".wav,.mp3,.aac"
+    mode: loop
+    auto_advance: 1
+    # Start paused — first browser tap toggles → bank unpauses
+    # AND unlocks the browser AudioContext in the same gesture
+    # stack. See examples/wasm/audio_player.yaml for the rationale.
+    paused: 1
+
+  # Unified codec — auto-detects WAV/MP3/AAC; emits i16 LE PCM at
+  # the file's native sample rate.
+  - name: codec
+
+  # WsFrame ↔ OctetStream bridge.
+  - name: ws
+    type: ws_stream
+
+  - name: http
+    port: 9090
+    routes:
+      - path: "/ws"
+        websocket_fanout: true
+
+wiring:
+  # PCM pipeline: storage → decode → ws frame → http
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.audio
+    to: ws.tx_in
+  - from: ws.tx_out
+    to: http.ws_in
+    buffer_group: 1
+
+  # Browser nav (FMP next/prev/toggle) → bank.
+  - from: http.ws_out
+    to: ws.rx_in
+    buffer_group: 2
+  - from: ws.rx_out
+    to: bank.commands
+
+  # Network plumbing for cm5
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in

@@ -242,6 +242,24 @@
       },
     };
 
+    // BUTTON capability driver — wasm equivalent of `flash_rp` on
+    // rp boards. The runtime shell pushes one-byte transitions
+    // (0x01=pressed, 0x00=released) into this queue whenever the
+    // user taps an interactive surface; the wasm kernel drains via
+    // `host_button_pop`. Downstream `gesture` does click counting +
+    // FMP mapping — same chain every other platform uses.
+    const buttonQueue = window.__fluxor_button_queue
+      || (window.__fluxor_button_queue = []);
+    const buttonShim = {
+      host_button_pop: (bufPtr, bufLen) => {
+        if (buttonQueue.length === 0 || bufLen < 1) return 0;
+        const byte = buttonQueue.shift() & 0xFF;
+        const view = new DataView(getKernel().exports.memory.buffer, bufPtr, 1);
+        view.setUint8(0, byte);
+        return 1;
+      },
+    };
+
     const gamepadQueue = window.__fluxor_gamepad_queue
       || (window.__fluxor_gamepad_queue = []);
     const gamepadShim = {
@@ -337,6 +355,8 @@
     };
 
     // ── Audio sink (wasm_browser_audio) ──────────────────────────────
+    // AudioContext is created lazily on the first `host_audio_play`
+    // call and locked to the source sample rate.
     let audioCtx = null;
     let audioSchedTime = 0;
     function ensureAudio(sampleRate) {
@@ -346,10 +366,54 @@
       }
       return audioCtx;
     }
+    // Per the browser autoplay policy, AudioContext starts
+    // suspended until `resume()` is called inside a user-gesture
+    // handler. The wasm pipeline's first PCM frames arrive several
+    // ticks after the user's click, by which point the gesture
+    // context is gone and `host_audio_play` silently drops them.
+    // A one-shot document listener pre-creates and resumes the
+    // context inside the first gesture, before any PCM is queued.
+    function unlockAudioOnGesture() {
+      const ctx = ensureAudio(44100);
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      document.removeEventListener('pointerdown', unlockAudioOnGesture, true);
+      document.removeEventListener('keydown',     unlockAudioOnGesture, true);
+      document.removeEventListener('touchstart',  unlockAudioOnGesture, true);
+    }
+    document.addEventListener('pointerdown', unlockAudioOnGesture, true);
+    document.addEventListener('keydown',     unlockAudioOnGesture, true);
+    document.addEventListener('touchstart',  unlockAudioOnGesture, true);
+
+    // Diagnostic counters (surfaced once per second through onLog).
+    let audioPlayCalls = 0;
+    let audioPlayBytesAccepted = 0;
+    let audioPlayBytesDropped  = 0;
+    let audioPlayLastSurfaced  = 0;
+    let audioPeakAbs = 0;
+    function surfaceAudioStats() {
+      const now = performance.now();
+      if ((now - audioPlayLastSurfaced) < 1000) return;
+      audioPlayLastSurfaced = now;
+      const ctxState = audioCtx ? audioCtx.state : 'no-ctx';
+      const ctxRate  = audioCtx ? audioCtx.sampleRate : 0;
+      onLog(2,
+        `[audio] calls=${audioPlayCalls} bytes_played=${audioPlayBytesAccepted}` +
+        ` bytes_dropped=${audioPlayBytesDropped} peak=${audioPeakAbs}` +
+        ` ctx=${ctxState} hw_rate=${ctxRate}`);
+      audioPeakAbs = 0;
+    }
+
     const audioShim = {
       host_audio_play: (ptr, len, sampleRate, channels) => {
+        audioPlayCalls++;
         const ctx = ensureAudio(sampleRate);
-        if (ctx.state !== 'running') return;
+        if (ctx.state !== 'running') {
+          audioPlayBytesDropped += len;
+          surfaceAudioStats();
+          return;
+        }
         const i16 = new Int16Array(getKernel().exports.memory.buffer.slice(ptr, ptr + len));
         const ch = Math.max(1, channels | 0);
         const frames = Math.floor(i16.length / ch);
@@ -357,7 +421,12 @@
         const buf = ctx.createBuffer(ch, frames, sampleRate);
         for (let c = 0; c < ch; c++) {
           const f32 = buf.getChannelData(c);
-          for (let f = 0; f < frames; f++) f32[f] = i16[f * ch + c] / 32768;
+          for (let f = 0; f < frames; f++) {
+            const s = i16[f * ch + c];
+            f32[f] = s / 32768;
+            const abs = s < 0 ? -s : s;
+            if (abs > audioPeakAbs) audioPeakAbs = abs;
+          }
         }
         const src = ctx.createBufferSource();
         src.buffer = buf;
@@ -366,6 +435,8 @@
         if (audioSchedTime < now) audioSchedTime = now;
         src.start(audioSchedTime);
         audioSchedTime += frames / sampleRate;
+        audioPlayBytesAccepted += len;
+        surfaceAudioStats();
       },
     };
 
@@ -629,6 +700,7 @@
         inputShim,
         keyboardShim,
         pointerShim,
+        buttonShim,
         gamepadShim,
         wsShim,
         audioShim,

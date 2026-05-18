@@ -944,6 +944,7 @@ pub(crate) unsafe fn parse_route_body(s: &mut HttpState, idx: usize, d: *const u
         return;
     }
     if s.server.body_pool.is_null() {
+        log(s, b"[http] parse_route_body: body_pool NULL");
         return;
     }
     let offset = s.server.body_pool_used as usize;
@@ -1103,6 +1104,44 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
         }
     }
 
+    // Diagnostic: dump each route's final body_len + offset so we
+    // can pinpoint where body packing truncates without needing
+    // browser dev tools.
+    let mut i = 0u8;
+    while i < s.server.route_count {
+        let r = &*s.server.routes.as_ptr().add(i as usize);
+        let mut buf = [0u8; 96];
+        let p = buf.as_mut_ptr();
+        let pfx = b"[http] route ";
+        let mut q = 0usize;
+        let mut t = 0;
+        while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+        q += fmt_u32_raw(p.add(q), i as u32);
+        let bl = b" body_len=";
+        let mut t = 0;
+        while t < bl.len() { *p.add(q) = bl[t]; q += 1; t += 1; }
+        q += fmt_u32_raw(p.add(q), r.body_len);
+        let bo = b" body_off=";
+        let mut t = 0;
+        while t < bo.len() { *p.add(q) = bo[t]; q += 1; t += 1; }
+        q += fmt_u32_raw(p.add(q), r.body_offset);
+        dev_log(&*s.syscalls, 2, p, q);
+        i += 1;
+    }
+    {
+        let mut buf = [0u8; 64];
+        let p = buf.as_mut_ptr();
+        let pfx = b"[http] body_pool used=";
+        let mut q = 0usize;
+        let mut t = 0;
+        while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+        q += fmt_u32_raw(p.add(q), s.server.body_pool_used);
+        let cp = b" cap=";
+        let mut t = 0;
+        while t < cp.len() { *p.add(q) = cp[t]; q += 1; t += 1; }
+        q += fmt_u32_raw(p.add(q), s.server.body_pool_cap);
+        dev_log(&*s.syscalls, 2, p, q);
+    }
     log(s, b"[http] server ready");
 }
 

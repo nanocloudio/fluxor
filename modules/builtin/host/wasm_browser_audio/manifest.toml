@@ -12,7 +12,10 @@ builtin = true
 # gesture required) and i16 → f32 conversion.
 
 [[ports]]
-name = "samples"
+# Named `audio` for cross-platform consistency — same port name as
+# `linux_audio.audio`, `i2s_pio.audio`, and `mixer.audio`. Any
+# upstream `codec.audio` (or `mixer.mixed`) drops in unchanged.
+name = "audio"
 direction = "input"
 content_type = "AudioSample"
 required = true

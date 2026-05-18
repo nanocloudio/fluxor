@@ -45,8 +45,19 @@ const DEFAULT_DOUBLE: u32 = fnv1a(b"next");
 const DEFAULT_TRIPLE: u32 = fnv1a(b"prev");
 const DEFAULT_LONG_PRESS: u32 = fnv1a(b"long_press");
 
-const DEFAULT_MULTI_CLICK_MS: u16 = 300;
-const DEFAULT_LONG_PRESS_MS: u16 = 500;
+// Multi-click window: how long after a release a subsequent press
+// still counts as part of the same click chain. 300ms was too tight
+// for natural double-/triple-taps in a browser — most users land
+// the second tap in the 350-450ms window. 500ms is the de-facto
+// UX default (Android, iOS, most desktop file managers).
+const DEFAULT_MULTI_CLICK_MS: u16 = 500;
+// 500 ms was too tight: a normal browser-pointer click is 100-200 ms,
+// but a user pausing mid-tap chain (or a slightly heavier click) can
+// land at 500-700 ms and trigger long_press, which then suppresses
+// the subsequent release as a click (release sees long_press_emitted
+// and resets state). 1000 ms matches iOS/Android long-press defaults
+// and leaves clean headroom for natural taps.
+const DEFAULT_LONG_PRESS_MS: u16 = 1000;
 
 // ============================================================================
 // State
@@ -84,6 +95,12 @@ struct GestureState {
     map_double: u32,
     map_triple: u32,
     map_long_press: u32,
+
+    // Diagnostics — heartbeat counters surfaced every 5000 ticks
+    tick_count: u32,
+    total_bytes_seen: u32,
+    total_emits: u16,
+    _pad: [u8; 2],
 }
 
 // ============================================================================
@@ -100,22 +117,28 @@ mod params_def {
     define_params! {
         GestureState;
 
-        1, click, u32, 0
+        // The macro's `$default` literal seeds `set_defaults()`'s
+        // pre-packed buffer. `p_u*` only falls through to the lambda's
+        // own default arg when the buffer is *short* — so the literal
+        // here MUST be the real default, not 0, or set_defaults will
+        // stamp the field with 0 and the emit path will short-circuit
+        // on `msg_type == 0`.
+        1, click, u32, DEFAULT_CLICK
             => |s, d, len| { s.map_click = p_u32(d, len, 0, DEFAULT_CLICK); };
 
-        2, double_click, u32, 0
+        2, double_click, u32, DEFAULT_DOUBLE
             => |s, d, len| { s.map_double = p_u32(d, len, 0, DEFAULT_DOUBLE); };
 
-        3, triple_click, u32, 0
+        3, triple_click, u32, DEFAULT_TRIPLE
             => |s, d, len| { s.map_triple = p_u32(d, len, 0, DEFAULT_TRIPLE); };
 
-        4, long_press, u32, 0
+        4, long_press, u32, DEFAULT_LONG_PRESS
             => |s, d, len| { s.map_long_press = p_u32(d, len, 0, DEFAULT_LONG_PRESS); };
 
-        5, multi_click_ms, u16, 300
+        5, multi_click_ms, u16, DEFAULT_MULTI_CLICK_MS
             => |s, d, len| { s.multi_click_ms = p_u16(d, len, 0, DEFAULT_MULTI_CLICK_MS); };
 
-        6, long_press_ms, u16, 500
+        6, long_press_ms, u16, DEFAULT_LONG_PRESS_MS
             => |s, d, len| { s.long_press_ms = p_u16(d, len, 0, DEFAULT_LONG_PRESS_MS); };
 
         7, mode, u8, 0, enum { gesture=0, direct=1 }
@@ -219,12 +242,47 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         let now = dev_millis(sys) as u32;
 
+        // Periodic heartbeat — surface in/out chans + counters so we
+        // can tell whether bytes are reaching gesture at all.
+        s.tick_count = s.tick_count.wrapping_add(1);
+        if s.tick_count % 5000 == 0 {
+            let mut buf = [0u8; 96];
+            let p = buf.as_mut_ptr();
+            let pfx = b"[gesture] hb in=";
+            let mut q = 0usize;
+            let mut t = 0;
+            while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.in_chan as u32);
+            let oc = b" out=";
+            let mut t = 0;
+            while t < oc.len() { *p.add(q) = oc[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.out_chan as u32);
+            let by = b" bytes_in=";
+            let mut t = 0;
+            while t < by.len() { *p.add(q) = by[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.total_bytes_seen);
+            let em = b" emits=";
+            let mut t = 0;
+            while t < em.len() { *p.add(q) = em[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.total_emits as u32);
+            let dt = b" detect=";
+            let mut t = 0;
+            while t < dt.len() { *p.add(q) = dt[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.detect as u32);
+            let cc = b" cc=";
+            let mut t = 0;
+            while t < cc.len() { *p.add(q) = cc[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.click_count as u32);
+            dev_log(sys, 3, p, q);
+        }
+
         // Read raw byte transitions from input
         let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
         if poll > 0 && (poll as u32 & POLL_IN) != 0 {
             let mut byte = [0u8; 1];
             let n = (sys.channel_read)(s.in_chan, byte.as_mut_ptr(), 1);
             if n == 1 {
+                s.total_bytes_seen = s.total_bytes_seen.saturating_add(1);
                 let pressed = byte[0] != 0;
 
                 // Direct mode: immediate on/off
@@ -282,6 +340,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     _ => s.map_click,
                 };
                 emit_mapped(sys, s.out_chan, out_type);
+                s.total_emits = s.total_emits.saturating_add(1);
                 s.detect = DetectState::Idle;
                 s.click_count = 0;
             }

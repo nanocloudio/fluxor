@@ -7,9 +7,12 @@
 #
 # Concretely on this board the storage is an SD card on SPI1, the
 # display is the ST7701S 480×480 panel, and the input is the BOOTSEL
-# button mapped to gesture events by `flash_rp` (single click = next,
-# double click = prev). The codec auto-detects BMP / GIF / PNG / JPEG
-# and emits RGB565 LE.
+# button. The chain is `flash_rp → gesture → bank.commands` —
+# `flash_rp` is the driver that exposes the button capability (raw
+# transitions on out[0]), and `gesture` does click counting + FMP
+# mapping (single = next, double = prev). Same chain as every other
+# variant; only the driver swaps per platform. The codec
+# auto-detects BMP / GIF / PNG / JPEG and emits RGB565 LE.
 #
 # SD card requirements:
 #   * FAT32 (MBR or GPT)
@@ -42,13 +45,15 @@ modules:
 
   - name: fat32
 
-  # BOOTSEL gestures: single = next, double = prev. Same FMP message
-  # bytes the wasm_browser_click_command emits in the browser-side
-  # scenarios; bank doesn't know (or care) which input source produced
-  # them.
+  # BOOTSEL driver — exposes the button capability on `raw`.
   - name: flash_rp
+
+  # Click counter + FMP mapper. Single tap = next, double tap = prev.
+  # Same `gesture` module the wasm / linux / cm5 variants use.
+  - name: gesture
     click: next
     double_click: prev
+    triple_click: prev
 
   - name: bank
     dir: "/images"
@@ -73,5 +78,7 @@ wiring:
     to: codec.encoded
   - from: codec.pixels
     to: st7701s.pixels
-  - from: flash_rp.events
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
     to: bank.commands

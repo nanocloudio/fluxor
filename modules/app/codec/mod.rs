@@ -22,9 +22,18 @@
 //! DecoderState wraps a codec union (byte array sized to largest codec).
 //! Only one codec is active at a time.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
+
+// Host-test builds skip the SDK's PIC EABI intrinsic stubs (which
+// are gated to `target_os = "none"` / `wasm32`); provide a host
+// fallback for the one intrinsic the audio sub-codecs reach for.
+#[cfg(feature = "host-test")]
+#[allow(non_snake_case)]
+pub unsafe fn __aeabi_memclr(dest: *mut u8, n: usize) {
+    core::ptr::write_bytes(dest, 0, n);
+}
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
@@ -33,11 +42,16 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 
-mod wav_codec;
+// Sub-codecs. PIC builds keep these private; host-test builds expose
+// them so the harness can drive each sub-codec directly.
+#[cfg(feature = "host-test")] pub mod wav_codec;
+#[cfg(not(feature = "host-test"))] mod wav_codec;
 
-mod mp3_codec;
+#[cfg(feature = "host-test")] pub mod mp3_codec;
+#[cfg(not(feature = "host-test"))] mod mp3_codec;
 
-mod aac_codec;
+#[cfg(feature = "host-test")] pub mod aac_codec;
+#[cfg(not(feature = "host-test"))] mod aac_codec;
 
 mod image_codec;
 mod image_deflate;
@@ -384,7 +398,7 @@ unsafe fn init_codec(s: &mut DecoderState) {
 // Module API
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<DecoderState>() as u32
@@ -394,17 +408,17 @@ pub extern "C" fn module_state_size() -> u32 {
 /// (8 MiB encoded BMP accumulator + 2 MiB decoded RGB565 slack); the
 /// audio paths use ~32 KB at most. Same budget covers any format
 /// since only one is active at a time per module instance.
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
     10 * 1024 * 1024
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -453,7 +467,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
@@ -504,8 +518,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // ----------------------------------------------------------------
         if s.format == FMT_DETECTING {
             let sys = s.sys();
-            let in_poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-            if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
+            // Ack a pending stream-boundary HUP iff the ring is
+            // empty. Bank waits on HUP-clear before writing the next
+            // file, so the consumer side must release it here.
+            // Flushing while bytes are queued would drop the start
+            // of the new stream — those bytes are what we need to
+            // run detection against.
+            let poll = (sys.channel_poll)(s.in_chan, POLL_IN | POLL_HUP);
+            let has_hup = (poll as u32) & POLL_HUP != 0;
+            let has_in = (poll as u32) & POLL_IN != 0;
+            if has_hup && !has_in {
+                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                return 0;
+            }
+            if !has_in {
                 return 0;
             }
 
@@ -540,7 +566,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             s.detect_len += i as u8;
 
-            // Try format detection
             let fmt = detect_format(&s.detect_buf, s.detect_len);
             if fmt != FMT_DETECTING {
                 s.format = fmt;
@@ -555,50 +580,51 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Active codec phase
         // ----------------------------------------------------------------
 
-        // Check for stream reset signal (EOF from bank on file switch
-        // OR end-of-asset from host_browser_fetch). Reset must be
-        // deferred until BOTH:
-        //   1. The input channel has actually drained (POLL_IN clear).
-        //      `host_browser_fetch` sets HUP as soon as the response
-        //      body has been fully read from the JS side, but the
-        //      kernel's channel ring may still hold ~10 AAC frames
-        //      that the codec hasn't decoded yet. Flushing those
-        //      bytes via IOCTL_FLUSH was costing the wasm browser
-        //      harness ~250 ms of trailing audio (last 2 notes of
-        //      the 8-note cmajor scale).
-        //   2. The codec has been quiescent for HUP_QUIESCE_TICKS
-        //      consecutive ticks after (1). Each codec keeps a
-        //      bounded internal buffer of decoded PCM that it
-        //      drip-feeds to its consumer one chunk per tick; the
-        //      quiesce window lets it finish that drain before we
-        //      wipe its state.
-        // Audio-side HUP-quiesce reset. Image formats own their own
-        // EOF / drain / reset cycle inside `image_codec.rs`'s phase
-        // machine and would be torn out from under their own drain
-        // by this 64-tick reset (a 1 MiB RGB565 frame takes ~1000
-        // ticks to drain at WRITE_CHUNK = 1024 B/tick). Image
-        // formats also auto-reset to Phase::Ingest after drain so
-        // the next file's bytes pick up cleanly without a
-        // codec-state wipe.
+        // Audio sub-codecs: reset on upstream HUP. Image formats
+        // own their own EOF / drain / reset cycle inside
+        // `image_codec.rs`'s phase machine — wiping their state here
+        // would tear down a 1 MiB RGB565 frame mid-drain (≈ 1000
+        // ticks at WRITE_CHUNK = 1024 B/tick).
         if !is_image_format(s.format) {
             let sys_ptr = s.syscalls;
             let in_chan = s.in_chan;
             let in_poll = ((*sys_ptr).channel_poll)(in_chan, POLL_IN | POLL_HUP);
             let has_hup = (in_poll as u32) & POLL_HUP != 0;
             let has_in  = (in_poll as u32) & POLL_IN  != 0;
+
+            // Fast path: WAV has reached the header-declared
+            // `data_size` and upstream signalled HUP. The stream is
+            // over — reset and FLUSH. The FLUSH both drops any
+            // trailing junk (some WAV files carry metadata after
+            // the data chunk) and clears HUP so a HUP-gated producer
+            // can resume. MP3 / AAC don't expose a `sub_done`
+            // predicate and fall through to the quiesce path.
+            let sub_done = match s.format {
+                FMT_WAV => wav_codec::wav_is_done(s.wav()),
+                _ => false,
+            };
+            if has_hup && sub_done {
+                dev_log(&*sys_ptr, 3, b"[dec] rst-adv".as_ptr(), 13);
+                dev_channel_ioctl(&*sys_ptr, in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                reset_to_detect(s);
+                return 0;
+            }
+
+            // Quiesce path: HUP is set and the ring has drained.
+            // Wait `HUP_QUIESCE_TICKS` consecutive ticks to give the
+            // sub-codec a chance to flush its internal output (the
+            // wasm fetch consumer drops the last 250 ms of audio
+            // without it), then FLUSH + reset.
             if has_hup && !has_in {
                 s.hup_quiet_ticks = s.hup_quiet_ticks.saturating_add(1);
                 if s.hup_quiet_ticks >= HUP_QUIESCE_TICKS {
-                    // Codec genuinely idle on a closed input — safe to
-                    // flush + reset for the next stream.
                     dev_channel_ioctl(&*sys_ptr, in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
                     dev_log(&*sys_ptr, 3, b"[dec] rst".as_ptr(), 9);
                     reset_to_detect(s);
                     return 0;
                 }
             } else {
-                // Either fresh input arrived or HUP cleared (bank
-                // started a new file); restart the quiesce window.
+                // Fresh input or HUP-cleared — restart the window.
                 s.hup_quiet_ticks = 0;
             }
         }
@@ -625,7 +651,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// (`ws_stream` → `http`) would then either drop pre-connect bytes at the
 /// no-fan-out gate or stall. 1 MiB fits any single-asset test plus several
 /// seconds of live decode at typical bitrates.
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(hints: *mut ChannelHint, max_hints: usize) -> usize {
     if hints.is_null() || max_hints == 0 { return 0; }

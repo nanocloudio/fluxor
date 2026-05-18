@@ -461,24 +461,18 @@ pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     handle
 }
 
-/// Virtual handle for the board user button (BOOTSEL on Pico).
-/// Outside the normal GPIO handle range (0..31).
-const USER_BUTTON_HANDLE: i32 = 0xFF;
-
 /// Convenience syscall: claim + configure as input with pull
 /// pull: 0=none, 1=up, 2=down
-/// Pin 0xFF = board user button (BOOTSEL on Pico)
 /// Returns handle on success, <0 on error
+///
+/// BOOTSEL is a separate capability — use the `flash_rp` driver,
+/// not a synthetic GPIO pin. This entry point handles real GPIO
+/// pins only.
 ///
 /// # Safety
 /// `extern "C"` syscall ABI shim invoked by PIC modules. Takes no
 /// pointers; marked `unsafe` only to match the syscall-table signature.
-/// `pin_num == 0xFF` is intercepted as the virtual user-button handle.
 pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i32 {
-    if pin_num == 0xFF {
-        // Board user button — return virtual handle
-        return USER_BUTTON_HANDLE;
-    }
     let handle = gpio::gpio_claim(pin_num);
     if handle < 0 {
         return handle;
@@ -503,11 +497,8 @@ pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i3
     handle
 }
 
-/// GPIO get level wrapper — handles virtual user button handle
+/// GPIO get level wrapper.
 unsafe extern "C" fn syscall_gpio_get_level(handle: i32) -> i32 {
-    if handle == USER_BUTTON_HANDLE {
-        return crate::kernel::resource::flash_sideband_read_cs();
-    }
     if !gpio::gpio_check_owner(handle) {
         return E_INVAL;
     }

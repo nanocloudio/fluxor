@@ -667,6 +667,23 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
 
 /// Substitute `${VAR}` and `${VAR:-default}` patterns with environment variable values.
 /// Escape literal `${` with `$${`.
+/// True iff `s` is a POSIX-valid environment variable identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Anything else inside `${...}` is
+/// treated as a literal pass-through so YAML config can embed JS
+/// template-literal source without the substitution treating its
+/// `${expr}` syntax as missing env vars.
+fn is_env_var_name(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn substitute_env_vars(input: &str) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -703,6 +720,24 @@ fn substitute_env_vars(input: &str) -> Result<String> {
         } else {
             (expr, None)
         };
+
+        // POSIX-valid env-var name: `[A-Za-z_][A-Za-z0-9_]*`. Any
+        // other shape (dots, spaces, hyphens, etc.) is a JS-side
+        // template literal that just happens to look like `${...}`
+        // when YAML embeds JS source (e.g. the canonical wasm
+        // runtime shell embeds JS that does
+        // `\`${window.__fluxorBase}host_shims.js\``). Treat
+        // non-env-shaped names as inert — emit the literal
+        // `${...}` back into the output unchanged. Only well-formed
+        // names participate in substitution, so unset env vars
+        // still error loudly.
+        if !is_env_var_name(var_name) {
+            out.push_str("${");
+            out.push_str(expr);
+            out.push('}');
+            rest = &rest[end + 1..];
+            continue;
+        }
 
         match std::env::var(var_name) {
             Ok(val) => out.push_str(&val),
@@ -2415,7 +2450,7 @@ fn cmd_run_dispatch(
     if let Some(dir) = &flags.list {
         let scenarios = scenario::list_scenarios(dir)?;
         if scenarios.is_empty() {
-            eprintln!("(no *.scenario.yaml files in {})", dir.display());
+            eprintln!("(no scenarios in {})", dir.display());
         } else {
             for (path, name) in scenarios {
                 println!("{}\t{}", path.display(), name);
@@ -2438,7 +2473,7 @@ fn cmd_run_dispatch(
     // `scenario:` block (orchestration baked into the same file as the
     // graph). When present, synthesise a `Scenario` in memory and
     // dispatch through the regular scenario flow — same code path as
-    // an explicit `*.scenario.yaml`, one less file per example.
+    // a standalone `kind: scenario` file, one less file per example.
     if let Some(synth) = scenario::synthesize_from_graph(config_path)? {
         return cmd_run_inline_scenario(synth, config_path, &flags, verbose);
     }

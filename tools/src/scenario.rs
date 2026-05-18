@@ -222,7 +222,7 @@ pub fn is_scenario_file(path: &Path) -> bool {
 // an in-memory `Scenario` (with the host graph as the "main"
 // component) and dispatches through the regular scenario flow. The
 // result: one file per example per platform — no separate
-// `*.scenario.yaml` sibling needed.
+// standalone scenario sibling needed.
 //
 // The block fields mirror the explicit-scenario schema (§5) one-to-
 // one minus the always-implicit primary component:
@@ -288,7 +288,7 @@ pub fn synthesize_from_graph(graph_path: &Path) -> Result<Option<Scenario>> {
 
     // Path resolution for an inline scenario uses the graph YAML's
     // parent as the base (companions: paths are relative to it, same
-    // as an explicit `*.scenario.yaml`). The `main` component's graph
+    // as a standalone `kind: scenario` file). The `main` component's graph
     // is therefore just the graph file's basename — joining it with
     // the same parent yields the original path back. Storing the full
     // path here would double-prepend the parent dir during validation
@@ -760,32 +760,44 @@ pub fn synthesise_host_config(
     Ok(Some(config))
 }
 
-/// Canonical wasm runtime assets — the HTML shell and JS shim that
-/// every wasm bundle is served alongside. Live under
-/// `src/platform/wasm/host/` so wasm is symmetric with the linux
-/// platform (one `fluxor-linux` binary, infinitely many graphs).
-/// Discovered relative to the project root at scenario-load time.
-const CANONICAL_RUNTIME_HTML: &str = "src/platform/wasm/host/runtime.html";
-const CANONICAL_HOST_SHIMS_JS: &str = "src/platform/wasm/host/host_shims.js";
+/// Canonical wasm runtime shell — the HTML page and JS shim that
+/// every wasm bundle is served alongside. **Baked into
+/// `fluxor-tools` at compile time** via `include_str!` because they
+/// are shared infrastructure (byte-identical across every wasm
+/// scenario in the tree), not per-scenario data.
+///
+/// Partition principle: per-scenario things go in the `.wasm`
+/// bundle (assets, PIC modules, config blob); shared infra lives
+/// in the orchestrator. The shell is the browser-side analog of
+/// `target/wasm/firmware.wasm` — built once into the orchestrator,
+/// served once per scenario. Same shape as how `fluxor-linux`
+/// hosts countless `bcm2712` configs without those configs
+/// shipping their own kernel.
+///
+/// Edits to either file rebuild `fluxor-tools` automatically —
+/// `include_str!` registers the file as a build dependency.
+const CANONICAL_RUNTIME_HTML_RAW: &str =
+    include_str!("../../src/platform/wasm/host/runtime.html");
+const CANONICAL_HOST_SHIMS_JS_RAW: &str =
+    include_str!("../../src/platform/wasm/host/host_shims.js");
 
-/// Find the fluxor project root by walking up from `start` looking
-/// for `modules/sdk/config.rs` — a stable marker that's at the
-/// project root and nowhere else in the tree. Falls back to
-/// `start` when no marker is found (graceful degradation; the
-/// canonical-asset existence check downstream surfaces a clear
-/// error in that case).
-fn find_project_root(start: &Path) -> PathBuf {
-    let marker = Path::new("modules/sdk/config.rs");
-    let mut cur = start.to_path_buf();
-    loop {
-        if cur.join(marker).is_file() {
-            return cur;
-        }
-        match cur.parent() {
-            Some(p) => cur = p.to_path_buf(),
-            None => return start.to_path_buf(),
-        }
-    }
+/// Escape every `${` so the config-load env-var substitutor passes
+/// the content through verbatim. The shell HTML / JS contains lots
+/// of JS template literals (`${msg}`, `${n}`, `${assetUrl}`, etc.)
+/// that look like env-var refs but aren't; the substitutor's
+/// existing `$${...}` escape syntax (see `substitute_env_vars`)
+/// then collapses our `$${` back to literal `${` so the browser
+/// sees the original source.
+fn escape_for_env_substitution(s: &str) -> String {
+    s.replace("${", "$${")
+}
+
+fn canonical_runtime_html_body() -> String {
+    escape_for_env_substitution(CANONICAL_RUNTIME_HTML_RAW)
+}
+
+fn canonical_host_shims_js_body() -> String {
+    escape_for_env_substitution(CANONICAL_HOST_SHIMS_JS_RAW)
 }
 
 /// Build the `routes:` array for the synthesised host. Mounts the
@@ -808,8 +820,6 @@ fn synthesise_host_routes(
     scenario_path: &Path,
 ) -> Result<Vec<serde_json::Value>> {
     let mut routes = Vec::new();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = find_project_root(&cwd);
 
     // ── Track the active `serve:` binding so we can synthesise the
     //    `/`, `/fluxor.wasm`, and `/scenario.json` routes coherently.
@@ -817,10 +827,14 @@ fn synthesise_host_routes(
     //    overrides) are not supported on the synth host today —
     //    the first one wins; subsequent ones would need explicit
     //    `on:` targets to mount elsewhere.
+    //
+    // The default page is the embedded canonical runtime shell
+    // (`canonical_runtime_html_body`). A `host_page:` override on
+    // the component swaps in a user-provided file via fs_path.
     let mut serve_component: Option<&str> = None;
     let mut runtime_prefix: String = "/".to_string();
     let mut bundle_route_url: String = "/fluxor.wasm".to_string();
-    let mut runtime_fs_path: PathBuf = project_root.join(CANONICAL_RUNTIME_HTML);
+    let mut runtime_override_fs_path: Option<PathBuf> = None;
 
     for binding in &scenario.bindings {
         match binding {
@@ -847,26 +861,37 @@ fn synthesise_host_routes(
                         serve.serve
                     ))
                 })?;
-                // host_page is now OPTIONAL: when unset, the synth
-                // host serves the canonical runtime.html — which is
-                // the right default for almost every wasm scenario.
-                // Custom shells (test harness with bespoke layout,
-                // researcher prototypes, etc) can still set
-                // `host_page: my_shell.html` to override.
+                // host_page is OPTIONAL: when unset, the synth host
+                // serves the canonical runtime shell embedded in
+                // fluxor-tools. Custom shells (test harness,
+                // research prototypes) still set
+                // `host_page: my_shell.html` to override with an
+                // on-disk file.
                 if let Some(host_page) = &comp.host_page {
-                    runtime_fs_path = absolute_or_join(base, host_page);
+                    runtime_override_fs_path = Some(absolute_or_join(base, host_page));
                 }
                 let desc = format!("serve: {} (host_page)", serve.serve);
-                check_fs_path_length(&runtime_fs_path, 0, &desc, scenario_path)?;
 
-                // ── /  → host page (canonical runtime.html OR override).
-                routes.push(serde_json::json!({
-                    "path": runtime_prefix,
-                    "fs_path": runtime_fs_path.display().to_string(),
-                    "content_type": "text/html",
-                }));
+                // ── /  → host page (canonical embedded shell OR
+                //    user fs_path override).
+                if let Some(ref override_path) = runtime_override_fs_path {
+                    check_fs_path_length(override_path, 0, &desc, scenario_path)?;
+                    routes.push(serde_json::json!({
+                        "path": runtime_prefix,
+                        "fs_path": override_path.display().to_string(),
+                        "content_type": "text/html",
+                    }));
+                } else {
+                    routes.push(serde_json::json!({
+                        "path": runtime_prefix,
+                        "body": canonical_runtime_html_body(),
+                        "content_type": "text/html",
+                    }));
+                }
 
                 // ── /fluxor.wasm → built bundle for this component.
+                //    Stays as fs_path — per-scenario artifact, often
+                //    multi-MB, not appropriate for inlining.
                 let bundle_path = bundle_path_for(scenario_path, &serve.serve, comp)?;
                 check_fs_path_length(&bundle_path, 0, &desc, scenario_path)?;
                 routes.push(serde_json::json!({
@@ -897,20 +922,12 @@ fn synthesise_host_routes(
         }
     }
 
-    // ── /host_shims.js → canonical JS shim (always mounted, lives
-    //    under src/platform/wasm/host/). Required by runtime.html
-    //    AND by any user-written shell — the wasm kernel imports
-    //    20+ `host_*` extern fns; the shim provides them all.
-    let shims_path = project_root.join(CANONICAL_HOST_SHIMS_JS);
-    if !shims_path.is_file() {
-        return Err(Error::Config(format!(
-            "scenario {}: canonical wasm host shim missing at {} — \
-             have you run `make firmware TARGET=wasm` from a fresh checkout? \
-             (file is part of the wasm runtime, not the example tree.)",
-            scenario_path.display(),
-            shims_path.display()
-        )));
-    }
+    // ── /host_shims.js → canonical JS shim (always mounted).
+    //    Embedded in fluxor-tools at compile time — required by
+    //    runtime.html AND by any user-written shell, since the wasm
+    //    kernel imports 20+ `host_*` extern fns and the shim
+    //    provides them all. There is no per-scenario host_shims.js;
+    //    the kernel ABI is fixed across every wasm bundle.
     let shims_url = if runtime_prefix == "/" {
         "/host_shims.js".to_string()
     } else {
@@ -918,7 +935,7 @@ fn synthesise_host_routes(
     };
     routes.push(serde_json::json!({
         "path": shims_url,
-        "fs_path": shims_path.display().to_string(),
+        "body": canonical_host_shims_js_body(),
         "content_type": "application/javascript",
     }));
 
@@ -1375,16 +1392,13 @@ fn serve_binding_routes(
         ))
     })?;
     // host_page is OPTIONAL — when omitted, the canonical wasm
-    // runtime shell from `src/platform/wasm/host/runtime.html` is
-    // mounted instead. Custom shells (test harness, bespoke
-    // research UIs) still set `host_page:` explicitly to override.
-    let page_path = if let Some(host_page) = comp.host_page.as_ref() {
-        absolute_or_join(base, host_page)
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let root = find_project_root(&cwd);
-        root.join(CANONICAL_RUNTIME_HTML)
-    };
+    // runtime shell embedded in fluxor-tools is mounted instead.
+    // Custom shells (test harness, bespoke research UIs) still set
+    // `host_page:` explicitly to override with an on-disk file.
+    let override_page_path: Option<PathBuf> = comp
+        .host_page
+        .as_ref()
+        .map(|hp| absolute_or_join(base, hp));
     let bundle_path = bundle_path_for(scenario_path, &s.serve, comp)?;
     let bundle_url = if s.prefix == "/" {
         "/fluxor.wasm".to_string()
@@ -1392,16 +1406,15 @@ fn serve_binding_routes(
         format!("{}/fluxor.wasm", s.prefix.trim_end_matches('/'))
     };
     let desc = format!("serve: {}", s.serve);
-    check_fs_path_length(&page_path, 0, &desc, scenario_path)?;
+    if let Some(ref p) = override_page_path {
+        check_fs_path_length(p, 0, &desc, scenario_path)?;
+    }
     check_fs_path_length(&bundle_path, 0, &desc, scenario_path)?;
 
-    // /<prefix>/host_shims.js — canonical wasm host shim. Same file
-    // the synth host mounts; we mount it here under the binding's
-    // prefix so the browser can resolve `<script src="host_shims.js">`
-    // from the runtime.html shell relative to the prefix.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = find_project_root(&cwd);
-    let shims_path = project_root.join(CANONICAL_HOST_SHIMS_JS);
+    // /<prefix>/host_shims.js — canonical wasm host shim. Embedded
+    // in fluxor-tools at compile time so the orchestrator is
+    // self-contained; same kernel ABI as the synth host's root
+    // /host_shims.js route.
     let shims_url = if s.prefix == "/" {
         "/host_shims.js".to_string()
     } else {
@@ -1429,17 +1442,27 @@ fn serve_binding_routes(
     } else {
         format!("{}/", prefix_no_slash)
     };
-    let mut routes = vec![serde_json::json!({
-        "path": if prefix_no_slash.is_empty() { "/".to_string() } else { prefix_no_slash.clone() },
-        "fs_path": page_path.display().to_string(),
-        "content_type": "text/html",
-    })];
+    // Build the page-route value (embedded body OR override fs_path).
+    let make_page_route = |path: String| -> serde_json::Value {
+        if let Some(ref override_path) = override_page_path {
+            serde_json::json!({
+                "path": path,
+                "fs_path": override_path.display().to_string(),
+                "content_type": "text/html",
+            })
+        } else {
+            serde_json::json!({
+                "path": path,
+                "body": canonical_runtime_html_body(),
+                "content_type": "text/html",
+            })
+        }
+    };
+    let mut routes = vec![make_page_route(
+        if prefix_no_slash.is_empty() { "/".to_string() } else { prefix_no_slash.clone() },
+    )];
     if prefix_with_slash != prefix_no_slash && prefix_no_slash != "/" && !prefix_no_slash.is_empty() {
-        routes.push(serde_json::json!({
-            "path": prefix_with_slash,
-            "fs_path": page_path.display().to_string(),
-            "content_type": "text/html",
-        }));
+        routes.push(make_page_route(prefix_with_slash));
     }
     routes.push(serde_json::json!({
         "path": bundle_url,
@@ -1448,7 +1471,7 @@ fn serve_binding_routes(
     }));
     routes.push(serde_json::json!({
         "path": shims_url,
-        "fs_path": shims_path.display().to_string(),
+        "body": canonical_host_shims_js_body(),
         "content_type": "application/javascript",
     }));
     routes.push(serde_json::json!({
@@ -2005,7 +2028,14 @@ pub fn revalidate_all(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
 // `--list`
 // ============================================================================
 
-/// Enumerate every `*.scenario.yaml` in a directory (non-recursive).
+/// Enumerate every runnable scenario in a directory (non-recursive).
+/// Kind is detected from file content (`kind: scenario` line), not
+/// from filename — the legacy `*.scenario.yaml` infix is gone.
+///
+/// Two kinds of runnable orchestration:
+///   1. standalone `kind: scenario` file (multi-graph harness).
+///   2. graph YAML carrying an inline `scenario:` block.
+///
 /// Returns `(path, name)` pairs — `name` is the scenario's `name:`
 /// field, or the file stem if `name:` is missing.
 pub fn list_scenarios(dir: &Path) -> Result<Vec<(PathBuf, String)>> {
@@ -2025,24 +2055,16 @@ pub fn list_scenarios(dir: &Path) -> Result<Vec<(PathBuf, String)>> {
             continue;
         }
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        // Two kinds of runnable orchestration:
-        //   1. explicit `*.scenario.yaml` with `kind: scenario`
-        //   2. graph YAML carrying an inline `scenario:` block
-        // The second form has no naming convention (the user picked
-        // the basename), so probe every `.yaml`/`.yml` for the block.
-        let is_explicit_scenario =
-            name.ends_with(".scenario.yaml") || name.ends_with(".scenario.yml");
-        let is_graph_yaml = (name.ends_with(".yaml") || name.ends_with(".yml"))
-            && !is_explicit_scenario;
-        if !is_explicit_scenario && !is_graph_yaml {
+        if !(name.ends_with(".yaml") || name.ends_with(".yml")) {
             continue;
         }
         if !seen.insert(path.clone()) {
             continue;
         }
-        let display_name = if is_explicit_scenario {
-            // Best-effort parse: a file that fails to parse still gets
-            // listed (with an error tag) so the user can see it's there.
+        let display_name = if is_scenario_file(&path) {
+            // Standalone scenario — best-effort parse. A file that
+            // fails to parse still gets listed with an error tag so
+            // the user can see it's there.
             match parse(&path) {
                 Ok(s) => s.name,
                 Err(_) => format!(

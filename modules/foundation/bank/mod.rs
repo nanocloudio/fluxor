@@ -50,9 +50,18 @@
 //!
 //!   - `status` : `{ index: u16, count: u16, file_type: u8, flags: u8 }`
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
+
+// Host-test builds skip the SDK's PIC EABI intrinsic stubs (which
+// are gated to `target_os = "none"` / `wasm32`); provide a host
+// fallback for the one intrinsic the audio sub-codecs reach for.
+#[cfg(feature = "host-test")]
+#[allow(non_snake_case)]
+pub unsafe fn __aeabi_memclr(dest: *mut u8, n: usize) {
+    core::ptr::write_bytes(dest, 0, n);
+}
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
@@ -187,6 +196,15 @@ struct BankState {
 
     /// Tick counter for periodic diagnostics. Wraps freely.
     tick_count: u32,
+
+    /// Bytes written to `out_chans[0]`. Surfaced in the heartbeat
+    /// so an operator can see whether the producer side is flowing.
+    total_bytes_emitted: u32,
+    /// FMP commands consumed from `ctrl_chan` (toggle / next / prev
+    /// / select). Counterpart to `total_bytes_emitted` for the
+    /// consumer side.
+    total_cmds_seen: u16,
+    _pad1: [u8; 2],
 }
 
 impl BankState {
@@ -284,6 +302,13 @@ mod params_def {
             while i < n { s.formats[i] = *d.add(i); i += 1; }
             s.formats_len = n as u8;
         };
+
+        // Initial paused state. Default 0 = start streaming
+        // immediately. Audio players set this to 1 so the first user
+        // tap unpauses (and, on the wasm target, unlocks the browser
+        // AudioContext) instead of pausing an already-running stream.
+        28, paused, u8, 0, enum { running=0, paused=1 }
+            => |s, d, len| { s.paused = p_u8(d, len, 0, 0); };
     }
 }
 
@@ -324,26 +349,12 @@ unsafe fn fs_open_index(s: &mut BankState, idx: u16) -> bool {
         return false;
     }
     s.fs_fd = fd;
-    // Fresh open → reset any stale pending writes from the previous file.
+    // Fresh open: drop any stale pending writes from the previous
+    // file. The output channel's HUP flag is left alone — its only
+    // setter is `select_index`, which is the boundary signal the
+    // consumer waits on.
     s.pending_out = 0;
     s.pending_offset = 0;
-    // Clear any HUP flag left on the output channel by the previous
-    // file's `signal_stream_eof` (which sends IOCTL_SET_HUP to signal
-    // end-of-file to the consumer). Without this, subsequent
-    // channel_writes to the HUP'd channel fail and bank's auto-
-    // advanced second-cycle stream never reaches the consumer. The
-    // channel reset clears HUP/ERR/sticky flags and the ring; aux
-    // state is also wiped, which is fine because each file is a
-    // fresh logical stream.
-    if s.out_chans[0] >= 0 {
-        dev_channel_ioctl(
-            s.sys(),
-            s.out_chans[0],
-            IOCTL_FLUSH,
-            core::ptr::null_mut(),
-            0,
-        );
-    }
     true
 }
 
@@ -572,11 +583,32 @@ unsafe fn emit_notification(s: &BankState) {
     }
 }
 
-/// Common selection update: flush stale stream, OPEN the new index,
-/// emit a notification. Used by the next/prev/select commands and by
-/// auto-advance.
+/// Close the previous stream and open the index in `s.index`.
+///
+/// `flush` toggles whether the output channel's unread tail is
+/// dropped before HUP is raised:
+///
+/// - **User navigation** (`true`): the user has interrupted the
+///   current track. Any of its unread bytes still buffered in the
+///   ring would be decoded as a continuation of the previous
+///   stream. Drop them so the consumer sees the boundary cleanly.
+///   IOCTL_FLUSH also clears HUP, so `signal_stream_eof` re-arms
+///   it immediately.
+///
+/// - **Auto-advance** (`false`): the previous stream ended at EOF.
+///   The consumer is allowed to drain whatever is queued in the
+///   ring before HUP triggers its reset.
 #[inline]
-unsafe fn select_index(s: &mut BankState) {
+unsafe fn select_index(s: &mut BankState, flush: bool) {
+    if flush && s.out_chans[0] >= 0 {
+        dev_channel_ioctl(
+            s.sys(),
+            s.out_chans[0],
+            IOCTL_FLUSH,
+            core::ptr::null_mut(),
+            0,
+        );
+    }
     signal_stream_eof(s);
     if s.path_count > 0 {
         fs_open_index(s, s.index);
@@ -588,17 +620,17 @@ unsafe fn select_index(s: &mut BankState) {
 // Module API
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<BankState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     _in_chan: i32,
@@ -644,7 +676,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
@@ -652,12 +684,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut BankState);
         if s.syscalls.is_null() { return -1; }
 
-        // Periodic heartbeat — `[bank] init` is a one-shot that can
-        // get lost in the early-boot log ring before `log_net` starts
-        // draining over UDP (DHCP isn't bound yet). The heartbeat
-        // surfaces bank's state once per 5000 ticks (~500 ms at
-        // tick_us=100) so the cm5 rig telemetry sees it indefinitely.
-        // Same cadence + format as `[fat32] hb`.
+        // Periodic heartbeat (~500 ms at tick_us=100). Surfaces
+        // bank's state to log_net once it starts draining over UDP,
+        // covering the case where `[bank] init` got dropped from the
+        // early-boot ring before DHCP came up. Same cadence + format
+        // as `[fat32] hb`.
         s.tick_count = s.tick_count.wrapping_add(1);
         if s.tick_count % 5000 == 0 {
             let mut buf = [0u8; 96];
@@ -683,6 +714,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut t = 0;
             while t < fd.len() { *p.add(q) = fd[t]; q += 1; t += 1; }
             q += fmt_u32_raw(p.add(q), s.fs_fd as u32);
+            let ps = b" paused=";
+            let mut t = 0;
+            while t < ps.len() { *p.add(q) = ps[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.paused as u32);
+            let be = b" bytes=";
+            let mut t = 0;
+            while t < be.len() { *p.add(q) = be[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.total_bytes_emitted);
+            let cm = b" cmd_rx=";
+            let mut t = 0;
+            while t < cm.len() { *p.add(q) = cm[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.total_cmds_seen as u32);
+            let cc = b" ctrl=";
+            let mut t = 0;
+            while t < cc.len() { *p.add(q) = cc[t]; q += 1; t += 1; }
+            q += fmt_u32_raw(p.add(q), s.ctrl_chan as u32);
             dev_log(s.sys(), 3, p, q);
         }
 
@@ -740,8 +787,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let poll_ctrl = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
             if poll_ctrl > 0 && (poll_ctrl as u32 & POLL_IN) != 0 {
                 let (ty, _len) = msg_read(sys, s.ctrl_chan, s.msg_buf.as_mut_ptr(), 16);
+                s.total_cmds_seen = s.total_cmds_seen.saturating_add(1);
                 match ty {
                     MSG_TOGGLE => {
+                        log_info(s, b"[bank] MSG_TOGGLE");
                         s.paused = if s.paused != 0 { 0 } else { 1 };
                         emit_notification(s);
                     }
@@ -749,7 +798,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         log_info(s, b"[bank] MSG_NEXT");
                         if navigate(s, 1) {
                             s.paused = 0;
-                            select_index(s);
+                            select_index(s, /*flush=*/ true);
                         } else {
                             log_info(s, b"[bank] navigate denied");
                         }
@@ -758,7 +807,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         log_info(s, b"[bank] MSG_PREV");
                         if navigate(s, -1) {
                             s.paused = 0;
-                            select_index(s);
+                            select_index(s, /*flush=*/ true);
                         }
                     }
                     MSG_SELECT => {
@@ -767,11 +816,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             if s.count > 0 && target < s.count {
                                 s.index = target;
                                 s.paused = 0;
-                                select_index(s);
+                                select_index(s, /*flush=*/ true);
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        // Unknown verb — log the type byte so an
+                        // operator can distinguish a producer error
+                        // (unrecognised verb) from channel-framing
+                        // damage (partial write seen as garbage).
+                        let mut buf = [0u8; 32];
+                        let p = buf.as_mut_ptr();
+                        let pfx = b"[bank] unk ty=";
+                        let mut q = 0usize;
+                        let mut t = 0;
+                        while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+                        q += fmt_u32_raw(p.add(q), ty);
+                        dev_log(s.sys(), 3, p, q);
+                    }
                 }
             }
         }
@@ -787,7 +849,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.next_advance_ms = 0;
                 s.paused = 0;
                 if navigate(s, 1) {
-                    select_index(s);
+                    select_index(s, /*flush=*/ false);
                     log_info(s, b"[bank] auto (paced)");
                 }
             }
@@ -796,6 +858,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Audio bytes: FS_READ chunks → out_chans[0]. Skipped entirely
         // in preset-selector mode (no paths) or when paused.
         if s.paused == 0 && s.out_chans[0] >= 0 && s.path_count > 0 {
+            // Hold off until the consumer has acknowledged any
+            // pending stream boundary. HUP is sticky on the shared
+            // channel slot; the consumer clears it via IOCTL_FLUSH
+            // at the end of its reset path. Skipping this gate
+            // would append the next file's bytes to the previous
+            // stream's tail in the same ring — the consumer (still
+            // bound to the previous stream's sub-decoder) would
+            // then decode them under the wrong format.
+            if (s.sys().channel_poll)(s.out_chans[0], POLL_HUP) > 0 {
+                return 0;
+            }
             // Drain any half-flushed buffer from the previous step
             // before issuing another FS_READ.
             if s.pending_out > 0 {
@@ -834,6 +907,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.buf.as_ptr(),
                     n as usize,
                 );
+                if written > 0 {
+                    s.total_bytes_emitted =
+                        s.total_bytes_emitted.saturating_add(written as u32);
+                }
                 track_pending(written, n as usize, &mut s.pending_out, &mut s.pending_offset);
                 return 2; // Burst — keep stepping while there's data.
             }
@@ -861,7 +938,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.next_advance_ms = now.saturating_add(s.interval_ms as u64);
                     s.paused = 1;
                 } else if navigate(s, 1) {
-                    select_index(s);
+                    select_index(s, /*flush=*/ false);
                     log_info(s, b"[bank] auto");
                 }
             } else {
@@ -878,7 +955,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // Channel Hints
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let hints = [

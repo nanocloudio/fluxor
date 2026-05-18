@@ -2,16 +2,21 @@ version = "1.0.0"
 hardware_targets = ["rp2350"]
 permissions = ["flash_raw", "backing_provider"]
 
+# BOOTSEL button driver — reads the QSPI CS pin via the flash
+# sideband, debounces, and emits the canonical `input::button` raw
+# transition contract on `raw` (out[0]). Same wire shape
+# `modules/foundation/button` produces for GPIO pins; downstream
+# `gesture` does click counting and FMP mapping.
 [[ports]]
-name = "events"
+name = "raw"
 direction = "output"
-content_type = "FmpMessage"
+content_type = "OctetStream"
 
+# Blob serving / asset bank source — flash-resident preset blobs
+# served on demand via IOCTL_NOTIFY. Used by waveshare image_viewer
+# bare-metal builds where the gallery is baked into flash.
 [[ports]]
 name = "stream"
 index = 1
 direction = "output"
 content_type = "OctetStream"
-
-[commands]
-emits = ["toggle", "next", "prev", "long_press", "on", "off"]

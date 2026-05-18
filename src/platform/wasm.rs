@@ -38,6 +38,15 @@ mod pointer;
 #[path = "wasm/gamepad.rs"]
 mod gamepad;
 
+// Browser-side BUTTON capability driver — wasm equivalent of
+// `flash_rp` (rp BOOTSEL) and `modules/foundation/button` (rp GPIO).
+// Emits one-byte transitions (`input::button` raw contract) drained
+// from a host-side queue the runtime shell populates on canvas tap.
+// Downstream `gesture` does click counting + FMP mapping, identical
+// to every other platform's chain.
+#[path = "wasm/button.rs"]
+mod button;
+
 // DOM terminal — kernel-log-ring scrollback rendered into the page.
 // Drains via the same LOG_RING_DRAIN opcode (0x0C64) that
 // `log_net` uses on bcm2712/rp; multi-consumer-safe, so wiring a
@@ -52,16 +61,6 @@ mod terminal;
 // table the module hit-tests against.
 #[path = "wasm/touch_gamepad_overlay.rs"]
 pub(crate) mod touch_gamepad_overlay;
-
-// Click → FMP `next`/`prev` transformer. Browser-side analogue of
-// a hardware navigation button: KIND_UP with primary button → next,
-// KIND_UP with secondary button → prev. Wires the same FMP wire
-// the foundation/bank module accepts on its `commands` ctrl port,
-// either locally (pure-wasm) or across a WebSocket (split via
-// wasm_browser_websocket → http.ws_out → ws_stream.rx_out →
-// bank.commands).
-#[path = "wasm/click_command.rs"]
-mod click_command;
 
 #[path = "wasm/audio.rs"]
 mod audio;
@@ -305,6 +304,7 @@ const WASM_BROWSER_CANVAS_HASH: u32 = fnv1a32(b"wasm_browser_canvas");
 const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
 const WASM_BROWSER_KEYBOARD_HASH: u32 = fnv1a32(b"wasm_browser_keyboard");
 const WASM_BROWSER_POINTER_HASH: u32 = fnv1a32(b"wasm_browser_pointer");
+const WASM_BROWSER_BUTTON_HASH: u32 = fnv1a32(b"wasm_browser_button");
 const WASM_BROWSER_GAMEPAD_HASH: u32 = fnv1a32(b"wasm_browser_gamepad");
 const WASM_BROWSER_AUDIO_HASH: u32 = fnv1a32(b"wasm_browser_audio");
 const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
@@ -314,7 +314,6 @@ const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
 const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 =
     fnv1a32(b"wasm_browser_touch_gamepad_overlay");
-const WASM_BROWSER_CLICK_COMMAND_HASH: u32 = fnv1a32(b"wasm_browser_click_command");
 
 /// Initialise a per-module heap sized for one `State` struct plus
 /// alignment slack. Each built-in's `alloc_state` makes one
@@ -511,6 +510,25 @@ unsafe fn load_embedded_modules() -> usize {
             registered += 1;
             log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
                 " = wasm_browser_gamepad (built-in)", 0);
+            continue;
+        }
+
+        // BUTTON capability driver — emits raw button transitions
+        // (one byte per debounced edge) on out[0]. Symmetric to
+        // `flash_rp` on rp boards; same `input::button` contract,
+        // same downstream `gesture` chain.
+        if entry.name_hash == WASM_BROWSER_BUTTON_HASH {
+            if !init_builtin_heap::<button::ButtonState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_button: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = button::build(out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_button (built-in)", 0);
             continue;
         }
 
@@ -728,26 +746,6 @@ unsafe fn load_embedded_modules() -> usize {
             continue;
         }
 
-        // Click → FMP `next`/`prev`: KIND_UP pointer events become
-        // canonical bank navigation commands. Same module powers
-        // pure-wasm (wired to local bank) and split (wired to
-        // wasm_browser_websocket.tx_in → /ws → linux bank).
-        if entry.name_hash == WASM_BROWSER_CLICK_COMMAND_HASH {
-            if !init_builtin_heap::<click_command::ClickCommandState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_click_command: STATE_ARENA full, skipping", 0);
-                continue;
-            }
-            let in_chan  = scheduler::get_module_port(module_idx, 0, 0);
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
-            let m = click_command::build(in_chan, out_chan);
-            scheduler::store_builtin_module(module_idx, m);
-            registered += 1;
-            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_click_command (built-in)", 0);
-            continue;
-        }
-
         // Non-builtin: locate the .fmod in modules.bin via the static
         // loader's name-hash index, verify it's a wasm payload, and
         // hand the wasm bytes to `host_instantiate_module`.
@@ -833,9 +831,17 @@ unsafe fn load_embedded_modules() -> usize {
         // slots (in[0], out[0], ctrl[0] — slot 0 of each direction).
         // Modules with more ports look the rest up internally via
         // `dev_channel_port`.
+        //
+        // Port direction id 2 = ctrl_input. Modules that declare a
+        // `ctrl_input` port (e.g. bank.commands, voip.call) need
+        // this; without it the module gets `ctrl_chan = -1` and
+        // silently ignores every FMP message on its ctrl port —
+        // which is exactly what was breaking the wasm audio_player
+        // and image_viewer chains. Same lookup pattern bcm2712 and
+        // rp2350 use in `kernel::scheduler::instantiate_one_module`.
         let in_chan = scheduler::get_module_port(module_idx, 0, 0);
         let out_chan = scheduler::get_module_port(module_idx, 1, 0);
-        let ctrl_chan: i32 = -1;
+        let ctrl_chan = scheduler::get_module_port(module_idx, 2, 0);
 
         // Diagnostic: log the full port table for each PIC module so
         // wiring issues are visible. Three log lines, one per
@@ -860,6 +866,13 @@ unsafe fn load_embedded_modules() -> usize {
             out_chan as i64 as u64,
             " out1=",
             out1 as i64 as u64,
+        );
+        log_fmt2(
+            2,
+            "[wasm-kernel] ports idx=",
+            module_idx as u64,
+            " ctrl0=",
+            ctrl_chan as i64 as u64,
         );
 
         // Read the optional `module_arena_size` export. Modules that

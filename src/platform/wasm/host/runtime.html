@@ -128,13 +128,44 @@
       background: var(--accent);
       transition: width 120ms linear;
     }
+    #debug {
+      margin-top: 12px;
+      position: relative;
+    }
+    #debug-toolbar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 4px 8px;
+      background: var(--bg-canvas);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 4px 4px 0 0;
+      font-size: 11px;
+      color: var(--fg-faint);
+    }
+    #debug-toolbar .title { font-weight: 600; letter-spacing: 0.5px; }
+    #debug-toolbar button {
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 2px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    #debug-toolbar button:hover { background: var(--accent-strong); }
+    #debug-toolbar button:active { transform: translateY(1px); }
+    #debug-toolbar button.copied {
+      background: var(--info, #2a7a4a);
+      color: var(--fg);
+    }
     #log {
       white-space: pre-wrap; font-size: 11px; line-height: 1.4;
       max-height: 20vh; overflow-y: auto;
       padding: 6px 8px; background: var(--bg-canvas);
-      border: 1px solid var(--border); border-radius: 4px;
+      border: 1px solid var(--border); border-top: none;
+      border-radius: 0 0 4px 4px;
       color: var(--fg-faint);
-      margin-top: 12px;
     }
     .err  { color: var(--err); }
     .info { color: var(--info); }
@@ -151,7 +182,20 @@
        the scenario JSON resolves. -->
   <div id="surfaces"></div>
 
-  <div id="log"></div>
+  <!-- Debug log panel. Toolbar provides a one-click copy of every
+       line in the on-page log — useful when reporting kernel-side
+       state (bank heartbeat counters, port-table dumps, etc.) without
+       opening browser dev tools. Mounts on every wasm runtime
+       (pure-wasm scenarios + thin viewer/player halves of splits)
+       because the canonical runtime.html shell is the single source
+       of truth for every wasm bundle's host page. -->
+  <div id="debug">
+    <div id="debug-toolbar">
+      <span class="title">debug log</span>
+      <button id="debug-copy" type="button" title="Copy all log lines to clipboard">Copy</button>
+    </div>
+    <div id="log"></div>
+  </div>
 
   <!-- Mount-aware bootstrap.
        The synthesiser may mount this shell at any URL prefix:
@@ -212,6 +256,43 @@
       logEl.scrollTop = logEl.scrollHeight;
     }
     function setStatus(t) { statusEl.textContent = t; }
+
+    // Copy-log-to-clipboard. Uses the modern Clipboard API when
+    // available (browsers permit it from a user-gesture handler),
+    // falls back to a transient `<textarea>` + `document.execCommand`
+    // for older Safari / strict-CSP contexts. The visual feedback
+    // ("Copied!" → "Copy") closes the loop so a tap doesn't feel
+    // silently lost.
+    const copyBtn = document.getElementById('debug-copy');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', async () => {
+        const text = logEl.innerText;
+        const reset = () => setTimeout(() => {
+          copyBtn.textContent = 'Copy';
+          copyBtn.classList.remove('copied');
+        }, 1200);
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.top = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+          }
+          copyBtn.textContent = 'Copied!';
+          copyBtn.classList.add('copied');
+        } catch (err) {
+          copyBtn.textContent = 'Copy failed';
+          copyBtn.classList.add('copied');
+        }
+        reset();
+      });
+    }
 
     // ---------------------------------------------------------------
     // Scenario introspection
@@ -289,9 +370,18 @@
     // that the wasm graph can consume input from — display, player,
     // gamepad-overlay. The gamepad-overlay path also renders visual
     // button DOM on top via `buildOverlayButtons()`.
+    //
+    // The same DOM events also feed `__fluxor_button_queue` for
+    // `wasm_browser_button` (the canonical BUTTON capability driver,
+    // wasm equivalent of `flash_rp` on rp). One DOM tap, one
+    // 0x01-then-0x00 transition pair — same wire shape every
+    // platform's button driver produces. Downstream `gesture`
+    // counts clicks and emits FMP commands.
     function installPointerListeners(el) {
-      const queue = window.__fluxor_pointer_queue
+      const pointerQ = window.__fluxor_pointer_queue
         || (window.__fluxor_pointer_queue = []);
+      const buttonQ = window.__fluxor_button_queue
+        || (window.__fluxor_button_queue = []);
       function localCoords(ev) {
         const rect = el.getBoundingClientRect();
         // Scale page→surface if the surface is shrunk by max-width.
@@ -302,9 +392,9 @@
           y: Math.round((ev.clientY - rect.top)  * scaleY),
         };
       }
-      function push(ev, kind) {
+      function pushPointer(ev, kind) {
         const { x, y } = localCoords(ev);
-        queue.push({
+        pointerQ.push({
           pointerId: ev.pointerId & 0xFF,
           kind,
           buttons: ev.buttons & 0xFF,
@@ -315,14 +405,41 @@
           x, y,
         });
       }
+      // Canonical BUTTON capability — one byte per debounced edge.
+      // De-dupe so a multi-touch DOWN burst doesn't repeat 0x01.
+      let buttonHeld = false;
+      function setButton(pressed) {
+        if (pressed && !buttonHeld) {
+          buttonHeld = true;
+          buttonQ.push(0x01);
+        } else if (!pressed && buttonHeld) {
+          buttonHeld = false;
+          buttonQ.push(0x00);
+        }
+      }
       // input::pointer::KIND_*  →  1=DOWN, 2=UP, 3=MOVE, 4=CANCEL
-      el.addEventListener('pointerdown',   (e) => { el.setPointerCapture(e.pointerId); push(e, 1); });
-      el.addEventListener('pointerup',     (e) => { push(e, 2); el.releasePointerCapture(e.pointerId); });
-      el.addEventListener('pointermove',   (e) => { if (e.buttons || e.pressure > 0) push(e, 3); });
-      el.addEventListener('pointercancel', (e) => { push(e, 4); });
+      el.addEventListener('pointerdown', (e) => {
+        el.setPointerCapture(e.pointerId);
+        pushPointer(e, 1);
+        setButton(true);
+      });
+      el.addEventListener('pointerup', (e) => {
+        pushPointer(e, 2);
+        setButton(false);
+        el.releasePointerCapture(e.pointerId);
+      });
+      el.addEventListener('pointermove', (e) => {
+        if (e.buttons || e.pressure > 0) pushPointer(e, 3);
+      });
+      el.addEventListener('pointercancel', (e) => {
+        pushPointer(e, 4);
+        setButton(false);
+      });
       // Suppress the browser context menu so right-click reaches the
-      // wasm graph as `BTN_SECONDARY` (which click_command maps to
-      // FMP `prev`) instead of opening the OS menu.
+      // wasm graph as `BTN_SECONDARY` instead of opening the OS menu.
+      // (The button capability driver only signals press/release;
+      // graphs that need to distinguish primary vs secondary clicks
+      // wire `wasm_browser_pointer` directly instead.)
       el.addEventListener('contextmenu', (e) => { e.preventDefault(); });
     }
 
@@ -351,13 +468,13 @@
       el.dataset.role = spec.role;
       el.dataset.module = spec.module;
       if (spec.role === 'player') {
-        el.title = 'click = next, right-click = previous';
+        el.title = 'tap = play/pause, double-tap = next, triple-tap = previous';
         el.innerHTML = `
           <div class="player-row">
             <div class="player-icon paused" data-icon>▶</div>
             <div style="flex:1;min-width:0">
-              <div class="player-title" data-title>—</div>
-              <div class="player-count small" data-count>0 / 0</div>
+              <div class="player-title" data-title>tap to play</div>
+              <div class="player-count small" data-count></div>
             </div>
           </div>
           <div class="player-bar"><div class="fill" data-fill></div></div>`;
@@ -366,13 +483,21 @@
       } else if (spec.role === 'gamepad-overlay') {
         buildOverlayButtons(el);
       }
-      // Interactive surfaces forward PointerEvents to the wasm graph
-      // via `__fluxor_pointer_queue`. The graph's own modules
-      // (`wasm_browser_pointer` → `wasm_browser_click_command` →
-      // `bank.commands` or `ws.tx`) decide what each event means —
-      // the JS shell stays a dumb pipe. Old JS-driven kernel-reboot
-      // cycling is gone (image_viewer, audio_player, … all use the
-      // bank + click_command pattern now).
+      // Interactive surfaces forward DOM events to the wasm graph
+      // via two queues:
+      //   __fluxor_pointer_queue → `wasm_browser_pointer` (W3C
+      //                            pointer events — coords,
+      //                            multi-touch, modifiers; used
+      //                            by gamepad overlay etc.)
+      //   __fluxor_button_queue  → `wasm_browser_button` (canonical
+      //                            BUTTON capability — one byte
+      //                            per debounced press/release;
+      //                            wasm equivalent of `flash_rp`
+      //                            on rp boards). Downstream
+      //                            `gesture` does click counting +
+      //                            FMP mapping.
+      // The JS shell stays a dumb pipe — graphs pick which driver
+      // they consume.
       if (spec.role === 'display' ||
           spec.role === 'player'  ||
           spec.role === 'gamepad-overlay') {
@@ -475,7 +600,16 @@
     async function bootKernel(scenario, surfacesByRole, assetUrl) {
       teardownKernel();
       await loadBundleOnce(scenario);
-      setStatus(`booting ${assetUrl || '(no asset)'}`);
+      // `assetUrl` is the JS-side per-track URL override used by
+      // host_browser_fetch — irrelevant when bank reads from the
+      // bundle's embedded asset bank (the canonical audio_player
+      // path). Show a useful prompt instead of the misleading
+      // "(no asset)" placeholder.
+      if (assetUrl) {
+        setStatus(`booting ${assetUrl}`);
+      } else {
+        setStatus('ready — tap player to start');
+      }
       currentAssetUrl = assetUrl;
 
       // Container resolution: canvas modules render into the display
@@ -536,8 +670,8 @@
     }
 
     // Navigation is handled by wasm-side modules now
-    // (wasm_browser_pointer → wasm_browser_click_command →
-    // bank.commands), so the JS shell just boots the kernel ONCE
+    // (wasm_browser_button → gesture → bank.commands), so the JS
+    // shell just boots the kernel ONCE
     // and lets pointer events flow through `installPointerListeners`
     // → `__fluxor_pointer_queue` → `host_pointer_pop`. No more JS-
     // driven kernel reboots; bank's cursor + commands input handle

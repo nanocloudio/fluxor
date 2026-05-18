@@ -1,0 +1,19 @@
+[package]
+name = "fluxor-contracts"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Public Fluxor storage-surface contracts (Fence, StorageHandle, content types)"
+
+[lib]
+name = "fluxor_contracts"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Derive serde::{Serialize, Deserialize} on every public type. Off by
+# default so embedded consumers don't pull in serde.
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"], optional = true }

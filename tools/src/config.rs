@@ -1224,11 +1224,24 @@ const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN
 /// bitmap in `kernel/event.rs` also bumped to u64 to match.
 const MAX_MODULES: usize = 64;
 
-/// Module entry header size (entry_length + name_hash + id + reserved)
-const MODULE_ENTRY_HEADER_SIZE: usize = 8;
+/// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + reserved:u8).
+/// entry_length widened to u32 so a single module's params can exceed
+/// 64 KiB — needed by synth host's http module when both halves of a
+/// split scenario inline the canonical wasm shell as body routes
+/// (~95 KiB combined). Coordinated with `src/kernel/config.rs`'s
+/// `parse_module_entry`, which reads matching field widths.
+const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 
-/// Maximum module params size (allows for wavetables, large sequences, etc.)
-const MAX_MODULE_PARAMS_SIZE: usize = 32 * 1024;
+/// Maximum module params size. 128 KiB accommodates the
+/// wasm-scenario synth host's http module, which inlines the
+/// canonical browser shell (runtime.html + host_shims.js, ~60 KiB
+/// combined) as `body:` routes per the shared-infra-in-orchestrator
+/// partition principle. Previously 32 KiB, which silently
+/// truncated the second body — surfaced as host_shims.js arriving
+/// at 1.2 KiB in the browser and the wasm bundle failing to
+/// instantiate. Wavetables / large sequences (the prior consumers
+/// of the cap) easily fit within the new bound.
+const MAX_MODULE_PARAMS_SIZE: usize = 128 * 1024;
 
 /// Param base offset within a module entry (= header size = 8)
 const P: usize = MODULE_ENTRY_HEADER_SIZE;
@@ -1684,13 +1697,15 @@ fn build_module_entry(
     // Name hash (bytes 2-5) — hash the type name so the kernel can find the .fmod.
     // This allows multiple instances: name: seq_kick, type: sequencer
     let name_hash = fnv1a_hash(type_name.as_bytes());
-    entry[2..6].copy_from_slice(&name_hash.to_le_bytes());
-
-    // Module ID (byte 6)
-    entry[6] = id;
-    // Domain ID (byte 7) — resolved from module's "domain" field against domain_names
+    // Header layout (10 bytes total):
+    //   bytes 0-3: entry_length (u32, patched in below at line ~1953)
+    //   bytes 4-7: name_hash (u32)
+    //   byte 8:    module id
+    //   byte 9:    domain id
+    entry[4..8].copy_from_slice(&name_hash.to_le_bytes());
+    entry[8] = id;
     let domain_id = resolve_domain_id(module, config);
-    entry[7] = domain_id;
+    entry[9] = domain_id;
 
     // Track actual params length used
     let params_len: usize;
@@ -1942,7 +1957,7 @@ fn build_module_entry(
 
     // Calculate total entry length and write to header
     let entry_len = MODULE_ENTRY_HEADER_SIZE + params_len + extra_len;
-    entry[0..2].copy_from_slice(&(entry_len as u16).to_le_bytes());
+    entry[0..4].copy_from_slice(&(entry_len as u32).to_le_bytes());
 
     // Truncate to actual size
     entry.truncate(entry_len);
@@ -2933,7 +2948,7 @@ fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
 /// Layout:
 /// - Header (8 bytes): magic (u32), version (u16), checksum (u16)
 /// - Counts (8 bytes): module_count, edge_count, reserved[6]
-/// - Module section header (4 bytes): module_count, reserved, section_size (u16)
+/// - Module section header (6 bytes): module_count, reserved, section_size (u32)
 /// - Module entries (variable length each)
 /// - Graph section (64 bytes): edge_count, flags, reserved[2], edges[15]
 /// - Hardware section: spi_count, i2c_count, gpio_count, reserved, configs...
@@ -3154,10 +3169,16 @@ fn generate_config_impl(
     // Calculate total module section size
     let module_section_size: usize = module_entries.iter().map(|e| e.len()).sum();
 
-    // Module section header (4 bytes)
+    // Module section header (6 bytes). `section_size` is u32 so the
+    // synth host can carry per-component embedded shells (~60 KiB
+    // each) without overflowing — split scenarios that mount a
+    // viewer/player alongside a producer easily sum to >64 KiB of
+    // module data when both halves' http modules inline their
+    // shells. Embedded targets (rp/bcm) still fit in u16 worth of
+    // bytes in practice; the wider field costs 2 bytes per config.
     result.push(module_entries.len() as u8); // module_count
     result.push(0); // reserved
-    result.extend_from_slice(&(module_section_size as u16).to_le_bytes()); // section_size
+    result.extend_from_slice(&(module_section_size as u32).to_le_bytes()); // section_size
 
     // Module entries (variable length)
     for entry in &module_entries {

@@ -1,0 +1,112 @@
+# Audio Player — linux producer half of the split scenario.
+#
+# Linux-native counterpart to `../cm5/audio_player_split.yaml`. The
+# producer pipeline (bank → codec → ws → http) is identical in
+# shape; the WebSocket bridges between the linux kernel and the
+# browser. The pure-wasm form (`../wasm/audio_player.yaml`) is the
+# same shape collapsed into a single kernel.
+#
+# Shape:
+#
+#   browser  : pointer → pointer_to_button → gesture → ws_websocket.tx
+#                                                       │ WS up   /ws  (FMP next/prev/toggle)
+#                                                       ▼
+#   linux    : http.ws_out → ws_stream.rx → bank.commands
+#                                                       │
+#                                                       ▼
+#              bank.stream → codec.encoded → codec.audio → ws_stream.tx_in
+#                                                       │ WS down /ws  (i16 LE PCM)
+#                                                       ▼
+#   browser  : ws.rx → audio_out (WebAudio)
+#
+# Library directory (on the linux host):
+#   mkdir -p /tmp/audio
+#   cp assets/test_harness/cmajor.{wav,mp3,aac} /tmp/audio/
+#
+# Run:
+#   fluxor run examples/linux/audio_player.yaml
+#   open http://localhost:9090/player/
+
+target: linux
+tick_us: 100
+
+# Inline scenario — `fluxor run examples/linux/audio_player.yaml`
+# orchestrates this graph plus the thin wasm player at `/player/`.
+# Same shape as the cm5 split, just with the linux unified codec on
+# the producer side.
+scenario:
+  name: audio_player_linux
+  companions:
+    player: ../wasm/audio_player_thin.yaml
+  bindings:
+    - serve: player
+      on: main.http
+      prefix: /player
+
+# Bidirectional feedback at http ↔ ws_stream + http ↔ linux_net.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+
+modules:
+  # Asset bank. Reads from `/tmp/audio/` on the linux host; cycle
+  # via `next`/`prev`/`toggle` FMP commands arriving on
+  # `bank.commands` from the browser-side gesture chain over the
+  # WebSocket. `auto_advance: 1` rolls over on EOF so an unattended
+  # session keeps playing.
+  - name: bank
+    dir: "/tmp/audio"
+    formats: ".wav,.mp3,.aac"
+    mode: loop
+    auto_advance: 1
+    # Start paused — first browser tap toggles → bank unpauses
+    # AND unlocks the browser AudioContext in the same gesture
+    # stack. See examples/wasm/audio_player.yaml for the rationale.
+    paused: 1
+
+  # Unified codec — auto-detects WAV/MP3/AAC; emits i16 LE PCM at
+  # the file's native sample rate. Same module the cm5 / wasm /
+  # pico2w players use.
+  - name: codec
+
+  - name: ws
+    type: ws_stream
+
+  - name: http
+    port: 9090
+    routes:
+      - path: "/ws"
+        websocket_fanout: true
+
+wiring:
+  # Producer: bank → codec → ws.tx_out → http.ws_in → browser.
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.audio
+    to: ws.tx_in
+  # WsFrame envelopes carry an 8-byte header + variable payload.
+  # `buffer_group:` flips the channel to mailbox mode so the http
+  # module reads a full envelope per atomic read.
+  - from: ws.tx_out
+    to: http.ws_in
+    buffer_group: 1
+
+  # Consumer: browser → http.ws_out → ws.rx → bank.commands.
+  # `ws.rx_out` is OctetStream (raw bytes the browser sent); those
+  # bytes ARE FMP messages. OctetStream → FmpMessage is allowed
+  # because OctetStream is universal-compatible.
+  - from: http.ws_out
+    to: ws.rx_in
+    buffer_group: 2
+  - from: ws.rx_out
+    to: bank.commands
+
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in

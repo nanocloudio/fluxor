@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "fluxor-mod-bank"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Asset bank PIC module — host-test build"
+
+# Bare-metal PIC builds use `rustc` directly against `mod.rs` and ignore
+# this file; Cargo only sees it during host-test builds where the test
+# harness links the module as a plain rlib. Same additive-only pattern
+# as `modules/foundation/{ip,http,ws_stream}/Cargo.toml`.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+host-test = []
+
+[dependencies]
+fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }

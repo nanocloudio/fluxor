@@ -1366,6 +1366,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxor-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "fluxor-mod-http"
 version = "0.1.0"
 dependencies = [

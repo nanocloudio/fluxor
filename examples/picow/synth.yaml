@@ -508,7 +508,9 @@ data:
 # ============================================================================
 
 modules:
+  # BOOTSEL control: driver → gesture → mapped FMP
   - name: flash_rp
+  - name: gesture
     click: next
     double_click: prev
     long_press: toggle
@@ -544,9 +546,11 @@ modules:
 # ============================================================================
 
 wiring:
-  - from: flash_rp.events
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
     to: synth.preset
-  - from: flash_rp.events
+  - from: gesture.commands
     to: effects.preset
   - from: sequencer.notes
     to: synth.notes

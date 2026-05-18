@@ -1,13 +1,21 @@
-//! Button PIC Module
+//! Button PIC Module — GPIO button driver.
 //!
-//! GPIO button input with debouncing. Reads a GPIO pin, debounces the signal,
-//! and emits raw state bytes (0x01=pressed, 0x00=released) on state change.
+//! Reads a GPIO pin, debounces, and emits the canonical
+//! `input::button` raw transition contract on the output port:
+//! one byte per debounced edge (0x01=pressed, 0x00=released).
+//! Same wire shape `flash_rp.raw` (BOOTSEL) and
+//! `wasm_browser_button.raw` produce — every platform's button
+//! driver speaks the same contract.
 //!
-//! Downstream `gesture` module handles click counting, long press detection,
-//! and command mapping.
+//! Downstream `gesture` module handles click counting, long press
+//! detection, and FMP command mapping.
+//!
+//! **For BOOTSEL on rp boards** use the dedicated `flash_rp`
+//! driver instead — it reads the QSPI sideband, not GPIO.
 //!
 //! **Params (from config):**
-//! - `pin`: GPIO pin number (0xFF = board user button, default)
+//! - `pin`: GPIO pin number (required — must be a real pin in
+//!          the board's valid GPIO range)
 //! - `control_id`: button identity (default 0)
 //! - `active_low`: 0=active high, 1=active low (default 1)
 //! - `pull`: 0=none, 1=pull-up (default), 2=pull-down

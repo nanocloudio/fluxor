@@ -79,11 +79,17 @@ data:
       ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000
 
 modules:
-  # Flash provides two inline BMP blobs + BOOTSEL gesture events.
+  # Flash provides two inline BMP blobs (on `stream`) and the
+  # BOOTSEL button capability (raw transitions on `raw`).
   - name: flash_rp
     presets: [color_diag_8x8, color_diag_32x32]
+
+  # Click counter + FMP mapper. Same `gesture` module every other
+  # variant uses.
+  - name: gesture
     click: next
     double_click: prev
+    triple_click: prev
 
   # Bank cycles the preset list. file_count=2 matches presets length.
   - name: bank
@@ -107,5 +113,7 @@ wiring:
     to: codec.encoded
   - from: codec.pixels
     to: st7701s.pixels
-  - from: flash_rp.events
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
     to: bank.commands

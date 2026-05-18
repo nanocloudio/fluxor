@@ -1,0 +1,58 @@
+# Audio Player — cycle audio files via button presses.
+# sd → fat32 (FS provider) ← bank (FS_CONTRACT consumer) → decoder → mixer → i2s
+target: picow
+
+
+modules:
+  - name: sd
+    spi_bus: 0
+    cs_pin: 17
+    start_block: 0
+    block_count: 0
+
+  - name: fat32
+
+  - name: button
+    pin: 22
+    control_id: 0
+    active_low: 1
+    pull: up
+
+  - name: gesture
+    multi_click_ms: 300
+    long_press_ms: 500
+
+  - name: bank
+    mode: loop
+    initial_index: 0
+    auto_advance: 1
+    path_0: "/SONG1.WAV"
+    path_1: "/SONG2.WAV"
+    path_2: "/SONG3.WAV"
+    path_3: "/SONG4.MP3"
+
+  - name: codec
+
+  - name: mixer
+    gain_in: 128
+    gain_out: 38
+
+  - name: pio_rp
+  - name: i2s_pio
+    data_pin: 28
+    clock_base: 26
+    sample_rate: 48000
+
+wiring:
+  - from: sd.blocks
+    to: fat32.blocks
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.audio
+    to: mixer.audio
+  - from: mixer.mixed
+    to: i2s_pio.audio
+  - from: button.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: bank.commands

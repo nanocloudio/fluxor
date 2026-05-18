@@ -8,7 +8,7 @@
 #
 # Shape:
 #
-#   browser  : pointer → click_command → ws_websocket.tx
+#   browser  : pointer → pointer_to_button → gesture → ws_websocket.tx
 #                                            │ WS up   /ws  (FMP next/prev)
 #                                            ▼
 #   linux    : http.ws_out → ws_stream.rx → bank.commands
@@ -19,10 +19,9 @@
 #                                            ▼
 #   browser  : ws.rx → canvas
 #
-# The host `codec` here is `host_image_codec`, the libimage-backed
-# sibling of the unified cm5 / wasm `codec` module. It decodes the
-# same formats (BMP / GIF / PNG / JPEG with all variants) via the
-# `image` crate. Requires `fluxor-linux --features host-image`.
+# Uses the unified PIC `codec` module everywhere — the linux
+# kernel cross-loads the bcm2712-aarch64 .fmod via its PIC loader,
+# so the same code path that runs on cm5 silicon runs here.
 
 target: linux
 tick_us: 100
@@ -53,18 +52,19 @@ platform:
 modules:
   # Asset bank. Reads from `/tmp/spirals/` on the linux host; cycle
   # via `next`/`prev` FMP commands arriving on `bank.commands` from
-  # the browser-side click_command module over the WebSocket.
+  # the browser-side gesture chain over the WebSocket.
   - name: bank
     dir: "/tmp/spirals"
     formats: ".bmp,.gif,.png,.jpg,.jpeg"
     mode: loop
     auto_advance: 0
 
+  # Unified PIC codec — auto-detects BMP/GIF/PNG/JPEG. Linux loads
+  # the aarch64 .fmod from target/bcm2712/modules/ via the PIC
+  # loader. Same module the cm5 / wasm producers use.
   - name: codec
-    type: host_image_codec
     width: 960
     height: 540
-    scale_mode: fit
     max_bytes: 16777216
 
   - name: ws

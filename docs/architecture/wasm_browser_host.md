@@ -244,7 +244,7 @@ path.
 
 | Port | Direction | Content type |
 |------|-----------|--------------|
-| `samples`    | input  | `AudioSample` |
+| `audio`      | input  | `AudioSample` |
 
 | Param | Type | Notes |
 |-------|------|-------|

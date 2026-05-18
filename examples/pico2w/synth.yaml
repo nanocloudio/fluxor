@@ -995,8 +995,9 @@ data:
 # ============================================================================
 
 modules:
-  # --- BOOTSEL control (flash has built-in gesture detection) ---
+  # --- BOOTSEL control: driver → gesture → mapped FMP ---
   - name: flash_rp
+  - name: gesture
     click: next
     double_click: prev
     long_press: toggle
@@ -1033,10 +1034,12 @@ modules:
 # ============================================================================
 
 wiring:
-  # BOOTSEL control: flash emits FMP commands directly
-  - from: flash_rp.events
+  # BOOTSEL control: driver → gesture → fan out to synth + effects
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
     to: synth.preset
-  - from: flash_rp.events
+  - from: gesture.commands
     to: effects.preset
 
   # Audio chain: sequencer → synth → effects → i2s

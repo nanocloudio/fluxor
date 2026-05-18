@@ -1,9 +1,13 @@
-//! Flash Module — BOOTSEL Button + Blob Serving + Runtime Parameter Store
+//! Flash Module — BOOTSEL Button Driver + Blob Serving + Runtime Parameter Store
 //!
 //! Three functions in one module:
 //!
-//! 1. **BOOTSEL button** — Reads via flash sideband (QSPI CS pin),
-//!    debounces, detects click patterns, emits FMP commands on out[0].
+//! 1. **BOOTSEL button driver** — Reads via flash sideband (QSPI CS pin),
+//!    debounces, and emits the canonical `input::button` raw
+//!    transition contract on out[0]: one byte per debounced
+//!    transition (0x01=pressed, 0x00=released). Same wire shape
+//!    `modules/foundation/button` emits for GPIO pins; downstream
+//!    `gesture` does click counting + FMP mapping.
 //!
 //! 2. **Blob serving** — Stores inline data blobs from config presets,
 //!    serves them on out[1] via IOCTL_NOTIFY protocol (replaces data_source).
@@ -12,18 +16,12 @@
 //!    modules persist params via PARAM_STORE/DELETE/CLEAR_ALL syscalls.
 //!
 //! **Params (from config):**
-//! - `mode`: 0=gesture (default), 1=direct (on/off tracks button state)
-//! - `debounce_ms`: debounce window in ms (default 50, gesture mode only)
-//! - `multi_click_ms`: multi-click timeout window in ms (default 300)
-//! - `long_press_ms`: long press threshold in ms (default 500)
-//! - `click`: FMP message for single click (default "toggle")
-//! - `double_click`: FMP message for double click (default "next")
-//! - `triple_click`: FMP message for triple click (default "prev")
-//! - `long_press_cmd`: FMP message for long press (default "long_press")
+//! - `debounce_ms`: debounce window in ms (default 50)
 //! - `presets`: inline blob data (type=blob, up to 8 blobs, 4KB total)
 //!
 //! **Outputs:**
-//!   - out[0]: FMP messages (gesture/direct mode commands)
+//!   - out[0]: `input::button` raw transitions (OctetStream, 1 byte
+//!             per debounced edge; 0x01=pressed, 0x00=released)
 //!   - out[1]: Blob stream (IOCTL_NOTIFY indexed, 512B chunks, IOCTL_EOF)
 
 #![no_std]
@@ -46,12 +44,6 @@ use abi::internal::flash::SIDEBAND as FLASH_SIDEBAND;
 
 /// Flash sideband operation: READ_CS
 const READ_CS: u8 = abi::internal::flash::sideband_op::READ_CS;
-
-// Click-mapping defaults (same as gesture module)
-const DEFAULT_CLICK: u32 = fnv1a(b"toggle");
-const DEFAULT_DOUBLE: u32 = fnv1a(b"next");
-const DEFAULT_TRIPLE: u32 = fnv1a(b"prev");
-const DEFAULT_LONG: u32 = fnv1a(b"long_press");
 
 // ============================================================================
 // Constants — Flash Store Provider
@@ -104,21 +96,6 @@ enum StreamPhase {
 }
 
 // ============================================================================
-// Gesture State Machine
-// ============================================================================
-
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-enum GestureState {
-    /// Idle, waiting for first press
-    Idle = 0,
-    /// Button is currently pressed
-    Pressed = 1,
-    /// Released, waiting for possible follow-up click
-    WaitingForClick = 2,
-}
-
-// ============================================================================
 // Compact entry — stored in module state for compaction scratch
 // ============================================================================
 
@@ -140,12 +117,8 @@ struct FlashState {
     syscalls: *const SyscallTable,
     out_chan: i32,
     // --- Config params ---
-    /// 0=gesture (click/long_press), 1=direct (on/off tracks button state)
-    mode: u8,
-    _pad0: u8,
     debounce_ms: u16,
-    multi_click_ms: u16,
-    long_press_ms: u16,
+    _pad0: u16,
     // --- Debounce state ---
     /// Current debounced state (0=released, 1=pressed)
     current_state: u8,
@@ -156,18 +129,6 @@ struct FlashState {
     _pad1: u8,
     /// Timestamp when raw state last changed (for debounce)
     state_change_time: u32,
-    // --- Gesture state ---
-    gesture: GestureState,
-    click_count: u8,
-    long_press_emitted: u8,
-    _pad2: u8,
-    press_time: u32,
-    release_time: u32,
-    // --- Click-mapping ---
-    map_click: u32,
-    map_double: u32,
-    map_triple: u32,
-    map_long_press: u32,
     // --- Error tracking ---
     error_count: u32,
     // --- Flash store provider ---
@@ -200,8 +161,7 @@ struct FlashState {
 
 mod params_def {
     use super::FlashState;
-    use super::{p_u8, p_u16, p_u32};
-    use super::{DEFAULT_CLICK, DEFAULT_DOUBLE, DEFAULT_TRIPLE, DEFAULT_LONG};
+    use super::{p_u8, p_u16};
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -209,27 +169,6 @@ mod params_def {
 
         1, debounce_ms, u16, 50
             => |s, d, len| { s.debounce_ms = p_u16(d, len, 0, 50); };
-
-        2, multi_click_ms, u16, 300
-            => |s, d, len| { s.multi_click_ms = p_u16(d, len, 0, 300); };
-
-        3, long_press_ms, u16, 500
-            => |s, d, len| { s.long_press_ms = p_u16(d, len, 0, 500); };
-
-        4, mode, u8, 0
-            => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
-
-        5, click, u32, 0
-            => |s, d, len| { s.map_click = p_u32(d, len, 0, DEFAULT_CLICK); };
-
-        6, double_click, u32, 0
-            => |s, d, len| { s.map_double = p_u32(d, len, 0, DEFAULT_DOUBLE); };
-
-        7, triple_click, u32, 0
-            => |s, d, len| { s.map_triple = p_u32(d, len, 0, DEFAULT_TRIPLE); };
-
-        8, long_press_cmd, u32, 0
-            => |s, d, len| { s.map_long_press = p_u32(d, len, 0, DEFAULT_LONG); };
 
         9, item_count, u8, 0
             => |s, d, len| { let _ = p_u8(d, len, 0, 0); };
@@ -346,19 +285,8 @@ pub extern "C" fn module_new(
         s.last_raw = 0;
         s.state_change_time = 0;
         s.state_processed = 1;
-        s.mode = 0;
         s._pad0 = 0;
         s._pad1 = 0;
-        s.gesture = GestureState::Idle;
-        s.click_count = 0;
-        s.long_press_emitted = 0;
-        s._pad2 = 0;
-        s.press_time = 0;
-        s.release_time = 0;
-        s.map_click = DEFAULT_CLICK;
-        s.map_double = DEFAULT_DOUBLE;
-        s.map_triple = DEFAULT_TRIPLE;
-        s.map_long_press = DEFAULT_LONG;
         s.error_count = 0;
 
         // Flash store provider state
@@ -509,21 +437,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let raw_state = if level != 0 { 1u8 } else { 0u8 };
 
-        // ---- Direct mode: emit on/off immediately, no debounce ----
-
-        if s.mode == 1 {
-            if raw_state != s.current_state {
-                s.current_state = raw_state;
-                if raw_state == 1 {
-                    emit_msg(s, sys, MSG_ON, core::ptr::null(), 0);
-                } else {
-                    emit_msg(s, sys, MSG_OFF, core::ptr::null(), 0);
-                }
-            }
-            return 0;
-        }
-
-        // ---- Debounce (gesture mode only) ----
+        // ---- Debounce ----
 
         if raw_state != s.last_raw {
             s.last_raw = raw_state;
@@ -536,73 +450,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // ---- Feed debounced transitions into output (gesture mode) ----
+        // ---- Emit raw button transition on debounced edge ----
+        //
+        // One byte per transition (0x01=pressed, 0x00=released).
+        // Same wire shape `modules/foundation/button` produces for
+        // GPIO pins; downstream `gesture` does click counting and
+        // FMP mapping.
 
-        if s.state_processed == 0 {
-            s.state_processed = 1;
-
-            // Gesture mode: click counting + long press detection
-            if s.current_state == 1 {
-                // Press
-                s.press_time = now;
-                s.long_press_emitted = 0;
-                match s.gesture {
-                    GestureState::Idle => {
-                        s.click_count = 0;
-                        s.gesture = GestureState::Pressed;
-                    }
-                    GestureState::WaitingForClick => {
-                        s.gesture = GestureState::Pressed;
-                    }
-                    GestureState::Pressed => {} // spurious
-                }
-            } else {
-                // Release
-                if s.gesture == GestureState::Pressed {
-                    if s.long_press_emitted != 0 {
-                        // Long press already fired while held — suppress click
-                        s.gesture = GestureState::Idle;
-                        s.click_count = 0;
-                    } else {
-                        let duration = now.wrapping_sub(s.press_time);
-                        if duration >= s.long_press_ms as u32 {
-                            emit_msg(s, sys, s.map_long_press, core::ptr::null(), 0);
-                            s.gesture = GestureState::Idle;
-                            s.click_count = 0;
-                        } else {
-                            s.click_count += 1;
-                            s.release_time = now;
-                            s.gesture = GestureState::WaitingForClick;
-                        }
-                    }
+        if s.state_processed == 0 && s.out_chan >= 0 {
+            let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
+            if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
+                let byte = [s.current_state];
+                let written = (sys.channel_write)(s.out_chan, byte.as_ptr(), 1);
+                if written > 0 {
+                    s.state_processed = 1;
                 }
             }
-        }
-
-        // ---- Check long press while held ----
-
-        if s.gesture == GestureState::Pressed && s.long_press_emitted == 0 {
-            let duration = now.wrapping_sub(s.press_time);
-            if duration >= s.long_press_ms as u32 {
-                emit_msg(s, sys, s.map_long_press, core::ptr::null(), 0);
-                s.long_press_emitted = 1;
-            }
-        }
-
-        // ---- Check multi-click timeout ----
-
-        if s.gesture == GestureState::WaitingForClick {
-            let elapsed = now.wrapping_sub(s.release_time);
-            if elapsed >= s.multi_click_ms as u32 {
-                let msg = match s.click_count {
-                    2 => s.map_double,
-                    3 => s.map_triple,
-                    _ => s.map_click,
-                };
-                emit_msg(s, sys, msg, core::ptr::null(), 0);
-                s.gesture = GestureState::Idle;
-                s.click_count = 0;
-            }
+            // If the channel was full, leave state_processed=0 so we
+            // retry next tick — never drop a transition.
         }
 
         // ---- Blob serving on out[1] ----
@@ -662,14 +527,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         0
-    }
-}
-
-/// Emit an FMP message on the output channel.
-unsafe fn emit_msg(s: &FlashState, sys: &SyscallTable, msg_type: u32, payload: *const u8, payload_len: u16) {
-    let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-    if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
-        msg_write(sys, s.out_chan, msg_type, payload, payload_len);
     }
 }
 
@@ -1186,7 +1043,7 @@ unsafe fn read_u32_xip(ptr: *const u8) -> u32 {
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let hints = [
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 256 },  // out[0]: FMP messages
+        ChannelHint { port_type: 1, port_index: 0, buffer_size: 64 },   // out[0]: button raw transitions (1 byte each)
         ChannelHint { port_type: 1, port_index: 1, buffer_size: 2048 }, // out[1]: blob stream
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }

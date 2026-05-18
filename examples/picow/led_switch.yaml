@@ -3,10 +3,7 @@
 # Press BOOTSEL to turn LED on, release to turn it off.
 #
 # Control flow:
-#   flash (mode: direct) → cyw43 (LED)
-#
-# In direct mode, flash emits on/off messages tracking button state.
-# No gesture module needed.
+#   flash_rp.raw → gesture (mode: direct) → cyw43.led
 target: picow
 
 
@@ -14,8 +11,11 @@ modules:
   - name: pio_rp
   - name: cyw43
   - name: flash_rp
-    mode: 1
+  - name: gesture
+    mode: 1                  # direct: on/off tracks button state
 
 wiring:
-  - from: flash_rp.events
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
     to: cyw43.led

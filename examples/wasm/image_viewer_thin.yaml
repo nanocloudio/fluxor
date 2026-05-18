@@ -2,23 +2,23 @@
 #
 # Browser-side companion to either `examples/linux/image_viewer.yaml`
 # or `examples/cm5/image_viewer.yaml`. The shape mirrors the
-# producer-half display path exactly: pointer → click_command emits
-# FMP commands, the canvas renders incoming raster bytes. The only
-# difference vs the pure-wasm version (`image_viewer.yaml`) is that
-# `bank` + `codec` live in a different kernel, on the other side of
-# the WebSocket.
+# producer-half display path exactly: button driver → gesture
+# emits FMP commands, the canvas renders incoming raster bytes.
+# The only difference vs the pure-wasm version
+# (`image_viewer.yaml`) is that `bank` + `codec` live in a
+# different kernel, on the other side of the WebSocket.
 #
-#   pointer → click_command → ws.tx_in   ──┐
-#                                          │  WS up   /ws  (FMP next/prev)
-#                                          ▼
-#                            (producer kernel: linux / cm5)
-#                                          │
-#                                          │  WS down /ws  (RGB565 bytes)
-#   display ←──────────────── ws.rx_out  ──┘
+#   wasm_browser_button → gesture → ws.tx_in   ──┐
+#                                                │  WS up   /ws  (FMP next/prev)
+#                                                ▼
+#                                  (producer kernel: linux / cm5)
+#                                                │
+#                                                │  WS down /ws  (RGB565 bytes)
+#   display ←────────────────────── ws.rx_out  ──┘
 #
 # `wasm_browser_websocket` is the single bidirectional WebSocket
-# carrier; tx_in carries OctetStream bytes UP (the click_command's
-# FMP messages), rx_out emits OctetStream bytes DOWN (the
+# carrier; tx_in carries OctetStream bytes UP (the gesture
+# module's FMP messages), rx_out emits OctetStream bytes DOWN (the
 # producer's decoded raster). One socket, two directions, zero
 # protocol divergence — the FMP message bytes the browser sends
 # are byte-for-byte the same as those bank.commands receives in
@@ -32,11 +32,15 @@ presentation:
     - { id: main, role: display, module: display }
 
 modules:
-  - name: pointer
-    type: wasm_browser_pointer
-
   - name: nav
-    type: wasm_browser_click_command
+    type: wasm_browser_button
+
+  # Image-gallery gesture mapping (matches the pure-wasm variant):
+  # single tap → next, double tap → prev.
+  - name: gesture
+    click: next
+    double_click: prev
+    triple_click: prev
 
   # Bidirectional WS carrier. tx_in: bytes to send up; rx_out:
   # bytes received from the server. Relative URL — host shim
@@ -52,9 +56,9 @@ modules:
     height: 540
 
 wiring:
-  - from: pointer.events
-    to: nav.events
-  - from: nav.commands
+  - from: nav.raw
+    to: gesture.raw
+  - from: gesture.commands
     to: ws.tx
   - from: ws.rx
     to: display.raster

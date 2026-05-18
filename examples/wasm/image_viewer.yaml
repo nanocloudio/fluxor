@@ -2,19 +2,24 @@
 #
 # All four image_viewer variants share the same overall shape:
 # `input → bank → codec → display`. Only where each stage runs
-# differs.
+# differs. The input chain is byte-for-byte identical to
+# audio_player's: `<button driver> → gesture → bank.commands`.
+# Each platform supplies its own button-capability driver:
 #
-#   pointer → click_command → bank.commands
-#                                │
-#                                ▼
-#                          bank.stream → codec.encoded → codec.pixels → display.raster
+#   wasm:        wasm_browser_button   (DOM tap on player surface)
+#   rp BOOTSEL:  flash_rp              (QSPI sideband)
+#   rp GPIO:     button (pin: N)       (external switch)
 #
-# `wasm_browser_click_command` is the same input transformer in all
-# wasm-side variants: KIND_UP primary click → FMP `next`, KIND_UP
-# secondary click → FMP `prev`. In pure-wasm its `commands` output
-# wires directly to `bank.commands` in the same kernel; in the
-# split variants it wires to `wasm_browser_websocket.tx_in` and the
-# same FMP bytes ride the WebSocket up to the producer's bank.
+# All three emit the same one-byte input::button raw contract;
+# `gesture` does click counting + FMP mapping with per-graph verbs.
+#
+#   wasm_browser_button.raw → gesture.raw → gesture.commands
+#                                                 │
+#                                                 ▼
+#                                          bank.commands
+#                                                 │
+#                                                 ▼
+#                                          bank.stream → codec.encoded → codec.pixels → display.raster
 #
 # Gallery is baked into the wasm bundle via the top-level `assets:`
 # block (see `tools/src/asset_bank.rs::append_asset_bank`). The
@@ -67,16 +72,20 @@ presentation:
     - { id: main, role: display, module: display }
 
 modules:
-  # Pointer events from the DOM (W3C PointerEvent). Both single
-  # surfaces and multi-touch routed through here.
-  - name: pointer
-    type: wasm_browser_pointer
-
-  # Click → FMP transformer. Same module shape (and wiring) used in
-  # the split scenarios — the OUTPUT just travels different
-  # distances.
+  # BUTTON capability driver — wasm equivalent of `flash_rp`. DOM
+  # taps on the display surface become one-byte transitions on
+  # `raw`. Same shape every other platform's button driver emits.
   - name: nav
-    type: wasm_browser_click_command
+    type: wasm_browser_button
+
+  # Cross-platform click counter → FMP commands. Image-gallery
+  # mapping: single tap → next, double tap → prev. Audio_player
+  # remaps the same module to single→toggle, double→next — same
+  # logic, different verbs.
+  - name: gesture
+    click: next
+    double_click: prev
+    triple_click: prev
 
   # Asset bank cursor. `path_*` enumerates the gallery; bank cycles
   # through them in response to `next`/`prev`/`select` FMP commands
@@ -91,8 +100,10 @@ modules:
     path_4: "asset://spiral.gif"
     path_5: "asset://spiral.bmp"
 
+  # Unified PIC codec — auto-detects BMP/GIF/PNG/JPEG (and the
+  # audio formats, though they're not wired here). Same module the
+  # cm5 / linux / pico2w producers use; lives at modules/app/codec/.
   - name: codec
-    type: wasm_browser_image_codec
     width: 960
     height: 540
     max_bytes: 16777216
@@ -103,9 +114,9 @@ modules:
     height: 540
 
 wiring:
-  - from: pointer.events
-    to: nav.events
-  - from: nav.commands
+  - from: nav.raw
+    to: gesture.raw
+  - from: gesture.commands
     to: bank.commands
   - from: bank.stream
     to: codec.encoded

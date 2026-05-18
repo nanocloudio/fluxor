@@ -1,0 +1,21 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser-side BUTTON capability driver — the wasm equivalent of
+# `flash_rp` (rp BOOTSEL) and `modules/foundation/button` (rp GPIO).
+# Drains a host-side queue populated by the runtime shell when the
+# user taps an interactive surface, and emits the canonical
+# `input::button` raw transition contract on `raw`: one byte per
+# debounced edge (0x01=pressed, 0x00=released).
+#
+# Downstream `gesture` does click counting + FMP mapping — same
+# module + parameters every other platform's chain uses. One
+# driver per platform exposing the same capability is the whole
+# point.
+
+[[ports]]
+name = "raw"
+direction = "output"
+content_type = "OctetStream"
+required = true

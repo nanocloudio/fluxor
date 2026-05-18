@@ -107,8 +107,14 @@ macro_rules! define_params {
         pub unsafe fn parse_tlv(s: &mut $state_type, p: *const u8, total_len: usize) {
             set_defaults(s);
             if total_len < 4 { return; }
-            let payload_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
-            let end = if 4 + payload_len < total_len { 4 + payload_len } else { total_len };
+            // `payload_len` at bytes 2-3 is u16 (max 65535) — wraps
+            // for module-params blobs >64 KiB (e.g. synth host's
+            // http module with both shell halves inlined as body
+            // routes). Treat it as advisory: iterate up to
+            // `total_len` (sized by the kernel from the u32
+            // entry_length, which has plenty of room), relying on
+            // the `TLV_END` byte to mark the real stream end.
+            let end = total_len;
             let mut off = 4usize;
             while off + 2 <= end {
                 let tag = *p.add(off);
