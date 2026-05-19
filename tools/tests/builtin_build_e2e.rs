@@ -88,17 +88,16 @@ fn skip_if_unconfigured() -> bool {
     false
 }
 
-fn write_yaml(name: &str, body: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let p = std::env::temp_dir().join(format!(
-        "fluxor-e2e-{}-{}-{}.yaml",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed),
-        name,
-    ));
+fn write_yaml(name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
+    // RAII scratch dir; caller binds both so the file survives the
+    // `fluxor build` invocation and disappears when the test ends.
+    let dir = tempfile::Builder::new()
+        .prefix("fluxor-e2e-")
+        .tempdir()
+        .expect("tempdir");
+    let p = dir.path().join(format!("{name}.yaml"));
     std::fs::write(&p, body).unwrap();
-    p
+    (dir, p)
 }
 
 /// Run `fluxor build <yaml>` and capture stderr+stdout.
@@ -122,7 +121,7 @@ fn jpeg_display_clean_build() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "valid",
         r#"
 target: linux
@@ -157,7 +156,7 @@ fn typo_in_param_rejected_with_did_you_mean_hint() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "typo",
         r#"
 target: linux
@@ -187,7 +186,7 @@ fn out_of_range_param_rejected_with_bounds() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "range",
         r#"
 target: linux
@@ -219,7 +218,7 @@ fn missing_required_param_rejected() {
     }
     // `host_asset_source.path` is `required = true` with no default,
     // so omitting it must fail the build with a missing-required error.
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "missing_required",
         r#"
 target: linux
@@ -244,7 +243,7 @@ fn transparent_params_wrapper_works() {
     }
     // `params: { ... }` is a transparent grouping container — its
     // inner keys map to schema params with no prefix.
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "params_wrapper",
         r#"
 target: linux
@@ -276,7 +275,7 @@ fn defaults_propagate_when_yaml_omits_param() {
     // host_image_codec has no required params (other than its
     // type/name); omitting all of width/height/scale_mode/max_bytes
     // should succeed because the manifest declares defaults.
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "defaults",
         r#"
 target: linux

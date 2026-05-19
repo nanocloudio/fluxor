@@ -43,17 +43,14 @@ fn skip_if_unconfigured() -> bool {
     false
 }
 
-fn write_yaml(name: &str, body: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let p = std::env::temp_dir().join(format!(
-        "fluxor-pg-{}-{}-{}.yaml",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed),
-        name,
-    ));
+fn write_yaml(name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("fluxor-pg-")
+        .tempdir()
+        .expect("tempdir");
+    let p = dir.path().join(format!("{name}.yaml"));
     std::fs::write(&p, body).unwrap();
-    p
+    (dir, p)
 }
 
 fn run_validate(yaml: &Path) -> (bool, String) {
@@ -101,7 +98,7 @@ fn solo_speaker_group_validates() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "solo_ok",
         &pico_with_pg(
             r#"
@@ -123,7 +120,7 @@ fn missing_clock_authority_field_rejected() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "missing_authority",
         &pico_with_pg(
             r#"
@@ -148,7 +145,7 @@ fn clock_authority_without_capability_rejected() {
     }
     // `synth` does not declare `presentation.clock`, so naming it as
     // the clock authority must fail with a pointer at the manifest.
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "synth_authority",
         &pico_with_pg(
             r#"
@@ -172,7 +169,7 @@ fn clock_authority_must_be_a_member() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "auth_not_in_members",
         &pico_with_pg(
             r#"
@@ -196,7 +193,7 @@ fn non_string_member_rejected_with_index() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "bad_member_type",
         &pico_with_pg(
             r#"
@@ -224,7 +221,7 @@ fn invalid_cutover_policy_rejected() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "bad_cutover",
         &pico_with_pg(
             r#"
@@ -251,7 +248,7 @@ fn protected_without_capability_rejected() {
     }
     // i2s_pio declares audio.sample but not audio.protected_out, so a
     // group that demands a protected path must reject it.
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "protected_no_cap",
         &pico_with_pg(
             r#"
@@ -276,7 +273,7 @@ fn duplicate_group_ids_rejected() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "dup_ids",
         &pico_with_pg(
             r#"
@@ -303,7 +300,7 @@ fn budget_implausibly_large_rejected() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "big_budget",
         &pico_with_pg(
             r#"
@@ -331,7 +328,7 @@ fn multihead_with_two_display_scanout_validates() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "multihead_ok",
         r#"
 target: linux
@@ -387,7 +384,7 @@ fn multihead_with_single_display_scanout_rejected() {
     if skip_if_unconfigured() {
         return;
     }
-    let yaml = write_yaml(
+    let (_yaml_dir, yaml) = write_yaml(
         "multihead_fail",
         r#"
 target: linux
@@ -457,7 +454,11 @@ fn fluxor_validate_resolves_config_relative_modules() {
     if skip_if_unconfigured() {
         return;
     }
-    let proj = std::env::temp_dir().join(format!("fluxor-pg-localmod-{}", std::process::id()));
+    let _proj_dir = tempfile::Builder::new()
+        .prefix("fluxor-pg-localmod-")
+        .tempdir()
+        .expect("tempdir");
+    let proj = _proj_dir.path();
     let mod_dir = proj.join("modules").join("local_clock");
     std::fs::create_dir_all(&mod_dir).unwrap();
     std::fs::write(
@@ -522,7 +523,11 @@ fn capability_names_are_case_insensitive_at_parse() {
     if skip_if_unconfigured() {
         return;
     }
-    let proj = std::env::temp_dir().join(format!("fluxor-pg-mixedcase-{}", std::process::id()));
+    let _proj_dir = tempfile::Builder::new()
+        .prefix("fluxor-pg-mixedcase-")
+        .tempdir()
+        .expect("tempdir");
+    let proj = _proj_dir.path();
     let mod_dir = proj.join("modules").join("mixed_case_clock");
     std::fs::create_dir_all(&mod_dir).unwrap();
     std::fs::write(

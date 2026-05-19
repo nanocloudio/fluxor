@@ -2158,10 +2158,15 @@ mod tests {
     ///   <tmp>/viewer/graph.yaml        target: wasm
     ///   <tmp>/viewer/viewer.html
     ///   <tmp>/assets/                  (an empty dir)
-    /// Returns the scenario_path.
-    fn make_temp_tree(name: &str, scenario_yaml: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fluxor_scenario_test_{}_{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+    /// Returns `(TempDir, scenario_path)` — the caller must hold the
+    /// `TempDir` for the lifetime of the test so the on-disk tree is
+    /// cleaned up automatically when the test ends.
+    fn make_temp_tree(name: &str, scenario_yaml: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("fluxor_scenario_test_{}_", name))
+            .tempdir()
+            .expect("temp dir");
+        let dir = tmp.path();
         fs::create_dir_all(dir.join("viewer")).unwrap();
         fs::create_dir_all(dir.join("assets")).unwrap();
         let graph = dir.join("viewer/graph.yaml");
@@ -2177,12 +2182,12 @@ mod tests {
         .unwrap();
         let scenario = dir.join("scenario.yaml");
         write!(fs::File::create(&scenario).unwrap(), "{}", scenario_yaml).unwrap();
-        scenario
+        (tmp, scenario)
     }
 
     #[test]
     fn minimal_wasm_scenario_round_trips() {
-        let path = make_temp_tree(
+        let (_tmp, path) = make_temp_tree(
             "round_trip",
             "\
 kind: scenario
@@ -2209,7 +2214,7 @@ bindings:
 
     #[test]
     fn wasm_without_origin_is_rejected() {
-        let path = make_temp_tree(
+        let (_tmp, path) = make_temp_tree(
             "no_origin",
             "\
 kind: scenario
@@ -2234,7 +2239,7 @@ bindings:
 
     #[test]
     fn runtime_override_wasm_is_rejected() {
-        let path = make_temp_tree(
+        let (_tmp, path) = make_temp_tree(
             "override_wasm",
             "\
 kind: scenario
@@ -2262,9 +2267,11 @@ bindings:
 
     #[test]
     fn missing_kind_is_rejected_with_helpful_message() {
-        let dir = std::env::temp_dir().join(format!("fluxor_scenario_test_mk_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("fluxor_scenario_test_mk_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         let path = dir.join("not_a_scenario.yaml");
         write!(
             fs::File::create(&path).unwrap(),
@@ -2282,9 +2289,11 @@ bindings:
 
     #[test]
     fn missing_graph_file_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("fluxor_scenario_test_nograph_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("fluxor_scenario_test_nograph_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         let path = dir.join("scenario.yaml");
         write!(
             fs::File::create(&path).unwrap(),
@@ -2311,7 +2320,7 @@ host:
 
     #[test]
     fn print_synthesised_emits_host_routes() {
-        let path = make_temp_tree(
+        let (_tmp, path) = make_temp_tree(
             "synth",
             "\
 kind: scenario
@@ -2342,8 +2351,11 @@ bindings:
     fn render_synthesised_returns_none_without_host() {
         // A scenario whose only binding has explicit `on:` and no
         // `host:` section — render_synthesised_host returns None.
-        let dir = std::env::temp_dir().join(format!("fluxor_scenario_test_nosynth_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let _tmp = tempfile::Builder::new()
+            .prefix("fluxor_scenario_test_nosynth_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         fs::create_dir_all(dir.join("decoder")).unwrap();
         fs::create_dir_all(dir.join("viewer")).unwrap();
         write!(
@@ -2386,9 +2398,11 @@ bindings:
 
     #[test]
     fn list_scenarios_finds_and_filters() {
-        let dir = std::env::temp_dir().join(format!("fluxor_scenario_test_list_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("fluxor_scenario_test_list_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         // A real scenario.
         write!(
             fs::File::create(dir.join("foo.scenario.yaml")).unwrap(),
@@ -2435,16 +2449,24 @@ bindings:
     // detection, host-FS gate.
     // -------------------------------------------------------------
 
-    fn make_split_tree(name: &str, decoder_yaml: &str, scenario_yaml: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fluxor_scenario_test_{}_{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
+    fn make_split_tree(
+        name: &str,
+        decoder_yaml: &str,
+        scenario_yaml: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("fluxor_scenario_test_{}_", name))
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
         fs::create_dir_all(dir.join("decoder")).unwrap();
         fs::create_dir_all(dir.join("viewer")).unwrap();
-        write!(fs::File::create(dir.join("decoder/graph.yaml")).unwrap(), "{}", decoder_yaml).unwrap();
+        write!(
+            fs::File::create(dir.join("decoder/graph.yaml")).unwrap(),
+            "{}",
+            decoder_yaml
+        )
+        .unwrap();
         write!(
             fs::File::create(dir.join("viewer/graph.yaml")).unwrap(),
             "target: wasm\nmodules: []\nwiring: []\n"
@@ -2457,7 +2479,7 @@ bindings:
         .unwrap();
         let scenario = dir.join("scenario.yaml");
         write!(fs::File::create(&scenario).unwrap(), "{}", scenario_yaml).unwrap();
-        scenario
+        (tmp, scenario)
     }
 
     #[test]
@@ -2467,7 +2489,7 @@ bindings:
         // The synthesiser sets `scheduler.accept_cycles: true` so the
         // kernel's prepare_graph accepts it under the explicit
         // attestation.
-        let path = make_temp_tree(
+        let (_tmp, path) = make_temp_tree(
             "synth_accept_cycles",
             "\
 kind: scenario
@@ -2498,7 +2520,7 @@ bindings:
 
     #[test]
     fn synthesised_host_has_canonical_shape() {
-        let path = make_temp_tree(
+        let (_tmp, path) = make_temp_tree(
             "synth_shape",
             "\
 kind: scenario
@@ -2547,7 +2569,7 @@ bindings:
 
     #[test]
     fn merger_injects_routes_into_named_module() {
-        let path = make_split_tree(
+        let (_tmp, path) = make_split_tree(
             "merge_inject",
             "\
 target: linux
@@ -2591,7 +2613,7 @@ bindings:
 
     #[test]
     fn merger_detects_route_conflict_with_helpful_error() {
-        let path = make_split_tree(
+        let (_tmp, path) = make_split_tree(
             "merge_conflict",
             "\
 target: linux
@@ -2628,7 +2650,7 @@ bindings:
 
     #[test]
     fn merger_blocks_binding_on_silicon_without_override() {
-        let path = make_split_tree(
+        let (_tmp, path) = make_split_tree(
             "merge_silicon",
             "\
 target: cm5
@@ -2665,7 +2687,7 @@ bindings:
 
     #[test]
     fn runtime_override_flips_effective_target_in_merged_config() {
-        let path = make_split_tree(
+        let (_tmp, path) = make_split_tree(
             "merge_override",
             "\
 target: cm5
@@ -2698,7 +2720,7 @@ bindings:
 
     #[test]
     fn binding_targeting_missing_module_errors_clearly() {
-        let path = make_split_tree(
+        let (_tmp, path) = make_split_tree(
             "merge_no_module",
             "\
 target: linux
@@ -2737,7 +2759,7 @@ bindings:
 
     #[test]
     fn effective_target_honours_runtime_override() {
-        let path = make_split_tree(
+        let (_tmp, path) = make_split_tree(
             "et_override",
             "target: cm5\nmodules: []\nwiring: []\n",
             "\
@@ -2776,7 +2798,7 @@ bindings:
 
     #[test]
     fn write_merged_component_yaml_lands_under_target_scenarios() {
-        let path = make_split_tree(
+        let (_tmp, path) = make_split_tree(
             "wmc_yaml",
             "\
 target: linux
@@ -2864,12 +2886,11 @@ bindings:
         // should be rejected. We use `wifi` (CYW43-only RP module)
         // because its hardware_targets manifest definitely doesn't
         // include linux or bcm2712.
-        let dir = std::env::temp_dir().join(format!(
-            "fluxor_scenario_test_mask_{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("fluxor_scenario_test_mask_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         let graph = dir.join("graph.yaml");
         write!(
             fs::File::create(&graph).unwrap(),
@@ -2930,12 +2951,11 @@ bindings:
         // (hardware_targets = ["rp2350", "bcm2712"]) coerced to linux
         // — should pass because target_aliases("linux") includes
         // "bcm2712".
-        let dir = std::env::temp_dir().join(format!(
-            "fluxor_scenario_test_mask_ok_{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("fluxor_scenario_test_mask_ok_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         let graph = dir.join("graph.yaml");
         write!(
             fs::File::create(&graph).unwrap(),
@@ -2972,8 +2992,11 @@ bindings:
         // Two components, each whose serve-binding points at the
         // other's http — degenerate, but the dependency graph forms
         // a cycle.
-        let dir = std::env::temp_dir().join(format!("fluxor_scenario_test_cycle_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let _tmp = tempfile::Builder::new()
+            .prefix("fluxor_scenario_test_cycle_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         fs::create_dir_all(dir.join("a")).unwrap();
         fs::create_dir_all(dir.join("b")).unwrap();
         write!(

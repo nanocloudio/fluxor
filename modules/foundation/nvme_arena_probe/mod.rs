@@ -40,10 +40,15 @@ include!("../../sdk/params.rs");
 const PAGE_BYTES: usize = 4096;
 const PAGE_WORDS: usize = PAGE_BYTES / 4;
 
-/// Pages per bulk write/read syscall. Each bulk syscall translates
-/// to exactly one NVMe command (multi-block write/read with PRP-list).
-/// Larger amortizes the per-command roundtrip more aggressively;
-/// 32 pages = 128 KB matches the driver's `MAX_BULK_PAGES`.
+/// Pages per bulk write/read syscall. Larger values trigger the
+/// driver's pipelined-read path: a single syscall covering more
+/// than the driver's per-command ceiling (`MAX_BULK_PAGES = 32`)
+/// is internally split into multiple commands submitted across the
+/// driver's slot pool (`ASYNC_BULK_SLOTS = 8`) and I/O queues, so
+/// reads pipeline rather than serializing one command at a time.
+/// 32 pages = 128 KB per syscall = 1 in-flight NVMe command (no
+/// pipelining); 128 pages = 4 in-flight; 256 pages = saturate the
+/// 8-slot pool.
 const BULK_PAGES: usize = 32;
 const BULK_WORDS: usize = BULK_PAGES * PAGE_WORDS;
 
@@ -347,7 +352,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             s.arena_id = rc as u8;
             s.cursor = 0;
             s.state = ST_WRITE;
-            s.write_start_ms = dev_micros(sys);
+            // `write_start_ms` deliberately stays 0 here; the first
+            // successful write call captures it. Anchoring on ST_INIT
+            // entry conflates the (potentially many-tick) ENODEV-retry
+            // wait for the backing provider with actual device work —
+            // a small per-graph priming cost that distorted reported
+            // throughput by orders of magnitude on cold-boot configs.
             emit_heartbeat(s);
             0
         }
@@ -406,6 +416,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 write_dec(p, &mut pos, s.cursor as u32);
                 dev_log(sys, 3, p, pos);
                 return 0;
+            }
+            // First successful write retires the priming phase; clear
+            // any latched ENODEV and anchor `write_start_ms` here so
+            // the timing window captures real device work only.
+            if s.write_start_ms == 0 {
+                s.write_start_ms = dev_micros(sys);
+                if s.err == -19 {
+                    s.err = 0;
+                }
             }
             s.cursor += chunk as u16;
             2 // Burst — keep stepping

@@ -1414,17 +1414,14 @@ mod tests {
     }
 
     fn parse_toml(src: &str) -> Result<Manifest> {
-        // Use a unique scratch path per call so parallel tests don't
-        // race on the same file.
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "fluxor-manifest-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("manifest.toml");
+        // RAII scratch dir; cleaned when this function returns. The
+        // path passed to `from_toml` is only borrowed during the
+        // synchronous parse, so the TempDir can drop right after.
+        let tmp = tempfile::Builder::new()
+            .prefix("fluxor-manifest-test-")
+            .tempdir()
+            .unwrap();
+        let path = tmp.path().join("manifest.toml");
         std::fs::write(&path, src).unwrap();
         Manifest::from_toml(&path)
     }

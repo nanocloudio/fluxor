@@ -272,7 +272,6 @@ mod tests {
     use crate::rig::backend::protocol::BackendContext;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::sync::mpsc;
 
     /// Returns (tmp dir, backend ref, exec-spawn lock guard).
@@ -287,7 +286,11 @@ mod tests {
         name: &str,
         surface: Surface,
         script: &str,
-    ) -> (PathBuf, BackendRef, std::sync::MutexGuard<'static, ()>) {
+    ) -> (
+        crate::rig::test_utils::UniqueTmpDir,
+        BackendRef,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
         let guard = crate::rig::test_utils::lock_exec_spawn();
         let tmp = crate::rig::test_utils::unique_tmp_dir(&format!("transport-{name}"));
         let slug = format!("{}-{}", surface.as_str(), name);

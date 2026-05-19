@@ -275,14 +275,22 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::*;
 
-    fn tmp_path(name: &str) -> PathBuf {
-        let pid = std::process::id();
-        std::env::temp_dir().join(format!("fluxor-rig-lock-{pid}-{name}"))
+    /// RAII scratch directory + lock-file path. Caller binds both so
+    /// the TempDir lives for the test scope; the file inside it is
+    /// removed when the dir drops. Replaces the old
+    /// `/tmp/fluxor-rig-lock-<pid>-<name>` leak.
+    fn tmp_path(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("fluxor-rig-lock-")
+            .tempdir()
+            .expect("tempdir");
+        let path = dir.path().join(name);
+        (dir, path)
     }
 
     #[test]
     fn acquire_and_release() {
-        let path = tmp_path("basic.lock");
+        let (_lock_dir, path) = tmp_path("basic.lock");
         let _ = std::fs::remove_file(&path);
         let owner = LockOwner::now("rig-a", "test:x", 30);
         let outcome = acquire(&path, &owner, false).unwrap();
@@ -298,7 +306,7 @@ mod tests {
 
     #[test]
     fn second_acquire_reports_holder() {
-        let path = tmp_path("held.lock");
+        let (_lock_dir, path) = tmp_path("held.lock");
         let _ = std::fs::remove_file(&path);
         let first = LockOwner::now("rig-a", "test:x", 30);
         let _g = match acquire(&path, &first, false).unwrap() {
@@ -317,7 +325,7 @@ mod tests {
 
     #[test]
     fn force_takes_over() {
-        let path = tmp_path("force.lock");
+        let (_lock_dir, path) = tmp_path("force.lock");
         let _ = std::fs::remove_file(&path);
         let first = LockOwner::now("rig-a", "test:x", 30);
         let _g = match acquire(&path, &first, false).unwrap() {
@@ -334,7 +342,7 @@ mod tests {
 
     #[test]
     fn dropping_displaced_guard_leaves_new_owners_lock_intact() {
-        let path = tmp_path("takeover.lock");
+        let (_lock_dir, path) = tmp_path("takeover.lock");
         let _ = std::fs::remove_file(&path);
 
         let first = LockOwner::now("rig-a", "test:x", 30);
@@ -376,7 +384,7 @@ mod tests {
 
     #[test]
     fn stale_lock_is_taken_over_without_force() {
-        let path = tmp_path("stale.lock");
+        let (_lock_dir, path) = tmp_path("stale.lock");
         let _ = std::fs::remove_file(&path);
         // Plant an owner with started_at way in the past.
         let mut ancient = LockOwner::now("rig-a", "test:old", 1);

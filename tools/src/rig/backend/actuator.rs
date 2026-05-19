@@ -128,16 +128,21 @@ mod tests {
     use crate::rig::vocab::Surface;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
 
-    /// Returns (tmp dir, backend ref, exec-spawn lock guard). Caller
-    /// holds the guard until after `invoke_actuator` returns to
-    /// serialise the write-and-spawn window across parallel tests; see
-    /// `rig::test_utils::lock_exec_spawn` for why.
+    /// Returns (tmp dir guard, backend ref, exec-spawn lock guard).
+    /// Caller holds the guard until after `invoke_actuator` returns
+    /// to serialise the write-and-spawn window across parallel
+    /// tests; see `rig::test_utils::lock_exec_spawn` for why. Caller
+    /// must also hold the [`UniqueTmpDir`] until the test finishes so
+    /// the backing scratch directory doesn't drop early.
     fn fixture_backend(
         name: &str,
         script: &str,
-    ) -> (PathBuf, BackendRef, std::sync::MutexGuard<'static, ()>) {
+    ) -> (
+        crate::rig::test_utils::UniqueTmpDir,
+        BackendRef,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
         let guard = crate::rig::test_utils::lock_exec_spawn();
         let tmp = crate::rig::test_utils::unique_tmp_dir(&format!("actuator-{name}"));
         let exe = tmp.join(format!("power-{name}"));

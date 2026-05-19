@@ -1,30 +1,71 @@
 //! Test helpers shared across rig submodules.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
+use tempfile::TempDir;
 
-/// Create a fresh tmp directory keyed on (pid, label, nanos, counter).
-/// The combination is unique per call so that fixtures which write
-/// executables and immediately spawn them never reuse an inode that
-/// another test is still holding open for write.
-pub(crate) fn unique_tmp_dir(label: &str) -> PathBuf {
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "fluxor-test-{}-{}-{}-{}",
-        std::process::id(),
-        sanitise(label),
-        nanos,
-        seq,
-    ));
-    std::fs::create_dir_all(&path).expect("creating unique tmp dir");
-    path
+/// RAII scratch directory used across rig submodule tests. Replaces
+/// the old `unique_tmp_dir(label) -> PathBuf` which leaked to
+/// `/tmp/fluxor-test-*` on every run. Backed by [`tempfile::TempDir`]
+/// so the directory is removed automatically on drop. Path-style
+/// helpers (`.path()`, `.join(...)`) match the previous call-site
+/// ergonomics, so the only required change at call sites is "bind
+/// the return value for the test's lifetime".
+#[derive(Debug)]
+pub(crate) struct UniqueTmpDir {
+    inner: TempDir,
+}
+
+impl UniqueTmpDir {
+    #[allow(dead_code)] // not every consumer goes through this accessor
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn join<P: AsRef<Path>>(&self, rel: P) -> PathBuf {
+        self.inner.path().join(rel)
+    }
+}
+
+impl AsRef<Path> for UniqueTmpDir {
+    fn as_ref(&self) -> &Path {
+        self.inner.path()
+    }
+}
+
+// Deref to Path so test sites that called methods like `.display()`,
+// `.to_str()`, or compared paths still compile unchanged. Path methods
+// return borrowed data tied to the TempDir's lifetime, so the safety
+// argument is the same as for `&Path` derived from any owning struct.
+impl std::ops::Deref for UniqueTmpDir {
+    type Target = Path;
+    fn deref(&self) -> &Self::Target {
+        self.inner.path()
+    }
+}
+
+impl PartialEq<PathBuf> for UniqueTmpDir {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.inner.path() == other.as_path()
+    }
+}
+
+impl PartialEq<UniqueTmpDir> for PathBuf {
+    fn eq(&self, other: &UniqueTmpDir) -> bool {
+        self.as_path() == other.inner.path()
+    }
+}
+
+/// Create a fresh scratch directory tagged with `label`. The path
+/// goes under the OS temp root (`tempfile`'s default) and the
+/// directory is removed when the returned value drops.
+pub(crate) fn unique_tmp_dir(label: &str) -> UniqueTmpDir {
+    let inner = tempfile::Builder::new()
+        .prefix(&format!("fluxor-test-{}-", sanitise(label)))
+        .tempdir()
+        .expect("creating unique tmp dir");
+    UniqueTmpDir { inner }
 }
 
 fn sanitise(label: &str) -> String {

@@ -35,7 +35,7 @@
 //! | 0x1000 | 32    | SQ0TDBL                                       |
 //! | +DSTRD | 32    | CQ0HDBL                                       |
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
@@ -87,7 +87,7 @@ const CSTS_CFS:    u32 = 1 << 1;
 const ADMIN_Q_ENTRIES: u32 = 64;
 const SQE_BYTES:       u32 = 64;
 const CQE_BYTES:       u32 = 16;
-const PAGE:            u32 = 4096;
+pub const PAGE:        u32 = 4096;
 
 // Identify Controller field offsets (NVMe 1.4 §5.15.2.1 Figure 249).
 const ID_VID:  usize = 0;    // u16
@@ -110,7 +110,7 @@ const BLOCK_SIZE: u32 = 512;
 
 /// Max NLB per I/O SQE. PRP1 covers one 4 KB page = 8 × 512-byte
 /// LBAs; callers that need more must split (no PRP2 / PRP-list).
-const MAX_NLB: u16 = 8;
+pub const MAX_NLB: u16 = 8;
 
 /// Inbound write-request header on `req_in`: op:u32 | lba:u64 | nlb:u32 |
 /// nsid:u32. Producers (fat32, future block consumers) stage 20 B before
@@ -122,10 +122,10 @@ const REQ_HDR_SIZE: usize = 20;
 /// inflight writes 0x0100..=0x017F on aarch64 / 0x0100..=0x011F on
 /// embedded — see `CID_IO_WRITE_BASE` / `CID_SLOT_BITS`) so
 /// `poll_io_cqe` routines can't mistake them.
-const CID_PAGER_READ:  u16 = 0x0200;
+pub const CID_PAGER_READ:  u16 = 0x0200;
 /// Synchronous single-page pager-write CID. One in-flight at a time;
 /// used by the per-page `PAGER_OP_WRITE` dispatch path.
-const CID_PAGER_WRITE: u16 = 0x0201;
+pub const CID_PAGER_WRITE: u16 = 0x0201;
 
 /// Number of in-flight async bulk-write slots. Each slot owns
 /// `MAX_BULK_PAGES` DMA pages plus a 4 KB PRP-list page. With
@@ -134,7 +134,7 @@ const CID_PAGER_WRITE: u16 = 0x0201;
 /// arena, with headroom for other consumers. Pipelining multiple
 /// bulks at once hides the per-command device latency on drives
 /// whose controller can dispatch multiple commands in parallel.
-const ASYNC_BULK_SLOTS: usize = 8;
+pub const ASYNC_BULK_SLOTS: usize = 8;
 
 /// Total pre-allocated coherent DMA pages: one set of MAX_BULK_PAGES
 /// per async-bulk slot. Layout is flat — slot `i`'s pages live at
@@ -143,9 +143,11 @@ const PAGER_WRITE_SLOTS: usize = ASYNC_BULK_SLOTS * (MAX_BULK_PAGES as usize);
 
 /// Base CID for async bulk writes. CIDs occupy
 /// `CID_BULK_WRITE_BASE..(BASE + ASYNC_BULK_SLOTS)` — currently
-/// 0x0400..=0x0403 — disjoint from every other CID range.
-/// The completion path uses cid - BASE to identify the slot.
-const CID_BULK_WRITE_BASE: u16 = 0x0400;
+/// 0x0400..=0x0407 (8 slots) — disjoint from every other CID
+/// range. The completion path uses `cid - BASE` to identify the
+/// slot. Bumping ASYNC_BULK_SLOTS widens this range; the pairwise-
+/// disjointness invariant is pinned by the harness CID test.
+pub const CID_BULK_WRITE_BASE: u16 = 0x0400;
 
 /// Budget for the pager's synchronous spin-poll (ms). Generous —
 /// the fault handler blocks for this long on slow-media worst case.
@@ -159,19 +161,23 @@ const PAGER_OP_FLUSH: u32 = 0x0003;
 const PAGER_OP_READ_BULK:  u32 = 0x0004;
 const PAGER_OP_WRITE_BULK: u32 = 0x0005;
 
-/// Synchronous bulk-read CID. Reads stay strictly QD=1 — the caller
-/// owns the destination buffer and we copy into it before returning,
-/// so async would require per-slot copy-out scaffolding. Writes use
-/// `CID_BULK_WRITE_BASE` instead and are async (multiple in-flight).
-const CID_PAGER_READ_BULK:  u16 = 0x0300;
+/// Async bulk-read CID base. Reads pipeline like writes: up to
+/// `ASYNC_BULK_SLOTS` in flight, each carrying CID
+/// `CID_PAGER_READ_BULK + slot_idx`. Single-chunk reads still use
+/// slot 0 (CID == CID_PAGER_READ_BULK); multi-chunk reads stripe
+/// across slots so a 1024-page transfer at MAX_BULK_PAGES = 32
+/// pipelines 32 commands instead of executing them serially.
+pub const CID_PAGER_READ_BULK:  u16 = 0x0300;
 
 /// Maximum pages per bulk transfer. Bounded by the count of pre-
-/// allocated coherent DMA buffers (`PAGER_WRITE_SLOTS`) and by the
-/// controller's MDTS. NVMe NLB field caps at 65536 LBAs (≈32 MB at
-/// 4 KB pages) — well above any realistic value. 32 pages = 128 KB =
-/// 256 LBAs per command — comfortably under any drive's MDTS and
-/// big enough for the device's multi-block fast path.
-const MAX_BULK_PAGES: u32 = 32;
+/// allocated DMA buffers (`PAGER_WRITE_SLOTS = ASYNC_BULK_SLOTS *
+/// MAX_BULK_PAGES`), by the 2 MB PCIE1 coherent-DMA arena, and by
+/// the controller's MDTS. 32 pages = 128 KB per command. 8 slots ×
+/// 32 pages = 256 pages = 1 MB DMA footprint — fits the 2 MB arena
+/// with room for the per-slot PRP-list pages and the smaller sync
+/// buffers. NVMe NLB field caps at 65536 LBAs (≈32 MB at 4 KB
+/// pages) — well above any realistic value.
+pub const MAX_BULK_PAGES: u32 = 32;
 
 /// Generic backing-provider registration syscall.
 const BACKING_PROVIDER_ENABLE: u32 = 0x0CED;
@@ -244,14 +250,14 @@ const CID_READ_LBA0:         u16 = 0x0005;
 // than enough for the MAX_INFLIGHT-bounded pipelined I/O the driver
 // actually submits per queue.
 const IO_QID:                u16 = 1;
-const IO_Q_ENTRIES:          u32 = 64;
+pub const IO_Q_ENTRIES:                    u32 = 64;
 
 /// Maximum I/O queue pairs. Hard cap bounded
 /// by (a) controller's Number of I/O Queues Requested admin feature
 /// result and (b) the CID encoding space `(q_idx << 3) | slot_idx`
 /// with slot_idx∈0..8 leaving 2 bits for q_idx. 4 pairs match the
 /// Pi 5 CM's 4 Cortex-A76 cores.
-const MAX_IO_QUEUES:         usize = 4;
+pub const MAX_IO_QUEUES:                  usize = 4;
 
 /// Maximum write requests per queue the driver keeps in flight at
 /// once. Each in-flight slot owns a 4 KB DMA buffer, so this caps
@@ -267,19 +273,19 @@ const MAX_IO_QUEUES:         usize = 4;
 /// **rp2350 / rp2040 / wasm32** — 8 (`128 KB` DMA, original budget).
 /// CID layout stays at `(q << 3) | slot` for ABI compatibility.
 #[cfg(target_arch = "aarch64")]
-const MAX_INFLIGHT:          usize = 32;
+pub const MAX_INFLIGHT:                    usize = 32;
 #[cfg(not(target_arch = "aarch64"))]
-const MAX_INFLIGHT:          usize = 8;
+pub const MAX_INFLIGHT:                    usize = 8;
 
 /// Slot-bits shift in the write-CID encoding. Caller-supplied so the
 /// queue-id occupies the high bits and the slot-id the low bits. Tied
 /// to `MAX_INFLIGHT` — keep the two in sync.
 #[cfg(target_arch = "aarch64")]
-const CID_SLOT_BITS:         u32 = 5;
+pub const CID_SLOT_BITS:                  u32 = 5;
 #[cfg(not(target_arch = "aarch64"))]
-const CID_SLOT_BITS:         u32 = 3;
+pub const CID_SLOT_BITS:                  u32 = 3;
 
-const CID_SLOT_MASK:         u16 = (1 << CID_SLOT_BITS) - 1;
+pub const CID_SLOT_MASK:                  u16 = (1 << CID_SLOT_BITS) - 1;
 
 /// Base CID for pipelined write SQEs. With multi-queue, the CID is
 /// `CID_IO_WRITE_BASE | (q_idx << CID_SLOT_BITS) | slot_idx`:
@@ -288,14 +294,14 @@ const CID_SLOT_MASK:         u16 = (1 << CID_SLOT_BITS) - 1;
 /// On aarch64 (slot_bits=5, 4 queues): 0x0100..=0x017F (128 CIDs).
 /// On embedded (slot_bits=3, 4 queues): 0x0100..=0x011F (32 CIDs).
 /// Both ranges stay disjoint from admin CIDs 0x0001..=0x000F.
-const CID_IO_WRITE_BASE:     u16 = 0x0100;
+pub const CID_IO_WRITE_BASE:          u16 = 0x0100;
 
 /// Sentinel for `poll_io_cqe(_, CID_NONE)` — harvest-only mode.
 /// Tells the poller to drain any ready write-pipeline CQEs but not
 /// consume anything else. 0xFFFF is outside every live CID range
 /// (admin 0x0001..=0x003F, IO writes 0x0100..=0x011F), so it can
 /// never match a real completion.
-const CID_NONE: u16 = 0xFFFF;
+pub const CID_NONE: u16 = 0xFFFF;
 
 // Identify Namespace response (NVMe 1.4 §5.15.2.2 Figure 246).
 const INS_NSZE:              usize = 0;     // u64
@@ -501,6 +507,23 @@ struct NvmeState {
     bulk_tail:           u8,
     bulk_count:          u8,
     bulk_depth_peak:     u8,
+    /// Peak in-flight depth observed inside `pager_read_pipelined`.
+    /// Mirrors `bulk_depth_peak` but for the async-bulk-READ side
+    /// so the heartbeat can tell us whether reads are actually
+    /// pipelining (`rd >= 2` ⇒ multiple commands in flight, `rd=1`
+    /// ⇒ effectively QD=1 even with a multi-slot caller).
+    read_depth_peak:     u8,
+    _pad_rdp:            [u8; 7],
+    /// Per-section microsecond accumulators for the pipelined-read
+    /// hot path. Heartbeat emits `[nvme] rperf calls=N sub=AVG
+    /// poll=AVG copy=AVG total=AVG` so a drop into Linux-style
+    /// throughput can pinpoint whether SQE submit, CQE poll, or
+    /// the post-CQE memcpy is dominating.
+    read_call_count:     u64,
+    read_submit_us:      u64,
+    read_poll_us:        u64,
+    read_copy_us:        u64,
+    read_total_us:       u64,
     /// Latched on async-bulk CQE failure so the next FLUSH (or
     /// next bulk submit) can surface the error to the caller. The
     /// original async submit has already returned 0 by the time the
@@ -660,7 +683,16 @@ unsafe fn write_sqe(sq_base: u64, slot: u32, cdw: [u32; 16]) {
         write_volatile(sqe.add(i), cdw[i]);
         i += 1;
     }
-    core::arch::asm!("dmb sy", options(nostack));
+    // DSB SY: stronger than DMB SY — the SQE write AND every prior
+    // memory write (PRP1 patch, PRP-list page) must complete to the
+    // point of coherency before the next instruction. The caller's
+    // following `reg_w32(doorbell)` is a Device-nGnRnE write that
+    // is NOT buffered on ARM64; without DSB, the SQE writes could
+    // still be in PCIe write buffers when the doorbell rings,
+    // letting the controller race ahead and fetch a partial SQE /
+    // stale PRP-list. Cross-queue async-bulk reads on bcm2712
+    // PCIe1 silently dropped ~75% of pages under the weaker DMB.
+    core::arch::asm!("dsb sy", options(nostack));
 }
 
 /// Build an admin-queue SQE for a PRP1-only command and ring the admin
@@ -812,7 +844,57 @@ unsafe fn heartbeat(s: &mut NvmeState) {
     pos += bd.len();
     write_dec3(p, &mut pos, s.bulk_depth_peak as u32);
 
+    // `rd` = peak in-flight depth observed inside the async-bulk
+    // READ path. A baseline `rd=001` even with a multi-slot caller
+    // means the read pipeline is collapsing to QD=1 somewhere
+    // (controller scheduling, single-thread spin-poll, …).
+    let rd = b" rd=";
+    core::ptr::copy_nonoverlapping(rd.as_ptr(), p.add(pos), rd.len());
+    pos += rd.len();
+    write_dec3(p, &mut pos, s.read_depth_peak as u32);
+
     dev_log(&*s.syscalls, 3, p, pos);
+
+    // Read-path latency breakdown: per-call averages of submit /
+    // CQE-poll-wait / DMA-memcpy / total time. Reveals which stage
+    // dominates the 6x gap vs Linux at QD=1.
+    if s.state == S_READY && s.read_call_count > 0 {
+        let n = s.read_call_count;
+        let mut rb = [0u8; 128];
+        let rp = rb.as_mut_ptr();
+        let prefix = b"[nvme] rperf calls=";
+        core::ptr::copy_nonoverlapping(prefix.as_ptr(), rp, prefix.len());
+        let mut rpos = prefix.len();
+        // 4-digit decimal helper inline (calls can climb past 1000).
+        fn write_dec_u32(out: *mut u8, pos: &mut usize, mut v: u32) {
+            if v == 0 { unsafe { *out.add(*pos) = b'0'; } *pos += 1; return; }
+            let mut d = [0u8; 10]; let mut n = 0usize;
+            while v > 0 { d[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+            while n > 0 { n -= 1; unsafe { *out.add(*pos) = d[n]; } *pos += 1; }
+        }
+        write_dec_u32(rp, &mut rpos, n as u32);
+        let sub_avg = (s.read_submit_us / n) as u32;
+        let poll_avg = (s.read_poll_us / n) as u32;
+        let copy_avg = (s.read_copy_us / n) as u32;
+        let total_avg = (s.read_total_us / n) as u32;
+        let tag = b" sub_us=";
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
+        rpos += tag.len();
+        write_dec_u32(rp, &mut rpos, sub_avg);
+        let tag = b" poll_us=";
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
+        rpos += tag.len();
+        write_dec_u32(rp, &mut rpos, poll_avg);
+        let tag = b" copy_us=";
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
+        rpos += tag.len();
+        write_dec_u32(rp, &mut rpos, copy_avg);
+        let tag = b" total_us=";
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), rp.add(rpos), tag.len());
+        rpos += tag.len();
+        write_dec_u32(rp, &mut rpos, total_avg);
+        dev_log(&*s.syscalls, 3, rp, rpos);
+    }
 
     // Re-emit the identification / capability / namespace lines once
     // per heartbeat while we're READY. These are printed once at boot
@@ -1398,8 +1480,47 @@ unsafe fn submit_io_write(
 
 /// Clamp a caller-supplied NLB to the driver's single-PRP1 limit.
 #[inline(always)]
-fn clamp_nlb(nlb: u16) -> u16 {
+pub fn clamp_nlb(nlb: u16) -> u16 {
     if nlb == 0 { 1 } else if nlb > MAX_NLB { MAX_NLB } else { nlb }
+}
+
+/// Driver-facing limits, CID-encoding helpers, and the DMA slot
+/// addressing function — exposed *only* under `feature = "host-test"`
+/// for the harness at `tests/harness/tests/nvme_driver.rs`. The
+/// bare-metal cdylib build never enables this feature, so no
+/// host-test surface lands in the shipped module. (The harness
+/// itself is intentionally untracked — `tests/` is gitignored —
+/// so this gate keeps the staged source free of pub items whose
+/// only consumer would not be in the commit.)
+#[cfg(feature = "host-test")]
+pub mod limits {
+    pub use super::{
+        MAX_NLB,
+        MAX_IO_QUEUES,
+        MAX_INFLIGHT,
+        ASYNC_BULK_SLOTS,
+        MAX_BULK_PAGES,
+        IO_Q_ENTRIES,
+        PAGE,
+        CID_NONE,
+        CID_IO_WRITE_BASE,
+        CID_PAGER_READ,
+        CID_PAGER_WRITE,
+        CID_PAGER_READ_BULK,
+        CID_BULK_WRITE_BASE,
+        CID_SLOT_BITS,
+        CID_SLOT_MASK,
+    };
+    pub use super::{
+        clamp_nlb,
+        encode_write_cid,
+        write_cid_queue,
+        write_cid_slot,
+        is_write_cid,
+        is_bulk_write_cid,
+        is_bulk_read_cid,
+        slot_page_addr,
+    };
 }
 
 /// One-shot read of LBA 0 via the I/O queue; log boot-sector signature
@@ -1530,19 +1651,31 @@ unsafe fn consume_io_cqe(s: &mut NvmeState, q: usize) {
 /// `CID_IO_WRITE_BASE | (q_idx << CID_SLOT_BITS) | slot_idx` —
 /// q_idx occupies bits above slot.
 #[inline(always)]
-fn write_cid_queue(cid: u16) -> usize {
+pub fn write_cid_queue(cid: u16) -> usize {
     ((cid - CID_IO_WRITE_BASE) >> CID_SLOT_BITS) as usize
 }
 
 #[inline(always)]
-fn write_cid_slot(cid: u16) -> usize {
+pub fn write_cid_slot(cid: u16) -> usize {
     ((cid - CID_IO_WRITE_BASE) & CID_SLOT_MASK) as usize
 }
 
 #[inline(always)]
-fn is_write_cid(cid: u16) -> bool {
+pub fn is_write_cid(cid: u16) -> bool {
     cid >= CID_IO_WRITE_BASE
         && cid < CID_IO_WRITE_BASE + (MAX_IO_QUEUES * MAX_INFLIGHT) as u16
+}
+
+/// Encode a (queue, slot) pair into a write CID. Inverse of
+/// `write_cid_queue` / `write_cid_slot`. The PIC driver inlines
+/// this expression at submit sites; the helper exists so host
+/// tests can round-trip the encoding without re-deriving the
+/// formula in the test fixture.
+#[inline(always)]
+pub fn encode_write_cid(queue: usize, slot: usize) -> u16 {
+    CID_IO_WRITE_BASE
+        | ((queue as u16) << CID_SLOT_BITS)
+        | (slot as u16 & CID_SLOT_MASK)
 }
 
 /// Total writes currently outstanding across all queues.
@@ -2113,17 +2246,20 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
 
 unsafe fn step_ready(s: &mut NvmeState) -> i32 {
     log_once(s, b"[nvme] Ready\0");
-    if s.returned_ready == 0 {
-        s.returned_ready = 1;
-        return 3; // signal scheduler we've reached the steady state
-    }
 
-    // One-shot: register as the paged-arena backing-store provider so
-    // the kernel pager can drive synchronous page reads/writes via
-    // `backing_provider_dispatch`. A configuration without any
-    // `BackingType::External` arena never triggers the dispatch, so
-    // this registration is free on the hot path. The kernel resolves
-    // the FNV-1a hash to the function address in our module image.
+    // Register the paged-arena backing-store provider BEFORE the first
+    // `Ready` (3) signal so consumers gated on `module_deferred_ready`
+    // see a fully-armed dispatcher on their first step. Without this
+    // ordering, a `BackingType::External` arena registered downstream
+    // hits `backing_provider::ready() == false` for one or more ticks
+    // and returns ENODEV — surfacing as `err=19` in the consumer's
+    // heartbeat and inflating any wall-clock perf measurement that
+    // anchors its start before the retry succeeds.
+    //
+    // A configuration without any `BackingType::External` arena never
+    // triggers the dispatch, so this registration is free on the hot
+    // path. The kernel resolves the FNV-1a hash to the function
+    // address in our module image.
     if s.pager_registered == 0 {
         let sys = &*s.syscalls;
         let mut arg = BACKING_PROVIDER_DISPATCH_HASH.to_le_bytes();
@@ -2149,21 +2285,37 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
         // - `pager_buf`            : single-page sync pager scratch
         // - `sync_blk_buf`         : single-page sync block-read scratch
         //                            for fat32's FS dispatch
-        // - `pager_write_bufs[..]` : ASYNC_BULK_SLOTS × MAX_BULK_PAGES
-        //                            per-slot DMA pages (= PAGER_WRITE_SLOTS)
+        // - `pager_write_bufs[..]` : ASYNC_BULK_SLOTS slots × one
+        //                            contiguous MAX_BULK_PAGES * PAGE
+        //                            DMA region per slot; per-page
+        //                            addresses derived from the slot
+        //                            base so the bulk memcpy is sound.
         // - `bulk_prp_list_bufs[]` : one PRP-list page per async slot
-        let _ = pager_ensure_buf(s);
-        let _ = sync_blk_ensure_buf(s);
-        let mut i: u32 = 0;
-        while (i as usize) < PAGER_WRITE_SLOTS {
-            let _ = pager_ensure_write_buf(s, i as usize);
-            i += 1;
-        }
+    }
+
+    // Gate `Ready` on registration + DMA allocations. The original
+    // ordering swallowed both failures and still returned Ready 3,
+    // letting consumers observe a half-armed driver: a downstream
+    // `BackingType::External` arena would dispatch into us and find
+    // either no provider or unallocated slot buffers. Now: any
+    // failure here returns 0, leaving the module below Ready until
+    // the next tick retries (lazy alloc helpers are idempotent on
+    // success).
+    if s.pager_registered == 0 { return 0; }
+    if !pager_ensure_buf(s) { return 0; }
+    if !sync_blk_ensure_buf(s) { return 0; }
+    {
         let mut s_idx: usize = 0;
         while s_idx < ASYNC_BULK_SLOTS {
-            let _ = pager_ensure_prp_list(s, s_idx);
+            if !pager_ensure_slot_bufs(s, s_idx) { return 0; }
+            if !pager_ensure_prp_list(s, s_idx) { return 0; }
             s_idx += 1;
         }
+    }
+
+    if s.returned_ready == 0 {
+        s.returned_ready = 1;
+        return 3; // signal scheduler we've reached the steady state
     }
 
     // One-shot PCIe capability walk for observability — the heartbeat
@@ -2513,9 +2665,19 @@ unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
 
 /// True iff `cid` belongs to the async bulk-write CID range.
 #[inline(always)]
-fn is_bulk_write_cid(cid: u16) -> bool {
+pub fn is_bulk_write_cid(cid: u16) -> bool {
     cid >= CID_BULK_WRITE_BASE
         && cid < CID_BULK_WRITE_BASE + (ASYNC_BULK_SLOTS as u16)
+}
+
+/// True iff `cid` belongs to the async bulk-read CID range
+/// (`CID_PAGER_READ_BULK..CID_PAGER_READ_BULK + ASYNC_BULK_SLOTS`).
+/// Pipelined reads use one CID per in-flight slot, mirroring the
+/// write-side encoding.
+#[inline(always)]
+pub fn is_bulk_read_cid(cid: u16) -> bool {
+    cid >= CID_PAGER_READ_BULK
+        && cid < CID_PAGER_READ_BULK + (ASYNC_BULK_SLOTS as u16)
 }
 
 /// Acquire the next free async bulk-write slot. If the ring is full,
@@ -2605,16 +2767,50 @@ unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
     err
 }
 
-/// Ensure the ring slot at index `idx` has its 4 KB coherent DMA
-/// buffer allocated. Lazy so a graph that never writes pays no
-/// arena cost.
-unsafe fn pager_ensure_write_buf(s: &mut NvmeState, idx: usize) -> bool {
-    if idx >= PAGER_WRITE_SLOTS { return false; }
-    if s.pager_write_bufs[idx] != 0 { return true; }
-    let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
+/// Ensure the async-bulk slot at index `slot` has its
+/// `MAX_BULK_PAGES * PAGE` contiguous DMA region allocated, and seed
+/// `pager_write_bufs[base..base+MAX_BULK_PAGES]` with the per-page
+/// addresses carved from that single region. Lazy so a graph that
+/// never writes pays no arena cost.
+///
+/// Per-page allocations were not safe to bulk-memcpy across: the DMA
+/// arena allocator only guarantees each individual allocation is
+/// physically contiguous, not that two separate calls produce
+/// adjacent addresses (any other consumer can interleave). The
+/// `pager_read_pipelined` post-CQE memcpy and `handle_pager_bulk`'s
+/// write-stage memcpy both copy `count * PAGE_BYTES` from
+/// `pager_write_bufs[base]`, which only works if all of a slot's
+/// pages live in one contiguous run — enforced here by allocating
+/// the whole slot at once.
+///
+/// Coherent (Non-Cacheable Normal) arena — the device DMAs to and
+/// from these pages without CPU cache snooping; reads use the
+/// NEON-paired memcpy (`nc_to_c_memcpy_aligned`) to extract
+/// throughput from the Non-Cacheable bus on Cortex-A76.
+unsafe fn pager_ensure_slot_bufs(s: &mut NvmeState, slot: usize) -> bool {
+    if slot >= ASYNC_BULK_SLOTS { return false; }
+    let base = slot * (MAX_BULK_PAGES as usize);
+    if s.pager_write_bufs[base] != 0 { return true; }
+    let bytes = MAX_BULK_PAGES * PAGE;
+    let p = dev_dma_alloc(&*s.syscalls, bytes, PAGE);
     if p == 0 { return false; }
-    s.pager_write_bufs[idx] = p;
+    let mut i: usize = 0;
+    while i < (MAX_BULK_PAGES as usize) {
+        s.pager_write_bufs[base + i] = slot_page_addr(p, i);
+        i += 1;
+    }
     true
+}
+
+/// Per-page DMA address inside a slot's contiguous DMA region.
+/// `slot_base` is the address returned by `dev_dma_alloc(MAX_BULK_PAGES
+/// * PAGE, PAGE)`; the bulk memcpy that follows assumes the resulting
+/// per-page addresses are PAGE-strided, which is what this function
+/// guarantees. Exposed so the harness can pin the contiguity invariant
+/// without instantiating a full driver state.
+#[inline(always)]
+pub fn slot_page_addr(slot_base: u64, page_idx: usize) -> u64 {
+    slot_base + (page_idx as u64) * (PAGE as u64)
 }
 
 /// Ensure `pager_buf` has a 4 KB DMA page allocated. Uses the
@@ -2724,11 +2920,12 @@ unsafe fn submit_bulk_op(
     cid: u16,
     slot: usize,
 ) -> i32 {
-    // Stripe submissions across I/O queues so successive async-bulk
-    // writes hit different controller-side schedulers. Reads always
-    // use queue 0 — the read path is sync and doesn't benefit from
-    // queue-level fan-out.
-    let pager_q: usize = if is_write && s.io_q_count > 0 {
+    // Stripe both reads and writes across I/O queues. Cross-queue
+    // reads were unstable until SQE+PRP visibility was tightened
+    // with a DSB before each doorbell (see `write_sqe`); striping
+    // them now gives the same depth-across-queues win that writes
+    // already enjoy.
+    let pager_q: usize = if s.io_q_count > 0 {
         slot % (s.io_q_count as usize)
     } else {
         0
@@ -2811,22 +3008,18 @@ unsafe fn handle_pager_bulk(
             Err(e) => return e,
         };
         if !pager_ensure_prp_list(s, slot) { return E_INVAL; }
+        if !pager_ensure_slot_bufs(s, slot) { return E_INVAL; }
         let base = slot * (MAX_BULK_PAGES as usize);
-        let mut i: u32 = 0;
-        while i < count {
-            if !pager_ensure_write_buf(s, base + i as usize) { return E_INVAL; }
-            i += 1;
-        }
         // Stage every page from caller's buffer into the slot's DMA
-        // pages. Once the memcpy returns, the caller is free to reuse
-        // its source buffer — the device DMA reads from our staging.
-        let mut p: u32 = 0;
-        while p < count {
-            let src = user_buf.add((p as usize) * (PAGE_BYTES as usize)) as *const u8;
-            let dst = s.pager_write_bufs[base + p as usize] as *mut u8;
-            core::ptr::copy_nonoverlapping(src, dst, PAGE_BYTES as usize);
-            p += 1;
-        }
+        // region. DMA pages are coherent so no flush needed before
+        // the device-bound submit. The slot's MAX_BULK_PAGES pages
+        // are carved from one `dev_dma_alloc` and therefore physically
+        // contiguous, so one bulk memcpy covers the full chunk span.
+        core::ptr::copy_nonoverlapping(
+            user_buf as *const u8,
+            s.pager_write_bufs[base] as *mut u8,
+            (count as usize) * (PAGE_BYTES as usize),
+        );
         let cid = CID_BULK_WRITE_BASE + (slot as u16);
         let rc = submit_bulk_op(s, true, lba, count, cid, slot);
         if rc != 0 { return rc; }
@@ -2850,27 +3043,282 @@ unsafe fn handle_pager_bulk(
     if drain_rc != 0 { return drain_rc; }
     let slot: usize = 0;
     if !pager_ensure_prp_list(s, slot) { return E_INVAL; }
+    if !pager_ensure_slot_bufs(s, slot) { return E_INVAL; }
     let base = slot * (MAX_BULK_PAGES as usize);
-    let mut i: u32 = 0;
-    while i < count {
-        if !pager_ensure_write_buf(s, base + i as usize) { return E_INVAL; }
-        i += 1;
-    }
     let rc = submit_bulk_op(s, false, lba, count, CID_PAGER_READ_BULK, slot);
     if rc != 0 { return rc; }
     let pr = pager_spin_poll_cqe(s, CID_PAGER_READ_BULK);
     if pr != 0 { return pr; }
-    let mut p: u32 = 0;
-    while p < count {
-        let src = s.pager_write_bufs[base + p as usize] as *const u8;
-        let dst = user_buf.add((p as usize) * (PAGE_BYTES as usize));
-        core::ptr::copy_nonoverlapping(src, dst, PAGE_BYTES as usize);
-        p += 1;
-    }
+    // DMA pages are coherent and physically contiguous. Use the
+    // NEON-paired memcpy: see `nc_to_c_memcpy_aligned` — copying
+    // from Non-Cacheable memory with 128-bit register pairs keeps
+    // the LSU's outstanding-load queue saturated and avoids the
+    // ~67 MB/s ceiling of the default 8-byte-load lowering.
+    nc_to_c_memcpy_aligned(
+        user_buf,
+        s.pager_write_bufs[base] as *const u8,
+        (count as usize) * (PAGE_BYTES as usize),
+    );
     0
 }
 
-#[unsafe(no_mangle)]
+/// Per-in-flight slot state for `pager_read_pipelined`. `chunk == 0`
+/// marks the slot free. `user_page_offset` is the page index in the
+/// caller's destination buffer where the slot's DMA pages will land
+/// once the CQE retires.
+#[derive(Clone, Copy)]
+struct ReadSlot {
+    user_page_offset: u32,
+    chunk: u16,
+}
+
+/// Optimized memcpy for the Non-Cacheable DMA arena → cacheable user
+/// buffer path. The default `core::ptr::copy_nonoverlapping` lowers to
+/// an inline loop with 8-byte general-register loads, which serialises
+/// at ~67 MB/s against the Non-Cacheable bus on bcm2712. The NEON
+/// 128-bit `ldp q,q`/`stp q,q` form gives the LSU enough outstanding
+/// loads (4 pairs × 32 B = 128 B per iteration) to keep the AXI read
+/// pipeline saturated even without burst-merging.
+///
+/// Caller guarantees `len` is a multiple of 128 and both pointers are
+/// 16-byte aligned (4 KB DMA page is both). Returns early without
+/// touching the tail if `len == 0`.
+#[inline(always)]
+unsafe fn nc_to_c_memcpy_aligned(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 { return; }
+    debug_assert!(len % 128 == 0);
+    debug_assert!((src as usize) % 16 == 0);
+    debug_assert!((dst as usize) % 16 == 0);
+    let iters = len / 128;
+    core::arch::asm!(
+        "1:",
+        "ldp q0, q1, [{s}, #0]",
+        "ldp q2, q3, [{s}, #32]",
+        "ldp q4, q5, [{s}, #64]",
+        "ldp q6, q7, [{s}, #96]",
+        "stp q0, q1, [{d}, #0]",
+        "stp q2, q3, [{d}, #32]",
+        "stp q4, q5, [{d}, #64]",
+        "stp q6, q7, [{d}, #96]",
+        "add {s}, {s}, #128",
+        "add {d}, {d}, #128",
+        "subs {n}, {n}, #1",
+        "b.ne 1b",
+        s = inout(reg) src => _,
+        d = inout(reg) dst => _,
+        n = inout(reg) iters => _,
+        out("q0") _, out("q1") _, out("q2") _, out("q3") _,
+        out("q4") _, out("q5") _, out("q6") _, out("q7") _,
+        options(nostack),
+    );
+}
+
+/// Pipelined bulk read across `MAX_IO_QUEUES` and `ASYNC_BULK_SLOTS`.
+/// Submits up to `ASYNC_BULK_SLOTS` MAX_BULK_PAGES-sized read
+/// commands at once (one per slot, slot index picks the queue via
+/// `submit_bulk_op`'s `slot % io_q_count` rule), then refills each
+/// slot as its CQE retires. Throughput approaches the PCIe link
+/// rather than the per-command sync latency a serial reader would
+/// see.
+///
+/// Each slot's CID is `CID_PAGER_READ_BULK + slot_idx`, and stays
+/// distinct from the write-side `CID_BULK_WRITE_BASE..` range, so
+/// the CQE-drain loop can route absorbed writes (from a prior async
+/// pipeline) into the write ring without confusing them with reads.
+///
+/// Writes are drained before the first submission so the device
+/// sees a coherent snapshot for the entire read window — same
+/// post-write barrier the legacy single-command path enforces.
+unsafe fn pager_read_pipelined(
+    s: &mut NvmeState,
+    arena_base_page: u32,
+    vpage_start: u32,
+    count: u32,
+    user_buf: *mut u8,
+) -> i32 {
+    if count == 0 { return E_INVAL; }
+    if user_buf.is_null() { return E_INVAL; }
+
+    let t_enter = dev_micros(&*s.syscalls);
+    let drain_rc = bulk_drain_writes(s);
+    if drain_rc != 0 { return drain_rc; }
+    let t_submit_start = dev_micros(&*s.syscalls);
+    let mut copy_us_local: u64 = 0;
+
+    let mut slots: [ReadSlot; ASYNC_BULK_SLOTS] = [
+        ReadSlot { user_page_offset: 0, chunk: 0 };
+        ASYNC_BULK_SLOTS
+    ];
+
+    let base_lba = NVME_ARENA_LBA_BASE
+        + ((arena_base_page as u64) + (vpage_start as u64)) * (PAGE_LBAS as u64);
+
+    let mut submitted_pages: u32 = 0;
+    let mut completed_pages: u32 = 0;
+    let mut in_flight: u32 = 0;
+
+    // Prime the pipeline.
+    let mut slot_idx: usize = 0;
+    while slot_idx < ASYNC_BULK_SLOTS && submitted_pages < count {
+        let chunk = (count - submitted_pages).min(MAX_BULK_PAGES);
+        if !pager_ensure_prp_list(s, slot_idx) { return E_INVAL; }
+        if !pager_ensure_slot_bufs(s, slot_idx) { return E_INVAL; }
+        let cid = CID_PAGER_READ_BULK + (slot_idx as u16);
+        let lba = base_lba + (submitted_pages as u64) * (PAGE_LBAS as u64);
+        let rc = submit_bulk_op(s, false, lba, chunk, cid, slot_idx);
+        if rc != 0 { return rc; }
+        *slots.as_mut_ptr().add(slot_idx) = ReadSlot {
+            user_page_offset: submitted_pages,
+            chunk: chunk as u16,
+        };
+        submitted_pages += chunk;
+        in_flight += 1;
+        if in_flight as u8 > s.read_depth_peak {
+            s.read_depth_peak = in_flight as u8;
+        }
+        slot_idx += 1;
+    }
+
+    let t_poll_start = dev_micros(&*s.syscalls);
+
+    // Pump completions in arrival order; refill any slot that still
+    // has work to do.
+    let start = now_ms(s);
+    while completed_pages < count {
+        let mut made_progress = false;
+        let n = s.io_q_count as usize;
+        for q in 0..n {
+            while let Some((cid, sc)) = peek_io_cqe(s, q) {
+                consume_io_cqe(s, q);
+                made_progress = true;
+
+                if is_bulk_read_cid(cid) {
+                    let slot = (cid - CID_PAGER_READ_BULK) as usize;
+                    if slot >= ASYNC_BULK_SLOTS {
+                        return E_INVAL;
+                    }
+                    if sc != 0 {
+                        return E_INVAL;
+                    }
+                    let info = *slots.as_ptr().add(slot);
+                    if info.chunk == 0 {
+                        // CQE for a slot we don't think is in flight —
+                        // shouldn't happen; surface as a fault rather
+                        // than silently mis-copy.
+                        return E_INVAL;
+                    }
+                    let chunk = info.chunk as u32;
+                    let base = slot * (MAX_BULK_PAGES as usize);
+                    // DMA pages are coherent (Non-Cacheable Normal)
+                    // and physically contiguous. Use the NEON-paired
+                    // memcpy: the default `copy_nonoverlapping` lowers
+                    // to 8-byte general-register loads (~67 MB/s on
+                    // the bcm2712 Non-Cacheable bus), while four
+                    // pairs of 128-bit `ldp q,q` per iteration keep
+                    // enough outstanding loads in flight to saturate
+                    // the AXI read pipeline.
+                    let t_copy_start = dev_micros(&*s.syscalls);
+                    let src = s.pager_write_bufs[base] as *const u8;
+                    let dst = user_buf.add(
+                        (info.user_page_offset as usize) * (PAGE_BYTES as usize),
+                    );
+                    nc_to_c_memcpy_aligned(
+                        dst,
+                        src,
+                        (chunk as usize) * (PAGE_BYTES as usize),
+                    );
+                    copy_us_local += dev_micros(&*s.syscalls).saturating_sub(t_copy_start);
+                    completed_pages += chunk;
+                    in_flight -= 1;
+                    // Refill this slot if more pages remain.
+                    if submitted_pages < count {
+                        let next_chunk = (count - submitted_pages).min(MAX_BULK_PAGES);
+                        // Slot's contiguous DMA region was allocated
+                        // on the prime pass; `pager_ensure_slot_bufs`
+                        // here is a fast-path no-op.
+                        if !pager_ensure_slot_bufs(s, slot) {
+                            return E_INVAL;
+                        }
+                        let next_cid = CID_PAGER_READ_BULK + (slot as u16);
+                        let next_lba = base_lba
+                            + (submitted_pages as u64) * (PAGE_LBAS as u64);
+                        let rc = submit_bulk_op(s, false, next_lba, next_chunk, next_cid, slot);
+                        if rc != 0 { return rc; }
+                        *slots.as_mut_ptr().add(slot) = ReadSlot {
+                            user_page_offset: submitted_pages,
+                            chunk: next_chunk as u16,
+                        };
+                        submitted_pages += next_chunk;
+                        in_flight += 1;
+                        if in_flight as u8 > s.read_depth_peak {
+                            s.read_depth_peak = in_flight as u8;
+                        }
+                    } else {
+                        *slots.as_mut_ptr().add(slot) = ReadSlot {
+                            user_page_offset: 0,
+                            chunk: 0,
+                        };
+                    }
+                    continue;
+                }
+
+                if is_bulk_write_cid(cid) {
+                    // Stale write CQE absorbed (drain-before-read
+                    // should have already retired these — log and
+                    // continue rather than wedge).
+                    if s.bulk_count > 0 {
+                        s.bulk_count -= 1;
+                        s.bulk_head =
+                            (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
+                    }
+                    if sc != 0 && s.bulk_err == 0 {
+                        s.bulk_err = E_INVAL;
+                    }
+                    continue;
+                }
+
+                if is_write_cid(cid) {
+                    let cnt = *s.inflight_count.as_ptr().add(q);
+                    if cnt > 0 {
+                        let head = *s.inflight_head.as_ptr().add(q) as usize;
+                        let new_head = (head + 1) % MAX_INFLIGHT;
+                        *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
+                        *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
+                    }
+                    continue;
+                }
+
+                // Stray CID — log and keep pumping.
+                dev_log(&*s.syscalls, 2, b"[nvme] pager read: stray cqe\0".as_ptr(), 28);
+            }
+        }
+        if !made_progress {
+            if in_flight == 0 {
+                // Nothing in flight but completion is not yet count —
+                // hit only if submit failed before reaching count, which
+                // would have returned above. Belt-and-braces guard.
+                return E_INVAL;
+            }
+            if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
+                return E_AGAIN;
+            }
+        }
+    }
+    let t_exit = dev_micros(&*s.syscalls);
+    s.read_call_count = s.read_call_count.wrapping_add(1);
+    s.read_submit_us = s.read_submit_us
+        .wrapping_add(t_poll_start.saturating_sub(t_submit_start));
+    // Poll = from end-of-submit to end-of-call MINUS the time the
+    // memcpy used. Captures CQE-wait time minus copy time.
+    s.read_poll_us = s.read_poll_us
+        .wrapping_add(t_exit.saturating_sub(t_poll_start).saturating_sub(copy_us_local));
+    s.read_copy_us = s.read_copy_us.wrapping_add(copy_us_local);
+    s.read_total_us = s.read_total_us
+        .wrapping_add(t_exit.saturating_sub(t_enter));
+    0
+}
+
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.backing_provider_dispatch"]
 pub unsafe extern "C" fn backing_provider_dispatch(
     state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usize,
@@ -2916,16 +3364,27 @@ pub unsafe extern "C" fn backing_provider_dispatch(
             *arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23),
         ]) as *mut u8;
         if buf_ptr.is_null() { return E_INVAL; }
-        // Drive in MAX_BULK_PAGES-sized batches so callers can pass
-        // any contiguous count without us needing to allocate per-
-        // batch state. Each batch is one NVMe command.
+        if opcode == PAGER_OP_READ_BULK {
+            // Pipelined read: submits up to ASYNC_BULK_SLOTS
+            // MAX_BULK_PAGES-sized commands across all I/O queues,
+            // pumps completions out-of-order, and memcpy-s each
+            // slot's DMA pages into the caller's buffer as they
+            // retire. Throughput tracks the link rather than the
+            // per-command sync latency a serial reader would see.
+            return pager_read_pipelined(s, arena_base_page, vpage_start, count, buf_ptr);
+        }
+        // Writes still go through the per-chunk path: each call
+        // submits one async-bulk command into the slot ring and
+        // returns immediately. The next call drains an in-flight
+        // slot if the ring is full, so the kernel pager's outer loop
+        // implicitly pipelines the entire `count`.
         let mut done: u32 = 0;
         while done < count {
             let chunk = (count - done).min(MAX_BULK_PAGES);
             let user = buf_ptr.add((done as usize) * (PAGE_BYTES as usize));
             let rc = handle_pager_bulk(
                 s,
-                opcode == PAGER_OP_WRITE_BULK,
+                true,
                 arena_base_page,
                 vpage_start + done,
                 chunk,
@@ -3016,21 +3475,21 @@ pub unsafe extern "C" fn backing_provider_dispatch(
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_deferred_ready"]
 pub extern "C" fn module_deferred_ready() -> u32 { 1 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<NvmeState>()
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     _in_chan: i32, out_chan: i32, ctrl_chan: i32,
@@ -3122,7 +3581,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut NvmeState);

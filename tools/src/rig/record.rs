@@ -345,8 +345,11 @@ regex = "kernel\\.img$"
 
     #[test]
     fn bundle_hash_is_stable_across_dir_walk_order() {
-        let tmp = std::env::temp_dir().join(format!("fluxor-rig-bundle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _scratch = tempfile::Builder::new()
+            .prefix("fluxor-rig-bundle-")
+            .tempdir()
+            .unwrap();
+        let tmp = _scratch.path();
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
         std::fs::write(tmp.join("a.bin"), b"aaa").unwrap();
         std::fs::write(tmp.join("sub/b.bin"), b"bbb").unwrap();
@@ -416,8 +419,11 @@ regex = "kernel\\.img$"
 
     #[test]
     fn artifact_file_hash_matches_sha256() {
-        let tmp =
-            std::env::temp_dir().join(format!("fluxor-rig-artifact-{}.bin", std::process::id()));
+        let _scratch = tempfile::Builder::new()
+            .prefix("fluxor-rig-artifact-")
+            .tempdir()
+            .unwrap();
+        let tmp = _scratch.path().join("artifact.bin");
         std::fs::write(&tmp, b"hello").unwrap();
         let h = hash_artifact_file(&tmp).unwrap();
         // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
@@ -425,6 +431,5 @@ regex = "kernel\\.img$"
             h,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
-        let _ = std::fs::remove_file(&tmp);
     }
 }

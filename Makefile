@@ -224,7 +224,7 @@ else
 			newest=$$(find "$$mod_dir" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
 			if [ -f "$$mod_dir/module.ld" ]; then ld_script="$$mod_dir/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
 			if [ -f "$$mod_dir/manifest.toml" ] && grep -q "^hardware_targets" "$$mod_dir/manifest.toml"; then \
-				if ! grep "^hardware_targets" "$$mod_dir/manifest.toml" | grep -q "\"$(TARGET)\""; then \
+				if ! grep "^hardware_targets" "$$mod_dir/manifest.toml" | grep -Eq "\"$(TARGET)\"|\"$(SILICON_ID)\""; then \
 					continue; \
 				fi; \
 			fi; \

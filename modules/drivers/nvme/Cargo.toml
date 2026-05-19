@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "fluxor-mod-nvme"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "NVMe block driver PIC module — host-test build"
+
+# Same additive-only pattern as `modules/foundation/{ip,http,ws_stream}/Cargo.toml`:
+# the bare-metal build invokes `rustc` directly against `mod.rs` and
+# ignores this file. Cargo only sees it during host-test builds where
+# the harness needs the module's CID / ring / NLB helpers as a plain rlib.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+host-test = []
+
+[dependencies]
+fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }
