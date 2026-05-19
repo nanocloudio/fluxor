@@ -32,6 +32,11 @@ else ifeq ($(TARGET),cm5)
   MODULE_LD := modules/module.ld
   MODULE_LINKER := rust-lld -flavor gnu
   SILICON_ID := bcm2712
+  # Cortex-A76 ships the Cryptography Extension (AES + PMULL +
+  # SHA1/SHA2). Gate `target_feature = "aes"` so the inline-asm
+  # AES path in modules/sdk/aes_gcm.rs activates; without it the
+  # AESE/AESMC instructions would SIGILL.
+  MODULE_RUSTFLAGS := -C target-feature=+aes,+sha2,+neon
 else ifeq ($(TARGET),bcm2712)
   RUST_TARGET := aarch64-unknown-none
   CARGO_FEATURES := chip-bcm2712
@@ -39,6 +44,7 @@ else ifeq ($(TARGET),bcm2712)
   MODULE_LD := modules/module.ld
   MODULE_LINKER := rust-lld -flavor gnu
   SILICON_ID := bcm2712
+  MODULE_RUSTFLAGS := -C target-feature=+aes,+sha2,+neon
 else ifeq ($(TARGET),wasm)
   RUST_TARGET := wasm32-unknown-unknown
   CARGO_FEATURES := host-wasm
@@ -229,7 +235,7 @@ else
 				fi; \
 			fi; \
 			if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(SDK_DIR)/runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULE_LD)" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
-				rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
+				rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic $(MODULE_RUSTFLAGS) -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
 				$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
 				mtype=$$(echo "$(call mod_type,$$mod)"); [ -z "$$mtype" ] && mtype=2; \
 				manifest_arg=""; \
@@ -426,6 +432,14 @@ lint: check-no-inline-tests check-no-historical-abi
 test:
 	@echo "==> testing fluxor-tools ..."
 	@cd tools && cargo test --all-targets --all-features
+	@echo "==> testing fluxor-mod-tls crypto KATs ..."
+	@# `fluxor-mod-tls` defaults to `#![no_std]` / `#![no_main]` so
+	@# plain `cargo test -p fluxor-mod-tls` against the aarch64 host
+	@# fails. The `host-test` feature toggles those attributes off;
+	@# we run it here unconditionally so the crypto KAT regression
+	@# gate fires from `make test` and `make check-stable`.
+	@cargo test -p fluxor-mod-tls --features host-test \
+		--target aarch64-unknown-linux-gnu --no-fail-fast
 	@if [ -d tests/harness ]; then \
 		echo "==> testing fluxor-test-harness (sub-workspace) ..." && \
 		cd tests/harness && cargo test --target aarch64-unknown-linux-gnu --no-fail-fast; \

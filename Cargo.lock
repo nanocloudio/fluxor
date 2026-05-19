@@ -1387,6 +1387,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxor-mod-tls"
+version = "0.1.0"
+dependencies = [
+ "fluxor",
+]
+
+[[package]]
 name = "fluxor-mod-ws-stream"
 version = "0.1.0"
 dependencies = [

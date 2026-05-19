@@ -9,10 +9,27 @@
 // Session lookup / allocation
 // ---------------------------------------------------------------------
 
+/// True if a peer slot is reusable — either fresh (Idle) or in
+/// a terminal state we've already given up on (Errored / Closed).
+/// `Handshaking` and `Ready` peers are "live" and must NOT be
+/// overwritten by a new session for a different 4-tuple.
+fn dtls_slot_reusable(phase: DtlsPhase) -> bool {
+    matches!(phase, DtlsPhase::Idle | DtlsPhase::Errored | DtlsPhase::Closed)
+}
+
 fn dtls_find_session(s: &TlsState, ip: &[u8; 4], port: u16) -> i32 {
     let mut i = 0;
     while i < MAX_PEERS {
-        if s.peer_sessions[i].phase != DtlsPhase::Idle
+        // Match only against live peers. Errored / Closed slots are
+        // tombstones — incoming records for that 4-tuple shouldn't
+        // be routed there (the peer either gave up or we tore the
+        // session down). The slot stays bound to the address for
+        // allocator priority (`dtls_alloc_session` below prefers
+        // overwriting the address-matched tombstone before evicting
+        // an unrelated one) but the record-receive path treats it
+        // as if it doesn't exist.
+        let phase = s.peer_sessions[i].phase;
+        if (phase == DtlsPhase::Handshaking || phase == DtlsPhase::Ready)
             && s.peer_sessions[i].peer.matches(ip, port)
         {
             return i as i32;
@@ -23,25 +40,64 @@ fn dtls_find_session(s: &TlsState, ip: &[u8; 4], port: u16) -> i32 {
 }
 
 unsafe fn dtls_alloc_session(s: &mut TlsState, ip: &[u8; 4], port: u16) -> Option<usize> {
+    // Two-pass allocation. First pass prefers reusing the slot
+    // already keyed to this 4-tuple if it's a tombstone — this is
+    // the common case after a handshake timeout where the same
+    // peer retries from the same source port. Second pass takes
+    // any reusable slot.
     let mut i = 0;
     while i < MAX_PEERS {
-        if s.peer_sessions[i].phase == DtlsPhase::Idle {
-            let sess = &mut s.peer_sessions[i];
-            sess.reset();
-            sess.peer.ip = *ip;
-            sess.peer.port = port;
-            sess.phase = DtlsPhase::Handshaking;
-            sess.endpoint.driver.is_server = true;
-            sess.endpoint.driver.hs_state = HandshakeState::RecvClientHello;
-            sess.endpoint.driver.suite = CipherSuite::ChaCha20Poly1305;
-            sess.endpoint.driver.ecdh_private = s.eph_private[i];
-            sess.endpoint.driver.ecdh_public = s.eph_public[i];
-            s.eph_used[i] = true;
-            return Some(i);
+        if dtls_slot_reusable(s.peer_sessions[i].phase)
+            && s.peer_sessions[i].peer.matches(ip, port)
+        {
+            return Some(dtls_init_server_session(s, i, ip, port));
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < MAX_PEERS {
+        if dtls_slot_reusable(s.peer_sessions[i].phase) {
+            return Some(dtls_init_server_session(s, i, ip, port));
         }
         i += 1;
     }
     None
+}
+
+unsafe fn dtls_init_server_session(
+    s: &mut TlsState,
+    i: usize,
+    ip: &[u8; 4],
+    port: u16,
+) -> usize {
+    let sys = &*s.syscalls;
+    {
+        let sess = &mut s.peer_sessions[i];
+        sess.reset();
+        sess.peer.ip = *ip;
+        sess.peer.port = port;
+        sess.phase = DtlsPhase::Handshaking;
+        sess.handshake_start_step = s.step_count;
+        sess.endpoint.driver.is_server = true;
+        sess.endpoint.driver.hs_state = HandshakeState::RecvClientHello;
+        sess.endpoint.driver.suite = CipherSuite::ChaCha20Poly1305;
+    }
+    // Fresh ECDH key per session (forward secrecy). Same helper
+    // and same CSPRNG-failure → pool-fallback policy as TCP-TLS
+    // (see `assign_fresh_ecdh_key`). On total failure, mark the
+    // slot Errored so the allocator's tombstone-reuse path picks
+    // it up rather than handing back a session with a zero key.
+    let ok = assign_fresh_ecdh_key(
+        sys,
+        &mut s.peer_sessions[i].endpoint.driver,
+        &s.eph_private,
+        &s.eph_public,
+        &mut s.eph_used,
+    );
+    if !ok {
+        s.peer_sessions[i].phase = DtlsPhase::Errored;
+    }
+    i
 }
 
 unsafe fn dtls_alloc_client_session(
@@ -49,25 +105,57 @@ unsafe fn dtls_alloc_client_session(
     ip: &[u8; 4],
     port: u16,
 ) -> Option<usize> {
+    // Same two-pass strategy as the server-side allocator: prefer
+    // overwriting a same-tuple tombstone (handshake-timeout retry
+    // is the common case), then fall back to any reusable slot.
     let mut i = 0;
     while i < MAX_PEERS {
-        if s.peer_sessions[i].phase == DtlsPhase::Idle {
-            let sess = &mut s.peer_sessions[i];
-            sess.reset();
-            sess.peer.ip = *ip;
-            sess.peer.port = port;
-            sess.phase = DtlsPhase::Handshaking;
-            sess.endpoint.driver.is_server = false;
-            sess.endpoint.driver.hs_state = HandshakeState::SendClientHello;
-            sess.endpoint.driver.suite = CipherSuite::ChaCha20Poly1305;
-            sess.endpoint.driver.ecdh_private = s.eph_private[i];
-            sess.endpoint.driver.ecdh_public = s.eph_public[i];
-            s.eph_used[i] = true;
-            return Some(i);
+        if dtls_slot_reusable(s.peer_sessions[i].phase)
+            && s.peer_sessions[i].peer.matches(ip, port)
+        {
+            return Some(dtls_init_client_session(s, i, ip, port));
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < MAX_PEERS {
+        if dtls_slot_reusable(s.peer_sessions[i].phase) {
+            return Some(dtls_init_client_session(s, i, ip, port));
         }
         i += 1;
     }
     None
+}
+
+unsafe fn dtls_init_client_session(
+    s: &mut TlsState,
+    i: usize,
+    ip: &[u8; 4],
+    port: u16,
+) -> usize {
+    let sys = &*s.syscalls;
+    {
+        let sess = &mut s.peer_sessions[i];
+        sess.reset();
+        sess.peer.ip = *ip;
+        sess.peer.port = port;
+        sess.phase = DtlsPhase::Handshaking;
+        sess.handshake_start_step = s.step_count;
+        sess.endpoint.driver.is_server = false;
+        sess.endpoint.driver.hs_state = HandshakeState::SendClientHello;
+        sess.endpoint.driver.suite = CipherSuite::ChaCha20Poly1305;
+    }
+    let ok = assign_fresh_ecdh_key(
+        sys,
+        &mut s.peer_sessions[i].endpoint.driver,
+        &s.eph_private,
+        &s.eph_public,
+        &mut s.eph_used,
+    );
+    if !ok {
+        s.peer_sessions[i].phase = DtlsPhase::Errored;
+    }
+    i
 }
 
 // ---------------------------------------------------------------------
@@ -122,10 +210,19 @@ unsafe fn dtls_pump_session(s: &mut TlsState, idx: usize) -> bool {
         HandshakeState::Complete => {
             s.peer_sessions[idx].phase = DtlsPhase::Ready;
             dev_log(sys, 3, b"[dtls] handshake complete".as_ptr(), b"[dtls] handshake complete".len());
+            // Symmetry with TCP-TLS: emit MSG_PEER_IDENTITY for
+            // the DTLS peer so RBAC / peer_router consumers see
+            // the same envelope regardless of transport. The
+            // peer slot index is the per-transport conn_id.
+            emit_peer_identity_dtls(s, idx);
             true
         }
         HandshakeState::Error => {
             s.peer_sessions[idx].phase = DtlsPhase::Errored;
+            // Drop the cached flight so the §5.8 retx sweep
+            // doesn't keep replaying records to a peer whose
+            // handshake we just gave up on.
+            dtls_disarm_retx(&mut s.peer_sessions[idx]);
             true
         }
         _ => false,
@@ -311,6 +408,10 @@ unsafe fn dtls_pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         endpoint.write_keys = wk;
         endpoint.read_keys = rk;
     }
+    // Drop handshake secrets + ECDH private — shared with TCP-TLS
+    // via `zeroize_post_app_keys` so the post-handshake secret-
+    // scrubbing policy is identical across transports.
+    zeroize_post_app_keys(&mut endpoint.driver);
     // RFC 9147 §6.1: Application traffic = epoch 3.
     endpoint.recv_state.rotate_epoch(3);
     endpoint.send_state.rotate_epoch(3);
@@ -365,6 +466,21 @@ unsafe fn dtls_pump_recv_encrypted_extensions(s: &mut TlsState, idx: usize) -> b
 }
 
 unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
+    // Snapshot the TLS-state-level CA + trust-domain config off the
+    // shared `TlsState` so the same chain-of-trust rules apply to
+    // DTLS. Earlier code skipped both checks and just copied the
+    // leaf public key — the TCP-TLS hardening in extract_peer_cert_key
+    // wasn't reaching DTLS peers (audit finding #6).
+    let ca_pk_ptr: Option<&[u8]> = if s.require_ca && s.ca_pubkey_len > 0 {
+        Some(&s.ca_pubkey[..s.ca_pubkey_len as usize])
+    } else {
+        None
+    };
+    let td_ptr: Option<&[u8]> = if s.trust_domain_len > 0 {
+        Some(&s.trust_domain[..s.trust_domain_len])
+    } else {
+        None
+    };
     let endpoint = &mut s.peer_sessions[idx].endpoint;
     let (data, len, msg_type) = match endpoint.driver.read_handshake_message() {
         Some(t) => t,
@@ -378,49 +494,12 @@ unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
         t.update(&data[..len]);
     }
     let body = &data[4..len];
-    if !dtls_extract_peer_cert_pubkey(body, &mut endpoint.driver) {
+    if !validate_and_extract_peer_cert(body, &mut endpoint.driver, ca_pk_ptr, td_ptr) {
         endpoint.driver.hs_state = HandshakeState::Error;
         return true;
     }
     endpoint.driver.hs_state = HandshakeState::RecvCertificateVerify;
     true
-}
-
-/// Pull the peer's X.509 certificate public key from a TLS 1.3
-/// Certificate message body.
-unsafe fn dtls_extract_peer_cert_pubkey(body: &[u8], driver: &mut HandshakeDriver) -> bool {
-    if body.len() < 4 {
-        return false;
-    }
-    let ctx_len = body[0] as usize;
-    if 1 + ctx_len + 3 > body.len() {
-        return false;
-    }
-    let mut pos = 1 + ctx_len;
-    let list_len = ((body[pos] as usize) << 16)
-        | ((body[pos + 1] as usize) << 8)
-        | (body[pos + 2] as usize);
-    pos += 3;
-    if pos + list_len > body.len() || list_len < 3 {
-        return false;
-    }
-    let cert_len = ((body[pos] as usize) << 16)
-        | ((body[pos + 1] as usize) << 8)
-        | (body[pos + 2] as usize);
-    pos += 3;
-    if pos + cert_len > body.len() {
-        return false;
-    }
-    let cert_der = &body[pos..pos + cert_len];
-    if let Some(parsed) = parse_certificate(cert_der) {
-        let pk = parsed.public_key;
-        let n = if pk.len() <= 65 { pk.len() } else { 65 };
-        core::ptr::copy_nonoverlapping(pk.as_ptr(), driver.peer_cert_pubkey.as_mut_ptr(), n);
-        driver.peer_cert_pubkey_len = n as u8;
-        true
-    } else {
-        false
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -462,9 +541,30 @@ unsafe fn dtls_drain_inbound(s: &mut TlsState, idx: usize) {
         sess.inbound_len = 0;
     }
 
-    let made_progress = {
+    // `dtls_recv_into_driver` returns `(inner_ct, recovered_seq,
+    // plaintext_len)`. The recovered seq is the actual record
+    // number we accepted — never a synthesised next-seq — so
+    // out-of-order delivery ACKs the right record. The plaintext
+    // payload lives at `datagram[DTLS_UNIFIED_HDR_LEN..]` (length
+    // = plaintext_len) so we can parse a CT_DTLS_ACK body before
+    // disarming the retx timer.
+    let recv_epoch = s.peer_sessions[idx].endpoint.recv_state.epoch as u64;
+
+    // Snapshot reassembler / driver state BEFORE the call so we
+    // can tell whether *this* record drove the handshake forward,
+    // not just whether earlier records left the session in an
+    // active state. Without these snapshots a CT_DTLS_ACK record
+    // could disarm the retx timer via the generic "made_progress"
+    // path purely because a previous handshake fragment had set
+    // `reassembler.active = true`.
+    let (in_len_before, reassembler_active_before) = {
+        let endpoint = &s.peer_sessions[idx].endpoint;
+        (endpoint.driver.in_len, endpoint.reassembler.active)
+    };
+
+    let (record_made_progress, inner_ct, recv_seq, plaintext_len) = {
         let endpoint = &mut s.peer_sessions[idx].endpoint;
-        let _ = dtls_recv_into_driver(
+        let result = dtls_recv_into_driver(
             suite,
             is_initial,
             &mut endpoint.read_keys,
@@ -473,11 +573,197 @@ unsafe fn dtls_drain_inbound(s: &mut TlsState, idx: usize) {
             &mut endpoint.driver,
             &mut datagram[..inbound_len],
         );
-        endpoint.driver.in_len > 0 || endpoint.reassembler.active
+        // "Progress" means *this record* contributed to the
+        // handshake state — either grew driver.in_len, or newly
+        // activated the reassembler. An ACK record, an alert, or
+        // app data hits this function but never moves these, so
+        // they don't disarm the retx timer through the generic
+        // path. The ACK-specific disarm logic below handles
+        // CT_DTLS_ACK on its own merits.
+        let driver_grew = endpoint.driver.in_len > in_len_before;
+        let reassembler_newly_active =
+            endpoint.reassembler.active && !reassembler_active_before;
+        let progress = driver_grew || reassembler_newly_active;
+        match result {
+            Some((ct, seq, pt_len)) => (progress, Some(ct), Some(seq), pt_len),
+            None => (false, None, None, 0),
+        }
     };
 
-    if made_progress {
+    // RFC 9147 §7 ACK *receive*: parse the body and disarm the
+    // retx timer iff the ACK is well-formed AND covers a record
+    // from our current outbound flight. Earlier code disarmed on
+    // any decrypted CT_DTLS_ACK — that opened a denial-of-service
+    // hole where a peer could stop our retransmits with a record
+    // that didn't actually acknowledge anything (including a 0-
+    // entry ACK or one with bogus tuples).
+    if matches!(inner_ct, Some(ct) if ct == CT_DTLS_ACK) {
+        let body =
+            &datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN + plaintext_len];
+        let mut tuples = [(0u64, 0u64); 8];
+        if let Some(count) = parse_dtls_ack_body(body, &mut tuples) {
+            let n = if count < tuples.len() { count } else { tuples.len() };
+            // Match against our last flight. With `last_flight_record_count`
+            // tracking the count of records in the current flight and
+            // their seqs running [send_seq - count .. send_seq), we
+            // accept the ACK iff any tuple's (epoch, seq) falls in
+            // that range under the current outbound epoch.
+            let send_state = &s.peer_sessions[idx].endpoint.send_state;
+            let our_epoch = send_state.epoch as u64;
+            let flight_count = s.peer_sessions[idx].last_flight_record_count as u64;
+            let flight_hi = send_state.send_seq;
+            let flight_lo = flight_hi.wrapping_sub(flight_count);
+            let mut covers = false;
+            let mut i = 0;
+            while i < n {
+                let (e, sq) = tuples[i];
+                if e == our_epoch && sq >= flight_lo && sq < flight_hi {
+                    covers = true;
+                    break;
+                }
+                i += 1;
+            }
+            if covers {
+                dtls_disarm_retx(&mut s.peer_sessions[idx]);
+            }
+            // Body well-formed but doesn't cover us → ignore the
+            // ACK. Spec-compliant peers won't send these; an
+            // adversarial / lagging peer doesn't get to stop our
+            // retransmits by sending unrelated record numbers.
+        }
+        // Malformed body (parse_dtls_ack_body returned None) is
+        // silently ignored — we already authenticated the record
+        // via the AEAD tag; the body just isn't actionable.
+    }
+
+    // Generic disarm path for non-ACK records that drove the
+    // handshake forward (CT_HANDSHAKE fragments, mostly). The
+    // `record_made_progress` flag only flips on state moved by
+    // the current record — see the snapshot above — so an
+    // authenticated CT_DTLS_ACK that didn't cover our flight
+    // can't piggy-back on an earlier fragment's reassembler
+    // state to falsely disarm.
+    if record_made_progress {
         dtls_disarm_retx(&mut s.peer_sessions[idx]);
+    }
+
+    // RFC 9147 §7 ACK-the-record emission. We send an ACK back
+    // when:
+    //   - we successfully processed an encrypted handshake record
+    //     (Initial-level plaintext records aren't ACKed — without
+    //     keys the ACK would be plaintext and contribute nothing
+    //     beyond the implicit next-record ACK behaviour the spec
+    //     already requires the peer to handle),
+    //   - the inner type is not itself an ACK (avoid ack-of-ack
+    //     amplification loops),
+    //   - the record didn't drive the handshake forward, but the
+    //     peer should still be told their record landed so they
+    //     stop retransmitting it.
+    let should_ack = !is_initial
+        && matches!(inner_ct, Some(ct) if ct == 22u8); // CT_HANDSHAKE
+    if should_ack {
+        if let Some(seq) = recv_seq {
+            dtls_emit_ack(s, idx, (recv_epoch, seq));
+        }
+    }
+}
+
+/// Build, encrypt, and emit a single-record-number DTLS ACK
+/// (RFC 9147 §7) on the peer's current write level. Uses the same
+/// `write_keys`/`send_state` plumbing as handshake records so the
+/// receiver authenticates the ACK under the in-force epoch.
+unsafe fn dtls_emit_ack(s: &mut TlsState, idx: usize, acked: (u64, u64)) {
+    let sys = &*s.syscalls;
+    let suite = s.peer_sessions[idx].endpoint.driver.suite;
+    let mut body = [0u8; 2 + 16];
+    let body_len = build_dtls_ack_body(&[acked], &mut body);
+    if body_len == 0 {
+        return;
+    }
+    let mut out = [0u8; DTLS_UNIFIED_HDR_LEN + 2 + 16 + 1 + 16];
+    let endpoint = &mut s.peer_sessions[idx].endpoint;
+    let n = encrypt_dtls_record(
+        suite,
+        &mut endpoint.write_keys,
+        &mut endpoint.send_state,
+        CT_DTLS_ACK,
+        &body[..body_len],
+        &mut out,
+    );
+    if n == 0 {
+        return;
+    }
+    // `encrypt_dtls_record` advances `send_state.send_seq` for us;
+    // a manual bump here would double-count and emit the next
+    // outbound record with a seq one ahead of the unified-header
+    // value the peer just saw. Caught by the audit pass — first
+    // version had `send_state.send_seq += 1` here on top of the
+    // increment inside encrypt_dtls_record.
+    let peer = s.peer_sessions[idx].peer;
+    dtls_send_datagram(
+        sys,
+        s.cipher_out,
+        s.dtls_listen_ep,
+        &peer,
+        &out[..n],
+        &mut s.net_scratch,
+    );
+}
+
+/// Build the MSG_PEER_IDENTITY envelope for the DTLS peer and try
+/// to write it on the optional `peer_identity` output port. Same
+/// latch-on-backpressure pattern as the TCP-TLS path; the
+/// envelope's `conn_id` byte carries the DTLS peer-slot index
+/// (0..MAX_PEERS-1) since DTLS has no IP-module conn_id.
+unsafe fn emit_peer_identity_dtls(s: &mut TlsState, idx: usize) {
+    if s.peer_identity < 0 { return; }
+    let pk_len = s.peer_sessions[idx].endpoint.driver.peer_cert_pubkey_len as usize;
+    let mut svid_buf = [0u8; PEER_IDENTITY_MAX_SVID];
+    let svid_slice: &[u8] = if pk_len > 0 {
+        let digest = sha256(&s.peer_sessions[idx].endpoint.driver.peer_cert_pubkey[..pk_len]);
+        svid_buf.copy_from_slice(&digest);
+        &svid_buf[..]
+    } else {
+        &svid_buf[..0]
+    };
+    let conn_id = idx as u8;
+    let mut envelope = [0u8; PEER_IDENTITY_MAX_TOTAL];
+    let total = build_peer_identity_envelope(conn_id, svid_slice, &mut envelope);
+    {
+        let sess = &mut s.peer_sessions[idx];
+        sess.pending_peer_identity[..total].copy_from_slice(&envelope[..total]);
+        sess.pending_peer_identity_len = total as u8;
+    }
+    try_drain_pending_peer_identity_dtls(s, idx);
+}
+
+/// Attempt one write of any pending DTLS peer-identity envelope.
+unsafe fn try_drain_pending_peer_identity_dtls(s: &mut TlsState, idx: usize) {
+    if s.peer_identity < 0 { return; }
+    let len = s.peer_sessions[idx].pending_peer_identity_len as usize;
+    if len == 0 { return; }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.peer_identity, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    let ptr = s.peer_sessions[idx].pending_peer_identity.as_ptr();
+    let written = (sys.channel_write)(s.peer_identity, ptr, len);
+    if written == len as i32 {
+        s.peer_sessions[idx].pending_peer_identity_len = 0;
+    }
+}
+
+/// Per-tick sweep over DTLS peer sessions with a latched
+/// peer-identity envelope. Mirrors `service_pending_peer_identity`
+/// for the TCP-TLS path; called once at the top of
+/// `dtls_module_step`.
+unsafe fn service_pending_peer_identity_dtls(s: &mut TlsState) {
+    if s.peer_identity < 0 { return; }
+    let mut i = 0;
+    while i < MAX_PEERS {
+        if s.peer_sessions[i].pending_peer_identity_len > 0 {
+            try_drain_pending_peer_identity_dtls(s, i);
+        }
+        i += 1;
     }
 }
 
@@ -630,11 +916,42 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
         return 1;
     }
 
-    // RFC 9147 §5.8 retransmission timer.
+    // Retry any DTLS peer-identity envelopes that couldn't ship
+    // at handshake completion because the consumer was backed
+    // up. Symmetric with the TCP-TLS sweep in `module_step`.
+    service_pending_peer_identity_dtls(s);
+
+    // Half-open handshake idle timeout: any peer stuck in
+    // Handshaking past DTLS_HANDSHAKE_TIMEOUT_STEPS is moved to
+    // Errored so the slot can be reclaimed. With 4 peer slots a
+    // single stuck handshake otherwise blocks 25 % of capacity
+    // indefinitely. Clear the retx state at the same transition
+    // — otherwise the §5.8 sweep below would keep replaying the
+    // cached flight to a peer that's already given up.
+    let now_step = s.step_count;
+    let mut t = 0;
+    while t < MAX_PEERS {
+        if s.peer_sessions[t].phase == DtlsPhase::Handshaking {
+            let elapsed = now_step.wrapping_sub(s.peer_sessions[t].handshake_start_step);
+            if elapsed > DTLS_HANDSHAKE_TIMEOUT_STEPS {
+                s.peer_sessions[t].phase = DtlsPhase::Errored;
+                dtls_disarm_retx(&mut s.peer_sessions[t]);
+            }
+        }
+        t += 1;
+    }
+
+    // RFC 9147 §5.8 retransmission timer. Gated to Handshaking
+    // peers only — Errored / Closed / Ready slots never need to
+    // replay a flight (Handshaking is the only phase where the
+    // peer might still be waiting for a record). Belt-and-braces
+    // with `dtls_clear_retx_state` above: even if a transition
+    // forgot to clear the cache, the phase gate keeps the sweep
+    // silent.
     let now_ms = dev_millis(sys);
     let mut i = 0;
     while i < MAX_PEERS {
-        if s.peer_sessions[i].phase != DtlsPhase::Idle
+        if s.peer_sessions[i].phase == DtlsPhase::Handshaking
             && s.peer_sessions[i].last_flight_record_count > 0
             && s.peer_sessions[i].endpoint.retx_timer.should_retx(now_ms)
         {

@@ -1011,6 +1011,24 @@ const FS_CLOSE:   u32 = 0x0903;
 const FS_STAT:    u32 = 0x0904;
 const FS_OPENDIR: u32 = 0x0907;
 const FS_READDIR: u32 = 0x0908;
+/// `OPEN_CREATE` (0x0909) is documented in
+/// `modules/sdk/contracts/storage/fs.rs` and reserved at the
+/// SDK level, but FAT32 doesn't implement file creation — no FAT
+/// table writeback, no cluster allocator, no directory-entry
+/// emit. We explicitly return ENOSYS rather than fall through to
+/// the catch-all so the gap is obvious to readers of this file.
+const FS_OPEN_CREATE: u32 = 0x0909;
+
+/// `CAPS` (0x09FF) — capability-discovery opcode. Returns a u32
+/// LE bitmap of supported FS opcodes. Callers query this before
+/// invoking write-tier ops (currently just `OPEN_CREATE`) so
+/// they can branch on capability rather than catch `ENOSYS`.
+const FS_CAPS: u32 = 0x09FF;
+
+/// FS capability bits — must match
+/// `modules/sdk/contracts/storage/fs.rs::caps`.
+const FS_CAP_OPEN:    u32 = 1 << 0;
+const FS_CAP_OPENDIR: u32 = 1 << 1;
 
 /// Synchronously fetch a 512-byte sector at `lba` into `out`. Returns
 /// 0 on success, negative errno otherwise. The block source must
@@ -1614,14 +1632,32 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
             None => E_INVAL,
         };
     }
+    // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
+    // FAT32 v1 is read-only — no cluster allocator, no FAT-table
+    // writeback, no directory-entry emit. The CAPS query is the
+    // canonical way for callers to discover the read-only posture
+    // before they call OPEN_CREATE / WRITE / etc and get ENOSYS.
+    if opcode == FS_CAPS {
+        if arg.is_null() || arg_len < 4 {
+            return E_INVAL;
+        }
+        let caps: u32 = FS_CAP_OPEN | FS_CAP_OPENDIR;
+        let bytes = caps.to_le_bytes();
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
+        return 4;
+    }
     match opcode {
-        FS_OPEN    => fs_op_open(s, arg as *const u8, arg_len),
-        FS_READ    => fs_op_read(s, handle, arg, arg_len),
-        FS_SEEK    => fs_op_seek(s, handle, arg as *const u8, arg_len),
-        FS_CLOSE   => fs_op_close(s, handle),
-        FS_STAT    => fs_op_stat(s, handle, arg, arg_len),
-        FS_OPENDIR => fs_op_opendir(s, arg as *const u8, arg_len),
-        FS_READDIR => fs_op_readdir(s, handle, arg, arg_len),
+        FS_OPEN        => fs_op_open(s, arg as *const u8, arg_len),
+        FS_READ        => fs_op_read(s, handle, arg, arg_len),
+        FS_SEEK        => fs_op_seek(s, handle, arg as *const u8, arg_len),
+        FS_CLOSE       => fs_op_close(s, handle),
+        FS_STAT        => fs_op_stat(s, handle, arg, arg_len),
+        FS_OPENDIR     => fs_op_opendir(s, arg as *const u8, arg_len),
+        FS_READDIR     => fs_op_readdir(s, handle, arg, arg_len),
+        // FAT32 write support is not in v1 — see the comment on
+        // FS_OPEN_CREATE above. ENOSYS lets callers detect the
+        // gap (vs a silent fall-through misread as "wrong path").
+        FS_OPEN_CREATE => -38, // ENOSYS
         _ => -38, // ENOSYS
     }
 }

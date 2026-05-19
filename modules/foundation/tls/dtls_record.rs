@@ -68,6 +68,84 @@ impl DtlsRecord {
 
 pub const DTLS_UNIFIED_HDR_LEN: usize = 5;
 
+/// RFC 9147 §7 inner content type for ACK records. ACKs are sealed
+/// records (same record protection as handshake/app-data) whose
+/// plaintext payload is a list of (epoch, seq) tuples identifying
+/// records the receiver has accepted. The sender clears its
+/// retransmit timer when an ACK covers any record of the current
+/// flight.
+pub const CT_DTLS_ACK: u8 = 26;
+
+/// Build an RFC 9147 §7.1 ACK record body. `record_numbers` is a
+/// slice of `(epoch, seq)` tuples; the body wire format is a
+/// 16-bit big-endian byte-length prefix followed by `count * 16`
+/// bytes, each a (uint64 epoch || uint64 seq) pair in BE.
+/// Returns the body length written, or 0 if `out` is too small.
+pub fn build_dtls_ack_body(record_numbers: &[(u64, u64)], out: &mut [u8]) -> usize {
+    let count = record_numbers.len();
+    let bytes_len = count * 16;
+    let body_len = 2 + bytes_len;
+    if out.len() < body_len || bytes_len > 0xFFFF {
+        return 0;
+    }
+    out[0] = (bytes_len >> 8) as u8;
+    out[1] = bytes_len as u8;
+    let mut i = 0;
+    while i < count {
+        let off = 2 + i * 16;
+        let (epoch, seq) = record_numbers[i];
+        let eb = epoch.to_be_bytes();
+        let sb = seq.to_be_bytes();
+        let mut j = 0;
+        while j < 8 {
+            out[off + j] = eb[j];
+            out[off + 8 + j] = sb[j];
+            j += 1;
+        }
+        i += 1;
+    }
+    body_len
+}
+
+/// Parse an RFC 9147 §7.1 ACK record body. Writes up to
+/// `out.len()` record numbers into `out`. Returns the number of
+/// tuples actually present in `body` (which may exceed `out.len()`
+/// — the caller can decide whether to grow its buffer or treat
+/// the overflow as "ack covers current flight").
+///
+/// Strict on framing: the body length MUST equal `2 + bytes_len`
+/// exactly, no trailing bytes. RFC 9147 §7.1 doesn't reserve space
+/// for record-level padding inside an ACK body (the AEAD inner-
+/// content padding happens outside, in the record itself), so
+/// any tail bytes indicate either a malformed peer or an attack
+/// stuffing data into a record that's supposed to be a pure ACK.
+pub fn parse_dtls_ack_body(body: &[u8], out: &mut [(u64, u64)]) -> Option<usize> {
+    if body.len() < 2 {
+        return None;
+    }
+    let bytes_len = ((body[0] as usize) << 8) | (body[1] as usize);
+    if body.len() != 2 + bytes_len || bytes_len % 16 != 0 {
+        return None;
+    }
+    let count = bytes_len / 16;
+    let max = if count < out.len() { count } else { out.len() };
+    let mut i = 0;
+    while i < max {
+        let off = 2 + i * 16;
+        let mut e = [0u8; 8];
+        let mut s = [0u8; 8];
+        let mut j = 0;
+        while j < 8 {
+            e[j] = body[off + j];
+            s[j] = body[off + 8 + j];
+            j += 1;
+        }
+        out[i] = (u64::from_be_bytes(e), u64::from_be_bytes(s));
+        i += 1;
+    }
+    Some(count)
+}
+
 /// Build the 5-byte DTLS 1.3 unified header for `seq` / `epoch` /
 /// `enc_len` (encrypted_record length = plaintext + content_type + tag).
 /// `out` MUST be at least `DTLS_UNIFIED_HDR_LEN` bytes.
@@ -245,7 +323,13 @@ pub fn encrypt_dtls_record(
         }
     }
 
-    keys.advance_seq();
+    // DTLS uses an explicit per-record seq in the unified header
+    // (state.send_seq) — the TrafficKeys.seq we just touched is
+    // re-synced at the top of every call (line above). Advancing
+    // here keeps the conventional invariant; the bool return is
+    // discarded because the DTLS path's send_seq is the
+    // authoritative counter for the record we just emitted.
+    let _ = keys.advance_seq();
     state.send_seq = state.send_seq.wrapping_add(1);
     total
 }
@@ -378,6 +462,18 @@ pub fn decrypt_dtls_record(
 // ----------------------------------------------------------------------
 
 pub const DTLS_HS_HEADER_LEN: usize = 12;
+/// Per-peer DTLS handshake reassembly buffer.
+///
+/// **aarch64** — 8 KiB. Sized to fit a TLS 1.3 server flight with a
+/// non-trivial certificate chain + extensions; the 4 KiB original
+/// dropped fragments for any peer with a chain larger than ~3 KiB.
+///
+/// **embedded** — 4 KiB. Stays under the rp2350 / wasm32 module
+/// state budget; chain-bearing peers will fail at fragment-overflow
+/// rather than silently truncate.
+#[cfg(target_arch = "aarch64")]
+pub const DTLS_HS_REASSEMBLY_BUF: usize = 8192;
+#[cfg(not(target_arch = "aarch64"))]
 pub const DTLS_HS_REASSEMBLY_BUF: usize = 4096;
 
 pub struct DtlsHandshakeReassembler {
@@ -577,9 +673,15 @@ impl DtlsRetxTimer {
 /// `reassembler`; if the message becomes complete, a TLS-style
 /// 4-byte-headered message is appended to `driver.in_buf`.
 ///
-/// Returns the inner content type that was decrypted (so the caller
-/// can route alerts / app data appropriately) or None on a malformed
-/// or undecryptable record.
+/// Returns `(inner_content_type, recovered_seq, plaintext_len)`
+/// so the caller can route alerts / app data appropriately AND
+/// ACK the exact record-number the record carried (RFC 9147 §7 —
+/// ACKs must reference the recovered seq, not a synthesised next-
+/// seq) AND inspect the plaintext body (e.g. parse a CT_DTLS_ACK
+/// payload before disarming the retx timer). The plaintext body
+/// lives at `datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN
+/// + plaintext_len]` after the call.
+/// Returns None on a malformed or undecryptable record.
 ///
 /// `read_keys` is the AEAD state for the current inbound EncLevel.
 /// `state` holds the per-direction sequence counter / replay window.
@@ -592,8 +694,8 @@ pub unsafe fn dtls_recv_into_driver(
     reassembler: &mut DtlsHandshakeReassembler,
     driver: &mut HandshakeDriver,
     datagram: &mut [u8],
-) -> Option<u8> {
-    let payload = if is_initial {
+) -> Option<(u8, u64, usize)> {
+    let (payload_len, recovered_seq) = if is_initial {
         // Plaintext CT_HANDSHAKE record per DTLS 1.3 §4 — same unified
         // header form, but `epoch == 0` and no AEAD seal. Body is the
         // handshake fragment in the clear, with no inner content_type
@@ -611,20 +713,24 @@ pub unsafe fn dtls_recv_into_driver(
         if !check_replay(state, seq) {
             return None;
         }
-        &datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN + body_len]
+        (body_len, seq)
     } else {
-        let (pt_len, inner_type, _seq) =
+        let (pt_len, inner_type, seq) =
             decrypt_dtls_record(suite, read_keys, state, datagram)?;
         if inner_type != 22u8 {
-            // CT_HANDSHAKE = 22. Other inner types are returned to
-            // caller via the function's Some(inner_type) below.
-            return Some(inner_type);
+            // CT_HANDSHAKE = 22. Other inner types (alerts, app
+            // data, RFC 9147 §7 ACK records) are returned to
+            // caller paired with the recovered seq + the
+            // plaintext length so the caller can inspect the body
+            // at `datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN + pt_len]`.
+            return Some((inner_type, seq, pt_len));
         }
-        &datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN + pt_len]
+        (pt_len, seq)
     };
+    let payload = &datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN + payload_len];
 
     if !reassembler.feed(payload) {
-        return Some(22u8); // Fragment accepted, message not yet complete.
+        return Some((22u8, recovered_seq, payload_len)); // Fragment accepted, message not yet complete.
     }
 
     // Message complete — push to driver.in_buf with a TLS-style
@@ -642,7 +748,7 @@ pub unsafe fn dtls_recv_into_driver(
     );
     let _ = driver.feed_handshake(EncLevel::Handshake, &hdr_and_body[..4 + total]);
     reassembler.reset();
-    Some(22u8)
+    Some((22u8, recovered_seq, payload_len))
 }
 
 /// Maximum body bytes per DTLS handshake fragment. Sized so a record

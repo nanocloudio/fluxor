@@ -72,6 +72,53 @@ pub fn slot_fence(slot: i32) -> Option<Fence> {
     }
 }
 
+/// Maximum FS path length the linux provider accepts. One byte
+/// reserved for the trailing NUL so libc's path-arg primitives
+/// can be called directly. Callers passing a longer path get
+/// `E2BIG` rather than a silently truncated open.
+const LINUX_FS_PATH_MAX: usize = 255;
+
+/// Validate + copy a UTF-8 path argument from a contract caller
+/// into `out` and NUL-terminate it for libc.
+///
+/// Returns the path length in bytes (NOT counting the NUL) on
+/// success, or a negative errno:
+///
+///   - `EINVAL` if the buffer is null, empty, or contains an
+///     interior NUL byte (interior NULs let an attacker submit
+///     `evil\0../etc/passwd` and have libc see `evil` while a
+///     downstream policy check saw the longer string),
+///   - `E2BIG` if the path length exceeds `LINUX_FS_PATH_MAX`.
+///
+/// Centralised so OPEN, OPEN_CREATE, and OPENDIR get identical
+/// path validation — previously each arm rolled its own
+/// `arg_len.min(255)` and OPENDIR silently truncated where the
+/// other two now reject overlong paths.
+unsafe fn validate_fs_path(arg: *const u8, arg_len: usize, out: &mut [u8; 256]) -> Result<usize, i32> {
+    use fluxor::kernel::errno;
+    if arg.is_null() || arg_len == 0 {
+        return Err(errno::EINVAL);
+    }
+    if arg_len > LINUX_FS_PATH_MAX {
+        return Err(errno::E2BIG);
+    }
+    let bytes = core::slice::from_raw_parts(arg, arg_len);
+    let mut i = 0;
+    while i < arg_len {
+        if bytes[i] == 0 {
+            // Interior NUL — refuse rather than passing a
+            // truncated path to libc. POSIX paths can't contain
+            // NULs, so an interior NUL is always either a bug
+            // or a path-splicing attack.
+            return Err(errno::EINVAL);
+        }
+        i += 1;
+    }
+    out[..arg_len].copy_from_slice(bytes);
+    out[arg_len] = 0;
+    Ok(arg_len)
+}
+
 /// FS provider dispatch.
 ///
 /// `OPEN` and `OPENDIR` self-tag their returns with `FD_TAG_FS` so
@@ -103,6 +150,26 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         };
     }
 
+    // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
+    // Linux implements the full read-tier + the write-tier ops
+    // that already have opcode assignments (WRITE 0x0906 +
+    // FSYNC 0x0905, both wired in this dispatcher). The reserved
+    // bits (UNLINK / TRUNCATE / MKDIR / RENAME) stay 0 — those
+    // opcodes aren't assigned yet.
+    if opcode == dev_fs::CAPS {
+        if arg.is_null() || arg_len < 4 {
+            return errno::EINVAL;
+        }
+        let caps: u32 = dev_fs::caps::OPEN
+            | dev_fs::caps::OPENDIR
+            | dev_fs::caps::OPEN_CREATE
+            | dev_fs::caps::WRITE
+            | dev_fs::caps::FSYNC;
+        let bytes = caps.to_le_bytes();
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
+        return 4;
+    }
+
     match opcode {
         dev_fs::OPEN => {
             if arg.is_null() || arg_len == 0 {
@@ -115,11 +182,10 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
                 None => return errno::ENOMEM,
             };
 
-            let path_bytes = core::slice::from_raw_parts(arg, arg_len);
             let mut path_buf = [0u8; 256];
-            let plen = arg_len.min(255);
-            path_buf[..plen].copy_from_slice(&path_bytes[..plen]);
-            path_buf[plen] = 0;
+            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+                return e;
+            }
 
             // Open policy: read-write on existing files, never auto-
             // create. The kernel's `FS_OPEN` opcode has no flags
@@ -152,6 +218,34 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
                 // FS handles carry their contract in the tag; the
                 // vtable wrapper strips it on re-entry.
                 return tag_fd(FD_TAG_FS, slot_idx as i32);
+            }
+            files[slot_idx].fd = fd_raw;
+            files[slot_idx].in_use = true;
+            files[slot_idx].last_fence = Fence::Volatile;
+            tag_fd(FD_TAG_FS, slot_idx as i32)
+        }
+        dev_fs::OPEN_CREATE => {
+            let mut path_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+                return e;
+            }
+            let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
+            let slot_idx = files.iter().position(|s| !s.in_use);
+            let slot_idx = match slot_idx {
+                Some(i) => i,
+                None => return errno::ENOMEM,
+            };
+            // O_RDWR|O_CREAT, mode 0600. Distinct opcode from
+            // OPEN — callers opt in to the create-on-missing
+            // behaviour so OPEN keeps its "loud on missing"
+            // policy (see comment on the OPEN arm above).
+            let fd_raw = libc::open(
+                path_buf.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_CREAT,
+                0o600,
+            );
+            if fd_raw < 0 {
+                return errno::ENODEV;
             }
             files[slot_idx].fd = fd_raw;
             files[slot_idx].in_use = true;
@@ -292,20 +386,15 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             }
         }
         dev_fs::OPENDIR => {
-            if arg.is_null() || arg_len == 0 {
-                return errno::EINVAL;
+            let mut path_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+                return e;
             }
             let files = &mut *core::ptr::addr_of_mut!(LINUX_FILES);
             let slot_idx = match files.iter().position(|s| !s.in_use) {
                 Some(i) => i,
                 None => return errno::ENOMEM,
             };
-            // Null-terminate the path for libc::opendir.
-            let path_bytes = core::slice::from_raw_parts(arg, arg_len);
-            let mut path_buf = [0u8; 256];
-            let plen = arg_len.min(255);
-            path_buf[..plen].copy_from_slice(&path_bytes[..plen]);
-            path_buf[plen] = 0;
             let dir = libc::opendir(path_buf.as_ptr() as *const libc::c_char);
             if dir.is_null() {
                 return errno::ENODEV;

@@ -129,6 +129,24 @@ unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
             None => errno::EINVAL,
         };
     }
+    // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
+    // Reports handle-acquisition / write-tier capability only;
+    // per-FD ops (READ, STAT, CLOSE) are always supported on any
+    // FD this provider hands back and aren't represented in the
+    // bitmap. The wasm backend offers OPEN against asset URLs;
+    // OPENDIR is not advertised (browsers don't expose a generic
+    // list-files primitive for arbitrary URL roots) and write
+    // ops are not implemented (the underlying browser-storage
+    // primitives are key-value, not file-by-path).
+    if opcode == dev_fs::CAPS {
+        if arg.is_null() || arg_len < 4 {
+            return errno::EINVAL;
+        }
+        let caps: u32 = dev_fs::caps::OPEN;
+        let bytes = caps.to_le_bytes();
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
+        return 4;
+    }
     match opcode {
         dev_fs::OPEN => fs_open(arg, arg_len),
         dev_fs::READ => fs_read(handle, arg, arg_len),

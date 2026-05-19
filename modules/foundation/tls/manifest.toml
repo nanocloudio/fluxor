@@ -20,3 +20,16 @@ content_type = "NetProto"
 name = "clear_out"
 direction = "output"
 content_type = "NetProto"
+
+# Per-session peer-identity envelope emitted after TLS handshake
+# completion. Wire format documented in
+# modules/foundation/tls/mod.rs (`MSG_PEER_IDENTITY` const block):
+#   [msg_type:1=0x5A][payload_len:2 LE]
+#   [conn_id:1][replica_id:1=0xFF][verified:1][svid_len:1][svid…]
+# `verified == 1` iff `svid_len > 0`. SVID is SHA-256 of the peer
+# cert's raw subjectPublicKey (32 B). The TLS module retries on
+# back-pressure so delivery is at-least-once.
+[[ports]]
+name = "peer_identity"
+direction = "output"
+content_type = "OctetStream"

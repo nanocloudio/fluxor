@@ -7,8 +7,19 @@
 //! Cipher suites: TLS_CHACHA20_POLY1305_SHA256 (preferred),
 //!                TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384
 
-#![no_std]
-#![no_main]
+// `no_std` / `no_main` are stripped under EITHER the host-test
+// feature (the explicit "build me as a host rlib" knob) OR
+// `cfg(test)` (cargo's own test-runner harness). The PIC build
+// sets neither, so the firmware blob stays bare-metal.
+//
+// The `cfg(test)` arm matters because `cargo test -p
+// fluxor-mod-tls --target aarch64-unknown-linux-gnu` without
+// `--features host-test` would otherwise fail with `undefined
+// reference to main` — cargo's test harness needs a normal
+// `main` entrypoint to instantiate `#[test]` functions, which
+// `#![no_main]` suppresses.
+#![cfg_attr(not(any(feature = "host-test", test)), no_std)]
+#![cfg_attr(not(any(feature = "host-test", test)), no_main)]
 
 use core::ffi::c_void;
 
@@ -144,6 +155,16 @@ struct TlsSession {
     /// emits ClientHello so the bridge can inject a CCS record before
     /// the first encrypted client flight.
     pending_ccs_client: bool,
+
+    /// Latched MSG_PEER_IDENTITY envelope for sessions whose
+    /// peer_identity output port was full at handshake completion.
+    /// `pending_peer_identity_len > 0` means a retry is scheduled;
+    /// `module_step` walks active sessions and retries the write
+    /// each tick until either the channel accepts the envelope or
+    /// the session is released. Sized for the MSG_PEER_IDENTITY
+    /// envelope: 3 B header + 4 B fixed + 32 B SVID = 39 B max.
+    pending_peer_identity: [u8; 39],
+    pending_peer_identity_len: u8,
 }
 
 impl TlsSession {
@@ -167,6 +188,8 @@ impl TlsSession {
             retx_seq_anchored: false,
             pending_ccs: false,
             pending_ccs_client: false,
+            pending_peer_identity: [0; 39],
+            pending_peer_identity_len: 0,
         }
     }
 
@@ -194,6 +217,7 @@ impl TlsSession {
         self.send_offset = 0;
         self.pending_ccs = false;
         self.pending_ccs_client = false;
+        self.pending_peer_identity_len = 0;
         self.read_keys = TrafficKeys::empty();
         self.write_keys = TrafficKeys::empty();
     }
@@ -256,6 +280,20 @@ struct PeerSession {
     last_flight_len: usize,
     last_flight_record_lens: [u16; MAX_FLIGHT_RECORDS],
     last_flight_record_count: u8,
+    /// `step_count` snapshot at the moment this peer entered the
+    /// `Handshaking` phase. The DTLS module sweep transitions the
+    /// peer to `Errored` after `DTLS_HANDSHAKE_TIMEOUT_STEPS` so a
+    /// stuck handshake can't pin a slot in the 4-peer table.
+    handshake_start_step: u32,
+    /// MSG_PEER_IDENTITY latch — same shape as TlsSession's, but
+    /// scoped to a DTLS peer. The conn_id field of the envelope
+    /// carries the peer-slot index (0..MAX_PEERS-1) since DTLS
+    /// has no IP-module conn_id; downstream consumers
+    /// distinguish DTLS vs TCP peers by the peer_identity
+    /// channel routing alone, so the slot index is a stable per-
+    /// transport identifier.
+    pending_peer_identity: [u8; 39],
+    pending_peer_identity_len: u8,
 }
 
 impl PeerSession {
@@ -270,6 +308,9 @@ impl PeerSession {
             last_flight_len: 0,
             last_flight_record_lens: [0; MAX_FLIGHT_RECORDS],
             last_flight_record_count: 0,
+            handshake_start_step: 0,
+            pending_peer_identity: [0; 39],
+            pending_peer_identity_len: 0,
         }
     }
 
@@ -280,6 +321,8 @@ impl PeerSession {
         self.inbound_len = 0;
         self.last_flight_len = 0;
         self.last_flight_record_count = 0;
+        self.handshake_start_step = 0;
+        self.pending_peer_identity_len = 0;
     }
 }
 
@@ -302,6 +345,12 @@ struct TlsState {
     cipher_out: i32,    // to IP: ciphertext net_proto frames
     clear_in: i32,      // from HTTP: cleartext net_proto frames (commands)
     clear_out: i32,     // to HTTP: cleartext net_proto frames (events)
+    /// Optional peer-identity output (clustor phase-3 RFC §5.1).
+    /// Emits `MSG_PEER_IDENTITY` (msg_type 0x5A) per accepted
+    /// TLS session after Finished. Wired only when a downstream
+    /// consumer needs it; -1 when the port is unwired makes the
+    /// emit a no-op. Channel slot: out[2].
+    peer_identity: i32,
 
     // Pre-computed ephemeral ECDH key pairs (one per session, computed in module_new)
     eph_private: [[u8; 32]; MAX_SESSIONS],
@@ -357,7 +406,21 @@ struct TlsState {
 
     // Scratch buffer for net_proto frame assembly
     net_scratch: [u8; NET_SCRATCH_SIZE],
+    /// Module step counter, incremented at the top of every
+    /// `module_step` (regardless of TCP / DTLS path). Used as the
+    /// monotonic clock source for the DTLS half-open handshake
+    /// idle timeout — DTLS sessions don't have access to
+    /// `dev_get_ticks` and the host syscall surface is the same.
+    step_count: u32,
 }
+
+/// DTLS half-open handshake idle timeout in module steps. At the
+/// 1 ms scheduler tick, this is 60 s — long enough to ride out a
+/// slow handshake on a high-latency link, short enough that a
+/// stuck peer can't pin a `peer_sessions[]` slot indefinitely.
+/// Triggers a transition `Handshaking → Errored` so the slot is
+/// reclaimed on the next free-slot scan.
+const DTLS_HANDSHAKE_TIMEOUT_STEPS: u32 = 60_000;
 
 // ============================================================================
 // Parameter definitions
@@ -434,6 +497,7 @@ pub unsafe extern "C" fn module_new(
     s.dtls_peer_port = 4433;
     s.dtls_bound = false;
     s.dtls_client_started = false;
+    s.step_count = 0;
     let mut i = 0;
     while i < MAX_PEERS {
         s.peer_sessions[i] = PeerSession::empty();
@@ -449,6 +513,7 @@ pub unsafe extern "C" fn module_new(
     s.clear_in = dev_channel_port(sys, 0, 1);
     s.cipher_out = dev_channel_port(sys, 1, 0);
     s.clear_out = dev_channel_port(sys, 1, 1);
+    s.peer_identity = dev_channel_port(sys, 1, 2);
 
     // Initialize sessions
     let mut i = 0;
@@ -600,9 +665,18 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
 #[no_mangle]
 pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = &mut *(state as *mut TlsState);
+    s.step_count = s.step_count.wrapping_add(1);
     if s.transport == TRANSPORT_UDP {
         return dtls_module_step(s);
     }
+    // Retry any peer-identity envelopes that couldn't ship at
+    // handshake completion because the consumer was backed up.
+    // Runs every tick to bound delivery latency without busy-
+    // waiting — the inner `try_drain_pending_peer_identity` polls
+    // first so quiet steps cost a single syscall per latched
+    // session.
+    service_pending_peer_identity(s);
+
     let sys = &*s.syscalls;
     let mut did_work = false;
 
@@ -934,7 +1008,11 @@ fn find_session_by_conn_id(s: &TlsState, conn_id: u8) -> i32 {
 /// Verify CertificateVerify signature from peer. Returns true on success.
 unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: usize) -> bool {
     let sess = &s.sessions[idx];
-    if sess.driver.peer_cert_pubkey_len == 0 { return true; }
+    // No peer cert means nothing to verify against. If mTLS is required
+    // (server with verify_peer=1, or client always), the caller must
+    // have already rejected an empty Certificate message — by the time
+    // we get here, a zero pubkey means the chain of trust is broken.
+    if sess.driver.peer_cert_pubkey_len == 0 { return false; }
     let hl = sess.driver.suite.hash_len();
     let transcript_hash = match &sess.driver.transcript {
         Some(t) => t.current_hash(),
@@ -958,41 +1036,88 @@ unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: us
     false
 }
 
-/// Extract peer certificate public key and validate SPIFFE SAN.
-unsafe fn extract_peer_cert_key(s: &mut TlsState, idx: usize, hs_body: &[u8]) -> bool {
-    if let Some(cert_der) = parse_certificate_msg(hs_body) {
-        if let Some(cert) = parse_certificate(cert_der) {
-            // Trust anchor check: if a CA public key is configured, verify
-            // the peer certificate's TBS signature against it. Chain-of-one
-            // path validation — leaf must be signed directly by the CA.
-            if s.require_ca && s.ca_pubkey_len > 0 {
-                let ca_pk = &s.ca_pubkey[..s.ca_pubkey_len as usize];
-                let tbs_hash = sha256(cert.tbs_raw);
-                let raw_sig = match parse_der_signature(cert.signature) {
-                    Some(r) => r,
-                    None => return false,
-                };
-                if !ecdsa_verify(ca_pk, &tbs_hash, &raw_sig) {
-                    return false;
-                }
-            }
-
-            let pk = cert.public_key;
-            let pk_len = if pk.len() <= 65 { pk.len() } else { 65 };
-            core::ptr::copy_nonoverlapping(pk.as_ptr(), s.sessions[idx].driver.peer_cert_pubkey.as_mut_ptr(), pk_len);
-            s.sessions[idx].driver.peer_cert_pubkey_len = pk_len as u8;
-            if s.trust_domain_len > 0 {
-                let td = &s.trust_domain[..s.trust_domain_len];
-                let mut spiffe_ok = false;
-                extract_san_uris(cert_der, |uri| {
-                    if is_spiffe_match(uri, td) { spiffe_ok = true; }
-                    spiffe_ok
-                });
-                if !spiffe_ok { return false; }
+/// Shared peer-certificate validation. Used by both the TCP-TLS
+/// path (`extract_peer_cert_key`) and the DTLS path
+/// (`dtls_state.rs::dtls_extract_peer_cert_pubkey`) so the same
+/// chain-of-trust + SPIFFE rules apply to every transport.
+///
+/// Returns false on any parse / validation failure — empty
+/// Certificate list, malformed leaf cert, signature failure
+/// against the configured CA, empty pubkey, or SPIFFE SAN
+/// mismatch. On success, the peer's raw subjectPublicKey is
+/// written into `driver.peer_cert_pubkey` (length in
+/// `peer_cert_pubkey_len`).
+///
+/// Pass `None` for `ca_pubkey` to skip CA verification, or
+/// `None` for `trust_domain` to skip SPIFFE SAN matching.
+/// Downstream code (`verify_peer_cert_verify`, `emit_peer_identity`)
+/// relies on `peer_cert_pubkey_len > 0` as the marker that a real
+/// identity was bound; this helper guarantees that property
+/// only when *every* configured check passes.
+unsafe fn validate_and_extract_peer_cert(
+    hs_body: &[u8],
+    driver: &mut HandshakeDriver,
+    ca_pubkey: Option<&[u8]>,
+    trust_domain: Option<&[u8]>,
+) -> bool {
+    let cert_der = match parse_certificate_msg(hs_body) {
+        Some(d) => d,
+        None => return false,
+    };
+    let cert = match parse_certificate(cert_der) {
+        Some(c) => c,
+        None => return false,
+    };
+    if let Some(ca_pk) = ca_pubkey {
+        if !ca_pk.is_empty() {
+            // Chain-of-one path validation: leaf must be signed
+            // directly by the configured CA.
+            let tbs_hash = sha256(cert.tbs_raw);
+            let raw_sig = match parse_der_signature(cert.signature) {
+                Some(r) => r,
+                None => return false,
+            };
+            if !ecdsa_verify(ca_pk, &tbs_hash, &raw_sig) {
+                return false;
             }
         }
     }
+    let pk = cert.public_key;
+    if pk.is_empty() || pk.len() > 65 { return false; }
+    core::ptr::copy_nonoverlapping(pk.as_ptr(), driver.peer_cert_pubkey.as_mut_ptr(), pk.len());
+    driver.peer_cert_pubkey_len = pk.len() as u8;
+    if let Some(td) = trust_domain {
+        if !td.is_empty() {
+            let mut spiffe_ok = false;
+            extract_san_uris(cert_der, |uri| {
+                if is_spiffe_match(uri, td) { spiffe_ok = true; }
+                spiffe_ok
+            });
+            if !spiffe_ok { return false; }
+        }
+    }
     true
+}
+
+/// TCP-TLS adapter: pulls the configured CA pubkey + trust domain
+/// off `TlsState` and delegates to `validate_and_extract_peer_cert`.
+unsafe fn extract_peer_cert_key(s: &mut TlsState, idx: usize, hs_body: &[u8]) -> bool {
+    let ca_pk = if s.require_ca && s.ca_pubkey_len > 0 {
+        Some(&s.ca_pubkey[..s.ca_pubkey_len as usize])
+    } else {
+        None
+    };
+    let td = if s.trust_domain_len > 0 {
+        Some(&s.trust_domain[..s.trust_domain_len])
+    } else {
+        None
+    };
+    validate_and_extract_peer_cert(
+        hs_body,
+        &mut s.sessions[idx].driver,
+        ca_pk,
+        td,
+    )
 }
 
 /// Skip any CCS records at the front of a session's recv_buf.
@@ -1010,36 +1135,108 @@ unsafe fn skip_ccs(sess: &mut TlsSession) {
     }
 }
 
-unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
-    let sys = &*s.syscalls;
-    let sess = &mut s.sessions[idx];
-
-    // Generate a fresh ephemeral ECDH key pair per session (RFC §2.4).
-    // Pre-computing keys at module_new and reusing them across sessions
-    // weakens forward secrecy: a memory disclosure after session N reveals
-    // the private key of every subsequent session that reuses it.
+/// Assign a fresh ephemeral ECDH key pair to `driver`. Single
+/// source of truth for both TCP-TLS and DTLS — pre-computing
+/// keys at `module_new` and reusing them across sessions would
+/// weaken forward secrecy (a memory disclosure after session N
+/// reveals the private key of every subsequent session that
+/// reuses it). Calls CSPRNG; on failure, falls back to the
+/// pre-computed pool slot, consuming it at most once. Returns
+/// true on success, false if neither a fresh key nor a free pool
+/// slot is available — in that case the caller must abort
+/// session setup (do NOT carry on with a zero-initialised
+/// private key).
+unsafe fn assign_fresh_ecdh_key(
+    sys: &SyscallTable,
+    driver: &mut HandshakeDriver,
+    eph_private: &[[u8; 32]; MAX_SESSIONS],
+    eph_public: &[[u8; 65]; MAX_SESSIONS],
+    eph_used: &mut [bool; MAX_SESSIONS],
+) -> bool {
     let mut random = [0u8; 32];
     if dev_csprng_fill(sys, random.as_mut_ptr(), 32) < 0 {
-        // Fall back to the pre-computed pool slot if CSPRNG is unavailable.
-        let key_idx = if idx < MAX_SESSIONS && !s.eph_used[idx] { idx } else { 0 };
-        sess.driver.ecdh_private = s.eph_private[key_idx];
-        sess.driver.ecdh_public = s.eph_public[key_idx];
-        s.eph_used[key_idx] = true;
+        // CSPRNG unavailable — burn one pool slot. The pool is
+        // consumed at most once per slot across the module's
+        // lifetime; if every slot is used, the caller aborts.
+        let mut key_idx: Option<usize> = None;
+        let mut k = 0;
+        while k < MAX_SESSIONS {
+            if !eph_used[k] { key_idx = Some(k); break; }
+            k += 1;
+        }
+        let key_idx = match key_idx {
+            Some(i) => i,
+            None => return false,
+        };
+        driver.ecdh_private = eph_private[key_idx];
+        driver.ecdh_public = eph_public[key_idx];
+        eph_used[key_idx] = true;
     } else {
-        let (priv_key, pub_key) = ecdh_keygen(&random);
-        sess.driver.ecdh_private = priv_key;
-        sess.driver.ecdh_public = pub_key;
-        // Volatile wipe of the stack buffer — the private scalar has been
-        // consumed by ecdh_keygen but the random seed also leaks it.
+        let (mut priv_key, pub_key) = ecdh_keygen(&random);
+        driver.ecdh_private = priv_key;
+        driver.ecdh_public = pub_key;
+        // Volatile wipe of every stack-resident copy of the
+        // private scalar — the seed (`random`) the key was
+        // derived from, plus the `priv_key` temporary we just
+        // moved into the driver. The compiler is free to leave
+        // both alive until the function returns; without these
+        // wipes a downstream stack-overlay reuse could observe
+        // a residue of the secret in another frame.
         let mut i = 0;
         while i < 32 {
             core::ptr::write_volatile(random.as_mut_ptr().add(i), 0);
+            core::ptr::write_volatile(priv_key.as_mut_ptr().add(i), 0);
             i += 1;
         }
     }
+    true
+}
 
+/// Post-handshake key-material cleanup. Zeroes the ECDH private
+/// scalar and the handshake-tier secrets once application keys
+/// are derived. Neither piece of material is recoverable from
+/// the on-wire transcript (forward secrecy holds against a passive
+/// observer regardless of what we wipe), but leaving these
+/// resident widens the *compromise* window — any attacker who
+/// later reads our memory recovers the handshake secrets and
+/// from them the application traffic keys, breaking confidentiality
+/// of every record we've sent or will send under this session.
+/// Scrubbing them as soon as the next-tier keys exist bounds that
+/// window to the lifetime of `application_traffic_secret_N` itself.
+///
+/// Called by both the TCP-TLS and DTLS app-keys-derivation paths
+/// so the rule is uniform across transports.
+unsafe fn zeroize_post_app_keys(driver: &mut HandshakeDriver) {
+    if let Some(ref mut ks) = driver.key_schedule {
+        let mut i = 0;
+        while i < 48 {
+            core::ptr::write_volatile(&mut ks.client_hs_secret[i], 0);
+            core::ptr::write_volatile(&mut ks.server_hs_secret[i], 0);
+            i += 1;
+        }
+    }
+    let mut i = 0;
+    while i < 32 {
+        core::ptr::write_volatile(&mut driver.ecdh_private[i], 0);
+        i += 1;
+    }
+}
+
+unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
+    let sys = &*s.syscalls;
+    let ok = assign_fresh_ecdh_key(
+        sys,
+        &mut s.sessions[idx].driver,
+        &s.eph_private,
+        &s.eph_public,
+        &mut s.eph_used,
+    );
+    if !ok {
+        s.sessions[idx].state = SessionState::Error;
+        return;
+    }
     // Default suite (will be set during handshake)
-    sess.driver.suite = CipherSuite::ChaCha20Poly1305;
+    s.sessions[idx].driver.suite = CipherSuite::ChaCha20Poly1305;
 }
 
 // ============================================================================
@@ -1500,11 +1697,12 @@ unsafe fn pump_send_certificate_request(s: &mut TlsState, idx: usize) -> bool {
 unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
     match recv_encrypted_handshake(s, idx) {
         Some((data, len, msg_type)) => {
-            if msg_type != 11 {
-                if let Some(ref mut t) = s.sessions[idx].driver.transcript {
-                    t.update(&data[..len]);
-                }
-                s.sessions[idx].driver.hs_state = HandshakeState::RecvClientFinished;
+            // We only reach this state when verify_peer != 0 (mTLS).
+            // RFC 8446 §4.4.2.4: the client MUST send a Certificate
+            // message. Anything else — including a client sending
+            // Finished directly to skip auth — is a protocol error.
+            if msg_type != HT_CERTIFICATE {
+                s.sessions[idx].state = SessionState::Error;
                 return true;
             }
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
@@ -1677,22 +1875,14 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         sess.write_keys = wk;
         sess.read_keys = rk;
     }
-    // Zeroize handshake secrets — no longer needed.
-    if let Some(ref mut ks) = sess.driver.key_schedule {
-        let mut i = 0;
-        while i < 48 {
-            core::ptr::write_volatile(&mut ks.client_hs_secret[i], 0);
-            core::ptr::write_volatile(&mut ks.server_hs_secret[i], 0);
-            i += 1;
-        }
-    }
-    let mut i = 0;
-    while i < 32 {
-        core::ptr::write_volatile(&mut sess.driver.ecdh_private[i], 0);
-        i += 1;
-    }
+    // Drop handshake secrets + ECDH private. Shared with DTLS via
+    // `zeroize_post_app_keys` — the secret-scrubbing rule is one
+    // policy, applied identically across transports.
+    zeroize_post_app_keys(&mut sess.driver);
     sess.state = SessionState::Ready;
     dev_log(sys, 3, b"[tls] handshake complete".as_ptr(), b"[tls] handshake complete".len());
+    emit_peer_identity(s, idx);
+    let sess = &mut s.sessions[idx];
     let held = sess.held_msg_type;
     let conn_id = sess.conn_id;
     if held != 0 {
@@ -1700,6 +1890,131 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         tls_write_frame(sys, s.clear_out, held, conn_id, core::ptr::null(), 0, &mut s.net_scratch);
     }
     true
+}
+
+/// Fluxor-owned wire constants for `MSG_PEER_IDENTITY`. The
+/// envelope is a fluxor-graph primitive (foundation/tls emits it,
+/// any consumer module — peer_router, RBAC, log, audit — can read
+/// it); the format is documented here, not in any downstream
+/// consumer's repo. clustor's `peer_router` mirrors these
+/// constants but is one valid consumer among many.
+///
+/// Wire format: `[msg_type:1][payload_len:2 LE]
+/// [conn_id:1][replica_id:1=0xFF][verified:1][svid_len:1][svid…]`
+/// (payload_len excludes the 3-byte header).
+///
+/// `verified == 1` iff `svid_len > 0`. `svid` is the SHA-256 of
+/// the peer's raw cert subjectPublicKey (always 32 bytes for
+/// ECDSA-P-256). A peer with no cert (plaintext / anonymous
+/// handshake) gets `verified=0, svid_len=0`.
+pub const MSG_PEER_IDENTITY: u8 = 0x5A;
+pub const PEER_IDENTITY_REPLICA_UNKNOWN: u8 = 0xFF;
+pub const PEER_IDENTITY_HEADER_LEN: usize = 3;
+pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = 4; // conn_id + replica + verified + svid_len
+pub const PEER_IDENTITY_MAX_SVID: usize = 32;
+pub const PEER_IDENTITY_MAX_TOTAL: usize =
+    PEER_IDENTITY_HEADER_LEN + PEER_IDENTITY_FIXED_PAYLOAD_LEN + PEER_IDENTITY_MAX_SVID;
+
+/// Build the `MSG_PEER_IDENTITY` envelope into `out`. Returns the
+/// total byte count. Pure formatter — no I/O. Separated from the
+/// emit path so the latch/retry logic can re-send byte-identical
+/// envelopes across ticks.
+pub fn build_peer_identity_envelope(
+    conn_id: u8,
+    svid: &[u8],
+    out: &mut [u8; PEER_IDENTITY_MAX_TOTAL],
+) -> usize {
+    let svid_len = if svid.len() > PEER_IDENTITY_MAX_SVID {
+        PEER_IDENTITY_MAX_SVID
+    } else {
+        svid.len()
+    };
+    let verified: u8 = if svid_len > 0 { 1 } else { 0 };
+    let payload_len = PEER_IDENTITY_FIXED_PAYLOAD_LEN + svid_len;
+    out[0] = MSG_PEER_IDENTITY;
+    out[1] = (payload_len & 0xFF) as u8;
+    out[2] = ((payload_len >> 8) & 0xFF) as u8;
+    out[3] = conn_id;
+    out[4] = PEER_IDENTITY_REPLICA_UNKNOWN;
+    out[5] = verified;
+    out[6] = svid_len as u8;
+    if svid_len > 0 {
+        out[7..7 + svid_len].copy_from_slice(&svid[..svid_len]);
+    }
+    PEER_IDENTITY_HEADER_LEN + payload_len
+}
+
+/// Build a `MSG_PEER_IDENTITY` envelope for the session and try to
+/// write it on the optional `peer_identity` output port. If the
+/// channel is full at handshake completion, latch the envelope in
+/// `pending_peer_identity` so `service_pending_peer_identity` can
+/// retry from `module_step` on subsequent ticks. The contract is
+/// at-least-once delivery: downstream consumers may safely receive
+/// the same envelope twice (idempotent identity binding).
+unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
+    if s.peer_identity < 0 { return; }
+    // Hash the peer pubkey into a 32-byte SVID. Plaintext peers
+    // (no cert) yield an empty slice → verified=0.
+    let pk_len = s.sessions[idx].driver.peer_cert_pubkey_len as usize;
+    let mut svid_buf = [0u8; PEER_IDENTITY_MAX_SVID];
+    let svid_slice: &[u8] = if pk_len > 0 {
+        let digest = sha256(&s.sessions[idx].driver.peer_cert_pubkey[..pk_len]);
+        svid_buf.copy_from_slice(&digest);
+        &svid_buf[..]
+    } else {
+        &svid_buf[..0]
+    };
+    let conn_id = s.sessions[idx].conn_id;
+    let mut envelope = [0u8; PEER_IDENTITY_MAX_TOTAL];
+    let total = build_peer_identity_envelope(conn_id, svid_slice, &mut envelope);
+
+    // Latch first, then attempt an immediate write. If the write
+    // accepts the full envelope we clear the latch in the same
+    // pass; otherwise `service_pending_peer_identity` picks it up
+    // on the next tick. Latching unconditionally avoids races
+    // where another producer fills the channel between our poll
+    // and our write.
+    {
+        let sess = &mut s.sessions[idx];
+        sess.pending_peer_identity[..total].copy_from_slice(&envelope[..total]);
+        sess.pending_peer_identity_len = total as u8;
+    }
+    try_drain_pending_peer_identity(s, idx);
+}
+
+/// Attempt one write of any pending peer-identity envelope. Used
+/// both at handshake completion (via `emit_peer_identity`) and
+/// from the module-step sweep when the channel was previously
+/// full.
+unsafe fn try_drain_pending_peer_identity(s: &mut TlsState, idx: usize) {
+    if s.peer_identity < 0 { return; }
+    let len = s.sessions[idx].pending_peer_identity_len as usize;
+    if len == 0 { return; }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.peer_identity, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    let ptr = s.sessions[idx].pending_peer_identity.as_ptr();
+    let written = (sys.channel_write)(s.peer_identity, ptr, len);
+    if written == len as i32 {
+        s.sessions[idx].pending_peer_identity_len = 0;
+    }
+    // Partial-write isn't allowed by the channel ABI (writes are
+    // atomic-FIFO — accepted wholesale or rejected). On rejection
+    // the latch is preserved and we retry next tick.
+}
+
+/// Sweep every Ready session and retry latched peer-identity
+/// envelopes. Called once per `module_step` after the handshake
+/// pump runs. O(MAX_SESSIONS) per tick — fine at MAX_SESSIONS=4.
+unsafe fn service_pending_peer_identity(s: &mut TlsState) {
+    if s.peer_identity < 0 { return; }
+    let mut i = 0;
+    while i < MAX_SESSIONS {
+        if s.sessions[i].pending_peer_identity_len > 0 {
+            try_drain_pending_peer_identity(s, i);
+        }
+        i += 1;
+    }
 }
 
 // ============================================================================

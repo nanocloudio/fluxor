@@ -2959,6 +2959,29 @@ pub mod test_helpers {
         }
         (used, tcp::MAX_TCP_CONNS)
     }
+
+    /// Snapshot of the per-tick telemetry counters. Tests use this to
+    /// gate on "the data path is starved" (`idle_steps` ≈ ticks) vs
+    /// "back-pressure caused stalls" (`bp_steps` > 0) without parsing
+    /// the periodic `[ip] tlm …` log line.
+    pub struct TlmSnapshot {
+        pub bytes_in: u32,
+        pub bytes_out: u32,
+        pub idle_steps: u32,
+        pub bp_steps: u32,
+        pub step_count: u32,
+    }
+
+    pub unsafe fn tlm_snapshot(state: *const u8) -> TlmSnapshot {
+        let s = &*(state as *const IpState);
+        TlmSnapshot {
+            bytes_in: s.tlm.bytes_in,
+            bytes_out: s.tlm.bytes_out,
+            idle_steps: s.tlm.idle_steps,
+            bp_steps: s.tlm.bp_steps,
+            step_count: s.step_count,
+        }
+    }
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

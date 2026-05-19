@@ -941,19 +941,28 @@ pub fn parse_encrypted_extensions_for_quic(body: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Select best cipher suite from client's list.
-/// Currently restricted to ChaCha20-Poly1305 only — AES-GCM requires SBOX
-/// lookup tables in .rodata which miscompile on PIC aarch64.
+/// Select best cipher suite from client's list. Preference order:
+/// ChaCha20-Poly1305 → AES-128-GCM → AES-256-GCM. The AES suites are
+/// PIC-safe now that `module.ld` funnels `.data.rel.ro*` (LLVM jump
+/// tables) into the loader-relocated `.rodata` output section; the
+/// AES SBOX itself is `const [u8; 256]` which has always landed in
+/// `.rodata` directly.
 pub fn select_cipher_suite(client_suites: &[u8]) -> Option<CipherSuite> {
-    // Only ChaCha20-Poly1305 is PIC-safe (no lookup tables, no .rodata consts)
+    let mut found_aes128 = false;
+    let mut found_aes256 = false;
     let mut i = 0;
     while i + 1 < client_suites.len() {
         let cs = get_u16(client_suites, i);
+        // ChaCha20 wins outright — fastest scalar path, no SBOX.
         if cs == 0x1303 {
             return Some(CipherSuite::ChaCha20Poly1305);
         }
+        if cs == 0x1301 { found_aes128 = true; }
+        if cs == 0x1302 { found_aes256 = true; }
         i += 2;
     }
+    if found_aes128 { return Some(CipherSuite::Aes128Gcm); }
+    if found_aes256 { return Some(CipherSuite::Aes256Gcm); }
     None
 }
 

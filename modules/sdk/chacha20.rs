@@ -72,6 +72,39 @@ fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     out
 }
 
+/// XOR 64 bytes of keystream into `data` using NEON `eor` over four
+/// 128-bit `q` registers. The scalar loop pegs at ~3 cycles/byte on
+/// ARMv8; the NEON path is ~0.3 cycles/byte for the XOR proper
+/// (same pattern as the NVMe NC→C memcpy fix), shifting the
+/// bottleneck back onto `chacha20_block` itself which dominates
+/// total runtime anyway. The block compute is unchanged — only the
+/// per-byte XOR step is vectorised.
+///
+/// # Safety
+/// Both pointers must reference 64 valid bytes. They may alias —
+/// `ldp` / `stp` against the same address sequence is well-defined
+/// when the data window is identical.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_64_neon(keystream: *const u8, data: *mut u8) {
+    core::arch::asm!(
+        "ldp q0, q1, [{ks}]",
+        "ldp q2, q3, [{ks}, #32]",
+        "ldp q4, q5, [{dst}]",
+        "ldp q6, q7, [{dst}, #32]",
+        "eor v4.16b, v4.16b, v0.16b",
+        "eor v5.16b, v5.16b, v1.16b",
+        "eor v6.16b, v6.16b, v2.16b",
+        "eor v7.16b, v7.16b, v3.16b",
+        "stp q4, q5, [{dst}]",
+        "stp q6, q7, [{dst}, #32]",
+        ks = in(reg) keystream,
+        dst = in(reg) data,
+        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+    );
+}
+
 /// ChaCha20 encrypt/decrypt (XOR keystream)
 fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
     let mut ctr = counter;
@@ -79,6 +112,23 @@ fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8])
     while offset < data.len() {
         let block = chacha20_block(key, ctr, nonce);
         let remain = data.len() - offset;
+        // Full 64-byte block + aarch64 → NEON eor. Tail bytes
+        // (< 64 remaining) take the scalar path so we don't read
+        // past the data slice.
+        #[cfg(target_arch = "aarch64")]
+        {
+            if remain >= 64 {
+                unsafe {
+                    xor_64_neon(
+                        block.as_ptr(),
+                        data.as_mut_ptr().add(offset),
+                    );
+                }
+                offset += 64;
+                ctr += 1;
+                continue;
+            }
+        }
         let take = if remain < 64 { remain } else { 64 };
         let mut j = 0;
         while j < take {

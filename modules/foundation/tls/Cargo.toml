@@ -1,0 +1,26 @@
+[package]
+name = "fluxor-mod-tls"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Bare-metal TLS 1.3 / DTLS 1.3 module — host-test build"
+
+# Mirrors `modules/foundation/ip/Cargo.toml`. Lets the bare-metal
+# `tls` module crate compile as a host rlib so the test harness can
+# KAT the crypto primitives + drive the handshake state machine.
+# PIC firmware builds invoke `rustc` directly against `mod.rs` (see
+# `Makefile :: modules`) and don't consult this file.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+# `host-test` switches the module away from `#![no_std]` and lets
+# the host harness link it. PIC builds never set this feature.
+default = []
+host-test = []
+
+[dependencies]
+fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }

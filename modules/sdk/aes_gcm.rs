@@ -101,11 +101,17 @@ impl AesKey {
                 rk[i][3] = SBOX[prev[12] as usize] ^ prev2[3];
                 rcon_idx += 1;
             } else {
-                // SubWord only (AES-256 extra step)
-                rk[i][0] = SBOX[prev[0] as usize] ^ prev2[0];
-                rk[i][1] = SBOX[prev[1] as usize] ^ prev2[1];
-                rk[i][2] = SBOX[prev[2] as usize] ^ prev2[2];
-                rk[i][3] = SBOX[prev[3] as usize] ^ prev2[3];
+                // AES-256 odd-index step: SubWord applied to the LAST
+                // word of the previous round key (W[i-1] in FIPS-197
+                // notation), i.e. `prev[12..15]` not `prev[0..3]`.
+                // Caught by NIST GCM Test Case 13/14 — the previous
+                // code was operating on W[i-4] which silently produced
+                // a wrong key schedule with no other test ever
+                // exercising it.
+                rk[i][0] = SBOX[prev[12] as usize] ^ prev2[0];
+                rk[i][1] = SBOX[prev[13] as usize] ^ prev2[1];
+                rk[i][2] = SBOX[prev[14] as usize] ^ prev2[2];
+                rk[i][3] = SBOX[prev[15] as usize] ^ prev2[3];
             }
 
             let mut j = 4;
@@ -119,23 +125,144 @@ impl AesKey {
     }
 
     fn encrypt_block(&self, block: &mut [u8; 16]) {
-        // AddRoundKey (initial)
-        xor_block(block, &self.round_keys[0]);
+        // ARMv8 Cryptography Extension fast path. Gated on
+        // `target_feature = "aes"` (not just `target_arch =
+        // "aarch64"`) — bare ARMv8-A without the +crypto extension
+        // SIGILLs on AESE/AESMC. Cortex-A76 (Pi 5, our cm5 build)
+        // and every Pi-class A-core ships +crypto; the gate keeps
+        // QEMU-unknown / older Cortex-A53 hosts honest.
+        //
+        // RUSTFLAGS for the cm5 / bcm2712 PIC build sets
+        // `-C target-feature=+aes`. Host-test on the same Pi 5
+        // gets it via the rustc auto-detect of the build host.
+        // Everything else falls through to the scalar path that
+        // the KATs gate against.
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        unsafe {
+            encrypt_block_aarch64_aes(block, &self.round_keys, self.rounds);
+            return;
+        }
+        // Scalar AddRoundKey + SubBytes + ShiftRows + MixColumns +
+        // AddRoundKey loop. Byte-identical reference for KATs and
+        // the fallback used on aarch64-without-crypto, rp2350
+        // Cortex-M33, wasm32, and any host where the AES extension
+        // isn't present.
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            // AddRoundKey (initial)
+            xor_block(block, &self.round_keys[0]);
 
-        // Main rounds
-        let mut r = 1;
-        while r < self.rounds {
+            // Main rounds
+            let mut r = 1;
+            while r < self.rounds {
+                sub_bytes(block);
+                shift_rows(block);
+                mix_columns(block);
+                xor_block(block, &self.round_keys[r]);
+                r += 1;
+            }
+
+            // Final round (no MixColumns)
             sub_bytes(block);
             shift_rows(block);
-            mix_columns(block);
-            xor_block(block, &self.round_keys[r]);
-            r += 1;
+            xor_block(block, &self.round_keys[self.rounds]);
         }
+    }
+}
 
-        // Final round (no MixColumns)
-        sub_bytes(block);
-        shift_rows(block);
-        xor_block(block, &self.round_keys[self.rounds]);
+/// ARMv8-A AES instructions for one block. `rounds` is 10 (AES-128)
+/// or 14 (AES-256). The round-key array holds `rounds + 1` keys
+/// (the last entry is the post-final-AESE EOR target).
+///
+/// Compiled only when both `target_arch = "aarch64"` AND
+/// `target_feature = "aes"` are set — guards against SIGILL on
+/// ARMv8-A cores without the Cryptography Extension. The cm5 PIC
+/// build sets `-C target-feature=+aes` via the bcm2712 target
+/// spec; host-test on the same Pi 5 inherits the host CPU's
+/// feature set; non-aarch64 builds and aarch64-without-crypto
+/// hosts fall back to the scalar SBOX path in `encrypt_block`.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(never)]
+unsafe fn encrypt_block_aarch64_aes(
+    block: &mut [u8; 16],
+    rks: &[[u8; 16]; 15],
+    rounds: usize,
+) {
+    // `aese` consumes v1; we need a fresh round-key register for
+    // each round so we load them all upfront into v1..v15 then
+    // pipeline AESE/AESMC against the contiguous register file.
+    if rounds == 10 {
+        core::arch::asm!(
+            ".arch armv8-a+crypto",
+            "ldr q0, [{state}]",
+            "ldp q1, q2, [{rks}, #0]",
+            "ldp q3, q4, [{rks}, #32]",
+            "ldp q5, q6, [{rks}, #64]",
+            "ldp q7, q8, [{rks}, #96]",
+            "ldp q9, q10, [{rks}, #128]",
+            "ldr q11, [{rks}, #160]",
+            // Rounds 1-9: AESE then AESMC.
+            "aese v0.16b, v1.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v2.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v3.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v4.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v5.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v6.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v7.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v8.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v9.16b",  "aesmc v0.16b, v0.16b",
+            // Final round: AESE (no AESMC) then EOR with rk[10].
+            "aese v0.16b, v10.16b",
+            "eor v0.16b, v0.16b, v11.16b",
+            "str q0, [{state}]",
+            state = in(reg) block.as_mut_ptr(),
+            rks = in(reg) rks.as_ptr(),
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+        );
+    } else {
+        // AES-256 — 14 rounds → 15 round keys → 14 AESE + 13 AESMC
+        // + 1 EOR. We hold rk[0..7] in v1..v8 for the first
+        // batch, then reload rk[8..14] into v9..v15 + v1 (reuse).
+        core::arch::asm!(
+            ".arch armv8-a+crypto",
+            "ldr q0, [{state}]",
+            // rk[0..6] → v1..v7
+            "ldp q1, q2, [{rks}, #0]",
+            "ldp q3, q4, [{rks}, #32]",
+            "ldp q5, q6, [{rks}, #64]",
+            "ldr q7, [{rks}, #96]",
+            // First 7 AESE+AESMC pairs.
+            "aese v0.16b, v1.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v2.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v3.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v4.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v5.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v6.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v7.16b",  "aesmc v0.16b, v0.16b",
+            // rk[7..14] → v1..v8 (reload).
+            "ldp q1, q2, [{rks}, #112]",
+            "ldp q3, q4, [{rks}, #144]",
+            "ldp q5, q6, [{rks}, #176]",
+            "ldp q7, q8, [{rks}, #208]",
+            // Rounds 8..13: AESE + AESMC.
+            "aese v0.16b, v1.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v2.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v3.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v4.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v5.16b",  "aesmc v0.16b, v0.16b",
+            "aese v0.16b, v6.16b",  "aesmc v0.16b, v0.16b",
+            // Final round: AESE (no AESMC) then EOR with rk[14].
+            "aese v0.16b, v7.16b",
+            "eor v0.16b, v0.16b, v8.16b",
+            "str q0, [{state}]",
+            state = in(reg) block.as_mut_ptr(),
+            rks = in(reg) rks.as_ptr(),
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _,
+        );
     }
 }
 

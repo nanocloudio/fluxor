@@ -111,8 +111,28 @@ impl TrafficKeys {
         n
     }
 
-    pub fn advance_seq(&mut self) {
+    /// Advance the AEAD record sequence counter. Returns false if
+    /// the counter would wrap past `u64::MAX` — RFC 8446 §5.3 says
+    /// the endpoint MUST either rekey or close the connection at
+    /// that point. With no rekey path the caller's option is to
+    /// abort the encrypt/decrypt and transition the session to
+    /// Error so the peer reconnects. In practice no real session
+    /// sees 2^64 records — at 10 Gb/s of 1500-byte records that's
+    /// ~880 millennia — but the check is a one-instruction
+    /// defence against a torn implementation reusing nonces.
+    #[must_use]
+    pub fn advance_seq(&mut self) -> bool {
+        if self.seq == u64::MAX { return false; }
         self.seq += 1;
+        true
+    }
+
+    /// True if the next call to `advance_seq` would fail. Use
+    /// before calling `encrypt_record` / `decrypt_record` so the
+    /// session can shed back into an Error state before the
+    /// invalid encrypt is attempted.
+    pub fn seq_exhausted(&self) -> bool {
+        self.seq == u64::MAX
     }
 }
 
@@ -164,8 +184,12 @@ pub fn encrypt_record(
     out_buf[plaintext.len()] = content_type;
 
     let data_len = plaintext.len() + 1;
+    // Nonce uses the current seq value; advance_seq bumps it for
+    // the next record. RFC 8446 §5.3: refuse to encrypt under a
+    // seq that would wrap, returning 0 (the caller's "no record
+    // produced" sentinel).
     let nonce = keys.nonce();
-    keys.advance_seq();
+    if !keys.advance_seq() { return 0; }
 
     match suite {
         CipherSuite::ChaCha20Poly1305 => {
@@ -246,8 +270,11 @@ pub fn decrypt_record(
 
     if !ok { return None; }
 
-    // MAC verified — now advance sequence counter
-    keys.advance_seq();
+    // MAC verified — now advance sequence counter. RFC 8446 §5.3:
+    // refuse to decrypt past 2^64-1; signal to the caller (None ≡
+    // bad MAC) so the session is torn down rather than reusing
+    // a nonce.
+    if !keys.advance_seq() { return None; }
 
     // Find inner content type (last non-zero byte of decrypted data)
     let mut pt_len = data.len();
