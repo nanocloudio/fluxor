@@ -12,6 +12,7 @@ use std::env;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::process;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -329,6 +330,12 @@ fn main() {
     let tick_duration = Duration::from_micros(tick_us as u64);
     let mut tick: u64 = 0;
 
+    // Capture the runtime thread so `linux_wake_scheduler` (called via
+    // `hal::wake_scheduler` from `event_signal` / `event_signal_from_isr`)
+    // can `unpark()` us out of `park_timeout` between ticks. Matches RP's
+    // SIGNAL-races-Timer pattern in `embassy_futures::select`.
+    linux_install_wake_thread();
+
     loop {
         let t0 = Instant::now();
 
@@ -348,6 +355,18 @@ fn main() {
             process::exit(0);
         }
 
+        // Event-wake parity with RP: drain any wake bits that latched
+        // during step_modules (modules signaling their own events) and
+        // run the affected modules through the same `step_one_module`
+        // body with `event_wake = true`. Without this, events signaled
+        // mid-tick on Linux waited until the next full tick to run —
+        // an interrupt-driven module would observe its event arbitrarily
+        // late depending on `tick_us`.
+        let wake = fluxor::kernel::event::take_wake_pending();
+        if wake != 0 {
+            scheduler::step_woken_modules(&mut sched.modules, module_count, wake);
+        }
+
         tick += 1;
 
         scheduler::maybe_emit_alive(tick, None);
@@ -358,17 +377,41 @@ fn main() {
         // instead and only fall back to sleep at coarse settings:
         //
         //   * tick_us == 0   → pure busy-loop, no pacing.
-        //   * tick_us <= 200 → spin until `tick_duration` elapses.
-        //   * tick_us > 200  → sleep for the remainder.
+        //   * tick_us <= 200 → spin until `tick_duration` elapses,
+        //                      yielding early if a wake bit fires.
+        //   * tick_us > 200  → `park_timeout` for the remainder; an
+        //                      `unpark` from `linux_wake_scheduler`
+        //                      returns immediately so the next
+        //                      iteration's drain runs the woken module.
         let elapsed = t0.elapsed();
         if tick_us == 0 {
             // Pure busy-loop — recheck immediately.
         } else if tick_us <= 200 {
             while t0.elapsed() < tick_duration {
+                // Yield early on wake so woken modules don't wait out
+                // the remainder of the spin budget. The bit stays
+                // latched in EVENT_WAKE_PENDING for the next iteration.
+                if fluxor::kernel::event::wake_pending_nonzero() {
+                    break;
+                }
                 core::hint::spin_loop();
             }
         } else if elapsed < tick_duration {
-            thread::sleep(tick_duration - elapsed);
+            // `park_timeout` is interruptible by `unpark()` and may
+            // return spuriously; either way the next iteration drains
+            // wake bits and steps. The remaining budget is the upper
+            // bound, never a hard sleep.
+            thread::park_timeout(tick_duration - elapsed);
+        }
+
+        // Second drain after the wait: an event signaled during the
+        // park_timeout (or between the first drain and entering the
+        // spin) reaches `step_woken_modules` before the next full
+        // step pass, matching RP's two-drain wake path.
+        let wake = fluxor::kernel::event::take_wake_pending();
+        if wake != 0 {
+            let sched = unsafe { scheduler::sched_mut() };
+            scheduler::step_woken_modules(&mut sched.modules, module_count, wake);
         }
     }
 }

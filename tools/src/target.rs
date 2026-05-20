@@ -270,74 +270,129 @@ impl TargetDescriptor {
 /// Load and resolve a target by name.
 ///
 /// Resolution order:
-/// 1. Check `targets/boards/{name}.toml` — if found, load board + referenced silicon
-/// 2. Check `targets/silicon/{name}.toml` — if found, load silicon directly
-/// 3. Error: unknown target
+/// 1. Check `<project_root>/targets/boards/{name}.toml` — board first.
+/// 2. Check `<project_root>/targets/silicon/{name}.toml`.
+/// 3. **Fall back to the install root** (when discovered — see
+///    `project::install_root`) and repeat 1+2 against it. Lets an
+///    external user project reuse bundled targets without copying
+///    them.
+/// 4. Error: unknown target.
 pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> {
-    let targets_dir = project_root.join("targets");
-
-    // Try board first
-    let board_path = targets_dir.join("boards").join(format!("{}.toml", name));
-    if board_path.exists() {
-        return load_board_target(&board_path, &targets_dir);
+    // Try project root first.
+    if let Some(desc) = try_load_target_under(name, project_root)? {
+        return Ok(desc);
     }
-
-    // Try silicon
-    let silicon_path = targets_dir.join("silicon").join(format!("{}.toml", name));
-    if silicon_path.exists() {
-        return load_silicon_target(&silicon_path);
-    }
-
-    // List available targets for error message
-    let available = list_targets(project_root);
-    Err(Error::Config(format!(
-        "Unknown target '{}'. Available: {}",
-        name,
-        if available.is_empty() {
-            "none (missing targets/ directory?)".to_string()
-        } else {
-            available.join(", ")
+    // Then install root, if discovered.
+    if let Some(install) = crate::project::install_root() {
+        if install.path != project_root {
+            if let Some(desc) = try_load_target_under(name, &install.path)? {
+                return Ok(desc);
+            }
         }
+    }
+
+    let available = list_targets(project_root);
+    let main = if available.is_empty() {
+        "none (missing targets/ directory?)".to_string()
+    } else {
+        available.join(", ")
+    };
+    // "Did you mean …?" hint — small Levenshtein with a cheap
+    // threshold. Most typos are 1-2 character distance from the
+    // intended name (`pic2w` → `pico2w`, `cm` → `cm5`, …). Cap at
+    // distance 3 to avoid suggesting wildly unrelated targets.
+    let suggestion = closest_match(name, &available, 3);
+    let did_you_mean = match suggestion {
+        Some(s) => format!(" Did you mean '{s}'?"),
+        None => String::new(),
+    };
+    Err(Error::Config(format!(
+        "Unknown target '{name}'.{did_you_mean} Available: {main}"
     )))
 }
 
-/// List all available target names (boards + silicon).
-pub fn list_targets(project_root: &Path) -> Vec<String> {
-    let targets_dir = project_root.join("targets");
-    let mut names = Vec::new();
+// Levenshtein-distance helpers moved to
+// `tools/src/text_distance.rs` so the library-side `manifest.rs`
+// can use the same lookup for "did you mean" hints on content_type
+// typos. Re-exported here for binary-tree callers (stack_expand,
+// config, this file) that adopted them via
+// `crate::target::closest_match` before the move.
+pub(crate) use crate::text_distance::closest_match;
 
-    // Boards first (more user-friendly)
-    if let Ok(entries) = std::fs::read_dir(targets_dir.join("boards")) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry
-                .path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-            {
-                names.push(name);
-            }
-        }
+/// Try to resolve `name` under a single root. Returns `Ok(None)`
+/// when neither the board nor silicon file exists — distinct from
+/// `Ok(Some(desc))` (found) and `Err(...)` (file present but
+/// malformed). The two-stage return lets `load_target` walk
+/// multiple roots without conflating "not here" with "broken".
+fn try_load_target_under(name: &str, root: &Path) -> Result<Option<TargetDescriptor>> {
+    let targets_dir = root.join("targets");
+    let board_path = targets_dir.join("boards").join(format!("{}.toml", name));
+    if board_path.exists() {
+        return load_board_target(&board_path, &targets_dir).map(Some);
     }
+    let silicon_path = targets_dir.join("silicon").join(format!("{}.toml", name));
+    if silicon_path.exists() {
+        return load_silicon_target(&silicon_path).map(Some);
+    }
+    Ok(None)
+}
 
-    // Then silicon
-    if let Ok(entries) = std::fs::read_dir(targets_dir.join("silicon")) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry
-                .path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-            {
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
+/// List all available target names (boards + silicon).
+///
+/// Merges entries from `project_root/targets/` AND from the install
+/// root (when discovered via `project::install_root`). The project
+/// root wins on duplicate names — a user override silently masks
+/// the bundled descriptor, which is the intended behaviour.
+pub fn list_targets(project_root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_target_names_under(project_root, &mut names);
+
+    // Merge install-root entries that aren't already present.
+    if let Some(install) = crate::project::install_root() {
+        if install.path != project_root {
+            collect_target_names_under(&install.path, &mut names);
         }
     }
 
     names.sort();
     names
+}
+
+/// List target names under a single root. Used by `fluxor inspect`
+/// to render a merged "what's available where" view with source
+/// annotations (project root vs install root). Distinct from
+/// `list_targets` which deduplicates across roots — this returns
+/// only what `root` itself carries, so the caller can compute
+/// merge/shadow semantics for display.
+pub fn list_targets_under(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_target_names_under(root, &mut names);
+    names.sort();
+    names
+}
+
+/// Walk a single root's `targets/{boards,silicon}/` and append
+/// every `*.toml` file stem to `names` that isn't already present.
+/// Project-root entries win on duplicate names because the project
+/// root is walked first.
+fn collect_target_names_under(root: &Path, names: &mut Vec<String>) {
+    let targets_dir = root.join("targets");
+    for subdir in ["boards", "silicon"] {
+        if let Ok(entries) = std::fs::read_dir(targets_dir.join(subdir)) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry
+                    .path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Internal loading ────────────────────────────────────────────────────────
@@ -527,3 +582,6 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
         s.parse::<u32>().ok()
     }
 }
+
+// Inline tests for `closest_match` / `levenshtein` live in
+// `tools/src/text_distance.rs` alongside the implementation.

@@ -355,17 +355,17 @@ regex = "kernel\\.img$"
         std::fs::write(tmp.join("sub/b.bin"), b"bbb").unwrap();
         std::fs::write(tmp.join("c.bin"), b"ccc").unwrap();
 
-        let h1 = hash_artifact_bundle(&tmp).unwrap();
+        let h1 = hash_artifact_bundle(tmp).unwrap();
         // Perturb: add and remove a file that shouldn't change the hash
         // after being removed.
         std::fs::write(tmp.join("temp.bin"), b"xxx").unwrap();
-        let h_with = hash_artifact_bundle(&tmp).unwrap();
+        let h_with = hash_artifact_bundle(tmp).unwrap();
         assert_ne!(h1, h_with);
         std::fs::remove_file(tmp.join("temp.bin")).unwrap();
-        let h_after = hash_artifact_bundle(&tmp).unwrap();
+        let h_after = hash_artifact_bundle(tmp).unwrap();
         assert_eq!(h1, h_after);
 
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

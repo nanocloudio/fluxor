@@ -189,6 +189,16 @@ pub fn take_wake_pending() -> u64 {
     EVENT_WAKE_PENDING.swap(0, Ordering::AcqRel)
 }
 
+/// Non-clearing peek at the wake-pending bitmask. Used by platforms
+/// that pace with a spin loop (Linux `tick_us <= 200` path) to yield
+/// the spin budget early when an event fires, without consuming the
+/// bits — the next iteration's `take_wake_pending` still observes them
+/// and runs the woken modules.
+#[inline]
+pub fn wake_pending_nonzero() -> bool {
+    EVENT_WAKE_PENDING.load(Ordering::Acquire) != 0
+}
+
 /// Release all events owned by a specific module. Called on module finish.
 /// Note: Device providers (GPIO etc.) clean up their own bindings via
 /// their own release_owned_by — this only frees event slots.

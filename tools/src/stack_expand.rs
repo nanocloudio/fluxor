@@ -277,14 +277,81 @@ pub fn expand_platform_stacks(
 // Stack loading
 // ============================================================================
 
+/// Walk `<root>/stacks/` and return every `*.toml` file stem.
+/// Used by `load_stack`'s "did you mean…?" diagnostic when the
+/// caller typo'd a stack name AND by `fluxor inspect` to render a
+/// merged project+install view (the caller dedupes/annotates by
+/// source).
+pub fn list_available_stack_names(root: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("stacks")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().is_some_and(|ext| ext == "toml") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
 fn load_stack(name: &str, project_root: &std::path::Path) -> Result<StackFile> {
-    let path = project_root.join("stacks").join(format!("{}.toml", name));
+    // Layered lookup: project root first, then the install root
+    // (when discovered). Lets an external user project override
+    // individual stacks (`stacks/audio.toml`) while still reaching
+    // the bundled defaults for everything else.
+    let project_path = project_root.join("stacks").join(format!("{}.toml", name));
+    let path = if project_path.exists() {
+        project_path
+    } else if let Some(install) = crate::project::install_root() {
+        let install_path = install.path.join("stacks").join(format!("{}.toml", name));
+        if install_path.exists() {
+            install_path
+        } else {
+            // Both roots checked, neither has the stack. Surface
+            // the *project* path in the error so the user knows
+            // where to add the override — the install path is
+            // immutable.
+            project_path
+        }
+    } else {
+        project_path
+    };
+
     let content = std::fs::read_to_string(&path).map_err(|e| {
+        // "Did you mean…?" hint via the same Levenshtein lookup
+        // the target loader uses for typo'd target names. Pulls
+        // the candidate list from both the project root and the
+        // install root so a user override that *replaces* a
+        // bundled stack still surfaces the bundled name as a
+        // suggestion.
+        let mut available = list_available_stack_names(project_root);
+        if let Some(install) = crate::project::install_root() {
+            if install.path != project_root {
+                for n in list_available_stack_names(&install.path) {
+                    if !available.contains(&n) {
+                        available.push(n);
+                    }
+                }
+            }
+        }
+        available.sort();
+        let suggestion = crate::target::closest_match(name, &available, 3);
+        let did_you_mean = match suggestion {
+            Some(s) => format!(" Did you mean '{s}'?"),
+            None => String::new(),
+        };
+        let available_str = if available.is_empty() {
+            String::new()
+        } else {
+            format!(" Available stacks: {}.", available.join(", "))
+        };
         Error::Config(format!(
-            "Unknown platform stack '{}' (no {}): {}",
-            name,
-            path.display(),
-            e
+            "Unknown platform stack '{name}' (no {}): {e}.{did_you_mean}{available_str}",
+            path.display()
         ))
     })?;
     toml::from_str(&content)

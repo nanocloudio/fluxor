@@ -60,7 +60,14 @@ pub const SIGNATURE_BLOCK_SIZE: usize = 96;
 // variants kept distinct from the generic AudioEncoded / VideoEncoded
 // surfaces so `content_type` can carry codec identity without sideband.
 
-const CONTENT_TYPES: &[&str] = &[
+/// Content-type byte → friendly name. **Single source of truth** for
+/// both manifest parsing (this file's `content_type_from_str`) and
+/// compiled-config decoding (re-exported via `pub use` so
+/// `tools/src/config.rs` does not maintain a parallel copy). Position
+/// in this table is the on-wire byte. **Appending is safe; reordering
+/// or removing entries is a wire-format break** that would silently
+/// mis-route every wired edge in every existing config blob.
+pub const CONTENT_TYPES: &[&str] = &[
     "OctetStream",
     "Cbor",
     "Json",
@@ -125,11 +132,25 @@ const CONTENT_TYPES: &[&str] = &[
 ];
 
 fn content_type_from_str(s: &str) -> Result<u8> {
-    CONTENT_TYPES
+    if let Some(idx) = CONTENT_TYPES
         .iter()
         .position(|&t| t.eq_ignore_ascii_case(s))
-        .map(|i| i as u8)
-        .ok_or_else(|| Error::Module(format!("unknown content type: {}", s)))
+    {
+        return Ok(idx as u8);
+    }
+    // Levenshtein "did you mean" hint — content_type typos in port
+    // declarations are common (e.g. `content_type: "AudioMP3"` vs
+    // `"AudioMp3"`). Case-insensitive match would have caught the
+    // capitalisation difference; the closest_match catches actual
+    // misspellings (`"AudioSamle"` → `"AudioSample"`). The helper
+    // lives in `crate::text_distance` so it's reachable from both
+    // the binary and library compilation contexts of this file.
+    let candidates: Vec<String> = CONTENT_TYPES.iter().map(|s| s.to_string()).collect();
+    let suggestion = crate::text_distance::closest_match(s, &candidates, 3);
+    Err(Error::Module(match suggestion {
+        Some(hint) => format!("unknown content type: '{s}'. Did you mean '{hint}'?"),
+        None => format!("unknown content type: '{s}'"),
+    }))
 }
 
 // ── Contract name → u8 mapping (matches provider::contract constants) ───────
@@ -152,7 +173,7 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 /// permission names like `"flash_raw"` or `"platform_raw"` are **not**
 /// contracts and must be declared under the top-level `permissions = [...]`
 /// list instead.
-fn contract_id_from_name(s: &str) -> Result<u8> {
+pub fn contract_id_from_name(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
         "gpio" => Ok(0x01),
         "spi" => Ok(0x02),
@@ -196,7 +217,13 @@ fn contract_id_from_name(s: &str) -> Result<u8> {
     }
 }
 
-fn contract_name_to_str(class: u8) -> &'static str {
+pub fn contract_name_to_str(class: u8) -> &'static str {
+    // Must round-trip with `contract_id_from_name`: every id that
+    // `_from_name` accepts MUST be present here, and the returned
+    // name MUST be one that `_from_name` round-trips back to the
+    // same id. The drift-guard test in
+    // `tools/tests/contract_id_round_trip.rs` enforces both
+    // directions.
     match class {
         0x01 => "gpio",
         0x02 => "spi",
@@ -215,6 +242,13 @@ fn contract_name_to_str(class: u8) -> &'static str {
         0x0F => "pwm",
         0x11 => "platform_dma_fd",
         0x12 => "pcie_device",
+        // Storage capability surfaces — kept in sync with
+        // `provider::contract::STORAGE_{NAMESPACE,OBJECT}` (kernel)
+        // and `contract_id_from_name` (this file). Missing these
+        // pre-2026-05-19 caused error messages quoting bit 0x13/0x14
+        // of a required-caps mask to render the byte as "unknown".
+        0x13 => "storage.namespace",
+        0x14 => "storage.object",
         _ => "unknown",
     }
 }
@@ -276,9 +310,13 @@ fn validate_capability_names(caps: &mut [String]) -> Result<()> {
                 }
             }
             None => {
+                let candidates: Vec<String> =
+                    AV_CAPABILITY_NAMES.iter().map(|s| s.to_string()).collect();
+                let did_you_mean = crate::text_distance::closest_match(c, &candidates, 3)
+                    .map(|s| format!(" Did you mean `{s}`?"))
+                    .unwrap_or_default();
                 return Err(Error::Module(format!(
-                    "unknown capability `{}`. Expected one of: {}.",
-                    c,
+                    "unknown capability `{c}`.{did_you_mean} Expected one of: {}.",
                     AV_CAPABILITY_NAMES.join(", "),
                 )));
             }
@@ -293,7 +331,18 @@ fn access_mode_from_str(s: &str) -> Result<u8> {
         "write" => Ok(1),
         "exclusive" => Ok(2),
         "chain" => Ok(3),
-        _ => Err(Error::Module(format!("unknown access mode: {}", s))),
+        _ => {
+            let valid = ["read", "write", "exclusive", "chain"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            let did_you_mean = crate::text_distance::closest_match(s, &valid, 3)
+                .map(|h| format!(" Did you mean '{h}'?"))
+                .unwrap_or_default();
+            Err(Error::Module(format!(
+                "unknown access mode: '{s}'.{did_you_mean} Expected: read, write, exclusive, chain."
+            )))
+        }
     }
 }
 
@@ -313,7 +362,18 @@ fn direction_from_str(s: &str) -> Result<u8> {
         "output" | "out" => Ok(1),
         "ctrl" | "ctrl_input" => Ok(2),
         "ctrl_output" => Ok(3),
-        _ => Err(Error::Module(format!("unknown port direction: {}", s))),
+        _ => {
+            let valid = ["input", "output", "ctrl", "ctrl_output"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            let did_you_mean = crate::text_distance::closest_match(s, &valid, 3)
+                .map(|h| format!(" Did you mean '{h}'?"))
+                .unwrap_or_default();
+            Err(Error::Module(format!(
+                "unknown port direction: '{s}'.{did_you_mean} Expected: input, output, ctrl, ctrl_output."
+            )))
+        }
     }
 }
 
@@ -541,6 +601,18 @@ pub struct Manifest {
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
     pub builtin: bool,
+    /// Module attests that its `module_step` / `module_isr_init` /
+    /// `module_isr_entry` exports are safe to invoke from an ISR
+    /// context: no heap allocation, no `provider_call`, no
+    /// `channel_read`/`channel_write`, bounded execution within the
+    /// declared `isr_budget_cycles`. The author owns this claim; the
+    /// tool does not statically verify it. The flag is mandatory for
+    /// admission into a Tier 1b (`domain_exec_mode == 2`) or Tier 2
+    /// (`domain_exec_mode == 4`) domain — modules without it are
+    /// rejected at build time. See
+    /// `.context/rfc_isr_tier_surface.md` §D7 for the contract this
+    /// flag attests to and §Step-3 for the validator that enforces it.
+    pub isr_safe: bool,
     /// Built-in parameter declarations from `[[params]]` (toml-only).
     /// `.fmod` modules carry their schema embedded in the binary; built-ins
     /// declare it here so the config tool can validate YAML and pack TLV.
@@ -564,6 +636,7 @@ impl Default for Manifest {
             provides: Vec::new(),
             capabilities: Vec::new(),
             builtin: false,
+            isr_safe: false,
             params: Vec::new(),
         }
     }
@@ -942,6 +1015,7 @@ impl Manifest {
             provides,
             capabilities,
             builtin,
+            isr_safe: toml_val.isr_safe,
             params,
         })
     }
@@ -975,8 +1049,25 @@ impl Manifest {
         buf.extend_from_slice(&self.module_version.to_le_bytes());
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
         buf.extend_from_slice(&self.state_size_hint.to_le_bytes());
-        // byte 14: bit 0 = has_integrity, bit 1 = has_signature.
-        let flags = (if has_integrity { 1 } else { 0 }) | (if has_signature { 2 } else { 0 });
+        // byte 14: bit 0 = has_integrity, bit 1 = has_signature,
+        //          bit 2 = isr_safe (author attestation; the
+        //                  **build-time** `validate_isr_tier_admission`
+        //                  in `tools/src/config.rs` is the live gate
+        //                  for this flag. The kernel-side
+        //                  `Manifest::from_bytes` round-trips the
+        //                  bit through `LoadedModule.manifest` but
+        //                  the loader does NOT currently re-check
+        //                  it at instantiation — Tier 1b/2 admission
+        //                  is rejected at build time today, so the
+        //                  runtime check is moot. When the Tier 1b/2
+        //                  runtime path lands, add a loader-side
+        //                  check that mirrors the build-time one
+        //                  (defense in depth against hand-rolled
+        //                  binaries).
+        //          bits 3-7: reserved (0).
+        let flags = (if has_integrity { 1 } else { 0 })
+            | (if has_signature { 2 } else { 0 })
+            | (if self.isr_safe { 4 } else { 0 });
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
@@ -1062,6 +1153,7 @@ impl Manifest {
         let flags = data[14];
         let has_integrity = (flags & 0x01) != 0;
         let has_signature = (flags & 0x02) != 0;
+        let isr_safe = (flags & 0x04) != 0;
         let permissions_bits = data[15]; // fine-grained permissions bitmap
 
         let expected_size = MANIFEST_HEADER_SIZE
@@ -1160,6 +1252,7 @@ impl Manifest {
             provides: Vec::new(),     // not serialized in binary format
             capabilities: Vec::new(), // not serialized in binary format
             builtin: false,
+            isr_safe,
             params: Vec::new(), // toml-only, not serialized
         })
     }
@@ -1284,6 +1377,10 @@ struct TomlManifest {
     capabilities: Option<Vec<String>>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,
+    /// Author attests ISR-safety. Required for Tier 1b/2 admission.
+    /// See `Manifest::isr_safe` for the contract.
+    #[serde(default)]
+    isr_safe: bool,
     /// `[[params]]` declarations — built-in modules only. PIC modules
     /// embed schema in their .fmod and these are ignored.
     params: Option<Vec<TomlParam>>,

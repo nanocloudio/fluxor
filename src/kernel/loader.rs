@@ -601,7 +601,13 @@ impl ModuleHeader {
     ///     (reconfigure / flash_raw / platform_raw / backing_provider /
     ///     monitor / bridge) live in the manifest binary at byte 15,
     ///     read by `LoadedModule::manifest_permissions()`.
-    ///   byte 1: step_period_ms (0 = every tick, N = every N ms).
+    ///   byte 1: step_period_ticks (0 = every tick, N = step every N
+    ///     scheduler ticks). The scheduler enforces this verbatim in
+    ///     `step_one_module` — it counts scheduler ticks, not
+    ///     milliseconds, so the wall-clock period is
+    ///     `step_period_ticks * domain_tick_us`. Modules that need a
+    ///     specific cadence in real time must size the field against
+    ///     the deployment's `tick_us`.
     ///   bytes 2-3: schema_size (u16 LE).
     ///   bytes 4-5: manifest_size (u16 LE).
     ///   bytes 6-9: required_caps (u32 LE) — public contract bitmask,
@@ -609,8 +615,10 @@ impl ModuleHeader {
     ///     the full 0..31 range of contract ids defined in
     ///     `provider::contract`.
     ///   bytes 10-11: reserved (0), available for future ABI extensions.
-    /// Step period hint from reserved[1]: 0 = every tick, N = every N ms.
-    pub fn step_period_ms(&self) -> u8 {
+    /// Step period from reserved[1]: 0 = every tick, N = step every N
+    /// scheduler ticks. Units are scheduler ticks, not milliseconds —
+    /// the wall-clock period depends on the domain's `tick_us`.
+    pub fn step_period_ticks(&self) -> u8 {
         self.reserved[1]
     }
     /// Schema section size from reserved[2..4].

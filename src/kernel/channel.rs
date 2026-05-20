@@ -351,6 +351,25 @@ pub fn channel_open_for_module(
     if chan_type != CHANNEL_TYPE_PIPE {
         return CHAN_EINVAL;
     }
+    // ISR-tier (Tier 1b / Tier 2) modules must not open generic
+    // PIPE channels — their I/O rides bridge channels, registered
+    // ahead of time via `isr_tier::register_tier1b_module` /
+    // `register_tier2_module`. Opening a PIPE from ISR context
+    // would cross-link the heap-allocating arena into an interrupt
+    // handler. The build-time validator
+    // (`tools/src/config.rs::validate_isr_tier_admission`) already
+    // rejects this shape at YAML-parse time; the runtime check is
+    // defense in depth for hand-rolled binaries.
+    let caller = crate::kernel::scheduler::current_module_index();
+    if caller < crate::kernel::config::MAX_MODULES
+        && crate::kernel::scheduler::module_is_isr_tier(caller)
+    {
+        debug!(
+            "channel_open: rejected — module {} is in an ISR-tier domain",
+            caller
+        );
+        return crate::kernel::errno::EACCES;
+    }
     // The v1 channel-open request shape is exactly:
     //   * `config = NULL && config_len == 0` → caller wants the
     //     default capacity (`BUFFER_SIZE`).

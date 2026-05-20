@@ -32,7 +32,30 @@ fn linux_disable_interrupts() -> u32 {
     0
 }
 fn linux_restore_interrupts(_state: u32) {}
-fn linux_wake_scheduler() {}
+
+/// Main-loop thread handle, captured before stepping starts.
+/// `linux_wake_scheduler` clones and unparks it so an event signaled
+/// from any thread (or from an ISR-equivalent callback) can interrupt
+/// the runtime's `park_timeout` and run woken modules in the same way
+/// RP breaks out of `embassy_futures::select` on a SIGNAL fire.
+static LINUX_MAIN_THREAD: OnceLock<thread::Thread> = OnceLock::new();
+
+/// Capture the current thread as the wake target. Call once, before
+/// the scheduler loop starts.
+fn linux_install_wake_thread() {
+    let _ = LINUX_MAIN_THREAD.set(thread::current());
+}
+
+fn linux_wake_scheduler() {
+    // Best-effort: if the runtime thread has been captured, unpark it.
+    // Spurious unparks are fine — the main loop drains wake bits each
+    // iteration. Before capture (early boot) wake is a no-op; the bit
+    // still latches in EVENT_WAKE_PENDING and the first scheduler tick
+    // observes it.
+    if let Some(t) = LINUX_MAIN_THREAD.get() {
+        t.unpark();
+    }
+}
 
 fn linux_now_millis() -> u64 {
     elapsed_micros() / 1000

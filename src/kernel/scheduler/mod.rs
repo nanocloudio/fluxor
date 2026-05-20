@@ -904,7 +904,11 @@ pub struct SchedulerState {
     ready: [bool; MAX_MODULES],
     /// Per-module upstream dependency bitmask (precomputed from edges)
     upstream_mask: [u64; MAX_MODULES],
-    /// Per-module step period (0 = every tick, N = every N ms)
+    /// Per-module step period in scheduler ticks (0 = every tick, N =
+    /// step every N ticks). Wall-clock period is
+    /// `step_period * domain_tick_us` — units are ticks, NOT
+    /// milliseconds. Sourced from the module header's
+    /// `step_period_ticks` byte.
     step_period: [u8; MAX_MODULES],
     /// Per-module step counter (counts ticks toward period)
     step_counter: [u8; MAX_MODULES],
@@ -934,6 +938,34 @@ pub struct SchedulerState {
     domain_tick_us: [u32; MAX_DOMAINS],
     /// Per-domain execution mode (0=cooperative/Tier 0, 1=high-rate/Tier 1a, 3=poll/Tier 3).
     domain_exec_mode: [u8; MAX_DOMAINS],
+
+    // ── Per-domain step budget accumulator ──────────────────────────
+    /// Per-domain budget limit in microseconds. Sourced from
+    /// `domain_tick_us[d]` at `prepare_graph` time. `0` disables the
+    /// budget check (no limit configured).
+    ///
+    /// Rationale: the cooperative scheduler can only enforce step
+    /// budgets *between* modules (aarch64 step_guard is advisory; see
+    /// [`step_guard.rs`](../step_guard.rs)). Tier 3 (poll-mode)
+    /// especially needs total domain budget accounting because there
+    /// is no per-tick boundary to fall back on — without this the
+    /// poll loop will run an over-budget module indefinitely.
+    ///
+    /// The limit *is* the tick. There is intentionally no overrun
+    /// "factor" multiplier — slack belongs in `tick_us`, not in a
+    /// hidden tunable that has to be tracked separately. See
+    /// [[scheduler-priority1-pass]] memory note for the decision.
+    domain_budget_us_limit: [u32; MAX_DOMAINS],
+    /// Per-domain microseconds consumed in the *current* step pass.
+    /// Reset at the top of `step_modules` / `step_domain_modules` /
+    /// `step_domain_modules_poll`; accumulated after every
+    /// `step_one_module` return regardless of `StepOutcome`.
+    domain_budget_us_consumed: [u64; MAX_DOMAINS],
+    /// Cumulative count of times the domain's pass was cut short
+    /// because `consumed > limit`. Surfaced via `monitor` so operators
+    /// see chronically over-subscribed domains without needing to
+    /// instrument modules individually.
+    domain_budget_overruns: [u32; MAX_DOMAINS],
 
     // ── Live Reconfigure State ──────────────────────────────────────
     /// Current reconfigure phase, queryable via `reconfigure_phase()`.
@@ -997,6 +1029,9 @@ impl SchedulerState {
             domain_count: 0,
             domain_tick_us: [0; MAX_DOMAINS],
             domain_exec_mode: [0; MAX_DOMAINS],
+            domain_budget_us_limit: [0; MAX_DOMAINS],
+            domain_budget_us_consumed: [0; MAX_DOMAINS],
+            domain_budget_overruns: [0; MAX_DOMAINS],
             reconfigure_phase: ReconfigurePhase::Running,
             active_module_count: 0,
             rebuild_request: None,
@@ -1049,6 +1084,9 @@ impl SchedulerState {
         for d in 0..MAX_DOMAINS {
             self.domain_module_count[d] = 0;
             self.domain_tick_us[d] = 0;
+            self.domain_budget_us_limit[d] = 0;
+            self.domain_budget_us_consumed[d] = 0;
+            self.domain_budget_overruns[d] = 0;
         }
         self.reconfigure_phase = ReconfigurePhase::Running;
         self.active_module_count = 0;
@@ -1389,13 +1427,78 @@ pub fn domain_tick_us(domain_id: usize) -> u32 {
     tick_us()
 }
 
-/// Return the execution mode for a domain.
-/// 0 = cooperative (Tier 0), 1 = high-rate periodic (Tier 1a), 3 = poll-mode (Tier 3).
+/// Domain execution-mode wire byte values.
+///
+/// These bytes appear in the config blob's domain-metadata section
+/// (`tools/src/config.rs` writes them via `parse_domain_tier_to_exec_mode`)
+/// and are read back by `prepare_graph` into `SCHED.domain_exec_mode`.
+/// **Values are wire-stable** — older `.cfg.bin` blobs read by newer
+/// kernels (and vice versa) must agree on the byte-to-tier mapping.
+/// The mapping is asymmetric (Tier 1b → 2, Tier 2 → 4) because Tier
+/// 1a/3 were allocated first; reshuffling would break already-built
+/// configs. See `.context/rfc_isr_tier_surface.md` §D5.
+pub mod exec_mode {
+    /// Tier 0 — cooperative, main scheduler loop.
+    pub const COOPERATIVE: u8 = 0;
+    /// Tier 1a — high-rate periodic cooperative (sub-ms tick).
+    pub const TIER_1A: u8 = 1;
+    /// Tier 1b — shared timer-ISR. ISR-tier (requires `isr_safe` + bridge).
+    pub const TIER_1B: u8 = 2;
+    /// Tier 3 — poll-mode, continuous stepping with WFE on idle.
+    pub const TIER_3: u8 = 3;
+    /// Tier 2 — IRQ-owned. ISR-tier (requires `isr_safe` + bridge).
+    pub const TIER_2: u8 = 4;
+}
+
+/// Return the execution mode for a domain. See [`exec_mode`] for the
+/// stable byte→tier mapping.
 pub fn domain_exec_mode(domain_id: usize) -> u8 {
     if domain_id < MAX_DOMAINS {
         unsafe { SCHED.domain_exec_mode[domain_id] }
     } else {
         0
+    }
+}
+
+/// `true` if `exec_mode` denotes an ISR-tier domain (Tier 1b or
+/// Tier 2). Cooperative tiers (0, 1a, 3) do not require bridge-only
+/// channels or the `isr_safe` attestation. The byte values come from
+/// [`exec_mode`]; checked here against the named constants so a
+/// future reshuffle has to update both sides together.
+#[inline]
+pub fn is_isr_tier_exec_mode(mode: u8) -> bool {
+    mode == exec_mode::TIER_1B || mode == exec_mode::TIER_2
+}
+
+/// `true` if `module_idx`'s assigned domain is an ISR-tier
+/// (Tier 1b or Tier 2) domain. The cooperative scheduler skips
+/// stepping ISR-tier modules because they run from a timer/IRQ
+/// handler, not from `step_modules`. See
+/// `.context/rfc_isr_tier_surface.md` §D6.
+#[inline]
+pub fn module_is_isr_tier(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
+    let d = unsafe { SCHED.domain_id[module_idx] } as usize;
+    if d >= MAX_DOMAINS {
+        return false;
+    }
+    let m = unsafe { SCHED.domain_exec_mode[d] };
+    is_isr_tier_exec_mode(m)
+}
+
+/// Test-facing setter — assigns `exec_mode` to `domain_id`. Used by
+/// conformance tests that exercise the cooperative-skip behaviour
+/// without going through a full `prepare_graph` cycle. Production
+/// callers should source `exec_mode` from `prepare_graph` reading
+/// the config blob.
+pub fn set_domain_exec_mode(domain_id: usize, exec_mode: u8) {
+    if domain_id >= MAX_DOMAINS {
+        return;
+    }
+    unsafe {
+        SCHED.domain_exec_mode[domain_id] = exec_mode;
     }
 }
 
@@ -1664,7 +1767,8 @@ pub struct ModuleStateSnapshot {
     pub permissions: u8,
     /// Per-module fault state machine state.
     pub fault_state: FaultState,
-    /// Step-period gate (every N ticks; 0 = every tick).
+    /// Step-period gate in scheduler ticks (0 = every tick, N = every
+    /// N ticks). Wall-clock period is `step_period * domain_tick_us`.
     pub step_period: u8,
     /// Restart count to date.
     pub restart_count: u16,
@@ -1897,10 +2001,26 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         0
     };
 
-    // Populate per-domain tick_us and exec_mode from config
+    // Populate per-domain tick_us, exec_mode, and budget limit from
+    // config. The budget limit *is* the tick: a domain that exceeds
+    // its tick_us within a single pass is over-subscribed by
+    // definition. Per-domain `tick_us == 0` means "inherit the
+    // graph-level tick"; that fallback is what the budget guards
+    // against — the cooperative path doesn't gate inter-module
+    // execution by anything else.
     for d in 0..MAX_DOMAINS {
         sched.domain_tick_us[d] = config.domain_tick_us[d] as u32;
         sched.domain_exec_mode[d] = config.domain_exec_mode[d];
+        let dtick = sched.domain_tick_us[d];
+        sched.domain_budget_us_limit[d] = if dtick > 0 {
+            dtick
+        } else if sched.tick_us > 0 {
+            sched.tick_us
+        } else {
+            // Last resort: matches the platform main-loop default
+            // (`tick_period_us = 1000` when nothing is configured).
+            1000
+        };
     }
 
     let edges = &mut sched.edges;
@@ -2849,7 +2969,7 @@ pub fn instantiate_one_module(
         Ok(StartNewResult::Pending(pending)) => {
             // Record step period before returning
             unsafe {
-                SCHED.step_period[instantiated] = found_module.header.step_period_ms();
+                SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
             }
             return InstantiateResult::Pending(pending);
         }
@@ -2861,7 +2981,7 @@ pub fn instantiate_one_module(
 
     // Record step frequency hint from module header
     unsafe {
-        SCHED.step_period[instantiated] = found_module.header.step_period_ms();
+        SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
     }
 
     // Parse protection config from TLV params (tags 0xF0-0xF3)
@@ -3692,6 +3812,20 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         }
     }
 
+    // Reset the per-pass budget accumulator for **every** domain
+    // before this pass starts. The flat path used to reset only
+    // `domain_budget_us_consumed[0]` and check only domain 0
+    // after each module — but `step_one_module` charges elapsed
+    // time to the module's *actual* `domain_id`, so modules
+    // assigned to non-default domains (multi-domain configs on a
+    // flat target — currently rare but architecturally legal)
+    // had their step-time accumulating into a bucket nobody
+    // checked. Resetting every domain + checking the stepped
+    // module's own domain closes the gap.
+    for d in 0..MAX_DOMAINS {
+        sched.domain_budget_us_consumed[d] = 0;
+    }
+
     // Step modules in topological order so producers run before consumers.
     // The per-module step body is in `step_one_module` so the upcoming
     // domain-scoped `step_domain_modules` reuses the exact
@@ -3708,6 +3842,20 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
             continue;
         }
         step_one_module(modules, sched, module_idx, not_ready, &mut active_count, false);
+
+        // Check the budget of the domain the *just-stepped*
+        // module belongs to — not always domain 0. Two reasons to
+        // break the iteration on overrun: (1) any further work
+        // this pass is past-budget by definition, (2) the loop is
+        // single-threaded; we can't keep stepping other domains
+        // while breaking just one. Operators see one overrun per
+        // pass on the offending domain — same UX as the
+        // domain-scoped step path.
+        let stepped_domain = sched.domain_id[module_idx] as usize;
+        if stepped_domain < MAX_DOMAINS && domain_budget_exhausted(sched, stepped_domain) {
+            record_domain_budget_overrun(sched, stepped_domain, module_idx);
+            break;
+        }
     }
 
     if active_count == 0 {
@@ -3758,6 +3906,85 @@ pub fn step_domain_modules_poll(
     (result, burst)
 }
 
+/// Has the given domain consumed more than its tick budget in the
+/// current pass? Called between modules in `step_modules` /
+/// `step_domain_modules` to enforce the per-domain budget; returns
+/// `true` once the cumulative `m.step()` wall-clock for this pass
+/// exceeds `domain_budget_us_limit`. A `limit == 0` disables the
+/// check (no budget configured — e.g. host-test or pre-`prepare_graph`
+/// callers).
+#[inline]
+fn domain_budget_exhausted(sched: &SchedulerState, domain_id: usize) -> bool {
+    if domain_id >= MAX_DOMAINS {
+        return false;
+    }
+    let limit = sched.domain_budget_us_limit[domain_id] as u64;
+    if limit == 0 {
+        return false;
+    }
+    sched.domain_budget_us_consumed[domain_id] > limit
+}
+
+/// Record a per-domain budget-overrun event: increment the counter
+/// and emit a `MON_BUDGET_OVERRUN` log line over the same monitor
+/// transport the fault ring uses. Reusing the existing transport
+/// means operators see budget overruns alongside faults without a
+/// second pipe to subscribe to. `last_module_idx` names the module
+/// whose step closed the pass over budget, for triage — it isn't
+/// faulted (its `StepOutcome` was honoured), it's just the last
+/// observable step before the overrun fired.
+fn record_domain_budget_overrun(
+    sched: &mut SchedulerState,
+    domain_id: usize,
+    last_module_idx: usize,
+) {
+    sched.domain_budget_overruns[domain_id] =
+        sched.domain_budget_overruns[domain_id].saturating_add(1);
+    log::warn!(
+        "MON_BUDGET_OVERRUN domain={} consumed_us={} limit_us={} \
+         last_mod={} overrun_count={} tick={}",
+        domain_id,
+        sched.domain_budget_us_consumed[domain_id],
+        sched.domain_budget_us_limit[domain_id],
+        last_module_idx,
+        sched.domain_budget_overruns[domain_id],
+        unsafe { DBG_TICK },
+    );
+}
+
+/// Diagnostic accessor — total budget-overrun count for `domain_id`
+/// since boot. Returns 0 for invalid `domain_id`.
+pub fn domain_budget_overruns(domain_id: usize) -> u32 {
+    if domain_id >= MAX_DOMAINS {
+        return 0;
+    }
+    unsafe { SCHED.domain_budget_overruns[domain_id] }
+}
+
+/// Diagnostic accessor — microseconds consumed by `domain_id` in the
+/// most recent pass. Reset at the top of every pass; reading after
+/// the pass returns the cumulative time. Returns 0 for invalid
+/// `domain_id`.
+pub fn domain_budget_us_consumed(domain_id: usize) -> u64 {
+    if domain_id >= MAX_DOMAINS {
+        return 0;
+    }
+    unsafe { SCHED.domain_budget_us_consumed[domain_id] }
+}
+
+/// Test-facing setter — overrides the budget limit for a domain
+/// without going through `prepare_graph`. Conformance tests use this
+/// to plant a tight budget against a controllable workload. Passing
+/// `limit_us == 0` disables enforcement.
+pub fn set_domain_budget_us_limit(domain_id: usize, limit_us: u32) {
+    if domain_id >= MAX_DOMAINS {
+        return;
+    }
+    unsafe {
+        SCHED.domain_budget_us_limit[domain_id] = limit_us;
+    }
+}
+
 pub fn step_domain_modules(
     modules: &mut [ModuleSlot; MAX_MODULES],
     domain_id: usize,
@@ -3787,6 +4014,11 @@ pub fn step_domain_modules(
         }
     }
 
+    // Reset the per-pass budget accumulator before stepping any
+    // modules. `step_one_module` adds elapsed wall-clock here; the
+    // loop below cuts off if the domain overshoots its tick.
+    sched.domain_budget_us_consumed[domain_id] = 0;
+
     let n = sched.domain_module_count[domain_id] as usize;
     for pos in 0..n {
         let module_idx = sched.domain_exec_order[domain_id][pos] as usize;
@@ -3794,6 +4026,18 @@ pub fn step_domain_modules(
             continue;
         }
         step_one_module(modules, sched, module_idx, not_ready, &mut active_count, false);
+
+        // Per-domain budget enforcement: if cumulative step time has
+        // exceeded the domain's tick budget, log + count + skip the
+        // remaining modules this pass. They'll get their turn on the
+        // next pass when the accumulator resets. This is what keeps
+        // a misconfigured Tier 3 domain (or a sibling-starving
+        // burst) from monopolising a core indefinitely on aarch64
+        // where the step guard is advisory.
+        if domain_budget_exhausted(sched, domain_id) {
+            record_domain_budget_overrun(sched, domain_id, module_idx);
+            break;
+        }
     }
 
     if active_count == 0 {
@@ -3833,7 +4077,24 @@ fn step_one_module(
         return;
     }
 
+    // Skip ISR-tier modules. Tier 1b (`exec_mode == 2`) and Tier 2
+    // (`exec_mode == 4`) modules run from a timer-ISR or hardware IRQ
+    // handler — not from the cooperative `step_modules` loop. Stepping
+    // them here would double-execute their work (once cooperatively
+    // and once from the ISR) and would also break the ISR-only
+    // assumption that no `provider_call`/heap-allocation is on the
+    // call stack at module entry. The build-time validator in
+    // `tools/src/config.rs::validate_isr_tier_admission` already
+    // rejects ISR-tier modules without the `isr_safe` flag; the
+    // runtime skip here is defense in depth for hand-rolled binaries.
+    let domain = sched.domain_id[module_idx] as usize;
+    if domain < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[domain]) {
+        return;
+    }
+
     // Step frequency gating: skip if counter hasn't reached period.
+    // `step_period` is measured in scheduler ticks (NOT milliseconds);
+    // wall-clock cadence is `step_period * domain_tick_us`.
     // Event-wake bypasses the period — the event is the trigger.
     if !event_wake {
         let period = sched.step_period[module_idx];
@@ -3902,6 +4163,13 @@ fn step_one_module(
         let deadline = sched.fault_info[module_idx].effective_deadline_us();
         step_guard::arm(deadline);
         let step_t0 = crate::kernel::hal::now_micros();
+        // `module_t0` is the *whole-step* wall-clock anchor for the
+        // per-domain budget accumulator. Distinct from `step_t0`
+        // (which the Continue arm uses to record per-module step
+        // time) because Burst's re-step loop should count toward the
+        // domain budget too — every iteration of the loop is real
+        // wall-clock the domain owes.
+        let module_t0 = step_t0;
 
         match m.step() {
             Ok(StepOutcome::Continue) => {
@@ -4008,6 +4276,20 @@ fn step_one_module(
                     handle_mpu_fault(sched, modules, module_idx, active_count);
                 }
             }
+        }
+
+        // Accumulate wall-clock spent on this module (any outcome,
+        // including Burst loops and faults) into the owning domain's
+        // budget. The accumulator is reset by the caller at the top
+        // of each pass; the per-domain pass loop checks the limit
+        // after this function returns and breaks the iteration if
+        // exceeded. now_micros uses the same monotonic source as
+        // step_t0, so wraparound matches step-time recording.
+        let elapsed = crate::kernel::hal::now_micros().wrapping_sub(module_t0);
+        let d = sched.domain_id[module_idx] as usize;
+        if d < MAX_DOMAINS {
+            sched.domain_budget_us_consumed[d] =
+                sched.domain_budget_us_consumed[d].saturating_add(elapsed);
         }
     }
 }

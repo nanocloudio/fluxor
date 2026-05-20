@@ -10,6 +10,7 @@ pub mod error;
 mod hash;
 pub mod manifest;
 pub mod monitor;
+pub mod text_distance;
 
 /// Wire-format constants (ABI version byte, channel-hint stride,
 /// `fnv1a32`). Path-mounted from `modules/sdk/wire.rs` so the host

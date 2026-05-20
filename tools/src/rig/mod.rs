@@ -50,8 +50,8 @@ pub use lock::{
 };
 pub use plan::{build_plan, ArtifactPlan, Plan, PlanInputs};
 pub use profile::{
-    default_profile_path, enumerate_rigs, load_profile, parse_profile_str, BindingTable,
-    BindingValue, RigMeta, RigProfile,
+    default_profile_path, enumerate_labs, enumerate_rigs, load_profile, parse_profile_str,
+    BindingTable, BindingValue, RigMeta, RigProfile,
 };
 pub use project::{BuildOutput, BuildRecipe, ProjectDescriptor, PROJECT_DESCRIPTOR};
 pub use record::{

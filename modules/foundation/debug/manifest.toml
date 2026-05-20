@@ -1,8 +1,12 @@
 version = "1.0.0"
 hardware_targets = ["rp2350"]
 
+# `debug` accepts a data stream and logs it. The input is optional —
+# `examples/linux/hello.yaml` deliberately runs debug with no wiring
+# as a "does the runtime load modules?" smoke test, which is a
+# supported pattern. Marking the port required would force users
+# to wire a stub source they don't need.
 [[ports]]
 name = "data"
 direction = "input"
 content_type = "OctetStream"
-required = true

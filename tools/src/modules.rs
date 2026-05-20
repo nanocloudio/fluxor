@@ -93,7 +93,7 @@ impl ModuleInfo {
 
         // ABI v3 reserved layout (in the 72-byte module header):
         //   byte 0 (offset 60): flags
-        //   byte 1 (offset 61): step_period_ms
+        //   byte 1 (offset 61): step_period_ticks (scheduler ticks, NOT ms)
         //   bytes 2-3 (offset 62-63): schema_size (u16 LE)
         //   bytes 4-5 (offset 64-65): manifest_size (u16 LE)
         //   bytes 6-9 (offset 66-69): required_caps (u32 LE)
@@ -862,7 +862,8 @@ pub fn pack_fmod(
     //     bit 3: drain_capable
     //     bit 4: isr_module
     //     bits 5-7: reserved (0)
-    //   byte 1: step_period_ms (0 = every tick; set by config, not pack)
+    //   byte 1: step_period_ticks (0 = every tick; N = every N scheduler
+    //                              ticks. NOT milliseconds. Set by config, not pack)
     //   bytes 2-3: schema_size (u16 LE)
     //   bytes 4-5: manifest_size (u16 LE)
     //   bytes 6-9: required_caps (u32 LE) — public contract bitmask, full 0..31 range

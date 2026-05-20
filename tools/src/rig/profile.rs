@@ -262,6 +262,43 @@ pub fn default_profile_path(lab: &str, rig_id: &str) -> Option<PathBuf> {
     )
 }
 
+/// Enumerate available labs under `~/.config/fluxor/labs/`. A lab is
+/// any subdirectory containing a `rigs/` folder (the convention from
+/// RFC §9). Returns lab names sorted alphabetically; an empty list
+/// when the labs directory doesn't exist (a fresh install has no
+/// configured labs). Used by `fluxor inspect` to surface what's
+/// available without requiring the user to know the directory
+/// layout.
+///
+/// Distinct from [`enumerate_rigs`] which lists rigs *within* a lab;
+/// the two are paired so `inspect` can render
+///   active lab → all configured labs → rigs in active lab
+/// as a single discoverable block.
+pub fn enumerate_labs() -> Result<Vec<String>> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(Vec::new());
+    };
+    let labs_dir = home.join(".config").join("fluxor").join("labs");
+    if !labs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&labs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        // Only directories that actually contain a `rigs/` folder
+        // count as labs — a stray file or unrelated subdirectory
+        // shouldn't appear in the discovery output.
+        if path.is_dir() && path.join("rigs").is_dir() {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// Walk a directory and return candidate rig ids — for "when exactly one rig
 /// is configured, `--rig` is optional" per §10.2.
 pub fn enumerate_rigs(lab: &str) -> Result<Vec<String>> {
@@ -411,5 +448,93 @@ mod tests {
             weight = 1.5
         "#;
         assert!(parse_profile_str(src, Path::new("/tmp/x.toml")).is_err());
+    }
+
+    // ── enumerate_labs ────────────────────────────────────────────
+    //
+    // `enumerate_labs` walks the user's `~/.config/fluxor/labs/`.
+    // Tests synthesise a fake home via the `HOME` env var so they
+    // don't touch the real user config. Env-var mutation is
+    // process-global, so the tests serialise on a shared mutex with
+    // the broader project resolver tests.
+
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_home() -> std::sync::MutexGuard<'static, ()> {
+        match HOME_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Run `f` with `$HOME` set to `path` for its duration. Restores
+    /// the previous value (or unsets the var) on the way out, even
+    /// if `f` panics — that's what the manual struct guard buys.
+    fn with_home(path: &Path, f: impl FnOnce()) {
+        let _g = lock_home();
+        struct HomeGuard(Option<std::ffi::OsString>);
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => unsafe { std::env::set_var("HOME", v) },
+                    None => unsafe { std::env::remove_var("HOME") },
+                }
+            }
+        }
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", path) };
+        let _guard = HomeGuard(prev);
+        f();
+    }
+
+    #[test]
+    fn enumerate_labs_returns_empty_when_labs_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // tmp.path() has no `.config/fluxor/labs/` — enumerate_labs
+        // must return an empty Vec, not propagate a NotFound error.
+        with_home(tmp.path(), || {
+            let labs = enumerate_labs().expect("missing dir should not error");
+            assert!(labs.is_empty(), "expected empty list, got {labs:?}");
+        });
+    }
+
+    #[test]
+    fn enumerate_labs_lists_directories_with_rigs_subdir_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let labs_dir = tmp.path().join(".config/fluxor/labs");
+        // Two valid labs (have a `rigs/` subdir) and two decoys:
+        // - `stray-dir/` without a rigs/ subdir → must be skipped.
+        // - `random.toml` file at the labs level → must be skipped.
+        std::fs::create_dir_all(labs_dir.join("alpha/rigs")).unwrap();
+        std::fs::create_dir_all(labs_dir.join("beta/rigs")).unwrap();
+        std::fs::create_dir_all(labs_dir.join("stray-dir")).unwrap();
+        std::fs::write(labs_dir.join("random.toml"), b"").unwrap();
+
+        with_home(tmp.path(), || {
+            let labs = enumerate_labs().expect("enumerate");
+            assert_eq!(
+                labs,
+                vec!["alpha".to_string(), "beta".to_string()],
+                "only directories with a rigs/ subdir should appear, sorted"
+            );
+        });
+    }
+
+    #[test]
+    fn enumerate_labs_returns_empty_when_home_unset() {
+        let _g = lock_home();
+        struct UnsetHomeGuard(Option<std::ffi::OsString>);
+        impl Drop for UnsetHomeGuard {
+            fn drop(&mut self) {
+                if let Some(v) = self.0.take() {
+                    unsafe { std::env::set_var("HOME", v) };
+                }
+            }
+        }
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+        let _restore = UnsetHomeGuard(prev);
+        let labs = enumerate_labs().expect("$HOME unset must not error");
+        assert!(labs.is_empty(), "no HOME → no labs, got {labs:?}");
     }
 }

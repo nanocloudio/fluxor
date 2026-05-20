@@ -80,46 +80,12 @@ const TRANSFORMER_TYPES: &[&str] = &[
     "Digest",
 ];
 
-// Mirror of `tools/src/manifest.rs::CONTENT_TYPES`. Used here only for
-// human-readable rendering when decoding compiled-config dumps. Stays
-// positionally identical to the manifest table — content_type IDs are
-// the on-wire byte; appending here is safe, reordering is not.
-const CONTENT_TYPES: &[&str] = &[
-    "OctetStream",
-    "Cbor",
-    "Json",
-    "AudioSample",
-    "AudioOpus",
-    "AudioMp3",
-    "AudioAac",
-    "TextPlain",
-    "TextHtml",
-    "VideoRaster",
-    "ImageJpeg",
-    "ImagePng",
-    "MeshEvent",
-    "MeshCommand",
-    "MeshState",
-    "MeshHandle",
-    "InputEvent",
-    "GestureMatch",
-    "FmpMessage",
-    "EthernetFrame",
-    "HciMessage",
-    "AudioEncoded",
-    "VideoEncoded",
-    "VideoDraw",
-    "VideoScanout",
-    "MediaMuxed",
-    "WsFrame",
-    "InputBinaryState",
-    "EventTimelineVideo",
-    "EventTimelineAudio",
-    "NetProto",
-    "PointerEvents",
-    "KeyEvents",
-    "GamepadEvents",
-];
+// `CONTENT_TYPES` lives in `crate::manifest`; we re-use the same
+// table here so manifest parsing and compiled-config decoding can
+// never drift apart. Originally `config.rs` carried a positional
+// mirror of the manifest table — appending out of sync silently
+// re-numbered every wire byte downstream of the divergence point.
+use crate::manifest::CONTENT_TYPES;
 
 const INPUT_CONTROL_TYPES: &[&str] = &["Button", "Range"];
 
@@ -1285,38 +1251,576 @@ fn parse_broker_addr(s: &str) -> (u32, u16) {
     (ip, port)
 }
 
-/// Build a variable-length module entry from config.
+/// Default step deadline in microseconds — mirrors
+/// `kernel::step_guard::DEFAULT_STEP_DEADLINE_US`. Kept duplicated
+/// rather than imported so this tool stays independent of the kernel
+/// crate's `no_std` feature set; the silicon-config drift guard in
+/// `tools/tests/silicon_toml_shape.rs` pattern can be extended to
+/// pin this if it ever needs to change.
+const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
+
+/// Maximum number of scheduling domains the kernel supports.
+/// Mirrors `src/platform/bcm2712/multicore.rs::MAX_DOMAINS = 4` and
+/// the scheduler's `MAX_DOMAINS` constant. The config writer
+/// serialises exactly 4 domain-metadata entries; the wire format
+/// has no slot for a 5th. Locked at the wire layer by
+/// `tests/harness/tests/abi_wire_surface.rs` (the kernel-side
+/// constant is exercised there); the tools side hardcodes the same
+/// value here with a comment so a future bump touches both
+/// together.
+const MAX_DOMAINS: usize = 4;
+
+/// Burst-mode deadline multiplier — mirrors
+/// `kernel::step_guard::BURST_MULTIPLIER`.
+const BURST_DEADLINE_MULTIPLIER: u32 = 8;
+
+/// Effective tick_us when the config doesn't set one anywhere. Mirrors
+/// the platform main-loop fallback (`tick_period_us = 1000` when
+/// `cfg_header_tick_us == 0`).
+const DEFAULT_TICK_US: u32 = 1000;
+
+/// Hard absolute cap on a single module's burst deadline. The burst
+/// path uses `step_deadline_us * BURST_MULTIPLIER` as its extended
+/// timeout; capping the product at 100 ms keeps Tier 1a loops
+/// responsive even when a misconfigured module runs through its full
+/// burst budget. 100 ms is the conservative side of "no human-
+/// perceivable jitter" for audio/video pipelines; raise this only
+/// alongside a measured rationale.
+const HARD_BURST_CAP_US: u32 = 100_000;
+
+/// Soft warning threshold for the **declared** deadline sum on a
+/// single domain, expressed as a multiple of the domain's tick_us.
+/// Crossing this means the domain's modules collectively claim more
+/// budget than the tick allots — if any sustained run hits its
+/// declared deadline the loop slips. The threshold is a multiple
+/// because per-module deadlines are *fault thresholds*, not expected
+/// runtimes; most modules complete well inside their declared budget.
+const DECLARED_DEADLINE_BUDGET_FACTOR: u32 = 4;
+
+/// Cross-check that **explicitly declared** `step_deadline_us` values
+/// fit inside the domain budgets. Modules that don't declare a
+/// deadline silently use the kernel default
+/// (`DEFAULT_STEP_DEADLINE_US = 2000`); that default is a fault
+/// threshold, not a steady-state budget, and is intentionally bigger
+/// than typical tick_us values — so it's excluded from the sum-vs-tick
+/// invariant. Only opt-in deadlines are scored, because declaring a
+/// deadline is the config author saying "I expect this module to
+/// occasionally take this long, treat it as a real budget."
 ///
-/// Binary format (variable length):
-/// Resolve a module's domain assignment to a numeric domain ID.
+/// Rules enforced:
+///   1. Per-module hard cap: declared `step_deadline_us *
+///      BURST_MULTIPLIER` must not exceed `HARD_BURST_CAP_US` —
+///      otherwise the burst path silently authorises a multi-tick
+///      stall that starves every sibling module in the domain.
+///   2. Per-module hard cap: `step_deadline_us * BURST_MULTIPLIER`
+///      must not exceed `domain_tick_us * 16`. The burst guardrail
+///      is meant to absorb spike workloads, not authorise unbounded
+///      runaway loops.
+///   3. Per-domain warning: when the **sum of declared deadlines**
+///      exceeds `domain_tick_us * DECLARED_DEADLINE_BUDGET_FACTOR`,
+///      emit a warning. Each module is making a deadline claim and
+///      the domain can't keep all promises simultaneously.
 ///
-/// Looks up the module's `domain` field (string) in the `execution.domains` list.
-/// Returns 0 (default domain) if no domain is specified or the name is not found.
-fn resolve_domain_id(module: &Value, config: &Value) -> u8 {
-    let domain_name = match module.get("domain").and_then(|d| d.as_str()) {
-        Some(name) => name,
-        None => return 0,
+/// `tick_us == 0` (graph-level) means "use platform default";
+/// `domain_tick_us[i] == 0` means "use the graph-level tick".
+fn validate_scheduler_budgets(
+    config: &Value,
+    module_list: &[Value],
+    tick_us: u16,
+    domain_names: &[String],
+    domain_tick_us: &[u16],
+) -> Result<()> {
+    let effective_tick = |dtick: u16| -> u32 {
+        if dtick > 0 {
+            dtick as u32
+        } else if tick_us > 0 {
+            tick_us as u32
+        } else {
+            DEFAULT_TICK_US
+        }
     };
 
-    // Look up in execution.domains list
-    if let Some(exec) = config.get("execution") {
-        if let Some(domains) = exec.get("domains").and_then(|d| d.as_array()) {
-            for (i, domain) in domains.iter().enumerate() {
-                if let Some(name) = domain.get("name").and_then(|n| n.as_str()) {
-                    if name == domain_name {
-                        return i as u8;
+    // Sum of **declared** deadlines per domain; modules that don't
+    // declare are not scored.
+    let mut per_domain_sum: std::collections::HashMap<u8, u32> = std::collections::HashMap::new();
+
+    for module in module_list {
+        let name = module
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>");
+        let domain = resolve_domain_id(module, config)?;
+        let dtick = domain_tick_us.get(domain as usize).copied().unwrap_or(0);
+        let domain_budget = effective_tick(dtick);
+
+        let declared_deadline = module
+            .get("step_deadline_us")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
+        // Suppress the unused-binding lint on the kernel default —
+        // surfacing it keeps the const linked to its kernel mirror;
+        // future readers will see they need to update both sides if
+        // it changes.
+        let _ = DEFAULT_STEP_DEADLINE_US;
+
+        // Skip modules that don't opt into a deadline; they ride the
+        // kernel default which is a fault threshold, not a budget.
+        let deadline = match declared_deadline {
+            Some(0) | None => continue,
+            Some(d) => d,
+        };
+
+        let burst = deadline.saturating_mul(BURST_DEADLINE_MULTIPLIER);
+
+        // Rule 1 — absolute burst cap.
+        if burst > HARD_BURST_CAP_US {
+            return Err(Error::Config(format!(
+                "module '{}': step_deadline_us={} → burst deadline {} us \
+                 (× BURST_MULTIPLIER={}) exceeds the {} us absolute cap. \
+                 A single module cannot authorise stalling the scheduler \
+                 this long.",
+                name, deadline, burst, BURST_DEADLINE_MULTIPLIER, HARD_BURST_CAP_US
+            )));
+        }
+
+        // Rule 2 — burst budget relative to the domain tick. Bursts
+        // can span multiple ticks but capping at 16 × tick keeps the
+        // guardrail meaningful.
+        let burst_cap_for_domain = domain_budget.saturating_mul(16);
+        if burst > burst_cap_for_domain {
+            let domain_label = domain_names
+                .get(domain as usize)
+                .map(String::as_str)
+                .unwrap_or("default");
+            return Err(Error::Config(format!(
+                "module '{}' in domain '{}': burst deadline {} us \
+                 (step_deadline_us={} × {}) exceeds 16 × domain tick_us \
+                 ({} us). Bursts are guardrails, not licences to monopolise \
+                 the domain.",
+                name, domain_label, burst, deadline, BURST_DEADLINE_MULTIPLIER,
+                burst_cap_for_domain
+            )));
+        }
+
+        *per_domain_sum.entry(domain).or_insert(0) += deadline;
+    }
+
+    // Rule 3 — per-domain warning for the declared-deadline sum.
+    for (domain, sum) in per_domain_sum {
+        let dtick = domain_tick_us.get(domain as usize).copied().unwrap_or(0);
+        let domain_budget = effective_tick(dtick);
+        let budget_ceiling = domain_budget.saturating_mul(DECLARED_DEADLINE_BUDGET_FACTOR);
+        if sum > budget_ceiling {
+            let domain_label = domain_names
+                .get(domain as usize)
+                .map(String::as_str)
+                .unwrap_or("default");
+            eprintln!(
+                "warning: domain '{}' declared step_deadline_us sum = {} exceeds \
+                 {}× tick_us ({} us). If every module hits its declared deadline \
+                 the loop slips. Lower a declared deadline, raise tick_us, or \
+                 split modules across additional domains.",
+                domain_label, sum, DECLARED_DEADLINE_BUDGET_FACTOR, budget_ceiling
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Build-time admission gate for Tier 1b/Tier 2 (ISR) domains.
+///
+/// Two rules enforced:
+///
+/// 1. **`isr_safe` attestation is mandatory.** Every module assigned
+///    to a domain with `tier: 1b` (`exec_mode == 2`) or `tier: 2`
+///    (`exec_mode == 4`) must declare `isr_safe = true` in its
+///    manifest. Modules without the flag are rejected at build time
+///    with a message naming the module, the domain, and the manifest
+///    path so the author knows exactly where to add the attestation.
+///    Bridge routing has no fall-back: if the kernel admitted a
+///    non-ISR-safe module into an ISR domain it would deadlock on
+///    `provider_call` from interrupt context.
+///
+/// 2. **Edge class compatibility.** Bridge routing is derived from
+///    the consumer's tier — see `.context/rfc_isr_tier_surface.md`
+///    §D6. The validator rejects wiring that pre-emptively tags an
+///    edge with a class incompatible with bridge routing
+///    (`dma_owned`, `cross_core`, `nic_ring`) when either endpoint
+///    is in an ISR-tier domain. Untagged or `local`-tagged edges are
+///    accepted and silently promoted to bridge channels at
+///    instantiation time.
+///
+/// Modules whose manifests can't be located are skipped with a
+/// warning — the wiring/manifest validation in `validate_wiring_types`
+/// raises a separate, more descriptive error for missing manifests,
+/// and double-erroring here would obscure that diagnostic.
+fn validate_isr_tier_admission(
+    config: &Value,
+    module_list: &[Value],
+    modules_dir: &std::path::Path,
+    extra_module_dirs: &[&std::path::Path],
+) -> Result<()> {
+    // Per-domain exec_mode for the four supported domains.
+    let mut domain_exec_mode: [u8; 4] = [0; 4];
+    let mut domain_names_local: [Option<String>; 4] = [None, None, None, None];
+    if let Some(domains) = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(|d| d.as_array())
+    {
+        for (i, dom) in domains.iter().take(4).enumerate() {
+            if let Some(name) = dom.get("name").and_then(|n| n.as_str()) {
+                domain_names_local[i] = Some(name.to_string());
+            }
+            match parse_domain_tier_to_exec_mode(dom) {
+                Some(m) => domain_exec_mode[i] = m,
+                None => {
+                    // Unknown tier specifier — surface it. Silent
+                    // fall-through to Tier 0 cooperative would let a
+                    // typo (`tier: 1c`) silently downgrade the
+                    // execution discipline.
+                    if dom.get("tier").is_some() || dom.get("exec_mode").is_some() {
+                        let label = domain_names_local[i]
+                            .clone()
+                            .unwrap_or_else(|| format!("domains[{i}]"));
+                        return Err(Error::Config(format!(
+                            "execution.domains entry '{}' has an unknown tier/exec_mode \
+                             value. Valid: 0/cooperative, 1a/high_rate, 1b/isr_timer, \
+                             3/poll, 2/isr_owned.",
+                            label
+                        )));
                     }
                 }
             }
         }
     }
 
-    // Domain name not found in config — treat as domain 0 with a warning
-    eprintln!(
-        "warning: module domain '{}' not found in execution.domains, using default",
-        domain_name
+    // Hard-reject Tier 1b / Tier 2 admission until the runtime
+    // path is wired up. The pieces in place today:
+    //   * YAML surface: parsed by `parse_domain_tier_to_exec_mode`.
+    //   * Build-time admission: this validator (the `isr_safe`
+    //     manifest gate + the edge-class check below).
+    //   * Kernel cooperative skip: `step_one_module` returns
+    //     early for ISR-tier modules so they don't double-step.
+    //   * Runtime gate: `channel_open` returns EACCES from a
+    //     Tier 1b/2 caller.
+    //
+    // What's missing:
+    //   * `register_tier1b_module` / `register_tier2_module` have
+    //     no call sites — prepare_graph doesn't hand modules to
+    //     the ISR machinery.
+    //   * `bcm2712::run_domain_loop` only special-cases exec
+    //     modes 1 and 3; modes 2 and 4 fall through to the
+    //     default (cooperative) loop, which then skips the
+    //     module → it never runs.
+    //   * Bridge channel allocation from YAML edges is not done.
+    //
+    // Net effect of letting a Tier 1b/2 graph through today: the
+    // build succeeds, the module loads, and nothing ever runs it
+    // — the worst flavour of "config silently passes." Reject at
+    // build time with a precise message until the runtime piece
+    // lands; see `.context/rfc_isr_tier_surface.md` for the
+    // sequencing.
+    for d in 0..4 {
+        let m = domain_exec_mode[d];
+        if m == 2 || m == 4 {
+            let label = domain_names_local[d]
+                .clone()
+                .unwrap_or_else(|| format!("domains[{d}]"));
+            let tier_name = if m == 2 { "1b (isr_timer)" } else { "2 (isr_owned)" };
+            return Err(Error::Config(format!(
+                "execution.domains entry '{label}': tier {tier_name} is declared but not yet \
+                 runtime-supported on any target. The YAML schema, manifest gate, and \
+                 cooperative scheduler skip are in place, but the platform's \
+                 `register_tier1b_module` / `register_tier2_module` glue + bridge channel \
+                 allocation are not wired up — a build with this tier would load the \
+                 module and never run it. Use tier 0/1a/3 for now; track \
+                 .context/rfc_isr_tier_surface.md for the lift."
+            )));
+        }
+    }
+
+    // Helper: does this exec_mode require ISR-safe modules?
+    // (Reachable now only via the build-time-only branches below
+    // since the hard-reject above blocks any config from ever
+    // setting `domain_exec_mode[d]` to 2 or 4 — but kept for
+    // when the runtime path lands and the reject is lifted.)
+    let is_isr_tier = |m: u8| -> bool { m == 2 || m == 4 };
+
+    // Helper: friendly tier label for error messages.
+    let tier_label = |m: u8| -> &'static str {
+        match m {
+            2 => "1b (isr_timer)",
+            4 => "2 (isr_owned)",
+            _ => "unknown",
+        }
+    };
+
+    let manifests = load_module_manifests_with_extra(
+        &Value::Array(module_list.to_vec()),
+        extra_module_dirs,
     );
-    0
+
+    // ── Rule 1: isr_safe attestation ────────────────────────────
+    for module in module_list {
+        let name = match module.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let domain = resolve_domain_id(module, config)?;
+        let exec_mode = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
+        if !is_isr_tier(exec_mode) {
+            continue;
+        }
+        let domain_label = domain_names_local
+            .get(domain as usize)
+            .and_then(|n| n.clone())
+            .unwrap_or_else(|| format!("domain {domain}"));
+
+        // Look up the manifest. Missing-manifest is reported elsewhere
+        // (`validate_wiring_types`); skip silently here so this gate
+        // gives a single, focused diagnostic.
+        let manifest = match manifests.get(name) {
+            Some(m) => m,
+            None => continue,
+        };
+        if !manifest.isr_safe {
+            let module_type = module
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or(name);
+            return Err(Error::Config(format!(
+                "module '{name}' (type '{module_type}') is assigned to domain '{domain_label}' \
+                 (tier {tier}) but its manifest does not declare `isr_safe = true`. \
+                 Add `isr_safe = true` to the module's manifest.toml, or move the module \
+                 to a cooperative domain. See .context/rfc_isr_tier_surface.md §D7.",
+                tier = tier_label(exec_mode)
+            )));
+        }
+    }
+
+    // ── Rule 2: incompatible edge classes on ISR-tier edges ─────
+    // Build module name → exec_mode lookup.
+    let mut module_exec_mode: std::collections::HashMap<String, u8> =
+        std::collections::HashMap::new();
+    for module in module_list {
+        if let Some(name) = module.get("name").and_then(|n| n.as_str()) {
+            let domain = resolve_domain_id(module, config)?;
+            let m = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
+            module_exec_mode.insert(name.to_string(), m);
+        }
+    }
+
+    let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+    for (i, edge) in wiring.iter().enumerate() {
+        let ec_str = match edge.get("edge_class").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue, // untagged = local = OK with bridge
+        };
+        if ec_str == "local" {
+            continue;
+        }
+        let from_mod = edge
+            .get("from")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.split('.').next())
+            .unwrap_or("");
+        let to_mod = edge
+            .get("to")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.split('.').next())
+            .unwrap_or("");
+        let from_isr = module_exec_mode
+            .get(from_mod)
+            .copied()
+            .map(is_isr_tier)
+            .unwrap_or(false);
+        let to_isr = module_exec_mode
+            .get(to_mod)
+            .copied()
+            .map(is_isr_tier)
+            .unwrap_or(false);
+        if from_isr || to_isr {
+            return Err(Error::Config(format!(
+                "wiring[{i}] (from '{from_mod}' to '{to_mod}'): edge_class '{ec_str}' is \
+                 incompatible with ISR-tier endpoints. Tier 1b/2 modules consume their \
+                 inputs through bridge channels; the kernel routes the edge \
+                 automatically. Remove the `edge_class:` field or set it to `local`.",
+            )));
+        }
+    }
+
+    // Bonus diagnostic: warn if an ISR-tier domain has no modules
+    // assigned. A misnamed `domain:` field on a module is a common
+    // typo (the hard-error `resolve_domain_id` already catches
+    // it), but a correctly-named domain with no members is also a
+    // bug. Check by **domain id**, not by exec_mode: two domains
+    // at the same tier would otherwise mask each other (every
+    // module's exec_mode would be 2, satisfying the check for
+    // BOTH Tier 1b domains regardless of which they actually
+    // belong to).
+    //
+    // Currently unreachable in practice because the hard-reject
+    // above blocks any Tier 1b/2 admission — but kept honest so
+    // lifting the reject doesn't reintroduce the bug.
+    let mut per_domain_member_count: [usize; 4] = [0; 4];
+    for module in module_list {
+        let d = resolve_domain_id(module, config)?;
+        if (d as usize) < per_domain_member_count.len() {
+            per_domain_member_count[d as usize] += 1;
+        }
+    }
+    for d in 0..4 {
+        if !is_isr_tier(domain_exec_mode[d]) {
+            continue;
+        }
+        if per_domain_member_count[d] > 0 {
+            continue;
+        }
+        let label = domain_names_local[d]
+            .clone()
+            .unwrap_or_else(|| format!("domains[{d}]"));
+        eprintln!(
+            "warning: execution.domains entry '{label}' is tier {tier} but has no \
+             modules assigned to it. Did you forget a `domain: {label}` on a module?",
+            tier = tier_label(domain_exec_mode[d])
+        );
+    }
+
+    let _ = modules_dir; // reserved for future use (per-domain budget files)
+    Ok(())
+}
+
+/// Translate a domain's YAML tier specifier into the kernel's
+/// `domain_exec_mode` wire byte. Accepts the preferred friendly form
+/// (`tier: 1a`) and the legacy `exec_mode:` synonym for backward
+/// compatibility. Returns `None` when both fields are absent so the
+/// caller can default to Tier 0 (cooperative) without confusing
+/// "tier omitted" with "tier explicitly set to 0".
+///
+/// Wire encoding (kept stable — adding a tier here MUST keep the
+/// existing values intact so older `.cfg.bin` blobs continue to
+/// parse correctly):
+///
+/// | Tier (friendly)       | exec_mode byte |
+/// |-----------------------|----------------|
+/// | `0` / `cooperative`   | 0              |
+/// | `1a` / `high_rate`    | 1              |
+/// | `1b` / `isr_timer`    | 2 (Tier 1b)    |
+/// | `3` / `poll`          | 3              |
+/// | `2` / `isr_owned`     | 4 (Tier 2)     |
+///
+/// The Tier 1b → 2 / Tier 2 → 4 mapping is asymmetric because
+/// `domain_exec_mode` values {0, 1, 3} were allocated before Tier 1b
+/// and Tier 2 were introduced. Reshuffling would break already-built
+/// `.cfg.bin` blobs.
+///
+/// **Returned `Err` only on explicit unknown values** — silently
+/// dropping a typo'd tier (e.g. `tier: 1c`) would route the domain
+/// to Tier 0 cooperative without warning. See
+/// `.context/rfc_isr_tier_surface.md` §D5 for the design rationale.
+pub(crate) fn parse_domain_tier_to_exec_mode(domain: &Value) -> Option<u8> {
+    // `tier:` is the preferred friendly form per the RFC.
+    if let Some(raw) = domain.get("tier") {
+        if let Some(s) = raw.as_str() {
+            return match s {
+                "0" | "cooperative" => Some(0),
+                "1a" | "high_rate" | "tier1a" => Some(1),
+                "1b" | "isr_timer" | "tier1b" => Some(2),
+                "3" | "poll" | "tier3" => Some(3),
+                "2" | "isr_owned" | "tier2" => Some(4),
+                _ => None,
+            };
+        }
+        if let Some(n) = raw.as_u64() {
+            // Bare numeric `tier: 0` only resolves to cooperative;
+            // numeric form is intentionally narrow because it's
+            // ambiguous for Tier 1a/1b/Tier 2.
+            return match n {
+                0 => Some(0),
+                _ => None,
+            };
+        }
+    }
+    // Legacy `exec_mode:` synonym — kept so existing configs (e.g.
+    // `examples/cm5/*` exercising Tier 1a) build unchanged.
+    if let Some(m) = domain.get("exec_mode").and_then(|m| m.as_str()) {
+        return match m {
+            "cooperative" => Some(0),
+            "high_rate" | "tier1a" => Some(1),
+            "isr_timer" | "tier1b" => Some(2),
+            "poll" | "tier3" => Some(3),
+            "isr_owned" | "tier2" => Some(4),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Resolve a module's domain assignment to a numeric domain ID.
+///
+/// Looks up the module's `domain` field (string) in the
+/// `execution.domains` list. Returns 0 (default domain) when no domain
+/// is specified. **Hard error** when a domain is named but not present
+/// in `execution.domains` — silently falling back to domain 0 lets a
+/// typo'd domain name (or a stale config referencing a removed domain)
+/// silently route modules to the default partition, hiding capacity
+/// and budget mismatches the rest of the validator counts on.
+fn resolve_domain_id(module: &Value, config: &Value) -> Result<u8> {
+    let domain_name = match module.get("domain").and_then(|d| d.as_str()) {
+        Some(name) => name,
+        None => return Ok(0),
+    };
+
+    if let Some(exec) = config.get("execution") {
+        if let Some(domains) = exec.get("domains").and_then(|d| d.as_array()) {
+            for (i, domain) in domains.iter().enumerate() {
+                if let Some(name) = domain.get("name").and_then(|n| n.as_str()) {
+                    if name == domain_name {
+                        // Defense in depth: even though
+                        // `generate_config_impl` hard-rejects
+                        // `execution.domains.len() > MAX_DOMAINS`
+                        // at the top of validation, this lookup is
+                        // also reached directly by unit tests +
+                        // callers that bypass that gate. Reject
+                        // here too so a module that *resolves* to
+                        // an out-of-range domain id can never slip
+                        // into the rest of the pipeline.
+                        if i >= MAX_DOMAINS {
+                            return Err(Error::Config(format!(
+                                "module references domain '{domain_name}' at index {i}, but \
+                                 the kernel supports at most {MAX_DOMAINS} domains. The 5th+ \
+                                 entry in `execution.domains` is invalid — drop it or merge \
+                                 the modules into an existing domain."
+                            )));
+                        }
+                        return Ok(i as u8);
+                    }
+                }
+            }
+            // Build a name list for the error message so the user can
+            // spot the typo without grepping the YAML.
+            let known: Vec<String> = domains
+                .iter()
+                .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect();
+            return Err(Error::Config(format!(
+                "module references unknown domain '{}'; execution.domains declares [{}]",
+                domain_name,
+                known.join(", ")
+            )));
+        }
+    }
+
+    Err(Error::Config(format!(
+        "module references domain '{}' but execution.domains is missing or empty",
+        domain_name
+    )))
 }
 
 /// Load a built-in module's manifest from the source tree and
@@ -1602,32 +2106,30 @@ fn inject_manifest_defaults(module: &Value, manifest: &crate::manifest::Manifest
 /// Levenshtein-light: pick the schema param name with the smallest edit
 /// distance to `key`, returning it only if the distance is plausibly a typo
 /// (≤ 2 edits, or up to half the key length for short names).
+/// "Did you mean…?" lookup for param names. Threshold is dynamic —
+/// `(key.len() / 2).clamp(2, 4)` — because param names vary widely
+/// in length and a fixed cap would be too strict for long names
+/// (`encryption_passphrase` deserves more typo tolerance than `iv`).
+///
+/// Delegates the actual Levenshtein walk to the shared
+/// `crate::text_distance::closest_match` helper used across every
+/// other "did you mean" surface. Single source of truth — a future
+/// improvement to the Levenshtein implementation (or a switch to
+/// Damerau-Levenshtein etc.) takes effect uniformly.
 fn closest_param_name<'a>(key: &str, schema: &'a schema::ParamSchema) -> Option<&'a str> {
-    fn edit_distance(a: &str, b: &str) -> usize {
-        let (a, b) = (a.as_bytes(), b.as_bytes());
-        let m = a.len();
-        let n = b.len();
-        let mut prev: Vec<usize> = (0..=n).collect();
-        let mut curr = vec![0usize; n + 1];
-        for i in 1..=m {
-            curr[0] = i;
-            for j in 1..=n {
-                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-                curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
-            }
-            std::mem::swap(&mut prev, &mut curr);
-        }
-        prev[n]
-    }
     let threshold = (key.len() / 2).clamp(2, 4);
-    let mut best: Option<(&str, usize)> = None;
-    for p in &schema.params {
-        let d = edit_distance(key, &p.name);
-        if d <= threshold && best.is_none_or(|(_, b)| d < b) {
-            best = Some((p.name.as_str(), d));
-        }
-    }
-    best.map(|(n, _)| n)
+    let candidates: Vec<String> = schema.params.iter().map(|p| p.name.clone()).collect();
+    crate::text_distance::closest_match(key, &candidates, threshold)
+        .and_then(|name| {
+            // closest_match returns an owned String; map back to the
+            // borrowed `&'a str` the caller expects by looking up
+            // the schema entry that matched.
+            schema
+                .params
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.name.as_str())
+        })
 }
 
 /// Expand compound YAML fields that don't map 1:1 to schema params,
@@ -1704,7 +2206,7 @@ fn build_module_entry(
     //   byte 9:    domain id
     entry[4..8].copy_from_slice(&name_hash.to_le_bytes());
     entry[8] = id;
-    let domain_id = resolve_domain_id(module, config);
+    let domain_id = resolve_domain_id(module, config)?;
     entry[9] = domain_id;
 
     // Track actual params length used
@@ -1989,6 +2491,20 @@ fn parse_modules_map(
         let name = module["name"].as_str().ok_or_else(|| {
             Error::Config(format!("Module at index {} missing 'name' field", idx))
         })?;
+        // Duplicate-name detector. Names are used as keys in
+        // manifests / wiring lookup / scheduler module table, so
+        // two modules sharing a name silently makes every name
+        // reference ambiguous (the later one wins in some places,
+        // the earlier in others — neither is right). Catch at
+        // parse time and name the conflicting index pair so the
+        // user can find both occurrences in the YAML.
+        if let Some(prev_idx) = names.iter().position(|n| n == name) {
+            return Err(Error::Config(format!(
+                "Duplicate module name '{name}' at index {idx}; first declared at index \
+                 {prev_idx}. Every module needs a unique `name:` — rename one (the wiring \
+                 still uses the rename, the manifest's `type:` stays the same)."
+            )));
+        }
         let id = idx as u8;
         let entry = build_module_entry(name, module, id, data_section, config, modules_dir)?;
         entries.push(entry);
@@ -2057,28 +2573,106 @@ pub fn extract_module_search_paths(
         }
     }
 
+    // Append the project root's `modules/` and the install root's
+    // `modules/` so external user projects see the bundled
+    // modules in their search-path view. The manifest loader
+    // (`load_module_manifests_with_extra`) already walks these
+    // independently via `STANDARD_MODULE_SUBDIRS`; surfacing them
+    // here keeps `inspect`'s module-search-paths listing and the
+    // actual loader behaviour aligned.
+    let project = crate::project::root();
+    let project_modules = project.join("modules");
+    let canon = project_modules.canonicalize().unwrap_or(project_modules);
+    if !paths.iter().any(|p| p == &canon) {
+        paths.push(canon);
+    }
+    if let Some(install) = crate::project::install_root() {
+        if install.path != project {
+            let install_modules = install.path.join("modules");
+            let canon = install_modules.canonicalize().unwrap_or(install_modules);
+            if !paths.iter().any(|p| p == &canon) {
+                paths.push(canon);
+            }
+        }
+    }
+
     paths
 }
 
 /// any additional search paths (e.g., relative to the config file).
+/// Standard fluxor module subdirectories, relative to a root. Mirrors
+/// `Manifest::from_source_tree` in `tools/src/manifest.rs`. Built-ins
+/// live under `modules/builtin/<platform>/<name>/`.
+const STANDARD_MODULE_SUBDIRS: &[&str] = &[
+    "modules/drivers",
+    "modules/foundation",
+    "modules/app",
+    "modules/builtin/linux",
+    "modules/builtin/host",
+    "modules/builtin/wasm",
+    "modules/builtin/qemu",
+    "modules",
+];
+
+/// Build the prioritized list of module search roots. Order:
+///   1. `<project_root>/<standard subdirs>` — user's overrides
+///      first so a local module shadows the bundled one.
+///   2. `<install_root>/<standard subdirs>` — bundled fallback
+///      when the install root differs from the project root.
+///
+/// Returns absolute paths in priority order. Non-existent entries
+/// are kept (the manifest loader skips them) so a missing
+/// per-platform directory doesn't silently shadow other entries.
+fn standard_module_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let project = crate::project::root();
+    for sub in STANDARD_MODULE_SUBDIRS {
+        dirs.push(project.join(sub));
+    }
+    if let Some(install) = crate::project::install_root() {
+        if install.path != project {
+            for sub in STANDARD_MODULE_SUBDIRS {
+                let p = install.path.join(sub);
+                if !dirs.contains(&p) {
+                    dirs.push(p);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// Process-global "already warned" cache for malformed manifest
+/// paths. `load_module_manifests_with_extra` runs multiple times
+/// in a single `fluxor validate` / `fluxor build` invocation
+/// (presentation groups + the main pipeline + each scenario
+/// component); without deduplication the same warning fires 3-4
+/// times for a single broken manifest. The cache survives for the
+/// process lifetime, which is the natural scope — a fresh
+/// invocation re-emits the warnings.
+fn warn_manifest_parse_error_once(path: &std::path::Path, err: &Error) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::BTreeSet<std::path::PathBuf>>> = OnceLock::new();
+    let lock = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    let mut seen = match lock.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if seen.insert(path.to_path_buf()) {
+        eprintln!(
+            "warning: manifest at {} failed to parse: {}",
+            path.display(),
+            err
+        );
+    }
+}
+
 pub fn load_module_manifests_with_extra(
     modules_config: &Value,
     extra_dirs: &[&std::path::Path],
 ) -> HashMap<String, Manifest> {
     let mut manifests = HashMap::new();
-    // Standard fluxor module directories (relative to CWD = fluxor root).
-    // Order mirrors `Manifest::from_source_tree` in `tools/src/manifest.rs`.
-    // Built-ins live under `modules/builtin/<platform>/<name>/`.
-    let standard: Vec<std::path::PathBuf> = vec![
-        "modules/drivers".into(),
-        "modules/foundation".into(),
-        "modules/app".into(),
-        "modules/builtin/linux".into(),
-        "modules/builtin/host".into(),
-        "modules/builtin/wasm".into(),
-        "modules/builtin/qemu".into(),
-        "modules".into(),
-    ];
+    let standard = standard_module_dirs();
     let list = match modules_config.as_array() {
         Some(l) => l,
         None => return manifests,
@@ -2091,13 +2685,30 @@ pub fn load_module_manifests_with_extra(
         let type_name = module["type"].as_str().unwrap_or(name);
         let mut found = false;
 
-        // Search standard dirs first
+        // Search standard dirs first (project root, then install
+        // root). User overrides win because the project root is
+        // walked first.
         for dir in &standard {
             let manifest_path = dir.join(type_name).join("manifest.toml");
             if manifest_path.exists() {
-                if let Ok(m) = Manifest::from_toml(&manifest_path) {
-                    manifests.insert(name.to_string(), m);
-                    found = true;
+                match Manifest::from_toml(&manifest_path) {
+                    Ok(m) => {
+                        manifests.insert(name.to_string(), m);
+                        found = true;
+                    }
+                    Err(e) => {
+                        // Don't silently swallow the parse error —
+                        // a malformed manifest looks identical to
+                        // a missing one downstream ("no manifest
+                        // found"), and the user has no idea why.
+                        // Surface the path + error so they can fix
+                        // it; the downstream gate still errors out
+                        // because the module didn't make it into
+                        // the map. Dedup'd across the process so
+                        // re-entry from multiple validators doesn't
+                        // spam the same path 3-4 times.
+                        warn_manifest_parse_error_once(&manifest_path, &e);
+                    }
                 }
                 break;
             }
@@ -2108,8 +2719,13 @@ pub fn load_module_manifests_with_extra(
             for extra in extra_dirs {
                 let manifest_path = extra.join(type_name).join("manifest.toml");
                 if manifest_path.exists() {
-                    if let Ok(m) = Manifest::from_toml(&manifest_path) {
-                        manifests.insert(name.to_string(), m);
+                    match Manifest::from_toml(&manifest_path) {
+                        Ok(m) => {
+                            manifests.insert(name.to_string(), m);
+                        }
+                        Err(e) => {
+                            warn_manifest_parse_error_once(&manifest_path, &e);
+                        }
                     }
                     break;
                 }
@@ -2131,6 +2747,7 @@ fn resolve_port_spec<'a>(
     spec: &'a str,
     context_is_from: bool,
     manifests: &HashMap<String, Manifest>,
+    declared_names: &[String],
 ) -> std::result::Result<(&'a str, u8, u8), String> {
     let parts: Vec<&str> = spec.split('.').collect();
     let module_name = parts.first().unwrap_or(&spec).trim();
@@ -2143,21 +2760,43 @@ fn resolve_port_spec<'a>(
 
     let port_part = parts[1].trim();
 
-    // Named port — look up in manifest
+    // Named port — look up in manifest. A missing manifest at this
+    // point is almost always one of: a typo in the module's name
+    // (e.g. `sequencr.notes` when the module is declared as
+    // `sequencer`), a typo in the `type:` field, a `.fmod` whose
+    // source tree fluxor can't see (the project root is wrong, or
+    // the install root needs to be set), or a built-in module
+    // whose feature isn't compiled into the running fluxor binary.
+    // Run a Levenshtein lookup against the declared module-name
+    // list first — typo'd name is the single most common cause.
     let manifest = manifests.get(module_name).ok_or_else(|| {
+        let typo_hint = crate::target::closest_match(module_name, declared_names, 3)
+            .map(|s| format!("Did you mean '{s}'? "))
+            .unwrap_or_default();
         format!(
-            "no manifest found for module '{}' (needed to resolve port name '{}')",
-            module_name, port_part
+            "no manifest found for module '{module_name}' (needed to resolve port name \
+             '{port_part}'). {typo_hint}Common causes:\n\
+             \x20\x20- the module name is misspelled or doesn't match a `name:` declared \
+             under `modules:`;\n\
+             \x20\x20- the module's `type:` field is misspelled or refers to a module that \
+             doesn't exist;\n\
+             \x20\x20- the project / install roots don't include the module's source tree \
+             (run `fluxor inspect` to see the search paths in use);\n\
+             \x20\x20- the module is a built-in whose feature isn't compiled into this \
+             `fluxor` binary."
         )
     })?;
 
     let (direction, index, _content_type) =
         manifest.find_port_by_name(port_part).ok_or_else(|| {
-            // Build helpful error with available port names
-            let available: Vec<&str> = manifest
+            // Build helpful error with available port names + a
+            // Levenshtein "did you mean" suggestion. `notess` →
+            // 'notes' is the most common shape — the same pattern
+            // every other typo-prone surface in this tool uses.
+            let available: Vec<String> = manifest
                 .ports
                 .iter()
-                .filter_map(|p| p.name.as_deref())
+                .filter_map(|p| p.name.clone())
                 .collect();
             if available.is_empty() {
                 format!(
@@ -2165,10 +2804,12 @@ fn resolve_port_spec<'a>(
                     module_name
                 )
             } else {
+                let did_you_mean = crate::text_distance::closest_match(port_part, &available, 3)
+                    .map(|h| format!(" Did you mean '{h}'?"))
+                    .unwrap_or_default();
                 format!(
-                    "module '{}' has no port named '{}'; available: {}",
-                    module_name,
-                    port_part,
+                    "module '{module_name}' has no port named '{port_part}'.{did_you_mean} \
+                     Available: {}",
                     available.join(", ")
                 )
             }
@@ -2191,6 +2832,103 @@ fn resolve_port_spec<'a>(
     }
 
     Ok((module_name, direction, index))
+}
+
+/// Reject configs where a module declares an input port as
+/// `required: true` in its manifest but no wiring edge connects to
+/// that port. Without this check, the build silently succeeds and
+/// the runtime instance blocks forever on an empty input ring (or
+/// produces uninitialised output) — exactly the kind of "config
+/// passes but graph runs wrong" failure that's most painful to
+/// debug because nothing is logged.
+///
+/// Edges are checked against the resolved `to_port_index` field
+/// (the per-direction index `parse_wiring_edges` computed from
+/// either the bare-name shorthand or the explicit
+/// `module.portname` form). A module with multiple required inputs
+/// must have one edge per required input.
+///
+/// **Scope:** data inputs (direction == 0) only. Control inputs
+/// (direction == 2) are usually rare-event signaling channels that
+/// are typically optional; the manifest can still mark them
+/// `required: true` if a module genuinely can't initialise without
+/// the control wire, but the common case is "left unconnected".
+/// If a need surfaces to enforce required ctrl inputs too, this
+/// validator extends easily.
+fn validate_required_inputs_wired(
+    edges: &[(u8, u8, u8, u8, u8)],
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    // Index every (to_module_id, to_port_index) pair an edge
+    // delivers into. `to_port` (the wire format's 0=in/1=ctrl
+    // distinction) is also tracked so we can match against the
+    // manifest's direction byte.
+    //   wire_to_port 0 + manifest direction 0 → data input.
+    //   wire_to_port 1 + manifest direction 2 → ctrl input.
+    let mut covered_data: BTreeSet<(u8, u8)> = BTreeSet::new();
+    for &(_, to_id, to_port, _, to_port_index) in edges {
+        if to_port == 0 {
+            covered_data.insert((to_id, to_port_index));
+        }
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    for (module_id, name) in module_names.iter().enumerate() {
+        let manifest = match manifests.get(name) {
+            Some(m) => m,
+            // No manifest → already an error class handled by the
+            // wiring/manifest validator. Skip silently here to
+            // avoid double-reporting.
+            None => continue,
+        };
+        for port in &manifest.ports {
+            // direction == 0 = data input. Skip output (1) and
+            // ctrl input/output (2/3) — see scope comment above.
+            if port.direction != 0 {
+                continue;
+            }
+            // flags bit 0 = required (per `Manifest::from_toml` at
+            // tools/src/manifest.rs line ~760). A non-required
+            // input left unconnected is fine — module handles
+            // empty input by design.
+            if port.flags & 0x01 == 0 {
+                continue;
+            }
+            if covered_data.contains(&(module_id as u8, port.index)) {
+                continue;
+            }
+            // Build the most actionable label: prefer the port's
+            // human name if the manifest declares one, else fall
+            // back to `in[N]` so the user can spot which slot
+            // needs wiring.
+            let port_label = port
+                .name
+                .as_deref()
+                .map(|n| format!("'{n}' (in[{}])", port.index))
+                .unwrap_or_else(|| format!("in[{}]", port.index));
+            violations.push(format!(
+                "module '{name}' declares input port {port_label} as required, but no \
+                 wiring edge connects to it. Add a `wiring:` entry of the form \
+                 `to: {name}{port_specifier}`.",
+                port_specifier = match &port.name {
+                    Some(n) => format!(".{n}"),
+                    None if port.index == 0 => String::new(),
+                    None => format!(" (port index {})", port.index),
+                }
+            ));
+        }
+    }
+
+    if !violations.is_empty() {
+        return Err(Error::Config(format!(
+            "Required input(s) left unwired — these modules will block at runtime:\n  - {}",
+            violations.join("\n  - ")
+        )));
+    }
+    Ok(())
 }
 
 /// Validate content-type compatibility for all wiring edges.
@@ -2491,16 +3229,22 @@ pub fn validate_presentation_groups(
 /// Compose a clear "unknown module in wiring" error. For logical sink
 /// names that the platform stack would normally provide, hint at the
 /// missing `platform.<stack>:` block instead of leaving the developer
-/// to guess.
-fn unknown_module_in_wiring(name: &str) -> String {
-    let hint = match name {
-        "display" => Some("did you forget `platform.display:` in your config?"),
-        "audio_out" => Some("did you forget `platform.audio:` in your config?"),
+/// to guess. For everything else, run a Levenshtein lookup against
+/// the declared module list — the most common cause is a typo (e.g.
+/// `wiring: [from: my_modul.out]` against `name: my_module`).
+fn unknown_module_in_wiring(name: &str, declared_names: &[String]) -> String {
+    let stack_hint = match name {
+        "display" => Some("did you forget `platform.display:` in your config?".to_string()),
+        "audio_out" => Some("did you forget `platform.audio:` in your config?".to_string()),
         _ => None,
     };
-    match hint {
-        Some(h) => format!("Unknown module in wiring: {} ({})", name, h),
-        None => format!("Unknown module in wiring: {}", name),
+    let typo_hint = crate::target::closest_match(name, declared_names, 3)
+        .map(|s| format!("did you mean '{s}'?"));
+    let hints: Vec<String> = stack_hint.into_iter().chain(typo_hint).collect();
+    if hints.is_empty() {
+        format!("Unknown module in wiring: {name}")
+    } else {
+        format!("Unknown module in wiring: {name} ({})", hints.join("; "))
     }
 }
 
@@ -2535,9 +3279,9 @@ fn parse_wiring_edges(
         let force = w["force"].as_bool().unwrap_or(false);
 
         let (from_name, _from_port_type, from_port_index) =
-            resolve_port_spec(from, true, manifests)
+            resolve_port_spec(from, true, manifests, names)
                 .map_err(|e| Error::Config(format!("wiring from '{}': {}", from, e)))?;
-        let (to_name, to_port_type, to_port_index) = resolve_port_spec(to, false, manifests)
+        let (to_name, to_port_type, to_port_index) = resolve_port_spec(to, false, manifests, names)
             .map_err(|e| Error::Config(format!("wiring to '{}': {}", to, e)))?;
 
         // Map destination port type to wire format: in(0)→0, ctrl(2)→1
@@ -2546,12 +3290,12 @@ fn parse_wiring_edges(
         let from_id = names
             .iter()
             .position(|n| n == from_name)
-            .ok_or_else(|| Error::Config(unknown_module_in_wiring(from_name)))?
+            .ok_or_else(|| Error::Config(unknown_module_in_wiring(from_name, names)))?
             as u8;
         let to_id = names
             .iter()
             .position(|n| n == to_name)
-            .ok_or_else(|| Error::Config(unknown_module_in_wiring(to_name)))?
+            .ok_or_else(|| Error::Config(unknown_module_in_wiring(to_name, names)))?
             as u8;
 
         edges.push((from_id, to_id, to_port, from_port_index, to_port_index));
@@ -2843,21 +3587,23 @@ fn resolve_edge_classes(
     config: &Value,
     _module_names: &[String],
     domain_names: &[String],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
         Some(w) => w,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
 
     let mut classes = Vec::with_capacity(wiring.len());
 
-    // Build module_name → domain_id lookup
+    // Build module_name → domain_id lookup. Surfaces an unknown-domain
+    // typo here too so cross_core edge-class validation can't fall back
+    // to a phantom domain 0.
     let modules_list = config.get("modules").and_then(|m| m.as_array());
     let mut module_domain: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     if let Some(mods) = modules_list {
         for m in mods {
             if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
-                let domain = resolve_domain_id(m, config);
+                let domain = resolve_domain_id(m, config)?;
                 module_domain.insert(name.to_string(), domain);
             }
         }
@@ -2893,7 +3639,7 @@ fn resolve_edge_classes(
         classes.push(ec);
     }
 
-    classes
+    Ok(classes)
 }
 
 /// Resolve `buffer_bytes` for each wiring entry.
@@ -3038,11 +3784,29 @@ fn generate_config_impl(
         )));
     }
 
-    // Parse execution.domains
+    // Parse execution.domains. Hard-reject if the list exceeds
+    // the kernel's `MAX_DOMAINS = 4` ceiling. The config writer
+    // serialises exactly 4 domain-metadata entries
+    // (`domain metadata: 4 entries × …` in the graph section), so
+    // a 5th declared domain would either be silently dropped on
+    // the wire OR (worse) a module assigned to it would resolve
+    // to a domain id the kernel can't address (`domain_count`
+    // clamps to 4 in `prepare_graph`). Reject at source so the
+    // user sees a single clear error rather than odd runtime
+    // behaviour.
     let mut domain_names: Vec<String> = Vec::new();
     let mut domain_tick_us: Vec<u16> = Vec::new();
     if let Some(exec) = config.get("execution") {
         if let Some(domains) = exec.get("domains").and_then(|d| d.as_array()) {
+            if domains.len() > MAX_DOMAINS {
+                return Err(Error::Config(format!(
+                    "execution.domains has {} entries; the kernel supports at most {} \
+                     (MAX_DOMAINS — one per physical or logical scheduling partition). \
+                     Drop the extras or merge their modules into existing domains.",
+                    domains.len(),
+                    MAX_DOMAINS
+                )));
+            }
             for domain in domains {
                 let name = domain
                     .get("name")
@@ -3068,6 +3832,29 @@ fn generate_config_impl(
             module_list.len()
         );
     }
+
+    // Budget validation: prove step_deadlines, burst budgets, and
+    // per-domain tick budgets fit together before the kernel ever
+    // boots the graph. Until this lands, a config could declare
+    // `step_deadline_us: 5000` on a module in a domain with
+    // `tick_us: 1000` and the deadline would silently force every
+    // step over budget — observable only as missed-deadline timeouts
+    // at runtime.
+    validate_scheduler_budgets(
+        config,
+        module_list,
+        tick_us,
+        &domain_names,
+        &domain_tick_us,
+    )?;
+
+    // ISR-tier admission: every module routed to a Tier 1b/2 domain
+    // must declare `isr_safe = true` in its manifest, and the wiring
+    // touching it cannot use an edge class incompatible with bridge
+    // routing. The build-time gate is half of D6 — the runtime
+    // routing in `channel_open` is the other half. See
+    // `.context/rfc_isr_tier_surface.md` for the full contract.
+    validate_isr_tier_admission(config, module_list, modules_dir, extra_module_dirs)?;
 
     // Inject graph sample_rate into modules that don't declare their own
     let modules_with_rate;
@@ -3110,6 +3897,21 @@ fn generate_config_impl(
         &from_specs,
         &to_specs,
     )?;
+
+    // Required-input-unwired detector. Manifests mark some input
+    // ports `required: true` — those MUST have a wiring edge
+    // connecting to them or the module will block on an empty
+    // input ring at runtime with no diagnostic. Catching this at
+    // build time turns a silent runtime stall into a loud
+    // validate-time failure.
+    validate_required_inputs_wired(&edges, &module_names, &manifests)?;
+
+    // (Considered: warn on declared-but-never-wired modules. Real
+    // bug class — refactor leftovers, typo'd wire references —
+    // but the false-positive rate on legitimate standalone modules
+    // (`debug`, monitor, alive heartbeat) is too high to justify
+    // a default warning. Filed for revisit if a manifest-side
+    // `standalone: true` opt-in lands so the check can be precise.)
 
     validate_presentation_groups(config, &module_names, &manifests)?;
 
@@ -3215,7 +4017,7 @@ fn generate_config_impl(
     }
 
     // Resolve per-edge edge_class from wiring entries
-    let edge_classes = resolve_edge_classes(config, &module_names, &domain_names);
+    let edge_classes = resolve_edge_classes(config, &module_names, &domain_names)?;
     // Resolve per-edge `buffer_bytes` overrides from wiring entries.
     // Parallel array; entries default to 0 ("use module hints").
     let edge_buffer_bytes = resolve_edge_buffer_bytes(config);
@@ -3279,12 +4081,7 @@ fn generate_config_impl(
         {
             domains
                 .get(d)
-                .and_then(|dom| dom.get("exec_mode").and_then(|m| m.as_str()))
-                .map(|m| match m {
-                    "high_rate" | "tier1a" => 1u8,
-                    "poll" | "tier3" => 3u8,
-                    _ => 0u8,
-                })
+                .map(|dom| parse_domain_tier_to_exec_mode(dom).unwrap_or(0))
                 .unwrap_or(0)
         } else {
             0u8
@@ -3681,3 +4478,508 @@ pub static EXAMPLES: LazyLock<HashMap<&'static str, Value>> = LazyLock::new(|| {
 
     m
 });
+
+#[cfg(test)]
+mod scheduler_validation_tests {
+    use super::*;
+
+    // ---- resolve_domain_id: hard-fail on unknown domain ----
+
+    #[test]
+    fn unknown_domain_name_is_a_hard_error() {
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "audio", "tick_us": 1000},
+                    {"name": "control", "tick_us": 10000}
+                ]
+            }
+        });
+        let module = json!({"name": "synth", "type": "x", "domain": "audoi"});
+        let err = resolve_domain_id(&module, &cfg).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("audoi") && msg.contains("audio") && msg.contains("control"),
+            "expected error to name typo and known domains, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn module_without_domain_resolves_to_default_zero() {
+        let cfg = json!({
+            "execution": {
+                "domains": [{"name": "audio", "tick_us": 1000}]
+            }
+        });
+        let module = json!({"name": "m", "type": "x"});
+        assert_eq!(resolve_domain_id(&module, &cfg).unwrap(), 0);
+    }
+
+    #[test]
+    fn known_domain_resolves_to_its_index() {
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "audio", "tick_us": 1000},
+                    {"name": "control", "tick_us": 10000}
+                ]
+            }
+        });
+        let module = json!({"name": "m", "type": "x", "domain": "control"});
+        assert_eq!(resolve_domain_id(&module, &cfg).unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_rejects_module_targeting_fifth_or_later_domain() {
+        // Defense-in-depth: even if a caller bypasses the
+        // `generate_config_impl` top-level rejection of >4
+        // domains, `resolve_domain_id` must refuse to return an
+        // out-of-range domain id. A `domain_id >= MAX_DOMAINS`
+        // can't be encoded in the 4-slot domain metadata + the
+        // kernel's `domain_count` clamp would make the runtime
+        // behaviour undefined.
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "d0"},
+                    {"name": "d1"},
+                    {"name": "d2"},
+                    {"name": "d3"},
+                    {"name": "d4"}   // 5th domain — index 4
+                ]
+            }
+        });
+        let module = json!({"name": "m", "type": "x", "domain": "d4"});
+        let err = resolve_domain_id(&module, &cfg).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("at most 4") || msg.contains("index 4"),
+            "expected out-of-range domain diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_module_targeting_fourth_domain() {
+        // Boundary: index 3 (the 4th domain) IS valid — the cap
+        // is `MAX_DOMAINS = 4` total, so indices 0..=3 are legal.
+        // Catches an off-by-one regression where the bound
+        // accidentally goes `> MAX_DOMAINS` instead of `>=`.
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "d0"},
+                    {"name": "d1"},
+                    {"name": "d2"},
+                    {"name": "d3"}
+                ]
+            }
+        });
+        let module = json!({"name": "m", "type": "x", "domain": "d3"});
+        assert_eq!(resolve_domain_id(&module, &cfg).unwrap(), 3);
+    }
+
+    #[test]
+    fn domain_named_without_any_execution_domains_section_errors() {
+        // Catches the case where a module asks for a domain but the
+        // YAML forgot to declare `execution.domains` at all.
+        let cfg = json!({});
+        let module = json!({"name": "m", "type": "x", "domain": "audio"});
+        let err = resolve_domain_id(&module, &cfg).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("execution.domains is missing"),
+            "expected missing-section error, got: {msg}"
+        );
+    }
+
+    // ---- validate_scheduler_budgets ----
+
+    #[test]
+    fn declared_burst_over_100ms_hard_caps() {
+        // step_deadline_us=20_000 × BURST_MULTIPLIER(8) = 160 ms > 100 ms hard cap.
+        let cfg = json!({"execution": {"domains": []}});
+        let modules = vec![json!({
+            "name": "heavy",
+            "type": "x",
+            "step_deadline_us": 20_000
+        })];
+        let err = validate_scheduler_budgets(&cfg, &modules, 1000, &[], &[]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("absolute cap") && msg.contains("heavy"),
+            "expected absolute-cap error naming the module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn declared_burst_over_16x_tick_hard_caps() {
+        // step_deadline_us=3000 × 8 = 24_000 us. With tick_us=1000,
+        // domain budget × 16 = 16_000 us < 24_000 us → hard fail.
+        let cfg = json!({"execution": {"domains": []}});
+        let modules = vec![json!({
+            "name": "spikey",
+            "type": "x",
+            "step_deadline_us": 3000
+        })];
+        let err = validate_scheduler_budgets(&cfg, &modules, 1000, &[], &[]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("16 \u{00d7} domain tick_us") || msg.contains("16 × domain tick_us"),
+            "expected 16×-tick error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn undeclared_deadlines_skip_budget_validation() {
+        // Three modules all using the kernel default deadline should
+        // not trip the validator — the default is a fault threshold,
+        // not a budget claim.
+        let cfg = json!({"execution": {"domains": []}});
+        let modules = vec![
+            json!({"name": "a", "type": "x"}),
+            json!({"name": "b", "type": "x"}),
+            json!({"name": "c", "type": "x"}),
+        ];
+        validate_scheduler_budgets(&cfg, &modules, 1000, &[], &[]).unwrap();
+    }
+
+    // ---- parse_domain_tier_to_exec_mode ----
+
+    #[test]
+    fn tier_friendly_strings_map_to_exec_mode_bytes() {
+        // The byte mapping is wire-stable — adding tiers must preserve
+        // existing values. This test pins the {0,1,2,3,4} table from
+        // .context/rfc_isr_tier_surface.md §D5.
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "cooperative"})),
+            Some(0)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "1a"})),
+            Some(1)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "1b"})),
+            Some(2),
+            "Tier 1b → exec_mode 2 (the new admission target)"
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "3"})),
+            Some(3)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "2"})),
+            Some(4),
+            "Tier 2 → exec_mode 4 (asymmetric because the byte was \
+             allocated after 1a/3)"
+        );
+    }
+
+    #[test]
+    fn legacy_exec_mode_field_still_parses() {
+        // Pre-RFC configs use `exec_mode: tier1a`. The parser must
+        // keep accepting these so `examples/cm5/*` and other live
+        // configs build unchanged.
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "tier1a"})),
+            Some(1)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "high_rate"})),
+            Some(1)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "poll"})),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn unknown_tier_string_returns_none() {
+        // Caller is responsible for hard-failing on a None when the
+        // YAML actually had a `tier` / `exec_mode` field — silent
+        // fall-through to Tier 0 would mask typos.
+        assert!(parse_domain_tier_to_exec_mode(&json!({"tier": "1c"})).is_none());
+        assert!(parse_domain_tier_to_exec_mode(&json!({"exec_mode": "real-time"})).is_none());
+    }
+
+    #[test]
+    fn no_tier_field_returns_none_for_default() {
+        assert!(parse_domain_tier_to_exec_mode(&json!({"name": "d"})).is_none());
+    }
+
+    // ---- validate_isr_tier_admission ----
+    //
+    // These tests exercise the validator directly with synthetic
+    // manifests. Going through the full `fluxor build` path would
+    // require a populated modules tree; the validator's contract is
+    // narrow enough to test in isolation.
+
+    fn run_admission(
+        config: serde_json::Value,
+        modules: Vec<serde_json::Value>,
+    ) -> Result<()> {
+        // Use a path that surely doesn't exist so `load_module_
+        // manifests_with_extra` finds nothing. The validator handles
+        // the missing-manifest case by skipping the isr_safe check
+        // (the wiring/manifest validator surfaces missing-manifest
+        // errors separately), so for the unknown-tier-and-typed-edge
+        // tests we don't need a real manifest. The cases that DO
+        // need a manifest plant fake ones via an `extra_module_dirs`
+        // tempdir — see the dedicated tests below.
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = Vec::new();
+        validate_isr_tier_admission(&config, &modules, modules_dir, &extras)
+    }
+
+    #[test]
+    fn admission_passes_when_no_isr_tier_domains_present() {
+        let cfg = json!({
+            "execution": {"domains": [{"name": "main", "tier": "1a"}]}
+        });
+        let modules = vec![json!({"name": "m", "type": "x", "domain": "main"})];
+        run_admission(cfg, modules).expect("cooperative graph admits");
+    }
+
+    #[test]
+    fn admission_rejects_unknown_tier_string() {
+        let cfg = json!({
+            "execution": {"domains": [{"name": "main", "tier": "1c"}]}
+        });
+        let modules = vec![json!({"name": "m", "type": "x", "domain": "main"})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown tier") && msg.contains("1a/high_rate"),
+            "expected unknown-tier diagnostic naming valid values, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tier_1b_as_not_yet_runtime_supported() {
+        // Tier 1b is build-time-rejected today: the YAML schema +
+        // build-time manifest gate + cooperative scheduler skip
+        // are in place, but the runtime registration / bridge
+        // wiring isn't. Better to fail loudly at build than ship
+        // a config whose modules silently never run. Lift this
+        // test (and the gate) when the runtime path lands.
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({"name": "m", "type": "x", "domain": "audio_isr"})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("tier 1b") && msg.contains("not yet runtime-supported"),
+            "expected tier-1b-not-supported diagnostic, got: {msg}"
+        );
+        assert!(
+            msg.contains("rfc_isr_tier_surface"),
+            "diagnostic should point at the lift-tracking RFC, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tier_2_as_not_yet_runtime_supported() {
+        // Symmetric: Tier 2 (`tier: 2` / `isr_owned`) hits the
+        // same hard-reject — same missing runtime piece, same
+        // explanation.
+        let cfg = json!({
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "m", "type": "x", "domain": "irq_owner"})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("tier 2") && msg.contains("not yet runtime-supported"),
+            "expected tier-2-not-supported diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_accepts_tier_1a_cooperative_with_isr_safe_field_present() {
+        // Cooperative tiers (0/1a/3) are unaffected by the
+        // Tier 1b/2 hard-reject — the `isr_safe` manifest flag is
+        // simply ignored for non-ISR-tier domains. Catches a
+        // regression where the gate goes too broad.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("plain_mod");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "main", "tier": "1a"}]}
+        });
+        let modules = vec![
+            json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})
+        ];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect("cooperative tier with isr_safe=false on its modules is fine");
+    }
+
+    #[test]
+    fn declared_deadlines_within_budget_pass() {
+        // Two modules in domain 0 with declared deadlines summing to
+        // 1500 us, tick_us 1000 → declared sum < 4×tick = 4000 → ok.
+        let cfg = json!({"execution": {"domains": [{"name": "d0", "tick_us": 1000}]}});
+        let modules = vec![
+            json!({"name": "a", "type": "x", "step_deadline_us": 800}),
+            json!({"name": "b", "type": "x", "step_deadline_us": 700}),
+        ];
+        validate_scheduler_budgets(
+            &cfg,
+            &modules,
+            1000,
+            &["d0".to_string()],
+            &[1000],
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod module_discovery_tests {
+    //! Tests for the dual-root module manifest discovery added on
+    //! top of the project/install root resolver. Verifies that
+    //! `load_module_manifests_with_extra` finds modules under the
+    //! install root when the project root lacks them (the
+    //! "external user project pulls bundled modules" path), and
+    //! that the project root wins on duplicate names (the "user
+    //! overrides bundled" path).
+
+    use super::*;
+
+    /// Shared env-var lock — the project resolver reads
+    /// `$FLUXOR_PROJECT_ROOT` / `$FLUXOR_INSTALL_ROOT` and these
+    /// tests mutate both. Serialise so parallel test execution
+    /// doesn't see each other's settings.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Set up a tree under `root` with a manifest at
+    /// `root/modules/foundation/<name>/manifest.toml`. Used to
+    /// synthesise both project and install roots for these tests
+    /// without depending on the real source tree.
+    fn plant_manifest(root: &std::path::Path, name: &str, isr_safe: bool) {
+        let dir = root.join("modules/foundation").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!(
+            "name = \"{name}\"\nversion = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = {isr_safe}\n",
+        );
+        std::fs::write(dir.join("manifest.toml"), body).unwrap();
+    }
+
+    /// Install the `.fluxor` marker + a stub `targets/` + `stacks/`
+    /// so `discover()` and `install_root()` accept the path.
+    fn mark_project(root: &std::path::Path) {
+        std::fs::write(root.join(".fluxor"), b"").unwrap();
+    }
+
+    fn mark_install(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("stacks")).unwrap();
+        std::fs::create_dir_all(root.join("targets")).unwrap();
+    }
+
+    #[test]
+    fn finds_module_in_install_root_when_project_lacks_it() {
+        let _g = env_lock();
+        let project = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        mark_project(project.path());
+        mark_install(install.path());
+        // Only the install root has the manifest.
+        plant_manifest(install.path(), "bundled_mod", true);
+
+        unsafe {
+            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
+            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
+        }
+        let modules = json!([{"name": "bundled_mod", "type": "bundled_mod"}]);
+        let manifests = load_module_manifests_with_extra(&modules, &[]);
+        unsafe {
+            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
+            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
+        }
+        let m = manifests
+            .get("bundled_mod")
+            .expect("install-root manifest must be discoverable");
+        assert!(m.isr_safe, "manifest content round-trips");
+    }
+
+    #[test]
+    fn project_root_module_shadows_install_root_module() {
+        // Both roots carry the manifest under the same name. The
+        // project root's version must win — `isr_safe = true` in
+        // project, `false` in install. After loading, the result
+        // must reflect the project version.
+        let _g = env_lock();
+        let project = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        mark_project(project.path());
+        mark_install(install.path());
+        plant_manifest(project.path(), "shared_mod", true);
+        plant_manifest(install.path(), "shared_mod", false);
+
+        unsafe {
+            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
+            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
+        }
+        let modules = json!([{"name": "shared_mod", "type": "shared_mod"}]);
+        let manifests = load_module_manifests_with_extra(&modules, &[]);
+        unsafe {
+            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
+            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
+        }
+        let m = manifests.get("shared_mod").expect("must find shared_mod");
+        assert!(
+            m.isr_safe,
+            "expected project-root manifest (isr_safe=true) to shadow install-root manifest, got isr_safe=false"
+        );
+    }
+
+    #[test]
+    fn extract_module_search_paths_includes_install_root_modules() {
+        let _g = env_lock();
+        let project = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        mark_project(project.path());
+        mark_install(install.path());
+        // Create a `modules/` dir in install so the returned path
+        // canonicalises to an existing location.
+        std::fs::create_dir_all(install.path().join("modules")).unwrap();
+
+        unsafe {
+            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
+            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
+        }
+        // Place the config inside the project tree so the
+        // <config-parent>/../modules default doesn't accidentally
+        // land at a path that masks the install/modules entry.
+        let cfg_path = project.path().join("cfg/dummy.yaml");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        let cfg = json!({});
+        let paths = extract_module_search_paths(&cfg, &cfg_path);
+        unsafe {
+            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
+            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
+        }
+
+        let install_modules = install.path().join("modules").canonicalize().unwrap();
+        assert!(
+            paths.contains(&install_modules),
+            "install-root modules dir must appear in the search-paths surface; got {paths:?}"
+        );
+    }
+}

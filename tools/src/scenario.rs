@@ -1853,7 +1853,7 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
     let base = scenario_path
         .parent()
         .ok_or_else(|| Error::Config("scenario path has no parent dir".into()))?;
-    let project_root = std::env::current_dir().unwrap_or_default();
+    let project_root = crate::project::root();
 
     for (comp_name, comp) in &scenario.components {
         let target = effective_target(scenario_path, comp);
@@ -1955,7 +1955,7 @@ fn read_manifest_hardware_targets(path: &Path) -> Result<Vec<String>> {
 /// validation pass.
 pub fn revalidate_all(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
     use crate::target::load_target;
-    let project_root = std::env::current_dir().unwrap_or_default();
+    let project_root = crate::project::root();
 
     // PR 5: module hardware_targets ↔ effective_target consistency,
     // checked before any expensive validation downstream.
@@ -2434,7 +2434,7 @@ bindings:
             "kind: scenario\nname: [["
         )
         .unwrap();
-        let mut out = list_scenarios(&dir).unwrap();
+        let mut out = list_scenarios(dir).unwrap();
         out.sort();
         let names: Vec<&str> = out.iter().map(|(_, n)| n.as_str()).collect();
         assert!(names.contains(&"foo"));
