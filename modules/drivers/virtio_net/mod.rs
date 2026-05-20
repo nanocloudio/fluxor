@@ -383,9 +383,28 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
     desc_set(s.txq.desc, 0, tx_buf as u64, total as u32, 0);
     let ai = s.txq.next_avail;
     avail_ring_set(s.txq.avail, (ai as usize) % QUEUE_SIZE, 0);
-    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
     s.txq.next_avail = ai.wrapping_add(1);
     avail_set_idx(s.txq.avail, s.txq.next_avail);
+    // Full DSB barrier immediately before the QUEUE_NOTIFY write —
+    // and AFTER `avail_set_idx`. `avail.idx` is the queue-visible
+    // publish store that has to be ordered before the notify;
+    // otherwise the device can pick up the notify and still observe
+    // the old `avail.idx`. Placing the barrier before
+    // `avail_set_idx` would order only the descriptor + ring writes,
+    // not the publish.
+    //
+    // `dsb sy` on aarch64 covers the full system shareability domain
+    // — PCIe-attached virtio MMIO sits OUTSIDE the inner-shareable
+    // domain that `dmb ish` orders. On other architectures
+    // `compiler_fence(SeqCst)` keeps the optimiser from reordering
+    // the kick before the publish. Mirrors
+    // `kernel::hal::dma_kick_barrier`.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     mmio_write(s.device_base, QUEUE_NOTIFY, 1);
 }
 

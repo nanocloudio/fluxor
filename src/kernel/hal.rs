@@ -239,6 +239,56 @@ pub fn pic_barrier() {
     (ops().pic_barrier)()
 }
 
+/// Full barrier between a CPU-side write to a DMA buffer and the
+/// register write that arms the controller. Call immediately before
+/// any MMIO that hands a descriptor or queue index to a device — the
+/// `dsb sy` on aarch64 covers the system shareability domain that
+/// `dmb ish` does not (PCIe-attached devices sit outside the inner
+/// shareable). Cortex-M relies on the strongly-ordered system bus
+/// plus a compiler fence against reordering.
+#[inline(always)]
+pub fn dma_kick_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Minimum measurable wall-clock increment from `now_micros()` on
+/// this target, in nanoseconds. Reports the **API's** resolution,
+/// not the underlying counter — `now_micros()` returns integer
+/// microseconds everywhere except WASM, where browsers clamp
+/// `performance.now()` to 100 µs as a Spectre mitigation. Modules
+/// that depend on sub-µs timing should query this and adjust their
+/// math (or refuse to run on coarse platforms).
+#[inline(always)]
+pub fn tick_us_granularity_ns() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        100_000
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        1_000
+    }
+}
+
+/// `true` when the running target's scheduler tick is coarsened by
+/// an external constraint — currently only WASM. `step_period_ticks`
+/// counts scheduler returns, not wall-clock microseconds; on a
+/// coarsened platform a `step_period_ticks == 1` module may not run
+/// more often than the platform's tick floor. Modules that need
+/// sub-millisecond `tick_us` deltas (audio resampling, control
+/// loops) gate themselves out via this query.
+#[inline(always)]
+pub fn is_tick_coarsened() -> bool {
+    cfg!(target_arch = "wasm32")
+}
+
 // ── Step guard ────────────────────────────────────────────────────────
 
 #[inline(always)]

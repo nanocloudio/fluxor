@@ -398,14 +398,43 @@ const STATE_ALIGN: usize = 8;
 fn align_up(n: usize) -> usize {
     (n + STATE_ALIGN - 1) & !(STATE_ALIGN - 1)
 }
+
+/// `align_up` via checked arithmetic. The unchecked
+/// `n + STATE_ALIGN - 1` form wraps on `n` near `usize::MAX`; returns
+/// `None` so callers refuse the allocation rather than proceed with
+/// a tiny, wrapped value while the rest of the path treats the size
+/// as huge.
+#[inline]
+fn align_up_checked(n: usize) -> Option<usize> {
+    n.checked_add(STATE_ALIGN - 1).map(|m| m & !(STATE_ALIGN - 1))
+}
+
+/// 32-bit canary written at the trailing edge of every state
+/// allocation. A module that overruns its state buffer clobbers this
+/// word, and `free_state_range` (or `validate_state_canary` for
+/// ad-hoc checks) reports it. Distinct from heap's `0xDEAD_BEEF`
+/// `ALLOC_MAGIC` so a single 4-byte dump identifies which arena
+/// overflowed.
+const STATE_CANARY: u32 = 0xDEAD_C0DE;
+/// Trailing bytes reserved per allocation for the canary, kept
+/// within the alignment-rounded `need` budget so caller pointer
+/// math is unaffected.
+const STATE_CANARY_SIZE: usize = 4;
 /// Allocate a state buffer of `size` bytes from the pool.
 ///
 /// Returns a pointer to a zeroed, 8-byte-aligned buffer. Served from
-/// the free list if a region fits; otherwise bumps the high-water mark.
+/// the free list if a region fits; otherwise bumps the high-water
+/// mark. Every arithmetic step is checked — a wrapped result would
+/// round down to a tiny chunk that the caller's first
+/// `write_bytes(ptr, 0, size)` would then overrun by the original
+/// huge `size`.
 pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
     // SAFETY: Single-threaded embedded context, no concurrent access
     unsafe {
-        let need = align_up(size);
+        let need = size
+            .checked_add(STATE_CANARY_SIZE)
+            .and_then(align_up_checked)
+            .ok_or(LoaderError::StatePoolExhausted)?;
         // 1. Scan free list for first-fit.
         let free_list = &raw mut FREE_LIST;
         let count = FREE_COUNT;
@@ -432,29 +461,54 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
                     .cast::<u8>()
                     .add(offset);
                 core::ptr::write_bytes(ptr, 0, size);
+                core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
                 return Ok(ptr);
             }
             i += 1;
         }
-        // 2. Bump from the high-water mark.
+        // Bump from the high-water mark. `aligned + need` is checked
+        // — a wrapped result that passes the arena-cap test would
+        // let `write_bytes(ptr, 0, size)` corrupt memory past the
+        // arena. Overflow and over-cap fold into the same guard.
         let aligned = align_up(STATE_ARENA_OFFSET);
-        if aligned + need > STATE_ARENA_SIZE {
-            log::error!(
-                "[loader] STATE ARENA EXHAUSTED — need={} used={} cap={} (raise \
-                 abi::config::kernel::STATE_ARENA_SIZE or reduce module arena demand; \
-                 modules without a heap arena will silently fail every heap_alloc call)",
-                need,
-                aligned,
-                STATE_ARENA_SIZE
-            );
-            return Err(LoaderError::StatePoolExhausted);
-        }
+        let next = match aligned.checked_add(need) {
+            Some(n) if n <= STATE_ARENA_SIZE => n,
+            _ => {
+                log::error!(
+                    "[loader] STATE ARENA EXHAUSTED — need={} used={} cap={} (raise \
+                     abi::config::kernel::STATE_ARENA_SIZE or reduce module arena demand; \
+                     modules without a heap arena will silently fail every heap_alloc call)",
+                    need,
+                    aligned,
+                    STATE_ARENA_SIZE
+                );
+                return Err(LoaderError::StatePoolExhausted);
+            }
+        };
         let ptr = core::ptr::addr_of_mut!(STATE_ARENA.0)
             .cast::<u8>()
             .add(aligned);
         core::ptr::write_bytes(ptr, 0, size);
-        STATE_ARENA_OFFSET = aligned + need;
+        core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
+        STATE_ARENA_OFFSET = next;
         Ok(ptr)
+    }
+}
+
+/// Read the trailing canary for a state allocation at `ptr` of
+/// `size` user-bytes. Returns `true` if the canary matches
+/// `STATE_CANARY`, `false` if it was clobbered. The caller decides
+/// what to do on mismatch (fault the module, terminate the graph,
+/// log + continue).
+///
+/// `size` must match the original `alloc_state(size)` call.
+pub fn validate_state_canary(ptr: *const u8, size: usize) -> bool {
+    if ptr.is_null() {
+        return true;
+    }
+    unsafe {
+        let canary_ptr = ptr.add(size) as *const u32;
+        core::ptr::read_unaligned(canary_ptr) == STATE_CANARY
     }
 }
 /// Return high-water mark: (used_bytes, total_bytes). Does not reflect
@@ -470,12 +524,34 @@ pub fn arena_usage() -> (usize, usize) {
 /// # Safety
 /// `ptr` must have been returned by `alloc_state` and not already freed.
 pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 {
+    if ptr.is_null() {
         return;
+    }
+    // Zero-sized allocations still consume
+    // `align_up(STATE_CANARY_SIZE) = 8` bytes (canary plus alignment
+    // slack) — the free path releases the true footprint regardless
+    // of user-visible size. Validate the trailing canary first; for
+    // zero-sized regions the canary lives at `ptr + 0`.
+    if !validate_state_canary(ptr as *const u8, size) {
+        log::error!(
+            "[loader] STATE CANARY CLOBBERED at {:p} (size={}) — \
+             module overran its state buffer",
+            ptr,
+            size,
+        );
     }
     let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>();
     let offset = ptr as usize - base as usize;
-    let need = align_up(size);
+    // Checked arithmetic mirrors `alloc_state`. A wrapping
+    // `size + STATE_CANARY_SIZE` would compute a tiny `need` and
+    // leave the rest of the region claimed but unreachable.
+    let Some(need) = size
+        .checked_add(STATE_CANARY_SIZE)
+        .and_then(align_up_checked)
+    else {
+        log::error!("[loader] free_state_range: size={} overflows", size);
+        return;
+    };
     let free_list = &raw mut FREE_LIST;
     let mut new_offset = offset as u32;
     let mut new_size = need as u32;
@@ -614,12 +690,27 @@ impl ModuleHeader {
     ///     bit N = contract id N required in `[[resources]]`. Covers
     ///     the full 0..31 range of contract ids defined in
     ///     `provider::contract`.
-    ///   bytes 10-11: reserved (0), available for future ABI extensions.
+    ///   byte 10: step_phase — phase offset applied to the period
+    ///     counter at instantiation. Lets graph authors stagger
+    ///     coarse-period modules so they don't all fire on the same
+    ///     tick (convoy mitigation). Must satisfy
+    ///     `step_phase < step_period_ticks`; validated by the loader.
+    ///     `0` is the natural cadence.
+    ///   byte 11: reserved (0), available for future ABI extensions.
     /// Step period from reserved[1]: 0 = every tick, N = step every N
     /// scheduler ticks. Units are scheduler ticks, not milliseconds —
     /// the wall-clock period depends on the domain's `tick_us`.
     pub fn step_period_ticks(&self) -> u8 {
         self.reserved[1]
+    }
+    /// Phase offset applied to the period counter at module
+    /// instantiation. The scheduler initialises `step_counter[idx] =
+    /// step_phase` so the module's first eligible tick is at
+    /// `step_period_ticks - step_phase`. `0` means no phase, the
+    /// natural cadence. Validated against `step_period_ticks` so
+    /// `phase < period`.
+    pub fn step_phase(&self) -> u8 {
+        self.reserved[10]
     }
     /// Schema section size from reserved[2..4].
     pub fn schema_size(&self) -> u16 {
@@ -958,26 +1049,52 @@ impl ModuleLoader {
     /// the manifest-stored value; the test harness can override the verdict
     /// via `set_verify_integrity_mode`.
     pub fn init_from_blob(&mut self, blob: *const u8) -> Result<(), LoaderError> {
+        self.init_from_blob_with_len(blob, MAX_MODULES_BLOB_SIZE)
+    }
+
+    /// Length-aware counterpart to [`init_from_blob`]. `blob_len` is the
+    /// byte count the platform actually mapped — `total_size` declared
+    /// in the table header is rejected if it claims more bytes than
+    /// the mapping covers. Callers that know the exact length (Linux
+    /// reading from a file, WASM from a static `[u8; N]`) must use
+    /// this variant; the pointer-only entry falls back to the hard
+    /// upper bound `MAX_MODULES_BLOB_SIZE`.
+    ///
+    /// In addition to the header- and entry-bounds checks, each
+    /// module's internal sections (`code_size`, `data_size`,
+    /// `export_count`) must fit within the table entry's declared
+    /// `size`. A malformed module-header claiming `code_size >
+    /// entry.size` would otherwise produce out-of-bounds reads when
+    /// the instantiator walks past the header.
+    pub fn init_from_blob_with_len(
+        &mut self,
+        blob: *const u8,
+        blob_len: usize,
+    ) -> Result<(), LoaderError> {
         let header = unsafe { read_table_header(blob) };
         if header.magic != MODULE_TABLE_MAGIC {
             return Err(LoaderError::InvalidTableMagic);
         }
 
         // Validate the table header's declared size and every entry's
-        // offset/size against a hard upper bound before trusting any
-        // byte past the header. A tampered table — module_count =
-        // 0xFF, entry.offset = 0xFFFF_FFFF — would otherwise produce
-        // out-of-bounds pointer reads downstream.
-        //
-        // Hard cap: the on-disk modules blob never exceeds
-        // `MAX_MODULES_BLOB_SIZE`. Any header claiming more is
-        // rejected as malformed before the table walk.
+        // offset/size against the platform-supplied mapping bound
+        // before trusting any byte past the header. A tampered table
+        // — module_count = 0xFF, entry.offset = 0xFFFF_FFFF — would
+        // otherwise produce out-of-bounds pointer reads downstream.
         let total_size = ((header.total_size_hi as u32) << 16) | (header.total_size_lo as u32);
         if (total_size as usize) > MAX_MODULES_BLOB_SIZE {
             log::error!(
                 "[loader] modules blob size {} exceeds MAX_MODULES_BLOB_SIZE={}",
                 total_size,
                 MAX_MODULES_BLOB_SIZE
+            );
+            return Err(LoaderError::InvalidTableMagic);
+        }
+        if (total_size as usize) > blob_len {
+            log::error!(
+                "[loader] modules blob declared total_size={} > mapped blob_len={}",
+                total_size,
+                blob_len
             );
             return Err(LoaderError::InvalidTableMagic);
         }
@@ -995,7 +1112,10 @@ impl ModuleLoader {
         // Every entry's [offset, offset+size) must land inside
         // [table_size, total_size). Walking the table once here gives
         // every downstream pointer dereference a positive bounds
-        // proof.
+        // proof. Additionally, each entry's `size` must accommodate
+        // its module-header section sums so downstream readers
+        // (export table, schema, body) can never index past the
+        // entry's footprint.
         let entries_base = unsafe { offset_ptr(blob, 16) };
         for i in 0..header.module_count as usize {
             let entry = unsafe { read_table_entry(entries_base, i) };
@@ -1010,6 +1130,29 @@ impl ModuleLoader {
                     sz,
                     table_size,
                     total_size
+                );
+                return Err(LoaderError::InvalidTableMagic);
+            }
+            if sz < ModuleHeader::SIZE {
+                log::error!(
+                    "[loader] entry {} size={} < ModuleHeader::SIZE={}",
+                    i,
+                    sz,
+                    ModuleHeader::SIZE
+                );
+                return Err(LoaderError::InvalidTableMagic);
+            }
+            let mh = unsafe { read_module_header(offset_ptr(blob, off)) };
+            let inner = (mh.code_size as usize)
+                .saturating_add(mh.data_size as usize)
+                .saturating_add((mh.export_count as usize).saturating_mul(8))
+                .saturating_add(ModuleHeader::SIZE);
+            if inner > sz {
+                log::error!(
+                    "[loader] entry {} internal sections {} > entry size {}",
+                    i,
+                    inner,
+                    sz
                 );
                 return Err(LoaderError::InvalidTableMagic);
             }
@@ -1508,7 +1651,11 @@ impl DynamicModule {
     /// responsible for also freeing any heap arena recorded separately
     /// (see `free_state_range`).
     pub unsafe fn free(self) {
-        if !self.state_ptr.is_null() && self.state_size > 0 {
+        // A stateless module still occupies `align_up(STATE_CANARY_SIZE)`
+        // bytes of arena (canary + alignment slack), so the free
+        // path runs regardless of `state_size`. `free_state_range`
+        // computes the true footprint and handles `size == 0`.
+        if !self.state_ptr.is_null() {
             free_state_range(self.state_ptr, self.state_size as usize);
         }
     }
@@ -1608,6 +1755,24 @@ impl DynamicModule {
                 }
             }
         }
+        // Parse the protection-config TLV before any module code
+        // runs. The sequence is:
+        //   * heap init — allocator + flags table now exist
+        //   * parse_protection_config — installs heap canary,
+        //     zero_on_free, alloc_failure_policy, fault policy,
+        //     deadlines, quarantine partner
+        //   * invoke_init — `module_init(syscalls)` may `heap_alloc`
+        //     or `provider_call` with all flags in effect
+        //   * invoke_new — `module_new(...)` runs the same
+        //
+        // Every byte of declared protection is in place before the
+        // module's first instruction executes.
+        let params_slice = if params.ptr.is_null() || params.len == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(params.ptr, params.len) }
+        };
+        super::scheduler::parse_protection_config(inst_idx, params_slice);
         // 5. Initialize module (FFI call, but validated)
         if let Err(e) = invoke_init(module, syscalls, name) {
             free_state_range(state_ptr, required_size);

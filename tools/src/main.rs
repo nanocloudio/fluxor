@@ -45,7 +45,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    decode_config, generate_config_ext, generate_config_with_caps, ConfigBuilder, ModuleCaps,
+    decode_config, generate_config_ext, ConfigBuilder, ModuleCaps,
     EXAMPLES,
 };
 use crate::error::{Error, Result};
@@ -930,6 +930,7 @@ fn cmd_generate(
         &extra_dirs,
         target_desc.max_pin + 1,
         target_desc.pio_count,
+        Some(&target_desc.id),
     )?;
 
     eprintln!("Config size: {} bytes", binary_data.len());
@@ -1099,6 +1100,7 @@ fn cmd_combine(
         &extra_dirs,
         target_desc.max_pin + 1,
         target_desc.pio_count,
+        Some(&target_desc.id),
     )?;
 
     let modules_data = if !modules.is_empty() {
@@ -1374,13 +1376,15 @@ fn build_packaged_blobs(
         .collect();
 
     let builder = ConfigBuilder::new();
-    let config_data = generate_config_with_caps(
+    let config_data = generate_config_ext(
         config,
         &builder,
         &caps,
         modules_dir,
+        &[],
         target_desc.max_pin + 1,
         target_desc.pio_count,
+        Some(&target_desc.id),
     )?;
 
     let modules_data = if !modules.is_empty() {
@@ -1685,6 +1689,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         &extra_dirs,
         target_desc.max_pin + 1,
         target_desc.pio_count,
+        Some(&target_desc.id),
     ) {
         result.add_error(format!("{e}"));
     }

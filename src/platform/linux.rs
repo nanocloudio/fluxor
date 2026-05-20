@@ -180,11 +180,16 @@ fn main() {
     // inserts `_tee` / `_merge` for fan groups, allocates channels, and
     // populates port tables.
     loader::reset_state_arena();
-    // Length-aware: pass the file's exact byte count so the parser can
-    // reject any section that would extend past the actual blob.
-    if let Err(msg) =
-        unsafe { scheduler::populate_static_state_with_len(&config_data, modules_ptr as *const u8) }
-    {
+    // Length-aware: pass the file's exact byte count for both blobs
+    // so the parser rejects any section that would extend past the
+    // actual mappings.
+    if let Err(msg) = unsafe {
+        scheduler::populate_static_state_with_len(
+            &config_data,
+            modules_ptr as *const u8,
+            modules_len,
+        )
+    } {
         eprintln!("error: {}", msg);
         process::exit(1);
     }
@@ -329,6 +334,14 @@ fn main() {
     log::info!("[sched] starting main loop, tick_us={}", tick_us);
     let tick_duration = Duration::from_micros(tick_us as u64);
     let mut tick: u64 = 0;
+    // Throttle oversleep warnings to once every ~1 s of expected
+    // wall-clock so a chronic oversleep doesn't flood the log.
+    let mut last_oversleep_log_tick: u64 = 0;
+    let oversleep_log_period_ticks: u64 = if tick_us > 0 {
+        (1_000_000 / tick_us as u64).max(1)
+    } else {
+        u64::MAX
+    };
 
     // Capture the runtime thread so `linux_wake_scheduler` (called via
     // `hal::wake_scheduler` from `event_signal` / `event_signal_from_isr`)
@@ -412,6 +425,28 @@ fn main() {
         if wake != 0 {
             let sched = unsafe { scheduler::sched_mut() };
             scheduler::step_woken_modules(&mut sched.modules, module_count, wake);
+        }
+
+        // Detect chronic host oversleep. `thread::park_timeout`
+        // contracts with the OS scheduler; under `CONFIG_HZ=100` or
+        // load, the wake-up may overshoot by milliseconds. A 1.5×
+        // threshold ignores small-jitter overshoot and only fires on
+        // sustained drift, throttled once per ~second of expected
+        // wall-clock. Operators reading this in the log can correlate
+        // to RT-priority or CFS-bandwidth misconfiguration.
+        if tick_us > 200 {
+            let actual = t0.elapsed();
+            let threshold = tick_duration + tick_duration / 2;
+            if actual > threshold && tick - last_oversleep_log_tick >= oversleep_log_period_ticks {
+                log::warn!(
+                    "MON_HOST_OVERSLEEP tick={} requested_us={} actual_us={} threshold_us={}",
+                    tick,
+                    tick_us,
+                    actual.as_micros() as u64,
+                    threshold.as_micros() as u64,
+                );
+                last_oversleep_log_tick = tick;
+            }
         }
     }
 }

@@ -362,7 +362,7 @@ unsafe fn load_embedded_modules() -> usize {
     // construction makes the parser reject any section that overruns it.
     let cfg_slice = core::slice::from_raw_parts(EMBEDDED_CONFIG_BLOB.data.as_ptr(), config_used);
     let mod_ptr = EMBEDDED_MODULES_BLOB.data.as_ptr();
-    if let Err(msg) = scheduler::populate_static_state_with_len(cfg_slice, mod_ptr) {
+    if let Err(msg) = scheduler::populate_static_state_with_len(cfg_slice, mod_ptr, modules_used) {
         log_str(4, b"[wasm-kernel] populate_static_state failed:");
         log_str(4, msg.as_bytes());
         return 0;

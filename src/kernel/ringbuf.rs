@@ -62,6 +62,27 @@ impl RingBufState {
         if cap == 0 {
             return 0;
         }
+        // Defensive normalisation. The wrap arithmetic below relies
+        // on `head/tail < cap` and `len <= cap`; if any field
+        // desyncs from its `& cap_mask` invariant (rogue write,
+        // corrupted state, future code bypassing `write`), an
+        // unbounded index could panic and a corrupted `len > cap`
+        // would underflow `cap - self.len` into a huge `avail`. The
+        // debug assert catches corruption at its source; release
+        // builds silently re-establish the invariants.
+        debug_assert!(
+            self.tail < cap && self.head < cap && self.len <= cap,
+            "ringbuf: head/tail/len invariants (head={}, tail={}, len={}, cap={})",
+            self.head,
+            self.tail,
+            self.len,
+            cap,
+        );
+        self.tail &= self.cap_mask;
+        self.head &= self.cap_mask;
+        if self.len > cap {
+            self.len = cap;
+        }
         let avail = cap - self.len;
         // All-or-nothing: partial writes corrupt byte-stream framing
         // (e.g. net_proto between NIC driver and IP module).
@@ -88,6 +109,21 @@ impl RingBufState {
         if cap == 0 {
             return 0;
         }
+        // See `write` — same defensive normalisation against any
+        // desync of head/tail/len with their invariants.
+        debug_assert!(
+            self.tail < cap && self.head < cap && self.len <= cap,
+            "ringbuf: head/tail/len invariants (head={}, tail={}, len={}, cap={})",
+            self.head,
+            self.tail,
+            self.len,
+            cap,
+        );
+        self.tail &= self.cap_mask;
+        self.head &= self.cap_mask;
+        if self.len > cap {
+            self.len = cap;
+        }
         let total = out.len().min(self.len);
         if total == 0 {
             return 0;
@@ -111,22 +147,29 @@ impl RingBufState {
         if cap == 0 {
             return 0;
         }
-        let total = out.len().min(self.len);
+        // Clamp len to cap and head via the mask. `peek` is `&self`
+        // so we can't normalise the fields in place, but we can
+        // bound the slice indices computed from them.
+        let safe_len = self.len.min(cap);
+        let safe_head = self.head & self.cap_mask;
+        let total = out.len().min(safe_len);
         if total == 0 {
             return 0;
         }
-        let first = total.min(cap - self.head);
-        out[..first].copy_from_slice(&storage[self.head..self.head + first]);
+        let first = total.min(cap - safe_head);
+        out[..first].copy_from_slice(&storage[safe_head..safe_head + first]);
         if first < total {
             let second = total - first;
             out[first..first + second].copy_from_slice(&storage[..second]);
         }
         total
     }
-    /// Bytes available to read.
+    /// Bytes available to read. Clamps to `cap` so a corrupted
+    /// `len > cap` cannot propagate an oversized "readable" report
+    /// through `channel_readable_bytes` to module code.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.len.min(self.cap)
     }
     /// True when no bytes are available to read.
     #[inline]
@@ -138,10 +181,13 @@ impl RingBufState {
     pub fn capacity(&self) -> usize {
         self.cap
     }
-    /// Free space available for writing.
+    /// Free space available for writing. `saturating_sub` matches
+    /// the other accessors so a corrupted `len > cap` cannot
+    /// underflow into a wildly oversized free-space report visible
+    /// through `channel_space`.
     #[inline]
     pub fn space(&self) -> usize {
-        self.cap - self.len
+        self.cap.saturating_sub(self.len)
     }
     #[inline]
     pub fn is_readable(&self) -> bool {

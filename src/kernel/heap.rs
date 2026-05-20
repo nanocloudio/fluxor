@@ -35,6 +35,16 @@ const ALLOC_FLAG: u32 = 0x8000_0000;
 /// Magic value in next_or_magic when block is allocated (debug aid).
 const ALLOC_MAGIC: u32 = 0xDEAD_BEEF;
 
+/// Trailing canary value written at the end of every allocated chunk
+/// when `canary_enabled`. Distinct from `ALLOC_MAGIC` (chunk-header
+/// sentinel) and `STATE_CANARY` (state-arena trailing canary) so a
+/// single 4-byte dump at triage time identifies which arena overflowed.
+const HEAP_CANARY: u32 = 0xCAFE_BABE;
+
+/// Trailing-canary footprint in bytes. Included in the allocator's
+/// `aligned_size` so user-visible space is unchanged.
+const HEAP_CANARY_SIZE: usize = 4;
+
 // ============================================================================
 // Block Header
 // ============================================================================
@@ -103,8 +113,27 @@ pub struct ModuleHeap {
     pub high_water: u32,
     /// Number of failed allocation attempts.
     pub fail_count: u16,
-    /// Padding.
-    _pad: u16,
+    /// When set, `free()` memsets the chunk's data region to zero
+    /// before linking it back into the free list. Opt-in for modules
+    /// that handle secrets (TLS key material, session tokens) via
+    /// `heap.zero_on_free: true` in the manifest. Default `false`
+    /// keeps the hot-path free minimal for general modules.
+    zero_on_free: bool,
+    /// When set, a null return from `alloc()` or `realloc()` (with
+    /// `new_size > 0`) raises a module fault via
+    /// `raise_module_fault(idx, STEP_ERROR)`. The current step still
+    /// receives null, but the module enters `Faulted` and its
+    /// declared `FaultPolicy` runs at the next tick. Default `false`
+    /// preserves the C-style "caller checks null" pattern. Modules
+    /// preferring kernel-managed recovery declare
+    /// `heap.alloc_failure_policy = "fault"`.
+    fault_on_alloc_failure: bool,
+    /// When set, every allocation reserves a trailing canary word
+    /// inside the chunk; `free()` validates and logs on mismatch.
+    /// Opt-in because the +4 bytes per chunk are significant on
+    /// RP2350's tight `STATE_ARENA`. Modules with many small chunks
+    /// weigh the diagnostic value against the overhead.
+    canary_enabled: bool,
 }
 
 /// Heap statistics queryable by modules.
@@ -123,8 +152,14 @@ pub struct HeapStats {
     pub high_water: u32,
     /// Number of free blocks (fragmentation indicator).
     pub free_blocks: u16,
-    /// Largest free block in bytes (allocation headroom).
-    pub largest_free: u16,
+    /// Padding to align the `largest_free` u32 on its natural boundary.
+    pub _pad: u16,
+    /// Largest contiguous free block in bytes — the allocation
+    /// headroom for the next request. Under heavy fragmentation this
+    /// is significantly smaller than `arena_size - allocated`, and
+    /// surfacing it makes the fragmentation visible before a single
+    /// over-large request returns null.
+    pub largest_free: u32,
 }
 
 impl ModuleHeap {
@@ -139,7 +174,9 @@ impl ModuleHeap {
             total_allocs: 0,
             high_water: 0,
             fail_count: 0,
-            _pad: 0,
+            zero_on_free: false,
+            fault_on_alloc_failure: false,
+            canary_enabled: false,
         }
     }
 
@@ -168,7 +205,9 @@ impl ModuleHeap {
             total_allocs: 0,
             high_water: 0,
             fail_count: 0,
-            _pad: 0,
+            zero_on_free: false,
+            fault_on_alloc_failure: false,
+            canary_enabled: false,
         }
     }
 
@@ -182,13 +221,39 @@ impl ModuleHeap {
     ///
     /// Returns a pointer to the allocated memory, or null on failure.
     /// Size is rounded up to MIN_ALLOC alignment.
+    ///
+    /// When `canary_enabled`, the allocator reserves
+    /// `HEAP_CANARY_SIZE` extra bytes at the chunk tail and writes
+    /// `HEAP_CANARY` there. User-visible space is unchanged — the
+    /// canary sits in the alignment slack past `size`.
     pub fn alloc(&mut self, size: usize) -> *mut u8 {
         if !self.is_active() || size == 0 {
             return core::ptr::null_mut();
         }
 
-        // Round up to MIN_ALLOC granularity
-        let aligned_size = (size + MIN_ALLOC - 1) & !(MIN_ALLOC - 1);
+        // Round up to MIN_ALLOC granularity. Canary overhead is part
+        // of the rounding budget so the canary always lives within
+        // the chunk. Every arithmetic step is checked: a wrapped
+        // size would produce a tiny chunk that the caller's first
+        // write would overrun by `size` bytes.
+        let raw_need = if self.canary_enabled {
+            match size.checked_add(HEAP_CANARY_SIZE) {
+                Some(n) => n,
+                None => {
+                    self.fail_count = self.fail_count.saturating_add(1);
+                    return core::ptr::null_mut();
+                }
+            }
+        } else {
+            size
+        };
+        let aligned_size = match raw_need.checked_add(MIN_ALLOC - 1) {
+            Some(n) => n & !(MIN_ALLOC - 1),
+            None => {
+                self.fail_count = self.fail_count.saturating_add(1);
+                return core::ptr::null_mut();
+            }
+        };
 
         // First-fit search through free list
         let mut prev_offset: u32 = u32::MAX; // sentinel: no previous
@@ -263,8 +328,27 @@ impl ModuleHeap {
                     self.high_water = self.allocated;
                 }
 
+                let data_ptr = unsafe { self.base.add(cur_offset as usize + HEADER_SIZE) };
+                // Trailing canary at the last 4 bytes of the chunk's
+                // data region. Detection is at the chunk boundary,
+                // not the requested-size boundary: a user write
+                // exactly `size` bytes is safe; a write past chunk
+                // end clobbers the canary. Overruns into the
+                // alignment slack between `size` and the canary pass
+                // undetected — the chunk-header `ALLOC_MAGIC`
+                // sentinel catches writes into the next chunk.
+                if self.canary_enabled {
+                    let canary_off = actual_size as usize - HEAP_CANARY_SIZE;
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            data_ptr.add(canary_off) as *mut u32,
+                            HEAP_CANARY,
+                        );
+                    }
+                }
+
                 // Return pointer to data region (after header)
-                return unsafe { self.base.add(cur_offset as usize + HEADER_SIZE) };
+                return data_ptr;
             }
 
             // Move to next free block
@@ -315,6 +399,35 @@ impl ModuleHeap {
 
         let freed_size = hdr.data_size();
 
+        // Validate the trailing canary before releasing the chunk.
+        // A clobbered canary indicates the module wrote past its
+        // allocation; the chunk is still returned to the pool (the
+        // data is already lost — this is a detection hook, not a
+        // recovery one).
+        if self.canary_enabled && freed_size >= HEAP_CANARY_SIZE {
+            let canary_off = freed_size - HEAP_CANARY_SIZE;
+            let read =
+                unsafe { core::ptr::read_unaligned(ptr.add(canary_off) as *const u32) };
+            if read != HEAP_CANARY {
+                log::error!(
+                    "[heap] HEAP CANARY CLOBBERED at offset {} (chunk size {}) — \
+                     module overran its allocation",
+                    offset,
+                    freed_size,
+                );
+            }
+        }
+
+        // Zero the data region before insertion into the free list
+        // when the module opted in. Done BEFORE the insert so a
+        // subsequent allocator walk (immediate coalesce, realloc
+        // returning this chunk) can't observe the stale bytes.
+        if self.zero_on_free && freed_size > 0 {
+            unsafe {
+                core::ptr::write_bytes(ptr, 0, freed_size);
+            }
+        }
+
         // Update stats
         self.allocated = self.allocated.saturating_sub(freed_size as u32);
         self.alloc_count = self.alloc_count.saturating_sub(1);
@@ -351,11 +464,32 @@ impl ModuleHeap {
         }
 
         let old_size = hdr.data_size();
-        let aligned_new = (new_size + MIN_ALLOC - 1) & !(MIN_ALLOC - 1);
+        // Include canary cost in the new alignment when enabled —
+        // an in-place grow that omitted this would write the new
+        // canary at `chunk_end - 4`, landing inside the caller's
+        // resized region. Checked arithmetic guards against
+        // `realloc(ptr, usize::MAX)` shrinking the chunk while the
+        // caller treats it as huge.
+        let raw_need = if self.canary_enabled {
+            match new_size.checked_add(HEAP_CANARY_SIZE) {
+                Some(n) => n,
+                None => return core::ptr::null_mut(),
+            }
+        } else {
+            new_size
+        };
+        let aligned_new = match raw_need.checked_add(MIN_ALLOC - 1) {
+            Some(n) => n & !(MIN_ALLOC - 1),
+            None => return core::ptr::null_mut(),
+        };
 
-        // Shrink in place?
+        // Shrink in place. The chunk size header is unchanged, so
+        // the existing trailing canary at `old_size - 4` stays valid
+        // for `free()`. Detection inside the new (smaller) logical
+        // size is correspondingly looser — tightening would require
+        // splitting the chunk, which the allocator skips for
+        // simplicity.
         if aligned_new <= old_size {
-            // Could split excess into free block, but for simplicity just keep it
             return ptr;
         }
 
@@ -371,7 +505,7 @@ impl ModuleHeap {
                     self.remove_from_free_list(next_block_offset);
 
                     let remainder = combined - aligned_new;
-                    if remainder >= HEADER_SIZE + MIN_ALLOC {
+                    let final_size = if remainder >= HEADER_SIZE + MIN_ALLOC {
                         // Split: resize current, create new free block
                         unsafe {
                             (*hdr_ptr).set_allocated(aligned_new);
@@ -385,27 +519,51 @@ impl ModuleHeap {
                         }
                         self.insert_free_and_coalesce(new_free_off, new_free_size);
                         self.allocated += (aligned_new - old_size) as u32;
+                        aligned_new
                     } else {
                         // Use all combined space
                         unsafe {
                             (*hdr_ptr).set_allocated(combined);
                         }
                         self.allocated += (combined - old_size) as u32;
-                    }
+                        combined
+                    };
                     if self.allocated > self.high_water {
                         self.high_water = self.allocated;
+                    }
+                    // Stamp a fresh canary at the new chunk tail —
+                    // the grow moved `chunk_end`, so the canary
+                    // must move with it.
+                    if self.canary_enabled && final_size >= HEAP_CANARY_SIZE {
+                        let canary_off = final_size - HEAP_CANARY_SIZE;
+                        unsafe {
+                            core::ptr::write_unaligned(
+                                ptr.add(canary_off) as *mut u32,
+                                HEAP_CANARY,
+                            );
+                        }
                     }
                     return ptr;
                 }
             }
         }
 
-        // Fall back to alloc + copy + free
+        // Fall back to alloc + copy + free. With canary enabled,
+        // `old_size` includes the trailing canary bytes — copying
+        // those into the new chunk would land the canary value at
+        // an internal user-readable offset and confuse the next
+        // overrun-detection scan. Clamp the copy to the user
+        // region (old chunk minus its canary tail).
         let new_ptr = self.alloc(new_size);
         if new_ptr.is_null() {
             return core::ptr::null_mut();
         }
-        let copy_size = old_size.min(new_size);
+        let user_old = if self.canary_enabled && old_size >= HEAP_CANARY_SIZE {
+            old_size - HEAP_CANARY_SIZE
+        } else {
+            old_size
+        };
+        let copy_size = user_old.min(new_size);
         unsafe {
             core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
         }
@@ -450,7 +608,8 @@ impl ModuleHeap {
             total_allocs: self.total_allocs,
             high_water: self.high_water,
             free_blocks,
-            largest_free: largest_free.min(u16::MAX as usize) as u16,
+            _pad: 0,
+            largest_free: largest_free.min(u32::MAX as usize) as u32,
         }
     }
 
@@ -619,13 +778,26 @@ pub fn reset_all() {
     }
 }
 
-/// Allocate from the current module's heap.
-/// Returns pointer to allocated memory, or null on failure.
+/// Allocate from the current module's heap. Returns the allocated
+/// pointer or null on failure. When `fault_on_alloc_failure` is set,
+/// a null return also raises a `STEP_ERROR` fault so the module's
+/// declared `FaultPolicy` runs at the next tick; the C-style
+/// caller-checks-NULL pattern stays the default.
 pub fn heap_alloc(module_idx: usize, size: usize) -> *mut u8 {
     if module_idx >= MAX_MODULES {
         return core::ptr::null_mut();
     }
-    unsafe { MODULE_HEAPS[module_idx].alloc(size) }
+    let ptr = unsafe { MODULE_HEAPS[module_idx].alloc(size) };
+    if ptr.is_null() {
+        let fault_policy_enabled = unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure };
+        if fault_policy_enabled {
+            crate::kernel::scheduler::raise_module_fault(
+                module_idx,
+                crate::kernel::step_guard::fault_type::STEP_ERROR,
+            );
+        }
+    }
+    ptr
 }
 
 /// Free memory from the current module's heap.
@@ -637,11 +809,29 @@ pub fn heap_free(module_idx: usize, ptr: *mut u8) {
 }
 
 /// Reallocate from the current module's heap.
+///
+/// Honours `fault_on_alloc_failure` the same way as `heap_alloc`:
+/// when the realloc returns null AND `new_size > 0` (the caller
+/// wanted space, not a free), `raise_module_fault(idx, STEP_ERROR)`
+/// flips the module into `Faulted` so its declared `FaultPolicy`
+/// runs at the next tick. `new_size == 0` is the alloc-equivalent-
+/// of-free path — a null return there is the expected no-op, not an
+/// OOM, so it doesn't raise.
 pub fn heap_realloc(module_idx: usize, ptr: *mut u8, new_size: usize) -> *mut u8 {
     if module_idx >= MAX_MODULES {
         return core::ptr::null_mut();
     }
-    unsafe { MODULE_HEAPS[module_idx].realloc(ptr, new_size) }
+    let new_ptr = unsafe { MODULE_HEAPS[module_idx].realloc(ptr, new_size) };
+    if new_ptr.is_null() && new_size > 0 {
+        let fault_policy_enabled = unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure };
+        if fault_policy_enabled {
+            crate::kernel::scheduler::raise_module_fault(
+                module_idx,
+                crate::kernel::step_guard::fault_type::STEP_ERROR,
+            );
+        }
+    }
+    new_ptr
 }
 
 /// Get heap statistics for a module.
@@ -658,4 +848,71 @@ pub fn has_heap(module_idx: usize) -> bool {
         return false;
     }
     unsafe { MODULE_HEAPS[module_idx].is_active() }
+}
+
+/// Opt the module's heap into zero-on-free. Must be called before
+/// any allocation. When `true`, every `heap_free` memsets the chunk's
+/// data region to 0 before re-linking it into the free list, closing
+/// the cross-allocation residue channel for modules that handle
+/// secrets. Sourced from the manifest's `heap.zero_on_free` flag.
+pub fn set_zero_on_free(module_idx: usize, enabled: bool) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        MODULE_HEAPS[module_idx].zero_on_free = enabled;
+    }
+}
+
+/// Query whether the module's heap zeroes on free.
+pub fn zero_on_free_enabled(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
+    unsafe { MODULE_HEAPS[module_idx].zero_on_free }
+}
+
+/// Opt the module into kernel-managed fault on heap exhaustion.
+/// When `true`, every `heap_alloc`/`heap_realloc` null return also
+/// raises a `STEP_ERROR` fault — the declared `FaultPolicy` (Skip /
+/// Restart) decides what happens at the next tick. Default `false`
+/// keeps the caller-checks-NULL pattern. Sourced from the manifest's
+/// `heap.alloc_failure_policy = "fault"` setting.
+pub fn set_fault_on_alloc_failure(module_idx: usize, enabled: bool) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        MODULE_HEAPS[module_idx].fault_on_alloc_failure = enabled;
+    }
+}
+
+/// Query whether the module's heap raises a fault on exhaustion.
+pub fn fault_on_alloc_failure_enabled(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
+    unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure }
+}
+
+/// Enable the trailing canary on this module's heap. Must be called
+/// before any allocation — toggling mid-life would mismatch existing
+/// chunks. When enabled, each `alloc()` reserves `HEAP_CANARY_SIZE`
+/// extra bytes at the chunk tail; `free()` validates and logs on
+/// mismatch. Sourced from the manifest's `heap.canary_enabled` flag.
+pub fn set_canary_enabled(module_idx: usize, enabled: bool) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        MODULE_HEAPS[module_idx].canary_enabled = enabled;
+    }
+}
+
+/// Query whether the trailing canary is enabled for this module's heap.
+pub fn canary_enabled(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
+    unsafe { MODULE_HEAPS[module_idx].canary_enabled }
 }

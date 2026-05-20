@@ -104,6 +104,30 @@ pub enum ReconfigurePhase {
 /// while remaining cooperative (each individual step is still bounded).
 const MAX_BURST_STEPS: usize = 16384;
 
+/// Window (in scheduler ticks) within which a paired-module fault
+/// co-incidence triggers quarantine. If module A faults and its
+/// declared `quarantine_partner` B has also faulted within this many
+/// ticks, both transition to `Terminated` regardless of their
+/// individual `FaultPolicy`. 100 ticks ≈ 100 ms at the default 1 ms
+/// tick — comfortable for the "two halves of a TLS handshake go
+/// wrong at the same time" case, tight enough that unrelated faults
+/// don't mistakenly cross-trigger.
+const QUARANTINE_WINDOW_TICKS: u32 = 100;
+
+/// Hard kernel ceiling on `Draining` phase duration, in scheduler
+/// ticks. The reconfigure PIC module owns the drain orchestration and
+/// decides when each module has finished its in-flight work — but a
+/// buggy or hung module-drain can hold the graph indefinitely. After
+/// this many ticks in `Draining`, the kernel force-finalises every
+/// non-finished module with `FaultState::Terminated`, logs
+/// `MON_DRAIN_FORCED`, and snaps the phase back to `Running` so the
+/// next reconfigure attempt can proceed.
+///
+/// 30 000 ticks ≈ 30 s at the default 1 ms tick. Long enough that
+/// well-behaved drains never hit it; short enough that operators
+/// don't wait minutes on a hung migration.
+const MAX_DRAIN_TICKS: u32 = 30_000;
+
 /// Maximum number of execution domains.
 pub const MAX_DOMAINS: usize = 4;
 
@@ -682,22 +706,24 @@ pub unsafe fn populate_static_state(
 
 /// Length-aware counterpart to `populate_static_state`.
 ///
-/// `config_blob` is the entire config region as a byte slice; its length
-/// is the hard upper bound the parser uses when validating section
-/// offsets. Hosted targets (Linux: `Vec<u8>` from disk; WASM: a static
-/// `[u8; CONFIG_BLOB_CAPACITY]`) call this variant so a malformed
-/// header that claims a body larger than the actual blob fails
-/// deterministically rather than wandering past the mapping.
+/// `config_blob` is the entire config region as a byte slice and
+/// `modules_len` is the byte count the platform mapped for the
+/// module-table region. Both lengths are the hard upper bound the
+/// parser uses when validating section offsets — a header that claims
+/// a body larger than the actual blob fails deterministically rather
+/// than wandering past the mapping. Hosted targets (Linux: `Vec<u8>`
+/// from disk; WASM: a static `[u8; N]`) call this variant.
 ///
 /// # Safety
-/// `modules_ptr` must point at a valid module-table blob whose internal
-/// length fields stay within the mapped range. `config_blob` may be
+/// `modules_ptr` must point at a valid module-table blob whose
+/// `modules_len` bytes are mapped and readable. `config_blob` may be
 /// any slice the caller has a valid reference for. Mutates the static
 /// config + loader; not safe to call after the scheduler has started
 /// stepping modules.
 pub unsafe fn populate_static_state_with_len(
     config_blob: &[u8],
     modules_ptr: *const u8,
+    modules_len: usize,
 ) -> Result<(), &'static str> {
     let loader = unsafe {
         let p = &raw mut STATIC_LOADER;
@@ -708,7 +734,7 @@ pub unsafe fn populate_static_state_with_len(
         &mut *p
     };
     loader
-        .init_from_blob(modules_ptr)
+        .init_from_blob_with_len(modules_ptr, modules_len)
         .map_err(|_| "loader init failed")?;
     if !crate::kernel::config::read_config_from_slice(config_blob, config) {
         return Err("config parse failed");
@@ -912,6 +938,46 @@ pub struct SchedulerState {
     step_period: [u8; MAX_MODULES],
     /// Per-module step counter (counts ticks toward period)
     step_counter: [u8; MAX_MODULES],
+    /// Per-module count of consecutive ticks the module was considered
+    /// by the scheduler but never reached `m.step()` — readiness gate
+    /// vetoed every time. Reset to 0 on any actual step (Continue,
+    /// Burst, Ready, Done). A graph author seeing a non-zero value
+    /// here on a long-running module has either a dead edge or a
+    /// permanently-unsatisfied upstream dependency. Surfaced via
+    /// `ModuleStateSnapshot::inactive_for_ticks`.
+    inactive_for_ticks: [u32; MAX_MODULES],
+    /// Per-slot generation counter. Bumped on every event that
+    /// invalidates an outstanding reference into the slot's state
+    /// region — graph reset, module replacement (`store_builtin_module`,
+    /// `store_dynamic_module`), partial restart. Callers that snapshot
+    /// telemetry asynchronously can pair the snapshot's
+    /// `slot_generation` with a later read; a generation mismatch means
+    /// the slot was reused under them and the stale read must be
+    /// discarded. Closes the use-after-free window between a fault
+    /// telemetry dispatch and the read of the (possibly-replaced)
+    /// module state.
+    slot_generation: [u32; MAX_MODULES],
+    /// Tick at which the current `Draining` phase started.
+    /// Captured by `set_reconfigure_phase(Draining)`; consulted by
+    /// `step_modules` to enforce the `MAX_DRAIN_TICKS` ceiling.
+    /// `u32::MAX` means "no drain in progress" — distinguishes the
+    /// not-set sentinel from a legitimate `tick == 0` start.
+    drain_started_tick: u32,
+    /// Starting offset into the topological `exec_order` for the
+    /// flat-path next pass. Incremented after every `MON_BUDGET_OVERRUN`
+    /// so modules that are exec-order-behind the overrunning one don't
+    /// permanently lose every pass to the same upstream burster.
+    /// Pass order stays deterministic — same cyclic permutation per
+    /// non-overrunning pass.
+    exec_order_offset: u8,
+    /// Per-domain counterpart to `exec_order_offset` for the
+    /// domain-stepped path. `step_domain_modules` rotates the start
+    /// of `domain_exec_order[domain_id]` by this offset; it
+    /// increments on every per-domain budget overrun. Without this,
+    /// BCM multi-domain graphs with one overrunning module per
+    /// domain would permanently starve every later position in that
+    /// domain's exec_order.
+    domain_exec_order_offset: [u8; MAX_DOMAINS],
     /// Topological execution order (Kahn's algorithm output)
     exec_order: [u8; MAX_MODULES],
     /// Number of entries in exec_order
@@ -976,6 +1042,16 @@ pub struct SchedulerState {
     /// consumed by the per-platform main loop, which performs a destructive
     /// reset + reload.
     rebuild_request: Option<(*const u8, usize)>,
+    /// Transaction marker for `prepare_graph`. Set true at the *start* of
+    /// graph preparation (before any destructive `reset_*` call) and
+    /// cleared once the new graph is fully wired. While set, `step_modules`
+    /// short-circuits to `StepResult::Done` so a partially-built graph
+    /// can't be observed by a racing scheduler tick.
+    ///
+    /// Stays set across an early-return failure path so a half-prepared
+    /// SCHED is fail-safe until the *next* `prepare_graph` (which
+    /// re-sets the marker before resetting state again).
+    prepare_in_progress: bool,
 
     // ── Per-module export table info (for resolve_export_for_module) ──
     /// Code base address per module (for resolving export offsets)
@@ -1016,6 +1092,11 @@ impl SchedulerState {
             upstream_mask: [0; MAX_MODULES],
             step_period: [0; MAX_MODULES],
             step_counter: [0; MAX_MODULES],
+            inactive_for_ticks: [0; MAX_MODULES],
+            slot_generation: [0; MAX_MODULES],
+            drain_started_tick: u32::MAX,
+            exec_order_offset: 0,
+            domain_exec_order_offset: [0; MAX_DOMAINS],
             exec_order: [0; MAX_MODULES],
             exec_order_count: 0,
             graph_sample_rate: 0,
@@ -1035,6 +1116,7 @@ impl SchedulerState {
             reconfigure_phase: ReconfigurePhase::Running,
             active_module_count: 0,
             rebuild_request: None,
+            prepare_in_progress: false,
             module_code_base: [0; MAX_MODULES],
             module_code_size: [0; MAX_MODULES],
             module_export_table: [core::ptr::null(); MAX_MODULES],
@@ -1067,6 +1149,12 @@ impl SchedulerState {
             self.upstream_mask[i] = 0;
             self.step_period[i] = 0;
             self.step_counter[i] = 0;
+            self.inactive_for_ticks[i] = 0;
+            // Bump the generation on graph reset — every outstanding
+            // snapshot of the previous graph's slot is now stale.
+            // Wrapping ensures we keep producing fresh tokens across
+            // many reconfigures without overflowing.
+            self.slot_generation[i] = self.slot_generation[i].wrapping_add(1);
             self.module_latency[i] = 0;
             self.downstream_latency[i] = 0;
             self.fault_info[i] = ModuleFaultInfo::new();
@@ -1087,10 +1175,17 @@ impl SchedulerState {
             self.domain_budget_us_limit[d] = 0;
             self.domain_budget_us_consumed[d] = 0;
             self.domain_budget_overruns[d] = 0;
+            self.domain_exec_order_offset[d] = 0;
         }
         self.reconfigure_phase = ReconfigurePhase::Running;
         self.active_module_count = 0;
         self.rebuild_request = None;
+        self.drain_started_tick = u32::MAX;
+        self.exec_order_offset = 0;
+        // `prepare_in_progress` is intentionally NOT cleared here. The
+        // marker is owned by `prepare_graph`, which sets it *before*
+        // calling `reset()` and clears it once preparation completes.
+        // Resetting here would race the marker the caller just set.
     }
 }
 
@@ -1335,6 +1430,9 @@ pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
     unsafe {
         SCHED.modules[idx] = ModuleSlot::BuiltIn(m);
         SCHED.ready[idx] = true;
+        // Bump the slot generation on replacement so async consumers
+        // can detect a slot reuse.
+        SCHED.slot_generation[idx] = SCHED.slot_generation[idx].wrapping_add(1);
     }
 }
 
@@ -1345,6 +1443,8 @@ pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
     }
     unsafe {
         SCHED.modules[idx] = ModuleSlot::Dynamic(dm);
+        // See store_builtin_module — same rationale.
+        SCHED.slot_generation[idx] = SCHED.slot_generation[idx].wrapping_add(1);
     }
 }
 
@@ -1667,6 +1767,51 @@ pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
     }
 }
 
+/// Set the per-module burst-deadline override in microseconds.
+/// `0` disables the override and falls back to the implicit
+/// `step_deadline_us * BURST_MULTIPLIER` ceiling used by
+/// `step_one_module`. Sourced from the module manifest's
+/// `step_deadline_burst_us` setting.
+pub fn set_module_step_deadline_burst(module_idx: usize, deadline_us: u32) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        SCHED.fault_info[module_idx].step_deadline_burst_us = deadline_us;
+    }
+}
+
+/// Declare a quarantine partner for `module_idx`. When this module
+/// faults AND the partner has faulted within `QUARANTINE_WINDOW_TICKS`,
+/// both transition to `Terminated`. Pass `0xFF` to clear the pairing.
+/// Sourced from the module manifest's `quarantine_partner` setting;
+/// the kernel does not infer pairings from channel wiring.
+pub fn set_module_quarantine_partner(module_idx: usize, partner: u8) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        SCHED.fault_info[module_idx].quarantine_partner = partner;
+    }
+}
+
+/// Set the module's step-period phase offset. The phase is applied
+/// to the step counter as `step_counter[idx] = phase %
+/// step_period[idx]`, so the module's first eligible tick happens at
+/// `period - phase` ticks rather than `period`. Lets graph authors
+/// stagger coarse-period modules so they don't all fire on the same
+/// tick (convoy mitigation). Mirrors what `instantiate_one_module`
+/// does from the manifest's `ModuleHeader::step_phase()` byte.
+pub fn set_module_step_phase(module_idx: usize, phase: u8) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    unsafe {
+        let period = SCHED.step_period[module_idx];
+        SCHED.step_counter[module_idx] = if period > 0 { phase % period } else { 0 };
+    }
+}
+
 /// Set per-module step period (every N ticks). `0` = step every tick.
 /// Used by the loader's manifest-driven setup and by conformance tests
 /// that exercise the period-gating path in `step_one_module`.
@@ -1774,6 +1919,16 @@ pub struct ModuleStateSnapshot {
     pub restart_count: u16,
     /// Domain the module is assigned to (0 = default).
     pub domain_id: u8,
+    /// Consecutive ticks the readiness gate has been blocking this
+    /// module from stepping. `0` after every successful step; non-zero
+    /// indicates a dead upstream edge.
+    pub inactive_for_ticks: u32,
+    /// Per-slot generation. Bumped on graph reset, restart, and
+    /// module replacement. Async consumers that snapshot telemetry
+    /// must pair this with a later read of the same module — a
+    /// mismatch means the slot was reused and the prior snapshot is
+    /// stale.
+    pub slot_generation: u32,
 }
 
 /// Build a `ModuleStateSnapshot` for `module_idx`. Returns a
@@ -1792,6 +1947,8 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
             step_period: 0,
             restart_count: 0,
             domain_id: 0,
+            inactive_for_ticks: 0,
+            slot_generation: 0,
         };
     }
     let sched = unsafe {
@@ -1810,6 +1967,8 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
         step_period: sched.step_period[module_idx],
         restart_count: sched.fault_info[module_idx].restart_count,
         domain_id: sched.domain_id[module_idx],
+        inactive_for_ticks: sched.inactive_for_ticks[module_idx],
+        slot_generation: sched.slot_generation[module_idx],
     }
 }
 
@@ -1949,15 +2108,22 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         &mut *p
     };
 
-    // Reset all scheduler state, state arena, and name arena.
-    //
-    // also wipe channel slots and buffer registry slots
-    // so a previous graph's claims don't accumulate. Before this, the
-    // bump-allocator-only `reset_buffer_arena` and per-channel
-    // `channel_close` left slot metadata in `Allocated` state across
-    // reconfigures — each reconfigure ate slots that `try_allocate`
-    // then skipped, eventually exhausting `MAX_CHANNELS` / `MAX_BUFFER_SLOTS`
-    // even with otherwise well-sized graphs.
+    // Transaction marker: latch BEFORE any destructive reset so a
+    // racing `step_modules` on another core observes a half-prepared
+    // graph as `StepResult::Done` (cleanly idle) rather than iterating
+    // stale pointers. Cleared at the successful return path below; on
+    // an early-return failure the marker is intentionally left set so
+    // the SCHED is fail-safe until the next `prepare_graph` re-latches
+    // it.
+    sched.prepare_in_progress = true;
+
+    // Reset all scheduler state, state arena, and name arena. Channel
+    // slots and buffer registry slots also need to be wiped so a prior
+    // graph's claims don't accumulate — bump-allocator-only resets
+    // leave slot metadata in `Allocated` state across reconfigures,
+    // and `try_allocate` would then skip those slots until
+    // `MAX_CHANNELS` / `MAX_BUFFER_SLOTS` are exhausted even on
+    // otherwise well-sized graphs.
     reset_state_arena();
     crate::kernel::channel::reset_all();
     crate::kernel::buffer_pool::reset_all();
@@ -2088,14 +2254,12 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(-1);
     }
 
-    // validate buffer-group constraints
-    // uniformly across every platform. Previously this was wired only
-    // from `src/platform/rp.rs`; Linux / WASM / BCM platforms skipped
-    // the check, so graphs that pinned two in-place writers into the
-    // same buffer group ran with undefined producer ownership on
-    // those platforms. The function runs after `collect_module_hints`
-    // (which populates `in_place_writer`) and `open_channels` (which
-    // sets `edge.channel >= 0` for the live edges).
+    // Validate buffer-group constraints uniformly across every
+    // platform. Runs after `collect_module_hints` (which populates
+    // `in_place_writer`) and `open_channels` (which sets
+    // `edge.channel >= 0` for the live edges); two in-place writers
+    // pinned into the same buffer group is undefined producer
+    // ownership and must be rejected before the graph can step.
     if !validate_buffer_groups(&edges[..runtime_edge_count]) {
         log::error!("[graph] buffer group validation failed");
         return Err(crate::kernel::errno::EINVAL);
@@ -2112,27 +2276,20 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         }
     }
 
-    // Compute topological execution order.
+    // Compute topological execution order. A graph with cycles is
+    // rejected by default: silently running the topological prefix
+    // plus the cyclic remainder produces a *different* graph than
+    // the author declared. Typed feedback edges with explicit
+    // buffering will get their own ABI shape; until then a cycle is
+    // malformed and must be regenerated.
     //
-    // A graph with cycles is normally rejected here: previously
-    // `prepare_graph` discarded the cycle count via `_cycle_count`
-    // and ran the best-effort topological prefix plus the cyclic
-    // remainder, which produced a *different* graph than the
-    // author declared. Typed feedback edges with explicit buffering
-    // will get their own ABI shape; until then a cycle is malformed
-    // by default and must be regenerated.
-    //
-    // **Opt-in escape hatch** (`graph_flags & ACCEPT_CYCLES`): the
+    // Opt-in escape hatch (`graph_flags & ACCEPT_CYCLES`): the
     // config blob's graph-section flags byte can carry an explicit
     // author attestation that any cycles are bidirectional feedback
     // pairs (canonically `http <-> linux_net` in any linux http
     // example). When the flag is set, cycle members are appended to
-    // exec_order in declaration order — the same best-effort
-    // behaviour the old code had — and a loud `log::warn!` line is
-    // emitted so the choice is visible in operator output.
-    //
-    // See `.context/rfc_deployment_scenarios.md` §13 "Known issue
-    // blocking PR 3 end-to-end" for the design discussion.
+    // exec_order in declaration order and a loud `log::warn!` line
+    // is emitted so the choice is visible in operator output.
     let cycle_count = compute_exec_order(edges, runtime_edge_count, module_count);
     if cycle_count > 0 {
         let accept = (config.graph_flags
@@ -2185,6 +2342,11 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
             return Err(-1);
         }
     }
+
+    // Graph is fully wired — clear the in-progress marker so the
+    // scheduler can step. Earlier early-returns leave it set, which is
+    // the safe state (no module slots may be valid).
+    sched.prepare_in_progress = false;
 
     Ok((module_list, module_count))
 }
@@ -2970,6 +3132,16 @@ pub fn instantiate_one_module(
             // Record step period before returning
             unsafe {
                 SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
+                // Apply the manifest's `step_phase` as the initial
+                // counter value. With period P and phase φ, the first
+                // eligible tick is at `P - φ`, so coarse-period
+                // modules can be staggered to avoid convoy bursts.
+                // `step_phase < period` is validated by the loader;
+                // the clamp here is defense in depth so a malformed
+                // header can't index modulo 0.
+                let period = SCHED.step_period[instantiated];
+                let phase = found_module.header.step_phase();
+                SCHED.step_counter[instantiated] = if period > 0 { phase % period } else { 0 };
             }
             return InstantiateResult::Pending(pending);
         }
@@ -2982,10 +3154,15 @@ pub fn instantiate_one_module(
     // Record step frequency hint from module header
     unsafe {
         SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
+        // See Pending arm above — same step_phase initialisation.
+        let period = SCHED.step_period[instantiated];
+        let phase = found_module.header.step_phase();
+        SCHED.step_counter[instantiated] = if period > 0 { phase % period } else { 0 };
     }
 
-    // Parse protection config from TLV params (tags 0xF0-0xF3)
-    parse_protection_config(instantiated, entry.params());
+    // Protection config is parsed inside `start_new`, BETWEEN heap
+    // init and module_new, so module_new sees the declared heap
+    // flags / fault policy on its very first `heap_alloc`.
 
     InstantiateResult::Done
 }
@@ -3448,23 +3625,29 @@ pub const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
 
 /// Parse protection configuration from module params TLV.
 ///
-/// Looks for reserved tags 0xF0-0xF3 in the TLV v2 params blob:
-/// - 0xF0: step_deadline_us (u32, 4 bytes LE)
+/// Recognised tags in the schema-packed params blob:
+/// - 0xF0: step_deadline_us (u32 LE)
 /// - 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph)
-/// - 0xF2: max_restarts (u16, 2 bytes LE)
-/// - 0xF3: restart_backoff_ms (u16, 2 bytes LE)
-fn parse_protection_config(module_idx: usize, params: &[u8]) {
+/// - 0xF2: max_restarts (u16 LE)
+/// - 0xF3: restart_backoff_ms (u16 LE)
+/// - 0xF4: trust_tier (u8)
+/// - 0xF5: protection (u8)
+/// - 0xF6: step_deadline_burst_us (u32 LE)
+/// - 0xF7: quarantine_partner (u8 module index, 0xFF = none)
+/// - 0xF8: heap_zero_on_free (u8 bool)
+/// - 0xF9: heap_fault_on_alloc_failure (u8 bool)
+/// - 0xFA: heap_canary_enabled (u8 bool)
+pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
     if params.len() < 4 {
         return;
     }
 
-    // TLV v2 format: [0xFE, 0x02, len_lo, len_hi, ...entries..., 0xFF, 0x00]
-    // Each entry: tag(1), len(1), value(len)
-    // We scan raw bytes for our reserved tags regardless of TLV structure
+    // TLV format: [0xFE, ver, len_lo, len_hi, ...entries..., 0xFF, 0x00].
+    // Each entry: tag(1), len(1), value(len). The header layout (magic,
+    // version, u16 len) is stable across versions; only the version
+    // byte's meaning is informational, so any version is accepted here.
     let mut pos = 0;
-
-    // Skip TLV v2 header if present
-    if params.len() >= 4 && params[0] == 0xFE && params[1] == 0x02 {
+    if params.len() >= 4 && params[0] == 0xFE {
         pos = 4; // Skip header (magic, version, length)
     }
 
@@ -3531,10 +3714,248 @@ fn parse_protection_config(module_idx: usize, params: &[u8]) {
                     crate::kernel::mpu::set_enabled(true);
                 }
             }
+            0xF6 if len == 4 => {
+                // step_deadline_burst_us (u32 LE)
+                let val = u32::from_le_bytes([
+                    params[pos],
+                    params[pos + 1],
+                    params[pos + 2],
+                    params[pos + 3],
+                ]);
+                fi.step_deadline_burst_us = val;
+            }
+            0xF7 if len == 1 => {
+                // quarantine_partner (u8 module index, 0xFF = none)
+                fi.quarantine_partner = params[pos];
+            }
+            0xF8 if len == 1 => {
+                // heap.zero_on_free (u8 bool). Heap setter touches
+                // MODULE_HEAPS, not SCHED.fault_info, so no borrow
+                // conflict with `fi`.
+                crate::kernel::heap::set_zero_on_free(module_idx, params[pos] != 0);
+            }
+            0xF9 if len == 1 => {
+                // heap.alloc_failure_policy (u8 bool: false=null, true=fault)
+                crate::kernel::heap::set_fault_on_alloc_failure(
+                    module_idx,
+                    params[pos] != 0,
+                );
+            }
+            0xFA if len == 1 => {
+                // heap.canary_enabled (u8 bool)
+                crate::kernel::heap::set_canary_enabled(module_idx, params[pos] != 0);
+            }
             _ => {}
         }
 
         pos += len;
+    }
+}
+
+/// Drain-timeout enforcement, shared by `step_modules` and
+/// `step_domain_modules`. Returns `true` if the timeout fired and the
+/// caller should bail out of its iteration with `StepResult::Done`.
+///
+/// Walks every active module through `finalize_module` so the
+/// downstream POLL_ERR/POLL_HUP signalling, the
+/// `release_module_handles` syscall path, and the
+/// `mark_module_finished` invariant all fire. Setting
+/// `fault_info[i].state = Terminated` and `finished[i] = true`
+/// directly is not equivalent: it leaves consumers blocked on closed
+/// channels and leaks owned handles.
+fn enforce_drain_timeout(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    count: usize,
+    tick: u32,
+) -> bool {
+    if sched.reconfigure_phase != ReconfigurePhase::Draining {
+        return false;
+    }
+    let start = sched.drain_started_tick;
+    if start == u32::MAX || tick.wrapping_sub(start) <= MAX_DRAIN_TICKS {
+        return false;
+    }
+    let surviving = (0..count).filter(|i| !sched.finished[*i]).count();
+    log::warn!(
+        "MON_DRAIN_FORCED ticks_elapsed={} ceiling={} — force-terminating \
+         {} still-running modules",
+        tick.wrapping_sub(start),
+        MAX_DRAIN_TICKS,
+        surviving,
+    );
+    // Indexed loop — body touches `sched.finished[i]`, `sched.fault_info[i]`,
+    // and `modules[i]` together; an iterator over one array can't reach
+    // the parallel state on the others.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..count {
+        if !sched.finished[i] {
+            sched.fault_info[i].state = FaultState::Terminated;
+            let name = modules[i].type_name();
+            finalize_module(i, Some(-110), name, " (drain timeout)");
+        }
+    }
+    sched.reconfigure_phase = ReconfigurePhase::Running;
+    sched.drain_started_tick = u32::MAX;
+    true
+}
+
+/// Cascade-origin lookup. Walk the faulted module's
+/// `upstream_mask` and find the most-recent upstream that itself
+/// faulted within `CASCADE_WINDOW_TICKS` of the current tick. Returns
+/// `0xFF` if no cascade detected — the fault was independent (or its
+/// upstream was healthy). A "cascade" is loosely defined: 4 ticks is
+/// tight enough to ignore unrelated faults, wide enough that an
+/// upstream→downstream pipeline (rarely more than 1-2 ticks apart)
+/// is captured.
+const CASCADE_WINDOW_TICKS: u32 = 4;
+
+fn detect_caused_by(sched: &SchedulerState, module_idx: usize, tick: u32) -> u8 {
+    let mask = sched.upstream_mask[module_idx];
+    if mask == 0 {
+        return 0xFF;
+    }
+    let mut best: u8 = 0xFF;
+    let mut best_elapsed: u32 = CASCADE_WINDOW_TICKS + 1;
+    for i in 0..MAX_MODULES.min(64) {
+        if (mask & (1u64 << i)) == 0 {
+            continue;
+        }
+        let fi = &sched.fault_info[i];
+        if fi.fault_count == 0 {
+            continue;
+        }
+        let elapsed = tick.wrapping_sub(fi.last_fault_tick);
+        if elapsed <= CASCADE_WINDOW_TICKS && elapsed < best_elapsed {
+            best = i as u8;
+            best_elapsed = elapsed;
+        }
+    }
+    best
+}
+
+/// content_type of the module's last consumed input. Currently
+/// returns `0` (unknown) for every module — implementation deferred
+/// pending a per-channel content_type cache (`channel_content_type:
+/// [u8; MAX_CHANNELS]`) populated at edge-wire time and read on each
+/// `channel::channel_read`.
+///
+/// The wire byte at `FaultRecord.byte 3` is reserved so the
+/// FaultRecord layout doesn't change when the cache lands. See the
+/// doc comment on `FaultRecord` for the consumer-side contract.
+fn last_input_content_type(_module_idx: usize) -> u8 {
+    // TODO: wire to `SCHED.last_input_ct[module_idx]` once the
+    // per-channel content_type cache is in place. The cache is
+    // populated during prepare_graph (after the destination port
+    // → content_type lookup is resolved from each module's
+    // manifest) and read by `channel::channel_read` to update
+    // `SCHED.last_input_ct[current_module] = channel_content_type[handle]`.
+    0
+}
+
+/// Check whether a freshly-faulted module declares a paired partner
+/// that ALSO faulted within `QUARANTINE_WINDOW_TICKS`. If so,
+/// terminate both — the pair is bound by a shared invariant (TLS
+/// handshake pair, codec pair-stream) that's broken once half goes
+/// down. Skip if either side has already been finalised; idempotent.
+///
+/// Called from each `handle_step_*` fault handler AFTER it has set
+/// the faulted-module's `state` and `last_fault_tick`. Pair-terminate
+/// transitions the partner to `Terminated` regardless of its own
+/// `FaultPolicy::Restart` — quarantine is a graph-level decision that
+/// outranks individual-module recovery.
+fn apply_quarantine(
+    sched: &mut SchedulerState,
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    module_idx: usize,
+    active_count: &mut usize,
+) {
+    let tick = unsafe { DBG_TICK };
+    // Collect every module to quarantine — both the freshly-faulted
+    // module's declared partner AND any already-faulted module that
+    // named THIS module as its partner. The reverse-scan catches
+    // unreciprocated declarations (A → B without B → A) when A
+    // faulted first and B faulted later.
+    let mut targets: [bool; MAX_MODULES] = [false; MAX_MODULES];
+
+    // Forward: this module's declared partner (if any, and that
+    // partner itself has a recent fault).
+    let forward = sched.fault_info[module_idx].quarantine_partner as usize;
+    if forward < MAX_MODULES
+        && forward != module_idx
+        && !sched.finished[forward]
+        && sched.fault_info[forward].fault_count > 0
+        && tick.wrapping_sub(sched.fault_info[forward].last_fault_tick)
+            <= QUARANTINE_WINDOW_TICKS
+    {
+        targets[forward] = true;
+    }
+
+    // Reverse: any module that declared THIS module as its
+    // partner AND has itself faulted within the window. Walks
+    // every fault_info slot once — MAX_MODULES is small (64), so
+    // the per-fault cost is bounded. Indexed loop because the body
+    // reads from `sched.finished` and `sched.fault_info` and writes
+    // to `targets` — three parallel arrays keyed by module index.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..MAX_MODULES {
+        if i == module_idx || sched.finished[i] {
+            continue;
+        }
+        if sched.fault_info[i].quarantine_partner as usize != module_idx {
+            continue;
+        }
+        if sched.fault_info[i].fault_count == 0 {
+            continue;
+        }
+        if tick.wrapping_sub(sched.fault_info[i].last_fault_tick)
+            <= QUARANTINE_WINDOW_TICKS
+        {
+            targets[i] = true;
+        }
+    }
+
+    // Nothing to quarantine? Exit silently. Quarantine fires only
+    // when at least one partnered module is co-faulted.
+    if !targets.iter().any(|t| *t) {
+        return;
+    }
+
+    // Always include the self module in the termination set so
+    // operators see the pair (or set) terminated together. If
+    // self is already finished (Skip already finalised it), the
+    // loop below silently skips.
+    // Count targets for the log line — no Vec to avoid pulling in
+    // `alloc` from kernel-side code (which is no_std).
+    let target_count = targets.iter().filter(|t| **t).count();
+    log::warn!(
+        "MON_QUARANTINE module={} partner_count={} tick={} window={}",
+        module_idx,
+        target_count,
+        tick,
+        QUARANTINE_WINDOW_TICKS,
+    );
+
+    // Terminate self first, then every named target. Use a tiny
+    // closure to avoid duplicating the body.
+    let mut term = |idx: usize| {
+        if idx < MAX_MODULES && !sched.finished[idx] {
+            sched.fault_info[idx].state = FaultState::Terminated;
+            finalize_module(
+                idx,
+                Some(-111),
+                modules[idx].type_name(),
+                " (quarantined)",
+            );
+            *active_count -= 1;
+        }
+    };
+    term(module_idx);
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..MAX_MODULES {
+        if targets[i] {
+            term(i);
+        }
     }
 }
 
@@ -3546,6 +3967,11 @@ fn handle_step_timeout(
     active_count: &mut usize,
 ) {
     let tick = unsafe { DBG_TICK };
+    // Capture cascade + last-input bytes BEFORE taking the mutable
+    // borrow on fault_info — both helpers read sched immutably and
+    // would conflict with the `&mut fi` borrow below.
+    let caused_by = detect_caused_by(sched, module_idx, tick);
+    let last_input_ct = last_input_content_type(module_idx);
     let fi = &mut sched.fault_info[module_idx];
     fi.record_fault(fault_type::TIMEOUT, tick);
     log::warn!(
@@ -3557,7 +3983,8 @@ fn handle_step_timeout(
     step_guard::push_fault(FaultRecord {
         module_idx: module_idx as u8,
         fault_kind: fault_type::TIMEOUT,
-        _reserved: 0,
+        caused_by,
+        last_input_ct,
         tick,
         fault_count: fi.fault_count,
         restart_count: fi.restart_count,
@@ -3565,7 +3992,7 @@ fn handle_step_timeout(
 
     if fi.can_restart() {
         fi.state = FaultState::Faulted;
-        fi.backoff_remaining = fi.restart_backoff_ms as u32;
+        fi.backoff_remaining = fi.effective_backoff_ticks();
     } else {
         fi.state = FaultState::Terminated;
         finalize_module(
@@ -3576,6 +4003,8 @@ fn handle_step_timeout(
         );
         *active_count -= 1;
     }
+    // Check quarantine pair-terminate.
+    apply_quarantine(sched, modules, module_idx, active_count);
 }
 
 /// Handle a step error: record fault, transition to Faulted or finalize.
@@ -3588,12 +4017,15 @@ fn handle_step_error(
     context: &str,
 ) {
     let tick = unsafe { DBG_TICK };
+    let caused_by = detect_caused_by(sched, module_idx, tick);
+    let last_input_ct = last_input_content_type(module_idx);
     let fi = &mut sched.fault_info[module_idx];
     fi.record_fault(fault_type::STEP_ERROR, tick);
     step_guard::push_fault(FaultRecord {
         module_idx: module_idx as u8,
         fault_kind: fault_type::STEP_ERROR,
-        _reserved: 0,
+        caused_by,
+        last_input_ct,
         tick,
         fault_count: fi.fault_count,
         restart_count: fi.restart_count,
@@ -3601,7 +4033,7 @@ fn handle_step_error(
 
     if fi.can_restart() {
         fi.state = FaultState::Faulted;
-        fi.backoff_remaining = fi.restart_backoff_ms as u32;
+        fi.backoff_remaining = fi.effective_backoff_ticks();
         log::warn!(
             "[guard] module {} ({}) error rc={} — will restart (fault #{})",
             module_idx,
@@ -3619,6 +4051,8 @@ fn handle_step_error(
         );
         *active_count -= 1;
     }
+    // Check quarantine pair-terminate.
+    apply_quarantine(sched, modules, module_idx, active_count);
 }
 
 /// Handle an MPU/MMU protection fault: record, emit event, transition state.
@@ -3629,6 +4063,8 @@ fn handle_mpu_fault(
     active_count: &mut usize,
 ) {
     let tick = unsafe { DBG_TICK };
+    let caused_by = detect_caused_by(sched, module_idx, tick);
+    let last_input_ct = last_input_content_type(module_idx);
     let fi = &mut sched.fault_info[module_idx];
     fi.record_fault(fault_type::MPU_FAULT, tick);
     log::warn!(
@@ -3640,7 +4076,8 @@ fn handle_mpu_fault(
     step_guard::push_fault(FaultRecord {
         module_idx: module_idx as u8,
         fault_kind: fault_type::MPU_FAULT,
-        _reserved: 0,
+        caused_by,
+        last_input_ct,
         tick,
         fault_count: fi.fault_count,
         restart_count: fi.restart_count,
@@ -3648,7 +4085,7 @@ fn handle_mpu_fault(
 
     if fi.can_restart() {
         fi.state = FaultState::Faulted;
-        fi.backoff_remaining = fi.restart_backoff_ms as u32;
+        fi.backoff_remaining = fi.effective_backoff_ticks();
     } else {
         fi.state = FaultState::Terminated;
         finalize_module(
@@ -3659,6 +4096,8 @@ fn handle_mpu_fault(
         );
         *active_count -= 1;
     }
+    // Check quarantine pair-terminate.
+    apply_quarantine(sched, modules, module_idx, active_count);
 }
 
 /// Attempt to restart a faulted module.
@@ -3747,6 +4186,11 @@ fn handle_module_restart(
         sched.ready[module_idx] = false;
     }
 
+    // Bump the slot generation — outstanding telemetry snapshots
+    // taken before the restart now refer to pre-restart state and
+    // must not be trusted by async consumers.
+    sched.slot_generation[module_idx] = sched.slot_generation[module_idx].wrapping_add(1);
+
     // Mark as running again
     sched.fault_info[module_idx].state = FaultState::Running;
     sched.finished[module_idx] = false;
@@ -3757,9 +4201,21 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         let p = &raw mut SCHED;
         &mut *p
     };
+    // Transaction marker: if `prepare_graph` is mid-build or bailed
+    // mid-build, the module slots may not be wired. Treat the graph
+    // as cleanly idle (Done) so callers neither dereference
+    // half-initialised state nor mistake it for runnable work.
+    if sched.prepare_in_progress {
+        return StepResult::Done;
+    }
     let tick = unsafe { DBG_TICK };
     unsafe {
         DBG_TICK += 1;
+    }
+
+    // Drain timeout ceiling: see `enforce_drain_timeout`.
+    if enforce_drain_timeout(sched, modules, count, tick) {
+        return StepResult::Done;
     }
 
     // Crash-info one-shot: at first opportunity after boot, check the
@@ -3813,28 +4269,47 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     }
 
     // Reset the per-pass budget accumulator for **every** domain
-    // before this pass starts. The flat path used to reset only
-    // `domain_budget_us_consumed[0]` and check only domain 0
-    // after each module — but `step_one_module` charges elapsed
-    // time to the module's *actual* `domain_id`, so modules
-    // assigned to non-default domains (multi-domain configs on a
-    // flat target — currently rare but architecturally legal)
-    // had their step-time accumulating into a bucket nobody
-    // checked. Resetting every domain + checking the stepped
-    // module's own domain closes the gap.
+    // before this pass starts. `step_one_module` charges elapsed
+    // time to the module's *actual* `domain_id`, so multi-domain
+    // configs on a flat target (rare but architecturally legal)
+    // need every bucket cleared — resetting only domain 0 would
+    // leak time into the wrong accumulator when a non-default-domain
+    // module is stepped.
     for d in 0..MAX_DOMAINS {
         sched.domain_budget_us_consumed[d] = 0;
     }
 
-    // Step modules in topological order so producers run before consumers.
-    // The per-module step body is in `step_one_module` so the upcoming
-    // domain-scoped `step_domain_modules` reuses the exact
-    // same semantics — see `.context/scheduler_domain_api.md`.
+    // Step modules in topological order so producers run before
+    // consumers. The per-module step body is in `step_one_module`
+    // so the domain-scoped `step_domain_modules` can reuse the same
+    // semantics — see `.context/scheduler_domain_api.md`.
+    //
+    // When a previous pass tripped a budget overrun, the start of
+    // `exec_order` is rotated by `exec_order_offset`. Without the
+    // rotation, modules after the overrunning module in topological
+    // order never get their tick — the burster monopolises until
+    // its own domain budget is exhausted, then the pass breaks.
+    // Rotating the start point gives every position equal exposure
+    // across many passes (deterministic cycle, no random).
+    // Topological correctness is preserved because channel rings
+    // already buffer one tick of upstream output — a consumer that
+    // runs before its producer on tick T reads tick T-1's buffered
+    // bytes.
     let exec_count = sched.exec_order_count;
     let n = if exec_count > 0 { exec_count } else { count };
+    let offset = if exec_count > 0 {
+        (sched.exec_order_offset as usize) % exec_count
+    } else {
+        0
+    };
     for order_pos in 0..n {
+        let rotated_pos = if exec_count > 0 {
+            (order_pos + offset) % exec_count
+        } else {
+            order_pos
+        };
         let module_idx = if exec_count > 0 {
-            sched.exec_order[order_pos] as usize
+            sched.exec_order[rotated_pos] as usize
         } else {
             order_pos
         };
@@ -3854,6 +4329,11 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         let stepped_domain = sched.domain_id[module_idx] as usize;
         if stepped_domain < MAX_DOMAINS && domain_budget_exhausted(sched, stepped_domain) {
             record_domain_budget_overrun(sched, stepped_domain, module_idx);
+            // Advance the start offset so the next pass observes a
+            // different cyclic shift. The offset wraps naturally at
+            // u8::MAX; the `% exec_count` applied at the top of each
+            // pass keeps it in range regardless.
+            sched.exec_order_offset = sched.exec_order_offset.wrapping_add(1);
             break;
         }
     }
@@ -3874,7 +4354,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 ///
 /// Returns `StepResult::Done` when every active module across the
 /// whole graph is finalised (the active_count is global to v1; see
-/// `.context/scheduler_domain_api.md` §4). Sibling domains can keep
+/// `.context/scheduler_domain_api.md`). Sibling domains can keep
 /// stepping independently; callers should decide global shutdown
 /// based on every domain returning `Done`.
 ///
@@ -3996,11 +4476,38 @@ pub fn step_domain_modules(
         let p = &raw mut SCHED;
         &mut *p
     };
+    // Transaction marker — see `step_modules`.
+    if sched.prepare_in_progress {
+        return StepResult::Done;
+    }
+
+    // Advance the canonical tick. Multi-domain platforms (BCM2712)
+    // never call `step_modules`, so the tick advance has to happen
+    // here too — otherwise `DBG_TICK` stays at zero forever and the
+    // drain timeout (and every other tick-relative check) never
+    // fires. Only domain 0 increments to keep one canonical advance
+    // per platform-tick under the BCM convention of "one
+    // `step_domain_modules` call per core per platform-tick";
+    // sibling-domain cores observe the same `DBG_TICK` value within
+    // a platform tick. Multi-core races on `DBG_TICK++` already exist
+    // on event-wake paths; this doesn't make them worse.
+    if domain_id == 0 {
+        unsafe {
+            DBG_TICK = DBG_TICK.wrapping_add(1);
+        }
+    }
+
+    // Drain timeout ceiling — same check as `step_modules`. Tick is
+    // read off `DBG_TICK` here just as the flat path does.
+    let count = sched.active_module_count;
+    let tick = unsafe { DBG_TICK };
+    if enforce_drain_timeout(sched, modules, count, tick) {
+        return StepResult::Done;
+    }
 
     // Recompute active_count and not_ready once per tick (cheap; same
     // as `step_modules`). active_count is global; a domain-only count
     // would need per-domain `finished[]` tracking// per the design memo.
-    let count = sched.active_module_count;
     let mut active_count: usize = 0;
     for i in 0..count {
         if !sched.finished[i] {
@@ -4020,8 +4527,19 @@ pub fn step_domain_modules(
     sched.domain_budget_us_consumed[domain_id] = 0;
 
     let n = sched.domain_module_count[domain_id] as usize;
+    // Rotate the per-domain exec_order start by
+    // `domain_exec_order_offset[domain_id]`. Each domain's offset
+    // advances independently on its own budget overrun so a burster
+    // in one domain doesn't permanently starve later positions in
+    // that same domain's exec_order.
+    let dom_offset = if n > 0 {
+        (sched.domain_exec_order_offset[domain_id] as usize) % n
+    } else {
+        0
+    };
     for pos in 0..n {
-        let module_idx = sched.domain_exec_order[domain_id][pos] as usize;
+        let rotated = if n > 0 { (pos + dom_offset) % n } else { pos };
+        let module_idx = sched.domain_exec_order[domain_id][rotated] as usize;
         if module_idx >= count {
             continue;
         }
@@ -4036,6 +4554,10 @@ pub fn step_domain_modules(
         // where the step guard is advisory.
         if domain_budget_exhausted(sched, domain_id) {
             record_domain_budget_overrun(sched, domain_id, module_idx);
+            // Advance this domain's offset so the next pass observes
+            // a different cyclic shift.
+            sched.domain_exec_order_offset[domain_id] =
+                sched.domain_exec_order_offset[domain_id].wrapping_add(1);
             break;
         }
     }
@@ -4092,18 +4614,93 @@ fn step_one_module(
         return;
     }
 
+    // Handle the fault-state machine BEFORE the period/readiness
+    // gates. A module raised into `Faulted` by an out-of-step caller
+    // (notably `heap_alloc` with `alloc_failure_policy = "fault"`)
+    // must run its policy on the next tick regardless of declared
+    // period or upstream-readiness gates — those gates govern
+    // *normal* step scheduling, not recovery. A module with
+    // `step_period = 16` and a hung upstream would otherwise sit
+    // Faulted for tens or hundreds of ticks holding handles and
+    // channels.
+    //
+    // The Faulted branch routes through restart-or-finalize via
+    // the existing helpers; the Terminated/Recovering branches
+    // early-return so the period gate's counter advancement doesn't
+    // fire against a dead module.
+    let fault_state_early = sched.fault_info[module_idx].state;
+    if fault_state_early == FaultState::Faulted {
+        // Quarantine must be checked BEFORE draining the restart
+        // backoff. `raise_module_fault` arms `restart_backoff_ms`
+        // (default 100 ticks) for Restart-policy modules, and
+        // `QUARANTINE_WINDOW_TICKS` is also 100. Draining backoff
+        // first would let a Restart-policy module spend the full
+        // window decrementing while its partner's `last_fault_tick`
+        // ages past the edge of the window, and quarantine would
+        // silently miss the co-fault.
+        //
+        // The check is cheap (`apply_quarantine` returns immediately
+        // when no partner has faulted within the window) and
+        // idempotent (re-checking after both modules are finished
+        // is a no-op via the `finished[partner]` guard). Quarantine
+        // also outranks `FaultPolicy::Restart` per the documented
+        // contract.
+        let pre_finished = sched.finished[module_idx];
+        apply_quarantine(sched, modules, module_idx, active_count);
+        if sched.finished[module_idx] && !pre_finished {
+            return;
+        }
+        // Backoff drain happens AFTER quarantine. Restart modules
+        // wait for backoff; Skip modules (backoff=0) fall through
+        // to the can_restart check immediately.
+        if sched.fault_info[module_idx].backoff_remaining > 0 {
+            sched.fault_info[module_idx].backoff_remaining -= 1;
+            return;
+        }
+        if sched.fault_info[module_idx].can_restart() {
+            handle_module_restart(sched, modules, module_idx);
+            return;
+        } else {
+            sched.fault_info[module_idx].state = FaultState::Terminated;
+            finalize_module(
+                module_idx,
+                Some(-110),
+                modules[module_idx].type_name(),
+                " (terminated)",
+            );
+            *active_count -= 1;
+            return;
+        }
+    } else if fault_state_early == FaultState::Terminated
+        || fault_state_early == FaultState::Recovering
+    {
+        return;
+    }
+
     // Step frequency gating: skip if counter hasn't reached period.
     // `step_period` is measured in scheduler ticks (NOT milliseconds);
     // wall-clock cadence is `step_period * domain_tick_us`.
     // Event-wake bypasses the period — the event is the trigger.
+    //
+    // The counter is advanced here but **not** reset until the module
+    // actually executes (just before `m.step()` below). Resetting on
+    // the period boundary regardless of whether the step fires would
+    // lose the slot when the readiness or fault gate vetoes: the
+    // module would have to wait another full `period` ticks before
+    // becoming eligible again, even though it was *ready to run* on
+    // this tick. Keeping the counter saturated at `period` until the
+    // step lands preserves the slot across veto, matching the
+    // declared cadence under bursty upstream readiness.
     if !event_wake {
         let period = sched.step_period[module_idx];
         if period > 0 {
-            sched.step_counter[module_idx] = sched.step_counter[module_idx].wrapping_add(1);
+            let next = sched.step_counter[module_idx].saturating_add(1);
+            sched.step_counter[module_idx] = if next >= period { period } else { next };
             if sched.step_counter[module_idx] < period {
                 return;
             }
-            sched.step_counter[module_idx] = 0;
+            // counter stays at `period` until the step fires; reset is
+            // performed at the call site below.
         }
     }
 
@@ -4120,23 +4717,32 @@ fn step_one_module(
         && !sched.deferred_ready[module_idx]
         && (sched.upstream_mask[module_idx] & not_ready) != 0
     {
+        // Count consecutive ticks the readiness gate veto'd this
+        // module. Cleared once the module actually steps below. A
+        // non-zero value on a steady-state module indicates a dead
+        // upstream edge — the diagnostic surfaces via
+        // `ModuleStateSnapshot::inactive_for_ticks`.
+        sched.inactive_for_ticks[module_idx] =
+            sched.inactive_for_ticks[module_idx].saturating_add(1);
         return;
     }
 
-    // Skip faulted/terminated modules
+    // Defensive duplicate fault-state check. The early up-front
+    // check handles every transition; only modules in `Running`
+    // (or a recovering state that just woke) reach this point. This
+    // arm fires only if `state` flipped between the early check and
+    // here — currently impossible in single-domain single-thread,
+    // but cheap to keep for forward-compat with cross-core setters.
     let fault_state = sched.fault_info[module_idx].state;
     if fault_state == FaultState::Faulted {
-        // Check if backoff has elapsed → attempt restart
         if sched.fault_info[module_idx].backoff_remaining > 0 {
             sched.fault_info[module_idx].backoff_remaining -= 1;
             return;
         }
         if sched.fault_info[module_idx].can_restart() {
             handle_module_restart(sched, modules, module_idx);
-            // After restart attempt, skip this tick (module will run next tick)
             return;
         } else {
-            // Cannot restart — terminate
             sched.fault_info[module_idx].state = FaultState::Terminated;
             finalize_module(
                 module_idx,
@@ -4152,6 +4758,18 @@ fn step_one_module(
     }
 
     if let Some(m) = modules[module_idx].as_module_mut() {
+        // Step is committed for this tick — reset the period counter
+        // (it was held at `period` across veto cycles; clearing here
+        // restarts the period count for the next cadence boundary).
+        // Event-wake bypasses the period gate entirely and leaves the
+        // counter alone so the natural cadence resumes once events stop.
+        if !event_wake && sched.step_period[module_idx] > 0 {
+            sched.step_counter[module_idx] = 0;
+        }
+        // An actual step is about to fire — reset the readiness-veto
+        // counter. A non-zero value never persists past a successful
+        // step; it only accumulates while the gate keeps rejecting.
+        sched.inactive_for_ticks[module_idx] = 0;
         // Set current_module so channel_port works during module_step
         set_current_module(module_idx);
         // Track for HardFault diagnosis
@@ -4211,7 +4829,13 @@ fn step_one_module(
                 BURST_SEEN_THIS_PASS.store(true, Ordering::Relaxed);
                 // Keep timer armed for entire burst with extended deadline
                 step_guard::disarm();
-                let burst_deadline = deadline.saturating_mul(step_guard::BURST_MULTIPLIER);
+                // If the manifest declared an explicit burst deadline,
+                // use it as-is. Otherwise fall back to the implicit
+                // `deadline * BURST_MULTIPLIER` ceiling so modules
+                // without a declared burst window still get one.
+                let burst_deadline = sched.fault_info[module_idx]
+                    .explicit_burst_deadline_us()
+                    .unwrap_or_else(|| deadline.saturating_mul(step_guard::BURST_MULTIPLIER));
                 step_guard::arm(burst_deadline);
 
                 for _ in 0..MAX_BURST_STEPS {
@@ -4221,6 +4845,43 @@ fn step_one_module(
                         step_guard::check_and_clear_timeout();
                         handle_step_timeout(sched, modules, module_idx, active_count);
                         break;
+                    }
+                    // Per-iteration domain-budget check: a single
+                    // bursting module must not eat the entire tick's
+                    // budget for siblings. The accumulator at this
+                    // point reflects every module *before* this one in
+                    // the pass; adding the elapsed-so-far for this
+                    // step is the closest projection we have without
+                    // committing the time twice. When the projection
+                    // crosses the limit, abort the burst cleanly:
+                    // disarm the guard and break — the module is left
+                    // in its current state (no fault, no `Ready` flip)
+                    // so the next pass picks up where it left off.
+                    {
+                        let d = sched.domain_id[module_idx] as usize;
+                        if d < MAX_DOMAINS {
+                            let limit = sched.domain_budget_us_limit[d] as u64;
+                            if limit > 0 {
+                                let elapsed_now =
+                                    crate::kernel::hal::now_micros().wrapping_sub(module_t0);
+                                let projected = sched
+                                    .domain_budget_us_consumed[d]
+                                    .saturating_add(elapsed_now);
+                                if projected > limit {
+                                    log::warn!(
+                                        "MON_BURST_BUDGET_ABORT module={} domain={} \
+                                         elapsed_us={} consumed_us={} limit_us={}",
+                                        module_idx,
+                                        d,
+                                        elapsed_now,
+                                        sched.domain_budget_us_consumed[d],
+                                        limit,
+                                    );
+                                    step_guard::disarm();
+                                    break;
+                                }
+                            }
+                        }
                     }
                     if let Some(m) = modules[module_idx].as_module_mut() {
                         match m.step() {
@@ -4307,6 +4968,11 @@ pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize,
         let p = &raw mut SCHED;
         &mut *p
     };
+    // Transaction marker — drop event wakes targeting a graph
+    // mid-build. The event reappears once the consumer remounts.
+    if sched.prepare_in_progress {
+        return;
+    }
 
     // Compute current readiness mask once per wake pass, matching the
     // flat/domain stepping paths.
@@ -4353,10 +5019,35 @@ pub fn reconfigure_phase() -> ReconfigurePhase {
     unsafe { SCHED.reconfigure_phase }
 }
 
+/// Diagnostic accessor: `true` while `prepare_graph` is mid-build or
+/// has bailed mid-build. Exposed so tests and platform diagnostics can
+/// confirm the transaction-marker contract. When `true`, the
+/// scheduler step paths short-circuit to `StepResult::Done` (or no-op
+/// for event wakes) — the graph is not safe to step.
+pub fn prepare_in_progress() -> bool {
+    unsafe { SCHED.prepare_in_progress }
+}
+
 /// Set the current reconfigure phase.
+///
+/// Capturing the entry tick for `Draining` arms the kernel-side
+/// drain-timeout ceiling. Transitioning *out* of `Draining` clears
+/// the marker so a subsequent `Running → Migrating` transition (the
+/// normal happy path) doesn't false-trip the timeout.
 pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
     unsafe {
+        let was_draining = SCHED.reconfigure_phase == ReconfigurePhase::Draining;
         SCHED.reconfigure_phase = phase;
+        match phase {
+            ReconfigurePhase::Draining => {
+                if !was_draining {
+                    SCHED.drain_started_tick = DBG_TICK;
+                }
+            }
+            _ => {
+                SCHED.drain_started_tick = u32::MAX;
+            }
+        }
     }
 }
 
@@ -4413,9 +5104,29 @@ pub fn mark_module_finished(module_idx: usize) {
 }
 
 /// Raise a fault against module `idx` with the given `fault_kind`
-/// (see `step_guard::fault_type`). Updates the module's fault bookkeeping
-/// and pushes a record to the global fault ring so subscribers (monitor
-/// CLI, metrics sinks) observe it uniformly with step-guard / MPU faults.
+/// (see `step_guard::fault_type`). Updates the module's fault
+/// bookkeeping, **marks the module Faulted (or leaves it alone if
+/// already Faulted/Terminated)**, and pushes a record to the global
+/// fault ring so subscribers (monitor CLI, metrics sinks) observe it
+/// uniformly with step-guard / MPU faults.
+///
+/// Used by non-step-context faulting paths — currently `heap_alloc`
+/// when the module's `fault_on_alloc_failure` flag is set. The
+/// caller's `m.step()` frame is typically still on the stack at
+/// invocation, which means we **must not** finalize / release
+/// handles inline (that would tear down the module while its step
+/// body is still mid-execution). Instead, we just flip the
+/// fault-state machine and let the *next* `step_one_module` tick run
+/// the declared `FaultPolicy` through its normal recovery path:
+///
+///   * `FaultPolicy::Restart` + `can_restart()` → backoff arms, restart
+///     fires at the next eligible tick.
+///   * Otherwise → next `step_one_module` observes `Faulted` +
+///     `!can_restart()` and routes through the `Terminated` branch,
+///     which calls `finalize_module` from a safe context.
+///
+/// This matches the contract documented at the heap-side caller
+/// (`heap.alloc_failure_policy = "fault"` → "policy runs next tick").
 pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
     if module_idx >= MAX_MODULES {
         return;
@@ -4425,16 +5136,39 @@ pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
         &mut *p
     };
     let tick = unsafe { DBG_TICK };
+    let caused_by = detect_caused_by(sched, module_idx, tick);
+    let last_input_ct = last_input_content_type(module_idx);
     sched.fault_info[module_idx].record_fault(fault_kind, tick);
-    let fi = &sched.fault_info[module_idx];
+    let fi = &mut sched.fault_info[module_idx];
     step_guard::push_fault(FaultRecord {
         module_idx: module_idx as u8,
         fault_kind,
-        _reserved: 0,
+        caused_by,
+        last_input_ct,
         tick,
         fault_count: fi.fault_count,
         restart_count: fi.restart_count,
     });
+    // Mark Faulted only if not already in a terminal / recovering
+    // state. Critically, do NOT call `finalize_module` here — that
+    // releases handles while the caller's `m.step()` frame may
+    // still be on the stack.
+    //
+    // Backoff is only armed for `FaultPolicy::Restart` (and only
+    // when the module is actually restartable). Skip / RestartGraph
+    // / exhausted-restart modules don't restart — leaving
+    // `backoff_remaining` at zero means the next `step_one_module`
+    // observes `Faulted + !can_restart()` and finalises immediately,
+    // instead of waiting through `restart_backoff_ms` ticks while
+    // channels and handles stay live.
+    if fi.state == FaultState::Running {
+        fi.state = FaultState::Faulted;
+        if fi.can_restart() {
+            fi.backoff_remaining = fi.effective_backoff_ticks();
+        } else {
+            fi.backoff_remaining = 0;
+        }
+    }
 }
 
 /// Module capability flag bitmask:

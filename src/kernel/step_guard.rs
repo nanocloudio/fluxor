@@ -118,6 +118,21 @@ pub struct ModuleFaultInfo {
     pub backoff_remaining: u32,
     /// Step deadline in microseconds (0 = use default).
     pub step_deadline_us: u32,
+    /// Optional override for the deadline applied during a `Burst`
+    /// re-step loop. When set (`> 0`), the burst path uses this value
+    /// directly instead of the multiplier-derived `step_deadline_us *
+    /// BURST_MULTIPLIER`, so modules with asymmetric typical-vs-burst
+    /// step times (TCP retransmit path, codec keyframe decode) can
+    /// declare both numbers explicitly rather than sizing the typical
+    /// deadline for the worst case. `0` selects the multiplier path.
+    pub step_deadline_burst_us: u32,
+    /// Index of a paired module. When this module faults and the
+    /// partner has also faulted within `QUARANTINE_WINDOW_TICKS`,
+    /// both are terminated regardless of individual `FaultPolicy`.
+    /// `0xFF` means no partner declared. Used by tightly-coupled
+    /// pairs (TLS handshake + transport, codec pair-stream) where
+    /// one half's failure invalidates the other.
+    pub quarantine_partner: u8,
 }
 
 impl Default for ModuleFaultInfo {
@@ -139,6 +154,8 @@ impl ModuleFaultInfo {
             last_fault_tick: 0,
             backoff_remaining: 0,
             step_deadline_us: 0,
+            step_deadline_burst_us: 0,
+            quarantine_partner: 0xFF,
         }
     }
 
@@ -148,6 +165,16 @@ impl ModuleFaultInfo {
             self.step_deadline_us
         } else {
             DEFAULT_STEP_DEADLINE_US
+        }
+    }
+
+    /// Effective burst deadline override in microseconds, or `None`
+    /// to use the `step_deadline_us * BURST_MULTIPLIER` fallback.
+    pub fn explicit_burst_deadline_us(&self) -> Option<u32> {
+        if self.step_deadline_burst_us > 0 {
+            Some(self.step_deadline_burst_us)
+        } else {
+            None
         }
     }
 
@@ -167,6 +194,22 @@ impl ModuleFaultInfo {
             return false;
         }
         self.restart_count < self.max_restarts
+    }
+
+    /// Geometric backoff before the next restart attempt, in scheduler
+    /// ticks. Scales the configured base by `2^restart_count` so a
+    /// module faulting on every restart attempt doesn't monopolise the
+    /// scheduler with a tight retry loop — successive failures pay
+    /// exponentially longer waits, paired with the `max_restarts` cap.
+    ///
+    /// The configured base (`restart_backoff_ms`) is treated as
+    /// **ticks** here, matching the kernel's per-tick decrement of
+    /// `backoff_remaining`. The field name is a legacy misnomer kept
+    /// for ABI stability.
+    pub fn effective_backoff_ticks(&self) -> u32 {
+        let base = self.restart_backoff_ms as u32;
+        let shift = (self.restart_count as u32).min(8);
+        base.saturating_mul(1u32 << shift)
     }
 
     /// Build a FaultStats snapshot for `provider_query`.
@@ -343,6 +386,17 @@ pub fn post_step_check() {
 // ============================================================================
 
 /// Externally-visible fault record. Kept compact; serialised LE for monitors.
+///
+/// Wire layout (12 bytes):
+///   byte 0:    module_idx
+///   byte 1:    fault_kind
+///   byte 2:    caused_by — module index of the upstream that faulted
+///              within the cascade window, or `0xFF` if independent.
+///   byte 3:    last_input_ct — content_type of the module's most
+///              recent consumed input, or `0` for unknown.
+///   bytes 4-7: tick (u32 LE)
+///   bytes 8-9: fault_count (u16 LE)
+///   bytes 10-11: restart_count (u16 LE)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FaultRecord {
@@ -350,8 +404,11 @@ pub struct FaultRecord {
     pub module_idx: u8,
     /// Fault type (fault_type::*).
     pub fault_kind: u8,
-    /// Reserved for alignment.
-    pub _reserved: u16,
+    /// Cascade origin — upstream module index that faulted within
+    /// `CASCADE_WINDOW_TICKS` of this fault, or `0xFF` for independent.
+    pub caused_by: u8,
+    /// Content_type of the last consumed input, or `0` if unknown.
+    pub last_input_ct: u8,
     /// Tick at which the fault was observed.
     pub tick: u32,
     /// Cumulative fault count for this module after this event.
@@ -367,6 +424,8 @@ impl FaultRecord {
         let mut b = [0u8; Self::SIZE];
         b[0] = self.module_idx;
         b[1] = self.fault_kind;
+        b[2] = self.caused_by;
+        b[3] = self.last_input_ct;
         b[4..8].copy_from_slice(&self.tick.to_le_bytes());
         b[8..10].copy_from_slice(&self.fault_count.to_le_bytes());
         b[10..12].copy_from_slice(&self.restart_count.to_le_bytes());
@@ -396,7 +455,8 @@ static FAULT_RING: FaultRing = FaultRing {
         [FaultRecord {
             module_idx: 0,
             fault_kind: 0,
-            _reserved: 0,
+            caused_by: 0xFF,
+            last_input_ct: 0,
             tick: 0,
             fault_count: 0,
             restart_count: 0,
@@ -421,14 +481,19 @@ pub fn subscribe(event_handle: i32) -> i32 {
 /// Push a fault record into the ring and signal the subscribed event.
 /// Safe to call from scheduler thread context. Drops oldest if full.
 pub fn push_fault(rec: FaultRecord) {
-    // Emit on the host-facing log transport so `fluxor monitor` can parse
-    // faults without a second channel.
+    // Emit on the host-facing log transport so `fluxor monitor` can
+    // parse faults without a second channel — operators see cascade
+    // origin and consumed content_type alongside the regular counters
+    // without decoding the binary FaultRecord stream separately.
     log::info!(
-        "MON_FAULT mod={} kind={} fault_count={} restart_count={} tick={}",
+        "MON_FAULT mod={} kind={} fault_count={} restart_count={} \
+         caused_by={} last_input_ct={} tick={}",
         rec.module_idx,
         rec.fault_kind,
         rec.fault_count,
         rec.restart_count,
+        rec.caused_by,
+        rec.last_input_ct,
         rec.tick,
     );
     let head = FAULT_RING.head.load(Ordering::Relaxed);

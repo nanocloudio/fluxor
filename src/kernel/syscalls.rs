@@ -1618,15 +1618,26 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
             }
             dev_query_key::STATE => E_NOSYS,
             dev_query_key::HEAP_STATS => {
-                // Return heap stats for the calling module
+                // Accept any `out_len >= HEAP_STATS_MIN` and copy up
+                // to `out_len` bytes from the struct, returning the
+                // actual bytes written. This lets the SDK grow the
+                // `HeapStats` struct forward without breaking
+                // pre-existing PIC modules whose SDK helper passes
+                // only a 16-byte prefix buffer.
+                const HEAP_STATS_MIN: usize = 16;
                 let stats_size = core::mem::size_of::<crate::kernel::heap::HeapStats>();
-                if out.is_null() || out_len < stats_size {
+                if out.is_null() || out_len < HEAP_STATS_MIN {
                     return E_INVAL;
                 }
                 let idx = crate::kernel::scheduler::current_module_index();
                 let stats = crate::kernel::heap::heap_stats(idx);
-                *(out as *mut crate::kernel::heap::HeapStats) = stats;
-                stats_size as i32
+                let copy_len = stats_size.min(out_len);
+                core::ptr::copy_nonoverlapping(
+                    &stats as *const crate::kernel::heap::HeapStats as *const u8,
+                    out,
+                    copy_len,
+                );
+                copy_len as i32
             }
             dev_query_key::FAULT_STATS => {
                 use crate::kernel::step_guard::FaultStats;

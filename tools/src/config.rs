@@ -1202,11 +1202,8 @@ const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 /// wasm-scenario synth host's http module, which inlines the
 /// canonical browser shell (runtime.html + host_shims.js, ~60 KiB
 /// combined) as `body:` routes per the shared-infra-in-orchestrator
-/// partition principle. Previously 32 KiB, which silently
-/// truncated the second body — surfaced as host_shims.js arriving
-/// at 1.2 KiB in the browser and the wasm bundle failing to
-/// instantiate. Wavetables / large sequences (the prior consumers
-/// of the cap) easily fit within the new bound.
+/// partition principle. Wavetables and large sequences fit
+/// comfortably within the same bound.
 const MAX_MODULE_PARAMS_SIZE: usize = 128 * 1024;
 
 /// Param base offset within a module entry (= header size = 8)
@@ -1358,20 +1355,74 @@ fn validate_scheduler_budgets(
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
+        // An explicit `step_deadline_burst_us` overrides the implicit
+        // `step_deadline_us * BURST_MULTIPLIER` ceiling at runtime.
+        // The validator must check the EFFECTIVE burst deadline —
+        // otherwise a config with
+        // `step_deadline_us: 1000, step_deadline_burst_us: 1_000_000`
+        // would pass (because 1000 × 16 = 16ms is under the 100ms
+        // cap) while authorising a 1-second runtime burst. Read the
+        // override here and prefer it; fall back to the multiplier
+        // math when no override is declared.
+        //
+        // The raw YAML value is type- and range-checked explicitly.
+        // A u64 silently cast to u32 would wrap at 0x_0000_0001_0000_0000
+        // → 0; non-numeric values (e.g. a typo like
+        // `step_deadline_burst_us: "very_long"`) would otherwise become
+        // `None` via `as_u64` and silently disable the override.
+        let declared_burst_raw = module.get("step_deadline_burst_us");
+        let declared_burst: Option<u32> = match declared_burst_raw {
+            None => None,
+            Some(v) if v.is_null() => None,
+            Some(v) => match v.as_u64() {
+                Some(n) if n <= u32::MAX as u64 => Some(n as u32),
+                Some(n) => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': step_deadline_burst_us = {n} exceeds u32::MAX \
+                         ({})",
+                        u32::MAX
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': step_deadline_burst_us must be a non-negative \
+                         integer (got {v})"
+                    )));
+                }
+            },
+        };
+
         // Suppress the unused-binding lint on the kernel default —
         // surfacing it keeps the const linked to its kernel mirror;
         // future readers will see they need to update both sides if
         // it changes.
         let _ = DEFAULT_STEP_DEADLINE_US;
 
-        // Skip modules that don't opt into a deadline; they ride the
-        // kernel default which is a fault threshold, not a budget.
+        // A module with no declared `step_deadline_us` but an
+        // explicit `step_deadline_burst_us` still has to honour the
+        // per-domain burst ceiling — the burst budget must fit even
+        // when the typical deadline isn't declared.
         let deadline = match declared_deadline {
-            Some(0) | None => continue,
+            Some(0) | None => {
+                if declared_burst.is_some() {
+                    // Use the kernel's default step deadline for the
+                    // "typical" budget when validating burst alone;
+                    // the runtime treats `step_deadline_us == 0` as
+                    // "use default", so this matches behaviour.
+                    DEFAULT_STEP_DEADLINE_US
+                } else {
+                    continue;
+                }
+            }
             Some(d) => d,
         };
 
-        let burst = deadline.saturating_mul(BURST_DEADLINE_MULTIPLIER);
+        // Effective runtime burst = explicit override if set, else
+        // the multiplier math. The same per-module / per-domain caps
+        // apply to either path.
+        let burst = declared_burst
+            .filter(|b| *b > 0)
+            .unwrap_or_else(|| deadline.saturating_mul(BURST_DEADLINE_MULTIPLIER));
 
         // Rule 1 — absolute burst cap.
         if burst > HARD_BURST_CAP_US {
@@ -1598,6 +1649,34 @@ fn validate_isr_tier_admission(
                  to a cooperative domain. See .context/rfc_isr_tier_surface.md §D7.",
                 tier = tier_label(exec_mode)
             )));
+        }
+        // ISR-tier modules are scalar-only by contract.
+        // NEON registers are not preserved across a Tier 1b/Tier 2
+        // ISR — a module that pulls in `core::arch::aarch64` SIMD
+        // intrinsics from inside its ISR entry would corrupt the
+        // preempted cooperative thread's NEON file. Run the
+        // source-static lint on the module's `src/` tree; if it
+        // finds NEON markers, reject the placement.
+        let module_type = module
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or(name);
+        let mut src_root: Option<std::path::PathBuf> = None;
+        for dir in std::iter::once(modules_dir).chain(extra_module_dirs.iter().copied()) {
+            let candidate = dir.join(module_type);
+            if candidate.exists() {
+                src_root = Some(candidate);
+                break;
+            }
+        }
+        if let Some(root) = src_root {
+            if let Err(e) = crate::manifest::check_isr_safe_no_neon(&root) {
+                return Err(Error::Config(format!(
+                    "module '{name}' (type '{module_type}') admitted to domain \
+                     '{domain_label}' (tier {tier}) but its source declares NEON: {e}",
+                    tier = tier_label(exec_mode)
+                )));
+            }
         }
     }
 
@@ -1868,6 +1947,15 @@ const NON_PARAM_KEYS: &[&str] = &[
     "verify_hostname",
     "domain",
     "sample_rate", // injected by graph_sample_rate
+    // Protection-control keys emitted as TLV tags by
+    // `build_module_entry`. These are top-level module entries, not
+    // schema params, so the allow-list lets `validate_yaml_params`
+    // pass them through to the dedicated emitter.
+    "step_deadline_burst_us",
+    "quarantine_partner",     // name form, resolved at wiring pass
+    "quarantine_partner_idx", // numeric form passed straight through
+    "heap",                   // nested object: { zero_on_free,
+                              //   alloc_failure_policy, canary_enabled }
 ];
 
 /// Reject any YAML key on a module entry that the schema doesn't know
@@ -1879,6 +1967,63 @@ const NON_PARAM_KEYS: &[&str] = &[
 /// and outer keys ending in a `GROUPING_SUFFIXES` entry can also resolve
 /// to suffix-stripped names. Anything the packer would actually consume
 /// passes; only keys that have no path to any schema param fail here.
+/// Structural validator for the optional `heap:` subtree. Runs on every
+/// module entry regardless of whether the module has a schema source —
+/// schema-gated validation would otherwise let a `heap.alloc_failure_policy:
+/// "fualt"` typo on a no-schema driver pass silently and disable fault
+/// recovery without diagnostic. The emitter at `build_module_entry`
+/// reads each subkey through `.as_bool()` / `.as_str()` and drops
+/// unrecognised entries with no error; this validator catches the typo
+/// at the YAML boundary instead.
+fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
+    let Some(value) = module.get("heap") else {
+        return Ok(());
+    };
+    let heap_obj = value.as_object().ok_or_else(|| {
+        Error::Config(format!(
+            "module '{module_name}': `heap` must be an object \
+             (with `zero_on_free` / `alloc_failure_policy` / `canary_enabled`)"
+        ))
+    })?;
+    const HEAP_KEYS: &[&str] = &["zero_on_free", "alloc_failure_policy", "canary_enabled"];
+    for (subkey, subval) in heap_obj {
+        if !HEAP_KEYS.contains(&subkey.as_str()) {
+            return Err(Error::Config(format!(
+                "module '{module_name}': unknown heap key 'heap.{subkey}' (valid: {})",
+                HEAP_KEYS.join(", "),
+            )));
+        }
+        // `alloc_failure_policy` is the only string-valued key; the
+        // others are bool. A type mismatch on either would otherwise
+        // leave the tag at its default — the canonical typo case is
+        // `true`/`false` misspelled as `"yes"`/`"flase"`.
+        match subkey.as_str() {
+            "alloc_failure_policy" => {
+                let s = subval.as_str().ok_or_else(|| {
+                    Error::Config(format!(
+                        "module '{module_name}': heap.alloc_failure_policy must be a \
+                         string (\"return_null\" or \"fault\")"
+                    ))
+                })?;
+                if s != "return_null" && s != "fault" {
+                    return Err(Error::Config(format!(
+                        "module '{module_name}': heap.alloc_failure_policy = '{s}' is \
+                         invalid (use \"return_null\" or \"fault\")"
+                    )));
+                }
+            }
+            _ => {
+                if subval.as_bool().is_none() {
+                    return Err(Error::Config(format!(
+                        "module '{module_name}': heap.{subkey} must be a boolean (true/false)"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_yaml_params(
     module: &Value,
     schema: &schema::ParamSchema,
@@ -1890,6 +2035,10 @@ fn validate_yaml_params(
     };
     for (key, value) in obj {
         if NON_PARAM_KEYS.contains(&key.as_str()) {
+            if key == "heap" {
+                validate_heap_subtree(module, module_name)?;
+                let _ = value;
+            }
             continue;
         }
         if schema::SKIP_KEYS.contains(&key.as_str()) {
@@ -2218,6 +2367,13 @@ fn build_module_entry(
     let normalized_module = expand_compound_yaml_fields(type_name, module, config);
     let module = &normalized_module;
 
+    // The `heap:` subtree is structurally orthogonal to the schema
+    // (it's emitted as protection TLV tags, not schema params), so
+    // its validator runs unconditionally — modules with no schema
+    // source must still surface a `heap.alloc_failure_policy` typo
+    // at build time rather than letting it silently drop at runtime.
+    validate_heap_subtree(module, type_name)?;
+
     // PIC modules embed their schema in the `.fmod`; built-ins declare
     // it in `modules/builtin/<platform>/<name>/manifest.toml`. Both
     // paths produce a `ParamSchema` and feed the same TLV packer, so
@@ -2258,57 +2414,150 @@ fn build_module_entry(
         params_len = 0;
     }
 
-    // Append protection/fault policy params as reserved TLV tags (0xF0-0xF3).
-    // These are parsed by the kernel scheduler during instantiation.
+    // Append protection / fault-policy params as reserved TLV tags
+    // (0xF0..0xFA). Parsed by the kernel scheduler during
+    // instantiation via `parse_protection_config`.
+    //
+    // The schema packer writes a `0xFF 0x00` TLV end-marker at the
+    // tail of `params_len`, and the kernel parser stops on
+    // `tag == 0xFF`. Protection tags therefore have to land BEFORE
+    // that marker — strip it by rewinding `params_len` by 2 when the
+    // trailing bytes are `0xFF 0x00`, append the protection tags,
+    // then re-write the end marker at the new tail. Modules with no
+    // schema source (`params_len == 0`) don't have an end marker to
+    // strip; one is added here only if at least one protection tag
+    // fires, so a module declaring no policy stays at `params_len == 0`.
     let mut extra_len = 0usize;
-    let base = MODULE_ENTRY_HEADER_SIZE + params_len;
+    let had_end_marker = params_len >= 2
+        && entry
+            .get(MODULE_ENTRY_HEADER_SIZE + params_len - 2)
+            .copied()
+            == Some(0xFF)
+        && entry
+            .get(MODULE_ENTRY_HEADER_SIZE + params_len - 1)
+            .copied()
+            == Some(0x00);
+    let base = if had_end_marker {
+        MODULE_ENTRY_HEADER_SIZE + params_len - 2
+    } else {
+        MODULE_ENTRY_HEADER_SIZE + params_len
+    };
+
+    // Every numeric protection field below is range-checked. Typos
+    // and overflows produce explicit `Error::Config` at build time
+    // rather than silent `as u32` / `as u16` truncation; the
+    // non-numeric case (string typos like `"forever"`) also rejects
+    // explicitly so a malformed YAML value can't disable the field.
 
     // Tag 0xF0: step_deadline_us (u32, 4 bytes)
-    if let Some(deadline) = module.get("step_deadline_us").and_then(|v| v.as_u64()) {
-        if base + extra_len + 6 < entry.len() {
-            entry[base + extra_len] = 0xF0;
-            entry[base + extra_len + 1] = 4;
-            let bytes = (deadline as u32).to_le_bytes();
-            entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&bytes);
-            extra_len += 6;
+    if let Some(v) = module.get("step_deadline_us") {
+        if !v.is_null() {
+            let deadline = match v.as_u64() {
+                Some(n) if n <= u32::MAX as u64 => n as u32,
+                Some(n) => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': step_deadline_us = {n} exceeds u32::MAX"
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': step_deadline_us must be a non-negative \
+                         integer (got {v})"
+                    )));
+                }
+            };
+            if base + extra_len + 6 < entry.len() {
+                entry[base + extra_len] = 0xF0;
+                entry[base + extra_len + 1] = 4;
+                let bytes = deadline.to_le_bytes();
+                entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&bytes);
+                extra_len += 6;
+            }
         }
     }
 
-    // Tag 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph)
-    if let Some(policy_str) = module.get("fault_policy").and_then(|v| v.as_str()) {
-        let policy_val: u8 = match policy_str {
-            "skip" => 0,
-            "restart" => 1,
-            "restart_graph" => 2,
-            _ => 0,
-        };
-        if base + extra_len + 3 < entry.len() {
-            entry[base + extra_len] = 0xF1;
-            entry[base + extra_len + 1] = 1;
-            entry[base + extra_len + 2] = policy_val;
-            extra_len += 3;
+    // Tag 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph).
+    // Unknown policy strings error explicitly; the accepted set
+    // mirrors the kernel-side `FaultPolicy` enum.
+    if let Some(v) = module.get("fault_policy") {
+        if !v.is_null() {
+            let policy_str = v.as_str().ok_or_else(|| {
+                Error::Config(format!(
+                    "module '{name}': fault_policy must be a string \
+                     (\"skip\" | \"restart\" | \"restart_graph\"); got {v}"
+                ))
+            })?;
+            let policy_val: u8 = match policy_str {
+                "skip" => 0,
+                "restart" => 1,
+                "restart_graph" => 2,
+                _ => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': fault_policy = '{policy_str}' is invalid \
+                         (use \"skip\", \"restart\", or \"restart_graph\")"
+                    )));
+                }
+            };
+            if base + extra_len + 3 < entry.len() {
+                entry[base + extra_len] = 0xF1;
+                entry[base + extra_len + 1] = 1;
+                entry[base + extra_len + 2] = policy_val;
+                extra_len += 3;
+            }
         }
     }
 
     // Tag 0xF2: max_restarts (u16, 2 bytes)
-    if let Some(max_r) = module.get("max_restarts").and_then(|v| v.as_u64()) {
-        if base + extra_len + 4 < entry.len() {
-            entry[base + extra_len] = 0xF2;
-            entry[base + extra_len + 1] = 2;
-            let bytes = (max_r as u16).to_le_bytes();
-            entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
-            extra_len += 4;
+    if let Some(v) = module.get("max_restarts") {
+        if !v.is_null() {
+            let max_r = match v.as_u64() {
+                Some(n) if n <= u16::MAX as u64 => n as u16,
+                Some(n) => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': max_restarts = {n} exceeds u16::MAX (65535)"
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': max_restarts must be a non-negative integer \
+                         (got {v})"
+                    )));
+                }
+            };
+            if base + extra_len + 4 < entry.len() {
+                entry[base + extra_len] = 0xF2;
+                entry[base + extra_len + 1] = 2;
+                let bytes = max_r.to_le_bytes();
+                entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
+                extra_len += 4;
+            }
         }
     }
 
     // Tag 0xF3: restart_backoff_ms (u16, 2 bytes)
-    if let Some(backoff) = module.get("restart_backoff_ms").and_then(|v| v.as_u64()) {
-        if base + extra_len + 4 < entry.len() {
-            entry[base + extra_len] = 0xF3;
-            entry[base + extra_len + 1] = 2;
-            let bytes = (backoff as u16).to_le_bytes();
-            entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
-            extra_len += 4;
+    if let Some(v) = module.get("restart_backoff_ms") {
+        if !v.is_null() {
+            let backoff = match v.as_u64() {
+                Some(n) if n <= u16::MAX as u64 => n as u16,
+                Some(n) => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': restart_backoff_ms = {n} exceeds u16::MAX (65535)"
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': restart_backoff_ms must be a non-negative \
+                         integer (got {v})"
+                    )));
+                }
+            };
+            if base + extra_len + 4 < entry.len() {
+                entry[base + extra_len] = 0xF3;
+                entry[base + extra_len + 1] = 2;
+                let bytes = backoff.to_le_bytes();
+                entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
+                extra_len += 4;
+            }
         }
     }
 
@@ -2381,6 +2630,153 @@ fn build_module_entry(
         entry[base + extra_len + 1] = 1;
         entry[base + extra_len + 2] = prot_val;
         extra_len += 3;
+    }
+
+    // Extended-protection tags — emit when the module YAML declares
+    // them. The kernel-side parser at `parse_protection_config`
+    // reads each tag and routes to the appropriate setter. All tags
+    // are optional; omit when the field isn't declared so module
+    // graphs that opt out see no change.
+
+    // Tag 0xF6: step_deadline_burst_us (u32 LE, 4 bytes). Range-
+    // check the YAML value as u32 explicitly and reject non-numeric
+    // values. `validate_scheduler_budgets` also rejects out-of-range
+    // values, but `build_module_entry` runs in paths that bypass the
+    // validator (e.g. built-in packing tests); enforcing here too
+    // keeps the wire tag from ever being silently wrapped.
+    if let Some(v) = module.get("step_deadline_burst_us") {
+        if !v.is_null() {
+            let burst_us = match v.as_u64() {
+                Some(n) if n <= u32::MAX as u64 => n as u32,
+                Some(n) => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': step_deadline_burst_us = {n} exceeds u32::MAX"
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': step_deadline_burst_us must be a non-negative \
+                         integer (got {v})"
+                    )));
+                }
+            };
+            let burst = burst_us.to_le_bytes();
+            if base + extra_len + 6 < entry.len() {
+                entry[base + extra_len] = 0xF6;
+                entry[base + extra_len + 1] = 4;
+                entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&burst);
+                extra_len += 6;
+            }
+        }
+    }
+
+    // Tag 0xF7: quarantine_partner (u8 module index, 0xFF = none).
+    // Accepts either the partner's index directly (`quarantine_partner:
+    // 3`) or its name (`quarantine_partner: "tls_handshake"`). Name
+    // resolution happens in the wiring pass once the module-name →
+    // index map is built; what reaches `build_module_entry` is always
+    // the numeric form.
+    if let Some(v) = module.get("quarantine_partner_idx") {
+        if !v.is_null() {
+            // Reject non-numeric values explicitly: a string like
+            // `quarantine_partner_idx: "3"` would otherwise return
+            // `None` from `as_u64()` and silently omit the tag.
+            let partner = match v.as_u64() {
+                Some(n) => n,
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': quarantine_partner_idx must be a non-negative \
+                         integer (got {v})"
+                    )));
+                }
+            };
+            if partner >= MAX_MODULES as u64 {
+                return Err(Error::Config(format!(
+                    "module '{name}': quarantine_partner_idx {partner} out of range \
+                     (max {})",
+                    MAX_MODULES - 1
+                )));
+            }
+            if base + extra_len + 3 < entry.len() {
+                entry[base + extra_len] = 0xF7;
+                entry[base + extra_len + 1] = 1;
+                entry[base + extra_len + 2] = partner as u8;
+                extra_len += 3;
+            }
+        }
+    }
+
+    // Tag 0xF8: heap.zero_on_free (u8 bool)
+    if let Some(heap) = module.get("heap") {
+        if let Some(v) = heap.get("zero_on_free").and_then(|v| v.as_bool()) {
+            if base + extra_len + 3 < entry.len() {
+                entry[base + extra_len] = 0xF8;
+                entry[base + extra_len + 1] = 1;
+                entry[base + extra_len + 2] = if v { 1 } else { 0 };
+                extra_len += 3;
+            }
+        }
+
+        // Tag 0xF9: heap.alloc_failure_policy
+        //   "return_null" (default) → tag NOT emitted
+        //   "fault" → tag emitted with value 1
+        // The value space is validated by `validate_heap_subtree`; only
+        // `"fault"` produces a tag here.
+        if let Some(s) = heap.get("alloc_failure_policy").and_then(|v| v.as_str()) {
+            if s == "fault" && base + extra_len + 3 < entry.len() {
+                entry[base + extra_len] = 0xF9;
+                entry[base + extra_len + 1] = 1;
+                entry[base + extra_len + 2] = 1;
+                extra_len += 3;
+            }
+        }
+
+        // Tag 0xFA: heap.canary_enabled
+        if let Some(v) = heap.get("canary_enabled").and_then(|v| v.as_bool()) {
+            if v && base + extra_len + 3 < entry.len() {
+                entry[base + extra_len] = 0xFA;
+                entry[base + extra_len + 1] = 1;
+                entry[base + extra_len + 2] = 1;
+                extra_len += 3;
+            }
+        }
+    }
+
+    // Emit the schema-section end marker `0xFF 0x00` here, after the
+    // protection tags (0xF0-0xFA) but BEFORE any extended cert/key
+    // blobs. The schema SDK parser walks until it hits 0xFF and
+    // ignores everything after; cert/key extended tags reuse low
+    // tag numbers (10/11/12/13) that collide with real schema tags
+    // — notably QUIC's `enable_concurrent_bidi` at tag 10 — so they
+    // must live AFTER this marker. The TLS-module extended-TLV
+    // scanner independently walks the full params region looking
+    // for the `[tag, 0x00, hi, lo, payload]` extended pattern and
+    // picks them up there. Without this split, a cert-bearing QUIC
+    // config would silently reset `enable_concurrent_bidi` to 0.
+    if base + extra_len + 1 < entry.len() {
+        entry[base + extra_len] = 0xFF;
+        entry[base + extra_len + 1] = 0x00;
+        extra_len += 2;
+        // Also update the schema TLV header's payload_len (u16 LE at
+        // bytes 2-3 of the schema TLV) so it reflects the new end-marker
+        // position. Without this update, the TLS extended scanner
+        // (which uses the header's payload_len to find `basic_end`)
+        // would start mid-protection-tag and either false-match or skip
+        // legitimate cert/key tags.
+        //
+        // payload_len is measured from byte 4 (past the TLV header) to
+        // the byte AFTER the end marker. With the schema's original
+        // end marker overwritten, the new end-marker position relative
+        // to byte 4 is `base + extra_len - (MODULE_ENTRY_HEADER_SIZE + 4)`.
+        let header_pos = MODULE_ENTRY_HEADER_SIZE;
+        if entry.len() >= header_pos + 4 && entry[header_pos] == 0xFE {
+            let new_payload_len = (base + extra_len) - (header_pos + 4);
+            if new_payload_len <= u16::MAX as usize {
+                let bytes = (new_payload_len as u16).to_le_bytes();
+                entry[header_pos + 2] = bytes[0];
+                entry[header_pos + 3] = bytes[1];
+            }
+        }
     }
 
     // Tag 10: cert_file (DER blob, extended TLV for > 255 bytes)
@@ -2457,8 +2853,24 @@ fn build_module_entry(
         }
     }
 
-    // Calculate total entry length and write to header
-    let entry_len = MODULE_ENTRY_HEADER_SIZE + params_len + extra_len;
+    // Calculate total entry length and write to header. The
+    // extended cert/key bytes were written past the end marker and
+    // are accounted for in `extra_len`. The 2-byte original schema
+    // end marker, if any, was overwritten and re-emitted by the
+    // inserted-end-marker block above:
+    //   * had_end_marker == true:  base = orig_params_len - 2; the
+    //     original `0xFF 0x00` was overwritten and re-emitted
+    //     (counted in `extra_len`). Total = MODULE_ENTRY_HEADER_SIZE
+    //     + (params_len - 2) + extra_len.
+    //   * had_end_marker == false: base = orig_params_len; the end
+    //     marker was appended (counted in extra_len). Total =
+    //     MODULE_ENTRY_HEADER_SIZE + params_len + extra_len.
+    let payload_total = if had_end_marker {
+        params_len.saturating_sub(2) + extra_len
+    } else {
+        params_len + extra_len
+    };
+    let entry_len = MODULE_ENTRY_HEADER_SIZE + payload_total;
     entry[0..4].copy_from_slice(&(entry_len as u32).to_le_bytes());
 
     // Truncate to actual size
@@ -2479,6 +2891,22 @@ fn parse_modules_map(
     let list = modules.as_array().ok_or_else(|| {
         Error::Config("modules must be a list of module configs (each with a 'name' field)".into())
     })?;
+
+    // Pre-pass: collect module names so a `quarantine_partner:
+    // "name"` (string form) resolves to an index regardless of
+    // declaration order. Forward and backward partner references both
+    // resolve here. Modules using `quarantine_partner_idx: N`
+    // (numeric form) bypass this entirely.
+    let mut name_to_idx: std::collections::HashMap<String, u8> =
+        std::collections::HashMap::new();
+    for (idx, m) in list.iter().enumerate() {
+        if idx >= MAX_MODULES {
+            break;
+        }
+        if let Some(n) = m.get("name").and_then(|v| v.as_str()) {
+            name_to_idx.entry(n.to_string()).or_insert(idx as u8);
+        }
+    }
 
     for (idx, module) in list.iter().enumerate() {
         if idx >= MAX_MODULES {
@@ -2505,8 +2933,55 @@ fn parse_modules_map(
                  still uses the rename, the manifest's `type:` stays the same)."
             )));
         }
+
+        // Resolve `quarantine_partner` (string or numeric form) →
+        // `quarantine_partner_idx: N` so `build_module_entry` reads
+        // only the numeric form. Both spellings route to the same
+        // `_idx` field. The module Value is cloned to avoid mutating
+        // the borrowed input; the clone is cheap relative to the
+        // rest of the build.
+        let mut module_owned = module.clone();
+        let partner_val = module.get("quarantine_partner");
+        let resolved_idx: Option<u8> = match partner_val {
+            Some(v) if v.is_string() => {
+                let partner_name = v.as_str().unwrap();
+                let idx = name_to_idx.get(partner_name).copied().ok_or_else(|| {
+                    Error::Config(format!(
+                        "module '{name}': quarantine_partner '{partner_name}' is not a declared module"
+                    ))
+                })?;
+                Some(idx)
+            }
+            Some(v) if v.is_u64() => {
+                let n = v.as_u64().unwrap();
+                if n >= MAX_MODULES as u64 {
+                    return Err(Error::Config(format!(
+                        "module '{name}': quarantine_partner index {n} out of range (max {})",
+                        MAX_MODULES - 1
+                    )));
+                }
+                Some(n as u8)
+            }
+            Some(_) => {
+                return Err(Error::Config(format!(
+                    "module '{name}': quarantine_partner must be a module name (string) \
+                     or index (number)"
+                )));
+            }
+            None => None,
+        };
+        if let Some(idx) = resolved_idx {
+            if let Some(obj) = module_owned.as_object_mut() {
+                obj.insert(
+                    "quarantine_partner_idx".to_string(),
+                    serde_json::Value::Number((idx as u64).into()),
+                );
+            }
+        }
+
         let id = idx as u8;
-        let entry = build_module_entry(name, module, id, data_section, config, modules_dir)?;
+        let entry =
+            build_module_entry(name, &module_owned, id, data_section, config, modules_dir)?;
         entries.push(entry);
         names.push(name.to_string());
     }
@@ -3710,6 +4185,16 @@ pub struct ModuleCaps {
 }
 
 /// Generate config with extra module search directories (for external projects).
+///
+/// `resolved_target` is the silicon-or-board id chosen by the CLI's
+/// `--target` flag (or the default), already resolved by the caller via
+/// `target::load_target`. When `Some`, it overrides any literal
+/// `target:` field in the YAML config — that's what makes the
+/// `[requires]` hardware-capability check honour the actual build
+/// target rather than a stale YAML default. `None` means fall back to
+/// the YAML's literal value, which is the documented opt-in behaviour
+/// for legacy configs / fixtures with no declared target.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_config_ext(
     config: &Value,
     _template: &ConfigBuilder,
@@ -3718,6 +4203,7 @@ pub fn generate_config_ext(
     extra_module_dirs: &[&Path],
     max_gpio: u8,
     pio_count: u8,
+    resolved_target: Option<&str>,
 ) -> Result<Vec<u8>> {
     generate_config_impl(
         config,
@@ -3727,28 +4213,11 @@ pub fn generate_config_ext(
         extra_module_dirs,
         max_gpio,
         pio_count,
+        resolved_target,
     )
 }
 
-pub fn generate_config_with_caps(
-    config: &Value,
-    _template: &ConfigBuilder,
-    module_caps: &[ModuleCaps],
-    modules_dir: &Path,
-    max_gpio: u8,
-    pio_count: u8,
-) -> Result<Vec<u8>> {
-    generate_config_impl(
-        config,
-        _template,
-        module_caps,
-        modules_dir,
-        &[],
-        max_gpio,
-        pio_count,
-    )
-}
-
+#[allow(clippy::too_many_arguments)]
 fn generate_config_impl(
     config: &Value,
     _template: &ConfigBuilder,
@@ -3757,6 +4226,7 @@ fn generate_config_impl(
     extra_module_dirs: &[&Path],
     max_gpio: u8,
     pio_count: u8,
+    resolved_target: Option<&str>,
 ) -> Result<Vec<u8>> {
     let modules = config
         .get("modules")
@@ -3881,6 +4351,39 @@ fn generate_config_impl(
 
     // Load manifests for named port resolution and type validation
     let manifests = load_module_manifests_with_extra(modules_ref, extra_module_dirs);
+
+    // Hardware-capability validation. Each module's `[requires]`
+    // block declares what the silicon must provide (FPU / NEON /
+    // MMU). Reject placement on a silicon that doesn't satisfy the
+    // request BEFORE generating a binary that would silently
+    // soft-float on RP2040 or fail to link NEON on Cortex-M.
+    //
+    // The CLI-resolved target wins over any literal `target:` in the
+    // YAML — that's the contract that lets `--target` override a
+    // checked-in default. Legacy fixtures without either omit the
+    // check entirely; that's by design, since the default `requires`
+    // is all-false and satisfies every silicon.
+    let silicon_opt = resolved_target
+        .or_else(|| config.get("target").and_then(|t| t.as_str()));
+    if let Some(silicon) = silicon_opt {
+        for (i, m) in module_list.iter().enumerate() {
+            let name = m
+                .get("name")
+                .and_then(|n| n.as_str())
+                .or_else(|| m.get("type").and_then(|n| n.as_str()))
+                .unwrap_or("?");
+            if let Some(manifest) = manifests.get(name) {
+                if let Err(e) =
+                    crate::manifest::check_target_capabilities(manifest.requires, silicon)
+                {
+                    return Err(Error::Config(format!(
+                        "modules[{}] ({}): {}",
+                        i, name, e
+                    )));
+                }
+            }
+        }
+    }
 
     let (edges, force_flags, from_specs, to_specs) = if config.get("wiring").is_some() {
         parse_wiring_edges(&config["wiring"], &module_names, &manifests)?

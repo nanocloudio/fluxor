@@ -258,7 +258,7 @@ unsafe fn append_hex32_field(p: *mut u8, pos: &mut usize, tag: &[u8], val: u32) 
     }
 }
 
-/// Periodic heartbeat (~5 s in phase 2). Emits two lines:
+/// Periodic heartbeat (~5 s). Emits two lines:
 ///
 ///   `[rp1_gem] rx=N tx=M rsr=0xHH bna=K ovr=J hwrx=H hwtx=T`
 ///   `[rp1_gem] th=H tt=T u=U rfb=F shr=S txsr=0xHH txstk=0xHH`
@@ -794,7 +794,19 @@ unsafe fn poll_tx(s: &mut GemState) {
     // One STARTTX kick at the end of the batch covers every
     // descriptor just programmed — the MAC walks the ring once
     // started, so a single doorbell write per batch suffices.
+    //
+    // DSB SY before the kick so every descriptor write has
+    // committed to coherent memory before the MAC fetches the ring.
+    // Without this, the GEM has been observed on cm5 bringup
+    // reading partially-written descriptors when the CPU bursts the
+    // ring then immediately writes NWCTRL — the inner-shareable
+    // domain that `core::sync::atomic::fence(Release)` covers
+    // doesn't include the PCIe-attached GEM.
     if started {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
         let base = s.gem_base;
         let ctrl = gem_read(base, GEM_NWCTRL);
         gem_write(base, GEM_NWCTRL, ctrl | NWCTRL_STARTTX);

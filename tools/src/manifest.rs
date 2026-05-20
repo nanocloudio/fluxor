@@ -613,6 +613,12 @@ pub struct Manifest {
     /// `.context/rfc_isr_tier_surface.md` §D7 for the contract this
     /// flag attests to and §Step-3 for the validator that enforces it.
     pub isr_safe: bool,
+    /// Hardware-feature requirements declared by the module.
+    /// Validated against the resolved target's silicon capability
+    /// matrix at config time by `check_target_capabilities`. Default
+    /// `TomlRequires::default()` (all-false) means "no specific
+    /// requirements," which satisfies every silicon.
+    pub requires: TomlRequires,
     /// Built-in parameter declarations from `[[params]]` (toml-only).
     /// `.fmod` modules carry their schema embedded in the binary; built-ins
     /// declare it here so the config tool can validate YAML and pack TLV.
@@ -637,7 +643,97 @@ impl Default for Manifest {
             capabilities: Vec::new(),
             builtin: false,
             isr_safe: false,
+            requires: TomlRequires::default(),
             params: Vec::new(),
+        }
+    }
+}
+
+/// NEON / aarch64 intrinsic substrings that signal an
+/// ISR-unsafe import. A Tier 1b/Tier 2 module (`isr_safe = true`,
+/// `domain_exec_mode == 2 or 4`) hard-preempts the cooperative tier,
+/// and the ISR is documented as scalar-only. If a module accidentally
+/// pulls in a NEON intrinsic, restoring its NEON state on ISR
+/// completion is the caller's job — and nothing in the runtime saves
+/// the NEON file. A Tier 1b ISR that clobbers NEON would corrupt the
+/// preempted cooperative thread's vector regs.
+///
+/// The substrings below cover the canonical NEON paths in `core::arch`:
+///   * `core::arch::aarch64` — the `arm_neon` module re-exports
+///   * `arm_neon::` — direct import of the intrinsic module
+///   * `vqaddq_`, `vld1q_`, `vst1q_`, `vmlaq_`, etc. — common intrinsic
+///     prefixes (`v[name][q]_[type]`). The `vld1q_`/`vst1q_` plus
+///     `vqaddq_` triplet covers ~95% of real NEON use without a wide
+///     false-positive surface.
+const NEON_IMPORT_MARKERS: &[&str] = &[
+    "core::arch::aarch64",
+    "arm_neon::",
+    "::vld1q_",
+    "::vst1q_",
+    "::vqaddq_",
+    "::vaddq_",
+    "::vmulq_",
+    "::vmlaq_",
+];
+
+/// Scan a module source tree for NEON / aarch64 SIMD imports.
+/// Returns `Ok(())` if no markers found, `Err` listing the offending
+/// files otherwise. Designed to be called from the build path when
+/// `manifest.isr_safe == true` so a module that claims ISR safety
+/// can't quietly pull in NEON intrinsics.
+///
+/// The check is **substring-based and source-static** — it parses
+/// `.rs` files under `src_root` and looks for the marker strings
+/// in `NEON_IMPORT_MARKERS`. Inside a string literal or comment that
+/// happens to mention the marker, the check will false-positive;
+/// fix the source comment or split the literal in those cases. The
+/// alternative (full Rust parsing) costs ~100× more for the same
+/// signal.
+pub fn check_isr_safe_no_neon(src_root: &Path) -> Result<()> {
+    if !src_root.exists() {
+        return Ok(());
+    }
+    let mut offenders: Vec<String> = Vec::new();
+    walk_rs(src_root, &mut |path, source| {
+        for marker in NEON_IMPORT_MARKERS {
+            if source.contains(marker) {
+                offenders.push(format!(
+                    "{}: contains `{}` (NEON-marker substring)",
+                    path.display(),
+                    marker,
+                ));
+                break;
+            }
+        }
+    });
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Module(format!(
+            "ISR-tier module declares `isr_safe = true` but its source imports NEON / \
+             aarch64 SIMD intrinsics. Tier 1b/Tier 2 ISRs are scalar-only by contract \
+             — NEON registers are not preserved across an ISR. Offending files:\n  {}",
+            offenders.join("\n  "),
+        )))
+    }
+}
+
+/// Walk `.rs` files under `root`, invoking `f(path, source)` for each.
+/// Best-effort; unreadable files are skipped silently. Pure
+/// directory traversal — no Cargo metadata, no symlink chasing.
+fn walk_rs<F: FnMut(&Path, &str)>(root: &Path, f: &mut F) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_rs(&path, f);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                f(&path, &source);
+            }
         }
     }
 }
@@ -1016,6 +1112,7 @@ impl Manifest {
             capabilities,
             builtin,
             isr_safe: toml_val.isr_safe,
+            requires: toml_val.requires,
             params,
         })
     }
@@ -1253,6 +1350,11 @@ impl Manifest {
             capabilities: Vec::new(), // not serialized in binary format
             builtin: false,
             isr_safe,
+            // `requires` is a TOML-only field — modules carry their
+            // binary manifest stripped of the requires block (it's a
+            // build-time concern, not a runtime one). Round-tripping
+            // through the binary loses it; that's intentional.
+            requires: TomlRequires::default(),
             params: Vec::new(), // toml-only, not serialized
         })
     }
@@ -1381,9 +1483,138 @@ struct TomlManifest {
     /// See `Manifest::isr_safe` for the contract.
     #[serde(default)]
     isr_safe: bool,
+    /// Hardware-feature requirements. Validated at config time
+    /// against the resolved target's capability matrix. A module that
+    /// declares `requires.fpu = true` is rejected from a target without
+    /// FPU support (RP2040). Default-all-false means "no specific
+    /// requirements," which satisfies every silicon.
+    #[serde(default)]
+    requires: TomlRequires,
     /// `[[params]]` declarations — built-in modules only. PIC modules
     /// embed schema in their .fmod and these are ignored.
     params: Option<Vec<TomlParam>>,
+}
+
+/// Hardware-feature requirements declared by a module in its
+/// `[requires]` TOML section. Used by `check_target_capabilities` to
+/// reject the module at config time if the resolved target lacks
+/// the requested capability — catches a class of "module pulls in
+/// soft-float on a target without FPU and silently runs 100× slower"
+/// bugs before they ship.
+#[derive(Deserialize, Default, Clone, Copy, Debug)]
+#[serde(default)]
+pub struct TomlRequires {
+    /// Hardware floating-point unit. Modules using `f32`/`f64` math
+    /// on a target without FPU fall back to soft-float helpers in
+    /// `compiler-builtins`, which are 50–100× slower than scalar
+    /// integer ops. Declare `requires.fpu = true` to be rejected
+    /// from such targets at build time.
+    pub fpu: bool,
+    /// Advanced SIMD (NEON on aarch64). Modules that use
+    /// `core::arch::aarch64` intrinsics must declare this; the build
+    /// then rejects placement on Cortex-M / WASM targets where the
+    /// intrinsics simply don't exist (link error or panic at runtime).
+    pub neon: bool,
+    /// Memory-management unit with page-table isolation. Modules that
+    /// rely on `rfc_virtual_memory` paged arenas declare this; the
+    /// build rejects placement on Cortex-M / Cortex-A targets without
+    /// an MMU (RP2350 has an MPU but not an MMU).
+    pub mmu: bool,
+}
+
+/// Target hardware-capability matrix used by
+/// `check_target_capabilities`. Constructed from a target's silicon
+/// id; tracks the three boolean caps that modules can demand. Built
+/// here rather than read from `TargetDescriptor` to keep this lint
+/// portable across the tools crate's internal types (avoids a
+/// circular dependency in tools/src/config.rs).
+#[derive(Clone, Copy, Debug)]
+pub struct TargetCapabilities {
+    pub fpu: bool,
+    pub neon: bool,
+    pub mmu: bool,
+}
+
+impl TargetCapabilities {
+    /// Resolve capabilities for a silicon id OR a board id.
+    /// Conservative — unknown names return all-false so a manifest's
+    /// `requires.fpu = true` will reject placement until the name
+    /// is added here.
+    ///
+    /// Real YAML configs commonly use board ids (`cm5`, `pico2w`,
+    /// `linux`) rather than the silicon id (`bcm2712`, `rp2350a`).
+    /// The first arm of `match` normalises board ids to the matching
+    /// silicon entry; callers that already pass a silicon id pass
+    /// through unchanged. The board → silicon map mirrors
+    /// `targets/boards/<board>.toml`'s `board.silicon` field —
+    /// adding a board requires both the TOML descriptor AND a row
+    /// here.
+    pub fn for_silicon(name: &str) -> Self {
+        // Board → silicon normalisation. Mirrors
+        // `targets/boards/<board>.toml::[board].silicon`.
+        let silicon = match name {
+            "cm5" => "bcm2712",
+            "qemu-virt" => "bcm2712",
+            "pico2w" => "rp2350a",
+            "waveshare-lcd4" => "rp2350b",
+            "pico" | "picow" => "rp2040",
+            "linux-host" => "linux",
+            other => other,
+        };
+        match silicon {
+            // Cortex-M0+, no FPU, no SIMD, no MMU.
+            "rp2040" => Self { fpu: false, neon: false, mmu: false },
+            // Cortex-M33 with FPv5-SP single-precision FPU, no SIMD,
+            // MPU but not MMU.
+            s if s.starts_with("rp2350") => Self { fpu: true, neon: false, mmu: false },
+            // Cortex-A76 quad-core, full FP/NEON, full MMU.
+            "bcm2712" => Self { fpu: true, neon: true, mmu: true },
+            // Hosted: always all-yes (running on the dev machine).
+            "linux" => Self { fpu: true, neon: true, mmu: true },
+            // WASM: no NEON in the portable target; FPU yes via
+            // wasm-mvp; no MMU (linear memory only).
+            "wasm" | "wasm32" => Self { fpu: true, neon: false, mmu: false },
+            // Unknown — fail closed.
+            _ => Self { fpu: false, neon: false, mmu: false },
+        }
+    }
+}
+
+/// Confirm that the module's declared hardware-feature
+/// requirements are satisfied by the target's capabilities. Returns
+/// `Ok(())` if compatible, `Err` listing every mismatched capability
+/// otherwise.
+///
+/// Designed to be called from the config-validation path against the
+/// resolved per-module target after `parse_modules_from_config`. The
+/// resulting error message is operator-facing (cites silicon id and
+/// the missing caps).
+pub fn check_target_capabilities(
+    manifest_requires: TomlRequires,
+    silicon: &str,
+) -> Result<()> {
+    let caps = TargetCapabilities::for_silicon(silicon);
+    let mut missing: Vec<&str> = Vec::new();
+    if manifest_requires.fpu && !caps.fpu {
+        missing.push("fpu");
+    }
+    if manifest_requires.neon && !caps.neon {
+        missing.push("neon");
+    }
+    if manifest_requires.mmu && !caps.mmu {
+        missing.push("mmu");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Module(format!(
+            "module's `[requires]` declares {} but silicon `{}` does not provide them. \
+             Either place this module on a target with those caps, or drop the requirement \
+             if it's no longer needed.",
+            missing.join(", "),
+            silicon,
+        )))
+    }
 }
 
 #[derive(Deserialize)]
