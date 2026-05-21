@@ -135,6 +135,130 @@ pub unsafe fn write_error_response(
     off
 }
 
+/// Outcome of parsing an HTTP `Range:` header value against a known
+/// resource size.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RangeParse {
+    /// No `Range:` header was present, or it was malformed / used an
+    /// unsupported unit. Serve the full body as 200 OK.
+    None,
+    /// Header parsed; serve `start..=end` (inclusive byte offsets) as 206.
+    Satisfiable { start: u32, end: u32 },
+    /// Header parsed but the requested range can't intersect `[0, size)`.
+    /// Emit 416 with `Content-Range: bytes */<size>`.
+    Unsatisfiable,
+}
+
+/// Parse a single-range HTTP `Range:` header value against the
+/// resource's total size in bytes.
+///
+/// Accepts `bytes=N-`, `bytes=N-M`, and `bytes=-N` (suffix). Multipart
+/// byterange specs (`bytes=0-99,200-299`) fall through to `None` so the
+/// caller serves plain 200 — RFC 9110 §14.2 lets a server promising
+/// only single ranges ignore the extras.
+///
+/// `value` is the trimmed header value (no `Range:` prefix, no
+/// surrounding whitespace).
+pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
+    if size == 0 {
+        return RangeParse::None;
+    }
+    const PREFIX: &[u8] = b"bytes=";
+    if value.len() < PREFIX.len() {
+        return RangeParse::None;
+    }
+    let mut i = 0usize;
+    while i < PREFIX.len() {
+        let c = value[i];
+        let lower = if c.is_ascii_uppercase() { c + 32 } else { c };
+        if lower != PREFIX[i] {
+            return RangeParse::None;
+        }
+        i += 1;
+    }
+    // One byte-walk that finds the dash and rejects multipart specs
+    // (`bytes=0-99,200-299` → fall through to plain 200 OK; RFC 9110
+    // §14.2 lets a single-range server ignore the extras).
+    let spec = &value[PREFIX.len()..];
+    let mut dash: Option<usize> = None;
+    let mut k = 0usize;
+    while k < spec.len() {
+        let c = spec[k];
+        if c == b',' {
+            return RangeParse::None;
+        }
+        if c == b'-' && dash.is_none() {
+            dash = Some(k);
+        }
+        k += 1;
+    }
+    let dash = match dash {
+        Some(d) => d,
+        None => return RangeParse::None,
+    };
+    let last = size - 1;
+
+    // Saturating u64 parse — `bytes=9999999999-` (and larger) must
+    // resolve cleanly as out-of-range rather than wrap u32 or panic.
+    let parse_u64 = |bytes: &[u8]| -> Option<u64> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut acc: u64 = 0;
+        let mut j = 0;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if !(b'0'..=b'9').contains(&c) {
+                return None;
+            }
+            acc = acc.saturating_mul(10).saturating_add((c - b'0') as u64);
+            j += 1;
+        }
+        Some(acc)
+    };
+
+    let start_bytes = &spec[..dash];
+    let end_bytes = &spec[dash + 1..];
+    let size64 = size as u64;
+
+    if start_bytes.is_empty() {
+        // Suffix form: bytes=-N → last N bytes (clamped to the file).
+        let n = match parse_u64(end_bytes) {
+            Some(v) if v > 0 => v,
+            Some(_) => return RangeParse::Unsatisfiable,
+            None => return RangeParse::None,
+        };
+        let n = n.min(size64);
+        return RangeParse::Satisfiable {
+            start: (size64 - n) as u32,
+            end: last,
+        };
+    }
+
+    let start = match parse_u64(start_bytes) {
+        Some(v) => v,
+        None => return RangeParse::None,
+    };
+    if start >= size64 {
+        return RangeParse::Unsatisfiable;
+    }
+    let end = if end_bytes.is_empty() {
+        last as u64
+    } else {
+        match parse_u64(end_bytes) {
+            Some(v) => v,
+            None => return RangeParse::None,
+        }
+    };
+    if end < start {
+        return RangeParse::Unsatisfiable;
+    }
+    RangeParse::Satisfiable {
+        start: start as u32,
+        end: end.min(last as u64) as u32,
+    }
+}
+
 /// Write an HTTP/1.0 GET request line plus `Host:` header (using the
 /// peer's dotted-quad IP) and the `Connection: close` terminator into
 /// `dst`. Returns the total request length.

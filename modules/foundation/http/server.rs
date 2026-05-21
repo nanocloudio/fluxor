@@ -1524,6 +1524,113 @@ unsafe fn build_error(s: &mut HttpState, code: &[u8], body: &[u8]) {
     }
 }
 
+/// Append a decimal u32 at `off` in `dst`, returning the new offset.
+/// Helper for the Content-Range / Content-Length writers below.
+unsafe fn put_u32_decimal(dst: *mut u8, dst_cap: usize, mut off: usize, mut v: u32) -> usize {
+    let mut digits = [0u8; 10];
+    let mut n = 0usize;
+    if v == 0 {
+        digits[0] = b'0';
+        n = 1;
+    } else {
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        if off < dst_cap {
+            *dst.add(off) = digits[n];
+            off += 1;
+        }
+    }
+    off
+}
+
+unsafe fn put_bytes(dst: *mut u8, dst_cap: usize, mut off: usize, src: &[u8]) -> usize {
+    let mut k = 0usize;
+    while k < src.len() && off < dst_cap {
+        *dst.add(off) = src[k];
+        off += 1;
+        k += 1;
+    }
+    off
+}
+
+/// Like `build_header_with_len` but also emits `Accept-Ranges: bytes`
+/// so clients (browser media elements, iOS players, curl) know they
+/// can seek. Used by `HANDLER_FS_FILE` on the no-Range happy path.
+unsafe fn build_header_fs_full(
+    s: &mut HttpState,
+    status: &[u8],
+    content_type: &[u8],
+    content_length: u32,
+) {
+    let cap = SEND_BUF_SIZE;
+    let dst = cur_send_buf_mut_ptr(s);
+    let mut off = h1::write_status_line(dst, cap, status, content_type);
+    if off >= 4 {
+        off -= 4; // strip the trailing \r\n\r\n; we'll re-add it.
+    }
+    off = put_bytes(dst, cap, off, b"\r\nAccept-Ranges: bytes\r\nContent-Length: ");
+    off = put_u32_decimal(dst, cap, off, content_length);
+    off = put_bytes(dst, cap, off, b"\r\n\r\n");
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+        cur.send_len = off as u16;
+    }
+}
+
+/// Compose a 206 Partial Content head: status line + Content-Type +
+/// Accept-Ranges + Content-Range + Content-Length, terminated by the
+/// blank line. `start`/`end` are inclusive byte offsets into the file;
+/// `total` is the full file size.
+unsafe fn build_header_fs_partial(
+    s: &mut HttpState,
+    content_type: &[u8],
+    start: u32,
+    end: u32,
+    total: u32,
+) {
+    let cap = SEND_BUF_SIZE;
+    let dst = cur_send_buf_mut_ptr(s);
+    let mut off = h1::write_status_line(dst, cap, b"206 Partial Content", content_type);
+    if off >= 4 {
+        off -= 4;
+    }
+    off = put_bytes(dst, cap, off, b"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
+    off = put_u32_decimal(dst, cap, off, start);
+    off = put_bytes(dst, cap, off, b"-");
+    off = put_u32_decimal(dst, cap, off, end);
+    off = put_bytes(dst, cap, off, b"/");
+    off = put_u32_decimal(dst, cap, off, total);
+    off = put_bytes(dst, cap, off, b"\r\nContent-Length: ");
+    off = put_u32_decimal(dst, cap, off, end - start + 1);
+    off = put_bytes(dst, cap, off, b"\r\n\r\n");
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+        cur.send_len = off as u16;
+    }
+}
+
+/// 416 Range Not Satisfiable response: status line + `Content-Range:
+/// bytes */<total>` so the client learns the resource length even
+/// though it can't read the requested range. Body is the same short
+/// text payload as `build_error`.
+unsafe fn build_error_416(s: &mut HttpState, total: u32) {
+    let cap = SEND_BUF_SIZE;
+    let dst = cur_send_buf_mut_ptr(s);
+    let mut off = put_bytes(dst, cap, 0, b"HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */");
+    off = put_u32_decimal(dst, cap, off, total);
+    off = put_bytes(dst, cap, off, b"\r\nContent-Length: 22\r\n\r\nRange Not Satisfiable\n");
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+        cur.send_len = off as u16;
+    }
+}
+
 // ── Variable cache (drained from in[1] each tick) ──────────────────────────
 
 unsafe fn drain_variables(s: &mut HttpState) {
@@ -4364,14 +4471,84 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             if st >= 0 {
                 let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]);
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.fs_total = size;
+                // `recv_buf` still holds the full request head — the
+                // HTTP/1 path never strips it between RecvRequest and
+                // AwaitFsStat, and `Connection: close` means there are
+                // no leftover bytes from a prior keep-alive request.
+                let (recv_ptr, recv_len) = match cur_slot(s) {
+                    Some(c) => (c.recv_buf as *const u8, c.recv_len as usize),
+                    None => (core::ptr::null::<u8>(), 0usize),
+                };
+                let range = if recv_ptr.is_null() || recv_len == 0 {
+                    h1::RangeParse::None
+                } else {
+                    match ws::find_header_value(recv_ptr, recv_len, b"Range") {
+                        Some((off, n)) => h1::parse_range_header(
+                            core::slice::from_raw_parts(recv_ptr.add(off), n),
+                            size,
+                        ),
+                        None => h1::RangeParse::None,
+                    }
+                };
+
+                match range {
+                    h1::RangeParse::Satisfiable { start, end } => {
+                        // Pre-seek so the streamer's first FS_READ hits
+                        // the right offset; if the provider can't seek
+                        // (wasm browser-fetch returns ENOSYS), degrade
+                        // to 200 OK on the full body rather than 5xx —
+                        // the client falls back to a non-range fetch.
+                        let mut seek_arg = (start as i32).to_le_bytes();
+                        let seek_rc = (sys.provider_call)(
+                            cur_fs_fd(s),
+                            0x0902, // FS_SEEK
+                            seek_arg.as_mut_ptr(),
+                            seek_arg.len(),
+                        );
+                        if seek_rc < 0 {
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.fs_total = size;
+                            }
+                            build_header_fs_full(s, b"200 OK", ct_slice, size);
+                        } else {
+                            // Re-target the streamer at the range:
+                            // `fs_total` becomes the range length, the
+                            // FD's position is at `start`, and the
+                            // existing `fs_sent < fs_total` window stops
+                            // at the right byte.
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.fs_total = end - start + 1;
+                            }
+                            build_header_fs_partial(s, ct_slice, start, end, size);
+                        }
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::SendHeaders;
+                        }
+                        return 2;
+                    }
+                    h1::RangeParse::Unsatisfiable => {
+                        (sys.provider_call)(
+                            cur_fs_fd(s),
+                            0x0903, // FS_CLOSE
+                            core::ptr::null_mut(),
+                            0,
+                        );
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.fs_fd = -1;
+                            cur.phase = Phase::DrainSend;
+                        }
+                        build_error_416(s, size);
+                        return 2;
+                    }
+                    h1::RangeParse::None => {
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.fs_total = size;
+                            cur.phase = Phase::SendHeaders;
+                        }
+                        build_header_fs_full(s, b"200 OK", ct_slice, size);
+                        return 2;
+                    }
                 }
-                build_header_with_len(s, b"200 OK", ct_slice, size);
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.phase = Phase::SendHeaders;
-                }
-                return 2;
             }
             if st == E_NOSYS {
                 if let Some(cur) = cur_slot_mut(s) {

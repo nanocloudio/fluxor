@@ -1351,13 +1351,29 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         cluster = next;
         walked += 1;
     }
+    // When the target offset falls partway through a sector, pre-fetch
+    // it now and pin `scratch_pos` to the within-sector byte. Without
+    // this, FS_READ after a non-sector-aligned FS_SEEK returns bytes
+    // from offset 0 of the sector instead of from `target` — HTTP
+    // Range requests with non-aligned starts hit it every time.
+    let within_sector = target % bps;
+    if within_sector != 0 {
+        let lba = cluster_to_sector(s, cluster) + (target_sector as u32);
+        let buf_ptr = s.open_files[slot_idx].scratch_block.as_mut_ptr();
+        let rc = fs_sync_read_sector(s, lba, buf_ptr);
+        if rc != 0 { return rc; }
+    }
     let of = &mut s.open_files[slot_idx];
     of.current_cluster = cluster;
     of.sector_in_cluster = target_sector;
     of.offset = target;
-    // scratch is reset; the next FS_READ fetches the target sector.
-    of.scratch_avail = 0;
-    of.scratch_pos = 0;
+    if within_sector != 0 {
+        of.scratch_pos = within_sector as u16;
+        of.scratch_avail = (bps - within_sector) as u16;
+    } else {
+        of.scratch_pos = 0;
+        of.scratch_avail = 0;
+    }
     target as i32
 }
 
