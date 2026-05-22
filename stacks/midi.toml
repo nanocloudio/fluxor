@@ -1,0 +1,88 @@
+# Platform stack: midi — MIDI input/output capability surface.
+#
+# Resolves `platform.midi: { direction: in|out|duplex }` in a
+# graph YAML to the right per-target MIDI driver. Every variant
+# emits / consumes the `input::midi` contract on `events` ports
+# (output for `in`, input for `out`, both for `duplex`).
+#
+# Contract wire shape: `modules/sdk/contracts/input/midi.rs` —
+# pre-decoded 4-byte channel-voice messages.
+#
+# **Implementation status: every variant currently resolves to a
+# STUB module.** The shape of the stack is final (this is the
+# vocabulary future implementations will use), but no platform's
+# MIDI integration is wired through to real hardware yet:
+#
+#   - `wasm_browser_midi_{in,out}` — Web MIDI API not yet bridged.
+#   - `linux_alsa_midi` — ALSA seq client not yet implemented.
+#   - `usb_midi_host` — kernel-side USB host stack absent;
+#     `provider_open(USB_HOST, ...)` returns ENOSYS.
+#
+# Configs resolving to any variant load and run cleanly (the stubs
+# drain their input channels so producers don't backpressure) and
+# log a STUB marker per module on instantiation. Real MIDI activity
+# requires the per-target implementation to land — see each module's
+# `mod.rs` for the gap.
+
+[stack]
+name = "midi"
+
+# ── Browser: Web MIDI API (input) — STUB
+[[variant]]
+match = { family = "wasm", direction = "in" }
+modules = [{ name = "midi", type = "wasm_browser_midi_in" }]
+wiring = []
+
+# ── Browser: Web MIDI API (output) — STUB
+[[variant]]
+match = { family = "wasm", direction = "out" }
+modules = [{ name = "midi", type = "wasm_browser_midi_out" }]
+wiring = []
+
+# ── Linux host: ALSA seq client — STUB
+[[variant]]
+match = { family = "linux", direction = "in" }
+modules = [{ name = "midi", type = "linux_alsa_midi", params = { mode = "in" } }]
+wiring = []
+
+[[variant]]
+match = { family = "linux", direction = "out" }
+modules = [{ name = "midi", type = "linux_alsa_midi", params = { mode = "out" } }]
+wiring = []
+
+[[variant]]
+match = { family = "linux", direction = "duplex" }
+modules = [{ name = "midi", type = "linux_alsa_midi", params = { mode = "duplex" } }]
+wiring = []
+
+# ── USB-MIDI class-compliant host on pico2w / picow / cm5 — STUB
+# (kernel-side USB host stack absent; see usb_midi_host/mod.rs)
+[[variant]]
+match = { board = "pico2w", direction = "in" }
+modules = [{ name = "midi", type = "usb_midi_host", params = { usb_bus = "0", mode = "in" } }]
+wiring = []
+
+[[variant]]
+match = { board = "pico2w", direction = "duplex" }
+modules = [{ name = "midi", type = "usb_midi_host", params = { usb_bus = "0", mode = "duplex" } }]
+wiring = []
+
+[[variant]]
+match = { board = "picow", direction = "in" }
+modules = [{ name = "midi", type = "usb_midi_host", params = { usb_bus = "0", mode = "in" } }]
+wiring = []
+
+[[variant]]
+match = { board = "picow", direction = "duplex" }
+modules = [{ name = "midi", type = "usb_midi_host", params = { usb_bus = "0", mode = "duplex" } }]
+wiring = []
+
+[[variant]]
+match = { board = "cm5", direction = "in" }
+modules = [{ name = "midi", type = "usb_midi_host", params = { usb_bus = "0", mode = "in" } }]
+wiring = []
+
+[[variant]]
+match = { board = "cm5", direction = "duplex" }
+modules = [{ name = "midi", type = "usb_midi_host", params = { usb_bus = "0", mode = "duplex" } }]
+wiring = []

@@ -1,0 +1,29 @@
+# MIDI Echo — pico2w USB-MIDI driver validator. **STUB GRAPH.**
+#
+# `usb_midi_host` is a PIC module scaffold: the kernel-side USB
+# host stack is not yet implemented and `provider_open(USB_HOST,
+# ...)` returns ENOSYS. Loading this config exercises the wiring,
+# manifest, AND stack-resolution pipeline end-to-end (the
+# `platform.midi` directive resolves through `stacks/midi.toml`
+# to a `usb_midi_host` instance in duplex mode); the module drains
+# its input channel so wired producers don't backpressure. No USB
+# enumeration, no MIDI I/O. The STUB state is logged at runtime
+# when the module instantiates; see
+# `modules/foundation/usb_midi_host/mod.rs` and
+# `src/kernel/provider.rs::contract::USB_HOST`.
+#
+# When the real USB host stack lands, this example becomes a
+# working duplex echo validator: plug a controller with both
+# input and output (e.g. a Launchpad / keyboard with soft-thru
+# defeat) into the USB-A port to verify the contract round-trips.
+#
+#   midi.events_out ──▶ midi.events_in
+target: pico2w
+
+platform:
+  midi:
+    direction: duplex
+
+wiring:
+  - from: midi.events_out
+    to: midi.events_in

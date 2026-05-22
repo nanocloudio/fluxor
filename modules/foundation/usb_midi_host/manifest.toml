@@ -1,0 +1,46 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+capabilities = ["midi.input", "midi.output"]
+# USB host operations live in opcode class 0x15xx and are
+# `platform_raw`-gated by `privileged_op_permission` in
+# `src/kernel/syscalls.rs`. The real implementation will need
+# `permissions = ["platform_raw"]` declared in this manifest, but
+# the stub step_fn never reaches a privileged op and `platform_raw`
+# is a coarse grant covering every flash / MMIO / DMA / PCIe-config
+# opcode — pre-declaring on an inert module would authorise more
+# than the scaffold uses. The one-line manifest update lands with
+# the real implementation.
+
+# Class-compliant USB-MIDI host. Enumerates devices on the
+# selected USB bus, claims MIDI streaming interfaces, and exposes
+# their virtual cables as one logical MIDI port. `mode: in` emits
+# `input::midi` frames on `events_out`; `mode: out` consumes frames
+# on `events_in`; `mode: duplex` does both. Used by the `midi`
+# platform stack on rp2350 and cm5 to resolve `platform.midi:
+# {direction: in|out|duplex}`.
+#
+# Implementation status: scaffold. The PIC module compiles, packs
+# to `.fmod`, and validates against the `usb_host` contract, but
+# the runtime is a no-op (logs one STUB line on first step). Real
+# implementation requires the kernel-side USB host stack — see
+# `src/kernel/provider.rs::contract::USB_HOST` and the bind/open/
+# transfer opcode table noted there.
+#
+# Params are declared via `define_params!` in `mod.rs` (PIC
+# modules embed their schema in Rust, not in TOML).
+
+[[ports]]
+name = "events_out"
+direction = "output"
+content_type = "MidiEvents"
+required = false
+
+[[ports]]
+name = "events_in"
+direction = "input"
+content_type = "MidiEvents"
+required = false
+
+[[resources]]
+requires_contract = "usb_host"
+access = "exclusive"

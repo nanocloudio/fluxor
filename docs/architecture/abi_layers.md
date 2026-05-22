@@ -81,6 +81,7 @@ Consumers declare the contract in their manifest with
 | `PLATFORM_DMA` | `0x0008` | Kernel (platform) | Raw DMA channel allocation. Handle = channel number. Opcodes under `dma_raw::channel::*`. Also requires `platform_raw` permission. |
 | `PLATFORM_DMA_FD` | `0x0011` | Kernel (platform) | Async DMA fd with ping-pong queuing. Handle = tagged fd. Opcodes under `dma_raw::fd::*`. Separate contract from `PLATFORM_DMA`; drivers using both families (e.g. `pio_rp`) declare both in `[[resources]]`. Also requires `platform_raw` permission. |
 | `PCIE_DEVICE` | `0x0012` | Kernel (platform) | Handle-scoped PCIe device binding. `BIND` takes a selector (board alias like `m2_primary` or `@class=<name>`) and returns a handle; subsequent ops (`CFG_READ32` / `WRITE32`, `BAR_MAP`, `MSI_ALLOC`, `INFO`) act on the handle. Board topology lives in `src/platform/<chip>/pcie_aliases.rs`, not in driver code. Also requires `platform_raw` permission. |
+| `USB_HOST` | `0x0015` | Kernel (platform) — **scaffold only** | Handle-scoped USB host controller binding. Planned opcodes (`BIND`, `OPEN_ENDPOINT`, `BULK_READ` / `WRITE`, `INTERRUPT_POLL`, `RELEASE`) are reserved but not implemented; `provider_open` returns `-ENOSYS` until a host-controller driver lands in `src/platform/{rp,bcm2712}/usb_host.rs`. Will also require `platform_raw` permission. First declared consumer: `modules/foundation/usb_midi_host`. |
 
 Plus channel-served protocols (no contract id — there's nothing to
 dispatch, just message formats):

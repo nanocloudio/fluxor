@@ -35,7 +35,7 @@ pub use crate::abi::kernel_abi::fd::{
     FD_TAG_DMA_CHANNEL, FD_TAG_EVENT, FD_TAG_FS, FD_TAG_HAL_ADC, FD_TAG_HAL_GPIO, FD_TAG_HAL_I2C,
     FD_TAG_HAL_PIO, FD_TAG_HAL_PWM, FD_TAG_HAL_SPI, FD_TAG_HAL_UART, FD_TAG_KEY_VAULT,
     FD_TAG_NIC_RING, FD_TAG_PCIE_DEVICE, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT,
-    FD_TAG_TIMER,
+    FD_TAG_TIMER, FD_TAG_USB_HOST,
 };
 
 // ============================================================================

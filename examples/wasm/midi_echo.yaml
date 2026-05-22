@@ -1,0 +1,50 @@
+# MIDI Echo — pure-wasm driver validator. **STUB GRAPH.**
+#
+# `wasm_browser_midi_in` / `wasm_browser_midi_out` are built-in
+# placeholders: Web MIDI API integration is not yet implemented.
+# Loading this config in the browser instantiates both modules
+# and the `midi_out` end drains its input channel so wired
+# producers don't backpressure — but no MIDI events flow to or
+# from the Web MIDI device list. STUB markers are logged in the
+# wasm-kernel console at instantiation; see
+# `src/platform/wasm/midi.rs`.
+#
+# Unlike the linux and pico2w examples, this one instantiates the
+# two drivers directly rather than via `platform.midi`. Web MIDI's
+# `MIDIInput` / `MIDIOutput` are distinct browser objects, so a
+# duplex stack variant would need to inject two named modules —
+# the existing midi stack uses single-module-per-variant, matching
+# every other stack in `stacks/`. Adding a multi-module duplex
+# variant is feasible but breaks the stack's invariant; left as
+# direct instantiation until that design choice is made.
+#
+# When real Web MIDI support lands, this example becomes a working
+# echo validator: plug a controller into the browser's Web MIDI
+# device list, plug a synth into the output side, play. If notes
+# pass through, the contract round-trips on both drivers and the
+# host shim is wired correctly.
+#
+#   wasm_browser_midi_in.events ──▶ wasm_browser_midi_out.events
+target: wasm
+
+scenario:
+  name: midi_echo
+  host:
+    port: 9876
+  bindings:
+    - serve: main
+
+presentation:
+  layout: stacked
+  surfaces:
+    - { id: status, role: meter, module: midi_in }
+
+modules:
+  - name: midi_in
+    type: wasm_browser_midi_in
+  - name: midi_out
+    type: wasm_browser_midi_out
+
+wiring:
+  - from: midi_in.events
+    to: midi_out.events

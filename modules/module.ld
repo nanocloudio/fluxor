@@ -5,7 +5,15 @@ ENTRY(module_init)
 
 MEMORY
 {
-    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 256K
+    /* Per-module size cap. Not a real flash budget on any target —
+     * bcm2712 mmaps modules from RAM, rp2040/rp2350 XIP-image hosts
+     * multi-MB flash. The cap exists purely as a "modules should be
+     * small" guideline. Raised from 256K to 512K because mp3_codec
+     * already sits at ~254K in normal mode (99% full) and overflows
+     * with `MP3_PROBE=1` debug-probe rodata. 512K leaves comfortable
+     * headroom for the largest current module + probe builds + a
+     * future codec or two without re-litigating this number. */
+    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 512K
 }
 
 SECTIONS

@@ -10,6 +10,14 @@
 #   make fmt                      Apply rustfmt across the workspace
 #   make lint                      Run clippy across every kernel target + tools
 #                                  with `-D warnings` (CI-equivalent)
+#   make check-stable              Pre-release gate: structural guards +
+#                                  build matrix + tests + any local drift
+#                                  checks under `.context/drift/`.
+#
+# Engineer-local extensions (debugging workflows, project-lore drift
+# checks) live under `.context/` and are pulled in via the optional
+# include below. Missing — fine; present — added transparently.
+-include .context/Makefile
 
 # Default target silicon (override: make firmware TARGET=rp2040)
 TARGET ?= rp2350
@@ -81,7 +89,7 @@ ABI_HEADER := $(SDK_DIR)/abi.rs
 # Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
 mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,$(if $(filter synth_source,$(1)),1,2))))))))))))))
 
-.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint check-no-inline-tests check-no-historical-abi check-wasm-no-rp-residue check-build-matrix check-stable test install-rig-backends
+.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint check-no-inline-tests check-drift check-build-matrix check-stable test install-rig-backends
 
 all: tools firmware-all modules-all linux-bin
 
@@ -272,43 +280,6 @@ targets:
 linux-bin: tools
 	@cargo build --release --bin fluxor-linux --no-default-features --features host-linux --target aarch64-unknown-linux-gnu
 
-# Closed-loop iteration cycle for the embedded MP3 codec:
-# rebuild → capture-via-ws → diff vs ffmpeg reference. Use after
-# touching modules/app/codec/mp3_codec.rs to see whether your change
-# regressed or fixed the per-step metrics. With MP3_PROBE=1 set, the
-# codec also dumps per-layer state for .context/mp3_bisect/probe_mp3.py
-# to diff against the minimp3 ground truth at
-# .context/mp3_bisect/minimp3_layers. The bisection harness is
-# untracked (.context/ is gitignored) — build it on demand with
-# `make minimp3-ref`; see .context/mp3_bisect/README.md for the
-# workflow.
-#
-# Usage:
-#   make mp3-iterate                     # cmajor.mp3 (128 kbps stereo)
-#   make mp3-iterate MP3=cmajor_192k.mp3 # cross-validation bitrate
-#   MP3_PROBE=1 make mp3-iterate         # also emit [probe] dumps
-mp3-iterate:
-	@cd $(CURDIR) && touch modules/app/codec/mp3_codec.rs
-	@MP3_PROBE=$(MP3_PROBE) $(MAKE) modules TARGET=bcm2712
-	@bash /tmp/run_mp3.sh
-	@python3 examples/test_harness/diff_mp3.py
-	@if [ -n "$(MP3_PROBE)" ]; then \
-		python3 .context/mp3_bisect/probe_mp3.py /tmp/h.log \
-		    $${REF_LAYERS:-/tmp/ref_192k.layers} $${LO:-85} $${HI:-110}; \
-	fi
-
-# Build the minimp3 reference bisection binaries from .context/mp3_bisect/.
-# Pure debug tooling — only needed when chasing an MP3 codec regression
-# via `MP3_PROBE=1 make mp3-iterate`. Sources are CC0 (lieff/minimp3).
-.PHONY: minimp3-ref
-minimp3-ref: .context/mp3_bisect/minimp3_dump .context/mp3_bisect/minimp3_layers
-
-.context/mp3_bisect/minimp3_dump: .context/mp3_bisect/minimp3_dump.c .context/mp3_bisect/minimp3.h
-	@gcc -O2 -o $@ $< -lm
-
-.context/mp3_bisect/minimp3_layers: .context/mp3_bisect/minimp3_layers.c .context/mp3_bisect/minimp3_probe.h
-	@gcc -O2 -o $@ $< -lm
-
 init:
 	git submodule update --init --recursive
 
@@ -334,57 +305,47 @@ check-no-inline-tests:
 		exit 1; \
 	fi
 
-# Guard: the ABI is single-version v1. Historical "ABI v2 / ABI v3"
-# wording in source comments or architecture docs implies a migration
-# path and misleads implementers.
-check-no-historical-abi:
-	@echo "==> checking source + docs for historical ABI v2/v3 wording ..."
-	@if rg -n 'ABI v2|ABI v3|v2 manifest|v3 manifest|planned for v2|planned for v3|backward-compatible' docs/architecture src modules/sdk >/dev/null 2>&1; then \
-		echo "ERROR: historical ABI v2/v3 wording detected — describe the current shape as v1" >&2; \
-		rg -n 'ABI v2|ABI v3|v2 manifest|v3 manifest|planned for v2|planned for v3|backward-compatible' docs/architecture src modules/sdk >&2; \
-		exit 1; \
+# Run engineer-local drift checks under `.context/drift/checks/`.
+# These encode project-specific lore (forbidden wording in docs,
+# build-artefact invariants, etc.) and live outside the tracked tree
+# so the public Makefile stays focused on the build itself. Missing —
+# the gate prints "skipped" but does not fail, so a fresh clone still
+# completes `check-stable` cleanly. Present — every executable script
+# under `.context/drift/checks/` runs; any non-zero exit fails the gate.
+check-drift:
+	@if [ -x .context/drift/run.sh ]; then \
+		.context/drift/run.sh; \
+	else \
+		echo "==> check-drift: no local drift checks installed (.context/drift/ absent)"; \
 	fi
-
-# Guard: a wasm build must not pick up RP-family linker artifacts —
-# one platform per build, and wasm-ld silently ignoring a Cortex-M
-# `memory.x` shouldn't hide an upstream `build.rs` fall-through.
-check-wasm-no-rp-residue: target/wasm/firmware.wasm
-	@echo "==> checking wasm binary for RP-family residue ..."
-	@if strings target/wasm/firmware.wasm | grep -iE 'cortex_m|embassy_rp|rp2350|rp2040|msplim|memory-rp' >/dev/null 2>&1; then \
-		echo "ERROR: target/wasm/firmware.wasm contains RP-family symbols; build.rs is falling through to the RP arm again" >&2; \
-		strings target/wasm/firmware.wasm | grep -iE 'cortex_m|embassy_rp|rp2350|rp2040|msplim|memory-rp' | head -5 >&2; \
-		exit 1; \
-	fi
-
-target/wasm/firmware.wasm:
-	$(MAKE) firmware TARGET=wasm
 
 # Guard: every supported platform must build clean. Kernels only —
-# module builds run through their own matrix.
+# module builds run through their own matrix. Platform fall-through
+# (e.g. a wasm build picking up RP linker artefacts) is prevented
+# structurally by `build.rs::detect_platform`, which panics on any
+# input that isn't exactly one of the recognised platform features.
 check-build-matrix:
 	@echo "==> build matrix ..."
 	$(MAKE) linux-bin
 	$(MAKE) firmware TARGET=wasm
 	$(MAKE) firmware TARGET=rp2350
 	$(MAKE) firmware TARGET=cm5
-	$(MAKE) check-wasm-no-rp-residue
 	@echo "==> build matrix: all 4 platforms green"
 
 # Umbrella pre-commit / pre-release gate. Runs every static guard
 # plus the test suite. Use this in CI and before tagging a v1
 # candidate.
-check-stable: check-no-inline-tests check-no-historical-abi check-build-matrix test
+check-stable: check-no-inline-tests check-build-matrix test check-drift
 	@echo ""
 	@echo "================================================================"
 	@echo "  Release gate green:"
 	@echo "    * no inline tests under src/"
-	@echo "    * no historical ABI v2/v3 wording in docs or source"
 	@echo "    * linux + wasm + rp2350 + cm5 all build clean"
-	@echo "    * wasm binary has no RP-family residue"
 	@echo "    * make test passing (tools + harness)"
+	@echo "    * local drift checks (if any) passing"
 	@echo "================================================================"
 
-lint: check-no-inline-tests check-no-historical-abi
+lint: check-no-inline-tests
 	@echo "==> linting fluxor-tools (host + integration tests) ..."
 	@cd tools && cargo clippy --all-targets --all-features -- -D warnings
 	@echo "==> linting fluxor-linux (host-image, host-window, host-playback) ..."

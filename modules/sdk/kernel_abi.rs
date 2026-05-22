@@ -434,6 +434,11 @@ pub mod fd {
     pub const FD_TAG_HAL_PIO: i32 = 21;
     pub const FD_TAG_STORAGE_NAMESPACE: i32 = 22;
     pub const FD_TAG_STORAGE_OBJECT: i32 = 23;
+    /// USB host controller handle. Allocated as part of the scaffold
+    /// for `provider::contract::USB_HOST` (0x0015) — `provider_open`
+    /// will tag its returned handles with this once the host stack
+    /// lands. No live producer yet.
+    pub const FD_TAG_USB_HOST: i32 = 24;
 
     pub const TAG_SHIFT: u32 = 26;
     pub const SLOT_MASK: i32 = 0x03FF_FFFF;

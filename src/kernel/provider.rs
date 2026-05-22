@@ -109,6 +109,22 @@ pub mod contract {
     /// `docs/architecture/storage_capability_surface.md`.
     pub const STORAGE_OBJECT: u16 = 0x0014;
 
+    /// USB host controller binding — opcode class 0x15xx.
+    ///
+    /// **Scaffold only.** The id and the per-side drift guards exist
+    /// so foundation modules (`usb_midi_host`, future USB HID / mass-
+    /// storage hosts) can declare `requires_contract = "usb_host"`
+    /// without bumping the manifest schema later. No syscall vtable
+    /// is registered yet — `provider_open(USB_HOST, …)` will return
+    /// `-ENOSYS` until a host-controller driver lands.
+    ///
+    /// Planned opcodes (all gated behind `platform_raw`): `BIND`
+    /// (selector → handle), `OPEN_ENDPOINT`, `BULK_READ`,
+    /// `BULK_WRITE`, `INTERRUPT_POLL`, `RELEASE`. Implementation
+    /// surface lives in `src/platform/{rp,bcm2712}/usb_host.rs`
+    /// (currently absent).
+    pub const USB_HOST: u16 = 0x0015;
+
     // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
     // constants — the alias just drops the prefix for callsite brevity.
@@ -279,6 +295,12 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
         _t if _t == fd::FD_TAG_STORAGE_NAMESPACE => Some(contract::STORAGE_NAMESPACE),
         _t if _t == fd::FD_TAG_STORAGE_OBJECT => Some(contract::STORAGE_OBJECT),
         _t if _t == fd::FD_TAG_HAL_PIO => Some(contract::HAL_PIO),
+        // USB host (scaffold). No live producer yet — the kernel-side
+        // USB host stack is unimplemented, so `provider_open(USB_HOST,
+        // ...)` never returns a tagged handle today. The lookup is
+        // wired in advance so a future implementation needs no surface
+        // change.
+        _t if _t == fd::FD_TAG_USB_HOST => Some(contract::USB_HOST),
         _ => None,
     }
 }
@@ -343,6 +365,7 @@ fn contract_to_tag(contract: ContractId) -> Option<i32> {
         c if c == contract::HAL_PIO => Some(fd::FD_TAG_HAL_PIO),
         c if c == contract::STORAGE_NAMESPACE => Some(fd::FD_TAG_STORAGE_NAMESPACE),
         c if c == contract::STORAGE_OBJECT => Some(fd::FD_TAG_STORAGE_OBJECT),
+        c if c == contract::USB_HOST => Some(fd::FD_TAG_USB_HOST),
         _ => None,
     }
 }

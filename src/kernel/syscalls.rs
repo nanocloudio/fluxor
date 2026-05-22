@@ -625,15 +625,18 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     use crate::kernel::provider::contract as ct;
 
     // Tiers mirror `scheduler::current_module_cap_class()` return values.
-    // Bits 7 / 8 / 17 / 18 (PLATFORM_NIC_RING, PLATFORM_DMA,
-    // PLATFORM_DMA_FD, PCIE_DEVICE) are permitted at every service tier
-    // so a driver's `[[resources]]` declaration is what actually grants
-    // access. The `platform_raw` permission then gates the individual
-    // opcodes on top.
+    // Bits 7 / 8 / 17 / 18 / 21 (PLATFORM_NIC_RING, PLATFORM_DMA,
+    // PLATFORM_DMA_FD, PCIE_DEVICE, USB_HOST) are permitted at every
+    // service tier so a driver's `[[resources]]` declaration is what
+    // actually grants access. The `platform_raw` permission then gates
+    // the individual opcodes on top. USB_HOST is a scaffold — the
+    // kernel-side vtable is unimplemented; the bit is reserved so a
+    // future driver landing only needs to register handlers, not also
+    // amend this mask.
     const CAP_CONTRACT_MASK: [u32; 4] = [
-        0x0007_1FE1, // CAP_SERVICE: infra + FS + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE
-        0x0007_1FF1, // CAP_SERVICE_PIO: service + HAL_PIO
-        0x0007_1FE3, // CAP_SERVICE_GPIO: service + HAL_GPIO
+        0x0027_1FE1, // CAP_SERVICE: infra + FS + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST
+        0x0027_1FF1, // CAP_SERVICE_PIO: service + HAL_PIO
+        0x0027_1FE3, // CAP_SERVICE_GPIO: service + HAL_GPIO
         0xFFFF_FFFF, // CAP_FULL: any contract
     ];
 
@@ -719,6 +722,20 @@ pub mod permission {
 /// restrictive, avoiding accidental privilege leakage).
 fn privileged_op_permission(op: u32) -> Option<u8> {
     use permission::*;
+    // USB host (0x15xx) — scaffold contract. The kernel-side vtable
+    // is unimplemented; once it lands, every USB host op (BIND,
+    // OPEN_ENDPOINT, BULK_READ/WRITE, INTERRUPT_POLL, RELEASE) is
+    // expected to live in this opcode class and require `platform_raw`
+    // like the other kernel-mediated controller bindings. Gating here
+    // — rather than at the contract level — keeps the model consistent
+    // with how PCIE_DEVICE / PLATFORM_DMA / NIC_RING enforce their
+    // privileged ops (all of which live in the 0x0Cxx bucket but the
+    // pattern is identical). A future driver that picks a 0x15xx
+    // opcode for a non-privileged op (none planned) would need to add
+    // a fine-grained match arm here.
+    if (0x1500..=0x15FF).contains(&op) {
+        return Some(PLATFORM_RAW);
+    }
     if !(0x0C00..=0x0CFF).contains(&op) {
         return None;
     }

@@ -41,95 +41,11 @@ pub const MANIFEST_HEADER_SIZE: usize = 16;
 /// Signature block size (ed25519 signature + signer fingerprint).
 pub const SIGNATURE_BLOCK_SIZE: usize = 96;
 
-// ── Content type string→u8 mapping (matches config.rs CONTENT_TYPES) ────────
-//
-// Position in this table is the on-wire content_type byte; appending is
-// always safe, reordering is not. Manifest authors reference these names
-// in `[[ports]].content_type`.
-//
-// AV surface family:
-//   - AudioSample  — decoded sample-domain audio
-//   - AudioEncoded — codec-domain audio access units (Opus/MP3/AAC/G.711/...)
-//   - VideoEncoded — codec-domain video access units (H.264/H.265/AV1/...)
-//   - VideoDraw    — retained/replayable draw lists (UI, browser, dashboards)
-//   - VideoRaster  — pixel-domain frames
-//   - VideoScanout — present-ready output to a paced display sink
-//   - MediaMuxed   — deliberate combined AV/timing/container streams
-//
-// AudioOpus / AudioMp3 / AudioAac / ImageJpeg / ImagePng are codec-tagged
-// variants kept distinct from the generic AudioEncoded / VideoEncoded
-// surfaces so `content_type` can carry codec identity without sideband.
-
-/// Content-type byte → friendly name. **Single source of truth** for
-/// both manifest parsing (this file's `content_type_from_str`) and
-/// compiled-config decoding (re-exported via `pub use` so
-/// `tools/src/config.rs` does not maintain a parallel copy). Position
-/// in this table is the on-wire byte. **Appending is safe; reordering
-/// or removing entries is a wire-format break** that would silently
-/// mis-route every wired edge in every existing config blob.
-pub const CONTENT_TYPES: &[&str] = &[
-    "OctetStream",
-    "Cbor",
-    "Json",
-    "AudioSample",
-    "AudioOpus",
-    "AudioMp3",
-    "AudioAac",
-    "TextPlain",
-    "TextHtml",
-    "VideoRaster",
-    "ImageJpeg",
-    "ImagePng",
-    "MeshEvent",
-    "MeshCommand",
-    "MeshState",
-    "MeshHandle",
-    "InputEvent",
-    "GestureMatch",
-    "FmpMessage",
-    "EthernetFrame",
-    "HciMessage",
-    "AudioEncoded",
-    "VideoEncoded",
-    "VideoDraw",
-    "VideoScanout",
-    "MediaMuxed",
-    // WebSocket frame surface — header `{conn_id u32, opcode u8, fin u8,
-    // payload_len u16}` followed by `payload_len` bytes. Carried on a port
-    // when foundation/http (or another transport gateway) is configured to
-    // fan out upgraded connections to a downstream module instead of
-    // handling frames internally.
-    "WsFrame",
-    // Input surface primitive (see input_capability_surface.md §6).
-    "InputBinaryState",
-    // Generic event-timeline surfaces — variable-size packets carrying
-    // event records with stream-time / t-state timestamps. Used to
-    // bridge a compute core (e.g. an emulator core) to platform-
-    // specific renderer modules without leaking the producer's
-    // domain-specific identity. Receivers parse the inner packet
-    // shape; the surface itself only declares "frame-aligned event
-    // stream, video flavour" or "frame-aligned event stream, audio
-    // flavour".
-    "EventTimelineVideo",
-    "EventTimelineAudio",
-    // Net protocol framing — `[msg_type:u8][len:u16 LE][payload]`
-    // delivered atomically on a byte-stream channel. Used between
-    // network stacks (IP, TLS, QUIC) and their consumers. Distinct
-    // from `OctetStream` because consumers cannot parse it without
-    // the per-frame TLV; auto-inserted tee/merge modules need this
-    // discriminant to preserve frame boundaries during fan-out.
-    "NetProto",
-    // Per-class input event surfaces (see
-    // docs/architecture/input_capability_surface.md). Each carries a
-    // packed C-repr record on the wire — pointer/key/gamepad shapes
-    // documented in `modules/sdk/contracts/input/*.rs`. The legacy
-    // generic "InputEvent" stays in the table for back-compat with
-    // older modules, but new graphs wire one of the per-class names
-    // below so the kernel and shell stay narrow.
-    "PointerEvents",
-    "KeyEvents",
-    "GamepadEvents",
-];
+// Content-type wire-byte table lives in `fluxor-contracts` so sibling
+// projects authoring module manifests can depend on it without pulling
+// in the rest of the host-side tooling. Re-exported here to preserve
+// the long-standing `tools::manifest::CONTENT_TYPES` import path.
+pub use fluxor_contracts::CONTENT_TYPES;
 
 fn content_type_from_str(s: &str) -> Result<u8> {
     if let Some(idx) = CONTENT_TYPES
@@ -197,6 +113,11 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // `provider::contract::STORAGE_*` constants.
         "storage.namespace" | "namespace" => Ok(0x13),
         "storage.object" | "object" => Ok(0x14),
+        // USB host controller binding (scaffold). Allocated so
+        // foundation modules can name the contract today; the kernel
+        // vtable is not yet implemented and `provider_open` against
+        // it returns ENOSYS until a host-controller driver lands.
+        "usb_host" => Ok(0x15),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -209,7 +130,7 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         ))),
         _ => Err(Error::Module(format!(
             "unknown contract name: {} — expected one of: gpio, spi, i2c, pio, \
-             uart, adc, pwm, fs, storage.namespace, storage.object, \
+             uart, adc, pwm, fs, storage.namespace, storage.object, usb_host, \
              platform_nic_ring, platform_dma, platform_dma_fd, \
              pcie_device (see docs/architecture/abi_layers.md)",
             s
@@ -249,6 +170,7 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
         // of a required-caps mask to render the byte as "unknown".
         0x13 => "storage.namespace",
         0x14 => "storage.object",
+        0x15 => "usb_host",
         _ => "unknown",
     }
 }
@@ -291,6 +213,12 @@ const AV_CAPABILITY_NAMES: &[&str] = &[
     "input.gamepad",
     "input.virtual",
     "input.remote",
+    // MIDI surface — paired with the `input::midi` contract and the
+    // `MidiEvents` content type. Declared by the per-platform MIDI
+    // drivers (Web MIDI on wasm, ALSA seq on linux, class-compliant
+    // USB-MIDI on rp2350 / cm5).
+    "midi.input",
+    "midi.output",
 ];
 
 /// Validate capability names against the whitelist and canonicalize each

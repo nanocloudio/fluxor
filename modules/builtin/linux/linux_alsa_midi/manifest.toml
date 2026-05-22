@@ -1,0 +1,42 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+capabilities = ["midi.input", "midi.output"]
+
+# Linux ALSA seq MIDI client. `mode: in` opens a single input
+# port and emits `input::midi` frames on `events_out`. `mode: out`
+# opens a single output port and consumes frames from `events_in`.
+# `mode: duplex` exposes both ports; only the relevant port is
+# required when wired through the `midi` platform stack.
+#
+# `port_filter` matches the ALSA client:port name; empty selects
+# the first available match. The stack's `platform.midi` resolver
+# binds `mode` from the requested direction.
+
+[[ports]]
+name = "events_out"
+direction = "output"
+content_type = "MidiEvents"
+required = false
+
+[[ports]]
+name = "events_in"
+direction = "input"
+content_type = "MidiEvents"
+required = false
+
+[[params]]
+name = "mode"
+type = "enum"
+values = ["in", "out", "duplex"]
+default = "in"
+
+[[params]]
+name = "port_filter"
+type = "str"
+default = ""
+
+[[params]]
+name = "client_name"
+type = "str"
+default = "fluxor"

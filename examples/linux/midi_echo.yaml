@@ -1,0 +1,26 @@
+# MIDI Echo — Linux ALSA driver validator. **STUB GRAPH.**
+#
+# `linux_alsa_midi` is a built-in placeholder: ALSA seq integration
+# is not yet implemented. Loading this config exercises the wiring,
+# manifest, AND stack-resolution pipeline end-to-end (the `platform.
+# midi` directive resolves through `stacks/midi.toml` to a
+# `linux_alsa_midi` instance in duplex mode); the module drains its
+# input channel so wired producers don't backpressure, but no MIDI
+# events flow to / from ALSA. The STUB state is logged at runtime
+# when the module instantiates; see
+# `src/platform/linux/linux_alsa_midi.rs`.
+#
+# When real ALSA seq support lands, this example becomes a working
+# echo validator: route an external controller via `aconnect` to
+# fluxor's input and the output to a soft-synth or hardware module.
+#
+#   midi.events_out ──▶ midi.events_in
+target: linux
+
+platform:
+  midi:
+    direction: duplex
+
+wiring:
+  - from: midi.events_out
+    to: midi.events_in

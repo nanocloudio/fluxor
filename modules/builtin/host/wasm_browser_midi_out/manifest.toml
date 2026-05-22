@@ -1,0 +1,21 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+capabilities = ["midi.output"]
+
+# Browser MIDI output sink. Consumes 4-byte `input::midi` frames,
+# re-encodes them as standard MIDI 1.0 status + data bytes, and
+# dispatches via the Web MIDI API output port selected by
+# `port_filter`. Used by the `midi` platform stack to resolve
+# `platform.midi: {direction: out}` on wasm targets.
+
+[[ports]]
+name = "events"
+direction = "input"
+content_type = "MidiEvents"
+required = true
+
+[[params]]
+name = "port_filter"
+type = "str"
+default = ""

@@ -47,6 +47,9 @@ mod gamepad;
 #[path = "wasm/button.rs"]
 mod button;
 
+#[path = "wasm/midi.rs"]
+mod midi;
+
 // DOM terminal — kernel-log-ring scrollback rendered into the page.
 // Drains via the same LOG_RING_DRAIN opcode (0x0C64) that
 // `log_net` uses on bcm2712/rp; multi-consumer-safe, so wiring a
@@ -314,6 +317,11 @@ const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
 const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 =
     fnv1a32(b"wasm_browser_touch_gamepad_overlay");
+// MIDI built-ins — STUB. See `wasm/midi.rs` for the unimplemented
+// state. Registered here so configs that reference the modules
+// load cleanly instead of failing at the runtime dispatch step.
+const WASM_BROWSER_MIDI_IN_HASH: u32 = fnv1a32(b"wasm_browser_midi_in");
+const WASM_BROWSER_MIDI_OUT_HASH: u32 = fnv1a32(b"wasm_browser_midi_out");
 
 /// Initialise a per-module heap sized for one `State` struct plus
 /// alignment slack. Each built-in's `alloc_state` makes one
@@ -529,6 +537,38 @@ unsafe fn load_embedded_modules() -> usize {
             registered += 1;
             log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
                 " = wasm_browser_button (built-in)", 0);
+            continue;
+        }
+
+        // MIDI input/output — STUB. See `wasm/midi.rs`. Registers
+        // so the module loads cleanly. `midi_out` drains its input
+        // channel every step so wired producers don't backpressure.
+        if entry.name_hash == WASM_BROWSER_MIDI_IN_HASH {
+            if !init_builtin_heap::<midi::MidiInState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_midi_in: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let m = midi::build_in();
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_midi_in (built-in, STUB - Web MIDI not yet implemented)", 0);
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_MIDI_OUT_HASH {
+            if !init_builtin_heap::<midi::MidiOutState>(module_idx) {
+                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                    " = wasm_browser_midi_out: STATE_ARENA full, skipping", 0);
+                continue;
+            }
+            let events_in = scheduler::get_module_port(module_idx, 0, 0);
+            let m = midi::build_out(events_in);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
+                " = wasm_browser_midi_out (built-in, STUB - Web MIDI not yet implemented; drains input channel)", 0);
             continue;
         }
 

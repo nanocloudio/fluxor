@@ -110,6 +110,7 @@ include!("linux/host_asset_index.rs");
 include!("linux/linux_display.rs");
 include!("linux/linux_audio.rs");
 include!("linux/host_image_codec.rs");
+include!("linux/linux_alsa_midi.rs");
 
 // ============================================================================
 // Entry point
@@ -274,6 +275,13 @@ fn main() {
         #[cfg(feature = "host-image")]
         if entry.name_hash == HOST_IMAGE_CODEC_HASH {
             let m = build_host_image_codec(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_ALSA_MIDI_HASH {
+            let m = build_linux_alsa_midi(module_idx, entry.params());
             scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;

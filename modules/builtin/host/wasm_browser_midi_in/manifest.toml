@@ -1,0 +1,29 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+capabilities = ["midi.input"]
+
+# Browser MIDI input source. Subscribes to the Web MIDI API
+# (`navigator.requestMIDIAccess`) via the host shim, decodes the
+# raw status byte into the pre-decoded form used by Fluxor's
+# `input::midi` contract, and emits 4-byte channel-voice frames
+# on the output port. Used by the `midi` platform stack
+# (stacks/midi.toml) to resolve `platform.midi: {direction: in}`
+# on wasm targets.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "MidiEvents"
+required = true
+
+[[params]]
+name = "port_filter"
+type = "str"
+default = ""
+
+[[params]]
+name = "sysex"
+type = "enum"
+values = ["off", "on"]
+default = "off"

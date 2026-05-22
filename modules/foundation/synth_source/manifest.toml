@@ -1,0 +1,19 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# Synthetic byte source: emits `size` bytes on every IOCTL_NOTIFY
+# received on its output channel, then signals IOCTL_SET_HUP. Used
+# to decouple HTTP/IP throughput tests from disk content; consumers
+# (curl, range probes) only ever length-check, so the payload itself
+# is the pre-zeroed scratch buffer — see `mod.rs` for the cost trade
+# (avoids ~2 GB/s of pattern memcpy per sustained stream-second).
+# A position-only pattern (`byte = (off ^ off>>8) as u8`, matching
+# `fat32`'s synth-write path) can be re-enabled for byte-exact
+# verifier runs by reinstating the documented `fill_pattern` call in
+# the hot path.
+
+[[ports]]
+name = "stream"
+direction = "output"
+content_type = "OctetStream"
+required = true

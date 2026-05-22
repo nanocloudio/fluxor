@@ -140,6 +140,9 @@ pub mod contracts {
         pub mod key {
             include!("contracts/input/key.rs");
         }
+        pub mod midi {
+            include!("contracts/input/midi.rs");
+        }
     }
 }
 

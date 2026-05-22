@@ -29,6 +29,7 @@ path = "src/lib.rs"
 [dependencies]
 base64 = "0.22"
 clap = { version = "4.6.0", features = ["derive"] }
+fluxor-contracts = { path = "../contracts" }
 libc = "0.2"
 regex = "1.10"
 serde = { version = "1.0.228", features = ["derive"] }

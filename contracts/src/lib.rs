@@ -1,9 +1,11 @@
-//! Public Fluxor storage-surface contracts.
+//! Public Fluxor contracts and shared vocabulary.
 //!
-//! Fluxor owns the storage-surface vocabulary and the typed `Fence`
-//! enum that operations return. Downstream implementers (Loam,
-//! FAT32-backed providers, etc.) depend on this crate and produce
-//! honest `Fence` values out of their pipelines.
+//! Fluxor owns the storage-surface vocabulary, the typed `Fence` enum
+//! that operations return, and the wire-byte content-type table used
+//! by every module manifest. Downstream implementers (Loam, FAT32-backed
+//! providers, sibling projects authoring module manifests) depend on
+//! this crate and use these names directly instead of duplicating
+//! string constants.
 //!
 //! This crate is deliberately small and dependency-free so it can be
 //! pulled in by anything that needs the vocabulary without dragging in
@@ -29,6 +31,101 @@ pub mod content_type {
     pub const STORAGE_NAMESPACE: &str = "storage.namespace";
     pub const STORAGE_OBJECT: &str = "storage.object";
 }
+
+// ── Content type string→u8 mapping (single source of truth) ─────────────────
+//
+// Position in this table is the on-wire content_type byte used in every
+// compiled module manifest and every wired edge. Manifest authors reference
+// these names in `[[ports]].content_type`; tooling parses the name and writes
+// the byte index. The kernel routes by byte, never by name.
+//
+// AV surface family:
+//   - AudioSample  — decoded sample-domain audio
+//   - AudioEncoded — codec-domain audio access units (Opus/MP3/AAC/G.711/...)
+//   - VideoEncoded — codec-domain video access units (H.264/H.265/AV1/...)
+//   - VideoDraw    — retained/replayable draw lists (UI, browser, dashboards)
+//   - VideoRaster  — pixel-domain frames
+//   - VideoScanout — present-ready output to a paced display sink
+//   - MediaMuxed   — deliberate combined AV/timing/container streams
+//
+// AudioOpus / AudioMp3 / AudioAac / ImageJpeg / ImagePng are codec-tagged
+// variants kept distinct from the generic AudioEncoded / VideoEncoded
+// surfaces so `content_type` can carry codec identity without sideband.
+
+/// Content-type byte → friendly name. Single source of truth re-exported
+/// by `fluxor-tools` so manifest parsing and compiled-config decoding
+/// share one table. Position in this slice is the on-wire byte.
+/// **Appending is safe; reordering or removing entries is a wire-format
+/// break** that would silently mis-route every wired edge in every
+/// existing config blob.
+pub const CONTENT_TYPES: &[&str] = &[
+    "OctetStream",
+    "Cbor",
+    "Json",
+    "AudioSample",
+    "AudioOpus",
+    "AudioMp3",
+    "AudioAac",
+    "TextPlain",
+    "TextHtml",
+    "VideoRaster",
+    "ImageJpeg",
+    "ImagePng",
+    "MeshEvent",
+    "MeshCommand",
+    "MeshState",
+    "MeshHandle",
+    "InputEvent",
+    "GestureMatch",
+    "FmpMessage",
+    "EthernetFrame",
+    "HciMessage",
+    "AudioEncoded",
+    "VideoEncoded",
+    "VideoDraw",
+    "VideoScanout",
+    "MediaMuxed",
+    // WebSocket frame surface — header `{conn_id u32, opcode u8, fin u8,
+    // payload_len u16}` followed by `payload_len` bytes. Carried on a port
+    // when foundation/http (or another transport gateway) is configured to
+    // fan out upgraded connections to a downstream module instead of
+    // handling frames internally.
+    "WsFrame",
+    // Input surface primitive (see input_capability_surface.md §6).
+    "InputBinaryState",
+    // Generic event-timeline surfaces — variable-size packets carrying
+    // event records with stream-time / t-state timestamps. Used to
+    // bridge a compute core (e.g. an emulator core) to platform-
+    // specific renderer modules without leaking the producer's
+    // domain-specific identity. Receivers parse the inner packet
+    // shape; the surface itself only declares "frame-aligned event
+    // stream, video flavour" or "frame-aligned event stream, audio
+    // flavour".
+    "EventTimelineVideo",
+    "EventTimelineAudio",
+    // Net protocol framing — `[msg_type:u8][len:u16 LE][payload]`
+    // delivered atomically on a byte-stream channel. Used between
+    // network stacks (IP, TLS, QUIC) and their consumers. Distinct
+    // from `OctetStream` because consumers cannot parse it without
+    // the per-frame TLV; auto-inserted tee/merge modules need this
+    // discriminant to preserve frame boundaries during fan-out.
+    "NetProto",
+    // Per-class input event surfaces (see
+    // docs/architecture/input_capability_surface.md). Each carries a
+    // packed C-repr record on the wire — pointer/key/gamepad shapes
+    // documented in `modules/sdk/contracts/input/*.rs`. The legacy
+    // generic "InputEvent" stays in the table for back-compat with
+    // older modules, but new graphs wire one of the per-class names
+    // below so the kernel and shell stay narrow.
+    "PointerEvents",
+    "KeyEvents",
+    "GamepadEvents",
+    // Pre-decoded MIDI channel-voice events — fixed 4-byte frame per
+    // `modules/sdk/contracts/input/midi.rs`. Carries
+    // `[event_kind, channel, data1, data2]`. Producers: browser Web
+    // MIDI, Linux ALSA seq, class-compliant USB-MIDI hosts.
+    "MidiEvents",
+];
 
 /// Per-operation fence: the actual guarantee a returning operation
 /// achieved. Operations MUST NOT advertise a fence stronger than the
