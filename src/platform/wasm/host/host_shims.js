@@ -584,7 +584,7 @@
     // against those at instantiation. The shim bridges the
     // sub-module's linear memory and the kernel's linear memory by
     // allocating in the kernel's heap and copying through. Same
-    // shape as the wasm_smoke / test_harness reference shims.
+    // shape as the test_harness reference shims.
     const moduleInstances = new Map();
     let nextHandle = 1;
 

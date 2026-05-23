@@ -1,0 +1,75 @@
+# LED Patterns (Pico W) — button-cycled LED demo.
+#
+# Single click → next pattern. Double click → previous pattern.
+# Four patterns:
+#
+#   0. blink    — 1 Hz square wave (full on, full off, 500 ms each)
+#   1. breathe  — gamma-corrected sine ramp, 32 steps × 50 ms (~1.6 s cycle)
+#   2. solid_on — LED held on
+#   3. off      — LED held off
+#
+# Each pattern has its own step cadence (declared per-preset in the
+# `data:` block), so the slow blink and the smooth breathe share one
+# sequencer without compromising either.
+#
+# Pipeline (FMP commands flow control-side; brightness levels flow
+# data-side):
+#
+#   flash_rp.raw → gesture.commands → sequencer.control
+#   sequencer.notes → brightness.source → cyw43.led
+#
+# `brightness`'s gamma22 curve maps 0 ↔ 0 and 255 ↔ 255 exactly, so
+# the blink pattern still produces a clean square wave through it —
+# no separate fast path needed.
+#
+# Replaces the older single-pattern examples (`blinky`, `breathe`)
+# and the button-tracks-led one-liner (`led_switch`); all three are
+# expressed cleanly by picking a preset in this graph.
+
+target: picow
+
+data:
+  blink:
+    type: sequence
+    step_ms: 500
+    values: [255, 0]
+  breathe:
+    type: sequence
+    step_ms: 50
+    values: [0, 5, 10, 25, 40, 60, 80, 105, 130, 155, 180, 200,
+             220, 235, 250, 252, 255, 252, 250, 235, 220, 200,
+             180, 155, 130, 105, 80, 60, 40, 25, 10]
+  solid_on:
+    type: sequence
+    step_ms: 500
+    values: [255]
+  off:
+    type: sequence
+    step_ms: 500
+    values: [0]
+
+modules:
+  - name: pio_rp
+  - name: cyw43
+  - name: flash_rp
+
+  - name: gesture
+    click: next
+    double_click: prev
+
+  - name: sequencer
+    presets: [blink, breathe, solid_on, off]
+    mode: loop
+
+  - name: brightness
+    curve: gamma22
+
+wiring:
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: sequencer.control
+  - from: sequencer.notes
+    to: brightness.source
+  - from: brightness.level
+    to: cyw43.led

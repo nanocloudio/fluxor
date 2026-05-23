@@ -1,0 +1,78 @@
+# VoIP Call — Full Duplex P2P
+#
+# Point-to-point VoIP between two Fluxor devices using SIP signaling
+# and RTP media. Press BOOTSEL to initiate/end a call.
+#
+# Module graph (6 modules):
+#   wifi --ctrl--> cyw43 <---> ip  (WiFi + network stack)
+#
+#   TX path: mic_source → voip (encode) → rtp → [UDP]
+#   RX path: [UDP] → voip (internal jitter→decode) → i2s
+#
+#   SIP control:
+#     voip.sip_ctrl → rtp.endpoint
+#     flash_rp.raw → gesture → voip.call
+#
+# Replace local_ip, peer_ip, ssid, and password for your network.
+target: pico2w
+
+
+platform:
+  net: {}
+
+modules:
+  - name: mic_pio
+    in_pin: 22
+    clock_base: 18
+    sample_rate: 8000
+
+  - name: rtp
+    local_port: 5004
+    ssrc: 1179603028  # "FXRT"
+    ptime: 20
+
+  - name: voip
+    local_ip: "192.168.1.42"
+    peer_ip: "192.168.2.42"
+    rtp_port: 5004
+    jitter_ms: 60
+    ptime: 20
+
+  - name: pio_rp
+  - name: i2s_pio
+    data_pin: 28
+    clock_base: 26
+    sample_rate: 8000
+
+  - name: flash_rp
+
+  # Default mapping: single click → MSG_TOGGLE. voip.call treats
+  # toggle as start-call-if-idle / end-call-if-active.
+  - name: gesture
+
+wiring:
+  # RTP <-> IP net protocol channels (UDP media)
+  - from: ip.net_out
+    to: rtp.net_in
+  - from: rtp.net_out
+    to: ip.net_in
+
+  # TX: mic → voip (encode) → rtp
+  - from: mic_pio.audio
+    to: voip.mic
+  - from: voip.rtp
+    to: rtp.g711
+
+  # RX: voip (internal jitter→decode) → i2s
+  - from: voip.audio
+    to: i2s_pio.audio
+
+  # SIP: voip controls rtp
+  - from: voip.sip_ctrl
+    to: rtp.endpoint
+
+  # Button triggers call/hangup
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: voip.call

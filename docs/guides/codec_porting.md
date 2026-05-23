@@ -50,7 +50,7 @@ mkdir -p /tmp/minimp3 && cd /tmp/minimp3
 wget -q https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
 # probe_driver.c: see modules/app/codec/README.md for full source
 cc -O2 -DMINIMP3_IMPLEMENTATION -DMINIMP3_NO_SIMD -o driver driver.c -lm
-./driver assets/test_harness/cmajor.mp3 /tmp/minimp3_pcm.s16le
+./driver examples/test_harness/assets/cmajor.mp3 /tmp/minimp3_pcm.s16le
 ```
 
 **AAC (next):**
@@ -674,7 +674,7 @@ WS-streaming path also passes. Then:
   bundle gotcha" recipe above.
 - Run `bash examples/test_harness/run_ws_capture.sh` (no args) and
   confirm `pass=6`.
-- Also verify against `assets/test_harness/cmajor_192k.aac` (generated
+- Also verify against `examples/test_harness/assets/cmajor_192k.aac` (generated
   with `ffmpeg -i cmajor.wav -c:a aac -b:a 192k cmajor_192k.aac`) so
   you've fixed the codec, not memorised one input.
 

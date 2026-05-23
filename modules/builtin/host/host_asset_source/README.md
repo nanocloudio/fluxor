@@ -18,7 +18,7 @@ default for "what file to stream."
 modules:
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
 ```
 
 The transparent `params: { ... }` wrapper is also accepted:
@@ -27,7 +27,7 @@ The transparent `params: { ... }` wrapper is also accepted:
 - name: asset
   type: host_asset_source
   params:
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
 ```
 
 The schema lives in `manifest.toml` `[[params]]`; the config tool packs

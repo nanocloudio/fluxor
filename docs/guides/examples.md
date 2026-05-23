@@ -39,10 +39,10 @@ every column; only the deployment target changes.
 
 | Variant         | Target            | Source                          | Sink                          | Config                                                       |
 | --------------- | ----------------- | ------------------------------- | ----------------------------- | ------------------------------------------------------------ |
-| inline          | `rp2350` (lcd-4)  | two BMPs baked into config       | ST7701S 480×480 RGB parallel  | [`examples/waveshare-lcd4/image_viewer_inline.yaml`](../../examples/waveshare-lcd4/image_viewer_inline.yaml) |
-| canonical SD    | `rp2350` (lcd-4)  | SPI SD card, `/images/*`         | ST7701S 480×480 RGB parallel  | [`examples/waveshare-lcd4/image_viewer.yaml`](../../examples/waveshare-lcd4/image_viewer.yaml) |
-| split           | `cm5` + browser   | NVMe FAT32, `/images/*` on pi5   | browser `<canvas>` via WS     | [`examples/cm5/image_viewer.yaml`](../../examples/cm5/image_viewer.yaml) |
-| full browser    | `wasm`            | `host_browser_fetch` over HTTP   | browser `<canvas>`            | [`examples/wasm/image_viewer.yaml`](../../examples/wasm/image_viewer.yaml) + [`viewer.html`](../../examples/wasm/viewer.html) |
+| inline          | `rp2350` (lcd-4)  | two BMPs baked into config       | ST7701S 480×480 RGB parallel  | [`examples/image_viewer/waveshare-lcd4-inline.yaml`](../../examples/image_viewer/waveshare-lcd4-inline.yaml) |
+| canonical SD    | `rp2350` (lcd-4)  | SPI SD card, `/images/*`         | ST7701S 480×480 RGB parallel  | [`examples/image_viewer/waveshare-lcd4.yaml`](../../examples/image_viewer/waveshare-lcd4.yaml) |
+| split           | `cm5` + browser   | NVMe FAT32, `/images/*` on pi5   | browser `<canvas>` via WS     | [`examples/image_viewer/cm5.yaml`](../../examples/image_viewer/cm5.yaml) |
+| full browser    | `wasm`            | `host_browser_fetch` over HTTP   | browser `<canvas>`            | [`examples/image_viewer/wasm.yaml`](../../examples/image_viewer/wasm.yaml) |
 
 ### audio_player
 
@@ -50,10 +50,10 @@ every column; only the deployment target changes.
 
 | Variant         | Target           | Source                           | Sink                          | Config                                                       |
 | --------------- | ---------------- | -------------------------------- | ----------------------------- | ------------------------------------------------------------ |
-| inline          | `rp2350` (pico2w)| four sequence presets baked in   | I²S DAC                       | [`examples/pico2w/audio_player_inline.yaml`](../../examples/pico2w/audio_player_inline.yaml) |
-| canonical SD    | `rp2350` (pico2w)| SPI SD card, `/audio/*`          | I²S DAC                       | [`examples/pico2w/audio_player.yaml`](../../examples/pico2w/audio_player.yaml) |
-| split           | `cm5` + browser  | NVMe FAT32, `/audio/*` on pi5    | browser WebAudio via WS       | [`examples/cm5/audio_player_split.yaml`](../../examples/cm5/audio_player_split.yaml) |
-| full browser    | `wasm`           | `host_browser_fetch` over HTTP   | browser WebAudio              | [`examples/wasm/audio_player.yaml`](../../examples/wasm/audio_player.yaml) + [`player.html`](../../examples/wasm/player.html) |
+| inline          | `rp2350` (pico2w)| four sequence presets baked in   | I²S DAC                       | [`examples/audio_player/pico2w-inline.yaml`](../../examples/audio_player/pico2w-inline.yaml) |
+| canonical SD    | `rp2350` (pico2w)| SPI SD card, `/audio/*`          | I²S DAC                       | [`examples/audio_player/pico2w.yaml`](../../examples/audio_player/pico2w.yaml) |
+| split           | `cm5` + browser  | NVMe FAT32, `/audio/*` on pi5    | browser WebAudio via WS       | [`examples/audio_player/cm5-split.yaml`](../../examples/audio_player/cm5-split.yaml) |
+| full browser    | `wasm`           | `host_browser_fetch` over HTTP   | browser WebAudio              | [`examples/audio_player/wasm.yaml`](../../examples/audio_player/wasm.yaml) |
 
 ## Pipeline diagrams
 
@@ -121,7 +121,7 @@ browser side, which is a separate Fluxor graph. The deployment-
 scenario primitive ([RFC](../../.context/rfc_deployment_scenarios.md))
 solves this declaratively. Single-graph orchestration carries the
 `scenario:` block inline on the graph YAML (see
-`examples/cm5/image_viewer.yaml`); multi-graph harnesses use a
+`examples/image_viewer/cm5.yaml`); multi-graph harnesses use a
 standalone YAML with `kind: scenario` at the top
 (see `examples/test_harness/audio_codecs.yaml`). Either form is
 run by `fluxor run <yaml>`.

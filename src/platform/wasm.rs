@@ -1272,7 +1272,7 @@ const CONFIG_BLOB_MAGIC: [u8; 16] = *b"FLUXOR_CFG_BLOB\0";
 
 /// Total placeholder size for `modules.bin`, including the 32-byte
 /// header. 512 KiB is comfortably larger than the largest module set
-/// observed today (zedex's 7 modules total ~38 KiB; mainline foundation
+/// observed today (a typical browser app graph (~7-10 modules, ~40 KiB); mainline foundation
 /// stacks total ~120 KiB). Reproducible: the bundle tool fails fast if
 /// the real blob exceeds capacity, with a clear "rebuild kernel with
 /// larger placeholder" error.

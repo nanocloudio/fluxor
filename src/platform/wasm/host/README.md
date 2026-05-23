@@ -27,6 +27,24 @@ bundle.
   the child-module syscall bridge). `tools/tests/wasm_host_shim_coverage.rs`
   asserts every kernel-side extern fn has a matching shim entry.
 
+- **`endpoint_runtime.js`** — generic reusable browser-endpoint
+  runtime (350 lines, exposes `window.BrowserSurface`) described
+  in `docs/architecture/browser_capability_surface.md` §8. Owns
+  the generic mechanics: WebSocket connect + reconnect, packet
+  dispatch over the `[kind|flags|reserved|payload_len]` envelope,
+  audio unlock + PCM scheduling, RGB565 raster sink, input
+  capture lifecycle, diagnostics. Profile-specific code
+  (renderers, keymaps, wire encoders) lives next to the
+  application page that loads it.
+
+  Not loaded by `runtime.html` above — the wasm runtime carries
+  its own kernel + shims and doesn't need the JS-side runtime.
+  Used by **pure-JS browser endpoints** that talk to a fluxor
+  producer over WebSocket without downloading a wasm kernel.
+  Used by external browser-endpoint projects (sibling repos
+  (carrying their own `<profile>_browser_profile.js` alongside
+  the generic `endpoint_runtime.js` core).
+
 ## How they get served
 
 The scenario synthesiser auto-mounts both files as static routes on
@@ -49,9 +67,9 @@ bindings for separate galleries).
 
 This directory was previously `examples/wasm/{viewer.html,player.html,host_shims.js}` — a per-bundle layout that fossilised the Python-script era (one HTML per `.wasm` bundle, each with its own bespoke shim copy that drifted from the kernel ABI). The relocation makes wasm symmetric with the other platforms:
 
-- **Linux**: `src/bin/fluxor-linux.rs` is the runtime; `examples/linux/*.yaml` are pure graph manifests.
-- **RP / BCM**: kernel firmware blob built by `make firmware`; `examples/{pico2w,cm5}/*.yaml` are pure graph manifests.
-- **WASM**: `src/platform/wasm/host/*` is the runtime; `examples/wasm/*.yaml` are pure graph manifests.
+- **Linux**: `src/bin/fluxor-linux.rs` is the runtime; `examples/<capability>/linux.yaml` are pure graph manifests.
+- **RP / BCM**: kernel firmware blob built by `make firmware`; `examples/<capability>/{pico2w,cm5}.yaml` are pure graph manifests.
+- **WASM**: `src/platform/wasm/host/*` is the runtime; `examples/<capability>/wasm.yaml` are pure graph manifests.
 
 No per-bundle HTML, no per-bundle JS. One runtime, infinitely many
 graphs.

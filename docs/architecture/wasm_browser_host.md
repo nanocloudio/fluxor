@@ -523,7 +523,7 @@ The MVP runs single-threaded on the main thread, with the
   Pages defaults) don't set them.
 - The kernel's scheduler is designed around `kernel_step()` returning
   bounded-work intervals. Single-threaded performance is sufficient
-  for graphs at the size of zedex (one z80_core, one audio sink, one
+  for small graphs (~7-10 modules — e.g. one core, one audio sink, one
   raster sink, ~10 modules total).
 - Web Worker fan-out is a future option that doesn't change the
   module ABI — workers run additional `kernel_step()`-equivalent

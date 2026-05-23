@@ -21,6 +21,7 @@ mod asset_bank;
 mod monitor;
 mod project;
 pub mod reconfigure;
+mod render_template;
 pub mod rig;
 mod scenario;
 mod text_distance;
@@ -28,6 +29,7 @@ mod schema;
 mod stack_expand;
 pub mod target;
 mod uf2;
+mod up;
 mod wasm_bundle;
 
 /// Wire-format constants — path-mounted from `modules/sdk/wire.rs` so
@@ -253,6 +255,65 @@ enum Commands {
         /// Config file (YAML)
         config: PathBuf,
     },
+    /// Render a YAML config template by substituting `__KEY__`
+    /// placeholders with `--var KEY=VALUE` pairs. Writes the
+    /// rendered text to stdout (or `--output`).
+    ///
+    /// Fails if any `__KEY__` placeholder remains unresolved after
+    /// substitution — the common failure mode is a typo in a var
+    /// name and surfacing it at render time beats a confusing parse
+    /// error at `fluxor run` time.
+    ///
+    /// Example — render the per-node yaml of a 3-replica template:
+    ///   fluxor render-template configs/multi-3node.yaml \
+    ///       --var SELF_ID=0 --var LISTEN_PORT=9090 \
+    ///       --var PEER0_PORT=9090 --var PEER1_PORT=9091 \
+    ///       --var PEER2_PORT=9092 --var HTTP_PORT=19090
+    RenderTemplate {
+        /// Template file (YAML, JSON, or any text format using
+        /// `__KEY__` placeholders).
+        template: PathBuf,
+        /// `KEY=VALUE` pair. Keys are uppercase ASCII letters,
+        /// digits, and underscores. Repeat for every placeholder.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+        /// Write rendered output to this path instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Render a template N times and spawn N `fluxor run` processes
+    /// side-by-side, tailing their stderr until Ctrl+C. Designed
+    /// for local multi-replica bring-up (Raft clusters, partition
+    /// experiments, etc).
+    ///
+    /// The conventional placeholder set the template should use:
+    ///   __SELF_ID__       — replica index (0..replicas-1)
+    ///   __LISTEN_PORT__   — base_port + self_id
+    ///   __PEER<i>_PORT__  — base_port + i for i in 0..replicas-1
+    ///   __HTTP_PORT__     — listen_port + http_offset
+    ///
+    /// Anything else can be passed via `--var KEY=VALUE` and is
+    /// applied uniformly to every replica.
+    Up {
+        /// Template config to render per replica.
+        template: PathBuf,
+        /// Number of replicas to spawn.
+        #[arg(short = 'r', long, default_value = "3")]
+        replicas: u8,
+        /// Base wire (`peer_router.listen_port`) port. Replica i
+        /// listens on `base_port + i`.
+        #[arg(short = 'b', long, default_value = "9090")]
+        base_port: u16,
+        /// Offset added to `LISTEN_PORT` to derive `HTTP_PORT`.
+        /// Default 10000 matches the clustor diagnostic-surface
+        /// convention.
+        #[arg(long, default_value = "10000")]
+        http_offset: u16,
+        /// Extra `KEY=VALUE` placeholder substitutions, applied
+        /// uniformly to every replica. Repeat for multiple.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+    },
     /// Stream live fault stats, protection levels, and step timing
     /// histograms from a running Fluxor device.
     ///
@@ -392,6 +453,18 @@ fn main() {
             verbose,
         ),
         Commands::Flash { config } => cmd_flash(&config, verbose),
+        Commands::RenderTemplate {
+            template,
+            vars,
+            output,
+        } => render_template::cmd_render_template(&template, &vars, output.as_deref()),
+        Commands::Up {
+            template,
+            replicas,
+            base_port,
+            http_offset,
+            vars,
+        } => up::cmd_up(&template, replicas, base_port, http_offset, &vars, None),
         Commands::Sign { input, key, output } => cmd_sign(&input, &key, output.as_deref(), verbose),
         Commands::Monitor {
             port,
@@ -1068,7 +1141,7 @@ fn cmd_combine(
     }
 
     // Parse modules first (needed for in_place_safe caps in config generation).
-    // External-app configs (e.g. zedex) live outside fluxor's modules/ tree
+    // External-app configs live outside fluxor's modules/ tree
     // and either declare `module_search_paths:` or rely on the implicit
     // `<config-parent>/../modules` default — same mechanism the linux build
     // path uses (`cmd_generate`). Without this, fan modules like
@@ -2780,7 +2853,7 @@ struct BuildResult {
 }
 
 /// Derive the output subdirectory from a YAML path relative to `examples/`.
-/// e.g. `examples/pico2w/blinky.yaml` -> "pico2w", otherwise empty string.
+/// e.g. `examples/led_patterns/pico2w.yaml` -> "pico2w", otherwise empty string.
 fn subdir_from_path(yaml_path: &std::path::Path) -> String {
     // Walk components looking for "examples" then take the next component
     let components: Vec<_> = yaml_path.components().collect();
@@ -3052,7 +3125,7 @@ fn build_one(
 /// Pull `assets:` out of a graph YAML and return resolved `(name, path)`
 /// pairs the asset-bank builder can consume. Two shapes are accepted:
 ///
-/// 1. Bare string — `assets: [assets/test_harness/spiral.png, ...]`.
+/// 1. Bare string — `assets: [examples/test_harness/assets/spiral.png, ...]`.
 ///    The asset's logical name is the basename. Paths resolve
 ///    relative to the graph YAML's directory.
 /// 2. Per-entry map — `assets: [{ path: ..., name: spiral.png }, ...]`.

@@ -239,7 +239,7 @@ modules:
 one of two lanes (preserving connection affinity) and broadcasts
 control-plane traffic (ARP, DHCP) to both. Each TLS instance loads its
 own copy of the identity key material — key material is not shared
-across lanes. See `examples/cm5/https_multilane.yaml` for a complete
+across lanes. See `examples/test_harness/cm5/https_multilane.yaml` for a complete
 config.
 
 ## Platform HAL Hooks

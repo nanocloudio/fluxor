@@ -1,0 +1,46 @@
+# Temperature Monitoring → MQTT PoC
+#
+# Reads the RP2350 onboard temperature sensor, evaluates threshold rules
+# with hysteresis debounce, and publishes alerts over MQTT.
+#
+# Module graph (6 modules):
+#   wifi --ctrl--> cyw43 <---> ip   (bidirectional frame exchange)
+#   temp_sensor ---> rules ---> mqtt
+#
+# Alerts are published when temperature crosses 30C (high) or 20C (low).
+# Cross-inhibition prevents repeated alerts until the opposite boundary
+# is crossed.
+target: pico2w
+
+
+platform:
+  net: {}
+
+modules:
+  # MQTT client
+  - name: mqtt
+    broker: "192.168.1.100:1883"
+    keepalive_s: 60
+    client_id: "fluxor-temp-01"
+
+  # Sensor pipeline
+  - name: temp_sensor
+    interval_ms: 5000
+
+  - name: rules
+    high_threshold: 30000
+    low_threshold: 20000
+    topic: "fluxor/temp"
+
+wiring:
+  # MQTT <-> IP net protocol channels
+  - from: ip.net_out
+    to: mqtt.net_in
+  - from: mqtt.net_out
+    to: ip.net_in
+
+  # Sensor pipeline: temp_sensor -> rules -> mqtt
+  - from: temp_sensor.reading
+    to: rules.sensor
+  - from: rules.alarm
+    to: mqtt.mesh_rx

@@ -155,7 +155,7 @@ mod tests {
     const CM5_BANNER: &str = r#"
         name = "cm5_boot_banner"
         target = "cm5"
-        config = "../../examples/cm5/hello_uart.yaml"
+        config = "../../examples/hello/cm5.yaml"
         requires_tags = ["nvme"]
         requires = ["deploy.netboot_tftp", "power.cycle", "observe.console_regex"]
         timeout_s = 30
@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(s.target, "cm5");
         assert_eq!(
             s.config,
-            PathBuf::from("/repo/tests/hardware/../../examples/cm5/hello_uart.yaml")
+            PathBuf::from("/repo/tests/hardware/../../examples/hello/cm5.yaml")
         );
         assert_eq!(s.requires.len(), 3);
         assert_eq!(s.requires_tags, vec!["nvme"]);

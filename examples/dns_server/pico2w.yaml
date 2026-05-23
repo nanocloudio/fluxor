@@ -1,0 +1,51 @@
+# DNS Server
+#
+# Resolves configured hostnames locally and forwards everything else
+# to an upstream DNS server.
+#
+# Hardware:
+# - CYW43 WiFi (onboard, Pico W)
+#
+# Pipeline:
+#
+#   dns <--net_proto--> ip <--frames--> cyw43
+#                                         ^
+#                                      wifi
+#
+# Usage:
+#   1. Flash this config
+#   2. Device connects to WiFi
+#   3. Note IP address from debug output
+#   4. dig @<ip> pico.local       — local A record
+#   5. dig @<ip> google.com       — forwarded to upstream
+#   6. nslookup pico.local <ip>   — reverse lookup
+target: pico2w
+
+
+platform:
+  net: {}
+
+modules:
+  # DNS server
+  - name: dns
+    upstream: "8.8.8.8"
+    ttl: 300
+    host:
+      - "pico.local=192.168.1.42"
+      - "mydevice.home=192.168.1.42"
+
+  # Debug output
+  - name: debug
+    mode: plaintext
+
+wiring:
+  # DNS <-> IP net protocol channels
+  - from: ip.net_out
+    to: dns.net_in
+
+  - from: dns.net_out
+    to: ip.net_in
+
+  # Debug: scan results
+  - from: cyw43.scan_text
+    to: debug.data

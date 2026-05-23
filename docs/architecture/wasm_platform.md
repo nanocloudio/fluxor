@@ -373,7 +373,7 @@ A browser tab can do either, both, or neither, independently:
 - WASM-Fluxor only: the tab loads `<config>.wasm`, joins an upstream
   Fluxor graph via remote channels.
 - Endpoint surface only: the tab loads the endpoint runtime + an app
-  profile (e.g. zedex's setup today) and talks to upstream Fluxor over
+  profile and talks to upstream Fluxor over
   the endpoint session protocol.
 - Both: a tab might host a WASM-Fluxor for compute peers while also
   running the endpoint runtime for a presentation surface in the same

@@ -267,11 +267,11 @@ modules-all:
 
 # Thin wrappers around fluxor CLI
 run:
-	@if [ -z "$(CONFIG)" ]; then echo "Usage: make run CONFIG=examples/qemu-virt/hello_server.yaml"; exit 1; fi
+	@if [ -z "$(CONFIG)" ]; then echo "Usage: make run CONFIG=examples/web_server/linux.yaml"; exit 1; fi
 	$(FLUXOR_TOOL) run $(CONFIG)
 
 flash:
-	@if [ -z "$(CONFIG)" ]; then echo "Usage: make flash CONFIG=examples/pico2w/blinky.yaml"; exit 1; fi
+	@if [ -z "$(CONFIG)" ]; then echo "Usage: make flash CONFIG=examples/led_patterns/pico2w.yaml"; exit 1; fi
 	$(FLUXOR_TOOL) flash $(CONFIG)
 
 targets:

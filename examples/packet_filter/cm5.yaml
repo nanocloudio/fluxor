@@ -1,0 +1,65 @@
+# L2 packet filter (Pi 5 / CM5 bare-metal).
+#
+# Demonstrates the `rp1_gem → eth_parser → pkt_filter → debug`
+# chain: every frame the NIC receives is parsed, matched against
+# the accept rules below, and either dropped or forwarded to the
+# debug logger. The example accepts TCP/80 and UDP/53; everything
+# else drops.
+#
+# Useful as a starting point for L2 middleboxes, traffic monitors,
+# or custom protocols that don't need an IP stack. A real consumer
+# replaces `debug` with whatever module wants the accepted frames.
+#
+# The graph runs the NIC pipeline on a separate domain (`nic`,
+# cores: [1], `exec_mode: poll`). Poll-mode keeps the NIC ring
+# from missing frames at line rate; the dedicated core is optional
+# (the demo would run on a single domain too) but documents how to
+# isolate latency-sensitive work from the cooperative tick.
+#
+# Build:
+#   make cm5
+# Deploy:
+#   cp target/cm5/boot/kernel8.img /boot/firmware/
+target: cm5
+
+execution:
+  domains:
+    - name: main
+      cores: [0]
+    - name: nic
+      cores: [1]
+      exec_mode: poll      # Tier 3: tight poll loop, no sleep
+
+modules:
+  - name: rp1_gem
+    domain: nic
+  - name: eth_parser
+    domain: nic
+  - name: pkt_filter
+    domain: nic
+    params:
+      rule_count: 2
+      rule_0:               # Accept TCP port 80
+        action: 1
+        proto: 6
+        dst_port_lo: 80
+        dst_port_hi: 80
+      rule_1:               # Accept UDP port 53
+        action: 1
+        proto: 17
+        dst_port_lo: 53
+        dst_port_hi: 53
+      default_action: 0     # Drop everything else
+  - name: debug
+    domain: main
+    mode: plaintext
+
+wiring:
+  - from: rp1_gem
+    to: eth_parser
+    edge_class: nic_ring
+  - from: eth_parser
+    to: pkt_filter
+  - from: pkt_filter
+    to: debug
+    edge_class: cross_core

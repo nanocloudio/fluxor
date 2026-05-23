@@ -437,7 +437,7 @@ endian so a single grep follows a session across all emitters.
 
 No module emits `MON_SESSION` today — the format is reserved and will
 become load-bearing when Phase 5 anchor / worker deployments wire up
-telemetry. The echo demo (`examples/linux/echo_edge.yaml`) is a
+telemetry. The echo demo (`examples/test_harness/linux/web/echo_edge.yaml`) is a
 candidate first emitter.
 
 ## Module Stack Patterns
@@ -695,9 +695,9 @@ in the tree:
   `CMD_SC_ATTACH` / `CMD_SC_DRAIN` / `CMD_SC_DETACH`, uppercases each
   byte in the data plane, returns `MSG_SC_ATTACHED` / `MSG_SC_DRAINED`
   / `MSG_SC_DETACHED` back to the anchor.
-- `examples/linux/echo_edge.yaml` — graph wiring the two modules
+- `examples/test_harness/linux/web/echo_edge.yaml` — graph wiring the two modules
   against `linux_net` on port 9000. Runs with
-  `fluxor run examples/linux/echo_edge.yaml` and is exercised over
+  `fluxor run examples/test_harness/linux/web/echo_edge.yaml` and is exercised over
   plain TCP (`nc 127.0.0.1 9000`).
 
 The demo validates the `SessionCtrlV1` envelope end-to-end: HELLO is

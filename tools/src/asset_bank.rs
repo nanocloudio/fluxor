@@ -12,7 +12,7 @@
 //! The alternative was a fixed-size zero-initialised placeholder in
 //! the kernel `.rodata` — same magic-blob pattern as `modules.bin` /
 //! `config.bin` — but that forces every wasm scenario (audio_player,
-//! gamepad_demo, …) to ship a multi-megabyte zero block even when it
+//! input_only_demos, …) to ship a multi-megabyte zero block even when it
 //! has no assets. A custom section is zero-cost when absent and sized
 //! exactly to the declared asset payload otherwise.
 //!

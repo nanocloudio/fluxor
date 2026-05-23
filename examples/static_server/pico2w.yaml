@@ -1,0 +1,57 @@
+# Static File Server.
+#
+# Serves files from a FAT32-formatted SD card over HTTP via WiFi.
+# Reads via the unified FS_CONTRACT — fat32 registers as the FS
+# provider, http opens each route's `fs_path:` directly.
+#
+# SD card requirements:
+# - FAT32 formatted
+# - Files at the paths listed below (uppercase 8.3 short names)
+#
+# Hardware:
+# - CYW43 WiFi (onboard, Pico W)
+# - SD card on SPI0 (CS on GPIO 17)
+#
+# Usage:
+#   1. Flash this config
+#   2. Device connects to WiFi
+#   3. Note IP address from debug output
+#   4. curl http://<ip>/         → INDEX.HTM
+#   5. curl http://<ip>/about    → ABOUT.TXT
+target: pico2w
+
+
+platform:
+  net: {}
+
+modules:
+  - name: sd
+    spi_bus: 0
+    cs_pin: 17
+
+  - name: fat32
+
+  - name: http
+    port: 80
+    routes:
+      - path: "/"
+        fs_path: "/INDEX.HTM"
+        content_type: "text/html"
+      - path: "/about"
+        fs_path: "/ABOUT.TXT"
+        content_type: "text/plain"
+
+  - name: debug
+    mode: plaintext
+
+wiring:
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in
+
+  - from: sd.blocks
+    to: fat32.blocks
+
+  - from: cyw43.scan_text
+    to: debug.data

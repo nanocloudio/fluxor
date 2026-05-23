@@ -1,5 +1,8 @@
 version = "1.0.0"
-hardware_targets = ["rp2350"]
+# Logic is platform-agnostic (timer + preset lookup with a millis
+# fallback for the frame-accurate path). Available on hosts and
+# bare-metal targets that load PIC modules.
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 [[ports]]
 name = "control"
@@ -13,4 +16,4 @@ content_type = "OctetStream"
 required = true
 
 [commands]
-accepts = ["status", "toggle", "select"]
+accepts = ["status", "toggle", "select", "next", "prev"]

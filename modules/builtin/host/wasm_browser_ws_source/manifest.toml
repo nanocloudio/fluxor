@@ -7,8 +7,8 @@ builtin = true
 # bytes on the `bytes` output port as a `VideoRaster` stream.
 #
 # This is the thin half of the split-deployment image-viewer
-# pipeline (see `examples/wasm/image_viewer_thin.yaml` +
-# `examples/cm5/image_viewer.yaml`):
+# pipeline (see `examples/image_viewer/wasm-thin.yaml` +
+# `examples/image_viewer/cm5.yaml`):
 #
 #   pi5: bank → host_image_codec → ws_stream → http(/ws)
 #                                                |    ↓ WS BINARY frames

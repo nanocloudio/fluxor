@@ -11,7 +11,7 @@ without a board-side image codec module.
 modules:
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
   - name: codec
     type: host_image_codec
     width: 480

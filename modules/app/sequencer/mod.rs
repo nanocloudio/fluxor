@@ -9,6 +9,8 @@
 //!   - `status`: { index: u16, count: u16, ... } — switch to preset[index]
 //!   - `toggle`: pause/resume playback
 //!   - `select`: { index: u16 } — jump to specific preset
+//!   - `next`: advance to the next preset (wraps at preset_count)
+//!   - `prev`: step to the previous preset (wraps at 0)
 //!
 //! Timing is based on frames (stream clock) not wall-clock (millis).
 
@@ -409,6 +411,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 if seq.preset_count > 0 && (index as usize) < seq.preset_count as usize {
                                     presets::load_preset(seq, index as u8);
                                 }
+                            }
+                        }
+                        MSG_NEXT => {
+                            // Advance to the next preset, wrapping at preset_count.
+                            // Mirrors `bank`'s next/prev semantics so any
+                            // gesture or controller emitting FMP `next` /
+                            // `prev` verbs can drive either module.
+                            if seq.preset_count > 0 {
+                                let next = (seq.current_preset + 1) % seq.preset_count;
+                                presets::load_preset(seq, next);
+                            }
+                        }
+                        MSG_PREV => {
+                            if seq.preset_count > 0 {
+                                let prev = (seq.current_preset + seq.preset_count - 1)
+                                    % seq.preset_count;
+                                presets::load_preset(seq, prev);
                             }
                         }
                         _ => {}

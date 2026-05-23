@@ -1,0 +1,119 @@
+# Image Viewer — Waveshare RP2350-Touch-LCD-4, inline test patterns.
+#
+# Same shape as `image_viewer.yaml` minus the SD card: two BMP test
+# patterns baked into flash, BOOTSEL gestures cycle them. Useful as
+# a board bring-up sanity check — proves the codec → ST7701S path
+# end-to-end without any FS dependency.
+#
+# Pattern: 8-colour diagonal stripes (R G B C M Y K W) at two source
+# resolutions (8×8 and 32×32). The codec stretches horizontally; the
+# panel's row_lookup stretches vertically. Both patterns render
+# pixel-identical at 480×480 — switching between them exercises the
+# bank → codec hand-off, not the pattern itself.
+#
+# Sibling variants (same overall shape, real image sources):
+#   examples/image_viewer/waveshare-lcd4.yaml — SD card
+#   examples/image_viewer/cm5.yaml            — cm5 decodes, browser displays
+#   examples/image_viewer/linux.yaml          — linux decodes, browser displays
+#   examples/image_viewer/wasm.yaml           — full browser
+target: waveshare-lcd4
+
+data:
+  color_diag_8x8:
+    type: blob
+    # 8×8 24-bit BMP: diagonal colour pattern (246 bytes)
+    # BMP header (14) + DIB header (40) + pixel data (192)
+    # Height is -8 (0xFFFFFFF8 LE) for top-down row order (streaming-friendly)
+    # Colours: R G B C M Y K W — BMP stores BGR888
+    hex: >-
+      424df600000000000000360000002800000008000000
+      f8ffffff0100180000000000c000000000000000000000000000000000000000
+      0000ff00ff00ff0000ffff00ff00ff00ffff000000ffffff
+      00ff00ff0000ffff00ff00ff00ffff000000ffffff0000ff
+      ff0000ffff00ff00ff00ffff000000ffffff0000ff00ff00
+      ffff00ff00ff00ffff000000ffffff0000ff00ff00ff0000
+      ff00ff00ffff000000ffffff0000ff00ff00ff0000ffff00
+      00ffff000000ffffff0000ff00ff00ff0000ffff00ff00ff
+      000000ffffff0000ff00ff00ff0000ffff00ff00ff00ffff
+      ffffff0000ff00ff00ff0000ffff00ff00ff00000000ffff
+
+  color_diag_32x32:
+    type: blob
+    # 32×32 24-bit BMP: same pattern at 4px per band (3126 bytes)
+    # When stretched to 480×480 the two patterns are pixel-identical;
+    # the difference is what the codec sees on its input.
+    hex: >-
+      424d360c000000000000360000002800000020000000
+      e0ffffff0100180000000000000c000000000000000000000000000000000000
+      0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff
+      0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff
+      0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff
+      0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff
+      00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff
+      00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff
+      00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff
+      00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff
+      ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00
+      ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00
+      ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00
+      ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00
+      ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000
+      ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000
+      ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000
+      ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000
+      ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00
+      ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00
+      ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00
+      ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00
+      00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff
+      00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff
+      00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff
+      00ffff00ffff00ffff00ffff000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff
+      000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff
+      000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff
+      000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff
+      000000000000000000000000ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff
+      ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000
+      ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000
+      ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000
+      ffffffffffffffffffffffff0000ff0000ff0000ff0000ff00ff0000ff0000ff0000ff00ff0000ff0000ff0000ff0000ffff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ff00ffff00ffff00ffff00ffff000000000000000000000000
+
+modules:
+  # Flash provides two inline BMP blobs (on `stream`) and the
+  # BOOTSEL button capability (raw transitions on `raw`).
+  - name: flash_rp
+    presets: [color_diag_8x8, color_diag_32x32]
+
+  # Click counter + FMP mapper. Same `gesture` module every other
+  # variant uses.
+  - name: gesture
+    click: next
+    double_click: prev
+    triple_click: prev
+
+  # Bank cycles the preset list. file_count=2 matches presets length.
+  - name: bank
+    file_count: 2
+    mode: loop
+    auto_advance: 0
+
+  # Codec stretches input width → 480. Native source height (8 or 32)
+  # is preserved; st7701s row_lookup handles the vertical scale to 480.
+  - name: codec
+    width: 480
+    height: 32
+    scale_mode: stretch
+
+  - name: st7701s
+
+wiring:
+  - from: flash_rp.stream
+    to: bank.files
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.pixels
+    to: st7701s.pixels
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: bank.commands

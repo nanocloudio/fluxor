@@ -154,7 +154,7 @@ comparing them.
 
 Strip the fence and "the storage surface" is a type assertion with
 no behavioural contract behind it. With the fence, sibling projects
-(Loam, Lattice, Truffle, Zedex) can:
+(downstream / sibling projects) can:
 
 - substitute providers without anticipating ABI churn — they wire
   on the surface name and the required fence dominance;

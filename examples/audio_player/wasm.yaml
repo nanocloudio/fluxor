@@ -1,0 +1,105 @@
+# Audio Player — pure-wasm (full browser, self-contained).
+#
+# All audio_player variants share the same overall shape:
+# `<button driver> → gesture → bank → codec → audio_out`. Each
+# platform supplies its own button-capability driver:
+#
+#   wasm:        wasm_browser_button   (DOM tap on player surface)
+#   rp BOOTSEL:  flash_rp              (QSPI sideband)
+#   rp GPIO:     button (pin: N)       (external switch)
+#
+# All emit the same one-byte `input::button` raw contract;
+# `gesture` does click counting + FMP mapping with per-graph verbs.
+# Audio mapping: single tap → toggle play/pause, double tap →
+# next, triple tap → prev.
+#
+#   wasm_browser_button.raw → gesture.raw → gesture.commands
+#                                                 │
+#                                                 ▼
+#                                          bank.commands
+#                                                 │
+#                                                 ▼
+#                                          bank.stream → codec.encoded → codec.audio → audio_out.audio
+#
+# Sibling variants (same overall shape, different deployment):
+#   examples/audio_player/linux.yaml         — linux decodes, browser plays
+#   examples/audio_player/cm5-split.yaml     — pi5 silicon decodes, browser plays
+#   examples/audio_player/pico2w.yaml        — rp2350 SD card + BOOTSEL
+
+target: wasm
+
+# Inline scenario — `fluxor run examples/audio_player/wasm.yaml`
+# orchestrates the canonical wasm runtime (HTTP origin serving
+# `runtime.html` + `host_shims.js` + this graph's `.wasm` bundle +
+# `scenario.json`). Pure-wasm has no companion components; the
+# synthesised `fluxor-linux` host process serves the bundle, then
+# the browser kernel takes over end-to-end.
+scenario:
+  name: audio_player
+  host:
+    port: 9876
+  bindings:
+    - serve: main
+
+# Audio library baked into the bundle. Paths resolve relative to
+# this YAML's directory; the basename becomes the asset name (and
+# the `asset://<name>` URL bank opens). Codec coverage — one of
+# each supported format so the cycle is obvious and stresses the
+# auto-detect path on every transition.
+assets:
+  - ../../examples/test_harness/assets/cmajor.aac
+  - ../../examples/test_harness/assets/cmajor.mp3
+  - ../../examples/test_harness/assets/cmajor.wav
+
+presentation:
+  layout: stacked
+  surfaces:
+    - { id: deck, role: player, module: audio_out }
+
+modules:
+  # BUTTON capability driver — wasm equivalent of `flash_rp`. DOM
+  # taps on the player surface become one-byte transitions on
+  # `raw`. Same shape every other platform's button driver emits.
+  - name: nav
+    type: wasm_browser_button
+
+  # Cross-platform click counter → FMP commands. Audio mapping
+  # (the gesture defaults): single tap = toggle, double = next,
+  # triple = prev.
+  - name: gesture
+
+  # Asset bank cursor. `path_*` enumerates the library; bank cycles
+  # through them in response to `next`/`prev`/`select` FMP commands
+  # on its `commands` ctrl input. `auto_advance: 1` rolls over at
+  # EOF so a finished track moves to the next without a tap.
+  - name: bank
+    mode: loop
+    auto_advance: 1
+    # Start paused — first user tap toggles → bank unpauses AND
+    # unlocks the browser AudioContext in the same gesture stack.
+    # Without this, bank would silently pre-stream into a suspended
+    # AudioContext (audible nothing), and the first tap would
+    # toggle a running bank to paused — same audible nothing.
+    paused: 1
+    path_0: "asset://cmajor.aac"
+    path_1: "asset://cmajor.mp3"
+    path_2: "asset://cmajor.wav"
+
+  # Unified embedded codec — auto-detects WAV/MP3/AAC on each new
+  # stream. Same module the cm5 / linux / pico2w producers use.
+  - name: codec
+
+  - name: audio_out
+    type: wasm_browser_audio
+    sample_rate: 44100
+    channels: 2
+
+wiring:
+  - from: nav.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: bank.commands
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.audio
+    to: audio_out.audio

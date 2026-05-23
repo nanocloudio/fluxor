@@ -1,0 +1,59 @@
+# Audio Player — split deployment, wasm thin player half.
+#
+# Browser-side companion to either `examples/audio_player/linux.yaml`
+# or `examples/audio_player/cm5-split.yaml`. The shape mirrors the
+# producer-half pipeline exactly: button driver → gesture emits
+# FMP nav commands, the audio_out plays incoming PCM bytes. The
+# only difference vs the pure-wasm version (`audio_player.yaml`)
+# is that `bank` + `codec` live in a different kernel, on the
+# other side of the WebSocket.
+#
+#   wasm_browser_button → gesture → ws.tx_in   ──┐
+#                                                │  WS up   /ws  (FMP next/prev/toggle)
+#                                                ▼
+#                                  (producer kernel: linux / cm5)
+#                                                │
+#                                                │  WS down /ws  (i16 LE PCM)
+#   audio_out ←──────────────────── ws.rx_out  ──┘
+#
+# `wasm_browser_websocket` is the single bidirectional WebSocket
+# carrier; tx_in carries OctetStream bytes UP (the gesture
+# module's FMP messages), rx_out emits OctetStream bytes DOWN (the
+# producer's decoded PCM). One socket, two directions, zero
+# protocol divergence — the FMP message bytes the browser sends
+# are byte-for-byte the same as those bank.commands receives in
+# the pure-wasm graph.
+
+target: wasm
+
+presentation:
+  layout: stacked
+  surfaces:
+    - { id: deck, role: player, module: audio_out }
+
+modules:
+  - name: nav
+    type: wasm_browser_button
+
+  - name: gesture
+
+  # Bidirectional WS carrier. tx_in: bytes to send up; rx_out:
+  # bytes received from the server. Relative URL — host shim
+  # resolves against the page origin so the same graph works on
+  # any port (linux split: 9090; cm5 split: 9090).
+  - name: ws
+    type: wasm_browser_websocket
+    url: /ws
+
+  - name: audio_out
+    type: wasm_browser_audio
+    sample_rate: 48000
+    channels: 2
+
+wiring:
+  - from: nav.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: ws.tx
+  - from: ws.rx
+    to: audio_out.audio

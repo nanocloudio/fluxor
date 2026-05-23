@@ -128,7 +128,7 @@ target: linux
 modules:
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
   - name: codec
     type: host_image_codec
     width: 480
@@ -163,7 +163,7 @@ target: linux
 modules:
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
   - name: codec
     type: host_image_codec
     widht: 320
@@ -193,7 +193,7 @@ target: linux
 modules:
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
   - name: codec
     type: host_image_codec
     width: 8000
@@ -251,7 +251,7 @@ modules:
   - name: asset
     type: host_asset_source
     params:
-      path: assets/test.jpg
+      path: examples/image_viewer/assets/test.jpg
   - name: codec
     type: host_image_codec
     params:
@@ -282,7 +282,7 @@ target: linux
 modules:
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
   - name: codec
     type: host_image_codec
 wiring:

@@ -713,7 +713,7 @@ fn sniff_graph_target(path: &Path) -> Option<String> {
 
 /// Construct the synthesised host graph as a `serde_json::Value`
 /// equivalent to what a human would write in
-/// `examples/linux/serve_wasm.yaml`. Returns `None` when the scenario
+/// `examples/serve_wasm/linux.yaml`. Returns `None` when the scenario
 /// has no `host:` block (every binding has explicit `on:`).
 ///
 /// The returned Value is the same shape `tools::board::validate_config`
@@ -2539,7 +2539,7 @@ bindings:
         );
         let s = parse(&path).unwrap();
         let config = synthesise_host_config(&s, &path).unwrap().unwrap();
-        // Top-level shape mirrors what `examples/linux/serve_wasm.yaml` carries.
+        // Top-level shape mirrors what `examples/serve_wasm/linux.yaml` carries.
         assert_eq!(config["target"], "linux");
         assert!(config["platform"]["net"].is_object());
         let modules = config["modules"].as_array().unwrap();

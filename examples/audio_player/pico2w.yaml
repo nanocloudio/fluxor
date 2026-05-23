@@ -1,0 +1,100 @@
+# Audio Player — bare-metal SD canonical (Raspberry Pi Pico 2 W)
+#
+# Cycles through every supported audio file in `/audio` on the SD card,
+# decoded to PCM and played out the I²S amplifier. Audio formats are
+# auto-detected by the codec module (WAV / MP3 / AAC).
+#
+# Input — `flash_rp` is the rp BOOTSEL driver (reads QSPI sideband,
+# debounces, emits the canonical `input::button` raw transition
+# contract on `raw`). The chain `flash_rp → gesture → bank.commands`
+# is byte-for-byte identical to every other variant (wasm uses
+# `wasm_browser_button`, waveshare/picow use `flash_rp` too,
+# rp boards with an external GPIO switch use the `button` module
+# on a specific pin). One driver per platform exposing the same
+# capability; one `gesture` module mapping clicks to verbs.
+#
+# Pipeline:
+#   sd ──→ fat32 ──→ bank ──→ codec ──→ mixer ──→ i2s_pio
+#   flash_rp.raw ─→ gesture.raw ─→ gesture.commands ─→ bank.commands
+#
+# Gesture defaults (see `modules/foundation/gesture/mod.rs`):
+#   single click → toggle play/pause
+#   double click → next track
+#   triple click → previous track
+#   long press   → long_press FMP (unbound on bank — extend if you
+#                                  want a "shuffle" / "library" verb)
+#
+# SD card requirements:
+#   - FAT32 formatted (MBR or GPT)
+#   - Place .wav / .mp3 / .aac files under `/audio/`
+#   - 8.3 short names recommended; long file names are auto-folded
+#
+# Sibling variants:
+#   examples/audio_player_inline/pico2w.yaml  — synth-generated PCM
+#                                               baked into config,
+#                                               no SD card needed
+#   examples/audio_player/cm5-split.yaml      — pi5 decodes,
+#                                               browser plays via WebAudio
+#   examples/audio_player/linux.yaml          — linux decodes,
+#                                               browser plays
+#   examples/audio_player/wasm.yaml           — full browser
+target: pico2w
+
+modules:
+  # SD card on SPI0.
+  - name: sd
+    spi_bus: 0
+    cs_pin: 17
+    start_block: 0
+    block_count: 0
+
+  - name: fat32
+
+  # BOOTSEL driver — exposes the button capability on `raw`.
+  # Boards with an external GPIO switch swap this for
+  # `- name: button, pin: <N>`; the wire-shape is identical.
+  - name: flash_rp
+
+  # Defaults emit single→toggle, double→next, triple→prev as FMP
+  # verbs against bank.commands. Override here only if the wiring
+  # deviates.
+  - name: gesture
+
+  # Asset bank — enumerates /audio, filters to audio formats, advances
+  # on each EOF unless `toggle` paused playback.
+  - name: bank
+    dir: "/audio"
+    formats: ".wav,.mp3,.aac"
+    mode: loop
+    auto_advance: 1
+    # Start paused — single-click BOOTSEL unpauses + starts
+    # playback (toggle from a running stream would pause it,
+    # which is the wrong UX for "press to start").
+    paused: 1
+
+  # Codec — auto-detects WAV/MP3/AAC by magic; emits PCM @ track rate.
+  - name: codec
+
+  - name: mixer
+    gain_in: 128
+    gain_out: 38
+
+  - name: pio_rp
+  - name: i2s_pio
+    data_pin: 28
+    clock_base: 26
+    sample_rate: 48000
+
+wiring:
+  - from: sd.blocks
+    to: fat32.blocks
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.audio
+    to: mixer.audio
+  - from: mixer.mixed
+    to: i2s_pio.audio
+  - from: flash_rp.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: bank.commands

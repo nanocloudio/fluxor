@@ -1,0 +1,124 @@
+# Image Viewer — pure-wasm (full browser, self-contained).
+#
+# All four image_viewer variants share the same overall shape:
+# `input → bank → codec → display`. Only where each stage runs
+# differs. The input chain is byte-for-byte identical to
+# audio_player's: `<button driver> → gesture → bank.commands`.
+# Each platform supplies its own button-capability driver:
+#
+#   wasm:        wasm_browser_button   (DOM tap on player surface)
+#   rp BOOTSEL:  flash_rp              (QSPI sideband)
+#   rp GPIO:     button (pin: N)       (external switch)
+#
+# All three emit the same one-byte input::button raw contract;
+# `gesture` does click counting + FMP mapping with per-graph verbs.
+#
+#   wasm_browser_button.raw → gesture.raw → gesture.commands
+#                                                 │
+#                                                 ▼
+#                                          bank.commands
+#                                                 │
+#                                                 ▼
+#                                          bank.stream → codec.encoded → codec.pixels → display.raster
+#
+# Gallery is baked into the wasm bundle via the top-level `assets:`
+# block (see `tools/src/asset_bank.rs::append_asset_bank`). The
+# bundle's `fluxor.assets` custom section becomes a Map<name, bytes>
+# in the host shim; `asset://<name>` URLs short-circuit
+# `window.fetch` and serve from that map. `bank` opens each path
+# via the wasm FS provider (`src/platform/wasm/fs.rs`), which
+# forwards `provider_call(-1, FS_OPEN, "asset://name", ...)` to
+# `host_fetch_open` — same code path that serves an HTTP URL,
+# different bytes source.
+#
+# Sibling variants (same overall shape, different deployment):
+#   examples/image_viewer/linux.yaml  — linux decodes, browser displays
+#   examples/image_viewer/cm5.yaml    — cm5 silicon decodes, browser displays
+#   examples/image_viewer/waveshare-lcd4.yaml — single-board hardware display
+
+target: wasm
+
+# Inline scenario — `fluxor run examples/image_viewer/wasm.yaml`
+# orchestrates the canonical wasm runtime (HTTP origin serving
+# `runtime.html` + `host_shims.js` + this graph's `.wasm` bundle +
+# `scenario.json`). Pure-wasm has no companion components; the
+# synthesised `fluxor-linux` host process serves the bundle, then
+# the browser kernel takes over end-to-end.
+scenario:
+  name: image_viewer
+  host:
+    port: 9876
+  bindings:
+    - serve: main
+
+# Gallery baked into the bundle. Paths resolve relative to this
+# YAML's directory; the basename becomes the asset name (and the
+# `asset://<name>` URL bank opens). Visually distinct entries so
+# the cycle is obvious — the four spirals are the same image in
+# PNG/JPG/GIF/BMP, intentional codec-coverage; `test.jpg` /
+# `test2.jpg` give a different subject that makes navigation
+# unambiguous.
+assets:
+  - assets/test.jpg
+  - ../test_harness/assets/spiral.png
+  - assets/test2.jpg
+  - ../test_harness/assets/spiral.jpg
+  - ../test_harness/assets/spiral.gif
+  - ../test_harness/assets/spiral.bmp
+
+presentation:
+  layout: stacked
+  surfaces:
+    - { id: main, role: display, module: display }
+
+modules:
+  # BUTTON capability driver — wasm equivalent of `flash_rp`. DOM
+  # taps on the display surface become one-byte transitions on
+  # `raw`. Same shape every other platform's button driver emits.
+  - name: nav
+    type: wasm_browser_button
+
+  # Cross-platform click counter → FMP commands. Image-gallery
+  # mapping: single tap → next, double tap → prev. Audio_player
+  # remaps the same module to single→toggle, double→next — same
+  # logic, different verbs.
+  - name: gesture
+    click: next
+    double_click: prev
+    triple_click: prev
+
+  # Asset bank cursor. `path_*` enumerates the gallery; bank cycles
+  # through them in response to `next`/`prev`/`select` FMP commands
+  # on its `commands` ctrl input.
+  - name: bank
+    mode: loop
+    auto_advance: 0
+    path_0: "asset://test.jpg"
+    path_1: "asset://spiral.png"
+    path_2: "asset://test2.jpg"
+    path_3: "asset://spiral.jpg"
+    path_4: "asset://spiral.gif"
+    path_5: "asset://spiral.bmp"
+
+  # Unified PIC codec — auto-detects BMP/GIF/PNG/JPEG (and the
+  # audio formats, though they're not wired here). Same module the
+  # cm5 / linux / pico2w producers use; lives at modules/app/codec/.
+  - name: codec
+    width: 960
+    height: 540
+    max_bytes: 16777216
+
+  - name: display
+    type: wasm_browser_canvas
+    width: 960
+    height: 540
+
+wiring:
+  - from: nav.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: bank.commands
+  - from: bank.stream
+    to: codec.encoded
+  - from: codec.pixels
+    to: display.raster

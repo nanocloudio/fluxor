@@ -176,7 +176,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
 
         // One-shot STUB warning on first step. Visible at runtime so
-        // a user running `examples/pico2w/midi_echo.yaml` (or any
+        // a user running `examples/midi_echo/pico2w.yaml` (or any
         // graph wiring `usb_midi_host`) sees the unimplemented state.
         if s.warned == 0 {
             let msg = b"[usb_midi_host] STUB - USB host stack not yet implemented; module is a no-op";

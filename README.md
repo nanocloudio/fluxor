@@ -197,7 +197,7 @@ make examples-cm5
 For QEMU virt (BCM2712):
 
 ```bash
-make run CONFIG=examples/qemu-virt/hello.yaml
+make run CONFIG=examples/hello/qemu-virt.yaml
 ```
 
 For RP boards, flash the UF2 produced by `make examples` to your device.
@@ -211,7 +211,7 @@ The host tool is built as `fluxor` and provides packaging and inspection command
 fluxor targets
 
 # Validate a config without packaging
-fluxor validate examples/pico2w/music_player.yaml
+fluxor validate examples/music_player/pico2w.yaml
 
 # Compose firmware + YAML config + modules into a bootable image.
 #   RP targets -> UF2; aarch64 targets -> raw binary (kernel8.img)
@@ -242,10 +242,26 @@ fluxor/
 │   ├── foundation/     # Portable services (ip, fat32, http, mqtt, dns, tls, ...)
 │   └── app/            # Application modules (synth, codec, mixer, voip, ...)
 ├── tools/              # Host CLI: validate, combine, pack, build, diff
-├── examples/           # Example YAML configs per target board
+├── examples/           # Example YAML configs grouped by capability
 ├── docs/               # Architecture references and guides
 └── targets/            # Silicon and board definitions
 ```
+
+### Where media lives
+
+Fluxor doesn't keep a central asset pool. Each consumer owns its media:
+
+- **Example media** lives next to the example that uses it:
+  `examples/<capability>/assets/<file>`. The wasm asset bank,
+  `host_asset_source`, and similar loaders resolve paths from there.
+- **Module media** lives next to the module that ships with it:
+  `modules/<area>/<module>/assets/<file>`.
+- **Browser-runtime code** (`runtime.html`, `host_shims.js`,
+  `endpoint_runtime.js`) lives at `src/platform/wasm/host/`.
+
+Anything that doesn't fit one of these homes shouldn't grow into a
+flat shared `assets/` directory — give it a real home or keep it in
+your local `.context/` (gitignored) workspace.
 
 ## Documentation
 

@@ -1,0 +1,94 @@
+# QUIC loopback (Linux hosted) — single-process client + server pair.
+#
+# Drives the full QUIC stack through a real handshake + stream
+# exchange without needing two terminals. A `sequencer` ticks every
+# 500 ms; the tick byte payload streams through the client's
+# `app_in` port, gets wrapped in QUIC packets, hits the server on
+# loopback, and surfaces on the server's `app_out` for logging.
+#
+# Both QUIC modules share `linux_net`; fluxor's synthesiser
+# auto-inserts a tee on the inbound side (so both modules see every
+# packet and filter by destination port) and an auto-merge on the
+# outbound side.
+#
+# What this teaches:
+#   - Two `quic` instances in one graph (server + client roles)
+#   - Using `sequencer` as a generic periodic byte source
+#     (the 8-byte audio-shaped event is the payload; semantics
+#     don't matter, the lesson is "real periodic data flowing
+#     over a real QUIC connection")
+#   - Loopback validation of the full RFC 9000 + 9001 stack
+#
+# Setup:
+#   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+#     -nodes -keyout /tmp/server_key.pem -out /tmp/server_cert.pem \
+#     -days 365 -subj "/CN=fluxor"
+#   openssl x509 -in /tmp/server_cert.pem -outform DER -out /tmp/server_cert.der
+#   openssl ec  -in /tmp/server_key.pem  -outform DER -out /tmp/server_key.der
+#
+# Run:
+#   fluxor run examples/quic_loopback/linux.yaml
+#   # observe debug log lines every 500 ms showing the bytes the
+#   # server received.
+
+target: linux
+
+platform:
+  net: {}
+
+data:
+  ping:
+    type: sequence
+    step_ms: 500
+    values: [1, 2, 3, 4]
+
+modules:
+  # Server side: listens on 64443, surfaces received bytes on app_out.
+  - name: server
+    type: quic
+    mode: 1
+    port: 64443
+    cert_file: "/tmp/server_cert.der"
+    key_file:  "/tmp/server_key.der"
+
+  # Client side: connects to 127.0.0.1:64443 from local port 64444,
+  # streams app_in into a QUIC stream.
+  - name: client
+    type: quic
+    mode: 0
+    port: 64444
+    peer_ip: 0x0100007f          # 127.0.0.1 (little-endian u32)
+    peer_port: 64443
+    cert_file: "/tmp/server_cert.der"
+    key_file:  "/tmp/server_key.der"
+
+  # Timer-driven byte source. Sequencer's audio-shaped 8-byte event
+  # is repurposed here as a generic 2 Hz heartbeat — each tick
+  # becomes one stream write.
+  - name: heartbeat
+    type: sequencer
+    presets: [ping]
+    mode: loop
+
+  # Server-side observability sink.
+  - name: debug
+    mode: plaintext
+
+wiring:
+  # Both QUIC modules share linux_net (auto-tee on inbound,
+  # auto-merge on outbound).
+  - from: linux_net.net_out
+    to: server.net_in
+  - from: linux_net.net_out
+    to: client.net_in
+  - from: server.net_out
+    to: linux_net.net_in
+  - from: client.net_out
+    to: linux_net.net_in
+
+  # Application data flow: heartbeat → client (stream out) →
+  # (QUIC frames over loopback UDP) → server (stream in) → debug.
+  - from: heartbeat.notes
+    to: client.app_in
+  - from: server.app_out
+    to: debug.data

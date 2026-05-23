@@ -1,0 +1,103 @@
+# Button-Controlled Scale Player
+#
+# Demonstrates the three-layer input architecture:
+# - Button: reads GPIO, debounces, emits raw 0/1 bytes
+# - Gesture: detects clicks/long press, maps to semantic commands (toggle/next/prev)
+# - Bank: manages "preset" selection with Next/Prev navigation
+# - Sequencer: plays current preset sequence
+# - Synth: generates audio from frequency events
+# - I2S: outputs to speaker
+#
+# Control flow:
+#   button → gesture → bank → sequencer
+#
+# Audio flow:
+#   sequencer → synth → i2s
+#
+# Gesture mappings (configurable):
+#   Single click → toggle (play/pause)
+#   Double click → next (next preset)
+#   Triple click → prev (previous preset)
+#   Long press → long_press (reserved for menu)
+target: pico2w
+
+
+modules:
+  # Control chain
+  - name: button
+    pin: 21                      # GPIO21 (adjust for your hardware)
+    control_id: 0                # Identifies this button in events
+    active_low: 1                # Button connects to GND when pressed
+    pull: up                     # Enable internal pull-up (0=none, 1=up, 2=down)
+
+  - name: gesture
+    click: toggle                # Single click → toggle
+    double_click: next           # Double click → next
+    triple_click: prev           # Triple click → prev
+    long_press: long_press       # Long press → long_press
+    multi_click_ms: 300          # Time window for multi-click detection
+    long_press_ms: 500           # Hold duration for long press
+
+  - name: bank
+    item_count: 4                # Number of presets available
+    mode: loop                   # Wrap around at boundaries (once/loop/hold)
+    initial_index: 0             # Start at first preset
+
+  # Audio chain
+  - name: sequencer
+    preset: c_major              # Built-in C major scale
+    mode: ping_pong              # Go up and down continuously
+    step_ms: 500                 # 500ms per note
+
+  - name: synth
+    sample_rate: 8000
+
+    # Simple sine wave
+    waveform: sine
+
+    # Open filter
+    cutoff: 255
+    resonance: 0
+    env_amount: 0
+    key_track: 0
+
+    # Instant envelopes
+    filter_attack_ms: 0
+    filter_decay_ms: 0
+    filter_sustain: 255
+    filter_release_ms: 0
+
+    amp_attack_ms: 1
+    amp_decay_ms: 0
+    amp_sustain: 255
+    amp_release_ms: 10
+
+    level: 128                   # ~50% amplitude
+
+  - name: pio_rp
+  - name: i2s_pio
+    data_pin: 28
+    clock_base: 26
+    sample_rate: 8000
+
+# Control wiring: button -> gesture -> bank -> sequencer
+# Audio wiring: sequencer -> synth -> i2s
+wiring:
+  # Control chain: button emits raw 0/1, gesture detects clicks and maps to commands
+  - from: button.raw
+    to: gesture.raw
+  - from: gesture.commands
+    to: bank.commands
+  - from: bank.stream
+    to: sequencer.control
+
+  # Audio chain
+  - from: sequencer.notes
+    to: synth.notes
+  - from: synth.audio
+    to: i2s_pio.audio
+
+# Button actions (via gesture mapping):
+#   Single click: Toggle play/pause
+#   Double click: Next preset (C Major -> C Minor -> Pentatonic -> Blues)
+#   Triple click: Previous preset

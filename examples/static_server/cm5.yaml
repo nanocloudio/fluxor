@@ -1,0 +1,44 @@
+# NVMe-backed HTTP file server on CM5 — unified FS_CONTRACT path.
+#
+# fat32 registers as the FS provider; http opens files by absolute
+# path via `provider_call(-1, FS_OPEN, …)` against the configured
+# `fs_path:` per route. No `fat32.files → http.file_data` channel
+# wiring, no IOCTL_NOTIFY(idx) selection.
+#
+# Rig setup (Linux, before boot):
+#   sudo mkfs.vfat -F 32 -s 8 -n FLUXORNV /dev/nvme0n1p1
+#   sudo mount /dev/nvme0n1p1 /mnt/nvme
+#   echo "<h1>Hello from NVMe FAT32</h1>" | sudo tee /mnt/nvme/INDEX.HTM
+#   echo "file 1 from fat32" | sudo tee /mnt/nvme/FILE1.TXT
+#   sudo umount /mnt/nvme
+#
+# Test:
+#   curl http://<DUT_IP>/         # → INDEX.HTM
+#   curl http://<DUT_IP>/file1    # → FILE1.TXT
+target: cm5
+tick_us: 100
+
+platform:
+  net: {}
+  storage: { media: nvme }
+  debug:
+    to: net
+    monitor: true
+
+modules:
+  - name: fat32
+  - name: http
+    port: 80
+    routes:
+      - path: "/"
+        fs_path: "/INDEX.HTM"
+        content_type: "text/html"
+      - path: "/file1"
+        fs_path: "/FILE1.TXT"
+        content_type: "text/plain"
+
+wiring:
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in

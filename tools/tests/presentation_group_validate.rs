@@ -355,7 +355,7 @@ modules:
 
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
 
 wiring:
   - from: asset.stream
@@ -411,7 +411,7 @@ modules:
 
   - name: asset
     type: host_asset_source
-    path: assets/test.jpg
+    path: examples/image_viewer/assets/test.jpg
 
   - name: synth
     type: synth
