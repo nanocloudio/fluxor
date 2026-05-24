@@ -31,6 +31,18 @@
 //! | 1   | use_dhcp | u8   | 1       | Enable DHCP (1=yes, 0=no) |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
+#![allow(
+    unsafe_code,
+    reason = "PIC module: ABI shim, zero-copy packet buffers, and MMIO-adjacent operations"
+)]
+// PIC library code must not panic; surface errors through the ABI.
+#![deny(clippy::unwrap_used)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
 
 use core::ffi::c_void;
 
@@ -41,19 +53,40 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod arp;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod dhcp;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod eth;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod icmp;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod ipv4;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod tcp;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod udp;
 
 // ============================================================================
@@ -293,7 +326,10 @@ unsafe fn log_info(s: &IpState, msg: &[u8]) {
     dev_log(sys, 3, msg.as_ptr(), msg.len());
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 unsafe fn log_error(s: &IpState, msg: &[u8]) {
     let sys = &*s.syscalls;
     dev_log(sys, 1, msg.as_ptr(), msg.len());
@@ -507,7 +543,7 @@ unsafe fn net_send_bound(s: &mut IpState, conn_id: u8, local_port: u16) {
 
 #[inline(always)]
 unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) {
-    net_send_short(s, NET_MSG_CONNECTED, conn_id);
+    let _ = net_send_short(s, NET_MSG_CONNECTED, conn_id);
 }
 
 /// Send a MSG_ERROR frame. Returns whether the frame was delivered
@@ -542,7 +578,10 @@ unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u8, from_seq: u32) {
 
 /// Emit a MSG_ACK frame. Payload: [conn_id:1][acked_seq:4 LE].
 #[inline(always)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 unsafe fn net_send_ack(s: &mut IpState, conn_id: u8, acked_seq: u32) {
     let mut frame = [0u8; 8];
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACK);
@@ -761,13 +800,27 @@ pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<IpState>()
 }
 
+/// PIC module ABI entry: one-time initialisation. The kernel calls this
+/// once during loader bring-up before any `module_new` invocation.
+///
+/// # Safety
+/// `_syscalls` is currently unused. The kernel guarantees ABI binding has
+/// completed before this call; no module-side state exists yet so there
+/// is nothing to invalidate.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
@@ -777,6 +830,10 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
+    // SAFETY: `state` / `syscalls` are kernel-owned buffers passed across the
+    // module ABI. We null-check both before deref, bounds-check `state_size`
+    // against `sizeof::<IpState>()`, and the kernel guarantees the buffer is
+    // zero-initialised by `alloc_state()`.
     unsafe {
         if syscalls.is_null() || state.is_null() {
             return -1;
@@ -833,6 +890,13 @@ pub extern "C" fn module_new(
     }
 }
 
+/// PIC module ABI entry: per-tick cooperative step. Reads channel events,
+/// advances TCP/IP state machines, drains pending output.
+///
+/// # Safety
+/// `state` must point to an initialised `IpState` (laid down by
+/// `module_new`). The kernel scheduler guarantees no concurrent step
+/// invocation, so the unique `&mut *` re-borrow is sound.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
@@ -911,7 +975,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     }
 
     // Diagnostic: periodic status (every ~5s at 1ms steps)
-    if s.step_count % 5000 == 0 {
+    if s.step_count.is_multiple_of(5000) {
         if !s.mac_valid {
             log_info(s, b"[ip] waiting for mac");
         } else {
@@ -957,7 +1021,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     service_net_channels(s);
 
     // 4. Periodic ARP maintenance
-    if s.step_count % 256 == 0 {
+    if s.step_count.is_multiple_of(256) {
         arp::age_entries(&mut s.arp_table);
     }
 
@@ -1002,9 +1066,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0
 }
 
+/// PIC module ABI entry: report per-port channel ring sizes to the loader.
+///
+/// # Safety
+/// `out` must be valid for writes of at least `max_len` bytes; the loader
+/// passes a buffer it owns and `write_channel_hints` re-checks the size
+/// against the hint table.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
+pub unsafe extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     // Channel ring sizes are the per-tick burst budget for the IP
     // pipeline. Default 2-4 KiB caps single-connection throughput
     // at ~1-2 MSS / step; gigabit-class workloads need 8-16 KiB so
@@ -1047,6 +1117,9 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
             buffer_size: net_ring,
         }, // out[1]: net messages to consumer
     ];
+    // SAFETY: `write_channel_hints` validates `max_len >= hints.len() *
+    // sizeof::<ChannelHint>()` and writes through `out` as plain bytes; the
+    // kernel passes a buffer it owns and has sized via the same struct.
     unsafe { write_channel_hints(out, max_len, &hints) }
 }
 
@@ -1099,7 +1172,7 @@ unsafe fn process_rx_frames(s: &mut IpState) {
             break;
         }
 
-        let r = (sys.channel_read)(s.in_chan, s.rx_frame.as_mut_ptr(), frame_len) as i32;
+        let r = (sys.channel_read)(s.in_chan, s.rx_frame.as_mut_ptr(), frame_len);
         if r <= 0 {
             break;
         }
@@ -1693,11 +1766,9 @@ unsafe fn process_tcp_segment(
             }
             update_rcv_wnd(s, conn_idx);
             send_tcp_control(s, conn_idx, tcp::ACK, false);
-            if action == ACTION_RX_DATA_FIN {
-                if !net_send_closed(s, conn_idx as u8) {
-                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
-                    conn.pending_close_notify = NOTIFY_CLOSED;
-                }
+            if action == ACTION_RX_DATA_FIN && !net_send_closed(s, conn_idx as u8) {
+                let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+                conn.pending_close_notify = NOTIFY_CLOSED;
             }
         }
         ACTION_COMPLETE_ACCEPT => {
@@ -2707,12 +2778,12 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 // retry path resumes once the precondition clears.
                 if plen >= 1 {
                     let conn_id = *buf.as_ptr() as usize;
-                    if conn_id < tcp::MAX_TCP_CONNS {
-                        if s.pending_cmd_valid != 0 || !process_cmd_close(s, conn_id) {
-                            s.pending_close_valid = 1;
-                            s.pending_close_conn = conn_id as u8;
-                            return;
-                        }
+                    if conn_id < tcp::MAX_TCP_CONNS
+                        && (s.pending_cmd_valid != 0 || !process_cmd_close(s, conn_id))
+                    {
+                        s.pending_close_valid = 1;
+                        s.pending_close_conn = conn_id as u8;
+                        return;
                     }
                 }
             }
@@ -2943,12 +3014,19 @@ pub mod test_helpers {
     }
 
     /// Inspect the local IP currently held by the IP stack.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
     pub unsafe fn local_ip(state: *const u8) -> u32 {
         (*(state as *const IpState)).local_ip
     }
 
     /// Borrow the connection table for assertion. Returns the slot
     /// count `(used, total)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`. The borrow lives
+    /// only for the call; tests run single-threaded so no aliasing.
     pub unsafe fn conn_count(state: *const u8) -> (usize, usize) {
         let s = &*(state as *const IpState);
         let mut used = 0;
@@ -2972,6 +3050,9 @@ pub mod test_helpers {
         pub step_count: u32,
     }
 
+    /// # Safety
+    /// `state` must point to an initialised `IpState`. Single-threaded
+    /// borrow as for `conn_count`.
     pub unsafe fn tlm_snapshot(state: *const u8) -> TlmSnapshot {
         let s = &*(state as *const IpState);
         TlmSnapshot {

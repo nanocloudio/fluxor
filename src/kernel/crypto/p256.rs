@@ -10,7 +10,10 @@
 //! immediates — harmless on kernel hosts, required on the PIC copy where
 //! ADRP-based literal pool loads miscompile.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 use sha2::{Digest, Sha256};
 
@@ -110,6 +113,9 @@ const ONE: U256 = [1, 0, 0, 0];
 #[inline(always)]
 fn pic_u64(lo: u32, hi: u32) -> u64 {
     let mut v = 0u64;
+    // SAFETY: `&mut v` cast to `*mut u32` yields a properly-aligned
+    // pointer (u64 is 8-byte aligned, so u32-aligned too); writes of
+    // 4 + 4 = 8 bytes fit inside the u64 stack local.
     unsafe {
         let p = &mut v as *mut u64 as *mut u32;
         core::ptr::write_volatile(p, lo);
@@ -538,6 +544,8 @@ fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     ]);
 
     let mut acc = [0u64; 8];
+    // SAFETY: both `t` and `acc` are `[u64; 8]`; 8 u64 elements = 64 bytes,
+    // identical layout, disjoint stack locations.
     unsafe {
         core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8);
     }
@@ -605,6 +613,8 @@ fn fn_inv(a: &U256) -> U256 {
 fn zeroize(buf: &mut [u8]) {
     let mut i = 0;
     while i < buf.len() {
+        // SAFETY: `i < buf.len()` (loop bound); volatile write keeps the
+        // store live even when the compiler proves the buffer is dead.
         unsafe {
             core::ptr::write_volatile(buf.as_mut_ptr().add(i), 0);
         }
@@ -617,6 +627,7 @@ fn zeroize(buf: &mut [u8]) {
 fn zeroize_u256(v: &mut U256) {
     let mut i = 0;
     while i < 4 {
+        // SAFETY: `i < 4 = U256::len()`; volatile write through fixed-size array.
         unsafe {
             core::ptr::write_volatile(v.as_mut_ptr().add(i), 0);
         }
@@ -880,6 +891,8 @@ fn u256_to_be(a: &U256) -> [u8; 32] {
     let b2 = a[2].to_be_bytes();
     let b1 = a[1].to_be_bytes();
     let b0 = a[0].to_be_bytes();
+    // SAFETY: four 8-byte copies into the four 8-byte sub-slices of `out`;
+    // disjoint sub-ranges totalling exactly 32 bytes.
     unsafe {
         core::ptr::copy_nonoverlapping(b3.as_ptr(), out.as_mut_ptr(), 8);
         core::ptr::copy_nonoverlapping(b2.as_ptr(), out.as_mut_ptr().add(8), 8);
@@ -946,11 +959,14 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     // Truncate/pad hash to 32 bytes
     let mut h1 = [0u8; 32];
     if hash.len() >= 32 {
+        // SAFETY: `hash.len() >= 32` (branch condition); `h1` is 32 bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr(), 32);
         }
     } else {
         let offset = 32 - hash.len();
+        // SAFETY: `offset + hash.len() = 32`; right-pad into the trailing
+        // bytes of `h1`.
         unsafe {
             core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr().add(offset), hash.len());
         }
@@ -964,10 +980,12 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 
     // Step d: K = HMAC(K, V || 0x00 || private_key || h1)
     let mut msg_d = [0u8; 32 + 1 + 32 + 32]; // V(32) + 0x00(1) + x(32) + h1(32) = 97
+                                             // SAFETY: V is 32 bytes, msg_d is 97 bytes; in-bounds.
     unsafe {
         core::ptr::copy_nonoverlapping(v.as_ptr(), msg_d.as_mut_ptr(), 32);
     }
     msg_d[32] = 0x00;
+    // SAFETY: 32+1+32 = 65 < 97; 65+32 = 97 = msg_d.len(); both copies in-bounds.
     unsafe {
         core::ptr::copy_nonoverlapping(private_key.as_ptr(), msg_d.as_mut_ptr().add(33), 32);
         core::ptr::copy_nonoverlapping(h1.as_ptr(), msg_d.as_mut_ptr().add(65), 32);
@@ -986,6 +1004,7 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     }
 
     // Step f: K = HMAC(K, V || 0x01 || private_key || h1)
+    // SAFETY: V is 32 bytes; msg_d[..32] in-bounds.
     unsafe {
         core::ptr::copy_nonoverlapping(v.as_ptr(), msg_d.as_mut_ptr(), 32);
     }
@@ -1023,6 +1042,7 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 
         // Retry: K = HMAC(K, V || 0x00), V = HMAC(K, V)
         let mut retry = [0u8; 33];
+        // SAFETY: V is 32 bytes; retry[..32] in-bounds.
         unsafe {
             core::ptr::copy_nonoverlapping(v.as_ptr(), retry.as_mut_ptr(), 32);
         }
@@ -1058,6 +1078,8 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
         u256_from_be(&hash[..32])
     } else {
         let mut buf = [0u8; 32];
+        // SAFETY: `hash.len() < 32` (else branch); right-pad into buf's
+        // trailing `hash.len()` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 hash.as_ptr(),
@@ -1088,6 +1110,8 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
     let mut sig = [0u8; 64];
     let rb = u256_to_be(&r);
     let sb = u256_to_be(&s);
+    // SAFETY: two 32-byte copies into the two 32-byte halves of `sig`;
+    // disjoint sub-ranges totalling exactly 64 bytes.
     unsafe {
         core::ptr::copy_nonoverlapping(rb.as_ptr(), sig.as_mut_ptr(), 32);
         core::ptr::copy_nonoverlapping(sb.as_ptr(), sig.as_mut_ptr().add(32), 32);
@@ -1130,6 +1154,8 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
         u256_from_be(&hash[..32])
     } else {
         let mut buf = [0u8; 32];
+        // SAFETY: `hash.len() < 32` (else branch); right-pad into buf's
+        // trailing `hash.len()` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 hash.as_ptr(),
@@ -1182,6 +1208,8 @@ fn copy_be_padded(src: &[u8], dst: &mut [u8]) {
         dst[i] = 0;
         i += 1;
     }
+    // SAFETY: `offset + effective.len() = dst.len()` by construction; copy
+    // into the trailing `effective.len()` bytes of `dst`.
     unsafe {
         core::ptr::copy_nonoverlapping(
             effective.as_ptr(),

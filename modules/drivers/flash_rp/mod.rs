@@ -25,6 +25,13 @@
 //!   - out[1]: Blob stream (IOCTL_NOTIFY indexed, 512B chunks, IOCTL_EOF)
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -537,8 +544,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Provider dispatch function — called by kernel when modules use
 /// PARAM_STORE/DELETE/CLEAR_ALL syscalls. The kernel prepends the caller's
 /// module_id to the arg buffer before forwarding here.
-#[no_mangle]
-#[link_section = ".text.module_flash_store_dispatch"]
 #[export_name = "module_flash_store_dispatch"]
 #[link_section = ".text.flash_store_dispatch"]
 pub unsafe extern "C" fn flash_store_dispatch(
@@ -680,7 +685,7 @@ unsafe fn erase_store(s: &mut FlashState, sys: &SyscallTable) -> i32 {
 
 /// Write sector header + first entry to a virgin sector.
 unsafe fn write_header_and_entry(
-    s: &mut FlashState, sys: &SyscallTable,
+    _s: &mut FlashState, sys: &SyscallTable,
     module_id: u8, tag: u8, flags: u8, value: *const u8, value_len: usize,
 ) -> i32 {
     let total = HEADER_SIZE + ENTRY_HEADER_SIZE + value_len;

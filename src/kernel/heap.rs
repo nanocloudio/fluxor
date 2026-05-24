@@ -192,6 +192,8 @@ impl ModuleHeap {
         // Initialize the arena as a single free block
         let hdr = base as *mut BlockHeader;
         let data_size = size - HEADER_SIZE;
+        // SAFETY: `base..base + size` is the caller-supplied arena (sized
+        // and aligned during `Heap::new`); `hdr` writes the first 8 bytes.
         unsafe {
             (*hdr).set_free(data_size, 0); // 0 = no next free block
         }
@@ -265,7 +267,10 @@ impl ModuleHeap {
                 break;
             }
 
+            // SAFETY: `cur_offset + HEADER_SIZE <= self.size` checked above;
+            // `hdr_ptr` lands at a chunk header inside the arena.
             let hdr_ptr = unsafe { self.base.add(cur_offset as usize) as *mut BlockHeader };
+            // SAFETY: as above; reads the 8-byte header.
             let hdr = unsafe { *hdr_ptr };
 
             if hdr.is_allocated() {
@@ -284,8 +289,13 @@ impl ModuleHeap {
                     // Split: create new free block after this allocation
                     let new_free_offset = cur_offset + HEADER_SIZE as u32 + aligned_size as u32;
                     let new_free_data = remainder - HEADER_SIZE;
+                    // SAFETY: `new_free_offset = cur_offset + HEADER_SIZE +
+                    // aligned_size` and the if-guard ensured the remainder
+                    // fits a header + MIN_ALLOC. Pointer is inside the arena.
                     let new_hdr_ptr =
                         unsafe { self.base.add(new_free_offset as usize) as *mut BlockHeader };
+                    // SAFETY: `hdr_ptr` and `new_hdr_ptr` are distinct
+                    // 8-byte headers in the arena, just established above.
                     unsafe {
                         (*new_hdr_ptr).set_free(new_free_data, next_free);
                         (*hdr_ptr).set_allocated(aligned_size);
@@ -295,14 +305,19 @@ impl ModuleHeap {
                     if prev_offset == u32::MAX {
                         self.first_free_offset = new_free_offset;
                     } else {
+                        // SAFETY: `prev_offset < self.size` (it was a valid
+                        // free-list cursor on a prior iteration).
                         let prev_hdr =
                             unsafe { self.base.add(prev_offset as usize) as *mut BlockHeader };
+                        // SAFETY: writes the `next_or_magic` field of the
+                        // previous header at a known location inside the arena.
                         unsafe {
                             (*prev_hdr).next_or_magic = new_free_offset;
                         }
                     }
                 } else {
                     // Use entire block (no split — remainder too small)
+                    // SAFETY: `hdr_ptr` is the chunk header we just selected.
                     unsafe {
                         (*hdr_ptr).set_allocated(block_data_size);
                     }
@@ -311,8 +326,11 @@ impl ModuleHeap {
                     if prev_offset == u32::MAX {
                         self.first_free_offset = next_free;
                     } else {
+                        // SAFETY: `prev_offset < self.size` (prior iteration cursor).
                         let prev_hdr =
                             unsafe { self.base.add(prev_offset as usize) as *mut BlockHeader };
+                        // SAFETY: writes the `next_or_magic` field of the
+                        // previous header at a known location inside the arena.
                         unsafe {
                             (*prev_hdr).next_or_magic = next_free;
                         }
@@ -320,6 +338,8 @@ impl ModuleHeap {
                 }
 
                 // Update stats
+                // SAFETY: `hdr_ptr` is the chunk header for the just-allocated
+                // block; reads the size field set by `set_allocated`.
                 let actual_size = unsafe { (*hdr_ptr).data_size() as u32 };
                 self.allocated += actual_size;
                 self.alloc_count += 1;
@@ -328,6 +348,9 @@ impl ModuleHeap {
                     self.high_water = self.allocated;
                 }
 
+                // SAFETY: `cur_offset + HEADER_SIZE + actual_size <= self.size`
+                // because `aligned_size <= block_data_size` and the block
+                // fully lives inside the arena.
                 let data_ptr = unsafe { self.base.add(cur_offset as usize + HEADER_SIZE) };
                 // Trailing canary at the last 4 bytes of the chunk's
                 // data region. Detection is at the chunk boundary,
@@ -339,6 +362,9 @@ impl ModuleHeap {
                 // sentinel catches writes into the next chunk.
                 if self.canary_enabled {
                     let canary_off = actual_size as usize - HEAP_CANARY_SIZE;
+                    // SAFETY: `actual_size >= aligned_size >= HEAP_CANARY_SIZE`
+                    // (canary cost is rolled into `aligned_size`); writes
+                    // 4 bytes inside the just-allocated chunk.
                     unsafe {
                         core::ptr::write_unaligned(
                             data_ptr.add(canary_off) as *mut u32,
@@ -385,15 +411,18 @@ impl ModuleHeap {
         let hdr_addr = ptr_addr - HEADER_SIZE;
         let offset = (hdr_addr - base_addr) as u32;
         let hdr_ptr = hdr_addr as *mut BlockHeader;
+        // SAFETY: `ptr_addr - HEADER_SIZE >= base_addr` (caller passed an
+        // arena-allocated pointer ≥ base + HEADER_SIZE). The 8-byte header
+        // is inside the arena.
         let hdr = unsafe { *hdr_ptr };
 
         if !hdr.is_allocated() {
-            log::error!("[heap] free: double free at offset {}", offset);
+            log::error!("[heap] free: double free at offset {offset}");
             return;
         }
 
         if hdr.next_or_magic != ALLOC_MAGIC {
-            log::error!("[heap] free: corrupted header at offset {}", offset);
+            log::error!("[heap] free: corrupted header at offset {offset}");
             return;
         }
 
@@ -406,14 +435,13 @@ impl ModuleHeap {
         // recovery one).
         if self.canary_enabled && freed_size >= HEAP_CANARY_SIZE {
             let canary_off = freed_size - HEAP_CANARY_SIZE;
-            let read =
-                unsafe { core::ptr::read_unaligned(ptr.add(canary_off) as *const u32) };
+            // SAFETY: `canary_off + 4 = freed_size`; canary lives in the
+            // last 4 bytes of the chunk.
+            let read = unsafe { core::ptr::read_unaligned(ptr.add(canary_off) as *const u32) };
             if read != HEAP_CANARY {
                 log::error!(
-                    "[heap] HEAP CANARY CLOBBERED at offset {} (chunk size {}) — \
+                    "[heap] HEAP CANARY CLOBBERED at offset {offset} (chunk size {freed_size}) — \
                      module overran its allocation",
-                    offset,
-                    freed_size,
                 );
             }
         }
@@ -423,6 +451,8 @@ impl ModuleHeap {
         // subsequent allocator walk (immediate coalesce, realloc
         // returning this chunk) can't observe the stale bytes.
         if self.zero_on_free && freed_size > 0 {
+            // SAFETY: `ptr` is the just-freed chunk's data region;
+            // `freed_size` is the chunk header's stored size.
             unsafe {
                 core::ptr::write_bytes(ptr, 0, freed_size);
             }
@@ -457,6 +487,8 @@ impl ModuleHeap {
         }
 
         let hdr_ptr = (ptr_addr - HEADER_SIZE) as *mut BlockHeader;
+        // SAFETY: `ptr_addr - HEADER_SIZE >= base_addr` (checked above);
+        // the 8-byte header lies inside the arena.
         let hdr = unsafe { *hdr_ptr };
 
         if !hdr.is_allocated() {
@@ -496,6 +528,8 @@ impl ModuleHeap {
         // Try to extend in place by checking if next block is free and adjacent
         let next_block_offset = (ptr_addr - base_addr + old_size) as u32;
         if (next_block_offset as usize) + HEADER_SIZE <= self.size as usize {
+            // SAFETY: `next_block_offset + HEADER_SIZE <= self.size`
+            // checked above; reads the adjacent chunk's header.
             let next_hdr =
                 unsafe { *(self.base.add(next_block_offset as usize) as *const BlockHeader) };
             if !next_hdr.is_allocated() {
@@ -507,13 +541,18 @@ impl ModuleHeap {
                     let remainder = combined - aligned_new;
                     let final_size = if remainder >= HEADER_SIZE + MIN_ALLOC {
                         // Split: resize current, create new free block
+                        // SAFETY: `hdr_ptr` is the chunk we're resizing.
                         unsafe {
                             (*hdr_ptr).set_allocated(aligned_new);
                         }
                         let new_free_off = (ptr_addr - base_addr + aligned_new) as u32;
                         let new_free_size = remainder - HEADER_SIZE;
+                        // SAFETY: `new_free_off + HEADER_SIZE <=
+                        // next_block_offset + HEADER_SIZE + next.data_size()
+                        // <= self.size`.
                         let new_free_hdr =
                             unsafe { self.base.add(new_free_off as usize) as *mut BlockHeader };
+                        // SAFETY: `new_free_hdr` is the just-placed header.
                         unsafe {
                             (*new_free_hdr).set_free(new_free_size, 0);
                         }
@@ -522,6 +561,7 @@ impl ModuleHeap {
                         aligned_new
                     } else {
                         // Use all combined space
+                        // SAFETY: `hdr_ptr` is the chunk we're resizing.
                         unsafe {
                             (*hdr_ptr).set_allocated(combined);
                         }
@@ -536,6 +576,8 @@ impl ModuleHeap {
                     // must move with it.
                     if self.canary_enabled && final_size >= HEAP_CANARY_SIZE {
                         let canary_off = final_size - HEAP_CANARY_SIZE;
+                        // SAFETY: `canary_off + 4 = final_size`; writes
+                        // canary in the last 4 bytes of the resized chunk.
                         unsafe {
                             core::ptr::write_unaligned(
                                 ptr.add(canary_off) as *mut u32,
@@ -564,6 +606,9 @@ impl ModuleHeap {
             old_size
         };
         let copy_size = user_old.min(new_size);
+        // SAFETY: `copy_size <= user_old <= old_size` (user region of old
+        // chunk) and `copy_size <= new_size <= aligned_new` (data region
+        // of new chunk); src/dst are disjoint allocations.
         unsafe {
             core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
         }
@@ -584,6 +629,7 @@ impl ModuleHeap {
         let mut offset = self.first_free_offset;
         let mut iterations = 0u32;
         while (offset as usize) + HEADER_SIZE <= self.size as usize && iterations < 1000 {
+            // SAFETY: `offset + HEADER_SIZE <= self.size` (loop bound).
             let hdr = unsafe { *(self.base.add(offset as usize) as *const BlockHeader) };
             if hdr.is_allocated() {
                 break; // corrupted
@@ -619,6 +665,8 @@ impl ModuleHeap {
 
     /// Remove a free block at `offset` from the free list.
     fn remove_from_free_list(&mut self, offset: u32) {
+        // SAFETY: caller passes an offset that was previously inserted
+        // into the free list (so `offset + HEADER_SIZE <= self.size`).
         let target_hdr = unsafe { *(self.base.add(offset as usize) as *const BlockHeader) };
         let target_next = target_hdr.next_or_magic;
 
@@ -630,6 +678,7 @@ impl ModuleHeap {
         let mut prev = self.first_free_offset;
         let mut iterations = 0u32;
         while (prev as usize) + HEADER_SIZE <= self.size as usize && iterations < 1000 {
+            // SAFETY: `prev + HEADER_SIZE <= self.size` (loop bound).
             let hdr = unsafe { &mut *(self.base.add(prev as usize) as *mut BlockHeader) };
             if hdr.next_or_magic == offset {
                 hdr.next_or_magic = target_next;
@@ -646,6 +695,8 @@ impl ModuleHeap {
     /// Insert a freed block at `offset` into the free list in address order,
     /// then coalesce with adjacent free blocks.
     fn insert_free_and_coalesce(&mut self, offset: u32, data_size: usize) {
+        // SAFETY: caller passes a valid offset from `free()` so
+        // `offset + HEADER_SIZE <= self.size`.
         let hdr_ptr = unsafe { self.base.add(offset as usize) as *mut BlockHeader };
 
         // Find insertion point: the free block just before this offset
@@ -656,6 +707,7 @@ impl ModuleHeap {
             } else {
                 0
             };
+            // SAFETY: `hdr_ptr` is the newly-freed chunk's header.
             unsafe {
                 (*hdr_ptr).set_free(data_size, old_first);
             }
@@ -668,10 +720,12 @@ impl ModuleHeap {
                 if iterations >= 1000 {
                     break;
                 }
+                // SAFETY: free-list cursor; previously validated offset.
                 let prev_hdr = unsafe { &mut *(self.base.add(prev as usize) as *mut BlockHeader) };
                 let next = prev_hdr.next_or_magic;
                 if next == 0 || next > offset {
                     // Insert between prev and next
+                    // SAFETY: `hdr_ptr` is the newly-freed chunk's header.
                     unsafe {
                         (*hdr_ptr).set_free(data_size, next);
                     }
@@ -684,10 +738,13 @@ impl ModuleHeap {
         }
 
         // Coalesce forward: merge with next block if adjacent
+        // SAFETY: `hdr_ptr` is the just-inserted free chunk's header.
         let hdr = unsafe { &mut *hdr_ptr };
         let end_of_this = offset as usize + HEADER_SIZE + hdr.data_size();
         let next_off = hdr.next_or_magic;
         if next_off != 0 && end_of_this == next_off as usize {
+            // SAFETY: `next_off` is a free-list cursor; `next_off + HEADER_SIZE
+            // <= self.size` (was inserted by the same allocator path).
             let next_hdr = unsafe { *(self.base.add(next_off as usize) as *const BlockHeader) };
             if !next_hdr.is_allocated() {
                 let merged_size = hdr.data_size() + HEADER_SIZE + next_hdr.data_size();
@@ -700,11 +757,13 @@ impl ModuleHeap {
             let mut scan = self.first_free_offset;
             let mut iterations = 0u32;
             while (scan as usize) + HEADER_SIZE <= self.size as usize && iterations < 1000 {
+                // SAFETY: `scan + HEADER_SIZE <= self.size` (loop bound).
                 let scan_hdr = unsafe { &mut *(self.base.add(scan as usize) as *mut BlockHeader) };
                 if scan_hdr.next_or_magic == offset {
                     let end_of_prev = scan as usize + HEADER_SIZE + scan_hdr.data_size();
                     if end_of_prev == offset as usize {
                         // Adjacent — merge
+                        // SAFETY: `offset + HEADER_SIZE <= self.size` (caller).
                         let cur_hdr =
                             unsafe { *(self.base.add(offset as usize) as *const BlockHeader) };
                         let merged_size = scan_hdr.data_size() + HEADER_SIZE + cur_hdr.data_size();
@@ -728,6 +787,7 @@ impl ModuleHeap {
         if (offset as usize) + HEADER_SIZE > self.size as usize {
             return false;
         }
+        // SAFETY: `offset + HEADER_SIZE <= self.size` (checked above).
         let hdr = unsafe { *(self.base.add(offset as usize) as *const BlockHeader) };
         !hdr.is_allocated()
     }
@@ -746,15 +806,13 @@ pub fn init_module_heap(module_idx: usize, arena_ptr: *mut u8, arena_size: usize
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: per-module heap; each module steps on a single core (see file
+    // header), so concurrent access is precluded. `module_idx` bounded.
     unsafe {
         MODULE_HEAPS[module_idx] = ModuleHeap::init(arena_ptr, arena_size);
     }
     if arena_size > 0 {
-        log::debug!(
-            "[heap] module {} heap init {} bytes",
-            module_idx,
-            arena_size
-        );
+        log::debug!("[heap] module {module_idx} heap init {arena_size} bytes");
     }
 }
 
@@ -763,6 +821,7 @@ pub fn reset_module_heap(module_idx: usize) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: as above; reconfigure runs between graph rebuilds.
     unsafe {
         MODULE_HEAPS[module_idx] = ModuleHeap::empty();
     }
@@ -770,6 +829,7 @@ pub fn reset_module_heap(module_idx: usize) {
 
 /// Reset all module heaps.
 pub fn reset_all() {
+    // SAFETY: scheduler-side reset; no module is stepping when this runs.
     unsafe {
         let heaps = &raw mut MODULE_HEAPS;
         for slot in (*heaps).iter_mut() {
@@ -787,8 +847,10 @@ pub fn heap_alloc(module_idx: usize, size: usize) -> *mut u8 {
     if module_idx >= MAX_MODULES {
         return core::ptr::null_mut();
     }
+    // SAFETY: per-module heap owned by the calling module's core.
     let ptr = unsafe { MODULE_HEAPS[module_idx].alloc(size) };
     if ptr.is_null() {
+        // SAFETY: as above.
         let fault_policy_enabled = unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure };
         if fault_policy_enabled {
             crate::kernel::scheduler::raise_module_fault(
@@ -805,6 +867,7 @@ pub fn heap_free(module_idx: usize, ptr: *mut u8) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: per-module heap; `module_idx` bounded.
     unsafe { MODULE_HEAPS[module_idx].free(ptr) }
 }
 
@@ -821,8 +884,10 @@ pub fn heap_realloc(module_idx: usize, ptr: *mut u8, new_size: usize) -> *mut u8
     if module_idx >= MAX_MODULES {
         return core::ptr::null_mut();
     }
+    // SAFETY: per-module heap.
     let new_ptr = unsafe { MODULE_HEAPS[module_idx].realloc(ptr, new_size) };
     if new_ptr.is_null() && new_size > 0 {
+        // SAFETY: as above.
         let fault_policy_enabled = unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure };
         if fault_policy_enabled {
             crate::kernel::scheduler::raise_module_fault(
@@ -839,6 +904,7 @@ pub fn heap_stats(module_idx: usize) -> HeapStats {
     if module_idx >= MAX_MODULES {
         return HeapStats::default();
     }
+    // SAFETY: per-module heap.
     unsafe { MODULE_HEAPS[module_idx].stats() }
 }
 
@@ -847,6 +913,7 @@ pub fn has_heap(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: per-module heap; read-only.
     unsafe { MODULE_HEAPS[module_idx].is_active() }
 }
 
@@ -859,6 +926,7 @@ pub fn set_zero_on_free(module_idx: usize, enabled: bool) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: per-module heap; configured during instantiation.
     unsafe {
         MODULE_HEAPS[module_idx].zero_on_free = enabled;
     }
@@ -869,6 +937,7 @@ pub fn zero_on_free_enabled(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: per-module heap; read-only.
     unsafe { MODULE_HEAPS[module_idx].zero_on_free }
 }
 
@@ -882,6 +951,7 @@ pub fn set_fault_on_alloc_failure(module_idx: usize, enabled: bool) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: per-module heap; configured during instantiation.
     unsafe {
         MODULE_HEAPS[module_idx].fault_on_alloc_failure = enabled;
     }
@@ -892,6 +962,7 @@ pub fn fault_on_alloc_failure_enabled(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: per-module heap; read-only.
     unsafe { MODULE_HEAPS[module_idx].fault_on_alloc_failure }
 }
 
@@ -904,6 +975,7 @@ pub fn set_canary_enabled(module_idx: usize, enabled: bool) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: per-module heap; configured during instantiation.
     unsafe {
         MODULE_HEAPS[module_idx].canary_enabled = enabled;
     }
@@ -914,5 +986,6 @@ pub fn canary_enabled(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: per-module heap; read-only.
     unsafe { MODULE_HEAPS[module_idx].canary_enabled }
 }

@@ -139,8 +139,7 @@ pub fn validate_artifact_class(s: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Config(format!(
-            "rig artifact '{s}' is not a known class (valid: {:?})",
-            ARTIFACT_CLASSES
+            "rig artifact '{s}' is not a known class (valid: {ARTIFACT_CLASSES:?})"
         )))
     }
 }

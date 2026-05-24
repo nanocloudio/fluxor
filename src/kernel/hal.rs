@@ -108,6 +108,8 @@ static mut HAL_OPS: Option<&'static HalOps> = None;
 /// # Safety
 /// Must be called exactly once before any kernel code runs.
 pub fn init(ops: &'static HalOps) {
+    // SAFETY: `init` is documented as call-once before any kernel code
+    // runs; at that point no other thread observes `HAL_OPS`.
     unsafe {
         HAL_OPS = Some(ops);
     }
@@ -119,6 +121,8 @@ pub fn init(ops: &'static HalOps) {
 /// refactor fails loudly instead of trapping as undefined behaviour.
 #[inline(always)]
 fn ops() -> &'static HalOps {
+    // SAFETY: `HAL_OPS` is set once at boot by `init`; the panic-on-None
+    // branch catches the boot-ordering bug if a caller jumps the gun.
     unsafe {
         match HAL_OPS {
             Some(ops) => ops,
@@ -248,6 +252,8 @@ pub fn pic_barrier() {
 /// plus a compiler fence against reordering.
 #[inline(always)]
 pub fn dma_kick_barrier() {
+    // SAFETY: DSB is a system-control hint; no register or memory
+    // side-effects beyond the architectural ordering barrier.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));

@@ -34,6 +34,13 @@
 //! | 5   | pwr_pin | u8   | 23      | Power control pin     |
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -44,11 +51,11 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 mod constants;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 mod gspi;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 mod wifi_ops;
 
 use constants::*;
@@ -2428,7 +2435,7 @@ unsafe fn emit_scan_result_binary(
     ssid_len: usize,
     channel: u16,
     rssi: i16,
-    chanspec: u16,
+    _chanspec: u16,
 ) {
     if s.scan_bin_chan < 0 {
         return;
@@ -2603,7 +2610,7 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                     | (*st.add(3) as u32);
                 // Parse reason code (at offset +12 after preamble: version(2)+flags(2)+event_type(4)+status(4))
                 let rp = evt.add(EVT_MSG_PREAMBLE + 12);
-                let reason = ((*rp as u32) << 24)
+                let _reason = ((*rp as u32) << 24)
                     | ((*rp.add(1) as u32) << 16)
                     | ((*rp.add(2) as u32) << 8)
                     | (*rp.add(3) as u32);

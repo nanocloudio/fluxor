@@ -71,25 +71,23 @@ fn parse_hex(s: &str) -> u32 {
     let t = s
         .strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or_else(|| panic!("expected hex string starting with 0x, got {:?}", s));
-    u32::from_str_radix(t, 16)
-        .unwrap_or_else(|e| panic!("bad hex {:?}: {}", s, e))
+        .unwrap_or_else(|| panic!("expected hex string starting with 0x, got {s:?}"));
+    u32::from_str_radix(t, 16).unwrap_or_else(|e| panic!("bad hex {s:?}: {e}"))
 }
 
 fn load_silicon(rel: &str) -> SiliconToml {
     let path = workspace_root().join(rel);
     let content =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-    toml::from_str(&content)
-        .unwrap_or_else(|e| panic!("parse {}: {}", path.display(), e))
+    toml::from_str(&content).unwrap_or_else(|e| panic!("parse {}: {}", path.display(), e))
 }
 
 fn verify_kernel(k: &KernelSection, file: &str) {
     // Hex pointers parse as u32 and are non-zero.
     let wctrl = parse_hex(&k.watchdog_ctrl);
     let boot2 = parse_hex(&k.boot2_src);
-    assert_ne!(wctrl, 0, "{}: watchdog_ctrl must not be 0", file);
-    assert_ne!(boot2, 0, "{}: boot2_src must not be 0", file);
+    assert_ne!(wctrl, 0, "{file}: watchdog_ctrl must not be 0");
+    assert_ne!(boot2, 0, "{file}: boot2_src must not be 0");
 
     // KB-sized fields are non-zero and within sane bounds.
     // Floor: 4 KB (smallest plausible) so a TOML with `state_arena_kb = 0`
@@ -105,20 +103,15 @@ fn verify_kernel(k: &KernelSection, file: &str) {
     for (name, kb) in kb_fields {
         assert!(
             (4..=4096).contains(&kb),
-            "{}: {} = {} kb out of expected [4, 4096] range",
-            file,
-            name,
-            kb
+            "{file}: {name} = {kb} kb out of expected [4, 4096] range"
         );
         // Byte-multiplication does not overflow on a 32-bit usize host.
         let bytes = (kb as usize).checked_mul(1024).unwrap_or_else(|| {
-            panic!("{}: {} = {} kb overflows usize when multiplied by 1024", file, name, kb)
+            panic!("{file}: {name} = {kb} kb overflows usize when multiplied by 1024")
         });
         assert!(
             bytes > 0,
-            "{}: {} byte size computed to 0 (overflow guard)",
-            file,
-            name
+            "{file}: {name} byte size computed to 0 (overflow guard)"
         );
     }
 

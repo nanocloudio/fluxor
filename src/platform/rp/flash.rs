@@ -69,6 +69,9 @@ pub mod store {
 
     /// Register the flash module's dispatch function. Called via FLASH_STORE_ENABLE.
     pub fn register_dispatch(dispatch: FlashStoreDispatchFn, state: *mut u8) -> i32 {
+        // SAFETY: STORE_DISPATCH / STORE_STATE are set once during
+        // FLASH_STORE_ENABLE on the scheduler thread; EBUSY guard prevents
+        // double registration.
         unsafe {
             let p = &raw const STORE_DISPATCH;
             if (*p).is_some() {
@@ -83,6 +86,9 @@ pub mod store {
     /// Forward a param operation to the flash module's dispatch function.
     /// Returns ENOSYS if no flash module is registered.
     pub fn dispatch_param_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+        // SAFETY: STORE_DISPATCH is set once at boot; the registered dispatch
+        // function is the flash module's own export. We forward the caller's
+        // arg/arg_len; dispatch contract validates them.
         unsafe {
             match STORE_DISPATCH {
                 Some(dispatch) => dispatch(STORE_STATE, opcode, arg, arg_len),
@@ -133,6 +139,10 @@ pub mod store {
     /// Reads via XIP (no flash write needed). Copies active override values
     /// into OVERRIDE_ARENA so they remain valid if flash is later modified.
     pub fn boot_scan() {
+        // SAFETY: called once at boot before any module reads the override
+        // table; OVERRIDE_ARENA / BOOT_OVERRIDES / FREE_OFFSET are owned by
+        // this thread until boot_scan returns. STORE_XIP reads from the
+        // XIP-mapped flash region.
         unsafe {
             OVERRIDE_ARENA_OFFSET = 0;
             BOOT_OVERRIDES = OverrideTable::empty();
@@ -151,7 +161,7 @@ pub mod store {
 
             let version = *STORE_XIP.add(4);
             if version != flash_layout::PARAM_STORE_VERSION {
-                log::warn!("[flash_store] unknown version {}", version);
+                log::warn!("[flash_store] unknown version {version}");
                 return;
             }
 
@@ -172,7 +182,7 @@ pub mod store {
                 let value_len = *sector.add(off + 3) as usize;
 
                 if off + ENTRY_HEADER_SIZE + value_len > SECTOR_SIZE {
-                    log::warn!("[flash_store] truncated entry at offset {}", off);
+                    log::warn!("[flash_store] truncated entry at offset {off}");
                     break;
                 }
 
@@ -443,6 +453,8 @@ pub mod store {
         if !is_writable_sector(offset, SECTOR_SIZE as u32) {
             return crate::kernel::errno::EINVAL;
         }
+        // SAFETY: offset alignment + writable-region check above; with_flash_op
+        // disables IRQs and detaches XIP across the ROM-bootloader call.
         unsafe {
             match with_flash_op(|| flash_erase_sector(offset)) {
                 Ok(()) => 0,
@@ -457,6 +469,10 @@ pub mod store {
         if !is_writable_sector(offset, PAGE_SIZE as u32) {
             return crate::kernel::errno::EINVAL;
         }
+        // SAFETY: writable-region check above; with_flash_op disables IRQs
+        // and detaches XIP. Caller must ensure `data` points to a readable
+        // PAGE_SIZE buffer (raw_program is itself a syscall surface that
+        // already validates `data`).
         unsafe {
             match with_flash_op(|| flash_program_page(offset, data)) {
                 Ok(()) => 0,
@@ -739,6 +755,9 @@ pub mod xip_lock {
             // Wait for any XIP streaming to complete
             while pac::XIP_CTRL.stream_ctr().read().0 > 0 {}
 
+            // SAFETY: called inside interrupt-free, IO-quiesced critical
+            // section; the RAM-resident routine briefly detaches flash to
+            // read the QSPI SS pad.
             let (_status, sio) = unsafe { read_bootsel_io_qspi() };
             sio_hi_sample = sio;
         });

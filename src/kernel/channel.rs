@@ -207,6 +207,11 @@ struct ChannelSlot {
     ioctl_owner: AtomicU8,
 }
 
+// SAFETY: `ChannelSlot` interior is split between the atomics
+// (`state`, `lock`, `buffer_slot`, etc., all `Sync`) and the
+// `UnsafeCell<FifoState>` guarded by the spin-lock in `with_lock`.
+// Every mutation of `fifo` happens under that lock, so cross-thread
+// access is sequenced.
 unsafe impl Sync for ChannelSlot {}
 
 impl ChannelSlot {
@@ -251,6 +256,9 @@ impl ChannelSlot {
             self.chan_type.store(CHANNEL_TYPE_PIPE, Ordering::Release);
             self.sticky_events.store(0, Ordering::Release);
             // Initialize FIFO with the allocated capacity
+            // SAFETY: `self.fifo` is an `UnsafeCell<FifoState>` owned by
+            // this slot; the slot's `state` transition above means no
+            // other reader/writer holds a reference yet.
             unsafe {
                 (*self.fifo.get()).init(buf_capacity);
             }
@@ -278,6 +286,8 @@ impl ChannelSlot {
         self.ioctl_owner.store(u8::MAX, Ordering::Release);
         self.ioctl_state
             .store(core::ptr::null_mut(), Ordering::Release);
+        // SAFETY: `reset()` runs under the slot's free-transition; no
+        // active references to `self.fifo` are live at this point.
         unsafe {
             *self.fifo.get() = FifoState::new();
         }
@@ -309,6 +319,8 @@ impl ChannelSlot {
         {
             spins += 1;
             if spins > 256 {
+                // SAFETY: aarch64 `YIELD` is a hint, side-effect-free,
+                // safe to issue from any privilege level.
                 #[cfg(target_arch = "aarch64")]
                 unsafe {
                     core::arch::asm!("yield", options(nomem, nostack));
@@ -318,10 +330,15 @@ impl ChannelSlot {
             core::hint::spin_loop();
         }
         let buf_ptr = self.get_buffer_ptr();
+        // SAFETY: the spin-lock above gives this thread exclusive access
+        // to `self.fifo` for the duration of `f`.
         let fifo = unsafe { &mut *self.fifo.get() };
         let storage = if buf_ptr.is_null() {
             None
         } else {
+            // SAFETY: `buf_ptr` was obtained from `buffer_pool::get_streaming_ptr`
+            // for the slot pinned in `self.buffer_slot`; the lock ensures the
+            // slot can't be released while this slice is live.
             Some(unsafe { core::slice::from_raw_parts_mut(buf_ptr, fifo.capacity()) })
         };
         let result = f(fifo, storage);
@@ -364,10 +381,7 @@ pub fn channel_open_for_module(
     if caller < crate::kernel::config::MAX_MODULES
         && crate::kernel::scheduler::module_is_isr_tier(caller)
     {
-        debug!(
-            "channel_open: rejected — module {} is in an ISR-tier domain",
-            caller
-        );
+        debug!("channel_open: rejected — module {caller} is in an ISR-tier domain");
         return crate::kernel::errno::EACCES;
     }
     // The v1 channel-open request shape is exactly:
@@ -394,6 +408,8 @@ pub fn channel_open_for_module(
         if config_len != 4 {
             return CHAN_EINVAL;
         }
+        // SAFETY: caller passed `config_len == 4`, so `config[0..4]` is
+        // a valid 4-byte read.
         let size = unsafe {
             u32::from_le_bytes([*config, *config.add(1), *config.add(2), *config.add(3)]) as usize
         };
@@ -410,10 +426,7 @@ pub fn channel_open_for_module(
         if slot.try_allocate(idx, buf_capacity, producer_module) {
             slot.state
                 .store(ChannelState::Connected as u8, Ordering::Release);
-            debug!(
-                "channel_open: allocated channel {} buf_size={}",
-                idx, buf_capacity
-            );
+            debug!("channel_open: allocated channel {idx} buf_size={buf_capacity}");
             return idx as i32;
         }
     }
@@ -564,7 +577,7 @@ pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
         let copy_len = mbox_len as usize;
         core::ptr::copy_nonoverlapping(mbox_ptr, buf, copy_len);
         buffer_pool::mailbox_release_read(buf_slot);
-        trace!("chan_read h={} mailbox copy_len={}", handle, copy_len);
+        trace!("chan_read h={handle} mailbox copy_len={copy_len}");
         return copy_len as i32;
     }
     let out = core::slice::from_raw_parts_mut(buf, len);
@@ -672,7 +685,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
         }
         core::ptr::copy_nonoverlapping(data, mbox_ptr, len);
         buffer_pool::mailbox_release_write(buf_slot, len as u32);
-        trace!("chan_write h={} mailbox len={}", handle, len);
+        trace!("chan_write h={handle} mailbox len={len}");
         return len as i32;
     }
     let input = core::slice::from_raw_parts(data, len);
@@ -742,12 +755,7 @@ pub fn channel_poll(handle: i32, events: u32) -> i32 {
     if (events & POLL_ERR) != 0 && (persistent & POLL_ERR) != 0 {
         ready |= POLL_ERR;
     }
-    trace!(
-        "chan_poll h={} events=0x{:02x} ready=0x{:02x}",
-        handle,
-        events,
-        ready
-    );
+    trace!("chan_poll h={handle} events=0x{events:02x} ready=0x{ready:02x}");
     ready as i32
 }
 
@@ -770,9 +778,11 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             if arg.is_null() {
                 return CHAN_EINVAL;
             }
+            // SAFETY: NOTIFY contract: `arg` is a `*const u32` from the
+            // caller; non-null checked above.
             let val = unsafe { *(arg as *const u32) };
             slot.aux_u32.store(val, Ordering::Release);
-            debug!("chan_ioctl h={} NOTIFY val={}", handle, val);
+            debug!("chan_ioctl h={handle} NOTIFY val={val}");
             CHAN_OK
         }
         IOCTL_POLL_NOTIFY => {
@@ -784,10 +794,12 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             if val == NO_AUX_PENDING {
                 CHAN_EAGAIN
             } else {
+                // SAFETY: POLL_NOTIFY contract: `arg` is a `*mut u32`
+                // from the caller; non-null checked above.
                 unsafe {
                     *(arg as *mut u32) = val;
                 }
-                debug!("chan_ioctl h={} POLL_NOTIFY val={}", handle, val);
+                debug!("chan_ioctl h={handle} POLL_NOTIFY val={val}");
                 CHAN_OK
             }
         }
@@ -808,13 +820,13 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             slot.hup_flag.store(false, Ordering::Release);
             slot.sticky_events.store(0, Ordering::Release);
             slot.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
-            debug!("chan_ioctl h={} FLUSH", handle);
+            debug!("chan_ioctl h={handle} FLUSH");
             CHAN_OK
         }
         IOCTL_SET_HUP => {
             // Set HUP flag (producer signals completion / end-of-stream)
             slot.hup_flag.store(true, Ordering::Release);
-            debug!("chan_ioctl h={} SET_HUP", handle);
+            debug!("chan_ioctl h={handle} SET_HUP");
             CHAN_OK
         }
         _ => {
@@ -827,7 +839,14 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
                 return CHAN_ENOSYS;
             }
             let state = slot.ioctl_state.load(Ordering::Acquire);
+            // SAFETY: `ioctl_handler` is set by `channel_register_ioctl_handler`
+            // from a `ChannelIoctlHandler` fn-pointer via the same transmute;
+            // the registration / unregister handshake guarantees the pointer
+            // is either null (checked above) or points at a live handler.
             let handler: ChannelIoctlHandler = unsafe { core::mem::transmute(h) };
+            // SAFETY: `handler` is the registered ABI function; `state` is
+            // the handler's own opaque pointer paired with `h` at register
+            // time.
             unsafe { handler(state as *mut c_void, cmd, arg) }
         }
     }
@@ -907,7 +926,7 @@ pub fn channel_set_mailbox(handle: i32) {
         return;
     }
     CHANNELS[idx].mailbox.store(true, Ordering::Release);
-    debug!("channel_set_mailbox: ch {} enabled", handle);
+    debug!("channel_set_mailbox: ch {handle} enabled");
 }
 
 /// Return readable bytes in channel's ring buffer (0 for invalid/mailbox/empty).

@@ -36,8 +36,19 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"  # deprecated but functional; consider serde_yml for future
 sha2 = "0.11.0"
+# `proc-macro2` is a transitive dep of syn; pulling it in directly lets
+# us enable the `span-locations` feature so `Span::start()` yields
+# stable line numbers (otherwise the API is nightly-only).
+proc-macro2 = { version = "1", features = ["span-locations"] }
+# `full` enables the items/attrs/tokens needed by the hygiene scanner;
+# `extra-traits` exposes Debug/Eq for tests asserting on parsed nodes.
+syn = { version = "2.0", features = ["full", "extra-traits", "parsing", "visit"] }
 thiserror = "2.0.18"
 toml = "1.1.2"
+# Recursive directory walk for the hygiene scanner. The std-only path
+# (`fs::read_dir` recursion) reimplements its filter/skip logic; this
+# keeps the scanner focused on AST work.
+walkdir = "2.5"
 
 [dev-dependencies]
 # Used by test-side `#[cfg(test)]` helpers to construct auto-cleaning
@@ -47,3 +58,10 @@ toml = "1.1.2"
 # deliberately — those paths are part of the contract with downstream
 # tooling.
 tempfile = "3"
+
+# Inherit the workspace lint configuration. The tools CLI and
+# telemetry monitor are user-facing binaries that print to stdout,
+# so they relax `clippy::print_stdout` / `clippy::print_stderr` at
+# the crate root in `lib.rs` / `main.rs`.
+[lints]
+workspace = true

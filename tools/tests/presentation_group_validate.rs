@@ -7,6 +7,12 @@
 //! bcm2712 module tree is missing (same convention as
 //! `builtin_build_e2e.rs`).
 
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "integration test surfaces subprocess output to the test runner for diagnosis on failure"
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -59,7 +65,7 @@ fn run_validate(yaml: &Path) -> (bool, String) {
         .arg(yaml)
         .current_dir(project_root())
         .output()
-        .unwrap_or_else(|e| panic!("spawn fluxor: {}", e));
+        .unwrap_or_else(|e| panic!("spawn fluxor: {e}"));
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -90,7 +96,7 @@ wiring:
 "#;
 
 fn pico_with_pg(pg_block: &str) -> String {
-    format!("{}\n{}", PICO_BASE, pg_block)
+    format!("{PICO_BASE}\n{pg_block}")
 }
 
 #[test]

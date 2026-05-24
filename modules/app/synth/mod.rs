@@ -36,6 +36,13 @@
 //!   Replaces the entire params blob. N can be up to PARAMS_SIZE.
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -677,9 +684,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 } else { break; }
             }
 
-            // Sum voices
+            // Sum voices. Output is mono today; a right-channel
+            // accumulator was retired alongside its unused writes
+            // (the headroom-reduction / soft-drive paths kept it in
+            // lockstep with sum_l with no readers downstream).
             let mut sum_l: i32 = 0;
-            let mut sum_r: i32 = 0;
 
             let n = s.poly_count as usize;
             let waveform = s.waveform;
@@ -787,7 +796,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let voice_l = (filtered * (amp_env_level as i32)) >> 16;
 
                 sum_l += voice_l;
-                sum_r += voice_l;
 
                 vi += 1;
             }
@@ -796,10 +804,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if !is_mono {
                 if n <= 2 {
                     sum_l >>= 1;
-                    sum_r >>= 1;
                 } else {
                     sum_l >>= 2;
-                    sum_r >>= 2;
                 }
             }
 
@@ -821,7 +827,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let x_sq = (x_clamped * x_clamped) >> 15;
                 let x_cubed = (x_sq * x_clamped) >> 15;
                 sum_l = x_clamped - x_cubed / 3;
-                sum_r = sum_l;
             }
 
             // Output level (with optional LFO modulation)

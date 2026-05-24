@@ -63,6 +63,8 @@ pub fn slot_fence(slot: i32) -> Option<Fence> {
     if slot < 0 || (slot as usize) >= MAX_OPEN_FILES {
         return None;
     }
+    // SAFETY: `slot` is bounds-checked above; `LINUX_FILES` is a static
+    // array of plain-old-data `OpenFile` entries owned by this module.
     unsafe {
         let files = &*core::ptr::addr_of!(LINUX_FILES);
         if !files[slot as usize].in_use {
@@ -531,7 +533,7 @@ const DG_CMD_CLOSE: u8 = 0x22;
 const DG_MSG_BOUND: u8 = 0x40;
 const DG_MSG_RX_FROM: u8 = 0x41;
 const DG_MSG_CLOSED: u8 = 0x42;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_MSG_ERROR: u8 = 0x43;
 const DG_AF_INET: u8 = 4;
 
@@ -549,7 +551,7 @@ const LINUX_NET_WRITE_BUF: usize = 128 * 1024;
 // Intentionally NOT Copy: this struct holds a 128 KiB inline buffer.
 // Implicit copies (`let conn = st.conns[idx];`) would push that whole
 // buffer onto the stack on every read. References / field-access only.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 struct LinuxNetConn {
     fd: i32,
     conn_type: u8,
@@ -716,7 +718,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         core::mem::size_of::<libc::sockaddr_in>() as u32,
     ) < 0
     {
-        log::error!("[linux_net] bind() failed on port {}", port);
+        log::error!("[linux_net] bind() failed on port {port}");
         libc::close(fd);
         return;
     }
@@ -736,7 +738,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         port,
         ..LinuxNetConn::EMPTY
     };
-    log::info!("[linux_net] listening on port {} (slot {})", port, idx);
+    log::info!("[linux_net] listening on port {port} (slot {idx})");
 
     let msg = [MSG_BOUND];
     linux_net_send_msg(st, &msg);
@@ -778,7 +780,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16) {
         core::mem::size_of::<libc::sockaddr_in>() as u32,
     ) < 0
     {
-        log::error!("[linux_net] UDP bind() failed on port {}", port);
+        log::error!("[linux_net] UDP bind() failed on port {port}");
         libc::close(fd);
         return;
     }
@@ -790,7 +792,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16) {
         state: 3,
         ..LinuxNetConn::EMPTY
     };
-    log::info!("[linux_net] UDP bound port {} (slot {})", port, idx);
+    log::info!("[linux_net] UDP bound port {port} (slot {idx})");
 
     // MSG_DG_BOUND payload (datagram contract):
     //   [ep_id: u8] [local_port: u16 LE].
@@ -937,7 +939,7 @@ unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, 
     if ret < 0 {
         let errno = *libc::__errno_location();
         if errno != libc::EINPROGRESS {
-            log::error!("[linux_net] connect() failed errno={}", errno);
+            log::error!("[linux_net] connect() failed errno={errno}");
             libc::close(fd);
             let msg = [MSG_ERROR, idx as u8, errno as u8];
             linux_net_send_msg(st, &msg);
@@ -1228,7 +1230,7 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
 
         let msg = [MSG_ACCEPTED, idx as u8];
         linux_net_send_msg(st, &msg);
-        log::info!("[linux_net] accepted conn_id={}", idx);
+        log::info!("[linux_net] accepted conn_id={idx}");
         had_work = true;
     }
     had_work
@@ -1331,6 +1333,8 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
 }
 
 fn linux_net_step(state: *mut u8) -> i32 {
+    // SAFETY: `state` is the kernel-owned per-instance arena sized
+    // for `LinuxNetState` by the loader.
     unsafe {
         let st = instance_state::<LinuxNetState>(state);
 
@@ -1427,9 +1431,7 @@ fn linux_net_step(state: *mut u8) -> i32 {
                     }
                     _ => {
                         log::warn!(
-                            "[linux_net] unknown cmd 0x{:02x} pl={}",
-                            msg_type,
-                            payload_len
+                            "[linux_net] unknown cmd 0x{msg_type:02x} pl={payload_len}"
                         );
                     }
                 }

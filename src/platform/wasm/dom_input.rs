@@ -52,6 +52,9 @@ unsafe fn alloc_state(out_chan: i32) -> *mut DomInputState {
 }
 
 fn dom_input_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer for
+    // this module instance; we cast it back to the module-private state
+    // type allocated by the new_fn and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut DomInputState);
         if st_ptr.is_null() {

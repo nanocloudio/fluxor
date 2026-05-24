@@ -157,7 +157,7 @@ fn format_uuid(bytes: &[u8]) -> String {
 fn get_type_name(types: &[&str], id: u8) -> String {
     types
         .get(id as usize)
-        .map_or_else(|| format!("Unknown({})", id), |s| s.to_string())
+        .map_or_else(|| format!("Unknown({id})"), |s| s.to_string())
 }
 
 /// Decode source entry from binary (pointer-based format, 16 bytes)
@@ -1147,8 +1147,7 @@ pub fn decode_config(data: &[u8], memory: &BTreeMap<u32, u8>) -> Result<Value> {
         }
         MAGIC_LEGACY => decode_legacy_format(data),
         _ => Err(Error::Config(format!(
-            "Unknown config magic: 0x{:08x}",
-            magic
+            "Unknown config magic: 0x{magic:08x}"
         ))),
     }
 }
@@ -1427,11 +1426,10 @@ fn validate_scheduler_budgets(
         // Rule 1 — absolute burst cap.
         if burst > HARD_BURST_CAP_US {
             return Err(Error::Config(format!(
-                "module '{}': step_deadline_us={} → burst deadline {} us \
-                 (× BURST_MULTIPLIER={}) exceeds the {} us absolute cap. \
+                "module '{name}': step_deadline_us={deadline} → burst deadline {burst} us \
+                 (× BURST_MULTIPLIER={BURST_DEADLINE_MULTIPLIER}) exceeds the {HARD_BURST_CAP_US} us absolute cap. \
                  A single module cannot authorise stalling the scheduler \
-                 this long.",
-                name, deadline, burst, BURST_DEADLINE_MULTIPLIER, HARD_BURST_CAP_US
+                 this long."
             )));
         }
 
@@ -1445,12 +1443,10 @@ fn validate_scheduler_budgets(
                 .map(String::as_str)
                 .unwrap_or("default");
             return Err(Error::Config(format!(
-                "module '{}' in domain '{}': burst deadline {} us \
-                 (step_deadline_us={} × {}) exceeds 16 × domain tick_us \
-                 ({} us). Bursts are guardrails, not licences to monopolise \
-                 the domain.",
-                name, domain_label, burst, deadline, BURST_DEADLINE_MULTIPLIER,
-                burst_cap_for_domain
+                "module '{name}' in domain '{domain_label}': burst deadline {burst} us \
+                 (step_deadline_us={deadline} × {BURST_DEADLINE_MULTIPLIER}) exceeds 16 × domain tick_us \
+                 ({burst_cap_for_domain} us). Bursts are guardrails, not licences to monopolise \
+                 the domain."
             )));
         }
 
@@ -1468,11 +1464,10 @@ fn validate_scheduler_budgets(
                 .map(String::as_str)
                 .unwrap_or("default");
             eprintln!(
-                "warning: domain '{}' declared step_deadline_us sum = {} exceeds \
-                 {}× tick_us ({} us). If every module hits its declared deadline \
+                "warning: domain '{domain_label}' declared step_deadline_us sum = {sum} exceeds \
+                 {DECLARED_DEADLINE_BUDGET_FACTOR}× tick_us ({budget_ceiling} us). If every module hits its declared deadline \
                  the loop slips. Lower a declared deadline, raise tick_us, or \
-                 split modules across additional domains.",
-                domain_label, sum, DECLARED_DEADLINE_BUDGET_FACTOR, budget_ceiling
+                 split modules across additional domains."
             );
         }
     }
@@ -1537,10 +1532,9 @@ fn validate_isr_tier_admission(
                             .clone()
                             .unwrap_or_else(|| format!("domains[{i}]"));
                         return Err(Error::Config(format!(
-                            "execution.domains entry '{}' has an unknown tier/exec_mode \
+                            "execution.domains entry '{label}' has an unknown tier/exec_mode \
                              value. Valid: 0/cooperative, 1a/high_rate, 1b/isr_timer, \
-                             3/poll, 2/isr_owned.",
-                            label
+                             3/poll, 2/isr_owned."
                         )));
                     }
                 }
@@ -1580,7 +1574,11 @@ fn validate_isr_tier_admission(
             let label = domain_names_local[d]
                 .clone()
                 .unwrap_or_else(|| format!("domains[{d}]"));
-            let tier_name = if m == 2 { "1b (isr_timer)" } else { "2 (isr_owned)" };
+            let tier_name = if m == 2 {
+                "1b (isr_timer)"
+            } else {
+                "2 (isr_owned)"
+            };
             return Err(Error::Config(format!(
                 "execution.domains entry '{label}': tier {tier_name} is declared but not yet \
                  runtime-supported on any target. The YAML schema, manifest gate, and \
@@ -1609,10 +1607,8 @@ fn validate_isr_tier_admission(
         }
     };
 
-    let manifests = load_module_manifests_with_extra(
-        &Value::Array(module_list.to_vec()),
-        extra_module_dirs,
-    );
+    let manifests =
+        load_module_manifests_with_extra(&Value::Array(module_list.to_vec()), extra_module_dirs);
 
     // ── Rule 1: isr_safe attestation ────────────────────────────
     for module in module_list {
@@ -1638,10 +1634,7 @@ fn validate_isr_tier_admission(
             None => continue,
         };
         if !manifest.isr_safe {
-            let module_type = module
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or(name);
+            let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
             return Err(Error::Config(format!(
                 "module '{name}' (type '{module_type}') is assigned to domain '{domain_label}' \
                  (tier {tier}) but its manifest does not declare `isr_safe = true`. \
@@ -1657,10 +1650,7 @@ fn validate_isr_tier_admission(
         // preempted cooperative thread's NEON file. Run the
         // source-static lint on the module's `src/` tree; if it
         // finds NEON markers, reject the placement.
-        let module_type = module
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or(name);
+        let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
         let mut src_root: Option<std::path::PathBuf> = None;
         for dir in std::iter::once(modules_dir).chain(extra_module_dirs.iter().copied()) {
             let candidate = dir.join(module_type);
@@ -1897,8 +1887,7 @@ fn resolve_domain_id(module: &Value, config: &Value) -> Result<u8> {
     }
 
     Err(Error::Config(format!(
-        "module references domain '{}' but execution.domains is missing or empty",
-        domain_name
+        "module references domain '{domain_name}' but execution.domains is missing or empty"
     )))
 }
 
@@ -2062,9 +2051,9 @@ fn validate_yaml_params(
                 };
                 if !candidates.iter().any(|c| schema.find(c).is_some()) {
                     let display = if transparent {
-                        format!("params.{}", inner_key)
+                        format!("params.{inner_key}")
                     } else {
-                        format!("{}.{}", key, inner_key)
+                        format!("{key}.{inner_key}")
                     };
                     let suggestion = candidates
                         .iter()
@@ -2108,12 +2097,12 @@ fn validate_yaml_params(
 /// (when the outer key ends with a grouping suffix) suffix-stripped.
 fn nested_key_candidates(outer: &str, inner: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(3);
-    let dotted = format!("{}.{}", outer, inner);
+    let dotted = format!("{outer}.{inner}");
     out.push(dotted.replace('.', "_"));
     out.push(dotted);
     for suffix in schema::GROUPING_SUFFIXES {
         if let Some(prefix) = outer.strip_suffix(suffix) {
-            out.push(format!("{}_{}", prefix, inner));
+            out.push(format!("{prefix}_{inner}"));
         }
     }
     out
@@ -2121,7 +2110,7 @@ fn nested_key_candidates(outer: &str, inner: &str) -> Vec<String> {
 
 fn format_hint(suggestion: Option<&str>, schema: &schema::ParamSchema) -> String {
     if let Some(s) = suggestion {
-        format!(" — did you mean '{}'?", s)
+        format!(" — did you mean '{s}'?")
     } else {
         let valid: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
         format!(" — valid params: {}", valid.join(", "))
@@ -2268,17 +2257,16 @@ fn inject_manifest_defaults(module: &Value, manifest: &crate::manifest::Manifest
 fn closest_param_name<'a>(key: &str, schema: &'a schema::ParamSchema) -> Option<&'a str> {
     let threshold = (key.len() / 2).clamp(2, 4);
     let candidates: Vec<String> = schema.params.iter().map(|p| p.name.clone()).collect();
-    crate::text_distance::closest_match(key, &candidates, threshold)
-        .and_then(|name| {
-            // closest_match returns an owned String; map back to the
-            // borrowed `&'a str` the caller expects by looking up
-            // the schema entry that matched.
-            schema
-                .params
-                .iter()
-                .find(|p| p.name == name)
-                .map(|p| p.name.as_str())
-        })
+    crate::text_distance::closest_match(key, &candidates, threshold).and_then(|name| {
+        // closest_match returns an owned String; map back to the
+        // borrowed `&'a str` the caller expects by looking up
+        // the schema entry that matched.
+        schema
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.name.as_str())
+    })
 }
 
 /// Expand compound YAML fields that don't map 1:1 to schema params,
@@ -2316,7 +2304,7 @@ fn expand_compound_yaml_fields(type_name: &str, module: &Value, config: &Value) 
                 if let Some(uuid_str) = config.get("device_uuid").and_then(|v| v.as_str()) {
                     let uuid = parse_uuid_bytes(uuid_str);
                     if uuid != [0u8; 16] {
-                        let hex: String = uuid.iter().map(|b| format!("{:02x}", b)).collect();
+                        let hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
                         obj.insert(
                             "subscribe_topic".into(),
                             json!(format!("fluxor/{}/objects/+/commands", hex)),
@@ -2792,10 +2780,10 @@ fn build_module_entry(
                     entry[base + extra_len + 4..base + extra_len + 4 + n]
                         .copy_from_slice(&cert_data);
                     extra_len += 4 + n;
-                    eprintln!("  cert_file: {} ({} bytes)", cert_path, n);
+                    eprintln!("  cert_file: {cert_path} ({n} bytes)");
                 }
             }
-            Err(e) => eprintln!("  warn: cert_file: could not read '{}': {}", cert_path, e),
+            Err(e) => eprintln!("  warn: cert_file: could not read '{cert_path}': {e}"),
         }
     }
 
@@ -2812,10 +2800,10 @@ fn build_module_entry(
                     entry[base + extra_len + 4..base + extra_len + 4 + n]
                         .copy_from_slice(&key_data);
                     extra_len += 4 + n;
-                    eprintln!("  key_file: {} ({} bytes)", key_path, n);
+                    eprintln!("  key_file: {key_path} ({n} bytes)");
                 }
             }
-            Err(e) => eprintln!("  warn: key_file: could not read '{}': {}", key_path, e),
+            Err(e) => eprintln!("  warn: key_file: could not read '{key_path}': {e}"),
         }
     }
 
@@ -2831,10 +2819,10 @@ fn build_module_entry(
                     entry[base + extra_len + 3] = n as u8;
                     entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&data);
                     extra_len += 4 + n;
-                    eprintln!("  trust_cert_file: {} ({} bytes)", path, n);
+                    eprintln!("  trust_cert_file: {path} ({n} bytes)");
                 }
             }
-            Err(e) => eprintln!("  warn: trust_cert_file: could not read '{}': {}", path, e),
+            Err(e) => eprintln!("  warn: trust_cert_file: could not read '{path}': {e}"),
         }
     }
 
@@ -2849,7 +2837,7 @@ fn build_module_entry(
             entry[base + extra_len + 3] = n as u8;
             entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
             extra_len += 4 + n;
-            eprintln!("  verify_hostname: {}", name);
+            eprintln!("  verify_hostname: {name}");
         }
     }
 
@@ -2897,8 +2885,7 @@ fn parse_modules_map(
     // declaration order. Forward and backward partner references both
     // resolve here. Modules using `quarantine_partner_idx: N`
     // (numeric form) bypass this entirely.
-    let mut name_to_idx: std::collections::HashMap<String, u8> =
-        std::collections::HashMap::new();
+    let mut name_to_idx: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     for (idx, m) in list.iter().enumerate() {
         if idx >= MAX_MODULES {
             break;
@@ -2916,9 +2903,9 @@ fn parse_modules_map(
                 MAX_MODULES
             )));
         }
-        let name = module["name"].as_str().ok_or_else(|| {
-            Error::Config(format!("Module at index {} missing 'name' field", idx))
-        })?;
+        let name = module["name"]
+            .as_str()
+            .ok_or_else(|| Error::Config(format!("Module at index {idx} missing 'name' field")))?;
         // Duplicate-name detector. Names are used as keys in
         // manifests / wiring lookup / scheduler module table, so
         // two modules sharing a name silently makes every name
@@ -2980,8 +2967,7 @@ fn parse_modules_map(
         }
 
         let id = idx as u8;
-        let entry =
-            build_module_entry(name, &module_owned, id, data_section, config, modules_dir)?;
+        let entry = build_module_entry(name, &module_owned, id, data_section, config, modules_dir)?;
         entries.push(entry);
         names.push(name.to_string());
     }
@@ -3274,10 +3260,7 @@ fn resolve_port_spec<'a>(
                 .filter_map(|p| p.name.clone())
                 .collect();
             if available.is_empty() {
-                format!(
-                    "module '{}' has no named ports in its manifest",
-                    module_name
-                )
+                format!("module '{module_name}' has no named ports in its manifest")
             } else {
                 let did_you_mean = crate::text_distance::closest_match(port_part, &available, 3)
                     .map(|h| format!(" Did you mean '{h}'?"))
@@ -3301,8 +3284,7 @@ fn resolve_port_spec<'a>(
     }
     if !context_is_from && direction == 1 {
         return Err(format!(
-            "port '{}.{}' is output but used in 'to:' (must be input or ctrl)",
-            module_name, port_part
+            "port '{module_name}.{port_part}' is output but used in 'to:' (must be input or ctrl)"
         ));
     }
 
@@ -3541,15 +3523,13 @@ pub fn validate_presentation_groups(
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 Error::Config(format!(
-                    "presentation_groups[{}]: required field `id` missing",
-                    gi
+                    "presentation_groups[{gi}]: required field `id` missing"
                 ))
             })?
             .to_string();
         if !seen_ids.insert(id.clone()) {
             return Err(Error::Config(format!(
-                "presentation_groups: duplicate id `{}`",
-                id
+                "presentation_groups: duplicate id `{id}`"
             )));
         }
 
@@ -3558,16 +3538,14 @@ pub fn validate_presentation_groups(
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 Error::Config(format!(
-                    "presentation_group `{}`: required field `clock_authority` missing",
-                    id
+                    "presentation_group `{id}`: required field `clock_authority` missing"
                 ))
             })?
             .to_string();
 
         let members_raw = g.get("members").and_then(|v| v.as_array()).ok_or_else(|| {
             Error::Config(format!(
-                "presentation_group `{}`: required field `members` missing",
-                id
+                "presentation_group `{id}`: required field `members` missing"
             ))
         })?;
         let mut members: Vec<String> = Vec::with_capacity(members_raw.len());
@@ -3584,22 +3562,19 @@ pub fn validate_presentation_groups(
         }
         if members.is_empty() {
             return Err(Error::Config(format!(
-                "presentation_group `{}`: `members` is empty",
-                id
+                "presentation_group `{id}`: `members` is empty"
             )));
         }
         for m in &members {
             if !module_names.iter().any(|n| n == m) {
                 return Err(Error::Config(format!(
-                    "presentation_group `{}`: unknown member `{}`",
-                    id, m
+                    "presentation_group `{id}`: unknown member `{m}`"
                 )));
             }
         }
         if !members.iter().any(|m| m == &clock_authority) {
             return Err(Error::Config(format!(
-                "presentation_group `{}`: clock_authority `{}` is not in members {:?}",
-                id, clock_authority, members
+                "presentation_group `{id}`: clock_authority `{clock_authority}` is not in members {members:?}"
             )));
         }
 
@@ -3616,10 +3591,9 @@ pub fn validate_presentation_groups(
 
         if !has_cap(manifest_caps(&clock_authority), "presentation.clock") {
             return Err(Error::Config(format!(
-                "presentation_group `{}`: clock_authority `{}` does not declare \
+                "presentation_group `{id}`: clock_authority `{clock_authority}` does not declare \
                  capability `presentation.clock` (add it to the module's manifest, \
-                 or pick an authority that does)",
-                id, clock_authority
+                 or pick an authority that does)"
             )));
         }
 
@@ -3645,17 +3619,15 @@ pub fn validate_presentation_groups(
                 let caps = manifest_caps(m);
                 if has_any_cap(caps, AUDIO_SINK_CAPS) && !has_cap(caps, "audio.protected_out") {
                     return Err(Error::Config(format!(
-                        "presentation_group `{}`: protected=true but audio member \
-                         `{}` does not declare `audio.protected_out`",
-                        id, m
+                        "presentation_group `{id}`: protected=true but audio member \
+                         `{m}` does not declare `audio.protected_out`"
                     )));
                 }
                 if has_any_cap(caps, VIDEO_SINK_CAPS) && !has_any_cap(caps, VIDEO_PROTECTED_CAPS) {
                     return Err(Error::Config(format!(
-                        "presentation_group `{}`: protected=true but video member \
-                         `{}` does not declare `display.protected_scanout` or \
-                         `video.protected_decode`",
-                        id, m
+                        "presentation_group `{id}`: protected=true but video member \
+                         `{m}` does not declare `display.protected_scanout` or \
+                         `video.protected_decode`"
                     )));
                 }
             }
@@ -3673,9 +3645,8 @@ pub fn validate_presentation_groups(
                 .count();
             if scanout_count < 2 {
                 return Err(Error::Config(format!(
-                    "presentation_group `{}`: multihead=true but only {} member(s) \
-                     declare `display.scanout` (need ≥2)",
-                    id, scanout_count
+                    "presentation_group `{id}`: multihead=true but only {scanout_count} member(s) \
+                     declare `display.scanout` (need ≥2)"
                 )));
             }
         }
@@ -3684,15 +3655,13 @@ pub fn validate_presentation_groups(
             if let Some(v) = g.get(*k) {
                 let n = v.as_u64().ok_or_else(|| {
                     Error::Config(format!(
-                        "presentation_group `{}`: `{}` must be an unsigned integer (ms)",
-                        id, k
+                        "presentation_group `{id}`: `{k}` must be an unsigned integer (ms)"
                     ))
                 })?;
                 if n > MAX_PRESENTATION_BUDGET_MS {
                     return Err(Error::Config(format!(
-                        "presentation_group `{}`: `{}` = {} ms exceeds the {} ms \
-                         sanity bound (typical lip-sync budgets are ≤ 100 ms)",
-                        id, k, n, MAX_PRESENTATION_BUDGET_MS
+                        "presentation_group `{id}`: `{k}` = {n} ms exceeds the {MAX_PRESENTATION_BUDGET_MS} ms \
+                         sanity bound (typical lip-sync budgets are ≤ 100 ms)"
                     )));
                 }
             }
@@ -3755,9 +3724,9 @@ fn parse_wiring_edges(
 
         let (from_name, _from_port_type, from_port_index) =
             resolve_port_spec(from, true, manifests, names)
-                .map_err(|e| Error::Config(format!("wiring from '{}': {}", from, e)))?;
+                .map_err(|e| Error::Config(format!("wiring from '{from}': {e}")))?;
         let (to_name, to_port_type, to_port_index) = resolve_port_spec(to, false, manifests, names)
-            .map_err(|e| Error::Config(format!("wiring to '{}': {}", to, e)))?;
+            .map_err(|e| Error::Config(format!("wiring to '{to}': {e}")))?;
 
         // Map destination port type to wire format: in(0)→0, ctrl(2)→1
         let to_port = if to_port_type == 2 { 1u8 } else { 0u8 };
@@ -3883,17 +3852,17 @@ fn build_hardware_section(
         let bus = spi["bus"].as_u64().unwrap_or(0) as u8;
         let miso = validate_gpio_pin(
             spi["miso"].as_u64().unwrap_or(16),
-            &format!("hardware.spi[{}].miso", i),
+            &format!("hardware.spi[{i}].miso"),
             max_gpio,
         )?;
         let mosi = validate_gpio_pin(
             spi["mosi"].as_u64().unwrap_or(19),
-            &format!("hardware.spi[{}].mosi", i),
+            &format!("hardware.spi[{i}].mosi"),
             max_gpio,
         )?;
         let sck = validate_gpio_pin(
             spi["sck"].as_u64().unwrap_or(18),
-            &format!("hardware.spi[{}].sck", i),
+            &format!("hardware.spi[{i}].sck"),
             max_gpio,
         )?;
         let freq_hz = spi["freq_hz"].as_u64().unwrap_or(400_000) as u32;
@@ -3910,12 +3879,12 @@ fn build_hardware_section(
         let bus = i2c["bus"].as_u64().unwrap_or(0) as u8;
         let sda = validate_gpio_pin(
             i2c["sda"].as_u64().unwrap_or(4),
-            &format!("hardware.i2c[{}].sda", i),
+            &format!("hardware.i2c[{i}].sda"),
             max_gpio,
         )?;
         let scl = validate_gpio_pin(
             i2c["scl"].as_u64().unwrap_or(5),
-            &format!("hardware.i2c[{}].scl", i),
+            &format!("hardware.i2c[{i}].scl"),
             max_gpio,
         )?;
         let freq_hz = i2c["freq_hz"].as_u64().unwrap_or(100_000) as u32;
@@ -3932,12 +3901,12 @@ fn build_hardware_section(
         let bus = uart["bus"].as_u64().unwrap_or(0) as u8;
         let tx_pin = validate_gpio_pin(
             uart["tx_pin"].as_u64().unwrap_or(0),
-            &format!("hardware.uart[{}].tx_pin", i),
+            &format!("hardware.uart[{i}].tx_pin"),
             max_gpio,
         )?;
         let rx_pin = validate_gpio_pin(
             uart["rx_pin"].as_u64().unwrap_or(1),
-            &format!("hardware.uart[{}].rx_pin", i),
+            &format!("hardware.uart[{i}].rx_pin"),
             max_gpio,
         )?;
         let baudrate = uart["baudrate"].as_u64().unwrap_or(115200) as u32;
@@ -3953,7 +3922,7 @@ fn build_hardware_section(
     for (i, gpio) in gpio_configs.iter().enumerate() {
         let pin = validate_gpio_pin(
             gpio["pin"].as_u64().unwrap_or(0),
-            &format!("hardware.gpio[{}].pin", i),
+            &format!("hardware.gpio[{i}].pin"),
             max_gpio,
         )?;
 
@@ -4001,8 +3970,7 @@ fn build_hardware_section(
                 Some(idx) => idx as u8,
                 None => {
                     return Err(Error::Config(format!(
-                        "hardware.gpio[{}].owner: unknown module '{}'",
-                        i, owner_name
+                        "hardware.gpio[{i}].owner: unknown module '{owner_name}'"
                     )));
                 }
             }
@@ -4025,18 +3993,17 @@ fn build_hardware_section(
         let pio_idx = pio["pio_idx"].as_u64().unwrap_or(0) as u8;
         if pio_idx >= pio_count {
             return Err(Error::Config(format!(
-                "hardware.pio[{}].pio_idx {} >= target pio_count {}",
-                i, pio_idx, pio_count
+                "hardware.pio[{i}].pio_idx {pio_idx} >= target pio_count {pio_count}"
             )));
         }
         let data_pin = validate_gpio_pin(
             pio["data_pin"].as_u64().unwrap_or(0),
-            &format!("hardware.pio[{}].data_pin", i),
+            &format!("hardware.pio[{i}].data_pin"),
             max_gpio,
         )?;
         let clk_pin = validate_gpio_pin(
             pio["clk_pin"].as_u64().unwrap_or(0),
-            &format!("hardware.pio[{}].clk_pin", i),
+            &format!("hardware.pio[{i}].clk_pin"),
             max_gpio,
         )?;
         let extra_pin = pio["extra_pin"].as_u64().unwrap_or(0xFF) as u8;
@@ -4102,8 +4069,7 @@ fn resolve_edge_classes(
                     let from_d = module_domain.get(from_mod).copied().unwrap_or(0);
                     let to_d = module_domain.get(to_mod).copied().unwrap_or(0);
                     if from_d == to_d && !domain_names.is_empty() {
-                        eprintln!("warning: wiring[{}] edge_class=cross_core but '{}' and '{}' are in same domain {}",
-                            i, from_mod, to_mod, from_d);
+                        eprintln!("warning: wiring[{i}] edge_class=cross_core but '{from_mod}' and '{to_mod}' are in same domain {from_d}");
                     }
                 }
                 2u8
@@ -4145,15 +4111,11 @@ fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
         let clamped = if raw == 0 {
             0
         } else if raw < 64 {
-            eprintln!(
-                "warning: wiring[{}] buffer_bytes={} below minimum 64; rounding up",
-                i, raw
-            );
+            eprintln!("warning: wiring[{i}] buffer_bytes={raw} below minimum 64; rounding up");
             64
         } else if raw > MAX_CHAN_BYTES as u64 {
             eprintln!(
-                "warning: wiring[{}] buffer_bytes={} exceeds MAX_CHAN_BYTES={}; clamping",
-                i, raw, MAX_CHAN_BYTES
+                "warning: wiring[{i}] buffer_bytes={raw} exceeds MAX_CHAN_BYTES={MAX_CHAN_BYTES}; clamping"
             );
             MAX_CHAN_BYTES
         } else {
@@ -4194,7 +4156,10 @@ pub struct ModuleCaps {
 /// target rather than a stale YAML default. `None` means fall back to
 /// the YAML's literal value, which is the documented opt-in behaviour
 /// for legacy configs / fixtures with no declared target.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ABI-shaped function; argument list mirrors the syscall / register signature"
+)]
 pub fn generate_config_ext(
     config: &Value,
     _template: &ConfigBuilder,
@@ -4217,7 +4182,10 @@ pub fn generate_config_ext(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ABI-shaped function; argument list mirrors the syscall / register signature"
+)]
 fn generate_config_impl(
     config: &Value,
     _template: &ConfigBuilder,
@@ -4249,8 +4217,7 @@ fn generate_config_impl(
     // Validate tick_us range
     if tick_us > 0 && !(100..=50000).contains(&tick_us) {
         return Err(Error::Config(format!(
-            "tick_us {} out of range (valid: 100-50000, or 0 for default 1000)",
-            tick_us
+            "tick_us {tick_us} out of range (valid: 100-50000, or 0 for default 1000)"
         )));
     }
 
@@ -4310,13 +4277,7 @@ fn generate_config_impl(
     // `tick_us: 1000` and the deadline would silently force every
     // step over budget — observable only as missed-deadline timeouts
     // at runtime.
-    validate_scheduler_budgets(
-        config,
-        module_list,
-        tick_us,
-        &domain_names,
-        &domain_tick_us,
-    )?;
+    validate_scheduler_budgets(config, module_list, tick_us, &domain_names, &domain_tick_us)?;
 
     // ISR-tier admission: every module routed to a Tier 1b/2 domain
     // must declare `isr_safe = true` in its manifest, and the wiring
@@ -4363,8 +4324,7 @@ fn generate_config_impl(
     // checked-in default. Legacy fixtures without either omit the
     // check entirely; that's by design, since the default `requires`
     // is all-false and satisfies every silicon.
-    let silicon_opt = resolved_target
-        .or_else(|| config.get("target").and_then(|t| t.as_str()));
+    let silicon_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
     if let Some(silicon) = silicon_opt {
         for (i, m) in module_list.iter().enumerate() {
             let name = m
@@ -4376,10 +4336,7 @@ fn generate_config_impl(
                 if let Err(e) =
                     crate::manifest::check_target_capabilities(manifest.requires, silicon)
                 {
-                    return Err(Error::Config(format!(
-                        "modules[{}] ({}): {}",
-                        i, name, e
-                    )));
+                    return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
                 }
             }
         }
@@ -4758,8 +4715,7 @@ fn validate_manifests(module_names: &[String], module_caps: &[ModuleCaps]) -> Re
         let h = fnv1a_hash(name.as_bytes());
         if let Some(existing) = hash_to_name.get(&h) {
             return Err(Error::Config(format!(
-                "FNV-1a hash collision: '{}' and '{}' both hash to 0x{:08x}",
-                existing, name, h,
+                "FNV-1a hash collision: '{existing}' and '{name}' both hash to 0x{h:08x}",
             )));
         }
         hash_to_name.insert(h, name);
@@ -4839,8 +4795,7 @@ fn validate_services(
     for (service_name, provider_val) in services_map {
         let provider = provider_val.as_str().ok_or_else(|| {
             Error::Config(format!(
-                "services.{}: provider must be a string",
-                service_name
+                "services.{service_name}: provider must be a string"
             ))
         })?;
 
@@ -4849,8 +4804,7 @@ fn validate_services(
         let provider_found = module_names.iter().any(|n| n == provider);
         if !provider_found {
             return Err(Error::Config(format!(
-                "services.{}: provider module '{}' not found in config modules",
-                service_name, provider,
+                "services.{service_name}: provider module '{provider}' not found in config modules",
             )));
         }
 
@@ -4858,8 +4812,7 @@ fn validate_services(
         if let Some(manifest) = manifests.get(provider) {
             if !manifest.provides.iter().any(|p| p == service_name) {
                 return Err(Error::Config(format!(
-                    "services.{}: module '{}' does not declare 'provides = [\"{}\"]' in its manifest",
-                    service_name, provider, service_name,
+                    "services.{service_name}: module '{provider}' does not declare 'provides = [\"{service_name}\"]' in its manifest",
                 )));
             }
         }
@@ -5218,10 +5171,7 @@ mod scheduler_validation_tests {
     // require a populated modules tree; the validator's contract is
     // narrow enough to test in isolation.
 
-    fn run_admission(
-        config: serde_json::Value,
-        modules: Vec<serde_json::Value>,
-    ) -> Result<()> {
+    fn run_admission(config: serde_json::Value, modules: Vec<serde_json::Value>) -> Result<()> {
         // Use a path that surely doesn't exist so `load_module_
         // manifests_with_extra` finds nothing. The validator handles
         // the missing-manifest case by skipping the isr_safe check
@@ -5317,9 +5267,7 @@ mod scheduler_validation_tests {
         let cfg = json!({
             "execution": {"domains": [{"name": "main", "tier": "1a"}]}
         });
-        let modules = vec![
-            json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})
-        ];
+        let modules = vec![json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
         validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
@@ -5335,18 +5283,15 @@ mod scheduler_validation_tests {
             json!({"name": "a", "type": "x", "step_deadline_us": 800}),
             json!({"name": "b", "type": "x", "step_deadline_us": 700}),
         ];
-        validate_scheduler_budgets(
-            &cfg,
-            &modules,
-            1000,
-            &["d0".to_string()],
-            &[1000],
-        )
-        .unwrap();
+        validate_scheduler_budgets(&cfg, &modules, 1000, &["d0".to_string()], &[1000]).unwrap();
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::undocumented_unsafe_blocks,
+    reason = "test scaffolding wraps std::env::{set_var, remove_var} which became `unsafe fn` in Rust 2024; safety is identical at every call site — the tests serialise on the module-level mutex"
+)]
 mod module_discovery_tests {
     //! Tests for the dual-root module manifest discovery added on
     //! top of the project/install root resolver. Verifies that

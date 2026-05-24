@@ -79,6 +79,8 @@ pub(crate) fn install_state<T>(m: &mut scheduler::BuiltInModule, state: Box<T>) 
     // pointer fits — even 16-byte Box pointers leave plenty of slack
     // in the 64-byte buffer.
     debug_assert!(core::mem::size_of::<*mut T>() <= m.state.len());
+    // SAFETY: `m.state` is a 64-byte stack buffer owned by the module;
+    // the debug_assert above confirms `sizeof::<*mut T>() <= state.len()`.
     unsafe {
         core::ptr::write(m.state.as_mut_ptr() as *mut *mut T, raw);
     }
@@ -94,6 +96,11 @@ pub(crate) fn install_state<T>(m: &mut scheduler::BuiltInModule, state: Box<T>) 
 /// `src/platform/linux.rs` matches by `name_hash`, which encodes the
 /// type uniquely.
 pub(crate) unsafe fn instance_state<T>(state: *mut u8) -> &'static mut T {
+    // SAFETY: caller upholds the `# Safety` invariant above — `state`
+    // was previously initialised by `install_state::<T>`.
     let ptr = unsafe { core::ptr::read(state as *const *mut T) };
+    // SAFETY: `ptr` was produced by `Box::into_raw(Box::new(state))`
+    // in `install_state`; the heap allocation outlives the module
+    // instance per the linux platform's lifecycle.
     unsafe { &mut *ptr }
 }

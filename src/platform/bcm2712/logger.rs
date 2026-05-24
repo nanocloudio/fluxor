@@ -7,10 +7,10 @@
 pub struct RingLogger;
 
 impl log::Log for RingLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
         true
     }
-    fn log(&self, record: &log::Record) {
+    fn log(&self, record: &log::Record<'_>) {
         use core::fmt::Write;
         // Format into a stack buffer first, then push the whole record
         // (plus CRLF) into the ring in a single call. Incremental

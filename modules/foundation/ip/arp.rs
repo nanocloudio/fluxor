@@ -60,6 +60,9 @@ pub const ARP_PENDING_WAITING: u8 = 1;
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
 pub fn lookup(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32) -> Option<[u8; 6]> {
+    // SAFETY: `i < ARP_TABLE_SIZE` is the loop invariant; `table.as_ptr().add(i)`
+    // therefore points into the fixed-size array. `&*` materialises a shared
+    // reference that lives only for the iteration.
     unsafe {
         let mut i = 0;
         while i < ARP_TABLE_SIZE {
@@ -79,6 +82,10 @@ pub fn lookup(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32) -> Option<[u8; 6]> {
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
 pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], step_count: u16) {
+    // SAFETY: every `add(i)` is bounded by `i < ARP_TABLE_SIZE`. The `&mut *`
+    // re-borrow is unique because the loop holds no other live reference into
+    // `table`. `oldest_idx` is sentinel-checked against `ARP_TABLE_SIZE`
+    // before the eviction-slot write.
     unsafe {
         // Check if already exists
         let mut i = 0;
@@ -155,15 +162,16 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
 
 /// Pin an ARP entry for the given IP (called when TCP connection established).
 pub fn pin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+    // array; the unique re-borrow is safe because the loop holds no other
+    // live reference into `table`.
     unsafe {
         let mut i = 0;
         while i < ARP_TABLE_SIZE {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
                 entry.pinned = true;
-                if entry.pin_count < 255 {
-                    entry.pin_count += 1;
-                }
+                entry.pin_count = entry.pin_count.saturating_add(1);
                 return;
             }
             i += 1;
@@ -173,6 +181,9 @@ pub fn pin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
 
 /// Unpin an ARP entry (called when TCP connection closed).
 pub fn unpin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+    // array; the unique re-borrow is safe because the loop holds no other
+    // live reference into `table`.
     unsafe {
         let mut i = 0;
         while i < ARP_TABLE_SIZE {
@@ -191,6 +202,9 @@ pub fn unpin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
 
 /// Permanently pin the gateway ARP entry (set pin_count = 255).
 pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+    // array; the unique re-borrow is safe because the loop holds no other
+    // live reference into `table`.
     unsafe {
         let mut i = 0;
         while i < ARP_TABLE_SIZE {
@@ -210,6 +224,9 @@ pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
 pub fn age_entries(table: &mut [ArpEntry; ARP_TABLE_SIZE]) {
+    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+    // array; the unique re-borrow is safe because the loop holds no other
+    // live reference into `table`.
     unsafe {
         let mut i = 0;
         while i < ARP_TABLE_SIZE {

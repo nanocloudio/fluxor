@@ -278,6 +278,9 @@ impl CrossDomainChannel {
 
         // Write slot data
         let slot_idx = (head & RING_MASK) as usize;
+        // SAFETY: SPSC ring — single producer writes the slot before
+        // publishing the new head with Release ordering. `slot_idx <
+        // RING_SLOTS` because `head` wraps mod `RING_SLOTS`.
         unsafe {
             let slot_ptr = &self.slots[slot_idx] as *const RingSlot as *mut RingSlot;
             let data_dst = core::ptr::addr_of_mut!((*slot_ptr).data) as *mut u8;
@@ -289,6 +292,7 @@ impl CrossDomainChannel {
         self.head.val.store(head.wrapping_add(1), Ordering::Release);
 
         // Wake any core waiting in WFE
+        // SAFETY: DMB + SEV are architectural hints; no memory effects.
         #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("dmb ish", "sev", options(nomem, nostack));
@@ -309,6 +313,8 @@ impl CrossDomainChannel {
             return None;
         }
         let slot_idx = (tail & RING_MASK) as usize;
+        // SAFETY: head>tail invariant means the slot at `tail` was just
+        // published by the producer with Release ordering.
         let len = unsafe {
             let slot_ptr = &self.slots[slot_idx] as *const RingSlot;
             core::ptr::read_volatile(core::ptr::addr_of!((*slot_ptr).len)) as usize
@@ -330,6 +336,8 @@ impl CrossDomainChannel {
 
         let slot_idx = (tail & RING_MASK) as usize;
         let (len, copy_len);
+        // SAFETY: SPSC consumer — slot was published by producer with
+        // Release; `copy_len` bounded by `dst.len()` and `SLOT_DATA_SIZE`.
         unsafe {
             let slot_ptr = &self.slots[slot_idx] as *const RingSlot;
             len = core::ptr::read_volatile(core::ptr::addr_of!((*slot_ptr).len)) as usize;
@@ -348,6 +356,7 @@ impl CrossDomainChannel {
     /// remaining messages then return None.
     pub fn close(&self) {
         self.closed.store(1, Ordering::Release);
+        // SAFETY: DMB + SEV are architectural hints; no memory effects.
         #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("dmb ish", "sev", options(nomem, nostack));
@@ -388,6 +397,7 @@ impl CrossDomainChannel {
 #[inline(always)]
 fn current_core_id_inline() -> u32 {
     let mpidr: u64;
+    // SAFETY: MRS MPIDR_EL1 is a read-only system register access.
     unsafe {
         core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
     }
@@ -483,6 +493,8 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
         return false;
     }
 
+    // SAFETY: boot-time slot publishing before the secondary core wakes;
+    // CORE_STARTED check above ensures we're the sole writer.
     unsafe {
         CORE_ENTRIES[idx] = Some(entry);
     }
@@ -493,11 +505,13 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     let context_id: u64 = 0;
 
     // Publish CORE_ENTRIES before the woken core reads it.
+    // SAFETY: DSB SY is an architectural barrier; no memory effects.
     unsafe {
         core::arch::asm!("dsb sy", options(nomem, nostack));
     }
 
     let ret: u64;
+    // SAFETY: PSCI CPU_ON via SMC; arch-mandated secure-monitor call.
     unsafe {
         core::arch::asm!(
             "smc #0",
@@ -525,6 +539,8 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
         return false;
     }
 
+    // SAFETY: boot-time slot publishing before the secondary core wakes;
+    // CORE_STARTED check above ensures we're the sole writer.
     unsafe {
         CORE_ENTRIES[idx] = Some(entry);
     }
@@ -536,6 +552,7 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     let context_id: u64 = 0;
 
     let ret: u64;
+    // SAFETY: PSCI CPU_ON via HVC; QEMU virt uses HVC for PSCI.
     unsafe {
         core::arch::asm!(
             "hvc #0",
@@ -794,6 +811,9 @@ pub mod dma40 {
     /// Returns `true` if the transfer is complete (or errored), `false` if still active.
     #[cfg(feature = "board-cm5")]
     pub fn poll(ch: u8) -> bool {
+        // SAFETY: DMA40 CS register read at a fixed MMIO address mapped
+        // by boot_mmu::init_page_tables; `read_reg` does the channel-base
+        // arithmetic and the MMIO load.
         unsafe {
             let cs = read_reg(ch, CS);
             // Complete when not active, or END/ERROR flag set
@@ -933,6 +953,8 @@ pub mod rp1_dma {
         if ch as usize >= NUM_CHANNELS {
             return true;
         }
+        // SAFETY: RP1_DMA_BASE + CH_EN is a fixed MMIO register mapped by
+        // boot_mmu::init_page_tables; reading is side-effect-free.
         unsafe {
             let ch_en_addr = super::RP1_DMA_BASE + CH_EN;
             let en_val = core::ptr::read_volatile(ch_en_addr as *const u32);
@@ -1010,6 +1032,8 @@ pub fn dma_arena_alloc(size: usize, align: usize) -> *mut u8 {
             )
             .is_ok()
         {
+            // SAFETY: `aligned + size <= DMA_ARENA_SIZE` (loop check); the
+            // returned pointer points inside the static DMA arena.
             return unsafe { core::ptr::addr_of_mut!(DMA_ARENA).cast::<u8>().add(aligned) };
         }
     }
@@ -1089,6 +1113,8 @@ pub unsafe fn domain_state(domain_id: usize) -> &'static mut DomainExecState {
 
 /// Get shared reference to domain state.
 pub fn domain_state_ref(domain_id: usize) -> &'static DomainExecState {
+    // SAFETY: `domain_id` must be < MAX_DOMAINS; DomainExecState is
+    // `Sync` because each field is touched by the owning core only.
     unsafe { &DOMAIN_STATE[domain_id] }
 }
 
@@ -1172,6 +1198,8 @@ pub fn cross_edge_count() -> usize {
 /// Get a reference to a cross-domain edge.
 pub fn get_cross_edge(idx: usize) -> Option<&'static CrossDomainEdge> {
     if idx < cross_edge_count() {
+        // SAFETY: `idx < cross_edge_count() <= MAX_CROSS_EDGES`; the
+        // edge was published by `register_cross_edge` at boot time.
         unsafe { Some(&CROSS_EDGES[idx]) }
     } else {
         None
@@ -1212,6 +1240,7 @@ static PARKED_COUNT: AtomicU32 = AtomicU32::new(0);
 pub fn request_quiesce() {
     PARKED_COUNT.store(0, Ordering::Release);
     QUIESCE_STATE.store(QUIESCE_REQUESTED, Ordering::Release);
+    // SAFETY: DMB + SEV are architectural hints; no memory effects.
     unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
 }
 
@@ -1229,6 +1258,7 @@ pub fn park_if_requested(domain_id: usize) {
     }
     PARKED_COUNT.fetch_add(1, Ordering::AcqRel);
     while quiesce_requested() {
+        // SAFETY: WFE is a hint to wait until the next event.
         unsafe { core::arch::asm!("wfe", options(nostack)) };
     }
 }
@@ -1243,6 +1273,7 @@ pub fn wait_parked(expected: u32) {
 /// Primary-only. Release all parked domains. Pairs with `request_quiesce`.
 pub fn release_quiesce() {
     QUIESCE_STATE.store(QUIESCE_RUNNING, Ordering::Release);
+    // SAFETY: DMB + SEV are architectural hints.
     unsafe { core::arch::asm!("dmb ish", "sev", options(nostack)) };
 }
 

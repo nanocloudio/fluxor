@@ -27,6 +27,13 @@
 //! 5. DMA done: sets result, consumer sees it via SPI_TRANSFER_POLL
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -365,7 +372,6 @@ unsafe fn live_handle_idx(s: &SpiState, handle: i32) -> Option<usize> {
 
 // Provider dispatch — called from kernel via registered function pointer.
 // SAFETY: state is our SpiState, validated at registration time.
-#[unsafe(no_mangle)]
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn spi_dispatch(
@@ -567,7 +573,7 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    params: *const u8, params_len: usize,
+    _params: *const u8, _params_len: usize,
     state: *mut u8, state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {

@@ -23,6 +23,13 @@
 
 #![no_std]
 #![no_main]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
@@ -122,7 +129,7 @@ struct ClientTicketEntry {
 }
 
 #[repr(C)]
-struct QuicState {
+pub(crate) struct QuicState {
     syscalls: *const SyscallTable,
     net_in: i32,
     net_out: i32,
@@ -1388,7 +1395,7 @@ unsafe fn h3_open_uni_streams(s: &mut QuicState, idx: usize) {
     }
     let is_server = s.conns[idx].is_server;
     // Allocate three slots: control / qpack-enc / qpack-dec.
-    let mut alloc_one =
+    let alloc_one =
         |conn: &mut QuicConnection, role: H3StreamRole, type_byte: u64| -> bool {
             let id = if is_server {
                 next_server_uni_id(conn.h3_next_uni_idx)

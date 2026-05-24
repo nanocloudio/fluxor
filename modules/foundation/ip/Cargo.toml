@@ -26,3 +26,10 @@ host-test = []
 # Tests run against the same `SyscallTable` / opcode constants the
 # kernel exposes, ensuring the harness sees byte-identical types.
 fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }
+
+# Dual-build module: PIC firmware ignores this file; host harness
+# links the same source through Cargo. Inherits the workspace lint
+# baseline; `mod.rs` adds `#![allow(unsafe_code, ...)]` at module root
+# for the wire-format / zero-copy buffer code.
+[lints]
+workspace = true

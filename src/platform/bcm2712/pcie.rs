@@ -6,7 +6,10 @@
 //! plus the syscall handler wrappers that delegate to whichever is
 //! available.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 // ============================================================================
 // Constants
@@ -554,11 +557,7 @@ unsafe fn pcie1_enumerate_bus1() {
         // device so downstream tools can see it.
         if header_type != 0 {
             log::info!(
-                "[pcie1] bus1 dev{} vid={:04x} did={:04x} (bridge, htype={})",
-                dev_num,
-                vendor_id,
-                device_id,
-                header_type
+                "[pcie1] bus1 dev{dev_num} vid={vendor_id:04x} did={device_id:04x} (bridge, htype={header_type})"
             );
             cfg_w32(rc, 1, dev_num, 0, 0x04, cmd_before | 0x0006);
             pdev.identify_nic();
@@ -575,11 +574,7 @@ unsafe fn pcie1_enumerate_bus1() {
             // just `(cursor + size - 1) & !(size - 1)`.
             let aligned = (cursor + size - 1) & !(size - 1);
             if aligned + size > limit {
-                log::warn!(
-                    "[pcie1] bus1 dev{} BAR0 size={:#x} exceeds outbound window",
-                    dev_num,
-                    size
-                );
+                log::warn!("[pcie1] bus1 dev{dev_num} BAR0 size={size:#x} exceeds outbound window");
             } else {
                 let bar_lo_flags = cfg_r32(rc, 1, dev_num, 0, 0x10) & 0xF;
                 let low = ((aligned & 0xFFFF_FFF0) as u32) | bar_lo_flags;
@@ -792,6 +787,10 @@ unsafe fn pcie1_populate_devices() {
 
 #[cfg(feature = "board-cm5")]
 pub fn enumerate() -> usize {
+    // SAFETY: PCIe RC + outbound aperture MMIO accesses target fixed
+    // BCM2712 register addresses mapped by boot_mmu::init_page_tables.
+    // PCIE1_BRINGUP_DONE / DEVICE_COUNT are scheduler-thread-only globals
+    // mutated from boot and the NVMe fault-retry loop, never re-entrant.
     unsafe {
         // On a rescan after link finally came up, skip the one-shot
         // bring-up and just re-enumerate. enumerate() is called at boot
@@ -921,6 +920,8 @@ pub fn enumerate() -> usize {
 
 #[cfg(not(feature = "board-cm5"))]
 pub fn enumerate() -> usize {
+    // SAFETY: QEMU virt enumeration runs once at boot; DEVICES /
+    // DEVICE_COUNT statics have no concurrent reader yet.
     unsafe {
         DEVICE_COUNT = 0;
         let mut rp1 = PcieDevice::empty();
@@ -941,6 +942,8 @@ pub fn enumerate() -> usize {
 // ============================================================================
 
 pub fn find_by_nic_type(nic_type: PcieNicType) -> Option<usize> {
+    // SAFETY: DEVICES + DEVICE_COUNT are set once at boot by `enumerate`;
+    // read-only access from kernel-side helpers afterwards.
     unsafe {
         let devices_p = &raw const DEVICES;
         (*devices_p)
@@ -951,6 +954,8 @@ pub fn find_by_nic_type(nic_type: PcieNicType) -> Option<usize> {
 }
 
 pub fn get_device(idx: usize) -> Option<&'static PcieDevice> {
+    // SAFETY: bounds-checked against DEVICE_COUNT below; DEVICES is
+    // set once at boot.
     unsafe {
         if idx < DEVICE_COUNT {
             Some(&DEVICES[idx])
@@ -961,6 +966,7 @@ pub fn get_device(idx: usize) -> Option<&'static PcieDevice> {
 }
 
 pub fn device_count() -> usize {
+    // SAFETY: DEVICE_COUNT is a `usize` static; aligned read.
     unsafe { DEVICE_COUNT }
 }
 
@@ -972,6 +978,9 @@ pub fn device_count() -> usize {
 /// PCIe controller returns for a missing responder).
 #[cfg(feature = "board-cm5")]
 pub fn device_cfg_read32(dev_idx: usize, offset: u16) -> u32 {
+    // SAFETY: DEVICE_COUNT bounds the `DEVICES` slot we read; `dev_idx`
+    // bounds-checked. `cfg_r32` does MMIO at the RC config aperture
+    // mapped by boot_mmu::init_page_tables.
     unsafe {
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
         if dev_idx >= count {
@@ -993,6 +1002,8 @@ pub fn device_cfg_read32(_dev_idx: usize, _offset: u16) -> u32 {
 /// `dev_idx`.
 #[cfg(feature = "board-cm5")]
 pub fn device_cfg_write32(dev_idx: usize, offset: u16, val: u32) -> i32 {
+    // SAFETY: DEVICE_COUNT bounds the `DEVICES` slot we read; `dev_idx`
+    // bounds-checked. `cfg_w32` does MMIO at the RC config aperture.
     unsafe {
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
         if dev_idx >= count {
@@ -1057,16 +1068,15 @@ pub unsafe fn syscall_cfg_write32(arg: *mut u8, arg_len: usize) -> i32 {
 // ============================================================================
 
 pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
+    // SAFETY: bar_map runs on the scheduler thread; DEVICES/BAR_MAPS
+    // are set during enumeration and mutated only here.
     unsafe {
         // Use addr_of! so the log macro doesn't expand into an
         // &static-mut reference (Rust 2024 static_mut_refs).
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
         if dev_idx >= count || bar_idx >= MAX_BARS {
             log::warn!(
-                "[pcie] bar_map: dev_idx={} count={} bar_idx={} out of range",
-                dev_idx,
-                count,
-                bar_idx
+                "[pcie] bar_map: dev_idx={dev_idx} count={count} bar_idx={bar_idx} out of range"
             );
             return 0;
         }
@@ -1074,13 +1084,7 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
         let phys = dev.bars[bar_idx];
         let size = dev.bar_sizes[bar_idx];
         if phys == 0 || size == 0 {
-            log::warn!(
-                "[pcie] bar_map: dev{} bar{} phys={:#x} size={:#x}",
-                dev_idx,
-                bar_idx,
-                phys,
-                size
-            );
+            log::warn!("[pcie] bar_map: dev{dev_idx} bar{bar_idx} phys={phys:#x} size={size:#x}");
             return 0;
         }
 
@@ -1114,6 +1118,7 @@ pub fn bar_map(dev_idx: usize, bar_idx: usize) -> usize {
 }
 
 pub fn bar_unmap(virt_addr: usize) -> i32 {
+    // SAFETY: scheduler-thread mutation of BAR_MAPS.
     unsafe {
         let bar_maps_p = &raw mut BAR_MAPS;
         for m in (*bar_maps_p).iter_mut() {
@@ -1241,7 +1246,7 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
         let code = match crate::kernel::pcie_aliases::class_code(rest) {
             Some(c) => c,
             None => {
-                log::warn!("[pcie_device] unknown class selector '{}'", rest);
+                log::warn!("[pcie_device] unknown class selector '{rest}'");
                 return crate::kernel::errno::EINVAL;
             }
         };
@@ -1252,8 +1257,7 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
             if d.class == code {
                 if hit.is_some() {
                     log::warn!(
-                        "[pcie_device] class selector '@class={}' matches multiple devices",
-                        rest
+                        "[pcie_device] class selector '@class={rest}' matches multiple devices"
                     );
                     return crate::kernel::errno::EBUSY;
                 }
@@ -1270,7 +1274,7 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
     let alias = match crate::kernel::pcie_aliases::resolve(s) {
         Some(a) => a,
         None => {
-            log::warn!("[pcie_device] unknown alias '{}'", s);
+            log::warn!("[pcie_device] unknown alias '{s}'");
             return crate::kernel::errno::ENODEV;
         }
     };
@@ -1294,10 +1298,7 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
         }
         crate::kernel::pcie_aliases::PcieRoot::Pcie2 => {
             // PCIe2 (RP1) is not brought up by the bare-metal kernel.
-            log::warn!(
-                "[pcie_device] alias '{}' resolves to PCIe2; not supported",
-                s
-            );
+            log::warn!("[pcie_device] alias '{s}' resolves to PCIe2; not supported");
             crate::kernel::errno::ENODEV
         }
     }

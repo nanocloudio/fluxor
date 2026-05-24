@@ -26,7 +26,7 @@
 //! is coarse enough to work. The key device regions (0x08000000 GIC,
 //! 0x09000000 UART) fall in the first 1GB which we map as device memory.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 
 #[cfg(feature = "board-cm5")]
 mod cm5_impl {

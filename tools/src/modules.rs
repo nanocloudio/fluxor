@@ -39,11 +39,17 @@ pub struct ModuleInfo {
     pub in_place_writer: bool,
     /// Module exports module_drain for live reconfigure (header flags bit 3).
     /// Used by `fluxor info` and `fluxor diff` for transition plan display.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     pub drain_capable: bool,
     /// Fine-grained permission bitmap from the manifest. See
     /// `manifest::permission` for the category bits.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     pub permissions_bits: u8,
     /// Raw param schema bytes (if module uses define_params! macro)
     pub schema: Option<Vec<u8>>,
@@ -69,8 +75,7 @@ impl ModuleInfo {
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         if magic != MODULE_MAGIC {
             return Err(Error::Module(format!(
-                "Invalid module magic: 0x{:08x}",
-                magic
+                "Invalid module magic: 0x{magic:08x}"
             )));
         }
 
@@ -233,7 +238,7 @@ fn resolve_fmod(
     primary_dir: &Path,
     extra_dirs: &[&Path],
 ) -> Option<std::path::PathBuf> {
-    let filename = format!("{}.fmod", module_type);
+    let filename = format!("{module_type}.fmod");
     let p = primary_dir.join(&filename);
     if p.exists() {
         return Some(p);
@@ -374,7 +379,10 @@ pub struct PackResult {
 #[derive(Debug, Default)]
 struct ElfSection {
     name: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     sh_type: u32,
     addr: usize,
     data: Vec<u8>,
@@ -386,11 +394,17 @@ struct ElfSection {
 struct ElfSymbol {
     name: String,
     value: u32,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     size: u32,
     bind: u8,
     sym_type: u8,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     section_idx: u16,
 }
 

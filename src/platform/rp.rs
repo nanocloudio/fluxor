@@ -69,10 +69,10 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
 struct RingLogger;
 
 impl log::Log for RingLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
         true
     }
-    fn log(&self, record: &log::Record) {
+    fn log(&self, record: &log::Record<'_>) {
         use core::fmt::Write;
 
         // Format into a stack buffer first. A full log line fits in 256 B
@@ -117,9 +117,9 @@ impl log::Log for RingLogger {
 static RING_LOGGER: RingLogger = RingLogger;
 
 fn init_logger() {
-    // Safe: called exactly once, before any task spawns.
-    // set_max_level_racy (vs set_max_level) works on Cortex-M0+ too,
-    // which lacks target_has_atomic = "ptr".
+    // SAFETY: called exactly once at boot, before any task spawns;
+    // set_max_level_racy / set_logger_racy work on Cortex-M0+ which
+    // lacks target_has_atomic = "ptr".
     unsafe {
         let _ = log::set_logger_racy(&RING_LOGGER);
         log::set_max_level_racy(log::LevelFilter::Info);
@@ -189,7 +189,7 @@ async fn usb_cdc_task(driver: Driver<'static, USB>) {
     static BOS_DESC: StaticCell<[u8; 16]> = StaticCell::new();
     static MSOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-    static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
+    static CDC_STATE: StaticCell<CdcState<'_>> = StaticCell::new();
 
     let mut config = UsbConfig::new(0xc0de, 0xcafe);
     config.manufacturer = Some("Fluxor");
@@ -257,6 +257,8 @@ async fn main(spawner: Spawner) {
     ));
 
     // Disable watchdog — bootloader may have enabled it, and we don't feed it.
+    // SAFETY: WATCHDOG_CTRL is a fixed MMIO register on the RP2xxx peripheral
+    // bus; single boot-thread writer.
     unsafe {
         core::ptr::write_volatile(fluxor::kernel::chip::WATCHDOG_CTRL as *mut u32, 0);
     }
@@ -282,7 +284,7 @@ async fn main(spawner: Spawner) {
     let plan = match planner::resolve(hw.raw_config(), max_gpio) {
         Ok(p) => p,
         Err(e) => {
-            log::error!("[boot] resource conflict: {:?}", e);
+            log::error!("[boot] resource conflict: {e:?}");
             loop {
                 Timer::after(Duration::from_millis(1000)).await;
             }
@@ -365,7 +367,7 @@ async fn main(spawner: Spawner) {
             }
         }
 
-        log::info!("[boot] ready modules={}", module_count);
+        log::info!("[boot] ready modules={module_count}");
         scheduler::log_arena_summary();
 
         match rp_run_main_loop(module_count as usize).await {
@@ -396,6 +398,8 @@ pub static SCHEDULER_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 fn rp_disable_interrupts() -> u32 {
     let primask: u32;
+    // SAFETY: MRS PRIMASK + CPSID i are interrupt-control instructions
+    // on Cortex-M; no operands beyond the register variable.
     unsafe {
         core::arch::asm!(
             "mrs {}, PRIMASK",
@@ -408,6 +412,8 @@ fn rp_disable_interrupts() -> u32 {
 }
 
 fn rp_restore_interrupts(saved: u32) {
+    // SAFETY: MSR PRIMASK restores the prior interrupt-disable mask;
+    // counterpart to rp_disable_interrupts above.
     unsafe {
         core::arch::asm!(
             "msr PRIMASK, {}",
@@ -447,10 +453,12 @@ extern "C" {
 
 #[inline(always)]
 fn flash_start() -> usize {
+    // SAFETY: linker-defined symbol; we only take its address, never deref.
     unsafe { &__flash_start__ as *const u8 as usize }
 }
 #[inline(always)]
 fn flash_end_addr() -> usize {
+    // SAFETY: linker-defined symbol; we only take its address, never deref.
     unsafe { &__flash_end__ as *const u8 as usize }
 }
 
@@ -491,6 +499,8 @@ fn rp_pic_barrier() {
     cortex_m::asm::isb();
     let primask = cortex_m::register::primask::read();
     if !primask.is_active() {
+        // SAFETY: counter increment + interrupt re-enable; we only enable
+        // when PRIMASK shows IRQs were already enabled (mirroring caller state).
         unsafe {
             fluxor::kernel::loader::increment_irq_disabled_count();
             cortex_m::interrupt::enable();
@@ -505,10 +515,13 @@ fn rp_step_guard_post_check() {
 }
 
 fn rp_read_cycle_count() -> u32 {
+    // SAFETY: DWT CYCCNT at 0xE000_1004 is a Cortex-M debug-block register.
     unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
 }
 
 fn rp_isr_tier_init() {
+    // SAFETY: DEMCR (TRCENA) and DWT_CTRL (CYCCNTENA) are Cortex-M debug
+    // registers; single boot-thread enabler.
     unsafe {
         let demcr = 0xE000_EDFC as *mut u32;
         let val = core::ptr::read_volatile(demcr);
@@ -544,6 +557,8 @@ fn rp_boot_scan() {
 }
 
 fn rp_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize {
+    // SAFETY: forwards buf/len/max from the kernel's persistent-storage
+    // caller; flash_store::merge_runtime_overrides documents the contract.
     unsafe { fluxor::kernel::flash_store::merge_runtime_overrides(module_id as u8, buf, len, max) }
 }
 
@@ -588,6 +603,9 @@ static RP_HAL_OPS: HalOps = HalOps {
 /// 8 bits per output byte. This is genuine hardware entropy suitable for
 /// seeding cryptographic keys.
 fn rp_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+    // SAFETY: caller is `hal::csprng_fill` which guarantees `buf` is valid
+    // for `len` bytes. `i` is bounded by `len`, so `buf.add(i)` stays
+    // within the caller's buffer.
     unsafe {
         use embassy_rp::pac;
         let mut i = 0usize;
@@ -615,7 +633,11 @@ async fn rp_setup_graph_async() -> i32 {
         Err(e) => return e,
     };
 
+    // SAFETY: `static_loader` and `sched_mut` return shared globals;
+    // this function runs on the single async executor task, serial
+    // with all other scheduler-state mutators.
     let loader = unsafe { scheduler::static_loader() };
+    // SAFETY: as above.
     let sched = unsafe { scheduler::sched_mut() };
     let result = rp_instantiate_all_modules_async(
         loader,
@@ -666,6 +688,9 @@ async fn rp_instantiate_all_modules_async(
             scheduler::InstantiateResult::Done => {}
             scheduler::InstantiateResult::Pending(mut pending) => loop {
                 Timer::after(Duration::from_millis(1)).await;
+                // SAFETY: `pending` is owned here and not aliased; the loader
+                // documents `try_complete` as callable from any task as long
+                // as no other task holds the same `Pending` instance.
                 match unsafe { pending.try_complete() } {
                     Ok(Some(dynamic)) => {
                         modules[instantiated] = scheduler::ModuleSlot::Dynamic(dynamic);
@@ -679,7 +704,7 @@ async fn rp_instantiate_all_modules_async(
                 }
             },
             scheduler::InstantiateResult::Error(e) => {
-                log::error!("[inst] failed module={} error={}", module_idx, e);
+                log::error!("[inst] failed module={module_idx} error={e}");
                 return e;
             }
         }
@@ -695,13 +720,13 @@ async fn rp_instantiate_all_modules_async(
 /// Step the graph until either a rebuild is requested (returns `Some((ptr, len))`)
 /// or the graph halts (returns `None`).
 async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
+    // SAFETY: `sched_modules` returns a shared global; runs on the single
+    // async executor task, serial with the scheduler.
     let modules = unsafe { scheduler::sched_modules() };
     let tick_period_us = scheduler::tick_us() as u64;
 
     log::info!(
-        "[sched] running modules={} tick_us={}",
-        module_count,
-        tick_period_us
+        "[sched] running modules={module_count} tick_us={tick_period_us}"
     );
 
     loop {
@@ -715,7 +740,7 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
                 return None;
             }
             StepResult::Error(i) => {
-                log::error!("[sched] step error module={}", i);
+                log::error!("[sched] step error module={i}");
                 return None;
             }
         }

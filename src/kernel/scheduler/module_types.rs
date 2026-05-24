@@ -242,6 +242,9 @@ impl Module for TeeModule {
         }
 
         if self.frame_kind != FRAME_KIND_NONE {
+            // SAFETY: `step_framed` is unsafe only because it touches
+            // `FAN_BUFS` via raw pointers; the scheduler serialises calls
+            // per `self.domain` so the scratch buffer is exclusive.
             return unsafe { self.step_framed() };
         }
 
@@ -255,6 +258,9 @@ impl Module for TeeModule {
             return Ok(StepOutcome::Continue);
         }
 
+        // SAFETY: `FAN_BUFS[domain]` is the per-domain fan-out scratch;
+        // the scheduler serialises calls per domain, so this reborrow is
+        // unique for the lifetime of the step.
         let buf = unsafe {
             let p = &raw mut FAN_BUFS[self.domain as usize];
             &mut *p
@@ -271,6 +277,8 @@ impl Module for TeeModule {
             return Ok(StepOutcome::Continue);
         }
 
+        // SAFETY: `read_amount <= buf.len()` (computed above); the kernel
+        // syscall fills up to `read_amount` bytes.
         let read =
             unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), read_amount) };
         if read <= 0 {
@@ -279,6 +287,8 @@ impl Module for TeeModule {
 
         let len = read as usize;
         for idx in 0..self.out_count {
+            // SAFETY: `len <= read_amount <= buf.len()`; output rings were
+            // pre-checked for `out_space >= read_amount`.
             let wrote =
                 unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), len) };
             if wrote != read {
@@ -315,6 +325,8 @@ impl TeeModule {
         // consume yet, so a backpressured output doesn't strand the
         // header in our scratch.
         let mut hdr = [0u8; 3];
+        // SAFETY: `hdr_len <= 3` (frame_kind dictates header size); peek
+        // doesn't consume so re-runs are idempotent.
         let peeked = unsafe { channel::channel_peek(self.in_chan, hdr.as_mut_ptr(), hdr_len) };
         if peeked != hdr_len as i32 {
             return Err(-3);
@@ -322,6 +334,9 @@ impl TeeModule {
         let frame_len = decode_frame_len(self.frame_kind, &hdr);
         let total = hdr_len + frame_len;
 
+        // SAFETY: `FAN_BUFS[domain]` is the per-domain fan-out scratch;
+        // the scheduler serialises calls per domain, so this reborrow is
+        // unique for the lifetime of the step.
         let buf = unsafe {
             let p = &raw mut FAN_BUFS[self.domain as usize];
             &mut *p
@@ -353,11 +368,15 @@ impl TeeModule {
             }
         }
 
+        // SAFETY: `total <= buf.len()` (checked above) and `avail >= total`;
+        // the kernel guarantees the frame is atomic on the ring.
         let read = unsafe { channel::syscall_channel_read(self.in_chan, buf.as_mut_ptr(), total) };
         if read != total as i32 {
             return Err(-5);
         }
         for idx in 0..self.out_count {
+            // SAFETY: each output ring was pre-checked for `>= total` bytes
+            // writable above; `buf[..total]` is the just-read frame.
             let wrote =
                 unsafe { channel::syscall_channel_write(self.out_chans[idx], buf.as_ptr(), total) };
             if wrote != total as i32 {
@@ -442,6 +461,9 @@ impl Module for MergeModule {
         }
 
         if self.frame_kind != FRAME_KIND_NONE {
+            // SAFETY: `step_framed` is unsafe only because it touches
+            // `FAN_BUFS` via raw pointers; the scheduler serialises calls
+            // per `self.domain` so the scratch buffer is exclusive.
             return unsafe { self.step_framed() };
         }
 
@@ -460,6 +482,8 @@ impl Module for MergeModule {
                 continue;
             }
 
+            // SAFETY: `FAN_BUFS[domain]` is the per-domain fan-in scratch;
+            // scheduler serialises calls per domain.
             let buf = unsafe {
                 let p = &raw mut FAN_BUFS[self.domain as usize];
                 &mut *p
@@ -470,12 +494,15 @@ impl Module for MergeModule {
                 continue;
             }
 
+            // SAFETY: `read_amount <= buf.len()` (computed above).
             let read =
                 unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), read_amount) };
             if read <= 0 {
                 continue;
             }
 
+            // SAFETY: `read <= read_amount <= out_space`; output ring
+            // pre-checked to have `read_amount` writable bytes.
             let wrote = unsafe {
                 channel::syscall_channel_write(self.out_chan, buf.as_ptr(), read as usize)
             };
@@ -504,6 +531,9 @@ impl MergeModule {
     /// so the per-domain `FAN_BUFS` scratch is never held across
     /// step calls.
     unsafe fn step_framed(&mut self) -> Result<StepOutcome, i32> {
+        // SAFETY: `FAN_BUFS[domain]` is the per-domain fan-out scratch;
+        // the scheduler serialises calls per domain, so this reborrow is
+        // unique for the lifetime of the step.
         let buf = unsafe {
             let p = &raw mut FAN_BUFS[self.domain as usize];
             &mut *p
@@ -521,6 +551,7 @@ impl MergeModule {
             }
 
             let mut hdr = [0u8; 3];
+            // SAFETY: `hdr_len <= 3`; peek doesn't consume.
             let peeked = unsafe { channel::channel_peek(chan, hdr.as_mut_ptr(), hdr_len) };
             if peeked != hdr_len as i32 {
                 return Err(-3);
@@ -540,10 +571,13 @@ impl MergeModule {
                 continue;
             }
 
+            // SAFETY: `total <= buf.len()`; full frame guaranteed by
+            // `avail >= total` and kernel-atomic frame writes.
             let read = unsafe { channel::syscall_channel_read(chan, buf.as_mut_ptr(), total) };
             if read != total as i32 {
                 return Err(-5);
             }
+            // SAFETY: output ring pre-checked for `>= total` writable bytes.
             let wrote =
                 unsafe { channel::syscall_channel_write(self.out_chan, buf.as_ptr(), total) };
             if wrote != total as i32 {

@@ -229,10 +229,14 @@ pub fn dma_fd_start(
     }
     let ch_a = dma.channel_a.load(Ordering::Acquire);
     let ch_b = dma.channel_b.load(Ordering::Acquire);
+    // SAFETY: ch_a is allocated to this fd_handle; dma_start_raw programs the
+    // DMA registers for an allocated channel only.
     let rc = unsafe { dma_start_raw(ch_a, read_addr, write_addr, count, dreq, flags) };
     if rc < 0 {
         return rc;
     }
+    // SAFETY: ch_b is allocated to the same fd_handle (ping-pong pair); it is
+    // not currently running until dma_fd_queue chains to it.
     unsafe {
         dma_preconfigure_inactive(ch_b, write_addr, dreq, flags);
     }
@@ -307,6 +311,7 @@ pub fn dma_fd_restart(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
         return E_INVAL;
     }
     let ch = dma.active_ch();
+    // SAFETY: `ch` is the dma_fd's allocated active channel.
     unsafe { dma_restart_raw(ch, read_addr, count) }
 }
 
@@ -437,11 +442,7 @@ pub fn is_gpio_registered(pin_num: u8) -> bool {
 pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     let handle = gpio::gpio_claim(pin_num);
     if handle < 0 {
-        log::error!(
-            "[gpio] request_output pin {} claim failed rc={}",
-            pin_num,
-            handle
-        );
+        log::error!("[gpio] request_output pin {pin_num} claim failed rc={handle}");
         return handle;
     }
     gpio::gpio_set_owner(
@@ -450,11 +451,7 @@ pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     );
     let result = gpio::gpio_set_mode(handle, gpio::PinMode::Output, true);
     if result < 0 {
-        log::error!(
-            "[gpio] request_output pin {} set_mode failed rc={}",
-            pin_num,
-            result
-        );
+        log::error!("[gpio] request_output pin {pin_num} set_mode failed rc={result}");
         gpio::gpio_release(handle);
         return result;
     }

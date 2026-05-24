@@ -43,13 +43,13 @@ pub fn parse_uf2(content: &[u8]) -> Result<BTreeMap<u32, u8>> {
 
         // Verify magic
         if magic0 != UF2_MAGIC_START0 || magic1 != UF2_MAGIC_START1 {
-            return Err(Error::Uf2(format!("Invalid UF2 magic at block {}", i)));
+            return Err(Error::Uf2(format!("Invalid UF2 magic at block {i}")));
         }
 
         // Verify end magic
         let end_magic = u32::from_le_bytes([block[508], block[509], block[510], block[511]]);
         if end_magic != UF2_MAGIC_END {
-            return Err(Error::Uf2(format!("Invalid UF2 end magic at block {}", i)));
+            return Err(Error::Uf2(format!("Invalid UF2 end magic at block {i}")));
         }
 
         // Extract payload

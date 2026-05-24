@@ -280,6 +280,8 @@ impl Edge {
 ///
 /// Returns the number of channels opened, or -1 on error.
 pub fn open_channels(edges: &mut [Edge]) -> i32 {
+    // SAFETY: SCHED is scheduler-thread owned; read-only access via
+    // `&raw const`. open_channels runs during graph prep.
     let module_hints = unsafe {
         let p = &raw const SCHED;
         &(*p).hints
@@ -331,6 +333,8 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         let group = edge.buffer_group as usize;
         if group > 0 && group < 128 && group_channels[group] >= 0 {
             // Verify destination module can safely consume from mailbox
+            // SAFETY: SCHED is scheduler-thread owned; `edge.to_module`
+            // is bounded against MAX_MODULES by config validation.
             let safe = unsafe { SCHED.mailbox_safe[edge.to_module] };
             if safe {
                 // Alias: reuse existing channel for this group
@@ -399,6 +403,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
 ///
 /// Returns true if valid, false if constraints violated.
 pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
+    // SAFETY: SCHED is scheduler-thread owned; read-only access.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
@@ -423,9 +428,7 @@ pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
             group_writers[group] += 1;
             if group_writers[group] > 1 {
                 log::error!(
-                    "[graph] buffer_group={} duplicate in_place_writer module={}",
-                    group,
-                    to_mod
+                    "[graph] buffer_group={group} duplicate in_place_writer module={to_mod}"
                 );
                 valid = false;
             }
@@ -522,13 +525,11 @@ impl NameArena {
     /// Intern a name, returning a &'static str.
     /// Returns "?" if arena is exhausted (should not happen with MAX_NAMES == MAX_MODULES).
     fn intern(name: &str) -> &'static str {
+        // SAFETY: NameArena is scheduler-thread owned; static name buffers
+        // are accessed only from prepare_graph / instantiate paths.
         unsafe {
             if NEXT_NAME_SLOT >= MAX_NAMES {
-                log::warn!(
-                    "NameArena: exhausted ({} slots), cannot intern '{}'",
-                    MAX_NAMES,
-                    name
-                );
+                log::warn!("NameArena: exhausted ({MAX_NAMES} slots), cannot intern '{name}'");
                 return "?";
             }
 
@@ -553,6 +554,7 @@ impl NameArena {
 
     /// Reset the arena (call when tearing down the graph).
     fn reset() {
+        // SAFETY: scheduler-thread reset between graph rebuilds.
         unsafe {
             NEXT_NAME_SLOT = 0;
         }
@@ -647,6 +649,8 @@ pub unsafe fn static_config() -> &'static Config {
 /// `STATIC_CONFIG` is live (no module is mid-step, no other thread is
 /// reading config). Test-only on hosted; reconfigure-time on bare metal.
 pub unsafe fn install_static_config(cfg: Config) {
+    // SAFETY: caller upholds the `# Safety` invariant — no concurrent
+    // reader of STATIC_CONFIG is alive.
     let dst = unsafe {
         let p = &raw mut STATIC_CONFIG;
         &mut *p
@@ -685,10 +689,12 @@ pub unsafe fn populate_static_state(
     // config blob's mapped region. QEMU virt passes the gap between
     // QEMU_CONFIG_BLOB_ADDR and QEMU_MODULES_BLOB_ADDR; other
     // bare-metal paths use the slot size from their flash trailer.
+    // SAFETY: caller upholds `# Safety` — single-threaded boot/init.
     let loader = unsafe {
         let p = &raw mut STATIC_LOADER;
         &mut *p
     };
+    // SAFETY: as above.
     let config = unsafe {
         let p = &raw mut STATIC_CONFIG;
         &mut *p
@@ -696,6 +702,7 @@ pub unsafe fn populate_static_state(
     loader
         .init_from_blob(modules_ptr)
         .map_err(|_| "loader init failed")?;
+    // SAFETY: caller supplied valid (config_ptr, config_len) per `# Safety`.
     if !unsafe {
         crate::kernel::config::read_config_from_ptr_with_len(config_ptr, config_len, config)
     } {
@@ -725,10 +732,12 @@ pub unsafe fn populate_static_state_with_len(
     modules_ptr: *const u8,
     modules_len: usize,
 ) -> Result<(), &'static str> {
+    // SAFETY: caller upholds `# Safety` — single-threaded boot/init.
     let loader = unsafe {
         let p = &raw mut STATIC_LOADER;
         &mut *p
     };
+    // SAFETY: as above.
     let config = unsafe {
         let p = &raw mut STATIC_CONFIG;
         &mut *p
@@ -779,6 +788,7 @@ pub fn get_module_port(module_idx: usize, port_type: u8, port_index: u8) -> i32 
     if module_idx >= MAX_MODULES {
         return -1;
     }
+    // SAFETY: SCHED scheduler-thread owned; module_idx bounded above.
     let ports = unsafe { &SCHED.ports[module_idx] };
     let idx = port_index as usize;
     match port_type {
@@ -814,6 +824,7 @@ pub fn set_module_port(module_idx: usize, port_type: u8, port_index: u8, channel
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: SCHED scheduler-thread owned; module_idx bounded above.
     let ports = unsafe { &mut SCHED.ports[module_idx] };
     let idx = port_index as usize;
     match port_type {
@@ -1262,6 +1273,7 @@ static mut INSTANTIATION_IDX: usize = usize::MAX;
 
 /// Set the instantiation state pointer (called before module_new).
 pub fn set_instantiation_state(idx: usize, state: *mut u8) {
+    // SAFETY: scheduler-thread-only mutation; set/clear bracket each module_new.
     unsafe {
         INSTANTIATION_STATE = state;
         INSTANTIATION_IDX = idx;
@@ -1270,6 +1282,7 @@ pub fn set_instantiation_state(idx: usize, state: *mut u8) {
 
 /// Clear the instantiation state pointer (called after module_new).
 pub fn clear_instantiation_state() {
+    // SAFETY: scheduler-thread-only mutation.
     unsafe {
         INSTANTIATION_STATE = core::ptr::null_mut();
         INSTANTIATION_IDX = usize::MAX;
@@ -1291,6 +1304,7 @@ pub fn set_module_state_ptr(idx: usize, state: *mut u8) {
     if idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
         MODULE_STATE_PTR[idx] = state;
     }
@@ -1300,6 +1314,9 @@ pub fn get_module_state(idx: usize) -> *mut u8 {
     if idx >= MAX_MODULES {
         return core::ptr::null_mut();
     }
+    // SAFETY: scheduler-thread-only access; idx bounded; the SCHED.modules
+    // entry / MODULE_STATE_PTR shadow / INSTANTIATION_STATE union covers
+    // every platform's lifecycle stage.
     unsafe {
         // During module_new, the module isn't stored in SCHED yet
         if idx == INSTANTIATION_IDX && !INSTANTIATION_STATE.is_null() {
@@ -1320,6 +1337,7 @@ pub fn get_module_state(idx: usize) -> *mut u8 {
 /// Used by `check_contract_grant` to gate `provider_*` dispatch.
 pub fn current_module_cap_class() -> u8 {
     let idx = current_module_index();
+    // SAFETY: scheduler-thread-only read; current_module_index is bounded.
     unsafe { SCHED.cap_class[idx] }
 }
 
@@ -1329,6 +1347,7 @@ pub fn current_module_cap_class() -> u8 {
 /// `current_module_internal_permission`.
 pub fn current_module_required_caps() -> u32 {
     let idx = current_module_index();
+    // SAFETY: scheduler-thread-only read.
     unsafe { SCHED.required_caps[idx] }
 }
 
@@ -1337,6 +1356,7 @@ pub fn current_module_required_caps() -> u32 {
 /// — see the `permission` module in `syscalls.rs`.
 pub fn current_module_permissions() -> u8 {
     let idx = current_module_index();
+    // SAFETY: scheduler-thread-only read.
     unsafe { SCHED.permissions[idx] }
 }
 
@@ -1346,6 +1366,7 @@ pub fn get_module_exports(idx: usize) -> (usize, *const u8, u16) {
     if idx >= MAX_MODULES {
         return (0, core::ptr::null(), 0);
     }
+    // SAFETY: scheduler-thread-only read; idx bounded.
     unsafe {
         (
             SCHED.module_code_base[idx],
@@ -1365,6 +1386,7 @@ pub fn set_module_exports(
     if idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
         SCHED.module_code_base[idx] = code_base;
         SCHED.module_export_table[idx] = export_table;
@@ -1377,6 +1399,7 @@ pub fn module_code_region(idx: usize) -> (usize, u32) {
     if idx >= MAX_MODULES {
         return (0, 0);
     }
+    // SAFETY: scheduler-thread-only read; idx bounded.
     unsafe { (SCHED.module_code_base[idx], SCHED.module_code_size[idx]) }
 }
 
@@ -1387,6 +1410,7 @@ pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permission
     if idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
         SCHED.cap_class[idx] = cap_class;
         SCHED.required_caps[idx] = required_caps;
@@ -1419,6 +1443,7 @@ pub fn module_params(idx: usize) -> (*const u8, usize) {
     if idx >= MAX_MODULES {
         return (core::ptr::null(), 0);
     }
+    // SAFETY: scheduler-thread-only read; idx bounded.
     unsafe { (SCHED.module_params_ptr[idx], SCHED.module_params_len[idx]) }
 }
 
@@ -1427,6 +1452,7 @@ pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
     if idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
         SCHED.modules[idx] = ModuleSlot::BuiltIn(m);
         SCHED.ready[idx] = true;
@@ -1441,6 +1467,7 @@ pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
     if idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; idx bounded.
     unsafe {
         SCHED.modules[idx] = ModuleSlot::Dynamic(dm);
         // See store_builtin_module — same rationale.
@@ -1450,6 +1477,7 @@ pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
 
 /// Return the graph-level sample rate (0 = not configured).
 pub fn graph_sample_rate() -> u32 {
+    // SAFETY: scheduler-thread-only read.
     unsafe { SCHED.graph_sample_rate }
 }
 
@@ -1480,10 +1508,13 @@ pub struct GraphSnapshot {
 /// Safe to call after `populate_static_state` + `prepare_graph` have run;
 /// before that returns a zero-filled snapshot (every field 0).
 pub fn graph_snapshot() -> GraphSnapshot {
+    // SAFETY: scheduler-thread-only read; static_config/SCHED stable
+    // after populate_static_state + prepare_graph.
     let cfg = unsafe {
         let p = &raw const STATIC_CONFIG;
         &*p
     };
+    // SAFETY: as above.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
@@ -1500,6 +1531,7 @@ pub fn graph_snapshot() -> GraphSnapshot {
 
 /// Set the graph-level sample rate (called from config parsing).
 pub fn set_graph_sample_rate(rate: u32) {
+    // SAFETY: scheduler-thread-only mutation; called from config parse.
     unsafe {
         SCHED.graph_sample_rate = rate;
     }
@@ -1507,6 +1539,7 @@ pub fn set_graph_sample_rate(rate: u32) {
 
 /// Return the configured tick period in microseconds.
 pub fn tick_us() -> u32 {
+    // SAFETY: scheduler-thread-only read.
     let t = unsafe { SCHED.tick_us };
     if t == 0 {
         DEFAULT_TICK_US
@@ -1519,6 +1552,7 @@ pub fn tick_us() -> u32 {
 /// Falls back to global tick_us if domain has no override.
 pub fn domain_tick_us(domain_id: usize) -> u32 {
     if domain_id < MAX_DOMAINS {
+        // SAFETY: scheduler-thread-only read; domain_id bounded.
         let t = unsafe { SCHED.domain_tick_us[domain_id] };
         if t > 0 {
             return t;
@@ -1554,6 +1588,7 @@ pub mod exec_mode {
 /// stable byte→tier mapping.
 pub fn domain_exec_mode(domain_id: usize) -> u8 {
     if domain_id < MAX_DOMAINS {
+        // SAFETY: scheduler-thread-only read; domain_id bounded.
         unsafe { SCHED.domain_exec_mode[domain_id] }
     } else {
         0
@@ -1580,10 +1615,12 @@ pub fn module_is_isr_tier(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: scheduler-thread-only read; module_idx bounded.
     let d = unsafe { SCHED.domain_id[module_idx] } as usize;
     if d >= MAX_DOMAINS {
         return false;
     }
+    // SAFETY: as above; d bounded by the check just above.
     let m = unsafe { SCHED.domain_exec_mode[d] };
     is_isr_tier_exec_mode(m)
 }
@@ -1597,6 +1634,7 @@ pub fn set_domain_exec_mode(domain_id: usize, exec_mode: u8) {
     if domain_id >= MAX_DOMAINS {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; domain_id bounded.
     unsafe {
         SCHED.domain_exec_mode[domain_id] = exec_mode;
     }
@@ -1604,6 +1642,7 @@ pub fn set_domain_exec_mode(domain_id: usize, exec_mode: u8) {
 
 /// Return the number of configured domains.
 pub fn domain_count() -> usize {
+    // SAFETY: scheduler-thread-only read.
     let c = unsafe { SCHED.domain_count } as usize;
     if c == 0 {
         1
@@ -1615,6 +1654,7 @@ pub fn domain_count() -> usize {
 /// Return the module count for a specific domain.
 pub fn domain_module_count(domain_id: usize) -> usize {
     if domain_id < MAX_DOMAINS {
+        // SAFETY: scheduler-thread-only read; domain_id bounded.
         unsafe { SCHED.domain_module_count[domain_id] as usize }
     } else {
         0
@@ -1629,10 +1669,12 @@ pub fn domain_exec_order_at(domain_id: usize, i: usize) -> Option<usize> {
     if domain_id >= MAX_DOMAINS {
         return None;
     }
+    // SAFETY: domain_id bounded above.
     let count = unsafe { SCHED.domain_module_count[domain_id] as usize };
     if i >= count {
         return None;
     }
+    // SAFETY: `i < count <= MAX_MODULES`; domain_id bounded.
     Some(unsafe { SCHED.domain_exec_order[domain_id][i] as usize })
 }
 
@@ -1642,6 +1684,7 @@ pub fn module_domain_id(module_idx: usize) -> u8 {
     if module_idx >= MAX_MODULES {
         return 0;
     }
+    // SAFETY: module_idx bounded above.
     unsafe { SCHED.domain_id[module_idx] }
 }
 
@@ -1649,6 +1692,7 @@ pub fn module_domain_id(module_idx: usize) -> u8 {
 /// Called by modules during init via the REPORT_LATENCY kernel primitive.
 pub fn report_module_latency(module_idx: usize, frames: u32) {
     if module_idx < MAX_MODULES {
+        // SAFETY: scheduler-thread-only mutation; idx bounded.
         unsafe {
             SCHED.module_latency[module_idx] = frames;
         }
@@ -1658,6 +1702,7 @@ pub fn report_module_latency(module_idx: usize, frames: u32) {
 /// Get the downstream latency for a module (computed after all modules init).
 pub fn downstream_latency(module_idx: usize) -> u32 {
     if module_idx < MAX_MODULES {
+        // SAFETY: module_idx bounded above.
         unsafe { SCHED.downstream_latency[module_idx] }
     } else {
         0
@@ -1693,6 +1738,7 @@ pub fn record_step_time(module_idx: usize, elapsed_us: u32) {
         return;
     }
     let b = step_bucket(elapsed_us);
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded above.
     unsafe {
         SCHED.step_hist[module_idx][b] = SCHED.step_hist[module_idx][b].saturating_add(1);
         SCHED.step_hist_global[b] = SCHED.step_hist_global[b].saturating_add(1);
@@ -1710,6 +1756,8 @@ pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
     let hist_ptr: *const [u32; 8] = if module_idx == usize::MAX {
         &raw const SCHED.step_hist_global
     } else if module_idx < MAX_MODULES {
+        // SAFETY: module_idx < MAX_MODULES bounds the offset; `step_hist`
+        // is `[[u32; 8]; MAX_MODULES]` so the cast + `add` is in-bounds.
         unsafe {
             (&raw const SCHED.step_hist)
                 .cast::<[u32; 8]>()
@@ -1719,8 +1767,11 @@ pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
         return crate::kernel::errno::EINVAL;
     };
     for i in 0..8 {
+        // SAFETY: hist_ptr is one of the two valid pointers selected above.
         let v = unsafe { (*hist_ptr)[i] };
         let bytes = v.to_le_bytes();
+        // SAFETY: caller's `# Safety` contract: `out_buf` covers 32 bytes;
+        // i*4 ranges in 0..28 → +4 reads stay in-bounds.
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.add(i * 4), 4);
         }
@@ -1733,6 +1784,7 @@ pub fn get_fault_stats(module_idx: usize) -> FaultStats {
     if module_idx >= MAX_MODULES {
         return FaultStats::default();
     }
+    // SAFETY: scheduler-thread-only read; module_idx bounded above.
     unsafe {
         let tick = DBG_TICK;
         SCHED.fault_info[module_idx].to_stats(tick)
@@ -1749,6 +1801,7 @@ pub fn set_module_fault_policy(
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         let fi = &mut SCHED.fault_info[module_idx];
         fi.policy = policy;
@@ -1762,6 +1815,7 @@ pub fn set_module_step_deadline(module_idx: usize, deadline_us: u32) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.fault_info[module_idx].step_deadline_us = deadline_us;
     }
@@ -1776,6 +1830,7 @@ pub fn set_module_step_deadline_burst(module_idx: usize, deadline_us: u32) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.fault_info[module_idx].step_deadline_burst_us = deadline_us;
     }
@@ -1790,6 +1845,7 @@ pub fn set_module_quarantine_partner(module_idx: usize, partner: u8) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.fault_info[module_idx].quarantine_partner = partner;
     }
@@ -1806,6 +1862,7 @@ pub fn set_module_step_phase(module_idx: usize, phase: u8) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         let period = SCHED.step_period[module_idx];
         SCHED.step_counter[module_idx] = if period > 0 { phase % period } else { 0 };
@@ -1819,6 +1876,7 @@ pub fn set_module_step_period(module_idx: usize, period: u8) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.step_period[module_idx] = period;
         // Resetting the counter keeps period semantics predictable: the
@@ -1834,6 +1892,7 @@ pub fn module_fault_state(module_idx: usize) -> FaultState {
     if module_idx >= MAX_MODULES {
         return FaultState::Running;
     }
+    // SAFETY: scheduler-thread-only read; module_idx bounded.
     unsafe { SCHED.fault_info[module_idx].state }
 }
 
@@ -1843,6 +1902,7 @@ pub fn module_finished(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: scheduler-thread-only read; module_idx bounded.
     unsafe { SCHED.finished[module_idx] }
 }
 
@@ -1855,6 +1915,7 @@ pub fn set_module_deferred_ready(module_idx: usize, deferred: bool) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.deferred_ready[module_idx] = deferred;
     }
@@ -1868,6 +1929,7 @@ pub fn set_module_upstream_mask(module_idx: usize, mask: u64) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.upstream_mask[module_idx] = mask;
     }
@@ -1880,6 +1942,7 @@ pub fn clear_module_ready(module_idx: usize) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
     unsafe {
         SCHED.ready[module_idx] = false;
     }
@@ -1890,11 +1953,12 @@ pub fn module_is_ready(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: scheduler-thread-only read; module_idx bounded.
     unsafe { SCHED.ready[module_idx] }
 }
 
 /// Snapshot of a single module's scheduler-visible state. Used by
-/// diagnostics 
+/// diagnostics
 /// and by operator-facing introspection.
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleStateSnapshot {
@@ -1951,6 +2015,7 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
             slot_generation: 0,
         };
     }
+    // SAFETY: scheduler-thread-only read; module_idx bounded above.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
@@ -1977,6 +2042,8 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
 pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
     let idx = index as usize;
     let cm = current_module_index();
+    // SAFETY: scheduler-thread-only read; `cm` from `current_module_index`
+    // is bounded against MAX_MODULES.
     let ports = unsafe { &SCHED.ports[cm] };
     match port_type {
         0 => {
@@ -2031,10 +2098,12 @@ pub unsafe extern "C" fn syscall_arena_get(size_out: *mut u32) -> *mut u8 {
 ///
 /// Call this first, then call run_main_loop() if it returns true.
 pub fn setup(runner_config: &RunnerConfig) -> bool {
+    // SAFETY: setup runs once at boot; no concurrent reader yet.
     let loader = unsafe {
         let p = &raw mut STATIC_LOADER;
         &mut *p
     };
+    // SAFETY: as above.
     let config = unsafe {
         let p = &raw mut STATIC_CONFIG;
         &mut *p
@@ -2071,10 +2140,12 @@ pub fn setup(runner_config: &RunnerConfig) -> bool {
 /// Returns (module_list, module_count) on success, or -1 on error.
 /// After this call, edges/modules/module_ports/finished/exec_order are initialized.
 pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i32> {
+    // SAFETY: prepare_graph runs single-threaded during graph bring-up.
     let config = unsafe {
         let p = &raw const STATIC_CONFIG;
         &*p
     };
+    // SAFETY: as above.
     let loader = unsafe {
         let p = &raw const STATIC_LOADER;
         &*p
@@ -2101,8 +2172,10 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(-1);
     }
 
-    log::info!("[graph] modules={} edges={}", declared_modules, edge_count);
+    log::info!("[graph] modules={declared_modules} edges={edge_count}");
 
+    // SAFETY: prepare_graph is the single mutator of SCHED until
+    // graph stepping resumes; this `&mut` is exclusive.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -2221,7 +2294,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
             e.buffer_bytes = edge.buffer_bytes;
             edges[i] = e;
         } else {
-            log::error!("[graph] edge {} missing", i);
+            log::error!("[graph] edge {i} missing");
             return Err(-1);
         }
     }
@@ -2292,22 +2365,18 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // is emitted so the choice is visible in operator output.
     let cycle_count = compute_exec_order(edges, runtime_edge_count, module_count);
     if cycle_count > 0 {
-        let accept = (config.graph_flags
-            & crate::kernel::config::GRAPH_FLAG_ACCEPT_CYCLES)
-            != 0;
+        let accept = (config.graph_flags & crate::kernel::config::GRAPH_FLAG_ACCEPT_CYCLES) != 0;
         if !accept {
             log::error!(
-                "[graph] {} module(s) involved in cycles — graph rejected. \
+                "[graph] {cycle_count} module(s) involved in cycles — graph rejected. \
                  Set `scheduler: {{ accept_cycles: true }}` in the graph YAML \
-                 if these cycles are bidirectional feedback pairs.",
-                cycle_count
+                 if these cycles are bidirectional feedback pairs."
             );
             return Err(crate::kernel::errno::EINVAL);
         }
         log::warn!(
-            "[graph] accepting {} cycle module(s) under graph_flags.ACCEPT_CYCLES \
-             — stepping order within the cycle is best-effort, declaration order.",
-            cycle_count
+            "[graph] accepting {cycle_count} cycle module(s) under graph_flags.ACCEPT_CYCLES \
+             — stepping order within the cycle is best-effort, declaration order."
         );
     }
 
@@ -2338,7 +2407,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // handles immediately on return.
     for module_idx in 0..module_count {
         if !populate_module_ports_from_edges(module_idx, module_idx) {
-            log::error!("[graph] port limit exceeded for module {}", module_idx);
+            log::error!("[graph] port limit exceeded for module {module_idx}");
             return Err(-1);
         }
     }
@@ -2361,13 +2430,7 @@ pub fn log_arena_summary() {
     let (cfg_used, cfg_cap) = crate::kernel::config::config_arena_usage();
     let (buf_used, buf_cap) = crate::kernel::buffer_pool::buffer_arena_usage();
     log::info!(
-        "[arena] state={}/{} cfg={}/{} buf={}/{}",
-        state_used,
-        state_cap,
-        cfg_used,
-        cfg_cap,
-        buf_used,
-        buf_cap
+        "[arena] state={state_used}/{state_cap} cfg={cfg_used}/{cfg_cap} buf={buf_used}/{buf_cap}"
     );
 }
 
@@ -2403,10 +2466,7 @@ fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
 
     for entry in config.modules.iter().flatten() {
         if count >= MAX_MODULES {
-            log::error!(
-                "[graph] module count exceeds MAX_MODULES={} — graph rejected",
-                MAX_MODULES
-            );
+            log::error!("[graph] module count exceeds MAX_MODULES={MAX_MODULES} — graph rejected");
             return Err(crate::kernel::errno::EINVAL);
         }
 
@@ -2421,10 +2481,7 @@ fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
         }
 
         if id_to_slot[id] >= 0 {
-            log::error!(
-                "[graph] duplicate module id={} — graph rejected",
-                entry.id
-            );
+            log::error!("[graph] duplicate module id={} — graph rejected", entry.id);
             return Err(crate::kernel::errno::EINVAL);
         }
 
@@ -2446,6 +2503,7 @@ fn collect_module_hints(
     module_list: &[Option<ModuleEntry>; MAX_MODULES],
     module_count: usize,
 ) {
+    // SAFETY: prepare_graph context — single mutator of SCHED.
     let module_hints = unsafe {
         let p = &raw mut SCHED;
         &mut (*p).hints
@@ -2471,6 +2529,7 @@ fn collect_module_hints(
         // Extract mailbox_safe / in_place_writer flags early so open_channels
         // can use them for buffer-group aliasing decisions.
         let flags_byte = loaded.header.reserved[0];
+        // SAFETY: prepare_graph context — single mutator.
         unsafe {
             let p = &raw mut SCHED;
             let sched = &mut *p;
@@ -2512,6 +2571,7 @@ fn push_internal_module(
     // Mirror the domain assignment into SCHED so the per-domain
     // exec-order partitioner sees the inserted slot.
     if idx < MAX_MODULES {
+        // SAFETY: prepare_graph context — single mutator; idx bounded.
         let sched = unsafe {
             let p = &raw mut SCHED;
             &mut *p
@@ -2692,7 +2752,7 @@ fn insert_fan(
 
             // Insert tee/merge module for this port group
             if *edge_count + 1 > MAX_CHANNELS {
-                log::error!("[graph] channel limit for {} module={}", name, entry_id);
+                log::error!("[graph] channel limit for {name} module={entry_id}");
                 return false;
             }
 
@@ -2835,12 +2895,12 @@ fn validate_hardware_requirements(config: &RunnerConfig) -> bool {
     // Log which buses are available (informational for debugging)
     for bus in 0..2u8 {
         if is_spi_initialized(bus) {
-            log::info!("[boot] spi{} available", bus);
+            log::info!("[boot] spi{bus} available");
         }
     }
     for bus in 0..2u8 {
         if crate::kernel::syscalls::is_i2c_initialized(bus) {
-            log::info!("[boot] i2c{} available", bus);
+            log::info!("[boot] i2c{bus} available");
         }
     }
 
@@ -2861,6 +2921,7 @@ pub fn populate_module_ports_from_edges(module_idx: usize, instantiated: usize) 
     if module_idx >= MAX_MODULES || instantiated >= MAX_MODULES {
         return false;
     }
+    // SAFETY: graph-prep context — single mutator; both indices bounded.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -2894,23 +2955,15 @@ fn populate_ports(
     ctrl_count: usize,
 ) -> bool {
     if in_count > MAX_PORTS {
-        log::error!("[inst] input port limit in={} max={}", in_count, MAX_PORTS);
+        log::error!("[inst] input port limit in={in_count} max={MAX_PORTS}");
         return false;
     }
     if out_count > MAX_PORTS {
-        log::error!(
-            "[inst] output port limit out={} max={}",
-            out_count,
-            MAX_PORTS
-        );
+        log::error!("[inst] output port limit out={out_count} max={MAX_PORTS}");
         return false;
     }
     if ctrl_count > MAX_PORTS {
-        log::error!(
-            "[inst] ctrl port limit ctrl={} max={}",
-            ctrl_count,
-            MAX_PORTS
-        );
+        log::error!("[inst] ctrl port limit ctrl={ctrl_count} max={MAX_PORTS}");
         return false;
     }
     ports.in_count = in_count as u8;
@@ -3029,6 +3082,7 @@ pub fn instantiate_one_module(
     let syscalls = get_table_for_module_type(found_module.header.module_type);
 
     // Record capability class and manifest metadata for enforcement
+    // SAFETY: instantiate_one_module runs on the scheduler thread.
     unsafe {
         let p = &raw mut SCHED;
         let sched = &mut *p;
@@ -3056,6 +3110,8 @@ pub fn instantiate_one_module(
     }
 
     // Check for optional module_arena_size export and allocate if present
+    // SAFETY: scheduler-thread context; arena_size_fn is the validated
+    // export address resolved from the module header.
     unsafe {
         let p = &raw mut SCHED;
         let sched = &mut *p;
@@ -3084,6 +3140,8 @@ pub fn instantiate_one_module(
     }
 
     // Copy params to static buffer and merge runtime overrides
+    // SAFETY: PARAM_BUFFER is scheduler-thread owned; consumed by
+    // start_new below.
     unsafe {
         let pb = &mut *core::ptr::addr_of_mut!(PARAM_BUFFER);
         pb.write(entry.params());
@@ -3105,6 +3163,8 @@ pub fn instantiate_one_module(
     // module_new() can identify the calling module (state pointer,
     // heap, required_caps, loader-driven provider registration).
     set_current_module(instantiated);
+    // SAFETY: PARAM_BUFFER lives for the duration of start_new; the
+    // pointer's lifetime is bounded by this scope.
     let result = unsafe {
         let pb = core::ptr::addr_of!(PARAM_BUFFER);
         DynamicModule::start_new(
@@ -3130,6 +3190,7 @@ pub fn instantiate_one_module(
         }
         Ok(StartNewResult::Pending(pending)) => {
             // Record step period before returning
+            // SAFETY: scheduler-thread context; instantiated bounded.
             unsafe {
                 SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
                 // Apply the manifest's `step_phase` as the initial
@@ -3152,6 +3213,7 @@ pub fn instantiate_one_module(
     }
 
     // Record step frequency hint from module header
+    // SAFETY: scheduler-thread context; instantiated bounded.
     unsafe {
         SCHED.step_period[instantiated] = found_module.header.step_period_ticks();
         // See Pending arm above — same step_phase initialisation.
@@ -3180,6 +3242,7 @@ pub fn instantiate_one_module(
 /// feed data into module i via edges. Used with ready[] to skip modules
 /// whose upstream infrastructure hasn't signaled Ready yet.
 fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
+    // SAFETY: scheduler-thread (prepare_graph) context.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -3215,6 +3278,7 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
 /// loses the diagnostic. Returns the number of modules that could NOT be
 /// topologically ordered (0 = no cycles).
 fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) -> usize {
+    // SAFETY: prepare_graph context — single mutator.
     let exec_order = unsafe {
         let p = &raw mut SCHED;
         &mut (*p).exec_order
@@ -3283,15 +3347,14 @@ fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) ->
             }
         }
         log::error!(
-            "[scheduler] graph has {} module(s) in a cycle (first unordered idx={}); \
+            "[scheduler] graph has {cycle_count} module(s) in a cycle (first unordered idx={first_unordered}); \
              v1 has no typed feedback edges — cycles are appended at the end in \
              declaration order, and `prepare_graph` decides whether to accept or \
              reject the resulting graph based on `graph_flags.ACCEPT_CYCLES`",
-            cycle_count,
-            first_unordered,
         );
     }
 
+    // SAFETY: prepare_graph context — single mutator.
     unsafe {
         SCHED.exec_order_count = count;
     }
@@ -3305,6 +3368,7 @@ fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count: usize) ->
 /// are ready for Epic 6 multi-core where each domain maps to a core.
 /// Accesses SCHED global directly to avoid borrow conflicts.
 fn compute_domain_exec_orders_static(_module_count: usize) {
+    // SAFETY: prepare_graph context — single mutator.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -3342,7 +3406,7 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
             } else {
                 sched.tick_us
             };
-            log::info!("[domain] {} modules={} tick_us={}", d, count, tick);
+            log::info!("[domain] {d} modules={count} tick_us={tick}");
         }
     }
 }
@@ -3365,6 +3429,7 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
 /// the module (see nvme `write_bufs[]`) and do their own DC CVAC via
 /// the `DMA_FLUSH` syscall before device submission.
 pub fn log_dma_owned_edges(edge_count: usize) {
+    // SAFETY: scheduler-thread-only read.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
@@ -3386,10 +3451,7 @@ pub fn log_dma_owned_edges(edge_count: usize) {
         }
     }
     if n > 0 {
-        log::info!(
-            "[sched] {} DmaOwned edges declared (maintenance deferred)",
-            n
-        );
+        log::info!("[sched] {n} DmaOwned edges declared (maintenance deferred)");
     }
 }
 
@@ -3410,14 +3472,12 @@ pub fn log_dma_owned_edges_from_config(edges: &[Option<crate::kernel::config::Gr
         }
     }
     if n > 0 {
-        log::info!(
-            "[sched] {} DmaOwned edges declared (maintenance deferred)",
-            n
-        );
+        log::info!("[sched] {n} DmaOwned edges declared (maintenance deferred)");
     }
 }
 
 fn validate_domains_static(module_count: usize, edge_count: usize) {
+    // SAFETY: prepare_graph context — single reader on the scheduler thread.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
@@ -3432,7 +3492,7 @@ fn validate_domains_static(module_count: usize, edge_count: usize) {
     // Warn on empty domains
     for d in 0..effective_domains {
         if sched.domain_module_count[d] == 0 {
-            log::warn!("[domain] domain {} is empty (no modules assigned)", d);
+            log::warn!("[domain] domain {d} is empty (no modules assigned)");
         }
     }
 
@@ -3484,10 +3544,7 @@ fn validate_domains_static(module_count: usize, edge_count: usize) {
         };
         if domain_tick < 500 && count > 8 {
             log::warn!(
-                "[domain] domain {} has {} modules with tick_us={} — may exceed tick budget",
-                d,
-                count,
-                domain_tick
+                "[domain] domain {d} has {count} modules with tick_us={domain_tick} — may exceed tick budget"
             );
         }
     }
@@ -3530,6 +3587,7 @@ pub fn compute_downstream_latency(sched: &mut SchedulerState, module_count: usiz
 /// releases owned handles, and marks the module finished.
 /// `error_code`: None = module done normally, Some(rc) = error with return code.
 fn finalize_module(module_idx: usize, error_code: Option<i32>, type_name: &str, context: &str) {
+    // SAFETY: scheduler-thread context (called from step_modules teardown).
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -3541,20 +3599,9 @@ fn finalize_module(module_idx: usize, error_code: Option<i32>, type_name: &str, 
         POLL_HUP as u8
     }; // u8: sticky_events is AtomicU8
     if let Some(rc) = error_code {
-        log::warn!(
-            "[sched] module {} ({}) error rc={}{}",
-            module_idx,
-            type_name,
-            rc,
-            context
-        );
+        log::warn!("[sched] module {module_idx} ({type_name}) error rc={rc}{context}");
     } else {
-        log::info!(
-            "[sched] module {} ({}) done{}",
-            module_idx,
-            type_name,
-            context
-        );
+        log::info!("[sched] module {module_idx} ({type_name}) done{context}");
     }
 
     let ports = &sched.ports[module_idx];
@@ -3574,6 +3621,7 @@ pub static mut DBG_TICK: u32 = 0;
 
 /// Current tick count (milliseconds since boot). Used by timer FDs on aarch64.
 pub fn tick_count() -> u32 {
+    // SAFETY: DBG_TICK is a u32 static; aligned read.
     unsafe { DBG_TICK }
 }
 
@@ -3605,8 +3653,8 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
     }
     let ms = crate::kernel::hal::now_millis();
     match domain_id {
-        Some(d) => log::info!("[sched] alive t={} elapsed_ms={} domain={}", tick, ms, d),
-        None => log::info!("[sched] alive t={} elapsed_ms={}", tick, ms),
+        Some(d) => log::info!("[sched] alive t={tick} elapsed_ms={ms} domain={d}"),
+        None => log::info!("[sched] alive t={tick} elapsed_ms={ms}"),
     }
 }
 /// Last module index attempted before a crash — readable by HardFault handler
@@ -3651,6 +3699,8 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
         pos = 4; // Skip header (magic, version, length)
     }
 
+    // SAFETY: parse_protection_config runs during instantiation —
+    // scheduler-thread, no concurrent reader on this module's slot.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -3703,7 +3753,7 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 // Signature verification happens in the loader; this tag only
                 // surfaces the outcome for telemetry.
                 if params[pos] == 3 {
-                    log::warn!("[trust] module {} is unsigned", module_idx);
+                    log::warn!("[trust] module {module_idx} is unsigned");
                 }
             }
             0xF5 if len == 1 => {
@@ -3736,10 +3786,7 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
             }
             0xF9 if len == 1 => {
                 // heap.alloc_failure_policy (u8 bool: false=null, true=fault)
-                crate::kernel::heap::set_fault_on_alloc_failure(
-                    module_idx,
-                    params[pos] != 0,
-                );
+                crate::kernel::heap::set_fault_on_alloc_failure(module_idx, params[pos] != 0);
             }
             0xFA if len == 1 => {
                 // heap.canary_enabled (u8 bool)
@@ -3787,7 +3834,10 @@ fn enforce_drain_timeout(
     // Indexed loop — body touches `sched.finished[i]`, `sched.fault_info[i]`,
     // and `modules[i]` together; an iterator over one array can't reach
     // the parallel state on the others.
-    #[allow(clippy::needless_range_loop)]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "iteration over indices avoids borrow conflicts on the collection"
+    )]
     for i in 0..count {
         if !sched.finished[i] {
             sched.fault_info[i].state = FaultState::Terminated;
@@ -3870,6 +3920,7 @@ fn apply_quarantine(
     module_idx: usize,
     active_count: &mut usize,
 ) {
+    // SAFETY: DBG_TICK is a u32 static; aligned read.
     let tick = unsafe { DBG_TICK };
     // Collect every module to quarantine — both the freshly-faulted
     // module's declared partner AND any already-faulted module that
@@ -3885,8 +3936,7 @@ fn apply_quarantine(
         && forward != module_idx
         && !sched.finished[forward]
         && sched.fault_info[forward].fault_count > 0
-        && tick.wrapping_sub(sched.fault_info[forward].last_fault_tick)
-            <= QUARANTINE_WINDOW_TICKS
+        && tick.wrapping_sub(sched.fault_info[forward].last_fault_tick) <= QUARANTINE_WINDOW_TICKS
     {
         targets[forward] = true;
     }
@@ -3897,7 +3947,10 @@ fn apply_quarantine(
     // the per-fault cost is bounded. Indexed loop because the body
     // reads from `sched.finished` and `sched.fault_info` and writes
     // to `targets` — three parallel arrays keyed by module index.
-    #[allow(clippy::needless_range_loop)]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "iteration over indices avoids borrow conflicts on the collection"
+    )]
     for i in 0..MAX_MODULES {
         if i == module_idx || sched.finished[i] {
             continue;
@@ -3908,9 +3961,7 @@ fn apply_quarantine(
         if sched.fault_info[i].fault_count == 0 {
             continue;
         }
-        if tick.wrapping_sub(sched.fault_info[i].last_fault_tick)
-            <= QUARANTINE_WINDOW_TICKS
-        {
+        if tick.wrapping_sub(sched.fault_info[i].last_fault_tick) <= QUARANTINE_WINDOW_TICKS {
             targets[i] = true;
         }
     }
@@ -3929,11 +3980,7 @@ fn apply_quarantine(
     // `alloc` from kernel-side code (which is no_std).
     let target_count = targets.iter().filter(|t| **t).count();
     log::warn!(
-        "MON_QUARANTINE module={} partner_count={} tick={} window={}",
-        module_idx,
-        target_count,
-        tick,
-        QUARANTINE_WINDOW_TICKS,
+        "MON_QUARANTINE module={module_idx} partner_count={target_count} tick={tick} window={QUARANTINE_WINDOW_TICKS}",
     );
 
     // Terminate self first, then every named target. Use a tiny
@@ -3941,17 +3988,15 @@ fn apply_quarantine(
     let mut term = |idx: usize| {
         if idx < MAX_MODULES && !sched.finished[idx] {
             sched.fault_info[idx].state = FaultState::Terminated;
-            finalize_module(
-                idx,
-                Some(-111),
-                modules[idx].type_name(),
-                " (quarantined)",
-            );
+            finalize_module(idx, Some(-111), modules[idx].type_name(), " (quarantined)");
             *active_count -= 1;
         }
     };
     term(module_idx);
-    #[allow(clippy::needless_range_loop)]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "iteration over indices avoids borrow conflicts on the collection"
+    )]
     for i in 0..MAX_MODULES {
         if targets[i] {
             term(i);
@@ -3966,6 +4011,7 @@ fn handle_step_timeout(
     module_idx: usize,
     active_count: &mut usize,
 ) {
+    // SAFETY: DBG_TICK is a u32 static; aligned read.
     let tick = unsafe { DBG_TICK };
     // Capture cascade + last-input bytes BEFORE taking the mutable
     // borrow on fault_info — both helpers read sched immutably and
@@ -4016,6 +4062,7 @@ fn handle_step_error(
     active_count: &mut usize,
     context: &str,
 ) {
+    // SAFETY: DBG_TICK aligned u32 static read.
     let tick = unsafe { DBG_TICK };
     let caused_by = detect_caused_by(sched, module_idx, tick);
     let last_input_ct = last_input_content_type(module_idx);
@@ -4062,6 +4109,7 @@ fn handle_mpu_fault(
     module_idx: usize,
     active_count: &mut usize,
 ) {
+    // SAFETY: DBG_TICK aligned u32 static read.
     let tick = unsafe { DBG_TICK };
     let caused_by = detect_caused_by(sched, module_idx, tick);
     let last_input_ct = last_input_content_type(module_idx);
@@ -4197,6 +4245,8 @@ fn handle_module_restart(
 }
 
 pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> StepResult {
+    // SAFETY: scheduler thread is the sole stepper; `modules` is passed
+    // through by the caller (per-platform main loop) which owns it.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -4208,7 +4258,9 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     if sched.prepare_in_progress {
         return StepResult::Done;
     }
+    // SAFETY: DBG_TICK is u32; aligned read.
     let tick = unsafe { DBG_TICK };
+    // SAFETY: scheduler-thread sole writer.
     unsafe {
         DBG_TICK += 1;
     }
@@ -4227,6 +4279,9 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // by the platform's outer loop via `maybe_emit_alive`.
     let crash_check_tick = (30_000_000u32 / sched.tick_us.max(1)).max(1);
     if tick == crash_check_tick {
+        // SAFETY: CRASH_DATA is in `.uninit` and survives soft reset; we
+        // read 8 u32 words (32 bytes) which match the section size, and
+        // re-clear `magic` afterwards so the path runs once per boot.
         unsafe {
             let crash = (&raw const CRASH_DATA) as *const u32;
             let magic = core::ptr::read_volatile(crash);
@@ -4239,14 +4294,9 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
                 let cfsr = core::ptr::read_volatile(crash.add(6));
                 let bfar = core::ptr::read_volatile(crash.add(7));
                 log::error!(
-                    "[crash] pc={:08x} lr={:08x} r0={:08x} mod={} t={}",
-                    pc,
-                    lr,
-                    r0,
-                    module,
-                    prev_tick
+                    "[crash] pc={pc:08x} lr={lr:08x} r0={r0:08x} mod={module} t={prev_tick}"
                 );
-                log::error!("[crash] cfsr={:08x} bfar={:08x}", cfsr, bfar);
+                log::error!("[crash] cfsr={cfsr:08x} bfar={bfar:08x}");
                 core::ptr::write_volatile((&raw mut CRASH_DATA) as *mut u32, 0);
             }
         }
@@ -4316,7 +4366,14 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         if module_idx >= count {
             continue;
         }
-        step_one_module(modules, sched, module_idx, not_ready, &mut active_count, false);
+        step_one_module(
+            modules,
+            sched,
+            module_idx,
+            not_ready,
+            &mut active_count,
+            false,
+        );
 
         // Check the budget of the domain the *just-stepped*
         // module belongs to — not always domain 0. Two reasons to
@@ -4428,6 +4485,7 @@ fn record_domain_budget_overrun(
         sched.domain_budget_us_limit[domain_id],
         last_module_idx,
         sched.domain_budget_overruns[domain_id],
+        // SAFETY: DBG_TICK aligned u32 read.
         unsafe { DBG_TICK },
     );
 }
@@ -4438,6 +4496,7 @@ pub fn domain_budget_overruns(domain_id: usize) -> u32 {
     if domain_id >= MAX_DOMAINS {
         return 0;
     }
+    // SAFETY: scheduler-thread read; domain_id bounded.
     unsafe { SCHED.domain_budget_overruns[domain_id] }
 }
 
@@ -4449,6 +4508,7 @@ pub fn domain_budget_us_consumed(domain_id: usize) -> u64 {
     if domain_id >= MAX_DOMAINS {
         return 0;
     }
+    // SAFETY: scheduler-thread read; domain_id bounded.
     unsafe { SCHED.domain_budget_us_consumed[domain_id] }
 }
 
@@ -4460,6 +4520,7 @@ pub fn set_domain_budget_us_limit(domain_id: usize, limit_us: u32) {
     if domain_id >= MAX_DOMAINS {
         return;
     }
+    // SAFETY: scheduler-thread mutation; domain_id bounded.
     unsafe {
         SCHED.domain_budget_us_limit[domain_id] = limit_us;
     }
@@ -4472,6 +4533,8 @@ pub fn step_domain_modules(
     if domain_id >= MAX_DOMAINS {
         return StepResult::Done;
     }
+    // SAFETY: scheduler-thread context — multi-domain platform's caller
+    // (BCM2712 core pump) is the sole stepper for this domain.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -4492,6 +4555,8 @@ pub fn step_domain_modules(
     // a platform tick. Multi-core races on `DBG_TICK++` already exist
     // on event-wake paths; this doesn't make them worse.
     if domain_id == 0 {
+        // SAFETY: domain 0 is the canonical tick advancer; the
+        // race with event-wake paths is documented above.
         unsafe {
             DBG_TICK = DBG_TICK.wrapping_add(1);
         }
@@ -4500,6 +4565,7 @@ pub fn step_domain_modules(
     // Drain timeout ceiling — same check as `step_modules`. Tick is
     // read off `DBG_TICK` here just as the flat path does.
     let count = sched.active_module_count;
+    // SAFETY: DBG_TICK aligned u32 read.
     let tick = unsafe { DBG_TICK };
     if enforce_drain_timeout(sched, modules, count, tick) {
         return StepResult::Done;
@@ -4543,7 +4609,14 @@ pub fn step_domain_modules(
         if module_idx >= count {
             continue;
         }
-        step_one_module(modules, sched, module_idx, not_ready, &mut active_count, false);
+        step_one_module(
+            modules,
+            sched,
+            module_idx,
+            not_ready,
+            &mut active_count,
+            false,
+        );
 
         // Per-domain budget enforcement: if cumulative step time has
         // exceeded the domain's tick budget, log + count + skip the
@@ -4773,6 +4846,9 @@ fn step_one_module(
         // Set current_module so channel_port works during module_step
         set_current_module(module_idx);
         // Track for HardFault diagnosis
+        // SAFETY: DBG_STEP_MODULE is a u8 diagnostic — single writer
+        // (this scheduler thread); the fault handler reads it via
+        // `read_volatile`.
         unsafe {
             core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
         }
@@ -4805,7 +4881,7 @@ fn step_one_module(
                 // bottom of the module stack is clobbered by an overflow.
                 // Re-arm it so the next module starts with a clean band.
                 if !crate::kernel::mpu::check_stack_canary() {
-                    log::error!("[mpu] module {} stack canary violated", module_idx);
+                    log::error!("[mpu] module {module_idx} stack canary violated");
                     crate::kernel::mpu::reinit_stack_canary();
                     handle_mpu_fault(sched, modules, module_idx, active_count);
                 }
@@ -4864,9 +4940,8 @@ fn step_one_module(
                             if limit > 0 {
                                 let elapsed_now =
                                     crate::kernel::hal::now_micros().wrapping_sub(module_t0);
-                                let projected = sched
-                                    .domain_budget_us_consumed[d]
-                                    .saturating_add(elapsed_now);
+                                let projected =
+                                    sched.domain_budget_us_consumed[d].saturating_add(elapsed_now);
                                 if projected > limit {
                                     log::warn!(
                                         "MON_BURST_BUDGET_ABORT module={} domain={} \
@@ -4964,6 +5039,7 @@ fn step_one_module(
 /// step-time recording, step-guard arm/disarm, stack-canary check,
 /// burst MPU-fault handling — from the shared body.
 pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize, wake_bits: u64) {
+    // SAFETY: scheduler thread is the sole stepper.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -5003,7 +5079,14 @@ pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize,
         if (wake_bits & (1u64 << module_idx)) == 0 {
             continue;
         }
-        step_one_module(modules, sched, module_idx, not_ready, &mut active_count, true);
+        step_one_module(
+            modules,
+            sched,
+            module_idx,
+            not_ready,
+            &mut active_count,
+            true,
+        );
     }
 }
 
@@ -5016,6 +5099,7 @@ pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize,
 
 /// Return the current reconfigure phase.
 pub fn reconfigure_phase() -> ReconfigurePhase {
+    // SAFETY: scheduler-thread read.
     unsafe { SCHED.reconfigure_phase }
 }
 
@@ -5025,6 +5109,7 @@ pub fn reconfigure_phase() -> ReconfigurePhase {
 /// scheduler step paths short-circuit to `StepResult::Done` (or no-op
 /// for event wakes) — the graph is not safe to step.
 pub fn prepare_in_progress() -> bool {
+    // SAFETY: scheduler-thread read of the transaction marker.
     unsafe { SCHED.prepare_in_progress }
 }
 
@@ -5035,6 +5120,7 @@ pub fn prepare_in_progress() -> bool {
 /// the marker so a subsequent `Running → Migrating` transition (the
 /// normal happy path) doesn't false-trip the timeout.
 pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
+    // SAFETY: reconfigure orchestrator runs on the scheduler thread.
     unsafe {
         let was_draining = SCHED.reconfigure_phase == ReconfigurePhase::Draining;
         SCHED.reconfigure_phase = phase;
@@ -5053,6 +5139,7 @@ pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
 
 /// Return the number of active modules in the current graph.
 pub fn active_module_count() -> usize {
+    // SAFETY: scheduler-thread read.
     unsafe { SCHED.active_module_count }
 }
 
@@ -5062,6 +5149,7 @@ pub fn active_module_count() -> usize {
 /// `active_module_count` after a clean graph prepare; >0 once any module
 /// has been ordered.
 pub fn exec_order_count() -> usize {
+    // SAFETY: scheduler-thread read.
     unsafe { SCHED.exec_order_count }
 }
 
@@ -5070,6 +5158,7 @@ pub fn exec_order_count() -> usize {
 /// domain-based instantiator) but which still want queries like
 /// `RECONFIGURE_MODULE_COUNT` to report the right value.
 pub fn set_active_module_count(n: usize) {
+    // SAFETY: scheduler-thread mutation.
     unsafe {
         SCHED.active_module_count = n;
     }
@@ -5081,12 +5170,15 @@ pub fn call_module_drain(module_idx: usize) -> i32 {
     if module_idx >= MAX_MODULES {
         return -1;
     }
+    // SAFETY: scheduler-thread read.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
     };
     if let ModuleSlot::Dynamic(ref m) = sched.modules[module_idx] {
         set_current_module(module_idx);
+        // SAFETY: `m` is the dynamic-module slot's owned handle; `call_drain`
+        // is its ABI surface invoked from a safe scheduler context.
         unsafe { m.call_drain() }
     } else {
         -1
@@ -5096,6 +5188,7 @@ pub fn call_module_drain(module_idx: usize) -> i32 {
 /// Mark a module as finished so the scheduler skips it in future ticks.
 pub fn mark_module_finished(module_idx: usize) {
     if module_idx < MAX_MODULES {
+        // SAFETY: scheduler-thread mutation; module_idx bounded.
         unsafe {
             let p = &raw mut SCHED;
             (*p).finished[module_idx] = true;
@@ -5131,10 +5224,14 @@ pub fn raise_module_fault(module_idx: usize, fault_kind: u8) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: heap-side caller runs on the scheduler thread (per the
+    // contract documented above: "policy runs next tick"); we only
+    // flip the fault-state machine here, finalisation happens later.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
     };
+    // SAFETY: DBG_TICK aligned u32 read.
     let tick = unsafe { DBG_TICK };
     let caused_by = detect_caused_by(sched, module_idx, tick);
     let last_input_ct = last_input_content_type(module_idx);
@@ -5180,6 +5277,7 @@ pub fn module_info_flags(module_idx: usize) -> u32 {
     if module_idx >= MAX_MODULES {
         return 0;
     }
+    // SAFETY: scheduler-thread read.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
@@ -5207,6 +5305,7 @@ pub fn module_upstream_mask(module_idx: usize) -> u64 {
     if module_idx >= MAX_MODULES {
         return 0;
     }
+    // SAFETY: scheduler-thread read; module_idx bounded.
     unsafe { SCHED.upstream_mask[module_idx] }
 }
 
@@ -5215,6 +5314,7 @@ pub fn module_is_finished(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
         return false;
     }
+    // SAFETY: scheduler-thread read; module_idx bounded.
     unsafe { SCHED.finished[module_idx] }
 }
 
@@ -5226,6 +5326,8 @@ pub fn module_is_finished(module_idx: usize) -> bool {
 /// until the main loop consumes the request. A null pointer with zero length
 /// signals "reload current STATIC_CONFIG".
 pub unsafe fn request_rebuild(config_ptr: *const u8, config_len: usize) {
+    // SAFETY: caller upholds `# Safety` invariant (pointer validity); the
+    // request is consumed before the main loop re-enters `prepare_graph`.
     unsafe {
         let p = &raw mut SCHED;
         (*p).rebuild_request = Some((config_ptr, config_len));
@@ -5234,6 +5336,7 @@ pub unsafe fn request_rebuild(config_ptr: *const u8, config_len: usize) {
 
 /// Consume the pending rebuild request, if any.
 pub fn take_rebuild_request() -> Option<(*const u8, usize)> {
+    // SAFETY: scheduler-thread mutation; single consumer (main loop).
     unsafe {
         let p = &raw mut SCHED;
         (*p).rebuild_request.take()
@@ -5252,6 +5355,7 @@ pub fn free_module_state(module_idx: usize) {
     if module_idx >= MAX_MODULES {
         return;
     }
+    // SAFETY: graph-rebuild context — scheduler thread is the sole mutator.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -5260,6 +5364,8 @@ pub fn free_module_state(module_idx: usize) {
     // Heap arena (from module_arena_size export, if any).
     let arena = sched.arenas[module_idx];
     if !arena.ptr.is_null() && arena.size > 0 {
+        // SAFETY: `(arena.ptr, arena.size)` was returned by
+        // `loader::alloc_state(size)` during instantiation.
         unsafe {
             crate::kernel::loader::free_state_range(arena.ptr, arena.size as usize);
         }
@@ -5269,6 +5375,7 @@ pub fn free_module_state(module_idx: usize) {
     // State buffer lives inside the DynamicModule; consume the slot.
     let slot = core::mem::replace(&mut sched.modules[module_idx], ModuleSlot::Empty);
     if let ModuleSlot::Dynamic(m) = slot {
+        // SAFETY: `m` is the just-replaced slot; no other reference is live.
         unsafe {
             m.free();
         }
@@ -5380,6 +5487,7 @@ pub type BuiltinModuleEntry = (&'static str, fn(*mut u8) -> i32);
 /// created automatically: module[0].out → module[1].in → module[1].out → ...
 pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
     let count = modules.len().min(MAX_MODULES);
+    // SAFETY: built-in graph runs on a single core (qemu/rp) without PIC.
     let sched = unsafe {
         let p = &raw mut SCHED;
         &mut *p
@@ -5408,9 +5516,12 @@ pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
         let state = m.state.as_mut_ptr();
         // Input channel (from previous module)
         let in_ch: i32 = if i > 0 { channels[i - 1] } else { -1 };
+        // SAFETY: `state` is the just-constructed BuiltInModule's state
+        // buffer (≥ 8 bytes by construction); single writer here.
         unsafe { core::ptr::write(state as *mut i32, in_ch) };
         // Output channel (to next module)
         let out_ch: i32 = if i < count - 1 { channels[i] } else { -1 };
+        // SAFETY: as above; second 4 bytes of the state buffer.
         unsafe { core::ptr::write(state.add(4) as *mut i32, out_ch) };
 
         sched.modules[i] = ModuleSlot::BuiltIn(m);
@@ -5418,7 +5529,7 @@ pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
         i += 1;
     }
 
-    log::info!("[sched] running modules={} channels={}", count, chan_count);
+    log::info!("[sched] running modules={count} channels={chan_count}");
 
     // Synchronous main loop
     loop {
@@ -5427,15 +5538,19 @@ pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
         // externally via `kernel_step()`, so this loop is unreachable
         // there — gate the asm so wasm32 compiles cleanly.
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        // SAFETY: WFI is a hint to halt the core until an interrupt;
+        // no register/memory side-effects beyond the architectural wait.
         unsafe {
             core::arch::asm!("wfi"); // Wait for timer tick
         }
         #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
         core::hint::spin_loop();
 
+        // SAFETY: built-in graph runs single-threaded.
         unsafe {
             DBG_TICK += 1;
         }
+        // SAFETY: DBG_TICK aligned u32 read.
         let tick = unsafe { DBG_TICK };
 
         step_modules(&mut sched.modules, count);

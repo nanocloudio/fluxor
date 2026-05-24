@@ -1,5 +1,12 @@
 #![cfg_attr(not(feature = "host-linux"), no_std)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    unsafe_code,
+    reason = "kernel + driver platform: MMIO, raw pointers, FFI, and bare-metal boot paths pervade the crate"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "kernel exposes raw-pointer entry points crossing the ABI boundary; deref is gated by the contract documented at each call site, not the type signature"
+)]
 
 #[cfg(any(
     feature = "rp",

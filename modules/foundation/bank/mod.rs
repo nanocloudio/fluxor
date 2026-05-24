@@ -51,6 +51,12 @@
 //!   - `status` : `{ index: u16, count: u16, file_type: u8, flags: u8 }`
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
 
 use core::ffi::c_void;
 
@@ -58,7 +64,6 @@ use core::ffi::c_void;
 // are gated to `target_os = "none"` / `wasm32`); provide a host
 // fallback for the one intrinsic the audio sub-codecs reach for.
 #[cfg(feature = "host-test")]
-#[allow(non_snake_case)]
 pub unsafe fn __aeabi_memclr(dest: *mut u8, n: usize) {
     core::ptr::write_bytes(dest, 0, n);
 }
@@ -403,7 +408,7 @@ unsafe fn append_path(s: &mut BankState, parent: &[u8], name: &[u8]) -> bool {
     if count >= MAX_PATHS { return false; }
     let mut total = parent.len();
     // Insert separator unless parent already ends with '/'.
-    let need_sep = !parent.is_empty() && *parent.last().unwrap() != b'/';
+    let need_sep = parent.last().is_some_and(|&b| b != b'/');
     if need_sep { total += 1; }
     total += name.len();
     if total > MAX_PATH_LEN { return false; }

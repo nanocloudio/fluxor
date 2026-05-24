@@ -1,0 +1,10 @@
+# Workspace-shared Clippy configuration.
+# Lint *levels* live in `[workspace.lints]` in `Cargo.toml`; this file
+# carries the lints that take configuration data instead of a level.
+
+# `std::dbg` is hard-banned — never appropriate in committed code.
+# `println!` / `eprintln!` are allowed to stay because the tools CLI
+# is the user-facing surface and the linux host kernel logs via stderr.
+disallowed-macros = [
+    { path = "std::dbg", reason = "remove before commit" },
+]

@@ -21,6 +21,7 @@ mod rp2350_guard {
         let t = timer1();
         t.inte().modify(|w| w.set_alarm(0, false));
         t.intr().write(|w| w.set_alarm(0, true));
+        // SAFETY: NVIC ISER enable for TIMER1_IRQ_0 (irq 4); called once at boot.
         unsafe {
             let nvic = &*cortex_m::peripheral::NVIC::PTR;
             const TIMER1_IRQ_0: u16 = 4;
@@ -73,6 +74,7 @@ mod rp2040_guard {
         let t = timer();
         t.inte().modify(|w| w.set_alarm(3, false));
         t.intr().write(|w| w.set_alarm(3, true));
+        // SAFETY: NVIC ISER enable for TIMER_IRQ_3; called once at boot.
         unsafe {
             let nvic = &*cortex_m::peripheral::NVIC::PTR;
             const TIMER_IRQ_3: u16 = 3;
@@ -179,6 +181,7 @@ mod rp2350_isr {
         let target = now_lo.wrapping_add(period_us);
         t.alarm(1).write_value(target);
         t.inte().modify(|w| w.set_alarm(1, true));
+        // SAFETY: NVIC ISER enable for TIMER1_IRQ_1 (irq 5); the Tier-1b ISR.
         unsafe {
             let nvic = &*cortex_m::peripheral::NVIC::PTR;
             const TIMER1_IRQ_1: u16 = 5;
@@ -206,6 +209,8 @@ mod rp2350_isr {
             t.inte().modify(|w| w.set_alarm(1, false));
             return;
         }
+        // SAFETY: invoked from the TIMER1_IRQ_1 ISR; isr_tier1b_handler
+        // documents itself as ISR-callable.
         unsafe {
             isr_tier::isr_tier1b_handler();
         }
@@ -232,6 +237,7 @@ mod rp2040_isr {
         let target = now_lo.wrapping_add(period_us);
         t.alarm(2).write_value(target);
         t.inte().modify(|w| w.set_alarm(2, true));
+        // SAFETY: NVIC ISER enable for TIMER_IRQ_2 (the Tier-1b ISR).
         unsafe {
             let nvic = &*cortex_m::peripheral::NVIC::PTR;
             const TIMER_IRQ_2: u16 = 2;
@@ -259,6 +265,8 @@ mod rp2040_isr {
             t.inte().modify(|w| w.set_alarm(2, false));
             return;
         }
+        // SAFETY: invoked from the TIMER_IRQ_2 ISR; isr_tier1b_handler
+        // documents itself as ISR-callable.
         unsafe {
             isr_tier::isr_tier1b_handler();
         }

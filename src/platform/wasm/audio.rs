@@ -52,6 +52,9 @@ unsafe fn alloc_state(in_chan: i32, sample_rate: u32, channels: u32) -> *mut Aud
 }
 
 fn audio_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer for
+    // this module instance; we cast it back to the module-private state
+    // type allocated by the new_fn and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut AudioState);
         if st_ptr.is_null() {

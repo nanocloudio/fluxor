@@ -109,6 +109,9 @@ unsafe fn shift_consume(buf: *mut u8, len: usize, consumed: usize) -> usize {
 }
 
 fn ws_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer for
+    // this module instance; we cast it back to the module-private state
+    // type allocated by the new_fn and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut WsState);
         if st_ptr.is_null() {

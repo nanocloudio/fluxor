@@ -13,7 +13,7 @@
 /// (RFC 9000 §17.1 + Appendix A.2). Always returns 4 — the longest
 /// form — since loss recovery here is conservative and the extra
 /// bytes don't matter at our throughput.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 pub fn pick_pn_len(_next: u64, _largest_acked: u64) -> usize {
     4
 }

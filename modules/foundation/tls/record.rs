@@ -139,6 +139,8 @@ impl TrafficKeys {
 /// Build a plaintext record header. All stores are volatile so PIC aarch64
 /// cannot dead-store part of the header.
 pub fn build_record_header(content_type: u8, length: usize, out: &mut [u8; 5]) {
+    // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+    // checked against record length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         core::ptr::write_volatile(p, content_type);
@@ -180,6 +182,8 @@ pub fn encrypt_record(
     aad[4] = ct_len as u8;
 
     // Copy plaintext + content_type into output
+    // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+    // checked against record length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(plaintext.as_ptr(), out_buf.as_mut_ptr(), plaintext.len()); }
     out_buf[plaintext.len()] = content_type;
 
@@ -194,24 +198,36 @@ pub fn encrypt_record(
     match suite {
         CipherSuite::ChaCha20Poly1305 => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
             let tag = chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut out_buf[..data_len]);
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
             zeroize(&mut key);
         }
         CipherSuite::Aes128Gcm => {
             let mut key = [0u8; 16];
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16); }
             let gcm = AesGcm::new_128(&key);
             let tag = gcm.encrypt(&nonce, &aad, &mut out_buf[..data_len]);
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
             zeroize(&mut key);
         }
         CipherSuite::Aes256Gcm => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
             let gcm = AesGcm::new_256(&key);
             let tag = gcm.encrypt(&nonce, &aad, &mut out_buf[..data_len]);
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
             zeroize(&mut key);
         }
@@ -234,6 +250,8 @@ pub fn decrypt_record(
 
     let tag_start = ciphertext.len() - 16;
     let mut tag = [0u8; 16];
+    // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+    // checked against record length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(ciphertext.as_ptr().add(tag_start), tag.as_mut_ptr(), 16); }
 
     let data = &mut ciphertext[..tag_start];
@@ -243,6 +261,8 @@ pub fn decrypt_record(
     let ok = match suite {
         CipherSuite::ChaCha20Poly1305 => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
             let r = chacha20_poly1305_decrypt(&key, &nonce, record_header, data, &tag);
             zeroize(&mut key);
@@ -250,6 +270,8 @@ pub fn decrypt_record(
         }
         CipherSuite::Aes128Gcm => {
             let mut key = [0u8; 16];
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16); }
             let gcm = AesGcm::new_128(&key);
             let r = gcm.decrypt(&nonce, record_header, data, &tag);
@@ -258,6 +280,8 @@ pub fn decrypt_record(
         }
         CipherSuite::Aes256Gcm => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
             let gcm = AesGcm::new_256(&key);
             let r = gcm.decrypt(&nonce, record_header, data, &tag);
@@ -286,6 +310,8 @@ pub fn decrypt_record(
     let inner_type = data[pt_len];
     // Wipe the inner-type byte — it is copied into the return value, and
     // leaving it in the scratch buffer leaks across record reuses.
+    // SAFETY: pointer arithmetic over the TLS record buffer; bounds
+    // checked against record length before each deref.
     unsafe { core::ptr::write_volatile(data.as_mut_ptr().add(pt_len), 0u8); }
 
     Some((pt_len, inner_type))

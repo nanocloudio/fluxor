@@ -10,6 +10,12 @@
 //! fresh tree would require building the wasm kernel and modules
 //! first.
 
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "integration test surfaces subprocess output to the test runner for diagnosis on failure"
+)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -84,9 +90,7 @@ wiring: []
     assert!(m_capacity > 0, "modules blob has zero capacity");
     assert!(
         m_used <= m_capacity,
-        "modules used {} > capacity {}",
-        m_used,
-        m_capacity
+        "modules used {m_used} > capacity {m_capacity}"
     );
 
     // The empty-modules config produces a 16-byte module-table

@@ -73,6 +73,9 @@ unsafe fn alloc_state(in_chan: i32, width: u16, height: u16) -> *mut CanvasState
 /// input channel into the frame buffer; once the buffer holds a full
 /// frame's worth (`width * height * 2`), presents it and resets.
 fn canvas_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer for
+    // this module instance; we cast it back to the module-private state
+    // type allocated by the new_fn and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut CanvasState);
         if st_ptr.is_null() {

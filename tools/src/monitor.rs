@@ -96,7 +96,7 @@ fn apply_line(rows: &mut BTreeMap<u8, ModuleRow>, line: &str) {
         }
         "MON_HIST" => {
             for i in 0..8 {
-                let key = format!("b{}", i);
+                let key = format!("b{i}");
                 if let Some(v) = kv.get(&key).and_then(|s| s.parse::<u32>().ok()) {
                     row.hist[i] = v;
                 }
@@ -162,12 +162,11 @@ pub fn cmd_monitor_dispatch(
 
 pub fn cmd_monitor(port: &str, _baud: u32, refresh_ms: u64) -> Result<()> {
     eprintln!(
-        "fluxor monitor: opening {} (configure baud externally, e.g. \
-         `stty -F {} 115200 raw -echo`)",
-        port, port
+        "fluxor monitor: opening {port} (configure baud externally, e.g. \
+         `stty -F {port} 115200 raw -echo`)"
     );
     let file = std::fs::File::open(port)
-        .map_err(|e| Error::Config(format!("failed to open {}: {}", port, e)))?;
+        .map_err(|e| Error::Config(format!("failed to open {port}: {e}")))?;
     let mut reader = BufReader::new(file);
     let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
     let mut last_render = Instant::now();
@@ -178,7 +177,7 @@ pub fn cmd_monitor(port: &str, _baud: u32, refresh_ms: u64) -> Result<()> {
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => apply_line(&mut rows, &line),
-            Err(e) => return Err(Error::Config(format!("read error: {}", e))),
+            Err(e) => return Err(Error::Config(format!("read error: {e}"))),
         }
         if last_render.elapsed() >= refresh {
             render(&rows);
@@ -201,12 +200,12 @@ pub fn bind_udp_listener(
 ) -> Result<std::net::UdpSocket> {
     use std::net::UdpSocket;
     let normalized = if bind_spec.starts_with(':') {
-        format!("0.0.0.0{}", bind_spec)
+        format!("0.0.0.0{bind_spec}")
     } else {
         bind_spec.to_string()
     };
     let sock = UdpSocket::bind(&normalized)
-        .map_err(|e| Error::Config(format!("bind {}: {}", normalized, e)))?;
+        .map_err(|e| Error::Config(format!("bind {normalized}: {e}")))?;
     if let Some(t) = read_timeout {
         sock.set_read_timeout(Some(t)).ok();
     }
@@ -246,7 +245,7 @@ pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
             {
                 // idle tick — fall through to render
             }
-            Err(e) => return Err(Error::Config(format!("udp recv: {}", e))),
+            Err(e) => return Err(Error::Config(format!("udp recv: {e}"))),
         }
         if last_render.elapsed() >= refresh {
             render(&rows);

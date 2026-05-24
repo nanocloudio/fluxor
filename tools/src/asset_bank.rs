@@ -177,9 +177,7 @@ pub fn append_asset_bank(wasm_bytes: &mut Vec<u8>, entries: &[AssetEntry]) -> Re
 /// with explicit `name:` overrides (`{path: ..., name: foo.png}`).
 /// The mapping is interpreted by the caller; this helper only deals
 /// with `(name, path)` pairs.
-pub fn load_assets(
-    pairs: &[(String, std::path::PathBuf)],
-) -> Result<Vec<AssetEntry>> {
+pub fn load_assets(pairs: &[(String, std::path::PathBuf)]) -> Result<Vec<AssetEntry>> {
     use std::collections::HashSet;
     // Dedup-check up-front so a duplicate fails fast (and
     // deterministically) without depending on which file the OS
@@ -188,9 +186,8 @@ pub fn load_assets(
     for (name, _) in pairs {
         if !seen.insert(name) {
             return Err(Error::Config(format!(
-                "asset bank: duplicate asset name `{}` — names must be \
-                 unique within a bundle",
-                name
+                "asset bank: duplicate asset name `{name}` — names must be \
+                 unique within a bundle"
             )));
         }
     }
@@ -238,7 +235,7 @@ mod tests {
         for (v, expected) in cases {
             let mut buf = Vec::new();
             write_leb128_u32(&mut buf, *v);
-            assert_eq!(&buf[..], *expected, "LEB128 mismatch for {}", v);
+            assert_eq!(&buf[..], *expected, "LEB128 mismatch for {v}");
         }
     }
 
@@ -254,8 +251,14 @@ mod tests {
     fn appends_well_formed_custom_section() {
         let mut w = empty_wasm();
         let entries = vec![
-            AssetEntry { name: "a.bin".into(), bytes: b"hello".to_vec() },
-            AssetEntry { name: "b.bin".into(), bytes: b"world!".to_vec() },
+            AssetEntry {
+                name: "a.bin".into(),
+                bytes: b"hello".to_vec(),
+            },
+            AssetEntry {
+                name: "b.bin".into(),
+                bytes: b"world!".to_vec(),
+            },
         ];
         append_asset_bank(&mut w, &entries).unwrap();
 
@@ -270,8 +273,7 @@ mod tests {
         let name = ASSET_BANK_SECTION_NAME.as_bytes();
         assert!(
             trailing.windows(name.len()).any(|win| win == name),
-            "expected custom section name `{}` in appended bytes",
-            ASSET_BANK_SECTION_NAME,
+            "expected custom section name `{ASSET_BANK_SECTION_NAME}` in appended bytes",
         );
 
         // TOC magic + entry bytes are reachable somewhere in the trailing region.
@@ -292,39 +294,53 @@ mod tests {
     #[test]
     fn rejects_duplicate_names() {
         let pairs = vec![
-            ("dup.png".to_string(), std::path::PathBuf::from("/tmp/nonexistent_a")),
-            ("dup.png".to_string(), std::path::PathBuf::from("/tmp/nonexistent_b")),
+            (
+                "dup.png".to_string(),
+                std::path::PathBuf::from("/tmp/nonexistent_a"),
+            ),
+            (
+                "dup.png".to_string(),
+                std::path::PathBuf::from("/tmp/nonexistent_b"),
+            ),
         ];
         // load_assets fails on the duplicate before it tries to read the file.
         let err = load_assets(&pairs).unwrap_err();
         assert!(
             err.to_string().contains("duplicate asset name"),
-            "wanted duplicate-name error, got: {}",
-            err
+            "wanted duplicate-name error, got: {err}"
         );
     }
 
     #[test]
     fn rejects_non_wasm_input() {
         let mut not_wasm = b"this is not wasm".to_vec();
-        let entries = vec![AssetEntry { name: "x".into(), bytes: vec![1, 2, 3] }];
+        let entries = vec![AssetEntry {
+            name: "x".into(),
+            bytes: vec![1, 2, 3],
+        }];
         let err = append_asset_bank(&mut not_wasm, &entries).unwrap_err();
-        assert!(err.to_string().contains("wasm magic"), "got: {}", err);
+        assert!(err.to_string().contains("wasm magic"), "got: {err}");
     }
 
     #[test]
     fn rejects_empty_name() {
         let mut w = empty_wasm();
-        let entries = vec![AssetEntry { name: "".into(), bytes: b"x".to_vec() }];
+        let entries = vec![AssetEntry {
+            name: "".into(),
+            bytes: b"x".to_vec(),
+        }];
         let err = append_asset_bank(&mut w, &entries).unwrap_err();
-        assert!(err.to_string().contains("empty asset name"), "got: {}", err);
+        assert!(err.to_string().contains("empty asset name"), "got: {err}");
     }
 
     #[test]
     fn rejects_nul_in_name() {
         let mut w = empty_wasm();
-        let entries = vec![AssetEntry { name: "ev\0il".into(), bytes: b"x".to_vec() }];
+        let entries = vec![AssetEntry {
+            name: "ev\0il".into(),
+            bytes: b"x".to_vec(),
+        }];
         let err = append_asset_bank(&mut w, &entries).unwrap_err();
-        assert!(err.to_string().contains("nul"), "got: {}", err);
+        assert!(err.to_string().contains("nul"), "got: {err}");
     }
 }

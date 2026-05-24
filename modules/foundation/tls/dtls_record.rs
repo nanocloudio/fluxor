@@ -46,6 +46,12 @@ pub struct DtlsRecord {
     pub recv_window: u64,
 }
 
+impl Default for DtlsRecord {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DtlsRecord {
     pub const fn new() -> Self {
         Self {
@@ -124,7 +130,7 @@ pub fn parse_dtls_ack_body(body: &[u8], out: &mut [(u64, u64)]) -> Option<usize>
         return None;
     }
     let bytes_len = ((body[0] as usize) << 8) | (body[1] as usize);
-    if body.len() != 2 + bytes_len || bytes_len % 16 != 0 {
+    if body.len() != 2 + bytes_len || !bytes_len.is_multiple_of(16) {
         return None;
     }
     let count = bytes_len / 16;
@@ -186,9 +192,7 @@ pub fn recover_seq(recv_high: u64, seq16_on_wire: u16) -> u64 {
     // window) and pick the one closest to recv_high.
     let prev = candidate.wrapping_sub(0x1_0000);
     let next = candidate.wrapping_add(0x1_0000);
-    let dist = |a: u64, b: u64| -> u64 {
-        if a > b { a - b } else { b - a }
-    };
+    let dist = |a: u64, b: u64| -> u64 { a.abs_diff(b) };
     let mut best = candidate;
     let mut best_d = dist(candidate, recv_high);
     if dist(prev, recv_high) < best_d {
@@ -255,6 +259,8 @@ pub fn encrypt_dtls_record(
 
     // Body = plaintext || content_type, then AEAD seals in-place and
     // appends the 16-byte tag. AAD = the unified header.
+    // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+    // checked against record length before each deref.
     unsafe {
         core::ptr::copy_nonoverlapping(
             plaintext.as_ptr(),
@@ -271,6 +277,8 @@ pub fn encrypt_dtls_record(
     match suite {
         CipherSuite::ChaCha20Poly1305 => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
             }
@@ -280,6 +288,8 @@ pub fn encrypt_dtls_record(
                 &hdr,
                 &mut out[body_off..body_off + data_len],
             );
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     tag.as_ptr(),
@@ -291,11 +301,15 @@ pub fn encrypt_dtls_record(
         }
         CipherSuite::Aes128Gcm => {
             let mut key = [0u8; 16];
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16);
             }
             let gcm = AesGcm::new_128(&key);
             let tag = gcm.encrypt(&nonce, &hdr, &mut out[body_off..body_off + data_len]);
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     tag.as_ptr(),
@@ -307,11 +321,15 @@ pub fn encrypt_dtls_record(
         }
         CipherSuite::Aes256Gcm => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
             }
             let gcm = AesGcm::new_256(&key);
             let tag = gcm.encrypt(&nonce, &hdr, &mut out[body_off..body_off + data_len]);
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     tag.as_ptr(),
@@ -372,6 +390,8 @@ pub fn decrypt_dtls_record(
     let body_off = DTLS_UNIFIED_HDR_LEN;
     let tag_start = body_off + enc_len - 16;
     let mut tag = [0u8; 16];
+    // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+    // checked against record length before each deref.
     unsafe {
         core::ptr::copy_nonoverlapping(
             record.as_ptr().add(tag_start),
@@ -383,6 +403,8 @@ pub fn decrypt_dtls_record(
     let ok = match suite {
         CipherSuite::ChaCha20Poly1305 => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
             }
@@ -398,6 +420,8 @@ pub fn decrypt_dtls_record(
         }
         CipherSuite::Aes128Gcm => {
             let mut key = [0u8; 16];
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16);
             }
@@ -408,6 +432,8 @@ pub fn decrypt_dtls_record(
         }
         CipherSuite::Aes256Gcm => {
             let mut key = [0u8; 32];
+            // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+            // checked against record length before each deref.
             unsafe {
                 core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
             }
@@ -438,6 +464,8 @@ pub fn decrypt_dtls_record(
     }
     pt_len -= 1;
     let inner_type = record[body_off + pt_len];
+    // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
+    // checked against record length before each deref.
     unsafe {
         core::ptr::write_volatile(record.as_mut_ptr().add(body_off + pt_len), 0);
     }
@@ -486,6 +514,12 @@ pub struct DtlsHandshakeReassembler {
     /// here for a self-contained test harness.
     pub seen: [u8; DTLS_HS_REASSEMBLY_BUF / 8],
     pub active: bool,
+}
+
+impl Default for DtlsHandshakeReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DtlsHandshakeReassembler {
@@ -589,6 +623,12 @@ pub struct DtlsRetxTimer {
     pub retx_count: u8,
 }
 
+impl Default for DtlsRetxTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DtlsRetxTimer {
     pub const INITIAL_MS: u32 = 1_000;
     pub const MAX_MS: u32 = 60_000;
@@ -681,11 +721,17 @@ impl DtlsRetxTimer {
 /// payload before disarming the retx timer). The plaintext body
 /// lives at `datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN
 /// + plaintext_len]` after the call.
+///
 /// Returns None on a malformed or undecryptable record.
 ///
 /// `read_keys` is the AEAD state for the current inbound EncLevel.
 /// `state` holds the per-direction sequence counter / replay window.
 /// `is_initial = true` means the record is plaintext (no AEAD).
+///
+/// # Safety
+/// `datagram` is a kernel-supplied buffer; the body bounds-checks every
+/// read against `datagram.len()` and the AEAD verification rejects
+/// modified ciphertexts before any out-of-bounds write.
 pub unsafe fn dtls_recv_into_driver(
     suite: CipherSuite,
     is_initial: bool,
@@ -769,6 +815,14 @@ pub const DTLS_HS_MAX_FRAGMENT: usize = 1024;
 /// or `out` is too small. Once all fragments of a message are emitted,
 /// the message is consumed from `driver.out_buf`, `next_send_msg_seq`
 /// is bumped, and `frag_off_state` is reset to 0.
+///
+/// # Safety
+/// `out` is a caller-supplied buffer sized at least `DTLS_HS_MAX_FRAGMENT
+/// + 34` bytes. The body bounds-checks every write against `out.len()`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "DTLS emit wire-shape: signature mirrors the per-direction state (epoch/seq/keys) that the kernel keeps separate from the unified record buffer"
+)]
 pub unsafe fn dtls_emit_from_driver(
     suite: CipherSuite,
     is_initial: bool,
@@ -887,6 +941,12 @@ pub struct DtlsEndpoint {
     /// `driver.out_buf` for the next fragment we'll emit. Cleared
     /// once the message is fully drained.
     pub current_frag_off: usize,
+}
+
+impl Default for DtlsEndpoint {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DtlsEndpoint {

@@ -1,0 +1,45 @@
+# Project-level fluxor configuration.
+
+[required]
+# Wire-ABI pin checked by `fluxor ci`'s version-skew phase. Bumps only
+# when `modules/sdk/wire.rs::ABI_VERSION` changes — i.e., when the
+# module-header / channel-hint / contract-id layout breaks. The
+# installed CLI's compiled-in ABI must equal this value.
+fluxor = { abi = 1 }
+
+[ci]
+# Module artefact build targets — `fluxor modules build --all`
+# iterates this list.
+targets = ["bcm2712", "rp2350", "rp2040", "wasm"]
+
+[ci.templates]
+# Directory whose YAML files render through `fluxor render-template`.
+# No `__KEY__` placeholders today; the empty render acts as a
+# syntactic gate.
+dir = "examples"
+
+[ci.lints]
+# Workspace-lints opt-in exemptions. New workspace members must
+# declare `[lints] workspace = true` or list themselves here with a
+# reason.
+
+[ci.hygiene]
+# `permissive` allows bottom-of-file `#[cfg(test)] mod tests` blocks
+# under `max_inline_lines` in `tools/` and `contracts/`. `modules/`
+# is under a hard ban — every PIC module is `no_std` and inline
+# tests would compile away silently.
+mode                = "permissive"
+forbid_inline_tests = ["modules"]
+max_inline_lines    = 1000
+
+# `tls/mod.rs` gates its `#![no_std]` / `#![no_main]` on
+# `not(any(feature = "host-test", test))`. The `test` cfg is
+# load-bearing: `cargo test -p fluxor-mod-tls` without `host-test`
+# still needs `main` + `std` to link the test harness. The crypto
+# KATs under `tests/harness` already exercise the module from
+# outside, so this is a structural cfg, not a smuggled inline test
+# suite.
+[[ci.hygiene.exemption]]
+path   = "modules/foundation/tls/mod.rs"
+rule   = "inline-tests"
+reason = "no_std/no_main predicate includes `test` so `cargo test -p fluxor-mod-tls` can link a harness binary"

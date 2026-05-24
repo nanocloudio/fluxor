@@ -92,6 +92,9 @@ unsafe fn shift_consume(buf: *mut u8, len: usize, consumed: usize) -> usize {
 }
 
 fn ws_source_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer for
+    // this module instance; we cast it back to the module-private state
+    // type allocated by the new_fn and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut WsSourceState);
         if st_ptr.is_null() {
@@ -116,8 +119,7 @@ fn ws_source_step(state: *mut u8) -> i32 {
 
         // Drain pending retry buffer first.
         if st.rx_pending_len > 0 {
-            let written =
-                channel::channel_write(st.out_chan, st.rx.as_ptr(), st.rx_pending_len);
+            let written = channel::channel_write(st.out_chan, st.rx.as_ptr(), st.rx_pending_len);
             if written > 0 {
                 let w = (written as usize).min(st.rx_pending_len);
                 st.rx_pending_len = shift_consume(st.rx.as_mut_ptr(), st.rx_pending_len, w);

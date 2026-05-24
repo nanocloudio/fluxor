@@ -506,6 +506,9 @@ pub fn push_fault(rec: FaultRecord) {
             .store(tail.wrapping_add(1), Ordering::Release);
         FAULT_RING.dropped.fetch_add(1, Ordering::Relaxed);
     }
+    // SAFETY: `head % FAULT_RING_CAP` is in-bounds for the records array.
+    // The write happens-before the `head.store(Release)` below, which is
+    // what readers Acquire-load to observe the entry.
     unsafe {
         let slot = &mut (*FAULT_RING.records.get())[(head as usize) % FAULT_RING_CAP];
         *slot = rec;
@@ -528,6 +531,9 @@ pub fn pop_fault(out: &mut FaultRecord) -> i32 {
     if (head as usize) % FAULT_RING_CAP == (tail as usize) % FAULT_RING_CAP {
         return 0;
     }
+    // SAFETY: `tail % FAULT_RING_CAP` is in-bounds; the corresponding
+    // record was published by the `head.store(Release)` in `record_fault`
+    // which this consumer observed via the matching Acquire above.
     unsafe {
         let slot = &(*FAULT_RING.records.get())[(tail as usize) % FAULT_RING_CAP];
         *out = *slot;

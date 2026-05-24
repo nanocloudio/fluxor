@@ -32,7 +32,10 @@
 //! we round to 32-byte alignment for MPU configuration.
 
 #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod rp2350_impl {
     use crate::abi::SyscallTable;
     use crate::kernel::loader::ModuleStepFn;
@@ -214,6 +217,8 @@ mod rp2350_impl {
     pub unsafe fn init_stack_canary() {
         let base = core::ptr::addr_of_mut!(MODULE_PSP_STACK.0).cast::<u32>();
         for i in 0..STACK_CANARY_CELLS {
+            // SAFETY: `i < STACK_CANARY_CELLS` and the stack array sizes
+            // `MODULE_PSP_STACK` to at least STACK_CANARY_CELLS u32 words.
             unsafe {
                 core::ptr::write_volatile(base.add(i), STACK_CANARY_WORD);
             }
@@ -225,6 +230,7 @@ mod rp2350_impl {
     pub unsafe fn check_stack_canary() -> bool {
         let base = core::ptr::addr_of!(MODULE_PSP_STACK.0).cast::<u32>();
         for i in 0..STACK_CANARY_CELLS {
+            // SAFETY: `i < STACK_CANARY_CELLS`; see init_stack_canary.
             if unsafe { core::ptr::read_volatile(base.add(i)) } != STACK_CANARY_WORD {
                 return false;
             }
@@ -289,15 +295,15 @@ mod rp2350_impl {
     /// Sets up MAIR attributes and static kernel regions (0-2, 7).
     /// Call once during kernel boot, before any module execution.
     pub fn mpu_init() {
+        // SAFETY: MPU + SCB registers at fixed Cortex-M system addresses.
+        // Called once at boot before any module runs; ISOLATION_ENABLED
+        // serves as the post-init handshake.
         unsafe {
             // Check MPU is present
             let mpu_type = core::ptr::read_volatile(MPU_TYPE);
             let num_regions = (mpu_type >> 8) & 0xFF;
             if num_regions < 8 {
-                log::warn!(
-                    "[mpu] only {} regions, need 8 — isolation disabled",
-                    num_regions
-                );
+                log::warn!("[mpu] only {num_regions} regions, need 8 — isolation disabled");
                 return;
             }
 
@@ -353,7 +359,7 @@ mod rp2350_impl {
             cortex_m::asm::isb();
 
             ISOLATION_ENABLED = true;
-            log::info!("[mpu] initialized, {} regions", num_regions);
+            log::info!("[mpu] initialized, {num_regions} regions");
         }
     }
 
@@ -374,6 +380,8 @@ mod rp2350_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: MODULE_REGIONS is scheduler-thread-only; `module_idx`
+        // bounds-checked above.
         unsafe {
             MODULE_REGIONS[module_idx] = ModuleRegions {
                 code_base: align_down_32(code_base),
@@ -403,6 +411,7 @@ mod rp2350_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: MODULE_REGIONS scheduler-thread-only; `module_idx` bounded.
         unsafe {
             MODULE_REGIONS[module_idx].chan_base = align_down_32(base);
             MODULE_REGIONS[module_idx].chan_size = align_up_32(size);
@@ -416,6 +425,8 @@ mod rp2350_impl {
         if !is_enabled() || module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: MODULE_REGIONS read; MPU registers at fixed addresses;
+        // scheduler-thread-only, called before each module step.
         unsafe {
             let r = &MODULE_REGIONS[module_idx];
 
@@ -483,11 +494,14 @@ mod rp2350_impl {
     /// Check if isolation is enabled.
     #[inline]
     pub fn is_enabled() -> bool {
+        // SAFETY: ISOLATION_ENABLED is a bool set once at boot then toggled
+        // via `set_enabled` on the scheduler thread; aligned read.
         unsafe { ISOLATION_ENABLED }
     }
 
     /// Enable or disable isolation at runtime.
     pub fn set_enabled(enabled: bool) {
+        // SAFETY: ISOLATION_ENABLED toggled on scheduler thread.
         unsafe {
             ISOLATION_ENABLED = enabled;
         }
@@ -703,23 +717,12 @@ mod rp2350_impl {
         let is_data = mmfsr & MMFSR_DACCVIOL != 0;
 
         if is_instruction {
-            log::error!(
-                "[mpu] module {} instruction access violation at 0x{:08x}",
-                module_idx,
-                mmfar
-            );
+            log::error!("[mpu] module {module_idx} instruction access violation at 0x{mmfar:08x}");
         } else if is_data {
-            log::error!(
-                "[mpu] module {} data access violation at 0x{:08x}",
-                module_idx,
-                mmfar
-            );
+            log::error!("[mpu] module {module_idx} data access violation at 0x{mmfar:08x}");
         } else {
             log::error!(
-                "[mpu] module {} mem fault mmfsr=0x{:02x} mmfar=0x{:08x}",
-                module_idx,
-                mmfsr,
-                mmfar
+                "[mpu] module {module_idx} mem fault mmfsr=0x{mmfsr:02x} mmfar=0x{mmfar:08x}"
             );
         }
 
@@ -813,6 +816,7 @@ pub fn init() {
     #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
     {
         rp2350_impl::mpu_init();
+        // SAFETY: called once at boot, before any module runs.
         unsafe {
             rp2350_impl::init_stack_canary();
         }
@@ -829,6 +833,7 @@ pub fn check_stack_canary() -> bool {
         if !rp2350_impl::is_enabled() {
             return true;
         }
+        // SAFETY: called by scheduler post-step on the kernel thread.
         unsafe { rp2350_impl::check_stack_canary() }
     }
     #[cfg(any(not(feature = "rp"), feature = "chip-rp2040"))]
@@ -840,6 +845,8 @@ pub fn check_stack_canary() -> bool {
 /// Re-write the stack canary after an overflow has been recorded.
 pub fn reinit_stack_canary() {
     #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
+    // SAFETY: called after an overflow has been recorded, before the next
+    // module step; kernel thread.
     unsafe {
         rp2350_impl::init_stack_canary();
     }

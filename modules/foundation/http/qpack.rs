@@ -16,7 +16,10 @@
 //! `h3.rs` per-stream HEADERS frame builder.
 
 #[path = "../../sdk/varint.rs"]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod varint;
 
 /// Lookup a static-table entry by 0-based index (RFC 9204 Appendix A).
@@ -205,10 +208,7 @@ pub fn qpack_decode_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
         if chunk > max_chunk {
             return None;
         }
-        value = match value.checked_add(chunk << shift) {
-            Some(v) => v,
-            None => return None,
-        };
+        value = value.checked_add(chunk << shift)?;
         if b & 0x80 == 0 {
             break;
         }
@@ -309,6 +309,8 @@ pub fn qpack_encode_field(name: &[u8], value: &[u8], out: &mut [u8]) -> usize {
         if pos + value.len() > out.len() {
             return 0;
         }
+        // SAFETY: `pos + value.len() <= out.len()` checked above; src/dst
+        // are disjoint slices owned by different stack locals.
         unsafe {
             core::ptr::copy_nonoverlapping(value.as_ptr(), out.as_mut_ptr().add(pos), value.len());
         }
@@ -324,6 +326,7 @@ pub fn qpack_encode_field(name: &[u8], value: &[u8], out: &mut [u8]) -> usize {
     if pos + name.len() > out.len() {
         return 0;
     }
+    // SAFETY: `pos + name.len() <= out.len()` checked above; disjoint slices.
     unsafe {
         core::ptr::copy_nonoverlapping(name.as_ptr(), out.as_mut_ptr().add(pos), name.len());
     }
@@ -336,6 +339,7 @@ pub fn qpack_encode_field(name: &[u8], value: &[u8], out: &mut [u8]) -> usize {
     if pos + value.len() > out.len() {
         return 0;
     }
+    // SAFETY: `pos + value.len() <= out.len()` checked above; disjoint slices.
     unsafe {
         core::ptr::copy_nonoverlapping(value.as_ptr(), out.as_mut_ptr().add(pos), value.len());
     }

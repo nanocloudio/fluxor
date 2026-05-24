@@ -1,116 +1,164 @@
-# Fluxor Makefile -- Multi-target firmware, PIC modules, host tools
+# fluxor Makefile — thin aliases over the `fluxor` CLI.
 #
-# Usage:
-#   make                           Build tools + firmware + modules (default: rp2350)
-#   make firmware TARGET=rp2040    Build firmware for a specific target
-#   make firmware-all              Build firmware for all targets
-#   make modules TARGET=rp2040    Build PIC modules for a specific target
-#   make modules-all               Build modules for all targets
-#   make targets                   List available targets
-#   make fmt                      Apply rustfmt across the workspace
-#   make lint                      Run clippy across every kernel target + tools
-#                                  with `-D warnings` (CI-equivalent)
-#   make check-stable              Pre-release gate: structural guards +
-#                                  build matrix + tests + any local drift
-#                                  checks under `.context/drift/`.
+# Module discovery + per-target build is in `fluxor modules build`; the
+# AST hygiene scan is in `fluxor lint hygiene`; the full CI gate is in
+# `fluxor ci`. Project-specific targets (firmware, build-matrix, drift
+# checks) sit alongside the standard set below.
+
+SHELL       := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
+CARGO       ?= cargo
+FLUXOR      ?= target/aarch64-unknown-linux-gnu/release/fluxor
+TARGET      ?= bcm2712
+
+.DEFAULT_GOAL := build
+
+# ── Standard targets ───────────────────────────────────────────────────
+
+.PHONY: help build test fmt fmt-check clippy lint ci verify \
+        modules modules-all modules-clean modules-list modules-resolve \
+        up up-cluster clean setup \
+        firmware firmware-all linux-bin tools install-rig-backends \
+        targets init run flash all \
+        check-no-inline-tests check-drift check-build-matrix check-stable
+
+# `help` is zero-dependency: it must work before `fluxor` is installed.
+help:
+	@echo "fluxor make targets"
+	@echo "  Standard surface:"
+	@echo "    make build            host build"
+	@echo "    make test             cargo test --workspace"
+	@echo "    make fmt|fmt-check    rustfmt"
+	@echo "    make clippy|lint      clippy + fmt-check"
+	@echo "    make modules          PIC modules for TARGET=\$$(TARGET)"
+	@echo "    make modules-all      modules for every target in fluxor.toml"
+	@echo "    make up               render+run a single replica (CONFIG=, NODE_ID=)"
+	@echo "    make up-cluster       spawn REPLICAS replicas"
+	@echo "    make ci               full CI gate (fluxor ci)"
+	@echo "    make clean            cargo clean + module artefacts"
+	@echo "    make setup            install fluxor CLI onto PATH"
+	@echo "  Project-specific:"
+	@echo "    make firmware TARGET=…   bare-metal kernel build"
+	@echo "    make linux-bin           Linux userspace binary"
+	@echo "    make flash CONFIG=…      flash a graph to a USB-DFU target"
+	@echo "    make targets             list available targets"
+
+setup:
+	$(CARGO) install --locked --path tools
+
+# `build` / `test` / `clippy` run from `tools/` rather than the
+# workspace root. The kernel's default features pull in embedded
+# crates that don't compile on the host; cross-target kernel clippy
+# lives in `fluxor ci`'s per-target matrix.
+build:       ; cd tools && $(CARGO) build --all-targets
+test:        ; cd tools && $(CARGO) test --all-targets --all-features
+fmt:         ; $(CARGO) fmt --all
+fmt-check:   ; $(CARGO) fmt --all -- --check
+clippy:      ; cd tools && $(CARGO) clippy --all-targets --all-features -- -D warnings
+lint:        fmt-check clippy
+
+# ── Module CLI wrappers ────────────────────────────────────────────────
 #
-# Engineer-local extensions (debugging workflows, project-lore drift
-# checks) live under `.context/` and are pulled in via the optional
-# include below. Missing — fine; present — added transparently.
--include .context/Makefile
+# Outputs land at `target/$(SILICON_ID)/modules/<name>.fmod` — the
+# layout `combine` / `run` tooling expects. The newer
+# `target/fluxor/<silicon>/modules/` layout is reachable by dropping
+# the `--out target` flag.
 
-# Default target silicon (override: make firmware TARGET=rp2040)
-TARGET ?= rp2350
+modules: tools
+	$(FLUXOR) modules build --target $(TARGET) --out target
 
-# Target-to-toolchain lookup (avoids circular dep with tools binary)
-# SILICON_ID: the chip the TARGET runs on. Board targets (e.g. cm5) map to
-# their silicon (bcm2712). Modules are byte-identical across boards that
-# share silicon + module_target, so they live under the silicon id.
+modules-all: tools
+	$(FLUXOR) modules build --all --out target
+
+modules-clean: tools
+	$(FLUXOR) modules clean --out target
+
+modules-list: tools
+	@$(FLUXOR) modules list
+
+modules-resolve: tools
+	@$(FLUXOR) modules resolve --target $(TARGET) --out target
+
+# ── Run / cluster bring-up ─────────────────────────────────────────────
+
+CONFIG  ?=
+NODE_ID ?= 0
+
+up: tools
+	@if [ -z "$(CONFIG)" ]; then echo "Usage: make up CONFIG=examples/web_server/linux.yaml NODE_ID=0"; exit 1; fi
+	$(FLUXOR) run $(CONFIG) --node-id $(NODE_ID)
+
+REPLICAS ?= 3
+up-cluster: tools
+	@if [ -z "$(CONFIG)" ]; then echo "Usage: make up-cluster CONFIG=examples/cluster/linux.yaml REPLICAS=3"; exit 1; fi
+	$(FLUXOR) up $(CONFIG) --replicas $(REPLICAS)
+
+# ── Full CI gate ───────────────────────────────────────────────────────
+#
+# `make ci` delegates to `fluxor ci`. Every phase runs even when an
+# earlier one fails; the summary at the end lists every failure and
+# the exit code is non-zero on any failure.
+ci: tools
+	$(FLUXOR) ci
+
+# Deprecated aliases for external CI entry-points; prefer `make ci`.
+verify: ci
+check-stable: ci
+
+# ── clean ──────────────────────────────────────────────────────────────
+
+clean:
+	$(CARGO) clean
+	rm -rf target/fluxor
+
+# ─────────────────────────────────────────────────────────────────────────
+# Project-specific targets — these sit alongside the standard set
+# above and don't duplicate behaviour the CLI already owns.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Per-target build configuration. The `firmware` recipe consults these;
+# module per-target rustc flags live in `fluxor modules build`'s
+# silicon-spec table now (replacing the old `MODULE_TARGET` / `MODULE_LD`
+# / `MODULE_LINKER` / `MODULE_RUSTFLAGS` variables).
 ifeq ($(TARGET),rp2040)
-  RUST_TARGET := thumbv6m-none-eabi
+  RUST_TARGET    := thumbv6m-none-eabi
   CARGO_FEATURES := chip-rp2040
-  MODULE_TARGET := thumbv6m-none-eabi
-  MODULE_LD := modules/module.ld
-  MODULE_LINKER := arm-none-eabi-ld
-  SILICON_ID := rp2040
+  SILICON_ID     := rp2040
 else ifeq ($(TARGET),cm5)
-  RUST_TARGET := aarch64-unknown-none
+  RUST_TARGET    := aarch64-unknown-none
   CARGO_FEATURES := board-cm5
-  MODULE_TARGET := aarch64-unknown-none
-  MODULE_LD := modules/module.ld
-  MODULE_LINKER := rust-lld -flavor gnu
-  SILICON_ID := bcm2712
-  # Cortex-A76 ships the Cryptography Extension (AES + PMULL +
-  # SHA1/SHA2). Gate `target_feature = "aes"` so the inline-asm
-  # AES path in modules/sdk/aes_gcm.rs activates; without it the
-  # AESE/AESMC instructions would SIGILL.
-  MODULE_RUSTFLAGS := -C target-feature=+aes,+sha2,+neon
+  SILICON_ID     := bcm2712
 else ifeq ($(TARGET),bcm2712)
-  RUST_TARGET := aarch64-unknown-none
+  RUST_TARGET    := aarch64-unknown-none
   CARGO_FEATURES := chip-bcm2712
-  MODULE_TARGET := aarch64-unknown-none
-  MODULE_LD := modules/module.ld
-  MODULE_LINKER := rust-lld -flavor gnu
-  SILICON_ID := bcm2712
-  MODULE_RUSTFLAGS := -C target-feature=+aes,+sha2,+neon
+  SILICON_ID     := bcm2712
 else ifeq ($(TARGET),wasm)
-  RUST_TARGET := wasm32-unknown-unknown
+  RUST_TARGET    := wasm32-unknown-unknown
   CARGO_FEATURES := host-wasm
-  MODULE_TARGET := wasm32-unknown-unknown
-  # wasm has no linker script — the wasm module format prescribes
-  # section layout. MODULE_LD is set to /dev/null so the module-build
-  # rule has a placeholder to skip; module compilation for wasm is
-  # done via cargo + cdylib, not rustc+ld (see modules-wasm rule).
-  MODULE_LD := /dev/null
-  MODULE_LINKER := wasm-ld
-  SILICON_ID := wasm
+  SILICON_ID     := wasm
 else
-  # rp2350, rp2350a, rp2350b: all use the same binary (runtime detection handles A/B)
-  RUST_TARGET := thumbv8m.main-none-eabihf
+  RUST_TARGET    := thumbv8m.main-none-eabihf
   CARGO_FEATURES := chip-rp2350b
-  MODULE_TARGET := thumbv8m.main-none-eabihf
-  MODULE_LD := modules/module.ld
-  MODULE_LINKER := arm-none-eabi-ld
-  SILICON_ID := rp2350
+  SILICON_ID     := rp2350
 endif
 
-RELEASE_DIR := target/$(RUST_TARGET)/release
+RELEASE_DIR  := target/$(RUST_TARGET)/release
 FIRMWARE_ELF := $(RELEASE_DIR)/fluxor
 FIRMWARE_BIN := target/$(TARGET)/firmware.bin
-MODULES_OUT := target/$(SILICON_ID)/modules
-FLUXOR_TOOL := target/aarch64-unknown-linux-gnu/release/fluxor
 
-# Module source directories under modules/
-MODULE_DIRS := modules/drivers modules/foundation modules/app
-# Shared PIC SDK files (abi.rs, runtime.rs, params.rs) live in modules/sdk/
-SDK_DIR := modules/sdk
-ABI_HEADER := $(SDK_DIR)/abi.rs
-
-# Module type mapping: Source=1, Transformer=2, Sink=3, EventHandler=4, Protocol=5
-mod_type = $(strip $(if $(filter cyw43,$(1)),5,$(if $(filter enc28j60,$(1)),5,$(if $(filter ch9120,$(1)),5,$(if $(filter sd,$(1)),5,$(if $(filter st7701s,$(1)),5,$(if $(filter gt911,$(1)),5,$(if $(filter pwm_rp,$(1)),5,$(if $(filter i2s_pio,$(1)),3,$(if $(filter button,$(1)),4,$(if $(filter flash_rp,$(1)),4,$(if $(filter temp_sensor,$(1)),1,$(if $(filter mic_pio,$(1)),1,$(if $(filter synth_source,$(1)),1,2))))))))))))))
-
-.PHONY: all firmware firmware-all tools modules modules-all linux-bin clean targets init run flash fmt lint check-no-inline-tests check-drift check-build-matrix check-stable test install-rig-backends
+# ── Bare-metal firmware ────────────────────────────────────────────────
 
 all: tools firmware-all modules-all linux-bin
 
 firmware:
 	@echo "Building firmware for $(TARGET) ($(RUST_TARGET))..."
 ifeq ($(TARGET),wasm)
-	@# wasm needs cdylib output for the host shim to instantiate.
-	@# `cargo rustc --crate-type=cdylib` requests it on the side so
-	@# Cargo.toml's default `crate-type = ["rlib"]` stays clean for
-	@# every other target (avoids the "dropping unsupported crate
-	@# type cdylib" warning on embedded builds).
-	cargo rustc --release --target $(RUST_TARGET) --no-default-features --features $(CARGO_FEATURES) --lib --crate-type=cdylib
+	$(CARGO) rustc --release --target $(RUST_TARGET) --no-default-features --features $(CARGO_FEATURES) --lib --crate-type=cdylib
 else
-	cargo build --release --target $(RUST_TARGET) --no-default-features --features $(CARGO_FEATURES)
+	$(CARGO) build --release --target $(RUST_TARGET) --no-default-features --features $(CARGO_FEATURES)
 endif
 	@mkdir -p target/$(TARGET)
 ifeq ($(TARGET),wasm)
-	@# The wasm build emits `fluxor.wasm` directly — no objcopy step.
-	@# The bundle tool reads from `target/wasm/firmware.wasm`; copy
-	@# (rather than rename) so subsequent `cargo build` doesn't have
-	@# to rebuild from scratch.
 	@cp $(RELEASE_DIR)/fluxor.wasm target/wasm/firmware.wasm
 else ifeq ($(TARGET),bcm2712)
 	@rust-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
@@ -128,12 +176,12 @@ firmware-all:
 
 tools:
 	@echo "Building tools..."
-	cargo build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
+	$(CARGO) build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
 
 # Symlink rig backend executables into the discovery path used by
 # `fluxor rig …`. Run after `make tools`.
 RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
-RIG_BACKENDS := telemetry-monitor_udp
+RIG_BACKENDS    := telemetry-monitor_udp
 install-rig-backends: tools
 	@mkdir -p $(RIG_BACKEND_DIR)
 	@for b in $(RIG_BACKENDS); do \
@@ -147,171 +195,31 @@ install-rig-backends: tools
 		echo "install-rig-backends: $$dst -> $$src"; \
 	done
 
-modules: tools
-ifeq ($(TARGET),wasm)
-	@# Each module compiles to a self-contained wasm32 cdylib, which
-	@# the pack tool wraps in the same `.fmod` envelope used by every
-	@# other target. The kernel detects wasm payloads via the
-	@# wasm-payload flag in the module header (bit 5 of byte 60) and
-	@# dispatches through `host_instantiate_module` instead of the
-	@# PIC loader.
-	@#
-	@# Every module is attempted. Modules that fail to compile or
-	@# don't export the canonical wasm entry points are listed and
-	@# skipped. The final summary prints the explicit built / skipped
-	@# names so configs that reference a missing module surface the
-	@# gap at build time.
-	@mkdir -p $(MODULES_OUT)
-	@built_list=""; skipped_list=""; total=0; \
-	for dir in $(MODULE_DIRS); do \
-		[ -d "$$dir" ] || continue; \
-		for src in $$(find "$$dir" -mindepth 2 -maxdepth 3 -name 'mod.rs' | sort); do \
-			mod_dir=$$(dirname "$$src"); \
-			mod=$$(basename "$$mod_dir"); \
-			total=$$((total + 1)); \
-			wasm="$(MODULES_OUT)/$$mod.wasm"; \
-			out="$(MODULES_OUT)/$$mod.fmod"; \
-			# Drop any existing .fmod that does not contain the \
-			# canonical wasm exports, so a non-canonical module \
-			# never stays loadable to configs purely because the \
-			# timestamp check would otherwise pass it through. \
-			if [ -f "$$out" ]; then \
-				if ! grep -q 'module_init_wasm' "$$out" || ! grep -q 'module_step_wasm' "$$out"; then \
-					rm -f "$$out"; \
-				fi; \
-			fi; \
-			newest=$$(find "$$mod_dir" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
-			if [ -n "$$newest" ] || [ "$(SDK_DIR)/runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(SDK_DIR)/wasm_entry.rs" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
-				if rustc --crate-type=cdylib --target=wasm32-unknown-unknown -C opt-level=z -C strip=symbols -A warnings -o "$$wasm" "$$src" 2>/tmp/wasm_build.$$$$.err; then \
-					if ! grep -q 'module_init_wasm' "$$wasm" || ! grep -q 'module_step_wasm' "$$wasm"; then \
-						echo "Skip: $$mod (compiles for wasm32 but does not export module_init_wasm + module_step_wasm — non-canonical lifecycle, can't be wasm-payload)"; \
-						skipped_list="$$skipped_list $$mod"; \
-						rm -f "$$wasm" "$$out" /tmp/wasm_build.$$$$.err; \
-						continue; \
-					fi; \
-					mtype=$$(echo "$(call mod_type,$$mod)"); [ -z "$$mtype" ] && mtype=2; \
-					manifest_arg=""; \
-					if [ -f "$$mod_dir/manifest.toml" ]; then manifest_arg="--manifest $$mod_dir/manifest.toml"; fi; \
-					if ! $(FLUXOR_TOOL) pack "$$wasm" -o "$$out" -n "$$mod" -t "$$mtype" $$manifest_arg; then \
-						echo "ERROR: pack failed for $$mod"; \
-						rm -f "$$out" /tmp/wasm_build.$$$$.err; \
-						exit 1; \
-					fi; \
-					built_list="$$built_list $$mod"; \
-				else \
-					echo "Skip: $$mod (wasm32 compile failed):"; \
-					sed 's/^/  | /' /tmp/wasm_build.$$$$.err | head -5; \
-					skipped_list="$$skipped_list $$mod"; \
-					rm -f "$$out"; \
-				fi; \
-				rm -f /tmp/wasm_build.$$$$.err; \
-			else \
-				built_list="$$built_list $$mod"; \
-			fi; \
-		done; \
-	done; \
-	built_count=$$(echo "$$built_list" | wc -w); \
-	skipped_count=$$(echo "$$skipped_list" | wc -w); \
-	echo "Modules (wasm): built $$built_count of $$total"; \
-	if [ -n "$$skipped_list" ]; then \
-		echo "  skipped:$$skipped_list"; \
-	fi
-else
-	@mkdir -p $(MODULES_OUT)
-	@# rp2350a and rp2350b produce identical PIC modules (same thumbv8m target).
-	@# Symlink both silicon variant names → rp2350 so combine tool finds modules at target/{silicon_id}/modules.
-	@if [ "$(TARGET)" = "rp2350" ]; then \
-		mkdir -p target/rp2350 && \
-		{ [ -e target/rp2350a ] || ln -s rp2350 target/rp2350a; } && \
-		{ [ -e target/rp2350b ] || ln -s rp2350 target/rp2350b; }; \
-	fi
-	@built=0; total=0; \
-	for dir in $(MODULE_DIRS); do \
-		[ -d "$$dir" ] || continue; \
-		for src in $$(find "$$dir" -mindepth 2 -maxdepth 3 -name 'mod.rs' | sort); do \
-			mod_dir=$$(dirname "$$src"); \
-			mod=$$(basename "$$mod_dir"); \
-			total=$$((total + 1)); \
-			obj="$(MODULES_OUT)/$$mod.o"; \
-			elf="$(MODULES_OUT)/$$mod.elf"; \
-			out="$(MODULES_OUT)/$$mod.fmod"; \
-			newest=$$(find "$$mod_dir" -name '*.rs' -newer "$$out" 2>/dev/null | head -1); \
-			if [ -f "$$mod_dir/module.ld" ]; then ld_script="$$mod_dir/module.ld"; else ld_script="$(MODULE_LD)"; fi; \
-			if [ -f "$$mod_dir/manifest.toml" ] && grep -q "^hardware_targets" "$$mod_dir/manifest.toml"; then \
-				if ! grep "^hardware_targets" "$$mod_dir/manifest.toml" | grep -Eq "\"$(TARGET)\"|\"$(SILICON_ID)\""; then \
-					continue; \
-				fi; \
-			fi; \
-			if [ -n "$$newest" ] || [ "$(ABI_HEADER)" -nt "$$out" ] 2>/dev/null || [ "$(SDK_DIR)/runtime.rs" -nt "$$out" ] 2>/dev/null || [ "$(MODULE_LD)" -nt "$$out" ] 2>/dev/null || [ ! -f "$$out" ]; then \
-				rustc --crate-type=lib --target $(MODULE_TARGET) -O -C relocation-model=pic $(MODULE_RUSTFLAGS) -A warnings --emit=obj -o "$$obj" "$$src" || exit 1; \
-				$(MODULE_LINKER) -T "$$ld_script" --gc-sections --no-undefined --undefined=module_arena_size -o "$$elf" "$$obj" || exit 1; \
-				mtype=$$(echo "$(call mod_type,$$mod)"); [ -z "$$mtype" ] && mtype=2; \
-				manifest_arg=""; \
-				if [ -f "$$mod_dir/manifest.toml" ]; then manifest_arg="--manifest $$mod_dir/manifest.toml"; fi; \
-				$(FLUXOR_TOOL) pack "$$elf" -o "$$out" -n "$$mod" -t "$$mtype" $$manifest_arg || exit 1; \
-				built=$$((built + 1)); \
-			fi; \
-		done; \
-	done; \
-	if [ "$$built" -gt 0 ]; then \
-		echo "Modules ($(TARGET)): built $$built of $$total"; \
-	else \
-		echo "Modules ($(TARGET)): up to date ($$total)"; \
-	fi
-endif
-
-modules-all:
-	$(MAKE) modules TARGET=rp2350
-	$(MAKE) modules TARGET=rp2040
-	$(MAKE) modules TARGET=bcm2712
-
-# Thin wrappers around fluxor CLI
-run:
-	@if [ -z "$(CONFIG)" ]; then echo "Usage: make run CONFIG=examples/web_server/linux.yaml"; exit 1; fi
-	$(FLUXOR_TOOL) run $(CONFIG)
-
-flash:
-	@if [ -z "$(CONFIG)" ]; then echo "Usage: make flash CONFIG=examples/led_patterns/pico2w.yaml"; exit 1; fi
-	$(FLUXOR_TOOL) flash $(CONFIG)
-
-targets:
-	@$(FLUXOR_TOOL) targets
-
 linux-bin: tools
-	@cargo build --release --bin fluxor-linux --no-default-features --features host-linux --target aarch64-unknown-linux-gnu
+	$(CARGO) build --release --bin fluxor-linux --no-default-features --features host-linux --target aarch64-unknown-linux-gnu
+
+run: tools
+	@if [ -z "$(CONFIG)" ]; then echo "Usage: make run CONFIG=examples/web_server/linux.yaml"; exit 1; fi
+	$(FLUXOR) run $(CONFIG)
+
+flash: tools
+	@if [ -z "$(CONFIG)" ]; then echo "Usage: make flash CONFIG=examples/led_patterns/pico2w.yaml"; exit 1; fi
+	$(FLUXOR) flash $(CONFIG)
+
+targets: tools
+	@$(FLUXOR) targets
 
 init:
 	git submodule update --init --recursive
 
-fmt:
-	@cargo fmt --all
+# ── Migration aliases ──────────────────────────────────────────────────
+#
+# The historic standalone shell guards `check-no-inline-tests` and
+# `check-drift` are now subsumed by `fluxor ci`. Aliases kept so any
+# stray external scripts that still call them continue to work.
+check-no-inline-tests: tools
+	@$(FLUXOR) lint hygiene
 
-# Run clippy on every kernel target the firmware ships for, plus the host
-# tools and the Linux harness. Each invocation uses `-D warnings` so any
-# new lint becomes a CI failure rather than a passive warning. Targets
-# share most of the kernel source, but each enables a different set of
-# `chip-*` / `board-*` features that gate platform code, so all of them
-# must be checked. The leading `touch src/lib.rs` invalidates clippy's
-# incremental cache so warnings re-emit even when the prior compile was
-# silent on a sibling target.
-# Guard: production `src/` must stay free of inline `#[cfg(test)]`
-# modules. Tests for `src/` live under `tests/harness/tests/` so the
-# kernel build matrix never compiles test code into firmware.
-check-no-inline-tests:
-	@echo "==> checking src/ for inline #[cfg(test)] modules ..."
-	@if rg -l '#\[cfg\(test\)\]' src/ >/dev/null 2>&1; then \
-		echo "ERROR: inline tests detected under src/ — move them to tests/harness/" >&2; \
-		rg -l '#\[cfg\(test\)\]' src/ >&2; \
-		exit 1; \
-	fi
-
-# Run engineer-local drift checks under `.context/drift/checks/`.
-# These encode project-specific lore (forbidden wording in docs,
-# build-artefact invariants, etc.) and live outside the tracked tree
-# so the public Makefile stays focused on the build itself. Missing —
-# the gate prints "skipped" but does not fail, so a fresh clone still
-# completes `check-stable` cleanly. Present — every executable script
-# under `.context/drift/checks/` runs; any non-zero exit fails the gate.
 check-drift:
 	@if [ -x .context/drift/run.sh ]; then \
 		.context/drift/run.sh; \
@@ -319,11 +227,10 @@ check-drift:
 		echo "==> check-drift: no local drift checks installed (.context/drift/ absent)"; \
 	fi
 
-# Guard: every supported platform must build clean. Kernels only —
-# module builds run through their own matrix. Platform fall-through
-# (e.g. a wasm build picking up RP linker artefacts) is prevented
-# structurally by `build.rs::detect_platform`, which panics on any
-# input that isn't exactly one of the recognised platform features.
+# Guard: every supported platform must build clean. Kernels only;
+# module builds run through `fluxor modules build --all`. Kept as a
+# project-specific target because `fluxor ci` doesn't cross-compile
+# the kernel for every silicon target, only run host clippy.
 check-build-matrix:
 	@echo "==> build matrix ..."
 	$(MAKE) linux-bin
@@ -331,84 +238,3 @@ check-build-matrix:
 	$(MAKE) firmware TARGET=rp2350
 	$(MAKE) firmware TARGET=cm5
 	@echo "==> build matrix: all 4 platforms green"
-
-# Umbrella pre-commit / pre-release gate. Runs every static guard
-# plus the test suite. Use this in CI and before tagging a v1
-# candidate.
-check-stable: check-no-inline-tests check-build-matrix test check-drift
-	@echo ""
-	@echo "================================================================"
-	@echo "  Release gate green:"
-	@echo "    * no inline tests under src/"
-	@echo "    * linux + wasm + rp2350 + cm5 all build clean"
-	@echo "    * make test passing (tools + harness)"
-	@echo "    * local drift checks (if any) passing"
-	@echo "================================================================"
-
-lint: check-no-inline-tests
-	@echo "==> linting fluxor-tools (host + integration tests) ..."
-	@cd tools && cargo clippy --all-targets --all-features -- -D warnings
-	@echo "==> linting fluxor-linux (host-image, host-window, host-playback) ..."
-	@touch src/lib.rs
-	@cargo clippy --release --bin fluxor-linux \
-		--no-default-features \
-		--features "host-linux host-image host-window host-playback" \
-		--target aarch64-unknown-linux-gnu -- -D warnings
-	@echo "==> linting firmware (rp2350b) ..."
-	@touch src/lib.rs
-	@cargo clippy --release --target thumbv8m.main-none-eabihf \
-		--no-default-features --features chip-rp2350b -- -D warnings
-	@echo "==> linting firmware (rp2040) ..."
-	@touch src/lib.rs
-	@cargo clippy --release --target thumbv6m-none-eabi \
-		--no-default-features --features chip-rp2040 -- -D warnings
-	@echo "==> linting firmware (bcm2712) ..."
-	@touch src/lib.rs
-	@cargo clippy --release --target aarch64-unknown-none \
-		--no-default-features --features chip-bcm2712 -- -D warnings
-	@echo "==> linting firmware (board-cm5) ..."
-	@touch src/lib.rs
-	@cargo clippy --release --target aarch64-unknown-none \
-		--no-default-features --features board-cm5 -- -D warnings
-	@echo "==> linting firmware (wasm) ..."
-	@touch src/lib.rs
-	@# Lint the lib as rlib — type/borrow checks don't differ between
-	@# rlib and cdylib, and `cargo clippy` doesn't accept `--crate-type`.
-	@# The cdylib artifact itself is produced by `make firmware TARGET=wasm`.
-	@cargo clippy --release --target wasm32-unknown-unknown \
-		--no-default-features --features host-wasm -- -D warnings
-	@echo "lint: clean"
-
-# Host-side test suite.
-#  - fluxor-tools workspace tests
-#  - fluxor-test-harness sub-workspace (in `tests/harness/`):
-#      - harness self-tests (mock channel/provider/syscall table)
-#      - integration tests under `tests/harness/tests/*.rs`
-#        (graph_unification, ip, http, ws, kernel_*, perf_http,
-#        platform_debug, http3 — the network-stack matrix)
-#
-# `tests/` is a sub-workspace independent of the main one. The main
-# tree builds without it; `make test` runs the harness from inside
-# its own directory.
-test:
-	@echo "==> testing fluxor-tools ..."
-	@cd tools && cargo test --all-targets --all-features
-	@echo "==> testing fluxor-mod-tls crypto KATs ..."
-	@# `fluxor-mod-tls` defaults to `#![no_std]` / `#![no_main]` so
-	@# plain `cargo test -p fluxor-mod-tls` against the aarch64 host
-	@# fails. The `host-test` feature toggles those attributes off;
-	@# we run it here unconditionally so the crypto KAT regression
-	@# gate fires from `make test` and `make check-stable`.
-	@cargo test -p fluxor-mod-tls --features host-test \
-		--target aarch64-unknown-linux-gnu --no-fail-fast
-	@if [ -d tests/harness ]; then \
-		echo "==> testing fluxor-test-harness (sub-workspace) ..." && \
-		cd tests/harness && cargo test --target aarch64-unknown-linux-gnu --no-fail-fast; \
-	else \
-		echo "==> tests/harness not present; skipping integration tests"; \
-	fi
-	@echo "test: complete (any failures listed above are real and must be addressed)"
-
-clean:
-	cargo clean
-	rm -rf target

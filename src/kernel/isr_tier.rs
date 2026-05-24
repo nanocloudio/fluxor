@@ -249,10 +249,12 @@ pub fn register_tier1b_module(
     in_bridges: &[i8],
     out_bridges: &[i8],
 ) -> i32 {
+    // SAFETY: registration runs during scheduler bring-up before any ISR
+    // is enabled; no concurrent reader observes `ISR_SLOTS` / `ISR_COUNT`.
     unsafe {
         let count = ISR_COUNT as usize;
         if count >= MAX_ISR_MODULES {
-            log::error!("[isr] tier1b full ({} slots)", MAX_ISR_MODULES);
+            log::error!("[isr] tier1b full ({MAX_ISR_MODULES} slots)");
             return -1;
         }
 
@@ -281,10 +283,7 @@ pub fn register_tier1b_module(
         ISR_COUNT = count as u8 + 1;
 
         log::info!(
-            "[isr] tier1b registered slot={} mod={} budget={}cy",
-            count,
-            module_index,
-            budget_cycles
+            "[isr] tier1b registered slot={count} mod={module_index} budget={budget_cycles}cy"
         );
         count as i32
     }
@@ -311,10 +310,12 @@ pub struct Tier2Registration<'a> {
 /// - `reg.state_ptr` must be a valid state buffer for the module's lifetime
 /// - Must be called before enabling the IRQ
 pub fn register_tier2_module(reg: Tier2Registration<'_>) -> i32 {
+    // SAFETY: same single-threaded-bringup invariant as register_tier1b_module;
+    // no IRQ is bound yet.
     unsafe {
         let count = ISR_T2_COUNT as usize;
         if count >= MAX_ISR_T2_MODULES {
-            log::error!("[isr] tier2 full ({} slots)", MAX_ISR_T2_MODULES);
+            log::error!("[isr] tier2 full ({MAX_ISR_T2_MODULES} slots)");
             return -1;
         }
 
@@ -358,6 +359,9 @@ pub fn register_tier2_module(reg: Tier2Registration<'_>) -> i32 {
 /// Reset all ISR state (called on graph reconfigure).
 pub fn reset_all() {
     stop_tier1b();
+    // SAFETY: `stop_tier1b()` above drops the active flag and waits;
+    // after this point ISRs are quiesced so the static slot arrays are
+    // exclusively accessible.
     unsafe {
         let slots = &raw mut ISR_SLOTS;
         for slot in (*slots).iter_mut() {
@@ -456,6 +460,10 @@ pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
 ///
 /// Returns the metrics struct, or None if invalid tier/slot.
 pub fn query_metrics(tier: u8, slot: u8) -> Option<IsrMetrics> {
+    // SAFETY: `IsrMetrics` is `Copy` POD; reading the snapshot races with
+    // ISR increments but each field is `u32`/aligned-load atomic on the
+    // supported architectures, and the metrics struct is documented as
+    // best-effort introspection.
     unsafe {
         match tier {
             1 => {
@@ -482,6 +490,7 @@ pub fn query_metrics(tier: u8, slot: u8) -> Option<IsrMetrics> {
 /// Query the number of registered ISR modules.
 /// Returns (tier1b_count, tier2_count).
 pub fn module_counts() -> (u8, u8) {
+    // SAFETY: `ISR_COUNT` / `ISR_T2_COUNT` are u8 statics; aligned reads.
     unsafe { (ISR_COUNT, ISR_T2_COUNT) }
 }
 
@@ -497,11 +506,14 @@ pub fn check_and_clear_overrun() -> bool {
 
 /// Get the Tier 1b period in microseconds.
 pub fn tier1b_period_us() -> u32 {
+    // SAFETY: `TIER1B_PERIOD_US` is a u32 static; aligned read.
     unsafe { TIER1B_PERIOD_US }
 }
 
 /// Set the Tier 1b period in microseconds (called by platform start).
 pub fn set_tier1b_period_us(period_us: u32) {
+    // SAFETY: called once during platform start before tier1b becomes
+    // active; the active flag is set after this write.
     unsafe {
         TIER1B_PERIOD_US = period_us;
     }
@@ -538,7 +550,7 @@ pub fn start_tier1b(period_us: u32) {
     init(); // Ensure cycle counter is enabled
     set_tier1b_period_us(period_us);
     hal::isr_tier_start(period_us);
-    log::info!("[isr] tier1b started period={}us", period_us);
+    log::info!("[isr] tier1b started period={period_us}us");
 }
 
 /// Stop the Tier 1b periodic timer.
@@ -569,7 +581,9 @@ pub fn isr_metrics_dispatch(arg: *mut u8, arg_len: usize) -> i32 {
         return crate::kernel::errno::EINVAL;
     }
 
+    // SAFETY: `arg_len >= 2` checked above; reading 2 bytes from `arg`.
     let tier = unsafe { *arg };
+    // SAFETY: as above.
     let slot = unsafe { *arg.add(1) };
 
     match query_metrics(tier, slot) {
@@ -578,6 +592,8 @@ pub fn isr_metrics_dispatch(arg: *mut u8, arg_len: usize) -> i32 {
             if arg_len < out_size {
                 return crate::kernel::errno::EINVAL;
             }
+            // SAFETY: `arg_len >= out_size` checked above; `IsrMetrics` is
+            // `Copy` POD so byte-copy preserves representation.
             unsafe {
                 let src = &metrics as *const IsrMetrics as *const u8;
                 core::ptr::copy_nonoverlapping(src, arg, out_size);

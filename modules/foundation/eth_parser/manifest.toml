@@ -1,0 +1,6 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# Ethernet/IP header parser. Reads raw frames from the NIC driver and
+# emits parsed packet metadata + payload to consumers. Pairs with
+# `pkt_filter` for a stateless firewall topology.

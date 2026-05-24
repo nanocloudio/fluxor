@@ -60,6 +60,8 @@ struct AesKey {
 impl AesKey {
     fn expand_128(key: &[u8; 16]) -> Self {
         let mut rk = [[0u8; 16]; 15];
+        // SAFETY: pointer arithmetic over the AES round-key state and the
+        // GHASH accumulator; both are fixed-size structs.
         unsafe { core::ptr::copy_nonoverlapping(key.as_ptr(), rk[0].as_mut_ptr(), 16); }
 
         let mut i = 1;
@@ -82,6 +84,8 @@ impl AesKey {
 
     fn expand_256(key: &[u8; 32]) -> Self {
         let mut rk = [[0u8; 16]; 15];
+        // SAFETY: pointer arithmetic over the AES round-key state and the
+        // GHASH accumulator; both are fixed-size structs.
         unsafe {
             core::ptr::copy_nonoverlapping(key.as_ptr(), rk[0].as_mut_ptr(), 16);
             core::ptr::copy_nonoverlapping(key.as_ptr().add(16), rk[1].as_mut_ptr(), 16);
@@ -382,6 +386,8 @@ impl GHash {
         let mut offset = 0;
         while offset + 16 <= data.len() {
             let mut block = [0u8; 16];
+            // SAFETY: pointer arithmetic over the AES round-key state and the
+            // GHASH accumulator; both are fixed-size structs.
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), 16); }
             self.update_block(&block);
             offset += 16;
@@ -389,6 +395,8 @@ impl GHash {
         if offset < data.len() {
             let mut block = [0u8; 16];
             let remain = data.len() - offset;
+            // SAFETY: pointer arithmetic over the AES round-key state and the
+            // GHASH accumulator; both are fixed-size structs.
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), remain); }
             self.update_block(&block);
         }
@@ -399,6 +407,8 @@ impl GHash {
         let mut len_block = [0u8; 16];
         let aad_bits = (aad_len as u64) * 8;
         let ct_bits = (ct_len as u64) * 8;
+        // SAFETY: pointer arithmetic over the AES round-key state and the
+        // GHASH accumulator; both are fixed-size structs.
         unsafe {
             let a = aad_bits.to_be_bytes();
             let c = ct_bits.to_be_bytes();
@@ -408,6 +418,8 @@ impl GHash {
         self.update_block(&len_block);
 
         let mut tag = [0u8; 16];
+        // SAFETY: pointer arithmetic over the AES round-key state and the
+        // GHASH accumulator; both are fixed-size structs.
         unsafe {
             let hi = self.y_hi.to_be_bytes();
             let lo = self.y_lo.to_be_bytes();
@@ -449,7 +461,7 @@ impl Drop for AesKey {
 /// The function inlines the round-key expansion each call; callers
 /// who do header protection per-packet should cache the expanded key
 /// in `Aes128Hp` instead.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 pub fn aes128_ecb_encrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
     let aes = AesKey::expand_128(key);
     aes.encrypt_block(block);
@@ -462,7 +474,7 @@ pub struct Aes128Hp {
     aes: AesKey,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 impl Aes128Hp {
     pub fn new(key: &[u8; 16]) -> Self {
         Self { aes: AesKey::expand_128(key) }
@@ -499,6 +511,8 @@ impl AesGcm {
     /// Generate counter block from nonce (12 bytes) + counter (big-endian u32)
     fn make_j0(nonce: &[u8; 12]) -> [u8; 16] {
         let mut j0 = [0u8; 16];
+        // SAFETY: pointer arithmetic over the AES round-key state and the
+        // GHASH accumulator; both are fixed-size structs.
         unsafe { core::ptr::copy_nonoverlapping(nonce.as_ptr(), j0.as_mut_ptr(), 12); }
         j0[15] = 1; // Initial counter = 1
         j0
@@ -508,6 +522,8 @@ impl AesGcm {
         let mut c = u32::from_be_bytes([ctr[12], ctr[13], ctr[14], ctr[15]]);
         c = c.wrapping_add(1);
         let b = c.to_be_bytes();
+        // SAFETY: pointer arithmetic over the AES round-key state and the
+        // GHASH accumulator; both are fixed-size structs.
         unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), ctr.as_mut_ptr().add(12), 4); }
     }
 
@@ -528,13 +544,13 @@ impl AesGcm {
         ghash.update(aad);
         // Pad AAD to 16 bytes
         let aad_pad = (16 - (aad.len() % 16)) % 16;
-        if aad_pad > 0 && aad.len() > 0 {
+        if aad_pad > 0 && !aad.is_empty() {
             let zeros = [0u8; 16];
             ghash.update(&zeros[..aad_pad]);
         }
         ghash.update(data);
         let ct_pad = (16 - (data.len() % 16)) % 16;
-        if ct_pad > 0 && data.len() > 0 {
+        if ct_pad > 0 && !data.is_empty() {
             let zeros = [0u8; 16];
             ghash.update(&zeros[..ct_pad]);
         }
@@ -560,13 +576,13 @@ impl AesGcm {
         let mut ghash = GHash::new(&self.h);
         ghash.update(aad);
         let aad_pad = (16 - (aad.len() % 16)) % 16;
-        if aad_pad > 0 && aad.len() > 0 {
+        if aad_pad > 0 && !aad.is_empty() {
             let zeros = [0u8; 16];
             ghash.update(&zeros[..aad_pad]);
         }
         ghash.update(data);
         let ct_pad = (16 - (data.len() % 16)) % 16;
-        if ct_pad > 0 && data.len() > 0 {
+        if ct_pad > 0 && !data.is_empty() {
             let zeros = [0u8; 16];
             ghash.update(&zeros[..ct_pad]);
         }

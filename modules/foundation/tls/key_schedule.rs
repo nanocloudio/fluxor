@@ -188,12 +188,16 @@ fn hash_empty(alg: HashAlg, out: &mut [u8]) {
             let h = Sha256::new();
             let digest = h.finalize();
             let n = if out.len() < 32 { out.len() } else { 32 };
+            // SAFETY: pointer arithmetic over fixed-size key-schedule scalars
+            // (HKDF output, traffic secret slots).
             unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n); }
         }
         HashAlg::Sha384 => {
             let h = Sha384::new();
             let digest = h.finalize();
             let n = if out.len() < 48 { out.len() } else { 48 };
+            // SAFETY: pointer arithmetic over fixed-size key-schedule scalars
+            // (HKDF output, traffic secret slots).
             unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n); }
         }
     }

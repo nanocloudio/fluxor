@@ -108,7 +108,9 @@ pub fn install_root() -> Option<InstallRoot> {
             }
             if has_install_markers(prefix) {
                 return Some(InstallRoot {
-                    path: prefix.canonicalize().unwrap_or_else(|_| prefix.to_path_buf()),
+                    path: prefix
+                        .canonicalize()
+                        .unwrap_or_else(|_| prefix.to_path_buf()),
                     source: InstallDiscoverySource::ExePrefixFlat,
                 });
             }
@@ -133,7 +135,10 @@ fn has_install_markers(path: &Path) -> bool {
 /// `Path::new("stacks/audio.toml")`. Absolute paths are returned
 /// as-is when they exist (defensive — callers should pass relative
 /// paths, but absolutes pass through cleanly when they happen).
-#[allow(dead_code)] // exercised by inline tests; reserved for future callers (e.g. inspect).
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)] // exercised by inline tests; reserved for future callers (e.g. inspect).
 pub fn find_resource(relative: &Path) -> Option<PathBuf> {
     if relative.is_absolute() {
         return relative.is_file().then(|| relative.to_path_buf());
@@ -244,7 +249,10 @@ pub fn discover() -> ProjectRoot {
 /// Skips the env-var check — callers that want env-var semantics
 /// should use [`discover`] / [`root`]. Returns `None` when no marker
 /// is found (callers can decide whether to fall back to `start`).
-#[allow(dead_code)] // exercised by inline tests; reserved for future callers.
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)] // exercised by inline tests; reserved for future callers.
 pub fn discover_from(start: &Path) -> Option<ProjectRoot> {
     let starting_cwd = start.to_path_buf();
     let mut cur = starting_cwd.clone();
@@ -277,6 +285,10 @@ fn marker_at(path: &Path) -> Option<DiscoverySource> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::undocumented_unsafe_blocks,
+    reason = "test scaffolding wraps std::env::{set_var, remove_var} which became `unsafe fn` in Rust 2024; safety is identical at every call site — the tests serialise on the module-level `lock()` mutex, so racing env-mutation across threads is structurally precluded"
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -351,10 +363,7 @@ mod tests {
         // Compare canonicalised forms — `discover_from` canonicalises
         // its result; `tempdir()` on macOS returns a /var path that
         // canonicalises to /private/var.
-        assert_eq!(
-            found.path,
-            root.canonicalize().unwrap()
-        );
+        assert_eq!(found.path, root.canonicalize().unwrap());
     }
 
     #[test]
@@ -374,7 +383,9 @@ mod tests {
         if let Some(found) = result {
             assert_ne!(
                 found.path,
-                tmp.path().canonicalize().unwrap_or(tmp.path().to_path_buf()),
+                tmp.path()
+                    .canonicalize()
+                    .unwrap_or(tmp.path().to_path_buf()),
                 "tempdir without a marker must not be reported as the root"
             );
         }
@@ -399,7 +410,10 @@ mod tests {
             std::env::remove_var(ENV_PROJECT_ROOT);
         }
         assert_eq!(found.source, DiscoverySource::EnvVar);
-        assert_eq!(found.env_var_value.as_deref(), Some(tmp.path().to_str().unwrap()));
+        assert_eq!(
+            found.env_var_value.as_deref(),
+            Some(tmp.path().to_str().unwrap())
+        );
     }
 
     // ── install_root ─────────────────────────────────────────────

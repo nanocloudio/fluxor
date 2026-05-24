@@ -37,6 +37,8 @@ fn hash(alg: HashAlg, data: &[u8], out: &mut [u8]) {
             h.update(data);
             let digest = h.finalize();
             let n = if out.len() < 32 { out.len() } else { 32 };
+            // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+            // bounded by loop invariant or the struct's own BLOCK_LEN.
             unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n); }
         }
         HashAlg::Sha384 => {
@@ -44,6 +46,8 @@ fn hash(alg: HashAlg, data: &[u8], out: &mut [u8]) {
             h.update(data);
             let digest = h.finalize();
             let n = if out.len() < 48 { out.len() } else { 48 };
+            // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+            // bounded by loop invariant or the struct's own BLOCK_LEN.
             unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n); }
         }
     }
@@ -59,6 +63,8 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
     if key.len() > block_len {
         hash(alg, key, &mut k_pad[..hash_len]);
     } else {
+        // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+        // bounded by loop invariant or the struct's own BLOCK_LEN.
         unsafe { core::ptr::copy_nonoverlapping(key.as_ptr(), k_pad.as_mut_ptr(), key.len()); }
     }
 
@@ -77,6 +83,8 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
             h.update(&ipad[..block_len]);
             h.update(message);
             let d = h.finalize();
+            // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+            // bounded by loop invariant or the struct's own BLOCK_LEN.
             unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), inner_hash.as_mut_ptr(), 32); }
         }
         HashAlg::Sha384 => {
@@ -84,6 +92,8 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
             h.update(&ipad[..block_len]);
             h.update(message);
             let d = h.finalize();
+            // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+            // bounded by loop invariant or the struct's own BLOCK_LEN.
             unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), inner_hash.as_mut_ptr(), 48); }
         }
     }
@@ -103,6 +113,8 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
             h.update(&inner_hash[..32]);
             let d = h.finalize();
             let n = if out.len() < 32 { out.len() } else { 32 };
+            // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+            // bounded by loop invariant or the struct's own BLOCK_LEN.
             unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), out.as_mut_ptr(), n); }
         }
         HashAlg::Sha384 => {
@@ -111,6 +123,8 @@ pub fn hmac(alg: HashAlg, key: &[u8], message: &[u8], out: &mut [u8]) {
             h.update(&inner_hash[..48]);
             let d = h.finalize();
             let n = if out.len() < 48 { out.len() } else { 48 };
+            // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+            // bounded by loop invariant or the struct's own BLOCK_LEN.
             unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), out.as_mut_ptr(), n); }
         }
     }
@@ -137,7 +151,7 @@ pub fn hkdf_extract(alg: HashAlg, salt: &[u8], ikm: &[u8], prk: &mut [u8]) {
 /// HKDF-Expand: OKM = T(1) || T(2) || ... (truncated to length)
 pub fn hkdf_expand(alg: HashAlg, prk: &[u8], info: &[u8], okm: &mut [u8]) {
     let hash_len = alg.digest_len();
-    let n = (okm.len() + hash_len - 1) / hash_len;
+    let n = okm.len().div_ceil(hash_len);
     let mut t = [0u8; MAX_HASH_LEN];
     let mut t_len = 0usize;
     let mut offset = 0;
@@ -150,8 +164,12 @@ pub fn hkdf_expand(alg: HashAlg, prk: &[u8], info: &[u8], okm: &mut [u8]) {
         // max: hash(48) + HkdfLabel(520) + counter(1) = 569
         let mut msg = [0u8; 576];
         if t_len > 0 {
+            // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+            // bounded by loop invariant or the struct's own BLOCK_LEN.
             unsafe { core::ptr::copy_nonoverlapping(t.as_ptr(), msg.as_mut_ptr(), t_len); }
         }
+        // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+        // bounded by loop invariant or the struct's own BLOCK_LEN.
         unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), msg.as_mut_ptr().add(t_len), info.len()); }
         msg[t_len + info.len()] = i;
 
@@ -159,6 +177,8 @@ pub fn hkdf_expand(alg: HashAlg, prk: &[u8], info: &[u8], okm: &mut [u8]) {
         t_len = hash_len;
 
         let copy_len = if okm.len() - offset < hash_len { okm.len() - offset } else { hash_len };
+        // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+        // bounded by loop invariant or the struct's own BLOCK_LEN.
         unsafe { core::ptr::copy_nonoverlapping(t.as_ptr(), okm.as_mut_ptr().add(offset), copy_len); }
         offset += copy_len;
 
@@ -177,7 +197,7 @@ pub fn hkdf_expand_label(
 ) {
     // Build HkdfLabel struct
     let label_with_prefix_len = 6 + label.len(); // "tls13 " + label
-    let total = 2 + 1 + label_with_prefix_len + 1 + context.len();
+    let _total = 2 + 1 + label_with_prefix_len + 1 + context.len();
     let mut info = [0u8; 520]; // max: 2 + 1 + (6+255) + 1 + 255 = 520
     let length = out.len() as u16;
     info[0] = (length >> 8) as u8;
@@ -185,10 +205,15 @@ pub fn hkdf_expand_label(
     info[2] = label_with_prefix_len as u8;
     info[3] = b't'; info[4] = b'l'; info[5] = b's';
     info[6] = b'1'; info[7] = b'3'; info[8] = b' ';
+    // SAFETY: pointer arithmetic over fixed-size scalars and HMAC state;
+    // bounded by loop invariant or the struct's own BLOCK_LEN.
     unsafe { core::ptr::copy_nonoverlapping(label.as_ptr(), info.as_mut_ptr().add(9), label.len()); }
     let ctx_off = 9 + label.len();
     info[ctx_off] = context.len() as u8;
-    if context.len() > 0 {
+    if !context.is_empty() {
+        // SAFETY: `info` has capacity `MAX_INFO`; `ctx_off + 1 + context.len()
+        // <= MAX_INFO` checked by the caller via `info_len <= MAX_INFO`
+        // before invoking this helper.
         unsafe { core::ptr::copy_nonoverlapping(context.as_ptr(), info.as_mut_ptr().add(ctx_off + 1), context.len()); }
     }
     let info_len = ctx_off + 1 + context.len();

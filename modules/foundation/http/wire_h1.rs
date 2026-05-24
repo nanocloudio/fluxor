@@ -10,6 +10,10 @@
 ///
 /// `len` may be smaller than `buf.len()` to scan only the populated
 /// prefix of a fixed-size receive buffer.
+///
+/// # Safety
+/// `buf` must be valid for reads of `len` bytes (which may be ≤ `buf.len()`).
+/// Internal pointer arithmetic stays inside that prefix.
 pub unsafe fn find_header_end(buf: &[u8], len: usize) -> Option<usize> {
     if len < 4 {
         return None;
@@ -36,6 +40,11 @@ pub unsafe fn find_header_end(buf: &[u8], len: usize) -> Option<usize> {
 ///
 /// GET is the only method this server accepts; non-GET requests fall
 /// through to a 400 reply.
+///
+/// # Safety
+/// `src` must be valid for reads of `src_len` bytes; `dst` must be
+/// valid for writes of up to `dst_cap` bytes. The returned length is
+/// clamped to `dst_cap` so writes never overshoot.
 pub unsafe fn parse_request_line(
     src: *const u8,
     src_len: usize,
@@ -76,6 +85,9 @@ pub unsafe fn parse_request_line(
 /// clients into 1.0 keep-alive semantics. We always include
 /// `Connection: close`, so the connection still closes after each
 /// response — but the version now matches modern requests.
+///
+/// # Safety
+/// `dst` must be valid for writes of `dst_cap` bytes.
 pub unsafe fn write_status_line(
     dst: *mut u8,
     dst_cap: usize,
@@ -107,6 +119,9 @@ pub unsafe fn write_status_line(
 
 /// Write a minimal HTTP/1.1 error response (status line + Connection:
 /// close + blank line + body) into `dst`. Returns total bytes written.
+///
+/// # Safety
+/// `dst` must be valid for writes of `dst_cap` bytes.
 pub unsafe fn write_error_response(
     dst: *mut u8,
     dst_cap: usize,
@@ -208,7 +223,7 @@ pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
         let mut j = 0;
         while j < bytes.len() {
             let c = bytes[j];
-            if !(b'0'..=b'9').contains(&c) {
+            if !c.is_ascii_digit() {
                 return None;
             }
             acc = acc.saturating_mul(10).saturating_add((c - b'0') as u64);
@@ -265,6 +280,9 @@ pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
 ///
 /// Capped at 256 bytes total — `dst_cap` must reflect the caller's
 /// scratch capacity. The host IP is written in big-endian dotted-quad.
+///
+/// # Safety
+/// `dst` must be valid for writes of `dst_cap` bytes.
 pub unsafe fn write_request_line(
     dst: *mut u8,
     dst_cap: usize,

@@ -45,10 +45,7 @@ fn load(name: &str) -> fluxor_tools::manifest::Manifest {
                 .unwrap_or_else(|e| panic!("parse {}: {}", p.display(), e));
         }
     }
-    panic!(
-        "no manifest found for '{}' under modules/builtin/{{linux,host}}/",
-        name
-    );
+    panic!("no manifest found for '{name}' under modules/builtin/{{linux,host}}/");
 }
 
 /// Assert that a manifest's `[[params]]` declarations match an expected
@@ -71,10 +68,9 @@ fn assert_layout(name: &str, expected: &[(u8, &str)]) {
     for (i, (exp, act)) in expected.iter().zip(actual.iter()).enumerate() {
         assert_eq!(
             exp, act,
-            "{}: param {} drifted — manifest says {:?}, test expects {:?}. \
-             If you reordered [[params]], update src/platform/linux/{}.rs \
+            "{name}: param {i} drifted — manifest says {act:?}, test expects {exp:?}. \
+             If you reordered [[params]], update src/platform/linux/{name}.rs \
              tag constants to match.",
-            name, i, act, exp, name,
         );
     }
 }

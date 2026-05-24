@@ -38,6 +38,13 @@
 //! and `modules/sdk/contracts/net/net_proto.rs` for Stream Surface v1.
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 

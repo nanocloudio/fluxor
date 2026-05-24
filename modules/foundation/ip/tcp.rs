@@ -475,10 +475,12 @@ pub unsafe fn reorder_insert(conn: &mut TcpConn, seq: u32, payload: *const u8, l
 /// Pop the next in-order segment from the reorder buffer if its seq matches
 /// `rcv_nxt`. Returns (ptr, len) on hit, None otherwise. The returned pointer
 /// is valid until the next `reorder_insert` or `reorder_take_next`.
-pub unsafe fn reorder_take_next<'a>(
-    conn: &'a mut TcpConn,
-    rcv_nxt: u32,
-) -> Option<(&'a [u8], u32)> {
+///
+/// # Safety
+/// `conn.reorder_buf` must outlive the returned slice; the slot's
+/// `valid` flag is cleared before return so a subsequent re-fill must
+/// be observed only after the slice is consumed.
+pub unsafe fn reorder_take_next(conn: &mut TcpConn, rcv_nxt: u32) -> Option<(&[u8], u32)> {
     let mut i = 0;
     while i < REORDER_SLOTS {
         if conn.reorder_slots[i].valid && conn.reorder_slots[i].seq == rcv_nxt {
@@ -500,7 +502,11 @@ pub unsafe fn reorder_take_next<'a>(
 /// slot stays valid for the next retry. The returned slice is valid
 /// until the next `reorder_insert` / `reorder_take_next` /
 /// `reorder_consume_at`.
-pub unsafe fn reorder_peek_next<'a>(conn: &'a TcpConn, rcv_nxt: u32) -> Option<(&'a [u8], u32)> {
+///
+/// # Safety
+/// `conn.reorder_buf` must outlive the returned slice. The caller
+/// must not mutate the reorder ring while the slice is live.
+pub unsafe fn reorder_peek_next(conn: &TcpConn, rcv_nxt: u32) -> Option<(&[u8], u32)> {
     let mut i = 0;
     while i < REORDER_SLOTS {
         if conn.reorder_slots[i].valid && conn.reorder_slots[i].seq == rcv_nxt {
@@ -602,11 +608,7 @@ pub fn rtt_update(conn: &mut TcpConn, sample_ticks: u16) {
         conn.rttvar = (r << 2) as u16;
     } else {
         let srtt_shifted = (conn.srtt >> 3) as u32;
-        let delta = if r > srtt_shifted {
-            r - srtt_shifted
-        } else {
-            srtt_shifted - r
-        };
+        let delta = r.abs_diff(srtt_shifted);
         // rttvar = rttvar - (rttvar >> 2) + delta
         conn.rttvar = (conn.rttvar as u32)
             .wrapping_sub((conn.rttvar as u32) >> 2)

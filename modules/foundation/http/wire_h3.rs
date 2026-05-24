@@ -59,8 +59,11 @@ pub struct H3Frame<'a> {
 /// Parse one frame from `buf`. Returns `Some((frame, total_consumed))`
 /// or `None` on truncation (caller should buffer more bytes).
 pub fn parse_h3_frame(buf: &[u8]) -> Option<(H3Frame<'_>, usize)> {
+    // SAFETY: pointer/length pair derived from a Rust slice; varint_decode
+    // bounds-checks internally against the supplied length.
     let (frame_type, type_len) = unsafe { varint_decode(buf.as_ptr(), buf.len()) }?;
     let after_type = &buf[type_len..];
+    // SAFETY: as above; `after_type` is a sub-slice of `buf`.
     let (length, len_len) = unsafe { varint_decode(after_type.as_ptr(), after_type.len()) }?;
     let length = length as usize;
     let payload_off = type_len + len_len;
@@ -85,11 +88,14 @@ pub fn build_h3_frame_header(frame_type: u64, payload_len: usize, out: &mut [u8]
         return 0;
     }
     let mut cursor = 0;
+    // SAFETY: pointer derived from a Rust slice; `out.len() - cursor` is
+    // the exact remaining capacity passed to varint_encode for bounds.
     let n = unsafe { varint_encode(out.as_mut_ptr().add(cursor), out.len() - cursor, frame_type) };
     if n == 0 {
         return 0;
     }
     cursor += n;
+    // SAFETY: as above; `cursor` has advanced by the returned byte count.
     let n = unsafe {
         varint_encode(
             out.as_mut_ptr().add(cursor),

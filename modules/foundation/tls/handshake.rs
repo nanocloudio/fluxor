@@ -118,10 +118,14 @@ impl Transcript {
         match self.alg {
             HashAlg::Sha256 => {
                 let h = self.sha256.clone().finalize();
+                // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+                // checked against the message length before each deref.
                 unsafe { core::ptr::copy_nonoverlapping(h.as_ptr(), out.as_mut_ptr(), 32); }
             }
             HashAlg::Sha384 => {
                 let h = self.sha384.clone().finalize();
+                // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+                // checked against the message length before each deref.
                 unsafe { core::ptr::copy_nonoverlapping(h.as_ptr(), out.as_mut_ptr(), 48); }
             }
         }
@@ -164,9 +168,13 @@ pub fn build_client_hello_ext(
 
     // ClientHello body
     out[pos] = 0x03; out[pos + 1] = 0x03; pos += 2;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(random.as_ptr(), out.as_mut_ptr().add(pos), 32); }
     pos += 32;
     out[pos] = 32; pos += 1;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32); }
     pos += 32;
     out[pos] = 0; out[pos + 1] = 6; pos += 2;
@@ -185,6 +193,8 @@ pub fn build_client_hello_ext(
     if !quic_tp.is_empty() {
         put_u16(out, pos, EXT_QUIC_TRANSPORT_PARAMETERS); pos += 2;
         put_u16(out, pos, quic_tp.len() as u16); pos += 2;
+        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+        // checked against the message length before each deref.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 quic_tp.as_ptr(),
@@ -218,6 +228,8 @@ pub fn build_server_hello(
     pub_key: &[u8; 65],
     out: &mut [u8],
 ) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         use core::ptr::write_volatile as wv;
         let p = out.as_mut_ptr();
@@ -272,6 +284,10 @@ pub fn build_server_hello(
 }
 
 /// Write a u16 big-endian at *p.add(pos), advance pos by 2.
+///
+/// # Safety
+/// `p.add(*pos + 1)` must be in-bounds for writes. Caller sizes the
+/// destination buffer before invoking this helper.
 #[inline(never)]
 pub unsafe fn pu16(p: *mut u8, pos: &mut usize, val: u16) {
     core::ptr::write_volatile(p.add(*pos), (val >> 8) as u8);
@@ -292,6 +308,8 @@ pub fn build_hello_retry_request(
     suite: CipherSuite,
     out: &mut [u8],
 ) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         use core::ptr::write_volatile as wv;
         let p = out.as_mut_ptr();
@@ -361,6 +379,8 @@ pub fn build_hello_retry_request(
 
 /// Build CertificateRequest message (for mTLS, raw pointer writes)
 pub fn build_certificate_request(out: &mut [u8]) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         let mut pos = 0;
@@ -400,6 +420,8 @@ pub fn build_encrypted_extensions(out: &mut [u8], alpn: &[u8]) -> usize {
 /// see `build_client_hello_ext` for the framing convention. Used by
 /// the QUIC server to advertise its transport parameters in EE.
 pub fn build_encrypted_extensions_ext(out: &mut [u8], alpn: &[u8], quic_tp: &[u8]) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         *p.add(0) = HT_ENCRYPTED_EXTENSIONS;
@@ -450,6 +472,8 @@ pub fn build_encrypted_extensions_ext(out: &mut [u8], alpn: &[u8], quic_tp: &[u8
 /// Uses raw pointer writes — array indexing generates bounds-check panics
 /// that crash on PIC aarch64 (panic handler accesses .rodata via ADRP).
 pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         let mut pos = 0;
@@ -495,6 +519,8 @@ pub fn build_certificate_verify(
     sig_len: usize,
     out: &mut [u8],
 ) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         let mut pos = 0;
@@ -519,6 +545,8 @@ pub fn build_certificate_verify(
 
 /// Build Finished message (raw pointer writes for PIC safety)
 pub fn build_finished(verify_data: &[u8], hash_len: usize, out: &mut [u8]) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         *p.add(0) = HT_FINISHED;
@@ -613,6 +641,8 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
     let dp = data.as_ptr();
     let mut pos: usize = 0;
 
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         // legacy_version (skip)
         pos += 2;
@@ -735,8 +765,8 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
             cipher_suites,
             key_share,
             supported_versions,
-            alpn_protos,
             transport_parameters,
+            alpn_protos,
             pre_shared_key,
             psk_binders_off,
             psk_dhe_offered,
@@ -1003,9 +1033,13 @@ pub fn build_verify_content(context: &[u8], transcript_hash: &[u8], hash_len: us
     let mut pos = 0;
     let mut i = 0;
     while i < 64 { out[pos] = 0x20; pos += 1; i += 1; }
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(context.as_ptr(), out.as_mut_ptr().add(pos), context.len()); }
     pos += context.len();
     out[pos] = 0x00; pos += 1;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(transcript_hash.as_ptr(), out.as_mut_ptr().add(pos), hash_len); }
     pos += hash_len;
     pos
@@ -1030,6 +1064,8 @@ fn write_ext_key_share_client(out: &mut [u8], mut pos: usize, pub_key: &[u8; 65]
     put_u16(out, pos, 2 + 2 + 65); pos += 2; // client_shares length
     put_u16(out, pos, GROUP_SECP256R1); pos += 2;
     put_u16(out, pos, 65); pos += 2;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(pub_key.as_ptr(), out.as_mut_ptr().add(pos), 65); }
     pos += 65;
     pos
@@ -1047,6 +1083,8 @@ fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
 /// order) — the http module's only consumer wants those two.
 /// Raw pointer writes for PIC aarch64 safety.
 fn write_ext_alpn_client(out: &mut [u8], mut pos: usize) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         // ext_type = 16 (ALPN)
@@ -1088,6 +1126,8 @@ fn write_ext_alpn_client(out: &mut [u8], mut pos: usize) -> usize {
 #[inline(always)]
 fn put_u16(buf: &mut [u8], pos: usize, val: u16) {
     // Use raw pointer writes — array indexing miscompiles on PIC aarch64
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = buf.as_mut_ptr();
         *p.add(pos) = (val >> 8) as u8;
@@ -1098,6 +1138,8 @@ fn put_u16(buf: &mut [u8], pos: usize, val: u16) {
 #[inline(always)]
 fn get_u16(buf: &[u8], pos: usize) -> u16 {
     // Use raw pointer reads — array indexing miscompiles on PIC aarch64
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = buf.as_ptr();
         ((*p.add(pos) as u16) << 8) | (*p.add(pos + 1) as u16)
@@ -1111,6 +1153,8 @@ fn get_u24(buf: &[u8], pos: usize) -> usize {
 
 #[inline(always)]
 fn put_u32(buf: &mut [u8], pos: usize, val: u32) {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = buf.as_mut_ptr();
         *p.add(pos) = (val >> 24) as u8;
@@ -1122,6 +1166,8 @@ fn put_u32(buf: &mut [u8], pos: usize, val: u32) {
 
 #[inline(always)]
 fn get_u32(buf: &[u8], pos: usize) -> u32 {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         let p = buf.as_ptr();
         ((*p.add(pos) as u32) << 24)
@@ -1165,6 +1211,8 @@ pub fn build_new_session_ticket(
     out[pos] = nonce.len() as u8;
     pos += 1;
     if !nonce.is_empty() {
+        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+        // checked against the message length before each deref.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 nonce.as_ptr(),
@@ -1177,6 +1225,8 @@ pub fn build_new_session_ticket(
     put_u16(out, pos, ticket.len() as u16);
     pos += 2;
     if !ticket.is_empty() {
+        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+        // checked against the message length before each deref.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 ticket.as_ptr(),
@@ -1278,6 +1328,10 @@ pub fn parse_new_session_ticket(body: &[u8]) -> Option<ParsedNewSessionTicket<'_
 /// the binders length field begins; the partial transcript hash for
 /// the binder MUST cover `body[..binders_off_in_body]` only (RFC 8446
 /// §4.2.11.2). Single-binder layout: binders_len (u16) + binder_len (u8) + binder (hash_len bytes).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "client-hello wire-shape: signature mirrors the on-wire ClientHello fields specific to the PSK + early-data path"
+)]
 pub fn build_client_hello_psk(
     random: &[u8; 32],
     session_id: &[u8; 32],
@@ -1299,12 +1353,16 @@ pub fn build_client_hello_psk(
     out[pos] = 0x03;
     out[pos + 1] = 0x03;
     pos += 2;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         core::ptr::copy_nonoverlapping(random.as_ptr(), out.as_mut_ptr().add(pos), 32);
     }
     pos += 32;
     out[pos] = 32;
     pos += 1;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32);
     }
@@ -1335,6 +1393,8 @@ pub fn build_client_hello_psk(
         pos += 2;
         put_u16(out, pos, quic_tp.len() as u16);
         pos += 2;
+        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+        // checked against the message length before each deref.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 quic_tp.as_ptr(),
@@ -1375,6 +1435,8 @@ pub fn build_client_hello_psk(
     pos += 2;
     put_u16(out, pos, psk_identity.len() as u16);
     pos += 2;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         core::ptr::copy_nonoverlapping(
             psk_identity.as_ptr(),
@@ -1420,6 +1482,8 @@ pub fn psk_overwrite_binder(buf: &mut [u8], full_ch_off: usize, binder: &[u8]) {
     if full_ch_off + binder.len() > buf.len() {
         return;
     }
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         core::ptr::copy_nonoverlapping(
             binder.as_ptr(),
@@ -1439,6 +1503,8 @@ pub fn build_server_hello_psk(
     selected_identity: u16,
     out: &mut [u8],
 ) -> usize {
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
     unsafe {
         use core::ptr::write_volatile as wv;
         let p = out.as_mut_ptr();

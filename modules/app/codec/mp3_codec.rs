@@ -845,7 +845,7 @@ fn reorder_short(grbuf: *mut f32, scratch: *mut f32, sfb_widths: *const u8, nban
         let mut src = grbuf;
         let mut dst_count: usize = 0;
         let mut wi: usize = 0;
-        let mut samples_left = nbands_to_reorder * 18; // safety bound
+        let samples_left = nbands_to_reorder * 18; // safety bound
         loop {
             let len = *sfb_widths.add(wi) as usize;
             if len == 0 { break; }
@@ -1842,19 +1842,19 @@ fn decode_frame(s: &mut Mp3State) -> i32 {
                 let nch = num_channels;
                 let emit_at = |bp: *mut u8, label: &[u8], gr_val: usize, sample_off: usize| -> usize {
                     let mut p = 0usize;
-                    let mut t = 0; while t < label.len() && p < 6 { unsafe { *bp.add(p) = label[t]; } p += 1; t += 1; }
-                    while p < 6 { unsafe { *bp.add(p) = b' '; } p += 1; }
-                    unsafe { *bp.add(p) = b' '; } p += 1;
-                    unsafe { *bp.add(p) = b'f'; } p += 1;
-                    p += unsafe { fmt_u32_raw(bp.add(p), s.frame_count) };
-                    unsafe { *bp.add(p) = b' '; } p += 1;
-                    unsafe { *bp.add(p) = b'g'; } p += 1;
-                    p += unsafe { fmt_u32_raw(bp.add(p), gr_val as u32) };
+                    let mut t = 0; while t < label.len() && p < 6 { *bp.add(p) = label[t]; p += 1; t += 1; }
+                    while p < 6 { *bp.add(p) = b' '; p += 1; }
+                    *bp.add(p) = b' '; p += 1;
+                    *bp.add(p) = b'f'; p += 1;
+                    p += fmt_u32_raw(bp.add(p), s.frame_count);
+                    *bp.add(p) = b' '; p += 1;
+                    *bp.add(p) = b'g'; p += 1;
+                    p += fmt_u32_raw(bp.add(p), gr_val as u32);
                     let mut k = 0;
                     while k < 16 {
-                        unsafe { *bp.add(p) = b' '; } p += 1;
-                        let sample = unsafe { *s.out_buf.as_ptr().add(output_offset + (sample_off + k) * nch) };
-                        p += unsafe { fmt_i16_raw(bp.add(p), sample) };
+                        *bp.add(p) = b' '; p += 1;
+                        let sample = *s.out_buf.as_ptr().add(output_offset + (sample_off + k) * nch);
+                        p += fmt_i16_raw(bp.add(p), sample);
                         k += 1;
                     }
                     p

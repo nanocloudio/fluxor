@@ -268,10 +268,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             H2Phase::WaitResponse => {
                 // If we owe a WINDOW_UPDATE, get it onto the wire
                 // before pulling more inbound bytes.
-                if maybe_queue_window_update(s) {
-                    if !drain_request_buf(s) {
-                        return 0;
-                    }
+                if maybe_queue_window_update(s) && !drain_request_buf(s) {
+                    return 0;
                 }
                 // Always try to make progress on inbound bytes first.
                 pump_inbound(s);
@@ -313,10 +311,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             H2Phase::WsActive => {
                 // Drain any pending outbound bytes (the initial WS
                 // frame or a queued CLOSE).
-                if s.client.request_sent < s.client.request_len {
-                    if !drain_request_buf(s) {
-                        return 0;
-                    }
+                if s.client.request_sent < s.client.request_len && !drain_request_buf(s) {
+                    return 0;
                 }
                 // First action after the upgrade: send `request_body`
                 // as a masked WS TEXT frame inside an h2 DATA frame.
@@ -344,17 +340,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // Bidirectional mode: if `in[1]` is wired and has
                 // outgoing data, wrap and queue it. HUP queues a
                 // CLOSE so the session terminates cleanly.
-                if s.client.data_in_chan >= 0 && s.client.ws_done == 0 {
-                    if let Some(_) = pump_data_in(s) {
-                        continue;
-                    }
+                if s.client.data_in_chan >= 0 && s.client.ws_done == 0 && pump_data_in(s).is_some()
+                {
+                    continue;
                 }
                 // If we owe a WINDOW_UPDATE, get it onto the wire so
                 // the server keeps streaming WS frames.
-                if maybe_queue_window_update(s) {
-                    if !drain_request_buf(s) {
-                        return 0;
-                    }
+                if maybe_queue_window_update(s) && !drain_request_buf(s) {
+                    return 0;
                 }
                 // Otherwise pump inbound frames and process WS DATA
                 // inline (process_ws_data may queue our own CLOSE).
@@ -894,9 +887,7 @@ unsafe fn format_authority(host: u32, port: u16, dst: *mut u8) -> usize {
         *dst.add(o) = b'.';
         o += 1;
     }
-    if o > 0 {
-        o -= 1; // strip trailing '.'
-    }
+    o = o.saturating_sub(1); // strip trailing '.'
     *dst.add(o) = b':';
     o += 1;
     o += super::fmt_u32_raw(dst.add(o), port as u32);
@@ -987,10 +978,7 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
 unsafe fn consume_until_settings(s: &mut HttpState) -> Option<bool> {
     loop {
         let len = s.client.recv_len as usize;
-        let hdr = match h2w::parse_header(s.client.recv_buf.as_ptr(), len) {
-            Some(h) => h,
-            None => return None,
-        };
+        let hdr = h2w::parse_header(s.client.recv_buf.as_ptr(), len)?;
         let total = h2w::FRAME_HEADER_LEN + hdr.length as usize;
         if total > len {
             return None;

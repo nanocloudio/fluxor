@@ -20,6 +20,13 @@
 //! CPU only feeds pixel data via DMA to the rgb SM's TX FIFO.
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -545,7 +552,7 @@ fn build_pinctrl(
     // [28:26] SET_COUNT
     // [31:29] SIDESET_COUNT
     let mut val: u32 = 0;
-    val |= (out_base as u32 & 0x1F);
+    val |= out_base as u32 & 0x1F;
     val |= (set_base as u32 & 0x1F) << 5;
     val |= (sideset_base as u32 & 0x1F) << 10;
     val |= (in_base as u32 & 0x1F) << 15;
@@ -910,7 +917,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                 // Set sideset pins as outputs via SET PINDIRS
                 // HSYNC SM0: 2 sideset pins (hsync, pclk)
-                let set_pindirs_2 = 0xE082u16; // set pindirs, 2 (binary: 00010)...
+                let _set_pindirs_2 = 0xE082u16; // set pindirs, 2 (binary: 00010)...
                 // Actually: set pindirs, 0b11 = set pindirs, 3 — but set only has 5 bits for data.
                 // We need SET PINDIRS, with count matching sideset_count-1 pins.
                 // Better approach: temporarily set SET_BASE and SET_COUNT to the sideset pins.

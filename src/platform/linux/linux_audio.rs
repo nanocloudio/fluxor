@@ -271,6 +271,7 @@ fn linux_audio_due_bytes(st: &LinuxAudioState) -> usize {
 }
 
 fn linux_audio_step(state: *mut u8) -> i32 {
+    // SAFETY: kernel-owned arena sized to `LinuxAudioState` by the loader.
     let st = unsafe { instance_state::<LinuxAudioState>(state) };
 
     if st.failed || st.in_chan < 0 {
@@ -288,6 +289,7 @@ fn linux_audio_step(state: *mut u8) -> i32 {
         return 0;
     }
 
+    // SAFETY: `max_read <= buf.len() = 4096`; channel_read writes ≤ max_read.
     let read = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), max_read) };
     if read <= 0 {
         match st.mode {
@@ -321,11 +323,13 @@ fn linux_audio_step(state: *mut u8) -> i32 {
         AudioMode::Raw | AudioMode::Wav => {
             if let Some(f) = st.file.as_mut() {
                 if let Err(e) = f.write_all(&buf[..n]) {
-                    log::warn!("[linux_audio] write failed: {}", e);
+                    log::warn!("[linux_audio] write failed: {e}");
                     st.failed = true;
                     return 0;
                 }
                 st.bytes_written = st.bytes_written.saturating_add(n as u32);
+                // SAFETY: `LINUX_AUDIO_CLOCK` is owned by this module;
+                // single-writer (this step fn), readers use atomic loads.
                 unsafe {
                     let clock = &mut *core::ptr::addr_of_mut!(LINUX_AUDIO_CLOCK);
                     clock.bytes_written = st.bytes_written as u64;
@@ -336,7 +340,7 @@ fn linux_audio_step(state: *mut u8) -> i32 {
                     let sr = st.sample_rate;
                     let ch = st.channels;
                     if let Err(e) = write_wav_header(f, sr, ch, total) {
-                        log::warn!("[linux_audio] header refresh failed: {}", e);
+                        log::warn!("[linux_audio] header refresh failed: {e}");
                     }
                     let _ = f.seek(SeekFrom::End(0));
                     st.bytes_since_flush = 0;
@@ -382,14 +386,14 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
             Ok(mut f) => {
                 if matches!(mode, AudioMode::Wav) {
                     if let Err(e) = write_wav_header(&mut f, sample_rate, channels, 0) {
-                        log::warn!("[linux_audio] header write failed: {}", e);
+                        log::warn!("[linux_audio] header write failed: {e}");
                         failed = true;
                     }
                 }
                 file = Some(f);
             }
             Err(e) => {
-                log::warn!("[linux_audio] open '{}' failed: {}", path, e);
+                log::warn!("[linux_audio] open '{path}' failed: {e}");
                 failed = true;
             }
         }
@@ -402,12 +406,10 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
         AudioMode::Playback => "playback",
     };
     log::info!(
-        "[linux_audio] mode={} {}Hz {}ch path='{}'",
-        mode_str,
-        sample_rate,
-        channels,
-        path,
+        "[linux_audio] mode={mode_str} {sample_rate}Hz {channels}ch path='{path}'",
     );
+    // SAFETY: module construction; no other thread observes
+    // `LINUX_AUDIO_CLOCK` until step starts running.
     unsafe {
         let clock = &mut *core::ptr::addr_of_mut!(LINUX_AUDIO_CLOCK);
         clock.started = true;
@@ -457,9 +459,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
         }),
     );
     log::info!(
-        "[inst] module {} = linux_audio (built-in) in={}",
-        module_idx,
-        in_chan
+        "[inst] module {module_idx} = linux_audio (built-in) in={in_chan}"
     );
     m
 }

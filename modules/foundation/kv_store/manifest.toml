@@ -1,0 +1,6 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# Lattice KV — paged-arena key-value store. Demonstrates transparent
+# demand paging on MMU-capable targets (bcm2712) and resident-arena
+# storage on MMU-less targets (rp2350).

@@ -1,0 +1,6 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# Fault-injection diagnostic module. Deliberately triggers faults to
+# exercise the step-guard timer and fault-recovery infrastructure.
+# Diagnostic only — not loaded by production configs.

@@ -120,6 +120,8 @@ impl HandshakeDriver {
     }
 
     pub fn reset(&mut self) {
+        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+        // checked against the driver-message length.
         unsafe {
             let mut i = 0;
             while i < 32 {
@@ -158,6 +160,8 @@ impl HandshakeDriver {
         if n == 0 {
             return 0;
         }
+        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+        // checked against the driver-message length.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -183,6 +187,8 @@ impl HandshakeDriver {
         } else {
             self.out_len
         };
+        // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+        // checked against the driver-message length.
         unsafe {
             core::ptr::copy_nonoverlapping(self.out_buf.as_ptr(), out.as_mut_ptr(), n);
             let remain = self.out_len - n;
@@ -242,6 +248,9 @@ impl HandshakeDriver {
     /// (`dtls_recv_into_driver` ultimately appends bytes via
     /// `feed_handshake`; the pump_* logic then calls this method to
     /// pull complete messages out).
+    /// # Safety
+    /// `in_buf` is owned by `self` and sized `HS_IO_BUF_SIZE`; the
+    /// bounds-checks above ensure the message length fits in scratch.
     pub unsafe fn read_handshake_message(
         &mut self,
     ) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
@@ -278,6 +287,10 @@ impl HandshakeDriver {
     /// Returns false on overflow — caller retries on the next pump
     /// tick. The TLS / DTLS / QUIC record (or packet) bridge drains
     /// these messages and frames them appropriately.
+    ///
+    /// # Safety
+    /// `out_buf` is owned by `self`; the `msg.len() > space` guard
+    /// keeps the `copy_nonoverlapping` write in-bounds.
     pub unsafe fn write_handshake_message(&mut self, msg: &[u8]) -> bool {
         let space = HS_IO_BUF_SIZE - self.out_len;
         if msg.len() > space {

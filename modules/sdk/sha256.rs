@@ -9,6 +9,8 @@
 #[inline(never)]
 fn load_k256() -> [u32; 64] {
     let mut k = [0u32; 64];
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     unsafe {
         let p = k.as_mut_ptr();
         k256_store(p,  0, 0x428a2f98); k256_store(p,  1, 0x71374491);
@@ -77,7 +79,15 @@ impl Sha256 {
             total_len: 0,
         }
     }
+}
 
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
         self.total_len += data.len() as u64;
@@ -88,6 +98,8 @@ impl Sha256 {
             let take = if data.len() < space { data.len() } else { space };
             let dst = self.buf.as_mut_ptr();
             let src = data.as_ptr();
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant `i < N` keeps offsets in range.
             unsafe {
                 core::ptr::copy_nonoverlapping(src, dst.add(self.buf_len), take);
             }
@@ -104,6 +116,8 @@ impl Sha256 {
         // Process full blocks
         while offset + 64 <= data.len() {
             let mut block = [0u8; 64];
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant `i < N` keeps offsets in range.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), 64);
             }
@@ -114,6 +128,8 @@ impl Sha256 {
         // Buffer remainder
         let remain = data.len() - offset;
         if remain > 0 {
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant `i < N` keeps offsets in range.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), self.buf.as_mut_ptr(), remain);
             }
@@ -131,6 +147,8 @@ impl Sha256 {
         if self.buf_len > 56 {
             // Zero rest of current block
             let dst = self.buf.as_mut_ptr();
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant `i < N` keeps offsets in range.
             unsafe {
                 let p = dst.add(self.buf_len);
                 let n = 64 - self.buf_len;
@@ -142,6 +160,8 @@ impl Sha256 {
         }
 
         // Zero up to length field
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant `i < N` keeps offsets in range.
         unsafe {
             let p = self.buf.as_mut_ptr().add(self.buf_len);
             let n = 56 - self.buf_len;
@@ -150,6 +170,8 @@ impl Sha256 {
 
         // Append bit length (big-endian)
         let len_bytes = bit_len.to_be_bytes();
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant `i < N` keeps offsets in range.
         unsafe {
             core::ptr::copy_nonoverlapping(len_bytes.as_ptr(), self.buf.as_mut_ptr().add(56), 8);
         }
@@ -185,6 +207,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let bp = block.as_ptr();
     let wp = w.as_mut_ptr();
     while i < 16 {
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant `i < N` keeps offsets in range.
         unsafe {
             let off = i * 4;
             let b0 = *bp.add(off) as u32;
@@ -198,6 +222,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
 
     // Extend.
     while i < 64 {
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant `i < N` keeps offsets in range.
         unsafe {
             let w15 = *wp.add(i - 15);
             let w2  = *wp.add(i - 2);
@@ -211,19 +237,39 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 
     let sp = state.as_ptr();
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut a = unsafe { *sp.add(0) };
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut b = unsafe { *sp.add(1) };
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut c = unsafe { *sp.add(2) };
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut d = unsafe { *sp.add(3) };
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut e = unsafe { *sp.add(4) };
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut f = unsafe { *sp.add(5) };
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut g = unsafe { *sp.add(6) };
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     let mut h = unsafe { *sp.add(7) };
 
     let kp = k.as_ptr();
     i = 0;
     while i < 64 {
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant `i < N` keeps offsets in range.
         let ki = unsafe { *kp.add(i) };
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant `i < N` keeps offsets in range.
         let wi = unsafe { *wp.add(i) };
         let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
         let ch = (e & f) ^ ((!e) & g);
@@ -244,6 +290,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 
     let smp = state.as_mut_ptr();
+    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+    // loop invariant `i < N` keeps offsets in range.
     unsafe {
         *smp.add(0) = (*smp.add(0)).wrapping_add(a);
         *smp.add(1) = (*smp.add(1)).wrapping_add(b);

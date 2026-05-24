@@ -329,6 +329,10 @@ pub fn enumerate_rigs(lab: &str) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::undocumented_unsafe_blocks,
+    reason = "tests wrap std::env::set_var which became `unsafe fn` in Rust 2024; safety is identical at every call site — there is no concurrent env mutation in single-test contexts"
+)]
 mod tests {
     use super::*;
 

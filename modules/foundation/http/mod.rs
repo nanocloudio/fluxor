@@ -58,6 +58,22 @@
 //! | 10-45 | route_N_*   | —    | —       | Route params (server mode)                          |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
+#![allow(
+    unsafe_code,
+    reason = "PIC module: ABI shim and zero-copy buffer plumbing"
+)]
+// PIC library code must not panic; surface errors through the ABI.
+#![deny(clippy::unwrap_used)]
+#![allow(
+    clippy::duplicate_mod,
+    reason = "PIC build path-mounts sdk/* into each `.rs` file via `#[path = \"...\"] mod`; in the host workspace build the same file appears in multiple parents. Splitting into a shared `use` import would break the bare-metal compilation pattern where each .rs is its own rustc invocation."
+)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
 
 use core::ffi::c_void;
 
@@ -433,13 +449,24 @@ pub extern "C" fn module_arena_size() -> u32 {
         .saturating_add(2048) // slack for body_pool resize + headers
 }
 
+/// PIC module ABI entry: one-time initialisation. No state to bind yet.
+///
+/// # Safety
+/// `_syscalls` is currently unused; the kernel guarantees ABI binding has
+/// completed before this call.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state`.
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers; the loader
+/// passes `state_size` ≥ `module_state_size()` and `params_len` ≥ the
+/// declared TLV size, both zero-init.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -449,6 +476,8 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
+    // SAFETY: kernel-owned buffers; null-checked + size-checked before use,
+    // and the kernel guarantees `state` is zero-initialised at `state_size`.
     unsafe {
         if syscalls.is_null() {
             return -2;
@@ -489,9 +518,16 @@ pub extern "C" fn module_new(
     }
 }
 
+/// PIC module ABI entry: per-tick cooperative step.
+///
+/// # Safety
+/// `state` must point to an initialised `HttpState`; the scheduler
+/// guarantees no concurrent step invocation.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+    // SAFETY: `state` was initialised by `module_new`; the scheduler
+    // serialises module_step calls so the `&mut *` re-borrow is unique.
     unsafe {
         if state.is_null() {
             return -1;
@@ -548,7 +584,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // recurs often enough that having this on by default is the
         // only cheap way to characterise the next regression without
         // round-tripping a redeploy.
-        if s.mode == MODE_SERVER && s.step_count % HTTP_TLM_PERIOD == 0 {
+        if s.mode == MODE_SERVER && s.step_count.is_multiple_of(HTTP_TLM_PERIOD) {
             let mut buf = [0u8; 128];
             let p = buf.as_mut_ptr();
             let prefix = b"[http] state ph=";
@@ -616,12 +652,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Drain marks the server for graceful shutdown — the next time it
 /// returns to `WaitAccept` it reports done instead of looping. Client
 /// mode is one-shot and ignores drain.
+///
+/// # Safety
+/// `state` must point to an initialised `HttpState`.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_drain"]
-pub extern "C" fn module_drain(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_drain(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: state non-null per the check above; module_new initialised
+    // it as `HttpState` so the cast is sound.
     unsafe {
         let s = &mut *(state as *mut HttpState);
         if s.mode == MODE_SERVER {
@@ -634,9 +675,14 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
     0
 }
 
+/// PIC module ABI entry: report per-port channel ring sizes.
+///
+/// # Safety
+/// `out` must be valid for writes of at least `max_len` bytes; the
+/// loader passes a buffer it owns.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
+pub unsafe extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     // net_in / net_out / file_data sized to absorb 8 KiB CMD_SEND
     // payloads (the staging cap on aarch64) plus a couple of frames
     // worth of in-flight headroom. Channel writes are all-or-nothing
@@ -701,6 +747,8 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
             buffer_size: 256,
         }, // out[1]: file ctrl
     ];
+    // SAFETY: `write_channel_hints` validates `max_len` against the hint
+    // table size before writing through `out`.
     unsafe { write_channel_hints(out, max_len, &hints) }
 }
 

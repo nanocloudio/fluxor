@@ -68,6 +68,8 @@ pub unsafe fn register(dispatch: BackingProviderDispatchFn, state: *mut u8) {
 /// rebuilds so a stale pointer into the previous state arena is not
 /// kept alive.
 pub fn unregister() {
+    // SAFETY: scheduler::reset is the single caller; runs between
+    // graph rebuilds when no other thread can observe DISPATCH/STATE.
     unsafe {
         DISPATCH = None;
         STATE = core::ptr::null_mut();
@@ -76,6 +78,9 @@ pub fn unregister() {
 
 /// Returns true once an External-backed arena can be used.
 pub fn ready() -> bool {
+    // SAFETY: reading the static through `&raw const` avoids materialising
+    // a `&'static` to a potentially-changing slot; the `is_some()` check
+    // is a single atomic-sized load on the discriminant.
     unsafe {
         let p = &raw const DISPATCH;
         (*p).is_some()
@@ -86,6 +91,9 @@ pub fn ready() -> bool {
 /// module is registered. Callers in `backing_store` already check
 /// `ready()` before invoking.
 pub fn dispatch(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // SAFETY: DISPATCH / STATE are scheduler-managed; the public API
+    // requires `ready()` is checked first which observes a registered
+    // function pointer paired with the matching STATE.
     unsafe {
         match DISPATCH {
             Some(f) => f(STATE, opcode, arg, arg_len),

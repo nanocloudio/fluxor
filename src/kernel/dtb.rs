@@ -54,6 +54,9 @@ unsafe fn read_be_u32(p: *const u8) -> u32 {
 /// `local-mac-address` property of exactly 6 bytes, and returns the first
 /// match. Returns None if no such property is found or no DTB is attached.
 pub fn read_ethernet_mac() -> Option<[u8; 6]> {
+    // SAFETY: `dtb_base()` returns the pointer set by the boot path
+    // after MMU init; the FDT header + structure/strings sections live
+    // within the mapped region. All offsets are bounds-checked below.
     unsafe {
         let base = dtb_base()?;
         let header = &*(base as *const FdtHeader);

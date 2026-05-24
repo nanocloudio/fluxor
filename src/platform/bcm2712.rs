@@ -169,7 +169,7 @@ unsafe fn rp1_pcie_disable_aspm() {
 // macb driver path. We rely on that state for initial bring-up.
 
 #[cfg(feature = "board-cm5")]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 mod eth {
     pub const GEM_BASE:     usize = 0x1c_0010_0000;
     pub const ETH_CFG_BASE: usize = 0x1c_0010_4000;
@@ -440,6 +440,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     //      PCI_COMMAND, and configured GPIO14/15 + PL011 for UART.
     //   3. uart_init() — reprogram PL011 to be sure (VPU may have left
     //      it configured, but we set our own baud/params).
+    // SAFETY: Single boot-thread; MMU init runs once before any module
+    // observes virtual addresses. RP1 ASPM disable touches MMIO mapped
+    // by init_page_tables one line earlier.
     #[cfg(feature = "board-cm5")]
     unsafe {
         boot_mmu::init_page_tables();
@@ -447,6 +450,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         rp1_pcie_disable_aspm();
     }
 
+    // SAFETY: uart_init configures the PL011 MMIO pre-driver; single-threaded boot.
     unsafe { uart_init() };
     UART_READY.store(1, Ordering::Release);
     // UART FIFO is always drained by hardware, so the local log-ring
@@ -455,6 +459,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Record the DTB pointer now that the MMU is on; later DTB reads
     // dereference `_boot_dtb_ptr`.
+    // SAFETY: `_boot_dtb_ptr` is a static usize; single boot-time writer.
     unsafe {
         core::ptr::write_volatile(&raw mut _boot_dtb_ptr, dtb_phys);
     }
@@ -465,6 +470,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_puts(b"[fluxor] bcm2712 boot (QEMU virt)\r\n");
 
     // QEMU virt: MMU init happens here (Pi 5 did it earlier, before PCIe).
+    // SAFETY: MMU init runs once at boot before any module observes virt addrs.
     #[cfg(not(feature = "board-cm5"))]
     unsafe {
         boot_mmu::init_page_tables();
@@ -479,6 +485,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // log::info! lines reach the ring (and therefore log_net -> UDP).
     #[cfg(feature = "board-cm5")]
     {
+        // SAFETY: GEM_BASE + MID is the documented module-ID register at the
+        // GEM MMIO base; aligned u32 read.
         let mid = unsafe { core::ptr::read_volatile(eth::GEM_BASE.wrapping_add(eth::MID) as *const u32) };
         uart_puts(b"[gem] MID=0x");
         uart_put_hex32(mid);
@@ -490,6 +498,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     }
 
     static LOGGER: RingLogger = RingLogger;
+    // SAFETY: set_logger_racy is documented as "single-threaded only"; boot
+    // is the only call site and runs before any module exists.
     unsafe { log::set_logger_racy(&LOGGER).ok() };
     log::set_max_level(log::LevelFilter::Info);
 
@@ -498,7 +508,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // pending cold-boot stability work.
     {
         let n = fluxor::kernel::pcie::enumerate();
-        log::info!("[pcie] bus1 devices={}", n);
+        log::info!("[pcie] bus1 devices={n}");
     }
 
     // Report timer frequency
@@ -510,6 +520,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Exception vectors + GIC + timer
     // Timer tick period will be recalculated after config is parsed (tick_us).
     // Start with 1ms default so the system runs during init.
+    // SAFETY: GIC + generic timer init touch system control regs that the
+    // boot path is the sole writer of; DAIFCLR enables IRQs after vectors
+    // and step_guard are wired.
     unsafe {
         gic_init();
         TICKS_PER_TICK = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
@@ -544,13 +557,19 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     let static_state_ok = {
         #[cfg(not(feature = "board-cm5"))]
         {
+            // SAFETY: QEMU virt's fluxor.ld places the config blob and
+            // modules blob at known phys addresses; mappings established
+            // by `boot_mmu::init_page_tables()` above.
             let blob_magic = unsafe { core::ptr::read_volatile(QEMU_CONFIG_BLOB_ADDR as *const u32) };
+            // SAFETY: as above.
             let modules_blob_magic = unsafe {
                 core::ptr::read_volatile(QEMU_MODULES_BLOB_ADDR as *const u32)
             };
             if blob_magic == config::MAGIC_CONFIG
                 && modules_blob_magic == loader::MODULE_TABLE_MAGIC
             {
+                // SAFETY: caller upholds `# Safety` invariant — blobs at
+                // the QEMU known addresses remain mapped for the whole boot.
                 unsafe {
                     // Cap the declared length to MAX_CONFIG_SIZE so the
                     // parser slice doesn't span the full 16 MB gap
@@ -565,7 +584,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 }
                 .is_ok()
             } else {
+                // SAFETY: boot-time single-thread init.
                 let loader_ref = unsafe { scheduler::static_loader_mut() };
+                // SAFETY: as above.
                 let cfg_ref = unsafe { scheduler::static_config_mut() };
                 let l_ok = loader_ref.init().is_ok();
                 let c_ok = config::read_config_into(cfg_ref);
@@ -576,7 +597,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         {
             // Flash-trailer path: the loader scans the packed image for
             // the module table; the config sits in the same trailer.
+            // SAFETY: boot-time single-thread init.
             let loader_ref = unsafe { scheduler::static_loader_mut() };
+            // SAFETY: as above.
             let cfg_ref = unsafe { scheduler::static_config_mut() };
             let l_ok = loader_ref.init().is_ok();
             let c_ok = config::read_config_into(cfg_ref);
@@ -585,14 +608,17 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     };
     if !static_state_ok {
         uart_puts(b"[config] parse / loader failed\r\n");
+        // SAFETY: WFI is a hint to halt the core; safe as a fault path.
         loop { unsafe { core::arch::asm!("wfi") }; }
     }
+    // SAFETY: scheduler-thread boot-time read.
     let cfg = unsafe { scheduler::static_config() };
     let n_modules = cfg.module_count as usize;
     let n_edges = cfg.edge_count as usize;
 
     // Reconfigure the timer tick from config.tick_us.
     let tick_us = if cfg.header.tick_us > 0 { cfg.header.tick_us as u32 } else { 1000 };
+    // SAFETY: TICKS_PER_TICK is a u32 static; single boot-time writer.
     unsafe {
         // freq is in Hz, so ticks_per_us = freq / 1_000_000
         // TICKS_PER_TICK = tick_us * (freq / 1_000_000) = tick_us * freq / 1_000_000
@@ -617,6 +643,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         Ok(v) => v,
         Err(_) => {
             uart_puts(b"[graph] prepare_graph failed\r\n");
+            // SAFETY: WFI is a hint; safe as a fault path.
             loop { unsafe { core::arch::asm!("wfi") }; }
         }
     };
@@ -636,6 +663,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // `consumer_channel`, so `populate_ports` lifts `W2` into the
     // consumer's in_chans.
     {
+        // SAFETY: scheduler-thread boot-time access.
         let sched = unsafe { scheduler::sched_mut() };
         let n_compiled_edges = sched.edge_count;
         let mut e = 0usize;
@@ -664,7 +692,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                     uart_puts(b" max); cannot bridge edge ");
                     uart_put_u32(e as u32);
                     uart_puts(b"\r\n");
-                    loop { unsafe { core::arch::asm!("wfi") }; }
+                    // SAFETY: WFI is a hint; safe as a fault path.
+            loop { unsafe { core::arch::asm!("wfi") }; }
                 }
             };
 
@@ -674,7 +703,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 uart_puts(b"[graph] consumer-side channel alloc failed for cross-domain edge ");
                 uart_put_u32(e as u32);
                 uart_puts(b"\r\n");
-                loop { unsafe { core::arch::asm!("wfi") }; }
+                // SAFETY: WFI is a hint; safe as a fault path.
+            loop { unsafe { core::arch::asm!("wfi") }; }
             }
 
             // Mirror the producer-side channel's mailbox flag onto the
@@ -692,6 +722,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
             }
 
             let to_port_marker: u8 = if edge_snapshot.is_ctrl() { 1 } else { 0 };
+            // SAFETY: cross-edge registration runs once per cross-domain
+            // hop during graph prep; multicore module owns the registry.
             let registered = unsafe {
                 multicore::register_cross_edge(multicore::CrossDomainEdge {
                     from_domain,
@@ -712,7 +744,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 uart_puts(b" max); cannot bridge edge ");
                 uart_put_u32(e as u32);
                 uart_puts(b"\r\n");
-                loop { unsafe { core::arch::asm!("wfi") }; }
+                // SAFETY: WFI is a hint; safe as a fault path.
+            loop { unsafe { core::arch::asm!("wfi") }; }
             }
 
             sched.edges[e].consumer_channel = in_ch;
@@ -723,7 +756,9 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Mask IRQs during module instantiation
     let _inst_guard = fluxor::kernel::guard::KernelGuard::acquire();
 
+    // SAFETY: boot-time read.
     let loader_ref = unsafe { scheduler::static_loader() };
+    // SAFETY: scheduler-thread mutable access during graph instantiation.
     let sched = unsafe { scheduler::sched_mut() };
     let mut total_mods = 0usize;
     for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
@@ -752,7 +787,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
             scheduler::InstantiateResult::Pending(mut pending) => {
                 let mut loaded = false;
                 for _ in 0..100 {
+                    // SAFETY: NOP is a hint; safe spin delay.
                     for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
+                    // SAFETY: `pending` was allocated by instantiate_one_module
+                    // and lives across these poll iterations.
                     match unsafe { pending.try_complete() } {
                         Ok(Some(dm)) => {
                             scheduler::store_dynamic_module(module_idx, dm);
@@ -785,6 +823,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     while d < multicore::MAX_DOMAINS {
         let mod_count = scheduler::domain_module_count(d);
         if mod_count > 0 {
+            // SAFETY: boot-time per-domain state init; domain `d` not yet
+            // running on its assigned core.
             unsafe {
                 let ds = multicore::domain_state(d);
                 ds.core_id = d as u8; // Domain N runs on core N
@@ -892,6 +932,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
             log::info!("[domain] {} core={} tier=1a tick_us={}", domain_id, core_id,
                 scheduler::domain_tick_us(domain_id));
             loop {
+                // SAFETY: WFI halts the core until next interrupt; hint-only.
                 unsafe { core::arch::asm!("wfi") };
                 multicore::park_if_requested(domain_id);
                 let t0 = timer::read_timer_count();
@@ -899,6 +940,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 pump_cross_domain(domain_id);
                 if core_id == 0 { debug_drain_poll_core0(); }
                 let elapsed = timer::read_timer_count().wrapping_sub(t0);
+                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
+                // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
                 if elapsed > metrics.worst_step_ticks { metrics.worst_step_ticks = elapsed; }
@@ -922,20 +965,24 @@ fn run_domain_loop(domain_id: usize) -> ! {
         // no module bursted (and there's no other pending work) the
         // core WFEs.
         3 => {
-            log::info!("[domain] {} core={} tier=3 poll-mode", domain_id, core_id);
+            log::info!("[domain] {domain_id} core={core_id} tier=3 poll-mode");
             loop {
                 multicore::park_if_requested(domain_id);
+                // SAFETY: scheduler-thread per-domain access; bounded.
                 let sched = unsafe { scheduler::sched_mut() };
                 let (_result, any_burst) =
                     scheduler::step_domain_modules_poll(&mut sched.modules, domain_id);
                 pump_cross_domain(domain_id);
                 if core_id == 0 { debug_drain_poll_core0(); }
 
+                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
+                // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.poll_steps += 1;
                 if !any_burst {
                     metrics.poll_idle += 1;
                     metrics.wfe_count += 1;
+                    // SAFETY: WFE halts the core until an event; hint-only.
                     unsafe { core::arch::asm!("wfe") };
                 }
                 // Report every ~1M poll steps
@@ -949,12 +996,15 @@ fn run_domain_loop(domain_id: usize) -> ! {
         // ── Tier 0: Cooperative (default, 1ms tick) ──
         _ => {
             loop {
+                // SAFETY: WFI halts the core until next interrupt; hint-only.
                 unsafe { core::arch::asm!("wfi") };
                 multicore::park_if_requested(domain_id);
                 let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
                 if core_id == 0 { debug_drain_poll_core0(); }
+                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
+                // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
                 scheduler::maybe_emit_alive(tick as u64, Some(domain_id));
@@ -969,7 +1019,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                     let expected = multicore::non_primary_active_count();
                     multicore::request_quiesce();
                     multicore::wait_parked(expected);
-                    log::warn!("[reconfigure] quiesced {} domains; phase reset", expected);
+                    log::warn!("[reconfigure] quiesced {expected} domains; phase reset");
                     scheduler::set_reconfigure_phase(
                         scheduler::ReconfigurePhase::Running
                     );
@@ -988,6 +1038,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
 /// `Burst` loop identically to RP/Linux/WASM. See
 /// `.context/scheduler_domain_api.md`.
 fn domain_step_all(domain_id: usize) {
+    // SAFETY: per-domain pump runs on the domain's owning core.
     let sched = unsafe { scheduler::sched_mut() };
     let _ = scheduler::step_domain_modules(&mut sched.modules, domain_id);
 }
@@ -1025,6 +1076,8 @@ fn pump_cross_domain(domain_id: usize) {
                 multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
             } else {
                 let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
+                // SAFETY: `buf` is `SLOT_DATA_SIZE` bytes on the stack;
+                // channel_read writes ≤ `buf.len()` bytes.
                 let n = unsafe {
                     fluxor::kernel::channel::channel_read(
                         edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
@@ -1063,6 +1116,9 @@ fn pump_cross_domain(domain_id: usize) {
             if can_write {
                 let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
                 if let Some(len) = ch.try_recv(&mut buf) {
+                    // SAFETY: `len <= SLOT_DATA_SIZE = buf.len()`;
+                    // `local_in_handle` already polled for POLL_OUT
+                    // capacity above.
                     unsafe {
                         fluxor::kernel::channel::channel_write(
                             edge.local_in_handle, buf.as_ptr(), len,
@@ -1122,6 +1178,7 @@ fn secondary_core_main_3() -> ! {
 fn secondary_core_main(domain_id: usize) -> ! {
     // Wait for init to complete on core 0
     while INIT_COMPLETE.load(Ordering::Acquire) == 0 {
+        // SAFETY: WFE is a hint to wait until the next event.
         unsafe { core::arch::asm!("wfe"); }
     }
 
@@ -1131,9 +1188,11 @@ fn secondary_core_main(domain_id: usize) -> ! {
     uart_puts(b"] started, domain=");
     uart_put_u32(domain_id as u32);
     uart_puts(b"\r\n");
-    log::info!("[core{}] started, domain={}", core_id, domain_id);
+    log::info!("[core{core_id}] started, domain={domain_id}");
 
     // Set up GIC CPU interface for this core
+    // SAFETY: secondary-core init runs once before the domain pump starts;
+    // GIC + generic-timer registers are per-CPU.
     unsafe {
         gic_init_secondary();
         // Set per-domain timer rate (Tier 1a may run faster than global tick)
@@ -1155,6 +1214,7 @@ fn secondary_core_main(domain_id: usize) -> ! {
         uart_puts(b"[core");
         uart_put_u32(core_id as u32);
         uart_puts(b"] no work, parking\r\n");
+        // SAFETY: WFE halts the core until an event; idle path.
         loop { unsafe { core::arch::asm!("wfe"); } }
     }
 
@@ -1203,6 +1263,8 @@ use fluxor::kernel::hal::HalOps;
 
 fn bcm_disable_interrupts() -> u32 {
     let daif: u32;
+    // SAFETY: reads + writes the DAIF system register; preserves_flags +
+    // nomem/nostack mean the asm has no side effects on memory.
     unsafe {
         core::arch::asm!(
             "mrs {0:x}, daif",
@@ -1215,6 +1277,7 @@ fn bcm_disable_interrupts() -> u32 {
 }
 
 fn bcm_restore_interrupts(saved: u32) {
+    // SAFETY: writes DAIF (interrupt-mask system register); no memory effects.
     unsafe {
         core::arch::asm!(
             "msr daif, {0:x}",
@@ -1225,6 +1288,7 @@ fn bcm_restore_interrupts(saved: u32) {
 }
 
 fn bcm_wake_scheduler() {
+    // SAFETY: SEV broadcasts an event to wake WFE-parked cores; hint-only.
     unsafe { core::arch::asm!("sev") };
 }
 
@@ -1281,6 +1345,7 @@ fn bcm_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
 }
 
 fn bcm_pic_barrier() {
+    // SAFETY: DSB SY + ISB are architectural barriers — no memory effects.
     unsafe { core::arch::asm!("dsb sy", "isb") };
 }
 
@@ -1291,8 +1356,10 @@ static mut BCM_DEADLINE_TICKS: u64 = 0;
 /// Read the timer counter (physical on Pi 5, virtual on QEMU for KVM compat).
 fn bcm_read_cntpct() -> u64 {
     let val: u64;
+    // SAFETY: reads CNTPCT_EL0 — generic timer counter, side-effect-free.
     #[cfg(feature = "board-cm5")]
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
+    // SAFETY: reads CNTVCT_EL0 — virtual counter under KVM/QEMU.
     #[cfg(not(feature = "board-cm5"))]
     unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
     val
@@ -1300,6 +1367,7 @@ fn bcm_read_cntpct() -> u64 {
 
 fn bcm_counter_freq() -> u64 {
     let freq: u64;
+    // SAFETY: reads CNTFRQ_EL0 — read-only frequency register.
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
     freq
 }
@@ -1312,6 +1380,8 @@ fn bcm_step_guard_arm(deadline_us: u32) {
     step_guard::set_armed(true);
     let freq = bcm_counter_freq();
     let ticks = (deadline_us as u64 * freq) / 1_000_000;
+    // SAFETY: per-core step-guard state; written by the same core that
+    // armed it. Read back in `bcm_step_guard_post_check` on the same core.
     unsafe {
         BCM_ARM_TIME = bcm_read_cntpct();
         BCM_DEADLINE_TICKS = ticks;
@@ -1326,7 +1396,9 @@ fn bcm_step_guard_post_check() {
     use fluxor::kernel::step_guard;
     if !step_guard::is_armed() { return; }
     let now = bcm_read_cntpct();
+    // SAFETY: per-core step-guard read paired with the arming write above.
     let elapsed = now.wrapping_sub(unsafe { BCM_ARM_TIME });
+    // SAFETY: as above.
     if elapsed >= unsafe { BCM_DEADLINE_TICKS } {
         step_guard::set_timed_out();
     }
@@ -1347,6 +1419,8 @@ fn bcm_isr_tier_start(period_us: u32) {
     use fluxor::kernel::isr_tier;
     isr_tier::set_tier1b_period_us(period_us);
     let freq = bcm_counter_freq();
+    // SAFETY: ISR-tier statics are set during init before any tier-1b
+    // module runs; sole writer on the scheduler thread.
     unsafe {
         BCM_ISR_PERIOD_TICKS = (period_us as u64 * freq) / 1_000_000;
         BCM_ISR_LAST_TICK = bcm_read_cntpct();
@@ -1362,9 +1436,12 @@ fn bcm_isr_tier_poll() {
     use fluxor::kernel::isr_tier;
     if !isr_tier::TIER1B_ACTIVE.load(core::sync::atomic::Ordering::Acquire) { return; }
     let now = bcm_read_cntpct();
+    // SAFETY: ISR poll runs on the scheduler thread; sole reader.
     let elapsed = now.wrapping_sub(unsafe { BCM_ISR_LAST_TICK });
+    // SAFETY: as above.
     let period = unsafe { BCM_ISR_PERIOD_TICKS };
     if period > 0 && elapsed >= period {
+        // SAFETY: sole writer for the ISR poll counter.
         unsafe {
             BCM_ISR_LAST_TICK = now;
             isr_tier::isr_tier1b_handler();
@@ -1751,7 +1828,7 @@ const RNG200_BASE: usize = 0x10_7d20_8000;
 #[cfg(feature = "board-cm5")]
 const RNG200_CTRL: *mut u32 = RNG200_BASE as *mut u32;
 #[cfg(feature = "board-cm5")]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const RNG200_STATUS: *const u32 = (RNG200_BASE + 0x04) as *const u32;
 #[cfg(feature = "board-cm5")]
 const RNG200_DATA: *const u32 = (RNG200_BASE + 0x08) as *const u32;
@@ -1765,6 +1842,9 @@ const RNG200_COUNT: *const u32 = (RNG200_BASE + 0x0C) as *const u32;
 ///
 /// Returns len on success, -1 if the hardware failed to produce entropy.
 fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
+    // SAFETY: iproc-rng200 MMIO is the documented BCM2712 RNG block;
+    // mapped by `boot_mmu::init_page_tables`. `buf`/`len` come from a
+    // caller-owned slice via the syscall ABI.
     unsafe {
         #[cfg(feature = "board-cm5")]
         {
@@ -1825,7 +1905,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
 }
 
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo<'_>) -> ! {
     // Emergency sink: platform-owned, separate from the normal
     // DebugTx drain. Writes directly to the UART hardware because
     // the scheduler is dead and the debug drain won't run again.
@@ -1852,5 +1932,6 @@ fn panic(info: &PanicInfo) -> ! {
             uart_raw_puts(b"\r\n--- end ---\r\n");
         }
     }
+    // SAFETY: WFI is a hint; halts the core until next interrupt.
     loop { unsafe { core::arch::asm!("wfi") }; }
 }

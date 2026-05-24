@@ -25,18 +25,16 @@ use fluxor_mod_tls as tls;
 #[test]
 fn sha256_empty_string_matches_fips_180_4() {
     let digest = tls::sha256(b"");
-    let expected: [u8; 32] = hex!(
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
+    let expected: [u8; 32] =
+        hex!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     assert_eq!(digest, expected);
 }
 
 #[test]
 fn sha256_abc_matches_fips_180_4() {
     let digest = tls::sha256(b"abc");
-    let expected: [u8; 32] = hex!(
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
+    let expected: [u8; 32] =
+        hex!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     assert_eq!(digest, expected);
 }
 
@@ -45,9 +43,8 @@ fn sha256_long_block_aligned() {
     // 1 MiB of zeros — covers many block boundaries.
     let zeros = vec![0u8; 1024 * 1024];
     let digest = tls::sha256(&zeros);
-    let expected: [u8; 32] = hex!(
-        "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58"
-    );
+    let expected: [u8; 32] =
+        hex!("30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58");
     assert_eq!(digest, expected);
 }
 
@@ -110,7 +107,9 @@ fn chacha20_poly1305_neon_path_matches_scalar_for_long_payload() {
     let mut pt: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
     let original = pt.clone();
     let tag = tls::chacha20_poly1305_encrypt(&key, &nonce, aad, &mut pt);
-    assert!(tls::chacha20_poly1305_decrypt(&key, &nonce, aad, &mut pt, &tag));
+    assert!(tls::chacha20_poly1305_decrypt(
+        &key, &nonce, aad, &mut pt, &tag
+    ));
     assert_eq!(pt, original);
 }
 
@@ -204,7 +203,10 @@ fn aes_gcm_aad_authenticated_separately_from_plaintext() {
     let mut buf2 = vec![0u8; 16];
     let tag1 = gcm.encrypt(&iv, b"aad-a", &mut buf1);
     let tag2 = gcm.encrypt(&iv, b"aad-b", &mut buf2);
-    assert_eq!(buf1, buf2, "ciphertext should be identical when key+iv+pt match");
+    assert_eq!(
+        buf1, buf2,
+        "ciphertext should be identical when key+iv+pt match"
+    );
     assert_ne!(tag1, tag2, "tag must differ when AAD differs");
 }
 
@@ -217,17 +219,20 @@ fn p256_ecdh_alice_and_bob_agree_on_shared_secret() {
     // Generate two key pairs deterministically. Compute shared
     // secret from each side; they MUST match (RFC 5903 §8).
     let mut alice_rand = [0u8; 32];
-    for (i, b) in alice_rand.iter_mut().enumerate() { *b = i as u8 + 1; }
+    for (i, b) in alice_rand.iter_mut().enumerate() {
+        *b = i as u8 + 1;
+    }
     let mut bob_rand = [0u8; 32];
-    for (i, b) in bob_rand.iter_mut().enumerate() { *b = (i as u8) ^ 0x5a; }
+    for (i, b) in bob_rand.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0x5a;
+    }
 
     let (alice_priv, alice_pub) = tls::ecdh_keygen(&alice_rand);
     let (bob_priv, bob_pub) = tls::ecdh_keygen(&bob_rand);
 
-    let alice_shared = tls::ecdh_shared_secret(&alice_priv, &bob_pub)
-        .expect("alice computes shared");
-    let bob_shared = tls::ecdh_shared_secret(&bob_priv, &alice_pub)
-        .expect("bob computes shared");
+    let alice_shared =
+        tls::ecdh_shared_secret(&alice_priv, &bob_pub).expect("alice computes shared");
+    let bob_shared = tls::ecdh_shared_secret(&bob_priv, &alice_pub).expect("bob computes shared");
 
     assert_eq!(alice_shared, bob_shared, "ECDH must converge");
 }
@@ -240,7 +245,9 @@ fn p256_ecdh_rejects_point_not_on_curve() {
     let priv_key = [1u8; 32];
     let mut bogus_pub = [0u8; 65];
     bogus_pub[0] = 0x04;
-    for b in bogus_pub.iter_mut().skip(1) { *b = 0xff; }
+    for b in bogus_pub.iter_mut().skip(1) {
+        *b = 0xff;
+    }
     let result = tls::ecdh_shared_secret(&priv_key, &bogus_pub);
     assert!(
         result.is_none(),
@@ -251,14 +258,18 @@ fn p256_ecdh_rejects_point_not_on_curve() {
 #[test]
 fn p256_ecdsa_sign_verify_round_trip() {
     let mut rand = [0u8; 32];
-    for (i, b) in rand.iter_mut().enumerate() { *b = i as u8 + 7; }
+    for (i, b) in rand.iter_mut().enumerate() {
+        *b = i as u8 + 7;
+    }
     let (priv_key, pub_key) = tls::ecdh_keygen(&rand);
 
     let msg = b"the quick brown fox jumps over the lazy dog";
     let hash = tls::sha256(msg);
 
     let mut k = [0u8; 32];
-    for (i, b) in k.iter_mut().enumerate() { *b = (i as u8) ^ 0xa5; }
+    for (i, b) in k.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xa5;
+    }
     let sig = tls::ecdsa_sign(&priv_key, &hash, &k);
     assert!(
         tls::ecdsa_verify(&pub_key, &hash, &sig),
@@ -284,7 +295,11 @@ fn peer_identity_envelope_format_with_svid() {
     let mut out = [0u8; tls::PEER_IDENTITY_MAX_TOTAL];
     let n = tls::build_peer_identity_envelope(7, &svid, &mut out);
 
-    assert_eq!(n, tls::PEER_IDENTITY_MAX_TOTAL, "full 32-B SVID fills the envelope");
+    assert_eq!(
+        n,
+        tls::PEER_IDENTITY_MAX_TOTAL,
+        "full 32-B SVID fills the envelope"
+    );
     assert_eq!(out[0], tls::MSG_PEER_IDENTITY);
     // payload_len = 4 (fixed) + 32 (svid) = 36 → 0x24 0x00 LE
     assert_eq!(out[1], 36);
@@ -296,7 +311,12 @@ fn peer_identity_envelope_format_with_svid() {
     // SVID body bytes
     let mut all_de = true;
     let mut i = 0;
-    while i < 32 { if out[7 + i] != 0xDE { all_de = false; } i += 1; }
+    while i < 32 {
+        if out[7 + i] != 0xDE {
+            all_de = false;
+        }
+        i += 1;
+    }
     assert!(all_de);
 }
 
@@ -305,7 +325,10 @@ fn peer_identity_envelope_format_no_svid_marks_unverified() {
     let mut out = [0u8; tls::PEER_IDENTITY_MAX_TOTAL];
     let n = tls::build_peer_identity_envelope(0, &[], &mut out);
 
-    assert_eq!(n, tls::PEER_IDENTITY_HEADER_LEN + tls::PEER_IDENTITY_FIXED_PAYLOAD_LEN);
+    assert_eq!(
+        n,
+        tls::PEER_IDENTITY_HEADER_LEN + tls::PEER_IDENTITY_FIXED_PAYLOAD_LEN
+    );
     assert_eq!(out[0], tls::MSG_PEER_IDENTITY);
     assert_eq!(out[5], 0, "verified=0 when SVID is empty");
     assert_eq!(out[6], 0, "svid_len=0");
@@ -331,11 +354,7 @@ fn dtls_ack_record_round_trip() {
     // Build → parse must be exact-identity, including wire-length
     // prefix. Per RFC 9147 §7.1 the body is `uint16 length || N ×
     // (uint64 epoch || uint64 seq)` in network byte order.
-    let records = [
-        (2u64, 0u64),
-        (2u64, 1u64),
-        (3u64, 42u64),
-    ];
+    let records = [(2u64, 0u64), (2u64, 1u64), (3u64, 42u64)];
     let mut buf = [0u8; 64];
     let n = tls::build_dtls_ack_body(&records, &mut buf);
     assert_eq!(n, 2 + 3 * 16, "wire length = 2 + 16 × count");

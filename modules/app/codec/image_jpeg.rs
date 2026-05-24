@@ -800,7 +800,10 @@ unsafe fn decode_progressive_scan(
                     for c in comps.iter_mut().take(n_comps) {
                         c.dc_pred = 0;
                     }
-                    eob_run = 0;
+                    // Multi-component branch never reads `eob_run`, so
+                    // the restart-interval reset isn't needed here
+                    // (the single-component branch below resets its
+                    // own counter at its restart point).
                     br.align_to_byte();
                     br.buf = 0;
                     br.n = 0;

@@ -60,18 +60,18 @@ const MAX_ACTIVE_POINTERS: usize = 8;
 /// Hardcoded button bit indices from
 /// `modules/sdk/contracts/input/gamepad.rs` — must stay in sync.
 mod btn {
-    pub const A: u8           = 0;
-    pub const B: u8           = 1;
-    pub const X: u8           = 2;
-    pub const Y: u8           = 3;
-    pub const L1: u8          = 4;
-    pub const R1: u8          = 5;
-    pub const SELECT: u8      = 8;
-    pub const START: u8       = 9;
-    pub const DPAD_UP: u8     = 12;
-    pub const DPAD_DOWN: u8   = 13;
-    pub const DPAD_LEFT: u8   = 14;
-    pub const DPAD_RIGHT: u8  = 15;
+    pub const A: u8 = 0;
+    pub const B: u8 = 1;
+    pub const X: u8 = 2;
+    pub const Y: u8 = 3;
+    pub const L1: u8 = 4;
+    pub const R1: u8 = 5;
+    pub const SELECT: u8 = 8;
+    pub const START: u8 = 9;
+    pub const DPAD_UP: u8 = 12;
+    pub const DPAD_DOWN: u8 = 13;
+    pub const DPAD_LEFT: u8 = 14;
+    pub const DPAD_RIGHT: u8 = 15;
 }
 
 /// `(button_index, x, y, w, h)` — a single hit region.
@@ -102,7 +102,9 @@ impl Region {
 /// L1 / R1 are bumper strips along the top corners. These match
 /// the regions runtime.html renders as DOM overlays — keep both in
 /// sync (the test in `tools/tests/wasm_touch_overlay_layout.rs`
-/// pins the mapping).
+/// pins the mapping). The skip attr keeps the one-line-per-region
+/// layout intact — the test parser matches that exact shape.
+#[rustfmt::skip]
 const REGIONS: &[Region] = &[
     // DPAD cross — left thumb. Centred at (130, 380), 60×60 cells.
     Region { btn: btn::DPAD_UP,    x: 100, y: 290, w: 60, h: 60 },
@@ -137,7 +139,7 @@ pub(crate) struct OverlayState {
     /// Last-emitted composite button bits — emit a new MSG_STATE
     /// only when this changes.
     pub last_bits: u16,
-    pub in_buf:  [u8; POINTER_EVENT_SIZE],
+    pub in_buf: [u8; POINTER_EVENT_SIZE],
     pub out_buf: [u8; GAMEPAD_EVENT_SIZE],
 }
 
@@ -155,7 +157,7 @@ unsafe fn alloc_state(in_chan: i32, out_chan: i32) -> *mut OverlayState {
             out_chan,
             active: [ActivePointer { id: -1, bits: 0 }; MAX_ACTIVE_POINTERS],
             last_bits: 0,
-            in_buf:  [0u8; POINTER_EVENT_SIZE],
+            in_buf: [0u8; POINTER_EVENT_SIZE],
             out_buf: [0u8; GAMEPAD_EVENT_SIZE],
         },
     );
@@ -187,6 +189,9 @@ fn composite_bits(active: &[ActivePointer; MAX_ACTIVE_POINTERS]) -> u16 {
 }
 
 fn overlay_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer for
+    // this module instance; we cast it back to the module-private state
+    // type allocated by the new_fn and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut OverlayState);
         if st_ptr.is_null() {
@@ -202,11 +207,7 @@ fn overlay_step(state: *mut u8) -> i32 {
         // event; many can pile up per scheduler tick during a
         // burst.
         loop {
-            let n = channel::channel_read(
-                st.in_chan,
-                st.in_buf.as_mut_ptr(),
-                st.in_buf.len(),
-            );
+            let n = channel::channel_read(st.in_chan, st.in_buf.as_mut_ptr(), st.in_buf.len());
             if n <= 0 {
                 break;
             }
@@ -219,13 +220,13 @@ fn overlay_step(state: *mut u8) -> i32 {
             let pointer_id = buf[1] as i16;
             let kind = buf[2];
             // Skip the buttons / modifiers / pressure bytes (3..7).
-            let x = i16::from_le_bytes([buf[8],  buf[9]]);
+            let x = i16::from_le_bytes([buf[8], buf[9]]);
             let y = i16::from_le_bytes([buf[10], buf[11]]);
 
             // input::pointer::KIND_*
-            const KIND_DOWN: u8   = 1;
-            const KIND_UP: u8     = 2;
-            const KIND_MOVE: u8   = 3;
+            const KIND_DOWN: u8 = 1;
+            const KIND_UP: u8 = 2;
+            const KIND_MOVE: u8 = 3;
             const KIND_CANCEL: u8 = 4;
 
             match kind {
@@ -276,22 +277,19 @@ fn overlay_step(state: *mut u8) -> i32 {
             // Layout: msg_type, pad, pad×2, gamepad_id, connected,
             // button_bits:u16, axes:i16×4.
             let out = &mut st.out_buf;
-            out[0] = 0x01;            // MSG_STATE
+            out[0] = 0x01; // MSG_STATE
             out[1] = 0;
-            out[2] = 0; out[3] = 0;
-            out[4] = 0;               // gamepad_id 0 (virtual)
-            out[5] = 1;               // connected
+            out[2] = 0;
+            out[3] = 0;
+            out[4] = 0; // gamepad_id 0 (virtual)
+            out[5] = 1; // connected
             out[6..8].copy_from_slice(&bits.to_le_bytes());
             // No analog sticks from a touch overlay; could later
             // emit derived axes (DPAD as full-deflection axis).
             for byte in &mut out[8..16] {
                 *byte = 0;
             }
-            let _ = channel::channel_write(
-                st.out_chan,
-                out.as_ptr(),
-                out.len(),
-            );
+            let _ = channel::channel_write(st.out_chan, out.as_ptr(), out.len());
         }
 
         0
@@ -299,10 +297,7 @@ fn overlay_step(state: *mut u8) -> i32 {
 }
 
 pub(crate) unsafe fn build(in_chan: i32, out_chan: i32) -> scheduler::BuiltInModule {
-    let mut m = scheduler::BuiltInModule::new(
-        "wasm_browser_touch_gamepad_overlay",
-        overlay_step,
-    );
+    let mut m = scheduler::BuiltInModule::new("wasm_browser_touch_gamepad_overlay", overlay_step);
     let raw = alloc_state(in_chan, out_chan);
     core::ptr::write(m.state.as_mut_ptr() as *mut *mut OverlayState, raw);
     m

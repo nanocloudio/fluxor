@@ -118,6 +118,9 @@ fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8])
         #[cfg(target_arch = "aarch64")]
         {
             if remain >= 64 {
+                // SAFETY: `block` is a fixed 64-byte stack buffer; the
+                // `remain >= 64` guard and `offset` accounting ensure the
+                // `data[offset..offset+64]` slice is in-bounds.
                 unsafe {
                     xor_64_neon(
                         block.as_ptr(),
@@ -158,6 +161,9 @@ impl Drop for Poly1305 {
         let rp = self.r.as_mut_ptr();
         let hp = self.h.as_mut_ptr();
         let pp = self.pad.as_mut_ptr();
+        // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+        // caller-supplied input/output buffers; offsets stay within the
+        // documented length.
         unsafe {
             let mut i = 0;
             while i < 5 { core::ptr::write_volatile(rp.add(i), 0); core::ptr::write_volatile(hp.add(i), 0); i += 1; }
@@ -257,6 +263,9 @@ impl Poly1305 {
         if self.buf_len > 0 {
             let space = 16 - self.buf_len;
             let take = if data.len() < space { data.len() } else { space };
+            // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+            // caller-supplied input/output buffers; offsets stay within the
+            // documented length.
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf.as_mut_ptr().add(self.buf_len), take); }
             self.buf_len += take;
             offset = take;
@@ -276,6 +285,9 @@ impl Poly1305 {
         // Buffer remainder
         if offset < data.len() {
             let remain = data.len() - offset;
+            // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+            // caller-supplied input/output buffers; offsets stay within the
+            // documented length.
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), self.buf.as_mut_ptr(), remain); }
             self.buf_len = remain;
         }
@@ -285,6 +297,9 @@ impl Poly1305 {
         // Flush partial buffer
         if self.buf_len > 0 {
             let mut last = [0u8; 16];
+            // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+            // caller-supplied input/output buffers; offsets stay within the
+            // documented length.
             unsafe { core::ptr::copy_nonoverlapping(self.buf.as_ptr(), last.as_mut_ptr(), self.buf_len); }
             last[self.buf_len] = 0x01;
             self.block(&last, 0);
@@ -339,6 +354,9 @@ impl Poly1305 {
         let b1 = (f1 as u32).to_le_bytes();
         let b2 = (f2 as u32).to_le_bytes();
         let b3 = (f3 as u32).to_le_bytes();
+        // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+        // caller-supplied input/output buffers; offsets stay within the
+        // documented length.
         unsafe {
             core::ptr::copy_nonoverlapping(b0.as_ptr(), tag.as_mut_ptr(), 4);
             core::ptr::copy_nonoverlapping(b1.as_ptr(), tag.as_mut_ptr().add(4), 4);
@@ -379,6 +397,9 @@ pub fn chacha20_poly1305_encrypt(
     // Generate Poly1305 one-time key (counter=0)
     let poly_key_block = chacha20_block(key, 0, nonce);
     let mut poly_key = [0u8; 32];
+    // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+    // caller-supplied input/output buffers; offsets stay within the
+    // documented length.
     unsafe { core::ptr::copy_nonoverlapping(poly_key_block.as_ptr(), poly_key.as_mut_ptr(), 32); }
 
     // Encrypt plaintext (counter starts at 1)
@@ -401,6 +422,9 @@ pub fn chacha20_poly1305_encrypt(
     }
     // Lengths (little-endian u64)
     let mut lens = [0u8; 16];
+    // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+    // caller-supplied input/output buffers; offsets stay within the
+    // documented length.
     unsafe {
         let a = (aad.len() as u64).to_le_bytes();
         let d = (data.len() as u64).to_le_bytes();
@@ -427,6 +451,9 @@ pub fn chacha20_poly1305_decrypt(
     // Generate Poly1305 one-time key
     let poly_key_block = chacha20_block(key, 0, nonce);
     let mut poly_key = [0u8; 32];
+    // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+    // caller-supplied input/output buffers; offsets stay within the
+    // documented length.
     unsafe { core::ptr::copy_nonoverlapping(poly_key_block.as_ptr(), poly_key.as_mut_ptr(), 32); }
 
     // Verify tag BEFORE decrypting (ciphertext is what's authenticated)
@@ -438,6 +465,9 @@ pub fn chacha20_poly1305_decrypt(
     let ct_pad = (16 - (data.len() % 16)) % 16;
     if ct_pad > 0 { mac.update(&[0u8; 16][..ct_pad]); }
     let mut lens = [0u8; 16];
+    // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
+    // caller-supplied input/output buffers; offsets stay within the
+    // documented length.
     unsafe {
         let a = (aad.len() as u64).to_le_bytes();
         let d = (data.len() as u64).to_le_bytes();

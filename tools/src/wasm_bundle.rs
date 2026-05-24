@@ -48,9 +48,8 @@ fn find_magic_offset(kernel: &[u8], magic: &[u8; 16], name: &str) -> Result<usiz
         if &kernel[i..i + 16] == magic {
             if found.is_some() {
                 return Err(Error::Config(format!(
-                    "wasm bundle: {} magic appears more than once in kernel.wasm \
-                     (corrupt build or magic collision); aborting",
-                    name
+                    "wasm bundle: {name} magic appears more than once in kernel.wasm \
+                     (corrupt build or magic collision); aborting"
                 )));
             }
             found = Some(i);
@@ -62,17 +61,16 @@ fn find_magic_offset(kernel: &[u8], magic: &[u8; 16], name: &str) -> Result<usiz
     }
     found.ok_or_else(|| {
         Error::Config(format!(
-            "wasm bundle: {} magic not found in kernel.wasm — was the kernel \
+            "wasm bundle: {name} magic not found in kernel.wasm — was the kernel \
              built without the host-wasm feature, or is this not a Fluxor \
-             kernel?",
-            name
+             kernel?"
         ))
     })
 }
 
 /// Rewrite one blob slot in `kernel`. Verifies capacity ≥ payload, then
 /// overwrites `used_len` and the first `payload.len()` bytes of `data`.
-fn rewrite_one(kernel: &mut [u8], slot: &BlobSlot) -> Result<()> {
+fn rewrite_one(kernel: &mut [u8], slot: &BlobSlot<'_>) -> Result<()> {
     let header_off = find_magic_offset(kernel, slot.magic, slot.name)?;
 
     // Header layout: [16 magic][u32 capacity][u32 used_len][8 reserved]

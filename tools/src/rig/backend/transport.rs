@@ -56,6 +56,8 @@ impl Drop for TransportHandle {
             // spawned by the backend script) die too — otherwise they
             // keep the stdout pipe open and wedge the reader thread.
             let pid = child.id() as i32;
+            // SAFETY: negative pid signals the whole process group;
+            // libc::kill has no memory effects, only signal delivery.
             unsafe {
                 libc::kill(-pid, libc::SIGTERM);
             }
@@ -73,6 +75,7 @@ impl Drop for TransportHandle {
                 }
             };
             if !exited {
+                // SAFETY: same group-signal as the SIGTERM above.
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }

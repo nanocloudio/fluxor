@@ -14,7 +14,7 @@
 //! `event_handle = EVENT_HANDLE_PCIE1_MSI` routes the IRQ into the
 //! brcmstb PCIe1 MSI mux dispatch instead of a single event.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 
 // GIC
 #[cfg(not(feature = "board-cm5"))]
@@ -84,6 +84,9 @@ pub fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
 ///
 /// Returns 0 on success, negative errno on failure.
 pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
+    // SAFETY: IRQ_BINDINGS / IRQ_BINDING_COUNT are scheduler-thread-only
+    // and only grow at boot/configure time; `idx` is range-checked above.
+    // GICD register addresses are fixed MMIO mapped by boot_mmu.
     unsafe {
         if IRQ_BINDING_COUNT >= MAX_IRQ_BINDINGS {
             return fluxor::kernel::errno::ENOMEM;
@@ -103,7 +106,7 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
         // Target CPU 0
         core::ptr::write_volatile((GICD_BASE + 0x800 + irq as usize) as *mut u8, 1);
 
-        log::info!("[irq] bind irq={} event={} mmio={:#x}", irq, event_handle, mmio_base);
+        log::info!("[irq] bind irq={irq} event={event_handle} mmio={mmio_base:#x}");
     }
     0
 }

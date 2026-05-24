@@ -28,7 +28,10 @@
 //! TTBR0_EL1 is swapped per-module with the module's page table + ASID.
 
 #[cfg(feature = "chip-bcm2712")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod bcm2712_impl {
     use crate::kernel::scheduler::MAX_MODULES;
 
@@ -230,6 +233,8 @@ mod bcm2712_impl {
     /// the kernel. This function builds the per-module isolation tables
     /// on top of that foundation.
     pub fn mmu_init() {
+        // SAFETY: MMU init runs once at boot before any module observes
+        // virt addresses; touches KERNEL_L1/L2 statics + MAIR/TCR sysregs.
         unsafe {
             // Build kernel L2 page table (identity map first 1GB)
             // This covers RAM + MMIO for QEMU virt
@@ -300,6 +305,9 @@ mod bcm2712_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: per-module page-table build runs during instantiation;
+        // no other thread accesses this module's MODULE_REGION_INFO /
+        // MODULE_L1 / MODULE_L2 entry yet. module_idx bounded above.
         unsafe {
             let r = &MODULE_REGION_INFO[module_idx];
             let l2 = &mut MODULE_L2[module_idx];
@@ -402,6 +410,7 @@ mod bcm2712_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: per-module write during instantiation; module_idx bounded.
         unsafe {
             MODULE_REGION_INFO[module_idx] = ModuleRegions {
                 code_base,
@@ -429,6 +438,7 @@ mod bcm2712_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: per-module write; module_idx bounded.
         unsafe {
             MODULE_REGION_INFO[module_idx].chan_base = base;
             MODULE_REGION_INFO[module_idx].chan_size = size;
@@ -446,6 +456,8 @@ mod bcm2712_impl {
         if !is_enabled() || module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: writes TTBR0_EL1 to the per-module L1 base — sysreg
+        // is per-CPU and the scheduler thread is the sole writer.
         unsafe {
             let l1_addr = &MODULE_L1[module_idx] as *const _ as u64;
             let asid = (module_idx as u64 + 1) & 0xFF;
@@ -464,6 +476,7 @@ mod bcm2712_impl {
         if !is_enabled() {
             return;
         }
+        // SAFETY: TTBR0_EL1 write to the kernel L1; ASID 0 reserved.
         unsafe {
             let l1_addr = &raw const KERNEL_L1 as u64;
             let ttbr0 = l1_addr; // ASID 0 (kernel)
@@ -479,11 +492,14 @@ mod bcm2712_impl {
     /// Check if MMU isolation is enabled.
     #[inline]
     pub fn is_enabled() -> bool {
+        // SAFETY: ISOLATION_ENABLED is a bool static; aligned read.
         unsafe { ISOLATION_ENABLED }
     }
 
     /// Enable or disable MMU isolation.
     pub fn set_enabled(enabled: bool) {
+        // SAFETY: ISOLATION_ENABLED is a bool static; sole writer is the
+        // scheduler-thread `mmu_init` / `set_enabled` call.
         unsafe {
             ISOLATION_ENABLED = enabled;
         }
@@ -544,10 +560,7 @@ mod bcm2712_impl {
                 Ok(()) => return, // Page loaded, retry faulting instruction
                 Err(e) => {
                     log::error!(
-                        "[mmu] pager fault failed for module {} at 0x{:016x}: {:?}",
-                        module_idx,
-                        far,
-                        e
+                        "[mmu] pager fault failed for module {module_idx} at 0x{far:016x}: {e:?}"
                     );
                     // Fall through to record as MPU fault
                 }
@@ -555,11 +568,7 @@ mod bcm2712_impl {
         }
 
         log::error!(
-            "[mmu] module {} data abort at 0x{:016x} ESR=0x{:08x} DFSC=0x{:02x}",
-            module_idx,
-            far,
-            esr,
-            dfsc
+            "[mmu] module {module_idx} data abort at 0x{far:016x} ESR=0x{esr:08x} DFSC=0x{dfsc:02x}"
         );
 
         // Record fault via step_guard
@@ -625,6 +634,8 @@ mod bcm2712_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: paged-arena setup runs during instantiation; module_idx
+        // bounded above; MODULE_PAGED_* and MODULE_L3 entries are per-module.
         unsafe {
             MODULE_PAGED_BASE[module_idx] = base_va;
             MODULE_PAGED_SIZE[module_idx] = size;
@@ -665,6 +676,7 @@ mod bcm2712_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: pager-thread per-module mutation; module_idx bounded.
         unsafe {
             let base = MODULE_PAGED_BASE[module_idx];
             let size = MODULE_PAGED_SIZE[module_idx];
@@ -691,6 +703,7 @@ mod bcm2712_impl {
         if module_idx >= MAX_MODULES {
             return;
         }
+        // SAFETY: pager-thread per-module mutation; module_idx bounded.
         unsafe {
             let base = MODULE_PAGED_BASE[module_idx];
             let size = MODULE_PAGED_SIZE[module_idx];

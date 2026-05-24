@@ -157,6 +157,13 @@ enforce_signatures = []
 toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 
+# Inherit the workspace lint baseline. Crate-root `#![allow(...)]`
+# blocks in `src/lib.rs` and `src/main.rs` relax `unsafe_code` for
+# this kernel; every `unsafe { }` block carries its own SAFETY
+# comment per the workspace-wide `undocumented_unsafe_blocks` lint.
+[lints]
+workspace = true
+
 [profile.release]
 debug = 2
 lto = false
@@ -174,3 +181,152 @@ members = ["contracts", "tools", "modules/foundation/ip", "modules/foundation/ht
 # tests are run from inside `tests/harness` so the rest of the tree
 # builds without them present.
 exclude = ["tests"]
+
+# Workspace-wide lint configuration. Each member inherits this via
+# `[lints] workspace = true` and relaxes specific lints per-crate
+# where appropriate.
+[workspace.lints.rust]
+# `unsafe_code = "deny"` keeps every unsafe block locally justified.
+# Crates that legitimately use unsafe relax the lint with a single
+# crate-root `#![allow(unsafe_code, reason = "...")]`.
+unsafe_code               = "deny"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+# `priority = -1` ensures group enables apply *before* per-lint
+# overrides below — without that, `pedantic = warn` would re-warn
+# every lint we explicitly allow further down.
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "warn",  priority = -1 }
+
+# Every `#[allow(...)]` must carry a `reason = "..."` clause; the
+# hygiene scanner enforces the same on module trees outside the
+# cargo workspace. `allow_attributes` is permissive because the
+# kernel matrix uses many target-conditional allows on cfg-gated
+# items, and `#[expect]` fails the build for configurations where
+# the lint doesn't fire.
+allow_attributes                = "allow"
+allow_attributes_without_reason = "deny"
+
+# Hardened defaults beyond clippy::all.
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+# `unwrap_used` / `expect_used` / `panic` are permissive workspace-wide:
+# the kernel + CLI are crash-on-precondition-violation paths by design
+# (boot-time integrity checks panic; CLI exits on bad input). PIC
+# library crates opt back in with a crate-root
+# `#![deny(clippy::unwrap_used)]` (see `modules/foundation/*/mod.rs`).
+#
+# `print_stdout` / `print_stderr` are denied so library code doesn't
+# print; the `tools` CLI and the `fluxor` host-linux binary relax
+# both lints at the crate root.
+unwrap_used   = "allow"
+expect_used   = "allow"
+panic         = "allow"
+print_stdout  = "deny"
+print_stderr  = "deny"
+
+# Pedantic carve-outs — universally noisy lints suppressed workspace-wide.
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+missing_const_for_fn    = "allow"
+too_many_lines          = "allow"
+# Cast lints fire constantly in low-level code that has to cross
+# integer-width boundaries (MMIO, packet field encoding, length
+# truncation at protocol limits). Audited individually at each site
+# via `as u32` / `as u8` etc.; clippy's blanket warning isn't useful.
+cast_possible_truncation = "allow"
+cast_possible_wrap       = "allow"
+cast_sign_loss           = "allow"
+cast_lossless            = "allow"
+cast_precision_loss      = "allow"
+# Style preferences.
+uninlined_format_args     = "warn"  # `format!("{x}")` preferred
+doc_markdown              = "allow"  # backtick-around-identifier in doc comments
+map_unwrap_or             = "allow"  # `.map(...).unwrap_or(...)` form
+manual_let_else           = "allow"  # `match Some(x) { … }` vs `let Some(x) = …`
+items_after_statements    = "allow"  # private helpers after the first use
+similar_names             = "allow"  # adjacent identifiers that differ by one letter
+struct_excessive_bools    = "allow"  # CLI flag structs
+unreadable_literal        = "allow"  # `0xDEADBEEF` etc.
+needless_pass_by_value    = "allow"  # by-value args at fn boundaries are intentional
+redundant_closure_for_method_calls = "allow"
+single_match_else         = "allow"
+match_same_arms           = "allow"
+single_match              = "allow"
+needless_raw_string_hashes = "allow"
+format_collect            = "allow"
+format_push_string        = "allow"  # `s += &format!(...)` style
+assigning_clones          = "allow"  # `*lhs = rhs.clone()` micro-opt
+inefficient_to_string     = "allow"
+useless_let_if_seq        = "allow"
+ptr_as_ptr                = "allow"
+return_self_not_must_use  = "allow"
+ref_as_ptr                = "allow"
+bool_to_int_with_if       = "allow"  # `if x { 1 } else { 0 }` style
+if_not_else               = "allow"  # `if !x { … } else { … }` is fine
+manual_string_new         = "allow"  # `String::from("")` etc.
+elidable_lifetime_names   = "allow"  # explicit lifetimes for clarity
+explicit_iter_loop        = "allow"  # `for x in v.iter()` is fine
+unnecessary_wraps         = "allow"  # functions that return Result<T> for uniformity
+# Further pedantic noise — see the rationale-by-category above.
+implicit_clone                        = "allow"  # `to_vec()` on deref
+checked_conversions                   = "allow"  # manual checked casts
+many_single_char_names                = "allow"
+used_underscore_binding               = "allow"
+default_trait_access                  = "allow"  # `Map::new()` vs `Map::default()`
+unnested_or_patterns                  = "allow"
+multiple_unsafe_ops_per_block         = "allow"
+ref_option                            = "allow"  # `&Option<T>` vs `Option<&T>`
+case_sensitive_file_extension_comparisons = "allow"
+filter_map_next                       = "allow"
+no_effect_underscore_binding          = "allow"
+large_stack_arrays                    = "allow"  # PIC modules carry sizable buffers
+wildcard_enum_match_arm               = "allow"
+stable_sort_primitive                 = "allow"
+trivially_copy_pass_by_ref            = "allow"
+doc_link_with_quotes                  = "allow"
+semicolon_if_nothing_returned         = "allow"
+needless_for_each                     = "allow"
+collapsible_else_if                   = "allow"
+collapsible_match                     = "allow"
+unused_self                           = "allow"
+match_wildcard_for_single_variants    = "allow"
+struct_field_names                    = "allow"
+manual_range_contains                 = "allow"
+ignored_unit_patterns                 = "allow"
+range_plus_one                        = "allow"
+borrow_as_ptr                         = "allow"
+verbose_bit_mask                      = "allow"
+
+# Unsafe hygiene: every `unsafe { }` block carries a `// SAFETY: …`
+# comment immediately above (multi-line is fine — clippy walks
+# contiguous comment lines). Modules outside the cargo workspace
+# (`modules/sdk/*`, `modules/drivers/*`, `modules/app/*`) build via
+# `rustc` direct calls and don't run clippy; their SAFETY discipline
+# is enforced by review.
+undocumented_unsafe_blocks    = "deny"
+# Kernel pointer math repeatedly casts u8 buffers to typed structs
+# (BlockHeader, syscall args, MMIO descriptors). Alignment is hand-
+# verified at allocation; the lint can't see that invariant.
+cast_ptr_alignment            = "allow"
+# `#[inline(always)]` is intentional in the kernel hot-paths
+# (step-guard, syscall fast-path). The lint's "usually a bad idea"
+# warning is the wrong default for a kernel.
+inline_always                 = "allow"
+# Some `pub` structs carry `_`-prefixed padding/reserved fields that
+# the host can read but isn't expected to write.
+pub_underscore_fields         = "allow"
+# Style: `} else { ... }` after a returning if-branch.
+redundant_else                = "allow"
+# Style.
+ptr_cast_constness            = "allow"  # `as *const u8` ↔ `as *mut u8`
+enum_glob_use                 = "allow"  # `use Foo::*` is acceptable
+wildcard_imports              = "allow"
+needless_continue             = "allow"
+comparison_chain              = "allow"  # `if a < b … else if a == b …` form
+unchecked_time_subtraction    = "allow"  # internal monotonic clocks won't wrap

@@ -92,6 +92,8 @@ pub mod backing_store {
 
     pub fn backing_init() {
         let arenas = &raw mut ARENAS;
+        // SAFETY: backing_init runs once at boot before any pager thread
+        // observes ARENAS / RAMDISK_NEXT_OFFSET / EXTERNAL_ARENA_NEXT_PAGE.
         unsafe {
             for i in 0..MAX_ARENAS {
                 (*arenas)[i] = ArenaBackingInfo::empty();
@@ -112,6 +114,8 @@ pub mod backing_store {
         writeback: WritebackPolicy,
     ) -> i32 {
         let arenas = &raw mut ARENAS;
+        // SAFETY: pager-thread serialised; backing_register is called
+        // from scheduler bring-up.
         unsafe {
             let mut slot = MAX_ARENAS;
             for i in 0..MAX_ARENAS {
@@ -209,6 +213,7 @@ pub mod backing_store {
             return -22;
         }
         let arenas = &raw const ARENAS;
+        // SAFETY: ARENAS is pager-thread serialised; bounds-checked below.
         let info = unsafe {
             if arena_id >= MAX_ARENAS || !(*arenas)[arena_id].active {
                 return -19;
@@ -222,6 +227,8 @@ pub mod backing_store {
         match info.backing_type {
             BackingType::RamDisk => {
                 #[cfg(feature = "chip-bcm2712")]
+                // SAFETY: `disk_page < MAX_RAMDISK_PAGES` checked; copy of
+                // PAGE_SIZE bytes from owned RAMDISK[disk_page] to caller buf.
                 unsafe {
                     let disk_page = (info.backing_offset + vpage_idx) as usize;
                     if disk_page >= MAX_RAMDISK_PAGES {
@@ -251,6 +258,8 @@ pub mod backing_store {
                 } // ENOSYS
             }
             BackingType::None => {
+                // SAFETY: caller's `buf` is a writable PAGE_SIZE buffer
+                // (kernel pager contract).
                 unsafe {
                     core::ptr::write_bytes(buf, 0, PAGE_SIZE);
                 }
@@ -264,6 +273,7 @@ pub mod backing_store {
             return -22;
         }
         let arenas = &raw const ARENAS;
+        // SAFETY: ARENAS pager-thread serialised; bounds-checked below.
         let info = unsafe {
             if arena_id >= MAX_ARENAS || !(*arenas)[arena_id].active {
                 return -19;
@@ -277,6 +287,8 @@ pub mod backing_store {
         match info.backing_type {
             BackingType::RamDisk => {
                 #[cfg(feature = "chip-bcm2712")]
+                // SAFETY: `disk_page < MAX_RAMDISK_PAGES` checked; copy of
+                // PAGE_SIZE bytes from caller buf to owned RAMDISK[disk_page].
                 unsafe {
                     let disk_page = (info.backing_offset + vpage_idx) as usize;
                     if disk_page >= MAX_RAMDISK_PAGES {
@@ -335,6 +347,7 @@ pub mod backing_store {
             return -22;
         }
         let arenas = &raw const ARENAS;
+        // SAFETY: ARENAS pager-thread serialised; bounds-checked below.
         let info = unsafe {
             if arena_id >= MAX_ARENAS || !(*arenas)[arena_id].active {
                 return -19;
@@ -368,6 +381,8 @@ pub mod backing_store {
             _ => {
                 let mut i: u32 = 0;
                 while i < count {
+                    // SAFETY: caller's `buf` covers `count * PAGE_SIZE` bytes;
+                    // `i < count` keeps offset in-bounds.
                     let dst = unsafe { buf.add((i as usize) * PAGE_SIZE) };
                     let rc = backing_read(arena_id, vpage_start + i, dst);
                     if rc != 0 {
@@ -394,6 +409,7 @@ pub mod backing_store {
             return -22;
         }
         let arenas = &raw const ARENAS;
+        // SAFETY: ARENAS pager-thread serialised; bounds-checked below.
         let info = unsafe {
             if arena_id >= MAX_ARENAS || !(*arenas)[arena_id].active {
                 return -19;
@@ -427,6 +443,7 @@ pub mod backing_store {
             _ => {
                 let mut i: u32 = 0;
                 while i < count {
+                    // SAFETY: caller's `buf` covers `count * PAGE_SIZE`.
                     let src = unsafe { buf.add((i as usize) * PAGE_SIZE) };
                     let rc = backing_write(arena_id, vpage_start + i, src);
                     if rc != 0 {
@@ -445,6 +462,7 @@ pub mod backing_store {
     /// and the driver is free to over-write it on the next registration).
     pub fn backing_release(arena_id: usize) {
         let arenas = &raw mut ARENAS;
+        // SAFETY: pager-thread serialised; arena_id bounds-checked.
         unsafe {
             if arena_id < MAX_ARENAS {
                 (*arenas)[arena_id] = ArenaBackingInfo::empty();
@@ -589,6 +607,8 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return false;
         }
+        // SAFETY: `module_idx < MAX_MODULES` checked above; PAGER_CONFIG
+        // is the static per-module pager state, owned by the pager thread.
         let config = unsafe { PAGER_CONFIG[module_idx] };
         if !config.active {
             return false;
@@ -608,6 +628,7 @@ pub mod pager {
             return Err(FaultError::InvalidModule);
         }
 
+        // SAFETY: as above.
         let config = unsafe { PAGER_CONFIG[module_idx] };
         if !config.active {
             return Err(FaultError::NotPagedArena);
@@ -621,6 +642,7 @@ pub mod pager {
         let vpage_idx = ((fault_vaddr - config.base_vaddr) / PAGE_SIZE) as u32;
 
         // Check fault budget
+        // SAFETY: pager-thread mutates PAGER_STATS exclusively; module_idx bounded.
         let stats = unsafe { &mut PAGER_STATS[module_idx] };
         if stats.faults_this_step >= config.max_faults_per_step {
             return Err(FaultError::BudgetExceeded);
@@ -696,6 +718,7 @@ pub mod pager {
                 // Continue anyway — data loss on this page
             }
 
+            // SAFETY: pager-thread exclusive; owner_module bounded by descriptor.
             let stats = unsafe { &mut PAGER_STATS[desc.owner_module as usize] };
             stats.writebacks += 1;
         }
@@ -704,6 +727,7 @@ pub mod pager {
         #[cfg(feature = "chip-bcm2712")]
         {
             let old_module = desc.owner_module as usize;
+            // SAFETY: read-only access through `&raw const`; pager-thread serialised.
             let old_config = unsafe {
                 let p = &raw const PAGER_CONFIG;
                 &(*p)[old_module]
@@ -717,6 +741,7 @@ pub mod pager {
 
         // Update eviction stats for the old owner
         {
+            // SAFETY: as above.
             let owner_stats = unsafe { &mut PAGER_STATS[desc.owner_module as usize] };
             owner_stats.evictions += 1;
         }
@@ -751,6 +776,9 @@ pub mod pager {
     /// Invalidate TLB entry for a specific virtual address.
     #[cfg(feature = "chip-bcm2712")]
     fn tlbi_page(vaddr: usize) {
+        // SAFETY: TLBI VALE1 + DSB + ISB are architectural instructions
+        // with no register/memory side-effects beyond the requested TLB
+        // invalidation.
         unsafe {
             let addr = (vaddr >> 12) as u64; // TLB invalidate by VA, page-aligned
             core::arch::asm!(
@@ -773,11 +801,13 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return 0;
         }
+        // SAFETY: `module_idx < MAX_MODULES` checked above.
         let config = unsafe { &PAGER_CONFIG[module_idx] };
         if !config.active {
             return 0;
         }
 
+        // SAFETY: pool_mut returns the global pool's mutable view; pager-thread.
         let pool = unsafe { page_pool::pool_mut() };
         let total = pool.total_pages();
         let mut written = 0;
@@ -802,6 +832,7 @@ pub mod pager {
                     d.flags &= !page_flags::DIRTY;
                     written += 1;
 
+                    // SAFETY: pager-thread exclusive; module_idx bounded.
                     let stats = unsafe { &mut PAGER_STATS[module_idx] };
                     stats.writebacks += 1;
                 }
@@ -824,6 +855,7 @@ pub mod pager {
     /// Reset per-step fault counters. Called by scheduler before each step.
     pub fn reset_step_faults(module_idx: usize) {
         if module_idx < MAX_MODULES {
+            // SAFETY: pager-thread exclusive; module_idx bounded.
             unsafe {
                 PAGER_STATS[module_idx].faults_this_step = 0;
             }
@@ -855,6 +887,8 @@ pub mod pager {
             return arena_id;
         }
 
+        // SAFETY: registration runs on the scheduler thread before the
+        // arena is wired up; `module_idx < MAX_MODULES` checked earlier.
         unsafe {
             PAGER_CONFIG[module_idx] = PagedArenaConfig {
                 active: true,
@@ -889,6 +923,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return 0;
         }
+        // SAFETY: module_idx < MAX_MODULES checked above.
         let config = unsafe { PAGER_CONFIG[module_idx] };
         if !config.active {
             return 0;
@@ -936,6 +971,9 @@ pub mod pager {
         #[cfg(feature = "chip-bcm2712")]
         if loaded > 0 {
             // Bulk TLB invalidation
+            // SAFETY: TLBI / DSB / ISB are system control instructions
+            // with no register or memory side-effects beyond the
+            // architectural invalidation they request.
             unsafe {
                 core::arch::asm!("tlbi vmalle1", "dsb ish", "isb");
             }
@@ -950,6 +988,7 @@ pub mod pager {
             return;
         }
 
+        // SAFETY: module_idx < MAX_MODULES checked above; pager-thread.
         let config = unsafe { &PAGER_CONFIG[module_idx] };
         if !config.active {
             return;
@@ -965,6 +1004,7 @@ pub mod pager {
         backing_store::backing_release(config.arena_id as usize);
 
         // Clear config
+        // SAFETY: pager-thread exclusive; module_idx still in-bounds.
         unsafe {
             PAGER_CONFIG[module_idx] = PagedArenaConfig::empty();
             PAGER_STATS[module_idx] = PagerStats::new();
@@ -976,6 +1016,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return PagedArenaConfig::empty();
         }
+        // SAFETY: module_idx < MAX_MODULES checked above.
         unsafe { PAGER_CONFIG[module_idx] }
     }
 
@@ -984,6 +1025,7 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return PagerStats::new();
         }
+        // SAFETY: as above.
         unsafe { PAGER_STATS[module_idx] }
     }
 
@@ -1013,10 +1055,12 @@ pub mod pager {
         if module_idx >= MAX_MODULES {
             return PagedArenaStats::default();
         }
+        // SAFETY: module_idx < MAX_MODULES checked above.
         let config = unsafe { &PAGER_CONFIG[module_idx] };
         if !config.active {
             return PagedArenaStats::default();
         }
+        // SAFETY: as above.
         let stats = unsafe { &PAGER_STATS[module_idx] };
 
         let resident = page_pool::pool_resident_count(module_idx as u8) as u32;

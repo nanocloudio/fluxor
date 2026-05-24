@@ -242,7 +242,7 @@ impl CacheEntry {
 }
 
 #[repr(C)]
-struct VarEntry {
+pub(crate) struct VarEntry {
     name_hash: u32,
     value_len: u8,
     _pad: [u8; 3],
@@ -621,7 +621,7 @@ pub(crate) struct ServerState {
 
 /// Number of `u64` words needed to cover `MAX_CONCURRENT_CONNS`
 /// bits (rounded up). At MAX=1024 this is 16 words = 128 bytes.
-pub(crate) const READY_BITS_WORDS: usize = (MAX_CONCURRENT_CONNS + 63) / 64;
+pub(crate) const READY_BITS_WORDS: usize = MAX_CONCURRENT_CONNS.div_ceil(64);
 
 #[inline(always)]
 unsafe fn ready_set(s: &mut HttpState, idx: usize) {
@@ -908,7 +908,10 @@ pub(crate) unsafe fn cur_conn_id(s: &HttpState) -> u8 {
 /// Number of slots currently in use (any phase other than `Init`
 /// with a non-negative `conn_id`). Used by the step iterator to
 /// know when to round-robin and by tests to assert occupancy.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 pub(crate) unsafe fn active_slot_count(s: &HttpState) -> usize {
     let mut count = 0;
     for i in 0..MAX_CONCURRENT_CONNS {
@@ -1115,15 +1118,27 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
         let pfx = b"[http] route ";
         let mut q = 0usize;
         let mut t = 0;
-        while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+        while t < pfx.len() {
+            *p.add(q) = pfx[t];
+            q += 1;
+            t += 1;
+        }
         q += fmt_u32_raw(p.add(q), i as u32);
         let bl = b" body_len=";
         let mut t = 0;
-        while t < bl.len() { *p.add(q) = bl[t]; q += 1; t += 1; }
+        while t < bl.len() {
+            *p.add(q) = bl[t];
+            q += 1;
+            t += 1;
+        }
         q += fmt_u32_raw(p.add(q), r.body_len);
         let bo = b" body_off=";
         let mut t = 0;
-        while t < bo.len() { *p.add(q) = bo[t]; q += 1; t += 1; }
+        while t < bo.len() {
+            *p.add(q) = bo[t];
+            q += 1;
+            t += 1;
+        }
         q += fmt_u32_raw(p.add(q), r.body_offset);
         dev_log(&*s.syscalls, 2, p, q);
         i += 1;
@@ -1134,11 +1149,19 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
         let pfx = b"[http] body_pool used=";
         let mut q = 0usize;
         let mut t = 0;
-        while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+        while t < pfx.len() {
+            *p.add(q) = pfx[t];
+            q += 1;
+            t += 1;
+        }
         q += fmt_u32_raw(p.add(q), s.server.body_pool_used);
         let cp = b" cap=";
         let mut t = 0;
-        while t < cp.len() { *p.add(q) = cp[t]; q += 1; t += 1; }
+        while t < cp.len() {
+            *p.add(q) = cp[t];
+            q += 1;
+            t += 1;
+        }
         q += fmt_u32_raw(p.add(q), s.server.body_pool_cap);
         dev_log(&*s.syscalls, 2, p, q);
     }
@@ -1410,12 +1433,12 @@ unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'static [u8] 
     }
     // ASCII-lowercase scratch.
     let mut buf = [0u8; 8];
-    for k in 0..ext_len {
+    for (k, slot) in buf.iter_mut().enumerate().take(ext_len) {
         let mut b = *path.add(start + k);
-        if (b'A'..=b'Z').contains(&b) {
+        if b.is_ascii_uppercase() {
             b += 32;
         }
-        buf[k] = b;
+        *slot = b;
     }
     let ext = &buf[..ext_len];
     match ext {
@@ -1574,7 +1597,12 @@ unsafe fn build_header_fs_full(
     if off >= 4 {
         off -= 4; // strip the trailing \r\n\r\n; we'll re-add it.
     }
-    off = put_bytes(dst, cap, off, b"\r\nAccept-Ranges: bytes\r\nContent-Length: ");
+    off = put_bytes(
+        dst,
+        cap,
+        off,
+        b"\r\nAccept-Ranges: bytes\r\nContent-Length: ",
+    );
     off = put_u32_decimal(dst, cap, off, content_length);
     off = put_bytes(dst, cap, off, b"\r\n\r\n");
     if let Some(cur) = cur_slot_mut(s) {
@@ -1600,7 +1628,12 @@ unsafe fn build_header_fs_partial(
     if off >= 4 {
         off -= 4;
     }
-    off = put_bytes(dst, cap, off, b"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
+    off = put_bytes(
+        dst,
+        cap,
+        off,
+        b"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ",
+    );
     off = put_u32_decimal(dst, cap, off, start);
     off = put_bytes(dst, cap, off, b"-");
     off = put_u32_decimal(dst, cap, off, end);
@@ -1622,9 +1655,19 @@ unsafe fn build_header_fs_partial(
 unsafe fn build_error_416(s: &mut HttpState, total: u32) {
     let cap = SEND_BUF_SIZE;
     let dst = cur_send_buf_mut_ptr(s);
-    let mut off = put_bytes(dst, cap, 0, b"HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */");
+    let mut off = put_bytes(
+        dst,
+        cap,
+        0,
+        b"HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */",
+    );
     off = put_u32_decimal(dst, cap, off, total);
-    off = put_bytes(dst, cap, off, b"\r\nContent-Length: 22\r\n\r\nRange Not Satisfiable\n");
+    off = put_bytes(
+        dst,
+        cap,
+        off,
+        b"\r\nContent-Length: 22\r\n\r\nRange Not Satisfiable\n",
+    );
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_offset = 0;
         cur.send_len = off as u16;
@@ -3326,7 +3369,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             (0, cursor_start)
         };
         let mut word_idx = lo / 64;
-        let word_end = (hi + 63) / 64;
+        let word_end = hi.div_ceil(64);
         while word_idx < word_end {
             let mut word = ready_snapshot[word_idx];
             // Mask off bits before `lo` and at-or-after `hi` to
@@ -4118,8 +4161,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         while k + 1 < suffix_end {
                             if composed[k] == b'.' && composed[k + 1] == b'.' {
                                 let before_ok = k == suffix_start || composed[k - 1] == b'/';
-                                let after_ok = (k + 2) == suffix_end
-                                    || composed[k + 2] == b'/';
+                                let after_ok = (k + 2) == suffix_end || composed[k + 2] == b'/';
                                 if before_ok && after_ok {
                                     build_error(
                                         s,
@@ -4262,16 +4304,8 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                         while k < elen {
                                             let a = tail[k];
                                             let b = filter[start + k];
-                                            let al = if (b'A'..=b'Z').contains(&a) {
-                                                a + 32
-                                            } else {
-                                                a
-                                            };
-                                            let bl = if (b'A'..=b'Z').contains(&b) {
-                                                b + 32
-                                            } else {
-                                                b
-                                            };
+                                            let al = a.to_ascii_lowercase();
+                                            let bl = b.to_ascii_lowercase();
                                             if al != bl {
                                                 m = false;
                                                 break;
@@ -4292,11 +4326,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 }
                             }
                             // Comma separator between items.
-                            if !first {
-                                if bp < body.len() {
-                                    body[bp] = b',';
-                                    bp += 1;
-                                }
+                            if !first && bp < body.len() {
+                                body[bp] = b',';
+                                bp += 1;
                             }
                             first = false;
                             // Opening quote.
@@ -4796,9 +4828,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
 
             let poll = ((*s.syscalls).channel_poll)(s.server.file_chan, POLL_IN | POLL_HUP);
-            let eof = poll > 0
-                && (poll as u32 & POLL_HUP) != 0
-                && (poll <= 0 || (poll as u32 & POLL_IN) == 0);
+            let eof = poll > 0 && (poll as u32 & POLL_HUP) != 0 && (poll as u32 & POLL_IN) == 0;
             let full = (arena_off + ce.length as usize) >= pool_cap;
 
             if eof || full {
@@ -4937,9 +4967,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 && s.server.latest_fanout_slot != me_idx;
             if displaced {
                 let send_empty = cur_send_len(s) == 0;
-                let no_frag = cur_slot(s)
-                    .map(|c| c.ws_frag_buf.is_null())
-                    .unwrap_or(true);
+                let no_frag = cur_slot(s).map(|c| c.ws_frag_buf.is_null()).unwrap_or(true);
                 if send_empty && no_frag {
                     ws_begin_close(s, ws::CLOSE_GOING_AWAY);
                     return 2;
@@ -4978,9 +5006,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // subsequent ticks fall through to the normal flow.
             let needs_replay = cur_slot(s)
                 .map(|c| {
-                    c.ws_fan_out != 0
-                        && c.retained_replay_done == 0
-                        && c.ws_frag_buf.is_null()
+                    c.ws_fan_out != 0 && c.retained_replay_done == 0 && c.ws_frag_buf.is_null()
                 })
                 .unwrap_or(false);
             if needs_replay && cur_send_len(s) == 0 && !s.server.retained_buf.is_null() {
@@ -4989,9 +5015,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 // only up to that boundary, so envelopes captured
                 // *after* the slot enters WsActive (which are also
                 // queued live) don't get re-delivered through replay.
-                let started = cur_slot(s)
-                    .map(|c| c.retained_replay_started)
-                    .unwrap_or(0);
+                let started = cur_slot(s).map(|c| c.retained_replay_started).unwrap_or(0);
                 if started == 0 {
                     let snapshot = s.server.retained_used;
                     if let Some(cur) = cur_slot_mut(s) {
@@ -5029,8 +5053,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         let payload_ptr = buf.add(RETAINED_ENVELOPE_HDR);
                         if ws_queue_envelope_on_active(s, r_op, r_fin, payload_ptr, r_len) {
                             if let Some(cur) = cur_slot_mut(s) {
-                                cur.retained_replay_offset =
-                                    cur.retained_replay_offset.saturating_add(envelope_total as u32);
+                                cur.retained_replay_offset = cur
+                                    .retained_replay_offset
+                                    .saturating_add(envelope_total as u32);
                             }
                         } else {
                             // Heap-alloc failure on fragmentation —

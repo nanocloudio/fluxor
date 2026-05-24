@@ -143,7 +143,7 @@ pub mod gpio {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            log::warn!("[gpio] pin {} already claimed", pin_num);
+            log::warn!("[gpio] pin {pin_num} already claimed");
             return errno::EAGAIN;
         }
 
@@ -163,7 +163,8 @@ pub mod gpio {
             return errno::ERROR;
         }
 
-        // Drop any existing wrappers
+        // SAFETY: SLOTS is mutated only by claim/release helpers under the
+        // CLAIMED atomic guard; `idx` is range-checked above.
         unsafe {
             SLOTS[idx].output = None;
             SLOTS[idx].input = None;
@@ -212,13 +213,15 @@ pub mod gpio {
         for i in 0..MAX_GPIO {
             if OWNER[i].load(Ordering::Acquire) == module_idx && CLAIMED[i].load(Ordering::Acquire)
             {
-                // Clear edge detection and event binding before releasing
+                // SAFETY: IRQ_EDGE_CONFIG indexed by `i` (< MAX_GPIO from loop bound);
+                // gated by CLAIMED + module-owner check above.
                 unsafe {
                     IRQ_EDGE_CONFIG[i] = 0;
                 }
                 EDGE_ACTIVE_MASK[edge_word(i)].fetch_and(!edge_bit(i), Ordering::Release);
                 GPIO_EVENT_BINDING[i].store(-1, Ordering::Release);
-                // Release the pin
+                // SAFETY: SLOTS[i] mutated only while CLAIMED guard is true;
+                // `i` is bounded by the MAX_GPIO loop.
                 unsafe {
                     SLOTS[i].output = None;
                     SLOTS[i].input = None;
@@ -259,10 +262,12 @@ pub mod gpio {
     /// - `ERROR` if invalid handle
     /// - `EAGAIN` if not claimed
     pub fn gpio_set_mode(handle: i32, mode: PinMode, initial_level: bool) -> i32 {
+        // SAFETY: `claimed_slot_mut` validates the handle and CLAIMED guard
+        // before returning the &mut; serial caller path (kernel scheduler thread).
         let (idx, slot) = match unsafe { claimed_slot_mut(handle) } {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("[gpio] set_mode invalid handle={}", handle);
+                log::warn!("[gpio] set_mode invalid handle={handle}");
                 return e;
             }
         };
@@ -273,7 +278,8 @@ pub mod gpio {
 
         match mode {
             PinMode::Output => {
-                // SAFETY: Pin is claimed, we own it
+                // SAFETY: pin is claimed (CLAIMED guard); we hold the only
+                // wrapper for it via SLOTS[idx].
                 let pin = unsafe { AnyPin::steal(idx as u8) };
                 let level = if initial_level {
                     Level::High
@@ -283,6 +289,8 @@ pub mod gpio {
                 slot.output = Some(Output::new(pin, level));
             }
             PinMode::Input => {
+                // SAFETY: pin is claimed (CLAIMED guard); we hold the only
+                // wrapper for it via SLOTS[idx].
                 let pin = unsafe { AnyPin::steal(idx as u8) };
                 slot.input = Some(Input::new(pin, slot.pull.into()));
             }
@@ -303,6 +311,7 @@ pub mod gpio {
     ///
     /// Returns 0 on success, `ERROR` if invalid handle, `EAGAIN` if not claimed.
     pub fn gpio_set_pull(handle: i32, pull: PinPull) -> i32 {
+        // SAFETY: handle validated by claimed_slot_mut.
         let (idx, slot) = match unsafe { claimed_slot_mut(handle) } {
             Ok(v) => v,
             Err(e) => return e,
@@ -313,6 +322,7 @@ pub mod gpio {
         // If already in input mode, recreate with new pull
         if slot.mode == PinMode::Input {
             slot.input = None;
+            // SAFETY: pin is claimed; we hold the only wrapper via SLOTS[idx].
             let pin = unsafe { AnyPin::steal(idx as u8) };
             slot.input = Some(Input::new(pin, pull.into()));
         }
@@ -325,6 +335,7 @@ pub mod gpio {
     /// Returns 0 on success, `ERROR` if invalid, `EAGAIN` if not claimed,
     /// `ENOTSUP` if not in output mode.
     pub fn gpio_set_level(handle: i32, high: bool) -> i32 {
+        // SAFETY: handle validated by claimed_slot_mut.
         let (_idx, slot) = match unsafe { claimed_slot_mut(handle) } {
             Ok(v) => v,
             Err(e) => return e,
@@ -349,6 +360,7 @@ pub mod gpio {
     /// - `EAGAIN` if not claimed
     /// - `ENOTSUP` if not in input mode
     pub fn gpio_get_level(handle: i32) -> i32 {
+        // SAFETY: handle validated by claimed_slot_mut.
         let (_idx, slot) = match unsafe { claimed_slot_mut(handle) } {
             Ok(v) => v,
             Err(e) => return e,
@@ -367,6 +379,7 @@ pub mod gpio {
 
     /// Get current mode of a claimed pin.
     pub fn gpio_get_mode(handle: i32) -> PinMode {
+        // SAFETY: handle validated by claimed_slot_mut.
         match unsafe { claimed_slot_mut(handle) } {
             Ok((_idx, slot)) => slot.mode,
             Err(_) => PinMode::Unconfigured,
@@ -505,6 +518,8 @@ pub mod gpio {
         if edge > 3 {
             return errno::EINVAL;
         }
+        // SAFETY: IRQ_EDGE_CONFIG / IRQ_PENDING / LAST_LEVEL indexed by `idx`
+        // (< MAX_GPIO). Mutation is serial: kernel scheduler thread only.
         unsafe {
             IRQ_EDGE_CONFIG[idx] = edge;
             IRQ_PENDING[idx] = 0;
@@ -530,6 +545,7 @@ pub mod gpio {
         if !CLAIMED[idx].load(Ordering::Acquire) {
             return errno::EAGAIN;
         }
+        // SAFETY: IRQ_PENDING indexed by `idx` (< MAX_GPIO); serial scheduler thread.
         unsafe {
             let pending = IRQ_PENDING[idx];
             IRQ_PENDING[idx] = 0;
@@ -561,6 +577,12 @@ pub mod gpio {
     /// Poll GPIO pins with active edge interest. Called once per scheduler tick.
     /// Uses a bitmask to skip pins without edge detection — O(active pins) not O(MAX_GPIO).
     pub fn poll_gpio_edges() {
+        // SAFETY: scheduler-thread-only entry point. `idx` is computed from
+        // `word * 32 + bit_pos` where `bit_pos < 32`; `word` is the
+        // EDGE_ACTIVE_MASK array index. EDGE_ACTIVE_MASK was sized so its
+        // bits cover MAX_GPIO indices, so `idx < MAX_GPIO` for any set bit.
+        // `IRQ_EDGE_CONFIG`/`IRQ_PENDING`/`LAST_LEVEL` are mutated only on
+        // this thread (and gpio_set_irq, also kernel scheduler thread).
         unsafe {
             for (word, mask_atomic) in EDGE_ACTIVE_MASK.iter().enumerate() {
                 let mut mask = mask_atomic.load(Ordering::Acquire);

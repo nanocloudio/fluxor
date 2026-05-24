@@ -23,6 +23,12 @@
 //! Only one codec is active at a time.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
 
 use core::ffi::c_void;
 
@@ -30,7 +36,6 @@ use core::ffi::c_void;
 // are gated to `target_os = "none"` / `wasm32`); provide a host
 // fallback for the one intrinsic the audio sub-codecs reach for.
 #[cfg(feature = "host-test")]
-#[allow(non_snake_case)]
 pub unsafe fn __aeabi_memclr(dest: *mut u8, n: usize) {
     core::ptr::write_bytes(dest, 0, n);
 }

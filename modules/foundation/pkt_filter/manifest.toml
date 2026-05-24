@@ -1,0 +1,5 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# Stateless packet filter. Reads parsed metadata from `eth_parser`,
+# evaluates match rules from config params, and forwards or drops.

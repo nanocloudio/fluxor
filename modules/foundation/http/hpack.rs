@@ -341,25 +341,23 @@ pub(crate) unsafe fn encode_header(
     value: &[u8],
 ) -> usize {
     let idx = static_name_index(name);
-    let mut o = 0usize;
-    if idx > 0 {
+    let o = if idx > 0 {
         let n = encode_integer(dst, dst_cap, 0x00, 4, idx);
         if n == 0 {
             return 0;
         }
-        o = n;
+        n
     } else {
         if dst_cap < 1 {
             return 0;
         }
         *dst = 0x00;
-        o = 1;
-        let n = encode_string(dst.add(o), dst_cap - o, name.as_ptr(), name.len());
+        let n = encode_string(dst.add(1), dst_cap - 1, name.as_ptr(), name.len());
         if n == 0 {
             return 0;
         }
-        o += n;
-    }
+        1 + n
+    };
     let n = encode_string(dst.add(o), dst_cap - o, value.as_ptr(), value.len());
     if n == 0 {
         return 0;
@@ -395,6 +393,8 @@ fn names_eq(a: &[u8], b: &[u8]) -> bool {
     let bp = b.as_ptr();
     let mut i = 0usize;
     while i < n {
+        // SAFETY: `n = a.len().min(b.len())` (computed above); `i < n`
+        // is the loop invariant so both `add(i)` reads stay in-bounds.
         unsafe {
             if *ap.add(i) != *bp.add(i) {
                 return false;

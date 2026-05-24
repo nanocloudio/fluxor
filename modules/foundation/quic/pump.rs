@@ -1487,7 +1487,7 @@ fn mark_inbound_consumed(conn: &mut QuicConnection) {
 // Retry plumbing (RFC 9000 §17.2.5 + §8.1.2 + RFC 9001 §5.8).
 // ---------------------------------------------------------------------
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 enum InitialAction {
     IssueRetry {
         dcid: [u8; MAX_CID_LEN],
@@ -3158,7 +3158,7 @@ unsafe fn emit_crypto_packet(
 /// `frame_cause`: frame type that triggered the error (0 if not
 /// frame-related).
 /// `reason`: optional human-readable text (≤120 bytes recommended).
-pub unsafe fn emit_connection_close(
+pub(crate) unsafe fn emit_connection_close(
     s: &mut QuicState,
     idx: usize,
     error_code: u64,
@@ -3250,7 +3250,7 @@ pub unsafe fn emit_connection_close(
 
 /// Emit a RESET_STREAM frame on the 1-RTT level for the given stream.
 /// RFC 9000 §19.4 — abruptly terminates a stream's send side.
-pub unsafe fn emit_reset_stream(
+pub(crate) unsafe fn emit_reset_stream(
     s: &mut QuicState,
     idx: usize,
     stream_id: u64,
@@ -3311,7 +3311,7 @@ pub unsafe fn emit_reset_stream(
 /// On expiry we also drive the NewReno congestion controller: the
 /// presumed-lost packet's bytes are deducted from `bytes_in_flight`
 /// and `cc_on_loss` collapses cwnd (RFC 9002 §B.6).
-pub unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
+pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
     let sys = &*s.syscalls;
     let now_ms = dev_millis(sys);
     let pto_threshold = s.conns[idx].rtt.pto() as u64;

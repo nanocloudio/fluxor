@@ -10,7 +10,10 @@
 //! - RX: NIC writes descriptors at head, driver reads at tail
 //! - TX: Driver writes descriptors at head, NIC reads at tail
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -349,6 +352,8 @@ fn dma_alloc(size: usize) -> usize {
 /// Get the virtual address for an arena offset.
 #[cfg(feature = "chip-bcm2712")]
 fn dma_arena_ptr(offset: usize) -> *mut u8 {
+    // SAFETY: caller upholds `offset < DMA_ARENA_SIZE`; the static DMA
+    // arena is contiguous identity-mapped memory.
     unsafe { (&raw mut DMA_ARENA.0 as *mut u8).add(offset) }
 }
 
@@ -406,6 +411,8 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
     }
 
     #[cfg(feature = "chip-bcm2712")]
+    // SAFETY: ring registry mutation runs on the scheduler thread during
+    // NIC setup; bound checks below before any indexing.
     unsafe {
         // Validate
         if rx_desc_count as usize > MAX_DESC_COUNT
@@ -487,13 +494,7 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
         };
 
         log::info!(
-            "[nic_ring] ring {} created: rx={} tx={} bufs={}x{} total={}",
-            slot,
-            rx_desc_count,
-            tx_desc_count,
-            buf_count,
-            buf_size,
-            total
+            "[nic_ring] ring {slot} created: rx={rx_desc_count} tx={tx_desc_count} bufs={buf_count}x{buf_size} total={total}"
         );
         slot as i32
     }
@@ -507,6 +508,8 @@ pub fn ring_destroy(ring_handle: i32) -> i32 {
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return crate::kernel::errno::EINVAL;
     }
+    // SAFETY: NIC_RINGS is scheduler-thread-owned ring registry;
+    // `ring_handle` bounds-checked above.
     unsafe {
         let ring = &mut NIC_RINGS[ring_handle as usize];
         if !ring.active {
@@ -515,7 +518,7 @@ pub fn ring_destroy(ring_handle: i32) -> i32 {
         ring.active = false;
         // Note: DMA arena is bump-allocated; we don't reclaim space.
         // This is acceptable for long-lived NIC rings.
-        log::info!("[nic_ring] ring {} destroyed", ring_handle);
+        log::info!("[nic_ring] ring {ring_handle} destroyed");
         0
     }
 }
@@ -542,6 +545,9 @@ pub fn ring_info(ring_handle: i32, out: *mut u8, out_len: usize) -> i32 {
     }
 
     #[cfg(feature = "chip-bcm2712")]
+    // SAFETY: NIC_RINGS is scheduler-thread-owned; ring_handle bounds-checked above.
+    // `out` validity guaranteed by caller per the syscall_ring_info contract;
+    // 32-byte write length matches the out_len >= 32 check above.
     unsafe {
         let ring = &NIC_RINGS[ring_handle as usize];
         if !ring.active {
@@ -590,6 +596,9 @@ pub fn nic_ring_acquire_rx(ring_handle: i32) -> (*mut u8, usize) {
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return (core::ptr::null_mut(), 0);
     }
+    // SAFETY: NIC_RINGS is scheduler-thread-owned; ring_handle bounds-checked above.
+    // Descriptor pointer lives in the DMA arena mapped by ring_create; idx is
+    // taken modulo rx_desc_count so stays within the allocated descriptor range.
     unsafe {
         let ring = &mut NIC_RINGS[ring_handle as usize];
         if !ring.active || ring.rx_desc_count == 0 {
@@ -625,6 +634,9 @@ pub fn nic_ring_release_rx(ring_handle: i32) {
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return;
     }
+    // SAFETY: NIC_RINGS is scheduler-thread-owned; ring_handle bounds-checked above.
+    // Descriptor pointer indexed modulo rx_desc_count stays within the DMA arena
+    // allocation made by ring_create.
     unsafe {
         let ring = &mut NIC_RINGS[ring_handle as usize];
         if !ring.active || ring.rx_desc_count == 0 {
@@ -654,6 +666,8 @@ pub fn nic_ring_acquire_tx(ring_handle: i32) -> (*mut u8, usize) {
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return (core::ptr::null_mut(), 0);
     }
+    // SAFETY: NIC_RINGS is scheduler-thread-owned; ring_handle bounds-checked above.
+    // Buffer index is range-checked against buf_count below before pointer use.
     unsafe {
         let ring = &mut NIC_RINGS[ring_handle as usize];
         if !ring.active || ring.tx_desc_count == 0 {
@@ -684,6 +698,10 @@ pub fn nic_ring_submit_tx(ring_handle: i32, len: usize) {
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS || len == 0 {
         return;
     }
+    // SAFETY: NIC_RINGS is scheduler-thread-owned; ring_handle bounds-checked above.
+    // Descriptor pointer indexed modulo tx_desc_count stays within the DMA arena
+    // allocation made by ring_create. The Release fence ensures the NIC sees the
+    // descriptor payload writes before observing DESC_OWNED_BY_NIC in status.
     unsafe {
         let ring = &mut NIC_RINGS[ring_handle as usize];
         if !ring.active || ring.tx_desc_count == 0 {
@@ -722,29 +740,42 @@ pub fn nic_ring_submit_tx(ring_handle: i32, len: usize) {
 // ============================================================================
 
 /// Clean data cache by virtual address range (write-back dirty lines).
+///
+/// # Safety
+/// Caller-supplied `[addr, addr+size)` must lie in the mapped DMA arena.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn cache_clean(addr: *mut u8, size: usize) {
     let mut ptr = addr as usize & !63; // align to cache line
     let end = (addr as usize + size + 63) & !63;
     while ptr < end {
-        core::arch::asm!("dc civac, {}", in(reg) ptr, options(nostack));
+        // SAFETY: DC CIVAC is cache maintenance over a virtual address;
+        // `ptr` walks cache-line-aligned positions in the caller's range.
+        unsafe { core::arch::asm!("dc civac, {}", in(reg) ptr, options(nostack)) };
         ptr += 64;
     }
-    core::arch::asm!("dsb sy", options(nostack));
+    // SAFETY: DSB is an unconditional system barrier; no operands.
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
 }
 
 /// Invalidate data cache by virtual address range.
+///
+/// # Safety
+/// Caller-supplied `[addr, addr+size)` must lie in the mapped DMA arena.
+/// Any unwritten dirty lines in the range are discarded.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn cache_invalidate(addr: *mut u8, size: usize) {
     let mut ptr = addr as usize & !63;
     let end = (addr as usize + size + 63) & !63;
     while ptr < end {
-        core::arch::asm!("dc ivac, {}", in(reg) ptr, options(nostack));
+        // SAFETY: DC IVAC is cache maintenance over a virtual address;
+        // `ptr` walks cache-line-aligned positions in the caller's range.
+        unsafe { core::arch::asm!("dc ivac, {}", in(reg) ptr, options(nostack)) };
         ptr += 64;
     }
-    core::arch::asm!("dsb sy", options(nostack));
+    // SAFETY: DSB is an unconditional system barrier; no operands.
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
 }
 
 // ============================================================================
@@ -806,6 +837,9 @@ static mut RSS_QUEUE_COUNT: usize = 0;
 ///
 /// Returns queue index (0..MAX_RSS_QUEUES-1) on success, or -1 if full.
 pub fn rss_register_queue(ring_handle: i32) -> i32 {
+    // SAFETY: RSS_QUEUE_MAP / RSS_QUEUE_COUNT are scheduler-thread-only
+    // and only mutated here (registration) at boot/configure time;
+    // `idx` is range-checked against MAX_RSS_QUEUES above.
     unsafe {
         if RSS_QUEUE_COUNT >= MAX_RSS_QUEUES {
             return -1;
@@ -822,6 +856,8 @@ pub fn rss_register_queue(ring_handle: i32) -> i32 {
 /// Uses the Toeplitz hash (or any u32 hash) to select a queue/ring.
 /// Returns the ring handle for the selected queue, or -1 if no queues registered.
 pub fn nic_ring_steer(hash: u32) -> i32 {
+    // SAFETY: RSS_QUEUE_MAP / RSS_QUEUE_COUNT are scheduler-thread-only;
+    // `idx` is reduced mod RSS_QUEUE_COUNT.
     unsafe {
         if RSS_QUEUE_COUNT == 0 {
             return -1;

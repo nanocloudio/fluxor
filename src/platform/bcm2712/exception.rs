@@ -17,7 +17,7 @@
 //! early-boot fault. State is also stashed at the fixed address
 //! 0x4007_0000 for offline QEMU monitor inspection.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -170,6 +170,7 @@ pub static CORE_TICKS: [AtomicU32; 4] = [
 #[inline(always)]
 pub fn current_core_id() -> u8 {
     let mpidr: u64;
+    // SAFETY: `mrs mpidr_el1` reads a per-CPU system register; no operands.
     unsafe {
         core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
     }

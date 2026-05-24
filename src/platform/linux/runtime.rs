@@ -15,6 +15,9 @@ static __end_block_addr: u8 = 0;
 static mut BOOT_INSTANT: Option<Instant> = None;
 
 fn elapsed_micros() -> u64 {
+    // SAFETY: `BOOT_INSTANT` is set once at boot by the bin's main()
+    // before any timer reader is alive; this reads through `&raw const`
+    // to avoid materialising a long-lived reference.
     unsafe {
         let ptr = &raw const BOOT_INSTANT;
         match &*ptr {
@@ -204,6 +207,10 @@ fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     // `libc::SYS_getrandom` is the canonical per-arch constant and
     // `libc::syscall` handles the platform-specific calling
     // convention. See.
+    // SAFETY: `libc::syscall` invoked with the per-arch SYS_getrandom
+    // selector and `(buf, len, flags=0)` matches `getrandom(2)`. The
+    // caller supplies `buf`/`len` from a Rust slice, so the pointer
+    // is valid for writes of `len` bytes.
     let ret =
         unsafe { libc::syscall(libc::SYS_getrandom, buf as *mut libc::c_void, len, 0u32) };
     if ret < 0 || ret as usize != len {

@@ -29,7 +29,7 @@ include!("wire.rs");
 #[cfg(any(target_os = "none", target_arch = "wasm32"))]
 mod _pic_intrinsics {
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 mod core_stubs {
     #[inline(never)]
     pub fn slice_index_trap() -> ! {
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn __aeabi_llsr(v_lo: u32, v_hi: u32, shift: u32) -> u64 {
 // module code that calls `__aeabi_memcpy` etc. by name keeps working.
 // Gated identically — on host the symbols don't exist.
 #[cfg(any(target_os = "none", target_arch = "wasm32"))]
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "import surface kept for downstream re-export consumers")]
 use _pic_intrinsics::*;
 
 // ============================================================================
@@ -542,6 +542,10 @@ pub const MSG_BLINK: u32 = fnv1a(b"blink");
 // ============================================================================
 
 /// Format u32 as decimal. Caller must ensure `dst` has at least 10 bytes.
+///
+/// # Safety
+/// `dst` must be valid for writes of up to 10 bytes (the maximum decimal
+/// width of `u32::MAX`). Pointer is written without bounds checks.
 #[inline(always)]
 pub unsafe fn fmt_u32_raw(dst: *mut u8, val: u32) -> usize {
     if val == 0 {
@@ -567,6 +571,10 @@ pub unsafe fn fmt_u32_raw(dst: *mut u8, val: u32) -> usize {
 
 /// Format IPv4 address (network byte order u32) as dotted decimal.
 /// Caller must ensure `dst` has at least 15 bytes.
+///
+/// # Safety
+/// `dst` must be valid for writes of up to 15 bytes
+/// (`xxx.xxx.xxx.xxx` = 4×3 digits + 3 dots). Bounds are not checked.
 #[inline(always)]
 pub unsafe fn fmt_ip_raw(dst: *mut u8, ip: u32) -> usize {
     let b = ip.to_be_bytes();
@@ -584,6 +592,10 @@ pub unsafe fn fmt_ip_raw(dst: *mut u8, ip: u32) -> usize {
 }
 
 /// Format i16 as signed decimal. Caller must ensure `dst` has at least 6 bytes.
+///
+/// # Safety
+/// `dst` must be valid for writes of up to 6 bytes (`-32768` is the widest
+/// case). Bounds are not checked.
 #[inline(always)]
 pub unsafe fn fmt_i16_raw(dst: *mut u8, val: i16) -> usize {
     let mut pos = 0usize;
@@ -599,6 +611,9 @@ pub unsafe fn fmt_i16_raw(dst: *mut u8, val: i16) -> usize {
 }
 
 /// Format u8 as 2-digit hex. Caller must ensure `dst` has at least 2 bytes.
+///
+/// # Safety
+/// `dst` must be valid for writes of 2 bytes. Bounds are not checked.
 #[inline(always)]
 pub unsafe fn fmt_hex_u8(dst: *mut u8, val: u8) -> usize {
     let hi = val >> 4;
@@ -614,6 +629,11 @@ pub unsafe fn fmt_hex_u8(dst: *mut u8, val: u8) -> usize {
 
 /// Drain pending output buffer. Returns true if all pending data was flushed.
 /// Call at the top of module_step before reading new input.
+///
+/// # Safety
+/// `buf` must be valid for reads of at least `*pending_out + *pending_offset`
+/// bytes. `sys` must outlive the call. The kernel guarantees both when the
+/// helper is invoked from `module_step`.
 #[inline(always)]
 pub unsafe fn drain_pending(
     sys: &SyscallTable,
@@ -905,7 +925,7 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
 // Everything routes through `SyscallTable::provider_call`.
 
 /// Monotonic time in milliseconds (TIMER::MILLIS 0x0602).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
@@ -915,7 +935,7 @@ unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
 
 /// Monotonic time in microseconds (TIMER::MICROS 0x0603). Useful for
 /// per-phase profiling at sub-millisecond granularity.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
@@ -924,14 +944,14 @@ unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
 }
 
 /// Log a message (kernel primitive LOG_WRITE, opcode 0x0C40). Level encoded as handle.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_log(sys: &SyscallTable, level: u8, msg: *const u8, len: usize) {
     (sys.provider_call)(level as i32, 0x0C40, msg as *mut u8, len);
 }
 
 /// Poll any fd via provider_call (kernel primitive HANDLE_POLL, opcode 0x0C41).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u32) -> i32 {
     let mut buf = [events as u8];
@@ -939,14 +959,14 @@ unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u32) -> i32 {
 }
 
 /// Create an event via provider_call (EVENT::CREATE 0x0B00).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_event_create(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0B00, core::ptr::null_mut(), 0)
 }
 
 /// Poll an event via provider_call (EVENT::POLL 0x0B02). Returns 1 if signaled (clears it), 0 if not.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_event_poll(sys: &SyscallTable, handle: i32) -> i32 {
     (sys.provider_call)(handle, 0x0B02, core::ptr::null_mut(), 0)
@@ -954,7 +974,7 @@ unsafe fn dev_event_poll(sys: &SyscallTable, handle: i32) -> i32 {
 
 /// Bind an event to a hardware IRQ (kernel primitive BIND_IRQ, opcode 0x0C51).
 /// `irq`: GIC interrupt number. `mmio_base`: virtio-mmio base for auto-ACK (0 = none).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_base: usize) -> i32 {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
@@ -974,7 +994,7 @@ unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_bas
 
 /// Query graph-level sample rate (kernel primitive GRAPH_SAMPLE_RATE, opcode 0x0C31).
 /// Returns 0 if not configured.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
@@ -988,7 +1008,7 @@ unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
 
 /// Query system clock frequency (kernel primitive SYS_CLOCK_HZ, opcode 0x0C3B).
 /// Returns 0 on error (should not happen in practice).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_sys_clock_hz(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
@@ -1003,7 +1023,7 @@ unsafe fn dev_sys_clock_hz(sys: &SyscallTable) -> u32 {
 /// Query stream time via `provider_query(-1, kernel_abi::STREAM_TIME)`.
 /// Returns the first active PIO stream's (consumed_units, queued_units,
 /// units_per_sec_q16, t0_micros), or zeros if no stream is active.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
     let mut buf = [0u8; 24]; // StreamTime is 24 bytes
@@ -1024,7 +1044,7 @@ unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
 
 /// Query downstream latency (kernel primitive DOWNSTREAM_LATENCY, opcode 0x0C33).
 /// Returns frames of latency downstream from the calling module, or 0.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_downstream_latency(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
@@ -1037,7 +1057,7 @@ unsafe fn dev_downstream_latency(sys: &SyscallTable) -> u32 {
 }
 
 /// Report module's processing latency (kernel primitive REPORT_LATENCY, opcode 0x0C50).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
     let mut buf = frames.to_le_bytes();
@@ -1045,7 +1065,7 @@ unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
 }
 
 /// Discover channel port via provider_call (CHANNEL::PORT 0x050C).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 {
     let mut buf = [0u8; 2];
@@ -1067,7 +1087,7 @@ unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 
 ///
 /// On return the first `arg_len` bytes of `arg` carry the handler's
 /// response. Pass `arg = null` and `arg_len = 0` for arg-less cmds.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_channel_ioctl(
     sys: &SyscallTable,
@@ -1102,7 +1122,7 @@ unsafe fn dev_channel_ioctl(
 ///
 /// Registration is one-shot per channel; the last call wins. The
 /// `state` pointer is typically `&mut MyState as *mut c_void`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_channel_register_ioctl(
     sys: &SyscallTable,
@@ -1124,7 +1144,7 @@ unsafe fn dev_channel_register_ioctl(
 
 /// Acquire write access to mailbox buffer via provider_call (BUFFER::ACQUIRE_WRITE 0x0A00).
 /// Returns pointer (as *mut u8) or null. capacity_out receives buffer capacity.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_write(
     sys: &SyscallTable,
@@ -1135,7 +1155,7 @@ unsafe fn dev_buffer_acquire_write(
 }
 
 /// Release write buffer via provider_call (BUFFER::RELEASE_WRITE 0x0A01).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_buffer_release_write(sys: &SyscallTable, chan: i32, len: u32) -> i32 {
     let mut buf = len.to_le_bytes();
@@ -1144,7 +1164,7 @@ unsafe fn dev_buffer_release_write(sys: &SyscallTable, chan: i32, len: u32) -> i
 
 /// Acquire in-place buffer access via provider_call (BUFFER::ACQUIRE_INPLACE 0x0A04).
 /// Returns pointer to existing data or null. len_out receives data length.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_inplace(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *mut u8 {
     (sys.provider_call)(chan, 0x0A04, len_out as *mut u8, 4) as *mut u8
@@ -1152,14 +1172,14 @@ unsafe fn dev_buffer_acquire_inplace(sys: &SyscallTable, chan: i32, len_out: *mu
 
 /// Acquire read access to buffer via provider_call (BUFFER::ACQUIRE_READ 0x0A02).
 /// Returns pointer to data or null. len_out receives data length.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_read(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *const u8 {
     (sys.provider_call)(chan, 0x0A02, len_out as *mut u8, 4) as *const u8
 }
 
 /// Release read buffer via provider_call (BUFFER::RELEASE_READ 0x0A03).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
     (sys.provider_call)(chan, 0x0A03, core::ptr::null_mut(), 0)
@@ -1178,7 +1198,7 @@ const NET_FRAME_HDR: usize = 3;
 /// frame; returns 0 on backpressure (channel ring full or atomic
 /// FIFO write rejected) so callers can retry rather than treat a
 /// dropped frame as committed.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 unsafe fn net_write_frame(
     sys: &SyscallTable,
     chan: i32,
@@ -1209,7 +1229,7 @@ unsafe fn net_write_frame(
 ///
 /// Two-step read: first the 3-byte TLV header, then exactly payload_len bytes.
 /// This prevents consuming multiple frames from the byte-stream FIFO in one call.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 unsafe fn net_read_frame(
     sys: &SyscallTable,
     chan: i32,
@@ -1243,7 +1263,7 @@ unsafe fn net_read_frame(
 
 /// Fill buffer with cryptographically secure random bytes.
 /// Returns 0 on success, negative errno on failure.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
     (sys.provider_call)(-1, 0x0C3C, buf, len)
@@ -1254,29 +1274,29 @@ unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
 // ============================================================================
 
 /// `datagram` IPv4 address-prefix size: `[ep_id:1][af:1][addr:4][port:2]`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_V4_PREFIX: usize = 8;
 
 // datagram opcodes — full set (see modules/sdk/contracts/net/datagram.rs).
 // Provided here so consumers don't redefine them.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_CMD_BIND: u8 = 0x20;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_CMD_SEND_TO: u8 = 0x21;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_CMD_CLOSE: u8 = 0x22;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_MSG_BOUND: u8 = 0x40;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_MSG_RX_FROM: u8 = 0x41;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_MSG_CLOSED: u8 = 0x42;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_MSG_ERROR: u8 = 0x43;
 /// `AF_INET` address-family code (matches contracts/net/datagram.rs).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_AF_INET: u8 = 4;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DG_AF_INET6: u8 = 6;
 
 /// Build and emit a `CMD_DG_SEND_TO` frame for an IPv4 destination.
@@ -1292,7 +1312,11 @@ const DG_AF_INET6: u8 = 6;
 /// scratch too small for `DG_V4_PREFIX + data_len + NET_FRAME_HDR`).
 ///
 /// See `modules/sdk/contracts/net/datagram.rs` for the wire spec.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "datagram send wire-shape: signature mirrors the on-wire datagram envelope fields"
+)]
 unsafe fn dev_dg_send_to_v4(
     sys: &SyscallTable,
     chan: i32,
@@ -1339,7 +1363,7 @@ unsafe fn dev_dg_send_to_v4(
 /// first byte of the inner datagram payload. Returns `None` if the
 /// frame is too short, has the wrong `af`, or `payload_len` underflows
 /// the prefix.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline]
 unsafe fn parse_dg_rx_from_v4(
     frame_buf: *const u8,
@@ -1366,7 +1390,7 @@ unsafe fn parse_dg_rx_from_v4(
 /// success, negative errno on failure (e.g. called outside step). Used
 /// by anchors / workers / directories to render the `mod=` field of
 /// `MON_SESSION` telemetry lines.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
@@ -1374,7 +1398,7 @@ unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
 
 /// Render `bytes` as lowercase hex into `out`. Caller must ensure
 /// `out.len() >= bytes.len() * 2`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn hex_render(bytes: *const u8, n: usize, out: *mut u8) {
     let h = b"0123456789abcdef";
@@ -1390,7 +1414,7 @@ unsafe fn hex_render(bytes: *const u8, n: usize, out: *mut u8) {
 /// Render a `mod=<n>` decimal field. `n` is the module's own scheduler
 /// index (from `dev_self_index`); we cap at three digits since the
 /// scheduler's `MAX_MODULES` is well under 1000. Returns bytes written.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 unsafe fn fmt_u32_dec(mut n: u32, out: *mut u8) -> usize {
     if n == 0 {
         *out = b'0';
@@ -1418,21 +1442,21 @@ const MON_SESSION_BUF_SIZE: usize = 192;
 /// `MON_SESSION` event tag codes for `dev_mon_session`. Strings live in
 /// the helper to keep call sites short. Wire format remains the
 /// human-readable name from `monitor-protocol.md`.
-#[allow(dead_code)] pub const MON_EV_ATTACH_REQ: u8 = 1;
-#[allow(dead_code)] pub const MON_EV_ATTACHED: u8 = 2;
-#[allow(dead_code)] pub const MON_EV_ATTACH_FAILED: u8 = 3;
-#[allow(dead_code)] pub const MON_EV_DRAINED: u8 = 4;
-#[allow(dead_code)] pub const MON_EV_EXPORTED: u8 = 5;
-#[allow(dead_code)] pub const MON_EV_IMPORTED: u8 = 6;
-#[allow(dead_code)] pub const MON_EV_RESUMED: u8 = 7;
-#[allow(dead_code)] pub const MON_EV_DETACH_REQ: u8 = 8;
-#[allow(dead_code)] pub const MON_EV_DETACHED: u8 = 9;
-#[allow(dead_code)] pub const MON_EV_RELOCATED: u8 = 10;
-#[allow(dead_code)] pub const MON_EV_REJECTED: u8 = 11;
-#[allow(dead_code)] pub const MON_EV_ERROR: u8 = 12;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_ATTACH_REQ: u8 = 1;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_ATTACHED: u8 = 2;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_ATTACH_FAILED: u8 = 3;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_DRAINED: u8 = 4;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_EXPORTED: u8 = 5;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_IMPORTED: u8 = 6;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_RESUMED: u8 = 7;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_DETACH_REQ: u8 = 8;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_DETACHED: u8 = 9;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_RELOCATED: u8 = 10;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_REJECTED: u8 = 11;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_ERROR: u8 = 12;
 
 /// Map an event code to its on-the-wire string. Empty for unknown codes.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 fn mon_event_name(ev: u8) -> &'static [u8] {
     match ev {
         MON_EV_ATTACH_REQ => b"attach_req",
@@ -1466,7 +1490,11 @@ fn mon_event_name(ev: u8) -> &'static [u8] {
 ///
 /// See `docs/architecture/monitor-protocol.md` §`MON_SESSION` for the
 /// authoritative line-format spec.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MON_SESSION line-format: signature mirrors the documented monitor-protocol fields"
+)]
 unsafe fn dev_mon_session(
     sys: &SyscallTable,
     self_idx: u8,
@@ -1482,7 +1510,7 @@ unsafe fn dev_mon_session(
 ) -> usize {
     if scratch_max < MON_SESSION_BUF_SIZE { return 0; }
     let mut pos = 0usize;
-    let mut emit = |bytes: &[u8], pos: &mut usize| {
+    let emit = |bytes: &[u8], pos: &mut usize| {
         let mut i = 0;
         while i < bytes.len() && *pos < scratch_max {
             *scratch.add(*pos) = bytes[i];
@@ -1561,14 +1589,14 @@ unsafe fn dev_mon_session(
 
 /// One-line emit budget for a `[<mod>] tlm …` line. Caller-allocated
 /// scratch must be at least this long.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 pub const TLM_LINE_BUF_SIZE: usize = 128;
 
 /// Per-module hot-path counters. Modules embed this in state and bump
 /// individual fields at data-flow points. `last_emit_step` tracks the
 /// step count at which the previous line was emitted so the helper can
 /// compute the delta. Initialise with `TlmCounters::new()`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 pub struct TlmCounters {
     pub bytes_in: u32,
     pub bytes_out: u32,
@@ -1577,10 +1605,17 @@ pub struct TlmCounters {
     pub last_emit_step: u32,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 impl TlmCounters {
     pub const fn new() -> Self {
         Self { bytes_in: 0, bytes_out: 0, idle_steps: 0, bp_steps: 0, last_emit_step: 0 }
+    }
+}
+
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+impl Default for TlmCounters {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1591,7 +1626,7 @@ impl TlmCounters {
 /// this, a step that polled a full downstream channel was
 /// double-counted as both back-pressured and idle (idle_steps and
 /// bp_steps each → period_steps for a steady-state stalled module).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 fn tlm_idle_if_unchanged(
     tlm: &mut TlmCounters,
@@ -1615,7 +1650,7 @@ fn tlm_idle_if_unchanged(
 /// monotonic counter (any module that already increments one for
 /// existing periodic logs can reuse it). `scratch` must point to at
 /// least `TLM_LINE_BUF_SIZE` writable bytes.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 unsafe fn dev_tlm_maybe_emit(
     sys: &SyscallTable,
     prefix: &[u8],
@@ -1634,7 +1669,7 @@ unsafe fn dev_tlm_maybe_emit(
     }
 
     let mut pos = 0usize;
-    let mut emit = |bytes: &[u8], pos: &mut usize| {
+    let emit = |bytes: &[u8], pos: &mut usize| {
         let mut i = 0;
         while i < bytes.len() && *pos < scratch_max {
             *scratch.add(*pos) = bytes[i];
@@ -1675,7 +1710,7 @@ unsafe fn dev_tlm_maybe_emit(
 /// `src/platform/bcm2712.rs` `init_page_tables()` (MAIR attr2 = 0x44).
 ///
 /// Bump-only for v1 — there is no matching `dev_dma_free`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     let mut buf = [0u8; 16];
@@ -1713,7 +1748,7 @@ unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
 /// Streaming buffers must be paired with explicit cache maintenance at
 /// handoff — see `dev_dma_flush` (before device-reads) and
 /// `dev_dma_invalidate` (before CPU-reads of device-written regions).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     let mut buf = [0u8; 16];
@@ -1747,7 +1782,7 @@ unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> 
 /// Clean a VA range from the data cache (`dc cvac` + `dsb sy`). Call
 /// after writing into a streaming DMA buffer and before handing it to
 /// a device that will read it — ensures the device sees the CPU's writes.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     let mut buf = [0u8; 12];
@@ -1773,7 +1808,7 @@ unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
 /// Call before reading from a streaming DMA buffer that a device has
 /// just written — drops any stale CPU cache lines so the next load
 /// returns the device-written data.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     let mut buf = [0u8; 12];
@@ -1802,7 +1837,7 @@ unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
 /// resolve to exactly one device. Returns the device handle on
 /// success; on EAGAIN/ENODEV the caller should retry (the PCIe link
 /// may still be training).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie_device_open(sys: &SyscallTable, selector: &[u8]) -> i32 {
     (sys.provider_open)(
@@ -1815,7 +1850,7 @@ unsafe fn dev_pcie_device_open(sys: &SyscallTable, selector: &[u8]) -> i32 {
 
 /// PCIE_DEVICE contract: read 32-bit config-space word for the bound
 /// handle. Returns 0xFFFFFFFF on any failure (matches real-PCIe sentinel).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie_device_cfg_read32(sys: &SyscallTable, handle: i32, offset: u16) -> u32 {
     let mut buf = [0u8; 8];
@@ -1837,7 +1872,7 @@ unsafe fn dev_pcie_device_cfg_read32(sys: &SyscallTable, handle: i32, offset: u1
 
 /// PCIE_DEVICE contract: write 32-bit config-space word for the bound
 /// handle. Returns 0 on success, negative errno otherwise.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie_device_cfg_write32(sys: &SyscallTable, handle: i32, offset: u16, val: u32) -> i32 {
     let mut buf = [0u8; 8];
@@ -1848,7 +1883,9 @@ unsafe fn dev_pcie_device_cfg_write32(sys: &SyscallTable, handle: i32, offset: u
     *bp.add(2) = 0;
     *bp.add(3) = 0;
     let vb = val.to_le_bytes();
-    for i in 0..4 { *bp.add(4 + i) = vb[i]; }
+    for (i, b) in vb.iter().enumerate() {
+        *bp.add(4 + i) = *b;
+    }
     (sys.provider_call)(
         handle,
         abi::platform::bcm2712::pcie_device::CFG_WRITE32,
@@ -1859,7 +1896,7 @@ unsafe fn dev_pcie_device_cfg_write32(sys: &SyscallTable, handle: i32, offset: u
 
 /// PCIE_DEVICE contract: map BAR `bar_idx` for the bound handle,
 /// returning the kernel-visible virt address (or 0 on failure).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie_device_bar_map(sys: &SyscallTable, handle: i32, bar_idx: u8) -> u64 {
     let mut buf = [0u8; 10];
@@ -1883,7 +1920,7 @@ unsafe fn dev_pcie_device_bar_map(sys: &SyscallTable, handle: i32, bar_idx: u8) 
 /// device's root complex, routing fires to `event_handle`. The
 /// kernel brings up the MSI controller lazily on first call.
 /// Returns `Some((vector_idx, target_addr, data))` on success.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie_device_msi_alloc(
     sys: &SyscallTable,
@@ -1893,7 +1930,9 @@ unsafe fn dev_pcie_device_msi_alloc(
     let mut buf = [0u8; 20];
     let bp = buf.as_mut_ptr();
     let eb = event_handle.to_le_bytes();
-    for i in 0..4 { *bp.add(i) = eb[i]; }
+    for (i, b) in eb.iter().enumerate() {
+        *bp.add(i) = *b;
+    }
     let rc = (sys.provider_call)(
         handle,
         abi::platform::bcm2712::pcie_device::MSI_ALLOC,
@@ -1918,7 +1957,7 @@ unsafe fn dev_pcie_device_msi_alloc(
 /// `offset` is the byte offset within config space, 4-byte aligned
 /// (low 2 bits ignored). Returns 0xFFFFFFFF when the device index
 /// is out of range or the target function did not respond.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u32 {
     let mut buf = [0u8; 8];
@@ -1937,7 +1976,7 @@ unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u
 
 /// Write a 32-bit value into a discovered device's PCI configuration
 /// space. Returns 0 on success, negative errno on failure.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val: u32) -> i32 {
     let mut buf = [0u8; 8];
@@ -1957,7 +1996,7 @@ unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val
 
 /// Initialise the brcmstb PCIe1 MSI controller behind GIC SPI
 /// `spi_irq`. Idempotent. Returns 0 on success, negative errno otherwise.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie1_msi_init(sys: &SyscallTable, spi_irq: u32) -> i32 {
     let mut buf = spi_irq.to_le_bytes();
@@ -1972,7 +2011,7 @@ unsafe fn dev_pcie1_msi_init(sys: &SyscallTable, spi_irq: u32) -> i32 {
 /// Allocate an MSI vector for `event_handle` and retrieve the
 /// (target_addr, data) the caller writes into its MSI-X table entry.
 /// Returns `Some((vector, target_addr, data))` on success.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_pcie1_msi_alloc_vector(
     sys: &SyscallTable,
@@ -2016,7 +2055,7 @@ unsafe fn dev_pcie1_msi_alloc_vector(
 /// loaded and have registered its `backing_provider_dispatch` via
 /// `BACKING_PROVIDER_ENABLE` — otherwise later read/write calls
 /// return ENODEV.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_backing_arena_register(
     sys: &SyscallTable,
@@ -2044,7 +2083,7 @@ unsafe fn dev_backing_arena_register(
 
 /// Write one 4 KB page from `buf` to a registered backing arena.
 /// `buf` must point to at least 4096 bytes of readable memory.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_backing_arena_write(
     sys: &SyscallTable,
@@ -2075,7 +2114,7 @@ unsafe fn dev_backing_arena_write(
 
 /// Read one 4 KB page from a registered backing arena into `buf`.
 /// `buf` must point to at least 4096 bytes of writable memory.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_backing_arena_read(
     sys: &SyscallTable,
@@ -2105,7 +2144,7 @@ unsafe fn dev_backing_arena_read(
 }
 
 /// Flush any pending writes for a backing arena.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
     let mut a = [arena_id];
@@ -2117,7 +2156,7 @@ unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
 /// Drivers that support multi-block transfers (NVMe with PRP-lists)
 /// translate this to a single device command — far higher sustained
 /// throughput than per-page writes.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_backing_arena_write_pages(
     sys: &SyscallTable,
@@ -2131,7 +2170,7 @@ unsafe fn dev_backing_arena_write_pages(
 
 /// Read `count` contiguous 4 KB pages from a registered backing arena
 /// into `buf`. `buf` must point to `count * 4096` writable bytes.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_backing_arena_read_pages(
     sys: &SyscallTable,
@@ -2177,7 +2216,7 @@ unsafe fn dev_backing_arena_bulk(
 /// `value`: pointer to raw value bytes.
 /// `len`: value byte count (max 250).
 /// Returns 0 on success, negative errno on error.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_param_store(sys: &SyscallTable, tag: u8, value: *const u8, len: usize) -> i32 {
     let mut buf = [0u8; 252]; // 1 tag + 250 max value + 1 spare
@@ -2198,7 +2237,7 @@ unsafe fn dev_param_store(sys: &SyscallTable, tag: u8, value: *const u8, len: us
 }
 
 /// Store a u8 parameter override.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_param_store_u8(sys: &SyscallTable, tag: u8, val: u8) -> i32 {
     let mut buf = [tag, val];
@@ -2211,14 +2250,14 @@ unsafe fn dev_param_store_u8(sys: &SyscallTable, tag: u8, val: u8) -> i32 {
 }
 
 /// Store a string parameter override.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_param_store_str(sys: &SyscallTable, tag: u8, s: *const u8, len: usize) -> i32 {
     dev_param_store(sys, tag, s, len)
 }
 
 /// Delete a parameter override (reverts to compiled default on next boot).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_param_delete(sys: &SyscallTable, tag: u8) -> i32 {
     let mut buf = [tag];
@@ -2231,7 +2270,7 @@ unsafe fn dev_param_delete(sys: &SyscallTable, tag: u8) -> i32 {
 }
 
 /// Clear all runtime overrides for this module.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(
@@ -2244,7 +2283,7 @@ unsafe fn dev_param_clear_all(sys: &SyscallTable) -> i32 {
 
 /// Get this module's arena allocation (from module_arena_size export).
 /// Returns (ptr, size). ptr is null and size is 0 if no arena was allocated.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_arena_get(sys: &SyscallTable) -> (*mut u8, u32) {
     let mut buf = [0u8; 4];
@@ -2260,7 +2299,7 @@ unsafe fn dev_arena_get(sys: &SyscallTable) -> (*mut u8, u32) {
 /// Paged arena stats returned by dev_paged_arena_stats.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 struct PagedArenaStats {
     resident: u32,
     faults: u32,
@@ -2273,7 +2312,7 @@ struct PagedArenaStats {
 
 /// Get paged arena base address and size.
 /// Returns (base_ptr, size, status). status=1 if active, 0 if not.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_paged_arena_get(sys: &SyscallTable) -> (*mut u8, usize, u32) {
     let mut buf = [0u8; 20];
@@ -2292,7 +2331,7 @@ unsafe fn dev_paged_arena_get(sys: &SyscallTable) -> (*mut u8, usize, u32) {
 }
 
 /// Get paged arena statistics.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_paged_arena_stats(sys: &SyscallTable) -> PagedArenaStats {
     let mut stats = PagedArenaStats::default();
@@ -2309,7 +2348,7 @@ unsafe fn dev_paged_arena_stats(sys: &SyscallTable) -> PagedArenaStats {
 /// Prefault pages into the paged arena.
 /// `offset`: starting page index, `count`: number of pages to prefault.
 /// Returns number of pages actually prefaulted.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_paged_arena_prefault(sys: &SyscallTable, offset: u32, count: u32) -> u32 {
     let mut buf = [0u8; 8];
@@ -2345,7 +2384,7 @@ unsafe fn dev_paged_arena_prefault(sys: &SyscallTable, offset: u32, count: u32) 
 const MSG_HDR_SIZE: usize = 6;
 
 /// FNV-1a 32-bit hash. Const-evaluable for compile-time message type IDs.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const fn fnv1a(s: &[u8]) -> u32 {
     let mut h: u32 = 0x811c9dc5;
     let mut i = 0;
@@ -2367,7 +2406,7 @@ const fn fnv1a(s: &[u8]) -> u32 {
 /// bytes from another producer. The buffer is sized to
 /// `CHANNEL_BUFFER_SIZE` — messages above that cap cannot fit in the
 /// channel anyway.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn msg_write(
     sys: &SyscallTable,
@@ -2399,7 +2438,7 @@ unsafe fn msg_write(
 }
 
 /// Write a typed message with no payload.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn msg_write_empty(sys: &SyscallTable, chan: i32, msg_type: u32) -> i32 {
     msg_write(sys, chan, msg_type, core::ptr::null(), 0)
@@ -2409,7 +2448,7 @@ unsafe fn msg_write_empty(sys: &SyscallTable, chan: i32, msg_type: u32) -> i32 {
 /// Returns (msg_type, payload_len). (0, 0) if no complete header available.
 /// Payload bytes are written to buf[0..payload_len.min(buf_cap)].
 /// Excess payload bytes (beyond buf_cap) are consumed and discarded.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn msg_read(sys: &SyscallTable, chan: i32, buf: *mut u8, buf_cap: usize) -> (u32, u16) {
     let mut hdr = [0u8; MSG_HDR_SIZE];
@@ -2444,6 +2483,11 @@ unsafe fn msg_read(sys: &SyscallTable, chan: i32, buf: *mut u8, buf_cap: usize) 
 // ============================================================================
 
 /// Read u8 from params blob at `offset`. Returns `default` if out of bounds.
+///
+/// # Safety
+/// `params` must be valid for reads of `len` bytes. The kernel passes the
+/// module's params blob plus its size from the loader; both are checked
+/// against the actual blob length before this function sees them.
 #[inline(always)]
 pub unsafe fn p_u8(params: *const u8, len: usize, offset: usize, default: u8) -> u8 {
     if offset < len {
@@ -2454,6 +2498,11 @@ pub unsafe fn p_u8(params: *const u8, len: usize, offset: usize, default: u8) ->
 }
 
 /// Read little-endian u16 from params blob at `offset`. Returns `default` if out of bounds.
+///
+/// # Safety
+/// `params` must be valid for reads of `len` bytes. The kernel passes the
+/// module's params blob plus its size; both are checked against the actual
+/// blob length before this function sees them.
 #[inline(always)]
 pub unsafe fn p_u16(params: *const u8, len: usize, offset: usize, default: u16) -> u16 {
     if offset + 1 < len {
@@ -2466,6 +2515,11 @@ pub unsafe fn p_u16(params: *const u8, len: usize, offset: usize, default: u16) 
 }
 
 /// Read little-endian u32 from params blob at `offset`. Returns `default` if out of bounds.
+///
+/// # Safety
+/// `params` must be valid for reads of `len` bytes. The kernel passes the
+/// module's params blob plus its size; both are checked against the actual
+/// blob length before this function sees them.
 #[inline(always)]
 pub unsafe fn p_u32(params: *const u8, len: usize, offset: usize, default: u32) -> u32 {
     if offset + 3 < len {
@@ -2498,7 +2552,7 @@ pub unsafe fn p_u32(params: *const u8, len: usize, offset: usize, default: u32) 
 ///
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 pub unsafe fn heap_alloc(sys: &SyscallTable, size: u32) -> *mut u8 {
     (sys.heap_alloc)(size)
@@ -2512,7 +2566,7 @@ pub unsafe fn heap_alloc(sys: &SyscallTable, size: u32) -> *mut u8 {
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
 /// `ptr` must be null or a pointer previously returned by `heap_alloc`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 pub unsafe fn heap_free(sys: &SyscallTable, ptr: *mut u8) {
     (sys.heap_free)(ptr)
@@ -2529,7 +2583,7 @@ pub unsafe fn heap_free(sys: &SyscallTable, ptr: *mut u8) {
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
 /// `ptr` must be null or a pointer previously returned by `heap_alloc`.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 pub unsafe fn heap_realloc(sys: &SyscallTable, ptr: *mut u8, new_size: u32) -> *mut u8 {
     (sys.heap_realloc)(ptr, new_size)
@@ -2554,7 +2608,7 @@ pub unsafe fn heap_realloc(sys: &SyscallTable, ptr: *mut u8, new_size: u32) -> *
 ///
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 pub unsafe fn heap_stats(
     sys: &SyscallTable,
@@ -2592,28 +2646,28 @@ pub unsafe fn heap_stats(
 // ============================================================================
 
 /// Write data to a bridge channel. Returns 0 on success, -EAGAIN if ring full.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_bridge_write(sys: &SyscallTable, bridge_fd: i32, data: *const u8, len: usize) -> i32 {
     (sys.provider_call)(bridge_fd, 0x0CE0, data as *mut u8, len)
 }
 
 /// Read data from a bridge channel. Returns bytes read, -EAGAIN if empty/no new.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_bridge_read(sys: &SyscallTable, bridge_fd: i32, buf: *mut u8, len: usize) -> i32 {
     (sys.provider_call)(bridge_fd, 0x0CE1, buf, len)
 }
 
 /// Poll bridge readiness. Returns 1 if readable, 0 if not.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_bridge_poll(sys: &SyscallTable, bridge_fd: i32) -> i32 {
     (sys.provider_call)(bridge_fd, 0x0CE2, core::ptr::null_mut(), 0)
 }
 
 /// Get bridge info. Returns 12 bytes: [type, from, to, _, drops:u32, seq:u32].
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]
 unsafe fn dev_bridge_info(sys: &SyscallTable, bridge_fd: i32, buf: &mut [u8; 12]) -> i32 {
     (sys.provider_call)(bridge_fd, 0x0CE3, buf.as_mut_ptr(), 12)

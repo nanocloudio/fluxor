@@ -7,6 +7,13 @@
 //! and run at 100-400 KHz, so polling is efficient and simpler.
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -310,7 +317,6 @@ const I2C_WRITE_READ: u32 = 0x0304;
 const I2C_CLAIM: u32 = 0x0305;
 const I2C_RELEASE: u32 = 0x0306;
 
-#[unsafe(no_mangle)]
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn i2c_dispatch(

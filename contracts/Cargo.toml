@@ -17,3 +17,9 @@ serde = ["dep:serde"]
 
 [dependencies]
 serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"], optional = true }
+
+# Public contract crate — pure type definitions. The workspace
+# `unsafe_code = "forbid"` is the right level here; nothing in this
+# crate needs unsafe and we want a compile error if that ever changes.
+[lints]
+workspace = true

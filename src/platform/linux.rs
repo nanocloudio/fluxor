@@ -8,6 +8,16 @@
 //   fluxor-linux --config config.bin --modules modules.bin
 //   fluxor-linux config.yaml                  # (future: auto-generate bins)
 
+#![allow(
+    unsafe_code,
+    reason = "host kernel binary: mmap of PIC .fmod modules and raw syscall plumbing for FD passing"
+)]
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "host-linux kernel binary logs to stdout/stderr as user-visible process output"
+)]
+
 use std::env;
 use std::fs;
 use std::os::unix::io::AsRawFd;
@@ -84,7 +94,7 @@ fn parse_args() -> CliArgs {
                 process::exit(0);
             }
             other => {
-                eprintln!("error: unknown argument: {}", other);
+                eprintln!("error: unknown argument: {other}");
                 process::exit(1);
             }
         }
@@ -118,6 +128,8 @@ include!("linux/linux_alsa_midi.rs");
 
 fn main() {
     // Initialize boot instant for monotonic clock
+    // SAFETY: main runs before any other thread; first write to BOOT_INSTANT
+    // happens-before any reader observes it.
     unsafe {
         BOOT_INSTANT = Some(Instant::now());
     }
@@ -145,6 +157,8 @@ fn main() {
         process::exit(1);
     });
     let modules_len = modules_file.metadata().unwrap().len() as usize;
+    // SAFETY: `mmap` with a valid fd, length, and PRIVATE|EXEC flags — the
+    // kernel returns either a valid mapping or MAP_FAILED (checked below).
     let modules_ptr = unsafe {
         libc::mmap(
             core::ptr::null_mut(),
@@ -184,6 +198,9 @@ fn main() {
     // Length-aware: pass the file's exact byte count for both blobs
     // so the parser rejects any section that would extend past the
     // actual mappings.
+    // SAFETY: `config_data` is a Vec<u8>; `modules_ptr`/`modules_len` come from
+    // the mmap above and cover the full file. `populate_static_state_with_len`
+    // bounds-checks both blobs against the supplied lengths.
     if let Err(msg) = unsafe {
         scheduler::populate_static_state_with_len(
             &config_data,
@@ -191,33 +208,40 @@ fn main() {
             modules_len,
         )
     } {
-        eprintln!("error: {}", msg);
+        eprintln!("error: {msg}");
         process::exit(1);
     }
 
+    // SAFETY: `static_config()` returns a reference into the static config
+    // arena populated by `populate_static_state_with_len` above.
     let cfg_header_tick_us = unsafe { scheduler::static_config().header.tick_us as u32 };
     let tick_us = if cfg_header_tick_us > 0 {
         cfg_header_tick_us
     } else {
         1000
     };
-    log::info!("[loader] module table loaded, tick_us={}", tick_us);
+    log::info!("[loader] module table loaded, tick_us={tick_us}");
 
     let (module_list, module_count) = match scheduler::prepare_graph() {
         Ok(v) => v,
         Err(rc) => {
-            eprintln!("error: prepare_graph failed (rc={})", rc);
+            eprintln!("error: prepare_graph failed (rc={rc})");
             process::exit(1);
         }
     };
-    log::info!("[graph] compiled: {} modules", module_count);
+    log::info!("[graph] compiled: {module_count} modules");
 
     // Instantiate every module in the compiled list. `linux_net` is a
     // hosted built-in with no .fmod entry, so it's constructed directly
     // as a `BuiltInModule`; every other slot — user modules and any
     // kernel-inserted `_tee` / `_merge` — goes through the shared
     // `instantiate_one_module` path.
+    // SAFETY: `static_loader` returns a reference into the static loader
+    // arena populated by `populate_static_state_with_len`.
     let loader_ref = unsafe { scheduler::static_loader() };
+    // SAFETY: single-threaded boot; `sched_mut` exposes the scheduler's
+    // static state during module instantiation, before any worker thread
+    // takes ownership.
     let sched = unsafe { scheduler::sched_mut() };
     let mut loaded_count = 0usize;
 
@@ -235,10 +259,7 @@ fn main() {
             install_state(&mut m, Box::new(LinuxNetState::new(net_in_ch, net_out_ch)));
             scheduler::store_builtin_module(module_idx, m);
             log::info!(
-                "[inst] module {} = linux_net (built-in) net_in={} net_out={}",
-                module_idx,
-                net_in_ch,
-                net_out_ch
+                "[inst] module {module_idx} = linux_net (built-in) net_in={net_in_ch} net_out={net_out_ch}"
             );
             loaded_count += 1;
             continue;
@@ -299,16 +320,19 @@ fn main() {
         );
         match result {
             scheduler::InstantiateResult::Done => {
-                log::info!("[inst] module {} ready", module_idx);
+                log::info!("[inst] module {module_idx} ready");
                 loaded_count += 1;
             }
             scheduler::InstantiateResult::Pending(mut pending) => {
                 let mut loaded = false;
                 for _ in 0..100 {
                     thread::sleep(Duration::from_millis(10));
+                    // SAFETY: `pending` is the scheduler-allocated handle from
+                    // `instantiate_one_module`; `try_complete` polls the loader
+                    // state machine and is the contract-correct call here.
                     match unsafe { pending.try_complete() } {
                         Ok(Some(dm)) => {
-                            log::info!("[inst] module {} ready (pending)", module_idx);
+                            log::info!("[inst] module {module_idx} ready (pending)");
                             scheduler::store_dynamic_module(module_idx, dm);
                             loaded_count += 1;
                             loaded = true;
@@ -316,30 +340,30 @@ fn main() {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            log::error!("[inst] module {} failed: {:?}", module_idx, e);
+                            log::error!("[inst] module {module_idx} failed: {e:?}");
                             loaded = true;
                             break;
                         }
                     }
                 }
                 if !loaded {
-                    log::error!("[inst] module {} timeout", module_idx);
+                    log::error!("[inst] module {module_idx} timeout");
                 }
             }
             scheduler::InstantiateResult::Error(rc) => {
-                log::error!("[inst] module {} error rc={}", module_idx, rc);
+                log::error!("[inst] module {module_idx} error rc={rc}");
             }
         }
     }
 
-    log::info!("[inst] {} of {} modules loaded", loaded_count, module_count);
+    log::info!("[inst] {loaded_count} of {module_count} modules loaded");
     if loaded_count == 0 {
         log::warn!("[sched] no modules loaded, nothing to do");
         process::exit(0);
     }
     scheduler::log_arena_summary();
 
-    log::info!("[sched] starting main loop, tick_us={}", tick_us);
+    log::info!("[sched] starting main loop, tick_us={tick_us}");
     let tick_duration = Duration::from_micros(tick_us as u64);
     let mut tick: u64 = 0;
     // Throttle oversleep warnings to once every ~1 s of expected
@@ -368,6 +392,8 @@ fn main() {
         // Linux loop only handled `Burst` and stepped in raw index order
         // — non-trivially divergent from the reference path.
         //
+        // SAFETY: linux platform is single-threaded; the main loop is the
+        // sole scheduler user after instantiation.
         let sched = unsafe { scheduler::sched_mut() };
         let result = scheduler::step_modules(&mut sched.modules, module_count);
 
@@ -431,6 +457,7 @@ fn main() {
         // step pass, matching RP's two-drain wake path.
         let wake = fluxor::kernel::event::take_wake_pending();
         if wake != 0 {
+            // SAFETY: single-threaded linux main loop — sole scheduler user.
             let sched = unsafe { scheduler::sched_mut() };
             scheduler::step_woken_modules(&mut sched.modules, module_count, wake);
         }

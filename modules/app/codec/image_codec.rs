@@ -152,7 +152,7 @@ pub unsafe fn image_feed_detect(s: &mut ImageState, buf: *const u8, len: usize) 
     s.encoded_used += len as u32;
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 pub unsafe fn image_is_done(s: &ImageState) -> bool {
     matches!(s.phase, Phase::Error)
         || (matches!(s.phase, Phase::Draining) && s.pending_pos >= s.pending_size)

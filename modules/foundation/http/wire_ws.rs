@@ -49,6 +49,10 @@ const MAGIC_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// goes into the server's `Sec-WebSocket-Accept` response header.
 ///
 /// Output is exactly 28 ASCII bytes (no terminator).
+///
+/// # Safety
+/// `key` must be valid for reads of `key_len` bytes. `out` must be
+/// valid for writes of 28 bytes.
 pub unsafe fn compute_accept(key: *const u8, key_len: usize, out: *mut u8) {
     let mut sha = Sha1::new();
     sha.update(key, key_len);

@@ -45,6 +45,18 @@
 //! buffer is held full for a sustained period.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
+#![allow(
+    unsafe_code,
+    reason = "PIC module: ABI shim and zero-copy buffer plumbing"
+)]
+// PIC library code must not panic; surface errors through the ABI.
+#![deny(clippy::unwrap_used)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
 
 use core::ffi::c_void;
 
@@ -108,12 +120,21 @@ pub extern "C" fn module_new(
         return -1;
     }
     let sys = syscalls as *const SyscallTable;
+    // SAFETY: `sys` is non-null (checked at fn entry) and points at the
+    // kernel's syscall table for this module instance.
     let sys_ref = unsafe { &*sys };
+    // SAFETY: `state` was null- and size-checked at fn entry; the kernel
+    // zero-initialised `state_size >= sizeof::<State>()` bytes.
     let s = unsafe { &mut *(state as *mut State) };
     s.syscalls = sys;
+    // SAFETY: `dev_channel_port` is a syscall-table wrapper; `sys_ref`
+    // outlives the call and `(port_kind, port_index)` is a valid pair.
     s.tx_in = unsafe { dev_channel_port(sys_ref, 0, 0) };
+    // SAFETY: as above; in/out parity covers all four ports.
     s.rx_in = unsafe { dev_channel_port(sys_ref, 0, 1) };
+    // SAFETY: as above.
     s.tx_out = unsafe { dev_channel_port(sys_ref, 1, 0) };
+    // SAFETY: as above.
     s.rx_out = unsafe { dev_channel_port(sys_ref, 1, 1) };
     // `u32::MAX` is the "unclaimed" sentinel: stamped on outbound
     // envelopes when no inbound frame has arrived yet. The HTTP
@@ -150,26 +171,37 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if state.is_null() {
         return -1;
     }
+    // SAFETY: `state` non-null (checked above); `module_new` initialised
+    // it as `State`. Scheduler serialises module_step so re-borrow unique.
     let s = unsafe { &mut *(state as *mut State) };
     if s.syscalls.is_null() {
         return -1;
     }
+    // SAFETY: `s.syscalls` non-null (checked above); the kernel-owned
+    // table outlives this step.
     let sys = unsafe { &*s.syscalls };
 
     // ── Inbound: rx_in (WsFrame) → rx_out (OctetStream) ──
     if s.rx_in >= 0 && s.rx_out >= 0 {
         // Drain the pending retry buffer first.
         if s.rx_pending_len > 0 {
+            // SAFETY: `channel_write` is a syscall taking (chan, *const u8,
+            // len); `s.rx_pending_len <= s.rx_pending.len()` by invariant.
             let written =
                 unsafe { (sys.channel_write)(s.rx_out, s.rx_pending.as_ptr(), s.rx_pending_len) };
             if written > 0 {
                 let w = (written as usize).min(s.rx_pending_len);
+                // SAFETY: `shift_consume` is unsafe over a raw pointer + len;
+                // `s.rx_pending` is owned by `s` so the pointer is valid for
+                // the whole buffer length.
                 s.rx_pending_len =
                     unsafe { shift_consume(s.rx_pending.as_mut_ptr(), s.rx_pending_len, w) };
             }
         }
         // Pull new frames only when retry buffer drained.
         while s.rx_pending_len == 0 {
+            // SAFETY: `channel_read` takes (chan, *mut u8, max_len); the
+            // scratch buffer is owned by `s` and sized to its array length.
             let n = unsafe { (sys.channel_read)(s.rx_in, s.scratch.as_mut_ptr(), s.scratch.len()) };
             if n < WS_FRAME_HDR as i32 {
                 break;
@@ -190,6 +222,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 continue;
             }
             // Try to write directly first.
+            // SAFETY: `WS_FRAME_HDR + payload_len <= n <= s.scratch.len()`
+            // checked above; pointer offset stays in-bounds.
             let written = unsafe {
                 (sys.channel_write)(s.rx_out, s.scratch.as_ptr().add(WS_FRAME_HDR), payload_len)
             };
@@ -208,6 +242,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let tail = payload_len - w;
                 let cap = s.rx_pending.len();
                 let take = tail.min(cap);
+                // SAFETY: `take <= cap` and `WS_FRAME_HDR + w + take <= n`
+                // (since `take <= tail = payload_len - w` and `WS_FRAME_HDR
+                // + payload_len <= n`); src/dst are disjoint buffers in `s`.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         s.scratch.as_ptr().add(WS_FRAME_HDR + w),
@@ -233,10 +270,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     if s.tx_in >= 0 && s.tx_out >= 0 {
         // Drain the pending framed message first.
         if s.tx_pending_len > 0 {
+            // SAFETY: `channel_write` over `s.tx_pending[..tx_pending_len]`;
+            // length is an invariant of the retry buffer.
             let written =
                 unsafe { (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), s.tx_pending_len) };
             if written > 0 {
                 let w = (written as usize).min(s.tx_pending_len);
+                // SAFETY: `shift_consume` over an owned buffer pointer; `w`
+                // is the just-confirmed write count.
                 s.tx_pending_len =
                     unsafe { shift_consume(s.tx_pending.as_mut_ptr(), s.tx_pending_len, w) };
             }
@@ -252,6 +293,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // couldn't atomically queue the full envelope.
         let max_payload = (FRAME_BUF_BYTES - WS_FRAME_HDR).min(4096);
         while s.tx_pending_len == 0 {
+            // SAFETY: `WS_FRAME_HDR + max_payload <= FRAME_BUF_BYTES`
+            // (max_payload = `(FRAME_BUF_BYTES - WS_FRAME_HDR).min(4096)`);
+            // pointer offset stays inside `s.tx_pending`.
             let n = unsafe {
                 (sys.channel_read)(
                     s.tx_in,
@@ -275,6 +319,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.tx_pending[7] = plen_le[1];
             let total = WS_FRAME_HDR + payload_len;
             // Try direct write first.
+            // SAFETY: `total = WS_FRAME_HDR + payload_len`; `payload_len`
+            // was just written into `tx_pending` by the channel_read above.
             let written = unsafe { (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), total) };
             if written < 0 {
                 // tx_out back-pressured. Stash the whole frame and
@@ -286,6 +332,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let w = (written as usize).min(total);
             if w < total {
                 // Hold tail; tx_pending_len remembers what's left.
+                // SAFETY: `shift_consume` over owned buffer; `total` is the
+                // exact pending byte count.
                 s.tx_pending_len = unsafe { shift_consume(s.tx_pending.as_mut_ptr(), total, w) };
                 break;
             }

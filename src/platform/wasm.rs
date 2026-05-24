@@ -9,7 +9,10 @@
 //! See `docs/architecture/wasm_platform.md` for the platform contract
 //! and the per-host docs for what the shim looks like.
 
-#![allow(unused_unsafe)]
+#![allow(
+    unused_unsafe,
+    reason = "explicit unsafe block kept for SAFETY documentation; compiler may elide the requirement"
+)]
 
 use crate::kernel::{channel, scheduler};
 
@@ -135,7 +138,10 @@ extern "C" {
 
     /// Terminal panic. Hosts should surface the message and stop
     /// driving `kernel_step`.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     fn host_panic(ptr: *const u8, len: usize) -> !;
 
     /// Instantiate a WASM module from `bytes_ptr[..bytes_len]`.
@@ -184,7 +190,10 @@ extern "C" {
     /// Free the module instance identified by `handle`. Subsequent
     /// `host_invoke_module` calls with the same handle return an
     /// error.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     fn host_destroy_module(handle: i32) -> i32;
 }
 
@@ -217,10 +226,10 @@ const MINIMAL_WASM_ANSWER: &[u8] = &[
 struct WasmLogger;
 
 impl log::Log for WasmLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
         true
     }
-    fn log(&self, record: &log::Record) {
+    fn log(&self, record: &log::Record<'_>) {
         let level = match record.level() {
             log::Level::Error => 4u32,
             log::Level::Warn => 3,
@@ -251,6 +260,8 @@ impl log::Log for WasmLogger {
         };
         let _ = core::fmt::write(&mut sink, *record.args());
         let pos = sink.pos;
+        // SAFETY: `host_log` is a wasm import; we pass `buf.as_ptr()` and
+        // the byte length `pos` of the formatted message in the local buffer.
         unsafe {
             host_log(level, buf.as_ptr(), pos);
         }
@@ -288,6 +299,8 @@ fn init_tick_demo() {
     sink.state[0..4].copy_from_slice(&(chan as i32).to_le_bytes());
     scheduler::store_builtin_module(1, sink);
 
+    // SAFETY: MODULE_COUNT mutated once at boot under single-threaded
+    // wasm runtime; init_tick_demo is the only writer in this path.
     unsafe {
         MODULE_COUNT = 2;
     }
@@ -315,8 +328,7 @@ const WASM_BROWSER_WS_SOURCE_HASH: u32 = fnv1a32(b"wasm_browser_ws_source");
 const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
 const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
-const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 =
-    fnv1a32(b"wasm_browser_touch_gamepad_overlay");
+const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 = fnv1a32(b"wasm_browser_touch_gamepad_overlay");
 // MIDI built-ins — STUB. See `wasm/midi.rs` for the unimplemented
 // state. Registered here so configs that reference the modules
 // load cleanly instead of failing at the runtime dispatch step.
@@ -478,46 +490,76 @@ unsafe fn load_embedded_modules() -> usize {
         // output port (port idx 0 — input modules are sources).
         if entry.name_hash == WASM_BROWSER_KEYBOARD_HASH {
             if !init_builtin_heap::<keyboard::KeyboardState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_keyboard: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_keyboard: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
             let out_chan = scheduler::get_module_port(module_idx, 1, 0);
             let m = keyboard::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
-            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_keyboard (built-in)", 0);
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_keyboard (built-in)",
+                0,
+            );
             continue;
         }
 
         if entry.name_hash == WASM_BROWSER_POINTER_HASH {
             if !init_builtin_heap::<pointer::PointerState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_pointer: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_pointer: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
             let out_chan = scheduler::get_module_port(module_idx, 1, 0);
             let m = pointer::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
-            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_pointer (built-in)", 0);
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_pointer (built-in)",
+                0,
+            );
             continue;
         }
 
         if entry.name_hash == WASM_BROWSER_GAMEPAD_HASH {
             if !init_builtin_heap::<gamepad::GamepadState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_gamepad: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_gamepad: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
             let out_chan = scheduler::get_module_port(module_idx, 1, 0);
             let m = gamepad::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
-            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_gamepad (built-in)", 0);
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_gamepad (built-in)",
+                0,
+            );
             continue;
         }
 
@@ -527,16 +569,26 @@ unsafe fn load_embedded_modules() -> usize {
         // same downstream `gesture` chain.
         if entry.name_hash == WASM_BROWSER_BUTTON_HASH {
             if !init_builtin_heap::<button::ButtonState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_button: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_button: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
             let out_chan = scheduler::get_module_port(module_idx, 1, 0);
             let m = button::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
-            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_button (built-in)", 0);
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_button (built-in)",
+                0,
+            );
             continue;
         }
 
@@ -545,22 +597,37 @@ unsafe fn load_embedded_modules() -> usize {
         // channel every step so wired producers don't backpressure.
         if entry.name_hash == WASM_BROWSER_MIDI_IN_HASH {
             if !init_builtin_heap::<midi::MidiInState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_midi_in: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_midi_in: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
             let m = midi::build_in();
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
-            log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_midi_in (built-in, STUB - Web MIDI not yet implemented)", 0);
+            log_fmt2(
+                3,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_midi_in (built-in, STUB - Web MIDI not yet implemented)",
+                0,
+            );
             continue;
         }
 
         if entry.name_hash == WASM_BROWSER_MIDI_OUT_HASH {
             if !init_builtin_heap::<midi::MidiOutState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_midi_out: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_midi_out: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
             let events_in = scheduler::get_module_port(module_idx, 0, 0);
@@ -753,15 +820,25 @@ unsafe fn load_embedded_modules() -> usize {
         // opcode same as `log_net` on embedded.
         if entry.name_hash == WASM_BROWSER_TERMINAL_HASH {
             if !init_builtin_heap::<terminal::TerminalState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_terminal: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_terminal: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
             let m = terminal::build();
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
-            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_terminal (built-in)", 0);
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_terminal (built-in)",
+                0,
+            );
             continue;
         }
 
@@ -772,17 +849,27 @@ unsafe fn load_embedded_modules() -> usize {
         // against — see `touch_gamepad_overlay::REGIONS`.
         if entry.name_hash == WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH {
             if !init_builtin_heap::<touch_gamepad_overlay::OverlayState>(module_idx) {
-                log_fmt2(3, "[wasm-kernel] module ", module_idx as u64,
-                    " = wasm_browser_touch_gamepad_overlay: STATE_ARENA full, skipping", 0);
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_touch_gamepad_overlay: STATE_ARENA full, skipping",
+                    0,
+                );
                 continue;
             }
-            let in_chan  = scheduler::get_module_port(module_idx, 0, 0);
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
             let out_chan = scheduler::get_module_port(module_idx, 1, 0);
             let m = touch_gamepad_overlay::build(in_chan, out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
-            log_fmt2(2, "[wasm-kernel] module ", module_idx as u64,
-                " = wasm_browser_touch_gamepad_overlay (built-in)", 0);
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_touch_gamepad_overlay (built-in)",
+                0,
+            );
             continue;
         }
 
@@ -980,6 +1067,9 @@ unsafe fn load_embedded_modules() -> usize {
         // pull it via `MODULE_INSTANCE_PARAMS` instead. The blob
         // borrows from the `'static` embedded-modules section.
         let params_slice = entry.params();
+        // SAFETY: `params_slice` borrows from the 'static embedded-modules
+        // section; `set_module_params` records the pointer + length for the
+        // module's first init call.
         unsafe {
             scheduler::set_module_params(module_idx, params_slice.as_ptr(), params_slice.len());
         }
@@ -1079,6 +1169,10 @@ unsafe fn load_embedded_modules() -> usize {
 /// dispatches into the module's existing `module_step(state_ptr)`
 /// using its internal static state buffer.
 fn wasm_module_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer; the first
+    // 4 bytes hold the host module handle written in load_embedded_modules.
+    // `host_invoke_module` is a wasm import; we pass it the handle plus a
+    // small local return buffer.
     unsafe {
         let handle = core::ptr::read_unaligned(state as *const i32);
         if handle < 0 {
@@ -1132,12 +1226,15 @@ pub extern "C" fn kernel_init() -> i32 {
     // bundled modules), in which case we fall back to the in-kernel
     // tick demo so the smoke artifact still exercises scheduler
     // dispatch and channel IPC.
+    // SAFETY: walks the 'static embedded-modules section. Single-threaded
+    // wasm boot; runs once at init.
     let module_count = unsafe { load_embedded_modules() };
 
     if module_count == 0 {
         log_str(2, b"[wasm-kernel] no bundled modules; running tick demo");
         init_tick_demo();
     } else {
+        // SAFETY: MODULE_COUNT mutated once at boot, single-threaded wasm.
         unsafe {
             MODULE_COUNT = module_count;
         }
@@ -1156,6 +1253,9 @@ pub extern "C" fn kernel_init() -> i32 {
     // `answer() -> i32 = 42`. Verifies the host's WASM-specific
     // import surface (`wasm_platform.md` §6) for an imports-free
     // module independent of the bundled-module path.
+    // SAFETY: host_instantiate_module / host_invoke_module are wasm
+    // imports; we pass static byte arrays for the module body and
+    // export name, and a small local ret_buf.
     unsafe {
         let handle = host_instantiate_module(
             MINIMAL_WASM_ANSWER.as_ptr(),
@@ -1219,7 +1319,10 @@ pub extern "C" fn kernel_init() -> i32 {
 ///
 #[no_mangle]
 pub extern "C" fn kernel_step() -> u32 {
+    // SAFETY: MODULE_COUNT and the scheduler globals are accessed from
+    // the single-threaded wasm runtime.
     let count = unsafe { MODULE_COUNT };
+    // SAFETY: as above.
     let sched = unsafe { scheduler::sched_mut() };
     let _ = scheduler::step_modules(&mut sched.modules, count);
     // Heartbeat opt-out on wasm: the browser tab is a single-step
@@ -1233,6 +1336,7 @@ pub extern "C" fn kernel_step() -> u32 {
 /// Number of modules currently registered with the scheduler.
 #[no_mangle]
 pub extern "C" fn kernel_module_count() -> u32 {
+    // SAFETY: MODULE_COUNT single-threaded wasm global.
     unsafe { MODULE_COUNT as u32 }
 }
 
@@ -1331,6 +1435,8 @@ pub extern "C" fn kernel_modules_blob_offset() -> u32 {
 /// Returns 0 for an unbundled kernel (bare `firmware.wasm`).
 #[no_mangle]
 pub extern "C" fn kernel_modules_blob_len() -> u32 {
+    // SAFETY: EMBEDDED_MODULES_BLOB.used_len is a `u32` field in a 'static
+    // placeholder rewritten in-place by the bundle tool; volatile read.
     unsafe { core::ptr::read_volatile(&EMBEDDED_MODULES_BLOB.used_len) }
 }
 
@@ -1349,6 +1455,8 @@ pub extern "C" fn kernel_config_blob_offset() -> u32 {
 /// Number of bytes the bundle tool wrote into the config blob.
 #[no_mangle]
 pub extern "C" fn kernel_config_blob_len() -> u32 {
+    // SAFETY: EMBEDDED_CONFIG_BLOB.used_len is a `u32` field in a 'static
+    // placeholder rewritten in-place by the bundle tool; volatile read.
     unsafe { core::ptr::read_volatile(&EMBEDDED_CONFIG_BLOB.used_len) }
 }
 
@@ -1368,6 +1476,8 @@ pub extern "C" fn kernel_config_blob_capacity() -> u32 {
 const REPORT_INTERVAL: u32 = 60;
 
 fn tick_source_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the BuiltInModule's 64-byte state buffer; we read
+    // the channel handle from [0..4] and the tick counter from [4..8].
     unsafe {
         let chan = core::ptr::read_unaligned(state as *const i32);
         let counter_ptr = state.add(4) as *mut u32;
@@ -1384,6 +1494,8 @@ fn tick_source_step(state: *mut u8) -> i32 {
 }
 
 fn tick_sink_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the BuiltInModule's 64-byte state buffer; we read
+    // the channel handle from [0..4], counter from [4..8], timestamp from [8..16].
     unsafe {
         let chan = core::ptr::read_unaligned(state as *const i32);
         let counter_ptr = state.add(4) as *mut u32;
@@ -1428,8 +1540,9 @@ fn tick_sink_step(state: *mut u8) -> i32 {
 
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     let msg = b"[wasm-kernel] panic";
+    // SAFETY: wasm imports; we pass a static byte array and its length.
     unsafe {
         host_log(4, msg.as_ptr(), msg.len());
         host_panic(msg.as_ptr(), msg.len())
@@ -1439,6 +1552,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn log_str(level: u32, msg: &[u8]) {
+    // SAFETY: wasm import; pass the message pointer + length.
     unsafe {
         host_log(level, msg.as_ptr(), msg.len());
     }
@@ -1451,6 +1565,7 @@ fn log_fmt2(level: u32, label_a: &str, value_a: u64, label_b: &str, value_b: u64
     pos = append_u64(&mut buf, pos, value_a);
     pos = append_str(&mut buf, pos, label_b.as_bytes());
     pos = append_u64(&mut buf, pos, value_b);
+    // SAFETY: wasm import; pass the formatted buffer pointer + populated length.
     unsafe {
         host_log(level, buf.as_ptr(), pos);
     }
@@ -1473,6 +1588,7 @@ fn log_fmt3(
     pos = append_u64(&mut buf, pos, value_b);
     pos = append_str(&mut buf, pos, label_c.as_bytes());
     pos = append_u64(&mut buf, pos, value_c);
+    // SAFETY: wasm import; pass the formatted buffer pointer + populated length.
     unsafe {
         host_log(level, buf.as_ptr(), pos);
     }
@@ -1548,7 +1664,10 @@ fn append_u64(buf: &mut [u8], mut pos: usize, value: u64) -> usize {
 
 /// Channel read. The bridge supplies a kernel-memory `buf`; if data
 /// is read, the bridge copies it back into the child's memory after.
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
     let table = crate::kernel::syscalls::get_syscall_table();
@@ -1557,14 +1676,20 @@ pub unsafe extern "C" fn channel_read(handle: i32, buf: *mut u8, len: usize) -> 
 
 /// Channel write. Bridge has copied the child's payload into a kernel
 /// scratch at `data` before calling.
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     let table = crate::kernel::syscalls::get_syscall_table();
     (table.channel_write)(handle, data, len)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn channel_poll(handle: i32, events: u32) -> i32 {
     let table = crate::kernel::syscalls::get_syscall_table();
@@ -1573,7 +1698,10 @@ pub unsafe extern "C" fn channel_poll(handle: i32, events: u32) -> i32 {
 
 /// Channel peek. Bridge supplies a kernel-memory `buf`; the bridge
 /// copies bytes back into the child's memory if peek succeeded.
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
     let table = crate::kernel::syscalls::get_syscall_table();
@@ -1584,28 +1712,40 @@ pub unsafe extern "C" fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> 
 /// has its own arena; the kernel's scheduler tracks which module is
 /// the current caller via `set_current_module` (called by the bridge
 /// before each syscall) and routes `heap_alloc` to that arena.
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn heap_alloc(size: u32) -> *mut u8 {
     let table = crate::kernel::syscalls::get_syscall_table();
     (table.heap_alloc)(size)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn heap_free(ptr: *mut u8) {
     let table = crate::kernel::syscalls::get_syscall_table();
     (table.heap_free)(ptr)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u8 {
     let table = crate::kernel::syscalls::get_syscall_table();
     (table.heap_realloc)(ptr, new_size)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn provider_open(
     contract: u32,
@@ -1617,14 +1757,20 @@ pub unsafe extern "C" fn provider_open(
     (table.provider_open)(contract, open_op, config, config_len)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     let table = crate::kernel::syscalls::get_syscall_table();
     (table.provider_call)(handle, op, arg, arg_len)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn provider_query(
     handle: i32,
@@ -1636,7 +1782,10 @@ pub unsafe extern "C" fn provider_query(
     (table.provider_query)(handle, key, out, out_len)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn provider_close(handle: i32) -> i32 {
     let table = crate::kernel::syscalls::get_syscall_table();
@@ -1647,14 +1796,20 @@ pub unsafe extern "C" fn provider_close(handle: i32) -> i32 {
 /// a buffer in the kernel's linear memory for cross-boundary copies
 /// (child memory → kernel memory on syscall entry; kernel → child on
 /// output return). Returns a pointer in the kernel's memory.
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn kernel_heap_alloc(size: u32) -> *mut u8 {
     let table = crate::kernel::syscalls::get_syscall_table();
     (table.heap_alloc)(size)
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(
+    clippy::missing_safety_doc,
+    reason = "low-level platform shim; safety contract documented at call site"
+)]
 #[no_mangle]
 pub unsafe extern "C" fn kernel_heap_free(ptr: *mut u8) {
     let table = crate::kernel::syscalls::get_syscall_table();

@@ -18,7 +18,10 @@ pub(crate) struct UniqueTmpDir {
 }
 
 impl UniqueTmpDir {
-    #[allow(dead_code)] // not every consumer goes through this accessor
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )] // not every consumer goes through this accessor
     pub fn path(&self) -> &Path {
         self.inner.path()
     }

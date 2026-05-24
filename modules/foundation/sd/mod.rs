@@ -32,6 +32,13 @@
 //! - All syscalls through function pointer table
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 use core::ptr;
@@ -1579,20 +1586,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let tag = b"[sd] E";
                     let mut p = 0usize;
                     let mut t = 0usize;
-                    while t < tag.len() { unsafe { *lb.as_mut_ptr().add(p) = *tag.as_ptr().add(t); } p += 1; t += 1; }
+                    while t < tag.len() { *lb.as_mut_ptr().add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
                     // Error code (negate to get positive)
                     let ecode = (0i32.wrapping_sub(res)) as u32;
-                    p += unsafe { fmt_u32_raw(lb.as_mut_ptr().add(p), ecode) };
+                    p += fmt_u32_raw(lb.as_mut_ptr().add(p), ecode);
                     let at = b" @";
-                    t = 0; while t < at.len() { unsafe { *lb.as_mut_ptr().add(p) = *at.as_ptr().add(t); } p += 1; t += 1; }
-                    p += unsafe { fmt_u32_raw(lb.as_mut_ptr().add(p), s.current_block) };
+                    t = 0; while t < at.len() { *lb.as_mut_ptr().add(p) = *at.as_ptr().add(t); p += 1; t += 1; }
+                    p += fmt_u32_raw(lb.as_mut_ptr().add(p), s.current_block);
                     if res == -6 {
                         // Also log R1 response byte
                         let r1t = b" R1=";
-                        t = 0; while t < r1t.len() { unsafe { *lb.as_mut_ptr().add(p) = *r1t.as_ptr().add(t); } p += 1; t += 1; }
-                        p += unsafe { fmt_u32_raw(lb.as_mut_ptr().add(p), s.rb_attempts as u32) };
+                        t = 0; while t < r1t.len() { *lb.as_mut_ptr().add(p) = *r1t.as_ptr().add(t); p += 1; t += 1; }
+                        p += fmt_u32_raw(lb.as_mut_ptr().add(p), s.rb_attempts as u32);
                     }
-                    unsafe { dev_log(s.sys(), 3, lb.as_ptr(), p); }
+                    dev_log(s.sys(), 3, lb.as_ptr(), p);
                     return E_READ_FAILED;
                 }
                 if res > 0 {

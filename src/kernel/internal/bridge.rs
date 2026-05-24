@@ -139,6 +139,9 @@ impl SnapshotBridge {
         } else {
             &self.buf1.data as *const [u8; MAX_BRIDGE_DATA] as *mut u8
         };
+        // SAFETY: `dst` points at the inactive buffer's `MAX_BRIDGE_DATA`
+        // byte array; `len = min(src.len(), self.data_size) <= MAX_BRIDGE_DATA`
+        // so the volatile writes stay in-bounds.
         unsafe {
             for (i, &b) in src.iter().take(len).enumerate() {
                 core::ptr::write_volatile(dst.add(i), b);
@@ -165,6 +168,8 @@ impl SnapshotBridge {
         } else {
             &self.buf1.data as *const [u8; MAX_BRIDGE_DATA] as *const u8
         };
+        // SAFETY: `src` points at the active buffer's `MAX_BRIDGE_DATA`
+        // byte array; `len = min(dst.len(), data_size) <= MAX_BRIDGE_DATA`.
         unsafe {
             for (i, slot) in dst.iter_mut().take(len).enumerate() {
                 *slot = core::ptr::read_volatile(src.add(i));
@@ -260,6 +265,9 @@ impl RingBridge {
         let len = if src.len() < sz { src.len() } else { sz };
 
         let dst = &self.data as *const [u8; RING_CAPACITY * MAX_BRIDGE_DATA] as *mut u8;
+        // SAFETY: `offset + sz <= RING_CAPACITY * MAX_BRIDGE_DATA` because
+        // `idx < RING_CAPACITY` and `sz <= MAX_BRIDGE_DATA`; both inner loops
+        // bound i ≤ sz, so volatile writes stay inside the ring storage.
         unsafe {
             for (i, &b) in src.iter().take(len).enumerate() {
                 core::ptr::write_volatile(dst.add(offset + i), b);
@@ -291,6 +299,8 @@ impl RingBridge {
         let len = if dst.len() < sz { dst.len() } else { sz };
 
         let src = &self.data as *const [u8; RING_CAPACITY * MAX_BRIDGE_DATA] as *const u8;
+        // SAFETY: `offset + sz <= RING_CAPACITY * MAX_BRIDGE_DATA`; volatile
+        // reads bounded by `len <= sz`.
         unsafe {
             for (i, slot) in dst.iter_mut().take(len).enumerate() {
                 *slot = core::ptr::read_volatile(src.add(offset + i));
@@ -322,6 +332,9 @@ impl RingBridge {
             let idx = (t as usize) & (RING_CAPACITY - 1);
             let src_off = idx * sz;
             let dst_off = n * sz;
+            // SAFETY: `src_off + sz <= RING_CAPACITY * MAX_BRIDGE_DATA`
+            // (idx < RING_CAPACITY, sz <= MAX_BRIDGE_DATA); `dst_off + sz
+            // <= dst.len()` because `count <= dst.len() / sz`.
             unsafe {
                 for i in 0..sz {
                     dst[dst_off + i] = core::ptr::read_volatile(src_base.add(src_off + i));
@@ -415,6 +428,7 @@ impl CommandBridge {
         let len = if src.len() < sz { src.len() } else { sz };
 
         let dst = &self.data.data as *const [u8; MAX_BRIDGE_DATA] as *mut u8;
+        // SAFETY: `len <= MAX_BRIDGE_DATA`; volatile writes stay in the buffer.
         unsafe {
             for (i, &b) in src.iter().take(len).enumerate() {
                 core::ptr::write_volatile(dst.add(i), b);
@@ -440,6 +454,8 @@ impl CommandBridge {
         let len = if dst.len() < sz { dst.len() } else { sz };
 
         let src = &self.data.data as *const [u8; MAX_BRIDGE_DATA] as *const u8;
+        // SAFETY: `src` points at the active buffer's `MAX_BRIDGE_DATA`
+        // byte array; `len = min(dst.len(), data_size) <= MAX_BRIDGE_DATA`.
         unsafe {
             for (i, slot) in dst.iter_mut().take(len).enumerate() {
                 *slot = core::ptr::read_volatile(src.add(i));
@@ -455,6 +471,8 @@ impl CommandBridge {
         let sz = self.data_size as usize;
         let len = if dst.len() < sz { dst.len() } else { sz };
         let src = &self.data.data as *const [u8; MAX_BRIDGE_DATA] as *const u8;
+        // SAFETY: `src` points at the active buffer's `MAX_BRIDGE_DATA`
+        // byte array; `len = min(dst.len(), data_size) <= MAX_BRIDGE_DATA`.
         unsafe {
             for (i, slot) in dst.iter_mut().take(len).enumerate() {
                 *slot = core::ptr::read_volatile(src.add(i));
@@ -504,7 +522,10 @@ pub struct BridgeSlot {
 /// every `BridgeSlot` in the static `BRIDGES` array must hold the maximum
 /// size at rest. `clippy::large_enum_variant` is silenced here for that
 /// reason — boxing isn't an option in this context.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "variant size dictated by external protocol / register layout"
+)]
 enum BridgeInner {
     None,
     Snapshot(SnapshotBridge),
@@ -590,6 +611,8 @@ static mut BRIDGES: [BridgeSlot; MAX_BRIDGES] = [const { BridgeSlot::new() }; MA
 
 /// Allocate a bridge slot. Returns slot index or -1 if full.
 pub fn bridge_alloc() -> i32 {
+    // SAFETY: BRIDGES static is owned by the scheduler-side bridge module;
+    // all alloc/get/reset paths share the scheduler thread.
     unsafe {
         let bridges = &raw const BRIDGES;
         for (i, slot) in (*bridges).iter().enumerate() {
@@ -606,6 +629,7 @@ pub fn bridge_get_mut(idx: usize) -> Option<&'static mut BridgeSlot> {
     if idx >= MAX_BRIDGES {
         return None;
     }
+    // SAFETY: `idx < MAX_BRIDGES` (checked above); scheduler-thread exclusive.
     unsafe {
         if let BridgeType::None = BRIDGES[idx].bridge_type {
             return None;
@@ -619,6 +643,7 @@ pub fn bridge_get(idx: usize) -> Option<&'static BridgeSlot> {
     if idx >= MAX_BRIDGES {
         return None;
     }
+    // SAFETY: `idx < MAX_BRIDGES` (checked above); shared-read access.
     unsafe {
         if let BridgeType::None = BRIDGES[idx].bridge_type {
             return None;
@@ -632,11 +657,13 @@ pub fn bridge_slot_mut(idx: usize) -> Option<&'static mut BridgeSlot> {
     if idx >= MAX_BRIDGES {
         return None;
     }
+    // SAFETY: `idx < MAX_BRIDGES` (checked above); setup-time only call.
     unsafe { Some(&mut BRIDGES[idx]) }
 }
 
 /// Reset all bridge slots.
 pub fn bridge_reset_all() {
+    // SAFETY: called between graph rebuilds when no module observes BRIDGES.
     unsafe {
         let bridges = &raw mut BRIDGES;
         for slot in (*bridges).iter_mut() {
@@ -669,6 +696,8 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
             if arg.is_null() || arg_len == 0 {
                 return crate::kernel::errno::EINVAL;
             }
+            // SAFETY: `arg` non-null + `arg_len > 0` checked above; caller
+            // owns the buffer for the duration of this call.
             let data = unsafe { core::slice::from_raw_parts(arg, arg_len) };
             match &bridge.inner {
                 BridgeInner::Snapshot(b) => {
@@ -694,6 +723,8 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
             if arg.is_null() || arg_len == 0 {
                 return crate::kernel::errno::EINVAL;
             }
+            // SAFETY: `arg` non-null + `arg_len > 0` checked above; caller
+            // owns the buffer for the duration of this call.
             let data = unsafe { core::slice::from_raw_parts_mut(arg, arg_len) };
             match &bridge.inner {
                 BridgeInner::Snapshot(b) => {
@@ -741,6 +772,7 @@ pub fn bridge_dispatch(slot: usize, op: u32, arg: *mut u8, arg_len: usize) -> i3
             if arg.is_null() || arg_len < 12 {
                 return crate::kernel::errno::EINVAL;
             }
+            // SAFETY: `arg_len >= 12` (checked above) so 12-byte slice in-bounds.
             let out = unsafe { core::slice::from_raw_parts_mut(arg, 12) };
             out[0] = bridge.bridge_type as u8;
             out[1] = bridge.from_module;

@@ -20,7 +20,7 @@
 // approximations (no_std, no libm). Pre-computed IQ_TABLE and sine
 // windows are built at codec init in static mut state.
 
-#![allow(dead_code, non_upper_case_globals)]
+#![allow(dead_code, non_upper_case_globals, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it / matches external constant naming")]
 
 use super::abi::SyscallTable;
 use super::{POLL_IN, POLL_OUT, E_AGAIN, drain_pending, __aeabi_memclr, dev_log};
@@ -1431,9 +1431,8 @@ fn decode_aac_frame(payload: *const u8, payload_len: usize, s: &mut AacState) ->
             ID_CPE => {
                             let _tag = br.read_bits(4);
                 let common_window = br.read_bit() != 0;
-                let mut shared_info = IcsInfo::default();
                 if common_window {
-                                    shared_info = read_ics_info(&mut br);
+                                    let shared_info = read_ics_info(&mut br);
                                     ms_mask_present = br.read_bits(2) as u8;
                     if ms_mask_present == 1 {
                         let max_sfb = shared_info.max_sfb as usize;

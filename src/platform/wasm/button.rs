@@ -49,6 +49,9 @@ unsafe fn alloc_state(out_chan: i32) -> *mut ButtonState {
 }
 
 fn button_step(state: *mut u8) -> i32 {
+    // SAFETY: state is the kernel-provided opaque state pointer for
+    // this module instance; we cast it back to the module-private state
+    // type allocated by the new_fn and operate within that allocation.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut ButtonState);
         if st_ptr.is_null() {
@@ -66,8 +69,7 @@ fn button_step(state: *mut u8) -> i32 {
             if n <= 0 {
                 break;
             }
-            let written =
-                channel::channel_write(st.out_chan, st.buf.as_ptr(), n as usize);
+            let written = channel::channel_write(st.out_chan, st.buf.as_ptr(), n as usize);
             if written <= 0 {
                 // Channel full — leave the rest in the host queue
                 // for next tick rather than dropping transitions.

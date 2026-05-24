@@ -4,7 +4,14 @@
 //! from TweetNaCl (public domain); the kernel loader runs the same verify
 //! path against signatures produced here.
 
-#![allow(clippy::needless_range_loop, dead_code)]
+#![expect(
+    clippy::needless_range_loop,
+    reason = "iteration over indices avoids borrow conflicts on the collection"
+)]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 // ============================================================================
 // SHA-512 (FIPS 180-4 §6.4).

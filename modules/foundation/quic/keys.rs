@@ -253,7 +253,7 @@ pub fn quic_decrypt_payload(
 /// the public surface; it isn't called from the live module path so
 /// it gets dead-stripped, but the compiler validates that the API
 /// surface is consistent.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 unsafe fn rfc9001_a1_self_check() -> bool {
     let dcid: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
     let (client, server) = derive_initial_keys(&dcid);
@@ -291,7 +291,7 @@ unsafe fn rfc9001_a1_self_check() -> bool {
         && bytes_eq(&server.hp, &expected_server_hp)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

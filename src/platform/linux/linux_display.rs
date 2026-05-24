@@ -291,7 +291,7 @@ fn render_path_template(template: &str, counter: u32) -> String {
     if let Some(idx) = template.find("%04d") {
         let mut out = String::with_capacity(template.len() + 4);
         out.push_str(&template[..idx]);
-        out.push_str(&format!("{:04}", counter));
+        out.push_str(&format!("{counter:04}"));
         out.push_str(&template[idx + 4..]);
         out
     } else {
@@ -306,7 +306,7 @@ fn write_ppm(path: &str, width: usize, height: usize, rgb565: &[u8]) -> std::io:
         }
     }
     let mut f = std::fs::File::create(path)?;
-    write!(f, "P6\n{} {}\n255\n", width, height)?;
+    write!(f, "P6\n{width} {height}\n255\n")?;
     let mut rgb888 = Vec::with_capacity(width * height * 3);
     for pixel in rgb565.chunks_exact(2) {
         let lo = pixel[0] as u16;
@@ -325,6 +325,7 @@ fn write_ppm(path: &str, width: usize, height: usize, rgb565: &[u8]) -> std::io:
 }
 
 fn linux_display_step(state: *mut u8) -> i32 {
+    // SAFETY: kernel-owned arena sized to `LinuxDisplayState` by the loader.
     let st = unsafe { instance_state::<LinuxDisplayState>(state) };
 
     if st.failed || st.in_chan < 0 {
@@ -332,6 +333,7 @@ fn linux_display_step(state: *mut u8) -> i32 {
     }
 
     let mut buf = [0u8; 4096];
+    // SAFETY: stack buffer of 4096 bytes; `channel_read` writes ≤ `buf.len()`.
     let n = unsafe { channel::channel_read(st.in_chan, buf.as_mut_ptr(), buf.len()) };
     if n <= 0 {
         return 0;
@@ -352,11 +354,11 @@ fn linux_display_step(state: *mut u8) -> i32 {
                 DisplayMode::File => {
                     let path = render_path_template(&st.path_template, st.frame_counter);
                     if let Err(e) = write_ppm(&path, st.width, st.height, &st.scratch) {
-                        log::warn!("[linux_display] write {} failed: {}", path, e);
+                        log::warn!("[linux_display] write {path} failed: {e}");
                         st.failed = true;
                         return 0;
                     } else if st.frame_counter < 4 || st.frame_counter % 60 == 0 {
-                        log::info!("[linux_display] wrote {}", path);
+                        log::info!("[linux_display] wrote {path}");
                     }
                 }
                 DisplayMode::Null => {}
@@ -399,8 +401,7 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
         DisplayMode::Window => "window",
     };
     log::info!(
-        "[linux_display] mode={} {}x{} scale={} ({} bytes/frame) path='{}'",
-        mode_str, width, height, scale, frame_size, path,
+        "[linux_display] mode={mode_str} {width}x{height} scale={scale} ({frame_size} bytes/frame) path='{path}'",
     );
 
     #[cfg(feature = "host-window")]
@@ -435,8 +436,7 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
         }),
     );
     log::info!(
-        "[inst] module {} = linux_display (built-in) in={}",
-        module_idx, in_chan
+        "[inst] module {module_idx} = linux_display (built-in) in={in_chan}"
     );
     m
 }

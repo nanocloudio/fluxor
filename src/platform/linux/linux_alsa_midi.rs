@@ -33,9 +33,13 @@ struct LinuxAlsaMidiState {
 }
 
 fn linux_alsa_midi_step(state: *mut u8) -> i32 {
+    // SAFETY: `state` is the kernel-owned per-instance arena for this
+    // module; size-matched to `LinuxAlsaMidiState` by the loader.
     let st = unsafe { instance_state::<LinuxAlsaMidiState>(state) };
     if st.events_in >= 0 {
         let mut scratch = [0u8; 256];
+        // SAFETY: `channel_read` takes (chan, *mut u8, max_len); scratch
+        // is a stack buffer sized to its array length.
         unsafe {
             let _ = channel::channel_read(st.events_in, scratch.as_mut_ptr(), scratch.len());
         }
@@ -51,10 +55,8 @@ fn build_linux_alsa_midi(module_idx: usize, _params: &[u8]) -> scheduler::BuiltI
     let mut m = scheduler::BuiltInModule::new("linux_alsa_midi", linux_alsa_midi_step);
     install_state(&mut m, Box::new(LinuxAlsaMidiState { events_in }));
     log::warn!(
-        "[inst] module {} = linux_alsa_midi (built-in, STUB — ALSA seq integration not yet implemented; \
-         events_in={} drains to /dev/null)",
-        module_idx,
-        events_in
+        "[inst] module {module_idx} = linux_alsa_midi (built-in, STUB — ALSA seq integration not yet implemented; \
+         events_in={events_in} drains to /dev/null)"
     );
     m
 }

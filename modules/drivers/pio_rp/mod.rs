@@ -16,6 +16,13 @@
 //!   - HANDLE_POLL (0x0C41): non-blocking DMA completion check
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -94,7 +101,7 @@ use abi::platform::rp::pio_raw::{
     INPUT_SYNC_BYPASS as PIO_INPUT_SYNC_BYPASS,
     CMD_TRANSFER as PIO_CMD_XFER,
 };
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 use abi::platform::rp::pio_raw::GPIOBASE as PIO_GPIOBASE;
 // pio_rp uses BOTH DMA families:
 //   * `dma_fd::*` for stream transfers (ping-pong queued) — see the
@@ -106,7 +113,7 @@ use abi::kernel_abi::HANDLE_POLL as FD_POLL;
 
 // DMA flags
 const DMA_FLAG_INCR_READ: u8 = 0x01;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 const DMA_FLAG_INCR_WRITE: u8 = 0x02;
 const DMA_FLAG_SIZE_32: u8 = 0x04;
 
@@ -486,15 +493,7 @@ unsafe fn configure_stream_sm(
     }
     pio_sm_write_reg(sys, pio_num, sm, REG_EXECCTRL, execctrl);
 
-    // PINCTRL: out_base, out_count=1, sideset_base, sideset_count, set_base, set_count=1
-    let mut pinctrl: u32 = 0;
-    pinctrl |= slot.out_pin as u32;                    // OUT_BASE [4:0]
-    pinctrl |= 1 << 20;                                // OUT_COUNT [25:20] = 1
-    pinctrl |= (slot.sideset_base as u32) << 10;       // SIDESET_BASE [14:10]
-    pinctrl |= (slot.program.sideset_bits as u32) << 26; // SIDESET_COUNT [31:29] — actually [28:26]
-    pinctrl |= (slot.out_pin as u32) << 5;             // SET_BASE [9:5]
-    pinctrl |= 1 << 26;                                // SET_COUNT [28:26] = 1 — wait, overlaps with SIDESET_COUNT
-    // Actually RP2350 PINCTRL layout:
+    // PINCTRL: RP2350 layout
     //  [4:0]   = OUT_BASE
     //  [9:5]   = SET_BASE
     //  [14:10] = SIDESET_BASE
@@ -502,7 +501,7 @@ unsafe fn configure_stream_sm(
     //  [25:20] = OUT_COUNT
     //  [28:26] = SET_COUNT
     //  [31:29] = SIDESET_COUNT
-    pinctrl = 0;
+    let mut pinctrl: u32 = 0;
     pinctrl |= slot.out_pin as u32;                         // [4:0] OUT_BASE
     pinctrl |= (slot.out_pin as u32) << 5;                  // [9:5] SET_BASE
     pinctrl |= (slot.sideset_base as u32) << 10;            // [14:10] SIDESET_BASE
@@ -745,7 +744,6 @@ unsafe fn copy_program(prog: &mut PioProgram, src: *const u16, len: u8, wrap_tar
 // Provider dispatch
 // ============================================================================
 
-#[unsafe(no_mangle)]
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn pio_dispatch(

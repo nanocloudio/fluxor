@@ -48,7 +48,10 @@ use crate::kernel::hal;
 
 const E_INVAL: i32 = errno::EINVAL;
 const E_NOSYS: i32 = errno::ENOSYS;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 const E_NOMEM: i32 = errno::ENOMEM;
 
 // ============================================================================
@@ -58,6 +61,8 @@ const E_NOMEM: i32 = errno::ENOMEM;
 static mut SYSCALL_TABLE: SyscallTable = SyscallTable::empty();
 
 pub fn set_syscall_table(table: SyscallTable) {
+    // SAFETY: called once during boot (kernel::boot -> init_syscall_table)
+    // before any module runs; no concurrent reader.
     unsafe {
         SYSCALL_TABLE = table;
     }
@@ -172,6 +177,9 @@ unsafe extern "C" fn syscall_provider_close(handle: i32) -> i32 {
 }
 
 fn syscall_table() -> &'static SyscallTable {
+    // SAFETY: `SYSCALL_TABLE` is set once during boot before any module
+    // observes it; `&raw const` avoids materialising a long-lived shared
+    // reference to a mutable static.
     unsafe {
         let p = &raw const SYSCALL_TABLE;
         &*p
@@ -206,11 +214,11 @@ unsafe extern "C" fn syscall_log(level: u8, msg: *const u8, len: usize) {
     let slice = core::slice::from_raw_parts(msg, len);
     if let Ok(s) = core::str::from_utf8(slice) {
         match level {
-            1 => log::error!("{}", s),
-            2 => log::warn!("{}", s),
-            3 => log::info!("{}", s),
-            4 => log::debug!("{}", s),
-            _ => log::trace!("{}", s),
+            1 => log::error!("{s}"),
+            2 => log::warn!("{s}"),
+            3 => log::info!("{s}"),
+            4 => log::debug!("{s}"),
+            _ => log::trace!("{s}"),
         }
     }
 }
@@ -243,6 +251,8 @@ use crate::kernel::config::HardwareContext;
 static mut HARDWARE_CONTEXT: HardwareContext = HardwareContext::new();
 
 pub fn mark_spi_initialized(bus: u8) {
+    // SAFETY: HARDWARE_CONTEXT lives on the boot-time / scheduler thread;
+    // mark/is calls do not race because scheduler-init runs sequentially.
     unsafe {
         let p = &raw mut HARDWARE_CONTEXT;
         (*p).mark_spi_initialized(bus)
@@ -251,6 +261,7 @@ pub fn mark_spi_initialized(bus: u8) {
 
 /// Check if an SPI bus has been initialized
 pub fn is_spi_initialized(bus: u8) -> bool {
+    // SAFETY: as above; read-only path.
     unsafe {
         let p = &raw const HARDWARE_CONTEXT;
         (*p).is_spi_initialized(bus)
@@ -258,6 +269,7 @@ pub fn is_spi_initialized(bus: u8) -> bool {
 }
 
 pub fn mark_i2c_initialized(bus: u8) {
+    // SAFETY: as above.
     unsafe {
         let p = &raw mut HARDWARE_CONTEXT;
         (*p).mark_i2c_initialized(bus)
@@ -266,6 +278,7 @@ pub fn mark_i2c_initialized(bus: u8) {
 
 /// Check if an I2C bus has been initialized
 pub fn is_i2c_initialized(bus: u8) -> bool {
+    // SAFETY: as above; read-only path.
     unsafe {
         let p = &raw const HARDWARE_CONTEXT;
         (*p).is_i2c_initialized(bus)
@@ -679,9 +692,7 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
         && (req & (1u32 << contract)) == 0
     {
         log::debug!(
-            "[syscalls] contract 0x{:04x}: manifest gate denied — required_caps=0x{:08x} (declare `[[resources]]` requires_contract for this contract)",
-            contract,
-            req,
+            "[syscalls] contract 0x{contract:04x}: manifest gate denied — required_caps=0x{req:08x} (declare `[[resources]]` requires_contract for this contract)",
         );
         return Some(E_NOSYS);
     }
@@ -1023,6 +1034,7 @@ pub type ExtensionFn = unsafe fn(i32, u32, *mut u8, usize) -> i32;
 static mut SYSTEM_EXTENSION: Option<ExtensionFn> = None;
 
 pub fn register_system_extension(f: ExtensionFn) {
+    // SAFETY: called once during platform init before any module runs.
     unsafe {
         SYSTEM_EXTENSION = Some(f);
     }
@@ -1033,10 +1045,14 @@ pub fn register_system_extension(f: ExtensionFn) {
 /// vtable doesn't claim the key. Used by platform code (RP, BCM2712)
 /// to expose chip-specific introspection (SYS_CLOCK_HZ, GPIO::GET_LEVEL
 /// for untracked handles, …).
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 static mut DEV_QUERY_EXTENSION: Option<ExtensionFn> = None;
 
 pub fn register_dev_query_extension(f: ExtensionFn) {
+    // SAFETY: as `register_system_extension` — boot-time installation.
     unsafe {
         DEV_QUERY_EXTENSION = Some(f);
     }
@@ -1065,11 +1081,7 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
             LOGGED |= mask;
             let (_code, tbl, cnt) = scheduler::get_module_exports(module_idx);
             log::warn!(
-                "[reg] resolve_export failed: hash={:#x} mod={} exp_tbl={:?} exp_cnt={}",
-                hash,
-                module_idx,
-                tbl,
-                cnt,
+                "[reg] resolve_export failed: hash={hash:#x} mod={module_idx} exp_tbl={tbl:?} exp_cnt={cnt}",
             );
         }
         return None;
@@ -1079,12 +1091,7 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
         static mut LOGGED_NULL_STATE: bool = false;
         if !LOGGED_NULL_STATE {
             LOGGED_NULL_STATE = true;
-            log::warn!(
-                "[reg] state-null: hash={:#x} mod={} resolved={:#x}",
-                hash,
-                module_idx,
-                resolved,
-            );
+            log::warn!("[reg] state-null: hash={hash:#x} mod={module_idx} resolved={resolved:#x}",);
         }
         return None;
     }
@@ -1153,9 +1160,15 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             if arg.is_null() || arg_len < 2 * ptr_size {
                 return E_INVAL;
             }
+            // SAFETY: `arg_len >= 2 * sizeof::<usize>()` checked above;
+            // `read_unaligned` handles any alignment of `arg`.
             let config_ptr = unsafe { core::ptr::read_unaligned(arg as *const usize) } as *const u8;
+            // SAFETY: as above; second usize at arg + sizeof::<usize>().
             let config_len =
                 unsafe { core::ptr::read_unaligned(arg.add(ptr_size) as *const usize) };
+            // SAFETY: `request_rebuild` is a kernel-internal scheduler API
+            // that takes ownership of the config pointer for the reconfigure
+            // ABI; the caller (this opcode handler) holds the only reference.
             unsafe {
                 scheduler::request_rebuild(config_ptr, config_len);
             }
@@ -1204,6 +1217,9 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 return len as i32;
             }
             let copy_len = len.min(arg_len);
+            // SAFETY: `copy_len <= min(len, arg_len)` so `src[..copy_len]`
+            // and `arg[..copy_len]` are both in-bounds; `src` is `&[u8]`,
+            // `arg` is the caller's `*mut u8` (non-null checked above).
             unsafe {
                 core::ptr::copy_nonoverlapping(src, arg, copy_len);
             }
@@ -1773,7 +1789,11 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
             }
         }
         _ => {
+            // SAFETY: `DEV_QUERY_EXTENSION` is a `Option<fn>` set once at
+            // boot; the copy out is a word-sized load.
             if let Some(ext) = unsafe { DEV_QUERY_EXTENSION } {
+                // SAFETY: `ext` is the registered platform extension fn;
+                // arguments are passed straight through from the caller.
                 unsafe { ext(handle, key, out, out_len) }
             } else {
                 E_NOSYS

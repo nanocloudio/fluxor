@@ -105,27 +105,24 @@ impl LoaderError {
     /// Log the error with appropriate level.
     pub fn log(&self, context: &str) {
         match self {
-            Self::NoLayout => log::warn!("[loader] {}: no layout trailer", context),
-            Self::NoModules => log::info!("[loader] {}: no modules", context),
-            Self::InvalidTableMagic => log::warn!("[loader] {}: bad table magic", context),
-            Self::InvalidModuleMagic => log::warn!("[loader] {}: bad module magic", context),
-            Self::ModuleNotFound => log::warn!("[loader] {}: not found", context),
-            Self::ExportNotFound => log::warn!("[loader] {}: export missing", context),
-            Self::InvalidFnPtr => log::error!("[loader] {}: invalid fn ptr", context),
-            Self::InvalidModuleBase => log::error!("[loader] {}: base outside flash", context),
-            Self::CodeOutOfBounds => log::error!("[loader] {}: code past flash", context),
-            Self::CodeSizeTooLarge => log::error!("[loader] {}: code too large", context),
-            Self::StatePoolExhausted => log::error!("[loader] {}: state arena full", context),
-            Self::InitFailed(code) => log::error!("[loader] {}: init failed rc={}", context, code),
-            Self::NewFailed(code) => log::warn!("[loader] {}: new failed rc={}", context, code),
-            Self::AbiVersionMismatch { expected, found } => log::error!(
-                "[loader] {}: abi mismatch expected={} found={}",
-                context,
-                expected,
-                found
-            ),
-            Self::IntegrityMismatch => log::error!("[loader] {}: integrity hash mismatch", context),
-            Self::SignatureInvalid => log::error!("[loader] {}: signature invalid", context),
+            Self::NoLayout => log::warn!("[loader] {context}: no layout trailer"),
+            Self::NoModules => log::info!("[loader] {context}: no modules"),
+            Self::InvalidTableMagic => log::warn!("[loader] {context}: bad table magic"),
+            Self::InvalidModuleMagic => log::warn!("[loader] {context}: bad module magic"),
+            Self::ModuleNotFound => log::warn!("[loader] {context}: not found"),
+            Self::ExportNotFound => log::warn!("[loader] {context}: export missing"),
+            Self::InvalidFnPtr => log::error!("[loader] {context}: invalid fn ptr"),
+            Self::InvalidModuleBase => log::error!("[loader] {context}: base outside flash"),
+            Self::CodeOutOfBounds => log::error!("[loader] {context}: code past flash"),
+            Self::CodeSizeTooLarge => log::error!("[loader] {context}: code too large"),
+            Self::StatePoolExhausted => log::error!("[loader] {context}: state arena full"),
+            Self::InitFailed(code) => log::error!("[loader] {context}: init failed rc={code}"),
+            Self::NewFailed(code) => log::warn!("[loader] {context}: new failed rc={code}"),
+            Self::AbiVersionMismatch { expected, found } => {
+                log::error!("[loader] {context}: abi mismatch expected={expected} found={found}")
+            }
+            Self::IntegrityMismatch => log::error!("[loader] {context}: integrity hash mismatch"),
+            Self::SignatureInvalid => log::error!("[loader] {context}: signature invalid"),
         }
     }
 }
@@ -252,10 +249,7 @@ impl ProviderAutoRegister {
         );
         if rc != 0 {
             log::warn!(
-                "[inst] {} provider auto-register failed contract=0x{:04x} rc={}",
-                name,
-                contract,
-                rc
+                "[inst] {name} provider auto-register failed contract=0x{contract:04x} rc={rc}"
             );
         }
     }
@@ -264,6 +258,8 @@ impl ProviderAutoRegister {
 static mut PIC_IRQ_DISABLED_COUNT: u32 = 0;
 /// Increment the IRQ-disabled counter (called by HAL pic_barrier).
 pub fn increment_irq_disabled_count() {
+    // SAFETY: single counter; the HAL only calls this from a single
+    // post-PIC barrier path on the scheduler thread.
     unsafe {
         PIC_IRQ_DISABLED_COUNT += 1;
     }
@@ -352,6 +348,7 @@ unsafe fn call_drain(f: ModuleDrainFn, state: *mut u8) -> i32 {
 }
 /// Return count of PIC calls that left interrupts disabled.
 pub fn pic_irq_disabled_count() -> u32 {
+    // SAFETY: single-word read.
     unsafe { PIC_IRQ_DISABLED_COUNT }
 }
 // ============================================================================
@@ -406,7 +403,8 @@ fn align_up(n: usize) -> usize {
 /// as huge.
 #[inline]
 fn align_up_checked(n: usize) -> Option<usize> {
-    n.checked_add(STATE_ALIGN - 1).map(|m| m & !(STATE_ALIGN - 1))
+    n.checked_add(STATE_ALIGN - 1)
+        .map(|m| m & !(STATE_ALIGN - 1))
 }
 
 /// 32-bit canary written at the trailing edge of every state
@@ -475,12 +473,9 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
             Some(n) if n <= STATE_ARENA_SIZE => n,
             _ => {
                 log::error!(
-                    "[loader] STATE ARENA EXHAUSTED — need={} used={} cap={} (raise \
+                    "[loader] STATE ARENA EXHAUSTED — need={need} used={aligned} cap={STATE_ARENA_SIZE} (raise \
                      abi::config::kernel::STATE_ARENA_SIZE or reduce module arena demand; \
-                     modules without a heap arena will silently fail every heap_alloc call)",
-                    need,
-                    aligned,
-                    STATE_ARENA_SIZE
+                     modules without a heap arena will silently fail every heap_alloc call)"
                 );
                 return Err(LoaderError::StatePoolExhausted);
             }
@@ -506,6 +501,9 @@ pub fn validate_state_canary(ptr: *const u8, size: usize) -> bool {
     if ptr.is_null() {
         return true;
     }
+    // SAFETY: `ptr` came from `alloc_state(size)` which allocated `size + 4`
+    // bytes and wrote a `u32` canary at offset `size`; reading it back stays
+    // within the allocation. `read_unaligned` handles any alignment.
     unsafe {
         let canary_ptr = ptr.add(size) as *const u32;
         core::ptr::read_unaligned(canary_ptr) == STATE_CANARY
@@ -514,6 +512,7 @@ pub fn validate_state_canary(ptr: *const u8, size: usize) -> bool {
 /// Return high-water mark: (used_bytes, total_bytes). Does not reflect
 /// free-list holes — live memory is (used − Σ holes).
 pub fn arena_usage() -> (usize, usize) {
+    // SAFETY: word-sized read of static usize.
     unsafe { (STATE_ARENA_OFFSET, STATE_ARENA_SIZE) }
 }
 /// Return a previously allocated region to the pool. `size` must match
@@ -534,10 +533,8 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
     // zero-sized regions the canary lives at `ptr + 0`.
     if !validate_state_canary(ptr as *const u8, size) {
         log::error!(
-            "[loader] STATE CANARY CLOBBERED at {:p} (size={}) — \
+            "[loader] STATE CANARY CLOBBERED at {ptr:p} (size={size}) — \
              module overran its state buffer",
-            ptr,
-            size,
         );
     }
     let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>();
@@ -549,7 +546,7 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
         .checked_add(STATE_CANARY_SIZE)
         .and_then(align_up_checked)
     else {
-        log::error!("[loader] free_state_range: size={} overflows", size);
+        log::error!("[loader] free_state_range: size={size} overflows");
         return;
     };
     let free_list = &raw mut FREE_LIST;
@@ -594,10 +591,7 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
         };
         FREE_COUNT += 1;
     } else {
-        log::warn!(
-            "[loader] free list full; leaking {} bytes until reset",
-            new_size
-        );
+        log::warn!("[loader] free list full; leaking {new_size} bytes until reset");
     }
 }
 /// Reset the pool: clear the free list and drop the high-water mark to 0.
@@ -617,6 +611,7 @@ pub fn reset_state_arena() {
 /// `reset_state_arena`). Read by `scheduler::log_arena_summary` for
 /// post-instantiation telemetry.
 pub fn state_arena_usage() -> (usize, usize) {
+    // SAFETY: word-sized read of static usize.
     unsafe { (STATE_ARENA_OFFSET, STATE_ARENA_SIZE) }
 }
 // ============================================================================
@@ -780,6 +775,8 @@ impl LoadedModule {
         // Compute from code_size + data_size (both u32) to avoid u16 overflow
         // in the header's export_offset field for modules > 64KB.
         let offset = self.header.code_size as usize + self.header.data_size as usize;
+        // SAFETY: offset = code_size + data_size points at the start of
+        // the export table per the .fmod layout validated at load time.
         unsafe { offset_ptr(self.code_base(), offset) }
     }
     /// Read the fine-grained permissions bitmap from the manifest section.
@@ -799,6 +796,10 @@ impl LoadedModule {
         let schema_size = self.header.schema_size() as usize;
         let manifest_offset =
             ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        // SAFETY: `manifest_offset` plus 16 bytes lies inside the .fmod
+        // mapping (caller has already validated total_size by this point);
+        // the FXMF magic check rejects mis-aligned tails before we trust
+        // byte 15.
         unsafe {
             let p = offset_ptr(self.base, manifest_offset);
             // Verify magic before trusting byte 15.
@@ -833,6 +834,9 @@ impl LoadedModule {
         let schema_size = self.header.schema_size() as usize;
         let manifest_offset =
             ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
+        // mapping (validated at load time). Inner loop bounded by
+        // `manifest_size >= 16 + port_count * 4`.
         unsafe {
             let p = offset_ptr(self.base, manifest_offset);
             let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
@@ -881,10 +885,7 @@ impl LoadedModule {
                 let offset = entry.offset & !1;
                 if offset >= code_size {
                     log::error!(
-                        "[loader] export offset {:#x} >= code_size {:#x} (hash={:#x}); rejecting",
-                        offset,
-                        code_size,
-                        hash,
+                        "[loader] export offset {offset:#x} >= code_size {code_size:#x} (hash={hash:#x}); rejecting",
                     );
                     return Err(LoaderError::ExportNotFound);
                 }
@@ -1033,7 +1034,7 @@ impl ModuleLoader {
         // SAFETY: module_base points to module header in flash
         let header = unsafe { read_module_header(module_base) };
         if header.magic != MODULE_MAGIC {
-            log::warn!("[loader] bad module magic offset={}", offset);
+            log::warn!("[loader] bad module magic offset={offset}");
             return Err(LoaderError::InvalidModuleMagic);
         }
         Ok(LoadedModule {
@@ -1071,6 +1072,9 @@ impl ModuleLoader {
         blob: *const u8,
         blob_len: usize,
     ) -> Result<(), LoaderError> {
+        // SAFETY: caller passes a `blob` pointer + `blob_len` covering the
+        // mapped modules region; `read_table_header` reads the 16-byte
+        // header which the next check validates against `blob_len`.
         let header = unsafe { read_table_header(blob) };
         if header.magic != MODULE_TABLE_MAGIC {
             return Err(LoaderError::InvalidTableMagic);
@@ -1084,17 +1088,13 @@ impl ModuleLoader {
         let total_size = ((header.total_size_hi as u32) << 16) | (header.total_size_lo as u32);
         if (total_size as usize) > MAX_MODULES_BLOB_SIZE {
             log::error!(
-                "[loader] modules blob size {} exceeds MAX_MODULES_BLOB_SIZE={}",
-                total_size,
-                MAX_MODULES_BLOB_SIZE
+                "[loader] modules blob size {total_size} exceeds MAX_MODULES_BLOB_SIZE={MAX_MODULES_BLOB_SIZE}"
             );
             return Err(LoaderError::InvalidTableMagic);
         }
         if (total_size as usize) > blob_len {
             log::error!(
-                "[loader] modules blob declared total_size={} > mapped blob_len={}",
-                total_size,
-                blob_len
+                "[loader] modules blob declared total_size={total_size} > mapped blob_len={blob_len}"
             );
             return Err(LoaderError::InvalidTableMagic);
         }
@@ -1102,11 +1102,7 @@ impl ModuleLoader {
         // within total_size.
         let table_size = 16usize.saturating_add((header.module_count as usize) * 16);
         if table_size > total_size as usize {
-            log::error!(
-                "[loader] module-table size {} > total_size {}",
-                table_size,
-                total_size
-            );
+            log::error!("[loader] module-table size {table_size} > total_size {total_size}");
             return Err(LoaderError::InvalidTableMagic);
         }
         // Every entry's [offset, offset+size) must land inside
@@ -1116,20 +1112,19 @@ impl ModuleLoader {
         // its module-header section sums so downstream readers
         // (export table, schema, body) can never index past the
         // entry's footprint.
+        // SAFETY: table_size <= total_size <= blob_len; entries start at
+        // offset 16 and span `header.module_count * 16` bytes within
+        // `table_size`.
         let entries_base = unsafe { offset_ptr(blob, 16) };
         for i in 0..header.module_count as usize {
+            // SAFETY: i bounded by module_count; entry footprint inside table.
             let entry = unsafe { read_table_entry(entries_base, i) };
             let off = entry.offset as usize;
             let sz = entry.size as usize;
             let end = off.saturating_add(sz);
             if off < table_size || end > total_size as usize {
                 log::error!(
-                    "[loader] entry {} bounds offset={} size={} outside table_size={} total_size={}",
-                    i,
-                    off,
-                    sz,
-                    table_size,
-                    total_size
+                    "[loader] entry {i} bounds offset={off} size={sz} outside table_size={table_size} total_size={total_size}"
                 );
                 return Err(LoaderError::InvalidTableMagic);
             }
@@ -1142,18 +1137,15 @@ impl ModuleLoader {
                 );
                 return Err(LoaderError::InvalidTableMagic);
             }
+            // SAFETY: `off + ModuleHeader::SIZE <= end <= total_size` (sz
+            // >= ModuleHeader::SIZE checked above); pointer in bounds.
             let mh = unsafe { read_module_header(offset_ptr(blob, off)) };
             let inner = (mh.code_size as usize)
                 .saturating_add(mh.data_size as usize)
                 .saturating_add((mh.export_count as usize).saturating_mul(8))
                 .saturating_add(ModuleHeader::SIZE);
             if inner > sz {
-                log::error!(
-                    "[loader] entry {} internal sections {} > entry size {}",
-                    i,
-                    inner,
-                    sz
-                );
+                log::error!("[loader] entry {i} internal sections {inner} > entry size {sz}");
                 return Err(LoaderError::InvalidTableMagic);
             }
         }
@@ -1212,7 +1204,7 @@ impl<'a> Iterator for ModuleIter<'a> {
 /// - Within flash memory range
 fn validate_fn_addr(addr: usize, name: &str) -> Result<(), LoaderError> {
     if !hal::validate_fn_addr(addr) {
-        log::error!("[loader] {}: invalid fn addr=0x{:08x}", name, addr);
+        log::error!("[loader] {name}: invalid fn addr=0x{addr:08x}");
         return Err(LoaderError::InvalidFnPtr);
     }
     let _ = name;
@@ -1257,7 +1249,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
         let code_end = code_base + module.header.code_size as usize;
         let flash_end = hal::flash_end();
         if flash_end > 0 && code_end > flash_end {
-            log::error!("[loader] {}: code past flash end=0x{:08x}", name, code_end);
+            log::error!("[loader] {name}: code past flash end=0x{code_end:08x}");
             return Err(LoaderError::CodeOutOfBounds);
         }
     }
@@ -1274,9 +1266,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
         // unsigned-module path with `flags & 0x01 == 0`).
         if cfg!(feature = "enforce_signatures") {
             log::error!(
-                "[loader] {}: manifest size {} below minimum (48) under enforce_signatures",
-                name,
-                manifest_size
+                "[loader] {name}: manifest size {manifest_size} below minimum (48) under enforce_signatures"
             );
             return Err(LoaderError::SignatureInvalid);
         }
@@ -1289,7 +1279,11 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
         let schema_size = module.header.schema_size() as usize;
         let manifest_offset =
             ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        // SAFETY: `manifest_offset + manifest_size` is the slot footprint
+        // validated at table load; manifest lies within the .fmod mapping.
         let manifest_ptr = unsafe { offset_ptr(module.base, manifest_offset) };
+        // SAFETY: `manifest_ptr` covers `manifest_size` bytes inside the
+        // mapping (per the entry-size check at load time).
         let manifest_data = unsafe { core::slice::from_raw_parts(manifest_ptr, manifest_size) };
         // `manifest_size >= 48` was checked above, so `>= 16` is trivially
         // true — keep the explicit assertion-style read but reject any
@@ -1304,9 +1298,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
             if magic != 0x464D5846 {
                 if cfg!(feature = "enforce_signatures") {
                     log::error!(
-                        "[loader] {}: bad manifest magic 0x{:08x} under enforce_signatures",
-                        name,
-                        magic
+                        "[loader] {name}: bad manifest magic 0x{magic:08x} under enforce_signatures"
                     );
                     return Err(LoaderError::SignatureInvalid);
                 }
@@ -1331,17 +1323,21 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         + (manifest_data[7] as usize) * 8;
                     let hash_offset = 16 + var_size;
                     if hash_offset + 32 > manifest_size {
-                        log::error!("[loader] {}: manifest hash out of range", name);
+                        log::error!("[loader] {name}: manifest hash out of range");
                         return Err(LoaderError::IntegrityMismatch);
                     }
                     let stored_hash = &manifest_data[hash_offset..hash_offset + 32];
                     use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::new();
                     let code_ptr = module.code_base();
+                    // SAFETY: code section is `code_size` bytes starting at
+                    // `code_base()`, validated as inside the entry footprint.
                     let code_data = unsafe { core::slice::from_raw_parts(code_ptr, code_size) };
                     hasher.update(code_data);
                     if data_size > 0 {
+                        // SAFETY: data section follows code; inside footprint.
                         let data_ptr = unsafe { offset_ptr(code_ptr, code_size) };
+                        // SAFETY: `data_size` bytes inside the entry footprint.
                         let data_section =
                             unsafe { core::slice::from_raw_parts(data_ptr, data_size) };
                         hasher.update(data_section);
@@ -1350,7 +1346,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     let mut h = [0u8; 32];
                     h.copy_from_slice(&computed);
                     if !hal::verify_integrity(&h, stored_hash) {
-                        log::error!("[loader] {}: integrity mismatch", name);
+                        log::error!("[loader] {name}: integrity mismatch");
                         return Err(LoaderError::IntegrityMismatch);
                     }
                     computed_hash = Some(h);
@@ -1378,7 +1374,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     let mut pubkey = [0u8; 32];
                     if hal::otp_read_signing_key(&mut pubkey) {
                         if !crate::kernel::crypto::ed25519::verify(&pubkey, &hash, &sig) {
-                            log::error!("[loader] {}: signature invalid", name);
+                            log::error!("[loader] {name}: signature invalid");
                             return Err(LoaderError::SignatureInvalid);
                         }
                     } else if cfg!(feature = "enforce_signatures") {
@@ -1387,7 +1383,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     }
                 } else if cfg!(feature = "enforce_signatures") {
                     // Unsigned module under enforcement — reject.
-                    log::error!("[loader] {}: unsigned module rejected", name);
+                    log::error!("[loader] {name}: unsigned module rejected");
                     return Err(LoaderError::SignatureInvalid);
                 }
             }
@@ -1403,7 +1399,7 @@ fn validate_fn_in_code(
     _name: &str,
 ) -> Result<(), LoaderError> {
     if !hal::validate_fn_in_code(addr, code_base, code_size) {
-        log::error!("[loader] {}: outside code", _name);
+        log::error!("[loader] {_name}: outside code");
         return Err(LoaderError::InvalidFnPtr);
     }
     let _ = (_name,);
@@ -1426,12 +1422,18 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
     validate_fn_addr(new_addr, "module_new")?;
     let step_addr = module.get_export_addr(export_hashes::MODULE_STEP)?;
     validate_fn_addr(step_addr, "module_step")?;
-    // Convert addresses to typed function pointers
-    // SAFETY: addresses validated above, types match module ABI
+    // Convert addresses to typed function pointers.
+    // SAFETY: all three addresses validated above by validate_fn_addr;
+    // ModuleExports types match the module ABI shape.
+    let ss_fn = unsafe { fn_ptr_from_addr(state_size_addr) };
+    // SAFETY: as above.
+    let nw_fn = unsafe { fn_ptr_from_addr(new_addr) };
+    // SAFETY: as above.
+    let st_fn = unsafe { fn_ptr_from_addr(step_addr) };
     Ok(ModuleExports {
-        state_size_fn: unsafe { fn_ptr_from_addr(state_size_addr) },
-        new_fn: unsafe { fn_ptr_from_addr(new_addr) },
-        step_fn: unsafe { fn_ptr_from_addr(step_addr) },
+        state_size_fn: ss_fn,
+        new_fn: nw_fn,
+        step_fn: st_fn,
     })
 }
 /// Call module_state_size - returns required state buffer size
@@ -1454,9 +1456,10 @@ pub fn invoke_init(
     validate_fn_addr(init_addr, "module_init")?;
     let code_base = module.code_base() as usize;
     validate_fn_in_code(init_addr, code_base, module.header.code_size, "module_init")?;
-    // Convert to typed function pointer and call
-    // SAFETY: init_addr validated above, syscalls is valid reference
+    // Convert to typed function pointer and call.
+    // SAFETY: init_addr validated above; ModuleInitFn matches the ABI.
     let init_fn: ModuleInitFn = unsafe { fn_ptr_from_addr(init_addr) };
+    // SAFETY: init_fn validated, syscalls is a live reference.
     unsafe { call_init(init_fn, syscalls) };
     Ok(())
 }
@@ -1770,6 +1773,8 @@ impl DynamicModule {
         let params_slice = if params.ptr.is_null() || params.len == 0 {
             &[][..]
         } else {
+            // SAFETY: `params.ptr` non-null + `params.len > 0` checked;
+            // caller validated the pointer covers `params.len` bytes.
             unsafe { core::slice::from_raw_parts(params.ptr, params.len) }
         };
         super::scheduler::parse_protection_config(inst_idx, params_slice);
@@ -1795,7 +1800,7 @@ impl DynamicModule {
         };
         match invoke_new(exports.new_fn, syscalls, &init_args)? {
             NewStatus::Ready => {
-                log::info!("[inst] loaded {}", name);
+                log::info!("[inst] loaded {name}");
                 if let Some(ar) = auto_register.as_ref() {
                     ar.register(inst_idx as u8, state_ptr, name);
                 }
@@ -1825,7 +1830,7 @@ impl DynamicModule {
                     auto_register,
                     module_idx: inst_idx as u8,
                 };
-                log::info!("[inst] pending {}", name);
+                log::info!("[inst] pending {name}");
                 Ok(StartNewResult::Pending(pending))
             }
         }
@@ -1888,9 +1893,12 @@ pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PE
         return (hints, 0);
     }
     // Call the export: module_channel_hints(out: *mut u8, max_len: usize) -> i32
+    // SAFETY: addr validated via validate_fn_addr above; ABI shape matches.
     let hints_fn: ModuleChannelHintsFn = unsafe { fn_ptr_from_addr(addr) };
     let buf_size = MAX_HINTS_PER_MODULE * CHANNEL_HINT_WIRE_BYTES;
     let mut buf = [0u8; MAX_HINTS_PER_MODULE * CHANNEL_HINT_WIRE_BYTES];
+    // SAFETY: buf is sized to `buf_size`; the PIC export honours its own
+    // max_len contract.
     let count = unsafe { hints_fn(buf.as_mut_ptr(), buf_size) };
     if count <= 0 {
         return (hints, 0);
@@ -1951,6 +1959,8 @@ pub fn resolve_export_for_module(module_idx: usize, export_hash: u32) -> Option<
         return None;
     }
     for i in 0..export_count as usize {
+        // SAFETY: `export_table` covers `export_count * 8` bytes per the
+        // module's section; loop bounded by `export_count`.
         let entry = unsafe { read_export_entry(export_table, i) };
         if entry.hash == export_hash {
             let offset = entry.offset & !1;
@@ -1959,11 +1969,7 @@ pub fn resolve_export_for_module(module_idx: usize, export_hash: u32) -> Option<
             // entry at the boundary is rejected too.
             if (offset as u64) >= code_size as u64 {
                 log::warn!(
-                    "[loader] resolve_export: module {} export 0x{:08x} offset {} out of code_size {}",
-                    module_idx,
-                    export_hash,
-                    offset,
-                    code_size
+                    "[loader] resolve_export: module {module_idx} export 0x{export_hash:08x} offset {offset} out of code_size {code_size}"
                 );
                 return None;
             }

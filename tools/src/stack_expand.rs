@@ -181,7 +181,10 @@ struct StackFile {
 #[derive(Deserialize)]
 struct StackMeta {
     name: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     provides: Option<Vec<String>>,
 }
 
@@ -303,11 +306,11 @@ fn load_stack(name: &str, project_root: &std::path::Path) -> Result<StackFile> {
     // (when discovered). Lets an external user project override
     // individual stacks (`stacks/audio.toml`) while still reaching
     // the bundled defaults for everything else.
-    let project_path = project_root.join("stacks").join(format!("{}.toml", name));
+    let project_path = project_root.join("stacks").join(format!("{name}.toml"));
     let path = if project_path.exists() {
         project_path
     } else if let Some(install) = crate::project::install_root() {
-        let install_path = install.path.join("stacks").join(format!("{}.toml", name));
+        let install_path = install.path.join("stacks").join(format!("{name}.toml"));
         if install_path.exists() {
             install_path
         } else {
@@ -563,7 +566,7 @@ fn inject_injection(
     let mut wiring_prepend = Vec::new();
     for edge_str in &variant.wiring {
         let (from, to) = parse_edge_str(edge_str)?;
-        let key = format!("{}->{}", from, to);
+        let key = format!("{from}->{to}");
         if !existing_edges.contains(&key) {
             wiring_prepend.push(json!({"from": from, "to": to}));
         }
@@ -622,7 +625,7 @@ fn collect_existing_edges(config: &Value) -> Vec<String> {
                 .filter_map(|e| {
                     let from = e.get("from").and_then(|f| f.as_str())?;
                     let to = e.get("to").and_then(|t| t.as_str())?;
-                    Some(format!("{}->{}", from, to))
+                    Some(format!("{from}->{to}"))
                 })
                 .collect()
         })
@@ -633,8 +636,7 @@ fn parse_edge_str(s: &str) -> Result<(String, String)> {
     let parts: Vec<&str> = s.split("->").map(|p| p.trim()).collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         return Err(Error::Config(format!(
-            "Invalid wiring syntax '{}' — expected 'module.port -> module.port'",
-            s
+            "Invalid wiring syntax '{s}' — expected 'module.port -> module.port'"
         )));
     }
     Ok((parts[0].to_string(), parts[1].to_string()))

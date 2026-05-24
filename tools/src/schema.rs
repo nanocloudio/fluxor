@@ -42,7 +42,10 @@ impl ParamType {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     fn wire_size(&self) -> Option<usize> {
         match self {
             Self::U8 => Some(1),
@@ -307,7 +310,7 @@ pub fn build_params_from_schema(
                             }
                             continue;
                         }
-                        let dotted = format!("{}.{}", key, inner_key);
+                        let dotted = format!("{key}.{inner_key}");
                         let underscored = dotted.replace('.', "_");
                         kv.insert(dotted, inner_value.clone());
                         kv.insert(underscored.clone(), inner_value.clone());
@@ -316,7 +319,7 @@ pub fn build_params_from_schema(
                         for suffix in GROUPING_SUFFIXES {
                             if key.ends_with(suffix) {
                                 let prefix = &key[..key.len() - suffix.len()];
-                                let stripped = format!("{}_{}", prefix, inner_key);
+                                let stripped = format!("{prefix}_{inner_key}");
                                 kv.insert(stripped, inner_value.clone());
                             }
                         }
@@ -350,7 +353,7 @@ pub fn build_params_from_schema(
             if let Some(arr) = presets.as_ref() {
                 for preset_ref in arr {
                     let values = resolve_preset_values(preset_ref, data_section)
-                        .map_err(|e| format!("module '{}': {}", module_name, e))?;
+                        .map_err(|e| format!("module '{module_name}': {e}"))?;
                     if !values.is_empty() {
                         let val_len = values.len() * 2;
                         if pos + 2 + val_len < entry.len() {
@@ -376,7 +379,7 @@ pub fn build_params_from_schema(
             if let Some(arr) = presets.as_ref() {
                 for preset_ref in arr.iter() {
                     let blob = resolve_preset_blob(preset_ref, data_section)
-                        .map_err(|e| format!("module '{}': {}", module_name, e))?;
+                        .map_err(|e| format!("module '{module_name}': {e}"))?;
                     if blob.is_empty() {
                         continue;
                     }
@@ -786,9 +789,8 @@ fn resolve_preset_values(
         }
 
         return Err(format!(
-            "preset '{}' not found (not in data section or built-in presets: \
-             c_major, c_minor, pentatonic, blues, chromatic, bass)",
-            name
+            "preset '{name}' not found (not in data section or built-in presets: \
+             c_major, c_minor, pentatonic, blues, chromatic, bass)"
         ));
     }
 
@@ -819,7 +821,7 @@ fn resolve_preset_blob(
             if let Some(entry) = data.get(name) {
                 // Try hex string first
                 if let Some(hex_str) = entry.get("hex").and_then(|v| v.as_str()) {
-                    return decode_hex(hex_str).map_err(|e| format!("blob '{}': {}", name, e));
+                    return decode_hex(hex_str).map_err(|e| format!("blob '{name}': {e}"));
                 }
                 // Try bytes array
                 if let Some(bytes_arr) = entry.get("bytes").and_then(|v| v.as_array()) {
@@ -829,12 +831,11 @@ fn resolve_preset_blob(
                         .collect());
                 }
                 return Err(format!(
-                    "blob '{}' in data section has no 'hex' or 'bytes' field",
-                    name
+                    "blob '{name}' in data section has no 'hex' or 'bytes' field"
                 ));
             }
         }
-        return Err(format!("blob '{}' not found in data section", name));
+        return Err(format!("blob '{name}' not found in data section"));
     }
 
     Err("blob preset must be a string name or array of byte values".into())
@@ -850,7 +851,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let mut i = 0;
     while i < hex.len() {
         let byte = u8::from_str_radix(&hex[i..i + 2], 16)
-            .map_err(|_| format!("invalid hex at position {}", i))?;
+            .map_err(|_| format!("invalid hex at position {i}"))?;
         bytes.push(byte);
         i += 2;
     }
@@ -904,14 +905,14 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
             if value.is_object() {
                 if let Some(inner_obj) = value.as_object() {
                     for (inner_key, inner_value) in inner_obj {
-                        let dotted = format!("{}.{}", key, inner_key);
+                        let dotted = format!("{key}.{inner_key}");
                         let underscored = dotted.replace('.', "_");
                         kv.insert(dotted, inner_value.clone());
                         kv.insert(underscored.clone(), inner_value.clone());
                         for suffix in GROUPING_SUFFIXES {
                             if key.ends_with(suffix) {
                                 let prefix = &key[..key.len() - suffix.len()];
-                                let stripped = format!("{}_{}", prefix, inner_key);
+                                let stripped = format!("{prefix}_{inner_key}");
                                 kv.insert(stripped, inner_value.clone());
                             }
                         }
@@ -963,7 +964,7 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
 
 /// Load schema for a module type from the .fmod files directory.
 pub fn load_schema_for_module(module_type: &str, modules_dir: &Path) -> Option<ParamSchema> {
-    let fmod_path = modules_dir.join(format!("{}.fmod", module_type));
+    let fmod_path = modules_dir.join(format!("{module_type}.fmod"));
     if !fmod_path.exists() {
         return None;
     }
@@ -1006,7 +1007,7 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
 
         // Path
         if let Some(path) = obj.get("path") {
-            kv.insert(format!("route_{}_path", i), path.clone());
+            kv.insert(format!("route_{i}_path"), path.clone());
         }
 
         // Determine handler type and body
@@ -1034,16 +1035,16 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             if let Some(proxy_str) = proxy_val.as_str() {
                 if let Some((ip_str, port_str)) = proxy_str.rsplit_once(':') {
                     kv.insert(
-                        format!("route_{}_proxy_ip", i),
+                        format!("route_{i}_proxy_ip"),
                         Value::String(ip_str.to_string()),
                     );
                     kv.insert(
-                        format!("route_{}_proxy_port", i),
+                        format!("route_{i}_proxy_port"),
                         Value::String(port_str.to_string()),
                     );
                 } else {
                     // No port — use IP as-is, default port
-                    kv.insert(format!("route_{}_proxy_ip", i), proxy_val.clone());
+                    kv.insert(format!("route_{i}_proxy_ip"), proxy_val.clone());
                 }
             }
         } else if let Some(fs_path_val) = obj.get("fs_path") {
@@ -1053,7 +1054,7 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             // the FS provider (`fat32` on bare-metal, `linux_fs_dispatch`
             // on the host).
             handler = 7; // HANDLER_FS_FILE
-            kv.insert(format!("route_{}_fs_path", i), fs_path_val.clone());
+            kv.insert(format!("route_{i}_fs_path"), fs_path_val.clone());
         } else if let Some(fs_list_val) = obj.get("fs_list") {
             // FS_CONTRACT-served directory listing as JSON. The http
             // module calls `FS_OPENDIR` + `FS_READDIR` against the
@@ -1063,9 +1064,9 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             // result. Used by the browser image_viewer / audio_player
             // launchers to enumerate the asset bank.
             handler = 8; // HANDLER_FS_LIST
-            kv.insert(format!("route_{}_fs_list", i), fs_list_val.clone());
+            kv.insert(format!("route_{i}_fs_list"), fs_list_val.clone());
             if let Some(fs_filter_val) = obj.get("fs_filter") {
-                kv.insert(format!("route_{}_fs_filter", i), fs_filter_val.clone());
+                kv.insert(format!("route_{i}_fs_filter"), fs_filter_val.clone());
             }
         } else if obj.get("source").is_some() {
             // The `source` value is informational (typically the
@@ -1090,7 +1091,7 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
                 if let Some(idx) = idx_val.as_u64() {
                     handler = if stream { 6 } else { 0 };
                     kv.insert(
-                        format!("route_{}_source", i),
+                        format!("route_{i}_source"),
                         Value::Number(serde_json::Number::from(idx)),
                     );
                 }
@@ -1137,11 +1138,11 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
                 _ => 0,                                    // static
             };
 
-            kv.insert(format!("route_{}_body", i), body_value);
+            kv.insert(format!("route_{i}_body"), body_value);
         }
 
         kv.insert(
-            format!("route_{}_handler", i),
+            format!("route_{i}_handler"),
             Value::Number(serde_json::Number::from(handler)),
         );
 
@@ -1151,7 +1152,7 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
         // MAX_CONTENT_TYPE bytes; longer values are truncated.
         if let Some(ct_val) = obj.get("content_type").and_then(|v| v.as_str()) {
             kv.insert(
-                format!("route_{}_content_type", i),
+                format!("route_{i}_content_type"),
                 Value::String(ct_val.to_string()),
             );
         }

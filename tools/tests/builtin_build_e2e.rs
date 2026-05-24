@@ -15,6 +15,12 @@
 //! pulls .fmod files from there and we can't fail useful tests on a
 //! fresh tree.
 
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "integration test surfaces subprocess output to the test runner for diagnosis on failure"
+)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -107,7 +113,7 @@ fn run_build(yaml: &PathBuf) -> (bool, String) {
         .arg(yaml)
         .current_dir(project_root())
         .output()
-        .unwrap_or_else(|e| panic!("spawn fluxor: {}", e));
+        .unwrap_or_else(|e| panic!("spawn fluxor: {e}"));
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

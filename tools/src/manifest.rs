@@ -3,7 +3,10 @@
 //! The manifest is a required section in every `.fmod` file (ABI v2+).
 //! It describes ports, resource claims, dependencies, and an optional integrity hash.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 use std::path::Path;
 
@@ -123,17 +126,15 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // `[[resources]]`.
         "internal" | "system" | "reconfigure" | "flash_raw" | "backing_provider"
         | "platform_raw" | "monitor" | "bridge" => Err(Error::Module(format!(
-            "`{}` is a permission, not a contract. Declare it in the \
-                 top-level `permissions = [\"{}\", ...]` list, not under \
-                 `[[resources]]`. See docs/architecture/abi_layers.md.",
-            s, s
+            "`{s}` is a permission, not a contract. Declare it in the \
+                 top-level `permissions = [\"{s}\", ...]` list, not under \
+                 `[[resources]]`. See docs/architecture/abi_layers.md."
         ))),
         _ => Err(Error::Module(format!(
-            "unknown contract name: {} — expected one of: gpio, spi, i2c, pio, \
+            "unknown contract name: {s} — expected one of: gpio, spi, i2c, pio, \
              uart, adc, pwm, fs, storage.namespace, storage.object, usb_host, \
              platform_nic_ring, platform_dma, platform_dma_fd, \
-             pcie_device (see docs/architecture/abi_layers.md)",
-            s
+             pcie_device (see docs/architecture/abi_layers.md)"
         ))),
     }
 }
@@ -338,17 +339,17 @@ pub fn decode_semver(v: u16) -> (u8, u8, u8) {
 fn parse_semver(s: &str) -> Result<(u8, u8, u8)> {
     let parts: Vec<&str> = s.split('.').collect();
     if parts.len() != 3 {
-        return Err(Error::Module(format!("invalid semver: {}", s)));
+        return Err(Error::Module(format!("invalid semver: {s}")));
     }
     let major: u8 = parts[0]
         .parse()
-        .map_err(|_| Error::Module(format!("invalid semver major: {}", s)))?;
+        .map_err(|_| Error::Module(format!("invalid semver major: {s}")))?;
     let minor: u8 = parts[1]
         .parse()
-        .map_err(|_| Error::Module(format!("invalid semver minor: {}", s)))?;
+        .map_err(|_| Error::Module(format!("invalid semver minor: {s}")))?;
     let patch: u8 = parts[2]
         .parse()
-        .map_err(|_| Error::Module(format!("invalid semver patch: {}", s)))?;
+        .map_err(|_| Error::Module(format!("invalid semver patch: {s}")))?;
     Ok((major, minor, patch))
 }
 
@@ -761,7 +762,7 @@ impl Manifest {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Module(format!("cannot read {}: {}", path.display(), e)))?;
         let toml_val: TomlManifest = toml::from_str(&content)
-            .map_err(|e| Error::Module(format!("invalid manifest TOML: {}", e)))?;
+            .map_err(|e| Error::Module(format!("invalid manifest TOML: {e}")))?;
 
         let (major, minor, patch) = parse_semver(&toml_val.version)?;
         let module_version = encode_semver(major, minor, patch);
@@ -789,12 +790,11 @@ impl Manifest {
             if let Some(ref name) = p.name {
                 if name == "in" || name == "out" || name == "ctrl" {
                     return Err(Error::Module(format!(
-                        "port name '{}' is a reserved word",
-                        name
+                        "port name '{name}' is a reserved word"
                     )));
                 }
                 if !port_names.insert(name.clone()) {
-                    return Err(Error::Module(format!("duplicate port name '{}'", name)));
+                    return Err(Error::Module(format!("duplicate port name '{name}'")));
                 }
             }
 
@@ -839,10 +839,9 @@ impl Manifest {
                 Some(bit) => permissions.bits |= bit,
                 None => {
                     return Err(Error::Module(format!(
-                        "unknown permission: {} — expected one of: reconfigure, \
+                        "unknown permission: {name} — expected one of: reconfigure, \
                          flash_raw, backing_provider, platform_raw, monitor, bridge \
                          (see docs/architecture/abi_layers.md)",
-                        name,
                     )));
                 }
             }
@@ -1156,16 +1155,14 @@ impl Manifest {
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         if magic != MANIFEST_MAGIC {
             return Err(Error::Module(format!(
-                "invalid manifest magic: 0x{:08x}",
-                magic
+                "invalid manifest magic: 0x{magic:08x}"
             )));
         }
 
         let version = data[4];
         if version != MANIFEST_VERSION {
             return Err(Error::Module(format!(
-                "unsupported manifest version: {}",
-                version
+                "unsupported manifest version: {version}"
             )));
         }
 
@@ -1294,8 +1291,8 @@ impl Manifest {
             format!("  version: {}.{}.{}", major, minor, patch),
             format!("  hardware_targets: 0x{:04x}", self.hardware_targets),
             match self.required_caps_mask() {
-                Ok(m) => format!("  required_caps: 0x{:08x}", m),
-                Err(e) => format!("  required_caps: <error: {}>", e),
+                Ok(m) => format!("  required_caps: 0x{m:08x}"),
+                Err(e) => format!("  required_caps: <error: {e}>"),
             },
         ];
         if self.state_size_hint > 0 {
@@ -1368,8 +1365,8 @@ impl Manifest {
             }
         }
         if let Some(hash) = &self.integrity_hash {
-            let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-            lines.push(format!("  integrity: sha256:{}", hex));
+            let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+            lines.push(format!("  integrity: sha256:{hex}"));
         }
         lines.join("\n")
     }
@@ -1491,19 +1488,43 @@ impl TargetCapabilities {
         };
         match silicon {
             // Cortex-M0+, no FPU, no SIMD, no MMU.
-            "rp2040" => Self { fpu: false, neon: false, mmu: false },
+            "rp2040" => Self {
+                fpu: false,
+                neon: false,
+                mmu: false,
+            },
             // Cortex-M33 with FPv5-SP single-precision FPU, no SIMD,
             // MPU but not MMU.
-            s if s.starts_with("rp2350") => Self { fpu: true, neon: false, mmu: false },
+            s if s.starts_with("rp2350") => Self {
+                fpu: true,
+                neon: false,
+                mmu: false,
+            },
             // Cortex-A76 quad-core, full FP/NEON, full MMU.
-            "bcm2712" => Self { fpu: true, neon: true, mmu: true },
+            "bcm2712" => Self {
+                fpu: true,
+                neon: true,
+                mmu: true,
+            },
             // Hosted: always all-yes (running on the dev machine).
-            "linux" => Self { fpu: true, neon: true, mmu: true },
+            "linux" => Self {
+                fpu: true,
+                neon: true,
+                mmu: true,
+            },
             // WASM: no NEON in the portable target; FPU yes via
             // wasm-mvp; no MMU (linear memory only).
-            "wasm" | "wasm32" => Self { fpu: true, neon: false, mmu: false },
+            "wasm" | "wasm32" => Self {
+                fpu: true,
+                neon: false,
+                mmu: false,
+            },
             // Unknown — fail closed.
-            _ => Self { fpu: false, neon: false, mmu: false },
+            _ => Self {
+                fpu: false,
+                neon: false,
+                mmu: false,
+            },
         }
     }
 }
@@ -1517,10 +1538,7 @@ impl TargetCapabilities {
 /// resolved per-module target after `parse_modules_from_config`. The
 /// resulting error message is operator-facing (cites silicon id and
 /// the missing caps).
-pub fn check_target_capabilities(
-    manifest_requires: TomlRequires,
-    silicon: &str,
-) -> Result<()> {
+pub fn check_target_capabilities(manifest_requires: TomlRequires, silicon: &str) -> Result<()> {
     let caps = TargetCapabilities::for_silicon(silicon);
     let mut missing: Vec<&str> = Vec::new();
     if manifest_requires.fpu && !caps.fpu {
@@ -1699,7 +1717,7 @@ type = "u32"
 default = 1
 "#;
         let err = parse_toml(src).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("[[params]] is only valid on built-in modules"),
             "unexpected message: {msg}",
@@ -1767,7 +1785,7 @@ default = "/tmp/foo"
 required = true
 "#;
         let err = parse_toml(src).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("mutually exclusive"), "unexpected: {msg}");
     }
 }

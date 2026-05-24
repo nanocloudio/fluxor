@@ -22,3 +22,7 @@ host-test = []
 
 [dependencies]
 fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }
+
+# Dual-build module — see fluxor-mod-ip's Cargo.toml.
+[lints]
+workspace = true

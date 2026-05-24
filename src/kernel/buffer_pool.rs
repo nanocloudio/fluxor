@@ -114,15 +114,13 @@ static mut BUFFER_ARENA_OFFSET: usize = 0;
 ///
 /// Returns pointer to zeroed buffer, aligned to 4 bytes.
 fn alloc_buffer(size: usize) -> Option<*mut u8> {
+    // SAFETY: bump-allocator on `BUFFER_ARENA`; `aligned + size <= ARENA_SIZE`
+    // is checked above so the pointer is in-bounds. Single-threaded boot path
+    // (called during scheduler::prepare_graph), no concurrent allocators.
     unsafe {
         let aligned = (BUFFER_ARENA_OFFSET + 3) & !3;
         if aligned + size > BUFFER_ARENA_SIZE {
-            log::error!(
-                "[buf] arena full need={} used={} cap={}",
-                size,
-                aligned,
-                BUFFER_ARENA_SIZE
-            );
+            log::error!("[buf] arena full need={size} used={aligned} cap={BUFFER_ARENA_SIZE}");
             return None;
         }
         let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0)
@@ -136,6 +134,7 @@ fn alloc_buffer(size: usize) -> Option<*mut u8> {
 
 /// Reset the buffer arena for a new graph configuration.
 pub fn reset_buffer_arena() {
+    // SAFETY: called between graph rebuilds; no buffer pointers are live.
     unsafe {
         BUFFER_ARENA_OFFSET = 0;
     }
@@ -143,6 +142,7 @@ pub fn reset_buffer_arena() {
 
 /// Return current buffer arena usage: (used_bytes, total_bytes).
 pub fn buffer_arena_usage() -> (usize, usize) {
+    // SAFETY: `BUFFER_ARENA_OFFSET` is a `usize`; load is atomic-sized.
     unsafe { (BUFFER_ARENA_OFFSET, BUFFER_ARENA_SIZE) }
 }
 
@@ -212,6 +212,10 @@ struct BufferRegistrySlot {
     producer_module: AtomicU8,
 }
 
+// SAFETY: The `data_ptr` UnsafeCell is mutated only via dedicated
+// state-transitioning helpers (claim/release/migrate) that take
+// `&mut self` from the global registry while holding the
+// `state`/`owner_channel` atomic guards. All other fields are atomics.
 unsafe impl Sync for BufferRegistrySlot {}
 
 impl BufferRegistrySlot {
@@ -244,11 +248,17 @@ impl BufferRegistrySlot {
 
     #[inline]
     fn data_ptr(&self) -> *mut u8 {
+        // SAFETY: `data_ptr` is an `UnsafeCell<*mut u8>`; reading a copy
+        // of the raw pointer is a single load. The producer/consumer
+        // handshake uses the atomic `len`/`owner_channel` fields to
+        // synchronise access to the pointed-at memory.
         unsafe { *self.data_ptr.get() }
     }
 
     /// Assign arena-allocated memory to this slot.
     fn assign(&self, ptr: *mut u8, capacity: usize, channel: i16) {
+        // SAFETY: `assign` is called from `prepare_graph` on the
+        // single-threaded boot path; no other accessors are live.
         unsafe {
             *self.data_ptr.get() = ptr;
         }
@@ -358,6 +368,7 @@ impl BufferRegistrySlot {
         self.len.store(0, Ordering::Release);
         self.inplace_flag.store(0, Ordering::Release);
         self.producer_module.store(0xFF, Ordering::Release);
+        // SAFETY: reset called from prepare_graph teardown; no other accessor.
         unsafe {
             *self.data_ptr.get() = core::ptr::null_mut();
         }
@@ -419,13 +430,13 @@ pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module
                     // Roll back the slot claim so it can be retried for a
                     // smaller capacity.
                     slot.state.store(STATE_FREE, Ordering::Release);
-                    log::warn!("[buf] arena exhausted size={}", capacity);
+                    log::warn!("[buf] arena exhausted size={capacity}");
                     return -1;
                 }
             }
         }
     }
-    log::warn!("[buf] no free slots ch={}", channel);
+    log::warn!("[buf] no free slots ch={channel}");
     -1
 }
 

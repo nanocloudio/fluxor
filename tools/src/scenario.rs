@@ -83,7 +83,10 @@ pub struct ComponentSpec {
     /// actual deploy-time merge lives in the route-merger / spawn path
     /// (PRs 2–4).
     #[serde(default)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     pub params: BTreeMap<String, BTreeMap<String, serde_yaml::Value>>,
 }
 
@@ -269,11 +272,14 @@ struct InlineScenarioBlock {
 /// reference components by name exactly like an explicit scenario file
 /// would.
 pub fn synthesize_from_graph(graph_path: &Path) -> Result<Option<Scenario>> {
-    let text = fs::read_to_string(graph_path).map_err(|e| {
-        Error::Config(format!("graph {}: {}", graph_path.display(), e))
-    })?;
+    let text = fs::read_to_string(graph_path)
+        .map_err(|e| Error::Config(format!("graph {}: {}", graph_path.display(), e)))?;
     let probe: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| {
-        Error::Config(format!("graph {}: YAML parse error: {}", graph_path.display(), e))
+        Error::Config(format!(
+            "graph {}: YAML parse error: {}",
+            graph_path.display(),
+            e
+        ))
     })?;
     let Some(block_value) = probe.get("scenario") else {
         return Ok(None);
@@ -642,9 +648,7 @@ fn check_binding_dag(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
         let Some((on_comp, _)) = on.split_once('.') else {
             continue;
         };
-        adj.entry(serve.serve.as_str())
-            .or_default()
-            .push(on_comp);
+        adj.entry(serve.serve.as_str()).or_default().push(on_comp);
     }
 
     let mut color: HashMap<&str, u8> = HashMap::new(); // 0=white, 1=gray, 2=black
@@ -776,8 +780,7 @@ pub fn synthesise_host_config(
 ///
 /// Edits to either file rebuild `fluxor-tools` automatically —
 /// `include_str!` registers the file as a build dependency.
-const CANONICAL_RUNTIME_HTML_RAW: &str =
-    include_str!("../../src/platform/wasm/host/runtime.html");
+const CANONICAL_RUNTIME_HTML_RAW: &str = include_str!("../../src/platform/wasm/host/runtime.html");
 const CANONICAL_HOST_SHIMS_JS_RAW: &str =
     include_str!("../../src/platform/wasm/host/host_shims.js");
 
@@ -948,12 +951,8 @@ fn synthesise_host_routes(
     } else {
         format!("{}/scenario.json", runtime_prefix.trim_end_matches('/'))
     };
-    let scenario_json_body = build_scenario_json(
-        scenario,
-        scenario_path,
-        serve_component,
-        &bundle_route_url,
-    )?;
+    let scenario_json_body =
+        build_scenario_json(scenario, scenario_path, serve_component, &bundle_route_url)?;
     routes.push(serde_json::json!({
         "path": scenario_json_url,
         "body": scenario_json_body,
@@ -1016,12 +1015,16 @@ fn build_scenario_json(
     // synthesised default. We read the graph file to find the
     // `presentation:` block.
     let presentation = serve_component
-        .and_then(|c| read_component_presentation(scenario, scenario_path, c).ok().flatten())
+        .and_then(|c| {
+            read_component_presentation(scenario, scenario_path, c)
+                .ok()
+                .flatten()
+        })
         .unwrap_or_else(default_presentation);
     obj.insert("presentation".into(), presentation);
 
     serde_json::to_string_pretty(&serde_json::Value::Object(obj))
-        .map_err(|e| Error::Config(format!("serialise scenario.json: {}", e)))
+        .map_err(|e| Error::Config(format!("serialise scenario.json: {e}")))
 }
 
 /// Map a `list:` binding's `formats:` extension list to a coarse
@@ -1031,7 +1034,10 @@ fn playlist_filter_for_formats(formats: &[String]) -> &'static str {
     let mut has_audio = false;
     for f in formats {
         let f = f.to_ascii_lowercase();
-        if matches!(f.as_str(), ".png" | ".jpg" | ".jpeg" | ".gif" | ".bmp" | ".webp") {
+        if matches!(
+            f.as_str(),
+            ".png" | ".jpg" | ".jpeg" | ".gif" | ".bmp" | ".webp"
+        ) {
             has_image = true;
         }
         if matches!(f.as_str(), ".wav" | ".mp3" | ".aac" | ".ogg" | ".flac") {
@@ -1053,9 +1059,10 @@ fn read_component_presentation(
     scenario_path: &Path,
     comp_name: &str,
 ) -> Result<Option<serde_json::Value>> {
-    let comp = scenario.components.get(comp_name).ok_or_else(|| {
-        Error::Config(format!("undefined component `{}`", comp_name))
-    })?;
+    let comp = scenario
+        .components
+        .get(comp_name)
+        .ok_or_else(|| Error::Config(format!("undefined component `{comp_name}`")))?;
     let base = scenario_path
         .parent()
         .ok_or_else(|| Error::Config("scenario path has no parent dir".into()))?;
@@ -1096,7 +1103,11 @@ fn absolute_or_join(base: &Path, p: &Path) -> PathBuf {
 /// the same path to `build_one()` as `output_override` at spawn time)
 /// so the synthesised host's `fs_path:` route and the actual build
 /// artefact agree byte-for-byte.
-fn bundle_path_for(_scenario_path: &Path, comp_name: &str, comp: &ComponentSpec) -> Result<PathBuf> {
+fn bundle_path_for(
+    _scenario_path: &Path,
+    comp_name: &str,
+    comp: &ComponentSpec,
+) -> Result<PathBuf> {
     let rel = wasm_bundle_target_path(comp_name, comp)?;
     let mut abs = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     abs.push(rel);
@@ -1108,8 +1119,8 @@ fn bundle_path_for(_scenario_path: &Path, comp_name: &str, comp: &ComponentSpec)
 /// `--print-merged`.
 fn render_value_as_yaml(value: &serde_json::Value, banner: &str) -> Result<String> {
     let body = serde_yaml::to_string(value)
-        .map_err(|e| Error::Config(format!("serialise synthesised graph: {}", e)))?;
-    Ok(format!("{}\n{}", banner, body))
+        .map_err(|e| Error::Config(format!("serialise synthesised graph: {e}")))?;
+    Ok(format!("{banner}\n{body}"))
 }
 
 /// Emit the synthesised host graph YAML to stdout (or anywhere — the
@@ -1231,7 +1242,10 @@ pub fn merge_bindings_for_component(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let has_bindings_for_us = scenario.bindings.iter().any(|b| binding_targets(b, comp_name));
+    let has_bindings_for_us = scenario
+        .bindings
+        .iter()
+        .any(|b| binding_targets(b, comp_name));
     if has_bindings_for_us && !target_supports_host_fs(&target_str) {
         return Err(Error::Config(format!(
             "scenario {}: binding(s) target `{}.<http>` but `{}`'s effective target is `{}`, \
@@ -1261,7 +1275,10 @@ pub fn merge_bindings_for_component(
                         on
                     ))
                 })?;
-                (m.to_string(), serve_binding_routes(s, scenario, base, scenario_path)?)
+                (
+                    m.to_string(),
+                    serve_binding_routes(s, scenario, base, scenario_path)?,
+                )
             }
             Binding::List(l) if binding_targets(binding, comp_name) => {
                 let on = l.on.as_ref().unwrap();
@@ -1326,14 +1343,16 @@ fn rewrite_wiring_module(config: &mut serde_json::Value, old_name: &str, new_nam
     let Some(wiring) = config.get_mut("wiring").and_then(|w| w.as_array_mut()) else {
         return;
     };
-    let prefix = format!("{}.", old_name);
-    let replacement = format!("{}.", new_name);
+    let prefix = format!("{old_name}.");
+    let replacement = format!("{new_name}.");
     for edge in wiring {
         for field in ["from", "to"] {
-            let Some(val) = edge.get_mut(field) else { continue };
+            let Some(val) = edge.get_mut(field) else {
+                continue;
+            };
             let Some(s) = val.as_str() else { continue };
             if let Some(rest) = s.strip_prefix(&prefix) {
-                *val = serde_json::Value::String(format!("{}{}", replacement, rest));
+                *val = serde_json::Value::String(format!("{replacement}{rest}"));
             }
         }
     }
@@ -1352,7 +1371,10 @@ fn target_supports_host_fs(target: &str) -> bool {
 /// responses.  Discovered while bringing PR 6's image_viewer
 /// scenario end-to-end.
 const MAX_FS_PATH_HOST: usize = 256;
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 const MAX_FS_PATH_EMBEDDED: usize = 64;
 
 fn check_fs_path_length(
@@ -1395,10 +1417,8 @@ fn serve_binding_routes(
     // runtime shell embedded in fluxor-tools is mounted instead.
     // Custom shells (test harness, bespoke research UIs) still set
     // `host_page:` explicitly to override with an on-disk file.
-    let override_page_path: Option<PathBuf> = comp
-        .host_page
-        .as_ref()
-        .map(|hp| absolute_or_join(base, hp));
+    let override_page_path: Option<PathBuf> =
+        comp.host_page.as_ref().map(|hp| absolute_or_join(base, hp));
     let bundle_path = bundle_path_for(scenario_path, &s.serve, comp)?;
     let bundle_url = if s.prefix == "/" {
         "/fluxor.wasm".to_string()
@@ -1440,7 +1460,7 @@ fn serve_binding_routes(
     let prefix_with_slash = if prefix_no_slash.is_empty() {
         "/".to_string()
     } else {
-        format!("{}/", prefix_no_slash)
+        format!("{prefix_no_slash}/")
     };
     // Build the page-route value (embedded body OR override fs_path).
     let make_page_route = |path: String| -> serde_json::Value {
@@ -1458,10 +1478,13 @@ fn serve_binding_routes(
             })
         }
     };
-    let mut routes = vec![make_page_route(
-        if prefix_no_slash.is_empty() { "/".to_string() } else { prefix_no_slash.clone() },
-    )];
-    if prefix_with_slash != prefix_no_slash && prefix_no_slash != "/" && !prefix_no_slash.is_empty() {
+    let mut routes = vec![make_page_route(if prefix_no_slash.is_empty() {
+        "/".to_string()
+    } else {
+        prefix_no_slash.clone()
+    })];
+    if prefix_with_slash != prefix_no_slash && prefix_no_slash != "/" && !prefix_no_slash.is_empty()
+    {
         routes.push(make_page_route(prefix_with_slash));
     }
     routes.push(serde_json::json!({
@@ -1501,7 +1524,10 @@ fn list_binding_route(l: &ListBinding, base: &Path) -> Result<serde_json::Value>
     Ok(serde_json::Value::Object(entry))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ABI-shaped function; argument list mirrors the syscall / register signature"
+)]
 fn inject_routes_into_module(
     config: &mut serde_json::Value,
     module_name: &str,
@@ -1546,11 +1572,7 @@ fn inject_routes_into_module(
         .and_then(|r| r.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|r| {
-                    r.get("path")
-                        .and_then(|p| p.as_str())
-                        .map(String::from)
-                })
+                .filter_map(|r| r.get("path").and_then(|p| p.as_str()).map(String::from))
                 .collect()
         })
         .unwrap_or_default();
@@ -1695,19 +1717,23 @@ pub fn wasm_bundle_target_path(comp_name: &str, comp: &ComponentSpec) -> Result<
     let graph = comp
         .graph
         .as_ref()
-        .ok_or_else(|| Error::Config(format!("component `{}` has no `graph:`", comp_name)))?;
-    let stem = graph
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| Error::Config(format!("component `{}` graph has no filename stem", comp_name)))?;
-    Ok(PathBuf::from(format!("target/wasm/{}.wasm", stem)))
+        .ok_or_else(|| Error::Config(format!("component `{comp_name}` has no `graph:`")))?;
+    let stem = graph.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+        Error::Config(format!(
+            "component `{comp_name}` graph has no filename stem"
+        ))
+    })?;
+    Ok(PathBuf::from(format!("target/wasm/{stem}.wasm")))
 }
 
 /// True when this scenario has exactly one component. Kept for
 /// introspection / future fast-path dispatch; PR 4's spawn path
 /// handles single-component scenarios as a degenerate case of the
 /// generic multi-component flow.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 pub fn is_single_component(scenario: &Scenario) -> bool {
     scenario.components.len() == 1
 }
@@ -1735,20 +1761,18 @@ pub fn effective_target(scenario_path: &Path, comp: &ComponentSpec) -> String {
 /// but the readiness probe falls back to "child has exited" instead
 /// of "child bound a listener".
 pub fn extract_http_port(config: &serde_json::Value) -> Option<u16> {
-    config
-        .get("modules")?
-        .as_array()?
-        .iter()
-        .find_map(|m| {
-            // The convention is `name: http` for the http module; if
-            // a future scenario names it differently we'd need
-            // explicit per-component port hints in the schema.
-            let name = m.get("name").and_then(|n| n.as_str())?;
-            if name != "http" {
-                return None;
-            }
-            m.get("port").and_then(|p| p.as_u64()).and_then(|p| u16::try_from(p).ok())
-        })
+    config.get("modules")?.as_array()?.iter().find_map(|m| {
+        // The convention is `name: http` for the http module; if
+        // a future scenario names it differently we'd need
+        // explicit per-component port hints in the schema.
+        let name = m.get("name").and_then(|n| n.as_str())?;
+        if name != "http" {
+            return None;
+        }
+        m.get("port")
+            .and_then(|p| p.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+    })
 }
 
 /// Write a merged-config YAML to disk under
@@ -1777,7 +1801,7 @@ pub fn write_merged_component_yaml(
         comp_name,
     );
     let yaml = render_value_as_yaml(&merged, &banner)?;
-    let path = work_dir.join(format!("{}.yaml", comp_name));
+    let path = work_dir.join(format!("{comp_name}.yaml"));
     fs::write(&path, yaml).map_err(|e| {
         Error::Config(format!(
             "scenario {}: cannot write {}: {}",
@@ -1901,7 +1925,10 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
             if manifest_targets.is_empty() {
                 continue;
             }
-            if !manifest_targets.iter().any(|m| aliases.iter().any(|a| a == m)) {
+            if !manifest_targets
+                .iter()
+                .any(|m| aliases.iter().any(|a| a == m))
+            {
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` uses module `{}` (type `{}`) — its \
                      manifest at {} declares hardware_targets = {:?}, which does not \
@@ -1993,7 +2020,12 @@ pub fn revalidate_all(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
         let comp = scenario.components.get(comp_name).unwrap();
         let merged = merge_bindings_for_component(comp_name, scenario, scenario_path)?;
         let effective = effective_target_for(comp)
-            .or_else(|| merged.get("target").and_then(|t| t.as_str()).map(String::from))
+            .or_else(|| {
+                merged
+                    .get("target")
+                    .and_then(|t| t.as_str())
+                    .map(String::from)
+            })
             .unwrap_or_else(|| "linux".to_string());
         let target_desc = match load_target(&effective, &project_root) {
             Ok(d) => d,
@@ -2107,30 +2139,28 @@ pub fn render_graphviz(scenario: &Scenario) -> String {
     }
     let mut nodes: HashSet<&str> = scenario.components.keys().map(String::as_str).collect();
     for name in &nodes {
-        out.push_str(&format!("  \"{}\" [label=\"{}\"];\n", name, name));
+        out.push_str(&format!("  \"{name}\" [label=\"{name}\"];\n"));
     }
     nodes.clear();
     for binding in &scenario.bindings {
         match binding {
             Binding::Serve(s) => {
-                let dst = s
-                    .on
-                    .as_deref()
-                    .and_then(|on| on.split_once('.'))
-                    .map(|(c, _)| c.to_string())
-                    .unwrap_or_else(|| "host".to_string());
+                let dst =
+                    s.on.as_deref()
+                        .and_then(|on| on.split_once('.'))
+                        .map(|(c, _)| c.to_string())
+                        .unwrap_or_else(|| "host".to_string());
                 out.push_str(&format!(
                     "  \"{}\" -> \"{}\" [label=\"serve\"];\n",
                     s.serve, dst
                 ));
             }
             Binding::List(l) => {
-                let dst = l
-                    .on
-                    .as_deref()
-                    .and_then(|on| on.split_once('.'))
-                    .map(|(c, _)| c.to_string())
-                    .unwrap_or_else(|| "host".to_string());
+                let dst =
+                    l.on.as_deref()
+                        .and_then(|on| on.split_once('.'))
+                        .map(|(c, _)| c.to_string())
+                        .unwrap_or_else(|| "host".to_string());
                 out.push_str(&format!(
                     "  \"{}\" -> \"{}\" [label=\"list {}\"];\n",
                     l.list.display(),
@@ -2163,7 +2193,7 @@ mod tests {
     /// cleaned up automatically when the test ends.
     fn make_temp_tree(name: &str, scenario_yaml: &str) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::Builder::new()
-            .prefix(&format!("fluxor_scenario_test_{}_", name))
+            .prefix(&format!("fluxor_scenario_test_{name}_"))
             .tempdir()
             .expect("temp dir");
         let dir = tmp.path();
@@ -2181,7 +2211,7 @@ mod tests {
         )
         .unwrap();
         let scenario = dir.join("scenario.yaml");
-        write!(fs::File::create(&scenario).unwrap(), "{}", scenario_yaml).unwrap();
+        write!(fs::File::create(&scenario).unwrap(), "{scenario_yaml}").unwrap();
         (tmp, scenario)
     }
 
@@ -2229,11 +2259,10 @@ bindings:
         );
         let s = parse(&path).unwrap();
         let err = validate(&s, &path).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("`host:`") || msg.contains("origin"),
-            "expected host-missing error, got: {}",
-            msg
+            "expected host-missing error, got: {msg}"
         );
     }
 
@@ -2257,11 +2286,10 @@ bindings:
         );
         let s = parse(&path).unwrap();
         let err = validate(&s, &path).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("runtime_override") && msg.contains("wasm"),
-            "expected runtime_override: wasm rejection, got: {}",
-            msg
+            "expected runtime_override: wasm rejection, got: {msg}"
         );
     }
 
@@ -2279,11 +2307,10 @@ bindings:
         )
         .unwrap();
         let err = parse(&path).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("graph YAML") || msg.contains("kind"),
-            "expected helpful kind: error, got: {}",
-            msg
+            "expected helpful kind: error, got: {msg}"
         );
     }
 
@@ -2310,11 +2337,10 @@ host:
         .unwrap();
         let s = parse(&path).unwrap();
         let err = validate(&s, &path).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("does not exist") && msg.contains("missing"),
-            "expected missing-graph error, got: {}",
-            msg
+            "expected missing-graph error, got: {msg}"
         );
     }
 
@@ -2455,7 +2481,7 @@ bindings:
         scenario_yaml: &str,
     ) -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::Builder::new()
-            .prefix(&format!("fluxor_scenario_test_{}_", name))
+            .prefix(&format!("fluxor_scenario_test_{name}_"))
             .tempdir()
             .unwrap();
         let dir = tmp.path();
@@ -2463,8 +2489,7 @@ bindings:
         fs::create_dir_all(dir.join("viewer")).unwrap();
         write!(
             fs::File::create(dir.join("decoder/graph.yaml")).unwrap(),
-            "{}",
-            decoder_yaml
+            "{decoder_yaml}"
         )
         .unwrap();
         write!(
@@ -2478,7 +2503,7 @@ bindings:
         )
         .unwrap();
         let scenario = dir.join("scenario.yaml");
-        write!(fs::File::create(&scenario).unwrap(), "{}", scenario_yaml).unwrap();
+        write!(fs::File::create(&scenario).unwrap(), "{scenario_yaml}").unwrap();
         (tmp, scenario)
     }
 
@@ -2513,8 +2538,7 @@ bindings:
             .unwrap_or(false);
         assert!(
             accept,
-            "synthesised host must opt into accept_cycles, got: {:?}",
-            scheduler
+            "synthesised host must opt into accept_cycles, got: {scheduler:?}"
         );
     }
 
@@ -2553,10 +2577,7 @@ bindings:
         // (2 more); list binding contributes /api/list (1 more).
         // Total = 5.
         assert_eq!(routes.len(), 5);
-        let paths: Vec<&str> = routes
-            .iter()
-            .map(|r| r["path"].as_str().unwrap())
-            .collect();
+        let paths: Vec<&str> = routes.iter().map(|r| r["path"].as_str().unwrap()).collect();
         assert!(paths.contains(&"/"));
         assert!(paths.contains(&"/fluxor.wasm"));
         assert!(paths.contains(&"/host_shims.js"));
@@ -2600,10 +2621,7 @@ bindings:
         // Original /api/list + 4 binding-injected routes (page,
         // bundle, host_shims.js, scenario.json — commit 1c).
         assert_eq!(routes.len(), 5);
-        let paths: Vec<&str> = routes
-            .iter()
-            .map(|r| r["path"].as_str().unwrap())
-            .collect();
+        let paths: Vec<&str> = routes.iter().map(|r| r["path"].as_str().unwrap()).collect();
         assert!(paths.contains(&"/api/list"));
         assert!(paths.contains(&"/"));
         assert!(paths.contains(&"/fluxor.wasm"));
@@ -2640,12 +2658,21 @@ bindings:
         );
         let s = parse(&path).unwrap();
         let err = merge_bindings_for_component("decoder", &s, &path).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         // Per RFC §7 the error must name the binding, cite the file,
         // and suggest a `prefix:` value.
-        assert!(msg.contains("serve: viewer"), "should name the binding, got: {}", msg);
-        assert!(msg.contains("decoder/graph.yaml"), "should cite the file, got: {}", msg);
-        assert!(msg.contains("prefix:"), "should suggest a prefix, got: {}", msg);
+        assert!(
+            msg.contains("serve: viewer"),
+            "should name the binding, got: {msg}"
+        );
+        assert!(
+            msg.contains("decoder/graph.yaml"),
+            "should cite the file, got: {msg}"
+        );
+        assert!(
+            msg.contains("prefix:"),
+            "should suggest a prefix, got: {msg}"
+        );
     }
 
     #[test]
@@ -2677,11 +2704,10 @@ bindings:
         );
         let s = parse(&path).unwrap();
         let err = merge_bindings_for_component("decoder", &s, &path).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("host filesystem") && msg.contains("runtime_override"),
-            "should explain host-FS gate (RFC §16 Q9), got: {}",
-            msg
+            "should explain host-FS gate (RFC §16 Q9), got: {msg}"
         );
     }
 
@@ -2744,11 +2770,10 @@ bindings:
         );
         let s = parse(&path).unwrap();
         let err = merge_bindings_for_component("decoder", &s, &path).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("no module named") && msg.contains("http"),
-            "should name the missing module clearly, got: {}",
-            msg
+            "should name the missing module clearly, got: {msg}"
         );
     }
 
@@ -2930,18 +2955,15 @@ bindings:
                 }
                 panic!("expected mismatch error, got Ok");
             }
-            Err(e) => format!("{}", e),
+            Err(e) => format!("{e}"),
         };
         assert!(
             err.contains("hardware_targets") && err.contains("effective target"),
-            "expected helpful mask error, got: {}",
-            err
+            "expected helpful mask error, got: {err}"
         );
         assert!(
-            err.contains("modules/foundation/wifi/manifest.toml")
-                || err.contains("wifi"),
-            "expected manifest path / module name cited, got: {}",
-            err
+            err.contains("modules/foundation/wifi/manifest.toml") || err.contains("wifi"),
+            "expected manifest path / module name cited, got: {err}"
         );
     }
 
@@ -2983,7 +3005,7 @@ bindings:
 
         match res {
             Ok(()) => {}
-            Err(e) => panic!("expected pass under runtime_override: linux, got: {}", e),
+            Err(e) => panic!("expected pass under runtime_override: linux, got: {e}"),
         }
     }
 
@@ -3042,11 +3064,7 @@ bindings:
         .unwrap();
         let s = parse(&path).unwrap();
         let err = validate(&s, &path).unwrap_err();
-        let msg = format!("{}", err);
-        assert!(
-            msg.contains("cyclic"),
-            "expected cycle error, got: {}",
-            msg
-        );
+        let msg = format!("{err}");
+        assert!(msg.contains("cyclic"), "expected cycle error, got: {msg}");
     }
 }

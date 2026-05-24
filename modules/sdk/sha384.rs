@@ -49,7 +49,15 @@ impl Sha384 {
             total_len: 0,
         }
     }
+}
 
+impl Default for Sha384 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha384 {
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
         self.total_len += data.len() as u64;
@@ -57,6 +65,8 @@ impl Sha384 {
         if self.buf_len > 0 {
             let space = 128 - self.buf_len;
             let take = if data.len() < space { data.len() } else { space };
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf.as_mut_ptr().add(self.buf_len), take);
             }
@@ -72,6 +82,8 @@ impl Sha384 {
 
         while offset + 128 <= data.len() {
             let mut block = [0u8; 128];
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), 128);
             }
@@ -81,6 +93,8 @@ impl Sha384 {
 
         let remain = data.len() - offset;
         if remain > 0 {
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), self.buf.as_mut_ptr(), remain);
             }
@@ -95,6 +109,8 @@ impl Sha384 {
         self.buf_len += 1;
 
         if self.buf_len > 112 {
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
             unsafe {
                 let p = self.buf.as_mut_ptr().add(self.buf_len);
                 for i in 0..(128 - self.buf_len) { core::ptr::write_volatile(p.add(i), 0); }
@@ -104,6 +120,8 @@ impl Sha384 {
             self.buf_len = 0;
         }
 
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant keeps offsets in range.
         unsafe {
             let p = self.buf.as_mut_ptr().add(self.buf_len);
             for i in 0..(112 - self.buf_len) { core::ptr::write_volatile(p.add(i), 0); }
@@ -112,6 +130,8 @@ impl Sha384 {
         // Append 128-bit length (big-endian) — high 64 bits are 0 for our sizes
         let len_hi = (bit_len >> 64) as u64;
         let len_lo = bit_len as u64;
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant keeps offsets in range.
         unsafe {
             core::ptr::copy_nonoverlapping(len_hi.to_be_bytes().as_ptr(), self.buf.as_mut_ptr().add(112), 8);
             core::ptr::copy_nonoverlapping(len_lo.to_be_bytes().as_ptr(), self.buf.as_mut_ptr().add(120), 8);
@@ -193,7 +213,7 @@ fn compress512(state: &mut [u64; 8], block: &[u8; 128]) {
     state[7] = state[7].wrapping_add(h);
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 pub fn sha384(data: &[u8]) -> [u8; 48] {
     let mut h = Sha384::new();
     h.update(data);

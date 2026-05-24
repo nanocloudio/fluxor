@@ -176,6 +176,9 @@ static mut VTABLES: [Option<&'static ProviderVTable>; MAX_CONTRACTS] =
 pub fn register_vtable(vt: &'static ProviderVTable) {
     let idx = vt.contract as usize;
     assert!(idx < MAX_CONTRACTS, "contract id out of range");
+    // SAFETY: vtable registration is single-threaded boot-time work; no
+    // concurrent reader observes VTABLES at this point. `idx` bounded
+    // by the assert.
     unsafe {
         VTABLES[idx] = Some(vt);
     }
@@ -187,6 +190,8 @@ fn vtable_for(contract: ContractId) -> Option<&'static ProviderVTable> {
     if idx >= MAX_CONTRACTS {
         return None;
     }
+    // SAFETY: VTABLES is set during boot; read-only after that. `idx`
+    // bounded above.
     unsafe { VTABLES[idx] }
 }
 
@@ -229,6 +234,8 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
     if fd_tag_contract(handle).is_some() {
         return Ok(());
     }
+    // SAFETY: HANDLE_BINDINGS is scheduler-thread-owned; track_handle
+    // is called from provider_open which serialises on the kernel side.
     unsafe {
         let p = &raw mut HANDLE_BINDINGS;
         for slot in (*p).iter_mut() {
@@ -239,11 +246,8 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
             }
         }
         log::error!(
-            "[provider] HANDLE_BINDINGS exhausted (MAX_TRACKED={}); refusing to leak \
-             untracked handle {} for contract {:#x}",
-            MAX_TRACKED,
-            handle,
-            contract,
+            "[provider] HANDLE_BINDINGS exhausted (MAX_TRACKED={MAX_TRACKED}); refusing to leak \
+             untracked handle {handle} for contract {contract:#x}",
         );
         Err(())
     }
@@ -312,6 +316,8 @@ fn lookup_contract(handle: i32) -> Option<ContractId> {
     if let Some(c) = fd_tag_contract(handle) {
         return Some(c);
     }
+    // SAFETY: HANDLE_BINDINGS read-only path; the producer side is
+    // serialised on the scheduler thread.
     unsafe {
         let p = &raw const HANDLE_BINDINGS;
         for slot in (*p).iter() {
@@ -327,6 +333,7 @@ fn release_handle(handle: i32) {
     if handle < 0 {
         return;
     }
+    // SAFETY: scheduler-thread-only mutation.
     unsafe {
         let p = &raw mut HANDLE_BINDINGS;
         for slot in (*p).iter_mut() {
@@ -389,10 +396,13 @@ pub fn provider_open(
     config_len: usize,
 ) -> i32 {
     let handle = match vtable_for(contract) {
+        // SAFETY: vt.call is the contract's registered fn-pointer; passing
+        // -1 (no handle yet) with the open opcode and caller's config buf.
         Some(vt) => unsafe { (vt.call)(-1, open_op, config as *mut u8, config_len) },
         None => {
             // No vtable — fall back to the contract's registered
             // chain dispatcher directly.
+            // SAFETY: as above; `dispatch` enforces its own bounds checks.
             unsafe { dispatch(contract, -1, open_op, config as *mut u8, config_len) }
         }
     };
@@ -408,8 +418,7 @@ pub fn provider_open(
                 fd::tag_fd(expected, slot)
             } else {
                 log::error!(
-                    "[provider] contract {:#x} open returned handle with tag={} (expected {}); refusing",
-                    contract, actual, expected,
+                    "[provider] contract {contract:#x} open returned handle with tag={actual} (expected {expected}); refusing",
                 );
                 errno::ENOSYS
             }
@@ -429,6 +438,8 @@ pub fn provider_open(
                     // delivered.
                     if let Some(vt) = vtable_for(contract) {
                         if vt.default_close_op != 0 {
+                            // SAFETY: vt.call is the registered fn-pointer;
+                            // null arg, zero len is the close convention.
                             unsafe {
                                 (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0);
                             }
@@ -459,11 +470,15 @@ pub fn provider_open(
 pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
+            // SAFETY: vt.call is the contract's registered ABI entry;
+            // caller owns `arg`/`arg_len` for the call.
             return unsafe { (vt.call)(handle, op, arg, arg_len) };
         }
+        // SAFETY: dispatch routes to the chain-registered handler.
         return unsafe { dispatch(contract, handle, op, arg, arg_len) };
     }
     let contract = ((op >> 8) & 0xFF) as u16;
+    // SAFETY: as above; class-byte dispatch fallback.
     unsafe { dispatch(contract, handle, op, arg, arg_len) }
 }
 
@@ -472,6 +487,7 @@ pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i3
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             return match vt.query {
+                // SAFETY: vt.query is the registered fn-pointer.
                 Some(f) => unsafe { f(handle, key, out, out_len) },
                 None => errno::ENOSYS,
             };
@@ -487,6 +503,7 @@ pub fn provider_close(handle: i32) -> i32 {
     let result = if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             if vt.default_close_op != 0 {
+                // SAFETY: vt.call is the registered fn-pointer.
                 unsafe { (vt.call)(handle, vt.default_close_op, core::ptr::null_mut(), 0) }
             } else {
                 0
@@ -504,6 +521,8 @@ pub fn provider_close(handle: i32) -> i32 {
 /// Clear all handle tracking. Called on `scheduler::reset` so new
 /// graphs don't inherit stale handle→contract bindings.
 pub fn reset_handle_tracking() {
+    // SAFETY: called from scheduler::reset between graph rebuilds; no
+    // module observes HANDLE_BINDINGS at this point.
     unsafe {
         let p = &raw mut HANDLE_BINDINGS;
         for slot in (*p).iter_mut() {
@@ -528,6 +547,8 @@ pub struct HandleTrackingStats {
 /// Cheap: walks `MAX_TRACKED` entries once with relaxed ordering.
 pub fn handle_tracking_stats() -> HandleTrackingStats {
     let mut in_use = 0usize;
+    // SAFETY: read-only walk of HANDLE_BINDINGS; producer side runs on
+    // the scheduler thread.
     unsafe {
         let p = &raw const HANDLE_BINDINGS;
         for slot in (*p).iter() {
@@ -606,6 +627,8 @@ static mut PROVIDERS: [ProviderEntry; MAX_PROVIDERS] =
 pub fn register(contract: ContractId, dispatch: ProviderDispatch) {
     let idx = contract as usize;
     assert!(idx < MAX_PROVIDERS, "contract id out of range");
+    // SAFETY: register runs once per contract during boot; no concurrent
+    // reader observes PROVIDERS[idx].kernel_dispatch.
     unsafe {
         PROVIDERS[idx].kernel_dispatch = Some(dispatch);
     }
@@ -655,9 +678,7 @@ pub fn register_module_provider(
     }
     if !is_module_providable(contract) {
         log::error!(
-            "[provider] module {} tried to register for non-providable contract 0x{:04x}",
-            module_idx,
-            contract,
+            "[provider] module {module_idx} tried to register for non-providable contract 0x{contract:04x}",
         );
         return errno::EACCES;
     }
@@ -671,26 +692,20 @@ pub fn register_module_provider(
         let code_end = code_base + code_size as usize;
         if fn_addr < code_base || fn_addr >= code_end {
             log::error!(
-                "[provider] module {} fn_ptr 0x{:08x} outside code region 0x{:08x}..0x{:08x}",
-                module_idx,
-                fn_addr,
-                code_base,
-                code_end
+                "[provider] module {module_idx} fn_ptr 0x{fn_addr:08x} outside code region 0x{code_base:08x}..0x{code_end:08x}"
             );
             return errno::EINVAL;
         }
         // On Cortex-M (Thumb mode): verify LSB is set
         #[cfg(target_arch = "arm")]
         if fn_addr & 1 == 0 {
-            log::error!(
-                "[provider] module {} fn_ptr 0x{:08x} missing Thumb bit",
-                module_idx,
-                fn_addr
-            );
+            log::error!("[provider] module {module_idx} fn_ptr 0x{fn_addr:08x} missing Thumb bit");
             return errno::EINVAL;
         }
     }
 
+    // SAFETY: `idx < MAX_PROVIDERS` (bounds-checked above); registration
+    // runs on the scheduler thread.
     unsafe {
         let entry = &mut PROVIDERS[idx];
 
@@ -730,6 +745,7 @@ pub fn register_module_provider(
 /// Called on module finish (Done/Error) for cleanup.
 /// Compacts chains to maintain stack ordering.
 pub fn release_module_providers(module_idx: u8) {
+    // SAFETY: called from scheduler module-finish path; scheduler thread.
     unsafe {
         let p = &raw mut PROVIDERS;
         let providers = &mut *p;
@@ -778,6 +794,8 @@ pub unsafe fn dispatch(
     if idx >= MAX_PROVIDERS {
         return errno::ENOSYS;
     }
+    // SAFETY: `idx < MAX_PROVIDERS` bounded; the registered dispatch chain
+    // is set up on the scheduler thread before any module observes it.
     unsafe {
         let entry = &PROVIDERS[idx];
 
@@ -799,19 +817,13 @@ pub unsafe fn dispatch(
                 let rc = handler(handle, opcode, arg, arg_len);
                 if rc == errno::ENOSYS {
                     log::debug!(
-                        "[provider] contract 0x{:04x} op 0x{:04x}: kernel handler returned ENOSYS",
-                        contract,
-                        opcode
+                        "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: kernel handler returned ENOSYS"
                     );
                 }
                 rc
             }
             None => {
-                log::warn!(
-                    "[provider] contract 0x{:04x} op 0x{:04x}: no provider",
-                    contract,
-                    opcode
-                );
+                log::warn!("[provider] contract 0x{contract:04x} op 0x{opcode:04x}: no provider");
                 errno::ENOSYS
             }
         }
@@ -838,6 +850,8 @@ pub unsafe fn dispatch_next(
     if idx >= MAX_PROVIDERS {
         return errno::ENOSYS;
     }
+    // SAFETY: `idx < MAX_PROVIDERS` bounded; PROVIDERS chain is mutated
+    // only on the scheduler thread, callers run cooperatively.
     unsafe {
         let entry = &PROVIDERS[idx];
 

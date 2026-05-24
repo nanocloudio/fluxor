@@ -12,6 +12,10 @@
 
 #![no_std]
 #![no_main]
+#![allow(
+    unsafe_code,
+    reason = "embedded firmware binary: boot/exception vectors, MMIO, and raw stack setup"
+)]
 
 // RP family (RP2040, RP2350A/B) — Cortex-M, embassy async runtime
 #[cfg(feature = "rp")]

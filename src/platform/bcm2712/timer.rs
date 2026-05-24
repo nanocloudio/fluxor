@@ -14,6 +14,7 @@
 #[inline(always)]
 pub fn timer_freq() -> u64 {
     let freq: u64;
+    // SAFETY: `mrs cntfrq_el0` reads a system register; no operands.
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
     freq
 }
@@ -25,10 +26,12 @@ pub fn timer_freq() -> u64 {
 pub fn read_timer_count() -> u32 {
     let val: u64;
     #[cfg(feature = "board-cm5")]
+    // SAFETY: `mrs cntpct_el0` reads the physical-counter system register.
     unsafe {
         core::arch::asm!("mrs {}, cntpct_el0", out(reg) val)
     };
     #[cfg(not(feature = "board-cm5"))]
+    // SAFETY: `mrs cntvct_el0` reads the virtual-counter system register.
     unsafe {
         core::arch::asm!("mrs {}, cntvct_el0", out(reg) val)
     };

@@ -179,6 +179,8 @@ static mut DMA_FD_POLL_FN: Option<fn(i32) -> bool> = None;
 
 /// Register a platform DMA FD poll function (called from platform init).
 pub fn register_dma_fd_poll(f: fn(i32) -> bool) {
+    // SAFETY: called once from platform init before any DMA FDs exist;
+    // no other thread observes `DMA_FD_POLL_FN` at this point.
     unsafe {
         DMA_FD_POLL_FN = Some(f);
     }
@@ -237,6 +239,9 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
             // Route to platform DMA FD poll (RP-only; returns false on other platforms)
             let mut ready = 0u32;
             if (ev & POLL_IN) != 0 {
+                // SAFETY: `DMA_FD_POLL_FN` is a static `Option<fn>`; the
+                // copy is a single word-sized load. The producer side
+                // (`register_dma_fd_poll`) runs once at boot.
                 let poll_fn = unsafe { DMA_FD_POLL_FN };
                 if let Some(f) = poll_fn {
                     if f(slot) {

@@ -226,7 +226,7 @@ fn extract_identities(config: &Value) -> Vec<ModuleIdentity> {
 
 /// Check if a module binary is drain-capable by checking the .fmod header flag.
 fn is_drain_capable(module_name: &str, modules_dir: &Path) -> bool {
-    let fmod_path = modules_dir.join(format!("{}.fmod", module_name));
+    let fmod_path = modules_dir.join(format!("{module_name}.fmod"));
     if !fmod_path.exists() {
         return false;
     }
@@ -439,7 +439,7 @@ pub fn format_plan(plan: &TransitionPlan) -> String {
         let id_str = entry
             .new_id
             .or(entry.old_id)
-            .map(|id| format!("{}", id))
+            .map(|id| format!("{id}"))
             .unwrap_or_else(|| "-".to_string());
 
         let drain_str = match entry.action {

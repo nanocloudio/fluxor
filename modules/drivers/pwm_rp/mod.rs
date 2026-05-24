@@ -12,6 +12,13 @@
 //! module implements the domain logic.
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -154,8 +161,6 @@ unsafe fn get_slot_mut(s: &mut PwmState, handle: i32) -> *mut PwmSlot {
 // provider_call on a HAL_PWM handle.
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 #[link_section = ".text.pwm_provider_dispatch"]
 pub unsafe extern "C" fn pwm_provider_dispatch(

@@ -198,9 +198,8 @@ fn detect_platform() -> Platform {
              with --no-default-features --features <name>. See `make targets`."
         ),
         _ => panic!(
-            "build.rs: multiple conflicting platform features active: {:?}. \
+            "build.rs: multiple conflicting platform features active: {active:?}. \
              Pass exactly one.",
-            active,
         ),
     }
 }
@@ -255,7 +254,7 @@ fn emit_bcm2712(out: &Path) {
         .write_all(include_bytes!("memory-bcm2712.x"))
         .unwrap();
     println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
-    println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={}", ram_origin);
+    println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={ram_origin}");
     println!("cargo:rerun-if-changed=memory-bcm2712.x");
     println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
 }

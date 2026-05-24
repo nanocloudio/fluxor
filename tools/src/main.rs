@@ -6,28 +6,41 @@
 //!     fluxor decode firmware.uf2           # Decode config from UF2
 //!     fluxor info firmware.uf2             # Show UF2 file info
 //!     fluxor generate config.yaml -o config.uf2  # Generate config UF2
+
+#![allow(
+    unsafe_code,
+    reason = "host CLI wraps libc, mmap, ELF parsing, UF2 packing, and IPC primitives"
+)]
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI is the user-facing product surface; `println!`/`eprintln!` is intentional output, not log misuse"
+)]
 //!     fluxor combine firmware.uf2 config.yaml -o combined.uf2
 //!     fluxor example blinky                # Show example config
 //!     fluxor pack module.o -o module.fmod # Pack ELF into .fmod module
 
+mod asset_bank;
 mod board;
+mod ci;
 mod config;
 mod crypto;
 mod error;
 mod hash;
+mod hygiene;
 mod manifest;
 mod modules;
-mod asset_bank;
+mod modules_build;
 mod monitor;
 mod project;
 pub mod reconfigure;
 mod render_template;
 pub mod rig;
 mod scenario;
-mod text_distance;
 mod schema;
 mod stack_expand;
 pub mod target;
+mod text_distance;
 mod uf2;
 mod up;
 mod wasm_bundle;
@@ -39,17 +52,17 @@ mod wasm_bundle;
 /// because tools only need a subset of the constants (e.g.
 /// `CHANNEL_HINT_WIRE_BYTES` is kernel-side only) but the file is
 /// shared verbatim.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 #[path = "../../modules/sdk/wire.rs"]
 mod wire;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use crate::config::{
-    decode_config, generate_config_ext, ConfigBuilder, ModuleCaps,
-    EXAMPLES,
-};
+use crate::config::{decode_config, generate_config_ext, ConfigBuilder, ModuleCaps, EXAMPLES};
 use crate::error::{Error, Result};
 use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config_multi};
 use crate::monitor::cmd_monitor_dispatch;
@@ -383,6 +396,113 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Source-tree lint suite. Each subcommand enforces one rule
+    /// over the workspace.
+    Lint {
+        #[command(subcommand)]
+        action: LintAction,
+    },
+
+    /// PIC module build orchestration. In-process discovery +
+    /// compile + pack pipeline; flags are documented per subcommand.
+    Modules {
+        #[command(subcommand)]
+        action: ModulesAction,
+    },
+
+    /// Full CI gate. Runs in order: fmt-check, clippy, workspace-lint
+    /// opt-in audit, hygiene scan, template render, version-skew
+    /// check, cargo unit tests, modules build (strict), and cargo
+    /// integration tests. Every phase runs even when an earlier one
+    /// fails; the summary lists all failures and exits non-zero.
+    Ci {
+        /// Skip an individual phase for local iteration. Rejected
+        /// when `$CI=1` so production CI always runs the full set.
+        /// Allowed values: cargo, modules, lint, hygiene, templates.
+        #[arg(long, value_delimiter = ',')]
+        skip: Vec<String>,
+        /// Project root override.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LintAction {
+    /// AST-based hygiene scanner. Bans inline tests in tiers listed
+    /// in `fluxor.toml::[ci.hygiene].forbid_inline_tests` and
+    /// requires `reason = "..."` on every `#[allow(...)]`. Reports
+    /// every violation in one pass.
+    Hygiene {
+        /// Project root override. Defaults to the directory resolved
+        /// by `fluxor inspect` (env > marker walk > CWD).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of human-friendly text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModulesAction {
+    /// Build PIC / wasm modules. `--target T` builds a single target;
+    /// `--all` reads the list from `fluxor.toml::[ci].targets`.
+    /// `--strict` enables `rustc -D warnings` (CI mode); `--lenient`
+    /// (default) keeps warnings as warnings except for unfulfilled
+    /// `#[expect(...)]` which always fails.
+    Build {
+        /// Single target to build (e.g. `bcm2712`, `rp2350`, `cm5`).
+        /// Mutually exclusive with `--all`.
+        #[arg(long, conflicts_with = "all")]
+        target: Option<String>,
+        /// Build every target from `[ci].targets`. Mutually exclusive
+        /// with `--target`.
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+        /// Output root for `<silicon>/modules/<name>.fmod`. Defaults
+        /// to `target/fluxor` per the standard's §2 path. Pass
+        /// `--out target` to land artefacts at the legacy
+        /// `target/<silicon>/modules/` layout the existing combine /
+        /// run tooling expects.
+        #[arg(long, default_value = "target/fluxor")]
+        out: PathBuf,
+        /// `rustc -D warnings` mode. Required for `fluxor ci`.
+        #[arg(long, conflicts_with = "lenient")]
+        strict: bool,
+        /// `rustc -W warnings` mode. Default when neither flag is
+        /// given — but `unfulfilled_lint_expectations` stays denied
+        /// so `#[expect]` is honest in either mode.
+        #[arg(long, conflicts_with = "strict")]
+        lenient: bool,
+        /// Project root override.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Remove module artefacts under the resolved output root.
+    Clean {
+        /// Output root to clean (defaults match `build`'s default).
+        #[arg(long, default_value = "target/fluxor")]
+        out: PathBuf,
+    },
+    /// Inventory the modules discovered under `modules/{drivers,
+    /// foundation,app}/<name>/manifest.toml`.
+    List {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the resolved `<out>/<silicon>/modules` path for a target.
+    /// Lets Makefiles and harness scripts refer to the artefact dir
+    /// without hard-coding the layout.
+    Resolve {
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = "target/fluxor")]
+        out: PathBuf,
+    },
 }
 
 fn main() {
@@ -474,10 +594,39 @@ fn main() {
         } => cmd_monitor_dispatch(&port, baud, refresh_ms, net.as_deref()),
         Commands::Rig(args) => rig::cli::dispatch(args),
         Commands::Inspect { config, json } => cmd_inspect(config.as_deref(), json),
+        Commands::Lint { action } => match action {
+            LintAction::Hygiene { project_root, json } => {
+                cmd_lint_hygiene(project_root.as_deref(), json)
+            }
+        },
+        Commands::Ci { skip, project_root } => cmd_ci(&skip, project_root.as_deref(), verbose),
+        Commands::Modules { action } => match action {
+            ModulesAction::Build {
+                target,
+                all,
+                out,
+                strict,
+                lenient,
+                project_root,
+            } => cmd_modules_build(
+                target,
+                all,
+                &out,
+                strict,
+                lenient,
+                project_root.as_deref(),
+                verbose,
+            ),
+            ModulesAction::Clean { out } => cmd_modules_clean(&out),
+            ModulesAction::List { project_root, json } => {
+                cmd_modules_list(project_root.as_deref(), json)
+            }
+            ModulesAction::Resolve { target, out } => cmd_modules_resolve(&target, &out),
+        },
     };
 
     if let Err(e) = result {
-        eprintln!("\x1b[1;31mError:\x1b[0m {}", e);
+        eprintln!("\x1b[1;31mError:\x1b[0m {e}");
         std::process::exit(1);
     }
 }
@@ -615,24 +764,24 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
 
     println!("UF2 File: {}", file.display());
     println!("Total bytes: {}", memory.len());
-    println!("Address range: 0x{:08x} - 0x{:08x}", min_addr, max_addr);
+    println!("Address range: 0x{min_addr:08x} - 0x{max_addr:08x}");
     println!("Segments: {}", segments.len());
 
     for (i, (start, end)) in segments.iter().enumerate() {
         let size = end - start + 1;
-        println!("  [{}] 0x{:08x} - 0x{:08x} ({} bytes)", i, start, end, size);
+        println!("  [{i}] 0x{start:08x} - 0x{end:08x} ({size} bytes)");
     }
 
     // Check for trailer
     println!();
     if let Ok((trailer_addr, modules_addr, config_addr)) = find_trailer(&memory) {
-        println!("Trailer: Present at 0x{:08x}", trailer_addr);
+        println!("Trailer: Present at 0x{trailer_addr:08x}");
         if modules_addr != 0 {
-            println!("  Modules: 0x{:08x}", modules_addr);
+            println!("  Modules: 0x{modules_addr:08x}");
         } else {
             println!("  Modules: None");
         }
-        println!("  Config:  0x{:08x}", config_addr);
+        println!("  Config:  0x{config_addr:08x}");
 
         // Check config magic
         if let Some(header_data) = uf2::extract_region(&memory, config_addr, 4) {
@@ -643,9 +792,9 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                 header_data[3],
             ]);
             if magic == config::MAGIC_CONFIG {
-                println!("  Config magic: Valid (0x{:08x})", magic);
+                println!("  Config magic: Valid (0x{magic:08x})");
             } else {
-                println!("  Config magic: Invalid (0x{:08x})", magic);
+                println!("  Config magic: Invalid (0x{magic:08x})");
             }
         }
 
@@ -662,7 +811,7 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                 ]);
                 if table_magic == modules::MODULE_TABLE_MAGIC {
                     let module_count = table_header[5] as usize;
-                    println!("\nModules: {} embedded", module_count);
+                    println!("\nModules: {module_count} embedded");
 
                     // Read entries
                     let entries_start = modules_addr + modules::TABLE_HEADER_SIZE as u32;
@@ -700,10 +849,9 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                                     _ => "Unknown",
                                 };
 
-                                println!("\n  [{}] {} (hash=0x{:08x})", i, name, name_hash);
+                                println!("\n  [{i}] {name} (hash=0x{name_hash:08x})");
                                 println!(
-                                    "      type: {} ({}), abi: v{}, size: {} bytes",
-                                    type_str, mod_type, abi, fmod_size
+                                    "      type: {type_str} ({mod_type}), abi: v{abi}, size: {fmod_size} bytes"
                                 );
 
                                 // Read manifest from fmod (ABI v2)
@@ -745,7 +893,7 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                                         ) {
                                             match manifest::Manifest::from_bytes(&manifest_data) {
                                                 Ok(m) => println!("{}", m.display()),
-                                                Err(e) => println!("      manifest: error: {}", e),
+                                                Err(e) => println!("      manifest: error: {e}"),
                                             }
                                         }
                                     }
@@ -844,9 +992,8 @@ fn substitute_env_vars(input: &str) -> Result<String> {
                     out.push_str(def);
                 } else {
                     return Err(crate::error::Error::Config(format!(
-                        "Environment variable '{}' is not set (referenced in config). \
-                         Use ${{{}:-default}} to provide a fallback.",
-                        var_name, var_name,
+                        "Environment variable '{var_name}' is not set (referenced in config). \
+                         Use ${{{var_name}:-default}} to provide a fallback.",
                     )));
                 }
             }
@@ -917,8 +1064,7 @@ fn inline_route_body_files(
                 Some(serde_json::Value::String(s)) => s,
                 Some(other) => {
                     return Err(Error::Config(format!(
-                        "route body_file must be a string path, got {}",
-                        other
+                        "route body_file must be a string path, got {other}"
                     )));
                 }
                 None => continue,
@@ -1024,10 +1170,10 @@ fn cmd_generate(
             let end = (i + 16).min(binary_data.len());
             let hex: String = binary_data[i..end]
                 .iter()
-                .map(|b| format!("{:02x}", b))
+                .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("{:04x}: {}", i, hex);
+            println!("{i:04x}: {hex}");
         }
     }
 
@@ -1107,7 +1253,7 @@ fn cmd_combine(
 
     if verbose {
         let fmt = if is_aarch64 { "raw" } else { "UF2" };
-        eprintln!("Firmware: {} ends at 0x{:08x}", fmt, firmware_max_addr);
+        eprintln!("Firmware: {fmt} ends at 0x{firmware_max_addr:08x}");
     }
 
     // Merge board hardware defaults for sections the YAML doesn't specify
@@ -1129,11 +1275,11 @@ fn cmd_combine(
 
     let validation = board::validate_config(&config, &target_desc)?;
     for warning in &validation.warnings {
-        eprintln!("  \x1b[1;33mWARNING:\x1b[0m {}", warning);
+        eprintln!("  \x1b[1;33mWARNING:\x1b[0m {warning}");
     }
     if !validation.is_ok() {
         for err in &validation.errors {
-            eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
+            eprintln!("  \x1b[1;31mERROR:\x1b[0m {err}");
         }
         return Err(error::Error::Config(
             "Config validation failed for target".into(),
@@ -1228,8 +1374,7 @@ fn cmd_combine(
         let config_end = config_addr + config_data.len() as u32;
         if config_end > SLOT_A_ADDR {
             return Err(error::Error::Config(format!(
-                "Combined image end ({:#010x}) overlaps reserved OTA/store region at {:#010x}. Reduce firmware/config size.",
-                config_end, SLOT_A_ADDR
+                "Combined image end ({config_end:#010x}) overlaps reserved OTA/store region at {SLOT_A_ADDR:#010x}. Reduce firmware/config size."
             )));
         }
     }
@@ -1241,11 +1386,8 @@ fn cmd_combine(
             XIP_BASE
         };
         eprintln!("Layout:");
-        eprintln!(
-            "  Firmware:  0x{:08x} - 0x{:08x}",
-            base_str, firmware_max_addr
-        );
-        eprintln!("  Trailer:   0x{:08x} (16 bytes)", trailer_addr);
+        eprintln!("  Firmware:  0x{base_str:08x} - 0x{firmware_max_addr:08x}");
+        eprintln!("  Trailer:   0x{trailer_addr:08x} (16 bytes)");
         if let Some(ref mdata) = modules_data {
             eprintln!(
                 "  Modules:   0x{:08x} ({} bytes)",
@@ -1415,11 +1557,11 @@ fn load_config_with_defaults(
 
     let validation = board::validate_config(&config, &target_desc)?;
     for warning in &validation.warnings {
-        eprintln!("  \x1b[1;33mWARNING:\x1b[0m {}", warning);
+        eprintln!("  \x1b[1;33mWARNING:\x1b[0m {warning}");
     }
     if !validation.is_ok() {
         for err in &validation.errors {
-            eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
+            eprintln!("  \x1b[1;31mERROR:\x1b[0m {err}");
         }
         return Err(error::Error::Config(
             "Config validation failed for target".into(),
@@ -1536,7 +1678,7 @@ fn cmd_slot_image(
     let validation = board::validate_config(&config, &target_desc)?;
     if !validation.is_ok() {
         for err in &validation.errors {
-            eprintln!("  \x1b[1;31mERROR:\x1b[0m {}", err);
+            eprintln!("  \x1b[1;31mERROR:\x1b[0m {err}");
         }
         return Err(error::Error::Config(
             "Config validation failed for target".into(),
@@ -1557,8 +1699,7 @@ fn cmd_slot_image(
     let config_end = config_offset + config_data.len();
     if config_end > SLOT_SIZE {
         return Err(error::Error::Config(format!(
-            "Slot image ({} bytes) exceeds slot size ({} bytes). Reduce modules/config.",
-            config_end, SLOT_SIZE
+            "Slot image ({config_end} bytes) exceeds slot size ({SLOT_SIZE} bytes). Reduce modules/config."
         )));
     }
 
@@ -1615,7 +1756,7 @@ fn cmd_example(name: &str) -> Result<()> {
     } else {
         let available: Vec<_> = EXAMPLES.keys().copied().collect();
         println!("Available examples: {}", available.join(", "));
-        Err(error::Error::Config(format!("Unknown example: {}", name)))
+        Err(error::Error::Config(format!("Unknown example: {name}")))
     }
 }
 
@@ -1658,7 +1799,7 @@ fn cmd_pack(
         println!("  Init offset: 0x{:x}", result.init_offset);
         println!("  Exports: {}", result.exports.len());
         for (name, offset, hash) in &result.exports {
-            println!("    {}: 0x{:x} (hash: 0x{:08x})", name, offset, hash);
+            println!("    {name}: 0x{offset:x} (hash: 0x{hash:08x})");
         }
         println!("  Total size: {} bytes", result.total_size);
     } else {
@@ -1769,12 +1910,12 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
 
     // Print warnings (yellow)
     for warning in &result.warnings {
-        println!("  \x1b[1;33mWARNING:\x1b[0m {}", warning);
+        println!("  \x1b[1;33mWARNING:\x1b[0m {warning}");
     }
 
     // Print errors (red)
     for error in &result.errors {
-        println!("  \x1b[1;31mERROR:\x1b[0m {}", error);
+        println!("  \x1b[1;31mERROR:\x1b[0m {error}");
     }
 
     // Summary
@@ -1835,9 +1976,8 @@ fn cmd_target_info(target_name: &str, field: Option<&str>) -> Result<()> {
             "dma_channels" => println!("{}", desc.dma_channels),
             _ => {
                 return Err(error::Error::Config(format!(
-                    "Unknown field '{}'. Available: rust_target, cargo_features, uf2_family_id, \
-                     module_target, max_pin, family, id, pio_count, spi_count, i2c_count, dma_channels",
-                    field
+                    "Unknown field '{field}'. Available: rust_target, cargo_features, uf2_family_id, \
+                     module_target, max_pin, family, id, pio_count, spi_count, i2c_count, dma_channels"
                 )));
             }
         }
@@ -1922,7 +2062,7 @@ fn cmd_targets() -> Result<()> {
                 println!("  {:20} {:12} {}", name, kind, desc.description);
             }
             Err(_) => {
-                println!("  {:20} (error loading)", name);
+                println!("  {name:20} (error loading)");
             }
         }
     }
@@ -1959,19 +2099,19 @@ fn cmd_inspect(config_path: Option<&Path>, json: bool) -> Result<()> {
 
     println!("Project root");
     println!("  path:                 {}", pr.path.display());
-    println!("  source:               {}", format_discovery_source(&pr.source));
+    println!(
+        "  source:               {}",
+        format_discovery_source(&pr.source)
+    );
     if pr.starting_cwd != pr.path {
         println!("  cwd:                  {}", pr.starting_cwd.display());
     }
     match &pr.env_var_value {
         Some(v) if pr.source == crate::project::DiscoverySource::EnvVar => {
-            println!("  $FLUXOR_PROJECT_ROOT: {} (active)", v);
+            println!("  $FLUXOR_PROJECT_ROOT: {v} (active)");
         }
         Some(v) => {
-            println!(
-                "  $FLUXOR_PROJECT_ROOT: {} (set but unusable; ignored)",
-                v
-            );
+            println!("  $FLUXOR_PROJECT_ROOT: {v} (set but unusable; ignored)");
         }
         None => {
             println!("  $FLUXOR_PROJECT_ROOT: <unset>");
@@ -2011,8 +2151,7 @@ fn cmd_inspect(config_path: Option<&Path>, json: bool) -> Result<()> {
     // carry the same name).
     let install_root = crate::project::install_root();
     let install_path_ref = install_root.as_ref().map(|i| i.path.as_path());
-    let install_distinct = install_path_ref
-        .filter(|p| **p != *pr.path);
+    let install_distinct = install_path_ref.filter(|p| **p != *pr.path);
     print_inspect_targets_block(&pr.path, install_distinct);
 
     // Stacks — same dual-root pattern. Stacks are file-listings
@@ -2197,8 +2336,8 @@ fn cmd_inspect_json(config_path: Option<&Path>) -> Result<()> {
     let rigs_json: Vec<serde_json::Value> = rigs
         .iter()
         .map(|r| {
-            let path = crate::rig::default_profile_path(&active_lab, r)
-                .map(|p| p.display().to_string());
+            let path =
+                crate::rig::default_profile_path(&active_lab, r).map(|p| p.display().to_string());
             serde_json::json!({ "name": r, "profile_path": path })
         })
         .collect();
@@ -2263,22 +2402,27 @@ fn cmd_inspect_json(config_path: Option<&Path>) -> Result<()> {
         out["config"] = config_inspection_json(cfg_path, &pr.path);
     }
 
-    println!("{}", serde_json::to_string_pretty(&out)
-        .map_err(|e| error::Error::Config(format!("inspect json: {e}")))?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| error::Error::Config(format!("inspect json: {e}")))?
+    );
     Ok(())
 }
 
 /// Build the JSON sub-object for the `config` block — mirrors the
 /// human-text `Config:` rendering. Read-only; never mutates state.
 fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json::Value {
-    let raw = match std::fs::read_to_string(config_path).and_then(|s| {
-        substitute_env_vars(&s).map_err(|e| std::io::Error::other(e.to_string()))
-    }) {
+    let raw = match std::fs::read_to_string(config_path)
+        .and_then(|s| substitute_env_vars(&s).map_err(|e| std::io::Error::other(e.to_string())))
+    {
         Ok(s) => s,
-        Err(e) => return serde_json::json!({
-            "path": config_path.display().to_string(),
-            "error": format!("read: {e}"),
-        }),
+        Err(e) => {
+            return serde_json::json!({
+                "path": config_path.display().to_string(),
+                "error": format!("read: {e}"),
+            })
+        }
     };
     let parse_result: std::result::Result<serde_json::Value, String> = if config_path
         .extension()
@@ -2290,13 +2434,18 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
     };
     let parsed = match parse_result {
         Ok(v) => v,
-        Err(e) => return serde_json::json!({
-            "path": config_path.display().to_string(),
-            "error": format!("parse: {e}"),
-        }),
+        Err(e) => {
+            return serde_json::json!({
+                "path": config_path.display().to_string(),
+                "error": format!("parse: {e}"),
+            })
+        }
     };
 
-    let declared = parsed.get("target").and_then(|v| v.as_str()).map(String::from);
+    let declared = parsed
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let resolved = match resolve_target(&parsed, None) {
         Ok(desc) => Some(serde_json::json!({
             "id": desc.id,
@@ -2389,8 +2538,7 @@ fn inspect_scenarios(project_root: &Path) {
     // within a directory; the cross-directory case fires when the
     // same scenario is symlinked, which is rare but worth handling
     // so the count is accurate.
-    let mut seen: std::collections::BTreeSet<PathBuf> =
-        std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     findings.retain(|(p, _)| {
         let key = p.canonicalize().unwrap_or_else(|_| p.clone());
         seen.insert(key)
@@ -2437,16 +2585,24 @@ fn print_inspect_targets_block(project_root: &Path, install_distinct: Option<&Pa
 
     if project_names.is_empty() && install_names.is_empty() {
         println!("Targets");
-        println!("  <none — neither {} nor any install root has a targets/ dir>",
-            project_root.display());
+        println!(
+            "  <none — neither {} nor any install root has a targets/ dir>",
+            project_root.display()
+        );
         println!();
         return;
     }
 
     println!("Targets");
-    println!("  project root:         {}", project_root.join("targets").display());
+    println!(
+        "  project root:         {}",
+        project_root.join("targets").display()
+    );
     if let Some(install) = install_distinct {
-        println!("  install root:         {}", install.join("targets").display());
+        println!(
+            "  install root:         {}",
+            install.join("targets").display()
+        );
     }
 
     // Build a deduped name list with per-name source info.
@@ -2507,16 +2663,24 @@ fn print_inspect_stacks_block(project_root: &Path, install_distinct: Option<&Pat
 
     if project_names.is_empty() && install_names.is_empty() {
         println!("Stacks");
-        println!("  <none — neither {} nor any install root has a stacks/ dir>",
-            project_root.display());
+        println!(
+            "  <none — neither {} nor any install root has a stacks/ dir>",
+            project_root.display()
+        );
         println!();
         return;
     }
 
     println!("Stacks");
-    println!("  project root:         {}", project_root.join("stacks").display());
+    println!(
+        "  project root:         {}",
+        project_root.join("stacks").display()
+    );
     if let Some(install) = install_distinct {
-        println!("  install root:         {}", install.join("stacks").display());
+        println!(
+            "  install root:         {}",
+            install.join("stacks").display()
+        );
     }
 
     use std::collections::BTreeMap;
@@ -2551,7 +2715,7 @@ fn inspect_rig_config() {
     // `rig::cli` uses to pick the lab namespace.
     let lab_env = std::env::var("FLUXOR_LAB").ok();
     let active_lab = lab_env.clone().unwrap_or_else(|| "default".to_string());
-    println!("  active lab:           {}", active_lab);
+    println!("  active lab:           {active_lab}");
     match lab_env {
         Some(_) => println!("  $FLUXOR_LAB:          set"),
         None => println!("  $FLUXOR_LAB:          <unset> (defaulting to 'default')"),
@@ -2564,17 +2728,20 @@ fn inspect_rig_config() {
     if let Some(ref dir) = labs_root {
         match crate::rig::enumerate_labs() {
             Ok(labs) if labs.is_empty() => {
-                println!("  available labs:       <none configured under {}>", dir.display());
+                println!(
+                    "  available labs:       <none configured under {}>",
+                    dir.display()
+                );
             }
             Ok(labs) => {
                 println!("  available labs:");
                 for lab in &labs {
                     let marker = if *lab == active_lab { " (active)" } else { "" };
-                    println!("    {}{}", lab, marker);
+                    println!("    {lab}{marker}");
                 }
             }
             Err(e) => {
-                println!("  available labs:       <error: {}>", e);
+                println!("  available labs:       <error: {e}>");
             }
         }
     } else {
@@ -2602,11 +2769,11 @@ fn inspect_rig_config() {
                 let path = crate::rig::default_profile_path(&active_lab, r)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<$HOME unset>".into());
-                println!("    {:24} {}", r, path);
+                println!("    {r:24} {path}");
             }
         }
         Err(e) => {
-            println!("  rigs in active lab:   <error: {}>", e);
+            println!("  rigs in active lab:   <error: {e}>");
         }
     }
 
@@ -2617,7 +2784,9 @@ fn format_discovery_source(source: &crate::project::DiscoverySource) -> &'static
     match source {
         crate::project::DiscoverySource::EnvVar => "$FLUXOR_PROJECT_ROOT override",
         crate::project::DiscoverySource::DotFluxorMarker => ".fluxor marker file",
-        crate::project::DiscoverySource::SourceTreeMarker => "source-tree heuristic (targets/ + stacks/)",
+        crate::project::DiscoverySource::SourceTreeMarker => {
+            "source-tree heuristic (targets/ + stacks/)"
+        }
         crate::project::DiscoverySource::CwdFallback => "CWD fallback (no marker found)",
     }
 }
@@ -2639,10 +2808,7 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     // than the bare "No such file or directory" the IO error's
     // Display gives.
     let content = std::fs::read_to_string(config_path).map_err(|e| {
-        error::Error::Config(format!(
-            "Cannot read config {}: {e}",
-            config_path.display()
-        ))
+        error::Error::Config(format!("Cannot read config {}: {e}", config_path.display()))
     })?;
     let content = substitute_env_vars(&content)?;
     let raw: serde_json::Value = if config_path
@@ -2670,7 +2836,7 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
         .get("target")
         .and_then(|v| v.as_str())
         .unwrap_or("<not set>");
-    println!("  declared target:      {}", declared);
+    println!("  declared target:      {declared}");
 
     // Resolve target. When `declared` names a board, the loader
     // walks the board → silicon link and returns the silicon
@@ -2680,7 +2846,7 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     match resolve_target(&raw, None) {
         Ok(desc) => {
             if let Some(board_id) = &desc.board_id {
-                println!("  resolved target:      {} (board)", board_id);
+                println!("  resolved target:      {board_id} (board)");
                 println!("  via board → silicon:  {}", desc.id);
             } else {
                 let kind = if desc.build.is_some() {
@@ -2692,7 +2858,7 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
             }
         }
         Err(e) => {
-            println!("  resolved target:      <error: {}>", e);
+            println!("  resolved target:      <error: {e}>");
         }
     }
 
@@ -2701,7 +2867,10 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     // more in place).
     let mut probe = raw.clone();
     if let Ok(desc) = resolve_target(&raw, None) {
-        let mut probe_yaml_dir = config_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut probe_yaml_dir = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         if probe_yaml_dir.as_os_str().is_empty() {
             probe_yaml_dir = std::path::PathBuf::from(".");
         }
@@ -2713,11 +2882,11 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
             Ok(added) => {
                 println!("  expanded stacks:      {} module(s) added", added.len());
                 for m in &added {
-                    println!("    + {}", m);
+                    println!("    + {m}");
                 }
             }
             Err(e) => {
-                println!("  expanded stacks:      <error: {}>", e);
+                println!("  expanded stacks:      <error: {e}>");
             }
         }
     }
@@ -2904,8 +3073,8 @@ fn build_one(
     //   modules   target/{silicon_id}/modules/     (byte-identical per
     //                                               silicon + module target)
     //   output    target/{build_id}/{images|uf2}/<subdir>/<name>.{img|uf2}
-    let firmware_path = PathBuf::from(format!("target/{}/firmware.bin", build_id));
-    let modules_dir = PathBuf::from(format!("target/{}/modules", silicon_id));
+    let firmware_path = PathBuf::from(format!("target/{build_id}/firmware.bin"));
+    let modules_dir = PathBuf::from(format!("target/{silicon_id}/modules"));
 
     let name = yaml_path
         .file_stem()
@@ -2918,39 +3087,38 @@ fn build_one(
     } else {
         match family.as_str() {
             "rp2" => {
-                let mut p = PathBuf::from(format!("target/{}/uf2", build_id));
+                let mut p = PathBuf::from(format!("target/{build_id}/uf2"));
                 if !subdir.is_empty() {
                     p.push(&subdir);
                 }
-                p.push(format!("{}.uf2", name));
+                p.push(format!("{name}.uf2"));
                 p
             }
             "bcm" => {
-                let mut p = PathBuf::from(format!("target/{}/images", build_id));
+                let mut p = PathBuf::from(format!("target/{build_id}/images"));
                 if !subdir.is_empty() {
                     p.push(&subdir);
                 }
-                p.push(format!("{}.img", name));
+                p.push(format!("{name}.img"));
                 p
             }
             "linux" => {
-                let mut p = PathBuf::from(format!("target/linux/{}", name));
+                let mut p = PathBuf::from(format!("target/linux/{name}"));
                 // Linux produces two files; the "output_path" is the directory
                 p.push("config.bin");
                 p
             }
             "wasm" => {
-                let mut p = PathBuf::from(format!("target/{}/wasm", build_id));
+                let mut p = PathBuf::from(format!("target/{build_id}/wasm"));
                 if !subdir.is_empty() {
                     p.push(&subdir);
                 }
-                p.push(format!("{}.wasm", name));
+                p.push(format!("{name}.wasm"));
                 p
             }
             _ => {
                 return Err(Error::Config(format!(
-                    "Unsupported target family '{}' for build",
-                    family
+                    "Unsupported target family '{family}' for build"
                 )));
             }
         }
@@ -2963,9 +3131,11 @@ fn build_one(
     match family.as_str() {
         "rp2" | "bcm" => {
             if !firmware_path.exists() {
-                let abs = firmware_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&firmware_path));
+                let abs = firmware_path.canonicalize().unwrap_or_else(|_| {
+                    std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(&firmware_path)
+                });
                 return Err(Error::Config(format!(
                     "Firmware not found at {} (resolved to {}). Run 'make firmware TARGET={}' from the \
                      project root (`fluxor inspect` shows where that is) to produce it.",
@@ -2975,9 +3145,11 @@ fn build_one(
                 )));
             }
             if !modules_dir.exists() {
-                let abs = modules_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&modules_dir));
+                let abs = modules_dir.canonicalize().unwrap_or_else(|_| {
+                    std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(&modules_dir)
+                });
                 return Err(Error::Config(format!(
                     "Modules not found at {} (resolved to {}). Run 'make modules TARGET={}' from the \
                      project root (`fluxor inspect` shows where that is) to produce them.",
@@ -3041,7 +3213,7 @@ fn build_one(
             // and config-blob placeholders rewritten in-place. See
             // `docs/architecture/wasm_platform.md` and the
             // `wasm_bundle` module for the rewrite mechanics.
-            let kernel_wasm_path = PathBuf::from(format!("target/{}/firmware.wasm", build_id));
+            let kernel_wasm_path = PathBuf::from(format!("target/{build_id}/firmware.wasm"));
             if !kernel_wasm_path.exists() {
                 return Err(Error::Config(format!(
                     "Kernel wasm not found at {}. Run 'make firmware TARGET=wasm' first.",
@@ -3061,10 +3233,10 @@ fn build_one(
             let work_dir = output_path
                 .parent()
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from(format!("target/{}/wasm", build_id)));
+                .unwrap_or_else(|| PathBuf::from(format!("target/{build_id}/wasm")));
             std::fs::create_dir_all(&work_dir)?;
-            let modules_bin_path = work_dir.join(format!("{}.modules.bin", name));
-            let config_bin_path = work_dir.join(format!("{}.config.bin", name));
+            let modules_bin_path = work_dir.join(format!("{name}.modules.bin"));
+            let config_bin_path = work_dir.join(format!("{name}.config.bin"));
 
             let extra_dirs: Vec<PathBuf> = Vec::new();
             let fmod_dirs: Vec<PathBuf> = std::iter::once(modules_dir.clone())
@@ -3081,8 +3253,7 @@ fn build_one(
             let kernel_bytes = std::fs::read(&kernel_wasm_path)?;
             let modules_bin = std::fs::read(&modules_bin_path)?;
             let config_bin = std::fs::read(&config_bin_path)?;
-            let mut bundled =
-                wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
+            let mut bundled = wasm_bundle::bundle(&kernel_bytes, &modules_bin, &config_bin)?;
 
             // Asset bank: bake graph-declared assets into the wasm via
             // a `fluxor.assets` custom section. Off when no `assets:`
@@ -3109,8 +3280,7 @@ fn build_one(
         }
         _ => {
             return Err(Error::Config(format!(
-                "Unsupported target family '{}' for build",
-                family
+                "Unsupported target family '{family}' for build"
             )));
         }
     }
@@ -3164,7 +3334,10 @@ fn extract_asset_pairs(
                         ))
                     })?
                     .to_string();
-                let n = m.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let n = m
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 (p, n)
             }
             _ => {
@@ -3217,7 +3390,7 @@ fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Re
             }
         }
 
-        println!("\nBuilt {}/{} configs ({} failed)", built, total, failed);
+        println!("\nBuilt {built}/{total} configs ({failed} failed)");
         if failed > 0 && built == 0 {
             return Err(Error::Config("All builds failed".into()));
         }
@@ -3317,12 +3490,11 @@ fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
         if let Some(feat) = required_for_type {
             if !features.contains(feat) {
                 return Err(Error::Config(format!(
-                    "module '{}' (type '{}') requires `fluxor-linux` to be built \
-                     with `--features {}` — current binary lacks it. \
+                    "module '{name}' (type '{module_type}') requires `fluxor-linux` to be built \
+                     with `--features {feat}` — current binary lacks it. \
                      Rebuild with: cargo build --release --bin fluxor-linux \
-                     --no-default-features --features {} \
+                     --no-default-features --features {feat} \
                      --target aarch64-unknown-linux-gnu",
-                    name, module_type, feat, feat,
                 )));
             }
         }
@@ -3393,11 +3565,7 @@ impl RunFlags {
 /// Top-level dispatch for `fluxor run`. Sniffs the YAML's `kind:`
 /// field; routes graph YAMLs to [`cmd_run`] (unchanged from
 /// pre-scenario behaviour) and scenario YAMLs to [`cmd_run_scenario`].
-fn cmd_run_dispatch(
-    config_path: Option<&PathBuf>,
-    flags: RunFlags,
-    verbose: bool,
-) -> Result<()> {
+fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: bool) -> Result<()> {
     // `--list` short-circuits: enumerate, print, exit.
     if let Some(dir) = &flags.list {
         let scenarios = scenario::list_scenarios(dir)?;
@@ -3412,9 +3580,7 @@ fn cmd_run_dispatch(
     }
 
     let config_path = config_path.ok_or_else(|| {
-        Error::Config(
-            "fluxor run: missing <CONFIG> argument (omit only with --list)".into(),
-        )
+        Error::Config("fluxor run: missing <CONFIG> argument (omit only with --list)".into())
     })?;
 
     if scenario::is_scenario_file(config_path) {
@@ -3470,7 +3636,7 @@ fn cmd_run_inline_scenario(
     }
     if flags.print_synthesised {
         match scenario::render_synthesised_host(&s, host_path)? {
-            Some(yaml) => print!("{}", yaml),
+            Some(yaml) => print!("{yaml}"),
             None => eprintln!(
                 "graph {}: no synthesised host (every binding has an explicit `on:` and no \
                  `host:` block is declared).",
@@ -3480,7 +3646,10 @@ fn cmd_run_inline_scenario(
         return Ok(());
     }
     if let Some(comp) = &flags.print_merged {
-        print!("{}", scenario::render_merged_component(comp, &s, host_path)?);
+        print!(
+            "{}",
+            scenario::render_merged_component(comp, &s, host_path)?
+        );
         return Ok(());
     }
     if flags.graph {
@@ -3493,11 +3662,7 @@ fn cmd_run_inline_scenario(
 
 /// Scenario dispatcher.  PR 1 implements the dump-only flags and
 /// validation; spawning lands in PR 3.
-fn cmd_run_scenario(
-    scenario_path: &Path,
-    flags: &RunFlags,
-    _verbose: bool,
-) -> Result<()> {
+fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> Result<()> {
     let s = scenario::parse(scenario_path)?;
     scenario::validate(&s, scenario_path)?;
 
@@ -3515,7 +3680,7 @@ fn cmd_run_scenario(
 
     if flags.print_synthesised {
         match scenario::render_synthesised_host(&s, scenario_path)? {
-            Some(yaml) => print!("{}", yaml),
+            Some(yaml) => print!("{yaml}"),
             None => {
                 eprintln!(
                     "scenario {}: no synthesised host (every binding has an explicit `on:` \
@@ -3528,7 +3693,10 @@ fn cmd_run_scenario(
     }
 
     if let Some(comp) = &flags.print_merged {
-        print!("{}", scenario::render_merged_component(comp, &s, scenario_path)?);
+        print!(
+            "{}",
+            scenario::render_merged_component(comp, &s, scenario_path)?
+        );
         return Ok(());
     }
 
@@ -3590,9 +3758,10 @@ fn spawn_scenario(
         if target == "wasm" {
             // Passive: build the bundle into the canonical location
             // the synthesised host's fs_path: route already points at.
-            let graph_rel = comp.graph.as_ref().ok_or_else(|| {
-                Error::Config(format!("component `{}` has no `graph:`", comp_name))
-            })?;
+            let graph_rel = comp
+                .graph
+                .as_ref()
+                .ok_or_else(|| Error::Config(format!("component `{comp_name}` has no `graph:`")))?;
             let graph_abs = scenario_dir.join(graph_rel);
             let bundle_target = scenario::wasm_bundle_target_path(comp_name, comp)?;
             eprintln!(
@@ -3608,10 +3777,14 @@ fn spawn_scenario(
 
         // Active: merge bindings into the component's graph, write to
         // disk, build, and queue for spawn.
-        let merged_yaml = scenario::write_merged_component_yaml(comp_name, scenario, scenario_path)?;
+        let merged_yaml =
+            scenario::write_merged_component_yaml(comp_name, scenario, scenario_path)?;
         eprintln!(
             "[scenario] {}: building component `{}` ({}) → {}",
-            scenario.name, comp_name, target, merged_yaml.display()
+            scenario.name,
+            comp_name,
+            target,
+            merged_yaml.display()
         );
         let build = build_one(&merged_yaml, None, verbose)?;
         if build.family != "linux" {
@@ -3624,19 +3797,23 @@ fn spawn_scenario(
             )));
         }
         let dir = build.output_path.parent().ok_or_else(|| {
-            Error::Config(format!("component `{}` build has no output parent", comp_name))
+            Error::Config(format!(
+                "component `{comp_name}` build has no output parent"
+            ))
         })?;
         let merged_config: serde_json::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&merged_yaml)?)
-                .map_err(|e| Error::Config(format!("parse merged yaml: {}", e)))?;
+                .map_err(|e| Error::Config(format!("parse merged yaml: {e}")))?;
         let port = scenario::extract_http_port(&merged_config);
         actives.push(ActiveComponent {
             display: comp_name.clone(),
             config_bin: dir.join("config.bin"),
             modules_bin: dir.join("modules.bin"),
             port,
-            url: port.map(|p| format!("http://localhost:{}/", p)),
-            duration: comp.duration.map(|d| std::time::Duration::from_secs(d as u64)),
+            url: port.map(|p| format!("http://localhost:{p}/")),
+            duration: comp
+                .duration
+                .map(|d| std::time::Duration::from_secs(d as u64)),
         });
     }
 
@@ -3782,10 +3959,7 @@ fn run_actives_parallel(
     if let Some((disp, outcome)) = probe_error {
         match outcome {
             ReadyOutcome::ChildExited(status) => {
-                eprintln!(
-                    "[scenario] {}: `{}` exited during startup ({})",
-                    name, disp, status
-                );
+                eprintln!("[scenario] {name}: `{disp}` exited during startup ({status})");
                 teardown_remaining(&mut spawned);
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` exited before its http listener bound \
@@ -3796,10 +3970,7 @@ fn run_actives_parallel(
                 )));
             }
             ReadyOutcome::Timeout => {
-                eprintln!(
-                    "[scenario] {}: `{}` did not bind within 5 s",
-                    name, disp
-                );
+                eprintln!("[scenario] {name}: `{disp}` did not bind within 5 s");
                 teardown_remaining(&mut spawned);
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` did not bind its http listener within 5 s.",
@@ -3833,7 +4004,7 @@ fn run_actives_parallel(
             first_exit
         )));
     }
-    eprintln!("[scenario] {}: terminated cleanly", name);
+    eprintln!("[scenario] {name}: terminated cleanly");
     Ok(())
 }
 
@@ -3846,7 +4017,12 @@ fn spawn_and_wait_one(
     scenario_path: &Path,
 ) -> Result<std::process::ExitStatus> {
     let mut s = spawn_one(linux_bin, active, scenario_path)?;
-    let outcome = race_probe(&mut s.child, &s.probe, s.port, std::time::Duration::from_secs(5));
+    let outcome = race_probe(
+        &mut s.child,
+        &s.probe,
+        s.port,
+        std::time::Duration::from_secs(5),
+    );
     match outcome {
         ReadyOutcome::Ready => {
             if let Some(u) = &s.url {
@@ -3859,7 +4035,9 @@ fn spawn_and_wait_one(
             }
         }
         ReadyOutcome::ChildExited(status) => {
-            if let Some(p) = s.probe.take() { p.join(); }
+            if let Some(p) = s.probe.take() {
+                p.join();
+            }
             return Err(Error::Config(format!(
                 "scenario {}: component `{}` exited before its http listener bound \
                  (status {}). The kernel's diagnostic appears above.",
@@ -3871,7 +4049,9 @@ fn spawn_and_wait_one(
         ReadyOutcome::Timeout => {
             let _ = s.child.kill();
             let _ = s.child.wait();
-            if let Some(p) = s.probe.take() { p.join(); }
+            if let Some(p) = s.probe.take() {
+                p.join();
+            }
             return Err(Error::Config(format!(
                 "scenario {}: component `{}` did not bind its http listener within 5 s.",
                 scenario_path.display(),
@@ -3883,12 +4063,15 @@ fn spawn_and_wait_one(
     let outcome = if let Some(d) = active.duration {
         wait_with_duration(&mut s.child, d)
     } else {
-        let status = s.child
+        let status = s
+            .child
             .wait()
             .map_err(|e| Error::Config(format!("waiting for {}: {}", s.display, e)))?;
         DurationOutcome::NaturalExit(status)
     };
-    if let Some(p) = s.probe.take() { p.join(); }
+    if let Some(p) = s.probe.take() {
+        p.join();
+    }
     Ok(match outcome {
         // Natural exit on its own → caller decides based on status.
         DurationOutcome::NaturalExit(s) => s,
@@ -3943,10 +4126,16 @@ fn spawn_one(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
-            Error::Config(format!("spawning fluxor-linux for `{}`: {}", active.display, e))
+            Error::Config(format!(
+                "spawning fluxor-linux for `{}`: {}",
+                active.display, e
+            ))
         })?;
     let stderr_pipe = child.stderr.take().ok_or_else(|| {
-        Error::Config(format!("`{}`: fluxor-linux has no stderr pipe", active.display))
+        Error::Config(format!(
+            "`{}`: fluxor-linux has no stderr pipe",
+            active.display
+        ))
     })?;
     let probe = scenario_readiness_probe::Probe::start(stderr_pipe, active.port.unwrap_or(0));
     Ok(SpawnedActive {
@@ -4048,16 +4237,18 @@ fn teardown_remaining(spawned: &mut [SpawnedActive]) {
 }
 
 fn launch_browser(url: &str) {
-    let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
     match std::process::Command::new(cmd).arg(url).spawn() {
-        Ok(_) => eprintln!("[scenario]   --open: launched `{}` on {}", cmd, url),
+        Ok(_) => eprintln!("[scenario]   --open: launched `{cmd}` on {url}"),
         Err(e) => eprintln!(
-            "[scenario]   --open: WARNING failed to launch `{}` ({}); open {} manually",
-            cmd, e, url
+            "[scenario]   --open: WARNING failed to launch `{cmd}` ({e}); open {url} manually"
         ),
     }
 }
-
 
 /// Outcome of racing the readiness probe against the spawned
 /// fluxor-linux's exit status.  Used by
@@ -4106,7 +4297,7 @@ mod scenario_readiness_probe {
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
                     // Tee: forward to our own stderr so users see logs.
-                    eprintln!("{}", line);
+                    eprintln!("{line}");
                     if line.contains("[linux_net] listening on port") {
                         tee_ready.store(true, Ordering::Release);
                     }
@@ -4125,7 +4316,10 @@ mod scenario_readiness_probe {
         /// the scenario runner usually polls [`ready`] in its own loop
         /// alongside `child.try_wait()` so a child crash short-circuits
         /// the 5 s wait.
-        #[allow(dead_code)]
+        #[allow(
+            dead_code,
+            reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+        )]
         pub fn wait(&self, timeout: Duration) -> bool {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
@@ -4190,8 +4384,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
 
             if !status.success() {
                 return Err(Error::Config(format!(
-                    "fluxor-linux exited with status {}",
-                    status
+                    "fluxor-linux exited with status {status}"
                 )));
             }
         }
@@ -4241,7 +4434,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 // Extract HTTP port from config YAML for QEMU port forwarding
                 let yaml_text = std::fs::read_to_string(config_path)?;
                 let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
-                    .map_err(|e| Error::Config(format!("YAML parse: {}", e)))?;
+                    .map_err(|e| Error::Config(format!("YAML parse: {e}")))?;
                 let guest_port = yaml
                     .get("modules")
                     .and_then(|m| m.as_sequence())
@@ -4257,13 +4450,13 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 } else {
                     guest_port
                 };
-                let hostfwd = format!("user,id=net0,hostfwd=tcp::{}-:{}", host_port, guest_port);
+                let hostfwd = format!("user,id=net0,hostfwd=tcp::{host_port}-:{guest_port}");
 
                 eprintln!(
                     "Running: qemu-system-aarch64 -kernel {}",
                     elf_path.display()
                 );
-                eprintln!("  Port forward: host {} -> guest {}", host_port, guest_port);
+                eprintln!("  Port forward: host {host_port} -> guest {guest_port}");
                 eprintln!(
                     "  Side-load: config={} @ 0x{:08x}, modules={} @ 0x{:08x}",
                     config_blob.display(),
@@ -4314,7 +4507,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                     .status()?;
 
                 if !status.success() {
-                    return Err(Error::Config(format!("QEMU exited with status {}", status)));
+                    return Err(Error::Config(format!("QEMU exited with status {status}")));
                 }
             } else {
                 eprintln!("Use 'fluxor flash' for hardware targets");
@@ -4559,7 +4752,7 @@ fn cmd_sign(
     fn hex(b: &[u8]) -> String {
         let mut s = String::with_capacity(b.len() * 2);
         for &x in b {
-            s.push_str(&format!("{:02x}", x));
+            s.push_str(&format!("{x:02x}"));
         }
         s
     }
@@ -4578,5 +4771,244 @@ fn cmd_sign(
         );
     }
 
+    Ok(())
+}
+
+/// `fluxor lint hygiene` — drive the AST scanner over a project root,
+/// honour `fluxor.toml::[ci.hygiene]`, and surface every violation in
+/// a single pass. Exit code is non-zero on any violation or stale
+/// exemption row.
+fn cmd_lint_hygiene(project_root_override: Option<&Path>, json: bool) -> Result<()> {
+    let root = match project_root_override {
+        Some(p) => p.to_path_buf(),
+        None => crate::project::root(),
+    };
+
+    let config = hygiene::Config::load(&root)
+        .map_err(|e| Error::Config(format!("loading fluxor.toml: {e}")))?;
+    let report =
+        hygiene::scan(&root, &config).map_err(|e| Error::Config(format!("scanning: {e}")))?;
+
+    if json {
+        let payload = serde_json::json!({
+            "files_scanned": report.files_scanned,
+            "mode": match config.mode {
+                hygiene::Mode::Strict => "strict",
+                hygiene::Mode::Permissive => "permissive",
+            },
+            "violations": report.violations.iter().map(|v| serde_json::json!({
+                "path": v.path.to_string_lossy(),
+                "line": v.line,
+                "rule": v.rule.as_str(),
+                "message": v.message,
+            })).collect::<Vec<_>>(),
+            "stale_exemptions": report.stale_exemptions.iter().map(|s| serde_json::json!({
+                "path": s.path.to_string_lossy(),
+                "rule": s.rule.as_str(),
+                "reason": s.kind.as_str(),
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        if !report.ok() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    for v in &report.violations {
+        eprintln!(
+            "\x1b[1;31m{rule}\x1b[0m {path}:{line}: {message}",
+            rule = v.rule.as_str(),
+            path = v.path.display(),
+            line = v.line,
+            message = v.message,
+        );
+    }
+    for s in &report.stale_exemptions {
+        eprintln!(
+            "\x1b[1;33mstale-exemption\x1b[0m {path} (rule={rule}): {reason}",
+            path = s.path.display(),
+            rule = s.rule.as_str(),
+            reason = s.kind.as_str(),
+        );
+    }
+
+    let n_v = report.violations.len();
+    let n_s = report.stale_exemptions.len();
+    if n_v == 0 && n_s == 0 {
+        eprintln!(
+            "\x1b[1;32mhygiene clean\x1b[0m ({} files scanned)",
+            report.files_scanned,
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "\x1b[1;31mhygiene\x1b[0m {n_v} violation(s), {n_s} stale exemption(s) across {} files",
+        report.files_scanned,
+    );
+    std::process::exit(1);
+}
+
+fn resolve_project_root(override_arg: Option<&Path>) -> PathBuf {
+    override_arg
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::project::root)
+}
+
+/// `fluxor modules build` — drive the PIC / wasm module pipeline.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "CLI boolean flags map 1:1 to clap fields; collapsing them adds indirection without clarifying intent"
+)]
+fn cmd_modules_build(
+    target: Option<String>,
+    all: bool,
+    out: &Path,
+    strict: bool,
+    lenient: bool,
+    project_root: Option<&Path>,
+    verbose: bool,
+) -> Result<()> {
+    let project_root = resolve_project_root(project_root);
+    let out_root = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        project_root.join(out)
+    };
+
+    let selector = match (target, all) {
+        (Some(t), false) => modules_build::TargetSelector::One(t),
+        (None, true) => modules_build::TargetSelector::All,
+        (None, false) => {
+            return Err(Error::Module(
+                "`fluxor modules build` requires `--target T` or `--all`".to_string(),
+            ));
+        }
+        (Some(_), true) => {
+            // clap's `conflicts_with` should catch this, but guard
+            // anyway so the error surfaces as a Module error rather
+            // than a clap panic.
+            return Err(Error::Module(
+                "`--target` and `--all` are mutually exclusive".to_string(),
+            ));
+        }
+    };
+
+    let opts = modules_build::BuildOpts {
+        project_root,
+        selector,
+        out_root,
+        // `--lenient` is the implicit default when neither flag is set.
+        strict: strict && !lenient,
+        verbose,
+    };
+    let report = modules_build::run(&opts)?;
+    let mut had_failure = false;
+    for tr in &report.per_target {
+        println!(
+            "Modules ({target}/{silicon}): built {} of {}, up-to-date {}, skipped {}, failed {}",
+            tr.built.len(),
+            tr.built.len() + tr.up_to_date.len() + tr.skipped.len() + tr.failed.len(),
+            tr.up_to_date.len(),
+            tr.skipped.len(),
+            tr.failed.len(),
+            target = tr.target,
+            silicon = tr.silicon,
+        );
+        for (name, reason) in &tr.skipped {
+            println!("  skipped: {name} — {reason}");
+        }
+        for (name, reason) in &tr.failed {
+            eprintln!("  FAILED:  {name} — {reason}");
+            had_failure = true;
+        }
+    }
+    if had_failure {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn cmd_modules_clean(out: &Path) -> Result<()> {
+    let project_root = crate::project::root();
+    let out_root = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        project_root.join(out)
+    };
+    let opts = modules_build::BuildOpts {
+        project_root,
+        selector: modules_build::TargetSelector::All,
+        out_root,
+        strict: false,
+        verbose: false,
+    };
+    let removed = modules_build::clean(&opts)?;
+    println!("modules clean: removed {removed} artefact file(s)");
+    Ok(())
+}
+
+fn cmd_modules_list(project_root: Option<&Path>, json: bool) -> Result<()> {
+    let project_root = resolve_project_root(project_root);
+    let summaries = modules_build::list(&project_root)?;
+    if json {
+        let payload = serde_json::json!({
+            "project_root": project_root.to_string_lossy(),
+            "modules": summaries.iter().map(|s| serde_json::json!({
+                "name": s.name,
+                "entry": s.entry.to_string_lossy(),
+                "manifest": s.manifest.to_string_lossy(),
+                "hardware_targets": s.hardware_targets,
+                "type_id": s.type_id,
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    println!("Modules under {}:", project_root.display());
+    for s in &summaries {
+        let targets = if s.hardware_targets.is_empty() {
+            "<all>".to_string()
+        } else {
+            s.hardware_targets.join(",")
+        };
+        println!(
+            "  {name:24} type={type_id} targets={targets} entry={entry}",
+            name = s.name,
+            type_id = s.type_id,
+            entry = s.entry.display(),
+        );
+    }
+    println!("({} modules)", summaries.len());
+    Ok(())
+}
+
+fn cmd_modules_resolve(target: &str, out: &Path) -> Result<()> {
+    let project_root = crate::project::root();
+    let out_root = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        project_root.join(out)
+    };
+    let path = modules_build::resolve(&out_root, target);
+    println!("{}", path.display());
+    Ok(())
+}
+
+/// `fluxor ci` — orchestrate the full CI gate.
+fn cmd_ci(skip: &[String], project_root: Option<&Path>, verbose: bool) -> Result<()> {
+    let project_root = resolve_project_root(project_root);
+    let skip_set = ci::SkipSet::from_strs(skip).map_err(Error::Config)?;
+    let results = ci::run(&project_root, &skip_set, verbose)?;
+    println!("{}", ci::format_summary(&results));
+    if !ci::all_ok(&results) {
+        std::process::exit(1);
+    }
     Ok(())
 }

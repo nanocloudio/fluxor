@@ -59,7 +59,10 @@ mod __wasm_entry {
         ctrl_chan: i32,
         arena_size: u32,
     ) -> i32 {
-        let sys: &SyscallTable = unsafe { &WASM_SYSCALLS };
+        // Rust 2024: taking a shared reference to a non-`UnsafeCell`
+        // static is safe; the surrounding `unsafe fn` calls below
+        // are what actually need the unsafe scope.
+        let sys: &SyscallTable = &WASM_SYSCALLS;
 
         // Module handlers vary between `u32` and `usize` returns and
         // between `*mut u8` / `*mut c_void` state pointers. Both

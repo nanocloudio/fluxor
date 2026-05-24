@@ -124,7 +124,6 @@ pub unsafe fn png_decode(s: &mut ImageState) -> bool {
             idat_total += clen as usize;
         } else if ctype == *b"IEND" {
             saw_iend = true;
-            walk = cnext;
             break;
         }
         walk = cnext;

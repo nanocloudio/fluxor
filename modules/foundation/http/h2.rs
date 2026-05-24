@@ -478,13 +478,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 cur.send_len = n as u16;
             }
             cur_h2_mut(s).sub = Sub::Active;
-            return 0;
+            0
         }
-        Sub::Active => return active(s),
-        Sub::SendingBody => return step_sending_body(s),
+        Sub::Active => active(s),
+        Sub::SendingBody => step_sending_body(s),
         Sub::Closing => {
             // Pending GOAWAY already drained by the flush above.
-            return 1;
+            1
         }
     }
 }
@@ -873,7 +873,7 @@ unsafe fn handle_settings(
         cur_h2_mut(s).settings_acked = 1;
         return Ok(());
     }
-    if hdr.length % 6 != 0 {
+    if !hdr.length.is_multiple_of(6) {
         return Err(h2w::ERR_FRAME_SIZE_ERROR);
     }
     // Walk SETTINGS payload (each entry: 2-byte id, 4-byte value).
@@ -1054,10 +1054,8 @@ unsafe fn handle_headers(
                 i += 1;
             }
             *pl_ptr = n as u8;
-        } else if bytes_eq(name, b":protocol") {
-            if bytes_eq(value, b"websocket") {
-                *pr_ptr = 1;
-            }
+        } else if bytes_eq(name, b":protocol") && bytes_eq(value, b"websocket") {
+            *pr_ptr = 1;
         }
     });
     if dec.is_err() {

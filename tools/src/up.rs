@@ -44,14 +44,11 @@ pub fn cmd_up(
     fluxor_bin: Option<&Path>,
 ) -> Result<()> {
     if replicas == 0 {
-        return Err(Error::Config(
-            "--replicas must be at least 1".to_string(),
-        ));
+        return Err(Error::Config("--replicas must be at least 1".to_string()));
     }
     if replicas as u32 + base_port as u32 > u16::MAX as u32 {
         return Err(Error::Config(format!(
-            "base_port + replicas overflows u16 (base_port={}, replicas={})",
-            base_port, replicas
+            "base_port + replicas overflows u16 (base_port={base_port}, replicas={replicas})"
         )));
     }
 
@@ -61,7 +58,7 @@ pub fn cmd_up(
     let scratch = tempdir_unique("fluxor-up")?;
     eprintln!("scratch:  {}", scratch.display());
     eprintln!("template: {}", template_path.display());
-    eprintln!("replicas: {}", replicas);
+    eprintln!("replicas: {replicas}");
     eprintln!(
         "ports:    {}..{}",
         base_port,
@@ -85,12 +82,12 @@ pub fn cmd_up(
             ("HTTP_PORT".to_string(), http_port.to_string()),
         ];
         for j in 0..replicas {
-            vars.push((format!("PEER{}_PORT", j), (base_port + j as u16).to_string()));
+            vars.push((format!("PEER{j}_PORT"), (base_port + j as u16).to_string()));
         }
         vars.extend(extra.iter().cloned());
 
         let rendered = render_file(template_path, &vars)?;
-        let yaml_path = scratch.join(format!("{}-n{}.yaml", stem, i));
+        let yaml_path = scratch.join(format!("{stem}-n{i}.yaml"));
         std::fs::write(&yaml_path, &rendered).map_err(|e| {
             Error::Config(format!(
                 "writing rendered yaml {}: {}",
@@ -99,7 +96,7 @@ pub fn cmd_up(
             ))
         })?;
 
-        let stderr_path = scratch.join(format!("n{}.stderr", i));
+        let stderr_path = scratch.join(format!("n{i}.stderr"));
         let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
             Error::Config(format!(
                 "creating stderr log {}: {}",
@@ -107,7 +104,7 @@ pub fn cmd_up(
                 e
             ))
         })?;
-        let stdout_path = scratch.join(format!("n{}.stdout", i));
+        let stdout_path = scratch.join(format!("n{i}.stdout"));
         let stdout_file = std::fs::File::create(&stdout_path).map_err(|e| {
             Error::Config(format!(
                 "creating stdout log {}: {}",
@@ -122,12 +119,7 @@ pub fn cmd_up(
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
             .spawn()
-            .map_err(|e| {
-                Error::Config(format!(
-                    "spawning fluxor run for replica {}: {}",
-                    i, e
-                ))
-            })?;
+            .map_err(|e| Error::Config(format!("spawning fluxor run for replica {i}: {e}")))?;
 
         eprintln!(
             "  node {}  pid {}  port {}  log {}",
@@ -213,10 +205,10 @@ struct Spawned {
 }
 
 fn signal_child(child: &Child, sig: libc::c_int) -> std::io::Result<()> {
+    let pid = child.id() as libc::pid_t;
     // SAFETY: kill(2) with a non-negative pid is well-defined; we
     // never call it on an already-reaped pid because the caller
     // checks `try_wait` first.
-    let pid = child.id() as libc::pid_t;
     let rc = unsafe { libc::kill(pid, sig) };
     if rc == 0 {
         Ok(())
@@ -267,7 +259,7 @@ fn tail_loop(id: u8, path: &Path, interrupt: Arc<AtomicBool>) {
         }
     };
     let mut reader = BufReader::new(file);
-    let prefix = format!("[n{}] ", id);
+    let prefix = format!("[n{id}] ");
     let mut buf = String::new();
     loop {
         buf.clear();
@@ -280,7 +272,7 @@ fn tail_loop(id: u8, path: &Path, interrupt: Arc<AtomicBool>) {
                 thread::sleep(Duration::from_millis(100));
             }
             Ok(_) => {
-                eprint!("{}{}", prefix, buf);
+                eprint!("{prefix}{buf}");
             }
             Err(_) => return,
         }
@@ -313,8 +305,7 @@ fn tempdir_unique(prefix: &str) -> Result<PathBuf> {
     // suffix). Caller is responsible for cleanup.
     let base = std::env::temp_dir();
     let path = base.join(format!("{}-{}", prefix, std::process::id()));
-    std::fs::create_dir_all(&path).map_err(|e| {
-        Error::Config(format!("creating scratch dir {}: {}", path.display(), e))
-    })?;
+    std::fs::create_dir_all(&path)
+        .map_err(|e| Error::Config(format!("creating scratch dir {}: {}", path.display(), e)))?;
     Ok(path)
 }

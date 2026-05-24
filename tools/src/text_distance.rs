@@ -17,11 +17,7 @@
 /// to `needle` is minimal AND `≤ max_distance`. `None` when no
 /// candidate is within the threshold. Distance cap keeps the
 /// suggestion sensible: a totally unrelated typo gets no hint.
-pub fn closest_match(
-    needle: &str,
-    haystack: &[String],
-    max_distance: usize,
-) -> Option<String> {
+pub fn closest_match(needle: &str, haystack: &[String], max_distance: usize) -> Option<String> {
     let mut best: Option<(usize, &String)> = None;
     for candidate in haystack {
         let d = levenshtein(needle, candidate);
@@ -46,10 +42,8 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i + 1;
         for (j, &bc) in b.iter().enumerate() {
             let cost = if ac == bc { 0 } else { 1 };
-            curr[j + 1] = std::cmp::min(
-                std::cmp::min(curr[j] + 1, prev[j + 1] + 1),
-                prev[j] + cost,
-            );
+            curr[j + 1] =
+                std::cmp::min(std::cmp::min(curr[j] + 1, prev[j + 1] + 1), prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -99,8 +93,7 @@ mod tests {
         // Ties: first-wins is the documented behaviour (Vec
         // iteration order). Pinned here so a future change to
         // the resolution gets a heads-up.
-        let targets: Vec<String> =
-            ["xyz", "yyz"].iter().map(|s| s.to_string()).collect();
+        let targets: Vec<String> = ["xyz", "yyz"].iter().map(|s| s.to_string()).collect();
         assert_eq!(closest_match("zzz", &targets, 3), Some("xyz".into()));
     }
 }

@@ -39,6 +39,8 @@ fn wasm_restore_interrupts(_state: u32) {}
 fn wasm_wake_scheduler() {}
 
 fn wasm_now_micros() -> u64 {
+    // SAFETY: `host_now_us` is a wasm import; the JS shim provides a
+    // pure clock read with no operands.
     unsafe { host_now_us() }
 }
 fn wasm_now_millis() -> u64 {
@@ -137,6 +139,9 @@ fn wasm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     if buf.is_null() || len == 0 {
         return 0;
     }
+    // SAFETY: `host_csprng_fill` is a wasm import; the host writes `len`
+    // bytes into `buf`. Caller is `hal::csprng_fill` which guarantees the
+    // pointer is valid for that length.
     unsafe { host_csprng_fill(buf, len) }
 }
 fn wasm_core_id() -> usize {

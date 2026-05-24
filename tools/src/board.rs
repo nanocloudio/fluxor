@@ -97,14 +97,13 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
     let valid_types = ["snapshot", "ring", "command"];
 
     for (i, bridge) in bridges.iter().enumerate() {
-        let prefix = format!("bridges[{}]", i);
+        let prefix = format!("bridges[{i}]");
 
         // Required: type
         let btype = bridge.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if !valid_types.contains(&btype) {
             result.add_error(format!(
-                "{}: invalid type '{}' (must be snapshot, ring, or command)",
-                prefix, btype
+                "{prefix}: invalid type '{btype}' (must be snapshot, ring, or command)"
             ));
         }
 
@@ -114,12 +113,11 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
                 let module_name = spec.split('.').next().unwrap_or("");
                 if !module_names.contains(&module_name.to_string()) {
                     result.add_error(format!(
-                        "{}.{}: module '{}' not found",
-                        prefix, field, module_name
+                        "{prefix}.{field}: module '{module_name}' not found"
                     ));
                 }
             } else {
-                result.add_error(format!("{}: missing '{}'", prefix, field));
+                result.add_error(format!("{prefix}: missing '{field}'"));
             }
         }
 
@@ -131,7 +129,7 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 if size == 0 || size > 56 {
-                    result.add_error(format!("{}: data_size must be 1-56 (got {})", prefix, size));
+                    result.add_error(format!("{prefix}: data_size must be 1-56 (got {size})"));
                 }
             }
             "ring" => {
@@ -140,7 +138,7 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 if elem == 0 || elem > 56 {
-                    result.add_error(format!("{}: elem_size must be 1-56 (got {})", prefix, elem));
+                    result.add_error(format!("{prefix}: elem_size must be 1-56 (got {elem})"));
                 }
             }
             "command" => {
@@ -149,7 +147,7 @@ fn validate_bridges(bridges: &[Value], config: &Value, result: &mut ValidationRe
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 if size == 0 || size > 56 {
-                    result.add_error(format!("{}: data_size must be 1-56 (got {})", prefix, size));
+                    result.add_error(format!("{prefix}: data_size must be 1-56 (got {size})"));
                 }
             }
             _ => {} // already flagged as invalid type
@@ -195,7 +193,7 @@ fn validate_isr_modules(
         }
 
         isr_module_count += 1;
-        let prefix = format!("modules[{}]", i);
+        let prefix = format!("modules[{i}]");
         let name = module
             .get("name")
             .and_then(|n| n.as_str())
@@ -205,8 +203,7 @@ fn validate_isr_modules(
         let trust = module.get("trust").and_then(|t| t.as_str()).unwrap_or("");
         if trust != "platform" {
             result.add_error(format!(
-                "{} ({}): ISR tier '{}' requires trust: \"platform\" (got '{}')",
-                prefix, name, tier, trust
+                "{prefix} ({name}): ISR tier '{tier}' requires trust: \"platform\" (got '{trust}')"
             ));
         }
 
@@ -217,8 +214,7 @@ fn validate_isr_modules(
             .unwrap_or(0);
         if max_cycles == 0 {
             result.add_error(format!(
-                "{} ({}): ISR tier '{}' requires max_cycles declaration",
-                prefix, name, tier
+                "{prefix} ({name}): ISR tier '{tier}' requires max_cycles declaration"
             ));
             continue;
         }
@@ -229,8 +225,7 @@ fn validate_isr_modules(
                 let period_cycles = clock_hz / rate_hz;
                 if max_cycles > period_cycles {
                     result.add_error(format!(
-                        "{} ({}): max_cycles ({}) exceeds period ({} cycles at {} Hz)",
-                        prefix, name, max_cycles, period_cycles, rate_hz
+                        "{prefix} ({name}): max_cycles ({max_cycles}) exceeds period ({period_cycles} cycles at {rate_hz} Hz)"
                     ));
                 }
                 // Track period for combined budget check (all Tier 1b share the same timer)
@@ -239,8 +234,7 @@ fn validate_isr_modules(
                     tier1b_period_us = this_period_us;
                 } else if this_period_us != tier1b_period_us {
                     result.add_warning(format!(
-                        "{} ({}): Tier 1b rate_hz ({}) implies different period than other Tier 1b modules",
-                        prefix, name, rate_hz
+                        "{prefix} ({name}): Tier 1b rate_hz ({rate_hz}) implies different period than other Tier 1b modules"
                     ));
                 }
             }
@@ -253,8 +247,7 @@ fn validate_isr_modules(
                 .unwrap_or(false)
             {
                 result.add_warning(format!(
-                    "{} ({}): FPU in Tier 1b ISR adds 33 cycle lazy stacking overhead on Cortex-M33",
-                    prefix, name
+                    "{prefix} ({name}): FPU in Tier 1b ISR adds 33 cycle lazy stacking overhead on Cortex-M33"
                 ));
             }
         }
@@ -263,8 +256,7 @@ fn validate_isr_modules(
             let irq = module.get("irq").and_then(|i| i.as_u64());
             if irq.is_none() {
                 result.add_error(format!(
-                    "{} ({}): Tier 2 module requires 'irq' field",
-                    prefix, name
+                    "{prefix} ({name}): Tier 2 module requires 'irq' field"
                 ));
             }
         }
@@ -276,8 +268,7 @@ fn validate_isr_modules(
         let max_budget = period_cycles / 2; // 50% limit
         if total_tier1b_budget > max_budget {
             result.add_error(format!(
-                "ISR budget: combined Tier 1b budget ({} cycles) exceeds 50% of period ({} cycles)",
-                total_tier1b_budget, period_cycles
+                "ISR budget: combined Tier 1b budget ({total_tier1b_budget} cycles) exceeds 50% of period ({period_cycles} cycles)"
             ));
         }
     }
@@ -285,8 +276,7 @@ fn validate_isr_modules(
     // Slot count check
     if isr_module_count > 8 {
         result.add_error(format!(
-            "ISR modules: too many ({}, max 4 Tier 1b + 4 Tier 2)",
-            isr_module_count
+            "ISR modules: too many ({isr_module_count}, max 4 Tier 1b + 4 Tier 2)"
         ));
     }
 }
@@ -298,8 +288,7 @@ fn validate_reconfigure_section(reconfig: &Value, config: &Value, result: &mut V
         match mode {
             "live" | "atomic" => {}
             _ => result.add_error(format!(
-                "reconfigure.mode: invalid value '{}' (must be 'live' or 'atomic')",
-                mode
+                "reconfigure.mode: invalid value '{mode}' (must be 'live' or 'atomic')"
             )),
         }
     }
@@ -313,14 +302,12 @@ fn validate_reconfigure_section(reconfig: &Value, config: &Value, result: &mut V
     if let Some(timeout) = global_timeout {
         if timeout < 100 {
             result.add_error(format!(
-                "reconfigure.drain_timeout_ms: {} too low (minimum 100ms)",
-                timeout
+                "reconfigure.drain_timeout_ms: {timeout} too low (minimum 100ms)"
             ));
         }
         if timeout > 30000 {
             result.add_error(format!(
-                "reconfigure.drain_timeout_ms: {} too high (maximum 30000ms)",
-                timeout
+                "reconfigure.drain_timeout_ms: {timeout} too high (maximum 30000ms)"
             ));
         }
     }
@@ -341,8 +328,7 @@ fn validate_reconfigure_section(reconfig: &Value, config: &Value, result: &mut V
                     if let Some(global) = global_timeout {
                         if per_timeout > global {
                             result.add_error(format!(
-                                "module '{}' drain.timeout ({}) exceeds global drain_timeout_ms ({})",
-                                module_name, per_timeout, global
+                                "module '{module_name}' drain.timeout ({per_timeout}) exceeds global drain_timeout_ms ({global})"
                             ));
                         }
                     }
@@ -353,8 +339,7 @@ fn validate_reconfigure_section(reconfig: &Value, config: &Value, result: &mut V
                     match policy {
                         "graceful" | "immediate" => {}
                         _ => result.add_error(format!(
-                            "module '{}' drain.policy: invalid value '{}' (must be 'graceful' or 'immediate')",
-                            module_name, policy
+                            "module '{module_name}' drain.policy: invalid value '{policy}' (must be 'graceful' or 'immediate')"
                         )),
                     }
                 }
@@ -399,9 +384,9 @@ fn validate_hardware_section(
 
             // Check pin range, reserved, conflicts
             for &pin in &[miso, mosi, sck] {
-                check_pin_range(pin, &format!("hardware.spi[{}]", i), target, result);
-                check_reserved_pin(pin, &format!("hardware.spi[{}]", i), target, result);
-                check_pin_conflict(pin, &format!("hardware.spi[{}]", i), used_pins, result);
+                check_pin_range(pin, &format!("hardware.spi[{i}]"), target, result);
+                check_reserved_pin(pin, &format!("hardware.spi[{i}]"), target, result);
+                check_pin_conflict(pin, &format!("hardware.spi[{i}]"), used_pins, result);
             }
 
             // Check valid SPI pin combination
@@ -432,9 +417,9 @@ fn validate_hardware_section(
 
             // Check pin range, reserved, conflicts
             for &pin in &[sda, scl] {
-                check_pin_range(pin, &format!("hardware.i2c[{}]", i), target, result);
-                check_reserved_pin(pin, &format!("hardware.i2c[{}]", i), target, result);
-                check_pin_conflict(pin, &format!("hardware.i2c[{}]", i), used_pins, result);
+                check_pin_range(pin, &format!("hardware.i2c[{i}]"), target, result);
+                check_reserved_pin(pin, &format!("hardware.i2c[{i}]"), target, result);
+                check_pin_conflict(pin, &format!("hardware.i2c[{i}]"), used_pins, result);
             }
 
             // Check valid I2C pin combination
@@ -451,9 +436,9 @@ fn validate_hardware_section(
     if let Some(gpio_configs) = hardware.get("gpio").and_then(|s| s.as_array()) {
         for (i, gpio) in gpio_configs.iter().enumerate() {
             let pin = gpio["pin"].as_u64().unwrap_or(0) as u8;
-            check_pin_range(pin, &format!("hardware.gpio[{}]", i), target, result);
-            check_reserved_pin(pin, &format!("hardware.gpio[{}]", i), target, result);
-            check_pin_conflict(pin, &format!("hardware.gpio[{}]", i), used_pins, result);
+            check_pin_range(pin, &format!("hardware.gpio[{i}]"), target, result);
+            check_reserved_pin(pin, &format!("hardware.gpio[{i}]"), target, result);
+            check_pin_conflict(pin, &format!("hardware.gpio[{i}]"), used_pins, result);
         }
     }
 
@@ -519,8 +504,7 @@ fn check_pin_conflict(
 ) {
     if !used_pins.insert(pin) {
         result.add_error(format!(
-            "{}: Pin {} is already used by another peripheral",
-            context, pin
+            "{context}: Pin {pin} is already used by another peripheral"
         ));
     }
 }
@@ -539,22 +523,17 @@ fn validate_source_pins(
         "gpioinput" | "gpio_input" => {
             if let Some(pin) = src["pin"].as_u64() {
                 let pin = pin as u8;
-                check_pin_range(pin, &format!("sources[{}]", index), target, result);
-                check_reserved_pin(pin, &format!("sources[{}]", index), target, result);
-                check_pin_conflict(pin, &format!("sources[{}].pin", index), used_pins, result);
+                check_pin_range(pin, &format!("sources[{index}]"), target, result);
+                check_reserved_pin(pin, &format!("sources[{index}]"), target, result);
+                check_pin_conflict(pin, &format!("sources[{index}].pin"), used_pins, result);
             }
         }
         "spiread" | "spi_read" => {
             if let Some(cs_pin) = src["cs_pin"].as_u64() {
                 let pin = cs_pin as u8;
-                check_pin_range(pin, &format!("sources[{}]", index), target, result);
-                check_reserved_pin(pin, &format!("sources[{}]", index), target, result);
-                check_pin_conflict(
-                    pin,
-                    &format!("sources[{}].cs_pin", index),
-                    used_pins,
-                    result,
-                );
+                check_pin_range(pin, &format!("sources[{index}]"), target, result);
+                check_reserved_pin(pin, &format!("sources[{index}]"), target, result);
+                check_pin_conflict(pin, &format!("sources[{index}].cs_pin"), used_pins, result);
             }
         }
         _ => {}
@@ -575,39 +554,34 @@ fn validate_sink_pins(
         "gpiooutput" | "gpio_output" | "gpio" => {
             if let Some(pin) = sink["pin"].as_u64() {
                 let pin = pin as u8;
-                check_pin_range(pin, &format!("sinks[{}]", index), target, result);
-                check_reserved_pin(pin, &format!("sinks[{}]", index), target, result);
-                check_pin_conflict(pin, &format!("sinks[{}].pin", index), used_pins, result);
+                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
+                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
+                check_pin_conflict(pin, &format!("sinks[{index}].pin"), used_pins, result);
             }
         }
         "i2soutput" | "i2s_output" | "i2s" => {
             if let Some(data_pin) = sink["data_pin"].as_u64() {
                 let pin = data_pin as u8;
-                check_pin_range(pin, &format!("sinks[{}]", index), target, result);
-                check_reserved_pin(pin, &format!("sinks[{}]", index), target, result);
-                check_pin_conflict(
-                    pin,
-                    &format!("sinks[{}].data_pin", index),
-                    used_pins,
-                    result,
-                );
+                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
+                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
+                check_pin_conflict(pin, &format!("sinks[{index}].data_pin"), used_pins, result);
             }
             if let Some(clock_base) = sink["clock_pin_base"].as_u64() {
                 let pin = clock_base as u8;
-                check_pin_range(pin, &format!("sinks[{}]", index), target, result);
-                check_reserved_pin(pin, &format!("sinks[{}]", index), target, result);
+                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
+                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
                 check_pin_conflict(
                     pin,
-                    &format!("sinks[{}].clock_pin_base", index),
+                    &format!("sinks[{index}].clock_pin_base"),
                     used_pins,
                     result,
                 );
                 let pin2 = pin + 1;
-                check_pin_range(pin2, &format!("sinks[{}]", index), target, result);
-                check_reserved_pin(pin2, &format!("sinks[{}]", index), target, result);
+                check_pin_range(pin2, &format!("sinks[{index}]"), target, result);
+                check_reserved_pin(pin2, &format!("sinks[{index}]"), target, result);
                 check_pin_conflict(
                     pin2,
-                    &format!("sinks[{}].clock_pin_base+1", index),
+                    &format!("sinks[{index}].clock_pin_base+1"),
                     used_pins,
                     result,
                 );
@@ -616,9 +590,9 @@ fn validate_sink_pins(
         "spiwrite" | "spi_write" => {
             if let Some(cs_pin) = sink["cs_pin"].as_u64() {
                 let pin = cs_pin as u8;
-                check_pin_range(pin, &format!("sinks[{}]", index), target, result);
-                check_reserved_pin(pin, &format!("sinks[{}]", index), target, result);
-                check_pin_conflict(pin, &format!("sinks[{}].cs_pin", index), used_pins, result);
+                check_pin_range(pin, &format!("sinks[{index}]"), target, result);
+                check_reserved_pin(pin, &format!("sinks[{index}]"), target, result);
+                check_pin_conflict(pin, &format!("sinks[{index}].cs_pin"), used_pins, result);
             }
         }
         _ => {}
@@ -726,7 +700,7 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
             .get("name")
             .and_then(|n| n.as_str())
             .unwrap_or("unknown");
-        let prefix = format!("modules[{}] ({})", i, name);
+        let prefix = format!("modules[{i}] ({name})");
 
         // Validate virtual_size_mb
         let virtual_mb = pa
@@ -734,15 +708,11 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         if virtual_mb == 0 {
-            result.add_error(format!(
-                "{}: paged_arena.virtual_size_mb must be > 0",
-                prefix
-            ));
+            result.add_error(format!("{prefix}: paged_arena.virtual_size_mb must be > 0"));
         }
         if virtual_mb > 4096 {
             result.add_error(format!(
-                "{}: paged_arena.virtual_size_mb {} exceeds 4GB limit",
-                prefix, virtual_mb
+                "{prefix}: paged_arena.virtual_size_mb {virtual_mb} exceeds 4GB limit"
             ));
         }
 
@@ -753,8 +723,7 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
             .unwrap_or(1);
         if resident_mb > virtual_mb {
             result.add_warning(format!(
-                "{}: paged_arena.resident_max_mb ({}) > virtual_size_mb ({}), clamped",
-                prefix, resident_mb, virtual_mb
+                "{prefix}: paged_arena.resident_max_mb ({resident_mb}) > virtual_size_mb ({virtual_mb}), clamped"
             ));
         }
         total_resident_mb += resident_mb;
@@ -768,8 +737,7 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
             "ramdisk" | "nvme" => {}
             _ => {
                 result.add_error(format!(
-                    "{}: paged_arena.backing '{}' must be 'ramdisk' or 'nvme'",
-                    prefix, backing
+                    "{prefix}: paged_arena.backing '{backing}' must be 'ramdisk' or 'nvme'"
                 ));
             }
         }
@@ -783,8 +751,7 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
             "deferred" | "write_through" => {}
             _ => {
                 result.add_error(format!(
-                    "{}: paged_arena.writeback '{}' must be 'deferred' or 'write_through'",
-                    prefix, writeback
+                    "{prefix}: paged_arena.writeback '{writeback}' must be 'deferred' or 'write_through'"
                 ));
             }
         }
@@ -802,9 +769,8 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
     // Check total resident fits in reasonable pool (256 pages = 1MB for RAM-disk testing)
     if total_resident_mb > 1 {
         result.add_warning(format!(
-            "Total paged_arena resident_max across all modules is {}MB. \
-             Ensure pool is sized accordingly (default 1MB for testing).",
-            total_resident_mb
+            "Total paged_arena resident_max across all modules is {total_resident_mb}MB. \
+             Ensure pool is sized accordingly (default 1MB for testing)."
         ));
     }
 }

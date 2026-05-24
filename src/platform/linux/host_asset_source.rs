@@ -28,6 +28,7 @@ struct HostAssetState {
 }
 
 fn host_asset_step(state: *mut u8) -> i32 {
+    // SAFETY: kernel-owned arena sized to `HostAssetState` by the loader.
     let st = unsafe { instance_state::<HostAssetState>(state) };
 
     if st.out_chan < 0 {
@@ -39,6 +40,8 @@ fn host_asset_step(state: *mut u8) -> i32 {
     // more from the file — this preserves byte order and prevents
     // truncation when the consumer back-pressures.
     while st.pending_pos < st.pending.len() {
+        // SAFETY: `pending_pos < pending.len()` (loop condition); offset
+        // and length stay within the owned Vec.
         let w = unsafe {
             channel::channel_write(
                 st.out_chan,
@@ -71,7 +74,7 @@ fn host_asset_step(state: *mut u8) -> i32 {
         }
         Ok(n) => n,
         Err(e) => {
-            log::warn!("[host_asset] read error: {}", e);
+            log::warn!("[host_asset] read error: {e}");
             st.eof = true;
             return 1;
         }
@@ -79,6 +82,8 @@ fn host_asset_step(state: *mut u8) -> i32 {
 
     let mut written = 0usize;
     while written < n {
+        // SAFETY: `written < n <= buf.len() = CHUNK_SIZE`; offset stays
+        // within the stack buffer.
         let w = unsafe {
             channel::channel_write(
                 st.out_chan,
@@ -117,11 +122,11 @@ fn build_host_asset_source(module_idx: usize, params: &[u8]) -> scheduler::Built
 
     let (file, eof) = match File::open(&path) {
         Ok(f) => {
-            log::info!("[host_asset] streaming {}", path);
+            log::info!("[host_asset] streaming {path}");
             (Some(f), false)
         }
         Err(e) => {
-            log::warn!("[host_asset] open '{}' failed: {}", path, e);
+            log::warn!("[host_asset] open '{path}' failed: {e}");
             (None, true)
         }
     };
@@ -138,8 +143,7 @@ fn build_host_asset_source(module_idx: usize, params: &[u8]) -> scheduler::Built
         }),
     );
     log::info!(
-        "[inst] module {} = host_asset_source (built-in) out={} path='{}'",
-        module_idx, out_chan, path
+        "[inst] module {module_idx} = host_asset_source (built-in) out={out_chan} path='{path}'"
     );
     m
 }

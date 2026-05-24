@@ -428,8 +428,15 @@ fn pool() -> *mut PagePool {
     &raw mut POOL
 }
 
+// SAFETY (all `(*pool())` derefs below): `POOL` is the kernel's global
+// page pool; all `pool_*` entry points are kernel-side helpers invoked
+// from the scheduler / pager paths which serialise access. The raw
+// pointer dance lets methods take `&mut self` without holding a long-
+// lived `&'static mut` to the static.
+
 /// Initialize the global page pool.
 pub fn pool_init(base_addr: usize, page_count: usize) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).init(base_addr, page_count);
     }
@@ -437,11 +444,13 @@ pub fn pool_init(base_addr: usize, page_count: usize) {
 
 /// Allocate a page for a module.
 pub fn pool_alloc(module_idx: u8) -> Option<usize> {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).alloc(module_idx) }
 }
 
 /// Free a page.
 pub fn pool_free(page_idx: usize) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).free(page_idx);
     }
@@ -449,11 +458,13 @@ pub fn pool_free(page_idx: usize) {
 
 /// Evict using clock algorithm, preferring pages from the given module.
 pub fn pool_evict_clock(module_idx: u8) -> Option<usize> {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).evict_clock(module_idx) }
 }
 
 /// Mark a page as mapped after loading.
 pub fn pool_mark_mapped(page_idx: usize, vpage_idx: u32) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).mark_mapped(page_idx, vpage_idx);
     }
@@ -461,6 +472,7 @@ pub fn pool_mark_mapped(page_idx: usize, vpage_idx: u32) {
 
 /// Mark a page as dirty.
 pub fn pool_mark_dirty(page_idx: usize) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).mark_dirty(page_idx);
     }
@@ -468,6 +480,7 @@ pub fn pool_mark_dirty(page_idx: usize) {
 
 /// Mark a page as accessed.
 pub fn pool_mark_accessed(page_idx: usize) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).mark_accessed(page_idx);
     }
@@ -475,6 +488,7 @@ pub fn pool_mark_accessed(page_idx: usize) {
 
 /// Free all pages for a module.
 pub fn pool_free_module(module_idx: u8) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).free_module_pages(module_idx);
     }
@@ -482,51 +496,61 @@ pub fn pool_free_module(module_idx: u8) {
 
 /// Count resident pages for a module.
 pub fn pool_resident_count(module_idx: u8) -> usize {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).resident_count(module_idx) }
 }
 
 /// Count dirty pages for a module.
 pub fn pool_dirty_count(module_idx: u8) -> usize {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).dirty_count(module_idx) }
 }
 
 /// Number of free pages in pool.
 pub fn pool_free_pages() -> usize {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).free_pages() }
 }
 
 /// Total pages in pool.
 pub fn pool_total_pages() -> usize {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).total_pages() }
 }
 
 /// Check if pool is active.
 pub fn pool_is_active() -> bool {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).is_active() }
 }
 
 /// Get physical address of a page.
 pub fn pool_page_phys_addr(page_idx: usize) -> usize {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).page_phys_addr(page_idx) }
 }
 
 /// Get pointer to page memory.
 pub fn pool_page_ptr(page_idx: usize) -> *mut u8 {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).page_ptr(page_idx) }
 }
 
 /// Find a mapped page.
 pub fn pool_find_page(module_idx: u8, vpage_idx: u32) -> Option<usize> {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).find_page(module_idx, vpage_idx) }
 }
 
 /// Get descriptor copy.
 pub fn pool_descriptor(page_idx: usize) -> PageDescriptor {
+    // SAFETY: see file-scope POOL comment.
     unsafe { (*pool()).descriptors[page_idx] }
 }
 
 /// Pin a page.
 pub fn pool_pin(page_idx: usize) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).pin(page_idx);
     }
@@ -534,6 +558,7 @@ pub fn pool_pin(page_idx: usize) {
 
 /// Unpin a page.
 pub fn pool_unpin(page_idx: usize) {
+    // SAFETY: see file-scope POOL comment.
     unsafe {
         (*pool()).unpin(page_idx);
     }

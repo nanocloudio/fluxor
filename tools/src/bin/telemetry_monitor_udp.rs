@@ -21,6 +21,16 @@
 //!
 //! Handles SIGTERM / SIGINT: close the socket and exit 0.
 
+#![allow(
+    unsafe_code,
+    reason = "rig backend wraps signal handler installation via libc"
+)]
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "rig backend streams NDJSON to stdout and diagnostics to stderr; both are part of the protocol"
+)]
+
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,6 +172,9 @@ fn install_signal_handlers() {
     extern "C" fn handler(_: libc::c_int) {
         SHUTDOWN.store(true, Ordering::Relaxed);
     }
+    // SAFETY: `libc::signal` is async-signal-safe; `handler` is a
+    // plain function pointer with C ABI. The atomic store inside
+    // `handler` is the only state mutation and is signal-safe.
     unsafe {
         libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
         libc::signal(libc::SIGINT, handler as libc::sighandler_t);

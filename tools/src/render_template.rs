@@ -28,13 +28,12 @@ use std::path::Path;
 pub fn render(template: &str, vars: &[(String, String)]) -> Result<String> {
     let mut out = template.to_string();
     for (key, value) in vars {
-        let needle = format!("__{}__", key);
+        let needle = format!("__{key}__");
         out = out.replace(&needle, value);
     }
     if let Some(leftover) = find_unresolved_placeholder(&out) {
         return Err(Error::Config(format!(
-            "unresolved placeholder `__{}__` after substitution",
-            leftover
+            "unresolved placeholder `__{leftover}__` after substitution"
         )));
     }
     Ok(out)
@@ -59,21 +58,17 @@ pub fn parse_vars(input: &[String]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(input.len());
     for raw in input {
         let (key, value) = raw.split_once('=').ok_or_else(|| {
-            Error::Config(format!(
-                "invalid --var {:?}: expected `KEY=VALUE` form",
-                raw
-            ))
+            Error::Config(format!("invalid --var {raw:?}: expected `KEY=VALUE` form"))
         })?;
         if key.is_empty() {
-            return Err(Error::Config(format!("--var {:?}: key is empty", raw)));
+            return Err(Error::Config(format!("--var {raw:?}: key is empty")));
         }
         if !key
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         {
             return Err(Error::Config(format!(
-                "--var {:?}: key must be uppercase ASCII letters, digits, and underscores",
-                raw
+                "--var {raw:?}: key must be uppercase ASCII letters, digits, and underscores"
             )));
         }
         out.push((key.to_string(), value.to_string()));
@@ -136,12 +131,11 @@ pub fn cmd_render_template(
     let rendered = render_file(template_path, &parsed)?;
     match output_path {
         None => {
-            print!("{}", rendered);
+            print!("{rendered}");
         }
         Some(p) => {
-            std::fs::write(p, &rendered).map_err(|e| {
-                Error::Config(format!("failed to write {}: {}", p.display(), e))
-            })?;
+            std::fs::write(p, &rendered)
+                .map_err(|e| Error::Config(format!("failed to write {}: {}", p.display(), e)))?;
         }
     }
     Ok(())
@@ -191,11 +185,7 @@ mod tests {
 
     #[test]
     fn parse_vars_round_trips() {
-        let vars = parse_vars(&[
-            "SELF_ID=0".to_string(),
-            "LISTEN_PORT=9090".to_string(),
-        ])
-        .unwrap();
+        let vars = parse_vars(&["SELF_ID=0".to_string(), "LISTEN_PORT=9090".to_string()]).unwrap();
         assert_eq!(vars.len(), 2);
         assert_eq!(vars[0], ("SELF_ID".to_string(), "0".to_string()));
         assert_eq!(vars[1], ("LISTEN_PORT".to_string(), "9090".to_string()));

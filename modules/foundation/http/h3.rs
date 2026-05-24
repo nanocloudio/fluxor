@@ -138,6 +138,8 @@ impl H3State {
 pub fn classify_uni_stream_prefix(buf: &[u8]) -> Option<(u64, usize)> {
     #[path = "../../sdk/varint.rs"]
     mod varint;
+    // SAFETY: pointer/length pair derived from a Rust slice; varint_decode
+    // bounds-checks against the supplied length.
     unsafe { varint::varint_decode(buf.as_ptr(), buf.len()) }
 }
 
@@ -163,7 +165,7 @@ pub fn decode_headers_block_skeleton(_qpack_block: &[u8]) -> Option<()> {
 pub fn is_request_stream_frame(frame_type: u64) -> bool {
     matches!(frame_type, H3_FRAME_DATA | H3_FRAME_HEADERS) ||
         // Reserved frame types per RFC 9114 §7.2.8 (formula: 0x1f * N + 0x21)
-        ((frame_type >= 0x21) && ((frame_type - 0x21) % 0x1f == 0))
+        ((frame_type >= 0x21) && (frame_type - 0x21).is_multiple_of(0x1f))
 }
 
 /// Identify whether `frame` is a control-stream-legal frame type.
@@ -179,7 +181,10 @@ pub fn is_control_stream_frame(frame_type: u64) -> bool {
 
 /// Suppress dead-code warnings for items reserved for the live pump
 /// loop. Forward-references everything the next session will wire up.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 fn _phase_d_anchor() {
     let _ = parse_h3_frame;
     let _ = build_h3_frame_header;

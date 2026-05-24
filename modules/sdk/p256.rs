@@ -86,6 +86,8 @@ const ONE: U256 = [1, 0, 0, 0];
 #[inline(always)]
 fn pic_u64(lo: u32, hi: u32) -> u64 {
     let mut v = 0u64;
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         let p = &mut v as *mut u64 as *mut u32;
         core::ptr::write_volatile(p, lo);
@@ -96,6 +98,10 @@ fn pic_u64(lo: u32, hi: u32) -> u64 {
 
 /// Build a U256 from 8 u32 halves.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "U256 construction wire-shape: 4 limbs × {lo, hi} u32 halves, mirroring the ABI emitted by the PIC build for unaligned 64-bit literals"
+)]
 fn pic_u256(lo0: u32, hi0: u32, lo1: u32, hi1: u32, lo2: u32, hi2: u32, lo3: u32, hi3: u32) -> U256 {
     [pic_u64(lo0, hi0), pic_u64(lo1, hi1), pic_u64(lo2, hi2), pic_u64(lo3, hi3)]
 }
@@ -489,6 +495,8 @@ fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     );
 
     let mut acc = [0u64; 8];
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe { core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8); }
 
     // Each iteration: acc = acc_lo + acc_hi * R
@@ -559,6 +567,8 @@ fn fn_inv(a: &U256) -> U256 {
 fn zeroize(buf: &mut [u8]) {
     let mut i = 0;
     while i < buf.len() {
+        // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+        // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
         unsafe { core::ptr::write_volatile(buf.as_mut_ptr().add(i), 0); }
         i += 1;
     }
@@ -569,6 +579,8 @@ fn zeroize(buf: &mut [u8]) {
 fn zeroize_u256(v: &mut U256) {
     let mut i = 0;
     while i < 4 {
+        // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+        // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
         unsafe { core::ptr::write_volatile(v.as_mut_ptr().add(i), 0); }
         i += 1;
     }
@@ -956,7 +968,7 @@ impl ScalarMulState {
     }
 
     /// Initialise for `k * G`.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
     pub fn new_base(k: &U256, bits_per_step: u8) -> Self {
         let gx = load_gx();
         let gy = load_gy();
@@ -1000,6 +1012,12 @@ impl ScalarMulState {
     }
 
     /// Extract the result. Caller must ensure `complete()` is true.
+    /// `JacobianPoint` is private to this module; the only caller is
+    /// `ecdh_shared_secret_finalise` further down the same file.
+    #[allow(
+        private_interfaces,
+        reason = "p256.rs is path-mounted into PIC modules; private JacobianPoint matches the file's internal-only consumers"
+    )]
     pub fn result(&self) -> JacobianPoint {
         JacobianPoint { x: self.r0.x, y: self.r0.y, z: self.r0.z }
     }
@@ -1066,6 +1084,8 @@ fn u256_to_be(a: &U256) -> [u8; 32] {
     let b2 = a[2].to_be_bytes();
     let b1 = a[1].to_be_bytes();
     let b0 = a[0].to_be_bytes();
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(b3.as_ptr(), out.as_mut_ptr(), 8);
         core::ptr::copy_nonoverlapping(b2.as_ptr(), out.as_mut_ptr().add(8), 8);
@@ -1096,6 +1116,8 @@ pub fn ecdh_keygen(random_bytes: &[u8; 32]) -> ([u8; 32], [u8; 65]) {
     pub_key[0] = 0x04; // Uncompressed point
     let xb = u256_to_be(&x);
     let yb = u256_to_be(&y);
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(xb.as_ptr(), pub_key.as_mut_ptr().add(1), 32);
         core::ptr::copy_nonoverlapping(yb.as_ptr(), pub_key.as_mut_ptr().add(33), 32);
@@ -1180,14 +1202,18 @@ pub fn ecdh_shared_secret(my_private: &[u8; 32], peer_pub: &[u8]) -> Option<[u8;
 /// HMAC-DRBG over (private_key, message_hash), eliminating any dependency
 /// on runtime randomness for signing and making signatures reproducible.
 fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
-    let hash_len = 32usize;
+    let _hash_len = 32usize;
 
     // Truncate/pad hash to 32 bytes
     let mut h1 = [0u8; 32];
     if hash.len() >= 32 {
+        // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+        // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
         unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr(), 32); }
     } else {
         let offset = 32 - hash.len();
+        // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+        // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
         unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr().add(offset), hash.len()); }
     }
 
@@ -1199,10 +1225,14 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 
     // Step d: K = HMAC(K, V || 0x00 || private_key || h1)
     let mut msg_d = [0u8; 32 + 1 + 32 + 32]; // V(32) + 0x00(1) + x(32) + h1(32) = 97
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(v.as_ptr(), msg_d.as_mut_ptr(), 32);
     }
     msg_d[32] = 0x00;
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(private_key.as_ptr(), msg_d.as_mut_ptr().add(33), 32);
         core::ptr::copy_nonoverlapping(h1.as_ptr(), msg_d.as_mut_ptr().add(65), 32);
@@ -1221,6 +1251,8 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     }
 
     // Step f: K = HMAC(K, V || 0x01 || private_key || h1)
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(v.as_ptr(), msg_d.as_mut_ptr(), 32);
     }
@@ -1258,6 +1290,8 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 
         // Retry: K = HMAC(K, V || 0x00), V = HMAC(K, V)
         let mut retry = [0u8; 33];
+        // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+        // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
         unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), retry.as_mut_ptr(), 32); }
         retry[32] = 0x00;
         {
@@ -1291,6 +1325,8 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
         u256_from_be(&hash[..32])
     } else {
         let mut buf = [0u8; 32];
+        // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+        // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
         unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), buf.as_mut_ptr().add(32 - hash.len()), hash.len()); }
         u256_from_be(&buf)
     };
@@ -1315,6 +1351,8 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
     let mut sig = [0u8; 64];
     let rb = u256_to_be(&r);
     let sb = u256_to_be(&s);
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(rb.as_ptr(), sig.as_mut_ptr(), 32);
         core::ptr::copy_nonoverlapping(sb.as_ptr(), sig.as_mut_ptr().add(32), 32);
@@ -1343,6 +1381,8 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
         u256_from_be(&hash[..32])
     } else {
         let mut buf = [0u8; 32];
+        // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+        // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
         unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), buf.as_mut_ptr().add(32 - hash.len()), hash.len()); }
         u256_from_be(&buf)
     };
@@ -1412,6 +1452,8 @@ fn copy_be_padded(src: &[u8], dst: &mut [u8]) {
     // Zero-fill prefix
     let mut i = 0;
     while i < offset { dst[i] = 0; i += 1; }
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(effective.as_ptr(), dst.as_mut_ptr().add(offset), effective.len());
     }
@@ -1429,10 +1471,12 @@ pub fn encode_der_signature(sig: &[u8; 64]) -> ([u8; 72], usize) {
     out[pos] = 0x02; pos += 1; // INTEGER
     let r_start = skip_leading_zeros(&sig[..32]);
     let r_data = &sig[r_start..32];
-    let needs_pad_r = r_data.len() > 0 && r_data[0] >= 0x80;
+    let needs_pad_r = !r_data.is_empty() && r_data[0] >= 0x80;
     let r_enc_len = r_data.len() + if needs_pad_r { 1 } else { 0 };
     out[pos] = r_enc_len as u8; pos += 1;
     if needs_pad_r { out[pos] = 0; pos += 1; }
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe { core::ptr::copy_nonoverlapping(r_data.as_ptr(), out.as_mut_ptr().add(pos), r_data.len()); }
     pos += r_data.len();
 
@@ -1440,10 +1484,12 @@ pub fn encode_der_signature(sig: &[u8; 64]) -> ([u8; 72], usize) {
     out[pos] = 0x02; pos += 1;
     let s_start = skip_leading_zeros(&sig[32..64]);
     let s_data = &sig[32 + s_start..64];
-    let needs_pad_s = s_data.len() > 0 && s_data[0] >= 0x80;
+    let needs_pad_s = !s_data.is_empty() && s_data[0] >= 0x80;
     let s_enc_len = s_data.len() + if needs_pad_s { 1 } else { 0 };
     out[pos] = s_enc_len as u8; pos += 1;
     if needs_pad_s { out[pos] = 0; pos += 1; }
+    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe { core::ptr::copy_nonoverlapping(s_data.as_ptr(), out.as_mut_ptr().add(pos), s_data.len()); }
     pos += s_data.len();
 

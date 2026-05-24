@@ -208,7 +208,7 @@ pub fn extract_san_uris(cert: &[u8], mut callback: impl FnMut(&[u8]) -> bool) ->
     false
 }
 
-fn walk_extensions_for_san(cert: &[u8], ext_start: usize, ext_len: usize, callback: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn walk_extensions_for_san(cert: &[u8], ext_start: usize, _ext_len: usize, callback: &mut impl FnMut(&[u8]) -> bool) -> bool {
     // Extensions is a SEQUENCE of Extension
     if cert[ext_start] != TAG_SEQUENCE { return false; }
     let (seq_start, seq_len, _) = match der_tlv(cert, ext_start) { Some(v) => v, None => return false };
@@ -226,7 +226,7 @@ fn walk_extensions_for_san(cert: &[u8], ext_start: usize, ext_len: usize, callba
         if inner_pos < inner_end && cert[inner_pos] == TAG_OID {
             let (oid_start, oid_len, oid_total) = match der_tlv(cert, inner_pos) { Some(v) => v, None => break };
 
-            if oid_len == OID_SAN.len() && &cert[oid_start..oid_start + oid_len] == &OID_SAN {
+            if oid_len == OID_SAN.len() && cert[oid_start..oid_start + oid_len] == OID_SAN {
                 // Found SAN extension — parse extnValue
                 inner_pos += oid_total;
                 // Skip optional BOOLEAN (critical)
@@ -247,7 +247,7 @@ fn walk_extensions_for_san(cert: &[u8], ext_start: usize, ext_len: usize, callba
     false
 }
 
-fn parse_san_value(cert: &[u8], san_start: usize, san_len: usize, callback: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn parse_san_value(cert: &[u8], san_start: usize, _san_len: usize, callback: &mut impl FnMut(&[u8]) -> bool) -> bool {
     // GeneralNames ::= SEQUENCE OF GeneralName
     if cert[san_start] != TAG_SEQUENCE { return false; }
     let (seq_start, seq_len, _) = match der_tlv(cert, san_start) { Some(v) => v, None => return false };
@@ -769,6 +769,10 @@ fn pubkey_eq(a: &[u8], b: &[u8]) -> bool {
 /// the TLS module (server CertificateVerify) and the DTLS module.
 /// Writes the scalar bytes into `out`; on parse failure leaves `out`
 /// untouched.
+///
+/// # Safety
+/// `der` is a kernel-owned blob; the body bounds-checks every read
+/// against `der.len()` before indexing.
 pub unsafe fn extract_ec_private_key(der: &[u8], out: &mut [u8; 32]) {
     if der.len() < 4 { return; }
     if der[0] != 0x30 { return; }

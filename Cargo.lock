@@ -1408,14 +1408,17 @@ dependencies = [
  "clap",
  "fluxor-contracts",
  "libc",
+ "proc-macro2",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "syn",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "walkdir",
 ]
 
 [[package]]

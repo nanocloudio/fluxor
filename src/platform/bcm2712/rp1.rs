@@ -17,7 +17,7 @@
 //! On non-`board-cm5` configs (QEMU virt) every entry point degrades to a
 //! no-op stub so the same code calls compile.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 
 #[cfg(feature = "board-cm5")]
 mod cm5_impl {
@@ -61,6 +61,8 @@ mod cm5_impl {
     /// Probe RP1: try reading the GPIO bank0 status register for pin 0.
     /// Returns true if the read succeeds (non-0xFFFFFFFF / non-fault).
     pub fn probe() -> bool {
+        // SAFETY: RP1_GPIO_BASE is a fixed MMIO register mapped by
+        // boot_mmu::init_page_tables; an unmapped PCIe BAR returns 0xFFFFFFFF.
         let val = unsafe { core::ptr::read_volatile(RP1_GPIO_BASE as *const u32) };
         // If PCIe is not mapped, reads return 0xFFFFFFFF (bus error → all-ones)
         val != 0xFFFF_FFFF
@@ -69,6 +71,7 @@ mod cm5_impl {
     /// Read the raw value of RP1 SYS_RIO0 input register.
     /// Returns the GPIO pin states as a bitmask.
     pub fn gpio_read_all() -> u32 {
+        // SAFETY: RIO_IN is a fixed MMIO register; read is side-effect free.
         unsafe { core::ptr::read_volatile((RP1_SYS_RIO0_BASE + RIO_IN) as *const u32) }
     }
 
@@ -78,6 +81,8 @@ mod cm5_impl {
         if pin > 27 {
             return;
         }
+        // SAFETY: GPIO_CTRL and RIO_OE registers are fixed MMIO; `pin` is
+        // range-checked against the 28-pin bank above.
         unsafe {
             // Set FUNCSEL to SYS_RIO (5)
             let ctrl_addr = (RP1_GPIO_BASE + (pin as usize) * 8 + GPIO_CTRL) as *mut u32;
@@ -94,6 +99,8 @@ mod cm5_impl {
         if pin > 27 {
             return;
         }
+        // SAFETY: GPIO_CTRL and RIO_OE registers are fixed MMIO; `pin` is
+        // range-checked above.
         unsafe {
             // Set FUNCSEL to SYS_RIO (5)
             let ctrl_addr = (RP1_GPIO_BASE + (pin as usize) * 8 + GPIO_CTRL) as *mut u32;
@@ -110,6 +117,7 @@ mod cm5_impl {
         if pin > 27 {
             return;
         }
+        // SAFETY: RIO_OUT set register is fixed MMIO; `pin` is range-checked.
         unsafe {
             let out_set = (RP1_SYS_RIO0_BASE + RIO_OUT + RIO_SET_OFFSET) as *mut u32;
             core::ptr::write_volatile(out_set, 1u32 << pin);
@@ -121,6 +129,7 @@ mod cm5_impl {
         if pin > 27 {
             return;
         }
+        // SAFETY: RIO_OUT clear register is fixed MMIO; `pin` is range-checked.
         unsafe {
             let out_clr = (RP1_SYS_RIO0_BASE + RIO_OUT + RIO_CLR_OFFSET) as *mut u32;
             core::ptr::write_volatile(out_clr, 1u32 << pin);
@@ -132,6 +141,7 @@ mod cm5_impl {
         if pin > 27 {
             return;
         }
+        // SAFETY: RIO_OUT XOR register is fixed MMIO; `pin` is range-checked.
         unsafe {
             let out_xor = (RP1_SYS_RIO0_BASE + RIO_OUT + RIO_XOR_OFFSET) as *mut u32;
             core::ptr::write_volatile(out_xor, 1u32 << pin);
@@ -163,12 +173,14 @@ mod cm5_impl {
     /// Write a 32-bit value to an RP1 SPI register.
     pub fn spi_reg_write(spi_idx: u8, offset: u16, value: u32) {
         let addr = spi_base(spi_idx) + offset as usize;
+        // SAFETY: SPI register block at known MMIO base mapped by boot_mmu.
         unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
     }
 
     /// Read a 32-bit value from an RP1 SPI register.
     pub fn spi_reg_read(spi_idx: u8, offset: u16) -> u32 {
         let addr = spi_base(spi_idx) + offset as usize;
+        // SAFETY: SPI register block at known MMIO base mapped by boot_mmu.
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
@@ -189,12 +201,14 @@ mod cm5_impl {
     /// Write a 32-bit value to an RP1 I2C register.
     pub fn i2c_reg_write(i2c_idx: u8, offset: u16, value: u32) {
         let addr = i2c_base(i2c_idx) + offset as usize;
+        // SAFETY: I2C register block at known MMIO base mapped by boot_mmu.
         unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
     }
 
     /// Read a 32-bit value from an RP1 I2C register.
     pub fn i2c_reg_read(i2c_idx: u8, offset: u16) -> u32 {
         let addr = i2c_base(i2c_idx) + offset as usize;
+        // SAFETY: I2C register block at known MMIO base mapped by boot_mmu.
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 

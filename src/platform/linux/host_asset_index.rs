@@ -37,6 +37,7 @@ struct HostAssetIndexState {
 }
 
 fn host_asset_index_step(state: *mut u8) -> i32 {
+    // SAFETY: kernel-owned arena sized to `HostAssetIndexState` by the loader.
     let st = unsafe { instance_state::<HostAssetIndexState>(state) };
 
     if st.out_chan < 0 {
@@ -47,6 +48,8 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
     //    must catch up before we read more from the file — preserves
     //    byte order under back-pressure.
     while st.pending_pos < st.pending.len() {
+        // SAFETY: `pending_pos < pending.len()` (loop condition); offset
+        // stays within the owned Vec.
         let w = unsafe {
             channel::channel_write(
                 st.out_chan,
@@ -131,7 +134,7 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
         }
         Ok(n) => n,
         Err(e) => {
-            log::warn!("[host_asset_index] read error: {}", e);
+            log::warn!("[host_asset_index] read error: {e}");
             fluxor::kernel::channel::channel_ioctl(
                 st.out_chan,
                 fluxor::kernel::channel::IOCTL_SET_HUP,
@@ -144,6 +147,7 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
 
     let mut written = 0usize;
     while written < n {
+        // SAFETY: `written < n <= buf.len()`; offset stays in-bounds.
         let w = unsafe {
             channel::channel_write(
                 st.out_chan,
@@ -197,8 +201,7 @@ fn build_host_asset_index(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
         }),
     );
     log::info!(
-        "[inst] module {} = host_asset_index (built-in) out={} paths={:?}",
-        module_idx, out_chan, paths
+        "[inst] module {module_idx} = host_asset_index (built-in) out={out_chan} paths={paths:?}"
     );
     m
 }

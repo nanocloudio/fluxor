@@ -20,7 +20,7 @@
 //!   * `+0x38 IMSC`  — interrupt mask
 //!   * `+0x44 ICR`   — interrupt clear
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -103,6 +103,9 @@ pub fn uart_puts(s: &[u8]) {
 // drain) still being alive. Normal-runtime writes go through the non-
 // blocking FIFO-fill path (`uart_nonblocking_write`).
 pub fn uart_raw_putc(c: u8) {
+    // SAFETY: UART_FR and UART_DR are fixed MMIO registers mapped by
+    // boot_mmu::init_page_tables; this is the panic-path synchronous
+    // writer with no concurrent access (other cores are halted).
     unsafe {
         #[cfg(feature = "board-cm5")]
         {
@@ -133,11 +136,13 @@ pub fn uart_nonblocking_write(bytes: &[u8]) -> usize {
     let mut i = 0;
     while i < bytes.len() {
         #[cfg(feature = "board-cm5")]
+        // SAFETY: UART_FR is a fixed MMIO register; read is side-effect free.
         unsafe {
             if core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {
                 break;
             }
         }
+        // SAFETY: UART_DR is a fixed MMIO register mapped by boot_mmu.
         unsafe { core::ptr::write_volatile(UART_DR, bytes[i] as u32) };
         i += 1;
     }

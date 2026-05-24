@@ -326,11 +326,11 @@ pub(crate) use crate::text_distance::closest_match;
 /// multiple roots without conflating "not here" with "broken".
 fn try_load_target_under(name: &str, root: &Path) -> Result<Option<TargetDescriptor>> {
     let targets_dir = root.join("targets");
-    let board_path = targets_dir.join("boards").join(format!("{}.toml", name));
+    let board_path = targets_dir.join("boards").join(format!("{name}.toml"));
     if board_path.exists() {
         return load_board_target(&board_path, &targets_dir).map(Some);
     }
-    let silicon_path = targets_dir.join("silicon").join(format!("{}.toml", name));
+    let silicon_path = targets_dir.join("silicon").join(format!("{name}.toml"));
     if silicon_path.exists() {
         return load_silicon_target(&silicon_path).map(Some);
     }

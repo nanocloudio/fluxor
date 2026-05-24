@@ -95,6 +95,9 @@ pub fn push_byte(b: u8) {
     // With no active consumer the head still advances so `read_tail` can
     // dump history in panic handlers, but the producer never drops.
     if !local_active && !net_active {
+        // SAFETY: `head as usize & MASK` is in-bounds for `BUF[0..CAPACITY]`
+        // since MASK = CAPACITY - 1; volatile write is single-byte and
+        // ordered against the subsequent `HEAD.store(Release)`.
         unsafe {
             let ptr = (&raw mut BUF[0]).add((head as usize) & MASK);
             core::ptr::write_volatile(ptr, b);
@@ -116,6 +119,8 @@ pub fn push_byte(b: u8) {
         }
         return;
     }
+    // SAFETY: `head as usize & MASK` is in-bounds for `BUF`; volatile
+    // write happens-before `HEAD.store(Release)` below.
     unsafe {
         let ptr = (&raw mut BUF[0]).add((head as usize) & MASK);
         core::ptr::write_volatile(ptr, b);
@@ -137,6 +142,8 @@ fn drain_from(tail_reg: &AtomicU32, out: &mut [u8]) -> usize {
     let mut i = 0;
     while i < n {
         let idx = (tail.wrapping_add(i as u32) as usize) & MASK;
+        // SAFETY: `idx & MASK` is in-bounds for `BUF`; volatile read
+        // paired with the `HEAD.load(Acquire)` above.
         out[i] = unsafe { core::ptr::read_volatile((&raw const BUF[0]).add(idx)) };
         i += 1;
     }
@@ -215,6 +222,8 @@ pub fn read_tail(out: &mut [u8]) -> usize {
     let mut i = 0;
     while i < n {
         let idx = (start.wrapping_add(i as u32) as usize) & MASK;
+        // SAFETY: `idx & MASK` is in-bounds for `BUF`; volatile read
+        // for panic-handler history dump.
         out[i] = unsafe { core::ptr::read_volatile((&raw const BUF[0]).add(idx)) };
         i += 1;
     }

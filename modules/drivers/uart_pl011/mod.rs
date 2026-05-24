@@ -5,6 +5,13 @@
 //! FIFO-based polling for TX/RX.
 
 #![no_std]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_patterns,
+    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+)]
+
 
 use core::ffi::c_void;
 
@@ -160,7 +167,6 @@ const UART_READ: u32 = 0x0D03;
 const UART_POLL: u32 = 0x0D04;
 const UART_CONFIGURE: u32 = 0x0D05;
 
-#[unsafe(no_mangle)]
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn uart_dispatch(
