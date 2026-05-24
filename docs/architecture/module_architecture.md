@@ -277,14 +277,13 @@ primitives), `modules/sdk/contracts/{hal,net,storage,key_vault}.rs`
 (chip-specific raw register bridges). The assembler composes them
 into the `abi` namespace. There is no `dev_*` facade anymore; every
 opcode lives in exactly one layer file and consumers import by its
-real path. See `.context/rfc_ipc_architecture.md` §1.1 for the
-layering rules.
+real path. `abi_layers.md` is the public reference for the layering
+rules.
 
 `runtime.rs` contains compiler intrinsics and helper functions every
 PIC module needs. `params.rs` provides the `define_params!` macro and
-parameter schema encoding. Modules outside the fluxor tree (such as
-the Clustor project's modules) include the same files via a relative
-path through their git submodule.
+parameter schema encoding. External modules can include the same SDK
+files via a relative path through their checked-out Fluxor SDK.
 
 **Built-in modules** (`builtin = true` in their `manifest.toml`) are
 compiled directly into the kernel binary rather than shipped as

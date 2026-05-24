@@ -456,7 +456,7 @@ These are deferred but tracked here for visibility:
   identical across targets.
 - `architecture/protocol_surfaces.md` — remote-channel surface that
   WASM-Fluxor peers use to join larger graphs.
-- `architecture/endpoint_capability_surface.md` — sibling external-host
+- `architecture/endpoint_capability_surface.md` — external-host
   surface for environments that don't run a kernel.
 - `architecture/reconfigure.md` — drain / migrate phases that apply
   unchanged to WASM hosts.

@@ -166,7 +166,7 @@ HTTP/3 lives alongside h1 and h2 inside `modules/foundation/http/`:
   `render_template_into`, `render_file_into`, `render_index_into`)
   unchanged — they already take `(dst, cap)` and return `(n, more)`.
 
-A single fluxor process can serve all three HTTP versions over the
+A single Fluxor process can serve all three HTTP versions over the
 same logical port. The h1/h2 path is a TCP listener
 (`linux_net.net_out → http.net_in`); h2c is detected via preface
 sniff inside that path. The h3 path is a UDP listener

@@ -172,7 +172,7 @@ resolves these into modules and wiring at build time.
 
 | Subsection | Drivers | Provides |
 |------------|---------|----------|
-| `network` | cyw43, enc28j60, w5500, ch9120 | `frame.*` or `socket` |
+| `network` | cyw43, enc28j60, ch9120, rp1_gem, e810 | `frame.*`, `platform_nic_ring`, or `socket` |
 | `audio.out` | i2s, pdm, pwm, dac, bluetooth_a2dp | `audio.out` |
 | `audio.in` | i2s, pdm, adc | `audio.in` |
 | `display` | epaper (ssd1680), oled (ssd1306), lcd (ili9341, st7789) | `display.*` |
@@ -205,91 +205,43 @@ The config tool deduplicates: one cyw43.fmod in the firmware, one module
 instance at runtime. Different hardware subsections wire to different ports
 on the same module.
 
-## Manifest Extensions
+## Manifest Fields
 
-Module manifests gain a `[capabilities]` section declaring what the module
-provides and requires:
+Current module manifests use separate fields for four different concerns:
+
+- top-level `provides = [...]` for service names used by provider-chain
+  validation
+- top-level `capabilities = [...]` for presentation, audio, MIDI, and
+  similar module capabilities
+- `[[resources]].requires_contract = "..."` for kernel/provider contracts
+  such as GPIO, SPI, PIO, channel, FS, timer, and platform DMA
+- `[requires]` for target CPU features such as FPU, NEON, or MMU
+
+Examples:
 
 ```toml
-# cyw43/manifest.toml
-[capabilities]
-provides = ["frame.wifi", "bluetooth.ble", "bluetooth.a2dp"]
-requires = ["pio", "gpio"]
+# modules/drivers/cyw43/manifest.toml
+[[resources]]
+requires_contract = "pio"
+access = "exclusive"
 
-# enc28j60/manifest.toml
-[capabilities]
-provides = ["frame.ethernet"]
-requires = ["spi", "gpio"]
+[[resources]]
+requires_contract = "gpio"
+access = "write"
 
-# ch9120/manifest.toml
-[capabilities]
-provides = ["socket"]
-requires = ["uart"]
+# modules/drivers/i2s_pio/manifest.toml
+capabilities = ["audio.sample", "presentation.clock"]
 
-# ip/manifest.toml
-[capabilities]
-provides = ["socket"]
-requires = ["frame"]
+[[resources]]
+requires_contract = "pio"
+access = "exclusive"
 
-# wifi/manifest.toml
-[capabilities]
-provides = ["link.wifi"]
-requires = ["frame.wifi"]
+# Service-provider modules may additionally declare:
+provides = ["example.service"]
 
-# i2s/manifest.toml
-[capabilities]
-provides = ["audio.out"]
-requires = ["pio"]
-
-# epaper_ssd1680/manifest.toml
-[capabilities]
-provides = ["display.still"]
-requires = ["spi", "gpio"]
-
-# lcd_ili9341/manifest.toml
-[capabilities]
-provides = ["display.still", "display.video"]
-requires = ["spi", "gpio"]
-
-# xpt2046/manifest.toml
-[capabilities]
-provides = ["display.touch"]
-requires = ["spi", "gpio"]
-
-# fat32/manifest.toml
-[capabilities]
-provides = ["file.data"]
-requires = ["storage.block"]
-
-# sd/manifest.toml
-[capabilities]
-provides = ["storage.block"]
-requires = ["spi", "gpio"]
-
-# mp3_decoder/manifest.toml
-[capabilities]
-provides = ["audio.pcm"]
-requires = ["audio.encoded"]
-
-# http_server/manifest.toml
-[capabilities]
-requires = ["socket"]
-
-# mqtt/manifest.toml
-[capabilities]
-requires = ["socket"]
-
-# synth/manifest.toml
-[capabilities]
-provides = ["audio.pcm"]
-
-# weather_station/manifest.toml
-[capabilities]
-requires = ["display.still"]
-
-# game/manifest.toml
-[capabilities]
-requires = ["display.video", "display.touch"]
+# Target-feature gating uses:
+[requires]
+fpu = true
 ```
 
 ### Wildcard Matching
@@ -363,8 +315,8 @@ a hierarchical naming scheme matching the capability taxonomy.
 | `display.touch_event` | Touch coordinates and gestures | xpt2046, ft6236 |
 | `storage.block` | Raw block I/O (512-byte sectors) | sd, flash |
 | `file.data` | File byte stream | fat32, littlefs, http, nfs |
-| `storage.namespace` | Directory-like name-keyed addressing (lookup, list, rename, delete, subscribe) | fat32, loam (dir), clustor (metadata), s3-adapter |
-| `storage.object` | Whole-blob byte-addressed put / get / range_get / head | loam (cas), clustor (replicated), s3-adapter, http-as-fs |
+| `storage.namespace` | Directory-like name-keyed addressing (lookup, list, rename, delete, subscribe) | fat32, linux_fs, replicated namespace adapters |
+| `storage.object` | Whole-blob byte-addressed put / get / range_get / head | content-addressed stores, replicated object stores, HTTP-backed adapters |
 | `frame.ethernet` | Raw ethernet frames | cyw43, enc28j60, ip |
 | `control.fmp` | FMP messages (next/prev/toggle) | button, gesture, bank |
 | `net.stream.cmd.v1` | Stream upstream commands (bind/connect/send/close) | ip, tls, ch9120, session workers |
@@ -377,11 +329,9 @@ a hierarchical naming scheme matching the capability taxonomy.
 | `net.session.ctrl.v1` | Control sideband between anchor, worker, directory | transport anchors, session workers, directories |
 
 The `net.*` content types correspond one-to-one with the protocol
-surfaces defined in `architecture/protocol_surfaces.md`. Phase 1 of the
-protocol-surfaces RFC reserves the names; the concrete envelopes land in
-`modules/sdk/contracts/net/` in later phases. Until the split lands, the
-existing TLV format described in `architecture/network.md` continues to
-carry both stream and datagram traffic as Stream Surface v1.
+surfaces defined in `architecture/protocol_surfaces.md`. The concrete
+envelopes live under `modules/sdk/contracts/net/`. The existing TLV
+format described in `architecture/network.md` is Stream Surface v1.
 
 These correspond to the content types in the mesh event system
 (see `architecture/mesh.md`), ensuring on-device channels and cross-device
@@ -854,7 +804,7 @@ Error: 'game' requires 'display.video' but hardware.display (epaper/ssd1680)
 
 ```
 frame.wifi          — raw WiFi ethernet frames (cyw43, esp32)
-frame.ethernet      — raw wired ethernet frames (enc28j60, w5500)
+frame.ethernet      — raw wired ethernet frames (enc28j60, rp1_gem, e810)
 bluetooth.ble       — Bluetooth Low Energy (cyw43, esp32)
 bluetooth.a2dp      — Bluetooth audio streaming (cyw43)
 audio.out           — physical audio output (i2s, pdm, pwm, dac, bt_a2dp)
@@ -873,11 +823,11 @@ uart                — UART serial access
 ### Service Capabilities (from module manifests)
 
 ```
-socket              — TCP/UDP networking (provided by ip, ch9120, w5500)
+socket              — TCP/UDP networking (provided by ip, ch9120, linux_net)
 link.wifi           — WiFi connection management (provided by wifi)
 file.data           — file byte stream (provided by fat32, littlefs, http)
-storage.namespace   — directory-like name-keyed surface (provided by fat32, loam, clustor)
-storage.object      — whole-blob byte-addressed surface (provided by loam, clustor, s3-adapter)
+storage.namespace   — directory-like name-keyed surface (provided by fat32, linux_fs, namespace adapters)
+storage.object      — whole-blob byte-addressed surface (provided by content-addressed and replicated object adapters)
 audio.pcm           — raw PCM audio samples (provided by synth, decoder, mic)
 audio.encoded       — compressed audio stream (provided by file reader, http)
 display.draw        — drawing commands / framebuffer (provided by renderer)
@@ -899,7 +849,8 @@ file.data           — byte-stream file access (open, read, seek,
                       provide; player / viewer modules consume.
 storage.namespace   — name-keyed directory surface (lookup, stat,
                       list, rename, delete, subscribe(prefix)).
-                      fat32 provides readonly; loam / clustor full.
+                      fat32 provides readonly; write-capable adapters
+                      can provide the full surface.
 storage.object      — whole-blob byte-addressed surface (put, get,
                       head, range_get, delete). Multipart upload
                       composes via the event.log pattern rather
@@ -926,9 +877,9 @@ leased-`Handle` contract.
 The `event.log` content-type pattern (not a surface) reuses these
 primitives: a `storage.namespace` entry resolves to an Event stream
 with monotone per-source sequence (mesh.md §5) and the appropriate
-fence (`ReplicatedDurable` for cluster-committed entries). Loam's
-WAL, Clustor's commit log, and generic append logs all reduce to
-this pattern without a separate capability surface.
+fence (`ReplicatedDurable` for cluster-committed entries). Local WALs,
+replicated commit logs, and generic append logs all reduce to this
+pattern without a separate capability surface.
 
 ### Protocol Surface Capabilities
 
@@ -1059,16 +1010,24 @@ knowledge of capabilities or content types.
 
 ### Manifest Schema
 
-`manifest.toml` for each module declares what it provides and requires:
+`manifest.toml` for each module declares service providers, presentation
+or media capabilities, hardware contracts, and target CPU requirements
+with separate fields:
 
 ```toml
-[capabilities]
-provides = ["audio.pcm"]
-requires = ["socket"]
+provides = ["example.service"]
+capabilities = ["audio.sample", "presentation.clock"]
+
+[[resources]]
+requires_contract = "pio"
+access = "exclusive"
+
+[requires]
+fpu = true
 ```
 
-Modules without the section have empty `provides`/`requires` lists and
-participate only in explicit wiring.
+Modules without these fields participate only in explicit wiring and
+the capabilities inferred from their ports and stack expansion.
 
 ### Port Content Types
 
@@ -1119,7 +1078,8 @@ description.
 
 The config tool walks the capability graph:
 
-1. Collect every module's `provides` and `requires` from manifests
+1. Collect every module's `provides`, `capabilities`, `[[resources]]`,
+   and `[requires]` fields from manifests
 2. Collect hardware section providers from the lookup table
 3. For each unsatisfied `requires`, find a provider chain through service
    modules (e.g. `socket` ← `ip` ← `frame.wifi` ← hardware section)
@@ -1158,11 +1118,11 @@ Error: Ambiguous auto-wire for 'audio.pcm' into i2s.in.
        Add explicit wiring to resolve.
 ```
 
-### Marketplace Modules
+### External Modules
 
-Modules loaded from a marketplace declare their capabilities and content
-types in the same `manifest.toml` schema as first-party modules. New
-content types are not restricted to the platform — any string value is
-valid, and modules that share a string match without coordination. The
-content type registry in this document lists the well-known types used
-by the first-party module set; third-party modules can extend it freely.
+External modules declare capabilities and content types in the same
+`manifest.toml` schema as first-party modules. New content types are
+not restricted to the platform — any string value is valid, and modules
+that share a string match without coordination. The content type registry
+in this document lists the well-known types used by the first-party
+module set; external modules can extend it freely.

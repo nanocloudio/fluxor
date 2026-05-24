@@ -90,10 +90,10 @@ on top of the same chip support.
 
 The kernel itself is mostly cfg-free. Per-silicon constants are generated
 at build time from `targets/silicon/*.toml` into `chip_generated.rs`,
-which `src/kernel/chip.rs` includes. The vast majority of kernel code
-calls into the chip module rather than scattering `#[cfg(...)]` blocks
-across `syscalls.rs` or `scheduler.rs`. See [pin_allocation.md](pin_allocation.md)
-for the silicon TOML schema.
+which the selected platform chip module includes. The vast majority of
+kernel code calls into the chip module rather than scattering
+`#[cfg(...)]` blocks across `syscalls.rs` or `scheduler/mod.rs`. See
+[pin_allocation.md](pin_allocation.md) for the silicon TOML schema.
 
 ## Bus Primitives
 
@@ -374,9 +374,9 @@ with the union of every supported peripheral.
 | Channel implementation | `src/kernel/channel.rs` |
 | Buffer pool | `src/kernel/buffer_pool.rs` |
 | Loader | `src/kernel/loader.rs` |
-| Scheduler | `src/kernel/scheduler.rs` |
-| Chip abstraction | `src/kernel/chip.rs` (+ generated `chip_generated.rs`) |
-| RP HAL | `src/platform/rp.rs`, `src/io/*.rs` |
+| Scheduler | `src/kernel/scheduler/mod.rs` |
+| Chip abstraction | `src/platform/{rp,bcm2712,linux,wasm}/chip.rs` (+ generated `chip_generated.rs` where applicable) |
+| RP HAL | `src/platform/rp.rs`, `src/platform/rp/*.rs` |
 | BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712/*.rs` |
 | Silicon definitions | `targets/silicon/*.toml` |
 | Board definitions | `targets/boards/*.toml` |

@@ -603,7 +603,7 @@ A browser-host integration is healthy when:
   `wasm_browser_dom_input` produces.
 - `architecture/protocol_surfaces.md` — stream-surface contract
   `wasm_browser_websocket` implements.
-- `architecture/endpoint_capability_surface.md` — sibling external
+- `architecture/endpoint_capability_surface.md` — external endpoint
   surface for browsers that don't run a WASM kernel.
 - `architecture/browser_capability_surface.md` — endpoint profile
   for the browser. Stays as the "no-WASM" path. Cross-referenced

@@ -6,19 +6,19 @@ position-independent modules connected by typed channels and executed in
 topological order by a cooperative scheduler. The runtime distinguishes
 wall-clock time from stream-clock time, enabling predictable pipelines
 for audio, display, control, networking, storage, consensus, and compute
-workloads — across microcontrollers, application processors, and
-server-class hardware.
+workloads across microcontrollers, application processors, Linux-hosted
+runs, browser-hosted WASM bundles, and server-class targets — without
+changing the abstraction.
 
-Fluxor is one half of a larger vision. The mesh surface provides the
-distributed object model — stable, capability-bearing objects addressable
-without assuming where they run. Fluxor provides the deterministic local
-execution. Together they point toward a computing model in which physical
-device boundaries become implementation details rather than architectural
-constraints.
+Fluxor sits below a broader capability-centric system model.
+[`vision.md`](vision.md) lays out the argument: capabilities, not
+devices, are the right unit of architecture. The architecture pages
+below are the implementation references that make that argument
+concrete.
 
 ## Start Here
 
-- [vision.md](vision.md) — the mesh-native computing model and why it matters
+- [vision.md](vision.md) — the capability-centric model and why it matters
 - [architecture/pipeline.md](architecture/pipeline.md) — graph runner, channels, and execution model
 - [architecture/module_architecture.md](architecture/module_architecture.md) — module contract, step semantics, composition rules
 - [architecture/hal_architecture.md](architecture/hal_architecture.md) — kernel/module split, syscall ABI, per-silicon HAL
@@ -38,10 +38,10 @@ How the system works. These are the authoritative references.
 - [architecture/network.md](architecture/network.md) — channel-based networking, net_proto, drivers, IP module, TLS
 - [architecture/heap.md](architecture/heap.md) — per-module heap allocation
 - [architecture/reconfigure.md](architecture/reconfigure.md) — live graph reconfigure, drain protocol
-- [architecture/mesh.md](architecture/mesh.md) — mesh architecture: identity, authority, discovery, events, binding
-- [architecture/network_boot.md](architecture/network_boot.md) — stateless network boot, fleet deployment, trust model
 - [architecture/security.md](architecture/security.md) — trust root, module signing, KEY_VAULT, network hardening
 - [architecture/pin_allocation.md](architecture/pin_allocation.md) — GPIO allocation, pin validation, peripheral assignments
+- [architecture/mesh.md](architecture/mesh.md) — mesh object, handle, event, and lease model
+- [architecture/network_boot.md](architecture/network_boot.md) — stateless network boot, fleet deployment, trust model
 
 ## Guides
 

@@ -2,11 +2,10 @@
 
 *It's a way to stop caring which computer something is on.*
 
-> **Note:** This document describes the mesh architecture model. The implementation
-> is in Rust, not C++. Code examples are pseudocode illustrating the concepts.
-> See the source code in `src/` for implementation details.
-
-Fluxor is a mesh-native firmware framework for embedded systems. This document describes the mesh primitives and how they integrate with the fluxor pipeline system.
+This document is the normative reference for the Fluxor mesh surface:
+the irreducible primitives, the wire formats they ride on, and how
+they compose with the local pipeline runtime. Field tables and byte
+layouts here are specification-grade; the prose explains intent.
 
 ## Overview
 
@@ -42,117 +41,97 @@ A Pico 2 W running fluxor participates in the mesh as a first-class citizen.
 
 **What it is:** A stable, location-independent identifier for something that exists.
 
-**Implementation:** `ObjectId` - 128-bit UUID stored in `identity.hpp`
-
-```cpp
-struct ObjectId {
-    uint8_t bytes[16];
-
-    bool is_null() const;
-    bool operator==(const ObjectId& other) const;
-    int to_string(char* buffer, size_t capacity) const;
-    static bool from_string(const char* str, ObjectId& out);
-};
-```
+**Shape:** 128-bit opaque identifier. Compared bytewise, rendered as a canonical UUID string for diagnostics. Object identity is independent of the device hosting the object, the transport carrying its events, and any address it currently binds to. Two endpoints can compare object IDs without coordinating.
 
 ### 2. Authority as Capability
 
 **What it is:** Unforgeable, transferable rights to observe or affect an object.
 
-**Implementation:** `Permission` flags and `Capability` struct in `capability.hpp`
+**Permission bits** (rendered as a 16-bit field):
 
-```cpp
-enum class Permission : uint16_t {
-    ReadState   = 1 << 0,
-    Subscribe   = 1 << 1,
-    SendCommand = 1 << 2,
-    Configure   = 1 << 3,
-    Admin       = 1 << 4,
-    Delegate    = 1 << 5,
-    // ...
-};
+| Bit | Permission   | Allows |
+|-----|--------------|--------|
+| 0   | ReadState    | Read object state snapshots |
+| 1   | Subscribe    | Receive event streams from the object |
+| 2   | SendCommand  | Issue commands to the object |
+| 3   | Configure    | Change object parameters |
+| 4   | Admin        | Manage object lifecycle |
+| 5   | Delegate     | Hand off a subset of these rights to another holder |
 
-struct Capability {
-    ObjectId object_id;
-    Permission permissions;
-    uint32_t not_after;     // Lease expiry
-    uint8_t signature[64];  // Ed25519 signature
-};
-```
+**Capability composition (96 bytes, fixed layout):**
 
-Capabilities are validated against a CA certificate stored in device flash.
+| Field          | Size  | Description |
+|----------------|-------|-------------|
+| object_id      | 16 B  | Object this grant applies to (full ObjectId, no truncation) |
+| permissions    | 2 B   | Bitfield from the table above |
+| flags          | 2 B   | Reserved — future use (delegation depth, contextual caveats) |
+| not_before     | 4 B   | Earliest validity, seconds since epoch — anti-replay |
+| not_after      | 4 B   | Expiry, seconds since epoch — lease bound |
+| issuer_key_id  | 4 B   | First 4 bytes of `SHA-256(issuer_pubkey)` — resolves to a slot in the device trust store |
+| signature      | 64 B  | Ed25519 over the preceding 32 bytes |
+
+The capability is a self-contained signed assertion. Everything needed to verify it travels in the 96 bytes — there is no "go ask a server" step. Verification is described in §Security Model; the wire layout in §Capability Token matches this composition exactly.
 
 ### 3. Handle
 
-**What it is:** A concrete thing you hold that combines object identity, capability, and optional location hints.
+**What it is:** A concrete reference combining identity, authority, and (optionally) where to find the object now.
 
-**Implementation:** `Handle` struct in `handle.hpp`
+**Composition:**
 
-```cpp
-struct Handle {
-    ObjectId object;            // Who you're talking to
-    CapabilityToken capability; // What you can do
-    LocationHint hint;          // Where to find it
-};
-```
+| Field      | Description |
+|------------|-------------|
+| object     | Object ID — who you're addressing |
+| capability | Capability token — what you're permitted to do |
+| hint       | Location hint — where to find it; an optimisation, never authoritative |
 
-Handles are the only way to touch the mesh. They encapsulate both reference and authority.
+Handles are the only way to touch the mesh. Holding a handle conveys both reference and authority; no other interface bypasses this.
 
 ### 4. Object
 
-**What it is:** The universal unit of meaning - something that may have state, events, and commands.
+**What it is:** The universal unit of meaning — something that may have state, events, and commands.
 
-**Implementation:** `Object` interface in `object.hpp`
+**Operations every Object exposes:**
 
-```cpp
-class Object {
-public:
-    virtual const ObjectId& id() const = 0;
-    virtual bool get_state(StateSnapshot& state) const = 0;
-    virtual bool emit_event(const Event& event) = 0;
-    virtual CommandResult handle_command(const Command& cmd,
-                                         const Capability& auth) = 0;
-};
-```
+- `id()` — return the Object ID
+- `get_state(snapshot)` — produce a current state snapshot
+- `emit_event(event)` — emit a typed event to subscribers
+- `handle_command(cmd, capability)` — evaluate a command under the supplied capability and return a result
 
-Objects collapse files, processes, services, and devices into one semantic unit.
+Objects collapse files, processes, services, and devices into one semantic unit. A speaker, a sensor, a file, a controller — all are Objects.
 
 ### 5. Event
 
-**What it is:** Append-only, ordered facts - the only way change is represented over time.
+**What it is:** Append-only, ordered facts — the only way change is represented over time.
 
-**Implementation:** `Event` struct in `event.hpp`
+**Composition:**
 
-```cpp
-struct Event {
-    ObjectId source;        // Who emitted this
-    uint32_t sequence;      // Monotonic per-source
-    uint64_t timestamp_us;  // When
-    ContentTypeId content_type;  // What kind
-    uint8_t* data;
-    uint16_t length;
-};
-```
+| Field         | Description |
+|---------------|-------------|
+| source        | Object ID of the emitter |
+| sequence      | Monotonic counter, per source |
+| timestamp_us  | Microsecond timestamp at the source |
+| content_type  | MIME-style identifier naming the payload format |
+| payload       | Opaque bytes interpreted per `content_type` |
 
-Events have a content type (MIME-like) that describes how to interpret the payload.
+Wire layout: see §Event Header below.
 
 ### 6. Deterministic State Derivation
 
 **What it is:** State is always a projection of events.
 
-**Implementation:** Objects derive their state from their event history. On embedded, we typically emit-and-forget (no local persistence), but the principle holds: state can always be reconstructed from events.
+Objects derive their state from their event history. On constrained targets the implementation is typically emit-and-forget — there is no local persistence — but the principle holds: state can always be reconstructed from events.
 
 ### 7. Execution (Agent)
 
 **What it is:** A place where commands are evaluated and events are emitted.
 
-**Implementation:** The device itself is an agent when it responds to commands and interacts with other objects. Passive sensors that only emit events are not agents.
+A device acts as an agent when it responds to commands and interacts with other objects. Passive sensors that only emit events are not agents.
 
 ### 8. Time-boundedness (Lease)
 
 **What it is:** All authority and resource claims are finite unless renewed.
 
-**Implementation:** Capabilities have `not_after` timestamps. Handles expire and must be renewed.
+Capabilities carry a `not_after` timestamp. Handles expire and must be renewed. Nothing in the mesh is held open indefinitely without an explicit lease.
 
 ## Content Types
 
@@ -167,7 +146,7 @@ Events carry typed data identified by MIME-like content types:
 | 4 | `audio/opus` | Opus audio |
 | ... | ... | ... |
 
-See `content_type.hpp` for the full list.
+The full registry lives alongside the kernel's `CONTENT_TYPES` table and is the same set used by typed channels — see [`capability_surface.md`](capability_surface.md#content-type-registry) for the canonical list.
 
 ## Pipeline Integration
 
@@ -176,15 +155,7 @@ Fluxor's existing pipeline system (Source -> Transformer -> Sink) integrates wit
 - **Pipelines are internal:** They process data within an object
 - **Events cross boundaries:** Objects communicate via events
 
-`MeshBridge` bridges the two:
-
-```cpp
-class MeshBridge : public Object {
-    // Wraps pipelines
-    // Converts pipeline output to events
-    // Injects commands into pipelines
-};
-```
+A **mesh bridge** is an Object that wraps one or more local pipelines: it surfaces pipeline output as outbound events, routes inbound commands into the pipeline as control input, and presents the pipeline's status as queryable state. The bridge is where the local execution model and the mesh surface meet — the pipeline contract is unchanged on one side, the Object contract is unchanged on the other.
 
 ### Example: Audio Player Object
 
@@ -329,35 +300,105 @@ Responses to commands use Events with `content_type: MeshState` or a dedicated r
 | 0x0200-0x02FF | GPIO (SetPin, GetPin, TogglePin) |
 | 0x1000+ | Application-specific |
 
-### Capability Token (20 bytes)
+### Capability Token (96 bytes)
+
+The on-wire capability is byte-for-byte equal to the composition in
+§2. All fields are big-endian. Verification rules are in §Security
+Model.
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Object Hash                             |
+|                                                               |
+|                      Object ID                                |
+|                       (16 bytes)                              |
+|                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         Permissions         |          Not Before             |
+|          Permissions         |            Flags               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|          Not After          |        Issuer Hash              |
+|                       Not Before                              |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|    Issuer Hash (cont)       |         Signature               |
+|                       Not After                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                      Signature (cont)                         |
+|                      Issuer Key ID                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|                                                               |
+|                       Signature                               |
+|                       (64 bytes)                              |
+|                                                               |
+|                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
+| Field          | Offset | Size  | Type / encoding |
+|----------------|--------|-------|-----------------|
+| object_id      | 0      | 16 B  | Opaque bytes |
+| permissions    | 16     | 2 B   | u16, bitfield |
+| flags          | 18     | 2 B   | u16, reserved (must be 0) |
+| not_before     | 20     | 4 B   | u32 seconds since epoch |
+| not_after      | 24     | 4 B   | u32 seconds since epoch |
+| issuer_key_id  | 28     | 4 B   | First 4 bytes of `SHA-256(issuer_pubkey)` |
+| signature      | 32     | 64 B  | Ed25519 over bytes 0..32 |
+
+A *capability chain* — used to verify a token whose issuer is a
+delegated subkey rather than the root — is a contiguous sequence of
+these 96-byte records ordered leaf → … → root-signed. Each record's
+`object_id` for non-leaf links is the SHA-256 of the next link's
+signing key; each record's `permissions` for non-leaf links must
+include the `Delegate` bit and must be a superset of the next link's
+permissions. The transport carries `<u16 chain_len><96 B record>×N`.
+
 ## Security Model
 
-All operations are authorized by capabilities validated against a CA:
+The mesh uses the same trust primitives as the rest of Fluxor:
+Ed25519 signatures, root public keys, and KEY_VAULT-resident key
+material. There is no X.509, no certificate authority, no name
+binding — capabilities are bearer assertions, not certificates.
 
-1. Device has its keypair + CA certificate in flash
-2. Handles contain capability tokens
-3. On command receipt:
-   - Check capability signature chains to CA
-   - Verify `not_after` hasn't passed
-   - Verify required permissions are granted
-   - Execute if valid
+### Trust root
+
+Each device carries a root Ed25519 public key in KEY_VAULT (slot 0
+by convention). The root key is established at provisioning and is
+the only key whose authority is assumed; every other signing key
+must be reachable from it by a verifiable chain.
+
+### Per-command verification
+
+On receipt of a command bearing a capability (token + optional
+chain), the receiver executes the following checks. Every check is
+local — no remote lookup is consulted.
+
+1. **Structural decode.** Confirm the token is 96 bytes and any
+   accompanying chain is well-formed (`<u16 chain_len><96 B>×N`).
+2. **Signature.** Verify `signature` against the issuer public key
+   identified by `issuer_key_id`. The issuer key must resolve to
+   either the local KEY_VAULT root or the leaf-key of an attached
+   chain whose head verifies to the root under the same rules.
+3. **Chain coherence** (when a chain is present). For each
+   non-leaf link L and its child C: L's `permissions` must include
+   `Delegate`; C's `permissions` must be a subset of L's; L's
+   `object_id` must equal `SHA-256(issuer_pubkey_of(C))` (i.e. L
+   binds the subkey that signs C); the lease window of every link
+   must contain `now`.
+4. **Validity window.** Check `not_before ≤ now ≤ not_after` on the
+   capability itself.
+5. **Permission match.** Check that the operation being attempted
+   is permitted by the bitfield.
+
+Any failure aborts the command. A holder is never expected to renew
+a capability mid-operation — leases are checked once at admission;
+in-flight commands continue under the lease they entered with.
+
+### Key custody
+
+Issuer private keys never leave KEY_VAULT. A holder that exercises
+`Delegate` does so via a KEY_VAULT signing primitive that takes the
+delegated capability bytes as input and emits the signature — the
+private key bytes are not exposed to module code. This is the same
+discipline used by every other Fluxor consumer of KEY_VAULT
+(see `security.md`).
 
 ## Memory Considerations
 
@@ -424,14 +465,12 @@ This separation allows:
 
 ### Content Bindings Map to Pipelines
 
-**Decision:** Object emit/accept bindings specify `{content_type, pipeline_id}`.
+**Decision:** Object emit/accept bindings pair a content type with a pipeline id.
 
-```cpp
-struct ContentBinding {
-    ContentTypeId content_type;  // What kind of data
-    uint8_t pipeline_id;         // Which pipeline handles it
-};
-```
+| Field        | Description |
+|--------------|-------------|
+| content_type | What kind of data this binding carries |
+| pipeline_id  | Which local pipeline produces or consumes it |
 
 **Rationale:** This bridges the mesh abstraction to fluxor's hardware pipeline system. When an object "accepts audio/pcm", it means:
 1. Incoming Events with `content_type: AudioSample` are valid
@@ -440,17 +479,23 @@ struct ContentBinding {
 
 This keeps objects declarative while pipelines handle the hardware details.
 
-## Conceptual Module Structure
+## Module Layout
 
-The mesh implementation would be organized as:
+The mesh module lives at `modules/foundation/mesh/`. Shared wire
+types and primitive structs are currently consolidated in
+`modules/foundation/mesh/mesh_types.rs` alongside `mod.rs`. As the
+surface grows, the file will split along the lines below.
 
-| Module | Purpose |
-|--------|---------|
-| `identity` | ObjectId generation and parsing |
-| `content_type` | ContentType registry and MIME mappings |
-| `event` | Event structure with 32-byte header |
-| `command` | CommandPayload, ResponsePayload, action codes |
-| `capability` | Permission flags, Capability tokens |
-| `handle` | Handle, LocationHint, HandleRegistry |
-| `object` | Object trait, ObjectRegistry |
-| `mesh_bridge` | Bridge between mesh objects and pipelines |
+**Planned decomposition** (a single planned split, not separate
+crates):
+
+| Submodule       | Purpose |
+|-----------------|---------|
+| `identity`      | Object ID generation, parsing, and canonical string form |
+| `content_type`  | Content-type registry shared with the kernel `CONTENT_TYPES` table |
+| `event`         | Event structure and 32-byte header codec |
+| `command`       | Command and response payload formats, action-code registry |
+| `capability`    | Permission flags, capability token codec, chain verification against KEY_VAULT root |
+| `handle`        | Handle composition, location hints, holder-side registry |
+| `object`        | Object trait, local object registry, dispatch |
+| `mesh_bridge`   | Object surfacing of local pipelines (events out, commands in) |

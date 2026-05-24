@@ -306,7 +306,7 @@ Backpressure is structural: a producer that cannot write its output
 advance its internal state. Time, frame counters, and read positions
 only move when the corresponding output has been committed. This is
 the same rule whether the producer is generating audio samples,
-emitting Ethernet frames, or fanning out a Raft proposal — see
+emitting Ethernet frames, or fanning out an application event — see
 [module_architecture.md](module_architecture.md) for the principles.
 
 ## Tee and Merge

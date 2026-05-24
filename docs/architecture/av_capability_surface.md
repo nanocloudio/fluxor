@@ -30,7 +30,7 @@ AV pipelines move data on channels typed by `content_type`:
 codec-tagged variants of the generic encoded surfaces so codec identity
 can travel in `content_type` itself without a sideband channel.
 
-The capture-side sibling, `VideoSensorRaw`, is a source-only surface
+The capture-side companion, `VideoSensorRaw`, is a source-only surface
 covered by the capture-side architecture and is not part of this page.
 
 ### Where this is enforced

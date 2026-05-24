@@ -5,9 +5,8 @@ standard protocol surfaces, the five session continuity classes, and the
 architectural roles (transport anchor, session worker, session directory)
 that sit above those surfaces.
 
-It is the canonical reference for the RFC in `.context/rfc_protocols.md`.
-The RFC explains the motivation and end state; this document is what modules,
-manifests, and graph configs refer to for normative vocabulary.
+This document is the normative Fluxor reference that modules, manifests,
+and graph configs use for protocol-surface vocabulary.
 
 ## Scope
 
@@ -47,8 +46,8 @@ This document extends, not replaces:
   state export/import hooks added in later phases
 - `architecture/pipeline.md` — channels remain the only module-to-module
   data path; every surface here is a channel contract
-- `.context/future/rfc_remote_channels.md` — remote channels are the
-  natural fabric between anchors and remote session workers
+- `modules/foundation/remote_channel/` — remote channels are the natural
+  fabric between anchors and remote session workers
 
 ## The Four Protocol Surfaces
 
@@ -115,9 +114,8 @@ Packet envelope metadata may include:
 The packet surface composes naturally with mailbox and in-place buffer
 edge classes where available, but it remains a channel contract. The
 zero-copy fast path depends on the mailbox/in-place edge classes and the
-NIC-bypass work tracked separately in `rfc_kernel_bypass_nic.md`; this
-document only defines the protocol surface that those optimizations
-would use.
+NIC-bypass work; this document only defines the protocol surface that
+those optimizations would use.
 
 ### Multiplexed Session Surface
 
@@ -168,8 +166,8 @@ Required structure: the consuming module must export `module_drain`
 The client may reconnect, but the application session can resume from a
 token, cursor, lease, or session identifier.
 
-Examples: MQTT session resume, Lattice watch cursor, Chronicle command
-cursor or checkpoint, push delivery cursor.
+Examples: MQTT session resume, watch-stream cursors, command cursors or
+checkpoints, push delivery cursors.
 
 Required structure:
 
@@ -184,7 +182,7 @@ The client-visible transport remains attached to a stable anchor while
 the session or application worker may move behind it.
 
 Examples: large MQTT front doors, push notification gateways, long-lived
-watch streams, Chronicle agent control channels.
+watch streams, and remote control channels.
 
 Required structure:
 
@@ -271,8 +269,8 @@ A session directory provides placement and continuity metadata:
 - optional anchor binding metadata
 
 The session directory is an architectural role, not necessarily a
-dedicated binary. It may be implemented by a shared service or by a
-sibling system such as Lattice for bounded clusters.
+dedicated binary. It may be implemented by a shared service, a local
+module, or a replicated Fluxor deployment.
 
 The expected continuity class of the directory itself is normally
 `resumable`, not `edge_anchored`. It should be replicated and
@@ -451,15 +449,15 @@ driver(frame.ethernet) -> ip(transport.stream.tcp)   -> tls -> http
 
 VIPs, anycast, and drain are typically sufficient.
 
-### Large Quantum Cluster (`edge_anchored`)
+### Large MQTT Front Door (`edge_anchored`)
 
 ```text
 client
-  -> quantum_edge_anchor(transport.anchor.stream.secure, mqtt wire session)
+  -> mqtt_edge_anchor(transport.anchor.stream.secure, mqtt wire session)
   -> remote/local channels
-  -> quantum_session_core(session.worker)
+  -> mqtt_session_worker(session.worker)
   -> topic_router / fanout / persistence
-  -> lattice-backed session.directory
+  -> replicated session.directory
 ```
 
 The split:
@@ -497,8 +495,8 @@ Worker replacement sequence:
    ready for that epoch
 
 MQTT shared-subscription semantics such as `$share/*` cut across
-individual session boundaries and are a later Quantum-specific
-extension to this split, not part of the first anchor/worker baseline.
+individual session boundaries and are a later broker-specific extension
+to this split, not part of the first anchor/worker baseline.
 
 ### Push Notification Front Door (`edge_anchored`)
 
@@ -509,10 +507,10 @@ device
   -> fanout / queue / backend
 ```
 
-Same pattern as Quantum, optimized for enormous numbers of mostly idle
+Same pattern as the MQTT front door, optimized for enormous numbers of mostly idle
 long-lived sessions.
 
-### Lattice Watches / Chronicle Control Channels (`resumable` or `edge_anchored`)
+### Watch Streams / Control Channels (`resumable` or `edge_anchored`)
 
 ```text
 client/agent
@@ -521,7 +519,7 @@ client/agent
   -> replicated state / orchestration backend
 ```
 
-### Clustor Internal Replication (`resumable`)
+### Internal Replication (`resumable`)
 
 ```text
 replicator
@@ -632,8 +630,7 @@ staging primitive be local.
 
 If current `graph_slot` activation remains whole-graph rather than
 partial or per-subgraph, then anchor-preserved worker swap requires
-either a `graph_slot` extension or an equivalent staging mechanism, and
-is tracked as an explicit implementation dependency in the RFC.
+either a `graph_slot` extension or an equivalent staging mechanism.
 
 ## Remote Channels and Placement
 
@@ -646,7 +643,7 @@ When an anchor terminates TLS, DTLS, or QUIC crypto and forwards
 post-decrypt traffic to a worker on another node, the remote-channel
 hop becomes the new trust boundary. In that case the remote-channel
 transport **must** provide mutual authentication, integrity protection,
-and encryption in line with `.context/future/rfc_remote_channels.md`.
+and encryption.
 
 The architecture should explicitly support different continuity
 expectations per edge:
@@ -712,21 +709,21 @@ activation or an equivalent staging mechanism (see
 `architecture/protocol_surfaces.md` §Handoff and Reconfigure
 Integration).
 
-## Buildability — VoIP-as-anchor and QUIC
+## Implementation Fit — VoIP-as-anchor and QUIC
 
 The five contract files (`net_proto`, `datagram`, `packet`, `mux`,
 `session_ctrl`) plus the `transport.*` / `session.*` capability
 vocabulary in `capability_surface.md` plus the `MON_SESSION` line
-format in `monitor-protocol.md` together cover every operation the
-RFC's six phases require. Two specific future deployments are
-buildable from what's landed today:
+format in `monitor-protocol.md` are intended to cover the operations
+these future deployments need. They still require module work before
+they are shipped workflows:
 
 ### VoIP edge-anchored
 
 A VoIP front door split into `voip_edge_anchor` (owns SIP/RTP client
 attachment) + `voip_session_worker` (owns dialog state, fanout,
-durable interaction with backend) is buildable with **no new
-contracts**:
+durable interaction with backend) should fit the current contract
+vocabulary:
 
 | Need | Provided by |
 |------|-------------|
@@ -740,14 +737,13 @@ contracts**:
 What's still needed to ship: split the existing `voip` module's
 state into `voip_edge_anchor` + `voip_session_worker` along the
 SIP-state vs media-state boundary, wire SessionCtrlV1 between them.
-Pattern proven by `echo_anchor` + `echo_worker`. No architectural
-gaps.
+The `echo_anchor` + `echo_worker` demo proves the control-envelope
+shape, not a production VoIP handoff.
 
 ### QUIC + HTTP/3
 
 A `quic` foundation module providing `transport.mux.quic` with
-`transport_migratable` continuity is buildable with the contracts
-landed today:
+`transport_migratable` continuity should fit the same vocabulary:
 
 | Need | Provided by |
 |------|-------------|
@@ -761,27 +757,25 @@ landed today:
 What's still needed to ship: the `quic` module itself (substantial
 engineering), an HTTP/3 layer that consumes `transport.mux`, and
 config-tool validation for `transport_migratable` graphs. The
-contract envelopes are reserved in advance precisely so this work
-has a stable target.
+contract envelopes are reserved in advance so this work has a stable
+target.
 
 ### What's NOT in this document
 
-The following are explicitly **out of scope** of the RFC's protocol
-substrate but are tracked separately:
+The following are explicitly **out of scope** of the protocol substrate:
 
-- `graph_slot` per-subgraph activation (RFC §13.4 dependency) — needed
-  for fully-atomic anchor-preserved worker swap. Tracked in repo
-  memory as a separate workstream.
+- `graph_slot` per-subgraph activation — needed for fully-atomic
+  anchor-preserved worker swap.
 - Reusable protocol cores (`tcp_core`, `quic_recovery_core`,
-  `session_handoff_core`, etc., RFC §15.1) — code-sharing units
+  `session_handoff_core`, etc.) — code-sharing units
   extracted from real implementations once two consumers exist.
 - Live `MON_SESSION` emission in modules — needs a module-index
   syscall or a dedicated monitor module that tails SessionCtrlV1
   channels.
 
-These are engineering follow-ups, not architectural gaps. The
-five-contract substrate and the role / capability / continuity-class
-vocabulary are complete.
+These are engineering follow-ups. The five-contract substrate and the
+role / capability / continuity-class vocabulary should remain stable as
+the first production users land.
 
 ## Related Documentation
 
@@ -796,6 +790,3 @@ vocabulary are complete.
   deferred ready
 - `architecture/monitor-protocol.md` — MON_* telemetry families;
   `MON_SESSION` lands here
-- `.context/rfc_protocols.md` — the source RFC for this document
-- `.context/future/rfc_remote_channels.md` — remote-channel fabric
-  between anchors and remote workers

@@ -13,8 +13,9 @@ wrong layer = redraw before coding.
 | `platform` | `modules/sdk/platform/{rp,bcm2712}/*.rs`, `src/platform/*.rs` | Chip-specific drivers in `modules/drivers/` only | Chip-specific raw register bridges and layout constants. **Not public; not portable.** |
 
 Adding a new chip is a new `platform/<chip>/*` tree plus its hardware
-drivers — no changes to the upper layers. The guardrails are spelled
-out in [`.context/rfc_ipc_architecture.md`](../../.context/rfc_ipc_architecture.md) §1.1 and §8.1.
+drivers — no changes to the upper layers. Keep new APIs in the narrowest
+layer that can own them, and do not expose `internal` or `platform`
+contracts to portable application modules.
 
 ## Kernel primitives — `kernel_abi`
 
@@ -459,7 +460,7 @@ sits below it (Linux runtime sinks). Selection is orthogonal —
 either a PIC driver or a built-in via board/family/platform match
 keys, with no per-stack-file knowledge of the deployment shape. The
 multi-platform model is documented in
-`.context/stress_test_browser_hosted_fluxor_apps.md`.
+`wasm_platform.md` and `wasm_browser_host.md`.
 
 Built-in manifests carry `builtin = true`. Their `[[params]]` schema
 is read by the config tool and packed into the same TLV stream PIC
@@ -470,6 +471,6 @@ language.
 ## What the kernel is
 
 The kernel moves bytes, touches registers, and wakes ISRs. It does
-not know what TCP is, what TLS is, what MQTT is, what Raft is, or
+not know what TCP is, what TLS is, what MQTT is, what HTTP is, or
 what audio looks like. Every protocol, every domain, every piece of
 application logic lives in a module.

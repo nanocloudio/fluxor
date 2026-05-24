@@ -35,11 +35,12 @@ one.
    connection tracking, congestion control — all of it is internal to the
    IP module. The kernel cannot observe a TCP connection because the kernel
    does not have a concept of TCP. This makes the IP module replaceable:
-   smoltcp on RP2350, a libc-socket bridge on Linux, a kernel-bypass
-   driver on a server-class target, all expose the same channel surface.
+   the in-tree IP module on bare-metal targets, a libc-socket bridge on
+   Linux, or a kernel-bypass driver on a server-class target can expose
+   the same channel surface.
 
 4. **Consumer modules speak net_proto, not sockets.** HTTP, DNS, MQTT,
-   VoIP, RTP, TLS, and Clustor modules each have a channel pair to the IP
+   VoIP, RTP, TLS, and mesh modules each have a channel pair to the IP
    module. They send typed framed messages (`CMD_BIND`, `CMD_CONNECT`,
    `CMD_SEND`) and receive typed framed messages (`MSG_DATA`,
    `MSG_ACCEPTED`, `MSG_CLOSED`) over that channel pair. There is no
@@ -64,7 +65,7 @@ one.
 ```
 +------------------------------------------------------------------+
 |                      Application Modules                         |
-|       (HTTP, DNS, MQTT, VoIP, RTP, TLS, Clustor stack)           |
+|              (HTTP, DNS, MQTT, VoIP, RTP, TLS, mesh)             |
 |                                                                  |
 |  Each module has a channel pair to the IP module.                |
 |  Frames carry the net_proto TLV protocol.                        |
@@ -282,9 +283,9 @@ untouched. The CM5 ethernet stack wires it automatically via
 ## The IP Module
 
 The IP module (`modules/foundation/ip/mod.rs`) is a standalone PIC module
-that owns the entire TCP/UDP/IPv4 stack. On constrained targets it uses
-smoltcp; on Linux it bridges to libc sockets internally. Either way, the
-upward interface is identical: net_proto frames over channels.
+that owns the TCP/UDP/IPv4 stack on bare-metal targets. On Linux the same
+surface bridges to libc sockets internally. Either way, the upward
+interface is identical: net_proto frames over channels.
 
 ### Inputs and outputs
 
@@ -400,7 +401,6 @@ shipping today:
 | `rtp` | RTP packet framing |
 | `tls` | Channel-to-channel TLS 1.3 transformer |
 | `mesh` | MQTT-bridged mesh transport |
-| Clustor stack | `replicator`, `tls_stream`, `client_codec`, etc. |
 
 Every one of these modules opens a channel pair to the IP (or TLS) module
 in its config wiring and exchanges net_proto frames. None of them call a
@@ -617,4 +617,3 @@ on which channel pair the connection was opened on.
 - `architecture/abi_layers.md` — HAL contracts drivers use to touch hardware
 - `architecture/security.md` — conn_guard, retx buffering, KEY_VAULT,
   trust model
-- `.context/rfc_protocols.md` — RFC underlying `protocol_surfaces.md`

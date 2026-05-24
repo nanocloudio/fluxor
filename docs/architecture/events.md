@@ -339,8 +339,8 @@ The kernel does NOT provide:
 | `modules/sdk/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
 | `modules/sdk/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
 | `src/kernel/syscalls.rs` | EVENT contract vtable + provider dispatch |
-| `src/io/gpio.rs` | `GPIO_EVENT_BINDING`, `poll_gpio_edges()`, accessors (RP) |
-| `src/kernel/scheduler.rs` | `select()` wake, `step_woken_modules()`, `current_module_index()` |
+| `src/platform/rp/io.rs` | `GPIO_EVENT_BINDING`, `poll_gpio_edges()`, accessors (RP) |
+| `src/kernel/scheduler/mod.rs` | `select()` wake, `step_woken_modules()`, `current_module_index()` |
 
 ## Limits
 

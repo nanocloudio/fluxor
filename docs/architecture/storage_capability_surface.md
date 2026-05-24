@@ -30,15 +30,16 @@ surfaces compose the family; every provider declares one or more.
 |---------------------|-----------------------------------------------------------------|--------------------------------------------------------------|
 | `storage.block`     | Raw 512-byte block I/O                                          | sd, flash, nvme; fat32, littlefs consume                     |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32, linux_fs, http-as-fs; player / viewer modules consume |
-| `storage.namespace` | Name-keyed directory surface (lookup, list, rename, …)          | fat32 (readonly), loam, clustor, s3-adapter                  |
-| `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get)   | loam (cas), clustor (replicated), s3-adapter, http-as-fs     |
+| `storage.namespace` | Name-keyed directory surface (lookup, list, rename, …)          | fat32 (readonly), linux_fs, replicated namespace adapters    |
+| `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get)   | content-addressed stores, replicated object stores, HTTP-backed adapters |
 
 Multipart object upload is deliberately not part of `storage.object`.
 Large writes compose via the `event.log` pattern in §4 and finalise
 with `object::PUT_STREAMED_COMMIT` — the concrete four-opcode
 sequence (`PUT_STREAMED_OPEN` / `_WRITE` / `_COMMIT` / `_ABORT`).
-An S3 adapter synthesises multipart on top of this surface; the
-surface itself stays narrow so substitutability holds.
+Object-store adapters can synthesize provider-specific multipart
+uploads on top of this surface; the surface itself stays narrow so
+substitutability holds.
 
 Append-log behaviour is deliberately not a new surface — it is an
 Event-stream content-type pattern over the mesh Event primitive
@@ -90,7 +91,7 @@ wildly in what `PUT` means:
   holds the bytes — no durability until the next sync.
 - A FAT32 driver over SD returns "ok" once the FAT block has been
   flushed — local durability against a specific device.
-- A Clustor-replicated put returns "ok" once a quorum has accepted
+- A replicated put returns "ok" once a quorum has accepted
   a particular log position — durability against a configured
   cluster.
 - A content-addressed put returns "ok" with the digest of the
@@ -121,7 +122,7 @@ namespace B. The source identifies the log, namespace, or state
 machine the fence refers to; `dominates` requires same-source for
 any same-dimension comparison.
 
-`ReplicatedDurable` carries enough fields to make the lattice
+`ReplicatedDurable` carries enough fields to make the partial order
 correct:
 
 - `commit_index` is the monotone log position within an epoch.
@@ -153,15 +154,15 @@ comparing them.
 ### Why this is load-bearing
 
 Strip the fence and "the storage surface" is a type assertion with
-no behavioural contract behind it. With the fence, sibling projects
-(downstream / sibling projects) can:
+no behavioural contract behind it. With the fence, Fluxor providers
+and consumers can:
 
 - substitute providers without anticipating ABI churn — they wire
   on the surface name and the required fence dominance;
 - record the achieved fence alongside the value so a follow-up
   reader refuses to proceed unless the recorded fence still
   dominates what it needs;
-- gossip witnesses across the mesh — Clustor populates
+- gossip witnesses across the mesh — replicated providers populate
   `ReplicatedDurable.witness`; everyone else treats it as bytes to
   forward.
 
@@ -271,7 +272,7 @@ Lifecycle rules:
 - `not_after` is an absolute monotonic timestamp (kernel
   `time_ns`). Providers refuse ops with `now_ns >= not_after` and
   free the slot.
-- Revocation is provider-driven: a FAT32 unmount, a Clustor
+- Revocation is provider-driven: a FAT32 unmount, a replicated store
   reconfiguration, or an explicit revoke from the issuer flips
   `revoked` and frees the slot. The next op against a revoked
   handle fails with `EACCES` or `ENODEV`.
@@ -302,11 +303,11 @@ content-type pattern built on the mesh Event primitive (mesh.md
   entry of `HandleKind::Stream` (or by subscribing under a prefix
   via `namespace::SUBSCRIBE`).
 
-Three otherwise unrelated systems reduce to this pattern:
+Three otherwise unrelated provider classes reduce to this pattern:
 
-- **Loam WAL** — per-store write-ahead log; `RevisionMonotone` per
+- **Local WAL** — per-store write-ahead log; `RevisionMonotone` per
   commit, `LocalDurable` per fsync.
-- **Clustor commit log** — replicated state-machine log;
+- **Replicated commit log** — replicated state-machine log;
   `ReplicatedDurable` per accepted entry.
 - **Generic append logs** — any "name resolves to an Event stream
   with monotone sequence" use case, including foundation/log_net's
@@ -335,18 +336,17 @@ PUT_STREAMED_ABORT  (handle = sh)  →  discard staged events
 Providers map this onto whatever shape their backing store
 prefers:
 
-- **Loam-distributed** opens an `event.log` stream at
+- **Replicated object store** opens an `event.log` stream at
   `_staging/<key>`; each `PUT_STREAMED_WRITE` appends one Event;
   `PUT_STREAMED_COMMIT` atomically links the finalised event
   sequence under `<key>` and advertises `ReplicatedDurable
   { source, commit_index, epoch, quorum, witness }`.
-- **Loam-local** writes chunks to an append-only WAL;
+- **Local object store** writes chunks to an append-only WAL;
   `PUT_STREAMED_COMMIT` fsync+renames and advertises
   `LocalDurable { device_id }`.
-- **An S3 adapter** maps `PUT_STREAMED_OPEN` to
-  `CreateMultipartUpload`, `PUT_STREAMED_WRITE` to `UploadPart`,
-  and `PUT_STREAMED_COMMIT` to `CompleteMultipartUpload`. The
-  fence on COMMIT is whatever the upstream advertised (typically
+- **Object-store adapter** maps the streamed open/write/commit
+  sequence to the provider's native multipart or staged-upload API.
+  The fence on COMMIT is whatever the upstream advertised (typically
   `ReplicatedDurable` or `ContentHashed`).
 
 The handle's per-handle fence is `Volatile` during WRITE and
@@ -356,7 +356,7 @@ records it in band with the success return. `PUT_STREAMED_ABORT`
 releases the staging events; subsequent reads of `<key>` see no
 trace of the partial sequence.
 
-Every cloud-scale provider satisfies this contract. There is no
+Large object providers can satisfy this contract. There is no
 separate "multipart" surface, and `object::PUT` is not stretched
 into a streaming op — `PUT` stays a small-blob single-shot; large
 bodies compose through the four streaming opcodes above.
@@ -379,9 +379,9 @@ The local POSIX adapter at `src/platform/linux/providers.rs`
   linux_fs once `RENAME` / `DELETE` lands) — `OPENDIR` / `READDIR`
   surface the listing operations.
 
-`fs.rs` is one adapter family; Loam, Clustor, and the S3 adapter
-are others. All four interoperate because they share the four
-surfaces and the fence contract.
+`fs.rs` is one adapter family; content-addressed, replicated, and
+object-store adapters can use the same surface vocabulary. They
+interoperate when they share the four surfaces and the fence contract.
 
 ---
 
@@ -396,8 +396,9 @@ This page covers:
 
 Out of scope (deliberately):
 
-- A per-capability conformance test suite. Cases stabilise after
-  the surfaces do; Loam and Truffle drive the first suites.
+- A per-capability conformance test suite. Cases should stabilise
+  after the surfaces do and after two independent providers exercise
+  the same contract.
 - Wire-level paired `(value, Fence)` envelopes on the existing
   `fs` opcodes. The syscall ABI returns `i32`; the per-handle
   fence is fetched via a follow-up `provider_query(handle,

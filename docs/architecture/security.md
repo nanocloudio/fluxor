@@ -68,7 +68,7 @@ about explicitly:
 | **Trusted built-in** | Compiled-in `BuiltInModule` (e.g. `linux_net`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM host built-ins; bypass the loader entirely |
 | **Signed flash image** | RP / CM5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | If signature present, Ed25519 verify; if absent and `enforce_signatures` set, reject | Production RP2350 + CM5 firmware images |
 | **Embedded blob** | WASM `EMBEDDED_MODULES_BLOB`, Linux `mmap`'d `.fmod` file | `hal::verify_integrity` byte-compares SHA-256 on every platform (Linux/WASM/BCM/RP all match) | Same as flash image when present | Linux dev runs, WASM bundles |
-| **Network / staged** | TFTP / OTA delivered image into a staging area then promoted | Same as flash image once promoted | Same | Future scope; `.context/rfc_graph_reconfigure.md` discusses the staged-image flow |
+| **Network / staged** | TFTP / OTA delivered image into a staging area then promoted | Same as flash image once promoted | Same | Future scope; see `reconfigure.md` and `network_boot.md` for the staged-image model |
 
 The loader does not currently distinguish "host development file" from
 "network/staged image" — both flow through `init_from_blob` and the
@@ -262,7 +262,7 @@ config.
   production-network hazard. The rig config ships in proxy-DHCP mode —
   dnsmasq advertises PXE/TFTP options only and never hands out leases.
   Do not add a non-proxy `dhcp-range` to any config on a shared
-  interface; see the safety note in `docs/guides/pi5-bare-metal.md` (§ Dev host setup: dnsmasq).
+  interface.
 - `sudo ip neigh` static entries are host-local and do not leak onto
   the LAN, but they will misdirect traffic on the originating host if
   the target IP is reassigned.

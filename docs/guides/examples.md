@@ -117,9 +117,8 @@ graph today — `fluxor run <yaml>` for linux/qemu, `make firmware`
 then flash for embedded.
 
 The **WASM** and **split** variants need an HTTP origin to host the
-browser side, which is a separate Fluxor graph. The deployment-
-scenario primitive ([RFC](../../.context/rfc_deployment_scenarios.md))
-solves this declaratively. Single-graph orchestration carries the
+browser side, which is a separate Fluxor graph. The deployment-scenario
+primitive solves this declaratively. Single-graph orchestration carries the
 `scenario:` block inline on the graph YAML (see
 `examples/image_viewer/cm5.yaml`); multi-graph harnesses use a
 standalone YAML with `kind: scenario` at the top

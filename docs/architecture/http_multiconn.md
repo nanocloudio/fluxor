@@ -128,8 +128,8 @@ Cache entries carry a `retain: u8` reader refcount. A cache hit
 bumps it on the way in (in `cache_try_or_fetch` and the inline h1
 hit path); end-of-emission (`Phase::DrainSend` for h1, h2's
 `free_slot`) decrements via `cache_release_for_route`.
-`cache_alloc` refuses to evict any entry with `retain > 0`, so a
-sibling cache miss can't trample the body_pool region a stream is
+`cache_alloc` refuses to evict any entry with `retain > 0`, so another
+cache miss can't trample the body_pool region a stream is
 still rendering from. `cache_lookup` also requires `CACHE_COMPLETE`
 so an in-progress fill doesn't masquerade as a hit.
 
