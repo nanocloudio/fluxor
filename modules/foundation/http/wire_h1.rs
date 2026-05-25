@@ -4,6 +4,104 @@
 //! no module state: each function takes raw byte slices so the same
 //! routines serve both the server and client state machines.
 
+/// Decide whether the response to a parsed request head should
+/// keep the connection open. RFC 9112 §9.3 default rules:
+///   HTTP/1.1 + no `Connection: close`        → keep-alive
+///   HTTP/1.1 + `Connection: close`           → close
+///   HTTP/1.0 + `Connection: keep-alive`      → keep-alive
+///   HTTP/1.0 (no Connection or anything else) → close
+///   anything older / malformed               → close
+///
+/// `head` is the request bytes up to and including the `\r\n\r\n`
+/// terminator. Header name match is case-insensitive; value tokens
+/// are comma-separated, each trimmed and compared case-insensitively.
+pub fn request_keeps_alive(head: &[u8]) -> bool {
+    // 1) Find end of request line (first \r\n).
+    let mut line_end = 0usize;
+    while line_end + 1 < head.len() {
+        if head[line_end] == b'\r' && head[line_end + 1] == b'\n' {
+            break;
+        }
+        line_end += 1;
+    }
+    if line_end + 1 >= head.len() {
+        return false;
+    }
+
+    // 2) HTTP version is the token after the second space on the
+    //    request line: `METHOD SP PATH SP HTTP/1.x CRLF`.
+    let req_line = &head[..line_end];
+    let v_is_11 = req_line.ends_with(b"HTTP/1.1");
+    let v_is_10 = req_line.ends_with(b"HTTP/1.0");
+    if !v_is_11 && !v_is_10 {
+        return false;
+    }
+
+    // 3) Walk header lines for `Connection:`. Last wins (per RFC
+    //    9110 §5.3 it's a "list-based" header; multiple Connection
+    //    headers are merged in order, so the union of tokens
+    //    decides). We track two bits: saw `close`, saw `keep-alive`.
+    let mut saw_close = false;
+    let mut saw_keep = false;
+    let mut cursor = line_end + 2;
+    while cursor < head.len() {
+        let line_start = cursor;
+        let mut nl = line_start;
+        while nl + 1 < head.len() {
+            if head[nl] == b'\r' && head[nl + 1] == b'\n' {
+                break;
+            }
+            nl += 1;
+        }
+        if nl == line_start {
+            break; // blank line = end of head
+        }
+        if nl + 1 >= head.len() {
+            break; // truncated
+        }
+        let line = &head[line_start..nl];
+        if let Some(colon) = line.iter().position(|c| *c == b':') {
+            let name = &line[..colon];
+            if name.eq_ignore_ascii_case(b"connection") {
+                let mut value_start = colon + 1;
+                while value_start < line.len()
+                    && (line[value_start] == b' ' || line[value_start] == b'\t')
+                {
+                    value_start += 1;
+                }
+                let value = &line[value_start..];
+                for tok in value.split(|c| *c == b',') {
+                    // Trim whitespace each side.
+                    let mut start = 0;
+                    let mut end = tok.len();
+                    while start < end && (tok[start] == b' ' || tok[start] == b'\t') {
+                        start += 1;
+                    }
+                    while end > start && (tok[end - 1] == b' ' || tok[end - 1] == b'\t') {
+                        end -= 1;
+                    }
+                    let trimmed = &tok[start..end];
+                    if trimmed.eq_ignore_ascii_case(b"close") {
+                        saw_close = true;
+                    } else if trimmed.eq_ignore_ascii_case(b"keep-alive") {
+                        saw_keep = true;
+                    }
+                }
+            }
+        }
+        cursor = nl + 2;
+    }
+
+    if saw_close {
+        return false;
+    }
+    if v_is_11 {
+        return true;
+    }
+    // HTTP/1.0: only keep-alive if explicitly requested.
+    saw_keep
+}
+
 /// Locate the end-of-headers sentinel `\r\n\r\n` in a partial HTTP/1
 /// message. Returns the byte offset *after* the sentinel — i.e. where
 /// the body begins — or `None` if the sentinel is not yet present.
@@ -75,16 +173,17 @@ pub unsafe fn parse_request_line(
     Some(plen)
 }
 
-/// Write a minimal HTTP/1.1 response status line plus `Connection:
-/// close` and a `Content-Type` header into `dst`, terminated by the
-/// blank line that ends the head. Returns the number of bytes written
-/// (capped at `dst_cap`).
+/// Write a minimal HTTP/1.1 response status line plus a
+/// `Connection:` header (`keep-alive` or `close` per the
+/// `keepalive` flag) and a `Content-Type` header into `dst`,
+/// terminated by the blank line that ends the head. Returns the
+/// number of bytes written (capped at `dst_cap`).
 ///
-/// RFC 9110 §6.6 requires the response version to be `<=` the
-/// request version; emitting 1.0 in reply to a 1.1 request forces
-/// clients into 1.0 keep-alive semantics. We always include
-/// `Connection: close`, so the connection still closes after each
-/// response — but the version now matches modern requests.
+/// `keepalive = true` is what the server SHOULD emit when the
+/// matching request was HTTP/1.1 without an explicit `Connection:
+/// close`, or HTTP/1.0 with `Connection: keep-alive`. The server's
+/// per-slot `Phase::RecvRequest` decides this and threads the flag
+/// down to here; the caller never picks unilaterally.
 ///
 /// # Safety
 /// `dst` must be valid for writes of `dst_cap` bytes.
@@ -93,6 +192,7 @@ pub unsafe fn write_status_line(
     dst_cap: usize,
     status: &[u8],
     content_type: &[u8],
+    keepalive: bool,
 ) -> usize {
     let mut off = 0usize;
 
@@ -110,7 +210,11 @@ pub unsafe fn write_status_line(
 
     put!(b"HTTP/1.1 ");
     put!(status);
-    put!(b"\r\nConnection: close\r\nContent-Type: ");
+    if keepalive {
+        put!(b"\r\nConnection: keep-alive\r\nContent-Type: ");
+    } else {
+        put!(b"\r\nConnection: close\r\nContent-Type: ");
+    }
     put!(content_type);
     put!(b"\r\n\r\n");
 

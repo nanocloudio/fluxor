@@ -50,6 +50,7 @@ pub fn wire_binding(table: &BindingTable) -> BTreeMap<String, BindingValue> {
         let wire = match v {
             ProfileBindingValue::Secret(s) => BindingValue::String(s.expose().to_string()),
             ProfileBindingValue::Int(n) => BindingValue::Int(*n),
+            ProfileBindingValue::Float(f) => BindingValue::Float(*f),
             ProfileBindingValue::Bool(b) => BindingValue::Bool(*b),
         };
         out.insert(k.clone(), wire);

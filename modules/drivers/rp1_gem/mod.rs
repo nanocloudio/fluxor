@@ -189,6 +189,9 @@ struct GemState {
     _pad: [u8; 3],
     step_count: u32,
     rx_packets: u32,
+    /// Frames received but dropped because `out_chan` (→ conn_guard)
+    /// was full. Surfaced as `cdr=N` on the heartbeat.
+    rx_chan_drops: u32,
     tx_packets: u32,
     link_poll_counter: u32,
     /// Cumulative RX resource errors (BNA). Cadence GEM RW1Cs the HW
@@ -305,6 +308,7 @@ unsafe fn heartbeat(s: &mut GemState) {
         append_dec_field(p, &mut pos, b" ovr=",  s.rx_overrun_total);
         append_dec_field(p, &mut pos, b" hwrx=", s.rx_frames_hw_total);
         append_dec_field(p, &mut pos, b" hwtx=", s.tx_frames_hw_total);
+        append_dec_field(p, &mut pos, b" cdr=", s.rx_chan_drops);
         dev_log(&*s.syscalls, 3, p, pos);
     }
 
@@ -693,12 +697,14 @@ unsafe fn poll_rx(s: &mut GemState) {
             core::ptr::write_volatile(sp.add(1), (len >> 8) as u8);
             core::ptr::copy_nonoverlapping(buf_ptr, sp.add(2), len);
 
-            // Writes are atomic (all-or-nothing); on a full channel the frame
-            // is dropped. The GEM descriptor is still returned below so the
-            // ring does not stall.
+            // Writes are atomic; a full channel drops the frame and
+            // bumps `rx_chan_drops`. The descriptor is still returned
+            // below so the ring keeps draining.
             let written = (sys.channel_write)(s.out_chan, sp, 2 + len);
             if written > 0 {
                 s.rx_packets = s.rx_packets.wrapping_add(1);
+            } else {
+                s.rx_chan_drops = s.rx_chan_drops.wrapping_add(1);
             }
         }
 

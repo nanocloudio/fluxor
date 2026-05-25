@@ -4328,6 +4328,9 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     for d in 0..MAX_DOMAINS {
         sched.domain_budget_us_consumed[d] = 0;
     }
+    // Track which domains already logged a soft-overrun this pass,
+    // so we don't emit a MON_BUDGET_OVERRUN line per remaining module.
+    let mut overrun_logged: [bool; MAX_DOMAINS] = [false; MAX_DOMAINS];
 
     // Step modules in topological order so producers run before
     // consumers. The per-module step body is in `step_one_module`
@@ -4375,23 +4378,21 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
             false,
         );
 
-        // Check the budget of the domain the *just-stepped*
-        // module belongs to — not always domain 0. Two reasons to
-        // break the iteration on overrun: (1) any further work
-        // this pass is past-budget by definition, (2) the loop is
-        // single-threaded; we can't keep stepping other domains
-        // while breaking just one. Operators see one overrun per
-        // pass on the offending domain — same UX as the
-        // domain-scoped step path.
+        // Soft overrun: log + advance the cyclic shift but keep
+        // running downstream modules (the NIC drain in particular).
+        // Hard overrun (`break`) reserved for runaway-loop protection.
         let stepped_domain = sched.domain_id[module_idx] as usize;
-        if stepped_domain < MAX_DOMAINS && domain_budget_exhausted(sched, stepped_domain) {
-            record_domain_budget_overrun(sched, stepped_domain, module_idx);
-            // Advance the start offset so the next pass observes a
-            // different cyclic shift. The offset wraps naturally at
-            // u8::MAX; the `% exec_count` applied at the top of each
-            // pass keeps it in range regardless.
-            sched.exec_order_offset = sched.exec_order_offset.wrapping_add(1);
-            break;
+        if stepped_domain < MAX_DOMAINS {
+            let soft = domain_budget_exhausted(sched, stepped_domain);
+            let hard = soft && domain_budget_hard_overrun(sched, stepped_domain);
+            if soft && !overrun_logged[stepped_domain] {
+                record_domain_budget_overrun(sched, stepped_domain, module_idx);
+                sched.exec_order_offset = sched.exec_order_offset.wrapping_add(1);
+                overrun_logged[stepped_domain] = true;
+            }
+            if hard {
+                break;
+            }
         }
     }
 
@@ -4460,6 +4461,24 @@ fn domain_budget_exhausted(sched: &SchedulerState, domain_id: usize) -> bool {
         return false;
     }
     sched.domain_budget_us_consumed[domain_id] > limit
+}
+
+/// Multiplier above the per-domain budget at which the scheduler
+/// breaks the pass rather than just logging the overrun. Reserved
+/// for runaway-loop protection; soft overruns let the pass finish
+/// so downstream modules (e.g. the NIC drain) still tick.
+const BUDGET_HARD_BREAK_MULTIPLIER: u64 = 10;
+
+#[inline]
+fn domain_budget_hard_overrun(sched: &SchedulerState, domain_id: usize) -> bool {
+    if domain_id >= MAX_DOMAINS {
+        return false;
+    }
+    let limit = sched.domain_budget_us_limit[domain_id] as u64;
+    if limit == 0 {
+        return false;
+    }
+    sched.domain_budget_us_consumed[domain_id] > limit.saturating_mul(BUDGET_HARD_BREAK_MULTIPLIER)
 }
 
 /// Record a per-domain budget-overrun event: increment the counter
@@ -4589,8 +4608,11 @@ pub fn step_domain_modules(
 
     // Reset the per-pass budget accumulator before stepping any
     // modules. `step_one_module` adds elapsed wall-clock here; the
-    // loop below cuts off if the domain overshoots its tick.
+    // loop below cuts the pass only on a hard overrun, advancing
+    // the cyclic shift on soft overruns so operators see them
+    // without losing the rest of the pass.
     sched.domain_budget_us_consumed[domain_id] = 0;
+    let mut overrun_logged_this_pass = false;
 
     let n = sched.domain_module_count[domain_id] as usize;
     // Rotate the per-domain exec_order start by
@@ -4618,19 +4640,17 @@ pub fn step_domain_modules(
             false,
         );
 
-        // Per-domain budget enforcement: if cumulative step time has
-        // exceeded the domain's tick budget, log + count + skip the
-        // remaining modules this pass. They'll get their turn on the
-        // next pass when the accumulator resets. This is what keeps
-        // a misconfigured Tier 3 domain (or a sibling-starving
-        // burst) from monopolising a core indefinitely on aarch64
-        // where the step guard is advisory.
-        if domain_budget_exhausted(sched, domain_id) {
+        // Soft overrun: log once + advance the cyclic shift, keep
+        // running. Hard overrun (`break`) is runaway-loop protection.
+        let soft = domain_budget_exhausted(sched, domain_id);
+        let hard = soft && domain_budget_hard_overrun(sched, domain_id);
+        if soft && !overrun_logged_this_pass {
             record_domain_budget_overrun(sched, domain_id, module_idx);
-            // Advance this domain's offset so the next pass observes
-            // a different cyclic shift.
             sched.domain_exec_order_offset[domain_id] =
                 sched.domain_exec_order_offset[domain_id].wrapping_add(1);
+            overrun_logged_this_pass = true;
+        }
+        if hard {
             break;
         }
     }
@@ -5027,8 +5047,26 @@ fn step_one_module(
             sched.domain_budget_us_consumed[d] =
                 sched.domain_budget_us_consumed[d].saturating_add(elapsed);
         }
+        // Name the module that actually consumed the time — the
+        // overrun line names whichever finished *last*, which is a
+        // poor proxy for cause.
+        if elapsed > MOD_STEP_HEAVY_US {
+            log::warn!(
+                "MON_HEAVY_STEP module={} domain={} elapsed_us={} tick={}",
+                module_idx,
+                d,
+                elapsed,
+                // SAFETY: DBG_TICK is an aligned u32 read; the scheduler
+                // is the only writer.
+                unsafe { DBG_TICK },
+            );
+        }
     }
 }
+
+/// Threshold (µs) above which a single module-step emits
+/// `MON_HEAVY_STEP`. Sized to stay quiet on the fast path.
+const MOD_STEP_HEAVY_US: u64 = 50;
 
 /// Step only modules whose bit is set in `wake_bits`. Walks the
 /// topological execution order so producer modules still run before

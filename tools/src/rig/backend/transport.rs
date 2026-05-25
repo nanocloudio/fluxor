@@ -136,13 +136,21 @@ pub fn attach(
         Surface::Rig => "rig",
     };
 
-    // For transports that emit bytes (console.*, telemetry.*), compute the
-    // fully-qualified capability this backend speaks on. Byte events carry
-    // this tag so the matcher routes them to the correct per-source buffer
-    // and rules that name a specific capability match only their own
-    // traffic.
+    // For transports that emit bytes (console.*, telemetry.*, observe.*),
+    // compute the fully-qualified capability this backend speaks on.
+    // Byte events carry this tag so the matcher routes them to the
+    // correct per-source buffer and rules that name a specific
+    // capability match only their own traffic.
+    //
+    // Observe-surface backends (e.g. `observe-https_load`) emit
+    // synthesised NDJSON bytes summarising probe results so the same
+    // byte-buffer/regex pipeline used for console + telemetry can
+    // evaluate scenario rules against them. The `observe.netboot_fetch`
+    // capability is the exception — it produces structured deploy events
+    // via the deploy backend's `watch` verb, not a transport of its own,
+    // so it deliberately has no `attach_transport` path.
     let byte_source: Option<Capability> = match surface {
-        Surface::Console | Surface::Telemetry => {
+        Surface::Console | Surface::Telemetry | Surface::Observe => {
             let qualified = format!("{}.{}", surface.as_str(), backend.name);
             Some(Capability::parse(&qualified).map_err(|e| {
                 Error::Config(format!(

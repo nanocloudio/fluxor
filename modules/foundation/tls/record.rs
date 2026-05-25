@@ -161,6 +161,75 @@ pub fn build_encrypted_record_header(payload_len: usize, out: &mut [u8; 5]) {
     out[4] = total as u8;
 }
 
+/// Encrypt a TLS 1.3 record in-place. Caller positions plaintext at
+/// `buf[0..plaintext_len]`; on return `buf` holds the encrypted
+/// payload + content_type + 16-byte tag. `buf.len()` must be
+/// ≥ `plaintext_len + 17`. Returns `plaintext_len + 1 + 16` on
+/// success, `0` on seq wrap or buffer too small. Bit-identical to
+/// `encrypt_record`; avoids two memcpys per record on the hot send
+/// path.
+pub fn encrypt_record_in_place(
+    suite: CipherSuite,
+    keys: &mut TrafficKeys,
+    content_type: u8,
+    plaintext_len: usize,
+    buf: &mut [u8],
+) -> usize {
+    if buf.len() < plaintext_len + 17 {
+        return 0;
+    }
+    let ct_len = plaintext_len + 1 + 16;
+
+    let mut aad = [0u8; 5];
+    aad[0] = CT_APPLICATION_DATA;
+    aad[1] = 0x03;
+    aad[2] = 0x03;
+    aad[3] = (ct_len >> 8) as u8;
+    aad[4] = ct_len as u8;
+
+    buf[plaintext_len] = content_type;
+    let data_len = plaintext_len + 1;
+
+    let nonce = keys.nonce();
+    if !keys.advance_seq() {
+        return 0;
+    }
+
+    match suite {
+        CipherSuite::ChaCha20Poly1305 => {
+            let mut key = [0u8; 32];
+            // SAFETY: keys.key is a 32-byte array; copying fixed length.
+            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
+            let tag = chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut buf[..data_len]);
+            // SAFETY: bounds check at function entry guarantees data_len + 16 ≤ buf.len().
+            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16); }
+            zeroize(&mut key);
+        }
+        CipherSuite::Aes128Gcm => {
+            let mut key = [0u8; 16];
+            // SAFETY: keys.key holds the AES-128-GCM key in its first 16 bytes.
+            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16); }
+            let gcm = AesGcm::new_128(&key);
+            let tag = gcm.encrypt(&nonce, &aad, &mut buf[..data_len]);
+            // SAFETY: bounds check at function entry guarantees data_len + 16 ≤ buf.len().
+            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16); }
+            zeroize(&mut key);
+        }
+        CipherSuite::Aes256Gcm => {
+            let mut key = [0u8; 32];
+            // SAFETY: keys.key is a 32-byte array.
+            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
+            let gcm = AesGcm::new_256(&key);
+            let tag = gcm.encrypt(&nonce, &aad, &mut buf[..data_len]);
+            // SAFETY: bounds check at function entry guarantees data_len + 16 ≤ buf.len().
+            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16); }
+            zeroize(&mut key);
+        }
+    }
+
+    ct_len
+}
+
 /// Encrypt a TLS 1.3 record in-place.
 /// `plaintext` is the data to encrypt. `content_type` is the inner type.
 /// On return, `out_buf` contains: encrypted_data + content_type + tag

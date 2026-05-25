@@ -279,6 +279,10 @@ pub(crate) struct ConnSlot {
     pub(crate) recv_parsed: u8,
     pub(crate) req_path_len: u8,
     pub(crate) peer_closed: u8,
+    /// Keep-alive for the current request. Derived in
+    /// `Phase::RecvRequest` from the version + `Connection:` header,
+    /// consumed by `finish_response`. Cleared in `free_slot`.
+    pub(crate) keepalive: u8,
     /// Set to 1 when the matched route uses
     /// `HANDLER_WEBSOCKET_FANOUT` and the upgrade succeeded.
     pub(crate) ws_fan_out: u8,
@@ -295,6 +299,9 @@ pub(crate) struct ConnSlot {
     pub(crate) cache_retained: u8,
 
     pub(crate) recv_len: u16,
+    /// Offset in `recv_buf` of the first byte after `\r\n\r\n` (or
+    /// the start of the next pipelined request). 0 before parse.
+    pub(crate) header_end_off: u16,
     pub(crate) send_offset: u16,
     pub(crate) send_len: u16,
     pub(crate) file_index: i16,
@@ -1465,12 +1472,24 @@ unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'static [u8] 
     }
 }
 
+/// Close-delimited response header (no Content-Length). Forces
+/// `Connection: close` and clears the slot's keepalive flag. For
+/// self-delimited responses use `build_header_with_len` /
+/// `build_header_fs_full` / `build_header_fs_partial` so keep-alive
+/// is preserved.
 unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type: &[u8]) {
-    let len = h1::write_status_line(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, status, content_type);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.keepalive = 0;
+    }
+    let len = h1::write_status_line(
+        cur_send_buf_mut_ptr(s),
+        SEND_BUF_SIZE,
+        status,
+        content_type,
+        false,
+    );
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_offset = 0;
-    }
-    if let Some(cur) = cur_slot_mut(s) {
         cur.send_len = len as u16;
     }
 }
@@ -1488,8 +1507,14 @@ unsafe fn build_header_with_len(
     // Write the standard status line (which terminates with \r\n\r\n)
     // then strip the trailing blank line, append the Content-Length
     // header, and re-terminate.
-    let mut off =
-        h1::write_status_line(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, status, content_type);
+    let keepalive = cur_slot(s).map(|c| c.keepalive != 0).unwrap_or(false);
+    let mut off = h1::write_status_line(
+        cur_send_buf_mut_ptr(s),
+        SEND_BUF_SIZE,
+        status,
+        content_type,
+        keepalive,
+    );
     if off >= 4 {
         off -= 4;
     }
@@ -1538,11 +1563,13 @@ unsafe fn build_header_with_len(
 }
 
 unsafe fn build_error(s: &mut HttpState, code: &[u8], body: &[u8]) {
+    // Error responses are close-delimited — keep wire + slot in sync.
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.keepalive = 0;
+    }
     let len = h1::write_error_response(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, code, body);
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_offset = 0;
-    }
-    if let Some(cur) = cur_slot_mut(s) {
         cur.send_len = len as u16;
     }
 }
@@ -1592,8 +1619,9 @@ unsafe fn build_header_fs_full(
     content_length: u32,
 ) {
     let cap = SEND_BUF_SIZE;
+    let keepalive = cur_slot(s).map(|c| c.keepalive != 0).unwrap_or(false);
     let dst = cur_send_buf_mut_ptr(s);
-    let mut off = h1::write_status_line(dst, cap, status, content_type);
+    let mut off = h1::write_status_line(dst, cap, status, content_type, keepalive);
     if off >= 4 {
         off -= 4; // strip the trailing \r\n\r\n; we'll re-add it.
     }
@@ -1623,8 +1651,9 @@ unsafe fn build_header_fs_partial(
     total: u32,
 ) {
     let cap = SEND_BUF_SIZE;
+    let keepalive = cur_slot(s).map(|c| c.keepalive != 0).unwrap_or(false);
     let dst = cur_send_buf_mut_ptr(s);
-    let mut off = h1::write_status_line(dst, cap, b"206 Partial Content", content_type);
+    let mut off = h1::write_status_line(dst, cap, b"206 Partial Content", content_type, keepalive);
     if off >= 4 {
         off -= 4;
     }
@@ -1649,10 +1678,12 @@ unsafe fn build_header_fs_partial(
 }
 
 /// 416 Range Not Satisfiable response: status line + `Content-Range:
-/// bytes */<total>` so the client learns the resource length even
-/// though it can't read the requested range. Body is the same short
-/// text payload as `build_error`.
+/// bytes */<total>` so the client learns the resource length.
 unsafe fn build_error_416(s: &mut HttpState, total: u32) {
+    // Close-delimited error — keep wire + slot in sync.
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.keepalive = 0;
+    }
     let cap = SEND_BUF_SIZE;
     let dst = cur_send_buf_mut_ptr(s);
     let mut off = put_bytes(
@@ -2952,6 +2983,53 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
 
 // ── Body-send phase helpers ───────────────────────────────────────────────
 
+/// Transition out of a fully-drained response. Honours the slot's
+/// `keepalive` flag: reuse the slot for the next request (compacting
+/// any pipelined bytes already in `recv_buf`) or close the
+/// connection.
+unsafe fn finish_response(s: &mut HttpState) {
+    let (keepalive, header_end_off, recv_len) = match cur_slot(s) {
+        Some(c) => (
+            c.keepalive != 0,
+            c.header_end_off as usize,
+            c.recv_len as usize,
+        ),
+        None => {
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::CloseConn;
+            }
+            return;
+        }
+    };
+    if !keepalive {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::CloseConn;
+        }
+        return;
+    }
+    // Compact any pipelined-request bytes to recv_buf[0..] so the
+    // next RecvRequest pass parses them without needing a fresh
+    // channel read.
+    let leftover = recv_len.saturating_sub(header_end_off);
+    if leftover > 0 {
+        let buf = cur_recv_buf_mut_ptr(s);
+        core::ptr::copy(buf.add(header_end_off), buf, leftover);
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.recv_len = leftover as u16;
+        cur.recv_parsed = 0;
+        cur.req_path_len = 0;
+        cur.matched_route = -1;
+        cur.header_end_off = 0;
+        cur.tmpl_pos = 0;
+        cur.send_offset = 0;
+        cur.send_len = 0;
+        // `keepalive` left untouched — re-derived from the next
+        // request's headers (clients may switch mid-session).
+        cur.phase = Phase::RecvRequest;
+    }
+}
+
 unsafe fn step_send_static(s: &mut HttpState) -> i32 {
     let cur_ptr = match cur_slot_mut(s) {
         Some(c) => c as *mut ConnSlot,
@@ -2963,9 +3041,7 @@ unsafe fn step_send_static(s: &mut HttpState) -> i32 {
     let pos = body_start + (*cur_ptr).tmpl_pos as usize;
 
     if pos >= body_end {
-        if let Some(cur) = cur_slot_mut(s) {
-            cur.phase = Phase::CloseConn;
-        }
+        finish_response(s);
         return 0;
     }
 
@@ -3121,9 +3197,9 @@ unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.fs_fd = -1;
             }
-            if let Some(cur) = cur_slot_mut(s) {
-                cur.phase = Phase::CloseConn;
-            }
+            // Self-delimited (Content-Length already emitted) — honour
+            // the client's keep-alive intent.
+            finish_response(s);
             return 0;
         }
         // Refill: streaming reads a full SEND_BUF; length-known caps
@@ -3694,7 +3770,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             if recv_parsed == 1 {
                 let ptr = cur_recv_buf_ptr(s);
                 let scan_len = cur_recv_len(s) as usize;
-                let mut found = false;
+                let mut found_at: Option<usize> = None;
                 if scan_len >= 4 {
                     let mut i = 0;
                     while i + 3 < scan_len {
@@ -3703,15 +3779,22 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             && *ptr.add(i + 2) == b'\r'
                             && *ptr.add(i + 3) == b'\n'
                         {
-                            found = true;
+                            found_at = Some(i);
                             break;
                         }
                         i += 1;
                     }
                 }
 
-                if found {
+                if let Some(crlf_pos) = found_at {
+                    // Pin keep-alive disposition before DispatchRoute
+                    // so every write_status_line sees the right flag.
+                    let head_len = crlf_pos + 4;
+                    let head = core::slice::from_raw_parts(ptr, head_len);
+                    let keepalive = h1::request_keeps_alive(head);
                     if let Some(cur) = cur_slot_mut(s) {
+                        cur.keepalive = if keepalive { 1 } else { 0 };
+                        cur.header_end_off = head_len as u16;
                         cur.phase = Phase::DispatchRoute;
                     }
                     return 2;
@@ -3753,6 +3836,11 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 && *req.add(3) == b'a'
                 && *req.add(4) == b'n'
             {
+                // Close-delimited (provider body ends at EOF) —
+                // keep wire + slot in sync.
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.keepalive = 0;
+                }
                 let buf = cur_send_buf_mut_ptr(s);
                 let cap = SEND_BUF_SIZE;
                 let mut off = 0usize;
@@ -3771,11 +3859,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.send_offset = 0;
-                }
-                if let Some(cur) = cur_slot_mut(s) {
                     cur.send_len = off as u16;
-                }
-                if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::DrainSend;
                 }
                 return 0;
@@ -3822,7 +3906,14 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             } else {
                                 &ct[..ct_len]
                             };
-                            build_header(s, b"200 OK", ct_slice);
+                            // Static → Content-Length + keep-alive.
+                            // Template → close-delimited.
+                            let body_len = r.body_len;
+                            if handler == HANDLER_STATIC {
+                                build_header_with_len(s, b"200 OK", ct_slice, body_len);
+                            } else {
+                                build_header(s, b"200 OK", ct_slice);
+                            }
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.tmpl_pos = 0;
                                 cur.cache_retained = 1;
@@ -3880,7 +3971,15 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         } else {
                             &ct[..ct_len]
                         };
-                        build_header(s, b"200 OK", ct_slice);
+                        // Static → fixed body_len, emit Content-Length
+                        // (enables keep-alive). Template → unknown
+                        // total, close-delimited.
+                        let body_len = route.body_len;
+                        if handler == HANDLER_STATIC {
+                            build_header_with_len(s, b"200 OK", ct_slice, body_len);
+                        } else {
+                            build_header(s, b"200 OK", ct_slice);
+                        }
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.tmpl_pos = 0;
                         }
@@ -4503,18 +4602,25 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             if st >= 0 {
                 let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]);
-                // `recv_buf` still holds the full request head — the
-                // HTTP/1 path never strips it between RecvRequest and
-                // AwaitFsStat, and `Connection: close` means there are
-                // no leftover bytes from a prior keep-alive request.
-                let (recv_ptr, recv_len) = match cur_slot(s) {
-                    Some(c) => (c.recv_buf as *const u8, c.recv_len as usize),
+                // In keep-alive mode recv_buf may also hold pipelined
+                // bytes from the next request; cap the Range scan at
+                // the current request's head so a follow-up `Range:`
+                // can't bleed into this request's framing decision.
+                let (recv_ptr, scan_len) = match cur_slot(s) {
+                    Some(c) => (
+                        c.recv_buf as *const u8,
+                        if c.header_end_off > 0 {
+                            (c.header_end_off as usize).min(c.recv_len as usize)
+                        } else {
+                            c.recv_len as usize
+                        },
+                    ),
                     None => (core::ptr::null::<u8>(), 0usize),
                 };
-                let range = if recv_ptr.is_null() || recv_len == 0 {
+                let range = if recv_ptr.is_null() || scan_len == 0 {
                     h1::RangeParse::None
                 } else {
-                    match ws::find_header_value(recv_ptr, recv_len, b"Range") {
+                    match ws::find_header_value(recv_ptr, scan_len, b"Range") {
                         Some((off, n)) => h1::parse_range_header(
                             core::slice::from_raw_parts(recv_ptr.add(off), n),
                             size,
@@ -4770,9 +4876,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.phase = Phase::CloseConn;
-                }
+                finish_response(s);
                 return 0;
             }
             let sent = net_send(
@@ -4842,6 +4946,8 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 let r = &mut *s.server.routes.as_mut_ptr().add(ri);
                 r.body_offset = ce.arena_offset;
                 r.body_len = ce.length;
+                let handler = r.handler;
+                let body_len = r.body_len;
                 let mut ct = [0u8; MAX_CONTENT_TYPE];
                 let ct_len = r.content_type_len as usize;
                 if ct_len > 0 && ct_len <= MAX_CONTENT_TYPE {
@@ -4852,12 +4958,17 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 } else {
                     &ct[..ct_len]
                 };
-                build_header(s, b"200 OK", ct_slice);
+                // Static bodies: Content-Length is known, so emit it
+                // and keep-alive is preserved. Templates render
+                // chunk-by-chunk with unknown total → close-delimited.
+                if handler == HANDLER_STATIC {
+                    build_header_with_len(s, b"200 OK", ct_slice, body_len);
+                } else {
+                    build_header(s, b"200 OK", ct_slice);
+                }
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.tmpl_pos = 0;
                     cur.cache_retained = 1;
-                }
-                if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::SendHeaders;
                 }
                 return 2;

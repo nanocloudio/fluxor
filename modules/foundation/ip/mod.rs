@@ -294,6 +294,12 @@ pub struct IpState {
     tlm: TlmCounters,
     /// One-line scratch for the tlm emit, sized at `TLM_LINE_BUF_SIZE`.
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
+
+    /// Lifetime duplicate SYNs received for a slot already in
+    /// `SynReceived`. Non-zero means the peer retransmitted SYN —
+    /// our SYN-ACK didn't reach the peer (rig→peer loss, not
+    /// peer→rig). Emitted on the `[ip] hb` line.
+    tcp_dup_syn_rx: u32,
 }
 
 /// Cadence for the `[ip] tlm` line — every 5000 module steps.
@@ -1057,6 +1063,26 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         );
     }
 
+    // `[ip] hb …` — counters that don't fit dev_tlm_maybe_emit's
+    // fixed shape. Same cadence as `[ip] tlm`.
+    if s.step_count.is_multiple_of(IP_TLM_PERIOD) {
+        let sys = &*s.syscalls;
+        let buf = s.tlm_scratch.as_mut_ptr();
+        let buf_max = s.tlm_scratch.len();
+        let mut pos = 0usize;
+        let emit = |bytes: &[u8], pos: &mut usize| {
+            let mut k = 0;
+            while k < bytes.len() && *pos < buf_max {
+                *buf.add(*pos) = bytes[k];
+                *pos += 1;
+                k += 1;
+            }
+        };
+        emit(b"[ip] hb dupSYN=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_dup_syn_rx, buf.add(pos));
+        dev_log(sys, 3, buf, pos);
+    }
+
     // Signal Ready once IP is configured (DHCP bound or static)
     if s.ip_configured && !s.signaled_ready {
         s.signaled_ready = true;
@@ -1450,6 +1476,7 @@ unsafe fn process_tcp_segment(
                     if accept_idx < 0 {
                         // No free slot — drop the SYN silently and let
                         // the client retransmit.
+                        log_info(s, b"[ip] tcp syn DROP no_slot");
                         return;
                     }
                     log_info(s, b"[ip] tcp syn received");
@@ -1640,7 +1667,10 @@ unsafe fn process_tcp_segment(
                     // is on a separate slot and stays put.
                     action = ACTION_FREE_SLOT;
                 } else if (tcp_hdr.flags & tcp::SYN) != 0 && (tcp_hdr.flags & tcp::ACK) == 0 {
-                    // Duplicate SYN — retransmit SYN-ACK
+                    // Duplicate SYN — our prior SYN-ACK didn't reach
+                    // the peer. Retransmit; count for the `[ip] hb`
+                    // `dupSYN=N` line.
+                    s.tcp_dup_syn_rx = s.tcp_dup_syn_rx.wrapping_add(1);
                     conn.retransmit_timer = 0;
                     action = ACTION_RETRANSMIT_SYNACK;
                 } else if (tcp_hdr.flags & tcp::ACK) != 0 {
@@ -2934,11 +2964,11 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
             }
             tcp::TcpState::TimeWait => {
                 conn.timewait_timer += 1;
-                // Exit time-wait after ~30 seconds, but only if the
-                // outbound MSG_CLOSED can be delivered or queued —
-                // losing the close event would strand any consumer
-                // state machine waiting for it.
-                if conn.timewait_timer > 600 {
+                // Exit after ~2 s (40 × 50 ms). Long enough to cover
+                // stray retransmits, short enough to avoid slot
+                // exhaustion from a single peer at >8 hps. Held until
+                // MSG_CLOSED can be delivered so consumers don't strand.
+                if conn.timewait_timer > 40 {
                     let remote_ip = conn.remote_ip;
                     if net_send_closed(s, i as u8) {
                         if remote_ip != 0 {

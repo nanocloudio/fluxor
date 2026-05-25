@@ -51,6 +51,15 @@ pub struct HandshakeDriver {
     pub peer_key_share: [u8; 65],
     pub peer_key_share_len: u8,
 
+    /// Resumable ECDSA signing for the server CertificateVerify;
+    /// driven across ticks by `ecdh_bits_per_step` so concurrent
+    /// handshakes don't stall on the P-256 ladder.
+    pub ecdsa_sign_state: EcdsaSignState,
+    /// Hash retained across the multi-tick signer; cleared once
+    /// the signature is finalised.
+    pub cert_verify_hash: [u8; 32],
+    pub cert_verify_hash_ready: u8,
+
     pub peer_cert_pubkey: [u8; 65],
     pub peer_cert_pubkey_len: u8,
     pub peer_session_id: [u8; 32],
@@ -101,6 +110,9 @@ impl HandshakeDriver {
             ecdh_state: ScalarMulState::empty(),
             peer_key_share: [0; 65],
             peer_key_share_len: 0,
+            ecdsa_sign_state: EcdsaSignState::empty(),
+            cert_verify_hash: [0; 32],
+            cert_verify_hash_ready: 0,
             peer_cert_pubkey: [0; 65],
             peer_cert_pubkey_len: 0,
             peer_session_id: [0; 32],
@@ -140,6 +152,13 @@ impl HandshakeDriver {
         self.out_len = 0;
         self.ecdh_state.zeroise_scalar();
         self.ecdh_state = ScalarMulState::empty();
+        self.ecdsa_sign_state.zeroise_secrets();
+        self.ecdsa_sign_state = EcdsaSignState::empty();
+        for byte in &mut self.cert_verify_hash {
+            // SAFETY: volatile write to a bounded array slot.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        self.cert_verify_hash_ready = 0;
         self.key_schedule = None;
         self.transcript = None;
     }

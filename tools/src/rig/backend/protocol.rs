@@ -51,9 +51,14 @@ pub struct BackendContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BindingValue {
+    // Order matters for `#[serde(untagged)]`: serde tries variants in
+    // declaration order, so `Bool` and `Int` must precede `Float` —
+    // otherwise a JSON literal like `5` deserializes as `Float(5.0)`
+    // instead of `Int(5)` and `true` deserializes as a non-Bool.
     String(String),
-    Int(i64),
     Bool(bool),
+    Int(i64),
+    Float(f64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

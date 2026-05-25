@@ -93,6 +93,7 @@ pub struct GuardState {
     passed: u32,
     dropped_syn: u32,
     dropped_full: u32,
+    step_count: u32,
 
     /// Frame staging buffer (length-prefix + frame). Kept in state rather
     /// than on the stack so `module_step` has a tiny frame.
@@ -276,6 +277,28 @@ pub extern "C" fn module_new(
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut GuardState);
     let sys = &*s.syscalls;
+
+    s.step_count = s.step_count.wrapping_add(1);
+    // `[guard] pass=...` heartbeat — same cadence as other foundation
+    // modules. `drop_full` non-zero ⇒ IP not draining; `drop_syn`
+    // non-zero ⇒ SYN-rate fuse tripping.
+    if s.step_count.is_multiple_of(50_000) {
+        let mut msg = [0u8; 96];
+        let p = msg.as_mut_ptr();
+        let prefix = b"[guard] pass=";
+        core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
+        let mut pos = prefix.len();
+        pos += fmt_u32_dec(s.passed, p.add(pos));
+        let f2 = b" drop_syn=";
+        core::ptr::copy_nonoverlapping(f2.as_ptr(), p.add(pos), f2.len());
+        pos += f2.len();
+        pos += fmt_u32_dec(s.dropped_syn, p.add(pos));
+        let f3 = b" drop_full=";
+        core::ptr::copy_nonoverlapping(f3.as_ptr(), p.add(pos), f3.len());
+        pos += f3.len();
+        pos += fmt_u32_dec(s.dropped_full, p.add(pos));
+        dev_log(sys, 3, p, pos);
+    }
 
     if s.in_chan < 0 || s.out_chan < 0 { return 0; }
 

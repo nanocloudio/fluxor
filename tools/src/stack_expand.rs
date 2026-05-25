@@ -245,26 +245,76 @@ pub fn expand_platform_stacks(
     // file is fine; `|required` catches gaps at injection time.
     let host = load_host_config()?;
 
+    // Two-pass expansion. Pass 1 injects every stack's MODULES; we
+    // accumulate `globally_skipped` across all passes. Pass 2 — once
+    // every module that will exist has been added — injects every
+    // stack's WIRING with full knowledge of which names were dropped
+    // (and therefore which wires must be dropped along with them).
+    //
+    // Why split: `platform_map` iterates alphabetically (serde_json
+    // is a BTreeMap), so `debug` runs before `net`. If we did
+    // modules+wiring in one pass per stack, debug would add wires
+    // referencing `ip` before net had a chance to add (or skip) it,
+    // and the cross-stack dedup case (e.g. multilane skipping ip via
+    // type-collision with ip_0/ip_1) would never propagate to debug's
+    // wires. The single-pass design was the source of the multilane
+    // dangling-wire bug.
+    let mut globally_skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Resolve each stack file + matching variants/overlays up front
+    // so both passes iterate the same set in the same order.
+    struct Resolved {
+        stack_file: StackFile,
+        merged: HashMap<String, String>,
+    }
+    let mut resolved: Vec<Resolved> = Vec::with_capacity(platform_map.len());
     for (stack_name, user_fields) in &platform_map {
         let stack_file = load_stack(stack_name, project_root)?;
         let merged = merge_with_board_defaults(user_fields, stack_name, target);
+        resolved.push(Resolved { stack_file, merged });
+    }
 
-        // Variants are exclusive: pick exactly one by specificity score.
-        if !stack_file.variant.is_empty() {
-            let variant = select_variant(&stack_file, &merged)?;
-            let added = inject_injection(config, variant, &merged, &host, &stack_file.stack)?;
+    // ── Pass 1: modules only ──
+    for r in &resolved {
+        if !r.stack_file.variant.is_empty() {
+            let variant = select_variant(&r.stack_file, &r.merged)?;
+            let added = inject_modules(
+                config,
+                variant,
+                &r.merged,
+                &host,
+                &r.stack_file.stack,
+                &mut globally_skipped,
+            )?;
             auto_added.extend(added);
         }
-
-        // Overlays are additive: every overlay whose match predicate holds
-        // is applied on top of the variant. Deduplication by module name and
-        // edge-key already handles repeated application.
-        for overlay in &stack_file.overlay {
-            if !injection_matches(&overlay.match_keys, &merged) {
+        for overlay in &r.stack_file.overlay {
+            if !injection_matches(&overlay.match_keys, &r.merged) {
                 continue;
             }
-            let added = inject_injection(config, overlay, &merged, &host, &stack_file.stack)?;
+            let added = inject_modules(
+                config,
+                overlay,
+                &r.merged,
+                &host,
+                &r.stack_file.stack,
+                &mut globally_skipped,
+            )?;
             auto_added.extend(added);
+        }
+    }
+
+    // ── Pass 2: wiring + services ──
+    for r in &resolved {
+        if !r.stack_file.variant.is_empty() {
+            let variant = select_variant(&r.stack_file, &r.merged)?;
+            inject_wiring_and_services(config, variant, &r.stack_file.stack, &globally_skipped)?;
+        }
+        for overlay in &r.stack_file.overlay {
+            if !injection_matches(&overlay.match_keys, &r.merged) {
+                continue;
+            }
+            inject_wiring_and_services(config, overlay, &r.stack_file.stack, &globally_skipped)?;
         }
     }
 
@@ -491,17 +541,55 @@ fn injection_matches(
 // Injection
 // ============================================================================
 
+/// Single-shot injection (modules + wiring + services). Convenience
+/// wrapper used by tests: runs `inject_modules` then immediately
+/// `inject_wiring_and_services` against the same skip set. The real
+/// expansion path in [`expand_platform_stacks`] interleaves the two
+/// passes across stacks instead, so a later stack's wiring sees
+/// modules an earlier stack hasn't added yet — but for single-stack
+/// unit tests this shim has identical semantics.
+#[cfg(test)]
 fn inject_injection(
     config: &mut Value,
     variant: &StackInjection,
     merged: &HashMap<String, String>,
     host: &HostConfig,
     stack_meta: &StackMeta,
+    globally_skipped: &mut std::collections::HashSet<String>,
+) -> Result<Vec<String>> {
+    let added = inject_modules(config, variant, merged, host, stack_meta, globally_skipped)?;
+    inject_wiring_and_services(config, variant, stack_meta, globally_skipped)?;
+    Ok(added)
+}
+
+/// Pass 1 of stack expansion: inject only this stack's modules.
+/// Returns the names of modules actually added (after name and type
+/// dedup). Skipped names go into `globally_skipped` so pass 2 wiring
+/// dedup can recognize them across stack boundaries.
+fn inject_modules(
+    config: &mut Value,
+    variant: &StackInjection,
+    merged: &HashMap<String, String>,
+    host: &HostConfig,
+    _stack_meta: &StackMeta,
+    globally_skipped: &mut std::collections::HashSet<String>,
 ) -> Result<Vec<String>> {
     let mut added = Vec::new();
 
-    // Collect existing module names for dedup
+    // Collect existing module names + types for dedup. Two distinct
+    // dedup paths:
+    //   * **by name** — the original behavior. A user yaml that re-
+    //     declares a stack-named module overrides the default.
+    //   * **by type** — when a stack module's effective type matches
+    //     an existing user module's effective type (e.g. stack wants
+    //     `{name:"ip", type:"ip"}` and the user has `ip_0`/`ip_1` with
+    //     `type:ip`), skip the stack module. Catches the multilane-
+    //     HTTPS shape where the user wants per-lane IP stacks driven
+    //     by a custom demux and the auto-`ip` would otherwise be
+    //     added unwired downstream. Wiring referring to the skipped
+    //     name is dropped in pass 2 via `globally_skipped`.
     let existing = collect_module_names(config);
+    let existing_types = collect_existing_types(config);
 
     // Ensure arrays exist
     if config.get("modules").is_none() {
@@ -511,10 +599,36 @@ fn inject_injection(
         config["wiring"] = json!([]);
     }
 
-    // Inject modules (prepend for lower IDs → earlier instantiation)
+    // Inject modules (prepend for lower IDs → earlier instantiation).
+    //
+    // `globally_skipped` is the per-expansion accumulator threaded
+    // through every stack injection so a later stack can recognize
+    // names an earlier stack dropped. The wiring loop below drops any
+    // edge whose endpoint references one of these names.
     let mut to_prepend = Vec::new();
     for sm in &variant.modules {
         if existing.contains(&sm.name) {
+            // Name-based dedup. The user re-declared the stack's
+            // module (same name) — their declaration wins; the stack
+            // wiring still applies since the name is still valid.
+            continue;
+        }
+        // Effective type = explicit `type:` if set, else module name.
+        // Matches how the kernel config-gen path computes a module's
+        // implementation selector.
+        let effective_type = sm.type_name.as_deref().unwrap_or(&sm.name);
+        if existing_types.iter().any(|t| t == effective_type) {
+            // Type-based dedup. Some existing module already provides
+            // this implementation; injecting another would create two
+            // independent instances (e.g. parallel IP stacks) — almost
+            // never what the user wants. Log the skip so it's obvious
+            // why a stack-default module didn't appear in the final
+            // graph, then suppress the module's wiring too.
+            eprintln!(
+                "stack expansion: skipped module '{}' (type='{}') — existing module(s) already provide this type; wiring referencing '{}' will be dropped",
+                sm.name, effective_type, sm.name,
+            );
+            globally_skipped.insert(sm.name.clone());
             continue;
         }
 
@@ -561,11 +675,43 @@ fn inject_injection(
         }
     }
 
-    // Inject wiring (prepend, dedup)
+    Ok(added)
+}
+
+/// Pass 2 of stack expansion: add this stack's wiring + services. By
+/// the time this runs every other stack's modules are already in
+/// `config["modules"]` and `globally_skipped` is complete, so wires
+/// whose endpoint was deduped away in pass 1 (by any stack) get
+/// dropped here with a stderr note. Wires whose endpoint truly doesn't
+/// exist anywhere fall through to structural validation, which owns
+/// the file:line diagnostic for those.
+fn inject_wiring_and_services(
+    config: &mut Value,
+    variant: &StackInjection,
+    stack_meta: &StackMeta,
+    globally_skipped: &std::collections::HashSet<String>,
+) -> Result<()> {
+    if config.get("wiring").is_none() {
+        config["wiring"] = json!([]);
+    }
     let existing_edges = collect_existing_edges(config);
     let mut wiring_prepend = Vec::new();
     for edge_str in &variant.wiring {
         let (from, to) = parse_edge_str(edge_str)?;
+        let from_mod = endpoint_module(&from);
+        let to_mod = endpoint_module(&to);
+        if globally_skipped.contains(from_mod) {
+            eprintln!(
+                "stack expansion: dropped wiring '{edge_str}' — `from` module '{from_mod}' was skipped by earlier dedup",
+            );
+            continue;
+        }
+        if globally_skipped.contains(to_mod) {
+            eprintln!(
+                "stack expansion: dropped wiring '{edge_str}' — `to` module '{to_mod}' was skipped by earlier dedup",
+            );
+            continue;
+        }
         let key = format!("{from}->{to}");
         if !existing_edges.contains(&key) {
             wiring_prepend.push(json!({"from": from, "to": to}));
@@ -596,7 +742,7 @@ fn inject_injection(
         }
     }
 
-    Ok(added)
+    Ok(())
 }
 
 // ============================================================================
@@ -614,6 +760,36 @@ fn collect_module_names(config: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Collect each existing module's effective type — `type:` field when
+/// present, otherwise the module's `name:`. Used by stack expansion to
+/// skip a stack-default module when the user already supplied one with
+/// the same implementation (e.g. two `type:ip` modules + the stack
+/// would have added a third).
+fn collect_existing_types(config: &Value) -> Vec<String> {
+    config
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    e.get("type")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| e.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract the module name from a wiring endpoint string. `"foo.bar"`
+/// returns `"foo"`; a malformed endpoint with no `.` returns the
+/// whole string (the wiring would fail validation elsewhere anyway —
+/// this fallback just keeps the dedup loop infallible).
+fn endpoint_module(endpoint: &str) -> &str {
+    endpoint.split('.').next().unwrap_or(endpoint)
 }
 
 fn collect_existing_edges(config: &Value) -> Vec<String> {
@@ -640,4 +816,386 @@ fn parse_edge_str(s: &str) -> Result<(String, String)> {
         )));
     }
     Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_injection(modules: Vec<StackModule>, wiring: Vec<&str>) -> StackInjection {
+        StackInjection {
+            match_keys: HashMap::new(),
+            modules,
+            wiring: wiring.into_iter().map(String::from).collect(),
+            service: None,
+        }
+    }
+
+    fn make_module(name: &str, type_name: Option<&str>) -> StackModule {
+        StackModule {
+            name: name.to_string(),
+            type_name: type_name.map(String::from),
+            params: HashMap::new(),
+        }
+    }
+
+    fn empty_meta() -> StackMeta {
+        StackMeta {
+            name: "test".to_string(),
+            provides: None,
+        }
+    }
+
+    fn dummy_host() -> HostConfig {
+        toml::Value::Table(toml::value::Table::new())
+    }
+
+    /// Modules in the resulting config — name + type pairs, in graph
+    /// order. Type is `null` when the entry has no explicit `type:`
+    /// (kernel config-gen defaults it to name).
+    fn module_pairs(config: &Value) -> Vec<(String, Option<String>)> {
+        config
+            .get("modules")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        let name = e.get("name").and_then(|n| n.as_str())?;
+                        let ty = e.get("type").and_then(|t| t.as_str()).map(String::from);
+                        Some((name.to_string(), ty))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn edge_strings(config: &Value) -> Vec<String> {
+        collect_existing_edges(config)
+    }
+
+    /// Original name-based dedup: stack module whose name matches an
+    /// existing user module is silently skipped. The user's version
+    /// wins. Stack wiring referencing that name is still applied —
+    /// the name is valid, the module exists post-injection.
+    #[test]
+    fn name_collision_skips_module_but_keeps_wiring() {
+        let mut config = json!({
+            "modules": [{ "name": "ip", "use_dhcp": "1" }],
+            "wiring": [],
+        });
+        let injection = make_injection(
+            vec![
+                make_module("rp1_gem", None),
+                make_module("conn_guard", None),
+                make_module("ip", Some("ip")),
+            ],
+            vec![
+                "rp1_gem.frames_rx -> conn_guard.frames_rx",
+                "conn_guard.frames_tx -> ip.frames_rx",
+            ],
+        );
+        let mut globally_skipped = std::collections::HashSet::new();
+        let added = inject_injection(
+            &mut config,
+            &injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        assert_eq!(added, vec!["rp1_gem", "conn_guard"]);
+        let pairs = module_pairs(&config);
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["rp1_gem", "conn_guard", "ip"]);
+        // Wiring stays — the user's `ip` is still a valid endpoint.
+        let edges = edge_strings(&config);
+        assert!(edges.contains(&"rp1_gem.frames_rx->conn_guard.frames_rx".to_string()));
+        assert!(edges.contains(&"conn_guard.frames_tx->ip.frames_rx".to_string()));
+    }
+
+    /// Type-based dedup: the user has `ip_0` with explicit `type:ip`,
+    /// and the stack wants to add a generic `{name:"ip", type:"ip"}`.
+    /// Same implementation type already present — skip both the
+    /// module AND any wiring that points to the auto-name. This is
+    /// the multilane-HTTPS shape.
+    #[test]
+    fn type_collision_skips_module_and_referencing_wiring() {
+        let mut config = json!({
+            "modules": [
+                { "name": "ip_0", "type": "ip" },
+                { "name": "ip_1", "type": "ip" },
+                { "name": "demux" },
+            ],
+            "wiring": [
+                { "from": "rp1_gem.frames_rx", "to": "demux.frames_rx" },
+            ],
+        });
+        let injection = make_injection(
+            vec![
+                make_module("rp1_gem", None),
+                make_module("conn_guard", None),
+                make_module("ip", Some("ip")),
+            ],
+            vec![
+                "rp1_gem.frames_rx -> conn_guard.frames_rx",
+                "conn_guard.frames_tx -> ip.frames_rx",
+                "ip.frames_tx -> rp1_gem.frames_tx",
+            ],
+        );
+        let mut globally_skipped = std::collections::HashSet::new();
+        let added = inject_injection(
+            &mut config,
+            &injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        assert_eq!(
+            added,
+            vec!["rp1_gem", "conn_guard"],
+            "rp1_gem + conn_guard added, ip dropped via type dedup"
+        );
+        let pairs = module_pairs(&config);
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"ip"),
+            "auto-`ip` should be absent — type collision with ip_0/ip_1"
+        );
+        // The two wires that *reference* the dropped `ip` are dropped.
+        // The pure conn_guard wire stays.
+        let edges = edge_strings(&config);
+        assert!(
+            edges.contains(&"rp1_gem.frames_rx->conn_guard.frames_rx".to_string()),
+            "conn_guard wiring should remain — both endpoints exist"
+        );
+        assert!(
+            !edges.contains(&"conn_guard.frames_tx->ip.frames_rx".to_string()),
+            "wiring to dropped ip must be skipped — would dangle otherwise"
+        );
+        assert!(
+            !edges.contains(&"ip.frames_tx->rp1_gem.frames_tx".to_string()),
+            "wiring from dropped ip must be skipped"
+        );
+    }
+
+    /// Effective-type fallback: the user's module declared with just
+    /// `name:` (no explicit `type:`) still de-dupes a stack module
+    /// of the same name when matched by type (since type-when-absent
+    /// = name).
+    #[test]
+    fn implicit_type_via_name_still_blocks_duplicate() {
+        let mut config = json!({
+            "modules": [{ "name": "ip" }],   // no explicit type; effective type = "ip"
+            "wiring": [],
+        });
+        let injection = make_injection(
+            vec![make_module("ip", Some("ip"))],
+            vec!["conn_guard.frames_tx -> ip.frames_rx"],
+        );
+        let mut globally_skipped = std::collections::HashSet::new();
+        let added = inject_injection(
+            &mut config,
+            &injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        // Name path catches this before type path, but the result is
+        // the same — the auto-`ip` is not added a second time.
+        assert!(added.is_empty(), "no new modules — collision handled");
+        let pairs = module_pairs(&config);
+        assert_eq!(pairs.len(), 1, "still exactly one ip module");
+    }
+
+    /// No collision → stack module is added and its wiring lands.
+    /// Sanity check that the dedup paths don't reject normal usage.
+    #[test]
+    fn no_collision_adds_module_and_wiring() {
+        let mut config = json!({
+            "modules": [{ "name": "tls" }],
+            "wiring": [],
+        });
+        let injection = make_injection(
+            vec![make_module("ip", Some("ip"))],
+            vec!["ip.net_out -> tls.cipher_in"],
+        );
+        let mut globally_skipped = std::collections::HashSet::new();
+        let added = inject_injection(
+            &mut config,
+            &injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        assert_eq!(added, vec!["ip"]);
+        let pairs = module_pairs(&config);
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"ip"));
+        assert!(names.contains(&"tls"));
+        let edges = edge_strings(&config);
+        assert!(edges.contains(&"ip.net_out->tls.cipher_in".to_string()));
+    }
+
+    /// Cross-stack dangling wire: an earlier stack dropped `ip` via
+    /// type dedup; a later stack's wiring references that name and
+    /// must be dropped too via the shared `globally_skipped` set.
+    /// Models the multilane HTTPS flow: `net` runs first, skips `ip`
+    /// because `ip_0`/`ip_1` are present; `debug` runs second and
+    /// would otherwise wire `log_net <-> ip`.
+    #[test]
+    fn cross_stack_dangling_wire_is_dropped() {
+        let mut config = json!({
+            "modules": [
+                { "name": "ip_0", "type": "ip" },
+                { "name": "ip_1", "type": "ip" },
+            ],
+            "wiring": [],
+        });
+        let mut globally_skipped = std::collections::HashSet::new();
+
+        // Stack #1 ("net"): tries to add ip; skipped by type dedup.
+        let net_injection = make_injection(
+            vec![make_module("ip", Some("ip"))],
+            vec!["conn_guard.frames_tx -> ip.frames_rx"],
+        );
+        inject_injection(
+            &mut config,
+            &net_injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        assert!(
+            globally_skipped.contains("ip"),
+            "first stack should record 'ip' as skipped"
+        );
+
+        // Stack #2 ("debug"): adds log_net + tries to wire it to `ip`.
+        // The wires must be dropped because `ip` is in globally_skipped.
+        let debug_injection = make_injection(
+            vec![make_module("log_net", None)],
+            vec![
+                "ip.net_out -> log_net.net_in",
+                "log_net.net_out -> ip.net_in",
+            ],
+        );
+        let added = inject_injection(
+            &mut config,
+            &debug_injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        assert_eq!(added, vec!["log_net"], "log_net is still added");
+        let edges = edge_strings(&config);
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.contains("ip.net_out") || e.contains("ip.net_in")),
+            "wires referencing dropped `ip` must be skipped; got: {edges:?}"
+        );
+    }
+
+    /// Inverse of the dangling case: a stack adds wiring referencing
+    /// a module another stack will add *later* in the same expansion.
+    /// Stacks process in alphabetical order, so `debug` runs before
+    /// `net` — debug's `log_net <-> ip` wiring must survive until
+    /// `net` injects `ip`. Single-lane HTTPS depends on this. With no
+    /// type collisions, `globally_skipped` is empty and the wire
+    /// remains in the graph.
+    #[test]
+    fn forward_reference_wiring_is_kept_when_target_added_later() {
+        let mut config = json!({ "modules": [], "wiring": [] });
+        let mut globally_skipped = std::collections::HashSet::new();
+
+        // Stack #1 ("debug" — alphabetically first): adds log_net and
+        // wires to `ip` which doesn't exist yet.
+        let debug_injection = make_injection(
+            vec![make_module("log_net", None)],
+            vec![
+                "ip.net_out -> log_net.net_in",
+                "log_net.net_out -> ip.net_in",
+            ],
+        );
+        inject_injection(
+            &mut config,
+            &debug_injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        let edges_after_debug = edge_strings(&config);
+        assert!(
+            edges_after_debug
+                .iter()
+                .any(|e| e == "ip.net_out->log_net.net_in"),
+            "forward-referenced wire must survive — net stack will add ip next"
+        );
+
+        // Stack #2 ("net"): adds rp1_gem + conn_guard + ip.
+        let net_injection = make_injection(
+            vec![
+                make_module("rp1_gem", None),
+                make_module("conn_guard", None),
+                make_module("ip", Some("ip")),
+            ],
+            vec![],
+        );
+        inject_injection(
+            &mut config,
+            &net_injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        let pairs = module_pairs(&config);
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"ip"));
+        assert!(names.contains(&"log_net"));
+        assert!(
+            edge_strings(&config)
+                .iter()
+                .any(|e| e == "ip.net_out->log_net.net_in"),
+            "wire must still be present after net adds ip"
+        );
+    }
+
+    #[test]
+    fn endpoint_module_extracts_name_before_dot() {
+        assert_eq!(endpoint_module("ip.frames_rx"), "ip");
+        assert_eq!(endpoint_module("conn_guard.frames_tx"), "conn_guard");
+        // Malformed (no dot) — return whole string. The wiring would
+        // fail later validation; the dedup loop just needs to not panic.
+        assert_eq!(endpoint_module("noport"), "noport");
+        // Empty endpoint — split returns one empty piece; preserved.
+        assert_eq!(endpoint_module(""), "");
+    }
+
+    #[test]
+    fn collect_existing_types_uses_explicit_type_or_falls_back_to_name() {
+        let config = json!({
+            "modules": [
+                { "name": "ip_0", "type": "ip" },
+                { "name": "tls" },
+                { "name": "lane_a", "type": "http" },
+            ],
+        });
+        let types = collect_existing_types(&config);
+        assert_eq!(types, vec!["ip", "tls", "http"]);
+    }
 }

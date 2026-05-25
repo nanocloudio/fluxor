@@ -181,8 +181,16 @@ tools:
 # Symlink rig backend executables into the discovery path used by
 # `fluxor rig …`. Run after `make tools`.
 RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
-RIG_BACKENDS    := telemetry-monitor_udp
-install-rig-backends: tools
+RIG_BACKENDS    := telemetry-monitor_udp observe-https_load
+
+# `observe-https_load` is feature-gated (pulls tokio + reqwest + rustls)
+# so plain `make tools` doesn't carry async-HTTPS deps. Build it
+# explicitly here so `install-rig-backends` finds it on the symlink path.
+loadgen-backend:
+	$(CARGO) build --release -p fluxor-tools --bin observe-https_load \
+		--features observe-https-load --target aarch64-unknown-linux-gnu
+
+install-rig-backends: tools loadgen-backend
 	@mkdir -p $(RIG_BACKEND_DIR)
 	@for b in $(RIG_BACKENDS); do \
 		src=$(CURDIR)/target/aarch64-unknown-linux-gnu/release/$$b; \

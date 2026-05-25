@@ -7,7 +7,8 @@ define_params! {
     1, rate_table_size, u8, MAX_TABLE as u32
         => |s, d, len| {
             let v = p_u8(d, len, 0, MAX_TABLE as u8);
-            s.rate_table_size = if v == 0 { 1 } else if v as usize > MAX_TABLE { MAX_TABLE as u8 } else { v };
+            // 0 disables rate limiting (`admit_syn` short-circuits).
+            s.rate_table_size = if v as usize > MAX_TABLE { MAX_TABLE as u8 } else { v };
         };
 
     2, rate_limit_per_ip, u8, 16

@@ -36,6 +36,14 @@ pub struct Plan {
     /// the run log may still be added by the orchestrator).
     pub consoles: Vec<AdapterSelection>,
     pub telemetry: Option<AdapterSelection>,
+    /// Transport-style observe.* adapters resolved for this run.
+    /// `observe.netboot_fetch` is excluded — that capability is produced
+    /// by the deploy backend's `watch` verb, not a transport of its own.
+    /// All other observe.* capabilities named in scenario rules or
+    /// `requires` resolve to one entry here and become a long-running
+    /// transport (e.g. `observe-https_load` driving a load probe and
+    /// emitting NDJSON bytes the matcher evaluates).
+    pub observe_transports: Vec<AdapterSelection>,
     pub power: Option<PowerSelection>,
     /// Power verbs the orchestrator will invoke (in order) against the
     /// power backend. Derived from `scenario.requires`: `power.cycle`
@@ -122,6 +130,7 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
 
     let deploy = pick_deploy(scenario, board, profile)?;
     let consoles = pick_consoles(scenario, board, profile)?;
+    let observe_transports = pick_observe_transports(scenario, board, profile)?;
     let telemetry = pick_single_surface(
         Surface::Telemetry,
         &board.telemetry,
@@ -180,6 +189,7 @@ pub fn build_plan(inputs: PlanInputs<'_>) -> Result<Plan> {
         deploy,
         consoles,
         telemetry,
+        observe_transports,
         power,
         power_actions,
         power_required,
@@ -322,6 +332,63 @@ fn pick_deploy(
 /// If the scenario names nothing console-specific, fall back to the
 /// board's preferred console so the orchestrator can still capture a
 /// `console.log` for diagnostics.
+/// Resolve transport-style observe.* adapters required by the scenario.
+///
+/// `observe.netboot_fetch` is excluded — it's emitted by the deploy
+/// backend's `watch` verb, not a transport of its own. Every other
+/// observe.* capability mentioned in `scenario.requires` or in a rule
+/// `source` must be declared by the board AND bound in the profile,
+/// otherwise plan resolution fails (matching how console + telemetry
+/// are validated).
+fn pick_observe_transports(
+    scenario: &Scenario,
+    board: &BoardRig,
+    profile: &RigProfile,
+) -> Result<Vec<AdapterSelection>> {
+    let mut wanted: Vec<Capability> = Vec::new();
+    let is_transport_observe = |cap: &Capability| -> bool {
+        cap.surface() == Surface::Observe && cap.as_str() != "observe.netboot_fetch"
+    };
+    for cap in &scenario.requires {
+        if is_transport_observe(cap) && !wanted.contains(cap) {
+            wanted.push(*cap);
+        }
+    }
+    for rule in scenario.pass.iter().chain(scenario.fail.iter()) {
+        if is_transport_observe(&rule.source) && !wanted.contains(&rule.source) {
+            wanted.push(rule.source);
+        }
+    }
+    let mut out = Vec::with_capacity(wanted.len());
+    for cap in wanted {
+        if !board.observe.contains(&cap) {
+            return Err(Error::Config(format!(
+                "rig plan: scenario '{}' references {} but board '{}' does not \
+                 declare it (board observe: {:?})",
+                scenario.name,
+                cap.as_str(),
+                scenario.target,
+                board.observe.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            )));
+        }
+        let binding = profile.observe.get(&cap).ok_or_else(|| {
+            Error::Config(format!(
+                "rig plan: scenario '{}' references {} but profile '{}' has no \
+                 [{}] binding",
+                scenario.name,
+                cap.as_str(),
+                profile.rig.id,
+                cap.as_str(),
+            ))
+        })?;
+        out.push(AdapterSelection {
+            capability: cap,
+            summary: summarise_binding(binding),
+        });
+    }
+    Ok(out)
+}
+
 fn pick_consoles(
     scenario: &Scenario,
     board: &BoardRig,
@@ -520,6 +587,7 @@ fn summarise_binding(table: &BindingTable) -> String {
         let rendered = match v {
             crate::rig::profile::BindingValue::Secret(s) => format!("{s}"),
             crate::rig::profile::BindingValue::Int(n) => format!("{n}"),
+            crate::rig::profile::BindingValue::Float(f) => format!("{f}"),
             crate::rig::profile::BindingValue::Bool(b) => format!("{b}"),
         };
         parts.push(format!("{k}={rendered}"));

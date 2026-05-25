@@ -34,6 +34,10 @@ use crate::rig::vocab::{Capability, Surface};
 ///     `telemetry.<name>` source, which the matcher buckets the same
 ///     way it does console bytes)
 ///   * `observe.netboot_fetch` (satisfied by a DeployEvent::ArtifactFetched)
+///   * `observe.https_load` (transport-style observer that drives a
+///     load probe against the rig's IP and emits NDJSON bytes; the
+///     matcher evaluates regex rules against the same byte-stream path
+///     it uses for console/telemetry)
 ///
 /// Not yet supported (need transport attachment + matcher wiring):
 ///   * `observe.monitor_stream`
@@ -41,6 +45,7 @@ use crate::rig::vocab::{Capability, Surface};
 pub fn supports_rule_source(cap: Capability) -> bool {
     matches!(cap.surface(), Surface::Console | Surface::Telemetry)
         || cap.as_str() == "observe.netboot_fetch"
+        || cap.as_str() == "observe.https_load"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

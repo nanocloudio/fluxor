@@ -249,6 +249,10 @@ fn emit_binding(section: &str, table: &BindingTable, out: &mut Vec<String>) {
         let rendered = match v {
             BindingValue::Secret(s) => format!("string:{}", s.for_hash()),
             BindingValue::Int(n) => format!("int:{n}"),
+            // `{:?}` on f64 round-trips the literal exactly (`0.75`,
+            // `1.0`, `nan`) — keeps the profile hash deterministic
+            // across plan runs without locale or width drift.
+            BindingValue::Float(f) => format!("float:{f:?}"),
             BindingValue::Bool(b) => format!("bool:{b}"),
         };
         out.push(format!("{section}.{k}={rendered}"));

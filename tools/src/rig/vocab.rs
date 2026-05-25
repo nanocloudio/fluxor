@@ -69,6 +69,7 @@ impl Surface {
                 "observe.monitor_stream",
                 "observe.netboot_fetch",
                 "observe.usb_enumeration",
+                "observe.https_load",
             ],
             Self::Rig => &["rig.claim", "rig.release", "rig.lock"],
         }

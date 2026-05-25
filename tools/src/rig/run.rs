@@ -110,6 +110,14 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
                 .map(|b| (t.capability, b))
         })
         .transpose()?;
+    let observe_backends: Vec<(Capability, BackendRef)> = plan
+        .observe_transports
+        .iter()
+        .map(|o| {
+            resolve_backend(Surface::Observe, capability_name(o.capability))
+                .map(|b| (o.capability, b))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let power_backend = profile
         .power
         .as_ref()
@@ -149,6 +157,9 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     let mut byte_log_caps: Vec<Capability> = plan.consoles.iter().map(|c| c.capability).collect();
     if let Some(t) = &plan.telemetry {
         byte_log_caps.push(t.capability);
+    }
+    for o in &plan.observe_transports {
+        byte_log_caps.push(o.capability);
     }
     for cap in byte_log_caps {
         let path = run_dir.join(format!("{}.log", cap.as_str()));
@@ -209,6 +220,24 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         };
         let handle = attach_transport(backend, "attach", &invocation, tx.clone())?;
         eprintln!("[rig] telemetry attached: {}", handle.backend().slug());
+        _byte_stream_transports.push(handle);
+    }
+
+    // Transport-style observe.* backends (e.g. `observe-https_load`).
+    // Each spawns a long-running probe (load generator, USB enumerator,
+    // etc.) and streams NDJSON `bytes` events tagged with its qualified
+    // capability so scenario rules can match on the probe's output the
+    // same way they match console / telemetry. `observe.netboot_fetch`
+    // is excluded at plan time — it rides the deploy `watch` channel.
+    for (cap, backend) in observe_backends {
+        let binding = observe_binding_for(profile, cap)?;
+        let invocation = BackendInvocation {
+            binding: wire_binding(binding),
+            context: context_from_plan(plan, &run_dir),
+            artifact: None,
+        };
+        let handle = attach_transport(backend, "attach", &invocation, tx.clone())?;
+        eprintln!("[rig] observer attached: {}", handle.backend().slug());
         _byte_stream_transports.push(handle);
     }
 
@@ -437,6 +466,15 @@ fn telemetry_binding_for(profile: &RigProfile, cap: Capability) -> Result<&Bindi
     profile.telemetry.get(&cap).ok_or_else(|| {
         Error::Config(format!(
             "rig run: plan chose {} but profile has no [telemetry.*] binding",
+            cap.as_str()
+        ))
+    })
+}
+
+fn observe_binding_for(profile: &RigProfile, cap: Capability) -> Result<&BindingTable> {
+    profile.observe.get(&cap).ok_or_else(|| {
+        Error::Config(format!(
+            "rig run: plan chose {} but profile has no [observe.*] binding",
             cap.as_str()
         ))
     })

@@ -72,6 +72,129 @@ fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     out
 }
 
+/// One-block ChaCha20 keystream via NEON: 4 row vectors, quarter-
+/// round computed across all 4 columns simultaneously, diagonal
+/// rounds use `vextq_u32` to rotate rows so diagonals line up as
+/// columns. Bit-identical to the scalar `chacha20_block`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn chacha20_block_neon(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+    use core::arch::aarch64::{
+        uint32x4_t, vaddq_u32, veorq_u32, vextq_u32, vld1q_u32, vld1q_u8, vorrq_u32,
+        vqtbl1q_u8, vreinterpretq_u16_u32, vreinterpretq_u32_u16, vreinterpretq_u32_u8,
+        vreinterpretq_u8_u32, vrev32q_u16, vshlq_n_u32, vshrq_n_u32, vst1q_u8,
+    };
+    // Per-rotate helpers — split because `vshlq_n_u32::<N>` is a const
+    // generic and one fn per N keeps us away from `generic_const_exprs`.
+    #[inline(always)]
+    unsafe fn rotl12(v: uint32x4_t) -> uint32x4_t {
+        // SAFETY: NEON intrinsics, always available on aarch64.
+        unsafe { vorrq_u32(vshlq_n_u32::<12>(v), vshrq_n_u32::<20>(v)) }
+    }
+    #[inline(always)]
+    unsafe fn rotl7(v: uint32x4_t) -> uint32x4_t {
+        // SAFETY: NEON intrinsics, always available on aarch64.
+        unsafe { vorrq_u32(vshlq_n_u32::<7>(v), vshrq_n_u32::<25>(v)) }
+    }
+    #[inline(always)]
+    unsafe fn rotl16(v: uint32x4_t) -> uint32x4_t {
+        // SAFETY: NEON intrinsics, always available on aarch64.
+        unsafe { vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(v))) }
+    }
+    #[inline(always)]
+    unsafe fn rotl8(v: uint32x4_t) -> uint32x4_t {
+        // Byte-level permutation; faster than shift+or because the
+        // lane width matches a single TBL lookup.
+        const TBL: [u8; 16] = [3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14];
+        // SAFETY: 16-byte aligned load from a 16-byte const; all TBL
+        // indices in 0..16 so no zeroing in vqtbl1q_u8.
+        unsafe {
+            let t = vld1q_u8(TBL.as_ptr());
+            vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), t))
+        }
+    }
+    // Column-or-diagonal quarter-round on 4 row vectors in parallel.
+    #[inline(always)]
+    unsafe fn qr(
+        a: &mut uint32x4_t,
+        b: &mut uint32x4_t,
+        c: &mut uint32x4_t,
+        d: &mut uint32x4_t,
+    ) {
+        // SAFETY: pure NEON arithmetic; helpers each carry their
+        // own SAFETY justification.
+        unsafe {
+            *a = vaddq_u32(*a, *b);
+            *d = veorq_u32(*d, *a);
+            *d = rotl16(*d);
+            *c = vaddq_u32(*c, *d);
+            *b = veorq_u32(*b, *c);
+            *b = rotl12(*b);
+            *a = vaddq_u32(*a, *b);
+            *d = veorq_u32(*d, *a);
+            *d = rotl8(*d);
+            *c = vaddq_u32(*c, *d);
+            *b = veorq_u32(*b, *c);
+            *b = rotl7(*b);
+        }
+    }
+    let mut out = [0u8; 64];
+    // SAFETY: 16-byte vector loads from stack-resident arrays
+    // (key: 32 B, row3 composite: 16 B); offsets stay in range.
+    unsafe {
+        let consts: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
+        let row0_init = vld1q_u32(consts.as_ptr());
+        let row1_init = vld1q_u32(key.as_ptr() as *const u32);
+        let row2_init = vld1q_u32(key.as_ptr().add(16) as *const u32);
+        let row3_words: [u32; 4] = [
+            counter,
+            u32::from_le_bytes([nonce[0], nonce[1], nonce[2], nonce[3]]),
+            u32::from_le_bytes([nonce[4], nonce[5], nonce[6], nonce[7]]),
+            u32::from_le_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]),
+        ];
+        let row3_init = vld1q_u32(row3_words.as_ptr());
+
+        let mut r0 = row0_init;
+        let mut r1 = row1_init;
+        let mut r2 = row2_init;
+        let mut r3 = row3_init;
+
+        // 20 rounds = 10 double rounds. Each double round does a
+        // column quarter-round then a diagonal quarter-round.
+        let mut i = 0;
+        while i < 10 {
+            // Column round: rows already line up as columns.
+            qr(&mut r0, &mut r1, &mut r2, &mut r3);
+            // Diagonalise: rotate row N left by N lanes so each
+            // diagonal becomes a column.
+            r1 = vextq_u32(r1, r1, 1);
+            r2 = vextq_u32(r2, r2, 2);
+            r3 = vextq_u32(r3, r3, 3);
+            // Diagonal round on the rotated state.
+            qr(&mut r0, &mut r1, &mut r2, &mut r3);
+            // Undo the rotation so the state is back in row-major
+            // form for the next column round.
+            r1 = vextq_u32(r1, r1, 3);
+            r2 = vextq_u32(r2, r2, 2);
+            r3 = vextq_u32(r3, r3, 1);
+            i += 1;
+        }
+
+        // Add initial state back per spec.
+        r0 = vaddq_u32(r0, row0_init);
+        r1 = vaddq_u32(r1, row1_init);
+        r2 = vaddq_u32(r2, row2_init);
+        r3 = vaddq_u32(r3, row3_init);
+
+        // Serialise rows to 64-byte output buffer.
+        vst1q_u8(out.as_mut_ptr(), vreinterpretq_u8_u32(r0));
+        vst1q_u8(out.as_mut_ptr().add(16), vreinterpretq_u8_u32(r1));
+        vst1q_u8(out.as_mut_ptr().add(32), vreinterpretq_u8_u32(r2));
+        vst1q_u8(out.as_mut_ptr().add(48), vreinterpretq_u8_u32(r3));
+    }
+    out
+}
+
 /// XOR 64 bytes of keystream into `data` using NEON `eor` over four
 /// 128-bit `q` registers. The scalar loop pegs at ~3 cycles/byte on
 /// ARMv8; the NEON path is ~0.3 cycles/byte for the XOR proper
@@ -105,11 +228,18 @@ unsafe fn xor_64_neon(keystream: *const u8, data: *mut u8) {
     );
 }
 
-/// ChaCha20 encrypt/decrypt (XOR keystream)
+/// ChaCha20 encrypt/decrypt (XOR keystream). On aarch64 both halves
+/// — keystream generation and XOR-into-buffer — run vectorised; on
+/// other targets the scalar path is used. The KAT suite in
+/// `tests/harness/tests/tls_*` exercises both paths to guarantee
+/// byte-equivalence with the spec.
 fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
     let mut ctr = counter;
     let mut offset = 0;
     while offset < data.len() {
+        #[cfg(target_arch = "aarch64")]
+        let block = chacha20_block_neon(key, ctr, nonce);
+        #[cfg(not(target_arch = "aarch64"))]
         let block = chacha20_block(key, ctr, nonce);
         let remain = data.len() - offset;
         // Full 64-byte block + aarch64 → NEON eor. Tail bytes
@@ -140,6 +270,23 @@ fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8])
         }
         offset += take;
         ctr += 1;
+    }
+}
+
+/// Polymorphic ChaCha20 block — dispatches to the NEON path on
+/// aarch64 and the scalar path everywhere else. The Poly1305 key
+/// derivation in `chacha20_poly1305_*` calls this directly (one
+/// 64-byte block, no XOR), so keeping a single dispatch helper avoids
+/// having every call site repeat the `cfg(target_arch)` pair.
+#[inline]
+fn chacha20_block_dispatch(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        chacha20_block_neon(key, counter, nonce)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        chacha20_block(key, counter, nonce)
     }
 }
 
@@ -395,7 +542,7 @@ pub fn chacha20_poly1305_encrypt(
     data: &mut [u8],
 ) -> [u8; 16] {
     // Generate Poly1305 one-time key (counter=0)
-    let poly_key_block = chacha20_block(key, 0, nonce);
+    let poly_key_block = chacha20_block_dispatch(key, 0, nonce);
     let mut poly_key = [0u8; 32];
     // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
     // caller-supplied input/output buffers; offsets stay within the
@@ -449,7 +596,7 @@ pub fn chacha20_poly1305_decrypt(
     tag: &[u8; 16],
 ) -> bool {
     // Generate Poly1305 one-time key
-    let poly_key_block = chacha20_block(key, 0, nonce);
+    let poly_key_block = chacha20_block_dispatch(key, 0, nonce);
     let mut poly_key = [0u8; 32];
     // SAFETY: pointer arithmetic over the 64-byte ChaCha20 state and the
     // caller-supplied input/output buffers; offsets stay within the

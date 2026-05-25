@@ -90,9 +90,11 @@ unsafe fn dtls_init_server_session(
     let ok = assign_fresh_ecdh_key(
         sys,
         &mut s.peer_sessions[i].endpoint.driver,
-        &s.eph_private,
+        &mut s.eph_private,
         &s.eph_public,
         &mut s.eph_used,
+        &mut s.ecdh_pool_hit,
+        &mut s.ecdh_fallback_keygen,
     );
     if !ok {
         s.peer_sessions[i].phase = DtlsPhase::Errored;
@@ -148,9 +150,11 @@ unsafe fn dtls_init_client_session(
     let ok = assign_fresh_ecdh_key(
         sys,
         &mut s.peer_sessions[i].endpoint.driver,
-        &s.eph_private,
+        &mut s.eph_private,
         &s.eph_public,
         &mut s.eph_used,
+        &mut s.ecdh_pool_hit,
+        &mut s.ecdh_fallback_keygen,
     );
     if !ok {
         s.peer_sessions[i].phase = DtlsPhase::Errored;

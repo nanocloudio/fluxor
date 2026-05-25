@@ -1061,6 +1061,139 @@ pub fn ecdh_shared_secret_finalise(state: &ScalarMulState) -> Option<[u8; 32]> {
 }
 
 // ============================================================================
+// Resumable ECDSA signing
+// ============================================================================
+//
+// Splits the `k * G` scalar mul across ticks so concurrent
+// handshakes can interleave through the heavy ladder without one
+// signer locking the scheduler.
+
+pub struct EcdsaSignState {
+    /// Resumable `k * G` scalar mul. The expensive 256-bit
+    /// Montgomery ladder lives here and gets driven by the same
+    /// `step()` API ECDH uses.
+    pub scalar_mul: ScalarMulState,
+    /// Private signer key (cleared by `ecdsa_sign_finalise` after
+    /// the signature is computed).
+    d: U256,
+    /// RFC 6979 deterministic nonce. Kept until finalise so the
+    /// modular-inverse + multiply can produce `s`.
+    k: U256,
+    /// Message hash reduced into `[0, n-1]`.
+    z: U256,
+    /// Set once `_init` has populated the fields; lets callers
+    /// distinguish a zero-initialised state from a real one.
+    initialised: u8,
+}
+
+impl EcdsaSignState {
+    /// Empty state. Use `ecdsa_sign_init` to populate.
+    pub const fn empty() -> Self {
+        Self {
+            scalar_mul: ScalarMulState::empty(),
+            d: ZERO,
+            k: ZERO,
+            z: ZERO,
+            initialised: 0,
+        }
+    }
+
+    pub fn is_initialised(&self) -> bool {
+        self.initialised != 0
+    }
+
+    /// Zeroise the secret scalar + private key. Call after the
+    /// signature has been extracted so the keying material isn't
+    /// sitting in RAM longer than necessary. Mirrors
+    /// `ScalarMulState::zeroise_scalar`.
+    pub fn zeroise_secrets(&mut self) {
+        zeroize_u256(&mut self.k);
+        zeroize_u256(&mut self.d);
+        self.scalar_mul.zeroise_scalar();
+    }
+}
+
+/// Initialise resumable ECDSA signing. `bits_per_step` is forwarded
+/// to the inner `ScalarMulState` — 0 means "run to completion in one
+/// step" (matches non-incremental `ecdsa_sign`); a small value (e.g.
+/// 32) splits the ladder so each step fits a typical scheduler tick.
+pub fn ecdsa_sign_init(
+    private_key: &[u8; 32],
+    hash: &[u8],
+    bits_per_step: u8,
+) -> EcdsaSignState {
+    let d = u256_from_be(private_key);
+    let k = rfc6979_nonce(private_key, hash);
+    // Truncate / pad hash to 32 bytes, then reduce mod n. Matches
+    // the prologue of `ecdsa_sign`.
+    let z = if hash.len() >= 32 {
+        u256_from_be(&hash[..32])
+    } else {
+        let mut buf = [0u8; 32];
+        // SAFETY: copy `hash.len()` bytes into the tail of a 32-byte
+        // stack buffer; `hash.len() < 32` per the branch guard.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                hash.as_ptr(),
+                buf.as_mut_ptr().add(32 - hash.len()),
+                hash.len(),
+            );
+        }
+        u256_from_be(&buf)
+    };
+    let z = mod_n_reduce(&z);
+    EcdsaSignState {
+        scalar_mul: ScalarMulState::new_base(&k, bits_per_step),
+        d,
+        k,
+        z,
+        initialised: 1,
+    }
+}
+
+/// Finalise resumable ECDSA signing. Callers must drive
+/// `state.scalar_mul` until `complete()` returns true before calling
+/// this. Returns the 64-byte signature `r || s` in big-endian, with
+/// `s` normalised to low-s. Zeroises the in-state private key + nonce
+/// before returning.
+#[allow(
+    private_interfaces,
+    reason = "p256.rs is path-mounted into PIC modules; the private JacobianPoint type is internal"
+)]
+pub fn ecdsa_sign_finalise(mut state: EcdsaSignState) -> [u8; 64] {
+    // r = (k * G).x mod n. `scalar_mul` already produced the point.
+    let point = state.scalar_mul.result();
+    let (rx, _) = point.to_affine();
+    let r = mod_n_reduce(&rx);
+
+    // s = k^-1 * (z + r * d) mod n
+    let k_inv = fn_inv(&state.k);
+    let rd = fn_mul(&r, &state.d);
+    let z_rd = fn_add(&state.z, &rd);
+    let mut s = fn_mul(&k_inv, &z_rd);
+
+    // Low-s normalisation per RFC 6979 §2.4 / SEC 1 §4.1.4.
+    let n_half = load_n_half();
+    if u256_gte(&s, &n_half) != 0 {
+        let n = load_n();
+        let (ns, _) = u256_sub(&n, &s);
+        s = ns;
+    }
+
+    state.zeroise_secrets();
+
+    let mut sig = [0u8; 64];
+    let rb = u256_to_be(&r);
+    let sb = u256_to_be(&s);
+    // SAFETY: `sig` is 64 bytes; the two 32-byte writes are bounded.
+    unsafe {
+        core::ptr::copy_nonoverlapping(rb.as_ptr(), sig.as_mut_ptr(), 32);
+        core::ptr::copy_nonoverlapping(sb.as_ptr(), sig.as_mut_ptr().add(32), 32);
+    }
+    sig
+}
+
+// ============================================================================
 // Serialization
 // ============================================================================
 

@@ -49,6 +49,6 @@ preferred_console = "console.serial"
 # `[nvme] / [fat32] / [ip] / [sched]` markers without a serial cable.
 telemetry = ["telemetry.monitor_udp"]
 preferred_telemetry = "telemetry.monitor_udp"
-observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream"]
+observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.https_load"]
 power = ["power.cycle"]
 default_timeout_s = 30

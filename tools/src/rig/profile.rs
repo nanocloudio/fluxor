@@ -50,6 +50,7 @@ pub struct BindingTable {
 pub enum BindingValue {
     Secret(Secret),
     Int(i64),
+    Float(f64),
     Bool(bool),
 }
 
@@ -103,6 +104,19 @@ impl BindingTable {
     pub fn optional_int(&self, key: &str) -> Option<i64> {
         match self.fields.get(key) {
             Some(BindingValue::Int(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Borrow an optional numeric field as `f64`. Accepts both
+    /// integer-typed and float-typed profile entries so a backend
+    /// can declare a floor like `throughput_floor_mbps = 0.75` (a
+    /// TOML float) or `throughput_floor_mbps = 5` (a TOML integer)
+    /// without forcing the operator to choose.
+    pub fn optional_float(&self, key: &str) -> Option<f64> {
+        match self.fields.get(key) {
+            Some(BindingValue::Float(f)) => Some(*f),
+            Some(BindingValue::Int(n)) => Some(*n as f64),
             _ => None,
         }
     }
@@ -221,12 +235,24 @@ fn load_binding(table: toml::Table, ctx: &str) -> Result<BindingTable> {
             toml::Value::String(s) => BindingValue::Secret(resolve(&s, &field_ctx)?),
             toml::Value::Integer(n) => BindingValue::Int(n),
             toml::Value::Boolean(b) => BindingValue::Bool(b),
-            toml::Value::Float(_)
-            | toml::Value::Datetime(_)
-            | toml::Value::Array(_)
-            | toml::Value::Table(_) => {
+            toml::Value::Float(f) => {
+                // Reject non-finite floats at profile load. The wire
+                // protocol carries values as JSON numbers, and JSON
+                // has no representation for NaN / +Inf / -Inf — a
+                // non-finite value here would serialize as `null`
+                // or fail outright at the backend boundary. Rejecting
+                // upfront keeps the failure mode clear: bad profile,
+                // not silent backend miswiring.
+                if !f.is_finite() {
+                    return Err(Error::Config(format!(
+                        "{field_ctx}: float value must be finite (got {f})"
+                    )));
+                }
+                BindingValue::Float(f)
+            }
+            toml::Value::Datetime(_) | toml::Value::Array(_) | toml::Value::Table(_) => {
                 return Err(Error::Config(format!(
-                    "{field_ctx}: unsupported value type {}; only string/int/bool allowed",
+                    "{field_ctx}: unsupported value type {}; only string/int/float/bool allowed",
                     type_of(&value)
                 )));
             }
@@ -442,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_float_and_array_values() {
+    fn accepts_float_value_and_round_trips_as_f64() {
         let src = r#"
             [rig]
             id = "x"
@@ -451,7 +477,74 @@ mod tests {
             [power]
             weight = 1.5
         "#;
-        assert!(parse_profile_str(src, Path::new("/tmp/x.toml")).is_err());
+        let profile = parse_profile_str(src, Path::new("/tmp/x.toml")).expect("profile parses");
+        let power = profile.power.as_ref().expect("[power] present");
+        assert_eq!(power.optional_float("weight"), Some(1.5));
+        // optional_int rejects floats (no silent truncation).
+        assert_eq!(power.optional_int("weight"), None);
+    }
+
+    #[test]
+    fn rejects_non_finite_float_values() {
+        // JSON can't represent NaN / ±Inf, so they'd silently break
+        // the wire boundary. Reject at profile load.
+        for src in [
+            r#"
+            [rig]
+            id = "x"
+            board = "cm5"
+
+            [power]
+            weight = nan
+            "#,
+            r#"
+            [rig]
+            id = "x"
+            board = "cm5"
+
+            [power]
+            weight = inf
+            "#,
+            r#"
+            [rig]
+            id = "x"
+            board = "cm5"
+
+            [power]
+            weight = -inf
+            "#,
+        ] {
+            let err = parse_profile_str(src, Path::new("/tmp/x.toml"))
+                .expect_err("non-finite must reject");
+            assert!(
+                format!("{err}").contains("must be finite"),
+                "wrong error message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_array_and_table_values() {
+        for src in [
+            r#"
+            [rig]
+            id = "x"
+            board = "cm5"
+
+            [power]
+            list = [1, 2, 3]
+            "#,
+            r#"
+            [rig]
+            id = "x"
+            board = "cm5"
+
+            [power.nested]
+            x = "y"
+            "#,
+        ] {
+            assert!(parse_profile_str(src, Path::new("/tmp/x.toml")).is_err());
+        }
     }
 
     // ── enumerate_labs ────────────────────────────────────────────

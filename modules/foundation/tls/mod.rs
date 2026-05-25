@@ -66,7 +66,12 @@ include!("dtls_state.rs");
 // Module constants
 // ============================================================================
 
-const MAX_SESSIONS: usize = 4;
+/// Concurrent TLS sessions. Must be ≥ peak in-flight TCP connections
+/// upstream; otherwise SYNs are accepted at IP but stall at TLS
+/// allocation (surfaces as a probe-side connect timeout).
+/// Per-tick work is O(MAX_SESSIONS), so oversizing trades concurrency
+/// for tick overhead. Each `TlsSession` is ~13 KB.
+const MAX_SESSIONS: usize = 16;
 const MAX_CERT_LEN: usize = 1024;
 const MAX_KEY_LEN: usize = 160;
 
@@ -356,6 +361,10 @@ struct TlsState {
     /// ladder in one call; smaller values yield between chunks so a second
     /// concurrent handshake doesn't wait for the first to finish.
     ecdh_bits_per_step: u16,
+    /// Emit per-phase `[tls] heavy ...` timing. Adds five
+    /// `dev_micros` syscalls per tick (~25 µs at default tick_us);
+    /// leave off for perf runs, on only when triaging step costs.
+    diag_phase_timing: u8,
 
     // Channel ports (4-port node: cipher side facing IP, clear side facing HTTP)
     cipher_in: i32,  // from IP: ciphertext net_proto frames
@@ -373,6 +382,15 @@ struct TlsState {
     eph_private: [[u8; 32]; MAX_SESSIONS],
     eph_public: [[u8; 65]; MAX_SESSIONS],
     eph_used: [bool; MAX_SESSIONS], // true if key has been consumed
+    // Lifetime counters surfaced on the `[tls] hb` line. The pool
+    // cliff signal is `ecdh_fallback_keygen > 0`: once seen, every
+    // new session pays the synchronous keygen cost.
+    ecdh_pool_hit: u32,
+    ecdh_fallback_keygen: u32,
+    /// `tls_write_frame` failures across cipher_out / clear_out;
+    /// non-zero in steady state means a downstream consumer is
+    /// back-pressuring TLS. Emitted on the `[tls] hb` line.
+    frame_write_dropped: u32,
 
     // Certificate and key (DER-encoded, loaded from params)
     cert: [u8; MAX_CERT_LEN],
@@ -469,6 +487,9 @@ define_params! {
 
     7, dtls_peer_port, u16, 4433
         => |s, d, len| { s.dtls_peer_port = p_u16(d, len, 0, 4433); };
+
+    8, diag_phase_timing, u8, 0
+        => |s, d, len| { s.diag_phase_timing = p_u8(d, len, 0, 0); };
 }
 
 // ============================================================================
@@ -514,6 +535,9 @@ pub unsafe extern "C" fn module_new(
     s.ca_pubkey_len = 0;
     s.require_ca = false;
     s.key_vault_handle = -1;
+    s.ecdh_pool_hit = 0;
+    s.ecdh_fallback_keygen = 0;
+    s.frame_write_dropped = 0;
     s.transport = TRANSPORT_TCP;
     s.dtls_listen_ep = -1;
     s.dtls_port = 4433;
@@ -581,12 +605,15 @@ pub unsafe extern "C" fn module_new(
         }
     }
 
-    // Deposit the private scalar into the kernel KEY_VAULT so that
-    // CertificateVerify signs via `KV_SIGN` and the in-module `s.key`
-    // bytes can be wiped immediately after.
+    // Deposit the private scalar into the kernel KEY_VAULT so
+    // CertificateVerify signs via `KV_SIGN` and `s.key` can be
+    // wiped. Bypassed when `ecdh_bits_per_step < 256` — KV_SIGN
+    // runs to completion in one syscall, which would short-circuit
+    // the in-module incremental signer the user opted into.
     const KV_PROBE: u32 = 0x1000;
     const KV_STORE: u32 = 0x1001;
-    if s.key_len >= 32 {
+    let use_vault = s.ecdh_bits_per_step >= 256;
+    if use_vault && s.key_len >= 32 {
         let present = (sys.provider_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
         if present == 1 {
             let mut raw = [0u8; 32];
@@ -735,6 +762,33 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let sys = &*s.syscalls;
     let mut did_work = false;
 
+    // `[tls] hb` heartbeat — same cadence as `[ip] tlm` / `[http] tlm`.
+    if s.step_count.is_multiple_of(50_000) {
+        let buf = s.net_scratch.as_mut_ptr();
+        let buf_max = s.net_scratch.len();
+        let mut pos = 0usize;
+        let emit = |bytes: &[u8], pos: &mut usize| {
+            let mut k = 0;
+            while k < bytes.len() && *pos < buf_max {
+                *buf.add(*pos) = bytes[k];
+                *pos += 1;
+                k += 1;
+            }
+        };
+        emit(b"[tls] hb pool_hit=", &mut pos);
+        pos += fmt_u32_dec(s.ecdh_pool_hit, buf.add(pos));
+        emit(b" fallback_keygen=", &mut pos);
+        pos += fmt_u32_dec(s.ecdh_fallback_keygen, buf.add(pos));
+        emit(b" frame_write_dropped=", &mut pos);
+        pos += fmt_u32_dec(s.frame_write_dropped, buf.add(pos));
+        dev_log(sys, 3, buf, pos);
+    }
+
+    // Per-phase timing for the heavy-step diagnostic; see the field
+    // docstring for the perf trade-off.
+    let diag_on = s.diag_phase_timing != 0;
+    let t0 = if diag_on { dev_micros(sys) } else { 0 };
+
     // ── Phase 1: Drive active handshake sessions ──
     //
     // For each handshaking session, the queue bridge runs:
@@ -751,9 +805,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let mut i = 0;
     while i < MAX_SESSIONS {
         if s.sessions[i].state == SessionState::Handshaking {
-            // Bound the inner loop so a misbehaving driver can't spin forever.
+            // Yield after one state transition per tick so a heavy
+            // handshake step doesn't starve the IP/rp1_gem RX path
+            // long enough to drop arriving SYNs.
             let mut steps = 0;
-            while steps < 64 && s.sessions[i].state == SessionState::Handshaking {
+            const PUMP_BUDGET: u32 = 1;
+            while steps < PUMP_BUDGET && s.sessions[i].state == SessionState::Handshaking {
                 let drained = record_drain_inbound_one(s, i);
                 let progressed = pump_session(s, i);
                 record_drain_outbound(s, i);
@@ -766,30 +823,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         } else if s.sessions[i].state == SessionState::Closed {
             s.sessions[i].reset();
         } else if s.sessions[i].state == SessionState::Error {
-            // Send CMD_CLOSE upstream for this conn_id, then forward MSG_CLOSED downstream
+            // Best-effort close notifications; if the channel is
+            // full `tls_write_or_count` bumps `frame_write_dropped`
+            // and the peer / HTTP consumer eventually times out.
             let cid = s.sessions[i].conn_id;
-            tls_write_frame(
-                sys,
-                s.cipher_out,
-                NET_CMD_CLOSE,
-                cid,
-                core::ptr::null(),
-                0,
-                &mut s.net_scratch,
-            );
-            tls_write_frame(
-                sys,
-                s.clear_out,
-                NET_MSG_CLOSED,
-                cid,
-                core::ptr::null(),
-                0,
-                &mut s.net_scratch,
-            );
+            let _ = tls_write_or_count(s, s.cipher_out, NET_CMD_CLOSE, cid, core::ptr::null(), 0);
+            let _ = tls_write_or_count(s, s.clear_out, NET_MSG_CLOSED, cid, core::ptr::null(), 0);
             s.sessions[i].reset();
         }
         i += 1;
     }
+
+    let t1 = if diag_on { dev_micros(sys) } else { 0 };
 
     // ── Phase 2: Read from cipher_in (downstream: IP → TLS) ──
     let poll_ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
@@ -831,15 +876,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             init_session_crypto(s, idx);
                         }
                         None => {
-                            // No session slots — forward close
-                            tls_write_frame(
-                                sys,
+                            // No session slots — best-effort close
+                            // notification upstream; if the channel
+                            // is full the peer notices via TCP RST
+                            // or timeout.
+                            let _ = tls_write_or_count(
+                                s,
                                 s.cipher_out,
                                 NET_CMD_CLOSE,
                                 conn_id,
                                 core::ptr::null(),
                                 0,
-                                &mut s.net_scratch,
                             );
                         }
                     }
@@ -922,15 +969,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if si >= 0 {
                         s.sessions[si as usize].reset();
                     }
-                    // Forward to HTTP
-                    tls_write_frame(
-                        sys,
+                    // Forward to HTTP — best-effort close notification.
+                    let _ = tls_write_or_count(
+                        s,
                         s.clear_out,
                         NET_MSG_CLOSED,
                         conn_id,
                         core::ptr::null(),
                         0,
-                        &mut s.net_scratch,
                     );
                 }
                 t if t == NET_MSG_BOUND || t == NET_MSG_ERROR => {
@@ -999,6 +1045,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
+    let t2 = if diag_on { dev_micros(sys) } else { 0 };
+
     // ── Phase 3: Read from clear_in (upstream: HTTP → TLS) ──
     let poll_cl = (sys.channel_poll)(s.clear_in, POLL_IN);
     if poll_cl > 0 && (poll_cl as u32 & POLL_IN) != 0 {
@@ -1020,53 +1068,74 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         if si >= 0 {
                             let idx = si as usize;
                             if s.sessions[idx].state == SessionState::Ready && data_len > 0 {
-                                // Read plaintext
-                                let rd = if data_len < SEND_BUF_SIZE {
-                                    data_len
-                                } else {
-                                    SEND_BUF_SIZE
-                                };
-                                let sess = &mut s.sessions[idx];
-                                (sys.channel_read)(s.clear_in, sess.send_buf.as_mut_ptr(), rd);
-                                if data_len > rd {
-                                    tls_discard(sys, s.clear_in, data_len - rd);
+                                // Split bodies larger than one wire
+                                // record into multiple application_data
+                                // records. Chunk size leaves room for
+                                // the 5-byte record header, content-type
+                                // trailer, AEAD tag, and outer framing.
+                                const CLEAR_CHUNK_MAX: usize = NET_SCRATCH_SIZE - 5 - 16 - 1 - 4;
+                                let mut remaining = data_len;
+                                while remaining > 0 {
+                                    let rd = remaining.min(CLEAR_CHUNK_MAX);
+
+                                    // Read plaintext directly into the
+                                    // wire-record buffer so encrypt
+                                    // happens in place (saves two memcpys
+                                    // vs the prior staged path).
+                                    let mut rec = [0u8; SEND_BUF_SIZE + 5];
+                                    (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
+
+                                    let sess = &mut s.sessions[idx];
+                                    let enc_payload_len = encrypt_record_in_place(
+                                        sess.driver.suite,
+                                        &mut sess.write_keys,
+                                        CT_APPLICATION_DATA,
+                                        rd,
+                                        &mut rec[5..],
+                                    );
+                                    // Header written AFTER encrypt so
+                                    // length reflects the actual
+                                    // payload, including seq-wrap
+                                    // (enc_payload_len == 0).
+                                    *rec.as_mut_ptr() = CT_APPLICATION_DATA;
+                                    *rec.as_mut_ptr().add(1) = 0x03;
+                                    *rec.as_mut_ptr().add(2) = 0x03;
+                                    *rec.as_mut_ptr().add(3) = (enc_payload_len >> 8) as u8;
+                                    *rec.as_mut_ptr().add(4) = enc_payload_len as u8;
+                                    let total = 5 + enc_payload_len;
+
+                                    // The AEAD seq has already advanced;
+                                    // dropping this record would desync
+                                    // the peer permanently. Fail the
+                                    // session loudly instead.
+                                    let sent = tls_write_frame(
+                                        sys,
+                                        s.cipher_out,
+                                        NET_CMD_SEND,
+                                        conn_id,
+                                        rec.as_ptr(),
+                                        total as u16,
+                                        &mut s.net_scratch,
+                                    );
+                                    if !sent {
+                                        let msg: &[u8] =
+                                            b"[tls] cipher_out full mid-record; session->Error";
+                                        dev_log(sys, 3, msg.as_ptr(), msg.len());
+                                        s.frame_write_dropped =
+                                            s.frame_write_dropped.wrapping_add(1);
+                                        s.sessions[idx].state = SessionState::Error;
+                                        if remaining > rd {
+                                            // Drop the rest of the
+                                            // incoming clear send;
+                                            // session is already
+                                            // Errored.
+                                            tls_discard(sys, s.clear_in, remaining - rd);
+                                        }
+                                        break;
+                                    }
+                                    retx_push(&mut s.sessions[idx], rec.as_ptr(), total as u16);
+                                    remaining -= rd;
                                 }
-
-                                // Encrypt as TLS application_data record
-                                let mut enc_buf = [0u8; SEND_BUF_SIZE];
-                                let enc_len = encrypt_record(
-                                    sess.driver.suite,
-                                    &mut sess.write_keys,
-                                    CT_APPLICATION_DATA,
-                                    &sess.send_buf[..rd],
-                                    &mut enc_buf,
-                                );
-
-                                // Build TLS record: 5-byte header + ciphertext
-                                let mut rec = [0u8; SEND_BUF_SIZE + 5];
-                                *rec.as_mut_ptr() = CT_APPLICATION_DATA;
-                                *rec.as_mut_ptr().add(1) = 0x03;
-                                *rec.as_mut_ptr().add(2) = 0x03;
-                                *rec.as_mut_ptr().add(3) = (enc_len >> 8) as u8;
-                                *rec.as_mut_ptr().add(4) = enc_len as u8;
-                                core::ptr::copy_nonoverlapping(
-                                    enc_buf.as_ptr(),
-                                    rec.as_mut_ptr().add(5),
-                                    enc_len,
-                                );
-                                let total = 5 + enc_len;
-
-                                // Write CMD_SEND(conn_id, tls_record) to cipher_out
-                                tls_write_frame(
-                                    sys,
-                                    s.cipher_out,
-                                    NET_CMD_SEND,
-                                    conn_id,
-                                    rec.as_ptr(),
-                                    total as u16,
-                                    &mut s.net_scratch,
-                                );
-                                retx_push(&mut s.sessions[idx], rec.as_ptr(), total as u16);
                             } else {
                                 tls_discard(sys, s.clear_in, data_len);
                             }
@@ -1095,15 +1164,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                         s.sessions[idx].reset();
                     }
-                    // Forward CMD_CLOSE to cipher_out
-                    tls_write_frame(
-                        sys,
+                    // Forward CMD_CLOSE to cipher_out — best-effort.
+                    let _ = tls_write_or_count(
+                        s,
                         s.cipher_out,
                         NET_CMD_CLOSE,
                         conn_id,
                         core::ptr::null(),
                         0,
-                        &mut s.net_scratch,
                     );
                 }
                 t if t == NET_CMD_BIND || t == NET_CMD_CONNECT => {
@@ -1129,6 +1197,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
+    let t3 = if diag_on { dev_micros(sys) } else { 0 };
+
     // ── Phase 4: For Ready sessions, try to decrypt any buffered data ──
     i = 0;
     while i < MAX_SESSIONS {
@@ -1136,6 +1206,41 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             try_decrypt_forward(s, i);
         }
         i += 1;
+    }
+    let t4 = if diag_on { dev_micros(sys) } else { 0 };
+
+    // Emit a per-phase breakdown only when the step crossed the
+    // heavy threshold and the diagnostic is on. Threshold keeps
+    // the fast path silent.
+    const TLS_STEP_HEAVY_US: u64 = 200;
+    let total = t4.wrapping_sub(t0);
+    if diag_on && total >= TLS_STEP_HEAVY_US {
+        let p1 = (t1.wrapping_sub(t0)) as u32;
+        let p2 = (t2.wrapping_sub(t1)) as u32;
+        let p3 = (t3.wrapping_sub(t2)) as u32;
+        let p4 = (t4.wrapping_sub(t3)) as u32;
+        let buf = s.net_scratch.as_mut_ptr();
+        let buf_max = s.net_scratch.len();
+        let mut pos = 0usize;
+        let emit = |bytes: &[u8], pos: &mut usize| {
+            let mut i = 0;
+            while i < bytes.len() && *pos < buf_max {
+                *buf.add(*pos) = bytes[i];
+                *pos += 1;
+                i += 1;
+            }
+        };
+        emit(b"[tls] heavy total_us=", &mut pos);
+        pos += fmt_u32_dec(total as u32, buf.add(pos));
+        emit(b" hs=", &mut pos);
+        pos += fmt_u32_dec(p1, buf.add(pos));
+        emit(b" cipher_in=", &mut pos);
+        pos += fmt_u32_dec(p2, buf.add(pos));
+        emit(b" clear_in=", &mut pos);
+        pos += fmt_u32_dec(p3, buf.add(pos));
+        emit(b" ready=", &mut pos);
+        pos += fmt_u32_dec(p4, buf.add(pos));
+        dev_log(sys, 3, buf, pos);
     }
 
     if did_work {
@@ -1331,48 +1436,55 @@ unsafe fn skip_ccs(sess: &mut TlsSession) {
 unsafe fn assign_fresh_ecdh_key(
     sys: &SyscallTable,
     driver: &mut HandshakeDriver,
-    eph_private: &[[u8; 32]; MAX_SESSIONS],
+    eph_private: &mut [[u8; 32]; MAX_SESSIONS],
     eph_public: &[[u8; 65]; MAX_SESSIONS],
     eph_used: &mut [bool; MAX_SESSIONS],
+    pool_hit: &mut u32,
+    fallback_keygen: &mut u32,
 ) -> bool {
+    // Pool first — each entry was CSPRNG-generated at `module_new`
+    // and is consumed once. Drops the per-accept cost from ~900 µs
+    // (scalar-mult-base) to a memcpy. Pool slot is wiped on hand-off
+    // so a future memory read can't recover the scalar.
+    let mut key_idx: Option<usize> = None;
+    let mut k = 0;
+    while k < MAX_SESSIONS {
+        if !eph_used[k] {
+            key_idx = Some(k);
+            break;
+        }
+        k += 1;
+    }
+    if let Some(idx) = key_idx {
+        driver.ecdh_private = eph_private[idx];
+        driver.ecdh_public = eph_public[idx];
+        // Wipe the pool slot's private scalar — the public point
+        // is fine to leave (it's already on the wire).
+        let mut j = 0;
+        while j < 32 {
+            core::ptr::write_volatile(&mut eph_private[idx][j], 0);
+            j += 1;
+        }
+        eph_used[idx] = true;
+        *pool_hit = pool_hit.wrapping_add(1);
+        return true;
+    }
+
+    // Pool exhausted — synchronous keygen. Counter bumps before
+    // the keygen so a CSPRNG outage still surfaces on telemetry.
+    *fallback_keygen = fallback_keygen.wrapping_add(1);
     let mut random = [0u8; 32];
     if dev_csprng_fill(sys, random.as_mut_ptr(), 32) < 0 {
-        // CSPRNG unavailable — burn one pool slot. The pool is
-        // consumed at most once per slot across the module's
-        // lifetime; if every slot is used, the caller aborts.
-        let mut key_idx: Option<usize> = None;
-        let mut k = 0;
-        while k < MAX_SESSIONS {
-            if !eph_used[k] {
-                key_idx = Some(k);
-                break;
-            }
-            k += 1;
-        }
-        let key_idx = match key_idx {
-            Some(i) => i,
-            None => return false,
-        };
-        driver.ecdh_private = eph_private[key_idx];
-        driver.ecdh_public = eph_public[key_idx];
-        eph_used[key_idx] = true;
-    } else {
-        let (mut priv_key, pub_key) = ecdh_keygen(&random);
-        driver.ecdh_private = priv_key;
-        driver.ecdh_public = pub_key;
-        // Volatile wipe of every stack-resident copy of the
-        // private scalar — the seed (`random`) the key was
-        // derived from, plus the `priv_key` temporary we just
-        // moved into the driver. The compiler is free to leave
-        // both alive until the function returns; without these
-        // wipes a downstream stack-overlay reuse could observe
-        // a residue of the secret in another frame.
-        let mut i = 0;
-        while i < 32 {
-            core::ptr::write_volatile(random.as_mut_ptr().add(i), 0);
-            core::ptr::write_volatile(priv_key.as_mut_ptr().add(i), 0);
-            i += 1;
-        }
+        return false;
+    }
+    let (mut priv_key, pub_key) = ecdh_keygen(&random);
+    driver.ecdh_private = priv_key;
+    driver.ecdh_public = pub_key;
+    let mut i = 0;
+    while i < 32 {
+        core::ptr::write_volatile(random.as_mut_ptr().add(i), 0);
+        core::ptr::write_volatile(priv_key.as_mut_ptr().add(i), 0);
+        i += 1;
     }
     true
 }
@@ -1412,9 +1524,11 @@ unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
     let ok = assign_fresh_ecdh_key(
         sys,
         &mut s.sessions[idx].driver,
-        &s.eph_private,
+        &mut s.eph_private,
         &s.eph_public,
         &mut s.eph_used,
+        &mut s.ecdh_pool_hit,
+        &mut s.ecdh_fallback_keygen,
     );
     if !ok {
         s.sessions[idx].state = SessionState::Error;
@@ -1636,7 +1750,9 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
 
         let conn_id = s.sessions[idx].conn_id;
         let sys = &*s.syscalls;
-        tls_write_frame(
+        // AEAD seq already advanced; a dropped write would desync
+        // the peer permanently. Fail the session if the write fails.
+        let sent = tls_write_frame(
             sys,
             s.cipher_out,
             NET_CMD_SEND,
@@ -1645,6 +1761,13 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
             total_len as u16,
             &mut s.net_scratch,
         );
+        if !sent {
+            s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
+            let msg: &[u8] = b"[tls] handshake out drop; session->Error";
+            dev_log(sys, 3, msg.as_ptr(), msg.len());
+            s.sessions[idx].state = SessionState::Error;
+            return;
+        }
         retx_push(&mut s.sessions[idx], rec.as_ptr(), total_len as u16);
 
         let sess = &mut s.sessions[idx];
@@ -1999,66 +2122,117 @@ unsafe fn pump_send_certificate(s: &mut TlsState, idx: usize) -> bool {
 
 unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
-    let sess = &mut s.sessions[idx];
-
-    let hl = sess.driver.suite.hash_len();
-    let transcript_hash = match &sess.driver.transcript {
-        Some(t) => t.current_hash(),
-        None => {
-            sess.state = SessionState::Error;
-            return true;
-        }
+    let bits_per_step = if s.ecdh_bits_per_step >= 256 {
+        0u8
+    } else {
+        s.ecdh_bits_per_step as u8
     };
 
-    // Build signing content
-    let context = b"TLS 1.3, server CertificateVerify";
-    let mut verify_content = [0u8; 200];
-    let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
-
-    // Hash the verify content
-    let vc_hash = sha256(&verify_content[..vc_len]);
-
-    // Sign with private key
-    let mut k_random = [0u8; 32];
-    dev_csprng_fill(sys, k_random.as_mut_ptr(), 32);
-
-    // Sign via kernel KEY_VAULT when the identity key is held there; fall
-    // back to the in-module signer on ENOSYS.
-    const KV_SIGN: u32 = 0x1003;
-    let mut raw_sig = [0u8; 64];
-    let mut signed_via_vault = false;
-    if s.key_vault_handle >= 0 {
-        // arg layout: [hash_len: u16 LE][pad: u16][hash[32]][sig_out[64]]
-        let mut sign_arg = [0u8; 4 + 32 + 64];
-        sign_arg[0] = 32;
-        core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(4), 32);
-        let rc = (sys.provider_call)(
-            s.key_vault_handle,
-            KV_SIGN,
-            sign_arg.as_mut_ptr(),
-            sign_arg.len(),
+    // ── Stage 1 — hash the transcript + try the key-vault signer.
+    //
+    // Runs once per CertificateVerify (gated by `cert_verify_hash_ready`).
+    // Hashing is cheap (~20 µs); the expensive part is the ECDSA
+    // scalar mul which subsequent stages split across multiple
+    // `tls.step()` calls. The vault path is treated as fast-and-
+    // opaque — if it succeeds we emit immediately. Otherwise we
+    // initialise the in-module signer state and yield.
+    if s.sessions[idx].driver.cert_verify_hash_ready == 0 {
+        let sess = &mut s.sessions[idx];
+        let hl = sess.driver.suite.hash_len();
+        let transcript_hash = match &sess.driver.transcript {
+            Some(t) => t.current_hash(),
+            None => {
+                sess.state = SessionState::Error;
+                return true;
+            }
+        };
+        let context = b"TLS 1.3, server CertificateVerify";
+        let mut verify_content = [0u8; 200];
+        let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
+        let vc_hash = sha256(&verify_content[..vc_len]);
+        core::ptr::copy_nonoverlapping(
+            vc_hash.as_ptr(),
+            sess.driver.cert_verify_hash.as_mut_ptr(),
+            32,
         );
-        if rc == 0 {
-            core::ptr::copy_nonoverlapping(sign_arg.as_ptr().add(4 + 32), raw_sig.as_mut_ptr(), 64);
-            signed_via_vault = true;
+        sess.driver.cert_verify_hash_ready = 1;
+
+        // Try kernel KEY_VAULT first. The vault provider returns a
+        // 64-byte raw signature directly and is responsible for its
+        // own scheduler discipline — no resumable contract on the
+        // vault side yet.
+        const KV_SIGN: u32 = 0x1003;
+        if s.key_vault_handle >= 0 {
+            let mut sign_arg = [0u8; 4 + 32 + 64];
+            sign_arg[0] = 32;
+            core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(4), 32);
+            let rc = (sys.provider_call)(
+                s.key_vault_handle,
+                KV_SIGN,
+                sign_arg.as_mut_ptr(),
+                sign_arg.len(),
+            );
+            if rc == 0 {
+                let mut raw_sig = [0u8; 64];
+                core::ptr::copy_nonoverlapping(
+                    sign_arg.as_ptr().add(4 + 32),
+                    raw_sig.as_mut_ptr(),
+                    64,
+                );
+                return finalise_certificate_verify(s, idx, &raw_sig);
+            }
         }
-    }
-    if !signed_via_vault {
+
+        // No vault — initialise the resumable in-module signer.
+        // Subsequent calls drive `scalar_mul.step()` until complete,
+        // then `ecdsa_sign_finalise` builds the signature.
         let mut priv_key = [0u8; 32];
         if s.key_len == 32 {
             core::ptr::copy_nonoverlapping(s.key.as_ptr(), priv_key.as_mut_ptr(), 32);
         } else if s.key_len > 32 {
             extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
         }
-        raw_sig = ecdsa_sign(&priv_key, &vc_hash, &k_random);
+        sess.driver.ecdsa_sign_state = ecdsa_sign_init(&priv_key, &vc_hash, bits_per_step);
         let mut j = 0;
         while j < 32 {
             core::ptr::write_volatile(&mut priv_key[j], 0);
             j += 1;
         }
+        return true;
     }
-    let (der_sig, der_len) = encode_der_signature(&raw_sig);
 
+    // ── Stage 2 — advance the scalar-mul ladder one budget step.
+    //
+    // `bits_per_step` (from the same `ecdh_bits_per_step` param) caps
+    // how much work this step does. If the ladder finishes inside one
+    // step (e.g. ecdh_bits_per_step=256) we fall through immediately
+    // to stage 3.
+    let sess = &mut s.sessions[idx];
+    if !sess.driver.ecdsa_sign_state.scalar_mul.complete() {
+        sess.driver.ecdsa_sign_state.scalar_mul.step();
+        if !sess.driver.ecdsa_sign_state.scalar_mul.complete() {
+            return true;
+        }
+    }
+
+    // ── Stage 3 — finalise the signature + emit the message.
+    //
+    // `ecdsa_sign_finalise` consumes the state and zeroises secrets,
+    // so we swap it out by value. Both the vault path above and this
+    // path converge on `finalise_certificate_verify` below.
+    let state = core::mem::replace(&mut sess.driver.ecdsa_sign_state, EcdsaSignState::empty());
+    let raw_sig = ecdsa_sign_finalise(state);
+    finalise_certificate_verify(s, idx, &raw_sig)
+}
+
+/// Build the CertificateVerify message + update transcript + send.
+/// Shared by both the vault-sign and incremental-in-module paths in
+/// `pump_send_certificate_verify`. Returns true to signal handshake
+/// progress (transitions state to `SendFinished`).
+#[inline]
+unsafe fn finalise_certificate_verify(s: &mut TlsState, idx: usize, raw_sig: &[u8; 64]) -> bool {
+    let sess = &mut s.sessions[idx];
+    let (der_sig, der_len) = encode_der_signature(raw_sig);
     let msg_len = build_certificate_verify(&der_sig, der_len, &mut sess.driver.scratch);
 
     if let Some(ref mut t) = sess.driver.transcript {
@@ -2069,6 +2243,9 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     core::ptr::copy_nonoverlapping(sess.driver.scratch.as_ptr(), buf.as_mut_ptr(), msg_len);
     send_encrypted_handshake(s, idx, &buf, msg_len);
 
+    // Reset the per-handshake stage flag so a future renegotiation
+    // / session reuse starts fresh.
+    s.sessions[idx].driver.cert_verify_hash_ready = 0;
     s.sessions[idx].driver.hs_state = HandshakeState::SendFinished;
     true
 }
@@ -2108,20 +2285,14 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         b"[tls] handshake complete".len(),
     );
     emit_peer_identity(s, idx);
-    let sess = &mut s.sessions[idx];
-    let held = sess.held_msg_type;
-    let conn_id = sess.conn_id;
+    let held = s.sessions[idx].held_msg_type;
+    let conn_id = s.sessions[idx].conn_id;
     if held != 0 {
-        sess.held_msg_type = 0;
-        tls_write_frame(
-            sys,
-            s.clear_out,
-            held,
-            conn_id,
-            core::ptr::null(),
-            0,
-            &mut s.net_scratch,
-        );
+        s.sessions[idx].held_msg_type = 0;
+        // Forward the held NET_MSG_ACCEPTED / NET_MSG_CONNECTED
+        // tag now that the handshake is complete. Best-effort:
+        // HTTP times out on no traffic if this drops.
+        let _ = tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0);
     }
     true
 }
@@ -2401,18 +2572,19 @@ unsafe fn recv_encrypted_handshake(
 
 /// Send an encrypted alert via cipher_out channel
 unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
-    let sys = &*s.syscalls;
-    let sess = &mut s.sessions[idx];
-
     let alert_body = build_alert(description);
     let mut enc_buf = [0u8; 64];
-    let enc_len = encrypt_record(
-        sess.driver.suite,
-        &mut sess.write_keys,
-        CT_ALERT,
-        &alert_body,
-        &mut enc_buf,
-    );
+    let (enc_len, conn_id) = {
+        let sess = &mut s.sessions[idx];
+        let n = encrypt_record(
+            sess.driver.suite,
+            &mut sess.write_keys,
+            CT_ALERT,
+            &alert_body,
+            &mut enc_buf,
+        );
+        (n, sess.conn_id)
+    };
 
     let mut rec = [0u8; 69];
     *rec.as_mut_ptr() = CT_APPLICATION_DATA;
@@ -2423,15 +2595,15 @@ unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
     core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), rec.as_mut_ptr().add(5), enc_len);
 
     let total = 5 + enc_len;
-    let conn_id = sess.conn_id;
-    tls_write_frame(
-        sys,
-        s.cipher_out,
+    // Alerts are advisory (RFC 8446 §6) — best-effort is fine.
+    let cipher_chan = s.cipher_out;
+    let _ = tls_write_or_count(
+        s,
+        cipher_chan,
         NET_CMD_SEND,
         conn_id,
         rec.as_ptr(),
         total as u16,
-        &mut s.net_scratch,
     );
 }
 
@@ -2461,6 +2633,7 @@ unsafe fn tls_read_header(sys: &SyscallTable, chan: i32) -> (u8, u16) {
 /// len = 1 + data_len (conn_id byte + payload bytes)
 /// Assembled in scratch buffer and written in a single channel_write to
 /// prevent split-read issues on byte-stream FIFO channels.
+#[must_use = "may fail under backpressure; fail the session or use tls_write_or_count for best-effort sends"]
 unsafe fn tls_write_frame(
     sys: &SyscallTable,
     chan: i32,
@@ -2469,13 +2642,14 @@ unsafe fn tls_write_frame(
     data: *const u8,
     data_len: u16,
     scratch: &mut [u8; NET_SCRATCH_SIZE],
-) {
+) -> bool {
     let total_payload = 1u16 + data_len; // conn_id + data
     let frame_len = 3 + total_payload as usize;
     if frame_len > NET_SCRATCH_SIZE {
-        return;
+        // Frame larger than the per-write scratch; chunk in the
+        // caller. False makes the loss visible.
+        return false;
     }
-    // Assemble complete frame in scratch
     *scratch.as_mut_ptr() = msg_type;
     *scratch.as_mut_ptr().add(1) = total_payload as u8;
     *scratch.as_mut_ptr().add(2) = (total_payload >> 8) as u8;
@@ -2483,7 +2657,40 @@ unsafe fn tls_write_frame(
     if data_len > 0 && !data.is_null() {
         core::ptr::copy_nonoverlapping(data, scratch.as_mut_ptr().add(4), data_len as usize);
     }
-    (sys.channel_write)(chan, scratch.as_ptr(), frame_len);
+    // `channel_write` is atomic-or-nothing: returns frame_len on
+    // success, 0 on backpressure. A silent loss would advance the
+    // peer's expected AEAD seq into a permanent mismatch — surface it.
+    let n = (sys.channel_write)(chan, scratch.as_ptr(), frame_len);
+    n as usize == frame_len
+}
+
+/// Best-effort `tls_write_frame`: on failure, bumps the periodic
+/// `frame_write_dropped` counter and returns false. Use for sends
+/// where the peer / HTTP consumer can recover by timeout
+/// (close notifications, alerts, CMD_BIND pass-through).
+#[allow(clippy::too_many_arguments, reason = "mirrors tls_write_frame")]
+unsafe fn tls_write_or_count(
+    s: &mut TlsState,
+    chan: i32,
+    msg_type: u8,
+    conn_id: u8,
+    data: *const u8,
+    data_len: u16,
+) -> bool {
+    let sys = &*s.syscalls;
+    let ok = tls_write_frame(
+        sys,
+        chan,
+        msg_type,
+        conn_id,
+        data,
+        data_len,
+        &mut s.net_scratch,
+    );
+    if !ok {
+        s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
+    }
+    ok
 }
 
 /// Retain `n` bytes of encrypted record in the session's retransmit buffer.
@@ -2546,16 +2753,16 @@ unsafe fn retx_replay(s: &mut TlsState, idx: usize, from_seq: u32) {
         local.as_mut_ptr(),
         bytes,
     );
-    let sys = &*s.syscalls;
     let conn_id = s.sessions[idx].conn_id;
-    tls_write_frame(
-        sys,
+    // Best-effort: replaying already-encrypted ciphertext, no
+    // AEAD seq to keep in sync. TCP's RTO will retry on drop.
+    let _ = tls_write_or_count(
+        s,
         s.cipher_out,
         NET_CMD_SEND,
         conn_id,
         local.as_ptr(),
         bytes as u16,
-        &mut s.net_scratch,
     );
 }
 
@@ -2658,7 +2865,9 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 if pt_len >= 2 && *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
                     sess.state = SessionState::Closed;
                     let conn_id = sess.conn_id;
-                    tls_write_frame(
+                    // Best-effort close notification (sess borrow
+                    // prevents tls_write_or_count; count inline).
+                    let ok = tls_write_frame(
                         sys,
                         s.clear_out,
                         NET_MSG_CLOSED,
@@ -2667,15 +2876,21 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                         0,
                         &mut s.net_scratch,
                     );
+                    if !ok {
+                        s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
+                    }
                     return;
                 }
                 sess.state = SessionState::Error;
                 return;
             }
             if inner_type == CT_APPLICATION_DATA && pt_len > 0 {
-                // Forward decrypted data as MSG_DATA(conn_id, plaintext) to clear_out
+                // Forward decrypted bytes as MSG_DATA. The plaintext
+                // isn't retained — a dropped write would silently
+                // lose bytes the peer thinks were delivered, so we
+                // fail the session.
                 let conn_id = sess.conn_id;
-                tls_write_frame(
+                let sent = tls_write_frame(
                     sys,
                     s.clear_out,
                     NET_MSG_DATA,
@@ -2684,6 +2899,12 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                     pt_len as u16,
                     &mut s.net_scratch,
                 );
+                if !sent {
+                    s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
+                    let msg: &[u8] = b"[tls] clear_out full mid-record; session->Error";
+                    dev_log(sys, 3, msg.as_ptr(), msg.len());
+                    s.sessions[idx].state = SessionState::Error;
+                }
             }
         }
         None => {

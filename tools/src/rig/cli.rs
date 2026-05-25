@@ -397,6 +397,7 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
             match v {
                 crate::rig::profile::BindingValue::Secret(s) => print!("{s}"),
                 crate::rig::profile::BindingValue::Int(n) => print!("{n}"),
+                crate::rig::profile::BindingValue::Float(f) => print!("{f}"),
                 crate::rig::profile::BindingValue::Bool(b) => print!("{b}"),
             }
         }

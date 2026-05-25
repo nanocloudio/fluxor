@@ -42,11 +42,15 @@ modules:
         body: "<html><body><h1>Fluxor web_server (Pi 5)</h1><p>HTTP/2, TLS 1.3 — bare metal.</p></body></html>"
 
 wiring:
+  # 32 KiB on the TLS output edges so MAX_SESSIONS keep-alive
+  # responses don't back-pressure on the default 8 KiB channel.
   - from: ip.net_out
     to: tls.cipher_in
   - from: tls.cipher_out
     to: ip.net_in
+    buffer_bytes: 32768
   - from: tls.clear_out
     to: http.net_in
   - from: http.net_out
     to: tls.clear_in
+    buffer_bytes: 32768

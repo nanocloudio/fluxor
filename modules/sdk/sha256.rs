@@ -198,7 +198,190 @@ impl Sha256 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    // SAFETY: `compress_neon` is gated on `target_feature = "sha2"`,
+    // which cm5 (Cortex-A76) provides.
+    unsafe { compress_neon(state, block) };
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    compress_scalar(state, block);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha2")]
+#[inline]
+unsafe fn compress_neon(state: &mut [u32; 8], block: &[u8; 64]) {
+    use core::arch::aarch64::{
+        uint32x4_t, vaddq_u32, vld1q_u32, vld1q_u8, vreinterpretq_u32_u8,
+        vrev32q_u8, vsha256h2q_u32, vsha256hq_u32,
+        vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
+    };
+    // Round constants packed into 16 vectors of 4 u32 each.
+    // Loaded onto the stack so PIC modules don't need ADRP-based
+    // .rodata access (the scalar path's reasoning applies here too).
+    let k_raw = load_k256();
+    let kp = k_raw.as_ptr();
+    let kv = |i: usize| vld1q_u32(kp.add(i * 4));
+
+    // Initial hash state.
+    let sp = state.as_ptr();
+    let mut abcd: uint32x4_t = vld1q_u32(sp);
+    let mut efgh: uint32x4_t = vld1q_u32(sp.add(4));
+    let abcd_save = abcd;
+    let efgh_save = efgh;
+
+    // Load message block, byte-swap each u32 (the FIPS schedule is
+    // big-endian; `vrev32q_u8` reverses within each u32 lane).
+    let bp = block.as_ptr();
+    let load_be = |off: usize| -> uint32x4_t {
+        let v = vld1q_u8(bp.add(off));
+        vreinterpretq_u32_u8(vrev32q_u8(v))
+    };
+    let mut w0 = load_be(0);
+    let mut w1 = load_be(16);
+    let mut w2 = load_be(32);
+    let mut w3 = load_be(48);
+
+    // 16 quarter-rounds = 64 SHA-256 rounds. Each iteration does 4
+    // rounds via the SHA-2 intrinsics (vsha256hq + vsha256h2q) and
+    // updates the message schedule for the next 4-round window
+    // (vsha256su0q + vsha256su1q) until the last 4 rounds.
+    let mut prev: uint32x4_t;
+
+    // Rounds 0-3
+    let mut msg = vaddq_u32(w0, kv(0));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+
+    // Rounds 4-7
+    msg = vaddq_u32(w1, kv(1));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w0 = vsha256su0q_u32(w0, w1);
+
+    // Rounds 8-11
+    msg = vaddq_u32(w2, kv(2));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w0 = vsha256su1q_u32(w0, w2, w3);
+    w1 = vsha256su0q_u32(w1, w2);
+
+    // Rounds 12-15
+    msg = vaddq_u32(w3, kv(3));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w1 = vsha256su1q_u32(w1, w3, w0);
+    w2 = vsha256su0q_u32(w2, w3);
+
+    // Rounds 16-19
+    msg = vaddq_u32(w0, kv(4));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w2 = vsha256su1q_u32(w2, w0, w1);
+    w3 = vsha256su0q_u32(w3, w0);
+
+    // Rounds 20-23
+    msg = vaddq_u32(w1, kv(5));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w3 = vsha256su1q_u32(w3, w1, w2);
+    w0 = vsha256su0q_u32(w0, w1);
+
+    // Rounds 24-27
+    msg = vaddq_u32(w2, kv(6));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w0 = vsha256su1q_u32(w0, w2, w3);
+    w1 = vsha256su0q_u32(w1, w2);
+
+    // Rounds 28-31
+    msg = vaddq_u32(w3, kv(7));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w1 = vsha256su1q_u32(w1, w3, w0);
+    w2 = vsha256su0q_u32(w2, w3);
+
+    // Rounds 32-35
+    msg = vaddq_u32(w0, kv(8));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w2 = vsha256su1q_u32(w2, w0, w1);
+    w3 = vsha256su0q_u32(w3, w0);
+
+    // Rounds 36-39
+    msg = vaddq_u32(w1, kv(9));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w3 = vsha256su1q_u32(w3, w1, w2);
+    w0 = vsha256su0q_u32(w0, w1);
+
+    // Rounds 40-43
+    msg = vaddq_u32(w2, kv(10));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w0 = vsha256su1q_u32(w0, w2, w3);
+    w1 = vsha256su0q_u32(w1, w2);
+
+    // Rounds 44-47
+    msg = vaddq_u32(w3, kv(11));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w1 = vsha256su1q_u32(w1, w3, w0);
+    w2 = vsha256su0q_u32(w2, w3);
+
+    // Rounds 48-51 (no more schedule updates needed; last 4
+    // 4-round chunks use the already-extended w0..w3).
+    msg = vaddq_u32(w0, kv(12));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w2 = vsha256su1q_u32(w2, w0, w1);
+    w3 = vsha256su0q_u32(w3, w0);
+
+    // Rounds 52-55
+    msg = vaddq_u32(w1, kv(13));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+    w3 = vsha256su1q_u32(w3, w1, w2);
+
+    // Rounds 56-59
+    msg = vaddq_u32(w2, kv(14));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+
+    // Rounds 60-63
+    msg = vaddq_u32(w3, kv(15));
+    prev = abcd;
+    abcd = vsha256hq_u32(abcd, efgh, msg);
+    efgh = vsha256h2q_u32(efgh, prev, msg);
+
+    // Fold into the original state and write back.
+    abcd = vaddq_u32(abcd, abcd_save);
+    efgh = vaddq_u32(efgh, efgh_save);
+    let smp = state.as_mut_ptr();
+    vst1q_u32(smp, abcd);
+    vst1q_u32(smp.add(4), efgh);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn compress_scalar(state: &mut [u32; 8], block: &[u8; 64]) {
     let k = load_k256();
     let mut w = [0u32; 64];
 
