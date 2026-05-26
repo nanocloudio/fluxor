@@ -542,6 +542,19 @@ pub struct Manifest {
     /// `.context/rfc_isr_tier_surface.md` §D7 for the contract this
     /// flag attests to and §Step-3 for the validator that enforces it.
     pub isr_safe: bool,
+    /// Module opts into the **Tier 1c pre-pass drain slot**. Pre-tick
+    /// modules run cooperatively at the *start* of every scheduler
+    /// pass for their domain, before the regular `domain_exec_order`
+    /// rotation. Use for latency-critical drains that need to run
+    /// every tick regardless of `exec_order` position (canonical
+    /// case: NIC RX/TX). The module retains the full cooperative API
+    /// (heap + `provider_call` + `channel_read`/`write`); the only
+    /// new contract is a shared combined cycle budget across all
+    /// pre-tick modules in a domain (kernel default
+    /// `MAX_PRE_TICK_BUDGET_US = 5`). See
+    /// `.context/rfc_isr_tier_surface.md` §D8 for the contract and
+    /// motivating measurement.
+    pub pre_tick_drain: bool,
     /// Hardware-feature requirements declared by the module.
     /// Validated against the resolved target's silicon capability
     /// matrix at config time by `check_target_capabilities`. Default
@@ -572,6 +585,7 @@ impl Default for Manifest {
             capabilities: Vec::new(),
             builtin: false,
             isr_safe: false,
+            pre_tick_drain: false,
             requires: TomlRequires::default(),
             params: Vec::new(),
         }
@@ -1039,6 +1053,7 @@ impl Manifest {
             capabilities,
             builtin,
             isr_safe: toml_val.isr_safe,
+            pre_tick_drain: toml_val.pre_tick_drain,
             requires: toml_val.requires,
             params,
         })
@@ -1077,21 +1092,29 @@ impl Manifest {
         //          bit 2 = isr_safe (author attestation; the
         //                  **build-time** `validate_isr_tier_admission`
         //                  in `tools/src/config.rs` is the live gate
-        //                  for this flag. The kernel-side
+        //                  for this flag. Tier 1b admission is live;
+        //                  Tier 2 is still hard-rejected at build
+        //                  time pending the PIC-loader
+        //                  `module_isr_entry` lift. The kernel-side
         //                  `Manifest::from_bytes` round-trips the
-        //                  bit through `LoadedModule.manifest` but
-        //                  the loader does NOT currently re-check
-        //                  it at instantiation — Tier 1b/2 admission
-        //                  is rejected at build time today, so the
-        //                  runtime check is moot. When the Tier 1b/2
-        //                  runtime path lands, add a loader-side
-        //                  check that mirrors the build-time one
-        //                  (defense in depth against hand-rolled
-        //                  binaries).
-        //          bits 3-7: reserved (0).
+        //                  bit through `LoadedModule.manifest`, but
+        //                  the loader does NOT currently re-check it
+        //                  at instantiation — the runtime gate today
+        //                  is the §D7 EACCES check on every gated
+        //                  syscall (`scheduler::deny_isr_tier_syscall`).
+        //                  A loader-side defense-in-depth check that
+        //                  mirrors the build-time one would still be
+        //                  worth adding for hand-rolled binaries.
+        //          bit 3 = pre_tick_drain (Tier 1c opt-in; see
+        //                  `.context/rfc_isr_tier_surface.md` §D8).
+        //                  Read by `prepare_graph` to populate
+        //                  `domain_pre_tick_order` and exclude the
+        //                  module from `domain_exec_order`.
+        //          bits 4-7: reserved (0).
         let flags = (if has_integrity { 1 } else { 0 })
             | (if has_signature { 2 } else { 0 })
-            | (if self.isr_safe { 4 } else { 0 });
+            | (if self.isr_safe { 4 } else { 0 })
+            | (if self.pre_tick_drain { 8 } else { 0 });
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
@@ -1176,6 +1199,7 @@ impl Manifest {
         let has_integrity = (flags & 0x01) != 0;
         let has_signature = (flags & 0x02) != 0;
         let isr_safe = (flags & 0x04) != 0;
+        let pre_tick_drain = (flags & 0x08) != 0;
         let permissions_bits = data[15]; // fine-grained permissions bitmap
 
         let expected_size = MANIFEST_HEADER_SIZE
@@ -1275,6 +1299,7 @@ impl Manifest {
             capabilities: Vec::new(), // not serialized in binary format
             builtin: false,
             isr_safe,
+            pre_tick_drain,
             // `requires` is a TOML-only field — modules carry their
             // binary manifest stripped of the requires block (it's a
             // build-time concern, not a runtime one). Round-tripping
@@ -1408,6 +1433,10 @@ struct TomlManifest {
     /// See `Manifest::isr_safe` for the contract.
     #[serde(default)]
     isr_safe: bool,
+    /// Author opts the module into the Tier 1c pre-pass drain slot.
+    /// See `Manifest::pre_tick_drain` for the contract.
+    #[serde(default)]
+    pre_tick_drain: bool,
     /// Hardware-feature requirements. Validated at config time
     /// against the resolved target's capability matrix. A module that
     /// declares `requires.fpu = true` is rejected from a target without

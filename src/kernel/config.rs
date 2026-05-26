@@ -525,7 +525,10 @@ pub fn config_arena_usage() -> (usize, usize) {
 /// - Bytes 0-1: entry_length (u16) - total entry size including header
 /// - Bytes 2-5: name_hash (fnv1a32)
 /// - Byte 6: id
-/// - Byte 7: domain_id (0 = default domain)
+/// - Byte 7: bit-packed metadata —
+///   bits 0-2 = domain_id (0..7, 0 = default domain),
+///   bit  4   = pre_tick_drain (Tier 1c opt-in),
+///   bits 3, 5-7 reserved.
 /// - Bytes 8+: params (entry_length - 8 bytes)
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleEntry {
@@ -533,6 +536,12 @@ pub struct ModuleEntry {
     pub id: u8,
     /// Execution domain ID (0 = default domain)
     pub domain_id: u8,
+    /// Module opts into the Tier 1c pre-pass drain slot. Set by the
+    /// tools-side build pipeline from the module manifest's
+    /// `pre_tick_drain` field. Read by `prepare_graph` to populate
+    /// `domain_pre_tick_order` and exclude the module from
+    /// `domain_exec_order`. See `.context/rfc_isr_tier_surface.md` §D8.
+    pub pre_tick_drain: bool,
     /// Tee/merge framing mode (`FRAME_KIND_*` from `module_types`).
     /// `FRAME_KIND_NONE` (0) is best-effort byte-stream forwarding;
     /// `FRAME_KIND_ETH` (1) parses `[len:u16][payload]`;
@@ -566,6 +575,7 @@ impl Default for ModuleEntry {
             name_hash: 0,
             id: 0,
             domain_id: 0,
+            pre_tick_drain: false,
             frame_kind: 0,
             params_ptr: core::ptr::null(),
             params_len: 0,
@@ -1101,7 +1111,11 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
     unsafe {
         let name_hash = read_u32(ptr.add(4));
         let id = *ptr.add(8);
-        let domain_id = *ptr.add(9);
+        // Byte 9 is multiplexed (see ModuleEntry docs): bits 0-2 carry
+        // domain_id (0..7), bit 4 carries pre_tick_drain.
+        let byte9 = *ptr.add(9);
+        let domain_id = byte9 & 0x07;
+        let pre_tick_drain = (byte9 & 0x10) != 0;
 
         let params_len = entry_len.saturating_sub(10);
         if params_len == 0 {
@@ -1109,6 +1123,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
                 name_hash,
                 id,
                 domain_id,
+                pre_tick_drain,
                 frame_kind: 0,
                 params_ptr: core::ptr::null(),
                 params_len: 0,
@@ -1123,6 +1138,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
             name_hash,
             id,
             domain_id,
+            pre_tick_drain,
             frame_kind: 0,
             params_ptr: arena_buf.as_ptr(),
             params_len,

@@ -395,6 +395,11 @@ pub fn provider_open(
     config: *const u8,
     config_len: usize,
 ) -> i32 {
+    // RFC §D7: ISR-tier modules must not touch the provider table.
+    // Bridge channels are the only legal cross-tier conduit.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_open") {
+        return errno::EACCES;
+    }
     let handle = match vtable_for(contract) {
         // SAFETY: vt.call is the contract's registered fn-pointer; passing
         // -1 (no handle yet) with the open opcode and caller's config buf.
@@ -468,6 +473,14 @@ pub fn provider_open(
 /// the tag when they need to reject a wrong-family handle (e.g. a
 /// channel-op handler rejecting a DMA-fd tag).
 pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // Defense in depth (RFC §D6): ISR-tier (Tier 1b/2) modules must
+    // not reach `provider_call` — the contract is "bridge-only I/O,
+    // no syscalls". The build-time validator already gates
+    // admission; this catches hand-rolled binaries that bypass the
+    // tools pipeline.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_call") {
+        return errno::EACCES;
+    }
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             // SAFETY: vt.call is the contract's registered ABI entry;
@@ -484,6 +497,9 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
 
 /// Query handle state by key.
 pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_query") {
+        return errno::EACCES;
+    }
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             return match vt.query {
@@ -500,6 +516,9 @@ pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i3
 /// For contracts whose vtable declares `default_close_op = 0`,
 /// `provider_close` only releases the tracking entry and returns 0.
 pub fn provider_close(handle: i32) -> i32 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_close") {
+        return errno::EACCES;
+    }
     let result = if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             if vt.default_close_op != 0 {

@@ -147,6 +147,14 @@ impl BuiltInModule {
             state: [0u8; 64],
         }
     }
+
+    /// Read-only view of the step-function pointer. Used by the
+    /// scheduler's Tier 1b admission path to forward the function
+    /// pointer to `isr_tier::register_tier1b_module`, which fires it
+    /// from the polled-timer ISR rather than the cooperative loop.
+    pub fn step_fn(&self) -> fn(*mut u8) -> i32 {
+        self.step_fn
+    }
 }
 
 impl Module for BuiltInModule {

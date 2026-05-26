@@ -1489,19 +1489,28 @@ fn validate_scheduler_budgets(
 ///    non-ISR-safe module into an ISR domain it would deadlock on
 ///    `provider_call` from interrupt context.
 ///
-/// 2. **Edge class compatibility.** Bridge routing is derived from
-///    the consumer's tier — see `.context/rfc_isr_tier_surface.md`
-///    §D6. The validator rejects wiring that pre-emptively tags an
-///    edge with a class incompatible with bridge routing
-///    (`dma_owned`, `cross_core`, `nic_ring`) when either endpoint
-///    is in an ISR-tier domain. Untagged or `local`-tagged edges are
-///    accepted and silently promoted to bridge channels at
-///    instantiation time.
+/// 2. **No edges touching ISR-tier endpoints.** As of 2026-05-26
+///    ANY YAML edge with at least one Tier 1b/2 endpoint is
+///    rejected, regardless of `edge_class`. The kernel-side bridge
+///    wiring (`scheduler::wire_isr_bridges` + `pump_isr_bridges`)
+///    is implemented and verified by harness tests, but PIC
+///    modules have no documented SDK surface for reading their
+///    bridge slot indices from inside `module_step` — the SDK's
+///    `bridge_dispatch` helper rides `provider_call`, which the
+///    §D7 syscall gate denies for ISR-tier callers. Admitting a
+///    config that would silently fail at runtime is worse than
+///    rejecting it loudly. See `docs/architecture/scheduler.md`
+///    §"ISR-tier I/O contract" for the lift path. Tests that need
+///    to exercise the kernel-side bridge mechanism bypass YAML via
+///    `install_static_config` + `set_domain_exec_mode`.
 ///
-/// Modules whose manifests can't be located are skipped with a
-/// warning — the wiring/manifest validation in `validate_wiring_types`
-/// raises a separate, more descriptive error for missing manifests,
-/// and double-erroring here would obscure that diagnostic.
+/// A module that lands in an ISR-tier domain without a resolvable
+/// manifest is a **hard error**. `validate_wiring_types` only
+/// enforces content-type compatibility when both edge endpoints
+/// have manifests, so a Tier 1b module with no wiring (or bare /
+/// default ports) would otherwise slip through both this gate and
+/// the wiring check unchecked. The diagnostic names the module +
+/// the directory it should live under.
 fn validate_isr_tier_admission(
     config: &Value,
     module_list: &[Value],
@@ -1542,60 +1551,36 @@ fn validate_isr_tier_admission(
         }
     }
 
-    // Hard-reject Tier 1b / Tier 2 admission until the runtime
-    // path is wired up. The pieces in place today:
-    //   * YAML surface: parsed by `parse_domain_tier_to_exec_mode`.
-    //   * Build-time admission: this validator (the `isr_safe`
-    //     manifest gate + the edge-class check below).
-    //   * Kernel cooperative skip: `step_one_module` returns
-    //     early for ISR-tier modules so they don't double-step.
-    //   * Runtime gate: `channel_open` returns EACCES from a
-    //     Tier 1b/2 caller.
-    //
-    // What's missing:
-    //   * `register_tier1b_module` / `register_tier2_module` have
-    //     no call sites — prepare_graph doesn't hand modules to
-    //     the ISR machinery.
-    //   * `bcm2712::run_domain_loop` only special-cases exec
-    //     modes 1 and 3; modes 2 and 4 fall through to the
-    //     default (cooperative) loop, which then skips the
-    //     module → it never runs.
-    //   * Bridge channel allocation from YAML edges is not done.
-    //
-    // Net effect of letting a Tier 1b/2 graph through today: the
-    // build succeeds, the module loads, and nothing ever runs it
-    // — the worst flavour of "config silently passes." Reject at
-    // build time with a precise message until the runtime piece
-    // lands; see `.context/rfc_isr_tier_surface.md` for the
-    // sequencing.
+    // Tier 2 (per-IRQ) is wire-format-defined but **not yet runtime-
+    // wired**: the .fmod ABI exports a separate `module_isr_entry`
+    // (see `src/kernel/loader.rs::MODULE_ISR_ENTRY` ABI hash and
+    // `tools/src/modules.rs`'s ISR-symbol detection) which the
+    // current loader does NOT extract into `ModuleExports`, and the
+    // admission helper would otherwise call the cooperative
+    // `module_step` from IRQ context — wrong function, wrong
+    // contract. Until the loader extracts the ISR entry symbol and
+    // the kernel routes it through `register_tier2_module`, Tier 2
+    // is build-time rejected. See
+    // `.context/rfc_isr_tier_surface.md` "Remaining work".
     for d in 0..4 {
         let m = domain_exec_mode[d];
-        if m == 2 || m == 4 {
+        if m == 4 {
             let label = domain_names_local[d]
                 .clone()
                 .unwrap_or_else(|| format!("domains[{d}]"));
-            let tier_name = if m == 2 {
-                "1b (isr_timer)"
-            } else {
-                "2 (isr_owned)"
-            };
             return Err(Error::Config(format!(
-                "execution.domains entry '{label}': tier {tier_name} is declared but not yet \
-                 runtime-supported on any target. The YAML schema, manifest gate, and \
-                 cooperative scheduler skip are in place, but the platform's \
-                 `register_tier1b_module` / `register_tier2_module` glue + bridge channel \
-                 allocation are not wired up — a build with this tier would load the \
-                 module and never run it. Use tier 0/1a/3 for now; track \
+                "execution.domains entry '{label}': tier 2 (isr_owned) is declared, \
+                 but the kernel's PIC loader does not yet extract the \
+                 `module_isr_entry` ABI export — admitting a Tier 2 module today \
+                 would call the cooperative `module_step` from IRQ context, which \
+                 violates the §D7 contract. Tier 1b (timer-driven) is supported \
+                 today; use it if a periodic ISR fits the workload. Track \
                  .context/rfc_isr_tier_surface.md for the lift."
             )));
         }
     }
 
     // Helper: does this exec_mode require ISR-safe modules?
-    // (Reachable now only via the build-time-only branches below
-    // since the hard-reject above blocks any config from ever
-    // setting `domain_exec_mode[d]` to 2 or 4 — but kept for
-    // when the runtime path lands and the reject is lifted.)
     let is_isr_tier = |m: u8| -> bool { m == 2 || m == 4 };
 
     // Helper: friendly tier label for error messages.
@@ -1626,12 +1611,27 @@ fn validate_isr_tier_admission(
             .and_then(|n| n.clone())
             .unwrap_or_else(|| format!("domain {domain}"));
 
-        // Look up the manifest. Missing-manifest is reported elsewhere
-        // (`validate_wiring_types`); skip silently here so this gate
-        // gives a single, focused diagnostic.
+        // ISR-tier admission requires a manifest — we cannot
+        // certify `isr_safe = true` (or run the NEON-import lint)
+        // without one. Don't defer to `validate_wiring_types`: that
+        // pass only enforces content-type compatibility when both
+        // endpoints have manifests, so a Tier 1b module with no
+        // edges or bare/default ports would slip through silently.
         let manifest = match manifests.get(name) {
             Some(m) => m,
-            None => continue,
+            None => {
+                let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
+                return Err(Error::Config(format!(
+                    "module '{name}' (type '{module_type}') is assigned to domain \
+                     '{domain_label}' (tier {tier}) but no manifest was found. \
+                     ISR-tier admission requires a manifest declaring `isr_safe = true`; \
+                     add `manifest.toml` under the module's source tree (`modules/<area>/<type>/`) \
+                     or list a containing directory in the config's top-level \
+                     `module_search_paths:`. Run `fluxor inspect` to see the active search list. \
+                     See .context/rfc_isr_tier_surface.md §D7.",
+                    tier = tier_label(exec_mode)
+                )));
+            }
         };
         if !manifest.isr_safe {
             let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
@@ -1650,16 +1650,15 @@ fn validate_isr_tier_admission(
         // preempted cooperative thread's NEON file. Run the
         // source-static lint on the module's `src/` tree; if it
         // finds NEON markers, reject the placement.
+        //
+        // The lookup goes through `resolve_module_root` so the
+        // search order is identical to the manifest loader's: an
+        // explicit YAML `module_search_paths:` entry shadowing a
+        // bundled module wins for both `isr_safe` and the NEON
+        // lint, instead of one reader trusting the bundled copy
+        // and the other trusting the override.
         let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
-        let mut src_root: Option<std::path::PathBuf> = None;
-        for dir in std::iter::once(modules_dir).chain(extra_module_dirs.iter().copied()) {
-            let candidate = dir.join(module_type);
-            if candidate.exists() {
-                src_root = Some(candidate);
-                break;
-            }
-        }
-        if let Some(root) = src_root {
+        if let Some(root) = resolve_module_root(module_type, extra_module_dirs) {
             if let Err(e) = crate::manifest::check_isr_safe_no_neon(&root) {
                 return Err(Error::Config(format!(
                     "module '{name}' (type '{module_type}') admitted to domain \
@@ -1670,8 +1669,7 @@ fn validate_isr_tier_admission(
         }
     }
 
-    // ── Rule 2: incompatible edge classes on ISR-tier edges ─────
-    // Build module name → exec_mode lookup.
+    // Build module name → exec_mode lookup (used by Rules 2 and 3).
     let mut module_exec_mode: std::collections::HashMap<String, u8> =
         std::collections::HashMap::new();
     for module in module_list {
@@ -1682,18 +1680,66 @@ fn validate_isr_tier_admission(
         }
     }
 
+    // ── Rule 3 (runs BEFORE Rule 2 so wireless graphs still check):
+    // Tier 2 `irq:` requirement + duplicate check.
+    let mut seen_irq: Vec<(u16, String)> = Vec::new();
+    for module in module_list {
+        let name = match module.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let m = module_exec_mode.get(name).copied().unwrap_or(0);
+        if m != 4 {
+            continue;
+        }
+        let irq = match module.get("irq").and_then(|v| v.as_u64()) {
+            Some(n) if n < u16::MAX as u64 => n as u16,
+            Some(_) | None => {
+                return Err(Error::Config(format!(
+                    "module '{name}' is in a Tier 2 (isr_owned) domain but does not \
+                     declare an `irq:` field (or its value is out of u16 range). Add \
+                     `irq: N` on the module, where N is the hardware IRQ number the \
+                     module owns. See .context/rfc_isr_tier_surface.md §D5."
+                )));
+            }
+        };
+        if let Some((_, prev_name)) = seen_irq.iter().find(|(i, _)| *i == irq) {
+            return Err(Error::Config(format!(
+                "Tier 2 IRQ {irq} declared by both module '{prev_name}' and \
+                 module '{name}'. Two modules sharing one hardware IRQ produce \
+                 undefined dispatch ordering — the kernel's \
+                 `isr_tier2_trampoline` is a single-handler-per-IRQ table. Give \
+                 each Tier 2 module a distinct IRQ number."
+            )));
+        }
+        seen_irq.push((irq, name.to_string()));
+    }
+
+    // ── Rule 2: edges touching ISR-tier modules are rejected ────
+    //
+    // v1 reality (2026-05-26): the kernel-side bridge wiring works
+    // — `wire_isr_bridges` + `pump_isr_bridges` shuttle bytes
+    // between cooperative PIPE channels and bridge rings — but PIC
+    // modules have NO documented way to read their own bridge slot
+    // indices from inside `module_step`, and the §D7 syscall gate
+    // denies `provider_call` (which the SDK's `bridge_dispatch`
+    // helper rides on). So an ISR-endpoint edge would get a bridge
+    // slot allocated, the kernel would drain bytes into the ring,
+    // and the ISR module would have no supported way to read them.
+    //
+    // Until the module-facing bridge ABI lands (see
+    // `docs/architecture/scheduler.md` §"ISR-tier I/O contract"),
+    // reject ANY YAML edge with an ISR-tier endpoint. Tests that
+    // bypass YAML (e.g. `tests/harness/tests/scheduler_isr_bridges.rs`)
+    // continue to exercise the kernel-side mechanism through
+    // `install_static_config` + `set_domain_exec_mode`, but a real
+    // graph can't admit a configuration that would silently
+    // not-work at runtime.
     let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
         Some(w) => w,
         None => return Ok(()),
     };
     for (i, edge) in wiring.iter().enumerate() {
-        let ec_str = match edge.get("edge_class").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => continue, // untagged = local = OK with bridge
-        };
-        if ec_str == "local" {
-            continue;
-        }
         let from_mod = edge
             .get("from")
             .and_then(|v| v.as_str())
@@ -1716,12 +1762,21 @@ fn validate_isr_tier_admission(
             .unwrap_or(false);
         if from_isr || to_isr {
             return Err(Error::Config(format!(
-                "wiring[{i}] (from '{from_mod}' to '{to_mod}'): edge_class '{ec_str}' is \
-                 incompatible with ISR-tier endpoints. Tier 1b/2 modules consume their \
-                 inputs through bridge channels; the kernel routes the edge \
-                 automatically. Remove the `edge_class:` field or set it to `local`.",
+                "wiring[{i}] (from '{from_mod}' to '{to_mod}'): an edge touching an \
+                 ISR-tier endpoint cannot be wired in v1 — PIC modules have no \
+                 module-facing API to read/write their bridge slots from inside \
+                 `module_step`. The kernel-side bridge mechanism is wired and \
+                 tested, but the SDK surface is not. Drop the edge from your YAML \
+                 (Tier 1b modules in v1 do private-state work only), or move both \
+                 endpoints to cooperative tiers. Track \
+                 `docs/architecture/scheduler.md` §\"ISR-tier I/O contract\" \
+                 for the lift."
             )));
         }
+        // Past this point both endpoints are cooperative. Any
+        // explicit `edge_class` (DmaOwned/CrossCore/NicRing) on a
+        // cooperative-only edge is the operator's choice and the
+        // existing wiring path handles it.
     }
 
     // Bonus diagnostic: warn if an ISR-tier domain has no modules
@@ -1734,9 +1789,10 @@ fn validate_isr_tier_admission(
     // BOTH Tier 1b domains regardless of which they actually
     // belong to).
     //
-    // Currently unreachable in practice because the hard-reject
-    // above blocks any Tier 1b/2 admission — but kept honest so
-    // lifting the reject doesn't reintroduce the bug.
+    // Tier 1b admission is live (gated on `isr_safe = true` +
+    // NEON-import lint). Tier 2 is still hard-rejected pending the
+    // PIC-loader `module_isr_entry` lift. This check stays honest
+    // for both tiers — an empty Tier 1b domain is still a bug.
     let mut per_domain_member_count: [usize; 4] = [0; 4];
     for module in module_list {
         let d = resolve_domain_id(module, config)?;
@@ -1762,6 +1818,85 @@ fn validate_isr_tier_admission(
     }
 
     let _ = modules_dir; // reserved for future use (per-domain budget files)
+    Ok(())
+}
+
+/// Reject placement of a `pre_tick_drain` module into any domain
+/// whose tier isn't cooperative (Tier 0 or Tier 1a). Pre-tick
+/// modules run in cooperative context with the full kernel API;
+/// admitting one into a Tier 1b/2 (ISR) or Tier 3 (poll) domain
+/// would either run it from interrupt context (where its
+/// `provider_call`/heap usage is undefined) or never run it at all
+/// (Tier 3 has no `domain_exec_order` to inject the pre-tick slot
+/// into). See `.context/rfc_isr_tier_surface.md` §D8 for the
+/// contract this validator enforces.
+fn validate_pre_tick_drain_admission(
+    config: &Value,
+    module_list: &[Value],
+    extra_module_dirs: &[&std::path::Path],
+) -> Result<()> {
+    // Per-domain exec_mode for the four supported domains.
+    let mut domain_exec_mode: [u8; 4] = [0; 4];
+    let mut domain_names_local: [Option<String>; 4] = [None, None, None, None];
+    if let Some(domains) = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(|d| d.as_array())
+    {
+        for (i, dom) in domains.iter().take(4).enumerate() {
+            if let Some(name) = dom.get("name").and_then(|n| n.as_str()) {
+                domain_names_local[i] = Some(name.to_string());
+            }
+            if let Some(m) = parse_domain_tier_to_exec_mode(dom) {
+                domain_exec_mode[i] = m;
+            }
+        }
+    }
+
+    let manifests =
+        load_module_manifests_with_extra(&Value::Array(module_list.to_vec()), extra_module_dirs);
+
+    for module in module_list {
+        let name = match module.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let manifest = match manifests.get(name) {
+            Some(m) => m,
+            None => continue,
+        };
+        if !manifest.pre_tick_drain {
+            continue;
+        }
+        let domain = resolve_domain_id(module, config)?;
+        let exec_mode = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
+        // Tier 0 (0) and Tier 1a (1) are the only valid hosts for
+        // pre-tick modules. Tier 1b (2) / Tier 2 (4) are ISR; Tier 3
+        // (3) is poll-mode with no exec_order to drain alongside.
+        if exec_mode != 0 && exec_mode != 1 {
+            let domain_label = domain_names_local
+                .get(domain as usize)
+                .and_then(|n| n.clone())
+                .unwrap_or_else(|| format!("domain {domain}"));
+            let module_type = module.get("type").and_then(|t| t.as_str()).unwrap_or(name);
+            let tier_name = match exec_mode {
+                2 => "1b (isr_timer)",
+                3 => "3 (poll)",
+                4 => "2 (isr_owned)",
+                _ => "non-cooperative",
+            };
+            return Err(Error::Config(format!(
+                "module '{name}' (type '{module_type}') declares \
+                 `pre_tick_drain = true` but is assigned to domain '{domain_label}' \
+                 (tier {tier_name}). Pre-tick modules run cooperatively at the start \
+                 of every scheduler pass — they must live in a Tier 0 or Tier 1a \
+                 domain. Move the module to a cooperative domain, or drop \
+                 `pre_tick_drain` from its manifest. See \
+                 .context/rfc_isr_tier_surface.md §D8."
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -2324,6 +2459,7 @@ fn build_module_entry(
     data_section: Option<&Value>,
     config: &Value,
     modules_dir: &Path,
+    manifests: &HashMap<String, Manifest>,
 ) -> Result<Vec<u8>> {
     // Start with max possible size, will truncate to actual used size
     let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + MAX_MODULE_PARAMS_SIZE];
@@ -2340,11 +2476,30 @@ fn build_module_entry(
     //   bytes 0-3: entry_length (u32, patched in below at line ~1953)
     //   bytes 4-7: name_hash (u32)
     //   byte 8:    module id
-    //   byte 9:    domain id
+    //   byte 9:    bits 0-2 = domain_id (0..7), bit 4 = pre_tick_drain
+    //              (Tier 1c opt-in). Mirrored from
+    //              `manifest.pre_tick_drain`. Kept on the module entry
+    //              (not the .fmod manifest) so the kernel reads it
+    //              during `prepare_graph` without a second loader pass.
     entry[4..8].copy_from_slice(&name_hash.to_le_bytes());
     entry[8] = id;
     let domain_id = resolve_domain_id(module, config)?;
-    entry[9] = domain_id;
+    if domain_id > 7 {
+        return Err(Error::Config(format!(
+            "module `{name}` resolves to domain_id={domain_id}, exceeds wire-format max of 7"
+        )));
+    }
+    // `manifests` was populated by `load_module_manifests_with_extra`
+    // against the SAME resolver chain that admission validation
+    // uses (project root, install root, caller-supplied extras).
+    // The previous version called `Manifest::from_source_tree`
+    // here, which used a hard-coded `SOURCE_DIRS` list — modules
+    // outside that list (e.g. an installed driver with
+    // `pre_tick_drain = true`) would pass admission but emit a
+    // config blob with the bit clear, silently demoting the module
+    // out of `domain_pre_tick_order` at runtime.
+    let pre_tick_drain = manifests.get(name).is_some_and(|m| m.pre_tick_drain);
+    entry[9] = domain_id | (if pre_tick_drain { 0x10 } else { 0 });
 
     // Track actual params length used
     let params_len: usize;
@@ -2730,6 +2885,67 @@ fn build_module_entry(
         }
     }
 
+    // Tag 0xFB: isr_budget_cycles (u32 LE, 4 bytes). Per-module
+    // Tier 1b/2 cycle budget override. Default `0` falls back to the
+    // kernel's `DEFAULT_ISR_BUDGET_CYCLES`. See
+    // `.context/rfc_isr_tier_surface.md` §D7.
+    if let Some(v) = module.get("isr_budget_cycles") {
+        if !v.is_null() {
+            let cycles = match v.as_u64() {
+                Some(n) if n <= u32::MAX as u64 => n as u32,
+                Some(n) => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': isr_budget_cycles = {n} exceeds u32::MAX"
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': isr_budget_cycles must be a non-negative \
+                         integer (got {v})"
+                    )));
+                }
+            };
+            if base + extra_len + 6 < entry.len() {
+                entry[base + extra_len] = 0xFB;
+                entry[base + extra_len + 1] = 4;
+                let bytes = cycles.to_le_bytes();
+                entry[base + extra_len + 2..base + extra_len + 6].copy_from_slice(&bytes);
+                extra_len += 6;
+            }
+        }
+    }
+
+    // Tag 0xFC: irq (u16 LE, 2 bytes). Per-module hardware IRQ
+    // number for Tier 2 admission. Required for Tier 2 modules
+    // (`validate_isr_tier_admission` enforces); the kernel passes
+    // it to `register_tier2_module` at admission time.
+    if let Some(v) = module.get("irq") {
+        if !v.is_null() {
+            let irq_num = match v.as_u64() {
+                Some(n) if n < u16::MAX as u64 => n as u16,
+                Some(n) => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': irq = {n} exceeds u16 range \
+                         (max = {} — u16::MAX reserved as 'unset' sentinel)",
+                        u16::MAX - 1
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "module '{name}': irq must be a non-negative integer (got {v})"
+                    )));
+                }
+            };
+            if base + extra_len + 4 < entry.len() {
+                entry[base + extra_len] = 0xFC;
+                entry[base + extra_len + 1] = 2;
+                let bytes = irq_num.to_le_bytes();
+                entry[base + extra_len + 2..base + extra_len + 4].copy_from_slice(&bytes);
+                extra_len += 4;
+            }
+        }
+    }
+
     // Emit the schema-section end marker `0xFF 0x00` here, after the
     // protection tags (0xF0-0xFA) but BEFORE any extended cert/key
     // blobs. The schema SDK parser walks until it hits 0xFF and
@@ -2872,6 +3088,7 @@ fn parse_modules_map(
     data_section: Option<&Value>,
     config: &Value,
     modules_dir: &Path,
+    manifests: &HashMap<String, Manifest>,
 ) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
     let mut entries = Vec::new();
     let mut names = Vec::new();
@@ -2967,7 +3184,15 @@ fn parse_modules_map(
         }
 
         let id = idx as u8;
-        let entry = build_module_entry(name, &module_owned, id, data_section, config, modules_dir)?;
+        let entry = build_module_entry(
+            name,
+            &module_owned,
+            id,
+            data_section,
+            config,
+            modules_dir,
+            manifests,
+        )?;
         entries.push(entry);
         names.push(name.to_string());
     }
@@ -3103,6 +3328,46 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// Resolve a module `type_name` to the directory that contains its
+/// `manifest.toml` + `src/` tree, honoring the documented search-path
+/// priority order:
+///
+///   1. **`extra_dirs` first** — the caller-supplied list, typically
+///      `extract_module_search_paths()`'s output (YAML
+///      `module_search_paths` → `<config-parent>/../modules` →
+///      project/install `modules/`). The YAML entry is *priority-
+///      ordered*: an entry earlier in the list shadows a later one.
+///   2. **`standard_module_dirs()`** — the bundled subtree layout
+///      (`modules/drivers`, `modules/foundation`, ...) under the
+///      project root, then under the install root.
+///
+/// Returns the first hit (`<dir>/<type_name>` whose directory
+/// exists). Centralising the lookup keeps the manifest loader
+/// (`load_module_manifests_with_extra`) and the ISR-tier NEON-lint
+/// in `validate_isr_tier_admission` aligned: if a config-declared
+/// `module_search_paths:` entry collides with a bundled module of
+/// the same `type:` name, both readers must agree on which one
+/// wins. Splitting the order between the two readers historically
+/// admitted an ISR module that scanned the wrong source tree.
+fn resolve_module_root(
+    type_name: &str,
+    extra_dirs: &[&std::path::Path],
+) -> Option<std::path::PathBuf> {
+    for extra in extra_dirs {
+        let candidate = extra.join(type_name);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    for dir in standard_module_dirs() {
+        let candidate = dir.join(type_name);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Process-global "already warned" cache for malformed manifest
 /// paths. `load_module_manifests_with_extra` runs multiple times
 /// in a single `fluxor validate` / `fluxor build` invocation
@@ -3133,7 +3398,6 @@ pub fn load_module_manifests_with_extra(
     extra_dirs: &[&std::path::Path],
 ) -> HashMap<String, Manifest> {
     let mut manifests = HashMap::new();
-    let standard = standard_module_dirs();
     let list = match modules_config.as_array() {
         Some(l) => l,
         None => return manifests,
@@ -3144,52 +3408,35 @@ pub fn load_module_manifests_with_extra(
             None => continue,
         };
         let type_name = module["type"].as_str().unwrap_or(name);
-        let mut found = false;
 
-        // Search standard dirs first (project root, then install
-        // root). User overrides win because the project root is
-        // walked first.
-        for dir in &standard {
-            let manifest_path = dir.join(type_name).join("manifest.toml");
-            if manifest_path.exists() {
-                match Manifest::from_toml(&manifest_path) {
-                    Ok(m) => {
-                        manifests.insert(name.to_string(), m);
-                        found = true;
-                    }
-                    Err(e) => {
-                        // Don't silently swallow the parse error —
-                        // a malformed manifest looks identical to
-                        // a missing one downstream ("no manifest
-                        // found"), and the user has no idea why.
-                        // Surface the path + error so they can fix
-                        // it; the downstream gate still errors out
-                        // because the module didn't make it into
-                        // the map. Dedup'd across the process so
-                        // re-entry from multiple validators doesn't
-                        // spam the same path 3-4 times.
-                        warn_manifest_parse_error_once(&manifest_path, &e);
-                    }
-                }
-                break;
-            }
+        // `resolve_module_root` walks `extra_dirs` first (the
+        // YAML-declared `module_search_paths:` order), then the
+        // standard bundled subdirs. An explicit YAML entry
+        // shadowing a bundled module of the same type:name was
+        // documented to win — searching standard first violated
+        // that and could load the wrong `manifest.toml` for
+        // ISR-tier admission.
+        let Some(root) = resolve_module_root(type_name, extra_dirs) else {
+            continue;
+        };
+        let manifest_path = root.join("manifest.toml");
+        if !manifest_path.exists() {
+            continue;
         }
-
-        // Then search extra dirs (config-relative module paths)
-        if !found {
-            for extra in extra_dirs {
-                let manifest_path = extra.join(type_name).join("manifest.toml");
-                if manifest_path.exists() {
-                    match Manifest::from_toml(&manifest_path) {
-                        Ok(m) => {
-                            manifests.insert(name.to_string(), m);
-                        }
-                        Err(e) => {
-                            warn_manifest_parse_error_once(&manifest_path, &e);
-                        }
-                    }
-                    break;
-                }
+        match Manifest::from_toml(&manifest_path) {
+            Ok(m) => {
+                manifests.insert(name.to_string(), m);
+            }
+            Err(e) => {
+                // Don't silently swallow the parse error — a
+                // malformed manifest looks identical to a missing
+                // one downstream ("no manifest found") and the
+                // user has no idea why. Surface the path + error;
+                // the downstream gate still errors out because the
+                // module didn't make it into the map. Dedup'd
+                // across the process so re-entry from multiple
+                // validators doesn't spam the same path 3-4 times.
+                warn_manifest_parse_error_once(&manifest_path, &e);
             }
         }
     }
@@ -4287,6 +4534,17 @@ fn generate_config_impl(
     // `.context/rfc_isr_tier_surface.md` for the full contract.
     validate_isr_tier_admission(config, module_list, modules_dir, extra_module_dirs)?;
 
+    // Tier 1c pre-pass drain admission: a module flagged
+    // `pre_tick_drain = true` in its manifest is cooperative-only —
+    // the kernel iterates pre-tick modules before the regular
+    // `domain_exec_order` rotation, and the entry point still calls
+    // through `step_one_module` which assumes cooperative context.
+    // Placement in Tier 1b/2/3 domains is rejected here so the
+    // misconfiguration surfaces at build time rather than as silent
+    // misbehaviour at runtime. See `.context/rfc_isr_tier_surface.md`
+    // §D8 for the contract.
+    validate_pre_tick_drain_admission(config, module_list, extra_module_dirs)?;
+
     // Inject graph sample_rate into modules that don't declare their own
     let modules_with_rate;
     let modules_ref = if graph_sample_rate > 0 {
@@ -4307,11 +4565,17 @@ fn generate_config_impl(
     // Get data section for preset resolution
     let data_section = config.get("data");
 
-    let (module_entries, module_names) =
-        parse_modules_map(modules_ref, data_section, config, modules_dir)?;
-
-    // Load manifests for named port resolution and type validation
+    // Load manifests FIRST (via the rich resolver — standard module
+    // dirs + project/install roots + caller-supplied extras) so that
+    // `parse_modules_map` / `build_module_entry` can read per-module
+    // flags like `pre_tick_drain` from the resolved manifest instead
+    // of doing a second, narrower lookup that may miss modules
+    // outside the hard-coded `Manifest::from_source_tree` search
+    // list (e.g. modules in the install root or in extras).
     let manifests = load_module_manifests_with_extra(modules_ref, extra_module_dirs);
+
+    let (module_entries, module_names) =
+        parse_modules_map(modules_ref, data_section, config, modules_dir, &manifests)?;
 
     // Hardware-capability validation. Each module's `[requires]`
     // block declares what the silicon must provide (FPU / NEON /
@@ -4935,6 +5199,77 @@ pub static EXAMPLES: LazyLock<HashMap<&'static str, Value>> = LazyLock::new(|| {
     m
 });
 
+/// Shared test helpers for env-mutating tests.
+///
+/// Multiple test modules in this file (`scheduler_validation_tests`
+/// and `module_discovery_tests`) mutate `FLUXOR_PROJECT_ROOT` /
+/// `FLUXOR_INSTALL_ROOT`. Cargo runs tests inside one binary in
+/// parallel by default, and `project::root()` reads the env
+/// dynamically — so without a shared lock, parallel tests see each
+/// other's mid-test state.
+///
+/// The lock + guard live here, sibling to both test modules; each
+/// uses them via `super::test_env::*`.
+#[cfg(test)]
+pub(crate) mod test_env {
+    /// File-scope mutex serialising every env-mutating test.
+    /// Poisoning is treated as benign: callers continue with the
+    /// recovered guard.
+    pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
+        match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// RAII guard: takes the file-scope env lock, snapshots a set of
+    /// env vars, applies overrides, and restores the originals on
+    /// drop — so a panic inside a test does not leak mutated state
+    /// to subsequent tests.
+    pub struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        /// Acquire the lock, save current values of `vars`, then set
+        /// each to its override.
+        pub fn set(vars: &[(&'static str, &std::path::Path)]) -> Self {
+            let _lock = lock();
+            let mut saved = Vec::with_capacity(vars.len());
+            for (k, _) in vars {
+                saved.push((*k, std::env::var(k).ok()));
+            }
+            for (k, v) in vars {
+                // SAFETY: process-global env mutation serialised by
+                // the file-scope `ENV_LOCK` held in `_lock` for the
+                // lifetime of this guard.
+                unsafe {
+                    std::env::set_var(k, v);
+                }
+            }
+            Self { _lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                // SAFETY: same lock as `set`; runs on drop (incl.
+                // panic unwind) so callers never leak overrides.
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod scheduler_validation_tests {
     use super::*;
@@ -5164,6 +5499,61 @@ mod scheduler_validation_tests {
         assert!(parse_domain_tier_to_exec_mode(&json!({"name": "d"})).is_none());
     }
 
+    #[test]
+    fn exec_mode_wire_bytes_locked_against_rfc_d5_table() {
+        // FULL `(string → byte)` mapping pinned verbatim against the
+        // §D5 table in `.context/rfc_isr_tier_surface.md`. Any change
+        // here is a wire-format break (older `.cfg.bin` blobs with
+        // the previous mapping would silently mis-route domains).
+        // Failing this test means either the table changed or a
+        // synonym was renamed — both require coordinated kernel +
+        // tools + docs updates.
+        let pairs: &[(&str, u8)] = &[
+            ("cooperative", 0),
+            ("0", 0),
+            ("1a", 1),
+            ("high_rate", 1),
+            ("tier1a", 1),
+            ("1b", 2),
+            ("isr_timer", 2),
+            ("tier1b", 2),
+            ("3", 3),
+            ("poll", 3),
+            ("tier3", 3),
+            ("2", 4),
+            ("isr_owned", 4),
+            ("tier2", 4),
+        ];
+        for (s, expected) in pairs {
+            assert_eq!(
+                parse_domain_tier_to_exec_mode(&json!({"tier": s})),
+                Some(*expected),
+                "WIRE-FORMAT BREAK: tier `{s}` no longer maps to byte \
+                 {expected}. Update `.context/rfc_isr_tier_surface.md` \
+                 §D5 + the kernel-side `scheduler::exec_mode::*` \
+                 constants together."
+            );
+        }
+    }
+
+    #[test]
+    fn exec_mode_bare_numeric_only_accepts_zero() {
+        // Numeric form is intentionally narrow (YAML can't
+        // distinguish `tier: 1` from a 1a vs 1b string). Only `0`
+        // resolves; everything else must return None so the operator
+        // sees a hard error instead of a silent fall-through.
+        assert_eq!(parse_domain_tier_to_exec_mode(&json!({"tier": 0})), Some(0));
+        for n in [1u64, 2, 3, 4, 5, 7, 100] {
+            assert_eq!(
+                parse_domain_tier_to_exec_mode(&json!({"tier": n})),
+                None,
+                "bare numeric tier {n} must NOT silently parse — \
+                 only the friendly-string form is allowed for non-zero \
+                 tiers."
+            );
+        }
+    }
+
     // ---- validate_isr_tier_admission ----
     //
     // These tests exercise the validator directly with synthetic
@@ -5209,34 +5599,149 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn admission_rejects_tier_1b_as_not_yet_runtime_supported() {
-        // Tier 1b is build-time-rejected today: the YAML schema +
-        // build-time manifest gate + cooperative scheduler skip
-        // are in place, but the runtime registration / bridge
-        // wiring isn't. Better to fail loudly at build than ship
-        // a config whose modules silently never run. Lift this
-        // test (and the gate) when the runtime path lands.
+    fn admission_rejects_tier_1b_module_without_isr_safe_manifest() {
+        // Tier 1b is admitted as of 2026-05-26 — but only for modules
+        // that declare `isr_safe = true` in their manifest. A module
+        // without the attestation must be rejected with a precise
+        // diagnostic pointing at the offending manifest path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("unflagged");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
         let cfg = json!({
             "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
         });
-        let modules = vec![json!({"name": "m", "type": "x", "domain": "audio_isr"})];
-        let err = run_admission(cfg, modules).unwrap_err();
+        let modules =
+            vec![json!({"name": "unflagged", "type": "unflagged", "domain": "audio_isr"})];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("unflagged module in Tier 1b domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("tier 1b") && msg.contains("not yet runtime-supported"),
-            "expected tier-1b-not-supported diagnostic, got: {msg}"
-        );
-        assert!(
-            msg.contains("rfc_isr_tier_surface"),
-            "diagnostic should point at the lift-tracking RFC, got: {msg}"
+            msg.contains("isr_safe = true") && msg.contains("unflagged"),
+            "diagnostic must name the missing attestation + the module, got: {msg}"
         );
     }
 
     #[test]
-    fn admission_rejects_tier_2_as_not_yet_runtime_supported() {
-        // Symmetric: Tier 2 (`tier: 2` / `isr_owned`) hits the
-        // same hard-reject — same missing runtime piece, same
-        // explanation.
+    fn admission_rejects_tier_1b_module_with_no_resolvable_manifest() {
+        // Regression: an ISR-tier module that does not resolve to a
+        // manifest (typo in `type:`, missing module dir, build-tree
+        // not on the search path, etc.) used to be skipped silently
+        // in `validate_isr_tier_admission` on the assumption that
+        // `validate_wiring_types` would catch it. That assumption
+        // is wrong — `validate_wiring_types` only enforces content
+        // types when **both** endpoints have manifests, so a Tier 1b
+        // module with no edges (or bare/default ports) can land in
+        // the graph without ever running through the `isr_safe`
+        // check or the NEON-import lint.
+        //
+        // Hard-error here so the operator gets a single, focused
+        // diagnostic naming the unresolved module rather than a
+        // silent admission followed by a runtime trap.
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "ghost_module",
+            "type": "definitely_not_a_real_module_type_xyz",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = Vec::new();
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("Tier 1b module with no resolvable manifest must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ghost_module") && msg.contains("manifest"),
+            "diagnostic must name the unresolved module + the missing manifest, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_priority_module_search_paths_extra_dir_shadows_standard_tree() {
+        // Regression: `extract_module_search_paths` documents the
+        // returned list as *priority-ordered*, with explicit YAML
+        // `module_search_paths:` entries first. But the manifest
+        // loader (`load_module_manifests_with_extra`) and the
+        // ISR NEON-lint used to search `standard_module_dirs()`
+        // *first*, then extras. If a config-declared override
+        // collided with a bundled module of the same `type:`,
+        // ISR admission would read `isr_safe` and scan source
+        // from the bundled copy — silently admitting a module the
+        // operator had explicitly redirected to a vetted vendor
+        // tree.
+        //
+        // This test plants the *same* type name twice:
+        //   - standard tree (`<project>/modules/foundation/coll/`)
+        //     declares `isr_safe = true` and a NEON-free src tree.
+        //   - extra dir (`<override>/coll/`) declares
+        //     `isr_safe = true` but imports NEON in its src.
+        //
+        // If standard wins, admission passes (wrong). If the
+        // extra dir wins, the NEON lint fires.
+        let project = tempfile::tempdir().expect("tempdir-project");
+        let extra = tempfile::tempdir().expect("tempdir-extra");
+        let _env = super::test_env::EnvGuard::set(&[("FLUXOR_PROJECT_ROOT", project.path())]);
+
+        let std_dir = project.path().join("modules/foundation/coll");
+        let std_src = std_dir.join("src");
+        std::fs::create_dir_all(&std_src).expect("mkdir std");
+        std::fs::write(
+            std_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write std manifest");
+        std::fs::write(std_src.join("lib.rs"), "fn unused() {}\n").expect("write std src");
+
+        let ovr_dir = extra.path().join("coll");
+        let ovr_src = ovr_dir.join("src");
+        std::fs::create_dir_all(&ovr_src).expect("mkdir override");
+        std::fs::write(
+            ovr_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write override manifest");
+        std::fs::write(
+            ovr_src.join("lib.rs"),
+            "use core::arch::aarch64::*;\nfn unused() {}\n",
+        )
+        .expect("write override src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "coll",
+            "type": "coll",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![extra.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("extras-first lookup must surface the NEON-importing override");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("NEON") && msg.contains("coll"),
+            "extras must shadow the standard tree — NEON lint should fire on the override, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tier_2_as_loader_abi_not_wired() {
+        // Tier 2 (`tier: 2` / `isr_owned`) is build-time rejected:
+        // the .fmod ABI exports a separate `module_isr_entry`
+        // symbol (see kernel `loader.rs::MODULE_ISR_ENTRY` ABI
+        // hash) which the current PIC loader does not extract into
+        // `ModuleExports`. Admitting a Tier 2 module today would
+        // call the cooperative `module_step` from IRQ context.
+        // Track `.context/rfc_isr_tier_surface.md` for the lift.
         let cfg = json!({
             "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
         });
@@ -5244,9 +5749,266 @@ mod scheduler_validation_tests {
         let err = run_admission(cfg, modules).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("tier 2") && msg.contains("not yet runtime-supported"),
-            "expected tier-2-not-supported diagnostic, got: {msg}"
+            msg.contains("tier 2") && msg.contains("module_isr_entry"),
+            "expected the tier-2-ABI-not-wired diagnostic, got: {msg}"
         );
+    }
+
+    #[test]
+    fn admission_neon_lint_finds_standard_tree_modules_too() {
+        // Regression: the NEON-import lint used to search only
+        // `modules_dir + extra_module_dirs` for the module's src
+        // root. A module under `modules/drivers/<name>` (resolved
+        // via `standard_module_dirs()` for the manifest) would
+        // pass admission silently without ever running
+        // `check_isr_safe_no_neon`. This test plants an
+        // `isr_safe = true` module with a NEON import in a fake
+        // project root and asserts the lint catches it.
+        let project = tempfile::tempdir().expect("tempdir");
+        // `standard_module_dirs()` reads `$FLUXOR_PROJECT_ROOT`
+        // dynamically. Use the shared file-scope env lock + Drop
+        // guard so this test (a) does not race the sibling
+        // `module_discovery_tests` (which also mutates this var)
+        // and (b) restores the original value even on panic.
+        let _env = super::test_env::EnvGuard::set(&[("FLUXOR_PROJECT_ROOT", project.path())]);
+        // Plant a driver under modules/drivers/<name>/ with both a
+        // manifest and a NEON-importing src tree.
+        let drivers = project.path().join("modules/drivers/neon_isr_module");
+        let src = drivers.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            drivers.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            src.join("lib.rs"),
+            // The lint scans .rs files for marker substrings.
+            "use core::arch::aarch64::*;\nfn unused() {}\n",
+        )
+        .expect("write src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "neon_isr_module",
+            "type": "neon_isr_module",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = Vec::new();
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("standard-tree NEON-importing ISR module must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("NEON")
+                && (msg.contains("neon_isr_module") || msg.contains("core::arch::aarch64")),
+            "diagnostic must name NEON + the offending module/source, got: {msg}"
+        );
+        // `_env` drops here, restoring `FLUXOR_PROJECT_ROOT` and
+        // releasing the file-scope env lock.
+    }
+
+    #[test]
+    fn build_module_entry_emits_pre_tick_bit_from_extra_dir_manifest() {
+        // Regression: an earlier version of `build_module_entry`
+        // called `Manifest::from_source_tree`, which searches a
+        // hard-coded `SOURCE_DIRS` list relative to the process
+        // cwd. A manifest living in `extra_module_dirs` (e.g. an
+        // installed driver) could pass validation but emit a
+        // config blob with byte-9 bit 4 clear — silently demoting
+        // the module out of `domain_pre_tick_order`.
+        //
+        // This test plants a `pre_tick_drain = true` manifest in a
+        // tempdir, feeds the dir as an extra, and asserts the bit
+        // lands in the emitted module entry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("ext_drainer");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\
+             pre_tick_drain = true\n",
+        )
+        .expect("write manifest");
+
+        let modules_value = json!([{
+            "name": "ext_drainer",
+            "type": "ext_drainer",
+        }]);
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let manifests = load_module_manifests_with_extra(&modules_value, &extras);
+        assert!(
+            manifests
+                .get("ext_drainer")
+                .is_some_and(|m| m.pre_tick_drain),
+            "loader must find the extra-dir manifest with pre_tick_drain = true"
+        );
+
+        let config = json!({});
+        let module = json!({"name": "ext_drainer", "type": "ext_drainer"});
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let entry = build_module_entry(
+            "ext_drainer",
+            &module,
+            0,
+            None,
+            &config,
+            modules_dir,
+            &manifests,
+        )
+        .expect("emit module entry");
+        // Entry layout (see `parse_module_entry`): bytes 0-3 =
+        // length, bytes 4-7 = name_hash, byte 8 = id, byte 9 = the
+        // multiplexed domain/pre-tick byte (bits 0-2 = domain_id,
+        // bit 4 = pre_tick_drain).
+        let byte9 = entry[9];
+        assert_eq!(
+            byte9 & 0x10,
+            0x10,
+            "byte-9 bit 4 (pre_tick_drain) must be SET when the resolved \
+             manifest has pre_tick_drain = true (got byte9 = 0x{byte9:02x})"
+        );
+        assert_eq!(
+            byte9 & 0x07,
+            0,
+            "byte-9 bits 0-2 (domain_id) should be 0 (no domain assigned in YAML)"
+        );
+    }
+
+    #[test]
+    fn admission_accepts_tier_1b_module_with_isr_safe_manifest() {
+        // Mirror of the rejection case: when the manifest declares
+        // `isr_safe = true`, the Tier 1b admission path lets the module
+        // through. This pins the lift that happened on 2026-05-26.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("attested_isr");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "attested_isr",
+            "type": "attested_isr",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect("isr_safe = true module in Tier 1b domain must be admitted");
+    }
+
+    #[test]
+    fn admission_rejects_any_edge_touching_isr_tier_module() {
+        // v1 reality (2026-05-26): ANY edge with an ISR-tier
+        // endpoint is rejected at validation. The kernel-side
+        // bridge mechanism is wired (and tested via direct test
+        // fixtures), but PIC modules in v1 have no documented way
+        // to read/write their own bridge slots from inside
+        // `module_step`. Admitting an edge that the ISR module
+        // can't consume is silently broken; surface it loudly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("attested_isr");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        let producer_dir = dir.path().join("plain_producer");
+        std::fs::create_dir_all(&producer_dir).expect("mkdir");
+        std::fs::write(
+            producer_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
+        // Even an untagged (`local`) edge into a Tier 1b module is
+        // rejected — the bridge ABI gap is independent of edge_class.
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "main", "tier": "0"},
+                    {"name": "audio_isr", "tier": "1b"},
+                ]
+            },
+            "wiring": [
+                {
+                    "from": "plain_producer.out",
+                    "to": "attested_isr.in",
+                    // No edge_class tag = local; still rejected.
+                }
+            ]
+        });
+        let modules = vec![
+            json!({"name": "plain_producer", "type": "plain_producer", "domain": "main"}),
+            json!({
+                "name": "attested_isr",
+                "type": "attested_isr",
+                "domain": "audio_isr",
+            }),
+        ];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("untagged edge into Tier 1b module must still be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ISR-tier endpoint")
+                && msg.contains("module-facing API")
+                && msg.contains("attested_isr"),
+            "diagnostic must name the gap + the offending module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_dma_owned_edge_into_isr_tier_module_too() {
+        // The catch-all rejection above subsumes the previous
+        // edge_class-specific check; pin the diagnostic still
+        // surfaces clearly when the operator added an explicit
+        // `dma_owned` tag.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let isr_dir = dir.path().join("attested_isr");
+        std::fs::create_dir_all(&isr_dir).expect("mkdir");
+        std::fs::write(
+            isr_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        let prod_dir = dir.path().join("plain_producer");
+        std::fs::create_dir_all(&prod_dir).expect("mkdir");
+        std::fs::write(
+            prod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "execution": {"domains": [
+                {"name": "main", "tier": "0"},
+                {"name": "audio_isr", "tier": "1b"},
+            ]},
+            "wiring": [{
+                "from": "plain_producer.out",
+                "to": "attested_isr.in",
+                "edge_class": "dma_owned",
+            }]
+        });
+        let modules = vec![
+            json!({"name": "plain_producer", "type": "plain_producer", "domain": "main"}),
+            json!({"name": "attested_isr", "type": "attested_isr", "domain": "audio_isr"}),
+        ];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("dma_owned edge into Tier 1b module rejected (subsumed by ISR-edge rule)");
     }
 
     #[test]
@@ -5305,15 +6067,12 @@ mod module_discovery_tests {
 
     /// Shared env-var lock — the project resolver reads
     /// `$FLUXOR_PROJECT_ROOT` / `$FLUXOR_INSTALL_ROOT` and these
-    /// tests mutate both. Serialise so parallel test execution
-    /// doesn't see each other's settings.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// tests mutate both. The lock itself lives at file scope (see
+    /// `super::test_env`) so the sibling `scheduler_validation_tests`
+    /// module — which also mutates `$FLUXOR_PROJECT_ROOT` — shares
+    /// the same mutex and we do not race across modules.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        match ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
+        super::test_env::lock()
     }
 
     /// Set up a tree under `root` with a manifest at

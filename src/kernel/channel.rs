@@ -365,9 +365,6 @@ pub fn channel_open_for_module(
     config_len: usize,
     producer_module: u8,
 ) -> i32 {
-    if chan_type != CHANNEL_TYPE_PIPE {
-        return CHAN_EINVAL;
-    }
     // ISR-tier (Tier 1b / Tier 2) modules must not open generic
     // PIPE channels — their I/O rides bridge channels, registered
     // ahead of time via `isr_tier::register_tier1b_module` /
@@ -376,13 +373,16 @@ pub fn channel_open_for_module(
     // handler. The build-time validator
     // (`tools/src/config.rs::validate_isr_tier_admission`) already
     // rejects this shape at YAML-parse time; the runtime check is
-    // defense in depth for hand-rolled binaries.
-    let caller = crate::kernel::scheduler::current_module_index();
-    if caller < crate::kernel::config::MAX_MODULES
-        && crate::kernel::scheduler::module_is_isr_tier(caller)
-    {
-        debug!("channel_open: rejected — module {caller} is in an ISR-tier domain");
+    // defense in depth for hand-rolled binaries. Fire BEFORE the
+    // chan_type check so a malformed ISR-tier syscall surfaces as
+    // EACCES (the permission violation) rather than CHAN_EINVAL
+    // (the type-tag mismatch). See `.context/rfc_isr_tier_surface.md`
+    // §D6.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("channel_open") {
         return crate::kernel::errno::EACCES;
+    }
+    if chan_type != CHANNEL_TYPE_PIPE {
+        return CHAN_EINVAL;
     }
     // The v1 channel-open request shape is exactly:
     //   * `config = NULL && config_len == 0` → caller wants the
@@ -541,6 +541,14 @@ pub fn release_module_handlers(module_idx: u8) {
 /// `len` bytes into `buf` — the destination region must not alias any
 /// kernel state observed via shared references.
 pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    // Defense in depth (RFC §D6): ISR-tier callers do not use the
+    // generic PIPE syscall — they read from bridge rings registered
+    // at `register_tier1b_module`/`register_tier2_module` time. Fire
+    // BEFORE the argument-validation checks so a malformed ISR-tier
+    // syscall surfaces as EACCES rather than CHAN_EINVAL.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("channel_read") {
+        return crate::kernel::errno::EACCES;
+    }
     if buf.is_null() {
         return CHAN_EINVAL;
     }
@@ -613,6 +621,13 @@ pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
 /// through `buf`; the caller owns the buffer and is responsible for
 /// its lifetime and aliasing.
 pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    // RFC §D7 contract — deny PIPE-channel I/O from ISR-tier callers.
+    // Same rationale as `channel_read`: `peek` exposes the consumer
+    // side of a cooperative-PIPE channel and is not part of the
+    // bridge ABI.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("channel_peek") {
+        return crate::kernel::errno::EACCES;
+    }
     if buf.is_null() {
         return CHAN_EINVAL;
     }
@@ -650,6 +665,14 @@ pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
 /// FIFO/mailbox storage; the source region must remain initialised for
 /// the duration of the call.
 pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
+    // Defense in depth (RFC §D6): ISR-tier callers do not use the
+    // generic PIPE syscall — they write into bridge rings registered
+    // at `register_tier1b_module`/`register_tier2_module` time. Fire
+    // BEFORE the argument-validation checks so a malformed ISR-tier
+    // syscall surfaces as EACCES rather than CHAN_EINVAL.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("channel_write") {
+        return crate::kernel::errno::EACCES;
+    }
     if data.is_null() {
         return CHAN_EINVAL;
     }
@@ -704,6 +727,13 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
 }
 
 pub fn channel_poll(handle: i32, events: u32) -> i32 {
+    // RFC §D7 contract: ISR-tier modules have no PIPE-channel API.
+    // `channel_poll` is a read-only inspector, but exposing it would
+    // let an ISR module busy-wait on a PIPE — semantically out of
+    // contract — so deny along with channel_read/write/peek.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("channel_poll") {
+        return crate::kernel::errno::EACCES;
+    }
     if handle < 0 {
         return CHAN_EINVAL;
     }

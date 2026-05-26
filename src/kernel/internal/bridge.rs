@@ -361,6 +361,41 @@ impl RingBridge {
         self.len() == 0
     }
 
+    /// True when the ring has no free element slots. Callers that
+    /// want to avoid consuming a source on the producer side
+    /// (e.g. the `pump_isr_bridges` PIPE→ring drain) check this
+    /// before reading from upstream; without it, a full ring drops
+    /// the data after the source has already been consumed.
+    pub fn is_full(&self) -> bool {
+        self.len() >= RING_CAPACITY
+    }
+
+    /// Copy the element at the ring's head into `dst` WITHOUT
+    /// advancing the tail. Returns the number of bytes copied (0 if
+    /// empty). Symmetric to `pop` minus the commit — pair with
+    /// `pop` for peek-then-commit semantics.
+    pub fn peek_one(&self, dst: &mut [u8]) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return 0;
+        }
+        let sz = self.elem_size as usize;
+        let idx = (tail as usize) & (RING_CAPACITY - 1);
+        let offset = idx * sz;
+        let len = if dst.len() < sz { dst.len() } else { sz };
+        let src = &self.data as *const [u8; RING_CAPACITY * MAX_BRIDGE_DATA] as *const u8;
+        // SAFETY: `offset + sz <= RING_CAPACITY * MAX_BRIDGE_DATA`;
+        // volatile reads bounded by `len <= sz`. We do NOT touch
+        // `tail` here — the caller commits later via `pop`.
+        unsafe {
+            for (i, slot) in dst.iter_mut().take(len).enumerate() {
+                *slot = core::ptr::read_volatile(src.add(offset + i));
+            }
+        }
+        len
+    }
+
     /// Return the total number of dropped elements.
     pub fn drops(&self) -> u32 {
         self.drop_count.load(Ordering::Relaxed)

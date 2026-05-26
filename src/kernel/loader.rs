@@ -1637,6 +1637,15 @@ impl DynamicModule {
     pub fn state_ptr(&self) -> *mut u8 {
         self.state_ptr
     }
+
+    /// Get the module's step function pointer. Used by the
+    /// scheduler's Tier 1b admission path to forward the function
+    /// pointer to `isr_tier::register_tier1b_module` so the polled
+    /// timer ISR dispatches into it directly, bypassing the
+    /// cooperative `step_modules` loop.
+    pub fn step_fn(&self) -> ModuleStepFn {
+        self.step_fn
+    }
     /// Create from pre-validated parts (for debug stepping through instantiation).
     pub fn from_parts(step_fn: ModuleStepFn, state_ptr: *mut u8, state_size: u32) -> Self {
         Self {

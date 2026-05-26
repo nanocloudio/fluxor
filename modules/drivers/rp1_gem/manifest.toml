@@ -2,6 +2,17 @@ version = "1.0.0"
 hardware_targets = ["bcm2712"]
 permissions = ["platform_raw"]
 
+# Opt rp1_gem into the Tier 1c pre-pass drain slot
+# (`.context/rfc_isr_tier_surface.md` §D8). The NIC driver's TX/RX
+# step is the critical-latency path for HTTPS keepalive throughput;
+# running it once at the *start* of every scheduler pass (rather
+# than at its `exec_order` slot) shortens the RX-to-input-channel
+# hop by ~one full pass, attacking the 797 µs fixed per-request
+# overhead measured at [[body_size_scaling]]. Step time is bounded
+# (~1 µs in current builds) so it fits comfortably under the
+# combined `MAX_PRE_TICK_BUDGET_US = 5` ceiling.
+pre_tick_drain = true
+
 [[ports]]
 name = "frames_tx"
 direction = "input"

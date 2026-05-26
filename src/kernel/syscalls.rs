@@ -86,10 +86,27 @@ pub fn init_syscall_table() {
 }
 
 unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    // ISR-tier gate at the syscall-wrapper boundary (matches the
+    // pattern below for provider_*). The inner `channel::channel_peek`
+    // also gates as defense in depth, but firing here means the
+    // module sees `EACCES` rather than any later validation error.
+    if crate::kernel::scheduler::deny_isr_tier_syscall("channel_peek") {
+        return crate::kernel::errno::EACCES;
+    }
     channel::channel_peek(handle, buf, len)
 }
 
 // ── Handle-scoped provider dispatch ─────────────────────────────────
+//
+// Every `syscall_provider_*` wrapper fires the ISR-tier gate as its
+// FIRST check — BEFORE the contract-grant lookup, the
+// privileged-op gate, or the contract dispatch. Without this
+// ordering, an ISR-tier module calling `provider_open` on a
+// contract it has no permission for would receive `ENOSYS` (the
+// permission gate's reject) rather than `EACCES` (the §D7 ISR
+// gate's reject), and a future loader bug could ride that path
+// silently. The inner `provider::*` functions also gate as
+// defense in depth.
 
 unsafe extern "C" fn syscall_provider_open(
     contract: u32,
@@ -97,6 +114,9 @@ unsafe extern "C" fn syscall_provider_open(
     config: *const u8,
     config_len: usize,
 ) -> i32 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_open") {
+        return crate::kernel::errno::EACCES;
+    }
     // INTERNAL_DISPATCH_BUCKET (0x000C) is kernel-internal only — module
     // code must use the public platform contracts (PLATFORM_NIC_RING,
     // PLATFORM_DMA, PLATFORM_DMA_FD) for handle-returning platform ops.
@@ -125,6 +145,9 @@ unsafe extern "C" fn syscall_provider_call(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_call") {
+        return crate::kernel::errno::EACCES;
+    }
     // Contract comes from the handle's FD tag (tagged fds resolve
     // directly via `fd_tag_contract`), falling back to the opcode's
     // class byte for handle=-1 globals and scheduler-assigned channel
@@ -148,6 +171,9 @@ unsafe extern "C" fn syscall_provider_query(
     out: *mut u8,
     out_len: usize,
 ) -> i32 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_query") {
+        return crate::kernel::errno::EACCES;
+    }
     let contract =
         crate::kernel::provider::contract_of(handle).unwrap_or(((key >> 8) & 0xFF) as u16);
     if let Some(rc) = check_contract_grant(contract) {
@@ -168,6 +194,9 @@ unsafe extern "C" fn syscall_provider_query(
 }
 
 unsafe extern "C" fn syscall_provider_close(handle: i32) -> i32 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_close") {
+        return crate::kernel::errno::EACCES;
+    }
     if let Some(contract) = crate::kernel::provider::contract_of(handle) {
         if let Some(rc) = check_contract_grant(contract) {
             return rc;
@@ -1900,19 +1929,33 @@ unsafe extern "C" fn stub_provider_close(_handle: i32) -> i32 {
 // ============================================================================
 
 /// Allocate from the calling module's heap.
+///
+/// RFC §D7: ISR-tier modules are forbidden from heap operations.
+/// The gate fires here (at the syscall boundary) rather than in
+/// `heap::heap_alloc` itself because kernel-internal heap callers
+/// must keep working — only the module-facing path is gated.
 unsafe extern "C" fn syscall_heap_alloc(size: u32) -> *mut u8 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("heap_alloc") {
+        return core::ptr::null_mut();
+    }
     let idx = crate::kernel::scheduler::current_module_index();
     crate::kernel::heap::heap_alloc(idx, size as usize)
 }
 
 /// Free a previous allocation from the calling module's heap.
 unsafe extern "C" fn syscall_heap_free(ptr: *mut u8) {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("heap_free") {
+        return;
+    }
     let idx = crate::kernel::scheduler::current_module_index();
     crate::kernel::heap::heap_free(idx, ptr)
 }
 
 /// Reallocate from the calling module's heap.
 unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u8 {
+    if crate::kernel::scheduler::deny_isr_tier_syscall("heap_realloc") {
+        return core::ptr::null_mut();
+    }
     let idx = crate::kernel::scheduler::current_module_index();
     crate::kernel::heap::heap_realloc(idx, ptr, new_size as usize)
 }

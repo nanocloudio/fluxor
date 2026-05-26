@@ -819,6 +819,20 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     scheduler::set_active_module_count(module_count);
     fluxor::kernel::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
 
+    // Tier 1b admission: hand every module in a Tier 1b domain to
+    // the ISR-tier dispatcher. The helper picks the appropriate
+    // (step_fn, state_ptr) pair from each slot and arms the
+    // platform's polled-timer ISR (`bcm_isr_tier_poll`). Cooperative
+    // domains are untouched; the cooperative scheduler already
+    // skips ISR-tier modules via `step_one_module`. See
+    // `.context/rfc_isr_tier_surface.md` §D5 + §D6.
+    let isr_registered = scheduler::register_isr_tier_modules_from_graph();
+    if isr_registered > 0 {
+        uart_puts(b"[isr] Tier 1b admitted ");
+        uart_put_u32(isr_registered as u32);
+        uart_puts(b" module(s)\r\n");
+    }
+
     let mut d = 0usize;
     while d < multicore::MAX_DOMAINS {
         let mod_count = scheduler::domain_module_count(d);
@@ -993,6 +1007,44 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 }
             }
         }
+        // ── Tier 1b: Polled-timer ISR ──
+        // Modules in this domain are *not* iterated via
+        // `domain_step_all` — they were handed to the ISR-tier
+        // dispatcher at graph setup. The pump just calls
+        // `isr_tier::poll_tier1b` each loop iteration; that helper
+        // fires `isr_tier1b_handler` when the configured period has
+        // elapsed (bcm_isr_tier_poll software-polls the architected
+        // counter on aarch64, since the cooperative scheduler shares
+        // the core). Cross-domain pumps still run so a Tier 0
+        // sibling can deliver work into the Tier 1b domain.
+        2 => {
+            log::info!(
+                "[domain] {} core={} tier=1b period_us={}",
+                domain_id, core_id, scheduler::domain_tick_us(domain_id)
+            );
+            loop {
+                multicore::park_if_requested(domain_id);
+                fluxor::kernel::isr_tier::poll_tier1b();
+                pump_cross_domain(domain_id);
+                if core_id == 0 { debug_drain_poll_core0(); }
+                // SAFETY: WFE halts the core until an event arrives;
+                // the poll above is non-blocking, so spinning into WFE
+                // is the correct idle posture.
+                unsafe { core::arch::asm!("wfe") };
+                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by
+                // domain `d`'s pump thread; bounded by MAX_DOMAINS.
+                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
+                metrics.tick_count += 1;
+                if metrics.tick_count.is_multiple_of(1_000_000) {
+                    log::info!(
+                        "[tier1b] d={} polls={} ticks={}",
+                        domain_id,
+                        metrics.tick_count,
+                        fluxor::kernel::isr_tier::tier1b_ticks(),
+                    );
+                }
+            }
+        }
         // ── Tier 0: Cooperative (default, 1ms tick) ──
         _ => {
             loop {
@@ -1002,6 +1054,10 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
+                // Poll the Tier 1b timer here too — on configurations
+                // with no dedicated Tier 1b core, the cooperative pump
+                // is the only path to fire the ISR handler.
+                fluxor::kernel::isr_tier::poll_tier1b();
                 if core_id == 0 { debug_drain_poll_core0(); }
                 // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
                 // pump thread; bounded by MAX_DOMAINS.

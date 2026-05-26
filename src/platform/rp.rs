@@ -370,6 +370,17 @@ async fn main(spawner: Spawner) {
         log::info!("[boot] ready modules={module_count}");
         scheduler::log_arena_summary();
 
+        // Tier 1b admission: hand any Tier 1b-domain modules to the
+        // ISR-tier dispatcher and arm the timer-poll. RP's single
+        // async executor calls `isr_tier::poll_tier1b` from
+        // `rp_run_main_loop` each iteration, so registration
+        // here is the platform's only ISR setup. See
+        // `.context/rfc_isr_tier_surface.md` §D5+§D6.
+        let isr_registered = scheduler::register_isr_tier_modules_from_graph();
+        if isr_registered > 0 {
+            log::info!("[isr] Tier 1b admitted {isr_registered} module(s)");
+        }
+
         match rp_run_main_loop(module_count as usize).await {
             Some(_rebuild) => {
                 log::info!("[reconfigure] main loop yielded, rebuilding graph");
@@ -744,6 +755,12 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
                 return None;
             }
         }
+
+        // Poll the Tier 1b timer — fires `isr_tier1b_handler` if the
+        // configured period elapsed since the last poll. On RP this
+        // is the only path that invokes the ISR dispatcher; without
+        // this call, registered Tier 1b modules never run.
+        fluxor::kernel::isr_tier::poll_tier1b();
 
         debug_drain_poll();
 

@@ -134,6 +134,22 @@ pub const MAX_DOMAINS: usize = 4;
 /// Default tick period in microseconds (1ms).
 pub const DEFAULT_TICK_US: u32 = 1000;
 
+/// Maximum number of Tier 1c pre-tick drain modules per domain.
+/// Sized for NIC RX + ARP cache drain + headroom — enough for the
+/// canonical use case (single NIC driver per domain) without
+/// bloating `SchedulerState` (each domain costs
+/// `MAX_PRE_TICK_PER_DOMAIN` bytes in `domain_pre_tick_order`).
+pub const MAX_PRE_TICK_PER_DOMAIN: usize = 4;
+
+/// Combined cycle budget for *all* Tier 1c pre-tick modules in a
+/// single domain pass, in microseconds. Pre-tick modules run before
+/// the regular `domain_exec_order` rotation; this cap prevents
+/// cumulative pre-tick work from starving the cooperative loop.
+/// At `tick_us = 100`, 5 µs leaves >99 µs for Tier 0/1a modules.
+/// See `.context/rfc_isr_tier_surface.md` §D8 for the budget
+/// rationale.
+pub const MAX_PRE_TICK_BUDGET_US: u32 = 5;
+
 /// Describes a connection between two module ports.
 #[derive(Debug, Clone, Copy)]
 pub struct Edge {
@@ -169,6 +185,13 @@ pub struct Edge {
     /// via `max(...)` in `open_channels`. See
     /// `kernel::config::GraphEdge::buffer_bytes`.
     pub buffer_bytes: u32,
+    /// Bridge slot index when at least one endpoint is in an ISR-tier
+    /// domain (Tier 1b/2). `-1` means no bridge — same-tier edges
+    /// continue to use the regular PIPE channel exclusively. Set by
+    /// `wire_isr_bridges` after `open_channels`. The
+    /// `pump_isr_bridges` routine drains PIPE↔bridge in whichever
+    /// direction the ISR-tier endpoint sits.
+    pub bridge_slot: i8,
 }
 
 impl Edge {
@@ -191,6 +214,7 @@ impl Edge {
             buffer_group: 0,
             edge_class: crate::kernel::config::EdgeClass::Local,
             buffer_bytes: 0,
+            bridge_slot: -1,
         }
     }
 
@@ -215,6 +239,7 @@ impl Edge {
             buffer_group: 0,
             edge_class: crate::kernel::config::EdgeClass::Local,
             buffer_bytes: 0,
+            bridge_slot: -1,
         }
     }
 
@@ -1005,6 +1030,11 @@ pub struct SchedulerState {
     fault_info: [ModuleFaultInfo; MAX_MODULES],
     /// Per-module domain assignment (0 = default domain)
     domain_id: [u8; MAX_MODULES],
+    /// Per-module Tier 1c opt-in. Mirrors
+    /// `ModuleEntry::pre_tick_drain` so `compute_domain_exec_orders_static`
+    /// can partition pre-tick modules into `domain_pre_tick_order`
+    /// without re-reading the config blob.
+    pre_tick_drain: [bool; MAX_MODULES],
     /// Per-domain topological execution order
     domain_exec_order: [[u8; MAX_MODULES]; MAX_DOMAINS],
     /// Number of modules in each domain's execution order
@@ -1043,6 +1073,23 @@ pub struct SchedulerState {
     /// see chronically over-subscribed domains without needing to
     /// instrument modules individually.
     domain_budget_overruns: [u32; MAX_DOMAINS],
+
+    // ── Tier 1c pre-pass drain slot ─────────────────────────────────
+    /// Per-domain module indices that opt into the Tier 1c pre-tick
+    /// slot. Each tick, `step_domain_modules` (and its `_poll`
+    /// variant) walks this list before the regular `domain_exec_order`
+    /// rotation, calling `step_one_module` for each entry. The
+    /// indices are populated by `prepare_graph` from
+    /// `ModuleEntry::pre_tick_drain` (which mirrors the manifest
+    /// flag). See `.context/rfc_isr_tier_surface.md` §D8.
+    domain_pre_tick_order: [[u8; MAX_PRE_TICK_PER_DOMAIN]; MAX_DOMAINS],
+    /// Number of pre-tick modules in each domain.
+    domain_pre_tick_count: [u8; MAX_DOMAINS],
+    /// Cumulative count of times the per-domain pre-tick combined
+    /// budget (`MAX_PRE_TICK_BUDGET_US`) was exceeded, causing the
+    /// remaining pre-tick modules in the list to skip the current
+    /// pass. Surfaced via monitor telemetry.
+    domain_pre_tick_overruns: [u32; MAX_DOMAINS],
 
     // ── Live Reconfigure State ──────────────────────────────────────
     /// Current reconfigure phase, queryable via `reconfigure_phase()`.
@@ -1116,6 +1163,7 @@ impl SchedulerState {
             downstream_latency: [0; MAX_MODULES],
             fault_info: [ModuleFaultInfo::new(); MAX_MODULES],
             domain_id: [0; MAX_MODULES],
+            pre_tick_drain: [false; MAX_MODULES],
             domain_exec_order: [[0; MAX_MODULES]; MAX_DOMAINS],
             domain_module_count: [0; MAX_DOMAINS],
             domain_count: 0,
@@ -1124,6 +1172,9 @@ impl SchedulerState {
             domain_budget_us_limit: [0; MAX_DOMAINS],
             domain_budget_us_consumed: [0; MAX_DOMAINS],
             domain_budget_overruns: [0; MAX_DOMAINS],
+            domain_pre_tick_order: [[0; MAX_PRE_TICK_PER_DOMAIN]; MAX_DOMAINS],
+            domain_pre_tick_count: [0; MAX_DOMAINS],
+            domain_pre_tick_overruns: [0; MAX_DOMAINS],
             reconfigure_phase: ReconfigurePhase::Running,
             active_module_count: 0,
             rebuild_request: None,
@@ -1174,6 +1225,7 @@ impl SchedulerState {
             self.module_export_table[i] = core::ptr::null();
             self.module_export_count[i] = 0;
             self.step_hist[i] = [0; 8];
+            self.pre_tick_drain[i] = false;
         }
         self.step_hist_global = [0; 8];
         self.exec_order_count = 0;
@@ -1187,6 +1239,11 @@ impl SchedulerState {
             self.domain_budget_us_consumed[d] = 0;
             self.domain_budget_overruns[d] = 0;
             self.domain_exec_order_offset[d] = 0;
+            self.domain_pre_tick_count[d] = 0;
+            self.domain_pre_tick_overruns[d] = 0;
+            for i in 0..MAX_PRE_TICK_PER_DOMAIN {
+                self.domain_pre_tick_order[d][i] = 0;
+            }
         }
         self.reconfigure_phase = ReconfigurePhase::Running;
         self.active_module_count = 0;
@@ -1582,6 +1639,15 @@ pub mod exec_mode {
     pub const TIER_3: u8 = 3;
     /// Tier 2 — IRQ-owned. ISR-tier (requires `isr_safe` + bridge).
     pub const TIER_2: u8 = 4;
+    /// Tier 1c — pre-pass cooperative drain. Per-module flag, *not* a
+    /// per-domain exec_mode: a Tier 1c module sits inside a Tier 0
+    /// or Tier 1a domain and runs at the start of every scheduler
+    /// pass before any `domain_exec_order` modules. The byte value
+    /// here is reserved for telemetry/logging only — the kernel reads
+    /// the bit per-module from `ModuleEntry::pre_tick_drain`, not from
+    /// the domain's exec_mode. See `.context/rfc_isr_tier_surface.md`
+    /// §D8.
+    pub const TIER_1C: u8 = 5;
 }
 
 /// Return the execution mode for a domain. See [`exec_mode`] for the
@@ -1623,6 +1689,51 @@ pub fn module_is_isr_tier(module_idx: usize) -> bool {
     // SAFETY: as above; d bounded by the check just above.
     let m = unsafe { SCHED.domain_exec_mode[d] };
     is_isr_tier_exec_mode(m)
+}
+
+/// Reject syscall `op` when the calling module sits in an ISR-tier
+/// (Tier 1b or Tier 2) domain. Emits a single `MON_PERM_DENIED` log
+/// line per rejection and returns `true` so the caller can bail with
+/// the standard `errno::EACCES`. Cooperative callers (Tier 0/1a/1c)
+/// and out-of-bounds `module_idx` return `false`.
+///
+/// The runtime gate is defense in depth — the build-time validator
+/// (`tools/src/config.rs::validate_isr_tier_admission`) already
+/// rejects malformed graphs; this catches hand-rolled binaries that
+/// bypass the tools pipeline. See
+/// `.context/rfc_isr_tier_surface.md` §D6.
+#[inline]
+pub fn deny_isr_tier_syscall(op: &'static str) -> bool {
+    let module_idx = current_module_index();
+    if module_idx >= MAX_MODULES {
+        return false;
+    }
+    if !module_is_isr_tier(module_idx) {
+        return false;
+    }
+    // SAFETY: scheduler-thread read; module_idx already bounded.
+    let domain = unsafe { SCHED.domain_id[module_idx] };
+    log::warn!(
+        "MON_PERM_DENIED domain={domain} mod={module_idx} op={op} tick={tick}",
+        // SAFETY: DBG_TICK is an aligned u32 read.
+        tick = unsafe { DBG_TICK },
+    );
+    true
+}
+
+/// Test-facing setter — assigns `domain` to module `module_idx`.
+/// Production paths route the assignment through `prepare_graph`,
+/// which reads it off the config blob; this helper exists so
+/// scheduler-conformance tests can plant a module's domain without
+/// going through a full graph build.
+pub fn set_module_domain(module_idx: usize, domain: u8) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    // SAFETY: scheduler-thread mutation; module_idx bounded.
+    unsafe {
+        SCHED.domain_id[module_idx] = domain;
+    }
 }
 
 /// Test-facing setter — assigns `exec_mode` to `domain_id`. Used by
@@ -2190,6 +2301,17 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // it.
     sched.prepare_in_progress = true;
 
+    // Clear `current_module` so the runtime EACCES gate
+    // (`deny_isr_tier_syscall`) doesn't fire for kernel-internal
+    // `channel_open` / `channel_read` / `channel_write` calls that
+    // happen during graph build. The stale value from the previous
+    // graph could point at a slot whose *new* domain is Tier 1b — a
+    // classic teardown race that would surface as "open_channels
+    // returns EACCES" inside the very call that's *populating* the
+    // new graph. Reset is bounded by MAX_MODULES so the gate's
+    // `caller >= MAX_MODULES` short-circuit kicks in.
+    set_current_module(MAX_MODULES);
+
     // Reset all scheduler state, state arena, and name arena. Channel
     // slots and buffer registry slots also need to be wiped so a prior
     // graph's claims don't accumulate — bump-allocator-only resets
@@ -2204,6 +2326,13 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     NameArena::reset();
     crate::kernel::backing_provider::unregister();
     crate::kernel::provider::reset_handle_tracking();
+    // Tear down any prior graph's ISR-tier registrations and bridge
+    // slots before walking the new module table. Without this, the
+    // post-instantiation `register_isr_tier_modules_from_graph`
+    // helper would append on top of stale entries from the previous
+    // graph, and `wire_isr_bridges` would over-allocate bridge slots.
+    crate::kernel::isr_tier::reset_all();
+    crate::kernel::bridge::bridge_reset_all();
     sched.reset();
 
     // Store graph-level sample rate from config header
@@ -2223,12 +2352,16 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         log::info!("[graph] tick_us={}", sched.tick_us);
     }
 
-    // Store per-module domain assignments and infer domain count
+    // Store per-module domain assignments and infer domain count.
+    // Mirror the per-module `pre_tick_drain` flag into SCHED at the
+    // same time so the post-instantiation ISR-tier admission helper
+    // reads it without re-touching the config blob.
     let mut max_domain: u8 = 0;
     for entry in config.modules.iter().flatten() {
         let id = entry.id as usize;
         if id < MAX_MODULES {
             sched.domain_id[id] = entry.domain_id;
+            sched.pre_tick_drain[id] = entry.pre_tick_drain;
             if entry.domain_id > max_domain {
                 max_domain = entry.domain_id;
             }
@@ -2327,6 +2460,14 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(-1);
     }
 
+    // Allocate ISR-tier bridge slots for any edge with at least one
+    // endpoint in a Tier 1b/2 domain. The producer continues to
+    // write the regular PIPE channel; `pump_isr_bridges` drains it
+    // into the bridge ring each scheduler tick (and vice versa for
+    // ISR→cooperative direction). See
+    // `.context/rfc_isr_tier_surface.md` §D6.
+    wire_isr_bridges(&mut edges[..runtime_edge_count]);
+
     // Validate buffer-group constraints uniformly across every
     // platform. Runs after `collect_module_hints` (which populates
     // `in_place_writer`) and `open_channels` (which sets
@@ -2418,6 +2559,544 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     sched.prepare_in_progress = false;
 
     Ok((module_list, module_count))
+}
+
+/// Default cycle budget for Tier 1b modules when no per-module
+/// override is configured. ~2 µs on a Cortex-A76 at 2 GHz; tuned to
+/// stay quiet on rp1_gem-class workloads while still catching a
+/// runaway ISR body. Per-module overrides via the YAML `scheduler:
+/// { isr_budget_cycles: N }` per-module block override this default;
+/// see `prepare_graph` for the plumbing.
+pub const DEFAULT_ISR_BUDGET_CYCLES: u32 = 2000;
+
+/// Per-module ISR cycle budget override populated from the
+/// `isr_budget_cycles:` YAML field via the kernel TLV tag 0xFB at
+/// instantiation time. `0` means "fall back to
+/// `DEFAULT_ISR_BUDGET_CYCLES`". Indexed by module slot.
+static mut MODULE_ISR_BUDGET_OVERRIDE: [u32; MAX_MODULES] = [0; MAX_MODULES];
+
+/// Per-module hardware IRQ number for Tier 2 admission. Populated
+/// from the `irq:` YAML field via TLV tag 0xFC at instantiation
+/// time. `u16::MAX` (the default) means "unset" — non-Tier-2 modules
+/// keep the sentinel and the admission helper skips them.
+static mut MODULE_IRQ_NUMBER: [u16; MAX_MODULES] = [u16::MAX; MAX_MODULES];
+
+/// Read the resolved IRQ for `module_idx`, or `None` when unset.
+pub fn module_irq(module_idx: usize) -> Option<u16> {
+    if module_idx >= MAX_MODULES {
+        return None;
+    }
+    // SAFETY: scheduler-thread read; module_idx bounded.
+    let v = unsafe { MODULE_IRQ_NUMBER[module_idx] };
+    if v == u16::MAX {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Assign a Tier 2 IRQ number to a module. Production path is
+/// `parse_protection_config`'s TLV-tag 0xFC handler at module
+/// instantiation; conformance tests call this directly to plant an
+/// IRQ on a slot without going through a YAML/TLV cycle. `u16::MAX`
+/// clears the override (the same sentinel `module_irq` uses to mean
+/// "unset").
+pub fn set_module_irq(module_idx: usize, irq: u16) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    // SAFETY: scheduler-thread mutation; module_idx bounded.
+    unsafe {
+        MODULE_IRQ_NUMBER[module_idx] = irq;
+    }
+}
+
+/// Set the Tier 1b cycle budget override for a module. `0` clears
+/// the override so the kernel falls back to
+/// `DEFAULT_ISR_BUDGET_CYCLES`. Production path is
+/// `parse_protection_config`'s TLV-tag 0xFB handler at module
+/// instantiation; conformance tests call this directly.
+pub fn set_module_isr_budget_cycles(module_idx: usize, budget_cycles: u32) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
+    unsafe {
+        MODULE_ISR_BUDGET_OVERRIDE[module_idx] = budget_cycles;
+    }
+}
+
+/// Read the resolved Tier 1b budget for a module: the per-module
+/// override if non-zero, otherwise `DEFAULT_ISR_BUDGET_CYCLES`.
+fn resolved_isr_budget_cycles(module_idx: usize) -> u32 {
+    if module_idx >= MAX_MODULES {
+        return DEFAULT_ISR_BUDGET_CYCLES;
+    }
+    // SAFETY: scheduler-thread read; module_idx bounded.
+    let ov = unsafe { MODULE_ISR_BUDGET_OVERRIDE[module_idx] };
+    if ov == 0 {
+        DEFAULT_ISR_BUDGET_CYCLES
+    } else {
+        ov
+    }
+}
+
+/// Element size advertised by every kernel-allocated ISR bridge ring.
+/// Sized to the bridge crate's `MAX_BRIDGE_DATA` so the entire payload
+/// fits in one slot; chunked payloads need their own bridge protocol.
+const ISR_BRIDGE_ELEM_SIZE: usize = 56;
+
+/// Walk every edge with at least one endpoint in an ISR-tier
+/// (Tier 1b/2) domain and allocate a `RingBridge` slot, recording the
+/// slot index in `edge.bridge_slot`. The bridge is the *only*
+/// channel ISR-tier modules read/write through — the cooperative
+/// side keeps its PIPE channel, and `pump_isr_bridges` shuttles
+/// bytes between the two at every scheduler tick. Edges with both
+/// endpoints in cooperative tiers are skipped.
+///
+/// `MAX_BRIDGES` (16) caps the total bridges. Exceeding it returns
+/// without crashing — the affected edges lose their ISR routing,
+/// the cooperative scheduler's runtime gate still rejects any
+/// channel I/O attempts from the ISR side, so the graph is dead
+/// rather than corrupt. The build-time validator catches the
+/// over-budget case in practice.
+fn wire_isr_bridges(edges: &mut [Edge]) {
+    // SAFETY: prepare_graph runs single-threaded; SCHED writers are
+    // serialised, so a shared read of `domain_id`/`domain_exec_mode`
+    // is consistent here.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    for edge in edges.iter_mut() {
+        if edge.bridge_slot >= 0 {
+            continue; // already assigned (rerun safety)
+        }
+        let from_d = sched.domain_id[edge.from_module] as usize;
+        let to_d = sched.domain_id[edge.to_module] as usize;
+        let from_isr =
+            from_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[from_d]);
+        let to_isr = to_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[to_d]);
+        if !from_isr && !to_isr {
+            continue;
+        }
+        let slot = crate::kernel::bridge::bridge_alloc();
+        if slot < 0 {
+            log::error!(
+                "[isr] bridge alloc exhausted at edge {}->{} (MAX_BRIDGES={MAX_ISR_BRIDGES_PER_GRAPH})",
+                edge.from_module,
+                edge.to_module,
+            );
+            continue;
+        }
+        let slot_idx = slot as usize;
+        if let Some(bs) = crate::kernel::bridge::bridge_slot_mut(slot_idx) {
+            bs.init_ring(
+                ISR_BRIDGE_ELEM_SIZE,
+                edge.from_module as u8,
+                edge.to_module as u8,
+            );
+        }
+        edge.bridge_slot = slot as i8;
+        log::info!(
+            "[isr] bridge slot {slot_idx} wired for edge {}->{} (from_isr={from_isr} to_isr={to_isr})",
+            edge.from_module,
+            edge.to_module,
+        );
+    }
+}
+
+/// Public alias for the `MAX_BRIDGES` ceiling visible from the
+/// scheduler. Re-exported so logging + diagnostics that originate
+/// here name the same constant as the bridge implementation.
+const MAX_ISR_BRIDGES_PER_GRAPH: usize = crate::kernel::bridge::MAX_BRIDGES;
+
+/// Drain bytes between the PIPE channels and their associated ISR
+/// bridge slots. Runs once per scheduler tick after `step_modules`
+/// (cooperative path) and from the BCM2712 Tier 0 arm. Direction is
+/// inferred from each edge's endpoint tiers:
+///
+/// * `from = cooperative, to = Tier 1b/2` → drain bytes from
+///   `edge.channel` (PIPE) into `bridge_slot` (Ring push). ISR
+///   consumes from bridge on its next fire.
+/// * `from = Tier 1b/2, to = cooperative` → pop from `bridge_slot`
+///   and write into `edge.channel` (PIPE). Cooperative consumer
+///   reads from the channel via the regular `channel_read` path.
+/// * Same-tier (both endpoints ISR-tier) is rare but works: the
+///   bridge becomes the only conduit; the helper drains it back
+///   into the consumer's PIPE handle so downstream port resolution
+///   keeps working.
+///
+/// The drain is bounded — at most `MAX_DRAINS_PER_TICK` slots per
+/// direction per tick — so a hot edge can't monopolise the pump.
+pub fn pump_isr_bridges() {
+    const MAX_DRAINS_PER_TICK: usize = 8;
+
+    // SAFETY: scheduler-thread access during the scheduler tick.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let edge_count = sched.edge_count;
+    let mut buf = [0u8; ISR_BRIDGE_ELEM_SIZE];
+
+    for i in 0..edge_count {
+        if i >= MAX_CHANNELS {
+            break;
+        }
+        let edge = &sched.edges[i];
+        if edge.bridge_slot < 0 {
+            continue;
+        }
+        let from_d = sched.domain_id[edge.from_module] as usize;
+        let to_d = sched.domain_id[edge.to_module] as usize;
+        let from_isr =
+            from_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[from_d]);
+        let to_isr = to_d < MAX_DOMAINS && is_isr_tier_exec_mode(sched.domain_exec_mode[to_d]);
+        let slot_idx = edge.bridge_slot as usize;
+        let bridge = match crate::kernel::bridge::bridge_get(slot_idx) {
+            Some(b) => b,
+            None => continue,
+        };
+        let ring = match bridge.as_ring() {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Cooperative → ISR: drain PIPE → bridge push.
+        //
+        // **Backpressure contract:** check that the ring has room
+        // BEFORE reading the channel. `channel_read` consumes on
+        // success, so a read-then-push pattern would drop the
+        // payload when `ring.push` fails. Stopping at the source
+        // keeps the bytes in the PIPE for the next pump pass.
+        if !from_isr && to_isr && edge.channel >= 0 {
+            for _ in 0..MAX_DRAINS_PER_TICK {
+                if ring.is_full() {
+                    break;
+                }
+                // SAFETY: buf is a stack array, len matches.
+                let n = unsafe {
+                    crate::kernel::channel::channel_read(
+                        edge.channel,
+                        buf.as_mut_ptr(),
+                        ISR_BRIDGE_ELEM_SIZE,
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+                let len = n as usize;
+                if !ring.push(&buf[..len]) {
+                    // Should be unreachable given the `is_full`
+                    // check above (kernel runs the pump from the
+                    // scheduler thread; no concurrent producer
+                    // races here in single-core builds). Log if it
+                    // ever happens.
+                    log::warn!(
+                        "[isr] bridge ring overflow on edge {}->{} after is_full check; \
+                         {} bytes lost",
+                        edge.from_module,
+                        edge.to_module,
+                        len,
+                    );
+                    break;
+                }
+            }
+        }
+        // ISR → cooperative: peek bridge → PIPE write → commit pop.
+        //
+        // **Backpressure contract:** the previous version popped
+        // before writing, which discarded data on `channel_write`
+        // backpressure. Peek-then-commit holds the element in the
+        // ring head until the PIPE accepts the write; on EAGAIN
+        // the element stays put for the next pump pass.
+        if from_isr && !to_isr && edge.channel >= 0 {
+            for _ in 0..MAX_DRAINS_PER_TICK {
+                let len = ring.peek_one(&mut buf);
+                if len == 0 {
+                    break;
+                }
+                // SAFETY: buf alive for the call.
+                let written = unsafe {
+                    crate::kernel::channel::channel_write(edge.channel, buf.as_ptr(), len)
+                };
+                if written <= 0 {
+                    // PIPE back-pressured — leave the element in
+                    // the ring (`peek_one` didn't advance tail).
+                    // Next pump pass retries.
+                    break;
+                }
+                // Confirmed write: commit the pop. `dst` slot is
+                // discarded — we already wrote the peeked copy.
+                let mut sink = [0u8; ISR_BRIDGE_ELEM_SIZE];
+                let _ = ring.pop(&mut sink);
+            }
+        }
+    }
+}
+
+/// Collect the bridge slots whose ISR-tier endpoint is `module_idx`,
+/// partitioning into (`in_bridges`, `out_bridges`) for the
+/// `isr_tier::register_*` calls. Each return slice carries at most 4
+/// entries (matching `MAX_ISR_BRIDGES` in `src/kernel/isr_tier.rs`).
+fn collect_isr_bridges_for_module(module_idx: usize) -> ([i8; 4], usize, [i8; 4], usize) {
+    let mut in_bridges = [-1i8; 4];
+    let mut in_count = 0usize;
+    let mut out_bridges = [-1i8; 4];
+    let mut out_count = 0usize;
+    // SAFETY: scheduler-thread access during the post-instantiation
+    // admission helper.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let edge_count = sched.edge_count;
+    for i in 0..edge_count.min(MAX_CHANNELS) {
+        let edge = &sched.edges[i];
+        if edge.bridge_slot < 0 {
+            continue;
+        }
+        if edge.to_module == module_idx && in_count < in_bridges.len() {
+            in_bridges[in_count] = edge.bridge_slot;
+            in_count += 1;
+        } else if edge.from_module == module_idx && out_count < out_bridges.len() {
+            out_bridges[out_count] = edge.bridge_slot;
+            out_count += 1;
+        }
+    }
+    (in_bridges, in_count, out_bridges, out_count)
+}
+
+/// Tier 1b BCM admission trampoline state — exposes the BuiltInModule's
+/// step pointer + state buffer via the slot index encoded in the
+/// `state_ptr` argument. The `isr_tier1b_handler` invokes step_fn
+/// with this index, the trampoline resolves the slot and dispatches
+/// to the inner BuiltInModule step function.
+unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
+    // `state` is the module index encoded as an integer pointer (see
+    // `register_isr_tier_modules_from_graph` below). The encoding
+    // round-trips through `usize` because the scheduler's module
+    // slots are stable for the graph's lifetime.
+    let module_idx = state as usize;
+    // SAFETY: ISR-tier dispatch on BCM is polled from the scheduler
+    // thread (the platform's `bcm_isr_tier_poll` invocation), so
+    // there's no preemption against the cooperative writer; we
+    // observe a coherent slot.
+    let sched = unsafe { sched_ref() };
+    if module_idx >= MAX_MODULES {
+        return 0;
+    }
+    if let crate::kernel::scheduler::module_types::ModuleSlot::BuiltIn(m) =
+        &sched.modules[module_idx]
+    {
+        // Cast away the const — BuiltInModule::step_fn writes to the
+        // state buffer in-place. The state buffer is owned by the slot
+        // and not shared with anyone else this tick.
+        let state_ptr = m.state.as_ptr() as *mut u8;
+        return (m.step_fn())(state_ptr);
+    }
+    0
+}
+
+/// Walk the prepared graph and hand every Tier 1b module to the ISR-
+/// tier dispatcher. For each ISR-tier-domain module, the helper picks
+/// the appropriate `(step_fn, state_ptr)` pair from its slot and
+/// invokes `isr_tier::register_tier1b_module`. After all modules are
+/// registered, the helper computes the minimum tick interval across
+/// all Tier 1b domains and arms the platform's Tier 1b timer via
+/// `isr_tier::start_tier1b`.
+///
+/// Returns the number of modules registered. A return of `0` means
+/// no Tier 1b modules are present and the timer was not started.
+///
+/// Bridge-channel wiring from YAML edges is **partially wired** as
+/// of 2026-05-26:
+///   * `wire_isr_bridges` allocates a `RingBridge` slot for every
+///     edge with at least one ISR-tier endpoint; the slot index
+///     lands in `Edge::bridge_slot`.
+///   * `collect_isr_bridges_for_module` (called below) populates
+///     the per-module `in_bridges` / `out_bridges` arrays passed to
+///     `register_tier1b_module` from those slots.
+///   * `pump_isr_bridges` drains PIPE↔ring each scheduler tick
+///     using the `is_full` + `peek_one` peek-then-commit pattern
+///     so backpressure is non-lossy.
+///
+/// **Module-facing gap (v1):** PIC modules have no documented SDK
+/// surface to read/write their bridge slots from inside
+/// `module_step`. The SDK's `bridge_dispatch` helper rides
+/// `provider_call`, which the §D7 syscall gate denies for
+/// ISR-tier callers. The build-time validator now rejects any
+/// YAML edge touching an ISR-tier endpoint to prevent silently-
+/// broken admission; production Tier 1b step bodies do
+/// private-state work only. See
+/// `docs/architecture/scheduler.md` §"ISR-tier I/O contract"
+/// for the planned lift.
+pub fn register_isr_tier_modules_from_graph() -> usize {
+    // SAFETY: caller runs on the scheduler thread during graph bring-
+    // up; no concurrent observers of SCHED/ISR_SLOTS yet.
+    let sched = unsafe { sched_ref() };
+    let count = sched.active_module_count;
+    let mut registered: usize = 0;
+    let mut min_period_us: u32 = u32::MAX;
+
+    for module_idx in 0..count {
+        let domain = sched.domain_id[module_idx] as usize;
+        if domain >= MAX_DOMAINS {
+            continue;
+        }
+        let exec_mode = sched.domain_exec_mode[domain];
+
+        // Tier 2: per-IRQ-owned.
+        //
+        // **Unreachable from production graphs as of 2026-05-26** —
+        // `validate_isr_tier_admission` rejects `exec_mode == 4` at
+        // build time because the .fmod ABI exports a separate
+        // `module_isr_entry` symbol (see
+        // `src/kernel/loader.rs::MODULE_ISR_ENTRY`) which the
+        // current loader does NOT extract into `ModuleExports`; this
+        // branch below uses `m.step_fn()` (the cooperative step) as
+        // a placeholder, which is wrong from IRQ context for a real
+        // PIC module. The branch stays in place for `BuiltInModule`
+        // test fixtures whose Rust step function happens to be
+        // trivially ISR-safe — that's the only path that reaches
+        // here today, via `install_static_config` + `set_module_irq`
+        // in [tests/harness/tests/scheduler_isr_tier_admission.rs].
+        //
+        // When the loader extracts `module_isr_entry`, switch the
+        // Dynamic-module arm below to `m.isr_entry_fn()`, lift the
+        // validator's hard-reject, and the rest of the path
+        // (trampoline dispatch, IRQ binding, current_module
+        // tracking) is already wired and tested.
+        if exec_mode == exec_mode::TIER_2 {
+            let irq = match module_irq(module_idx) {
+                Some(n) => n,
+                None => {
+                    log::error!("[isr] Tier 2 module {module_idx} has no IRQ assigned — skipping");
+                    continue;
+                }
+            };
+            let (in_arr, in_n, out_arr, out_n) = collect_isr_bridges_for_module(module_idx);
+            let budget = resolved_isr_budget_cycles(module_idx);
+            let rc = match &sched.modules[module_idx] {
+                crate::kernel::scheduler::module_types::ModuleSlot::Dynamic(m) => {
+                    crate::kernel::isr_tier::register_tier2_module(
+                        crate::kernel::isr_tier::Tier2Registration {
+                            isr_entry: m.step_fn(),
+                            state_ptr: m.state_ptr(),
+                            irq_number: irq,
+                            module_index: module_idx as u8,
+                            budget_cycles: budget,
+                            uses_fpu: false,
+                            in_bridges: &in_arr[..in_n],
+                            out_bridges: &out_arr[..out_n],
+                        },
+                    )
+                }
+                crate::kernel::scheduler::module_types::ModuleSlot::BuiltIn(_) => {
+                    crate::kernel::isr_tier::register_tier2_module(
+                        crate::kernel::isr_tier::Tier2Registration {
+                            isr_entry: builtin_tier1b_trampoline,
+                            state_ptr: module_idx as *mut u8,
+                            irq_number: irq,
+                            module_index: module_idx as u8,
+                            budget_cycles: budget,
+                            uses_fpu: false,
+                            in_bridges: &in_arr[..in_n],
+                            out_bridges: &out_arr[..out_n],
+                        },
+                    )
+                }
+                _ => -1,
+            };
+            if rc < 0 {
+                log::error!("[isr] failed to register Tier 2 module {module_idx}");
+                continue;
+            }
+            // Bind the IRQ vector to the trampoline. The HAL hook is
+            // a no-op on platforms without a real interrupt
+            // controller (e.g. the host harness); production platforms
+            // wire the IRQ-controller register here.
+            let bind_rc = crate::kernel::hal::irq_bind(
+                irq as u32,
+                0,
+                crate::kernel::isr_tier::isr_tier2_trampoline as usize,
+            );
+            if bind_rc < 0 {
+                log::warn!(
+                    "[isr] hal::irq_bind(irq={irq}) returned {bind_rc} — Tier 2 \
+                     dispatch may not fire on this platform"
+                );
+            }
+            registered += 1;
+            continue;
+        }
+
+        if exec_mode != exec_mode::TIER_1B {
+            continue;
+        }
+        // Find the period for this domain (fall back to graph-level
+        // tick_us, then DEFAULT_TICK_US for fully un-configured cases).
+        let dtick = sched.domain_tick_us[domain];
+        let period_us = if dtick > 0 {
+            dtick
+        } else if sched.tick_us > 0 {
+            sched.tick_us
+        } else {
+            DEFAULT_TICK_US
+        };
+        if period_us < min_period_us {
+            min_period_us = period_us;
+        }
+
+        // Resolve in/out bridge slots for this module from the edge
+        // table populated by `wire_isr_bridges`.
+        let (in_arr, in_n, out_arr, out_n) = collect_isr_bridges_for_module(module_idx);
+        let in_slice = &in_arr[..in_n];
+        let out_slice = &out_arr[..out_n];
+        let budget = resolved_isr_budget_cycles(module_idx);
+
+        // Resolve the step_fn + state_ptr pair based on the slot kind.
+        let rc = match &sched.modules[module_idx] {
+            crate::kernel::scheduler::module_types::ModuleSlot::Dynamic(m) => {
+                crate::kernel::isr_tier::register_tier1b_module(
+                    m.step_fn(),
+                    m.state_ptr(),
+                    module_idx as u8,
+                    budget,
+                    in_slice,
+                    out_slice,
+                )
+            }
+            crate::kernel::scheduler::module_types::ModuleSlot::BuiltIn(_) => {
+                // BuiltInModule has Rust ABI; route through the
+                // `builtin_tier1b_trampoline` which decodes the slot
+                // index from `state_ptr`.
+                crate::kernel::isr_tier::register_tier1b_module(
+                    builtin_tier1b_trampoline,
+                    module_idx as *mut u8,
+                    module_idx as u8,
+                    budget,
+                    in_slice,
+                    out_slice,
+                )
+            }
+            _ => -1,
+        };
+        if rc < 0 {
+            log::error!("[isr] failed to register Tier 1b module {module_idx} (domain {domain})");
+            continue;
+        }
+        registered += 1;
+    }
+
+    if registered > 0 && min_period_us < u32::MAX {
+        log::info!(
+            "[isr] starting Tier 1b timer period={min_period_us}us with {registered} modules"
+        );
+        crate::kernel::isr_tier::start_tier1b(min_period_us);
+    }
+    registered
 }
 
 /// Emit a one-line `[arena]` summary covering each kernel arena's
@@ -2564,6 +3243,7 @@ fn push_internal_module(
         name_hash,
         id: idx as u8,
         domain_id,
+        pre_tick_drain: false,
         frame_kind,
         params_ptr: core::ptr::null(),
         params_len: 0,
@@ -3374,16 +4054,36 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
         &mut *p
     };
 
-    // Clear domain module counts
+    // Clear domain module counts (both the regular exec_order list and
+    // the Tier 1c pre-tick list).
     for d in 0..MAX_DOMAINS {
         sched.domain_module_count[d] = 0;
+        sched.domain_pre_tick_count[d] = 0;
     }
 
-    // Walk exec_order (already topologically sorted) and partition by domain
+    // Walk exec_order (already topologically sorted) and partition by
+    // domain. Modules flagged `pre_tick_drain` go into
+    // `domain_pre_tick_order` instead of `domain_exec_order` so
+    // `step_domain_modules` can drain them before the regular rotation
+    // (see `.context/rfc_isr_tier_surface.md` §D8).
     for order_pos in 0..sched.exec_order_count {
         let module_idx = sched.exec_order[order_pos] as usize;
         let domain = sched.domain_id[module_idx] as usize;
         let domain = if domain < MAX_DOMAINS { domain } else { 0 };
+
+        if sched.pre_tick_drain[module_idx] {
+            let pcount = sched.domain_pre_tick_count[domain] as usize;
+            if pcount < MAX_PRE_TICK_PER_DOMAIN {
+                sched.domain_pre_tick_order[domain][pcount] = module_idx as u8;
+                sched.domain_pre_tick_count[domain] = (pcount + 1) as u8;
+            } else {
+                log::error!(
+                    "[domain] {domain} dropping pre_tick_drain module {module_idx} \
+                     — capacity {MAX_PRE_TICK_PER_DOMAIN} exceeded"
+                );
+            }
+            continue;
+        }
 
         let count = sched.domain_module_count[domain] as usize;
         if count < MAX_MODULES {
@@ -3392,7 +4092,7 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
         }
     }
 
-    // Log domain composition
+    // Log domain composition (regular + pre-tick).
     let effective_domains = if sched.domain_count > 0 {
         sched.domain_count as usize
     } else {
@@ -3400,13 +4100,18 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
     };
     for d in 0..effective_domains {
         let count = sched.domain_module_count[d];
-        if count > 0 || d == 0 {
+        let pcount = sched.domain_pre_tick_count[d];
+        if count > 0 || pcount > 0 || d == 0 {
             let tick = if sched.domain_tick_us[d] > 0 {
                 sched.domain_tick_us[d]
             } else {
                 sched.tick_us
             };
-            log::info!("[domain] {d} modules={count} tick_us={tick}");
+            if pcount > 0 {
+                log::info!("[domain] {d} modules={count} pre_tick={pcount} tick_us={tick}");
+            } else {
+                log::info!("[domain] {d} modules={count} tick_us={tick}");
+            }
         }
     }
 }
@@ -3791,6 +4496,28 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
             0xFA if len == 1 => {
                 // heap.canary_enabled (u8 bool)
                 crate::kernel::heap::set_canary_enabled(module_idx, params[pos] != 0);
+            }
+            0xFB if len == 4 => {
+                // isr_budget_cycles (u32 LE). Per-module Tier 1b/2
+                // cycle budget; `0` falls back to
+                // `DEFAULT_ISR_BUDGET_CYCLES`. Set BEFORE the
+                // post-instantiation `register_isr_tier_modules_from_graph`
+                // helper reads it (parse_protection_config runs
+                // per-module right after `module_new`).
+                let val = u32::from_le_bytes([
+                    params[pos],
+                    params[pos + 1],
+                    params[pos + 2],
+                    params[pos + 3],
+                ]);
+                set_module_isr_budget_cycles(module_idx, val);
+            }
+            0xFC if len == 2 => {
+                // irq (u16 LE). Per-module hardware IRQ for Tier 2
+                // admission. The admission helper later passes this
+                // to `register_tier2_module`.
+                let val = u16::from_le_bytes([params[pos], params[pos + 1]]);
+                set_module_irq(module_idx, val);
             }
             _ => {}
         }
@@ -4332,6 +5059,16 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // so we don't emit a MON_BUDGET_OVERRUN line per remaining module.
     let mut overrun_logged: [bool; MAX_DOMAINS] = [false; MAX_DOMAINS];
 
+    // Tier 1c pre-pass drain — run each domain's `pre_tick_drain`
+    // modules before the global exec_order rotation. Single-core
+    // targets only populate domain 0; the loop is bounded so the
+    // overhead is constant when no domain has pre-tick modules.
+    for d in 0..MAX_DOMAINS {
+        if sched.domain_pre_tick_count[d] > 0 {
+            step_domain_pre_tick(modules, sched, d, not_ready, &mut active_count);
+        }
+    }
+
     // Step modules in topological order so producers run before
     // consumers. The per-module step body is in `step_one_module`
     // so the domain-scoped `step_domain_modules` can reuse the same
@@ -4369,6 +5106,16 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         if module_idx >= count {
             continue;
         }
+        // Skip Tier 1c (pre-tick) modules from the regular exec_order
+        // pass — they already ran via `step_domain_pre_tick` at the
+        // top of this function. Without this, every Tier 1c module
+        // would step twice per cooperative tick, doubling the
+        // accumulator and confusing telemetry. The skip is bounded
+        // (per-module flag read), so the cost on non-Tier-1c modules
+        // is one branch.
+        if sched.pre_tick_drain[module_idx] {
+            continue;
+        }
         step_one_module(
             modules,
             sched,
@@ -4395,6 +5142,13 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
             }
         }
     }
+
+    // Drain any cooperative⇄ISR-tier bridge edges so messages
+    // pending in either direction flow before the next tick. Runs
+    // last (after all cooperative modules have a chance to produce)
+    // so a producer's tick-T output reaches the ISR side as soon as
+    // tick T finishes.
+    pump_isr_bridges();
 
     if active_count == 0 {
         StepResult::Done
@@ -4519,6 +5273,48 @@ pub fn domain_budget_overruns(domain_id: usize) -> u32 {
     unsafe { SCHED.domain_budget_overruns[domain_id] }
 }
 
+/// Diagnostic accessor — cumulative count of Tier 1c pre-tick budget
+/// overruns for `domain_id` since boot (one increment per pass where
+/// the combined pre-tick budget `MAX_PRE_TICK_BUDGET_US` was
+/// exceeded). Returns 0 for invalid `domain_id`. See
+/// `.context/rfc_isr_tier_surface.md` §D8.
+pub fn domain_pre_tick_overruns(domain_id: usize) -> u32 {
+    if domain_id >= MAX_DOMAINS {
+        return 0;
+    }
+    // SAFETY: scheduler-thread read; domain_id bounded.
+    unsafe { SCHED.domain_pre_tick_overruns[domain_id] }
+}
+
+/// Diagnostic accessor — number of Tier 1c pre-tick modules
+/// currently assigned to `domain_id`. Returns 0 for invalid
+/// `domain_id`. Used by `tools/tests/scheduler_pre_tick_slot.rs`
+/// (the Step 4-7 drift guard) to confirm `pre_tick_drain` modules
+/// route to the pre-tick list and not to `domain_exec_order`.
+pub fn domain_pre_tick_count(domain_id: usize) -> usize {
+    if domain_id >= MAX_DOMAINS {
+        return 0;
+    }
+    // SAFETY: scheduler-thread read; domain_id bounded.
+    unsafe { SCHED.domain_pre_tick_count[domain_id] as usize }
+}
+
+/// Diagnostic accessor — Tier 1c pre-tick module index at `pos`
+/// within `domain_id`. Returns `None` for invalid `domain_id` or
+/// `pos` past the populated count. Used by the Step 4-7 drift guard.
+pub fn domain_pre_tick_at(domain_id: usize, pos: usize) -> Option<usize> {
+    if domain_id >= MAX_DOMAINS {
+        return None;
+    }
+    // SAFETY: scheduler-thread read; domain_id bounded.
+    let count = unsafe { SCHED.domain_pre_tick_count[domain_id] as usize };
+    if pos >= count || pos >= MAX_PRE_TICK_PER_DOMAIN {
+        return None;
+    }
+    // SAFETY: as above, bounded by MAX_PRE_TICK_PER_DOMAIN.
+    Some(unsafe { SCHED.domain_pre_tick_order[domain_id][pos] as usize })
+}
+
 /// Diagnostic accessor — microseconds consumed by `domain_id` in the
 /// most recent pass. Reset at the top of every pass; reading after
 /// the pass returns the cumulative time. Returns 0 for invalid
@@ -4614,6 +5410,13 @@ pub fn step_domain_modules(
     sched.domain_budget_us_consumed[domain_id] = 0;
     let mut overrun_logged_this_pass = false;
 
+    // Tier 1c pre-pass drain — runs `domain_pre_tick_order[d]`
+    // modules before the regular exec_order rotation, capped at
+    // `MAX_PRE_TICK_BUDGET_US` combined. Pre-tick costs are
+    // snapshot-restored against the regular accumulator inside
+    // the helper.
+    step_domain_pre_tick(modules, sched, domain_id, not_ready, &mut active_count);
+
     let n = sched.domain_module_count[domain_id] as usize;
     // Rotate the per-domain exec_order start by
     // `domain_exec_order_offset[domain_id]`. Each domain's offset
@@ -4655,11 +5458,73 @@ pub fn step_domain_modules(
         }
     }
 
+    // Drain cooperative⇄ISR bridges after the domain finishes its
+    // exec_order rotation. Mirrors the pump call in `step_modules`.
+    pump_isr_bridges();
+
     if active_count == 0 {
         StepResult::Done
     } else {
         StepResult::Continue
     }
+}
+
+/// Run the Tier 1c pre-tick slot for `domain_id`. Walks
+/// `domain_pre_tick_order[domain_id]` and steps each entry through
+/// `step_one_module`, honouring the combined budget cap
+/// `MAX_PRE_TICK_BUDGET_US`. When the cap is exceeded, emits
+/// `MON_PRE_TICK_OVERRUN`, bumps `domain_pre_tick_overruns[d]`, and
+/// stops iterating — remaining pre-tick modules wait until the next
+/// pass.
+///
+/// Pre-tick costs are charged into `domain_budget_us_consumed` as a
+/// side effect of `step_one_module`; this helper snapshots the
+/// accumulator before iterating and restores it on return so the
+/// regular `domain_exec_order` rotation that follows starts with a
+/// fresh budget. See `.context/rfc_isr_tier_surface.md` §D8.
+#[inline]
+fn step_domain_pre_tick(
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    sched: &mut SchedulerState,
+    domain_id: usize,
+    not_ready: u64,
+    active_count: &mut usize,
+) {
+    if domain_id >= MAX_DOMAINS {
+        return;
+    }
+    let n = sched.domain_pre_tick_count[domain_id] as usize;
+    if n == 0 {
+        return;
+    }
+    let active_module_count = sched.active_module_count;
+    let baseline = sched.domain_budget_us_consumed[domain_id];
+    let budget = MAX_PRE_TICK_BUDGET_US as u64;
+    for pos in 0..n.min(MAX_PRE_TICK_PER_DOMAIN) {
+        let module_idx = sched.domain_pre_tick_order[domain_id][pos] as usize;
+        if module_idx >= active_module_count {
+            continue;
+        }
+        step_one_module(modules, sched, module_idx, not_ready, active_count, false);
+        let used = sched.domain_budget_us_consumed[domain_id].saturating_sub(baseline);
+        if used > budget {
+            sched.domain_pre_tick_overruns[domain_id] =
+                sched.domain_pre_tick_overruns[domain_id].saturating_add(1);
+            log::warn!(
+                "MON_PRE_TICK_OVERRUN domain={} elapsed_us={} budget_us={} last_mod={} tick={}",
+                domain_id,
+                used,
+                MAX_PRE_TICK_BUDGET_US,
+                module_idx,
+                // SAFETY: DBG_TICK is an aligned u32 read.
+                unsafe { DBG_TICK },
+            );
+            break;
+        }
+    }
+    // Subtract pre-tick costs back out so the regular exec_order
+    // accounting starts at `baseline` for the rest of the pass.
+    sched.domain_budget_us_consumed[domain_id] = baseline;
 }
 
 /// Per-module step body shared between `step_modules` (flat,

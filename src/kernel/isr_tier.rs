@@ -389,6 +389,13 @@ pub fn reset_all() {
 /// Called from the platform-specific timer ISR. Reads cycle counter before/after
 /// each module step for timing metrics.
 ///
+/// Sets `scheduler::current_module_index` to the ISR-tier slot's module
+/// index for the duration of each step so the runtime EACCES gate
+/// (`scheduler::deny_isr_tier_syscall`) fires correctly if the ISR
+/// step body inadvertently calls `provider_call` / `channel_read` /
+/// `channel_write`. The original current-module pointer is restored
+/// after the step so cooperative-thread state is left untouched.
+///
 /// # Safety
 /// Called from ISR context. Must not call any blocking or allocating functions.
 #[inline(never)]
@@ -397,11 +404,13 @@ pub unsafe fn isr_tier1b_handler() {
 
     let count = ISR_COUNT as usize;
     let slots = &raw mut ISR_SLOTS;
+    let saved_module = crate::kernel::scheduler::current_module_index();
     for slot in (*slots).iter_mut().take(count) {
         if !slot.active {
             continue;
         }
 
+        crate::kernel::scheduler::set_current_module(slot.module_index as usize);
         let before = hal::read_cycle_count();
         let _rc = (slot.step_fn)(slot.state_ptr);
         let after = hal::read_cycle_count();
@@ -409,6 +418,7 @@ pub unsafe fn isr_tier1b_handler() {
 
         slot.metrics.record(elapsed);
     }
+    crate::kernel::scheduler::set_current_module(saved_module);
 }
 
 // ============================================================================
@@ -420,6 +430,12 @@ pub unsafe fn isr_tier1b_handler() {
 /// Called from a generic ISR handler. Looks up the Tier 2 module registered
 /// for the given IRQ and calls its `isr_entry` function.
 ///
+/// Sets `scheduler::current_module_index` to the matching slot's module
+/// index for the duration of the dispatch so the runtime EACCES gate
+/// (`scheduler::deny_isr_tier_syscall`) fires correctly if the Tier 2
+/// step body inadvertently calls a forbidden syscall. The original
+/// current-module pointer is restored after the step.
+///
 /// Returns 0 if handled, -1 if no module registered for this IRQ.
 ///
 /// # Safety
@@ -427,11 +443,13 @@ pub unsafe fn isr_tier1b_handler() {
 pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
     let count = ISR_T2_COUNT as usize;
     let slots = &raw mut ISR_T2_SLOTS;
+    let saved_module = crate::kernel::scheduler::current_module_index();
     for slot in (*slots).iter_mut().take(count) {
         if !slot.active || slot.irq_number != irq_number {
             continue;
         }
 
+        crate::kernel::scheduler::set_current_module(slot.module_index as usize);
         let before = hal::read_cycle_count();
         let rc = (slot.isr_entry)(slot.state_ptr);
         let after = hal::read_cycle_count();
@@ -444,8 +462,10 @@ pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
         }
 
         slot.metrics.record(elapsed);
+        crate::kernel::scheduler::set_current_module(saved_module);
         return rc;
     }
+    crate::kernel::scheduler::set_current_module(saved_module);
     -1 // No module found for this IRQ
 }
 
