@@ -39,6 +39,12 @@ embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime
 # RP2350 HAL (SPI, GPIO, USB, DMA, clocks).
 # Chip variant (rp235xa or rp235xb) selected via features below.
 embassy-rp = { version = "0.10.0", features = ["defmt", "time-driver", "critical-section-impl", "rt", "unstable-pac"], optional = true }
+# `fixed` is pulled in transitively via embassy-rp. The lockfile
+# pins it to 1.29.0 because 1.31.0+ requires rustc 1.93, while the
+# installed toolchain is 1.92. `cargo update fixed` will try to bump
+# to 1.31 — keep it at 1.29 (or whatever is the latest version
+# supporting the installed toolchain) until either rustc moves to
+# 1.93+ or embassy-rp's MSRV-floor catches up.
 # USB device stack for CDC logging.
 embassy-usb = { version = "0.6.0", features = ["defmt"], optional = true }
 # USB serial logger implementation.
@@ -174,13 +180,18 @@ debug = 2
 opt-level = 1
 
 [workspace]
-members = ["contracts", "tools", "modules/foundation/ip", "modules/foundation/http", "modules/foundation/ws_stream", "modules/foundation/tls"]
+members = ["contracts", "crates/fluxor-abi", "crates/fluxor-sdk", "tools", "modules/foundation/ip", "modules/foundation/http", "modules/foundation/ws_stream", "modules/foundation/tls"]
 # `tests/harness` is a self-contained sub-workspace (its Cargo.toml
 # declares its own `[workspace]`) that depends on the crates above
 # via path. It is intentionally not a member here — host integration
 # tests are run from inside `tests/harness` so the rest of the tree
 # builds without them present.
 exclude = ["tests"]
+
+[workspace.package]
+# Shared by every publishable crate via `version.workspace = true`.
+# Mirrors `fluxor.toml::[project].version`; publish enforces equality.
+version = "0.1.0"
 
 # Workspace-wide lint configuration. Each member inherits this via
 # `[lints] workspace = true` and relaxes specific lints per-crate

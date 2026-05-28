@@ -43,6 +43,10 @@ pub const ENV_INSTALL_ROOT: &str = "FLUXOR_INSTALL_ROOT";
 pub enum InstallDiscoverySource {
     /// `$FLUXOR_INSTALL_ROOT` env var pointed at a usable directory.
     EnvVar,
+    /// A `~/.fluxor/workspace.toml` member's checkout carries
+    /// `stacks/` + `targets/`. Carries the member's `[project].name`
+    /// (from its `fluxor.toml`) for diagnostic rendering.
+    WorkspaceMember { project_name: String },
     /// Found `<exe-prefix>/share/fluxor/{stacks,targets}` from the
     /// running binary's path — matches a `make install`-style layout
     /// where the binary lives at `<prefix>/bin/fluxor`.
@@ -72,13 +76,17 @@ pub struct InstallRoot {
 ///
 /// 1. **`$FLUXOR_INSTALL_ROOT` env var** when set to a directory
 ///    that has the install markers (`stacks/` + `targets/`).
-/// 2. **Walk from `std::env::current_exe()`** looking for
+/// 2. **`~/.fluxor/workspace.toml` member** whose checkout carries
+///    the install markers. When a downstream project declares
+///    fluxor as a live workspace member, the catalog falls out for
+///    free — no env-var pointer required.
+/// 3. **Walk from `std::env::current_exe()`** looking for
 ///    - `<prefix>/share/fluxor/{stacks,targets}` (matches the
 ///      Make / Debian-style install layout where the binary lives
 ///      at `<prefix>/bin/fluxor`).
 ///    - `<prefix>/{stacks,targets}` directly (matches a flat
 ///      install where stacks/targets sit next to the bin dir).
-/// 3. **`None`** when neither matches. In dev mode, the project
+/// 4. **`None`** when nothing matches. In dev mode, the project
 ///    root walk-up already finds the source tree's
 ///    `stacks/+targets/`, so the install root being `None` is a
 ///    no-op fallback.
@@ -94,7 +102,38 @@ pub fn install_root() -> Option<InstallRoot> {
         }
     }
 
-    // 2. Walk from the running binary's path.
+    // 2. Workspace member with install markers. Workspace mode
+    //    already routes source crates / fmods / runtimes through
+    //    live member checkouts; catalogs are the one fluxor-owned
+    //    resource the lookup hadn't yet covered. First member whose
+    //    root has both markers wins (in practice only fluxor's own
+    //    checkout passes). Silent skip on missing / unparseable
+    //    workspace.toml — broken user state should never block the
+    //    exe-walk fallback.
+    if let Ok(Some(ws)) = crate::workspace::load_workspace() {
+        for member in &ws.workspace.members {
+            if !has_install_markers(member) {
+                continue;
+            }
+            let project_name = project_identity(member)
+                .ok()
+                .flatten()
+                .map(|id| id.name)
+                .unwrap_or_else(|| {
+                    member
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "<unnamed>".to_string())
+                });
+            let canon = member.canonicalize().unwrap_or_else(|_| member.clone());
+            return Some(InstallRoot {
+                path: canon,
+                source: InstallDiscoverySource::WorkspaceMember { project_name },
+            });
+        }
+    }
+
+    // 3. Walk from the running binary's path.
     if let Ok(exe) = std::env::current_exe() {
         // `<prefix>/bin/fluxor` → `<prefix>` is `exe.parent().parent()`.
         // Use `.parent()` only when both `bin` and the prefix exist.
@@ -197,6 +236,176 @@ pub fn root() -> PathBuf {
     discover().path
 }
 
+/// `[project]` table from `fluxor.toml`. Parsed lazily by publish-side
+/// commands that need to scope artefacts into
+/// `~/.fluxor/registry/{fmod,index}/<project>/`.
+#[derive(Debug, Clone)]
+pub struct ProjectIdentity {
+    /// `[project].name` — required for publish to succeed. The CLI
+    /// does not fall back to a directory-name heuristic on purpose:
+    /// silent identity inference would mean two checkouts with the
+    /// same path basename collide in the registry.
+    pub name: String,
+    /// `[project].version` — defaults to `"0.0.0-dev"` when absent.
+    /// Canonical publish (`fluxor publish` without `--local`) refuses
+    /// the dev default; `--local` accepts it.
+    pub version: String,
+}
+
+/// Default `[project].version` when the manifest omits it. Canonical
+/// publish refuses this value.
+pub const DEV_VERSION: &str = "0.0.0-dev";
+
+/// Read `[project]` from `<project_root>/fluxor.toml`. Returns
+/// `Ok(None)` when the file is absent (caller decides whether that's
+/// an error). Returns an error when the file exists but the
+/// `[project]` table is malformed.
+pub fn project_identity(project_root: &Path) -> Result<Option<ProjectIdentity>, String> {
+    let parsed = read_fluxor_toml(project_root)?;
+    Ok(parsed.and_then(|f| f.project).map(|p| ProjectIdentity {
+        name: p.name,
+        version: p.version.unwrap_or_else(|| DEV_VERSION.to_string()),
+    }))
+}
+
+/// One entry in `fluxor.toml::[dependencies]`. The wire form is either
+/// a bare version string (`fluxor = "1.0"`) or a table
+/// (`fluxor = { version = "1.0", path = "../fluxor" }`).
+#[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "`optional` field is consumed by callers that handle feature-gating; the surface stays exposed"
+)]
+pub struct DepSpec {
+    /// Upstream project name.
+    pub name: String,
+    /// Version range (e.g. `"1.0"`). `None` for path/git overrides
+    /// where the source is authoritative.
+    pub version: Option<String>,
+    /// Path override — inline form. Resolved relative to the
+    /// consuming project's root.
+    pub path: Option<PathBuf>,
+    /// Git override.
+    pub git: Option<String>,
+    /// Optional + feature-gated.
+    pub optional: bool,
+}
+
+/// Parse `[features]` from `<project_root>/fluxor.toml`. Each entry
+/// maps a feature name to the list of dep names it activates.
+/// Returns an empty map when the section is absent.
+pub fn features(
+    project_root: &Path,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let Some(parsed) = read_fluxor_toml(project_root)? else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    Ok(parsed.features.unwrap_or_default())
+}
+
+/// Filter `[dependencies]` by the set of active features. Required
+/// deps (those without `optional = true`) always pass through.
+/// Optional deps pass through only when at least one active feature
+/// lists them in its activation set.
+pub fn active_dependencies(
+    project_root: &Path,
+    active_features: &[String],
+) -> Result<Vec<DepSpec>, String> {
+    let deps = dependencies(project_root)?;
+    let feats = features(project_root)?;
+    let activated_names: std::collections::BTreeSet<String> = active_features
+        .iter()
+        .flat_map(|f| feats.get(f).cloned().unwrap_or_default())
+        .collect();
+    Ok(deps
+        .into_iter()
+        .filter(|d| !d.optional || activated_names.contains(&d.name))
+        .collect())
+}
+
+/// Parse `[dependencies]` (and `[dependencies.X]` table forms) from
+/// `<project_root>/fluxor.toml`. Returns an empty vec when the
+/// section is absent. Includes both required and optional entries —
+/// callers that need feature-gated filtering should use
+/// [`active_dependencies`] instead.
+pub fn dependencies(project_root: &Path) -> Result<Vec<DepSpec>, String> {
+    let Some(parsed) = read_fluxor_toml(project_root)? else {
+        return Ok(Vec::new());
+    };
+    let Some(deps) = parsed.dependencies else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (name, value) in deps {
+        let spec = match value {
+            DepValue::Simple(version) => DepSpec {
+                name,
+                version: Some(version),
+                path: None,
+                git: None,
+                optional: false,
+            },
+            DepValue::Table(t) => DepSpec {
+                name,
+                version: t.version,
+                path: t.path.map(PathBuf::from),
+                git: t.git,
+                optional: t.optional.unwrap_or(false),
+            },
+        };
+        out.push(spec);
+    }
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+struct FluxorTomlParse {
+    #[serde(default)]
+    project: Option<ProjectSection>,
+    #[serde(default)]
+    dependencies: Option<std::collections::BTreeMap<String, DepValue>>,
+    #[serde(default)]
+    features: Option<std::collections::BTreeMap<String, Vec<String>>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectSection {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum DepValue {
+    Simple(String),
+    Table(DepTable),
+}
+
+#[derive(serde::Deserialize)]
+struct DepTable {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    git: Option<String>,
+    #[serde(default)]
+    optional: Option<bool>,
+}
+
+fn read_fluxor_toml(project_root: &Path) -> Result<Option<FluxorTomlParse>, String> {
+    let path = project_root.join("fluxor.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let parsed: FluxorTomlParse =
+        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    Ok(Some(parsed))
+}
+
 /// Discover the project root with provenance. See [`ProjectRoot`].
 pub fn discover() -> ProjectRoot {
     let env_var_value = std::env::var(ENV_PROJECT_ROOT).ok();
@@ -289,7 +498,7 @@ fn marker_at(path: &Path) -> Option<DiscoverySource> {
     clippy::undocumented_unsafe_blocks,
     reason = "test scaffolding wraps std::env::{set_var, remove_var} which became `unsafe fn` in Rust 2024; safety is identical at every call site — the tests serialise on the module-level `lock()` mutex, so racing env-mutation across threads is structurally precluded"
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
 
@@ -297,7 +506,7 @@ mod tests {
     /// process-global, so the tests serialise on a shared mutex.
     /// `Mutex<()>` rather than `RwLock` because read/write semantics
     /// don't help when env vars are involved.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         match ENV_LOCK.lock() {
@@ -418,9 +627,27 @@ mod tests {
 
     // ── install_root ─────────────────────────────────────────────
 
+    /// Point `$FLUXOR_WORKSPACE` at a path that doesn't exist so the
+    /// workspace-member resolution branch reads `Ok(None)` and the
+    /// test exercises only the env-var / exe-walk branches.
+    /// `install_root`'s branches are independent, so neutralising
+    /// workspace mode keeps the per-branch tests focused.
+    fn neutralise_workspace_env() {
+        unsafe {
+            std::env::set_var("FLUXOR_WORKSPACE", "/nonexistent/workspace.toml");
+        }
+    }
+
+    fn restore_workspace_env() {
+        unsafe {
+            std::env::remove_var("FLUXOR_WORKSPACE");
+        }
+    }
+
     #[test]
     fn install_root_env_var_resolves_when_dir_has_markers() {
         let _g = lock();
+        neutralise_workspace_env();
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("stacks")).unwrap();
         fs::create_dir(tmp.path().join("targets")).unwrap();
@@ -431,6 +658,7 @@ mod tests {
         unsafe {
             std::env::remove_var(ENV_INSTALL_ROOT);
         }
+        restore_workspace_env();
         let install = found.expect("env var with valid markers must resolve");
         assert_eq!(install.source, InstallDiscoverySource::EnvVar);
     }
@@ -442,19 +670,21 @@ mod tests {
         // (the install layout is what makes the path a fluxor
         // install, not the env var pointing there).
         let _g = lock();
+        neutralise_workspace_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var(ENV_INSTALL_ROOT, tmp.path());
         }
         // The env-var path is unusable; install_root should walk
-        // through the env-var branch and fall to the current_exe
-        // branch. In a test binary current_exe lives under
-        // `target/debug/deps/`, where no `share/fluxor` or flat
-        // markers exist — so the final result should be None.
+        // past the env-var and workspace branches and reach the
+        // current_exe branch. In a test binary current_exe lives
+        // under `target/debug/deps/`, where no `share/fluxor` or
+        // flat markers exist — so the final result should be None.
         let found = install_root();
         unsafe {
             std::env::remove_var(ENV_INSTALL_ROOT);
         }
+        restore_workspace_env();
         assert!(
             found.is_none(),
             "expected no install root when env-var path has no markers, got {found:?}"
@@ -464,6 +694,7 @@ mod tests {
     #[test]
     fn install_root_none_when_no_markers_anywhere() {
         let _g = lock();
+        neutralise_workspace_env();
         // Ensure no env var sets the install root explicitly.
         unsafe {
             std::env::remove_var(ENV_INSTALL_ROOT);
@@ -471,7 +702,116 @@ mod tests {
         // Test binary's current_exe is under target/debug/deps/;
         // walking up doesn't hit a `share/fluxor/` or flat install
         // layout. Result should be None.
-        assert!(install_root().is_none());
+        let found = install_root();
+        restore_workspace_env();
+        assert!(found.is_none());
+    }
+
+    /// Synthesise a fake fluxor checkout (stacks/ + targets/ + a
+    /// fluxor.toml declaring the project name) and a workspace.toml
+    /// listing it. Returns the `TempDir` so the caller controls the
+    /// lifetime — drop it after the test finishes.
+    fn build_workspace_member(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let member = tempfile::tempdir().unwrap();
+        fs::create_dir(member.path().join("stacks")).unwrap();
+        fs::create_dir(member.path().join("targets")).unwrap();
+        fs::write(
+            member.path().join("fluxor.toml"),
+            format!("[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        let path = member.path().to_path_buf();
+        (member, path)
+    }
+
+    fn write_workspace_toml(members: &[&Path]) -> tempfile::NamedTempFile {
+        let mut body = String::from("[workspace]\nmembers = [\n");
+        for m in members {
+            body.push_str(&format!("  \"{}\",\n", m.display()));
+        }
+        body.push_str("]\n");
+        let file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        fs::write(file.path(), body).unwrap();
+        file
+    }
+
+    #[test]
+    fn install_root_resolves_to_workspace_member_when_marker_present() {
+        let _g = lock();
+        unsafe {
+            std::env::remove_var(ENV_INSTALL_ROOT);
+        }
+        let (_member_guard, member_path) = build_workspace_member("fluxor");
+        let ws_file = write_workspace_toml(&[&member_path]);
+        unsafe {
+            std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
+        }
+        let found = install_root();
+        restore_workspace_env();
+        let install = found.expect("workspace member with markers must resolve");
+        assert_eq!(
+            install.path.canonicalize().unwrap(),
+            member_path.canonicalize().unwrap(),
+        );
+        assert_eq!(
+            install.source,
+            InstallDiscoverySource::WorkspaceMember {
+                project_name: "fluxor".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn install_root_env_var_wins_over_workspace_member() {
+        // Both branches would resolve; env var must win.
+        let _g = lock();
+        let (_member_guard, member_path) = build_workspace_member("fluxor");
+        let ws_file = write_workspace_toml(&[&member_path]);
+        let env_target = tempfile::tempdir().unwrap();
+        fs::create_dir(env_target.path().join("stacks")).unwrap();
+        fs::create_dir(env_target.path().join("targets")).unwrap();
+        unsafe {
+            std::env::set_var(ENV_INSTALL_ROOT, env_target.path());
+            std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
+        }
+        let found = install_root();
+        unsafe {
+            std::env::remove_var(ENV_INSTALL_ROOT);
+        }
+        restore_workspace_env();
+        let install = found.expect("env-var path with markers must resolve");
+        assert_eq!(install.source, InstallDiscoverySource::EnvVar);
+        assert_eq!(
+            install.path.canonicalize().unwrap(),
+            env_target.path().canonicalize().unwrap(),
+        );
+    }
+
+    #[test]
+    fn install_root_skips_workspace_member_without_markers() {
+        // A workspace member that's a downstream project (no
+        // stacks/+targets/) must not be picked. install_root should
+        // skip it and return None (no env var, no exe-walk match).
+        let _g = lock();
+        unsafe {
+            std::env::remove_var(ENV_INSTALL_ROOT);
+        }
+        let downstream = tempfile::tempdir().unwrap();
+        fs::write(
+            downstream.path().join("fluxor.toml"),
+            "[project]\nname = \"downstream\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let ws_file = write_workspace_toml(&[downstream.path()]);
+        unsafe {
+            std::env::set_var("FLUXOR_WORKSPACE", ws_file.path());
+        }
+        let found = install_root();
+        restore_workspace_env();
+        assert!(
+            found.is_none(),
+            "downstream member without markers must not be promoted, got {found:?}"
+        );
     }
 
     // ── find_resource ────────────────────────────────────────────
@@ -571,5 +911,66 @@ mod tests {
             found.env_var_value.as_deref(),
             Some("/this/path/does/not/exist")
         );
+    }
+
+    fn write_fluxor_toml(dir: &Path, body: &str) {
+        fs::write(dir.join("fluxor.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn active_dependencies_filters_optional_deps_without_feature() {
+        let _g = lock();
+        let tmp =
+            std::env::temp_dir().join(format!("fluxor_active_deps_no_feat_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        write_fluxor_toml(
+            &tmp,
+            r#"
+                [project]
+                name = "x"
+                version = "0.1.0"
+                [dependencies]
+                req = "1.0"
+                [dependencies.opt]
+                version = "1.0"
+                optional = true
+                [features]
+                cluster = ["opt"]
+            "#,
+        );
+        let deps = active_dependencies(&tmp, &[]).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["req"]);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn active_dependencies_includes_optional_when_feature_active() {
+        let _g = lock();
+        let tmp =
+            std::env::temp_dir().join(format!("fluxor_active_deps_feat_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        write_fluxor_toml(
+            &tmp,
+            r#"
+                [project]
+                name = "x"
+                version = "0.1.0"
+                [dependencies]
+                req = "1.0"
+                [dependencies.opt]
+                version = "1.0"
+                optional = true
+                [features]
+                cluster = ["opt"]
+            "#,
+        );
+        let mut deps = active_dependencies(&tmp, &["cluster".into()]).unwrap();
+        deps.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["opt", "req"]);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

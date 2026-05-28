@@ -5212,13 +5212,12 @@ pub static EXAMPLES: LazyLock<HashMap<&'static str, Value>> = LazyLock::new(|| {
 /// uses them via `super::test_env::*`.
 #[cfg(test)]
 pub(crate) mod test_env {
-    /// File-scope mutex serialising every env-mutating test.
-    /// Poisoning is treated as benign: callers continue with the
-    /// recovered guard.
-    pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Process-global env-mutating tests serialise through a single
+    /// mutex. The mutex itself lives in `project::tests` (which is
+    /// reachable from both lib and bin test targets) so independent
+    /// test modules can't accidentally race against each other.
     pub fn lock() -> std::sync::MutexGuard<'static, ()> {
-        match ENV_LOCK.lock() {
+        match crate::project::tests::ENV_LOCK.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }

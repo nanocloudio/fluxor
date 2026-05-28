@@ -37,6 +37,17 @@ help:
 	@echo "    make ci               full CI gate (fluxor ci)"
 	@echo "    make clean            cargo clean + module artefacts"
 	@echo "    make setup            install fluxor CLI onto PATH"
+	@echo "  Registry:"
+	@echo "    make publish               canonical publish of every publishable artefact"
+	@echo "    make publish-local         same, content-hashed -local.<sha> suffix"
+	@echo "    make publish-{abi,sdk,modules,common}[-local]   per-tier publish"
+	@echo "    make update                regenerate fluxor.lock"
+	@echo "    make sync[-dry]            install lockfile-resolved fmods locally"
+	@echo "    make registry-init         bootstrap ~/.fluxor/registry/ + cargo git index"
+	@echo "    make registry-list         inventory ~/.fluxor/registry/"
+	@echo "    make registry-gc[-dry]     trim old -local/-live artefacts"
+	@echo "    make registry-setup-cargo  add [registries.fluxor] to ~/.cargo/config.toml"
+	@echo "    make workspace-status      show ~/.fluxor/workspace.toml state"
 	@echo "  Project-specific:"
 	@echo "    make firmware TARGET=…   bare-metal kernel build"
 	@echo "    make linux-bin           Linux userspace binary"
@@ -78,6 +89,108 @@ modules-list: tools
 
 modules-resolve: tools
 	@$(FLUXOR) modules resolve --target $(TARGET) --out target
+
+# ── Registry publish wrappers ──────────────────────────────────────────
+#
+# Convention: explicit `-local` targets rather than a `LOCAL=1` flag.
+# `publish` is canonical; `publish-local` produces `-local.<sha>`
+# content-hashed artefacts for path/git override workflows.
+# (Workspace mode bypasses publish entirely.)
+
+# `make publish` is the one-stop "everything downstream needs" target.
+# Builds module artefacts + the fluxor-linux runtime first, then
+# publishes all four tiers (abi source, sdk source, fmod palette,
+# runtime binary). Heavy but deterministic — incremental rebuilds
+# make subsequent runs cheap.
+publish: tools modules-all linux-bin publish-abi publish-sdk publish-modules publish-runtime
+publish-local: tools modules-all linux-bin
+	$(FLUXOR) publish --local
+	$(FLUXOR) publish runtime --binary $(RUNTIME_BINARY) --local $(if $(HOST_TARGET),--host-target $(HOST_TARGET),)
+
+publish-abi: tools
+	$(FLUXOR) publish abi
+publish-abi-local: tools
+	$(FLUXOR) publish abi --local
+
+publish-sdk: tools
+	$(FLUXOR) publish sdk
+publish-sdk-local: tools
+	$(FLUXOR) publish sdk --local
+
+publish-modules: tools
+	$(FLUXOR) publish fmod
+publish-modules-local: tools
+	$(FLUXOR) publish fmod --local
+
+# Runtime binary publish. The host-target defaults to rustc's host;
+# override with HOST_TARGET=... for cross-compiled outputs.
+HOST_TARGET ?=
+RUNTIME_BINARY ?= fluxor-linux
+publish-runtime: tools
+	$(FLUXOR) publish runtime --binary $(RUNTIME_BINARY) $(if $(HOST_TARGET),--host-target $(HOST_TARGET),)
+publish-runtime-local: tools
+	$(FLUXOR) publish runtime --binary $(RUNTIME_BINARY) --local $(if $(HOST_TARGET),--host-target $(HOST_TARGET),)
+
+# `publish-common` is a downstream-project target only — fluxor itself
+# owns the SDK, not a project-local common crate. The recipe stays
+# here so the standard `make publish-common` works in every fluxor-
+# based project; in this repo it's an error path (fluxor has no
+# `common/`).
+publish-common: tools
+	$(FLUXOR) publish common
+publish-common-local: tools
+	$(FLUXOR) publish common --local
+
+# ── Registry maintenance ───────────────────────────────────────────────
+#
+# Inspect and trim `~/.fluxor/registry/`.
+
+registry-init: tools
+	$(FLUXOR) registry init
+
+registry-list: tools
+	@$(FLUXOR) registry list
+
+registry-gc: tools
+	$(FLUXOR) registry gc
+
+registry-gc-dry: tools
+	$(FLUXOR) registry gc --dry-run
+
+registry-setup-cargo: tools
+	$(FLUXOR) registry setup-cargo
+
+# ── Lockfile ──────────────────────────────────────────────────────────
+#
+# `make update` re-resolves and rewrites `fluxor.lock` from
+# `fluxor.toml` + registry state.
+
+# `FEATURES` is a comma-separated list of features to activate when
+# resolving the lockfile. Optional deps participate only when at
+# least one active feature lists them under `[features]`.
+FEATURES ?=
+update: tools
+	$(FLUXOR) update $(if $(FEATURES),--features $(FEATURES),)
+
+# ── Sync ──────────────────────────────────────────────────────────────
+#
+# Install lockfile-resolved fmods into `target/fluxor/<target>/modules/`.
+# Symmetric half of `make publish-modules`. Hash-verified, idempotent.
+
+sync: tools
+	$(FLUXOR) sync
+
+sync-dry: tools
+	$(FLUXOR) sync --dry-run
+
+# ── Workspace mode ────────────────────────────────────────────────────
+#
+# `~/.fluxor/workspace.toml` lists colocated checkouts the CLI should
+# treat as live source. Mode is positional (CWD-based);
+# `workspace-status` is the inspection surface.
+
+workspace-status: tools
+	@$(FLUXOR) workspace status
 
 # ── Run / cluster bring-up ─────────────────────────────────────────────
 

@@ -743,7 +743,13 @@ impl Manifest {
         if let Some(hit) = cache.lock().unwrap().get(module_type) {
             return Ok(hit.clone());
         }
-        const SOURCE_DIRS: &[&str] = &[
+        // Per-root manifest layouts. The first set targets a real
+        // fluxor source tree (modules/ at the root); the second
+        // targets a downstream project that has run `fluxor sync`
+        // and consumed fluxor's SDK via the registry — the SDK
+        // bundles `modules/builtin/*` so the per-platform manifests
+        // ship as part of the published `fluxor-sdk` crate.
+        const SOURCE_TREE_DIRS: &[&str] = &[
             "modules/drivers",
             "modules/foundation",
             "modules/app",
@@ -753,15 +759,48 @@ impl Manifest {
             "modules/builtin/qemu",
             "modules",
         ];
+        const SYNCED_SDK_DIRS: &[&str] = &[
+            "target/fluxor/fluxor-sdk/builtin/linux",
+            "target/fluxor/fluxor-sdk/builtin/host",
+            "target/fluxor/fluxor-sdk/builtin/wasm",
+            "target/fluxor/fluxor-sdk/builtin/qemu",
+        ];
+
+        // Search roots are walked in order:
+        //   1. Project root (CWD-relative discovery via marker walk, or
+        //      `$FLUXOR_PROJECT_ROOT` override).
+        //   2. Install root (`$FLUXOR_INSTALL_ROOT` or exe-prefix
+        //      derivation). Downstream consumers point this at a
+        //      sibling fluxor checkout so builtin modules resolve
+        //      without requiring a fully-synced registry.
+        //   3. Bare CWD as the final fallback so existing call sites
+        //      that ran from fluxor's repo root continue to work.
+        //
+        // Per root, source-tree layouts are checked first so a
+        // colocated fluxor checkout wins over a synced SDK copy
+        // (the source is newer than the published artefact during
+        // active development).
+        let mut search_roots: Vec<std::path::PathBuf> = Vec::new();
+        search_roots.push(crate::project::root());
+        if let Some(install) = crate::project::install_root() {
+            if !search_roots.contains(&install.path) {
+                search_roots.push(install.path);
+            }
+        }
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if !search_roots.contains(&cwd) {
+            search_roots.push(cwd);
+        }
+
         let mut found: Option<Manifest> = None;
-        for dir in SOURCE_DIRS {
-            let p = std::path::Path::new(dir)
-                .join(module_type)
-                .join("manifest.toml");
-            if p.exists() {
-                let m = Manifest::from_toml(&p)?;
-                found = Some(m);
-                break;
+        'outer: for root in &search_roots {
+            for dir in SOURCE_TREE_DIRS.iter().chain(SYNCED_SDK_DIRS) {
+                let p = root.join(dir).join(module_type).join("manifest.toml");
+                if p.exists() {
+                    let m = Manifest::from_toml(&p)?;
+                    found = Some(m);
+                    break 'outer;
+                }
             }
         }
         cache

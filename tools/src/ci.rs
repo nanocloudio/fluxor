@@ -142,6 +142,16 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         check_version_skew(project_root)
     }));
 
+    // ───── Phase 1.7: lockfile consistency ──────────────────────────
+    //
+    // When the project declares `[dependencies]`, the committed
+    // `fluxor.lock` must match what the resolver would produce today
+    // against the local registry. Projects without `[dependencies]`
+    // skip cleanly — no lockfile is expected.
+    results.push(run_step("lockfile-consistency", verbose, || {
+        check_lockfile_consistency(project_root)
+    }));
+
     // ───── Phase 2: cargo unit + library tests ──────────────────────
     //
     // For fluxor itself, run from `tools/` rather than workspace
@@ -1002,6 +1012,36 @@ fn extract_missing_key_from_err(msg: &str) -> Option<String> {
     let after = &msg[open + 3..];
     let close = after.find("__`")?;
     Some(after[..close].to_string())
+}
+
+/// Lockfile-consistency phase. Skips cleanly when:
+///
+/// - the project has no `[dependencies]` table (no lockfile expected); or
+/// - live workspace mode is active for this project root (live members
+///   bypass the lockfile and an advisory is printed at sync time; CI
+///   should treat drift as informational, not fatal).
+///
+/// Otherwise demands a present, parseable, drift-free `fluxor.lock`.
+fn check_lockfile_consistency(project_root: &Path) -> std::result::Result<(), String> {
+    let deps = crate::project::dependencies(project_root)?;
+    if deps.is_empty() {
+        return Ok(());
+    }
+    // Live-mode advisory: workspace mode is per-developer, gitignored,
+    // and intentionally bypasses lockfile pinning. CI shouldn't reject
+    // a build just because the developer happens to have the project
+    // listed in `~/.fluxor/workspace.toml`.
+    if let Ok(Some(ws)) = crate::workspace::load_workspace() {
+        if crate::workspace::current_member(&ws, project_root).is_some() {
+            eprintln!(
+                "note: live workspace mode active for this project root — \
+                 lockfile-consistency check skipped. Run `make update` after \
+                 leaving workspace mode to refresh fluxor.lock against the registry."
+            );
+            return Ok(());
+        }
+    }
+    crate::lockfile::check_consistent(project_root).map_err(|e| e.to_string())
 }
 
 /// Version-skew check.

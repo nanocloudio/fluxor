@@ -1,9 +1,9 @@
 [package]
-name = "fluxor-contracts"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
-description = "Public Fluxor storage-surface contracts (Fence, StorageHandle, content types)"
+name              = "fluxor-contracts"
+version.workspace = true
+edition           = "2021"
+license           = "Apache-2.0"
+description       = "Public Fluxor storage-surface contracts (Fence, StorageHandle, content types)"
 
 [lib]
 name = "fluxor_contracts"

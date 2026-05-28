@@ -403,7 +403,9 @@ fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool
         project_root.join("modules/sdk/abi.rs"),
         project_root.join("modules/sdk/runtime.rs"),
         project_root.join("modules/sdk/params.rs"),
-        project_root.join("modules/module.ld"),
+        // Linker script. Lives under modules/sdk/ so it ships in the
+        // fluxor-abi / fluxor-sdk source bundle for downstream consumers.
+        project_root.join("modules/sdk/module.ld"),
     ];
     for input in &inputs {
         if let Some(im) = mtime(input) {
@@ -578,12 +580,38 @@ fn compile_module_wasm(
 }
 
 fn pick_linker_script(cand: &Candidate, project_root: &Path) -> PathBuf {
+    // 1. Per-module override wins.
     let local = cand.dir.join("module.ld");
     if local.exists() {
-        local
-    } else {
-        project_root.join("modules/module.ld")
+        return local;
     }
+    // 2. Project-local default at `modules/sdk/module.ld` — bundled
+    //    into the `fluxor-abi`/`fluxor-sdk` crates via the symlinked
+    //    sdk/ directory. Also accept `modules/module.ld` as a
+    //    fallback location.
+    for cand_path in [
+        project_root.join("modules/sdk/module.ld"),
+        project_root.join("modules/module.ld"),
+    ] {
+        if cand_path.exists() {
+            return cand_path;
+        }
+    }
+    // 3. Downstream consumers materialise fluxor's SDK source into
+    //    `target/fluxor/{fluxor-abi,fluxor-sdk}/sdk/` via
+    //    `fluxor sync`. Pick that up so PIC builds in a downstream
+    //    project find the script without an explicit copy.
+    for cand_path in [
+        project_root.join("target/fluxor/fluxor-abi/sdk/module.ld"),
+        project_root.join("target/fluxor/fluxor-sdk/sdk/module.ld"),
+    ] {
+        if cand_path.exists() {
+            return cand_path;
+        }
+    }
+    // Fall back to a conventional path so the error message points at
+    // the familiar location.
+    project_root.join("modules/module.ld")
 }
 
 fn run_step(mut cmd: Command, name: &str) -> Result<()> {

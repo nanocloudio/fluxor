@@ -1,10 +1,10 @@
 [package]
-name = "fluxor-tools"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/nanocloudio/fluxor"
-description = "Host-side tools for Fluxor firmware configuration"
+name              = "fluxor-tools"
+version.workspace = true
+edition           = "2021"
+license           = "MIT OR Apache-2.0"
+repository        = "https://github.com/nanocloudio/fluxor"
+description       = "Host-side tools for Fluxor firmware configuration"
 
 [[bin]]
 name = "fluxor"
@@ -63,6 +63,7 @@ regex = "1.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"  # deprecated but functional; consider serde_yml for future
+semver = "1.0"
 sha2 = "0.11.0"
 # `proc-macro2` is a transitive dep of syn; pulling it in directly lets
 # us enable the `span-locations` feature so `Span::start()` yields

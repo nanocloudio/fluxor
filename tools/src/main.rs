@@ -22,28 +22,35 @@
 
 mod asset_bank;
 mod board;
+mod cargo_index;
 mod ci;
 mod config;
 mod crypto;
 mod error;
 mod hash;
 mod hygiene;
+mod lockfile;
 mod manifest;
 mod modules;
 mod modules_build;
 mod monitor;
 mod project;
+mod project_meta;
+mod publish;
 pub mod reconfigure;
+mod registry;
 mod render_template;
 pub mod rig;
 mod scenario;
 mod schema;
 mod stack_expand;
+mod sync;
 pub mod target;
 mod text_distance;
 mod uf2;
 mod up;
 mod wasm_bundle;
+mod workspace;
 
 /// Wire-format constants — path-mounted from `modules/sdk/wire.rs` so
 /// the host tools see the exact same `ABI_VERSION` byte and `fnv1a32`
@@ -426,6 +433,175 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
+
+    /// Publish artefacts to the local Fluxor registry
+    /// (`~/.fluxor/registry/`).
+    ///
+    /// `fluxor publish --local` (no subcommand) publishes every
+    /// publishable artefact in the project with content-hashed `-local.<sha>`
+    /// names, for path/git override workflows. Workspace mode
+    /// (`~/.fluxor/workspace.toml`) is the preferred way to iterate
+    /// across projects without needing publish-local at all.
+    Publish {
+        #[command(subcommand)]
+        action: Option<PublishAction>,
+        /// Local-publish all publishable artefacts (no subcommand form).
+        /// Each artefact gets a `-local.<content-hash>` suffix.
+        #[arg(long, conflicts_with = "action")]
+        local: bool,
+        /// Project root override. Defaults to the directory resolved
+        /// by `fluxor inspect`.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+
+    /// Regenerate `fluxor.lock` from the current `fluxor.toml` and the
+    /// registry's available versions.
+    Update {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Features to activate when resolving `[dependencies]`.
+        /// Optional deps (those declared with `optional = true`)
+        /// participate only when at least one active feature lists
+        /// them under `[features]`. Repeat the flag or pass a
+        /// comma-separated list.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+    },
+
+    /// Install lockfile-resolved fmods into
+    /// `<project>/target/fluxor/<target>/modules/`. The symmetric
+    /// half of `fluxor publish fmod`: where publish writes into the
+    /// registry, sync copies *from* the registry into the local
+    /// build tree where `fluxor modules build` / `fluxor flash`
+    /// expect to find foundation fmods.
+    ///
+    /// Hash-verified against the lockfile. Idempotent: re-running
+    /// is a no-op when destination hashes match.
+    Sync {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Don't copy — list what would change.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Inspect and maintain the local Fluxor registry.
+    Registry {
+        #[command(subcommand)]
+        action: RegistryAction,
+    },
+
+    /// Inspect the live-workspace state (`~/.fluxor/workspace.toml`).
+    ///
+    /// Workspace mode is detected positionally — by whether the CWD
+    /// sits inside a listed member. This command shows whether the
+    /// workspace file is present, which members it lists, and whether
+    /// the current working directory triggers live-mode resolution.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PublishAction {
+    /// Publish `fluxor-abi` (fluxor repo only).
+    Abi {
+        /// Content-hashed `-local.<sha>` suffix for the published
+        /// artefact — for cross-project iteration without committing
+        /// to a canonical version.
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Publish `fluxor-sdk` and `fluxor-sdk-macros` (fluxor repo only).
+    Sdk {
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Publish `<project>-common` (every downstream project).
+    Common {
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Publish compiled `.fmod` artefacts. Defaults to every
+    /// `(target, module)` declared in `fluxor.toml::[ci].targets ×
+    /// modules/`.
+    Fmod {
+        /// Limit to one target.
+        #[arg(long)]
+        target: Option<String>,
+        /// Limit to one module.
+        #[arg(long)]
+        module: Option<String>,
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    /// Publish a host runtime binary (e.g. `fluxor-linux`). Reads
+    /// `<project>/target/<host-target>/release/<binary>` and copies
+    /// to `~/.fluxor/registry/bin/<project>/<host-target>/<binary>/
+    /// <version>`. Downstream `fluxor run` resolves the runtime via
+    /// this registry path.
+    Runtime {
+        /// Binary name (cargo `[[bin]] name`). For fluxor itself,
+        /// `fluxor-linux`.
+        #[arg(long)]
+        binary: String,
+        /// Host triple — e.g. `aarch64-unknown-linux-gnu`. Defaults
+        /// to the running CLI's host target.
+        #[arg(long)]
+        host_target: Option<String>,
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegistryAction {
+    /// Bootstrap the registry index — create `~/.fluxor/registry/`,
+    /// initialise the cargo git-index at `index/`, write
+    /// `config.json`. Idempotent; safe to re-run.
+    Init,
+    /// Inventory the local registry: source crates and fmod palettes
+    /// keyed by `(project, target, version)`.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Trim old `-local.<sha>` and `-live.<sha>` artefacts from the
+    /// local registry. Default policy: keep newest N per
+    /// `(project, target, name)` plus anything younger than M days.
+    Gc {
+        /// Don't actually delete — list what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Add the `[registries.fluxor]` alias to `~/.cargo/config.toml`
+    /// so cargo can resolve fluxor-published crates by name.
+    /// Idempotent: updates a sentinel-bounded block, preserves the
+    /// rest of the file.
+    SetupCargo,
+}
+
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Print the current workspace state: file location, members,
+    /// CWD, and whether live-mode resolution applies to this
+    /// invocation.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -622,6 +798,64 @@ fn main() {
                 cmd_modules_list(project_root.as_deref(), json)
             }
             ModulesAction::Resolve { target, out } => cmd_modules_resolve(&target, &out),
+        },
+        Commands::Publish {
+            action,
+            local,
+            project_root,
+        } => match action {
+            None => publish::cmd_publish_all(local, project_root.as_deref()),
+            Some(PublishAction::Abi {
+                local: sub_local,
+                project_root: sub_root,
+            }) => publish::cmd_publish_abi(local || sub_local, sub_root.as_deref()),
+            Some(PublishAction::Sdk {
+                local: sub_local,
+                project_root: sub_root,
+            }) => publish::cmd_publish_sdk(local || sub_local, sub_root.as_deref()),
+            Some(PublishAction::Common {
+                local: sub_local,
+                project_root: sub_root,
+            }) => publish::cmd_publish_common(local || sub_local, sub_root.as_deref()),
+            Some(PublishAction::Fmod {
+                target,
+                module,
+                local: sub_local,
+                project_root: sub_root,
+            }) => publish::cmd_publish_fmod(
+                target.as_deref(),
+                module.as_deref(),
+                local || sub_local,
+                sub_root.as_deref(),
+            ),
+            Some(PublishAction::Runtime {
+                binary,
+                host_target,
+                local: sub_local,
+                project_root: sub_root,
+            }) => publish::cmd_publish_runtime(
+                &binary,
+                host_target.as_deref(),
+                local || sub_local,
+                sub_root.as_deref(),
+            ),
+        },
+        Commands::Update {
+            project_root,
+            features,
+        } => lockfile::cmd_update(project_root.as_deref(), &features),
+        Commands::Sync {
+            project_root,
+            dry_run,
+        } => sync::cmd_sync(project_root.as_deref(), dry_run),
+        Commands::Registry { action } => match action {
+            RegistryAction::Init => cargo_index::cmd_registry_init(),
+            RegistryAction::List { json } => registry::cmd_registry_list(json),
+            RegistryAction::Gc { dry_run } => registry::cmd_registry_gc(dry_run),
+            RegistryAction::SetupCargo => cargo_index::cmd_registry_setup_cargo(),
+        },
+        Commands::Workspace { action } => match action {
+            WorkspaceAction::Status { json } => workspace::cmd_workspace_status(json),
         },
     };
 
@@ -2228,15 +2462,27 @@ fn cmd_inspect_json(config_path: Option<&Path>) -> Result<()> {
 
     // Install root.
     out["install_root"] = match crate::project::install_root() {
-        Some(install) => serde_json::json!({
-            "path": install.path.display().to_string(),
-            "source": match install.source {
-                crate::project::InstallDiscoverySource::EnvVar => "env_var",
-                crate::project::InstallDiscoverySource::ExePrefixShare => "exe_prefix_share",
-                crate::project::InstallDiscoverySource::ExePrefixFlat => "exe_prefix_flat",
-            },
-            "same_as_project": install.path == pr.path,
-        }),
+        Some(install) => {
+            let (source_tag, project_name) = match &install.source {
+                crate::project::InstallDiscoverySource::EnvVar => ("env_var", None),
+                crate::project::InstallDiscoverySource::WorkspaceMember { project_name } => {
+                    ("workspace_member", Some(project_name.clone()))
+                }
+                crate::project::InstallDiscoverySource::ExePrefixShare => {
+                    ("exe_prefix_share", None)
+                }
+                crate::project::InstallDiscoverySource::ExePrefixFlat => ("exe_prefix_flat", None),
+            };
+            let mut entry = serde_json::json!({
+                "path": install.path.display().to_string(),
+                "source": source_tag,
+                "same_as_project": install.path == pr.path,
+            });
+            if let Some(name) = project_name {
+                entry["workspace_project"] = serde_json::Value::String(name);
+            }
+            entry
+        }
         None => serde_json::Value::Null,
     };
 
@@ -2791,13 +3037,16 @@ fn format_discovery_source(source: &crate::project::DiscoverySource) -> &'static
     }
 }
 
-fn format_install_source(source: &crate::project::InstallDiscoverySource) -> &'static str {
+fn format_install_source(source: &crate::project::InstallDiscoverySource) -> String {
     match source {
-        crate::project::InstallDiscoverySource::EnvVar => "$FLUXOR_INSTALL_ROOT override",
-        crate::project::InstallDiscoverySource::ExePrefixShare => {
-            "exe-prefix `<prefix>/share/fluxor/`"
+        crate::project::InstallDiscoverySource::EnvVar => "$FLUXOR_INSTALL_ROOT override".into(),
+        crate::project::InstallDiscoverySource::WorkspaceMember { project_name } => {
+            format!("workspace member `{project_name}`")
         }
-        crate::project::InstallDiscoverySource::ExePrefixFlat => "exe-prefix `<prefix>/`",
+        crate::project::InstallDiscoverySource::ExePrefixShare => {
+            "exe-prefix `<prefix>/share/fluxor/`".into()
+        }
+        crate::project::InstallDiscoverySource::ExePrefixFlat => "exe-prefix `<prefix>/`".into(),
     }
 }
 

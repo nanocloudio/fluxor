@@ -1,0 +1,24 @@
+[package]
+name              = "fluxor-sdk"
+version.workspace = true
+edition           = "2021"
+license           = "Apache-2.0"
+description       = "Fluxor SDK — no_std runtime helpers (crypto primitives, varint, params)"
+
+[lib]
+name = "fluxor_sdk"
+path = "src/lib.rs"
+
+# Thin façade over `modules/sdk/*.rs`. Same source files PIC modules
+# `include!()` directly; this crate exposes them to cargo-based
+# consumers.
+#
+# The SDK files are designed for `include!()` into a flat parent
+# scope — they cross-reference each other by bare name (e.g. hmac.rs
+# uses `Sha256::new()` without qualification). We preserve that
+# convention here by mounting them into one inner module rather than
+# one `pub mod` per file. Consumers see a flat surface
+# (`fluxor_sdk::Sha256`, `fluxor_sdk::chacha20_poly1305_encrypt`, …).
+
+[lints]
+workspace = true

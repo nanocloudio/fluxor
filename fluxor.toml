@@ -1,5 +1,13 @@
 # Project-level fluxor configuration.
 
+# Project identity. Read by `fluxor publish` to scope artefacts into
+# `~/.fluxor/registry/{fmod,index}/<project>/`. `[project].version`
+# defaults to `0.0.0-dev` when absent; canonical publish refuses the
+# dev default.
+[project]
+name    = "fluxor"
+version = "0.1.0"
+
 [required]
 # Wire-ABI pin checked by `fluxor ci`'s version-skew phase. Bumps only
 # when `modules/sdk/wire.rs::ABI_VERSION` changes — i.e., when the

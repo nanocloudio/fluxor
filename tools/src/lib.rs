@@ -18,10 +18,12 @@
 )]
 
 pub mod asset_bank;
+pub mod cargo_index;
 pub mod ci;
 pub mod error;
-mod hash;
+pub mod hash;
 pub mod hygiene;
+pub mod lockfile;
 pub mod manifest;
 // `modules` carries the `.fmod` pack/parse primitives that
 // `modules_build` calls into. Exposed here (rather than left
@@ -30,8 +32,12 @@ pub mod manifest;
 pub mod modules;
 pub mod modules_build;
 pub mod monitor;
+pub mod project;
+pub mod project_meta;
+pub mod registry;
 pub mod render_template;
 pub mod text_distance;
+pub mod workspace;
 
 /// Wire-format constants (ABI version byte, channel-hint stride,
 /// `fnv1a32`). Path-mounted from `modules/sdk/wire.rs` so the host

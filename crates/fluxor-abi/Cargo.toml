@@ -1,0 +1,19 @@
+[package]
+name              = "fluxor-abi"
+version.workspace = true
+edition           = "2021"
+license           = "Apache-2.0"
+description       = "Fluxor wire ABI — contract IDs, opcodes, wire structs, ABI version constants"
+
+[lib]
+name = "fluxor_abi"
+path = "src/lib.rs"
+
+# This crate is a thin façade over `modules/sdk/abi.rs` and its
+# `include!`'d siblings. The same source files are compiled into PIC
+# modules via direct rustc invocations (no cargo); this crate exposes
+# them to cargo-based host consumers (the fluxor CLI, host tests,
+# downstream projects' tooling). Same bytes, two access paths.
+
+[lints]
+workspace = true
