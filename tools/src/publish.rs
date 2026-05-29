@@ -94,14 +94,39 @@ fn target_filename(stem: &str, ext: &str, hash: Option<&str>) -> String {
     }
 }
 
-/// Copy `src` into the registry's `cargo/` shelf. Returns the
-/// destination path. Refuses to overwrite a canonical artefact.
+/// What `install_crate_artefact` (and the analogous runtime install)
+/// did. Callers branch on this so a byte-identical re-publish stays
+/// idempotent — the cargo-index `append_entry` step refuses to add a
+/// duplicate `(name, version)`, so on `SkippedIdempotent` we have to
+/// skip the index step too.
+enum InstallOutcome {
+    /// The destination didn't exist and we wrote it.
+    Written(PathBuf),
+    /// The destination existed with byte-identical content; no-op.
+    SkippedIdempotent(PathBuf),
+}
+
+impl InstallOutcome {
+    fn path(&self) -> &Path {
+        match self {
+            InstallOutcome::Written(p) | InstallOutcome::SkippedIdempotent(p) => p,
+        }
+    }
+}
+
+/// Copy `src` into the registry's `cargo/` shelf. Byte-identical
+/// re-publishes are an idempotent no-op (matches the per-fmod
+/// behaviour of `cmd_publish_fmod`). A canonical re-publish with
+/// different bytes at the same version is still a hard error —
+/// `(name, version)` identifies one immutable artefact in the
+/// registry, and the operator needs to know they should bump the
+/// version.
 fn install_crate_artefact(
     src: &Path,
     crate_name: &str,
     version: &str,
     local: bool,
-) -> Result<PathBuf> {
+) -> Result<InstallOutcome> {
     let root = registry::registry_root()?;
     registry::ensure_layout(&root)?;
     let cargo_dir = root.join("cargo");
@@ -116,14 +141,20 @@ fn install_crate_artefact(
     let dest = cargo_dir.join(&filename);
 
     if !local && dest.exists() {
+        let existing_hash = content_hash(&dest)?;
+        let new_hash = content_hash(src)?;
+        if existing_hash == new_hash {
+            return Ok(InstallOutcome::SkippedIdempotent(dest));
+        }
         return Err(Error::Config(format!(
-            "canonical {} already exists; bump [package].version or pass --local",
+            "canonical {} already exists with different content; \
+             bump [package].version or pass --local",
             dest.display()
         )));
     }
 
     fs::copy(src, &dest)?;
-    Ok(dest)
+    Ok(InstallOutcome::Written(dest))
 }
 
 fn run_cargo_package(project_root: &Path, package: &str) -> Result<PathBuf> {
@@ -165,40 +196,72 @@ struct CrateManifest {
     version: String,
 }
 
-fn read_crate_manifest(project_root: &Path, package: &str) -> Result<CrateManifest> {
-    // Parse the workspace root's Cargo.toml to enumerate members,
-    // then walk each member's Cargo.toml looking for the requested
-    // package name. Avoids a fragile substring match and tolerates
-    // any layout the workspace declares.
+/// Resolution-ready view of one workspace member's `Cargo.toml`.
+struct MemberManifest {
+    path: PathBuf,
+    name: String,
+    version: String,
+}
+
+/// Walk the workspace root's `Cargo.toml` and return every member's
+/// resolved `(path, name, version)`. Members declaring
+/// `version.workspace = true` (the standard cargo workspace-
+/// inheritance form) get the root's `[workspace.package].version`
+/// substituted. Members whose Cargo.toml is missing the
+/// `[package]` table — e.g. virtual sub-workspaces — are skipped
+/// silently; the publisher only cares about publishable members.
+fn enumerate_workspace_members(project_root: &Path) -> Result<Vec<MemberManifest>> {
     #[derive(serde::Deserialize)]
-    struct WorkspaceManifest {
+    struct RootManifest {
         workspace: Option<WorkspaceSection>,
     }
     #[derive(serde::Deserialize)]
     struct WorkspaceSection {
         #[serde(default)]
         members: Vec<String>,
+        #[serde(default)]
+        package: Option<WorkspacePackage>,
     }
     #[derive(serde::Deserialize)]
-    struct PackageManifest {
-        package: PackageSection,
+    struct WorkspacePackage {
+        #[serde(default)]
+        version: Option<String>,
     }
     #[derive(serde::Deserialize)]
-    struct PackageSection {
+    struct MemberRoot {
+        package: Option<MemberPackage>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MemberPackage {
         name: String,
-        version: String,
+        #[serde(default)]
+        version: Option<VersionField>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum VersionField {
+        Literal(String),
+        Inherited(WorkspaceInherit),
+    }
+    #[derive(serde::Deserialize)]
+    struct WorkspaceInherit {
+        #[serde(default)]
+        workspace: bool,
     }
 
-    let root_manifest_path = project_root.join("Cargo.toml");
-    let root_text = fs::read_to_string(&root_manifest_path)
-        .map_err(|e| Error::Config(format!("read {}: {e}", root_manifest_path.display())))?;
-    let root_manifest: WorkspaceManifest = toml::from_str(&root_text)
-        .map_err(|e| Error::Config(format!("parse {}: {e}", root_manifest_path.display())))?;
-    let members = root_manifest
+    let root_path = project_root.join("Cargo.toml");
+    let root_text = fs::read_to_string(&root_path)
+        .map_err(|e| Error::Config(format!("read {}: {e}", root_path.display())))?;
+    let root_parsed: RootManifest = toml::from_str(&root_text)
+        .map_err(|e| Error::Config(format!("parse {}: {e}", root_path.display())))?;
+    let workspace_version = root_parsed
         .workspace
-        .map(|w| w.members)
-        .unwrap_or_default();
+        .as_ref()
+        .and_then(|w| w.package.as_ref())
+        .and_then(|p| p.version.clone());
+    let members = root_parsed.workspace.map(|w| w.members).unwrap_or_default();
 
+    let mut out = Vec::new();
     for member in &members {
         let manifest_path = project_root.join(member).join("Cargo.toml");
         if !manifest_path.exists() {
@@ -206,21 +269,52 @@ fn read_crate_manifest(project_root: &Path, package: &str) -> Result<CrateManife
         }
         let text = fs::read_to_string(&manifest_path)
             .map_err(|e| Error::Config(format!("read {}: {e}", manifest_path.display())))?;
-        let pkg: PackageManifest = match toml::from_str(&text) {
+        let parsed: MemberRoot = match toml::from_str(&text) {
             Ok(p) => p,
-            Err(_) => continue, // member may be a virtual workspace
+            Err(_) => continue, // virtual workspace or other non-publishable layout
         };
-        if pkg.package.name == package {
+        let Some(pkg) = parsed.package else {
+            continue;
+        };
+        let resolved_version = match pkg.version {
+            Some(VersionField::Literal(v)) => v,
+            Some(VersionField::Inherited(WorkspaceInherit { workspace: true })) => {
+                let Some(ref ws_version) = workspace_version else {
+                    return Err(Error::Config(format!(
+                        "{} declares `version.workspace = true` but the workspace root \
+                         has no `[workspace.package].version` to inherit from",
+                        manifest_path.display()
+                    )));
+                };
+                ws_version.clone()
+            }
+            Some(VersionField::Inherited(WorkspaceInherit { workspace: false })) | None => {
+                // `version` omitted entirely is unusual but not our problem to
+                // diagnose — this enumerator just skips such members.
+                continue;
+            }
+        };
+        out.push(MemberManifest {
+            path: manifest_path,
+            name: pkg.name,
+            version: resolved_version,
+        });
+    }
+    Ok(out)
+}
+
+fn read_crate_manifest(project_root: &Path, package: &str) -> Result<CrateManifest> {
+    for member in enumerate_workspace_members(project_root)? {
+        if member.name == package {
             return Ok(CrateManifest {
-                version: pkg.package.version,
+                version: member.version,
             });
         }
     }
-
     Err(Error::Config(format!(
         "could not locate Cargo.toml for package {package} \
          (searched workspace members from {})",
-        root_manifest_path.display()
+        project_root.join("Cargo.toml").display()
     )))
 }
 
@@ -274,13 +368,27 @@ fn publish_workspace_crate(package: &str, local: bool, project_root: Option<&Pat
     );
     let crate_path = run_cargo_package(&pr, package)?;
 
-    let dest = install_crate_artefact(&crate_path, package, &manifest.version, local)?;
-    println!("published {} → {}", package, dest.display());
+    let outcome = install_crate_artefact(&crate_path, package, &manifest.version, local)?;
+    let dest = outcome.path().to_path_buf();
+    match &outcome {
+        InstallOutcome::Written(_) => {
+            println!("published {} → {}", package, dest.display());
+        }
+        InstallOutcome::SkippedIdempotent(_) => {
+            println!(
+                "skipped {} → {} (already published, byte-identical)",
+                package,
+                dest.display()
+            );
+        }
+    }
 
     // Canonical publish updates the cargo git-index so downstream
     // projects can resolve the crate by name. Local publishes are
     // throwaway content-hashed artefacts and never enter the index.
-    if !local {
+    // Idempotent skips don't re-index either — the index already
+    // records this `(name, version)` from the prior write.
+    if !local && matches!(outcome, InstallOutcome::Written(_)) {
         let manifest_path = locate_member_manifest(&pr, package)?;
         let deps = cargo_index::extract_deps(&manifest_path)?;
         let cksum = cargo_index::sha256_hex(&dest)?;
@@ -310,40 +418,9 @@ fn publish_workspace_crate(package: &str, local: bool, project_root: Option<&Pat
 /// package. Reused by `publish_workspace_crate` to feed dep
 /// extraction into the cargo-index writer.
 fn locate_member_manifest(project_root: &Path, package: &str) -> Result<PathBuf> {
-    #[derive(serde::Deserialize)]
-    struct WorkspaceManifest {
-        workspace: Option<WorkspaceSection>,
-    }
-    #[derive(serde::Deserialize)]
-    struct WorkspaceSection {
-        #[serde(default)]
-        members: Vec<String>,
-    }
-    #[derive(serde::Deserialize)]
-    struct PackageManifest {
-        package: PackageSection,
-    }
-    #[derive(serde::Deserialize)]
-    struct PackageSection {
-        name: String,
-    }
-
-    let root_text = fs::read_to_string(project_root.join("Cargo.toml"))?;
-    let root: WorkspaceManifest =
-        toml::from_str(&root_text).map_err(|e| Error::Config(format!("parse Cargo.toml: {e}")))?;
-    let members = root.workspace.map(|w| w.members).unwrap_or_default();
-    for m in &members {
-        let path = project_root.join(m).join("Cargo.toml");
-        if !path.exists() {
-            continue;
-        }
-        let text = fs::read_to_string(&path).unwrap_or_default();
-        let parsed: PackageManifest = match toml::from_str(&text) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if parsed.package.name == package {
-            return Ok(path);
+    for member in enumerate_workspace_members(project_root)? {
+        if member.name == package {
+            return Ok(member.path);
         }
     }
     Err(Error::Config(format!(
@@ -351,29 +428,58 @@ fn locate_member_manifest(project_root: &Path, package: &str) -> Result<PathBuf>
     )))
 }
 
-/// Read `version = "..."` from a module's `manifest.toml`. Each fmod
-/// is versioned independently from the project — bumping `moduleA1`
-/// shouldn't require republishing `moduleA2`.
-fn read_module_version(project_root: &Path, module_name: &str) -> Option<String> {
+/// One module owned by this project: tier-relative module name and
+/// the version declared in its `manifest.toml`.
+struct OwnedModule {
+    name: String,
+    version: String,
+}
+
+/// Enumerate every module this project owns by walking the local
+/// `modules/{foundation,app,drivers}/*/manifest.toml` tree. The
+/// returned list is what the publisher considers republishable —
+/// fmods present in `target/` whose name doesn't appear here belong
+/// to some other project (synced upstream artefacts) and must not
+/// be re-published under this project's namespace. Modules without
+/// a `version` field in their manifest are reported as errors so
+/// the operator notices the manifest is incomplete.
+fn list_owned_modules(project_root: &Path) -> Result<Vec<OwnedModule>> {
+    #[derive(serde::Deserialize)]
+    struct ModuleManifest {
+        version: Option<String>,
+    }
     let tiers = ["foundation", "app", "drivers"];
+    let mut out = Vec::new();
     for tier in tiers {
-        let manifest = project_root
-            .join("modules")
-            .join(tier)
-            .join(module_name)
-            .join("manifest.toml");
-        if !manifest.exists() {
+        let tier_dir = project_root.join("modules").join(tier);
+        if !tier_dir.is_dir() {
             continue;
         }
-        let text = fs::read_to_string(&manifest).ok()?;
-        #[derive(serde::Deserialize)]
-        struct ModuleManifest {
-            version: Option<String>,
+        for entry in fs::read_dir(&tier_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let manifest_path = entry.path().join("manifest.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let text = fs::read_to_string(&manifest_path)
+                .map_err(|e| Error::Config(format!("read {}: {e}", manifest_path.display())))?;
+            let parsed: ModuleManifest = toml::from_str(&text)
+                .map_err(|e| Error::Config(format!("parse {}: {e}", manifest_path.display())))?;
+            let Some(version) = parsed.version else {
+                return Err(Error::Config(format!(
+                    "{} has no `version` field — every publishable module \
+                     manifest must declare one",
+                    manifest_path.display()
+                )));
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            out.push(OwnedModule { name, version });
         }
-        let parsed: ModuleManifest = toml::from_str(&text).ok()?;
-        return parsed.version;
     }
-    None
+    Ok(out)
 }
 
 pub fn cmd_publish_fmod(
@@ -384,21 +490,41 @@ pub fn cmd_publish_fmod(
 ) -> Result<()> {
     let pr = resolve_project_root(project_root);
     let identity = require_project_identity(&pr)?;
-    // Note: identity.version is *not* what gates canonical fmod
-    // publish — each fmod uses its own manifest version. The
-    // project-version guard here exists so a `publish --local` run
-    // catches the missing `[project].name` early; we re-evaluate
-    // each fmod's version individually below.
+    // identity.version is *not* what gates canonical fmod publish —
+    // each fmod uses its own manifest version. The project-version
+    // guard here exists so a `publish --local` run catches a missing
+    // `[project].name` early; per-fmod versions are re-evaluated below.
     reject_dev_version_for_canonical(&identity, true)?;
     announce_workspace_mode_if_active(&pr);
 
     let root = registry::registry_root()?;
     registry::ensure_layout(&root)?;
 
-    // Source layout: fmods land under either
-    // `target/fluxor/<target>/modules/<name>.fmod` or
-    // `target/<target>/modules/<name>.fmod` depending on how the build
-    // was invoked. Search both.
+    // Drive from the project's own manifest tree, not the target/
+    // shelf. The target tree contains every fmod that ever passed
+    // through `make sync`, including synced upstream artefacts —
+    // republishing those under this project's namespace would
+    // misattribute them. The manifest tree is the canonical list of
+    // what this project owns; only modules with a local manifest get
+    // considered.
+    let mut owned = list_owned_modules(&pr)?;
+    if let Some(m) = module {
+        owned.retain(|o| o.name == m);
+        if owned.is_empty() {
+            return Err(Error::Config(format!(
+                "no module manifest at modules/{{foundation,app,drivers}}/{m}/manifest.toml"
+            )));
+        }
+    }
+    if owned.is_empty() {
+        // No owned modules at all — fluxor publish (no subcommand)
+        // routes here best-effort, so emit a soft message and exit
+        // cleanly. A project with zero modules just has nothing to
+        // publish at this tier.
+        println!("no owned modules to publish (modules/{{foundation,app,drivers}}/*/manifest.toml is empty).");
+        return Ok(());
+    }
+
     let target_root_under_fluxor = pr.join("target").join("fluxor");
     let target_root_bare = pr.join("target");
     let candidate_roots = [&target_root_under_fluxor, &target_root_bare];
@@ -419,79 +545,70 @@ pub fn cmd_publish_fmod(
     let mut skipped_idempotent = 0usize;
     let mut errors: Vec<String> = Vec::new();
     for target_name in &targets_to_walk {
-        for root_dir in &candidate_roots {
-            let modules_dir = root_dir.join(target_name).join("modules");
-            if !modules_dir.exists() {
+        for owned_module in &owned {
+            if !local && owned_module.version == project::DEV_VERSION {
+                errors.push(format!(
+                    "skip {}: canonical publish refuses module version `{}`",
+                    owned_module.name,
+                    project::DEV_VERSION
+                ));
                 continue;
             }
-            for entry in fs::read_dir(&modules_dir)? {
-                let entry = entry?;
-                let filename = entry.file_name().to_string_lossy().into_owned();
-                let Some(stem) = filename.strip_suffix(".fmod") else {
-                    continue;
-                };
-                if let Some(m) = module {
-                    if stem != m {
-                        continue;
-                    }
-                }
-                let src = entry.path();
-                let module_version = match read_module_version(&pr, stem) {
-                    Some(v) => v,
-                    None => {
-                        errors.push(format!(
-                            "skip {stem}: no version in modules/*/{stem}/manifest.toml"
-                        ));
-                        continue;
-                    }
-                };
-                if !local && module_version == project::DEV_VERSION {
-                    errors.push(format!(
-                        "skip {stem}: canonical publish refuses module version `{}`",
-                        project::DEV_VERSION
-                    ));
-                    continue;
-                }
-                let dest_dir = root
-                    .join("fmod")
-                    .join(&identity.name)
-                    .join(target_name)
-                    .join(stem);
-                fs::create_dir_all(&dest_dir)?;
-                let hash = if local {
-                    Some(content_hash(&src)?)
-                } else {
-                    None
-                };
-                let dest_filename = target_filename(&module_version, "fmod", hash.as_deref());
-                let dest = dest_dir.join(&dest_filename);
-                if !local && dest.exists() {
-                    // Same-version + same-content: idempotent
-                    // skip. Different content at the same version
-                    // is a hard error — the registry promise is
-                    // that `(name, version)` identifies one
-                    // immutable artefact. fmod versions are
-                    // independent of `[project].version`, so an
-                    // ABI/SDK/runtime-only publish-cycle commonly
-                    // re-encounters every already-published fmod
-                    // unchanged. Don't fail that case.
-                    let existing_hash = content_hash(&dest)?;
-                    let new_hash = content_hash(&src)?;
-                    if existing_hash == new_hash {
-                        skipped_idempotent += 1;
-                        continue;
-                    }
-                    errors.push(format!(
-                        "{} already exists with different content — bump module version in modules/{}/<tier>/{}/manifest.toml",
-                        dest.display(),
-                        target_name,
-                        stem,
-                    ));
+            // Find the built fmod for this (target, module). Either
+            // layout is acceptable; the first one that exists wins.
+            let src = candidate_roots
+                .iter()
+                .map(|r| {
+                    r.join(target_name)
+                        .join("modules")
+                        .join(format!("{}.fmod", owned_module.name))
+                })
+                .find(|p| p.exists());
+            let Some(src) = src else {
+                // Module is owned but not built for this target.
+                // Silent skip — not every owned module targets
+                // every silicon (e.g. a host-only app module skipped
+                // for rp2040), and the operator already controls the
+                // build set via `make modules` / `make modules-all`.
+                continue;
+            };
+
+            let dest_dir = root
+                .join("fmod")
+                .join(&identity.name)
+                .join(target_name)
+                .join(&owned_module.name);
+            fs::create_dir_all(&dest_dir)?;
+            let hash = if local {
+                Some(content_hash(&src)?)
+            } else {
+                None
+            };
+            let dest_filename = target_filename(&owned_module.version, "fmod", hash.as_deref());
+            let dest = dest_dir.join(&dest_filename);
+            if !local && dest.exists() {
+                // Idempotent skip on byte-identical re-publish; hard
+                // error on diverging content at the same version.
+                // The registry promise is that `(name, version)`
+                // identifies one immutable artefact. Module
+                // versions are independent of `[project].version`,
+                // so any publish cycle commonly re-encounters every
+                // already-published fmod unchanged.
+                let existing_hash = content_hash(&dest)?;
+                let new_hash = content_hash(&src)?;
+                if existing_hash == new_hash {
+                    skipped_idempotent += 1;
                     continue;
                 }
-                fs::copy(&src, &dest)?;
-                published.push(dest);
+                errors.push(format!(
+                    "{} already exists with different content — bump module version in modules/<tier>/{}/manifest.toml",
+                    dest.display(),
+                    owned_module.name,
+                ));
+                continue;
             }
+            fs::copy(&src, &dest)?;
+            published.push(dest);
         }
     }
 
@@ -501,9 +618,10 @@ pub fn cmd_publish_fmod(
     }
     if published.is_empty() && skipped_idempotent == 0 {
         // Truly nothing happened — neither published nor skipped.
-        // Likely an empty target set or all source files missing.
+        // Likely the operator hasn't built owned modules for any of
+        // the discovered targets yet.
         return Err(Error::Config(
-            "no fmods were published or matched (empty target set?)".into(),
+            "no fmods were published — run `make modules-all` first".into(),
         ));
     }
     if real_failure {
@@ -627,8 +745,25 @@ pub fn cmd_publish_runtime(
     let dest = dest_dir.join(&dest_filename);
 
     if !local && dest.exists() {
+        // Byte-identical re-publish is an idempotent no-op (matches
+        // the per-fmod and per-crate behaviour). Different content
+        // at the same version stays a hard error so the operator
+        // bumps the version.
+        let existing_hash = content_hash(&dest)?;
+        let new_hash = content_hash(&src)?;
+        if existing_hash == new_hash {
+            println!(
+                "skipped runtime {} ({}/{}) → {} (already published, byte-identical)",
+                binary,
+                identity.name,
+                host_target,
+                dest.display(),
+            );
+            return Ok(());
+        }
         return Err(Error::Config(format!(
-            "canonical {} already exists; bump [project].version or pass --local",
+            "canonical {} already exists with different content; \
+             bump [project].version or pass --local",
             dest.display()
         )));
     }
@@ -654,63 +789,116 @@ pub fn cmd_publish_runtime(
     Ok(())
 }
 
+/// Does the project at `project_root` own a workspace member with
+/// the given package name? Used by `cmd_publish_all` to gate the
+/// abi / sdk subcommands so a downstream consumer doesn't try to
+/// republish fluxor-owned crates under its own namespace.
+fn project_owns_workspace_crate(project_root: &Path, package: &str) -> bool {
+    enumerate_workspace_members(project_root)
+        .map(|members| members.iter().any(|m| m.name == package))
+        .unwrap_or(false)
+}
+
 /// Publish every applicable tier in one sweep. `local=false`
-/// performs canonical publishing (refuses dev versions, refuses to
-/// overwrite, writes cargo-index entries and project-meta files);
-/// `local=true` writes content-hashed `-local.<sha>` snapshots that
-/// never enter the cargo index. The bare `fluxor publish` (no
-/// subcommand) routes here, honouring the top-level `--local` flag.
+/// performs canonical publishing (refuses dev versions, idempotent-
+/// skips byte-identical re-publishes, writes cargo-index entries
+/// and project-meta files); `local=true` writes content-hashed
+/// `-local.<sha>` snapshots that never enter the cargo index. The
+/// bare `fluxor publish` (no subcommand) routes here, honouring
+/// the top-level `--local` flag.
 ///
-/// Each tier is attempted best-effort: a fluxor checkout may lack
-/// `common` (only fluxor itself owns `abi`/`sdk`), a downstream
-/// checkout may lack `abi`/`sdk`. The aggregate is fault-tolerant
-/// across that asymmetry; it only fails when *no* tier produced an
-/// artefact AND every tier reported a real error.
+/// Each tier is gated by what this project actually owns:
+///
+/// - `abi`/`sdk` run only when `fluxor-abi`/`fluxor-sdk` are
+///   workspace members of THIS project (i.e. when running from
+///   fluxor's own checkout). Downstream consumers skip silently
+///   instead of trying to republish fluxor-owned crates under
+///   their own name.
+/// - `common` runs only when `<project>-common` is a workspace
+///   member.
+/// - `fmod` always runs — the publisher walks the project's local
+///   manifest tree, so synced upstream fmods are correctly
+///   ignored.
+/// - `runtime` runs only for binaries explicitly listed in
+///   `fluxor.toml::[project].runtimes`. The previous "publish
+///   anything in target/<host>/release/" heuristic
+///   misclassified synced upstream binaries as owned.
+///
+/// Failure of an applicable tier is non-fatal as long as some
+/// other tier produced an artefact (or skipped idempotently); the
+/// command only fails when nothing was published, skipped, or
+/// silently bypassed.
 pub fn cmd_publish_all(local: bool, project_root: Option<&Path>) -> Result<()> {
     let pr = resolve_project_root(project_root);
-    let _identity = require_project_identity(&pr)?;
+    let identity = require_project_identity(&pr)?;
 
     type PublishFn = fn(bool, Option<&Path>) -> Result<()>;
-    let attempts: &[(&str, PublishFn)] = &[
-        ("abi", cmd_publish_abi),
-        ("sdk", cmd_publish_sdk),
-        ("common", cmd_publish_common),
+    let candidate_tiers: &[(&str, &str, PublishFn)] = &[
+        ("abi", "fluxor-abi", cmd_publish_abi),
+        ("sdk", "fluxor-sdk", cmd_publish_sdk),
     ];
 
     let mut any_succeeded = false;
     let mut soft_failures: Vec<String> = Vec::new();
-    for (label, f) in attempts {
+
+    // abi / sdk only when this project owns the workspace member.
+    for (label, package, f) in candidate_tiers {
+        if !project_owns_workspace_crate(&pr, package) {
+            continue;
+        }
         match f(local, Some(&pr)) {
             Ok(()) => any_succeeded = true,
             Err(e) => soft_failures.push(format!("{label}: {e}")),
         }
     }
 
-    // fmods — always attempted; per-module idempotency means a
-    // canonical-mode re-publish without version bumps doesn't count
-    // as failure.
+    // common only when `<project>-common` is a workspace member.
+    let common_package = format!("{}-common", identity.name);
+    if project_owns_workspace_crate(&pr, &common_package) {
+        match cmd_publish_common(local, Some(&pr)) {
+            Ok(()) => any_succeeded = true,
+            Err(e) => soft_failures.push(format!("common: {e}")),
+        }
+    }
+
+    // fmods — owned modules only (driven by local manifest tree).
     match cmd_publish_fmod(None, None, local, Some(&pr)) {
         Ok(()) => any_succeeded = true,
         Err(e) => soft_failures.push(format!("fmod: {e}")),
     }
 
-    // Runtime binaries — best-effort. Each project declares its
-    // host-runtime binaries via `fluxor.toml::[publish.runtime]`
-    // (future) or via convention. Today the only host-runtime
-    // binary fluxor itself publishes is `fluxor-linux`; downstream
-    // projects don't generally have one. Attempt fluxor-linux when
-    // the binary exists at the conventional location; otherwise
-    // silently skip.
-    if let Ok(host_target) = detect_host_target() {
-        let conventional = pr
-            .join("target")
-            .join(&host_target)
-            .join("release")
-            .join("fluxor-linux");
-        if conventional.exists() {
-            match cmd_publish_runtime("fluxor-linux", Some(&host_target), local, Some(&pr)) {
-                Ok(()) => any_succeeded = true,
-                Err(e) => soft_failures.push(format!("runtime fluxor-linux: {e}")),
+    // Runtime binaries — explicit opt-in via `[project].runtimes`.
+    // Without an entry there, the publish sweep doesn't go anywhere
+    // near the target tree's `release/` directory; a binary synced
+    // from upstream into the consumer's tree (e.g. fluxor-linux)
+    // doesn't get republished under the consumer's namespace.
+    if !identity.runtimes.is_empty() {
+        let host_target = match detect_host_target() {
+            Ok(t) => t,
+            Err(e) => {
+                soft_failures.push(format!("runtime host-target detect: {e}"));
+                String::new()
+            }
+        };
+        if !host_target.is_empty() {
+            for binary in &identity.runtimes {
+                let conventional = pr
+                    .join("target")
+                    .join(&host_target)
+                    .join("release")
+                    .join(binary);
+                if !conventional.exists() {
+                    soft_failures.push(format!(
+                        "runtime {binary}: declared in [project].runtimes but \
+                         {} doesn't exist — build it first",
+                        conventional.display()
+                    ));
+                    continue;
+                }
+                match cmd_publish_runtime(binary, Some(&host_target), local, Some(&pr)) {
+                    Ok(()) => any_succeeded = true,
+                    Err(e) => soft_failures.push(format!("runtime {binary}: {e}")),
+                }
             }
         }
     }

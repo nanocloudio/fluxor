@@ -5,8 +5,13 @@
 # defaults to `0.0.0-dev` when absent; canonical publish refuses the
 # dev default.
 [project]
-name    = "fluxor"
-version = "0.1.0"
+name     = "fluxor"
+version  = "0.1.0"
+# Host runtime binaries this project owns. Bare `fluxor publish`
+# republishes only the binaries named here; this keeps a downstream
+# consumer that has synced `fluxor-linux` into its own target tree
+# from accidentally re-publishing it under the consumer's namespace.
+runtimes = ["fluxor-linux"]
 
 [required]
 # Wire-ABI pin checked by `fluxor ci`'s version-skew phase. Bumps only

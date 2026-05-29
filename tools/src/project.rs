@@ -250,6 +250,13 @@ pub struct ProjectIdentity {
     /// Canonical publish (`fluxor publish` without `--local`) refuses
     /// the dev default; `--local` accepts it.
     pub version: String,
+    /// `[project].runtimes` — explicit opt-in list of host runtime
+    /// binaries this project owns. The bare `fluxor publish` sweep
+    /// only republishes binaries named here, so binaries synced from
+    /// upstream into the consumer's `target/` tree don't get
+    /// misclassified as owned and re-published under the consumer's
+    /// namespace. Empty when omitted.
+    pub runtimes: Vec<String>,
 }
 
 /// Default `[project].version` when the manifest omits it. Canonical
@@ -265,6 +272,7 @@ pub fn project_identity(project_root: &Path) -> Result<Option<ProjectIdentity>, 
     Ok(parsed.and_then(|f| f.project).map(|p| ProjectIdentity {
         name: p.name,
         version: p.version.unwrap_or_else(|| DEV_VERSION.to_string()),
+        runtimes: p.runtimes.unwrap_or_default(),
     }))
 }
 
@@ -373,6 +381,8 @@ struct ProjectSection {
     name: String,
     #[serde(default)]
     version: Option<String>,
+    #[serde(default)]
+    runtimes: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
