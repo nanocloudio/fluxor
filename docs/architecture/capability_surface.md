@@ -833,7 +833,30 @@ audio.encoded       — compressed audio stream (provided by file reader, http)
 display.draw        — drawing commands / framebuffer (provided by renderer)
 display.touch_event — touch coordinates (provided by touch driver)
 selection           — item selection (provided by bank)
+replication.state_machine — replicated commit log + apply pipeline
+                      (committed-entry stream, snapshot install/export,
+                      apply reset) (provided by clustor)
 ```
+
+`replication.state_machine` names the apply-pipeline / state-machine
+surface a consumer attaches to for replicated commit-and-apply: a
+per-entry committed stream, an early "accepted into WAL, here's its
+index" echo, a quorum-durability notice, bidirectional snapshot
+install/export callbacks, and an apply-pipeline reset signal. It sits
+one layer above the storage read/write/durability surfaces — the
+early-ack echo, snapshot callbacks for apply-derived state, and the
+reset signal have no equivalent in the `storage.namespace` + `event.log`
+pattern (see `storage_capability_surface.md` §4), which correctly stays
+at the storage layer. The full seven-primitive contract lives with its
+single current provider, clustor, at
+`../clustor/docs/architecture/substrate_capability_surface.md`; only the
+surface name is canonicalized here. A consumer requires it by name
+through the same string-matched capability resolution as any other
+service capability (the resolver wires it to whichever module provides
+it) — not through the `[requires]` table, which carries typed CPU/board
+features. This gives the surface a documented home should a second
+provider (a single-node WAL stand-in or a managed-Raft service) ever
+ship.
 
 ### Storage Capability Surfaces
 

@@ -65,6 +65,23 @@ const STATE_ARENA_SIZE: usize = super::chip::STATE_ARENA_SIZE;
 /// header must carry; sourced from `abi::wire` so the kernel, the
 /// SDK, and the host pack tool agree.
 pub use crate::abi::wire::ABI_VERSION as MODULE_ABI_VERSION;
+
+// Format-version contracts. These are SEPARATE compatibility axes from
+// the module ABI version above: the table envelope, the per-module
+// header envelope, and the manifest each carry their own version byte,
+// written by the pack tool (`tools/src/modules.rs` TABLE_VERSION /
+// `tools/src/manifest.rs` MANIFEST_VERSION). The kernel pins them to v1
+// and rejects anything else — the project stays on v1 across all sibling
+// consumers until v1 is formally cut, so a non-1 byte means a corrupt or
+// forward-incompatible artifact, not a format we can parse. They share a
+// value today but are named distinctly so they can diverge per-axis.
+/// Module-table envelope format version (`ModuleTableHeader.version`).
+pub const EXPECTED_TABLE_VERSION: u8 = 1;
+/// Per-module header envelope format version (`ModuleHeader.version`,
+/// distinct from `abi_version`).
+pub const EXPECTED_MODULE_VERSION: u8 = 1;
+/// Manifest (FXMF) format version (`manifest[4]`).
+pub const EXPECTED_MANIFEST_VERSION: u8 = 1;
 /// Errors that can occur during module loading and instantiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderError {
@@ -659,6 +676,53 @@ pub struct ModuleHeader {
     pub name: [u8; 32],
     pub reserved: [u8; 12],
 }
+
+// On-disk ABI ratchet. These three structs are read field-by-field from
+// flash / blob bytes at fixed offsets, and the pack tool
+// (`tools/src/modules.rs`) writes the identical byte layout. A size or
+// offset change here silently misaligns every downstream typed read (and
+// desyncs from the packer) — pin the load-bearing sizes and offsets so
+// any such change fails the build and forces a matching packer change +
+// format-version bump. (`SyscallTable` carries its own ratchet in
+// `kernel_abi.rs`.)
+const _: () = {
+    // Sizes — catch any field add/remove.
+    assert!(core::mem::size_of::<ModuleTableHeader>() == 16);
+    assert!(core::mem::size_of::<ModuleTableEntry>() == 16);
+    assert!(core::mem::size_of::<ModuleHeader>() == ModuleHeader::SIZE);
+    assert!(ModuleHeader::SIZE == 72);
+    // Every field offset is pinned, not a representative subset — a
+    // size-preserving reorder (e.g. swapping data_size and bss_size, or
+    // module_type and flags) would otherwise pass. These are the positions
+    // the loader and the pack tool both hardcode.
+    assert!(core::mem::offset_of!(ModuleTableHeader, magic) == 0);
+    assert!(core::mem::offset_of!(ModuleTableHeader, version) == 4);
+    assert!(core::mem::offset_of!(ModuleTableHeader, module_count) == 5);
+    assert!(core::mem::offset_of!(ModuleTableHeader, total_size_lo) == 6);
+    assert!(core::mem::offset_of!(ModuleTableHeader, total_size_hi) == 8);
+    assert!(core::mem::offset_of!(ModuleTableHeader, reserved) == 10);
+    assert!(core::mem::offset_of!(ModuleTableEntry, name_hash) == 0);
+    assert!(core::mem::offset_of!(ModuleTableEntry, offset) == 4);
+    assert!(core::mem::offset_of!(ModuleTableEntry, size) == 8);
+    assert!(core::mem::offset_of!(ModuleTableEntry, module_type) == 12);
+    assert!(core::mem::offset_of!(ModuleTableEntry, flags) == 13);
+    assert!(core::mem::offset_of!(ModuleTableEntry, reserved) == 14);
+    assert!(core::mem::offset_of!(ModuleHeader, magic) == 0);
+    assert!(core::mem::offset_of!(ModuleHeader, version) == 4);
+    assert!(core::mem::offset_of!(ModuleHeader, abi_version) == 5);
+    assert!(core::mem::offset_of!(ModuleHeader, module_type) == 6);
+    assert!(core::mem::offset_of!(ModuleHeader, flags) == 7);
+    assert!(core::mem::offset_of!(ModuleHeader, code_size) == 8);
+    assert!(core::mem::offset_of!(ModuleHeader, data_size) == 12);
+    assert!(core::mem::offset_of!(ModuleHeader, bss_size) == 16);
+    assert!(core::mem::offset_of!(ModuleHeader, init_offset) == 20);
+    assert!(core::mem::offset_of!(ModuleHeader, export_count) == 24);
+    assert!(core::mem::offset_of!(ModuleHeader, export_offset) == 26);
+    assert!(core::mem::offset_of!(ModuleHeader, name) == 28);
+    // schema_size / manifest_size live in reserved[2..4] / reserved[4..6].
+    assert!(core::mem::offset_of!(ModuleHeader, reserved) == 60);
+};
+
 impl ModuleHeader {
     pub const SIZE: usize = 72;
     /// Reserved layout:
@@ -668,7 +732,9 @@ impl ModuleHeader {
     ///     bit 2: deferred_ready — module needs init time before downstream runs.
     ///     bit 3: drain_capable — module exports module_drain for live reconfigure.
     ///     bit 4: isr_module — module exports module_isr_init / module_isr_entry.
-    ///     bits 5-7: reserved (0). Fine-grained permissions
+    ///     bit 5: wasm_payload — module body is a wasm payload (set by
+    ///       `pack_fmod_wasm`, read by `platform/wasm.rs`).
+    ///     bits 6-7: reserved (0). Fine-grained permissions
     ///     (reconfigure / flash_raw / platform_raw / backing_provider /
     ///     monitor / bridge) live in the manifest binary at byte 15,
     ///     read by `LoadedModule::manifest_permissions()`.
@@ -973,6 +1039,21 @@ impl ModuleLoader {
             log::warn!("[loader] bad table magic=0x{:08x}", header.magic);
             return Err(LoaderError::InvalidTableMagic);
         }
+        // Run the SAME bounded validator the embedded-blob path uses, so a
+        // corrupted or torn staged flash image can't drive unchecked typed
+        // reads through `module_count` / `entry.offset`. The bound is the
+        // slot's known `modules_size` when the layout source carried one
+        // (flash A/B graph slots); legacy trailers expose no length, so we
+        // fall back to the hard cap and lean on the table's own `total_size`
+        // for the internal-consistency checks. `total_size` is always
+        // written by the pack tool (`tools/src/modules.rs`), so the same
+        // `.fxmt` that loads from an embedded blob validates here too.
+        let bound = if layout.modules_size != 0 {
+            layout.modules_size as usize
+        } else {
+            MAX_MODULES_BLOB_SIZE
+        };
+        Self::validate_table_layout(self.table_base, bound, &header)?;
         log::debug!(
             "[loader] {} modules at 0x{:08x}",
             header.module_count,
@@ -1072,19 +1153,51 @@ impl ModuleLoader {
         blob: *const u8,
         blob_len: usize,
     ) -> Result<(), LoaderError> {
-        // SAFETY: caller passes a `blob` pointer + `blob_len` covering the
-        // mapped modules region; `read_table_header` reads the 16-byte
-        // header which the next check validates against `blob_len`.
+        // Refuse to read the 16-byte header if the mapping can't even cover
+        // it — otherwise `read_table_header` is an out-of-bounds read before
+        // any length check (a truncated or empty blob_len).
+        if blob_len < 16 {
+            return Err(LoaderError::InvalidTableMagic);
+        }
+        // SAFETY: `blob_len >= 16` checked above, so the 16-byte header read is
+        // in bounds; `validate_table_layout` then bounds everything past it.
         let header = unsafe { read_table_header(blob) };
         if header.magic != MODULE_TABLE_MAGIC {
             return Err(LoaderError::InvalidTableMagic);
         }
+        Self::validate_table_layout(blob, blob_len, &header)?;
 
-        // Validate the table header's declared size and every entry's
-        // offset/size against the platform-supplied mapping bound
-        // before trusting any byte past the header. A tampered table
-        // — module_count = 0xFF, entry.offset = 0xFFFF_FFFF — would
-        // otherwise produce out-of-bounds pointer reads downstream.
+        self.table_base = blob;
+        self.header = Some(header);
+        self.source = LoadSource::Embedded;
+        log::info!("[loader] {} modules from blob", header.module_count);
+        Ok(())
+    }
+
+    /// The single bounded table validator shared by every load source
+    /// (embedded blob, flash A/B slot, flash trailer). Given a mapped
+    /// `blob` of at most `blob_len` bytes and its already-magic-checked
+    /// `header`, it proves the table version, the declared `total_size`,
+    /// and every entry's offset/size/footprint are in bounds BEFORE any
+    /// downstream code dereferences a table-derived pointer. A tampered
+    /// or torn image — `module_count = 0xFF`, `entry.offset =
+    /// 0xFFFF_FFFF`, an oversized schema/manifest tail — is rejected
+    /// here rather than driving an out-of-bounds typed read later.
+    fn validate_table_layout(
+        blob: *const u8,
+        blob_len: usize,
+        header: &ModuleTableHeader,
+    ) -> Result<(), LoaderError> {
+        // Table-format envelope version. The project stays on v1; a
+        // different byte is a corrupt or forward-incompatible artifact
+        // we must not parse with v1 field offsets.
+        if header.version != EXPECTED_TABLE_VERSION {
+            log::error!(
+                "[loader] module-table version={} expected={EXPECTED_TABLE_VERSION}",
+                header.version
+            );
+            return Err(LoaderError::InvalidTableMagic);
+        }
         let total_size = ((header.total_size_hi as u32) << 16) | (header.total_size_lo as u32);
         if (total_size as usize) > MAX_MODULES_BLOB_SIZE {
             log::error!(
@@ -1140,20 +1253,25 @@ impl ModuleLoader {
             // SAFETY: `off + ModuleHeader::SIZE <= end <= total_size` (sz
             // >= ModuleHeader::SIZE checked above); pointer in bounds.
             let mh = unsafe { read_module_header(offset_ptr(blob, off)) };
+            // Full on-disk footprint: header + code + data + export table +
+            // schema tail + manifest tail. The schema and manifest sizes MUST
+            // be included — `manifest_permissions()`, `port_content_type()`
+            // and `validate_module()` later compute `manifest_offset` from
+            // these same header fields and do raw typed reads (the worst being
+            // a `from_raw_parts(manifest_ptr, manifest_size)` slice). Omitting
+            // the tails here would let a crafted `schema_size`/`manifest_size`
+            // push those reads past the mapped blob — an OOB read / UB.
             let inner = (mh.code_size as usize)
                 .saturating_add(mh.data_size as usize)
                 .saturating_add((mh.export_count as usize).saturating_mul(8))
+                .saturating_add(mh.schema_size() as usize)
+                .saturating_add(mh.manifest_size() as usize)
                 .saturating_add(ModuleHeader::SIZE);
             if inner > sz {
                 log::error!("[loader] entry {i} internal sections {inner} > entry size {sz}");
                 return Err(LoaderError::InvalidTableMagic);
             }
         }
-
-        self.table_base = blob;
-        self.header = Some(header);
-        self.source = LoadSource::Embedded;
-        log::info!("[loader] {} modules from blob", header.module_count);
         Ok(())
     }
     /// Get module table entry by index
@@ -1234,6 +1352,22 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
             found: module.header.abi_version,
         });
     }
+    // Check module-header envelope format version (a separate axis from
+    // `abi_version` above — the syscall-table ABI vs the on-disk header
+    // layout). v1-only; a different byte is a corrupt or forward-format
+    // header we must not parse with v1 field offsets.
+    if module.header.version != EXPECTED_MODULE_VERSION {
+        log::error!(
+            "[loader] {}: module header version={} expected={}",
+            name,
+            module.header.version,
+            EXPECTED_MODULE_VERSION
+        );
+        return Err(LoaderError::AbiVersionMismatch {
+            expected: EXPECTED_MODULE_VERSION,
+            found: module.header.version,
+        });
+    }
     // Check code_size is reasonable (< 384KB — protocol modules may bundle firmware+NVRAM)
     if module.header.code_size > 393216 {
         log::error!(
@@ -1309,10 +1443,27 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                 return Ok(());
             }
             {
-                let version = manifest_data[4];
+                // Manifest-format envelope version. v1-only; an unknown
+                // version means the field offsets below can't be trusted,
+                // so mirror the unrecognised-magic posture above: reject
+                // under enforcement, otherwise treat as "no manifest".
+                let manifest_version = manifest_data[4];
+                if manifest_version != EXPECTED_MANIFEST_VERSION {
+                    if cfg!(feature = "enforce_signatures") {
+                        log::error!(
+                            "[loader] {name}: manifest version={manifest_version} expected={EXPECTED_MANIFEST_VERSION} under enforce_signatures"
+                        );
+                        return Err(LoaderError::SignatureInvalid);
+                    }
+                    return Ok(());
+                }
                 let flags = manifest_data[14];
                 let has_integrity = (flags & 0x01) != 0;
-                let has_signature = version >= 2 && (flags & 0x02) != 0;
+                // Signature presence is signalled by flag bit 1, not by a
+                // manifest-version split — mirroring the tool serializer
+                // (`tools/src/manifest.rs::to_bytes`, which keeps signed and
+                // unsigned manifests both at MANIFEST_VERSION = 1).
+                let has_signature = (flags & 0x02) != 0;
                 let mut computed_hash: Option<[u8; 32]> = None;
                 if has_integrity {
                     // Stored hash sits after ports/resources/dependencies; its

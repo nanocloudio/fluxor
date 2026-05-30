@@ -22,6 +22,7 @@ contracts to portable application modules.
 Every PIC module receives a `SyscallTable` at init. It holds exactly:
 
 - `channel_read` / `channel_write` / `channel_poll` — direct ring-buffer I/O
+- `channel_peek` — copy from a FIFO channel head without advancing the read pointer (frame-aware consumers inspect a header before committing to consume)
 - `heap_alloc` / `heap_free` / `heap_realloc` — per-module heap
 - `provider_open` / `provider_call` / `provider_query` / `provider_close` — handle-scoped contract dispatch
 
@@ -364,8 +365,10 @@ pub unsafe extern "C" fn module_provider_dispatch(
 The loader resolves both after `module_new()` succeeds and calls
 `provider::register_module_provider()`. There is no runtime
 registration syscall — a module that doesn't export these is not a
-provider. The loader's registration is whitelisted to HAL contracts
-and FS; other contract ids are rejected.
+provider. The loader's registration is whitelisted to the HAL
+contracts, FS, and the storage namespace/object contracts
+(`is_module_providable` in `kernel/provider.rs`); other contract ids
+are rejected.
 
 ## Capabilities
 

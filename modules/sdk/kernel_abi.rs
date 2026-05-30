@@ -146,6 +146,36 @@ pub struct SyscallTable {
     pub channel_peek: unsafe extern "C" fn(handle: i32, buf: *mut u8, len: usize) -> i32,
 }
 
+// Positional `repr(C)` ABI ratchet. `SyscallTable` is the load-bearing
+// kernel<->module boundary: modules call through it by field *offset*, not
+// by name. Reordering, inserting, or removing a field silently breaks any
+// module built against a different layout (it jumps through the wrong
+// function pointer). These asserts pin the layout so any such change fails
+// the build — and is a forcing function to bump `ABI_VERSION` (wire.rs) and
+// re-validate every consumer. Layout is one `u32` slot (version, padded to
+// pointer width) followed by 11 function pointers = 12 pointer-sized slots,
+// which holds on both 64-bit (native) and 32-bit wasm builds.
+const _: () = {
+    // Every positional field is pinned, not just the first/last + size — a
+    // size-preserving reorder (e.g. swapping channel_read and channel_write)
+    // would otherwise compile while breaking every module. `version` is one
+    // pointer-width slot (u32 padded), then 11 function pointers.
+    let p = core::mem::size_of::<usize>();
+    assert!(core::mem::offset_of!(SyscallTable, version) == 0);
+    assert!(core::mem::offset_of!(SyscallTable, channel_read) == p);
+    assert!(core::mem::offset_of!(SyscallTable, channel_write) == p * 2);
+    assert!(core::mem::offset_of!(SyscallTable, channel_poll) == p * 3);
+    assert!(core::mem::offset_of!(SyscallTable, heap_alloc) == p * 4);
+    assert!(core::mem::offset_of!(SyscallTable, heap_free) == p * 5);
+    assert!(core::mem::offset_of!(SyscallTable, heap_realloc) == p * 6);
+    assert!(core::mem::offset_of!(SyscallTable, provider_open) == p * 7);
+    assert!(core::mem::offset_of!(SyscallTable, provider_call) == p * 8);
+    assert!(core::mem::offset_of!(SyscallTable, provider_query) == p * 9);
+    assert!(core::mem::offset_of!(SyscallTable, provider_close) == p * 10);
+    assert!(core::mem::offset_of!(SyscallTable, channel_peek) == p * 11);
+    assert!(core::mem::size_of::<SyscallTable>() == p * 12);
+};
+
 /// Poll event flags (used with `handle_poll` / `channel_poll`).
 /// These values are part of the stable ABI — modules hardcode them.
 pub mod poll {
@@ -451,6 +481,17 @@ pub mod fd {
     pub const fn tag_fd(tag: i32, slot: i32) -> i32 {
         if slot < 0 {
             return slot;
+        }
+        // Fail closed on an out-of-range tag rather than masking it into a
+        // valid one. The tag field is 5 bits [30..26] with bit 31 reserved,
+        // so only tags 0..32 are encodable. Masking a tag of 32+ to 5 bits
+        // would ALIAS a real contract (32 -> tag 0 = channels) and silently
+        // mis-route a handle; returning EINVAL makes callers treat it as the
+        // error it is (they already check for negative returns). Valid tags
+        // are pinned < 32 by `fd_tag_wire_surface.rs`, so this never fires in
+        // practice — it is the construction-time backstop.
+        if tag < 0 || tag >= 32 {
+            return -22; // EINVAL
         }
         (tag << TAG_SHIFT) | (slot & SLOT_MASK)
     }

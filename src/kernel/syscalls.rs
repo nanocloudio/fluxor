@@ -1257,6 +1257,19 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         ARENA_GET => {
             let mut size_out: u32 = 0;
             let ptr = scheduler::syscall_arena_get(&mut size_out);
+            // The wire field is 4 bytes, so a resident arena pointer must fit
+            // in u32 or it would be silently truncated into a wrong base. On
+            // cm5 `STATE_ARENA` (.bss) is linked sub-4GiB so this never trips;
+            // a hosted (PIE) Linux process can place .bss above 4GiB, where
+            // truncation would corrupt the module's arena base. Fail closed
+            // with a hard check. (PAGED_ARENA_GET carries a u64 base for
+            // callers that genuinely need >4GiB.)
+            if (ptr as usize) > u32::MAX as usize {
+                log::error!(
+                    "[syscall] ARENA_GET: arena ptr {ptr:p} exceeds u32; use PAGED_ARENA_GET"
+                );
+                return E_INVAL;
+            }
             if !arg.is_null() && arg_len >= 4 {
                 let addr = ptr as u32;
                 *arg = addr as u8;

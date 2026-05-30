@@ -266,6 +266,14 @@ pub const MAGIC_CONFIG: u32 = 0x52575846; // "FXWR"
 pub struct FlashLayout {
     /// Address of module table (0 = no modules)
     pub modules_addr: u32,
+    /// Known byte length of the module-table region, or 0 if the layout
+    /// source doesn't carry one. Flash A/B graph slots record it (and
+    /// bound-check it against the slot aperture); the legacy firmware
+    /// trailer has no length field, so it reports 0 and the loader falls
+    /// back to the hard `MAX_MODULES_BLOB_SIZE` cap. Preserved so the
+    /// loader can give the shared table validator a real mapping bound
+    /// instead of trusting the table's self-declared `total_size` alone.
+    pub modules_size: u32,
     /// Address of config
     pub config_addr: u32,
 }
@@ -330,6 +338,7 @@ fn read_layout_from_slots() -> Option<FlashLayout> {
     let slot_base = base as u32;
     Some(FlashLayout {
         modules_addr: slot_base + hdr.modules_offset,
+        modules_size: hdr.modules_size,
         config_addr: slot_base + hdr.config_offset,
     })
 }
@@ -338,6 +347,7 @@ fn read_layout_from_slots() -> Option<FlashLayout> {
 struct SlotHeader {
     epoch: u64,
     modules_offset: u32,
+    modules_size: u32,
     config_offset: u32,
 }
 
@@ -358,6 +368,16 @@ unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
     let config_offset = read_u32(base.add(24));
     let config_size = read_u32(base.add(28));
 
+    // An A/B slot always carries a real module-table length written by the
+    // packer; the smallest possible table is its 16-byte header. A
+    // `modules_size` below that is a torn/corrupt slot — reject it rather than
+    // letting `init()` treat 0 as the trailer's "legacy unknown length"
+    // sentinel and fall back to the MAX_MODULES_BLOB_SIZE bound, which would
+    // let a corrupt table escape the slot aperture. (The legacy trailer, which
+    // has no length field, keeps 0 = unknown — see read_layout_from_trailer.)
+    if modules_size < 16 {
+        return None;
+    }
     // Both regions must fit inside the slot.
     if (modules_offset as u64) + (modules_size as u64) > flash_layout::GRAPH_SLOT_SIZE as u64 {
         return None;
@@ -369,6 +389,7 @@ unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
     Some(SlotHeader {
         epoch,
         modules_offset,
+        modules_size,
         config_offset,
     })
 }
@@ -411,6 +432,11 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
 
         Some(FlashLayout {
             modules_addr,
+            // The legacy trailer has no module-table length field; 0 tells
+            // the loader to fall back to the MAX_MODULES_BLOB_SIZE cap and
+            // validate internal consistency against the table's own
+            // total_size.
+            modules_size: 0,
             config_addr,
         })
     }

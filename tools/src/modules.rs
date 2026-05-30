@@ -128,12 +128,24 @@ impl ModuleInfo {
             None
         };
 
-        // Read manifest (follows schema)
+        // Read manifest (follows schema). Distinguish "no manifest"
+        // (manifest_size == 0, a legitimate bare module) from "manifest
+        // declared but overrunning the file" (a corrupt/truncated artifact),
+        // which must fail loud rather than silently yield an empty,
+        // permission-less manifest to `fluxor info` and config validation.
+        // Mirrors `cmd_sign`'s "fmod truncated before manifest" rejection.
         let manifest_offset = schema_offset + schema_size;
-        let manifest = if manifest_size > 0 && manifest_offset + manifest_size <= data.len() {
+        let manifest = if manifest_size == 0 {
+            Manifest::default()
+        } else if manifest_offset + manifest_size <= data.len() {
             Manifest::from_bytes(&data[manifest_offset..manifest_offset + manifest_size])?
         } else {
-            Manifest::default()
+            return Err(Error::Module(format!(
+                "{}: manifest overruns file — header declares manifest_size={manifest_size} \
+                 at offset {manifest_offset} but file is only {} bytes",
+                name,
+                data.len(),
+            )));
         };
 
         let name_hash = fnv1a_hash(name.as_bytes());

@@ -139,4 +139,6 @@ those specific modules.
 | 1 | in_place_writer | Uses buffer_acquire_inplace |
 | 2 | deferred_ready | Needs init time before downstream runs |
 | 3 | drain_capable | Exports module_drain for live reconfigure |
-| 4-7 | reserved | Must be 0 |
+| 4 | isr_module | Exports module_isr_init / module_isr_entry (Tier 2) |
+| 5 | wasm_payload | Module body is a wasm payload (set by `pack_fmod_wasm`, read by `platform/wasm.rs`) |
+| 6-7 | reserved | Must be 0 |

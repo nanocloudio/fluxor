@@ -896,7 +896,11 @@ unsafe extern "C" fn wasm_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u8 {
 #[used]
 #[no_mangle]
 pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
-    version: 1,
+    // Sourced from the ABI constant (wire.rs `ABI_VERSION`, included above) so
+    // an ABI bump propagates here automatically instead of drifting at a
+    // hardcoded 1. The SyscallTable layout ratchet in kernel_abi.rs forces the
+    // bump on any field change; this mirror tracks it in lockstep.
+    version: ABI_VERSION as u32,
     channel_read: wasm_syscalls::channel_read,
     channel_write: wasm_syscalls::channel_write,
     channel_poll: wasm_syscalls::channel_poll,

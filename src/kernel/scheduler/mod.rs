@@ -3205,6 +3205,17 @@ fn collect_module_hints(
             Err(_) => continue, // Will be caught during instantiation
         };
 
+        // Validate integrity/signature BEFORE invoking any of the module's own
+        // code. `query_channel_hints` below calls the module's
+        // `module_channel_hints` export; without this gate unverified native
+        // code runs before admission, because the signature/integrity check in
+        // `start_new` only happens later, at instantiation. A module that fails
+        // here is skipped now (its code never runs) and is hard-rejected when
+        // instantiation re-validates it.
+        if crate::kernel::loader::validate_module(&loaded, "hints").is_err() {
+            continue;
+        }
+
         // Extract mailbox_safe / in_place_writer flags early so open_channels
         // can use them for buffer-group aliasing decisions.
         let flags_byte = loaded.header.reserved[0];
@@ -3757,6 +3768,17 @@ pub fn instantiate_one_module(
     };
     let name = found_module.name_str();
     let static_name = NameArena::intern(name);
+
+    // Validate integrity/signature BEFORE any module export runs or any
+    // manifest metadata is trusted. The `module_arena_size` export below is
+    // module code, and `start_new` (which also validates) runs only after it —
+    // so without an early gate here unverified native code executes. This is
+    // redundant with start_new's check by design: defense in depth at the two
+    // points where module code first becomes reachable.
+    if let Err(e) = crate::kernel::loader::validate_module(&found_module, static_name) {
+        e.log("validate");
+        return InstantiateResult::Error(-1);
+    }
 
     // Select capability-filtered syscall table based on module type
     let syscalls = get_table_for_module_type(found_module.header.module_type);
