@@ -55,7 +55,7 @@ requires `file.data` can be satisfied by:
 - `nfs_client` mounting a remote filesystem
 - `mesh_bridge` proxying file data from another device
 
-Similarly, a module that provides `audio.pcm` can feed:
+Similarly, a module that provides `audio.sample` can feed:
 
 - `i2s` driving a local DAC via PIO
 - `rtp` streaming over UDP to a remote speaker
@@ -68,7 +68,7 @@ detail hidden inside modules and wiring.
 
 This means the wiring of modules within one device is architecturally
 identical to having them connect across devices. A display connected by
-SPI and a display streamed via MPEG-2 transport both consume `display.draw`.
+SPI and a display streamed via MPEG-2 transport both consume `VideoDraw`.
 A file on local SD and a file on a network share both provide `file.data`.
 
 ## Architecture Overview
@@ -78,7 +78,7 @@ A file on local SD and a file on a network share both provide `file.data`.
 |                    Application Modules                          |
 |        (http_server, mqtt, synth, photo_viewer, game)          |
 |                                                                |
-|        requires: [socket]  [audio.pcm]  [display.still]       |
+|     requires: [transport.stream] [audio.sample] [display.scanout]  |
 +----------------------------------------------------------------+
                               |
                    Capability Resolution
@@ -88,9 +88,9 @@ A file on local SD and a file on a network share both provide `file.data`.
 |                    Foundation Modules                           |
 |             (ip, fat32, mp3_decoder, ble_stack)                |
 |                                                                |
-|        provides: [socket]        requires: [frame]             |
-|        provides: [file.data]     requires: [storage.block]     |
-|        provides: [audio.pcm]     requires: [audio.encoded]     |
+|     provides: [transport.stream]  requires: [net.frame]         |
+|     provides: [file.data]         requires: [storage.block]     |
+|     provides: [audio.sample]      requires: [audio.encoded]     |
 +----------------------------------------------------------------+
                               |
                    Capability Resolution
@@ -99,12 +99,12 @@ A file on local SD and a file on a network share both provide `file.data`.
 |                    Driver Modules                               |
 |          (cyw43, enc28j60, ch9120, sd, i2s, epaper)           |
 |                                                                |
-|        provides: [frame.wifi]                                  |
-|        provides: [frame.ethernet]                              |
-|        provides: [socket]          (ch9120: TCP/IP offload)    |
+|        provides: [net.frame.wifi]                              |
+|        provides: [net.frame.ethernet]                          |
+|        provides: [transport.stream]  (ch9120: TCP/IP offload)  |
 |        provides: [storage.block]                               |
-|        provides: [audio.out]                                   |
-|        provides: [display.still]                               |
+|        provides: [audio.output]                                |
+|        provides: [display.scanout]                             |
 +----------------------------------------------------------------+
                               |
                       hardware: section
@@ -172,19 +172,19 @@ resolves these into modules and wiring at build time.
 
 | Subsection | Drivers | Provides |
 |------------|---------|----------|
-| `network` | cyw43, enc28j60, ch9120, rp1_gem, e810 | `frame.*`, `platform_nic_ring`, or `socket` |
-| `audio.out` | i2s, pdm, pwm, dac, bluetooth_a2dp | `audio.out` |
-| `audio.in` | i2s, pdm, adc | `audio.in` |
-| `display` | epaper (ssd1680), oled (ssd1306), lcd (ili9341, st7789) | `display.*` |
-| `display.touch` | xpt2046, ft6236, gt911 | `display.touch` |
+| `network` | cyw43, enc28j60, ch9120, rp1_gem, e810 | `net.frame.*`, `platform_nic_ring`, or `transport.stream` |
+| `audio.out` | i2s, pdm, pwm, dac, bluetooth_a2dp | `audio.output` |
+| `audio.in` | i2s, pdm, adc | `audio.capture` |
+| `display` | epaper (ssd1680), oled (ssd1306), lcd (ili9341, st7789) | `display.scanout` (+ `max_refresh_hz` fact) |
+| `display.touch` | xpt2046, ft6236, gt911 | `input.touch` |
 | `storage` | sd, flash, eeprom | `storage.block` |
 | `bluetooth` | cyw43, esp32 | `bluetooth.*` |
 
 ### Multi-Capability Chips
 
 Some chips provide multiple capabilities. cyw43 provides WiFi frames and
-Bluetooth. The CH9120 provides sockets directly. A chip appearing in
-multiple hardware subsections is loaded once as a single module:
+Bluetooth. The CH9120 provides a stream transport directly. A chip appearing
+in multiple hardware subsections is loaded once as a single module:
 
 ```yaml
 hardware:
@@ -246,14 +246,14 @@ fpu = true
 
 ### Wildcard Matching
 
-A requirement of `"frame"` matches any `frame.*` provider (`frame.wifi`,
-`frame.ethernet`). This is how the IP module works with any frame source
-without listing every possible driver.
+A requirement of `"net.frame"` matches any `net.frame.*` provider
+(`net.frame.wifi`, `net.frame.ethernet`). This is how the IP module works with
+any frame source without listing every possible driver.
 
 Matching rules:
-- Exact match: `"socket"` matches `"socket"`
-- Prefix match: `"frame"` matches `"frame.wifi"`, `"frame.ethernet"`
-- No reverse: `"frame.wifi"` does NOT match `"frame"` (a WiFi-specific
+- Exact match: `"transport.stream"` matches `"transport.stream"`
+- Prefix match: `"net.frame"` matches `"net.frame.wifi"`, `"net.frame.ethernet"`
+- No reverse: `"net.frame.wifi"` does NOT match `"net.frame"` (a WiFi-specific
   module can't run on a generic frame provider)
 
 ## Port Content Types
@@ -265,21 +265,21 @@ This enables auto-wiring and type-checked connections.
 # synth/manifest.toml
 [[ports]]
 direction = "output"
-content_type = "audio.pcm"
+content_type = "AudioSample"
 
 # mp3_decoder/manifest.toml
 [[ports]]
 direction = "input"
-content_type = "audio.encoded"
+content_type = "AudioEncoded"
 
 [[ports]]
 direction = "output"
-content_type = "audio.pcm"
+content_type = "AudioSample"
 
 # i2s/manifest.toml
 [[ports]]
 direction = "input"
-content_type = "audio.pcm"
+content_type = "AudioSample"
 
 # fat32/manifest.toml
 [[ports]]
@@ -298,7 +298,7 @@ content_type = "storage.block"
 # epaper/manifest.toml
 [[ports]]
 direction = "input"
-content_type = "display.draw"
+content_type = "VideoDraw"
 ```
 
 ### Content Type Registry
@@ -306,58 +306,64 @@ content_type = "display.draw"
 Content types describe the data format flowing through channels. They use
 a hierarchical naming scheme matching the capability taxonomy.
 
+Content-type identifiers are `UpperCamelCase` and resolve to a positional
+wire byte (`contracts/src/lib.rs::CONTENT_TYPES`). The four storage surfaces
+are the deliberate exception: they keep their dotted lowercase spelling, which
+doubles as their semantic-surface and provider-contract name.
+
 | Content Type | Description | Example Providers |
 |-------------|-------------|-------------------|
-| `audio.pcm` | Raw PCM samples (interleaved stereo) | synth, mp3_decoder, mic_source |
-| `audio.encoded` | Compressed audio (MP3, AAC, WAV) | file reader, http client |
-| `audio.encoded.mp3` | Specifically MP3 | file reader with MP3 files |
-| `display.draw` | Drawing commands or framebuffer | photo viewer, UI renderer |
-| `display.touch_event` | Touch coordinates and gestures | xpt2046, ft6236 |
+| `AudioSample` | Raw PCM samples (interleaved stereo) | synth, mp3_decoder, mic_source |
+| `AudioEncoded` | Compressed audio (MP3, AAC, WAV) | file reader, http client |
+| `AudioMp3` | Specifically MP3 | file reader with MP3 files |
+| `VideoDraw` | Drawing commands or framebuffer | photo viewer, UI renderer |
+| `PointerEvents` | Pointer / touch coordinates and gestures | xpt2046, ft6236 |
 | `storage.block` | Raw block I/O (512-byte sectors) | sd, flash |
 | `file.data` | File byte stream | fat32, littlefs, http, nfs |
 | `storage.namespace` | Directory-like name-keyed addressing (lookup, list, rename, delete, subscribe) | fat32, linux_fs, replicated namespace adapters |
 | `storage.object` | Whole-blob byte-addressed put / get / range_get / head | content-addressed stores, replicated object stores, HTTP-backed adapters |
-| `frame.ethernet` | Raw ethernet frames | cyw43, enc28j60, ip |
-| `control.fmp` | FMP messages (next/prev/toggle) | button, gesture, bank |
-| `net.stream.cmd.v1` | Stream upstream commands (bind/connect/send/close) | ip, tls, ch9120, session workers |
-| `net.stream.evt.v1` | Stream downstream events (accepted/data/closed/error) | ip, tls, ch9120 |
-| `net.datagram.tx.v1` | Datagram with explicit destination | dns, rtp, log_net |
-| `net.datagram.rx.v1` | Datagram with explicit source | dns, rtp, log_net |
-| `net.packet.v1` | Packet-preserving envelope with ingress metadata | quic, dtls, srtp, packet classifiers |
-| `net.mux.cmd.v1` | Multiplexed session / stream open / close / send | quic, http3, mux transports |
-| `net.mux.evt.v1` | Multiplexed session / stream events and readiness | quic, http3 |
-| `net.session.ctrl.v1` | Control sideband between anchor, worker, directory | transport anchors, session workers, directories |
+| `EthernetFrame` | Raw ethernet frames | cyw43, enc28j60, ip |
+| `FmpMessage` | FMP messages (next/prev/toggle) | button, gesture, bank |
+| `NetProto` | Unified TCP/UDP framing (`[msg_type][len][payload]`) | ip, tls, ch9120 |
 
-The `net.*` content types correspond one-to-one with the protocol
-surfaces defined in `architecture/protocol_surfaces.md`. The concrete
-envelopes live under `modules/sdk/contracts/net/`. The existing TLV
-format described in `architecture/network.md` is Stream Surface v1.
+The richer per-surface protocol envelopes — `NetStreamCmdV1`,
+`NetStreamEvtV1`, `NetDatagramTxV1`, `NetDatagramRxV1`, `NetPacketV1`,
+`NetMuxCmdV1`, `NetMuxEvtV1`, `NetSessionCtrlV1` — are appended to the wire
+table as their implementations land. They correspond one-to-one with the
+protocol surfaces defined in `architecture/protocol_surfaces.md`; the concrete
+envelopes live under `modules/sdk/contracts/net/`. The existing TLV format
+described in `architecture/network.md` is `NetProto`, the shipped compact
+Stream Surface v1.
 
 These correspond to the content types in the mesh event system
 (see `architecture/mesh.md`), ensuring on-device channels and cross-device
 mesh events use the same type identifiers.
 
-## Graduated Display Capabilities
+## Display Capability and Refresh Facts
 
-Display hardware provides different capability levels. The capability model
-captures this as graduated sets:
+All display hardware provides one role capability, `display.scanout`. What
+distinguishes e-paper from an LCD is not a separate capability tier but a
+capability fact — chiefly `max_refresh_hz`. Touch is a separate input
+capability (`input.touch`), even when the panel is physically integrated with
+the display.
 
-| Hardware | display.still | display.video | display.touch |
+| Hardware | display.scanout | max_refresh_hz | input.touch |
 |----------|:---:|:---:|:---:|
-| e-paper (ssd1680) | Y | | |
-| OLED (ssd1306) | Y | Y | |
-| LCD (ili9341) | Y | Y | |
-| LCD + touch (ili9341 + xpt2046) | Y | Y | Y |
+| e-paper (ssd1680) | Y | ~1 | |
+| OLED (ssd1306) | Y | 60 | |
+| LCD (ili9341) | Y | 60 | |
+| LCD + touch (ili9341 + xpt2046) | Y | 60 | Y |
 
-Application modules declare their minimum requirements:
+Application modules bind `display.scanout` and, when they need motion,
+constrain the refresh fact:
 
-| Application | Minimum Requirement | Works On |
+| Application | Requirement | Works On |
 |-------------|-------------------|----------|
-| Weather station | `display.still` | All displays |
-| Photo frame | `display.still` | All displays |
-| Video player | `display.video` | OLED, LCD |
-| Game | `display.video` + `display.touch` | LCD with touch only |
-| Dashboard | `display.still` | All displays |
+| Weather station | `display.scanout` | All displays |
+| Photo frame | `display.scanout` | All displays |
+| Video player | `display.scanout` + `max_refresh_hz >= 30` | OLED, LCD |
+| Game | `display.scanout` + `max_refresh_hz >= 30` + `input.touch` | LCD with touch only |
+| Dashboard | `display.scanout` | All displays |
 
 The config tool validates at build time:
 
@@ -370,8 +376,8 @@ hardware:
 modules:
   - name: game
 
-Error: 'game' requires 'display.video' but hardware provides only
-       'display.still' (epaper/ssd1680).
+Error: 'game' requires display.scanout with max_refresh_hz >= 30 but
+       hardware.display (epaper/ssd1680) provides max_refresh_hz ~1.
        Compatible hardware: lcd/ili9341, lcd/st7789, oled/ssd1306.
 ```
 
@@ -385,24 +391,24 @@ capabilities instead of software libraries.
 
 ```
 1. Collect all `requires` from user-declared modules
-     http_server -> {socket}
-     synth -> {audio.pcm} (provides, not requires)
-     game -> {display.video, display.touch}
+     http_server -> {transport.stream}
+     synth -> {audio.sample} (provides, not requires)
+     game -> {display.scanout (max_refresh_hz >= 30), input.touch}
 
 2. Collect all `provides` from hardware: section
-     hardware.network (wifi/cyw43) -> {frame.wifi}
-     hardware.audio.out (i2s) -> {audio.out}
-     hardware.display (lcd/ili9341) -> {display.still, display.video}
-     hardware.display.touch (xpt2046) -> {display.touch}
+     hardware.network (wifi/cyw43) -> {net.frame.wifi}
+     hardware.audio.out (i2s) -> {audio.output}
+     hardware.display (lcd/ili9341) -> {display.scanout (max_refresh_hz 60)}
+     hardware.display.touch (xpt2046) -> {input.touch}
 
 3. For each unsatisfied requirement, find a provider chain:
-     socket <- ip (provides socket, requires frame)
-             <- cyw43 (provides frame.wifi, from hardware)
-     display.video <- ili9341 (from hardware)
-     display.touch <- xpt2046 (from hardware)
+     transport.stream <- ip (provides transport.stream, requires net.frame)
+                      <- cyw43 (provides net.frame.wifi, from hardware)
+     display.scanout <- ili9341 (from hardware)
+     input.touch <- xpt2046 (from hardware)
 
-4. For frame.wifi, also resolve link management:
-     link.wifi <- wifi module (requires frame.wifi)
+4. For net.frame.wifi, also resolve link management:
+     net.link.wifi <- wifi module (requires net.frame.wifi)
 
 5. Emit resolved module list + infrastructure wiring:
      Auto-added: cyw43, wifi, ip, ili9341, xpt2046, i2s
@@ -415,17 +421,17 @@ capabilities instead of software libraries.
 To keep behavior predictable and debuggable:
 
 1. **Always auto-wire hardware infrastructure**: storage driver to filesystem,
-   frame driver to IP stack, audio.pcm to audio output. These are the
+   frame driver to IP stack, `AudioSample` to audio output. These are the
    "plumbing" connections that every application needs.
 
 2. **Auto-wire when unambiguous**: if exactly one unconnected output port
-   has content_type `audio.pcm` and exactly one unconnected input port
-   expects `audio.pcm`, wire them.
+   has content_type `AudioSample` and exactly one unconnected input port
+   expects `AudioSample`, wire them.
 
 3. **Error when ambiguous**: if both synth and mp3_decoder output
-   `audio.pcm` and i2s needs `audio.pcm`, the config tool reports:
+   `AudioSample` and i2s needs `AudioSample`, the config tool reports:
    ```
-   Error: Ambiguous auto-wire for 'audio.pcm' into i2s.in.
+   Error: Ambiguous auto-wire for 'AudioSample' into i2s.in.
           Multiple providers: synth.out, mp3_decoder.out.
           Add explicit wiring to resolve.
    ```
@@ -435,14 +441,14 @@ To keep behavior predictable and debuggable:
    the auto-wirer doesn't also try to wire `synth.out -> i2s.in`.
 
 5. **Validate all connections**: even explicit wiring is checked against
-   content types. Connecting `synth.out(audio.pcm)` to `fat32.in(storage.block)`
+   content types. Connecting `synth.out(AudioSample)` to `fat32.in(storage.block)`
    produces a type mismatch warning.
 
 ### What Gets Auto-Wired vs What Stays Explicit
 
 | Category | Auto-Wired | Example |
 |----------|-----------|---------|
-| Hardware infrastructure | Yes | sd -> fat32, cyw43 <-> ip, pcm -> i2s |
+| Hardware infrastructure | Yes | sd -> fat32, cyw43 <-> ip, AudioSample -> i2s |
 | Driver control sidebands | Yes | wifi <-> cyw43 ctrl/status |
 | Application data flow | No | bank -> mp3_decoder, button -> gesture |
 | Application control flow | No | gesture -> bank.ctrl |
@@ -536,7 +542,7 @@ The `modules:` and `wiring:` sections are identical across all three boards.
 ### Resolved module graphs
 
 The config tool resolves these hardware sections into different module
-stacks, all providing the same `socket` capability to http_server:
+stacks, all providing the same `transport.stream` capability to http_server:
 
 **WiFi (cyw43):**
 ```
@@ -600,7 +606,7 @@ Auto-resolved:
 ```
 Auto-added: sd, i2s
 Auto-wired: sd.out -> fat32.in
-            mp3_decoder.out(audio.pcm) -> i2s.in(audio.pcm)
+            mp3_decoder.out(AudioSample) -> i2s.in(AudioSample)
 ```
 
 Same player with PWM audio — one hardware line changes:
@@ -625,8 +631,8 @@ hardware:
   # ... rest identical
 ```
 
-The mp3_decoder still outputs `audio.pcm`. The Bluetooth A2DP module
-consumes `audio.pcm` exactly like i2s does.
+The mp3_decoder still outputs `AudioSample`. The Bluetooth A2DP module
+consumes `AudioSample` exactly like i2s does.
 
 ### Synthesizer with Effects
 
@@ -660,11 +666,11 @@ data:
 Auto-resolved:
 ```
 Auto-added: i2s
-Auto-wired: effects.out(audio.pcm) -> i2s.in(audio.pcm)
+Auto-wired: effects.out(AudioSample) -> i2s.in(AudioSample)
 ```
 
-The auto-wirer sees that `effects.out` provides `audio.pcm` and `i2s.in`
-requires `audio.pcm`, with no other audio.pcm providers having unconnected
+The auto-wirer sees that `effects.out` provides `AudioSample` and `i2s.in`
+requires `AudioSample`, with no other `AudioSample` providers having unconnected
 outputs. Unambiguous, so it wires automatically.
 
 ### Network File Player (Locality Transparency)
@@ -722,7 +728,7 @@ wiring:
     to: mpeg2_ts.in
 ```
 
-The renderer provides `display.draw` on its output. When wired to a local
+The renderer provides `VideoDraw` on its output. When wired to a local
 display driver, pixels go to SPI. When wired to mpeg2_ts, the same pixels
 get packetized into MPEG-2 transport and sent over UDP. The renderer module
 is unchanged.
@@ -756,10 +762,10 @@ Auto-resolved:
 ```
 Auto-added: cyw43, wifi, ip, ssd1680
 Auto-wired: cyw43<->ip, wifi<->cyw43
-            weather_station.out(display.draw) -> ssd1680.in(display.draw)
+            weather_station.out(VideoDraw) -> ssd1680.in(VideoDraw)
 ```
 
-Validated: weather_station requires `display.still`, ssd1680 provides it.
+Validated: weather_station requires `display.scanout`, ssd1680 provides it.
 
 ### Game on LCD with Touch
 
@@ -785,17 +791,18 @@ modules:
 Auto-resolved:
 ```
 Auto-added: ili9341, xpt2046
-Auto-wired: game.out(display.draw) -> ili9341.in(display.draw)
-            xpt2046.out(display.touch_event) -> game.in(display.touch_event)
+Auto-wired: game.out(VideoDraw) -> ili9341.in(VideoDraw)
+            xpt2046.out(PointerEvents) -> game.in(PointerEvents)
 ```
 
-Validated: game requires `display.video` and `display.touch`. ili9341
-provides `display.video`, xpt2046 provides `display.touch`.
+Validated: game requires `display.scanout` (with `max_refresh_hz >= 30`) and
+`input.touch`. ili9341 provides `display.scanout` at 60 Hz, xpt2046 provides
+`input.touch`.
 
 If the user tried this on e-paper:
 ```
-Error: 'game' requires 'display.video' but hardware.display (epaper/ssd1680)
-       only provides 'display.still'.
+Error: 'game' requires display.scanout with max_refresh_hz >= 30 but
+       hardware.display (epaper/ssd1680) provides max_refresh_hz ~1.
 ```
 
 ## Capability Taxonomy
@@ -803,15 +810,15 @@ Error: 'game' requires 'display.video' but hardware.display (epaper/ssd1680)
 ### Hardware Capabilities (from hardware: section)
 
 ```
-frame.wifi          — raw WiFi ethernet frames (cyw43, esp32)
-frame.ethernet      — raw wired ethernet frames (enc28j60, rp1_gem, e810)
+net.frame.wifi      — raw WiFi ethernet frames (cyw43, esp32)
+net.frame.ethernet  — raw wired ethernet frames (enc28j60, rp1_gem, e810)
 bluetooth.ble       — Bluetooth Low Energy (cyw43, esp32)
 bluetooth.a2dp      — Bluetooth audio streaming (cyw43)
-audio.out           — physical audio output (i2s, pdm, pwm, dac, bt_a2dp)
-audio.in            — physical audio input (i2s_in, pdm_in, adc)
-display.still       — static image rendering (epaper, oled, lcd)
-display.video       — frame-rate rendering (oled, lcd)
-display.touch       — touch input (xpt2046, ft6236, gt911)
+audio.output        — physical audio output (i2s, pdm, pwm, dac, bt_a2dp)
+audio.capture       — physical audio input (i2s_in, pdm_in, adc)
+display.scanout     — paced display output (epaper, oled, lcd);
+                      the max_refresh_hz fact distinguishes static from motion
+input.touch         — touch input (xpt2046, ft6236, gt911)
 storage.block       — raw block I/O (sd, flash, eeprom)
 pio                 — programmable I/O (RP2350 PIO peripheral)
 spi                 — SPI bus access
@@ -823,16 +830,16 @@ uart                — UART serial access
 ### Service Capabilities (from module manifests)
 
 ```
-socket              — TCP/UDP networking (provided by ip, ch9120, linux_net)
-link.wifi           — WiFi connection management (provided by wifi)
+transport.stream    — byte-stream transport (provided by ip, ch9120, linux_net)
+net.link.wifi       — WiFi connection management (provided by wifi)
 file.data           — file byte stream (provided by fat32, littlefs, http)
 storage.namespace   — directory-like name-keyed surface (provided by fat32, linux_fs, namespace adapters)
 storage.object      — whole-blob byte-addressed surface (provided by content-addressed and replicated object adapters)
-audio.pcm           — raw PCM audio samples (provided by synth, decoder, mic)
+audio.sample        — raw PCM audio samples (provided by synth, decoder, mic)
 audio.encoded       — compressed audio stream (provided by file reader, http)
-display.draw        — drawing commands / framebuffer (provided by renderer)
-display.touch_event — touch coordinates (provided by touch driver)
-selection           — item selection (provided by bank)
+video.draw          — drawing commands / framebuffer (provided by renderer)
+input.touch         — touch coordinates, carried as PointerEvents (provided by touch driver)
+selection           — item selection (project-local provides name, e.g. bank)
 replication.state_machine — replicated commit log + apply pipeline
                       (committed-entry stream, snapshot install/export,
                       apply reset) (provided by clustor)
@@ -910,7 +917,7 @@ Transport surfaces are capabilities, one per surface defined in
 `architecture/protocol_surfaces.md`:
 
 ```
-packet.net                       — packet-preserving network surface
+transport.packet                 — packet-preserving network surface
 transport.stream                 — byte-stream transport endpoint
 transport.stream.tcp             — TCP byte-stream transport
 transport.stream.secure          — secured byte-stream transport (post-TLS)
@@ -920,12 +927,13 @@ transport.datagram.secure        — secured datagram transport (post-DTLS)
 transport.mux                    — multiplexed session transport
 transport.mux.quic               — QUIC transport
 security.tls13.stream            — TLS 1.3 stream security layer
-security.dtls13                  — DTLS datagram security layer
+security.dtls13.datagram         — DTLS 1.3 datagram security layer
 ```
 
-`socket` remains as the legacy capability covering the current unified
-`net_proto` contract (TCP+UDP multiplexed). New modules should depend on
-the explicit surface names above.
+The `net_proto` contract — the compact TCP/UDP multiplexed framing, content
+type `NetProto` — is exposed through `transport.stream` and
+`transport.datagram`. A module depends on the explicit transport surface it
+actually uses.
 
 ### Continuity Role Capabilities
 
@@ -944,7 +952,7 @@ session.handoff                  — opaque export / import handoff support
 
 These are manifest-level capability names. They do not consume bits in
 the `required_caps` device-class mask; they participate in the same
-string-matched capability resolution as `file.data` or `audio.pcm`.
+string-matched capability resolution as `file.data` or `audio.sample`.
 
 ### Capability Inheritance
 
@@ -952,17 +960,20 @@ Capabilities form a hierarchy. A requirement for a parent capability is
 satisfied by any child:
 
 ```
-frame               — matches frame.wifi, frame.ethernet
+net.frame           — matches net.frame.wifi, net.frame.ethernet
 bluetooth           — matches bluetooth.ble, bluetooth.a2dp
 audio.encoded       — matches audio.encoded.mp3, audio.encoded.aac
-display             — matches display.still, display.video
 transport.stream    — matches transport.stream.tcp, transport.stream.secure
 transport.datagram  — matches transport.datagram.udp, transport.datagram.secure
 transport.mux       — matches transport.mux.quic
 ```
 
-The reverse does NOT hold. A module requiring `frame.wifi` specifically
-cannot be satisfied by `frame.ethernet`, and a module requiring
+`display.scanout` does not graduate by name — every display provides it, and
+the `max_refresh_hz` fact (not a child capability) is what a motion consumer
+constrains.
+
+The reverse does NOT hold. A module requiring `net.frame.wifi` specifically
+cannot be satisfied by `net.frame.ethernet`, and a module requiring
 `transport.stream.secure` is not satisfied by plain `transport.stream`.
 
 **Security is orthogonal.** `transport.stream` is not equivalent to
@@ -983,9 +994,9 @@ behaviour is policy, not incidental broad matching.
 
 ### Network Architecture (network.md)
 
-`network.md` describes the frame provider vs socket provider
+`network.md` describes the frame provider vs transport provider
 distinction. This document generalizes that pattern: frame providers and
-socket providers are both instances of the capability model. The `provides`
+transport providers are both instances of the capability model. The `provides`
 field in manifests formalizes that contract.
 
 The NetIF contract (frame channels between drivers and IP) becomes an
@@ -1060,7 +1071,7 @@ Ports in `manifest.toml` declare their `content_type`:
 [[ports]]
 name = "out"
 direction = "output"
-content_type = "audio.pcm"
+content_type = "AudioSample"
 ```
 
 The config tool uses content types for validation and for unambiguous
@@ -1085,10 +1096,10 @@ list and a wiring template:
                        wiring:  []   (ch9120 speaks net_proto directly)
 
 (audio.out, i2s)     → modules: [i2s]
-                       wiring:  [i2s gets the auto-wired audio.pcm input]
+                       wiring:  [i2s gets the auto-wired AudioSample input]
 
 (display, ili9341)   → modules: [ili9341]
-                       wiring:  [ili9341 gets the auto-wired display.draw input]
+                       wiring:  [ili9341 gets the auto-wired VideoDraw input]
 ```
 
 The hardware section is the board support declaration: it describes the
@@ -1105,8 +1116,8 @@ The config tool walks the capability graph:
    and `[requires]` fields from manifests
 2. Collect hardware section providers from the lookup table
 3. For each unsatisfied `requires`, find a provider chain through service
-   modules (e.g. `socket` ← `ip` ← `frame.wifi` ← hardware section)
-4. Auto-add intermediate modules (the `ip` module if a socket consumer
+   modules (e.g. `transport.stream` ← `ip` ← `net.frame.wifi` ← hardware section)
+4. Auto-add intermediate modules (the `ip` module if a transport consumer
    needs frames-from-driver)
 5. Auto-wire content-type matches where there is exactly one unconnected
    producer and one unconnected consumer of that type
@@ -1117,10 +1128,10 @@ The config tool walks the capability graph:
 ### Auto-Wiring Rules
 
 - **Always auto-wire hardware infrastructure**: storage driver to filesystem,
-  frame driver to IP module, audio.pcm output to audio output
+  frame driver to IP module, `AudioSample` output to audio output
 - **Auto-wire when unambiguous**: exactly one unconnected producer and
   exactly one unconnected consumer of a given content type
-- **Error when ambiguous**: multiple producers of `audio.pcm` and one
+- **Error when ambiguous**: multiple producers of `AudioSample` and one
   i2s consumer requires explicit user wiring to disambiguate
 - **Never override explicit wiring**: user-declared wiring always wins
 - **Validate all connections**: even explicit wiring is checked against
@@ -1132,11 +1143,11 @@ Resolution errors are reported with the source location and a list of
 candidates:
 
 ```
-Error: 'game' requires 'display.video' but hardware.display (epaper/ssd1680)
-       only provides 'display.still'.
+Error: 'game' requires display.scanout with max_refresh_hz >= 30 but
+       hardware.display (epaper/ssd1680) provides max_refresh_hz ~1.
        Compatible hardware: lcd/ili9341, lcd/st7789, oled/ssd1306.
 
-Error: Ambiguous auto-wire for 'audio.pcm' into i2s.in.
+Error: Ambiguous auto-wire for 'AudioSample' into i2s.in.
        Multiple unconnected providers: synth.out, mp3_decoder.out.
        Add explicit wiring to resolve.
 ```

@@ -51,8 +51,9 @@ Modules declare AV-side capabilities via the manifest top-level field:
 capabilities = ["video.scanout", "display.scanout", "presentation.clock"]
 ```
 
-The whitelist enforced by `tools/src/manifest.rs::AV_CAPABILITY_NAMES`
-covers two tiers. Hardware-facing names describe what the sink *is*;
+The whitelist enforced by `tools/src/manifest.rs::CAPABILITY_NAMES`
+(re-exported from `fluxor-contracts::vocabulary`) covers two tiers.
+Hardware-facing names describe what the sink *is*;
 service-level names describe what data shape the sink *accepts*. A
 paced display sink declares both: `display.scanout` (hardware role)
 and `video.scanout` (carries the VideoScanout content type). The
@@ -63,11 +64,11 @@ wiring matches against `video.scanout`.
 
 - `display.scanout` — paced display output with frame-boundary present
 - `display.multihead` — more than one coordinated display output
-- `display.protected_scanout` — scanout path for rights-managed content
+- `display.scanout.protected` — scanout path for rights-managed content
 - `video.decode` / `video.encode` — hw-assisted (en|de)code endpoints
-- `video.protected_decode` — protected decode path
-- `audio.protected_out` — protected audio output path
-- `audio.rate_trim` — sink can perform fine drift correction
+- `video.decode.protected` — protected decode path
+- `audio.output.protected` — protected audio output path
+- `audio.output.rate_trim` — sink can perform fine drift correction
 - `gpu.render` — render / submit capability for GPU-backed paths
 - `presentation.clock` — sink or device can act as a group clock authority
 
@@ -75,7 +76,7 @@ wiring matches against `video.scanout`.
 
 - `audio.sample`, `audio.encoded`
 - `video.encoded`, `video.draw`, `video.raster`, `video.scanout`
-- `media.muxed`, `media.protected_path`
+- `media.muxed`, `media.path.protected`
 - `presentation.group`
 
 Capability names are matched case-insensitively at parse time and
@@ -121,9 +122,9 @@ invoked from both `fluxor build` and `fluxor validate`.
 - `continuity_policy` ∈ `{drain, anchor_preserved}`.
 - `mirror_policy` ∈ `{independent, strict_mirror, partition}`.
 - If `protected: true`:
-  - every audio member must declare `audio.protected_out`;
-  - every video member must declare `display.protected_scanout` or
-    `video.protected_decode`.
+  - every audio member must declare `audio.output.protected`;
+  - every video member must declare `display.scanout.protected` or
+    `video.decode.protected`.
 - If `multihead: true`, at least two members must declare
   `display.scanout`.
 - `latency_budget_ms` / `skew_budget_ms` must be unsigned integers and

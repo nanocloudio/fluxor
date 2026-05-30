@@ -443,8 +443,8 @@ candidate first emitter.
 ### Stateless DNS / Short HTTP (`reroutable` / `drain_only`)
 
 ```text
-driver(frame.ethernet) -> ip(transport.datagram.udp) -> dns
-driver(frame.ethernet) -> ip(transport.stream.tcp)   -> tls -> http
+driver(net.frame.ethernet) -> ip(transport.datagram.udp) -> dns
+driver(net.frame.ethernet) -> ip(transport.stream.tcp)   -> tls -> http
 ```
 
 VIPs, anycast, and drain are typically sufficient.
@@ -533,7 +533,7 @@ indices, terms, and retry logic, so `resumable` is usually enough.
 ### QUIC / HTTP/3 (`transport_migratable`)
 
 ```text
-driver(frame.ethernet)
+driver(net.frame.ethernet)
   -> ip(transport.datagram.udp)
   -> quic(transport.mux.quic, session continuity support)
   -> http3 / broker / remote-channel transport

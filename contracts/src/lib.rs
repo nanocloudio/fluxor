@@ -22,6 +22,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+pub mod vocabulary;
+
 /// Canonical content-type identifiers for the four storage surfaces
 /// Fluxor publishes. Implementers expose themselves on the mesh under
 /// one of these strings.

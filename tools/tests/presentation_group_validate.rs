@@ -252,7 +252,7 @@ fn protected_without_capability_rejected() {
     if skip_if_unconfigured() {
         return;
     }
-    // i2s_pio declares audio.sample but not audio.protected_out, so a
+    // i2s_pio declares audio.sample but not audio.output.protected, so a
     // group that demands a protected path must reject it.
     let (_yaml_dir, yaml) = write_yaml(
         "protected_no_cap",
@@ -269,7 +269,7 @@ presentation_groups:
     let (ok, out) = run_validate(&yaml);
     assert!(!ok, "expected validation failure, got success:\n{out}");
     assert!(
-        out.contains("does not declare `audio.protected_out`"),
+        out.contains("does not declare `audio.output.protected`"),
         "expected protected-cap error, got:\n{out}"
     );
 }

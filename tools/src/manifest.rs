@@ -114,8 +114,8 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // docs/architecture/storage_capability_surface.md). Both are
         // module-providable contracts; class bytes match the kernel
         // `provider::contract::STORAGE_*` constants.
-        "storage.namespace" | "namespace" => Ok(0x13),
-        "storage.object" | "object" => Ok(0x14),
+        "storage.namespace" => Ok(0x13),
+        "storage.object" => Ok(0x14),
         // USB host controller binding (scaffold). Allocated so
         // foundation modules can name the contract today; the kernel
         // vtable is not yet implemented and `provider_open` against
@@ -176,51 +176,11 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
     }
 }
 
-/// Whitelist of AV / presentation / input capability names accepted in
-/// a manifest's top-level `capabilities = [...]` list. Two tiers:
-/// hardware-facing (the role the module plays — paced scanout, group
-/// clock, protected output, mapper) and service-level (the surface a
-/// producer or consumer carries). Unknown names are rejected at parse
-/// time so `display.scaneout` and friends fail the build rather than
-/// silently dropping out.
-///
-/// AV names are documented in `docs/architecture/av_capability_surface.md`.
-/// Input names are documented in `docs/architecture/input_capability_surface.md`
-/// and added one at a time as a real module declares them.
-const AV_CAPABILITY_NAMES: &[&str] = &[
-    // Hardware-facing
-    "display.scanout",
-    "display.multihead",
-    "display.protected_scanout",
-    "video.decode",
-    "video.encode",
-    "video.protected_decode",
-    "audio.protected_out",
-    "audio.rate_trim",
-    "gpu.render",
-    "presentation.clock",
-    // Service-level (mirror the canonical content-type surface family)
-    "audio.sample",
-    "audio.encoded",
-    "video.encoded",
-    "video.draw",
-    "video.raster",
-    "video.scanout",
-    "media.muxed",
-    "media.protected_path",
-    "presentation.group",
-    // Input (added as modules declare them; see input_capability_surface.md §5)
-    "input.mapper",
-    "input.gamepad",
-    "input.virtual",
-    "input.remote",
-    // MIDI surface — paired with the `input::midi` contract and the
-    // `MidiEvents` content type. Declared by the per-platform MIDI
-    // drivers (Web MIDI on wasm, ALSA seq on linux, class-compliant
-    // USB-MIDI on rp2350 / cm5).
-    "midi.input",
-    "midi.output",
-];
+// Canonical capability registry lives in `fluxor-contracts` so sibling
+// projects authoring module manifests share one source of truth (the same
+// reason `CONTENT_TYPES` lives there). Re-exported here for manifest
+// validation and the presentation-group checks.
+pub use fluxor_contracts::vocabulary::CAPABILITY_NAMES;
 
 /// Validate capability names against the whitelist and canonicalize each
 /// entry to its lowercase form in place. Downstream consumers — the
@@ -229,10 +189,7 @@ const AV_CAPABILITY_NAMES: &[&str] = &[
 /// matching at every callsite.
 fn validate_capability_names(caps: &mut [String]) -> Result<()> {
     for c in caps {
-        match AV_CAPABILITY_NAMES
-            .iter()
-            .find(|n| n.eq_ignore_ascii_case(c))
-        {
+        match CAPABILITY_NAMES.iter().find(|n| n.eq_ignore_ascii_case(c)) {
             Some(canonical) => {
                 if c.as_str() != *canonical {
                     *c = canonical.to_string();
@@ -240,13 +197,13 @@ fn validate_capability_names(caps: &mut [String]) -> Result<()> {
             }
             None => {
                 let candidates: Vec<String> =
-                    AV_CAPABILITY_NAMES.iter().map(|s| s.to_string()).collect();
+                    CAPABILITY_NAMES.iter().map(|s| s.to_string()).collect();
                 let did_you_mean = crate::text_distance::closest_match(c, &candidates, 3)
                     .map(|s| format!(" Did you mean `{s}`?"))
                     .unwrap_or_default();
                 return Err(Error::Module(format!(
                     "unknown capability `{c}`.{did_you_mean} Expected one of: {}.",
-                    AV_CAPABILITY_NAMES.join(", "),
+                    CAPABILITY_NAMES.join(", "),
                 )));
             }
         }
@@ -521,10 +478,10 @@ pub struct Manifest {
     /// binary format). Used by the config resolver to wire dependencies by
     /// service name (e.g. `pwm_rp` provides `"pwm"`).
     pub provides: Vec<String>,
-    /// AV / presentation capabilities this module declares (parsed from
-    /// TOML, not serialized to the binary `.fmod`). The whitelist lives
-    /// in `AV_CAPABILITY_NAMES`; the config validator consults this
-    /// field to enforce presentation-group rules. See
+    /// Role/surface capabilities this module declares (parsed from TOML,
+    /// not serialized to the binary `.fmod`). The whitelist lives in
+    /// `CAPABILITY_NAMES`; the config validator consults this field to
+    /// enforce presentation-group rules. See
     /// `docs/architecture/av_capability_surface.md`.
     pub capabilities: Vec<String>,
     /// Module is built into the kernel (no .fmod file needed).
@@ -1463,8 +1420,8 @@ struct TomlManifest {
     dependencies: Option<Vec<TomlDependency>>,
     commands: Option<TomlCommands>,
     provides: Option<Vec<String>>,
-    /// AV / presentation capability strings. Whitelisted by
-    /// `AV_CAPABILITY_NAMES`; validated and canonicalized at parse time.
+    /// Role/surface capability strings. Whitelisted by
+    /// `CAPABILITY_NAMES`; validated and canonicalized at parse time.
     capabilities: Option<Vec<String>>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,

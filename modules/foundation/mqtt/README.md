@@ -23,9 +23,16 @@ name = "mesh_tx"
 direction = "output"
 content_type = "OctetStream"
 
-[[resources]]
-requires_contract = "socket"
-access = "write"
+# Network transport: wired to the IP / transport stack via NetProto.
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
 ```
 
 ## Parameters

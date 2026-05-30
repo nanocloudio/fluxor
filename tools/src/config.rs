@@ -3691,7 +3691,7 @@ const CONTINUITY_POLICIES: &[&str] = &["drain", "anchor_preserved"];
 const MIRROR_POLICIES: &[&str] = &["independent", "strict_mirror", "partition"];
 const AUDIO_SINK_CAPS: &[&str] = &["audio.sample", "audio.encoded"];
 const VIDEO_SINK_CAPS: &[&str] = &["video.raster", "video.scanout", "video.encoded"];
-const VIDEO_PROTECTED_CAPS: &[&str] = &["display.protected_scanout", "video.protected_decode"];
+const VIDEO_PROTECTED_CAPS: &[&str] = &["display.scanout.protected", "video.decode.protected"];
 
 /// Maximum value (in ms) accepted for `latency_budget_ms` /
 /// `skew_budget_ms`. Beyond this the value almost certainly indicates a
@@ -3855,8 +3855,8 @@ pub fn validate_presentation_groups(
         }
 
         // Protected playback: every audio sink must declare
-        // `audio.protected_out`; every video sink must declare either
-        // `display.protected_scanout` or `video.protected_decode`. A
+        // `audio.output.protected`; every video sink must declare either
+        // `display.scanout.protected` or `video.decode.protected`. A
         // protected path is end-to-end or it isn't a protected path.
         if g.get("protected")
             .and_then(|v| v.as_bool())
@@ -3864,17 +3864,17 @@ pub fn validate_presentation_groups(
         {
             for m in &members {
                 let caps = manifest_caps(m);
-                if has_any_cap(caps, AUDIO_SINK_CAPS) && !has_cap(caps, "audio.protected_out") {
+                if has_any_cap(caps, AUDIO_SINK_CAPS) && !has_cap(caps, "audio.output.protected") {
                     return Err(Error::Config(format!(
                         "presentation_group `{id}`: protected=true but audio member \
-                         `{m}` does not declare `audio.protected_out`"
+                         `{m}` does not declare `audio.output.protected`"
                     )));
                 }
                 if has_any_cap(caps, VIDEO_SINK_CAPS) && !has_any_cap(caps, VIDEO_PROTECTED_CAPS) {
                     return Err(Error::Config(format!(
                         "presentation_group `{id}`: protected=true but video member \
-                         `{m}` does not declare `display.protected_scanout` or \
-                         `video.protected_decode`"
+                         `{m}` does not declare `display.scanout.protected` or \
+                         `video.decode.protected`"
                     )));
                 }
             }
