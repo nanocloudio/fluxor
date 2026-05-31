@@ -1,12 +1,12 @@
 //! End-to-end integration test for the WASM bundle pipeline.
 //!
 //! Exercises the full chain: a YAML config with `target: wasm` →
-//! module table assembly from `target/wasm/modules/` → config.bin
+//! module table assembly from `target/fluxor/wasm/modules/` → config.bin
 //! emission → kernel `firmware.wasm` placeholder rewrite → final
 //! self-contained `<config>.wasm` artifact.
 //!
 //! Skipped when the prerequisites aren't built (`firmware.wasm`
-//! and/or `target/wasm/modules/`) — running this test from a
+//! and/or `target/fluxor/wasm/modules/`) — running this test from a
 //! fresh tree would require building the wasm kernel and modules
 //! first.
 
@@ -38,9 +38,9 @@ fn skip_if_unconfigured() -> Option<&'static str> {
     if !firmware.exists() {
         return Some("target/wasm/firmware.wasm missing — run `make firmware TARGET=wasm`");
     }
-    let modules = project_root().join("target/wasm/modules");
+    let modules = project_root().join("target/fluxor/wasm/modules");
     if !modules.exists() {
-        return Some("target/wasm/modules missing — run `make modules TARGET=wasm`");
+        return Some("target/fluxor/wasm/modules missing — run `make modules TARGET=wasm`");
     }
     None
 }

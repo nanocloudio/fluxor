@@ -1400,6 +1400,57 @@ unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
 }
 
+/// Emit a scalar metric (counter / up-down) on a telemetry output channel.
+/// No-op if `chan < 0`, so instrumentation costs nothing when the telemetry
+/// port is unwired. `module_idx` is the emitter's own index (`dev_self_index`);
+/// `t_micros` is a best-effort monotonic stamp (the host collector applies
+/// receive time). See `modules/sdk/contracts/telemetry.rs` and
+/// `standards/observability.md`.
+#[allow(dead_code, reason = "emit-side helper; invoked only by instrumented modules")]
+#[inline]
+unsafe fn dev_telemetry_metric(
+    sys: &SyscallTable,
+    chan: i32,
+    module_idx: u16,
+    t_micros: u64,
+    kind: u8,
+    id: u16,
+    value: u64,
+) {
+    if chan < 0 {
+        return;
+    }
+    let mut buf = [0u8; abi::contracts::telemetry::METRIC_SCALAR_SIZE];
+    if let Some(n) = abi::contracts::telemetry::write_metric_scalar(
+        &mut buf, module_idx, t_micros, kind, id, value,
+    ) {
+        let _ = (sys.channel_write)(chan, buf.as_ptr(), n);
+    }
+}
+
+/// Emit a histogram metric (`HIST_BUCKETS` log2-spaced counts) on a telemetry
+/// output channel. No-op if `chan < 0`.
+#[allow(dead_code, reason = "emit-side helper; invoked only by instrumented modules")]
+#[inline]
+unsafe fn dev_telemetry_histogram(
+    sys: &SyscallTable,
+    chan: i32,
+    module_idx: u16,
+    t_micros: u64,
+    id: u16,
+    buckets: &[u64; abi::contracts::telemetry::HIST_BUCKETS],
+) {
+    if chan < 0 {
+        return;
+    }
+    let mut buf = [0u8; abi::contracts::telemetry::METRIC_HIST_SIZE];
+    if let Some(n) = abi::contracts::telemetry::write_metric_histogram(
+        &mut buf, module_idx, t_micros, id, buckets,
+    ) {
+        let _ = (sys.channel_write)(chan, buf.as_ptr(), n);
+    }
+}
+
 /// Render `bytes` as lowercase hex into `out`. Caller must ensure
 /// `out.len() >= bytes.len() * 2`.
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]

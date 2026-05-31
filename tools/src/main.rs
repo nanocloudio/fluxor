@@ -117,7 +117,7 @@ enum Commands {
         /// Output file
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Override modules directory (default: target/{silicon}/modules)
+        /// Override modules directory (default: target/fluxor/{silicon}/modules)
         #[arg(short = 'm', long)]
         modules_dir: Option<PathBuf>,
         /// Output raw binary instead of UF2
@@ -619,6 +619,19 @@ enum LintAction {
         #[arg(long)]
         json: bool,
     },
+    /// Observability instrumentation-contract check
+    /// (standards/observability.md §6): every data-moving module declares
+    /// `[observability]` metrics/spans or an `exempt` reason, and instrument
+    /// names are dotted lowercase. Reports the uninstrumented-module gap list;
+    /// fails only on malformed names.
+    Observability {
+        /// Project root override (defaults to the resolved project root).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of human-friendly text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -773,6 +786,9 @@ fn main() {
         Commands::Lint { action } => match action {
             LintAction::Hygiene { project_root, json } => {
                 cmd_lint_hygiene(project_root.as_deref(), json)
+            }
+            LintAction::Observability { project_root, json } => {
+                cmd_lint_observability(project_root.as_deref(), json)
             }
         },
         Commands::Ci { skip, project_root } => cmd_ci(&skip, project_root.as_deref(), verbose),
@@ -1366,7 +1382,7 @@ fn cmd_generate(
         }
         config["hardware"] = serde_json::Value::Object(merged);
     }
-    let modules_dir_default = format!("target/{}/modules", target_desc.id);
+    let modules_dir_default = format!("target/fluxor/{}/modules", target_desc.id);
     let modules_dir = modules_dir_override.unwrap_or(std::path::Path::new(&modules_dir_default));
 
     // Manifest search paths: explicit `module_search_paths:` from the
@@ -1526,7 +1542,7 @@ fn cmd_combine(
     // `<config-parent>/../modules` default — same mechanism the linux build
     // path uses (`cmd_generate`). Without this, fan modules like
     // media_loader fail port-name resolution.
-    let modules_dir_path = format!("target/{}/modules", target_desc.id);
+    let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
     let modules_dir = std::path::Path::new(&modules_dir_path);
     let search_paths = config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
@@ -1919,7 +1935,7 @@ fn cmd_slot_image(
         ));
     }
 
-    let modules_dir_path = format!("target/{}/modules", target_desc.id);
+    let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
     let modules_dir = std::path::Path::new(&modules_dir_path);
     let (modules_data, config_data) =
         build_packaged_blobs(&config, modules_dir, &[], &target_desc, verbose)?;
@@ -2124,7 +2140,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
     // The module directory and pin/pio bounds use the target's
     // declared geometry so a host-target validate doesn't try to
     // load .fmod files from an embedded target tree.
-    let modules_dir_default = format!("target/{}/modules", target_desc.id);
+    let modules_dir_default = format!("target/fluxor/{}/modules", target_desc.id);
     let modules_dir = std::path::PathBuf::from(&modules_dir_default);
     let search_paths = crate::config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
@@ -3251,7 +3267,7 @@ fn cmd_diff(old_path: &PathBuf, new_path: &PathBuf, target_override: Option<&str
     let new_config: serde_json::Value = serde_yaml::from_str(&new_content)?;
 
     let target_desc = resolve_target(&new_config, target_override)?;
-    let modules_dir_path = format!("target/{}/modules", target_desc.id);
+    let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
     let modules_dir = std::path::Path::new(&modules_dir_path);
 
     let plan = reconfigure::compute_transition_plan(&old_config, &new_config, modules_dir);
@@ -3319,11 +3335,11 @@ fn build_one(
     // Artifact layout:
     //   firmware  target/{build_id}/firmware.bin   (board-specific when cargo
     //                                               features differ per board)
-    //   modules   target/{silicon_id}/modules/     (byte-identical per
+    //   modules   target/fluxor/{silicon_id}/modules/  (byte-identical per
     //                                               silicon + module target)
     //   output    target/{build_id}/{images|uf2}/<subdir>/<name>.{img|uf2}
     let firmware_path = PathBuf::from(format!("target/{build_id}/firmware.bin"));
-    let modules_dir = PathBuf::from(format!("target/{silicon_id}/modules"));
+    let modules_dir = PathBuf::from(format!("target/fluxor/{silicon_id}/modules"));
 
     let name = yaml_path
         .file_stem()
@@ -3425,21 +3441,21 @@ fn build_one(
 
             // Linux host reuses the aarch64 PIC modules built for bcm2712.
             // When fluxor is consumed as a submodule, accept a sibling copy
-            // at ../deps/fluxor/target/bcm2712/modules.
-            let modules_dir = PathBuf::from("target/bcm2712/modules");
+            // at ../deps/fluxor/target/fluxor/bcm2712/modules.
+            let modules_dir = PathBuf::from("target/fluxor/bcm2712/modules");
             let mut fmod_dirs: Vec<PathBuf> = Vec::new();
             if modules_dir.exists() {
                 fmod_dirs.push(modules_dir.clone());
             }
             if let Some(config_parent) = yaml_path.parent().and_then(|p| p.parent()) {
-                let ext_modules = config_parent.join("deps/fluxor/target/bcm2712/modules");
+                let ext_modules = config_parent.join("deps/fluxor/target/fluxor/bcm2712/modules");
                 if ext_modules.exists() {
                     fmod_dirs.push(ext_modules);
                 }
             }
             if fmod_dirs.is_empty() {
                 return Err(Error::Config(
-                    "Modules not found at target/bcm2712/modules. Run 'make modules TARGET=bcm2712' first.".into()
+                    "Modules not found at target/fluxor/bcm2712/modules. Run 'make modules TARGET=bcm2712' first.".into()
                 ));
             }
             // Cross-check the YAML against the linux binary's
@@ -4659,7 +4675,8 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 let modules_blob = out_dir.join("modules.bin");
 
                 let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
-                let modules_dir = PathBuf::from(format!("target/{}/modules", target_desc.id));
+                let modules_dir =
+                    PathBuf::from(format!("target/fluxor/{}/modules", target_desc.id));
                 if !modules_dir.exists() {
                     return Err(Error::Config(format!(
                         "Modules not found at {}. Run 'make modules TARGET={}' first.",
@@ -5105,6 +5122,63 @@ fn resolve_project_root(override_arg: Option<&Path>) -> PathBuf {
     override_arg
         .map(Path::to_path_buf)
         .unwrap_or_else(crate::project::root)
+}
+
+/// `fluxor lint observability` — check the instrumentation contract across
+/// every module manifest. Reports the gap list (data-moving modules with no
+/// `[observability]`); fails only on malformed instrument names
+/// (standards/observability.md §6, §9).
+fn cmd_lint_observability(project_root_override: Option<&Path>, json: bool) -> Result<()> {
+    let root = resolve_project_root(project_root_override);
+    let report = fluxor_tools::observability::lint(&root.join("modules"));
+
+    if json {
+        let payload = serde_json::json!({
+            "scanned": report.scanned,
+            "instrumented": report.instrumented,
+            "uninstrumented": report.uninstrumented,
+            "exempt": report.exempt.iter()
+                .map(|(m, r)| serde_json::json!({ "module": m, "reason": r }))
+                .collect::<Vec<_>>(),
+            "invalid_names": report.invalid_names.iter()
+                .map(|(m, n)| serde_json::json!({ "module": m, "name": n }))
+                .collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        if report.has_errors() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    for (m, n) in &report.invalid_names {
+        eprintln!(
+            "\x1b[1;31mobservability\x1b[0m {m}: invalid instrument name {n:?} \
+             (instrument names are dotted lowercase)"
+        );
+    }
+    for m in &report.uninstrumented {
+        eprintln!(
+            "\x1b[1;33mobservability\x1b[0m {m}: data-moving module declares no \
+             `[observability]` metrics/spans and no `exempt` reason"
+        );
+    }
+    eprintln!(
+        "\x1b[1;32mobservability\x1b[0m {} scanned, {} instrumented, {} exempt, \
+         {} uninstrumented, {} invalid",
+        report.scanned,
+        report.instrumented,
+        report.exempt.len(),
+        report.uninstrumented.len(),
+        report.invalid_names.len(),
+    );
+    if report.has_errors() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `fluxor modules build` — drive the PIC / wasm module pipeline.

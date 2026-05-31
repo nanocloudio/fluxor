@@ -31,7 +31,7 @@ fn fluxor_binary() -> PathBuf {
 }
 
 fn modules_dir() -> PathBuf {
-    project_root().join("target/bcm2712/modules")
+    project_root().join("target/fluxor/bcm2712/modules")
 }
 
 fn skip_if_unconfigured() -> bool {

@@ -33,3 +33,12 @@ content_type = "NetProto"
 name = "peer_identity"
 direction = "output"
 content_type = "OctetStream"
+
+# Module-scope observability (out[3], optional); wired to observe.telemetry.
+[[ports]]
+name = "telemetry"
+direction = "output"
+content_type = "Telemetry"
+
+[observability]
+metrics = ["ecdh_pool_hit", "ecdh_fallback_keygen", "frame_write_dropped"]

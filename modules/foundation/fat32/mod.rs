@@ -498,6 +498,9 @@ struct Fat32State {
     // port: REQ_HDR_SIZE header { op:u32=1, lba:u64, nlb:u32, nsid:u32 }
     // followed by nlb * 512 B payload.
     write_out_chan:    i32,
+    /// Optional telemetry output (out[1]) to the `observe` collector; -1 when
+    /// unwired. Emits `file_count` on the tick cadence.
+    telemetry_chan:    i32,
     /// NVMe namespace id stamped into every WRITE header. `0` forwards
     /// to the consumer's driver-wide default (nvme falls back to its
     /// `namespace` param in that case).
@@ -614,6 +617,7 @@ impl Fat32State {
         self.read_fill = 0;
         self.tick_count = 0;
         self.write_out_chan = -1;
+        self.telemetry_chan = -1;
         self.namespace = 1;
         self.write_state = WS_IDLE;
         self.write_file_len = 0;
@@ -1732,6 +1736,7 @@ pub extern "C" fn module_new(
         // upstream block source; the wiring stays inert when the YAML
         // doesn't connect it.
         s.write_out_chan = dev_channel_port(&*s.syscalls, 1, 0);
+        s.telemetry_chan = dev_channel_port(&*s.syscalls, 1, 1); // out[1]: telemetry (optional)
 
         // Parse params
         let is_tlv = !params.is_null() && params_len >= 4
@@ -1761,6 +1766,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         s.tick_count = s.tick_count.wrapping_add(1);
         if s.tick_count % 5000 == 0 {
+            // Module-scope telemetry: emit the current directory file count to
+            // the `observe` collector (no-op when unwired). id 0 = file_count
+            // per `[observability].metrics`; UpDownCounter since it's a gauge.
+            if s.telemetry_chan >= 0 {
+                let tsys = &*s.syscalls;
+                let me = dev_self_index(tsys);
+                if me >= 0 {
+                    dev_telemetry_metric(
+                        tsys,
+                        s.telemetry_chan,
+                        me as u16,
+                        s.tick_count as u64,
+                        abi::contracts::telemetry::METRIC_UPDOWN,
+                        0,
+                        s.file_count as u64,
+                    );
+                }
+            }
+
             let mut msg = [0u8; 64];
             let p = msg.as_mut_ptr();
             let prefix = b"[fat32] hb init=";

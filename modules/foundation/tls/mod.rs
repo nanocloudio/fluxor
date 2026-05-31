@@ -377,6 +377,9 @@ struct TlsState {
     /// consumer needs it; -1 when the port is unwired makes the
     /// emit a no-op. Channel slot: out[2].
     peer_identity: i32,
+    /// Optional telemetry output (out[3]) to the `observe` collector; -1 when
+    /// unwired. Cumulative crypto/backpressure counters on the 50k cadence.
+    telemetry_chan: i32,
 
     // Pre-computed ephemeral ECDH key pairs (one per session, computed in module_new)
     eph_private: [[u8; 32]; MAX_SESSIONS],
@@ -562,6 +565,7 @@ pub unsafe extern "C" fn module_new(
     s.cipher_out = dev_channel_port(sys, 1, 0);
     s.clear_out = dev_channel_port(sys, 1, 1);
     s.peer_identity = dev_channel_port(sys, 1, 2);
+    s.telemetry_chan = dev_channel_port(sys, 1, 3); // out[3]: telemetry (optional)
 
     // Initialize sessions
     let mut i = 0;
@@ -764,6 +768,46 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // `[tls] hb` heartbeat — same cadence as `[ip] tlm` / `[http] tlm`.
     if s.step_count.is_multiple_of(50_000) {
+        // Module-scope telemetry: emit cumulative crypto-pool / backpressure
+        // counters to the `observe` collector (no-op when unwired). ids follow
+        // `[observability].metrics`: 0=ecdh_pool_hit, 1=ecdh_fallback_keygen,
+        // 2=frame_write_dropped.
+        if s.telemetry_chan >= 0 {
+            let tsys = &*s.syscalls;
+            let me = dev_self_index(tsys);
+            if me >= 0 {
+                let midx = me as u16;
+                let t = s.step_count as u64;
+                let c = abi::contracts::telemetry::METRIC_COUNTER;
+                dev_telemetry_metric(
+                    tsys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    c,
+                    0,
+                    s.ecdh_pool_hit as u64,
+                );
+                dev_telemetry_metric(
+                    tsys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    c,
+                    1,
+                    s.ecdh_fallback_keygen as u64,
+                );
+                dev_telemetry_metric(
+                    tsys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    c,
+                    2,
+                    s.frame_write_dropped as u64,
+                );
+            }
+        }
         let buf = s.net_scratch.as_mut_ptr();
         let buf_max = s.net_scratch.len();
         let mut pos = 0usize;

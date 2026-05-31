@@ -484,6 +484,10 @@ pub struct Manifest {
     /// enforce presentation-group rules. See
     /// `docs/architecture/av_capability_surface.md`.
     pub capabilities: Vec<String>,
+    /// Build-time observability declarations from the `[observability]` table
+    /// (parsed from TOML, not serialized to the binary `.fmod`). Consulted by
+    /// `fluxor lint observability`. See `standards/observability.md` §6.
+    pub observability: Observability,
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
     pub builtin: bool,
@@ -540,6 +544,7 @@ impl Default for Manifest {
             commands: CommandVocabulary::default(),
             provides: Vec::new(),
             capabilities: Vec::new(),
+            observability: Observability::default(),
             builtin: false,
             isr_safe: false,
             pre_tick_drain: false,
@@ -547,6 +552,22 @@ impl Default for Manifest {
             params: Vec::new(),
         }
     }
+}
+
+/// Build-time observability declarations from the `[observability]` manifest
+/// table — the instrument names a module emits, and an optional opt-out reason.
+/// Parsed from TOML, not serialized to the binary `.fmod`. Instrument-name
+/// resolution and the baseline contract are enforced by
+/// `fluxor lint observability`; see `standards/observability.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observability {
+    /// Metric instrument names this module emits (interned per module at build).
+    pub metrics: Vec<String>,
+    /// Span names this module emits.
+    pub spans: Vec<String>,
+    /// When set, the module opts out of the instrumentation contract with a
+    /// stated reason (data-moving modules only).
+    pub exempt: Option<String>,
 }
 
 /// NEON / aarch64 intrinsic substrings that signal an
@@ -885,6 +906,14 @@ impl Manifest {
         let mut capabilities = toml_val.capabilities.unwrap_or_default();
         validate_capability_names(&mut capabilities)?;
 
+        let observability = toml_val
+            .observability
+            .map_or_else(Observability::default, |o| Observability {
+                metrics: o.metrics,
+                spans: o.spans,
+                exempt: o.exempt,
+            });
+
         let builtin = toml_val.builtin.unwrap_or(false);
 
         let raw_params = toml_val.params.unwrap_or_default();
@@ -1047,6 +1076,7 @@ impl Manifest {
             commands,
             provides,
             capabilities,
+            observability,
             builtin,
             isr_safe: toml_val.isr_safe,
             pre_tick_drain: toml_val.pre_tick_drain,
@@ -1293,6 +1323,7 @@ impl Manifest {
             commands: CommandVocabulary::default(),
             provides: Vec::new(),     // not serialized in binary format
             capabilities: Vec::new(), // not serialized in binary format
+            observability: Observability::default(), // not serialized in binary format
             builtin: false,
             isr_safe,
             pre_tick_drain,
@@ -1406,6 +1437,15 @@ pub fn compute_integrity(code: &[u8], data: &[u8]) -> [u8; 32] {
 
 // ── TOML deserialization structs ────────────────────────────────────────────
 
+#[derive(Deserialize, Default)]
+struct TomlObservability {
+    #[serde(default)]
+    metrics: Vec<String>,
+    #[serde(default)]
+    spans: Vec<String>,
+    exempt: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct TomlManifest {
     version: String,
@@ -1423,6 +1463,8 @@ struct TomlManifest {
     /// Role/surface capability strings. Whitelisted by
     /// `CAPABILITY_NAMES`; validated and canonicalized at parse time.
     capabilities: Option<Vec<String>>,
+    /// `[observability]` table — instrument names this module emits.
+    observability: Option<TomlObservability>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,
     /// Author attests ISR-safety. Required for Tier 1b/2 admission.

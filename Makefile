@@ -70,25 +70,24 @@ lint:        fmt-check clippy
 
 # ── Module CLI wrappers ────────────────────────────────────────────────
 #
-# Outputs land at `target/$(SILICON_ID)/modules/<name>.fmod` — the
-# layout `combine` / `run` tooling expects. The newer
-# `target/fluxor/<silicon>/modules/` layout is reachable by dropping
-# the `--out target` flag.
+# Outputs land at `target/fluxor/$(SILICON_ID)/modules/<name>.fmod` — the
+# canonical layout (standards/fluxor-modules.md §2) that the `combine` /
+# `run` tooling, `fluxor sync`, and CI all read from.
 
 modules: tools
-	$(FLUXOR) modules build --target $(TARGET) --out target
+	$(FLUXOR) modules build --target $(TARGET)
 
 modules-all: tools
-	$(FLUXOR) modules build --all --out target
+	$(FLUXOR) modules build --all
 
 modules-clean: tools
-	$(FLUXOR) modules clean --out target
+	$(FLUXOR) modules clean
 
 modules-list: tools
 	@$(FLUXOR) modules list
 
 modules-resolve: tools
-	@$(FLUXOR) modules resolve --target $(TARGET) --out target
+	@$(FLUXOR) modules resolve --target $(TARGET)
 
 # ── Registry publish wrappers ──────────────────────────────────────────
 #

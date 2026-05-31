@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+pub mod observability;
 pub mod vocabulary;
 
 /// Canonical content-type identifiers for the four storage surfaces
@@ -127,6 +128,12 @@ pub const CONTENT_TYPES: &[&str] = &[
     // `[event_kind, channel, data1, data2]`. Producers: browser Web
     // MIDI, Linux ALSA seq, class-compliant USB-MIDI hosts.
     "MidiEvents",
+    // Observability telemetry envelope — fixed-layout `TelemetryRecord`
+    // (`modules/sdk/contracts/telemetry.rs`) carrying one metric or span
+    // signal. Module-scope telemetry flows on this content type to the
+    // `observe` collector; logs ride `log_ring` separately. See
+    // `standards/observability.md`.
+    "Telemetry",
 ];
 
 /// Per-operation fence: the actual guarantee a returning operation

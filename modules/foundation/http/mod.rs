@@ -149,6 +149,9 @@ struct HttpState {
     // instance regardless of role.
     net_in_chan: i32,
     net_out_chan: i32,
+    /// Optional telemetry output (out[3]) to the `observe` collector; -1 when
+    /// unwired. Cumulative counters emitted on the tlm cadence.
+    telemetry_chan: i32,
     net_buf: [u8; NET_BUF_SIZE],
 
     /// Monotonic step counter feeding the tlm cadence.
@@ -494,6 +497,7 @@ pub unsafe extern "C" fn module_new(
         s.mode = MODE_SERVER;
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
+        s.telemetry_chan = dev_channel_port(&*s.syscalls, 1, 3); // out[3]: telemetry (optional)
 
         // Pre-init both modes so the body pool is ready before TLV
         // params (which may call parse_route_body) are dispatched.
@@ -575,6 +579,36 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             scratch_ptr,
             scratch_len,
         );
+
+        // Module-scope telemetry: emit cumulative counters to the `observe`
+        // collector on the tlm cadence (no-op when the telemetry port is
+        // unwired). ids follow `[observability].metrics`: 0=bytes_in, 1=bytes_out.
+        if s.telemetry_chan >= 0 && s.step_count.is_multiple_of(HTTP_TLM_PERIOD) {
+            let me = dev_self_index(sys);
+            if me >= 0 {
+                let midx = me as u16;
+                let t = s.step_count as u64;
+                let counter = abi::contracts::telemetry::METRIC_COUNTER;
+                dev_telemetry_metric(
+                    sys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    counter,
+                    0,
+                    s.tlm.bytes_in as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    counter,
+                    1,
+                    s.tlm.bytes_out as u64,
+                );
+            }
+        }
 
         // Phase-machine snapshot — fires every tlm period so when the
         // server appears unresponsive we can see exactly which Phase

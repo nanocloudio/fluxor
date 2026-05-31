@@ -20,3 +20,12 @@ required = true
 name = "block_writes"
 direction = "output"
 content_type = "OctetStream"
+
+# Module-scope observability (out[1], optional); wired to observe.telemetry.
+[[ports]]
+name = "telemetry"
+direction = "output"
+content_type = "Telemetry"
+
+[observability]
+metrics = ["file_count"]

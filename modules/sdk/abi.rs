@@ -100,6 +100,10 @@ pub mod contracts {
     pub mod fence {
         include!("contracts/fence.rs");
     }
+    /// Observability telemetry envelope (metric / span signals).
+    pub mod telemetry {
+        include!("contracts/telemetry.rs");
+    }
     pub mod storage {
         pub mod graph_slot {
             include!("contracts/storage/graph_slot.rs");

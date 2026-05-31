@@ -7,6 +7,12 @@ direction = "output"
 content_type = "OctetStream"
 required = true
 
+# Module-scope observability (out[1], optional); wired to observe.telemetry.
+[[ports]]
+name = "telemetry"
+direction = "output"
+content_type = "Telemetry"
+
 [[resources]]
 requires_contract = "spi"
 access = "exclusive"
@@ -18,3 +24,6 @@ access = "write"
 [[resources]]
 requires_contract = "timer"
 access = "write"
+
+[observability]
+metrics = ["blocks_read"]

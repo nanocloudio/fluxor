@@ -32,6 +32,7 @@ pub mod manifest;
 pub mod modules;
 pub mod modules_build;
 pub mod monitor;
+pub mod observability;
 pub mod project;
 pub mod project_meta;
 pub mod registry;

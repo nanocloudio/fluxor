@@ -1,0 +1,11 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+permissions = ["monitor", "reconfigure"]
+
+# Module-scope telemetry arrives here as fixed-layout `TelemetryRecord`s
+# (modules/sdk/contracts/telemetry.rs). Kernel-scope signals (step-time
+# histograms, faults) are pulled over the monitor syscalls — no port.
+[[ports]]
+name = "telemetry"
+direction = "input"
+content_type = "Telemetry"

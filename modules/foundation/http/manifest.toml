@@ -46,6 +46,13 @@ index = 3
 direction = "input"
 content_type = "WsFrame"
 
+# Module-scope observability (out[3], optional); wired to observe.telemetry.
+[[ports]]
+name = "telemetry"
+index = 3
+direction = "output"
+content_type = "Telemetry"
+
 [[resources]]
 requires_contract = "channel"
 access = "read"
@@ -56,3 +63,6 @@ access = "read"
 [[resources]]
 requires_contract = "fs"
 access = "read"
+
+[observability]
+metrics = ["bytes_in", "bytes_out"]

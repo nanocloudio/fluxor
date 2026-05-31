@@ -150,3 +150,22 @@ modules = [
   } },
 ]
 wiring = []
+
+# Observability collector: the `observe` module subsumes `monitor` and adds the
+# module-scope signal path. Kernel-scope step histograms (`MON_HIST`) stream
+# immediately; module-scope `MON_METRIC` / `MON_SPAN` light up once an
+# instrumented module's telemetry output is wired to `observe.telemetry`. Emits
+# via the same `log_ring` path, so whatever `to:` transport is active carries it.
+#
+#   platform:
+#     debug:
+#       observe: true
+#       # observe_interval_ms: 5000   # optional; default 5000
+[[overlay]]
+match = { observe = "*" }
+modules = [
+  { name = "observe", params = {
+      interval_ms = "user:observe_interval_ms",
+  } },
+]
+wiring = []

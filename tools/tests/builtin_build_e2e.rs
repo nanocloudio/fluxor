@@ -11,7 +11,7 @@
 //! infrastructure (a built `fluxor-linux`, a populated bcm2712 modules
 //! dir, and possibly hardware).
 //!
-//! Tests are skipped if `target/bcm2712/modules/` is missing — the tool
+//! Tests are skipped if `target/fluxor/bcm2712/modules/` is missing — the tool
 //! pulls .fmod files from there and we can't fail useful tests on a
 //! fresh tree.
 
@@ -39,7 +39,7 @@ fn fluxor_binary() -> PathBuf {
 }
 
 fn modules_dir() -> PathBuf {
-    project_root().join("target/bcm2712/modules")
+    project_root().join("target/fluxor/bcm2712/modules")
 }
 
 fn linux_runtime_binary() -> PathBuf {

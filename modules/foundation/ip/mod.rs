@@ -211,6 +211,9 @@ pub struct IpState {
     // Net protocol channels (consumer ↔ IP)
     net_in_chan: i32,
     net_out_chan: i32,
+    /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
+    /// unwired. Cumulative counters are emitted on the tlm cadence.
+    telemetry_chan: i32,
 
     // Net protocol scratch buffer: NET_FRAME_HDR(3) + conn_id(1) + TCP payload.
     net_scratch: [u8; 1600],
@@ -884,6 +887,7 @@ pub unsafe extern "C" fn module_new(
         let sys = &*s.syscalls;
         s.net_in_chan = dev_channel_port(sys, 0, 1); // in[1]: net commands from consumer
         s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
+        s.telemetry_chan = dev_channel_port(sys, 1, 2); // out[2]: telemetry (optional)
 
         // Parse TLV params
         if !params.is_null() && params_len > 0 {
@@ -982,6 +986,37 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
     // Diagnostic: periodic status (every ~5s at 1ms steps)
     if s.step_count.is_multiple_of(5000) {
+        // Module-scope telemetry: emit cumulative counters to the `observe`
+        // collector when the telemetry port is wired (no-op otherwise). Metric
+        // ids follow `[observability].metrics` order: 0 = bytes_in, 1 = bytes_out.
+        if s.telemetry_chan >= 0 {
+            let tsys = &*s.syscalls;
+            let me = dev_self_index(tsys);
+            if me >= 0 {
+                let midx = me as u16;
+                let t = s.step_count as u64;
+                let counter = abi::contracts::telemetry::METRIC_COUNTER;
+                dev_telemetry_metric(
+                    tsys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    counter,
+                    0,
+                    s.tlm.bytes_in as u64,
+                );
+                dev_telemetry_metric(
+                    tsys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    counter,
+                    1,
+                    s.tlm.bytes_out as u64,
+                );
+            }
+        }
+
         if !s.mac_valid {
             log_info(s, b"[ip] waiting for mac");
         } else {
