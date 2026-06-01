@@ -458,15 +458,24 @@ fn merge_with_board_defaults(
         merged.remove("driver");
     }
 
-    // Inject target metadata (available for matching but not user-set)
+    // Inject target metadata AUTHORITATIVELY. `board` / `family` / `silicon` are
+    // derived facts about the resolved target, not user-tunable knobs — a
+    // user-supplied value (whether a mistake or an attempt to force a mismatched
+    // variant) is overwritten here so overlay/variant matching can't be steered
+    // away from the real hardware. `insert` (not `entry().or_insert`) makes the
+    // injected value win regardless of any earlier user field.
     if let Some(ref board) = target.board_id {
-        merged
-            .entry("board".into())
-            .or_insert_with(|| board.clone());
+        merged.insert("board".into(), board.clone());
     }
-    merged
-        .entry("family".into())
-        .or_insert_with(|| target.family.clone());
+    merged.insert("family".into(), target.family.clone());
+    // `silicon` is the module-artefact silicon id (rp2350a/rp2350b → rp2350,
+    // cm5 → bcm2712). Lets an overlay select a narrower set than `family`
+    // when a module supports only some silicon within a family — e.g. the
+    // OTLP exporter is rp2350-only and must not match rp2040 under `family="rp2"`.
+    merged.insert(
+        "silicon".into(),
+        crate::modules_build::target_to_silicon(&target.id).to_string(),
+    );
 
     merged
 }
@@ -1197,5 +1206,39 @@ mod tests {
         });
         let types = collect_existing_types(&config);
         assert_eq!(types, vec!["ip", "tls", "http"]);
+    }
+
+    fn project_root() -> std::path::PathBuf {
+        // tools/ → project root.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    /// `merge_with_board_defaults` injects a `silicon` key (the module-artefact
+    /// silicon id) so overlays can select a narrower set than `family`. The
+    /// OTLP overlay relies on this to match rp2350 boards but not rp2040
+    /// (both are `family="rp2"`, but otlp_http is rp2350-only).
+    #[test]
+    fn merged_injects_silicon_id_distinct_from_family() {
+        let root = project_root();
+        let rp2350 = crate::target::load_target("pico2w", &root).unwrap();
+        let merged = merge_with_board_defaults(&json!({}), "debug", &rp2350);
+        assert_eq!(merged.get("family"), Some(&"rp2".to_string()));
+        assert_eq!(
+            merged.get("silicon"),
+            Some(&"rp2350".to_string()),
+            "rp2350a board collapses to the rp2350 module silicon"
+        );
+
+        let rp2040 = crate::target::load_target("pico", &root).unwrap();
+        let merged = merge_with_board_defaults(&json!({}), "debug", &rp2040);
+        assert_eq!(merged.get("family"), Some(&"rp2".to_string()));
+        assert_eq!(
+            merged.get("silicon"),
+            Some(&"rp2040".to_string()),
+            "rp2040 stays distinct so the OTLP `silicon=rp2350` overlay skips it"
+        );
     }
 }

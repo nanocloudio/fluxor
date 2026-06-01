@@ -197,6 +197,15 @@ struct TlsSession {
     /// downstream so HTTP parents under it.
     trace_ctx_trace: [u8; 16],
     trace_ctx_parent: [u8; 8],
+    /// W3C trace-flags byte latched from IP's `MSG_TRACE_CTX` (low bit =
+    /// `sampled`), re-emitted downstream so the sampling decision survives.
+    trace_ctx_flags: u8,
+    /// Original downstream requester tag for a TLS-mediated CLIENT connect — the
+    /// tag the clear-side consumer put on its `CMD_CONNECT` before TLS rewrote it
+    /// to TLS's own tag toward IP. Echoed when TLS forwards `MSG_CONNECTED`
+    /// downstream so the original requester routes it on a fanned clear_out.
+    /// `0` for inbound (server) sessions.
+    downstream_tag: u8,
     span_id: [u8; 8],
 }
 
@@ -226,6 +235,8 @@ impl TlsSession {
             span_start_us: 0,
             trace_ctx_trace: [0; 16],
             trace_ctx_parent: [0; 8],
+            trace_ctx_flags: 0,
+            downstream_tag: 0,
             span_id: [0; 8],
         }
     }
@@ -260,6 +271,8 @@ impl TlsSession {
         self.span_start_us = 0;
         self.trace_ctx_trace = [0; 16];
         self.trace_ctx_parent = [0; 8];
+        self.trace_ctx_flags = 0;
+        self.downstream_tag = 0;
         self.span_id = [0; 8];
         self.read_keys = TrafficKeys::empty();
         self.write_keys = TrafficKeys::empty();
@@ -419,6 +432,16 @@ struct TlsState {
     /// back-pressuring TLS. Emitted on the `[tls] hb` line.
     frame_write_dropped: u32,
 
+    /// Downstream requester tag of the in-flight clear-side `CMD_CONNECT`,
+    /// transferred to a session's `downstream_tag` on `MSG_CONNECTED` or used to
+    /// translate a connect-failure `MSG_ERROR` back downstream.
+    pending_downstream_tag: u8,
+    /// True while a clear-side `CMD_CONNECT` is forwarded but not yet completed
+    /// (`MSG_CONNECTED` or `MSG_ERROR`). TLS serialises outbound connects through
+    /// its single tag, so a SECOND concurrent connect is rejected with EAGAIN
+    /// (translated downstream) rather than silently overwriting the pending slot.
+    pending_connect_active: bool,
+
     // Certificate and key (DER-encoded, loaded from params)
     cert: [u8; MAX_CERT_LEN],
     cert_len: usize,
@@ -565,6 +588,8 @@ pub unsafe extern "C" fn module_new(
     s.ecdh_pool_hit = 0;
     s.ecdh_fallback_keygen = 0;
     s.frame_write_dropped = 0;
+    s.pending_downstream_tag = 0;
+    s.pending_connect_active = false;
     s.transport = TRANSPORT_TCP;
     s.dtls_listen_ep = -1;
     s.dtls_port = 4433;
@@ -944,43 +969,93 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     } else {
                         0
                     };
-                    // Allocate session for this connection
-                    match alloc_session_for_conn(s, conn_id) {
-                        Some(idx) => {
-                            s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
-                            s.sessions[idx].held_msg_type = t;
-                            s.sessions[idx].state = SessionState::Handshaking;
-                            // Observability: start the `tls.handshake` span and
-                            // mint this session's own span id (used for the span
-                            // AND forwarded downstream so HTTP parents under it).
-                            // Gated on a wired telemetry port — no clock read,
-                            // no span, when tracing is off.
-                            if s.telemetry_chan >= 0 {
-                                let sys = &*s.syscalls;
-                                let now = dev_micros(sys);
-                                s.sessions[idx].span_start_us = if now == 0 { 1 } else { now };
-                                dev_csprng_fill(sys, s.sessions[idx].span_id.as_mut_ptr(), 8);
+                    // Stream-surface routing: `MSG_CONNECTED` carries a requester
+                    // tag at payload[1]. When `ip.net_out` is fanned to TLS plus
+                    // another stream consumer (e.g. an OTLP exporter), claim an
+                    // outbound connect ONLY if its tag is ours (or untagged, for
+                    // single-consumer / legacy graphs) — otherwise it belongs to
+                    // the other consumer and starting a handshake on its plaintext
+                    // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
+                    // unaffected: TLS is the sole accept-claimant on its channel.
+                    let claim = if t == NET_MSG_CONNECTED {
+                        let tag = if pl >= 2 { payload[1] } else { 0 };
+                        let me = dev_requester_tag(sys);
+                        tag == 0 || tag == me
+                    } else {
+                        true
+                    };
+                    // Allocate a session only for connections we claim. A
+                    // MSG_CONNECTED tagged for another consumer is consumed
+                    // (frame already read) but otherwise ignored.
+                    if claim {
+                        match alloc_session_for_conn(s, conn_id) {
+                            Some(idx) => {
+                                s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
+                                s.sessions[idx].held_msg_type = t;
+                                s.sessions[idx].state = SessionState::Handshaking;
+                                // For a client connect, carry the clear-side
+                                // consumer's original tag so the forwarded
+                                // MSG_CONNECTED routes back to it. Accepts: 0.
+                                s.sessions[idx].downstream_tag = if t == NET_MSG_CONNECTED {
+                                    let dt = s.pending_downstream_tag;
+                                    s.pending_downstream_tag = 0;
+                                    s.pending_connect_active = false; // connect completed
+                                    dt
+                                } else {
+                                    0
+                                };
+                                // Observability: start the `tls.handshake` span and
+                                // mint this session's own span id (used for the span
+                                // AND forwarded downstream so HTTP parents under it).
+                                // Gated on a wired telemetry port — no clock read,
+                                // no span, when tracing is off.
+                                if s.telemetry_chan >= 0 {
+                                    let sys = &*s.syscalls;
+                                    let now = dev_micros(sys);
+                                    s.sessions[idx].span_start_us = if now == 0 { 1 } else { now };
+                                    dev_csprng_fill(sys, s.sessions[idx].span_id.as_mut_ptr(), 8);
+                                }
+                                if s.sessions[idx].driver.is_server {
+                                    s.sessions[idx].driver.hs_state =
+                                        HandshakeState::RecvClientHello;
+                                } else {
+                                    s.sessions[idx].driver.hs_state =
+                                        HandshakeState::SendClientHello;
+                                }
+                                init_session_crypto(s, idx);
                             }
-                            if s.sessions[idx].driver.is_server {
-                                s.sessions[idx].driver.hs_state = HandshakeState::RecvClientHello;
-                            } else {
-                                s.sessions[idx].driver.hs_state = HandshakeState::SendClientHello;
+                            None => {
+                                // No session slots — close the socket upstream
+                                // (best-effort; a full channel still RSTs/times
+                                // out on the peer).
+                                let _ = tls_write_or_count(
+                                    s,
+                                    s.cipher_out,
+                                    NET_CMD_CLOSE,
+                                    conn_id,
+                                    core::ptr::null(),
+                                    0,
+                                );
+                                // For a CLIENT connect the clear-side requester is
+                                // waiting on this completion — emit a TAGGED
+                                // terminal failure downstream and clear the pending
+                                // slot so it doesn't wedge. (Accepts aren't visible
+                                // downstream until the held handshake completes.)
+                                if t == NET_MSG_CONNECTED {
+                                    let dtag = s.pending_downstream_tag;
+                                    s.pending_connect_active = false;
+                                    s.pending_downstream_tag = 0;
+                                    let err = [(-12i8) as u8, dtag]; // ENOMEM + tag
+                                    let _ = tls_write_or_count(
+                                        s,
+                                        s.clear_out,
+                                        NET_MSG_ERROR,
+                                        conn_id,
+                                        err.as_ptr(),
+                                        err.len() as u16,
+                                    );
+                                }
                             }
-                            init_session_crypto(s, idx);
-                        }
-                        None => {
-                            // No session slots — best-effort close
-                            // notification upstream; if the channel
-                            // is full the peer notices via TCP RST
-                            // or timeout.
-                            let _ = tls_write_or_count(
-                                s,
-                                s.cipher_out,
-                                NET_CMD_CLOSE,
-                                conn_id,
-                                core::ptr::null(),
-                                0,
-                            );
                         }
                     }
                 }
@@ -1073,7 +1148,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     );
                 }
                 t if t == NET_MSG_BOUND || t == NET_MSG_ERROR => {
-                    // Pass through unchanged to clear_out
                     let pl = payload_len as usize;
                     let rd = if pl < NET_SCRATCH_SIZE {
                         pl
@@ -1086,7 +1160,38 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if pl > rd {
                         tls_discard(sys, s.cipher_in, pl - rd);
                     }
-                    tls_write_raw_frame(sys, s.clear_out, t, s.net_scratch.as_ptr(), rd as u16);
+                    // MSG_ERROR `[conn_id][errno][tag]` carries IP's tag (TLS's own
+                    // tag). TRANSLATE it to the original downstream tag so the
+                    // clear-side requester recognises the failure — otherwise it
+                    // ignores the error and waits for a timeout. For an established
+                    // conn the tag comes from its session; for a connect failure
+                    // (no session yet) from the pending connect slot. MSG_BOUND has
+                    // no tag and passes through unchanged.
+                    let mut forward = true;
+                    if t == NET_MSG_ERROR && rd >= 3 {
+                        let conn_id = s.net_scratch[0];
+                        let in_tag = s.net_scratch[2]; // IP-echoed requester tag
+                        let si = find_session_by_conn_id(s, conn_id);
+                        if si >= 0 {
+                            // Established-connection error → its session's tag.
+                            s.net_scratch[2] = s.sessions[si as usize].downstream_tag;
+                        } else if s.pending_connect_active && in_tag == dev_requester_tag(sys) {
+                            // A CONNECT failure routed to TLS carries TLS's own
+                            // tag (TLS stamped it). Only THEN consume the pending
+                            // slot — a co-wired consumer's failure (different tag)
+                            // must not cancel our connect.
+                            s.pending_connect_active = false;
+                            s.net_scratch[2] = s.pending_downstream_tag;
+                            s.pending_downstream_tag = 0;
+                        } else {
+                            // Another consumer's error on the shared fan, or an
+                            // error for a conn we don't own — not for HTTP. Drop.
+                            forward = false;
+                        }
+                    }
+                    if forward {
+                        tls_write_raw_frame(sys, s.clear_out, t, s.net_scratch.as_ptr(), rd as u16);
+                    }
                 }
                 t if t == NET_MSG_ACK => {
                     // Payload: [conn_id:1][acked_seq:4 LE].
@@ -1162,6 +1267,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.sessions[idx]
                                 .trace_ctx_parent
                                 .copy_from_slice(&pbuf[17..25]);
+                            s.sessions[idx].trace_ctx_flags = pbuf[25];
                         }
                     }
                 }
@@ -1303,9 +1409,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     );
                 }
                 t if t == NET_CMD_BIND || t == NET_CMD_CONNECT => {
-                    // Pass through unchanged to cipher_out
+                    // Forward to cipher_out (toward IP). For CMD_CONNECT, STAMP
+                    // the requester tag (byte 7) with TLS's own module index so
+                    // IP echoes it in MSG_CONNECTED and TLS — not a co-wired
+                    // exporter sharing ip.net_out — claims the resulting outbound
+                    // connection. CMD_BIND passes through unchanged.
                     let pl = payload_len as usize;
-                    let rd = if pl < NET_SCRATCH_SIZE {
+                    let mut rd = if pl < NET_SCRATCH_SIZE {
                         pl
                     } else {
                         NET_SCRATCH_SIZE
@@ -1316,7 +1426,59 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if pl > rd {
                         tls_discard(sys, s.clear_in, pl - rd);
                     }
-                    tls_write_raw_frame(sys, s.cipher_out, t, s.net_scratch.as_ptr(), rd as u16);
+                    let mut forward = true;
+                    // For a CMD_CONNECT we're about to forward: the downstream tag
+                    // to latch, deferred until the upstream write actually lands.
+                    let mut arm_pending: Option<u8> = None;
+                    if t == NET_CMD_CONNECT && rd >= 7 && rd < NET_SCRATCH_SIZE {
+                        let new_tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
+                        if s.pending_connect_active {
+                            // SERIALIZE: a connect is already in flight and TLS
+                            // routes all mediated connects through its single tag,
+                            // so a second concurrent connect would clobber the
+                            // pending correlation. Reject it downstream with EAGAIN
+                            // (translated to the new request's tag) and DON'T
+                            // forward — the clear-side consumer retries.
+                            let err = [(-11i8) as u8, new_tag]; // EAGAIN + downstream tag
+                            let _ = tls_write_or_count(
+                                s,
+                                s.clear_out,
+                                NET_MSG_ERROR,
+                                0,
+                                err.as_ptr(),
+                                err.len() as u16,
+                            );
+                            forward = false;
+                        } else {
+                            // Remember the clear-side consumer's original tag, then
+                            // overwrite byte 7 with TLS's own tag so IP routes the
+                            // completion to TLS. Defer marking the connect pending
+                            // until the forward below actually succeeds.
+                            if rd == 7 {
+                                rd = 8;
+                            }
+                            s.net_scratch[7] = dev_requester_tag(sys);
+                            arm_pending = Some(new_tag);
+                        }
+                    }
+                    if forward {
+                        let wrote = tls_write_raw_frame(
+                            sys,
+                            s.cipher_out,
+                            t,
+                            s.net_scratch.as_ptr(),
+                            rd as u16,
+                        );
+                        // Latch pending ONLY after the connect was actually
+                        // written upstream — a dropped write must not wedge the
+                        // single pending slot (the consumer retries).
+                        if wrote {
+                            if let Some(dtag) = arm_pending {
+                                s.pending_downstream_tag = dtag;
+                                s.pending_connect_active = true;
+                            }
+                        }
+                    }
                 }
                 _ => {
                     tls_discard(sys, s.clear_in, payload_len as usize);
@@ -1330,8 +1492,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // ── Phase 4: For Ready sessions, try to decrypt any buffered data ──
     i = 0;
     while i < MAX_SESSIONS {
-        if s.sessions[i].state == SessionState::Ready && s.sessions[i].recv_len >= 5 {
-            try_decrypt_forward(s, i);
+        if s.sessions[i].state == SessionState::Ready {
+            // Retry any held completion that a back-pressured clear_out dropped
+            // at handshake-complete, so the consumer always learns of the accept.
+            if s.sessions[i].held_msg_type != 0 {
+                forward_held_completion(s, i);
+            }
+            if s.sessions[i].recv_len >= 5 {
+                try_decrypt_forward(s, i);
+            }
         }
         i += 1;
     }
@@ -1389,6 +1558,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 /// `[observability].spans` entry.
 #[inline(never)]
 unsafe fn emit_handshake_span(s: &mut TlsState, idx: usize, ok: bool) {
+    // Head-sampling gate FIRST — before any clock read or RNG. A propagated
+    // context carries the ingress decision in its flags; a root (no propagation)
+    // is sampled. An unsampled flow emits nothing (RFC observability §sampling).
+    let propagated = s.sessions[idx].trace_ctx_trace != [0u8; 16];
+    let eff_flags = if propagated {
+        s.sessions[idx].trace_ctx_flags
+    } else {
+        abi::contracts::telemetry::TRACE_FLAGS_SAMPLED
+    };
+    if eff_flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0 {
+        return;
+    }
     let sys = &*s.syscalls;
     let me = dev_self_index(sys);
     if me < 0 {
@@ -1401,10 +1582,11 @@ unsafe fn emit_handshake_span(s: &mut TlsState, idx: usize, ok: bool) {
         trace_id: [0u8; 16],
         span_id: s.sessions[idx].span_id,
         parent_id: [0u8; 8],
+        flags: eff_flags,
     };
     // A non-zero received trace id means IP propagated context — join its trace
     // under IP's span; otherwise this handshake is its own root.
-    if s.sessions[idx].trace_ctx_trace != [0u8; 16] {
+    if propagated {
         ctx.trace_id = s.sessions[idx].trace_ctx_trace;
         ctx.parent_id = s.sessions[idx].trace_ctx_parent;
     } else {
@@ -2445,6 +2627,27 @@ unsafe fn pump_recv_client_finished(s: &mut TlsState, idx: usize) -> bool {
     pump_recv_client_finished_core(&mut s.sessions[idx].driver)
 }
 
+/// Forward a session's held `MSG_ACCEPTED` / `MSG_CONNECTED` to clear_out,
+/// clearing the latch ONLY if the write lands. A dropped completion stays
+/// latched and is retried per-step (the Ready-session loop) so the clear-side
+/// consumer is never stranded waiting for the accept.
+unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
+    let held = s.sessions[idx].held_msg_type;
+    if held == 0 {
+        return;
+    }
+    let conn_id = s.sessions[idx].conn_id;
+    let ok = if held == NET_MSG_CONNECTED {
+        let dtag = [s.sessions[idx].downstream_tag];
+        tls_write_or_count(s, s.clear_out, held, conn_id, dtag.as_ptr(), 1)
+    } else {
+        tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0)
+    };
+    if ok {
+        s.sessions[idx].held_msg_type = 0;
+    }
+}
+
 unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
@@ -2464,20 +2667,20 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         b"[tls] handshake complete".len(),
     );
     emit_peer_identity(s, idx);
-    let held = s.sessions[idx].held_msg_type;
     let conn_id = s.sessions[idx].conn_id;
-    if held != 0 {
-        s.sessions[idx].held_msg_type = 0;
-        // Forward the held NET_MSG_ACCEPTED / NET_MSG_CONNECTED
-        // tag now that the handshake is complete. Best-effort:
-        // HTTP times out on no traffic if this drops.
-        let _ = tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0);
+    if s.sessions[idx].held_msg_type != 0 {
+        // Forward the held NET_MSG_ACCEPTED / NET_MSG_CONNECTED now that the
+        // handshake is complete. Clear the latch ONLY if the write lands — a
+        // dropped completion is retried per-step (see the Ready-session loop) so
+        // the clear-side consumer is never stranded waiting for the accept.
+        forward_held_completion(s, idx);
         // Observability: forward IP's trace context to HTTP immediately AFTER
         // the accept, parented under this session's own span id, so HTTP's slot
         // exists when it arrives. Only when IP propagated a trace.
         if s.telemetry_chan >= 0 && s.sessions[idx].trace_ctx_trace != [0u8; 16] {
             let trace = s.sessions[idx].trace_ctx_trace;
             let own = s.sessions[idx].span_id;
+            let flags = s.sessions[idx].trace_ctx_flags;
             let sys = &*s.syscalls;
             let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
             dev_net_send_trace_ctx(
@@ -2486,6 +2689,7 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
                 conn_id,
                 &trace,
                 &own,
+                flags,
                 scratch.as_mut_ptr(),
                 scratch.len(),
             );
@@ -2966,17 +3170,19 @@ unsafe fn retx_replay(s: &mut TlsState, idx: usize, from_seq: u32) {
 /// Write a raw net_proto frame (no conn_id prefix — used for pass-through).
 /// Payload must already be in a buffer that can be prepended with a 3-byte
 /// header. Uses a stack buffer to assemble atomically.
+/// Returns true iff the full frame was written to `chan` (used to gate pending
+/// connect state on a successful upstream write).
 unsafe fn tls_write_raw_frame(
     sys: &SyscallTable,
     chan: i32,
     msg_type: u8,
     payload: *const u8,
     payload_len: u16,
-) {
+) -> bool {
     let frame_len = 3 + payload_len as usize;
     let mut frame = [0u8; 256];
     if frame_len > 256 {
-        return;
+        return false;
     }
     frame[0] = msg_type;
     frame[1] = payload_len as u8;
@@ -2984,7 +3190,7 @@ unsafe fn tls_write_raw_frame(
     if payload_len > 0 && !payload.is_null() {
         core::ptr::copy_nonoverlapping(payload, frame.as_mut_ptr().add(3), payload_len as usize);
     }
-    (sys.channel_write)(chan, frame.as_ptr(), frame_len);
+    (sys.channel_write)(chan, frame.as_ptr(), frame_len) == frame_len as i32
 }
 
 /// Discard bytes from a channel.
@@ -3114,3 +3320,39 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
 // `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
 include!("../../sdk/wasm_entry.rs");
+
+// ============================================================================
+// Test helpers (host-test feature only)
+// ============================================================================
+
+#[cfg(feature = "host-test")]
+pub mod test_helpers {
+    //! Host-side introspection for the harness. Not compiled into PIC firmware.
+
+    use super::{SessionState, TlsState};
+
+    /// Count sessions that are not Idle — i.e. allocated for a connection.
+    /// A claimed `MSG_ACCEPTED` / `MSG_CONNECTED` allocates one; an ignored
+    /// (foreign-tagged) `MSG_CONNECTED` allocates none.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState` (post-`module_new`).
+    pub unsafe fn active_session_count(state: *const u8) -> usize {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .filter(|sess| sess.state != SessionState::Idle)
+            .count()
+    }
+
+    /// True if some session is bound to `conn_id` (claimed it).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn has_session_for_conn(state: *const u8, conn_id: u8) -> bool {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .any(|sess| sess.state != SessionState::Idle && sess.conn_id == conn_id)
+    }
+}

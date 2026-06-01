@@ -72,9 +72,12 @@ const NET_CMD_CONNECT: u8 = 0x13;
 
 // Buffer sizes
 const TX_BUF_SIZE: usize = 256;
-const RX_BUF_SIZE: usize = 256;
+/// Reassembly buffer. Sized to hold a full MAX_DATA_FRAGMENT (1460) TCP segment
+/// plus headroom, because TCP legitimately coalesces several small MQTT packets
+/// into one fragment — failing on those would reconnect on valid traffic.
+const RX_BUF_SIZE: usize = 2048;
 const CHAN_BUF_SIZE: usize = 192;
-const NET_BUF_SIZE: usize = 600;
+const NET_BUF_SIZE: usize = 1600; // > one TCP MSS (~1460) so a full segment fits
 
 // Param layout sizes
 const MAX_CLIENT_ID_LEN: usize = 32;
@@ -193,7 +196,10 @@ struct MqttState {
     subscribe_topic_len: u8,
     publish_topic_len: u8,
     conn_id: u8,
-    _pad: u8,
+    /// 1 once `MSG_CONNECTED` established the TCP connection — connection
+    /// PRESENCE tracked separately from `conn_id`'s value because IP may assign
+    /// conn_id 0 (keying off `conn_id != 0` would leak the first connection).
+    conn_present: u8,
 
     // State machine
     phase: MqttPhase,
@@ -522,7 +528,7 @@ unsafe fn process_rx_packet(s: &mut MqttState) -> usize {
                     }
                 } else {
                     log_err(s, b"[mqtt] connack rejected");
-                    s.phase = MqttPhase::Reconnect;
+                    enter_reconnect(s);
                 }
             }
         }
@@ -540,7 +546,7 @@ unsafe fn process_rx_packet(s: &mut MqttState) -> usize {
                     }
                 } else {
                     log_err(s, b"[mqtt] sub rejected");
-                    s.phase = MqttPhase::Reconnect;
+                    enter_reconnect(s);
                 }
             }
         }
@@ -615,33 +621,71 @@ unsafe fn handle_rx(s: &mut MqttState) {
     }
 
     let nbuf = s.net_buf.as_mut_ptr();
-    let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
+    // Alignment-safe: net_in may be fanned to other consumers whose frames can
+    // exceed our scratch; the reader drains the tail to keep the FIFO aligned and
+    // reports the FULL payload length so we can detect a truncated segment.
+    let (msg_type, payload_len, full) =
+        net_read_frame_aligned(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
+
+    // Established-stream isolation: only act on frames for OUR connection.
+    if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
+        && payload_len >= 1
+        && *nbuf.add(NET_FRAME_HDR) != s.conn_id
+    {
+        return;
+    }
 
     if msg_type == NET_MSG_CLOSED || msg_type == NET_MSG_ERROR {
         log_err(s, b"[mqtt] connection lost");
-        s.phase = MqttPhase::Reconnect;
+        enter_reconnect(s); // CMD_CLOSE + state reset + backoff
         return;
     }
 
     if msg_type == NET_MSG_DATA && payload_len > 1 {
-        // Payload: [conn_id][data...]
-        // Skip conn_id byte, copy data into rx_buf
+        // Payload: [conn_id][data...]. A net-level truncation (`full > payload_len`,
+        // frame bigger than our scratch) means the byte stream is unrecoverable.
+        if full > payload_len {
+            log_err(s, b"[mqtt] truncated segment; dropping connection");
+            enter_reconnect(s);
+            return;
+        }
         let data_len = payload_len - 1;
-        let copy_len = if data_len < space { data_len } else { space };
+
+        // INCREMENTAL DRAIN: process already-buffered complete MQTT packets
+        // first, freeing the maximum reassembly space before admitting this
+        // segment. TCP coalesces several small packets into one fragment (up to
+        // MAX_DATA_FRAGMENT), and that's valid — never reconnect over it.
+        loop {
+            let consumed = process_rx_packet(s);
+            if consumed == 0 {
+                break;
+            }
+            compact_rx(s, consumed);
+        }
+        let space = RX_BUF_SIZE - s.rx_have as usize;
+        if data_len > space {
+            // Even drained, a single MQTT packet exceeds rx_buf — genuinely too
+            // big for this minimal client. Reconnect rather than mis-parse.
+            log_err(s, b"[mqtt] oversized packet; dropping connection");
+            enter_reconnect(s);
+            return;
+        }
         let src = nbuf.add(NET_FRAME_HDR + 1); // skip frame hdr + conn_id
         let dst = s.rx_buf.as_mut_ptr().add(s.rx_have as usize);
         let mut i = 0;
-        while i < copy_len {
+        while i < data_len {
             *dst.add(i) = *src.add(i);
             i += 1;
         }
-        s.rx_have += copy_len as u16;
+        s.rx_have += data_len as u16;
         s.last_activity_ms = millis(s);
 
-        // Process as many complete MQTT packets as possible
+        // Process the newly-coalesced packets.
         loop {
             let consumed = process_rx_packet(s);
-            if consumed == 0 { break; }
+            if consumed == 0 {
+                break;
+            }
             compact_rx(s, consumed);
         }
     }
@@ -735,7 +779,7 @@ unsafe fn handle_keepalive(s: &mut MqttState) {
     // Check for broker silence (2x keepalive = dead)
     if now.wrapping_sub(s.last_activity_ms) >= interval_ms * 2 {
         log_err(s, b"[mqtt] broker timeout");
-        s.phase = MqttPhase::Reconnect;
+        enter_reconnect(s);
     }
 }
 
@@ -756,8 +800,8 @@ unsafe fn check_net_health(s: &mut MqttState) {
 // ============================================================================
 
 unsafe fn enter_reconnect(s: &mut MqttState) {
-    // Send CMD_CLOSE for current connection
-    if s.conn_id != 0 && s.net_out_chan >= 0 {
+    // Send CMD_CLOSE for current connection (presence, not conn_id != 0).
+    if s.conn_present != 0 && s.net_out_chan >= 0 {
         let sys = &*s.syscalls;
         let mut payload = [0u8; 1];
         payload[0] = s.conn_id;
@@ -767,6 +811,7 @@ unsafe fn enter_reconnect(s: &mut MqttState) {
             s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
         );
         s.conn_id = 0;
+        s.conn_present = 0;
     }
 
     // Reset RX/TX state
@@ -832,6 +877,7 @@ pub extern "C" fn module_new(
         s.mesh_in_chan = dev_channel_port(sys, 0, 1);  // in[1]: from mesh
         s.mesh_out_chan = dev_channel_port(sys, 1, 1); // out[1]: to mesh
         s.conn_id = 0;
+        s.conn_present = 0;
 
         // Parse params
         let is_tlv = !params.is_null() && params_len >= 4
@@ -924,8 +970,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.phase = MqttPhase::Error;
                         return -1;
                     }
-                    // Send CMD_CONNECT: [sock_type:u8][ip:u32 LE][port:u16 LE]
-                    let mut payload = [0u8; 7];
+                    // CMD_CONNECT: [sock_type][ip:4][port:2][requester_tag].
+                    // The tag (our module index) lets us claim only our own
+                    // MSG_CONNECTED on an ip.net_out fanned to other consumers.
+                    let mut payload = [0u8; 8];
                     payload[0] = SOCK_TYPE_STREAM;
                     let ip_bytes = s.broker_ip.to_le_bytes();
                     *payload.as_mut_ptr().add(1) = *ip_bytes.as_ptr();
@@ -934,9 +982,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     *payload.as_mut_ptr().add(4) = *ip_bytes.as_ptr().add(3);
                     *payload.as_mut_ptr().add(5) = (s.broker_port & 0xFF) as u8;
                     *payload.as_mut_ptr().add(6) = (s.broker_port >> 8) as u8;
+                    *payload.as_mut_ptr().add(7) = dev_requester_tag(sys);
                     let wrote = net_write_frame(
                         sys, s.net_out_chan, NET_CMD_CONNECT,
-                        payload.as_ptr(), 7,
+                        payload.as_ptr(), 8,
                         s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
                     );
                     if wrote == 0 { return 0; } // channel full, retry next tick
@@ -952,16 +1001,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let nbuf = s.net_buf.as_mut_ptr();
                         let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
                         if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                            // Claim only our own outbound connection by tag.
+                            let tag = if payload_len >= 2 { *nbuf.add(NET_FRAME_HDR + 1) } else { 0 };
+                            let me = dev_requester_tag(sys);
+                            if tag != 0 && tag != me {
+                                return 0; // another consumer's connection.
+                            }
                             s.conn_id = *nbuf.add(NET_FRAME_HDR);
+                            s.conn_present = 1;
                             log_msg(s, b"[mqtt] tcp connected");
                             s.phase = MqttPhase::MqttConnect;
                             continue;
                         }
-                        if msg_type == NET_MSG_ERROR || msg_type == NET_MSG_CLOSED {
-                            log_err(s, b"[mqtt] connect rejected");
-                            enter_reconnect(s);
+                        if msg_type == NET_MSG_ERROR {
+                            // Connect failure carries our tag at payload[2]
+                            // ([conn_id][errno][tag]); ignore another consumer's.
+                            let etag = if payload_len >= 3 { *nbuf.add(NET_FRAME_HDR + 2) } else { 0 };
+                            if etag == 0 || etag == dev_requester_tag(sys) {
+                                log_err(s, b"[mqtt] connect rejected");
+                                enter_reconnect(s);
+                            }
                             return 0;
                         }
+                        // A MSG_CLOSED here is NOT ours: we have no conn_id yet
+                        // (still awaiting MSG_CONNECTED), so any close on the
+                        // fanned net_in belongs to another connection — ignore it
+                        // rather than treat it as our own rejection.
                     }
                     // Timeout
                     if dev_millis(sys).wrapping_sub(s.state_start_ms) >= CONNECT_TIMEOUT_MS {

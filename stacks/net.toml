@@ -5,7 +5,7 @@ name = "net"
 match = { board = "qemu-virt", phy = "ethernet", driver = "virtio_net" }
 modules = [
   { name = "virtio_net" },
-  { name = "ip", params = { use_dhcp = "1" } },
+  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [
   "virtio_net.frames_rx -> ip.frames_rx",
@@ -17,7 +17,7 @@ match = { board = "pico2w", phy = "wifi", driver = "cyw43" }
 modules = [
   { name = "cyw43" },
   { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
-  { name = "ip", params = { use_dhcp = "1" } },
+  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [
   "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
@@ -32,7 +32,7 @@ match = { board = "picow", phy = "wifi", driver = "cyw43" }
 modules = [
   { name = "cyw43" },
   { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
-  { name = "ip", params = { use_dhcp = "1" } },
+  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [
   "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
@@ -47,7 +47,7 @@ match = { board = "cm5", phy = "ethernet", driver = "rp1_gem" }
 modules = [
   { name = "rp1_gem" },
   { name = "conn_guard" },
-  { name = "ip", params = { use_dhcp = "1" } },
+  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 # RX path passes through conn_guard for SYN-flood admission control.
 # TX path goes direct from ip back to the NIC (no per-egress filtering).

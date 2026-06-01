@@ -571,7 +571,9 @@ pub struct ModuleEntry {
     /// Tee/merge framing mode (`FRAME_KIND_*` from `module_types`).
     /// `FRAME_KIND_NONE` (0) is best-effort byte-stream forwarding;
     /// `FRAME_KIND_ETH` (1) parses `[len:u16][payload]`;
-    /// `FRAME_KIND_NET` (2) parses `[msg_type:u8][len:u16][payload]`.
+    /// `FRAME_KIND_NET` (2) parses `[msg_type:u8][len:u16][payload]`;
+    /// `FRAME_KIND_TELEMETRY` (3) sizes a `TelemetryRecord` from its
+    /// `signal`+`kind` prefix.
     /// Set by `insert_fan` for ports that carry framed protocols;
     /// ignored for any other module type.
     pub frame_kind: u8,

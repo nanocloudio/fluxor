@@ -235,22 +235,39 @@ wiring = [
 # `export_telemetry: otlp` inserts `otlp_http` — the OTLP/HTTP (JSON) exporter.
 # It opens an outbound TCP connection to an OTLP/HTTP collector and POSTs metrics
 # as OpenTelemetry Protocol JSON to `/v1/metrics`, resolving `(module,id)` names
-# on-device, so no host decoder is needed (unlike `udp`). bcm/rp2 only (the
-# module is heavier than the UDP exporter). The compiler injects the per-config
+# on-device, so no host decoder is needed (unlike `udp`). bcm/rp2350 only (the
+# module is heavier than the UDP exporter — rp2040 is excluded). The compiler injects the per-config
 # id-table param; you still wire each instrumented source's telemetry output.
 #
 #   platform:
 #     debug:
 #       export_telemetry: otlp
+#       export_epoch_sec: 1717200000  # REQUIRED — Unix seconds at boot (anchor)
 #       # export_dst_ip: "0xC0A80A0A"   # else host.toml debug.collector_ip
 #       # export_dst_port: 4318         # OTLP/HTTP port
+#
+# `epoch_sec` is `|required`: OTLP needs Unix-epoch `timeUnixNano`, which the
+# device can't synthesise from boot-relative micros, so a config WITHOUT an
+# epoch anchor FAILS validation here rather than validating and then disabling
+# the exporter at runtime. Supply a boot-synchronised value via the platform key
+# or `host.toml debug.otlp_epoch_sec`.
+#
+# NOTE: a reusable STATIC graph cannot inherently carry a true "Unix seconds at
+# boot" — a fixed `epoch_sec` baked into the config is only correct for the boot
+# it was generated for. Production OTLP needs a boot-time INJECTION path (the
+# flasher/launcher stamps `epoch_sec` from the host clock at deploy) or an
+# on-device runtime clock authority (RTC / NTP / SNTP). Until one exists, treat
+# `epoch_sec` as a per-deployment value, not a property of the saved graph.
+# rp2350-only: `silicon` (not `family="rp2"`) so this overlay does NOT match
+# rp2040 — otlp_http is too heavy for the M0+ and excludes it in its manifest.
 [[overlay]]
-match = { export_telemetry = "otlp", family = "rp2" }
+match = { export_telemetry = "otlp", silicon = "rp2350" }
 modules = [
   { name = "otlp_http", params = {
-      dst_ip   = "user:export_dst_ip|host:debug.collector_ip|required",
-      dst_port = "user:export_dst_port|host:debug.otlp_port",
-      flush_ms = "user:export_flush_ms",
+      dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:export_dst_port|host:debug.otlp_port",
+      flush_ms  = "user:export_flush_ms",
+      epoch_sec = "user:export_epoch_sec|host:debug.otlp_epoch_sec|required",
   } },
 ]
 wiring = [
@@ -262,9 +279,10 @@ wiring = [
 match = { export_telemetry = "otlp", family = "bcm" }
 modules = [
   { name = "otlp_http", params = {
-      dst_ip   = "user:export_dst_ip|host:debug.collector_ip|required",
-      dst_port = "user:export_dst_port|host:debug.otlp_port",
-      flush_ms = "user:export_flush_ms",
+      dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:export_dst_port|host:debug.otlp_port",
+      flush_ms  = "user:export_flush_ms",
+      epoch_sec = "user:export_epoch_sec|host:debug.otlp_epoch_sec|required",
   } },
 ]
 wiring = [

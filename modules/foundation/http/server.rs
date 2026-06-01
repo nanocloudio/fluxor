@@ -397,11 +397,16 @@ pub(crate) struct ConnSlot {
     /// All-zero trace id → root span.
     pub(crate) span_trace_id: [u8; 16],
     pub(crate) span_parent_id: [u8; 8],
+    /// W3C trace-flags the span adopts (per request): the `traceparent` flags
+    /// when present, else `conn_flags`. Low bit = `sampled`.
+    pub(crate) span_flags: u8,
     /// Connection-scoped trace context from IP→TLS `MSG_TRACE_CTX` (TLS's span
     /// id as parent). Set once at accept, applied to every request on the
     /// connection that doesn't carry its own `traceparent`. All-zero = none.
     pub(crate) conn_trace_id: [u8; 16],
     pub(crate) conn_parent_id: [u8; 8],
+    /// W3C trace-flags from the connection's `MSG_TRACE_CTX`. Low bit = `sampled`.
+    pub(crate) conn_flags: u8,
 }
 
 impl ConnSlot {
@@ -738,8 +743,10 @@ pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u8) -> Option<u
     // the new connection's `MSG_TRACE_CTX` (if any) repopulates it.
     slot.conn_trace_id = [0u8; 16];
     slot.conn_parent_id = [0u8; 8];
+    slot.conn_flags = 0;
     slot.span_trace_id = [0u8; 16];
     slot.span_parent_id = [0u8; 8];
+    slot.span_flags = 0;
     ready_set(s, idx);
     Some(idx)
 }
@@ -3014,10 +3021,31 @@ unsafe fn emit_request_span(s: &mut HttpState) {
     if s.telemetry_chan < 0 {
         return;
     }
-    let (start, tp_trace, tp_parent) = match cur_slot(s) {
-        Some(c) if c.span_start_us != 0 => (c.span_start_us, c.span_trace_id, c.span_parent_id),
+    let (start, tp_trace, tp_parent, tp_flags) = match cur_slot(s) {
+        Some(c) if c.span_start_us != 0 => (
+            c.span_start_us,
+            c.span_trace_id,
+            c.span_parent_id,
+            c.span_flags,
+        ),
         _ => return,
     };
+    // Head-sampling gate FIRST — before any clock read or RNG. A propagated
+    // `traceparent` carries the caller's decision; a minted root is sampled. An
+    // unsampled flow emits nothing (RFC observability bit test); the client
+    // controls this, so the early gate matters.
+    let propagated = tp_trace != [0u8; 16];
+    let eff_flags = if propagated {
+        tp_flags
+    } else {
+        super::abi::contracts::telemetry::TRACE_FLAGS_SAMPLED
+    };
+    if eff_flags & super::abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0 {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.span_start_us = 0;
+        }
+        return;
+    }
     let sys = &*s.syscalls;
     let me = dev_self_index(sys);
     if me < 0 {
@@ -3029,10 +3057,11 @@ unsafe fn emit_request_span(s: &mut HttpState) {
         trace_id: [0u8; 16],
         span_id: [0u8; 8],
         parent_id: [0u8; 8],
+        flags: eff_flags,
     };
     // A non-zero trace id means the caller propagated context — join its trace
-    // and parent under it; otherwise this is a root span.
-    if tp_trace != [0u8; 16] {
+    // and parent under it; otherwise this is a minted root.
+    if propagated {
         ctx.trace_id = tp_trace;
         ctx.parent_id = tp_parent;
     } else {
@@ -3742,6 +3771,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 slot.conn_parent_id.as_mut_ptr(),
                                 8,
                             );
+                            slot.conn_flags = *p.add(25);
                         }
                     }
                     return 2;
@@ -3911,10 +3941,9 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // otherwise fall back to the connection context propagated
                     // in-band by IP/TLS. Resolved per request so a keepalive slot
                     // never inherits a previous request's header.
-                    let header_ctx: Option<([u8; 16], [u8; 8])> = if span_now != 0 {
+                    let header_ctx: Option<([u8; 16], [u8; 8], u8)> = if span_now != 0 {
                         h1::find_header(head, b"traceparent")
                             .and_then(super::abi::contracts::telemetry::parse_traceparent)
-                            .map(|(tid, pid, _flags)| (tid, pid))
                     } else {
                         None
                     };
@@ -3922,18 +3951,28 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         cur.keepalive = if keepalive { 1 } else { 0 };
                         cur.header_end_off = head_len as u16;
                         cur.phase = Phase::DispatchRoute;
-                        cur.span_start_us = span_now;
-                        match header_ctx {
-                            Some((tid, pid)) => {
+                        let flags = match header_ctx {
+                            Some((tid, pid, flags)) => {
                                 cur.span_trace_id = tid;
                                 cur.span_parent_id = pid;
+                                flags
                             }
                             None => {
                                 // In-band connection context (all-zero = root).
                                 cur.span_trace_id = cur.conn_trace_id;
                                 cur.span_parent_id = cur.conn_parent_id;
+                                cur.conn_flags
                             }
-                        }
+                        };
+                        cur.span_flags = flags;
+                        // Head-sampling: a propagated context carries the caller's
+                        // bit; a root (all-zero trace) is sampled. Latch the span
+                        // start ONLY when sampled, so an unsampled request does NO
+                        // end-of-request clock/RNG work (emit returns on start==0).
+                        let propagated = cur.span_trace_id != [0u8; 16];
+                        let sampled = !propagated
+                            || flags & super::abi::contracts::telemetry::TRACE_FLAGS_SAMPLED != 0;
+                        cur.span_start_us = if sampled { span_now } else { 0 };
                     }
                     return 2;
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {

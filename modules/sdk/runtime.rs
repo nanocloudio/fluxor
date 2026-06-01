@@ -1265,6 +1265,52 @@ unsafe fn net_read_frame(
     (msg_type, actual)
 }
 
+/// Like [`net_read_frame`] but **stays frame-aligned** when a frame's payload is
+/// larger than `buf`: after copying `min(payload_len, buf-3)` bytes, it discards
+/// the remaining `payload_len - copied` bytes from the channel so the next read
+/// starts on a real frame header rather than mid-payload. Returns
+/// `(msg_type, copied_len, payload_len)` — `copied_len < payload_len` signals the
+/// frame was truncated into `buf` (the tail was dropped, not left to desync the
+/// FIFO). A consumer that must not lose bytes can compare the two and reconnect.
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+unsafe fn net_read_frame_aligned(
+    sys: &SyscallTable,
+    chan: i32,
+    buf: *mut u8,
+    buf_max: usize,
+) -> (u8, usize, usize) {
+    if chan < 0 || buf_max < NET_FRAME_HDR {
+        return (0, 0, 0);
+    }
+    let n = (sys.channel_read)(chan, buf, NET_FRAME_HDR);
+    if n < NET_FRAME_HDR as i32 {
+        return (0, 0, 0);
+    }
+    let msg_type = *buf;
+    let payload_len = (*buf.add(1) as u16 | ((*buf.add(2) as u16) << 8)) as usize;
+    if payload_len == 0 {
+        return (msg_type, 0, 0);
+    }
+    let max_payload = buf_max - NET_FRAME_HDR;
+    let to_read = if payload_len < max_payload { payload_len } else { max_payload };
+    let n2 = (sys.channel_read)(chan, buf.add(NET_FRAME_HDR), to_read);
+    let copied = if n2 > 0 { n2 as usize } else { 0 };
+    // Drain any tail beyond what fit, so the FIFO stays frame-aligned.
+    let mut leftover = payload_len.saturating_sub(copied);
+    if leftover > 0 {
+        let mut scratch = [0u8; 64];
+        while leftover > 0 {
+            let take = if leftover < scratch.len() { leftover } else { scratch.len() };
+            let got = (sys.channel_read)(chan, scratch.as_mut_ptr(), take);
+            if got <= 0 {
+                break; // nothing more buffered yet — avoid a busy spin.
+            }
+            leftover -= got as usize;
+        }
+    }
+    (msg_type, copied, payload_len)
+}
+
 /// Fill buffer with cryptographically secure random bytes.
 /// Returns 0 on success, negative errno on failure.
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
@@ -1275,15 +1321,22 @@ unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
 
 /// Build + emit a `MSG_TRACE_CTX` frame carrying a connection's W3C trace
 /// context downstream (ingress IP after MSG_ACCEPTED, or a forwarding stage with
-/// its own span id). Payload: `[conn_id][trace_id 16][parent_span_id 8]`.
-/// Returns true if the frame was written. See `contracts/net/net_proto.rs`.
+/// its own span id). Payload:
+/// `[conn_id][trace_id 16][parent_span_id 8][trace_flags 1]`. `flags` is the
+/// W3C trace-flags byte (low bit = `sampled`). Returns true if the frame was
+/// written. See `contracts/net/net_proto.rs`.
 #[allow(dead_code, reason = "observability propagation; invoked only by instrumented stream stages")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "flat trace-context args (conn id, trace/span ids, flags) plus the caller's scratch buffer — a struct would just move the list"
+)]
 unsafe fn dev_net_send_trace_ctx(
     sys: &SyscallTable,
     chan: i32,
     conn_id: u8,
     trace_id: &[u8; 16],
     span_id: &[u8; 8],
+    flags: u8,
     scratch: *mut u8,
     scratch_max: usize,
 ) -> bool {
@@ -1292,15 +1345,20 @@ unsafe fn dev_net_send_trace_ctx(
     payload[0] = conn_id;
     payload[1..17].copy_from_slice(trace_id);
     payload[17..25].copy_from_slice(span_id);
+    payload[25] = flags;
     net_write_frame(sys, chan, MSG_TRACE_CTX, payload.as_ptr(), TRACE_CTX_LEN, scratch, scratch_max)
         > 0
 }
 
 /// Parse a received `MSG_TRACE_CTX` frame. `frame_buf` points at the frame start
 /// (including the 3-byte net_proto header); `payload_len` is from
-/// `net_read_frame`. Returns `(conn_id, trace_id, parent_span_id)` or `None`.
+/// `net_read_frame`. Returns `(conn_id, trace_id, parent_span_id, trace_flags)`
+/// or `None`.
 #[allow(dead_code, reason = "observability propagation; invoked only by instrumented stream stages")]
-unsafe fn parse_trace_ctx(frame_buf: *const u8, payload_len: usize) -> Option<(u8, [u8; 16], [u8; 8])> {
+unsafe fn parse_trace_ctx(
+    frame_buf: *const u8,
+    payload_len: usize,
+) -> Option<(u8, [u8; 16], [u8; 8], u8)> {
     use abi::contracts::net::net_proto::TRACE_CTX_LEN;
     if payload_len < TRACE_CTX_LEN {
         return None;
@@ -1311,7 +1369,8 @@ unsafe fn parse_trace_ctx(frame_buf: *const u8, payload_len: usize) -> Option<(u
     let mut span_id = [0u8; 8];
     core::ptr::copy_nonoverlapping(p.add(1), trace_id.as_mut_ptr(), 16);
     core::ptr::copy_nonoverlapping(p.add(17), span_id.as_mut_ptr(), 8);
-    Some((conn_id, trace_id, span_id))
+    let flags = *p.add(25);
+    Some((conn_id, trace_id, span_id, flags))
 }
 
 // ============================================================================
@@ -1448,6 +1507,21 @@ unsafe fn parse_dg_rx_from_v4(
 #[inline(always)]
 unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
+}
+
+/// Stream-surface requester tag for this module: `module index + 1`, so the
+/// "untagged" sentinel `REQUESTER_TAG_NONE` (0) never collides with a valid
+/// zero-based module index. Saturates at `u8::MAX`. Used to tag `CMD_CONNECT`
+/// and to recognise the matching `MSG_CONNECTED` when `ip.net_out` is fanned to
+/// several stream consumers. Returns 0 only if the index is unavailable.
+#[allow(dead_code, reason = "stream-surface routing; used by instrumented connectors")]
+unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
+    let idx = dev_self_index(sys);
+    if idx < 0 {
+        0
+    } else {
+        ((idx as u32).saturating_add(1)).min(u8::MAX as u32) as u8
+    }
 }
 
 

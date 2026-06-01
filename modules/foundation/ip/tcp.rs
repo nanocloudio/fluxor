@@ -131,7 +131,16 @@ pub struct TcpConn {
     /// latch a queue-full at the moment of close would lose the
     /// consumer event entirely.
     pub pending_close_notify: u8,
-    _close_pad: [u8; 3],
+    /// Requester tag from `CMD_CONNECT` (the connecting module's index),
+    /// echoed in `MSG_CONNECTED` so a fanned `net_out` routes the event back
+    /// to the consumer that opened the connection. `0` = untagged. Only set
+    /// for outbound (client) conns; inbound accepts leave it `0`.
+    pub connect_tag: u8,
+    /// Head-sampling decision latched ONCE at accept: the W3C trace-flags
+    /// (`TRACE_FLAGS_SAMPLED` or 0) emitted for this connection's span AND
+    /// propagated downstream. Read — never recomputed — at span close.
+    pub sampled_flags: u8,
+    _close_pad: u8,
 
     /// Observability: monotonic-micros start of this connection's
     /// `tcp.connection` span, latched at accept when the telemetry port is
@@ -181,7 +190,9 @@ impl TcpConn {
             delivered_bytes: 0,
             consumed_bytes: 0,
             pending_close_notify: 0,
-            _close_pad: [0; 3],
+            connect_tag: 0,
+            sampled_flags: 0,
+            _close_pad: 0,
             span_start_us: 0,
             trace_id: [0; 16],
             span_id: [0; 8],

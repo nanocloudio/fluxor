@@ -50,3 +50,9 @@ pub(crate) const NET_CMD_CONNECT: u8 = 0x13;
 pub(crate) const NET_BUF_SIZE: usize = 8192;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) const NET_BUF_SIZE: usize = 1600;
+
+/// Largest `data` portion of one `MSG_DATA` frame (mirrors
+/// `net_proto::MAX_DATA_FRAGMENT`). The receive-side admission threshold uses
+/// THIS — not `NET_BUF_SIZE` (the much larger outbound scratch) — so an h2
+/// client with a small `recv_buf` still admits inbound frames.
+pub(crate) const MAX_DATA_FRAGMENT: usize = 1460;

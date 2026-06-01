@@ -145,6 +145,12 @@ const NET_OUT_QUEUE_SLOTS: usize = 32;
 const NOTIFY_NONE: u8 = 0;
 const NOTIFY_CLOSED: u8 = 1;
 const NOTIFY_ERROR_REFUSED: u8 = 2;
+/// Successful outbound connect whose `MSG_CONNECTED` couldn't be delivered yet
+/// — retried so a waiter always learns it connected (conn stays Established).
+const NOTIFY_CONNECTED: u8 = 3;
+/// Connect timeout (`ETIMEDOUT`) whose `MSG_ERROR` couldn't be delivered yet —
+/// retried, then the slot frees (conn is `Closed`).
+const NOTIFY_ERROR_TIMEOUT: u8 = 4;
 
 /// A TCP-conn slot is free for re-allocation only when it's `Closed`
 /// AND no close-notification latch is still pending — reusing a
@@ -177,7 +183,11 @@ pub struct IpState {
 
     // Config
     use_dhcp: u8,
-    _cfg_pad: [u8; 3],
+    _cfg_pad: u8,
+    /// Head-sampling rate in per-mille (0–1000); the fraction of ingress roots
+    /// that are sampled. Default 1000 (100%). The decision is made once per
+    /// connection at accept and stored in `TcpConn::sampled_flags`.
+    sample_permille: u16,
 
     // Network identity
     mac_addr: [u8; 6],
@@ -323,6 +333,8 @@ mod params_def {
             => |s, d, len| { s.use_dhcp = p_u8(d, len, 0, 1); };
         2, expected_dhcp_server, u32, 0
             => |s, d, len| { s.dhcp.expected_server = p_u32(d, len, 0, 0); };
+        3, trace_sample_permille, u16, 1000
+            => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 1000); };
     }
 }
 
@@ -544,6 +556,9 @@ unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) -> bool {
             dev_csprng_fill(sys, s.tcp_conns[idx].span_id.as_mut_ptr(), 8);
             let trace_id = s.tcp_conns[idx].trace_id;
             let span_id = s.tcp_conns[idx].span_id;
+            // Decide head sampling ONCE, here, and latch it on the connection.
+            let sampled = ingress_sample_decision(s.sample_permille, &trace_id);
+            s.tcp_conns[idx].sampled_flags = sampled;
             let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
             dev_net_send_trace_ctx(
                 sys,
@@ -551,6 +566,7 @@ unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) -> bool {
                 conn_id,
                 &trace_id,
                 &span_id,
+                sampled,
                 scratch.as_mut_ptr(),
                 scratch.len(),
             );
@@ -572,12 +588,37 @@ unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) -> bool {
     net_send_short(s, NET_MSG_CLOSED, conn_id)
 }
 
+/// Head-sampling decision for a NEW ingress root, made ONCE at accept. Draws a
+/// deterministic per-mille value from the (random) minted `trace_id` and
+/// compares it to the configured `sample_permille` rate. Returns the W3C
+/// trace-flags to stamp: `TRACE_FLAGS_SAMPLED` when sampled, else 0. The result
+/// is stored in `TcpConn::sampled_flags` and BOTH emitted locally and
+/// propagated downstream, so the decision is never recomputed (RFC: decide once
+/// at ingress, carry in flags).
+#[inline(always)]
+fn ingress_sample_decision(permille: u16, trace_id: &[u8; 16]) -> u8 {
+    // permille >= 1000 → always sampled (the common default); 0 → never.
+    let draw = u16::from_le_bytes([trace_id[0], trace_id[1]]) % 1000;
+    if draw < permille {
+        abi::contracts::telemetry::TRACE_FLAGS_SAMPLED
+    } else {
+        0
+    }
+}
+
 /// Emit the finished `tcp.connection` span using the connection's root trace
 /// context (minted at accept, also propagated downstream), so the span and the
 /// `MSG_TRACE_CTX` children share one `trace_id` / parent `span_id`. `name_id =
 /// 0` is the first `[observability].spans` entry.
 #[inline(never)]
 unsafe fn emit_conn_span(s: &mut IpState, idx: usize) {
+    // Bit test FIRST, before any clock read — the decision was latched at accept
+    // (`sampled_flags`), never recomputed. An unsampled root emits nothing (and
+    // its children won't either, since the cleared bit was propagated).
+    let sampled_flags = s.tcp_conns[idx].sampled_flags;
+    if sampled_flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0 {
+        return;
+    }
     let sys = &*s.syscalls;
     let me = dev_self_index(sys);
     if me < 0 {
@@ -590,6 +631,7 @@ unsafe fn emit_conn_span(s: &mut IpState, idx: usize) {
         trace_id: s.tcp_conns[idx].trace_id,
         span_id: s.tcp_conns[idx].span_id,
         parent_id: [0u8; 8], // ip is the ingress → root span (no parent)
+        flags: sampled_flags,
     };
     dev_telemetry_span(
         sys,
@@ -621,21 +663,40 @@ unsafe fn net_send_bound(s: &mut IpState, conn_id: u8, local_port: u16) {
 }
 
 #[inline(always)]
-unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) {
-    let _ = net_send_short(s, NET_MSG_CONNECTED, conn_id);
+#[must_use]
+unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) -> bool {
+    // Payload `[conn_id][requester_tag]` — the tag echoes the connecting
+    // module's CMD_CONNECT tag so a fanned net_out routes the event back to it.
+    let tag = if (conn_id as usize) < tcp::MAX_TCP_CONNS {
+        s.tcp_conns[conn_id as usize].connect_tag
+    } else {
+        0
+    };
+    let mut frame = [0u8; 5];
+    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_CONNECTED);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 2u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), tag);
+    net_send_or_queue(s, &frame)
 }
 
 /// Send a MSG_ERROR frame. Returns whether the frame was delivered
 /// or queued; callers latching `pending_close_notify` on connect /
 /// accept failure use the bool to know whether the latch is needed.
 #[inline(always)]
-unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8) -> bool {
-    let mut frame = [0u8; 5];
+unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8, tag: u8) -> bool {
+    // Payload `[conn_id][errno][requester_tag]`. The tag echoes the failing
+    // CMD_CONNECT's tag so a consumer sharing a fanned net_out attributes a
+    // connect failure to the right requester (it has no conn_id yet). Errors
+    // not tied to an outbound connect pass tag 0 (untagged).
+    let mut frame = [0u8; 6];
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ERROR);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 2u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
     core::ptr::write_volatile(frame.as_mut_ptr().add(4), errno as u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), tag);
     net_send_or_queue(s, &frame)
 }
 
@@ -930,6 +991,18 @@ pub unsafe extern "C" fn module_new(
         s.ctrl_chan = ctrl_chan;
 
         s.use_dhcp = 1;
+        // Target-tier head-sampling default (rfc_observability §sampling),
+        // overridable by the `trace_sample_permille` param. The bcm2712 (aarch64)
+        // module artefact is the CM5-class rig → 50‰; MCU silicon (rp2350/rp2040,
+        // thumbv8m/v6m) → 0‰ so tiny targets pay no tracing cost by default.
+        #[cfg(target_arch = "aarch64")]
+        {
+            s.sample_permille = 50;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            s.sample_permille = 0;
+        }
         s.mac_valid = false;
 
         // Initialize ARP table
@@ -1374,7 +1447,7 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
             );
             send_frame(s, s.tx_frame.as_ptr(), frame_len);
         }
-        net_send_error(s, 0, -1);
+        net_send_error(s, 0, -1, 0);
         return;
     }
 
@@ -1806,12 +1879,17 @@ unsafe fn process_tcp_segment(
         }
         ACTION_COMPLETE_CONNECT => {
             send_tcp_control(s, conn_idx, tcp::ACK, false);
-            net_send_connected(s, conn_idx as u8);
+            // Latch the connected-notification for retry if it couldn't be
+            // delivered now, so a waiter always learns the connect succeeded.
+            if !net_send_connected(s, conn_idx as u8) {
+                (*s.tcp_conns.as_mut_ptr().add(conn_idx)).pending_close_notify = NOTIFY_CONNECTED;
+            }
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
         }
         ACTION_COMPLETE_REFUSED => {
-            let delivered = net_send_error(s, conn_idx as u8, -111i8);
+            let tag = (*s.tcp_conns.as_ptr().add(conn_idx)).connect_tag;
+            let delivered = net_send_error(s, conn_idx as u8, -111i8, tag);
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
             if delivered {
                 *conn = tcp::TcpConn::new();
@@ -2812,7 +2890,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             net_send_bound(s, ci as u8, port);
                         } else {
                             log_info(s, b"[ip] net bind: no free conn");
-                            net_send_error(s, 0, -12); // ENOMEM
+                            net_send_error(s, 0, -12, 0); // ENOMEM (bind — untagged)
                         }
                     }
                 }
@@ -2825,8 +2903,12 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 if plen >= 7 {
                     let bp = buf.as_ptr();
                     let sock_type = *bp;
+                    // Optional trailing requester tag (8-byte form); echoed in
+                    // MSG_CONNECTED / connect-failure MSG_ERROR so a fanned
+                    // net_out routes the event back to the requester.
+                    let requester_tag = if plen >= 8 { *bp.add(7) } else { 0 };
                     if sock_type != SOCK_TYPE_STREAM {
-                        net_send_error(s, 0, -22); // EINVAL
+                        net_send_error(s, 0, -22, requester_tag); // EINVAL
                     } else {
                         let ip =
                             u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
@@ -2844,7 +2926,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         }
 
                         if conn_id < 0 {
-                            net_send_error(s, 0, -12); // ENOMEM
+                            net_send_error(s, 0, -12, requester_tag); // ENOMEM
                         } else {
                             let ci = conn_id as usize;
                             let local_port = next_port(s);
@@ -2855,6 +2937,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             conn.remote_ip = ip;
                             conn.remote_port = port;
                             conn.local_port = local_port;
+                            conn.connect_tag = requester_tag;
                             conn.iss = iss;
                             conn.snd_nxt = iss;
                             conn.snd_una = iss;
@@ -3021,10 +3104,13 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
         while i < tcp::MAX_TCP_CONNS {
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
             let kind = conn.pending_close_notify;
+            let tag = conn.connect_tag;
             if kind != NOTIFY_NONE {
                 let delivered = match kind {
                     NOTIFY_CLOSED => net_send_closed(s, i as u8),
-                    NOTIFY_ERROR_REFUSED => net_send_error(s, i as u8, -111i8),
+                    NOTIFY_ERROR_REFUSED => net_send_error(s, i as u8, -111i8, tag),
+                    NOTIFY_ERROR_TIMEOUT => net_send_error(s, i as u8, -110i8, tag),
+                    NOTIFY_CONNECTED => net_send_connected(s, i as u8),
                     _ => true, // unknown code → drop the latch
                 };
                 if delivered {
@@ -3050,10 +3136,25 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
         match conn.state {
             tcp::TcpState::SynSent => {
                 conn.retransmit_timer += 1;
-                // Retransmit SYN after ~3 seconds (60 ticks at 50ms period)
-                if conn.retransmit_timer > 60 {
-                    conn.retransmit_timer = 0;
+                // Retransmit SYN every ~3 s (60 ticks at 50 ms).
+                if conn.retransmit_timer % 60 == 0 && conn.retransmit_timer < 300 {
                     send_tcp_control(s, i, tcp::SYN, true);
+                }
+                // Connect timeout after ~15 s: emit exactly one TAGGED terminal
+                // result (ETIMEDOUT) so the requester completes its connect and
+                // can drop the orphan, then free the slot. Without this the
+                // consumer (HTTP/MQTT/OTLP) would wait forever with no conn_id.
+                if conn.retransmit_timer >= 300 {
+                    let tag = conn.connect_tag;
+                    // Free on delivery; else latch (Closed + retry) so the
+                    // requester always gets exactly one tagged terminal result.
+                    if net_send_error(s, i as u8, -110, tag) {
+                        *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                    } else {
+                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                        conn.state = tcp::TcpState::Closed;
+                        conn.pending_close_notify = NOTIFY_ERROR_TIMEOUT;
+                    }
                 }
             }
             tcp::TcpState::SynReceived => {

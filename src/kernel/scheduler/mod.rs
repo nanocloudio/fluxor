@@ -3292,12 +3292,13 @@ enum FanDirection {
 /// write atomically to all outputs).
 pub fn port_frame_kind_from_content_type(content_type: u8) -> u8 {
     use module_types::{
-        CONTENT_TYPE_ETHERNET_FRAME, CONTENT_TYPE_NET_PROTO, FRAME_KIND_ETH, FRAME_KIND_NET,
-        FRAME_KIND_NONE,
+        CONTENT_TYPE_ETHERNET_FRAME, CONTENT_TYPE_NET_PROTO, CONTENT_TYPE_TELEMETRY,
+        FRAME_KIND_ETH, FRAME_KIND_NET, FRAME_KIND_NONE, FRAME_KIND_TELEMETRY,
     };
     match content_type {
         CONTENT_TYPE_ETHERNET_FRAME => FRAME_KIND_ETH,
         CONTENT_TYPE_NET_PROTO => FRAME_KIND_NET,
+        CONTENT_TYPE_TELEMETRY => FRAME_KIND_TELEMETRY,
         _ => FRAME_KIND_NONE,
     }
 }

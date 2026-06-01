@@ -38,8 +38,9 @@ use super::wire_h2 as h2w;
 use super::wire_ws as ws;
 use super::HttpState;
 use super::{
-    dev_csprng_fill, dev_log, dev_millis, net_read_frame, net_write_frame, E_AGAIN, NET_FRAME_HDR,
-    POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    dev_csprng_fill, dev_log, dev_millis, dev_requester_tag, net_read_frame,
+    net_read_frame_aligned, net_write_frame, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT,
+    SOCK_TYPE_STREAM,
 };
 
 const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -143,7 +144,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let sys = &*s.syscalls;
                 let chan = s.net_out_chan;
                 let buf = s.net_buf.as_mut_ptr();
-                let mut payload = [0u8; 7];
+                let mut payload = [0u8; 8];
                 payload[0] = SOCK_TYPE_STREAM;
                 let ip = s.client.host_ip.to_le_bytes();
                 payload[1] = ip[0];
@@ -152,12 +153,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 payload[4] = ip[3];
                 payload[5] = (s.client.port & 0xFF) as u8;
                 payload[6] = (s.client.port >> 8) as u8;
+                // requester tag = our module index (see client.rs).
+                payload[7] = dev_requester_tag(sys);
                 let wrote = net_write_frame(
                     sys,
                     chan,
                     NET_CMD_CONNECT,
                     payload.as_ptr(),
-                    7,
+                    8,
                     buf,
                     NET_BUF_SIZE,
                 );
@@ -180,15 +183,36 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     let buf = s.net_buf.as_mut_ptr();
                     let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
                     if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                        // Claim only our own outbound connection by requester tag
+                        // (see client.rs). Untagged or our tag → ours.
+                        let tag = if payload_len >= 2 {
+                            *buf.add(NET_FRAME_HDR + 1)
+                        } else {
+                            0
+                        };
+                        let me = dev_requester_tag(sys);
+                        if tag != 0 && tag != me {
+                            return 0;
+                        }
                         s.client.conn_id = *buf.add(NET_FRAME_HDR);
+                        s.client.conn_present = 1;
                         log(s, b"[http] connected (h2c)");
                         build_preface(s);
                         set_phase(s, H2Phase::SendPreface);
                         continue;
                     } else if msg_type == NET_MSG_ERROR {
-                        log(s, b"[http] connect error");
-                        set_phase(s, H2Phase::Error);
-                        return E_CONNECT_FAILED;
+                        // Connect failure carries our tag at payload[2]; ignore
+                        // another consumer's error on a fanned net_in.
+                        let etag = if payload_len >= 3 {
+                            *buf.add(NET_FRAME_HDR + 2)
+                        } else {
+                            0
+                        };
+                        if etag == 0 || etag == dev_requester_tag(sys) {
+                            log(s, b"[http] connect error");
+                            set_phase(s, H2Phase::Error);
+                            return E_CONNECT_FAILED;
+                        }
                     }
                 }
                 if dev_millis(sys).wrapping_sub(s.client.connect_start_ms) >= CONNECT_TIMEOUT_MS {
@@ -938,9 +962,11 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
         return false;
     }
     // Backpressure: refuse to pump if recv_buf can't hold a worst-case
-    // MSG_DATA payload. The channel queue then absorbs the backlog and
-    // ultimately TCP slows the peer.
-    let worst_case = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+    // MSG_DATA payload. The bound is the net_proto fragment CAP, NOT the (much
+    // larger) outbound scratch `NET_BUF_SIZE` — using the latter against a
+    // 2048-byte recv_buf would refuse forever (h2 inbound stalls on aarch64).
+    // The channel queue then absorbs the backlog and ultimately TCP slows the peer.
+    let worst_case = super::connection::MAX_DATA_FRAGMENT;
     if s.client.recv_len as usize + worst_case > RECV_BUF_SIZE {
         return false;
     }
@@ -951,7 +977,18 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
         return false;
     }
     let buf = s.net_buf.as_mut_ptr();
-    let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+    // Alignment-safe: per the net_proto cap a MSG_DATA frame fits our buffer,
+    // but a misbehaving producer's oversized frame is drained rather than left
+    // to desync the FIFO.
+    let (msg_type, payload_len, _full) = net_read_frame_aligned(sys, chan, buf, NET_BUF_SIZE);
+    // Established-stream isolation: ignore DATA/CLOSED/ERROR frames for other
+    // connections sharing a fanned net_in (e.g. an OTLP exporter).
+    if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
+        && payload_len >= 1
+        && *buf.add(NET_FRAME_HDR) != s.client.conn_id
+    {
+        return false;
+    }
     if msg_type == NET_MSG_CLOSED {
         // Peer hung up; treat as end of body.
         log(s, b"[http] premature close");
@@ -997,7 +1034,9 @@ unsafe fn consume_until_settings(s: &mut HttpState) -> Option<bool> {
 }
 
 unsafe fn send_close_frame(s: &mut HttpState) {
-    if s.client.conn_id == 0 || s.net_out_chan < 0 {
+    // Presence — not `conn_id != 0` — since IP may assign conn_id 0 (see
+    // ClientState::conn_present).
+    if s.client.conn_present == 0 || s.net_out_chan < 0 {
         return;
     }
     let sys = &*s.syscalls;
@@ -1015,4 +1054,5 @@ unsafe fn send_close_frame(s: &mut HttpState) {
         NET_BUF_SIZE,
     );
     s.client.conn_id = 0;
+    s.client.conn_present = 0;
 }

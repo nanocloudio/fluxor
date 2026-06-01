@@ -76,8 +76,8 @@ const REC_BUF: usize = 96;
 /// Bound on records drained per step so a flooded port can't starve the tick.
 const MAX_DRAIN_PER_STEP: u32 = 64;
 
-/// Backoff window between bind retries (ticks). 100 ms at tick_us=100.
-const BACKOFF_TICKS: u16 = 1000;
+/// Backoff window between bind retries — wall-clock, tick-rate independent.
+const BACKOFF_MICROS: u64 = 100_000; // 100 ms
 
 /// Give up binding after this many consecutive failures (stays faultless).
 const MAX_BIND_ATTEMPTS: u16 = 50;
@@ -113,13 +113,15 @@ struct OtelUdpState {
     /// datagram endpoint id from MSG_DG_BOUND. `0xFF` = unallocated.
     ep_id: u8,
 
-    backoff_ticks: u16,
+    /// Wall-clock micros until which the module stays in Backoff.
+    backoff_until_micros: u64,
     bind_attempts: u16,
 
-    /// Ticks between forced flushes of a partial batch.
-    flush_ticks: u32,
-    /// Countdown to the next forced flush.
-    flush_countdown: u32,
+    /// Configured forced-flush cadence in milliseconds. Timing is wall-clock
+    /// (`dev_micros`), independent of the scheduler tick rate.
+    flush_ms: u32,
+    /// Wall-clock micros at the last forced flush.
+    last_flush_micros: u64,
 
     /// Bytes used in `batch` (starts at BATCH_HEADER_SIZE — header is written
     /// at flush time). Records are appended after the reserved header.
@@ -150,10 +152,10 @@ impl OtelUdpState {
         self.bind_port = 4316;
         self.phase = Phase::Init;
         self.ep_id = 0xFF;
-        self.backoff_ticks = 0;
+        self.backoff_until_micros = 0;
         self.bind_attempts = 0;
-        self.flush_ticks = 0;
-        self.flush_countdown = 0;
+        self.flush_ms = 0;
+        self.last_flush_micros = 0;
         self.batch_len = tlm::BATCH_HEADER_SIZE as u16;
         self.batch_count = 0;
         self.datagrams_sent = 0;
@@ -189,7 +191,7 @@ mod params_def {
             => |s, d, len| { s.bind_port = p_u16(d, len, 0, 4316); };
 
         4, flush_ms, u32, 1000
-            => |s, d, len| { s.flush_ticks = p_u32(d, len, 0, 1000); };
+            => |s, d, len| { s.flush_ms = p_u32(d, len, 0, 1000); };
     }
 }
 
@@ -272,7 +274,11 @@ unsafe fn discard_net_in(s: &mut OtelUdpState) {
     let poll = (sys.channel_poll)(chan, 0x01 /* POLL_IN */);
     if poll > 0 && (poll & 0x01) != 0 {
         let buf = s.net_buf.as_mut_ptr();
-        let _ = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
+        // Alignment-safe: net_in is fanned from ip.net_out, so it can carry
+        // stream MSG_DATA fragments up to MAX_DATA_FRAGMENT (1460) — larger than
+        // this datagram exporter's small scratch. The aligned reader drains the
+        // tail rather than leaving it to desync the FIFO.
+        let _ = net_read_frame_aligned(sys, chan, buf, NET_BUF_SIZE);
     }
 }
 
@@ -323,7 +329,6 @@ pub extern "C" fn module_new(
         s.net_in_chan = dev_channel_port(sys, 0, 1); // in[1]: frames from ip
         s.net_out_chan = dev_channel_port(sys, 1, 0); // out[0]: frames to ip
 
-        // params set flush_ticks to flush_ms; converted to ticks below.
         let is_tlv = !params.is_null()
             && params_len >= 4
             && *params == 0xFE
@@ -334,12 +339,9 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        // Convert flush_ms → ticks (assume the documented dev tick_us=100, same
-        // convention as observe/monitor). Floor at one tick.
-        const ASSUMED_TICK_US: u32 = 100;
-        let ticks = s.flush_ticks.saturating_mul(1000) / ASSUMED_TICK_US;
-        s.flush_ticks = if ticks < 1 { 1 } else { ticks };
-        s.flush_countdown = s.flush_ticks;
+        // Flush cadence is wall-clock (see `last_flush_micros`); seed the clock
+        // so the first forced flush waits a full interval.
+        s.last_flush_micros = dev_micros(sys);
 
         0
     }
@@ -424,15 +426,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 } else if msg_type == DG_MSG_ERROR {
                     s.phase = Phase::Backoff;
-                    s.backoff_ticks = BACKOFF_TICKS;
+                    s.backoff_until_micros = dev_micros(sys).wrapping_add(BACKOFF_MICROS);
                     return 0;
                 }
                 // Other message — stay in WaitBound.
             }
 
             Phase::Backoff => {
-                if s.backoff_ticks > 0 {
-                    s.backoff_ticks -= 1;
+                let sys = &*s.syscalls;
+                if dev_micros(sys) < s.backoff_until_micros {
                     return 0;
                 }
                 s.phase = Phase::Binding;
@@ -444,10 +446,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                 // Forced flush on cadence so a low-rate partial batch still
                 // leaves the device promptly.
-                if s.flush_countdown > 0 {
-                    s.flush_countdown -= 1;
-                } else {
-                    s.flush_countdown = s.flush_ticks;
+                let sys = &*s.syscalls;
+                let now = dev_micros(sys);
+                if now.wrapping_sub(s.last_flush_micros) >= (s.flush_ms as u64) * 1000 {
+                    s.last_flush_micros = now;
                     let _ = flush(s);
                 }
                 return 2;

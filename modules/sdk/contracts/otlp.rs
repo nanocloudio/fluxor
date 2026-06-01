@@ -17,8 +17,10 @@
 //
 // Each metric carries the producing module index as a `fluxor.module.index` data-point
 // attribute, so a collector keeps per-module series without the device grouping
-// them. `timeUnixNano` is the device's best-effort monotonic micros×1000 — not
-// epoch-anchored; a collector re-stamps or the device syncs time upstream.
+// them. `timeUnixNano` is Unix-epoch nanos: the exporter adds a configured
+// boot-epoch anchor (`epoch_sec`, REQUIRED for direct export) to the device's
+// monotonic micros×1000. Without an anchor the exporter disables itself rather
+// than emit non-epoch timestamps.
 
 /// Explicit histogram bucket upper bounds (µs), matching the telemetry
 /// histogram's log2 spacing: <64, <128, …, <4096, >=4096. Seven bounds delimit
@@ -264,6 +266,7 @@ impl<'a> SpanDoc<'a> {
         parent_id: &[u8],
         telemetry_kind: u8,
         status: u8,
+        flags: u32,
         start_nanos: u64,
         end_nanos: u64,
     ) {
@@ -291,6 +294,13 @@ impl<'a> SpanDoc<'a> {
         self.j.put(b"\",\"status\":{\"code\":");
         self.j.put_u64(status as u64);
         self.j.put(b"},");
+        // OTLP SpanFlags (low 8 bits = W3C trace-flags). Omit the default 0 to
+        // keep minimal records small; emit it when the span is sampled/marked.
+        if flags != 0 {
+            self.j.put(b"\"flags\":");
+            self.j.put_u64(flags as u64);
+            self.j.put(b",");
+        }
         self.j.put_module_attr(module);
         self.j.put(b"}");
     }

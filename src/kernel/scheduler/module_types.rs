@@ -192,11 +192,40 @@ pub const FRAME_KIND_ETH: u8 = 1;
 /// `NetProto` (IP / TLS / QUIC ↔ consumer ports). msg_type at
 /// byte 0, little-endian length at bytes 1..3.
 pub const FRAME_KIND_NET: u8 = 2;
+/// `[signal:u8][kind:u8]…` — content_type `Telemetry`. A
+/// `TelemetryRecord` (`modules/sdk/contracts/telemetry.rs`) is
+/// self-sizing: its total length is derived from `signal`+`kind`
+/// (no explicit length prefix), so a tee/merge fan must peek those two
+/// bytes and transfer the whole record. Without this, a fan splits a
+/// record mid-body and the `observe`/exporter drain mis-frames the tail.
+pub const FRAME_KIND_TELEMETRY: u8 = 3;
 
 /// Manifest `content_type` byte values that map to a non-NONE
-/// `FRAME_KIND_*`. Position must match `tools::manifest::CONTENT_TYPES`.
+/// `FRAME_KIND_*`. Position must match `tools::manifest::CONTENT_TYPES`
+/// (drift-guarded by `graph_unification::content_type_byte_maps_to_expected_frame_kind`).
 pub const CONTENT_TYPE_ETHERNET_FRAME: u8 = 19;
 pub const CONTENT_TYPE_NET_PROTO: u8 = 30;
+pub const CONTENT_TYPE_TELEMETRY: u8 = 35;
+
+/// Total length of a `TelemetryRecord` from its 2-byte `signal`+`kind`
+/// prefix. A kernel-side mirror of
+/// `abi::contracts::telemetry::record_len` — the fan can't link the
+/// module SDK, so the few stable sizes are duplicated here and pinned by
+/// `graph_unification::telemetry_record_len_mirrors_contract`. Returns 0
+/// for an unrecognised header (a malformed record the fan rejects).
+pub fn telemetry_record_len(signal: u8, kind: u8) -> usize {
+    // Mirror of contracts/telemetry.rs: SIGNAL_METRIC=2, SIGNAL_SPAN=3,
+    // METRIC_HISTOGRAM=3; scalar=24, histogram=80, span=64.
+    const SIGNAL_METRIC: u8 = 2;
+    const SIGNAL_SPAN: u8 = 3;
+    const METRIC_HISTOGRAM: u8 = 3;
+    match signal {
+        SIGNAL_METRIC if kind == METRIC_HISTOGRAM => 80,
+        SIGNAL_METRIC => 24,
+        SIGNAL_SPAN => 64,
+        _ => 0,
+    }
+}
 
 pub struct TeeModule {
     in_chan: i32,
@@ -358,7 +387,12 @@ impl TeeModule {
             // topology error.
             return Err(-4);
         }
-        if frame_len == 0 && self.frame_kind == FRAME_KIND_ETH {
+        // Zero frame_len: fatal for ETH (always ≥1 byte) and for TELEMETRY
+        // (record_len 0 = unrecognised/malformed header, which we must not
+        // forward as a bare 2-byte fragment). Valid for NET control frames.
+        if frame_len == 0
+            && (self.frame_kind == FRAME_KIND_ETH || self.frame_kind == FRAME_KIND_TELEMETRY)
+        {
             return Err(-4);
         }
 
@@ -403,6 +437,8 @@ pub(super) fn frame_kind_hdr_len(kind: u8) -> usize {
     match kind {
         FRAME_KIND_ETH => 2,
         FRAME_KIND_NET => 3,
+        // Peek `signal`+`kind` to size the self-describing record.
+        FRAME_KIND_TELEMETRY => 2,
         _ => 0,
     }
 }
@@ -414,6 +450,10 @@ pub(super) fn decode_frame_len(kind: u8, hdr: &[u8; 3]) -> usize {
         FRAME_KIND_ETH => (hdr[0] as usize) | ((hdr[1] as usize) << 8),
         // net_proto: msg_type at hdr[0], len at hdr[1..3].
         FRAME_KIND_NET => (hdr[1] as usize) | ((hdr[2] as usize) << 8),
+        // telemetry: total record length from signal+kind, minus the 2 peeked
+        // header bytes so `hdr_len + frame_len == record_len`. A 0 record_len
+        // (unrecognised header) yields frame_len 0 → rejected in `step_framed`.
+        FRAME_KIND_TELEMETRY => telemetry_record_len(hdr[0], hdr[1]).saturating_sub(2),
         _ => 0,
     }
 }
@@ -569,7 +609,10 @@ impl MergeModule {
             if total > buf.len() {
                 return Err(-4);
             }
-            if frame_len == 0 && self.frame_kind == FRAME_KIND_ETH {
+            // See TeeModule::step_framed — 0 is malformed for ETH and TELEMETRY.
+            if frame_len == 0
+                && (self.frame_kind == FRAME_KIND_ETH || self.frame_kind == FRAME_KIND_TELEMETRY)
+            {
                 return Err(-4);
             }
             if avail < total {

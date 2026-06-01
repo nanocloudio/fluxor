@@ -564,6 +564,9 @@ struct LinuxNetConn {
     write_offset: u32,
     /// Total valid bytes in `write_buf` (drained slice is `[offset..len]`).
     write_len: u32,
+    /// Requester tag from `CMD_CONNECT`, echoed in `MSG_CONNECTED` /
+    /// connect-failure `MSG_ERROR` so a fanned net_out routes the event back.
+    connect_tag: u8,
     write_buf: [u8; LINUX_NET_WRITE_BUF],
 }
 
@@ -575,6 +578,7 @@ impl LinuxNetConn {
         port: 0,
         write_offset: 0,
         write_len: 0,
+        connect_tag: 0,
         write_buf: [0u8; LINUX_NET_WRITE_BUF],
     };
 }
@@ -605,6 +609,12 @@ struct LinuxNetState {
     /// stale `CMD_SEND` bytes from the previous session land on the
     /// fresh connection's fd, scrambling its response stream.
     next_alloc: u8,
+    /// Control-frame (MSG_CONNECTED / CLOSED / ERROR / BOUND) retry queue. The
+    /// consumer channel is all-or-nothing; when it's momentarily full a tiny
+    /// control frame would otherwise be DROPPED, stranding a waiter. Queue it and
+    /// flush before each step. Bounded so a wedged consumer can't grow it without
+    /// limit (oldest dropped past the cap).
+    pending_ctrl: std::collections::VecDeque<([u8; 8], usize)>,
 }
 
 impl LinuxNetState {
@@ -619,7 +629,23 @@ impl LinuxNetState {
             // Skip slot 0 in initial rotation — it's almost always the
             // TCP listener bound by the first CMD_BIND.
             next_alloc: 1,
+            pending_ctrl: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Flush queued control frames; stops at the first one the channel can't
+    /// take so ordering is preserved. Returns true if the queue is now empty.
+    unsafe fn flush_pending_ctrl(&mut self) -> bool {
+        while let Some((frame, len)) = self.pending_ctrl.front() {
+            if self.net_out < 0 {
+                return false;
+            }
+            if channel::channel_write(self.net_out, frame.as_ptr(), *len) < *len as i32 {
+                return false;
+            }
+            self.pending_ctrl.pop_front();
+        }
+        true
     }
 }
 
@@ -647,7 +673,7 @@ fn linux_net_alloc_conn(st: &mut LinuxNetState) -> i32 {
     -1
 }
 
-unsafe fn linux_net_send_msg(st: &LinuxNetState, data: &[u8]) {
+unsafe fn linux_net_send_msg(st: &mut LinuxNetState, data: &[u8]) {
     if st.net_out < 0 || data.is_empty() {
         return;
     }
@@ -667,7 +693,25 @@ unsafe fn linux_net_send_msg(st: &LinuxNetState, data: &[u8]) {
         frame[3..3 + payload.len()].copy_from_slice(payload);
     }
     let total = 3 + payload.len();
-    channel::channel_write(st.net_out, frame.as_ptr(), total);
+    // Preserve ordering: if anything is already queued, OR this write doesn't
+    // fully land, enqueue for retry rather than dropping the terminal result.
+    // Small control frames (≤8 B) fit the queue slot; larger frames (datagram
+    // RX) fall back to best-effort (they're not terminal results).
+    let queued_empty = st.flush_pending_ctrl();
+    if queued_empty
+        && channel::channel_write(st.net_out, frame.as_ptr(), total) == total as i32
+    {
+        return;
+    }
+    if total <= 8 {
+        const PENDING_CTRL_CAP: usize = 256;
+        if st.pending_ctrl.len() >= PENDING_CTRL_CAP {
+            st.pending_ctrl.pop_front(); // bounded — drop oldest under sustained wedge
+        }
+        let mut slot = [0u8; 8];
+        slot[..total].copy_from_slice(&frame[..total]);
+        st.pending_ctrl.push_back((slot, total));
+    }
 }
 
 unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
@@ -895,7 +939,10 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
                     st.msg_buf.as_mut_ptr().add(9),
                     n,
                 );
-                linux_net_send_msg(st, &st.msg_buf[..1 + payload_len]);
+                // Copy out so `st` is free to borrow mutably in the send (the
+                // datagram RX frame lives in `st.msg_buf`).
+                let msg = st.msg_buf[..1 + payload_len].to_vec();
+                linux_net_send_msg(st, &msg);
                 had_work = true;
             }
         }
@@ -904,22 +951,40 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
     had_work
 }
 
-unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, port: u16) {
+unsafe fn linux_net_cmd_connect(
+    st: &mut LinuxNetState,
+    sock_type: u8,
+    ip: u32,
+    port: u16,
+    tag: u8,
+) {
+    // STREAM-only surface (net_proto Stream Surface v1). Datagram traffic uses
+    // the datagram surface (CMD_DG_BIND / CMD_DG_SEND_TO), not CMD_CONNECT, so a
+    // non-stream sock_type is rejected with EINVAL — matching the bare-metal IP
+    // module and the public contract.
+    const SOCK_TYPE_STREAM: u8 = 1;
+    if sock_type != SOCK_TYPE_STREAM {
+        let msg = [MSG_ERROR, 0u8, 22u8, tag]; // EINVAL, no slot allocated
+        linux_net_send_msg(st, &msg);
+        return;
+    }
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free connection slots");
+        // Tagged terminal result (ENOMEM) so the requester completes.
+        let msg = [MSG_ERROR, 0u8, 12u8, tag];
+        linux_net_send_msg(st, &msg);
         return;
     }
     let idx = slot as usize;
 
-    let libc_type = if sock_type == 2 {
-        libc::SOCK_DGRAM
-    } else {
-        libc::SOCK_STREAM
-    };
-    let fd = libc::socket(libc::AF_INET, libc_type, 0);
+    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
     if fd < 0 {
         log::error!("[linux_net] socket() failed for connect");
+        st.conns[idx] = LinuxNetConn::EMPTY; // release the slot we reserved
+        let errno = *libc::__errno_location();
+        let msg = [MSG_ERROR, idx as u8, errno as u8, tag];
+        linux_net_send_msg(st, &msg);
         return;
     }
 
@@ -941,7 +1006,7 @@ unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, 
         if errno != libc::EINPROGRESS {
             log::error!("[linux_net] connect() failed errno={errno}");
             libc::close(fd);
-            let msg = [MSG_ERROR, idx as u8, errno as u8];
+            let msg = [MSG_ERROR, idx as u8, errno as u8, tag];
             linux_net_send_msg(st, &msg);
             return;
         }
@@ -949,6 +1014,7 @@ unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, 
             fd,
             conn_type: sock_type,
             state: 1,
+            connect_tag: tag,
             ..LinuxNetConn::EMPTY
         };
     } else {
@@ -956,9 +1022,10 @@ unsafe fn linux_net_cmd_connect(st: &mut LinuxNetState, sock_type: u8, ip: u32, 
             fd,
             conn_type: sock_type,
             state: 2,
+            connect_tag: tag,
             ..LinuxNetConn::EMPTY
         };
-        let msg = [MSG_CONNECTED, idx as u8];
+        let msg = [MSG_CONNECTED, idx as u8, tag];
         linux_net_send_msg(st, &msg);
     }
 }
@@ -1264,15 +1331,16 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                         &mut err as *mut i32 as *mut libc::c_void,
                         &mut errlen,
                     );
+                    let tag = st.conns[i].connect_tag;
                     if err == 0 {
                         st.conns[i].state = 2;
-                        let msg = [MSG_CONNECTED, i as u8];
+                        let msg = [MSG_CONNECTED, i as u8, tag];
                         linux_net_send_msg(st, &msg);
                         had_work = true;
                     } else {
                         libc::close(st.conns[i].fd);
                         st.conns[i] = LinuxNetConn::EMPTY;
-                        let msg = [MSG_ERROR, i as u8, err as u8];
+                        let msg = [MSG_ERROR, i as u8, err as u8, tag];
                         linux_net_send_msg(st, &msg);
                     }
                 }
@@ -1280,28 +1348,58 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             continue;
         }
 
+        // BACKPRESSURE: kernel channel writes are all-or-nothing, so read from
+        // the socket only as many bytes as the consumer channel can accept right
+        // now — leaving the rest in the socket so TCP windows the peer down.
+        // Reading more and dropping the overflow would silently corrupt the
+        // stream. Bound the recv to the writable space minus chunk-framing
+        // overhead (≤4 B per ≤MSS fragment).
+        const MAX_DATA_FRAGMENT: usize = 1460; // mirrors net_proto::MAX_DATA_FRAGMENT
+        let room = if st.net_out >= 0 {
+            channel::channel_writable_bytes(st.net_out)
+        } else {
+            0
+        };
+        // Each fragment adds 4 B (hdr + conn_id); 64 B covers the worst case for
+        // a full recv_buf (≤12 fragments → ≤48 B).
+        let cap = st.recv_buf.len().min(room.saturating_sub(64));
+        if cap == 0 {
+            continue; // channel full — don't read; let TCP backpressure the peer.
+        }
         let n = libc::recv(
             st.conns[i].fd,
             st.recv_buf.as_mut_ptr() as *mut libc::c_void,
-            st.recv_buf.len(),
+            cap,
             0,
         );
         if n > 0 {
-            let payload_len = 1 + n as usize;
-            let frame_len = 3 + payload_len;
-            if frame_len <= st.msg_buf.len() {
+            // CHUNK the read into ≤MAX_DATA_FRAGMENT frames (the recv was bounded
+            // so every chunk is guaranteed to fit the channel — no drops).
+            let total = n as usize;
+            let mut off = 0usize;
+            while off < total {
+                let chunk = (total - off).min(MAX_DATA_FRAGMENT);
+                let payload_len = 1 + chunk;
+                let frame_len = 3 + payload_len;
+                if frame_len > st.msg_buf.len() {
+                    break;
+                }
                 st.msg_buf[0] = MSG_DATA;
                 st.msg_buf[1] = payload_len as u8;
                 st.msg_buf[2] = (payload_len >> 8) as u8;
                 st.msg_buf[3] = i as u8;
                 core::ptr::copy_nonoverlapping(
-                    st.recv_buf.as_ptr(),
+                    st.recv_buf.as_ptr().add(off),
                     st.msg_buf.as_mut_ptr().add(4),
-                    n as usize,
+                    chunk,
                 );
-                if st.net_out >= 0 {
-                    channel::channel_write(st.net_out, st.msg_buf.as_ptr(), frame_len);
+                let wrote = channel::channel_write(st.net_out, st.msg_buf.as_ptr(), frame_len);
+                if wrote < frame_len as i32 {
+                    // Shouldn't happen (recv was bounded) — but never advance past
+                    // an unwritten chunk; stop and retry next step.
+                    break;
                 }
+                off += chunk;
             }
             had_work = true;
         } else if n == 0 {
@@ -1340,6 +1438,12 @@ fn linux_net_step(state: *mut u8) -> i32 {
 
         let mut had_work = false;
 
+        // Retry any control frames a back-pressured consumer dropped earlier, so
+        // terminal results (MSG_CONNECTED / CLOSED / ERROR) are never lost.
+        if !st.flush_pending_ctrl() {
+            had_work = true; // still draining — keep getting scheduled
+        }
+
         // Drain per-connection write backlogs first. If any connection
         // is sitting on more than half a buffer of unsent bytes, defer
         // pulling new commands off the channel — the upstream channel
@@ -1359,7 +1463,25 @@ fn linux_net_step(state: *mut u8) -> i32 {
                 }
                 let msg_type = hdr[0];
                 let payload_len = (hdr[1] as u16 | ((hdr[2] as u16) << 8)) as usize;
-                if payload_len > 0 && payload_len <= st.cmd_buf.len() {
+                if payload_len > st.cmd_buf.len() {
+                    // Oversized command (a consumer exceeding MAX_CMD_DATA). The
+                    // body would NOT fit our scratch; DRAIN it from the FIFO so
+                    // the next read starts on a real header, then skip the frame
+                    // rather than parsing stale cmd_buf bytes mid-stream.
+                    let mut left = payload_len;
+                    let mut scratch = [0u8; 1024];
+                    while left > 0 {
+                        let take = left.min(scratch.len());
+                        let got = channel::channel_read(st.net_in, scratch.as_mut_ptr(), take);
+                        if got <= 0 {
+                            break;
+                        }
+                        left -= got as usize;
+                    }
+                    log::warn!("[linux_net] oversized command frame ({payload_len} B) dropped");
+                    continue;
+                }
+                if payload_len > 0 {
                     let n2 = channel::channel_read(st.net_in, st.cmd_buf.as_mut_ptr(), payload_len);
                     if n2 < payload_len as i32 {
                         break;
@@ -1381,7 +1503,10 @@ fn linux_net_step(state: *mut u8) -> i32 {
                             st.cmd_buf[4],
                         ]);
                         let port = u16::from_le_bytes([st.cmd_buf[5], st.cmd_buf[6]]);
-                        linux_net_cmd_connect(st, sock_type, ip, port);
+                        // Optional trailing requester tag (8-byte form), echoed in
+                        // MSG_CONNECTED / MSG_ERROR for fanned-net_out routing.
+                        let tag = if payload_len >= 8 { st.cmd_buf[7] } else { 0 };
+                        linux_net_cmd_connect(st, sock_type, ip, port, tag);
                         had_work = true;
                     }
                     CMD_SEND if payload_len >= 2 => {

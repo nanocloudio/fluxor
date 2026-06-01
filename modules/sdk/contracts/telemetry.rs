@@ -20,8 +20,11 @@
 //   header   [signal u8][kind u8][module u16][t_micros u64]
 //   metric   [id u16][_rsvd u16][value u64]                  (scalar → 24 B)
 //   metric   [id u16][_rsvd u16][bucket u64 × 8]             (histogram → 80 B)
-//   span     [name_id u16][status u8][_rsvd u8]
+//   span     [name_id u16][status u8][flags u8]
 //            [trace_id 16][span_id 8][parent_id 8][start u64][end u64]  (→ 64 B)
+//
+// `flags` is the W3C trace-flags byte (low bit = `sampled`); it occupies what
+// was a reserved byte, so the record size is unchanged.
 
 // ── Signal discriminator (header[0]) ────────────────────────────────
 pub const SIGNAL_LOG: u8 = 1; // reserved — logs ride log_ring
@@ -58,6 +61,11 @@ pub const SPAN_SIZE: usize = HEADER_SIZE + 52;
 /// W3C trace-context id widths.
 pub const TRACE_ID_LEN: usize = 16;
 pub const SPAN_ID_LEN: usize = 8;
+
+/// W3C trace-flags `sampled` bit (low bit of the flags byte). The device does
+/// no probabilistic sampling, so a minted root sets this; ingress-propagated
+/// contexts carry whatever the caller decided.
+pub const TRACE_FLAGS_SAMPLED: u8 = 0x01;
 
 // ── UDP batch envelope (otel_udp_sample exporter → host collector) ──────
 //
@@ -207,6 +215,8 @@ pub struct SpanContext {
     pub trace_id: [u8; TRACE_ID_LEN],
     pub span_id: [u8; SPAN_ID_LEN],
     pub parent_id: [u8; SPAN_ID_LEN],
+    /// W3C trace-flags byte (low bit = `sampled`). See [`TRACE_FLAGS_SAMPLED`].
+    pub flags: u8,
 }
 
 /// Encode a span record. Returns the total record length, or `None` if `buf` is
@@ -232,7 +242,7 @@ pub fn write_span(
     write_header(buf, SIGNAL_SPAN, span_kind, module, t_micros)?;
     buf[12..14].copy_from_slice(&name_id.to_le_bytes());
     buf[14] = status;
-    buf[15] = 0;
+    buf[15] = ctx.flags;
     buf[16..32].copy_from_slice(&ctx.trace_id);
     buf[32..40].copy_from_slice(&ctx.span_id);
     buf[40..48].copy_from_slice(&ctx.parent_id);
@@ -247,6 +257,11 @@ pub fn span_name_id(buf: &[u8]) -> u16 {
 
 pub fn span_status(buf: &[u8]) -> u8 {
     buf[14]
+}
+
+/// W3C trace-flags byte (low bit = `sampled`). See [`TRACE_FLAGS_SAMPLED`].
+pub fn span_flags(buf: &[u8]) -> u8 {
+    buf[15]
 }
 
 pub fn span_start_micros(buf: &[u8]) -> u64 {
@@ -292,8 +307,13 @@ pub const TRACE_FLAG_SAMPLED: u8 = 0x01;
 /// Parse a W3C `traceparent` header value. Returns
 /// `(trace_id, parent_span_id, flags)`, or `None` if malformed, an unsupported
 /// version, or an all-zero trace/span id (both forbidden by the spec).
+///
+/// Strict to W3C version `00`: the value must be EXACTLY 55 bytes and all hex
+/// digits LOWERCASE (`decode_hex` / `hex_byte` reject uppercase). Trailing bytes
+/// — which a later version might append — are rejected here because no later
+/// version is defined.
 pub fn parse_traceparent(s: &[u8]) -> Option<([u8; TRACE_ID_LEN], [u8; SPAN_ID_LEN], u8)> {
-    if s.len() < 55 || s[2] != b'-' || s[35] != b'-' || s[52] != b'-' {
+    if s.len() != 55 || s[2] != b'-' || s[35] != b'-' || s[52] != b'-' {
         return None;
     }
     if hex_byte(s[0], s[1])? != 0 {
@@ -310,11 +330,12 @@ pub fn parse_traceparent(s: &[u8]) -> Option<([u8; TRACE_ID_LEN], [u8; SPAN_ID_L
     Some((trace_id, span_id, flags))
 }
 
+/// Lowercase-only hex digit decode. W3C `traceparent` mandates lowercase, so an
+/// uppercase digit is a malformed header (rejected), not an alternate spelling.
 fn hex_val(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
 }

@@ -13,8 +13,9 @@ use super::connection::{
 use super::wire_h1 as h1;
 use super::HttpState;
 use super::{
-    dev_channel_port, dev_log, dev_millis, net_read_frame, net_write_frame, E_AGAIN, NET_FRAME_HDR,
-    POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame,
+    net_read_frame_aligned, net_write_frame, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT,
+    SOCK_TYPE_STREAM,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -55,7 +56,12 @@ pub(crate) enum Phase {
 #[repr(C)]
 pub(crate) struct ClientState {
     pub(crate) conn_id: u8,
-    _conn_pad: [u8; 3],
+    /// 1 once `MSG_CONNECTED` established a connection, 0 otherwise. Tracks
+    /// connection PRESENCE separately from `conn_id`'s value because IP can
+    /// legitimately assign `conn_id == 0`; keying "connected" off `conn_id != 0`
+    /// would leak the first connection (its `CMD_CLOSE` suppressed).
+    pub(crate) conn_present: u8,
+    _conn_pad: [u8; 2],
     pub(crate) out_chan: i32,
     /// `in[1]` — when wired (≥ 0), the WS client reads outgoing
     /// payloads from this channel and emits them as WS TEXT frames.
@@ -172,7 +178,7 @@ unsafe fn build_request(s: &mut HttpState) {
 }
 
 unsafe fn send_close_frame(s: &mut HttpState) {
-    if s.client.conn_id == 0 || s.net_out_chan < 0 {
+    if s.client.conn_present == 0 || s.net_out_chan < 0 {
         return;
     }
     let sys = &*s.syscalls;
@@ -190,6 +196,25 @@ unsafe fn send_close_frame(s: &mut HttpState) {
         NET_BUF_SIZE,
     );
     s.client.conn_id = 0;
+    s.client.conn_present = 0;
+}
+
+/// True when a just-read established-stream frame (`MSG_DATA` / `MSG_CLOSED` /
+/// `MSG_ERROR`, all of which lead with `conn_id`) belongs to a DIFFERENT
+/// connection than this client's. `ip.net_out` can be fanned to other stream
+/// consumers, so a client must not consume another connection's bytes as its
+/// own response. The frame has already been read (FIFO stays aligned); the
+/// caller simply ignores it.
+#[inline(always)]
+unsafe fn is_foreign_frame(
+    s: &HttpState,
+    msg_type: u8,
+    payload_len: usize,
+    nbuf: *const u8,
+) -> bool {
+    matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
+        && payload_len >= 1
+        && *nbuf.add(NET_FRAME_HDR) != s.client.conn_id
 }
 
 // ── Per-tick step machine ──────────────────────────────────────────────────
@@ -211,8 +236,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let sys = &*s.syscalls;
                 let chan = s.net_out_chan;
                 let buf = s.net_buf.as_mut_ptr();
-                // CMD_CONNECT payload: [sock_type: u8] [ip: u32 LE] [port: u16 LE]
-                let mut payload = [0u8; 7];
+                // CMD_CONNECT payload: [sock_type][ip:4][port:2][requester_tag].
+                // The tag (our module index) is echoed in MSG_CONNECTED so that
+                // when ip.net_out is fanned to another stream consumer (e.g. an
+                // OTLP exporter) we claim only our own outbound connection.
+                let mut payload = [0u8; 8];
                 payload[0] = SOCK_TYPE_STREAM;
                 let ip_bytes = s.client.host_ip.to_le_bytes();
                 payload[1] = ip_bytes[0];
@@ -221,12 +249,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 payload[4] = ip_bytes[3];
                 payload[5] = (s.client.port & 0xFF) as u8;
                 payload[6] = (s.client.port >> 8) as u8;
+                payload[7] = dev_requester_tag(sys);
                 let wrote = net_write_frame(
                     sys,
                     chan,
                     NET_CMD_CONNECT,
                     payload.as_ptr(),
-                    7,
+                    8,
                     buf,
                     NET_BUF_SIZE,
                 );
@@ -249,15 +278,39 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     let buf = s.net_buf.as_mut_ptr();
                     let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
                     if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                        // Claim only our own outbound connection: MSG_CONNECTED
+                        // is `[conn_id][requester_tag]`; the tag echoes our
+                        // CMD_CONNECT index. Untagged (legacy/sole-consumer) or
+                        // our tag → ours; any other tag belongs to a co-wired
+                        // consumer sharing this fanned queue, so ignore it.
+                        let tag = if payload_len >= 2 {
+                            *buf.add(NET_FRAME_HDR + 1)
+                        } else {
+                            0
+                        };
+                        let me = dev_requester_tag(sys);
+                        if tag != 0 && tag != me {
+                            return 0; // another consumer's connection — keep waiting.
+                        }
                         s.client.conn_id = *buf.add(NET_FRAME_HDR);
+                        s.client.conn_present = 1;
                         log(s, b"[http] connected");
                         build_request(s);
                         s.client.phase = Phase::SendRequest;
                         continue;
                     } else if msg_type == NET_MSG_ERROR {
-                        log(s, b"[http] connect error");
-                        s.client.phase = Phase::Error;
-                        return E_CONNECT_FAILED;
+                        // Connect failure carries our tag at payload[2]
+                        // ([conn_id][errno][tag]); ignore another consumer's.
+                        let etag = if payload_len >= 3 {
+                            *buf.add(NET_FRAME_HDR + 2)
+                        } else {
+                            0
+                        };
+                        if etag == 0 || etag == dev_requester_tag(sys) {
+                            log(s, b"[http] connect error");
+                            s.client.phase = Phase::Error;
+                            return E_CONNECT_FAILED;
+                        }
                     }
                 }
                 if dev_millis(sys).wrapping_sub(s.client.connect_start_ms) >= CONNECT_TIMEOUT_MS {
@@ -320,7 +373,15 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 }
 
                 let nbuf = s.net_buf.as_mut_ptr();
-                let (msg_type, payload_len) = net_read_frame(sys, chan, nbuf, NET_BUF_SIZE);
+                let (msg_type, payload_len, _full) =
+                    net_read_frame_aligned(sys, chan, nbuf, NET_BUF_SIZE);
+
+                // Established-stream isolation: ip.net_out may be fanned to other
+                // stream consumers (e.g. an OTLP exporter); ignore any DATA/CLOSED
+                // /ERROR frame that isn't for our own connection.
+                if is_foreign_frame(s, msg_type, payload_len, nbuf) {
+                    return 0;
+                }
 
                 if msg_type == NET_MSG_CLOSED {
                     log(s, b"[http] premature close");
@@ -389,7 +450,12 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 }
 
                 let nbuf = s.net_buf.as_mut_ptr();
-                let (msg_type, payload_len) = net_read_frame(sys, chan, nbuf, NET_BUF_SIZE);
+                let (msg_type, payload_len, _full) =
+                    net_read_frame_aligned(sys, chan, nbuf, NET_BUF_SIZE);
+
+                if is_foreign_frame(s, msg_type, payload_len, nbuf) {
+                    return 0;
+                }
 
                 if msg_type == NET_MSG_CLOSED {
                     log(s, b"[http] transfer done");
