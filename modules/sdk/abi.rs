@@ -104,6 +104,10 @@ pub mod contracts {
     pub mod telemetry {
         include!("contracts/telemetry.rs");
     }
+    /// OTLP/JSON metric encoder (the `otlp_http` exporter's wire form).
+    pub mod otlp {
+        include!("contracts/otlp.rs");
+    }
     pub mod storage {
         pub mod graph_slot {
             include!("contracts/storage/graph_slot.rs");

@@ -1,0 +1,32 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+permissions = ["platform_raw"]
+
+# Module-scope telemetry arrives here as fixed-layout `TelemetryRecord`s
+# (modules/sdk/contracts/telemetry.rs) — the same edge the `observe` collector
+# consumes. Tee an instrumented module's `telemetry` output to both to export
+# over UDP while still rendering MON_ lines on log_ring.
+[[ports]]
+name = "telemetry"
+direction = "input"
+content_type = "Telemetry"
+
+# Datagram surface to the IP module, identical to log_net's wiring:
+#   ip.net_out -> otel_udp_sample.net_in   (inbound frames — MSG_DG_BOUND etc.)
+#   otel_udp_sample.net_out -> ip.net_in   (CMD_DG_BIND + CMD_DG_SEND_TO)
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+
+# This module *forwards* telemetry; it does not originate any. It is exempt
+# from the instrumentation contract (standards/observability.md §6).
+[observability]
+exempt = "telemetry exporter — forwards records, originates none"

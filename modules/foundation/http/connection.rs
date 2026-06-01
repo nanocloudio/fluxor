@@ -17,6 +17,10 @@ pub(crate) const NET_MSG_CLOSED: u8 = 0x03;
 pub(crate) const NET_MSG_BOUND: u8 = 0x04;
 pub(crate) const NET_MSG_CONNECTED: u8 = 0x05;
 pub(crate) const NET_MSG_ERROR: u8 = 0x06;
+/// Observability trace context (see contracts/net/net_proto.rs). Received from
+/// IP (plain HTTP) or TLS (HTTPS) to parent `http.server.request` under the
+/// upstream span. 0x07/0x08 are the IP-private RETRANSMIT/ACK opcodes.
+pub(crate) const NET_MSG_TRACE_CTX: u8 = 0x09;
 
 // ── Outbound commands to the IP module ──
 pub(crate) const NET_CMD_BIND: u8 = 0x10;

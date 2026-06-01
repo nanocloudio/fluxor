@@ -34,6 +34,21 @@ pub const MSG_BOUND: u8 = 0x04;
 pub const MSG_CONNECTED: u8 = 0x05;
 /// Error. Payload: [conn_id: u8] [errno: i8]
 pub const MSG_ERROR: u8 = 0x06;
+// 0x07 / 0x08 are reserved: the IP module privately uses them for
+// `MSG_RETRANSMIT` / `MSG_ACK` (consumer-side retransmit + send-buffer release)
+// on the same channel. The next free downstream opcode is 0x09.
+
+/// Observability trace context for a connection (W3C). Emitted by the ingress
+/// (IP) right after `MSG_ACCEPTED`, and re-emitted by each forwarding stage
+/// (TLS) with its own span id, so the next stage parents its span correctly.
+/// Payload: `[conn_id: u8][trace_id: 16][parent_span_id: 8]` (25 bytes). Purely
+/// additive and best-effort (direct write, dropped if the channel is full) — a
+/// stage that doesn't trace discards it like any unknown frame, so it never
+/// affects the data path. See `standards/observability.md`.
+pub const MSG_TRACE_CTX: u8 = 0x09;
+
+/// `MSG_TRACE_CTX` payload length: conn_id + 16-byte trace id + 8-byte span id.
+pub const TRACE_CTX_LEN: usize = 1 + 16 + 8;
 
 // Upstream: consumer → IP/net
 /// Bind to port and listen. Payload: [port: u16 LE]

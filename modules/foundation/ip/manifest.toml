@@ -33,3 +33,7 @@ content_type = "Telemetry"
 
 [observability]
 metrics = ["bytes_in", "bytes_out"]
+# Span 0: one `tcp.connection` span per accepted connection (accept -> close),
+# the ingress root of a trace. Emitted on the same telemetry port; minted only
+# when wired (zero-cost otherwise).
+spans = ["tcp.connection"]

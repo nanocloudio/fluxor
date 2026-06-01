@@ -102,6 +102,57 @@ pub fn request_keeps_alive(head: &[u8]) -> bool {
     saw_keep
 }
 
+/// Find an HTTP/1 header by case-insensitive name in a parsed request head
+/// (request line + header lines through the blank line). Returns the trimmed
+/// value of the first matching header, or `None`. Used for `traceparent`
+/// trace-context ingress.
+pub fn find_header<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    // Skip the request line (up to its CRLF).
+    let mut cursor = 0usize;
+    while cursor + 1 < head.len() {
+        if head[cursor] == b'\r' && head[cursor + 1] == b'\n' {
+            break;
+        }
+        cursor += 1;
+    }
+    if cursor + 1 >= head.len() {
+        return None;
+    }
+    cursor += 2;
+    while cursor < head.len() {
+        let line_start = cursor;
+        let mut nl = line_start;
+        while nl + 1 < head.len() {
+            if head[nl] == b'\r' && head[nl + 1] == b'\n' {
+                break;
+            }
+            nl += 1;
+        }
+        if nl == line_start {
+            break; // blank line = end of head
+        }
+        if nl + 1 >= head.len() {
+            break; // truncated
+        }
+        let line = &head[line_start..nl];
+        if let Some(colon) = line.iter().position(|c| *c == b':') {
+            if line[..colon].eq_ignore_ascii_case(name) {
+                let mut vs = colon + 1;
+                while vs < line.len() && (line[vs] == b' ' || line[vs] == b'\t') {
+                    vs += 1;
+                }
+                let mut ve = line.len();
+                while ve > vs && (line[ve - 1] == b' ' || line[ve - 1] == b'\t') {
+                    ve -= 1;
+                }
+                return Some(&line[vs..ve]);
+            }
+        }
+        cursor = nl + 2;
+    }
+    None
+}
+
 /// Locate the end-of-headers sentinel `\r\n\r\n` in a partial HTTP/1
 /// message. Returns the byte offset *after* the sentinel — i.e. where
 /// the body begins — or `None` if the sentinel is not yet present.

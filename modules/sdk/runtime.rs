@@ -1273,6 +1273,47 @@ unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
     (sys.provider_call)(-1, 0x0C3C, buf, len)
 }
 
+/// Build + emit a `MSG_TRACE_CTX` frame carrying a connection's W3C trace
+/// context downstream (ingress IP after MSG_ACCEPTED, or a forwarding stage with
+/// its own span id). Payload: `[conn_id][trace_id 16][parent_span_id 8]`.
+/// Returns true if the frame was written. See `contracts/net/net_proto.rs`.
+#[allow(dead_code, reason = "observability propagation; invoked only by instrumented stream stages")]
+unsafe fn dev_net_send_trace_ctx(
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: u8,
+    trace_id: &[u8; 16],
+    span_id: &[u8; 8],
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> bool {
+    use abi::contracts::net::net_proto::{MSG_TRACE_CTX, TRACE_CTX_LEN};
+    let mut payload = [0u8; TRACE_CTX_LEN];
+    payload[0] = conn_id;
+    payload[1..17].copy_from_slice(trace_id);
+    payload[17..25].copy_from_slice(span_id);
+    net_write_frame(sys, chan, MSG_TRACE_CTX, payload.as_ptr(), TRACE_CTX_LEN, scratch, scratch_max)
+        > 0
+}
+
+/// Parse a received `MSG_TRACE_CTX` frame. `frame_buf` points at the frame start
+/// (including the 3-byte net_proto header); `payload_len` is from
+/// `net_read_frame`. Returns `(conn_id, trace_id, parent_span_id)` or `None`.
+#[allow(dead_code, reason = "observability propagation; invoked only by instrumented stream stages")]
+unsafe fn parse_trace_ctx(frame_buf: *const u8, payload_len: usize) -> Option<(u8, [u8; 16], [u8; 8])> {
+    use abi::contracts::net::net_proto::TRACE_CTX_LEN;
+    if payload_len < TRACE_CTX_LEN {
+        return None;
+    }
+    let p = frame_buf.add(NET_FRAME_HDR);
+    let conn_id = *p;
+    let mut trace_id = [0u8; 16];
+    let mut span_id = [0u8; 8];
+    core::ptr::copy_nonoverlapping(p.add(1), trace_id.as_mut_ptr(), 16);
+    core::ptr::copy_nonoverlapping(p.add(17), span_id.as_mut_ptr(), 8);
+    Some((conn_id, trace_id, span_id))
+}
+
 // ============================================================================
 // datagram contract helpers (modules/sdk/contracts/net/datagram.rs)
 // ============================================================================
@@ -1312,8 +1353,11 @@ const DG_AF_INET6: u8 = 6;
 /// the wire-order octets). Port is little-endian per contract.
 ///
 /// Returns total bytes handed to `channel_write` (NET_FRAME_HDR +
-/// payload_len), or `0` on validation failure (chan < 0, ep_id == 0xFF,
-/// scratch too small for `DG_V4_PREFIX + data_len + NET_FRAME_HDR`).
+/// payload_len). Returns `0` on validation failure (chan < 0, ep_id == 0xFF,
+/// scratch too small for `DG_V4_PREFIX + data_len + NET_FRAME_HDR`) **or when
+/// the channel rejected the write (backpressure)** — the datagram frame is
+/// atomic, so a short write is a drop. Callers MUST treat 0 as "not sent" and
+/// retain the payload.
 ///
 /// See `modules/sdk/contracts/net/datagram.rs` for the wire spec.
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
@@ -1354,8 +1398,14 @@ unsafe fn dev_dg_send_to_v4(
     if data_len > 0 && !data.is_null() {
         core::ptr::copy_nonoverlapping(data, scratch.add(NET_FRAME_HDR + DG_V4_PREFIX), data_len);
     }
-    (sys.channel_write)(chan, scratch, total);
-    total
+    // Honour backpressure: a datagram frame is atomic, so anything short of the
+    // full `total` means the channel rejected it. Return 0 so the caller keeps
+    // the unsent payload instead of treating a dropped write as success.
+    if (sys.channel_write)(chan, scratch, total) == total as i32 {
+        total
+    } else {
+        0
+    }
 }
 
 /// Parse a `MSG_DG_RX_FROM` frame's payload as IPv4. Caller passes the
@@ -1399,6 +1449,7 @@ unsafe fn parse_dg_rx_from_v4(
 unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
 }
+
 
 /// Emit a scalar metric (counter / up-down) on a telemetry output channel.
 /// No-op if `chan < 0`, so instrumentation costs nothing when the telemetry
@@ -1449,6 +1500,77 @@ unsafe fn dev_telemetry_histogram(
     ) {
         let _ = (sys.channel_write)(chan, buf.as_ptr(), n);
     }
+}
+
+/// Emit a span on a telemetry output channel. No-op if `chan < 0`, so an
+/// uninstrumented (unwired) graph costs nothing. `ctx` carries the W3C trace
+/// context (trace/span/parent ids); `start_micros`/`end_micros` come from
+/// [`dev_micros`]. The header stamp is the span end. See
+/// `modules/sdk/contracts/telemetry.rs` and `standards/observability.md`.
+#[allow(dead_code, reason = "emit-side helper; invoked only by instrumented modules")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a span carries the full W3C context plus timing as flat args to stay allocation-free on the emit path"
+)]
+#[inline]
+unsafe fn dev_telemetry_span(
+    sys: &SyscallTable,
+    chan: i32,
+    module_idx: u16,
+    name_id: u16,
+    span_kind: u8,
+    status: u8,
+    ctx: &abi::contracts::telemetry::SpanContext,
+    start_micros: u64,
+    end_micros: u64,
+) {
+    if chan < 0 {
+        return;
+    }
+    let mut buf = [0u8; abi::contracts::telemetry::SPAN_SIZE];
+    if let Some(n) = abi::contracts::telemetry::write_span(
+        &mut buf, module_idx, end_micros, name_id, span_kind, status, ctx, start_micros, end_micros,
+    ) {
+        let _ = (sys.channel_write)(chan, buf.as_ptr(), n);
+    }
+}
+
+/// Read one whole self-sized `TelemetryRecord` from a telemetry channel into
+/// `out`. Returns the record's total length (header + body), or 0 if no full
+/// record is available or the header is unrecognised. The `observe` collector
+/// and every exporter share this, so the self-sizing read
+/// (`header → record_len → body`) lives in one place rather than being copied
+/// into each drain loop. `out_max` must be ≥ the largest record
+/// (`METRIC_HIST_SIZE`); a record that wouldn't fit returns 0 (the caller stops
+/// rather than mis-framing). See `modules/sdk/contracts/telemetry.rs`.
+#[allow(dead_code, reason = "drain-side helper; invoked only by the collector + exporters")]
+unsafe fn dev_read_telemetry_record(
+    sys: &SyscallTable,
+    chan: i32,
+    out: *mut u8,
+    out_max: usize,
+) -> usize {
+    let hdr = abi::contracts::telemetry::HEADER_SIZE;
+    if out_max < hdr {
+        return 0;
+    }
+    let h = (sys.channel_read)(chan, out, hdr);
+    if h < hdr as i32 {
+        return 0; // no full header available.
+    }
+    // header[0] = signal, header[1] = kind.
+    let len = abi::contracts::telemetry::record_len(*out, *out.add(1));
+    if len < hdr || len > out_max {
+        return 0; // unrecognised / too large — stop rather than mis-frame.
+    }
+    let body = len - hdr;
+    if body > 0 {
+        let b = (sys.channel_read)(chan, out.add(hdr), body);
+        if b < body as i32 {
+            return 0;
+        }
+    }
+    len
 }
 
 /// Render `bytes` as lowercase hex into `out`. Caller must ensure

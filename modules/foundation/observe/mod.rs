@@ -256,23 +256,10 @@ unsafe fn drain_telemetry(s: &ObserveState) {
 
     let mut drained = 0u32;
     while drained < MAX_DRAIN_PER_STEP {
-        // Read the fixed header to learn the record's full length.
-        let h = (sys.channel_read)(chan, rec.as_mut_ptr(), tlm::HEADER_SIZE);
-        if h < tlm::HEADER_SIZE as i32 {
-            // No (full) header available — done for this step.
-            break;
-        }
-        let len = tlm::record_len(tlm::signal(&rec), tlm::kind(&rec));
-        if len < tlm::HEADER_SIZE || len > REC_BUF {
-            // Unrecognised / corrupt header — stop rather than mis-frame.
-            break;
-        }
-        let body = len - tlm::HEADER_SIZE;
-        if body > 0 {
-            let b = (sys.channel_read)(chan, rec.as_mut_ptr().add(tlm::HEADER_SIZE), body);
-            if b < body as i32 {
-                break;
-            }
+        // Shared self-sizing read (header → record_len → body).
+        let len = dev_read_telemetry_record(sys, chan, rec.as_mut_ptr(), REC_BUF);
+        if len == 0 {
+            break; // no full record, or unrecognised header.
         }
         let n = render_record(&rec[..len], &mut line);
         if n > 0 {

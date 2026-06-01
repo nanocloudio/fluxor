@@ -1777,7 +1777,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         tsys,
                         s.telemetry_chan,
                         me as u16,
-                        s.tick_count as u64,
+                        dev_micros(tsys),
                         abi::contracts::telemetry::METRIC_UPDOWN,
                         0,
                         s.file_count as u64,

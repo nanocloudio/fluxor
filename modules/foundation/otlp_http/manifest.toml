@@ -1,0 +1,32 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350"]
+permissions = ["platform_raw"]
+
+# Module-scope telemetry arrives here as fixed-layout `TelemetryRecord`s
+# (modules/sdk/contracts/telemetry.rs) — the same edge `observe` and
+# `otel_udp_sample` consume.
+[[ports]]
+name = "telemetry"
+direction = "input"
+content_type = "Telemetry"
+
+# Stream surface to the IP module (net_proto / Stream Surface v1). Outbound
+# TCP client: CMD_CONNECT -> MSG_CONNECTED, CMD_SEND, MSG_DATA, CMD_CLOSE.
+#   ip.net_out -> otlp_http.net_in     (MSG_CONNECTED / MSG_DATA / MSG_CLOSED)
+#   otlp_http.net_out -> ip.net_in     (CMD_CONNECT / CMD_SEND / CMD_CLOSE)
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+
+# Forwards telemetry as OTLP/HTTP; originates none. Exempt from the
+# instrumentation contract (standards/observability.md §6).
+[observability]
+exempt = "telemetry exporter — forwards records, originates none"

@@ -526,12 +526,82 @@ unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u8) -> bool {
 #[inline(always)]
 #[must_use]
 unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) -> bool {
-    net_send_short(s, NET_MSG_ACCEPTED, conn_id)
+    let ok = net_send_short(s, NET_MSG_ACCEPTED, conn_id);
+    // Observability: start a `tcp.connection` span for the accepted (server-
+    // side) connection, mint its root trace context, and propagate that context
+    // downstream (best-effort `MSG_TRACE_CTX`, right after ACCEPTED) so TLS/HTTP
+    // parent their spans under it. One predicate — no clock read, no work — when
+    // the telemetry port is unwired, so tracing is zero-cost when disabled.
+    if ok && s.telemetry_chan >= 0 {
+        let idx = conn_id as usize;
+        if idx < tcp::MAX_TCP_CONNS {
+            let sys = &*s.syscalls;
+            let now = dev_micros(sys);
+            // `0` means "no span"; clamp a (boot-impossible) 0 to 1 so a real
+            // accept is never mistaken for an unspanned slot.
+            s.tcp_conns[idx].span_start_us = if now == 0 { 1 } else { now };
+            dev_csprng_fill(sys, s.tcp_conns[idx].trace_id.as_mut_ptr(), 16);
+            dev_csprng_fill(sys, s.tcp_conns[idx].span_id.as_mut_ptr(), 8);
+            let trace_id = s.tcp_conns[idx].trace_id;
+            let span_id = s.tcp_conns[idx].span_id;
+            let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
+            dev_net_send_trace_ctx(
+                sys,
+                s.net_out_chan,
+                conn_id,
+                &trace_id,
+                &span_id,
+                scratch.as_mut_ptr(),
+                scratch.len(),
+            );
+        }
+    }
+    ok
 }
 
 #[inline(always)]
 unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) -> bool {
+    // Observability: emit the `tcp.connection` span before the close frame so a
+    // full out-queue can't skip it. Only fires for a span that was started
+    // (server-accepted, telemetry wired); client connects never set it.
+    let idx = conn_id as usize;
+    if s.telemetry_chan >= 0 && idx < tcp::MAX_TCP_CONNS && s.tcp_conns[idx].span_start_us != 0 {
+        emit_conn_span(s, idx);
+        s.tcp_conns[idx].span_start_us = 0;
+    }
     net_send_short(s, NET_MSG_CLOSED, conn_id)
+}
+
+/// Emit the finished `tcp.connection` span using the connection's root trace
+/// context (minted at accept, also propagated downstream), so the span and the
+/// `MSG_TRACE_CTX` children share one `trace_id` / parent `span_id`. `name_id =
+/// 0` is the first `[observability].spans` entry.
+#[inline(never)]
+unsafe fn emit_conn_span(s: &mut IpState, idx: usize) {
+    let sys = &*s.syscalls;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let start = s.tcp_conns[idx].span_start_us;
+    let end_raw = dev_micros(sys);
+    let end = if end_raw < start { start } else { end_raw };
+    let ctx = abi::contracts::telemetry::SpanContext {
+        trace_id: s.tcp_conns[idx].trace_id,
+        span_id: s.tcp_conns[idx].span_id,
+        parent_id: [0u8; 8], // ip is the ingress → root span (no parent)
+    };
+    dev_telemetry_span(
+        sys,
+        s.telemetry_chan,
+        me as u16,
+        0, // name_id 0 = tcp.connection
+        abi::contracts::telemetry::SPAN_SERVER,
+        abi::contracts::telemetry::STATUS_OK,
+        &ctx,
+        start,
+        end,
+    );
 }
 
 /// MSG_BOUND payload: `[conn_id:1][local_port:2 LE]`. Consumers that
@@ -994,7 +1064,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let me = dev_self_index(tsys);
             if me >= 0 {
                 let midx = me as u16;
-                let t = s.step_count as u64;
+                let t = dev_micros(tsys);
                 let counter = abi::contracts::telemetry::METRIC_COUNTER;
                 dev_telemetry_metric(
                     tsys,

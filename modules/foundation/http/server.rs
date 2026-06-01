@@ -9,7 +9,7 @@
 use super::abi::SyscallTable;
 use super::connection::{
     NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND,
-    NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
+    NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
 };
 use super::h2;
 use super::wire_h1 as h1;
@@ -17,10 +17,10 @@ use super::wire_h2;
 use super::wire_ws as ws;
 use super::HttpState;
 use super::{
-    dev_channel_ioctl, dev_channel_port, dev_log, dev_millis as _, fmt_u32_raw, heap_alloc,
-    heap_free, heap_realloc, msg_read, net_read_frame, net_write_frame, p_u16, p_u32, p_u8,
-    IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN,
-    POLL_OUT,
+    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_log, dev_micros, dev_millis as _,
+    dev_self_index, dev_telemetry_span, fmt_u32_raw, heap_alloc, heap_free, heap_realloc, msg_read,
+    net_read_frame, net_write_frame, p_u16, p_u32, p_u8, IOCTL_FLUSH, IOCTL_NOTIFY,
+    IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN, POLL_OUT,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -386,6 +386,22 @@ pub(crate) struct ConnSlot {
     /// `retained_replay_target = retained_used` and flips this bit.
     pub(crate) retained_replay_started: u8,
     _slot_pad2: [u8; 2],
+
+    /// Observability: monotonic-micros start of this request's
+    /// `http.server.request` span, latched when the request head is parsed and
+    /// the telemetry port is wired (`0` = no span). Keepalive reuses the slot,
+    /// so it's re-latched per request. See `standards/observability.md`.
+    pub(crate) span_start_us: u64,
+    /// W3C trace context the span actually adopts (per request): the client's
+    /// `traceparent` header when present, else the connection context below.
+    /// All-zero trace id → root span.
+    pub(crate) span_trace_id: [u8; 16],
+    pub(crate) span_parent_id: [u8; 8],
+    /// Connection-scoped trace context from IP→TLS `MSG_TRACE_CTX` (TLS's span
+    /// id as parent). Set once at accept, applied to every request on the
+    /// connection that doesn't carry its own `traceparent`. All-zero = none.
+    pub(crate) conn_trace_id: [u8; 16],
+    pub(crate) conn_parent_id: [u8; 8],
 }
 
 impl ConnSlot {
@@ -718,6 +734,12 @@ pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u8) -> Option<u
     }
     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
     slot.conn_id = conn_id as i16;
+    // Clear any trace context inherited from a prior connection on this slot;
+    // the new connection's `MSG_TRACE_CTX` (if any) repopulates it.
+    slot.conn_trace_id = [0u8; 16];
+    slot.conn_parent_id = [0u8; 8];
+    slot.span_trace_id = [0u8; 16];
+    slot.span_parent_id = [0u8; 8];
     ready_set(s, idx);
     Some(idx)
 }
@@ -2983,11 +3005,64 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
 
 // ── Body-send phase helpers ───────────────────────────────────────────────
 
+/// Emit the `http.server.request` span for the just-completed response. Joins
+/// the caller's distributed trace when the request carried a `traceparent`
+/// (parsed into the slot at request start); otherwise mints a fresh root.
+/// `name_id = 0` is the first `[observability].spans` entry. No-op when the
+/// telemetry port is unwired or no span was started for this request.
+unsafe fn emit_request_span(s: &mut HttpState) {
+    if s.telemetry_chan < 0 {
+        return;
+    }
+    let (start, tp_trace, tp_parent) = match cur_slot(s) {
+        Some(c) if c.span_start_us != 0 => (c.span_start_us, c.span_trace_id, c.span_parent_id),
+        _ => return,
+    };
+    let sys = &*s.syscalls;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let end_raw = dev_micros(sys);
+    let end = if end_raw < start { start } else { end_raw };
+    let mut ctx = super::abi::contracts::telemetry::SpanContext {
+        trace_id: [0u8; 16],
+        span_id: [0u8; 8],
+        parent_id: [0u8; 8],
+    };
+    // A non-zero trace id means the caller propagated context — join its trace
+    // and parent under it; otherwise this is a root span.
+    if tp_trace != [0u8; 16] {
+        ctx.trace_id = tp_trace;
+        ctx.parent_id = tp_parent;
+    } else {
+        dev_csprng_fill(sys, ctx.trace_id.as_mut_ptr(), 16);
+    }
+    dev_csprng_fill(sys, ctx.span_id.as_mut_ptr(), 8);
+    dev_telemetry_span(
+        sys,
+        s.telemetry_chan,
+        me as u16,
+        0, // name_id 0 = http.server.request
+        super::abi::contracts::telemetry::SPAN_SERVER,
+        super::abi::contracts::telemetry::STATUS_OK,
+        &ctx,
+        start,
+        end,
+    );
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.span_start_us = 0;
+    }
+}
+
 /// Transition out of a fully-drained response. Honours the slot's
 /// `keepalive` flag: reuse the slot for the next request (compacting
 /// any pipelined bytes already in `recv_buf`) or close the
 /// connection.
 unsafe fn finish_response(s: &mut HttpState) {
+    // Observability: a response is fully drained here (keepalive reuse or
+    // close), so this is the single span-end chokepoint for the request.
+    emit_request_span(s);
     let (keepalive, header_end_off, recv_len) = match cur_slot(s) {
         Some(c) => (
             c.keepalive != 0,
@@ -3645,6 +3720,32 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                     return 2;
                 }
+                NET_MSG_TRACE_CTX
+                    if payload_len >= super::abi::contracts::net::net_proto::TRACE_CTX_LEN =>
+                {
+                    // Observability: the upstream (IP via TLS) trace context for
+                    // this connection — `[conn_id][trace_id 16][tls_span_id 8]`.
+                    // Store as the connection default; each request without its
+                    // own `traceparent` parents `http.server.request` under it.
+                    if s.telemetry_chan >= 0 {
+                        let p = s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                        let conn = *p;
+                        if let Some(idx) = find_slot_by_conn_id(s, conn) {
+                            let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                            core::ptr::copy_nonoverlapping(
+                                p.add(1),
+                                slot.conn_trace_id.as_mut_ptr(),
+                                16,
+                            );
+                            core::ptr::copy_nonoverlapping(
+                                p.add(17),
+                                slot.conn_parent_id.as_mut_ptr(),
+                                8,
+                            );
+                        }
+                    }
+                    return 2;
+                }
                 _ => return 2,
             }
         }
@@ -3792,10 +3893,47 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     let head_len = crlf_pos + 4;
                     let head = core::slice::from_raw_parts(ptr, head_len);
                     let keepalive = h1::request_keeps_alive(head);
+                    // Observability: stamp the `http.server.request` span start
+                    // as the head is parsed. Computed before the slot borrow;
+                    // one predicate, no clock read, when the port is unwired.
+                    let span_now: u64 = if s.telemetry_chan >= 0 {
+                        let n = dev_micros(&*s.syscalls);
+                        if n == 0 {
+                            1
+                        } else {
+                            n
+                        }
+                    } else {
+                        0
+                    };
+                    // W3C trace-context ingress: when tracing, a `traceparent`
+                    // header (the caller's distributed trace) takes precedence;
+                    // otherwise fall back to the connection context propagated
+                    // in-band by IP/TLS. Resolved per request so a keepalive slot
+                    // never inherits a previous request's header.
+                    let header_ctx: Option<([u8; 16], [u8; 8])> = if span_now != 0 {
+                        h1::find_header(head, b"traceparent")
+                            .and_then(super::abi::contracts::telemetry::parse_traceparent)
+                            .map(|(tid, pid, _flags)| (tid, pid))
+                    } else {
+                        None
+                    };
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.keepalive = if keepalive { 1 } else { 0 };
                         cur.header_end_off = head_len as u16;
                         cur.phase = Phase::DispatchRoute;
+                        cur.span_start_us = span_now;
+                        match header_ctx {
+                            Some((tid, pid)) => {
+                                cur.span_trace_id = tid;
+                                cur.span_parent_id = pid;
+                            }
+                            None => {
+                                // In-band connection context (all-zero = root).
+                                cur.span_trace_id = cur.conn_trace_id;
+                                cur.span_parent_id = cur.conn_parent_id;
+                            }
+                        }
                     }
                     return 2;
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {

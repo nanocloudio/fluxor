@@ -59,11 +59,51 @@ pub const SPAN_SIZE: usize = HEADER_SIZE + 52;
 pub const TRACE_ID_LEN: usize = 16;
 pub const SPAN_ID_LEN: usize = 8;
 
+// ── UDP batch envelope (otel_udp_sample exporter → host collector) ──────
+//
+// The `otel_udp_sample` exporter forwards drained records verbatim, packed
+// behind one envelope per UDP datagram:
+//
+//   [magic u32 = BATCH_MAGIC][version u8][_rsvd u8][count u16][record × count]
+//
+// Records are concatenated raw (each self-sizing via `record_len`), so the
+// host walks them without per-record framing. `count` is advisory — a decoder
+// that trusts the byte length can ignore it, but it catches truncation.
+pub const BATCH_MAGIC: u32 = 0x4C54_5846; // b"FXTL" little-endian
+pub const BATCH_VERSION: u8 = 1;
+pub const BATCH_HEADER_SIZE: usize = 8;
+
+/// Write the 8-byte batch envelope header. Returns its length, or `None` if
+/// `buf` is too small.
+pub fn write_batch_header(buf: &mut [u8], count: u16) -> Option<usize> {
+    if buf.len() < BATCH_HEADER_SIZE {
+        return None;
+    }
+    buf[0..4].copy_from_slice(&BATCH_MAGIC.to_le_bytes());
+    buf[4] = BATCH_VERSION;
+    buf[5] = 0;
+    buf[6..8].copy_from_slice(&count.to_le_bytes());
+    Some(BATCH_HEADER_SIZE)
+}
+
+pub fn batch_magic(buf: &[u8]) -> u32 {
+    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+}
+
+pub fn batch_version(buf: &[u8]) -> u8 {
+    buf[4]
+}
+
+pub fn batch_count(buf: &[u8]) -> u16 {
+    u16::from_le_bytes([buf[6], buf[7]])
+}
+
 // Compile-time invariants — checked when the SDK compiles during module build.
 const _: () = assert!(HEADER_SIZE == 12);
 const _: () = assert!(METRIC_SCALAR_SIZE == 24);
 const _: () = assert!(METRIC_HIST_SIZE == 80);
 const _: () = assert!(SPAN_SIZE == 64);
+const _: () = assert!(BATCH_HEADER_SIZE == 8);
 
 /// Total record length for a `(signal, kind)` header pair, or 0 if the pair is
 /// unrecognised. Lets a reader size a record from its header before draining.
@@ -215,6 +255,85 @@ pub fn span_start_micros(buf: &[u8]) -> u64 {
 
 pub fn span_end_micros(buf: &[u8]) -> u64 {
     read_u64(buf, 56)
+}
+
+/// Copy the span's 16-byte trace id out of a record.
+pub fn span_trace_id(buf: &[u8]) -> [u8; TRACE_ID_LEN] {
+    let mut id = [0u8; TRACE_ID_LEN];
+    id.copy_from_slice(&buf[16..32]);
+    id
+}
+
+/// Copy the span's own 8-byte span id out of a record.
+pub fn span_span_id(buf: &[u8]) -> [u8; SPAN_ID_LEN] {
+    let mut id = [0u8; SPAN_ID_LEN];
+    id.copy_from_slice(&buf[32..40]);
+    id
+}
+
+/// Copy the span's 8-byte parent id out of a record (all-zero = root).
+pub fn span_parent_id(buf: &[u8]) -> [u8; SPAN_ID_LEN] {
+    let mut id = [0u8; SPAN_ID_LEN];
+    id.copy_from_slice(&buf[40..48]);
+    id
+}
+
+// ── W3C Trace Context ───────────────────────────────────────────────
+//
+// Ingress propagation: a producer (e.g. http) parses an incoming `traceparent`
+// request header so its span joins the caller's trace. Format (version 00):
+//   `00-<32hex trace-id>-<16hex parent-id>-<2hex flags>`  (55 bytes)
+// The low bit of `flags` is `sampled`. On-device the context lives as the
+// fixed-layout fields above; the ASCII form only appears at ingress/egress.
+
+/// `sampled` bit of the trace-flags byte.
+pub const TRACE_FLAG_SAMPLED: u8 = 0x01;
+
+/// Parse a W3C `traceparent` header value. Returns
+/// `(trace_id, parent_span_id, flags)`, or `None` if malformed, an unsupported
+/// version, or an all-zero trace/span id (both forbidden by the spec).
+pub fn parse_traceparent(s: &[u8]) -> Option<([u8; TRACE_ID_LEN], [u8; SPAN_ID_LEN], u8)> {
+    if s.len() < 55 || s[2] != b'-' || s[35] != b'-' || s[52] != b'-' {
+        return None;
+    }
+    if hex_byte(s[0], s[1])? != 0 {
+        return None; // only version 00 is defined.
+    }
+    let mut trace_id = [0u8; TRACE_ID_LEN];
+    decode_hex(&s[3..35], &mut trace_id)?;
+    let mut span_id = [0u8; SPAN_ID_LEN];
+    decode_hex(&s[36..52], &mut span_id)?;
+    let flags = hex_byte(s[53], s[54])?;
+    if trace_id.iter().all(|b| *b == 0) || span_id.iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some((trace_id, span_id, flags))
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    Some((hex_val(hi)? << 4) | hex_val(lo)?)
+}
+
+/// Decode `src` (must be exactly `2 * dst.len()` hex digits) into `dst`.
+fn decode_hex(src: &[u8], dst: &mut [u8]) -> Option<()> {
+    if src.len() != dst.len() * 2 {
+        return None;
+    }
+    let mut i = 0;
+    while i < dst.len() {
+        dst[i] = hex_byte(src[i * 2], src[i * 2 + 1])?;
+        i += 1;
+    }
+    Some(())
 }
 
 // ── helpers ─────────────────────────────────────────────────────────

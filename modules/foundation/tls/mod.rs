@@ -101,6 +101,9 @@ const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
 const NET_MSG_RETRANSMIT: u8 = 0x07;
 const NET_MSG_ACK: u8 = 0x08;
+/// Observability trace context (see contracts/net/net_proto.rs). Received from
+/// IP on cipher_in; re-emitted to HTTP on clear_out with TLS's own span id.
+const NET_MSG_TRACE_CTX: u8 = 0x09;
 
 // Net protocol command types (upstream: HTTP -> TLS -> IP)
 const NET_CMD_BIND: u8 = 0x10;
@@ -182,6 +185,19 @@ struct TlsSession {
     /// envelope: 3 B header + 4 B fixed + 32 B SVID = 39 B max.
     pending_peer_identity: [u8; 39],
     pending_peer_identity_len: u8,
+
+    /// Observability: monotonic-micros start of this session's `tls.handshake`
+    /// span, latched when the handshake begins and the telemetry port is wired
+    /// (`0` = no span). See `standards/observability.md`.
+    span_start_us: u64,
+    /// Cross-module trace context. `trace_ctx_trace`/`trace_ctx_parent` are the
+    /// trace id + IP's span id received via `MSG_TRACE_CTX` (all-zero trace =
+    /// none → root). `span_id` is this session's own span id, minted at
+    /// handshake start, used for the `tls.handshake` span AND forwarded
+    /// downstream so HTTP parents under it.
+    trace_ctx_trace: [u8; 16],
+    trace_ctx_parent: [u8; 8],
+    span_id: [u8; 8],
 }
 
 impl TlsSession {
@@ -207,6 +223,10 @@ impl TlsSession {
             pending_ccs_client: false,
             pending_peer_identity: [0; 39],
             pending_peer_identity_len: 0,
+            span_start_us: 0,
+            trace_ctx_trace: [0; 16],
+            trace_ctx_parent: [0; 8],
+            span_id: [0; 8],
         }
     }
 
@@ -237,6 +257,10 @@ impl TlsSession {
         self.pending_ccs = false;
         self.pending_ccs_client = false;
         self.pending_peer_identity_len = 0;
+        self.span_start_us = 0;
+        self.trace_ctx_trace = [0; 16];
+        self.trace_ctx_parent = [0; 8];
+        self.span_id = [0; 8];
         self.read_keys = TrafficKeys::empty();
         self.write_keys = TrafficKeys::empty();
     }
@@ -777,7 +801,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let me = dev_self_index(tsys);
             if me >= 0 {
                 let midx = me as u16;
-                let t = s.step_count as u64;
+                let t = dev_micros(tsys);
                 let c = abi::contracts::telemetry::METRIC_COUNTER;
                 dev_telemetry_metric(
                     tsys,
@@ -848,6 +872,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // ServerHello with handshake keys — the peer can't decrypt that.
     let mut i = 0;
     while i < MAX_SESSIONS {
+        // Observability: emit the `tls.handshake` span once the handshake has
+        // resolved (Ready = ok, Error = failed). Done before the Closed/Error
+        // branches below reset the slot. Zero-cost when the port is unwired.
+        if s.telemetry_chan >= 0 && s.sessions[i].span_start_us != 0 {
+            let st = s.sessions[i].state;
+            let resolved = st == SessionState::Ready
+                || st == SessionState::Closing
+                || st == SessionState::Closed
+                || st == SessionState::Error;
+            if resolved {
+                emit_handshake_span(s, i, st != SessionState::Error);
+                s.sessions[i].span_start_us = 0;
+            }
+        }
         if s.sessions[i].state == SessionState::Handshaking {
             // Yield after one state transition per tick so a heavy
             // handshake step doesn't starve the IP/rp1_gem RX path
@@ -912,6 +950,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
                             s.sessions[idx].held_msg_type = t;
                             s.sessions[idx].state = SessionState::Handshaking;
+                            // Observability: start the `tls.handshake` span and
+                            // mint this session's own span id (used for the span
+                            // AND forwarded downstream so HTTP parents under it).
+                            // Gated on a wired telemetry port — no clock read,
+                            // no span, when tracing is off.
+                            if s.telemetry_chan >= 0 {
+                                let sys = &*s.syscalls;
+                                let now = dev_micros(sys);
+                                s.sessions[idx].span_start_us = if now == 0 { 1 } else { now };
+                                dev_csprng_fill(sys, s.sessions[idx].span_id.as_mut_ptr(), 8);
+                            }
                             if s.sessions[idx].driver.is_server {
                                 s.sessions[idx].driver.hs_state = HandshakeState::RecvClientHello;
                             } else {
@@ -1078,6 +1127,41 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let si = find_session_by_conn_id(s, conn_id);
                         if si >= 0 {
                             retx_replay(s, si as usize, from_seq);
+                        }
+                    }
+                }
+                t if t == NET_MSG_TRACE_CTX => {
+                    // Observability: IP's trace context for this connection.
+                    // Parent the `tls.handshake` span under IP's span, then
+                    // forward downstream (clear_out → HTTP) with TLS's own span
+                    // id so HTTP parents under it. Best-effort; payload always
+                    // consumed to stay frame-aligned.
+                    let pl = payload_len as usize;
+                    let mut pbuf = [0u8; 32];
+                    let rd = if pl < 32 { pl } else { 32 };
+                    if rd > 0 {
+                        (sys.channel_read)(s.cipher_in, pbuf.as_mut_ptr(), rd);
+                    }
+                    if pl > 32 {
+                        tls_discard(sys, s.cipher_in, pl - 32);
+                    }
+                    if pl >= abi::contracts::net::net_proto::TRACE_CTX_LEN && s.telemetry_chan >= 0
+                    {
+                        let conn_id = pbuf[0];
+                        let si = find_session_by_conn_id(s, conn_id);
+                        if si >= 0 {
+                            let idx = si as usize;
+                            // Latch IP's trace context. It is forwarded to HTTP
+                            // only AFTER the held MSG_ACCEPTED (at handshake
+                            // completion) — HTTP drops context for a conn_id it
+                            // hasn't accepted yet, so forwarding it now (before
+                            // the held accept) would lose the parenting.
+                            s.sessions[idx]
+                                .trace_ctx_trace
+                                .copy_from_slice(&pbuf[1..17]);
+                            s.sessions[idx]
+                                .trace_ctx_parent
+                                .copy_from_slice(&pbuf[17..25]);
                         }
                     }
                 }
@@ -1297,6 +1381,57 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 // ============================================================================
 // Session management
 // ============================================================================
+
+/// Emit a finished `tls.handshake` span. When IP propagated a `MSG_TRACE_CTX`
+/// for this connection, the span joins that trace as a child of IP's span
+/// (using this session's own minted `span_id`); otherwise it's a root. `ok`
+/// maps to OTLP status OK / ERROR. `name_id = 0` is the first
+/// `[observability].spans` entry.
+#[inline(never)]
+unsafe fn emit_handshake_span(s: &mut TlsState, idx: usize, ok: bool) {
+    let sys = &*s.syscalls;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let start = s.sessions[idx].span_start_us;
+    let end_raw = dev_micros(sys);
+    let end = if end_raw < start { start } else { end_raw };
+    let mut ctx = abi::contracts::telemetry::SpanContext {
+        trace_id: [0u8; 16],
+        span_id: s.sessions[idx].span_id,
+        parent_id: [0u8; 8],
+    };
+    // A non-zero received trace id means IP propagated context — join its trace
+    // under IP's span; otherwise this handshake is its own root.
+    if s.sessions[idx].trace_ctx_trace != [0u8; 16] {
+        ctx.trace_id = s.sessions[idx].trace_ctx_trace;
+        ctx.parent_id = s.sessions[idx].trace_ctx_parent;
+    } else {
+        dev_csprng_fill(sys, ctx.trace_id.as_mut_ptr(), 16);
+    }
+    // `span_id` was minted at handshake start; if somehow unset (all-zero),
+    // fall back to a fresh one so the span always has an id.
+    if ctx.span_id == [0u8; 8] {
+        dev_csprng_fill(sys, ctx.span_id.as_mut_ptr(), 8);
+    }
+    let status = if ok {
+        abi::contracts::telemetry::STATUS_OK
+    } else {
+        abi::contracts::telemetry::STATUS_ERROR
+    };
+    dev_telemetry_span(
+        sys,
+        s.telemetry_chan,
+        me as u16,
+        0, // name_id 0 = tls.handshake
+        abi::contracts::telemetry::SPAN_INTERNAL,
+        status,
+        &ctx,
+        start,
+        end,
+    );
+}
 
 fn alloc_session_for_conn(s: &mut TlsState, conn_id: u8) -> Option<usize> {
     let mut i = 0;
@@ -2337,6 +2472,24 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         // tag now that the handshake is complete. Best-effort:
         // HTTP times out on no traffic if this drops.
         let _ = tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0);
+        // Observability: forward IP's trace context to HTTP immediately AFTER
+        // the accept, parented under this session's own span id, so HTTP's slot
+        // exists when it arrives. Only when IP propagated a trace.
+        if s.telemetry_chan >= 0 && s.sessions[idx].trace_ctx_trace != [0u8; 16] {
+            let trace = s.sessions[idx].trace_ctx_trace;
+            let own = s.sessions[idx].span_id;
+            let sys = &*s.syscalls;
+            let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
+            dev_net_send_trace_ctx(
+                sys,
+                s.clear_out,
+                conn_id,
+                &trace,
+                &own,
+                scratch.as_mut_ptr(),
+                scratch.len(),
+            );
+        }
     }
     true
 }

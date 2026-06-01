@@ -587,7 +587,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let me = dev_self_index(sys);
             if me >= 0 {
                 let midx = me as u16;
-                let t = s.step_count as u64;
+                let t = dev_micros(sys);
                 let counter = abi::contracts::telemetry::METRIC_COUNTER;
                 dev_telemetry_metric(
                     sys,

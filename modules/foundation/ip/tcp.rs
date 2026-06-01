@@ -133,6 +133,16 @@ pub struct TcpConn {
     pub pending_close_notify: u8,
     _close_pad: [u8; 3],
 
+    /// Observability: monotonic-micros start of this connection's
+    /// `tcp.connection` span, latched at accept when the telemetry port is
+    /// wired (`0` = no span). See `standards/observability.md`.
+    pub span_start_us: u64,
+    /// Root W3C trace context for this connection: minted at accept, used for
+    /// the `tcp.connection` span AND propagated downstream as `MSG_TRACE_CTX`
+    /// so TLS/HTTP parent their spans under `span_id` in the same `trace_id`.
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+
     // Bounded reorder buffer (§4.1). Per-slot payload storage lives in
     // `reorder_buf`; metadata in `reorder_slots`.
     pub reorder_slots: [ReorderSlot; REORDER_SLOTS],
@@ -172,6 +182,9 @@ impl TcpConn {
             consumed_bytes: 0,
             pending_close_notify: 0,
             _close_pad: [0; 3],
+            span_start_us: 0,
+            trace_id: [0; 16],
+            span_id: [0; 8],
             reorder_slots: [EMPTY; REORDER_SLOTS],
             reorder_buf: [0u8; REORDER_SLOTS * REORDER_SLOT_BYTES],
         }

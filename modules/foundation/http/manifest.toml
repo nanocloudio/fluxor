@@ -66,3 +66,7 @@ access = "read"
 
 [observability]
 metrics = ["bytes_in", "bytes_out"]
+# Span 0: one `http.server.request` span per request (head parsed -> response
+# drained), SERVER kind. Minted only when the telemetry port is wired
+# (zero-cost otherwise). Keepalive re-latches the span per request.
+spans = ["http.server.request"]

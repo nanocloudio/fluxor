@@ -169,3 +169,105 @@ modules = [
   } },
 ]
 wiring = []
+
+# Telemetry export: `platform.debug.export_telemetry: <kind>` selects a
+# pluggable exporter. `udp` inserts `otel_udp_sample`, which drains the same
+# `Telemetry` edge as `observe` and forwards id-interned records as compact UDP
+# datagrams (one batch envelope per datagram, see
+# `modules/sdk/contracts/telemetry.rs`) — the metric/span analogue of
+# `log_net`'s log forwarding. Like `log_net` it needs a unicast `dst_ip`
+# (per-config or `~/.config/fluxor`). The overlay supplies the module + its
+# datagram plumbing to the family's net module; you still wire each instrumented
+# source explicitly, e.g. `wiring: [ ip.telemetry -> otel_udp_sample.telemetry ]`.
+# Matched by exact value so future exporters (`otlp`) add their own overlay
+# without colliding.
+#
+#   platform:
+#     debug:
+#       export_telemetry: udp
+#       # export_dst_ip: "0xC0A80A0A"   # else host.toml debug.collector_ip
+#       # export_flush_ms: 1000         # optional; max partial-batch latency
+[[overlay]]
+match = { export_telemetry = "udp", family = "rp2" }
+modules = [
+  { name = "otel_udp_sample", params = {
+      dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:export_dst_port|host:debug.telemetry_port",
+      bind_port = "user:export_bind_port|host:debug.telemetry_bind_port",
+      flush_ms  = "user:export_flush_ms",
+  } },
+]
+wiring = [
+  "ip.net_out -> otel_udp_sample.net_in",
+  "otel_udp_sample.net_out -> ip.net_in",
+]
+
+[[overlay]]
+match = { export_telemetry = "udp", family = "bcm" }
+modules = [
+  { name = "otel_udp_sample", params = {
+      dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:export_dst_port|host:debug.telemetry_port",
+      bind_port = "user:export_bind_port|host:debug.telemetry_bind_port",
+      flush_ms  = "user:export_flush_ms",
+  } },
+]
+wiring = [
+  "ip.net_out -> otel_udp_sample.net_in",
+  "otel_udp_sample.net_out -> ip.net_in",
+]
+
+[[overlay]]
+match = { export_telemetry = "udp", family = "linux" }
+modules = [
+  { name = "otel_udp_sample", params = {
+      dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
+      dst_port  = "user:export_dst_port|host:debug.telemetry_port",
+      bind_port = "user:export_bind_port|host:debug.telemetry_bind_port",
+      flush_ms  = "user:export_flush_ms",
+  } },
+]
+wiring = [
+  "linux_net.net_out -> otel_udp_sample.net_in",
+  "otel_udp_sample.net_out -> linux_net.net_in",
+]
+
+# `export_telemetry: otlp` inserts `otlp_http` — the OTLP/HTTP (JSON) exporter.
+# It opens an outbound TCP connection to an OTLP/HTTP collector and POSTs metrics
+# as OpenTelemetry Protocol JSON to `/v1/metrics`, resolving `(module,id)` names
+# on-device, so no host decoder is needed (unlike `udp`). bcm/rp2 only (the
+# module is heavier than the UDP exporter). The compiler injects the per-config
+# id-table param; you still wire each instrumented source's telemetry output.
+#
+#   platform:
+#     debug:
+#       export_telemetry: otlp
+#       # export_dst_ip: "0xC0A80A0A"   # else host.toml debug.collector_ip
+#       # export_dst_port: 4318         # OTLP/HTTP port
+[[overlay]]
+match = { export_telemetry = "otlp", family = "rp2" }
+modules = [
+  { name = "otlp_http", params = {
+      dst_ip   = "user:export_dst_ip|host:debug.collector_ip|required",
+      dst_port = "user:export_dst_port|host:debug.otlp_port",
+      flush_ms = "user:export_flush_ms",
+  } },
+]
+wiring = [
+  "ip.net_out -> otlp_http.net_in",
+  "otlp_http.net_out -> ip.net_in",
+]
+
+[[overlay]]
+match = { export_telemetry = "otlp", family = "bcm" }
+modules = [
+  { name = "otlp_http", params = {
+      dst_ip   = "user:export_dst_ip|host:debug.collector_ip|required",
+      dst_port = "user:export_dst_port|host:debug.otlp_port",
+      flush_ms = "user:export_flush_ms",
+  } },
+]
+wiring = [
+  "ip.net_out -> otlp_http.net_in",
+  "otlp_http.net_out -> ip.net_in",
+]

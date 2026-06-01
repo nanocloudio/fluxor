@@ -42,3 +42,7 @@ content_type = "Telemetry"
 
 [observability]
 metrics = ["ecdh_pool_hit", "ecdh_fallback_keygen", "frame_write_dropped"]
+# Span 0: one `tls.handshake` span per session (Handshaking -> Ready/Error),
+# status OK on completion, ERROR on a failed handshake. Minted only when the
+# telemetry port is wired (zero-cost otherwise).
+spans = ["tls.handshake"]
