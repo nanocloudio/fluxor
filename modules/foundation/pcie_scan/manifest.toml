@@ -6,3 +6,7 @@ permissions = ["platform_raw"]
 name = "devices"
 direction = "output"
 content_type = "OctetStream"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "diagnostic/one-shot probe — not a steady-state production data path"

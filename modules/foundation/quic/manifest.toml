@@ -26,6 +26,30 @@ name = "app_out"
 direction = "output"
 content_type = "OctetStream"
 
+# Module-scope observability. Optional 3rd output (out[2]); wired to
+# `observe.telemetry` when the debug stack's observe overlay is on. Emits
+# cumulative byte counters; no-op when unwired. See standards/observability.md.
+[[ports]]
+name = "telemetry"
+index = 2
+direction = "output"
+content_type = "Telemetry"
+
+[observability]
+# Application-stream bytes carried by QUIC (excludes handshake/ack overhead):
+# bytes_in  = stream data delivered inbound to app_out (peer → app)
+# bytes_out = stream data ingested from app_in (app → peer)
+metrics = ["bytes_in", "bytes_out"]
+# Span 0: one `quic.connection` span per server-accepted connection
+# (accept -> close), SERVER kind, rooting its own trace. Minted at accept when
+# the telemetry port is wired and the connection is head-sampled; emitted by the
+# close reaper. Client connections are not spanned. Zero-cost otherwise.
+# Span 1: one `h3.request` child span per server-dispatched HTTP/3 GET
+# (request HEADERS -> response queued), SERVER kind, parented by the enclosing
+# `quic.connection` span (shared trace id), so a connection's requests form a
+# tree. Inherits the connection's head-sampling decision.
+spans = ["quic.connection", "h3.request"]
+
 [[resources]]
 requires_contract = "channel"
 access = "read"

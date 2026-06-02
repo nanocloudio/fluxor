@@ -37,7 +37,7 @@
 // - PINGRESP (0xD0): 2 bytes, ignored
 // - DISCONNECT (0xE0): 2 bytes (not used — we send CMD_CLOSE)
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -187,6 +187,9 @@ struct MqttState {
     mesh_out_chan: i32,
     net_in_chan: i32,
     net_out_chan: i32,
+    /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
+    /// the port is unwired, so module-scope metrics are zero-cost when disabled.
+    telemetry_chan: i32,
 
     // Connection params
     broker_ip: u32,
@@ -220,6 +223,11 @@ struct MqttState {
     // TX tracking
     tx_len: u16,
     tx_sent: u16,
+
+    // Module-scope telemetry: cumulative byte counters + last emit timestamp
+    // (cadence gated on the wallclock since mqtt has no per-step counter).
+    tlm: TlmCounters,
+    tlm_last_ms: u64,
 
     // Strings
     client_id: [u8; MAX_CLIENT_ID_LEN],
@@ -476,8 +484,36 @@ unsafe fn flush_tx(s: &mut MqttState) -> bool {
     let written = (sys.channel_write)(s.net_out_chan, scratch, total);
     if written > 0 {
         s.tx_sent += to_send as u16;
+        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(to_send as u32);
     }
     s.tx_sent >= s.tx_len
+}
+
+/// Module-scope telemetry: emit cumulative `bytes_in` / `bytes_out` counters to
+/// the `observe` collector when the telemetry port is wired (no-op otherwise),
+/// at a ~5s wallclock cadence. Metric ids follow `[observability].metrics`
+/// order: 0 = bytes_in, 1 = bytes_out. Counter semantics are monotonic, so the
+/// deltas are NOT reset here.
+#[inline(never)]
+unsafe fn maybe_emit_telemetry(s: &mut MqttState) {
+    if s.telemetry_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.tlm_last_ms) < 5000 {
+        return;
+    }
+    s.tlm_last_ms = now;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let midx = me as u16;
+    let t = dev_micros(sys);
+    let counter = abi::contracts::telemetry::METRIC_COUNTER;
+    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 0, s.tlm.bytes_in as u64);
+    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 1, s.tlm.bytes_out as u64);
 }
 
 /// Start sending: set tx_len and tx_sent=0, attempt initial flush.
@@ -678,6 +714,7 @@ unsafe fn handle_rx(s: &mut MqttState) {
             i += 1;
         }
         s.rx_have += data_len as u16;
+        s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(data_len as u32);
         s.last_activity_ms = millis(s);
 
         // Process the newly-coalesced packets.
@@ -834,17 +871,17 @@ unsafe fn enter_reconnect(s: &mut MqttState) {
 // Exported PIC Module Interface
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<MqttState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -862,9 +899,15 @@ pub extern "C" fn module_new(
         if state_size < core::mem::size_of::<MqttState>() { return -6; }
 
         let s = &mut *(state as *mut MqttState);
-        // Zero-init via memset
+        // Zero-init via memset. The SDK's `__aeabi_memclr` is only compiled for
+        // bare-metal/wasm targets (libc provides it on the host), so the
+        // host-test build uses the portable `write_bytes` equivalent. Firmware
+        // is byte-identical.
         let state_bytes = state_size.min(core::mem::size_of::<MqttState>());
+        #[cfg(not(feature = "host-test"))]
         __aeabi_memclr(state, state_bytes);
+        #[cfg(feature = "host-test")]
+        core::ptr::write_bytes(state, 0, state_bytes);
 
         s.syscalls = syscalls as *const SyscallTable;
         let sys = &*(syscalls as *const SyscallTable);
@@ -876,6 +919,8 @@ pub extern "C" fn module_new(
         // Port 1 in/out = mesh channels (discovered via dev_channel_port)
         s.mesh_in_chan = dev_channel_port(sys, 0, 1);  // in[1]: from mesh
         s.mesh_out_chan = dev_channel_port(sys, 1, 1); // out[1]: to mesh
+        // Port out[2] = optional module-scope telemetry (-1 when unwired).
+        s.telemetry_chan = dev_channel_port(sys, 1, 2);
         s.conn_id = 0;
         s.conn_present = 0;
 
@@ -945,7 +990,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
@@ -955,6 +1000,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Copy pointer to avoid borrow issues
         let sys_ptr = s.syscalls;
         let sys = &*sys_ptr;
+
+        // Module-scope metrics: cumulative byte counters, ~5s cadence, no-op
+        // when the telemetry port is unwired.
+        maybe_emit_telemetry(s);
 
         loop {
             match s.phase {
@@ -1156,7 +1205,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_channel_hints"]
 pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
     let hints = [

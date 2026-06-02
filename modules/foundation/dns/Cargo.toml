@@ -1,0 +1,29 @@
+[package]
+name = "fluxor-mod-dns"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Bare-metal DNS server/forwarder module — host-test build"
+
+# This file lets the bare-metal `dns` module crate also build as a
+# host rlib so the test harness can link it as a normal Rust library.
+# The PIC firmware build invokes `rustc` directly against `mod.rs`
+# (see `Makefile :: modules` / `fluxor modules build`) and does NOT
+# consult this file, so the cargo build path is purely additive — the
+# firmware artefact is byte-identical with or without this manifest.
+#
+# Standalone (workspace `exclude`d): not part of the workspace lint
+# matrix. It only needs to compile under `host-test` for the harness.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+# `host-test` switches the module away from `#![no_std]` and drops the
+# `no_mangle` exports so the host harness can link the same source and
+# call `module_new` / `module_step` as plain Rust fns. PIC builds never
+# set this feature.
+default = []
+host-test = []

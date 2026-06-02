@@ -31,7 +31,7 @@
 //! | 3   | ttl      | u32  | 300        | TTL for local responses (sec)  |
 //! | 4   | port     | u16  | 53         | Listen port                    |
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -125,6 +125,13 @@ mod params_def {
 
         4, port, u16, 53
             => |s, d, len| { s.listen_port = p_u16(d, len, 0, 53); };
+
+        // Head-sampling rate (per-mille, 0..=1000) for `dns.query` spans. The
+        // default is the sentinel `0xFFFF` ("unset") so `module_new` can apply
+        // the target-tier default (aarch64 50‰ / MCU 0‰) only when no explicit
+        // value was supplied — set_defaults would otherwise clobber it.
+        5, trace_sample_permille, u16, 0xFFFF
+            => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 0xFFFF); };
     }
 }
 
@@ -187,6 +194,9 @@ struct DnsState {
     syscalls: *const SyscallTable,
     net_in_chan: i32,
     net_out_chan: i32,
+    /// Optional telemetry output (out[1]) to the `observe` collector; -1 when
+    /// the port is unwired, so module-scope metrics are zero-cost when disabled.
+    telemetry_chan: i32,
 
     upstream_ip: u32,
     ttl: u32,
@@ -204,6 +214,15 @@ struct DnsState {
     // Statistics
     queries_local: u32,
     queries_forwarded: u32,
+
+    // Module-scope telemetry: cumulative byte counters + last emit timestamp
+    // (cadence gated on the wallclock since dns has no per-step counter).
+    tlm: TlmCounters,
+    tlm_last_ms: u64,
+    /// Head-sampling rate (per-mille) for `dns.query` spans. Target-tier
+    /// default: 50‰ on aarch64 (CM5-class), 0‰ on MCUs. Decided per query
+    /// from its minted trace id.
+    sample_permille: u16,
 
     // Host table
     hosts: [HostEntry; MAX_HOSTS],
@@ -223,6 +242,7 @@ impl DnsState {
         self.syscalls = syscalls;
         self.net_in_chan = -1;
         self.net_out_chan = -1;
+        self.telemetry_chan = -1;
         self.upstream_ip = 0x08080808; // 8.8.8.8
         self.ttl = 300;
         self.listen_port = 53;
@@ -232,6 +252,11 @@ impl DnsState {
         self.upstream_ep = 0xFF;
         self.queries_local = 0;
         self.queries_forwarded = 0;
+        self.tlm = TlmCounters::new();
+        self.tlm_last_ms = 0;
+        // `sample_permille` is resolved in `module_new` after param parsing
+        // (set_defaults would clobber any value set here), via the
+        // `trace_sample_permille` param's `0xFFFF` "unset" sentinel.
     }
 
     #[inline(always)]
@@ -725,7 +750,124 @@ unsafe fn dg_send_to_v4(
         i += 1;
     }
 
-    ((*sys).channel_write)(net_out, buf, total);
+    let written = ((*sys).channel_write)(net_out, buf, total);
+    if written > 0 {
+        (*state).tlm.bytes_out = (*state).tlm.bytes_out.wrapping_add(dns_len as u32);
+    }
+}
+
+/// Module-scope telemetry: emit cumulative `bytes_in` / `bytes_out` counters to
+/// the `observe` collector when the telemetry port is wired (no-op otherwise),
+/// at a ~5s wallclock cadence. Metric ids follow `[observability].metrics`
+/// order: 0 = bytes_in, 1 = bytes_out. Counter semantics are monotonic, so the
+/// deltas are NOT reset here. Bytes counted are DNS payload (excluding the
+/// datagram framing) on both directions.
+#[inline(never)]
+unsafe fn maybe_emit_telemetry(s: &mut DnsState) {
+    if s.telemetry_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.tlm_last_ms) < 5000 {
+        return;
+    }
+    s.tlm_last_ms = now;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let midx = me as u16;
+    let t = dev_micros(sys);
+    let counter = abi::contracts::telemetry::METRIC_COUNTER;
+    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 0, s.tlm.bytes_in as u64);
+    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 1, s.tlm.bytes_out as u64);
+}
+
+/// Head-sampling decision for a new `dns.query` root, drawn deterministically
+/// from the (random) minted trace id and compared to `permille`. Returns the
+/// W3C trace-flags to stamp (`TRACE_FLAGS_SAMPLED` or 0). Mirrors the ip
+/// module's `ingress_sample_decision` so the two stay aligned.
+#[inline(always)]
+fn ingress_sample_decision(permille: u16, trace_id: &[u8; 16]) -> u8 {
+    let draw = u16::from_le_bytes([trace_id[0], trace_id[1]]) % 1000;
+    if draw < permille {
+        abi::contracts::telemetry::TRACE_FLAGS_SAMPLED
+    } else {
+        0
+    }
+}
+
+/// Minted-per-query trace context for a `dns.query` span. Zero-sized cost when
+/// the telemetry port is unwired or the query isn't head-sampled.
+struct QuerySpan {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    flags: u8,
+    start_us: u64,
+}
+
+/// Mint a root trace context for an incoming query when telemetry is wired.
+/// Returns `None` (no work) when the telemetry port is unwired; otherwise draws
+/// random ids, makes the head-sampling decision, and captures the start time
+/// only for sampled queries (the clock read is gated behind the sample bit).
+#[inline(never)]
+unsafe fn begin_query_span(s: &DnsState) -> Option<QuerySpan> {
+    if s.telemetry_chan < 0 {
+        return None;
+    }
+    let sys = &*s.syscalls;
+    let mut trace_id = [0u8; 16];
+    let mut span_id = [0u8; 8];
+    dev_csprng_fill(sys, trace_id.as_mut_ptr(), 16);
+    dev_csprng_fill(sys, span_id.as_mut_ptr(), 8);
+    let flags = ingress_sample_decision(s.sample_permille, &trace_id);
+    let start_us = if flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED != 0 {
+        dev_micros(sys)
+    } else {
+        0
+    };
+    Some(QuerySpan {
+        trace_id,
+        span_id,
+        flags,
+        start_us,
+    })
+}
+
+/// Emit the finished `dns.query` span (name_id 0, SERVER kind) for a locally
+/// resolved query. No-op unless the query was head-sampled. Called at each
+/// local-reply site; the bit test runs before the clock read so an unsampled
+/// query does no work.
+#[inline(never)]
+unsafe fn emit_query_span(s: &DnsState, span: &QuerySpan) {
+    if span.flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let end_raw = dev_micros(sys);
+    let end = if end_raw < span.start_us { span.start_us } else { end_raw };
+    let ctx = abi::contracts::telemetry::SpanContext {
+        trace_id: span.trace_id,
+        span_id: span.span_id,
+        parent_id: [0u8; 8], // dns is the ingress for this query → root span
+        flags: span.flags,
+    };
+    dev_telemetry_span(
+        sys,
+        s.telemetry_chan,
+        me as u16,
+        0, // name_id 0 = dns.query
+        abi::contracts::telemetry::SPAN_SERVER,
+        abi::contracts::telemetry::STATUS_OK,
+        &ctx,
+        span.start_us,
+        end,
+    );
 }
 
 /// Send a DNS reply from the server endpoint back to the original client.
@@ -860,6 +1002,11 @@ unsafe fn handle_query(
     // Use raw pointer to tx_buf to avoid borrow checker issues
     let tx_ptr = (*s).tx_buf.as_mut_ptr();
 
+    // Mint a `dns.query` trace context now (past the parse-fail returns, before
+    // resolution). Emitted only at the local-reply sites below; forwarded
+    // queries leave `qspan` unused. `None` when telemetry is unwired.
+    let qspan = begin_query_span(s);
+
     match qtype {
         QTYPE_A => {
             // Look up in local host table
@@ -874,6 +1021,9 @@ unsafe fn handle_query(
                         send_server_reply(s as *mut DnsState, client_ip, client_port,
                             tx_ptr as *const u8, resp_len);
                         s.queries_local += 1;
+                        if let Some(ref sp) = qspan {
+                            emit_query_span(s, sp);
+                        }
                     }
                 }
                 None => {
@@ -894,6 +1044,9 @@ unsafe fn handle_query(
                 if resp_len > 0 {
                     send_server_reply(s as *mut DnsState, client_ip, client_port,
                         tx_ptr as *const u8, resp_len);
+                    if let Some(ref sp) = qspan {
+                        emit_query_span(s, sp);
+                    }
                 }
             } else {
                 forward_to_upstream(s, id, client_ip, client_port, pkt, pkt_len);
@@ -911,6 +1064,9 @@ unsafe fn handle_query(
                         send_server_reply(s as *mut DnsState, client_ip, client_port,
                             tx_ptr as *const u8, resp_len);
                         s.queries_local += 1;
+                        if let Some(ref sp) = qspan {
+                            emit_query_span(s, sp);
+                        }
                     }
                 }
                 None => {
@@ -991,17 +1147,17 @@ unsafe fn handle_upstream_response(s: &mut DnsState, pkt: *const u8, pkt_len: us
 // PIC Module Interface
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<DnsState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -1024,6 +1180,8 @@ pub extern "C" fn module_new(
         // Net channels: in[0] = net_in (from IP), out[0] = net_out (to IP)
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
+        // Port out[1] = optional module-scope telemetry (-1 when unwired).
+        s.telemetry_chan = dev_channel_port(&*(syscalls as *const SyscallTable), 1, 1);
 
         // Parse TLV params
         let is_tlv = !params.is_null() && params_len >= 4
@@ -1034,19 +1192,38 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
+        // Resolve the target-tier head-sampling default only when the
+        // `trace_sample_permille` param was not explicitly supplied (still the
+        // `0xFFFF` sentinel): aarch64 (CM5-class) 50‰, MCUs 0‰. An explicit
+        // value (including 0) is honoured as-is.
+        if s.sample_permille == 0xFFFF {
+            #[cfg(target_arch = "aarch64")]
+            {
+                s.sample_permille = 50;
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                s.sample_permille = 0;
+            }
+        }
+
         log_info(s, b"[dns] init");
 
         0
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         if state.is_null() { return -1; }
         let s = &mut *(state as *mut DnsState);
         if s.syscalls.is_null() { return -1; }
+
+        // Module-scope metrics: cumulative byte counters, ~5s cadence, no-op
+        // when the telemetry port is unwired.
+        maybe_emit_telemetry(s);
 
         match s.phase {
             DnsPhase::Init => {
@@ -1160,6 +1337,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             ]);
                             let dns_data = buf.add(NET_FRAME_HDR + DG_V4_PREFIX) as *const u8;
                             let dns_len = payload_len - DG_V4_PREFIX;
+                            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(dns_len as u32);
 
                             if ep_id == s.server_ep {
                                 handle_query(s, src_ip, src_port, dns_data, dns_len);

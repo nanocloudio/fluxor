@@ -1,0 +1,24 @@
+[package]
+name = "fluxor-mod-quic"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Bare-metal QUIC v1 / HTTP-3 module — host-test build"
+
+# Purely-additive host-test shim, identical in spirit to the ip/dns/tls
+# manifests: it lets the bare-metal `quic` module compile as a host rlib so
+# the test harness can link it and call `module_new` / `module_step` directly.
+# The PIC firmware build invokes `rustc` against `mod.rs` and does NOT consult
+# this file, so the `.fmod` artefact is byte-identical with or without it.
+#
+# Standalone (workspace `exclude`d): not subject to the workspace lint matrix;
+# it only needs to compile under `host-test` for the integration tests.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+host-test = []

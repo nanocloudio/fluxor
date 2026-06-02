@@ -11,3 +11,7 @@ content_type = "NetProto"
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "Linux-host TCP/IP adapter — dev/test substitute for the silicon ip stack; host-side throughput is observed via the host OS (ss/netstat) and at the instrumented stream modules above it"

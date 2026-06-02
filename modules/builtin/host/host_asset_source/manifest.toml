@@ -12,3 +12,7 @@ required = true
 name = "path"
 type = "str"
 required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "host-side dev/test provider — runs on the build host, observed via host tooling, not part of the on-silicon data path"

@@ -32,3 +32,7 @@ name = "channels"
 type = "u8"
 default = 2
 range = [1, 8]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "Linux-host hardware shim — audio/display/MIDI via the host OS; observed via host tooling, not an on-silicon data path"

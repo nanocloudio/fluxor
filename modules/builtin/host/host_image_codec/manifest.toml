@@ -37,3 +37,7 @@ name = "max_bytes"
 type = "u32"
 default = 4194304
 range = [1024, 67108864]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "host-side dev/test provider — runs on the build host, observed via host tooling, not part of the on-silicon data path"

@@ -777,6 +777,18 @@ pub struct QuicConnection {
     pub h3_post_body_len: usize,
     /// Whether we've already dispatched (single-shot).
     pub h3_post_dispatched: bool,
+
+    // ── Observability: `quic.connection` span (server-accepted conns) ──
+    /// 16-byte W3C trace id, minted at server-accept when telemetry is wired.
+    pub trace_id: [u8; 16],
+    /// 8-byte span id for the connection's root span.
+    pub span_id: [u8; 8],
+    /// W3C trace-flags latched at accept (head-sampling decision). Low bit =
+    /// sampled; the span and any future child contexts share it.
+    pub sampled_flags: u8,
+    /// Span start micros. Non-zero marks a pending span that the close path
+    /// must still emit; zeroed once emitted (idempotent) or for client conns.
+    pub span_start_us: u64,
 }
 
 impl QuicConnection {
@@ -859,6 +871,10 @@ impl QuicConnection {
             h3_post_body: [0; 1024],
             h3_post_body_len: 0,
             h3_post_dispatched: false,
+            trace_id: [0; 16],
+            span_id: [0; 8],
+            sampled_flags: 0,
+            span_start_us: 0,
         }
     }
 

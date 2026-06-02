@@ -21,7 +21,7 @@
 //! - [`ws`](ws.rs) — WebSocket frame codec, UTF-8 streaming validation,
 //!   permessage-deflate (full RFC 1951 / RFC 6455 / RFC 7692 / RFC 9220).
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![no_main]
 #![allow(
     dead_code,
@@ -201,6 +201,17 @@ pub(crate) struct QuicState {
     /// §6.4.3) or, as fallback, Subject CN (§6.4.4).
     verify_hostname: [u8; 64],
     verify_hostname_len: usize,
+    /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
+    /// unwired, so module-scope metrics are zero-cost when disabled.
+    telemetry: i32,
+    /// Cumulative application-stream byte counters + last-emit wallclock
+    /// (cadence gated on `dev_millis` — quic has no per-step counter).
+    tlm: TlmCounters,
+    tlm_last_ms: u64,
+    /// Head-sampling rate (per-mille) for `quic.connection` spans. Target-tier
+    /// default: 50‰ on aarch64 (CM5-class), 0‰ on MCUs. Decided per accepted
+    /// connection from its minted trace id.
+    sample_permille: u16,
 }
 
 define_params! {
@@ -235,22 +246,28 @@ define_params! {
 
     9, verify_peer, u8, 0
         => |s, d, len| { s.verify_peer = p_u8(d, len, 0, 0); };
+
+    // Head-sampling rate (per-mille, 0..=1000) for the connection/request
+    // spans. Default sentinel `0xFFFF` ("unset") so `module_new` applies the
+    // target-tier default (aarch64 50‰ / MCU 0‰) only when not given.
+    11, trace_sample_permille, u16, 0xFFFF
+        => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 0xFFFF); };
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<QuicState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_arena_size() -> u32 {
     65536
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub extern "C" fn module_init(_syscalls: *const core::ffi::c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     _out_chan: i32,
@@ -319,6 +336,12 @@ pub unsafe extern "C" fn module_new(
     s.app_in = dev_channel_port(sys, 0, 1);
     s.net_out = dev_channel_port(sys, 1, 0);
     s.app_out = dev_channel_port(sys, 1, 1);
+    // out[2] = optional module-scope telemetry (-1 when unwired).
+    s.telemetry = dev_channel_port(sys, 1, 2);
+    s.tlm = TlmCounters::new();
+    s.tlm_last_ms = 0;
+    // `sample_permille` resolved after param parsing below (set_defaults would
+    // clobber a value set here) via the `trace_sample_permille` 0xFFFF sentinel.
 
     let mut i = 0;
     while i < MAX_CONNS {
@@ -334,6 +357,20 @@ pub unsafe extern "C" fn module_new(
         }
     }
     parse_extended_params(s, params, params_len);
+
+    // Resolve the target-tier head-sampling default only when
+    // `trace_sample_permille` was not explicitly supplied (still the sentinel):
+    // aarch64 (CM5-class) 50‰, MCUs 0‰. An explicit value (incl. 0) is honoured.
+    if s.sample_permille == 0xFFFF {
+        #[cfg(target_arch = "aarch64")]
+        {
+            s.sample_permille = 50;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            s.sample_permille = 0;
+        }
+    }
 
     // Initialise per-server retry + ticket secrets from the CSPRNG.
     if dev_csprng_fill(sys, s.retry_secret.as_mut_ptr(), 32) < 0 {
@@ -624,10 +661,14 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = &mut *(state as *mut QuicState);
     let sys = &*s.syscalls;
+
+    // Module-scope metrics: cumulative app-stream byte counters, ~5s cadence,
+    // no-op when the telemetry port is unwired.
+    maybe_emit_telemetry(s);
 
     if !s.bound {
         send_bind(s);
@@ -843,6 +884,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         i += 1;
     }
 
+    // Observability reaper: emit the `quic.connection` span for any
+    // server-accepted connection that has reached `Closed` (via received
+    // CONNECTION_CLOSE, protocol error, or idle timeout) and still has a
+    // pending span. `emit_conn_span` is idempotent — it emits once and clears
+    // the marker, so a lingering Closed slot is not re-emitted. No-op when
+    // telemetry is unwired or the connection wasn't head-sampled.
+    let mut i = 0;
+    while i < MAX_CONNS {
+        if s.conns[i].phase == ConnPhase::Closed {
+            emit_conn_span(s, i);
+        }
+        i += 1;
+    }
+
     // Client-side 0-RTT resumption: once the first connection is
     // Established and a ticket is cached, open a second handshake on a
     // free slot using that ticket so the PSK + early_data path runs
@@ -1020,6 +1075,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 n,
                             );
                             (sys.channel_write)(s.app_out, frame.as_ptr(), 3 + n);
+                            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(n as u32);
                         }
                     }
                     s.conns[i].stream_recv_buf_len = 0;
@@ -1084,6 +1140,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             n,
                         );
                         conn.stream_send_buf_len += n;
+                        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(n as u32);
                     }
                 }
             }
@@ -1096,7 +1153,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     1
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub unsafe extern "C" fn module_destroy(_state: *mut u8) {}
 
 unsafe fn discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
@@ -1106,6 +1163,141 @@ unsafe fn discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
         (sys.channel_read)(ch, buf.as_mut_ptr(), take);
         count -= take;
     }
+}
+
+/// Module-scope telemetry: emit cumulative `bytes_in` / `bytes_out` counters to
+/// the `observe` collector when the telemetry port is wired (no-op otherwise),
+/// at a ~5s wallclock cadence. Metric ids follow `[observability].metrics`
+/// order: 0 = bytes_in, 1 = bytes_out. Counter semantics are monotonic, so the
+/// deltas are NOT reset here.
+#[inline(never)]
+unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
+    if s.telemetry < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.tlm_last_ms) < 5000 {
+        return;
+    }
+    s.tlm_last_ms = now;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let midx = me as u16;
+    let t = dev_micros(sys);
+    let counter = abi::contracts::telemetry::METRIC_COUNTER;
+    dev_telemetry_metric(sys, s.telemetry, midx, t, counter, 0, s.tlm.bytes_in as u64);
+    dev_telemetry_metric(sys, s.telemetry, midx, t, counter, 1, s.tlm.bytes_out as u64);
+}
+
+/// Head-sampling decision for a new `quic.connection` root, drawn
+/// deterministically from the (random) minted trace id and compared to
+/// `permille`. Returns the W3C trace-flags to stamp. Mirrors ip/dns.
+#[inline(always)]
+fn ingress_sample_decision(permille: u16, trace_id: &[u8; 16]) -> u8 {
+    let draw = u16::from_le_bytes([trace_id[0], trace_id[1]]) % 1000;
+    if draw < permille {
+        abi::contracts::telemetry::TRACE_FLAGS_SAMPLED
+    } else {
+        0
+    }
+}
+
+/// Emit the finished `quic.connection` span (name_id 0, SERVER kind) for a
+/// server-accepted connection, then clear its pending marker (idempotent — safe
+/// to call at every close path). No-op for client conns, an already-emitted
+/// span, an unsampled connection, or an unwired telemetry port. The sample-bit
+/// test runs before the clock read so an unsampled conn does no work.
+#[inline(never)]
+unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
+    if !s.conns[idx].is_server || s.conns[idx].span_start_us == 0 {
+        return;
+    }
+    let flags = s.conns[idx].sampled_flags;
+    let start = s.conns[idx].span_start_us;
+    s.conns[idx].span_start_us = 0; // mark emitted before any early return
+    if flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0 || s.telemetry < 0 {
+        return;
+    }
+    let trace_id = s.conns[idx].trace_id;
+    let span_id = s.conns[idx].span_id;
+    let sys = &*s.syscalls;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let end_raw = dev_micros(sys);
+    let end = if end_raw < start { start } else { end_raw };
+    let ctx = abi::contracts::telemetry::SpanContext {
+        trace_id,
+        span_id,
+        parent_id: [0u8; 8], // quic is the ingress for this connection → root
+        flags,
+    };
+    dev_telemetry_span(
+        sys,
+        s.telemetry,
+        me as u16,
+        0, // name_id 0 = quic.connection
+        abi::contracts::telemetry::SPAN_SERVER,
+        abi::contracts::telemetry::STATUS_OK,
+        &ctx,
+        start,
+        end,
+    );
+}
+
+/// Capture the start time for an `h3.request` child span, but only when the
+/// enclosing connection is head-sampled and telemetry is wired. Returns 0 (no
+/// span) otherwise, so the clock read and the emit are both skipped — child
+/// spans inherit the connection's sample decision.
+#[inline(always)]
+unsafe fn h3_span_start(s: &QuicState, idx: usize) -> u64 {
+    if s.telemetry < 0
+        || s.conns[idx].sampled_flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0
+    {
+        return 0;
+    }
+    dev_micros(&*s.syscalls)
+}
+
+/// Emit a finished `h3.request` child span (name_id 1, SERVER kind) parented by
+/// the connection's `quic.connection` span — fresh span id, the connection's
+/// span id as parent, shared trace id and flags. No-op when `start == 0`
+/// (unsampled / unwired), so it composes with [`h3_span_start`].
+#[inline(never)]
+unsafe fn emit_h3_request_span(s: &QuicState, idx: usize, start: u64) {
+    if start == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let me = dev_self_index(sys);
+    if me < 0 {
+        return;
+    }
+    let end_raw = dev_micros(sys);
+    let end = if end_raw < start { start } else { end_raw };
+    let mut child_span_id = [0u8; 8];
+    dev_csprng_fill(sys, child_span_id.as_mut_ptr(), 8);
+    let ctx = abi::contracts::telemetry::SpanContext {
+        trace_id: s.conns[idx].trace_id,
+        span_id: child_span_id,
+        parent_id: s.conns[idx].span_id, // parented by quic.connection
+        flags: s.conns[idx].sampled_flags,
+    };
+    dev_telemetry_span(
+        sys,
+        s.telemetry,
+        me as u16,
+        1, // name_id 1 = h3.request
+        abi::contracts::telemetry::SPAN_SERVER,
+        abi::contracts::telemetry::STATUS_OK,
+        &ctx,
+        start,
+        end,
+    );
 }
 
 unsafe fn send_bind(s: &mut QuicState) {
@@ -1213,6 +1405,8 @@ unsafe fn alloc_server_connection(
     ip: &[u8; 4],
     port: u16,
 ) -> Option<usize> {
+    // Snapshot the sampling rate before borrowing a connection slot mutably.
+    let permille = s.sample_permille;
     let mut i = 0;
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Idle {
@@ -1230,6 +1424,17 @@ unsafe fn alloc_server_connection(
             let sys = &*s.syscalls;
             dev_csprng_fill(sys, conn.our_cid.as_mut_ptr(), 8);
             conn.our_cid_len = 8;
+
+            // Observability: mint the `quic.connection` root trace context and
+            // start the span clock when telemetry is wired. Head-sampling is
+            // decided once here and latched in `sampled_flags`; the close path
+            // emits the span. Zero-cost (no mint) when the port is unwired.
+            if s.telemetry >= 0 {
+                dev_csprng_fill(sys, conn.trace_id.as_mut_ptr(), 16);
+                dev_csprng_fill(sys, conn.span_id.as_mut_ptr(), 8);
+                conn.sampled_flags = ingress_sample_decision(permille, &conn.trace_id);
+                conn.span_start_us = dev_micros(sys);
+            }
 
             // Assign ECDH keypair.
             conn.driver.ecdh_private = s.eph_private[i];
@@ -1733,7 +1938,9 @@ unsafe fn h3_handle_stream_recv(s: &mut QuicState, idx: usize) {
         match frame.frame_type {
             x if x == H3_FRAME_HEADERS => {
                 if s.conns[idx].is_server {
+                    let h3_start = h3_span_start(s, idx);
                     h3_dispatch_request(s, idx, frame.payload);
+                    emit_h3_request_span(s, idx, h3_start);
                 } else {
                     if let Some(status) = h3_decode_status(frame.payload) {
                         let mut log_buf = [0u8; 64];
@@ -2076,7 +2283,9 @@ unsafe fn h3_handle_bidi_extra_recv(s: &mut QuicState, idx: usize) {
                                 let msg = b"[quic] h3 POST headers (bidi)";
                                 dev_log(sys, 3, msg.as_ptr(), msg.len());
                             } else {
+                                let h3_start = h3_span_start(s, idx);
                                 h3_dispatch_request_bidi(s, idx, k, path_bytes);
+                                emit_h3_request_span(s, idx, h3_start);
                             }
                         }
                     } else {
@@ -2594,6 +2803,74 @@ fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
         i += 1;
     }
     true
+}
+
+#[cfg(feature = "host-test")]
+pub mod test_helpers {
+    //! Helpers for host-side test harnesses. Not compiled into PIC firmware
+    //! (`cfg(feature = "host-test")`). They let a test observe and drive the
+    //! connection lifecycle without standing up a full QUIC crypto handshake.
+
+    use super::{ConnPhase, QuicState, MAX_CONNS};
+
+    /// Number of server-accepted connections currently occupying a slot
+    /// (anything past `Idle`). After the RX path allocates a server
+    /// connection this is ≥ 1 — and its `quic.connection` span has been
+    /// minted.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`.
+    pub unsafe fn server_conn_count(state: *mut u8) -> usize {
+        let s = &*(state as *const QuicState);
+        let mut n = 0;
+        let mut i = 0;
+        while i < MAX_CONNS {
+            if s.conns[i].is_server && s.conns[i].phase != ConnPhase::Idle {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    }
+
+    /// Force every live server connection to `Closed`. The real close paths
+    /// (received `CONNECTION_CLOSE`, protocol error, idle timeout) all do
+    /// exactly this; the next `module_step`'s close reaper then emits each
+    /// connection's `quic.connection` span. Lets a test exercise the span
+    /// emit/close path deterministically without driving a real handshake to
+    /// completion.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`.
+    pub unsafe fn close_server_conns(state: *mut u8) {
+        let s = &mut *(state as *mut QuicState);
+        let mut i = 0;
+        while i < MAX_CONNS {
+            if s.conns[i].is_server && s.conns[i].phase != ConnPhase::Idle {
+                s.conns[i].phase = ConnPhase::Closed;
+            }
+            i += 1;
+        }
+    }
+
+    /// Dispatch a synthetic HTTP/3 `GET /` through the real server request
+    /// handler on connection `idx`, bracketed exactly as the RX loop does — so
+    /// the module emits the `h3.request` child span (parented by the
+    /// connection's `quic.connection` span). Lets a test validate the
+    /// per-request span + its parent linkage without standing up a full QUIC +
+    /// TLS + HTTP/3 handshake.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`; `idx` must be an
+    /// allocated connection slot.
+    pub unsafe fn dispatch_h3_get(state: *mut u8, idx: usize) {
+        let s = &mut *(state as *mut QuicState);
+        let start = super::h3_span_start(s, idx);
+        let mut block = [0u8; 128];
+        let n = super::h3_encode_request_headers(b"GET", b"/", b"example.test", &mut block);
+        super::h3_dispatch_request(s, idx, &block[..n]);
+        super::emit_h3_request_span(s, idx, start);
+    }
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

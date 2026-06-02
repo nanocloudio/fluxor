@@ -29,3 +29,7 @@ vm/
 # not affected.
 /tests/
 /tools/tests/
+
+# Host-test shims for excluded (non-workspace) module crates generate
+# their own lockfile; not tracked (the crates carry no host-test deps).
+modules/**/Cargo.lock

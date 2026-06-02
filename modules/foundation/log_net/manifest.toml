@@ -13,3 +13,7 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "telemetry/log exporter or collector — forwards records, originates none (cf. otlp_http / otel_udp_sample)"

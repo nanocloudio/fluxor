@@ -31,3 +31,7 @@ content_type = "OctetStream"
 [[resources]]
 requires_contract = "channel"
 access = "read"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "application-layer demo — byte throughput is observed at the foundation transport (ip/quic/http) it rides"

@@ -41,3 +41,17 @@ content_type = "WsFrame"
 name = "rx_out"
 direction = "output"
 content_type = "OctetStream"
+
+# Module-scope observability. Optional 3rd output (out[2]); wired to
+# `observe.telemetry` when the debug stack's observe overlay is on. Emits
+# cumulative byte counters; no-op when unwired. See standards/observability.md.
+[[ports]]
+name = "telemetry"
+index = 2
+direction = "output"
+content_type = "Telemetry"
+
+[observability]
+# bytes_in  = payload delivered inbound to rx_out (browser → app)
+# bytes_out = WsFrame bytes sent outbound to tx_out (app → browser)
+metrics = ["bytes_in", "bytes_out"]

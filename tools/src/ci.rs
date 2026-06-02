@@ -130,6 +130,18 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("hygiene", verbose, || run_hygiene(project_root))
     });
 
+    // ───── Phase 1.45: observability instrumentation contract ───────
+    //
+    // Enforce standards/observability.md §6: every data-moving module
+    // either declares `[observability]` metrics/spans or carries an
+    // `exempt` reason. Strict (a gap is an error, not a warning), so a
+    // new byte-moving module can't land uninstrumented and unexplained.
+    results.push(if skip.hygiene {
+        skipped("observability")
+    } else {
+        run_step("observability", verbose, || run_observability(project_root))
+    });
+
     // ───── Phase 1.5: template render ───────────────────────────────
     results.push(if skip.templates {
         skipped("template-render")
@@ -742,6 +754,35 @@ fn run_hygiene(project_root: &Path) -> std::result::Result<(), String> {
         report.violations.len(),
         report.stale_exemptions.len()
     ))
+}
+
+/// Observability instrumentation-contract phase. Mirrors `fluxor lint
+/// observability --strict`: a data-moving module with neither `[observability]`
+/// instruments nor an `exempt` reason fails, as does a malformed instrument
+/// name. See `standards/observability.md` §6.
+fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
+    let toml_exempt = crate::observability::load_toml_exemptions(project_root);
+    let report =
+        crate::observability::lint_with_exemptions(&project_root.join("modules"), &toml_exempt);
+    if report.invalid_names.is_empty() && report.uninstrumented.is_empty() {
+        return Ok(());
+    }
+    let mut msg = String::new();
+    if !report.invalid_names.is_empty() {
+        msg.push_str(&format!(
+            "{} malformed instrument name(s); ",
+            report.invalid_names.len()
+        ));
+    }
+    if !report.uninstrumented.is_empty() {
+        msg.push_str(&format!(
+            "{} data-moving module(s) with no `[observability]` metrics/spans or `exempt` reason ({}); ",
+            report.uninstrumented.len(),
+            report.uninstrumented.join(", ")
+        ));
+    }
+    msg.push_str("run `fluxor lint observability --strict` for details");
+    Err(msg)
 }
 
 /// Walk every workspace member and confirm it declares

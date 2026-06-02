@@ -24,3 +24,7 @@ content_type = "FmpMessage"
 [[resources]]
 requires_contract = "uart"
 access = "exclusive"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "audio/media-sample path — meaningful throughput is sample-rate (Hz·channels), not byte count; off-device bytes are observed at the network transport"

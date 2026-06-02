@@ -11,3 +11,7 @@ required = true
 name = "status"
 direction = "output"
 content_type = "OctetStream"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "firmware-image ingest — emits its own progress status records (kind/offset/byte_count) on the status port; a generic byte counter would duplicate that domain telemetry"

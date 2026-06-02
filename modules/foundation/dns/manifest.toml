@@ -11,6 +11,24 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 
+# Module-scope observability. Optional 2nd output (out[1]); wired to
+# `observe.telemetry` when the debug stack's observe overlay is on. Emits
+# cumulative byte counters; no-op when unwired. See standards/observability.md.
+[[ports]]
+name = "telemetry"
+index = 1
+direction = "output"
+content_type = "Telemetry"
+
+[observability]
+metrics = ["bytes_in", "bytes_out"]
+# Span 0: one `dns.query` span per locally-resolved query (parse -> reply),
+# SERVER kind, rooting its own trace (DNS-over-UDP carries no inbound context).
+# Minted only when the telemetry port is wired and the query is head-sampled
+# (zero-cost otherwise). Forwarded/upstream queries are not spanned (their
+# latency is the upstream resolver's).
+spans = ["dns.query"]
+
 [[resources]]
 requires_contract = "channel"
 access = "read"

@@ -19,3 +19,7 @@ required = true
 
 [commands]
 emits = ["next", "prev", "toggle", "select", "long_press", "on", "off"]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "human-input device — event-rate is the domain metric, not byte throughput"

@@ -77,6 +77,13 @@ struct State {
     tx_out: i32,
     rx_in: i32,
     rx_out: i32,
+    /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
+    /// unwired, so module-scope metrics are zero-cost when disabled.
+    telemetry: i32,
+    /// Cumulative module-scope byte counters + last-emit wallclock (cadence
+    /// gated on `dev_millis` since this adapter has no per-step counter).
+    tlm: TlmCounters,
+    tlm_last_ms: u64,
     active_conn_id: u32,
     has_conn: bool,
     /// Outbound retry buffer: a fully-framed WsFrame waiting to be
@@ -136,6 +143,10 @@ pub extern "C" fn module_new(
     s.tx_out = unsafe { dev_channel_port(sys_ref, 1, 0) };
     // SAFETY: as above.
     s.rx_out = unsafe { dev_channel_port(sys_ref, 1, 1) };
+    // SAFETY: as above; out[2] is the optional telemetry port (-1 when unwired).
+    s.telemetry = unsafe { dev_channel_port(sys_ref, 1, 2) };
+    s.tlm = TlmCounters::new();
+    s.tlm_last_ms = 0;
     // `u32::MAX` is the "unclaimed" sentinel: stamped on outbound
     // envelopes when no inbound frame has arrived yet. The HTTP
     // server's `ws_drain_fanout_input` recognises this sentinel and
@@ -151,6 +162,46 @@ pub extern "C" fn module_new(
     s.rx_pending_len = 0;
     s.scratch = [0u8; FRAME_BUF_BYTES];
     0
+}
+
+/// Module-scope telemetry: emit cumulative `bytes_in` / `bytes_out` counters to
+/// the `observe` collector when the telemetry port is wired (no-op otherwise),
+/// at a ~5s wallclock cadence. Metric ids follow `[observability].metrics`
+/// order: 0 = bytes_in, 1 = bytes_out. Counter semantics are monotonic, so the
+/// deltas are NOT reset here.
+#[inline(never)]
+fn maybe_emit_telemetry(s: &mut State) {
+    if s.telemetry < 0 {
+        return;
+    }
+    // SAFETY: `s.syscalls` was null-checked by the caller (module_step) before
+    // this helper runs; the kernel-owned table outlives the call. All four
+    // `dev_*` wrappers below are syscall-table calls with no aliasing.
+    unsafe {
+        let sys = &*s.syscalls;
+        let now = dev_millis(sys);
+        if now.wrapping_sub(s.tlm_last_ms) < 5000 {
+            return;
+        }
+        s.tlm_last_ms = now;
+        let me = dev_self_index(sys);
+        if me < 0 {
+            return;
+        }
+        let midx = me as u16;
+        let t = dev_micros(sys);
+        let counter = abi::contracts::telemetry::METRIC_COUNTER;
+        dev_telemetry_metric(sys, s.telemetry, midx, t, counter, 0, s.tlm.bytes_in as u64);
+        dev_telemetry_metric(
+            sys,
+            s.telemetry,
+            midx,
+            t,
+            counter,
+            1,
+            s.tlm.bytes_out as u64,
+        );
+    }
 }
 
 /// Shift-compact the leading `consumed` bytes out of `buf[..len]`.
@@ -181,6 +232,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // table outlives this step.
     let sys = unsafe { &*s.syscalls };
 
+    // Module-scope metrics: cumulative byte counters, ~5s cadence, no-op when
+    // the telemetry port is unwired.
+    maybe_emit_telemetry(s);
+
     // ── Inbound: rx_in (WsFrame) → rx_out (OctetStream) ──
     if s.rx_in >= 0 && s.rx_out >= 0 {
         // Drain the pending retry buffer first.
@@ -191,6 +246,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 unsafe { (sys.channel_write)(s.rx_out, s.rx_pending.as_ptr(), s.rx_pending_len) };
             if written > 0 {
                 let w = (written as usize).min(s.rx_pending_len);
+                s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(w as u32);
                 // SAFETY: `shift_consume` is unsafe over a raw pointer + len;
                 // `s.rx_pending` is owned by `s` so the pointer is valid for
                 // the whole buffer length.
@@ -237,6 +293,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 0
             };
+            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(w as u32);
             if w < payload_len {
                 // Stash unwritten tail in retry buffer.
                 let tail = payload_len - w;
@@ -276,6 +333,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 unsafe { (sys.channel_write)(s.tx_out, s.tx_pending.as_ptr(), s.tx_pending_len) };
             if written > 0 {
                 let w = (written as usize).min(s.tx_pending_len);
+                s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(w as u32);
                 // SAFETY: `shift_consume` over an owned buffer pointer; `w`
                 // is the just-confirmed write count.
                 s.tx_pending_len =
@@ -330,6 +388,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             let w = (written as usize).min(total);
+            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(w as u32);
             if w < total {
                 // Hold tail; tx_pending_len remembers what's left.
                 // SAFETY: `shift_consume` over owned buffer; `total` is the

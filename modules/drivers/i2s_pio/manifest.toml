@@ -17,3 +17,7 @@ instance = 0
 [[resources]]
 requires_contract = "gpio"
 access = "write"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "audio/media-sample path — meaningful throughput is sample-rate (Hz·channels), not byte count; off-device bytes are observed at the network transport"

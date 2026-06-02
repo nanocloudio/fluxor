@@ -16,3 +16,7 @@ required = true
 [[resources]]
 requires_contract = "platform_nic_ring"
 access = "exclusive"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "L2 frame DMA shim — wire-byte throughput is observed at the ip module that consumes/produces these frames"

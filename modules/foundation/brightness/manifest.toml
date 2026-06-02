@@ -12,3 +12,7 @@ name = "level"
 direction = "output"
 content_type = "OctetStream"
 required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "GPIO sensor/actuator — emits state-change events, no sustained byte stream"

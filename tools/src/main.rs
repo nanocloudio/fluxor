@@ -34,6 +34,11 @@ mod manifest;
 mod modules;
 mod modules_build;
 mod monitor;
+// `ci.rs` is shared between the lib and this bin; it refers to the
+// observability lint as `crate::observability`. Re-export the lib's single
+// copy here so the bin doesn't recompile the (mostly bin-dead) id-table
+// generator that lives alongside the lint.
+pub(crate) use fluxor_tools::observability;
 mod project;
 mod project_meta;
 mod publish;
@@ -631,6 +636,11 @@ enum LintAction {
         /// Emit machine-readable JSON instead of human-friendly text.
         #[arg(long)]
         json: bool,
+        /// Enforcement mode (CI): treat any data-moving module that is neither
+        /// instrumented nor `exempt` as a hard error, not just a warning. The
+        /// `fluxor ci` observability phase runs with this on.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -787,9 +797,11 @@ fn main() {
             LintAction::Hygiene { project_root, json } => {
                 cmd_lint_hygiene(project_root.as_deref(), json)
             }
-            LintAction::Observability { project_root, json } => {
-                cmd_lint_observability(project_root.as_deref(), json)
-            }
+            LintAction::Observability {
+                project_root,
+                json,
+                strict,
+            } => cmd_lint_observability(project_root.as_deref(), json, strict),
         },
         Commands::Ci { skip, project_root } => cmd_ci(&skip, project_root.as_deref(), verbose),
         Commands::Modules { action } => match action {
@@ -5128,9 +5140,18 @@ fn resolve_project_root(override_arg: Option<&Path>) -> PathBuf {
 /// every module manifest. Reports the gap list (data-moving modules with no
 /// `[observability]`); fails only on malformed instrument names
 /// (standards/observability.md §6, §9).
-fn cmd_lint_observability(project_root_override: Option<&Path>, json: bool) -> Result<()> {
+fn cmd_lint_observability(
+    project_root_override: Option<&Path>,
+    json: bool,
+    strict: bool,
+) -> Result<()> {
     let root = resolve_project_root(project_root_override);
-    let report = fluxor_tools::observability::lint(&root.join("modules"));
+    let toml_exempt = fluxor_tools::observability::load_toml_exemptions(&root);
+    let report =
+        fluxor_tools::observability::lint_with_exemptions(&root.join("modules"), &toml_exempt);
+    // In `--strict` (CI) mode an uninstrumented data-moving module is a hard
+    // error; otherwise it is a warning and only malformed names fail.
+    let fail = report.has_errors() || (strict && !report.uninstrumented.is_empty());
 
     if json {
         let payload = serde_json::json!({
@@ -5148,7 +5169,7 @@ fn cmd_lint_observability(project_root_override: Option<&Path>, json: bool) -> R
             "{}",
             serde_json::to_string_pretty(&payload).unwrap_or_default()
         );
-        if report.has_errors() {
+        if fail {
             std::process::exit(1);
         }
         return Ok(());
@@ -5161,9 +5182,14 @@ fn cmd_lint_observability(project_root_override: Option<&Path>, json: bool) -> R
         );
     }
     for m in &report.uninstrumented {
+        let (colour, level) = if strict {
+            ("1;31", "error")
+        } else {
+            ("1;33", "warn")
+        };
         eprintln!(
-            "\x1b[1;33mobservability\x1b[0m {m}: data-moving module declares no \
-             `[observability]` metrics/spans and no `exempt` reason"
+            "\x1b[{colour}mobservability\x1b[0m {m}: data-moving module declares no \
+             `[observability]` metrics/spans and no `exempt` reason ({level})"
         );
     }
     eprintln!(
@@ -5175,7 +5201,7 @@ fn cmd_lint_observability(project_root_override: Option<&Path>, json: bool) -> R
         report.uninstrumented.len(),
         report.invalid_names.len(),
     );
-    if report.has_errors() {
+    if fail {
         std::process::exit(1);
     }
     Ok(())

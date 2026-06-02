@@ -12,8 +12,60 @@
 //! name is local id N, and the emitter references it by that same index.
 
 use crate::manifest::{Manifest, Observability};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// A `[[ci.observability.exemption]]` row from `fluxor.toml` — the
+/// project-level escape hatch for a data-moving module whose manifest can't be
+/// edited (e.g. a vendored/downstream module). Equivalent to a per-manifest
+/// `[observability] exempt = "..."`, but declared centrally. See
+/// `standards/observability.md` §9.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TomlExemption {
+    /// Module path as it appears in the lint (e.g. `foundation/quic`), matched
+    /// against the manifest's directory path under `modules/`.
+    pub module: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "documentation-only at scan time, mirrors hygiene exemptions"
+    )]
+    pub expires: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExemptToml {
+    #[serde(default)]
+    ci: ExemptCi,
+}
+#[derive(Debug, Default, Deserialize)]
+struct ExemptCi {
+    #[serde(default)]
+    observability: ExemptCfg,
+}
+#[derive(Debug, Default, Deserialize)]
+struct ExemptCfg {
+    #[serde(default)]
+    exemption: Vec<TomlExemption>,
+}
+
+/// Load `[[ci.observability.exemption]]` rows from `<project_root>/fluxor.toml`.
+/// Tolerant: a missing or unparseable file yields no exemptions (the
+/// per-manifest `exempt` field remains the primary mechanism, so a broken
+/// fluxor.toml never silently widens the gate).
+pub fn load_toml_exemptions(project_root: &Path) -> Vec<TomlExemption> {
+    let path = project_root.join("fluxor.toml");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    match toml::from_str::<ExemptToml>(&raw) {
+        Ok(parsed) => parsed.ci.observability.exemption,
+        Err(_) => Vec::new(),
+    }
+}
 
 /// A module's place in the resolved graph plus its declared instruments.
 pub struct ModuleInstruments<'a> {
@@ -159,6 +211,15 @@ impl ObsLintReport {
 /// contract. A port with direction `input` (0) or `output` (1) — not `ctrl`
 /// (2/3) — makes a module data-moving.
 pub fn lint(root: &Path) -> ObsLintReport {
+    lint_with_exemptions(root, &[])
+}
+
+/// As [`lint`], but a module whose path matches a `fluxor.toml`
+/// `[[ci.observability.exemption]]` row is treated as `Exempt` even when its
+/// manifest declares neither instruments nor an `exempt` reason. The
+/// per-manifest field takes precedence; the toml list only rescues otherwise-
+/// uninstrumented modules. See `standards/observability.md` §9.
+pub fn lint_with_exemptions(root: &Path, toml_exemptions: &[TomlExemption]) -> ObsLintReport {
     let mut report = ObsLintReport::default();
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
@@ -194,7 +255,23 @@ pub fn lint(root: &Path) -> ObsLintReport {
             ObsStatus::Exempt => report
                 .exempt
                 .push((name.clone(), obs.exempt.clone().unwrap_or_default())),
-            ObsStatus::Uninstrumented => report.uninstrumented.push(name.clone()),
+            ObsStatus::Uninstrumented => {
+                // A fluxor.toml exemption rescues an otherwise-uninstrumented
+                // data-moving module (the downstream/vendored escape hatch).
+                // Match tolerantly: the lint name is the path under `modules/`
+                // (e.g. `foundation/quic`), so accept a row written either way
+                // (`foundation/quic` or `modules/foundation/quic`).
+                if let Some(ex) = toml_exemptions.iter().find(|e| {
+                    let m = e.module.strip_prefix("modules/").unwrap_or(&e.module);
+                    m == name
+                }) {
+                    report
+                        .exempt
+                        .push((name.clone(), format!("{} (fluxor.toml)", ex.reason)));
+                } else {
+                    report.uninstrumented.push(name.clone());
+                }
+            }
             ObsStatus::NotDataMoving => {}
         }
     }
@@ -322,5 +399,86 @@ mod tests {
             r.has_errors(),
             "a malformed instrument name is a hard error"
         );
+    }
+
+    /// Write a minimal data-moving manifest (one input + one output port, no
+    /// `[observability]`) under `<root>/modules/<rel>/manifest.toml`.
+    fn write_uninstrumented_module(modules_root: &Path, rel: &str) {
+        let dir = modules_root.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            "version = \"1.0.0\"\nhardware_targets = [\"rp2350\"]\n\n\
+             [[ports]]\nname = \"in0\"\ndirection = \"input\"\ncontent_type = \"OctetStream\"\n\n\
+             [[ports]]\nname = \"out0\"\ndirection = \"output\"\ncontent_type = \"OctetStream\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fluxor_toml_exemption_rescues_an_uninstrumented_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modules_root = tmp.path().join("modules");
+        write_uninstrumented_module(&modules_root, "foundation/widget");
+
+        // No exemptions → the module is an uninstrumented gap.
+        let bare = lint(&modules_root);
+        assert_eq!(bare.uninstrumented, vec!["foundation/widget".to_string()]);
+        assert!(bare.exempt.is_empty());
+
+        // A matching fluxor.toml row (bare path) rescues it to exempt.
+        let ex = vec![TomlExemption {
+            module: "foundation/widget".into(),
+            reason: "vendored — owner instruments upstream".into(),
+            expires: None,
+        }];
+        let rescued = lint_with_exemptions(&modules_root, &ex);
+        assert!(rescued.uninstrumented.is_empty());
+        assert_eq!(rescued.exempt.len(), 1);
+        assert_eq!(rescued.exempt[0].0, "foundation/widget");
+        assert!(rescued.exempt[0].1.contains("fluxor.toml"));
+
+        // The `modules/`-prefixed form matches the same module.
+        let ex_prefixed = vec![TomlExemption {
+            module: "modules/foundation/widget".into(),
+            reason: "vendored".into(),
+            expires: None,
+        }];
+        assert!(
+            lint_with_exemptions(&modules_root, &ex_prefixed)
+                .uninstrumented
+                .is_empty(),
+            "a `modules/`-prefixed exemption path must match too"
+        );
+
+        // A non-matching row leaves the gap in place.
+        let ex_miss = vec![TomlExemption {
+            module: "foundation/other".into(),
+            reason: "x".into(),
+            expires: None,
+        }];
+        assert_eq!(
+            lint_with_exemptions(&modules_root, &ex_miss).uninstrumented,
+            vec!["foundation/widget".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_toml_exemptions_parses_rows_and_tolerates_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing fluxor.toml → empty, no error.
+        assert!(load_toml_exemptions(tmp.path()).is_empty());
+
+        std::fs::write(
+            tmp.path().join("fluxor.toml"),
+            "[[ci.observability.exemption]]\n\
+             module = \"foundation/widget\"\n\
+             reason = \"vendored\"\n",
+        )
+        .unwrap();
+        let rows = load_toml_exemptions(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].module, "foundation/widget");
+        assert_eq!(rows[0].reason, "vendored");
     }
 }

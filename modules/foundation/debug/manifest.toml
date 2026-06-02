@@ -10,3 +10,7 @@ hardware_targets = ["rp2350"]
 name = "data"
 direction = "input"
 content_type = "OctetStream"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "debug tap — diagnostic passthrough, not a production data path"

@@ -186,7 +186,11 @@ members = ["contracts", "crates/fluxor-abi", "crates/fluxor-sdk", "tools", "modu
 # via path. It is intentionally not a member here — host integration
 # tests are run from inside `tests/harness` so the rest of the tree
 # builds without them present.
-exclude = ["tests"]
+# `modules/foundation/dns` carries a purely-additive host-test Cargo shim
+# (firmware `rustc` build ignores it) so the harness can link it as a host
+# rlib. Excluded — it is not subject to the workspace lint matrix; it only
+# needs to compile under `host-test` for the integration tests.
+exclude = ["tests", "modules/foundation/dns", "modules/foundation/quic", "modules/foundation/mqtt"]
 
 [workspace.package]
 # Shared by every publishable crate via `version.workspace = true`.

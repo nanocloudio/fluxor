@@ -22,3 +22,7 @@ content_type = "OctetStream"
 name = "blocks"
 direction = "output"
 content_type = "OctetStream"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "block-storage driver — block I/O is observed at the fs/bank layer above it"

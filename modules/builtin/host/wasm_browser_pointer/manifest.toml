@@ -18,3 +18,7 @@ name = "events"
 direction = "output"
 content_type = "PointerEvents"
 required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; carries input events / media samples / canvas rasters / WS frames, not a measurable on-device byte stream"
