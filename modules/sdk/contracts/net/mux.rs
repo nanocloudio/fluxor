@@ -110,6 +110,12 @@ pub const CMD_MUX_STREAM_SEND: u8 = 0xB4;
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [bytes: u32 LE].
 pub const CMD_MUX_STREAM_ACK: u8 = 0xB5;
 
+/// Send an unreliable datagram on the session (RFC 9221 QUIC DATAGRAM).
+/// Session-scoped, not stream-scoped: there is no stream_id and no
+/// retransmission. Payload: [session_id: u32 LE] [data: ...]. A datagram
+/// larger than the peer's advertised max is dropped by the provider.
+pub const CMD_MUX_DATAGRAM_SEND: u8 = 0xB6;
+
 // ─── Downstream: provider → consumer ───────────────────────────────
 
 /// Session opened and ready to carry streams.
@@ -141,6 +147,24 @@ pub const MSG_MUX_STREAM_RX: u8 = 0xC5;
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [bytes: u32 LE].
 pub const MSG_MUX_STREAM_READY: u8 = 0xC6;
 
+/// Received an unreliable datagram on the session (RFC 9221 QUIC
+/// DATAGRAM). Session-scoped. Payload: [session_id: u32 LE] [data: ...].
+pub const MSG_MUX_DATAGRAM_RX: u8 = 0xC7;
+
+/// Peer-identity sideband for the session: a one-shot event a transport
+/// emits once the underlying secure handshake binds the peer, so an
+/// application consuming the mux surface (e.g. an mqtt codec) learns the
+/// authenticated peer identity without reaching into the transport.
+/// Session-scoped. Payload:
+/// `[session_id: u32 LE] [verified: u8] [svid_len: u16 LE] [svid: svid_len bytes]`
+/// where `verified` is 1 if the peer presented a verified credential
+/// (0 otherwise) and `svid` is the optional SPIFFE-style identity bytes
+/// (empty when none). This is a first-class mux downstream event — it
+/// must NOT be smuggled as an out-of-contract opcode (older revisions
+/// borrowed `0x5A`, which collides with the reserved `packet` range
+/// `0x50..0x63`).
+pub const MSG_MUX_PEER_IDENTITY: u8 = 0xC8;
+
 /// Generic session-scoped error.
 /// Payload: [session_id: u32 LE] [errno: i8].
 pub const MSG_MUX_SESSION_ERROR: u8 = 0xCE;
@@ -156,3 +180,49 @@ pub const MSG_MUX_STREAM_ERROR: u8 = 0xCF;
 /// `MSG_MUX_STREAM_RX`):
 /// `[session_id:4][stream_id:4] = 8 bytes`.
 pub const STREAM_DATA_PREFIX: usize = SESSION_ID_BYTES + STREAM_ID_BYTES;
+
+// ─── QUIC v1 constrained profile ───────────────────────────────────
+//
+// The QUIC foundation module is the first (and currently only) consumer
+// of this contract. It does NOT implement the full lifecycle above; it
+// exposes a deliberately constrained profile, documented here so a
+// consumer (e.g. an mqtt-over-QUIC codec) knows exactly what to expect
+// rather than discovering an undocumented subset by trial:
+//
+//   • session_id == QUIC connection index. Sessions are NOT opened via
+//     CMD_MUX_SESSION_OPEN; a session exists implicitly once the QUIC
+//     handshake completes for a connection that negotiated a non-h3
+//     ALPN. MSG_MUX_SESSION_OPENED is not emitted (the app learns the
+//     binding from MSG_MUX_STREAM_ACCEPTED / a one-shot peer-identity
+//     event instead). CMD_MUX_SESSION_OPEN / _CLOSE and
+//     CMD_MUX_STREAM_OPEN are not honoured in this profile.
+//
+//   • Exactly one stream per session — the client-initiated bidi stream
+//     id 0. `stream_id` on CMD_MUX_STREAM_SEND MUST be 0; a non-zero
+//     stream_id is rejected (the frame is dropped), never silently
+//     remapped onto stream 0. The peer-opened stream surfaces once as
+//     MSG_MUX_STREAM_ACCEPTED(stream 0, STREAM_FLAG_BIDI).
+//
+//   • [`MUX_QUIC_STREAM_SEND_MAX`] bounds the data carried in one
+//     CMD_MUX_STREAM_SEND (it matches the engine's single-MTU stream
+//     send buffer). A larger reliable write is REJECTED without
+//     truncation rather than clipped — the engine reads frames with an
+//     alignment-preserving reader, so an oversize frame neither desyncs
+//     the FIFO nor silently loses its tail.
+//
+//   • FIN delivery is reliable: MSG_MUX_STREAM_CLOSED is emitted exactly
+//     once when the peer FINs the stream, including an empty FIN that
+//     carries no data, and is retained-and-retried under app
+//     backpressure (never best-effort-dropped).
+//
+//   • Datagrams (CMD_MUX_DATAGRAM_SEND / MSG_MUX_DATAGRAM_RX) follow the
+//     session-scoped, unreliable semantics above unchanged (RFC 9221).
+//
+// Flow-control credit messages (CMD_MUX_STREAM_ACK / MSG_MUX_STREAM_READY)
+// are not used in this profile; backpressure is expressed by the channel
+// fill level (all-or-nothing frame writes).
+
+/// Maximum data bytes in one `CMD_MUX_STREAM_SEND` under the QUIC v1
+/// constrained profile (matches the engine's single-MTU stream send
+/// buffer). A reliable write larger than this is rejected, not truncated.
+pub const MUX_QUIC_STREAM_SEND_MAX: usize = 1200;

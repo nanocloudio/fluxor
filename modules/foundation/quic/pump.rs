@@ -49,6 +49,42 @@ unsafe fn pump_session(s: &mut QuicState, idx: usize) -> bool {
     }
 }
 
+/// Server ALPN selection (RFC 7301 §3.2): walk the module's configured
+/// list (comma-separated tokens, server-preference order) and return the
+/// first entry the client also offered. `cfg` is the raw `alpn` config
+/// bytes; `offered` is the client's ALPN ProtocolNameList payload (the
+/// inner list `ClientHelloInfo::alpn_protos` points at). Returns the
+/// matched token (a sub-slice of `cfg`), or `None` on no overlap / empty
+/// config — in which case no ALPN is negotiated.
+fn select_alpn<'a>(cfg: &'a [u8], offered: &[u8]) -> Option<&'a [u8]> {
+    for want in cfg.split(|&b| b == b',') {
+        if want.is_empty() {
+            continue;
+        }
+        for have in alpn_iter(offered) {
+            if have == want {
+                return Some(want);
+            }
+        }
+    }
+    None
+}
+
+/// Client ALPN validation (RFC 7301 §3.1): was `proto` (the protocol the
+/// server selected in EncryptedExtensions) actually offered by us in the
+/// ClientHello? `offered_cfg` is the raw `alpn` config (comma-separated
+/// tokens). An empty config means we offered the TLS default list
+/// (`h2`, `http/1.1`) — see `write_ext_alpn_client`. A server selection
+/// the client never offered MUST be rejected, not adopted.
+fn alpn_offered_contains(offered_cfg: &[u8], proto: &[u8]) -> bool {
+    if offered_cfg.is_empty() {
+        return proto == b"h2" || proto == b"http/1.1";
+    }
+    offered_cfg
+        .split(|&b| b == b',')
+        .any(|t| !t.is_empty() && t == proto)
+}
+
 unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let driver = &mut s.conns[idx].driver;
@@ -191,6 +227,9 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
         driver.hs_state = HandshakeState::Error;
         return true;
     }
+    // RFC 9221 §3: capture the client's max_datagram_frame_size so the
+    // server only emits DATAGRAMs the peer will accept.
+    s.conns[idx].peer_max_datagram_frame_size = parse_peer_max_datagram_frame_size(tp);
     let driver = &mut s.conns[idx].driver;
     driver.suite = match select_cipher_suite(ch.cipher_suites) {
         Some(cs) => cs,
@@ -272,6 +311,61 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
             conn.driver.key_schedule = Some(ks);
         }
     }
+
+    // ── ALPN selection (RFC 7301 §3.2) ─────────────────────────────
+    // Placed after the PSK block so no `driver` borrow is live. When an
+    // `alpn` list is configured, pick the server's first configured
+    // token the client also offered and latch it on the connection; it
+    // is echoed in EncryptedExtensions. The per-connection `use_h3` flag
+    // then decides whether this connection drives the HTTP/3 app layer
+    // (negotiated `h3`) or routes raw bidi streams to the app surface
+    // (any non-h3 ALPN, e.g. `mqtt`). With no ALPN configured, behaviour
+    // is unchanged: module-wide `enable_h3` governs.
+    let mut sel_buf = [0u8; MAX_ALPN];
+    let mut sel_len = 0usize;
+    let mut decided_h3 = s.enable_h3 != 0;
+    // RFC 7301 §3.2, fail-closed: an EXPLICITLY configured ALPN list means
+    // the application requires a negotiated protocol. The server MUST then
+    // either select exactly one overlapping token or abort with a fatal
+    // no_application_protocol alert. There is no silent fallback — that
+    // would route the connection over a protocol neither side agreed on.
+    // A client that omits the ALPN extension entirely is also rejected
+    // (it cannot satisfy our requirement). Only when NO ALPN is configured
+    // do we keep the legacy `enable_h3` default.
+    let mut alpn_fatal = false;
+    if s.alpn_cfg_len > 0 {
+        match ch.alpn_protos {
+            Some(offered) => {
+                let cfg = &s.alpn_cfg[..s.alpn_cfg_len];
+                match select_alpn(cfg, offered) {
+                    // A selected token is always a sub-slice of our own
+                    // config, which validation caps at MAX_ALPN; the length
+                    // guard is defensive (a non-fitting token fails closed).
+                    Some(sel) if sel.len() <= MAX_ALPN => {
+                        sel_len = sel.len();
+                        sel_buf[..sel_len].copy_from_slice(sel);
+                        decided_h3 = &sel_buf[..sel_len] == &b"h3"[..];
+                    }
+                    _ => {
+                        // No overlap (or malformed/oversize) → fail closed.
+                        alpn_fatal = true;
+                    }
+                }
+            }
+            // Configured list but the client offered no ALPN at all.
+            None => alpn_fatal = true,
+        }
+    }
+    let conn = &mut s.conns[idx];
+    if alpn_fatal {
+        conn.driver.hs_state = HandshakeState::Error;
+        let m = b"[quic] ALPN no overlap - no_application_protocol";
+        dev_log(sys, 2, m.as_ptr(), m.len());
+        return true;
+    }
+    conn.alpn_selected[..sel_len].copy_from_slice(&sel_buf[..sel_len]);
+    conn.alpn_selected_len = sel_len as u8;
+    conn.use_h3 = decided_h3;
     true
 }
 
@@ -439,15 +533,27 @@ unsafe fn pump_send_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
         &scid_buf[..scid_len],
         &orig_buf[..orig_dcid_len],
         rsc_opt,
+        s.disable_migration != 0,
         &mut tp,
     );
     let psk_selected = s.conns[idx].psk_selected;
     let zero_rtt_accepted = s.conns[idx].zero_rtt_accepted;
+    // Echo the negotiated ALPN (RFC 7301) back to the client in
+    // EncryptedExtensions. Empty when no ALPN was negotiated → omitted
+    // by the builder, preserving the pre-ALPN wire shape.
+    let alpn_len = s.conns[idx].alpn_selected_len as usize;
+    let mut alpn_buf = [0u8; MAX_ALPN];
+    alpn_buf[..alpn_len].copy_from_slice(&s.conns[idx].alpn_selected[..alpn_len]);
     let driver = &mut s.conns[idx].driver;
     let msg_len = if psk_selected {
-        build_encrypted_extensions_early(&mut driver.scratch, &[], &tp[..tp_len], zero_rtt_accepted)
+        build_encrypted_extensions_early(
+            &mut driver.scratch,
+            &alpn_buf[..alpn_len],
+            &tp[..tp_len],
+            zero_rtt_accepted,
+        )
     } else {
-        build_encrypted_extensions_ext(&mut driver.scratch, &[], &tp[..tp_len])
+        build_encrypted_extensions_ext(&mut driver.scratch, &alpn_buf[..alpn_len], &tp[..tp_len])
     };
     if let Some(ref mut t) = driver.transcript {
         t.update(&driver.scratch[..msg_len]);
@@ -710,13 +816,22 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
 
 unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
     let sys = &*s.syscalls;
+    // Snapshot the configured ALPN list into a local before borrowing the
+    // connection's driver, so the client offers its configured QUIC
+    // protocols (e.g. `mqtt`,`h3`) in the ClientHello instead of the
+    // TCP/HTTP `h2,http/1.1` default. Empty → builder keeps the default.
+    let alpn_len = s.alpn_cfg_len.min(MAX_ALPN_CFG);
+    let mut alpn_buf = [0u8; MAX_ALPN_CFG];
+    alpn_buf[..alpn_len].copy_from_slice(&s.alpn_cfg[..alpn_len]);
+    let alpn = &alpn_buf[..alpn_len];
     // Build transport_parameters first so we can pass it as an
     // extension to build_client_hello_ext.
     let mut tp = [0u8; TP_BUF_LEN];
     let scid_len = s.conns[idx].our_cid_len as usize;
     let mut scid_buf = [0u8; MAX_CID_LEN];
     core::ptr::copy_nonoverlapping(s.conns[idx].our_cid.as_ptr(), scid_buf.as_mut_ptr(), scid_len);
-    let tp_len = build_transport_params_client(&scid_buf[..scid_len], &mut tp);
+    let tp_len =
+        build_transport_params_client(&scid_buf[..scid_len], s.disable_migration != 0, &mut tp);
 
     let psk_len = s.conns[idx].psk_len as usize;
     let psk_id_len = s.conns[idx].psk_identity_len as usize;
@@ -753,6 +868,7 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
             0,
             hl,
             zero_rtt_offered,
+            alpn,
             &mut driver.scratch,
         );
         // Compute the partial-CH transcript hash. The binder covers
@@ -805,6 +921,7 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
         &session_id,
         &driver.ecdh_public,
         &tp[..tp_len],
+        alpn,
         &mut driver.scratch,
     );
     driver.transcript = Some(Transcript::new(HashAlg::Sha256));
@@ -885,6 +1002,16 @@ unsafe fn pump_recv_server_hello(s: &mut QuicState, idx: usize) -> bool {
 }
 
 unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool {
+    // Captured before borrowing the connection so the ALPN latch below
+    // can fall back to it without re-borrowing `s`.
+    let enable_h3 = s.enable_h3 != 0;
+    // Snapshot the ALPN list we offered in our ClientHello so the
+    // server's selection can be validated against it (RFC 7301 §3.1)
+    // without re-borrowing `s` after `conn` is taken. Empty == the TLS
+    // default offer (h2, http/1.1).
+    let mut offered_cfg = [0u8; MAX_ALPN_CFG];
+    let offered_cfg_len = s.alpn_cfg_len.min(MAX_ALPN_CFG);
+    offered_cfg[..offered_cfg_len].copy_from_slice(&s.alpn_cfg[..offered_cfg_len]);
     let conn = &mut s.conns[idx];
     let (data, len, msg_type) = match conn.driver.read_handshake_message() {
         Some(t) => t,
@@ -970,6 +1097,44 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
     ) {
         conn.driver.hs_state = HandshakeState::Error;
         return true;
+    }
+    // RFC 9221 §3: capture the server's max_datagram_frame_size.
+    conn.peer_max_datagram_frame_size = parse_peer_max_datagram_frame_size(tp);
+    // RFC 7301: latch the server-negotiated ALPN so a client that
+    // negotiated a non-h3 protocol (e.g. `mqtt`) routes to the raw
+    // bidi-stream surface, symmetric with the server. With no ALPN
+    // extension `alpn_selected_len` stays 0 and h3 stays governed by
+    // `enable_h3`, preserving the pre-ALPN client behaviour.
+    if let Some(proto) = parse_encrypted_extensions_alpn(&data[4..len]) {
+        // RFC 7301 §3.1: the client MUST fail the connection if the
+        // server selects a protocol the client did not offer (or one
+        // that doesn't fit our fixed store) — never silently adopt an
+        // unrequested protocol.
+        if proto.len() > MAX_ALPN
+            || !alpn_offered_contains(&offered_cfg[..offered_cfg_len], proto)
+        {
+            conn.driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+        // Latch the negotiated protocol verbatim (never truncated).
+        conn.alpn_selected[..proto.len()].copy_from_slice(proto);
+        conn.alpn_selected_len = proto.len() as u8;
+        conn.use_h3 = proto == &b"h3"[..];
+    } else if offered_cfg_len > 0 {
+        // Fail-closed (RFC 7301 §3.1): we offered an EXPLICIT ALPN list, so
+        // the server omitting the ALPN extension means it negotiated none
+        // of our required protocols. Abort rather than silently fall back
+        // to a non-negotiated protocol.
+        conn.driver.hs_state = HandshakeState::Error;
+        let m = b"[quic] server omitted ALPN despite our offer - abort";
+        let sys = &*s.syscalls;
+        dev_log(sys, 2, m.as_ptr(), m.len());
+        return true;
+    } else {
+        // No ALPN configured locally and none echoed → behaviour governed
+        // by the module's enable_h3 flag, latched per-connection so
+        // post-handshake routing consults `use_h3` uniformly.
+        conn.use_h3 = enable_h3;
     }
     if let Some(ref mut t) = conn.driver.transcript {
         t.update(&data[..len]);
@@ -1196,6 +1361,9 @@ unsafe fn pump_recv_server_finished(s: &mut QuicState, idx: usize) -> bool {
 // ---------------------------------------------------------------------
 
 unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
+    // Captured before the long-lived `conn` borrow so the post-auth
+    // migration check below can consult it without re-borrowing `s`.
+    let migration_enabled = s.disable_migration == 0;
     let conn = &mut s.conns[idx];
     if conn.inbound_len == 0 || conn.inbound_off >= conn.inbound_len {
         return false;
@@ -1359,7 +1527,10 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
 
         let payload = &pkt_copy[parsed.payload_off..parsed.payload_off + parsed.payload_len];
         let now_ms = dev_millis(&*s.syscalls);
-        process_frames(conn, level, payload, now_ms);
+        // Migration is a 1-RTT concern only; the non-probing flag is
+        // unused at Initial / Handshake level.
+        let mut np_ignored = false;
+        process_frames(conn, level, payload, now_ms, &mut np_ignored);
 
         // Advance past this packet — coalesced peer per RFC 9000 §12.2
         // may follow with another packet in the same datagram.
@@ -1472,10 +1643,59 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         }
         let payload = &pkt_copy[body_off..body_off + body_len];
         let now_ms = dev_millis(&*s.syscalls);
-        process_frames(conn, EncLevel::OneRtt, payload, now_ms);
+        let mut non_probing = false;
+        process_frames(conn, EncLevel::OneRtt, payload, now_ms, &mut non_probing);
+        arm_migration_if_new_path(conn, &*s.syscalls, migration_enabled, non_probing);
         mark_inbound_consumed(conn);
         return true;
     }
+}
+
+/// RFC 9000 §9 connection migration, armed ONLY after a 1-RTT packet has
+/// been AEAD-authenticated AND parsed, and ONLY when it was a NON-probing
+/// packet (§9.1). The source 4-tuple (`recv_*`, recorded at ingest) is
+/// compared to the active path; a genuine change carried by an
+/// authenticated, non-probing packet from a confirmed-handshake
+/// connection arms path validation toward the new address.
+///
+/// Two guards matter:
+///  • arming pre-auth would let a spoofed packet bearing a known DCID
+///    redirect challenge traffic and overwrite validation state;
+///  • arming on a probing-only packet (a bare PATH_CHALLENGE /
+///    PATH_RESPONSE, which a peer can send from any address) would let
+///    path probes themselves drive migration.
+///
+/// No-op when migration is disabled, the packet was probing-only, the
+/// handshake isn't confirmed, or the source matches the active path.
+pub(crate) unsafe fn arm_migration_if_new_path(
+    conn: &mut QuicConnection,
+    sys: &SyscallTable,
+    migration_enabled: bool,
+    non_probing: bool,
+) {
+    if !(migration_enabled
+        && non_probing
+        && conn.handshake_confirmed
+        && !conn.peer.matches(&conn.recv_ip, conn.recv_port))
+    {
+        return;
+    }
+    let already = conn.path_validating
+        && conn.cand_ip == conn.recv_ip
+        && conn.cand_port == conn.recv_port;
+    if !already {
+        // New candidate: fresh challenge bytes.
+        conn.cand_ip = conn.recv_ip;
+        conn.cand_port = conn.recv_port;
+        dev_csprng_fill(sys, conn.path_challenge_data.as_mut_ptr(), 8);
+        conn.path_validating = true;
+        conn.path_validate_ms = dev_millis(sys);
+        conn.path_challenge_tx_ms = 0;
+    }
+    // (Re)arm the probe on every authenticated non-probing packet from the
+    // candidate; it is also retried on PTO (see quic_pto_check) so a
+    // wire-lost challenge is resent even if the peer goes quiet.
+    conn.path_challenge_tx_pending = true;
 }
 
 fn mark_inbound_consumed(conn: &mut QuicConnection) {
@@ -1671,7 +1891,7 @@ unsafe fn emit_retry(
     let sys = &*s.syscalls;
     let listen_ep = s.listen_ep;
     let peer = s.conns[idx].peer;
-    send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch);
     dev_log(sys, 3, b"[quic] retry sent".as_ptr(), b"[quic] retry sent".len());
 }
 
@@ -1813,19 +2033,35 @@ unsafe fn emit_version_negotiation(s: &mut QuicState, idx: usize, off: usize, av
     let sys = &*s.syscalls;
     let peer = s.conns[idx].peer;
     let listen_ep = s.listen_ep;
-    send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch);
 }
 
-/// Walk a decrypted packet payload and dispatch each frame.
+/// Walk and dispatch every frame in a decrypted packet payload. Sets
+/// `*non_probing` true if the packet carried at least one NON-probing
+/// frame (RFC 9000 §9.1: probing frames are exactly PATH_CHALLENGE,
+/// PATH_RESPONSE, NEW_CONNECTION_ID, and PADDING; all others — STREAM,
+/// CRYPTO, ACK, PING, … — are non-probing). The caller uses this to gate
+/// connection migration: a packet from a new path that contains only
+/// probing frames must NOT trigger path validation toward that address.
 unsafe fn process_frames(
     conn: &mut QuicConnection,
     level: EncLevel,
     payload: &[u8],
     now_ms: u64,
+    non_probing: &mut bool,
 ) {
     let mut pos = 0;
     while pos < payload.len() {
         let frame_type = payload[pos];
+        // RFC 9000 §9.1 frame classification — anything outside the four
+        // probing frame types makes this a non-probing packet. The PADDING
+        // run (frame_type == 0) is handled in its arm below.
+        if !matches!(
+            frame_type,
+            FRAME_PADDING | FRAME_PATH_CHALLENGE | FRAME_PATH_RESPONSE | FRAME_NEW_CONNECTION_ID
+        ) {
+            *non_probing = true;
+        }
         match frame_type {
             FRAME_PADDING => {
                 // Skip runs of zero bytes.
@@ -2188,6 +2424,86 @@ unsafe fn process_frames(
                     handle_stream_frame(conn, &sf);
                 }
             }
+            FRAME_PATH_CHALLENGE => {
+                // RFC 9000 §8.2.2 / §19.17: echo the 8 challenge bytes
+                // back in a PATH_RESPONSE, sent on the network path the
+                // challenge ARRIVED on (§8.2.2) — which need not be the
+                // validated `peer` when the peer is probing a new path.
+                // Record that source 4-tuple (the datagram source captured
+                // in `recv_*`) so `emit_path_response` targets it.
+                pos += 1;
+                let after = &payload[pos..];
+                let data = match parse_path_data(after) {
+                    Some(d) => d,
+                    None => return,
+                };
+                pos += 8;
+                conn.path_response_data = data;
+                conn.path_response_to_ip = conn.recv_ip;
+                conn.path_response_to_port = conn.recv_port;
+                conn.path_response_tx_pending = true;
+            }
+            FRAME_PATH_RESPONSE => {
+                // RFC 9000 §8.2.3 / §9.3: a PATH_RESPONSE validates the
+                // candidate path only when (a) its token echoes our
+                // outstanding PATH_CHALLENGE AND (b) it was received on
+                // the path the challenge was sent to (the candidate). A
+                // response that merely echoes the token but arrives on a
+                // different path does NOT validate — otherwise an
+                // off-path attacker who observed the token could promote
+                // an unreachable candidate. On success, switch the active
+                // path and reset congestion control (RFC 9000 §9.4).
+                pos += 1;
+                let after = &payload[pos..];
+                let data = match parse_path_data(after) {
+                    Some(d) => d,
+                    None => return,
+                };
+                pos += 8;
+                let on_candidate_path =
+                    conn.recv_ip == conn.cand_ip && conn.recv_port == conn.cand_port;
+                if conn.path_validating
+                    && data == conn.path_challenge_data
+                    && on_candidate_path
+                {
+                    conn.peer = PeerAddr {
+                        ip: conn.cand_ip,
+                        port: conn.cand_port,
+                    };
+                    conn.path_validating = false;
+                    conn.path_challenge_tx_pending = false;
+                    // RFC 9000 §9.4 — reset the congestion controller and
+                    // RTT for the new path (anti-amplification fresh start).
+                    conn.congestion_window = INITIAL_WINDOW;
+                    conn.ssthresh = u64::MAX;
+                    conn.bytes_in_flight = 0;
+                    conn.recovery_start_time = 0;
+                }
+            }
+            FRAME_DATAGRAM_NOLEN | FRAME_DATAGRAM_LEN => {
+                let t = frame_type;
+                pos += 1;
+                let after = &payload[pos..];
+                let (data, n) = match parse_datagram(t, after) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n;
+                // RFC 9221: DATAGRAMs ride 0-RTT / 1-RTT only. Stage the
+                // payload for forward to the app surface. Unreliable — an
+                // undrained prior datagram is overwritten (§5.2), never
+                // retransmitted. Oversized (> our advertised max) is
+                // dropped silently rather than aborting the connection.
+                if matches!(level, EncLevel::OneRtt) && data.len() <= QUIC_MAX_DATAGRAM_SIZE {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        conn.dgram_rx.as_mut_ptr(),
+                        data.len(),
+                    );
+                    conn.dgram_rx_len = data.len();
+                    conn.dgram_rx_pending = true;
+                }
+            }
             _ => {
                 // Unknown / unhandled frame — abort.
                 return;
@@ -2447,6 +2763,20 @@ fn current_send_level(conn: &QuicConnection) -> EncLevel {
 }
 
 unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
+    // Migration: emit dedicated, destination-scoped path-validation
+    // packets FIRST and separately, so neither shares a packet (or a
+    // destination) with application data (RFC 9000 §9.3.3 / §8.2.2).
+    //  • PATH_CHALLENGE → the candidate path under validation.
+    //  • PATH_RESPONSE  → the path the peer's PATH_CHALLENGE arrived on
+    //    (`path_response_to_*`), which may differ from the validated
+    //    `peer` when the peer is probing a new path during its own
+    //    migration.
+    if s.conns[idx].path_validating && s.conns[idx].path_challenge_tx_pending {
+        emit_path_challenge(s, idx);
+    }
+    if s.conns[idx].path_response_tx_pending {
+        emit_path_response(s, idx);
+    }
     loop {
         let mut send_len;
         let level;
@@ -2501,7 +2831,14 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
             let one_rtt_ack_eliciting_pending = conn.stream_send_buf_len > 0
                 || conn.stream_send_fin
                 || conn.pending_handshake_done
-                || has_extra_pending;
+                || has_extra_pending
+                || conn.dgram_tx_pending
+                // (PATH_CHALLENGE and PATH_RESPONSE are emitted separately
+                // as dedicated destination-scoped packets — to the
+                // candidate / the challenge's source path respectively —
+                // by emit_path_challenge / emit_path_response, never
+                // packed into a validated-path data packet.)
+                || conn.new_cid_tx_pending;
 
             // RFC 9002 §7 — congestion control gates every ack-eliciting
             // 1-RTT send. Initial / Handshake packets are exempt so an
@@ -2703,6 +3040,14 @@ unsafe fn emit_crypto_packet(
             conn.our_cid_len,
             conn.peer_cid,
             conn.peer_cid_len,
+            // Data/ACK/CRYPTO always go to the validated active path
+            // (`peer`). RFC 9000 §9.3.3: non-probing frames are NEVER sent
+            // to an unvalidated candidate — the PATH_CHALLENGE probe is the
+            // only thing that reaches the candidate, via the dedicated
+            // `emit_path_challenge`. So a spoofed/stray packet bearing the
+            // connection's DCID can't redirect application traffic; at most
+            // it triggers a probe (which only the real peer at the
+            // candidate can answer).
             conn.peer,
             conn.is_server,
         )
@@ -2903,6 +3248,53 @@ unsafe fn emit_crypto_packet(
         }
     }
 
+    // DATAGRAM frame (RFC 9221, 1-RTT only). Unreliable: packed once and
+    // the slot cleared immediately — there is no retransmit tracking, so
+    // a lost packet simply loses the datagram (§5.2). It is ack-eliciting
+    // like any other frame, so it participates in CC/RTT accounting via
+    // the normal sent-packet ring.
+    // PATH_RESPONSE is NOT packed here. RFC 9000 §8.2.2 requires it be
+    // sent on the path the PATH_CHALLENGE arrived on (which may not be
+    // the validated `peer`), so it is emitted as a dedicated,
+    // destination-scoped packet by `emit_path_response`. PATH_CHALLENGE
+    // is likewise dedicated (`emit_path_challenge`, §9.3.3 anti-hijack).
+
+    // NEW_CONNECTION_ID frame (RFC 9000 §19.15, 1-RTT). Issues the spare
+    // local CID + its stateless-reset token. The pending flag is cleared
+    // in the deferred post-SEND block (only after the packet is on the
+    // wire), so a build/send failure re-emits it next tick rather than
+    // losing the spare CID. The peer ACKs it like any ack-eliciting frame.
+    let mut had_new_cid = false;
+    if matches!(level, EncLevel::OneRtt) && !ack_only_mode && s.conns[idx].new_cid_tx_pending {
+        let seq = s.conns[idx].alt_cid_seq;
+        let clen = s.conns[idx].alt_cid_len as usize;
+        let mut cid = [0u8; MAX_CID_LEN];
+        cid[..clen].copy_from_slice(&s.conns[idx].alt_cid[..clen]);
+        let token = s.conns[idx].alt_cid_reset_token;
+        let mut fb = [0u8; 64];
+        // retire_prior_to = 0 (don't retire any existing CID).
+        let n = build_new_connection_id(seq, 0, &cid[..clen], &token, &mut fb);
+        if n > 0 && payload_len + n <= payload.len() {
+            payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+            payload_len += n;
+            had_new_cid = true; // ack-eliciting
+        }
+    }
+
+    let mut had_datagram = false;
+    if matches!(level, EncLevel::OneRtt) && !ack_only_mode && s.conns[idx].dgram_tx_pending {
+        let dlen = s.conns[idx].dgram_tx_len;
+        let mut frame_buf = [0u8; QUIC_MAX_DATAGRAM_SIZE + 4];
+        let n = encode_datagram(&s.conns[idx].dgram_tx[..dlen], &mut frame_buf);
+        if n > 0 && payload_len + n <= payload.len() {
+            payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+            payload_len += n;
+            s.conns[idx].dgram_tx_pending = false;
+            s.conns[idx].dgram_tx_len = 0;
+            had_datagram = true;
+        }
+    }
+
     if payload_len == 0 {
         return (false, 0);
     }
@@ -3011,7 +3403,15 @@ unsafe fn emit_crypto_packet(
     }
 
     let listen_ep = s.listen_ep;
-    send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch);
+    if !send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch) {
+        // Channel backpressure — the packet did NOT make it onto the
+        // wire. Leave every per-conn field intact (PN, crypto offset,
+        // ack_pending, pending_handshake_done, stream send buffers,
+        // new_cid_tx_pending) so the next tick rebuilds and re-sends the
+        // same content. Returning (false, 0) also tells drain_outbound to
+        // bail this tick rather than spin on the blocked channel.
+        return (false, 0);
+    }
     // Idle-timeout activity stamp on emit too (RFC 9000 §10.1.2).
     s.conns[idx].last_activity_ms = dev_millis(sys);
 
@@ -3024,6 +3424,9 @@ unsafe fn emit_crypto_packet(
         let conn = &mut s.conns[idx];
         if had_handshake_done {
             conn.pending_handshake_done = false;
+        }
+        if had_new_cid {
+            conn.new_cid_tx_pending = false;
         }
         if had_main_stream {
             conn.stream_send_off += main_stream_buf_len as u64;
@@ -3105,7 +3508,9 @@ unsafe fn emit_crypto_packet(
     let ack_eliciting = crypto_packed > 0
         || had_handshake_done
         || had_main_stream
-        || had_extra_or_bidi;
+        || had_extra_or_bidi
+        || had_datagram
+        || had_new_cid;
     let conn = &mut s.conns[idx];
     let space = match level {
         EncLevel::Initial => &mut conn.initial,
@@ -3243,9 +3648,103 @@ pub(crate) unsafe fn emit_connection_close(
     }
     let sys = &*s.syscalls;
     let listen_ep = s.listen_ep;
-    send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..pkt_len], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..pkt_len], &mut s.net_scratch);
     let msg = b"[quic] CONNECTION_CLOSE sent";
     dev_log(sys, 3, msg.as_ptr(), msg.len());
+}
+
+/// Emit a dedicated PATH_CHALLENGE probe (RFC 9000 §8.2.1 / §9.3.3) to
+/// the candidate 4-tuple under validation. The probe is its OWN 1-RTT
+/// packet carrying nothing but the challenge frame — no application
+/// data, ACK, or CRYPTO ever reaches the unvalidated address. Clears
+/// `path_challenge_tx_pending`; the migration detector re-arms it on the
+/// next packet from the candidate, so a lost probe is naturally retried
+/// as long as the migrating peer keeps sending (bounded by the
+/// validation timeout). 1-RTT only — path validation is post-handshake.
+pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
+    let conn = &s.conns[idx];
+    if !conn.one_rtt.keys_set {
+        return;
+    }
+    let mut frame_buf = [0u8; 9];
+    let n = build_path_challenge(&conn.path_challenge_data, &mut frame_buf);
+    if n == 0 {
+        return;
+    }
+    let peer_cid_len = conn.peer_cid_len as usize;
+    let peer_cid = conn.peer_cid;
+    let cand = PeerAddr {
+        ip: conn.cand_ip,
+        port: conn.cand_port,
+    };
+    let keys = conn.one_rtt.write_keys;
+    let hp_key = conn.one_rtt.write_keys.hp;
+    let pn = conn.one_rtt.next_send_pn;
+    let key_phase = conn.one_rtt.key_phase;
+    let hp = Aes128Hp::new(&hp_key);
+    let mut pkt = [0u8; QUIC_DGRAM_MAX];
+    let dcid = &peer_cid[..peer_cid_len];
+    let pkt_len = build_one_rtt_packet(&keys, &hp, pn, 4, key_phase, dcid, &frame_buf[..n], &mut pkt);
+    if pkt_len == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let listen_ep = s.listen_ep;
+    // Only burn the packet number and clear the pending flag once the
+    // probe is actually accepted by the channel. On backpressure we
+    // leave both intact so drain_outbound re-emits the SAME challenge
+    // (same bytes, same PN-to-be) next tick rather than dropping it.
+    if send_datagram(sys, s.net_out, listen_ep, &cand, &pkt[..pkt_len], &mut s.net_scratch) {
+        s.conns[idx].one_rtt.next_send_pn = pn + 1;
+        s.conns[idx].path_challenge_tx_pending = false;
+        // Stamp the probe so quic_pto_check can retransmit it on timeout
+        // (RFC 9000 §8.1 / §9.3.3) even if the peer stops sending — these
+        // dedicated probes are outside the data sent-packet ring, so PTO
+        // is the only retry driver when the candidate falls silent.
+        s.conns[idx].path_challenge_tx_ms = dev_millis(sys);
+    }
+}
+
+/// Emit a dedicated PATH_RESPONSE (RFC 9000 §8.2.2 / §19.18) echoing a
+/// PATH_CHALLENGE the peer sent us. Per §8.2.2 the response MUST go out
+/// on the network path the challenge arrived on — `path_response_to_*`,
+/// captured at frame-dispatch time — NOT necessarily the validated
+/// `peer`. Its own 1-RTT packet (no other frames). Clears
+/// `path_response_tx_pending` only on a successful enqueue so a
+/// backpressured response is retried. 1-RTT only.
+pub(crate) unsafe fn emit_path_response(s: &mut QuicState, idx: usize) {
+    let conn = &s.conns[idx];
+    if !conn.one_rtt.keys_set {
+        return;
+    }
+    let mut frame_buf = [0u8; 9];
+    let n = build_path_response(&conn.path_response_data, &mut frame_buf);
+    if n == 0 {
+        return;
+    }
+    let peer_cid_len = conn.peer_cid_len as usize;
+    let peer_cid = conn.peer_cid;
+    let dest = PeerAddr {
+        ip: conn.path_response_to_ip,
+        port: conn.path_response_to_port,
+    };
+    let keys = conn.one_rtt.write_keys;
+    let hp_key = conn.one_rtt.write_keys.hp;
+    let pn = conn.one_rtt.next_send_pn;
+    let key_phase = conn.one_rtt.key_phase;
+    let hp = Aes128Hp::new(&hp_key);
+    let mut pkt = [0u8; QUIC_DGRAM_MAX];
+    let dcid = &peer_cid[..peer_cid_len];
+    let pkt_len = build_one_rtt_packet(&keys, &hp, pn, 4, key_phase, dcid, &frame_buf[..n], &mut pkt);
+    if pkt_len == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let listen_ep = s.listen_ep;
+    if send_datagram(sys, s.net_out, listen_ep, &dest, &pkt[..pkt_len], &mut s.net_scratch) {
+        s.conns[idx].one_rtt.next_send_pn = pn + 1;
+        s.conns[idx].path_response_tx_pending = false;
+    }
 }
 
 /// Emit a RESET_STREAM frame on the 1-RTT level for the given stream.
@@ -3299,7 +3798,7 @@ pub(crate) unsafe fn emit_reset_stream(
     }
     let sys = &*s.syscalls;
     let listen_ep = s.listen_ep;
-    send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..pkt_len], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..pkt_len], &mut s.net_scratch);
 }
 
 /// Probe-Timeout (RFC 9002 §6.2) check — replay the saved packet for
@@ -3358,7 +3857,7 @@ pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
             space.last_emitted_ms = now_ms; // exponential backoff in real impl
         }
         let listen_ep = s.listen_ep;
-        send_datagram(
+        let _ = send_datagram(
             sys,
             s.net_out,
             listen_ep,
@@ -3369,6 +3868,19 @@ pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
         if lost_bytes > 0 {
             s.conns[idx].cc_on_loss(lost_bytes, lost_sent_ms);
         }
+    }
+    // PTO retransmission of a path-validation PATH_CHALLENGE (RFC 9000
+    // §8.1 / §9.3.3). These probes are dedicated packets to the candidate
+    // path, outside the per-level sent-packet ring, so the normal replay
+    // above never covers them. Re-arm the pending flag once a PTO interval
+    // has elapsed since the last probe so drain_outbound re-emits it; the
+    // overall §8.2.4 validation-timeout sweep still bounds total retries.
+    if s.conns[idx].path_validating
+        && s.conns[idx].path_challenge_tx_ms > 0
+        && !s.conns[idx].path_challenge_tx_pending
+        && now_ms.wrapping_sub(s.conns[idx].path_challenge_tx_ms) >= pto_threshold
+    {
+        s.conns[idx].path_challenge_tx_pending = true;
     }
 }
 unsafe fn pump_send_client_finished(s: &mut QuicState, idx: usize) -> bool {

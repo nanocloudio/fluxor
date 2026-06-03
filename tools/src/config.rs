@@ -2069,6 +2069,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     "key_file",
     "trust_cert_file",
     "verify_hostname",
+    "alpn", // RFC 7301 ALPN list, emitted as extended TLV tag 14
     "domain",
     "sample_rate", // injected by graph_sample_rate
     // Protection-control keys emitted as TLV tags by
@@ -3080,6 +3081,59 @@ fn build_module_entry(
             entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
             extra_len += 4 + n;
             eprintln!("  verify_hostname: {name}");
+        }
+    }
+
+    // Tag 14: alpn (RFC 7301 ALPN list, comma-separated ASCII tokens
+    // like "mqtt,h3", extended TLV). Consumed by modules that negotiate
+    // ALPN (e.g. quic) to pick the offered protocol; selection is
+    // server-preference, first-configured-token-the-client-offered.
+    if let Some(alpn) = module.get("alpn").and_then(|v| v.as_str()) {
+        let bytes = alpn.as_bytes();
+        let n = bytes.len();
+        // The module stores the ALPN list in a fixed buffer and each
+        // selected token in a fixed per-token slot. Truncating a token
+        // would negotiate a protocol the peer never offered, so reject an
+        // over-capacity list at config time rather than silently clip it.
+        // (Mirrors the quic module: MAX_ALPN_CFG = 64, MAX_ALPN = 24.)
+        const ALPN_LIST_MAX: usize = 64;
+        const ALPN_TOKEN_MAX: usize = 24;
+        if n > ALPN_LIST_MAX {
+            return Err(Error::Config(format!(
+                "module '{name}': alpn list is {n} bytes, exceeds the {ALPN_LIST_MAX}-byte limit"
+            )));
+        }
+        if let Some(tok) = alpn.split(',').find(|t| t.len() > ALPN_TOKEN_MAX) {
+            return Err(Error::Config(format!(
+                "module '{name}': alpn token '{tok}' exceeds the {ALPN_TOKEN_MAX}-byte limit"
+            )));
+        }
+        if n > 0 {
+            // The TLV body spans `[base + extra_len .. base + extra_len + 4 + n)`,
+            // so the highest index written is `base + extra_len + 4 + n - 1`;
+            // the write fits iff `base + extra_len + 4 + n <= entry.len()`
+            // (note `<=`, so an exact fill is valid). An explicit `alpn` is a
+            // hard requirement — silently omitting it here would fall the
+            // module back to non-ALPN QUIC, which the operator did not ask
+            // for — so a buffer that can't hold it is a config error, not a
+            // silent drop.
+            let end = base + extra_len + 4 + n;
+            if end <= entry.len() {
+                entry[base + extra_len] = 14;
+                entry[base + extra_len + 1] = 0x00;
+                entry[base + extra_len + 2] = (n >> 8) as u8;
+                entry[base + extra_len + 3] = n as u8;
+                entry[base + extra_len + 4..end].copy_from_slice(bytes);
+                extra_len += 4 + n;
+                eprintln!("  alpn: {alpn}");
+            } else {
+                return Err(Error::Config(format!(
+                    "module '{name}': alpn list ({n} bytes) does not fit the module \
+                     params buffer (needs {} more bytes); enlarge the params buffer \
+                     or shorten the alpn list",
+                    end - entry.len()
+                )));
+            }
         }
     }
 

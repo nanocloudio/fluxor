@@ -256,7 +256,9 @@ fn main() {
             let net_in_ch = scheduler::get_module_port(module_idx, 0, 0);
             let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
             let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            install_state(&mut m, Box::new(LinuxNetState::new(net_in_ch, net_out_ch)));
+            // `LinuxNetState::new` already returns a heap `Box<Self>`
+            // (built in place to avoid a ~16 MiB stack temporary).
+            install_state(&mut m, LinuxNetState::new(net_in_ch, net_out_ch));
             scheduler::store_builtin_module(module_idx, m);
             log::info!(
                 "[inst] module {module_idx} = linux_net (built-in) net_in={net_in_ch} net_out={net_out_ch}"

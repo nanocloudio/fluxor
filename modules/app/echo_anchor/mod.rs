@@ -363,24 +363,43 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
 
     match msg_type {
         NET_MSG_BOUND => {
-            // Two shapes exist on the wire:
-            //   bare-metal IP module: [conn_id:1][local_port:2 LE]
-            //   linux_net provider:   (empty payload)
-            // Both mean "listener is ready". We store conn_id if present,
-            // otherwise leave `server_conn_id` at its init value (0).
+            // net_proto MSG_BOUND: `[conn_id:1][local_port:2 LE]`. The
+            // `local_port` echoes our CMD_BIND port (the IP module and the
+            // Linux host adapter both carry it now). On a fanned `net_out`
+            // we claim ONLY the bound for our own `listen_port`, so a
+            // neighbour anchor's listen completing first can't flip us to
+            // Listening. A port-less (legacy) frame is accepted as
+            // sole-consumer.
             if s.phase == AnchorPhase::WaitBoundNet {
-                if payload_len >= 1 {
-                    s.server_conn_id = *buf.add(NET_FRAME_HDR);
+                let ours = payload_len < 3 || {
+                    let lo = *buf.add(NET_FRAME_HDR + 1);
+                    let hi = *buf.add(NET_FRAME_HDR + 2);
+                    ((lo as u16) | ((hi as u16) << 8)) == s.listen_port
+                };
+                if ours {
+                    if payload_len >= 1 {
+                        s.server_conn_id = *buf.add(NET_FRAME_HDR);
+                    }
+                    s.phase = AnchorPhase::Listening;
+                    dev_log(&*sys_ptr, 3, b"[echo_anc] bound".as_ptr(), 16);
                 }
-                s.phase = AnchorPhase::Listening;
-                dev_log(&*sys_ptr, 3, b"[echo_anc] bound".as_ptr(), 16);
             }
         }
         NET_MSG_ACCEPTED => {
-            // [conn_id:1]
+            // `[conn_id:1][local_port:2 LE]`. Multi-anchor demux: claim
+            // only accepts on our `listen_port` (a port-less legacy frame
+            // is accepted). An accept on another anchor's port belongs to
+            // that anchor — ignore it (do NOT close it).
             if payload_len >= 1 {
                 let new_id = *buf.add(NET_FRAME_HDR);
-                if s.client_conn_id == 0xFF && s.phase == AnchorPhase::Listening {
+                let ours = payload_len < 3 || {
+                    let lo = *buf.add(NET_FRAME_HDR + 1);
+                    let hi = *buf.add(NET_FRAME_HDR + 2);
+                    ((lo as u16) | ((hi as u16) << 8)) == s.listen_port
+                };
+                if !ours {
+                    // Not for this anchor — leave it for the owning anchor.
+                } else if s.client_conn_id == 0xFF && s.phase == AnchorPhase::Listening {
                     s.client_conn_id = new_id;
                     mint_session_id(s);
                     s.phase = AnchorPhase::Attaching;

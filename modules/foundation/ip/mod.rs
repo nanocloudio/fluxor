@@ -537,8 +537,22 @@ unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u8) -> bool {
 
 #[inline(always)]
 #[must_use]
-unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8) -> bool {
-    let ok = net_send_short(s, NET_MSG_ACCEPTED, conn_id);
+unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8, local_port: u16) -> bool {
+    // MSG_ACCEPTED payload: `[conn_id:1][local_port:2 LE]`, mirroring
+    // `net_send_bound`. Consumers that share `net_out` with other anchors
+    // (multi-anchor graphs binding distinct ports) filter on `local_port` so
+    // they only claim conn_ids whose listener matches their own CMD_BIND;
+    // without it every consumer alloc_slot()s the same new conn_id and
+    // corrupts each other's subsequent NET_MSG_DATA dispatch.
+    let mut frame = [0u8; 6];
+    core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACCEPTED);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    let pb = local_port.to_le_bytes();
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), pb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[1]);
+    let ok = net_send_or_queue(s, &frame);
     // Observability: start a `tcp.connection` span for the accepted (server-
     // side) connection, mint its root trace context, and propagate that context
     // downstream (best-effort `MSG_TRACE_CTX`, right after ACCEPTED) so TLS/HTTP
@@ -1991,7 +2005,8 @@ unsafe fn process_tcp_segment(
             // headroom before progressing past Established.
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
-            let _ = net_send_accepted(s, conn_idx as u8);
+            let local_port = (*s.tcp_conns.as_ptr().add(conn_idx)).local_port;
+            let _ = net_send_accepted(s, conn_idx as u8, local_port);
             // Piggybacked data (e.g. HTTP GET on the third handshake
             // ACK). Same gate as the regular RX_DATA path: don't ACK
             // payload the consumer didn't receive.

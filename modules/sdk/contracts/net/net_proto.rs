@@ -22,7 +22,14 @@
 pub const FRAME_HDR: usize = 3;
 
 // Downstream: IP/net → consumer
-/// New connection accepted. Payload: [conn_id: u8]
+/// New connection accepted. Payload: `[conn_id: u8][local_port: u16 LE]`.
+/// `local_port` is the listener port the connection was accepted on. When
+/// `net_out` is fanned to several stream consumers each bound to a
+/// distinct port (a multi-anchor graph), every consumer filters on
+/// `local_port` and claims only the connections accepted on its own
+/// `CMD_BIND` — otherwise they would all `alloc` the same `conn_id` and
+/// corrupt each other's subsequent `MSG_DATA`. A single-consumer graph
+/// may ignore the trailing port bytes and read just `conn_id`.
 pub const MSG_ACCEPTED: u8 = 0x01;
 /// Received data. Payload: `[conn_id: u8][data…]`. The `data` portion of a
 /// single `MSG_DATA` frame MUST NOT exceed [`MAX_DATA_FRAGMENT`] — a producer
@@ -38,7 +45,10 @@ pub const MSG_DATA: u8 = 0x02;
 pub const MAX_DATA_FRAGMENT: usize = 1460;
 /// Remote closed connection. Payload: [conn_id: u8]
 pub const MSG_CLOSED: u8 = 0x03;
-/// Bind/listen completed. No payload.
+/// Bind/listen completed. Payload: `[conn_id: u8][local_port: u16 LE]`.
+/// `local_port` echoes the port from the consumer's `CMD_BIND`; a
+/// multi-anchor consumer records it and matches it against the
+/// `local_port` in subsequent `MSG_ACCEPTED` frames (see `MSG_ACCEPTED`).
 pub const MSG_BOUND: u8 = 0x04;
 /// Outbound connect completed. Payload: `[conn_id: u8][requester_tag: u8]`.
 /// `requester_tag` echoes the tag the consumer put on its `CMD_CONNECT` (its

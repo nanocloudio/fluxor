@@ -539,13 +539,23 @@ const DG_AF_INET: u8 = 4;
 
 const CONN_TYPE_UDP_BOUND: u8 = 2;
 
-const LINUX_NET_MAX_CONNS: usize = 24;
+/// Total connection slots (listeners + clients). Bumped from 24 to
+/// 128 so apps that benchmark with high-concurrency connect bursts
+/// (Lattice's 32-/64-client etcd + redis loadtests) don't hit the
+/// platform's slot cap before the app's own anchor MAX_CONNS.
+///
+/// `LinuxNetState` is built directly on the heap (`LinuxNetState::new`
+/// returns `Box<Self>` via `Box::new_uninit`), so `LINUX_NET_MAX_CONNS *
+/// LINUX_NET_WRITE_BUF` (here 128 × 128 KiB = 16 MiB) is NOT bounded by
+/// the process stack — there is no stack-resident temporary of the full
+/// struct.
+const LINUX_NET_MAX_CONNS: usize = 128;
 /// Per-connection write backlog. Sized to hold a full Spectrum video
-/// frame's worth of WS fragments (~98 KB) so a slow peer (mobile
-/// browser, congested LAN, etc.) can absorb one frame's transmission
-/// pause without causing upstream pressure to dump bytes. 128 KB gives
-/// generous headroom while keeping LinuxNetState bounded (24 × 128 KB
-/// ≈ 3 MB).
+/// frame's worth of WS fragments (~98 KB) so a slow peer can absorb one
+/// frame's transmission pause without the producer overflowing the
+/// backlog (which closes the connection). Kept at 128 KiB — the heap
+/// construction (see `LINUX_NET_MAX_CONNS`) lifts the prior stack-size
+/// constraint that had forced this down to 32 KiB.
 const LINUX_NET_WRITE_BUF: usize = 128 * 1024;
 
 // Intentionally NOT Copy: this struct holds a 128 KiB inline buffer.
@@ -618,18 +628,36 @@ struct LinuxNetState {
 }
 
 impl LinuxNetState {
-    fn new(net_in: i32, net_out: i32) -> Self {
-        Self {
-            net_in,
-            net_out,
-            conns: [LinuxNetConn::EMPTY; LINUX_NET_MAX_CONNS],
-            cmd_buf: [0u8; 16384],
-            msg_buf: [0u8; 16384],
-            recv_buf: [0u8; 16384],
+    /// Allocate the per-instance state DIRECTLY on the heap. At
+    /// `LINUX_NET_MAX_CONNS = 128` × `LINUX_NET_WRITE_BUF = 128 KiB` the
+    /// struct is ~16 MiB; building it by value (`Self { … }`) would
+    /// materialise that whole array as a stack temporary before the
+    /// `Box` move and overflow the 8 MiB default stack. Allocating with
+    /// `Box::new_uninit` and initialising fields in place never puts the
+    /// full struct on the stack (each `LinuxNetConn::EMPTY` write is one
+    /// slot at a time).
+    fn new(net_in: i32, net_out: i32) -> Box<Self> {
+        let mut b: Box<core::mem::MaybeUninit<Self>> = Box::new_uninit();
+        let p = b.as_mut_ptr();
+        // SAFETY: `p` points at the freshly-allocated, uninitialised Box
+        // contents; every field is written exactly once below before
+        // `assume_init`, and the pointer is valid + aligned for `Self`.
+        unsafe {
+            use core::ptr::addr_of_mut;
+            addr_of_mut!((*p).net_in).write(net_in);
+            addr_of_mut!((*p).net_out).write(net_out);
+            let conns = addr_of_mut!((*p).conns) as *mut LinuxNetConn;
+            for i in 0..LINUX_NET_MAX_CONNS {
+                conns.add(i).write(LinuxNetConn::EMPTY);
+            }
+            addr_of_mut!((*p).cmd_buf).write([0u8; 16384]);
+            addr_of_mut!((*p).msg_buf).write([0u8; 16384]);
+            addr_of_mut!((*p).recv_buf).write([0u8; 16384]);
             // Skip slot 0 in initial rotation — it's almost always the
             // TCP listener bound by the first CMD_BIND.
-            next_alloc: 1,
-            pending_ctrl: std::collections::VecDeque::new(),
+            addr_of_mut!((*p).next_alloc).write(1);
+            addr_of_mut!((*p).pending_ctrl).write(std::collections::VecDeque::new());
+            b.assume_init()
         }
     }
 
@@ -722,9 +750,11 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
     // re-bind with MSG_BOUND immediately when an existing listener
     // is alive *for the same port* — preserving the protocol contract
     // — and skip the socket(2)/bind(2) syscalls entirely.
-    for c in st.conns.iter() {
+    for (li, c) in st.conns.iter().enumerate() {
         if c.state == 3 && c.conn_type == 1 && c.fd >= 0 && c.port == port {
-            let msg = [MSG_BOUND];
+            // MSG_BOUND payload: [conn_id:1][local_port:2 LE]
+            let pb = port.to_le_bytes();
+            let msg = [MSG_BOUND, li as u8, pb[0], pb[1]];
             linux_net_send_msg(st, &msg);
             return;
         }
@@ -767,7 +797,11 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         return;
     }
 
-    if libc::listen(fd, 8) < 0 {
+    // Backlog 128: the kernel's SYN queue must absorb the entire
+    // burst of a high-concurrency connect (clients ramp up
+    // simultaneously in benchmarks). At backlog=8 a 32-client burst
+    // dropped SYNs 9..=32 — clients saw ConnectionReset on connect.
+    if libc::listen(fd, 128) < 0 {
         log::error!("[linux_net] listen() failed");
         libc::close(fd);
         return;
@@ -784,7 +818,11 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
     };
     log::info!("[linux_net] listening on port {port} (slot {idx})");
 
-    let msg = [MSG_BOUND];
+    // MSG_BOUND payload: [conn_id:1][local_port:2 LE]. Consumers
+    // sharing net_out filter by local_port; without it a second
+    // anchor's BIND races on the same channel and steals server_conn_id.
+    let pb = port.to_le_bytes();
+    let msg = [MSG_BOUND, idx as u8, pb[0], pb[1]];
     linux_net_send_msg(st, &msg);
 }
 
@@ -1187,120 +1225,141 @@ unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u8) {
 unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
     let mut had_work = false;
 
+    // Per-listener accept budget. Drain up to N pending connections
+    // per listener per tick rather than the historical 1/tick — at
+    // 1/tick a 32-client connect burst took 32 ticks (32 ms at the
+    // default 1 ms scheduler tick) to fully accept, and clients
+    // timed out their initial HTTP/2 handshake. 32 keeps the worst-
+    // case per-tick cost bounded (~32 × per-socket setsockopt
+    // overhead ≈ a few hundred µs).
+    const PER_TICK_ACCEPT_BUDGET: u32 = 32;
+
     for li in 0..LINUX_NET_MAX_CONNS {
         if st.conns[li].state != 3 || st.conns[li].fd < 0 {
             continue;
         }
 
-        let mut addr: libc::sockaddr_in = core::mem::zeroed();
-        let mut addr_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
+        let listener_fd = st.conns[li].fd;
+        let listener_port = st.conns[li].port;
+        let mut accepted_on_this_listener: u32 = 0;
+        while accepted_on_this_listener < PER_TICK_ACCEPT_BUDGET {
+            let mut addr: libc::sockaddr_in = core::mem::zeroed();
+            let mut addr_len: libc::socklen_t =
+                core::mem::size_of::<libc::sockaddr_in>() as u32;
 
-        let client_fd = libc::accept4(
-            st.conns[li].fd,
-            &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
-            &mut addr_len,
-            libc::SOCK_NONBLOCK,
-        );
-        if client_fd < 0 {
-            continue;
+            let client_fd = libc::accept4(
+                listener_fd,
+                &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
+                &mut addr_len,
+                libc::SOCK_NONBLOCK,
+            );
+            if client_fd < 0 {
+                break; // EAGAIN / EWOULDBLOCK — queue drained
+            }
+            accepted_on_this_listener += 1;
+            accept_one_client(st, client_fd, listener_port);
+            had_work = true;
         }
-
-        // Enable application-friendly TCP keepalive so a silently-dead
-        // peer (laptop suspended, NAT timeout without RST) is detected
-        // within ~30 s instead of the kernel default ~2 h. Without
-        // this, a paused-emulator/idle stream wouldn't trigger the
-        // outbound-write cleanup path (no data → no EPIPE) and the
-        // slot would stay live until OS keepalive fired.
-        let one: i32 = 1;
-        libc::setsockopt(
-            client_fd,
-            libc::SOL_SOCKET,
-            libc::SO_KEEPALIVE,
-            &one as *const i32 as *const libc::c_void,
-            4,
-        );
-
-        // TCP_NODELAY disables Nagle's algorithm, which would
-        // otherwise hold small sends until either the kernel ACKs the
-        // previous outbound packet or a 200 ms timer fires. Fluxor
-        // already does its own segmentation/coalescing per `CMD_SEND`,
-        // so Nagle only adds latency. With NODELAY the throughput
-        // ceiling is set by `SO_SNDBUF` instead.
-        libc::setsockopt(
-            client_fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            &one as *const i32 as *const libc::c_void,
-            4,
-        );
-        // SO_SNDBUF and SO_RCVBUF: 1 MiB each. The kernel default of
-        // 16 KiB on `tcp_wmem` (sysctl) was chosen for memory-constrained
-        // hosts and creates a tight per-segment ACK loop on loopback —
-        // each `send()` blocks at the 16 KiB watermark and the
-        // application waits for the receiver to drain. 1 MiB keeps
-        // the pipe full across one HTTP response (the synth-source
-        // workload pushes 1 MiB at a time). Linux clamps this against
-        // `wmem_max` / `rmem_max`; if the sysctl is lower, the kernel
-        // silently caps without erroring.
-        let buf_bytes: i32 = 1 << 20; // 1 MiB
-        libc::setsockopt(
-            client_fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &buf_bytes as *const i32 as *const libc::c_void,
-            4,
-        );
-        libc::setsockopt(
-            client_fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &buf_bytes as *const i32 as *const libc::c_void,
-            4,
-        );
-        let idle_secs: i32 = 15;
-        libc::setsockopt(
-            client_fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPIDLE,
-            &idle_secs as *const i32 as *const libc::c_void,
-            4,
-        );
-        let intvl_secs: i32 = 5;
-        libc::setsockopt(
-            client_fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPINTVL,
-            &intvl_secs as *const i32 as *const libc::c_void,
-            4,
-        );
-        let probes: i32 = 3;
-        libc::setsockopt(
-            client_fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPCNT,
-            &probes as *const i32 as *const libc::c_void,
-            4,
-        );
-
-        let slot = linux_net_alloc_conn(st);
-        if slot < 0 {
-            libc::close(client_fd);
-            continue;
-        }
-        let idx = slot as usize;
-        st.conns[idx] = LinuxNetConn {
-            fd: client_fd,
-            conn_type: 1,
-            state: 2,
-            ..LinuxNetConn::EMPTY
-        };
-
-        let msg = [MSG_ACCEPTED, idx as u8];
-        linux_net_send_msg(st, &msg);
-        log::info!("[linux_net] accepted conn_id={idx}");
-        had_work = true;
     }
     had_work
+}
+
+/// Per-accepted-connection setsockopt + slot allocation + MSG_ACCEPTED
+/// delivery. Split out of `linux_net_poll_accept` so the drain loop
+/// stays readable.
+///
+/// `listener_port` is included in the MSG_ACCEPTED payload so
+/// consumers that share `net_out` with other anchors (multi-anchor
+/// graphs binding distinct ports) can filter on it and only claim
+/// their own connections — the broadcast surface would otherwise
+/// double-allocate the conn_id across every consumer.
+unsafe fn accept_one_client(st: &mut LinuxNetState, client_fd: i32, listener_port: u16) {
+    // Enable application-friendly TCP keepalive so a silently-dead
+    // peer (laptop suspended, NAT timeout without RST) is detected
+    // within ~30 s instead of the kernel default ~2 h. Without
+    // this, a paused-emulator/idle stream wouldn't trigger the
+    // outbound-write cleanup path (no data → no EPIPE) and the
+    // slot would stay live until OS keepalive fired.
+    let one: i32 = 1;
+    libc::setsockopt(
+        client_fd,
+        libc::SOL_SOCKET,
+        libc::SO_KEEPALIVE,
+        &one as *const i32 as *const libc::c_void,
+        4,
+    );
+
+    // TCP_NODELAY disables Nagle's algorithm, which would otherwise
+    // hold small sends until either the kernel ACKs the previous
+    // outbound packet or a 200 ms timer fires. Fluxor already does
+    // its own segmentation/coalescing per `CMD_SEND`, so Nagle only
+    // adds latency. With NODELAY the throughput ceiling is set by
+    // `SO_SNDBUF` instead.
+    libc::setsockopt(
+        client_fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_NODELAY,
+        &one as *const i32 as *const libc::c_void,
+        4,
+    );
+    let buf_bytes: i32 = 1 << 20; // 1 MiB
+    libc::setsockopt(
+        client_fd,
+        libc::SOL_SOCKET,
+        libc::SO_SNDBUF,
+        &buf_bytes as *const i32 as *const libc::c_void,
+        4,
+    );
+    libc::setsockopt(
+        client_fd,
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        &buf_bytes as *const i32 as *const libc::c_void,
+        4,
+    );
+    let idle_secs: i32 = 15;
+    libc::setsockopt(
+        client_fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPIDLE,
+        &idle_secs as *const i32 as *const libc::c_void,
+        4,
+    );
+    let intvl_secs: i32 = 5;
+    libc::setsockopt(
+        client_fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPINTVL,
+        &intvl_secs as *const i32 as *const libc::c_void,
+        4,
+    );
+    let probes: i32 = 3;
+    libc::setsockopt(
+        client_fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPCNT,
+        &probes as *const i32 as *const libc::c_void,
+        4,
+    );
+
+    let slot = linux_net_alloc_conn(st);
+    if slot < 0 {
+        libc::close(client_fd);
+        return;
+    }
+    let idx = slot as usize;
+    st.conns[idx] = LinuxNetConn {
+        fd: client_fd,
+        conn_type: 1,
+        state: 2,
+        ..LinuxNetConn::EMPTY
+    };
+
+    // MSG_ACCEPTED payload: [conn_id:1][listener_port:2 LE]
+    let pb = listener_port.to_le_bytes();
+    let msg = [MSG_ACCEPTED, idx as u8, pb[0], pb[1]];
+    linux_net_send_msg(st, &msg);
+    log::info!("[linux_net] accepted conn_id={idx}");
 }
 
 unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {

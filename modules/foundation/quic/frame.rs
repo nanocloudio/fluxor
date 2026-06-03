@@ -37,6 +37,12 @@ pub const FRAME_PATH_RESPONSE: u8 = 0x1B;
 pub const FRAME_CONNECTION_CLOSE_TRANSPORT: u8 = 0x1C;
 pub const FRAME_CONNECTION_CLOSE_APP: u8 = 0x1D;
 pub const FRAME_HANDSHAKE_DONE: u8 = 0x1E;
+/// DATAGRAM frames (RFC 9221 §4). 0x30 carries the datagram payload to
+/// the end of the QUIC packet (no explicit length); 0x31 prefixes the
+/// payload with a varint Length. Both are ack-eliciting and counted for
+/// congestion control but are never retransmitted on loss (§5.2).
+pub const FRAME_DATAGRAM_NOLEN: u8 = 0x30;
+pub const FRAME_DATAGRAM_LEN: u8 = 0x31;
 
 // STREAM frame bit flags inside the type byte (RFC 9000 §19.8).
 pub const STREAM_FLAG_OFF: u8 = 0x04;
@@ -65,6 +71,7 @@ pub enum FrameKind {
     PathResponse,
     ConnectionClose,
     HandshakeDone,
+    Datagram,
     Unknown,
 }
 
@@ -88,6 +95,7 @@ pub fn classify(frame_type: u64) -> FrameKind {
         0x1B => FrameKind::PathResponse,
         0x1C | 0x1D => FrameKind::ConnectionClose,
         0x1E => FrameKind::HandshakeDone,
+        0x30 | 0x31 => FrameKind::Datagram,
         _ => FrameKind::Unknown,
     }
 }
@@ -178,6 +186,58 @@ pub fn parse_stream(type_byte: u8, body: &[u8]) -> Option<(StreamFrame<'_>, usiz
         },
         cursor + length,
     ))
+}
+
+/// Parse one DATAGRAM frame (RFC 9221 §4). `type_byte` is the consumed
+/// first byte (0x30 = no length → payload runs to the end of the QUIC
+/// packet; 0x31 = explicit varint length prefix). `body` is everything
+/// after the type byte. Returns the payload slice + bytes consumed, or
+/// None on truncation / malformed length.
+pub fn parse_datagram(type_byte: u8, body: &[u8]) -> Option<(&[u8], usize)> {
+    match type_byte {
+        FRAME_DATAGRAM_NOLEN => Some((body, body.len())),
+        FRAME_DATAGRAM_LEN => {
+            let (length, len_len) = unsafe { varint_decode(body.as_ptr(), body.len()) }?;
+            let length = length as usize;
+            if body.len() < len_len + length {
+                return None;
+            }
+            Some((&body[len_len..len_len + length], len_len + length))
+        }
+        _ => None,
+    }
+}
+
+/// Encode a DATAGRAM frame (RFC 9221 §4) in the explicit-length form
+/// (0x31) so it can be followed by other frames in the packet. Returns
+/// bytes written, or 0 on buffer overflow. The caller is responsible for
+/// enforcing the peer's `max_datagram_frame_size` BEFORE calling this —
+/// an over-large payload is dropped there, not silently truncated here.
+pub fn encode_datagram(payload: &[u8], out: &mut [u8]) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    let mut pos = 0;
+    out[pos] = FRAME_DATAGRAM_LEN;
+    pos += 1;
+    let nb =
+        unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, payload.len() as u64) };
+    if nb == 0 {
+        return 0;
+    }
+    pos += nb;
+    if out.len() < pos + payload.len() {
+        return 0;
+    }
+    // copy_nonoverlapping with verified bounds (module convention).
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            out.as_mut_ptr().add(pos),
+            payload.len(),
+        );
+    }
+    pos + payload.len()
 }
 
 /// Build an ACK frame (RFC 9000 §19.3) covering the ranges in
@@ -328,6 +388,41 @@ pub fn build_new_connection_id(
     pos += cid.len();
     out[pos..pos + 16].copy_from_slice(stateless_reset_token);
     pos + 16
+}
+
+/// Build a PATH_CHALLENGE frame (RFC 9000 §19.17): type byte + 8 bytes
+/// of unpredictable challenge data. Returns 9 (bytes written) or 0 on
+/// overflow.
+pub fn build_path_challenge(data: &[u8; 8], out: &mut [u8]) -> usize {
+    if out.len() < 9 {
+        return 0;
+    }
+    out[0] = FRAME_PATH_CHALLENGE;
+    out[1..9].copy_from_slice(data);
+    9
+}
+
+/// Build a PATH_RESPONSE frame (RFC 9000 §19.18): type byte + the 8
+/// data bytes echoed from a received PATH_CHALLENGE. Returns 9 or 0.
+pub fn build_path_response(data: &[u8; 8], out: &mut [u8]) -> usize {
+    if out.len() < 9 {
+        return 0;
+    }
+    out[0] = FRAME_PATH_RESPONSE;
+    out[1..9].copy_from_slice(data);
+    9
+}
+
+/// Parse the 8-byte data of a PATH_CHALLENGE / PATH_RESPONSE frame body
+/// (the type byte already consumed). Returns the 8 data bytes, or None
+/// on truncation.
+pub fn parse_path_data(body: &[u8]) -> Option<[u8; 8]> {
+    if body.len() < 8 {
+        return None;
+    }
+    let mut d = [0u8; 8];
+    d.copy_from_slice(&body[..8]);
+    Some(d)
 }
 
 /// Build a RETIRE_CONNECTION_ID frame (RFC 9000 §19.16).

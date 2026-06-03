@@ -200,6 +200,13 @@ struct TlsSession {
     /// W3C trace-flags byte latched from IP's `MSG_TRACE_CTX` (low bit =
     /// `sampled`), re-emitted downstream so the sampling decision survives.
     trace_ctx_flags: u8,
+    /// A `MSG_TRACE_CTX` is queued to forward downstream, to be emitted
+    /// ONLY after the held accept write lands (so HTTP's slot exists and
+    /// parents under this session's span). Latched at handshake completion
+    /// and cleared once the trace frame is actually written — so a
+    /// back-pressured `clear_out` that delays the accept doesn't drop the
+    /// parent trace context (the Ready loop retries both together).
+    trace_ctx_pending: bool,
     /// Original downstream requester tag for a TLS-mediated CLIENT connect — the
     /// tag the clear-side consumer put on its `CMD_CONNECT` before TLS rewrote it
     /// to TLS's own tag toward IP. Echoed when TLS forwards `MSG_CONNECTED`
@@ -236,6 +243,7 @@ impl TlsSession {
             trace_ctx_trace: [0; 16],
             trace_ctx_parent: [0; 8],
             trace_ctx_flags: 0,
+            trace_ctx_pending: false,
             downstream_tag: 0,
             span_id: [0; 8],
         }
@@ -272,6 +280,7 @@ impl TlsSession {
         self.trace_ctx_trace = [0; 16];
         self.trace_ctx_parent = [0; 8];
         self.trace_ctx_flags = 0;
+        self.trace_ctx_pending = false;
         self.downstream_tag = 0;
         self.span_id = [0; 8];
         self.read_keys = TrafficKeys::empty();
@@ -475,6 +484,17 @@ struct TlsState {
     /// `TRANSPORT_TCP` (TLS records on a stream channel) or
     /// `TRANSPORT_UDP` (DTLS records on a datagram channel).
     transport: u8,
+    /// TCP listener port this TLS server claims accepts on (multi-anchor
+    /// demux). Learned from the `local_port` in the `MSG_BOUND` whose port
+    /// matches [`Self::bind_port`] — i.e. the bind THIS instance issued,
+    /// not a neighbour's on a shared fan. 0 = unknown → claim every accept
+    /// (single-anchor / legacy producer without the port).
+    accept_port: u16,
+    /// Port from the `CMD_BIND` this TLS instance forwarded downstream
+    /// (toward IP). Used to recognise our own `MSG_BOUND` on a shared
+    /// `cipher_in` fan and ignore bounds belonging to other anchors.
+    /// 0 = no bind forwarded yet (accept any bound, legacy behaviour).
+    bind_port: u16,
     /// DTLS listener endpoint id returned by `CMD_DG_BIND`.
     dtls_listen_ep: i16,
     /// DTLS listening UDP port (server) or local source port (client).
@@ -591,6 +611,8 @@ pub unsafe extern "C" fn module_new(
     s.pending_downstream_tag = 0;
     s.pending_connect_active = false;
     s.transport = TRANSPORT_TCP;
+    s.accept_port = 0;
+    s.bind_port = 0;
     s.dtls_listen_ep = -1;
     s.dtls_port = 4433;
     s.dtls_peer_ip = 0x0100007f;
@@ -982,7 +1004,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let me = dev_requester_tag(sys);
                         tag == 0 || tag == me
                     } else {
-                        true
+                        // Inbound accept. Multi-anchor demux: when the
+                        // frame carries a listener port (pl >= 3) and we've
+                        // learned our bound port, claim only our port's
+                        // accepts. A port-less frame (legacy) or unknown
+                        // bound port → claim (sole-consumer behaviour).
+                        if pl >= 3 && s.accept_port != 0 {
+                            let port = (payload[1] as u16) | ((payload[2] as u16) << 8);
+                            port == s.accept_port
+                        } else {
+                            true
+                        }
                     };
                     // Allocate a session only for connections we claim. A
                     // MSG_CONNECTED tagged for another consumer is consumed
@@ -1160,6 +1192,25 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if pl > rd {
                         tls_discard(sys, s.cipher_in, pl - rd);
                     }
+                    // MSG_BOUND `[conn_id][local_port:2 LE]`: record the
+                    // listener port so we can demux accepts in a
+                    // multi-anchor fan-out (claim only our port's accepts).
+                    // On a shared `cipher_in` fan, IP emits one MSG_BOUND
+                    // per anchor's CMD_BIND; claim ONLY the one whose port
+                    // matches the bind THIS instance forwarded
+                    // (`bind_port`). A non-matching bound belongs to
+                    // another anchor — don't latch it and don't forward it
+                    // to our downstream. A port-less (legacy) bound or an
+                    // unknown `bind_port` is accepted as before.
+                    let mut bound_is_ours = true;
+                    if t == NET_MSG_BOUND && rd >= 3 {
+                        let bp = (s.net_scratch[1] as u16) | ((s.net_scratch[2] as u16) << 8);
+                        if s.bind_port == 0 || bp == s.bind_port {
+                            s.accept_port = bp;
+                        } else {
+                            bound_is_ours = false;
+                        }
+                    }
                     // MSG_ERROR `[conn_id][errno][tag]` carries IP's tag (TLS's own
                     // tag). TRANSLATE it to the original downstream tag so the
                     // clear-side requester recognises the failure — otherwise it
@@ -1167,7 +1218,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // conn the tag comes from its session; for a connect failure
                     // (no session yet) from the pending connect slot. MSG_BOUND has
                     // no tag and passes through unchanged.
-                    let mut forward = true;
+                    let mut forward = bound_is_ours;
                     if t == NET_MSG_ERROR && rd >= 3 {
                         let conn_id = s.net_scratch[0];
                         let in_tag = s.net_scratch[2]; // IP-echoed requester tag
@@ -1461,6 +1512,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             arm_pending = Some(new_tag);
                         }
                     }
+                    // Remember the port from OUR CMD_BIND so we can match
+                    // the corresponding MSG_BOUND on a shared fan (F5).
+                    if t == NET_CMD_BIND && rd >= 2 {
+                        s.bind_port = (s.net_scratch[0] as u16) | ((s.net_scratch[1] as u16) << 8);
+                    }
                     if forward {
                         let wrote = tls_write_raw_frame(
                             sys,
@@ -1494,8 +1550,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     while i < MAX_SESSIONS {
         if s.sessions[i].state == SessionState::Ready {
             // Retry any held completion that a back-pressured clear_out dropped
-            // at handshake-complete, so the consumer always learns of the accept.
-            if s.sessions[i].held_msg_type != 0 {
+            // at handshake-complete, so the consumer always learns of the accept
+            // — and its parent trace context, which is emitted only after the
+            // accept lands (so a dropped trace is retried even once the accept
+            // itself has gone out).
+            if s.sessions[i].held_msg_type != 0 || s.sessions[i].trace_ctx_pending {
                 forward_held_completion(s, i);
             }
             if s.sessions[i].recv_len >= 5 {
@@ -2632,19 +2691,56 @@ unsafe fn pump_recv_client_finished(s: &mut TlsState, idx: usize) -> bool {
 /// latched and is retried per-step (the Ready-session loop) so the clear-side
 /// consumer is never stranded waiting for the accept.
 unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
-    let held = s.sessions[idx].held_msg_type;
-    if held == 0 {
-        return;
-    }
     let conn_id = s.sessions[idx].conn_id;
-    let ok = if held == NET_MSG_CONNECTED {
-        let dtag = [s.sessions[idx].downstream_tag];
-        tls_write_or_count(s, s.clear_out, held, conn_id, dtag.as_ptr(), 1)
-    } else {
-        tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0)
-    };
-    if ok {
-        s.sessions[idx].held_msg_type = 0;
+    let held = s.sessions[idx].held_msg_type;
+    if held != 0 {
+        let ok = if held == NET_MSG_CONNECTED {
+            let dtag = [s.sessions[idx].downstream_tag];
+            tls_write_or_count(s, s.clear_out, held, conn_id, dtag.as_ptr(), 1)
+        } else {
+            // NET_MSG_ACCEPTED: carry the listener port the connection was
+            // accepted on (`[conn_id][local_port:2 LE]`, net_proto §
+            // MSG_ACCEPTED) so a fanned clear-side consumer can demux by
+            // port — matching the port-qualified accepts TLS itself
+            // consumes. A port-less form is forwarded only when we never
+            // learned our bound port (legacy / sole-consumer graph).
+            if s.accept_port != 0 {
+                let port = [(s.accept_port & 0xFF) as u8, (s.accept_port >> 8) as u8];
+                tls_write_or_count(s, s.clear_out, held, conn_id, port.as_ptr(), 2)
+            } else {
+                tls_write_or_count(s, s.clear_out, held, conn_id, core::ptr::null(), 0)
+            }
+        };
+        if ok {
+            s.sessions[idx].held_msg_type = 0;
+        } else {
+            // Accept didn't land — leave both the accept and any pending
+            // trace context queued; do NOT emit the trace before the accept.
+            return;
+        }
+    }
+    // The accept is on the wire (now or on a prior step). Emit the queued
+    // parent trace context AFTER it, so HTTP's slot exists and parents
+    // under this session's span. Retried until the write lands (F4).
+    if s.sessions[idx].trace_ctx_pending {
+        let trace = s.sessions[idx].trace_ctx_trace;
+        let own = s.sessions[idx].span_id;
+        let flags = s.sessions[idx].trace_ctx_flags;
+        let sys = &*s.syscalls;
+        let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
+        let wrote = dev_net_send_trace_ctx(
+            sys,
+            s.clear_out,
+            conn_id,
+            &trace,
+            &own,
+            flags,
+            scratch.as_mut_ptr(),
+            scratch.len(),
+        );
+        if wrote {
+            s.sessions[idx].trace_ctx_pending = false;
+        }
     }
 }
 
@@ -2667,33 +2763,23 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         b"[tls] handshake complete".len(),
     );
     emit_peer_identity(s, idx);
-    let conn_id = s.sessions[idx].conn_id;
     if s.sessions[idx].held_msg_type != 0 {
-        // Forward the held NET_MSG_ACCEPTED / NET_MSG_CONNECTED now that the
-        // handshake is complete. Clear the latch ONLY if the write lands — a
-        // dropped completion is retried per-step (see the Ready-session loop) so
-        // the clear-side consumer is never stranded waiting for the accept.
-        forward_held_completion(s, idx);
-        // Observability: forward IP's trace context to HTTP immediately AFTER
-        // the accept, parented under this session's own span id, so HTTP's slot
-        // exists when it arrives. Only when IP propagated a trace.
+        // Observability: queue IP's trace context to forward downstream,
+        // to be emitted by forward_held_completion ONLY after the held
+        // accept write lands (so HTTP's slot exists, parented under this
+        // session's span). Latching it — rather than emitting inline here —
+        // means a back-pressured clear_out that defers the accept to a
+        // later Ready-loop step still carries the parent trace with it,
+        // instead of dropping it (F4). Only when IP propagated a trace.
         if s.telemetry_chan >= 0 && s.sessions[idx].trace_ctx_trace != [0u8; 16] {
-            let trace = s.sessions[idx].trace_ctx_trace;
-            let own = s.sessions[idx].span_id;
-            let flags = s.sessions[idx].trace_ctx_flags;
-            let sys = &*s.syscalls;
-            let mut scratch = [0u8; NET_FRAME_HDR + abi::contracts::net::net_proto::TRACE_CTX_LEN];
-            dev_net_send_trace_ctx(
-                sys,
-                s.clear_out,
-                conn_id,
-                &trace,
-                &own,
-                flags,
-                scratch.as_mut_ptr(),
-                scratch.len(),
-            );
+            s.sessions[idx].trace_ctx_pending = true;
         }
+        // Forward the held NET_MSG_ACCEPTED / NET_MSG_CONNECTED (+ the
+        // queued trace) now that the handshake is complete. The latch is
+        // cleared only as each write lands; a dropped completion is retried
+        // per-step (see the Ready-session loop) so the clear-side consumer
+        // is never stranded waiting for the accept or its trace context.
+        forward_held_completion(s, idx);
     }
     true
 }

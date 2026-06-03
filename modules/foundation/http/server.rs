@@ -3458,15 +3458,28 @@ unsafe fn demux_inbound(s: &mut HttpState) {
         match msg_type {
             NET_MSG_ACCEPTED if payload_len >= 1 => {
                 let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                if let Some(idx) = alloc_free_slot(s, conn) {
-                    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
-                    slot.phase = Phase::RecvRequest;
-                } else {
-                    // Slot table full — actively close the new conn
-                    // (never drop silently: the IP module would
-                    // otherwise leave the slot in `Established`
-                    // until per-conn timeout, exhausting MAX_TCP_CONNS).
-                    close_net_conn(s, conn);
+                // Multi-anchor demux: when the accept carries a listener
+                // port (payload_len >= 3), claim it only if it matches our
+                // bound port — a fanned net_out delivers every consumer's
+                // accepts to all of them. A port-less frame (legacy
+                // single-anchor producer) is always ours. A non-matching
+                // accept is ignored (the owning anchor closes/claims it).
+                let ours = payload_len < 3 || {
+                    let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                    let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                    ((lo as u16) | ((hi as u16) << 8)) == s.server.port
+                };
+                if ours {
+                    if let Some(idx) = alloc_free_slot(s, conn) {
+                        let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                        slot.phase = Phase::RecvRequest;
+                    } else {
+                        // Slot table full — actively close the new conn
+                        // (never drop silently: the IP module would
+                        // otherwise leave the slot in `Established`
+                        // until per-conn timeout, exhausting MAX_TCP_CONNS).
+                        close_net_conn(s, conn);
+                    }
                 }
             }
             NET_MSG_DATA if payload_len > 1 => {
@@ -3684,7 +3697,19 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let buf = s.net_buf.as_mut_ptr();
             let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
             match msg_type {
-                NET_MSG_BOUND => {
+                // Multi-anchor demux: on a shared `net_in` fan IP emits one
+                // MSG_BOUND per anchor's CMD_BIND. Treat only the bound for
+                // OUR listener port as ours (a port-less legacy frame is
+                // accepted). Ignoring a neighbour's bound here prevents this
+                // server from flipping to WaitAccept / `bound` on someone
+                // else's listen completing first.
+                NET_MSG_BOUND
+                    if payload_len < 3 || {
+                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                        ((lo as u16) | ((hi as u16) << 8)) == s.server.port
+                    } =>
+                {
                     log(s, b"[http] bound, waiting for connections");
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::WaitAccept;
@@ -3709,13 +3734,21 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 NET_MSG_ACCEPTED if payload_len >= 1 => {
                     // A connection accepted by linux_net while we were
                     // still binding. Allocate a slot directly — the
-                    // slot table is the queue.
+                    // slot table is the queue. Multi-anchor demux: claim
+                    // only accepts on our bound port (see the demux path).
                     let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                    if let Some(idx) = alloc_free_slot(s, conn) {
-                        let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
-                        slot.phase = Phase::RecvRequest;
-                    } else {
-                        close_net_conn(s, conn);
+                    let ours = payload_len < 3 || {
+                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                        ((lo as u16) | ((hi as u16) << 8)) == s.server.port
+                    };
+                    if ours {
+                        if let Some(idx) = alloc_free_slot(s, conn) {
+                            let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                            slot.phase = Phase::RecvRequest;
+                        } else {
+                            close_net_conn(s, conn);
+                        }
                     }
                     return 2;
                 }

@@ -22,6 +22,12 @@ pub const QUIC_CRYPTO_BUF: usize = 4096;
 /// 16-byte HMAC tag — 51 bytes worst case. Round to 64.
 pub const MAX_RETRY_TOKEN_LEN: usize = 64;
 
+/// Maximum ALPN protocol-name length we store per connection (and per
+/// configured entry). The IANA tokens we care about — `h3`, `mqtt` —
+/// are short; 24 leaves headroom for future protocols without bloating
+/// the fixed-size connection struct.
+pub const MAX_ALPN: usize = 24;
+
 /// NewReno tunables (RFC 9002 §B.1).
 /// Congestion window measured in bytes; max_datagram_size = 1500 since
 /// our wire layer caps datagrams at QUIC_DGRAM_MAX.
@@ -789,6 +795,122 @@ pub struct QuicConnection {
     /// Span start micros. Non-zero marks a pending span that the close path
     /// must still emit; zeroed once emitted (idempotent) or for client conns.
     pub span_start_us: u64,
+
+    // ── ALPN (RFC 7301) ────────────────────────────────────────────
+    /// The negotiated application protocol for this connection, as a
+    /// raw token (e.g. `h3`, `mqtt`). Server: selected at ClientHello
+    /// from the intersection of the module's configured list and the
+    /// client's offered list. Client: the protocol we offered. Empty
+    /// (`alpn_selected_len == 0`) means no ALPN was negotiated — legacy
+    /// behaviour driven solely by `enable_h3`.
+    pub alpn_selected: [u8; MAX_ALPN],
+    pub alpn_selected_len: u8,
+
+    // ── DATAGRAM (RFC 9221) ────────────────────────────────────────
+    /// Peer's advertised `max_datagram_frame_size` (RFC 9221 §3),
+    /// captured from its transport parameters. 0 = peer won't accept
+    /// DATAGRAMs → outbound datagrams are dropped at the encoder. An
+    /// outbound payload larger than this value is also dropped (never
+    /// truncated, never retransmitted).
+    pub peer_max_datagram_frame_size: u64,
+    /// Single-slot outbound DATAGRAM staging. The app writes one
+    /// MSG_QUIC_DATAGRAM_TX per drain; the pump emits it in the next
+    /// 1-RTT packet and clears the slot. Unreliable: if a second TX
+    /// arrives before the first is flushed, the older one is dropped
+    /// (RFC 9221 §5.2 — datagrams may be dropped freely).
+    pub dgram_tx: [u8; QUIC_MAX_DATAGRAM_SIZE],
+    pub dgram_tx_len: usize,
+    pub dgram_tx_pending: bool,
+    /// Single-slot inbound DATAGRAM staging. `process_frames` writes a
+    /// received datagram here; the top-level loop forwards it to the app
+    /// (MSG_QUIC_DATAGRAM_RX) and clears the slot. Unreliable: a second
+    /// inbound datagram before the first is drained overwrites it.
+    pub dgram_rx: [u8; QUIC_MAX_DATAGRAM_SIZE],
+    pub dgram_rx_len: usize,
+    pub dgram_rx_pending: bool,
+
+    // ── Connection migration (RFC 9000 §9) ────────────────────────
+    /// True while we are validating a candidate 4-tuple before
+    /// switching the active path to it. Set when a confirmed-handshake
+    /// packet arrives from an address other than `peer`; cleared when
+    /// the matching PATH_RESPONSE confirms reachability.
+    pub path_validating: bool,
+    /// The 8 unpredictable bytes we sent in our PATH_CHALLENGE; a
+    /// PATH_RESPONSE must echo these to confirm the candidate path.
+    pub path_challenge_data: [u8; 8],
+    /// Wall-clock millis when path validation began. Used to abandon a
+    /// validation that never completes (RFC 9000 §8.2.4) so the flag
+    /// doesn't latch forever and block a later genuine migration.
+    pub path_validate_ms: u64,
+    /// Candidate path under validation (the new 4-tuple). Becomes the
+    /// active `peer` once validation succeeds.
+    pub cand_ip: [u8; 4],
+    pub cand_port: u16,
+    /// A PATH_CHALLENGE is queued for emission to the candidate path.
+    pub path_challenge_tx_pending: bool,
+    /// Wall-clock millis when the last PATH_CHALLENGE probe was enqueued
+    /// (0 = none outstanding). Drives PTO-style retransmission of the
+    /// probe (RFC 9000 §8.1 / §9.3.3) so a wire-lost challenge is resent
+    /// even if the migrating peer goes quiet, bounded by
+    /// `path_validate_ms` + the overall validation timeout.
+    pub path_challenge_tx_ms: u64,
+    /// A PATH_RESPONSE is queued (echoing a PATH_CHALLENGE the peer sent
+    /// us). `path_response_data` holds the bytes to echo. RFC 9000 §8.2.2
+    /// requires the PATH_RESPONSE be sent on the network path the
+    /// PATH_CHALLENGE arrived on, so `path_response_to_*` records that
+    /// source 4-tuple (captured at frame-dispatch time) and the response
+    /// is emitted as a dedicated destination-scoped packet — NOT folded
+    /// into the validated-path data packet.
+    pub path_response_tx_pending: bool,
+    pub path_response_data: [u8; 8],
+    pub path_response_to_ip: [u8; 4],
+    pub path_response_to_port: u16,
+    /// Source 4-tuple of the datagram currently being dispatched. Set in
+    /// `mod.rs` when bytes are staged into `inbound`, before
+    /// `process_frames` runs, so path-validation frames can associate
+    /// PATH_CHALLENGE / PATH_RESPONSE with the path they arrived on
+    /// (RFC 9000 §8.2.2 / §8.2.3). Without this a PATH_RESPONSE could be
+    /// matched on token alone and promote a candidate that answered on
+    /// the wrong path.
+    pub recv_ip: [u8; 4],
+    pub recv_port: u16,
+
+    // ── Raw bidi-stream surface (non-h3 ALPN) ──────────────────────
+    /// Whether we've emitted the one-shot MSG_QUIC_STREAM_OPEN event for
+    /// the main bidi stream (id 0) to the app surface.
+    pub raw_stream_open_sent: bool,
+    /// Whether the terminal MSG_MUX_STREAM_CLOSED has been emitted to the
+    /// app for the main bidi stream. Latched so a peer FIN (including an
+    /// empty FIN carrying no data) propagates exactly once, and is never
+    /// re-sent on a subsequent forward.
+    pub raw_stream_close_sent: bool,
+    /// Whether the post-handshake `MSG_MUX_PEER_IDENTITY` (mux 0xC8) has
+    /// been emitted to the app surface.
+    pub peer_identity_sent: bool,
+
+    // ── Alternate connection IDs (RFC 9000 §5.1.1 / §19.15) ────────
+    /// One spare local CID issued to the peer post-handshake via
+    /// NEW_CONNECTION_ID (sequence 1), so the peer can switch to a
+    /// fresh DCID on a new path (RFC 9000 §9.5 linkability). Matched by
+    /// `find_conn_by_dcid` alongside `our_cid`. We advertise
+    /// active_connection_id_limit = 2, so one spare is the most the peer
+    /// expects.
+    pub alt_cid: [u8; MAX_CID_LEN],
+    pub alt_cid_len: u8,
+    pub alt_cid_seq: u64,
+    /// Stateless-reset token paired with `alt_cid` (RFC 9000 §10.3),
+    /// carried in the NEW_CONNECTION_ID frame. Random per issuance.
+    pub alt_cid_reset_token: [u8; 16],
+    /// True once `alt_cid` has been minted (one-shot).
+    pub alt_cid_issued: bool,
+    /// A NEW_CONNECTION_ID frame for `alt_cid` is queued for emission.
+    pub new_cid_tx_pending: bool,
+    /// Whether this connection drives the HTTP/3 application layer.
+    /// Decided once, post-ALPN-selection: true when the negotiated ALPN
+    /// is `h3`, or — when no ALPN is configured — when `enable_h3` is
+    /// set (preserves pre-ALPN behaviour). A non-h3 ALPN (e.g. `mqtt`)
+    /// routes raw bidi streams to the app surface instead of h3.
+    pub use_h3: bool,
 }
 
 impl QuicConnection {
@@ -875,6 +997,38 @@ impl QuicConnection {
             span_id: [0; 8],
             sampled_flags: 0,
             span_start_us: 0,
+            alpn_selected: [0; MAX_ALPN],
+            alpn_selected_len: 0,
+            use_h3: false,
+            peer_max_datagram_frame_size: 0,
+            dgram_tx: [0; QUIC_MAX_DATAGRAM_SIZE],
+            dgram_tx_len: 0,
+            dgram_tx_pending: false,
+            dgram_rx: [0; QUIC_MAX_DATAGRAM_SIZE],
+            dgram_rx_len: 0,
+            dgram_rx_pending: false,
+            path_validating: false,
+            path_challenge_data: [0; 8],
+            path_validate_ms: 0,
+            cand_ip: [0; 4],
+            cand_port: 0,
+            path_challenge_tx_pending: false,
+            path_challenge_tx_ms: 0,
+            path_response_tx_pending: false,
+            path_response_data: [0; 8],
+            path_response_to_ip: [0; 4],
+            path_response_to_port: 0,
+            recv_ip: [0; 4],
+            recv_port: 0,
+            raw_stream_open_sent: false,
+            raw_stream_close_sent: false,
+            peer_identity_sent: false,
+            alt_cid: [0; MAX_CID_LEN],
+            alt_cid_len: 0,
+            alt_cid_seq: 0,
+            alt_cid_reset_token: [0; 16],
+            alt_cid_issued: false,
+            new_cid_tx_pending: false,
         }
     }
 
@@ -1137,6 +1291,15 @@ pub const TP_DISABLE_ACTIVE_MIGRATION: u64 = 0x0c;
 pub const TP_ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
 pub const TP_INITIAL_SOURCE_CID: u64 = 0x0f;
 pub const TP_RETRY_SOURCE_CID: u64 = 0x10;
+/// RFC 9221 §3 — `max_datagram_frame_size`. Advertising a non-zero
+/// value signals the peer it MAY send DATAGRAM frames up to that size.
+/// We advertise the largest datagram we can stage inbound.
+pub const TP_MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
+
+/// The largest DATAGRAM frame we advertise we can receive (RFC 9221 §3).
+/// Bounds the inbound staging copy; sized to a single QUIC packet's
+/// worth of payload so a datagram fits one 1-RTT packet.
+pub const QUIC_MAX_DATAGRAM_SIZE: usize = 1200;
 
 /// Maximum encoded transport parameters length we ever emit.
 pub const TP_BUF_LEN: usize = 256;
@@ -1180,7 +1343,11 @@ unsafe fn tp_put_int(out: &mut [u8], pos: &mut usize, id: u64, value: u64) {
 /// §18.2 mandates `initial_source_connection_id`. We also advertise
 /// flow-control / stream-limit ceilings so the peer can use them
 /// before we add explicit MAX_DATA / MAX_STREAMS frames.
-pub unsafe fn build_transport_params_client(scid: &[u8], out: &mut [u8]) -> usize {
+pub unsafe fn build_transport_params_client(
+    scid: &[u8],
+    disable_migration: bool,
+    out: &mut [u8],
+) -> usize {
     let mut pos = 0;
     tp_put_bytes(out, &mut pos, TP_INITIAL_SOURCE_CID, scid);
     tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, 30_000);
@@ -1192,9 +1359,20 @@ pub unsafe fn build_transport_params_client(scid: &[u8], out: &mut [u8]) -> usiz
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, 4);
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, 4);
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
-    // We don't support connection migration this revision; advertise
-    // disable_active_migration so a peer doesn't try (RFC 9000 §18.2).
-    tp_put_bytes(out, &mut pos, TP_DISABLE_ACTIVE_MIGRATION, &[]);
+    // RFC 9221 §3: advertise our inbound DATAGRAM capacity so the peer
+    // may send unreliable datagrams up to this size.
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_MAX_DATAGRAM_FRAME_SIZE,
+        QUIC_MAX_DATAGRAM_SIZE as u64,
+    );
+    // RFC 9000 §18.2: advertise disable_active_migration ONLY when the
+    // module is configured to refuse migration. By default we support it
+    // and so omit the TP, permitting the peer to migrate.
+    if disable_migration {
+        tp_put_bytes(out, &mut pos, TP_DISABLE_ACTIVE_MIGRATION, &[]);
+    }
     pos
 }
 
@@ -1207,6 +1385,7 @@ pub unsafe fn build_transport_params_server(
     scid: &[u8],
     original_dcid: &[u8],
     retry_source_cid: Option<&[u8]>,
+    disable_migration: bool,
     out: &mut [u8],
 ) -> usize {
     let mut pos = 0;
@@ -1224,10 +1403,53 @@ pub unsafe fn build_transport_params_server(
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, 4);
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, 4);
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
-    // We don't support connection migration this revision; advertise
-    // disable_active_migration so a peer doesn't try (RFC 9000 §18.2).
-    tp_put_bytes(out, &mut pos, TP_DISABLE_ACTIVE_MIGRATION, &[]);
+    // RFC 9221 §3: advertise our inbound DATAGRAM capacity.
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_MAX_DATAGRAM_FRAME_SIZE,
+        QUIC_MAX_DATAGRAM_SIZE as u64,
+    );
+    // RFC 9000 §18.2: advertise disable_active_migration ONLY when
+    // configured to refuse migration (default: support it, omit the TP).
+    if disable_migration {
+        tp_put_bytes(out, &mut pos, TP_DISABLE_ACTIVE_MIGRATION, &[]);
+    }
     pos
+}
+
+/// Extract the peer's `max_datagram_frame_size` (RFC 9221 §3) from a
+/// transport_parameters payload. Returns 0 if absent (peer won't accept
+/// DATAGRAMs) or on any decode error. Lenient: unknown params skipped.
+pub unsafe fn parse_peer_max_datagram_frame_size(payload: &[u8]) -> u64 {
+    let mut pos = 0;
+    while pos < payload.len() {
+        let after = &payload[pos..];
+        let (id, n) = match varint_decode(after.as_ptr(), after.len()) {
+            Some(t) => t,
+            None => return 0,
+        };
+        pos += n;
+        let after = &payload[pos..];
+        let (vlen, n) = match varint_decode(after.as_ptr(), after.len()) {
+            Some(t) => t,
+            None => return 0,
+        };
+        pos += n;
+        let vlen = vlen as usize;
+        if pos + vlen > payload.len() {
+            return 0;
+        }
+        let value = &payload[pos..pos + vlen];
+        pos += vlen;
+        if id == TP_MAX_DATAGRAM_FRAME_SIZE {
+            if let Some((v, _)) = varint_decode(value.as_ptr(), value.len()) {
+                return v;
+            }
+            return 0;
+        }
+    }
+    0
 }
 
 /// Walk a transport_parameters payload and validate the mandatory

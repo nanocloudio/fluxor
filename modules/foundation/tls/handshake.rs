@@ -145,7 +145,8 @@ pub fn build_client_hello(
     pub_key: &[u8; 65],  // uncompressed P-256 public key
     out: &mut [u8],
 ) -> usize {
-    build_client_hello_ext(random, session_id, pub_key, &[], out)
+    // Empty ALPN → builder keeps the default h2,http/1.1 offer.
+    build_client_hello_ext(random, session_id, pub_key, &[], &[], out)
 }
 
 /// Variant taking a QUIC `transport_parameters` extension payload.
@@ -158,6 +159,7 @@ pub fn build_client_hello_ext(
     session_id: &[u8; 32],
     pub_key: &[u8; 65],
     quic_tp: &[u8],
+    alpn: &[u8],
     out: &mut [u8],
 ) -> usize {
     let mut pos = 0;
@@ -189,7 +191,7 @@ pub fn build_client_hello_ext(
     pos = write_ext_supported_versions(out, pos);
     pos = write_ext_key_share_client(out, pos, pub_key);
     pos = write_ext_signature_algorithms(out, pos);
-    pos = write_ext_alpn_client(out, pos);
+    pos = write_ext_alpn_client(out, pos, alpn);
     if !quic_tp.is_empty() {
         put_u16(out, pos, EXT_QUIC_TRANSPORT_PARAMETERS); pos += 2;
         put_u16(out, pos, quic_tp.len() as u16); pos += 2;
@@ -971,6 +973,58 @@ pub fn parse_encrypted_extensions_for_quic(body: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// Extract the server's negotiated ALPN protocol (RFC 7301) from an
+/// EncryptedExtensions body. The server echoes exactly one protocol:
+/// the ext data is `[ProtocolNameList len:2][name_len:1][name…]`.
+/// Returns the protocol-name bytes, or None if no ALPN extension is
+/// present / it's malformed. Mirrors `parse_encrypted_extensions_for_quic`.
+pub fn parse_encrypted_extensions_alpn(body: &[u8]) -> Option<&[u8]> {
+    if body.len() < 2 {
+        return None;
+    }
+    let ext_len = get_u16(body, 0) as usize;
+    let mut pos = 2;
+    let ext_end = pos + ext_len;
+    if ext_end > body.len() {
+        return None;
+    }
+    while pos + 4 <= ext_end {
+        let ext_type = get_u16(body, pos);
+        pos += 2;
+        let ext_data_len = get_u16(body, pos) as usize;
+        pos += 2;
+        if pos + ext_data_len > ext_end {
+            break;
+        }
+        if ext_type == EXT_ALPN {
+            // [list_len:2][name_len:1][name…]. RFC 7301 §3.1: the server's
+            // EncryptedExtensions ALPN carries EXACTLY ONE protocol name.
+            // Parse strictly — reject a ProtocolNameList length that does
+            // not cover the extension body, a name that overruns it, a
+            // trailing second entry, or an empty name. A lax parse here
+            // would let a malformed echo be accepted as a valid selection.
+            let d = &body[pos..pos + ext_data_len];
+            if d.len() < 3 {
+                return None;
+            }
+            let list_len = get_u16(d, 0) as usize;
+            // The list length must exactly span the rest of the extension.
+            if list_len != d.len() - 2 {
+                return None;
+            }
+            let name_len = d[2] as usize;
+            // Exactly one name: its 1-byte length prefix + the name must
+            // consume the whole list, leaving no trailing entries.
+            if name_len == 0 || 1 + name_len != list_len {
+                return None;
+            }
+            return Some(&d[3..3 + name_len]);
+        }
+        pos += ext_data_len;
+    }
+    None
+}
+
 /// Select best cipher suite from client's list. Preference order:
 /// ChaCha20-Poly1305 → AES-128-GCM → AES-256-GCM. The AES suites are
 /// PIC-safe now that `module.ld` funnels `.data.rel.ro*` (LLVM jump
@@ -1079,10 +1133,13 @@ fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
     pos
 }
 
-/// Offer ALPN protocols `h2` and `http/1.1` (in that preference
-/// order) — the http module's only consumer wants those two.
-/// Raw pointer writes for PIC aarch64 safety.
-fn write_ext_alpn_client(out: &mut [u8], mut pos: usize) -> usize {
+/// Offer ALPN protocols (RFC 7301). When `alpn` is empty, defaults to
+/// `h2`,`http/1.1` (the http module's consumer set). Otherwise `alpn` is
+/// a comma-separated list of raw protocol tokens (e.g. `mqtt,h3`) and
+/// each is offered in order — this is how the QUIC client advertises its
+/// configured ALPN instead of the TCP/HTTP defaults. Raw pointer writes
+/// for PIC aarch64 safety.
+fn write_ext_alpn_client(out: &mut [u8], mut pos: usize, alpn: &[u8]) -> usize {
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
     unsafe {
@@ -1091,30 +1148,40 @@ fn write_ext_alpn_client(out: &mut [u8], mut pos: usize) -> usize {
         *p.add(pos) = 0;
         *p.add(pos + 1) = 16;
         pos += 2;
-        // protocol list — encoded once so we can compute lengths.
-        // [name_len=2, "h2", name_len=8, "http/1.1"]  → 13 bytes
-        let list_len: u16 = 1 + 2 + 1 + 8;
-        let ext_data_len: u16 = 2 + list_len;
-        *p.add(pos) = (ext_data_len >> 8) as u8;
-        *p.add(pos + 1) = ext_data_len as u8;
-        pos += 2;
-        *p.add(pos) = (list_len >> 8) as u8;
-        *p.add(pos + 1) = list_len as u8;
-        pos += 2;
-        *p.add(pos) = 2;
-        *p.add(pos + 1) = b'h';
-        *p.add(pos + 2) = b'2';
-        pos += 3;
-        *p.add(pos) = 8;
-        *p.add(pos + 1) = b'h';
-        *p.add(pos + 2) = b't';
-        *p.add(pos + 3) = b't';
-        *p.add(pos + 4) = b'p';
-        *p.add(pos + 5) = b'/';
-        *p.add(pos + 6) = b'1';
-        *p.add(pos + 7) = b'.';
-        *p.add(pos + 8) = b'1';
-        pos += 9;
+        // Reserve ext_data_len (2) + list_len (2); backfilled after the
+        // protocol names are written so any configured list length works.
+        let ext_data_len_pos = pos;
+        let list_len_pos = pos + 2;
+        pos += 4;
+        let list_start = pos;
+        if alpn.is_empty() {
+            // Default: [2,"h2"][8,"http/1.1"].
+            *p.add(pos) = 2;
+            *p.add(pos + 1) = b'h';
+            *p.add(pos + 2) = b'2';
+            pos += 3;
+            let http11 = b"http/1.1";
+            *p.add(pos) = http11.len() as u8;
+            pos += 1;
+            core::ptr::copy_nonoverlapping(http11.as_ptr(), p.add(pos), http11.len());
+            pos += http11.len();
+        } else {
+            for tok in alpn.split(|&b| b == b',') {
+                if tok.is_empty() || tok.len() > 255 {
+                    continue;
+                }
+                *p.add(pos) = tok.len() as u8;
+                pos += 1;
+                core::ptr::copy_nonoverlapping(tok.as_ptr(), p.add(pos), tok.len());
+                pos += tok.len();
+            }
+        }
+        let list_len = (pos - list_start) as u16;
+        let ext_data_len = list_len + 2;
+        *p.add(ext_data_len_pos) = (ext_data_len >> 8) as u8;
+        *p.add(ext_data_len_pos + 1) = ext_data_len as u8;
+        *p.add(list_len_pos) = (list_len >> 8) as u8;
+        *p.add(list_len_pos + 1) = list_len as u8;
     }
     pos
 }
@@ -1341,6 +1408,7 @@ pub fn build_client_hello_psk(
     obfuscated_age: u32,
     binder_len: usize,
     include_early_data: bool,
+    alpn: &[u8],
     out: &mut [u8],
 ) -> (usize, usize, usize) {
     let mut pos = 0;
@@ -1387,7 +1455,7 @@ pub fn build_client_hello_psk(
     pos = write_ext_supported_versions(out, pos);
     pos = write_ext_key_share_client(out, pos, pub_key);
     pos = write_ext_signature_algorithms(out, pos);
-    pos = write_ext_alpn_client(out, pos);
+    pos = write_ext_alpn_client(out, pos, alpn);
     if !quic_tp.is_empty() {
         put_u16(out, pos, EXT_QUIC_TRANSPORT_PARAMETERS);
         pos += 2;
