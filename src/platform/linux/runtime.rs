@@ -132,6 +132,10 @@ fn linux_init_providers() {
     use fluxor::kernel::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
     provider::register(dev_class::HAL_PIO, linux_stream_time_dispatch);
+    // storage.object over HTTP `Range:` — wasm peer in
+    // `src/platform/wasm/object.rs`; shared windowing in
+    // `abi::contracts::storage::object::range`.
+    provider::register(dev_class::STORAGE_OBJECT, linux_object_dispatch);
 }
 /// Platform-specific per-module cleanup for Linux host.
 ///

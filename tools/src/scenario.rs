@@ -783,6 +783,15 @@ pub fn synthesise_host_config(
 const CANONICAL_RUNTIME_HTML_RAW: &str = include_str!("../../src/platform/wasm/host/runtime.html");
 const CANONICAL_HOST_SHIMS_JS_RAW: &str =
     include_str!("../../src/platform/wasm/host/host_shims.js");
+/// Generic browser-overlay renderer (`presentation.shell`). Inlined
+/// into the served runtime.html (rather than a separate route) so it
+/// costs no slot against the kernel's `MAX_ROUTES = 8`. Defines
+/// `window.FluxorOverlay`; dormant until a scenario carries a
+/// `presentation.shell` block.
+const CANONICAL_OVERLAY_JS_RAW: &str =
+    include_str!("../../src/platform/wasm/host/browser_overlay_runtime.js");
+/// Marker in runtime.html where the overlay `<script>` is injected.
+const OVERLAY_MARKER: &str = "<!--FLUXOR_OVERLAY_RUNTIME-->";
 
 /// Escape every `${` so the config-load env-var substitutor passes
 /// the content through verbatim. The shell HTML / JS contains lots
@@ -796,7 +805,14 @@ fn escape_for_env_substitution(s: &str) -> String {
 }
 
 fn canonical_runtime_html_body() -> String {
-    escape_for_env_substitution(CANONICAL_RUNTIME_HTML_RAW)
+    // Inline the overlay renderer at its marker before env-escaping, so
+    // any `${` in the JS is escaped alongside the rest of the document.
+    // If the marker is absent (older runtime.html), this is a no-op.
+    let html = CANONICAL_RUNTIME_HTML_RAW.replace(
+        OVERLAY_MARKER,
+        &format!("<script>\n{CANONICAL_OVERLAY_JS_RAW}\n</script>"),
+    );
+    escape_for_env_substitution(&html)
 }
 
 fn canonical_host_shims_js_body() -> String {

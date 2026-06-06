@@ -10,8 +10,18 @@ builtin = true
 # `linux_display`). Other formats are added by extending the host
 # import.
 
+# Truthful AV capabilities, parallel to `linux_display` / `st7701s`
+# (RFC browser_overlay §5.7): a paced raster present surface. Lets the
+# `display` platform stack resolve a wasm variant and lets cross-target
+# graph-shape checks treat all three display sinks interchangeably.
+capabilities = ["video.raster", "display.scanout", "presentation.clock"]
+
+# Logical sink port `pixels` — uniform with `linux_display.pixels` and
+# `st7701s.pixels`, so `<producer>.pixels -> display.pixels` resolves on
+# every target (RFC §5.7). The kernel resolves this builtin's input by
+# port index, so the rename is a wiring-name change only.
 [[ports]]
-name = "raster"
+name = "pixels"
 direction = "input"
 content_type = "VideoRaster"
 required = true

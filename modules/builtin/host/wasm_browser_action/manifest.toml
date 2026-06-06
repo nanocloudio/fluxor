@@ -1,0 +1,29 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser-side semantic-action source. Drains a host-side queue the
+# presentation-shell overlay (`browser_overlay_runtime.js`) fills when
+# the user activates a media / transport / gallery control, and emits
+# the canonical FMP command verbs (`next` / `prev` / `toggle`) on
+# `commands` — mapped from the canonical `InputAction` vocabulary
+# (`action.transport.*`, `action.gallery.*`).
+#
+# This is the action-channel peer of `wasm_browser_button`: where that
+# emits raw button transitions for `gesture` to click-count, this emits
+# pre-mapped FMP verbs directly, so overlay controls drive `bank` (and
+# any other FMP consumer) end-to-end. The action→verb mapping is generic
+# Fluxor vocabulary, not application meaning.
+
+[[ports]]
+name = "commands"
+direction = "output"
+content_type = "FmpMessage"
+required = true
+
+[commands]
+emits = ["next", "prev", "toggle"]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; bridges user-activated overlay controls into FMP commands, not a measurable on-device byte stream"

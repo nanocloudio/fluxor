@@ -45,6 +45,26 @@ bundle.
   (carrying their own `<profile>_browser_profile.js` alongside
   the generic `endpoint_runtime.js` core).
 
+  On import it injects **`browser_surface.css`** and exposes the
+  touch-surface factory (`BrowserSurface.createPlayerShell` /
+  `applyTouchDefaults`) — see below.
+
+- **`browser_surface.css`** — the system-neutral touch-UI primitive
+  (iOS callout/loupe suppression, orientation-driven canvas+controls
+  flex layout, base `.pad-button` visuals). Theme-able via six CSS
+  custom properties (`--surface-bg`/`--surface-fg`/`--button-border`/
+  `--button-active-bg`/`--canvas-bg`/`--canvas-aspect`). `endpoint_
+  runtime.js` injects it on import (one-shot, idempotent) so player
+  pages inherit a consistent touch UX without re-coding the reset +
+  flex layout per system. System-specific bits (canvas aspect, which
+  buttons exist, theme colors) are supplied by `createPlayerShell()`.
+  `example.html` is a hand-written smoke page: open it locally and
+  DevTools-rotate portrait↔landscape to see the orientation flip.
+  Invariants pinned by `tools/tests/browser_surface_primitive.rs`
+  (CI) + behavioral fake-DOM checks in
+  `tests/host/endpoint_runtime.surface.test.js` (needs a JS runtime,
+  not in CI; test code is kept out of `src/` under local-only `tests/`).
+
 ## How they get served
 
 The scenario synthesiser auto-mounts both files as static routes on

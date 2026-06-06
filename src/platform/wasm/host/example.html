@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>BrowserSurface player-shell demo</title>
+  <!-- Hand-written smoke page for the touch-surface primitive. Opening
+       this file locally and DevTools-rotating between portrait and
+       landscape shows the orientation flip work. No <link> and no inline
+       <style> here on purpose: endpoint_runtime.js injects
+       browser_surface.css on import, and createPlayerShell() builds the
+       same DOM a hand-coded retro player page would produce today. -->
+</head>
+<body>
+  <!-- endpoint_runtime.js is a sibling file; load it relative so the page
+       opens straight off disk (file://) for the rotate test. -->
+  <script src="endpoint_runtime.js"></script>
+  <script>
+    BrowserSurface.createPlayerShell({
+      canvas: { id: 'screen', width: 160, height: 144, aspect: '10 / 9' },
+      controls: [
+        { kind: 'dpad' },
+        { kind: 'menu', items: ['select', 'start'] },
+        { kind: 'face', items: ['b', 'a'] },
+      ],
+      theme: { surfaceBg: '#0f1410', surfaceFg: '#d8e9c8', canvasBg: '#0f380f' },
+    });
+  </script>
+</body>
+</html>

@@ -35,3 +35,20 @@ modules = [
   },
 ]
 wiring = []
+
+# ── WASM: browser <canvas> raster sink (RFC browser_overlay §5.7) ───────
+# Lets a wasm graph resolve `display` through the same `platform.display:`
+# stack as Linux/hardware. `wasm_browser_canvas` exposes the uniform
+# `pixels` port and declares `video.raster` + `display.scanout` +
+# `presentation.clock`, so `<producer>.pixels -> display.pixels` resolves.
+[[variant]]
+match = { family = "wasm" }
+modules = [
+  { name = "display", type = "wasm_browser_canvas",
+    params = {
+      width  = "user:width|960",
+      height = "user:height|540",
+    },
+  },
+]
+wiring = []

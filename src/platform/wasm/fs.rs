@@ -46,7 +46,7 @@
 use crate::abi::contracts::fence as dev_fence;
 use crate::abi::contracts::storage::fs as dev_fs;
 use crate::kernel::errno;
-use crate::kernel::fd::{tag_fd, FD_TAG_FS};
+use crate::kernel::fd::{slot_of, tag_fd, FD_TAG_FS};
 
 const MAX_OPEN_FILES: usize = 16;
 
@@ -109,6 +109,16 @@ pub fn register() {
 }
 
 unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    // Per the provider contract (kernel/provider.rs::provider_call): a
+    // tagged handle passes through `dispatch` unchanged, and a typed
+    // inbound provider must strip the tag with `slot_of` to recover its
+    // raw FETCH_FILES slot. `fs_open` returns `tag_fd(FD_TAG_FS, slot)`,
+    // so every per-FD op (QUERY/READ/STAT/CLOSE) below receives a tagged
+    // fd — without this strip they indexed FETCH_FILES by the tagged
+    // value (tag<<26 == an out-of-range slot) and returned EINVAL on
+    // every read, so a fetch()-backed ROM never loaded. OPEN/CAPS ignore
+    // `handle`; stripping a -1 there is harmless.
+    let handle = slot_of(handle);
     // The wasm fetch model has no fsync path and no replication, so
     // every successful op is `Fence::Volatile`. Contract errno rule
     // (see `fence.rs::QUERY_OP`): `EINVAL` for malformed buffer,

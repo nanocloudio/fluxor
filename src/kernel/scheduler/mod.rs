@@ -1519,6 +1519,59 @@ pub fn store_builtin_module(idx: usize, m: BuiltInModule) {
     }
 }
 
+/// Install an internal fan module (`_tee` / `_merge`) at `idx`,
+/// collecting its channels from the prepared `sched.edges`.
+///
+/// The Linux / bare-metal path instantiates tee/merge inside
+/// [`instantiate_one_module`]; the wasm platform runs its own
+/// per-module bring-up loop (`src/platform/wasm.rs`) that dispatches
+/// host built-ins by name and otherwise host-instantiates PIC modules —
+/// it has no PIC `.fmod` for the kernel-internal fan modules, so without
+/// this the inserted `_merge`/`_tee` is never given a `ModuleSlot` and
+/// silently forwards nothing (fan-in into a consumer port delivers no
+/// data). This is the wasm equivalent of that instantiation; returns
+/// `false` if the port shape is invalid.
+pub fn install_fan_module(idx: usize, is_merge: bool, domain_id: u8, frame_kind: u8) -> bool {
+    if idx >= MAX_MODULES {
+        return false;
+    }
+    // SAFETY: graph-prep / bring-up context — single mutator, idx bounded.
+    let sched = unsafe { &mut *core::ptr::addr_of_mut!(SCHED) };
+    let mut in_chans = [-1i32; MAX_CHANNELS];
+    let mut out_chans = [-1i32; MAX_CHANNELS];
+    let in_count = collect_input_channels(&sched.edges, idx, &mut in_chans);
+    let out_count = collect_output_channels(&sched.edges, idx, &mut out_chans);
+    let domain = (domain_id as usize).min(MAX_DOMAINS - 1) as u8;
+    if is_merge {
+        if out_count != 1 || in_count == 0 {
+            log::error!("[inst] wasm merge idx={idx} invalid ports in={in_count} out={out_count}");
+            return false;
+        }
+        sched.modules[idx] = ModuleSlot::Merge(MergeModule::new(
+            &in_chans,
+            in_count,
+            out_chans[0],
+            domain,
+            frame_kind,
+        ));
+    } else {
+        if in_count != 1 || out_count == 0 {
+            log::error!("[inst] wasm tee idx={idx} invalid ports in={in_count} out={out_count}");
+            return false;
+        }
+        sched.modules[idx] = ModuleSlot::Tee(TeeModule::new(
+            in_chans[0],
+            &out_chans,
+            out_count,
+            domain,
+            frame_kind,
+        ));
+    }
+    sched.ready[idx] = true;
+    sched.slot_generation[idx] = sched.slot_generation[idx].wrapping_add(1);
+    true
+}
+
 /// Store a DynamicModule in the scheduler's module table (used by Linux platform).
 pub fn store_dynamic_module(idx: usize, dm: DynamicModule) {
     if idx >= MAX_MODULES {
@@ -3497,7 +3550,15 @@ fn insert_fan(
                 None => return false,
             };
 
-            // Add bridge edge: original module ↔ fan module
+            // Add bridge edge: original module ↔ fan module.
+            //
+            // For fan-IN, `port_key` is produced by `edge_port_key` which
+            // sets bit 0x10 when the consumer port is a *ctrl* input (see
+            // there). The merge→consumer bridge must therefore be a ctrl
+            // edge carrying the real (masked) port index — otherwise it
+            // is built as a data edge at index 0x10 (16), which both
+            // orphans the consumer's ctrl input AND lands a phantom data
+            // input at index 16 (≥ MAX_PORTS → "input port limit in=17").
             let new_edge = match direction {
                 FanDirection::Out => {
                     let mut e = Edge::simple(module_idx, fan_idx);
@@ -3505,8 +3566,14 @@ fn insert_fan(
                     e
                 }
                 FanDirection::In => {
-                    let mut e = Edge::simple(fan_idx, module_idx);
-                    e.to_port_index = port_key;
+                    let is_ctrl_port = (port_key & 0x10) != 0;
+                    let real_port = port_key & 0x0f;
+                    let mut e = if is_ctrl_port {
+                        Edge::ctrl(fan_idx, module_idx)
+                    } else {
+                        Edge::simple(fan_idx, module_idx)
+                    };
+                    e.to_port_index = real_port;
                     e
                 }
             };
@@ -3533,6 +3600,15 @@ fn insert_fan(
                     FanDirection::In => {
                         edges[group[k]].to_module = fan_idx;
                         edges[group[k]].to_port_index = k as u8;
+                        // The producer→merge hop is plain data into the
+                        // merge's inputs, regardless of whether the
+                        // original edge targeted a ctrl port — the merge
+                        // re-emits to the consumer's ctrl port via the
+                        // bridge edge above. Without clearing this, an
+                        // original ctrl edge keeps `to_port = "ctrl"`, so
+                        // `collect_input_channels` (data only) counts zero
+                        // merge inputs and the merge fails to install.
+                        edges[group[k]].to_port = "in";
                     }
                 }
             }

@@ -33,6 +33,11 @@ pub mod modules;
 pub mod modules_build;
 pub mod monitor;
 pub mod observability;
+// Standalone, unit-testable validator for `presentation.shell` /
+// `presentation.browser_overlay` descriptors (RFC browser_overlay §19).
+// Dependency-light (serde_json + error) so it dual-compiles cleanly
+// into both the lib (tests) and the bin (called from `config.rs`).
+pub mod presentation_shell;
 pub mod project;
 pub mod project_meta;
 pub mod registry;

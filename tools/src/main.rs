@@ -39,6 +39,10 @@ mod monitor;
 // copy here so the bin doesn't recompile the (mostly bin-dead) id-table
 // generator that lives alongside the lint.
 pub(crate) use fluxor_tools::observability;
+// `config.rs` calls `crate::presentation_shell::validate`; re-export the
+// lib's single copy (dependency-light, no bin-only refs) rather than
+// `mod` it twice.
+pub(crate) use fluxor_tools::presentation_shell;
 mod project;
 mod project_meta;
 mod publish;

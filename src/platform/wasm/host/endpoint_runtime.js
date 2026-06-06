@@ -19,6 +19,204 @@
   const PCM_LEAD_MIN = 0.06;
   const PCM_LEAD_MAX = 0.5;
 
+  // ── Touch surface primitive (browser_surface.css) ────────────────────
+  // The system-neutral iOS / touch UX (callout suppression + orientation
+  // flex layout + base button visuals) lives in `browser_surface.css`.
+  // This runtime injects it for you so player pages never have to add a
+  // `<link>` themselves; system-specific bits (canvas aspect, which
+  // buttons exist, theme colors) are supplied by createPlayerShell().
+  const SURFACE_STYLE_ID = 'fluxor-browser-surface';
+
+  // The script element is only the live `currentScript` while this IIFE
+  // runs at parse time — capture the URL now so we can resolve the CSS
+  // sitting next to endpoint_runtime.js regardless of the serving path.
+  const SELF_SCRIPT = (typeof document !== 'undefined') ? document.currentScript : null;
+
+  function surfaceCssUrl() {
+    if (SELF_SCRIPT && SELF_SCRIPT.src) {
+      return SELF_SCRIPT.src.replace(/[^/]*$/, 'browser_surface.css');
+    }
+    return 'browser_surface.css';
+  }
+
+  // theme → CSS custom property name. Camel-cased keys map onto the
+  // `--surface-*` / `--button-*` / `--canvas-*` vars browser_surface.css
+  // reads. Unknown keys are ignored.
+  const THEME_VARS = {
+    surfaceBg: '--surface-bg',
+    surfaceFg: '--surface-fg',
+    buttonBorder: '--button-border',
+    buttonActiveBg: '--button-active-bg',
+    canvasBg: '--canvas-bg',
+    canvasAspect: '--canvas-aspect',
+  };
+
+  // ensureStylesheet() — inject the <link> to browser_surface.css exactly
+  // once. Idempotent: a second call (or a host page that already linked
+  // it) is a no-op. CSP-clean — a plain <link>, no inline style text.
+  function ensureStylesheet(doc) {
+    doc = doc || (typeof document !== 'undefined' ? document : null);
+    if (!doc || !doc.head) return null;
+    let link = doc.getElementById(SURFACE_STYLE_ID);
+    if (link) return link;
+    link = doc.createElement('link');
+    link.id = SURFACE_STYLE_ID;
+    link.rel = 'stylesheet';
+    link.href = surfaceCssUrl();
+    doc.head.appendChild(link);
+    return link;
+  }
+
+  // applyTouchDefaults({ theme, doc }) — ensure the stylesheet is present
+  // and (optionally) override theme custom properties on :root. Pages
+  // that just want the defaults can ignore this — import alone injects
+  // the sheet. Pages with a distinct palette (e.g. the Spectrum dark
+  // theme) call this with a `theme` map.
+  function applyTouchDefaults(opts) {
+    opts = opts || {};
+    const doc = opts.doc || (typeof document !== 'undefined' ? document : null);
+    ensureStylesheet(doc);
+    const theme = opts.theme;
+    if (theme && doc && doc.documentElement) {
+      const style = doc.documentElement.style;
+      for (const key in THEME_VARS) {
+        if (theme[key] != null) style.setProperty(THEME_VARS[key], String(theme[key]));
+      }
+    }
+    return doc;
+  }
+
+  // Default glyph/label per known control name. Anything not listed
+  // renders as its upper-cased control id (so 'x' → 'X', '1' → '1').
+  const CONTROL_LABELS = {
+    up: '▲', down: '▼', left: '◀', right: '▶',
+    a: 'A', b: 'B', x: 'X', y: 'Y',
+    l: 'L', r: 'R',
+    select: 'SEL', start: 'START', fire: '●',
+  };
+  // The four dpad members carry positional classes so the CSS grid
+  // template (.pad-up/.pad-left/.pad-right/.pad-down) places them.
+  const DPAD_ITEMS = ['up', 'left', 'right', 'down'];
+  const DPAD_POS_CLASS = { up: 'pad-up', left: 'pad-left', right: 'pad-right', down: 'pad-down' };
+  // Container class per group kind.
+  const GROUP_CLASS = { dpad: 'dpad', menu: 'menu-buttons', face: 'face-buttons', row: 'row-buttons' };
+
+  function controlLabel(control) {
+    if (CONTROL_LABELS[control] != null) return CONTROL_LABELS[control];
+    return String(control).toUpperCase();
+  }
+
+  // createPlayerShell({ canvas, controls, theme, doc, mountEl }) — build
+  // the canonical player DOM that hand-coded retro player pages produce:
+  //
+  //   <div class="stage">
+  //     <canvas id width height></canvas>
+  //     <footer><span id=status><span id=audioStatus></footer>
+  //   </div>
+  //   <div class="controls"> …one container per control group… </div>
+  //
+  //   canvas:   { id, width, height, aspect } — aspect is the
+  //             SYSTEM-SPECIFIC ratio (e.g. '10 / 9'); applied inline.
+  //   controls: ordered [{ kind:'dpad'|'menu'|'face'|'row', items:[…] }]
+  //             dpad defaults to up/left/right/down; other kinds require
+  //             items. Each item becomes a `.pad-button[data-control]`.
+  //   theme:    optional palette → applyTouchDefaults({ theme }).
+  //   mountEl:  where to append (defaults to document.body).
+  //
+  // Returns { stage, canvas, status, audioStatus, controls, groups,
+  //           dpad, buttonByControl } so the caller can wire input via
+  //   BrowserSurface.createInput().bindButtons('.pad-button')
+  //   …and .bindDpad(shell.dpad).
+  function createPlayerShell(config) {
+    config = config || {};
+    const doc = config.doc || document;
+    applyTouchDefaults({ theme: config.theme, doc });
+
+    const canvasCfg = config.canvas || {};
+    const stage = doc.createElement('div');
+    stage.className = 'stage';
+    const canvas = doc.createElement('canvas');
+    if (canvasCfg.id != null) canvas.id = canvasCfg.id;
+    if (canvasCfg.width != null) canvas.setAttribute('width', String(canvasCfg.width));
+    if (canvasCfg.height != null) canvas.setAttribute('height', String(canvasCfg.height));
+    if (canvasCfg.aspect != null) canvas.style.aspectRatio = String(canvasCfg.aspect);
+    stage.appendChild(canvas);
+
+    const footer = doc.createElement('footer');
+    const status = doc.createElement('span');
+    status.id = 'status';
+    const audioStatus = doc.createElement('span');
+    audioStatus.id = 'audioStatus';
+    footer.appendChild(status);
+    footer.appendChild(audioStatus);
+    stage.appendChild(footer);
+
+    const controls = doc.createElement('div');
+    controls.className = 'controls';
+    controls.setAttribute('aria-label', 'game controls');
+
+    const buttonByControl = {};
+    const groups = [];
+    let dpad = null;
+
+    const groupCfgs = config.controls || [];
+    for (let i = 0; i < groupCfgs.length; i++) {
+      const g = groupCfgs[i] || {};
+      const kind = g.kind;
+      const cls = GROUP_CLASS[kind];
+      if (!cls) continue; // unknown kind → skip (factory stays additive)
+      const items = (kind === 'dpad') ? (g.items || DPAD_ITEMS) : (g.items || []);
+
+      const container = doc.createElement('div');
+      container.className = cls;
+      if (kind === 'dpad') {
+        container.id = 'dpad';
+        container.setAttribute('aria-label', 'direction pad');
+      }
+      // System-specific column/aspect layout the primitive CSS leaves
+      // open: face cluster width=item count + square overall (GB uses
+      // 2 → aspect 2); row cluster columns = item count.
+      if (kind === 'face' && items.length) {
+        container.style.gridTemplateColumns = 'repeat(' + items.length + ', 1fr)';
+        container.style.aspectRatio = String(items.length);
+      } else if (kind === 'row' && items.length) {
+        container.style.gridTemplateColumns = 'repeat(' + items.length + ', minmax(32px, 1fr))';
+      } else if (kind === 'menu' && items.length && items.length !== 2) {
+        container.style.gridTemplateColumns = 'repeat(' + items.length + ', 1fr)';
+      }
+
+      const buttons = {};
+      for (let j = 0; j < items.length; j++) {
+        const control = String(items[j]);
+        const btn = doc.createElement('button');
+        btn.className = 'pad-button';
+        if (kind === 'dpad' && DPAD_POS_CLASS[control]) {
+          btn.classList.add(DPAD_POS_CLASS[control]);
+        }
+        btn.setAttribute('type', 'button');
+        btn.setAttribute('data-control', control);
+        btn.dataset.control = control;
+        btn.setAttribute('aria-label', control);
+        btn.textContent = controlLabel(control);
+        container.appendChild(btn);
+        buttons[control] = btn;
+        buttonByControl[control] = btn;
+      }
+
+      controls.appendChild(container);
+      groups.push({ kind, el: container, buttons });
+      if (kind === 'dpad') dpad = container;
+    }
+
+    const mountEl = config.mountEl || doc.body;
+    if (mountEl) {
+      mountEl.appendChild(stage);
+      mountEl.appendChild(controls);
+    }
+
+    return { stage, canvas, status, audioStatus, controls, groups, dpad, buttonByControl };
+  }
+
   // ── Session ──────────────────────────────────────────────────────────
   // connect(url, { packetHandlers, onStatusChange, reconnectMs })
   //   packetHandlers: { [kindByte]: function(view, bytes) }
@@ -339,12 +537,60 @@
     });
   }
 
+  // ── Shared overlay renderer (RFC §6.3) ───────────────────────────────
+  // Mount the SAME generic presentation-shell renderer the full-WASM
+  // host uses (`browser_overlay_runtime.js` → `window.FluxorOverlay`)
+  // for a DOM-only endpoint, instead of hand-building controls with the
+  // legacy `createInput` + `data-control` buttons below. Control
+  // rendering, responsive layout, lifecycle cleanup, and input
+  // normalization are then identical across both host modes; only the
+  // *transport* differs — here normalized records flow to `onInput`,
+  // which the endpoint profile encodes into its session wire format and
+  // sends (RFC §6.2: "Application profiles may adapt remote wire
+  // formats, but the generic DOM capture and overlay rendering code
+  // must be shared with the full-WASM host").
+  //
+  //   mountOverlay({ shell, browser_overlay, lists, mountEl, onInput })
+  //     onInput(record) — record is `{ class:'gamepad'|'key'|'action', … }`,
+  //     the same normalized shape `makeSinks` produces for the host.
+  //
+  // Requires `browser_overlay_runtime.js` to be loaded first; throws if
+  // `window.FluxorOverlay` is absent so the misconfiguration is loud.
+  function mountOverlay(opts) {
+    opts = opts || {};
+    const overlay = window.FluxorOverlay;
+    if (!overlay || typeof overlay.mount !== 'function') {
+      throw new Error(
+        'mountOverlay: window.FluxorOverlay missing — load browser_overlay_runtime.js first'
+      );
+    }
+    const onInput = typeof opts.onInput === 'function' ? opts.onInput : function () {};
+    const sinks = overlay.makeSinks(onInput);
+    return overlay.mount({
+      shell: opts.shell,
+      browser_overlay: opts.browser_overlay,
+      lists: opts.lists,
+      mountEl: opts.mountEl,
+      contentEl: opts.contentEl,
+      viewport: opts.viewport,
+      sinks: sinks,
+    });
+  }
+
   window.BrowserSurface = {
     HEADER_LEN,
     connect,
     createAudio,
     createRasterRgb565,
     createInput,
+    mountOverlay,
     installDiagnostics,
+    applyTouchDefaults,
+    createPlayerShell,
+    ensureStylesheet,
   };
+
+  // Inject the touch-surface stylesheet on import — one-shot, idempotent.
+  // Host pages get the iOS / touch UX for free without adding a <link>.
+  if (typeof document !== 'undefined') ensureStylesheet(document);
 })();

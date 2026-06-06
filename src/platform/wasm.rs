@@ -50,6 +50,9 @@ mod gamepad;
 #[path = "wasm/button.rs"]
 mod button;
 
+#[path = "wasm/action.rs"]
+mod action;
+
 #[path = "wasm/midi.rs"]
 mod midi;
 
@@ -82,6 +85,9 @@ mod image_codec;
 
 #[path = "wasm/fs.rs"]
 mod fs;
+
+#[path = "wasm/object.rs"]
+mod object;
 
 #[path = "wasm/hal.rs"]
 mod hal;
@@ -321,6 +327,7 @@ const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
 const WASM_BROWSER_KEYBOARD_HASH: u32 = fnv1a32(b"wasm_browser_keyboard");
 const WASM_BROWSER_POINTER_HASH: u32 = fnv1a32(b"wasm_browser_pointer");
 const WASM_BROWSER_BUTTON_HASH: u32 = fnv1a32(b"wasm_browser_button");
+const WASM_BROWSER_ACTION_HASH: u32 = fnv1a32(b"wasm_browser_action");
 const WASM_BROWSER_GAMEPAD_HASH: u32 = fnv1a32(b"wasm_browser_gamepad");
 const WASM_BROWSER_AUDIO_HASH: u32 = fnv1a32(b"wasm_browser_audio");
 const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
@@ -410,6 +417,47 @@ unsafe fn load_embedded_modules() -> usize {
             None => continue,
         };
         scheduler::set_current_module(module_idx);
+
+        // Kernel-internal fan modules (`_tee` / `_merge`) inserted by
+        // `prepare_graph` for fan-out / fan-in groups. They have no PIC
+        // `.fmod` and aren't host built-ins, so the dispatch below would
+        // fall through to the (failing) host-instantiate path and leave
+        // them as no-op slots — silently dropping forwarded data. Install
+        // them as real Tee/Merge slots here (the wasm analog of
+        // `instantiate_one_module`'s internal-module handling).
+        if entry.name_hash == scheduler::INTERNAL_MERGE_HASH
+            || entry.name_hash == scheduler::INTERNAL_TEE_HASH
+        {
+            let is_merge = entry.name_hash == scheduler::INTERNAL_MERGE_HASH;
+            if scheduler::install_fan_module(
+                module_idx,
+                is_merge,
+                entry.domain_id,
+                entry.frame_kind,
+            ) {
+                registered += 1;
+                log_fmt2(
+                    2,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    if is_merge {
+                        " = _merge (internal fan-in)"
+                    } else {
+                        " = _tee (internal fan-out)"
+                    },
+                    0,
+                );
+            } else {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = internal fan module: install failed",
+                    0,
+                );
+            }
+            continue;
+        }
 
         // Browser-host built-ins, dispatched by name_hash. Same
         // pattern as the Linux platform (`linux_audio`,
@@ -587,6 +635,36 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_button (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // ACTION source — drains the host action queue and emits FMP
+        // command verbs (next/prev/toggle) mapped from the canonical
+        // presentation-shell `InputAction` vocabulary. Lets the
+        // browser-overlay media/gallery controls drive `bank` and other
+        // FMP consumers, the same way `gesture` drives them from taps.
+        if entry.name_hash == WASM_BROWSER_ACTION_HASH {
+            if !init_builtin_heap::<action::ActionState>(module_idx) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_action: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = action::build(out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_action (built-in)",
                 0,
             );
             continue;

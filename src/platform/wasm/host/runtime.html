@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- Lock the viewport: device-width, no user scaling. Without this
+       mobile browsers default to a ~980px layout and allow pinch /
+       double-tap-to-zoom — double-tapping the dpad's empty corner cells
+       would zoom the page instead of registering as input. `touch-action`
+       on the controls (below) is the iOS-reliable belt to this braces,
+       since iOS Safari ignores `user-scalable=no`. -->
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>Fluxor — WASM runtime</title>
   <style>
     :root {
@@ -169,6 +177,209 @@
     }
     .err  { color: var(--err); }
     .info { color: var(--info); }
+
+    /* Collapsible debug panel. Collapsed by default in player mode so the
+       display gets the room; the toolbar toggle expands it on demand. */
+    #debug.collapsed #log { display: none; }
+    #debug-toolbar .spacer { flex: 1 1 auto; }
+
+    /* ── Player mode ──────────────────────────────────────────────────
+       Activated (body.player-mode) when the scenario declares
+       `presentation.controls`. Mirrors browser_surface.css — the same
+       canvas+controls layout the WebSocket split page uses — so the
+       full-wasm and split experiences match: full-viewport pixelated
+       canvas, orientation-driven control placement, no page chrome. */
+    body.player-mode {
+      --surface-bg: #0f1410;
+      --surface-fg: #d8e9c8;
+      --button-border: 2px solid rgba(216, 233, 200, 0.68);
+      --button-active-bg: rgba(216, 233, 200, 0.80);
+      --canvas-bg: #0f380f;
+      --canvas-aspect: 1;
+      margin: 0;
+      padding: 0;
+      max-width: none;
+      height: 100dvh;
+      overflow: hidden;
+      display: flex;
+      background: var(--surface-bg);
+      color: var(--surface-fg);
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    /* Hide the generic shell chrome — title, caption, status line, the
+       #surfaces wrapper (we build our own .stage). */
+    body.player-mode > h1,
+    body.player-mode > p,
+    body.player-mode > #status,
+    body.player-mode > #surfaces { display: none; }
+
+    body.player-mode .stage {
+      position: relative;
+      flex: 1 1 auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      min-width: 0;
+      min-height: 0;
+      background: var(--bg-canvas);
+    }
+    /* The canvas sink (host_shims.js) sets inline `max-width:100%;
+       height:auto`, which only shrinks oversized content — a native
+       160×144 GB frame would stay tiny. Force it to fill the stage and
+       letterbox via object-fit (need !important to beat the inline
+       styles); pixelated keeps the upscale crisp. */
+    body.player-mode .stage canvas {
+      width: 100% !important;
+      height: 100% !important;
+      max-width: 100% !important;
+      max-height: 100% !important;
+      object-fit: contain;
+      image-rendering: pixelated;
+      background: var(--canvas-bg);
+      display: block;
+      touch-action: manipulation;
+      cursor: default;
+    }
+    /* Controls is a 2×2 grid in BOTH orientations: dpad + face cluster
+       share the top row, START/SELECT span the bottom. The body's
+       flex-direction (set per orientation) places this whole block below
+       the canvas in portrait and beside it in landscape; the grid itself
+       stays the same so the clusters fill their cells and never overflow
+       into each other (side-by-side) or off-screen (stacked). */
+    body.player-mode .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr auto;
+      grid-template-areas: "dpad face" "menu menu";
+      place-items: center;
+      gap: 6px 4px;
+      padding: 8px 4px;
+      box-sizing: border-box;
+      touch-action: manipulation;
+    }
+    body.player-mode .dpad {
+      grid-area: dpad;
+      width: min(73%, 260px);
+      aspect-ratio: 1;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(3, 1fr);
+      /* The dpad cross leaves the four corner cells empty — without
+         touch-action here a double-tap on a corner hits the .dpad box
+         and triggers double-tap-to-zoom instead of doing nothing. */
+      touch-action: manipulation;
+    }
+    body.player-mode .pad-button {
+      appearance: none;
+      border: var(--button-border);
+      background: rgba(8, 16, 8, 0.34);
+      color: var(--surface-fg);
+      border-radius: 8px;
+      font: 700 clamp(20px, 5.8vmin, 40px) system-ui, sans-serif;
+      display: grid;
+      place-items: center;
+      padding: 0;
+      touch-action: manipulation;
+      text-shadow: 0 1px 2px #000;
+    }
+    body.player-mode .pad-button:focus { outline: none; }
+    body.player-mode .pad-button.active {
+      background: var(--button-active-bg);
+      color: var(--surface-bg);
+    }
+    body.player-mode .pad-up    { grid-column: 2; grid-row: 1; }
+    body.player-mode .pad-left  { grid-column: 1; grid-row: 2; }
+    body.player-mode .pad-right { grid-column: 3; grid-row: 2; }
+    body.player-mode .pad-down  { grid-column: 2; grid-row: 3; }
+    body.player-mode .face-buttons {
+      grid-area: face;
+      width: min(73%, 260px);
+      display: grid;
+      gap: 12px;
+    }
+    body.player-mode .menu-buttons { grid-area: menu; margin-bottom: 24px; }
+    body.player-mode .row-buttons { grid-area: menu; margin-bottom: 24px; }
+    /* Disable double-tap-to-zoom on every touchable surface of the
+       player (empty gaps between clusters / buttons included), so a
+       quick double-press is always input, never a page zoom. */
+    body.player-mode,
+    body.player-mode .stage,
+    body.player-mode .face-buttons,
+    body.player-mode .menu-buttons,
+    body.player-mode .row-buttons {
+      touch-action: manipulation;
+    }
+    body.player-mode .face-buttons .pad-button {
+      border-radius: 50%;
+      aspect-ratio: 1;
+      font-size: clamp(20px, 5.4vmin, 36px);
+    }
+    /* Angle the A/B cluster like a classic handheld: B sits low-left, A
+       high-right, on a gentle diagonal. The glyphs stay upright (we
+       offset, not rotate). */
+    body.player-mode .face-buttons .pad-button[data-control="a"] { transform: translateY(-26%); }
+    body.player-mode .face-buttons .pad-button[data-control="b"] { transform: translateY(26%); }
+    body.player-mode .menu-buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    body.player-mode .menu-buttons .pad-button {
+      width: clamp(64px, 19vmin, 96px);
+      height: clamp(26px, 8vmin, 38px);
+      font-size: clamp(13px, 4vmin, 19px);
+      border-radius: 14px;
+    }
+    body.player-mode .row-buttons { display: grid; gap: 12px; }
+    body.player-mode .row-buttons .pad-button {
+      width: clamp(48px, 13.5vmin, 78px);
+      aspect-ratio: 1;
+      font-size: clamp(19px, 5.1vmin, 27px);
+    }
+    /* In player mode the debug panel floats so it never steals display
+       space. Collapsed: a small toggle in the TOP-right corner (over the
+       canvas letterbox, clear of the bottom controls). Expanded: a
+       full-width panel pinned to the bottom so the log is readable. */
+    body.player-mode #debug {
+      position: fixed;
+      z-index: 10;
+      margin: 0;
+      opacity: 0.92;
+    }
+    body.player-mode #debug.collapsed {
+      top: 8px;
+      right: 8px;
+    }
+    body.player-mode #debug:not(.collapsed) {
+      left: 8px;
+      right: 8px;
+      bottom: 8px;
+    }
+    /* The 2×2 grid layout lives in the base `.controls` rule; each
+       orientation only sets the block's footprint (a wide row below the
+       canvas in portrait, a tall column beside it in landscape). */
+    @media (orientation: portrait) {
+      body.player-mode { flex-direction: column; }
+      body.player-mode .stage { width: 100%; }
+      body.player-mode .controls {
+        flex: 0 0 auto;
+        width: 100%;
+        height: min(52dvh, 520px);
+      }
+    }
+    @media (orientation: landscape) {
+      body.player-mode { flex-direction: row; }
+      body.player-mode .stage { height: 100%; }
+      body.player-mode .controls {
+        flex: 0 0 auto;
+        height: 100%;
+        width: min(52vw, 520px);
+      }
+    }
   </style>
 </head>
 <body>
@@ -189,9 +400,11 @@
        (pure-wasm scenarios + thin viewer/player halves of splits)
        because the canonical runtime.html shell is the single source
        of truth for every wasm bundle's host page. -->
-  <div id="debug">
+  <div id="debug" class="collapsed">
     <div id="debug-toolbar">
       <span class="title">debug log</span>
+      <span class="spacer"></span>
+      <button id="debug-toggle" type="button" title="Show/hide the debug log">Show log</button>
       <button id="debug-copy" type="button" title="Copy all log lines to clipboard">Copy</button>
     </div>
     <div id="log"></div>
@@ -248,14 +461,153 @@
     const titleEl  = document.getElementById('scenarioTitle');
     const captionEl = document.getElementById('scenarioCaption');
 
+    // Per-step scheduler telemetry (heavy-step / budget-overrun /
+    // host-oversleep) floods the panel — often 95%+ of lines on a
+    // graph that runs near the tick budget. It's perf noise, not
+    // player-facing signal, so keep it out of the log. The kernel still
+    // emits it; we just don't render it here.
+    const LOG_NOISE = /MON_HEAVY_STEP|MON_BUDGET_OVERRUN|MON_HOST_OVERSLEEP/;
+    const LOG_MAX_LINES = 400;
     function append(text, cls = '') {
+      if (LOG_NOISE.test(text)) return;
       const span = document.createElement('span');
       if (cls) span.className = cls;
       span.textContent = text + '\n';
       logEl.appendChild(span);
+      // Bound DOM growth — a long-running emulator would otherwise leak
+      // unbounded log nodes.
+      while (logEl.childNodes.length > LOG_MAX_LINES) {
+        logEl.removeChild(logEl.firstChild);
+      }
       logEl.scrollTop = logEl.scrollHeight;
     }
     function setStatus(t) { statusEl.textContent = t; }
+
+    // Debug-log collapse toggle. Collapsed by default (see the markup's
+    // `class="collapsed"`) so the display owns the screen; the button
+    // expands it on demand and relabels itself.
+    const debugEl = document.getElementById('debug');
+    const debugToggle = document.getElementById('debug-toggle');
+    if (debugToggle && debugEl) {
+      debugToggle.addEventListener('click', () => {
+        const collapsed = debugEl.classList.toggle('collapsed');
+        debugToggle.textContent = collapsed ? 'Show log' : 'Hide log';
+      });
+    }
+
+    // ── Input: keyboard + on-screen touch controls ────────────────────
+    //
+    // `wasm_browser_dom_input` drains this queue via `host_input_pop`.
+    // The wire shape it expects: a `keyCode` whose bit 15 is the
+    // pressed/released flag (host_input_pop writes key_lo/key_hi; the
+    // consumer reads `pressed = key_hi & 0x80`, `code = low 15 bits`).
+    // This queue is passed to buildHostImports below; previously nothing
+    // fed it, so the wasm player had no working input at all.
+    const inputQueue = [];
+    const PRESSED_BIT = 0x8000;
+    function pushKey(code, down) {
+      inputQueue.push({ keyCode: (code & 0x7fff) | (down ? PRESSED_BIT : 0), modifiers: 0 });
+    }
+    // Physical keyboard → queue. Dedupe auto-repeat by tracking held
+    // codes, and swallow the default action (scroll on arrows/space) so
+    // the page stays put while playing.
+    const heldKeys = new Set();
+    window.addEventListener('keydown', (e) => {
+      const c = e.keyCode || e.which;
+      if (!c) return;
+      if (!heldKeys.has(c)) { heldKeys.add(c); pushKey(c, true); }
+      if ([13, 16, 32, 37, 38, 39, 40].includes(c)) e.preventDefault();
+    });
+    window.addEventListener('keyup', (e) => {
+      const c = e.keyCode || e.which;
+      if (!c) return;
+      heldKeys.delete(c);
+      pushKey(c, false);
+    });
+
+    // Player mode: when the scenario declares `presentation.controls`,
+    // build the canvas + on-screen control layout that mirrors the
+    // WebSocket split page (browser_surface.css). Returns the `.stage`
+    // element the canvas sink should mount into, or null if the scenario
+    // has no controls (the generic surface flow then applies unchanged).
+    const CONTROL_LABELS = {
+      up: '▲', down: '▼', left: '◀', right: '▶',
+      a: 'A', b: 'B', x: 'X', y: 'Y',
+      select: 'SEL', start: 'START',
+    };
+    const DPAD_ITEMS = ['up', 'left', 'right', 'down'];
+    const DPAD_POS = { up: 'pad-up', left: 'pad-left', right: 'pad-right', down: 'pad-down' };
+    const GROUP_CLASS = { dpad: 'dpad', menu: 'menu-buttons', face: 'face-buttons', row: 'row-buttons' };
+
+    function controlLabel(c) {
+      return CONTROL_LABELS[c] != null ? CONTROL_LABELS[c] : String(c).toUpperCase();
+    }
+
+    function setupPlayerMode(scenario) {
+      const pres = scenario.presentation || {};
+      const groups = pres.controls;
+      if (!Array.isArray(groups) || groups.length === 0) return null;
+      const keymap = pres.keymap || {};
+      const theme = pres.theme || {};
+
+      document.body.classList.add('player-mode');
+      const setVar = (name, val) => { if (val != null) document.body.style.setProperty(name, String(val)); };
+      setVar('--surface-bg', theme.surface_bg);
+      setVar('--surface-fg', theme.surface_fg);
+      setVar('--canvas-bg', theme.canvas_bg);
+      setVar('--canvas-aspect', theme.canvas_aspect);
+
+      const stage = document.createElement('div');
+      stage.className = 'stage';
+
+      const controls = document.createElement('div');
+      controls.className = 'controls';
+      controls.setAttribute('aria-label', 'game controls');
+
+      const bindButton = (btn, code) => {
+        if (code == null) return;
+        const press = (ev) => { ev.preventDefault(); btn.classList.add('active'); pushKey(code, true); };
+        const release = () => { btn.classList.remove('active'); pushKey(code, false); };
+        btn.addEventListener('pointerdown', (ev) => { btn.setPointerCapture(ev.pointerId); press(ev); });
+        btn.addEventListener('pointerup', release);
+        btn.addEventListener('pointercancel', release);
+        btn.addEventListener('pointerleave', (ev) => { if (ev.buttons) release(); });
+      };
+
+      for (const g of groups) {
+        const cls = GROUP_CLASS[g.kind];
+        if (!cls) continue;
+        const items = g.kind === 'dpad' ? (g.items || DPAD_ITEMS) : (g.items || []);
+        const box = document.createElement('div');
+        box.className = cls;
+        if (g.kind === 'dpad') box.setAttribute('aria-label', 'direction pad');
+        if (g.kind === 'face' && items.length) {
+          box.style.gridTemplateColumns = `repeat(${items.length}, 1fr)`;
+          box.style.aspectRatio = String(items.length);
+        } else if (g.kind === 'row' && items.length) {
+          box.style.gridTemplateColumns = `repeat(${items.length}, minmax(32px, 1fr))`;
+        } else if (g.kind === 'menu' && items.length && items.length !== 2) {
+          box.style.gridTemplateColumns = `repeat(${items.length}, 1fr)`;
+        }
+        for (const control of items) {
+          const btn = document.createElement('button');
+          btn.className = 'pad-button';
+          if (g.kind === 'dpad' && DPAD_POS[control]) btn.classList.add(DPAD_POS[control]);
+          btn.type = 'button';
+          btn.setAttribute('data-control', control);
+          btn.setAttribute('aria-label', control);
+          btn.textContent = controlLabel(control);
+          bindButton(btn, keymap[control]);
+          box.appendChild(btn);
+        }
+        controls.appendChild(box);
+      }
+
+      document.body.appendChild(stage);
+      document.body.appendChild(controls);
+      return stage;
+    }
+    let playerStage = null;
 
     // Copy-log-to-clipboard. Uses the modern Clipboard API when
     // available (browsers permit it from a user-gesture handler),
@@ -616,7 +968,9 @@
       // surface; everything else (audio, input) doesn't need a DOM
       // mount but the shim accepts the display container as a fallback
       // for any module that decides to mount its own widget.
-      const displayEl = surfacesByRole.get('display') || surfacesByRole.get('player') || document.body;
+      // In player mode the canvas mounts into our `.stage`; otherwise it
+      // falls back to the generic display/player surface.
+      const displayEl = playerStage || surfacesByRole.get('display') || surfacesByRole.get('player') || document.body;
 
       const imports = window.fluxor.buildHostImports({
         getKernel: () => kernel,
@@ -629,6 +983,10 @@
         canvasContainer: displayEl,
         fetchUrlOverride: (req) => currentAssetUrl || req,
         assetBank: bundleAssetBank,
+        // Feeds wasm_browser_dom_input via host_input_pop (keyboard +
+        // on-screen touch controls). Without this the queue is empty and
+        // the player has no input.
+        inputQueue,
       });
 
       const instance = await WebAssembly.instantiate(bundleModule, imports);
@@ -731,10 +1089,90 @@
       return [];
     }
 
+    // Mount the generic browser-overlay renderer when the scenario
+    // carries a `presentation.shell` descriptor. Strictly additive:
+    // scenarios without a `shell` block are untouched, and any mount
+    // failure is logged, never fatal. The renderer itself lives in
+    // browser_overlay_runtime.js, inlined at the end of <body>.
+    // Resolve the shell's `lists:` declaration map into the option-row
+    // arrays the renderer consumes. Per RFC §17.3 the descriptor's
+    // `lists:` only maps a list name to a *feed name* (e.g.
+    // `{ queue: "media_queue" }`); the actual rows arrive as a bounded,
+    // versioned list-feed snapshot. The renderer iterates
+    // `opts.lists[name]` as option rows, so passing the raw declaration
+    // (a string) would render one <option> per character. Resolve here:
+    //   - an inline array value is taken as-is (simple/test configs);
+    //   - an object carrying `options`/`items` uses that array;
+    //   - a string is a feed reference, looked up in the current
+    //     snapshot source (`window.__fluxor_list_snapshots[feed]` or a
+    //     static `presentation.list_data[feed]`), else an empty window
+    //     until the feed publishes.
+    // Returns a name -> option-row-array map; never a bare string.
+    function resolveShellLists(scenario) {
+      const presentation = scenario.presentation || {};
+      const shell = presentation.shell || {};
+      const decls = (shell.lists && typeof shell.lists === 'object') ? shell.lists : null;
+      const snapshots = window.__fluxor_list_snapshots || {};
+      const staticData = (presentation.list_data && typeof presentation.list_data === 'object')
+        ? presentation.list_data : {};
+      const out = {};
+      if (!decls) return out;
+      for (const name of Object.keys(decls)) {
+        const decl = decls[name];
+        if (Array.isArray(decl)) { out[name] = decl; continue; }
+        if (decl && typeof decl === 'object') {
+          if (Array.isArray(decl.options)) { out[name] = decl.options; continue; }
+          if (Array.isArray(decl.items)) { out[name] = decl.items; continue; }
+          out[name] = []; continue;
+        }
+        if (typeof decl === 'string') {
+          const snap = snapshots[decl] || staticData[decl];
+          out[name] = Array.isArray(snap) ? snap
+            : (snap && Array.isArray(snap.entries)) ? snap.entries : [];
+          continue;
+        }
+        out[name] = [];
+      }
+      return out;
+    }
+
+    function mountOverlayIfPresent(scenario, surfacesByRole) {
+      const shell = scenario.presentation && scenario.presentation.shell;
+      if (!shell || typeof window.FluxorOverlay === 'undefined') return;
+      try {
+        const container = document.createElement('div');
+        container.id = 'fx-overlay-root';
+        container.style.position = 'absolute';
+        container.style.inset = '0';
+        container.style.pointerEvents = 'none';
+        document.body.appendChild(container);
+        // Controls capture their own pointer events; the content zone
+        // stays click-through so the underlying surface still works.
+        const lists = resolveShellLists(scenario);
+        window.__fluxor_overlay = window.FluxorOverlay.mount({
+          shell: shell,
+          browser_overlay: scenario.presentation.browser_overlay,
+          lists: lists,
+          mountEl: container,
+          sinks: window.FluxorOverlay.makeHostSinks(window),
+        });
+        append('[overlay] presentation.shell mounted (' +
+          (shell.media_profile || 'custom') + ')', 'info');
+      } catch (e) {
+        append('[overlay] mount skipped: ' + e.message, 'err');
+      }
+    }
+
     (async () => {
       try {
         const scenario = await loadScenario();
         const surfacesByRole = composeDom(scenario);
+        // Player mode (scenarios with `presentation.controls`): build the
+        // canvas+controls layout that matches the WebSocket split page and
+        // route input. Returns the stage the canvas mounts into; null
+        // leaves the generic surface flow untouched.
+        playerStage = setupPlayerMode(scenario);
+        mountOverlayIfPresent(scenario, surfacesByRole);
         const playlistUrls = await resolvePlaylist(scenario);
 
         // Hand off to the role-specific navigator. We pick the
@@ -758,5 +1196,6 @@
       }
     })();
   </script>
+  <!--FLUXOR_OVERLAY_RUNTIME-->
 </body>
 </html>

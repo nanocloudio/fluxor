@@ -170,6 +170,161 @@
       },
     };
 
+    // ── object shim (host_object_*, storage.object range reads) ──────
+    // Backs the wasm `storage.object` provider (`src/platform/wasm/
+    // object.rs`). Adds bounded `Range:` reads + `HEAD` metadata on top
+    // of the same fetch model as `fetchShim`. `host_object_head` and
+    // `host_object_range_open` are idempotent per identity so a
+    // provider call that returns EAGAIN and retries re-finds the same
+    // in-flight request instead of issuing a duplicate fetch.
+    const objects = new Map(); // handle -> entry
+    const headByKey = new Map(); // url -> handle
+    const rangeByKey = new Map(); // `${url}\0${off}\0${len}` -> handle
+    let nextObjectHandle = 1;
+
+    // Encode [size:u64 LE][mtime:u64 LE] into a fresh 16-byte view.
+    const encodeMeta = (size, mtimeSec) => {
+      const meta = new Uint8Array(16);
+      const dv = new DataView(meta.buffer);
+      dv.setBigUint64(0, BigInt(size >>> 0 === size ? size : Math.floor(size)), true);
+      dv.setBigUint64(8, BigInt(Math.max(0, Math.floor(mtimeSec))), true);
+      return meta;
+    };
+
+    const objectShim = {
+      host_object_head: (keyPtr, keyLen) => {
+        try {
+          let url = kstr(keyPtr, keyLen);
+          if (fetchUrlOverride) url = fetchUrlOverride(url);
+          const existing = headByKey.get(url);
+          if (existing !== undefined) return existing;
+
+          const handle = nextObjectHandle++;
+          // A HEAD stream's queue carries exactly the 16-byte meta
+          // record; `recv` drains it once ready.
+          const entry = { reader: null, queue: [], eof: false, bytes: 0, isHead: true };
+          objects.set(handle, entry);
+          headByKey.set(url, handle);
+
+          if (url.startsWith('asset://')) {
+            const bytes = assetBank.get(url.slice('asset://'.length));
+            if (!bytes) { entry.eof = true; return handle; }
+            entry.queue.push(encodeMeta(bytes.byteLength, 0));
+            entry.eof = true;
+            return handle;
+          }
+
+          fetch(url, { method: 'HEAD' }).then((resp) => {
+            if (!resp.ok) { entry.eof = true; return; }
+            const cl = parseInt(resp.headers.get('content-length') || '0', 10) || 0;
+            const lm = resp.headers.get('last-modified');
+            const mtime = lm ? Math.floor(Date.parse(lm) / 1000) : 0;
+            entry.queue.push(encodeMeta(cl, mtime));
+            entry.eof = true;
+          }).catch((err) => {
+            entry.eof = true;
+            console.error(`host_object_head: ${err.message} for ${url}`);
+          });
+          return handle;
+        } catch (err) {
+          console.error(`host_object_head threw: ${err.message}`);
+          return -1;
+        }
+      },
+
+      host_object_range_open: (keyPtr, keyLen, offset, length) => {
+        try {
+          let url = kstr(keyPtr, keyLen);
+          if (fetchUrlOverride) url = fetchUrlOverride(url);
+          const off = Number(offset);
+          const len = Number(length);
+          const idKey = `${url}\0${off}\0${len}`;
+          const existing = rangeByKey.get(idKey);
+          if (existing !== undefined) return existing;
+
+          const handle = nextObjectHandle++;
+          const entry = { reader: null, queue: [], eof: false, bytes: 0, isHead: false, idKey };
+          objects.set(handle, entry);
+          rangeByKey.set(idKey, handle);
+
+          if (url.startsWith('asset://')) {
+            const bytes = assetBank.get(url.slice('asset://'.length));
+            if (!bytes) { entry.eof = true; return handle; }
+            const end = Math.min(bytes.byteLength, off + len);
+            if (off < end) entry.queue.push(bytes.subarray(off, end));
+            entry.eof = true;
+            return handle;
+          }
+
+          // Inclusive end byte per RFC 9110 §14.1.
+          const range = `bytes=${off}-${off + len - 1}`;
+          fetch(url, { headers: { Range: range } }).then(async (resp) => {
+            if (!resp.ok) { entry.eof = true; return; }
+            // 206 Partial Content → body IS the requested window. 200 OK
+            // → the server ignored `Range` and sent the whole object from
+            // byte 0, so we must skip `off` bytes and cap at `len`
+            // locally; otherwise a nonzero-offset read returns the wrong
+            // bytes. `remaining` also caps 206 in case a server over-sends.
+            let skip = resp.status === 206 ? 0 : off;
+            let remaining = len;
+            const reader = resp.body.getReader();
+            entry.reader = reader;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) { entry.eof = true; break; }
+              let chunk = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+              if (skip > 0) {
+                if (chunk.length <= skip) { skip -= chunk.length; continue; }
+                chunk = chunk.subarray(skip);
+                skip = 0;
+              }
+              if (chunk.length > remaining) chunk = chunk.subarray(0, remaining);
+              if (chunk.length === 0) { entry.eof = true; break; }
+              entry.queue.push(chunk);
+              entry.bytes += chunk.length;
+              remaining -= chunk.length;
+              if (remaining <= 0) { entry.eof = true; try { reader.cancel().catch(() => {}); } catch (_) {} break; }
+            }
+          }).catch((err) => {
+            entry.eof = true;
+            console.error(`host_object_range_open: ${err.message} for ${url}`);
+          });
+          return handle;
+        } catch (err) {
+          console.error(`host_object_range_open threw: ${err.message}`);
+          return -1;
+        }
+      },
+
+      host_object_recv: (handle, bufPtr, bufLen) => {
+        const entry = objects.get(handle);
+        if (!entry) return -2;
+        if (entry.queue.length === 0) return entry.eof ? -1 : 0;
+        const chunk = entry.queue[0];
+        const n = Math.min(chunk.length, bufLen);
+        kview(bufPtr, n).set(chunk.subarray(0, n));
+        if (n >= chunk.length) entry.queue.shift();
+        else entry.queue[0] = chunk.subarray(n);
+        return n;
+      },
+
+      host_object_close: (handle) => {
+        const entry = objects.get(handle);
+        if (!entry) return 0;
+        if (entry.reader && !entry.eof) {
+          try { entry.reader.cancel().catch(() => {}); } catch (_) {}
+        }
+        // Drop idempotency index entries so a later request re-fetches.
+        if (entry.isHead) {
+          for (const [k, h] of headByKey) if (h === handle) { headByKey.delete(k); break; }
+        } else if (entry.idKey !== undefined) {
+          rangeByKey.delete(entry.idKey);
+        }
+        objects.delete(handle);
+        return 0;
+      },
+    };
+
     // ── Legacy omnibus input drain (wasm_browser_dom_input) ──────────
     // Kept for graphs that still wire the old combined module. New
     // graphs use the per-class modules below.
@@ -281,6 +436,25 @@
       },
     };
 
+    // ACTION source — wasm_browser_action. The presentation-shell
+    // overlay (browser_overlay_runtime.js) pushes one record per
+    // activated media/transport/gallery control:
+    //   { hash: fnv1a32(action_id), value: <number> }
+    // `host_action_pop` serialises it as [hash:u32 LE][value:f32 LE]
+    // (8 bytes); the built-in maps the hash to an FMP verb.
+    const actionQueue = window.__fluxor_action_queue
+      || (window.__fluxor_action_queue = []);
+    const actionShim = {
+      host_action_pop: (bufPtr, bufLen) => {
+        if (actionQueue.length === 0 || bufLen < 8) return 0;
+        const ev = actionQueue.shift();
+        const view = new DataView(getKernel().exports.memory.buffer, bufPtr, 8);
+        view.setUint32(0, (ev.hash >>> 0), true);
+        view.setFloat32(4, Number(ev.value) || 0, true);
+        return 8;
+      },
+    };
+
     // ── WebSocket (wasm_browser_websocket) ───────────────────────────
     const wsSockets = new Map();
     let nextWsHandle = 1;
@@ -359,6 +533,17 @@
     // call and locked to the source sample rate.
     let audioCtx = null;
     let audioSchedTime = 0;
+    // Scheduling cushion. The kernel emits PCM in bursts (tied to the
+    // requestAnimationFrame step loop), so blocks must be queued ahead of
+    // the audio clock — otherwise any late block underruns and clicks.
+    // With the producer rate fixed at the source (gb_core now paces at a
+    // true 59.726 Hz and ships the APU's exact per-frame sample count),
+    // this cushion only has to absorb short scheduling jitter — rAF
+    // granularity and the odd GC pause — not a steady drift. ~120ms is
+    // ample for that at a low latency. MAX_AHEAD caps the queue so a
+    // transient burst can't grow latency without bound.
+    const AUDIO_LOOKAHEAD = 0.12;
+    const AUDIO_MAX_AHEAD = 0.4;
     function ensureAudio(sampleRate) {
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
@@ -373,18 +558,23 @@
     // context is gone and `host_audio_play` silently drops them.
     // A one-shot document listener pre-creates and resumes the
     // context inside the first gesture, before any PCM is queued.
+    const UNLOCK_EVENTS = ['pointerdown', 'pointerup', 'click', 'keydown', 'touchstart', 'touchend'];
+    function removeUnlockListeners() {
+      for (const e of UNLOCK_EVENTS) document.removeEventListener(e, unlockAudioOnGesture, true);
+    }
     function unlockAudioOnGesture() {
       const ctx = ensureAudio(44100);
-      if (ctx.state === 'suspended') {
-        ctx.resume().catch(() => {});
-      }
-      document.removeEventListener('pointerdown', unlockAudioOnGesture, true);
-      document.removeEventListener('keydown',     unlockAudioOnGesture, true);
-      document.removeEventListener('touchstart',  unlockAudioOnGesture, true);
+      if (ctx.state === 'running') { removeUnlockListeners(); return; }
+      // resume() must run inside the gesture's call stack. Only stop
+      // listening once it has actually taken effect — a single failed or
+      // ignored attempt must NOT disarm the unlock, or audio stays dead
+      // for the rest of the session (the original bug: listeners were
+      // removed after the first gesture regardless of the outcome).
+      ctx.resume().then(() => {
+        if (ctx.state === 'running') removeUnlockListeners();
+      }).catch(() => {});
     }
-    document.addEventListener('pointerdown', unlockAudioOnGesture, true);
-    document.addEventListener('keydown',     unlockAudioOnGesture, true);
-    document.addEventListener('touchstart',  unlockAudioOnGesture, true);
+    for (const e of UNLOCK_EVENTS) document.addEventListener(e, unlockAudioOnGesture, true);
 
     // Diagnostic counters (surfaced once per second through onLog).
     let audioPlayCalls = 0;
@@ -392,6 +582,7 @@
     let audioPlayBytesDropped  = 0;
     let audioPlayLastSurfaced  = 0;
     let audioPeakAbs = 0;
+    let audioUnderruns = 0;
     function surfaceAudioStats() {
       const now = performance.now();
       if ((now - audioPlayLastSurfaced) < 1000) return;
@@ -400,8 +591,8 @@
       const ctxRate  = audioCtx ? audioCtx.sampleRate : 0;
       onLog(2,
         `[audio] calls=${audioPlayCalls} bytes_played=${audioPlayBytesAccepted}` +
-        ` bytes_dropped=${audioPlayBytesDropped} peak=${audioPeakAbs}` +
-        ` ctx=${ctxState} hw_rate=${ctxRate}`);
+        ` bytes_dropped=${audioPlayBytesDropped} underruns=${audioUnderruns}` +
+        ` peak=${audioPeakAbs} ctx=${ctxState} hw_rate=${ctxRate}`);
       audioPeakAbs = 0;
     }
 
@@ -410,6 +601,11 @@
         audioPlayCalls++;
         const ctx = ensureAudio(sampleRate);
         if (ctx.state !== 'running') {
+          // Context not resumed yet (autoplay policy). Re-attempt the
+          // resume opportunistically — host_audio_play runs every frame,
+          // so the moment a user gesture has happened this catches up
+          // and starts playback instead of dropping forever.
+          if (ctx.state === 'suspended') ctx.resume().catch(() => {});
           audioPlayBytesDropped += len;
           surfaceAudioStats();
           return;
@@ -432,7 +628,18 @@
         src.buffer = buf;
         src.connect(ctx.destination);
         const now = ctx.currentTime;
-        if (audioSchedTime < now) audioSchedTime = now;
+        // Underrun: the queue drained to (or below) the clock since the
+        // last block — a gap was emitted. Restart AHEAD of the clock so
+        // the next blocks have a cushion again, instead of butting right
+        // up against `now` (which underruns again on the next late block).
+        if (audioSchedTime < now + 0.005) {
+          audioSchedTime = now + AUDIO_LOOKAHEAD;
+          audioUnderruns++;
+        } else if (audioSchedTime > now + AUDIO_MAX_AHEAD) {
+          // Producer running ahead of real time — let it ride; the queue
+          // is bounded by how fast PCM actually arrives.
+          audioSchedTime = now + AUDIO_MAX_AHEAD;
+        }
         src.start(audioSchedTime);
         audioSchedTime += frames / sampleRate;
         audioPlayBytesAccepted += len;
@@ -697,11 +904,13 @@
         {},
         universal,
         fetchShim,
+        objectShim,
         inputShim,
         keyboardShim,
         pointerShim,
         buttonShim,
         gamepadShim,
+        actionShim,
         wsShim,
         audioShim,
         canvasShim,

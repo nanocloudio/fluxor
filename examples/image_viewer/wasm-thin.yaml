@@ -61,4 +61,4 @@ wiring:
   - from: gesture.commands
     to: ws.tx
   - from: ws.rx
-    to: display.raster
+    to: display.pixels

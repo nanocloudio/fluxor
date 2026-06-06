@@ -1,4 +1,4 @@
-# Image Viewer — pure-wasm (full browser, self-contained).
+# Image Viewer — pure-wasm, SHELL-DRIVEN (overlay controls drive bank).
 #
 # All four image_viewer variants share the same overall shape:
 # `input → bank → codec → display`. Only where each stage runs
@@ -45,7 +45,7 @@ target: wasm
 # synthesised `fluxor-linux` host process serves the bundle, then
 # the browser kernel takes over end-to-end.
 scenario:
-  name: image_viewer
+  name: image_viewer_shell
   host:
     port: 9876
   bindings:
@@ -77,12 +77,10 @@ presentation:
   # them out responsively around the display — prev on the leading
   # edge, next on the trailing edge, never over the image.
   #
-  # Both input paths drive `bank`: the existing DOM-tap nav
-  # (nav → gesture → bank) AND these overlay controls
-  # (overlay → actionnav → bank), fanned in on `bank.commands`. The
-  # Prev/Next controls emit `action.gallery.*` InputActions which
-  # `wasm_browser_action` (the `actionnav` module below) maps to FMP
-  # next/prev.
+  # SHELL-DRIVEN: these gallery controls are the only navigation. Each
+  # tap emits an `action.gallery.*` InputAction → `wasm_browser_action`
+  # → FMP next/prev → `bank`. Verified live: tapping Next advances bank
+  # (cmd_rx + idx increment per tap).
   shell:
     version: 1
     media_profile: gallery
@@ -104,25 +102,12 @@ presentation:
       safe_area: required
 
 modules:
-  # BUTTON capability driver — wasm equivalent of `flash_rp`. DOM
-  # taps on the display surface become one-byte transitions on
-  # `raw`. Same shape every other platform's button driver emits.
-  - name: nav
-    type: wasm_browser_button
-
-  # Cross-platform click counter → FMP commands. Image-gallery
-  # mapping: single tap → next, double tap → prev. Audio_player
-  # remaps the same module to single→toggle, double→next — same
-  # logic, different verbs.
-  - name: gesture
-    click: next
-    double_click: prev
-    triple_click: prev
-
-  # Browser-overlay action source: the shell's Prev/Next gallery
-  # controls → `action.gallery.*` → FMP next/prev → bank. Fans in with
-  # `gesture` on `bank.commands` (the kernel inserts a `_merge`), so
-  # both DOM taps and overlay buttons navigate.
+  # Browser-overlay action source — the SOLE commands producer in this
+  # shell-driven variant. The overlay's Prev/Next gallery controls emit
+  # `action.gallery.{previous,next}`, which this bridges to FMP
+  # `prev`/`next` for `bank`. (The canonical wasm.yaml keeps the DOM-tap
+  # nav→gesture path instead; fan-in of both into one ctrl input is a
+  # separate kernel concern.)
   - name: actionnav
     type: wasm_browser_action
 
@@ -153,10 +138,6 @@ modules:
     height: 540
 
 wiring:
-  - from: nav.raw
-    to: gesture.raw
-  - from: gesture.commands
-    to: bank.commands
   - from: actionnav.commands
     to: bank.commands
   - from: bank.stream

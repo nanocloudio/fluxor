@@ -151,6 +151,9 @@ pub mod contracts {
         pub mod midi {
             include!("contracts/input/midi.rs");
         }
+        pub mod action {
+            include!("contracts/input/action.rs");
+        }
     }
 }
 

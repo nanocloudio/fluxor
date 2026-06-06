@@ -56,6 +56,37 @@ presentation:
   surfaces:
     - { id: deck, role: player, module: audio_out }
 
+  # Declarative browser-overlay shell (RFC browser_overlay) — a `music`
+  # profile rendered by the generic overlay runtime: transport row plus
+  # a status-driven progress scrubber and a volume slider, laid out
+  # below the deck. Both the existing DOM-tap nav (nav → gesture → bank)
+  # and these transport controls (overlay → actionnav → bank) drive
+  # playback, fanned in on `bank.commands`. The transport buttons emit
+  # `action.transport.{previous,toggle,next}` which `wasm_browser_action`
+  # maps to FMP prev/toggle/next. (The scrubber renders from a
+  # `PresentationStatus` feed once a coordinator publishes one; seek /
+  # set_volume have no FMP-verb equivalent so they reach the action hook
+  # only — see RFC §29 open question on PresentationStatus.)
+  shell:
+    version: 1
+    media_profile: music
+    context: active
+    status_feed: media_status
+    controls:
+      - { id: prev, kind: button, placement: primary_start, label: "‹‹",
+          action: action.transport.previous }
+      - { id: toggle, kind: toggle, placement: secondary, label: "Play/Pause",
+          action: action.transport.toggle, status_field: playback_state }
+      - { id: next, kind: button, placement: primary_end, label: "››",
+          action: action.transport.next }
+      - { id: progress, kind: scrubber, placement: secondary,
+          action: action.transport.seek_absolute, status_field: position }
+      - { id: volume, kind: slider, placement: drawer,
+          action: action.transport.set_volume }
+
+  browser_overlay:
+    version: 1
+
 modules:
   # BUTTON capability driver — wasm equivalent of `flash_rp`. DOM
   # taps on the player surface become one-byte transitions on
@@ -67,6 +98,12 @@ modules:
   # (the gesture defaults): single tap = toggle, double = next,
   # triple = prev.
   - name: gesture
+
+  # Browser-overlay action source: the shell's transport controls →
+  # `action.transport.*` → FMP prev/toggle/next → bank. Fans in with
+  # `gesture` on `bank.commands`.
+  - name: actionnav
+    type: wasm_browser_action
 
   # Asset bank cursor. `path_*` enumerates the library; bank cycles
   # through them in response to `next`/`prev`/`select` FMP commands
@@ -98,6 +135,8 @@ wiring:
   - from: nav.raw
     to: gesture.raw
   - from: gesture.commands
+    to: bank.commands
+  - from: actionnav.commands
     to: bank.commands
   - from: bank.stream
     to: codec.encoded

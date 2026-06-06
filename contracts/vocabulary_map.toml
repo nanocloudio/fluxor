@@ -1,0 +1,315 @@
+# GENERATED — do not edit by hand.
+#
+# Source of truth: fluxor-contracts `vocabulary.rs::RENAME_MAP`.
+# Regenerate after editing the map with:
+#   REGEN_VOCABULARY_MAP=1 cargo test -p fluxor-tools --test vocabulary_map_drift
+#
+# Machine-readable capability/surface migration map
+# (.context/rfc_capability_refinement.md §8.7). Siblings consume this
+# file instead of hand-copying vocabulary constants. Per decision 16 it
+# is a *rename* map: there are no alias or deprecation-window fields.
+#
+# Schema per entry: legacy, canonical, layer
+# (wire_content | surface | role | provider | fact), kind
+# (rename | doc_only), mechanical (false = needs per-site judgement).
+
+[[entry]]
+legacy     = "frame"
+canonical  = "net.frame"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "frame.wifi"
+canonical  = "net.frame.wifi"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "frame.ethernet"
+canonical  = "net.frame.ethernet"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "link.wifi"
+canonical  = "net.link.wifi"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "packet.net"
+canonical  = "transport.packet"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "security.dtls13"
+canonical  = "security.dtls13.datagram"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "audio.out"
+canonical  = "audio.output"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "audio.in"
+canonical  = "audio.capture"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "display.touch"
+canonical  = "input.touch"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "display.protected_scanout"
+canonical  = "display.scanout.protected"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "video.protected_decode"
+canonical  = "video.decode.protected"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "audio.protected_out"
+canonical  = "audio.output.protected"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "audio.rate_trim"
+canonical  = "audio.output.rate_trim"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "media.protected_path"
+canonical  = "media.path.protected"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "capture.protected_in"
+canonical  = "capture.input.protected"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "replicated_state_machine"
+canonical  = "replication.state_machine"
+layer      = "role"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "socket"
+canonical  = "transport.stream"
+layer      = "surface"
+kind       = "rename"
+mechanical = false
+
+[[entry]]
+legacy     = "display.still"
+canonical  = "display.scanout"
+layer      = "role"
+kind       = "rename"
+mechanical = false
+
+[[entry]]
+legacy     = "display.video"
+canonical  = "display.scanout"
+layer      = "role"
+kind       = "rename"
+mechanical = false
+
+[[entry]]
+legacy     = "audio.pcm"
+canonical  = "audio.sample"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "display.draw"
+canonical  = "video.draw"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "display.touch_event"
+canonical  = "input.touch_event"
+layer      = "surface"
+kind       = "rename"
+mechanical = false
+
+[[entry]]
+legacy     = "audio.pcm"
+canonical  = "AudioSample"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "audio.encoded"
+canonical  = "AudioEncoded"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "display.draw"
+canonical  = "VideoDraw"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "frame.ethernet"
+canonical  = "EthernetFrame"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "control.fmp"
+canonical  = "FmpMessage"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.stream.cmd.v1"
+canonical  = "NetStreamCmdV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.stream.evt.v1"
+canonical  = "NetStreamEvtV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.datagram.tx.v1"
+canonical  = "NetDatagramTxV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.datagram.rx.v1"
+canonical  = "NetDatagramRxV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.packet.v1"
+canonical  = "NetPacketV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.mux.cmd.v1"
+canonical  = "NetMuxCmdV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.mux.evt.v1"
+canonical  = "NetMuxEvtV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "net.session.ctrl.v1"
+canonical  = "NetSessionCtrlV1"
+layer      = "wire_content"
+kind       = "doc_only"
+mechanical = true
+
+[[entry]]
+legacy     = "storage.block.v1"
+canonical  = "storage.block"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "buffer.lease_ring.v1"
+canonical  = "buffer.lease_ring"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "net.stream.scaled.v1"
+canonical  = "transport.stream"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "net.packet.v1"
+canonical  = "transport.packet"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "fpga.region.v1"
+canonical  = "fpga_region"
+layer      = "provider"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "accelerator.queue.v1"
+canonical  = "accelerator.queue"
+layer      = "surface"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "namespace"
+canonical  = "storage.namespace"
+layer      = "provider"
+kind       = "rename"
+mechanical = true
+
+[[entry]]
+legacy     = "object"
+canonical  = "storage.object"
+layer      = "provider"
+kind       = "rename"
+mechanical = true

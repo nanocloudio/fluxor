@@ -216,3 +216,231 @@ pub const PUT_STREAMED_COMMIT: u32 = 0x1428;
 /// not observe any appended chunks. After ABORT the handle is
 /// released — callers do not need to `CLOSE`.
 pub const PUT_STREAMED_ABORT: u32 = 0x1429;
+
+/// Host-neutral helpers shared by the platform `storage.object`
+/// adapters that back `HEAD` / `RANGE_GET` with browser `fetch()`
+/// (wasm) and `Range:` requests (linux). The four browser host
+/// bindings named by the Playload RFC §12.3 — `host_object_head`,
+/// `host_object_range_open`, `host_object_recv`, `host_object_close`
+/// — and their Linux peers all reduce to the same three concerns:
+/// clamping a requested window against the object size, encoding the
+/// `HEAD` metadata record, and formatting an HTTP byte-range. Keeping
+/// that logic here (no_std, no alloc, no host calls) is what lets it
+/// be unit-tested off-target; the per-platform providers are thin
+/// transport wrappers over these functions.
+pub mod range {
+    /// A requested byte window resolved against a known object size.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Resolved {
+        /// First byte to read. Clamped to `object_size` when the
+        /// request starts at or past the end (yields `count == 0`).
+        pub start: u64,
+        /// Number of bytes actually available in the window — `length`
+        /// for a fully-in-bounds request, `object_size - start` for a
+        /// tail request that runs off the end, `0` for an empty
+        /// (`length == 0`) or wholly out-of-bounds request.
+        pub count: u64,
+        /// `true` when this window reaches the end of the object, so a
+        /// reader knows no further range follows.
+        pub eof_after: bool,
+    }
+
+    /// Clamp a `[offset, offset+length)` request against `object_size`.
+    ///
+    /// Three shapes matter to callers and tests:
+    /// - **empty** — `length == 0` → `count == 0` (a HEAD-style probe).
+    /// - **partial** — fully in bounds → `count == length`.
+    /// - **tail** — starts in bounds but runs off the end → `count`
+    ///   trimmed to `object_size - offset`.
+    ///
+    /// A request whose `offset >= object_size` is wholly out of bounds:
+    /// `start` is pinned to `object_size` and `count` is `0` (the
+    /// provider surfaces this as a zero-byte read / `416`-style state,
+    /// not an error here).
+    pub fn resolve(offset: u64, length: u64, object_size: u64) -> Resolved {
+        if offset >= object_size {
+            return Resolved {
+                start: object_size,
+                count: 0,
+                eof_after: true,
+            };
+        }
+        // `offset < object_size`, so the subtraction can't underflow.
+        let max_avail = object_size - offset;
+        let count = if length > max_avail { max_avail } else { length };
+        Resolved {
+            start: offset,
+            count,
+            eof_after: offset + count >= object_size,
+        }
+    }
+
+    /// Tracks how many bytes of a resolved window remain to be drained
+    /// across repeated `host_object_recv` calls. The provider owns the
+    /// actual byte transport; this only does the bounded accounting so
+    /// a recv never over-reads its window and EOF is reported exactly
+    /// once the window is exhausted.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Cursor {
+        remaining: u64,
+    }
+
+    impl Cursor {
+        /// A cursor over a freshly-resolved window.
+        pub fn new(resolved: Resolved) -> Self {
+            Cursor {
+                remaining: resolved.count,
+            }
+        }
+
+        /// Bytes still owed on this window.
+        pub fn remaining(&self) -> u64 {
+            self.remaining
+        }
+
+        /// Whether the window is fully drained.
+        pub fn is_eof(&self) -> bool {
+            self.remaining == 0
+        }
+
+        /// Reserve up to `want` bytes for the next recv, never more
+        /// than the window has left. Decrements the cursor by the
+        /// granted amount and returns it. A `want` of `0`, or a call
+        /// after EOF, grants `0`.
+        pub fn take(&mut self, want: usize) -> usize {
+            let want = want as u64;
+            let grant = if want > self.remaining {
+                self.remaining
+            } else {
+                want
+            };
+            self.remaining -= grant;
+            grant as usize
+        }
+    }
+
+    /// Minimum encoded size of a `HEAD` record: `size` + `mtime` + the
+    /// two length prefixes, with empty content-type and etag.
+    pub const HEAD_MIN_LEN: usize = 8 + 8 + 1 + 1;
+
+    /// Encode a `HEAD` record into `out` per the `object::HEAD` layout
+    /// (`[size:u64][mtime:u64][ct_len:u8][ct][etag_len:u8][etag]`).
+    /// Returns the number of bytes written, or `None` if `out` is too
+    /// small or a field exceeds its `u8` length prefix.
+    pub fn encode_head(
+        out: &mut [u8],
+        size: u64,
+        mtime: u64,
+        content_type: &[u8],
+        etag: &[u8],
+    ) -> Option<usize> {
+        if content_type.len() > u8::MAX as usize || etag.len() > u8::MAX as usize {
+            return None;
+        }
+        let total = HEAD_MIN_LEN + content_type.len() + etag.len();
+        if out.len() < total {
+            return None;
+        }
+        out[0..8].copy_from_slice(&size.to_le_bytes());
+        out[8..16].copy_from_slice(&mtime.to_le_bytes());
+        let mut p = 16;
+        out[p] = content_type.len() as u8;
+        p += 1;
+        out[p..p + content_type.len()].copy_from_slice(content_type);
+        p += content_type.len();
+        out[p] = etag.len() as u8;
+        p += 1;
+        out[p..p + etag.len()].copy_from_slice(etag);
+        p += etag.len();
+        Some(p)
+    }
+
+    /// The fixed-width prefix of a decoded `HEAD` record.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Head {
+        pub size: u64,
+        pub mtime: u64,
+    }
+
+    /// Decode a `HEAD` record, returning its fixed fields plus borrowed
+    /// `content_type` and `etag` slices. Returns `None` on truncation.
+    pub fn decode_head(buf: &[u8]) -> Option<(Head, &[u8], &[u8])> {
+        if buf.len() < HEAD_MIN_LEN {
+            return None;
+        }
+        let mut size = [0u8; 8];
+        size.copy_from_slice(&buf[0..8]);
+        let mut mtime = [0u8; 8];
+        mtime.copy_from_slice(&buf[8..16]);
+        let ct_len = buf[16] as usize;
+        let ct_start: usize = 17;
+        let ct_end = ct_start.checked_add(ct_len)?;
+        if buf.len() < ct_end + 1 {
+            return None;
+        }
+        let content_type = &buf[ct_start..ct_end];
+        let etag_len = buf[ct_end] as usize;
+        let etag_start = ct_end + 1;
+        let etag_end = etag_start.checked_add(etag_len)?;
+        if buf.len() < etag_end {
+            return None;
+        }
+        let etag = &buf[etag_start..etag_end];
+        Some((
+            Head {
+                size: u64::from_le_bytes(size),
+                mtime: u64::from_le_bytes(mtime),
+            },
+            content_type,
+            etag,
+        ))
+    }
+
+    /// Format an HTTP `Range` header *value* for a resolved window into
+    /// `out` (e.g. `bytes=100-199`). Used by the Linux adapter to issue
+    /// a ranged `GET` through `linux_net`. Returns the byte length
+    /// written, or `None` if `out` is too small or `count == 0` (an
+    /// empty window has no range to request — the caller issues a HEAD
+    /// instead). The end byte is inclusive per RFC 9110 §14.1.
+    pub fn write_range_header_value(out: &mut [u8], start: u64, count: u64) -> Option<usize> {
+        if count == 0 {
+            return None;
+        }
+        let end = start + count - 1;
+        let mut p = 0;
+        for b in b"bytes=" {
+            *out.get_mut(p)? = *b;
+            p += 1;
+        }
+        p += write_u64(out.get_mut(p..)?, start)?;
+        *out.get_mut(p)? = b'-';
+        p += 1;
+        p += write_u64(out.get_mut(p..)?, end)?;
+        Some(p)
+    }
+
+    /// Write a `u64` as decimal ASCII into `out`, returning its length.
+    /// `None` if `out` can't hold the digits.
+    fn write_u64(out: &mut [u8], mut v: u64) -> Option<usize> {
+        // Render into a scratch buffer (max 20 digits for u64) then
+        // copy in order — avoids alloc in this no_std path.
+        let mut scratch = [0u8; 20];
+        let mut n = 0;
+        if v == 0 {
+            *out.get_mut(0)? = b'0';
+            return Some(1);
+        }
+        while v > 0 {
+            scratch[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        if out.len() < n {
+            return None;
+        }
+        for i in 0..n {
+            out[i] = scratch[n - 1 - i];
+        }
+        Some(n)
+    }
+}

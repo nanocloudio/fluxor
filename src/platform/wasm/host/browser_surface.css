@@ -1,0 +1,215 @@
+/* browser_surface.css — system-neutral touch-UI primitive for Fluxor
+ * browser player pages.
+ *
+ * Extracted from a proven retro-handheld / home-computer player layout.
+ * These rules are SYSTEM-NEUTRAL:
+ * the iOS callout/loupe suppression, the orientation-driven flex layout
+ * (canvas + controls, never overlapping), and the base touch-button
+ * visual/interaction defaults. Every Fluxor sibling shipping a player
+ * page inherits the same iOS / touch UX from here instead of re-coding
+ * it per system.
+ *
+ * System-SPECIFIC bits stay in the backend's HTML / factory config:
+ *   - canvas aspect-ratio (handheld, home-computer, console, ... all differ)
+ *     → set per page via the `--canvas-aspect` custom property.
+ *   - which buttons exist, their grouping and count
+ *     → built by BrowserSurface.createPlayerShell(); the face-cluster's
+ *       column count + overall aspect are set inline by the factory (a
+ *       compact handheld page pins a 2-up face cluster; that ratio is NOT
+ *       baked into this primitive).
+ *   - theme colors (handheld green, computer black, console red, ...)
+ *     → the `--surface-*` / `--button-*` / `--canvas-bg` custom props.
+ *
+ * Theme via CSS custom properties (defaults below are a neutral dark
+ * scheme; override on :root, or via BrowserSurface.applyTouchDefaults):
+ *   --surface-bg     page background + active-button text color
+ *   --surface-fg     page foreground (text, button glyphs, borders)
+ *   --button-border  .pad-button border shorthand
+ *   --button-active-bg  pressed .pad-button background
+ *   --canvas-bg      canvas backdrop (letterbox color)
+ *   --canvas-aspect  canvas aspect-ratio (per-system, e.g. width/height)
+ *
+ * Uses dvh + vmin-based clamps so it tracks the iOS safe area the same
+ * way the reference handheld page does.
+ */
+
+:root {
+  --surface-bg: #0f1410;
+  --surface-fg: #d8e9c8;
+  --button-border: 2px solid rgba(216, 233, 200, 0.68);
+  --button-active-bg: rgba(216, 233, 200, 0.80);
+  --canvas-bg: #0f380f;
+  --canvas-aspect: 1;
+
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  background: var(--surface-bg);
+  color: var(--surface-fg);
+  /* iOS: never raise the callout/loupe, never paint a tap flash,
+     never let text selection start anywhere on the page. */
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+*,
+*::before,
+*::after {
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+::selection { background: transparent; }
+::-moz-selection { background: transparent; }
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  height: 100dvh;
+  display: flex;
+  overflow: hidden;
+}
+
+/* The stage holds the canvas (centered, aspect-locked) plus the
+   status footer overlay. It never overlaps the controls. */
+.stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+}
+canvas {
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: var(--canvas-aspect);
+  image-rendering: pixelated;
+  background: var(--canvas-bg);
+  display: block;
+  touch-action: manipulation;
+}
+footer {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--surface-fg);
+  opacity: 0.78;
+  pointer-events: none;
+  text-shadow: 0 1px 2px #000;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  gap: 12px;
+  padding: 12px;
+  box-sizing: border-box;
+  touch-action: manipulation;
+}
+
+.dpad {
+  width: min(30vmin, 170px);
+  aspect-ratio: 1;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  touch-action: manipulation;
+}
+
+.pad-button {
+  appearance: none;
+  border: var(--button-border);
+  background: rgba(8, 16, 8, 0.34);
+  color: var(--surface-fg);
+  border-radius: 8px;
+  font: 700 clamp(16px, 4vmin, 28px) system-ui, sans-serif;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  touch-action: manipulation;
+  text-shadow: 0 1px 2px #000;
+}
+.pad-button:focus { outline: none; }
+.pad-button.active {
+  background: var(--button-active-bg);
+  color: var(--surface-bg);
+}
+
+.pad-up { grid-column: 2; grid-row: 1; }
+.pad-left { grid-column: 1; grid-row: 2; }
+.pad-right { grid-column: 3; grid-row: 2; }
+.pad-down { grid-column: 2; grid-row: 3; }
+
+/* Face cluster: a row of round buttons. The column count + overall
+   aspect-ratio are SYSTEM-SPECIFIC and set inline by the factory
+   (GB: 2 columns / aspect 2). The neutral base here only fixes the
+   round shape + sizing of each member. */
+.face-buttons {
+  width: min(34vmin, 190px);
+  display: grid;
+  gap: 10px;
+}
+.face-buttons .pad-button {
+  border-radius: 50%;
+  aspect-ratio: 1;
+  font-size: clamp(16px, 4vmin, 26px);
+}
+
+/* Menu cluster: small pill buttons (SELECT / START and friends). */
+.menu-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.menu-buttons .pad-button {
+  width: clamp(48px, 14vmin, 72px);
+  height: clamp(20px, 6vmin, 28px);
+  font-size: clamp(11px, 3vmin, 14px);
+  border-radius: 12px;
+}
+
+/* Generic row cluster: an inline run of equally-sized square buttons
+   (quick-keys etc). Column count set inline by the factory. */
+.row-buttons {
+  display: grid;
+  gap: 8px;
+}
+.row-buttons .pad-button {
+  width: clamp(32px, 9vmin, 52px);
+  aspect-ratio: 1;
+  font-size: clamp(13px, 3.4vmin, 18px);
+}
+
+/* Portrait: canvas on top, controls in a fixed-height row below. */
+@media (orientation: portrait) {
+  body { flex-direction: column; }
+  .stage { flex: 1 1 auto; width: 100%; }
+  .controls {
+    flex: 0 0 auto;
+    width: 100%;
+    flex-direction: row;
+    height: min(36dvh, 320px);
+  }
+}
+/* Landscape: canvas on the left, controls in a right-side column. */
+@media (orientation: landscape) {
+  body { flex-direction: row; }
+  .stage { flex: 1 1 auto; height: 100%; }
+  .controls {
+    flex: 0 0 auto;
+    height: 100%;
+    flex-direction: column;
+    width: min(38vw, 360px);
+  }
+}

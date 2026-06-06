@@ -180,6 +180,20 @@ resolves these into modules and wiring at build time.
 | `storage` | sd, flash, eeprom | `storage.block` |
 | `bluetooth` | cyw43, esp32 | `bluetooth.*` |
 
+> **Notation — these are config paths, not capabilities.** In the
+> Subsection column, `audio.out`, `audio.in`, and `display.touch` are
+> *paths* into the `hardware:` YAML block: the dot is nesting (`out:` /
+> `in:` under `audio:`, `touch:` under `display:`), not a
+> capability-name separator. They are deliberately distinct from the
+> legacy *capability* spellings `audio.out` / `audio.in` /
+> `display.touch`, which `.context/rfc_capability_refinement.md` §8.1
+> renames to `audio.output` / `audio.capture` / `input.touch` — the
+> canonical names already shown in the **Provides** column. The
+> vocabulary migration map (`contracts/vocabulary_map.toml`) governs
+> the capability spellings only; it must not rewrite these config
+> paths. The same notation appears in the resolution traces below
+> (`hardware.audio.out`, `hardware.display.touch`, `(audio.out, i2s)`).
+
 ### Multi-Capability Chips
 
 Some chips provide multiple capabilities. cyw43 provides WiFi frames and

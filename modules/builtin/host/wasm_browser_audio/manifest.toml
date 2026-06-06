@@ -2,6 +2,12 @@ version = "1.0.0"
 hardware_targets = ["wasm"]
 builtin = true
 
+# Truthful AV capabilities, parallel to `linux_audio` / `i2s_pio`
+# (RFC browser_overlay §5.7): a PCM sample sink with a presentation
+# clock. Lets the `audio` platform stack resolve a wasm variant and
+# lets cross-target graph-shape checks treat all PCM sinks alike.
+capabilities = ["audio.sample", "presentation.clock"]
+
 # Browser audio sink. Consumes `AudioSample` (signed 16-bit PCM)
 # blocks on the input port and forwards them to the host shim's
 # `host_audio_play` import, which schedules playback through

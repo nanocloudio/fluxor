@@ -106,6 +106,10 @@ fn wasm_init_providers() {
     // and `linux_fs_dispatch` (host). Backs FS_CONTRACT for any
     // module that opens assets through `provider_call(-1, FS_OPEN, …)`.
     super::fs::register();
+    // Browser-fetch object provider — adds bounded `RANGE_GET` / `HEAD`
+    // over `Range:`-capable `fetch()` so modules demand-page immutable
+    // assets via `requires_contract = "storage.object"`.
+    super::object::register();
 }
 /// Platform-specific per-module cleanup for WASM host..
 ///

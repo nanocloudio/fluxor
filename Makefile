@@ -285,6 +285,7 @@ firmware-all:
 	$(MAKE) firmware TARGET=rp2040
 	$(MAKE) firmware TARGET=bcm2712
 	$(MAKE) firmware TARGET=cm5
+	$(MAKE) firmware TARGET=wasm
 
 tools:
 	@echo "Building tools..."
