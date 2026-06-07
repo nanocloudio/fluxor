@@ -137,6 +137,26 @@ impl Transcript {
     }
 }
 
+/// The full TLS 1.3 cipher-suite offer for the record layer (which
+/// implements all three): ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM,
+/// in the module's long-standing preference order. QUIC packet
+/// protection only implements AES-128-GCM-SHA256, so the QUIC client
+/// passes a narrower list (see `quic::pump`).
+pub const TLS13_RECORD_SUITES: &[u16] = &[0x1303, 0x1301, 0x1302];
+
+/// Write the ClientHello `cipher_suites` vector: a 2-byte length prefix
+/// (in bytes) followed by each suite id as a big-endian u16. Returns the
+/// updated write position.
+fn write_cipher_suites(out: &mut [u8], mut pos: usize, suites: &[u16]) -> usize {
+    put_u16(out, pos, (suites.len() * 2) as u16);
+    pos += 2;
+    for &suite in suites {
+        put_u16(out, pos, suite);
+        pos += 2;
+    }
+    pos
+}
+
 /// Build ClientHello message body (without record header).
 /// Returns length written to `out`.
 pub fn build_client_hello(
@@ -146,7 +166,7 @@ pub fn build_client_hello(
     out: &mut [u8],
 ) -> usize {
     // Empty ALPN → builder keeps the default h2,http/1.1 offer.
-    build_client_hello_ext(random, session_id, pub_key, &[], &[], out)
+    build_client_hello_ext(random, session_id, pub_key, &[], &[], TLS13_RECORD_SUITES, out)
 }
 
 /// Variant taking a QUIC `transport_parameters` extension payload.
@@ -160,6 +180,7 @@ pub fn build_client_hello_ext(
     pub_key: &[u8; 65],
     quic_tp: &[u8],
     alpn: &[u8],
+    suites: &[u16],
     out: &mut [u8],
 ) -> usize {
     let mut pos = 0;
@@ -179,10 +200,7 @@ pub fn build_client_hello_ext(
     // checked against the message length before each deref.
     unsafe { core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32); }
     pos += 32;
-    out[pos] = 0; out[pos + 1] = 6; pos += 2;
-    put_u16(out, pos, 0x1303); pos += 2;
-    put_u16(out, pos, 0x1301); pos += 2;
-    put_u16(out, pos, 0x1302); pos += 2;
+    pos = write_cipher_suites(out, pos, suites);
     out[pos] = 1; pos += 1;
     out[pos] = 0; pos += 1;
 
@@ -1409,6 +1427,7 @@ pub fn build_client_hello_psk(
     binder_len: usize,
     include_early_data: bool,
     alpn: &[u8],
+    suites: &[u16],
     out: &mut [u8],
 ) -> (usize, usize, usize) {
     let mut pos = 0;
@@ -1435,15 +1454,7 @@ pub fn build_client_hello_psk(
         core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32);
     }
     pos += 32;
-    out[pos] = 0;
-    out[pos + 1] = 6;
-    pos += 2;
-    put_u16(out, pos, 0x1303);
-    pos += 2;
-    put_u16(out, pos, 0x1301);
-    pos += 2;
-    put_u16(out, pos, 0x1302);
-    pos += 2;
+    pos = write_cipher_suites(out, pos, suites);
     out[pos] = 1;
     pos += 1;
     out[pos] = 0;

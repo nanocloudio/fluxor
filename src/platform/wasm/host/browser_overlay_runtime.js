@@ -263,6 +263,7 @@
         case 'checkbox': return buildCheckbox(spec);
         case 'menu': // a menu is a select backed by a media list
         case 'select': return buildSelect(spec);
+        case 'list': return buildList(spec);
         case 'keyboard': return buildKeyboard(spec);
         case 'status': return buildStatus(spec);
         default: return null;
@@ -565,6 +566,78 @@
         update: (val) => { if (val != null) node.value = String(val); } };
     }
 
+    // A browsable, selectable list view — the rich-row sibling of
+    // `select` (which is a compact dropdown). Generic by construction:
+    // rows are `{ id, label, sublabel?, badge?, selected?, enabled? }`
+    // records carrying no domain meaning. Rows come from the resolved
+    // feed snapshot `opts.lists[spec.list]` (RFC §17.3 — the shell's
+    // `lists:` is a name→feed declaration the host resolves to a bounded
+    // snapshot) with an inline `spec.options` fallback. Picking a row
+    // emits the selection `action` with `{ item_id }`; the app decides
+    // what that means (catalog launch, ROM select, save-state slot, …).
+    // Feed-driven: when the status plane (`applyStatus`) pushes a fresh
+    // row array on `spec.status_field`, the list re-renders, so a
+    // coordinator can stream live catalog updates in. All label text is
+    // untrusted → `cap()`-bounded, same as every other control.
+    function buildList(spec) {
+      const node = el('div');
+      node.className = 'fx-ctl fx-list';
+      node.dataset.id = spec.id;
+      node.setAttribute('role', 'listbox');
+      if (spec.a11y && spec.a11y.label) node.setAttribute('aria-label', cap(spec.a11y.label));
+
+      function rows(src) {
+        if (Array.isArray(src)) return src;
+        const l = opts.lists && opts.lists[spec.list];
+        if (Array.isArray(l)) return l;
+        return Array.isArray(spec.options) ? spec.options : [];
+      }
+      function clearSelection() {
+        const kids = node.childNodes || [];
+        for (let i = 0; i < kids.length; i++) {
+          if (kids[i].classList) kids[i].classList.remove('fx-list-row-selected');
+        }
+      }
+      function render(src) {
+        node.textContent = '';
+        for (const o of rows(src)) {
+          if (!o || typeof o !== 'object') continue;
+          const id = o.id != null ? o.id : o.option_id;
+          const row = el('button');
+          row.className = 'fx-list-row' + (o.selected ? ' fx-list-row-selected' : '');
+          row.setAttribute('role', 'option');
+          row.dataset.itemId = cap(id);
+          if (o.enabled === false) row.setAttribute('disabled', 'true');
+          const title = el('span');
+          title.className = 'fx-list-title';
+          title.textContent = cap(o.label);
+          row.appendChild(title);
+          if (o.sublabel != null) {
+            const sub = el('span');
+            sub.className = 'fx-list-sub';
+            sub.textContent = cap(o.sublabel);
+            row.appendChild(sub);
+          }
+          if (o.badge != null) {
+            const b = el('span');
+            b.className = 'fx-list-badge';
+            b.textContent = cap(o.badge);
+            row.appendChild(b);
+          }
+          row.addEventListener('click', () => {
+            if (o.enabled === false) return;
+            clearSelection();
+            row.classList.add('fx-list-row-selected');
+            if (spec.action) sinks.action(spec.action, { item_id: id });
+          });
+          node.appendChild(row);
+        }
+      }
+      render(null);
+      return { node, spec, statusField: spec.status_field,
+        update: (val) => { if (Array.isArray(val)) render(val); } };
+    }
+
     // Virtual keyboard show/hide drawer (RFC §11.5). A machine keyboard
     // emits key identities; this builds a compact key grid that emits
     // `key.symbolic.*` transitions.
@@ -737,6 +810,19 @@
     '.fx-stick-knob{position:absolute;left:35%;top:35%;width:30%;height:30%;border-radius:50%;background:#555;}',
     '.fx-slider,.fx-scrubber{width:100%;}',
     '.fx-keyboard{display:flex;flex-wrap:wrap;gap:4px;}',
+    // Browsable list view (the `list` control). Scrolls internally;
+    // rows are full-width selectable buttons with title + optional
+    // sublabel/badge. Selection highlight reuses the on-state accent.
+    '.fx-list{display:flex;flex-direction:column;align-items:stretch;gap:4px;',
+    'width:min(92vw,560px);max-height:100%;overflow-y:auto;padding:4px;box-sizing:border-box;}',
+    '.fx-list-row{display:flex;flex-direction:column;align-items:flex-start;gap:2px;',
+    'padding:8px 12px;border-radius:8px;border:1px solid #333;background:#1c1c1c;',
+    'color:#eee;font:inherit;text-align:left;width:100%;box-sizing:border-box;cursor:pointer;}',
+    '.fx-list-row:hover{background:#262626;}',
+    '.fx-list-row-selected{background:#284;border-color:#3a6;}',
+    '.fx-list-title{font-weight:600;}',
+    '.fx-list-sub{font-size:0.82em;opacity:0.68;}',
+    '.fx-list-badge{font-size:0.72em;opacity:0.6;align-self:flex-end;}',
   ].join('');
 
   const api = { mount, makeSinks, makeHostSinks, GAMEPAD_BIT, parseControl, fnv1a32, _css: OVERLAY_CSS };

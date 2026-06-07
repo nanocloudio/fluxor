@@ -1197,13 +1197,17 @@ const MAX_MODULES: usize = 64;
 /// `parse_module_entry`, which reads matching field widths.
 const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 
-/// Maximum module params size. 128 KiB accommodates the
+/// Maximum module params size. 256 KiB accommodates the
 /// wasm-scenario synth host's http module, which inlines the
-/// canonical browser shell (runtime.html + host_shims.js, ~60 KiB
-/// combined) as `body:` routes per the shared-infra-in-orchestrator
-/// partition principle. Wavetables and large sequences fit
-/// comfortably within the same bound.
-const MAX_MODULE_PARAMS_SIZE: usize = 128 * 1024;
+/// canonical browser shell (runtime.html ~83 KiB after scenario
+/// substitution + host_shims.js ~56 KiB + scenario.json) as `body:`
+/// routes per the shared-infra-in-orchestrator partition principle.
+/// At 128 KiB the later route bodies were silently truncated (clipped
+/// JS / empty scenario.json in the browser). Kept in lockstep with the
+/// runtime `MAX_CONFIG_SIZE` / http `DEFAULT_BODY_POOL_SIZE` host caps.
+/// Generation runs host-side, so this is a sanity bound, not a memory
+/// constraint. Wavetables and large sequences fit comfortably within.
+const MAX_MODULE_PARAMS_SIZE: usize = 256 * 1024;
 
 /// Param base offset within a module entry (= header size = 8)
 const P: usize = MODULE_ENTRY_HEADER_SIZE;

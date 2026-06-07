@@ -32,6 +32,7 @@ pub const CONTROL_KINDS: &[&str] = &[
     "checkbox",
     "menu",
     "select",
+    "list",
     "keyboard",
     "status",
 ];
@@ -248,6 +249,32 @@ fn validate_control(
                 Some(l) if !list_resolves => {
                     return Err(format!(
                         "control `{id}` ({kind}): `list: {l}` is not declared under the shell's `lists:`"
+                    ))
+                }
+                _ => {}
+            }
+        }
+        // A `list` is the browsable, rich-row sibling of `select`. It is
+        // feed-backed via a declared `list:` (RFC §17.3) OR carries an
+        // inline `options:` array for static collections; at least one
+        // must be present. Picking a row emits the selection `action`.
+        "list" => {
+            if !has_action {
+                return Err(format!("control `{id}` (list): requires a selection `action`"));
+            }
+            let has_options = ctl
+                .get("options")
+                .map(|v| v.is_array())
+                .unwrap_or(false);
+            match names_list {
+                Some(l) if !list_resolves => {
+                    return Err(format!(
+                        "control `{id}` (list): `list: {l}` is not declared under the shell's `lists:`"
+                    ))
+                }
+                None if !has_options => {
+                    return Err(format!(
+                        "control `{id}` (list): requires a `list` (declared `lists:` entry) or an inline `options` array"
                     ))
                 }
                 _ => {}

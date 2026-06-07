@@ -466,13 +466,15 @@ pub const MAX_GRAPH_EDGES: usize = 128;
 /// - Embedded targets (rp/bcm) cap at 32 KiB — fits in their
 ///   statically-sized flash regions; bumping requires re-validating
 ///   the mapped config region + trailer's `config_size` field.
-/// - Host targets (linux/wasm) cap at 128 KiB — the synthesised
+/// - Host targets (linux/wasm) cap at 256 KiB — the synthesised
 ///   wasm-scenario host inlines the canonical browser shell
-///   (runtime.html + host_shims.js, ~60 KiB combined) as `body:`
-///   routes so the orchestrator stays self-contained per the
-///   shared-infra-in-orchestrator partition principle.
+///   (runtime.html + host_shims.js, now ~110 KiB combined and growing
+///   with player-mode UX + the OPFS object tier) plus scenario.json as
+///   `body:` routes so the orchestrator stays self-contained per the
+///   shared-infra-in-orchestrator partition principle. Host targets have
+///   GiBs of RAM, so the cap is a sanity bound, not a memory constraint.
 #[cfg(any(target_os = "linux", target_arch = "wasm32"))]
-pub const MAX_CONFIG_SIZE: usize = 128 * 1024;
+pub const MAX_CONFIG_SIZE: usize = 256 * 1024;
 #[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
 pub const MAX_CONFIG_SIZE: usize = 32 * 1024;
 
@@ -992,11 +994,12 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     }
     // Bounds-check: module section size should be reasonable.
     // Linux/wasm get a larger ceiling so the wasm-scenario synth
-    // host can carry the inlined browser shell (~60 KiB of
-    // runtime.html + host_shims.js as http route bodies) — same
-    // partition principle as `MAX_CONFIG_SIZE` above.
+    // host can carry the inlined browser shell (~140 KiB of
+    // runtime.html + host_shims.js + scenario.json as http route
+    // bodies) — same partition principle as `MAX_CONFIG_SIZE` above,
+    // kept in lockstep with it and the CLI's MAX_MODULE_PARAMS_SIZE.
     #[cfg(any(target_os = "linux", target_arch = "wasm32"))]
-    const MAX_MODULE_SECTION: usize = 128 * 1024;
+    const MAX_MODULE_SECTION: usize = 256 * 1024;
     #[cfg(not(any(target_os = "linux", target_arch = "wasm32")))]
     const MAX_MODULE_SECTION: usize = 32 * 1024;
     if section_size > MAX_MODULE_SECTION {

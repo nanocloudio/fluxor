@@ -663,24 +663,36 @@ unsafe fn key_vault_provider_dispatch(
 ///    allow-list (below) or in the module's declared `required_caps`
 ///    set. Modules that declare nothing get nothing beyond infra +
 ///    whatever the tier mask opens.
+// Storage family: a service-tier module may reach the storage contracts
+// on the same footing as FS (already in the masks below) when — and only
+// when — it declares them in `[[resources]]` (the manifest gate in
+// `check_contract_grant` remains authoritative). This lets a service-tier
+// backend (e.g. an emulator asset bank, RFC 0009) resolve an object
+// handle via `storage.object`/`storage.namespace` without being
+// mis-typed as a CAP_FULL `Protocol` module just to get the grant.
+// STORAGE_NAMESPACE = 0x13, STORAGE_OBJECT = 0x14.
+const STORAGE_FAMILY: u32 = (1u32 << crate::kernel::provider::contract::STORAGE_NAMESPACE as u32)
+    | (1u32 << crate::kernel::provider::contract::STORAGE_OBJECT as u32);
+
+/// Per-cap-class contract ceiling. Indexed by
+/// `scheduler::current_module_cap_class()`. Bits 7 / 8 / 17 / 18 / 21
+/// (PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, PCIE_DEVICE,
+/// USB_HOST) are permitted at every service tier so a driver's
+/// `[[resources]]` declaration is what actually grants access; the
+/// `platform_raw` permission then gates the individual opcodes on top.
+/// USB_HOST is a scaffold — the bit is reserved so a future driver
+/// landing only needs to register handlers, not amend this mask. This is
+/// a ceiling, NOT a grant: `check_contract_grant`'s manifest gate still
+/// requires each non-infra contract to be declared.
+const CAP_CONTRACT_MASK: [u32; 4] = [
+    0x0027_1FE1 | STORAGE_FAMILY, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST
+    0x0027_1FF1 | STORAGE_FAMILY, // CAP_SERVICE_PIO: service + HAL_PIO
+    0x0027_1FE3 | STORAGE_FAMILY, // CAP_SERVICE_GPIO: service + HAL_GPIO
+    0xFFFF_FFFF,                  // CAP_FULL: any contract
+];
+
 unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     use crate::kernel::provider::contract as ct;
-
-    // Tiers mirror `scheduler::current_module_cap_class()` return values.
-    // Bits 7 / 8 / 17 / 18 / 21 (PLATFORM_NIC_RING, PLATFORM_DMA,
-    // PLATFORM_DMA_FD, PCIE_DEVICE, USB_HOST) are permitted at every
-    // service tier so a driver's `[[resources]]` declaration is what
-    // actually grants access. The `platform_raw` permission then gates
-    // the individual opcodes on top. USB_HOST is a scaffold — the
-    // kernel-side vtable is unimplemented; the bit is reserved so a
-    // future driver landing only needs to register handlers, not also
-    // amend this mask.
-    const CAP_CONTRACT_MASK: [u32; 4] = [
-        0x0027_1FE1, // CAP_SERVICE: infra + FS + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST
-        0x0027_1FF1, // CAP_SERVICE_PIO: service + HAL_PIO
-        0x0027_1FE3, // CAP_SERVICE_GPIO: service + HAL_GPIO
-        0xFFFF_FFFF, // CAP_FULL: any contract
-    ];
 
     let cap = crate::kernel::scheduler::current_module_cap_class() as usize;
     if cap < CAP_CONTRACT_MASK.len() {
@@ -1975,3 +1987,36 @@ unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u
 
 // RP platform providers are now registered via HAL (init_providers / release_module_handles).
 // The rp/providers.rs file is included from the RP platform entrypoint instead.
+
+#[cfg(test)]
+mod cap_class_grant_tests {
+    use super::CAP_CONTRACT_MASK;
+    use crate::kernel::provider::contract as ct;
+
+    // Pins the RFC 0009 cap-class policy: a service-tier module (anything
+    // not typed `Protocol` → CAP_FULL) may reach the storage family on the
+    // same footing as `fs`. This is a CEILING; `check_contract_grant`'s
+    // manifest gate still requires each contract to be declared. Reverting
+    // the storage-family bits would silently re-break service-tier
+    // storage.object resolution (the emulator asset bank), so pin it here.
+    #[test]
+    fn service_tiers_admit_storage_family_like_fs() {
+        for cap in 0..3usize {
+            // CAP_SERVICE (0), CAP_SERVICE_PIO (1), CAP_SERVICE_GPIO (2)
+            let m = CAP_CONTRACT_MASK[cap];
+            assert_ne!(m & (1u32 << ct::FS as u32), 0, "fs must be service-reachable");
+            assert_ne!(
+                m & (1u32 << ct::STORAGE_OBJECT as u32),
+                0,
+                "storage.object must be service-reachable (RFC 0009)"
+            );
+            assert_ne!(
+                m & (1u32 << ct::STORAGE_NAMESPACE as u32),
+                0,
+                "storage.namespace must be service-reachable (RFC 0009)"
+            );
+        }
+        // CAP_FULL reaches every contract.
+        assert_eq!(CAP_CONTRACT_MASK[3], 0xFFFF_FFFF);
+    }
+}

@@ -5,6 +5,29 @@
 // we plug QUIC's `install_handshake_keys` / `install_one_rtt_keys`
 // in instead of populating TLS-style TrafficKeys.
 
+/// The only cipher suite QUIC packet protection implements:
+/// TLS_AES_128_GCM_SHA256 (0x1301). `keys.rs::secret_to_keys` derives a
+/// 16-byte key under SHA-256 and `wire.rs` uses `AesGcm::new_128` + AES
+/// header protection — there is no ChaCha20/AES-256 packet-protection
+/// path. The client therefore offers ONLY this suite (so a compliant
+/// server can't pick something we can't encrypt with) and rejects any
+/// other suite in the ServerHello rather than negotiating then failing.
+const QUIC_PACKET_SUITES: &[u16] = &[0x1301];
+
+/// True if the client's TLS cipher-suites list (2-byte big-endian ids,
+/// back to back) contains `want`.
+fn cipher_suites_offer(client_suites: &[u8], want: u16) -> bool {
+    let mut i = 0;
+    while i + 1 < client_suites.len() {
+        let cs = ((client_suites[i] as u16) << 8) | (client_suites[i + 1] as u16);
+        if cs == want {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
 unsafe fn pump_session(s: &mut QuicState, idx: usize) -> bool {
     let st = s.conns[idx].driver.hs_state;
     match st {
@@ -231,12 +254,22 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
     // server only emits DATAGRAMs the peer will accept.
     s.conns[idx].peer_max_datagram_frame_size = parse_peer_max_datagram_frame_size(tp);
     let driver = &mut s.conns[idx].driver;
-    driver.suite = match select_cipher_suite(ch.cipher_suites) {
-        Some(cs) => cs,
-        None => {
-            driver.hs_state = HandshakeState::Error;
-            return true;
-        }
+    // QUIC packet protection here is implemented for AES-128-GCM-SHA256
+    // ONLY (keys.rs::secret_to_keys derives a 16-byte key under SHA256 and
+    // wire.rs uses AesGcm::new_128 + AES header protection — there is no
+    // ChaCha20/AES-256 packet-protection path). The shared
+    // `select_cipher_suite` prefers ChaCha20 when the client offers it
+    // (great for the TLS-over-TCP record layer, which does implement all
+    // three), so using it here makes the ServerHello advertise a suite we
+    // then can't actually encrypt with — the peer derives ChaCha keys and
+    // every Handshake/1-RTT packet fails to decrypt. Pin AES-128-GCM, which
+    // is mandatory-to-implement in TLS 1.3 (RFC 8446 §9.1) so every
+    // compliant client offers it.
+    driver.suite = if cipher_suites_offer(ch.cipher_suites, 0x1301) {
+        CipherSuite::Aes128Gcm
+    } else {
+        driver.hs_state = HandshakeState::Error;
+        return true;
     };
     if ch.session_id.len() <= 32 {
         core::ptr::copy_nonoverlapping(
@@ -869,6 +902,7 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
             hl,
             zero_rtt_offered,
             alpn,
+            QUIC_PACKET_SUITES,
             &mut driver.scratch,
         );
         // Compute the partial-CH transcript hash. The binder covers
@@ -922,6 +956,7 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
         &driver.ecdh_public,
         &tp[..tp_len],
         alpn,
+        QUIC_PACKET_SUITES,
         &mut driver.scratch,
     );
     driver.transcript = Some(Transcript::new(HashAlg::Sha256));
@@ -960,6 +995,15 @@ unsafe fn pump_recv_server_hello(s: &mut QuicState, idx: usize) -> bool {
         return true;
     }
     if sh.random.len() == 32 && sh.random == HRR_RANDOM {
+        driver.hs_state = HandshakeState::Error;
+        return true;
+    }
+    // QUIC packet protection only implements AES-128-GCM-SHA256, so a
+    // server that selected ChaCha20/AES-256 (even though it parses as a
+    // known suite) must be rejected here — otherwise we'd "negotiate"
+    // and then fail every Handshake/1-RTT packet en/decrypt. We only
+    // offered 0x1301, so a compliant server can't reach this branch.
+    if sh.cipher_suite != 0x1301 {
         driver.hs_state = HandshakeState::Error;
         return true;
     }

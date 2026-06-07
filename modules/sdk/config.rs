@@ -77,8 +77,11 @@ mod profile_host {
         // host_shims.js getting served at 1275 bytes instead of
         // its full ~32 KiB. Aligned with `MAX_CONFIG_SIZE`,
         // `MAX_MODULE_PARAMS_SIZE` (tools), and the http module
-        // section cap.
-        pub const MAX_MODULE_CONFIG_SIZE: usize = 128 * 1024;
+        // section cap. Bumped 128 → 256 KiB as the shell grew again
+        // (host_shims.js ~32 → ~56 KiB + runtime.html ~83 KiB), which
+        // re-tripped the same truncation (host_shims served at 46665
+        // of 55873). Keep this whole set in lockstep.
+        pub const MAX_MODULE_CONFIG_SIZE: usize = 256 * 1024;
         // 256 KiB so split scenarios where both halves' http modules
         // inline the canonical wasm shell as body routes
         // (~95 KiB per http module) leave enough headroom for the
@@ -152,7 +155,16 @@ mod profile_host {
         pub const MAX_VARS: usize = 16;
         pub const MAX_VAR_VALUE: usize = 16;
         pub const MAX_CACHE: usize = 4;
-        pub const DEFAULT_BODY_POOL_SIZE: usize = 48 * 1024;
+        // Host profile (aarch64: linux orchestrator, Pi 5 / cm5) serves
+        // synthesised wasm-scenario hosts that inline the canonical
+        // browser shell as `body:` routes — runtime.html (~83 KiB after
+        // scenario substitution) + host_shims.js (~56 KiB) + scenario.json.
+        // At 48 KiB the pool overflowed and silently truncated bodies
+        // (corrupt JS → "missing }" / empty scenario.json in the browser).
+        // Bumped to 256 KiB; the arena reserves 2× this and these targets
+        // have GiBs of RAM, so it's a sanity bound, not a memory constraint.
+        // profile_wasm / profile_embedded keep their small pools.
+        pub const DEFAULT_BODY_POOL_SIZE: usize = 256 * 1024;
     }
 
     pub mod ip {

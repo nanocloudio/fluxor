@@ -177,10 +177,196 @@
     // `host_object_range_open` are idempotent per identity so a
     // provider call that returns EAGAIN and retries re-finds the same
     // in-flight request instead of issuing a duplicate fetch.
+    //
+    // Read tier vs. write tier: `fetch()` + `asset://` are read-only and
+    // serve shipped content. `host_object_put` adds the persistent write
+    // tier (RFC 0009 save-states, imports) backed by OPFS. Writes land
+    // synchronously in `objStore` (so an immediately-following read sees
+    // them) and persist to OPFS in the background; `objStore` is also
+    // hydrated from OPFS at boot. Reads consult `objStore` before
+    // fetch(), so a PUT key reads back this session and across reloads.
     const objects = new Map(); // handle -> entry
     const headByKey = new Map(); // url -> handle
     const rangeByKey = new Map(); // `${url}\0${off}\0${len}` -> handle
     let nextObjectHandle = 1;
+
+    // Persistent write tier: key -> Uint8Array. Source of truth for
+    // reads of written/hydrated objects; OPFS is its durable backing.
+    const objStore = new Map();
+
+    // OPFS root directory handle (a promise that resolves to the handle,
+    // or to null when the host has no OPFS — older browsers, Node tests
+    // without a mock, private-mode quotas). All OPFS work awaits this and
+    // no-ops on null, so the provider degrades to the fetch read tier.
+    const opfsRootP = (typeof navigator !== 'undefined'
+      && navigator.storage && typeof navigator.storage.getDirectory === 'function')
+      ? Promise.resolve().then(() => navigator.storage.getDirectory()).catch((err) => {
+          console.warn(`host_object: OPFS unavailable (${err && err.message}); writes are session-only`);
+          return null;
+        })
+      : Promise.resolve(null);
+
+    // Resolve `key` ("a/b/c.bin") to an OPFS file handle, creating the
+    // intermediate directories when `create` is set. Returns null if OPFS
+    // is absent, or (for create=false) if any path segment is missing.
+    const opfsResolveFile = async (key, create) => {
+      const root = await opfsRootP;
+      if (!root) return null;
+      const parts = key.split('/').filter((s) => s.length > 0);
+      if (parts.length === 0) return null;
+      let dir = root;
+      try {
+        for (let i = 0; i < parts.length - 1; i++) {
+          dir = await dir.getDirectoryHandle(parts[i], { create: !!create });
+        }
+        return await dir.getFileHandle(parts[parts.length - 1], { create: !!create });
+      } catch (_) {
+        return null; // missing segment (read) or creation denied.
+      }
+    };
+
+    // Background-persist `bytes` for `key` to OPFS. Fire-and-forget: the
+    // synchronous PUT has already populated `objStore`, so a failure here
+    // only costs durability, never correctness this session.
+    const opfsPersist = (key, bytes) => {
+      opfsResolveFile(key, true).then(async (fh) => {
+        if (!fh) return;
+        const w = await fh.createWritable();
+        await w.write(bytes);
+        await w.close();
+      }).catch((err) => {
+        console.warn(`host_object: OPFS persist failed for "${key}": ${err && err.message}`);
+      });
+    };
+
+    // At boot, load every persisted object into `objStore` so keys
+    // written in a prior session read back. Best-effort + recursive;
+    // reads that race ahead of hydration fall through to the fetch tier.
+    const opfsHydrate = () => {
+      opfsRootP.then(async (root) => {
+        if (!root || typeof root.entries !== 'function') return;
+        const walk = async (dir, prefix) => {
+          for await (const [name, handle] of dir.entries()) {
+            const path = prefix ? `${prefix}/${name}` : name;
+            if (handle.kind === 'directory') {
+              await walk(handle, path);
+            } else {
+              try {
+                const file = await handle.getFile();
+                const buf = new Uint8Array(await file.arrayBuffer());
+                if (!objStore.has(path)) objStore.set(path, buf);
+              } catch (_) { /* skip unreadable entry */ }
+            }
+          }
+        };
+        await walk(root, '');
+      }).catch(() => { /* no OPFS / iteration unsupported — skip */ });
+    };
+    opfsHydrate();
+
+    // ── namespace index (host_ns_*, storage.namespace enumeration) ───
+    // Directory enumeration over the SAME flat key space the object tier
+    // writes (`objStore`, OPFS-backed) unioned with a fetched manifest of
+    // shipped, immutable content. `/` is the hierarchy separator, so a
+    // key "saves/tetris" makes LIST("") yield "saves" (namespace) and
+    // LIST("saves/") yield "tetris" (object). Backs src/platform/wasm/
+    // namespace.rs; lets `storage.namespace` consumers (truffle's
+    // scanner) walk a tree the browser has no POSIX readdir for.
+    const manifestIndex = new Map(); // key -> { size, mtime, etag(string) }
+    const manifestUrl = o.manifestUrl || 'fluxor-manifest.json';
+    // Best-effort boot fetch of the shipped-content manifest: a JSON
+    // array of { key, size, mtime?, etag? }. Absent/garbled → the
+    // namespace tier serves objStore (user data) only.
+    (() => {
+      if (typeof fetch !== 'function') return;
+      Promise.resolve().then(() => fetch(manifestUrl))
+        .then((resp) => (resp && resp.ok) ? resp.json() : null)
+        .then((entries) => {
+          if (!Array.isArray(entries)) return;
+          for (const e of entries) {
+            if (!e || typeof e.key !== 'string') continue;
+            manifestIndex.set(e.key, {
+              size: Number(e.size) || 0,
+              mtime: Number(e.mtime) || 0,
+              etag: typeof e.etag === 'string' ? e.etag : '',
+            });
+          }
+        }).catch(() => { /* no manifest — objStore-only namespace */ });
+    })();
+
+    // Deterministic 16-byte object id for a key (FNV-1a, four seeded
+    // 32-bit passes). Stable per key + high-entropy, which is what the
+    // scanner's etag→ObjectId packing wants for objStore entries that
+    // carry no server etag.
+    const fnvEtag16 = (key) => {
+      const bytes = new TextEncoder().encode(key);
+      const out = new Uint8Array(16);
+      for (let lane = 0; lane < 4; lane++) {
+        let h = (0x811c9dc5 ^ (lane * 0x9e3779b1)) >>> 0;
+        for (let i = 0; i < bytes.length; i++) {
+          h = (h ^ bytes[i]) >>> 0;
+          h = Math.imul(h, 0x01000193) >>> 0;
+        }
+        out[lane * 4] = h & 0xff;
+        out[lane * 4 + 1] = (h >>> 8) & 0xff;
+        out[lane * 4 + 2] = (h >>> 16) & 0xff;
+        out[lane * 4 + 3] = (h >>> 24) & 0xff;
+      }
+      return out;
+    };
+
+    // A manifest etag string → 16 bytes (utf-8, truncated/zero-padded).
+    const etagToBytes16 = (s) => {
+      const b = new TextEncoder().encode(s);
+      const out = new Uint8Array(16);
+      out.set(b.subarray(0, 16));
+      return out;
+    };
+
+    // Resolve a key against the union index:
+    //   { kind:'object', size, mtime, etag:Uint8Array(16) } | a leaf
+    //   { kind:'namespace' }   — a prefix that has children
+    //   null                   — unknown
+    const nsResolve = (key) => {
+      const stored = objStore.get(key);
+      if (stored !== undefined) {
+        return { kind: 'object', size: stored.byteLength, mtime: 0, etag: fnvEtag16(key) };
+      }
+      const m = manifestIndex.get(key);
+      if (m !== undefined) {
+        return {
+          kind: 'object', size: m.size, mtime: m.mtime,
+          etag: m.etag ? etagToBytes16(m.etag) : fnvEtag16(key),
+        };
+      }
+      const dirPrefix = key.endsWith('/') ? key : key + '/';
+      for (const k of objStore.keys()) if (k.startsWith(dirPrefix)) return { kind: 'namespace' };
+      for (const k of manifestIndex.keys()) if (k.startsWith(dirPrefix)) return { kind: 'namespace' };
+      return null;
+    };
+
+    // Immediate children under `prefix`, deduped and name-sorted (stable
+    // order so integer-cursor paging is deterministic). A name that is
+    // both a leaf and a sub-prefix resolves to a namespace.
+    const nsListChildren = (prefix) => {
+      let pfx = prefix;
+      if (pfx.length > 0 && !pfx.endsWith('/')) pfx = pfx + '/';
+      const children = new Map(); // name -> 'object' | 'namespace'
+      const consider = (key) => {
+        if (!key.startsWith(pfx)) return;
+        const rest = key.slice(pfx.length);
+        if (rest.length === 0) return;
+        const slash = rest.indexOf('/');
+        if (slash === -1) {
+          if (!children.has(rest)) children.set(rest, 'object');
+        } else {
+          children.set(rest.slice(0, slash), 'namespace'); // namespace wins
+        }
+      };
+      for (const k of objStore.keys()) consider(k);
+      for (const k of manifestIndex.keys()) consider(k);
+      return [...children.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    };
 
     // Encode [size:u64 LE][mtime:u64 LE] into a fresh 16-byte view.
     const encodeMeta = (size, mtimeSec) => {
@@ -194,7 +380,20 @@
     const objectShim = {
       host_object_head: (keyPtr, keyLen) => {
         try {
-          let url = kstr(keyPtr, keyLen);
+          const rawKey = kstr(keyPtr, keyLen);
+          // Persistent write tier first: a PUT/hydrated key serves its
+          // size from memory without a HEAD round-trip. Keyed by the raw
+          // PUT key, before any fetch URL override.
+          const stored = objStore.get(rawKey);
+          if (stored !== undefined) {
+            const handle = nextObjectHandle++;
+            objects.set(handle, {
+              reader: null, queue: [encodeMeta(stored.byteLength, 0)],
+              eof: true, bytes: 0, isHead: true,
+            });
+            return handle;
+          }
+          let url = rawKey;
           if (fetchUrlOverride) url = fetchUrlOverride(url);
           const existing = headByKey.get(url);
           if (existing !== undefined) return existing;
@@ -234,10 +433,22 @@
 
       host_object_range_open: (keyPtr, keyLen, offset, length) => {
         try {
-          let url = kstr(keyPtr, keyLen);
-          if (fetchUrlOverride) url = fetchUrlOverride(url);
+          const rawKey = kstr(keyPtr, keyLen);
           const off = Number(offset);
           const len = Number(length);
+          // Persistent write tier first: serve the window straight from
+          // the in-memory blob (same windowing as the asset:// branch).
+          const stored = objStore.get(rawKey);
+          if (stored !== undefined) {
+            const handle = nextObjectHandle++;
+            const entry = { reader: null, queue: [], eof: true, bytes: 0, isHead: false };
+            const end = Math.min(stored.byteLength, off + len);
+            if (off < end) entry.queue.push(stored.subarray(off, end));
+            objects.set(handle, entry);
+            return handle;
+          }
+          let url = rawKey;
+          if (fetchUrlOverride) url = fetchUrlOverride(url);
           const idKey = `${url}\0${off}\0${len}`;
           const existing = rangeByKey.get(idKey);
           if (existing !== undefined) return existing;
@@ -322,6 +533,105 @@
         }
         objects.delete(handle);
         return 0;
+      },
+
+      // Write tier (OPFS). Stage the bytes synchronously so a following
+      // read sees them, then persist to OPFS in the background. Returns 0
+      // on acceptance, -1 on a hard failure (e.g. memory read fault).
+      host_object_put: (keyPtr, keyLen, bodyPtr, bodyLen) => {
+        try {
+          const key = kstr(keyPtr, keyLen);
+          if (key.length === 0) return -1;
+          // Copy out of wasm linear memory — the buffer is reused after
+          // the call returns, and OPFS persistence reads it later.
+          const body = kview(bodyPtr, bodyLen).slice();
+          objStore.set(key, body);
+          opfsPersist(key, body);
+          return 0;
+        } catch (err) {
+          console.error(`host_object_put threw: ${err.message}`);
+          return -1;
+        }
+      },
+    };
+
+    // storage.namespace host bindings — render the contract wire format
+    // straight into the caller's buffer from the union index above.
+    const NS_KIND_OBJECT = 0, NS_KIND_NAMESPACE = 1;
+    const nsShim = {
+      // STAT: [size:u64][mtime:u64][kind:u8][etag_len:u8][etag]. ENOENT
+      // (-2) when the key names neither an object nor a populated prefix.
+      host_ns_stat: (keyPtr, keyLen, outPtr, outCap) => {
+        try {
+          const res = nsResolve(kstr(keyPtr, keyLen));
+          if (!res) return -2; // ENOENT
+          const etag = res.kind === 'object' ? res.etag : new Uint8Array(0);
+          const need = 8 + 8 + 1 + 1 + etag.length;
+          if (outCap < need) return -22; // EINVAL — buffer too small
+          const out = kview(outPtr, outCap);
+          const dv = new DataView(out.buffer, out.byteOffset, 16);
+          dv.setBigUint64(0, BigInt(res.size || 0), true);
+          dv.setBigUint64(8, BigInt(res.mtime || 0), true);
+          out[16] = res.kind === 'namespace' ? NS_KIND_NAMESPACE : NS_KIND_OBJECT;
+          out[17] = etag.length;
+          out.set(etag, 18);
+          return need;
+        } catch (err) {
+          console.error(`host_ns_stat threw: ${err.message}`);
+          return -22;
+        }
+      },
+
+      // LIST one page: entries [name_len:u8][kind:u8][name] then a
+      // trailing [0xFF][cursor_len:u8][cursor] record — a 4-byte LE
+      // next-index when more remain, cursor_len=0 at end of listing.
+      host_ns_list: (prefixPtr, prefixLen, cursorIdx, outPtr, outCap) => {
+        try {
+          const children = nsListChildren(kstr(prefixPtr, prefixLen));
+          const out = kview(outPtr, outCap);
+          let w = 0;
+          let i = cursorIdx >>> 0;
+          for (; i < children.length; i++) {
+            const name = new TextEncoder().encode(children[i][0]);
+            if (name.length > 255) continue; // unaddressable in [name_len:u8]
+            const need = 2 + name.length;
+            // Always leave room for the worst-case trailing cursor (6 B).
+            if (w + need + 6 > outCap) break;
+            out[w++] = name.length;
+            out[w++] = children[i][1] === 'namespace' ? NS_KIND_NAMESPACE : NS_KIND_OBJECT;
+            out.set(name, w); w += name.length;
+          }
+          // The trailing cursor record is MANDATORY — a caller parses it
+          // to learn whether more pages remain. Out-of-range writes on a
+          // too-small typed array are silent no-ops, so without an
+          // explicit check we'd return a positive count over a buffer
+          // that never actually received the trailer, leaving the caller
+          // to parse stale/malformed bytes. Fail with EINVAL instead:
+          //   - more entries remain but nothing fit (w === 0): the buffer
+          //     can't even hold one entry + the 6-byte cursor, so the
+          //     caller could never advance — reject rather than hand back
+          //     an empty page that re-polls forever;
+          //   - end-of-listing but no room for the 2-byte terminator.
+          // (When the loop DID emit entries it already reserved 6 B.)
+          const more = i < children.length;
+          if (more) {
+            if (w === 0 || w + 6 > outCap) return -22; // EINVAL — buffer too small to page
+          } else if (w + 2 > outCap) {
+            return -22; // EINVAL — no room for end-of-listing marker
+          }
+          out[w++] = 0xFF;
+          if (more) {
+            out[w++] = 4;
+            out[w++] = i & 0xff; out[w++] = (i >>> 8) & 0xff;
+            out[w++] = (i >>> 16) & 0xff; out[w++] = (i >>> 24) & 0xff;
+          } else {
+            out[w++] = 0; // end of listing
+          }
+          return w;
+        } catch (err) {
+          console.error(`host_ns_list threw: ${err.message}`);
+          return -22;
+        }
       },
     };
 
@@ -905,6 +1215,7 @@
         universal,
         fetchShim,
         objectShim,
+        nsShim,
         inputShim,
         keyboardShim,
         pointerShim,

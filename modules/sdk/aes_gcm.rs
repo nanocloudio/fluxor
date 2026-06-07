@@ -539,21 +539,17 @@ impl AesGcm {
         Self::inc_counter(&mut ctr);
         self.ctr_xor(&mut ctr, data);
 
-        // GHASH
+        // GHASH. `update` already zero-pads each call's trailing partial
+        // block up to the GCM block boundary (see GHash::update), which is
+        // exactly the padding GCM requires between AAD and ciphertext and
+        // before the length block. Do NOT add an extra explicit padding
+        // block here — that injects a spurious all-zero GHASH block for any
+        // non-16-aligned AAD/ciphertext, producing a wrong tag. (It stayed
+        // hidden because it's self-consistent encrypt↔decrypt and the only
+        // GCM KAT used empty AAD + a block-aligned plaintext.)
         let mut ghash = GHash::new(&self.h);
         ghash.update(aad);
-        // Pad AAD to 16 bytes
-        let aad_pad = (16 - (aad.len() % 16)) % 16;
-        if aad_pad > 0 && !aad.is_empty() {
-            let zeros = [0u8; 16];
-            ghash.update(&zeros[..aad_pad]);
-        }
         ghash.update(data);
-        let ct_pad = (16 - (data.len() % 16)) % 16;
-        if ct_pad > 0 && !data.is_empty() {
-            let zeros = [0u8; 16];
-            ghash.update(&zeros[..ct_pad]);
-        }
 
         let mut tag = ghash.finalize_tag(aad.len(), data.len());
         // XOR with encrypted J0
@@ -572,20 +568,14 @@ impl AesGcm {
         let mut tag_mask = ctr;
         self.aes.encrypt_block(&mut tag_mask);
 
-        // GHASH over ciphertext (before decryption)
+        // GHASH over ciphertext (before decryption). `update` already
+        // zero-pads each call's trailing partial block to the GCM block
+        // boundary, so no extra explicit padding block must be added (doing
+        // so injects a spurious all-zero GHASH block for non-16-aligned
+        // AAD/ciphertext and yields a wrong tag). Mirror `encrypt`.
         let mut ghash = GHash::new(&self.h);
         ghash.update(aad);
-        let aad_pad = (16 - (aad.len() % 16)) % 16;
-        if aad_pad > 0 && !aad.is_empty() {
-            let zeros = [0u8; 16];
-            ghash.update(&zeros[..aad_pad]);
-        }
         ghash.update(data);
-        let ct_pad = (16 - (data.len() % 16)) % 16;
-        if ct_pad > 0 && !data.is_empty() {
-            let zeros = [0u8; 16];
-            ghash.update(&zeros[..ct_pad]);
-        }
         let mut computed_tag = ghash.finalize_tag(aad.len(), data.len());
         let mut i = 0;
         while i < 16 { computed_tag[i] ^= tag_mask[i]; i += 1; }

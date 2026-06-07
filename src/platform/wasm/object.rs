@@ -7,13 +7,35 @@
 //! bounded-range reads the Playload RFC (§12.3) needs so a wasm host
 //! can demand-page immutable assets instead of fetching whole files.
 //!
-//! It is backed by four host bindings, the browser shims named by the
+//! It is backed by five host bindings, the browser shims named by the
 //! RFC:
 //!
 //!   - `host_object_head`       — issue a `HEAD`, surface size + mtime
 //!   - `host_object_range_open` — issue a ranged `GET`, return a stream
 //!   - `host_object_recv`       — drain bytes / metadata from a stream
 //!   - `host_object_close`      — cancel + release a stream handle
+//!   - `host_object_put`        — write a blob to the persistent tier
+//!
+//! ## Read tier vs. write tier (OPFS)
+//!
+//! The four read bindings front a *read-only* tier: `fetch()` over the
+//! page origin (and the in-bundle `asset://` map), which serves shipped,
+//! immutable content. There is no way to `PUT` to an HTTP origin from the
+//! browser, so on its own this tier cannot persist user-generated data
+//! (RFC 0009 save-state derivatives, imported ROMs, caches).
+//!
+//! `host_object_put` adds the missing write tier, backed by **OPFS**
+//! (Origin Private File System) on the host side — see
+//! `docs/architecture/wasm_browser_host.md` §5.6. Writes are
+//! synchronously *accepted* into an in-memory store (so an immediately
+//! following `GET`/`HEAD`/`RANGE_GET` of the same key sees the bytes)
+//! and persisted to OPFS in the background; the shim also hydrates that
+//! store from OPFS at boot, so a key written in a prior session reads
+//! back. Reads consult the written store before falling through to
+//! `fetch()`, which is why GET/HEAD/RANGE_GET need no wasm-side change to
+//! see PUT data. Durability is therefore *best-effort* — the per-handle
+//! fence stays `Volatile`, matching the browser quota model (origin
+//! storage may be evicted) per `endpoint_capability_surface.md` §4.
 //!
 //! All windowing math (clamping a request to the object tail, encoding
 //! the `HEAD` record) lives in the host-neutral, unit-tested
@@ -91,6 +113,17 @@ extern "C" {
 
     /// Cancel any in-flight reader and release the handle. Idempotent.
     fn host_object_close(handle: i32) -> i32;
+
+    /// Write `body_ptr[..body_len]` to the persistent (OPFS) tier under
+    /// `key_ptr[..key_len]`. Returns `0` once the write is *accepted*
+    /// (staged in the host's in-memory store and queued for OPFS
+    /// persistence), or a negative errno. The acceptance is synchronous —
+    /// a subsequent `host_object_head`/`host_object_range_open` for the
+    /// same key reads the staged bytes immediately — but OPFS durability
+    /// is best-effort (background commit), so the contract fence is
+    /// `Volatile`, not `Durable`.
+    fn host_object_put(key_ptr: *const u8, key_len: usize, body_ptr: *const u8, body_len: usize)
+        -> i32;
 }
 
 /// Register the provider with the kernel so any module declaring
@@ -129,6 +162,7 @@ unsafe fn wasm_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: 
         };
     }
     match opcode {
+        dev_obj::PUT => obj_put(arg, arg_len),
         dev_obj::GET => obj_get(arg, arg_len),
         dev_obj::HEAD => obj_head(arg, arg_len),
         dev_obj::RANGE_GET => obj_range_get(handle, arg, arg_len),
@@ -162,6 +196,86 @@ unsafe fn alloc_slot(key: &[u8]) -> i32 {
     slot.open_end = 0;
     slot.in_use = true;
     tag_fd(FD_TAG_STORAGE_OBJECT, slot_idx as i32)
+}
+
+/// `PUT` — single-shot write to the persistent (OPFS) tier. `arg` is:
+///
+/// ```text
+///   [key_len:u16 LE][key]
+///   [content_type_len:u8][content_type]
+///   [body_ptr:u64 LE][body_len:u64 LE]
+///   [if_match_len:u8][if_match]
+///   [fence_out_ptr:u64 LE][fence_out_cap:u16 LE]
+/// ```
+///
+/// We forward `key` and `body` to `host_object_put` (which stages then
+/// background-persists to OPFS) and write a `Volatile` fence into the
+/// caller's fence buffer on success. `content_type` is parsed for layout
+/// but not enforced (no etag store). A nonzero `if_match` requests a
+/// conditional overwrite the wasm tier cannot honor yet, so it is
+/// REJECTED with `ENOSYS` rather than silently performing an
+/// unconditional PUT and reporting the guard as satisfied — matching the
+/// linux provider, which also rejects conditional PUT until etag
+/// enforcement lands.
+unsafe fn obj_put(arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 2 {
+        return errno::EINVAL;
+    }
+    let key_len = {
+        let mut b = [0u8; 2];
+        core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 2);
+        u16::from_le_bytes(b) as usize
+    };
+    if key_len == 0 || key_len > MAX_KEY_LEN {
+        return errno::EINVAL;
+    }
+    // Walk the variable-width prefix, bounds-checking each field before
+    // advancing so a short/truncated arg can never read past the buffer.
+    let mut p = 2 + key_len;
+    if arg_len < p + 1 {
+        return errno::EINVAL;
+    }
+    let ct_len = *arg.add(p) as usize;
+    p += 1 + ct_len;
+    if arg_len < p + 8 + 8 + 1 {
+        return errno::EINVAL;
+    }
+    let body_ptr = read_u64(arg, p) as usize as *const u8;
+    p += 8;
+    let body_len = read_u64(arg, p) as usize;
+    p += 8;
+    let if_match_len = *arg.add(p) as usize;
+    p += 1 + if_match_len;
+    if arg_len < p + 8 + 2 {
+        return errno::EINVAL;
+    }
+    // Conditional PUT (nonzero if_match) can't be enforced without an
+    // etag store. Fail loudly rather than do an unconditional overwrite
+    // and falsely report the precondition as met.
+    if if_match_len != 0 {
+        return errno::ENOSYS;
+    }
+    let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;
+    p += 8;
+    let fence_out_cap = {
+        let mut b = [0u8; 2];
+        core::ptr::copy_nonoverlapping(arg.add(p), b.as_mut_ptr(), 2);
+        u16::from_le_bytes(b) as usize
+    };
+
+    let key_ptr = arg.add(2);
+    let rc = host_object_put(key_ptr, key_len, body_ptr, body_len);
+    if rc < 0 {
+        return errno::ENODEV;
+    }
+
+    // PUT acceptance carries the strongest fence the commit achieved;
+    // the browser write tier is best-effort, so that is Volatile.
+    if !fence_out_ptr.is_null() && fence_out_cap >= dev_fence::WIRE_MAX_LEN {
+        let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
+        let _ = dev_fence::Fence::Volatile.encode(fbuf);
+    }
+    errno::OK
 }
 
 /// `GET` — `arg` is the UTF-8 key; reserve a handle bound to it. The

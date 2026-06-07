@@ -89,6 +89,9 @@ mod fs;
 #[path = "wasm/object.rs"]
 mod object;
 
+#[path = "wasm/namespace.rs"]
+mod namespace;
+
 #[path = "wasm/hal.rs"]
 mod hal;
 

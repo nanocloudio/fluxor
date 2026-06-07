@@ -1,0 +1,43 @@
+version = "2.0.0"
+hardware_targets = ["rp2350", "bcm2712", "wasm"]
+
+# Audio asset streamer + navigation — the storage.namespace/object
+# sibling of `foundation/bank`. Enumerates a `dir:` prefix via
+# storage.namespace::LIST and streams each entry via storage.object
+# GET/RANGE_GET (or uses explicit `path_*` object keys); cycles between
+# them in response to `next`/`prev`/`select` FMP commands. On wasm both
+# surfaces resolve to the OPFS-backed objStore + fetched manifest, so a
+# browser player can run against a persistent, user-populatable library.
+
+[[ports]]
+name = "stream"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "notify"
+index = 1
+direction = "output"
+content_type = "FmpMessage"
+
+[[ports]]
+name = "commands"
+direction = "ctrl_input"
+content_type = "FmpMessage"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access = "read"
+
+[commands]
+accepts = ["next", "prev", "toggle", "select"]
+emits = ["status"]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "asset store — served bytes are observed at the http module that serves them"

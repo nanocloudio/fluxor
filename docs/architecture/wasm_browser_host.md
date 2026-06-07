@@ -411,6 +411,87 @@ browser supports it; falls back to **IndexedDB**. Quota is
 origin-scoped and may be evicted; the cache contract is best-effort
 per `endpoint_capability_surface.md` §4 (Cache role).
 
+**Status — persistent `storage.object` write tier (landed).** The
+generic cache-role *module* is still planned, but the OPFS binding it
+prescribes is now realized at the contract level: the wasm
+`storage.object` provider (`src/platform/wasm/object.rs`) gained a `PUT`
+op backed by `host_object_put` in `host_shims.js`. This is the
+write/persistence half the read-only `fetch()` tier could never provide
+— it is what lets RFC 0009 save-state derivatives (and any imported
+asset) survive in-browser. Semantics:
+
+- **Synchronous acceptance, background durability.** `PUT` stages the
+  blob in an in-memory `objStore` (so an immediately-following
+  `GET`/`HEAD`/`RANGE_GET` of the same key sees it) and returns `0`; the
+  OPFS file write happens in the background. The contract fence stays
+  `Volatile` — origin storage may be evicted, matching §4's best-effort
+  Cache role.
+- **OPFS-first reads.** `HEAD`/`RANGE_GET` consult `objStore` before
+  `fetch()`, so a written key reads back without a network round-trip.
+  Unknown keys fall through to the read-only `fetch()`/`asset://` tier
+  (shipped, immutable content) unchanged.
+- **Boot hydration.** At startup the shim recursively walks OPFS into
+  `objStore`, so a key written in a prior session reads back after a
+  reload. Hosts without OPFS (older browsers, private mode) degrade to
+  session-only writes; reads still serve from `fetch()`.
+
+The binding is checked by the host-shim coverage guard
+`tools/tests/wasm_host_shim_coverage.rs` (every wasm extern must have a
+matching `host_*` shim), which runs in `make ci`. Behavior is
+additionally exercised by `tests/host/wasm_object_opfs.test.js` (a Node
+test with a mock OPFS). Both `tools/tests/` and `/tests/` are local-only
+by repo policy (not tracked — see `.gitignore`), and there is no JS
+runtime in `fluxor ci`, so neither file is committed nor gates the
+published CI.
+
+**Status — `storage.namespace` enumeration tier (landed).** The browser
+has no POSIX `readdir`, so directory-style discovery (truffle's
+`truffle_scanner`, any `requires_contract = "storage.namespace"`
+consumer) had nothing to talk to on wasm. The wasm `storage.namespace`
+provider (`src/platform/wasm/namespace.rs`, bindings `host_ns_stat` /
+`host_ns_list`) closes that gap by deriving a directory tree from the
+**same flat key space** the object tier writes:
+
+- **One key space, two surfaces.** `/` is the hierarchy separator over
+  the union of `objStore` (OPFS-backed user data) and a fetched
+  **manifest** of shipped content (`manifestUrl`, default
+  `fluxor-manifest.json` — a JSON array of `{key, size, mtime?, etag?}`).
+  A key `saves/tetris` makes `LIST("")` yield `saves` (namespace) and
+  `LIST("saves/")` yield `tetris` (object). A consumer scans here, then
+  fetches each hit via `storage.object` `GET` on the *same key*.
+- **Synchronous answers.** `LIST`/`STAT` resolve from the in-memory
+  union index — the scanner treats a negative `LIST` as end-of-listing
+  and does not retry, so these never return EAGAIN. The index is
+  hydrated asynchronously (OPFS walk + manifest fetch) and mutated
+  synchronously on object `PUT`; a scan that races boot sees a smaller
+  tree, never a stall.
+- **Paging + identity.** `LIST` pages via an integer cursor; `STAT`
+  returns `[size][mtime][kind][etag]`, with a stable FNV etag
+  synthesized per key for objStore entries (the scanner packs the etag
+  as its 16-byte ObjectId) or the manifest-supplied etag for shipped
+  content.
+
+Binding checked by the same `wasm_host_shim_coverage.rs` guard (run in
+`make ci`); behavior exercised by `tests/host/wasm_namespace.test.js`.
+Both are local-only by repo policy (not tracked — see `.gitignore`).
+
+**Putting the tiers together — the persistent-library player.** The
+write tier, the namespace tier, and the existing codec/audio path
+compose into a browser music library that survives reloads.
+`modules/foundation/object_bank` is `foundation/bank` with its `fs`
+backend swapped for `storage.namespace::LIST` (enumerate a prefix) +
+`storage.object` `GET`/`RANGE_GET` (stream each entry) — identical
+navigation/FMP/streaming machinery, storage-backed source. The example
+graph `examples/audio_player/wasm-library.yaml` wires
+`button → gesture → object_bank → codec → audio_out`, so a browser plays
+WAV/MP3/AAC from a *user-populatable* library (imported via the
+object-PUT tier, or listed in `fluxor-manifest.json`) instead of only
+bundle-baked `asset://` tracks. The graph type-checks under `fluxor
+validate` for the wasm target; the enumerate→stream protocol is
+additionally exercised at the shim level by the local-only (uncommitted)
+Node test
+`tests/host/wasm_object_bank_flow.test.js`.
+
 ### 5.7 `wasm_browser_video_decode` — encoded media decode (planned)
 
 | Port | Direction | Content type |

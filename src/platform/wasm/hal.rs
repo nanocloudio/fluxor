@@ -110,6 +110,12 @@ fn wasm_init_providers() {
     // over `Range:`-capable `fetch()` so modules demand-page immutable
     // assets via `requires_contract = "storage.object"`.
     super::object::register();
+    // Namespace/index provider — directory enumeration (LIST / STAT /
+    // LOOKUP) over the same key space the object provider writes (OPFS
+    // `objStore`) plus a fetched manifest of shipped content. Lets
+    // `requires_contract = "storage.namespace"` consumers (truffle's
+    // scanner) walk a tree the browser has no POSIX `readdir` for.
+    super::namespace::register();
 }
 /// Platform-specific per-module cleanup for WASM host..
 ///
