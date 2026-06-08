@@ -1,0 +1,50 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350"]
+
+# Connection-level demultiplexer. Sits on a single shared `ip` module's
+# `net_out` (NetProto stream) and routes each net_proto frame to one of N
+# downstream TLS+HTTP compute lanes by hashing the per-connection `conn_id`
+# (the first payload byte of every per-connection message: MSG_ACCEPTED,
+# MSG_DATA, MSG_CLOSED, MSG_CONNECTED, MSG_ERROR, MSG_TRACE_CTX, ...). All
+# frames of one connection share a conn_id → land on the same lane → stable
+# per-connection affinity. The return path (lane TLS cipher_out → ip.net_in)
+# is a plain `merge` edge in the graph, NOT through this module.
+#
+# Unlike `demux` (which hashes the ethernet 4-tuple BEFORE a per-lane `ip`),
+# this routes AFTER one shared `ip`, so there is a single IP identity / ARP /
+# DHCP / TCP accept loop and the parallelism lands on the measured bottleneck
+# (TLS compute), not the idle IP stack.
+
+[[ports]]
+name = "conn_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "lane_0"
+direction = "output"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "lane_1"
+direction = "output"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "lane_2"
+direction = "output"
+content_type = "NetProto"
+required = false
+
+[[ports]]
+name = "lane_3"
+direction = "output"
+content_type = "NetProto"
+required = false
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "connection-level fan-out — per-connection bytes are observed at the ip and tls modules; this module's domain metric is route/drop counts only"

@@ -20,7 +20,7 @@
 #![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::gic::{
     EVENT_HANDLE_PCIE1_MSI, GICC_EOIR, GICC_IAR, IRQ_BINDINGS, IRQ_BINDING_COUNT, TIMER_PPI,
@@ -96,8 +96,27 @@ global_asm!(
 /// Guard against recursive exceptions in exception_dump.
 pub static EXCEPTION_DEPTH: AtomicU32 = AtomicU32::new(0);
 
+/// Per-core fault latch. `exception_dump` records the faulting core's ESR/FAR
+/// and a count here so a sibling core (core 0, which owns the UDP debug drain)
+/// can surface secondary-core faults over network telemetry — the UART dump is
+/// invisible on benches without a wired debug UART. Indexed by core id (0..3).
+pub static CORE_FAULT_ESR: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub static CORE_FAULT_FAR: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub static CORE_FAULT_COUNT: [AtomicU32; 4] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
 #[no_mangle]
 pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
+    // Latch the fault per-core BEFORE the recursion guard so a sibling core
+    // (core 0) can surface it over UDP telemetry even when this core's UART
+    // dump is invisible (no wired debug UART) or the core then hangs.
+    let c = (current_core_id() as usize) & 3;
+    CORE_FAULT_ESR[c].store(esr, Ordering::Relaxed);
+    CORE_FAULT_FAR[c].store(far, Ordering::Relaxed);
+    CORE_FAULT_COUNT[c].fetch_add(1, Ordering::Relaxed);
+
     // Prevent recursive exception storms — if we fault inside the handler,
     // just spin silently rather than faulting again.
     if EXCEPTION_DEPTH.fetch_add(1, Ordering::Relaxed) > 0 {
@@ -166,6 +185,12 @@ pub static CORE_TICKS: [AtomicU32; 4] = [
     AtomicU32::new(0),
 ];
 
+/// Per-core last interrupted PC (ELR_EL1), latched by the timer IRQ. When a
+/// core's scheduler loop hangs but timer IRQs still fire, this is the PC of
+/// the spinning code — map it with `rust-objdump -d` on the firmware ELF.
+pub static CORE_LAST_ELR: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 /// Current core number (0-3). Pi 5 encodes it in MPIDR Aff1[15:8].
 #[inline(always)]
 pub fn current_core_id() -> u8 {
@@ -192,6 +217,15 @@ pub unsafe extern "C" fn irq_handler() {
             ((mpidr >> 8) & 0xFF) as usize
         };
         CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
+        // Latch the interrupted PC per core. If a core's scheduler loop has
+        // frozen (domain tick_count stuck) while CORE_TICKS keeps climbing,
+        // every timer IRQ interrupts the spinning code at the same PC — so
+        // CORE_LAST_ELR names exactly where it's stuck (map via objdump).
+        if core_id < 4 {
+            let elr: u64;
+            core::arch::asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+            CORE_LAST_ELR[core_id].store(elr, Ordering::Relaxed);
+        }
     } else {
         // Check IRQ bindings (virtio, etc.)
         let n = IRQ_BINDING_COUNT;

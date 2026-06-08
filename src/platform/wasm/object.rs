@@ -122,8 +122,12 @@ extern "C" {
     /// same key reads the staged bytes immediately — but OPFS durability
     /// is best-effort (background commit), so the contract fence is
     /// `Volatile`, not `Durable`.
-    fn host_object_put(key_ptr: *const u8, key_len: usize, body_ptr: *const u8, body_len: usize)
-        -> i32;
+    fn host_object_put(
+        key_ptr: *const u8,
+        key_len: usize,
+        body_ptr: *const u8,
+        body_len: usize,
+    ) -> i32;
 }
 
 /// Register the provider with the kernel so any module declaring

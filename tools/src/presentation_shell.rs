@@ -260,12 +260,11 @@ fn validate_control(
         // must be present. Picking a row emits the selection `action`.
         "list" => {
             if !has_action {
-                return Err(format!("control `{id}` (list): requires a selection `action`"));
+                return Err(format!(
+                    "control `{id}` (list): requires a selection `action`"
+                ));
             }
-            let has_options = ctl
-                .get("options")
-                .map(|v| v.is_array())
-                .unwrap_or(false);
+            let has_options = ctl.get("options").map(|v| v.is_array()).unwrap_or(false);
             match names_list {
                 Some(l) if !list_resolves => {
                     return Err(format!(

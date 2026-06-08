@@ -3107,6 +3107,21 @@ unsafe fn service_net_channels(s: &mut IpState) {
 // ============================================================================
 
 /// Process TCP timers (retransmit, time-wait).
+/// SYN / SYN-ACK retransmit schedule, in 50 ms timer ticks: fire at 0.5 s,
+/// 1.5 s, 3.5 s, 7.5 s (gaps 0.5/1/2/4 s — exponential backoff).
+///
+/// The previous flat `timer % 60 == 0` retransmitted only every 3 s, so a
+/// single dropped SYN-ACK stalled a connection's establishment for a full 3 s.
+/// Under a lossy link or a connection burst that throttled *establishment*,
+/// which is the dominant achievable-throughput limiter (the server itself has
+/// CPU headroom at 10k+ rps; the ceiling is how fast connections come up). A
+/// faster first retransmit recovers a dropped SYN-ACK in 0.5 s instead of 3 s.
+/// The 15 s connect timeout (`>= 300`) is unchanged.
+#[inline]
+fn is_syn_retransmit_tick(timer: u16) -> bool {
+    matches!(timer, 10 | 30 | 70 | 150)
+}
+
 unsafe fn step_tcp_timers(s: &mut IpState) {
     // Retry pending close-notifications first. Terminal slots
     // (`state == Closed`) are freed on successful retry; non-terminal
@@ -3151,8 +3166,9 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
         match conn.state {
             tcp::TcpState::SynSent => {
                 conn.retransmit_timer += 1;
-                // Retransmit SYN every ~3 s (60 ticks at 50 ms).
-                if conn.retransmit_timer % 60 == 0 && conn.retransmit_timer < 300 {
+                // Retransmit SYN on the exponential-backoff schedule
+                // (0.5/1.5/3.5/7.5 s) so a dropped SYN recovers fast.
+                if is_syn_retransmit_tick(conn.retransmit_timer) {
                     send_tcp_control(s, i, tcp::SYN, true);
                 }
                 // Connect timeout after ~15 s: emit exactly one TAGGED terminal
@@ -3174,8 +3190,10 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
             }
             tcp::TcpState::SynReceived => {
                 conn.retransmit_timer += 1;
-                // Retransmit SYN-ACK every ~3 seconds (timer doesn't reset)
-                if conn.retransmit_timer % 60 == 0 && conn.retransmit_timer < 300 {
+                // Retransmit SYN-ACK on the exponential-backoff schedule
+                // (0.5/1.5/3.5/7.5 s) instead of the old flat 3 s — a dropped
+                // SYN-ACK was the main cause of slow connection establishment.
+                if is_syn_retransmit_tick(conn.retransmit_timer) {
                     send_tcp_control(s, i, tcp::SYN | tcp::ACK, true);
                 }
                 // Timeout after ~15 seconds — free the slot.

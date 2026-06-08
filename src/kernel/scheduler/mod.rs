@@ -1314,6 +1314,16 @@ pub fn current_module_index() -> usize {
     CURRENT_MODULE_PER_CORE[core].load(portable_atomic::Ordering::Relaxed) as usize
 }
 
+/// Return the module index a specific core is currently stepping. Lets a
+/// sibling core (e.g. core 0) identify which module another core is stuck in
+/// when that core's tick count has frozen — a cross-core hang diagnostic.
+pub fn module_index_on_core(core: usize) -> usize {
+    if core >= MAX_DOMAINS {
+        return 0;
+    }
+    CURRENT_MODULE_PER_CORE[core].load(portable_atomic::Ordering::Relaxed) as usize
+}
+
 /// Set the current module index. Used by provider dispatch for context switching.
 pub fn set_current_module(idx: usize) {
     let core = crate::kernel::hal::core_id();
@@ -5191,56 +5201,92 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     } else {
         0
     };
-    for order_pos in 0..n {
-        let rotated_pos = if exec_count > 0 {
-            (order_pos + offset) % exec_count
-        } else {
-            order_pos
-        };
-        let module_idx = if exec_count > 0 {
-            sched.exec_order[rotated_pos] as usize
-        } else {
-            order_pos
-        };
-        if module_idx >= count {
-            continue;
+    // Bounded multi-pass within the tick (see `MAX_PIPELINE_PASSES`). One pass
+    // moves data one hop along `exec_order`, so a request's return path
+    // (consumer-before-producer for the reverse direction) waits a full tick
+    // per hop. Re-running the pass while any module still reports `Burst` lets
+    // the full round-trip complete in one tick — the dominant per-request
+    // latency. Idle ticks burst nothing → one pass (low-load cost unchanged);
+    // the per-domain budget bounds the busy case.
+    let mut tick_pass = 0u32;
+    let mut hard_break = false;
+    loop {
+        // Single-domain path (rp2350/linux/wasm): not run concurrently, but it
+        // steps every module regardless of `domain_id`, so clear/check across
+        // all domain slots rather than assuming domain 0.
+        for b in BURST_SEEN_THIS_PASS.iter() {
+            b.store(false, Ordering::Relaxed);
         }
-        // Skip Tier 1c (pre-tick) modules from the regular exec_order
-        // pass — they already ran via `step_domain_pre_tick` at the
-        // top of this function. Without this, every Tier 1c module
-        // would step twice per cooperative tick, doubling the
-        // accumulator and confusing telemetry. The skip is bounded
-        // (per-module flag read), so the cost on non-Tier-1c modules
-        // is one branch.
-        if sched.pre_tick_drain[module_idx] {
-            continue;
-        }
-        step_one_module(
-            modules,
-            sched,
-            module_idx,
-            not_ready,
-            &mut active_count,
-            false,
-        );
+        for order_pos in 0..n {
+            let rotated_pos = if exec_count > 0 {
+                (order_pos + offset) % exec_count
+            } else {
+                order_pos
+            };
+            let module_idx = if exec_count > 0 {
+                sched.exec_order[rotated_pos] as usize
+            } else {
+                order_pos
+            };
+            if module_idx >= count {
+                continue;
+            }
+            // Skip Tier 1c (pre-tick) modules from the regular exec_order
+            // pass — they already ran via `step_domain_pre_tick` at the
+            // top of this function.
+            if sched.pre_tick_drain[module_idx] {
+                continue;
+            }
+            step_one_module(
+                modules,
+                sched,
+                module_idx,
+                not_ready,
+                &mut active_count,
+                false,
+            );
 
-        // Soft overrun: log + advance the cyclic shift but keep
-        // running downstream modules (the NIC drain in particular).
-        // Hard overrun (`break`) reserved for runaway-loop protection.
-        let stepped_domain = sched.domain_id[module_idx] as usize;
-        if stepped_domain < MAX_DOMAINS {
-            let soft = domain_budget_exhausted(sched, stepped_domain);
-            let hard = soft && domain_budget_hard_overrun(sched, stepped_domain);
-            if soft && !overrun_logged[stepped_domain] {
-                record_domain_budget_overrun(sched, stepped_domain, module_idx);
-                sched.exec_order_offset = sched.exec_order_offset.wrapping_add(1);
-                overrun_logged[stepped_domain] = true;
+            // Soft overrun: log + advance the cyclic shift but keep
+            // running downstream modules (the NIC drain in particular).
+            // Hard overrun (`break`) reserved for runaway-loop protection.
+            let stepped_domain = sched.domain_id[module_idx] as usize;
+            if stepped_domain < MAX_DOMAINS {
+                let soft = domain_budget_exhausted(sched, stepped_domain);
+                let hard = soft && domain_budget_hard_overrun(sched, stepped_domain);
+                if soft && !overrun_logged[stepped_domain] {
+                    record_domain_budget_overrun(sched, stepped_domain, module_idx);
+                    sched.exec_order_offset = sched.exec_order_offset.wrapping_add(1);
+                    overrun_logged[stepped_domain] = true;
+                }
+                if hard {
+                    hard_break = true;
+                    break;
+                }
             }
-            if hard {
-                break;
-            }
+        }
+        tick_pass += 1;
+        if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
+            break;
+        }
+        // Pipeline drained (no pending work in any domain) → nothing to re-pass.
+        if !BURST_SEEN_THIS_PASS
+            .iter()
+            .any(|b| b.load(Ordering::Relaxed))
+        {
+            break;
+        }
+        // Domain 0 (the only domain on single-domain targets) out of budget.
+        if domain_budget_exhausted(sched, 0) {
+            break;
         }
     }
+
+    // NB: no post-exec re-run of the pre-tick (Tier 1c) drain here. Re-running
+    // `step_domain_pre_tick` would step every Tier 1c module a second time —
+    // including RX-draining ones, not just a NIC TX flush — double-executing
+    // side-effecting modules (pinned by `scheduler_pre_tick_slot`). Same-tick
+    // TX shipping would need a dedicated post-exec flush tier; the multi-pass
+    // loop above is the dominant latency win and stands on its own.
 
     // Drain any cooperative⇄ISR-tier bridge edges so messages
     // pending in either direction flow before the next tick. Runs
@@ -5278,7 +5324,14 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 /// (`step_domain_modules_poll`) to decide whether the domain has more
 /// work pending or can WFE. Each `step_domain_modules_poll` call
 /// clears the flag before the pass.
-static BURST_SEEN_THIS_PASS: AtomicBool = AtomicBool::new(false);
+/// PER-DOMAIN, indexed by `domain_id`. On BCM2712 each core runs its own
+/// domain's `step_domain_modules` concurrently; a single shared flag would let
+/// one core clear or observe another core's burst marker mid-pass, making the
+/// multi-pass re-run nondeterministic and risking a poll-mode domain WFE-ing
+/// while it still has local pending work. A slot per domain keeps each core's
+/// burst signal isolated to its own pass.
+static BURST_SEEN_THIS_PASS: [AtomicBool; MAX_DOMAINS] =
+    [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
 /// Variant of [`step_domain_modules`] for platforms running a
 /// continuous-poll execution tier (e.g. BCM2712 Tier 3): runs one full
@@ -5291,9 +5344,12 @@ pub fn step_domain_modules_poll(
     modules: &mut [ModuleSlot; MAX_MODULES],
     domain_id: usize,
 ) -> (StepResult, bool) {
-    BURST_SEEN_THIS_PASS.store(false, Ordering::Relaxed);
+    if domain_id >= MAX_DOMAINS {
+        return (step_domain_modules(modules, domain_id), false);
+    }
+    BURST_SEEN_THIS_PASS[domain_id].store(false, Ordering::Relaxed);
     let result = step_domain_modules(modules, domain_id);
-    let burst = BURST_SEEN_THIS_PASS.swap(false, Ordering::Relaxed);
+    let burst = BURST_SEEN_THIS_PASS[domain_id].swap(false, Ordering::Relaxed);
     (result, burst)
 }
 
@@ -5321,6 +5377,18 @@ fn domain_budget_exhausted(sched: &SchedulerState, domain_id: usize) -> bool {
 /// for runaway-loop protection; soft overruns let the pass finish
 /// so downstream modules (e.g. the NIC drain) still tick.
 const BUDGET_HARD_BREAK_MULTIPLIER: u64 = 10;
+
+/// Max times the per-domain exec rotation is re-run within a single tick.
+///
+/// One pass moves data one hop along `exec_order`, so a request's RETURN
+/// path (http→tls→ip, against topological order) would otherwise wait a full
+/// tick per hop — the dominant per-request latency (≈ pipeline-depth × tick_us).
+/// Re-running the pass while any module still reports `Burst` (pending work)
+/// lets a full ip→tls→http→tls→ip round-trip complete in one tick. Idle ticks
+/// burst nothing → exactly one pass, so the low-load cost is unchanged; the
+/// per-domain budget caps the busy case. Bounded so a perpetually-bursting
+/// module can't spin the tick.
+const MAX_PIPELINE_PASSES: u32 = 4;
 
 #[inline]
 fn domain_budget_hard_overrun(sched: &SchedulerState, domain_id: usize) -> bool {
@@ -5527,35 +5595,64 @@ pub fn step_domain_modules(
     } else {
         0
     };
-    for pos in 0..n {
-        let rotated = if n > 0 { (pos + dom_offset) % n } else { pos };
-        let module_idx = sched.domain_exec_order[domain_id][rotated] as usize;
-        if module_idx >= count {
-            continue;
-        }
-        step_one_module(
-            modules,
-            sched,
-            module_idx,
-            not_ready,
-            &mut active_count,
-            false,
-        );
+    // Bounded multi-pass within the tick (see `MAX_PIPELINE_PASSES`). Re-run
+    // the exec rotation while any module still reports `Burst` and the domain
+    // budget isn't spent, so a request's forward AND return path flow in one
+    // tick instead of one hop per tick. The budget accumulates across passes
+    // (reset once above), so the existing soft/hard overrun guards bound the
+    // busy case exactly as a single pass would.
+    let mut tick_pass = 0u32;
+    let mut hard_break = false;
+    loop {
+        BURST_SEEN_THIS_PASS[domain_id].store(false, Ordering::Relaxed);
+        for pos in 0..n {
+            let rotated = if n > 0 { (pos + dom_offset) % n } else { pos };
+            let module_idx = sched.domain_exec_order[domain_id][rotated] as usize;
+            if module_idx >= count {
+                continue;
+            }
+            step_one_module(
+                modules,
+                sched,
+                module_idx,
+                not_ready,
+                &mut active_count,
+                false,
+            );
 
-        // Soft overrun: log once + advance the cyclic shift, keep
-        // running. Hard overrun (`break`) is runaway-loop protection.
-        let soft = domain_budget_exhausted(sched, domain_id);
-        let hard = soft && domain_budget_hard_overrun(sched, domain_id);
-        if soft && !overrun_logged_this_pass {
-            record_domain_budget_overrun(sched, domain_id, module_idx);
-            sched.domain_exec_order_offset[domain_id] =
-                sched.domain_exec_order_offset[domain_id].wrapping_add(1);
-            overrun_logged_this_pass = true;
+            // Soft overrun: log once + advance the cyclic shift, keep
+            // running. Hard overrun (`break`) is runaway-loop protection.
+            let soft = domain_budget_exhausted(sched, domain_id);
+            let hard = soft && domain_budget_hard_overrun(sched, domain_id);
+            if soft && !overrun_logged_this_pass {
+                record_domain_budget_overrun(sched, domain_id, module_idx);
+                sched.domain_exec_order_offset[domain_id] =
+                    sched.domain_exec_order_offset[domain_id].wrapping_add(1);
+                overrun_logged_this_pass = true;
+            }
+            if hard {
+                hard_break = true;
+                break;
+            }
         }
-        if hard {
+        tick_pass += 1;
+        if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
+            break;
+        }
+        // No module had pending work → pipeline drained, nothing to re-pass.
+        if !BURST_SEEN_THIS_PASS[domain_id].load(Ordering::Relaxed) {
+            break;
+        }
+        // Out of tick budget → let the next tick continue draining.
+        if domain_budget_exhausted(sched, domain_id) {
             break;
         }
     }
+
+    // NB: no post-exec re-run of the pre-tick (Tier 1c) drain here — see the
+    // matching note in `step_modules`. Re-running it double-executes every
+    // Tier 1c module (RX drains, not just a NIC TX flush) and breaks the
+    // run-exactly-once contract pinned by `scheduler_pre_tick_slot`.
 
     // Drain cooperative⇄ISR bridges after the domain finishes its
     // exec_order rotation. Mirrors the pump call in `step_modules`.
@@ -5885,8 +5982,13 @@ fn step_one_module(
             Ok(StepOutcome::Burst) => {
                 // Record that this pass saw a Burst — poll-mode callers
                 // (`step_domain_modules_poll`) read this to decide
-                // whether to spin or WFE.
-                BURST_SEEN_THIS_PASS.store(true, Ordering::Relaxed);
+                // whether to spin or WFE. Set the bursting module's OWN
+                // domain slot so a concurrent sibling-core pass can't be
+                // confused by it.
+                let burst_domain = sched.domain_id[module_idx] as usize;
+                if burst_domain < MAX_DOMAINS {
+                    BURST_SEEN_THIS_PASS[burst_domain].store(true, Ordering::Relaxed);
+                }
                 // Keep timer armed for entire burst with extended deadline
                 step_guard::disarm();
                 // If the manifest declared an explicit burst deadline,

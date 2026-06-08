@@ -370,61 +370,74 @@ fn fp_mul(a: &U256, b: &U256) -> U256 {
     fp_reduce(&t)
 }
 
-/// Wide squaring: a^2 → 512-bit result.
-/// Exploits symmetry: cross-products a[i]*a[j] (i≠j) computed once and doubled.
-/// 10 multiplications instead of 16 for general multiply.
+/// Wide squaring: `a^2` → 512-bit result (8 × u64 limbs, little-endian).
+///
+/// Comba / column method exploiting symmetry: each output column `k` is the
+/// sum over `i + j == k` of `a[i]*a[j]`, with the off-diagonal (`i < j`) terms
+/// doubled and the diagonal (`i == j`) term added once — 10 single-limb
+/// multiplies instead of the 16 a general product needs. A 3-limb accumulator
+/// (`acc_lo: u128` + `acc_hi: u64`) absorbs each column's full sum (up to
+/// ~5·2^128) before the low 64 bits are emitted and the rest shifted down, so
+/// carries never truncate. Bit-identical to `u256_mul_wide(a, a)`; the prior
+/// version had a carry-truncation bug (gated out by the ECDSA/ECDH KATs).
 fn u256_sqr_wide(a: &U256) -> [u64; 8] {
-    let mut r = [0u128; 8];
-
-    // Cross-products (i < j only), then double
-    let mut i = 0;
-    while i < 4 {
-        let mut j = i + 1;
-        while j < 4 {
-            let prod = (a[i] as u128) * (a[j] as u128);
-            r[i + j] += prod;
-            r[i + j + 1] += r[i + j] >> 64;
-            r[i + j] &= 0xFFFFFFFFFFFFFFFF;
-            j += 1;
-        }
-        i += 1;
-    }
-
-    // Double all cross-products
-    i = 7;
-    while i > 0 {
-        r[i] = (r[i] << 1) | (r[i - 1] >> 63);
-        i -= 1;
-    }
-    r[0] <<= 1;
-
-    // Add squared terms a[i]*a[i]
-    i = 0;
-    while i < 4 {
-        let sq = (a[i] as u128) * (a[i] as u128);
-        r[i * 2] += sq & 0xFFFFFFFFFFFFFFFF;
-        r[i * 2 + 1] += r[i * 2] >> 64;
-        r[i * 2] &= 0xFFFFFFFFFFFFFFFF;
-        r[i * 2 + 1] += sq >> 64;
-        if i < 3 {
-            r[i * 2 + 2] += r[i * 2 + 1] >> 64;
-            r[i * 2 + 1] &= 0xFFFFFFFFFFFFFFFF;
-        }
-        i += 1;
-    }
-
     let mut out = [0u64; 8];
-    i = 0;
-    while i < 8 {
-        out[i] = r[i] as u64;
-        i += 1;
+    // 3-limb little-endian accumulator: `acc_lo` holds bits 0..128, `acc_hi`
+    // holds bits 128..192. A single column sum stays well under 2^192.
+    let mut acc_lo: u128 = 0;
+    let mut acc_hi: u64 = 0;
+
+    let mut col = 0usize;
+    while col < 8 {
+        let mut i = 0usize;
+        while i < 4 {
+            // j such that i + j == col, with 0 <= j < 4.
+            if col >= i {
+                let j = col - i;
+                if j < 4 && i < j {
+                    // Off-diagonal: add the product twice (doubled).
+                    let p = (a[i] as u128) * (a[j] as u128);
+                    let (s1, c1) = acc_lo.overflowing_add(p);
+                    acc_lo = s1;
+                    if c1 {
+                        acc_hi += 1;
+                    }
+                    let (s2, c2) = acc_lo.overflowing_add(p);
+                    acc_lo = s2;
+                    if c2 {
+                        acc_hi += 1;
+                    }
+                } else if j == i {
+                    // Diagonal square term: add once.
+                    let p = (a[i] as u128) * (a[i] as u128);
+                    let (s, c) = acc_lo.overflowing_add(p);
+                    acc_lo = s;
+                    if c {
+                        acc_hi += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        // Emit the low 64 bits of this column, shift the accumulator down 64.
+        out[col] = acc_lo as u64;
+        acc_lo = (acc_lo >> 64) | ((acc_hi as u128) << 64);
+        acc_hi = 0;
+        col += 1;
     }
     out
 }
 
-/// Modular squaring: a^2 mod p
+/// Modular squaring: a^2 mod p.
+///
+/// Uses the dedicated `u256_sqr_wide` (10 multiplies via cross-product
+/// symmetry) rather than the general `u256_mul_wide` (16 multiplies). Squaring
+/// dominates Jacobian point doubling, which dominates the scalar multiplication
+/// on every ECDH agreement and ECDSA sign — so this ~1.6× cheaper wide product
+/// speeds the whole handshake crypto. Bit-identical to `fp_mul(a, a)`, gated by
+/// the ECDSA/ECDH KATs in `tests/harness/tests/tls_crypto_kat.rs`.
 fn fp_sqr(a: &U256) -> U256 {
-    fp_mul(a, a)
+    fp_reduce(&u256_sqr_wide(a))
 }
 
 /// Modular inversion using Fermat's little theorem: a^(p-2) mod p
@@ -1257,6 +1270,51 @@ pub fn ecdh_keygen(random_bytes: &[u8; 32]) -> ([u8; 32], [u8; 65]) {
     }
 
     (priv_key, pub_key)
+}
+
+/// Resumable variant of `ecdh_keygen` for background ECDH-pool refill.
+///
+/// Reduces `random_bytes` into a valid scalar `k ∈ [1, n-1]` (identical
+/// clamping to `ecdh_keygen`), returns the private-key bytes immediately,
+/// plus a `ScalarMulState` that computes the public point `k·G`
+/// incrementally — `bits_per_step` ladder bits per `step()` call
+/// (`bits_per_step == 0` runs to completion in one call). Drive `step()`
+/// until it returns true, then call `ecdh_keygen_finalise`. The resulting
+/// keypair is byte-identical to `ecdh_keygen(random_bytes)` because both
+/// reduce `k` the same way and `k·G` is independent of the multiplication
+/// algorithm.
+pub fn ecdh_keygen_init(random_bytes: &[u8; 32], bits_per_step: u8) -> ([u8; 32], ScalarMulState) {
+    let mut k = u256_from_be(random_bytes);
+    k = mod_n_reduce(&k);
+    if u256_is_zero(&k) {
+        k = ONE;
+    }
+    let priv_key = u256_to_be(&k);
+    let state = ScalarMulState::new_base(&k, bits_per_step);
+    (priv_key, state)
+}
+
+/// Finalise an `ecdh_keygen_init` ladder into the 65-byte uncompressed
+/// public key (`0x04 || X || Y`). The caller must ensure `state.step()`
+/// has returned true. Returns `None` only if the result is the point at
+/// infinity — which `ecdh_keygen_init`'s non-zero `k` clamp already
+/// precludes, so a `None` here signals a logic error, not normal input.
+pub fn ecdh_keygen_finalise(state: &ScalarMulState) -> Option<[u8; 65]> {
+    let point = state.result();
+    if point.is_identity() {
+        return None;
+    }
+    let (x, y) = point.to_affine();
+    let mut pub_key = [0u8; 65];
+    pub_key[0] = 0x04;
+    let xb = u256_to_be(&x);
+    let yb = u256_to_be(&y);
+    // SAFETY: fixed-size P-256 field elements (32 bytes), offsets bounded.
+    unsafe {
+        core::ptr::copy_nonoverlapping(xb.as_ptr(), pub_key.as_mut_ptr().add(1), 32);
+        core::ptr::copy_nonoverlapping(yb.as_ptr(), pub_key.as_mut_ptr().add(33), 32);
+    }
+    Some(pub_key)
 }
 
 /// Public-key validation: is the affine point (x, y) on the P-256

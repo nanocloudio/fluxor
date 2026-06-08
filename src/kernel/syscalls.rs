@@ -684,7 +684,11 @@ const STORAGE_FAMILY: u32 = (1u32 << crate::kernel::provider::contract::STORAGE_
 /// landing only needs to register handlers, not amend this mask. This is
 /// a ceiling, NOT a grant: `check_contract_grant`'s manifest gate still
 /// requires each non-infra contract to be declared.
-const CAP_CONTRACT_MASK: [u32; 4] = [
+///
+/// `pub` so the cap-class policy can be pinned by an out-of-tree harness
+/// test (`tests/harness/tests/kernel_permissions.rs`) — production `src/`
+/// keeps no inline tests (enforced by `tools/tests/src_shape_no_inline_tests`).
+pub const CAP_CONTRACT_MASK: [u32; 4] = [
     0x0027_1FE1 | STORAGE_FAMILY, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST
     0x0027_1FF1 | STORAGE_FAMILY, // CAP_SERVICE_PIO: service + HAL_PIO
     0x0027_1FE3 | STORAGE_FAMILY, // CAP_SERVICE_GPIO: service + HAL_GPIO
@@ -1987,36 +1991,8 @@ unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u
 
 // RP platform providers are now registered via HAL (init_providers / release_module_handles).
 // The rp/providers.rs file is included from the RP platform entrypoint instead.
-
-#[cfg(test)]
-mod cap_class_grant_tests {
-    use super::CAP_CONTRACT_MASK;
-    use crate::kernel::provider::contract as ct;
-
-    // Pins the RFC 0009 cap-class policy: a service-tier module (anything
-    // not typed `Protocol` → CAP_FULL) may reach the storage family on the
-    // same footing as `fs`. This is a CEILING; `check_contract_grant`'s
-    // manifest gate still requires each contract to be declared. Reverting
-    // the storage-family bits would silently re-break service-tier
-    // storage.object resolution (the emulator asset bank), so pin it here.
-    #[test]
-    fn service_tiers_admit_storage_family_like_fs() {
-        for cap in 0..3usize {
-            // CAP_SERVICE (0), CAP_SERVICE_PIO (1), CAP_SERVICE_GPIO (2)
-            let m = CAP_CONTRACT_MASK[cap];
-            assert_ne!(m & (1u32 << ct::FS as u32), 0, "fs must be service-reachable");
-            assert_ne!(
-                m & (1u32 << ct::STORAGE_OBJECT as u32),
-                0,
-                "storage.object must be service-reachable (RFC 0009)"
-            );
-            assert_ne!(
-                m & (1u32 << ct::STORAGE_NAMESPACE as u32),
-                0,
-                "storage.namespace must be service-reachable (RFC 0009)"
-            );
-        }
-        // CAP_FULL reaches every contract.
-        assert_eq!(CAP_CONTRACT_MASK[3], 0xFFFF_FFFF);
-    }
-}
+//
+// The cap-class grant policy (`CAP_CONTRACT_MASK`) is pinned by an out-of-tree
+// test — `service_tiers_admit_storage_family_like_fs` in
+// `tests/harness/tests/kernel_permissions.rs` — so production `src/` stays
+// inline-test-free.

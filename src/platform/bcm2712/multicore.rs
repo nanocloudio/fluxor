@@ -436,8 +436,21 @@ pub fn get_cross_channel(idx: usize) -> Option<&'static CrossDomainChannel> {
 // Secondary core wake
 // ============================================================================
 
-/// Per-core stack size (16 KB each).
-pub const CORE_STACK_SIZE: usize = 16 * 1024;
+/// Per-core stack size for secondary cores.
+///
+/// Must match the primary core's stack budget (`__stack_start..__stack_end`
+/// = 1 MB in `memory-bcm2712.x`), because any module assigned to a secondary
+/// domain runs the same deep call chains the primary stack was sized for — in
+/// particular the P-256 primitives, which materialise curve constants on the
+/// stack per call (a TLS handshake nests several of these under the record
+/// and key-schedule frames). At 16 KB a `tls` lane pinned to a secondary core
+/// overflowed this stack mid-handshake: with no guard page the overflow
+/// silently corrupted adjacent statics (clobbering `run_domain_loop`'s
+/// `domain_id`, which then bounds-panicked on `DOMAIN_METRICS[domain_id]`),
+/// so single-domain graphs (tls on the 1 MB primary stack) worked while the
+/// multi-core lane variant hung. Reserved in BSS (NOLOAD) — costs RAM, not
+/// image size.
+pub const CORE_STACK_SIZE: usize = 1024 * 1024;
 
 /// Stack storage for secondary cores. 16-byte aligned per AArch64 SP
 /// alignment requirement.

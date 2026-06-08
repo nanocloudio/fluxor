@@ -968,6 +968,64 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 if metrics.tick_count % report_interval == 0 && metrics.tick_count > 0 {
                     log::info!("[tier1a] d={} ticks={} worst={}cyc", domain_id, metrics.tick_count, metrics.worst_step_ticks);
                 }
+                // Cross-domain bridge health — domain 0 only (core 0 owns the
+                // UDP debug drain), emitted frequently (~0.5 s at tick_us=100)
+                // so the multi-lane cross-domain wedge is visible over telemetry
+                // without UART. drops = SPSC ring rejected a frame; bp =
+                // backpressure (ring full / consumer not ready); depth[d] =
+                // pending frames queued toward domain d.
+                if domain_id == 0 && metrics.tick_count % 5000 == 0 {
+                    let (drops, bp, _sb) = multicore::cross_domain_stats();
+                    let depth = multicore::cross_domain_queue_depths();
+                    // Per-domain liveness: tick_count (tier 0/1a) and poll_steps
+                    // (tier 3). A frozen count for a lane domain means that core
+                    // isn't stepping (timer/wake), distinct from a module that
+                    // isn't consuming its input. SAFETY: relaxed reads of other
+                    // domains' metrics for diagnostics only.
+                    let (d1t, d1p, d2t, d2p) = unsafe {
+                        (DOMAIN_METRICS[1].tick_count, DOMAIN_METRICS[1].poll_steps,
+                         DOMAIN_METRICS[2].tick_count, DOMAIN_METRICS[2].poll_steps)
+                    };
+                    // Secondary-core fault latch — a frozen lane tick_count with
+                    // a nonzero fault count + ESR identifies a core that took an
+                    // exception (the UART dump being invisible on this bench).
+                    let f1 = exception::CORE_FAULT_COUNT[1].load(Ordering::Relaxed);
+                    let f2 = exception::CORE_FAULT_COUNT[2].load(Ordering::Relaxed);
+                    let e1 = exception::CORE_FAULT_ESR[1].load(Ordering::Relaxed);
+                    let e2 = exception::CORE_FAULT_ESR[2].load(Ordering::Relaxed);
+                    // Which module each lane core is currently stepping — if a
+                    // lane's tick is frozen, this names the module it hung in.
+                    let m1 = scheduler::module_index_on_core(1);
+                    // HW timer-IRQ count per core (climbs even while the loop is
+                    // stuck) + the last interrupted PC (the spin location).
+                    let ct1 = exception::CORE_TICKS[1].load(Ordering::Relaxed);
+                    let elr1 = exception::CORE_LAST_ELR[1].load(Ordering::Relaxed);
+                    log::info!(
+                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d1=[t{} ct{} mod{} elr{:#x}] d2=[t{}]",
+                        drops, bp,
+                        depth[0], depth[1], depth[2], depth[3],
+                        d1t, ct1, m1, elr1, d2t
+                    );
+                    let _ = (d1p, d2p, f1, e1, f2, e2);
+                    // If any core latched a panic, broadcast the site over UDP.
+                    let pc = PANIC_CORE.load(Ordering::Relaxed);
+                    if pc != 0xFFFF_FFFF {
+                        let line = PANIC_LINE.load(Ordering::Relaxed);
+                        let fptr = PANIC_FILE_PTR.load(Ordering::Relaxed);
+                        let flen = PANIC_FILE_LEN.load(Ordering::Relaxed) as usize;
+                        let file = if fptr != 0 && flen > 0 && flen < 256 {
+                            // SAFETY: file ptr/len come from a `&'static str` in
+                            // the shared address space; bounded length (<256),
+                            // read-only.
+                            let bytes =
+                                unsafe { core::slice::from_raw_parts(fptr as *const u8, flen) };
+                            core::str::from_utf8(bytes).unwrap_or("?")
+                        } else {
+                            "?"
+                        };
+                        log::info!("[PANIC] core={pc} at {file}:{line}");
+                    }
+                }
             }
         }
         // ── Tier 3: Poll-mode (continuous stepping) ──
@@ -1114,6 +1172,13 @@ fn domain_step_all(domain_id: usize) {
 /// `edge.pending_aux`: the consumer-side pump drains the consumer's
 /// local input aux and stores it there; the producer-side pump drains
 /// it and replays it onto the producer's local output aux.
+/// Max frames a single `pump_cross_domain` pass moves per edge per direction.
+/// Sized to a full SPSC ring so a producer can fill (or a consumer drain) the
+/// whole ring in one pass instead of one frame per domain tick — the latter
+/// throttled cross-domain TLS flights to 1 frame/tick and saturated the ring
+/// under load.
+const CROSS_PUMP_BURST: u32 = multicore::RING_SLOTS as u32;
+
 fn pump_cross_domain(domain_id: usize) {
     let n_cross = multicore::cross_edge_count();
     let mut ei = 0;
@@ -1128,9 +1193,19 @@ fn pump_cross_domain(domain_id: usize) {
         // mailbox; the producer module sees back-pressure on its output
         // and the pump retries next tick.
         if edge.from_domain == domain_id as u8 && edge.local_out_handle >= 0 {
-            if ch.is_full() {
-                multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
-            } else {
+            // Drain up to a full ring's worth of frames from the producer
+            // mailbox into the SPSC ring this pass. The original one-frame-
+            // per-pump shipped at most one frame per domain tick, so a TLS
+            // flight (many records) crawled across the seam and the ring
+            // saturated under load (observed: depth stuck at RING_SLOTS, the
+            // consumer's curl timing out). Stop when the ring is full
+            // (back-pressure) or the mailbox is drained.
+            let mut moved = 0u32;
+            while moved < CROSS_PUMP_BURST {
+                if ch.is_full() {
+                    multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
                 let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
                 // SAFETY: `buf` is `SLOT_DATA_SIZE` bytes on the stack;
                 // channel_read writes ≤ `buf.len()` bytes.
@@ -1139,16 +1214,18 @@ fn pump_cross_domain(domain_id: usize) {
                         edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
                     )
                 };
-                if n > 0 {
-                    // The ring had space when we checked, but a parallel
-                    // consumer-side close (or an oversized frame, which
-                    // `ch.send` rejects) can still cause a refusal. Bump
-                    // the cross-domain drop counter so operator-side
-                    // telemetry sees it.
-                    if !ch.send(&buf[..n as usize]) {
-                        multicore::CROSS_DOMAIN_DROPS.fetch_add(1, Ordering::Relaxed);
-                    }
+                if n <= 0 {
+                    break; // producer mailbox empty
                 }
+                // The ring had space when we checked, but a parallel
+                // consumer-side close (or an oversized frame, which
+                // `ch.send` rejects) can still cause a refusal. Bump the
+                // cross-domain drop counter so operator-side telemetry sees it.
+                if !ch.send(&buf[..n as usize]) {
+                    multicore::CROSS_DOMAIN_DROPS.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                moved += 1;
             }
             let aux = edge.pending_aux.swap(u32::MAX, Ordering::AcqRel);
             if aux != u32::MAX {
@@ -1163,30 +1240,43 @@ fn pump_cross_domain(domain_id: usize) {
 
         // Consumer side.
         if edge.to_domain == domain_id as u8 && edge.local_in_handle >= 0 {
-            let write_ready = fluxor::kernel::channel::channel_poll(
-                edge.local_in_handle,
-                fluxor::kernel::channel::POLL_OUT,
-            );
-            let can_write = write_ready > 0
-                && (write_ready as u32 & fluxor::kernel::channel::POLL_OUT) != 0;
-            if can_write {
-                let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
-                if let Some(len) = ch.try_recv(&mut buf) {
-                    // SAFETY: `len <= SLOT_DATA_SIZE = buf.len()`;
-                    // `local_in_handle` already polled for POLL_OUT
-                    // capacity above.
-                    unsafe {
-                        fluxor::kernel::channel::channel_write(
-                            edge.local_in_handle, buf.as_ptr(), len,
-                        );
-                    }
+            // Drain up to a full ring's worth of frames from the SPSC ring
+            // into the local consumer channel this pass, re-checking POLL_OUT
+            // each iteration (the FIFO can fill mid-drain). Matches the
+            // multi-frame producer drain above so a burst clears in one pump.
+            let mut moved = 0u32;
+            while moved < CROSS_PUMP_BURST {
+                // Atomic-or-nothing delivery. The local consumer channel is a
+                // FIFO whose `channel_write` is partial-OK — writing a slot
+                // that doesn't fully fit truncates it, losing the tail and
+                // corrupting the consumer's framed byte stream (net_proto:
+                // a dropped tail desyncs the [type][len][payload] framing, so
+                // the consumer reads a bogus length and SPINS on phantom reads
+                // — exactly the lane-core hang). So peek the next slot's length
+                // and only consume+write it when the FIFO has room for ALL of
+                // it; otherwise leave it queued and back-pressure.
+                let Some(slot_len) = ch.try_peek_len() else {
+                    break; // ring empty
+                };
+                if fluxor::kernel::channel::channel_writable_bytes(edge.local_in_handle)
+                    < slot_len
+                {
+                    multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
+                    break;
                 }
-            } else if ch.try_peek_len().is_some() {
-                // Cross-domain ring has data but the local consumer
-                // can't accept right now. No drop — the data stays
-                // queued until the next pump — but a sustained nonzero
-                // rate here means the consumer is under-served.
-                multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
+                let mut buf = [0u8; multicore::SLOT_DATA_SIZE];
+                let Some(len) = ch.try_recv(&mut buf) else {
+                    break; // ring drained between peek and recv
+                };
+                // SAFETY: `len == slot_len <= SLOT_DATA_SIZE = buf.len()`, and
+                // the FIFO was just confirmed to have room for the whole slot,
+                // so this write is complete (no truncation).
+                unsafe {
+                    fluxor::kernel::channel::channel_write(
+                        edge.local_in_handle, buf.as_ptr(), len,
+                    );
+                }
+                moved += 1;
             }
             let mut val: u32 = 0;
             let rc = fluxor::kernel::channel::channel_ioctl(
@@ -1960,8 +2050,28 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     len as i32
 }
 
+/// Panic latch — a panic on a secondary core prints to the (possibly unwired)
+/// UART then halts. These atomics let core 0, which owns the live UDP debug
+/// drain, surface the panic site over network telemetry. file ptr+len point
+/// into 'static rodata (kernel or PIC module — shared address space), so core 0
+/// can reconstruct the `&str`.
+pub static PANIC_CORE: portable_atomic::AtomicU32 =
+    portable_atomic::AtomicU32::new(0xFFFF_FFFF);
+pub static PANIC_LINE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+pub static PANIC_FILE_PTR: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+pub static PANIC_FILE_LEN: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
+    // Latch the panic site so core 0 can broadcast it over UDP (the UART
+    // dump below is invisible on benches without a wired debug UART). Done
+    // first, with plain atomic stores only — no formatting/alloc in here.
+    if let Some(loc) = info.location() {
+        PANIC_LINE.store(loc.line(), Ordering::Relaxed);
+        PANIC_FILE_PTR.store(loc.file().as_ptr() as u64, Ordering::Relaxed);
+        PANIC_FILE_LEN.store(loc.file().len() as u32, Ordering::Relaxed);
+    }
+    PANIC_CORE.store(current_core_id() as u32, Ordering::Relaxed);
     // Emergency sink: platform-owned, separate from the normal
     // DebugTx drain. Writes directly to the UART hardware because
     // the scheduler is dead and the debug drain won't run again.
