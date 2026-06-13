@@ -189,11 +189,15 @@ mod profile_host {
 #[cfg(target_arch = "wasm32")]
 mod profile_wasm {
     pub mod kernel {
-        // Bumped from 8 MiB to 32 MiB to comfortably hold a graph
-        // that ingests a multi-MB encoded image (browser image-codec
-        // built-in). Browser tabs have ample memory headroom; the
+        // Sized to hold the N64 graph at the 32 MiB cartridge ceiling
+        // (Ocarina of Time, DK64): `n64_core` streams the ROM straight into
+        // its bus ROM (~32 MiB ROM + 4 MiB RDRAM, no second full-ROM copy),
+        // and `emu_file_loader` stages one framed copy (~32 MiB) to emit the
+        // load command — ~72 MiB of live state at peak, plus the small video /
+        // audio / mapper modules. 96 MiB covers it with margin; 64 MiB held
+        // only the ≤12 MB carts. Browser tabs have ample memory headroom; the
         // arena is paged in lazily by `memory.grow`.
-        pub const STATE_ARENA_SIZE: usize = 32 * 1024 * 1024;
+        pub const STATE_ARENA_SIZE: usize = 96 * 1024 * 1024;
         pub const BUFFER_ARENA_SIZE: usize = 2 * 1024 * 1024;
         pub const MAX_MODULES: usize = 32;
         pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;

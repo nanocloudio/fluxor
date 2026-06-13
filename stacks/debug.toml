@@ -48,6 +48,7 @@ name = "debug"
 # rp2 / bcm / qemu-virt wire the netconsole alongside their IP stack.
 [[variant]]
 match = { to = "net", family = "rp2" }
+accept_cycles = true
 modules = [
   { name = "log_net", params = {
       dst_ip    = "user:dst_ip|host:debug.collector_ip|required",
@@ -62,6 +63,7 @@ wiring = [
 
 [[variant]]
 match = { to = "net", family = "bcm" }
+accept_cycles = true
 modules = [
   { name = "log_net", params = {
       dst_ip    = "user:dst_ip|host:debug.collector_ip|required",
@@ -83,6 +85,7 @@ wiring = [
 # `ip`-fronted variants above.
 [[variant]]
 match = { to = "net", family = "linux" }
+accept_cycles = true
 modules = [
   { name = "log_net", params = {
       dst_ip    = "user:dst_ip|host:debug.collector_ip|required",
@@ -189,6 +192,7 @@ wiring = []
 #       # export_flush_ms: 1000         # optional; max partial-batch latency
 [[overlay]]
 match = { export_telemetry = "udp", family = "rp2" }
+accept_cycles = true
 modules = [
   { name = "otel_udp_sample", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
@@ -204,6 +208,7 @@ wiring = [
 
 [[overlay]]
 match = { export_telemetry = "udp", family = "bcm" }
+accept_cycles = true
 modules = [
   { name = "otel_udp_sample", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
@@ -219,6 +224,7 @@ wiring = [
 
 [[overlay]]
 match = { export_telemetry = "udp", family = "linux" }
+accept_cycles = true
 modules = [
   { name = "otel_udp_sample", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
@@ -262,6 +268,7 @@ wiring = [
 # rp2040 — otlp_http is too heavy for the M0+ and excludes it in its manifest.
 [[overlay]]
 match = { export_telemetry = "otlp", silicon = "rp2350" }
+accept_cycles = true
 modules = [
   { name = "otlp_http", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
@@ -277,6 +284,7 @@ wiring = [
 
 [[overlay]]
 match = { export_telemetry = "otlp", family = "bcm" }
+accept_cycles = true
 modules = [
   { name = "otlp_http", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",

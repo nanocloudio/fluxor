@@ -201,6 +201,17 @@ struct StackInjection {
     #[serde(default)]
     wiring: Vec<String>,
     service: Option<String>,
+    /// When true, this injection introduces an intentional bidirectional
+    /// feedback pair (e.g. `debug: to: net` wires `ip.net_out -> log_net`
+    /// AND `log_net.net_out -> ip.net_in`, a 2-cycle). The v1 scheduler
+    /// rejects cyclic graphs unless `scheduler.accept_cycles` is set, so an
+    /// injection that knowingly creates a feedback pair sets that flag on the
+    /// expanded config — otherwise every `debug: to: net` graph is rejected
+    /// at `prepare_graph` and boots with no working graph (the cm5 "low-module
+    /// boot wedge" was this: small configs lacked an unrelated http<->ws cycle
+    /// that would have set the flag for them).
+    #[serde(default)]
+    accept_cycles: bool,
 }
 
 #[derive(Deserialize)]
@@ -732,6 +743,21 @@ fn inject_wiring_and_services(
         }
     }
 
+    // Intentional feedback pair → opt the graph into cycle acceptance. Set
+    // only when not already specified, so a user's explicit `accept_cycles:
+    // false` (should they ever want it) isn't silently overridden — but in
+    // practice this is what makes `debug: to: net` graphs boot at all.
+    if variant.accept_cycles {
+        if config.get("scheduler").is_none() {
+            config["scheduler"] = json!({});
+        }
+        if let Some(sched) = config["scheduler"].as_object_mut() {
+            sched
+                .entry("accept_cycles".to_string())
+                .or_insert_with(|| json!(true));
+        }
+    }
+
     // Service injection
     if let Some(ref svc) = variant.service {
         if svc == "host" {
@@ -837,6 +863,7 @@ mod tests {
             modules,
             wiring: wiring.into_iter().map(String::from).collect(),
             service: None,
+            accept_cycles: false,
         }
     }
 
@@ -921,6 +948,87 @@ mod tests {
         let edges = edge_strings(&config);
         assert!(edges.contains(&"rp1_gem.frames_rx->conn_guard.frames_rx".to_string()));
         assert!(edges.contains(&"conn_guard.frames_tx->ip.frames_rx".to_string()));
+    }
+
+    /// `debug: to: net` injects a `log_net <-> ip` feedback 2-cycle. An
+    /// injection with `accept_cycles = true` must set
+    /// `scheduler.accept_cycles` on the expanded config so `prepare_graph`
+    /// doesn't reject the graph (the cm5 low-module boot wedge). A user's
+    /// explicit value is preserved (`.or_insert`).
+    #[test]
+    fn accept_cycles_injection_sets_scheduler_flag() {
+        let mut config = json!({
+            "modules": [{ "name": "ip" }],
+            "wiring": [],
+        });
+        let mut injection = make_injection(
+            vec![make_module("log_net", None)],
+            vec!["ip.net_out -> log_net.net_in", "log_net.net_out -> ip.net_in"],
+        );
+        injection.accept_cycles = true;
+        let mut globally_skipped = std::collections::HashSet::new();
+        inject_injection(
+            &mut config,
+            &injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut globally_skipped,
+        )
+        .unwrap();
+        assert_eq!(
+            config["scheduler"]["accept_cycles"],
+            json!(true),
+            "debug:to:net feedback pair must auto-enable accept_cycles"
+        );
+
+        // An explicit user value wins over the auto-set.
+        let mut config2 = json!({
+            "scheduler": { "accept_cycles": false },
+            "modules": [{ "name": "ip" }],
+            "wiring": [],
+        });
+        let mut injection2 = make_injection(
+            vec![make_module("log_net", None)],
+            vec!["ip.net_out -> log_net.net_in", "log_net.net_out -> ip.net_in"],
+        );
+        injection2.accept_cycles = true;
+        let mut skipped2 = std::collections::HashSet::new();
+        inject_injection(
+            &mut config2,
+            &injection2,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut skipped2,
+        )
+        .unwrap();
+        assert_eq!(
+            config2["scheduler"]["accept_cycles"],
+            json!(false),
+            "explicit user accept_cycles must be preserved"
+        );
+    }
+
+    /// An injection WITHOUT `accept_cycles` must not add a scheduler block.
+    #[test]
+    fn no_accept_cycles_leaves_scheduler_absent() {
+        let mut config = json!({ "modules": [], "wiring": [] });
+        let injection = make_injection(vec![make_module("foo", None)], vec![]);
+        let mut skipped = std::collections::HashSet::new();
+        inject_injection(
+            &mut config,
+            &injection,
+            &HashMap::new(),
+            &dummy_host(),
+            &empty_meta(),
+            &mut skipped,
+        )
+        .unwrap();
+        assert!(
+            config.get("scheduler").is_none(),
+            "non-cycle injection must not synthesize a scheduler block"
+        );
     }
 
     /// Type-based dedup: the user has `ip_0` with explicit `type:ip`,
