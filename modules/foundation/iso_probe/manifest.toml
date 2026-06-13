@@ -1,0 +1,9 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# EL0 module-isolation probe for the CM5 walking skeleton. Runs at EL0
+# under its own page table when wired with `protection: isolated` and
+# demonstrates allowed (own state) vs. denied (kernel / out-of-region /
+# execute-state / write-code) accesses, each of which becomes a contained
+# module protection fault rather than a core hang. Diagnostic only — not
+# loaded by production configs. See docs/architecture/cm5_el0_isolation.md.

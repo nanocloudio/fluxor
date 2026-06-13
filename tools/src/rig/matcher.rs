@@ -38,6 +38,12 @@ use crate::rig::vocab::{Capability, Surface};
 ///     load probe against the rig's IP and emits NDJSON bytes; the
 ///     matcher evaluates regex rules against the same byte-stream path
 ///     it uses for console/telemetry)
+///   * `observe.udp_capture` (generic UDP-datagram capture transport —
+///     binds a configured port and streams each datagram as bytes; the
+///     matcher evaluates regex rules against that per-source byte stream,
+///     same path as console/telemetry. Use it to assert on arbitrary
+///     `platform.debug.to: net` log lines, e.g. the EL0 isolation
+///     `[el0]` / `MON_FAULT` records)
 ///
 /// Not yet supported (need transport attachment + matcher wiring):
 ///   * `observe.monitor_stream`
@@ -46,6 +52,7 @@ pub fn supports_rule_source(cap: Capability) -> bool {
     matches!(cap.surface(), Surface::Console | Surface::Telemetry)
         || cap.as_str() == "observe.netboot_fetch"
         || cap.as_str() == "observe.https_load"
+        || cap.as_str() == "observe.udp_capture"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

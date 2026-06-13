@@ -407,6 +407,96 @@ const MAX_FREE_REGIONS: usize = 32;
 static mut FREE_LIST: [FreeRegion; MAX_FREE_REGIONS] =
     [FreeRegion { offset: 0, size: 0 }; MAX_FREE_REGIONS];
 static mut FREE_COUNT: usize = 0;
+
+// ============================================================================
+// Isolated-module arena (EL0 isolation, BCM2712)
+// ============================================================================
+//
+// State and heap for `protection: isolated` modules are carved from this
+// DEDICATED, page-aligned arena rather than `STATE_ARENA`. The EL0 page-table
+// mapping rounds every region out to whole 4 KiB pages, so an isolated
+// allocation MUST own its pages exclusively — otherwise the rounding would map
+// a neighbouring allocation (a kernel global, or a peer module's state) into
+// the module's address space, writable. Keeping isolated memory in its own
+// arena, with each allocation page-aligned and page-padded, guarantees that:
+//   * the arena base is page-aligned (so an aligned offset is an aligned addr),
+//   * no isolated allocation shares a page with a non-isolated one,
+//   * the kernel's own globals never share a page with an EL0-RW mapping.
+// Bump-allocated; reclaimed wholesale by `reset_state_arena` on reconfigure.
+// `mmu::build_table` independently REFUSES to map any non-page-clean region, so
+// a sizing shortfall here fails closed (the module is never run) rather than
+// leaking. Sized for a small number of special isolated modules; a module that
+// needs more fails closed loudly.
+/// Page granule for isolated allocations (matches the EL0 4 KiB page size).
+#[cfg(feature = "chip-bcm2712")]
+const ISO_PAGE: usize = 4096;
+/// Per-image budget for all isolated module state + heap combined.
+#[cfg(feature = "chip-bcm2712")]
+const ISO_ARENA_SIZE: usize = 2 * 1024 * 1024;
+#[cfg(feature = "chip-bcm2712")]
+#[repr(C, align(4096))]
+struct IsoArena([u8; ISO_ARENA_SIZE]);
+#[cfg(feature = "chip-bcm2712")]
+static mut ISO_ARENA: IsoArena = IsoArena([0; ISO_ARENA_SIZE]);
+#[cfg(feature = "chip-bcm2712")]
+static mut ISO_ARENA_OFFSET: usize = 0;
+
+/// Allocate a page-aligned, page-padded region for an isolated module from the
+/// dedicated ISO arena. Returns `(ptr, mapped_size)` where `ptr` is
+/// page-aligned, a `STATE_CANARY` is written at `ptr + size`, and `mapped_size`
+/// is the page-rounded footprint to register with the MMU (so the EL0 mapping
+/// covers only pages this allocation owns). The caller keeps the *user* `size`
+/// for canary validation / free. Memory is zeroed.
+#[cfg(feature = "chip-bcm2712")]
+pub fn alloc_isolated(size: usize) -> Result<(*mut u8, usize), LoaderError> {
+    // SAFETY: single-threaded prepare-graph/instantiation path; bump allocator
+    // on the dedicated ISO arena with checked arithmetic against its cap.
+    unsafe {
+        let off = (ISO_ARENA_OFFSET + ISO_PAGE - 1) & !(ISO_PAGE - 1);
+        // Pad the (user + canary) footprint up to a whole number of pages so
+        // the region the MMU maps is exclusively this allocation's.
+        let mapped = size
+            .checked_add(STATE_CANARY_SIZE)
+            .map(|n| (n + ISO_PAGE - 1) & !(ISO_PAGE - 1))
+            .ok_or(LoaderError::StatePoolExhausted)?;
+        let next = match off.checked_add(mapped) {
+            Some(n) if n <= ISO_ARENA_SIZE => n,
+            _ => {
+                log::error!(
+                    "[loader] ISO ARENA EXHAUSTED — need={mapped} used={off} cap={ISO_ARENA_SIZE} \
+                     (isolated module too large; raise ISO_ARENA_SIZE or shrink the module). \
+                     Module will FAIL CLOSED."
+                );
+                return Err(LoaderError::StatePoolExhausted);
+            }
+        };
+        let ptr = core::ptr::addr_of_mut!(ISO_ARENA.0).cast::<u8>().add(off);
+        // Zero the ENTIRE mapped (page-rounded) span, not just `size`. The full
+        // span is mapped EL0-RW into the module's page table; the arena is
+        // reset by rewinding the offset (no clear), so a later isolated module
+        // reusing this region would otherwise read the PREVIOUS module's stale
+        // state/heap bytes from the page-padding tail. Zeroing `mapped` closes
+        // that cross-reconfiguration leak.
+        core::ptr::write_bytes(ptr, 0, mapped);
+        core::ptr::write_unaligned(ptr.add(size) as *mut u32, STATE_CANARY);
+        ISO_ARENA_OFFSET = next;
+        Ok((ptr, mapped))
+    }
+}
+
+/// True if `ptr` was handed out by [`alloc_isolated`] (lives in the ISO arena).
+/// `free_state_range` uses this to skip the STATE_ARENA free-list bookkeeping
+/// for isolated allocations (which are reclaimed wholesale at reset).
+#[cfg(feature = "chip-bcm2712")]
+fn is_iso_ptr(ptr: *const u8) -> bool {
+    // SAFETY: address comparison only; no dereference.
+    unsafe {
+        let base = core::ptr::addr_of!(ISO_ARENA.0) as *const u8 as usize;
+        let p = ptr as usize;
+        p >= base && p < base + ISO_ARENA_SIZE
+    }
+}
+
 const STATE_ALIGN: usize = 8;
 #[inline]
 fn align_up(n: usize) -> usize {
@@ -554,6 +644,15 @@ pub unsafe fn free_state_range(ptr: *mut u8, size: usize) {
              module overran its state buffer",
         );
     }
+    // Isolated allocations live in the dedicated ISO arena, not STATE_ARENA.
+    // They have no free-list entry (the arena is bump-only, reclaimed wholesale
+    // by reset_state_arena), so there is nothing to release here — just return
+    // after the canary check above. Computing a STATE_ARENA offset from an ISO
+    // pointer would corrupt the free list.
+    #[cfg(feature = "chip-bcm2712")]
+    if is_iso_ptr(ptr as *const u8) {
+        return;
+    }
     let base = core::ptr::addr_of_mut!(STATE_ARENA.0).cast::<u8>();
     let offset = ptr as usize - base as usize;
     // Checked arithmetic mirrors `alloc_state`. A wrapping
@@ -618,6 +717,12 @@ pub fn reset_state_arena() {
     unsafe {
         STATE_ARENA_OFFSET = 0;
         FREE_COUNT = 0;
+        // Reclaim the isolated arena too; the next graph rebuilds its isolated
+        // tables from scratch (mmu::reset_isolation runs in the same pass).
+        #[cfg(feature = "chip-bcm2712")]
+        {
+            ISO_ARENA_OFFSET = 0;
+        }
         // Content is not zeroed; alloc_state zeros each allocation.
     }
 }
@@ -1464,7 +1569,6 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                 // (`tools/src/manifest.rs::to_bytes`, which keeps signed and
                 // unsigned manifests both at MANIFEST_VERSION = 1).
                 let has_signature = (flags & 0x02) != 0;
-                let mut computed_hash: Option<[u8; 32]> = None;
                 if has_integrity {
                     // Stored hash sits after ports/resources/dependencies; its
                     // offset depends on those counts. If signature follows,
@@ -1480,15 +1584,23 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     let stored_hash = &manifest_data[hash_offset..hash_offset + 32];
                     use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::new();
+                    // The stored integrity hash covers code||data — a corruption
+                    // check (recomputable by anyone, so no authenticity on its
+                    // own). AUTHENTICITY over the full security envelope (header,
+                    // export table, schema, manifest capability metadata) is the
+                    // SIGNATURE's job — see the `module_signing_envelope` hash in
+                    // the signature-verification block below, which the Ed25519
+                    // signature is taken over. Keeping integrity as code||data
+                    // keeps unsigned/dev modules loadable (pack stamps the same).
                     let code_ptr = module.code_base();
-                    // SAFETY: code section is `code_size` bytes starting at
-                    // `code_base()`, validated as inside the entry footprint.
+                    // SAFETY: code section is `code_size` bytes from code_base(),
+                    // inside the validated entry footprint.
                     let code_data = unsafe { core::slice::from_raw_parts(code_ptr, code_size) };
                     hasher.update(code_data);
                     if data_size > 0 {
                         // SAFETY: data section follows code; inside footprint.
                         let data_ptr = unsafe { offset_ptr(code_ptr, code_size) };
-                        // SAFETY: `data_size` bytes inside the entry footprint.
+                        // SAFETY: `data_size` bytes from data_ptr, inside footprint.
                         let data_section =
                             unsafe { core::slice::from_raw_parts(data_ptr, data_size) };
                         hasher.update(data_section);
@@ -1500,7 +1612,6 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         log::error!("[loader] {name}: integrity mismatch");
                         return Err(LoaderError::IntegrityMismatch);
                     }
-                    computed_hash = Some(h);
                 }
                 // Signature verification. The feature flag gates enforcement;
                 // when off, we still verify if a signature is present (to
@@ -1518,9 +1629,35 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     sig.copy_from_slice(&manifest_data[sig_offset..sig_offset + 64]);
                     let mut _signer_fp = [0u8; 32];
                     _signer_fp.copy_from_slice(&manifest_data[sig_offset + 64..sig_offset + 96]);
-                    let hash = match computed_hash {
-                        Some(h) => h,
-                        None => return Err(LoaderError::SignatureInvalid),
+                    // The signature is taken over the SIGNING ENVELOPE — the full
+                    // security-relevant image, NOT just code/data — so a tampered
+                    // header / export table / schema / manifest-capability field
+                    // breaks the signature. MUST byte-match the signer (`tools`
+                    // `cmd_sign`):
+                    //   header[0..64]          (sizes, export_count, abi_version…)
+                    //   skip header[64..66]    (manifest_size: signing grows it)
+                    //   header[66..72] || code || data || export-table || schema
+                    //   manifest[0..hash_offset] with flags byte 14 bits 0-1
+                    //     (has_integrity/has_signature) MASKED — the only
+                    //     [0..hash_offset] bytes that differ unsigned vs signed.
+                    let hash = {
+                        let hash_offset = 16 + var_size;
+                        use sha2::{Digest, Sha256};
+                        let mut eh = Sha256::new();
+                        // SAFETY: [module.base, +manifest_offset) is the
+                        // header+code+data+exports+schema region, inside the
+                        // validated entry footprint; manifest_offset >= 72.
+                        let pre =
+                            unsafe { core::slice::from_raw_parts(module.base, manifest_offset) };
+                        eh.update(&pre[0..64]);
+                        eh.update(&pre[66..manifest_offset]);
+                        eh.update(&manifest_data[0..14]);
+                        eh.update([manifest_data[14] & 0xFC]);
+                        eh.update(&manifest_data[15..hash_offset]);
+                        let d = eh.finalize();
+                        let mut h = [0u8; 32];
+                        h.copy_from_slice(&d);
+                        h
                     };
                     let mut pubkey = [0u8; 32];
                     if hal::otp_read_signing_key(&mut pubkey) {
@@ -1658,6 +1795,11 @@ pub struct DynamicModule {
     /// Optional drain function pointer (resolved from module_drain export).
     /// None if the module does not export module_drain.
     drain_fn: Option<ModuleDrainFn>,
+    /// `true` when this module declared `protection: isolated` and is
+    /// routed through `mmu::protected_step` (EL0 on BCM2712). `false`
+    /// keeps the unchanged direct EL1 call path used by `none`/`guarded`.
+    /// Set at construction from `scheduler::module_is_isolated`.
+    isolated: bool,
 }
 /// Partially initialized module waiting for async operations to complete.
 ///
@@ -1759,6 +1901,7 @@ impl DynamicModulePending {
                     state_ptr: self.state_ptr,
                     state_size: self.state_size as u32,
                     drain_fn: self.drain_fn,
+                    isolated: super::scheduler::module_is_isolated(self.module_idx as usize),
                 }))
             }
             NewStatus::Pending => Ok(None),
@@ -1804,6 +1947,7 @@ impl DynamicModule {
             state_ptr,
             state_size,
             drain_fn: None,
+            isolated: false,
         }
     }
     /// Release this module's state buffer back to the pool. Consumes the
@@ -1876,8 +2020,37 @@ impl DynamicModule {
         let exports = lookup_exports(module, name)?;
         // 3. Get required state size (FFI call, but validated)
         let required_size = invoke_state_size(&exports);
-        // 4. Allocate state from arena (safe)
-        let state_ptr = alloc_state(required_size)?;
+        // Peek the protection TLV BEFORE allocating: an isolated module's
+        // state/heap must come from the dedicated page-aligned ISO arena so the
+        // EL0 mapping (which rounds to whole pages) can't expose neighbours.
+        // (Full parse happens after heap init, below — this is a non-mutating
+        // read.) `iso_requested` is always false off BCM2712 (no EL0 regime).
+        let params_slice = if params.ptr.is_null() || params.len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: `params.ptr` non-null + `params.len > 0` checked;
+            // caller validated the pointer covers `params.len` bytes.
+            unsafe { core::slice::from_raw_parts(params.ptr, params.len) }
+        };
+        #[cfg(feature = "chip-bcm2712")]
+        let iso_requested = super::scheduler::params_request_isolation(params_slice);
+        #[cfg(not(feature = "chip-bcm2712"))]
+        let iso_requested = false;
+        // 4. Allocate state. `state_map_size` is the footprint the MMU maps
+        // (page-padded for isolated modules so it owns whole pages); the module
+        // and its canary still use `required_size`.
+        let (state_ptr, state_map_size) = if iso_requested {
+            #[cfg(feature = "chip-bcm2712")]
+            {
+                alloc_isolated(required_size)?
+            }
+            #[cfg(not(feature = "chip-bcm2712"))]
+            {
+                (alloc_state(required_size)?, required_size)
+            }
+        } else {
+            (alloc_state(required_size)?, required_size)
+        };
         // Set instantiation state so syscalls made from module_new can
         // locate the module by index → state pointer.
         let inst_idx = super::scheduler::current_module_index();
@@ -1893,14 +2066,36 @@ impl DynamicModule {
         // typically silently (the http multi-conn refactor learned this
         // the hard way on cm5: 16+ MiB arena ask vs 4 MiB STATE_ARENA
         // → arena alloc skipped → http silently never instantiated).
+        // Heap arena pointer/size captured for MMU-isolation region
+        // registration below (null/0 when the module has no arena).
+        let mut iso_heap_ptr: *mut u8 = core::ptr::null_mut();
+        let mut iso_heap_size: usize = 0;
+        // Footprint the MMU maps for the heap (page-padded for isolated modules);
+        // the heap allocator still manages only `arena_size` usable bytes.
+        let mut iso_heap_map_size: usize = 0;
         if let Ok(arena_addr) = module.get_export_addr(export_hashes::MODULE_ARENA_SIZE) {
             let arena_fn: ModuleStateSizeFn = fn_ptr_from_addr(arena_addr);
             let arena_size = call_state_size(arena_fn);
             if arena_size > 0 {
-                match alloc_state(arena_size) {
-                    Ok(arena_ptr) => {
+                let arena_alloc = if iso_requested {
+                    #[cfg(feature = "chip-bcm2712")]
+                    {
+                        alloc_isolated(arena_size)
+                    }
+                    #[cfg(not(feature = "chip-bcm2712"))]
+                    {
+                        alloc_state(arena_size).map(|p| (p, arena_size))
+                    }
+                } else {
+                    alloc_state(arena_size).map(|p| (p, arena_size))
+                };
+                match arena_alloc {
+                    Ok((arena_ptr, arena_map)) => {
                         let module_idx = super::scheduler::current_module_index();
                         super::heap::init_module_heap(module_idx, arena_ptr, arena_size);
+                        iso_heap_ptr = arena_ptr;
+                        iso_heap_size = arena_size;
+                        iso_heap_map_size = arena_map;
                     }
                     Err(e) => {
                         log::error!(
@@ -1929,15 +2124,50 @@ impl DynamicModule {
         //   * invoke_new — `module_new(...)` runs the same
         //
         // Every byte of declared protection is in place before the
-        // module's first instruction executes.
-        let params_slice = if params.ptr.is_null() || params.len == 0 {
-            &[][..]
-        } else {
-            // SAFETY: `params.ptr` non-null + `params.len > 0` checked;
-            // caller validated the pointer covers `params.len` bytes.
-            unsafe { core::slice::from_raw_parts(params.ptr, params.len) }
-        };
+        // module's first instruction executes. (`params_slice` was bound near
+        // the top of this fn for the early isolation peek; reuse it here.)
         super::scheduler::parse_protection_config(inst_idx, params_slice);
+
+        // Register this module's code/state/heap regions with the MMU so
+        // that — if it declared `protection: isolated` — the graph-prepare
+        // pass can build a complete EL0 page table from them. Cheap and
+        // always recorded; only consulted when isolation is enabled. The
+        // channel-buffer region is registered separately once channels are
+        // open (see `set_channel_region` in the prepare pass). BCM2712 only.
+        // Register the MMU-mapped footprints: `state_map_size`/`iso_heap_map_size`
+        // are page-padded for isolated modules so the EL0 mapping covers only
+        // pages this module owns (and `build_table`'s page-clean check passes).
+        // For non-isolated modules these equal the raw sizes (unchanged path).
+        #[cfg(feature = "chip-bcm2712")]
+        crate::kernel::mmu::register_module(
+            inst_idx,
+            module.code_base() as u64,
+            module.header.code_size as u64,
+            state_ptr,
+            state_map_size,
+            iso_heap_ptr,
+            iso_heap_map_size,
+        );
+        // Record the exact channel handles this module is allowed to name in
+        // an isolated `SVC #1` gateway call — its own in/out/ctrl. The gateway
+        // rejects any other handle so an isolated module can't read or modify
+        // unrelated graph edges. Always recorded (cheap); only consulted for
+        // isolated modules. BCM2712 only.
+        #[cfg(feature = "chip-bcm2712")]
+        crate::kernel::mmu::set_isolated_channels(
+            inst_idx,
+            channels.in_chan,
+            channels.out_chan,
+            channels.ctrl_chan,
+        );
+        // Silence unused warnings on non-BCM2712 targets, where these feed only
+        // the cfg-gated MMU registration above.
+        let _ = (
+            iso_heap_ptr,
+            iso_heap_size,
+            state_map_size,
+            iso_heap_map_size,
+        );
         // 5. Initialize module (FFI call, but validated)
         if let Err(e) = invoke_init(module, syscalls, name) {
             free_state_range(state_ptr, required_size);
@@ -1969,6 +2199,7 @@ impl DynamicModule {
                     state_ptr,
                     state_size: required_size as u32,
                     drain_fn,
+                    isolated: super::scheduler::module_is_isolated(inst_idx),
                 }))
             }
             NewStatus::Pending => {
@@ -1998,8 +2229,29 @@ impl DynamicModule {
 }
 impl Module for DynamicModule {
     fn step(&mut self) -> Result<StepOutcome, i32> {
-        // SAFETY: step_fn and state_ptr were validated during construction
-        let result = unsafe { call_step(self.step_fn, self.state_ptr) };
+        // Isolated modules drop to EL0 under their own page table via
+        // `mmu::protected_step` (BCM2712). Everything else takes the
+        // unchanged direct EL1 call so `none`/`guarded` modules and the
+        // performance path are byte-for-byte as before. `protected_step`
+        // itself re-checks that an isolated table was built and falls back
+        // to a direct call otherwise, so this branch is purely a fast gate.
+        let result = if self.isolated {
+            #[cfg(feature = "chip-bcm2712")]
+            {
+                // SAFETY: step_fn/state_ptr validated at construction; the
+                // scheduler set `current_module_index()` before `m.step()`,
+                // which `mmu::enter_el0` uses to locate the page table.
+                unsafe { crate::kernel::mmu::protected_step(self.step_fn, self.state_ptr) }
+            }
+            #[cfg(not(feature = "chip-bcm2712"))]
+            {
+                // SAFETY: step_fn and state_ptr were validated during construction
+                unsafe { call_step(self.step_fn, self.state_ptr) }
+            }
+        } else {
+            // SAFETY: step_fn and state_ptr were validated during construction
+            unsafe { call_step(self.step_fn, self.state_ptr) }
+        };
         match result {
             0 => Ok(StepOutcome::Continue),
             1 => Ok(StepOutcome::Done),

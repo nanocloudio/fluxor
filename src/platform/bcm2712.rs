@@ -1000,13 +1000,16 @@ fn run_domain_loop(domain_id: usize) -> ! {
                     // stuck) + the last interrupted PC (the spin location).
                     let ct1 = exception::CORE_TICKS[1].load(Ordering::Relaxed);
                     let elr1 = exception::CORE_LAST_ELR[1].load(Ordering::Relaxed);
+                    let far1 = exception::CORE_FAULT_FAR[1].load(Ordering::Relaxed);
+                    let sp1 = exception::CORE_FAULT_SPSR[1].load(Ordering::Relaxed);
+                    let fe1 = exception::CORE_FAULT_ELR[1].load(Ordering::Relaxed);
                     log::info!(
-                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d1=[t{} ct{} mod{} elr{:#x}] d2=[t{}]",
+                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d1=[t{} ct{} mod{} elr{:#x} fc{} esr{:#x} far{:#x} spsr{:#x} felr{:#x}] d2=[t{}]",
                         drops, bp,
                         depth[0], depth[1], depth[2], depth[3],
-                        d1t, ct1, m1, elr1, d2t
+                        d1t, ct1, m1, elr1, f1, e1, far1, sp1, fe1, d2t
                     );
-                    let _ = (d1p, d2p, f1, e1, f2, e2);
+                    let _ = (d1p, d2p, f2, e2);
                     // If any core latched a panic, broadcast the site over UDP.
                     let pc = PANIC_CORE.load(Ordering::Relaxed);
                     if pc != 0xFFFF_FFFF {

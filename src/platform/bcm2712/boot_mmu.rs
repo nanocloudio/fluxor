@@ -41,6 +41,17 @@ mod cm5_impl {
     const AP_RW: u64 = 0 << 6; // AP[2:1] = 00: EL1 RW
     const SH_INNER: u64 = 3 << 8; // Inner shareable
     const AF: u64 = 1 << 10; // Access flag (must set or we get fault)
+    // nG (not-global): ASID-tag the entry. The kernel runs under ASID 0, but
+    // EL0-isolated modules run under their own ASID (module_idx+1) with their
+    // own page table (see bcm2712/mmu.rs). If the kernel identity map were
+    // GLOBAL, its cached 2 MB DRAM block TLB entries would match ANY ASID and
+    // SHADOW an isolated module's nG 4 KB EL0 carve in the same window (e.g.
+    // the EL0 stack, which co-locates with the per-module page-table BSS) →
+    // a spurious EL0 permission fault at level 2 even though the module's
+    // L1/L2/L3 are correctly carved EL0-RW. Tagging the kernel map nG (ASID 0)
+    // means it never matches an ASID-5 EL0 access, so the module's own carve is
+    // always used. The kernel always runs ASID 0, so its own accesses still hit.
+    const NG: u64 = 1 << 11;
 
     // Upper attributes
     const PXN: u64 = 1 << 53; // Privileged execute-never
@@ -70,9 +81,11 @@ mod cm5_impl {
         | (1 << 23)       // EPD1: disable TTBR1_EL1 walks (kernel-only, no upper VA)
         | (0b010u64 << 32); // IPS = 0b010 → 40-bit PA (1TB, covers RP1 BAR at 0x1f_xxxx_xxxx)
 
-    // Block descriptor for DRAM: Normal Cacheable, RW, Inner Shareable
+    // Block descriptor for DRAM: Normal Cacheable, RW, Inner Shareable, nG.
+    // nG so kernel (ASID 0) DRAM blocks never shadow an isolated module's
+    // ASID-tagged EL0 carve in the same 2 MB window (see `NG`).
     const fn dram_block(addr: u64) -> u64 {
-        addr | VALID | BLOCK | (0 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF
+        addr | VALID | BLOCK | (0 << ATTR_IDX_SHIFT) | AP_RW | SH_INNER | AF | NG
     }
 
     // Block descriptor for Device memory: Device-nGnRnE, RW, no exec

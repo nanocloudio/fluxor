@@ -68,6 +68,7 @@ impl Surface {
                 "observe.console_regex",
                 "observe.monitor_stream",
                 "observe.netboot_fetch",
+                "observe.udp_capture",
                 "observe.usb_enumeration",
                 "observe.https_load",
             ],

@@ -52,6 +52,7 @@ pub use internal::bridge;
 pub mod buffer_pool;
 pub mod channel;
 pub mod config;
+pub mod el0_abi;
 pub mod errno;
 pub mod event;
 pub mod loader;

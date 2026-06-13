@@ -33,13 +33,23 @@ global_asm!(
     ".balign 2048",
     ".global exception_vectors",
     "exception_vectors:",
-    // Current EL with SP_EL0 (4 entries)
-    ".balign 128", "b unhandled_exception",  // Synchronous
-    ".balign 128", "b unhandled_exception",  // IRQ
-    ".balign 128", "b unhandled_exception",  // FIQ
-    ".balign 128", "b unhandled_exception",  // SError
+    // Current EL with SP_EL0 (4 entries). Tagged catch (`fluxor_el1_catch` in
+    // kernel::mmu): a kernel-side or async fault taken while servicing an
+    // isolated module FAILS STOP — it latches ESR/FAR/SPSR/ELR (surfaced over
+    // UDP by a sibling core) and spins, rather than longjmp-recovering out of a
+    // possibly-held kernel lock. (Genuine EL0 module faults arrive at the
+    // lower-EL synchronous vector instead, which does recover.)
+    ".balign 128", "mov w17, #5", "b fluxor_el1_catch",  // Synchronous
+    ".balign 128", "mov w17, #6", "b fluxor_el1_catch",  // IRQ
+    ".balign 128", "mov w17, #7", "b fluxor_el1_catch",  // FIQ
+    ".balign 128", "mov w17, #8", "b fluxor_el1_catch",  // SError
     // Current EL with SP_ELx (4 entries)
-    ".balign 128", "b unhandled_exception",  // Synchronous
+    // Synchronous (EL1h): a fault in the kernel's own EL1 code — including
+    // while servicing an isolated module's svc1/abort path — FAILS STOP via
+    // `fluxor_el1_sync_vec` (kernel::mmu): latch syndrome + dump + spin. It is
+    // NOT recovered, because a fault inside kernel servicing may hold a lock
+    // whose abandonment would deadlock the kernel.
+    ".balign 128", "b fluxor_el1_sync_vec",  // Synchronous
     // IRQ handler — save all caller-saved registers
     ".balign 128",
     "sub sp, sp, #256",
@@ -68,18 +78,28 @@ global_asm!(
     "ldp x29, x30, [sp, #160]",
     "add sp, sp, #256",
     "eret",
-    ".balign 128", "b unhandled_exception",  // FIQ
-    ".balign 128", "b unhandled_exception",  // SError
+    ".balign 128", "mov w17, #9", "b fluxor_el1_catch",  // FIQ (EL1h)
+    ".balign 128", "mov w17, #4", "b fluxor_el1_catch",  // SError (EL1h)
     // Lower EL using AArch64 (4 entries)
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
+    // Synchronous from a lower EL (EL0) — SVC return from an isolated
+    // module_step, or a data/instruction abort while it runs. Routed to
+    // the EL0-isolation dispatcher in `kernel::mmu` (fluxor_el0_lower_sync_vec)
+    // which longjmps back to the EL1 scheduler. The other three lower-EL
+    // entries (IRQ/FIQ/SError) stay on the dump path: IRQs are masked for
+    // the duration of an EL0 step, so they should not fire here.
+    ".balign 128", "b fluxor_el0_lower_sync_vec",  // Synchronous
+    ".balign 128", "mov w17, #10", "b fluxor_el1_catch",  // IRQ (lower EL)
+    ".balign 128", "mov w17, #11", "b fluxor_el1_catch",  // FIQ (lower EL)
+    ".balign 128", "mov w17, #12", "b fluxor_el1_catch",  // SError (lower EL)
     // Lower EL using AArch32 (4 entries)
     ".balign 128", "b unhandled_exception",
     ".balign 128", "b unhandled_exception",
     ".balign 128", "b unhandled_exception",
     ".balign 128", "b unhandled_exception",
+    // `.global` so the EL0-isolation dispatcher in `kernel::mmu`
+    // (a separate global_asm! block) can branch here when a lower-EL
+    // synchronous exception arrives with no active EL0 step.
+    ".global unhandled_exception",
     "unhandled_exception:",
     "stp x29, x30, [sp, #-16]!",
     "stp x0, x1, [sp, #-16]!",
@@ -106,6 +126,13 @@ pub static CORE_FAULT_FAR: [AtomicU64; 4] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 pub static CORE_FAULT_COUNT: [AtomicU32; 4] =
     [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// SPSR_EL1 at the fault — M[3:0] gives the EL the fault was taken FROM
+/// (0=EL0t, 4=EL1t, 5=EL1h), which disambiguates an `svc` taken at EL0 vs EL1.
+pub static CORE_FAULT_SPSR: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// ELR_EL1 at the fault — the faulting instruction's address.
+pub static CORE_FAULT_ELR: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 #[no_mangle]
 pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
@@ -113,6 +140,11 @@ pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     // (core 0) can surface it over UDP telemetry even when this core's UART
     // dump is invisible (no wired debug UART) or the core then hangs.
     let c = (current_core_id() as usize) & 3;
+    let spsr: u64;
+    // SAFETY: reading SPSR_EL1 in the exception handler is side-effect free.
+    core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr, options(nomem, nostack));
+    CORE_FAULT_SPSR[c].store(spsr, Ordering::Relaxed);
+    CORE_FAULT_ELR[c].store(elr, Ordering::Relaxed);
     CORE_FAULT_ESR[c].store(esr, Ordering::Relaxed);
     CORE_FAULT_FAR[c].store(far, Ordering::Relaxed);
     CORE_FAULT_COUNT[c].fetch_add(1, Ordering::Relaxed);

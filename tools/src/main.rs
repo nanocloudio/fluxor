@@ -382,6 +382,21 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Generate / inspect an Ed25519 module-signing keypair.
+    ///
+    /// Prints the 64-hex-char PUBLIC key to stdout (for the kernel's
+    /// `FLUXOR_SIGNING_PUBKEY_HEX` build env) and ensures the 32-byte private
+    /// seed exists at `--key` (generated 0600 from the OS RNG if absent). The
+    /// matching seed is what `fluxor sign` consumes. Idempotent: re-running
+    /// with an existing key just re-prints its pubkey (use `--force` to rotate).
+    Keygen {
+        /// Path to the 32-byte Ed25519 seed (private key). Created if absent.
+        #[arg(short = 'k', long)]
+        key: PathBuf,
+        /// Overwrite an existing key with a freshly-generated one (rotate).
+        #[arg(long)]
+        force: bool,
+    },
     /// Hardware-rig orchestration (`rig test --scenario …`, `rig power`, …).
     ///
     /// Host-side hardware-rig orchestration with a board-agnostic
@@ -789,6 +804,7 @@ fn main() {
             vars,
         } => up::cmd_up(&template, replicas, base_port, http_offset, &vars, None),
         Commands::Sign { input, key, output } => cmd_sign(&input, &key, output.as_deref(), verbose),
+        Commands::Keygen { key, force } => cmd_keygen(&key, force),
         Commands::Monitor {
             port,
             baud,
@@ -4951,6 +4967,74 @@ fn cmd_flash(config_path: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// Generate / inspect an Ed25519 module-signing keypair. Ensures a 32-byte
+/// private seed exists at `key_path` (generated 0600 from the OS RNG if absent,
+/// or `--force`d), then prints the matching 64-hex-char PUBLIC key to stdout —
+/// the value the kernel embeds via `FLUXOR_SIGNING_PUBKEY_HEX`. Human notes go
+/// to stderr so stdout is exactly the pubkey (capturable in `$(...)`).
+fn cmd_keygen(key_path: &PathBuf, force: bool) -> Result<()> {
+    use std::fs;
+    use std::io::Write as _;
+
+    let exists = key_path.exists();
+    if !exists || force {
+        // Exactly 32 bytes from the OS RNG (Linux build host). MUST use
+        // read_exact, not fs::read — /dev/urandom is an endless stream and
+        // reading it to EOF never returns (OOMs).
+        use std::io::Read as _;
+        let mut seed = [0u8; 32];
+        fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut seed))
+            .map_err(|e| Error::Module(format!("read /dev/urandom: {e}")))?;
+        if let Some(dir) = key_path.parent() {
+            if !dir.as_os_str().is_empty() {
+                fs::create_dir_all(dir)
+                    .map_err(|e| Error::Module(format!("mkdir {}: {e}", dir.display())))?;
+            }
+        }
+        let mut f = fs::File::create(key_path)
+            .map_err(|e| Error::Module(format!("create {}: {e}", key_path.display())))?;
+        // 0600 — a signing seed must not be world/group readable.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perm = f
+                .metadata()
+                .map_err(|e| Error::Module(format!("stat key: {e}")))?
+                .permissions();
+            perm.set_mode(0o600);
+            f.set_permissions(perm)
+                .map_err(|e| Error::Module(format!("chmod key: {e}")))?;
+        }
+        f.write_all(&seed)
+            .map_err(|e| Error::Module(format!("write key: {e}")))?;
+        eprintln!(
+            "\x1b[1;32mGenerated\x1b[0m signing seed {} (0600){}",
+            key_path.display(),
+            if force && exists { " [rotated]" } else { "" }
+        );
+    } else {
+        eprintln!("Using existing signing seed {}", key_path.display());
+    }
+
+    let seed_bytes = fs::read(key_path).map_err(|e| Error::Module(format!("read key: {e}")))?;
+    if seed_bytes.len() != 32 {
+        return Err(Error::Module(format!(
+            "key must be exactly 32 bytes, got {}",
+            seed_bytes.len()
+        )));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes);
+    let pk = crypto::derive_public_key(&seed);
+    // stdout = JUST the pubkey hex, so `FLUXOR_SIGNING_PUBKEY_HEX=$(fluxor keygen …)` works.
+    let mut s = String::with_capacity(64);
+    for &b in pk.iter() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    println!("{s}");
+    Ok(())
+}
+
 /// Sign a packed .fmod module with an Ed25519 seed, appending a v2 manifest
 /// carrying the signature + signer fingerprint. Writes either in place or to
 /// `output`.
@@ -4997,23 +5081,56 @@ fn cmd_sign(
     let mut manifest =
         manifest::Manifest::from_bytes(&fmod[manifest_offset..manifest_offset + manifest_size])?;
 
-    // Re-derive the integrity hash from the file (matches what the kernel
-    // computes). Signature covers this hash.
     use sha2::Digest as _;
+    // (1) Integrity hash = SHA256(code || data) — a corruption check, stored in
+    // the manifest. Identical to what the module-pack step stamps, so unsigned
+    // dev modules stay loadable; the kernel re-checks this on load.
     let code_data = &fmod[MODULE_HEADER_SIZE..MODULE_HEADER_SIZE + code_size + data_size];
-    let mut h = sha2::Sha256::new();
-    h.update(code_data);
-    let hh = h.finalize();
+    let mut ih = sha2::Sha256::new();
+    ih.update(code_data);
     let mut integrity_hash = [0u8; 32];
-    integrity_hash.copy_from_slice(&hh);
+    integrity_hash.copy_from_slice(&ih.finalize());
 
-    let (pk, sig) = crypto::sign(&seed, &integrity_hash);
+    // (2) SIGNING ENVELOPE hash = the full security-relevant image. The Ed25519
+    // signature is taken over THIS, not the integrity hash, so a tampered header
+    // / export table / schema / manifest-capability field breaks the signature
+    // even though code||data is untouched. MUST byte-match the kernel loader's
+    // signature-verification envelope (`validate_module`):
+    //   header[0..64]  (skip manifest_size @64..66 — signing grows it)
+    //   || header[66..72] || code || data || export-table || schema
+    //   || manifest[0..hash_offset] with flags byte 14 bits 0-1 masked
+    //     (has_integrity / has_signature — the only [0..hash_offset] bytes that
+    //      differ between the unsigned and signed image).
+    // The manifest header+var region [0..hash_offset] is independent of the
+    // hash/signature VALUES, so serialize with placeholder integrity+sig to get
+    // the final layout, hash [0..hash_offset], then fill in the real values
+    // (which only touch bytes at/after hash_offset).
+    manifest.integrity_hash = Some(integrity_hash);
+    manifest.signature = Some([0u8; 64]);
+    manifest.signer_fp = Some([0u8; 32]);
+    let layout = manifest.to_bytes();
+    let var_size =
+        manifest.ports.len() * 4 + manifest.resources.len() * 4 + manifest.dependencies.len() * 8;
+    let hash_offset = 16 + var_size;
+    if hash_offset + 32 > layout.len() {
+        return Err(Error::Module("manifest layout too small for hash".into()));
+    }
+    let mut h = sha2::Sha256::new();
+    h.update(&fmod[0..64]);
+    h.update(&fmod[66..manifest_offset]);
+    h.update(&layout[0..14]);
+    h.update([layout[14] & 0xFC]);
+    h.update(&layout[15..hash_offset]);
+    let mut envelope_hash = [0u8; 32];
+    envelope_hash.copy_from_slice(&h.finalize());
+
+    let (pk, sig) = crypto::sign(&seed, &envelope_hash);
     let signer_fp = crypto::sha256(&pk);
-    if !crypto::verify(&pk, &integrity_hash, &sig) {
+    if !crypto::verify(&pk, &envelope_hash, &sig) {
         return Err(Error::Module("internal: round-trip verify failed".into()));
     }
 
-    manifest.integrity_hash = Some(integrity_hash);
+    // integrity_hash already set above (code||data); attach the signature.
     manifest.signature = Some(sig);
     manifest.signer_fp = Some(signer_fp);
     let new_manifest_bytes = manifest.to_bytes();

@@ -962,6 +962,10 @@ pub struct SchedulerState {
     in_place_writer: [bool; MAX_MODULES],
     /// Per-module deferred ready flag (header flags bit 2)
     deferred_ready: [bool; MAX_MODULES],
+    /// Per-module EL0-isolation request (set from the `protection: isolated`
+    /// TLV tag 0xF5 == 2). Gates whether the module is routed through the
+    /// EL0 protected step; `none`/`guarded` modules keep the direct EL1 path.
+    isolated: [bool; MAX_MODULES],
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
     ready: [bool; MAX_MODULES],
     /// Per-module upstream dependency bitmask (precomputed from edges)
@@ -1146,6 +1150,7 @@ impl SchedulerState {
             mailbox_safe: [false; MAX_MODULES],
             in_place_writer: [false; MAX_MODULES],
             deferred_ready: [false; MAX_MODULES],
+            isolated: [false; MAX_MODULES],
             ready: [true; MAX_MODULES],
             upstream_mask: [0; MAX_MODULES],
             step_period: [0; MAX_MODULES],
@@ -1207,6 +1212,7 @@ impl SchedulerState {
             self.mailbox_safe[i] = false;
             self.in_place_writer[i] = false;
             self.deferred_ready[i] = false;
+            self.isolated[i] = false;
             self.ready[i] = true;
             self.upstream_mask[i] = 0;
             self.step_period[i] = 0;
@@ -2383,6 +2389,11 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // `MAX_CHANNELS` / `MAX_BUFFER_SLOTS` are exhausted even on
     // otherwise well-sized graphs.
     reset_state_arena();
+    // Drop any EL0-isolation page tables from a previous graph so a
+    // reconfigure rebuilds them from the new graph's regions. No-op on
+    // non-BCM2712 platforms.
+    #[cfg(feature = "chip-bcm2712")]
+    crate::kernel::mmu::reset_isolation();
     crate::kernel::channel::reset_all();
     crate::kernel::buffer_pool::reset_all();
     crate::kernel::buffer_pool::reset_buffer_arena();
@@ -2516,6 +2527,18 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         return Err(-1);
     }
 
+    // EL0-isolation pre-pass: mark which modules requested `protection:
+    // isolated` from their config params BEFORE channels are opened. The full
+    // protection TLV is parsed later, at instantiation (`parse_protection_config`,
+    // which runs after this in the platform flow), but `open_channels` →
+    // `alloc_streaming_for_module` and the channel-region pass below both need
+    // `module_is_isolated` to already be true so an isolated producer's channel
+    // buffers are page-aligned + page-padded (otherwise the EL0 channel mapping
+    // would round into a peer's buffer, and `build_table` would refuse the
+    // non-page-clean region → the module would fail closed). Cheap, idempotent
+    // with the later full parse.
+    mark_isolated_from_params(&module_list, module_count);
+
     // Query channel hints and open channels
     collect_module_hints(loader, &module_list, module_count);
     if open_channels(&mut edges[..runtime_edge_count]) < 0 {
@@ -2548,10 +2571,64 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
         let (base, size) = crate::kernel::buffer_pool::compute_module_buffer_range(i as u8);
         if size > 0 {
             crate::kernel::mpu::set_channel_region(i, base as u32, size as u32);
+            // For isolated modules the EL0 mapping rounds to whole pages, so the
+            // channel region must be page-aligned/page-sized too. The isolated
+            // producer's buffers are page-aligned + page-padded (see
+            // `buffer_pool::alloc_buffer_page_aligned`), so `base` is already
+            // page-aligned and rounding the span UP stays inside pages this
+            // module owns. `mmu::build_table` independently REFUSES a non-page-
+            // clean region, so this is the matching producer side.
             #[cfg(feature = "chip-bcm2712")]
-            crate::kernel::mmu::set_channel_region(i, base as u64, size as u64);
+            {
+                const PAGE: usize = 4096;
+                if module_is_isolated(i) {
+                    let pbase = base & !(PAGE - 1);
+                    let pend = (base + size + PAGE - 1) & !(PAGE - 1);
+                    // FAIL CLOSED on interleaving: an isolated module's channel
+                    // region is mapped EL0-RW as one page-rounded span. If a PEER
+                    // producer's buffer falls inside that span (possible for a
+                    // multi-output module whose buffers bracket a peer's, since
+                    // buffers are bump-allocated in edge order), mapping the span
+                    // would grant writable access to the peer's buffer. Refuse to
+                    // register the region in that case — the isolated module then
+                    // can't reach its OWN channel buffers either (its mediated
+                    // I/O EFAULTs and it faults per policy), but no peer buffer is
+                    // ever exposed. The single-output common case (incl.
+                    // iso_transform) is unaffected.
+                    if crate::kernel::buffer_pool::any_foreign_buffer_in_range(
+                        i as u8,
+                        pbase,
+                        pend - pbase,
+                    ) {
+                        log::error!(
+                            "[el0] module {i}: channel span 0x{pbase:x}+{} overlaps a peer \
+                             buffer — REFUSING to map channel region (fail closed; isolated \
+                             module's own channel I/O will fault). Multi-output isolated \
+                             modules need contiguous buffers or per-buffer mapping.",
+                            pend - pbase,
+                        );
+                    } else {
+                        crate::kernel::mmu::set_channel_region(
+                            i,
+                            pbase as u64,
+                            (pend - pbase) as u64,
+                        );
+                    }
+                } else {
+                    crate::kernel::mmu::set_channel_region(i, base as u64, size as u64);
+                }
+            }
         }
     }
+
+    // EL0-isolation page tables are built LAZILY on a module's first EL0 entry
+    // (`mmu::enter_el0` → `build_table`), not here: module instantiation (which
+    // registers the code/state/heap regions via `register_module`) runs in the
+    // platform flow AFTER `prepare_graph` returns, so the regions aren't known
+    // yet at this point. `register_module` preserves the channel region set by
+    // the pass above, so the lazy build sees code/state/heap plus the
+    // page-aligned channel range together. A failed lazy build fails the module
+    // closed (never stepped at EL1) — see `enter_el0`.
 
     // Compute topological execution order. A graph with cycles is
     // rejected by default: silently running the topological prefix
@@ -3240,6 +3317,41 @@ fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
 /// For each module, looks up its `module_channel_hints` export and
 /// stores the hints in MODULE_HINTS. Modules without the export
 /// get empty hints (all ports use default buffer sizes).
+/// Pre-pass: set `SCHED.isolated[i]` for every module whose config params
+/// request `protection: isolated` (TLV tag 0xF5 >= 2), BEFORE channels are
+/// opened. This lets `open_channels`/`alloc_streaming_for_module` page-align an
+/// isolated producer's channel buffers and the channel-region pass round its
+/// region to whole pages. The full protection TLV (fault policy, deadlines, …)
+/// is still parsed at instantiation via `parse_protection_config`; this only
+/// peeks the isolation bit. No-op off BCM2712 (EL0 isolation is BCM2712-only,
+/// but the flag itself is platform-agnostic — `module_is_isolated` callers gate
+/// on the chip feature).
+fn mark_isolated_from_params(
+    module_list: &[Option<ModuleEntry>; MAX_MODULES],
+    module_count: usize,
+) {
+    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
+        let entry = match slot {
+            Some(e) => e,
+            None => continue,
+        };
+        if is_internal_module(entry) {
+            continue;
+        }
+        if !params_request_isolation(entry.params()) {
+            continue;
+        }
+        // SAFETY: prepare_graph context — single mutator of SCHED.
+        unsafe {
+            let p = &raw mut SCHED;
+            (*p).isolated[module_idx] = true;
+        }
+        crate::kernel::mpu::set_enabled(true);
+        #[cfg(feature = "chip-bcm2712")]
+        crate::kernel::mmu::set_enabled(true);
+    }
+}
+
 fn collect_module_hints(
     loader: &ModuleLoader,
     module_list: &[Option<ModuleEntry>; MAX_MODULES],
@@ -4485,6 +4597,48 @@ pub static mut CRASH_DATA: core::mem::MaybeUninit<[u32; 8]> = core::mem::MaybeUn
 /// Magic marker for valid crash data
 pub const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
 
+/// Whether module `idx` requested `protection: isolated` (TLV 0xF5 == 2).
+/// Read by the graph-prepare pass to decide which modules get an EL0
+/// page table, and by the loader to flag the `DynamicModule` so its
+/// step routes through `mmu::protected_step`. Non-isolated modules keep
+/// the direct EL1 call path unchanged.
+pub fn module_is_isolated(idx: usize) -> bool {
+    if idx >= MAX_MODULES {
+        return false;
+    }
+    // SAFETY: scheduler-thread-only read of a bool array; `idx` bounded.
+    unsafe { SCHED.isolated[idx] }
+}
+
+/// Peek a module's params TLV for a `protection: isolated` request (tag
+/// 0xF5, value >= 2) WITHOUT mutating any scheduler state. The loader calls
+/// this before allocating state so it can route an isolated module's state and
+/// heap into the dedicated page-aligned ISO arena (the EL0 mapping rounds to
+/// pages, so isolated allocations must own their pages — see
+/// `loader::alloc_isolated`). Mirrors the tag walk in `parse_protection_config`.
+pub fn params_request_isolation(params: &[u8]) -> bool {
+    if params.len() < 4 {
+        return false;
+    }
+    let mut pos = if params[0] == 0xFE { 4 } else { 0 };
+    while pos + 2 <= params.len() {
+        let tag = params[pos];
+        let len = params[pos + 1] as usize;
+        pos += 2;
+        if tag == 0xFF {
+            break;
+        }
+        if pos + len > params.len() {
+            break;
+        }
+        if tag == 0xF5 && len == 1 && params[pos] >= 2 {
+            return true;
+        }
+        pos += len;
+    }
+    false
+}
+
 /// Parse protection configuration from module params TLV.
 ///
 /// Recognised tags in the schema-packed params blob:
@@ -4572,10 +4726,18 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
             }
             0xF5 if len == 1 => {
                 // protection: 0=none, 1=guarded, 2=isolated.
-                // An isolated module opts the whole graph into MPU isolation;
-                // per-module MPU regions are registered during instantiation.
+                // An isolated module opts the whole graph into MPU/MMU
+                // isolation; per-module regions are registered during
+                // instantiation and the page table is built before the
+                // first step (see `build_isolated_tables`).
                 if params[pos] >= 2 {
                     crate::kernel::mpu::set_enabled(true);
+                    sched.isolated[module_idx] = true;
+                    // On CM5/BCM2712, enable the EL0 MMU-isolation regime so
+                    // `mmu::protected_step` drops the module to EL0. No-op on
+                    // other platforms (the Cortex-M MPU path above stands in).
+                    #[cfg(feature = "chip-bcm2712")]
+                    crate::kernel::mmu::set_enabled(true);
                 }
             }
             0xF6 if len == 4 => {
@@ -5948,22 +6110,31 @@ fn step_one_module(
 
         match m.step() {
             Ok(StepOutcome::Continue) => {
-                step_guard::disarm();
                 let elapsed = (crate::kernel::hal::now_micros() - step_t0) as u32;
                 record_step_time(module_idx, elapsed);
+                // Run the post-step deadline check BEFORE disarming. The BCM
+                // (cooperative) guard's `post_step_check` early-returns when the
+                // guard is already disarmed, so the previous `disarm()`-first
+                // order silently dropped every over-deadline step; `post_step_check`
+                // both records the timeout AND disarms.
                 step_guard::post_step_check();
-                if step_guard::check_and_clear_timeout() {
-                    handle_step_timeout(sched, modules, module_idx, active_count);
-                }
-                if step_guard::check_and_clear_mpu_fault() {
-                    handle_mpu_fault(sched, modules, module_idx, active_count);
-                }
-                // PSP stack overflow detection: the canary word at the
-                // bottom of the module stack is clobbered by an overflow.
-                // Re-arm it so the next module starts with a clean band.
-                if !crate::kernel::mpu::check_stack_canary() {
+                // A single step finalizes AT MOST ONCE. A timeout, an MPU/EL0
+                // protection fault, and a stack-canary overflow each
+                // terminate/quarantine the module and decrement `active_count`;
+                // running more than one for the same step double-counts (and can
+                // stop a healthy sibling). Clear both guard flags unconditionally
+                // (so neither lingers into the next step), then finalize once —
+                // timeout takes precedence, MPU and canary collapse into one fault.
+                let timed_out = step_guard::check_and_clear_timeout();
+                let mpu = step_guard::check_and_clear_mpu_fault();
+                let canary_violated = !crate::kernel::mpu::check_stack_canary();
+                if canary_violated {
                     log::error!("[mpu] module {module_idx} stack canary violated");
                     crate::kernel::mpu::reinit_stack_canary();
+                }
+                if timed_out {
+                    handle_step_timeout(sched, modules, module_idx, active_count);
+                } else if mpu || canary_violated {
                     handle_mpu_fault(sched, modules, module_idx, active_count);
                 }
             }
@@ -6081,21 +6252,29 @@ fn step_one_module(
                         break;
                     }
                 }
-                step_guard::disarm();
+                // Post-check before disarm (see the Continue arm) so an
+                // over-deadline burst is actually recorded; finalize at most once.
                 step_guard::post_step_check();
-                // Check if burst as a whole timed out
-                if step_guard::check_and_clear_timeout() {
+                let timed_out = step_guard::check_and_clear_timeout();
+                let mpu = step_guard::check_and_clear_mpu_fault();
+                if timed_out {
                     handle_step_timeout(sched, modules, module_idx, active_count);
-                }
-                if step_guard::check_and_clear_mpu_fault() {
+                } else if mpu {
                     handle_mpu_fault(sched, modules, module_idx, active_count);
                 }
             }
             Err(rc) => {
                 step_guard::disarm();
-                handle_step_error(sched, modules, module_idx, rc, active_count, "");
-                if step_guard::check_and_clear_mpu_fault() {
+                // A returned error and a pending MPU fault must not BOTH finalize
+                // the same step (each terminates + decrements active_count). The
+                // EL0 abort path already returns Continue (handled via the MPU
+                // flag above), so reaching here with a pending MPU fault is a
+                // genuine double-signal — handle the step error XOR the MPU fault.
+                let mpu = step_guard::check_and_clear_mpu_fault();
+                if mpu {
                     handle_mpu_fault(sched, modules, module_idx, active_count);
+                } else {
+                    handle_step_error(sched, modules, module_idx, rc, active_count, "");
                 }
             }
         }

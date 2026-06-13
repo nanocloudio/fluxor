@@ -18,7 +18,7 @@ TARGET      ?= bcm2712
 .PHONY: help build test fmt fmt-check clippy lint ci verify \
         modules modules-all modules-clean modules-list modules-resolve \
         up up-cluster clean setup \
-        firmware firmware-all linux-bin tools install-rig-backends \
+        firmware firmware-all secure-cm5 linux-bin tools install-rig-backends \
         targets init run flash all \
         check-no-inline-tests check-drift check-build-matrix check-stable
 
@@ -287,6 +287,43 @@ firmware-all:
 	$(MAKE) firmware TARGET=cm5
 	$(MAKE) firmware TARGET=wasm
 
+# ── Secure (signature-enforced) cm5 image ──────────────────────────────
+# Produces a bootable cm5 image that REJECTS unsigned/tampered modules at
+# load: the kernel is built with `enforce_signatures` and the signing
+# PUBLIC key embedded (`FLUXOR_SIGNING_PUBKEY_HEX`), every module is signed
+# with the matching private seed, and the result is combined. Without this
+# target the default cm5 build is permissive (unsigned modules load) — see
+# docs/architecture/cm5_el0_isolation.md "Construction-phase trust boundary".
+#
+#   make secure-cm5                       # uses default key path + iso_transform demo
+#   make secure-cm5 SECURE_CONFIG=examples/iso_probe/cm5.yaml
+#   make secure-cm5 SIGN_KEY=/path/to.seed SECURE_IMG=/srv/tftp/fluxor/kernel_2712.img
+#
+# The private seed is generated (0600) on first run and reused thereafter;
+# rotate with `fluxor keygen -k $(SIGN_KEY) --force`. Keep it OUT of git.
+SIGN_KEY      ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/fluxor/signing/cm5.seed
+SECURE_CONFIG ?= examples/iso_transform/cm5.yaml
+SECURE_IMG    ?= target/cm5/secure.img
+
+secure-cm5: tools
+	@mkdir -p $(dir $(SIGN_KEY)) target/cm5
+	@echo "[secure] resolving signing pubkey ($(SIGN_KEY))..."
+	@PUBKEY=$$($(FLUXOR) keygen -k $(SIGN_KEY)) && \
+	  echo "[secure] FLUXOR_SIGNING_PUBKEY_HEX=$$PUBKEY" && \
+	  echo "[secure] building enforce_signatures firmware..." && \
+	  FLUXOR_SIGNING_PUBKEY_HEX=$$PUBKEY $(CARGO) build --release \
+	    --target aarch64-unknown-none --no-default-features \
+	    --features board-cm5,enforce_signatures && \
+	  rust-objcopy -O binary target/aarch64-unknown-none/release/fluxor target/cm5/firmware.bin && \
+	  echo "[secure] building + signing modules..." && \
+	  $(FLUXOR) modules build --target cm5 && \
+	  for m in target/fluxor/bcm2712/modules/*.fmod; do \
+	    $(FLUXOR) sign -k $(SIGN_KEY) "$$m" || exit 1; \
+	  done && \
+	  echo "[secure] combining $(SECURE_CONFIG) -> $(SECURE_IMG)..." && \
+	  $(FLUXOR) combine -o $(SECURE_IMG) target/cm5/firmware.bin $(SECURE_CONFIG) && \
+	  echo "[secure] done: $(SECURE_IMG) (unsigned/tampered modules will be rejected)"
+
 tools:
 	@echo "Building tools..."
 	$(CARGO) build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
@@ -294,7 +331,7 @@ tools:
 # Symlink rig backend executables into the discovery path used by
 # `fluxor rig …`. Run after `make tools`.
 RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
-RIG_BACKENDS    := telemetry-monitor_udp observe-https_load
+RIG_BACKENDS    := telemetry-monitor_udp observe-https_load observe-udp_capture
 
 # `observe-https_load` is feature-gated (pulls tokio + reqwest + rustls)
 # so plain `make tools` doesn't carry async-HTTPS deps. Build it

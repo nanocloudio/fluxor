@@ -963,7 +963,10 @@ mod tests {
         });
         let mut injection = make_injection(
             vec![make_module("log_net", None)],
-            vec!["ip.net_out -> log_net.net_in", "log_net.net_out -> ip.net_in"],
+            vec![
+                "ip.net_out -> log_net.net_in",
+                "log_net.net_out -> ip.net_in",
+            ],
         );
         injection.accept_cycles = true;
         let mut globally_skipped = std::collections::HashSet::new();
@@ -990,7 +993,10 @@ mod tests {
         });
         let mut injection2 = make_injection(
             vec![make_module("log_net", None)],
-            vec!["ip.net_out -> log_net.net_in", "log_net.net_out -> ip.net_in"],
+            vec![
+                "ip.net_out -> log_net.net_in",
+                "log_net.net_out -> ip.net_in",
+            ],
         );
         injection2.accept_cycles = true;
         let mut skipped2 = std::collections::HashSet::new();

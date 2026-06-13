@@ -105,10 +105,18 @@ const BUFFER_ARENA_SIZE: usize = super::chip::BUFFER_ARENA_SIZE;
 // Buffer Arena (separate from module state arena)
 // ============================================================================
 
-#[repr(C, align(4))]
+// Page-aligned (4 KiB) so a buffer carved at a page-aligned offset is at a
+// page-aligned ADDRESS — required for isolated-module channel buffers, whose
+// EL0 page-table mapping rounds to whole pages. (Was `align(4)`; widening the
+// base alignment is harmless for non-isolated buffers.)
+#[repr(C, align(4096))]
 struct AlignedBufferArena([u8; BUFFER_ARENA_SIZE]);
 static mut BUFFER_ARENA: AlignedBufferArena = AlignedBufferArena([0; BUFFER_ARENA_SIZE]);
 static mut BUFFER_ARENA_OFFSET: usize = 0;
+
+/// Page granule for isolated-module channel buffers (matches EL0 page size).
+#[cfg(feature = "chip-bcm2712")]
+const BUF_ISO_PAGE: usize = 4096;
 
 /// Allocate a buffer from the dedicated buffer arena.
 ///
@@ -128,6 +136,38 @@ fn alloc_buffer(size: usize) -> Option<*mut u8> {
             .add(aligned);
         core::ptr::write_bytes(ptr, 0, size);
         BUFFER_ARENA_OFFSET = aligned + size;
+        Some(ptr)
+    }
+}
+
+/// Allocate a channel buffer for an ISOLATED producer: page-aligned base and
+/// the bump reservation padded to a whole number of pages, so the buffer owns
+/// its 4 KiB pages exclusively. The EL0 mapping for the isolated module rounds
+/// its channel region out to page boundaries; without exclusive page ownership
+/// that rounding would expose a neighbouring buffer (writable) to the module.
+/// The slot still records the logical `size` as capacity; the page padding is
+/// reserved (unused) tail so no other allocation lands in those pages.
+#[cfg(feature = "chip-bcm2712")]
+fn alloc_buffer_page_aligned(size: usize) -> Option<*mut u8> {
+    // SAFETY: single-threaded prepare-graph path; checked against arena cap.
+    unsafe {
+        let aligned = (BUFFER_ARENA_OFFSET + BUF_ISO_PAGE - 1) & !(BUF_ISO_PAGE - 1);
+        let reserve = (size + BUF_ISO_PAGE - 1) & !(BUF_ISO_PAGE - 1);
+        if aligned + reserve > BUFFER_ARENA_SIZE {
+            log::error!(
+                "[buf] iso arena full need={reserve} used={aligned} cap={BUFFER_ARENA_SIZE}"
+            );
+            return None;
+        }
+        let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0)
+            .cast::<u8>()
+            .add(aligned);
+        // Zero the full page-rounded reservation, not just `size`: the whole
+        // span is mapped EL0-RW for the isolated module and the arena reset
+        // only rewinds the offset, so the page-padding tail would otherwise
+        // leak the previous graph's buffer bytes to a later isolated module.
+        core::ptr::write_bytes(ptr, 0, reserve);
+        BUFFER_ARENA_OFFSET = aligned + reserve;
         Some(ptr)
     }
 }
@@ -419,7 +459,20 @@ pub fn alloc_streaming_for_module(channel: i16, capacity: usize, producer_module
             )
             .is_ok()
         {
-            match alloc_buffer(capacity) {
+            // Isolated producers get page-aligned, page-padded buffers so their
+            // EL0 channel mapping owns whole pages (no spill into peer buffers).
+            // Non-isolated producers keep the tight 4-byte-aligned bump path.
+            #[cfg(feature = "chip-bcm2712")]
+            let buf = if producer_module != 0xFF
+                && crate::kernel::scheduler::module_is_isolated(producer_module as usize)
+            {
+                alloc_buffer_page_aligned(capacity)
+            } else {
+                alloc_buffer(capacity)
+            };
+            #[cfg(not(feature = "chip-bcm2712"))]
+            let buf = alloc_buffer(capacity);
+            match buf {
                 Some(ptr) => {
                     slot.assign(ptr, capacity, channel);
                     slot.producer_module
@@ -467,6 +520,38 @@ pub fn compute_module_buffer_range(module_idx: u8) -> (usize, usize) {
     } else {
         (lo, hi - lo)
     }
+}
+
+/// True if ANY buffer NOT produced by `module_idx` overlaps `[base, base+size)`.
+///
+/// An isolated module's channel region is mapped EL0-RW as one `[lo,hi)` span
+/// (see `compute_module_buffer_range`, and the page-rounded form in
+/// `scheduler::prepare_graph`). Because buffers are bump-allocated in edge
+/// order, a *peer* producer's buffer can land between two of this module's
+/// buffers — and mapping the whole span would then hand the isolated module
+/// writable access to that peer buffer. The scheduler calls this on the
+/// page-rounded span for an isolated producer and FAILS CLOSED (does not map
+/// the channel region) if it returns true, upholding the cross-module isolation
+/// boundary at the cost of that (rare, multi-output interleaved) module's
+/// channel I/O. `0xFF` = unowned/free slot, never counted as a peer.
+pub fn any_foreign_buffer_in_range(module_idx: u8, base: usize, size: usize) -> bool {
+    let end = base.saturating_add(size);
+    for slot in BUFFER_REGISTRY.iter() {
+        let owner = slot.producer_module.load(Ordering::Acquire);
+        if owner == module_idx || owner == 0xFF {
+            continue;
+        }
+        let ptr = slot.data_ptr() as usize;
+        if ptr == 0 {
+            continue;
+        }
+        let cap = slot.get_capacity() as usize;
+        // Overlap test: [ptr, ptr+cap) ∩ [base, end) != ∅
+        if ptr < end && base < ptr.saturating_add(cap) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Free a streaming buffer slot.

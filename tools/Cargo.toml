@@ -18,6 +18,16 @@ path = "src/main.rs"
 name = "telemetry-monitor_udp"
 path = "src/bin/telemetry_monitor_udp.rs"
 
+# Generic UDP-datagram capture observer. Binds a configured port and
+# streams each received datagram to the matcher as bytes, so a scenario
+# can pin regex pass/fail rules against arbitrary `platform.debug.to: net`
+# log lines (e.g. the EL0-isolation `[el0]` / `MON_FAULT` records).
+# Distinct from `telemetry-monitor_udp` only in capability surface
+# (observe vs telemetry); shares the same generic listener.
+[[bin]]
+name = "observe-udp_capture"
+path = "src/bin/observe_udp_capture.rs"
+
 # HTTPS load-probe observer: drives concurrent TLS clients against the
 # rig's HTTPS endpoint and emits NDJSON bytes per phase so the matcher
 # can pin throughput, concurrency, and handshake-rate floors.
