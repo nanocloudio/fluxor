@@ -639,6 +639,110 @@ pub fn check_isr_safe_no_neon(src_root: &Path) -> Result<()> {
     }
 }
 
+/// Scan a module source tree for an actual `module_isr_entry` **export**
+/// — the IRQ-context entry point a Tier 2 (IRQ-owned) module must
+/// provide. Returns `Ok(())` if any `.rs` file under `src_root` defines
+/// the symbol with an exportable signature, `Err` otherwise. Used by the
+/// Tier 2 admission validator so a module placed in an `isr_owned`
+/// domain that forgot to export `module_isr_entry` fails the graph build
+/// rather than failing registration on the rig.
+///
+/// **The packer's ELF symbol table is the authoritative source of
+/// truth** — it sets the `.fmod` isr_module header bit only when the
+/// linked symbol is actually present, and the kernel loader fail-closes
+/// at runtime (`isr_entry_fn = None` → admission refused, never
+/// dispatches the cooperative `module_step` from IRQ context). This
+/// source-static check is the *early, build-time mirror* of that gate;
+/// its job is to catch the common mistake at validation time instead of
+/// on the rig.
+///
+/// To avoid the false-admits a bare substring match would allow (the
+/// name in a comment / string / a plain `fn module_isr_entry` with no
+/// `#[no_mangle]`, which the linker would NOT export), the match
+/// requires the real export shape on one logical declaration: a
+/// `#[no_mangle]` / `#[unsafe(no_mangle)]` attribute on the signature
+/// line or within the few preceding attribute lines, AND an
+/// `extern "C" fn module_isr_entry` signature on that line.
+///
+/// `//` line comments are stripped before matching. Residual gaps the
+/// source scan cannot see (a `#[cfg(...)]`-disabled definition, a
+/// block-comment-spanned signature) are caught by the authoritative
+/// packer/loader gate described above — the same tradeoff
+/// `check_isr_safe_no_neon` carries.
+pub fn check_module_exports_isr_entry(src_root: &Path) -> Result<()> {
+    if !src_root.exists() {
+        return Err(Error::Module(format!(
+            "source tree {} does not exist — cannot verify the \
+             `module_isr_entry` export",
+            src_root.display(),
+        )));
+    }
+    let mut found = false;
+    walk_rs(src_root, &mut |_path, source| {
+        if source_exports_isr_entry(source) {
+            found = true;
+        }
+    });
+    if found {
+        Ok(())
+    } else {
+        Err(Error::Module(
+            "its source tree exports no `module_isr_entry` — expected a \
+             `#[no_mangle] pub extern \"C\" fn module_isr_entry(...)` \
+             definition (a bare `fn module_isr_entry` without `#[no_mangle]` \
+             would not be linked as an export)"
+                .to_string(),
+        ))
+    }
+}
+
+/// Source-static test for a real `module_isr_entry` export in one `.rs`
+/// file's text. See `check_module_exports_isr_entry` for the contract;
+/// factored out so it is unit-testable in isolation.
+///
+/// Models Rust attribute attachment: a `#[no_mangle]` attribute attaches
+/// to the *next item*. We carry a `pending_no_mangle` flag set by an
+/// attribute line and cleared by the next code (item) line, so an
+/// intervening `fn` consumes the attribute and a later bare
+/// `fn module_isr_entry` does not steal it.
+fn source_exports_isr_entry(source: &str) -> bool {
+    let mut pending_no_mangle = false;
+    for raw in source.lines() {
+        // Strip a `//` line comment (conservative: only removes text, so
+        // it can never manufacture a match). `///` / `//!` doc lines
+        // collapse to empty and are treated as blank.
+        let line = match raw.find("//") {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let has_no_mangle = line.contains("no_mangle");
+        // The real export shape: `extern "C" fn module_isr_entry` with a
+        // `no_mangle` attribute on this line or on a preceding attribute
+        // line that hasn't been consumed by another item yet.
+        if line.contains("extern \"C\"")
+            && line.contains("fn module_isr_entry")
+            && (has_no_mangle || pending_no_mangle)
+        {
+            return true;
+        }
+        if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+            // Attribute line — accumulate `no_mangle`, leave any pending
+            // flag from a sibling attribute (`#[cfg]` between
+            // `#[no_mangle]` and the fn) intact.
+            pending_no_mangle |= has_no_mangle;
+        } else {
+            // A code/item line consumes the pending attribute (it
+            // attached to *this* item, whatever it was).
+            pending_no_mangle = false;
+        }
+    }
+    false
+}
+
 /// Walk `.rs` files under `root`, invoking `f(path, source)` for each.
 /// Best-effort; unreadable files are skipped silently. Pure
 /// directory traversal — no Cargo metadata, no symlink chasing.
@@ -1118,10 +1222,11 @@ impl Manifest {
         //          bit 2 = isr_safe (author attestation; the
         //                  **build-time** `validate_isr_tier_admission`
         //                  in `tools/src/config.rs` is the live gate
-        //                  for this flag. Tier 1b admission is live;
-        //                  Tier 2 is still hard-rejected at build
-        //                  time pending the PIC-loader
-        //                  `module_isr_entry` lift. The kernel-side
+        //                  for this flag. Tier 1b and Tier 2 admission
+        //                  are both live (Tier 2 additionally requires
+        //                  an `irq:` field + a `module_isr_entry`
+        //                  export — see `check_module_exports_isr_entry`
+        //                  and the loader's `isr_entry_fn`). The kernel-side
         //                  `Manifest::from_bytes` round-trips the
         //                  bit through `LoadedModule.manifest`, but
         //                  the loader does NOT currently re-check it
@@ -1691,6 +1796,89 @@ mod tests {
     fn semver_roundtrip() {
         let v = encode_semver(1, 2, 3);
         assert_eq!(decode_semver(v), (1, 2, 3));
+    }
+
+    #[test]
+    fn check_module_exports_isr_entry_finds_definition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write");
+        check_module_exports_isr_entry(dir.path())
+            .expect("source defining module_isr_entry must pass");
+    }
+
+    #[test]
+    fn check_module_exports_isr_entry_rejects_missing_definition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        // Only a cooperative step — no ISR entry.
+        std::fs::write(
+            src.join("lib.rs"),
+            "fn module_step(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write");
+        let err = check_module_exports_isr_entry(dir.path())
+            .expect_err("source without module_isr_entry must be rejected");
+        assert!(
+            format!("{err}").contains("module_isr_entry"),
+            "diagnostic must name the missing export, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_module_exports_isr_entry_rejects_missing_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does_not_exist");
+        check_module_exports_isr_entry(&missing)
+            .expect_err("nonexistent source tree must be rejected");
+    }
+
+    #[test]
+    fn source_exports_isr_entry_accepts_real_shapes() {
+        // Attribute on its own line, with #[cfg] in between.
+        assert!(source_exports_isr_entry(
+            "#[no_mangle]\n#[cfg(feature = \"x\")]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n"
+        ));
+        // Attribute and signature on the same line.
+        assert!(source_exports_isr_entry(
+            "#[no_mangle] pub unsafe extern \"C\" fn module_isr_entry(s: *mut u8) -> i32 { 0 }\n"
+        ));
+        // Rust-2024 unsafe(no_mangle) form.
+        assert!(source_exports_isr_entry(
+            "#[unsafe(no_mangle)]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n"
+        ));
+    }
+
+    #[test]
+    fn source_exports_isr_entry_rejects_false_positives() {
+        // Bare fn with no #[no_mangle] — the linker would NOT export it.
+        assert!(!source_exports_isr_entry(
+            "pub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n"
+        ));
+        // Not extern "C" — also not the export ABI.
+        assert!(!source_exports_isr_entry(
+            "#[no_mangle]\nfn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n"
+        ));
+        // Name only in a line comment.
+        assert!(!source_exports_isr_entry(
+            "// TODO: add extern \"C\" fn module_isr_entry later\n#[no_mangle]\n"
+        ));
+        // Name only in a doc comment.
+        assert!(!source_exports_isr_entry(
+            "/// calls extern \"C\" fn module_isr_entry from the ISR\nfn other() {}\n"
+        ));
+        // The #[no_mangle] attaches to an intervening fn, NOT to the
+        // bare module_isr_entry that follows.
+        assert!(!source_exports_isr_entry(
+            "#[no_mangle]\npub extern \"C\" fn other_export() -> i32 { 0 }\n\
+             pub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n"
+        ));
     }
 
     #[test]

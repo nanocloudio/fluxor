@@ -1481,7 +1481,7 @@ fn validate_scheduler_budgets(
 
 /// Build-time admission gate for Tier 1b/Tier 2 (ISR) domains.
 ///
-/// Two rules enforced:
+/// Rules enforced:
 ///
 /// 1. **`isr_safe` attestation is mandatory.** Every module assigned
 ///    to a domain with `tier: 1b` (`exec_mode == 2`) or `tier: 2`
@@ -1491,7 +1491,9 @@ fn validate_scheduler_budgets(
 ///    path so the author knows exactly where to add the attestation.
 ///    Bridge routing has no fall-back: if the kernel admitted a
 ///    non-ISR-safe module into an ISR domain it would deadlock on
-///    `provider_call` from interrupt context.
+///    `provider_call` from interrupt context. For Tier 2 modules this
+///    rule also requires a `module_isr_entry` export in the source —
+///    the IRQ dispatches into it, not the cooperative `module_step`.
 ///
 /// 2. **No edges touching ISR-tier endpoints.** As of 2026-05-26
 ///    ANY YAML edge with at least one Tier 1b/2 endpoint is
@@ -1555,34 +1557,13 @@ fn validate_isr_tier_admission(
         }
     }
 
-    // Tier 2 (per-IRQ) is wire-format-defined but **not yet runtime-
-    // wired**: the .fmod ABI exports a separate `module_isr_entry`
-    // (see `src/kernel/loader.rs::MODULE_ISR_ENTRY` ABI hash and
-    // `tools/src/modules.rs`'s ISR-symbol detection) which the
-    // current loader does NOT extract into `ModuleExports`, and the
-    // admission helper would otherwise call the cooperative
-    // `module_step` from IRQ context — wrong function, wrong
-    // contract. Until the loader extracts the ISR entry symbol and
-    // the kernel routes it through `register_tier2_module`, Tier 2
-    // is build-time rejected. See
-    // `.context/rfc_isr_tier_surface.md` "Remaining work".
-    for d in 0..4 {
-        let m = domain_exec_mode[d];
-        if m == 4 {
-            let label = domain_names_local[d]
-                .clone()
-                .unwrap_or_else(|| format!("domains[{d}]"));
-            return Err(Error::Config(format!(
-                "execution.domains entry '{label}': tier 2 (isr_owned) is declared, \
-                 but the kernel's PIC loader does not yet extract the \
-                 `module_isr_entry` ABI export — admitting a Tier 2 module today \
-                 would call the cooperative `module_step` from IRQ context, which \
-                 violates the §D7 contract. Tier 1b (timer-driven) is supported \
-                 today; use it if a periodic ISR fits the workload. Track \
-                 .context/rfc_isr_tier_surface.md for the lift."
-            )));
-        }
-    }
+    // Tier 2 (per-IRQ) admission: a Tier 2 module is dispatched from
+    // its `module_isr_entry` export (resolved by the kernel loader into
+    // `DynamicModule::isr_entry_fn()` and routed through
+    // `register_tier2_module`). Rules 1/3 below require every Tier 2
+    // module to declare `isr_safe = true`, an `irq:` field, and an
+    // actual `module_isr_entry` export in its source. See
+    // `.context/rfc_isr_tier_surface.md` §D5/§D7.
 
     // Helper: does this exec_mode require ISR-safe modules?
     let is_isr_tier = |m: u8| -> bool { m == 2 || m == 4 };
@@ -1670,6 +1651,44 @@ fn validate_isr_tier_admission(
                     tier = tier_label(exec_mode)
                 )));
             }
+            // Tier 2 (IRQ-owned) modules are dispatched from hardware-IRQ
+            // context through their `module_isr_entry` export, NOT the
+            // cooperative `module_step`. The authoritative gate is the
+            // packer (ELF symtab → `.fmod` isr_module bit) + the loader
+            // (`isr_entry_fn = None` → admission fail-closes at runtime).
+            // This source-static check is the early, build-time mirror
+            // so a Tier 2 module missing the entry point fails the graph
+            // build instead of getting refused on the rig. (Tier 1b —
+            // `exec_mode == 2` — dispatches the cooperative step from a
+            // polled timer and needs no ISR entry. `module_isr_init` is
+            // a reserved ABI symbol with no consumer today — Tier 2
+            // construction goes through the normal cooperative
+            // `module_new`, same as Tier 1b — so it is intentionally not
+            // required here.)
+            if exec_mode == 4 {
+                if let Err(e) = crate::manifest::check_module_exports_isr_entry(&root) {
+                    return Err(Error::Config(format!(
+                        "module '{name}' (type '{module_type}') is assigned to domain \
+                         '{domain_label}' (tier {tier}) but {e}. A Tier 2 module must \
+                         export `module_isr_entry` (an `extern \"C\" fn(*mut u8) -> i32`) \
+                         — the hardware IRQ dispatches into it, not the cooperative \
+                         `module_step`. See .context/rfc_isr_tier_surface.md §D7.",
+                        tier = tier_label(exec_mode)
+                    )));
+                }
+            }
+        } else if exec_mode == 4 {
+            // No resolvable source root for a Tier 2 module means we
+            // can't certify the ISR entry export exists. The manifest
+            // check (Rule 1, above) already hard-errors a Tier 2 module
+            // with no manifest, so reaching here implies a manifest with
+            // no co-located `src/` tree — still unsafe to admit.
+            return Err(Error::Config(format!(
+                "module '{name}' (type '{module_type}') is assigned to a Tier 2 \
+                 (isr_owned) domain but its source tree could not be resolved to \
+                 verify the required `module_isr_entry` export. See \
+                 .context/rfc_isr_tier_surface.md §D7."
+            )));
         }
     }
 
@@ -1794,9 +1813,10 @@ fn validate_isr_tier_admission(
     // belong to).
     //
     // Tier 1b admission is live (gated on `isr_safe = true` +
-    // NEON-import lint). Tier 2 is still hard-rejected pending the
-    // PIC-loader `module_isr_entry` lift. This check stays honest
-    // for both tiers — an empty Tier 1b domain is still a bug.
+    // NEON-import lint); Tier 2 admission is live too (additionally
+    // gated on an `irq:` field + a `module_isr_entry` export). This
+    // check stays honest for both tiers — an empty ISR-tier domain is
+    // still a bug.
     let mut per_domain_member_count: [usize; 4] = [0; 4];
     for module in module_list {
         let d = resolve_domain_id(module, config)?;
@@ -5879,23 +5899,117 @@ mod scheduler_validation_tests {
     }
 
     #[test]
-    fn admission_rejects_tier_2_as_loader_abi_not_wired() {
-        // Tier 2 (`tier: 2` / `isr_owned`) is build-time rejected:
-        // the .fmod ABI exports a separate `module_isr_entry`
-        // symbol (see kernel `loader.rs::MODULE_ISR_ENTRY` ABI
-        // hash) which the current PIC loader does not extract into
-        // `ModuleExports`. Admitting a Tier 2 module today would
-        // call the cooperative `module_step` from IRQ context.
-        // Track `.context/rfc_isr_tier_surface.md` for the lift.
+    fn admission_accepts_tier_2_module_with_isr_entry_export() {
+        // A Tier 2 (`tier: 2` / `isr_owned`) module declaring
+        // `isr_safe = true`, an `irq:`, and a real `module_isr_entry`
+        // export is admitted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("irq_driver");
+        let src = mod_dir.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write src");
+
         let cfg = json!({
             "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
         });
-        let modules = vec![json!({"name": "m", "type": "x", "domain": "irq_owner"})];
-        let err = run_admission(cfg, modules).unwrap_err();
+        let modules = vec![json!({
+            "name": "irq_driver",
+            "type": "irq_driver",
+            "domain": "irq_owner",
+            "irq": 42,
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect("Tier 2 module exporting module_isr_entry must be admitted");
+    }
+
+    #[test]
+    fn admission_rejects_tier_2_module_without_isr_entry_export() {
+        // A Tier 2 module that declares `isr_safe = true` + `irq:` but
+        // whose source exports no `module_isr_entry` is rejected: the
+        // kernel would refuse to dispatch its cooperative `module_step`
+        // from IRQ context, so surface the gap loudly at build time.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("irq_driver");
+        let src = mod_dir.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        // Source has no `fn module_isr_entry` definition.
+        std::fs::write(
+            src.join("lib.rs"),
+            "fn module_step(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+        });
+        let modules = vec![json!({
+            "name": "irq_driver",
+            "type": "irq_driver",
+            "domain": "irq_owner",
+            "irq": 42,
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("Tier 2 module without module_isr_entry must be rejected");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("tier 2") && msg.contains("module_isr_entry"),
-            "expected the tier-2-ABI-not-wired diagnostic, got: {msg}"
+            msg.contains("module_isr_entry") && msg.contains("irq_driver"),
+            "diagnostic must name the missing export + the offending module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tier_2_module_without_irq() {
+        // A Tier 2 module that has the ISR entry but no `irq:` field is
+        // rejected by Rule 3 — the kernel has no IRQ vector to bind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("irq_driver");
+        let src = mod_dir.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+        });
+        let modules = vec![json!({
+            "name": "irq_driver",
+            "type": "irq_driver",
+            "domain": "irq_owner",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+            .expect_err("Tier 2 module without irq: must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("irq") && msg.contains("irq_driver"),
+            "diagnostic must name the missing irq field + the module, got: {msg}"
         );
     }
 
@@ -6160,7 +6274,7 @@ mod scheduler_validation_tests {
     #[test]
     fn admission_accepts_tier_1a_cooperative_with_isr_safe_field_present() {
         // Cooperative tiers (0/1a/3) are unaffected by the
-        // Tier 1b/2 hard-reject — the `isr_safe` manifest flag is
+        // Tier 1b/2 admission gate — the `isr_safe` manifest flag is
         // simply ignored for non-ISR-tier domains. Catches a
         // regression where the gate goes too broad.
         let dir = tempfile::tempdir().expect("tempdir");

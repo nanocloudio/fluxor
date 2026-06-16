@@ -1701,6 +1701,11 @@ pub struct ModuleExports {
     pub state_size_fn: ModuleStateSizeFn,
     pub new_fn: ModuleNewFn,
     pub step_fn: ModuleStepFn,
+    /// Optional `module_isr_entry` export — present only for Tier 2
+    /// (IRQ-owned) modules. `None` for ordinary cooperative modules.
+    /// The ISR dispatcher calls this from IRQ context instead of
+    /// `step_fn`; see `scheduler::register_isr_tier_modules_from_graph`.
+    pub isr_entry_fn: Option<ModuleIsrEntryFn>,
 }
 /// Lookup and validate all required exports from a module (safe - no FFI calls)
 pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExports, LoaderError> {
@@ -1718,10 +1723,25 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
     let nw_fn = unsafe { fn_ptr_from_addr(new_addr) };
     // SAFETY: as above.
     let st_fn = unsafe { fn_ptr_from_addr(step_addr) };
+    // Optional ISR entry — present only when the module exported
+    // `module_isr_entry` (the packer sets the isr_module header bit and
+    // emits the export). Validate it the same way as the mandatory
+    // exports so a Tier 2 module dispatched from IRQ context never jumps
+    // to an address outside the module's code region.
+    let isr_entry_fn = match module.get_export_addr(export_hashes::MODULE_ISR_ENTRY) {
+        Ok(addr) => {
+            validate_fn_addr(addr, "module_isr_entry")?;
+            // SAFETY: addr validated above; ModuleIsrEntryFn matches the
+            // module_isr_entry ABI shape (`extern "C" fn(*mut u8) -> i32`).
+            Some(unsafe { fn_ptr_from_addr::<ModuleIsrEntryFn>(addr) })
+        }
+        Err(_) => None,
+    };
     Ok(ModuleExports {
         state_size_fn: ss_fn,
         new_fn: nw_fn,
         step_fn: st_fn,
+        isr_entry_fn,
     })
 }
 /// Call module_state_size - returns required state buffer size
@@ -1800,6 +1820,12 @@ pub struct DynamicModule {
     /// keeps the unchanged direct EL1 call path used by `none`/`guarded`.
     /// Set at construction from `scheduler::module_is_isolated`.
     isolated: bool,
+    /// Optional `module_isr_entry` export (Tier 2 IRQ-owned modules).
+    /// `None` for cooperative modules. The scheduler's Tier 2 admission
+    /// path forwards this to `isr_tier::register_tier2_module` so the
+    /// hardware IRQ dispatches into the module's ISR entry rather than
+    /// its cooperative `module_step`.
+    isr_entry_fn: Option<ModuleIsrEntryFn>,
 }
 /// Partially initialized module waiting for async operations to complete.
 ///
@@ -1828,6 +1854,10 @@ pub struct DynamicModulePending {
     drain_fn: Option<ModuleDrainFn>,
     auto_register: Option<ProviderAutoRegister>,
     module_idx: u8,
+    /// Carried through from `ModuleExports` so the completed
+    /// `DynamicModule` exposes the Tier 2 ISR entry. See
+    /// `DynamicModule::isr_entry_fn`.
+    isr_entry_fn: Option<ModuleIsrEntryFn>,
 }
 impl DynamicModulePending {
     /// Get step function pointer (for force-completing a pending module).
@@ -1866,6 +1896,7 @@ impl DynamicModulePending {
             drain_fn: None,
             auto_register: None,
             module_idx: 0,
+            isr_entry_fn: None,
         }
     }
     /// Try to complete initialization by calling module_new again.
@@ -1902,6 +1933,7 @@ impl DynamicModulePending {
                     state_size: self.state_size as u32,
                     drain_fn: self.drain_fn,
                     isolated: super::scheduler::module_is_isolated(self.module_idx as usize),
+                    isr_entry_fn: self.isr_entry_fn,
                 }))
             }
             NewStatus::Pending => Ok(None),
@@ -1940,6 +1972,16 @@ impl DynamicModule {
     pub fn step_fn(&self) -> ModuleStepFn {
         self.step_fn
     }
+    /// Get the module's `module_isr_entry` export, if it declared one.
+    /// `Some` only for Tier 2 (IRQ-owned) modules; the scheduler's Tier 2
+    /// admission path forwards it to `isr_tier::register_tier2_module` so
+    /// the hardware IRQ dispatches into the ISR entry rather than the
+    /// cooperative `module_step`. `None` modules cannot be admitted to a
+    /// Tier 2 domain (admission fails, defending against a graph that
+    /// slipped past the build-time validator).
+    pub fn isr_entry_fn(&self) -> Option<ModuleIsrEntryFn> {
+        self.isr_entry_fn
+    }
     /// Create from pre-validated parts (for debug stepping through instantiation).
     pub fn from_parts(step_fn: ModuleStepFn, state_ptr: *mut u8, state_size: u32) -> Self {
         Self {
@@ -1948,6 +1990,27 @@ impl DynamicModule {
             state_size,
             drain_fn: None,
             isolated: false,
+            isr_entry_fn: None,
+        }
+    }
+    /// Like `from_parts`, but injects a Tier 2 `module_isr_entry`
+    /// pointer. Used by the scheduler's Tier 2 admission tests to stand
+    /// up a `DynamicModule` carrying an ISR entry without running the
+    /// full PIC instantiation path. Production code populates
+    /// `isr_entry_fn` exclusively from `lookup_exports`.
+    pub fn from_parts_with_isr_entry(
+        step_fn: ModuleStepFn,
+        state_ptr: *mut u8,
+        state_size: u32,
+        isr_entry_fn: Option<ModuleIsrEntryFn>,
+    ) -> Self {
+        Self {
+            step_fn,
+            state_ptr,
+            state_size,
+            drain_fn: None,
+            isolated: false,
+            isr_entry_fn,
         }
     }
     /// Release this module's state buffer back to the pool. Consumes the
@@ -2200,6 +2263,7 @@ impl DynamicModule {
                     state_size: required_size as u32,
                     drain_fn,
                     isolated: super::scheduler::module_is_isolated(inst_idx),
+                    isr_entry_fn: exports.isr_entry_fn,
                 }))
             }
             NewStatus::Pending => {
@@ -2220,6 +2284,7 @@ impl DynamicModule {
                     drain_fn,
                     auto_register,
                     module_idx: inst_idx as u8,
+                    isr_entry_fn: exports.isr_entry_fn,
                 };
                 log::info!("[inst] pending {name}");
                 Ok(StartNewResult::Pending(pending))

@@ -16,7 +16,7 @@ for the design rationale.
 | **1a** High-rate cooperative | 1 | Sub-ms timer-driven cooperative tick | per-module `step_deadline_us` | full | audio loops, control loops |
 | **1b** Timer ISR | 2 | Polled-timer ISR (BCM2712: soft-polled from scheduler thread; RP: real timer ISR) | `DEFAULT_ISR_BUDGET_CYCLES` (2000 cy ≈ 1 µs on Cortex-A76) | **none from the step body in v1** — see "ISR-tier I/O contract" below | precise-cadence drivers; v1 step bodies do private-state work only |
 | **1c** Pre-pass drain | (per-module flag on a Tier 0/1a domain) | Cooperative, called at start of every pass before `domain_exec_order` | combined `MAX_PRE_TICK_BUDGET_US = 5` µs | full (cooperative) | NIC RX/TX, ARP-table drains |
-| **2** IRQ-owned | 4 | Per-IRQ ISR | per-module budget | (n/a) | **build-time rejected as of 2026-05-26** — the .fmod ABI's `module_isr_entry` symbol is not yet extracted by the PIC loader; admission would call the cooperative `module_step` from IRQ context |
+| **2** IRQ-owned | 4 | Per-IRQ ISR (dispatched via `isr_tier2_trampoline` bound through `hal::irq_bind`) | per-module budget | **none from the `module_isr_entry` body in v1** — same bridge-ABI gap as Tier 1b | precise per-IRQ drivers. **Admission landed 2026-06-16**: module must declare `isr_safe = true`, an `irq:` field, and export `module_isr_entry` (the loader extracts it into `isr_entry_fn`; the IRQ dispatches into it, not the cooperative `module_step`) |
 | **3** Poll | 3 | Continuous spin with WFE on idle | per-pass `domain_budget_us_limit` | full | tight polling loops |
 
 Wire-byte values are stable: changing the byte mapping would break
@@ -54,7 +54,11 @@ The build-time validator
 + [`validate_pre_tick_drain_admission`](../../tools/src/config.rs))
 rejects misconfigurations: a module without `isr_safe = true` in its
 manifest can't land in a Tier 1b/2 domain; a module with
-`pre_tick_drain = true` can't land in a Tier 1b/2/3 domain.
+`pre_tick_drain = true` can't land in a Tier 1b/2/3 domain. A Tier 2
+(`isr_owned`) module additionally must declare an `irq:` field and
+export `module_isr_entry` in its source — the IRQ dispatches into that
+entry point, not the cooperative `module_step`, so a Tier 2 module
+missing either is rejected at build time.
 
 ## Manifest attestations
 
@@ -265,21 +269,39 @@ Conformance tests in [`tests/harness/tests/`](../../tests/harness/tests):
 
 ## What's not yet wired
 
-- **Tier 2 (per-IRQ ISR)** is build-time rejected by the validator.
-  The wire-format byte (`exec_mode == 4`), YAML `irq:` field
-  surface (TLV tag 0xFC), `register_tier2_module` API,
-  `isr_tier2_trampoline`, `hal::irq_bind` hook, and a behavioural
-  test harness for the trampoline are all in place — but the
-  kernel's PIC loader does not yet extract the `module_isr_entry`
-  ABI symbol from the .fmod. Admitting a Tier 2 module today
-  would call the cooperative `module_step` from IRQ context (wrong
-  function, wrong contract). The validator surfaces this with a
-  precise diagnostic pointing at the RFC. **Lift checklist:**
-  extend `kernel::loader::ModuleExports` to carry `isr_entry_fn`,
-  extract it from `MODULE_ISR_ENTRY` exports in the .fmod parser,
-  add an `isr_entry_fn()` accessor on `DynamicModule`, switch the
-  Tier 2 admission branch in `register_isr_tier_modules_from_graph`
-  to use it, then remove the validator hard-reject.
+- **Tier 2 (per-IRQ ISR)** admission is **wired as of 2026-06-16**.
+  The PIC loader extracts the `.fmod`'s `module_isr_entry` export
+  into `ModuleExports::isr_entry_fn` / `DynamicModule::isr_entry_fn()`
+  ([`loader::lookup_exports`](../../src/kernel/loader.rs)); the Tier 2
+  admission branch in
+  [`register_isr_tier_modules_from_graph`](../../src/kernel/scheduler/mod.rs)
+  forwards that pointer to `register_tier2_module` and refuses a
+  Dynamic module that exported no ISR entry (rather than dispatching
+  its cooperative `module_step` from IRQ context). The build-time
+  validator was lifted from a hard-reject to admit-with-checks
+  (`isr_safe = true` + `irq:` + `module_isr_entry` export). The
+  wire-format byte (`exec_mode == 4`), YAML `irq:` field (TLV tag
+  0xFC), `register_tier2_module`, `isr_tier2_trampoline`, and the
+  `hal::irq_bind` hook were already in place. Exercised by a real
+  module-pack loader test (`tests/harness/tests/kernel_loader_isr_entry.rs`)
+  plus Dynamic-module admission + IRQ-dispatch tests in
+  `tests/harness/tests/scheduler_isr_tier_admission.rs` — **these are
+  local-only harness tests; `/tests/` is gitignored by repo policy, so
+  they are not committed regression coverage**. The committed
+  build-time coverage lives in the `fluxor-tools` unit/bin tests
+  (`tools/src/manifest.rs`, `tools/src/config.rs`).
+  **Still platform TODO:** a dedicated-core `run_domain_loop` WFI arm
+  for `exec_mode == 4` (Tier 2 dispatch fires from the hardware IRQ
+  trampoline, so this matters only when a Tier 2 domain owns its own
+  physical core).
+  - **`module_isr_init` is a reserved, unwired ABI symbol.** The
+    packer detects it and the loader defines `ModuleIsrInitFn`, but
+    `Tier2Registration` carries no init pointer and nothing calls it.
+    Tier 2 state is built through the normal cooperative `module_new`
+    at instantiation (non-ISR context), the same trusted-construction
+    path Tier 1b uses — so the v1 Tier 2 contract is **`module_isr_entry`
+    only**. A dedicated ISR-context init hook is a later addition if a
+    driver needs ISR-time state setup distinct from `module_new`.
 - **Module-facing bridge ABI for ISR step bodies.** See the
   "ISR-tier I/O contract" section above — the kernel-side bridge
   wiring is sound, but PIC modules have no documented way to read

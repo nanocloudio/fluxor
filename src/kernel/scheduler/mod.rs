@@ -3089,25 +3089,15 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
 
         // Tier 2: per-IRQ-owned.
         //
-        // **Unreachable from production graphs as of 2026-05-26** —
-        // `validate_isr_tier_admission` rejects `exec_mode == 4` at
-        // build time because the .fmod ABI exports a separate
-        // `module_isr_entry` symbol (see
-        // `src/kernel/loader.rs::MODULE_ISR_ENTRY`) which the
-        // current loader does NOT extract into `ModuleExports`; this
-        // branch below uses `m.step_fn()` (the cooperative step) as
-        // a placeholder, which is wrong from IRQ context for a real
-        // PIC module. The branch stays in place for `BuiltInModule`
-        // test fixtures whose Rust step function happens to be
-        // trivially ISR-safe — that's the only path that reaches
-        // here today, via `install_static_config` + `set_module_irq`
-        // in [tests/harness/tests/scheduler_isr_tier_admission.rs].
-        //
-        // When the loader extracts `module_isr_entry`, switch the
-        // Dynamic-module arm below to `m.isr_entry_fn()`, lift the
-        // validator's hard-reject, and the rest of the path
-        // (trampoline dispatch, IRQ binding, current_module
-        // tracking) is already wired and tested.
+        // A dynamically-loaded Tier 2 module is dispatched from IRQ
+        // context through its dedicated `module_isr_entry` export
+        // (resolved by `loader::lookup_exports` into
+        // `DynamicModule::isr_entry_fn()`), never the cooperative
+        // `module_step`. A Dynamic module with no ISR entry is a hard
+        // registration failure here — the build-time validator requires
+        // the export, and this is the runtime backstop. `BuiltInModule`
+        // fixtures (whose Rust step function is trivially ISR-safe) take
+        // the trampoline arm below.
         if exec_mode == exec_mode::TIER_2 {
             let irq = match module_irq(module_idx) {
                 Some(n) => n,
@@ -3120,18 +3110,28 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
             let budget = resolved_isr_budget_cycles(module_idx);
             let rc = match &sched.modules[module_idx] {
                 crate::kernel::scheduler::module_types::ModuleSlot::Dynamic(m) => {
-                    crate::kernel::isr_tier::register_tier2_module(
-                        crate::kernel::isr_tier::Tier2Registration {
-                            isr_entry: m.step_fn(),
-                            state_ptr: m.state_ptr(),
-                            irq_number: irq,
-                            module_index: module_idx as u8,
-                            budget_cycles: budget,
-                            uses_fpu: false,
-                            in_bridges: &in_arr[..in_n],
-                            out_bridges: &out_arr[..out_n],
-                        },
-                    )
+                    match m.isr_entry_fn() {
+                        Some(isr_entry) => crate::kernel::isr_tier::register_tier2_module(
+                            crate::kernel::isr_tier::Tier2Registration {
+                                isr_entry,
+                                state_ptr: m.state_ptr(),
+                                irq_number: irq,
+                                module_index: module_idx as u8,
+                                budget_cycles: budget,
+                                uses_fpu: false,
+                                in_bridges: &in_arr[..in_n],
+                                out_bridges: &out_arr[..out_n],
+                            },
+                        ),
+                        None => {
+                            log::error!(
+                                "[isr] Tier 2 module {module_idx} exports no \
+                                 module_isr_entry — refusing to dispatch its \
+                                 cooperative module_step from IRQ context"
+                            );
+                            -1
+                        }
+                    }
                 }
                 crate::kernel::scheduler::module_types::ModuleSlot::BuiltIn(_) => {
                     crate::kernel::isr_tier::register_tier2_module(

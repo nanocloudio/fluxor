@@ -504,6 +504,28 @@ pub const IOCTL_BLOCKS_READ_NLB: u32 = 0x4E56_0002;
 /// Returns 0 on success, negative errno on submit / completion error.
 pub const IOCTL_BLOCKS_READ_LBAS_SYNC: u32 = 0x4E56_0003;
 
+/// Block-source ioctl: synchronously write `nlb` sectors at `lba`
+/// from the caller-supplied buffer. The symmetric counterpart of
+/// [`IOCTL_BLOCKS_READ_LBAS_SYNC`] — the producer copies the data into
+/// its DMA scratch, submits the device Write command, and spin-polls
+/// completion before returning. Used by synchronous file-system
+/// providers (`fat32`'s FS_CONTRACT write path) that must land FAT /
+/// directory / data sectors and know they reached the controller
+/// within the `provider_call`, since the async `WS_*` channel state
+/// machine cannot advance inside a synchronous dispatch.
+///
+/// Durability note: this guarantees the write reached the controller,
+/// not that it is NAND-committed. A subsequent device flush
+/// (`PAGER_OP_FLUSH`, which issues an NVMe Flush) is required for
+/// fsync-grade durability.
+///
+/// arg layout (16 bytes, little-endian):
+///   [lba: u32][nlb: u16][_pad: u16][buf_ptr: u64]
+/// `buf_ptr` must point to ≥ `nlb * 512` readable bytes. `nlb` is
+/// clamped to the producer's per-command sector limit (NVMe MAX_NLB).
+/// Returns 0 on success, negative errno on submit / completion error.
+pub const IOCTL_BLOCKS_WRITE_LBAS_SYNC: u32 = 0x4E56_0004;
+
 // ============================================================================
 // FMP Well-Known Message Types (pre-computed FNV-1a hashes)
 // ============================================================================
