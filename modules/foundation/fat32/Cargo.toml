@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "fluxor-mod-fat32"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "FAT32 filesystem PIC module — host-test build"
+
+# Same additive-only pattern as modules/drivers/nvme/Cargo.toml: the
+# bare-metal build invokes `rustc` directly against `mod.rs` and ignores
+# this file. Cargo only sees it during host-test builds where the harness
+# exercises the synchronous FS_CONTRACT write path (fs_op_create /
+# fs_op_write / fs_op_fsync) against an in-memory block device.
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+host-test = []
+
+[dependencies]
+fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }

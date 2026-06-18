@@ -526,6 +526,14 @@ pub const IOCTL_BLOCKS_READ_LBAS_SYNC: u32 = 0x4E56_0003;
 /// Returns 0 on success, negative errno on submit / completion error.
 pub const IOCTL_BLOCKS_WRITE_LBAS_SYNC: u32 = 0x4E56_0004;
 
+/// Block-source ioctl: synchronously commit the device's volatile
+/// write cache to non-volatile media (NVMe Flush, opcode 0x00).
+/// Drains any in-flight async writes first. `arg` is ignored (pass
+/// null). Returns 0 on success, negative errno otherwise. Used by
+/// synchronous file-system providers (`fat32`'s `FS_FSYNC`) to give
+/// callers true fsync-grade durability after `IOCTL_BLOCKS_WRITE_LBAS_SYNC`.
+pub const IOCTL_BLOCKS_FLUSH_SYNC: u32 = 0x4E56_0005;
+
 // ============================================================================
 // FMP Well-Known Message Types (pre-computed FNV-1a hashes)
 // ============================================================================

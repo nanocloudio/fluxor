@@ -4136,12 +4136,25 @@ pub fn instantiate_one_module(
 // sched_mut(), sched_modules(), validate_buffer_groups(), compute_downstream_latency(),
 // step_modules(), step_woken_modules().
 
-/// Compute topological execution order from the edge graph using Kahn's algorithm.
-///
 /// Precompute upstream dependency bitmask for ready-signal gating.
-/// For each module, upstream_mask[i] has bits set for all modules that
-/// feed data into module i via edges. Used with ready[] to skip modules
-/// whose upstream infrastructure hasn't signaled Ready yet.
+///
+/// For each module, `upstream_mask[i]` has one bit set per module that feeds
+/// `i` over a **forward** edge — an edge whose source precedes its destination
+/// in the topological execution order (`exec_order`). Used with `ready[]` to
+/// skip a module while any of its forward upstreams has not yet signaled
+/// `StepOutcome::Ready` (see `.context/scheduler_domain_api.md` §4).
+///
+/// **Back-edges are excluded.** A back-edge is a cycle-closing edge that only
+/// exists when the graph declares `scheduler: accept_cycles: true`; under the
+/// topological sort, a cycle's members are ordered linearly and the edge that
+/// runs "backward" (a later member → an earlier one) is the back-edge. Counting
+/// such an edge toward `upstream_mask` would make a feedback cycle's members
+/// each wait on the other's `Ready` forever — a mutual deadlock that leaves the
+/// whole feedback cycle dark. Excluding back-edges lets cycle members step from
+/// the first tick and converge to `Ready`.
+///
+/// MUST be called after `compute_exec_order` (which appends cycle members under
+/// `accept_cycles`) so the position map reflects the final ordering.
 fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
     // SAFETY: scheduler-thread (prepare_graph) context.
     let sched = unsafe {
@@ -4151,10 +4164,36 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
     for slot in sched.upstream_mask.iter_mut() {
         *slot = 0;
     }
+
+    // Build a module→position map from the topological execution order.
+    // `NO_POS` marks a module absent from exec_order; we can't prove an edge
+    // touching it is forward, so we conservatively exclude that edge from the
+    // gate rather than index out of range.
+    const NO_POS: u16 = u16::MAX;
+    let mut pos = [NO_POS; MAX_MODULES];
+    for (order_pos, &m) in sched
+        .exec_order
+        .iter()
+        .take(sched.exec_order_count)
+        .enumerate()
+    {
+        let midx = m as usize;
+        if midx < MAX_MODULES {
+            pos[midx] = order_pos as u16;
+        }
+    }
+
     for edge in edges.iter().take(edge_count) {
         let from = edge.from_module;
         let to = edge.to_module;
-        if from < MAX_MODULES && to < MAX_MODULES {
+        if from >= MAX_MODULES || to >= MAX_MODULES {
+            continue;
+        }
+        let (pf, pt) = (pos[from], pos[to]);
+        // Forward edge only: both endpoints ordered and source strictly
+        // precedes destination. `pf >= pt` (including either unordered) is a
+        // back-edge or unprovable — excluded so feedback cycles don't deadlock.
+        if pf != NO_POS && pt != NO_POS && pf < pt {
             sched.upstream_mask[to] |= 1u64 << from;
         }
     }

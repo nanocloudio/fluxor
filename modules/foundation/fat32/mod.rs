@@ -24,7 +24,7 @@
 //! Downstream (bank) sends IOCTL_NOTIFY with file index (0, 1, 2, ...).
 //! Fat32 starts streaming that file's data.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -311,6 +311,38 @@ mod params_def {
         //     count; `write_data_len` is ignored.
         7, seed_pattern, u8, 0
             => |s, d, len| { s.seed_pattern = super::p_u8(d, len, 0, 0); };
+
+        // When non-zero, on mount the synchronous write path's free-cluster
+        // scan resumes from this cluster (and the value is persisted to the
+        // FSINFO next-free hint). Operational override for a volume whose low
+        // clusters are a long run of allocated/orphaned entries: seeding the
+        // hint past that region keeps the first allocation O(1) instead of
+        // scanning thousands of FAT entries. Clusters at/after the hint must
+        // actually be free.
+        8, init_free_hint, u32, 0
+            => |s, d, len| { s.init_free_hint = p_u32(d, len, 0, 0); };
+
+        // When non-zero (and `init_free_hint` set), the first create zeros the
+        // FAT entries for `[init_free_hint, init_free_hint + clear_free_region)`
+        // in every FAT copy, making that span free, before seeding the scan
+        // there. Reclaims a span of a volume whose FAT region holds stale /
+        // never-formatted (non-zero) entries the free-cluster scan would
+        // otherwise treat as allocated. Keep small (a few hundred clusters) so
+        // it fits one create's cooperative step budget; the span only needs to
+        // cover the writer's working set. The region must not overlap real data
+        // (pick a high, unused `init_free_hint`).
+        9, clear_free_region, u32, 0
+            => |s, d, len| { s.clear_free_region = p_u32(d, len, 0, 0); };
+
+        // When non-zero, the first create truncates the root directory to one
+        // empty cluster (zero cluster 2's sectors, set FAT[2]=EOC) before
+        // scanning it. Reclaims a root dir bloated by orphaned entries: the dir
+        // walk then touches one warm (just-written) cluster instead of many
+        // cold ones — a cold first-touch read of a dir cluster can exceed the
+        // cooperative step guard. CLEAN-SLATE ONLY: discards existing root-dir
+        // entries; do not set where on-disk files must survive a remount.
+        10, clean_root, u32, 0
+            => |s, d, len| { s.clean_root = p_u32(d, len, 0, 0); };
     }
 }
 
@@ -394,6 +426,37 @@ struct OpenFile {
     scratch_pos: u16,
     /// Most recently fetched 512-byte sector for this FD.
     scratch_block: [u8; BLOCK_SIZE],
+
+    // ── FS_CONTRACT write path (FS_OPEN_CREATE / FS_WRITE / FS_FSYNC) ──
+    /// 1 = opened for append-writing via FS_OPEN_CREATE. Write ops
+    /// reject FDs without this set. For a writable FD, `size` is the
+    /// append cursor, `current_cluster` is the cluster holding byte
+    /// `size`, and `start_cluster` is the chain head (0 = empty file).
+    writable: u8,
+    /// 1 = `size` / first-cluster grew since the last FS_FSYNC, so the
+    /// directory entry needs writeback before the data is discoverable.
+    dirty: u8,
+    /// 1 once this handle's data + dir entry have been made device-durable
+    /// by a successful FS_FSYNC; cleared on the next write. Drives the
+    /// fence `QUERY_OP` so durability-aware callers observe `LocalDurable`
+    /// after fsync rather than `Volatile`.
+    durable: u8,
+    /// Absolute LBA of the sector holding this file's 32-byte directory
+    /// entry, and the byte offset of the entry within it. Captured at
+    /// FS_OPEN_CREATE so FS_FSYNC/FS_CLOSE can patch the size + first
+    /// cluster fields.
+    dir_lba: u32,
+    dir_off: u16,
+    _pad_of: u16,
+    /// Absolute LBA currently mirrored in `scratch_block` (single-sector
+    /// write-back cache), or 0 for none — LBA 0 is the MBR, never a file
+    /// data sector. When a write or RMW targets this same sector, the
+    /// device read is skipped because `scratch_block` already mirrors it.
+    /// Eliminates the read-after-write of a freshly-allocated cluster (a
+    /// cold first-touch read can blow the cooperative step guard) on the
+    /// append pattern where a length prefix and the payload share a sector,
+    /// forcing an RMW of the sector just written.
+    scratch_lba: u32,
 }
 
 impl OpenFile {
@@ -410,6 +473,13 @@ impl OpenFile {
             scratch_avail: 0,
             scratch_pos: 0,
             scratch_block: [0u8; BLOCK_SIZE],
+            writable: 0,
+            dirty: 0,
+            durable: 0,
+            dir_lba: 0,
+            dir_off: 0,
+            _pad_of: 0,
+            scratch_lba: 0,
         }
     }
 }
@@ -436,6 +506,11 @@ struct Fat32State {
     root_cluster: u32,
     fat_start_sector: u32,
     data_start_sector: u32,
+    /// Count of addressable data clusters (`(total_sectors - metadata) /
+    /// sectors_per_cluster`). Valid cluster numbers are `2 ..= count + 1`. 0
+    /// if not derived from the BPB; the FAT's entry capacity is used as a
+    /// fallback ceiling then. See `cluster_count_ceiling`.
+    count_of_clusters: u32,
     partition_lba: u32,
     /// Sector number of the FSINFO sector relative to `partition_lba`,
     /// from BPB_FSInfo (boot-sector offset 48). `0` or `0xFFFF` means
@@ -578,6 +653,22 @@ struct Fat32State {
     /// synchronous and serializes within each dispatch call.
     open_files: [OpenFile; MAX_OPEN_FILES],
 
+    /// Linear free-cluster allocation hint for the synchronous FS write
+    /// path. Starts at 2 and advances past every cluster handed out, so
+    /// sequential appends don't rescan the FAT from the start each time.
+    /// Only a hint — `fs_alloc_cluster` still verifies the entry is free.
+    next_free_hint: u32,
+    /// Mount-time override for `next_free_hint` (param `init_free_hint`);
+    /// persisted to FSINFO once at init. 0 = unset.
+    init_free_hint: u32,
+    /// Clusters to zero in the FAT starting at `init_free_hint` on first
+    /// create (param `clear_free_region`); reclaims a span of a garbage FAT.
+    clear_free_region: u32,
+    /// When non-zero (param `clean_root`), the first create truncates the root
+    /// directory to one empty, warm cluster — avoids cold-read scans of a
+    /// bloated root dir. Bench/clean-slate only.
+    clean_root: u32,
+
     /// Hot-path counters emitted as `[fat32] tlm dt=… rx=… tx=… idle=… bp=…`
     /// every `FAT32_TLM_PERIOD` steps. `rx` is bytes consumed from
     /// the upstream blocks channel (init walks + write-path FAT/dir
@@ -603,9 +694,11 @@ impl Fat32State {
         self.root_cluster = 0;
         self.fat_start_sector = 0;
         self.data_start_sector = 0;
+        self.count_of_clusters = 0;
         self.partition_lba = 0;
         self.fsinfo_sector = 0;
         self.init_phase = Fat32InitPhase::Idle;
+        self.next_free_hint = 2;
         self.file_count = 0;
         self.dir_cluster = 0;
         self.dir_sector_in_cluster = 0;
@@ -685,6 +778,23 @@ unsafe fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
 #[inline(always)]
 fn cluster_to_sector(s: &Fat32State, cluster: u32) -> u32 {
     s.data_start_sector + (cluster - 2) * (s.sectors_per_cluster as u32)
+}
+
+/// Exclusive upper bound for valid data-cluster numbers. Clusters are numbered
+/// `2 ..= count_of_clusters + 1`, so the exclusive end is `count_of_clusters +
+/// 2`, capped at the FAT's entry capacity. Falls back to FAT capacity when the
+/// cluster count wasn't derived (non-standard BPB) so behaviour is never worse
+/// than the old capacity-only bound. Allocators MUST scan below this so they
+/// never hand out a FAT slack entry that maps past the end of the data area.
+#[inline]
+fn cluster_count_ceiling(s: &Fat32State) -> u32 {
+    let eps = (s.bytes_per_sector as u32) / 4;
+    let fat_cap = eps.saturating_mul(s.fat_size_32);
+    if s.count_of_clusters == 0 {
+        fat_cap
+    } else {
+        s.count_of_clusters.saturating_add(2).min(fat_cap)
+    }
 }
 
 /// Get sector containing FAT entry for given cluster
@@ -769,6 +879,18 @@ unsafe fn parse_boot_sector(s: &mut Fat32State) -> bool {
     if s.root_cluster < 2 {
         return false;
     }
+
+    // Real count of addressable data clusters (FAT32 §3.5). For FAT32 the
+    // 16-bit total-sectors field is 0, so the 32-bit field at offset 32 holds
+    // the count. The FAT can hold more entries than there are data clusters
+    // (trailing slack), so the allocator must bound on this, not FAT capacity.
+    let tot_sec_16 = read_u16_le(buf, 19) as u32;
+    let tot_sec_32 = read_u32_le(buf, 32);
+    let tot_sec = if tot_sec_16 != 0 { tot_sec_16 } else { tot_sec_32 };
+    let meta_sectors = (s.reserved_sectors as u32)
+        .wrapping_add((s.num_fats as u32).wrapping_mul(s.fat_size_32));
+    let data_sectors = tot_sec.saturating_sub(meta_sectors);
+    s.count_of_clusters = data_sectors / (s.sectors_per_cluster as u32);
 
     true
 }
@@ -1020,6 +1142,8 @@ const FS_READ:    u32 = 0x0901;
 const FS_SEEK:    u32 = 0x0902;
 const FS_CLOSE:   u32 = 0x0903;
 const FS_STAT:    u32 = 0x0904;
+const FS_FSYNC:   u32 = 0x0905;
+const FS_WRITE:   u32 = 0x0906;
 const FS_OPENDIR: u32 = 0x0907;
 const FS_READDIR: u32 = 0x0908;
 /// `OPEN_CREATE` (0x0909) is documented in
@@ -1038,8 +1162,17 @@ const FS_CAPS: u32 = 0x09FF;
 
 /// FS capability bits — must match
 /// `modules/sdk/contracts/storage/fs.rs::caps`.
-const FS_CAP_OPEN:    u32 = 1 << 0;
-const FS_CAP_OPENDIR: u32 = 1 << 1;
+const FS_CAP_OPEN:        u32 = 1 << 0;
+const FS_CAP_OPENDIR:     u32 = 1 << 1;
+const FS_CAP_OPEN_CREATE: u32 = 1 << 2;
+const FS_CAP_WRITE:       u32 = 1 << 3;
+const FS_CAP_FSYNC:       u32 = 1 << 4;
+
+/// `Fence::LocalDurable` device id reported by fat32 handles once their
+/// data has been fsync'd. Opaque per `contracts::fence::DeviceId` (u64);
+/// the ASCII tag just makes it legible in traces. Mirrors the linux FS
+/// provider's `LINUX_FS_DEVICE_ID` convention.
+const FAT32_FS_DEVICE_ID: u64 = 0x6661_7433_325f_6673; // "fat32_fs"
 
 /// Synchronously fetch a 512-byte sector at `lba` into `out`. Returns
 /// 0 on success, negative errno otherwise. The block source must
@@ -1251,6 +1384,10 @@ unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 
     of.sector_in_cluster = 0;
     of.scratch_avail = 0;
     of.scratch_pos = 0;
+    of.writable = 0;
+    of.dirty = 0;
+    of.dir_lba = 0;
+    of.dir_off = 0;
     // FS handles carry their contract in the tag; the vtable
     // wrapper strips it on re-entry so inbound ops see the raw
     // slot.
@@ -1287,6 +1424,9 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
             let of2 = &mut s.open_files[slot_idx];
             of2.scratch_avail = bps as u16;
             of2.scratch_pos = 0;
+            // Keep the write-back cache tag coherent: scratch_block now holds
+            // `sector`, not whatever a prior write left.
+            of2.scratch_lba = sector;
         }
         let of3 = &mut s.open_files[slot_idx];
         let avail = of3.scratch_avail as u32;
@@ -1373,6 +1513,8 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         let buf_ptr = s.open_files[slot_idx].scratch_block.as_mut_ptr();
         let rc = fs_sync_read_sector(s, lba, buf_ptr);
         if rc != 0 { return rc; }
+        // scratch_block now holds `lba` — keep the write-back cache tag coherent.
+        s.open_files[slot_idx].scratch_lba = lba;
     }
     let of = &mut s.open_files[slot_idx];
     of.current_cluster = cluster;
@@ -1393,8 +1535,26 @@ unsafe fn fs_op_close(s: &mut Fat32State, handle: i32) -> i32 {
     let slot_idx = handle as usize;
     if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
     if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    // Flush a dirty writable handle so the directory entry (size +
+    // first cluster) is persisted before the slot is released — a
+    // close without an explicit fsync must not lose the file.
+    let mut rc = 0i32;
+    if s.open_files[slot_idx].writable != 0 {
+        if s.open_files[slot_idx].dirty != 0 {
+            let wb = fs_writeback_dir_entry(s, slot_idx);
+            let fl = fs_sync_flush(s);
+            // Surface a genuine durability failure (FS_FSYNC returns success,
+            // so a non-zero here is real); the slot is released either way.
+            rc = if wb != 0 { wb } else { fl };
+        }
+        // Persist the free-cluster hint once, on close (not per fsync), so a
+        // later mount resumes the scan past what this handle allocated. Done
+        // for every writable handle — a write→fsync→close clears `dirty`
+        // before close, so gating this on `dirty` would lose the hint.
+        let _ = fs_write_fsinfo_hint(s);
+    }
     s.open_files[slot_idx] = OpenFile::empty();
-    0
+    rc
 }
 
 /// FS_STAT: write `[size: u32 LE, mtime: u32 LE]` (8 bytes) into
@@ -1628,8 +1788,605 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
     out_pos as i32
 }
 
-#[link_section = ".text.module_provider_dispatch"]
-#[export_name = "module_provider_dispatch"]
+// ============================================================================
+// FS_CONTRACT write path (FS_OPEN_CREATE / FS_WRITE / FS_FSYNC)
+// ============================================================================
+//
+// Append-only synchronous writer, the counterpart of the synchronous
+// read path (`fs_op_open`/`fs_op_read` via `IOCTL_BLOCKS_READ_LBAS_SYNC`).
+// The async `WS_*` state machine cannot advance inside a synchronous
+// `provider_call`, so every block op here goes through the producer's
+// synchronous ioctls (`IOCTL_BLOCKS_{WRITE,READ}_LBAS_SYNC`,
+// `IOCTL_BLOCKS_FLUSH_SYNC`). Targets the append-only workload:
+// OPEN_CREATE → WRITE×N → FSYNC → CLOSE. All bookkeeping is sector-at-a-
+// time read-modify-write; `block_buf` is the FAT/dir scratch and each
+// FD's `scratch_block` is the data RMW buffer (nothing else runs during
+// a synchronous dispatch on this cooperative single-core design).
+
+/// Synchronously write one 512-byte sector at absolute `lba` from `buf`.
+/// Mirror of `fs_sync_read_sector`. Returns 0 on success.
+unsafe fn fs_sync_write_sector(s: &Fat32State, lba: u32, buf: *const u8) -> i32 {
+    let mut arg = [0u8; 16];
+    let lba_b = lba.to_le_bytes();
+    arg[0] = lba_b[0]; arg[1] = lba_b[1]; arg[2] = lba_b[2]; arg[3] = lba_b[3];
+    arg[4] = 1; arg[5] = 0; // nlb = 1
+    let buf_b = (buf as u64).to_le_bytes();
+    let mut i = 0usize;
+    while i < 8 { arg[8 + i] = buf_b[i]; i += 1; }
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_WRITE_LBAS_SYNC, arg.as_mut_ptr(), 16)
+}
+
+/// Commit the block source's write cache (NVMe Flush). Returns 0 on
+/// success; ENOSYS-tolerant callers treat a negative result as "no
+/// durable flush available" but fat32 surfaces it.
+unsafe fn fs_sync_flush(s: &Fat32State) -> i32 {
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_FLUSH_SYNC, core::ptr::null_mut(), 0)
+}
+
+/// Synchronously read one sector at `lba` into `block_buf`. Hoists the
+/// buffer pointer into a local first so the raw `*mut` doesn't collide
+/// with the immutable `&Fat32State` borrow the read takes (matches the
+/// pattern in `fs_op_read`).
+unsafe fn fs_read_blockbuf(s: &mut Fat32State, lba: u32) -> i32 {
+    let p = s.block_buf.as_mut_ptr();
+    fs_sync_read_sector(s, lba, p)
+}
+
+/// Write `value` (28-bit) into `cluster`'s FAT entry across every FAT
+/// copy, preserving the top 4 reserved bits. Read-modify-write of the
+/// containing FAT sector via `block_buf`.
+unsafe fn fs_write_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) -> i32 {
+    let fat1 = fat_sector_for_cluster(s, cluster);
+    let rc = fs_read_blockbuf(s, fat1);
+    if rc != 0 { return rc; }
+    let off = fat_offset_for_cluster(s, cluster);
+    let existing = read_u32_le(&s.block_buf, off);
+    let merged = (existing & !FAT32_MASK) | (value & FAT32_MASK);
+    let le = merged.to_le_bytes();
+    s.block_buf[off] = le[0];
+    s.block_buf[off + 1] = le[1];
+    s.block_buf[off + 2] = le[2];
+    s.block_buf[off + 3] = le[3];
+    let rel = fat1 - s.fat_start_sector;
+    let mut fi: u32 = 0;
+    while fi < s.num_fats as u32 {
+        let sec = s.fat_start_sector + fi * s.fat_size_32 + rel;
+        let wc = fs_sync_write_sector(s, sec, s.block_buf.as_ptr());
+        if wc != 0 { return wc; }
+        fi += 1;
+    }
+    0
+}
+
+/// Scan `[lo, hi)` for the first cluster whose FAT entry is free (== 0),
+/// reading FAT sectors into `block_buf`. Returns the cluster (>= 2) or 0
+/// if none free in the range (or an I/O error). Does not mutate the FAT.
+unsafe fn fs_scan_free_clusters(s: &mut Fat32State, lo: u32, hi: u32) -> u32 {
+    let bps = s.bytes_per_sector as u32;
+    if bps == 0 { return 0; }
+    let eps = bps / 4;
+    if eps == 0 { return 0; }
+    let mut c = if lo < 2 { 2 } else { lo };
+    while c < hi {
+        let fat_sec = fat_sector_for_cluster(s, c);
+        if fs_read_blockbuf(s, fat_sec) != 0 { return 0; }
+        let first_in_sec = (fat_sec - s.fat_start_sector).wrapping_mul(eps);
+        let end = first_in_sec + eps;
+        let mut cc = c;
+        while cc < end && cc < hi {
+            if cc >= 2 {
+                let off = ((cc - first_in_sec) * 4) as usize;
+                if (read_u32_le(&s.block_buf, off) & FAT32_MASK) == 0 {
+                    return cc;
+                }
+            }
+            cc += 1;
+        }
+        c = end;
+    }
+    0
+}
+
+/// Find a free cluster, treating `next_free_hint` as a true HINT, not a
+/// hard floor: scan `[hint, max)` first (the common fast path — the hint
+/// points at fresh free space), then WRAP and scan `[2, hint)`. Without
+/// the wrap a stale FSINFO hint or an `init_free_hint` set past the
+/// actually-free region would return ENOSPC while free clusters sit below
+/// it. Returns the cluster (>= 2) or 0 only when the volume is genuinely
+/// full. Does not mutate the FAT — caller links it.
+unsafe fn fs_find_free_cluster(s: &mut Fat32State) -> u32 {
+    // Real data-cluster ceiling, not raw FAT capacity — never return a slack
+    // entry that maps past the data area.
+    let max_clst = cluster_count_ceiling(s);
+    if max_clst < 3 { return 0; }
+    let hint = if s.next_free_hint < 2 { 2 } else { s.next_free_hint };
+    let found = fs_scan_free_clusters(s, hint, max_clst);
+    if found >= 2 { return found; }
+    // Wrap-around: the region at/after the hint is exhausted; reclaim from
+    // the low region the hint skipped past. Cap the upper bound at `max_clst`
+    // — a stale FSINFO hint or an `init_free_hint` set beyond the data area
+    // would otherwise scan past it and return a bogus (out-of-range) cluster.
+    if hint > 2 {
+        let wrapped = fs_scan_free_clusters(s, 2, hint.min(max_clst));
+        if wrapped >= 2 { return wrapped; }
+    }
+    0
+}
+
+/// Allocate a fresh cluster: find a free one, mark it EOC, and (when
+/// `prev >= 2`) link `prev` to it. Returns the new cluster or 0 on
+/// failure (disk full / I/O error).
+unsafe fn fs_alloc_cluster(s: &mut Fat32State, prev: u32) -> u32 {
+    let cc = fs_find_free_cluster(s);
+    if cc < 2 { return 0; }
+    s.next_free_hint = cc + 1;
+    if fs_write_fat_entry(s, cc, FAT32_TAIL) != 0 { return 0; }
+    if prev >= 2 && fs_write_fat_entry(s, prev, cc) != 0 { return 0; }
+    cc
+}
+
+/// Free an entire cluster chain (set every entry to 0). Used to
+/// truncate an existing file on FS_OPEN_CREATE.
+unsafe fn fs_free_chain(s: &mut Fat32State, start: u32) {
+    let mut c = start;
+    let mut guard: u32 = 0;
+    while c >= 2 && c < FAT32_EOC && guard < 0x1000_0000 {
+        let next = fs_read_fat_entry(s, c); // EOC on chain end / 0
+        let _ = fs_write_fat_entry(s, c, 0);
+        if next >= FAT32_EOC || next < 2 { break; }
+        c = next;
+        guard += 1;
+    }
+}
+
+/// Read the FAT32 FSINFO "next free cluster" hint (offset 0x1EC) from the
+/// volume's FSINFO sector. Returns the hint if the sector is present and the
+/// value is plausible (>= 2), else 0. Lets the synchronous write path resume
+/// the free-cluster scan near where the last mount left off instead of
+/// rescanning from cluster 2 — create-truncate cycles orphan old chains
+/// rather than synchronously freeing them (see `fs_op_create`), so the low
+/// clusters accumulate allocated entries the scan would otherwise rewalk.
+unsafe fn fs_read_fsinfo_hint(s: &mut Fat32State) -> u32 {
+    if s.fsinfo_sector == 0 || s.fsinfo_sector == 0xFFFF {
+        return 0;
+    }
+    let lba = s.partition_lba.wrapping_add(s.fsinfo_sector as u32);
+    if fs_read_blockbuf(s, lba) != 0 {
+        return 0;
+    }
+    let hint = read_u32_le(&s.block_buf, 0x1EC);
+    if hint >= 2 && hint != 0xFFFF_FFFF {
+        hint
+    } else {
+        0
+    }
+}
+
+/// Persist `next_free_hint` into the FSINFO sector's next-free field so the
+/// next mount resumes the free scan past the clusters already consumed.
+/// Best-effort: a missing / invalid FSINFO sector is a no-op. Called on
+/// CLOSE (once per file), not per FS_FSYNC, so it never inflates fsync
+/// latency.
+unsafe fn fs_write_fsinfo_hint(s: &mut Fat32State) -> i32 {
+    if s.fsinfo_sector == 0 || s.fsinfo_sector == 0xFFFF {
+        return 0;
+    }
+    let lba = s.partition_lba.wrapping_add(s.fsinfo_sector as u32);
+    if fs_read_blockbuf(s, lba) != 0 {
+        return 0;
+    }
+    let v = s.next_free_hint.to_le_bytes();
+    s.block_buf[0x1EC] = v[0];
+    s.block_buf[0x1ED] = v[1];
+    s.block_buf[0x1EE] = v[2];
+    s.block_buf[0x1EF] = v[3];
+    fs_sync_write_sector(s, lba, s.block_buf.as_ptr())
+}
+
+/// Truncate the root directory to one empty cluster: write zeroed sectors over
+/// the root cluster's data (every dir entry becomes 0x00 = end-of-directory)
+/// and set its FAT entry to EOC, orphaning any further root-dir clusters. The
+/// just-written cluster is warm, so the subsequent dir scan never cold-reads it
+/// (a cold first-touch read can blow the cooperative step guard). Clean-slate
+/// only — discards existing root-dir entries.
+unsafe fn fs_clean_root(s: &mut Fat32State) {
+    let spc = s.sectors_per_cluster as u32;
+    if spc == 0 || s.root_cluster < 2 { return; }
+    let base = cluster_to_sector(s, s.root_cluster);
+    let zero = [0u8; BLOCK_SIZE];
+    let mut i: u32 = 0;
+    while i < spc {
+        if fs_sync_write_sector(s, base + i, zero.as_ptr()) != 0 { return; }
+        i += 1;
+    }
+    // One-cluster root: point its FAT entry at EOC, leaking any tail clusters.
+    let _ = fs_write_fat_entry(s, s.root_cluster, FAT32_TAIL);
+}
+
+/// Zero the FAT entries for `[start, start + count)` clusters in every FAT
+/// copy, marking that span free. Batched one FAT sector at a time (128
+/// entries/sector), so `count` of a few hundred is a handful of sync sector
+/// writes. Used to reclaim a usable region of a volume whose FAT holds stale
+/// non-zero entries the free scan would otherwise treat as allocated.
+///
+/// DESTRUCTIVE: blindly frees the whole span, so it MUST run only on a
+/// fresh-format mount where the span holds nothing live. The mount path
+/// gates the call on `clean_root` for exactly this reason — running it on a
+/// remount severs any live chains that live in the operator's
+/// `init_free_hint` region (FS_STAT still reports the full size, but the
+/// chain past the first cluster — hence the data — is lost on read-back).
+unsafe fn fs_clear_fat_region(s: &mut Fat32State, start: u32, count: u32) {
+    let bps = s.bytes_per_sector as u32;
+    if bps == 0 { return; }
+    let eps = bps / 4; // FAT entries per sector
+    if eps == 0 { return; }
+    let max_clst = cluster_count_ceiling(s);
+    // Never touch the reserved entries FAT[0]/FAT[1] (media byte / EOC marker).
+    let start = start.max(2);
+    let endc = start.saturating_add(count).min(max_clst);
+    let mut c = start;
+    while c < endc {
+        let fat_sec = fat_sector_for_cluster(s, c);
+        if fs_read_blockbuf(s, fat_sec) != 0 { return; }
+        let first_in_sec = (fat_sec - s.fat_start_sector).wrapping_mul(eps);
+        let sec_end = first_in_sec.saturating_add(eps);
+        let lo = c.max(first_in_sec);
+        let hi = endc.min(sec_end);
+        let mut cc = lo;
+        while cc < hi {
+            let off = ((cc - first_in_sec) * 4) as usize;
+            if off + 4 <= BLOCK_SIZE {
+                s.block_buf[off] = 0;
+                s.block_buf[off + 1] = 0;
+                s.block_buf[off + 2] = 0;
+                s.block_buf[off + 3] = 0;
+            }
+            cc += 1;
+        }
+        let rel = fat_sec - s.fat_start_sector;
+        let mut fi: u32 = 0;
+        while fi < s.num_fats as u32 {
+            let sec = s.fat_start_sector + fi * s.fat_size_32 + rel;
+            if fs_sync_write_sector(s, sec, s.block_buf.as_ptr()) != 0 { return; }
+            fi += 1;
+        }
+        c = sec_end;
+    }
+}
+
+/// Location of a directory entry (existing match or a free slot).
+struct DirentLoc {
+    lba: u32,
+    off: u16,
+    exists: bool,
+    /// Set only when `exists` and the matched entry has `ATTR_DIRECTORY`.
+    is_dir: bool,
+    start_cluster: u32,
+    size: u32,
+}
+
+/// Compare two 11-byte FAT 8.3 short names for equality.
+#[inline]
+fn name_eq(a: &[u8], b: &[u8; 11]) -> bool {
+    let mut i = 0usize;
+    while i < 11 { if a[i] != b[i] { return false; } i += 1; }
+    true
+}
+
+/// Scan the directory at `dir_cluster` for the 8.3 name `want`. Returns
+/// the matching entry's location (`exists = true`) or the first free
+/// slot (deleted `0xE5`, else the `0x00` end marker). `None` only if the
+/// directory is full with no end marker (caller treats as ENOSPC).
+unsafe fn fs_scan_dir(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11]) -> Option<DirentLoc> {
+    if dir_cluster < 2 { return None; }
+    let spc = s.sectors_per_cluster as u32;
+    if spc == 0 { return None; }
+    let mut cur = dir_cluster;
+    let mut free_lba: u32 = 0;
+    let mut free_off: u16 = 0;
+    let mut have_free = false;
+    loop {
+        let first_sec = cluster_to_sector(s, cur);
+        let mut sec: u32 = 0;
+        while sec < spc {
+            let lba = first_sec + sec;
+            if fs_read_blockbuf(s, lba) != 0 { return None; }
+            let mut e: usize = 0;
+            while e < BLOCK_SIZE {
+                let b0 = s.block_buf[e];
+                if b0 == 0x00 {
+                    // End of directory — reuse a remembered free slot if
+                    // we found one earlier, else take this end slot.
+                    if have_free {
+                        return Some(DirentLoc { lba: free_lba, off: free_off, exists: false, is_dir: false, start_cluster: 0, size: 0 });
+                    }
+                    return Some(DirentLoc { lba, off: e as u16, exists: false, is_dir: false, start_cluster: 0, size: 0 });
+                }
+                if b0 == 0xE5 {
+                    if !have_free { free_lba = lba; free_off = e as u16; have_free = true; }
+                } else {
+                    let attr = s.block_buf[e + 11];
+                    if attr != ATTR_LONG_NAME && (attr & ATTR_VOLUME_ID) == 0
+                        && name_eq(&s.block_buf[e..e + 11], want)
+                    {
+                        let chi = read_u16_le(&s.block_buf, e + 20) as u32;
+                        let clo = read_u16_le(&s.block_buf, e + 26) as u32;
+                        let sz = read_u32_le(&s.block_buf, e + 28);
+                        return Some(DirentLoc {
+                            lba, off: e as u16, exists: true,
+                            is_dir: (attr & ATTR_DIRECTORY) != 0,
+                            start_cluster: (chi << 16) | clo, size: sz,
+                        });
+                    }
+                }
+                e += DIR_ENTRY_SIZE;
+            }
+            sec += 1;
+        }
+        let next = fs_read_fat_entry(s, cur);
+        if next >= FAT32_EOC || next < 2 {
+            if have_free {
+                return Some(DirentLoc { lba: free_lba, off: free_off, exists: false, is_dir: false, start_cluster: 0, size: 0 });
+            }
+            return None; // directory full, no end marker, no free slot
+        }
+        cur = next;
+    }
+}
+
+/// Patch a directory entry's first-cluster (hi@20/lo@26) and size@28
+/// fields in place. Read-modify-write of the entry's sector.
+unsafe fn fs_patch_dirent(s: &mut Fat32State, lba: u32, off: u16, first_cluster: u32, size: u32) -> i32 {
+    let rc = fs_read_blockbuf(s, lba);
+    if rc != 0 { return rc; }
+    let e = off as usize;
+    s.block_buf[e + 20] = (first_cluster >> 16) as u8;
+    s.block_buf[e + 21] = (first_cluster >> 24) as u8;
+    s.block_buf[e + 26] = first_cluster as u8;
+    s.block_buf[e + 27] = (first_cluster >> 8) as u8;
+    let sz = size.to_le_bytes();
+    s.block_buf[e + 28] = sz[0];
+    s.block_buf[e + 29] = sz[1];
+    s.block_buf[e + 30] = sz[2];
+    s.block_buf[e + 31] = sz[3];
+    fs_sync_write_sector(s, lba, s.block_buf.as_ptr())
+}
+
+/// Persist a writable FD's directory entry (first cluster + size) and
+/// clear its dirty flag.
+unsafe fn fs_writeback_dir_entry(s: &mut Fat32State, slot: usize) -> i32 {
+    let (lba, off, fc, sz) = {
+        let of = &s.open_files[slot];
+        (of.dir_lba, of.dir_off, of.start_cluster, of.size)
+    };
+    let rc = fs_patch_dirent(s, lba, off, fc, sz);
+    if rc == 0 { s.open_files[slot].dirty = 0; }
+    rc
+}
+
+/// Resolve `path` into (parent directory cluster, final 8.3 name).
+/// Intermediate components must be existing directories. Returns `None`
+/// on a missing intermediate dir or a malformed component.
+unsafe fn fs_split_parent(s: &mut Fat32State, path: &[u8]) -> Option<(u32, [u8; 11])> {
+    let mut cur = s.root_cluster;
+    let mut i = 0usize;
+    while i < path.len() && path[i] == b'/' { i += 1; }
+    loop {
+        let start = i;
+        while i < path.len() && path[i] != b'/' { i += 1; }
+        let comp = &path[start..i];
+        if comp.is_empty() { return None; }
+        let mut j = i;
+        while j < path.len() && path[j] == b'/' { j += 1; }
+        let is_final = j >= path.len();
+        let mut want = [b' '; 11];
+        if !fs_path_to_short_name(comp, &mut want) { return None; }
+        if is_final { return Some((cur, want)); }
+        let (sc, _sz, attr) = fs_dir_lookup(s, cur, &want)?;
+        if (attr & ATTR_DIRECTORY) == 0 { return None; }
+        cur = sc;
+        i = j;
+    }
+}
+
+/// FS_OPEN_CREATE: create (or truncate) `path` and return a writable FD
+/// positioned for append at offset 0. The parent directory must already
+/// exist (no mkdir). Append-only — an existing file is truncated to 0.
+unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len == 0 { return E_INVAL; }
+    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    if s.root_cluster < 2 { return E_AGAIN; }
+    let path = core::slice::from_raw_parts(arg, arg_len);
+    let (parent, want) = match fs_split_parent(s, path) {
+        Some(p) => p,
+        None => return -2, // ENOENT
+    };
+    // Resume the free-cluster scan past clusters consumed by earlier mounts
+    // (and the orphaned chains of prior truncates) instead of rescanning the
+    // allocated low region every time. Only when the in-memory hint is still
+    // at its mount default (so we don't clobber progress within this mount).
+    // An explicit `init_free_hint` param wins over the on-disk FSINFO hint —
+    // it is the operator's override for a volume whose FSINFO hint is stale.
+    if s.next_free_hint <= 2 {
+        if s.clean_root > 0 {
+            fs_clean_root(s);
+            // `clear_free_region` blindly zeros the FAT span at
+            // `init_free_hint` — DESTRUCTIVE. Run it ONLY on a fresh-format
+            // mount (the same `clean_root` that just wiped the root). On a
+            // remount (`clean_root` unset) any crash-durable files live in
+            // that very region, and zeroing it would sever their multi-cluster
+            // FAT chains past the first cluster — read-back then reconstructs
+            // only ~1 cluster's worth (FS_STAT still shows the full size).
+            // Gating the clear on `clean_root` preserves those chains; the
+            // allocator simply scans past the existing data from
+            // `next_free_hint`.
+            if s.init_free_hint >= 2 && s.clear_free_region > 0 {
+                fs_clear_fat_region(s, s.init_free_hint, s.clear_free_region);
+            }
+        }
+        if s.init_free_hint >= 2 {
+            s.next_free_hint = s.init_free_hint;
+        } else {
+            let h = fs_read_fsinfo_hint(s);
+            if h >= 2 {
+                s.next_free_hint = h;
+            }
+        }
+    }
+    // Find a free OpenFile slot up front.
+    let mut slot: i32 = -1;
+    let mut k = 0usize;
+    while k < MAX_OPEN_FILES {
+        if s.open_files[k].in_use == 0 { slot = k as i32; break; }
+        k += 1;
+    }
+    if slot < 0 { return -23; } // ENFILE
+    let slot = slot as usize;
+
+    let loc = match fs_scan_dir(s, parent, &want) {
+        Some(l) => l,
+        None => return -28, // ENOSPC (directory full)
+    };
+
+    // Never repurpose a directory entry as a regular file: truncating it would
+    // orphan the directory's contents and leave a writable handle on an entry
+    // still flagged ATTR_DIRECTORY.
+    if loc.exists && loc.is_dir { return -21; } // EISDIR
+
+    if loc.exists {
+        // Truncate: zero the entry's cluster + size. The old cluster chain
+        // is deliberately ORPHANED, not freed: synchronously walking the FAT
+        // to free an N-cluster chain is O(N) device round-trips inside a
+        // single `provider_call`, which can blow the cooperative step-guard
+        // deadline, and a chain left inconsistent by an earlier interrupted
+        // free can walk far past the file's real length. Leaking the clusters
+        // keeps create O(1); the lost space is reclaimed by a reformat. An
+        // append-only workload creates fresh paths (the `else` branch), so it
+        // never frees here.
+        if fs_patch_dirent(s, loc.lba, loc.off, 0, 0) != 0 { return -5; } // EIO
+    } else {
+        // Write a fresh 8.3 entry (ATTR_ARCHIVE, cluster 0, size 0).
+        if fs_read_blockbuf(s, loc.lba) != 0 { return -5; }
+        let e = loc.off as usize;
+        let mut i = 0usize;
+        while i < DIR_ENTRY_SIZE { s.block_buf[e + i] = 0; i += 1; }
+        let mut n = 0usize;
+        while n < 11 { s.block_buf[e + n] = want[n]; n += 1; }
+        s.block_buf[e + 11] = 0x20; // ATTR_ARCHIVE
+        if fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr()) != 0 { return -5; }
+    }
+
+    let of = &mut s.open_files[slot];
+    *of = OpenFile::empty();
+    of.in_use = 1;
+    of.writable = 1;
+    of.dirty = 0;
+    of.start_cluster = 0;
+    of.current_cluster = 0;
+    of.size = 0;
+    of.offset = 0;
+    of.dir_lba = loc.lba;
+    of.dir_off = loc.off;
+    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot as i32)
+}
+
+/// FS_WRITE: append `arg_len` bytes to a writable FD, allocating and
+/// linking clusters as the file grows. Sector-at-a-time
+/// read-modify-write. The directory-entry size is updated lazily at
+/// FS_FSYNC / FS_CLOSE. Returns bytes written.
+unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() { return E_INVAL; }
+    if arg_len == 0 { return 0; }
+    let slot = handle as usize;
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
+    if s.open_files[slot].writable == 0 { return E_INVAL; }
+    let bps = s.bytes_per_sector as u32;
+    let spc = s.sectors_per_cluster as u32;
+    if bps == 0 || spc == 0 { return E_AGAIN; }
+    let cpb = bps * spc; // bytes per cluster
+
+    let total = arg_len;
+    let mut done = 0usize;
+    while done < total {
+        let size = s.open_files[slot].size;
+        // At a cluster boundary, ensure a cluster exists for byte `size`.
+        if size % cpb == 0 {
+            let start = s.open_files[slot].start_cluster;
+            if start == 0 {
+                let nc = fs_alloc_cluster(s, 0);
+                if nc < 2 { return -28; } // ENOSPC
+                s.open_files[slot].start_cluster = nc;
+                s.open_files[slot].current_cluster = nc;
+            } else {
+                let cur = s.open_files[slot].current_cluster;
+                let nc = fs_alloc_cluster(s, cur);
+                if nc < 2 { return -28; }
+                s.open_files[slot].current_cluster = nc;
+            }
+        }
+        let cur = s.open_files[slot].current_cluster;
+        let sec_in_clu = (size / bps) % spc;
+        let sector = cluster_to_sector(s, cur) + sec_in_clu;
+        let off_in_sec = (size % bps) as usize;
+        let n = core::cmp::min(bps as usize - off_in_sec, total - done);
+        // Read-modify-write only when starting mid-sector (preserve the
+        // existing prefix). A fresh sector written from offset 0 needs no
+        // read — bytes past `size` are never read (size-capped). And when
+        // `scratch_block` already mirrors this sector (the previous write
+        // landed here — the common append case: a length prefix then the
+        // payload share a sector), the read is skipped too: the cache is the
+        // prefix. This avoids a read-after-write of a freshly-allocated
+        // cluster, whose cold first-touch read could blow the step guard. The
+        // read survives only for a genuine mid-sector write to a sector
+        // neither fresh nor cached (e.g. reopened-file append).
+        if off_in_sec != 0 && s.open_files[slot].scratch_lba != sector {
+            let p = s.open_files[slot].scratch_block.as_mut_ptr();
+            if fs_sync_read_sector(s, sector, p) != 0 { return -5; }
+        }
+        core::ptr::copy_nonoverlapping(
+            arg.add(done),
+            s.open_files[slot].scratch_block.as_mut_ptr().add(off_in_sec),
+            n,
+        );
+        let wp = s.open_files[slot].scratch_block.as_ptr();
+        if fs_sync_write_sector(s, sector, wp) != 0 { return -5; }
+        // `scratch_block` now mirrors `sector` on the device — cache it so a
+        // follow-up write to the same sector skips the RMW read.
+        s.open_files[slot].scratch_lba = sector;
+        let new_size = size + n as u32;
+        s.open_files[slot].size = new_size;
+        s.open_files[slot].offset = new_size;
+        s.open_files[slot].dirty = 1;
+        // Fresh bytes are only in the controller's volatile cache until the
+        // next FS_FSYNC — drop the durable fence.
+        s.open_files[slot].durable = 0;
+        done += n;
+    }
+    done as i32
+}
+
+/// FS_FSYNC: write back the directory entry (if dirty) then flush the
+/// device write cache so the data + metadata are durable. A no-op on a
+/// read-only FD.
+unsafe fn fs_op_fsync(s: &mut Fat32State, handle: i32) -> i32 {
+    let slot = handle as usize;
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
+    if s.open_files[slot].writable == 0 { return 0; }
+    if s.open_files[slot].dirty != 0 {
+        let rc = fs_writeback_dir_entry(s, slot);
+        if rc != 0 { return rc; }
+    }
+    let rc = fs_sync_flush(s);
+    if rc == 0 {
+        // Data + dir entry are now committed past the device's volatile
+        // cache (NVMe Flush). Promote the handle's fence to LocalDurable.
+        s.open_files[slot].durable = 1;
+    }
+    rc
+}
+
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_dispatch")]
+#[cfg_attr(not(feature = "host-test"), export_name = "module_provider_dispatch")]
 pub unsafe extern "C" fn fat32_fs_dispatch(
     state: *mut u8,
     handle: i32,
@@ -1639,11 +2396,15 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
 ) -> i32 {
     if state.is_null() { return E_INVAL; }
     let s = &mut *(state as *mut Fat32State);
-    // `contracts::fence::QUERY_OP` — fence introspection. fat32 is
-    // read-only and has no fsync or replication path, so every op
-    // is `Fence::Volatile`. The handle is validated like every
-    // other op: `EINVAL` for malformed buffer, `ENOSYS` for handles
-    // this provider does not own (closed, stale, or out-of-range).
+    // `contracts::fence::QUERY_OP` — fence introspection. A handle reports
+    // `LocalDurable` ONLY after a writable handle's bytes have been committed
+    // past the device's volatile cache by a successful FS_FSYNC (`durable`
+    // flag, advertised via FS_CAP_FSYNC). Everything else — a writable handle
+    // with unflushed writes, AND any read-only handle — is `Volatile`, per the
+    // fence contract ("plain reads ... land [in Volatile]") and
+    // `contracts/storage/fs.rs` (OPEN/READ report Volatile). The handle is
+    // validated like every other op: `EINVAL` for a malformed buffer,
+    // `ENOSYS` for handles this provider does not own.
     if opcode == abi::contracts::fence::QUERY_OP {
         if arg.is_null() || arg_len < abi::contracts::fence::WIRE_MAX_LEN {
             return E_INVAL;
@@ -1652,8 +2413,17 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         if slot_idx >= MAX_OPEN_FILES || s.open_files[slot_idx].in_use == 0 {
             return E_NOSYS;
         }
+        let of = &s.open_files[slot_idx];
+        let fence = if of.writable != 0 && of.durable != 0 {
+            abi::contracts::fence::Fence::LocalDurable {
+                device_id: FAT32_FS_DEVICE_ID,
+            }
+        } else {
+            // Read-only handle, or writable bytes not yet through FS_FSYNC.
+            abi::contracts::fence::Fence::Volatile
+        };
         let buf = core::slice::from_raw_parts_mut(arg, arg_len);
-        return match abi::contracts::fence::Fence::Volatile.encode(buf) {
+        return match fence.encode(buf) {
             Some(n) => n as i32,
             None => E_INVAL,
         };
@@ -1667,7 +2437,8 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         if arg.is_null() || arg_len < 4 {
             return E_INVAL;
         }
-        let caps: u32 = FS_CAP_OPEN | FS_CAP_OPENDIR;
+        let caps: u32 = FS_CAP_OPEN | FS_CAP_OPENDIR
+            | FS_CAP_OPEN_CREATE | FS_CAP_WRITE | FS_CAP_FSYNC;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -1680,16 +2451,18 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         FS_STAT        => fs_op_stat(s, handle, arg, arg_len),
         FS_OPENDIR     => fs_op_opendir(s, arg as *const u8, arg_len),
         FS_READDIR     => fs_op_readdir(s, handle, arg, arg_len),
-        // FAT32 write support is not in v1 — see the comment on
-        // FS_OPEN_CREATE above. ENOSYS lets callers detect the
-        // gap (vs a silent fall-through misread as "wrong path").
-        FS_OPEN_CREATE => -38, // ENOSYS
+        // Append-only synchronous write contract. The write machinery is
+        // driven through the producer's synchronous block ioctls — see the
+        // FS_CONTRACT write-path section above.
+        FS_OPEN_CREATE => fs_op_create(s, arg as *const u8, arg_len),
+        FS_WRITE       => fs_op_write(s, handle, arg as *const u8, arg_len),
+        FS_FSYNC       => fs_op_fsync(s, handle),
         _ => -38, // ENOSYS
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_provides_contract"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provides_contract")]
 pub extern "C" fn module_provides_contract() -> u32 {
     0x0009 // FS
 }
@@ -1698,18 +2471,18 @@ pub extern "C" fn module_provides_contract() -> u32 {
 // Exported PIC Module Interface
 // ============================================================================
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<Fat32State>() as u32
 }
 
-#[no_mangle]
-#[link_section = ".text.module_init"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_init")]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
-#[link_section = ".text.module_new"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_new")]
 pub extern "C" fn module_new(
     in_chan: i32,
     _out_chan: i32,
@@ -1752,8 +2525,8 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_step"]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_step")]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         if state.is_null() {
@@ -2364,10 +3137,10 @@ unsafe fn ws_alloc_wait(s: &mut Fat32State) -> i32 {
     if found == 0 {
         // No free entry in this sector — advance probe past it.
         s.w_alloc_probe = end_clst;
-        // Guard against runaway scan on tiny / bogus filesystems:
-        // FAT32 caps cluster count at ~2^28. Stop after we've walked
-        // the full FAT.
-        let max_clst = entries_per_sector.saturating_mul(s.fat_size_32);
+        // Stop at the real data-cluster ceiling (not raw FAT capacity) so the
+        // async allocator never hands out a slack entry past the data area,
+        // and so "disk full" is declared at the right point.
+        let max_clst = cluster_count_ceiling(s);
         if s.w_alloc_probe >= max_clst {
             log_info(s, b"[fat32] write: disk full");
             s.write_state = WS_DONE;
@@ -3181,3 +3954,68 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 // `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
 include!("../../sdk/wasm_entry.rs");
+
+// ============================================================================
+// Host-test surface (feature = "host-test")
+// ============================================================================
+
+/// FS_CONTRACT opcodes, re-exported so the host-test harness can drive
+/// `fat32_fs_dispatch` without re-declaring the magic numbers.
+#[cfg(feature = "host-test")]
+pub mod test_ops {
+    pub const FS_OPEN: u32 = super::FS_OPEN;
+    pub const FS_READ: u32 = super::FS_READ;
+    pub const FS_CLOSE: u32 = super::FS_CLOSE;
+    pub const FS_FSYNC: u32 = super::FS_FSYNC;
+    pub const FS_WRITE: u32 = super::FS_WRITE;
+    pub const FS_OPEN_CREATE: u32 = super::FS_OPEN_CREATE;
+    /// FAT end-of-chain marker; the harness writes it into FAT[root] so the
+    /// allocator never hands out the root-directory cluster.
+    pub const FAT32_TAIL: u32 = super::FAT32_TAIL;
+}
+
+/// Host-test only: force an already-`module_new`'d `Fat32State` into a
+/// mounted state with an explicit minimal FAT32 geometry, bypassing the
+/// async init state machine (which needs the NOTIFY+channel block-source
+/// protocol). The harness backs the sync block ioctls (`provider_call`
+/// opcode `0x0506`) with a zeroed RAM disk; the geometry below must match
+/// what the harness sizes that disk for.
+///
+/// Geometry: 512 B sectors, 8 sectors/cluster (4 KiB clusters),
+/// 32 reserved sectors, 2 FATs of `fat_size_32` sectors each, root at
+/// cluster 2, data starting right after FAT2. `next_free_hint = 3` so the
+/// allocator skips the root-dir cluster (the harness marks FAT[2] = EOC).
+///
+/// # Safety
+/// `state` must point at a live `Fat32State` of at least
+/// `module_state_size()` bytes whose `syscalls` is set (i.e. `module_new`
+/// has run).
+#[cfg(feature = "host-test")]
+pub unsafe fn test_force_ready(state: *mut u8, fat_size_32: u32, fsinfo_sector: u16) {
+    let s = &mut *(state as *mut Fat32State);
+    s.bytes_per_sector = 512;
+    s.sectors_per_cluster = 8;
+    s.reserved_sectors = 32;
+    s.num_fats = 2;
+    s.fat_size_32 = fat_size_32;
+    s.root_cluster = 2;
+    s.partition_lba = 0;
+    s.fat_start_sector = 32;
+    s.data_start_sector = 32 + 2 * fat_size_32;
+    s.fsinfo_sector = fsinfo_sector;
+    s.next_free_hint = 2; // mount default; the allocator skips FAT[2]=EOC (root)
+    s.init_phase = Fat32InitPhase::Done;
+}
+
+/// Host-test only: read a writable OpenFile slot's first cluster, so a test
+/// can assert which cluster the allocator handed out (e.g. that the FSINFO
+/// next-free hint was honoured). `slot` is the untagged fd.
+#[cfg(feature = "host-test")]
+pub unsafe fn test_file_start_cluster(state: *mut u8, slot: i32) -> u32 {
+    let s = &*(state as *const Fat32State);
+    let idx = slot as usize;
+    if idx >= MAX_OPEN_FILES {
+        return 0;
+    }
+    s.open_files[idx].start_cluster
+}

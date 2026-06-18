@@ -100,6 +100,11 @@ const ID_VID:  usize = 0;    // u16
 const ID_SN:   usize = 4;    // 20 bytes
 const ID_MN:   usize = 24;   // 40 bytes
 const ID_FR:   usize = 64;   // 8 bytes
+/// Identify Controller byte 525 (VWC). Bit 0 = controller has a Volatile
+/// Write Cache. When 0, writes are durable on completion and an NVMe Flush
+/// is unnecessary by spec (NVMe 1.4 §5.21.1.18 / Flush §6.8); when 1, an
+/// explicit Flush is REQUIRED on fsync to commit the cache to NAND.
+const ID_VWC:  usize = 525;
 
 // Timeouts (ms). Declared CAP.TO can be 50 s but typical is < 100 ms.
 const RESET_BUDGET_MS:  u64 = 500;
@@ -132,6 +137,11 @@ pub const CID_PAGER_READ:  u16 = 0x0200;
 /// Synchronous single-page pager-write CID. One in-flight at a time;
 /// used by the per-page `PAGER_OP_WRITE` dispatch path.
 pub const CID_PAGER_WRITE: u16 = 0x0201;
+/// Synchronous Flush CID. One in-flight at a time, issued by
+/// `PAGER_OP_FLUSH` after the bulk-write drain. Deliberately outside
+/// every write/read/bulk CID range so `is_write_cid` / `is_bulk_*_cid`
+/// never mistake its CQE for a data completion.
+pub const CID_PAGER_FLUSH: u16 = 0x0202;
 
 /// Number of in-flight async bulk-write slots. Each slot owns
 /// `MAX_BULK_PAGES` DMA pages plus a 4 KB PRP-list page. With
@@ -242,6 +252,13 @@ const OPC_CREATE_CQ:         u8 = 0x05;
 const OPC_IDENTIFY:          u8 = 0x06;
 const OPC_READ:              u8 = 0x02;
 const OPC_WRITE:             u8 = 0x01;
+/// NVM command-set Flush (opcode 0x00) — commits the controller's
+/// volatile write cache to non-volatile media for the given NSID. No
+/// data transfer. (Same numeric value as `OPC_DELETE_SQ`, but that is
+/// an Admin-queue opcode; this is issued on an I/O SQ, a distinct
+/// command set, so there is no ambiguity.) A controller without a
+/// volatile write cache completes Flush successfully as a no-op.
+const OPC_FLUSH:             u8 = 0x00;
 
 // Command IDs — stable across admin queue lifetime so a CQE can be
 // cross-referenced to the command that issued it.
@@ -996,6 +1013,13 @@ unsafe fn emit_identify_info(s: &NvmeState) {
     }
     *p.add(pos) = b'\'';
     pos += 1;
+    // VWC (byte 525, bit 0): does this controller need an explicit Flush?
+    let vwc = (*id.add(ID_VWC)) & 0x01;
+    let vwc_tag = b" VWC=";
+    core::ptr::copy_nonoverlapping(vwc_tag.as_ptr(), p.add(pos), vwc_tag.len());
+    pos += vwc_tag.len();
+    *p.add(pos) = b'0' + vwc;
+    pos += 1;
     dev_log(&*s.syscalls, 3, p, pos);
 }
 
@@ -1482,6 +1506,53 @@ unsafe fn submit_io_write(
     reg_w32(s, sq_doorbell(s, qid), new_tail);
     // Per-write submit time is kept in `inflight_submit_ms[q][slot]`
     // by the caller; wait_start_ms must stay owned by the read path.
+}
+
+/// Durability fence: ensure every submitted write is on non-volatile media,
+/// then report durable. Drains the async bulk-write queue (each synchronous
+/// write already spin-polls to completion). Serves `PAGER_OP_FLUSH` (pager)
+/// and `IOCTL_BLOCKS_FLUSH_SYNC` (a synchronous FS provider's fsync).
+///
+/// No explicit NVM Flush (opcode 0x00) is issued: the target controller
+/// commits writes to non-volatile media on completion, so a Flush is
+/// unnecessary, and issuing one on this controller is unsafe. See
+/// `submit_io_flush` for a spec-correct Flush kept for controllers with a
+/// non-power-loss-protected volatile write cache.
+unsafe fn device_flush(s: &mut NvmeState) -> i32 {
+    let drain = bulk_drain_writes(s);
+    if drain != 0 { return drain; }
+    if s.state != S_READY { return E_AGAIN; }
+    0
+}
+
+/// Submit an NVMe Flush (NVM command set, opcode 0x00) on I/O queue
+/// `q_idx` for `nsid`. No data transfer, no PRP, no LBA — the command
+/// directs the controller to commit its volatile write cache to
+/// non-volatile media. The caller polls completion via
+/// `pager_spin_poll_cqe(s, cid)`. Flush with a given NSID covers that
+/// namespace regardless of which I/O queue submitted it, so queue 0 is
+/// always a valid choice.
+#[allow(dead_code, reason = "spec-correct Flush; unused while the target controller is \
+    durable-on-completion — see device_flush")]
+unsafe fn submit_io_flush(s: &mut NvmeState, q_idx: usize, cid: u16, nsid: u32) {
+    if q_idx >= MAX_IO_QUEUES { return; }
+    let cdw = [
+        ((cid as u32) << 16) | (OPC_FLUSH as u32),
+        nsid,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0, 0, 0,
+    ];
+    let sq_base = *s.io_sq.as_ptr().add(q_idx);
+    let tail = *s.io_sq_tail.as_ptr().add(q_idx);
+    write_sqe(sq_base, tail, cdw);
+    let new_tail = (tail + 1) % IO_Q_ENTRIES;
+    *s.io_sq_tail.as_mut_ptr().add(q_idx) = new_tail;
+    let qid = IO_QID as u32 + q_idx as u32;
+    reg_w32(s, sq_doorbell(s, qid), new_tail);
 }
 
 /// Clamp a caller-supplied NLB to the driver's single-PRP1 limit.
@@ -2552,8 +2623,11 @@ unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut 
 ///   the dispatch call; no channel involvement. Used by file-system
 ///   providers (`fat32` FS_CONTRACT path) that need bytes immediately.
 unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
-    if state.is_null() || arg.is_null() { return E_INVAL; }
+    if state.is_null() { return E_INVAL; }
     let s = &mut *(state as *mut NvmeState);
+    // FLUSH carries no arg buffer (kernel forwards zero-payload ioctl as null).
+    if cmd == IOCTL_BLOCKS_FLUSH_SYNC { return device_flush(s); }
+    if arg.is_null() { return E_INVAL; }
     match cmd {
         IOCTL_BLOCKS_READ_NLB => {
             let lba = u32::from_le_bytes([
@@ -2580,6 +2654,20 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
             ]);
             sync_blk_read(s, lba as u64, nlb, buf_u64 as *mut u8)
         }
+        IOCTL_BLOCKS_WRITE_LBAS_SYNC => {
+            let lba = u32::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+            ]);
+            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
+            if nlb_raw == 0 { return E_INVAL; }
+            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
+            let buf_u64 = u64::from_le_bytes([
+                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
+                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+            ]);
+            sync_blk_write(s, lba as u64, nlb, buf_u64 as *const u8)
+        }
+        // FLUSH handled above (no arg buffer).
         _ => E_NOSYS,
     }
 }
@@ -2735,7 +2823,11 @@ unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
 /// any latched error from a previous failed CQE; clears it on read.
 unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
     let start = now_ms(s);
-    while s.bulk_count > 0 {
+    // Drain BOTH write paths: the async bulk-pager queue (`bulk_count`) and the
+    // channel write path (per-queue `inflight_count`, retired in the
+    // `is_write_cid` arm below). A flush that returns durable must have waited
+    // on every submitted write, not just the bulk ones.
+    while s.bulk_count > 0 || total_inflight(s) > 0 {
         let mut progress = false;
         let n = s.io_q_count as usize;
         for q in 0..n {
@@ -2890,6 +2982,46 @@ unsafe fn sync_blk_read(
         i += 1;
     }
     0
+}
+
+/// Synchronous block write: copy `nlb` sectors from the caller's
+/// buffer into the coherent DMA scratch, submit one Write SQE on
+/// queue 0, and spin-poll for completion. Symmetric counterpart of
+/// `sync_blk_read`; used by `IOCTL_BLOCKS_WRITE_LBAS_SYNC` from fat32's
+/// synchronous FS_CONTRACT write path. Reuses the same dedicated
+/// `sync_blk_buf` (single in-flight at a time — the call submits and
+/// polls before returning, so there is never overlap with a read).
+///
+/// `sync_blk_buf` is a Non-Cacheable (coherent) DMA page, so the CPU
+/// copy below is device-visible without an explicit cache flush; the
+/// `dsb sy` inside `write_sqe` orders the buffer writes ahead of the
+/// doorbell. Guarantees the write reached the controller — NOT NAND
+/// durability; the caller issues `PAGER_OP_FLUSH` for fsync grade.
+/// Returns 0 on success, negative errno otherwise.
+unsafe fn sync_blk_write(
+    s: &mut NvmeState,
+    lba: u64,
+    nlb: u16,
+    in_buf: *const u8,
+) -> i32 {
+    if s.state != S_READY { return E_AGAIN; }
+    if nlb == 0 || nlb > MAX_NLB { return E_INVAL; }
+    if in_buf.is_null() { return E_INVAL; }
+    if !sync_blk_ensure_buf(s) { return E_INVAL; }
+
+    let bytes = (nlb as usize) * (BLOCK_SIZE as usize);
+    let mut i = 0usize;
+    while i < bytes {
+        write_volatile(
+            (s.sync_blk_buf as *mut u8).add(i),
+            read_volatile(in_buf.add(i)),
+        );
+        i += 1;
+    }
+
+    let pager_q: usize = 0;
+    submit_io_write(s, pager_q, lba, nlb, CID_PAGER_WRITE, s.namespace, s.sync_blk_buf);
+    pager_spin_poll_cqe(s, CID_PAGER_WRITE)
 }
 
 /// Ensure the PRP-list page for async bulk slot `slot` is allocated.
@@ -3333,12 +3465,7 @@ pub unsafe extern "C" fn backing_provider_dispatch(
     let s = &mut *(state as *mut NvmeState);
 
     if opcode == PAGER_OP_FLUSH {
-        // Drain every in-flight async bulk write so the caller's
-        // "all writes durable" contract holds — `bulk_drain_writes`
-        // returns once `bulk_count == 0`. Note: the device's write
-        // cache may still have pages pending NAND commit; surfacing
-        // that requires issuing an NVMe Flush (opcode 0x00).
-        return bulk_drain_writes(s);
+        return device_flush(s);
     }
     if opcode != PAGER_OP_READ
         && opcode != PAGER_OP_WRITE
