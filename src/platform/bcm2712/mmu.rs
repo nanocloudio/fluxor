@@ -1721,6 +1721,19 @@ mod bcm2712_impl {
             allowed[0] == chan || allowed[1] == chan || allowed[2] == chan
         }
 
+        /// The calling module's registered EL0 heap mapping `(base, size)`.
+        /// `size` is the page-padded footprint mapped EL0-RW (≥ the
+        /// allocator's usable arena), so a pointer validated against it is
+        /// guaranteed reachable by the module at EL0. `(0, 0)` when the module
+        /// declared no arena.
+        unsafe fn el0_heap_region(module_idx: usize) -> (u64, u64) {
+            if module_idx >= super::MAX_MODULES {
+                return (0, 0);
+            }
+            let r = MODULE_REGION_INFO[module_idx];
+            (r.heap_base, r.heap_size)
+        }
+
         /// EL1 service routine for an isolated module's `SVC #1` channel
         /// syscall. Called from the lower-EL vector with the module's EL0
         /// register values; runs at EL1 under the module's TTBR0 (kernel is
@@ -1729,9 +1742,20 @@ mod bcm2712_impl {
         /// it, then forwards to the channel primitive. The caller `ERET`s
         /// back to EL0 with the returned value in x0.
         ///
-        /// Only `channel_read` / `channel_write` / `channel_poll` are
-        /// exposed (this slice). Unknown ops and out-of-region buffers
-        /// return errno without touching kernel state.
+        /// `channel_read` / `channel_write` / `channel_poll` and the
+        /// per-module heap ops `heap_alloc` / `heap_free` are exposed (this
+        /// slice). Unknown ops, unauthorized handles, and out-of-region
+        /// pointers return errno without touching kernel state.
+        ///
+        /// Returns a **signed 64-bit** value in `x0`: channel errno/byte
+        /// counts keep their `i32` semantics (sign-extended), while
+        /// `heap_alloc` returns a full pointer-sized value (or `0`/null) that
+        /// must not be truncated — hence the `i64` return.
+        ///
+        /// `module_idx` is the explicit identity latched in the EL0 control
+        /// block at entry; the gateway routes EVERY operation through it and
+        /// never consults ambient scheduler state, so a module can only reach
+        /// its own channels and its own heap.
         ///
         /// # Safety
         /// Invoked only from `fluxor_el0_svc1` with a live isolated-module
@@ -1744,52 +1768,134 @@ mod bcm2712_impl {
             ptr: u64,
             len: usize,
             module_idx: u32,
-        ) -> i32 {
+        ) -> i64 {
             use crate::kernel::channel;
-            use crate::kernel::el0_abi::{SYS_CHANNEL_POLL, SYS_CHANNEL_READ, SYS_CHANNEL_WRITE};
+            use crate::kernel::el0_abi::{
+                classify_heap_free, HeapFreeAction, EL0_EFAULT, EL0_EINVAL, EL0_EPERM,
+                SYS_CHANNEL_POLL, SYS_CHANNEL_READ, SYS_CHANNEL_WRITE, SYS_HEAP_ALLOC,
+                SYS_HEAP_FREE,
+            };
             let module_idx = module_idx as usize;
-            const EFAULT: i32 = -14;
-            const EINVAL: i32 = -22;
-            const EPERM: i32 = -1;
-            // Every channel op names a handle; authorize it against the
-            // module's own [in, out, ctrl] before touching channel state, so a
-            // hostile module cannot reach edges it was never granted.
-            if !el0_chan_ok(module_idx, chan) {
-                // Log the first 64 denials then rate-limit, so a denial is
-                // observable without a tight denial loop flooding the log.
-                use core::sync::atomic::{AtomicU32, Ordering as O};
-                static DENY: AtomicU32 = AtomicU32::new(0);
-                let dn = DENY.fetch_add(1, O::Relaxed);
-                if dn < 64 || dn.is_multiple_of(256) {
-                    log::warn!(
-                        "[el0] module {module_idx} channel handle {chan} DENIED (op={op}) — \
-                         not in module's [in,out,ctrl] allowlist; returning EPERM"
-                    );
-                }
-                return EPERM;
-            }
             match op {
-                SYS_CHANNEL_READ => {
-                    if !el0_buf_ok(module_idx, ptr, len) {
-                        return EFAULT;
+                SYS_CHANNEL_READ | SYS_CHANNEL_WRITE | SYS_CHANNEL_POLL => {
+                    // Every channel op names a handle; authorize it against the
+                    // module's own [in, out, ctrl] before touching channel
+                    // state, so a hostile module cannot reach edges it was
+                    // never granted.
+                    if !el0_chan_ok(module_idx, chan) {
+                        // Log the first 64 denials then rate-limit, so a denial
+                        // is observable without a tight loop flooding the log.
+                        use core::sync::atomic::{AtomicU32, Ordering as O};
+                        static DENY: AtomicU32 = AtomicU32::new(0);
+                        let dn = DENY.fetch_add(1, O::Relaxed);
+                        if dn < 64 || dn.is_multiple_of(256) {
+                            log::warn!(
+                                "[el0] module {module_idx} channel handle {chan} DENIED (op={op}) — \
+                                 not in module's [in,out,ctrl] allowlist; returning EPERM"
+                            );
+                        }
+                        return EL0_EPERM;
                     }
-                    // SAFETY: range validated to lie in the module's EL0 RW
-                    // memory (also EL1-RW under the module table); the kernel
-                    // writes up to `len` bytes there.
-                    channel::syscall_channel_read(chan, ptr as *mut u8, len)
-                }
-                SYS_CHANNEL_WRITE => {
-                    if !el0_buf_ok(module_idx, ptr, len) {
-                        return EFAULT;
+                    match op {
+                        SYS_CHANNEL_READ => {
+                            if !el0_buf_ok(module_idx, ptr, len) {
+                                return EL0_EFAULT;
+                            }
+                            // SAFETY: range validated to lie in the module's EL0
+                            // RW memory (also EL1-RW under the module table);
+                            // the kernel writes up to `len` bytes there.
+                            channel::syscall_channel_read(chan, ptr as *mut u8, len) as i64
+                        }
+                        SYS_CHANNEL_WRITE => {
+                            if !el0_buf_ok(module_idx, ptr, len) {
+                                return EL0_EFAULT;
+                            }
+                            // SAFETY: range validated as above; the kernel reads
+                            // up to `len` bytes from it.
+                            channel::syscall_channel_write(chan, ptr as *const u8, len) as i64
+                        }
+                        // Poll takes no buffer — report readable bytes (or 0 for
+                        // an invalid handle, matching channel_readable_bytes).
+                        _ => channel::channel_readable_bytes(chan) as i64,
                     }
-                    // SAFETY: range validated as above; the kernel reads up
-                    // to `len` bytes from it.
-                    channel::syscall_channel_write(chan, ptr as *const u8, len)
                 }
-                // Poll takes no buffer — report readable bytes (or 0 for an
-                // invalid handle, matching channel_readable_bytes).
-                SYS_CHANNEL_POLL => channel::channel_readable_bytes(chan) as i32,
-                _ => EINVAL,
+                // ---- Per-module heap (routed through THIS module's own heap) --
+                //
+                // Size travels in `len` (x3). The kernel allocator is keyed by
+                // the explicit `module_idx`, so the allocation comes from this
+                // module's own `ModuleHeap` — no other module's arena is
+                // reachable. A null return (heap exhausted / no arena) is the
+                // defined failure signal; the module checks for it.
+                SYS_HEAP_ALLOC => {
+                    let size = len;
+                    if size == 0 {
+                        return 0; // alloc(0) is null by contract
+                    }
+                    let p = crate::kernel::heap::heap_alloc(module_idx, size);
+                    if p.is_null() {
+                        return 0;
+                    }
+                    // DEFENSE IN DEPTH: confirm the allocation lies wholly
+                    // within this module's EL0-mapped heap region. By
+                    // construction it does (the allocator arena IS the mapped
+                    // heap), but if a misconfiguration ever returned memory
+                    // outside the EL0 mapping we must NOT hand EL0 a pointer it
+                    // cannot reach (or that aliases foreign memory) — free it
+                    // back and fail closed.
+                    let pa = p as u64;
+                    let (hb, hs) = el0_heap_region(module_idx);
+                    if !crate::kernel::el0_abi::buf_within_regions(pa, size, &[(hb, hs)]) {
+                        crate::kernel::heap::heap_free(module_idx, p);
+                        log::error!(
+                            "[el0] module {module_idx} heap_alloc({size}) returned 0x{pa:x} \
+                             OUTSIDE heap mapping 0x{hb:x}+{hs} — freed + failing closed"
+                        );
+                        return 0;
+                    }
+                    // Observable proof of a serviced heap alloc: first few then
+                    // periodic (rate-limited like the clean-step / deny logs).
+                    use core::sync::atomic::{AtomicU32, Ordering as O};
+                    static ALLOC_OK: AtomicU32 = AtomicU32::new(0);
+                    let an = ALLOC_OK.fetch_add(1, O::Relaxed);
+                    if an < 8 || an.is_multiple_of(1024) {
+                        log::info!(
+                            "[el0] module {module_idx} heap_alloc ok ptr=0x{pa:x} size={size} \
+                             (within heap 0x{hb:x}+{hs})"
+                        );
+                    }
+                    pa as i64
+                }
+                SYS_HEAP_FREE => {
+                    let (hb, hs) = el0_heap_region(module_idx);
+                    match classify_heap_free(ptr, hb, hs) {
+                        HeapFreeAction::Noop => 0, // free(NULL) — defined no-op
+                        HeapFreeAction::Forward => {
+                            // Inside the module's own heap. The allocator does
+                            // the remaining interior/stale/double-free/header
+                            // checks against its block metadata (confined to
+                            // this arena) — logging, never corrupting, on a bad
+                            // pointer.
+                            // SAFETY: `ptr` is non-null and validated to lie in
+                            // this module's heap arena; the allocator only
+                            // touches block metadata within that arena.
+                            crate::kernel::heap::heap_free(module_idx, ptr as *mut u8);
+                            0
+                        }
+                        HeapFreeAction::Reject => {
+                            use core::sync::atomic::{AtomicU32, Ordering as O};
+                            static REJ: AtomicU32 = AtomicU32::new(0);
+                            let rn = REJ.fetch_add(1, O::Relaxed);
+                            if rn < 64 || rn.is_multiple_of(256) {
+                                log::warn!(
+                                    "[el0] module {module_idx} heap_free ptr=0x{ptr:x} REJECTED — \
+                                     outside heap 0x{hb:x}+{hs}; returning EFAULT (no kernel deref)"
+                                );
+                            }
+                            EL0_EFAULT
+                        }
+                    }
+                }
+                _ => EL0_EINVAL,
             }
         }
 
@@ -1989,16 +2095,18 @@ mod bcm2712_impl {
             "mov   x0, x11",
             "mov   w1, w9", // outcome = EL0 x0 (StepOutcome i32)
             "b     fluxor_el0_resume",
-            // SVC #1: channel syscall gateway. Service it at EL1 (still under
-            // the module's TTBR0, where the kernel is mapped EL1-only) and
-            // ERET back to EL0 so the module continues the same step. EL0
+            // SVC #1: channel + heap syscall gateway. Service it at EL1 (still
+            // under the module's TTBR0, where the kernel is mapped EL1-only)
+            // and ERET back to EL0 so the module continues the same step. EL0
             // x0=op (saved in x9), x1=chan, x2=ptr, x3=len are the args;
             // x4=module_idx from the control block. el0_syscall_dispatch
-            // validates the pointer before any dereference and returns the
-            // result in x0; the C ABI preserves x19-x30 and SP_EL1, and
-            // ELR_EL1/SPSR_EL1 still point just past the SVC at EL0. The
-            // module's own `svc #1` asm marks x0-x18+lr clobbered, so leaving
-            // x1-x18 dirty across the syscall is within contract.
+            // validates the pointer/handle before any dereference and returns
+            // an i64 result in x0 — a full pointer-sized value for heap_alloc,
+            // which the scrub below preserves (it clears only x1-x18+lr). The
+            // C ABI preserves x19-x30 and SP_EL1, and ELR_EL1/SPSR_EL1 still
+            // point just past the SVC at EL0. The module's own `svc #1` asm
+            // marks x0-x18+lr clobbered, so leaving x1-x18 dirty across the
+            // syscall is within contract.
             "fluxor_el0_svc1:",
             "ldr   w4, [x11, #156]", // module_idx
             "mov   x0, x9",          // op

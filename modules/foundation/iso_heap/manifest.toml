@@ -1,0 +1,11 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# EL0 isolated heap module — proves the SVC #1 heap-mediation slice
+# (heap_alloc / heap_free) end to end. Runs at EL0 under its own page table
+# when wired with `protection: isolated`, allocating from / freeing to its
+# OWN per-module heap via mediated syscalls, with no access to kernel memory.
+# Exercises a rejected invalid free (a non-heap pointer) to prove the gateway
+# fails closed. REQUIRES `protection: isolated` (run non-isolated, its
+# `svc #1` has no EL1 handler). Diagnostic/demonstration — not loaded by
+# production configs. See docs/architecture/cm5_el0_isolation.md.
