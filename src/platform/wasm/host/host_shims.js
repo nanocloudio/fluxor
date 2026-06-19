@@ -955,6 +955,21 @@
         audioPlayBytesAccepted += len;
         surfaceAudioStats();
       },
+      // How much audio is currently queued ahead of the playback clock,
+      // in microseconds (`audioSchedTime - currentTime`). The kernel sink
+      // reads this to pace itself to the WebAudio clock: it forwards PCM
+      // only until this lead reaches its target, then HOLDS — leaving the
+      // rest in its input channel so back-pressure propagates upstream and
+      // the pipeline is locked to real time instead of free-running at the
+      // browser's frame rate (which overruns the scheduler and overlaps
+      // blocks → garbled, uneven-tempo playback). Returns 0 until the
+      // context is running, so pre-gesture frames still drain (and drop)
+      // exactly as before.
+      host_audio_lead_us: () => {
+        if (!audioCtx || audioCtx.state !== 'running') return 0n;
+        const lead = audioSchedTime - audioCtx.currentTime;
+        return BigInt(lead > 0 ? Math.round(lead * 1_000_000) : 0);
+      },
     };
 
     // ── Canvas sink (wasm_browser_canvas) ────────────────────────────
