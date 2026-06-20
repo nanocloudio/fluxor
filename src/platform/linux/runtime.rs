@@ -136,6 +136,11 @@ fn linux_init_providers() {
     // `src/platform/wasm/object.rs`; shared windowing in
     // `abi::contracts::storage::object::range`.
     provider::register(dev_class::STORAGE_OBJECT, linux_object_dispatch);
+    // storage.namespace over the real filesystem (std::fs read_dir/metadata)
+    // — the directory-enumeration sibling of the FS provider; wasm peer in
+    // `src/platform/wasm/namespace.rs`. Lets a scanner walk a host library on
+    // Linux exactly as it walks the manifest-backed index in the browser.
+    provider::register(dev_class::STORAGE_NAMESPACE, linux_namespace_dispatch);
 }
 /// Platform-specific per-module cleanup for Linux host.
 ///

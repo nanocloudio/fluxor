@@ -61,8 +61,10 @@ mod profile_host {
         /// module's `module_state` and `module_arena`. Sized to
         /// hold a busy graph: 64 modules × ~100 KiB state plus
         /// peak heap usage from the http module at full
-        /// `ARENA_WORKING_SET_CONNS` activity.
-        pub const STATE_ARENA_SIZE: usize = 32 * 1024 * 1024;
+        /// `ARENA_WORKING_SET_CONNS` activity. Raised to 64 MiB so the
+        /// N64 host configs fit `n64_core`'s ~39 MiB working set (the
+        /// wasm profile already provisions 96 MiB for the same core).
+        pub const STATE_ARENA_SIZE: usize = 64 * 1024 * 1024;
         /// Per-channel buffer pool. 8 MiB lets graphs size
         /// individual channels at 16-64 KiB without exhausting
         /// the arena under sustained gigabit-class loads.

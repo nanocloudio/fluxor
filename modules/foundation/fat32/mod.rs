@@ -457,6 +457,16 @@ struct OpenFile {
     /// append pattern where a length prefix and the payload share a sector,
     /// forcing an RMW of the sector just written.
     scratch_lba: u32,
+    /// 1 when `scratch_block` holds appended data NOT yet written to the
+    /// device at `scratch_lba`. Sequential small appends accumulate in
+    /// `scratch_block` and the sector is written once — on a sector change
+    /// (the old sector is complete), at FS_FSYNC, or at FS_CLOSE. This
+    /// collapses the per-append synchronous sector rewrite (a ~88-byte WAL
+    /// entry would otherwise re-write its 512-byte sector ~6×) into one write
+    /// per filled sector. Safe for the durability contract: un-fsynced bytes
+    /// are not durable, so deferring their device write loses nothing a crash
+    /// wouldn't already lose — FS_FSYNC flushes the pending sector first.
+    scratch_dirty: u8,
 }
 
 impl OpenFile {
@@ -480,6 +490,7 @@ impl OpenFile {
             dir_off: 0,
             _pad_of: 0,
             scratch_lba: 0,
+            scratch_dirty: 0,
         }
     }
 }
@@ -1404,6 +1415,12 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
     let slot_idx = handle as usize;
     if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
     if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    // A read reuses `scratch_block` as the read cache; if it still holds
+    // un-flushed appends (deferred writes), persist them first so the device
+    // is consistent and the data isn't clobbered. No-op for read-only FDs and
+    // for append writers (whose read offset sits at EOF, so no fetch occurs).
+    let sr = fs_flush_scratch(s, slot_idx);
+    if sr != 0 { return sr; }
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
     if bps == 0 || spc == 0 { return E_AGAIN; }
@@ -1476,6 +1493,20 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
     let raw = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
     if raw < 0 { return E_INVAL; }
     let target = raw as u32;
+    // Deferred-write coherence (the append writer's `scratch_block` may hold
+    // un-flushed bytes): a seek to the CURRENT offset is a positional no-op —
+    // the common WAL "FS_SEEK to s.cursor before every append" pattern — so
+    // keep the pending sector intact and let coalescing survive. A REAL
+    // reposition must flush the pending sector first, because the walk below
+    // can re-fetch/reset `scratch_block` (a mid-sector seek reads the target
+    // sector into it). On a rewind-over-a-failed-write the flush is harmless:
+    // the WAL re-writes from the cursor and the final FS_FSYNC makes the
+    // corrected bytes durable.
+    if target == s.open_files[slot_idx].offset {
+        return target as i32;
+    }
+    let sr = fs_flush_scratch(s, slot_idx);
+    if sr != 0 { return sr; }
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
     if bps == 0 || spc == 0 { return E_AGAIN; }
@@ -1540,12 +1571,17 @@ unsafe fn fs_op_close(s: &mut Fat32State, handle: i32) -> i32 {
     // close without an explicit fsync must not lose the file.
     let mut rc = 0i32;
     if s.open_files[slot_idx].writable != 0 {
+        // Persist any deferred data sector before releasing the slot — a close
+        // without an explicit fsync must not lose the tail of appends.
+        let sr = fs_flush_scratch(s, slot_idx);
         if s.open_files[slot_idx].dirty != 0 {
             let wb = fs_writeback_dir_entry(s, slot_idx);
             let fl = fs_sync_flush(s);
             // Surface a genuine durability failure (FS_FSYNC returns success,
             // so a non-zero here is real); the slot is released either way.
-            rc = if wb != 0 { wb } else { fl };
+            rc = if sr != 0 { sr } else if wb != 0 { wb } else { fl };
+        } else if sr != 0 {
+            rc = sr;
         }
         // Persist the free-cluster hint once, on close (not per fsync), so a
         // later mount resumes the scan past what this handle allocated. Done
@@ -2329,6 +2365,15 @@ unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: 
         let sector = cluster_to_sector(s, cur) + sec_in_clu;
         let off_in_sec = (size % bps) as usize;
         let n = core::cmp::min(bps as usize - off_in_sec, total - done);
+        // Moving to a different sector: the previously-cached sector is now
+        // complete (this write starts a new one). If it carried un-flushed
+        // appends, write it out once, now, before `scratch_block` is reused.
+        if s.open_files[slot].scratch_lba != sector && s.open_files[slot].scratch_dirty != 0 {
+            let prev = s.open_files[slot].scratch_lba;
+            let wp = s.open_files[slot].scratch_block.as_ptr();
+            if fs_sync_write_sector(s, prev, wp) != 0 { return -5; }
+            s.open_files[slot].scratch_dirty = 0;
+        }
         // Read-modify-write only when starting mid-sector (preserve the
         // existing prefix). A fresh sector written from offset 0 needs no
         // read — bytes past `size` are never read (size-capped). And when
@@ -2348,11 +2393,12 @@ unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: 
             s.open_files[slot].scratch_block.as_mut_ptr().add(off_in_sec),
             n,
         );
-        let wp = s.open_files[slot].scratch_block.as_ptr();
-        if fs_sync_write_sector(s, sector, wp) != 0 { return -5; }
-        // `scratch_block` now mirrors `sector` on the device — cache it so a
-        // follow-up write to the same sector skips the RMW read.
+        // DEFER the device write: `scratch_block` now mirrors `sector` with the
+        // appended bytes, but we do NOT write it to the device yet. It is
+        // flushed on the next sector change (above), at FS_FSYNC, or at
+        // FS_CLOSE — collapsing repeated same-sector appends into one write.
         s.open_files[slot].scratch_lba = sector;
+        s.open_files[slot].scratch_dirty = 1;
         let new_size = size + n as u32;
         s.open_files[slot].size = new_size;
         s.open_files[slot].offset = new_size;
@@ -2365,6 +2411,24 @@ unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: 
     done as i32
 }
 
+/// Write the pending (deferred) data sector to the device if `scratch_block`
+/// carries un-flushed appends. The companion to the write-deferral in
+/// `fs_op_write`: called at FS_FSYNC / FS_CLOSE / before a read fetch so the
+/// device reflects every byte the caller wrote before durability or read-back
+/// is observed. Returns the device write rc (0 on success / nothing to do).
+unsafe fn fs_flush_scratch(s: &mut Fat32State, slot: usize) -> i32 {
+    if s.open_files[slot].scratch_dirty == 0 {
+        return 0;
+    }
+    let lba = s.open_files[slot].scratch_lba;
+    let wp = s.open_files[slot].scratch_block.as_ptr();
+    let rc = fs_sync_write_sector(s, lba, wp);
+    if rc == 0 {
+        s.open_files[slot].scratch_dirty = 0;
+    }
+    rc
+}
+
 /// FS_FSYNC: write back the directory entry (if dirty) then flush the
 /// device write cache so the data + metadata are durable. A no-op on a
 /// read-only FD.
@@ -2372,6 +2436,11 @@ unsafe fn fs_op_fsync(s: &mut Fat32State, handle: i32) -> i32 {
     let slot = handle as usize;
     if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
     if s.open_files[slot].writable == 0 { return 0; }
+    // Flush any pending deferred data sector BEFORE the dir-entry writeback and
+    // the device cache flush — otherwise the last partial sector of appends
+    // would never reach the platter and a reopen-read would lose it.
+    let sr = fs_flush_scratch(s, slot);
+    if sr != 0 { return sr; }
     if s.open_files[slot].dirty != 0 {
         let rc = fs_writeback_dir_entry(s, slot);
         if rc != 0 { return rc; }
@@ -3968,6 +4037,7 @@ pub mod test_ops {
     pub const FS_CLOSE: u32 = super::FS_CLOSE;
     pub const FS_FSYNC: u32 = super::FS_FSYNC;
     pub const FS_WRITE: u32 = super::FS_WRITE;
+    pub const FS_SEEK: u32 = super::FS_SEEK;
     pub const FS_OPEN_CREATE: u32 = super::FS_OPEN_CREATE;
     /// FAT end-of-chain marker; the harness writes it into FAT[root] so the
     /// allocator never hands out the root-directory cluster.

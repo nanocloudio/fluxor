@@ -115,6 +115,7 @@ fn parse_args() -> CliArgs {
 
 include!("linux/providers.rs");
 include!("linux/object.rs");
+include!("linux/namespace.rs");
 include!("linux/builtin_params.rs");
 include!("linux/host_asset_source.rs");
 include!("linux/host_asset_index.rs");
