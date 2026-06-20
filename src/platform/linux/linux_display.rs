@@ -19,6 +19,15 @@ mod window_backend {
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
     use winit::window::{Window, WindowAttributes, WindowId};
 
+    /// Publish the current logical content geometry into the Surface Traits
+    /// authority's shared slot (`super::SURFACE_WINDOW_GEOM`, packed
+    /// `(w << 16) | h`). Dimensions are clamped to u16. See
+    /// `.context/rfc_surface_traits.md`.
+    fn publish_surface_geom(w: u32, h: u32) {
+        let packed = ((w.min(0xFFFF)) << 16) | h.min(0xFFFF);
+        super::SURFACE_WINDOW_GEOM.store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Window backend: a dedicated thread owns the winit event loop;
     /// the linux_display step thread submits RGB565 frames into a
     /// shared latest-frame slot. Drop semantics: backend keeps
@@ -121,6 +130,11 @@ mod window_backend {
             self.window = Some(window);
             self.context = Some(context);
             self.surface = Some(surface);
+            // Publish the initial logical content geometry to the Surface
+            // Traits authority (rfc_surface_traits.md). `width`/`height` are the
+            // unscaled content size — the viewport an adaptive consumer reasons
+            // about.
+            publish_surface_geom(self.width, self.height);
         }
 
         fn window_event(
@@ -132,6 +146,13 @@ mod window_backend {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::RedrawRequested => self.redraw(),
+                WindowEvent::Resized(size) => {
+                    // Republish the logical content geometry so the Surface
+                    // Traits authority emits a fresh record (and the consumer
+                    // re-adapts). Physical → logical via the integer scale.
+                    let scale = self.scale.max(1);
+                    publish_surface_geom(size.width / scale, size.height / scale);
+                }
                 _ => {}
             }
         }

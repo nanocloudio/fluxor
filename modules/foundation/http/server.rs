@@ -35,6 +35,17 @@ pub(crate) use super::abi::config::http::{
     SEND_BUF_SIZE,
 };
 
+/// Decode one hex digit (`0-9a-fA-F`) for percent-unescaping request
+/// paths. Returns `None` for non-hex bytes.
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 // ── Retention buffer sizing ───────────────────────────────────────────────
 
 /// Server-wide retention buffer capacity. Sized for one decoded
@@ -4429,8 +4440,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         let mut composed = [0u8; MAX_FS_PATH];
                         let dir_len = route.fs_path_len as usize;
                         let suffix_len = req_path_len - route_path_len;
-                        let total = dir_len + suffix_len;
-                        if dir_len == 0 || total > MAX_FS_PATH {
+                        if dir_len == 0 || dir_len + suffix_len > MAX_FS_PATH {
                             build_error(
                                 s,
                                 b"500 Internal Server Error",
@@ -4443,11 +4453,30 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                         composed[..dir_len].copy_from_slice(&route.fs_path[..dir_len]);
                         let req_path_ptr = req_path_ptr_local;
-                        for k in 0..suffix_len {
-                            // Path-traversal guard: reject `..` segments
-                            // and embedded null bytes outright. Any
-                            // non-printable / control byte also rejected.
-                            let b = *req_path_ptr.add(route_path_len + k);
+                        // Percent-decode the request suffix so spaces and
+                        // other `%XX`-escaped bytes in filenames resolve to
+                        // the real on-disk path (browsers encode them).
+                        // Decoding only shrinks the length, so the bound
+                        // check above stays valid.
+                        let mut out = dir_len;
+                        let mut k = 0usize;
+                        while k < suffix_len {
+                            let mut b = *req_path_ptr.add(route_path_len + k);
+                            if b == b'%' && k + 3 <= suffix_len {
+                                match (
+                                    hex_val(*req_path_ptr.add(route_path_len + k + 1)),
+                                    hex_val(*req_path_ptr.add(route_path_len + k + 2)),
+                                ) {
+                                    (Some(h), Some(l)) => {
+                                        b = (h << 4) | l;
+                                        k += 3;
+                                    }
+                                    _ => k += 1,
+                                }
+                            } else {
+                                k += 1;
+                            }
+                            // Reject embedded null / backslash control bytes.
                             if b == 0 || b == b'\\' {
                                 build_error(s, b"400 Bad Request", b"bad path\n");
                                 if let Some(cur) = cur_slot_mut(s) {
@@ -4455,8 +4484,10 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 }
                                 return 0;
                             }
-                            composed[dir_len + k] = b;
+                            composed[out] = b;
+                            out += 1;
                         }
+                        let total = out;
                         // Reject `..` traversal: scan for `/../`,
                         // trailing `/..`, leading `../`, or bare `..`.
                         // Cheap byte-window check rather than a full

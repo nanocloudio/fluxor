@@ -43,6 +43,9 @@ pub(crate) use fluxor_tools::observability;
 // lib's single copy (dependency-light, no bin-only refs) rather than
 // `mod` it twice.
 pub(crate) use fluxor_tools::presentation_shell;
+// `ci.rs` runs the placement lint as `crate::presentation_resolver`; re-export
+// the lib's copy for the bin (same pattern as observability/presentation_shell).
+pub(crate) use fluxor_tools::presentation_resolver;
 mod project;
 mod project_meta;
 mod publish;
@@ -443,10 +446,11 @@ enum Commands {
     },
 
     /// Full CI gate. Runs in order: fmt-check, clippy, workspace-lint
-    /// opt-in audit, hygiene scan, template render, version-skew
-    /// check, cargo unit tests, modules build (strict), and cargo
-    /// integration tests. Every phase runs even when an earlier one
-    /// fails; the summary lists all failures and exits non-zero.
+    /// opt-in audit, hygiene scan, observability + presentation lints,
+    /// template render, version-skew check, cargo unit tests, modules
+    /// build (strict), and cargo integration tests. Every phase runs even
+    /// when an earlier one fails; the summary lists all failures and exits
+    /// non-zero.
     Ci {
         /// Skip an individual phase for local iteration. Rejected
         /// when `$CI=1` so production CI always runs the full set.
@@ -661,6 +665,16 @@ enum LintAction {
         #[arg(long)]
         strict: bool,
     },
+    /// Presentation placement check (rfc_adaptive_presentation.md §9): runs the
+    /// placement resolver over every config's `presentation.shell` against the
+    /// surface it targets, and fails on any `essential` control that cannot be
+    /// surfaced there (no chrome/content plane and no `bind_physical`). Catches
+    /// "this control is dead on this device" at build time.
+    Presentation {
+        /// Project root override (defaults to the resolved project root).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -822,6 +836,9 @@ fn main() {
                 json,
                 strict,
             } => cmd_lint_observability(project_root.as_deref(), json, strict),
+            LintAction::Presentation { project_root } => {
+                cmd_lint_presentation(project_root.as_deref())
+            }
         },
         Commands::Ci { skip, project_root } => cmd_ci(&skip, project_root.as_deref(), verbose),
         Commands::Modules { action } => match action {
@@ -5326,6 +5343,71 @@ fn cmd_lint_observability(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `fluxor lint presentation` — run the placement resolver over every config's
+/// `presentation.shell` and fail on any unplaceable `essential` control.
+fn cmd_lint_presentation(project_root_override: Option<&Path>) -> Result<()> {
+    let root = resolve_project_root(project_root_override);
+    let mut scanned = 0usize;
+    let mut with_shell = 0usize;
+    let mut violations: Vec<(String, String)> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Generated artefacts under target/ aren't source configs.
+        if path.components().any(|c| c.as_os_str() == "target") {
+            continue;
+        }
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("yaml") | Some("yml") => {}
+            _ => continue,
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Not every .yaml is a Fluxor config; skip anything that doesn't parse.
+        let cfg: serde_json::Value = match serde_yaml::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        scanned += 1;
+        if cfg.pointer("/presentation/shell").is_some() {
+            with_shell += 1;
+        }
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        for msg in fluxor_tools::presentation_resolver::lint_config(&cfg) {
+            violations.push((rel.clone(), msg));
+        }
+    }
+
+    for (file, msg) in &violations {
+        eprintln!("\x1b[1;31mpresentation\x1b[0m {file}: {msg}");
+    }
+    if violations.is_empty() {
+        println!(
+            "\x1b[1;32mpresentation clean\x1b[0m ({scanned} configs scanned, \
+             {with_shell} with a presentation.shell)"
+        );
+        Ok(())
+    } else {
+        eprintln!(
+            "\npresentation: {} unplaceable essential control(s)",
+            violations.len()
+        );
+        std::process::exit(1);
+    }
 }
 
 /// `fluxor modules build` — drive the PIC / wasm module pipeline.

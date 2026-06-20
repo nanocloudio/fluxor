@@ -819,6 +819,86 @@ fn canonical_host_shims_js_body() -> String {
     escape_for_env_substitution(CANONICAL_HOST_SHIMS_JS_RAW)
 }
 
+/// Walk a `list:` directory and build the `fluxor-manifest.json` entries
+/// the wasm `storage.namespace` provider fetches at boot — one
+/// `{ key, size, mtime, etag }` per file. Browsers can't `readdir` an
+/// HTTP origin, so this synth-time directory snapshot is how a runtime
+/// `storage.namespace` LIST enumerates shipped content. `key` is the
+/// object key the `storage.object` provider fetches *as a URL*, so it
+/// must equal the path the file is served at — `<path_prefix>/<relpath>`
+/// with forward slashes and no leading slash, matching the `list:`
+/// `path:` mount. `formats` (if non-empty) restricts to those extensions.
+fn fluxor_manifest_entries(
+    dir: &Path,
+    path_prefix: &str,
+    formats: &[String],
+) -> Vec<serde_json::Value> {
+    let prefix = path_prefix.trim_matches('/');
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.path();
+        if !formats.is_empty() {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !formats
+                .iter()
+                .any(|f| f.trim_start_matches('.').eq_ignore_ascii_case(&ext))
+            {
+                continue;
+            }
+        }
+        let rel = match p.strip_prefix(dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let mut rel_str = String::new();
+        for (i, comp) in rel.components().enumerate() {
+            if i > 0 {
+                rel_str.push('/');
+            }
+            rel_str.push_str(&comp.as_os_str().to_string_lossy());
+        }
+        let key = if prefix.is_empty() {
+            rel_str
+        } else {
+            format!("{prefix}/{rel_str}")
+        };
+        let md = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size = md.len();
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(serde_json::json!({
+            "key": key,
+            "size": size,
+            "mtime": mtime,
+            "etag": format!("{size:x}-{mtime:x}"),
+        }));
+    }
+    out.sort_by(|a, b| {
+        a["key"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["key"].as_str().unwrap_or(""))
+    });
+    out
+}
+
 /// Build the `routes:` array for the synthesised host. Mounts the
 /// canonical wasm runtime assets + bundle + scenario metadata, plus
 /// any user `serve:` host_page override and `list:` binding-injected
@@ -854,6 +934,10 @@ fn synthesise_host_routes(
     let mut runtime_prefix: String = "/".to_string();
     let mut bundle_route_url: String = "/fluxor.wasm".to_string();
     let mut runtime_override_fs_path: Option<PathBuf> = None;
+    // Accumulated `fluxor-manifest.json` entries across all `list:`
+    // bindings — the directory snapshot a runtime `storage.namespace`
+    // LIST enumerates (browsers can't readdir an HTTP origin).
+    let mut manifest_entries: Vec<serde_json::Value> = Vec::new();
 
     for binding in &scenario.bindings {
         match binding {
@@ -936,9 +1020,31 @@ fn synthesise_host_routes(
                     );
                 }
                 routes.push(serde_json::Value::Object(entry));
+                // Snapshot the directory into the manifest so a runtime
+                // `storage.namespace` LIST can enumerate it in-browser.
+                manifest_entries.extend(fluxor_manifest_entries(&dir, &list.path, &list.formats));
             }
             _ => {}
         }
+    }
+
+    // ── /fluxor-manifest.json → directory snapshot for the wasm
+    //    `storage.namespace` provider (fetched once at boot). Only
+    //    emitted when there's at least one `list:` binding.
+    if !manifest_entries.is_empty() {
+        let manifest_url = if runtime_prefix == "/" {
+            "/fluxor-manifest.json".to_string()
+        } else {
+            format!(
+                "{}/fluxor-manifest.json",
+                runtime_prefix.trim_end_matches('/')
+            )
+        };
+        routes.push(serde_json::json!({
+            "path": manifest_url,
+            "body": serde_json::Value::Array(manifest_entries).to_string(),
+            "content_type": "application/json",
+        }));
     }
 
     // ── /host_shims.js → canonical JS shim (always mounted).

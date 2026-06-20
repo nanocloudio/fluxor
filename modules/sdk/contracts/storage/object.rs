@@ -146,6 +146,23 @@ pub const DELETE: u32 = 0x1424;
 /// Close a GET or PUT_STREAMED_OPEN handle.
 pub const CLOSE: u32 = 0x1425;
 
+// ── Embedded-image decode (cover art) ───────────────────────────────
+//
+// Range-fetch an image embedded in a served object (e.g. the `covr`
+// payload inside an `.m4a`) and decode it straight to RGB565 at a target
+// size — host-side on wasm (browser `createImageBitmap` + downscale), so
+// a PIC UI module renders album art without an in-wasm image decoder or
+// multi-MB encoded buffers.
+//
+// `IMG_DECODE` (handle = -1) — `arg` is
+//   `[offset:u64 LE][length:u64 LE][width:u16 LE][height:u16 LE][url…]`
+// returns a non-negative handle. `IMG_RECV(handle)` drains the
+// `width*height*2`-byte RGB565 buffer (EAGAIN while the async decode is
+// pending). `IMG_CLOSE(handle)` releases it.
+pub const IMG_DECODE: u32 = 0x1430;
+pub const IMG_RECV: u32 = 0x1431;
+pub const IMG_CLOSE: u32 = 0x1432;
+
 // ── Large-blob streaming write (event.log composition) ──────────────
 //
 // `PUT_STREAMED_OPEN` produces a stream handle; the caller writes

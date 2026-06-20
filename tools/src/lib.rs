@@ -37,6 +37,8 @@ pub mod observability;
 // `presentation.browser_overlay` descriptors (RFC browser_overlay §19).
 // Dependency-light (serde_json + error) so it dual-compiles cleanly
 // into both the lib (tests) and the bin (called from `config.rs`).
+pub mod content_render;
+pub mod presentation_resolver;
 pub mod presentation_shell;
 pub mod project;
 pub mod project_meta;

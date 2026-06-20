@@ -122,6 +122,9 @@ include!("linux/linux_display.rs");
 include!("linux/linux_audio.rs");
 include!("linux/host_image_codec.rs");
 include!("linux/linux_alsa_midi.rs");
+include!("linux/linux_surface_traits_scan.rs");
+include!("linux/linux_surface_traits.rs");
+include!("linux/linux_surface_traits_probe.rs");
 
 // ============================================================================
 // Entry point
@@ -306,6 +309,20 @@ fn main() {
 
         if entry.name_hash == LINUX_ALSA_MIDI_HASH {
             let m = build_linux_alsa_midi(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_SURFACE_TRAITS_HASH {
+            let m = build_linux_surface_traits(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_SURFACE_TRAITS_PROBE_HASH {
+            let m = build_linux_surface_traits_probe(module_idx);
             scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;

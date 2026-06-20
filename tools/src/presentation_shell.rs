@@ -1,6 +1,6 @@
 //! Build-time validator for the `presentation.shell` /
-//! `presentation.browser_overlay` descriptors (RFC browser_overlay §19
-//! + Amendment A §A.7).
+//! `presentation.browser_overlay` descriptors (RFC browser_overlay §19,
+//! §A.7).
 //!
 //! Kept as a standalone, dependency-light module (only `serde_json`) so
 //! it is unit-testable directly with synthetic configs — no module
@@ -20,7 +20,7 @@
 
 use serde_json::Value;
 
-/// Canonical control kinds (RFC §7.3 + Amendment A: `select`/`checkbox`).
+/// Canonical control kinds (RFC §7.3, §A: `select`/`checkbox`).
 pub const CONTROL_KINDS: &[&str] = &[
     "button",
     "button_cluster",
@@ -61,6 +61,32 @@ pub const MEDIA_PROFILES: &[&str] = &[
 
 /// Activity contexts (RFC §7.5).
 pub const CONTEXTS: &[&str] = &["preview", "launching", "active", "background", "spectator"];
+
+// ── Control-intent metadata (rfc_adaptive_presentation.md §9) ──
+// Optional per-control fields that drive the placement resolver. All are
+// additive: a control omitting them keeps the existing chrome behaviour.
+
+/// `plane_affinity`: ordered preference of render planes. `bound`/`hidden` are
+/// resolver *outcomes*, not requestable affinities — a control reaches `bound`
+/// via `bind_physical`, and `hidden` only under overflow.
+pub const PLANES: &[&str] = &["chrome", "content"];
+
+/// `priority`: governs drop order under overflow. `essential` is never hidden.
+pub const PRIORITIES: &[&str] = &["essential", "standard", "optional"];
+
+/// `min_size_class` / size-class vocabulary (mirrors input::surface_traits).
+pub const SIZE_CLASSES: &[&str] = &["compact", "regular", "expanded"];
+
+/// Input modalities a `suppress_if: modality.<name>` clause may name (mirrors
+/// the input::surface_traits MODALITY_* bits).
+pub const MODALITIES: &[&str] = &[
+    "key",
+    "pointer_fine",
+    "pointer_coarse",
+    "touch",
+    "gamepad",
+    "physical_buttons",
+];
 
 /// Validate `config.presentation.shell` / `.browser_overlay` if present.
 /// `module_names` is the set of declared module instance names, used to
@@ -166,7 +192,96 @@ pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate one shell control (§19.2, §19.4, Amendment A §A.7).
+/// Validate one shell control (§19.2, §19.4, §A.7).
+/// Validate the optional control-intent fields
+/// (`rfc_adaptive_presentation.md` §9): `plane_affinity`, `priority`,
+/// `min_size_class`, `suppress_if`, `bind_physical`, `overlay`,
+/// `overlay_regions`. All are additive — a control omitting them is unchanged.
+fn validate_intent(ctl: &Value, id: &str) -> Result<(), String> {
+    if let Some(v) = ctl.get("plane_affinity") {
+        let arr = v.as_array().ok_or_else(|| {
+            format!("control `{id}`: `plane_affinity` must be an array of planes {PLANES:?}")
+        })?;
+        if arr.is_empty() {
+            return Err(format!(
+                "control `{id}`: `plane_affinity` must not be empty (a control with no \
+                 eligible plane can never render)"
+            ));
+        }
+        for p in arr {
+            let p = p.as_str().ok_or_else(|| {
+                format!("control `{id}`: `plane_affinity` entries must be strings {PLANES:?}")
+            })?;
+            if !PLANES.contains(&p) {
+                return Err(format!(
+                    "control `{id}`: unknown plane `{p}` in `plane_affinity` (expected one of {PLANES:?})"
+                ));
+            }
+        }
+    }
+    if let Some(p) = ctl.get("priority") {
+        let p = p
+            .as_str()
+            .ok_or_else(|| format!("control `{id}`: `priority` must be a string"))?;
+        if !PRIORITIES.contains(&p) {
+            return Err(format!(
+                "control `{id}`: unknown priority `{p}` (expected one of {PRIORITIES:?})"
+            ));
+        }
+    }
+    if let Some(s) = ctl.get("min_size_class") {
+        let s = s
+            .as_str()
+            .ok_or_else(|| format!("control `{id}`: `min_size_class` must be a string"))?;
+        if !SIZE_CLASSES.contains(&s) {
+            return Err(format!(
+                "control `{id}`: unknown min_size_class `{s}` (expected one of {SIZE_CLASSES:?})"
+            ));
+        }
+    }
+    if let Some(s) = ctl.get("suppress_if") {
+        let s = s
+            .as_str()
+            .ok_or_else(|| format!("control `{id}`: `suppress_if` must be a string"))?;
+        let m = s.strip_prefix("modality.").ok_or_else(|| {
+            format!("control `{id}`: `suppress_if` must be `modality.<name>` (got `{s}`)")
+        })?;
+        if !MODALITIES.contains(&m) {
+            return Err(format!(
+                "control `{id}`: unknown modality `{m}` in `suppress_if` (expected one of {MODALITIES:?})"
+            ));
+        }
+    }
+    if let Some(b) = ctl.get("bind_physical") {
+        let b = b
+            .as_str()
+            .ok_or_else(|| format!("control `{id}`: `bind_physical` must be a string"))?;
+        if b.is_empty() {
+            return Err(format!(
+                "control `{id}`: `bind_physical` must be a non-empty physical-control id"
+            ));
+        }
+    }
+    if let Some(o) = ctl.get("overlay") {
+        if !o.is_boolean() {
+            return Err(format!("control `{id}`: `overlay` must be a boolean"));
+        }
+    }
+    if let Some(v) = ctl.get("overlay_regions") {
+        let arr = v
+            .as_array()
+            .ok_or_else(|| format!("control `{id}`: `overlay_regions` must be an array"))?;
+        for r in arr {
+            if !r.is_string() {
+                return Err(format!(
+                    "control `{id}`: `overlay_regions` entries must be strings"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_control(
     ctl: &Value,
     idx: usize,
@@ -201,6 +316,8 @@ fn validate_control(
             ));
         }
     }
+
+    validate_intent(ctl, id)?;
 
     let has_action = ctl.get("action").and_then(|v| v.as_str()).is_some();
     let has_control = ctl.get("control").and_then(|v| v.as_str()).is_some();

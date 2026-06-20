@@ -40,16 +40,20 @@
 //!   - `host_ns_list` — write a `LIST` page (entries + trailing cursor
 //!     record) for a prefix + integer page cursor.
 //!
-//! ## Synchronous answers, async hydration
+//! ## Synchronous answers, boot-ordered hydration
 //!
-//! `LIST`/`STAT` answer *synchronously* from the in-memory index —
-//! `truffle_scanner` treats a negative `LIST` as "end of listing" and
-//! does not retry, so EAGAIN is not an option here. The index is
-//! hydrated asynchronously at boot (OPFS walk + manifest fetch, both in
-//! `host_shims.js`) and mutated synchronously on object `PUT`; a scanner
-//! that races ahead of boot hydration simply sees a smaller tree, never
-//! a stall. The per-handle fence is `ViewConsistent`-shaped but, as a
-//! volatile browser index, advertised `Volatile`.
+//! `LIST`/`STAT` answer *synchronously* from the in-memory index — a
+//! consumer treats a negative/empty `LIST` as "end of listing" and does
+//! not retry, so EAGAIN is not an option here. The index has two sources,
+//! both in `host_shims.js`: a one-shot OPFS walk + shipped-manifest fetch
+//! at boot, and synchronous mutation on object `PUT`. Because an empty
+//! `LIST` is terminal, a consumer must never observe the index mid-
+//! hydration — so the canonical runtime *awaits* both boot sources
+//! (`onNamespaceReady`) before the kernel steps any module. By the time a
+//! scanner can issue its first `LIST`, the shipped tree is fully built;
+//! `PUT`s thereafter mutate it in place. The per-handle fence is
+//! `ViewConsistent`-shaped but, as a volatile browser index, advertised
+//! `Volatile`.
 
 use crate::abi::contracts::fence as dev_fence;
 use crate::abi::contracts::storage::namespace as dev_ns;

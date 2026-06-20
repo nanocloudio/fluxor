@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["cm5", "bcm2712", "rp2350"]
+
+# Bare-metal Surface Traits authority for fixed-function panels
+# (.context/rfc_surface_traits.md). Emits one 24-byte
+# `input::surface_traits::MSG_TRAITS` record describing the statically-declared
+# panel surface — viewport (width/height), derived orientation + size class, the
+# wired input modalities (a MODALITY_* bitmask), and gamepad count — so an app
+# adapts to a buttoned speaker/instrument panel the same way it adapts to a
+# browser window. Orientation/size-class use the contract's own helpers (no
+# threshold duplication). A consumer wired to `events` reacts to the record; an
+# unwired graph is unaffected.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "SurfaceTraits"
+
+# PIC module: the param schema (width / height / modalities / gamepad_count /
+# display_count / audio_channels / audio_rate) is embedded via `define_params!`
+# in mod.rs, not declared here. Boards set the values in their graph YAML.
+# `modalities` is the input::surface_traits MODALITY_* bitmask (default 0x21 =
+# key | physical_buttons); `display_count = 0` declares a screenless audio-only
+# device (rp2350 + I2S speaker).
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "environment-plane authority — emits a one-shot surface-state descriptor, not a sustained byte stream"

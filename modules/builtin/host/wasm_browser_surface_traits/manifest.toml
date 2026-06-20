@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser surface-traits authority. The host runtime publisher
+# (FluxorOverlay.installSurfaceTraits) coalesces resize / visualViewport /
+# pointer-class / gamepad connect-disconnect / audio changes to at most one
+# record per animation frame; this built-in drains that queue via
+# `host_surface_traits_pop` and emits 24-byte
+# `input::surface_traits::MSG_TRAITS` records on the output port.
+#
+# It is the browser implementation of the runtime environment plane
+# (.context/rfc_surface_traits.md). A module that wants to adapt to its
+# surface (viewport / orientation / size class / input modalities / audio)
+# wires an input port to this output and reacts per record; a module that
+# ignores it keeps static-config behaviour, so the surface is purely
+# additive. Linux / bare-metal panels publish the same wire shape from
+# their own authorities (A-1).
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "SurfaceTraits"
+required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; carries surface-state snapshots, not a measurable on-device byte stream"

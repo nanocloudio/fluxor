@@ -1,0 +1,36 @@
+version = "1.0.0"
+# A content-plane *display* panel: it owns a framebuffer and draws into it. The
+# rp2350 surface in this project is the headless I2S speaker (no display), so it
+# is intentionally NOT a target — there is nothing to draw to, and its 256 KiB
+# state arena can't satisfy this module's framebuffer arena anyway.
+hardware_targets = ["cm5", "bcm2712", "wasm"]
+
+# Content-plane control panel (rfc_adaptive_presentation.md §11.3). Draws a touch
+# transport bar (prev / play-pause / next) into an RGB565 VideoRaster frame and,
+# on a touch hit, emits the matching FMP verb on `commands` — the same vocabulary
+# `gesture` emits, so it drives a `bank`/player identically. This is the in-raster
+# widget backend for a surface with no host chrome (a bare-metal panel, or a
+# browser canvas drawing its own controls). The pixel + hit-test logic mirrors
+# the host-unit-tested `tools/src/content_render.rs`.
+#
+# PIC module: param schema (width / height / pad) is embedded via define_params!
+# in mod.rs; the transport layout is fixed.
+
+[[ports]]
+name = "pointer"
+direction = "input"
+content_type = "PointerEvents"
+
+[[ports]]
+name = "raster"
+direction = "output"
+content_type = "VideoRaster"
+
+[[ports]]
+name = "commands"
+direction = "output"
+content_type = "FmpMessage"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "UI control panel — draws a raster + emits transport verbs on touch, not a measurable sustained byte stream"

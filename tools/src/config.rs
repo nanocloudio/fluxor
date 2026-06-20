@@ -4800,9 +4800,8 @@ fn generate_config_impl(
     validate_presentation_groups(config, &module_names, &manifests)?;
 
     // Presentation-shell / browser-overlay descriptor validation
-    // (RFC browser_overlay §19 + Amendment A). Additive: scenarios
-    // without a `presentation.shell` block are unaffected. Lives in a
-    // standalone, unit-testable module.
+    // (RFC browser_overlay §19). Scenarios without a `presentation.shell`
+    // block are unaffected. Lives in a standalone, unit-testable module.
     crate::presentation_shell::validate(config, &module_names).map_err(Error::Config)?;
 
     if edges.len() > MAX_GRAPH_EDGES {

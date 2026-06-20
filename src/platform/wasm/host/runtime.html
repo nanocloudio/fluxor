@@ -972,6 +972,11 @@
       // falls back to the generic display/player surface.
       const displayEl = playerStage || surfacesByRole.get('display') || surfacesByRole.get('player') || document.body;
 
+      // Resolves once the storage.namespace index (shipped manifest + OPFS)
+      // is hydrated. We block kernel startup on it so a scanner's first LIST
+      // sees the complete tree — LIST is synchronous and treats empty as
+      // end-of-listing, so a partial index would be read as final.
+      let namespaceReady = Promise.resolve();
       const imports = window.fluxor.buildHostImports({
         getKernel: () => kernel,
         onLog: (level, msg) => append(`[wasm] ${msg}`, level >= 3 ? 'err' : ''),
@@ -983,11 +988,21 @@
         canvasContainer: displayEl,
         fetchUrlOverride: (req) => currentAssetUrl || req,
         assetBank: bundleAssetBank,
+        manifestUrl: window.__fluxorBase + 'fluxor-manifest.json',
+        onNamespaceReady: (p) => { namespaceReady = p; },
         // Feeds wasm_browser_dom_input via host_input_pop (keyboard +
         // on-screen touch controls). Without this the queue is empty and
         // the player has no input.
         inputQueue,
       });
+
+      // Gate startup on namespace hydration, but bound the wait so a
+      // missing/slow manifest degrades to the best-effort tree instead of
+      // wedging boot (hydration continues in the background regardless).
+      await Promise.race([
+        namespaceReady,
+        new Promise((res) => setTimeout(res, 5000)),
+      ]);
 
       const instance = await WebAssembly.instantiate(bundleModule, imports);
       kernel = instance;
@@ -1173,6 +1188,13 @@
         // leaves the generic surface flow untouched.
         playerStage = setupPlayerMode(scenario);
         mountOverlayIfPresent(scenario, surfacesByRole);
+        // Surface Traits authority (rfc_surface_traits.md): publish the
+        // environment plane regardless of whether the overlay mounted — a
+        // chrome-less player still adapts. Harmless if no module drains the
+        // queue. Only the `wasm_browser_surface_traits` built-in consumes it.
+        if (window.FluxorOverlay && window.FluxorOverlay.installSurfaceTraits) {
+          window.__fluxor_surface_traits = window.FluxorOverlay.installSurfaceTraits(window);
+        }
         const playlistUrls = await resolvePlaylist(scenario);
 
         // Hand off to the role-specific navigator. We pick the

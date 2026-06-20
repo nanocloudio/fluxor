@@ -41,6 +41,18 @@ mod pointer;
 #[path = "wasm/gamepad.rs"]
 mod gamepad;
 
+// Surface Traits authority — drains coalesced environment-plane snapshots
+// (viewport / orientation / size class / modality / audio) from the browser
+// host shim and emits `input::surface_traits::MSG_TRAITS` records. See
+// `.context/rfc_surface_traits.md`.
+#[path = "wasm/surface_traits.rs"]
+mod surface_traits;
+
+// Demo consumer of the Surface Traits surface — decodes MSG_TRAITS and
+// logs the fields, proving the round-trip end-to-end.
+#[path = "wasm/surface_traits_probe.rs"]
+mod surface_traits_probe;
+
 // Browser-side BUTTON capability driver — wasm equivalent of
 // `flash_rp` (rp BOOTSEL) and `modules/foundation/button` (rp GPIO).
 // Emits one-byte transitions (`input::button` raw contract) drained
@@ -332,6 +344,8 @@ const WASM_BROWSER_POINTER_HASH: u32 = fnv1a32(b"wasm_browser_pointer");
 const WASM_BROWSER_BUTTON_HASH: u32 = fnv1a32(b"wasm_browser_button");
 const WASM_BROWSER_ACTION_HASH: u32 = fnv1a32(b"wasm_browser_action");
 const WASM_BROWSER_GAMEPAD_HASH: u32 = fnv1a32(b"wasm_browser_gamepad");
+const WASM_BROWSER_SURFACE_TRAITS_HASH: u32 = fnv1a32(b"wasm_browser_surface_traits");
+const WASM_BROWSER_SURFACE_TRAITS_PROBE_HASH: u32 = fnv1a32(b"wasm_browser_surface_traits_probe");
 const WASM_BROWSER_AUDIO_HASH: u32 = fnv1a32(b"wasm_browser_audio");
 const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
 const WASM_BROWSER_WS_SOURCE_HASH: u32 = fnv1a32(b"wasm_browser_ws_source");
@@ -609,6 +623,63 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_gamepad (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // SURFACE TRAITS authority — drains coalesced environment-plane
+        // snapshots (viewport / orientation / size class / modality /
+        // audio) from the browser host shim and emits 24-byte
+        // `input::surface_traits::MSG_TRAITS` records on out[0]. See
+        // `.context/rfc_surface_traits.md`.
+        if entry.name_hash == WASM_BROWSER_SURFACE_TRAITS_HASH {
+            if !init_builtin_heap::<surface_traits::SurfaceTraitsState>(module_idx) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_surface_traits: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = surface_traits::build(out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_surface_traits (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // SURFACE TRAITS probe — demo consumer that logs decoded
+        // MSG_TRAITS records (round-trip acceptance check).
+        if entry.name_hash == WASM_BROWSER_SURFACE_TRAITS_PROBE_HASH {
+            if !init_builtin_heap::<surface_traits_probe::ProbeState>(module_idx) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_surface_traits_probe: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let m = surface_traits_probe::build(in_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_surface_traits_probe (built-in)",
                 0,
             );
             continue;
@@ -1639,7 +1710,7 @@ fn log_str(level: u32, msg: &[u8]) {
     }
 }
 
-fn log_fmt2(level: u32, label_a: &str, value_a: u64, label_b: &str, value_b: u64) {
+pub(crate) fn log_fmt2(level: u32, label_a: &str, value_a: u64, label_b: &str, value_b: u64) {
     let mut buf = [0u8; 128];
     let mut pos = 0usize;
     pos = append_str(&mut buf, pos, label_a.as_bytes());

@@ -139,7 +139,13 @@ mod profile_host {
         // (runtime.html, fluxor.wasm, host_shims.js, /scenario.json,
         // /api/list, plus 3 spare for user/scenario route merges).
         pub const MAX_ROUTES: usize = 8;
-        pub const MAX_PATH: usize = 32;
+        // Request-path budget. Bumped 32 → 200 alongside MAX_FS_PATH:
+        // serving a real library (`list:` over `/tmp/music`) means request
+        // URLs like `/music/Elbow/Asleep In the Back/01 Any Day Now.m4a`,
+        // and percent-encoding (`%20` per space) inflates them further. At
+        // 32 the request path truncated, so `fs_list` OPENed a clipped path
+        // → 404. (`req_path_len` is a u8, so this stays ≤ 255.)
+        pub const MAX_PATH: usize = 200;
         pub const MAX_CONTENT_TYPE: usize = 32;
         /// Per-route absolute filesystem path budget on host targets.
         /// Bumped 64 → 256 in PR 6+ to fit realistic absolute paths

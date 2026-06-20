@@ -128,6 +128,26 @@ extern "C" {
         body_ptr: *const u8,
         body_len: usize,
     ) -> i32;
+
+    /// Range-fetch `url[..url_len]` (`Range: bytes=offset-…`) and decode
+    /// the result to a `width`×`height` RGB565 buffer in the browser.
+    /// Returns a non-negative job handle for `host_image_decode_recv` /
+    /// `host_image_decode_close`, or a negative errno.
+    fn host_image_decode_url(
+        url_ptr: *const u8,
+        url_len: usize,
+        offset: u64,
+        length: u64,
+        width: u32,
+        height: u32,
+    ) -> i32;
+
+    /// Drain the decoded RGB565 buffer. Returns bytes copied, `-1` while
+    /// the decode is still pending, `-2` on error, `0` once drained.
+    fn host_image_decode_recv(handle: i32, buf: *mut u8, len: usize) -> i32;
+
+    /// Release a decode job. Idempotent.
+    fn host_image_decode_close(handle: i32) -> i32;
 }
 
 /// Register the provider with the kernel so any module declaring
@@ -171,8 +191,79 @@ unsafe fn wasm_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: 
         dev_obj::HEAD => obj_head(arg, arg_len),
         dev_obj::RANGE_GET => obj_range_get(handle, arg, arg_len),
         dev_obj::CLOSE => obj_close(handle),
+        dev_obj::IMG_DECODE => img_decode(arg, arg_len),
+        dev_obj::IMG_RECV => img_recv(handle, arg, arg_len),
+        dev_obj::IMG_CLOSE => img_close(handle),
         _ => errno::ENOSYS,
     }
+}
+
+/// `IMG_DECODE` — range-fetch + decode an embedded image to RGB565.
+/// `arg` = `[offset:u64][length:u64][width:u16][height:u16][url…]`.
+/// Returns a tagged handle (for `IMG_RECV` / `IMG_CLOSE`) or errno.
+unsafe fn img_decode(arg: *mut u8, arg_len: usize) -> i32 {
+    const HDR: usize = 8 + 8 + 2 + 2;
+    if arg.is_null() || arg_len <= HDR {
+        return errno::EINVAL;
+    }
+    let offset = read_u64(arg, 0);
+    let length = read_u64(arg, 8);
+    let mut wb = [0u8; 2];
+    core::ptr::copy_nonoverlapping(arg.add(16), wb.as_mut_ptr(), 2);
+    let width = u16::from_le_bytes(wb) as u32;
+    let mut hb = [0u8; 2];
+    core::ptr::copy_nonoverlapping(arg.add(18), hb.as_mut_ptr(), 2);
+    let height = u16::from_le_bytes(hb) as u32;
+    let url = core::slice::from_raw_parts(arg.add(HDR), arg_len - HDR);
+
+    // Reuse the OBJECTS slot table for the handle mapping (url as key).
+    let fd = alloc_slot(url);
+    if fd < 0 {
+        return fd;
+    }
+    let idx = slot_of(fd) as usize;
+    let objs = &mut *core::ptr::addr_of_mut!(OBJECTS);
+    let h = host_image_decode_url(url.as_ptr(), url.len(), offset, length, width, height);
+    if h < 0 {
+        objs[idx].in_use = false;
+        return errno::ENODEV;
+    }
+    objs[idx].host_handle = h;
+    fd
+}
+
+/// `IMG_RECV` — drain the decoded RGB565 into `arg[..arg_len]`. Returns
+/// bytes copied, `EAGAIN` while decoding, `OK` (0) once drained, or errno.
+unsafe fn img_recv(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+    let idx = handle as usize;
+    let objs = &mut *core::ptr::addr_of_mut!(OBJECTS);
+    if idx >= MAX_OPEN_OBJECTS || !objs[idx].in_use || arg.is_null() {
+        return errno::EINVAL;
+    }
+    let h = objs[idx].host_handle;
+    let n = host_image_decode_recv(h, arg, arg_len);
+    if n > 0 {
+        n
+    } else if n == -1 {
+        errno::EAGAIN // decode still pending
+    } else if n == 0 {
+        errno::OK // fully drained
+    } else {
+        errno::ERROR // decode failed
+    }
+}
+
+/// `IMG_CLOSE` — release a decode handle.
+unsafe fn img_close(handle: i32) -> i32 {
+    let idx = handle as usize;
+    let objs = &mut *core::ptr::addr_of_mut!(OBJECTS);
+    if idx < MAX_OPEN_OBJECTS && objs[idx].in_use {
+        if objs[idx].host_handle >= 0 {
+            host_image_decode_close(objs[idx].host_handle);
+        }
+        objs[idx].in_use = false;
+    }
+    errno::OK
 }
 
 /// Read a little-endian `u64` from `ptr[off..off+8]`.

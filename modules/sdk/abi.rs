@@ -154,6 +154,9 @@ pub mod contracts {
         pub mod action {
             include!("contracts/input/action.rs");
         }
+        pub mod surface_traits {
+            include!("contracts/input/surface_traits.rs");
+        }
     }
 }
 

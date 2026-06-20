@@ -240,10 +240,11 @@
     };
 
     // At boot, load every persisted object into `objStore` so keys
-    // written in a prior session read back. Best-effort + recursive;
-    // reads that race ahead of hydration fall through to the fetch tier.
+    // written in a prior session read back. Best-effort + recursive.
+    // Returns the hydration promise so the host can gate module startup
+    // on a complete index (see `namespaceReady` below).
     const opfsHydrate = () => {
-      opfsRootP.then(async (root) => {
+      return opfsRootP.then(async (root) => {
         if (!root || typeof root.entries !== 'function') return;
         const walk = async (dir, prefix) => {
           for await (const [name, handle] of dir.entries()) {
@@ -262,7 +263,7 @@
         await walk(root, '');
       }).catch(() => { /* no OPFS / iteration unsupported — skip */ });
     };
-    opfsHydrate();
+    const opfsHydrateP = opfsHydrate();
 
     // ── namespace index (host_ns_*, storage.namespace enumeration) ───
     // Directory enumeration over the SAME flat key space the object tier
@@ -274,12 +275,13 @@
     // scanner) walk a tree the browser has no POSIX readdir for.
     const manifestIndex = new Map(); // key -> { size, mtime, etag(string) }
     const manifestUrl = o.manifestUrl || 'fluxor-manifest.json';
-    // Best-effort boot fetch of the shipped-content manifest: a JSON
-    // array of { key, size, mtime?, etag? }. Absent/garbled → the
-    // namespace tier serves objStore (user data) only.
-    (() => {
-      if (typeof fetch !== 'function') return;
-      Promise.resolve().then(() => fetch(manifestUrl))
+    // Boot fetch of the shipped-content manifest: a JSON array of
+    // { key, size, mtime?, etag? }. Absent/garbled → the namespace tier
+    // serves objStore (user data) only. Returns its promise so startup can
+    // wait for it.
+    const manifestHydrateP = (function loadManifest() {
+      if (typeof fetch !== 'function') return Promise.resolve();
+      return Promise.resolve().then(() => fetch(manifestUrl))
         .then((resp) => (resp && resp.ok) ? resp.json() : null)
         .then((entries) => {
           if (!Array.isArray(entries)) return;
@@ -293,6 +295,21 @@
           }
         }).catch(() => { /* no manifest — objStore-only namespace */ });
     })();
+
+    // Single namespace-readiness signal. The `storage.namespace` LIST/STAT
+    // answers SYNCHRONOUSLY from these two in-memory sources and treats a
+    // negative/empty LIST as end-of-listing (no EAGAIN), so a scanner that
+    // runs before hydration would read a partial tree as complete and miss
+    // shipped content permanently. The canonical runtime awaits this promise
+    // before the kernel steps any module (see runtime.html), making the index
+    // fully built by the time the first LIST can be issued. A host that omits
+    // the callback keeps the old best-effort behavior (no behavioral change).
+    const namespaceReady = Promise
+      .allSettled([opfsHydrateP, manifestHydrateP])
+      .then(() => {});
+    if (typeof o.onNamespaceReady === 'function') {
+      try { o.onNamespaceReady(namespaceReady); } catch (_) { /* ignore */ }
+    }
 
     // Deterministic 16-byte object id for a key (FNV-1a, four seeded
     // 32-bit passes). Stable per key + high-entropy, which is what the
@@ -765,6 +782,40 @@
       },
     };
 
+    // SURFACE TRAITS authority — wasm_browser_surface_traits. The browser
+    // runtime publisher (installSurfaceTraits in browser_overlay_runtime.js)
+    // coalesces resize / visualViewport / pointer-class / gamepad / audio
+    // changes to at most one record per animation frame and pushes:
+    //   { orientation, sizeClassW, sizeClassH, viewportW, viewportH,
+    //     modalities, gamepadCount, audioChannels, audioRateHz, epoch }
+    // `host_surface_traits_pop` serialises it to the 24-byte MSG_TRAITS
+    // record (input::surface_traits.rs). authority = 0 (browser).
+    const surfaceTraitsQueue = window.__fluxor_surface_traits_queue
+      || (window.__fluxor_surface_traits_queue = []);
+    const surfaceTraitsShim = {
+      host_surface_traits_pop: (bufPtr, bufLen) => {
+        if (surfaceTraitsQueue.length === 0 || bufLen < 24) return 0;
+        const ev = surfaceTraitsQueue.shift();
+        const view = new DataView(getKernel().exports.memory.buffer, bufPtr, 24);
+        view.setUint8(0, 0x01);                          // MSG_TRAITS
+        view.setUint8(1, ev.orientation & 0xFF);
+        view.setUint8(2, ev.sizeClassW & 0xFF);
+        view.setUint8(3, ev.sizeClassH & 0xFF);
+        view.setUint16(4, ev.viewportW & 0xFFFF, true);
+        view.setUint16(6, ev.viewportH & 0xFFFF, true);
+        view.setUint16(8, ev.modalities & 0xFFFF, true);
+        view.setUint8(10, ev.gamepadCount & 0xFF);
+        view.setUint8(11, ev.audioChannels & 0xFF);
+        view.setUint32(12, (ev.audioRateHz >>> 0), true);
+        view.setUint32(16, (ev.epoch >>> 0), true);
+        view.setUint8(20, 0);                            // AUTHORITY_BROWSER
+        view.setUint8(21, (ev.displayCount == null ? 1 : ev.displayCount) & 0xFF); // a browser always has a display
+        view.setUint8(22, 0);
+        view.setUint8(23, 0);
+        return 24;
+      },
+    };
+
     // ── WebSocket (wasm_browser_websocket) ───────────────────────────
     const wsSockets = new Map();
     let nextWsHandle = 1;
@@ -922,6 +973,18 @@
         }
         const i16 = new Int16Array(getKernel().exports.memory.buffer.slice(ptr, ptr + len));
         const ch = Math.max(1, channels | 0);
+        // Publish the live audio config to the Surface Traits authority
+        // (rfc_surface_traits.md). The publisher reads this each recompute; on a
+        // real change, nudge it to emit a fresh record. Guarded so this runs
+        // once per config change, not every audio frame.
+        const rateHz = ctx.sampleRate | 0;
+        const prevAudio = window.__fluxor_audio_traits;
+        if (!prevAudio || prevAudio.channels !== ch || prevAudio.rateHz !== rateHz) {
+          window.__fluxor_audio_traits = { channels: ch, rateHz };
+          if (window.__fluxor_surface_traits && window.__fluxor_surface_traits.schedule) {
+            window.__fluxor_surface_traits.schedule();
+          }
+        }
         const frames = Math.floor(i16.length / ch);
         if (!frames) return;
         const buf = ctx.createBuffer(ch, frames, sampleRate);
@@ -1098,6 +1161,10 @@
       host_image_decode_recv: (handle, bufPtr, bufLen) => {
         const job = imageDecodes.get(handle);
         if (!job) return -3;
+        // Distinguish a failed decode (-2, terminal) from one still decoding
+        // (-1, EAGAIN). The Rust img_recv maps -1 → EAGAIN, so collapsing the
+        // error state into -1 would loop the caller forever on a dead job.
+        if (job.state === 'error') return -2;
         if (job.state !== 'ready') return -1;
         const remaining = job.buf.length - job.pos;
         if (remaining === 0) return 0;
@@ -1107,6 +1174,61 @@
         return n;
       },
       host_image_decode_close: (handle) => imageDecodes.delete(handle) ? 0 : -1,
+
+      // Range-fetch an embedded image (cover art lives inside an .m4a at a
+      // byte offset) and decode it straight to a `width`×`height` RGB565
+      // buffer in the browser — so a PIC module (truffle_shell) gets album
+      // covers without pulling multi-MB encoded images into wasm or
+      // touching an in-wasm JPEG/PNG decoder. Reuses the
+      // `host_image_decode_recv/size/close` job machinery.
+      host_image_decode_url: (urlPtr, urlLen, offset, length, width, height) => {
+        try {
+          const url = kstr(urlPtr, urlLen);
+          const off = Number(offset);
+          const len = Number(length);
+          const handle = nextImageHandle++;
+          const job = { state: 'pending', buf: null, pos: 0, error: null, width, height };
+          imageDecodes.set(handle, job);
+          fetch(url, { headers: { Range: `bytes=${off}-${off + len - 1}` } })
+            .then((r) => r.arrayBuffer().then((ab) => ({ status: r.status, ab })))
+            .then(({ status, ab }) => {
+              let bytes = new Uint8Array(ab);
+              // Server ignored `Range:` (200, whole body) → slice the cover
+              // out; a 206 already carries exactly the requested range.
+              if (status !== 206 && bytes.length > len) {
+                bytes = bytes.subarray(off, off + len);
+              }
+              return createImageBitmap(new Blob([bytes]), {
+                resizeWidth: width, resizeHeight: height, resizeQuality: 'high',
+              });
+            })
+            .then((bitmap) => {
+              const oc = new OffscreenCanvas(width, height);
+              const ctx = oc.getContext('2d');
+              ctx.drawImage(bitmap, 0, 0);
+              const rgba = ctx.getImageData(0, 0, width, height).data;
+              const out = new Uint8Array(width * height * 2);
+              for (let i = 0, p = 0; i < rgba.length; i += 4, p += 2) {
+                const r = rgba[i] >> 3, g = rgba[i + 1] >> 2, b = rgba[i + 2] >> 3;
+                const v = (r << 11) | (g << 5) | b;
+                out[p] = v & 0xFF;
+                out[p + 1] = (v >> 8) & 0xFF;
+              }
+              job.buf = out;
+              job.state = 'ready';
+              bitmap.close();
+            })
+            .catch((err) => {
+              job.state = 'error';
+              job.error = err.message;
+              console.error(`host_image_decode_url[${handle}] failed: ${err.message}`);
+            });
+          return handle;
+        } catch (err) {
+          console.error(`host_image_decode_url threw: ${err.message}`);
+          return -1;
+        }
+      },
     };
 
     // ── Sub-module instantiation (host_instantiate_module, ...) ──────
@@ -1237,6 +1359,7 @@
         buttonShim,
         gamepadShim,
         actionShim,
+        surfaceTraitsShim,
         wsShim,
         audioShim,
         canvasShim,

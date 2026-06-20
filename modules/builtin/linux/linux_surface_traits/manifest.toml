@@ -1,0 +1,35 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# Linux Surface Traits authority — the Linux implementation of the runtime
+# environment plane (.context/rfc_surface_traits.md). Emits 24-byte
+# `input::surface_traits::MSG_TRAITS` records on the output port: a baseline at
+# startup, then one per change. Orientation / size class derive from the
+# configured width/height; input modalities are scanned from
+# /proc/bus/input/devices and re-scanned periodically so USB device hot-plug
+# bumps the epoch. Window-resize propagation, audio config, and gamepad count
+# are deferred (see the module header). A consumer wired to this output adapts
+# to the surface; an unwired graph is unaffected.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "SurfaceTraits"
+required = true
+
+[[params]]
+name = "width"
+type = "u32"
+default = 480
+range = [1, 4096]
+
+[[params]]
+name = "height"
+type = "u32"
+default = 480
+range = [1, 4096]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "Linux-host environment shim — publishes surface-state snapshots derived from config + /proc input enumeration, not an on-silicon data path"

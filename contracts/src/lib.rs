@@ -134,6 +134,13 @@ pub const CONTENT_TYPES: &[&str] = &[
     // `observe` collector; logs ride `log_ring` separately. See
     // `standards/observability.md`.
     "Telemetry",
+    // Runtime environment-plane descriptor — fixed 24-byte `MSG_TRAITS`
+    // record per `modules/sdk/contracts/input/surface_traits.rs`. The
+    // host platform adapter publishes viewport / orientation / size-class
+    // / input-modality / audio-config snapshots on this content type; a
+    // module that wants to adapt to its surface wires an input port to
+    // it. See `.context/rfc_surface_traits.md`.
+    "SurfaceTraits",
 ];
 
 /// Per-operation fence: the actual guarantee a returning operation

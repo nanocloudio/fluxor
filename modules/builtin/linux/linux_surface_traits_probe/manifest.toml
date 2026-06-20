@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# Demo consumer of the Surface Traits surface on Linux
+# (.context/rfc_surface_traits.md). Reads `input::surface_traits::MSG_TRAITS`
+# records from its input port and logs the decoded fields via log::info!, so
+# the A-1 round-trip is observable on a headless Linux box: linux_surface_traits
+# → channel → this probe. Not a production module — the live acceptance check
+# (criterion 1). Plug/unplug a USB input device and watch the epoch bump.
+
+[[ports]]
+name = "events"
+direction = "input"
+content_type = "SurfaceTraits"
+required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "Linux-host demo probe — logs decoded surface-state to stdout, not an on-silicon data path"

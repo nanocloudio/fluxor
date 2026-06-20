@@ -142,6 +142,19 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("observability", verbose, || run_observability(project_root))
     });
 
+    // ───── Phase 1.46: presentation placement ───────────────────────
+    //
+    // Enforce rfc_adaptive_presentation.md §9: run the placement resolver
+    // over every config's `presentation.shell` against the surface it
+    // targets, and fail on any `essential` control that can't be surfaced
+    // there (no plane + no `bind_physical`). Stops a control going silently
+    // dead on a constrained device (e.g. a screenless rp2350 + I2S speaker).
+    results.push(if skip.lint {
+        skipped("presentation")
+    } else {
+        run_step("presentation", verbose, || run_presentation(project_root))
+    });
+
     // ───── Phase 1.5: template render ───────────────────────────────
     results.push(if skip.templates {
         skipped("template-render")
@@ -783,6 +796,45 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
     }
     msg.push_str("run `fluxor lint observability --strict` for details");
     Err(msg)
+}
+
+/// Run the placement-resolver lint over every config's `presentation.shell`
+/// (rfc_adaptive_presentation.md §9). Mirrors `fluxor lint presentation`.
+fn run_presentation(project_root: &Path) -> std::result::Result<(), String> {
+    let mut violations: Vec<String> = Vec::new();
+    for entry in walkdir::WalkDir::new(project_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() || path.components().any(|c| c.as_os_str() == "target") {
+            continue;
+        }
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("yaml") | Some("yml") => {}
+            _ => continue,
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // Not every .yaml is a Fluxor config; skip anything that doesn't parse.
+        let Ok(cfg) = serde_yaml::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let rel = path.strip_prefix(project_root).unwrap_or(path).display();
+        for msg in crate::presentation_resolver::lint_config(&cfg) {
+            violations.push(format!("{rel}: {msg}"));
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} unplaceable essential control(s): {}; run `fluxor lint presentation` for details",
+            violations.len(),
+            violations.join("; ")
+        ))
+    }
 }
 
 /// Walk every workspace member and confirm it declares
