@@ -141,6 +141,13 @@ pub const CONTENT_TYPES: &[&str] = &[
     // module that wants to adapt to its surface wires an input port to
     // it. See `.context/rfc_surface_traits.md`.
     "SurfaceTraits",
+    // Resolved presentation layout — the `presentation.layout` record per
+    // `tools/src/presentation_resolver.rs`: per-control disposition (chrome /
+    // content / bound / hidden), plane, flags, and a physical-button legend.
+    // The `presentation_resolver` module emits it from a SurfaceTraits stream;
+    // chrome/content renderers consume it. See
+    // `.context/rfc_adaptive_presentation.md`.
+    "PresentationLayout",
 ];
 
 /// Per-operation fence: the actual guarantee a returning operation

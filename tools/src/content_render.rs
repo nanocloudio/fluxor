@@ -49,6 +49,54 @@ pub fn icon_for_action(action: &str) -> Icon {
     }
 }
 
+/// Icon → wire code (matches the on-device `content_controls` ICON_* and the
+/// `Icon` enum discriminant order).
+pub fn icon_code(icon: Icon) -> u8 {
+    match icon {
+        Icon::Play => 0,
+        Icon::Pause => 1,
+        Icon::Next => 2,
+        Icon::Prev => 3,
+        Icon::Stop => 4,
+        Icon::Generic => 5,
+    }
+}
+
+/// Map a canonical `action.*` id to the short FMP transport verb a content
+/// control emits on tap — the same vocabulary `gesture` produces, so it drives a
+/// `bank`/player identically. EXACT-matches the canonical `action.transport.*`
+/// ids (not a substring test): `action.gallery.next` is NOT transport `next`,
+/// and the idempotent `play`/`pause` are NOT folded into the flip-semantics
+/// `toggle`. Returns `None` for anything outside this set — content_controls
+/// then rejects it (a control it can't actuate) rather than emitting a wrong or
+/// unsupported verb.
+///
+/// The set is exactly the verbs the canonical action bridge
+/// (`abi::contracts::input::action::action_to_verb`) resolves AND a `bank`
+/// consumer handles end-to-end (`next`/`prev`/`toggle`). `stop` is deliberately
+/// absent: there is no `action.transport.stop` mapping in the bridge and no
+/// `bank` handler for it, so certifying it would let the same shell action drive
+/// a host overlay one way and a content panel another (or silently no-op).
+pub fn verb_for_action(action: &str) -> Option<&'static str> {
+    match action {
+        "action.transport.next" => Some("next"),
+        "action.transport.previous" => Some("prev"),
+        "action.transport.toggle" => Some("toggle"),
+        _ => None,
+    }
+}
+
+/// FNV-1a 32-bit hash — the verb-hash form the on-device `msg_write_empty` /
+/// `bank` consume (mirrors `modules/sdk/runtime.rs::fnv1a`).
+pub fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 /// One drawable control.
 #[derive(Clone, Copy, Debug)]
 pub struct Control {
@@ -266,11 +314,52 @@ fn draw_play(fb: &mut [u16], stride: u16, ox: u16, oy: u16, w: u16, h: u16, flip
     }
 }
 
+// ── Bitmap text (5×7 glyphs) ─────────────────────────────────────────
+//
+// The font itself lives in `modules/sdk/font5x7.rs` (no_std-safe) and is shared
+// verbatim with the on-device `content_controls` module via `include!`, so the
+// two can never drift. It defines `glyph` / `draw_glyph` / `draw_text` +
+// `GLYPH_W` / `GLYPH_H`.
+include!("../../modules/sdk/font5x7.rs");
+
 /// Hit-test a point against the laid-out rects → control index.
 pub fn hit_test(rects: &[Rect], x: u16, y: u16) -> Option<usize> {
     rects.iter().position(|r| {
         x >= r.x && x < r.x.saturating_add(r.w) && y >= r.y && y < r.y.saturating_add(r.h)
     })
+}
+
+/// One legend entry: a physical button and the action it drives (RFC §14). On a
+/// surface with physical buttons + a display, the `bound` controls' legend is
+/// drawn so the user knows what each button does.
+#[derive(Clone, Copy, Debug)]
+pub struct LegendEntry<'a> {
+    pub button: &'a str,
+    pub action: &'a str,
+}
+
+/// Draw a legend strip into the bottom `rows*scale*GLYPH_H`-ish band of `fb`:
+/// one `BUTTON: ACTION` line per entry, top-down from `y`. Returns the y after
+/// the last line. Pure; clips to the buffer.
+pub fn render_legend(
+    fb: &mut [u16],
+    width: u16,
+    y: u16,
+    entries: &[LegendEntry<'_>],
+    scale: u16,
+    theme: &Theme,
+) -> u16 {
+    let s = scale.max(1);
+    let line_h = GLYPH_H * s + 2;
+    let mut cy = y;
+    for e in entries {
+        let mut cx = 1u16;
+        cx += draw_text(fb, width, cx, cy, e.button, s, theme.icon);
+        cx += 2 + draw_text(fb, width, cx + 2, cy, ":", s, theme.border);
+        draw_text(fb, width, cx + 4, cy, e.action, s, theme.button_pressed);
+        cy = cy.saturating_add(line_h);
+    }
+    cy
 }
 
 /// Render a control panel into `fb` (`width`×`height`, RGB565). Clears to the

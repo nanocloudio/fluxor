@@ -735,13 +735,16 @@
       const buttonQ = window.__fluxor_button_queue
         || (window.__fluxor_button_queue = []);
       function localCoords(ev) {
+        // Map page coords into the surface's logical pixel space (the canvas's
+        // intrinsic raster size when mounted, else the canonical 960×540). The
+        // shared, unit-tested helper lives in browser_overlay_runtime.js.
+        if (window.FluxorOverlay && window.FluxorOverlay.surfaceLocalCoords) {
+          return window.FluxorOverlay.surfaceLocalCoords(el, ev.clientX, ev.clientY);
+        }
         const rect = el.getBoundingClientRect();
-        // Scale page→surface if the surface is shrunk by max-width.
-        const scaleX = 960 / rect.width;
-        const scaleY = 540 / rect.height;
         return {
-          x: Math.round((ev.clientX - rect.left) * scaleX),
-          y: Math.round((ev.clientY - rect.top)  * scaleY),
+          x: Math.round((ev.clientX - rect.left) * (960 / (rect.width || 960))),
+          y: Math.round((ev.clientY - rect.top) * (540 / (rect.height || 540))),
         };
       }
       function pushPointer(ev, kind) {

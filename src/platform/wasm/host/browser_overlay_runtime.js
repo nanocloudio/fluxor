@@ -242,25 +242,100 @@
         if (k === 'content') continue;
         while (zones[k].firstChild) zones[k].removeChild(zones[k].firstChild);
       }
+      // The content zone holds the app canvas (never cleared), but prior
+      // superimposed controls must be removed so they don't accumulate.
+      if (zones.content) {
+        for (const n of Array.from(zones.content.children)) {
+          if (n.classList && n.classList.contains('fx-superimposed')) {
+            zones.content.removeChild(n);
+          }
+        }
+      }
       controls.length = 0;
       statusBound.length = 0;
-      // Resolve which controls render on the current surface (the shrink
-      // ladder + suppress_if): hidden controls are not built at all.
-      const hidden = browserHiddenControls(shell.controls, curSizeClass, curModalities);
+      // Resolve the layout for the current surface. A `chrome`-disposition
+      // control renders in its chrome zone; a `content`-disposition control is
+      // normally drawn by the app (skipped here) — UNLESS it is superimposed
+      // (`overlay`), in which case it overlays the content regardless of plane.
+      // So the overlay check comes BEFORE the chrome gate, gated only on
+      // `hidden` (shrink ladder / suppression). The RFC's canonical overlay
+      // control uses `[content, chrome]` affinity → resolves to `content`, and
+      // would be dropped if we gated on chrome first.
+      const layout = resolveLayout(shell.controls, curSizeClass, curModalities);
       for (const spec of shell.controls) {
-        if (spec.id && hidden.has(spec.id)) continue;
-        // Respect plane_affinity: the DOM overlay renders the CHROME plane only.
-        // A content-plane control is drawn by the app into its own canvas (e.g.
-        // the content_controls module), so it must not also appear as chrome.
-        if (!chromePlaneControl(spec)) continue;
+        const disp = spec.id ? layout.get(spec.id) : 'chrome';
+        if (disp === 'hidden') continue;
+        if (spec.overlay === true) {
+          // Superimposed mode (RFC §11.3): overlay the control translucently
+          // OVER live content at an app-declared `overlay_regions`, rather than
+          // packing it into a chrome zone. The "controls never obscure content"
+          // invariant is deliberately waived here (virtual gamepads on a game).
+          const built = buildControl(spec);
+          if (!built) continue;
+          applyA11y(built.node, spec);
+          built.node.classList.add('fx-superimposed');
+          applyOverlayRegion(built.node, spec);
+          zones.content.appendChild(built.node);
+          controls.push(built);
+          if (built.statusField) statusBound.push(built);
+          continue;
+        }
+        // Non-overlay: only the chrome plane renders as DOM chrome.
+        if (disp !== 'chrome') continue;
         const built = buildControl(spec);
         if (!built) continue;
+        applyA11y(built.node, spec);
         const placement = spec.placement || defaultPlacement(profile, spec);
         const z = (placement === 'drawer') ? 'drawer' : zoneFor(placement);
         zones[z].appendChild(built.node);
         controls.push(built);
         if (built.statusField) statusBound.push(built);
       }
+    }
+
+    // Ensure every rendered control exposes an accessible name + role for the
+    // a11y tree (RFC §13). Native <button>/<select>/<input> derive a name from
+    // their text/options; div-based controls (dpad/stick/cluster/keyboard/status)
+    // need an explicit role + aria-label so assistive tech can navigate them.
+    function applyA11y(node, spec) {
+      if (!node || !node.setAttribute) return;
+      const name = cap((spec.a11y && spec.a11y.label) || spec.label || spec.id || '');
+      if (name && !node.getAttribute('aria-label')) node.setAttribute('aria-label', name);
+      const tag = (node.tagName || '').toUpperCase();
+      const native = tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
+      if (!native && !node.getAttribute('role')) {
+        node.setAttribute('role', spec.kind === 'status' ? 'status' : 'group');
+      }
+    }
+
+    // Named overlay regions (RFC §11.3 `overlay_regions`) → CSS placement within
+    // the content zone. The validated schema is `overlay` boolean +
+    // `overlay_regions` a list of region NAMES; the validator
+    // (tools/src/presentation_shell.rs OVERLAY_REGIONS) accepts EXACTLY these
+    // names, so an unknown region fails the build rather than silently
+    // defaulting. Keep the two lists in lock-step (pinned by
+    // tools/tests/browser_overlay_runtime_surface.rs).
+    const OVERLAY_REGION = {
+      // Edge thirds (the RFC canonical safe regions — e.g. a dpad in left_third).
+      left_third: { left: '2%', top: '50%', transform: 'translateY(-50%)', width: '30%' },
+      right_third: { right: '2%', top: '50%', transform: 'translateY(-50%)', width: '30%' },
+      center_third: { left: '50%', top: '50%', transform: 'translate(-50%,-50%)', width: '30%' },
+      // Corners + bottom-center.
+      bottom_start: { left: '4%', bottom: '6%' },
+      bottom_end: { right: '4%', bottom: '6%' },
+      top_start: { left: '4%', top: '6%' },
+      top_end: { right: '4%', top: '6%' },
+      bottom_center: { left: '50%', bottom: '6%', transform: 'translateX(-50%)' },
+    };
+
+    // Position a superimposed control from its declared `overlay_regions` (first
+    // named region; default bottom_start). Safe when the platform node has no
+    // `style` (tests).
+    function applyOverlayRegion(node, spec) {
+      if (!node || !node.style) return;
+      const names = Array.isArray(spec.overlay_regions) ? spec.overlay_regions : [];
+      const region = (names.length && OVERLAY_REGION[names[0]]) || OVERLAY_REGION.bottom_start;
+      for (const k of Object.keys(region)) node.style[k] = region[k];
     }
 
     function buildControl(spec) {
@@ -809,6 +884,12 @@
     // go dead. The content zone deliberately stays click-through.
     '.fx-zone{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;pointer-events:auto;}',
     '.fx-zone-content{overflow:hidden;pointer-events:none;}',
+    // Superimposed mode (RFC §11.3): a control overlaid translucently OVER live
+    // content at its app-declared region. The content zone becomes the
+    // positioning context; the control re-asserts pointer-events (the zone is
+    // click-through) and sits above the content.
+    '.fx-zone-content{position:relative;}',
+    '.fx-superimposed{position:absolute;pointer-events:auto;opacity:0.82;z-index:3;}',
     '.fx-zone-transient{position:absolute;left:0;right:0;bottom:0;pointer-events:none;}',
     '.fx-zone-transient>*{pointer-events:auto;}',
     '.fx-zone-debug{display:none;}',
@@ -822,12 +903,10 @@
     'grid-template-areas:"above above above" "left_rail content right_rail" "below_center below_center below_center" "drawer drawer drawer";',
     'grid-template-rows:auto 1fr auto auto;}',
     '.fx-orient-landscape .fx-zone-below_start,.fx-orient-landscape .fx-zone-below_end{display:none;}',
-    // Desktop: content centered, virtual gameplay controls hidden.
+    // Desktop: content centered. Virtual gameplay controls are hidden by the
+    // resolver (resolveLayout's virtual-gameplay policy), not CSS.
     '.fx-orient-desktop{grid-template-columns:1fr;',
     'grid-template-areas:"above" "content" "below_center" "drawer";grid-template-rows:auto 1fr auto auto;}',
-    '.fx-orient-desktop[data-profile="game"] .fx-dpad,',
-    '.fx-orient-desktop[data-profile="game"] .fx-stick,',
-    '.fx-orient-desktop[data-profile="game"] .fx-cluster{display:none;}',
     '.fx-zone-above{grid-area:above;}.fx-zone-content{grid-area:content;}',
     '.fx-zone-left_rail{grid-area:left_rail;flex-direction:column;}',
     '.fx-zone-right_rail{grid-area:right_rail;flex-direction:column;}',
@@ -910,43 +989,50 @@
   };
   const SIZECLASS_RANK = { compact: 0, regular: 1, expanded: 2 };
 
-  // Does a control resolve to the CHROME plane on a browser surface? Mirrors
-  // the canonical resolver (tools/src/presentation_resolver.rs): a browser
-  // surface has both chrome and content eligible, so a control resolves to the
-  // first plane in its `plane_affinity` (default ['chrome']). Only chrome-plane
-  // controls are rendered as DOM chrome; content-plane controls belong to the
-  // app's own canvas (e.g. the content_controls module) and must be skipped.
-  function chromePlaneControl(spec) {
-    const aff = Array.isArray(spec.plane_affinity)
-      ? spec.plane_affinity.filter((p) => p === 'chrome' || p === 'content')
-      : [];
-    return (aff.length ? aff[0] : 'chrome') === 'chrome';
-  }
+  // Virtual gameplay controls are pointless on a true mouse-and-keyboard
+  // surface (fine pointer, no touch) — this was a hard-coded desktop CSS rule;
+  // it is now resolver POLICY DATA so the browser and the on-device resolver
+  // make the same call. A real gamepad is handled by a declared
+  // `suppress_if: modality.gamepad`; this covers the no-pad desktop case.
+  const VIRTUAL_GAMEPLAY_KIND = { dpad: 1, stick: 1, button_cluster: 1 };
 
   // Browser specialization of the placement resolver
-  // (tools/src/presentation_resolver.rs). On a browser surface (chrome region,
-  // unbounded scrolling zones, no physical buttons) a control resolves to chrome
-  // UNLESS it is below its `min_size_class` (and not `essential`) or suppressed
-  // by a present modality — in which case it is hidden. `bound`/capacity-overflow
-  // can't trigger on this surface; the content plane is handled separately by
-  // `chromePlaneControl` (the app draws those). Returns a Set of hidden control
-  // ids. The shrink ladder is exactly this driven by viewport size class.
-  function browserHiddenControls(specs, sizeClassRank, modalities) {
-    const hidden = new Set();
+  // (tools/src/presentation_resolver.rs). It returns a `presentation.layout`-
+  // shaped result: a Map of control id → disposition ('chrome' | 'content' |
+  // 'hidden'). A browser surface has both chrome and content eligible with
+  // unbounded zones and no physical buttons, so `bound`/capacity-overflow can't
+  // trigger and the resolve reduces to: size filter → suppression (declared +
+  // the virtual-gameplay policy) → plane = first `plane_affinity` (default
+  // chrome). `renderAll` builds only the `chrome`-disposition controls; the
+  // shrink ladder is this driven by viewport size class.
+  function resolveLayout(specs, sizeClassRank, modalities) {
+    const layout = new Map();
+    const has = (name) => (modalities & MODALITY_BIT[name]) !== 0;
     for (const spec of specs) {
+      const id = spec.id;
       const min = SIZECLASS_RANK[spec.min_size_class] || 0;
       const essential = spec.priority === 'essential';
-      if (sizeClassRank < min && !essential) {
-        hidden.add(spec.id);
-        continue;
-      }
+      // 1. Below the surface size class → hidden (essential ignores the floor).
+      if (sizeClassRank < min && !essential) { layout.set(id, 'hidden'); continue; }
+      // 2. Suppression: a declared `suppress_if: modality.X`, or the virtual-
+      //    gameplay policy (fine pointer present, no touch → no virtual pad).
+      let suppressed = false;
       const s = spec.suppress_if;
       if (typeof s === 'string' && s.indexOf('modality.') === 0) {
         const bit = MODALITY_BIT[s.slice('modality.'.length)];
-        if (bit && (modalities & bit)) hidden.add(spec.id);
+        if (bit && (modalities & bit)) suppressed = true;
       }
+      if (!suppressed && VIRTUAL_GAMEPLAY_KIND[spec.kind] && has('pointer_fine') && !has('touch')) {
+        suppressed = true;
+      }
+      if (suppressed) { layout.set(id, 'hidden'); continue; }
+      // 3. Plane = first eligible affinity (both eligible on a browser surface).
+      const aff = Array.isArray(spec.plane_affinity)
+        ? spec.plane_affinity.filter((p) => p === 'chrome' || p === 'content')
+        : [];
+      layout.set(id, aff.length ? aff[0] : 'chrome');
     }
-    return hidden;
+    return layout;
   }
 
   function installSurfaceTraits(win, opts) {
@@ -1055,7 +1141,32 @@
     return { recompute, schedule, stop, _sizeClassFor: sizeClassFor };
   }
 
-  const api = { mount, makeSinks, makeHostSinks, installSurfaceTraits, sizeClassFor, GAMEPAD_BIT, parseControl, fnv1a32, _css: OVERLAY_CSS };
+  // Map a page-space pointer position into a surface's LOGICAL pixel space —
+  // the raster a module renders + hit-tests in. When a canvas is mounted (any
+  // raster-rendering module, e.g. content_controls), that is the canvas's own
+  // rect + intrinsic width/height, so a 240×80 content panel yields panel-local
+  // coords and a 960×540 display yields 960×540. Canvas-less surfaces (the
+  // gamepad overlay, hit-tested against the canonical 960×540 region table) use
+  // the element rect + a 960×540 fallback. Used by runtime.html's pointer
+  // listeners; exported so it can be unit-tested without a live browser.
+  function surfaceLocalCoords(el, clientX, clientY) {
+    const isCanvas = el && el.tagName && el.tagName.toUpperCase() === 'CANVAS';
+    const canvas = isCanvas
+      ? el
+      : (el && el.querySelector ? el.querySelector('canvas') : null);
+    const target = canvas || el;
+    const rect = target.getBoundingClientRect();
+    const logicalW = (canvas && canvas.width) || 960;
+    const logicalH = (canvas && canvas.height) || 540;
+    const scaleX = logicalW / (rect.width || logicalW);
+    const scaleY = logicalH / (rect.height || logicalH);
+    return {
+      x: Math.round((clientX - rect.left) * scaleX),
+      y: Math.round((clientY - rect.top) * scaleY),
+    };
+  }
+
+  const api = { mount, makeSinks, makeHostSinks, installSurfaceTraits, surfaceLocalCoords, sizeClassFor, GAMEPAD_BIT, parseControl, fnv1a32, _css: OVERLAY_CSS };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.FluxorOverlay = api;
 })(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));

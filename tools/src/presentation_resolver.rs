@@ -79,6 +79,11 @@ pub struct ControlIntent {
     pub bind_physical: Option<String>,
     /// Drop the control when this modality bit is present.
     pub suppress_if: Option<u16>,
+    /// A virtual gameplay control (dpad / stick / button_cluster): suppressed on
+    /// a mouse-and-keyboard surface (fine pointer present, no touch) — a real
+    /// gamepad/desktop has no use for an on-screen pad. Derived from `kind` so
+    /// the browser, host lint, and on-device resolver all apply the same rule.
+    pub virtual_gameplay: bool,
 }
 
 impl ControlIntent {
@@ -91,6 +96,7 @@ impl ControlIntent {
             min_size_class: SizeClass::Compact,
             bind_physical: None,
             suppress_if: None,
+            virtual_gameplay: false,
         }
     }
 }
@@ -189,12 +195,17 @@ pub fn resolve(intents: &[ControlIntent], surface: &Surface) -> LayoutResolution
                 continue;
             }
         }
-        // 3. Suppressed by a present modality.
-        if let Some(m) = c.suppress_if {
-            if surface.has(m) {
-                disp.insert(i, entry(Disposition::Hidden, None, None, false));
-                continue;
-            }
+        // 3. Suppressed by a present modality, or the virtual-gameplay policy
+        //    (a mouse-and-keyboard surface — fine pointer, no touch — has no use
+        //    for an on-screen pad). The same rule runs in the browser overlay
+        //    and the on-device resolver.
+        let suppressed = c.suppress_if.is_some_and(|m| surface.has(m))
+            || (c.virtual_gameplay
+                && surface.has(MODALITY_POINTER_FINE)
+                && !surface.has(MODALITY_TOUCH));
+        if suppressed {
+            disp.insert(i, entry(Disposition::Hidden, None, None, false));
+            continue;
         }
         need_plane.push(i);
     }
@@ -406,6 +417,113 @@ pub fn encode(res: &LayoutResolution, epoch: u32) -> Vec<u8> {
     buf
 }
 
+// ── Intent-table wire format (presentation_resolver module `intents` param) ──
+//
+// The on-device `presentation_resolver` PIC module can't parse a config's
+// `presentation.shell`, so the tooling serializes each control's resolver-
+// relevant intent into a compact blob param the module decodes into fixed
+// arrays. Plane affinity is an ordered preference of up to two planes, encoded
+// as one byte; priority and size-class reuse their enum discriminant order.
+//
+//   [count: u8]
+//   count × {
+//     [affinity:      u8]   AFFINITY_*
+//     [priority:      u8]   0 optional / 1 standard / 2 essential
+//     [min_size_class:u8]   0 compact / 1 regular / 2 expanded
+//     [suppress_if:   u16 LE] modality bit, 0 = none
+//     [flags:         u8]   INTENT_FLAG_* (bit0 = virtual_gameplay)
+//     [btn_name_len:  u8]   bind_physical name length, 0 = none
+//     [btn_name bytes]
+//   }
+
+pub const AFFINITY_CHROME: u8 = 0; // [Chrome]
+pub const AFFINITY_CONTENT: u8 = 1; // [Content]
+pub const AFFINITY_CHROME_CONTENT: u8 = 2; // [Chrome, Content]
+pub const AFFINITY_CONTENT_CHROME: u8 = 3; // [Content, Chrome]
+
+/// Maximum shell controls the on-device renderers handle (the fixed-array bound
+/// in both `presentation_resolver` and `content_controls`, `MAX_CONTROLS`).
+/// Config-gen rejects a shell with more, so controls never silently disappear.
+pub const MAX_SHELL_CONTROLS: usize = 16;
+
+/// Count of `id`-bearing controls in a config's `presentation.shell` (the set the
+/// resolver/content_controls process positionally). 0 when there is no shell.
+pub fn shell_control_count(config: &Value) -> usize {
+    config
+        .pointer("/presentation/shell/controls")
+        .and_then(|c| c.as_array())
+        .map(|c| {
+            c.iter()
+                .filter(|x| x.get("id").and_then(|v| v.as_str()).is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Encode a control's plane-affinity preference list to its wire code. An empty
+/// or unrecognized list defaults to chrome (matching `intent_from_control`).
+pub fn affinity_code(affinity: &[Plane]) -> u8 {
+    match affinity {
+        [Plane::Content] => AFFINITY_CONTENT,
+        [Plane::Chrome, Plane::Content] => AFFINITY_CHROME_CONTENT,
+        [Plane::Content, Plane::Chrome] => AFFINITY_CONTENT_CHROME,
+        _ => AFFINITY_CHROME,
+    }
+}
+
+/// Priority → wire code (matches the `Priority` enum discriminant order).
+pub fn priority_code(p: Priority) -> u8 {
+    match p {
+        Priority::Optional => 0,
+        Priority::Standard => 1,
+        Priority::Essential => 2,
+    }
+}
+
+/// Size class → wire code (matches the `SizeClass` enum discriminant order).
+pub fn size_class_code(s: SizeClass) -> u8 {
+    match s {
+        SizeClass::Compact => 0,
+        SizeClass::Regular => 1,
+        SizeClass::Expanded => 2,
+    }
+}
+
+/// Serialize control intents to the `presentation_resolver` `intents` blob
+/// param. The module mirrors this decode (drift-guarded). Truncated to 255
+/// controls / 255-byte button names (the on-device fixed-array bound).
+pub fn encode_intents(intents: &[ControlIntent]) -> Vec<u8> {
+    let n = intents.len().min(u8::MAX as usize);
+    let mut buf = Vec::with_capacity(1 + n * 6);
+    buf.push(n as u8);
+    for c in &intents[..n] {
+        buf.push(affinity_code(&c.affinity));
+        buf.push(priority_code(c.priority));
+        buf.push(size_class_code(c.min_size_class));
+        let sup = c.suppress_if.unwrap_or(0);
+        buf.extend_from_slice(&sup.to_le_bytes());
+        // flags byte: bit0 = virtual_gameplay.
+        buf.push(if c.virtual_gameplay {
+            INTENT_FLAG_VIRTUAL
+        } else {
+            0
+        });
+        match &c.bind_physical {
+            Some(name) => {
+                let nb = name.as_bytes();
+                let nb = &nb[..nb.len().min(u8::MAX as usize)];
+                buf.push(nb.len() as u8);
+                buf.extend_from_slice(nb);
+            }
+            None => buf.push(0),
+        }
+    }
+    buf
+}
+
+/// Intent flags-byte bit: a virtual gameplay control (dpad/stick/button_cluster).
+pub const INTENT_FLAG_VIRTUAL: u8 = 0x01;
+
 /// A decoded entry (identity is the position; the wire carries no id).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireEntry {
@@ -541,6 +659,10 @@ fn intent_from_control(ctl: &Value) -> Option<ControlIntent> {
         .get("suppress_if")
         .and_then(|v| v.as_str())
         .and_then(modality_bit);
+    let virtual_gameplay = matches!(
+        ctl.get("kind").and_then(|v| v.as_str()),
+        Some("dpad") | Some("stick") | Some("button_cluster")
+    );
     Some(ControlIntent {
         id,
         affinity,
@@ -548,6 +670,7 @@ fn intent_from_control(ctl: &Value) -> Option<ControlIntent> {
         min_size_class,
         bind_physical,
         suppress_if,
+        virtual_gameplay,
     })
 }
 
@@ -589,7 +712,7 @@ fn declared_buttons(panel: &Value) -> Option<Vec<String>> {
 /// chrome. The non-browser cases are checked at the *compact* size class — the
 /// smallest plausible viewport — so a control needing more room is caught.
 pub fn surface_from_config(config: &Value) -> Surface {
-    if let Some(m) = find_authority(config, "panel_surface_traits") {
+    let mut surf = if let Some(m) = find_authority(config, "panel_surface_traits") {
         let display_count = m.get("display_count").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
         let modalities = m
             .get("modalities")
@@ -609,7 +732,7 @@ pub fn surface_from_config(config: &Value) -> Surface {
         } else {
             u8::MAX
         };
-        return Surface {
+        Surface {
             size_class_w: SizeClass::Compact,
             modalities,
             display_count,
@@ -618,11 +741,10 @@ pub fn surface_from_config(config: &Value) -> Surface {
             physical_buttons,
             chrome_capacity: 0,
             content_capacity: if display_count > 0 { 64 } else { 0 },
-        };
-    }
-    if let Some(m) = find_authority(config, "linux_surface_traits") {
+        }
+    } else if let Some(m) = find_authority(config, "linux_surface_traits") {
         let display_count = m.get("display_count").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
-        return Surface {
+        Surface {
             size_class_w: SizeClass::Compact,
             // Linux host input paths (keyboard/pointer); scanned at runtime, but
             // for the lint assume the baseline present set.
@@ -633,17 +755,151 @@ pub fn surface_from_config(config: &Value) -> Surface {
             physical_buttons: 0,
             chrome_capacity: 0,
             content_capacity: if display_count > 0 { 64 } else { 0 },
+        }
+    } else {
+        Surface {
+            size_class_w: SizeClass::Compact,
+            modalities: MODALITY_KEY | MODALITY_POINTER_FINE,
+            display_count: 1,
+            chrome_region: true,
+            physical_buttons: 0,
+            chrome_capacity: 64,
+            content_capacity: 64,
+        }
+    };
+
+    // If an on-device `presentation_resolver` will run, the lint MUST resolve
+    // with the exact policy that module uses at runtime (its params, with the
+    // module's own defaults) — otherwise a lint-clean graph could overflow
+    // capacity or lack a button and resolve controls as hidden on silicon. Read
+    // those params here so build-time and runtime agree.
+    if let Some(r) = find_authority(config, "presentation_resolver") {
+        let p = |k: &str, d: u64| r.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
+        // Truncate EXACTLY as the module does (`p_u32(..) as u16` / `as u8`), so
+        // an out-of-range param resolves the same at build time and on silicon:
+        // e.g. content_capacity 65536 → u16 0 (not 65536), so the lint sees the
+        // controls-hidden reality instead of certifying a graph that fails live.
+        surf.content_capacity = (p("content_capacity", 8) as u32 as u16) as usize;
+        surf.chrome_capacity = (p("chrome_capacity", 0) as u32 as u16) as usize;
+        surf.physical_buttons = p("physical_buttons", 0) as u32 as u8;
+        surf.chrome_region = p("chrome_region", 0) as u32 != 0;
+    }
+    surf
+}
+
+/// Serialize a config's `presentation.shell.controls` to the on-device
+/// `presentation_resolver` module's `intents` blob param (see `encode_intents`).
+/// Empty when the config declares no shell — the tooling injects this so the
+/// bare-metal resolver gets the same control intents the host lint sees. The
+/// declaration order is preserved (it is the layout's positional identity).
+pub fn intents_from_shell(config: &Value) -> Vec<u8> {
+    let controls = match config
+        .pointer("/presentation/shell/controls")
+        .and_then(|c| c.as_array())
+    {
+        Some(c) if !c.is_empty() => c,
+        _ => return Vec::new(),
+    };
+    let intents: Vec<ControlIntent> = controls.iter().filter_map(intent_from_control).collect();
+    encode_intents(&intents)
+}
+
+/// Serialize a config's `presentation.shell.controls` to the on-device
+/// `content_controls` `controls` blob param: per control `[icon u8, verb u32 LE]`
+/// (prefixed by a count). The icon is derived from the control's `action`
+/// (`content_render::icon_for_action`); the verb hash is the FMP verb the
+/// control emits on tap. Declaration order matches the resolver's `intents` and
+/// the layout's positional entries, so a `content_controls` instance's controls
+/// line up 1:1 with the layout's dispositions. Empty when there's no shell.
+pub fn content_descriptors_from_shell(config: &Value) -> Vec<u8> {
+    use crate::content_render::{fnv1a32, icon_code, icon_for_action, verb_for_action, Icon};
+    let controls = match config
+        .pointer("/presentation/shell/controls")
+        .and_then(|c| c.as_array())
+    {
+        Some(c) if !c.is_empty() => c,
+        _ => return Vec::new(),
+    };
+    // One descriptor per `id`-bearing control, in declaration order — the SAME
+    // set/order `intents_from_shell` produces and the layout's entries use, so
+    // `disposition[i]` lines up with descriptor `i`. An action-less control gets
+    // a Generic icon and verb 0 (non-interactive) but still holds its slot.
+    let controls: Vec<&Value> = controls
+        .iter()
+        .filter(|c| c.get("id").and_then(|v| v.as_str()).is_some())
+        .collect();
+    let n = controls.len().min(u8::MAX as usize);
+    let mut buf = Vec::with_capacity(1 + n * 5);
+    buf.push(n as u8);
+    for c in &controls[..n] {
+        match c.get("action").and_then(|a| a.as_str()) {
+            // A transport action → icon + verb hash. An action outside the
+            // transport vocabulary (or no action) → Generic icon + verb 0
+            // (drawn but non-interactive), never a wrong verb.
+            Some(action) => {
+                let icon = icon_for_action(action);
+                let verb = verb_for_action(action).map_or(0, |v| fnv1a32(v.as_bytes()));
+                let icon = if verb == 0 { Icon::Generic } else { icon };
+                buf.push(icon_code(icon));
+                buf.extend_from_slice(&verb.to_le_bytes());
+            }
+            None => {
+                buf.push(icon_code(Icon::Generic));
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+    buf
+}
+
+/// `content_controls` is a TRANSPORT renderer: it draws tappable buttons and
+/// emits a transport verb on hit. A chrome-less panel auto-extends every control
+/// to the content plane, so a control content_controls can't actuate would draw
+/// as a dead/wrong button. When a `content_controls` module is in the graph,
+/// every shell control must be a tappable transport control (kind button/toggle
+/// with a transport `action`). Returns the first offender `(id, reason)` so
+/// config-gen rejects it instead of shipping a dead control. `None` = ok (incl.
+/// no shell → the module uses its built-in prev/play/next).
+pub fn content_controls_unrenderable(config: &Value) -> Option<(String, String)> {
+    use crate::content_render::verb_for_action;
+    let controls = config
+        .pointer("/presentation/shell/controls")
+        .and_then(|c| c.as_array())?;
+    let surf = surface_from_config(config);
+    for c in controls {
+        let Some(id) = c.get("id").and_then(|v| v.as_str()) else {
+            continue;
         };
+        // Only controls that can resolve to the CONTENT plane reach
+        // content_controls. On a chrome-less surface every control auto-extends
+        // to content; on a surface WITH chrome, only content-affinity controls
+        // do — chrome-assigned controls (status/menu in a mixed-backend shell)
+        // are rendered by the chrome/browser overlay and must NOT be constrained
+        // to content_controls' transport vocabulary.
+        let reaches_content = !surf.chrome_region
+            || intent_from_control(c).is_none_or(|i| i.affinity.contains(&Plane::Content));
+        if !reaches_content {
+            continue;
+        }
+        let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "button" && kind != "toggle" {
+            return Some((
+                id.to_string(),
+                format!("has kind `{kind}` — content_controls draws only tappable buttons"),
+            ));
+        }
+        match c.get("action").and_then(|a| a.as_str()) {
+            Some(a) if verb_for_action(a).is_some() => {}
+            Some(a) => {
+                return Some((
+                    id.to_string(),
+                    format!("action `{a}` is outside content_controls' transport vocabulary"),
+                ))
+            }
+            None => return Some((id.to_string(), "has no `action`".to_string())),
+        }
     }
-    Surface {
-        size_class_w: SizeClass::Compact,
-        modalities: MODALITY_KEY | MODALITY_POINTER_FINE,
-        display_count: 1,
-        chrome_region: true,
-        physical_buttons: 0,
-        chrome_capacity: 64,
-        content_capacity: 64,
-    }
+    None
 }
 
 /// Lint a config's presentation shell against its surface. Returns one message

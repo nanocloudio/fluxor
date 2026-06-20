@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["cm5", "bcm2712", "rp2350", "wasm"]
+
+# On-device placement resolver (.context/rfc_adaptive_presentation.md §10). Maps
+# a stream of `input::surface_traits` records onto a `presentation.layout` — the
+# per-control disposition (chrome / content / bound / hidden) + physical-button
+# legend — so a Linux-display or bare-metal-panel surface adapts its UI without a
+# host. The browser runs the same algorithm in JS; this is its silicon twin.
+#
+# PIC module: the control-intent table + surface policy (chrome region, button
+# count, plane capacities) are embedded via define_params! in mod.rs. The
+# tooling serializes `presentation.shell.controls` into the `intents` blob param
+# (`tools/src/presentation_resolver.rs::encode_intents`). The resolve + encode
+# logic mirrors that host reference (drift-guarded).
+
+[[ports]]
+name = "traits"
+direction = "input"
+content_type = "SurfaceTraits"
+
+[[ports]]
+name = "layout"
+direction = "output"
+content_type = "PresentationLayout"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "placement resolver — emits a small layout record per surface-state change, not a sustained byte stream"

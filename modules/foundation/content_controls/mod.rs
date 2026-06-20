@@ -31,10 +31,51 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
+// Shared 5×7 font (same file the host content_render.rs includes) — glyph /
+// draw_glyph / draw_text / GLYPH_W / GLYPH_H, for transport-button labels.
+include!("../../sdk/font5x7.rs");
 
 use abi::contracts::input::pointer as ptr;
 
-const MAX_CONTROLS: usize = 8;
+/// Short label drawn under a transport icon.
+fn label_for(icon: u8) -> &'static str {
+    match icon {
+        ICON_PLAY => "PLAY",
+        ICON_PAUSE => "PAUSE",
+        ICON_NEXT => "NEXT",
+        ICON_PREV => "PREV",
+        ICON_STOP => "STOP",
+        _ => "",
+    }
+}
+
+/// Draw a label centred along the bottom edge of `r`, at the largest scale whose
+/// rendered width fits, when the button is tall enough to spare the rows.
+fn draw_label(fb: &mut [u16], stride: u16, r: Rect, text: &str, color: u16) {
+    if text.is_empty() || r.w < GLYPH_W + 2 || r.h < GLYPH_H + 6 {
+        return;
+    }
+    // Labels are ASCII, so byte length == glyph count (avoids pulling
+    // `str::chars().count()`, which the PIC runtime doesn't link).
+    let chars = text.len() as u16;
+    if chars == 0 {
+        return;
+    }
+    // Pick scale 2 if it fits, else 1.
+    let text_w = |s: u16| chars * (GLYPH_W + 1) * s;
+    let scale = if text_w(2) + 2 <= r.w { 2 } else { 1 };
+    let tw = text_w(scale).saturating_sub(scale); // no trailing gap
+    let x = r.x + (r.w.saturating_sub(tw)) / 2;
+    let y = r.y + r.h.saturating_sub(GLYPH_H * scale + 1);
+    draw_text(fb, stride, x, y, text, scale, color);
+}
+
+// Must match the resolver's MAX_CONTROLS and the host MAX_SHELL_CONTROLS so a
+// shell's controls line up 1:1 with the layout's entries; config-gen rejects
+// shells that exceed it (no silent drop).
+const MAX_CONTROLS: usize = 16;
+// Max stored legend button-name length (matches the resolver's MAX_BTN_LEN).
+const MAX_BTN_LEN: usize = 24;
 
 // ── Icon codes (mirror tools content_render::Icon ordering) ──────────
 const ICON_PLAY: u8 = 0;
@@ -43,6 +84,19 @@ const ICON_NEXT: u8 = 2;
 const ICON_PREV: u8 = 3;
 const ICON_STOP: u8 = 4;
 const ICON_GENERIC: u8 = 5;
+
+// presentation.layout wire format (mirror of the resolver / host reference):
+//   [0]=MSG_LAYOUT [1]=entry_count [2]=legend_count [3]=0 [4..8]=epoch
+//   entries: entry_count × [disp, plane, flags, legend_ref]
+//   legend:  legend_count × [name_len, name…]
+const MSG_LAYOUT: u8 = 0x01;
+const DISP_CONTENT: u8 = 1;
+const DISP_BOUND: u8 = 2;
+const LEGEND_NONE: u8 = 0xFF;
+// Per-read layout buffer. A frame is written atomically, so a read returns a run
+// of complete records (possibly + a trailing partial, which is carried to the
+// next read — see `s.carry`). We apply the LAST complete record (coalesce).
+const LAYOUT_BUF: usize = 512;
 
 // ── Theme (RGB565) ───────────────────────────────────────────────────
 const COL_BG: u16 = rgb565(16, 16, 20);
@@ -159,14 +213,39 @@ fn draw_icon(fb: &mut [u16], stride: u16, r: Rect, icon: u8, c: u16) {
     let ox = r.x + r.w.saturating_sub(iw) / 2;
     let oy = r.y + r.h.saturating_sub(ih) / 2;
     match icon {
-        ICON_GENERIC | ICON_STOP => fill_rect(fb, stride, Rect { x: ox, y: oy, w: iw, h: ih }, c),
+        ICON_GENERIC | ICON_STOP => fill_rect(
+            fb,
+            stride,
+            Rect {
+                x: ox,
+                y: oy,
+                w: iw,
+                h: ih,
+            },
+            c,
+        ),
         ICON_PAUSE => {
             let bw = (iw / 3).max(1);
-            fill_rect(fb, stride, Rect { x: ox, y: oy, w: bw, h: ih }, c);
             fill_rect(
                 fb,
                 stride,
-                Rect { x: ox + iw.saturating_sub(bw), y: oy, w: bw, h: ih },
+                Rect {
+                    x: ox,
+                    y: oy,
+                    w: bw,
+                    h: ih,
+                },
+                c,
+            );
+            fill_rect(
+                fb,
+                stride,
+                Rect {
+                    x: ox + iw.saturating_sub(bw),
+                    y: oy,
+                    w: bw,
+                    h: ih,
+                },
                 c,
             );
         }
@@ -176,13 +255,28 @@ fn draw_icon(fb: &mut [u16], stride: u16, r: Rect, icon: u8, c: u16) {
             fill_rect(
                 fb,
                 stride,
-                Rect { x: ox + iw.saturating_sub(bw), y: oy, w: bw, h: ih },
+                Rect {
+                    x: ox + iw.saturating_sub(bw),
+                    y: oy,
+                    w: bw,
+                    h: ih,
+                },
                 c,
             );
         }
         ICON_PREV => {
             let bw = 2.min(iw);
-            fill_rect(fb, stride, Rect { x: ox, y: oy, w: bw, h: ih }, c);
+            fill_rect(
+                fb,
+                stride,
+                Rect {
+                    x: ox,
+                    y: oy,
+                    w: bw,
+                    h: ih,
+                },
+                c,
+            );
             draw_play(fb, stride, ox + bw, oy, iw.saturating_sub(bw), ih, true, c);
         }
         _ => draw_play(fb, stride, ox, oy, iw, ih, false, c), // ICON_PLAY
@@ -202,6 +296,7 @@ fn hit_test(rects: &[Rect], n: usize, x: u16, y: u16) -> Option<usize> {
 struct State {
     syscalls: *const SyscallTable,
     in_chan: i32,
+    layout_chan: i32,
     raster_chan: i32,
     cmd_chan: i32,
     fb: *mut u16,
@@ -212,6 +307,28 @@ struct State {
     icons: [u8; MAX_CONTROLS],
     verbs: [u32; MAX_CONTROLS],
     pressed: [bool; MAX_CONTROLS],
+    // Per-control disposition from the latest presentation.layout. Only read
+    // once `have_layout` is set and a layout port is wired; visibility when
+    // unwired is decided by `recompute_visible` (show all), not this default.
+    disp: [u8; MAX_CONTROLS],
+    have_layout: bool,
+    // Legend (RFC §14): per-entry legend index (0xFF = none) + the legend's
+    // button-name table, decoded from the layout record. Drawn as a strip so
+    // BOUND physical controls are discoverable on a displayed panel.
+    legend_ref: [u8; MAX_CONTROLS],
+    legend: [[u8; MAX_BTN_LEN]; MAX_CONTROLS],
+    legend_lens: [u8; MAX_CONTROLS],
+    legend_n: usize,
+    // Incomplete trailing bytes from the previous layout read, kept so a record
+    // split across reads is reassembled rather than lost (the channel read
+    // CONSUMES, so a dropped partial would desync every later record). Always
+    // starts on a record boundary (the byte after the last complete record).
+    carry: [u8; LAYOUT_BUF],
+    carry_len: usize,
+    // The visible subset (control indices) + their grid rects. `rects[k]` is the
+    // rect for control `visible[k]`. Recomputed when the layout changes.
+    visible: [usize; MAX_CONTROLS],
+    visible_n: usize,
     rects: [Rect; MAX_CONTROLS],
     dirty: bool,
     // Frame streaming: a frame is written to the raster channel in chunks
@@ -221,8 +338,132 @@ struct State {
     initialized: bool,
 }
 
+/// Decode the `controls` blob param (`[count][icon u8, verb u32 LE]…`) into the
+/// control table. Mirrors the host `content_descriptors_from_shell`.
+fn parse_controls(s: &mut State, d: *const u8, len: usize) {
+    s.n = 0;
+    if d.is_null() || len < 1 {
+        return;
+    }
+    let rd = |o: usize| -> u8 { unsafe { *d.add(o) } };
+    let count = rd(0) as usize;
+    let mut off = 1usize;
+    let mut i = 0usize;
+    while i < count && i < MAX_CONTROLS {
+        if off + 5 > len {
+            break;
+        }
+        s.icons[i] = rd(off);
+        s.verbs[i] = (rd(off + 1) as u32)
+            | ((rd(off + 2) as u32) << 8)
+            | ((rd(off + 3) as u32) << 16)
+            | ((rd(off + 4) as u32) << 24);
+        off += 5;
+        i += 1;
+    }
+    s.n = i;
+}
+
+/// End offset of the complete presentation.layout record starting at `off`, or
+/// `None` if `buf[off..n]` does not hold a whole record (incomplete tail /
+/// desync). Length = 8 header + entry_count×4 + Σ legend (1 + name_len).
+fn record_end(buf: &[u8], n: usize, off: usize) -> Option<usize> {
+    if off + 8 > n || buf[off] != MSG_LAYOUT {
+        return None;
+    }
+    let count = buf[off + 1] as usize;
+    let legend_count = buf[off + 2] as usize;
+    let mut o = off + 8 + count * 4;
+    if o > n {
+        return None;
+    }
+    for _ in 0..legend_count {
+        if o >= n {
+            return None;
+        }
+        o += 1 + buf[o] as usize;
+        if o > n {
+            return None;
+        }
+    }
+    Some(o)
+}
+
+/// Decode the layout record at `off` into per-control disposition + legend ref
+/// and the legend name table.
+fn apply_layout(s: &mut State, buf: &[u8], off: usize) {
+    let count = (buf[off + 1] as usize).min(MAX_CONTROLS);
+    let legend_count = (buf[off + 2] as usize).min(MAX_CONTROLS);
+    s.disp = [DISP_CONTENT; MAX_CONTROLS];
+    s.legend_ref = [LEGEND_NONE; MAX_CONTROLS];
+    for i in 0..count {
+        let e = off + 8 + i * 4;
+        s.disp[i] = buf[e];
+        s.legend_ref[i] = buf[e + 3];
+    }
+    let mut o = off + 8 + (buf[off + 1] as usize) * 4;
+    s.legend_n = 0;
+    for _ in 0..legend_count {
+        let nl = buf[o] as usize;
+        let take = nl.min(MAX_BTN_LEN);
+        for k in 0..take {
+            s.legend[s.legend_n][k] = buf[o + 1 + k];
+        }
+        s.legend_lens[s.legend_n] = take as u8;
+        s.legend_n += 1;
+        o += 1 + nl;
+    }
+}
+
+/// Height (px) reserved at the bottom of the framebuffer for the legend strip —
+/// one line per BOUND control with a legend name (0 when none, the common touch
+/// case).
+fn legend_band_px(s: &State) -> u16 {
+    let mut lines = 0u16;
+    for i in 0..s.n {
+        if s.disp[i] == DISP_BOUND && s.legend_ref[i] != LEGEND_NONE {
+            lines += 1;
+        }
+    }
+    if lines == 0 {
+        0
+    } else {
+        lines * (GLYPH_H + 2)
+    }
+}
+
+/// Rebuild the visible subset (controls the resolver placed on the content
+/// plane) and its grid; marks the frame dirty. Reserves a bottom band for the
+/// bound-control legend.
+fn recompute_visible(s: &mut State) {
+    let content_h = s.height.saturating_sub(legend_band_px(s));
+    // When a `layout` port is WIRED the resolver is authoritative: show nothing
+    // until the first layout arrives, then only the controls it placed on the
+    // content plane — never a chrome-only descriptor as a dead duplicate button,
+    // and no incorrect initial frame in the pre-layout window. When UNWIRED
+    // (standalone built-in transport) there is no resolver, so show every
+    // control. `layout_chan` is resolved in module_new before this first runs.
+    let resolver_driven = s.layout_chan >= 0;
+    let mut vn = 0usize;
+    for i in 0..s.n {
+        let show = if resolver_driven {
+            s.have_layout && s.disp[i] == DISP_CONTENT
+        } else {
+            true
+        };
+        if show {
+            s.visible[vn] = i;
+            vn += 1;
+        }
+    }
+    s.visible_n = vn;
+    grid_layout(vn, s.width, content_h, s.pad, &mut s.rects);
+    s.dirty = true;
+}
+
 mod params_def {
     use super::p_u32;
+    use super::parse_controls;
     use super::State;
     use super::SCHEMA_MAX;
 
@@ -235,6 +476,10 @@ mod params_def {
             => |s, d, len| { s.height = p_u32(d, len, 0, 40) as u16; };
         3, pad, u32, 2
             => |s, d, len| { s.pad = p_u32(d, len, 0, 2) as u16; };
+        // Control-descriptor table from the shell (icon + verb per control);
+        // injected by config-gen. Absent → the built-in prev/play/next transport.
+        4, controls, blob, 0
+            => |s, d, len| { parse_controls(s, d, len); };
     }
 }
 
@@ -287,12 +532,24 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
         s.in_chan = -1;
+        s.layout_chan = -1;
         s.raster_chan = -1;
         s.cmd_chan = -1;
         s.fb = core::ptr::null_mut();
         s.pad = 2;
         s.width = 160;
         s.height = 40;
+        s.n = 0;
+        s.disp = [DISP_CONTENT; MAX_CONTROLS];
+        s.have_layout = false;
+        s.legend_ref = [LEGEND_NONE; MAX_CONTROLS];
+        s.legend = [[0; MAX_BTN_LEN]; MAX_CONTROLS];
+        s.legend_lens = [0; MAX_CONTROLS];
+        s.legend_n = 0;
+        s.carry = [0; LAYOUT_BUF];
+        s.carry_len = 0;
+        s.visible = [0; MAX_CONTROLS];
+        s.visible_n = 0;
         s.dirty = true;
         s.pending = false;
         s.pending_off = 0;
@@ -306,14 +563,16 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        // Fixed transport layout: prev, play/pause, next.
-        s.n = 3;
-        s.icons[0] = ICON_PREV;
-        s.icons[1] = ICON_PLAY;
-        s.icons[2] = ICON_NEXT;
-        s.verbs[0] = fnv1a(b"prev");
-        s.verbs[1] = fnv1a(b"toggle");
-        s.verbs[2] = fnv1a(b"next");
+        // No `controls` descriptor table (no shell) → the built-in transport.
+        if s.n == 0 {
+            s.n = 3;
+            s.icons[0] = ICON_PREV;
+            s.icons[1] = ICON_PLAY;
+            s.icons[2] = ICON_NEXT;
+            s.verbs[0] = fnv1a(b"prev");
+            s.verbs[1] = fnv1a(b"toggle");
+            s.verbs[2] = fnv1a(b"next");
+        }
         for p in s.pressed.iter_mut() {
             *p = false;
         }
@@ -336,6 +595,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if !s.initialized {
             s.in_chan = dev_channel_port(sys, 0, 0); // input port 0: pointer
+            s.layout_chan = dev_channel_port(sys, 0, 1); // input port 1: layout (optional)
             s.raster_chan = dev_channel_port(sys, 1, 0); // output 0: raster
             s.cmd_chan = dev_channel_port(sys, 1, 1); // output 1: commands
             let px = (s.width as u32) * (s.height as u32);
@@ -343,11 +603,59 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if s.fb.is_null() {
                 return -3;
             }
-            grid_layout(s.n, s.width, s.height, s.pad, &mut s.rects);
+            recompute_visible(s);
             s.initialized = true;
         }
 
-        // Drain pointer events → hit-test → emit verb + repaint.
+        // Drain presentation.layout records. Each was written atomically (the
+        // kernel FIFO write is all-or-nothing), so the channel holds a run of
+        // complete records — but a single read can return a trailing PARTIAL
+        // record, and the read consumes it, so we must retain that tail
+        // (`s.carry`) and prepend it to the next read or framing desyncs. Apply
+        // only the LAST complete record (coalesce to the newest surface state).
+        if s.layout_chan >= 0 {
+            loop {
+                let mut work = [0u8; LAYOUT_BUF * 2];
+                let cl = s.carry_len.min(LAYOUT_BUF);
+                work[..cl].copy_from_slice(&s.carry[..cl]);
+                let nread =
+                    (sys.channel_read)(s.layout_chan, work.as_mut_ptr().add(cl), LAYOUT_BUF);
+                let got = if nread > 0 { nread as usize } else { 0 };
+                if got == 0 && cl == 0 {
+                    break;
+                }
+                let total = cl + got;
+
+                let mut off = 0usize;
+                let mut last: Option<usize> = None;
+                while let Some(end) = record_end(&work, total, off) {
+                    last = Some(off);
+                    off = end;
+                }
+                if let Some(start) = last {
+                    apply_layout(s, &work, start);
+                    s.have_layout = true;
+                    recompute_visible(s);
+                }
+                // Retain the incomplete tail (starts on a record boundary). Drop
+                // it if it somehow exceeds the buffer (malformed/oversized record)
+                // to stay bounded.
+                let tail = total - off;
+                if tail <= LAYOUT_BUF {
+                    s.carry[..tail].copy_from_slice(&work[off..total]);
+                    s.carry_len = tail;
+                } else {
+                    s.carry_len = 0;
+                }
+                // Nothing new and nothing progressed → stop (avoid spinning on a
+                // stuck partial that will never complete).
+                if got < LAYOUT_BUF {
+                    break;
+                }
+            }
+        }
+
+        // Drain pointer events → hit-test the visible rects → emit verb + repaint.
         if s.in_chan >= 0 {
             let mut buf = [0u8; ptr::EVENT_SIZE];
             loop {
@@ -359,9 +667,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let x = i16::from_le_bytes([buf[8], buf[9]]);
                 let y = i16::from_le_bytes([buf[10], buf[11]]);
                 if kind == ptr::KIND_DOWN && x >= 0 && y >= 0 {
-                    if let Some(i) = hit_test(&s.rects, s.n, x as u16, y as u16) {
+                    if let Some(slot) = hit_test(&s.rects, s.visible_n, x as u16, y as u16) {
+                        let i = s.visible[slot];
                         s.pressed[i] = true;
-                        if s.cmd_chan >= 0 {
+                        // verb 0 = a non-interactive control (no `action`).
+                        if s.cmd_chan >= 0 && s.verbs[i] != 0 {
                             msg_write_empty(sys, s.cmd_chan, s.verbs[i]);
                         }
                         s.dirty = true;
@@ -390,12 +700,61 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             for p in fb.iter_mut() {
                 *p = COL_BG;
             }
-            for i in 0..s.n {
-                let r = s.rects[i];
-                let bg = if s.pressed[i] { COL_PRESSED } else { COL_BUTTON };
+            for slot in 0..s.visible_n {
+                let i = s.visible[slot];
+                let r = s.rects[slot];
+                let bg = if s.pressed[i] {
+                    COL_PRESSED
+                } else {
+                    COL_BUTTON
+                };
                 fill_rect(fb, s.width, r, bg);
                 draw_border(fb, s.width, r, COL_BORDER);
-                draw_icon(fb, s.width, r, s.icons[i], COL_ICON);
+                // When a label fits, draw the icon in the upper band and the
+                // label along the bottom; otherwise the icon uses the whole cell.
+                let label = label_for(s.icons[i]);
+                let icon_rect = if !label.is_empty() && r.h >= GLYPH_H + 6 {
+                    Rect {
+                        x: r.x,
+                        y: r.y,
+                        w: r.w,
+                        h: r.h.saturating_sub(GLYPH_H + 4),
+                    }
+                } else {
+                    r
+                };
+                draw_icon(fb, s.width, icon_rect, s.icons[i], COL_ICON);
+                draw_label(fb, s.width, r, label, COL_ICON);
+            }
+            // Legend strip (RFC §14): one `BUTTON: LABEL` line per BOUND control,
+            // in the reserved bottom band, so physical-button controls are
+            // discoverable. Common touch panels have no bound controls → nothing.
+            let band = legend_band_px(s);
+            if band > 0 {
+                let mut y = s.height.saturating_sub(band) + 1;
+                for i in 0..s.n {
+                    if s.disp[i] != DISP_BOUND || s.legend_ref[i] == LEGEND_NONE {
+                        continue;
+                    }
+                    let li = s.legend_ref[i] as usize;
+                    if li >= s.legend_n {
+                        continue;
+                    }
+                    let bl = s.legend_lens[li] as usize;
+                    let mut cx = 1u16;
+                    cx += draw_bytes(fb, s.width, cx, y, &s.legend[li][..bl], 1, COL_ICON);
+                    cx += 2 + draw_text(fb, s.width, cx + 2, y, ":", 1, COL_BORDER);
+                    draw_text(
+                        fb,
+                        s.width,
+                        cx + 4,
+                        y,
+                        label_for(s.icons[i]),
+                        1,
+                        COL_PRESSED,
+                    );
+                    y += GLYPH_H + 2;
+                }
             }
             s.dirty = false;
             s.pending = true;
@@ -437,8 +796,16 @@ pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
         // raster: one RGB565 frame is written atomically, so the buffer must
         // hold a whole frame (≈ width*height*2). 96 KiB covers a 240×80 panel
         // (38 400 B) with headroom up to ~256×192.
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 96 * 1024 },
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: 64 }, // commands (FMP)
+        ChannelHint {
+            port_type: 1,
+            port_index: 0,
+            buffer_size: 96 * 1024,
+        },
+        ChannelHint {
+            port_type: 1,
+            port_index: 1,
+            buffer_size: 64,
+        }, // commands (FMP)
     ];
     unsafe { write_channel_hints(out, max_len, &hints) }
 }

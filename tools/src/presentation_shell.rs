@@ -37,6 +37,12 @@ pub const CONTROL_KINDS: &[&str] = &[
     "status",
 ];
 
+/// Max byte length of a `bind_physical` name. MUST match the on-device legend
+/// store `MAX_BTN_LEN` in `presentation_resolver` and `content_controls` — those
+/// PIC modules truncate a longer bound name, which would diverge the host and
+/// device legends, so the validator rejects names over this length.
+pub const BIND_PHYSICAL_MAX: usize = 24;
+
 /// Semantic placement groups (RFC §7.2).
 pub const PLACEMENTS: &[&str] = &[
     "primary_start",
@@ -46,6 +52,21 @@ pub const PLACEMENTS: &[&str] = &[
     "transient",
     "above_content",
     "debug",
+];
+
+/// Named superimposed-overlay regions (RFC §11.3 `overlay_regions`). MUST match
+/// the `OVERLAY_REGION` map in `browser_overlay_runtime.js` (pinned by
+/// `tools/tests/browser_overlay_runtime_surface.rs`) — an unknown name would
+/// silently default to a corner at runtime, so the validator rejects it.
+pub const OVERLAY_REGIONS: &[&str] = &[
+    "left_third",
+    "right_third",
+    "center_third",
+    "top_start",
+    "top_end",
+    "bottom_start",
+    "bottom_end",
+    "bottom_center",
 ];
 
 /// Media profiles (RFC §16).
@@ -261,6 +282,21 @@ fn validate_intent(ctl: &Value, id: &str) -> Result<(), String> {
                 "control `{id}`: `bind_physical` must be a non-empty physical-control id"
             ));
         }
+        // The on-device legend (presentation_resolver / content_controls
+        // MAX_BTN_LEN) truncates a bound name to BIND_PHYSICAL_MAX bytes, while
+        // the host overlay carries the full string. A longer name would render
+        // a different legend on host vs device, and two names sharing a
+        // BIND_PHYSICAL_MAX-byte prefix would collapse to the same on-device
+        // legend. Reject at config time so the two implementations never diverge.
+        if b.len() > BIND_PHYSICAL_MAX {
+            return Err(format!(
+                "control `{id}`: `bind_physical` is {} bytes; the on-device legend \
+                 truncates bound names to {BIND_PHYSICAL_MAX}, so a longer name would \
+                 render differently on host and device (and names sharing a \
+                 {BIND_PHYSICAL_MAX}-byte prefix would collapse) — shorten it",
+                b.len()
+            ));
+        }
     }
     if let Some(o) = ctl.get("overlay") {
         if !o.is_boolean() {
@@ -272,9 +308,13 @@ fn validate_intent(ctl: &Value, id: &str) -> Result<(), String> {
             .as_array()
             .ok_or_else(|| format!("control `{id}`: `overlay_regions` must be an array"))?;
         for r in arr {
-            if !r.is_string() {
+            let name = r.as_str().ok_or_else(|| {
+                format!("control `{id}`: `overlay_regions` entries must be strings")
+            })?;
+            if !OVERLAY_REGIONS.contains(&name) {
                 return Err(format!(
-                    "control `{id}`: `overlay_regions` entries must be strings"
+                    "control `{id}`: `overlay_regions` entry `{name}` is not a known region \
+                     (one of {OVERLAY_REGIONS:?}) — an unknown name renders at a default corner"
                 ));
             }
         }

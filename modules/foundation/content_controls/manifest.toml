@@ -13,13 +13,23 @@ hardware_targets = ["cm5", "bcm2712", "wasm"]
 # browser canvas drawing its own controls). The pixel + hit-test logic mirrors
 # the host-unit-tested `tools/src/content_render.rs`.
 #
-# PIC module: param schema (width / height / pad) is embedded via define_params!
-# in mod.rs; the transport layout is fixed.
+# PIC module: param schema (width / height / pad / controls) is embedded via
+# define_params! in mod.rs. With a `presentation.shell`, config-gen injects the
+# `controls` descriptor table and the module renders those controls, hiding the
+# ones the `presentation.layout` (optional `layout` input) does not place on the
+# content plane; with no shell it draws the built-in prev / play-pause / next.
 
 [[ports]]
 name = "pointer"
 direction = "input"
 content_type = "PointerEvents"
+
+# Optional: resolved layout from `presentation_resolver`. When wired, the module
+# shows only the controls placed on the content plane; unwired → all are shown.
+[[ports]]
+name = "layout"
+direction = "input"
+content_type = "PresentationLayout"
 
 [[ports]]
 name = "raster"

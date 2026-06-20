@@ -10,7 +10,13 @@
 //! ## Buffer Modes
 //!
 //! Each channel's buffer supports two usage modes:
-//! - **FIFO:** Ring buffer via channel_write/channel_read (copy semantics, partial OK)
+//! - **FIFO:** Ring buffer via channel_write/channel_read (copy semantics). A
+//!   `channel_write` is **all-or-nothing**: it writes the whole record or
+//!   nothing and returns `len` or `CHAN_EAGAIN` — never a partial byte count
+//!   (`ringbuf::write` refuses a write that exceeds free space, since a partial
+//!   write would corrupt record framing). A `channel_read` MAY be partial: it
+//!   returns up to `len` bytes (a record-framed reader frames by length / keeps
+//!   a carry for a split tail).
 //! - **Mailbox:** Zero-copy via buffer_acquire_write/release/acquire_read/release
 //!
 //! Mailbox mode is not a separate channel type — it is enabled only when the

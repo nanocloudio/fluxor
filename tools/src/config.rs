@@ -2637,6 +2637,101 @@ fn build_module_entry(
         MODULE_ENTRY_HEADER_SIZE + params_len
     };
 
+    // The on-device renderers (presentation_resolver, content_controls) process
+    // a fixed `MAX_SHELL_CONTROLS` controls; a shell with more would silently
+    // drop the overflow. Reject it at build time so config, resolver, and
+    // content_controls agree on capacity.
+    if type_name == "presentation_resolver" || type_name == "content_controls" {
+        let n = crate::presentation_resolver::shell_control_count(config);
+        let max = crate::presentation_resolver::MAX_SHELL_CONTROLS;
+        if n > max {
+            return Err(Error::Config(format!(
+                "module '{name}': presentation.shell declares {n} controls, exceeding the \
+                 on-device limit of {max} ({type_name} would silently drop the rest) — \
+                 reduce the control count",
+            )));
+        }
+    }
+
+    // The resolver stores its capacity policy in u16/u8 fields, so a value that
+    // overflows would WRAP on silicon (content_capacity: 65536 → 0, hiding every
+    // control). Reject out-of-range values rather than silently truncating.
+    if type_name == "presentation_resolver" {
+        for (k, max) in [
+            ("physical_buttons", u8::MAX as u64),
+            ("content_capacity", u16::MAX as u64),
+            ("chrome_capacity", u16::MAX as u64),
+        ] {
+            if let Some(v) = module.get(k).and_then(|v| v.as_u64()) {
+                if v > max {
+                    return Err(Error::Config(format!(
+                        "module '{name}': {k} = {v} exceeds the on-device maximum {max} \
+                         (it would wrap to a smaller value on silicon)",
+                    )));
+                }
+            }
+        }
+    }
+
+    // The on-device `presentation_resolver` can't parse `presentation.shell`,
+    // so inject the serialized control-intent table as its `intents` blob (TLV
+    // tag 1) directly from the config — the same intents the host lint resolves.
+    // One TLV entry (≤255 bytes); a larger shell would need chunking (not v1).
+    if type_name == "presentation_resolver" {
+        let intents = crate::presentation_resolver::intents_from_shell(config);
+        if !intents.is_empty() {
+            if intents.len() > 255 {
+                return Err(Error::Config(format!(
+                    "module '{name}': presentation.shell serializes to {} intent bytes, \
+                     exceeding the 255-byte single-TLV limit — reduce controls",
+                    intents.len()
+                )));
+            }
+            if base + extra_len + 2 + intents.len() < entry.len() {
+                entry[base + extra_len] = 1; // tag 1 = intents
+                entry[base + extra_len + 1] = intents.len() as u8;
+                entry[base + extra_len + 2..base + extra_len + 2 + intents.len()]
+                    .copy_from_slice(&intents);
+                extra_len += 2 + intents.len();
+            }
+        }
+    }
+
+    // `content_controls` renders the shell's content-plane controls: inject the
+    // control-descriptor table (icon + verb-hash per control, declaration order)
+    // as its `controls` blob (TLV tag 4) so its controls line up 1:1 with the
+    // resolver's `intents`/layout. Absent a shell, the module keeps its built-in
+    // prev/play/next transport.
+    if type_name == "content_controls" {
+        // content_controls only actuates tappable transport controls; reject a
+        // shell control it would render as a dead/wrong button (H2).
+        if let Some((id, why)) = crate::presentation_resolver::content_controls_unrenderable(config)
+        {
+            return Err(Error::Config(format!(
+                "module '{name}': control `{id}` {why} — content_controls renders only \
+                 button/toggle transport controls; move it to a chrome/browser surface or a \
+                 richer content renderer",
+            )));
+        }
+        let descriptors = crate::presentation_resolver::content_descriptors_from_shell(config);
+        if !descriptors.is_empty() {
+            if descriptors.len() > 255 {
+                return Err(Error::Config(format!(
+                    "module '{name}': presentation.shell serializes to {} descriptor bytes, \
+                     exceeding the 255-byte single-TLV limit — reduce controls",
+                    descriptors.len()
+                )));
+            }
+            if base + extra_len + 2 + descriptors.len() < entry.len() {
+                entry[base + extra_len] = 4; // tag 4 = controls
+                entry[base + extra_len + 1] = descriptors.len() as u8;
+                entry[base + extra_len + 2..base + extra_len + 2 + descriptors.len()]
+                    .copy_from_slice(&descriptors);
+                extra_len += 2 + descriptors.len();
+            }
+        }
+    }
+
     // Every numeric protection field below is range-checked. Typos
     // and overflows produce explicit `Error::Config` at build time
     // rather than silent `as u32` / `as u16` truncation; the
