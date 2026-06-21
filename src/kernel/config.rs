@@ -502,7 +502,28 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 ///              Otherwise `max(module_hint, buffer_bytes)` is the
 ///              size requested from `channel_open_for_module`.
 pub const GRAPH_EDGE_SIZE: usize = 8;
-pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + 16; // header + edges + domain metadata
+/// Per-domain metadata entry, bytes: `tick_us:u16 | exec_mode:u8 |
+/// adaptive_flags:u8` = 4. The formerly-reserved byte 3 now carries
+/// `adaptive_flags` (RFC adaptive_tick §8) — a behaviour-only change, no growth.
+/// `tick_min_us`/`tick_max_us` are deliberately NOT in this (checksummed) entry:
+/// they ride in the POST-BODY adaptive section past `total_size` (see
+/// `ADAPTIVE_POST_SIZE`), because growing the checksummed `body_size` hangs the
+/// bare-metal CM5 boot. So the entry stays 4 bytes and `body_size`/CRC are
+/// unchanged. The blob format version is NOT bumped (latest-only; kernel + tools
+/// ship together) — a stale blob is rejected by the body-size/CRC check.
+pub const DOMAIN_META_ENTRY_SIZE: usize = 4;
+pub const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
+/// Adaptive-tick post-body section: 4 domains × `[tick_min_us:u16, tick_max_us:u16]`.
+/// Stored AFTER the checksummed body (past `total_size`), never inside
+/// `body_size` — growing `body_size` hangs the bare-metal CM5 boot, but trailing
+/// bytes past it are harmless (both rig-proven). See the read site in
+/// `read_config_from_slice`.
+pub const ADAPTIVE_POST_SIZE: usize = 16;
+/// Valid per-domain tick range (µs); mirrors the tools `validate_adaptive_tick`
+/// range gate. A post-body value outside this falls back to the domain tick.
+const TICK_BOUND_MIN: u16 = 100;
+const TICK_BOUND_MAX: u16 = 50_000;
+pub const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE; // header + edges + domain metadata
 
 // ============================================================================
 // Graph Config (Version 1: Variable-Length Module Entries)
@@ -703,6 +724,22 @@ pub struct Config {
     pub domain_tick_us: [u16; 4],
     /// Per-domain execution mode: 0=cooperative, 1=high_rate/Tier1a, 3=poll/Tier3.
     pub domain_exec_mode: [u8; 4],
+    /// Per-domain adaptive-tick enable flags (RFC adaptive_tick §8). Lives in
+    /// the per-domain metadata's formerly-reserved byte 3, so an old config
+    /// (byte 3 == 0) is `adaptive off` → byte-identical behaviour.
+    ///   bit 0: enable mechanism (a) demand-driven idle.
+    ///   bit 1: enable mechanism (b) adaptive cadence.
+    /// bits 2-7: reserved (must be 0).
+    pub domain_adaptive_flags: [u8; 4],
+    /// Per-domain adaptive-tick latency floor target, µs (mechanism (b)). The
+    /// pacer never drives the tick below `max(tick_min_us, worst_step×margin)`.
+    /// 0 ⇒ default-filled to that domain's `tick_us` at parse time (so an
+    /// unconfigured domain has no adaptive headroom — a no-op).
+    pub domain_tick_min_us: [u16; 4],
+    /// Per-domain adaptive-tick relaxed/idle backstop cadence, µs. The idle
+    /// sleep (a) and the cooldown ceiling (b) relax toward this. 0 ⇒
+    /// default-filled to that domain's `tick_us` at parse time (no-op).
+    pub domain_tick_max_us: [u16; 4],
     /// Graph-level flags byte (graph section header byte 1).
     ///   bit 0: ACCEPT_CYCLES — author has explicitly attested that
     ///          any cycles in the graph are bidirectional feedback
@@ -742,6 +779,9 @@ impl Config {
             hardware: HardwareConfig::new(),
             domain_tick_us: [0; 4],
             domain_exec_mode: [0; 4],
+            domain_adaptive_flags: [0; 4],
+            domain_tick_min_us: [0; 4],
+            domain_tick_max_us: [0; 4],
             graph_flags: 0,
         }
     }
@@ -876,7 +916,11 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
 
     // Kernel and tools always ship together, so any mismatch is an
     // upgrade-skipped or toolchain-mismatch bug rather than a
-    // graceful path.
+    // graceful path. The version is intentionally NOT bumped for the
+    // adaptive-tick per-domain-metadata widening (4→8 bytes): the format
+    // is latest-only, so a stale blob is rejected by the body-size / CRC
+    // checks below, not by a version number. (See standing rule: never
+    // bump format versions — it breaks every sibling consumer.)
     if header.version != 1 {
         log::error!("[config] unsupported version={}", header.version);
         return false;
@@ -1092,16 +1136,37 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         config.graph_edges[i] = Some(parse_graph_edge(entry_ptr));
     }
 
-    // Parse domain metadata (16 bytes after edge entries)
+    // Parse domain metadata (DOMAIN_META_SIZE bytes after edge entries).
+    // Each entry is DOMAIN_META_ENTRY_SIZE (4) bytes:
+    //   [0..2] tick_us:u16  [2] exec_mode:u8  [3] adaptive_flags:u8
+    // tick_min_us/tick_max_us are NOT in this entry — they're read below from
+    // the post-body adaptive section past total_size (see ADAPTIVE_POST_SIZE).
     // SAFETY: section_base + 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE points
     // at the domain meta section within GRAPH_SECTION_SIZE.
     let domain_meta_base = unsafe { section_base.add(4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE) };
+    let global_tick = if config.header.tick_us > 0 {
+        config.header.tick_us
+    } else {
+        1000
+    };
     for d in 0..4usize {
-        // SAFETY: `d < 4`; 16 bytes of domain meta = 4 × 4-byte entries.
+        // SAFETY: `d < 4`; DOMAIN_META_SIZE = 4 × DOMAIN_META_ENTRY_SIZE bytes.
         unsafe {
-            let base = domain_meta_base.add(d * 4);
-            config.domain_tick_us[d] = read_u16(base);
+            let base = domain_meta_base.add(d * DOMAIN_META_ENTRY_SIZE);
+            let dtick = read_u16(base);
+            config.domain_tick_us[d] = dtick;
             config.domain_exec_mode[d] = *base.add(2);
+            // adaptive_flags reuses the formerly-reserved byte 3 (no wire growth).
+            config.domain_adaptive_flags[d] = *base.add(3);
+            // Default tick_min/tick_max to the domain's effective tick; the
+            // post-body adaptive section (read below, after the hw section)
+            // overrides these when present. They live there — not here in the
+            // graph domain meta — because growing the checksummed `body_size`
+            // hangs the bare-metal CM5 boot (rig-proven), whereas trailing bytes
+            // past `body_size` are harmless.
+            let eff = if dtick > 0 { dtick } else { global_tick };
+            config.domain_tick_min_us[d] = eff;
+            config.domain_tick_max_us[d] = eff;
         }
     }
 
@@ -1118,6 +1183,49 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             return false;
         }
     };
+
+    // Adaptive-tick post-body section: 4 domains × [tick_min_us:u16 LE,
+    // tick_max_us:u16 LE] = 16 bytes, placed AFTER the checksummed body (at
+    // `total_size`), NOT inside `body_size`. This is deliberate: growing
+    // `body_size` itself hangs the bare-metal CM5 boot (rig-proven, mechanism
+    // unresolved — a body of N+16 hangs where N boots), but trailing bytes PAST
+    // `body_size` are harmless (rig-proven: a 16B post-body pad boots). So the
+    // body/checksum/parse stay byte-identical to a config without adaptive data,
+    // and these values ride along in the gap before the next 256B image
+    // boundary. Not checksum-covered → range-validated + 0/garbage ⇒ domain
+    // tick, and adaptive is default-off (flags=0) so a torn tail is inert.
+    let post_off = total_size; // = 8 + body_size, first byte past the CRC'd body
+    if post_off + ADAPTIVE_POST_SIZE <= blob_len {
+        for d in 0..4usize {
+            // SAFETY: `post_off + ADAPTIVE_POST_SIZE <= blob_len` checked above;
+            // each domain reads 4 bytes within that 16-byte window.
+            unsafe {
+                let ab = flash_ptr.add(post_off + d * 4);
+                let raw_min = read_u16(ab);
+                let raw_max = read_u16(ab.add(2));
+                let eff = if config.domain_tick_us[d] > 0 {
+                    config.domain_tick_us[d]
+                } else {
+                    global_tick
+                };
+                // Validate as a PAIR. The post-body tail is deliberately OUTSIDE
+                // the checksum, so a torn/stale tail could pass independent range
+                // checks yet still be an impossible min>max (e.g. half-written).
+                // Require BOTH fields in range AND raw_min <= raw_max; otherwise
+                // fall back to the domain tick for both (min==max==eff ⇒ adaptive
+                // has no range to move in ⇒ inert), so an unprotected post-body
+                // can never inject a dangerous or inverted cadence.
+                let in_range = |v: u16| (TICK_BOUND_MIN..=TICK_BOUND_MAX).contains(&v);
+                if in_range(raw_min) && in_range(raw_max) && raw_min <= raw_max {
+                    config.domain_tick_min_us[d] = raw_min;
+                    config.domain_tick_max_us[d] = raw_max;
+                } else {
+                    config.domain_tick_min_us[d] = eff;
+                    config.domain_tick_max_us[d] = eff;
+                }
+            }
+        }
+    }
 
     true
 }

@@ -136,6 +136,16 @@ pub const MAX_DOMAINS: usize = 4;
 /// Default tick period in microseconds (1ms).
 pub const DEFAULT_TICK_US: u32 = 1000;
 
+/// Per-pass exponential-decay shift for `domain_worst_step_us` (the §5.3
+/// adaptive-tick floor input). Each pass removes `1/2^SHIFT` of the retained
+/// peak, so a one-off spike ages out in ~`SHIFT × ln(spike/steady)` passes
+/// (~0.4 s at a 1 ms tick for SHIFT=8) and the floor relaxes on cool-down
+/// (AC7). Exact value is rig-tuned (OQ1); the decay couples weakly to pass
+/// rate under variable tick (a documented second-order effect — relaxation
+/// speed, not correctness). The per-step peak-hold re-raises it to the live
+/// worst, so steady-state tracks the current worst and only stale spikes decay.
+pub const WORST_STEP_DECAY_SHIFT: u32 = 8;
+
 /// Maximum number of Tier 1c pre-tick drain modules per domain.
 /// Sized for NIC RX + ARP cache drain + headroom — enough for the
 /// canonical use case (single NIC driver per domain) without
@@ -1052,6 +1062,18 @@ pub struct SchedulerState {
     /// Per-domain execution mode (0=cooperative/Tier 0, 1=high-rate/Tier 1a, 3=poll/Tier 3).
     domain_exec_mode: [u8; MAX_DOMAINS],
 
+    // ── Adaptive-tick per-domain config (RFC adaptive_tick §8) ──────────
+    /// Per-domain adaptive enable flags: bit 0 = (a) demand-driven idle,
+    /// bit 1 = (b) adaptive cadence. `0` (the default for every unmodified
+    /// config) ⇒ adaptive tick is fully off and pacing is byte-identical.
+    domain_adaptive_flags: [u8; MAX_DOMAINS],
+    /// Per-domain latency-floor target the pacer drives toward under load
+    /// (mechanism (b)), µs. Default-filled to the domain's tick at parse.
+    domain_tick_min_us: [u32; MAX_DOMAINS],
+    /// Per-domain relaxed/idle backstop cadence the pacer relaxes toward
+    /// (mechanisms (a)/(b)), µs. Default-filled to the domain's tick at parse.
+    domain_tick_max_us: [u32; MAX_DOMAINS],
+
     // ── Per-domain step budget accumulator ──────────────────────────
     /// Per-domain budget limit in microseconds. Sourced from
     /// `domain_tick_us[d]` at `prepare_graph` time. `0` disables the
@@ -1079,6 +1101,26 @@ pub struct SchedulerState {
     /// see chronically over-subscribed domains without needing to
     /// instrument modules individually.
     domain_budget_overruns: [u32; MAX_DOMAINS],
+    /// Per-domain worst-recent single-step time, microseconds. This is the
+    /// adaptive-tick **floor input** (RFC adaptive_tick §5.3 / P0b): the pacer
+    /// must never drive the tick below `worst_step × margin` or it re-creates
+    /// the `tick_us=500` budget overrun (evidence #5). It is a **decaying
+    /// peak-hold**, NOT a monotonic max: `step_one_module` raises it to the
+    /// live worst, and the per-pass budget reset decays it by `>>
+    /// WORST_STEP_DECAY_SHIFT`, so a one-off (thermal) spike ages out and the
+    /// floor relaxes on cool-down (AC7). A monotonic max would pin the floor
+    /// high forever. Portable / measured on every tier + platform — the only
+    /// pre-existing worst-step (`DomainMetrics.worst_step_ticks`, bcm2712) is
+    /// Tier-1a-only, in cycles, and monotonic, so it cannot serve here.
+    domain_worst_step_us: [u32; MAX_DOMAINS],
+
+    /// Per-domain module bitmap — bit `m` set iff module `m` belongs to this
+    /// domain. Built once in `prepare_graph` from `domain_id`. The adaptive-tick
+    /// pacer intersects it with `EVENT_WAKE_PENDING` so one domain's idle
+    /// decision is not coupled to a sibling domain's wake (RFC adaptive_tick
+    /// §5.1). On a single-domain target every module lands in domain 0, so the
+    /// intersection degenerates exactly to the global `wake_pending_nonzero()`.
+    domain_module_mask: [ModuleMask; MAX_DOMAINS],
 
     // ── Tier 1c pre-pass drain slot ─────────────────────────────────
     /// Per-domain module indices that opt into the Tier 1c pre-tick
@@ -1184,9 +1226,14 @@ impl SchedulerState {
             domain_count: 0,
             domain_tick_us: [0; MAX_DOMAINS],
             domain_exec_mode: [0; MAX_DOMAINS],
+            domain_adaptive_flags: [0; MAX_DOMAINS],
+            domain_tick_min_us: [0; MAX_DOMAINS],
+            domain_tick_max_us: [0; MAX_DOMAINS],
             domain_budget_us_limit: [0; MAX_DOMAINS],
             domain_budget_us_consumed: [0; MAX_DOMAINS],
             domain_budget_overruns: [0; MAX_DOMAINS],
+            domain_worst_step_us: [0; MAX_DOMAINS],
+            domain_module_mask: [ModuleMask::EMPTY; MAX_DOMAINS],
             domain_pre_tick_order: [[0; MAX_PRE_TICK_PER_DOMAIN]; MAX_DOMAINS],
             domain_pre_tick_count: [0; MAX_DOMAINS],
             domain_pre_tick_overruns: [0; MAX_DOMAINS],
@@ -1260,9 +1307,14 @@ impl SchedulerState {
         for d in 0..MAX_DOMAINS {
             self.domain_module_count[d] = 0;
             self.domain_tick_us[d] = 0;
+            self.domain_adaptive_flags[d] = 0;
+            self.domain_tick_min_us[d] = 0;
+            self.domain_tick_max_us[d] = 0;
             self.domain_budget_us_limit[d] = 0;
             self.domain_budget_us_consumed[d] = 0;
             self.domain_budget_overruns[d] = 0;
+            self.domain_worst_step_us[d] = 0;
+            self.domain_module_mask[d] = ModuleMask::EMPTY;
             self.domain_exec_order_offset[d] = 0;
             self.domain_pre_tick_count[d] = 0;
             self.domain_pre_tick_overruns[d] = 0;
@@ -1704,6 +1756,367 @@ pub fn domain_tick_us(domain_id: usize) -> u32 {
         }
     }
     tick_us()
+}
+
+/// Return the per-domain worst-recent single-step time in microseconds — the
+/// §5.3 adaptive-tick floor input (decaying peak-hold, NOT a monotonic max).
+/// The pacer clamps `tick_min_us` up by `worst × margin` so a shortened tick
+/// never shrinks the per-domain budget below one heavy step (evidence #5).
+/// `0` until the domain has stepped at least once.
+pub fn domain_worst_step_us(domain_id: usize) -> u32 {
+    if domain_id < MAX_DOMAINS {
+        // SAFETY: scheduler-thread-only read; domain_id bounded.
+        unsafe { SCHED.domain_worst_step_us[domain_id] }
+    } else {
+        0
+    }
+}
+
+/// True iff any module belonging to `domain_id` has a pending event
+/// (non-consuming peek). The per-domain wake signal for the adaptive-tick pacer
+/// (RFC adaptive_tick §5.1): a domain only counts its own
+/// modules' wakes, so a busy sibling domain can't keep this domain from
+/// relaxing/idling on multicore. If the domain's module mask is empty
+/// (unconfigured/degenerate domain) it falls back to the global wake signal, so
+/// a missing mask can never produce a false "idle" (which would over-relax the
+/// tick and risk a missed wake).
+pub fn domain_wake_pending(domain_id: usize) -> bool {
+    let d = domain_id.min(MAX_DOMAINS - 1);
+    // SAFETY: scheduler-thread-only read; `ModuleMask` is `Copy`.
+    let mask = unsafe { SCHED.domain_module_mask[d] };
+    if mask.is_empty() {
+        return crate::kernel::event::wake_pending_nonzero();
+    }
+    crate::kernel::event::wake_pending_in_mask(&mask)
+}
+
+/// Adaptive-tick enable flags for a domain (RFC adaptive_tick §8): bit 0 =
+/// (a) demand-driven idle, bit 1 = (b) adaptive cadence. `0` ⇒ adaptive off.
+pub fn domain_adaptive_flags(domain_id: usize) -> u8 {
+    if domain_id < MAX_DOMAINS {
+        // SAFETY: scheduler-thread-only read; domain_id bounded.
+        unsafe { SCHED.domain_adaptive_flags[domain_id] }
+    } else {
+        0
+    }
+}
+
+/// Per-domain adaptive latency-floor target (µs). Default-filled to the
+/// domain's tick when unconfigured, so it is a safe lower bound for the pacer.
+pub fn domain_tick_min_us(domain_id: usize) -> u32 {
+    if domain_id < MAX_DOMAINS {
+        // SAFETY: scheduler-thread-only read; domain_id bounded.
+        let v = unsafe { SCHED.domain_tick_min_us[domain_id] };
+        if v > 0 {
+            return v;
+        }
+    }
+    domain_tick_us(domain_id)
+}
+
+/// Per-domain adaptive relaxed/idle backstop cadence (µs). Default-filled to
+/// the domain's tick when unconfigured (so an un-opted domain never relaxes).
+pub fn domain_tick_max_us(domain_id: usize) -> u32 {
+    if domain_id < MAX_DOMAINS {
+        // SAFETY: scheduler-thread-only read; domain_id bounded.
+        let v = unsafe { SCHED.domain_tick_max_us[domain_id] };
+        if v > 0 {
+            return v;
+        }
+    }
+    domain_tick_us(domain_id)
+}
+
+/// Bit 0 of `domain_adaptive_flags` — mechanism (a) demand-driven idle enabled.
+pub const ADAPTIVE_FLAG_IDLE: u8 = 0x01;
+/// Bit 1 of `domain_adaptive_flags` — mechanism (b) adaptive cadence enabled.
+pub const ADAPTIVE_FLAG_CADENCE: u8 = 0x02;
+
+// ── Mechanism (b) AIMD cadence tunables (RFC adaptive_tick §5.2/§5.3) ────────
+// These are PLACEHOLDER defaults — OQ1 marks the exact values as rig-tuned on
+// the cooled CM5. The locked design constraints they must respect: AIMD is
+// asymmetric (fast multiplicative decrease on busy, slow additive increase on
+// idle); the minimum dwell must be ≥ the workload's burst inter-arrival or the
+// cadence sawtooths (§5.2); levels are discrete to bound step-counted rescaling
+// and keep diagnostics legible.
+/// Floor margin: the pacer never drives the tick below `worst_step ×
+/// FLOOR_MARGIN` (so the per-domain budget always fits one heavy step —
+/// evidence #5). 2× leaves headroom for the rest of the pass.
+const FLOOR_MARGIN: u32 = 2;
+/// Consecutive busy passes required before stepping the cadence DOWN (faster).
+const PACER_BUSY_RUN_N: u16 = 2;
+/// Consecutive idle passes required before stepping the cadence UP (relax).
+const PACER_IDLE_RUN_M: u16 = 4;
+/// Minimum wall-clock dwell between cadence-level changes, µs. MUST be ≥ the
+/// expected burst inter-arrival for the workload (§5.2) — placeholder, rig-tuned.
+const PACER_MIN_DWELL_US: u64 = 2_000;
+/// Max discrete level index (deadline = `tick_max >> idx`, clamped to floor).
+/// Caps the geometric ladder depth; the floor clamp usually bites first.
+const PACER_MAX_LEVEL: u8 = 12;
+
+/// Cadence deadband. Hold the previously-applied deadline unless a new candidate
+/// differs by more than `last >> PACER_DEADBAND_SHIFT` (≈6.25%), floored at
+/// `PACER_DEADBAND_MIN_US`. This suppresses sub-µs floor jitter from
+/// `domain_worst_step_us` measurement noise (e.g. 750↔752 → floor 1500↔1504),
+/// which would otherwise dither the cadence and spam `MON_PACER_LEVEL` (AC6).
+/// Real ladder steps (≥2×) and load/thermal floor moves always clear the band.
+const PACER_DEADBAND_SHIFT: u32 = 4;
+const PACER_DEADBAND_MIN_US: u32 = 16;
+
+/// Per-domain mechanism-(b) pacer state. Touched only by the domain's own
+/// scheduler pass (single-threaded on Linux/rp; per-core-exclusive on
+/// bcm2712, like `DOMAIN_METRICS`), so a plain `static mut` is sound.
+#[derive(Clone, Copy)]
+struct PacerState {
+    /// Discrete level index: 0 = `tick_max` (relaxed); higher = faster.
+    level_idx: u8,
+    busy_run: u16,
+    idle_run: u16,
+    /// `now_micros()` of the last level change (dwell gate).
+    last_change_us: u64,
+    /// Last reported deadline, so MON_PACER_LEVEL only logs real changes.
+    last_reported_us: u32,
+    init: bool,
+}
+impl PacerState {
+    const fn new() -> Self {
+        Self {
+            level_idx: 0,
+            busy_run: 0,
+            idle_run: 0,
+            last_change_us: 0,
+            last_reported_us: 0,
+            init: false,
+        }
+    }
+}
+static mut PACER: [PacerState; MAX_DOMAINS] = [PacerState::new(); MAX_DOMAINS];
+
+/// Per-domain "currently in demand-driven idle" latch, so MON_PACER_IDLE_SLEEP
+/// logs once per busy→idle transition (low-rate) rather than every idle pass.
+static PACER_IDLE_REPORTED: [AtomicBool; MAX_DOMAINS] =
+    [const { AtomicBool::new(false) }; MAX_DOMAINS];
+
+/// Compute the §5.3 per-domain floor (µs): never below `tick_min_us`, raised by
+/// the live decaying worst-step so a shortened tick can't shrink the budget
+/// below one heavy step. Clamped not to exceed `tick_max_us`.
+fn pacer_floor_us(domain_id: usize, tick_max: u32) -> u32 {
+    let tick_min = domain_tick_min_us(domain_id);
+    let worst = domain_worst_step_us(domain_id);
+    tick_min
+        .max(worst.saturating_mul(FLOOR_MARGIN))
+        .min(tick_max)
+}
+
+/// Public accessor: the live §5.3 effective floor (µs) for `domain_id` right now
+/// — `max(tick_min_us, worst_step × FLOOR_MARGIN)`, clamped to `tick_max_us`.
+/// `pacer_next_deadline_us` never returns below this. A platform that further
+/// clamps the armed deadline (e.g. bcm2712's software-wake latency clamp) MUST
+/// NOT arm below it: doing so would run a heavy domain faster than its
+/// worst-step budget admits, breaking the budget/floor contract. Reconcile as
+/// `raw.min(clamp.max(pacer_domain_floor_us(d)))`.
+pub fn pacer_domain_floor_us(domain_id: usize) -> u32 {
+    let tick_max = domain_tick_max_us(domain_id);
+    pacer_floor_us(domain_id, tick_max)
+}
+
+/// Reset all mechanism-(a)/(b) pacer state to boot defaults. The pacer statics
+/// (`PACER`, `PACER_IDLE_REPORTED`, `PACER_BURST_TICK`) live OUTSIDE `Sched`, so
+/// `Sched::reset()` does not touch them. `prepare_graph` calls this on every
+/// (re)configuration: without it a rebuilt graph would inherit the prior graph's
+/// `level_idx`, dwell timestamps, deadband (`last_reported_us`), idle-report
+/// latch, and burst accumulator — making the new graph's first cadence decision
+/// a function of the OLD config/load instead of purely the new one. Runs
+/// single-threaded during reconfigure, before any domain pump steps the new
+/// graph, so there is no concurrent pacer access.
+fn pacer_reset_all() {
+    for d in 0..MAX_DOMAINS {
+        // SAFETY: single-threaded reconfigure (no concurrent pacer pass);
+        // `&raw mut` forms a pointer to the static-mut element without a
+        // reference (avoids static_mut_refs), mirroring `pacer_apply_cadence`.
+        let slot = unsafe { &raw mut PACER[d] };
+        // SAFETY: exclusive write of the Copy state during reconfigure.
+        unsafe { *slot = PacerState::new() };
+        PACER_IDLE_REPORTED[d].store(false, Ordering::Relaxed);
+        PACER_BURST_TICK[d].store(false, Ordering::Relaxed);
+    }
+}
+
+/// Drive the mechanism-(b) pacer to its fully-relaxed level (`tick_max`). Called
+/// on the mechanism-(a) demand-idle path: (a) returns `tick_max` directly WITHOUT
+/// running the (b) AIMD ladder, so without this the (b) `level_idx` /
+/// `last_reported_us` stay frozen at the pre-idle busy level — and the first busy
+/// pass after a long idle would jump straight back to the busy cadence,
+/// bypassing the intended AIMD cooldown + dwell (RFC adaptive_tick §5.3). Forcing
+/// level 0 makes the post-idle resume start from the relaxed cadence and ramp
+/// back down under sustained load. Per-domain-exclusive access (same invariant as
+/// `pacer_apply_cadence`).
+fn pacer_force_relaxed(domain_id: usize, tick_max: u32) {
+    let d = domain_id.min(MAX_DOMAINS - 1);
+    let now = crate::kernel::hal::now_micros();
+    // SAFETY: per-domain-exclusive; `&raw mut` avoids a static_mut reference.
+    let slot = unsafe { &raw mut PACER[d] };
+    // SAFETY: per-domain-exclusive read/write of the Copy state.
+    let mut ps = unsafe { *slot };
+    // Mark the busy→relaxed transition for the dwell gate only on a real change
+    // (or first use), so repeated idle passes don't keep pushing the dwell window.
+    if ps.level_idx != 0 || !ps.init {
+        ps.last_change_us = now;
+    }
+    ps.init = true;
+    ps.level_idx = 0;
+    ps.busy_run = 0;
+    ps.last_reported_us = tick_max;
+    // SAFETY: per-domain-exclusive write-back.
+    unsafe { *slot = ps };
+}
+
+/// Mechanism (b): AIMD cadence between the floor and `tick_max`, with run-length
+/// hysteresis + a minimum dwell, on a discrete geometric level ladder
+/// (`tick_max >> level_idx`, clamped to the floor). Busy passes step the level
+/// DOWN fast (toward the floor = lower latency); idle passes step it UP slowly
+/// (toward `tick_max`). Emits MON_PACER_LEVEL on a real change and
+/// MON_PACER_FLOOR when the live floor has raised the effective minimum above
+/// `tick_min_us` (the load-shed / thermal signal).
+fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
+    let d = domain_id.min(MAX_DOMAINS - 1);
+    let floor = pacer_floor_us(domain_id, tick_max);
+    let now = crate::kernel::hal::now_micros();
+    // PACER[d] is touched only by domain d's own scheduler pass (single-threaded
+    // on Linux/rp; per-core-exclusive on bcm2712). `PacerState` is `Copy`, so we
+    // read-modify-write through a raw pointer — no reference to the `static mut`
+    // (avoids both static_mut_refs and deref_addrof).
+    // SAFETY: per-domain-exclusive access as documented above; `&raw mut`
+    // forms a pointer to the static-mut element without a reference to it.
+    let slot = unsafe { &raw mut PACER[d] };
+    // SAFETY: per-domain-exclusive read of the Copy state.
+    let mut ps = unsafe { *slot };
+    if !ps.init {
+        ps.init = true;
+        ps.level_idx = 0;
+        ps.last_change_us = now;
+    }
+    if idle {
+        ps.idle_run = ps.idle_run.saturating_add(1);
+        ps.busy_run = 0;
+    } else {
+        ps.busy_run = ps.busy_run.saturating_add(1);
+        ps.idle_run = 0;
+    }
+    let dwell_ok = now.wrapping_sub(ps.last_change_us) >= PACER_MIN_DWELL_US;
+    let old_idx = ps.level_idx;
+    if !idle && ps.busy_run >= PACER_BUSY_RUN_N && dwell_ok {
+        // Multiplicative decrease (one halving) — fast to get faster.
+        ps.level_idx = (ps.level_idx + 1).min(PACER_MAX_LEVEL);
+        ps.busy_run = 0;
+    } else if idle && ps.idle_run >= PACER_IDLE_RUN_M && dwell_ok {
+        // Additive increase (one level) — slow to relax.
+        ps.level_idx = ps.level_idx.saturating_sub(1);
+        ps.idle_run = 0;
+    }
+    if ps.level_idx != old_idx {
+        ps.last_change_us = now;
+    }
+    let raw_deadline = (tick_max >> ps.level_idx.min(31)).max(floor).min(tick_max);
+    // Deadband: hold the previously-applied deadline unless the change is
+    // significant. Worst_step measurement jitter (±a few µs) would otherwise
+    // dither the floor (and thus the cadence) and spam MON_PACER_LEVEL (AC6);
+    // ladder steps and real floor moves clear the band.
+    let last = ps.last_reported_us;
+    let band = (last >> PACER_DEADBAND_SHIFT).max(PACER_DEADBAND_MIN_US);
+    let deadline = if last != 0 && raw_deadline.abs_diff(last) <= band {
+        last
+    } else {
+        raw_deadline
+    };
+    if deadline != ps.last_reported_us {
+        ps.last_reported_us = deadline;
+        let reason = if idle { "cooldown" } else { "busy" };
+        // SAFETY: DBG_TICK aligned u32 read.
+        let tick = unsafe { DBG_TICK };
+        log::info!("MON_PACER_LEVEL domain={d} tick_us={deadline} reason={reason} tick={tick}");
+        if floor > domain_tick_min_us(domain_id) {
+            log::info!(
+                "MON_PACER_FLOOR domain={d} floor_us={floor} worst_step_us={} tick={tick}",
+                domain_worst_step_us(domain_id)
+            );
+        }
+    }
+    // SAFETY: per-domain-exclusive write-back of the updated state.
+    unsafe {
+        *slot = ps;
+    }
+    deadline
+}
+
+/// Select the next pacing deadline (µs) for `domain_id` from existing kernel
+/// signals — the single adaptive-tick decision "how long until the next pass?"
+/// (RFC adaptive_tick §5.1). Call it at the platform pacing tail, AFTER the
+/// pass + its pre-sleep wake drain, so the busy/idle signal reflects the pass
+/// just finished.
+///
+/// **Mechanism (a) demand-driven idle** (bit 0): when (a) is enabled and the
+/// pass was idle (no pending wake, no burst), relax the next sleep to
+/// `tick_max_us` — the platform sleeps in an event-interruptible posture, so a
+/// wake returns immediately; the backstop bounds worst-case re-evaluation and
+/// keeps step-counted timers advancing (always-armed-backstop invariant, D7).
+/// **Mechanism (b) adaptive cadence** (bit 1): AIMD toward `tick_min_us` on a
+/// busy pass / back off toward `tick_max_us` on an idle one, with hysteresis
+/// (deadband) and the §5.3 floor = `max(tick_min_us, worst_step × FLOOR_MARGIN)`
+/// so the chosen cadence never undershoots the live worst-step cost.
+///
+/// When no adaptive flag is set this returns `domain_tick_us` exactly, so an
+/// unconfigured domain is byte-identical in pacing to today.
+///
+/// Idle is decided per-domain via `domain_wake_pending(domain_id)` (the
+/// `EVENT_WAKE_PENDING ∩ domain_module_mask` intersection), so on
+/// multicore a busy sibling domain can't block this domain from relaxing. On a
+/// single-domain target (Linux/rp) every module is in domain 0, so it
+/// degenerates exactly to the global `wake_pending_nonzero()`.
+pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
+    let flags = domain_adaptive_flags(domain_id);
+    if flags == 0 {
+        return domain_tick_us(domain_id);
+    }
+    // Use the outer-tick accumulator, NOT BURST_SEEN_THIS_PASS (which is reset
+    // per pipeline sub-pass and reads false after a flush-then-drain tick).
+    let burst = PACER_BURST_TICK
+        .get(domain_id.min(MAX_DOMAINS - 1))
+        .map(|b| b.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    let idle = !burst && !domain_wake_pending(domain_id);
+    let tick_max = domain_tick_max_us(domain_id);
+    // MON_PACER_IDLE_SLEEP on the busy→idle transition only (low-rate), when
+    // demand-driven idle is the active relaxation for this domain.
+    if (flags & ADAPTIVE_FLAG_IDLE) != 0 {
+        let di = domain_id.min(MAX_DOMAINS - 1);
+        let was = PACER_IDLE_REPORTED[di].swap(idle, Ordering::Relaxed);
+        if idle && !was {
+            // SAFETY: DBG_TICK aligned u32 read.
+            let tick = unsafe { DBG_TICK };
+            log::info!("MON_PACER_IDLE_SLEEP domain={di} backstop_us={tick_max} tick={tick}");
+        }
+    }
+    if (flags & ADAPTIVE_FLAG_IDLE) != 0 && idle {
+        // (a) demand-driven idle: relax straight to the backstop. The platform
+        // sleeps event-interruptibly so a wake returns immediately. When (b) is
+        // ALSO enabled, (a) bypasses its AIMD ladder — so explicitly drive the
+        // (b) pacer to its relaxed level here. Otherwise level_idx/last_reported_us
+        // stay frozen at the pre-idle busy level and the first busy pass after a
+        // long idle jumps straight back to the busy cadence, skipping the AIMD
+        // cooldown/dwell. With this, the post-idle resume starts relaxed and ramps
+        // back down under load (the intended hysteresis).
+        if (flags & ADAPTIVE_FLAG_CADENCE) != 0 {
+            pacer_force_relaxed(domain_id, tick_max);
+        }
+        return tick_max;
+    }
+    if (flags & ADAPTIVE_FLAG_CADENCE) != 0 {
+        // (b) AIMD cadence between the §5.3 floor and tick_max.
+        return pacer_apply_cadence(domain_id, idle, tick_max);
+    }
+    // (a) enabled but this pass was busy, (b) disabled → nominal tick.
+    domain_tick_us(domain_id)
 }
 
 /// Domain execution-mode wire byte values.
@@ -2429,6 +2842,10 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     crate::kernel::isr_tier::reset_all();
     crate::kernel::bridge::bridge_reset_all();
     sched.reset();
+    // The mechanism-(a)/(b) pacer statics live outside `Sched`, so reset them
+    // here too — a rebuilt graph must start from a clean cadence (level/dwell/
+    // deadband/idle-latch/burst) rather than inheriting the prior graph's.
+    pacer_reset_all();
 
     // Store graph-level sample rate from config header
     sched.graph_sample_rate = config.header.graph_sample_rate;
@@ -2452,11 +2869,21 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // same time so the post-instantiation ISR-tier admission helper
     // reads it without re-touching the config blob.
     let mut max_domain: u8 = 0;
+    // Rebuild the per-domain module bitmap from scratch (prepare_graph re-runs
+    // on live reconfigure). The pacer intersects it with EVENT_WAKE_PENDING for
+    // a per-domain idle decision (RFC adaptive_tick §5.1).
+    for m in sched.domain_module_mask.iter_mut() {
+        *m = ModuleMask::EMPTY;
+    }
     for entry in config.modules.iter().flatten() {
         let id = entry.id as usize;
         if id < MAX_MODULES {
             sched.domain_id[id] = entry.domain_id;
             sched.pre_tick_drain[id] = entry.pre_tick_drain;
+            let d = entry.domain_id as usize;
+            if d < MAX_DOMAINS {
+                sched.domain_module_mask[d].set(id);
+            }
             if entry.domain_id > max_domain {
                 max_domain = entry.domain_id;
             }
@@ -2478,6 +2905,13 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     for d in 0..MAX_DOMAINS {
         sched.domain_tick_us[d] = config.domain_tick_us[d] as u32;
         sched.domain_exec_mode[d] = config.domain_exec_mode[d];
+        // Adaptive-tick per-domain config (RFC adaptive_tick §8). The config
+        // parser already default-filled tick_min/tick_max to the domain's
+        // effective tick when unset, so for an unmodified config
+        // tick_min == tick_max == tick and adaptive_flags == 0 ⇒ no-op.
+        sched.domain_adaptive_flags[d] = config.domain_adaptive_flags[d];
+        sched.domain_tick_min_us[d] = config.domain_tick_min_us[d] as u32;
+        sched.domain_tick_max_us[d] = config.domain_tick_max_us[d] as u32;
         let dtick = sched.domain_tick_us[d];
         sched.domain_budget_us_limit[d] = if dtick > 0 {
             dtick
@@ -4631,18 +5065,34 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
     if tick == 0 {
         return;
     }
-    let d = domain_id.unwrap_or(0);
-    let tick_us = domain_tick_us(d).max(1) as u64;
-    let period = (30_000_000u64 / tick_us).max(1);
-    if !tick.is_multiple_of(period) {
+    let di = domain_id.unwrap_or(0).min(MAX_DOMAINS - 1);
+    let ms = crate::kernel::hal::now_millis();
+    // Wall-clock cadence (~30 s), driven by `now_millis()` rather than a
+    // `30_000_000 / tick_us` tick-count threshold. The tick-count form silently
+    // mis-scales the moment mechanism (b) varies the period away from 1 ms, and
+    // stalls entirely when mechanism (a) idle-sleep stops advancing the tick —
+    // so the heartbeat would no longer be ~30 s. Diagnostic-cadence class:
+    // best-effort, no correctness impact (RFC adaptive_tick §7.6).
+    // `LAST_ALIVE_MS` is 0 at boot, so the first heartbeat lands ~30 s in,
+    // matching the previous tick-count behaviour.
+    let last = LAST_ALIVE_MS[di].load(Ordering::Relaxed);
+    if ms.wrapping_sub(last) < ALIVE_INTERVAL_MS {
         return;
     }
-    let ms = crate::kernel::hal::now_millis();
+    LAST_ALIVE_MS[di].store(ms, Ordering::Relaxed);
     match domain_id {
         Some(d) => log::info!("[sched] alive t={tick} elapsed_ms={ms} domain={d}"),
         None => log::info!("[sched] alive t={tick} elapsed_ms={ms}"),
     }
 }
+
+/// Per-domain wall-clock timestamp (ms) of the last `[sched] alive` heartbeat,
+/// so the cadence is driven by `now_millis()` instead of a tick count that
+/// mis-scales under variable/idle pacing (RFC adaptive_tick §7.6).
+static LAST_ALIVE_MS: [portable_atomic::AtomicU64; MAX_DOMAINS] =
+    [const { portable_atomic::AtomicU64::new(0) }; MAX_DOMAINS];
+/// Wall-clock heartbeat interval for `maybe_emit_alive` (~30 s).
+const ALIVE_INTERVAL_MS: u64 = 30_000;
 /// Last module index attempted before a crash — readable by HardFault handler
 #[no_mangle]
 pub static mut DBG_STEP_MODULE: u8 = 0xFF;
@@ -4656,6 +5106,15 @@ pub static mut CRASH_DATA: core::mem::MaybeUninit<[u32; 8]> = core::mem::MaybeUn
 
 /// Magic marker for valid crash data
 pub const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
+
+/// One-shot latch for the post-boot crash-info read (`step_modules`). Set once
+/// per boot so the prior-run `.uninit CRASH_DATA` is read exactly once, gated on
+/// a wall-clock delay rather than a `30_000_000 / tick_us` tick threshold that
+/// mis-scales / can be skipped under variable or idle pacing (RFC adaptive_tick
+/// §7.6, one-shot-correctness class).
+static CRASH_CHECKED: AtomicBool = AtomicBool::new(false);
+/// Wall-clock delay after boot before the crash-info read (USB serial up).
+const CRASH_CHECK_DELAY_MS: u64 = 30_000;
 
 /// Whether module `idx` requested `protection: isolated` (TLV 0xF5 == 2).
 /// Read by the graph-prepare pass to decide which modules get an EL0
@@ -5325,15 +5784,21 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         return StepResult::Done;
     }
 
-    // Crash-info one-shot: at first opportunity after boot, check the
-    // .uninit CRASH_DATA RAM that a HardFault handler may have left
-    // behind from the previous run, and clear the marker so it
-    // doesn't repeat. Tick threshold chosen so USB serial is
-    // definitely connected (≈ first scheduler-heartbeat slot at the
-    // active tick rate). The `[sched] alive` log itself is emitted
-    // by the platform's outer loop via `maybe_emit_alive`.
-    let crash_check_tick = (30_000_000u32 / sched.tick_us.max(1)).max(1);
-    if tick == crash_check_tick {
+    // Crash-info one-shot: ~CRASH_CHECK_DELAY_MS after boot (by when USB serial
+    // is reliably connected), check the .uninit CRASH_DATA RAM that a HardFault
+    // handler may have left behind from the previous run, and clear the marker
+    // so it doesn't repeat. Gated on wall-clock + a one-shot latch rather than a
+    // `30_000_000 / tick_us` tick threshold: the tick form mis-scales when
+    // mechanism (b) varies the period, and under mechanism (a) idle-sleep the
+    // threshold tick may never be reached (DBG_TICK stalls) — a missed
+    // one-shot-correctness read (RFC adaptive_tick §7.6). The latch guarantees
+    // it fires exactly once per boot regardless of pass count. The `[sched]
+    // alive` log itself is emitted by the platform's outer loop via
+    // `maybe_emit_alive`.
+    if !CRASH_CHECKED.load(Ordering::Relaxed)
+        && crate::kernel::hal::now_millis() >= CRASH_CHECK_DELAY_MS
+    {
+        CRASH_CHECKED.store(true, Ordering::Relaxed);
         // SAFETY: CRASH_DATA is in `.uninit` and survives soft reset; we
         // read 8 u32 words (32 bytes) which match the section size, and
         // re-clear `magic` afterwards so the path runs once per boot.
@@ -5382,6 +5847,15 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // module is stepped.
     for d in 0..MAX_DOMAINS {
         sched.domain_budget_us_consumed[d] = 0;
+        // Decay the §5.3 floor's worst-step peak-hold once per pass so a stale
+        // spike ages out (AC7). step_one_module re-raises it to the live worst.
+        // The decrement is `max(v >> shift, 1)` for any non-zero value: a pure
+        // `v >> 8` stalls at 0 once v < 256, so a stale sub-256 µs spike would
+        // never fully age out and would hold the floor (and tick_min) up.
+        let w = sched.domain_worst_step_us[d];
+        if w > 0 {
+            sched.domain_worst_step_us[d] = w - (w >> WORST_STEP_DECAY_SHIFT).max(1);
+        }
     }
     // Track which domains already logged a soft-overrun this pass,
     // so we don't emit a MON_BUDGET_OVERRUN line per remaining module.
@@ -5427,6 +5901,14 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // the full round-trip complete in one tick — the dominant per-request
     // latency. Idle ticks burst nothing → one pass (low-load cost unchanged);
     // the per-domain budget bounds the busy case.
+    //
+    // Reset the pacer's per-tick busy accumulator once for the whole outer tick
+    // (all domains — the flat path steps every domain). Set on any burst, read
+    // by the pacer; `BURST_SEEN_THIS_PASS` is reset per sub-pass and can't serve
+    // it. See `PACER_BURST_TICK`.
+    for b in PACER_BURST_TICK.iter() {
+        b.store(false, Ordering::Relaxed);
+    }
     let mut tick_pass = 0u32;
     let mut hard_break = false;
     loop {
@@ -5550,6 +6032,16 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 /// while it still has local pending work. A slot per domain keeps each core's
 /// burst signal isolated to its own pass.
 static BURST_SEEN_THIS_PASS: [AtomicBool; MAX_DOMAINS] =
+    [const { AtomicBool::new(false) }; MAX_DOMAINS];
+
+/// Per-domain "any Burst across the whole outer tick" — the adaptive-tick
+/// pacer's busy signal. Distinct from `BURST_SEEN_THIS_PASS`, which is reset at
+/// the start of EVERY pipeline sub-pass for drain-detection and is therefore
+/// `false` after a tick that bursts early then drains clean. The pacer must see
+/// "was this *tick* busy", so this slot is reset once per outer tick (top of
+/// `step_modules` / `step_domain_modules`) and only ever SET on a burst, never
+/// mid-tick. Read by `pacer_next_deadline_us`.
+static PACER_BURST_TICK: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
 /// Variant of [`step_domain_modules`] for platforms running a
@@ -5734,6 +6226,10 @@ pub fn step_domain_modules(
     if domain_id >= MAX_DOMAINS {
         return StepResult::Done;
     }
+    // Reset the pacer's per-tick busy accumulator once for the whole outer tick
+    // (before any sub-pass or pre-tick step). `BURST_SEEN_THIS_PASS` is reset
+    // per sub-pass for drain-detection and can't serve the pacer's "tick busy?".
+    PACER_BURST_TICK[domain_id].store(false, Ordering::Relaxed);
     // SAFETY: scheduler-thread context — multi-domain platform's caller
     // (BCM2712 core pump) is the sole stepper for this domain.
     let sched = unsafe {
@@ -5794,6 +6290,14 @@ pub fn step_domain_modules(
     // the cyclic shift on soft overruns so operators see them
     // without losing the rest of the pass.
     sched.domain_budget_us_consumed[domain_id] = 0;
+    // Decay this domain's §5.3 floor worst-step peak-hold once per pass so a
+    // stale spike ages out (AC7); step_one_module re-raises it to the live worst.
+    // `max(v >> shift, 1)` for non-zero v — a pure `v >> 8` stalls at 0 once
+    // v < 256, leaving a sub-256 µs spike to pin the floor (and tick_min) forever.
+    let w = sched.domain_worst_step_us[domain_id];
+    if w > 0 {
+        sched.domain_worst_step_us[domain_id] = w - (w >> WORST_STEP_DECAY_SHIFT).max(1);
+    }
     let mut overrun_logged_this_pass = false;
 
     // Tier 1c pre-pass drain — runs `domain_pre_tick_order[d]`
@@ -6216,6 +6720,9 @@ fn step_one_module(
                 let burst_domain = sched.domain_id[module_idx] as usize;
                 if burst_domain < MAX_DOMAINS {
                     BURST_SEEN_THIS_PASS[burst_domain].store(true, Ordering::Relaxed);
+                    // Outer-tick accumulator for the pacer — never cleared
+                    // mid-tick, so a flush-then-drain tick still reads busy.
+                    PACER_BURST_TICK[burst_domain].store(true, Ordering::Relaxed);
                 }
                 // Keep timer armed for entire burst with extended deadline
                 step_guard::disarm();
@@ -6348,6 +6855,15 @@ fn step_one_module(
         if d < MAX_DOMAINS {
             sched.domain_budget_us_consumed[d] =
                 sched.domain_budget_us_consumed[d].saturating_add(elapsed);
+            // Peak-hold the per-domain worst single-step (µs) for the §5.3
+            // adaptive-tick floor. Decayed once per pass (see the per-pass
+            // budget reset) so it relaxes after a spike — a decaying peak-hold,
+            // not a monotonic max (AC7). u32 µs is ample: a step over ~4 ms
+            // already trips the budget at any sane tick.
+            let e = elapsed.min(u32::MAX as u64) as u32;
+            if e > sched.domain_worst_step_us[d] {
+                sched.domain_worst_step_us[d] = e;
+            }
         }
         // Name the module that actually consumed the time — the
         // overrun line names whichever finished *last*, which is a

@@ -263,10 +263,17 @@ pub fn compose(
     })
 }
 
-/// Canonical content digest over a plan. Fixed-width big-endian encoding so the
-/// bytes — and therefore the digest — are stable across platforms.
-fn digest_plan(generation: u64, assignments: &[OwnerAssignment]) -> Digest32 {
-    let mut buf: Vec<u8> = Vec::with_capacity(8 + assignments.len() * 40);
+/// Per-assignment fixed record width in the canonical plan body:
+/// pod_uid(16) + slot(2) + generation(4) + module_base(2) + module_count(2)
+/// + edge_base(2) + edge_count(2).
+const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2;
+
+/// Canonical, fixed-width big-endian serialization of a plan's payload
+/// (generation + count + assignments). Stable across platforms, so the digest
+/// over it — and the encoded plan — are reproducible. Shared by `digest_plan`
+/// and `encode_plan`.
+fn plan_body(generation: u64, assignments: &[OwnerAssignment]) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(12 + assignments.len() * ASSIGN_REC_LEN);
     buf.extend_from_slice(&generation.to_be_bytes());
     buf.extend_from_slice(&(assignments.len() as u32).to_be_bytes());
     for a in assignments {
@@ -278,12 +285,121 @@ fn digest_plan(generation: u64, assignments: &[OwnerAssignment]) -> Digest32 {
         buf.extend_from_slice(&a.edge_base.to_be_bytes());
         buf.extend_from_slice(&a.edge_count.to_be_bytes());
     }
+    buf
+}
+
+fn sha256_of(bytes: &[u8]) -> Digest32 {
     let mut hasher = Sha256::new();
-    hasher.update(&buf);
+    hasher.update(bytes);
     let out = hasher.finalize();
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&out);
     digest
+}
+
+/// Canonical content digest over a plan. Fixed-width big-endian encoding so the
+/// bytes — and therefore the digest — are stable across platforms.
+fn digest_plan(generation: u64, assignments: &[OwnerAssignment]) -> Digest32 {
+    sha256_of(&plan_body(generation, assignments))
+}
+
+// ============================================================================
+// Binary plan codec (rfc_k8s.md §11: "the kernel consumes a validated bounded
+// binary plan; it does not parse Kubernetes objects, OCI manifests, or YAML")
+// ============================================================================
+
+/// Magic for an encoded device-graph plan: "FLXP".
+const PLAN_MAGIC: u32 = 0x464C_5850;
+/// On-wire plan format version.
+const PLAN_VERSION: u16 = 1;
+/// Fixed header: magic(4) + version(2) + reserved(2).
+const PLAN_HEADER_LEN: usize = 8;
+/// Hard ceiling on assignments in one bounded plan (matches the largest
+/// per-profile owner table; the kernel rejects anything larger).
+const MAX_PLAN_ASSIGNMENTS: usize = 256;
+
+/// Why decoding a binary plan failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanDecodeError {
+    BadMagic,
+    BadVersion,
+    Truncated,
+    TooManyAssignments,
+    DigestMismatch,
+    TrailingBytes,
+}
+
+/// Encode a composed plan into the bounded binary form the kernel consumes:
+/// `[header][body][sha256(body)]`. Deterministic — identical plans encode to
+/// identical bytes.
+pub fn encode_plan(plan: &CompositionPlan) -> Vec<u8> {
+    let body = plan_body(plan.generation, &plan.assignments);
+    let digest = sha256_of(&body);
+    let mut out = Vec::with_capacity(PLAN_HEADER_LEN + body.len() + 32);
+    out.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
+    out.extend_from_slice(&PLAN_VERSION.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// Decode and verify a binary plan. Validates magic/version, bounds every length
+/// against the input, enforces `MAX_PLAN_ASSIGNMENTS`, and verifies the trailing
+/// sha256 over the body so a tampered or truncated plan fails closed.
+pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
+    if bytes.len() < PLAN_HEADER_LEN + 12 + 32 {
+        return Err(PlanDecodeError::Truncated);
+    }
+    let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    if magic != PLAN_MAGIC {
+        return Err(PlanDecodeError::BadMagic);
+    }
+    let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+    if version != PLAN_VERSION {
+        return Err(PlanDecodeError::BadVersion);
+    }
+    let body = &bytes[PLAN_HEADER_LEN..];
+    let generation = u64::from_be_bytes(body[0..8].try_into().unwrap());
+    let count = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+    if count > MAX_PLAN_ASSIGNMENTS {
+        return Err(PlanDecodeError::TooManyAssignments);
+    }
+    let body_len = 12 + count * ASSIGN_REC_LEN;
+    let expected_total = PLAN_HEADER_LEN + body_len + 32;
+    if bytes.len() < expected_total {
+        return Err(PlanDecodeError::Truncated);
+    }
+    if bytes.len() > expected_total {
+        return Err(PlanDecodeError::TrailingBytes);
+    }
+    // Verify the digest over the body before trusting any field.
+    let digest = &bytes[PLAN_HEADER_LEN + body_len..];
+    if sha256_of(&body[..body_len]) != digest {
+        return Err(PlanDecodeError::DigestMismatch);
+    }
+    let mut assignments = Vec::with_capacity(count);
+    for i in 0..count {
+        let r = &body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN];
+        let mut pod_uid = [0u8; 16];
+        pod_uid.copy_from_slice(&r[0..16]);
+        assignments.push(OwnerAssignment {
+            pod_uid,
+            slot: u16::from_be_bytes(r[16..18].try_into().unwrap()),
+            generation: u32::from_be_bytes(r[18..22].try_into().unwrap()),
+            module_base: u16::from_be_bytes(r[22..24].try_into().unwrap()),
+            module_count: u16::from_be_bytes(r[24..26].try_into().unwrap()),
+            edge_base: u16::from_be_bytes(r[26..28].try_into().unwrap()),
+            edge_count: u16::from_be_bytes(r[28..30].try_into().unwrap()),
+        });
+    }
+    let mut plan_digest = [0u8; 32];
+    plan_digest.copy_from_slice(digest);
+    Ok(CompositionPlan {
+        generation,
+        assignments,
+        plan_digest,
+    })
 }
 
 // ============================================================================
@@ -567,5 +683,95 @@ mod tests {
         // a fresh token under the new epoch stages fine
         let t2 = r.reserve(uid(1), [1; 32], [2; 32]);
         assert!(r.stage(&t2).is_ok());
+    }
+
+    // ── Binary plan codec ───────────────────────────────────────────────────
+
+    fn sample_plan() -> CompositionPlan {
+        let snap = OwnerSnapshot::empty(16);
+        let ds = DeviceDesiredState {
+            generation: 42,
+            system_revision: 1,
+            pods: vec![
+                pod(1, DesiredPhase::Running, profile(4, 6)),
+                pod(2, DesiredPhase::Running, profile(8, 10)),
+            ],
+        };
+        compose(&ds, &cap(), &snap).unwrap()
+    }
+
+    #[test]
+    fn encode_decode_round_trips() {
+        let plan = sample_plan();
+        let bytes = encode_plan(&plan);
+        let decoded = decode_plan(&bytes).expect("decode");
+        assert_eq!(decoded, plan);
+        // decoded plan_digest matches the freshly composed one
+        assert_eq!(decoded.plan_digest, plan.plan_digest);
+    }
+
+    #[test]
+    fn encode_is_deterministic() {
+        let plan = sample_plan();
+        assert_eq!(encode_plan(&plan), encode_plan(&plan));
+    }
+
+    #[test]
+    fn empty_plan_round_trips() {
+        let plan = CompositionPlan {
+            generation: 7,
+            assignments: vec![],
+            plan_digest: digest_plan(7, &[]),
+        };
+        assert_eq!(decode_plan(&encode_plan(&plan)).unwrap(), plan);
+    }
+
+    #[test]
+    fn tampered_body_fails_digest() {
+        let mut bytes = encode_plan(&sample_plan());
+        // flip a byte inside the first assignment record (after the 12-byte
+        // body prefix, which is after the 8-byte header).
+        let idx = PLAN_HEADER_LEN + 12 + 4;
+        bytes[idx] ^= 0xFF;
+        assert_eq!(decode_plan(&bytes), Err(PlanDecodeError::DigestMismatch));
+    }
+
+    #[test]
+    fn bad_magic_and_version_rejected() {
+        let mut bytes = encode_plan(&sample_plan());
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 0xFF;
+        assert_eq!(decode_plan(&bad_magic), Err(PlanDecodeError::BadMagic));
+        bytes[5] = 0xFF; // version low byte
+        assert_eq!(decode_plan(&bytes), Err(PlanDecodeError::BadVersion));
+    }
+
+    #[test]
+    fn truncated_and_trailing_rejected() {
+        let bytes = encode_plan(&sample_plan());
+        assert_eq!(
+            decode_plan(&bytes[..bytes.len() - 1]),
+            Err(PlanDecodeError::Truncated)
+        );
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(decode_plan(&extra), Err(PlanDecodeError::TrailingBytes));
+    }
+
+    #[test]
+    fn over_cap_count_rejected() {
+        // Hand-craft a header claiming more assignments than the bound, so the
+        // count check trips before any allocation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
+        bytes.extend_from_slice(&PLAN_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&7u64.to_be_bytes()); // generation
+        bytes.extend_from_slice(&((MAX_PLAN_ASSIGNMENTS as u32 + 1).to_be_bytes()));
+        bytes.extend_from_slice(&[0u8; 32]); // (bogus) digest area
+        assert_eq!(
+            decode_plan(&bytes),
+            Err(PlanDecodeError::TooManyAssignments)
+        );
     }
 }

@@ -390,7 +390,10 @@ fn main() {
     }
 
     log::info!("[sched] starting main loop, tick_us={tick_us}");
-    let tick_duration = Duration::from_micros(tick_us as u64);
+    // The per-iteration deadline is chosen by the adaptive-tick pacer
+    // (`scheduler::pacer_next_deadline_us`) inside the loop; there is no fixed
+    // `tick_duration` any more. With no adaptive flag set the pacer returns the
+    // nominal tick every iteration, so pacing is byte-identical to before.
     let mut tick: u64 = 0;
     // Test hook: when FLUXOR_TEST_REBUILD_EVERY=N is set,
     // self-trigger a graph rebuild every N loop iterations to exercise the
@@ -477,23 +480,34 @@ fn main() {
 
         scheduler::maybe_emit_alive(tick, None);
 
-        // Tick pacing. `thread::sleep` for sub-millisecond targets
-        // has a ~50-150 µs floor on Linux (timer-tick granularity +
-        // scheduler wake latency), so for hot cadences we busy-spin
-        // instead and only fall back to sleep at coarse settings:
+        // Tick pacing, against the pacer-chosen `sleep_us` (below).
+        // `thread::sleep` for sub-millisecond targets has a ~50-150 µs floor
+        // on Linux (timer-tick granularity + scheduler wake latency), so for
+        // hot cadences we busy-spin instead and only fall back to sleep at
+        // coarse settings:
         //
-        //   * tick_us == 0   → pure busy-loop, no pacing.
-        //   * tick_us <= 200 → spin until `tick_duration` elapses,
-        //                      yielding early if a wake bit fires.
-        //   * tick_us > 200  → `park_timeout` for the remainder; an
-        //                      `unpark` from `linux_wake_scheduler`
-        //                      returns immediately so the next
-        //                      iteration's drain runs the woken module.
+        //   * sleep_us == 0   → pure busy-loop, no pacing.
+        //   * sleep_us <= 200 → spin until `sleep_duration` elapses,
+        //                       yielding early if a wake bit fires.
+        //   * sleep_us > 200  → `park_timeout` for the remainder; an
+        //                       `unpark` from `linux_wake_scheduler`
+        //                       returns immediately so the next
+        //                       iteration's drain runs the woken module.
+        // Adaptive-tick pacer (RFC adaptive_tick §5.1): choose this
+        // iteration's deadline from the just-finished pass. With no adaptive
+        // flag set this returns the domain's nominal tick, so `sleep_us ==
+        // tick_us` every iteration and the bands below are byte-identical to
+        // the fixed-tick loop. With mechanism (a) enabled and an idle pass it
+        // returns `tick_max_us`; `park_timeout` stays interruptible by
+        // `unpark` from `linux_wake_scheduler`, so a wake returns immediately.
+        // Linux is single-domain → domain 0.
+        let sleep_us = scheduler::pacer_next_deadline_us(0);
+        let sleep_duration = Duration::from_micros(sleep_us as u64);
         let elapsed = t0.elapsed();
-        if tick_us == 0 {
+        if sleep_us == 0 {
             // Pure busy-loop — recheck immediately.
-        } else if tick_us <= 200 {
-            while t0.elapsed() < tick_duration {
+        } else if sleep_us <= 200 {
+            while t0.elapsed() < sleep_duration {
                 // Yield early on wake so woken modules don't wait out
                 // the remainder of the spin budget. The bit stays
                 // latched in EVENT_WAKE_PENDING for the next iteration.
@@ -502,12 +516,13 @@ fn main() {
                 }
                 core::hint::spin_loop();
             }
-        } else if elapsed < tick_duration {
+        } else if elapsed < sleep_duration {
             // `park_timeout` is interruptible by `unpark()` and may
             // return spuriously; either way the next iteration drains
             // wake bits and steps. The remaining budget is the upper
-            // bound, never a hard sleep.
-            thread::park_timeout(tick_duration - elapsed);
+            // bound, never a hard sleep. Under mechanism (a) idle this is
+            // the `tick_max_us` backstop — a wake cuts it short.
+            thread::park_timeout(sleep_duration - elapsed);
         }
 
         // Second drain after the wait: an event signaled during the
@@ -528,14 +543,18 @@ fn main() {
         // sustained drift, throttled once per ~second of expected
         // wall-clock. Operators reading this in the log can correlate
         // to RT-priority or CFS-bandwidth misconfiguration.
-        if tick_us > 200 {
+        // Threshold tracks the ACTUAL chosen deadline (`sleep_duration`), not
+        // the nominal tick — otherwise mechanism (a)'s idle `tick_max_us`
+        // sleeps would trip this every idle pass. A real oversleep is the OS
+        // overshooting the deadline it was given.
+        if sleep_us > 200 {
             let actual = t0.elapsed();
-            let threshold = tick_duration + tick_duration / 2;
+            let threshold = sleep_duration + sleep_duration / 2;
             if actual > threshold && tick - last_oversleep_log_tick >= oversleep_log_period_ticks {
                 log::warn!(
                     "MON_HOST_OVERSLEEP tick={} requested_us={} actual_us={} threshold_us={}",
                     tick,
-                    tick_us,
+                    sleep_us,
                     actual.as_micros() as u64,
                     threshold.as_micros() as u64,
                 );

@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::hash::fnv1a_hash;
-use crate::manifest::{self, Manifest};
+use crate::manifest::{self, Manifest, TimerClass};
 use crate::schema;
 use crate::uf2::extract_region;
 
@@ -1177,8 +1177,14 @@ const GRAPH_EDGE_SIZE: usize = 8;
 /// Maximum number of graph edges. Raised from 64 to 128 to fit the
 /// Quantum graph (114 edges).
 const MAX_GRAPH_EDGES: usize = 128;
-/// Per-domain metadata: 4 domains × (tick_us:u16 + exec_mode:u8 + reserved:u8) = 16 bytes
-const DOMAIN_META_SIZE: usize = 16;
+/// Per-domain metadata: 4 domains × DOMAIN_META_ENTRY_SIZE.
+/// Entry = `tick_us:u16 | exec_mode:u8 | adaptive_flags:u8` = 4 bytes. The
+/// adaptive-tick `tick_min_us`/`tick_max_us` bounds are NOT in this entry; they
+/// live in the unchecksummed post-body tail (see ADAPTIVE_POST_SIZE) so the
+/// checksummed `body_size` is unchanged (RFC adaptive_tick §8). Mirrors
+/// `kernel::config::{DOMAIN_META_ENTRY_SIZE, DOMAIN_META_SIZE}`.
+const DOMAIN_META_ENTRY_SIZE: usize = 4;
+const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// Graph section size (header + edges + domain metadata)
 const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
 
@@ -1273,6 +1279,17 @@ const MAX_DOMAINS: usize = 4;
 /// Burst-mode deadline multiplier — mirrors
 /// `kernel::step_guard::BURST_MULTIPLIER`.
 const BURST_DEADLINE_MULTIPLIER: u32 = 8;
+
+/// Adaptive-tick per-domain enable bits — mirror
+/// `kernel::scheduler::ADAPTIVE_FLAG_{IDLE,CADENCE}` (RFC adaptive_tick §8).
+const ADAPTIVE_FLAG_IDLE: u8 = 0x01;
+const ADAPTIVE_FLAG_CADENCE: u8 = 0x02;
+/// Valid per-domain tick bounds (µs), mirrors the kernel `tick_us` range.
+const TICK_US_MIN: u32 = 100;
+const TICK_US_MAX: u32 = 50_000;
+/// Default raft `heartbeat_interval_ms` when the module doesn't override it
+/// (mirrors `clustor raft_engine` default; RFC §7.2 D9 liveness gate).
+const DEFAULT_HEARTBEAT_MS: u64 = 150;
 
 /// Effective tick_us when the config doesn't set one anywhere. Mirrors
 /// the platform main-loop fallback (`tick_period_us = 1000` when
@@ -1473,6 +1490,315 @@ fn validate_scheduler_budgets(
                  the loop slips. Lower a declared deadline, raise tick_us, or \
                  split modules across additional domains."
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate the adaptive-tick per-domain config (RFC adaptive_tick §8, D8/D9/D10).
+///
+/// Runs only when at least one domain sets `adaptive_flags` — an unconfigured
+/// graph is untouched (byte-identical). Enforces:
+///   * **Range**: per adaptive domain, non-zero `tick_min_us`/`tick_max_us` ∈
+///     `[100, 50000]` and `tick_min ≤ tick_max` (0 = "use tick_us"). Warns when
+///     `tick_min == tick_max` (adaptive enabled but no range ⇒ no-op).
+///   * **Burst-at-floor (D8)**: for a mechanism-(b) domain, each module's
+///     `step_deadline_us × BURST` must fit `16 × tick_min_us` — the smallest
+///     cadence the domain can reach (evidence #4/#5).
+///   * **Liveness (D9)**: demand-driven idle (bit 0) on a domain hosting a
+///     liveness module (`raft_engine`) requires `tick_max_us <
+///     heartbeat_interval_ms × 1000`, else an idle leader misses heartbeats →
+///     spurious elections.
+///   * **Multi-node raft (D10)**: a `raft_engine` on an adaptive domain in a
+///     multi-node cluster (`voter_count`/`peer_count > 1`) is rejected — the
+///     raft-owning domain must be fixed cadence (both mechanisms off).
+///
+///   * **Timer-class (D8, RFC §8 rules 1-2)**: on a mechanism-(b) domain every
+///     admitted module must POSITIVELY attest cadence tolerance (`wall_clock` or
+///     explicit `agnostic`); an unattested module (no `timer_class` / no
+///     manifest) defaults to step_counted and is blocked (fail closed). A
+///     non-zero `step_period_ticks` (manifest → ABI header byte 1) is blocked on
+///     (b) unless `wall_clock`. On an (a)-only domain the gate is lenient (only
+///     `tick_counted`/`guaranteed` rejected).
+///
+/// NOT yet enforced here (documented follow-ups, RFC §8): the replicated-clock
+/// (ttl/lease) gate, the Guaranteed-tier WCET re-validation, and the
+/// bcm2712-only domain-0 `DBG_TICK` / `tick_count`-as-ms gates. These block their
+/// respective hazards once the bcm2712 multi-domain path lands.
+/// Read a numeric module param from EITHER the top-level entry (`voter_count: 3`)
+/// OR a nested `params:` map (`params: { voter_count: 3 }`). The TLV packer
+/// accepts both styles (schema.rs:298-335), so the D9/D10 raft gates must too —
+/// otherwise the normal top-level style silently bypasses them.
+fn module_param_u64(m: &Value, key: &str) -> Option<u64> {
+    m.get(key).and_then(|v| v.as_u64()).or_else(|| {
+        m.get("params")
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_u64())
+    })
+}
+
+fn validate_adaptive_tick(
+    config: &Value,
+    module_list: &[Value],
+    tick_us: u16,
+    domain_names: &[String],
+    domain_tick_us: &[u16],
+    manifests: &HashMap<String, Manifest>,
+    extra_module_dirs: &[&std::path::Path],
+) -> Result<()> {
+    // Read RAW u64 values (not `as u16`/`as u8`) so out-of-range inputs are
+    // caught BEFORE the wire cast silently wraps them (e.g. tick_max_us=200000
+    // would wrap to 3392 in a u16 and slip past the range check).
+    let mut flags = [0u64; MAX_DOMAINS];
+    let mut tmin = [0u64; MAX_DOMAINS];
+    let mut tmax = [0u64; MAX_DOMAINS];
+    if let Some(domains) = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(|d| d.as_array())
+    {
+        for (i, dom) in domains.iter().take(MAX_DOMAINS).enumerate() {
+            flags[i] = dom
+                .get("adaptive_flags")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            tmin[i] = dom.get("tick_min_us").and_then(|v| v.as_u64()).unwrap_or(0);
+            tmax[i] = dom.get("tick_max_us").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+    }
+    // Unconfigured ⇒ nothing to check (byte-identical path).
+    if flags.iter().all(|&f| f == 0) {
+        return Ok(());
+    }
+
+    let eff = |d: usize| -> u32 {
+        let dt = domain_tick_us.get(d).copied().unwrap_or(0);
+        if dt > 0 {
+            dt as u32
+        } else if tick_us > 0 {
+            tick_us as u32
+        } else {
+            DEFAULT_TICK_US
+        }
+    };
+    let label = |d: usize| -> &str { domain_names.get(d).map(String::as_str).unwrap_or("default") };
+
+    for d in 0..MAX_DOMAINS {
+        if flags[d] == 0 {
+            continue;
+        }
+        let allowed = (ADAPTIVE_FLAG_IDLE | ADAPTIVE_FLAG_CADENCE) as u64;
+        if flags[d] & !allowed != 0 {
+            return Err(Error::Config(format!(
+                "domain '{}': adaptive_flags={:#x} sets reserved bits; only bit 0 \
+                 (demand-driven idle) and bit 1 (adaptive cadence) are defined.",
+                label(d),
+                flags[d]
+            )));
+        }
+        for (name, v) in [("tick_min_us", tmin[d]), ("tick_max_us", tmax[d])] {
+            if v != 0 && !((TICK_US_MIN as u64)..=(TICK_US_MAX as u64)).contains(&v) {
+                return Err(Error::Config(format!(
+                    "domain '{}': {name}={v} out of range [{TICK_US_MIN}, {TICK_US_MAX}].",
+                    label(d)
+                )));
+            }
+        }
+        let emin = if tmin[d] > 0 { tmin[d] } else { eff(d) as u64 };
+        let emax = if tmax[d] > 0 { tmax[d] } else { eff(d) as u64 };
+        if emin > emax {
+            return Err(Error::Config(format!(
+                "domain '{}': tick_min_us ({emin}) > tick_max_us ({emax}).",
+                label(d)
+            )));
+        }
+        if emin == emax {
+            eprintln!(
+                "warning: domain '{}' sets adaptive_flags={:#x} but tick_min_us == \
+                 tick_max_us ({emin}) — adaptive tick has no range to move in (no-op). \
+                 Set tick_min_us < tick_max_us.",
+                label(d),
+                flags[d]
+            );
+        }
+    }
+
+    // Multi-node detection: any module declaring voter_count/peer_count > 1,
+    // in EITHER the top-level or nested `params:` style (both packed).
+    let multi_node = module_list.iter().any(|m| {
+        ["voter_count", "peer_count"]
+            .iter()
+            .any(|k| module_param_u64(m, k).unwrap_or(1) > 1)
+    });
+
+    for m in module_list {
+        let mtype = m
+            .get("type")
+            .or_else(|| m.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mname = m.get("name").and_then(|v| v.as_str()).unwrap_or(mtype);
+        let d = resolve_domain_id(m, config)? as usize;
+        if d >= MAX_DOMAINS || flags[d] == 0 {
+            continue;
+        }
+
+        // D8 timer-class attestation (AC5b): a module that counts scheduler
+        // ticks as time (`tick_counted`) or needs a fixed-cadence WCET
+        // (`guaranteed`) cannot run on an adaptive-tick domain — a variable
+        // cadence warps its timers / breaks its real-time guarantee. We read from
+        // the RESOLVED manifest map (`load_module_manifests_with_extra`, keyed by
+        // instance name, incl. extra_module_dirs) — NOT the narrower
+        // `from_source_tree`, which would miss external/project modules.
+        //
+        // The policy is SCOPED TO THE MECHANISM (RFC adaptive_tick §8 rules 1-2):
+        //  * Mechanism (b) (variable cadence): every admitted module must
+        //    POSITIVELY attest cadence tolerance (`wall_clock` or explicit
+        //    `agnostic`). An Unattested module (no timer_class / no manifest)
+        //    defaults to step_counted and is BLOCKED until attested — fail closed.
+        //    A non-zero `step_period_ticks` is also blocked unless `wall_clock`.
+        //  * Mechanism (a)-only: the lenient gate — only the hard-unsafe classes
+        //    (`tick_counted`/`guaranteed`) are rejected; idle-relax alone doesn't
+        //    warp a running module, and the §7.2/§7.3 type-specific gates cover it.
+        let cadence = flags[d] & ADAPTIVE_FLAG_CADENCE as u64 != 0;
+        if let Some(man) = manifests.get(mname) {
+            if cadence {
+                if !man.timer_class.tolerates_variable_cadence() {
+                    return Err(Error::Config(format!(
+                        "module '{mname}' (timer_class={}) cannot run on mechanism-(b) \
+                         (variable-cadence) domain '{}': it must positively attest \
+                         `timer_class = \"wall_clock\"` (or `\"agnostic\"` if it is \
+                         genuinely cadence-independent). An unattested module defaults \
+                         to step_counted and is blocked on (b) until attested \
+                         (RFC adaptive_tick §8 rule 2).",
+                        man.timer_class.as_str(),
+                        label(d),
+                    )));
+                }
+                // RFC §8 rule 1: a coarse step period counts TICKS, so the
+                // wall-clock period (step_period_ticks × domain_tick_us) warps as
+                // the pacer moves — blocked unless the module reads real time.
+                if man.step_period_ticks != 0 && man.timer_class != TimerClass::WallClock {
+                    return Err(Error::Config(format!(
+                        "module '{mname}' (step_period_ticks={}) cannot run on \
+                         mechanism-(b) domain '{}': its period counts scheduler ticks, \
+                         so the wall-clock cadence (step_period_ticks × domain_tick_us) \
+                         warps as the pacer moves. Declare `timer_class = \"wall_clock\"` \
+                         only if it re-derives its period from real time, else move it \
+                         to a fixed-cadence domain (RFC adaptive_tick §8 rule 1).",
+                        man.step_period_ticks,
+                        label(d),
+                    )));
+                }
+            } else if man.timer_class.forbids_adaptive() {
+                return Err(Error::Config(format!(
+                    "module '{mname}' (timer_class={}) cannot run on adaptive-tick \
+                     domain '{}': a {} module's timekeeping does not tolerate a \
+                     variable scheduler cadence (RFC adaptive_tick D8/AC5b). Move it \
+                     to a fixed-cadence domain (adaptive_flags=0) or correct its \
+                     timer_class.",
+                    man.timer_class.as_str(),
+                    label(d),
+                    man.timer_class.as_str(),
+                )));
+            }
+        } else if let Some(root) = resolve_module_root(mtype, extra_module_dirs) {
+            // Not in the parsed map: either a malformed manifest (omitted by the
+            // loader's warn-and-skip) or genuinely manifest-less.
+            let manifest_path = root.join("manifest.toml");
+            if manifest_path.exists() {
+                // A malformed manifest is a hard error on ANY adaptive domain — its
+                // timer_class can't be verified, so fail closed (a typo must not
+                // downgrade to "no manifest" and pass).
+                if let Err(e) = Manifest::from_toml(&manifest_path) {
+                    return Err(Error::Config(format!(
+                        "module '{mname}' is placed on adaptive-tick domain '{}' but \
+                         its manifest {} failed to parse, so its timer_class cannot \
+                         be verified: {e}. Fix the manifest — a malformed \
+                         timer_class must not silently downgrade to 'no manifest' \
+                         and pass adaptive admission (RFC adaptive_tick D8/AC5b).",
+                        label(d),
+                        manifest_path.display(),
+                    )));
+                }
+                // Parses but absent from the map (shouldn't happen) — leave it;
+                // the lenient/strict checks above only apply via the map.
+            } else if cadence {
+                // Genuinely manifest-less on a mechanism-(b) domain: unattested ⇒
+                // blocked. On an (a)-only domain it is still admitted (lenient).
+                return Err(Error::Config(format!(
+                    "module '{mname}' has no manifest, so it cannot attest a \
+                     timer_class, and an unattested module cannot run on \
+                     mechanism-(b) (variable-cadence) domain '{}'. Add a manifest \
+                     declaring `timer_class = \"wall_clock\"` or `\"agnostic\"`, or \
+                     move it to a fixed-cadence domain (RFC adaptive_tick §8 rule 2).",
+                    label(d),
+                )));
+            }
+        } else if cadence {
+            // Module root unresolvable AND on a (b) domain ⇒ cannot attest ⇒ block.
+            return Err(Error::Config(format!(
+                "module '{mname}' could not be resolved to a manifest, so its \
+                 timer_class cannot be verified; an unattested module cannot run on \
+                 mechanism-(b) domain '{}' (RFC adaptive_tick §8 rule 2).",
+                label(d),
+            )));
+        }
+
+        // D8 burst-at-floor: for a (b) domain, the burst deadline must fit the
+        // SMALLEST cadence the domain can reach (tick_min).
+        if flags[d] & ADAPTIVE_FLAG_CADENCE as u64 != 0 {
+            if let Some(dl) = m.get("step_deadline_us").and_then(|v| v.as_u64()) {
+                let burst = dl.saturating_mul(BURST_DEADLINE_MULTIPLIER as u64);
+                let floor_tick = if tmin[d] > 0 { tmin[d] } else { eff(d) as u64 };
+                if burst > floor_tick.saturating_mul(16) {
+                    return Err(Error::Config(format!(
+                        "module '{mname}' in adaptive (cadence) domain '{}': burst deadline \
+                         {burst} us (step_deadline_us={dl} × {BURST_DEADLINE_MULTIPLIER}) exceeds \
+                         16 × tick_min_us ({}). Mechanism (b) can drive the tick down to \
+                         tick_min_us, so the burst guardrail must fit there. Lower \
+                         step_deadline_us or raise tick_min_us.",
+                        label(d),
+                        floor_tick.saturating_mul(16)
+                    )));
+                }
+            }
+        }
+
+        // Liveness / multi-node raft gates apply to raft_engine.
+        if mtype != "raft_engine" {
+            continue;
+        }
+        // D10: a raft-owning domain on a multi-node cluster must be fixed.
+        if multi_node {
+            return Err(Error::Config(format!(
+                "raft_engine '{mname}' is on adaptive domain '{}' of a multi-node cluster \
+                 (voter_count/peer_count > 1). Per-node-variable pacing de-syncs heartbeat/\
+                 election timing across nodes → cross election timeouts. Pin the raft-owning \
+                 domain to fixed cadence (remove adaptive_flags), or satisfy the §7.2 \
+                 heartbeat clamp on every node (D10).",
+                label(d)
+            )));
+        }
+        // D9: demand-driven idle on a liveness domain requires the backstop to
+        // fire before a heartbeat is due.
+        if flags[d] & ADAPTIVE_FLAG_IDLE as u64 != 0 {
+            let hb_ms =
+                module_param_u64(m, "heartbeat_interval_ms").unwrap_or(DEFAULT_HEARTBEAT_MS);
+            let hb_us = hb_ms.saturating_mul(1000);
+            let emax = if tmax[d] > 0 { tmax[d] } else { eff(d) as u64 };
+            if emax >= hb_us {
+                return Err(Error::Config(format!(
+                    "raft_engine '{mname}' on adaptive domain '{}': demand-driven idle \
+                     (adaptive_flags bit 0) with tick_max_us={emax} ≥ heartbeat_interval \
+                     ({hb_ms} ms = {hb_us} us). An idle leader would stop emitting heartbeats \
+                     for up to tick_max_us while followers count toward election timeout → \
+                     spurious elections. Set tick_max_us < {hb_us}, or clear bit 0 on this \
+                     domain (D9).",
+                    label(d)
+                )));
+            }
         }
     }
 
@@ -3686,11 +4012,16 @@ pub fn load_module_manifests_with_extra(
                 // Don't silently swallow the parse error — a
                 // malformed manifest looks identical to a missing
                 // one downstream ("no manifest found") and the
-                // user has no idea why. Surface the path + error;
-                // the downstream gate still errors out because the
-                // module didn't make it into the map. Dedup'd
-                // across the process so re-entry from multiple
-                // validators doesn't spam the same path 3-4 times.
+                // user has no idea why. Surface the path + error.
+                // NOTE: a malformed manifest is OMITTED from the
+                // map, which is indistinguishable from "no manifest"
+                // to map lookups — so a gate that must NOT fail open
+                // on a malformed manifest (e.g. the adaptive
+                // timer-class gate in `validate_adaptive_tick`) has
+                // to re-check manifest-file existence itself and
+                // reject; it cannot rely on the omission alone.
+                // Dedup'd across the process so re-entry from
+                // multiple validators doesn't spam the same path.
                 warn_manifest_parse_error_once(&manifest_path, &e);
             }
         }
@@ -4780,6 +5111,11 @@ fn generate_config_impl(
     // step over budget — observable only as missed-deadline timeouts
     // at runtime.
     validate_scheduler_budgets(config, module_list, tick_us, &domain_names, &domain_tick_us)?;
+    // NOTE: validate_adaptive_tick is deferred to AFTER the manifest map is
+    // built (below) — its timer-class gate must consult the SAME resolver
+    // (`load_module_manifests_with_extra`, incl. extra_module_dirs) the rest of
+    // config-gen uses, or an external/project tick_counted module would fail
+    // open on an adaptive domain.
 
     // ISR-tier admission: every module routed to a Tier 1b/2 domain
     // must declare `isr_safe = true` in its manifest, and the wiring
@@ -4828,6 +5164,20 @@ fn generate_config_impl(
     // outside the hard-coded `Manifest::from_source_tree` search
     // list (e.g. modules in the install root or in extras).
     let manifests = load_module_manifests_with_extra(modules_ref, extra_module_dirs);
+
+    // Adaptive-tick validation (range/D8/D9/D10 + timer-class gate). Run here,
+    // after the full manifest map exists, so the timer-class gate resolves
+    // external/project modules via the same resolver (not the narrower
+    // from_source_tree) — closing the fail-open for non-bundled modules.
+    validate_adaptive_tick(
+        config,
+        module_list,
+        tick_us,
+        &domain_names,
+        &domain_tick_us,
+        &manifests,
+        extra_module_dirs,
+    )?;
 
     let (module_entries, module_names) =
         parse_modules_map(modules_ref, data_section, config, modules_dir, &manifests)?;
@@ -4934,9 +5284,10 @@ fn generate_config_impl(
         }
     }
 
-    // Mirrors `kernel::config`'s version check; bumped only when the
-    // kernel parser breaks compatibility, not for additive wire-
-    // format extensions like the per-edge `buffer_bytes` override.
+    // Mirrors `kernel::config`'s version check. The format is latest-only
+    // (kernel + tools ship together), so a stale blob is rejected by the
+    // body-size/CRC check, not by a version number. Standing rule: never bump
+    // format versions — it breaks every sibling consumer.
     let version: u16 = 1;
 
     let mut result = Vec::new();
@@ -5054,24 +5405,41 @@ fn generate_config_impl(
     while graph_section.len() < 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE {
         graph_section.push(0);
     }
-    // Domain metadata: 4 entries × (tick_us:u16 LE + exec_mode:u8 + reserved:u8) = 16 bytes
+    // Domain metadata: 4 entries × DOMAIN_META_ENTRY_SIZE (4) bytes:
+    //   tick_us:u16 LE | exec_mode:u8 | adaptive_flags:u8
+    // tick_min_us/tick_max_us are appended in the post-body adaptive section
+    // AFTER the checksum (see below), NOT in this entry — growing the checksummed
+    // body_size hangs the bare-metal CM5 boot.
+    let domains_arr = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(|d| d.as_array());
     for d in 0..4usize {
         let dtick = domain_tick_us.get(d).copied().unwrap_or(0);
+        let dom = domains_arr.and_then(|a| a.get(d));
+        let mode = dom
+            .map(|x| parse_domain_tier_to_exec_mode(x).unwrap_or(0))
+            .unwrap_or(0);
+        // Adaptive-tick per-domain config (RFC adaptive_tick §8), all optional.
+        // 0 ⇒ adaptive off / "use tick_us" (the kernel parser default-fills
+        // tick_min/tick_max to the domain's tick), so a domain that sets none
+        // of these is byte-identical in behaviour to today's fixed tick.
+        let flags = dom
+            .and_then(|x| x.get("adaptive_flags"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u8;
+        let tmin = dom
+            .and_then(|x| x.get("tick_min_us"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u16;
+        let tmax = dom
+            .and_then(|x| x.get("tick_max_us"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u16;
+        let _ = (tmin, tmax); // not stored in the wire (4-byte entry, no growth)
         graph_section.extend_from_slice(&dtick.to_le_bytes());
-        let mode = if let Some(domains) = config
-            .get("execution")
-            .and_then(|e| e.get("domains"))
-            .and_then(|d| d.as_array())
-        {
-            domains
-                .get(d)
-                .map(|dom| parse_domain_tier_to_exec_mode(dom).unwrap_or(0))
-                .unwrap_or(0)
-        } else {
-            0u8
-        };
         graph_section.push(mode);
-        graph_section.push(0); // reserved
+        graph_section.push(flags); // adaptive_flags in the formerly-reserved byte 3
     }
     while graph_section.len() < GRAPH_SECTION_SIZE {
         graph_section.push(0);
@@ -5086,6 +5454,31 @@ fn generate_config_impl(
     // Compute CRC16-CCITT checksum of body (bytes 8 onwards)
     let checksum = crc16_ccitt(&result[8..]);
     result[6..8].copy_from_slice(&checksum.to_le_bytes());
+
+    // Adaptive-tick post-body section: 4 domains × [tick_min_us:u16 LE,
+    // tick_max_us:u16 LE] = 16 bytes, appended AFTER the checksum so it sits
+    // PAST body_size (the kernel reads it at total_size). Deliberately not in
+    // body_size / not checksum-covered: growing body_size hangs the bare-metal
+    // CM5 boot, but trailing bytes past it are harmless (both rig-proven).
+    // Mirrors `kernel::config::ADAPTIVE_POST_SIZE`; default 0 ⇒ kernel uses the
+    // domain tick (adaptive is a no-op when unconfigured).
+    let adaptive_domains = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(|d| d.as_array());
+    for d in 0..4usize {
+        let dom = adaptive_domains.and_then(|a| a.get(d));
+        let tmin = dom
+            .and_then(|x| x.get("tick_min_us"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u16;
+        let tmax = dom
+            .and_then(|x| x.get("tick_max_us"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u16;
+        result.extend_from_slice(&tmin.to_le_bytes());
+        result.extend_from_slice(&tmax.to_le_bytes());
+    }
 
     Ok(result)
 }
@@ -5552,6 +5945,197 @@ mod scheduler_validation_tests {
             msg.contains("audoi") && msg.contains("audio") && msg.contains("control"),
             "expected error to name typo and known domains, got: {msg}"
         );
+    }
+
+    // ---- F2: D9/D10 must read params from top-level OR nested `params:` ----
+
+    #[test]
+    fn module_param_u64_reads_top_level_and_nested() {
+        // Top-level style `voter_count: 3` (the normal/packed form).
+        let top = json!({"name": "r", "type": "raft_engine", "voter_count": 3});
+        assert_eq!(module_param_u64(&top, "voter_count"), Some(3));
+        // Nested `params: { voter_count: 3 }`.
+        let nested = json!({"name": "r", "params": {"voter_count": 3}});
+        assert_eq!(module_param_u64(&nested, "voter_count"), Some(3));
+        // Absent → None (callers default appropriately).
+        assert_eq!(module_param_u64(&json!({"name": "r"}), "voter_count"), None);
+        // Top-level wins when both are present.
+        let both = json!({"name": "r", "voter_count": 5, "params": {"voter_count": 9}});
+        assert_eq!(module_param_u64(&both, "voter_count"), Some(5));
+    }
+
+    #[test]
+    fn d10_catches_top_level_voter_count_on_adaptive_raft() {
+        // raft_engine on an adaptive domain with TOP-LEVEL voter_count > 1 must
+        // be rejected (D10) — the bypass the nested-only read used to miss.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}
+        ]}});
+        let modules = vec![json!({"name": "raft", "type": "raft_engine", "voter_count": 3})];
+        let manifests = std::collections::HashMap::new();
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[])
+            .expect_err("D10 must reject multi-node raft on an adaptive domain");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("multi-node") && msg.contains("D10"),
+            "expected D10 multi-node rejection, got: {msg}"
+        );
+    }
+
+    // ---- F3: malformed manifest must FAIL CLOSED on an adaptive domain ----
+
+    #[test]
+    fn malformed_manifest_fails_closed_on_adaptive_domain() {
+        // `load_module_manifests_with_extra` only warns and OMITS a manifest that
+        // fails to parse, so a typo in `timer_class` would downgrade to "no
+        // manifest" and fail OPEN through the gate's `Some(man)` check. A
+        // malformed manifest on an adaptive domain must instead fail CLOSED — we
+        // cannot verify its timer_class.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("typo_mod");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        // Otherwise-valid manifest with an INVALID timer_class value → from_toml
+        // errors → the loader would warn + omit it from the parsed map.
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"cm5\"]\ntimer_class = \"tikc_counted\"\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}
+        ]}});
+        let modules = vec![json!({"name": "typo_mod", "type": "typo_mod"})];
+        // Empty parsed map simulates the loader's warn-and-omit of the bad file.
+        let manifests = std::collections::HashMap::new();
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &extras)
+            .expect_err("a malformed manifest on an adaptive domain must fail closed");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("failed to parse") && msg.contains("typo_mod"),
+            "expected fail-closed parse diagnostic naming the module, got: {msg}"
+        );
+    }
+
+    // ---- High-1: timer-class admission is fail-closed for mechanism (b) ----
+
+    #[test]
+    fn manifestless_module_passes_on_idle_a_domain_but_blocks_on_cadence_b() {
+        // (a)-only domain (flags=1): a genuinely manifest-less module is ADMITTED
+        // — the lenient gate, since idle-relax alone doesn't warp a running module
+        // (the §7.2/§7.3 type-specific gates cover (a)'s hazards). (b) domain
+        // (flags=3): the SAME module is BLOCKED — unattested defaults to
+        // step_counted (RFC adaptive_tick §8 rule 2, fail closed).
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A resolvable module DIRECTORY with NO manifest.toml — the realistic
+        // "genuinely manifest-less" case.
+        std::fs::create_dir_all(dir.path().join("no_manifest_mod")).expect("mkdir");
+        let modules = vec![json!({"name": "no_manifest_mod", "type": "no_manifest_mod"})];
+        let manifests = std::collections::HashMap::new();
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+
+        let cfg_a = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        validate_adaptive_tick(&cfg_a, &modules, 100, &names, &ticks, &manifests, &extras)
+            .expect("manifest-less module must pass on a mechanism-(a)-only domain");
+
+        let cfg_b = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let err = validate_adaptive_tick(&cfg_b, &modules, 100, &names, &ticks, &manifests, &extras)
+            .expect_err("manifest-less (unattested) module must be blocked on a (b) domain");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("no manifest") && msg.contains("no_manifest_mod"),
+            "expected unattested-block diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unattested_manifest_blocked_on_cadence_b_domain() {
+        // A module WITH a manifest but NO timer_class field defaults to Unattested
+        // → blocked on a (b) domain. The map carries the parsed (Unattested) manifest.
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("plain".to_string(), Manifest::default()); // timer_class=Unattested
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let modules = vec![json!({"name": "plain", "type": "plain"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[])
+            .expect_err("an unattested manifest must be blocked on a (b) domain");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("positively attest") && msg.contains("plain"),
+            "expected positive-attestation diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn attested_module_passes_on_cadence_b_domain() {
+        // wall_clock and explicit agnostic both positively attest → admitted on (b).
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let modules = vec![json!({"name": "ok", "type": "ok"})];
+        for tc in [TimerClass::WallClock, TimerClass::Agnostic] {
+            let man = Manifest { timer_class: tc, ..Manifest::default() };
+            let mut manifests = std::collections::HashMap::new();
+            manifests.insert("ok".to_string(), man);
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[])
+                .unwrap_or_else(|e| panic!("{} must pass on a (b) domain, got: {e:?}", tc.as_str()));
+        }
+    }
+
+    #[test]
+    fn step_period_ticks_blocked_on_cadence_b_unless_wallclock() {
+        // RFC §8 rule 1: a non-zero step_period_ticks is tick-counted → blocked on
+        // a (b) domain unless wall_clock (agnostic does NOT override it).
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let modules = vec![json!({"name": "periodic", "type": "periodic"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+
+        // agnostic + step_period_ticks=5 → blocked.
+        let blocked = Manifest {
+            timer_class: TimerClass::Agnostic,
+            step_period_ticks: 5,
+            ..Manifest::default()
+        };
+        let mut m_blocked = std::collections::HashMap::new();
+        m_blocked.insert("periodic".to_string(), blocked);
+        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_blocked, &[])
+            .expect_err("step_period_ticks!=0 on (b) must be blocked unless wall_clock");
+        assert!(
+            format!("{err:?}").contains("step_period_ticks"),
+            "expected step_period_ticks diagnostic, got: {err:?}"
+        );
+
+        // wall_clock + step_period_ticks=5 → passes (re-derives from real time).
+        let ok = Manifest {
+            timer_class: TimerClass::WallClock,
+            step_period_ticks: 5,
+            ..Manifest::default()
+        };
+        let mut m_ok = std::collections::HashMap::new();
+        m_ok.insert("periodic".to_string(), ok);
+        validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_ok, &[])
+            .expect("a wall_clock step-period module must pass on a (b) domain");
     }
 
     #[test]

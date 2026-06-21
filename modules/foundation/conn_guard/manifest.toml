@@ -1,5 +1,9 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350"]
+# Cadence-independent SYN/connection filter pass-through; no tick-based timing.
+# Explicit attestation to run on a mechanism-(b) domain (RFC adaptive_tick §8
+# rule 2 — an absent declaration is unattested → blocked on (b)).
+timer_class = "agnostic"
 
 [[ports]]
 name = "frames_rx"

@@ -1,4 +1,6 @@
 version = "1.0.0"
+# timer_class: TCP/ARP timers increment on a 50 ms wall-clock gate (dev_millis), not per tick.
+timer_class = "wall_clock"
 hardware_targets = ["rp2350", "bcm2712"]
 
 [[ports]]

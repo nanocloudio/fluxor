@@ -209,6 +209,21 @@ pub fn wake_pending_nonzero() -> bool {
         .any(|w| w.load(Ordering::Acquire) != 0)
 }
 
+/// Non-clearing peek at the wake-pending bitmask, restricted to a set of
+/// modules (a domain's modules). True iff any module in `mask` has a pending
+/// event. The adaptive-tick pacer uses this so one domain's idle decision is
+/// not coupled to a sibling domain's wake (RFC adaptive_tick §5.1). Like
+/// `wake_pending_nonzero`, it does NOT consume the bits — the next
+/// `take_wake_pending` still observes them.
+#[inline]
+pub fn wake_pending_in_mask(mask: &ModuleMask) -> bool {
+    let mut words = [0u64; MODULE_MASK_WORDS];
+    for (w, atomic) in words.iter_mut().zip(EVENT_WAKE_PENDING.iter()) {
+        *w = atomic.load(Ordering::Acquire);
+    }
+    ModuleMask::from_words(words).intersects(mask)
+}
+
 /// Release all events owned by a specific module. Called on module finish.
 /// Note: Device providers (GPIO etc.) clean up their own bindings via
 /// their own release_owned_by — this only frees event slots.

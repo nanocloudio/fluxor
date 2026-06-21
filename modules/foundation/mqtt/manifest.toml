@@ -1,4 +1,6 @@
 version = "2.0.0"
+# timer_class: keepalive/reconnect timers read wall-clock (dev_millis).
+timer_class = "wall_clock"
 hardware_targets = ["rp2350"]
 
 [[ports]]

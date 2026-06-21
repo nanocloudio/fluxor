@@ -456,6 +456,77 @@ pub struct ManifestParam {
     pub required: bool,
 }
 
+/// How a module's notion of time relates to the scheduler tick — governs
+/// whether it tolerates the adaptive-tick variable cadence (RFC adaptive_tick
+/// §8 D8 / AC5b). Declared in the manifest as `timer_class = "..."`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimerClass {
+    /// No `timer_class` declared (field absent, or the module has no manifest).
+    /// The SAFE default per RFC adaptive_tick §8 rule 2: an unattested module is
+    /// assumed step-counted, so mechanism (b) (variable cadence, bit 1) is
+    /// BLOCKED on any domain hosting it until it POSITIVELY attests
+    /// `wall_clock` or `agnostic`. Mechanism (a)-only domains still admit it
+    /// (idle-relax alone doesn't warp a running module; the §7.2/§7.3
+    /// liveness/replicated-clock gates cover (a)'s hazards by module type). This
+    /// is distinct from an EXPLICIT `agnostic` — the absence of a declaration is
+    /// not an attestation.
+    #[default]
+    Unattested,
+    /// Cadence-independent — a pure data transform whose output is a function of
+    /// its inputs, not of *when* it runs. Safe under any cadence. An EXPLICIT
+    /// declaration that the author has reasoned about cadence (a positive
+    /// attestation, unlike `Unattested`).
+    Agnostic,
+    /// Reads real wall-clock time (`dev_millis`/`dev_micros`) for its timing, so
+    /// a variable cadence only changes *when* it samples, never its correctness.
+    /// Safe under adaptive tick.
+    WallClock,
+    /// Counts scheduler ticks/passes as a time proxy — its sense of time warps
+    /// when the cadence varies (a relaxed tick stretches its timers). UNSAFE on
+    /// an adaptive domain; the validator rejects it (AC5b).
+    TickCounted,
+    /// Needs a fixed-cadence WCET guarantee (a control loop / hard-real-time
+    /// step). UNSAFE on an adaptive domain; the validator rejects it.
+    Guaranteed,
+}
+
+impl TimerClass {
+    /// Parse the manifest string; unknown values are an error so a typo can't
+    /// silently downgrade to the lenient default. `unattested` is NOT a writable
+    /// value — it is the implicit default for an absent declaration only.
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "agnostic" => Some(Self::Agnostic),
+            "wall_clock" => Some(Self::WallClock),
+            "tick_counted" => Some(Self::TickCounted),
+            "guaranteed" => Some(Self::Guaranteed),
+            _ => None,
+        }
+    }
+    /// True when the class cannot tolerate a variable scheduler cadence — used
+    /// for the mechanism-(a)-only lenient gate (only the two hard-unsafe classes
+    /// are rejected; `Unattested`/`Agnostic`/`WallClock` are admitted on (a)).
+    pub fn forbids_adaptive(self) -> bool {
+        matches!(self, Self::TickCounted | Self::Guaranteed)
+    }
+    /// True only for a POSITIVE attestation that the module tolerates a variable
+    /// cadence. Required for every admitted module on a mechanism-(b) domain (RFC
+    /// §8 rule 2): `Unattested` (absent declaration) does NOT qualify — that is
+    /// the fail-closed default.
+    pub fn tolerates_variable_cadence(self) -> bool {
+        matches!(self, Self::WallClock | Self::Agnostic)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unattested => "unattested",
+            Self::Agnostic => "agnostic",
+            Self::WallClock => "wall_clock",
+            Self::TickCounted => "tick_counted",
+            Self::Guaranteed => "guaranteed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub module_version: u16,
@@ -526,6 +597,20 @@ pub struct Manifest {
     /// `.fmod` modules carry their schema embedded in the binary; built-ins
     /// declare it here so the config tool can validate YAML and pack TLV.
     pub params: Vec<ManifestParam>,
+    /// How the module's timekeeping relates to the scheduler tick (RFC
+    /// adaptive_tick §8 D8 / AC5b). Default `Unattested` (no declaration). The
+    /// config validator rejects `TickCounted`/`Guaranteed` on any adaptive
+    /// domain, and on a mechanism-(b) domain requires a POSITIVE attestation
+    /// (`wall_clock` or `agnostic`) — `Unattested` is fail-closed for (b).
+    pub timer_class: TimerClass,
+    /// Coarse-step period in scheduler ticks (module ABI header byte 1,
+    /// loader.rs:846). 0 = step every tick (default). N>0 = step every N ticks;
+    /// the scheduler counts TICKS, so the wall-clock period is
+    /// `step_period_ticks × domain_tick_us` — which a variable cadence WARPS.
+    /// The adaptive validator therefore errors when a `step_period_ticks != 0`
+    /// module is on a mechanism-(b) domain unless it attests `wall_clock` (RFC
+    /// §8 rule 1). Wired into header byte 1 by `pack_fmod`/`pack_fmod_wasm`.
+    pub step_period_ticks: u8,
 }
 
 impl Default for Manifest {
@@ -550,6 +635,8 @@ impl Default for Manifest {
             pre_tick_drain: false,
             requires: TomlRequires::default(),
             params: Vec::new(),
+            timer_class: TimerClass::Unattested,
+            step_period_ticks: 0,
         }
     }
 }
@@ -1166,6 +1253,31 @@ impl Manifest {
             });
         }
 
+        let timer_class = match toml_val.timer_class.as_deref() {
+            // Absent ⇒ Unattested (fail-closed on mechanism (b); see TimerClass).
+            None => TimerClass::Unattested,
+            Some(s) => TimerClass::from_str_opt(s).ok_or_else(|| {
+                Error::Module(format!(
+                    "manifest timer_class=\"{s}\" is invalid; expected one of \
+                     agnostic | wall_clock | tick_counted | guaranteed"
+                ))
+            })?,
+        };
+
+        // step_period_ticks is the module ABI header byte 1 (0..=255). Range-check
+        // here so an out-of-byte value is a clear manifest error, not a silent
+        // truncation when wired into the header by pack_fmod.
+        let step_period_ticks = match toml_val.step_period_ticks {
+            None => 0u8,
+            Some(n) if n <= u8::MAX as u64 => n as u8,
+            Some(n) => {
+                return Err(Error::Module(format!(
+                    "manifest step_period_ticks={n} out of range; the ABI field is \
+                     a single byte (0..=255). 0 = every tick."
+                )));
+            }
+        };
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -1186,6 +1298,8 @@ impl Manifest {
             pre_tick_drain: toml_val.pre_tick_drain,
             requires: toml_val.requires,
             params,
+            timer_class,
+            step_period_ticks,
         })
     }
 
@@ -1438,6 +1552,13 @@ impl Manifest {
             // through the binary loses it; that's intentional.
             requires: TomlRequires::default(),
             params: Vec::new(), // toml-only, not serialized
+            // timer_class is a TOML-only build-time concern (drives the config
+            // validator's adaptive-tick gate); not serialized into the binary, so
+            // a binary-loaded manifest is Unattested (fail-closed) by default.
+            timer_class: TimerClass::Unattested,
+            // step_period_ticks lives in the module ABI HEADER (byte 1), not the
+            // manifest binary parsed here; a manifest-only load defaults to 0.
+            step_period_ticks: 0,
         })
     }
 
@@ -1590,6 +1711,17 @@ struct TomlManifest {
     /// `[[params]]` declarations — built-in modules only. PIC modules
     /// embed schema in their .fmod and these are ignored.
     params: Option<Vec<TomlParam>>,
+    /// `timer_class = "agnostic"|"wall_clock"|"tick_counted"|"guaranteed"` —
+    /// how the module's timekeeping relates to the scheduler tick. Absent ⇒
+    /// `Unattested` (fail-closed on mechanism (b)). See `TimerClass`
+    /// (RFC adaptive_tick §8 D8 / AC5b).
+    timer_class: Option<String>,
+    /// `step_period_ticks = N` — coarse-step period: run this module every N
+    /// scheduler ticks (0/absent = every tick). Wired into ABI header byte 1.
+    /// A non-zero value is tick-counted, so the adaptive validator blocks it on
+    /// a mechanism-(b) domain unless `timer_class = "wall_clock"` (RFC §8 rule 1).
+    #[serde(default)]
+    step_period_ticks: Option<u64>,
 }
 
 /// Hardware-feature requirements declared by a module in its

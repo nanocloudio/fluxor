@@ -53,7 +53,7 @@ mod exception;
 
 // Bring UART + GIC + exception names into the binary's namespace so
 // existing callsites (`uart_puts(b"…")`, `irq_bind(…)`, `GICD_BASE`,
-// `IRQ_BINDING_COUNT`, `TICKS_PER_TICK`, `CORE_TICKS`,
+// `IRQ_BINDING_COUNT`, `NEXT_DEADLINE_TICKS`, `CORE_TICKS`,
 // `current_core_id()`, …) stay unchanged. The submodules own the MMIO
 // registers, log-ring drain, debug-tx sink, GIC distributor + CPU
 // interface init, IRQ binding state, exception vectors, and the IRQ
@@ -705,6 +705,13 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     unsafe { log::set_logger_racy(&LOGGER).ok() };
     log::set_max_level(log::LevelFilter::Info);
 
+    // Force the active cooler to full so sustained-load rig runs aren't
+    // confounded by thermal throttling (RFC adaptive_tick AC7). Drives the RP1
+    // PWM channel the boot firmware uses for the Pi 5 / CM5 fan; the readback is
+    // logged so the rig can confirm the writes took. No-op on QEMU. Placed after
+    // logger init so the report reaches the UDP telemetry stream.
+    rp1::cooling_full_on();
+
     // PCIe1 bring-up: stages 1 + 2a + 2b (reset/RESCAL + RC-wide regs
     // + MDIO tuning). Stage 2c onwards (SerDes/PERST#/link) is deferred
     // pending cold-boot stability work.
@@ -722,13 +729,20 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Exception vectors + GIC + timer
     // Timer tick period will be recalculated after config is parsed (tick_us).
     // Start with 1ms default so the system runs during init.
+    let default_ticks = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
+    // Seed every per-core deadline slot with the 1 ms default so any core
+    // that takes a timer IRQ before its domain-specific re-seed reloads a
+    // sane value. Cores 1-3 overwrite their own slot in `secondary_core_main`
+    // and core 0 re-seeds from config.tick_us below.
+    for slot in &NEXT_DEADLINE_TICKS {
+        slot.store(default_ticks, Ordering::Relaxed);
+    }
     // SAFETY: GIC + generic timer init touch system control regs that the
     // boot path is the sole writer of; DAIFCLR enables IRQs after vectors
     // and step_guard are wired.
     unsafe {
         gic_init();
-        TICKS_PER_TICK = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
-        timer::timer_set(TICKS_PER_TICK);
+        timer::timer_set(default_ticks);
         core::arch::asm!("msr daifclr, #2"); // enable IRQs
     }
 
@@ -820,16 +834,23 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Reconfigure the timer tick from config.tick_us.
     let tick_us = if cfg.header.tick_us > 0 { cfg.header.tick_us as u32 } else { 1000 };
-    // SAFETY: TICKS_PER_TICK is a u32 static; single boot-time writer.
+    // freq is in Hz, so ticks_per_us = freq / 1_000_000
+    // ticks = tick_us * (freq / 1_000_000) = tick_us * freq / 1_000_000
+    let core0_ticks = if freq > 0 {
+        ((tick_us as u64) * freq / 1_000_000) as u32
+    } else {
+        62500 * tick_us / 1000
+    };
+    // Core 0 runs the default domain (domain 0); its Tier-0 cadence is the
+    // global tick. Seed core 0's per-core deadline slot and arm the timer.
+    // Cores 1-3 re-seed their own slots from `domain_tick_us` in
+    // `secondary_core_main`; the per-core slot is what survives the IRQ
+    // handler's reload, so each domain keeps its own rate.
+    let core0 = (current_core_id() as usize).min(NEXT_DEADLINE_TICKS.len() - 1);
+    NEXT_DEADLINE_TICKS[core0].store(core0_ticks, Ordering::Relaxed);
+    // SAFETY: generic-timer regs are per-CPU; the boot core is the sole writer.
     unsafe {
-        // freq is in Hz, so ticks_per_us = freq / 1_000_000
-        // TICKS_PER_TICK = tick_us * (freq / 1_000_000) = tick_us * freq / 1_000_000
-        TICKS_PER_TICK = if freq > 0 {
-            ((tick_us as u64) * freq / 1_000_000) as u32
-        } else {
-            62500 * tick_us / 1000
-        };
-        timer::timer_set(TICKS_PER_TICK);
+        timer::timer_set(core0_ticks);
     }
     uart_puts(b"[timer] tick_us=");
     uart_put_u32(tick_us);
@@ -1025,6 +1046,78 @@ impl DomainMetrics {
 static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
     [const { DomainMetrics::new() }; multicore::MAX_DOMAINS];
 
+/// Arm this core's next Tier-0 deadline from the pass just finished (RFC
+/// adaptive_tick §5.5 arm-after-step). The kernel pacer chooses the next-pass
+/// period (µs) from the domain's busy/idle + worst-step signals; we convert to
+/// generic-timer ticks and write this core's `NEXT_DEADLINE_TICKS` slot, which
+/// the `TIMER_PPI` handler reloads on the next fire. The IRQ-driven reload means
+/// the chosen period takes effect on the following timer period (a one-period
+/// propagation lag, acceptable for a cadence pacer).
+///
+/// A fixed domain (`adaptive_flags == 0`) gets the fixed `domain_tick_us` from
+/// the pacer, so the slot keeps its boot-seeded value and cadence is
+/// byte-identical to the non-adaptive kernel. Variable cadence (mechanisms
+/// (a)/(b)) becomes active only when a domain sets adaptive flags; on bcm2712
+/// multicore it also relies on the §5.4 SEV/WFI wake bound and the §5.1
+/// per-domain wake mask.
+///
+/// §5.4 SEV-vs-WFI bound: the Tier-0 loop idles on `WFI`, broken only by an IRQ.
+/// IRQ-backed wakes (device interrupts) break it immediately, but a
+/// cross-domain / software wake only sets `EVENT_WAKE_PENDING` — it does NOT
+/// raise an IRQ, so it cannot cut short a widened idle `WFI`; that wake is
+/// serviced when the timer next fires. We therefore clamp the adaptive
+/// idle/relaxed deadline so the worst-case software-wake latency is bounded (no
+/// hot-path cost, no extra hardware; an SGI doorbell that interrupts `WFI`
+/// directly is the measured alternative). The clamp only bites when the pacer
+/// relaxes past it (idle (a) → tick_max, or (b) near tick_max); busy passes
+/// return ≤ the nominal tick, far below it, so steady-state and the
+/// non-adaptive default are untouched. Rig-tunable (AC1 idle-wakeup vs AC2
+/// wake-latency trade-off).
+const BCM_IDLE_DEADLINE_CLAMP_US: u32 = 4_000;
+
+/// Most-relaxed deadline (µs) core 0's pacer chose since the last `[therm]`
+/// emit. The `[therm]` pass itself is busy (it drains the log ring → UDP), so a
+/// point-sampled `dl0_us` reads low even when the domain relaxes BETWEEN emits.
+/// This interval-max captures whether (a)/(b) actually reached the relaxed
+/// cadence — a sampling-robust idle witness. Reset each emit.
+static DL0_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+fn arm_next_deadline(domain_id: usize, core_id: usize) {
+    let raw_us = scheduler::pacer_next_deadline_us(domain_id);
+    // The §5.4 software-wake latency clamp applies ONLY to an adaptive relaxed
+    // deadline. A fixed domain (adaptive_flags == 0) gets `domain_tick_us`
+    // verbatim from the pacer and must keep it — clamping a 10 ms fixed tick to
+    // 4 ms would silently re-pace it and break the byte-identical non-adaptive
+    // cadence guarantee. Only mechanisms (a)/(b) can relax past the clamp.
+    let next_us = if scheduler::domain_adaptive_flags(domain_id) != 0 {
+        // The clamp must NOT undercut the §5.3 floor. The pacer never returns
+        // below `floor = max(tick_min_us, worst_step × MARGIN)`; arming below it
+        // (e.g. tick_min_us > 4 ms, or a live worst-step floor > 4 ms) would run
+        // the domain faster than its worst-step budget admits — a budget/floor
+        // contract break. Cap relaxation at `max(CLAMP, floor)`: the clamp still
+        // bounds software-wake latency when the floor is under it; a domain that
+        // genuinely needs a longer minimum period gets it (its own step cadence
+        // already bounds responsiveness, so no extra latency is added).
+        let floor = scheduler::pacer_domain_floor_us(domain_id);
+        raw_us.min(BCM_IDLE_DEADLINE_CLAMP_US.max(floor))
+    } else {
+        raw_us
+    };
+    if core_id == 0 {
+        DL0_MAX_US.fetch_max(next_us, Ordering::Relaxed);
+    }
+    let freq = timer::timer_freq();
+    let ticks = if freq > 0 {
+        ((next_us as u64) * freq / 1_000_000) as u32
+    } else {
+        // freq read failed — same ~1 ms @ 62.5 MHz fallback the seed paths use.
+        62_500
+    };
+    let slot = core_id.min(NEXT_DEADLINE_TICKS.len() - 1);
+    NEXT_DEADLINE_TICKS[slot].store(ticks, Ordering::Relaxed);
+}
+
 fn run_domain_loop(domain_id: usize) -> ! {
     let exec_mode = scheduler::domain_exec_mode(domain_id);
     let core_id = current_core_id() as usize;
@@ -1049,6 +1142,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
+                maybe_emit_soc_temp(core_id);
                 // live-rebuild bridge (Tier 1a primary).
                 poll_rebuild_bridge(domain_id);
                 if elapsed > metrics.worst_step_ticks { metrics.worst_step_ticks = elapsed; }
@@ -1067,7 +1161,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // without UART. drops = SPSC ring rejected a frame; bp =
                 // backpressure (ring full / consumer not ready); depth[d] =
                 // pending frames queued toward domain d.
-                if domain_id == 0 && metrics.tick_count % 5000 == 0 {
+                if domain_id == 0 && xdom_due() {
                     let (drops, bp, _sb) = multicore::cross_domain_stats();
                     let depth = multicore::cross_domain_queue_depths();
                     // Per-domain liveness: tick_count (tier 0/1a) and poll_steps
@@ -1092,15 +1186,22 @@ fn run_domain_loop(domain_id: usize) -> ! {
                     // HW timer-IRQ count per core (climbs even while the loop is
                     // stuck) + the last interrupted PC (the spin location).
                     let ct1 = exception::CORE_TICKS[1].load(Ordering::Relaxed);
+                    // Programmed deadline for the lane core (freeze-detector
+                    // aid): under variable cadence an idle core's CORE_TICKS
+                    // climbs slowly *by design* — surfacing its deadline lets a
+                    // reader tell "idle (widened deadline, tick_count still
+                    // advancing)" from "wedged (tick_count frozen)". The frozen
+                    // tick_count remains the cadence-invariant freeze signal.
+                    let dl1 = exception::NEXT_DEADLINE_TICKS[1].load(Ordering::Relaxed);
                     let elr1 = exception::CORE_LAST_ELR[1].load(Ordering::Relaxed);
                     let far1 = exception::CORE_FAULT_FAR[1].load(Ordering::Relaxed);
                     let sp1 = exception::CORE_FAULT_SPSR[1].load(Ordering::Relaxed);
                     let fe1 = exception::CORE_FAULT_ELR[1].load(Ordering::Relaxed);
                     log::info!(
-                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d1=[t{} ct{} mod{} elr{:#x} fc{} esr{:#x} far{:#x} spsr{:#x} felr{:#x}] d2=[t{}]",
+                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d1=[t{} ct{} dl{} mod{} elr{:#x} fc{} esr{:#x} far{:#x} spsr{:#x} felr{:#x}] d2=[t{}]",
                         drops, bp,
                         depth[0], depth[1], depth[2], depth[3],
-                        d1t, ct1, m1, elr1, f1, e1, far1, sp1, fe1, d2t
+                        d1t, ct1, dl1, m1, elr1, f1, e1, far1, sp1, fe1, d2t
                     );
                     let _ = (d1p, d2p, f2, e2);
                     // If any core latched a panic, broadcast the site over UDP.
@@ -1122,6 +1223,11 @@ fn run_domain_loop(domain_id: usize) -> ! {
                         log::info!("[PANIC] core={pc} at {file}:{line}");
                     }
                 }
+                // Arm-after-step for Tier 1a too (RFC adaptive_tick §5.5 — the
+                // pacer governs Tier 0 AND Tier 1a). A Tier-1a domain with
+                // adaptive_flags advances its cadence here; byte-identical when
+                // adaptive_flags==0 (the pacer returns the fixed domain tick).
+                arm_next_deadline(domain_id, core_id);
             }
         }
         // ── Tier 3: Poll-mode (continuous stepping) ──
@@ -1220,8 +1326,13 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
                 scheduler::maybe_emit_alive(tick as u64, Some(domain_id));
+                maybe_emit_soc_temp(core_id);
                 // live-rebuild bridge (cooperative / Tier 0 primary).
                 poll_rebuild_bridge(domain_id);
+                // Arm-after-step: pick the next deadline from this pass and
+                // write the per-core slot before looping back to WFI (RFC
+                // adaptive_tick §5.5 vii). Byte-identical when adaptive_flags==0.
+                arm_next_deadline(domain_id, core_id);
             }
         }
     }
@@ -1419,19 +1530,27 @@ fn secondary_core_main(domain_id: usize) -> ! {
     uart_puts(b"\r\n");
     log::info!("[core{core_id}] started, domain={domain_id}");
 
-    // Set up GIC CPU interface for this core
+    // Set up GIC CPU interface + per-domain timer rate for this core.
+    // Tier 1a may run faster than the global tick; a Tier-0 lane domain may
+    // run slower. Storing the domain's tick into THIS core's deadline slot is
+    // what makes the rate stick: the TIMER_PPI handler reloads from the
+    // per-core slot, so the rate is no longer clobbered by a shared global on
+    // the first IRQ (RFC adaptive_tick §5.5).
+    let domain_tick = scheduler::domain_tick_us(domain_id);
+    let freq = timer::timer_freq();
+    let ticks_for_domain = if freq > 0 {
+        ((domain_tick as u64) * freq / 1_000_000) as u32
+    } else {
+        // freq read failed — fall back to ~1 ms at the assumed 62.5 MHz timer
+        // (same constant the boot path uses for the freq==0 error case).
+        62_500
+    };
+    let slot = (core_id as usize).min(NEXT_DEADLINE_TICKS.len() - 1);
+    NEXT_DEADLINE_TICKS[slot].store(ticks_for_domain, Ordering::Relaxed);
     // SAFETY: secondary-core init runs once before the domain pump starts;
     // GIC + generic-timer registers are per-CPU.
     unsafe {
         gic_init_secondary();
-        // Set per-domain timer rate (Tier 1a may run faster than global tick)
-        let domain_tick = scheduler::domain_tick_us(domain_id);
-        let freq = timer::timer_freq();
-        let ticks_for_domain = if freq > 0 {
-            ((domain_tick as u64) * freq / 1_000_000) as u32
-        } else {
-            TICKS_PER_TICK
-        };
         timer::timer_set(ticks_for_domain);
         // Enable IRQs (not needed for Tier 3 poll-mode, but harmless)
         core::arch::asm!("msr daifclr, #2");
@@ -1542,6 +1661,119 @@ fn bcm_now_micros() -> u64 {
 }
 fn bcm_tick_count() -> u32 {
     fluxor::kernel::scheduler::tick_count()
+}
+
+// ============================================================================
+// BCM2712 SoC thermal sensor (AVS monitor) — read-only
+// ============================================================================
+//
+// The bcm2712 exposes its on-die temperature via the AVS monitor (device-tree
+// compatible "brcm,bcm2711-thermal") at SoC peripheral 0x7d542000, which the SoC
+// `ranges` map to CPU physical 0x10_7d542000 — inside the aperture boot_mmu
+// already maps (table[64]/[65]). The status word at +0x200 is valid only when
+// bits 16 and 10 are set; the low 10 bits are the raw code. Per the stock
+// device-tree `coefficients = <-550, 450000>`:  T(milli°C) = 450000 − 550·raw.
+// Verified on silicon (raw=714 → 57.3 °C, matching the Linux thermal zone).
+
+#[cfg(feature = "board-cm5")]
+const AVS_TEMP_STATUS: usize = 0x10_7d54_2200;
+#[cfg(feature = "board-cm5")]
+const AVS_TEMP_VALID: u32 = (1 << 16) | (1 << 10);
+
+/// SoC die temperature in milli-Celsius, or `None` if the sensor reading is not
+/// yet valid. Board-cm5 only (no AVS monitor on the QEMU virt model).
+#[cfg(feature = "board-cm5")]
+pub fn soc_temp_mc() -> Option<i32> {
+    // SAFETY: AVS_TEMP_STATUS is a fixed, side-effect-free MMIO status register
+    // in the SoC peripheral aperture mapped by boot_mmu.
+    let v = unsafe { core::ptr::read_volatile(AVS_TEMP_STATUS as *const u32) };
+    if v & AVS_TEMP_VALID != AVS_TEMP_VALID {
+        return None;
+    }
+    let raw = (v & 0x3ff) as i32;
+    Some(450_000 - 550 * raw)
+}
+
+#[cfg(not(feature = "board-cm5"))]
+pub fn soc_temp_mc() -> Option<i32> {
+    None
+}
+
+/// Emit the SoC die temperature to the log/telemetry stream on a ~5 s
+/// wall-clock cadence (core 0 only). This is the direct signal that the active
+/// cooler is working — the DUT should cool under a sustained load instead of
+/// throttling — and the measurement AC7 (thermal floor decay) consumes.
+fn maybe_emit_soc_temp(core_id: usize) {
+    if core_id != 0 {
+        return;
+    }
+    const TEMP_INTERVAL_MS: u64 = 5_000;
+    static LAST_TEMP_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static LAST_CT0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let now = bcm_now_millis();
+    let last = LAST_TEMP_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < TEMP_INTERVAL_MS {
+        return;
+    }
+    LAST_TEMP_MS.store(now, Ordering::Relaxed);
+    let ct0 = exception::CORE_TICKS[0].load(Ordering::Relaxed);
+    // irq_hz = the actual timer-IRQ (wakeup) RATE over the last interval — the
+    // RFC AC1 metric. With mechanism (a) on an idle domain this falls far below
+    // the nominal `1e6/tick_us`. This is the SAMPLING-ROBUST idle signal: unlike
+    // the instantaneous dl0_us below, it averages over the whole interval, so it
+    // isn't skewed by the fact that the emit pass itself is busy.
+    let dt_ms = now.wrapping_sub(last).max(1);
+    let last_ct0 = LAST_CT0.swap(ct0, Ordering::Relaxed);
+    let irq_hz = (ct0.wrapping_sub(last_ct0) as u64 * 1000 / dt_ms) as u32;
+    // dl0_us = core 0's deadline at THIS (busy) emit instant; dl0_max_us = the
+    // most-relaxed deadline reached since the last emit (sampling-robust — proves
+    // (a)/(b) actually relaxed even though the emit pass reads busy). Reset the
+    // interval-max after reading it.
+    let freq = timer::timer_freq();
+    let to_us = |ticks: u64| -> u32 {
+        if freq > 0 {
+            (ticks * 1_000_000 / freq) as u32
+        } else {
+            0
+        }
+    };
+    let dl0_us = to_us(exception::NEXT_DEADLINE_TICKS[0].load(Ordering::Relaxed) as u64);
+    let dl0_max_us = DL0_MAX_US.swap(0, Ordering::Relaxed);
+    // worst_us = the §5.3 floor input (decaying peak-hold step time); ovr =
+    // per-domain budget overruns. AC3 (no overrun) + AC7 (floor rises on load,
+    // decays on cool-down) are read from these.
+    let worst_us = scheduler::domain_worst_step_us(0);
+    let ovr = scheduler::domain_budget_overruns(0);
+    if let Some(mc) = soc_temp_mc() {
+        log::info!(
+            "[therm] soc_temp_mC={mc} t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr}"
+        );
+    } else {
+        log::info!(
+            "[therm] soc_temp_mC=na t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr}"
+        );
+    }
+    // Re-emit the fan PWM register readback on the same cadence. The one-shot
+    // boot report is pre-DHCP and never reaches the UDP stream; this recurring
+    // copy does, so the rig can confirm the channel stays programmed (DUTY,
+    // enable bit) for the whole run.
+    rp1::fan_report();
+}
+
+/// Wall-clock gate for the `[xdom]` cross-domain freeze/telemetry dump. Gated on
+/// a fixed ~0.5 s wall-clock cadence so the telemetry rate is decoupled from
+/// domain 0's `tick_count` — which, once domain 0 paces variably (adaptive
+/// idle), advances slowly and would otherwise stall the sibling-lane liveness
+/// windows. Core 0 / the domain-0 pump is the sole caller.
+fn xdom_due() -> bool {
+    const XDOM_INTERVAL_MS: u64 = 500;
+    static LAST_XDOM_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let now = bcm_now_millis();
+    if now.wrapping_sub(LAST_XDOM_MS.load(Ordering::Relaxed)) < XDOM_INTERVAL_MS {
+        return false;
+    }
+    LAST_XDOM_MS.store(now, Ordering::Relaxed);
+    true
 }
 
 fn bcm_flash_base() -> usize { 0 }

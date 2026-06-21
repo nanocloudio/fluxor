@@ -212,6 +212,152 @@ mod cm5_impl {
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
+    // ==========================================================================
+    // RP1 PWM — active-cooler ("pwm-fan") force-on
+    // ==========================================================================
+    //
+    // The Pi 5 / CM5 active cooler is driven by the RP1 `raspberrypi,rp1-pwm`
+    // block (offset 0x9c000 within the RP1 peripheral aperture) on channel 3,
+    // routed to gpio45 (function "pwm1" = ALT0). The fan PWM runs from a 50 MHz
+    // clock with a ~41.5 µs (24 kHz) period and INVERTED polarity (matching the
+    // stock device-tree `pwm-fan` node), so a *higher* DUTY value yields *more*
+    // low-time and therefore a *faster* fan.
+    //
+    // Register layout (verified against the rpi-6.12.y `pwm-rp1.c` driver and
+    // read back from a running Pi 5):
+    //   GLOBAL_CTRL @ 0x000 : per-channel enable = BIT(ch); SET_UPDATE = BIT(31)
+    //   CHANNEL_CTRL(ch) @ 0x014 + ch*0x10 : mode/FIFO_POP + POLARITY = BIT(3)
+    //   RANGE(ch)        @ 0x018 + ch*0x10 : period, in 20 ns clock cycles
+    //   DUTY(ch)         @ 0x020 + ch*0x10 : compare point, in clock cycles
+    //
+    // Empirical max-speed point on a Pi 5 cooler: RANGE=0x81E(2078),
+    // CHANNEL_CTRL=0x109, DUTY=0x7F6(2038) → ~8971 RPM. We program exactly that.
+    // This assumes the boot firmware (which drives the fan before kernel handoff)
+    // has left the PWM function clock running; `fan_report()` reads the registers
+    // back so the rig can confirm the writes stuck.
+
+    const RP1_PWM_BASE: usize = RP1_PERI_BASE + 0x9_c000;
+
+    const PWM_GLOBAL_CTRL: usize = 0x000;
+    const PWM_SET_UPDATE: u32 = 1 << 31;
+    /// FIFO_POP_MASK (bit 8) + trailing-edge mark-space mode (bit 0) — the
+    /// fixed-duty mode the Linux driver uses.
+    const PWM_CHANNEL_DEFAULT: u32 = (1 << 8) | (1 << 0);
+    const PWM_POLARITY: u32 = 1 << 3;
+
+    /// Fan tachometer / RPM register within the RP1 PWM block. The stock
+    /// device-tree `pwm-fan` node reads RPM from `rpm-offset = 0x3c`; verified
+    /// on silicon (reads decimal RPM, matching the Linux `fan1_input` hwmon).
+    /// Nonzero here is direct proof the fan is physically spinning.
+    const PWM_FAN_RPM: usize = 0x03c;
+
+    const fn pwm_chan_ctrl(ch: usize) -> usize {
+        0x014 + ch * 0x10
+    }
+    const fn pwm_chan_range(ch: usize) -> usize {
+        0x018 + ch * 0x10
+    }
+    const fn pwm_chan_duty(ch: usize) -> usize {
+        0x020 + ch * 0x10
+    }
+
+    /// Fan PWM channel (Pi 5 / CM5 active cooler).
+    const FAN_PWM_CHANNEL: usize = 3;
+    /// Period in 20 ns clock cycles (≈41.5 µs / 24 kHz).
+    const FAN_PWM_RANGE: u32 = 2078;
+    /// ~98 % duty — the empirically-confirmed max-speed point. Higher DUTY =
+    /// faster fan under inverted polarity; 2038 is proven (≈8971 RPM) and keeps
+    /// a small margin off the DUTY==RANGE edge.
+    const FAN_PWM_DUTY_FULL: u32 = 2038;
+
+    // gpio45 routing — RP1 GPIO bank2 (gpio34..53). Bank stride is +0x4000:
+    // bank0 IO @ 0xd0000 / pads @ 0xf0000, bank2 IO @ 0xd8000 / pads @ 0xf8000.
+    const RP1_GPIO2_BASE: usize = RP1_PERI_BASE + 0xd_8000;
+    const RP1_PADS2_BASE: usize = RP1_PERI_BASE + 0xf_8000;
+    const FAN_GPIO_BANK2_LOCAL: usize = 45 - 34; // local index 11
+    /// ALT0 selects function "pwm1" on gpio45.
+    const FAN_FUNCSEL_PWM1: u32 = 0;
+    const FUNCSEL_MASK_PWM: u32 = 0x1f;
+    /// Pad: pull-down (bit2) + 8 mA drive (bits5:4=0b10) + input-enable (bit6);
+    /// output-disable (bit7) left clear. Mirrors the stock pad config.
+    const FAN_PAD_VALUE: u32 = (1 << 2) | (0b10 << 4) | (1 << 6);
+
+    #[inline]
+    unsafe fn pwm_write(off: usize, val: u32) {
+        // SAFETY: caller guarantees `off` is a valid RP1 PWM register offset;
+        // RP1_PWM_BASE is fixed MMIO mapped by boot_mmu.
+        unsafe { core::ptr::write_volatile((RP1_PWM_BASE + off) as *mut u32, val) };
+    }
+    #[inline]
+    unsafe fn pwm_read(off: usize) -> u32 {
+        // SAFETY: side-effect-free MMIO read of a fixed RP1 PWM register.
+        unsafe { core::ptr::read_volatile((RP1_PWM_BASE + off) as *const u32) }
+    }
+
+    /// Route gpio45 to the RP1 PWM1 function and configure its pad as a
+    /// peripheral output. Defensive: the boot firmware that drives the fan
+    /// usually already did this, so this re-asserts known-good values.
+    unsafe fn fan_pin_configure() {
+        // GPIO ctrl reg: 8 bytes per pin, ctrl word @ +4. Preserve the upper
+        // ctrl bits, set only the FUNCSEL field.
+        let ctrl_addr = (RP1_GPIO2_BASE + FAN_GPIO_BANK2_LOCAL * 8 + 0x04) as *mut u32;
+        // SAFETY: bank2 GPIO ctrl register is fixed MMIO within the RP1 BAR.
+        unsafe {
+            let cur = core::ptr::read_volatile(ctrl_addr);
+            core::ptr::write_volatile(ctrl_addr, (cur & !FUNCSEL_MASK_PWM) | FAN_FUNCSEL_PWM1);
+        }
+        // Pad block: a voltage-select word sits at +0x00, then one pad word per
+        // pin starting at +0x04.
+        let pad_addr = (RP1_PADS2_BASE + 0x04 + FAN_GPIO_BANK2_LOCAL * 4) as *mut u32;
+        // SAFETY: bank2 pad register is fixed MMIO within the RP1 BAR.
+        unsafe { core::ptr::write_volatile(pad_addr, FAN_PAD_VALUE) };
+    }
+
+    /// Force the active cooler to (near-)maximum speed. Reprograms the RP1 PWM
+    /// channel the boot firmware uses for the fan so sustained-load rig runs are
+    /// not confounded by thermal throttling.
+    pub fn fan_full() {
+        // SAFETY: RP1 PWM + GPIO bank2 + pads are fixed MMIO mapped by boot_mmu
+        // (RP1 BAR @ 0x1c..). Runs once on the single boot thread.
+        unsafe {
+            fan_pin_configure();
+            // Mode + inverted polarity (matches the stock pwm-fan node).
+            pwm_write(pwm_chan_ctrl(FAN_PWM_CHANNEL), PWM_CHANNEL_DEFAULT | PWM_POLARITY);
+            pwm_write(pwm_chan_range(FAN_PWM_CHANNEL), FAN_PWM_RANGE);
+            pwm_write(pwm_chan_duty(FAN_PWM_CHANNEL), FAN_PWM_DUTY_FULL);
+            // Enable channel 3 and latch the new configuration (SET_UPDATE
+            // self-clears after the latch).
+            let g = pwm_read(PWM_GLOBAL_CTRL);
+            pwm_write(
+                PWM_GLOBAL_CTRL,
+                g | (1u32 << FAN_PWM_CHANNEL) | PWM_SET_UPDATE,
+            );
+        }
+    }
+
+    /// Read the fan PWM registers back for telemetry. If the writes stuck the
+    /// block is clocked and accessible; logged via `log` so it reaches the UDP
+    /// telemetry stream once networking is up (UART is dead on the bench).
+    pub fn fan_report() {
+        // SAFETY: side-effect-free MMIO reads of the RP1 PWM block.
+        unsafe {
+            let g = pwm_read(PWM_GLOBAL_CTRL);
+            let c = pwm_read(pwm_chan_ctrl(FAN_PWM_CHANNEL));
+            let r = pwm_read(pwm_chan_range(FAN_PWM_CHANNEL));
+            let d = pwm_read(pwm_chan_duty(FAN_PWM_CHANNEL));
+            let rpm = pwm_read(PWM_FAN_RPM);
+            log::info!(
+                "[fan] rp1 pwm ch{FAN_PWM_CHANNEL} GLOBAL={g:#010x} CTRL={c:#06x} RANGE={r} DUTY={d} rpm={rpm}"
+            );
+        }
+    }
+
+    /// Bring the active cooler to full and report the resulting register state.
+    pub fn cooling_full_on() {
+        fan_full();
+        fan_report();
+    }
+
     /// Print RP1 probe results to UART.
     pub fn report(uart_puts_fn: fn(&[u8]), uart_put_hex32_fn: fn(u32)) {
         if probe() {
@@ -234,6 +380,8 @@ mod cm5_impl {
         false
     }
     pub fn report(_uart_puts_fn: fn(&[u8]), _uart_put_hex32_fn: fn(u32)) {}
+    pub fn cooling_full_on() {}
+    pub fn fan_report() {}
 }
 
 pub use cm5_impl::*;

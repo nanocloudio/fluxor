@@ -928,6 +928,11 @@ pub fn pack_fmod(
     if has_isr_entry {
         reserved[0] |= 0x10; // isr_module (bit 4)
     }
+    // byte 1: step_period_ticks (0 = every tick). Sourced from the manifest
+    // (`step_period_ticks = N`) — this is the producer the loader/scheduler ABI
+    // (loader.rs:846) reads back. The adaptive validator gates a non-zero value
+    // on mechanism-(b) domains (RFC §8 rule 1).
+    reserved[1] = module_manifest.step_period_ticks;
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
     reserved[6..10].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
@@ -1070,6 +1075,7 @@ pub fn pack_fmod_wasm(
     // `wasm_payload` flag set in byte 0 bit 5.
     let mut reserved = [0u8; 12];
     reserved[0] |= 0x20; // bit 5: wasm_payload
+    reserved[1] = module_manifest.step_period_ticks; // byte 1: step_period_ticks (see pack_fmod)
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
     reserved[6..10].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());

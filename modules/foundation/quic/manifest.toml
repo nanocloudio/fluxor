@@ -1,4 +1,6 @@
 version = "1.0.0"
+# timer_class: loss/idle/PTO timers read wall-clock (dev_millis).
+timer_class = "wall_clock"
 hardware_targets = ["bcm2712"]
 
 # QUIC v1 (RFC 9000 + RFC 9001). Drives the same TLS 1.3

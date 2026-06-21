@@ -204,8 +204,28 @@ pub fn exception_dump_hex64(val: u64) {
     }
 }
 
-/// Timer ticks per scheduler tick (set from tick_us config or default 1ms)
-pub static mut TICKS_PER_TICK: u32 = 0;
+/// Per-core generic-timer reload value, in timer ticks. The `TIMER_PPI`
+/// IRQ handler reloads the one-shot down-counter from **this core's** slot,
+/// so each core (= each domain on multicore) paces at its own
+/// `domain_tick_us`. Boot seeds every slot to the default/global tick;
+/// `secondary_core_main` re-seeds cores 1-3 from their domain's tick.
+///
+/// Replaces the former single global `TICKS_PER_TICK`, whose unconditional
+/// handler reload clobbered the per-domain rates programmed at
+/// secondary-core init on the first IRQ — the standing per-domain-tick
+/// trust-root bug (RFC `adaptive_tick` §5.5 / §11). With per-core slots a
+/// validated `domain_tick_us` actually takes effect on the hardware timer.
+///
+/// Default-config behaviour is byte-identical: when every domain shares the
+/// global tick, every slot holds the same value the old global did. A future
+/// adaptive pacer (RFC mechanism (b)) rewrites a core's slot per pass
+/// (arm-after-step); fixed per-domain cadence only needs the seed.
+pub static NEXT_DEADLINE_TICKS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 
 /// Per-core tick counters. Core 0 also reads `DBG_TICK` (legacy
 /// alias kept for the single-core diagnostic path); cores 1-3
@@ -241,13 +261,31 @@ pub unsafe extern "C" fn irq_handler() {
     core::ptr::write_volatile(GICC_EOIR, iar);
 
     if irq_id == TIMER_PPI {
-        // Timer tick — reload and count
-        timer::timer_set(TICKS_PER_TICK);
+        // Timer tick — reload THIS core's deadline, then count. Reloading
+        // from the per-core slot (not a shared global) is what lets each
+        // core/domain pace at its own rate without a sibling clobbering it.
+        //
+        // Re-arm drift (RFC adaptive_tick §7.1a / Phase 3 (viii)): `timer_set`
+        // programmes a RELATIVE `cntp_tval` from "now", so each period loses the
+        // IRQ-entry→rearm latency (a few hundred ns on the A76) — the tick grid
+        // drifts vs an ideal absolute schedule. This is deliberately NOT
+        // converted to an absolute `cntp_cval` re-arm: under variable cadence an
+        // absolute compare can fall far in the past after a long ISR and emit a
+        // catch-up burst of immediate IRQs, whereas relative re-arm self-resyncs
+        // to "now" every period. The drift is benign because nothing
+        // wall-clock-sensitive derives from this cadence — all such timing reads
+        // `CNTPCT_EL0` directly via `now_millis` (the §7.6 wall-clock migration),
+        // not the tick count. The accumulated skew is bounded by per-period ISR
+        // latency and is observable on the rig via the wall-clock `[therm]`/
+        // `[xdom]` timestamps vs `CORE_TICKS` if it ever needs measuring.
         let core_id = {
             let mpidr: u64;
             core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
-            ((mpidr >> 8) & 0xFF) as usize
+            // Pi 5 has cores 0-3; clamp so the per-core slot/counter indexes
+            // stay in bounds even if a future part reports a higher Aff1.
+            (((mpidr >> 8) & 0xFF) as usize).min(NEXT_DEADLINE_TICKS.len() - 1)
         };
+        timer::timer_set(NEXT_DEADLINE_TICKS[core_id].load(Ordering::Relaxed));
         CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
         // Latch the interrupted PC per core. If a core's scheduler loop has
         // frozen (domain tick_count stuck) while CORE_TICKS keeps climbing,

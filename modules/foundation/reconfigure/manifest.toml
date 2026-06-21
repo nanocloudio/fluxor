@@ -1,4 +1,6 @@
 version = "1.0.0"
+# timer_class: drain window counts scheduler ticks as ms (elapsed vs drain_timeout_ms); warps under a variable cadence — keep off adaptive domains until migrated to dev_millis (RFC adaptive_tick §7.6).
+timer_class = "tick_counted"
 hardware_targets = ["rp2350", "rp2040", "bcm2712"]
 permissions = ["reconfigure", "monitor"]
 

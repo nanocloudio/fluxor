@@ -1,6 +1,12 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 permissions = ["platform_raw"]
+# Cadence-independent telemetry forwarder (drains the log ring → UDP); its emit
+# cadence is cosmetic, not correctness-bearing. Explicit attestation to run on a
+# mechanism-(b) domain (RFC adaptive_tick §8 rule 2 — absent = unattested =
+# blocked on (b)). This is one of the §7.6 foundation modules scoped for the
+# attestation pass.
+timer_class = "agnostic"
 
 [[ports]]
 name = "net_in"

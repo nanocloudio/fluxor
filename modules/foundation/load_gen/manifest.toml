@@ -1,0 +1,15 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350"]
+
+# Drives its busy/idle phase off real wall-clock time (dev_millis), so a
+# variable scheduler cadence only changes when it samples, not its behaviour —
+# safe on an adaptive-tick domain (RFC adaptive_tick D8/AC5b).
+timer_class = "wall_clock"
+
+# Synthetic, self-driven load generator for adaptive-tick (pacer) validation.
+# No I/O ports — it alternates busy/idle on a wall-clock duty cycle and emits
+# StepOutcome::Burst during the busy phase so the pacer sees the domain as busy.
+
+# Module-scope observability — exempt (diagnostic/test workload, not a data path).
+[observability]
+exempt = "synthetic load generator — adaptive-tick test workload, no data path"

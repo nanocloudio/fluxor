@@ -773,9 +773,20 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
             scheduler::step_woken_modules(modules, module_count, &wake);
         }
 
+        // Adaptive-tick pacer (RFC adaptive_tick §5.1): choose this iteration's
+        // deadline from the just-finished pass + its pre-sleep wake drain. With
+        // no adaptive flag set it returns the nominal tick, so the timer arm is
+        // byte-identical to the fixed-tick loop. With mechanism (a) idle it
+        // widens to `tick_max_us`; the `SCHEDULER_WAKE` signal still breaks the
+        // select immediately on a channel-write wake (Embassy thread executor
+        // idles on WFE, woken by SEV — the favourable pairing, §10), so
+        // first-request-after-idle latency is unaffected. rp2350 is
+        // single-domain → domain 0; the pacer adds one integer calc, no new
+        // alarm (Option A, AC4).
+        let sleep_us = scheduler::pacer_next_deadline_us(0) as u64;
         SCHEDULER_WAKE.reset();
         embassy_futures::select::select(
-            Timer::after(Duration::from_micros(tick_period_us)),
+            Timer::after(Duration::from_micros(sleep_us)),
             SCHEDULER_WAKE.wait(),
         )
         .await;
