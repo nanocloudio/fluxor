@@ -427,6 +427,208 @@ global_asm!(
 );
 
 // ============================================================================
+// Graph instantiation + activation
+// ============================================================================
+
+/// Instantiate every module in a compiled graph and activate per-domain
+/// scheduler state. Shared by first boot and live rebuild: both call
+/// `prepare_graph()` then this. Returns the count of modules loaded.
+///
+/// `module_list`/`module_count` come from `scheduler::prepare_graph()`. IRQs are
+/// masked for the duration via the kernel guard. Caller owns cross-domain edge
+/// bridging (boot does it inline before this; single-domain rebuild needs none).
+fn instantiate_and_activate(
+    module_list: &[Option<fluxor::kernel::config::ModuleEntry>],
+    module_count: usize,
+) -> usize {
+    // Mask IRQs during module instantiation
+    let _inst_guard = fluxor::kernel::guard::KernelGuard::acquire();
+
+    // SAFETY: boot-time read.
+    let loader_ref = unsafe { scheduler::static_loader() };
+    // SAFETY: scheduler-thread mutable access during graph instantiation.
+    let sched = unsafe { scheduler::sched_mut() };
+    let mut total_mods = 0usize;
+    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
+        let entry = match slot {
+            Some(e) => e,
+            None => continue,
+        };
+        if entry.domain_id as usize >= multicore::MAX_DOMAINS {
+            uart_puts(b"[inst] invalid domain_id for module ");
+            uart_put_u32(module_idx as u32);
+            uart_puts(b"\r\n");
+            continue;
+        }
+        scheduler::set_current_module(module_idx);
+        let result = scheduler::instantiate_one_module(
+            loader_ref, entry,
+            module_idx, module_idx,
+            &mut sched.edges,
+            &mut sched.modules,
+            &mut sched.ports,
+        );
+        match result {
+            scheduler::InstantiateResult::Done => {
+                total_mods += 1;
+            }
+            scheduler::InstantiateResult::Pending(mut pending) => {
+                let mut loaded = false;
+                for _ in 0..100 {
+                    // SAFETY: NOP is a hint; safe spin delay.
+                    for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
+                    // SAFETY: `pending` was allocated by instantiate_one_module
+                    // and lives across these poll iterations.
+                    match unsafe { pending.try_complete() } {
+                        Ok(Some(dm)) => {
+                            scheduler::store_dynamic_module(module_idx, dm);
+                            total_mods += 1;
+                            loaded = true;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => { e.log("module"); loaded = true; break; }
+                    }
+                }
+                if !loaded {
+                    uart_puts(b"[inst] module ");
+                    uart_put_u32(module_idx as u32);
+                    uart_puts(b" pending timeout\r\n");
+                }
+            }
+            scheduler::InstantiateResult::Error(_) => {}
+        }
+    }
+
+    // Activate the compiled graph and log per-domain composition.
+    // BCM doesn't populate `sched.edges`, so DMA-owned edges are
+    // logged by walking the config's edge slice directly via
+    // `log_dma_owned_edges_from_config`.
+    scheduler::set_active_module_count(module_count);
+    // SAFETY: scheduler-thread read of the installed static config.
+    let cfg = unsafe { scheduler::static_config() };
+    fluxor::kernel::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
+
+    // Tier 1b admission: hand every module in a Tier 1b domain to
+    // the ISR-tier dispatcher. The helper picks the appropriate
+    // (step_fn, state_ptr) pair from each slot and arms the
+    // platform's polled-timer ISR (`bcm_isr_tier_poll`). Cooperative
+    // domains are untouched; the cooperative scheduler already
+    // skips ISR-tier modules via `step_one_module`. See
+    // `.context/rfc_isr_tier_surface.md` §D5 + §D6.
+    let isr_registered = scheduler::register_isr_tier_modules_from_graph();
+    if isr_registered > 0 {
+        uart_puts(b"[isr] Tier 1b admitted ");
+        uart_put_u32(isr_registered as u32);
+        uart_puts(b" module(s)\r\n");
+    }
+
+    let mut d = 0usize;
+    while d < multicore::MAX_DOMAINS {
+        let mod_count = scheduler::domain_module_count(d);
+        if mod_count > 0 {
+            // SAFETY: per-domain state init; on boot the domain is not yet
+            // running, on rebuild its core is quiesced/parked.
+            unsafe {
+                let ds = multicore::domain_state(d);
+                ds.core_id = d as u8; // Domain N runs on core N
+                ds.module_count = mod_count as u8;
+                ds.active = true;
+            }
+            uart_puts(b"[domain] ");
+            uart_put_u32(d as u32);
+            uart_puts(b": ");
+            uart_put_u32(mod_count as u32);
+            uart_puts(b" modules (core ");
+            uart_put_u32(d as u32);
+            uart_puts(b") order: ");
+            let mut k = 0usize;
+            while k < mod_count {
+                if k > 0 { uart_puts(b"->"); }
+                if let Some(g) = scheduler::domain_exec_order_at(d, k) {
+                    uart_put_u32(g as u32);
+                }
+                k += 1;
+            }
+            uart_puts(b"\r\n");
+        }
+        d += 1;
+    }
+
+    drop(_inst_guard);
+    total_mods
+}
+
+/// Number of domains that have at least one module in the compiled graph.
+fn active_domain_count() -> usize {
+    (0..multicore::MAX_DOMAINS)
+        .filter(|&d| scheduler::domain_module_count(d) > 0)
+        .count()
+}
+
+/// Poll the live-rebuild bridge on the primary domain. Called from every
+/// per-domain pump loop (cooperative / Tier 1a / Tier 1b) so the rebuild runs
+/// regardless of the primary domain's tier. No-op off domain 0.
+///
+/// On a pending request: quiesce non-primary domains (race-free global mutation),
+/// reload STATIC_CONFIG, and rebuild the graph in place — mirroring the RP loop.
+/// `prepare_graph` does the destructive reset and is fail-safe on error.
+/// Single-domain only: multi-domain needs cross-domain SPSC bridges
+/// re-established (boot does that inline), so it is refused and left idle.
+/// Full rollback to the prior generation needs the previous config retained.
+fn poll_rebuild_bridge(domain_id: usize) {
+    if domain_id != 0 {
+        return;
+    }
+
+    // Test hook (feature `test-rebuild`): one-shot rebuild after a fixed number
+    // of polls so the bridge can be observed on hardware. Absent from normal builds.
+    #[cfg(feature = "test-rebuild")]
+    {
+        use core::sync::atomic::{AtomicBool, Ordering as TestOrd};
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        // Use the wall-clock-ish CORE_TICKS counter (advanced by the timer ISR,
+        // ~9.5k/s) rather than loop iterations — the cooperative pump `wfi`s, so
+        // iteration count accrues far slower than ticks. 450k ticks ≈ 47 s of
+        // scheduler time: long past DHCP/netconsole bring-up, so the rebuild is
+        // observable over the netconsole.
+        let t = CORE_TICKS[0].load(TestOrd::Relaxed);
+        if t >= 450_000 && !FIRED.swap(true, TestOrd::Relaxed) {
+            log::warn!("[test] one-shot rebuild trigger at tick {t}");
+            // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
+            unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+        }
+    }
+
+    if scheduler::take_rebuild_request().is_none() {
+        return;
+    }
+    let expected = multicore::non_primary_active_count();
+    multicore::request_quiesce();
+    multicore::wait_parked(expected);
+    log::warn!("[reconfigure] quiesced {expected} domains; rebuilding");
+    match scheduler::prepare_graph() {
+        Ok((module_list, module_count)) => {
+            let domains = active_domain_count();
+            if domains <= 1 {
+                let n = instantiate_and_activate(&module_list, module_count);
+                log::warn!("[reconfigure] rebuilt graph: {n} modules");
+            } else {
+                log::error!(
+                    "[reconfigure] multi-domain rebuild ({domains} domains) unsupported; \
+                     cross-domain bridges not re-established — graph left idle"
+                );
+            }
+        }
+        Err(_) => {
+            log::error!("[reconfigure] prepare_graph failed; graph left idle");
+        }
+    }
+    scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
+    multicore::release_quiesce();
+}
+
+// ============================================================================
 // Main entry point
 // ============================================================================
 
@@ -753,119 +955,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         }
     }
 
-    // Mask IRQs during module instantiation
-    let _inst_guard = fluxor::kernel::guard::KernelGuard::acquire();
-
-    // SAFETY: boot-time read.
-    let loader_ref = unsafe { scheduler::static_loader() };
-    // SAFETY: scheduler-thread mutable access during graph instantiation.
-    let sched = unsafe { scheduler::sched_mut() };
-    let mut total_mods = 0usize;
-    for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
-        let entry = match slot {
-            Some(e) => e,
-            None => continue,
-        };
-        if entry.domain_id as usize >= multicore::MAX_DOMAINS {
-            uart_puts(b"[inst] invalid domain_id for module ");
-            uart_put_u32(module_idx as u32);
-            uart_puts(b"\r\n");
-            continue;
-        }
-        scheduler::set_current_module(module_idx);
-        let result = scheduler::instantiate_one_module(
-            loader_ref, entry,
-            module_idx, module_idx,
-            &mut sched.edges,
-            &mut sched.modules,
-            &mut sched.ports,
-        );
-        match result {
-            scheduler::InstantiateResult::Done => {
-                total_mods += 1;
-            }
-            scheduler::InstantiateResult::Pending(mut pending) => {
-                let mut loaded = false;
-                for _ in 0..100 {
-                    // SAFETY: NOP is a hint; safe spin delay.
-                    for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
-                    // SAFETY: `pending` was allocated by instantiate_one_module
-                    // and lives across these poll iterations.
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dm)) => {
-                            scheduler::store_dynamic_module(module_idx, dm);
-                            total_mods += 1;
-                            loaded = true;
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(e) => { e.log("module"); loaded = true; break; }
-                    }
-                }
-                if !loaded {
-                    uart_puts(b"[inst] module ");
-                    uart_put_u32(module_idx as u32);
-                    uart_puts(b" pending timeout\r\n");
-                }
-            }
-            scheduler::InstantiateResult::Error(_) => {}
-        }
-    }
-
-    // Activate the compiled graph and log per-domain composition.
-    // BCM doesn't populate `sched.edges`, so DMA-owned edges are
-    // logged by walking the config's edge slice directly via
-    // `log_dma_owned_edges_from_config`.
-    scheduler::set_active_module_count(module_count);
-    fluxor::kernel::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
-
-    // Tier 1b admission: hand every module in a Tier 1b domain to
-    // the ISR-tier dispatcher. The helper picks the appropriate
-    // (step_fn, state_ptr) pair from each slot and arms the
-    // platform's polled-timer ISR (`bcm_isr_tier_poll`). Cooperative
-    // domains are untouched; the cooperative scheduler already
-    // skips ISR-tier modules via `step_one_module`. See
-    // `.context/rfc_isr_tier_surface.md` §D5 + §D6.
-    let isr_registered = scheduler::register_isr_tier_modules_from_graph();
-    if isr_registered > 0 {
-        uart_puts(b"[isr] Tier 1b admitted ");
-        uart_put_u32(isr_registered as u32);
-        uart_puts(b" module(s)\r\n");
-    }
-
-    let mut d = 0usize;
-    while d < multicore::MAX_DOMAINS {
-        let mod_count = scheduler::domain_module_count(d);
-        if mod_count > 0 {
-            // SAFETY: boot-time per-domain state init; domain `d` not yet
-            // running on its assigned core.
-            unsafe {
-                let ds = multicore::domain_state(d);
-                ds.core_id = d as u8; // Domain N runs on core N
-                ds.module_count = mod_count as u8;
-                ds.active = true;
-            }
-            uart_puts(b"[domain] ");
-            uart_put_u32(d as u32);
-            uart_puts(b": ");
-            uart_put_u32(mod_count as u32);
-            uart_puts(b" modules (core ");
-            uart_put_u32(d as u32);
-            uart_puts(b") order: ");
-            let mut k = 0usize;
-            while k < mod_count {
-                if k > 0 { uart_puts(b"->"); }
-                if let Some(g) = scheduler::domain_exec_order_at(d, k) {
-                    uart_put_u32(g as u32);
-                }
-                k += 1;
-            }
-            uart_puts(b"\r\n");
-        }
-        d += 1;
-    }
-
-    drop(_inst_guard);
+    // Instantiate + activate the compiled graph (shared with live rebuild).
+    let total_mods = instantiate_and_activate(&module_list, module_count);
 
     uart_puts(b"[inst] ");
     uart_put_u32(total_mods as u32);
@@ -958,6 +1049,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
+                // live-rebuild bridge (Tier 1a primary).
+                poll_rebuild_bridge(domain_id);
                 if elapsed > metrics.worst_step_ticks { metrics.worst_step_ticks = elapsed; }
                 // Track busy ticks (step work exceeded 50% of tick budget)
                 let freq = timer::timer_freq() as u32;
@@ -1096,6 +1189,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // domain `d`'s pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
+                // live-rebuild bridge (Tier 1b primary).
+                poll_rebuild_bridge(domain_id);
                 if metrics.tick_count.is_multiple_of(1_000_000) {
                     log::info!(
                         "[tier1b] d={} polls={} ticks={}",
@@ -1125,23 +1220,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
                 metrics.tick_count += 1;
                 scheduler::maybe_emit_alive(tick as u64, Some(domain_id));
-                // Rebuild bridge. On the primary domain, a pending rebuild
-                // request quiesces every non-primary domain (so mutation of
-                // global scheduler state is race-free), then clears the
-                // phase byte and releases. The rebuild body itself — full
-                // arena reset, prepare_graph, module instantiation — is
-                // not invoked here; on bcm2712 the request is consumed
-                // without rebuilding, leaving the current graph running.
-                if domain_id == 0 && scheduler::take_rebuild_request().is_some() {
-                    let expected = multicore::non_primary_active_count();
-                    multicore::request_quiesce();
-                    multicore::wait_parked(expected);
-                    log::warn!("[reconfigure] quiesced {expected} domains; phase reset");
-                    scheduler::set_reconfigure_phase(
-                        scheduler::ReconfigurePhase::Running
-                    );
-                    multicore::release_quiesce();
-                }
+                // live-rebuild bridge (cooperative / Tier 0 primary).
+                poll_rebuild_bridge(domain_id);
             }
         }
     }

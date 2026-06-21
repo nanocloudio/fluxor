@@ -209,12 +209,19 @@ const MAX_TRACKED: usize = 128;
 struct HandleBinding {
     handle: i32,
     contract: ContractId,
+    /// Owner that opened the handle (rfc_k8s.md §14).
+    /// Present only on multi-tenant builds — bare metal carries no per-handle
+    /// ownership state.
+    #[cfg(feature = "multitenant")]
+    owner: crate::kernel::owner::OwnerHandle,
 }
 
 static mut HANDLE_BINDINGS: [HandleBinding; MAX_TRACKED] = [const {
     HandleBinding {
         handle: -1,
         contract: 0,
+        #[cfg(feature = "multitenant")]
+        owner: crate::kernel::owner::OWNER_SYSTEM,
     }
 }; MAX_TRACKED];
 
@@ -242,6 +249,11 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
             if slot.handle == -1 {
                 slot.handle = handle;
                 slot.contract = contract;
+                // Stamp the opening module's owner so later use is owner-scoped.
+                #[cfg(feature = "multitenant")]
+                {
+                    slot.owner = crate::kernel::scheduler::caller_owner();
+                }
                 return Ok(());
             }
         }
@@ -251,6 +263,49 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
         );
         Err(())
     }
+}
+
+/// Owner-scoping guard for tracked provider handles (rfc_k8s.md §14
+/// invariant 1). Returns `true` — deny — when the calling
+/// module's owner may not use `handle` because it was opened by a different,
+/// non-system owner. Self-identifying FDs (event/timer/dma) are skipped: they
+/// carry no tracking entry and the event/timer subsystems enforce their own
+/// per-module ownership. Compile-time `false` (allow) on single-tenant builds,
+/// and inert on multi-tenant builds until the node agent stamps per-Pod owners
+/// (every module is the system owner until then).
+#[cfg(feature = "multitenant")]
+fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
+    if handle < 0 || fd_tag_contract(handle).is_some() {
+        return false;
+    }
+    // SAFETY: HANDLE_BINDINGS is scheduler-thread-owned (see `track_handle`).
+    let bound_owner = unsafe {
+        let p = &raw const HANDLE_BINDINGS;
+        (*p).iter().find(|s| s.handle == handle).map(|s| s.owner)
+    };
+    // Untracked handle → no entry to scope (raw HAL handle, etc.); allow.
+    let Some(bound_owner) = bound_owner else {
+        return false;
+    };
+    let caller = crate::kernel::scheduler::caller_owner();
+    if crate::kernel::owner::same_or_system(caller, bound_owner) {
+        false
+    } else {
+        log::warn!(
+            "[provider] {syscall}: owner slot {} denied cross-owner handle {handle} \
+             (opened by owner slot {})",
+            caller.slot,
+            bound_owner.slot,
+        );
+        true
+    }
+}
+
+/// Single-tenant: no ownership to enforce.
+#[cfg(not(feature = "multitenant"))]
+#[inline(always)]
+fn deny_cross_owner_handle(_handle: i32, _syscall: &str) -> bool {
+    false
 }
 
 /// Public lookup — returns the contract bound to `handle`. Resolution
@@ -481,6 +536,9 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
     if crate::kernel::scheduler::deny_isr_tier_syscall("provider_call") {
         return errno::EACCES;
     }
+    if deny_cross_owner_handle(handle, "provider_call") {
+        return errno::EACCES;
+    }
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             // SAFETY: vt.call is the contract's registered ABI entry;
@@ -500,6 +558,9 @@ pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i3
     if crate::kernel::scheduler::deny_isr_tier_syscall("provider_query") {
         return errno::EACCES;
     }
+    if deny_cross_owner_handle(handle, "provider_query") {
+        return errno::EACCES;
+    }
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             return match vt.query {
@@ -517,6 +578,9 @@ pub fn provider_query(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i3
 /// `provider_close` only releases the tracking entry and returns 0.
 pub fn provider_close(handle: i32) -> i32 {
     if crate::kernel::scheduler::deny_isr_tier_syscall("provider_close") {
+        return errno::EACCES;
+    }
+    if deny_cross_owner_handle(handle, "provider_close") {
         return errno::EACCES;
     }
     let result = if let Some(contract) = lookup_contract(handle) {

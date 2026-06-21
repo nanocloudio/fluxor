@@ -24,6 +24,7 @@ use core::ptr::null;
 
 use portable_atomic::{AtomicBool, Ordering};
 
+use crate::kernel::bitmask::ModuleMask;
 use crate::kernel::channel;
 use crate::kernel::channel::{channel_set_flags, channel_set_mailbox, POLL_ERR, POLL_HUP};
 use crate::kernel::config::{
@@ -34,6 +35,7 @@ use crate::kernel::loader::{
     find_hint_for_port, query_channel_hints, reset_state_arena, ChannelHint, DynamicModule,
     ModuleLoader, StartNewResult,
 };
+use crate::kernel::owner::{OwnerHandle, OwnerTable, OWNER_SYSTEM};
 use crate::kernel::step_guard::{
     self, fault_type, FaultPolicy, FaultRecord, FaultState, FaultStats, ModuleFaultInfo,
 };
@@ -48,15 +50,15 @@ use crate::modules::StepOutcome;
 /// Maximum number of modules in a graph.
 pub const MAX_MODULES: usize = CONFIG_MAX_MODULES;
 
-// Compile-time gate: readiness, upstream, event-wake, and domain-step
-// bitmaps in this module store one bit per module in a `u64`. Widening
-// `MAX_MODULES` past 64 must come with a matching bitmap rewrite — until
-// then this assert blocks the configuration drift that would let
-// `1u64 << module_idx` overflow at runtime.
+// Compile-time gate: readiness, upstream, event-wake, and domain-step bitmaps
+// are `ModuleMask`-backed, so they scale past 64.
+// The residual ceiling is fault-cascade attribution (`detect_caused_by` keeps
+// the caused-by module id in a `u8`) and the u16 module-index domain; 256 is
+// the validated multi-Pod profile (CM5). Raising it further requires widening
+// those id fields.
 const _: () = assert!(
-    MAX_MODULES <= 64,
-    "MAX_MODULES > 64 requires widening every scheduler bitmap (upstream_mask, \
-     not_ready, wake_bits, event-wake) past u64."
+    MAX_MODULES <= 256,
+    "MAX_MODULES > 256 requires widening fault-attribution module ids past u8."
 );
 
 /// Maximum number of channels (edges) in a graph.
@@ -969,7 +971,7 @@ pub struct SchedulerState {
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
     ready: [bool; MAX_MODULES],
     /// Per-module upstream dependency bitmask (precomputed from edges)
-    upstream_mask: [u64; MAX_MODULES],
+    upstream_mask: [ModuleMask; MAX_MODULES],
     /// Per-module step period in scheduler ticks (0 = every tick, N =
     /// step every N ticks). Wall-clock period is
     /// `step_period * domain_tick_us` — units are ticks, NOT
@@ -1130,6 +1132,14 @@ pub struct SchedulerState {
     step_hist: [[u32; 8]; MAX_MODULES],
     /// Global bucket counts across all modules.
     step_hist_global: [u32; 8],
+    /// Workload owner table (rfc_k8s.md §6.2, §10, §14).
+    /// Slot 0 is the system owner. Size-1 (system only) on single-tenant
+    /// builds, so it costs nothing meaningful when `multitenant` is off.
+    pub owners: OwnerTable,
+    /// Per-module owner handle. Present only on multi-tenant builds — bare
+    /// metal carries no per-module ownership state (rfc_k8s.md §6.4, §19.2).
+    #[cfg(feature = "multitenant")]
+    module_owner: [OwnerHandle; MAX_MODULES],
 }
 
 impl SchedulerState {
@@ -1152,7 +1162,7 @@ impl SchedulerState {
             deferred_ready: [false; MAX_MODULES],
             isolated: [false; MAX_MODULES],
             ready: [true; MAX_MODULES],
-            upstream_mask: [0; MAX_MODULES],
+            upstream_mask: [ModuleMask::EMPTY; MAX_MODULES],
             step_period: [0; MAX_MODULES],
             step_counter: [0; MAX_MODULES],
             inactive_for_ticks: [0; MAX_MODULES],
@@ -1190,6 +1200,9 @@ impl SchedulerState {
             module_export_count: [0; MAX_MODULES],
             step_hist: [[0; 8]; MAX_MODULES],
             step_hist_global: [0; 8],
+            owners: OwnerTable::new(),
+            #[cfg(feature = "multitenant")]
+            module_owner: [OWNER_SYSTEM; MAX_MODULES],
         }
     }
 
@@ -1214,7 +1227,13 @@ impl SchedulerState {
             self.deferred_ready[i] = false;
             self.isolated[i] = false;
             self.ready[i] = true;
-            self.upstream_mask[i] = 0;
+            self.upstream_mask[i] = ModuleMask::EMPTY;
+            // Clear the per-module owner stamp; workload owner lifecycle in the
+            // owner table is managed by the transition path, not here.
+            #[cfg(feature = "multitenant")]
+            {
+                self.module_owner[i] = OWNER_SYSTEM;
+            }
             self.step_period[i] = 0;
             self.step_counter[i] = 0;
             self.inactive_for_ticks[i] = 0;
@@ -2110,8 +2129,10 @@ pub fn set_module_upstream_mask(module_idx: usize, mask: u64) {
         return;
     }
     // SAFETY: scheduler-thread-only mutation; module_idx bounded.
+    // Loader manifest plumbing and conformance tests pass a u64 (≤64 modules);
+    // the full-width path is built by `compute_upstream_mask`.
     unsafe {
-        SCHED.upstream_mask[module_idx] = mask;
+        SCHED.upstream_mask[module_idx] = ModuleMask::from_u64(mask);
     }
 }
 
@@ -4162,7 +4183,7 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
         &mut *p
     };
     for slot in sched.upstream_mask.iter_mut() {
-        *slot = 0;
+        *slot = ModuleMask::EMPTY;
     }
 
     // Build a module→position map from the topological execution order.
@@ -4194,7 +4215,7 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
         // precedes destination. `pf >= pt` (including either unordered) is a
         // back-edge or unprovable — excluded so feedback cycles don't deadlock.
         if pf != NO_POS && pt != NO_POS && pf < pt {
-            sched.upstream_mask[to] |= 1u64 << from;
+            sched.upstream_mask[to].set(from as usize);
         }
     }
 }
@@ -4386,10 +4407,10 @@ fn compute_domain_exec_orders_static(_module_count: usize) {
 ///
 /// Log every edge tagged `EdgeClass::DmaOwned` at graph-prepare time.
 ///
-/// Pure observability for now: confirms that the YAML-level annotation
-/// reached the scheduler edge table. The scheduler does NOT yet issue
-/// cache maintenance on DmaOwned handoffs — that work lands with zero-
-/// copy mailbox edges, where the payload buffer is actually shared
+/// Pure observability: confirms that the YAML-level annotation reached the
+/// scheduler edge table. The scheduler does not issue cache maintenance on
+/// DmaOwned handoffs — that belongs with zero-copy mailbox edges, where the
+/// payload buffer is actually shared
 /// between producer and consumer. Streaming-arena buffers live inside
 /// the module (see nvme `write_bufs[]`) and do their own DC CVAC via
 /// the `DMA_FLUSH` syscall before device submission.
@@ -4899,15 +4920,12 @@ const CASCADE_WINDOW_TICKS: u32 = 4;
 
 fn detect_caused_by(sched: &SchedulerState, module_idx: usize, tick: u32) -> u8 {
     let mask = sched.upstream_mask[module_idx];
-    if mask == 0 {
+    if mask.is_empty() {
         return 0xFF;
     }
     let mut best: u8 = 0xFF;
     let mut best_elapsed: u32 = CASCADE_WINDOW_TICKS + 1;
-    for i in 0..MAX_MODULES.min(64) {
-        if (mask & (1u64 << i)) == 0 {
-            continue;
-        }
+    for i in mask.iter_set() {
         let fi = &sched.fault_info[i];
         if fi.fault_count == 0 {
             continue;
@@ -5348,10 +5366,10 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     }
 
     // Compute not-ready bitmask for upstream gating
-    let mut not_ready: u64 = 0;
+    let mut not_ready = ModuleMask::new();
     for i in 0..count {
         if !sched.ready[i] {
-            not_ready |= 1u64 << i;
+            not_ready.set(i);
         }
     }
 
@@ -5375,7 +5393,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // overhead is constant when no domain has pre-tick modules.
     for d in 0..MAX_DOMAINS {
         if sched.domain_pre_tick_count[d] > 0 {
-            step_domain_pre_tick(modules, sched, d, not_ready, &mut active_count);
+            step_domain_pre_tick(modules, sched, d, &not_ready, &mut active_count);
         }
     }
 
@@ -5442,7 +5460,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
                 modules,
                 sched,
                 module_idx,
-                not_ready,
+                &not_ready,
                 &mut active_count,
                 false,
             );
@@ -5763,10 +5781,10 @@ pub fn step_domain_modules(
             active_count += 1;
         }
     }
-    let mut not_ready: u64 = 0;
+    let mut not_ready = ModuleMask::new();
     for i in 0..count {
         if !sched.ready[i] {
-            not_ready |= 1u64 << i;
+            not_ready.set(i);
         }
     }
 
@@ -5783,7 +5801,7 @@ pub fn step_domain_modules(
     // `MAX_PRE_TICK_BUDGET_US` combined. Pre-tick costs are
     // snapshot-restored against the regular accumulator inside
     // the helper.
-    step_domain_pre_tick(modules, sched, domain_id, not_ready, &mut active_count);
+    step_domain_pre_tick(modules, sched, domain_id, &not_ready, &mut active_count);
 
     let n = sched.domain_module_count[domain_id] as usize;
     // Rotate the per-domain exec_order start by
@@ -5816,7 +5834,7 @@ pub fn step_domain_modules(
                 modules,
                 sched,
                 module_idx,
-                not_ready,
+                &not_ready,
                 &mut active_count,
                 false,
             );
@@ -5884,7 +5902,7 @@ fn step_domain_pre_tick(
     modules: &mut [ModuleSlot; MAX_MODULES],
     sched: &mut SchedulerState,
     domain_id: usize,
-    not_ready: u64,
+    not_ready: &ModuleMask,
     active_count: &mut usize,
 ) {
     if domain_id >= MAX_DOMAINS {
@@ -5945,7 +5963,7 @@ fn step_one_module(
     modules: &mut [ModuleSlot; MAX_MODULES],
     sched: &mut SchedulerState,
     module_idx: usize,
-    not_ready: u64,
+    not_ready: &ModuleMask,
     active_count: &mut usize,
     event_wake: bool,
 ) {
@@ -6068,9 +6086,9 @@ fn step_one_module(
     // Deferred-ready modules (infrastructure) are exempt while initializing —
     // they must step freely to reach Ready even if upstream peers aren't ready.
     // Only non-deferred (application) modules are gated by upstream readiness.
-    if not_ready != 0
+    if !not_ready.is_empty()
         && !sched.deferred_ready[module_idx]
-        && (sched.upstream_mask[module_idx] & not_ready) != 0
+        && sched.upstream_mask[module_idx].intersects(not_ready)
     {
         // Count consecutive ticks the readiness gate veto'd this
         // module. Cleared once the module actually steps below. A
@@ -6360,7 +6378,11 @@ const MOD_STEP_HEAVY_US: u64 = 50;
 /// scheduler invariant — upstream-ready gating, fault state machine,
 /// step-time recording, step-guard arm/disarm, stack-canary check,
 /// burst MPU-fault handling — from the shared body.
-pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize, wake_bits: u64) {
+pub fn step_woken_modules(
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    count: usize,
+    wake_bits: &ModuleMask,
+) {
     // SAFETY: scheduler thread is the sole stepper.
     let sched = unsafe {
         let p = &raw mut SCHED;
@@ -6374,10 +6396,10 @@ pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize,
 
     // Compute current readiness mask once per wake pass, matching the
     // flat/domain stepping paths.
-    let mut not_ready: u64 = 0;
+    let mut not_ready = ModuleMask::new();
     for i in 0..count {
         if !sched.ready[i] {
-            not_ready |= 1u64 << i;
+            not_ready.set(i);
         }
     }
     let mut active_count: usize = 0;
@@ -6398,14 +6420,14 @@ pub fn step_woken_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize,
         if module_idx >= count {
             continue;
         }
-        if (wake_bits & (1u64 << module_idx)) == 0 {
+        if !wake_bits.test(module_idx) {
             continue;
         }
         step_one_module(
             modules,
             sched,
             module_idx,
-            not_ready,
+            &not_ready,
             &mut active_count,
             true,
         );
@@ -6628,7 +6650,79 @@ pub fn module_upstream_mask(module_idx: usize) -> u64 {
         return 0;
     }
     // SAFETY: scheduler-thread read; module_idx bounded.
-    unsafe { SCHED.upstream_mask[module_idx] }
+    // The reconfigure syscall ABI surfaces a u64; it observes the low-64
+    // upstream bits. Widening that opcode is tracked with the reconfigure ABI.
+    unsafe { SCHED.upstream_mask[module_idx].as_u64() }
+}
+
+// ============================================================================
+// Workload ownership
+// ============================================================================
+
+/// Shared reference to the workload owner table.
+#[inline]
+pub fn owners() -> &'static OwnerTable {
+    // SAFETY: scheduler-thread read of the static owner table.
+    unsafe { &(*(&raw const SCHED)).owners }
+}
+
+/// Mutable reference to the workload owner table. Scheduler-thread only.
+#[inline]
+pub fn owners_mut() -> &'static mut OwnerTable {
+    // SAFETY: scheduler-thread-exclusive mutation of the static owner table.
+    unsafe { &mut (*(&raw mut SCHED)).owners }
+}
+
+/// Owner handle stamped on module `module_idx`. On single-tenant builds there
+/// is no per-module owner array; every module is the system owner.
+#[inline]
+pub fn module_owner(module_idx: usize) -> OwnerHandle {
+    #[cfg(feature = "multitenant")]
+    {
+        if module_idx >= MAX_MODULES {
+            return OWNER_SYSTEM;
+        }
+        // SAFETY: scheduler-thread read; module_idx bounded above.
+        unsafe { SCHED.module_owner[module_idx] }
+    }
+    #[cfg(not(feature = "multitenant"))]
+    {
+        let _ = module_idx;
+        OWNER_SYSTEM
+    }
+}
+
+/// Stamp module `module_idx` with `owner`. No-op on single-tenant builds.
+#[inline]
+pub fn set_module_owner(module_idx: usize, owner: OwnerHandle) {
+    #[cfg(feature = "multitenant")]
+    {
+        if module_idx < MAX_MODULES {
+            // SAFETY: scheduler-thread-exclusive mutation; module_idx bounded.
+            unsafe {
+                SCHED.module_owner[module_idx] = owner;
+            }
+        }
+    }
+    #[cfg(not(feature = "multitenant"))]
+    {
+        let _ = (module_idx, owner);
+    }
+}
+
+/// Authorize `caller` to touch a resource owned by module `target_idx`. Returns
+/// true when the target is system-owned or the same owner (rfc_k8s.md §14).
+/// Compile-time `true` on single-tenant builds.
+#[inline]
+pub fn authorize_module_access(caller: OwnerHandle, target_idx: usize) -> bool {
+    crate::kernel::owner::same_or_system(caller, module_owner(target_idx))
+}
+
+/// Owner of the currently-executing module (the syscall caller). On
+/// single-tenant builds this is always the system owner.
+#[inline]
+pub fn caller_owner() -> OwnerHandle {
+    module_owner(current_module_index())
 }
 
 /// Whether module N has returned StepOutcome::Done.
@@ -6711,7 +6805,7 @@ pub fn free_module_state(module_idx: usize) {
     sched.deferred_ready[module_idx] = false;
     sched.mailbox_safe[module_idx] = false;
     sched.in_place_writer[module_idx] = false;
-    sched.upstream_mask[module_idx] = 0;
+    sched.upstream_mask[module_idx] = ModuleMask::EMPTY;
     sched.step_period[module_idx] = 0;
     sched.step_counter[module_idx] = 0;
     sched.module_code_base[module_idx] = 0;
@@ -6879,8 +6973,8 @@ pub fn run_builtin_graph(modules: &[BuiltinModuleEntry]) -> ! {
 
         // Check event wake
         let wake = crate::kernel::event::take_wake_pending();
-        if wake != 0 {
-            step_woken_modules(&mut sched.modules, count, wake);
+        if !wake.is_empty() {
+            step_woken_modules(&mut sched.modules, count, &wake);
         }
 
         // Built-in-graph platforms (qemu / rp) don't have a separate

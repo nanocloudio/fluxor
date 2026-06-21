@@ -128,6 +128,161 @@ include!("linux/linux_surface_traits.rs");
 include!("linux/linux_surface_traits_probe.rs");
 
 // ============================================================================
+// Graph construction (shared by boot and live rebuild)
+// ============================================================================
+
+/// Compile the installed `STATIC_CONFIG` and instantiate every module, including
+/// the hosted built-ins (`linux_net`, asset/display/audio/etc.). Returns
+/// `(compiled_count, loaded_count)`. Shared by first boot and the live-rebuild
+/// path in the main loop; both call `prepare_graph()` (which does the
+/// destructive arena/scheduler reset) then this.
+fn build_graph_linux() -> (usize, usize) {
+    let (module_list, module_count) = match scheduler::prepare_graph() {
+        Ok(v) => v,
+        Err(rc) => {
+            eprintln!("error: prepare_graph failed (rc={rc})");
+            process::exit(1);
+        }
+    };
+    log::info!("[graph] compiled: {module_count} modules");
+
+    // SAFETY: `static_loader` returns a reference into the static loader arena.
+    let loader_ref = unsafe { scheduler::static_loader() };
+    // SAFETY: single-threaded; `sched_mut` exposes scheduler state during
+    // instantiation, before/between worker stepping.
+    let sched = unsafe { scheduler::sched_mut() };
+    let mut loaded_count = 0usize;
+
+    for (module_idx, entry) in module_list.iter().enumerate().take(module_count) {
+        let entry = match entry {
+            Some(e) => e,
+            None => continue,
+        };
+
+        if entry.name_hash == LINUX_NET_HASH {
+            scheduler::set_current_module(module_idx);
+            let net_in_ch = scheduler::get_module_port(module_idx, 0, 0);
+            let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
+            let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
+            install_state(&mut m, LinuxNetState::new(net_in_ch, net_out_ch));
+            scheduler::store_builtin_module(module_idx, m);
+            log::info!(
+                "[inst] module {module_idx} = linux_net (built-in) net_in={net_in_ch} net_out={net_out_ch}"
+            );
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == HOST_ASSET_SOURCE_HASH {
+            let m = build_host_asset_source(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == HOST_ASSET_INDEX_HASH {
+            let m = build_host_asset_index(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_DISPLAY_HASH {
+            let m = build_linux_display(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_AUDIO_HASH {
+            let m = build_linux_audio(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        #[cfg(feature = "host-image")]
+        if entry.name_hash == HOST_IMAGE_CODEC_HASH {
+            let m = build_host_image_codec(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_ALSA_MIDI_HASH {
+            let m = build_linux_alsa_midi(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_SURFACE_TRAITS_HASH {
+            let m = build_linux_surface_traits(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_SURFACE_TRAITS_PROBE_HASH {
+            let m = build_linux_surface_traits_probe(module_idx);
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        scheduler::set_current_module(module_idx);
+        let result = scheduler::instantiate_one_module(
+            loader_ref,
+            entry,
+            module_idx,
+            module_idx,
+            &mut sched.edges,
+            &mut sched.modules,
+            &mut sched.ports,
+        );
+        match result {
+            scheduler::InstantiateResult::Done => {
+                log::info!("[inst] module {module_idx} ready");
+                loaded_count += 1;
+            }
+            scheduler::InstantiateResult::Pending(mut pending) => {
+                let mut loaded = false;
+                for _ in 0..100 {
+                    thread::sleep(Duration::from_millis(10));
+                    // SAFETY: `pending` is the scheduler-allocated handle from
+                    // `instantiate_one_module`; `try_complete` polls the loader.
+                    match unsafe { pending.try_complete() } {
+                        Ok(Some(dm)) => {
+                            log::info!("[inst] module {module_idx} ready (pending)");
+                            scheduler::store_dynamic_module(module_idx, dm);
+                            loaded_count += 1;
+                            loaded = true;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::error!("[inst] module {module_idx} failed: {e:?}");
+                            loaded = true;
+                            break;
+                        }
+                    }
+                }
+                if !loaded {
+                    log::error!("[inst] module {module_idx} timeout");
+                }
+            }
+            scheduler::InstantiateResult::Error(rc) => {
+                log::error!("[inst] module {module_idx} error rc={rc}");
+            }
+        }
+    }
+
+    log::info!("[inst] {loaded_count} of {module_count} modules loaded");
+    scheduler::log_arena_summary();
+    (module_count, loaded_count)
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -227,166 +382,27 @@ fn main() {
     };
     log::info!("[loader] module table loaded, tick_us={tick_us}");
 
-    let (module_list, module_count) = match scheduler::prepare_graph() {
-        Ok(v) => v,
-        Err(rc) => {
-            eprintln!("error: prepare_graph failed (rc={rc})");
-            process::exit(1);
-        }
-    };
-    log::info!("[graph] compiled: {module_count} modules");
-
-    // Instantiate every module in the compiled list. `linux_net` is a
-    // hosted built-in with no .fmod entry, so it's constructed directly
-    // as a `BuiltInModule`; every other slot — user modules and any
-    // kernel-inserted `_tee` / `_merge` — goes through the shared
-    // `instantiate_one_module` path.
-    // SAFETY: `static_loader` returns a reference into the static loader
-    // arena populated by `populate_static_state_with_len`.
-    let loader_ref = unsafe { scheduler::static_loader() };
-    // SAFETY: single-threaded boot; `sched_mut` exposes the scheduler's
-    // static state during module instantiation, before any worker thread
-    // takes ownership.
-    let sched = unsafe { scheduler::sched_mut() };
-    let mut loaded_count = 0usize;
-
-    for (module_idx, entry) in module_list.iter().enumerate().take(module_count) {
-        let entry = match entry {
-            Some(e) => e,
-            None => continue,
-        };
-
-        if entry.name_hash == LINUX_NET_HASH {
-            scheduler::set_current_module(module_idx);
-            let net_in_ch = scheduler::get_module_port(module_idx, 0, 0);
-            let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
-            let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            // `LinuxNetState::new` already returns a heap `Box<Self>`
-            // (built in place to avoid a ~16 MiB stack temporary).
-            install_state(&mut m, LinuxNetState::new(net_in_ch, net_out_ch));
-            scheduler::store_builtin_module(module_idx, m);
-            log::info!(
-                "[inst] module {module_idx} = linux_net (built-in) net_in={net_in_ch} net_out={net_out_ch}"
-            );
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == HOST_ASSET_SOURCE_HASH {
-            let m = build_host_asset_source(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == HOST_ASSET_INDEX_HASH {
-            let m = build_host_asset_index(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_DISPLAY_HASH {
-            let m = build_linux_display(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_AUDIO_HASH {
-            let m = build_linux_audio(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        #[cfg(feature = "host-image")]
-        if entry.name_hash == HOST_IMAGE_CODEC_HASH {
-            let m = build_host_image_codec(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_ALSA_MIDI_HASH {
-            let m = build_linux_alsa_midi(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_SURFACE_TRAITS_HASH {
-            let m = build_linux_surface_traits(module_idx, entry.params());
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        if entry.name_hash == LINUX_SURFACE_TRAITS_PROBE_HASH {
-            let m = build_linux_surface_traits_probe(module_idx);
-            scheduler::store_builtin_module(module_idx, m);
-            loaded_count += 1;
-            continue;
-        }
-
-        scheduler::set_current_module(module_idx);
-        let result = scheduler::instantiate_one_module(
-            loader_ref,
-            entry,
-            module_idx,
-            module_idx,
-            &mut sched.edges,
-            &mut sched.modules,
-            &mut sched.ports,
-        );
-        match result {
-            scheduler::InstantiateResult::Done => {
-                log::info!("[inst] module {module_idx} ready");
-                loaded_count += 1;
-            }
-            scheduler::InstantiateResult::Pending(mut pending) => {
-                let mut loaded = false;
-                for _ in 0..100 {
-                    thread::sleep(Duration::from_millis(10));
-                    // SAFETY: `pending` is the scheduler-allocated handle from
-                    // `instantiate_one_module`; `try_complete` polls the loader
-                    // state machine and is the contract-correct call here.
-                    match unsafe { pending.try_complete() } {
-                        Ok(Some(dm)) => {
-                            log::info!("[inst] module {module_idx} ready (pending)");
-                            scheduler::store_dynamic_module(module_idx, dm);
-                            loaded_count += 1;
-                            loaded = true;
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::error!("[inst] module {module_idx} failed: {e:?}");
-                            loaded = true;
-                            break;
-                        }
-                    }
-                }
-                if !loaded {
-                    log::error!("[inst] module {module_idx} timeout");
-                }
-            }
-            scheduler::InstantiateResult::Error(rc) => {
-                log::error!("[inst] module {module_idx} error rc={rc}");
-            }
-        }
-    }
-
-    log::info!("[inst] {loaded_count} of {module_count} modules loaded");
+    // Compile + instantiate the graph (shared with the live-rebuild path).
+    let (mut module_count, loaded_count) = build_graph_linux();
     if loaded_count == 0 {
         log::warn!("[sched] no modules loaded, nothing to do");
         process::exit(0);
     }
-    scheduler::log_arena_summary();
 
     log::info!("[sched] starting main loop, tick_us={tick_us}");
     let tick_duration = Duration::from_micros(tick_us as u64);
     let mut tick: u64 = 0;
+    // Test hook: when FLUXOR_TEST_REBUILD_EVERY=N is set,
+    // self-trigger a graph rebuild every N loop iterations to exercise the
+    // live-rebuild loop without a full reconfigure graph. No-op when unset.
+    let test_rebuild_every: u64 = std::env::var("FLUXOR_TEST_REBUILD_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Always-incrementing iteration counter (unlike `tick`, it advances even on
+    // rebuild iterations that `continue` before the tick bump), so the periodic
+    // trigger fires exactly once per period.
+    let mut iter: u64 = 0;
     // Throttle oversleep warnings to once every ~1 s of expected
     // wall-clock so a chronic oversleep doesn't flood the log.
     let mut last_oversleep_log_tick: u64 = 0;
@@ -404,6 +420,28 @@ fn main() {
 
     loop {
         let t0 = Instant::now();
+        iter = iter.wrapping_add(1);
+
+        // Test hook: periodic self-trigger (no-op unless FLUXOR_TEST_REBUILD_EVERY set).
+        if test_rebuild_every > 0 && iter % test_rebuild_every == 0 {
+            log::info!("[test] auto-triggering rebuild at iter {iter}");
+            // SAFETY: null/0 = the documented "reload current STATIC_CONFIG" sentinel.
+            unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+        }
+
+        // Live rebuild. The reconfigure module triggers
+        // `TRIGGER_REBUILD` -> `request_rebuild`; consume it here and rebuild
+        // the graph from STATIC_CONFIG. Single-threaded, so no quiesce is
+        // needed (unlike bcm2712). `prepare_graph` does the destructive reset
+        // and is fail-safe on error.
+        if scheduler::take_rebuild_request().is_some() {
+            log::info!("[reconfigure] rebuild requested; rebuilding graph");
+            let (mc, lc) = build_graph_linux();
+            module_count = mc;
+            scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
+            log::info!("[reconfigure] rebuilt graph: {lc} of {mc} modules");
+            continue;
+        }
 
         // Use the shared scheduler stepping path — same one RP and BCM
         // (via its per-domain wrapper) call. Centralises topological
@@ -431,8 +469,8 @@ fn main() {
         // an interrupt-driven module would observe its event arbitrarily
         // late depending on `tick_us`.
         let wake = fluxor::kernel::event::take_wake_pending();
-        if wake != 0 {
-            scheduler::step_woken_modules(&mut sched.modules, module_count, wake);
+        if !wake.is_empty() {
+            scheduler::step_woken_modules(&mut sched.modules, module_count, &wake);
         }
 
         tick += 1;
@@ -477,10 +515,10 @@ fn main() {
         // spin) reaches `step_woken_modules` before the next full
         // step pass, matching RP's two-drain wake path.
         let wake = fluxor::kernel::event::take_wake_pending();
-        if wake != 0 {
+        if !wake.is_empty() {
             // SAFETY: single-threaded linux main loop — sole scheduler user.
             let sched = unsafe { scheduler::sched_mut() };
-            scheduler::step_woken_modules(&mut sched.modules, module_count, wake);
+            scheduler::step_woken_modules(&mut sched.modules, module_count, &wake);
         }
 
         // Detect chronic host oversleep. `thread::park_timeout`

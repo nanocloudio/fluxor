@@ -101,6 +101,18 @@ default = ["chip-rp2350b"]
 # lib alone.
 embedded-platform = []
 
+# Multi-Pod workload ownership (rfc_k8s.md §6.4, §19.2).
+# When OFF, `MAX_OWNERS == 1`, the owner table collapses to a single system
+# slot, owner fields on graph objects compile out, and the authorization
+# helpers become no-ops — so single-tenant bare-metal targets (rp*) carry no
+# ownership cost. Enabled by the multi-Pod targets (bcm2712, host-linux).
+multitenant = []
+
+# Test-only: bcm2712 fires a one-shot graph rebuild ~5 s after boot so the
+# live-rebuild bridge can be observed on hardware. Never enabled in
+# production images.
+test-rebuild = []
+
 # RP-family shared dependencies (pulled in by any chip-rp* feature)
 rp = [
     "embassy-executor", "embassy-time", "embassy-rp", "embassy-usb",
@@ -118,7 +130,7 @@ chip-rp2040 = ["rp", "embassy-rp/rp2040", "embedded-platform"]
 
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
 # Minimal — no embassy, no cortex-m. Bare-metal from scratch.
-chip-bcm2712 = ["portable-atomic", "sha2", "embedded-platform"]
+chip-bcm2712 = ["portable-atomic", "sha2", "embedded-platform", "multitenant"]
 
 # Board-level selection for BCM2712 targets.
 # board-cm5: Real Raspberry Pi 5 / CM5 hardware (kernel loaded at 0x80000).
@@ -127,7 +139,7 @@ board-cm5 = ["chip-bcm2712"]
 
 # Linux hosted (aarch64 userspace). Uses std — no embassy, no cortex-m.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
-host-linux = ["portable-atomic", "sha2", "env_logger", "libc"]
+host-linux = ["portable-atomic", "sha2", "env_logger", "libc", "multitenant"]
 
 # WASM target. Builds the kernel as a wasm32-unknown-unknown library.
 # A small bootstrap shim (browser, wasmtime, edge) provides the host

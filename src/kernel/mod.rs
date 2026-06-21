@@ -49,6 +49,7 @@ pub mod internal {
 // public ABI does not surface them.
 pub use internal::backing_provider;
 pub use internal::bridge;
+pub mod bitmask;
 pub mod buffer_pool;
 pub mod channel;
 pub mod config;
@@ -57,6 +58,7 @@ pub mod errno;
 pub mod event;
 pub mod loader;
 pub mod log_ring;
+pub mod owner;
 pub mod scheduler;
 
 // RP-family kernel services.

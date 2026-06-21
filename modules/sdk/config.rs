@@ -69,26 +69,25 @@ mod profile_host {
         /// individual channels at 16-64 KiB without exhausting
         /// the arena under sustained gigabit-class loads.
         pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
-        pub const MAX_MODULES: usize = 64;
-        // 128 KiB so the synth host can carry the inlined wasm
-        // browser shell (runtime.html + host_shims.js, ~60 KiB
-        // combined) as http `body:` routes. Smaller values
-        // silently truncate the http module's params blob (the
-        // kernel-side ParamBuffer copies up to this many bytes
-        // before passing to module_new), which manifested as
-        // host_shims.js getting served at 1275 bytes instead of
-        // its full ~32 KiB. Aligned with `MAX_CONFIG_SIZE`,
-        // `MAX_MODULE_PARAMS_SIZE` (tools), and the http module
-        // section cap. Bumped 128 → 256 KiB as the shell grew again
-        // (host_shims.js ~32 → ~56 KiB + runtime.html ~83 KiB), which
-        // re-tripped the same truncation (host_shims served at 46665
-        // of 55873). Keep this whole set in lockstep.
+        // Multi-Pod: 128 lets the system substrate plus several Pod subgraphs
+        // co-reside on aarch64 (CM5 / host-linux). 128 keeps every module index
+        // within the scheduler's u8 index domain (`exec_order: [u8; _]`,
+        // `module_idx as u8`); going past 256 requires widening those ids to
+        // u16. The `ModuleMask` bitmaps scale to match (MODULE_MASK_WORDS == 2
+        // here). Edge capacity is the global MAX_GRAPH_EDGES.
+        pub const MAX_MODULES: usize = 128;
+        // 256 KiB so the synth host can carry the inlined wasm browser shell
+        // (runtime.html ~83 KiB + host_shims.js ~56 KiB) as http `body:`
+        // routes. Smaller values silently truncate the http module's params
+        // blob (the kernel-side ParamBuffer copies up to this many bytes before
+        // passing to module_new). Aligned with `MAX_CONFIG_SIZE`,
+        // `MAX_MODULE_PARAMS_SIZE` (tools), and the http module section cap —
+        // keep this whole set in lockstep.
         pub const MAX_MODULE_CONFIG_SIZE: usize = 256 * 1024;
         // 256 KiB so split scenarios where both halves' http modules
         // inline the canonical wasm shell as body routes
         // (~95 KiB per http module) leave enough headroom for the
         // other modules' params (codec, bank, ws_stream, ...).
-        // Was 64 KiB pre-shell-bundling.
         pub const CONFIG_ARENA_SIZE: usize = 256 * 1024;
         /// Capacity of the in-memory log ring (`kernel::log_ring`).
         /// Sized for moderate trace volume.
@@ -141,37 +140,36 @@ mod profile_host {
         // (runtime.html, fluxor.wasm, host_shims.js, /scenario.json,
         // /api/list, plus 3 spare for user/scenario route merges).
         pub const MAX_ROUTES: usize = 8;
-        // Request-path budget. Bumped 32 → 200 alongside MAX_FS_PATH:
-        // serving a real library (`list:` over `/tmp/music`) means request
-        // URLs like `/music/Elbow/Asleep In the Back/01 Any Day Now.m4a`,
-        // and percent-encoding (`%20` per space) inflates them further. At
-        // 32 the request path truncated, so `fs_list` OPENed a clipped path
-        // → 404. (`req_path_len` is a u8, so this stays ≤ 255.)
+        // Request-path budget. Serving a real library (`list:` over
+        // `/tmp/music`) means request URLs like
+        // `/music/Elbow/Asleep In the Back/01 Any Day Now.m4a`, and
+        // percent-encoding (`%20` per space) inflates them further; 200 holds
+        // them without a clipped path → 404. (`req_path_len` is a u8, so this
+        // stays ≤ 255.)
         pub const MAX_PATH: usize = 200;
         pub const MAX_CONTENT_TYPE: usize = 32;
-        /// Per-route absolute filesystem path budget on host targets.
-        /// Bumped 64 → 256 in PR 6+ to fit realistic absolute paths
-        /// like `/home/<user>/Development/<project>/examples/.../viewer.html`
-        /// that the scenario synthesiser emits — at 64, paths were
-        /// silently truncated, causing `linux_fs_dispatch` to OPEN
-        /// the wrong filename (often creating an empty file via the
-        /// `O_CREAT` fallback) and FS_STAT to return `st_size = 0`,
-        /// surfacing as 200-OK-with-0-byte-body responses for
-        /// `fs_path:` routes. Embedded/wasm profiles keep 64 — their
-        /// fs_path values are short on-flash paths like `/web/INDEX.HTM`.
+        /// Per-route absolute filesystem path budget on host targets. 256 fits
+        /// realistic absolute paths like
+        /// `/home/<user>/Development/<project>/examples/.../viewer.html` that
+        /// the scenario synthesiser emits; a shorter budget truncates the path,
+        /// so `linux_fs_dispatch` OPENs the wrong filename (creating an empty
+        /// file via the `O_CREAT` fallback) and FS_STAT returns `st_size = 0` —
+        /// surfacing as 200-OK-with-0-byte-body responses for `fs_path:`
+        /// routes. Embedded/wasm profiles keep 64 — their fs_path values are
+        /// short on-flash paths like `/web/INDEX.HTM`.
         pub const MAX_FS_PATH: usize = 256;
         pub const MAX_VARS: usize = 16;
         pub const MAX_VAR_VALUE: usize = 16;
         pub const MAX_CACHE: usize = 4;
         // Host profile (aarch64: linux orchestrator, Pi 5 / cm5) serves
-        // synthesised wasm-scenario hosts that inline the canonical
-        // browser shell as `body:` routes — runtime.html (~83 KiB after
-        // scenario substitution) + host_shims.js (~56 KiB) + scenario.json.
-        // At 48 KiB the pool overflowed and silently truncated bodies
-        // (corrupt JS → "missing }" / empty scenario.json in the browser).
-        // Bumped to 256 KiB; the arena reserves 2× this and these targets
-        // have GiBs of RAM, so it's a sanity bound, not a memory constraint.
-        // profile_wasm / profile_embedded keep their small pools.
+        // synthesised wasm-scenario hosts that inline the canonical browser
+        // shell as `body:` routes — runtime.html (~83 KiB after scenario
+        // substitution) + host_shims.js (~56 KiB) + scenario.json. 256 KiB
+        // holds them without overflowing the pool (an overflow truncates bodies
+        // into corrupt JS / empty scenario.json); the arena reserves 2× this
+        // and these targets have GiBs of RAM, so it's a sanity bound, not a
+        // memory constraint. profile_wasm / profile_embedded keep their small
+        // pools.
         pub const DEFAULT_BODY_POOL_SIZE: usize = 256 * 1024;
     }
 

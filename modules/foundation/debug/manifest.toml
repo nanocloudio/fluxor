@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["rp2350"]
+hardware_targets = ["rp2350", "bcm2712"]
 
 # `debug` accepts a data stream and logs it. The input is optional —
 # `examples/hello/linux.yaml` deliberately runs debug with no wiring

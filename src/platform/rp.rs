@@ -769,8 +769,8 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
         }
 
         let wake = fluxor::kernel::event::take_wake_pending();
-        if wake != 0 {
-            scheduler::step_woken_modules(modules, module_count, wake);
+        if !wake.is_empty() {
+            scheduler::step_woken_modules(modules, module_count, &wake);
         }
 
         SCHEDULER_WAKE.reset();
@@ -781,8 +781,8 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
         .await;
 
         let wake = fluxor::kernel::event::take_wake_pending();
-        if wake != 0 {
-            scheduler::step_woken_modules(modules, module_count, wake);
+        if !wake.is_empty() {
+            scheduler::step_woken_modules(modules, module_count, &wake);
         }
     }
 }

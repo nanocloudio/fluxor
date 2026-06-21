@@ -20,6 +20,7 @@
 pub mod asset_bank;
 pub mod cargo_index;
 pub mod ci;
+pub mod compose;
 pub mod error;
 pub mod hash;
 pub mod hygiene;

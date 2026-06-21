@@ -452,12 +452,14 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
 /// value up to 64 is safe; >64 needs the bitmap widened first.
 pub use crate::abi::config::kernel::MAX_MODULES;
 
-// The event-wake bitmap in `kernel/event.rs` is u64, so MAX_MODULES > 64
-// would silently lose wake notifications for the higher-numbered modules.
-// Catch any future profile bump that would violate this at compile time.
+// The event-wake bitmap and scheduler readiness/upstream bitmaps are
+// `ModuleMask`-backed, so they scale with MAX_MODULES.
+// The residual ceiling is the scheduler's u8 module-index domain
+// (`exec_order: [u8; _]`, `module_idx as u8`, fault-attribution ids); 256 is
+// the boundary. See the matching assert in `kernel/scheduler`.
 const _: () = assert!(
-    MAX_MODULES <= 64,
-    "MAX_MODULES > 64 requires widening kernel/event.rs wake_bits beyond u64"
+    MAX_MODULES <= 256,
+    "MAX_MODULES > 256 requires widening scheduler module ids past u8"
 );
 
 pub const MAX_GRAPH_EDGES: usize = 128;
@@ -709,8 +711,7 @@ pub struct Config {
     ///          `prepare_graph` rejects cycles (v1 strict invariant).
     /// bits 1-7: reserved (must be 0).
     ///
-    /// See `.context/rfc_deployment_scenarios.md` §13 ("Known issue
-    /// blocking PR 3 end-to-end") for the design rationale.
+    /// See `.context/rfc_deployment_scenarios.md` §13 for the design rationale.
     pub graph_flags: u8,
 }
 
