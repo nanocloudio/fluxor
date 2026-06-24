@@ -605,6 +605,17 @@ impl NameArena {
 pub mod module_types;
 pub use module_types::{BuiltInModule, DummyModule, MergeModule, ModuleSlot, TeeModule};
 
+/// WS-D-min: live graph mutation (add owner / free owner). Multi-tenant only —
+/// bare-metal single-tenant targets compile it out at zero cost. See
+/// `.context/ws_d_min.md`.
+#[cfg(feature = "multitenant")]
+pub mod live;
+#[cfg(feature = "multitenant")]
+pub use live::{
+    apply_add, free_owner, AddEdge, AddError, AddModule, AddSubgraph, Endpoint, FreeError,
+    ModuleSource,
+};
+
 // ============================================================================
 // Runner Configuration
 // ============================================================================

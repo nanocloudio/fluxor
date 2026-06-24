@@ -1220,6 +1220,34 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             0
         }
 
+        // ── WS-D-min: live graph mutation (multi-tenant only) ──
+        reconfigure::APPLY_ADD => {
+            #[cfg(feature = "multitenant")]
+            {
+                // SAFETY: `arg`/`arg_len` describe the caller's request buffer,
+                // valid for this call; the decoder borrows module params from it
+                // in place and writes the owner handle back into it.
+                unsafe { scheduler::live::apply_add_encoded(arg, arg_len) }
+            }
+            #[cfg(not(feature = "multitenant"))]
+            {
+                let _ = (arg, arg_len);
+                E_NOSYS
+            }
+        }
+        reconfigure::FREE_OWNER => {
+            #[cfg(feature = "multitenant")]
+            {
+                // SAFETY: `arg`/`arg_len` describe a readable handle record.
+                unsafe { scheduler::live::free_owner_encoded(arg, arg_len) }
+            }
+            #[cfg(not(feature = "multitenant"))]
+            {
+                let _ = (arg, arg_len);
+                E_NOSYS
+            }
+        }
+
         _ => {
             // Delegate to platform extension for hardware-specific opcodes
             if let Some(ext) = SYSTEM_EXTENSION {

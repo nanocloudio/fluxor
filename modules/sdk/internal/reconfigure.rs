@@ -42,3 +42,24 @@ pub const MODULE_UPSTREAM: u32 = 0x0C6E;
 /// Query whether module N has returned StepOutcome::Done (finished).
 /// handle=-1, arg=[module_idx:u8]. Returns 1 if finished, 0 otherwise.
 pub const MODULE_DONE: u32 = 0x0C6F;
+
+// ── WS-D-min: live graph mutation (add owner / free owner) ──────────────────
+// Splice a self-contained subgraph into a running graph, and tear it down,
+// without a destructive rebuild. See `.context/ws_d_min.md`. Only the keystone
+// add+teardown is here; partial replacement / migration are later phases.
+
+/// Add a new owner's subgraph to the running graph.
+/// handle=-1, arg = bounded binary `AddSubgraph` (magic `FLXA`, version, body,
+/// trailing sha256 — same discipline as the composed plan codec). On success
+/// the kernel writes the 6-byte `OwnerHandle` (`slot:u16 LE, generation:u32 LE`)
+/// into the first 6 bytes of `arg`. Returns 0 on success, negative `AddError`
+/// otherwise. NOTE: the on-wire form carries PIC modules (by `name_hash` +
+/// params); a target whose PIC load is asynchronous returns `-WouldBlock` until
+/// the async-load follow-up lands. In-process callers use `scheduler::apply_add`
+/// directly (built-in or already-resident modules).
+pub const APPLY_ADD: u32 = 0x0C70;
+/// Free an owner: stop its modules, close its edges, reclaim its state, and
+/// revoke the handle (the generation guard rejects it thereafter).
+/// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
+/// negative `FreeError` otherwise.
+pub const FREE_OWNER: u32 = 0x0C71;
