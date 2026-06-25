@@ -1276,6 +1276,13 @@ const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 /// together.
 const MAX_DOMAINS: usize = 4;
 
+/// Bounded graph/domain pacer-instance table size (RFC adaptive_tick_extra
+/// §7.5). One pacer per (graph_instance, domain); with a single resident graph
+/// this equals `MAX_DOMAINS`. The build rejects adaptive configs that would
+/// need more resident pacer instances than this — the scheduler never allocates
+/// pacer state on a hot path.
+const MAX_PACER_INSTANCES: usize = MAX_DOMAINS;
+
 /// Burst-mode deadline multiplier — mirrors
 /// `kernel::step_guard::BURST_MULTIPLIER`.
 const BURST_DEADLINE_MULTIPLIER: u32 = 8;
@@ -1522,10 +1529,24 @@ fn validate_scheduler_budgets(
 ///     (b) unless `wall_clock`. On an (a)-only domain the gate is lenient (only
 ///     `tick_counted`/`guaranteed` rejected).
 ///
-/// NOT yet enforced here (documented follow-ups, RFC §8): the replicated-clock
-/// (ttl/lease) gate, the Guaranteed-tier WCET re-validation, and the
-/// bcm2712-only domain-0 `DBG_TICK` / `tick_count`-as-ms gates. These block their
-/// respective hazards once the bcm2712 multi-domain path lands.
+///   * **Replicated-clock (D8 rule 4, §7.3)**: a `replicated_clock`-class module
+///     (ttl/lease) is blocked on (b) unless the domain asserts
+///     `replica_agreed_cadence: true` (and never on a multi-node cluster);
+///     mechanism (a) idle is clamped so `tick_max_us` stays below the tick
+///     emission interval.
+///   * **Guaranteed-tier WCET (D8 rule 6, §11)**: a `guaranteed`-class module is
+///     blocked on (b) unless the domain asserts `guaranteed_wcet_revalidated:
+///     true` (the operator re-ran WCET/budget schedulability at `tick_min_us`).
+///   * **Domain-0 `DBG_TICK` rate-coupling (D8 rule 7, §7.1)**: on a DBG_TICK-
+///     backed target with ≥2 domains, an adaptive domain 0 must set a finite
+///     `tick_max_us` so its variable pacing can't stall sibling-domain
+///     `tick_count()` reads (the `*-TICKS` windows are already wall-clocked,
+///     remedy iii).
+///   * **`tick_count()`-as-ms (D8 rule 8, §7.6)**: resolved at the source — the
+///     bcm2712/Linux HAL `tick_count` is now wall-clock-backed (remedy i) and
+///     timer FDs already use `hal::now_millis`; a module that counts ticks as
+///     time is `tick_counted` and is rejected by the timer-class gate above.
+///
 /// Read a numeric module param from EITHER the top-level entry (`voter_count: 3`)
 /// OR a nested `params:` map (`params: { voter_count: 3 }`). The TLV packer
 /// accepts both styles (schema.rs:298-335), so the D9/D10 raft gates must too —
@@ -1538,6 +1559,11 @@ fn module_param_u64(m: &Value, key: &str) -> Option<u64> {
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "validation context is threaded positionally to match the other \
+              validate_* helpers; bundling into a struct would not improve clarity"
+)]
 fn validate_adaptive_tick(
     config: &Value,
     module_list: &[Value],
@@ -1546,6 +1572,7 @@ fn validate_adaptive_tick(
     domain_tick_us: &[u16],
     manifests: &HashMap<String, Manifest>,
     extra_module_dirs: &[&std::path::Path],
+    resolved_target: Option<&str>,
 ) -> Result<()> {
     // Read RAW u64 values (not `as u16`/`as u8`) so out-of-range inputs are
     // caught BEFORE the wire cast silently wraps them (e.g. tick_max_us=200000
@@ -1553,11 +1580,33 @@ fn validate_adaptive_tick(
     let mut flags = [0u64; MAX_DOMAINS];
     let mut tmin = [0u64; MAX_DOMAINS];
     let mut tmax = [0u64; MAX_DOMAINS];
+    // Per-domain operator attestations for the §11 / §7.3 escape hatches:
+    //  * `guaranteed_wcet_revalidated` — the operator asserts the domain's
+    //    WCET/budget schedulability was re-run at `tick_min_us`, permitting a
+    //    `guaranteed`-class module on a mechanism-(b) domain (D8 rule 6).
+    //  * `replica_agreed_cadence` — the operator asserts every replica paces
+    //    the replicated-tick emission identically, permitting a
+    //    `replicated_clock`-class module on a (single-node) (b) domain
+    //    (D8 rule 4).
+    let mut guar_reval = [false; MAX_DOMAINS];
+    let mut replica_agreed = [false; MAX_DOMAINS];
+    // Per-domain core bitmask (§9.2 shared-runner detection). A domain that
+    // pins `cores: [N, ...]` runs on those cores; a domain with no `cores`
+    // shares the cooperative runner (modelled as core 0 — true on single-core
+    // Linux/rp/wasm, and the default lane on bcm2712). Two domains whose
+    // bitmasks overlap share a physical runner.
+    let mut core_mask = [0u64; MAX_DOMAINS];
+    // Per-domain "hosts a timing-strict module" (Guaranteed WCET, replicated
+    // clock, or raft liveness) — the §9.2 / §9.4 shared-runner co-residency
+    // check rejects an adaptive domain sharing a runner with one of these.
+    let mut has_strict = [false; MAX_DOMAINS];
+    let mut domain_count = 0usize;
     if let Some(domains) = config
         .get("execution")
         .and_then(|e| e.get("domains"))
         .and_then(|d| d.as_array())
     {
+        domain_count = domains.len();
         for (i, dom) in domains.iter().take(MAX_DOMAINS).enumerate() {
             flags[i] = dom
                 .get("adaptive_flags")
@@ -1565,12 +1614,61 @@ fn validate_adaptive_tick(
                 .unwrap_or(0);
             tmin[i] = dom.get("tick_min_us").and_then(|v| v.as_u64()).unwrap_or(0);
             tmax[i] = dom.get("tick_max_us").and_then(|v| v.as_u64()).unwrap_or(0);
+            guar_reval[i] = dom
+                .get("guaranteed_wcet_revalidated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            replica_agreed[i] = dom
+                .get("replica_agreed_cadence")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match dom.get("cores").and_then(|v| v.as_array()) {
+                Some(arr) if !arr.is_empty() => {
+                    for c in arr {
+                        if let Some(n) = c.as_u64() {
+                            core_mask[i] |= 1u64 << (n & 63);
+                        }
+                    }
+                }
+                // No (or empty) `cores` ⇒ the shared cooperative runner (core 0).
+                _ => core_mask[i] = 1,
+            }
+            // §8.4 Tier-0-vs-Tier-3 warning: adaptive cadence (a Tier-0
+            // latency/efficiency mode) on a domain explicitly declared poll-mode
+            // (Tier 3 = continuous stepping, no relaxation) is contradictory —
+            // Tier 3 is the "use the whole core" mode. Recommend picking one.
+            if flags[i] != 0 {
+                let tier = dom.get("tier").and_then(|v| v.as_str()).unwrap_or("");
+                let exec = dom.get("exec_mode").and_then(|v| v.as_str()).unwrap_or("");
+                if tier == "3" || exec == "poll" {
+                    eprintln!(
+                        "warning: domain '{}' sets adaptive_flags={:#x} but is declared \
+                         Tier 3 / poll-mode. Tier 0 adaptive reduces idle work; Tier 3 \
+                         saturates the core continuously — they are mutually exclusive \
+                         intents. Use Tier 3 for full-CPU/poll workloads and drop \
+                         adaptive_flags, or use Tier 0 adaptive and drop the poll tier \
+                         (RFC adaptive_tick_extra §8.4).",
+                        dom.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                        flags[i]
+                    );
+                }
+            }
         }
     }
     // Unconfigured ⇒ nothing to check (byte-identical path).
     if flags.iter().all(|&f| f == 0) {
         return Ok(());
     }
+
+    // D8 rules 7-8 are scoped to platforms whose HAL `tick_count` is
+    // `DBG_TICK`-backed — bcm2712 and Linux. rp2350/pico read `tick_count`
+    // from a wall-clock `Instant` and drive timer FDs off `hal::now_millis`,
+    // so they are immune (RFC adaptive_tick §7.6, D8 rule 8 scoping).
+    let silicon = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
+    let dbg_tick_backed = silicon.is_none_or(|s| {
+        let s = s.to_ascii_lowercase();
+        !(s.contains("rp2") || s.contains("pico") || s.contains("rp1") || s.contains("wasm"))
+    });
 
     let eff = |d: usize| -> u32 {
         let dt = domain_tick_us.get(d).copied().unwrap_or(0);
@@ -1624,6 +1722,94 @@ fn validate_adaptive_tick(
         }
     }
 
+    // D8 rule 7 (§7.1): domain-0 DBG_TICK rate-coupling on a multi-domain
+    // bcm2712 node. `DBG_TICK` is advanced ONLY by domain 0, and every domain
+    // reads it for `tick_count()`. If domain 0 paces variably (b) or idle-sleeps
+    // to tick_max_us (a), the shared logical clock re-times for ALL domains.
+    // The `*-TICKS` drain/quarantine/backoff windows are wall-clocked
+    // (RFC §7.6), so they are immune. The residual coupling is the DBG_TICK
+    // *advance rate* feeding
+    // sibling-domain `tick_count()` reads: bound it by requiring domain 0 to
+    // declare a finite `tick_max_us` (no unbounded idle widen) whenever it
+    // enables adaptive tick alongside sibling domains. An unbounded
+    // (`tick_max_us == 0` ⇒ platform default, but bit-0 idle can widen the
+    // programmed deadline arbitrarily) domain-0 widen maximally stalls sibling
+    // tick reads.
+    if dbg_tick_backed && domain_count >= 2 && flags[0] != 0 && tmax[0] == 0 {
+        return Err(Error::Config(format!(
+            "domain '{}' (domain 0) enables adaptive_flags={:#x} in a multi-domain \
+             configuration ({} domains) on a DBG_TICK-backed target ({}), but does \
+             not set a finite tick_max_us. Domain 0 alone advances the shared \
+             DBG_TICK that every sibling domain reads via tick_count(); an unbounded \
+             idle/cadence widen on domain 0 stalls sibling-domain timing. Set an \
+             explicit tick_max_us on domain 0 to bound the coupling, or disable \
+             adaptive tick on domain 0 (RFC adaptive_tick §7.1 / D8 rule 7).",
+            label(0),
+            flags[0],
+            domain_count,
+            silicon.unwrap_or("unknown"),
+        )));
+    }
+
+    // Bounded pacer-table admission (RFC adaptive_tick_extra §7.5 / §13). Each
+    // (graph_instance, domain) owns one pacer instance; the target declares a
+    // static maximum and the build rejects configs that exceed it (no scheduler
+    // hot path may allocate or resize pacer state). With a single resident
+    // graph the instance count is the number of adaptive execution domains and
+    // the bound is `MAX_DOMAINS` (one pacer per domain); with multiple resident
+    // graphs it is `graphs × domains` against the declared table size.
+    if domain_count > MAX_PACER_INSTANCES {
+        return Err(Error::Config(format!(
+            "adaptive tick: configuration declares {domain_count} execution domains, \
+             exceeding the target's bounded pacer table ({MAX_PACER_INSTANCES} \
+             graph/domain pacer instances). The scheduler never allocates pacer \
+             state on a hot path, so the resident pacer count is statically capped. \
+             Reduce the domain count or raise the target's pacer-table bound \
+             (RFC adaptive_tick_extra §7.5)."
+        )));
+    }
+
+    // §10 BCM2712 wake-policy declaration (required statement). On bcm2712/cm5,
+    // demand-driven idle (mechanism (a), bit 0) is NOT fully event-driven —
+    // Tier-0/1a idle uses WFI, which software SEV does not break — so every
+    // adaptive-idle config MUST declare how it bounds first-wake latency:
+    // `clamp` (the default), `doorbell` (the §5.4 SGI, opt-in), or
+    // `wfe` (only where the platform contract proves it safe). The declaration
+    // forces the deployment to acknowledge "bounded idle polling", not
+    // "event-driven idle". rp/Linux/wasm are event-driven and exempt.
+    let is_bcm = silicon.is_some_and(|s| {
+        let s = s.to_ascii_lowercase();
+        s.contains("bcm") || s.contains("cm5")
+    });
+    let any_idle = (0..MAX_DOMAINS).any(|d| flags[d] & ADAPTIVE_FLAG_IDLE as u64 != 0);
+    if is_bcm && any_idle {
+        let policy = config
+            .get("execution")
+            .and_then(|e| e.get("bcm_wake_policy"))
+            .and_then(|v| v.as_str());
+        match policy {
+            Some("clamp") | Some("doorbell") | Some("wfe") => {}
+            Some(other) => {
+                return Err(Error::Config(format!(
+                    "execution.bcm_wake_policy = \"{other}\" is not recognised; bcm2712 \
+                     adaptive idle must declare one of \"clamp\", \"doorbell\", or \
+                     \"wfe\" (RFC adaptive_tick_extra §10)."
+                )));
+            }
+            None => {
+                return Err(Error::Config(
+                    "bcm2712/cm5 adaptive idle (adaptive_flags bit 0) requires an \
+                     explicit `execution.bcm_wake_policy` of \"clamp\", \"doorbell\", \
+                     or \"wfe\". bcm2712 idle is WFI-based and not fully event-driven, \
+                     so the deployment must declare how first-wake latency is bounded \
+                     (clamp = bounded idle polling, the default; doorbell = §5.4 SGI; \
+                     wfe = only where proven safe) (RFC adaptive_tick_extra §10)."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     // Multi-node detection: any module declaring voter_count/peer_count > 1,
     // in EITHER the top-level or nested `params:` style (both packed).
     let multi_node = module_list.iter().any(|m| {
@@ -1662,9 +1848,85 @@ fn validate_adaptive_tick(
         //    (`tick_counted`/`guaranteed`) are rejected; idle-relax alone doesn't
         //    warp a running module, and the §7.2/§7.3 type-specific gates cover it.
         let cadence = flags[d] & ADAPTIVE_FLAG_CADENCE as u64 != 0;
+        let idle = flags[d] & ADAPTIVE_FLAG_IDLE as u64 != 0;
         if let Some(man) = manifests.get(mname) {
+            // D8 rule 4 (§7.3), mechanism (a): demand-driven idle must not stall
+            // the committed-tick emitter long enough to delay replicated expiry.
+            // Same backstop clamp as the D9 liveness gate — applies whenever idle
+            // is enabled, independent of the cadence flag.
+            if idle && man.timer_class.is_replicated_clock() {
+                let interval_ms = module_param_u64(m, "tick_interval_ms")
+                    .or_else(|| module_param_u64(m, "heartbeat_interval_ms"))
+                    .unwrap_or(DEFAULT_HEARTBEAT_MS);
+                let interval_us = interval_ms.saturating_mul(1000);
+                let emax = if tmax[d] > 0 { tmax[d] } else { eff(d) as u64 };
+                if emax >= interval_us {
+                    return Err(Error::Config(format!(
+                        "module '{mname}' (timer_class=replicated_clock) on adaptive \
+                         domain '{}': demand-driven idle (adaptive_flags bit 0) with \
+                         tick_max_us={emax} ≥ tick emission interval ({interval_ms} ms \
+                         = {interval_us} us). An idle domain would stop stepping the \
+                         tick emitter, so committed/replicated expiry stalls until the \
+                         backstop fires. Set tick_max_us < {interval_us}, or clear \
+                         bit 0 on this domain (RFC adaptive_tick §7.3 / D8 rule 4).",
+                        label(d),
+                    )));
+                }
+            }
             if cadence {
-                if !man.timer_class.tolerates_variable_cadence() {
+                // D8 rule 4 (§7.3), mechanism (b): a replicated/committed clock
+                // self-reads wall-clock time (so it passes the rule-2 attestation
+                // gate), but varying the *emission cadence* shifts expiry timing.
+                // Independent per-node pacing cannot agree, so it is blocked
+                // outright on a multi-node cluster; on a single node it is allowed
+                // only when the operator asserts replica-agreed emission cadence.
+                if man.timer_class.is_replicated_clock() {
+                    if multi_node {
+                        return Err(Error::Config(format!(
+                            "module '{mname}' (timer_class=replicated_clock) cannot run \
+                             on mechanism-(b) domain '{}' of a multi-node cluster \
+                             (voter_count/peer_count > 1): independent per-node pacing \
+                             changes the replicated-tick emission rate, so replicas \
+                             diverge on expiry order. Pin the replicated-clock-owning \
+                             domain to fixed cadence (clear adaptive_flags bit 1) \
+                             (RFC adaptive_tick §7.3/§7.4 / D8 rule 4).",
+                            label(d),
+                        )));
+                    }
+                    if !replica_agreed[d] {
+                        return Err(Error::Config(format!(
+                            "module '{mname}' (timer_class=replicated_clock) cannot run \
+                             on mechanism-(b) (variable-cadence) domain '{}' unless the \
+                             config asserts that all replicas pace the replicated-tick \
+                             emission identically. Set `replica_agreed_cadence: true` on \
+                             the domain only if that holds, else pin the domain to fixed \
+                             cadence (RFC adaptive_tick §7.3 / D8 rule 4).",
+                            label(d),
+                        )));
+                    }
+                } else if man.timer_class == TimerClass::Guaranteed {
+                    // D8 rule 6 (§11, service tier): (b) lowers the tick and the
+                    // domain budget IS the tick, so a guaranteed-WCET module's
+                    // schedulability — proven at a fixed tick — can be silently
+                    // shrunk. Allowed only when the operator asserts the WCET/budget
+                    // schedulability was re-validated at the worst-case `tick_min_us`.
+                    // (The burst-at-floor rule below enforces the per-step bound at
+                    // tick_min; the full schedulability re-run is the operator's
+                    // attestation.)
+                    if !guar_reval[d] {
+                        return Err(Error::Config(format!(
+                            "module '{mname}' (timer_class=guaranteed) cannot run on \
+                             mechanism-(b) (variable-cadence) domain '{}': mechanism (b) \
+                             can drive the tick down to tick_min_us, shrinking the domain \
+                             budget below the value its WCET schedulability was proven \
+                             at. Re-validate the domain's WCET/budget schedulability at \
+                             tick_min_us and set `guaranteed_wcet_revalidated: true`, or \
+                             move it to a fixed-cadence domain (RFC adaptive_tick §11 / \
+                             D8 rule 6).",
+                            label(d),
+                        )));
+                    }
+                } else if !man.timer_class.tolerates_variable_cadence() {
                     return Err(Error::Config(format!(
                         "module '{mname}' (timer_class={}) cannot run on mechanism-(b) \
                          (variable-cadence) domain '{}': it must positively attest \
@@ -1691,6 +1953,17 @@ fn validate_adaptive_tick(
                         label(d),
                     )));
                 }
+                // D8 rule 8 (§7.6) — `tick_count()`-as-milliseconds — is resolved
+                // at the source: on the DBG_TICK-backed HALs (bcm2712/Linux) the
+                // HAL `tick_count` op is wall-clock-backed
+                // (`bcm_now_millis`/`elapsed_micros`), matching rp's `Instant` HAL,
+                // and timer FDs derive deadlines from `hal::now_millis`
+                // (`fd.rs`). A module that *itself* counts scheduler ticks as time
+                // is `tick_counted` and is already rejected above by rule 2, on
+                // every platform. So there is no residual graph-shape for the
+                // validator to gate here beyond that rule (RFC adaptive_tick §7.6 /
+                // D8 rule 8). `dbg_tick_backed`/`silicon` remain in scope for the
+                // rule-7 domain-0 gate above.
             } else if man.timer_class.forbids_adaptive() {
                 return Err(Error::Config(format!(
                     "module '{mname}' (timer_class={}) cannot run on adaptive-tick \
@@ -1802,6 +2075,65 @@ fn validate_adaptive_tick(
         }
     }
 
+    // §9.2 / §9.4 shared-runner co-residency gate (reject-by-default). Populate
+    // `has_strict` across ALL domains — a timing-strict module (Guaranteed WCET,
+    // replicated clock, raft liveness) usually sits on a NON-adaptive domain, so
+    // the adaptive-only module loop above doesn't see it.
+    for m in module_list {
+        let mtype = m
+            .get("type")
+            .or_else(|| m.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mname = m.get("name").and_then(|v| v.as_str()).unwrap_or(mtype);
+        let d = resolve_domain_id(m, config)? as usize;
+        if d >= MAX_DOMAINS {
+            continue;
+        }
+        let strict = mtype == "raft_engine"
+            || manifests
+                .get(mname)
+                .map(|man| {
+                    matches!(
+                        man.timer_class,
+                        TimerClass::Guaranteed | TimerClass::ReplicatedClock
+                    )
+                })
+                .unwrap_or(false);
+        if strict {
+            has_strict[d] = true;
+        }
+    }
+    // An adaptive domain sharing a physical runner (overlapping core mask) with
+    // a timing-strict domain is rejected: a variable-cadence sibling can delay
+    // the strict domain's deadline/emission/wake, and proving the bound under
+    // worst-case adaptive load is intractable (§9.2 reject-by-default). The fix
+    // is placement — a dedicated runner / ISR tier — not a schedulability proof.
+    for a in 0..MAX_DOMAINS {
+        if flags[a] == 0 {
+            continue; // `a` is not adaptive
+        }
+        for b in 0..MAX_DOMAINS {
+            if a == b || !has_strict[b] {
+                continue;
+            }
+            if core_mask[a] & core_mask[b] != 0 {
+                return Err(Error::Config(format!(
+                    "adaptive domain '{}' shares a runner (overlapping cores) with \
+                     timing-strict domain '{}' (a guaranteed-WCET, replicated-clock, \
+                     or raft-liveness module). A variable-cadence sibling can delay \
+                     the strict domain's deadline/emission/wake, and the bound cannot \
+                     be proven under worst-case adaptive load. Pin the strict domain \
+                     to its own core or an ISR tier, or remove adaptive_flags from \
+                     '{}' (RFC adaptive_tick_extra §9.2/§9.4).",
+                    label(a),
+                    label(b),
+                    label(a),
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1821,20 +2153,19 @@ fn validate_adaptive_tick(
 ///    rule also requires a `module_isr_entry` export in the source —
 ///    the IRQ dispatches into it, not the cooperative `module_step`.
 ///
-/// 2. **No edges touching ISR-tier endpoints.** As of 2026-05-26
-///    ANY YAML edge with at least one Tier 1b/2 endpoint is
-///    rejected, regardless of `edge_class`. The kernel-side bridge
-///    wiring (`scheduler::wire_isr_bridges` + `pump_isr_bridges`)
-///    is implemented and verified by harness tests, but PIC
-///    modules have no documented SDK surface for reading their
-///    bridge slot indices from inside `module_step` — the SDK's
-///    `bridge_dispatch` helper rides `provider_call`, which the
-///    §D7 syscall gate denies for ISR-tier callers. Admitting a
-///    config that would silently fail at runtime is worse than
-///    rejecting it loudly. See `docs/architecture/scheduler.md`
-///    §"ISR-tier I/O contract" for the lift path. Tests that need
-///    to exercise the kernel-side bridge mechanism bypass YAML via
-///    `install_static_config` + `set_domain_exec_mode`.
+/// 2. **No edges touching ISR-tier endpoints.** ANY YAML edge with at
+///    least one Tier 1b/2 endpoint is rejected, regardless of
+///    `edge_class`. The kernel-side bridge wiring
+///    (`scheduler::wire_isr_bridges` + `pump_isr_bridges`) and the
+///    module-facing surface (`bridge::SELF_BRIDGES` enumerates a
+///    module's own bridge fds; the bridge `WRITE`/`READ`/`POLL`/`INFO`
+///    ops are exempt from the §D7 ISR syscall deny, being lock-free
+///    rings) both exist, but the end-to-end YAML-edge → bridge-fd
+///    wiring is not silicon-validated, so the edge gate stays strict:
+///    admitting a config that might silently mis-wire at runtime is
+///    worse than rejecting it loudly. Tests exercise the kernel-side
+///    bridge mechanism via `install_static_config` +
+///    `set_domain_exec_mode`.
 ///
 /// A module that lands in an ISR-tier domain without a resolvable
 /// manifest is a **hard error**. `validate_wiring_types` only
@@ -1848,6 +2179,7 @@ fn validate_isr_tier_admission(
     module_list: &[Value],
     modules_dir: &std::path::Path,
     extra_module_dirs: &[&std::path::Path],
+    resolved_target: Option<&str>,
 ) -> Result<()> {
     // Per-domain exec_mode for the four supported domains.
     let mut domain_exec_mode: [u8; 4] = [0; 4];
@@ -1905,6 +2237,71 @@ fn validate_isr_tier_admission(
 
     let manifests =
         load_module_manifests_with_extra(&Value::Array(module_list.to_vec()), extra_module_dirs);
+
+    // ── Rule 0: Tier-2 IRQ range (structural, target-specific) ──────────
+    // Validate the declared `irq:` against the resolved silicon's interrupt
+    // controller BEFORE the manifest/export checks, so a bad IRQ value is
+    // rejected regardless of manifest state. The bound is the interrupt
+    // controller's maximum valid line number; a larger value would index the
+    // controller's enable/priority/target registers out of range on silicon.
+    // The runtime `irq_bind` on each platform enforces the same bound as a
+    // backstop.
+    //
+    //   - GIC-400 (bcm2712/cm5): INTIDs 0..=1019. 1020..=1023 are
+    //     reserved/special (e.g. 1023 = spurious). SGIs (0-15), PPIs (16-31) and
+    //     SPIs (32-1019) are all valid Tier-2 owners (the `tier2_probe` example
+    //     legitimately owns SGI 15).
+    //   - RP2350 (Cortex-M33/Hazard3 NVIC): highest line is SWI_IRQ_5 = 52, so
+    //     0..=52 (rp-pac `rp235x::Interrupt`). SWI lines are real NVIC lines and
+    //     valid to unmask; the bound exists only to keep the ISER/ICER index in
+    //     range.
+    //   - RP2040 (Cortex-M0+ NVIC): highest line is SWI_IRQ_5 = 31, so 0..=31
+    //     (rp-pac `rp2040::Interrupt`).
+    //
+    // `resolved_target` (the CLI's silicon id, e.g. "rp2350b") is authoritative;
+    // a board name in `config.target` (e.g. "pico2w") is the fallback and is
+    // matched on family substrings. Unknown/host targets keep the u16 bound.
+    {
+        let silicon = resolved_target
+            .or_else(|| config.get("target").and_then(|t| t.as_str()))
+            .map(|s| s.to_ascii_lowercase());
+        // (max_valid_intid, controller_label) for the resolved silicon, if known.
+        let irq_bound: Option<(u64, &str)> = silicon.as_deref().and_then(|s| {
+            if s.contains("bcm") || s.contains("cm5") || s.contains("aarch64") || s.contains("pi5")
+            {
+                Some((1019, "GIC-400 (bcm2712/cm5)"))
+            } else if s.contains("rp2040") || s.contains("rp204") || s == "picow" || s == "pico" {
+                Some((31, "RP2040 NVIC"))
+            } else if s.contains("rp235") || s.contains("rp2") || s.contains("pico2") {
+                Some((52, "RP2350 NVIC"))
+            } else {
+                None
+            }
+        });
+        if let Some((max_intid, label)) = irq_bound {
+            for module in module_list {
+                let name = match module.get("name").and_then(|n| n.as_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let domain = resolve_domain_id(module, config)?;
+                let exec_mode = *domain_exec_mode.get(domain as usize).unwrap_or(&0);
+                if exec_mode != 4 {
+                    continue;
+                }
+                if let Some(irq) = module.get("irq").and_then(|v| v.as_u64()) {
+                    if irq > max_intid {
+                        return Err(Error::Config(format!(
+                            "module '{name}' declares Tier 2 `irq: {irq}`, but the {label} on \
+                             this target only has interrupt lines 0..={max_intid}. Pick a valid \
+                             IRQ number for the silicon (out-of-range values index the interrupt \
+                             controller's registers out of bounds)."
+                        )));
+                    }
+                }
+            }
+        }
+    }
 
     // ── Rule 1: isr_safe attestation ────────────────────────────
     for module in module_list {
@@ -2030,7 +2427,8 @@ fn validate_isr_tier_admission(
     }
 
     // ── Rule 3 (runs BEFORE Rule 2 so wireless graphs still check):
-    // Tier 2 `irq:` requirement + duplicate check.
+    // Tier 2 `irq:` requirement + duplicate check. (The target-specific IRQ
+    // range is validated structurally in Rule 0, above, before manifests.)
     let mut seen_irq: Vec<(u16, String)> = Vec::new();
     for module in module_list {
         let name = match module.get("name").and_then(|n| n.as_str()) {
@@ -5123,7 +5521,13 @@ fn generate_config_impl(
     // routing. The build-time gate is half of D6 — the runtime
     // routing in `channel_open` is the other half. See
     // `.context/rfc_isr_tier_surface.md` for the full contract.
-    validate_isr_tier_admission(config, module_list, modules_dir, extra_module_dirs)?;
+    validate_isr_tier_admission(
+        config,
+        module_list,
+        modules_dir,
+        extra_module_dirs,
+        resolved_target,
+    )?;
 
     // Tier 1c pre-pass drain admission: a module flagged
     // `pre_tick_drain = true` in its manifest is cooperative-only —
@@ -5177,6 +5581,7 @@ fn generate_config_impl(
         &domain_tick_us,
         &manifests,
         extra_module_dirs,
+        resolved_target,
     )?;
 
     let (module_entries, module_names) =
@@ -5976,8 +6381,9 @@ mod scheduler_validation_tests {
         let manifests = std::collections::HashMap::new();
         let names = vec!["main".to_string()];
         let ticks = vec![100u16];
-        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[])
-            .expect_err("D10 must reject multi-node raft on an adaptive domain");
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("D10 must reject multi-node raft on an adaptive domain");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("multi-node") && msg.contains("D10"),
@@ -6015,8 +6421,10 @@ mod scheduler_validation_tests {
         let names = vec!["main".to_string()];
         let ticks = vec![100u16];
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &extras)
-            .expect_err("a malformed manifest on an adaptive domain must fail closed");
+        let err = validate_adaptive_tick(
+            &cfg, &modules, 100, &names, &ticks, &manifests, &extras, None,
+        )
+        .expect_err("a malformed manifest on an adaptive domain must fail closed");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("failed to parse") && msg.contains("typo_mod"),
@@ -6046,14 +6454,18 @@ mod scheduler_validation_tests {
         let cfg_a = json!({"execution": {"domains": [
             {"name": "main", "cores": [0], "adaptive_flags": 1,
              "tick_min_us": 100, "tick_max_us": 8000}]}});
-        validate_adaptive_tick(&cfg_a, &modules, 100, &names, &ticks, &manifests, &extras)
-            .expect("manifest-less module must pass on a mechanism-(a)-only domain");
+        validate_adaptive_tick(
+            &cfg_a, &modules, 100, &names, &ticks, &manifests, &extras, None,
+        )
+        .expect("manifest-less module must pass on a mechanism-(a)-only domain");
 
         let cfg_b = json!({"execution": {"domains": [
             {"name": "main", "cores": [0], "adaptive_flags": 3,
              "tick_min_us": 100, "tick_max_us": 8000}]}});
-        let err = validate_adaptive_tick(&cfg_b, &modules, 100, &names, &ticks, &manifests, &extras)
-            .expect_err("manifest-less (unattested) module must be blocked on a (b) domain");
+        let err = validate_adaptive_tick(
+            &cfg_b, &modules, 100, &names, &ticks, &manifests, &extras, None,
+        )
+        .expect_err("manifest-less (unattested) module must be blocked on a (b) domain");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("no manifest") && msg.contains("no_manifest_mod"),
@@ -6073,8 +6485,9 @@ mod scheduler_validation_tests {
         let modules = vec![json!({"name": "plain", "type": "plain"})];
         let names = vec!["main".to_string()];
         let ticks = vec![100u16];
-        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[])
-            .expect_err("an unattested manifest must be blocked on a (b) domain");
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("an unattested manifest must be blocked on a (b) domain");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("positively attest") && msg.contains("plain"),
@@ -6092,11 +6505,16 @@ mod scheduler_validation_tests {
         let ticks = vec![100u16];
         let modules = vec![json!({"name": "ok", "type": "ok"})];
         for tc in [TimerClass::WallClock, TimerClass::Agnostic] {
-            let man = Manifest { timer_class: tc, ..Manifest::default() };
+            let man = Manifest {
+                timer_class: tc,
+                ..Manifest::default()
+            };
             let mut manifests = std::collections::HashMap::new();
             manifests.insert("ok".to_string(), man);
-            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[])
-                .unwrap_or_else(|e| panic!("{} must pass on a (b) domain, got: {e:?}", tc.as_str()));
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .unwrap_or_else(|e| {
+                    panic!("{} must pass on a (b) domain, got: {e:?}", tc.as_str())
+                });
         }
     }
 
@@ -6119,8 +6537,9 @@ mod scheduler_validation_tests {
         };
         let mut m_blocked = std::collections::HashMap::new();
         m_blocked.insert("periodic".to_string(), blocked);
-        let err = validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_blocked, &[])
-            .expect_err("step_period_ticks!=0 on (b) must be blocked unless wall_clock");
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_blocked, &[], None)
+                .expect_err("step_period_ticks!=0 on (b) must be blocked unless wall_clock");
         assert!(
             format!("{err:?}").contains("step_period_ticks"),
             "expected step_period_ticks diagnostic, got: {err:?}"
@@ -6134,8 +6553,267 @@ mod scheduler_validation_tests {
         };
         let mut m_ok = std::collections::HashMap::new();
         m_ok.insert("periodic".to_string(), ok);
-        validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_ok, &[])
+        validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_ok, &[], None)
             .expect("a wall_clock step-period module must pass on a (b) domain");
+    }
+
+    #[test]
+    fn replicated_clock_blocked_on_cadence_b_without_replica_agreement() {
+        // D8 rule 4 (§7.3): a replicated_clock module self-reads wall-clock time
+        // (so it passes the rule-2 attestation gate), but mechanism (b) changing
+        // the emission cadence shifts replicated expiry. Blocked on (b) unless the
+        // domain asserts replica-agreed emission cadence.
+        let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::ReplicatedClock,
+            ..Manifest::default()
+        };
+
+        // Without the assertion → blocked.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ttl".to_string(), man.clone());
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("replicated_clock on (b) must be blocked without replica agreement");
+        assert!(
+            format!("{err:?}").contains("replica") && format!("{err:?}").contains("rule 4"),
+            "expected replicated-clock rule-4 diagnostic, got: {err:?}"
+        );
+
+        // With replica_agreed_cadence: true → passes (single node).
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 100, "tick_max_us": 8000, "replica_agreed_cadence": true}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("replicated_clock on (b) must pass once replica agreement is asserted");
+    }
+
+    #[test]
+    fn replicated_clock_multi_node_blocked_even_with_assertion() {
+        // D8 rule 4: a multi-node cluster cannot agree on emission rate under
+        // independent per-node pacing — blocked on (b) regardless of the assertion.
+        let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler", "voter_count": 3})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::ReplicatedClock,
+            ..Manifest::default()
+        };
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 100, "tick_max_us": 8000, "replica_agreed_cadence": true}]}});
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ttl".to_string(), man);
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("replicated_clock on (b) multi-node must be blocked");
+        assert!(
+            format!("{err:?}").contains("multi-node"),
+            "expected multi-node diagnostic, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn replicated_clock_idle_clamp_enforced() {
+        // D8 rule 4 (a): demand-driven idle must not widen tick_max_us past the
+        // tick emission interval, else committed expiry stalls.
+        let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler", "tick_interval_ms": 50})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::ReplicatedClock,
+            ..Manifest::default()
+        };
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ttl".to_string(), man);
+
+        // idle-only (bit 0), tick_max_us=50000 ≥ 50 ms (=50000 us) interval → blocked.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 50000}]}});
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("idle widen past the emission interval must be blocked");
+        assert!(
+            format!("{err:?}").contains("emission interval"),
+            "expected emission-interval clamp diagnostic, got: {err:?}"
+        );
+
+        // tick_max_us=8000 < 50 ms → passes.
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("idle within the emission interval must pass");
+    }
+
+    #[test]
+    fn guaranteed_blocked_on_cadence_b_unless_revalidated() {
+        // D8 rule 6 (§11): a guaranteed-WCET module's budget shrinks when (b)
+        // lowers the tick — blocked unless the domain asserts WCET re-validation
+        // at tick_min_us.
+        let modules = vec![json!({"name": "ctl", "type": "ctl", "step_deadline_us": 50})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::Guaranteed,
+            ..Manifest::default()
+        };
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ctl".to_string(), man);
+
+        // Without the assertion → blocked.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 1000, "tick_max_us": 8000}]}});
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("guaranteed on (b) must be blocked without WCET re-validation");
+        assert!(
+            format!("{err:?}").contains("guaranteed_wcet_revalidated"),
+            "expected rule-6 re-validation diagnostic, got: {err:?}"
+        );
+
+        // With the assertion → passes (burst-at-floor still enforced: 50×8=400 ≤ 16×1000).
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2, "tick_min_us": 1000,
+             "tick_max_us": 8000, "guaranteed_wcet_revalidated": true}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("guaranteed on (b) must pass once WCET re-validation is asserted");
+    }
+
+    #[test]
+    fn domain0_unbounded_tick_max_blocked_in_multi_domain() {
+        // D8 rule 7 (§7.1): domain 0 alone advances the shared DBG_TICK; in a
+        // multi-domain config on a DBG_TICK-backed target, an unbounded
+        // (tick_max_us=0) adaptive domain 0 stalls sibling-domain tick reads.
+        let modules = vec![json!({"name": "m", "type": "m"})];
+        let names = vec!["d0".to_string(), "d1".to_string()];
+        let ticks = vec![100u16, 100u16];
+        let manifests = std::collections::HashMap::new();
+
+        // Two domains, domain 0 adaptive with NO tick_max_us → blocked on bcm2712.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "d0", "cores": [0], "adaptive_flags": 1, "tick_min_us": 100},
+            {"name": "d1", "cores": [1]}]}});
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            Some("bcm2712"),
+        )
+        .expect_err("unbounded domain-0 adaptive in a multi-domain bcm2712 config must be blocked");
+        assert!(
+            format!("{err:?}").contains("rule 7") && format!("{err:?}").contains("tick_max_us"),
+            "expected rule-7 domain-0 diagnostic, got: {err:?}"
+        );
+
+        // Bounded tick_max_us on domain 0 → passes.
+        // bcm idle requires the §10 wake-policy declaration (execution-level).
+        let cfg_ok = json!({"execution": {
+            "bcm_wake_policy": "clamp",
+            "domains": [
+                {"name": "d0", "cores": [0], "adaptive_flags": 1, "tick_min_us": 100,
+                 "tick_max_us": 8000},
+                {"name": "d1", "cores": [1]}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            Some("bcm2712"),
+        )
+        .expect("bounded domain-0 adaptive must pass");
+
+        // rp2350 is exempt (wall-clock HAL) — unbounded passes there.
+        validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            Some("rp2350"),
+        )
+        .expect("rp2350 is exempt from the DBG_TICK domain-0 gate");
+    }
+
+    #[test]
+    fn adaptive_domain_sharing_runner_with_strict_domain_is_rejected() {
+        // §9.2/§9.4: an adaptive domain sharing a core with a timing-strict
+        // domain (here raft liveness) is rejected reject-by-default.
+        let names = vec!["main".to_string(), "rt".to_string()];
+        let ticks = vec![100u16, 100u16];
+        let manifests = std::collections::HashMap::new();
+        let modules = vec![json!({"name": "raft_engine", "type": "raft_engine", "domain": "rt"})];
+
+        // Both on core 0 → shared runner → reject.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2, "tick_min_us": 100, "tick_max_us": 8000},
+            {"name": "rt", "cores": [0]}]}});
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("adaptive + strict on the same core must be rejected");
+        assert!(
+            format!("{err:?}").contains("shares a runner"),
+            "expected shared-runner diagnostic, got: {err:?}"
+        );
+
+        // Strict domain on its own core (1) → no overlap → passes.
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2, "tick_min_us": 100, "tick_max_us": 8000},
+            {"name": "rt", "cores": [1]}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("strict domain on its own core must pass");
     }
 
     #[test]
@@ -6415,7 +7093,7 @@ mod scheduler_validation_tests {
         // tempdir — see the dedicated tests below.
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        validate_isr_tier_admission(&config, &modules, modules_dir, &extras)
+        validate_isr_tier_admission(&config, &modules, modules_dir, &extras, None)
     }
 
     #[test]
@@ -6442,6 +7120,98 @@ mod scheduler_validation_tests {
     }
 
     #[test]
+    fn admission_rejects_tier2_irq_beyond_gic_intid_range() {
+        // GIC-400 INTIDs are 0..=1019; an `irq:` past that would index the
+        // distributor's enable/priority/target banks out of range on silicon.
+        let cfg = json!({
+            "target": "cm5",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("0..=1019") && msg.contains("GIC-400"),
+            "expected a GIC INTID-range diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_allows_tier2_sgi_irq_on_gic() {
+        // SGI 15 is a legitimate Tier-2 owner (the `tier2_probe` SGI path); the
+        // range check must NOT reject it. Any other error (missing manifest,
+        // etc.) is fine here — just not the range diagnostic.
+        let cfg = json!({
+            "target": "cm5",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 15})];
+        if let Err(e) = run_admission(cfg, modules) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("0..=1019"),
+                "SGI 15 must not trip the GIC range check, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_rejects_tier2_irq_beyond_rp2350_nvic_range() {
+        // RP2350 NVIC tops out at SWI_IRQ_5 = 52 (0..=52); a far-larger value
+        // would unmask a non-existent line and index NVIC registers out of
+        // bounds. (Tests pass no resolved_target, so Rule 0 falls back to
+        // config.target.)
+        let cfg = json!({
+            "target": "rp2350b",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("0..=52") && msg.contains("RP2350"),
+            "expected an RP2350 NVIC range diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_allows_valid_rp2350_edge_irq() {
+        // SWI_IRQ_5 = 52 is the highest valid RP2350 line and must NOT trip the
+        // range check; any other error (missing manifest, etc.) is fine — just
+        // not the range.
+        let cfg = json!({
+            "target": "rp2350b",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 52})];
+        if let Err(e) = run_admission(cfg, modules) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("only has interrupt lines"),
+                "valid RP2350 edge IRQ 52 must not trip the range check, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_allows_valid_rp2040_swi_irq() {
+        // SWI_IRQ_5 = 31 is the highest valid RP2040 line and must pass the
+        // range check.
+        let cfg = json!({
+            "target": "rp2040",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 31})];
+        if let Err(e) = run_admission(cfg, modules) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("only has interrupt lines"),
+                "valid RP2040 SWI IRQ 31 must not trip the range check, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn admission_rejects_tier_1b_module_without_isr_safe_manifest() {
         // Tier 1b is admitted as of 2026-05-26 — but only for modules
         // that declare `isr_safe = true` in their manifest. A module
@@ -6463,7 +7233,7 @@ mod scheduler_validation_tests {
             vec![json!({"name": "unflagged", "type": "unflagged", "domain": "audio_isr"})];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("unflagged module in Tier 1b domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -6498,7 +7268,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("Tier 1b module with no resolvable manifest must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -6567,7 +7337,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![extra.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("extras-first lookup must surface the NEON-importing override");
         let msg = format!("{err:?}");
         assert!(
@@ -6607,7 +7377,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect("Tier 2 module exporting module_isr_entry must be admitted");
     }
 
@@ -6644,7 +7414,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("Tier 2 module without module_isr_entry must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -6682,7 +7452,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("Tier 2 module without irq: must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -6735,7 +7505,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("standard-tree NEON-importing ISR module must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -6839,7 +7609,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect("isr_safe = true module in Tier 1b domain must be admitted");
     }
 
@@ -6895,7 +7665,7 @@ mod scheduler_validation_tests {
         ];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("untagged edge into Tier 1b module must still be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -6945,7 +7715,7 @@ mod scheduler_validation_tests {
         ];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect_err("dma_owned edge into Tier 1b module rejected (subsumed by ISR-edge rule)");
     }
 
@@ -6970,7 +7740,7 @@ mod scheduler_validation_tests {
         let modules = vec![json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
             .expect("cooperative tier with isr_safe=false on its modules is fine");
     }
 

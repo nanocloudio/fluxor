@@ -15,7 +15,7 @@
 
 use core::panic::PanicInfo;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use fluxor::kernel::scheduler;
 use fluxor::kernel::loader;
@@ -856,6 +856,17 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(tick_us);
     uart_puts(b"\r\n");
 
+    // Measured-option opt-in (RFC adaptive_tick §5.4 / §7.1a): the SGI wake
+    // doorbell and absolute `cntp_cval` re-arm ship OFF by default and stay
+    // off in production. This build-time feature flips them on at boot so the
+    // rig can validate them on silicon without disturbing the default path.
+    #[cfg(feature = "adaptive_deferred_rig")]
+    {
+        set_wake_doorbell(true);
+        set_absolute_rearm(true);
+        log::info!("[adaptive] deferred mechanisms ON (wake_doorbell + absolute_rearm) — rig validation build");
+    }
+
     uart_puts(b"[config] ");
     uart_put_u32(n_modules as u32);
     uart_puts(b" modules, ");
@@ -1307,6 +1318,43 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 }
             }
         }
+        // ── Tier 2: IRQ-owned, dedicated core ──
+        // Modules in this domain are NOT iterated cooperatively — each is
+        // bound to a hardware IRQ at graph setup (`register_tier2_module` +
+        // `hal::irq_bind` → `isr_tier2_trampoline`), and the GIC dispatches
+        // straight into `module_isr_entry` from interrupt context. This core's
+        // job is therefore to (a) stay parked in WFI so it is available to take
+        // its owned IRQ with minimal latency, and (b) still service the
+        // cooperative housekeeping that every domain core owes: cross-domain
+        // SPSC pumping (so a sibling can hand work toward a Tier-2 module's
+        // bridge), the live-rebuild bridge, and park-on-reconfigure. Without
+        // this arm an `exec_mode == 4` domain fell through to the Tier-0
+        // default and spun a cooperative pump that does no useful work for its
+        // (skipped) ISR-tier modules.
+        4 => {
+            log::info!("[domain] {domain_id} core={core_id} tier=2 irq-owned");
+            loop {
+                // SAFETY: WFI halts the core until its owned IRQ (or any other
+                // unmasked interrupt) fires; the trampoline runs in ISR context.
+                unsafe { core::arch::asm!("wfi") };
+                multicore::park_if_requested(domain_id);
+                pump_cross_domain(domain_id);
+                if core_id == 0 { debug_drain_poll_core0(); }
+                // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain
+                // `d`'s pump thread; bounded by MAX_DOMAINS.
+                let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
+                metrics.tick_count += 1;
+                // live-rebuild bridge (so a Tier-2 domain can be reconfigured).
+                poll_rebuild_bridge(domain_id);
+                if metrics.tick_count.is_multiple_of(1_000_000) {
+                    log::info!(
+                        "[tier2] d={domain_id} wakes={} irqs={}",
+                        metrics.tick_count,
+                        fluxor::kernel::isr_tier::tier2_dispatch_count(),
+                    );
+                }
+            }
+        }
         // ── Tier 0: Cooperative (default, 1ms tick) ──
         _ => {
             loop {
@@ -1314,6 +1362,16 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 unsafe { core::arch::asm!("wfi") };
                 multicore::park_if_requested(domain_id);
                 let tick = CORE_TICKS[core_id].load(Ordering::Relaxed);
+                // Tier-2 silicon-validation trigger: from core 0, periodically
+                // send SGI 15 to core 1 (the Tier-2 dedicated core), which is
+                // the hardware IRQ its Tier-2 module owns. Drives
+                // `module_isr_entry` so the dispatch path is exercised on real
+                // silicon. Build-flag only; never in production.
+                #[cfg(feature = "test_tier2_sgi")]
+                if core_id == 0 && tick.is_multiple_of(2000) {
+                    // SAFETY: single MMIO write to the boot-mapped GIC distributor.
+                    unsafe { gic::send_sgi(1, 15) };
+                }
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
                 // Poll the Tier 1b timer here too — on configurations
@@ -1635,9 +1693,64 @@ fn bcm_restore_interrupts(saved: u32) {
     }
 }
 
+/// WFI wake-doorbell toggle (RFC adaptive_tick §5.4 mitigation 3). Default
+/// OFF: the wake path emits only `SEV`, paired with the `tick_max_us` idle
+/// clamp (mitigation 1). When ON, the wake path
+/// also broadcasts a GIC SGI so a WFI-parked Tier-0/1a core wakes immediately
+/// rather than waiting for the backstop — at the cost of an MMIO write on the
+/// hot `event_signal` / cross-domain SPSC-push paths. This is a measured
+/// option: enable only if AC1/AC2 show the clamp's first-request-after-idle
+/// latency is insufficient (RFC §5.4: "demoted to a measured option").
+static WAKE_DOORBELL: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the §5.4 SGI wake doorbell at runtime (default off).
+pub fn set_wake_doorbell(on: bool) {
+    WAKE_DOORBELL.store(on, Ordering::Relaxed);
+}
+
+/// Enable/disable the §7.1a absolute (`cntp_cval`) timer re-arm at runtime
+/// (default off — the relative `cntp_tval` path is the default). See
+/// `exception::ABSOLUTE_REARM`.
+pub fn set_absolute_rearm(on: bool) {
+    exception::ABSOLUTE_REARM.store(on, Ordering::Relaxed);
+}
+
+/// Broadcast the §5.4 wake doorbell SGI to all cores, IFF the doorbell is
+/// enabled. Called alongside `SEV` on every wake path so a WFI-parked core
+/// (which `SEV` cannot break) also wakes. No-op (one relaxed load) when off.
+#[inline(always)]
+pub fn wake_doorbell() {
+    if WAKE_DOORBELL.load(Ordering::Relaxed) {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: single MMIO write to the boot-mapped GIC distributor.
+        unsafe {
+            gic::send_sgi_all(gic::WAKE_SGI);
+        }
+    }
+}
+
 fn bcm_wake_scheduler() {
     // SAFETY: SEV broadcasts an event to wake WFE-parked cores; hint-only.
     unsafe { core::arch::asm!("sev") };
+    // SEV does NOT break WFI (Tier 0/1a idle posture). When the §5.4 doorbell
+    // is enabled, also send an SGI so a WFI-parked core wakes immediately.
+    wake_doorbell();
+}
+
+/// Portable `sleep_until` (RFC adaptive_tick §5.5 Option B). The per-core
+/// periodic timer (the §5.1 idle backstop, ≤ `tick_max_us`) is already armed,
+/// and any bound IRQ — plus the §5.4 wake doorbell SGI — breaks WFI. So a
+/// single WFI blocks until the next wake without programming a separate
+/// one-shot (which would race the IRQ-handler's per-core deadline reload).
+/// Returns UNKNOWN: WFI cannot report its wake source, so the caller must
+/// re-check its work/deadline state.
+fn bcm_sleep_until(_deadline_us: u64) -> u32 {
+    // SAFETY: WFI is a hint that parks the core until an unmasked IRQ.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("wfi")
+    };
+    fluxor::kernel::hal::WOKEN_UNKNOWN
 }
 
 /// Monotonic milliseconds since boot. Reads the ARM generic timer
@@ -1660,7 +1773,16 @@ fn bcm_now_micros() -> u64 {
     counter.wrapping_mul(1_000_000) / freq
 }
 fn bcm_tick_count() -> u32 {
-    fluxor::kernel::scheduler::tick_count()
+    // RFC adaptive_tick §7.6 (D8 rule 8): back the HAL `tick_count`
+    // with wall-clock milliseconds (CNTPCT-derived) instead of `DBG_TICK`. The
+    // identity "1 tick == 1 ms" holds only at the fixed 1 ms default; under
+    // mechanism (b) the period varies and under mechanism (a)/idle `DBG_TICK`
+    // stops advancing, so a `DBG_TICK`-backed `tick_count` returns wrong
+    // "ms since boot" under adaptive tick. `bcm_now_millis()` is correct under
+    // any pacing — matching rp's `Instant`-based `rp_tick_count` (rp.rs:449).
+    // The internal logical tick counter (`scheduler::tick_count()` → DBG_TICK)
+    // is unchanged; only this outward HAL op is decoupled.
+    bcm_now_millis() as u32
 }
 
 // ============================================================================
@@ -1744,13 +1866,17 @@ fn maybe_emit_soc_temp(core_id: usize) {
     // decays on cool-down) are read from these.
     let worst_us = scheduler::domain_worst_step_us(0);
     let ovr = scheduler::domain_budget_overruns(0);
+    // Surface the Tier-2 IRQ-dispatch count on the reliable core-0 cadence so a
+    // dedicated-core Tier-2 module's `module_isr_entry` firing is observable
+    // over UDP (its own loop logs only every 1M wakes).
+    let t2disp = fluxor::kernel::isr_tier::tier2_dispatch_count();
     if let Some(mc) = soc_temp_mc() {
         log::info!(
-            "[therm] soc_temp_mC={mc} t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr}"
+            "[therm] soc_temp_mC={mc} t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr} t2disp={t2disp}"
         );
     } else {
         log::info!(
-            "[therm] soc_temp_mC=na t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr}"
+            "[therm] soc_temp_mC=na t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr} t2disp={t2disp}"
         );
     }
     // Re-emit the fan PWM register readback on the same cadence. The one-shot
@@ -2280,6 +2406,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     csprng_fill: bcm_csprng_fill,
     core_id: || current_core_id() as usize,
     irq_bind,
+    sleep_until: bcm_sleep_until,
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000

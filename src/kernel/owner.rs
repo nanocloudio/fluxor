@@ -264,6 +264,11 @@ impl OwnerTable {
     /// Charge `bytes` of module state to `h`. Returns `Err(())` if it would
     /// exceed the owner's cap (the caller must then reject the allocation), or
     /// if `h` is stale. The system owner is always permitted.
+    #[allow(
+        clippy::result_unit_err,
+        reason = "the failure is a payload-free cap-exceeded/stale signal; the \
+                  caller only branches on success vs failure"
+    )]
     pub fn charge_state(&mut self, h: OwnerHandle, bytes: u32) -> Result<(), ()> {
         if h.is_system() {
             return Ok(());
@@ -288,6 +293,11 @@ impl OwnerTable {
     }
 
     /// Charge `bytes` of channel-buffer memory to `h`. See [`charge_state`].
+    #[allow(
+        clippy::result_unit_err,
+        reason = "the failure is a payload-free cap-exceeded/stale signal; the \
+                  caller only branches on success vs failure"
+    )]
     pub fn charge_buffer(&mut self, h: OwnerHandle, bytes: u32) -> Result<(), ()> {
         if h.is_system() {
             return Ok(());

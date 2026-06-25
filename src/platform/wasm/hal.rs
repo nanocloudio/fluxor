@@ -157,8 +157,16 @@ fn wasm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
 fn wasm_core_id() -> usize {
     0
 }
-fn wasm_irq_bind(_irq: u32, _event_handle: i32, _mmio_base: usize) -> i32 {
+fn wasm_irq_bind(_irq: u32, _event_handle: i32, _mmio_base: usize, _target_core: u8) -> i32 {
     -38 // ENOSYS — wasm has no hardware IRQs
+}
+/// Portable `sleep_until` (RFC adaptive_tick §5.5 Option B). wasm is a
+/// cooperative single-threaded runtime with no blocking primitive — the host
+/// event loop drives re-entry — so this returns immediately. Treated as a
+/// hint (the caller re-checks work state), it is correct: there is no idle
+/// posture to park into.
+fn wasm_sleep_until(_deadline_us: u64) -> u32 {
+    crate::kernel::hal::WOKEN_DEADLINE
 }
 
 pub static WASM_HAL_OPS: HalOps = HalOps {
@@ -193,4 +201,5 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     csprng_fill: wasm_csprng_fill,
     core_id: wasm_core_id,
     irq_bind: wasm_irq_bind,
+    sleep_until: wasm_sleep_until,
 };

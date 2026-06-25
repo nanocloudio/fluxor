@@ -43,6 +43,13 @@ pub const MAX_ISR_MODULES: usize = 4;
 /// Maximum number of Tier 2 modules (IRQ-owned).
 pub const MAX_ISR_T2_MODULES: usize = 4;
 
+/// Sentinel `event_handle` passed to `hal::irq_bind` for a Tier 2 module's
+/// hardware IRQ. The platform IRQ handler recognises it and dispatches the
+/// IRQ into `isr_tier2_trampoline` (which looks the module up by IRQ number),
+/// rather than treating the binding as a device→event signal. Distinct from
+/// the negative event handles used elsewhere (e.g. the PCIe1-MSI mux sentinel).
+pub const ISR_TIER2_EVENT: i32 = -3;
+
 /// Maximum number of bridge connections per ISR module.
 const MAX_ISR_BRIDGES: usize = 4;
 
@@ -228,6 +235,12 @@ static TIER1B_OVERRUN: AtomicBool = AtomicBool::new(false);
 
 /// Cumulative total ISR ticks processed.
 static TIER1B_TICK_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Cumulative count of Tier 2 IRQ dispatches that matched a registered
+/// module. Incremented by `isr_tier2_trampoline`; read for the dedicated-core
+/// liveness log so a Tier-2 owner core that has stopped taking its IRQ is
+/// visible (the count stalls while the loop's `tick_count` keeps climbing).
+static TIER2_DISPATCH_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
 // Registration API (called from scheduler during graph setup)
@@ -462,6 +475,7 @@ pub unsafe fn isr_tier2_trampoline(irq_number: u16) -> i32 {
         }
 
         slot.metrics.record(elapsed);
+        TIER2_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::kernel::scheduler::set_current_module(saved_module);
         return rc;
     }
@@ -517,6 +531,54 @@ pub fn module_counts() -> (u8, u8) {
 /// Return the cumulative Tier 1b tick count.
 pub fn tier1b_ticks() -> u32 {
     TIER1B_TICK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Return the cumulative count of Tier 2 IRQ dispatches that matched a
+/// registered module. Used by the bcm2712 Tier-2 dedicated-core loop's
+/// liveness log.
+pub fn tier2_dispatch_count() -> u32 {
+    TIER2_DISPATCH_COUNT.load(Ordering::Relaxed)
+}
+
+/// Maximum bridge endpoints per ISR-tier module (exposed for the
+/// module-facing `SELF_BRIDGES` ABI buffer sizing).
+pub const MODULE_MAX_BRIDGES: usize = MAX_ISR_BRIDGES;
+
+/// Look up the bridge slot indices wired for `module_index`, searching both
+/// the Tier 1b and Tier 2 registries. Returns `(in_bridges, out_bridges)` —
+/// each a `[i8; MAX_ISR_BRIDGES]` of global bridge-table slot indices (as
+/// allocated by `wire_isr_bridges`), `-1` for unused entries — or `None` if
+/// the module is not registered in any ISR tier.
+///
+/// This is the kernel side of the module-facing ISR-bridge ABI: an ISR-tier
+/// module enumerates its own bridge endpoints via the `SELF_BRIDGES` opcode,
+/// then reads/writes them with the bridge `WRITE`/`READ`/`POLL`/`INFO` opcodes
+/// (which are exempt from the §D7 ISR-context syscall deny because the
+/// underlying `RingBridge` ops are lock-free and allocation-free). This is how a
+/// PIC module reaches its bridges from `module_step` / `module_isr_entry`
+/// without routing through `provider_call`, which the §D7 gate denies for
+/// ISR-tier callers.
+pub fn module_bridge_slots(
+    module_index: u8,
+) -> Option<([i8; MAX_ISR_BRIDGES], [i8; MAX_ISR_BRIDGES])> {
+    // SAFETY: the ISR slot arrays are populated only at graph bring-up
+    // (single-threaded) and are read-only thereafter; this is a shared read of
+    // POD `i8` arrays / `bool` / `u8` fields.
+    unsafe {
+        let t2 = &raw const ISR_T2_SLOTS;
+        for slot in (*t2).iter().take(ISR_T2_COUNT as usize) {
+            if slot.active && slot.module_index == module_index {
+                return Some((slot.in_bridges, slot.out_bridges));
+            }
+        }
+        let t1 = &raw const ISR_SLOTS;
+        for slot in (*t1).iter().take(ISR_COUNT as usize) {
+            if slot.active && slot.module_index == module_index {
+                return Some((slot.in_bridges, slot.out_bridges));
+            }
+        }
+    }
+    None
 }
 
 /// Check and clear the Tier 1b overrun flag.

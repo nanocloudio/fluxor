@@ -113,7 +113,18 @@ pub struct ModuleFaultInfo {
     /// Type of last fault.
     pub last_fault_type: u8,
     /// Tick count at last fault (for ticks_since_fault calculation).
+    /// Diagnostic-cadence class: feeds the ABI `FaultStats.ticks_since_fault`
+    /// field and the best-effort cascade-attribution byte. Kept tick-counted
+    /// — these are best-effort and mis-scale harmlessly under adaptive pacing
+    /// (RFC adaptive_tick §7.6, diagnostic class).
     pub last_fault_tick: u32,
+    /// Wall-clock timestamp (ms, `hal::now_millis()`) at last fault. Drives
+    /// the *correctness* quarantine-window decision (`QUARANTINE_WINDOW_MS`),
+    /// which must measure real elapsed time rather than a tick count that
+    /// silently re-scales the moment mechanism (b) varies the period or
+    /// mechanism (a) idle-sleep stops advancing the tick (RFC adaptive_tick
+    /// §7.6 remedy iii).
+    pub last_fault_ms: u64,
     /// Backoff countdown (ticks remaining before restart attempt).
     pub backoff_remaining: u32,
     /// Step deadline in microseconds (0 = use default).
@@ -127,7 +138,7 @@ pub struct ModuleFaultInfo {
     /// deadline for the worst case. `0` selects the multiplier path.
     pub step_deadline_burst_us: u32,
     /// Index of a paired module. When this module faults and the
-    /// partner has also faulted within `QUARANTINE_WINDOW_TICKS`,
+    /// partner has also faulted within `QUARANTINE_WINDOW_MS`,
     /// both are terminated regardless of individual `FaultPolicy`.
     /// `0xFF` means no partner declared. Used by tightly-coupled
     /// pairs (TLS handshake + transport, codec pair-stream) where
@@ -152,6 +163,7 @@ impl ModuleFaultInfo {
             restart_backoff_ms: 100,
             last_fault_type: fault_type::NONE,
             last_fault_tick: 0,
+            last_fault_ms: 0,
             backoff_remaining: 0,
             step_deadline_us: 0,
             step_deadline_burst_us: 0,
@@ -183,6 +195,9 @@ impl ModuleFaultInfo {
         self.fault_count = self.fault_count.saturating_add(1);
         self.last_fault_type = fault_kind;
         self.last_fault_tick = tick;
+        // Wall-clock stamp for the quarantine-window correctness decision;
+        // independent of the tick-counted diagnostics above (RFC §7.6 iii).
+        self.last_fault_ms = hal::now_millis();
     }
 
     /// Check if restart is allowed (policy + max_restarts).

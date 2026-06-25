@@ -56,6 +56,76 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
 }
 
 // ============================================================================
+// Tier 2 (IRQ-owned) dispatch — RP single-core path
+// ============================================================================
+//
+// RP is single-core, so Tier 2 is not "a dedicated core owns the IRQ" (that is
+// the bcm2712 multicore model) but "a module is bound to a real NVIC IRQ and
+// dispatched preemptively from interrupt context." `register_tier2_module`
+// (platform-agnostic, called from `register_isr_tier_modules_from_graph` at
+// boot) records the module against its IRQ number and calls `hal::irq_bind`;
+// on RP that hook (`rp_irq_bind`) unmasks the NVIC line. Any line not claimed
+// by an embassy `bind_interrupts!` handler falls through to this
+// `DefaultHandler`, which routes it to the Tier 2 trampoline by IRQ number.
+//
+// `isr_tier2_trampoline` returns -1 when no Tier 2 module owns the IRQ; that
+// would otherwise re-fire forever (the pending bit is still set), so the
+// unowned line is masked to prevent an interrupt storm. A genuine Tier 2
+// module is responsible for clearing its own peripheral interrupt source
+// inside `module_isr_entry`, exactly as it would for any IRQ it owns.
+#[cortex_m_rt::exception]
+unsafe fn DefaultHandler(irqn: i16) {
+    if irqn >= 0 {
+        let irq = irqn as u16;
+        if fluxor::kernel::isr_tier::isr_tier2_trampoline(irq) < 0 {
+            // No Tier 2 module owns this IRQ — mask it so it cannot storm.
+            cortex_m::peripheral::NVIC::mask(RawIrq(irq));
+        }
+    }
+    // irqn < 0 is a system exception we do not handle here; returning resumes
+    // the faulting context, matching cortex-m-rt's default behaviour.
+}
+
+/// Newtype wrapping a raw IRQ number so the cortex-m NVIC API (which is
+/// generic over `InterruptNumber`) can enable/mask a line chosen at runtime
+/// from config, rather than a statically-named `embassy_rp::interrupt` variant.
+#[derive(Clone, Copy)]
+struct RawIrq(u16);
+// SAFETY: the contract is that `number()` returns a valid device IRQ number;
+// the value originates from the module manifest's `irq` field, range-checked
+// by the build-time ISR-tier validator before it reaches the binding path.
+unsafe impl cortex_m::interrupt::InterruptNumber for RawIrq {
+    fn number(self) -> u16 {
+        self.0
+    }
+}
+
+/// HAL `irq_bind` for RP: enable the NVIC line for a Tier 2 module's IRQ so it
+/// dispatches through `DefaultHandler` → `isr_tier2_trampoline`. The
+/// `event_handle` / `trampoline` parameters are unused on RP (the
+/// `DefaultHandler` dispatches by IRQ number directly). Returns 0.
+fn rp_irq_bind(irq: u32, _event_handle: i32, _trampoline_or_mmio: usize, _target_core: u8) -> i32 {
+    // NVIC line ceiling, from the rp-pac `Interrupt` enum: the highest line on
+    // each chip is SWI_IRQ_5 — 31 on RP2040, 52 on RP235x. The build-time
+    // ISR-tier validator rejects out-of-range IRQs; this is the runtime backstop
+    // — `NVIC::unmask` past the ceiling would index the ISER/ICER registers out
+    // of bounds.
+    #[cfg(feature = "chip-rp2040")]
+    const NVIC_IRQ_MAX: u32 = 31;
+    #[cfg(not(feature = "chip-rp2040"))]
+    const NVIC_IRQ_MAX: u32 = 52;
+    if irq > NVIC_IRQ_MAX {
+        return fluxor::kernel::errno::EINVAL;
+    }
+    // SAFETY: unmasking an NVIC line is sound; the line only fires once its
+    // peripheral asserts, and an unowned fire is masked by `DefaultHandler`.
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(RawIrq(irq as u16));
+    }
+    0
+}
+
+// ============================================================================
 // Log backend — formats log records into the kernel log ring.
 // ============================================================================
 //
@@ -450,6 +520,18 @@ fn rp_tick_count() -> u32 {
     embassy_time::Instant::now().as_millis() as u32
 }
 
+/// Portable `sleep_until` (RFC adaptive_tick §5.5 Option B). The Embassy
+/// thread-mode executor idles on WFE woken by SEV (via `SCHEDULER_WAKE` →
+/// `__pender`); a channel write or alarm raises SEV. This synchronous entry
+/// waits for the next such event with a bare WFE — the real rp idle path is
+/// the async `select(Timer::after, SCHEDULER_WAKE.wait())` in
+/// `rp_run_main_loop`, which a `fn`-pointer cannot await. Returns UNKNOWN: WFE
+/// cannot report its wake source, so the caller re-checks its work state.
+fn rp_sleep_until(_deadline_us: u64) -> u32 {
+    cortex_m::asm::wfe();
+    fluxor::kernel::hal::WOKEN_UNKNOWN
+}
+
 // Flash bounds come from linker symbols declared in
 // `memory-rp2350.x` / `memory-rp2040.x` (`__flash_start__` /
 // `__flash_end__`) rather than being hardcoded. The linker's view is
@@ -604,7 +686,8 @@ static RP_HAL_OPS: HalOps = HalOps {
     init_gpio: |gpio| fluxor::kernel::gpio::init_all_from_config(gpio),
     csprng_fill: rp_csprng_fill,
     core_id: || 0,
-    irq_bind: |_, _, _| fluxor::kernel::errno::ENOSYS,
+    irq_bind: rp_irq_bind,
+    sleep_until: rp_sleep_until,
 };
 
 /// Fill buffer with random bytes from the ROSC RANDOMBIT register.

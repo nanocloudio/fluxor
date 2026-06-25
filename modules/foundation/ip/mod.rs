@@ -1099,6 +1099,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         // Yield rather than re-step: returning Burst would loop IP up
         // to 16384 times before the NIC driver gets to drain its ring.
         if s.pending_tx_len > 0 {
+            // RunnableBacklog: more TX work is ready, but we yield for NIC
+            // fairness. Heat the pacer (keep cadence tight for the in-flight
+            // traffic) WITHOUT the immediate re-step that would starve the ring
+            // (RFC adaptive_tick_extra §6.2 — the motivating IP/NIC case).
+            dev_report_step_effect(&*s.syscalls, step_effect::RUNNABLE_BACKLOG);
             return 0; // StepOutcome::Continue
         }
     }
@@ -1273,6 +1278,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         emit(b"[ip] hb dupSYN=", &mut pos);
         pos += fmt_u32_dec(s.tcp_dup_syn_rx, buf.add(pos));
         dev_log(sys, 3, buf, pos);
+    }
+
+    // §6 work signal (RFC adaptive_tick_extra): if data moved this step but we
+    // didn't take the RunnableBacklog yield above, report WorkDone — keeps the
+    // pacer hot for an active data path without an immediate same-module re-step.
+    if s.tlm.bytes_in != rx_pre || s.tlm.bytes_out != tx_pre {
+        dev_report_step_effect(&*s.syscalls, step_effect::WORK_DONE);
     }
 
     // Signal Ready once IP is configured (DHCP bound or static)

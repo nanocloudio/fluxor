@@ -86,6 +86,9 @@ pub(crate) mod touch_gamepad_overlay;
 #[path = "wasm/audio.rs"]
 mod audio;
 
+#[path = "wasm/gpu.rs"]
+mod gpu;
+
 #[path = "wasm/websocket.rs"]
 mod websocket;
 
@@ -353,6 +356,7 @@ const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
 const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
 const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 = fnv1a32(b"wasm_browser_touch_gamepad_overlay");
+const WASM_BROWSER_GPU_HASH: u32 = fnv1a32(b"wasm_browser_gpu");
 // MIDI built-ins — STUB. See `wasm/midi.rs` for the unimplemented
 // state. Registered here so configs that reference the modules
 // load cleanly instead of failing at the runtime dispatch step.
@@ -1020,6 +1024,41 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_touch_gamepad_overlay (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // WebGPU rendering backend — receives draw commands via channel,
+        // renders using browser WebGPU API through host_webgpu_* shims.
+        if entry.name_hash == WASM_BROWSER_GPU_HASH {
+            let mut width = 800u16;
+            let mut height = 600u16;
+            walk_tlv(entry.params(), |tag, value| match tag {
+                10 => width = tlv_u32(value) as u16,
+                11 => height = tlv_u32(value) as u16,
+                _ => {}
+            });
+            let heap_bytes = gpu::heap_size_for(width, height);
+            if !init_builtin_heap_sized(module_idx, heap_bytes) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_gpu: STATE_ARENA full, skipping",
+                    heap_bytes as u64,
+                );
+                continue;
+            }
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let m = gpu::build(width, height, in_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_gpu (built-in)",
                 0,
             );
             continue;

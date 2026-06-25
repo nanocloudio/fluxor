@@ -297,6 +297,12 @@ impl CrossDomainChannel {
         unsafe {
             core::arch::asm!("dmb ish", "sev", options(nomem, nostack));
         }
+        // NOTE: SEV does not break a WFI-parked consumer core. The §5.4 wake
+        // doorbell SGI (cross-core) is issued from the
+        // platform's `bcm_wake_scheduler` (bcm2712.rs), reached on the common
+        // path where a cross-domain producer also signals the consumer's event
+        // (`event_signal → hal::wake_scheduler`). This SPSC ring lives in the
+        // portable kernel and cannot call the board-binary GIC directly.
 
         true
     }

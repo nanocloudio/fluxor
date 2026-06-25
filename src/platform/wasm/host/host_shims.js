@@ -1346,6 +1346,350 @@
       host_destroy_module: (handle) => moduleInstances.delete(handle) ? 0 : -1,
     };
 
+    // ── WebGPU 3D rendering shim (wasm_browser_webgpu) ───────────────
+    //
+    // Provides WebGPU device/context access for 3D rendering modules.
+    // The module sends vertex data and draw commands; the shim manages
+    // the WebGPU pipeline and presents frames to a canvas surface.
+    //
+    // State is managed in JS (device, pipeline, buffers) since WebGPU
+    // objects can't be serialized to WASM memory. The module calls
+    // host_webgpu_* imports which manipulate this JS-side state.
+    let gpuDevice = null;
+    let gpuContext = null;
+    let gpuCanvas = null;
+    let gpuPipeline = null;
+    let gpuDepthTexture = null;
+    let gpuVertexBuffer = null;
+    let gpuIndexBuffer = null;
+    let gpuUniformBuffer = null;
+    let gpuBindGroup = null;
+    let gpuEncoder = null;
+    let gpuPass = null;
+    let gpuVertexCount = 0;
+    let gpuIndexCount = 0;
+    let gpuInitialized = false;
+    // WebGPU init is asynchronous (adapter/device requests are Promises), but a
+    // Wasm import is synchronous — so `host_webgpu_init` cannot await and return
+    // the real result inline (the module would observe a coerced Promise and
+    // "succeed" before the device exists). Instead init kicks off the async work
+    // and records progress here; the module polls `host_webgpu_poll_init`.
+    // Status: 0 = ready, 1 = pending, 2 = not started, <0 = error (-1 no WebGPU,
+    // -2 no adapter, -3 init threw).
+    const GPU_INIT_READY = 0;
+    const GPU_INIT_PENDING = 1;
+    const GPU_INIT_NOT_STARTED = 2;
+    let gpuInitStatus = GPU_INIT_NOT_STARTED;
+    let gpuWidth = 0;
+    let gpuHeight = 0;
+
+    // Basic vertex shader for 3D voxel rendering
+    const gpuVertexShader = `
+      struct Uniforms {
+        viewProj: mat4x4<f32>,
+        camPos: vec4<f32>,
+        time: f32,
+        fogDist: f32,
+        _pad: vec2<f32>,
+      };
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+      struct VertexInput {
+        @location(0) position: vec3<f32>,
+        @location(1) color: vec3<f32>,
+        @location(2) normal: vec3<f32>,
+      };
+
+      struct VertexOutput {
+        @builtin(position) clip_position: vec4<f32>,
+        @location(0) color: vec3<f32>,
+        @location(1) world_pos: vec3<f32>,
+        @location(2) normal: vec3<f32>,
+      };
+
+      @vertex
+      fn vs_main(in: VertexInput) -> VertexOutput {
+        var out: VertexOutput;
+        out.clip_position = uniforms.viewProj * vec4<f32>(in.position, 1.0);
+        out.color = in.color;
+        out.world_pos = in.position;
+        out.normal = in.normal;
+        return out;
+      }
+    `;
+
+    const gpuFragmentShader = `
+      struct Uniforms {
+        viewProj: mat4x4<f32>,
+        camPos: vec4<f32>,
+        time: f32,
+        fogDist: f32,
+        _pad: vec2<f32>,
+      };
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+      struct VertexOutput {
+        @builtin(position) clip_position: vec4<f32>,
+        @location(0) color: vec3<f32>,
+        @location(1) world_pos: vec3<f32>,
+        @location(2) normal: vec3<f32>,
+      };
+
+      @fragment
+      fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+        // Simple directional lighting
+        let lightDir = normalize(vec3<f32>(0.5, 1.0, 0.3));
+        let ambient = 0.4;
+        let diffuse = max(dot(in.normal, lightDir), 0.0) * 0.6;
+        let lit = in.color * (ambient + diffuse);
+
+        // Distance fog
+        let dist = length(in.world_pos - uniforms.camPos.xyz);
+        let fogFactor = clamp(dist / uniforms.fogDist, 0.0, 1.0);
+        let fogColor = vec3<f32>(0.6, 0.8, 1.0);
+        let final = mix(lit, fogColor, fogFactor * fogFactor);
+
+        return vec4<f32>(final, 1.0);
+      }
+    `;
+
+    const webgpuShim = {
+      // Initialize WebGPU device and context. Returns 0 on success, <0 on error.
+      // Synchronous kick-off: starts the async init and returns PENDING (1).
+      // The module MUST poll `host_webgpu_poll_init` until it returns READY (0)
+      // or an error (<0) before calling any other host_webgpu_* function — a
+      // Wasm import cannot await, so this can't return the real device status
+      // inline. Idempotent: a second call while pending just returns PENDING.
+      host_webgpu_init: () => {
+        if (gpuInitialized) return GPU_INIT_READY;
+        if (gpuInitStatus === GPU_INIT_PENDING) return GPU_INIT_PENDING;
+        if (!navigator.gpu) {
+          console.error('[webgpu] WebGPU not supported');
+          gpuInitStatus = -1;
+          return -1;
+        }
+        gpuInitStatus = GPU_INIT_PENDING;
+        (async () => {
+        try {
+          const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+          if (!adapter) {
+            console.error('[webgpu] No adapter found');
+            gpuInitStatus = -2;
+            return;
+          }
+          gpuDevice = await adapter.requestDevice();
+          gpuDevice.lost.then((info) => {
+            console.error('[webgpu] Device lost:', info.message);
+            gpuInitialized = false;
+            gpuInitStatus = GPU_INIT_NOT_STARTED;
+          });
+
+          // Find or create canvas
+          gpuCanvas = canvasContainer
+            ? canvasContainer.querySelector('canvas') || document.createElement('canvas')
+            : document.createElement('canvas');
+          if (!gpuCanvas.parentElement && canvasContainer) {
+            canvasContainer.appendChild(gpuCanvas);
+          } else if (!gpuCanvas.parentElement) {
+            document.body.appendChild(gpuCanvas);
+          }
+          gpuCanvas.width = gpuWidth || 800;
+          gpuCanvas.height = gpuHeight || 600;
+
+          gpuContext = gpuCanvas.getContext('webgpu');
+          const format = navigator.gpu.getPreferredCanvasFormat();
+          gpuContext.configure({
+            device: gpuDevice,
+            format: format,
+            alphaMode: 'opaque',
+          });
+
+          // Create render pipeline
+          const vertexModule = gpuDevice.createShaderModule({ code: gpuVertexShader });
+          const fragmentModule = gpuDevice.createShaderModule({ code: gpuFragmentShader });
+
+          const bindGroupLayout = gpuDevice.createBindGroupLayout({
+            entries: [{
+              binding: 0,
+              visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+              buffer: { type: 'uniform' },
+            }],
+          });
+
+          gpuPipeline = gpuDevice.createRenderPipeline({
+            layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+            vertex: {
+              module: vertexModule,
+              entryPoint: 'vs_main',
+              buffers: [{
+                arrayStride: 36, // 3*4 + 3*4 + 3*4 = 36 bytes per vertex
+                attributes: [
+                  { shaderLocation: 0, offset: 0, format: 'float32x3' },  // position
+                  { shaderLocation: 1, offset: 12, format: 'float32x3' }, // color
+                  { shaderLocation: 2, offset: 24, format: 'float32x3' }, // normal
+                ],
+              }],
+            },
+            fragment: {
+              module: fragmentModule,
+              entryPoint: 'fs_main',
+              targets: [{ format: format }],
+            },
+            primitive: {
+              topology: 'triangle-list',
+              cullMode: 'back',
+              frontFace: 'ccw',
+            },
+            depthStencil: {
+              format: 'depth24plus',
+              depthWriteEnabled: true,
+              depthCompare: 'less',
+            },
+          });
+
+          // Create uniform buffer (viewProj matrix + camera pos + time + fog)
+          gpuUniformBuffer = gpuDevice.createBuffer({
+            size: 96, // 64 (mat4) + 16 (vec4) + 4 (time) + 4 (fog) + 8 (pad)
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+
+          gpuBindGroup = gpuDevice.createBindGroup({
+            layout: bindGroupLayout,
+            entries: [{ binding: 0, resource: { buffer: gpuUniformBuffer } }],
+          });
+
+          // Create depth texture
+          gpuDepthTexture = gpuDevice.createTexture({
+            size: [gpuCanvas.width, gpuCanvas.height],
+            format: 'depth24plus',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+
+          gpuInitialized = true;
+          gpuInitStatus = GPU_INIT_READY;
+          console.log('[webgpu] Initialized', gpuCanvas.width, 'x', gpuCanvas.height);
+        } catch (err) {
+          console.error('[webgpu] Init failed:', err.message);
+          gpuInitStatus = -3;
+        }
+        })();
+        return GPU_INIT_PENDING;
+      },
+
+      // Poll WebGPU init status: 0 = ready, 1 = pending, 2 = not started,
+      // <0 = error (-1 no WebGPU, -2 no adapter, -3 init threw). The module
+      // calls `host_webgpu_init` once, then polls this until it is not PENDING.
+      host_webgpu_poll_init: () => gpuInitStatus,
+
+      // Resize canvas and recreate depth texture
+      host_webgpu_resize: (width, height) => {
+        if (!gpuInitialized || !gpuCanvas || !gpuDevice) return -1;
+        gpuWidth = width;
+        gpuHeight = height;
+        gpuCanvas.width = width;
+        gpuCanvas.height = height;
+        if (gpuDepthTexture) gpuDepthTexture.destroy();
+        gpuDepthTexture = gpuDevice.createTexture({
+          size: [width, height],
+          format: 'depth24plus',
+          usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        return 0;
+      },
+
+      // Upload vertex data. Format: [x,y,z, r,g,b, nx,ny,nz] per vertex (9 floats = 36 bytes)
+      host_webgpu_upload_vertices: (ptr, byteLen) => {
+        if (!gpuInitialized || !gpuDevice) return -1;
+        const data = kview(ptr, byteLen);
+        if (gpuVertexBuffer) gpuVertexBuffer.destroy();
+        gpuVertexBuffer = gpuDevice.createBuffer({
+          size: byteLen,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        gpuDevice.queue.writeBuffer(gpuVertexBuffer, 0, data);
+        gpuVertexCount = (byteLen / 36) | 0;
+        return gpuVertexCount;
+      },
+
+      // Upload index data (u32 indices)
+      host_webgpu_upload_indices: (ptr, byteLen) => {
+        if (!gpuInitialized || !gpuDevice) return -1;
+        const data = kview(ptr, byteLen);
+        if (gpuIndexBuffer) gpuIndexBuffer.destroy();
+        gpuIndexBuffer = gpuDevice.createBuffer({
+          size: byteLen,
+          usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        });
+        gpuDevice.queue.writeBuffer(gpuIndexBuffer, 0, data);
+        gpuIndexCount = (byteLen / 4) | 0;
+        return gpuIndexCount;
+      },
+
+      // Set camera uniforms: viewProj (16 floats), camPos (3 floats), time, fogDist
+      host_webgpu_set_uniforms: (ptr, byteLen) => {
+        if (!gpuInitialized || !gpuDevice || !gpuUniformBuffer) return -1;
+        const data = kview(ptr, Math.min(byteLen, 96));
+        gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, data);
+        return 0;
+      },
+
+      // Begin a frame (clear and start render pass)
+      host_webgpu_begin_frame: (r, g, b) => {
+        if (!gpuInitialized || !gpuDevice || !gpuContext) return -1;
+        const texture = gpuContext.getCurrentTexture();
+        gpuEncoder = gpuDevice.createCommandEncoder();
+        gpuPass = gpuEncoder.beginRenderPass({
+          colorAttachments: [{
+            view: texture.createView(),
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: r, g: g, b: b, a: 1.0 },
+          }],
+          depthStencilAttachment: {
+            view: gpuDepthTexture.createView(),
+            depthLoadOp: 'clear',
+            depthStoreOp: 'store',
+            depthClearValue: 1.0,
+          },
+        });
+        gpuPass.setPipeline(gpuPipeline);
+        gpuPass.setBindGroup(0, gpuBindGroup);
+        return 0;
+      },
+
+      // Draw uploaded geometry
+      host_webgpu_draw: () => {
+        if (!gpuPass || !gpuVertexBuffer) return -1;
+        gpuPass.setVertexBuffer(0, gpuVertexBuffer);
+        if (gpuIndexBuffer && gpuIndexCount > 0) {
+          gpuPass.setIndexBuffer(gpuIndexBuffer, 'uint32');
+          gpuPass.drawIndexed(gpuIndexCount);
+        } else if (gpuVertexCount > 0) {
+          gpuPass.draw(gpuVertexCount);
+        }
+        return 0;
+      },
+
+      // End frame and present
+      host_webgpu_end_frame: () => {
+        if (!gpuPass || !gpuEncoder || !gpuDevice) return -1;
+        gpuPass.end();
+        gpuDevice.queue.submit([gpuEncoder.finish()]);
+        gpuPass = null;
+        gpuEncoder = null;
+        return 0;
+      },
+
+      // Get canvas dimensions
+      host_webgpu_get_size: (outPtr) => {
+        if (!gpuCanvas) return -1;
+        const view = new DataView(getKernel().exports.memory.buffer, outPtr, 8);
+        view.setUint32(0, gpuCanvas.width, true);
+        view.setUint32(4, gpuCanvas.height, true);
+        return 0;
+      },
+    };
+
     return {
       env: Object.assign(
         {},
@@ -1365,7 +1709,8 @@
         canvasShim,
         terminalShim,
         imageShim,
-        moduleShim
+        moduleShim,
+        webgpuShim
       ),
     };
   }

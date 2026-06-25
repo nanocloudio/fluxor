@@ -679,6 +679,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             q += fmt_u32_raw(p.add(q), server::active_slot_count(s) as u32);
             dev_log(sys, 3, p, q);
         }
+        // §6 work signal (RFC adaptive_tick_extra): if the request/response path
+        // moved bytes this step, keep the pacer hot. Redundant-but-harmless when
+        // the sub-step already returned Burst (rc==2); fixes the case where it
+        // did work but returned Continue.
+        if s.tlm.bytes_in != rx_pre || s.tlm.bytes_out != tx_pre {
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
+        }
         rc
     }
 }

@@ -20,7 +20,7 @@
 #![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::gic::{
     EVENT_HANDLE_PCIE1_MSI, GICC_EOIR, GICC_IAR, IRQ_BINDINGS, IRQ_BINDING_COUNT, TIMER_PPI,
@@ -243,6 +243,29 @@ pub static CORE_TICKS: [AtomicU32; 4] = [
 pub static CORE_LAST_ELR: [AtomicU64; 4] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Absolute-deadline (`cntp_cval`) re-arm toggle (RFC adaptive_tick §7.1a).
+/// Default OFF: the timer re-arms with the relative `cntp_tval` down-counter
+/// (`timer_set`). When ON, the IRQ handler
+/// re-arms an ABSOLUTE compare relative to the *previous* programmed deadline,
+/// eliminating the per-tick IRQ-entry-latency drift that makes the §7.1
+/// cross-domain skew bound optimistic under variable cadence — with a resync
+/// guard so a deadline that fell into the past during a long ISR snaps to
+/// `now + period` instead of emitting a catch-up burst of immediate IRQs.
+///
+/// This is an opt-in measured option: it changes the most timing-critical
+/// path and MUST be validated on the rig (AC5b: long-run accumulated
+/// cross-domain skew) before it is enabled by default. Toggle via
+/// `bcm2712::set_absolute_rearm`.
+pub static ABSOLUTE_REARM: AtomicBool = AtomicBool::new(false);
+
+/// Per-core last ABSOLUTE deadline programmed into `cntp_cval`, in counter
+/// ticks. The absolute re-arm path computes the next deadline as
+/// `LAST_DEADLINE_CVAL[core] + period` so the grid is drift-free; the resync
+/// guard overwrites it with `now + period` after a stall. Unused (stays 0)
+/// while `ABSOLUTE_REARM` is off.
+pub static LAST_DEADLINE_CVAL: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 /// Current core number (0-3). Pi 5 encodes it in MPIDR Aff1[15:8].
 #[inline(always)]
 pub fn current_core_id() -> u8 {
@@ -265,19 +288,19 @@ pub unsafe extern "C" fn irq_handler() {
         // from the per-core slot (not a shared global) is what lets each
         // core/domain pace at its own rate without a sibling clobbering it.
         //
-        // Re-arm drift (RFC adaptive_tick §7.1a / Phase 3 (viii)): `timer_set`
-        // programmes a RELATIVE `cntp_tval` from "now", so each period loses the
-        // IRQ-entry→rearm latency (a few hundred ns on the A76) — the tick grid
-        // drifts vs an ideal absolute schedule. This is deliberately NOT
-        // converted to an absolute `cntp_cval` re-arm: under variable cadence an
-        // absolute compare can fall far in the past after a long ISR and emit a
-        // catch-up burst of immediate IRQs, whereas relative re-arm self-resyncs
-        // to "now" every period. The drift is benign because nothing
-        // wall-clock-sensitive derives from this cadence — all such timing reads
-        // `CNTPCT_EL0` directly via `now_millis` (the §7.6 wall-clock migration),
-        // not the tick count. The accumulated skew is bounded by per-period ISR
-        // latency and is observable on the rig via the wall-clock `[therm]`/
-        // `[xdom]` timestamps vs `CORE_TICKS` if it ever needs measuring.
+        // Re-arm drift (RFC adaptive_tick §7.1a): the default
+        // relative `cntp_tval` re-arm ("from now") loses the IRQ-entry→rearm
+        // latency (a few hundred ns on the A76) each period, so the tick grid
+        // drifts vs an ideal absolute schedule. At a fixed 1 ms tick this is a
+        // small constant skew and is benign — nothing wall-clock-sensitive
+        // derives from this cadence (all such timing reads `CNTPCT_EL0` directly
+        // via `now_millis`, the §7.6 wall-clock migration, not the tick count).
+        // Under variable cadence (mechanism b) the drift becomes load-dependent,
+        // so the optional `ABSOLUTE_REARM` path below re-arms an absolute
+        // `cntp_cval` relative to the *previous* deadline to eliminate it; its
+        // resync guard avoids the post-long-ISR catch-up burst that a naive
+        // absolute compare would emit. The relative path is the default; it is
+        // self-resyncing and the absolute path is opt-in.
         let core_id = {
             let mpidr: u64;
             core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
@@ -285,7 +308,25 @@ pub unsafe extern "C" fn irq_handler() {
             // stay in bounds even if a future part reports a higher Aff1.
             (((mpidr >> 8) & 0xFF) as usize).min(NEXT_DEADLINE_TICKS.len() - 1)
         };
-        timer::timer_set(NEXT_DEADLINE_TICKS[core_id].load(Ordering::Relaxed));
+        let period = NEXT_DEADLINE_TICKS[core_id].load(Ordering::Relaxed);
+        if ABSOLUTE_REARM.load(Ordering::Relaxed) {
+            // Drift-free absolute re-arm (RFC §7.1a remedy): next deadline =
+            // previous programmed deadline + period. The resync guard handles
+            // boot (last == 0) and post-long-ISR catch-up: if the computed
+            // deadline already passed, snap to now + period so the timer never
+            // emits a burst of immediate IRQs (the hazard the relative path
+            // self-avoids).
+            let now = timer::read_timer_count_64();
+            let mut next =
+                LAST_DEADLINE_CVAL[core_id].load(Ordering::Relaxed).wrapping_add(period as u64);
+            if next <= now {
+                next = now.wrapping_add(period as u64);
+            }
+            timer::timer_set_cval(next);
+            LAST_DEADLINE_CVAL[core_id].store(next, Ordering::Relaxed);
+        } else {
+            timer::timer_set(period);
+        }
         CORE_TICKS[core_id].fetch_add(1, Ordering::Relaxed);
         // Latch the interrupted PC per core. If a core's scheduler loop has
         // frozen (domain tick_count stuck) while CORE_TICKS keeps climbing,
@@ -303,7 +344,14 @@ pub unsafe extern "C" fn irq_handler() {
         while i < n {
             let binding = &IRQ_BINDINGS[i];
             if binding.irq == irq_id {
-                if binding.event_handle == EVENT_HANDLE_PCIE1_MSI {
+                if binding.event_handle == fluxor::kernel::isr_tier::ISR_TIER2_EVENT {
+                    // Tier 2 (IRQ-owned) dispatch: route this hardware IRQ
+                    // straight into the module's `module_isr_entry` via the
+                    // trampoline (which looks the module up by IRQ number and
+                    // enforces the §D7 ISR-context syscall gate). This is the
+                    // bcm2712 counterpart to RP's `DefaultHandler` routing.
+                    let _ = fluxor::kernel::isr_tier::isr_tier2_trampoline(irq_id as u16);
+                } else if binding.event_handle == EVENT_HANDLE_PCIE1_MSI {
                     // brcmstb MSI mux: read + clear MSI_INT_STATUS,
                     // fan out per-vector events. Keeps total ISR
                     // cost proportional to the number of pending

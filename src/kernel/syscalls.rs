@@ -145,7 +145,14 @@ unsafe extern "C" fn syscall_provider_call(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_call") {
+    // ISR-tier (Tier 1b/2) modules are denied `provider_call` in general
+    // (RFC §D6/§D7), but the bridge ops and the `SELF_BRIDGES` enumeration are
+    // exempt: their underlying ring operations are lock-free and
+    // allocation-free, so they are the *sanctioned* I/O path for an ISR-tier
+    // step body (RFC rfc_isr_tier_surface "ISR-tier I/O contract").
+    if !crate::abi::internal::bridge::is_isr_safe(op)
+        && crate::kernel::scheduler::deny_isr_tier_syscall("provider_call")
+    {
         return crate::kernel::errno::EACCES;
     }
     // Contract comes from the handle's FD tag (tagged fds resolve
@@ -812,6 +819,8 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
         | 0x0C41
         | 0x0C42
         | 0x0C43
+        | 0x0C44
+        | 0x0C45
         | 0x0C50
         | 0x0C51
         | 0x0C65
@@ -1149,7 +1158,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
         ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_INSTANCE_PARAMS,
-        PAGED_ARENA_GET, PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
+        PAGED_ARENA_GET, PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT,
+        SELF_INDEX,
     };
     use crate::kernel::scheduler;
     match opcode {
@@ -1157,12 +1167,14 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         SELF_INDEX
         | ARENA_GET
         | REPORT_LATENCY
+        | REPORT_STEP_EFFECT
         | LOG_WRITE
         | GET_HW_ETHERNET_MAC
         | BIND_IRQ
         | HANDLE_POLL
         | RANDOM_FILL
         | MODULE_INSTANCE_PARAMS
+        | bridge::SELF_BRIDGES
         | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
         // ── Diagnostics / log transport ──
         diag::LOG_RING_DRAIN | diag::FAN_DIAG_SNAPSHOT => handle_diag_op(opcode, arg, arg_len),
@@ -1267,15 +1279,51 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // so the top-level match stays readable and each concern is local.
 
 unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::abi::internal::bridge;
     use crate::abi::internal::monitor::ISR_METRICS;
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
         ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_INSTANCE_PARAMS,
-        RANDOM_FILL, REPORT_LATENCY, SELF_INDEX,
+        RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
     };
     use crate::kernel::scheduler;
     match opcode {
         SELF_INDEX => scheduler::current_module_index() as i32,
+        // Module-facing ISR-bridge enumeration (RFC rfc_isr_tier_surface
+        // "ISR-tier I/O contract"). Returns the calling module's own input /
+        // output bridge fds (tagged), so an ISR-tier step body can then move
+        // data with the ISR-exempt bridge WRITE/READ/POLL/INFO ops.
+        bridge::SELF_BRIDGES => {
+            use crate::kernel::fd::{tag_fd, FD_TAG_BRIDGE};
+            let idx = scheduler::current_module_index();
+            if idx >= scheduler::MAX_MODULES {
+                return crate::kernel::errno::ENODEV;
+            }
+            let (in_b, out_b) = match crate::kernel::isr_tier::module_bridge_slots(idx as u8) {
+                Some(b) => b,
+                None => return crate::kernel::errno::ENODEV,
+            };
+            let in_n = in_b.iter().filter(|s| **s >= 0).count();
+            let out_n = out_b.iter().filter(|s| **s >= 0).count();
+            let need = 4 + (in_n + out_n) * 4;
+            if arg.is_null() || arg_len < need {
+                return crate::kernel::errno::EINVAL;
+            }
+            // SAFETY: `arg` is the caller's output buffer; `arg_len >= need`
+            // checked above, so the `need`-byte slice is in bounds.
+            let out = unsafe { core::slice::from_raw_parts_mut(arg, need) };
+            out[0] = in_n as u8;
+            out[1] = out_n as u8;
+            out[2] = 0;
+            out[3] = 0;
+            let mut pos = 4;
+            for s in in_b.iter().chain(out_b.iter()).filter(|s| **s >= 0) {
+                let fd = tag_fd(FD_TAG_BRIDGE, *s as i32);
+                out[pos..pos + 4].copy_from_slice(&fd.to_le_bytes());
+                pos += 4;
+            }
+            need as i32
+        }
         MODULE_INSTANCE_PARAMS => {
             let idx = scheduler::current_module_index();
             let (src, len) = scheduler::module_params(idx);
@@ -1332,6 +1380,16 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             scheduler::report_module_latency(idx, frames);
             0
         }
+        REPORT_STEP_EFFECT => {
+            // §6.1 work signal: one byte of StepEffect. Heats the adaptive pacer
+            // for WorkDone/RunnableBacklog/Burst; never authorises re-step.
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
+            let idx = scheduler::current_module_index();
+            scheduler::report_step_effect(idx, *arg);
+            0
+        }
         LOG_WRITE => {
             syscall_log(handle as u8, arg, arg_len);
             0
@@ -1381,7 +1439,8 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if event_slot < 0 {
                 return E_INVAL;
             }
-            hal::irq_bind(irq, event_slot, mmio_base)
+            // Event-bound IRQs (e.g. virtio-mmio) are serviced on core 0.
+            hal::irq_bind(irq, event_slot, mmio_base, 0)
         }
         HANDLE_POLL => {
             let events = if !arg.is_null() && arg_len >= 1 {

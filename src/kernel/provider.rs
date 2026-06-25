@@ -532,8 +532,13 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
     // not reach `provider_call` — the contract is "bridge-only I/O,
     // no syscalls". The build-time validator already gates
     // admission; this catches hand-rolled binaries that bypass the
-    // tools pipeline.
-    if crate::kernel::scheduler::deny_isr_tier_syscall("provider_call") {
+    // tools pipeline. EXCEPTION: the bridge ops and `SELF_BRIDGES`
+    // enumeration ARE the sanctioned ISR-tier I/O path (lock-free,
+    // allocation-free rings), so they are exempt from the deny here too —
+    // matching the exemption in `syscall_provider_call` (RFC §D7).
+    if !crate::abi::internal::bridge::is_isr_safe(op)
+        && crate::kernel::scheduler::deny_isr_tier_syscall("provider_call")
+    {
         return errno::EACCES;
     }
     if deny_cross_owner_handle(handle, "provider_call") {

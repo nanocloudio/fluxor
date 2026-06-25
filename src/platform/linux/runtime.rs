@@ -67,7 +67,35 @@ fn linux_now_micros() -> u64 {
     elapsed_micros()
 }
 fn linux_tick_count() -> u32 {
-    scheduler::tick_count()
+    // RFC adaptive_tick §7.6 (D8 rule 8): back the HAL `tick_count`
+    // with wall-clock milliseconds instead of `DBG_TICK`. The identity
+    // "1 tick == 1 ms" holds only at the fixed 1 ms default; mechanism (b)
+    // varies the period and mechanism (a) stops advancing `DBG_TICK` during
+    // idle, so a `DBG_TICK`-backed `tick_count` returns wrong "ms since boot"
+    // under adaptive tick. Wall-clock `elapsed_micros()/1000` is correct under
+    // any pacing — matching rp's `Instant`-based `rp_tick_count` (rp.rs:449).
+    // The internal logical tick counter (`scheduler::tick_count()` → DBG_TICK)
+    // is unchanged; only this outward HAL op is decoupled.
+    (elapsed_micros() / 1000) as u32
+}
+
+/// Portable `sleep_until` (RFC adaptive_tick §5.5 Option B). Parks the calling
+/// (scheduler) thread until `deadline_us` or until `linux_wake_scheduler`
+/// unparks it — the same primitive the native Linux loop uses. A spurious
+/// unpark just returns early; the caller re-checks its work state.
+fn linux_sleep_until(deadline_us: u64) -> u32 {
+    let now = elapsed_micros();
+    if deadline_us <= now {
+        return fluxor::kernel::hal::WOKEN_DEADLINE;
+    }
+    let remaining = deadline_us - now;
+    std::thread::park_timeout(std::time::Duration::from_micros(remaining));
+    // Distinguish deadline vs early wake by re-reading the clock.
+    if elapsed_micros() >= deadline_us {
+        fluxor::kernel::hal::WOKEN_DEADLINE
+    } else {
+        fluxor::kernel::hal::WOKEN_EVENT
+    }
 }
 
 fn linux_flash_base() -> usize {
@@ -199,7 +227,8 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     init_gpio: |_| 0,
     csprng_fill: linux_csprng_fill,
     core_id: || 0,
-    irq_bind: |_, _, _| fluxor::kernel::errno::ENOSYS,
+    irq_bind: |_, _, _, _| fluxor::kernel::errno::ENOSYS,
+    sleep_until: linux_sleep_until,
 };
 
 fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {

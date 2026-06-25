@@ -96,9 +96,30 @@ pub struct HalOps {
     pub core_id: fn() -> usize,
 
     /// Bind an event handle to a hardware IRQ. Platform-specific.
+    /// `target_core` is the core that should take the IRQ (the core running the
+    /// owning domain — on the multi-core platform domain id == core id). On
+    /// single-core / no-IRQ platforms it is ignored.
     /// Returns 0 on success, negative errno on failure.
-    pub irq_bind: fn(irq: u32, event_handle: i32, mmio_base: usize) -> i32,
+    pub irq_bind: fn(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) -> i32,
+
+    /// Block until the absolute `deadline_us` (microseconds since boot) OR an
+    /// event/IRQ wakes the scheduler, whichever comes first; returns a
+    /// `WOKEN_*` reason. The portable unification of the per-platform split wake
+    /// arms (RFC adaptive_tick §5.5 Option B / D5): platform loops may keep
+    /// using their native arms (Embassy select, thread park, WFI/WFE), and this
+    /// field provides the single portable primitive a loop can adopt instead,
+    /// without per-platform `#[cfg]` branching. Supplied on every platform.
+    pub sleep_until: fn(deadline_us: u64) -> u32,
 }
+
+/// `sleep_until` returned because its programmed deadline elapsed.
+pub const WOKEN_DEADLINE: u32 = 0;
+/// `sleep_until` returned because an event/IRQ woke the scheduler early.
+pub const WOKEN_EVENT: u32 = 1;
+/// `sleep_until` returned for an indeterminate reason (e.g. a bare WFI that
+/// cannot distinguish the wake source). The caller must re-check its own
+/// wake/work state — `sleep_until` is a hint, never an authority on readiness.
+pub const WOKEN_UNKNOWN: u32 = 2;
 
 /// Global HAL operations table. Set once at boot by `init()`.
 static mut HAL_OPS: Option<&'static HalOps> = None;
@@ -163,6 +184,14 @@ pub fn now_micros() -> u64 {
 #[inline(always)]
 pub fn tick_count() -> u32 {
     (ops().tick_count)()
+}
+
+/// Block until `deadline_us` (µs since boot) or an event/IRQ wakes the
+/// scheduler. Returns a `WOKEN_*` reason; treat it as a hint and re-check
+/// work state regardless (RFC adaptive_tick §5.5 Option B).
+#[inline(always)]
+pub fn sleep_until(deadline_us: u64) -> u32 {
+    (ops().sleep_until)(deadline_us)
 }
 
 // ── Memory model ──────────────────────────────────────────────────────
@@ -384,6 +413,6 @@ pub fn core_id() -> usize {
 
 /// Bind an event handle to a hardware IRQ.
 #[inline(always)]
-pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
-    (ops().irq_bind)(irq, event_handle, mmio_base)
+pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) -> i32 {
+    (ops().irq_bind)(irq, event_handle, mmio_base, target_core)
 }

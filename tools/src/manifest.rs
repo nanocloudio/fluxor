@@ -486,8 +486,19 @@ pub enum TimerClass {
     /// an adaptive domain; the validator rejects it (AC5b).
     TickCounted,
     /// Needs a fixed-cadence WCET guarantee (a control loop / hard-real-time
-    /// step). UNSAFE on an adaptive domain; the validator rejects it.
+    /// step). UNSAFE on a mechanism-(b) (variable-cadence) domain UNLESS the
+    /// domain re-validates its WCET/budget schedulability at `tick_min_us`
+    /// (RFC adaptive_tick §11 / D8 rule 6 — see `guaranteed_wcet_revalidated`).
     Guaranteed,
+    /// Advances an externally committed / replicated logical clock (e.g.
+    /// `ttl_scheduler`, `lease_manager`): it reads wall-clock `dev_millis` so
+    /// it does NOT silently rescale under a variable cadence, but its expiry
+    /// semantics must agree across replicas. Mechanism (b) MUST NOT change the
+    /// replicated-tick *emission rate* unless all replicas agree, and
+    /// mechanism (a) idle must not stall the tick emitter (RFC adaptive_tick
+    /// §7.3 / D8 rule 4). The validator applies the dedicated replicated-clock
+    /// gate rather than the generic step-counted gate.
+    ReplicatedClock,
 }
 
 impl TimerClass {
@@ -500,21 +511,35 @@ impl TimerClass {
             "wall_clock" => Some(Self::WallClock),
             "tick_counted" => Some(Self::TickCounted),
             "guaranteed" => Some(Self::Guaranteed),
+            "replicated_clock" => Some(Self::ReplicatedClock),
             _ => None,
         }
     }
     /// True when the class cannot tolerate a variable scheduler cadence — used
     /// for the mechanism-(a)-only lenient gate (only the two hard-unsafe classes
     /// are rejected; `Unattested`/`Agnostic`/`WallClock` are admitted on (a)).
+    /// `ReplicatedClock` is NOT here: it reads wall-clock time, so idle-relax
+    /// alone doesn't warp it — its (a) hazard (idle stalling the tick emitter)
+    /// is handled by the dedicated replicated-clock gate, not this lenient one.
     pub fn forbids_adaptive(self) -> bool {
         matches!(self, Self::TickCounted | Self::Guaranteed)
     }
     /// True only for a POSITIVE attestation that the module tolerates a variable
     /// cadence. Required for every admitted module on a mechanism-(b) domain (RFC
     /// §8 rule 2): `Unattested` (absent declaration) does NOT qualify — that is
-    /// the fail-closed default.
+    /// the fail-closed default. `ReplicatedClock` qualifies for the *per-module
+    /// rescale* concern (it reads wall-clock time), but the cross-replica
+    /// emission-rate hazard is gated separately by the replicated-clock gate.
     pub fn tolerates_variable_cadence(self) -> bool {
-        matches!(self, Self::WallClock | Self::Agnostic)
+        matches!(
+            self,
+            Self::WallClock | Self::Agnostic | Self::ReplicatedClock
+        )
+    }
+    /// A replicated/committed logical clock whose cross-replica agreement the
+    /// adaptive cadence must not break (RFC §7.3 / D8 rule 4).
+    pub fn is_replicated_clock(self) -> bool {
+        matches!(self, Self::ReplicatedClock)
     }
     pub fn as_str(self) -> &'static str {
         match self {
@@ -523,6 +548,7 @@ impl TimerClass {
             Self::WallClock => "wall_clock",
             Self::TickCounted => "tick_counted",
             Self::Guaranteed => "guaranteed",
+            Self::ReplicatedClock => "replicated_clock",
         }
     }
 }

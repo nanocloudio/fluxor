@@ -396,6 +396,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // Still can't write. Wait for the downstream channel
                         // to drain. New ring bytes accumulate in-place and
                         // are handled by the ring's own drop-new policy.
+                        // Blocked on downstream capacity → Waiting: do NOT heat
+                        // the pacer (a channel-drain event wakes us); the held
+                        // data is best-effort telemetry (RFC adaptive_tick_extra
+                        // §6.2). Forwarding itself returns Burst below, so the
+                        // hot path is already covered.
+                        dev_report_step_effect(&*s.syscalls, step_effect::WAITING);
                         return 0;
                     }
                 }

@@ -29,6 +29,45 @@ pub const GICC_BASE: usize = 0x10_7fff_a000; // Pi 5 GIC-400 CPU interface
 pub const GICC_IAR: *mut u32 = (GICC_BASE + 0x00C) as *mut u32;
 pub const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32;
 
+/// GICv2 Software-Generated-Interrupt register (GICD_SGIR).
+pub const GICD_SGIR: *mut u32 = (GICD_BASE + 0xF00) as *mut u32;
+
+/// SGI id used as the WFI wake doorbell (RFC adaptive_tick §5.4 mitigation 3).
+/// Tier 0/1a idle on **WFI**, which a global `SEV` does NOT break (SEV wakes
+/// WFE). Once mechanism (a) widens the idle deadline to `tick_max_us`, an
+/// intra-core `event_signal` or a cross-domain SPSC push can otherwise be
+/// delayed to the backstop. An SGI is a real IRQ, so it breaks WFI; the IRQ
+/// handler simply EOIs it (it matches no binding) and the loop re-evaluates.
+/// SGI ids 0-15 are always enabled in GICv2, so no `ISENABLER` setup is needed.
+pub const WAKE_SGI: u32 = 0;
+
+/// Send Software-Generated-Interrupt `sgi_id` to ALL cores (CPUTargetList =
+/// 0xF, TargetListFilter = 00 "use the target list"), so every WFI-parked core
+/// wakes — matching the broadcast semantics of the existing global `SEV`.
+///
+/// # Safety
+/// Performs a single MMIO write to the (boot-mapped) GIC distributor.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn send_sgi_all(sgi_id: u32) {
+    // [25:24] filter=00, [23:16] CPUTargetList=0xF (cores 0-3), [3:0] SGIINTID.
+    let val = (0xF << 16) | (sgi_id & 0xF);
+    core::ptr::write_volatile(GICD_SGIR, val);
+}
+
+/// Send SGI `sgi_id` to a single target core (`CPUTargetList = 1<<core`,
+/// TargetListFilter = 00). Drives a Tier-2 IRQ-owned module on a dedicated
+/// secondary core from core 0 (the IRQ a Tier-2 domain owns).
+///
+/// # Safety
+/// Single MMIO write to the (boot-mapped) GIC distributor.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn send_sgi(core: u32, sgi_id: u32) {
+    let val = ((1u32 << (core & 0x7)) << 16) | (sgi_id & 0xF);
+    core::ptr::write_volatile(GICD_SGIR, val);
+}
+
 // Pi 5 (board-cm5): physical timer PPI 30 — no hypervisor, direct access.
 // QEMU: virtual timer PPI 27 — avoids KVM trap overhead on physical timer.
 #[cfg(feature = "board-cm5")]
@@ -70,7 +109,7 @@ pub static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
 /// full.
 #[cfg(feature = "board-cm5")]
 pub fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
-    irq_bind(spi_irq, EVENT_HANDLE_PCIE1_MSI, 0)
+    irq_bind(spi_irq, EVENT_HANDLE_PCIE1_MSI, 0, 0)
 }
 
 #[cfg(not(feature = "board-cm5"))]
@@ -81,9 +120,20 @@ pub fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
 /// Bind an event to a hardware IRQ. Enables the IRQ in the GIC distributor.
 /// `mmio_base`: if nonzero, the ISR reads offset 0x60 (INTERRUPT_STATUS) and
 /// writes offset 0x64 (INTERRUPT_ACK) to ACK virtio-mmio devices.
+/// `target_core`: the CPU the GIC distributor should deliver this SPI to
+/// (GICD_ITARGETSR). For a Tier-2 IRQ this is the core parked on the owning
+/// domain's `exec_mode==4` run loop (domain id == core id on this platform);
+/// otherwise core 0. Clamped to the 8 ITARGETSR target bits.
 ///
 /// Returns 0 on success, negative errno on failure.
-pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
+pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) -> i32 {
+    // GIC-400 INTIDs are 0..=1019; 1020..=1023 are reserved/special and must
+    // never be programmed into the distributor (the validator rejects these at
+    // build time — this is the runtime backstop). A larger value would also
+    // index ISENABLER/IPRIORITYR/ITARGETSR past their banks.
+    if irq > 1019 {
+        return fluxor::kernel::errno::EINVAL;
+    }
     // SAFETY: IRQ_BINDINGS / IRQ_BINDING_COUNT are scheduler-thread-only
     // and only grow at boot/configure time; `idx` is range-checked above.
     // GICD register addresses are fixed MMIO mapped by boot_mmu.
@@ -103,10 +153,15 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize) -> i32 {
             core::ptr::read_volatile(reg as *const u32) | bit);
         // Set priority to 0 (highest)
         core::ptr::write_volatile((GICD_BASE + 0x400 + irq as usize) as *mut u8, 0);
-        // Target CPU 0
-        core::ptr::write_volatile((GICD_BASE + 0x800 + irq as usize) as *mut u8, 1);
+        // Target the owning core (ITARGETSR is a byte per SPI; bit N = core N).
+        // GIC-400 routes SPIs to at most 8 cores; clamp the shift so a bogus
+        // core never aliases to a different target bit.
+        let target = 1u8 << (target_core & 0x7);
+        core::ptr::write_volatile((GICD_BASE + 0x800 + irq as usize) as *mut u8, target);
 
-        log::info!("[irq] bind irq={irq} event={event_handle} mmio={mmio_base:#x}");
+        log::info!(
+            "[irq] bind irq={irq} event={event_handle} mmio={mmio_base:#x} core={target_core}"
+        );
     }
     0
 }

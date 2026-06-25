@@ -1098,6 +1098,29 @@ unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
     (sys.provider_call)(-1, 0x0C50, buf.as_mut_ptr(), 4);
 }
 
+/// `StepEffect` codes for [`dev_report_step_effect`] (RFC adaptive_tick_extra
+/// §6.1). Mirrors `kernel_abi::step_effect` and the kernel's `step_effect`.
+#[allow(dead_code, reason = "module SDK surface; not every module reports every variant")]
+mod step_effect {
+    pub const IDLE: u8 = 0;
+    pub const WAITING: u8 = 1;
+    pub const WORK_DONE: u8 = 2;
+    pub const RUNNABLE_BACKLOG: u8 = 3;
+    pub const BURST: u8 = 4;
+}
+
+/// Report this module's `StepEffect` for the current pass (kernel primitive
+/// `REPORT_STEP_EFFECT`, opcode 0x0C45). `WorkDone`/`RunnableBacklog`/`Burst`
+/// keep the adaptive pacer hot without an immediate same-module re-step; the
+/// re-step decision stays with the `StepOutcome::Burst` return value. A module
+/// that never calls this is treated as `Idle`.
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[inline(always)]
+unsafe fn dev_report_step_effect(sys: &SyscallTable, effect: u8) {
+    let mut buf = [effect];
+    (sys.provider_call)(-1, 0x0C45, buf.as_mut_ptr(), 1);
+}
+
 /// Discover channel port via provider_call (CHANNEL::PORT 0x050C).
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]

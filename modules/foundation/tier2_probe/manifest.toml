@@ -1,0 +1,23 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+permissions = ["platform_raw"]
+
+# Tier-2 (IRQ-owned) validation probe. `isr_safe` attests the step/ISR body
+# never calls a forbidden syscall from interrupt context (RFC
+# rfc_isr_tier_surface §D7) — required for admission to a `tier: 2` domain.
+# `module_isr_entry` (exported in mod.rs) is what the IRQ dispatches into; the
+# packer sets the isr_module header bit when it sees that symbol.
+isr_safe = true
+
+# Cadence-independent: it does no tick-based timekeeping. Lets it sit on an
+# adaptive domain too if desired (RFC adaptive_tick §8 rule 2).
+timer_class = "agnostic"
+
+[[ports]]
+name = "probe_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "Tier-2 IRQ probe — counts module_isr_entry dispatches, emits no sustained byte stream"

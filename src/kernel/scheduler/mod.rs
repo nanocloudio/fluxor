@@ -106,15 +106,21 @@ pub enum ReconfigurePhase {
 /// while remaining cooperative (each individual step is still bounded).
 const MAX_BURST_STEPS: usize = 16384;
 
-/// Window (in scheduler ticks) within which a paired-module fault
-/// co-incidence triggers quarantine. If module A faults and its
+/// Wall-clock window (in milliseconds) within which a paired-module
+/// fault co-incidence triggers quarantine. If module A faults and its
 /// declared `quarantine_partner` B has also faulted within this many
-/// ticks, both transition to `Terminated` regardless of their
-/// individual `FaultPolicy`. 100 ticks ≈ 100 ms at the default 1 ms
-/// tick — comfortable for the "two halves of a TLS handshake go
-/// wrong at the same time" case, tight enough that unrelated faults
-/// don't mistakenly cross-trigger.
-const QUARANTINE_WINDOW_TICKS: u32 = 100;
+/// milliseconds, both transition to `Terminated` regardless of their
+/// individual `FaultPolicy`. 100 ms is comfortable for the "two halves
+/// of a TLS handshake go wrong at the same time" case, tight enough
+/// that unrelated faults don't mistakenly cross-trigger.
+///
+/// Measured against `hal::now_millis()` (via `last_fault_ms`) rather
+/// than a tick count: a fixed tick window silently shrinks/grows the
+/// real coincidence window the moment mechanism (b) varies the tick
+/// period, and stalls entirely under mechanism (a) idle-sleep — a
+/// correctness regression for this safety decision (RFC adaptive_tick
+/// §7.6 remedy iii).
+const QUARANTINE_WINDOW_MS: u64 = 100;
 
 /// Hard kernel ceiling on `Draining` phase duration, in scheduler
 /// ticks. The reconfigure PIC module owns the drain orchestration and
@@ -125,10 +131,16 @@ const QUARANTINE_WINDOW_TICKS: u32 = 100;
 /// `MON_DRAIN_FORCED`, and snaps the phase back to `Running` so the
 /// next reconfigure attempt can proceed.
 ///
-/// 30 000 ticks ≈ 30 s at the default 1 ms tick. Long enough that
-/// well-behaved drains never hit it; short enough that operators
-/// don't wait minutes on a hung migration.
-const MAX_DRAIN_TICKS: u32 = 30_000;
+/// 30 000 ms = 30 s. Long enough that well-behaved drains never hit
+/// it; short enough that operators don't wait minutes on a hung
+/// migration.
+///
+/// Measured against `hal::now_millis()` (via `drain_started_ms`)
+/// rather than a tick count: under mechanism (b) the tick period
+/// varies, so a 30 000-tick ceiling would not map to 30 s, and under
+/// mechanism (a) the tick stops advancing while a hung module holds
+/// the graph — the ceiling would never fire (RFC adaptive_tick §7.6).
+const MAX_DRAIN_MS: u64 = 30_000;
 
 /// Maximum number of execution domains.
 pub const MAX_DOMAINS: usize = 4;
@@ -1020,12 +1032,13 @@ pub struct SchedulerState {
     /// telemetry dispatch and the read of the (possibly-replaced)
     /// module state.
     slot_generation: [u32; MAX_MODULES],
-    /// Tick at which the current `Draining` phase started.
-    /// Captured by `set_reconfigure_phase(Draining)`; consulted by
-    /// `step_modules` to enforce the `MAX_DRAIN_TICKS` ceiling.
-    /// `u32::MAX` means "no drain in progress" — distinguishes the
-    /// not-set sentinel from a legitimate `tick == 0` start.
-    drain_started_tick: u32,
+    /// Wall-clock time (ms, `hal::now_millis()`) at which the current
+    /// `Draining` phase started. Captured by
+    /// `set_reconfigure_phase(Draining)`; consulted by `step_modules`
+    /// to enforce the `MAX_DRAIN_MS` ceiling. `u64::MAX` means "no
+    /// drain in progress" — distinguishes the not-set sentinel from a
+    /// legitimate `now == 0` start.
+    drain_started_ms: u64,
     /// Starting offset into the topological `exec_order` for the
     /// flat-path next pass. Incremented after every `MON_BUDGET_OVERRUN`
     /// so modules that are exec-order-behind the overrunning one don't
@@ -1220,7 +1233,7 @@ impl SchedulerState {
             step_counter: [0; MAX_MODULES],
             inactive_for_ticks: [0; MAX_MODULES],
             slot_generation: [0; MAX_MODULES],
-            drain_started_tick: u32::MAX,
+            drain_started_ms: u64::MAX,
             exec_order_offset: 0,
             domain_exec_order_offset: [0; MAX_DOMAINS],
             exec_order: [0; MAX_MODULES],
@@ -1336,7 +1349,7 @@ impl SchedulerState {
         self.reconfigure_phase = ReconfigurePhase::Running;
         self.active_module_count = 0;
         self.rebuild_request = None;
-        self.drain_started_tick = u32::MAX;
+        self.drain_started_ms = u64::MAX;
         self.exec_order_offset = 0;
         // `prepare_in_progress` is intentionally NOT cleared here. The
         // marker is owned by `prepare_graph`, which sets it *before*
@@ -1838,6 +1851,27 @@ pub fn domain_tick_max_us(domain_id: usize) -> u32 {
     domain_tick_us(domain_id)
 }
 
+/// Test-only: plant a domain's adaptive config (flags + tick_min/max µs)
+/// without a full `install_static_config`. Production sets these from the
+/// config blob in `prepare_graph`; conformance tests use this to exercise the
+/// pacer / hot-start paths directly.
+pub fn set_domain_adaptive_for_test(
+    domain_id: usize,
+    flags: u8,
+    tick_min_us: u32,
+    tick_max_us: u32,
+) {
+    if domain_id >= MAX_DOMAINS {
+        return;
+    }
+    // SAFETY: scheduler-thread-exclusive mutation; domain_id bounded.
+    unsafe {
+        SCHED.domain_adaptive_flags[domain_id] = flags;
+        SCHED.domain_tick_min_us[domain_id] = tick_min_us;
+        SCHED.domain_tick_max_us[domain_id] = tick_max_us;
+    }
+}
+
 /// Bit 0 of `domain_adaptive_flags` — mechanism (a) demand-driven idle enabled.
 pub const ADAPTIVE_FLAG_IDLE: u8 = 0x01;
 /// Bit 1 of `domain_adaptive_flags` — mechanism (b) adaptive cadence enabled.
@@ -1908,6 +1942,24 @@ static mut PACER: [PacerState; MAX_DOMAINS] = [PacerState::new(); MAX_DOMAINS];
 static PACER_IDLE_REPORTED: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
+/// Per-domain "was the previous pass idle" latch, for the §6.6 hot-start
+/// transition detector (RFC adaptive_tick_extra). An idle→busy edge arms the
+/// hot-start window.
+static PACER_WAS_IDLE: [AtomicBool; MAX_DOMAINS] = [const { AtomicBool::new(false) }; MAX_DOMAINS];
+
+/// Per-domain hot-start passes remaining (§6.6). After a wake-from-idle the
+/// pacer runs this many busy passes at the §5.3 floor (the tightest safe
+/// cadence) instead of slowly ramping down from the relaxed `tick_max`, so a
+/// request-response pipeline's return hops don't each wait a full `tick_max`
+/// gap. Bounded window; never bypasses Burst/budget/floor guards.
+static PACER_HOTSTART: [portable_atomic::AtomicU8; MAX_DOMAINS] =
+    [const { portable_atomic::AtomicU8::new(0) }; MAX_DOMAINS];
+
+/// Hot-start window length in passes (§6.6). Matched to `MAX_PIPELINE_PASSES`
+/// (4) — the hop budget a single request-response round-trip can need — so the
+/// first request after idle converges at the floor rather than the relaxed tick.
+const PACER_HOTSTART_PASSES: u8 = 4;
+
 /// Compute the §5.3 per-domain floor (µs): never below `tick_min_us`, raised by
 /// the live decaying worst-step so a shortened tick can't shrink the budget
 /// below one heavy step. Clamped not to exceed `tick_max_us`.
@@ -1950,7 +2002,13 @@ fn pacer_reset_all() {
         unsafe { *slot = PacerState::new() };
         PACER_IDLE_REPORTED[d].store(false, Ordering::Relaxed);
         PACER_BURST_TICK[d].store(false, Ordering::Relaxed);
+        PACER_WORK_TICK[d].store(false, Ordering::Relaxed);
+        PACER_WAS_IDLE[d].store(false, Ordering::Relaxed);
+        PACER_HOTSTART[d].store(0, Ordering::Relaxed);
     }
+    // §7 graph-local pacer table — same reconfigure reset (a reused graph slot
+    // must not inherit the prior graph's heat).
+    graph_pacer_reset_all();
 }
 
 /// Drive the mechanism-(b) pacer to its fully-relaxed level (`tick_max`). Called
@@ -2095,8 +2153,23 @@ pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
         .get(domain_id.min(MAX_DOMAINS - 1))
         .map(|b| b.load(Ordering::Relaxed))
         .unwrap_or(false);
-    let idle = !burst && !domain_wake_pending(domain_id);
+    // §6 work signal (RFC adaptive_tick_extra): a module that did useful work
+    // this tick (WorkDone/RunnableBacklog/Burst, via REPORT_STEP_EFFECT) keeps
+    // the pacer hot even if it returned `Continue` for fairness (the IP/NIC
+    // case). Heat-only — re-step is still Burst-gated.
+    let work = PACER_WORK_TICK
+        .get(domain_id.min(MAX_DOMAINS - 1))
+        .map(|b| b.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    let idle = !burst && !work && !domain_wake_pending(domain_id);
     let tick_max = domain_tick_max_us(domain_id);
+    // §6.6 hot-start transition tracking: record idle→busy edges. On idle the
+    // hot-start window resets; the edge (was_idle && now busy) arms it below.
+    let hs_di = domain_id.min(MAX_DOMAINS - 1);
+    let was_idle = PACER_WAS_IDLE[hs_di].swap(idle, Ordering::Relaxed);
+    if idle {
+        PACER_HOTSTART[hs_di].store(0, Ordering::Relaxed);
+    }
     // MON_PACER_IDLE_SLEEP on the busy→idle transition only (low-rate), when
     // demand-driven idle is the active relaxation for this domain.
     if (flags & ADAPTIVE_FLAG_IDLE) != 0 {
@@ -2122,12 +2195,308 @@ pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
         }
         return tick_max;
     }
+    // §6.6 hot-start (busy pass): on the idle→busy edge, arm a bounded window of
+    // `PACER_HOTSTART_PASSES` and return the §5.3 floor — the tightest safe
+    // cadence, which never undershoots the live worst-step — so a
+    // request-response pipeline's return hops after idle don't each wait out
+    // (b)'s slow AIMD ramp down from `tick_max`. The floor still respects
+    // budgets/guaranteed admission, and Burst guards apply unchanged.
+    //
+    // Hot-start modulates the busy-pass deadline below the nominal tick, so it
+    // is part of mechanism (b) and runs only when (b) cadence is enabled. In
+    // idle-only mode (bit 0 without bit 1) a busy pass returns the nominal
+    // `domain_tick_us`: idle-only never changes the busy cadence, keeping the
+    // worst-step bound intact. The `was_idle` latch above is maintained either
+    // way.
     if (flags & ADAPTIVE_FLAG_CADENCE) != 0 {
+        let mut hot = PACER_HOTSTART[hs_di].load(Ordering::Relaxed);
+        if was_idle {
+            hot = PACER_HOTSTART_PASSES;
+        }
+        if hot > 0 {
+            PACER_HOTSTART[hs_di].store(hot - 1, Ordering::Relaxed);
+            let floor = pacer_floor_us(domain_id, tick_max);
+            if hot == PACER_HOTSTART_PASSES {
+                // SAFETY: DBG_TICK aligned u32 read.
+                let tick = unsafe { DBG_TICK };
+                log::info!(
+                    "MON_PACER_HOTSTART domain={hs_di} deadline_us={floor} passes={PACER_HOTSTART_PASSES} tick={tick}"
+                );
+            }
+            // Drive (b)'s ladder toward the floor so cadence stays tight when
+            // the window ends.
+            let _ = pacer_apply_cadence(domain_id, false, tick_max);
+            return floor;
+        }
         // (b) AIMD cadence between the §5.3 floor and tick_max.
         return pacer_apply_cadence(domain_id, idle, tick_max);
     }
     // (a) enabled but this pass was busy, (b) disabled → nominal tick.
     domain_tick_us(domain_id)
+}
+
+// ===========================================================================
+// §7 graph-local pacing (RFC adaptive_tick_extra)
+// ===========================================================================
+//
+// Per-`(graph_instance, domain)` pacer state, so a hot graph cannot pin an idle
+// graph's cadence and an idle graph cannot delay a hot one. Graph identity is
+// `owner::OwnerHandle{slot, generation}`. A multi-graph runner drives this
+// surface: the §7.2 shared-runner deadline-merge, the §6.5 skip-idle runnable
+// predicate, and §7.1 generation-reset on slot reuse. A single resident graph
+// reduces to the per-domain `pacer_next_deadline_us` path above. Bounded (§7.5),
+// no hot-path alloc (§7.6).
+//
+// Each instance carries its own AIMD `PacerState` and reuses the same ladder
+// constants as `pacer_apply_cadence`.
+
+/// Declared bounded graph/domain pacer-instance table size (§7.5). Sized for a
+/// handful of resident graphs across the domains; admission rejects configs
+/// that would need more (the tools `MAX_PACER_INSTANCES` gate).
+pub const MAX_GRAPH_PACERS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct GraphPacer {
+    active: bool,
+    graph_slot: u16,
+    generation: u32,
+    domain: u8,
+    state: PacerState,
+    /// Per-instance pass signals, set by the multi-graph runner before asking
+    /// for a deadline: work (WorkDone/RunnableBacklog/Burst seen), burst, a
+    /// targeted wake, and a due timer/liveness deadline.
+    work: bool,
+    burst: bool,
+    wake: bool,
+    timer_due: bool,
+    was_idle: bool,
+    hotstart: u8,
+}
+
+impl GraphPacer {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            graph_slot: 0,
+            generation: 0,
+            domain: 0,
+            state: PacerState::new(),
+            work: false,
+            burst: false,
+            wake: false,
+            timer_due: false,
+            was_idle: false,
+            hotstart: 0,
+        }
+    }
+}
+
+static mut GRAPH_PACERS: [GraphPacer; MAX_GRAPH_PACERS] = [GraphPacer::new(); MAX_GRAPH_PACERS];
+
+/// Resolve the bounded-table index for `(graph_slot, domain)`, allocating a
+/// free slot on first use. A generation mismatch (the owner slot was reused by
+/// a new graph) RESETS the instance so the new graph cannot inherit the old
+/// graph's heat/floor/dwell (§7.1). Returns `None` if the table is full
+/// (the build-time admission gate prevents this for valid configs). Not a
+/// hot-path scan in steady state — the runner caches the index at prepare time.
+fn graph_pacer_index(graph_slot: u16, generation: u32, domain: u8) -> Option<usize> {
+    let gp = &raw mut GRAPH_PACERS;
+    // SAFETY: scheduler-thread-exclusive access to the table.
+    let t = unsafe { &mut *gp };
+    // Existing instance for this key?
+    for (i, p) in t.iter_mut().enumerate() {
+        if p.active && p.graph_slot == graph_slot && p.domain == domain {
+            if p.generation != generation {
+                // Slot reused by a new graph — reset (§7.1 generation guard).
+                *p = GraphPacer::new();
+                p.active = true;
+                p.graph_slot = graph_slot;
+                p.generation = generation;
+                p.domain = domain;
+            }
+            return Some(i);
+        }
+    }
+    // Allocate a free slot.
+    for (i, p) in t.iter_mut().enumerate() {
+        if !p.active {
+            *p = GraphPacer::new();
+            p.active = true;
+            p.graph_slot = graph_slot;
+            p.generation = generation;
+            p.domain = domain;
+            return Some(i);
+        }
+    }
+    None // table full — admission should have rejected this config
+}
+
+/// AIMD ladder step for a graph-local instance (mirrors `pacer_apply_cadence`'s
+/// math on the instance's own `PacerState`, using the same constants). Returns
+/// the chosen deadline in µs, clamped to `[floor, tick_max]`.
+fn graph_pacer_ladder(ps: &mut PacerState, idle: bool, tick_max: u32, floor: u32, now: u64) -> u32 {
+    if !ps.init {
+        ps.init = true;
+        ps.level_idx = 0;
+        ps.last_change_us = now;
+    }
+    if idle {
+        ps.idle_run = ps.idle_run.saturating_add(1);
+        ps.busy_run = 0;
+    } else {
+        ps.busy_run = ps.busy_run.saturating_add(1);
+        ps.idle_run = 0;
+    }
+    let dwell_ok = now.wrapping_sub(ps.last_change_us) >= PACER_MIN_DWELL_US;
+    let old = ps.level_idx;
+    if !idle && ps.busy_run >= PACER_BUSY_RUN_N && dwell_ok {
+        ps.level_idx = (ps.level_idx + 1).min(PACER_MAX_LEVEL);
+        ps.busy_run = 0;
+    } else if idle && ps.idle_run >= PACER_IDLE_RUN_M && dwell_ok {
+        ps.level_idx = ps.level_idx.saturating_sub(1);
+        ps.idle_run = 0;
+    }
+    if ps.level_idx != old {
+        ps.last_change_us = now;
+    }
+    let raw = (tick_max >> ps.level_idx.min(31)).max(floor).min(tick_max);
+    ps.last_reported_us = raw;
+    raw
+}
+
+/// §6.5 runnable predicate: is this graph/domain instance runnable this pass
+/// (must be stepped), or may it be skipped on a shared runner? Runnable iff any
+/// of: prior-pass work/burst, a targeted wake, or a due timer/liveness
+/// deadline. Conservative — when in doubt the runner passes `timer_due=true`
+/// (fail-closed to the backstop).
+fn graph_pacer_runnable(p: &GraphPacer) -> bool {
+    p.work || p.burst || p.wake || p.timer_due
+}
+
+/// Set this instance's per-pass signals (called by the multi-graph runner
+/// before computing deadlines). Resolves/allocates the instance.
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "the four signals (work/burst/wake/timer_due) are the distinct \
+              §6.3 pacer busy inputs; a bitfield would obscure them at the \
+              call site for no safety gain"
+)]
+pub fn graph_pacer_set_signals(
+    graph_slot: u16,
+    generation: u32,
+    domain: u8,
+    work: bool,
+    burst: bool,
+    wake: bool,
+    timer_due: bool,
+) -> bool {
+    let Some(idx) = graph_pacer_index(graph_slot, generation, domain) else {
+        return false;
+    };
+    let gp = &raw mut GRAPH_PACERS;
+    // SAFETY: scheduler-thread-exclusive; idx in bounds.
+    let p = unsafe { &mut (*gp)[idx] };
+    p.work = work;
+    p.burst = burst;
+    p.wake = wake;
+    p.timer_due = timer_due;
+    true
+}
+
+/// §7.2 graph-local next deadline for one `(graph_slot, domain)` instance.
+/// Independent of every other instance: an idle instance relaxes to `tick_max`
+/// and a busy instance tightens toward `floor`, with the §6.6 hot-start jump on
+/// the idle→busy edge. `floor`/`tick_min`/`tick_max` are the domain's bounds.
+pub fn graph_pacer_deadline(
+    graph_slot: u16,
+    generation: u32,
+    domain: u8,
+    tick_min_us: u32,
+    tick_max_us: u32,
+    floor_us: u32,
+    now_us: u64,
+) -> u32 {
+    let Some(idx) = graph_pacer_index(graph_slot, generation, domain) else {
+        return tick_max_us;
+    };
+    let gp = &raw mut GRAPH_PACERS;
+    // SAFETY: scheduler-thread-exclusive; idx in bounds.
+    let p = unsafe { &mut (*gp)[idx] };
+    let floor = floor_us.max(tick_min_us).min(tick_max_us);
+    // Must mirror `graph_pacer_runnable` exactly: a graph runnable only because
+    // a timer/liveness deadline is due is NOT idle, or it would be relaxed to
+    // tick_max and miss its due deadline.
+    let idle = !graph_pacer_runnable(p);
+    let was_idle = p.was_idle;
+    p.was_idle = idle;
+    if idle {
+        p.hotstart = 0;
+        // Drive the ladder toward relaxed so the resume ramps (hysteresis).
+        let _ = graph_pacer_ladder(&mut p.state, true, tick_max_us, floor, now_us);
+        return tick_max_us;
+    }
+    // Busy: §6.6 hot-start on the idle→busy edge.
+    if was_idle {
+        p.hotstart = PACER_HOTSTART_PASSES;
+    }
+    if p.hotstart > 0 {
+        p.hotstart -= 1;
+        let _ = graph_pacer_ladder(&mut p.state, false, tick_max_us, floor, now_us);
+        return floor;
+    }
+    graph_pacer_ladder(&mut p.state, false, tick_max_us, floor, now_us)
+}
+
+/// §7.2 shared-runner deadline merge: the physical wait is the minimum deadline
+/// across the RUNNABLE instances in `keys` (each `(graph_slot, generation,
+/// domain, tick_min, tick_max, floor)`); idle instances are skipped (not
+/// stepped) but still bound the wait via their relaxed deadline if nothing is
+/// runnable. Returns `(min_deadline_us, any_runnable)`. This is how a hot graph
+/// keeps the runner tight without an idle sibling forcing it slow, and an idle
+/// sibling relaxes without delaying the hot graph.
+pub fn graph_pacer_shared_runner_deadline(
+    keys: &[(u16, u32, u8, u32, u32, u32)],
+    now_us: u64,
+) -> (u32, bool) {
+    let mut min_runnable = u32::MAX;
+    let mut min_backstop = u32::MAX;
+    let mut any_runnable = false;
+    for &(slot, gen_, domain, tmin, tmax, floor) in keys {
+        let d = graph_pacer_deadline(slot, gen_, domain, tmin, tmax, floor, now_us);
+        min_backstop = min_backstop.min(d);
+        // Re-read runnability from the instance the call resolved.
+        if let Some(idx) = graph_pacer_index(slot, gen_, domain) {
+            let gp = &raw const GRAPH_PACERS;
+            // SAFETY: scheduler-thread-exclusive read.
+            let p = unsafe { &(*gp)[idx] };
+            if graph_pacer_runnable(p) {
+                any_runnable = true;
+                min_runnable = min_runnable.min(d);
+            }
+        }
+    }
+    if any_runnable {
+        (min_runnable, true)
+    } else {
+        (
+            if min_backstop == u32::MAX {
+                0
+            } else {
+                min_backstop
+            },
+            false,
+        )
+    }
+}
+
+/// Reset the entire graph-local pacer table (reconfigure / test teardown).
+pub fn graph_pacer_reset_all() {
+    let gp = &raw mut GRAPH_PACERS;
+    // SAFETY: scheduler-thread-exclusive; called at reconfigure or in tests.
+    let t = unsafe { &mut *gp };
+    for p in t.iter_mut() {
+        *p = GraphPacer::new();
+    }
 }
 
 /// Domain execution-mode wire byte values.
@@ -2460,7 +2829,7 @@ pub fn set_module_step_deadline_burst(module_idx: usize, deadline_us: u32) {
 }
 
 /// Declare a quarantine partner for `module_idx`. When this module
-/// faults AND the partner has faulted within `QUARANTINE_WINDOW_TICKS`,
+/// faults AND the partner has faulted within `QUARANTINE_WINDOW_MS`,
 /// both transition to `Terminated`. Pass `0xFF` to clear the pairing.
 /// Sourced from the module manifest's `quarantine_partner` setting;
 /// the kernel does not infer pairings from channel wiring.
@@ -3232,6 +3601,14 @@ pub fn set_module_isr_budget_cycles(module_idx: usize, budget_cycles: u32) {
     }
 }
 
+/// Public accessor for the resolved per-module Tier 1b/2 ISR budget
+/// (override if set, else `DEFAULT_ISR_BUDGET_CYCLES`). Lets conformance
+/// tests observe the result of the TLV-tag-0xFB parse → `set_*` round trip
+/// without exposing the private override array.
+pub fn module_isr_budget_cycles(module_idx: usize) -> u32 {
+    resolved_isr_budget_cycles(module_idx)
+}
+
 /// Read the resolved Tier 1b budget for a module: the per-module
 /// override if non-zero, otherwise `DEFAULT_ISR_BUDGET_CYCLES`.
 fn resolved_isr_budget_cycles(module_idx: usize) -> u32 {
@@ -3623,10 +4000,16 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
             // a no-op on platforms without a real interrupt
             // controller (e.g. the host harness); production platforms
             // wire the IRQ-controller register here.
+            // Deliver the IRQ to the core that runs this Tier-2 domain's
+            // `exec_mode==4` park loop (domain id == core id on the multi-core
+            // platform), not core 0 — otherwise the GIC dispatches
+            // `module_isr_entry` on the wrong core. Single-core / no-IRQ
+            // platforms ignore the target.
             let bind_rc = crate::kernel::hal::irq_bind(
                 irq as u32,
-                0,
+                crate::kernel::isr_tier::ISR_TIER2_EVENT,
                 crate::kernel::isr_tier::isr_tier2_trampoline as usize,
+                domain as u8,
             );
             if bind_rc < 0 {
                 log::warn!(
@@ -4660,7 +5043,7 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
         // precedes destination. `pf >= pt` (including either unordered) is a
         // back-edge or unprovable — excluded so feedback cycles don't deadlock.
         if pf != NO_POS && pt != NO_POS && pf < pt {
-            sched.upstream_mask[to].set(from as usize);
+            sched.upstream_mask[to].set(from);
         }
     }
 }
@@ -5342,21 +5725,25 @@ fn enforce_drain_timeout(
     sched: &mut SchedulerState,
     modules: &mut [ModuleSlot; MAX_MODULES],
     count: usize,
-    tick: u32,
 ) -> bool {
     if sched.reconfigure_phase != ReconfigurePhase::Draining {
         return false;
     }
-    let start = sched.drain_started_tick;
-    if start == u32::MAX || tick.wrapping_sub(start) <= MAX_DRAIN_TICKS {
+    let start = sched.drain_started_ms;
+    // Wall-clock ceiling: a tick-counted `MAX_DRAIN_TICKS` would no
+    // longer mean 30 s once mechanism (b) varies the period, and a hung
+    // module under mechanism (a) freezes the tick so the ceiling could
+    // never fire (RFC adaptive_tick §7.6 remedy iii).
+    let now_ms = crate::kernel::hal::now_millis();
+    if start == u64::MAX || now_ms.wrapping_sub(start) <= MAX_DRAIN_MS {
         return false;
     }
     let surviving = (0..count).filter(|i| !sched.finished[*i]).count();
     log::warn!(
-        "MON_DRAIN_FORCED ticks_elapsed={} ceiling={} — force-terminating \
+        "MON_DRAIN_FORCED ms_elapsed={} ceiling_ms={} — force-terminating \
          {} still-running modules",
-        tick.wrapping_sub(start),
-        MAX_DRAIN_TICKS,
+        now_ms.wrapping_sub(start),
+        MAX_DRAIN_MS,
         surviving,
     );
     // Indexed loop — body touches `sched.finished[i]`, `sched.fault_info[i]`,
@@ -5374,7 +5761,7 @@ fn enforce_drain_timeout(
         }
     }
     sched.reconfigure_phase = ReconfigurePhase::Running;
-    sched.drain_started_tick = u32::MAX;
+    sched.drain_started_ms = u64::MAX;
     true
 }
 
@@ -5429,7 +5816,7 @@ fn last_input_content_type(_module_idx: usize) -> u8 {
 }
 
 /// Check whether a freshly-faulted module declares a paired partner
-/// that ALSO faulted within `QUARANTINE_WINDOW_TICKS`. If so,
+/// that ALSO faulted within `QUARANTINE_WINDOW_MS`. If so,
 /// terminate both — the pair is bound by a shared invariant (TLS
 /// handshake pair, codec pair-stream) that's broken once half goes
 /// down. Skip if either side has already been finalised; idempotent.
@@ -5445,8 +5832,10 @@ fn apply_quarantine(
     module_idx: usize,
     active_count: &mut usize,
 ) {
-    // SAFETY: DBG_TICK is a u32 static; aligned read.
-    let tick = unsafe { DBG_TICK };
+    // Wall-clock window decision (RFC §7.6 iii): a tick-counted window
+    // re-scales under variable pacing and stalls under idle-sleep, so
+    // the co-incidence test reads `last_fault_ms` against `now_millis()`.
+    let now_ms = crate::kernel::hal::now_millis();
     // Collect every module to quarantine — both the freshly-faulted
     // module's declared partner AND any already-faulted module that
     // named THIS module as its partner. The reverse-scan catches
@@ -5461,7 +5850,7 @@ fn apply_quarantine(
         && forward != module_idx
         && !sched.finished[forward]
         && sched.fault_info[forward].fault_count > 0
-        && tick.wrapping_sub(sched.fault_info[forward].last_fault_tick) <= QUARANTINE_WINDOW_TICKS
+        && now_ms.wrapping_sub(sched.fault_info[forward].last_fault_ms) <= QUARANTINE_WINDOW_MS
     {
         targets[forward] = true;
     }
@@ -5486,7 +5875,7 @@ fn apply_quarantine(
         if sched.fault_info[i].fault_count == 0 {
             continue;
         }
-        if tick.wrapping_sub(sched.fault_info[i].last_fault_tick) <= QUARANTINE_WINDOW_TICKS {
+        if now_ms.wrapping_sub(sched.fault_info[i].last_fault_ms) <= QUARANTINE_WINDOW_MS {
             targets[i] = true;
         }
     }
@@ -5505,7 +5894,7 @@ fn apply_quarantine(
     // `alloc` from kernel-side code (which is no_std).
     let target_count = targets.iter().filter(|t| **t).count();
     log::warn!(
-        "MON_QUARANTINE module={module_idx} partner_count={target_count} tick={tick} window={QUARANTINE_WINDOW_TICKS}",
+        "MON_QUARANTINE module={module_idx} partner_count={target_count} now_ms={now_ms} window_ms={QUARANTINE_WINDOW_MS}",
     );
 
     // Terminate self first, then every named target. Use a tiny
@@ -5783,15 +6172,13 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     if sched.prepare_in_progress {
         return StepResult::Done;
     }
-    // SAFETY: DBG_TICK is u32; aligned read.
-    let tick = unsafe { DBG_TICK };
     // SAFETY: scheduler-thread sole writer.
     unsafe {
         DBG_TICK += 1;
     }
 
     // Drain timeout ceiling: see `enforce_drain_timeout`.
-    if enforce_drain_timeout(sched, modules, count, tick) {
+    if enforce_drain_timeout(sched, modules, count) {
         return StepResult::Done;
     }
 
@@ -5918,6 +6305,11 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // by the pacer; `BURST_SEEN_THIS_PASS` is reset per sub-pass and can't serve
     // it. See `PACER_BURST_TICK`.
     for b in PACER_BURST_TICK.iter() {
+        b.store(false, Ordering::Relaxed);
+    }
+    // §6 work signal (RFC adaptive_tick_extra): reset on the same per-tick
+    // cadence as the burst accumulator.
+    for b in PACER_WORK_TICK.iter() {
         b.store(false, Ordering::Relaxed);
     }
     let mut tick_pass = 0u32;
@@ -6054,6 +6446,69 @@ static BURST_SEEN_THIS_PASS: [AtomicBool; MAX_DOMAINS] =
 /// mid-tick. Read by `pacer_next_deadline_us`.
 static PACER_BURST_TICK: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
+
+/// Per-domain "a module reported useful work this outer tick" — the §6 work
+/// signal (RFC adaptive_tick_extra). Set by the `REPORT_STEP_EFFECT` syscall
+/// when a module reports `WorkDone`/`RunnableBacklog`/`Burst`; reset once per
+/// outer tick alongside `PACER_BURST_TICK`. Read by `pacer_next_deadline_us` so
+/// a graph that does useful work WITHOUT returning `StepOutcome::Burst` (e.g.
+/// the IP forwarding path, which avoids Burst to not starve the NIC ring) still
+/// keeps the pacer hot. This heats the pacer ONLY — it never authorises the
+/// immediate same-module re-step, which remains driven by the `Burst` return.
+static PACER_WORK_TICK: [AtomicBool; MAX_DOMAINS] = [const { AtomicBool::new(false) }; MAX_DOMAINS];
+
+/// `StepEffect` codes reported via `REPORT_STEP_EFFECT` (RFC
+/// adaptive_tick_extra §6.1). Values are wire-stable (module SDK ↔ kernel).
+pub mod step_effect {
+    /// No useful work; no known runnable backlog.
+    pub const IDLE: u8 = 0;
+    /// Blocked on external/device/peer progress — does NOT heat the pacer.
+    pub const WAITING: u8 = 1;
+    /// Useful work happened; no immediate same-module re-step.
+    pub const WORK_DONE: u8 = 2;
+    /// More local work can progress, but fairness says yield — heats the pacer,
+    /// no immediate re-step.
+    pub const RUNNABLE_BACKLOG: u8 = 3;
+    /// Useful work and immediate re-step is productive (mirror of the `Burst`
+    /// return; reporting it here also heats the pacer).
+    pub const BURST: u8 = 4;
+}
+
+/// Record a module's `StepEffect` for the current outer tick (RFC
+/// adaptive_tick_extra §6.1). `WorkDone`/`RunnableBacklog`/`Burst` mark the
+/// module's domain busy for the pacer; `Idle`/`Waiting` do nothing (a blocked
+/// module must not pin the pacer hot). Called from the `REPORT_STEP_EFFECT`
+/// syscall handler with the calling module's index.
+pub fn report_step_effect(module_idx: usize, effect: u8) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    if effect >= step_effect::WORK_DONE {
+        // SAFETY: scheduler-thread read of the per-module domain id.
+        let domain = unsafe { SCHED.domain_id[module_idx] as usize };
+        if domain < MAX_DOMAINS {
+            PACER_WORK_TICK[domain].store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether a module in `domain_id` reported useful work this outer tick (§6
+/// work signal). Read by the pacer's busy rule and exposed for observability /
+/// conformance tests. Resets once per outer tick.
+pub fn domain_pacer_work_pending(domain_id: usize) -> bool {
+    PACER_WORK_TICK
+        .get(domain_id.min(MAX_DOMAINS - 1))
+        .map(|b| b.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+/// Test-only: clear the per-domain work-tick accumulator (production resets it
+/// once per outer tick at the top of `step_modules` / `step_domain_modules`).
+pub fn clear_domain_pacer_work_for_test(domain_id: usize) {
+    if let Some(b) = PACER_WORK_TICK.get(domain_id.min(MAX_DOMAINS - 1)) {
+        b.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Variant of [`step_domain_modules`] for platforms running a
 /// continuous-poll execution tier (e.g. BCM2712 Tier 3): runs one full
@@ -6241,6 +6696,8 @@ pub fn step_domain_modules(
     // (before any sub-pass or pre-tick step). `BURST_SEEN_THIS_PASS` is reset
     // per sub-pass for drain-detection and can't serve the pacer's "tick busy?".
     PACER_BURST_TICK[domain_id].store(false, Ordering::Relaxed);
+    // §6 work signal (RFC adaptive_tick_extra): same per-tick reset cadence.
+    PACER_WORK_TICK[domain_id].store(false, Ordering::Relaxed);
     // SAFETY: scheduler-thread context — multi-domain platform's caller
     // (BCM2712 core pump) is the sole stepper for this domain.
     let sched = unsafe {
@@ -6270,12 +6727,9 @@ pub fn step_domain_modules(
         }
     }
 
-    // Drain timeout ceiling — same check as `step_modules`. Tick is
-    // read off `DBG_TICK` here just as the flat path does.
+    // Drain timeout ceiling — same wall-clock check as `step_modules`.
     let count = sched.active_module_count;
-    // SAFETY: DBG_TICK aligned u32 read.
-    let tick = unsafe { DBG_TICK };
-    if enforce_drain_timeout(sched, modules, count, tick) {
+    if enforce_drain_timeout(sched, modules, count) {
         return StepResult::Done;
     }
 
@@ -6521,11 +6975,11 @@ fn step_one_module(
         // Quarantine must be checked BEFORE draining the restart
         // backoff. `raise_module_fault` arms `restart_backoff_ms`
         // (default 100 ticks) for Restart-policy modules, and
-        // `QUARANTINE_WINDOW_TICKS` is also 100. Draining backoff
-        // first would let a Restart-policy module spend the full
-        // window decrementing while its partner's `last_fault_tick`
-        // ages past the edge of the window, and quarantine would
-        // silently miss the co-fault.
+        // `QUARANTINE_WINDOW_MS` is also 100 ms (≈ 100 ticks at the
+        // 1 ms default). Draining backoff first would let a
+        // Restart-policy module spend the full window decrementing
+        // while its partner's `last_fault_ms` ages past the edge of
+        // the window, and quarantine would silently miss the co-fault.
         //
         // The check is cheap (`apply_quarantine` returns immediately
         // when no partner has faulted within the window) and
@@ -6998,11 +7452,11 @@ pub fn set_reconfigure_phase(phase: ReconfigurePhase) {
         match phase {
             ReconfigurePhase::Draining => {
                 if !was_draining {
-                    SCHED.drain_started_tick = DBG_TICK;
+                    SCHED.drain_started_ms = crate::kernel::hal::now_millis();
                 }
             }
             _ => {
-                SCHED.drain_started_tick = u32::MAX;
+                SCHED.drain_started_ms = u64::MAX;
             }
         }
     }
@@ -7022,6 +7476,20 @@ pub fn active_module_count() -> usize {
 pub fn exec_order_count() -> usize {
     // SAFETY: scheduler-thread read.
     unsafe { SCHED.exec_order_count }
+}
+
+/// Return the module slot scheduled at position `pos` in `exec_order`, or
+/// `None` if `pos` is past `exec_order_count`. Lets tests confirm a live
+/// mutation left existing modules at their original schedule positions.
+pub fn exec_order_slot(pos: usize) -> Option<u8> {
+    // SAFETY: scheduler-thread read.
+    unsafe {
+        if pos < SCHED.exec_order_count {
+            Some(SCHED.exec_order[pos])
+        } else {
+            None
+        }
+    }
 }
 
 /// Platform hook: set the active module count. Called by platforms whose
@@ -7189,15 +7657,22 @@ pub fn module_upstream_mask(module_idx: usize) -> u64 {
 /// Shared reference to the workload owner table.
 #[inline]
 pub fn owners() -> &'static OwnerTable {
+    // The raw pointer is bound to a local first so we never form a reference to
+    // the `static mut` (`static_mut_refs`) nor inline-deref an address-of
+    // (`deref_addrof`).
+    let p = &raw const SCHED;
     // SAFETY: scheduler-thread read of the static owner table.
-    unsafe { &(*(&raw const SCHED)).owners }
+    unsafe { &(*p).owners }
 }
 
 /// Mutable reference to the workload owner table. Scheduler-thread only.
 #[inline]
 pub fn owners_mut() -> &'static mut OwnerTable {
+    // Raw pointer bound to a local first (see `owners`) to avoid both the
+    // `static_mut_refs` and `deref_addrof` lints.
+    let p = &raw mut SCHED;
     // SAFETY: scheduler-thread-exclusive mutation of the static owner table.
-    unsafe { &mut (*(&raw mut SCHED)).owners }
+    unsafe { &mut (*p).owners }
 }
 
 /// Owner handle stamped on module `module_idx`. On single-tenant builds there

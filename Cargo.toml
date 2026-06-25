@@ -137,6 +137,18 @@ chip-bcm2712 = ["portable-atomic", "sha2", "embedded-platform", "multitenant"]
 # Without board-cm5: QEMU virt machine (kernel loaded at 0x40080000).
 board-cm5 = ["chip-bcm2712"]
 
+# Rig-validation opt-in: enables the deferred adaptive-tick mechanisms (the
+# §5.4 SGI wake doorbell + §7.1a absolute cntp_cval re-arm) at boot on
+# bcm2712. OFF by default and never in production — purely a build flag so the
+# CM5 rig can exercise these measured-option paths on silicon (RFC adaptive_tick).
+adaptive_deferred_rig = []
+
+# Rig-validation opt-in: from core 0, periodically fire SGI 15 at core 1 (the
+# Tier-2 dedicated core) so a Tier-2 IRQ-owned module's `module_isr_entry` is
+# driven on silicon. OFF by default; pairs with a `tier: 2` domain hosting the
+# `tier2_probe` module. Validates the Tier-2 dispatch path end-to-end on hardware.
+test_tier2_sgi = []
+
 # Linux hosted (aarch64 userspace). Uses std — no embassy, no cortex-m.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
 host-linux = ["portable-atomic", "sha2", "env_logger", "libc", "multitenant"]

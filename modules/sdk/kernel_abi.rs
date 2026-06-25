@@ -340,6 +340,25 @@ pub const DOWNSTREAM_LATENCY: u32 = 0x0C33;
 /// Report module's own processing latency in frames. handle=-1, arg[0..4]=frames (u32 LE).
 pub const REPORT_LATENCY: u32 = 0x0C50;
 
+/// Report this module's `StepEffect` for the current scheduler pass (RFC
+/// adaptive_tick_extra §6.1). handle=-1, arg[0]=effect code (u8):
+///   0=Idle, 1=Waiting, 2=WorkDone, 3=RunnableBacklog, 4=Burst.
+/// WorkDone/RunnableBacklog/Burst keep the adaptive pacer hot WITHOUT
+/// authorising an immediate same-module re-step (that stays `StepOutcome::Burst`
+/// only). Idle/Waiting do not heat the pacer. A no-permission core primitive;
+/// a module that never calls it is treated as `Idle`.
+pub const REPORT_STEP_EFFECT: u32 = 0x0C45;
+
+/// `StepEffect` codes for `REPORT_STEP_EFFECT` (wire-stable; mirrors the
+/// kernel's `scheduler::step_effect`).
+pub mod step_effect {
+    pub const IDLE: u8 = 0;
+    pub const WAITING: u8 = 1;
+    pub const WORK_DONE: u8 = 2;
+    pub const RUNNABLE_BACKLOG: u8 = 3;
+    pub const BURST: u8 = 4;
+}
+
 /// Get module's arena allocation. handle=-1, arg=[out_ptr:*mut *mut u8] (4 bytes).
 /// Returns arena size in bytes (0 if no arena allocated).
 pub const ARENA_GET: u32 = 0x0C3A;
