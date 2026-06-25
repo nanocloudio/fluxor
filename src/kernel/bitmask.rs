@@ -100,8 +100,7 @@ impl ModuleMask {
             .flat_map(|(w, &word)| BitIter { word, base: w * 64 })
     }
 
-    /// True when `self` and `other` share at least one set bit. Replaces the
-    /// `(a & b) != 0` idiom on the old `u64` masks.
+    /// True when `self` and `other` share at least one set bit.
     #[inline]
     pub fn intersects(&self, other: &ModuleMask) -> bool {
         self.words
@@ -115,6 +114,13 @@ impl ModuleMask {
     #[inline]
     pub fn from_words(words: [u64; MODULE_MASK_WORDS]) -> Self {
         ModuleMask { words }
+    }
+
+    /// Borrow the raw words (used by the multi-word atomic event-wake consume
+    /// path in `kernel/event.rs`).
+    #[inline]
+    pub fn as_words(&self) -> &[u64; MODULE_MASK_WORDS] {
+        &self.words
     }
 
     /// Build from a raw `u64` (migration shim for the single-word case).

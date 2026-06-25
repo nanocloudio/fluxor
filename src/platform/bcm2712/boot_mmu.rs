@@ -26,7 +26,10 @@
 //! is coarse enough to work. The key device regions (0x08000000 GIC,
 //! 0x09000000 UART) fall in the first 1GB which we map as device memory.
 
-#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 #[cfg(feature = "board-cm5")]
 mod cm5_impl {
@@ -41,16 +44,16 @@ mod cm5_impl {
     const AP_RW: u64 = 0 << 6; // AP[2:1] = 00: EL1 RW
     const SH_INNER: u64 = 3 << 8; // Inner shareable
     const AF: u64 = 1 << 10; // Access flag (must set or we get fault)
-    // nG (not-global): ASID-tag the entry. The kernel runs under ASID 0, but
-    // EL0-isolated modules run under their own ASID (module_idx+1) with their
-    // own page table (see bcm2712/mmu.rs). If the kernel identity map were
-    // GLOBAL, its cached 2 MB DRAM block TLB entries would match ANY ASID and
-    // SHADOW an isolated module's nG 4 KB EL0 carve in the same window (e.g.
-    // the EL0 stack, which co-locates with the per-module page-table BSS) →
-    // a spurious EL0 permission fault at level 2 even though the module's
-    // L1/L2/L3 are correctly carved EL0-RW. Tagging the kernel map nG (ASID 0)
-    // means it never matches an ASID-5 EL0 access, so the module's own carve is
-    // always used. The kernel always runs ASID 0, so its own accesses still hit.
+                             // nG (not-global): ASID-tag the entry. The kernel runs under ASID 0, but
+                             // EL0-isolated modules run under their own ASID (module_idx+1) with their
+                             // own page table (see bcm2712/mmu.rs). If the kernel identity map were
+                             // GLOBAL, its cached 2 MB DRAM block TLB entries would match ANY ASID and
+                             // SHADOW an isolated module's nG 4 KB EL0 carve in the same window (e.g.
+                             // the EL0 stack, which co-locates with the per-module page-table BSS) →
+                             // a spurious EL0 permission fault at level 2 even though the module's
+                             // L1/L2/L3 are correctly carved EL0-RW. Tagging the kernel map nG (ASID 0)
+                             // means it never matches an ASID-5 EL0 access, so the module's own carve is
+                             // always used. The kernel always runs ASID 0, so its own accesses still hit.
     const NG: u64 = 1 << 11;
 
     // Upper attributes

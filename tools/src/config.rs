@@ -1283,6 +1283,13 @@ const MAX_DOMAINS: usize = 4;
 /// pacer state on a hot path.
 const MAX_PACER_INSTANCES: usize = MAX_DOMAINS;
 
+/// Bounded MULTI-graph pacer-instance table size — mirrors the kernel's
+/// `scheduler::MAX_GRAPH_PACERS`. When more than one resident graph is admitted
+/// (a base graph plus `pods:`), the live pacer instances are the
+/// `(graph_instance, domain)` pairs across all resident graphs, capped by this
+/// static table (RFC adaptive_tick_extra §7.5 / §13).
+const MAX_GRAPH_PACER_INSTANCES: usize = 16;
+
 /// Burst-mode deadline multiplier — mirrors
 /// `kernel::step_guard::BURST_MULTIPLIER`.
 const BURST_DEADLINE_MULTIPLIER: u32 = 8;
@@ -1551,6 +1558,51 @@ fn validate_scheduler_budgets(
 /// OR a nested `params:` map (`params: { voter_count: 3 }`). The TLV packer
 /// accepts both styles (schema.rs:298-335), so the D9/D10 raft gates must too —
 /// otherwise the normal top-level style silently bypasses them.
+/// §7.5/§13 resident-graph (pod) pacer-table admission. Counts the base graph's
+/// domains plus each `pods:` entry's distinct module domains and rejects configs
+/// that would exceed the kernel's static `GRAPH_PACERS` table. Runs regardless of
+/// `adaptive_flags` — the runtime keys/steps the resident-graph table for ANY
+/// multi-graph config (fixed-tick included), and an overflow is silently dropped
+/// at runtime, so it must fail the build.
+fn validate_resident_pod_table(config: &Value, domain_count: usize) -> Result<()> {
+    let Some(pods) = config.get("pods").and_then(|p| p.as_array()) else {
+        return Ok(());
+    };
+    let mut total = domain_count.max(1);
+    for pod in pods.iter() {
+        // A pod's pacer instances = the number of distinct module domains it
+        // declares (a self-contained subgraph), default 1.
+        let mut seen = [false; MAX_DOMAINS];
+        let mut pod_domains = 0usize;
+        let mods = pod
+            .get("modules")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_else(|| vec![pod.clone()]);
+        for m in &mods {
+            // Domain resolved by NAME against execution.domains (hard-errors on an
+            // undeclared domain, like base modules); numeric/absent ⇒ domain 0.
+            let d = resolve_domain_id(m, config)? as usize;
+            if !seen[d] {
+                seen[d] = true;
+                pod_domains += 1;
+            }
+        }
+        total += pod_domains.max(1);
+    }
+    if total > MAX_GRAPH_PACER_INSTANCES {
+        return Err(Error::Config(format!(
+            "{} resident graph(s) need {total} (graph, domain) pacer instances, \
+             exceeding the kernel's static pacer table ({MAX_GRAPH_PACER_INSTANCES}, \
+             scheduler::MAX_GRAPH_PACERS). The runtime never allocates pacer state on \
+             a hot path, so resident graphs are statically capped. Reduce the number \
+             of pods/domains (RFC adaptive_tick_extra §7.5 / §13).",
+            pods.len() + 1
+        )));
+    }
+    Ok(())
+}
+
 fn module_param_u64(m: &Value, key: &str) -> Option<u64> {
     m.get(key).and_then(|v| v.as_u64()).or_else(|| {
         m.get("params")
@@ -1655,7 +1707,15 @@ fn validate_adaptive_tick(
             }
         }
     }
-    // Unconfigured ⇒ nothing to check (byte-identical path).
+    // Multi-graph pacer-table admission (RFC adaptive_tick_extra §7.5 / §13) runs
+    // BEFORE the adaptive-only early return: resident pods are admitted and the
+    // resident-graph table is keyed/stepped regardless of `adaptive_flags`
+    // (fixed-tick multi-graph still uses it), so an overflowing `pods:` set must
+    // be rejected at build time even with no adaptive domain — otherwise a
+    // graph/domain instance would just be silently dropped at runtime.
+    validate_resident_pod_table(config, domain_count)?;
+
+    // Unconfigured ⇒ nothing more to check (byte-identical path).
     if flags.iter().all(|&f| f == 0) {
         return Ok(());
     }
@@ -5501,6 +5561,68 @@ fn generate_config_impl(
         );
     }
 
+    // Resident-pod modules (RFC adaptive_tick_extra §7) are admitted into REAL
+    // execution domains and share their domain's runner, budget, and timing/ISR
+    // constraints, so they must pass the SAME admission checks as base modules —
+    // not a weaker pod-only path. Build an augmented list (base + every pod's
+    // modules) and run the budget / ISR-tier / pre-tick / adaptive-timer-class /
+    // hardware validators over it. The config-EMIT path is unchanged: base
+    // entries from `modules`, pods from `build_pod_section`. With no `pods:` the
+    // augmented list is the base list (byte-identical validation).
+    // Pod module local names are scoped to their pod, so two pods (or a pod and
+    // the base graph) may legitimately reuse a name. The manifest map
+    // (`load_module_manifests_with_extra`) is keyed by `name` ALONE and silently
+    // overwrites on collision — so a flat base+pod list could resolve a module to
+    // the WRONG manifest (wrong ISR safety / timer class / hardware / pre_tick
+    // metadata). Give every pod module a graph-scoped unique `name` for the
+    // validation list while preserving its `type` (manifests resolve by type), so
+    // each module is validated against its own manifest with no overwrite. This
+    // is validation-only; the emit path (`build_pod_section`) is unaffected.
+    let pod_modules: Vec<Value> = config
+        .get("pods")
+        .and_then(|p| p.as_array())
+        .map(|pods| {
+            pods.iter()
+                .enumerate()
+                .flat_map(|(pi, pod)| {
+                    pod.get("modules")
+                        .and_then(|m| m.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(li, mut m)| {
+                            if let Some(obj) = m.as_object_mut() {
+                                // Give EVERY pod module an INDEX-based graph-scoped
+                                // identity (`__pod{pi}__m{li}`), including `type`-only
+                                // entries and duplicate local names. A name-derived
+                                // identity would collide for two modules sharing a
+                                // local name in one pod (and the manifest loader skips
+                                // nameless modules), letting a tick-counted module
+                                // dodge the timer-class gate. Index identities are
+                                // unique by construction; `type` is preserved
+                                // (manifests resolve by type). Duplicate local names
+                                // are separately rejected in `build_pod_section`.
+                                obj.insert(
+                                    "name".to_string(),
+                                    Value::String(format!("__pod{pi}__m{li}")),
+                                );
+                            }
+                            m
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let validation_modules: Vec<Value> = if pod_modules.is_empty() {
+        module_list.clone()
+    } else {
+        let mut v = module_list.clone();
+        v.extend(pod_modules.iter().cloned());
+        v
+    };
+    let validation_list: &[Value] = &validation_modules;
+
     // Budget validation: prove step_deadlines, burst budgets, and
     // per-domain tick budgets fit together before the kernel ever
     // boots the graph. Until this lands, a config could declare
@@ -5508,7 +5630,13 @@ fn generate_config_impl(
     // `tick_us: 1000` and the deadline would silently force every
     // step over budget — observable only as missed-deadline timeouts
     // at runtime.
-    validate_scheduler_budgets(config, module_list, tick_us, &domain_names, &domain_tick_us)?;
+    validate_scheduler_budgets(
+        config,
+        validation_list,
+        tick_us,
+        &domain_names,
+        &domain_tick_us,
+    )?;
     // NOTE: validate_adaptive_tick is deferred to AFTER the manifest map is
     // built (below) — its timer-class gate must consult the SAME resolver
     // (`load_module_manifests_with_extra`, incl. extra_module_dirs) the rest of
@@ -5523,7 +5651,7 @@ fn generate_config_impl(
     // `.context/rfc_isr_tier_surface.md` for the full contract.
     validate_isr_tier_admission(
         config,
-        module_list,
+        validation_list,
         modules_dir,
         extra_module_dirs,
         resolved_target,
@@ -5538,7 +5666,7 @@ fn generate_config_impl(
     // misconfiguration surfaces at build time rather than as silent
     // misbehaviour at runtime. See `.context/rfc_isr_tier_surface.md`
     // §D8 for the contract.
-    validate_pre_tick_drain_admission(config, module_list, extra_module_dirs)?;
+    validate_pre_tick_drain_admission(config, validation_list, extra_module_dirs)?;
 
     // Inject graph sample_rate into modules that don't declare their own
     let modules_with_rate;
@@ -5567,7 +5695,11 @@ fn generate_config_impl(
     // of doing a second, narrower lookup that may miss modules
     // outside the hard-coded `Manifest::from_source_tree` search
     // list (e.g. modules in the install root or in extras).
-    let manifests = load_module_manifests_with_extra(modules_ref, extra_module_dirs);
+    // Manifests for the AUGMENTED set (base + pod modules) so the adaptive
+    // timer-class gate below resolves pod modules too; `parse_modules_map` (emit,
+    // base-only) just ignores the extra pod entries keyed by type.
+    let manifest_src = Value::Array(validation_modules.clone());
+    let manifests = load_module_manifests_with_extra(&manifest_src, extra_module_dirs);
 
     // Adaptive-tick validation (range/D8/D9/D10 + timer-class gate). Run here,
     // after the full manifest map exists, so the timer-class gate resolves
@@ -5575,7 +5707,7 @@ fn generate_config_impl(
     // from_source_tree) — closing the fail-open for non-bundled modules.
     validate_adaptive_tick(
         config,
-        module_list,
+        validation_list,
         tick_us,
         &domain_names,
         &domain_tick_us,
@@ -5600,7 +5732,9 @@ fn generate_config_impl(
     // is all-false and satisfies every silicon.
     let silicon_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
     if let Some(silicon) = silicon_opt {
-        for (i, m) in module_list.iter().enumerate() {
+        // Cover base AND pod modules — a pod module runs on the same silicon and
+        // must satisfy the same `[requires]` (FPU/NEON/MMU).
+        for (i, m) in validation_list.iter().enumerate() {
             let name = m
                 .get("name")
                 .and_then(|n| n.as_str())
@@ -5844,7 +5978,7 @@ fn generate_config_impl(
         let _ = (tmin, tmax); // not stored in the wire (4-byte entry, no growth)
         graph_section.extend_from_slice(&dtick.to_le_bytes());
         graph_section.push(mode);
-        graph_section.push(flags); // adaptive_flags in the formerly-reserved byte 3
+        graph_section.push(flags); // adaptive_flags = byte 3 of the domain entry
     }
     while graph_section.len() < GRAPH_SECTION_SIZE {
         graph_section.push(0);
@@ -5885,7 +6019,235 @@ fn generate_config_impl(
         result.extend_from_slice(&tmax.to_le_bytes());
     }
 
+    // Resident-pod section (RFC adaptive_tick_extra §7): each top-level `pods:`
+    // entry becomes a self-contained `AddSubgraph` (FLXA) blob the kernel admits
+    // at boot via `apply_add`. Appended right AFTER the 16-byte adaptive post-body
+    // (so the kernel reads it at `total_size + ADAPTIVE_POST_SIZE`), also PAST the
+    // checksummed body — same additive discipline, no format-version bump. Absent
+    // `pods:` ⇒ empty ⇒ byte-identical single-graph config.
+    let pod_section = build_pod_section(config, modules_dir, extra_module_dirs)?;
+    result.extend_from_slice(&pod_section);
+
     Ok(result)
+}
+
+/// Build the resident-pod config section from the optional top-level `pods:`
+/// list (RFC adaptive_tick_extra §7). Each pod is a self-contained subgraph:
+/// modules referenced by `name_hash` (FNV-1a of type) with inline-TLV params (the
+/// same `build_params_from_schema` packing base modules use), and optional
+/// intra-pod `wiring:` (`from`/`to` by pod-local module name). Cross-pod edges
+/// are not supported in v1 (strict isolation). Returns an empty Vec with no pods.
+fn build_pod_section(
+    config: &Value,
+    modules_dir: &Path,
+    extra_module_dirs: &[&Path],
+) -> Result<Vec<u8>> {
+    let Some(pods_yaml) = config.get("pods").and_then(|p| p.as_array()) else {
+        return Ok(Vec::new());
+    };
+    if pods_yaml.is_empty() {
+        return Ok(Vec::new());
+    }
+    let data_section = config.get("data");
+    // Manifest search path for the pre_tick_drain check: mirror the validators'
+    // resolution (extra_module_dirs first — they shadow bundled modules), then
+    // `modules_dir` as a fallback so an external/project module is found and
+    // checked rather than silently passing and losing its pre-tick semantics.
+    let manifest_search: Vec<&Path> = {
+        let mut v: Vec<&Path> = extra_module_dirs.to_vec();
+        v.push(modules_dir);
+        v
+    };
+    // Per-domain exec_mode (Tier) so pods can be rejected from ISR-tier domains.
+    // The FLXA pod codec carries NO exec-mode / `isr_safe` / `pre_tick_drain`
+    // metadata, and pod admission runs AFTER the platform registers ISR handlers
+    // (bcm2712.rs) — so an ISR-tier pod would be admitted yet never dispatched
+    // (the cooperative runner skips ISR domains) and a `pre_tick_drain` pod would
+    // silently lose its pre-pass semantics. Reject both until the codec and
+    // post-admission registration support them.
+    let mut domain_exec_mode: [u8; 4] = [0; 4];
+    if let Some(domains) = config
+        .get("execution")
+        .and_then(|e| e.get("domains"))
+        .and_then(|d| d.as_array())
+    {
+        for (i, dom) in domains.iter().take(4).enumerate() {
+            if let Some(m) = parse_domain_tier_to_exec_mode(dom) {
+                domain_exec_mode[i] = m;
+            }
+        }
+    }
+    let mut pods = Vec::new();
+    for (pi, pod_yaml) in pods_yaml.iter().enumerate() {
+        let mods_yaml = pod_yaml
+            .get("modules")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| Error::Config(format!("pod {pi}: missing `modules:` array")))?;
+        // Deterministic pod_uid: 0xD0 marker + index (host composer / kernel both
+        // treat the UID as opaque identity; uniqueness within the bundle suffices).
+        let mut pod_uid = [0u8; 16];
+        pod_uid[0] = 0xD0;
+        pod_uid[1] = pi as u8;
+        let mut name_to_local: HashMap<String, u8> = HashMap::new();
+        let mut modules = Vec::new();
+        for (li, m) in mods_yaml.iter().enumerate() {
+            let mname = m
+                .get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| m.get("type").and_then(|v| v.as_str()))
+                .ok_or_else(|| {
+                    Error::Config(format!("pod {pi} module {li}: needs a `name` or `type`"))
+                })?;
+            let mtype = m.get("type").and_then(|v| v.as_str()).unwrap_or(mname);
+            // PIC-only: the FLXA pod codec admits modules via the loader by
+            // name_hash; a built-in has no .fmod and apply_add cannot decode it.
+            if crate::modules::is_builtin_module(mtype) {
+                return Err(Error::Config(format!(
+                    "pod {pi} module '{mtype}' is a kernel built-in; resident pods are PIC-only \
+                     (no .fmod for apply_add to load). Use a PIC module, or place it in the base graph."
+                )));
+            }
+            // Reject duplicate local names within a pod: `name_to_local` resolves
+            // `wiring:` endpoints, so a silent overwrite would mis-wire edges to the
+            // wrong module. Names must be unique per pod (a module's `name` defaults
+            // to its `type`, so two same-type modules need explicit distinct names).
+            if name_to_local.insert(mname.to_string(), li as u8).is_some() {
+                return Err(Error::Config(format!(
+                    "pod {pi}: duplicate module name '{mname}' — pod-local module names must be \
+                     unique (they resolve `wiring:` endpoints). Give each module a distinct `name` \
+                     (two modules of the same `type` default to the same name)."
+                )));
+            }
+            let name_hash = crate::hash::fnv1a_hash(mtype.as_bytes());
+            // Domain is a NAME resolved against execution.domains (same namespace
+            // as base modules), so pod modules share their domain's runner/budget
+            // and the admission validators resolve them identically.
+            let domain_id = resolve_domain_id(m, config)?;
+            // Reject ISR-tier (1b/2) pod placement — the codec cannot represent it
+            // and the cooperative runner would never dispatch it.
+            let exec_mode = *domain_exec_mode.get(domain_id as usize).unwrap_or(&0);
+            if exec_mode == 2 || exec_mode == 4 {
+                return Err(Error::Config(format!(
+                    "pod {pi} module '{mtype}' targets an ISR-tier domain (tier 1b/2). Resident \
+                     pods are cooperative-only in v1: the FLXA codec carries no ISR metadata and \
+                     pod admission runs after ISR registration, so an ISR-tier pod would never \
+                     execute. Place ISR-tier modules in the base graph."
+                )));
+            }
+            // Reject `pre_tick_drain` pod modules — the codec drops the flag, so a
+            // pod module would silently run as an ordinary cooperative module,
+            // losing its Tier-1c pre-pass drain semantics.
+            if let Some(root) = resolve_module_root(mtype, &manifest_search) {
+                let mpath = root.join("manifest.toml");
+                if mpath.exists() {
+                    if let Ok(man) = Manifest::from_toml(&mpath) {
+                        if man.pre_tick_drain {
+                            return Err(Error::Config(format!(
+                                "pod {pi} module '{mtype}' is a pre_tick_drain (Tier 1c) module, \
+                                 which resident pods do not support in v1: the FLXA codec carries \
+                                 no pre_tick_drain flag, so the module would silently run as an \
+                                 ordinary cooperative module. Place pre_tick_drain modules in the \
+                                 base graph."
+                            )));
+                        }
+                    }
+                }
+            }
+            // Inline-TLV params — identical packing to base modules, so the kernel
+            // reads them via `params_ptr` exactly the same way.
+            let params =
+                if let Some(param_schema) = schema::load_schema_for_module(mtype, modules_dir) {
+                    let mut buf = vec![0u8; MAX_MODULE_PARAMS_SIZE];
+                    let plen = schema::build_params_from_schema(
+                        m,
+                        &param_schema,
+                        &mut buf,
+                        0,
+                        data_section,
+                        mtype,
+                    )
+                    .map_err(Error::Config)?;
+                    buf.truncate(plen);
+                    buf
+                } else {
+                    Vec::new()
+                };
+            modules.push(crate::add_subgraph::PodModule {
+                name_hash,
+                domain_id,
+                params,
+            });
+        }
+        let mut edges = Vec::new();
+        if let Some(wiring) = pod_yaml.get("wiring").and_then(|w| w.as_array()) {
+            for (ei, e) in wiring.iter().enumerate() {
+                let resolve = |key: &str| -> Result<u8> {
+                    let n = e.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+                        Error::Config(format!(
+                            "pod {pi} wiring {ei}: `{key}` must be a module name"
+                        ))
+                    })?;
+                    name_to_local.get(n).copied().ok_or_else(|| {
+                        Error::Config(format!(
+                            "pod {pi} wiring {ei}: unknown module `{n}` (cross-pod edges are not \
+                             supported in v1 — pods are self-contained)"
+                        ))
+                    })
+                };
+                let from_local = resolve("from")?;
+                let to_local = resolve("to")?;
+                // Reject cross-domain pod edges (v1). On bcm2712 a cross-domain
+                // edge needs the SPSC bridge provisioned at boot (base edges get
+                // it before pod admission, bcm2712.rs); `apply_add` opens an
+                // ordinary channel, so a cross-domain pod edge would silently lose
+                // the bridge. Until pod admission provisions the bridge, require
+                // intra-domain pod wiring on every target (self-contained pods).
+                let from_dom = modules[from_local as usize].domain_id;
+                let to_dom = modules[to_local as usize].domain_id;
+                if from_dom != to_dom {
+                    return Err(Error::Config(format!(
+                        "pod {pi} wiring {ei}: cross-domain edge (domain {from_dom} → {to_dom}) is \
+                         not supported — a cross-domain edge needs the SPSC bridge that pod \
+                         admission does not yet provision (notably on bcm2712). Keep pod modules \
+                         that are wired together in the same domain."
+                    )));
+                }
+                edges.push(crate::add_subgraph::PodEdge {
+                    from_local,
+                    from_port: e.get("from_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                    to_local,
+                    to_port: e.get("to_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                    buffer_bytes: e.get("buffer_bytes").and_then(|v| v.as_u64()).unwrap_or(0)
+                        as u32,
+                });
+            }
+        }
+        let state_cap = pod_yaml
+            .get("state_cap")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let buffer_cap = pod_yaml
+            .get("buffer_cap")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        // §6.5 idle-safe attestation: the operator asserts (pod-level
+        // `idle_safe: true`) that this pod is demand-driven and may be parked when
+        // idle. Absent/false ⇒ fail-closed: the kernel relaxes it to the `tick_max`
+        // backstop cadence rather than parking it.
+        let idle_safe = pod_yaml
+            .get("idle_safe")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        pods.push(crate::add_subgraph::Pod {
+            pod_uid,
+            state_cap,
+            buffer_cap,
+            modules,
+            edges,
+            idle_safe,
+        });
+    }
+    crate::add_subgraph::encode_pod_section(&pods).map_err(Error::Config)
 }
 
 /// Assign buffer group IDs for aliasable edge chains.
@@ -6624,6 +6986,164 @@ mod scheduler_validation_tests {
         assert!(
             format!("{err:?}").contains("multi-node"),
             "expected multi-node diagnostic, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_graph_pods_exceeding_pacer_table_rejected() {
+        // RFC adaptive_tick_extra §7.5/§13: resident graphs (base + `pods:`) ×
+        // domains must fit the kernel's static GRAPH_PACERS table (16). A base
+        // graph (1 domain) plus 16 single-domain pods = 17 instances → reject.
+        let modules = vec![json!({"name": "m", "type": "passthrough"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let manifests = std::collections::HashMap::new();
+        let domain = json!({
+            "name": "main", "cores": [0], "adaptive_flags": 1,
+            "tick_min_us": 100, "tick_max_us": 8000
+        });
+        let pods_over: Vec<_> = (0..16)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "pods": pods_over});
+        // resolved_target None ⇒ event-driven (Linux); skips the bcm wake-policy
+        // gate so this isolates the pacer-table gate.
+        let err = validate_adaptive_tick(
+            &cfg_over,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect_err("17 (graph,domain) pacer instances must exceed the 16-slot table");
+        assert!(
+            format!("{err:?}").contains("pacer table")
+                && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
+            "expected the §7.5 pacer-table overflow diagnostic, got: {err:?}"
+        );
+
+        // 3 pods → 1 (base) + 3 = 4 instances → fits.
+        let pods_ok: Vec<_> = (0..3)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_ok = json!({"execution": {"domains": [domain]}, "pods": pods_ok});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("4 (graph,domain) pacer instances must fit the 16-slot table");
+    }
+
+    #[test]
+    fn multi_graph_pods_overflow_rejected_without_adaptive_flags() {
+        // The pacer-table gate must run even when NO domain sets adaptive_flags:
+        // the runtime keys/steps the resident-graph table for any multi-graph
+        // config (fixed-tick too), so an overflowing `pods:` set with no adaptive
+        // flags must still be rejected, not silently dropped at runtime.
+        let modules = vec![json!({"name": "m", "type": "passthrough"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let manifests = std::collections::HashMap::new();
+        // domain with NO adaptive_flags (fixed-tick).
+        let domain = json!({"name": "main", "cores": [0]});
+        let pods_over: Vec<_> = (0..16)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "pods": pods_over});
+        let err = validate_adaptive_tick(
+            &cfg_over,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect_err("17 fixed-tick pacer instances must still exceed the 16-slot table");
+        assert!(
+            format!("{err:?}").contains("pacer table")
+                && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
+            "expected the §7.5 overflow diagnostic even with no adaptive flags, got: {err:?}"
+        );
+
+        // 2 fixed-tick pods → 1 + 2 = 3 instances → fits.
+        let pods_ok: Vec<_> = (0..2)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_ok = json!({"execution": {"domains": [domain]}, "pods": pods_ok});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("3 fixed-tick pacer instances must fit the 16-slot table");
+    }
+
+    #[test]
+    fn multi_graph_isr_tier_pod_rejected() {
+        // A pod module placed in an ISR-tier domain (tier 1b/2) must be rejected
+        // at emit time — the FLXA codec carries no ISR metadata and pod admission
+        // runs after ISR registration, so it would never execute.
+        let tmp = std::env::temp_dir();
+        // Domain 1 is tier 1b (isr_timer, exec_mode 2); domain 0 cooperative.
+        let cfg_isr = json!({
+            "execution": {"domains": [
+                {"name": "coop", "cores": [0]},
+                {"name": "isrd", "cores": [1], "tier": "1b"}
+            ]},
+            "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "isrd"}]}]
+        });
+        let err = build_pod_section(&cfg_isr, &tmp, &[])
+            .expect_err("an ISR-tier pod placement must be rejected");
+        assert!(
+            format!("{err:?}").contains("ISR-tier"),
+            "expected the ISR-tier pod rejection diagnostic, got: {err:?}"
+        );
+
+        // Same module in the cooperative domain is accepted (reaches schema/emit).
+        let cfg_ok = json!({
+            "execution": {"domains": [
+                {"name": "coop", "cores": [0]},
+                {"name": "isrd", "cores": [1], "tier": "1b"}
+            ]},
+            "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "coop"}]}]
+        });
+        build_pod_section(&cfg_ok, &tmp, &[])
+            .expect("a cooperative-domain pod placement must be accepted");
+    }
+
+    #[test]
+    fn multi_graph_duplicate_pod_local_name_rejected() {
+        // Two modules sharing a pod-local name would silently overwrite the
+        // wiring map (`name_to_local`) and mis-route edges. Must be rejected.
+        let tmp = std::env::temp_dir();
+        let cfg = json!({
+            "execution": {"domains": [{"name": "coop", "cores": [0]}]},
+            "pods": [{"modules": [
+                {"name": "dup", "type": "pod_pic_mod", "domain": "coop"},
+                {"name": "dup", "type": "pod_pic_mod2", "domain": "coop"}
+            ]}]
+        });
+        let err = build_pod_section(&cfg, &tmp, &[])
+            .expect_err("duplicate pod-local module names must be rejected");
+        assert!(
+            format!("{err:?}").contains("duplicate module name"),
+            "expected the duplicate-name diagnostic, got: {err:?}"
         );
     }
 

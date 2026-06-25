@@ -13,14 +13,14 @@
 // Fully config-driven: the boot image carries trailer, modules.bin, and config.bin
 // after the fixed kernel binary, discovered at runtime via the layout trailer.
 
-use core::panic::PanicInfo;
 use core::arch::global_asm;
+use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use fluxor::kernel::scheduler;
+use fluxor::kernel::config::EdgeClass;
 use fluxor::kernel::loader;
 use fluxor::kernel::multicore;
-use fluxor::kernel::config::EdgeClass;
+use fluxor::kernel::scheduler;
 
 // ── Boot-time submodules (binary-private; not exposed via fluxor::kernel) ──
 //
@@ -36,20 +36,20 @@ use fluxor::kernel::config::EdgeClass;
 // `fluxor::kernel::{pcie, mmu, multicore, nic_ring, …}`. They are
 // **not** redeclared here — a loaded module's kernel-facing surface
 // is the `fluxor::kernel` namespace, never `src/platform/*`.
-#[path = "bcm2712/timer.rs"]
-mod timer;
 #[path = "bcm2712/boot_mmu.rs"]
 mod boot_mmu;
-#[path = "bcm2712/uart.rs"]
-mod uart;
-#[path = "bcm2712/logger.rs"]
-mod logger;
-#[path = "bcm2712/gic.rs"]
-mod gic;
-#[path = "bcm2712/rp1.rs"]
-mod rp1;
 #[path = "bcm2712/exception.rs"]
 mod exception;
+#[path = "bcm2712/gic.rs"]
+mod gic;
+#[path = "bcm2712/logger.rs"]
+mod logger;
+#[path = "bcm2712/rp1.rs"]
+mod rp1;
+#[path = "bcm2712/timer.rs"]
+mod timer;
+#[path = "bcm2712/uart.rs"]
+mod uart;
 
 // Bring UART + GIC + exception names into the binary's namespace so
 // existing callsites (`uart_puts(b"…")`, `irq_bind(…)`, `GICD_BASE`,
@@ -58,10 +58,10 @@ mod exception;
 // registers, log-ring drain, debug-tx sink, GIC distributor + CPU
 // interface init, IRQ binding state, exception vectors, and the IRQ
 // dispatch path.
-use uart::*;
-use logger::RingLogger;
-use gic::*;
 use exception::*;
+use gic::*;
+use logger::RingLogger;
+use uart::*;
 
 // ============================================================================
 // Platform address constants (compile-time board selection)
@@ -93,7 +93,7 @@ global_asm!(
     // `package_size` bytes here only when package_size != 0; RAM-loaded
     // aarch64 images leave it at 0 and skip the copy.
     "    .word __end_data_addr",
-    "    .word 0",          // package_size (RP/XIP post-BSS relocation only)
+    "    .word 0", // package_size (RP/XIP post-BSS relocation only)
     "__package_source_start:",
 );
 
@@ -110,8 +110,10 @@ global_asm!(
 // PCIe root complex (onboard) MMIO base — used by rp1_pcie_disable_aspm.
 #[cfg(feature = "board-cm5")]
 const PCIE_RC_BASE: usize = 0x10_0012_0000;
-#[cfg(feature = "board-cm5")] const PCIE_MISC_HARD_PCIE_HARD_DEBUG: usize = 0x4304;
-#[cfg(feature = "board-cm5")] const PCIE_MISC_UBUS_CTRL:            usize = 0x40a4;
+#[cfg(feature = "board-cm5")]
+const PCIE_MISC_HARD_PCIE_HARD_DEBUG: usize = 0x4304;
+#[cfg(feature = "board-cm5")]
+const PCIE_MISC_UBUS_CTRL: usize = 0x40a4;
 
 #[cfg(feature = "board-cm5")]
 #[inline(always)]
@@ -169,64 +171,67 @@ unsafe fn rp1_pcie_disable_aspm() {
 // macb driver path. We rely on that state for initial bring-up.
 
 #[cfg(feature = "board-cm5")]
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod eth {
-    pub const GEM_BASE:     usize = 0x1c_0010_0000;
+    pub const GEM_BASE: usize = 0x1c_0010_0000;
     pub const ETH_CFG_BASE: usize = 0x1c_0010_4000;
 
     // --- Cadence GEM core register offsets ---
-    pub const NCR:    usize = 0x000;  // Network Control
-    pub const NCFGR:  usize = 0x004;  // Network Config
-    pub const NSR:    usize = 0x008;  // Network Status (MDIO idle etc)
-    pub const TSR:    usize = 0x014;  // Transmit Status
-    pub const RBQP:   usize = 0x018;  // classic MACB RX Queue Ptr
-    pub const TBQP:   usize = 0x01c;  // classic MACB TX Queue Ptr
-    pub const RSR:    usize = 0x020;  // Receive Status
-    pub const ISR:    usize = 0x024;
-    pub const IER:    usize = 0x028;
-    pub const IDR:    usize = 0x02c;
-    pub const IMR:    usize = 0x030;
-    pub const MAN:    usize = 0x034;  // PHY Maintenance (MDIO)
-    pub const HRB:    usize = 0x090;  // Hash Bottom
-    pub const HRT:    usize = 0x094;  // Hash Top
-    pub const SA1B:   usize = 0x098;  // Specific address 1 Bottom (MAC lo)
-    pub const SA1T:   usize = 0x09c;  // Specific address 1 Top    (MAC hi)
-    pub const USRIO:  usize = 0x0c0;  // User IO
-    pub const WOL:    usize = 0x0c4;
-    pub const MID:    usize = 0x0fc;  // Module ID (RO) — Pi 5 = 0x00070109
+    pub const NCR: usize = 0x000; // Network Control
+    pub const NCFGR: usize = 0x004; // Network Config
+    pub const NSR: usize = 0x008; // Network Status (MDIO idle etc)
+    pub const TSR: usize = 0x014; // Transmit Status
+    pub const RBQP: usize = 0x018; // classic MACB RX Queue Ptr
+    pub const TBQP: usize = 0x01c; // classic MACB TX Queue Ptr
+    pub const RSR: usize = 0x020; // Receive Status
+    pub const ISR: usize = 0x024;
+    pub const IER: usize = 0x028;
+    pub const IDR: usize = 0x02c;
+    pub const IMR: usize = 0x030;
+    pub const MAN: usize = 0x034; // PHY Maintenance (MDIO)
+    pub const HRB: usize = 0x090; // Hash Bottom
+    pub const HRT: usize = 0x094; // Hash Top
+    pub const SA1B: usize = 0x098; // Specific address 1 Bottom (MAC lo)
+    pub const SA1T: usize = 0x09c; // Specific address 1 Top    (MAC hi)
+    pub const USRIO: usize = 0x0c0; // User IO
+    pub const WOL: usize = 0x0c4;
+    pub const MID: usize = 0x0fc; // Module ID (RO) — Pi 5 = 0x00070109
 
-    pub const DMACFG: usize = 0x010;  // GEM DMA Config
-    pub const GEM_TBQP_0: usize = 0x440;  // GEM queue-0 TX BD ptr
-    pub const GEM_RBQP_0: usize = 0x480;  // GEM queue-0 RX BD ptr
+    pub const DMACFG: usize = 0x010; // GEM DMA Config
+    pub const GEM_TBQP_0: usize = 0x440; // GEM queue-0 TX BD ptr
+    pub const GEM_RBQP_0: usize = 0x480; // GEM queue-0 RX BD ptr
 
     // --- NCR bits ---
-    pub const NCR_LB:      u32 = 1 << 0;   // loopback
-    pub const NCR_LLB:     u32 = 1 << 1;   // local loopback
-    pub const NCR_RE:      u32 = 1 << 2;   // RX enable
-    pub const NCR_TE:      u32 = 1 << 3;   // TX enable
-    pub const NCR_MPE:     u32 = 1 << 4;   // Management port enable (MDIO)
+    pub const NCR_LB: u32 = 1 << 0; // loopback
+    pub const NCR_LLB: u32 = 1 << 1; // local loopback
+    pub const NCR_RE: u32 = 1 << 2; // RX enable
+    pub const NCR_TE: u32 = 1 << 3; // TX enable
+    pub const NCR_MPE: u32 = 1 << 4; // Management port enable (MDIO)
     pub const NCR_CLRSTAT: u32 = 1 << 5;
     pub const NCR_INCSTAT: u32 = 1 << 6;
-    pub const NCR_WESTAT:  u32 = 1 << 7;
-    pub const NCR_BP:      u32 = 1 << 8;
-    pub const NCR_TSTART:  u32 = 1 << 9;   // Start transmission
-    pub const NCR_THALT:   u32 = 1 << 10;
+    pub const NCR_WESTAT: u32 = 1 << 7;
+    pub const NCR_BP: u32 = 1 << 8;
+    pub const NCR_TSTART: u32 = 1 << 9; // Start transmission
+    pub const NCR_THALT: u32 = 1 << 10;
 
     // --- MID expected value (verified via Linux /dev/mem on DUT) ---
     pub const EXPECTED_MID: u32 = 0x0007_0109;
 
     // --- eth_cfg wrapper offsets (RP1 datasheet §7.1) ---
-    pub const CFG_CONTROL:   usize = 0x00;
-    pub const CFG_STATUS:    usize = 0x04;  // RGMII_LINK/SPEED/DUPLEX
-    pub const CFG_TSU_CNT0:  usize = 0x08;
-    pub const CFG_TSU_CNT1:  usize = 0x0c;
-    pub const CFG_TSU_CNT2:  usize = 0x10;
-    pub const CFG_CLKGEN:    usize = 0x14;  // TXCLKDELEN, ENABLE, SPEED_OVERRIDE
-    pub const CFG_CLK2FC:    usize = 0x18;
-    pub const CFG_INTR:      usize = 0x1c;  // bit 0 = ETHERNET top-level irq
-    pub const CFG_INTE:      usize = 0x20;
-    pub const CFG_INTF:      usize = 0x24;
-    pub const CFG_INTS:      usize = 0x28;
+    pub const CFG_CONTROL: usize = 0x00;
+    pub const CFG_STATUS: usize = 0x04; // RGMII_LINK/SPEED/DUPLEX
+    pub const CFG_TSU_CNT0: usize = 0x08;
+    pub const CFG_TSU_CNT1: usize = 0x0c;
+    pub const CFG_TSU_CNT2: usize = 0x10;
+    pub const CFG_CLKGEN: usize = 0x14; // TXCLKDELEN, ENABLE, SPEED_OVERRIDE
+    pub const CFG_CLK2FC: usize = 0x18;
+    pub const CFG_INTR: usize = 0x1c; // bit 0 = ETHERNET top-level irq
+    pub const CFG_INTE: usize = 0x20;
+    pub const CFG_INTF: usize = 0x24;
+    pub const CFG_INTS: usize = 0x28;
 
     #[inline(always)]
     pub unsafe fn read(off: usize) -> u32 {
@@ -249,8 +254,6 @@ mod eth {
     }
 }
 
-
-
 // Timer driver lives in `src/platform/bcm2712/timer.rs` — see
 // the `#[path = "bcm2712/timer.rs"] mod timer;` declaration at the
 // top of this file. Public surface: `timer::{timer_freq,
@@ -264,7 +267,6 @@ mod eth {
 /// finished. Cores 1..3 spin on this in `secondary_core_main` before
 /// entering their domain pump.
 static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
-
 
 // ============================================================================
 // Entry point with secondary core parking
@@ -299,76 +301,65 @@ global_asm!(
     "    mrs x0, mpidr_el1",
     "    ubfx x0, x0, #8, #8",
     "    cbnz x0, .Lpark_core",
-
     // ---- Primary core (core 0) continues ----
     // Pi 5 firmware hands off at EL2. Our kernel runs as EL1, so we must
     // drop down. If we're already at EL1 this short-circuits.
     "    mrs x0, CurrentEL",
-    "    cmp x0, #(2 << 2)",     // currently at EL2?
-    "    b.ne 2f",                // no → skip EL drop
-
+    "    cmp x0, #(2 << 2)", // currently at EL2?
+    "    b.ne 2f",           // no → skip EL drop
     // At EL2: disable EL2 MMU/caches and prepare an eret to EL1h.
     "    mrs x0, sctlr_el2",
-    "    bic x0, x0, #(1 << 0)", // M
-    "    bic x0, x0, #(1 << 2)", // C
-    "    bic x0, x0, #(1 << 12)",// I
+    "    bic x0, x0, #(1 << 0)",  // M
+    "    bic x0, x0, #(1 << 2)",  // C
+    "    bic x0, x0, #(1 << 12)", // I
     "    msr sctlr_el2, x0",
     "    isb",
-
     // HCR_EL2.RW = 1 → EL1 is aarch64
     "    mrs x0, hcr_el2",
     "    mov x1, #(1 << 31)",
     "    orr x0, x0, x1",
     "    msr hcr_el2, x0",
-
     // CNTHCTL_EL2: allow EL1 physical timer / counter access
     "    mrs x0, cnthctl_el2",
     "    orr x0, x0, #(1 << 0)", // EL1PCTEN
     "    orr x0, x0, #(1 << 1)", // EL1PCEN
     "    msr cnthctl_el2, x0",
     "    msr cntvoff_el2, xzr",
-
     // Fake EL1h return state: DAIF all masked, SP_EL1 selected
-    "    mov x0, #0x3c5",        // (D|A|I|F)<<6 | 0b0101 = EL1h
+    "    mov x0, #0x3c5", // (D|A|I|F)<<6 | 0b0101 = EL1h
     "    msr spsr_el2, x0",
     "    adr x0, 2f",
     "    msr elr_el2, x0",
     "    eret",
-
     "2:",
     // Now at EL1 (either originally or via eret).
     // Install exception vectors for EL1.
     "    adr x1, exception_vectors",
     "    msr vbar_el1, x1",
     "    isb",
-
     // Make sure EL1 MMU/caches are off. We enable them ourselves in
     // boot_mmu::enable() after setting up page tables; any residual VPU state
     // needs to be cleared so our setup actually takes effect.
     "    mrs x0, sctlr_el1",
-    "    bic x0, x0, #(1 << 0)", // M
-    "    bic x0, x0, #(1 << 2)", // C
-    "    bic x0, x0, #(1 << 12)",// I
+    "    bic x0, x0, #(1 << 0)",  // M
+    "    bic x0, x0, #(1 << 2)",  // C
+    "    bic x0, x0, #(1 << 12)", // I
     "    msr sctlr_el1, x0",
     "    isb",
     "    ic iallu",
     "    tlbi vmalle1",
     "    dsb sy",
     "    isb",
-
     // Enable NEON/FP (CPACR_EL1.FPEN = 0b11)
     "    mov x0, #(3 << 20)",
     "    msr cpacr_el1, x0",
     "    isb",
-
     // Use SP_EL1 for kernel execution so IRQs take the EL1h/SP_ELx vector slot.
     "    msr SPSel, #1",
     "    isb",
-
     // Set up stack before relocating the packaged payload.
     "    ldr x30, =__stack_end",
     "    mov sp, x30",
-
     // If a packaged payload is appended after the image, relocate it above the
     // runtime-reserved RAM region before zeroing .bss.
     "    ldr x2, =__package_header_start",
@@ -377,12 +368,12 @@ global_asm!(
     "    movk w4, #0x4B50, lsl #16",
     "    cmp w3, w4",
     "    b.ne 9f",
-    "    ldr w5, [x2, #12]",     // package_size
+    "    ldr w5, [x2, #12]", // package_size
     "    cbz w5, 9f",
-    "    add x6, x2, #16",       // source: bytes appended after the header
-    "    ldr w7, [x2, #8]",      // destination base (__end_block_addr, aligned by packer)
+    "    add x6, x2, #16",  // source: bytes appended after the header
+    "    ldr w7, [x2, #8]", // destination base (__end_block_addr, aligned by packer)
     // Fast 8-byte copy loop (both src and dst are 256-byte aligned by packer)
-    "    bic x10, x5, #7",       // x10 = size rounded down to 8-byte multiple
+    "    bic x10, x5, #7", // x10 = size rounded down to 8-byte multiple
     "    mov x8, xzr",
     "8:  cmp x8, x10",
     "    b.ge 7f",
@@ -398,7 +389,6 @@ global_asm!(
     "    add x8, x8, #1",
     "    b 7b",
     "9:",
-
     // Zero BSS
     "    ldr x0, =__bss_start",
     "    ldr x1, =__bss_end",
@@ -407,14 +397,11 @@ global_asm!(
     "    str xzr, [x0], #8",
     "    b 0b",
     "1:",
-
     // Jump to Rust main — pass DTB pointer (firmware-provided) as first arg.
     "    mov x0, x19",
     "    bl main",
-
     // Should never return
     "2:  b 2b",
-
     // Secondary-core fallback park. On Pi 5, ATF holds cores 1-3 in
     // its own PSCI-managed state and never dispatches them into
     // `_start`; `wake_secondary_cores` brings them up through PSCI
@@ -462,8 +449,10 @@ fn instantiate_and_activate(
         }
         scheduler::set_current_module(module_idx);
         let result = scheduler::instantiate_one_module(
-            loader_ref, entry,
-            module_idx, module_idx,
+            loader_ref,
+            entry,
+            module_idx,
+            module_idx,
             &mut sched.edges,
             &mut sched.modules,
             &mut sched.ports,
@@ -475,8 +464,10 @@ fn instantiate_and_activate(
             scheduler::InstantiateResult::Pending(mut pending) => {
                 let mut loaded = false;
                 for _ in 0..100 {
-                    // SAFETY: NOP is a hint; safe spin delay.
-                    for _ in 0..10000 { unsafe { core::arch::asm!("nop") }; }
+                    for _ in 0..10000 {
+                        // SAFETY: NOP is a hint; safe spin delay.
+                        unsafe { core::arch::asm!("nop") };
+                    }
                     // SAFETY: `pending` was allocated by instantiate_one_module
                     // and lives across these poll iterations.
                     match unsafe { pending.try_complete() } {
@@ -487,7 +478,11 @@ fn instantiate_and_activate(
                             break;
                         }
                         Ok(None) => {}
-                        Err(e) => { e.log("module"); loaded = true; break; }
+                        Err(e) => {
+                            e.log("module");
+                            loaded = true;
+                            break;
+                        }
                     }
                 }
                 if !loaded {
@@ -544,7 +539,9 @@ fn instantiate_and_activate(
             uart_puts(b") order: ");
             let mut k = 0usize;
             while k < mod_count {
-                if k > 0 { uart_puts(b"->"); }
+                if k > 0 {
+                    uart_puts(b"->");
+                }
                 if let Some(g) = scheduler::domain_exec_order_at(d, k) {
                     uart_put_u32(g as u32);
                 }
@@ -689,7 +686,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     {
         // SAFETY: GEM_BASE + MID is the documented module-ID register at the
         // GEM MMIO base; aligned u32 read.
-        let mid = unsafe { core::ptr::read_volatile(eth::GEM_BASE.wrapping_add(eth::MID) as *const u32) };
+        let mid =
+            unsafe { core::ptr::read_volatile(eth::GEM_BASE.wrapping_add(eth::MID) as *const u32) };
         uart_puts(b"[gem] MID=0x");
         uart_put_hex32(mid);
         if mid == eth::EXPECTED_MID {
@@ -729,7 +727,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Exception vectors + GIC + timer
     // Timer tick period will be recalculated after config is parsed (tick_us).
     // Start with 1ms default so the system runs during init.
-    let default_ticks = if freq > 0 { (freq / 1000) as u32 } else { 62500 };
+    let default_ticks = if freq > 0 {
+        (freq / 1000) as u32
+    } else {
+        62500
+    };
     // Seed every per-core deadline slot with the 1 ms default so any core
     // that takes a timer IRQ before its domain-specific re-seed reloads a
     // sane value. Cores 1-3 overwrite their own slot in `secondary_core_main`
@@ -776,11 +778,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
             // SAFETY: QEMU virt's fluxor.ld places the config blob and
             // modules blob at known phys addresses; mappings established
             // by `boot_mmu::init_page_tables()` above.
-            let blob_magic = unsafe { core::ptr::read_volatile(QEMU_CONFIG_BLOB_ADDR as *const u32) };
+            let blob_magic =
+                unsafe { core::ptr::read_volatile(QEMU_CONFIG_BLOB_ADDR as *const u32) };
             // SAFETY: as above.
-            let modules_blob_magic = unsafe {
-                core::ptr::read_volatile(QEMU_MODULES_BLOB_ADDR as *const u32)
-            };
+            let modules_blob_magic =
+                unsafe { core::ptr::read_volatile(QEMU_MODULES_BLOB_ADDR as *const u32) };
             if blob_magic == config::MAGIC_CONFIG
                 && modules_blob_magic == loader::MODULE_TABLE_MAGIC
             {
@@ -824,8 +826,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     };
     if !static_state_ok {
         uart_puts(b"[config] parse / loader failed\r\n");
-        // SAFETY: WFI is a hint to halt the core; safe as a fault path.
-        loop { unsafe { core::arch::asm!("wfi") }; }
+        loop {
+            // SAFETY: WFI is a hint to halt the core; safe as a fault path.
+            unsafe { core::arch::asm!("wfi") };
+        }
     }
     // SAFETY: scheduler-thread boot-time read.
     let cfg = unsafe { scheduler::static_config() };
@@ -833,7 +837,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     let n_edges = cfg.edge_count as usize;
 
     // Reconfigure the timer tick from config.tick_us.
-    let tick_us = if cfg.header.tick_us > 0 { cfg.header.tick_us as u32 } else { 1000 };
+    let tick_us = if cfg.header.tick_us > 0 {
+        cfg.header.tick_us as u32
+    } else {
+        1000
+    };
     // freq is in Hz, so ticks_per_us = freq / 1_000_000
     // ticks = tick_us * (freq / 1_000_000) = tick_us * freq / 1_000_000
     let core0_ticks = if freq > 0 {
@@ -877,8 +885,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         Ok(v) => v,
         Err(_) => {
             uart_puts(b"[graph] prepare_graph failed\r\n");
-            // SAFETY: WFI is a hint; safe as a fault path.
-            loop { unsafe { core::arch::asm!("wfi") }; }
+            loop {
+                // SAFETY: WFI is a hint; safe as a fault path.
+                unsafe { core::arch::asm!("wfi") };
+            }
         }
     };
 
@@ -903,15 +913,21 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         let mut e = 0usize;
         while e < n_compiled_edges {
             let edge_snapshot = sched.edges[e];
-            if edge_snapshot.channel < 0 { e += 1; continue; }
+            if edge_snapshot.channel < 0 {
+                e += 1;
+                continue;
+            }
 
             let from = edge_snapshot.from_module;
             let to = edge_snapshot.to_module;
             let from_domain = scheduler::module_domain_id(from);
             let to_domain = scheduler::module_domain_id(to);
-            let is_cross = from_domain != to_domain
-                || edge_snapshot.edge_class == EdgeClass::CrossCore;
-            if !is_cross { e += 1; continue; }
+            let is_cross =
+                from_domain != to_domain || edge_snapshot.edge_class == EdgeClass::CrossCore;
+            if !is_cross {
+                e += 1;
+                continue;
+            }
 
             // Reserve the SPSC ring, the consumer-side channel, and the
             // edge-table slot before touching `consumer_channel`. If any
@@ -926,19 +942,22 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                     uart_puts(b" max); cannot bridge edge ");
                     uart_put_u32(e as u32);
                     uart_puts(b"\r\n");
-                    // SAFETY: WFI is a hint; safe as a fault path.
-            loop { unsafe { core::arch::asm!("wfi") }; }
+                    loop {
+                        // SAFETY: WFI is a hint; safe as a fault path.
+                        unsafe { core::arch::asm!("wfi") };
+                    }
                 }
             };
 
-            let in_ch = channel::channel_open(
-                channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+            let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
             if in_ch < 0 {
                 uart_puts(b"[graph] consumer-side channel alloc failed for cross-domain edge ");
                 uart_put_u32(e as u32);
                 uart_puts(b"\r\n");
-                // SAFETY: WFI is a hint; safe as a fault path.
-            loop { unsafe { core::arch::asm!("wfi") }; }
+                loop {
+                    // SAFETY: WFI is a hint; safe as a fault path.
+                    unsafe { core::arch::asm!("wfi") };
+                }
             }
 
             // Mirror the producer-side channel's mailbox flag onto the
@@ -978,8 +997,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 uart_puts(b" max); cannot bridge edge ");
                 uart_put_u32(e as u32);
                 uart_puts(b"\r\n");
-                // SAFETY: WFI is a hint; safe as a fault path.
-            loop { unsafe { core::arch::asm!("wfi") }; }
+                loop {
+                    // SAFETY: WFI is a hint; safe as a fault path.
+                    unsafe { core::arch::asm!("wfi") };
+                }
             }
 
             sched.edges[e].consumer_channel = in_ch;
@@ -995,6 +1016,13 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_puts(b" modules loaded total\r\n");
 
     fluxor::kernel::scheduler::log_arena_summary();
+
+    // Admit resident pods declared in the config's `[FXPD]` section (RFC
+    // adaptive_tick_extra §7 — `pods:` / `combine <two-graph.yaml>`) as workload
+    // owners via `apply_add` + finalize. Boot-time, before the run loops start.
+    // No-op without a pod section; the multi-graph runner multiplexes the pods
+    // with the base graph on the shared cooperative runner.
+    fluxor::kernel::scheduler::admit_resident_pods_from_config();
 
     // Signal init complete — secondary cores can start
     INIT_COMPLETE.store(1, Ordering::Release);
@@ -1050,7 +1078,14 @@ struct DomainMetrics {
 
 impl DomainMetrics {
     const fn new() -> Self {
-        Self { tick_count: 0, busy_ticks: 0, poll_steps: 0, poll_idle: 0, wfe_count: 0, worst_step_ticks: 0 }
+        Self {
+            tick_count: 0,
+            busy_ticks: 0,
+            poll_steps: 0,
+            poll_idle: 0,
+            wfe_count: 0,
+            worst_step_ticks: 0,
+        }
     }
 }
 
@@ -1093,9 +1128,23 @@ const BCM_IDLE_DEADLINE_CLAMP_US: u32 = 4_000;
 /// cadence — a sampling-robust idle witness. Reset each emit.
 static DL0_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Per-domain next-deadline (µs) produced by the most recent `domain_step_all`
+/// (the resident-graph runner / single-graph pacer). `arm_next_deadline` reads
+/// it instead of re-querying the pacer, so a multi-graph domain arms the §7.2
+/// merged deadline rather than the per-domain single-graph one. Always written
+/// by `domain_step_all` before `arm_next_deadline` runs in the same loop body.
+static DOMAIN_RUNNER_DEADLINE_US: [core::sync::atomic::AtomicU32; multicore::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; multicore::MAX_DOMAINS];
+
 #[inline]
 fn arm_next_deadline(domain_id: usize, core_id: usize) {
-    let raw_us = scheduler::pacer_next_deadline_us(domain_id);
+    // The runner already chose this domain's next deadline during the preceding
+    // `domain_step_all` (resident-graph §7.2 merge, or the single-graph pacer).
+    let raw_us = if domain_id < multicore::MAX_DOMAINS {
+        DOMAIN_RUNNER_DEADLINE_US[domain_id].load(Ordering::Relaxed)
+    } else {
+        scheduler::pacer_next_deadline_us(domain_id)
+    };
     // The §5.4 software-wake latency clamp applies ONLY to an adaptive relaxed
     // deadline. A fixed domain (adaptive_flags == 0) gets `domain_tick_us`
     // verbatim from the pacer and must keep it — clamping a 10 ms fixed tick to
@@ -1138,8 +1187,12 @@ fn run_domain_loop(domain_id: usize) -> ! {
         // Same as Tier 0 but with per-domain timer tick rate.
         // Timer IRQ fires at domain_tick_us; full module ABI retained.
         1 => {
-            log::info!("[domain] {} core={} tier=1a tick_us={}", domain_id, core_id,
-                scheduler::domain_tick_us(domain_id));
+            log::info!(
+                "[domain] {} core={} tier=1a tick_us={}",
+                domain_id,
+                core_id,
+                scheduler::domain_tick_us(domain_id)
+            );
             loop {
                 // SAFETY: WFI halts the core until next interrupt; hint-only.
                 unsafe { core::arch::asm!("wfi") };
@@ -1147,7 +1200,9 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let t0 = timer::read_timer_count();
                 domain_step_all(domain_id);
                 pump_cross_domain(domain_id);
-                if core_id == 0 { debug_drain_poll_core0(); }
+                if core_id == 0 {
+                    debug_drain_poll_core0();
+                }
                 let elapsed = timer::read_timer_count().wrapping_sub(t0);
                 // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
                 // pump thread; bounded by MAX_DOMAINS.
@@ -1156,15 +1211,28 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 maybe_emit_soc_temp(core_id);
                 // live-rebuild bridge (Tier 1a primary).
                 poll_rebuild_bridge(domain_id);
-                if elapsed > metrics.worst_step_ticks { metrics.worst_step_ticks = elapsed; }
+                if elapsed > metrics.worst_step_ticks {
+                    metrics.worst_step_ticks = elapsed;
+                }
                 // Track busy ticks (step work exceeded 50% of tick budget)
                 let freq = timer::timer_freq() as u32;
-                let budget_ticks = if freq > 0 { (scheduler::domain_tick_us(domain_id) as u64 * freq as u64 / 1_000_000) as u32 } else { 62500 };
-                if elapsed > budget_ticks / 2 { metrics.busy_ticks += 1; }
+                let budget_ticks = if freq > 0 {
+                    (scheduler::domain_tick_us(domain_id) as u64 * freq as u64 / 1_000_000) as u32
+                } else {
+                    62500
+                };
+                if elapsed > budget_ticks / 2 {
+                    metrics.busy_ticks += 1;
+                }
                 // Report every ~10s (at domain tick rate)
                 let report_interval = 10_000_000 / scheduler::domain_tick_us(domain_id);
                 if metrics.tick_count % report_interval == 0 && metrics.tick_count > 0 {
-                    log::info!("[tier1a] d={} ticks={} worst={}cyc", domain_id, metrics.tick_count, metrics.worst_step_ticks);
+                    log::info!(
+                        "[tier1a] d={} ticks={} worst={}cyc",
+                        domain_id,
+                        metrics.tick_count,
+                        metrics.worst_step_ticks
+                    );
                 }
                 // Cross-domain bridge health — domain 0 only (core 0 owns the
                 // UDP debug drain), emitted frequently (~0.5 s at tick_us=100)
@@ -1181,8 +1249,12 @@ fn run_domain_loop(domain_id: usize) -> ! {
                     // isn't consuming its input. SAFETY: relaxed reads of other
                     // domains' metrics for diagnostics only.
                     let (d1t, d1p, d2t, d2p) = unsafe {
-                        (DOMAIN_METRICS[1].tick_count, DOMAIN_METRICS[1].poll_steps,
-                         DOMAIN_METRICS[2].tick_count, DOMAIN_METRICS[2].poll_steps)
+                        (
+                            DOMAIN_METRICS[1].tick_count,
+                            DOMAIN_METRICS[1].poll_steps,
+                            DOMAIN_METRICS[2].tick_count,
+                            DOMAIN_METRICS[2].poll_steps,
+                        )
                     };
                     // Secondary-core fault latch — a frozen lane tick_count with
                     // a nonzero fault count + ESR identifies a core that took an
@@ -1258,7 +1330,9 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 let (_result, any_burst) =
                     scheduler::step_domain_modules_poll(&mut sched.modules, domain_id);
                 pump_cross_domain(domain_id);
-                if core_id == 0 { debug_drain_poll_core0(); }
+                if core_id == 0 {
+                    debug_drain_poll_core0();
+                }
 
                 // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
                 // pump thread; bounded by MAX_DOMAINS.
@@ -1272,9 +1346,18 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 }
                 // Report every ~1M poll steps
                 if metrics.poll_steps & 0xFFFFF == 0 && metrics.poll_steps > 0 {
-                    let idle_pct = if metrics.poll_steps > 0 { metrics.poll_idle * 100 / metrics.poll_steps } else { 0 };
-                    log::info!("[tier3] d={} polls={} idle={}% wfe={}",
-                        domain_id, metrics.poll_steps, idle_pct, metrics.wfe_count);
+                    let idle_pct = if metrics.poll_steps > 0 {
+                        metrics.poll_idle * 100 / metrics.poll_steps
+                    } else {
+                        0
+                    };
+                    log::info!(
+                        "[tier3] d={} polls={} idle={}% wfe={}",
+                        domain_id,
+                        metrics.poll_steps,
+                        idle_pct,
+                        metrics.wfe_count
+                    );
                 }
             }
         }
@@ -1291,13 +1374,17 @@ fn run_domain_loop(domain_id: usize) -> ! {
         2 => {
             log::info!(
                 "[domain] {} core={} tier=1b period_us={}",
-                domain_id, core_id, scheduler::domain_tick_us(domain_id)
+                domain_id,
+                core_id,
+                scheduler::domain_tick_us(domain_id)
             );
             loop {
                 multicore::park_if_requested(domain_id);
                 fluxor::kernel::isr_tier::poll_tier1b();
                 pump_cross_domain(domain_id);
-                if core_id == 0 { debug_drain_poll_core0(); }
+                if core_id == 0 {
+                    debug_drain_poll_core0();
+                }
                 // SAFETY: WFE halts the core until an event arrives;
                 // the poll above is non-blocking, so spinning into WFE
                 // is the correct idle posture.
@@ -1339,7 +1426,9 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 unsafe { core::arch::asm!("wfi") };
                 multicore::park_if_requested(domain_id);
                 pump_cross_domain(domain_id);
-                if core_id == 0 { debug_drain_poll_core0(); }
+                if core_id == 0 {
+                    debug_drain_poll_core0();
+                }
                 // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain
                 // `d`'s pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
@@ -1378,7 +1467,9 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // with no dedicated Tier 1b core, the cooperative pump
                 // is the only path to fire the ISR handler.
                 fluxor::kernel::isr_tier::poll_tier1b();
-                if core_id == 0 { debug_drain_poll_core0(); }
+                if core_id == 0 {
+                    debug_drain_poll_core0();
+                }
                 // SAFETY: DOMAIN_METRICS[d] is exclusively touched by domain `d`'s
                 // pump thread; bounded by MAX_DOMAINS.
                 let metrics = unsafe { &mut DOMAIN_METRICS[domain_id] };
@@ -1406,7 +1497,16 @@ fn run_domain_loop(domain_id: usize) -> ! {
 fn domain_step_all(domain_id: usize) {
     // SAFETY: per-domain pump runs on the domain's owning core.
     let sched = unsafe { scheduler::sched_mut() };
-    let _ = scheduler::step_domain_modules(&mut sched.modules, domain_id);
+    // Multi-graph runtime (RFC adaptive_tick_extra §7): with more than one
+    // resident graph in this domain, steps each owner independently, skips idle
+    // owners, and returns the §7.2 merged deadline. Byte-identical to
+    // `step_domain_modules` + `pacer_next_deadline_us(domain)` with one resident
+    // graph. The deadline is stashed for the arm-after-step write below.
+    let (_result, deadline_us) =
+        scheduler::step_resident_graphs_domain(&mut sched.modules, domain_id);
+    if domain_id < multicore::MAX_DOMAINS {
+        DOMAIN_RUNNER_DEADLINE_US[domain_id].store(deadline_us, Ordering::Relaxed);
+    }
 }
 
 /// Move one slot per edge in each direction between local pipe channels
@@ -1435,8 +1535,14 @@ fn pump_cross_domain(domain_id: usize) {
     let n_cross = multicore::cross_edge_count();
     let mut ei = 0;
     while ei < n_cross {
-        let Some(edge) = multicore::get_cross_edge(ei) else { ei += 1; continue };
-        let Some(ch) = multicore::get_cross_channel(edge.channel_idx as usize) else { ei += 1; continue };
+        let Some(edge) = multicore::get_cross_edge(ei) else {
+            ei += 1;
+            continue;
+        };
+        let Some(ch) = multicore::get_cross_channel(edge.channel_idx as usize) else {
+            ei += 1;
+            continue;
+        };
 
         // Producer side. Check remote SPSC space first — `channel_read`
         // commits the local mailbox frame, so consuming the producer's
@@ -1463,7 +1569,9 @@ fn pump_cross_domain(domain_id: usize) {
                 // channel_read writes ≤ `buf.len()` bytes.
                 let n = unsafe {
                     fluxor::kernel::channel::channel_read(
-                        edge.local_out_handle, buf.as_mut_ptr(), buf.len(),
+                        edge.local_out_handle,
+                        buf.as_mut_ptr(),
+                        buf.len(),
                     )
                 };
                 if n <= 0 {
@@ -1510,8 +1618,7 @@ fn pump_cross_domain(domain_id: usize) {
                 let Some(slot_len) = ch.try_peek_len() else {
                     break; // ring empty
                 };
-                if fluxor::kernel::channel::channel_writable_bytes(edge.local_in_handle)
-                    < slot_len
+                if fluxor::kernel::channel::channel_writable_bytes(edge.local_in_handle) < slot_len
                 {
                     multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     break;
@@ -1524,9 +1631,7 @@ fn pump_cross_domain(domain_id: usize) {
                 // the FIFO was just confirmed to have room for the whole slot,
                 // so this write is complete (no truncation).
                 unsafe {
-                    fluxor::kernel::channel::channel_write(
-                        edge.local_in_handle, buf.as_ptr(), len,
-                    );
+                    fluxor::kernel::channel::channel_write(edge.local_in_handle, buf.as_ptr(), len);
                 }
                 moved += 1;
             }
@@ -1577,7 +1682,9 @@ fn secondary_core_main(domain_id: usize) -> ! {
     // Wait for init to complete on core 0
     while INIT_COMPLETE.load(Ordering::Acquire) == 0 {
         // SAFETY: WFE is a hint to wait until the next event.
-        unsafe { core::arch::asm!("wfe"); }
+        unsafe {
+            core::arch::asm!("wfe");
+        }
     }
 
     let core_id = current_core_id();
@@ -1620,8 +1727,12 @@ fn secondary_core_main(domain_id: usize) -> ! {
         uart_puts(b"[core");
         uart_put_u32(core_id as u32);
         uart_puts(b"] no work, parking\r\n");
-        // SAFETY: WFE halts the core until an event; idle path.
-        loop { unsafe { core::arch::asm!("wfe"); } }
+        loop {
+            // SAFETY: WFE halts the core until an event; idle path.
+            unsafe {
+                core::arch::asm!("wfe");
+            }
+        }
     }
 
     // Run the domain loop
@@ -1659,7 +1770,6 @@ pub fn wake_secondary_cores() {
         }
     }
 }
-
 
 // ============================================================================
 // BCM2712 HAL Ops
@@ -1760,7 +1870,9 @@ fn bcm_sleep_until(_deadline_us: u64) -> u32 {
 fn bcm_now_millis() -> u64 {
     let counter = bcm_read_cntpct();
     let freq = bcm_counter_freq();
-    if freq == 0 { return 0; }
+    if freq == 0 {
+        return 0;
+    }
     counter.wrapping_mul(1000) / freq
 }
 
@@ -1769,7 +1881,9 @@ fn bcm_now_millis() -> u64 {
 fn bcm_now_micros() -> u64 {
     let counter = bcm_read_cntpct();
     let freq = bcm_counter_freq();
-    if freq == 0 { return 0; }
+    if freq == 0 {
+        return 0;
+    }
     counter.wrapping_mul(1_000_000) / freq
 }
 fn bcm_tick_count() -> u32 {
@@ -1902,9 +2016,15 @@ fn xdom_due() -> bool {
     true
 }
 
-fn bcm_flash_base() -> usize { 0 }
-fn bcm_flash_end() -> usize { 0 }
-fn bcm_apply_code_bit(addr: usize) -> usize { addr }
+fn bcm_flash_base() -> usize {
+    0
+}
+fn bcm_flash_end() -> usize {
+    0
+}
+fn bcm_apply_code_bit(addr: usize) -> usize {
+    addr
+}
 // BCM address-validation hooks. aarch64 instructions are 4-byte
 // aligned and module headers / code bases are also 4-byte aligned on
 // bare-metal, so requiring `addr & 0x3 == 0` catches ABI corruption
@@ -1945,10 +2065,14 @@ fn bcm_read_cntpct() -> u64 {
     let val: u64;
     // SAFETY: reads CNTPCT_EL0 — generic timer counter, side-effect-free.
     #[cfg(feature = "board-cm5")]
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) val)
+    };
     // SAFETY: reads CNTVCT_EL0 — virtual counter under KVM/QEMU.
     #[cfg(not(feature = "board-cm5"))]
-    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val) };
+    unsafe {
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) val)
+    };
     val
 }
 
@@ -1981,7 +2105,9 @@ fn bcm_step_guard_disarm() {
 
 fn bcm_step_guard_post_check() {
     use fluxor::kernel::step_guard;
-    if !step_guard::is_armed() { return; }
+    if !step_guard::is_armed() {
+        return;
+    }
     let now = bcm_read_cntpct();
     // SAFETY: per-core step-guard read paired with the arming write above.
     let elapsed = now.wrapping_sub(unsafe { BCM_ARM_TIME });
@@ -2021,7 +2147,9 @@ fn bcm_isr_tier_stop() {
 
 fn bcm_isr_tier_poll() {
     use fluxor::kernel::isr_tier;
-    if !isr_tier::TIER1B_ACTIVE.load(core::sync::atomic::Ordering::Acquire) { return; }
+    if !isr_tier::TIER1B_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let now = bcm_read_cntpct();
     // SAFETY: ISR poll runs on the scheduler thread; sole reader.
     let elapsed = now.wrapping_sub(unsafe { BCM_ISR_LAST_TICK });
@@ -2060,39 +2188,72 @@ fn bcm_release_module_handles(_module_idx: u8) {
     // ownership tracking in nic_ring / pcie / dma arenas.
 }
 fn bcm_boot_scan() {}
-fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize { len }
+fn bcm_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize {
+    len
+}
 
-unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use fluxor::abi::platform::bcm2712::{mmio_dma, pcie_device, pcie_nic};
+unsafe fn bcm_system_extension_dispatch(
+    _handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
     use fluxor::abi::contracts::storage::paged_arena;
+    use fluxor::abi::platform::bcm2712::{mmio_dma, pcie_device, pcie_nic};
     match opcode {
         mmio_dma::MMIO_READ32 => {
-            if arg.is_null() || arg_len < 12 { return -22; }
+            if arg.is_null() || arg_len < 12 {
+                return -22;
+            }
             let addr = u64::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                *arg,
+                *arg.add(1),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
             ]);
             let val = core::ptr::read_volatile(addr as *const u32);
             let vb = val.to_le_bytes();
-            *arg.add(8) = vb[0]; *arg.add(9) = vb[1];
-            *arg.add(10) = vb[2]; *arg.add(11) = vb[3];
+            *arg.add(8) = vb[0];
+            *arg.add(9) = vb[1];
+            *arg.add(10) = vb[2];
+            *arg.add(11) = vb[3];
             0
         }
         mmio_dma::MMIO_WRITE32 => {
-            if arg.is_null() || arg_len < 12 { return -22; }
+            if arg.is_null() || arg_len < 12 {
+                return -22;
+            }
             let addr = u64::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                *arg,
+                *arg.add(1),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
             ]);
             let val = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             core::ptr::write_volatile(addr as *mut u32, val);
             0
         }
         mmio_dma::CACHE_FLUSH_RANGE => {
-            if arg.is_null() || arg_len < 12 { return -22; }
+            if arg.is_null() || arg_len < 12 {
+                return -22;
+            }
             let addr = u64::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                *arg,
+                *arg.add(1),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
             ]);
             let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             // Clean + invalidate data cache by VA range
@@ -2106,36 +2267,54 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             0
         }
         mmio_dma::DMA_ALLOC_CONTIG => {
-            if arg.is_null() || arg_len < 16 { return -22; }
+            if arg.is_null() || arg_len < 16 {
+                return -22;
+            }
             let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             // Use the PCIe1-reachable arena at AXI 0x1_0000_0000 so
             // device DMA routed through the PCIe1 inbound window lands
             // in real DRAM. See `bcm2712_nic_ring::pcie1_dma_alloc_contig`.
-            let phys = fluxor::kernel::nic_ring::pcie1_dma_alloc_contig(size as usize, align as usize);
-            if phys == 0 { return -38; }
+            let phys =
+                fluxor::kernel::nic_ring::pcie1_dma_alloc_contig(size as usize, align as usize);
+            if phys == 0 {
+                return -38;
+            }
             let pb = (phys as u64).to_le_bytes();
             core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
             0
         }
         mmio_dma::DMA_ALLOC_STREAMING => {
-            if arg.is_null() || arg_len < 16 { return -22; }
+            if arg.is_null() || arg_len < 16 {
+                return -22;
+            }
             let size = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let align = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             // Streaming arena stays WB-cacheable. Callers must pair writes
             // with DMA_FLUSH before device-reads and DMA_INVALIDATE before
             // CPU-reads of device-written regions.
-            let phys = fluxor::kernel::nic_ring::pcie1_dma_alloc_streaming(size as usize, align as usize);
-            if phys == 0 { return -38; }
+            let phys =
+                fluxor::kernel::nic_ring::pcie1_dma_alloc_streaming(size as usize, align as usize);
+            if phys == 0 {
+                return -38;
+            }
             let pb = (phys as u64).to_le_bytes();
             core::ptr::copy_nonoverlapping(pb.as_ptr(), arg.add(8), 8);
             0
         }
         mmio_dma::DMA_FLUSH => {
-            if arg.is_null() || arg_len < 12 { return -22; }
+            if arg.is_null() || arg_len < 12 {
+                return -22;
+            }
             let addr = u64::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                *arg,
+                *arg.add(1),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
             ]);
             let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             // Clean (but do not invalidate) by VA range. Caller has just
@@ -2152,10 +2331,18 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             0
         }
         mmio_dma::DMA_INVALIDATE => {
-            if arg.is_null() || arg_len < 12 { return -22; }
+            if arg.is_null() || arg_len < 12 {
+                return -22;
+            }
             let addr = u64::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                *arg,
+                *arg.add(1),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
             ]);
             let size = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
             // Invalidate by VA range. Device has just DMA'd into the
@@ -2175,18 +2362,10 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             core::arch::asm!("dsb sy");
             0
         }
-        pcie_nic::NIC_BAR_MAP => {
-            fluxor::kernel::pcie::syscall_bar_map(arg, arg_len)
-        }
-        pcie_nic::NIC_BAR_UNMAP => {
-            fluxor::kernel::pcie::syscall_bar_unmap(arg, arg_len)
-        }
-        pcie_nic::NIC_RING_CREATE => {
-            fluxor::kernel::nic_ring::syscall_ring_create(arg, arg_len)
-        }
-        pcie_nic::NIC_RING_DESTROY => {
-            fluxor::kernel::nic_ring::syscall_ring_destroy(arg, arg_len)
-        }
+        pcie_nic::NIC_BAR_MAP => fluxor::kernel::pcie::syscall_bar_map(arg, arg_len),
+        pcie_nic::NIC_BAR_UNMAP => fluxor::kernel::pcie::syscall_bar_unmap(arg, arg_len),
+        pcie_nic::NIC_RING_CREATE => fluxor::kernel::nic_ring::syscall_ring_create(arg, arg_len),
+        pcie_nic::NIC_RING_DESTROY => fluxor::kernel::nic_ring::syscall_ring_destroy(arg, arg_len),
         pcie_nic::NIC_RING_INFO => {
             fluxor::kernel::nic_ring::syscall_ring_info(_handle, arg, arg_len)
         }
@@ -2195,28 +2374,24 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             let _ = arg_len;
             fluxor::kernel::pcie::enumerate() as i32
         }
-        pcie_nic::PCIE_CFG_READ32 => {
-            fluxor::kernel::pcie::syscall_cfg_read32(arg, arg_len)
-        }
-        pcie_nic::PCIE_CFG_WRITE32 => {
-            fluxor::kernel::pcie::syscall_cfg_write32(arg, arg_len)
-        }
+        pcie_nic::PCIE_CFG_READ32 => fluxor::kernel::pcie::syscall_cfg_read32(arg, arg_len),
+        pcie_nic::PCIE_CFG_WRITE32 => fluxor::kernel::pcie::syscall_cfg_write32(arg, arg_len),
         pcie_nic::PCIE1_MSI_INIT => {
             // arg = [spi_irq: u32 LE]
-            if arg.is_null() || arg_len < 4 { return -22; }
-            let spi_irq = u32::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-            ]);
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
+            let spi_irq = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             if !fluxor::kernel::pcie::pcie1_msi_init() {
                 return fluxor::kernel::errno::ENODEV;
             }
             register_pcie1_msi_spi(spi_irq)
         }
         pcie_nic::PCIE1_MSI_ALLOC_VECTOR => {
-            if arg.is_null() || arg_len < 20 { return -22; }
-            let event_handle = i32::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-            ]);
+            if arg.is_null() || arg_len < 20 {
+                return -22;
+            }
+            let event_handle = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             match fluxor::kernel::pcie::pcie1_msi_alloc_vector(event_handle) {
                 None => -12, // ENOMEM
                 Some((vec, addr, data)) => {
@@ -2225,33 +2400,37 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                     *arg.add(6) = 0;
                     *arg.add(7) = 0;
                     let ab = addr.to_le_bytes();
-                    for (i, byte) in ab.iter().enumerate() { *arg.add(8 + i) = *byte; }
+                    for (i, byte) in ab.iter().enumerate() {
+                        *arg.add(8 + i) = *byte;
+                    }
                     let db = data.to_le_bytes();
-                    for (i, byte) in db.iter().enumerate() { *arg.add(16 + i) = *byte; }
+                    for (i, byte) in db.iter().enumerate() {
+                        *arg.add(16 + i) = *byte;
+                    }
                     0
                 }
             }
         }
         // ── PCIE_DEVICE contract ──────────────────────────────────
         pcie_device::BIND => {
-            if arg.is_null() || arg_len == 0 { return -22; }
+            if arg.is_null() || arg_len == 0 {
+                return -22;
+            }
             let sel = core::slice::from_raw_parts(arg, arg_len);
             fluxor::kernel::pcie::bind_selector(sel)
         }
-        pcie_device::CLOSE => {
-            fluxor::kernel::pcie::syscall_device_close(_handle)
-        }
+        pcie_device::CLOSE => fluxor::kernel::pcie::syscall_device_close(_handle),
         pcie_device::CFG_READ32 => {
             fluxor::kernel::pcie::syscall_device_cfg_read32(_handle, arg, arg_len)
         }
         pcie_device::CFG_WRITE32 => {
             fluxor::kernel::pcie::syscall_device_cfg_write32(_handle, arg, arg_len)
         }
-        pcie_device::BAR_MAP => {
-            fluxor::kernel::pcie::syscall_device_bar_map(_handle, arg, arg_len)
-        }
+        pcie_device::BAR_MAP => fluxor::kernel::pcie::syscall_device_bar_map(_handle, arg, arg_len),
         pcie_device::MSI_ALLOC => {
-            if arg.is_null() || arg_len < 20 || _handle < 0 { return -22; }
+            if arg.is_null() || arg_len < 20 || _handle < 0 {
+                return -22;
+            }
             // The bound handle tells us which root complex's MSI mux
             // to use. Only PCIe1 is wired today.
             match fluxor::kernel::pcie::bound_device_root(_handle) {
@@ -2269,9 +2448,8 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                                 );
                                 PCIE1_MSI_SPI_REGISTERED = true;
                             }
-                            let event_handle = i32::from_le_bytes([
-                                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-                            ]);
+                            let event_handle =
+                                i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
                             match fluxor::kernel::pcie::pcie1_msi_alloc_vector(event_handle) {
                                 None => fluxor::kernel::errno::ENOMEM,
                                 Some((vec, addr, data)) => {
@@ -2280,9 +2458,13 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                                     *arg.add(6) = 0;
                                     *arg.add(7) = 0;
                                     let ab = addr.to_le_bytes();
-                                    for (i, byte) in ab.iter().enumerate() { *arg.add(8 + i) = *byte; }
+                                    for (i, byte) in ab.iter().enumerate() {
+                                        *arg.add(8 + i) = *byte;
+                                    }
                                     let db = data.to_le_bytes();
-                                    for (i, byte) in db.iter().enumerate() { *arg.add(16 + i) = *byte; }
+                                    for (i, byte) in db.iter().enumerate() {
+                                        *arg.add(16 + i) = *byte;
+                                    }
                                     0
                                 }
                             }
@@ -2292,17 +2474,13 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
                 }
             }
         }
-        pcie_device::INFO => {
-            fluxor::kernel::pcie::syscall_device_info(_handle, arg, arg_len)
-        }
+        pcie_device::INFO => fluxor::kernel::pcie::syscall_device_info(_handle, arg, arg_len),
         paged_arena::ARENA_REGISTER => {
-            if arg.is_null() || arg_len < 10 { return -22; }
-            let vpages = u32::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-            ]);
-            let rmax = u32::from_le_bytes([
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
-            ]);
+            if arg.is_null() || arg_len < 10 {
+                return -22;
+            }
+            let vpages = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let rmax = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             let bt = match *arg.add(8) {
                 0 => fluxor::kernel::backing_store::BackingType::None,
                 1 => fluxor::kernel::backing_store::BackingType::RamDisk,
@@ -2318,55 +2496,83 @@ unsafe fn bcm_system_extension_dispatch(_handle: i32, opcode: u32, arg: *mut u8,
             fluxor::kernel::backing_store::backing_register(idx, vpages, rmax, bt, wb)
         }
         paged_arena::ARENA_READ => {
-            if arg.is_null() || arg_len < 14 { return -22; }
+            if arg.is_null() || arg_len < 14 {
+                return -22;
+            }
             let arena_id = *arg as usize;
-            let vpage = u32::from_le_bytes([
-                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
-            ]);
+            let vpage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
             let buf = u64::from_le_bytes([
-                *arg.add(6),  *arg.add(7),  *arg.add(8),  *arg.add(9),
-                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
+                *arg.add(6),
+                *arg.add(7),
+                *arg.add(8),
+                *arg.add(9),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
             ]) as *mut u8;
             fluxor::kernel::backing_store::backing_read(arena_id, vpage, buf)
         }
         paged_arena::ARENA_WRITE => {
-            if arg.is_null() || arg_len < 14 { return -22; }
+            if arg.is_null() || arg_len < 14 {
+                return -22;
+            }
             let arena_id = *arg as usize;
-            let vpage = u32::from_le_bytes([
-                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
-            ]);
+            let vpage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
             let buf = u64::from_le_bytes([
-                *arg.add(6),  *arg.add(7),  *arg.add(8),  *arg.add(9),
-                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
+                *arg.add(6),
+                *arg.add(7),
+                *arg.add(8),
+                *arg.add(9),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
             ]) as *const u8;
             fluxor::kernel::backing_store::backing_write(arena_id, vpage, buf)
         }
         paged_arena::ARENA_FLUSH => {
-            if arg.is_null() || arg_len < 1 { return -22; }
+            if arg.is_null() || arg_len < 1 {
+                return -22;
+            }
             let arena_id = *arg as usize;
             fluxor::kernel::backing_store::backing_flush(arena_id)
         }
         paged_arena::ARENA_BULK => {
-            if arg.is_null() || arg_len < 18 { return -22; }
+            if arg.is_null() || arg_len < 18 {
+                return -22;
+            }
             let arena_id = *arg as usize;
             let op = *arg.add(1);
-            let vpage = u32::from_le_bytes([
-                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
-            ]);
-            let count = u32::from_le_bytes([
-                *arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9),
-            ]);
+            let vpage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
+            let count = u32::from_le_bytes([*arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9)]);
             let buf_u64 = u64::from_le_bytes([
-                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
-                *arg.add(14), *arg.add(15), *arg.add(16), *arg.add(17),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
+                *arg.add(14),
+                *arg.add(15),
+                *arg.add(16),
+                *arg.add(17),
             ]);
             match op {
-                paged_arena::ARENA_BULK_OP_WRITE => fluxor::kernel::backing_store::backing_write_pages(
-                    arena_id, vpage, count, buf_u64 as *const u8,
-                ),
-                paged_arena::ARENA_BULK_OP_READ => fluxor::kernel::backing_store::backing_read_pages(
-                    arena_id, vpage, count, buf_u64 as *mut u8,
-                ),
+                paged_arena::ARENA_BULK_OP_WRITE => {
+                    fluxor::kernel::backing_store::backing_write_pages(
+                        arena_id,
+                        vpage,
+                        count,
+                        buf_u64 as *const u8,
+                    )
+                }
+                paged_arena::ARENA_BULK_OP_READ => {
+                    fluxor::kernel::backing_store::backing_read_pages(
+                        arena_id,
+                        vpage,
+                        count,
+                        buf_u64 as *mut u8,
+                    )
+                }
                 _ => -22,
             }
         }
@@ -2416,7 +2622,10 @@ const RNG200_BASE: usize = 0x10_7d20_8000;
 #[cfg(feature = "board-cm5")]
 const RNG200_CTRL: *mut u32 = RNG200_BASE as *mut u32;
 #[cfg(feature = "board-cm5")]
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 const RNG200_STATUS: *const u32 = (RNG200_BASE + 0x04) as *const u32;
 #[cfg(feature = "board-cm5")]
 const RNG200_DATA: *const u32 = (RNG200_BASE + 0x08) as *const u32;
@@ -2483,7 +2692,9 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
                 let cnt: u64;
                 core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt);
                 state ^= cnt;
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 core::ptr::write_volatile(buf.add(i), (state >> 32) as u8);
                 i += 1;
             }
@@ -2497,8 +2708,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
 /// drain, surface the panic site over network telemetry. file ptr+len point
 /// into 'static rodata (kernel or PIC module — shared address space), so core 0
 /// can reconstruct the `&str`.
-pub static PANIC_CORE: portable_atomic::AtomicU32 =
-    portable_atomic::AtomicU32::new(0xFFFF_FFFF);
+pub static PANIC_CORE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0xFFFF_FFFF);
 pub static PANIC_LINE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 pub static PANIC_FILE_PTR: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static PANIC_FILE_LEN: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
@@ -2540,6 +2750,8 @@ fn panic(info: &PanicInfo<'_>) -> ! {
             uart_raw_puts(b"\r\n--- end ---\r\n");
         }
     }
-    // SAFETY: WFI is a hint; halts the core until next interrupt.
-    loop { unsafe { core::arch::asm!("wfi") }; }
+    loop {
+        // SAFETY: WFI is a hint; halts the core until next interrupt.
+        unsafe { core::arch::asm!("wfi") };
+    }
 }

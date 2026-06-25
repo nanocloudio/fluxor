@@ -903,8 +903,24 @@
     // granularity and the odd GC pause — not a steady drift. ~120ms is
     // ample for that at a low latency. MAX_AHEAD caps the queue so a
     // transient burst can't grow latency without bound.
-    const AUDIO_LOOKAHEAD = 0.12;
+    // Resume cushion after an underrun (seconds). A producer that keeps up
+    // with the audio clock underruns only on isolated scheduling jitter, so
+    // the cushion stays at the low-latency floor. A producer running BELOW
+    // real time (e.g. the wasm N64 LLE core at ~25% of real time on a slow
+    // host) drains the queue faster than it fills and underruns on every
+    // reset; those underruns CLUSTER, and we then deepen the cushion so the
+    // dropouts are FEWER and LONGER — one gap then a continuous stretch —
+    // instead of a rapid stop/start chatter at the frame rate. The production
+    // deficit fixes the total silence either way; this only trades gap
+    // frequency for gap length (much less grating on a starved target) and
+    // costs the healthy real-time case nothing — the cushion relaxes straight
+    // back to the floor once underruns stop clustering.
+    const AUDIO_CUSHION_MIN = 0.12; // low-latency floor (healthy producer)
+    const AUDIO_CUSHION_MAX = 0.35; // deepest cushion under sustained starve
+    const AUDIO_CLUSTER_WINDOW = 0.7; // underruns closer than this = starved
     const AUDIO_MAX_AHEAD = 0.4;
+    let audioCushion = AUDIO_CUSHION_MIN;
+    let audioPrevUnderrunT = -1;
     function ensureAudio(sampleRate) {
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
@@ -950,10 +966,13 @@
       audioPlayLastSurfaced = now;
       const ctxState = audioCtx ? audioCtx.state : 'no-ctx';
       const ctxRate  = audioCtx ? audioCtx.sampleRate : 0;
+      const lead = audioCtx && audioCtx.state === 'running'
+        ? Math.max(0, audioSchedTime - audioCtx.currentTime) : 0;
       onLog(2,
         `[audio] calls=${audioPlayCalls} bytes_played=${audioPlayBytesAccepted}` +
         ` bytes_dropped=${audioPlayBytesDropped} underruns=${audioUnderruns}` +
-        ` peak=${audioPeakAbs} ctx=${ctxState} hw_rate=${ctxRate}`);
+        ` peak=${audioPeakAbs} ctx=${ctxState} hw_rate=${ctxRate}` +
+        ` cushion=${audioCushion.toFixed(2)} lead=${lead.toFixed(2)}`);
       audioPeakAbs = 0;
     }
 
@@ -1006,7 +1025,18 @@
         // the next blocks have a cushion again, instead of butting right
         // up against `now` (which underruns again on the next late block).
         if (audioSchedTime < now + 0.005) {
-          audioSchedTime = now + AUDIO_LOOKAHEAD;
+          // Clustered underruns (closer together than CLUSTER_WINDOW) mean the
+          // producer is below real time → grow the cushion toward its ceiling
+          // so the next gap is longer but rarer. An isolated underrun (a one-off
+          // GC / rAF stall on an otherwise real-time producer) relaxes it back
+          // to the floor, keeping latency low once the producer recovers.
+          if (audioPrevUnderrunT >= 0 && (now - audioPrevUnderrunT) < AUDIO_CLUSTER_WINDOW) {
+            audioCushion = Math.min(AUDIO_CUSHION_MAX, audioCushion * 1.5 + 0.02);
+          } else {
+            audioCushion = AUDIO_CUSHION_MIN;
+          }
+          audioPrevUnderrunT = now;
+          audioSchedTime = now + audioCushion;
           audioUnderruns++;
         } else if (audioSchedTime > now + AUDIO_MAX_AHEAD) {
           // Producer running ahead of real time — let it ride; the queue
@@ -1465,19 +1495,25 @@
         if (gpuInitStatus === GPU_INIT_PENDING) return GPU_INIT_PENDING;
         if (!navigator.gpu) {
           console.error('[webgpu] WebGPU not supported');
+          console.error('[webgpu] isSecureContext:', window.isSecureContext);
+          console.error('[webgpu] protocol:', window.location.protocol);
+          console.error('[webgpu] userAgent:', navigator.userAgent);
           gpuInitStatus = -1;
           return -1;
         }
         gpuInitStatus = GPU_INIT_PENDING;
         (async () => {
         try {
+          console.log('[webgpu] requesting adapter...');
           const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
           if (!adapter) {
             console.error('[webgpu] No adapter found');
             gpuInitStatus = -2;
             return;
           }
+          console.log('[webgpu] adapter found, requesting device...');
           gpuDevice = await adapter.requestDevice();
+          console.log('[webgpu] device acquired');
           gpuDevice.lost.then((info) => {
             console.error('[webgpu] Device lost:', info.message);
             gpuInitialized = false;
@@ -1690,6 +1726,687 @@
       },
     };
 
+    // ── GPU compute/present surface (host_gpgpu_*) ───────────────────
+    //
+    // The WebGPU host driver implementing the backend-agnostic GPU
+    // compute/present capability surface. It runs the FAITHFUL N64 pixel
+    // pipeline as COMPUTE shaders (not the graphics pipeline — that would change
+    // precision and break bit-exactness). The module side (wasm_gpu_vi, see
+    // gpu_vi.rs) speaks only these imports; no GPU types cross the boundary. A
+    // future Vulkan / bare-metal driver implements the same imports unchanged.
+    //
+    // Async model mirrors host_webgpu_init: init kicks off the async device
+    // acquire and returns PENDING; the module polls host_gpgpu_poll_init. Work is
+    // submit-then-signal — dispatch/present never block; guest timing stays
+    // CPU-modeled.
+    //
+    // The compute shaders are host-owned, version-locked assets (bit-significant,
+    // pinned to the software oracle). PIPE_VI_FILTER below is a VERBATIM copy of
+    // the canonical, bit-exactness-gated shader at
+    //   zedex/shaders/n64_vi_filter.wgsl
+    // validated per-pixel against software Rdp::vi_scanout by
+    //   zedex/scripts/n64-vi-gpu-check.py
+    // The two copies MUST stay in sync; the gate runs the canonical copy.
+    let ggDevice = null;
+    let ggCanvas = null, ggCtx = null, ggImage = null;
+    let ggInitStatus = GPU_INIT_NOT_STARTED;
+    let ggViPipeline = null;
+    const ggBuffers = { 0: null, 1: null, 2: null }; // pix, cov, params
+    let ggOut = null, ggOutN = 0, ggRead = null, ggReadBusy = false;
+    const PIPE_VI_FILTER = 1;
+
+    const VI_FILTER_WGSL = `
+// N64 VI scan-out filter + display resample — WebGPU COMPUTE port of the
+// software reference 'Rdp::vi_scanout' (rdp/vi_scanout.rs) and the display
+// linearise/resample 'N64Machine::render_vi_to_screen' (machine.rs). Both are
+// faithful integer pipelines (angrylion 'vi_fetch_filter16'/'restore_filter16'/
+// 'divot_filter', then the VI 2.10 x/y-scale scan-out window). Bit-exact to the
+// software oracles; integer-only, u32 wraps (WGSL-defined), i32<->u32 via bitcast
+// (reinterpret, matching Rust 'as'), top-justified 8-bit channels (5-bit << 3).
+//
+// Two entry points share one per-pixel filter ('vi_filter_px'):
+//   * 'main'       — filter only, at CI resolution (gate vs vi_scanout).
+//   * 'vi_display' — filter + resample to the display surface (gate vs
+//                    render_vi_to_screen); the in-app present path.
+// The divot stage needs the AA/restore-filtered horizontal neighbours; each
+// thread recomputes the filter for its 3 columns — pure compute, no barrier.
+
+struct Params {
+  w: u32,           // 0  colour-image width in pixels
+  h: u32,           // 1  filter height (CI rows the VI filters = SCREEN_HEIGHT)
+  vi_control: u32,  // 2  aa_mode[9:8], divot[4], dither[16], pixel_type[1:0]
+  ci_size: u32,     // 3  colour-image size code (2 = 16bpp)
+  v_res: u32,       // 4  active output rows  (resolved; defaults applied CPU-side)
+  y_off: u32,       // 5  Y_SCALE sub-pixel start (2.10)
+  y_mul: u32,       // 6  Y_SCALE step          (2.10; resolved default 0x400)
+  x_off: u32,       // 7  X_SCALE sub-pixel start (2.10)
+  x_mul: u32,       // 8  X_SCALE step          (2.10; resolved default 0x200)
+  screen_w: u32,    // 9  display surface width  (SCREEN_WIDTH)
+  screen_h: u32,    // 10 display surface height (SCREEN_HEIGHT)
+  origin_px: u32,   // 11 (VI_ORIGIN - base)/2: displayed buffer source-index offset
+};
+
+@group(0) @binding(0) var<uniform> P: Params;
+@group(0) @binding(1) var<storage, read> pix: array<u32>;  // 5551 pixel value per texel
+@group(0) @binding(2) var<storage, read> cov: array<u32>;  // coverage 0..=7 per texel
+@group(0) @binding(3) var<storage, read_write> outp: array<u32>; // r | g<<8 | b<<16
+
+fn px_at(idx: u32) -> u32 { return pix[idx] & 0xffffu; }
+fn cvg_at(idx: u32) -> u32 { return cov[idx]; }
+
+// angrylion RGBA16_R/G/B: top-justified 8-bit (5-bit channel << 3).
+fn work(px: u32) -> vec3<u32> {
+  return vec3<u32>((px >> 8u) & 0xf8u, (px >> 3u) & 0xf8u, (px << 2u) & 0xf8u);
+}
+
+// Penultimate (second) min and max of 'p[0..n]', matching 'video_max_optimized'.
+fn penu(p: ptr<function, array<u32, 7>>, n: u32) -> vec2<u32> {
+  var posmax: u32 = 0u;
+  var posmin: u32 = 0u;
+  var cpmax: u32 = (*p)[0];
+  var cpmin: u32 = (*p)[0];
+  var i: u32 = 1u;
+  loop {
+    if (i >= n) { break; }
+    if ((*p)[i] > (*p)[posmax]) {
+      cpmax = (*p)[posmax];
+      posmax = i;
+    } else if ((*p)[i] < (*p)[posmin]) {
+      cpmin = (*p)[posmin];
+      posmin = i;
+    }
+    i = i + 1u;
+  }
+  if (cpmax != (*p)[posmax]) {
+    var j: u32 = posmax + 1u;
+    loop {
+      if (j >= n) { break; }
+      if ((*p)[j] > cpmax) { cpmax = (*p)[j]; }
+      j = j + 1u;
+    }
+  }
+  if (cpmin != (*p)[posmin]) {
+    var j: u32 = posmin + 1u;
+    loop {
+      if (j >= n) { break; }
+      if ((*p)[j] < cpmin) { cpmin = (*p)[j]; }
+      j = j + 1u;
+    }
+  }
+  return vec2<u32>(cpmin, cpmax);
+}
+
+fn sgn(nv: u32, a: u32) -> i32 {
+  if (nv > a) { return 1; }
+  if (nv < a) { return -1; }
+  return 0;
+}
+
+// video_filter16 per-channel blend toward the penultimate min/max.
+fn aa_chan(c: u32, lo: u32, hi: u32, coeff: u32) -> u32 {
+  let col: u32 = lo + hi - (c << 1u);           // u32 wrap
+  return (((col * coeff + 4u) >> 3u) + c) & 0xffu;
+}
+
+// Stage 1+2: AA / restore-de-dither working value (vr,vg,vb) for pixel (x,y).
+fn aa_restore(x: u32, y: u32) -> vec3<u32> {
+  let w = P.w;
+  let h = P.h;
+  let idx = y * w + x;
+  var col = work(px_at(idx));
+  let cvg = cvg_at(idx);
+  let interior_row = (y >= 1u) && (y + 1u < h);
+  let interior = interior_row && (x >= 2u) && (x + 2u < w);
+  let dither_en = ((P.vi_control >> 16u) & 1u) != 0u;
+
+  if (cvg == 7u) {
+    if (dither_en && interior) {
+      let up = (y - 1u) * w;
+      let dn = (y + 1u) * w;
+      let row = y * w;
+      var taps = array<u32, 8>(
+        up + (x - 1u), up + x, up + (x + 1u),
+        row + (x - 1u), row + (x + 1u),
+        dn + (x - 1u), dn + x, dn + (x + 1u),
+      );
+      var ri: i32 = bitcast<i32>(col.r);
+      var gi: i32 = bitcast<i32>(col.g);
+      var bi: i32 = bitcast<i32>(col.b);
+      let ar = (col.r >> 3u) & 0x1fu;
+      let ag = (col.g >> 3u) & 0x1fu;
+      let ab = (col.b >> 3u) & 0x1fu;
+      var k: u32 = 0u;
+      loop {
+        if (k >= 8u) { break; }
+        let np = px_at(taps[k]);
+        ri = ri + sgn((np >> 11u) & 0x1fu, ar);
+        gi = gi + sgn((np >> 6u) & 0x1fu, ag);
+        bi = bi + sgn((np >> 1u) & 0x1fu, ab);
+        k = k + 1u;
+      }
+      col = vec3<u32>(bitcast<u32>(ri) & 0xffu, bitcast<u32>(gi) & 0xffu, bitcast<u32>(bi) & 0xffu);
+    }
+  } else if (interior) {
+    let up = (y - 1u) * w;
+    let dn = (y + 1u) * w;
+    let row = y * w;
+    var rr = array<u32, 7>(col.r, col.r, col.r, col.r, col.r, col.r, col.r);
+    var gg = array<u32, 7>(col.g, col.g, col.g, col.g, col.g, col.g, col.g);
+    var bb = array<u32, 7>(col.b, col.b, col.b, col.b, col.b, col.b, col.b);
+    var tidx = array<u32, 6>(
+      up + (x - 1u), up + (x + 1u),
+      row + (x - 2u), row + (x + 2u),
+      dn + (x - 1u), dn + (x + 1u),
+    );
+    var n: u32 = 1u;
+    var k: u32 = 0u;
+    loop {
+      if (k >= 6u) { break; }
+      let nidx = tidx[k];
+      if (cvg_at(nidx) == 7u) {
+        let nc = work(px_at(nidx));
+        rr[n] = nc.r;
+        gg[n] = nc.g;
+        bb[n] = nc.b;
+        n = n + 1u;
+      }
+      k = k + 1u;
+    }
+    let coeff = 7u - cvg;
+    let rlohi = penu(&rr, n);
+    let glohi = penu(&gg, n);
+    let blohi = penu(&bb, n);
+    col = vec3<u32>(
+      aa_chan(col.r, rlohi.x, rlohi.y, coeff),
+      aa_chan(col.g, glohi.x, glohi.y, coeff),
+      aa_chan(col.b, blohi.x, blohi.y, coeff),
+    );
+  }
+  return col;
+}
+
+fn med(l: u32, c: u32, r: u32) -> u32 {
+  if ((l >= c && r >= l) || (l >= r && c >= l)) { return l; }
+  if ((r >= c && l >= r) || (r >= l && c >= r)) { return r; }
+  return c;
+}
+
+// Full per-pixel VI filter (Stage 1+2 AA/restore + Stage 3 divot), with the
+// global early-outs (non-16bpp / width-range / identity aa_mode 2/3 -> the
+// top-justified passthrough). Pure function of (CI, coverage) at (x,y).
+fn vi_filter_px(x: u32, y: u32) -> vec3<u32> {
+  let aa_mode = (P.vi_control >> 8u) & 3u;
+  if (P.ci_size != 2u || P.w < 5u || P.w > 1024u || aa_mode >= 2u) {
+    return work(px_at(y * P.w + x));
+  }
+  var c = aa_restore(x, y);
+  let divot_en = ((P.vi_control >> 4u) & 1u) != 0u;
+  if (divot_en && x >= 1u && x + 1u < P.w) {
+    let idx = y * P.w + x;
+    let ca = cvg_at(idx);
+    let la = cvg_at(idx - 1u);
+    let ra = cvg_at(idx + 1u);
+    if (!(ca == 7u && la == 7u && ra == 7u)) {
+      let l = aa_restore(x - 1u, y);
+      let r = aa_restore(x + 1u, y);
+      c = vec3<u32>(med(l.r, c.r, r.r), med(l.g, c.g, r.g), med(l.b, c.b, r.b));
+    }
+  }
+  return c;
+}
+
+// Filter only, at CI resolution. Gate: == software Rdp::vi_scanout.
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= P.w * P.h) { return; }
+  let c = vi_filter_px(i % P.w, i / P.w);
+  outp[i] = c.r | (c.g << 8u) | (c.b << 16u);
+}
+
+// Filter + display resample. Gate: == software render_vi_to_screen for the
+// RGBA5551 (filtered) path. Per output pixel: map to the source colour image via
+// the VI 2.10 x/y-scale + active window, then filter at that source location.
+// (8888 framebuffers are left to the software path — the module falls back.)
+@compute @workgroup_size(64)
+fn vi_display(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let sw = P.screen_w;
+  let sh = P.screen_h;
+  if (i >= sw * sh) { return; }
+  let xo = i % sw;
+  let yo = i / sw;
+  // src_y = (y_off + yo*y_mul) >> 10, signed (matches the i32 arithmetic).
+  let src_y_s: i32 = (bitcast<i32>(P.y_off) + bitcast<i32>(yo) * bitcast<i32>(P.y_mul)) >> 10u;
+  if (bitcast<i32>(yo) >= bitcast<i32>(P.v_res) || src_y_s < 0 || src_y_s >= bitcast<i32>(P.h)) {
+    outp[i] = 0u; // VI blanking -> black
+    return;
+  }
+  let pixel_type = P.vi_control & 3u;
+  if (pixel_type != 2u) { outp[i] = 0u; return; } // GPU path is RGBA5551 only
+  let src_y = u32(src_y_s);
+  var src_x = (P.x_off + xo * 2u * P.x_mul) >> 10u;
+  if (src_x > P.w - 1u) { src_x = P.w - 1u; }
+  // VI_ORIGIN points into the buffer (base-relative); add its pixel offset to the
+  // source index, exactly as render_vi_to_screen reads display_pixel(origin+idx*2).
+  let base_idx = P.origin_px + src_y * P.w + src_x;
+  let sy = base_idx / P.w;
+  if (sy >= P.h) { outp[i] = 0u; return; }
+  let c = vi_filter_px(base_idx % P.w, sy);
+  outp[i] = c.r | (c.g << 8u) | (c.b << 16u);
+}
+`;
+
+    // WebGL2 FALLBACK backend (browsers without WebGPU). WebGL2 has no compute,
+    // so the same faithful integer VI filter+resample runs as a fullscreen-quad
+    // FRAGMENT shader (shaders/n64_vi_filter.frag) — bit-exact to the WGSL/software
+    // reference (validated by scripts/n64-vi-webgl-check.py). A SECOND host-driver
+    // behind the identical host_gpgpu_* surface; the module is unchanged.
+    let ggBackend = null;            // 'webgpu' | 'webgl2'
+    let ggGl = null, ggGlProg = null, ggGlCanvas = null, ggGlVao = null;
+    let ggGlTexPix = null, ggGlTexCov = null;
+    const ggGlU = {};
+    let ggGlPix = null, ggGlCov = null, ggGlParams = null; // staged uploads
+    const VI_FILTER_VERT = `#version 300 es
+void main(){ vec2 v[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); gl_Position=vec4(v[gl_VertexID],0.,1.); }`;
+    const VI_FILTER_FRAG = `#version 300 es
+// N64 VI scan-out filter + display resample — WebGL2 FALLBACK port of the WebGPU
+// compute shader (shaders/n64_vi_filter.wgsl), for browsers without WebGPU. Same
+// faithful integer pipeline as the software oracles (Rdp::vi_scanout +
+// N64Machine::render_vi_to_screen). WebGL2 has no compute, so the filter runs as
+// a fullscreen-quad FRAGMENT shader: one fragment = one output pixel, sampling the
+// colour image / coverage as integer textures.
+//
+// FAITHFULNESS: integer-only. GLSL ES 3.00 'highp uint' ops wrap mod 2^32 (== WGSL
+// u32); int<->uint conversions are bit-preserving for the in-range values used
+// here, and the restore accumulator wraps via 'ri & 0xff' (a non-negative mask)
+// rather than uint(negative). Bit-exact to the WGSL/software reference; only the
+// final float->unorm8 canvas write is non-integer (the non-bit-significant blit).
+
+precision highp int;
+precision highp float;
+precision highp usampler2D;
+
+uniform uint uW;          // colour-image width
+uniform uint uH;          // filter height (CI rows = SCREEN_HEIGHT)
+uniform uint uViControl;  // aa_mode[9:8], divot[4], dither[16], pixel_type[1:0]
+uniform uint uCiSize;     // 2 = 16bpp
+uniform uint uVRes;       // active output rows (resolved)
+uniform uint uYOff;       // Y_SCALE 2.10 (resolved)
+uniform uint uYMul;
+uniform uint uXOff;       // X_SCALE 2.10 (resolved)
+uniform uint uXMul;
+uniform uint uScreenW;
+uniform uint uScreenH;
+uniform uint uOriginPx;   // (VI_ORIGIN - base)/2: displayed buffer source-index offset
+uniform usampler2D uPix;  // R16UI: 5551 pixel value per texel
+uniform usampler2D uCov;  // R8UI:  coverage 0..=7 per texel
+
+out vec4 fragColor;
+
+uint pxAt(uint idx) {
+  return texelFetch(uPix, ivec2(int(idx % uW), int(idx / uW)), 0).r & 0xffffu;
+}
+uint cvgAt(uint idx) {
+  return texelFetch(uCov, ivec2(int(idx % uW), int(idx / uW)), 0).r;
+}
+
+uvec3 work(uint px) {
+  return uvec3((px >> 8u) & 0xf8u, (px >> 3u) & 0xf8u, (px << 2u) & 0xf8u);
+}
+
+// Penultimate (second) min and max of p[0..n], matching video_max_optimized.
+uvec2 penu(uint p[7], uint n) {
+  uint posmax = 0u, posmin = 0u;
+  uint cpmax = p[0], cpmin = p[0];
+  for (uint i = 1u; i < n; i++) {
+    if (p[i] > p[posmax]) { cpmax = p[posmax]; posmax = i; }
+    else if (p[i] < p[posmin]) { cpmin = p[posmin]; posmin = i; }
+  }
+  if (cpmax != p[posmax]) {
+    for (uint j = posmax + 1u; j < n; j++) { if (p[j] > cpmax) cpmax = p[j]; }
+  }
+  if (cpmin != p[posmin]) {
+    for (uint j = posmin + 1u; j < n; j++) { if (p[j] < cpmin) cpmin = p[j]; }
+  }
+  return uvec2(cpmin, cpmax);
+}
+
+int sgn(uint nv, uint a) {
+  if (nv > a) return 1;
+  if (nv < a) return -1;
+  return 0;
+}
+
+uint aaChan(uint c, uint lo, uint hi, uint coeff) {
+  uint col = lo + hi - (c << 1u);
+  return (((col * coeff + 4u) >> 3u) + c) & 0xffu;
+}
+
+// Stage 1+2: AA / restore-de-dither working value for pixel (x,y).
+uvec3 aaRestore(uint x, uint y) {
+  uint w = uW, h = uH;
+  uint idx = y * w + x;
+  uvec3 col = work(pxAt(idx));
+  uint cvg = cvgAt(idx);
+  bool interiorRow = (y >= 1u) && (y + 1u < h);
+  bool interior = interiorRow && (x >= 2u) && (x + 2u < w);
+  bool ditherEn = ((uViControl >> 16u) & 1u) != 0u;
+
+  if (cvg == 7u) {
+    if (ditherEn && interior) {
+      uint up = (y - 1u) * w, dn = (y + 1u) * w, row = y * w;
+      uint taps[8] = uint[8](
+        up + (x - 1u), up + x, up + (x + 1u),
+        row + (x - 1u), row + (x + 1u),
+        dn + (x - 1u), dn + x, dn + (x + 1u));
+      int ri = int(col.r), gi = int(col.g), bi = int(col.b);
+      uint ar = (col.r >> 3u) & 0x1fu, ag = (col.g >> 3u) & 0x1fu, ab = (col.b >> 3u) & 0x1fu;
+      for (uint k = 0u; k < 8u; k++) {
+        uint np = pxAt(taps[k]);
+        ri += sgn((np >> 11u) & 0x1fu, ar);
+        gi += sgn((np >> 6u) & 0x1fu, ag);
+        bi += sgn((np >> 1u) & 0x1fu, ab);
+      }
+      // (uint8_t) wrap via a non-negative mask (avoids uint(negative)).
+      col = uvec3(uint(ri & 0xff), uint(gi & 0xff), uint(bi & 0xff));
+    }
+  } else if (interior) {
+    uint up = (y - 1u) * w, dn = (y + 1u) * w, row = y * w;
+    uint rr[7] = uint[7](col.r, col.r, col.r, col.r, col.r, col.r, col.r);
+    uint gg[7] = uint[7](col.g, col.g, col.g, col.g, col.g, col.g, col.g);
+    uint bb[7] = uint[7](col.b, col.b, col.b, col.b, col.b, col.b, col.b);
+    uint tidx[6] = uint[6](
+      up + (x - 1u), up + (x + 1u),
+      row + (x - 2u), row + (x + 2u),
+      dn + (x - 1u), dn + (x + 1u));
+    uint n = 1u;
+    for (uint k = 0u; k < 6u; k++) {
+      uint nidx = tidx[k];
+      if (cvgAt(nidx) == 7u) {
+        uvec3 nc = work(pxAt(nidx));
+        rr[n] = nc.r; gg[n] = nc.g; bb[n] = nc.b;
+        n++;
+      }
+    }
+    uint coeff = 7u - cvg;
+    uvec2 rlohi = penu(rr, n);
+    uvec2 glohi = penu(gg, n);
+    uvec2 blohi = penu(bb, n);
+    col = uvec3(
+      aaChan(col.r, rlohi.x, rlohi.y, coeff),
+      aaChan(col.g, glohi.x, glohi.y, coeff),
+      aaChan(col.b, blohi.x, blohi.y, coeff));
+  }
+  return col;
+}
+
+uint med(uint l, uint c, uint r) {
+  if ((l >= c && r >= l) || (l >= r && c >= l)) return l;
+  if ((r >= c && l >= r) || (r >= l && c >= r)) return r;
+  return c;
+}
+
+uvec3 viFilterPx(uint x, uint y) {
+  uint aaMode = (uViControl >> 8u) & 3u;
+  if (uCiSize != 2u || uW < 5u || uW > 1024u || aaMode >= 2u) {
+    return work(pxAt(y * uW + x));
+  }
+  uvec3 c = aaRestore(x, y);
+  bool divotEn = ((uViControl >> 4u) & 1u) != 0u;
+  if (divotEn && x >= 1u && x + 1u < uW) {
+    uint idx = y * uW + x;
+    uint ca = cvgAt(idx), la = cvgAt(idx - 1u), ra = cvgAt(idx + 1u);
+    if (!(ca == 7u && la == 7u && ra == 7u)) {
+      uvec3 l = aaRestore(x - 1u, y);
+      uvec3 r = aaRestore(x + 1u, y);
+      c = uvec3(med(l.r, c.r, r.r), med(l.g, c.g, r.g), med(l.b, c.b, r.b));
+    }
+  }
+  return c;
+}
+
+void main() {
+  // Output pixel (top-left origin). gl_FragCoord.y is bottom-left, so flip to put
+  // N64 row 0 at the top of the canvas.
+  uint xo = uint(int(gl_FragCoord.x));
+  uint yo = uScreenH - 1u - uint(int(gl_FragCoord.y));
+
+  int srcYs = (int(uYOff) + int(yo) * int(uYMul)) >> 10;
+  if (int(yo) >= int(uVRes) || srcYs < 0 || srcYs >= int(uH)) {
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+  if ((uViControl & 3u) != 2u) { // RGBA5551 only
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+  uint srcY = uint(srcYs);
+  uint srcX = (uXOff + xo * 2u * uXMul) >> 10u;
+  if (srcX > uW - 1u) srcX = uW - 1u;
+  // VI_ORIGIN points into the buffer; add its pixel offset to the source index.
+  uint baseIdx = uOriginPx + srcY * uW + srcX;
+  uint sy = baseIdx / uW;
+  if (sy >= uH) { fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  uvec3 c = viFilterPx(baseIdx % uW, sy);
+  fragColor = vec4(float(c.r) / 255.0, float(c.g) / 255.0, float(c.b) / 255.0, 1.0);
+}
+`;
+
+    function ggGlInit() {
+      ggGlCanvas = document.createElement('canvas');
+      ggGlCanvas.style.maxWidth = '100%';
+      ggGlCanvas.style.height = 'auto';
+      ggGlCanvas.style.imageRendering = 'pixelated';
+      if (canvasContainer) canvasContainer.replaceChildren(ggGlCanvas);
+      else document.body.appendChild(ggGlCanvas);
+      const gl = ggGlCanvas.getContext('webgl2', { preserveDrawingBuffer: true });
+      if (!gl) return false;
+      const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o);
+        if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error('shader: ' + gl.getShaderInfoLog(o)); return o; };
+      const prog = gl.createProgram();
+      gl.attachShader(prog, sh(gl.VERTEX_SHADER, VI_FILTER_VERT));
+      gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, VI_FILTER_FRAG));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('link: ' + gl.getProgramInfoLog(prog));
+      gl.useProgram(prog);
+      ['uW','uH','uViControl','uCiSize','uVRes','uYOff','uYMul','uXOff','uXMul','uScreenW','uScreenH','uOriginPx','uPix','uCov']
+        .forEach(n => ggGlU[n] = gl.getUniformLocation(prog, n));
+      ggGlVao = gl.createVertexArray(); gl.bindVertexArray(ggGlVao);
+      ggGlTexPix = gl.createTexture(); ggGlTexCov = gl.createTexture();
+      gl.uniform1i(ggGlU.uPix, 0); gl.uniform1i(ggGlU.uCov, 1);
+      ggGl = gl; ggGlProg = prog;
+      return true;
+    }
+
+    function ggGlRender() {
+      if (!ggGl || !ggGlParams || !ggGlPix || !ggGlCov) return;
+      const gl = ggGl, p = ggGlParams, w = p[0], h = p[1], sw = p[9], sh = p[10];
+      ggGlCanvas.width = sw; ggGlCanvas.height = sh; gl.viewport(0, 0, sw, sh);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ggGlTexPix);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, w, h, 0, gl.RED_INTEGER, gl.UNSIGNED_SHORT, ggGlPix);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ggGlTexCov);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, w, h, 0, gl.RED_INTEGER, gl.UNSIGNED_BYTE, ggGlCov);
+      gl.uniform1ui(ggGlU.uW, p[0]); gl.uniform1ui(ggGlU.uH, p[1]); gl.uniform1ui(ggGlU.uViControl, p[2]);
+      gl.uniform1ui(ggGlU.uCiSize, p[3]); gl.uniform1ui(ggGlU.uVRes, p[4]); gl.uniform1ui(ggGlU.uYOff, p[5]);
+      gl.uniform1ui(ggGlU.uYMul, p[6]); gl.uniform1ui(ggGlU.uXOff, p[7]); gl.uniform1ui(ggGlU.uXMul, p[8]);
+      gl.uniform1ui(ggGlU.uScreenW, sw); gl.uniform1ui(ggGlU.uScreenH, sh); gl.uniform1ui(ggGlU.uOriginPx, p[11]);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    function ggEnsureCanvas(w, h) {
+      if (ggCanvas && ggCanvas.width === w && ggCanvas.height === h) return;
+      ggCanvas = document.createElement('canvas');
+      ggCanvas.width = w; ggCanvas.height = h;
+      ggCanvas.style.maxWidth = '100%';
+      ggCanvas.style.height = 'auto';
+      ggCanvas.style.imageRendering = 'pixelated';
+      if (canvasContainer) canvasContainer.replaceChildren(ggCanvas);
+      else document.body.appendChild(ggCanvas);
+      ggCtx = ggCanvas.getContext('2d');
+      ggImage = ggCtx.createImageData(w, h);
+    }
+
+    const gpgpuShim = {
+      // Kick off async device acquire; returns PENDING. Module polls poll_init.
+      host_gpgpu_init: () => {
+        if (ggBackend) return GPU_INIT_READY;
+        if (ggInitStatus === GPU_INIT_PENDING) return GPU_INIT_PENDING;
+        const tryWebgl2 = () => {
+          try {
+            if (ggGlInit()) { ggBackend = 'webgl2'; ggInitStatus = GPU_INIT_READY; console.log('[gpgpu] ready (WebGL2 fallback)'); return true; }
+          } catch (e) { console.error('[gpgpu] webgl2 init failed:', e.message); }
+          return false;
+        };
+        // `?gpu=webgl2` (or window.__FORCE_GPU_BACKEND) forces the WebGL2 path so
+        // it can be exercised on a WebGPU-capable browser (Safari has no WebGPU).
+        let forceGl = false;
+        try { forceGl = (new URLSearchParams(location.search).get('gpu') === 'webgl2') || window.__FORCE_GPU_BACKEND === 'webgl2'; } catch (e) {}
+        console.log('[gpgpu] init called: navigator.gpu=' + (!!navigator.gpu) + ' forceGl=' + forceGl);
+        if (!navigator.gpu || forceGl) {
+          // No WebGPU (or forced) — try the WebGL2 fallback (synchronous).
+          if (tryWebgl2()) return GPU_INIT_READY;
+          ggInitStatus = -1; return -1;
+        }
+        ggInitStatus = GPU_INIT_PENDING;
+        (async () => {
+          try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) throw new Error('no adapter');
+            ggDevice = await adapter.requestDevice();
+            ggDevice.lost.then((info) => { console.error('[gpgpu] device lost:', info.message); ggDevice = null; ggBackend = null; ggInitStatus = GPU_INIT_NOT_STARTED; });
+            const mod = ggDevice.createShaderModule({ code: VI_FILTER_WGSL });
+            // The in-app VI path is filter + display resample in one pass.
+            ggViPipeline = ggDevice.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'vi_display' } });
+            ggBackend = 'webgpu';
+            ggInitStatus = GPU_INIT_READY;
+            console.log('[gpgpu] ready (VI display compute pipeline)');
+          } catch (e) {
+            // WebGPU unavailable/failed — fall back to the WebGL2 driver.
+            console.warn('[gpgpu] WebGPU unavailable (' + e.message + '), trying WebGL2');
+            if (!tryWebgl2()) ggInitStatus = -3;
+          }
+        })();
+        return GPU_INIT_PENDING;
+      },
+      host_gpgpu_poll_init: () => ggInitStatus,
+
+      // Upload/refresh an input buffer slot (0=pix, 1=cov, 2=params). pix/cov
+      // arrive as packed planes (u16 / u8); we expand to u32 storage arrays the
+      // shader indexes — the integer values are identical, so bit-exactness holds.
+      host_gpgpu_buffer_update: (slot, ptr, len) => {
+        const raw = kview(ptr, len);
+        if (ggBackend === 'webgl2') {
+          // Stage the planes for ggGlRender (uploaded as integer textures there).
+          if (slot === 2) {
+            ggGlParams = new Uint32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + len));
+          } else if (slot === 0) {
+            // pix: RDRAM 5551 big-endian (hi,lo) -> value, into a R16UI texture.
+            const np = len >> 1;
+            const a = new Uint16Array(np);
+            for (let i = 0; i < np; i++) a[i] = (raw[2 * i] << 8) | raw[2 * i + 1];
+            ggGlPix = a;
+          } else {
+            ggGlCov = new Uint8Array(raw.subarray(0, len)); // copy out of wasm mem
+          }
+          return 0;
+        }
+        if (!ggDevice) return -1;
+        let arr;
+        if (slot === 2) {
+          arr = new Uint32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + len));
+          // params (12 u32): [w,h,vi_control,ci_size, v_res,y_off,y_mul,x_off,
+          // x_mul, screen_w,screen_h, _pad]. The vi_display pass outputs
+          // screen_w*screen_h; size the output buffer here so it exists before
+          // dispatch (which runs before present). Fall back to w*h for a
+          // filter-only (16-byte) params block.
+          const n = (arr.length >= 11) ? ((arr[9] | 0) * (arr[10] | 0)) : ((arr[0] | 0) * (arr[1] | 0));
+          if (n > 0 && ggOutN !== n) {
+            if (ggOut) ggOut.destroy();
+            if (ggRead) ggRead.destroy();
+            ggOut = ggDevice.createBuffer({ size: n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+            ggRead = ggDevice.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+            ggOutN = n;
+          }
+        } else if (slot === 0) {
+          // pix plane = the RDRAM 5551 colour image, big-endian per pixel
+          // (hi,lo) — decode to the pixel value the shader indexes.
+          const np = len >> 1;
+          arr = new Uint32Array(np);
+          for (let i = 0; i < np; i++) arr[i] = (raw[2 * i] << 8) | raw[2 * i + 1];
+        } else {
+          arr = Uint32Array.from(raw); // cov bytes -> u32
+        }
+        const want = arr.byteLength;
+        let b = ggBuffers[slot];
+        if (!b || b.size < want) {
+          if (b) b.destroy();
+          const usage = (slot === 2 ? GPUBufferUsage.UNIFORM : GPUBufferUsage.STORAGE) | GPUBufferUsage.COPY_DST;
+          b = ggDevice.createBuffer({ size: Math.max(want, 16), usage });
+          ggBuffers[slot] = b;
+        }
+        ggDevice.queue.writeBuffer(b, 0, arr);
+        return 0;
+      },
+
+      // Record + submit a compute pass. Returns immediately (submit-then-signal).
+      // ggOut is sized by the first present(); the first frame's dispatch (before
+      // any present) is skipped here and recovers on the next frame.
+      host_gpgpu_dispatch: (pipe, gx, gy, gz) => {
+        if (pipe !== PIPE_VI_FILTER) return -1;
+        if (ggBackend === 'webgl2') { ggGlRender(); return 0; } // renders to canvas
+        if (!ggDevice) return -1;
+        if (!ggBuffers[0] || !ggBuffers[1] || !ggBuffers[2] || !ggOut) return -1;
+        const bg = ggDevice.createBindGroup({ layout: ggViPipeline.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: ggBuffers[2] } },
+          { binding: 1, resource: { buffer: ggBuffers[0] } },
+          { binding: 2, resource: { buffer: ggBuffers[1] } },
+          { binding: 3, resource: { buffer: ggOut } },
+        ]});
+        const enc = ggDevice.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(ggViPipeline); pass.setBindGroup(0, bg);
+        pass.dispatchWorkgroups(gx, gy, gz); pass.end();
+        ggDevice.queue.submit([enc.finish()]);
+        return 0;
+      },
+
+      // Blit the compute output (r|g<<8|b<<16 per pixel) to the canvas. Async
+      // readback present for the pilot (the blit is not bit-significant); a
+      // production driver would sample the output buffer as a texture instead.
+      host_gpgpu_present: (w, h) => {
+        if (ggBackend === 'webgl2') return 0; // ggGlRender already drew to the canvas
+        if (!ggDevice || !ggOut) return -1;
+        const n = w * h;
+        if (ggOutN !== n) return -1; // params/present size mismatch
+        if (ggReadBusy) return 0; // drop frame while a readback is in flight
+        ggReadBusy = true;
+        const enc = ggDevice.createCommandEncoder();
+        enc.copyBufferToBuffer(ggOut, 0, ggRead, 0, n * 4);
+        ggDevice.queue.submit([enc.finish()]);
+        ggRead.mapAsync(GPUMapMode.READ).then(() => {
+          const got = new Uint32Array(ggRead.getMappedRange());
+          ggEnsureCanvas(w, h);
+          const dst = ggImage.data;
+          for (let i = 0; i < n; i++) {
+            const v = got[i]; const o = i * 4;
+            dst[o] = v & 0xff; dst[o + 1] = (v >> 8) & 0xff; dst[o + 2] = (v >> 16) & 0xff; dst[o + 3] = 255;
+          }
+          ggCtx.putImageData(ggImage, 0, 0);
+          ggRead.unmap();
+          ggReadBusy = false;
+        }).catch((e) => { console.error('[gpgpu] present readback:', e.message); ggReadBusy = false; });
+        return 0;
+      },
+
+      host_gpgpu_poll_done: () => (ggBackend === 'webgl2' ? 0 : (ggReadBusy ? 1 : 0)),
+    };
+
     return {
       env: Object.assign(
         {},
@@ -1710,7 +2427,8 @@
         terminalShim,
         imageShim,
         moduleShim,
-        webgpuShim
+        webgpuShim,
+        gpgpuShim
       ),
     };
   }

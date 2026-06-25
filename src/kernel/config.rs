@@ -503,8 +503,7 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 ///              size requested from `channel_open_for_module`.
 pub const GRAPH_EDGE_SIZE: usize = 8;
 /// Per-domain metadata entry, bytes: `tick_us:u16 | exec_mode:u8 |
-/// adaptive_flags:u8` = 4. The formerly-reserved byte 3 now carries
-/// `adaptive_flags` (RFC adaptive_tick §8) — a behaviour-only change, no growth.
+/// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags` (RFC adaptive_tick §8).
 /// `tick_min_us`/`tick_max_us` are deliberately NOT in this (checksummed) entry:
 /// they ride in the POST-BODY adaptive section past `total_size` (see
 /// `ADAPTIVE_POST_SIZE`), because growing the checksummed `body_size` hangs the
@@ -519,6 +518,18 @@ pub const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// bytes past it are harmless (both rig-proven). See the read site in
 /// `read_config_from_slice`.
 pub const ADAPTIVE_POST_SIZE: usize = 16;
+
+/// Resident-pod config-section magic: "FXPD". The section is appended PAST the
+/// checksummed body, right after the adaptive post-body tail (at
+/// `total_size + ADAPTIVE_POST_SIZE`), carrying one or more `AddSubgraph` (FLXA)
+/// blobs the kernel admits at boot via `scheduler::live::apply_add` (RFC
+/// adaptive_tick_extra §7). Layout: `[FXPD u32 LE][pod_count u16 LE]` then per
+/// pod `[blob_len u32 LE][FLXA blob]`. Mirrors `tools add_subgraph::POD_SECTION_MAGIC`.
+/// Same additive discipline as the adaptive tail — no format-version bump.
+pub const POD_SECTION_MAGIC: u32 = 0x4658_5044;
+/// Largest resident-pod section the kernel will map, in bytes (bounds a torn or
+/// hostile tail). Sized for a handful of pods with small param blobs.
+pub const MAX_POD_SECTION_BYTES: usize = 8 * 1024;
 /// Valid per-domain tick range (µs); mirrors the tools `validate_adaptive_tick`
 /// range gate. A post-body value outside this falls back to the domain tick.
 const TICK_BOUND_MIN: u16 = 100;
@@ -724,9 +735,8 @@ pub struct Config {
     pub domain_tick_us: [u16; 4],
     /// Per-domain execution mode: 0=cooperative, 1=high_rate/Tier1a, 3=poll/Tier3.
     pub domain_exec_mode: [u8; 4],
-    /// Per-domain adaptive-tick enable flags (RFC adaptive_tick §8). Lives in
-    /// the per-domain metadata's formerly-reserved byte 3, so an old config
-    /// (byte 3 == 0) is `adaptive off` → byte-identical behaviour.
+    /// Per-domain adaptive-tick enable flags (RFC adaptive_tick §8), in byte 3 of
+    /// the per-domain metadata entry. `0` = adaptive off.
     ///   bit 0: enable mechanism (a) demand-driven idle.
     ///   bit 1: enable mechanism (b) adaptive cadence.
     /// bits 2-7: reserved (must be 0).
@@ -750,6 +760,15 @@ pub struct Config {
     ///
     /// See `.context/rfc_deployment_scenarios.md` §13 for the design rationale.
     pub graph_flags: u8,
+    /// Resident-pod section (RFC adaptive_tick_extra §7): pointer into the config
+    /// blob at the `[FXPD][count]…` post-body section, or null if absent. The
+    /// boot path (`scheduler::admit_resident_pods_from_config`) walks it and
+    /// admits each pod via `apply_add`. Points into the persistent config image
+    /// (same lifetime contract as `ModuleEntry::params_ptr`). Null/0 on a
+    /// single-graph config ⇒ byte-identical boot.
+    pub resident_pod_section: *const u8,
+    /// Length in bytes of the resident-pod section (0 if absent).
+    pub resident_pod_section_len: usize,
 }
 
 /// `graph_flags` bit 0: accept cycles in the dataflow graph. The
@@ -783,6 +802,8 @@ impl Config {
             domain_tick_min_us: [0; 4],
             domain_tick_max_us: [0; 4],
             graph_flags: 0,
+            resident_pod_section: core::ptr::null(),
+            resident_pod_section_len: 0,
         }
     }
 }
@@ -1156,7 +1177,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             let dtick = read_u16(base);
             config.domain_tick_us[d] = dtick;
             config.domain_exec_mode[d] = *base.add(2);
-            // adaptive_flags reuses the formerly-reserved byte 3 (no wire growth).
+            // adaptive_flags is byte 3 of the domain meta entry.
             config.domain_adaptive_flags[d] = *base.add(3);
             // Default tick_min/tick_max to the domain's effective tick; the
             // post-body adaptive section (read below, after the hw section)
@@ -1222,6 +1243,53 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
                 } else {
                     config.domain_tick_min_us[d] = eff;
                     config.domain_tick_max_us[d] = eff;
+                }
+            }
+        }
+    }
+
+    // Resident-pod section (RFC adaptive_tick_extra §7), right after the 16-byte
+    // adaptive post-body, also PAST the checksummed body. `[FXPD u32 LE][count
+    // u16 LE]` then per pod `[blob_len u32 LE][FLXA blob]`. Record only its
+    // pointer+length here (the boot path walks it); validate the framing fits the
+    // mapped blob and the bound so a torn/hostile tail can't escape. Absent or
+    // bad magic ⇒ no pods (single-graph boot, byte-identical).
+    // Header: `[FXPD u32][section_len u32][crc16 u16][count u16]` then pods. The
+    // section rides past the body CRC, so it carries its OWN length + CRC over the
+    // payload (`count` + pods). Validate the WHOLE section here — bounds AND CRC —
+    // before recording it: pods are executable configuration (domains, wiring,
+    // params), so a corrupt or truncated section must admit ZERO pods, never a
+    // partial/garbled prefix. Absent/bad-magic ⇒ no pods (byte-identical boot).
+    let pod_off = post_off + ADAPTIVE_POST_SIZE;
+    if pod_off + 12 <= blob_len {
+        // SAFETY: `pod_off + 12 <= blob_len` checked; reads 4+4+2 bytes in range.
+        let magic = unsafe { read_u32(flash_ptr.add(pod_off)) };
+        if magic == POD_SECTION_MAGIC {
+            // SAFETY: header fields within the 12 bytes checked above.
+            let section_len = unsafe { read_u32(flash_ptr.add(pod_off + 4)) } as usize;
+            // SAFETY: crc at offset 8, within the 12 header bytes checked above.
+            let stored_crc = unsafe { read_u16(flash_ptr.add(pod_off + 8)) };
+            if section_len < 12
+                || section_len > MAX_POD_SECTION_BYTES
+                || pod_off + section_len > blob_len
+            {
+                log::error!(
+                    "[config] resident-pod section length {section_len} out of range \
+                     (cap {MAX_POD_SECTION_BYTES}, blob_len {blob_len}); ignoring pods"
+                );
+            } else {
+                // CRC over the payload = section[10..section_len] (count + pods).
+                // SAFETY: `pod_off + section_len <= blob_len`, so this range is
+                // within the mapped blob; `section_len >= 12 > 10`.
+                let payload = unsafe {
+                    core::slice::from_raw_parts(flash_ptr.add(pod_off + 10), section_len - 10)
+                };
+                if crc16_ccitt(payload) == stored_crc {
+                    // SAFETY: `pod_off < blob_len`; pointer into the mapped blob.
+                    config.resident_pod_section = unsafe { flash_ptr.add(pod_off) };
+                    config.resident_pod_section_len = section_len;
+                } else {
+                    log::error!("[config] resident-pod section CRC mismatch; ignoring pods");
                 }
             }
         }

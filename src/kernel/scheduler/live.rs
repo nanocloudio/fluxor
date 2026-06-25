@@ -332,6 +332,10 @@ pub fn apply_add(
 
     // 8. Activate.
     sched().owners.set_state(handle, OwnerState::Active);
+    // Refresh the multi-graph runner's bounded resident-graph index so the new
+    // owner is multiplexed (and its §7 pacer instance gets primed) on the next
+    // pass. Bounded one-shot, off the hot path.
+    super::rebuild_resident_graph_index();
     Ok(handle)
 }
 
@@ -573,6 +577,10 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
 
     // 5. Revoke the handle. The generation guard now rejects it.
     sched().owners.free(handle);
+    // Drop the freed owner from the resident-graph index. A later slot reuse
+    // bumps the generation, so its §7 pacer instance resets (§7.1) and the
+    // re-added entry is re-primed.
+    super::rebuild_resident_graph_index();
     Ok(())
 }
 

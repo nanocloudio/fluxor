@@ -89,6 +89,9 @@ mod audio;
 #[path = "wasm/gpu.rs"]
 mod gpu;
 
+#[path = "wasm/gpu_vi.rs"]
+mod gpu_vi;
+
 #[path = "wasm/websocket.rs"]
 mod websocket;
 
@@ -357,6 +360,7 @@ const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
 const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 = fnv1a32(b"wasm_browser_touch_gamepad_overlay");
 const WASM_BROWSER_GPU_HASH: u32 = fnv1a32(b"wasm_browser_gpu");
+const WASM_GPU_VI_HASH: u32 = fnv1a32(b"wasm_gpu_vi");
 // MIDI built-ins — STUB. See `wasm/midi.rs` for the unimplemented
 // state. Registered here so configs that reference the modules
 // load cleanly instead of failing at the runtime dispatch step.
@@ -1059,6 +1063,37 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_gpu (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // Faithful N64 VI scan-out filter on GPU compute — consumes the
+        // backend-agnostic host_gpgpu_* compute/present surface. Receives the
+        // pre-filter colour image + coverage + VI control word via channel and
+        // presents the bit-exact filtered frame. Opt-in; the software VI path
+        // stays the default + oracle.
+        if entry.name_hash == WASM_GPU_VI_HASH {
+            let heap_bytes = gpu_vi::heap_size_for();
+            if !init_builtin_heap_sized(module_idx, heap_bytes) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_gpu_vi: STATE_ARENA full, skipping",
+                    heap_bytes as u64,
+                );
+                continue;
+            }
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let m = gpu_vi::build(in_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_gpu_vi (built-in)",
                 0,
             );
             continue;

@@ -389,6 +389,12 @@ fn main() {
         process::exit(0);
     }
 
+    // Admit resident pods declared in the config's `[FXPD]` section (RFC
+    // adaptive_tick_extra §7 — `pods:` / `combine <two-graph.yaml>`) as workload
+    // owners via `apply_add`, then the multi-graph runner multiplexes them with
+    // the base graph. Boot-only (not re-run on live rebuild). No-op without pods.
+    scheduler::admit_resident_pods_from_config();
+
     log::info!("[sched] starting main loop, tick_us={tick_us}");
     // The per-iteration deadline is chosen by the adaptive-tick pacer
     // (`scheduler::pacer_next_deadline_us`) inside the loop; there is no fixed
@@ -426,7 +432,7 @@ fn main() {
         iter = iter.wrapping_add(1);
 
         // Test hook: periodic self-trigger (no-op unless FLUXOR_TEST_REBUILD_EVERY set).
-        if test_rebuild_every > 0 && iter % test_rebuild_every == 0 {
+        if test_rebuild_every > 0 && iter.is_multiple_of(test_rebuild_every) {
             log::info!("[test] auto-triggering rebuild at iter {iter}");
             // SAFETY: null/0 = the documented "reload current STATIC_CONFIG" sentinel.
             unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
@@ -457,7 +463,13 @@ fn main() {
         // SAFETY: linux platform is single-threaded; the main loop is the
         // sole scheduler user after instantiation.
         let sched = unsafe { scheduler::sched_mut() };
-        let result = scheduler::step_modules(&mut sched.modules, module_count);
+        // Multi-graph runtime (RFC adaptive_tick_extra §7): when more than one
+        // resident graph is admitted this steps each owner independently, skips
+        // idle owners, and returns the §7.2 merged sleep deadline. With one
+        // resident graph it is byte-identical to `step_modules` +
+        // `pacer_next_deadline_us(0)` (the fast path inside the call).
+        let (result, sleep_us) =
+            scheduler::step_resident_graphs_flat(&mut sched.modules, module_count);
 
         if matches!(result, fluxor::kernel::scheduler::StepResult::Done) {
             log::info!("[sched] all modules complete, exiting");
@@ -493,15 +505,14 @@ fn main() {
         //                       `unpark` from `linux_wake_scheduler`
         //                       returns immediately so the next
         //                       iteration's drain runs the woken module.
-        // Adaptive-tick pacer (RFC adaptive_tick §5.1): choose this
-        // iteration's deadline from the just-finished pass. With no adaptive
-        // flag set this returns the domain's nominal tick, so `sleep_us ==
-        // tick_us` every iteration and the bands below are byte-identical to
-        // the fixed-tick loop. With mechanism (a) enabled and an idle pass it
-        // returns `tick_max_us`; `park_timeout` stays interruptible by
-        // `unpark` from `linux_wake_scheduler`, so a wake returns immediately.
-        // Linux is single-domain → domain 0.
-        let sleep_us = scheduler::pacer_next_deadline_us(0);
+        // `sleep_us` was chosen above by the resident-graph runner (RFC
+        // adaptive_tick §5.1 / adaptive_tick_extra §7.2). With no adaptive flag
+        // set it returns the domain's nominal tick, so `sleep_us == tick_us`
+        // every iteration and the bands below are byte-identical to the
+        // fixed-tick loop. With mechanism (a) enabled and an idle pass it returns
+        // `tick_max_us`; `park_timeout` stays interruptible by `unpark` from
+        // `linux_wake_scheduler`, so a wake returns immediately. Linux is a flat
+        // single-domain runner → domain 0.
         let sleep_duration = Duration::from_micros(sleep_us as u64);
         let elapsed = t0.elapsed();
         if sleep_us == 0 {

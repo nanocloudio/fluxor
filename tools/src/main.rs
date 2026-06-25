@@ -20,6 +20,7 @@
 //!     fluxor example blinky                # Show example config
 //!     fluxor pack module.o -o module.fmod # Pack ELF into .fmod module
 
+mod add_subgraph;
 mod asset_bank;
 mod board;
 mod cargo_index;

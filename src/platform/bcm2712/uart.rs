@@ -20,7 +20,10 @@
 //!   * `+0x38 IMSC`  — interrupt mask
 //!   * `+0x44 ICR`   — interrupt clear
 
-#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -29,8 +32,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const UART_BASE: usize = 0x0900_0000; // QEMU virt PL011
 #[cfg(feature = "board-cm5")]
 pub const UART_BASE: usize = 0x1c_0003_0000; // Pi 5 RP1 UART0 on GPIO14/15
-// RP1 is mapped at 0x1c_0000_0000 by VPU firmware (PCIe outbound window).
-// Requires enable_uart=1, enable_rp1_uart=1, and pciex4_reset=0 in config.txt.
+                                             // RP1 is mapped at 0x1c_0000_0000 by VPU firmware (PCIe outbound window).
+                                             // Requires enable_uart=1, enable_rp1_uart=1, and pciex4_reset=0 in config.txt.
 
 pub const UART_DR: *mut u32 = UART_BASE as *mut u32;
 #[cfg(feature = "board-cm5")]

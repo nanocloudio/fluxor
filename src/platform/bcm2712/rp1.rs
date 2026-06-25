@@ -17,7 +17,10 @@
 //! On non-`board-cm5` configs (QEMU virt) every entry point degrades to a
 //! no-op stub so the same code calls compile.
 
-#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 #[cfg(feature = "board-cm5")]
 mod cm5_impl {
@@ -48,7 +51,7 @@ mod cm5_impl {
     const RIO_OUT: usize = 0x00; // Output value
     const RIO_OE: usize = 0x04; // Output enable
     const RIO_IN: usize = 0x08; // Input value
-    // Atomic set/clr/xor at +0x2000/+0x3000/+0x1000
+                                // Atomic set/clr/xor at +0x2000/+0x3000/+0x1000
 
     const RIO_SET_OFFSET: usize = 0x2000;
     const RIO_CLR_OFFSET: usize = 0x3000;
@@ -322,7 +325,10 @@ mod cm5_impl {
         unsafe {
             fan_pin_configure();
             // Mode + inverted polarity (matches the stock pwm-fan node).
-            pwm_write(pwm_chan_ctrl(FAN_PWM_CHANNEL), PWM_CHANNEL_DEFAULT | PWM_POLARITY);
+            pwm_write(
+                pwm_chan_ctrl(FAN_PWM_CHANNEL),
+                PWM_CHANNEL_DEFAULT | PWM_POLARITY,
+            );
             pwm_write(pwm_chan_range(FAN_PWM_CHANNEL), FAN_PWM_RANGE);
             pwm_write(pwm_chan_duty(FAN_PWM_CHANNEL), FAN_PWM_DUTY_FULL);
             // Enable channel 3 and latch the new configuration (SET_UPDATE

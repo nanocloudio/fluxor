@@ -17,7 +17,10 @@
 //! early-boot fault. State is also stashed at the fixed address
 //! 0x4007_0000 for offline QEMU monitor inspection.
 
-#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -25,8 +28,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use super::gic::{
     EVENT_HANDLE_PCIE1_MSI, GICC_EOIR, GICC_IAR, IRQ_BINDINGS, IRQ_BINDING_COUNT, TIMER_PPI,
 };
-use super::uart::{uart_raw_putc, uart_raw_put_u32, uart_raw_puts, UART_READY};
 use super::timer;
+use super::uart::{uart_raw_put_u32, uart_raw_putc, uart_raw_puts, UART_READY};
 
 global_asm!(
     ".section .text",
@@ -39,17 +42,26 @@ global_asm!(
     // UDP by a sibling core) and spins, rather than longjmp-recovering out of a
     // possibly-held kernel lock. (Genuine EL0 module faults arrive at the
     // lower-EL synchronous vector instead, which does recover.)
-    ".balign 128", "mov w17, #5", "b fluxor_el1_catch",  // Synchronous
-    ".balign 128", "mov w17, #6", "b fluxor_el1_catch",  // IRQ
-    ".balign 128", "mov w17, #7", "b fluxor_el1_catch",  // FIQ
-    ".balign 128", "mov w17, #8", "b fluxor_el1_catch",  // SError
+    ".balign 128",
+    "mov w17, #5",
+    "b fluxor_el1_catch", // Synchronous
+    ".balign 128",
+    "mov w17, #6",
+    "b fluxor_el1_catch", // IRQ
+    ".balign 128",
+    "mov w17, #7",
+    "b fluxor_el1_catch", // FIQ
+    ".balign 128",
+    "mov w17, #8",
+    "b fluxor_el1_catch", // SError
     // Current EL with SP_ELx (4 entries)
     // Synchronous (EL1h): a fault in the kernel's own EL1 code — including
     // while servicing an isolated module's svc1/abort path — FAILS STOP via
     // `fluxor_el1_sync_vec` (kernel::mmu): latch syndrome + dump + spin. It is
     // NOT recovered, because a fault inside kernel servicing may hold a lock
     // whose abandonment would deadlock the kernel.
-    ".balign 128", "b fluxor_el1_sync_vec",  // Synchronous
+    ".balign 128",
+    "b fluxor_el1_sync_vec", // Synchronous
     // IRQ handler — save all caller-saved registers
     ".balign 128",
     "sub sp, sp, #256",
@@ -78,8 +90,12 @@ global_asm!(
     "ldp x29, x30, [sp, #160]",
     "add sp, sp, #256",
     "eret",
-    ".balign 128", "mov w17, #9", "b fluxor_el1_catch",  // FIQ (EL1h)
-    ".balign 128", "mov w17, #4", "b fluxor_el1_catch",  // SError (EL1h)
+    ".balign 128",
+    "mov w17, #9",
+    "b fluxor_el1_catch", // FIQ (EL1h)
+    ".balign 128",
+    "mov w17, #4",
+    "b fluxor_el1_catch", // SError (EL1h)
     // Lower EL using AArch64 (4 entries)
     // Synchronous from a lower EL (EL0) — SVC return from an isolated
     // module_step, or a data/instruction abort while it runs. Routed to
@@ -87,15 +103,26 @@ global_asm!(
     // which longjmps back to the EL1 scheduler. The other three lower-EL
     // entries (IRQ/FIQ/SError) stay on the dump path: IRQs are masked for
     // the duration of an EL0 step, so they should not fire here.
-    ".balign 128", "b fluxor_el0_lower_sync_vec",  // Synchronous
-    ".balign 128", "mov w17, #10", "b fluxor_el1_catch",  // IRQ (lower EL)
-    ".balign 128", "mov w17, #11", "b fluxor_el1_catch",  // FIQ (lower EL)
-    ".balign 128", "mov w17, #12", "b fluxor_el1_catch",  // SError (lower EL)
+    ".balign 128",
+    "b fluxor_el0_lower_sync_vec", // Synchronous
+    ".balign 128",
+    "mov w17, #10",
+    "b fluxor_el1_catch", // IRQ (lower EL)
+    ".balign 128",
+    "mov w17, #11",
+    "b fluxor_el1_catch", // FIQ (lower EL)
+    ".balign 128",
+    "mov w17, #12",
+    "b fluxor_el1_catch", // SError (lower EL)
     // Lower EL using AArch32 (4 entries)
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
-    ".balign 128", "b unhandled_exception",
+    ".balign 128",
+    "b unhandled_exception",
+    ".balign 128",
+    "b unhandled_exception",
+    ".balign 128",
+    "b unhandled_exception",
+    ".balign 128",
+    "b unhandled_exception",
     // `.global` so the EL0-isolation dispatcher in `kernel::mmu`
     // (a separate global_asm! block) can branch here when a lower-EL
     // synchronous exception arrives with no active EL0 step.
@@ -120,19 +147,39 @@ pub static EXCEPTION_DEPTH: AtomicU32 = AtomicU32::new(0);
 /// and a count here so a sibling core (core 0, which owns the UDP debug drain)
 /// can surface secondary-core faults over network telemetry — the UART dump is
 /// invisible on benches without a wired debug UART. Indexed by core id (0..3).
-pub static CORE_FAULT_ESR: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-pub static CORE_FAULT_FAR: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-pub static CORE_FAULT_COUNT: [AtomicU32; 4] =
-    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+pub static CORE_FAULT_ESR: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+pub static CORE_FAULT_FAR: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+pub static CORE_FAULT_COUNT: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 /// SPSR_EL1 at the fault — M[3:0] gives the EL the fault was taken FROM
 /// (0=EL0t, 4=EL1t, 5=EL1h), which disambiguates an `svc` taken at EL0 vs EL1.
-pub static CORE_FAULT_SPSR: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub static CORE_FAULT_SPSR: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 /// ELR_EL1 at the fault — the faulting instruction's address.
-pub static CORE_FAULT_ELR: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub static CORE_FAULT_ELR: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 #[no_mangle]
 pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
@@ -240,8 +287,12 @@ pub static CORE_TICKS: [AtomicU32; 4] = [
 /// Per-core last interrupted PC (ELR_EL1), latched by the timer IRQ. When a
 /// core's scheduler loop hangs but timer IRQs still fire, this is the PC of
 /// the spinning code — map it with `rust-objdump -d` on the firmware ELF.
-pub static CORE_LAST_ELR: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub static CORE_LAST_ELR: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 /// Absolute-deadline (`cntp_cval`) re-arm toggle (RFC adaptive_tick §7.1a).
 /// Default OFF: the timer re-arms with the relative `cntp_tval` down-counter
@@ -263,8 +314,12 @@ pub static ABSOLUTE_REARM: AtomicBool = AtomicBool::new(false);
 /// `LAST_DEADLINE_CVAL[core] + period` so the grid is drift-free; the resync
 /// guard overwrites it with `now + period` after a stall. Unused (stays 0)
 /// while `ABSOLUTE_REARM` is off.
-pub static LAST_DEADLINE_CVAL: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub static LAST_DEADLINE_CVAL: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 /// Current core number (0-3). Pi 5 encodes it in MPIDR Aff1[15:8].
 #[inline(always)]
@@ -317,8 +372,9 @@ pub unsafe extern "C" fn irq_handler() {
             // emits a burst of immediate IRQs (the hazard the relative path
             // self-avoids).
             let now = timer::read_timer_count_64();
-            let mut next =
-                LAST_DEADLINE_CVAL[core_id].load(Ordering::Relaxed).wrapping_add(period as u64);
+            let mut next = LAST_DEADLINE_CVAL[core_id]
+                .load(Ordering::Relaxed)
+                .wrapping_add(period as u64);
             if next <= now {
                 next = now.wrapping_add(period as u64);
             }
@@ -360,14 +416,10 @@ pub unsafe extern "C" fn irq_handler() {
                 } else if binding.event_handle >= 0 {
                     // ACK device if mmio_base is set (virtio-mmio)
                     if binding.mmio_base != 0 {
-                        let isr = core::ptr::read_volatile(
-                            (binding.mmio_base + 0x60) as *const u32,
-                        );
+                        let isr =
+                            core::ptr::read_volatile((binding.mmio_base + 0x60) as *const u32);
                         if isr != 0 {
-                            core::ptr::write_volatile(
-                                (binding.mmio_base + 0x64) as *mut u32,
-                                isr,
-                            );
+                            core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
                         }
                     }
                     fluxor::kernel::event::event_signal_from_isr(binding.event_handle);

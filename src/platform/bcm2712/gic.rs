@@ -14,7 +14,10 @@
 //! `event_handle = EVENT_HANDLE_PCIE1_MSI` routes the IRQ into the
 //! brcmstb PCIe1 MSI mux dispatch instead of a single event.
 
-#![allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#![allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 
 // GIC
 #[cfg(not(feature = "board-cm5"))]
@@ -80,15 +83,31 @@ pub const TIMER_PPI: u32 = 27;
 /// Up to 4 bindings (virtio devices, GPIO, etc.).
 pub const MAX_IRQ_BINDINGS: usize = 4;
 pub struct IrqBinding {
-    pub irq: u32,           // GIC interrupt ID (e.g. 48 for virtio SPI 16)
-    pub event_handle: i32,  // Fluxor event handle to signal
-    pub mmio_base: usize,   // If nonzero, ACK device by reading INTERRUPT_STATUS and writing INTERRUPT_ACK
+    pub irq: u32,          // GIC interrupt ID (e.g. 48 for virtio SPI 16)
+    pub event_handle: i32, // Fluxor event handle to signal
+    pub mmio_base: usize, // If nonzero, ACK device by reading INTERRUPT_STATUS and writing INTERRUPT_ACK
 }
 pub static mut IRQ_BINDINGS: [IrqBinding; MAX_IRQ_BINDINGS] = [
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
-    IrqBinding { irq: 0, event_handle: -1, mmio_base: 0 },
+    IrqBinding {
+        irq: 0,
+        event_handle: -1,
+        mmio_base: 0,
+    },
+    IrqBinding {
+        irq: 0,
+        event_handle: -1,
+        mmio_base: 0,
+    },
+    IrqBinding {
+        irq: 0,
+        event_handle: -1,
+        mmio_base: 0,
+    },
+    IrqBinding {
+        irq: 0,
+        event_handle: -1,
+        mmio_base: 0,
+    },
 ];
 pub static mut IRQ_BINDING_COUNT: usize = 0;
 
@@ -142,15 +161,21 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) 
             return fluxor::kernel::errno::ENOMEM;
         }
         let idx = IRQ_BINDING_COUNT;
-        IRQ_BINDINGS[idx] = IrqBinding { irq, event_handle, mmio_base };
+        IRQ_BINDINGS[idx] = IrqBinding {
+            irq,
+            event_handle,
+            mmio_base,
+        };
         IRQ_BINDING_COUNT = idx + 1;
 
         // Enable the SPI in the GIC distributor
         // SPIs start at IRQ 32. ISENABLER register: base + 0x100 + (irq/32)*4, bit = irq%32
         let reg = GICD_BASE + 0x100 + (irq as usize / 32) * 4;
         let bit = 1u32 << (irq % 32);
-        core::ptr::write_volatile(reg as *mut u32,
-            core::ptr::read_volatile(reg as *const u32) | bit);
+        core::ptr::write_volatile(
+            reg as *mut u32,
+            core::ptr::read_volatile(reg as *const u32) | bit,
+        );
         // Set priority to 0 (highest)
         core::ptr::write_volatile((GICD_BASE + 0x400 + irq as usize) as *mut u8, 0);
         // Target the owning core (ITARGETSR is a byte per SPI; bit N = core N).
@@ -179,6 +204,6 @@ pub unsafe fn gic_init() {
 pub unsafe fn gic_init_secondary() {
     core::ptr::write_volatile((GICC_BASE + 0x004) as *mut u32, 0xFF); // PMR
     core::ptr::write_volatile(GICC_BASE as *mut u32, 1); // GICC_CTLR
-    // Enable timer PPI for this core
+                                                         // Enable timer PPI for this core
     core::ptr::write_volatile((GICD_BASE + 0x100) as *mut u32, 1u32 << TIMER_PPI);
 }

@@ -237,7 +237,7 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
 
 /// Check if a module type is a kernel built-in (has `builtin = true` in its manifest).
 /// Built-in modules don't have .fmod files — they're compiled into the kernel binary.
-fn is_builtin_module(module_type: &str) -> bool {
+pub fn is_builtin_module(module_type: &str) -> bool {
     matches!(
         manifest::Manifest::from_source_tree(module_type),
         Ok(Some(m)) if m.builtin
@@ -354,6 +354,46 @@ pub fn parse_modules_from_config_multi(
 
             let module_info = ModuleInfo::from_file(&module_path)?;
             modules.push(module_info);
+        }
+    }
+
+    // Resident-pod module types (RFC adaptive_tick_extra §7): pods admitted at
+    // boot via `apply_add` reference PIC modules by `name_hash`, so their .fmod
+    // must be in the module table too. Scan `pods:[*].modules:[*].type` and load
+    // any type not already present (dedup against the base graph's modules).
+    if let Some(pods) = config["pods"].as_array() {
+        let mut loaded_types: std::collections::HashSet<String> =
+            modules.iter().map(|m| m.name.clone()).collect();
+        for pod in pods {
+            let Some(pmods) = pod["modules"].as_array() else {
+                continue;
+            };
+            for m in pmods {
+                let module_type = match m["type"].as_str().or_else(|| m["name"].as_str()) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if !loaded_types.insert(module_type.to_string()) {
+                    continue;
+                }
+                if is_builtin_module(module_type) {
+                    continue;
+                }
+                let module_path = resolve_fmod(module_type, modules_dir, extra_dirs).ok_or_else(
+                    || {
+                        let searched: Vec<String> = std::iter::once(modules_dir)
+                            .chain(extra_dirs.iter().copied())
+                            .map(|d| d.display().to_string())
+                            .collect();
+                        Error::Module(format!(
+                            "pod module type '{}' not found in: {}\nRun 'make modules' to build modules.",
+                            module_type,
+                            searched.join(", "),
+                        ))
+                    },
+                )?;
+                modules.push(ModuleInfo::from_file(&module_path)?);
+            }
         }
     }
 
