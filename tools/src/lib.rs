@@ -23,10 +23,12 @@ pub mod cargo_index;
 pub mod ci;
 pub mod compose;
 pub mod error;
+pub mod genstore;
 pub mod hash;
 pub mod hygiene;
 pub mod lockfile;
 pub mod manifest;
+pub mod node_agent;
 // `modules` carries the `.fmod` pack/parse primitives that
 // `modules_build` calls into. Exposed here (rather than left
 // main-only) so the build orchestrator can reach it from the lib
@@ -47,6 +49,8 @@ pub mod project_meta;
 pub mod registry;
 pub mod render_template;
 pub mod text_distance;
+pub mod trust;
+pub mod workload;
 pub mod workspace;
 
 /// Wire-format constants (ABI version byte, channel-hint stride,

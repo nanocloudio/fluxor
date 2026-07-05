@@ -59,6 +59,7 @@ pub mod event;
 pub mod loader;
 pub mod log_ring;
 pub mod owner;
+pub mod owner_plan;
 pub mod scheduler;
 
 // RP-family kernel services.

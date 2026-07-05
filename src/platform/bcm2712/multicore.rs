@@ -1214,6 +1214,25 @@ pub fn cross_edge_count() -> usize {
     CROSS_EDGE_COUNT.load(Ordering::Relaxed) as usize
 }
 
+/// Reset all cross-domain bridge state — edge table and SPSC ring pool — so a
+/// live graph rebuild can re-establish bridges for the new graph exactly the
+/// way boot did.
+///
+/// # Safety
+/// Every non-primary domain must be parked (`request_quiesce` + `wait_parked`)
+/// before calling: parked pumps neither walk the edge table nor touch the
+/// rings, so zeroing the counts and resetting each ring is race-free. Entries
+/// past the reset counts are never read; new registrations overwrite in place.
+pub unsafe fn reset_cross_state() {
+    CROSS_EDGE_COUNT.store(0, Ordering::Release);
+    let n = CROSS_CHANNEL_COUNT.swap(0, Ordering::AcqRel) as usize;
+    let mut i = 0usize;
+    while i < n.min(MAX_CROSS_CHANNELS) {
+        CROSS_CHANNELS[i].reset();
+        i += 1;
+    }
+}
+
 /// Get a reference to a cross-domain edge.
 pub fn get_cross_edge(idx: usize) -> Option<&'static CrossDomainEdge> {
     if idx < cross_edge_count() {

@@ -146,6 +146,19 @@ fn build_graph_linux() -> (usize, usize) {
     };
     log::info!("[graph] compiled: {module_count} modules");
 
+    // Establish plan ownership BEFORE instantiation: prepare_graph above reset
+    // every module to the system owner, and module_new (in the loop below) opens
+    // provider handles that are recorded under the module's owner at open time —
+    // so ownership must be live first, or those handles are permanently
+    // system-owned and bypass tenant isolation. Also re-applies the retained
+    // plan on a rebuild (an ordinary rebuild must not drop isolation). Fail
+    // closed: a staged-but-invalid plan rejects the graph rather than running it
+    // system-owned (which would disable ownership isolation).
+    if let Err(e) = fluxor::kernel::owner_plan::apply_staged() {
+        eprintln!("error: staged owner plan invalid ({e:?}); refusing to run the graph with ownership isolation disabled");
+        process::exit(1);
+    }
+
     // SAFETY: `static_loader` returns a reference into the static loader arena.
     let loader_ref = unsafe { scheduler::static_loader() };
     // SAFETY: single-threaded; `sched_mut` exposes scheduler state during
@@ -286,6 +299,27 @@ fn build_graph_linux() -> (usize, usize) {
 // Entry point
 // ============================================================================
 
+/// Modification time of the published plan file, if it exists.
+fn plan_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Read + stage the plan blob at `path`. The bytes are intentionally leaked:
+/// the staged-plan contract requires them valid until the (asynchronous)
+/// apply consumes them, and reloads happen at pod-lifecycle frequency — a few
+/// dozen bytes per pod churn, not a growth path.
+fn stage_plan_from(path: &str) {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            log::info!("[owner] staging plan from {path} ({} bytes)", bytes.len());
+            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            // SAFETY: 'static bytes satisfy the validity contract.
+            unsafe { fluxor::kernel::owner_plan::set_staged_plan(leaked.as_ptr(), leaked.len()) };
+        }
+        Err(e) => log::error!("[owner] plan reload from {path} failed: {e}"),
+    }
+}
+
 fn main() {
     // Initialize boot instant for monotonic clock
     // SAFETY: main runs before any other thread; first write to BOOT_INSTANT
@@ -382,7 +416,33 @@ fn main() {
     };
     log::info!("[loader] module table loaded, tick_us={tick_us}");
 
+    // Stage an owner plan from FLUXOR_PLAN=<file> (the node agent's delivery
+    // path). Re-staged on SIGHUP: the agent recommits + republishes the plan,
+    // then signals us to pick up the new generation via a live rebuild.
+    let plan_path = std::env::var("FLUXOR_PLAN").ok();
+    let mut last_plan_mtime = None;
+    let mut last_plan_check = Instant::now();
+    if let Some(path) = plan_path.as_deref() {
+        stage_plan_from(path);
+        last_plan_mtime = plan_mtime(path);
+    }
+
     // Compile + instantiate the graph (shared with the live-rebuild path).
+    // Stage an owner plan from FLUXOR_PLAN=<file> (the host validation path; the
+    // node agent stages plans the same way on a real device). The bytes must
+    // outlive build_graph_linux's apply_staged call — keep them in main scope.
+    let _staged_plan = std::env::var("FLUXOR_PLAN")
+        .ok()
+        .and_then(|path| std::fs::read(&path).ok());
+    if let Some(ref bytes) = _staged_plan {
+        log::info!(
+            "[owner] staging plan from FLUXOR_PLAN ({} bytes)",
+            bytes.len()
+        );
+        // SAFETY: `_staged_plan` lives through the run loop, past apply_staged.
+        unsafe { fluxor::kernel::owner_plan::set_staged_plan(bytes.as_ptr(), bytes.len()) };
+    }
+
     let (mut module_count, loaded_count) = build_graph_linux();
     if loaded_count == 0 {
         log::warn!("[sched] no modules loaded, nothing to do");
@@ -438,6 +498,25 @@ fn main() {
             unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
         }
 
+        // Node-agent generation update: the agent recommits + republishes the
+        // plan file; a changed mtime re-stages it and live-rebuilds ownership
+        // (rfc_k8s.md §12). Time-gated to one stat() per ~100 ms regardless of
+        // tick rate (a busy-loop tick would otherwise stat every spin; an
+        // idle 100 ms-per-iteration loop would otherwise check too rarely).
+        if plan_path.is_some() && last_plan_check.elapsed() >= Duration::from_millis(100) {
+            last_plan_check = Instant::now();
+            if let Some(path) = plan_path.as_deref() {
+                let mtime = plan_mtime(path);
+                if mtime.is_some() && mtime != last_plan_mtime {
+                    last_plan_mtime = mtime;
+                    log::info!("[owner] plan file changed; reloading from {path}");
+                    stage_plan_from(path);
+                    // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
+                    unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+                }
+            }
+        }
+
         // Live rebuild. The reconfigure module triggers
         // `TRIGGER_REBUILD` -> `request_rebuild`; consume it here and rebuild
         // the graph from STATIC_CONFIG. Single-threaded, so no quiesce is
@@ -456,9 +535,7 @@ fn main() {
         // (via its per-domain wrapper) call. Centralises topological
         // execution order, `StepOutcome::{Continue, Ready, Done, Burst}`,
         // burst-cap enforcement, deferred-ready gating, step-period
-        // counters, fault transitions, and diagnostics. The previous
-        // Linux loop only handled `Burst` and stepped in raw index order
-        // — non-trivially divergent from the reference path.
+        // counters, fault transitions, and diagnostics.
         //
         // SAFETY: linux platform is single-threaded; the main loop is the
         // sole scheduler user after instantiation.
@@ -472,6 +549,13 @@ fn main() {
             scheduler::step_resident_graphs_flat(&mut sched.modules, module_count);
 
         if matches!(result, fluxor::kernel::scheduler::StepResult::Done) {
+            // Node-agent mode (FLUXOR_PLAN set): the runtime is the node's
+            // persistent substrate — pods come and go via plan reloads, so an
+            // all-done/empty graph idles awaiting SIGHUP instead of exiting.
+            if plan_path.is_some() {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             log::info!("[sched] all modules complete, exiting");
             process::exit(0);
         }

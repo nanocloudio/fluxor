@@ -22,13 +22,14 @@
 //! of the §11 reconcile) layer on top of this module, which owns the
 //! allocation/determinism and reservation invariants.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub type PodUid = [u8; 16];
 pub type Digest32 = [u8; 32];
 
 /// Desired lifecycle of a pod.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesiredPhase {
     Running,
     Stopped,
@@ -36,7 +37,7 @@ pub enum DesiredPhase {
 
 /// Measured runtime demand of a workload implementation (the signed resource
 /// profile). Counts are per-pod.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceProfile {
     pub modules: u16,
     pub edges: u16,
@@ -47,7 +48,7 @@ pub struct ResourceProfile {
 }
 
 /// One pod's desired state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodDesired {
     pub pod_uid: PodUid,
     pub namespace: String,
@@ -59,7 +60,7 @@ pub struct PodDesired {
 }
 
 /// Whole-device desired state (rfc_k8s.md §11).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceDesiredState {
     pub generation: u64,
     pub system_revision: u64,
@@ -134,6 +135,10 @@ pub struct OwnerAssignment {
     pub module_count: u16,
     pub edge_base: u16,
     pub edge_count: u16,
+    /// Admitted hard caps from the signed resource profile. The kernel installs
+    /// these so per-owner state/buffer accounting is charged against them.
+    pub state_cap: u32,
+    pub buffer_cap: u32,
 }
 
 /// A composed, validated device-graph plan.
@@ -252,6 +257,8 @@ pub fn compose(
             module_count: p.profile.modules,
             edge_base: (edge_cursor - p.profile.edges as u32) as u16,
             edge_count: p.profile.edges,
+            state_cap: p.profile.state_bytes,
+            buffer_cap: p.profile.buffer_bytes,
         });
     }
 
@@ -266,7 +273,7 @@ pub fn compose(
 /// Per-assignment fixed record width in the canonical plan body:
 /// pod_uid(16) + slot(2) + generation(4) + module_base(2) + module_count(2)
 /// + edge_base(2) + edge_count(2).
-const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2;
+const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
 
 /// Canonical, fixed-width big-endian serialization of a plan's payload
 /// (generation + count + assignments). Stable across platforms, so the digest
@@ -284,6 +291,8 @@ fn plan_body(generation: u64, assignments: &[OwnerAssignment]) -> Vec<u8> {
         buf.extend_from_slice(&a.module_count.to_be_bytes());
         buf.extend_from_slice(&a.edge_base.to_be_bytes());
         buf.extend_from_slice(&a.edge_count.to_be_bytes());
+        buf.extend_from_slice(&a.state_cap.to_be_bytes());
+        buf.extend_from_slice(&a.buffer_cap.to_be_bytes());
     }
     buf
 }
@@ -391,6 +400,8 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
             module_count: u16::from_be_bytes(r[24..26].try_into().unwrap()),
             edge_base: u16::from_be_bytes(r[26..28].try_into().unwrap()),
             edge_count: u16::from_be_bytes(r[28..30].try_into().unwrap()),
+            state_cap: u32::from_be_bytes(r[30..34].try_into().unwrap()),
+            buffer_cap: u32::from_be_bytes(r[34..38].try_into().unwrap()),
         });
     }
     let mut plan_digest = [0u8; 32];

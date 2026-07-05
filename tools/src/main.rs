@@ -21,6 +21,7 @@
 //!     fluxor pack module.o -o module.fmod # Pack ELF into .fmod module
 
 mod add_subgraph;
+mod agent_cli;
 mod asset_bank;
 mod board;
 mod cargo_index;
@@ -407,6 +408,8 @@ enum Commands {
     /// contract. See `.context/rfc_hardware_rig.md` for the model; scenarios
     /// live in `tests/hardware/`, rig profiles live outside the repo in
     /// `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`.
+    /// Node-agent operations (reconcile/commit/publish plans)
+    Agent(agent_cli::AgentArgs),
     #[command(subcommand_value_name = "RIG_SUBCOMMAND")]
     Rig(rig::cli::RigArgs),
 
@@ -826,6 +829,7 @@ fn main() {
             refresh_ms,
             net,
         } => cmd_monitor_dispatch(&port, baud, refresh_ms, net.as_deref()),
+        Commands::Agent(args) => agent_cli::dispatch(args),
         Commands::Rig(args) => rig::cli::dispatch(args),
         Commands::Inspect { config, json } => cmd_inspect(config.as_deref(), json),
         Commands::Lint { action } => match action {

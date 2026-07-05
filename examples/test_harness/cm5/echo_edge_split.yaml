@@ -1,0 +1,59 @@
+# Echo anchor/worker split across cores (Pi 5 / CM5) — multi-domain
+# rebuild validation graph.
+#
+# Same graph as echo_edge.yaml, but `echo_worker` runs in its own domain on
+# core 1, so all four anchor↔worker edges (ctrl + data, both directions) are
+# cross-domain SPSC bridges. With the `test-rebuild` firmware feature the
+# kernel fires a one-shot live rebuild ~47 s after start: quiesce both
+# domains → reset cross-bridge state → prepare_graph → re-bridge → re-
+# instantiate → resume. TCP echo on :9000 exercising the anchor→worker→anchor
+# round trip is the functional pass signal on both sides of the rebuild —
+# if the bridges were not re-established correctly, the echo path dies.
+#
+# tick_us=100 matches log_net so CORE_TICKS advances ~9.5k/s and the 450k-tick
+# test trigger fires inside a ~110 s observation window.
+#
+# Build (test firmware):
+#   cargo build --release --target aarch64-unknown-none \
+#     --no-default-features --features board-cm5,test-rebuild
+#   fluxor combine -o kernel_2712.img target/cm5/firmware.bin \
+#     examples/test_harness/cm5/echo_edge_split.yaml
+#
+# Probe from the host (before and after the rebuild window):
+#   printf 'ping' | nc -w2 192.168.1.9 9000
+
+target: cm5
+tick_us: 100
+
+execution:
+  domains:
+    - name: main
+      cores: [0]
+    - name: worker
+      cores: [1]
+
+platform:
+  net: {}
+  debug:
+    to: net
+
+modules:
+  - name: echo_anchor
+    domain: main
+    listen_port: 9000
+  - name: echo_worker
+    domain: worker
+
+wiring:
+  - from: ip.net_out
+    to: echo_anchor.net_in
+  - from: echo_anchor.net_out
+    to: ip.net_in
+  - from: echo_anchor.ctrl_out
+    to: echo_worker.ctrl_in
+  - from: echo_worker.ctrl_out
+    to: echo_anchor.ctrl_in
+  - from: echo_anchor.data_out
+    to: echo_worker.data_in
+  - from: echo_worker.data_out
+    to: echo_anchor.data_in

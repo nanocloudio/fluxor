@@ -431,6 +431,18 @@ fn instantiate_and_activate(
     // Mask IRQs during module instantiation
     let _inst_guard = fluxor::kernel::guard::KernelGuard::acquire();
 
+    // Establish plan ownership BEFORE instantiation: the caller's prepare_graph
+    // reset every module to the system owner, and module_new (in the loop below)
+    // records provider handles under the module's owner at open time — so
+    // ownership must be live first, or those handles are permanently
+    // system-owned and bypass tenant isolation. Also re-applies the retained
+    // plan on a rebuild (an ordinary rebuild must not drop isolation). Fail
+    // closed: a staged-but-invalid plan rejects the graph rather than running it
+    // system-owned (which would disable ownership isolation).
+    if let Err(e) = fluxor::kernel::owner_plan::apply_staged() {
+        panic!("[owner] staged plan invalid ({e:?}); refusing to run the graph with ownership isolation disabled");
+    }
+
     // SAFETY: boot-time read.
     let loader_ref = unsafe { scheduler::static_loader() };
     // SAFETY: scheduler-thread mutable access during graph instantiation.
@@ -563,6 +575,106 @@ fn active_domain_count() -> usize {
         .count()
 }
 
+/// Bridge every cross-domain edge of the freshly compiled graph: split each
+/// edge whose endpoints live in different domains into producer-side /
+/// consumer-side channels joined by a `multicore::CrossDomainChannel` SPSC
+/// pump. Shared by first boot and live rebuild — a rebuild first calls
+/// `multicore::reset_cross_state()` under quiesce so this re-registers from a
+/// clean table, exactly like boot.
+///
+/// The walk reads `sched.edges` (not `cfg.graph_edges`) so an edge that is
+/// part of both a fan group and a cross-domain hop is seen through its
+/// rewritten endpoints. For each cross edge: open a fresh consumer-side
+/// channel `W2`, register the SPSC bridge `edge.channel → W2`, and set
+/// `edge.consumer_channel = W2` (`collect_input_channels` honours it, so
+/// `populate_ports` lifts `W2` into the consumer's in_chans).
+///
+/// Returns the number of bridges established, or a diagnostic on reservation
+/// shortfall. On `Err` no partial rewiring is left visible to consumers: the
+/// failing edge's `consumer_channel` is untouched, and the caller decides the
+/// posture (boot halts; rebuild leaves the graph idle / fail-safe).
+fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
+    use fluxor::kernel::channel;
+
+    // SAFETY: scheduler-thread access during graph prep (boot) or under
+    // full quiesce (rebuild) — sole mutator of scheduler state either way.
+    let sched = unsafe { scheduler::sched_mut() };
+    let n_compiled_edges = sched.edge_count;
+    let mut bridged = 0usize;
+    let mut e = 0usize;
+    while e < n_compiled_edges {
+        let edge_snapshot = sched.edges[e];
+        if edge_snapshot.channel < 0 {
+            e += 1;
+            continue;
+        }
+
+        let from = edge_snapshot.from_module;
+        let to = edge_snapshot.to_module;
+        let from_domain = scheduler::module_domain_id(from);
+        let to_domain = scheduler::module_domain_id(to);
+        let is_cross =
+            from_domain != to_domain || edge_snapshot.edge_class == EdgeClass::CrossCore;
+        if !is_cross {
+            e += 1;
+            continue;
+        }
+
+        // Reserve the SPSC ring, the consumer-side channel, and the
+        // edge-table slot before touching `consumer_channel`, so a failure
+        // never leaves a consumer rebound to a handle no pump fills.
+        let cross_ch_idx = match multicore::alloc_cross_channel() {
+            Some(i) => i,
+            None => return Err("cross-domain SPSC rings exhausted; cannot bridge edge"),
+        };
+
+        let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
+        if in_ch < 0 {
+            return Err("consumer-side channel alloc failed for cross-domain edge");
+        }
+
+        // Mirror the producer-side channel's mailbox flag onto the
+        // consumer-side bridge channel. Without this, typed-envelope
+        // edges (WsFrame, FmpMessage, etc.) shred their framing at
+        // this seam: the pump writes back-to-back atomic frames into
+        // a FIFO ring, the consumer's next `channel_read` returns
+        // multiple envelopes coalesced, and only the first parses
+        // cleanly. POLL_IN also stays latched on the leftover bytes,
+        // driving the consumer module to spin on phantom reads. See
+        // `tests/ws.rs::cross_domain_pump_*` for the host-side
+        // regression coverage.
+        if channel::channel_is_mailbox(edge_snapshot.channel) {
+            channel::channel_set_mailbox(in_ch);
+        }
+
+        let to_port_marker: u8 = if edge_snapshot.is_ctrl() { 1 } else { 0 };
+        // SAFETY: cross-edge registration runs during graph prep (boot) or
+        // under full quiesce (rebuild); multicore module owns the registry.
+        let registered = unsafe {
+            multicore::register_cross_edge(multicore::CrossDomainEdge {
+                from_domain,
+                from_module: from as u8,
+                from_port: edge_snapshot.from_port_index,
+                to_domain,
+                to_module: to as u8,
+                to_port: to_port_marker,
+                channel_idx: cross_ch_idx as u8,
+                local_out_handle: edge_snapshot.channel,
+                local_in_handle: in_ch,
+                pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
+            })
+        };
+        if registered.is_none() {
+            return Err("cross-domain edge table full; cannot bridge edge");
+        }
+
+        sched.edges[e].consumer_channel = in_ch;
+        bridged += 1;
+        e += 1;
+    }
+    Ok(bridged)
+}
+
 /// Poll the live-rebuild bridge on the primary domain. Called from every
 /// per-domain pump loop (cooperative / Tier 1a / Tier 1b) so the rebuild runs
 /// regardless of the primary domain's tier. No-op off domain 0.
@@ -576,6 +688,22 @@ fn active_domain_count() -> usize {
 fn poll_rebuild_bridge(domain_id: usize) {
     if domain_id != 0 {
         return;
+    }
+
+    // Test hook (feature `test-plan`): once, well after netconsole bring-up,
+    // report the owner-table occupancy. The boot `apply_staged()` installs the
+    // embedded plan's owner before the net is up (so its own log predates the
+    // netconsole); this late report makes that boot-applied ownership observable
+    // over the netconsole. Expect "active workloads = 1".
+    #[cfg(feature = "test-plan")]
+    {
+        use core::sync::atomic::{AtomicBool, Ordering as TestOrd};
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        let t = CORE_TICKS[0].load(TestOrd::Relaxed);
+        if t >= 180_000 && !REPORTED.swap(true, TestOrd::Relaxed) {
+            let n = scheduler::owners().active_workload_count();
+            log::info!("[test] owner table active workloads = {n}");
+        }
     }
 
     // Test hook (feature `test-rebuild`): one-shot rebuild after a fixed number
@@ -604,17 +732,32 @@ fn poll_rebuild_bridge(domain_id: usize) {
     multicore::request_quiesce();
     multicore::wait_parked(expected);
     log::warn!("[reconfigure] quiesced {expected} domains; rebuilding");
+    // All non-primary domains are parked: safe to reset the cross-domain
+    // bridge state so `bridge_cross_domain_edges` re-registers from a clean
+    // table exactly like boot. (prepare_graph below also resets channel and
+    // buffer slots, so the consumer-side bridge channels are reopened fresh.)
+    // SAFETY: quiesce established above — parked pumps neither walk the edge
+    // table nor touch the SPSC rings.
+    unsafe { multicore::reset_cross_state() };
     match scheduler::prepare_graph() {
         Ok((module_list, module_count)) => {
-            let domains = active_domain_count();
-            if domains <= 1 {
-                let n = instantiate_and_activate(&module_list, module_count);
-                log::warn!("[reconfigure] rebuilt graph: {n} modules");
-            } else {
-                log::error!(
-                    "[reconfigure] multi-domain rebuild ({domains} domains) unsupported; \
-                     cross-domain bridges not re-established — graph left idle"
-                );
+            // Re-establish cross-domain bridges for the new graph, then
+            // instantiate. Domain topology (exec modes / core assignment) must
+            // match the running generation: parked pumps resume inside their
+            // tier loop and re-read module tables per tick, but not their
+            // exec mode — changing tiers needs a reboot-class system update.
+            match bridge_cross_domain_edges() {
+                Ok(bridges) => {
+                    let n = instantiate_and_activate(&module_list, module_count);
+                    let domains = active_domain_count();
+                    log::warn!(
+                        "[reconfigure] rebuilt graph: {n} modules, {domains} domain(s), \
+                         {bridges} cross-domain bridge(s)"
+                    );
+                }
+                Err(msg) => {
+                    log::error!("[reconfigure] {msg}; graph left idle");
+                }
             }
         }
         Err(_) => {
@@ -764,7 +907,6 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // core's run loop drives `scheduler::step_domain_modules` (or
     // `step_domain_modules_poll` for Tier 3) through the shared
     // `step_one_module` body.
-    use fluxor::kernel::channel;
     use fluxor::kernel::config;
 
     // Parse config + loader into the kernel's static state. CM5 scans
@@ -881,6 +1023,32 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(n_edges as u32);
     uart_puts(b" edges\r\n");
 
+    // Test hook (feature `test-plan`): stage an embedded owner plan so the boot
+    // `apply_staged()` exercises the live-ownership path on hardware. The blob
+    // (one pod in slot 1 owning module 0) is generated by
+    // `cargo run -p fluxor-tools --example emit_plan`. test-only, never shipped.
+    #[cfg(feature = "test-plan")]
+    {
+        // One pod (slot 1, gen 2) owning module index 100 — deliberately beyond
+        // any real graph module, so the stamp is observable yet harmless (it
+        // does not re-own the live net-stack modules and break the netconsole).
+        static TEST_PLAN: [u8; 90] = [
+            0x46, 0x4c, 0x58, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x64, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1b, 0x97,
+            0x01, 0x60, 0x9a, 0xb6, 0xd0, 0xd4, 0x07, 0x20, 0x5f, 0x44, 0x14, 0x8b,
+            0xed, 0x5e, 0x42, 0xa9, 0x63, 0x47, 0x6b, 0x72, 0x4d, 0xc6, 0xc8, 0x58,
+            0xf7, 0x14, 0x6e, 0x50, 0x2c, 0x35,
+        ];
+        // SAFETY: TEST_PLAN is 'static; the pointer stays valid for the run.
+        unsafe {
+            fluxor::kernel::owner_plan::set_staged_plan(TEST_PLAN.as_ptr(), TEST_PLAN.len());
+        }
+        uart_puts(b"[test] staged embedded owner plan\r\n");
+    }
+
     let (module_list, module_count) = match scheduler::prepare_graph() {
         Ok(v) => v,
         Err(_) => {
@@ -906,105 +1074,16 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // `edge.consumer_channel = W2`. `collect_input_channels` honours
     // `consumer_channel`, so `populate_ports` lifts `W2` into the
     // consumer's in_chans.
-    {
-        // SAFETY: scheduler-thread boot-time access.
-        let sched = unsafe { scheduler::sched_mut() };
-        let n_compiled_edges = sched.edge_count;
-        let mut e = 0usize;
-        while e < n_compiled_edges {
-            let edge_snapshot = sched.edges[e];
-            if edge_snapshot.channel < 0 {
-                e += 1;
-                continue;
-            }
-
-            let from = edge_snapshot.from_module;
-            let to = edge_snapshot.to_module;
-            let from_domain = scheduler::module_domain_id(from);
-            let to_domain = scheduler::module_domain_id(to);
-            let is_cross =
-                from_domain != to_domain || edge_snapshot.edge_class == EdgeClass::CrossCore;
-            if !is_cross {
-                e += 1;
-                continue;
-            }
-
-            // Reserve the SPSC ring, the consumer-side channel, and the
-            // edge-table slot before touching `consumer_channel`. If any
-            // reservation fails, halt — rebinding the consumer to a
-            // handle that no pump fills would strand every byte the
-            // producer writes.
-            let cross_ch_idx = match multicore::alloc_cross_channel() {
-                Some(i) => i,
-                None => {
-                    uart_puts(b"[graph] cross-domain SPSC rings exhausted (");
-                    uart_put_u32(multicore::MAX_CROSS_CHANNELS as u32);
-                    uart_puts(b" max); cannot bridge edge ");
-                    uart_put_u32(e as u32);
-                    uart_puts(b"\r\n");
-                    loop {
-                        // SAFETY: WFI is a hint; safe as a fault path.
-                        unsafe { core::arch::asm!("wfi") };
-                    }
-                }
-            };
-
-            let in_ch = channel::channel_open(channel::CHANNEL_TYPE_PIPE, core::ptr::null(), 0);
-            if in_ch < 0 {
-                uart_puts(b"[graph] consumer-side channel alloc failed for cross-domain edge ");
-                uart_put_u32(e as u32);
-                uart_puts(b"\r\n");
-                loop {
-                    // SAFETY: WFI is a hint; safe as a fault path.
-                    unsafe { core::arch::asm!("wfi") };
-                }
-            }
-
-            // Mirror the producer-side channel's mailbox flag onto the
-            // consumer-side bridge channel. Without this, typed-envelope
-            // edges (WsFrame, FmpMessage, etc.) shred their framing at
-            // this seam: the pump writes back-to-back atomic frames into
-            // a FIFO ring, the consumer's next `channel_read` returns
-            // multiple envelopes coalesced, and only the first parses
-            // cleanly. POLL_IN also stays latched on the leftover bytes,
-            // driving the consumer module to spin on phantom reads. See
-            // `tests/ws.rs::cross_domain_pump_*` for the host-side
-            // regression coverage.
-            if channel::channel_is_mailbox(edge_snapshot.channel) {
-                channel::channel_set_mailbox(in_ch);
-            }
-
-            let to_port_marker: u8 = if edge_snapshot.is_ctrl() { 1 } else { 0 };
-            // SAFETY: cross-edge registration runs once per cross-domain
-            // hop during graph prep; multicore module owns the registry.
-            let registered = unsafe {
-                multicore::register_cross_edge(multicore::CrossDomainEdge {
-                    from_domain,
-                    from_module: from as u8,
-                    from_port: edge_snapshot.from_port_index,
-                    to_domain,
-                    to_module: to as u8,
-                    to_port: to_port_marker,
-                    channel_idx: cross_ch_idx as u8,
-                    local_out_handle: edge_snapshot.channel,
-                    local_in_handle: in_ch,
-                    pending_aux: core::sync::atomic::AtomicU32::new(u32::MAX),
-                })
-            };
-            if registered.is_none() {
-                uart_puts(b"[graph] cross-domain edge table full (");
-                uart_put_u32(multicore::MAX_CROSS_EDGES as u32);
-                uart_puts(b" max); cannot bridge edge ");
-                uart_put_u32(e as u32);
-                uart_puts(b"\r\n");
-                loop {
-                    // SAFETY: WFI is a hint; safe as a fault path.
-                    unsafe { core::arch::asm!("wfi") };
-                }
-            }
-
-            sched.edges[e].consumer_channel = in_ch;
-            e += 1;
+    if let Err(msg) = bridge_cross_domain_edges() {
+        // Boot posture: a reservation shortfall halts — rebinding a consumer
+        // to a handle no pump fills would strand every byte the producer
+        // writes, and there is no earlier generation to fall back to.
+        uart_puts(b"[graph] ");
+        uart_puts(msg.as_bytes());
+        uart_puts(b"\r\n");
+        loop {
+            // SAFETY: WFI is a hint; safe as a fault path.
+            unsafe { core::arch::asm!("wfi") };
         }
     }
 

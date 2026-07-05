@@ -160,6 +160,50 @@ impl OwnerTable {
         None
     }
 
+    /// Install an owner at a specific `slot`/`generation` as dictated by a
+    /// composed plan (rfc_k8s.md §11 — the plan is authoritative for slot and
+    /// generation, unlike [`alloc`](Self::alloc) which picks them). The owner is
+    /// installed `Active`. Returns `None` for the system slot, an out-of-range
+    /// slot, or a `generation` that would *decrease* the slot's reuse counter.
+    /// Used by the kernel plan-apply path.
+    ///
+    /// The composer is trusted to keep generations monotonic, but the kernel
+    /// enforces it independently: `reset_workloads` preserves each slot's
+    /// generation counter, and a plan (corrupt, rolled-back, or a forward
+    /// generation that nonetheless regresses one slot) that tried to install a
+    /// generation below the retained counter would let a stale handle from the
+    /// slot's previous occupant re-validate. Such an install is refused — the
+    /// slot stays `Free` (fail-closed: its old handles already fail `authorize`),
+    /// so isolation is never silently weakened.
+    pub fn install(
+        &mut self,
+        slot: u16,
+        generation: u32,
+        pod_uid: [u8; 16],
+        state_cap: u32,
+        buffer_cap: u32,
+    ) -> Option<OwnerHandle> {
+        let s = slot as usize;
+        if s == 0 || s >= MAX_OWNERS {
+            return None;
+        }
+        // Never lower a slot's generation: that is the reuse guard's core
+        // invariant. Equal is allowed (idempotent re-apply of the same plan).
+        if generation < self.entries[s].generation {
+            return None;
+        }
+        let mut acct = OwnerAccounting::ZERO;
+        acct.state_cap = state_cap;
+        acct.buffer_cap = buffer_cap;
+        self.entries[s] = OwnerEntry {
+            pod_uid,
+            generation,
+            state: OwnerState::Active,
+            acct,
+        };
+        Some(OwnerHandle { slot, generation })
+    }
+
     #[inline]
     fn slot_valid(&self, h: OwnerHandle) -> bool {
         (h.slot as usize) < MAX_OWNERS
@@ -232,6 +276,19 @@ impl OwnerTable {
         e.pod_uid = [0; 16];
         e.acct = OwnerAccounting::ZERO;
         true
+    }
+
+    /// Free every non-system owner slot (generation counters preserved, so
+    /// later installs still issue strictly higher generations). Used by the
+    /// plan-apply path: the composed plan is authoritative for residency
+    /// (rfc_k8s.md §11), so owners absent from the new plan are revoked here
+    /// before the plan's owners are installed.
+    pub fn reset_workloads(&mut self) {
+        for e in self.entries.iter_mut().skip(1) {
+            e.state = OwnerState::Free;
+            e.pod_uid = [0; 16];
+            e.acct = OwnerAccounting::ZERO;
+        }
     }
 
     /// Number of active workload owners (excludes the system slot).

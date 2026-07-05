@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "name": "hello",
+  "version": "1.0.0",
+  "contract": {
+    "imports": [],
+    "exports": [],
+    "configSchema": { "digest": "sha256:abababababababababababababababababababababababababababababababab" },
+    "health": { "readiness": "hello.ready", "liveness": "hello.progress" },
+    "update": { "drainTimeoutMs": 5000, "statePolicy": "discard" }
+  },
+  "implementations": [
+    {
+      "target": { "family": "linux", "architecture": "aarch64", "fluxorAbi": 1 },
+      "graph": { "digest": "sha256:9b6e2c664adb80d2779e930ecb85dc852074983a1d0790a76f61f324674a4d84" },
+      "modules": [ { "name": "debug", "digest": "sha256:abababababababababababababababababababababababababababababababab" } ],
+      "resources": { "digest": "sha256:aab67e24609b9f9cc0f1d027ef40c5eb62666dc3b963f41762b3a9a19c72ca7f" },
+      "bindings": {
+        "imports": {},
+        "exports": {},
+        "health": { "hello.ready": "debug.ready", "hello.progress": "debug.progress" }
+      }
+    }
+  ]
+}

@@ -113,6 +113,10 @@ multitenant = []
 # production images.
 test-rebuild = []
 
+# Test-only: bcm2712 stages an embedded owner plan at boot so the staged-plan
+# apply path (per-Pod ownership) can be observed on hardware. Never shipped.
+test-plan = []
+
 # RP-family shared dependencies (pulled in by any chip-rp* feature)
 rp = [
     "embassy-executor", "embassy-time", "embassy-rp", "embassy-usb",
