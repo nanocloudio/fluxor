@@ -5378,7 +5378,7 @@ fn resolve_edge_classes(
 ///
 /// Reads the optional `buffer_bytes` field on each `wiring[]` entry.
 /// `0` (or missing) means "use module hints / default". Non-zero
-/// values are clamped to `[64, MAX_CHAN_BYTES = 256 KiB]`; the kernel
+/// values are clamped to `[64, MAX_CHAN_BYTES = 2 MiB]`; the kernel
 /// rounds up to the next power of two at channel-open time, so the
 /// encoded value is the lower bound the producer needs.
 ///
@@ -5388,7 +5388,13 @@ fn resolve_edge_classes(
 /// frame at 50 fps doesn't share a default with a low-rate
 /// telemetry edge from the same producer.
 fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
-    const MAX_CHAN_BYTES: u32 = 256 * 1024;
+    // Must match the kernel's channel/scheduler cap (src/kernel/channel.rs +
+    // scheduler/mod.rs = 2 MiB). This is the config-build clamp: it was stale at
+    // 256 KiB while the kernel allowed 2 MiB, so a wiring asking for 2 MiB (a
+    // GPU-offload frame channel — dense frames near 1 MiB) was silently clamped
+    // to 256 KiB, and a frame larger than the channel gated across ticks and
+    // FROZE the display.
+    const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
     let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
         Some(w) => w,
         None => return Vec::new(),

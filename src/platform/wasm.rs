@@ -89,6 +89,9 @@ mod audio;
 #[path = "wasm/gpu.rs"]
 mod gpu;
 
+#[path = "wasm/compute.rs"]
+mod compute;
+
 #[path = "wasm/websocket.rs"]
 mod websocket;
 
@@ -360,6 +363,7 @@ const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
 const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 = fnv1a32(b"wasm_browser_touch_gamepad_overlay");
 const WASM_BROWSER_GPU_HASH: u32 = fnv1a32(b"wasm_browser_gpu");
+const WASM_BROWSER_COMPUTE_HASH: u32 = fnv1a32(b"wasm_browser_compute");
 // MIDI built-ins — STUB. See `wasm/midi.rs` for the unimplemented
 // state. Registered here so configs that reference the modules
 // load cleanly instead of failing at the runtime dispatch step.
@@ -1064,6 +1068,39 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_gpu (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // Generic GPU compute driver — the compute sibling of wasm_browser_gpu.
+        // Consumes an app-supplied compute command stream (pipelines, buffers,
+        // dispatch lists, present) on the input port and forwards it to the
+        // backend-agnostic host_gpu_compute_* surface. Holds no application
+        // knowledge; a Vulkan or bare-metal backend implements the same imports.
+        if entry.name_hash == WASM_BROWSER_COMPUTE_HASH {
+            let heap_bytes = compute::heap_size_for();
+            if !init_builtin_heap_sized(module_idx, heap_bytes) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_compute: STATE_ARENA full, skipping",
+                    heap_bytes as u64,
+                );
+                continue;
+            }
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            // Optional output port (index 0) for READBACK results; -1 if unwired.
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = compute::build(in_chan, out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_compute (built-in)",
                 0,
             );
             continue;

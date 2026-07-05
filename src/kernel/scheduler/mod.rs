@@ -412,7 +412,11 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             // the scheduler is the place that normalises before the
             // syscall sees them.
             const MIN_CHAN_BYTES: u32 = 64;
-            const MAX_CHAN_BYTES: u32 = 256 * 1024;
+            // 256 KiB silently clamped large producers: app GPU/video frames run
+            // past 1 MiB, so they could not transit in one ring fill and the
+            // display gated/froze. The wasm buffer arena is 8 MiB, so 2 MiB
+            // headroom is safe (only channels that REQUEST more grow).
+            const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
             let normalised = buf_size
                 .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
                 .next_power_of_two();

@@ -31,6 +31,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "audio.output.protected",
     "audio.output.rate_trim",
     "gpu.render",
+    "gpu.compute",
     "presentation.clock",
     // Service-level surfaces (mirror the canonical content-type surface family).
     "audio.sample",

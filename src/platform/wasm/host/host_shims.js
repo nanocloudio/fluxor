@@ -2068,6 +2068,225 @@ registerProcessor('pcm-ring', PcmRing);
       },
     };
 
+
+    // ── Generic GPU compute surface (host_gpu_compute_*) ──────────────
+    // Backend-agnostic GPGPU driver, the compute sibling of webgpuShim. The app
+    // supplies compute shaders + buffers + dispatch lists as data; this shim
+    // holds ZERO application knowledge (no baked pipelines, no pixel formats).
+    // WebGPU backend today; a Vulkan or bare-metal driver implements the same
+    // host_gpu_compute_* surface and the module above is unchanged.
+    let cpDevice = null;
+    let cpInitStatus = GPU_INIT_NOT_STARTED;
+    const cpPipelines = new Map(); // id -> GPUComputePipeline
+    const cpBuffers = new Map(); // id -> { buf, size }
+    let cpCanvas = null, cpCtx = null, cpImage = null;
+    let cpRead = null, cpReadN = 0, cpReadBusy = false;
+    let cpRb = null; // pending readback: { staging, ready } (one outstanding)
+    let cpPresentLogged = false, cpMapLogged = false;
+
+    function cpEnsureCanvas(w, h) {
+      if (cpCanvas && cpCanvas.width === w && cpCanvas.height === h) return;
+      cpCanvas = document.createElement('canvas');
+      cpCanvas.width = w; cpCanvas.height = h;
+      cpCanvas.style.maxWidth = '100%';
+      cpCanvas.style.height = 'auto';
+      cpCanvas.style.imageRendering = 'pixelated';
+      if (canvasContainer) canvasContainer.replaceChildren(cpCanvas);
+      else document.body.appendChild(cpCanvas);
+      cpCtx = cpCanvas.getContext('2d');
+      cpImage = cpCtx.createImageData(w, h);
+    }
+
+    const computeShim = {
+      // Kick off async device acquire; returns PENDING. Module polls poll_init.
+      host_gpu_compute_init: () => {
+        if (cpDevice) return GPU_INIT_READY;
+        if (cpInitStatus === GPU_INIT_PENDING) return GPU_INIT_PENDING;
+        if (!navigator.gpu) { console.error('[compute] no WebGPU'); cpInitStatus = -1; return -1; }
+        cpInitStatus = GPU_INIT_PENDING;
+        (async () => {
+          try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) throw new Error('no adapter');
+            cpDevice = await adapter.requestDevice();
+            cpDevice.lost.then((info) => {
+              console.error('[compute] device lost:', info.message);
+              cpDevice = null; cpPipelines.clear(); cpBuffers.clear();
+              cpRead = null; cpReadN = 0; cpReadBusy = false; cpRb = null;
+              cpInitStatus = GPU_INIT_NOT_STARTED;
+            });
+            cpInitStatus = GPU_INIT_READY;
+            console.log('[compute] ready (WebGPU compute)');
+          } catch (e) { console.error('[compute] init failed:', e.message); cpInitStatus = -3; }
+        })();
+        return GPU_INIT_PENDING;
+      },
+      host_gpu_compute_poll_init: () => cpInitStatus,
+
+      // Create/replace compute pipeline `id`. shader_fmt: 0=WGSL utf8,
+      // 1=SPIR-V (a native backend's job — the browser takes WGSL only).
+      host_gpu_compute_pipeline: (id, fmt, entryPtr, entryLen, shaderPtr, shaderLen) => {
+        if (!cpDevice) return -1;
+        if (fmt !== 0) { console.error('[compute] unsupported shader_fmt', fmt); return -2; }
+        try {
+          const entry = kstr(entryPtr, entryLen);
+          const wgsl = kstr(shaderPtr, shaderLen);
+          const module = cpDevice.createShaderModule({ code: wgsl });
+          // ASYNC creation: a synchronous createComputePipeline stalls the
+          // whole device timeline while the backend compiles (minutes for a
+          // large kernel on a software adapter) — every later submit,
+          // present readback and map queues behind it. Async keeps the
+          // device live; DISPATCHes naming a still-compiling pipeline are
+          // skipped (drop-until-ready is the app contract during init).
+          cpPipelines.delete(id >>> 0);
+          cpDevice.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: entry } })
+            .then((pipeline) => {
+              cpPipelines.set(id >>> 0, pipeline);
+              console.log('[compute] pipeline', id, '(' + entry + ', ' + wgsl.length + ' B) ready');
+            })
+            .catch((e) => console.error('[compute] pipeline', id, '(' + entry + ') failed:', e.message));
+          return 0;
+        } catch (e) { console.error('[compute] pipeline', id, 'failed:', e.message); return -3; }
+      },
+
+      // Allocate buffer `id`. usage bitmask: 1=storage 2=uniform 4=copy-src
+      // 8=copy-dst 16=map-read. COPY_DST is always set so UPLOAD_BUFFER works.
+      host_gpu_compute_buffer: (id, size, usage) => {
+        if (!cpDevice) return -1;
+        try {
+          let u = GPUBufferUsage.COPY_DST;
+          if (usage & 1) u |= GPUBufferUsage.STORAGE;
+          if (usage & 2) u |= GPUBufferUsage.UNIFORM;
+          if (usage & 4) u |= GPUBufferUsage.COPY_SRC;
+          if (usage & 16) u |= GPUBufferUsage.MAP_READ;
+          const existing = cpBuffers.get(id >>> 0);
+          if (existing) existing.buf.destroy();
+          const buf = cpDevice.createBuffer({ size: Math.max(size >>> 0, 16), usage: u });
+          cpBuffers.set(id >>> 0, { buf, size: size >>> 0 });
+          return 0;
+        } catch (e) { console.error('[compute] buffer', id, 'failed:', e.message); return -3; }
+      },
+
+      host_gpu_compute_upload: (id, offset, ptr, len) => {
+        if (!cpDevice) return -1;
+        const e = cpBuffers.get(id >>> 0);
+        if (!e) return -1;
+        // Copy out of wasm memory: writeBuffer needs a source that isn't a live
+        // view onto the module's (movable) memory.
+        const data = kview(ptr, len).slice();
+        cpDevice.queue.writeBuffer(e.buf, offset >>> 0, data);
+        return 0;
+      },
+
+      // Decode + execute the DISPATCH/COPY sub-command list in one encoder.
+      host_gpu_compute_submit: (listPtr, listLen) => {
+        if (!cpDevice) return -1;
+        const view = kview(listPtr, listLen);
+        const dv = new DataView(view.buffer, view.byteOffset, listLen);
+        const enc = cpDevice.createCommandEncoder();
+        let off = 0, pass = null;
+        try {
+          while (off < listLen) {
+            const sub = dv.getUint8(off); off += 1;
+            if (sub === 0x01) { // DISPATCH
+              const pipeId = dv.getUint32(off, true); off += 4;
+              const nbind = dv.getUint32(off, true); off += 4;
+              const entries = [];
+              for (let i = 0; i < nbind; i++) {
+                const binding = dv.getUint32(off, true); off += 4;
+                const bufId = dv.getUint32(off, true); off += 4;
+                const be = cpBuffers.get(bufId >>> 0);
+                if (be) entries.push({ binding, resource: { buffer: be.buf } });
+              }
+              const gx = dv.getUint32(off, true); off += 4;
+              const gy = dv.getUint32(off, true); off += 4;
+              const gz = dv.getUint32(off, true); off += 4;
+              const pipe = cpPipelines.get(pipeId >>> 0);
+              if (!pipe) continue; // unknown pipeline; framing already advanced
+              const bg = cpDevice.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+              if (!pass) pass = enc.beginComputePass();
+              pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+              pass.dispatchWorkgroups(gx, gy, gz);
+            } else if (sub === 0x02) { // COPY (outside any compute pass)
+              const src = dv.getUint32(off, true); off += 4;
+              const srcOff = dv.getUint32(off, true); off += 4;
+              const dst = dv.getUint32(off, true); off += 4;
+              const dstOff = dv.getUint32(off, true); off += 4;
+              const len = dv.getUint32(off, true); off += 4;
+              if (pass) { pass.end(); pass = null; }
+              const s = cpBuffers.get(src >>> 0), d = cpBuffers.get(dst >>> 0);
+              if (s && d) enc.copyBufferToBuffer(s.buf, srcOff >>> 0, d.buf, dstOff >>> 0, len >>> 0);
+            } else { console.error('[compute] bad sub-op', sub, 'at', off - 1); break; }
+          }
+          if (pass) pass.end();
+          cpDevice.queue.submit([enc.finish()]);
+          return 0;
+        } catch (e) { console.error('[compute] submit failed:', e.message); return -3; }
+      },
+
+      // Blit buffer `id` (w*h u32, r|g<<8|b<<16) to the canvas via readback.
+      host_gpu_compute_present: (bufId, w, h) => {
+        if (!cpDevice) return -1;
+        const e = cpBuffers.get(bufId >>> 0);
+        if (!cpPresentLogged) { cpPresentLogged = true; console.log('[compute] first present buf=' + bufId + ' ' + w + 'x' + h + (e ? '' : ' (UNKNOWN BUFFER)')); }
+        if (!e) return -1;
+        const n = (w >>> 0) * (h >>> 0);
+        if (n === 0) return -1;
+        if (cpReadBusy) return 0; // drop a frame while a readback is in flight
+        if (!cpRead || cpReadN < n) {
+          if (cpRead) cpRead.destroy();
+          cpRead = cpDevice.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+          cpReadN = n;
+        }
+        cpReadBusy = true;
+        const enc = cpDevice.createCommandEncoder();
+        enc.copyBufferToBuffer(e.buf, 0, cpRead, 0, n * 4);
+        cpDevice.queue.submit([enc.finish()]);
+        cpRead.mapAsync(GPUMapMode.READ, 0, n * 4).then(() => {
+          const got = new Uint32Array(cpRead.getMappedRange(0, n * 4));
+          if (!cpMapLogged) { cpMapLogged = true; console.log('[compute] first present mapped (' + w + 'x' + h + ')'); }
+          cpEnsureCanvas(w, h);
+          const dst = cpImage.data;
+          for (let i = 0; i < n; i++) { const v = got[i]; const o = i * 4; dst[o] = v & 0xff; dst[o + 1] = (v >> 8) & 0xff; dst[o + 2] = (v >> 16) & 0xff; dst[o + 3] = 255; }
+          cpCtx.putImageData(cpImage, 0, 0);
+          cpRead.unmap();
+          cpReadBusy = false;
+        }).catch((err) => { console.error('[compute] present readback:', err.message); cpReadBusy = false; });
+        return 0;
+      },
+
+      // Read `len` bytes from buffer `bufId` at `offset` back to the CPU. Async:
+      // the first call kicks off copy+map and returns -1 (pending); a later call
+      // with the mapped result copies into out_ptr and returns `len`. One
+      // outstanding at a time (a new request while busy stays pending).
+      host_gpu_compute_readback: (bufId, offset, outPtr, len) => {
+        if (!cpDevice) return -1;
+        len = len >>> 0;
+        if (cpRb && cpRb.ready) {
+          try {
+            const src = new Uint8Array(cpRb.staging.getMappedRange(0, len));
+            kview(outPtr, len).set(src.subarray(0, len));
+          } catch (e) { console.error('[compute] readback copy:', e.message); }
+          cpRb.staging.unmap();
+          cpRb.staging.destroy();
+          cpRb = null;
+          return len;
+        }
+        if (cpRb) return -1; // in flight
+        const e = cpBuffers.get(bufId >>> 0);
+        if (!e || len === 0) return -1;
+        const staging = cpDevice.createBuffer({ size: len, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const enc = cpDevice.createCommandEncoder();
+        enc.copyBufferToBuffer(e.buf, offset >>> 0, staging, 0, len);
+        cpDevice.queue.submit([enc.finish()]);
+        cpRb = { staging, ready: false };
+        staging.mapAsync(GPUMapMode.READ, 0, len)
+          .then(() => { if (cpRb) cpRb.ready = true; })
+          .catch((err) => { console.error('[compute] readback map:', err.message); if (cpRb) { cpRb.staging.destroy(); cpRb = null; } });
+        return -1;
+      },
+    };
+
     return {
       env: Object.assign(
         {},
@@ -2088,7 +2307,8 @@ registerProcessor('pcm-ring', PcmRing);
         terminalShim,
         imageShim,
         moduleShim,
-        webgpuShim
+        webgpuShim,
+        computeShim
       ),
     };
   }

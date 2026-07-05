@@ -61,9 +61,9 @@ mod profile_host {
         /// module's `module_state` and `module_arena`. Sized to
         /// hold a busy graph: 64 modules × ~100 KiB state plus
         /// peak heap usage from the http module at full
-        /// `ARENA_WORKING_SET_CONNS` activity. Raised to 64 MiB so the
-        /// N64 host configs fit `n64_core`'s ~39 MiB working set (the
-        /// wasm profile already provisions 96 MiB for the same core).
+        /// `ARENA_WORKING_SET_CONNS` activity. Raised to 64 MiB so
+        /// console-emulator host configs fit a large core's ~39 MiB
+        /// working set (the wasm profile provisions 96 MiB for the same).
         pub const STATE_ARENA_SIZE: usize = 64 * 1024 * 1024;
         /// Per-channel buffer pool. 8 MiB lets graphs size
         /// individual channels at 16-64 KiB without exhausting
@@ -195,16 +195,24 @@ mod profile_host {
 #[cfg(target_arch = "wasm32")]
 mod profile_wasm {
     pub mod kernel {
-        // Sized to hold the N64 graph at the 32 MiB cartridge ceiling
-        // (Ocarina of Time, DK64): `n64_core` streams the ROM straight into
-        // its bus ROM (~32 MiB ROM + 4 MiB RDRAM, no second full-ROM copy),
-        // and `emu_file_loader` stages one framed copy (~32 MiB) to emit the
-        // load command — ~72 MiB of live state at peak, plus the small video /
-        // audio / mapper modules. 96 MiB covers it with margin; 64 MiB held
-        // only the ≤12 MB carts. Browser tabs have ample memory headroom; the
+        // Sized to hold a console-emulator graph at a 32 MiB cartridge
+        // ceiling: the core streams the ROM straight into its emulated bus
+        // (~32 MiB ROM + machine RAM, no second full-ROM copy) and a file
+        // loader stages one framed copy (~32 MiB) to emit the load command —
+        // ~72 MiB of live state at peak, plus the small video / audio /
+        // mapper modules. 96 MiB covers it with margin; 64 MiB held only
+        // ≤12 MB payloads. Browser tabs have ample memory headroom; the
         // arena is paged in lazily by `memory.grow`.
         pub const STATE_ARENA_SIZE: usize = 96 * 1024 * 1024;
-        pub const BUFFER_ARENA_SIZE: usize = 2 * 1024 * 1024;
+        // Holds ALL channel ring buffers for the live graph. GPU-offload graphs
+        // wire multi-MiB frame channels (a whole serialized frame — up to
+        // ~1.57 MiB dense — must cross child->kernel in one ring fill)
+        // PLUS the small audio/input/command channels (~24 KiB). At 2 MiB the arena
+        // couldn't fit the 2 MiB channel alongside the others ("[buf] arena full
+        // need=2097152 used=24576") -> channel open failed -> the emulator would not
+        // start. 4 MiB holds the 2 MiB channel + the rest with full headroom (lazily
+        // paged by memory.grow, so it costs nothing until used).
+        pub const BUFFER_ARENA_SIZE: usize = 4 * 1024 * 1024;
         pub const MAX_MODULES: usize = 32;
         pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
         pub const CONFIG_ARENA_SIZE: usize = 32 * 1024;

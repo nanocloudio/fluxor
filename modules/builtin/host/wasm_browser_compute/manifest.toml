@@ -1,0 +1,30 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Generic GPU compute (GPGPU) backend — the compute sibling of
+# `wasm_browser_gpu`. Consumes an application-supplied compute command stream on
+# the input port (CREATE_PIPELINE with app WGSL/SPIR-V shaders, CREATE_BUFFER,
+# UPLOAD_BUFFER, SUBMIT dispatch lists, PRESENT) and executes it via WebGPU
+# compute through the backend-agnostic `host_gpu_compute_*` imports. Holds ZERO
+# application knowledge; a Vulkan or bare-metal driver implements the same
+# imports so a graph wired to this module runs unchanged on any backend.
+
+capabilities = ["gpu.compute", "display.scanout"]
+
+[[ports]]
+name = "commands"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+# Optional: READBACK results (compute → CPU) are written here. Leave unwired if
+# the graph only renders/presents.
+[[ports]]
+name = "readback"
+direction = "output"
+content_type = "OctetStream"
+required = false
+
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools"
