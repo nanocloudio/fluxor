@@ -816,7 +816,10 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         port,
         ..LinuxNetConn::EMPTY
     };
-    log::info!("[linux_net] listening on port {port} (slot {idx})");
+    // The scenario runner uses this stderr line as its readiness signal. Keep it
+    // visible at the default warning log level; an info-only signal makes
+    // `fluxor run` kill a healthy, already-listening host after five seconds.
+    log::warn!("[linux_net] listening on port {port} (slot {idx})");
 
     // MSG_BOUND payload: [conn_id:1][local_port:2 LE]. Consumers
     // sharing net_out filter by local_port; without it a second

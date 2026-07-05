@@ -275,10 +275,25 @@ pub fn apply_add(
     sched().edge_count = edge_base + e;
 
     // 5. Populate the new modules' port tables from the freshly opened edges so
-    //    instantiation / lazy channel lookup sees them. Existing modules' port
-    //    tables are NOT touched.
+    //    instantiation / lazy channel lookup sees them.
     for &slot in local_to_global.iter().take(n) {
         super::populate_module_ports_from_edges(slot, slot);
+    }
+    // Also (re)populate any EXISTING module that a new edge attaches to, so its
+    // port table gains the freshly-opened data channels — e.g. an ssh module's
+    // data_rx/data_tx ports bridging to a spawned `run` pipeline. This rebuilds the
+    // module's channel lookup table from ALL committed edges; because
+    // collect_channels places each channel at its edge's declared port index,
+    // existing ports (net_in/net_out at index 0) are preserved and the new bridge
+    // ports (index 1) are added. Only the channel table is touched — the module's
+    // ready-gate mask is left alone (isolation).
+    for ae in sub.edges.iter() {
+        if let Endpoint::Existing(g) = ae.from {
+            super::populate_module_ports_from_edges(g as usize, g as usize);
+        }
+        if let Endpoint::Existing(g) = ae.to {
+            super::populate_module_ports_from_edges(g as usize, g as usize);
+        }
     }
 
     // 6. Instantiate each module synchronously and stamp it with the owner.

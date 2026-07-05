@@ -56,6 +56,7 @@ pub mod config;
 pub mod el0_abi;
 pub mod errno;
 pub mod event;
+pub mod extbridge;
 pub mod loader;
 pub mod log_ring;
 pub mod owner;
