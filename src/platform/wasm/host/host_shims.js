@@ -127,8 +127,9 @@ registerProcessor('pcm-ring', PcmRing);
 `;
 
   // Clock-locked AudioWorklet ring scheduler (the wasm_browser_audio sink).
-  // Replaces the old AudioBufferSource-per-block scheduler, which could only
-  // ever insert silence to catch up (compounding 1-2s drift over SM64's title).
+  // Locking playback to the audio clock keeps the producer in step; a
+  // per-block scheduler could only insert silence to catch up, compounding into
+  // seconds of drift.
   // The ring is shared by BOTH the in-process path (buildHostImports below) and
   // the Worker bridge (runtime.html runs the kernel off-thread and forwards PCM
   // to the page, which owns the AudioContext — a Worker has none). ALWAYS runs
@@ -255,10 +256,10 @@ registerProcessor('pcm-ring', PcmRing);
     // Eager bring-up: create the context + worklet NOW and try to resume. With
     // autoplay allowed (desktop with sound permission, kiosk, headless) the resume
     // succeeds without any gesture; where it's blocked the context just stays
-    // suspended until the unlock listeners fire. This must NOT be lazy anymore:
-    // host_audio_ready() backpressures PCM upstream until ready()==true, so the
-    // first host_audio_play call — which used to create the context — never comes.
-    // Without this kick, ready() could never become true and the producer would
+    // suspended until the unlock listeners fire. This must NOT be lazy:
+    // host_audio_ready() backpressures PCM upstream until ready()==true, so a
+    // lazy "create the context on first host_audio_play" never fires. Without
+    // this eager kick, ready() could never become true and the producer would
     // hold at the boot logo forever.
     if (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) {
       try { const ctx = ensureAudio(44100); ensureWorklet(ctx); ctx.resume().catch(() => {}); }
@@ -1638,7 +1639,9 @@ registerProcessor('pcm-ring', PcmRing);
     const gpuSlot = (slot) => {
       let s = gpuSlots.get(slot);
       if (!s) {
-        s = { vb: null, bytes: 0, ib: null, indexCount: 0, pendingVB: null, pendingTotal: 0, pendingCursor: 0 };
+        s = { vb: null, bytes: 0, ib: null, indexCount: 0,
+              pendingVB: null, pendingTotal: 0, pendingCursor: 0,
+              pendingIB: null, pendingITotal: 0, pendingICursor: 0 };
         gpuSlots.set(slot, s);
       }
       return s;
@@ -1904,6 +1907,13 @@ registerProcessor('pcm-ring', PcmRing);
       host_gpu_raster_vertices_begin: (slot, totalLen) => {
         if (!gpuInitialized || !gpuDevice) return -1;
         const s = gpuSlot(slot);
+        if (totalLen === 0) {
+          // Empty mesh: swap in immediately (no CHUNK will follow)
+          s.vb = null;
+          s.bytes = 0;
+          s.pendingVB = null;
+          return 0;
+        }
         s.pendingVB = gpuDevice.createBuffer({
           size: totalLen,
           usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -1979,6 +1989,47 @@ registerProcessor('pcm-ring', PcmRing);
           console.error('[webgpu] upload_indices failed: slot=' + slot + ' len=' + byteLen + ' — ' + e.message);
           return -3;
         }
+      },
+
+      // Streamed index upload — same staging semantics as the vertex pair.
+      host_gpu_raster_indices_begin: (slot, totalLen) => {
+        if (!gpuInitialized || !gpuDevice) return -1;
+        const s = gpuSlot(slot);
+        if (totalLen === 0) {
+          s.ib = null;
+          s.indexCount = 0;
+          s.pendingIB = null;
+          return 0;
+        }
+        s.pendingIB = gpuDevice.createBuffer({
+          size: totalLen,
+          usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        });
+        s.pendingITotal = totalLen;
+        s.pendingICursor = 0;
+        return 0;
+      },
+      host_gpu_raster_indices_chunk: (slot, ptr, byteLen) => {
+        const s = gpuSlots.get(slot);
+        if (!s || !s.pendingIB) return -1;
+        if (s.pendingICursor + byteLen > s.pendingITotal) {
+          console.error('[webgpu] indices_chunk overflow: slot=' + slot);
+          return -2;
+        }
+        try {
+          gpuDevice.queue.writeBuffer(s.pendingIB, s.pendingICursor, kview(ptr, byteLen));
+        } catch (e) {
+          console.error('[webgpu] indices_chunk failed: slot=' + slot + ' — ' + e.message);
+          s.pendingIB = null;
+          return -3;
+        }
+        s.pendingICursor += byteLen;
+        if (s.pendingICursor >= s.pendingITotal) {
+          s.ib = s.pendingIB;
+          s.indexCount = (s.pendingITotal / 4) | 0;
+          s.pendingIB = null;
+        }
+        return 0;
       },
 
       // Write bytes verbatim into pipeline `id`'s uniform buffer. The layout
@@ -2086,13 +2137,22 @@ registerProcessor('pcm-ring', PcmRing);
 
     function cpEnsureCanvas(w, h) {
       if (cpCanvas && cpCanvas.width === w && cpCanvas.height === h) return;
-      cpCanvas = document.createElement('canvas');
-      cpCanvas.width = w; cpCanvas.height = h;
-      cpCanvas.style.maxWidth = '100%';
-      cpCanvas.style.height = 'auto';
-      cpCanvas.style.imageRendering = 'pixelated';
-      if (canvasContainer) canvasContainer.replaceChildren(cpCanvas);
-      else document.body.appendChild(cpCanvas);
+      if (offscreenSurface) {
+        // Worker mode: draw into the OffscreenCanvas transferred from the page —
+        // the ONLY surface that composites here. A Worker's `document` is a stub,
+        // so a `createElement('canvas')` would be detached and never visible.
+        cpCanvas = offscreenSurface;
+        if (cpCanvas.width !== w) cpCanvas.width = w;
+        if (cpCanvas.height !== h) cpCanvas.height = h;
+      } else {
+        cpCanvas = document.createElement('canvas');
+        cpCanvas.width = w; cpCanvas.height = h;
+        cpCanvas.style.maxWidth = '100%';
+        cpCanvas.style.height = 'auto';
+        cpCanvas.style.imageRendering = 'pixelated';
+        if (canvasContainer) canvasContainer.replaceChildren(cpCanvas);
+        else document.body.appendChild(cpCanvas);
+      }
       cpCtx = cpCanvas.getContext('2d');
       cpImage = cpCtx.createImageData(w, h);
     }

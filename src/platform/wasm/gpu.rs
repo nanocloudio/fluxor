@@ -57,6 +57,12 @@
 //!   buffer. `byte_len` must be a multiple of 4 (backend writeBuffer rule).
 //!   Like SET_PIPELINE, upload commands are device state: they are processed
 //!   even while a stale frame is being discarded.
+//! - UPLOAD_INDICES_BEGIN [0x14] [slot:u32] [total_len:u32]
+//! - UPLOAD_INDICES_CHUNK [0x15] [slot:u32] [byte_len:u32] [data…]
+//!   Streamed u32 index upload, same staging semantics as the vertex pair.
+//!   An app replacing a slot's mesh should complete the vertex stream first,
+//!   then the index stream: draws are indexed once indices exist, and an
+//!   out-of-bounds index fetch is safe (zeroed) but visible for a frame.
 //! - DRAW [0x20] [pipeline_id:u32] [slot:u32]
 //!   Draws the slot's whole buffer with the pipeline (vertex count =
 //!   slot bytes / pipeline stride; indexed if the slot has indices).
@@ -72,6 +78,8 @@ const CMD_UPLOAD_VERTICES: u8 = 0x10;
 const CMD_UPLOAD_INDICES: u8 = 0x11;
 const CMD_UPLOAD_VERTICES_BEGIN: u8 = 0x12;
 const CMD_UPLOAD_VERTICES_CHUNK: u8 = 0x13;
+const CMD_UPLOAD_INDICES_BEGIN: u8 = 0x14;
+const CMD_UPLOAD_INDICES_CHUNK: u8 = 0x15;
 const CMD_DRAW: u8 = 0x20;
 const CMD_FRAME_END: u8 = 0xFF;
 
@@ -108,6 +116,12 @@ extern "C" {
 
     /// Upload indices (u32) for `slot`. Returns index count or <0 on error
     fn host_gpu_raster_upload_indices(slot: u32, ptr: *const u8, byte_len: u32) -> i32;
+
+    /// Begin a streamed index upload of `total_len` bytes into `slot`
+    fn host_gpu_raster_indices_begin(slot: u32, total_len: u32) -> i32;
+
+    /// Append a chunk to the slot's streamed index upload
+    fn host_gpu_raster_indices_chunk(slot: u32, ptr: *const u8, byte_len: u32) -> i32;
 
     /// Write `byte_len` bytes verbatim into pipeline `id`'s uniform buffer
     fn host_gpu_raster_set_uniforms(id: u32, ptr: *const u8, byte_len: u32) -> i32;
@@ -404,6 +418,35 @@ fn gpu_step(state: *mut u8) -> i32 {
                     if !st.skip_frame {
                         host_gpu_raster_upload_indices(slot, ptr, byte_len);
                     }
+                    st.cmd_offset += byte_len;
+                }
+
+                CMD_UPLOAD_INDICES_BEGIN => {
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let slot = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let total = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    st.cmd_offset += 8;
+                    // Device state: processed regardless of skip_frame.
+                    host_gpu_raster_indices_begin(slot, total);
+                }
+
+                CMD_UPLOAD_INDICES_CHUNK => {
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let slot = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let byte_len = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    if st.cmd_offset + 8 + byte_len > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    st.cmd_offset += 8;
+                    let ptr = st.cmd_buf.add(st.cmd_offset as usize);
+                    host_gpu_raster_indices_chunk(slot, ptr, byte_len);
                     st.cmd_offset += byte_len;
                 }
 

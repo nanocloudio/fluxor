@@ -772,18 +772,39 @@
           buttonQ.push(0x00);
         }
       }
-      // input::pointer::KIND_*  →  1=DOWN, 2=UP, 3=MOVE, 4=CANCEL
+      // input::pointer::KIND_*  →  1=DOWN, 2=UP, 3=MOVE, 4=CANCEL, 7=MOVE_REL
+      //
+      // Pointer Lock: double-click the surface to capture the mouse (FPS
+      // look); Esc releases it (browser default). While locked, motion is
+      // relayed as KIND_MOVE_REL with signed movementX/Y deltas and the
+      // absolute MOVE stream is suppressed.
+      const locked = () => document.pointerLockElement === el;
+      el.addEventListener('dblclick', () => {
+        if (!locked() && el.requestPointerLock) el.requestPointerLock();
+      });
       el.addEventListener('pointerdown', (e) => {
-        el.setPointerCapture(e.pointerId);
+        if (!locked()) el.setPointerCapture(e.pointerId);
         pushPointer(e, 1);
         setButton(true);
       });
       el.addEventListener('pointerup', (e) => {
         pushPointer(e, 2);
         setButton(false);
-        el.releasePointerCapture(e.pointerId);
+        if (!locked()) el.releasePointerCapture(e.pointerId);
       });
       el.addEventListener('pointermove', (e) => {
+        if (locked()) {
+          const dx = Math.max(-32767, Math.min(32767, e.movementX | 0));
+          const dy = Math.max(-32767, Math.min(32767, e.movementY | 0));
+          if (dx || dy) {
+            pointerQ.push({
+              pointerId: e.pointerId & 0xFF, kind: 7,
+              buttons: e.buttons & 0xFF, modifiers: 0, pressure: 0,
+              x: dx, y: dy,
+            });
+          }
+          return;
+        }
         if (e.buttons || e.pressure > 0) pushPointer(e, 3);
       });
       el.addEventListener('pointercancel', (e) => {
@@ -1000,7 +1021,7 @@
       // drain as the clock advances, so the sink resumes promptly. ~10 ms = frame-grain.
       const leadTimer = setInterval(() => {
         if (!workerRef) { clearInterval(leadTimer); return; }
-        // Also push the audio frame cursor: the Worker owns the GPU-RDP present (the
+        // Also push the audio frame cursor: the Worker owns the GPU present (the
         // OffscreenCanvas is there) but the AudioContext is on the page, so the page
         // sends the master clock; the Worker presents the cursor-selected frame.
         worker.postMessage({ type: 'audio-lead', leadUs: Number(audio.leadUs()), cursor: audio.frameCursor(), ready: audio.ready() });
@@ -1103,10 +1124,10 @@
       const initRet = kInit();
       append(`[wasm] kernel_init() → ${initRet}`, 'info');
 
-      // Cooperative scheduler pump. The old loop ran a FIXED 32 kernel_step calls
-      // synchronously per requestAnimationFrame; with a CPU-bound emulator each
-      // burst took 100+ ms, monopolising the main thread so audio scheduling, GPU
-      // promise completion and presentation were all blocked until it finished
+      // Cooperative scheduler pump. A fixed count of synchronous kernel_step
+      // calls per requestAnimationFrame would, with a CPU-bound workload, take
+      // 100+ ms per burst and monopolise the main thread — blocking audio
+      // scheduling, GPU promise completion and presentation until it finished
       // (jank, RAF stalls, audio underruns). Instead, run kernel_step in a
       // TIME-BUDGETED burst and YIELD to the event loop between bursts via a
       // MessageChannel (a macrotask) — the browser gets to paint, resolve GPU

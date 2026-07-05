@@ -38,6 +38,11 @@ pub const KIND_MOVE: u8   = 3;
 pub const KIND_CANCEL: u8 = 4;
 pub const KIND_ENTER: u8  = 5;
 pub const KIND_LEAVE: u8  = 6;
+/// Relative motion (pointer-lock / captured-mouse): `x`/`y` carry signed
+/// per-event deltas instead of absolute coordinates. Producers emit this
+/// while a lock is active (e.g. browser Pointer Lock API); consumers that
+/// implement FPS-style look should prefer it over KIND_MOVE deltas.
+pub const KIND_MOVE_REL: u8 = 7;
 
 // ── Button bitfield (msg.buttons) ────────────────────────────────────
 
