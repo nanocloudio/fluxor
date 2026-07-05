@@ -36,6 +36,16 @@ name = "height"
 type = "u16"
 required = true
 
+# When 1, each frame on `pixels` is prefixed with a self-describing SRF1 header
+# (magic + w + h + format) and the canvas presents at the geometry carried in the
+# STREAM rather than the width/height config (which becomes the max/backing size).
+# Lets a producer resize without both ends agreeing on a static config. Mirrors
+# linux_display's `header` param.
+[[params]]
+name = "header"
+type = "u16"
+default = 0
+
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries input events / media samples / canvas rasters / WS frames, not a measurable on-device byte stream"

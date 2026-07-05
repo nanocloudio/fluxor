@@ -226,9 +226,15 @@ pub unsafe fn parse_request_line(
 
 /// Write a minimal HTTP/1.1 response status line plus a
 /// `Connection:` header (`keep-alive` or `close` per the
-/// `keepalive` flag) and a `Content-Type` header into `dst`,
-/// terminated by the blank line that ends the head. Returns the
+/// `keepalive` flag), `Cache-Control: no-store`, and a `Content-Type`
+/// header into `dst`, terminated by the blank line that ends the head. Returns the
 /// number of bytes written (capped at `dst_cap`).
+///
+/// The HTTP module serves mutable development/runtime artifacts at stable URLs
+/// (`/`, `/host_shims.js`, `/fluxor.wasm`). Caching those independently can run a
+/// new shell with an old shim or kernel after a rebuild, so responses are
+/// deliberately non-cacheable until the scenario synthesizer emits content-hashed
+/// asset URLs.
 ///
 /// `keepalive = true` is what the server SHOULD emit when the
 /// matching request was HTTP/1.1 without an explicit `Connection:
@@ -262,9 +268,9 @@ pub unsafe fn write_status_line(
     put!(b"HTTP/1.1 ");
     put!(status);
     if keepalive {
-        put!(b"\r\nConnection: keep-alive\r\nContent-Type: ");
+        put!(b"\r\nConnection: keep-alive\r\nCache-Control: no-store\r\nContent-Type: ");
     } else {
-        put!(b"\r\nConnection: close\r\nContent-Type: ");
+        put!(b"\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: ");
     }
     put!(content_type);
     put!(b"\r\n\r\n");

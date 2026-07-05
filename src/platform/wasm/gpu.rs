@@ -1,38 +1,77 @@
-//! `wasm_browser_gpu` built-in: WebGPU rendering backend
+//! `wasm_browser_gpu` built-in: generic GPU raster driver (browser/WebGPU backend)
 //!
-//! Provides GPU rendering via WebGPU in the browser.
-//! Uses the host_webgpu_* shims defined in host_shims.js.
+//! Backend-agnostic 3D raster capability surface. The module holds ZERO
+//! application knowledge: no shaders, no vertex formats, no uniform layouts.
+//! Applications supply all of those as data via `CMD_SET_PIPELINE`; this
+//! driver only frames the command stream and forwards it to the host backend
+//! (`host_gpu_raster_*` in host_shims.js today; a Vulkan or bare-metal driver
+//! implements the same imports unchanged — WGSL compiles to SPIR-V via naga).
 //!
-//! ## API for modules
+//! ## Command stream (channel input, little-endian)
 //!
-//! Modules send draw commands via channel. The GPU module processes
-//! them and renders each frame using WebGPU.
+//! Pipelines and vertex buffers are SLOTTED (ids 0..=7): an app creates any
+//! number of pipelines (e.g. 0 = world, 1 = highlight overlay) and uploads
+//! into independent vertex-buffer slots; DRAW names the (pipeline, buffer)
+//! pair. Uniform buffers are per-pipeline.
 //!
-//! ## Command Format (channel input)
+//! - SET_PIPELINE [0x03] [pipeline_id:u32] [desc_len:u32] [descriptor…]
+//!   Creates/replaces render pipeline `pipeline_id` from an app-supplied
+//!   descriptor:
+//!     vertex_stride: u32
+//!     attr_count:    u32                 (≤ 16)
+//!     attrs:         attr_count × { format:u32, offset:u32, location:u32 }
+//!     uniform_size:  u32                 (bytes; bound at @group(0) @binding(0))
+//!     flags:         u32                 (bit0 = depth test, bit1 = cull back,
+//!                                         bit2 = line-list topology,
+//!                                         bit3 = suppress depth WRITE — for
+//!                                         overlays that test against the scene
+//!                                         but must not occlude it)
+//!     shader_format: u32                 (0 = WGSL utf8, 1 = SPIR-V,
+//!                                         2+ = reserved for native blobs;
+//!                                         a driver REJECTS formats it cannot
+//!                                         consume — apps ship the variant their
+//!                                         hardware target needs, translated at
+//!                                         build time from the canonical WGSL)
+//!     shader_len:    u32
+//!     shader:        one module, entry points `vs_main` / `fs_main`
+//!   Attribute format codes: 0=float32 1=float32x2 2=float32x3 3=float32x4
+//!                           4=uint32  5=unorm8x4
+//!   Applied outside frame gating (device state, not frame content).
 //!
-//! Commands are binary-encoded:
-//! - FRAME_BEGIN [0x01] [frame_tick:u32, clear_r:f32, clear_g:f32, clear_b:f32] = 16 bytes
-//!   (`frame_tick` gates frames generated before the GPU was ready — see the
-//!   CMD_FRAME_BEGIN parser; a producer omitting it shifts every field and its
-//!   frames are dropped as stale.)
-//! - SET_UNIFORMS [0x02] [viewProj:mat4(64), camPos:vec4(16), time:f32(4), fogDist:f32(4), _pad:vec2(8)] = 96 bytes
-//!   (camPos is a vec4 by WGSL 16-byte alignment — only xyz is used; the host
-//!   writes these bytes verbatim into the uniform buffer, so the wire layout IS
-//!   the WGSL std140 layout. See the CMD_SET_UNIFORMS parser for offsets.)
-//! - UPLOAD_VERTICES [0x10] [byte_len:u32] [vertex_data...]
-//! - UPLOAD_INDICES [0x11] [byte_len:u32] [index_data...]
-//! - DRAW [0x20]
+//! - FRAME_BEGIN [0x01] [frame_tick:u32, clear_r:f32, clear_g:f32, clear_b:f32]
+//!   (`frame_tick` gates frames generated before the GPU was ready; a producer
+//!   may pass u32::MAX to always pass the gate.)
+//! - SET_UNIFORMS [0x02] [pipeline_id:u32] [byte_len:u32] [bytes…] — written
+//!   verbatim into that pipeline's uniform buffer; layout is a contract
+//!   between the app's shader and the app's producer module, opaque here.
+//! - UPLOAD_VERTICES [0x10] [slot:u32] [byte_len:u32] [vertex_data…]
+//!   (small, single-shot; replaces the slot's buffer)
+//! - UPLOAD_INDICES  [0x11] [slot:u32] [byte_len:u32] [index_data…] (u32)
+//! - UPLOAD_VERTICES_BEGIN [0x12] [slot:u32] [total_len:u32]
+//!   Starts a streamed vertex upload into `slot`: the backend allocates a
+//!   staging buffer of `total_len` bytes. Draws keep using the slot's
+//!   previous geometry until the stream completes.
+//! - UPLOAD_VERTICES_CHUNK [0x13] [slot:u32] [byte_len:u32] [data…]
+//!   Appends to the slot's staging buffer. When the accumulated bytes reach
+//!   `total_len`, the staging buffer atomically becomes the slot's active
+//!   buffer. `byte_len` must be a multiple of 4 (backend writeBuffer rule).
+//!   Like SET_PIPELINE, upload commands are device state: they are processed
+//!   even while a stale frame is being discarded.
+//! - DRAW [0x20] [pipeline_id:u32] [slot:u32]
+//!   Draws the slot's whole buffer with the pipeline (vertex count =
+//!   slot bytes / pipeline stride; indexed if the slot has indices).
 //! - FRAME_END [0xFF]
-//!
-//! Vertex format: position (3xf32) + color (3xf32) + normal (3xf32) = 36 bytes
 
 use crate::kernel::{channel, scheduler, syscalls};
 
 // Command opcodes
 const CMD_FRAME_BEGIN: u8 = 0x01;
 const CMD_SET_UNIFORMS: u8 = 0x02;
+const CMD_SET_PIPELINE: u8 = 0x03;
 const CMD_UPLOAD_VERTICES: u8 = 0x10;
 const CMD_UPLOAD_INDICES: u8 = 0x11;
+const CMD_UPLOAD_VERTICES_BEGIN: u8 = 0x12;
+const CMD_UPLOAD_VERTICES_CHUNK: u8 = 0x13;
 const CMD_DRAW: u8 = 0x20;
 const CMD_FRAME_END: u8 = 0xFF;
 
@@ -41,39 +80,49 @@ const GPU_INIT_READY: i32 = 0;
 const GPU_INIT_PENDING: i32 = 1;
 const GPU_INIT_NOT_STARTED: i32 = 2;
 
-// Not every host_webgpu_* import is called yet (resize / get_size are part of the
+// Not every host_gpu_raster_* import is called yet (resize / get_size are part of the
 // host ABI surface the JS driver implements but the module does not drive today).
 #[allow(dead_code)]
 extern "C" {
-    /// Initialize WebGPU. Returns 0=ready, 1=pending, <0=error
-    fn host_webgpu_init() -> i32;
+    /// Initialize the GPU backend. Returns 0=ready, 1=pending, <0=error
+    fn host_gpu_raster_init() -> i32;
 
     /// Poll init status
-    fn host_webgpu_poll_init() -> i32;
+    fn host_gpu_raster_poll_init() -> i32;
 
-    /// Resize canvas
-    fn host_webgpu_resize(width: u32, height: u32) -> i32;
+    /// Resize the output surface
+    fn host_gpu_raster_resize(width: u32, height: u32) -> i32;
 
-    /// Upload vertices. Returns vertex count or <0 on error
-    fn host_webgpu_upload_vertices(ptr: *const u8, byte_len: u32) -> i32;
+    /// Create/replace render pipeline `id` from an app-supplied descriptor
+    /// (see module docs for the wire layout). Returns 0 or <0 on error.
+    fn host_gpu_raster_pipeline(id: u32, desc_ptr: *const u8, desc_len: u32) -> i32;
 
-    /// Upload indices (u32). Returns index count or <0 on error
-    fn host_webgpu_upload_indices(ptr: *const u8, byte_len: u32) -> i32;
+    /// Replace vertex-buffer `slot`. Returns 0 or <0 on error
+    fn host_gpu_raster_upload_vertices(slot: u32, ptr: *const u8, byte_len: u32) -> i32;
 
-    /// Set uniforms (viewProj + camPos + time + fogDist)
-    fn host_webgpu_set_uniforms(ptr: *const u8, byte_len: u32) -> i32;
+    /// Begin a streamed vertex upload of `total_len` bytes into `slot`
+    fn host_gpu_raster_vertices_begin(slot: u32, total_len: u32) -> i32;
+
+    /// Append a chunk to the slot's streamed upload; swaps in when complete
+    fn host_gpu_raster_vertices_chunk(slot: u32, ptr: *const u8, byte_len: u32) -> i32;
+
+    /// Upload indices (u32) for `slot`. Returns index count or <0 on error
+    fn host_gpu_raster_upload_indices(slot: u32, ptr: *const u8, byte_len: u32) -> i32;
+
+    /// Write `byte_len` bytes verbatim into pipeline `id`'s uniform buffer
+    fn host_gpu_raster_set_uniforms(id: u32, ptr: *const u8, byte_len: u32) -> i32;
 
     /// Begin frame with clear color
-    fn host_webgpu_begin_frame(r: f32, g: f32, b: f32) -> i32;
+    fn host_gpu_raster_begin_frame(r: f32, g: f32, b: f32) -> i32;
 
-    /// Draw current geometry
-    fn host_webgpu_draw() -> i32;
+    /// Draw vertex-buffer `slot` with pipeline `id`
+    fn host_gpu_raster_draw(id: u32, slot: u32) -> i32;
 
     /// End frame and present
-    fn host_webgpu_end_frame() -> i32;
+    fn host_gpu_raster_end_frame() -> i32;
 
-    /// Get canvas size
-    fn host_webgpu_get_size(out_ptr: *mut u32) -> i32;
+    /// Get surface size
+    fn host_gpu_raster_get_size(out_ptr: *mut u32) -> i32;
 }
 
 #[repr(C)]
@@ -161,27 +210,22 @@ fn log_msg(msg: &[u8]) {
     }
 }
 
-static mut STEP_COUNT: u32 = 0;
-
 fn gpu_step(state: *mut u8) -> i32 {
     unsafe {
-        STEP_COUNT += 1;
-
         let st_ptr = core::ptr::read(state as *const *mut GpuState);
         if st_ptr.is_null() {
             return -1;
         }
         let st = &mut *st_ptr;
 
-        // Initialize WebGPU if not started
+        // Initialize the backend if not started
         if st.init_status == GPU_INIT_NOT_STARTED {
-            log_msg(b"[gpu] init starting");
-            st.init_status = host_webgpu_init();
+            st.init_status = host_gpu_raster_init();
         }
 
         // Poll init if pending
         if st.init_status == GPU_INIT_PENDING {
-            st.init_status = host_webgpu_poll_init();
+            st.init_status = host_gpu_raster_poll_init();
         }
 
         // Don't process commands until initialized
@@ -192,7 +236,7 @@ fn gpu_step(state: *mut u8) -> i32 {
         // Record ready_tick on first ready (used to discard stale frames)
         if st.ready_tick == 0 {
             st.ready_tick = scheduler::tick_count();
-            log_msg(b"[gpu] ready, will discard stale frames");
+            log_msg(b"[gpu] backend ready");
         }
 
         // Read commands from channel
@@ -212,12 +256,38 @@ fn gpu_step(state: *mut u8) -> i32 {
             st.cmd_len += n as u32;
         }
 
-        // Process commands
+        // Process commands. Payload-carrying commands rewind to the opcode and
+        // break when the payload has not fully arrived yet; the tail is
+        // compacted below and completed on a later tick.
         while st.cmd_offset < st.cmd_len {
             let cmd = *st.cmd_buf.add(st.cmd_offset as usize);
             st.cmd_offset += 1;
 
             match cmd {
+                CMD_SET_PIPELINE => {
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let id = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let desc_len = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    if st.cmd_offset + 8 + desc_len > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    st.cmd_offset += 8;
+                    let ptr = st.cmd_buf.add(st.cmd_offset as usize);
+                    // Device state, not frame content: applied even while a
+                    // stale frame is being discarded.
+                    let rc = host_gpu_raster_pipeline(id, ptr, desc_len);
+                    if rc < 0 {
+                        log_msg(b"[gpu] pipeline create failed");
+                    } else {
+                        log_msg(b"[gpu] pipeline created");
+                    }
+                    st.cmd_offset += desc_len;
+                }
+
                 CMD_FRAME_BEGIN => {
                     // 16 bytes: frame_tick (u32) + clear color (3 floats)
                     if st.cmd_offset + 16 > st.cmd_len {
@@ -241,93 +311,138 @@ fn gpu_step(state: *mut u8) -> i32 {
                         continue;
                     }
 
-                    if st.frames == 0 {
-                        log_msg(b"[gpu] FRAME_BEGIN (synced)");
+                    // The driver may refuse the frame (e.g. vsync throttle:
+                    // one submitted frame per display refresh). Treat exactly
+                    // like a stale frame: keep parsing, suppress host effects.
+                    if host_gpu_raster_begin_frame(r, g, b) < 0 {
+                        st.skip_frame = true;
+                        continue;
                     }
-                    host_webgpu_begin_frame(r, g, b);
                     st.in_frame = true;
                 }
 
                 CMD_SET_UNIFORMS => {
-                    // 96 bytes in WGSL std140 layout, written verbatim into the
-                    // uniform buffer by the host (`host_webgpu_set_uniforms`):
-                    //   viewProj mat4x4 : offset  0, 64 bytes
-                    //   camPos   vec4   : offset 64, 16 bytes (only xyz used;
-                    //                     16-byte aligned per WGSL)
-                    //   time     f32    : offset 80,  4 bytes
-                    //   fogDist  f32    : offset 84,  4 bytes
-                    //   _pad     vec2   : offset 88,  8 bytes
-                    let uniform_size = 96u32;
-                    if st.cmd_offset + uniform_size > st.cmd_len {
+                    if st.cmd_offset + 8 > st.cmd_len {
                         st.cmd_offset -= 1;
                         break;
                     }
-                    let ptr = st.cmd_buf.add(st.cmd_offset as usize);
-                    if !st.skip_frame {
-                        host_webgpu_set_uniforms(ptr, uniform_size);
-                    }
-                    st.cmd_offset += uniform_size;
-                }
-
-                CMD_UPLOAD_VERTICES => {
-                    // 4 bytes: byte_len, then vertex data
-                    if st.cmd_offset + 4 > st.cmd_len {
+                    let id = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let byte_len = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    if st.cmd_offset + 8 + byte_len > st.cmd_len {
                         st.cmd_offset -= 1;
                         break;
                     }
-                    let byte_len = read_u32(st.cmd_buf, st.cmd_offset as usize);
-                    st.cmd_offset += 4;
-
-                    if st.cmd_offset + byte_len > st.cmd_len {
-                        st.cmd_offset -= 5;
-                        break;
-                    }
+                    st.cmd_offset += 8;
                     let ptr = st.cmd_buf.add(st.cmd_offset as usize);
                     if !st.skip_frame {
-                        host_webgpu_upload_vertices(ptr, byte_len);
+                        host_gpu_raster_set_uniforms(id, ptr, byte_len);
                     }
                     st.cmd_offset += byte_len;
                 }
 
-                CMD_UPLOAD_INDICES => {
-                    // 4 bytes: byte_len, then index data
-                    if st.cmd_offset + 4 > st.cmd_len {
+                CMD_UPLOAD_VERTICES => {
+                    if st.cmd_offset + 8 > st.cmd_len {
                         st.cmd_offset -= 1;
                         break;
                     }
-                    let byte_len = read_u32(st.cmd_buf, st.cmd_offset as usize);
-                    st.cmd_offset += 4;
-
-                    if st.cmd_offset + byte_len > st.cmd_len {
-                        st.cmd_offset -= 5;
+                    let slot = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let byte_len = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    if st.cmd_offset + 8 + byte_len > st.cmd_len {
+                        st.cmd_offset -= 1;
                         break;
                     }
+                    st.cmd_offset += 8;
                     let ptr = st.cmd_buf.add(st.cmd_offset as usize);
                     if !st.skip_frame {
-                        host_webgpu_upload_indices(ptr, byte_len);
+                        host_gpu_raster_upload_vertices(slot, ptr, byte_len);
+                    }
+                    st.cmd_offset += byte_len;
+                }
+
+                CMD_UPLOAD_VERTICES_BEGIN => {
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let slot = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let total = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    st.cmd_offset += 8;
+                    // Device state: processed regardless of skip_frame.
+                    host_gpu_raster_vertices_begin(slot, total);
+                }
+
+                CMD_UPLOAD_VERTICES_CHUNK => {
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let slot = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let byte_len = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    if st.cmd_offset + 8 + byte_len > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    st.cmd_offset += 8;
+                    let ptr = st.cmd_buf.add(st.cmd_offset as usize);
+                    host_gpu_raster_vertices_chunk(slot, ptr, byte_len);
+                    st.cmd_offset += byte_len;
+                }
+
+                CMD_UPLOAD_INDICES => {
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let slot = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let byte_len = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    if st.cmd_offset + 8 + byte_len > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    st.cmd_offset += 8;
+                    let ptr = st.cmd_buf.add(st.cmd_offset as usize);
+                    if !st.skip_frame {
+                        host_gpu_raster_upload_indices(slot, ptr, byte_len);
                     }
                     st.cmd_offset += byte_len;
                 }
 
                 CMD_DRAW => {
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let id = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let slot = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    st.cmd_offset += 8;
                     if !st.skip_frame {
-                        host_webgpu_draw();
+                        host_gpu_raster_draw(id, slot);
                     }
                 }
 
                 CMD_FRAME_END => {
                     if st.skip_frame {
-                        // End of a discarded stale frame — resume normal effects.
                         st.skip_frame = false;
                     } else {
-                        host_webgpu_end_frame();
+                        host_gpu_raster_end_frame();
                         st.in_frame = false;
                         st.frames = st.frames.wrapping_add(1);
                     }
                 }
 
                 _ => {
-                    // Unknown command, skip
+                    // Unknown opcode: the stream should never contain one — it
+                    // means framing desynced. Log byte+offset for diagnosis.
+                    let mut dbg = *b"[gpu] BAD op=00 at 00000";
+                    let hi = (cmd >> 4) & 0xF;
+                    let lo = cmd & 0xF;
+                    dbg[14] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                    dbg[15] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                    let off = st.cmd_offset - 1;
+                    for i in 0..5 {
+                        dbg[23 - i] = b'0' + ((off / 10u32.pow(i as u32)) % 10) as u8;
+                    }
+                    log_msg(&dbg);
                 }
             }
         }
@@ -351,10 +466,8 @@ fn gpu_step(state: *mut u8) -> i32 {
 }
 
 pub(crate) unsafe fn build(width: u16, height: u16, in_chan: i32) -> scheduler::BuiltInModule {
-    log_msg(b"[gpu] build() called");
     let mut m = scheduler::BuiltInModule::new("wasm_browser_gpu", gpu_step);
     let raw = alloc_state(in_chan, width, height);
     core::ptr::write(m.state.as_mut_ptr() as *mut *mut GpuState, raw);
-    log_msg(b"[gpu] module built");
     m
 }

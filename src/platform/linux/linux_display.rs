@@ -255,6 +255,18 @@ const DISPLAY_TAG_PATH: u8 = 11;
 const DISPLAY_TAG_WIDTH: u8 = 12;
 const DISPLAY_TAG_HEIGHT: u8 = 13;
 const DISPLAY_TAG_SCALE: u8 = 14;
+// When set, each frame on `pixels` is prefixed with a self-describing header and the
+// display takes its geometry from the STREAM, not the `width`/`height` config — so a
+// producer can resize without the two ends agreeing on a config. See
+// sector/modules/common/sector_raster.rs (`SRF1`).
+const DISPLAY_TAG_HEADER: u8 = 15;
+const SRF1_MAGIC: &[u8; 4] = b"SRF1";
+const SRF1_HDR_LEN: usize = 10; // magic(4) + w(2) + h(2) + format(1) + flags(1)
+/// Max per-axis dimension a stream-supplied SRF1 header may request. The
+/// u16 header field can encode up to 65535, so an unbounded `w*h*2` resize is
+/// ~8 GiB and can OOM-kill the host. Bound it to the same 4096 ceiling the
+/// module manifest enforces on configured geometry; a larger header is rejected.
+const SRF1_MAX_DIM: usize = 4096;
 
 const DISPLAY_MODE_FILE: u8 = 0;
 const DISPLAY_MODE_NULL: u8 = 1;
@@ -279,6 +291,11 @@ struct LinuxDisplayState {
     scratch: Vec<u8>,
     scratch_pos: usize,
     frame_counter: u32,
+    // Self-describing-frame mode: collect a per-frame SRF1 header and size geometry
+    // from it. `hdr_pos` is how much of the current frame's header is buffered.
+    header_mode: bool,
+    hdr: [u8; SRF1_HDR_LEN],
+    hdr_pos: usize,
     #[cfg(feature = "host-window")]
     window: Option<window_backend::WindowBackend>,
 }
@@ -363,6 +380,49 @@ fn linux_display_step(state: *mut u8) -> i32 {
     let mut consumed = 0usize;
     let n = n as usize;
     while consumed < n {
+        // Header phase (opt-in): collect the SRF1 header at each frame start and
+        // self-configure geometry from it — the producer decides the frame size.
+        if st.header_mode && st.hdr_pos < SRF1_HDR_LEN {
+            let want = SRF1_HDR_LEN - st.hdr_pos;
+            let take = (n - consumed).min(want);
+            st.hdr[st.hdr_pos..st.hdr_pos + take].copy_from_slice(&buf[consumed..consumed + take]);
+            st.hdr_pos += take;
+            consumed += take;
+            if st.hdr_pos == SRF1_HDR_LEN {
+                if &st.hdr[0..4] == SRF1_MAGIC {
+                    let w = (st.hdr[4] as usize) | ((st.hdr[5] as usize) << 8);
+                    let h = (st.hdr[6] as usize) | ((st.hdr[7] as usize) << 8);
+                    if w == 0 || h == 0 || w > SRF1_MAX_DIM || h > SRF1_MAX_DIM {
+                        // Reject a stream-supplied geometry outside the bound
+                        // rather than resize `scratch` to a multi-GiB buffer;
+                        // fall back to the configured geometry (raw mode).
+                        log::warn!(
+                            "[linux_display] header dims {w}x{h} out of range (max {SRF1_MAX_DIM}); raw fallback {}x{}",
+                            st.width,
+                            st.height
+                        );
+                        st.header_mode = false;
+                    } else if w != st.width || h != st.height {
+                        st.width = w;
+                        st.height = h;
+                        st.frame_size = w * h * 2;
+                        st.scratch.resize(st.frame_size, 0);
+                    }
+                } else {
+                    log::warn!(
+                        "[linux_display] header mode: frame magic mismatch; raw fallback {}x{}",
+                        st.width,
+                        st.height
+                    );
+                    st.header_mode = false;
+                }
+                st.scratch_pos = 0;
+            }
+            continue;
+        }
+        if st.frame_size == 0 {
+            break; // no geometry yet (header pending) — nothing to accumulate
+        }
         let want = st.frame_size - st.scratch_pos;
         let take = (n - consumed).min(want);
         st.scratch[st.scratch_pos..st.scratch_pos + take]
@@ -392,6 +452,9 @@ fn linux_display_step(state: *mut u8) -> i32 {
             }
             st.frame_counter = st.frame_counter.wrapping_add(1);
             st.scratch_pos = 0;
+            if st.header_mode {
+                st.hdr_pos = 0; // expect the next frame's header
+            }
         }
     }
     0
@@ -404,6 +467,7 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
     let mut width: usize = 0;
     let mut height: usize = 0;
     let mut scale: usize = 1;
+    let mut header_mode = false;
     let mut path = String::new();
     walk_tlv(params, |tag, value| match tag {
         DISPLAY_TAG_MODE => mode_raw = tlv_u8(value),
@@ -411,6 +475,7 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
         DISPLAY_TAG_WIDTH => width = tlv_u32(value) as usize,
         DISPLAY_TAG_HEIGHT => height = tlv_u32(value) as usize,
         DISPLAY_TAG_SCALE => scale = (tlv_u32(value) as usize).max(1),
+        DISPLAY_TAG_HEADER => header_mode = tlv_u32(value) != 0,
         _ => {}
     });
     let mode = resolve_mode(mode_raw);
@@ -422,7 +487,7 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
         DisplayMode::Window => "window",
     };
     log::info!(
-        "[linux_display] mode={mode_str} {width}x{height} scale={scale} ({frame_size} bytes/frame) path='{path}'",
+        "[linux_display] mode={mode_str} {width}x{height} scale={scale} ({frame_size} bytes/frame) header={header_mode} path='{path}'",
     );
 
     #[cfg(feature = "host-window")]
@@ -452,6 +517,9 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
             scratch: vec![0u8; frame_size],
             scratch_pos: 0,
             frame_counter: 0,
+            header_mode,
+            hdr: [0u8; SRF1_HDR_LEN],
+            hdr_pos: 0,
             #[cfg(feature = "host-window")]
             window,
         }),

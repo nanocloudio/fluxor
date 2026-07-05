@@ -17,10 +17,14 @@ extern "C" {
     /// schedules them through a WebAudio AudioContext at the
     /// configured sample rate.
     fn host_audio_play(ptr: *const u8, len: usize, sample_rate: u32, channels: u32);
-    /// Microseconds of audio currently queued ahead of the WebAudio
-    /// playback clock (`audioSchedTime - currentTime`), or 0 until the
-    /// AudioContext is running. Read straight from the audio clock — no
-    /// wall-clock estimation, so it's exact and drift-free.
+    /// Whether the browser renderer can consume PCM right now. Zero ring lead is
+    /// ambiguous before WebAudio has been unlocked, so readiness is a separate
+    /// signal rather than being inferred from `host_audio_lead_us`.
+    fn host_audio_ready() -> i32;
+    /// Microseconds of audio currently buffered in the AudioWorklet ring
+    /// (frames buffered ÷ sample rate), or 0 until the worklet is up and the
+    /// AudioContext is running. Read straight from the audio render thread's
+    /// ring fill — no wall-clock estimation, so it's exact and drift-free.
     fn host_audio_lead_us() -> u64;
 }
 
@@ -29,23 +33,25 @@ extern "C" {
 /// headroom for stereo + small jitter buffer).
 const READ_BUF_BYTES: usize = 4096;
 
-/// Target amount of audio queued ahead of the real-time playback clock,
-/// in microseconds. The sink forwards PCM to the WebAudio scheduler only
-/// until it is this far ahead, then HOLDS — leaving decoded PCM in the
-/// input channel so back-pressure propagates upstream
+/// Target ring depth, in microseconds. The sink forwards PCM to the
+/// AudioWorklet ring only until it is this full, then HOLDS — leaving
+/// decoded PCM in the input channel so back-pressure propagates upstream
 /// (codec → producer → fetch) and the whole pipeline is paced to the
 /// audio clock.
 ///
-/// Without this, the sink drains its input every tick and dumps every
-/// block into WebAudio, whose schedule advances at the browser's frame
-/// rate, NOT the 44.1 kHz audio clock. On a fast/visible tab the pipeline
-/// produces many× real-time, so the schedule races ahead, the shim clamps
-/// it at its `MAX_AHEAD` ceiling, and blocks overlap — audible as a fast,
-/// garbled, uneven-tempo playback. Holding at a bounded lead keeps the
-/// schedule between the shim's lookahead (~120 ms) and its clamp
-/// (~400 ms), so it never overlaps and never underruns. 200 ms leaves a
-/// comfortable jitter cushion on both sides (rAF granularity, GC pauses).
-const LEAD_TARGET_US: u64 = 200_000;
+/// Without this, the sink drains its input every tick and floods the ring;
+/// the ring's drop-oldest overflow path then discards audio. Holding at a
+/// bounded ring depth keeps the producer matched to the 44.1 kHz audio
+/// clock instead of free-running at the (much faster, when visible) frame
+/// rate.
+///
+/// The ring (host_shims.js `createAudioScheduler` / `pcm-ring`) always plays at
+/// exactly the source sample rate. This target sets its normal latency: 120 ms
+/// absorbs Worker/main-thread delivery jitter while remaining comfortably below
+/// the 320 ms ring cap. If production misses real time the worklet emits silence
+/// and reports an underflow; it must never hide the miss by changing music pitch
+/// or duration.
+const LEAD_TARGET_US: u64 = 120_000;
 
 #[repr(C)]
 pub(crate) struct AudioState {
@@ -85,6 +91,14 @@ fn audio_step(state: *mut u8) -> i32 {
         }
         let st = &mut *st_ptr;
         if st.in_chan < 0 {
+            return 0;
+        }
+
+        // Retain PCM in Fluxor's bounded channels until the AudioContext is
+        // running and its worklet is connected. Draining earlier creates an
+        // unbounded JS/MessagePort backlog which is discarded when Safari finally
+        // resumes the shallow render ring.
+        if host_audio_ready() <= 0 {
             return 0;
         }
 

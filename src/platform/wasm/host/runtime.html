@@ -914,6 +914,8 @@
 
     let kernel = null;
     let loopHandle = null;
+    let stepRunning = false;   // cooperative-pump run flag (teardown clears it)
+    let workerRef = null;      // emulation Worker (?worker=1 mode), if any
     let currentAssetUrl = null;
 
     // Asset bank: bundle-level (one Map<name, Uint8Array> shared across
@@ -948,8 +950,74 @@
     }
 
     function teardownKernel() {
+      stepRunning = false;
       if (loopHandle) { cancelAnimationFrame(loopHandle); loopHandle = null; }
+      if (workerRef) { workerRef.terminate(); workerRef = null; }
       kernel = null;
+    }
+
+    // Run the kernel in a Worker (off the main thread). The page keeps the canvas
+    // (transferred as an OffscreenCanvas the Worker draws into), the AudioContext,
+    // and input capture; the Worker runs kernel_init + the step pump + all host
+    // shims. This is the real fix for a CPU-bound core: the page stays responsive.
+    async function bootKernelInWorker(displayEl, assetUrl) {
+      await window.__fluxorShimReady; // need window.fluxor.createAudioScheduler
+      const canvas = document.createElement('canvas');
+      canvas.style.maxWidth = '100%'; canvas.style.height = 'auto'; canvas.style.imageRendering = 'pixelated';
+      displayEl.replaceChildren(canvas);
+      const offscreen = canvas.transferControlToOffscreen();
+      // The SAME adaptive scheduler host_shims uses in-process — no drift, no naive
+      // reimplementation. The Worker forwards PCM here; the page owns the AudioContext.
+      const audio = window.fluxor.createAudioScheduler((lvl, msg) => { append(`[wasm] ${msg}`, lvl >= 3 ? 'err' : ''); if (lvl >= 2) console.log('[wasm] ' + msg); });
+      const worker = new Worker(window.__fluxorBase + 'fluxor-worker.js');
+      workerRef = worker;
+      worker.onmessage = (e) => {
+        const m = e.data;
+        switch (m.type) {
+          case 'log': append(`[wasm] ${m.msg}`, m.level >= 3 ? 'err' : ''); if (m.level >= 2) console.log('[wasm] ' + m.msg); break;
+          case 'panic': append(`[wasm PANIC] ${m.msg}`, 'err'); break;
+          case 'perf': console.log(`[perf] ${m.ticksPerSec} ticks/s, ${m.bursts} bursts, ${m.budgetBound} budget-bound (${m.budgetMs}ms/${m.stepMax}) [worker]`); break;
+          case 'canvas-frame': setStatus(`rendered ${m.w}×${m.h}`); break;
+          case 'audio': { audio.schedule(new Int16Array(m.pcm), m.sampleRate, m.channels); worker.postMessage({ type: 'audio-lead', leadUs: Number(audio.leadUs()), cursor: audio.frameCursor(), ready: audio.ready() }); break; }
+        }
+      };
+      worker.onerror = (ev) => append(`[worker error] ${ev.message || ev}`, 'err');
+      worker.onmessageerror = (ev) => append(`[worker messageerror] ${ev.message || 'could not deserialize Worker message'}`, 'err');
+      worker.postMessage({
+        type: 'boot',
+        module: bundleModule,
+        assetBank: bundleAssetBank,
+        canvas: offscreen,
+        shimsUrl: window.__fluxorBase + 'host_shims.js',
+        manifestUrl: window.__fluxorBase + 'fluxor-manifest.json',
+        assetUrl,
+      }, [offscreen]);
+      // Push the LIVE audio-clock lead to the Worker on a timer, not only after each
+      // audio frame. wasm_browser_audio (in the Worker) paces on host_audio_lead_us;
+      // if audio pauses (a scene transition), no PCM frame arrives, so a per-frame-only
+      // update leaves the cached lead stale-HIGH — the sink thinks the queue is full
+      // and HOLDS, so music starts late then floods. A steady push lets the cached lead
+      // drain as the clock advances, so the sink resumes promptly. ~10 ms = frame-grain.
+      const leadTimer = setInterval(() => {
+        if (!workerRef) { clearInterval(leadTimer); return; }
+        // Also push the audio frame cursor: the Worker owns the GPU-RDP present (the
+        // OffscreenCanvas is there) but the AudioContext is on the page, so the page
+        // sends the master clock; the Worker presents the cursor-selected frame.
+        worker.postMessage({ type: 'audio-lead', leadUs: Number(audio.leadUs()), cursor: audio.frameCursor(), ready: audio.ready() });
+      }, 10);
+
+      // Forward input the page captures (keyboard queue + pointer/button queues) to
+      // the Worker; it repopulates the queues host_shims' *_pop functions drain.
+      const fwd = () => {
+        if (!workerRef) return;
+        const kbd = inputQueue.splice(0);
+        const ptr = (window.__fluxor_pointer_queue || []).splice(0);
+        const btn = (window.__fluxor_button_queue || []).splice(0);
+        if (kbd.length || ptr.length || btn.length) worker.postMessage({ type: 'input', keyboard: kbd, pointer: ptr, button: btn });
+        setTimeout(fwd, 16);
+      };
+      fwd();
+      append('[shell] emulation running in Worker (off main thread)', 'info');
     }
 
     async function bootKernel(scenario, surfacesByRole, assetUrl) {
@@ -974,6 +1042,19 @@
       // In player mode the canvas mounts into our `.stage`; otherwise it
       // falls back to the generic display/player surface.
       const displayEl = playerStage || surfacesByRole.get('display') || surfacesByRole.get('player') || document.body;
+
+      // ?worker=1 — run the whole emulation kernel in a Web Worker (off the main
+      // thread). The real fix for a CPU-bound core: the page no longer freezes
+      // behind a long synchronous step burst. Opt-in for now; the main-thread path
+      // below is the unchanged fallback.
+      // Hash fragment (#worker) not query string: the fluxor http router matches
+      // the full path incl. ?query, so "/?worker=1" 404s; "/#worker" is client-only.
+      let useWorker = false;
+      try { useWorker = /worker/.test(location.hash) || new URLSearchParams(location.search).has('worker'); } catch (e) {}
+      if (useWorker) {
+        try { await bootKernelInWorker(displayEl, assetUrl); return; }
+        catch (err) { append(`[shell] worker boot failed (${err.message || err}); falling back to main thread`, 'err'); }
+      }
 
       // Resolves once the storage.namespace index (shipped manifest + OPFS)
       // is hydrated. We block kernel startup on it so a scanner's first LIST
@@ -1022,18 +1103,51 @@
       const initRet = kInit();
       append(`[wasm] kernel_init() → ${initRet}`, 'info');
 
+      // Cooperative scheduler pump. The old loop ran a FIXED 32 kernel_step calls
+      // synchronously per requestAnimationFrame; with a CPU-bound emulator each
+      // burst took 100+ ms, monopolising the main thread so audio scheduling, GPU
+      // promise completion and presentation were all blocked until it finished
+      // (jank, RAF stalls, audio underruns). Instead, run kernel_step in a
+      // TIME-BUDGETED burst and YIELD to the event loop between bursts via a
+      // MessageChannel (a macrotask) — the browser gets to paint, resolve GPU
+      // mapAsync promises and service audio every few ms. Decoupled from RAF so a
+      // fast machine is not capped at the 60 Hz paint rate. The real fix for a
+      // CPU-bound core is a Worker (so the main thread is never touched); this
+      // keeps the page responsive until then. STEP_BUDGET_MS / STEP_MAX are tunable.
+      const STEP_BUDGET_MS = 10;   // max main-thread time per burst before yielding
+      const STEP_MAX = 64;         // hard ceiling on steps per burst
       let ticked = 0;
-      function frame() {
-        for (let i = 0; i < 32; i++) {
-          try { kStep(); ticked++; }
+      let diagTicks = 0, diagBursts = 0, diagBudgetBound = 0, diagLast = performance.now();
+      const stepCh = new MessageChannel();
+      stepRunning = true;
+      function pump() {
+        if (!stepRunning) return;
+        const start = performance.now();
+        let i = 0;
+        for (; i < STEP_MAX; i++) {
+          try { kStep(); ticked++; diagTicks++; }
           catch (err) {
             append(`[wasm] kernel_step trapped after ${ticked} ticks: ${err.message || err}`, 'err');
+            stepRunning = false;
             return;
           }
+          if (performance.now() - start >= STEP_BUDGET_MS) { i++; break; }
         }
-        loopHandle = requestAnimationFrame(frame);
+        diagBursts++;
+        if (i >= STEP_MAX || (performance.now() - start) >= STEP_BUDGET_MS) diagBudgetBound++;
+        // Periodic perf line: ticks/s and how often a burst was budget/ceiling
+        // bound (i.e. the core is CPU-bound on the main thread — Worker territory).
+        const now = performance.now();
+        if (now - diagLast >= 2000) {
+          const dt = (now - diagLast) / 1000;
+          // console (visible in devtools while profiling), not just the DOM overlay.
+          console.log(`[perf] ${(diagTicks / dt).toFixed(0)} ticks/s, ${diagBursts} bursts, ${diagBudgetBound} budget-bound (${STEP_BUDGET_MS}ms/${STEP_MAX})`);
+          diagTicks = 0; diagBursts = 0; diagBudgetBound = 0; diagLast = now;
+        }
+        stepCh.port2.postMessage(0); // yield to the event loop, then continue
       }
-      loopHandle = requestAnimationFrame(frame);
+      stepCh.port1.onmessage = pump;
+      stepCh.port2.postMessage(0);   // kick off the pump
     }
 
     // ---------------------------------------------------------------

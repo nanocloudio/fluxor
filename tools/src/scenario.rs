@@ -783,6 +783,9 @@ pub fn synthesise_host_config(
 const CANONICAL_RUNTIME_HTML_RAW: &str = include_str!("../../src/platform/wasm/host/runtime.html");
 const CANONICAL_HOST_SHIMS_JS_RAW: &str =
     include_str!("../../src/platform/wasm/host/host_shims.js");
+/// Emulation Worker (?worker=1): runs the kernel + step pump off the main thread.
+/// importScripts'es the canonical host_shims.js; reused across every scenario.
+const CANONICAL_WORKER_JS_RAW: &str = include_str!("../../src/platform/wasm/host/fluxor-worker.js");
 /// Generic browser-overlay renderer (`presentation.shell`). Inlined
 /// into the served runtime.html (rather than a separate route) so it
 /// costs no slot against the kernel's `MAX_ROUTES = 8`. Defines
@@ -1058,11 +1061,70 @@ fn synthesise_host_routes(
     } else {
         format!("{}/host_shims.js", runtime_prefix.trim_end_matches('/'))
     };
-    routes.push(serde_json::json!({
-        "path": shims_url,
-        "body": canonical_host_shims_js_body(),
-        "content_type": "application/javascript",
-    }));
+    // Served as a FILE (fs_path), not an inline body: at ~90 KiB it dominates the
+    // config arena (256 KiB), leaving no room for runtime.html to grow. The browser
+    // fetches it by URL either way; this just keeps it out of the config blob.
+    {
+        let work_dir = scenario_work_dir(scenario);
+        fs::create_dir_all(&work_dir).map_err(|e| {
+            Error::Config(format!(
+                "scenario {}: cannot create work dir {}: {}",
+                scenario_path.display(),
+                work_dir.display(),
+                e
+            ))
+        })?;
+        let shims_path = work_dir.join("host_shims.js");
+        fs::write(&shims_path, canonical_host_shims_js_body()).map_err(|e| {
+            Error::Config(format!(
+                "scenario {}: cannot write {}: {}",
+                scenario_path.display(),
+                shims_path.display(),
+                e
+            ))
+        })?;
+        routes.push(serde_json::json!({
+            "path": shims_url,
+            "fs_path": shims_path.display().to_string(),
+            "content_type": "application/javascript",
+        }));
+    }
+
+    // ── /fluxor-worker.js → emulation Worker (?worker=1 opt-in). Runs the kernel
+    //    off the main thread; importScripts'es the host_shims.js route above. Served
+    //    as a FILE (fs_path), not an inline body: the config arena (256 KiB) is
+    //    already near full with runtime.html + host_shims.js, so an inline body
+    //    overflows it. Harmless when ?worker=1 is not used — simply never fetched.
+    {
+        let work_dir = scenario_work_dir(scenario);
+        fs::create_dir_all(&work_dir).map_err(|e| {
+            Error::Config(format!(
+                "scenario {}: cannot create work dir {}: {}",
+                scenario_path.display(),
+                work_dir.display(),
+                e
+            ))
+        })?;
+        let worker_path = work_dir.join("fluxor-worker.js");
+        fs::write(&worker_path, CANONICAL_WORKER_JS_RAW).map_err(|e| {
+            Error::Config(format!(
+                "scenario {}: cannot write {}: {}",
+                scenario_path.display(),
+                worker_path.display(),
+                e
+            ))
+        })?;
+        let worker_url = if runtime_prefix == "/" {
+            "/fluxor-worker.js".to_string()
+        } else {
+            format!("{}/fluxor-worker.js", runtime_prefix.trim_end_matches('/'))
+        };
+        routes.push(serde_json::json!({
+            "path": worker_url,
+            "fs_path": worker_path.display().to_string(),
+            "content_type": "application/javascript",
+        }));
+    }
 
     // ── /scenario.json → inline static body with the wasm component's
     //    presentation block + playlist source + bundle URL. The shell
@@ -2695,14 +2757,15 @@ bindings:
         assert_eq!(modules[0]["host_tcp"], 1);
         let routes = modules[0]["routes"].as_array().unwrap();
         // serve binding contributes /, /fluxor.wasm (2 routes);
-        // synthesiser auto-mounts /host_shims.js + /scenario.json
-        // (2 more); list binding contributes /api/list (1 more).
-        // Total = 5.
-        assert_eq!(routes.len(), 5);
+        // synthesiser auto-mounts /host_shims.js + /fluxor-worker.js +
+        // /scenario.json (3 more); list binding contributes /api/list
+        // (1 more). Total = 6.
+        assert_eq!(routes.len(), 6);
         let paths: Vec<&str> = routes.iter().map(|r| r["path"].as_str().unwrap()).collect();
         assert!(paths.contains(&"/"));
         assert!(paths.contains(&"/fluxor.wasm"));
         assert!(paths.contains(&"/host_shims.js"));
+        assert!(paths.contains(&"/fluxor-worker.js"));
         assert!(paths.contains(&"/scenario.json"));
         assert!(paths.contains(&"/api/list"));
         // wiring is the canonical 2-edge linux net loop

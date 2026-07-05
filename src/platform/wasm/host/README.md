@@ -94,6 +94,16 @@ This directory was previously `examples/wasm/{viewer.html,player.html,host_shims
 No per-bundle HTML, no per-bundle JS. One runtime, infinitely many
 graphs.
 
+**Host extensions:** domain-specific host executors are NOT part of
+`host_shims.js`. They ship as separately served scripts that call
+`FluxorHostExt.register(name, factory)` at load; the shim's generic
+capability entries delegate through the registry, loading the script
+lazily on first use (`importScripts` in a Worker, `<script>` injection
+on the page). The registry currently has no in-tree clients: app-domain
+GPU work goes through the generic `wasm_browser_compute` driver instead
+(pipelines, buffers and dispatch lists arrive as channel data, so no
+host-side executor is needed).
+
 ## How `presentation:` drives layout
 
 The wasm component graph's top-level `presentation:` block declares

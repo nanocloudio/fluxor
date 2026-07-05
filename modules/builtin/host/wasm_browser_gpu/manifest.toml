@@ -4,7 +4,7 @@ builtin = true
 
 # WebGPU rendering backend. Consumes GPU draw commands on the input
 # port and renders to a `<canvas>` element using WebGPU through the
-# host shim's `host_webgpu_*` imports.
+# host shim's `host_gpu_raster_*` imports.
 #
 # Command format: binary-encoded FRAME_BEGIN, SET_UNIFORMS,
 # UPLOAD_VERTICES, DRAW, FRAME_END opcodes.

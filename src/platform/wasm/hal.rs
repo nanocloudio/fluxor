@@ -116,6 +116,11 @@ fn wasm_init_providers() {
     // `requires_contract = "storage.namespace"` consumers (truffle's
     // scanner) walk a tree the browser has no POSIX `readdir` for.
     super::namespace::register();
+    // Audio-clock StreamTime authority — answers `provider_query(-1, STREAM_TIME)`
+    // from the browser AudioWorklet's played-frame clock, so an app's producer and
+    // presenter pace on ONE audio-master clock (mirrors the Linux/RP2350 audio
+    // sinks registering HAL_PIO). See `stream_time.rs`.
+    super::stream_time::register();
 }
 /// Platform-specific per-module cleanup for WASM host..
 ///

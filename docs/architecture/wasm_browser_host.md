@@ -515,6 +515,50 @@ Used when the codec/container is natively playable and sync
 constraints are loose — see `endpoint_capability_surface.md` §9
 "Direct media" routing mode.
 
+### 5.9 `wasm_browser_gpu` / `wasm_browser_compute` — generic GPU raster + compute
+
+| Module | Port | Direction | Content type |
+|--------|------|-----------|--------------|
+| `wasm_browser_gpu`     | `commands` | input  | `OctetStream` (raster command stream) |
+| `wasm_browser_compute` | `commands` | input  | `OctetStream` (compute command stream) |
+| `wasm_browser_compute` | `readback` | output | `OctetStream` (optional; compute→CPU results) |
+
+**Backend-agnostic GPU capability surfaces.** Both modules hold ZERO
+application knowledge — no shaders, no vertex/buffer formats, no pixel
+semantics. The application supplies shaders and describes the work as
+data on the input channel; the driver only frames the command stream
+and forwards it to a backend surface:
+
+- **Raster** (`wasm_browser_gpu`) → `host_gpu_raster_*`: app-supplied
+  render pipelines (WGSL or SPIR-V), vertex/index/uniform buffers
+  (single-shot or streamed), draw, and frame lifecycle. Presents to a
+  `<canvas>`. See the module doc-comment in
+  `src/platform/wasm/gpu.rs` for the command byte layout.
+- **Compute** (`wasm_browser_compute`) → `host_gpu_compute_*`:
+  app-supplied compute pipelines, storage/uniform buffers, dispatch
+  command lists (a whole frame's dispatches in one `SUBMIT`), present of
+  a result buffer, and optional readback to the output channel. The
+  command opcodes are single-sourced in
+  `modules/sdk/contracts/gpu_compute_wire.rs` (pinned by
+  `tests/harness/tests/gpu_compute_wire.rs`); byte layout in
+  `src/platform/wasm/compute.rs`.
+
+The backend here is WebGPU (with a WebGL2 raster fallback where noted),
+but the surfaces are backend-neutral by name: a Vulkan linux built-in
+or a bare-metal GPU driver implements the same `host_gpu_raster_*` /
+`host_gpu_compute_*` imports, so a graph wired to these modules runs
+unchanged on any backend (shipping the SPIR-V shader variant where the
+backend needs it).
+
+**Domain-specific GPU pipelines live out of tree.** A fixed-function or
+console rasteriser, a media/scientific compute kernel, etc. is an
+*application* that consumes these generic surfaces — it ships its own
+shaders as data and generates the command stream. Fluxor holds no
+domain knowledge. Present *timing* is the app's decision; pace it on the
+`STREAM_TIME` audio clock (§5.1) for A/V sync. A worked non-domain
+example is `examples/compute_demo/` (a gradient-fill compute shader +
+the exact command encoding).
+
 ---
 
 ## 6. Audio Unlock and Lifecycle
