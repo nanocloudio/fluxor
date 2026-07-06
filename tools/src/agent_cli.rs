@@ -13,10 +13,12 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use crate::error::{Error, Result};
-use fluxor_tools::compose::{DesiredPhase, NodeCapacity, PodDesired, ResourceProfile};
+use fluxor_tools::compose::{
+    capacity_for_profile, DesiredPhase, NodeCapacity, PodDesired, ResourceProfile,
+};
 use fluxor_tools::genstore::{FsStorage, GenStore};
 use fluxor_tools::node_agent::{
-    publish_committed_plan, remove_pod_and_commit, upsert_pod_and_commit,
+    node_status, publish_committed_plan, remove_pod_and_commit, upsert_pod_and_commit,
 };
 use fluxor_tools::workload::{
     parse_manifest, parse_resource_profile, select_implementation, validate,
@@ -35,6 +37,19 @@ pub enum AgentCommand {
     Commit(CommitArgs),
     /// Remove a pod from the desired state, recompose, and publish.
     Remove(RemoveArgs),
+    /// Report the node's committed generation and per-pod status
+    /// (owner-tagged: pod UID + owner slot + generation, rfc_k8s.md §17.2).
+    Status(StatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Generation-store directory.
+    #[arg(long)]
+    pub store: PathBuf,
+    /// Machine-readable JSON output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -46,6 +61,10 @@ pub struct RemoveArgs {
     /// Pod UID as 32 hex chars (dashes allowed).
     #[arg(long)]
     pub pod_uid: String,
+    /// Target capacity profile (linux | cm5 | bcm2712) — sets the kernel
+    /// limits admission checks against.
+    #[arg(long, default_value = "linux")]
+    pub profile: String,
 }
 
 #[derive(Args, Debug)]
@@ -80,6 +99,10 @@ pub struct CommitArgs {
     /// `resources.json` — overriding the explicit profile flags above.
     #[arg(long)]
     pub bundle: Option<PathBuf>,
+    /// Target capacity profile (linux | cm5 | bcm2712) — sets the kernel
+    /// limits admission checks against.
+    #[arg(long, default_value = "linux")]
+    pub profile: String,
 }
 
 /// Raw sha256 of `bytes`.
@@ -180,26 +203,70 @@ fn parse_pod_uid(hex: &str) -> Result<[u8; 16]> {
     Ok(uid)
 }
 
-/// Node capacity facts for the Linux host profile (matches
-/// `modules/sdk/config.rs` `profile_host`). A future verb can read these from
-/// the running kernel instead of mirroring the profile.
-fn linux_capacity() -> NodeCapacity {
-    NodeCapacity {
-        max_owners: 64,
-        max_modules: 128,
-        max_edges: 128,
-        state_bytes: 64 * 1024 * 1024,
-        buffer_bytes: 8 * 1024 * 1024,
-        max_endpoints: 64,
-        max_domains: 4,
-    }
+/// Capacity for the named target profile, from the kernel-mirroring table in
+/// `compose` (drift-guarded against the kernel sources there). Unknown
+/// profiles are a hard admission error, never a silent linux fallback.
+fn capacity(profile: &str) -> Result<NodeCapacity> {
+    capacity_for_profile(profile).ok_or_else(|| {
+        Error::Config(format!(
+            "unknown capacity profile '{profile}' (known: linux, cm5, bcm2712)"
+        ))
+    })
 }
 
 pub fn dispatch(args: AgentArgs) -> Result<()> {
     match args.command {
         AgentCommand::Commit(c) => commit(c),
         AgentCommand::Remove(r) => remove(r),
+        AgentCommand::Status(s) => status(s),
     }
+}
+
+fn status(a: StatusArgs) -> Result<()> {
+    let storage = FsStorage::open(&a.store)
+        .map_err(|e| Error::Config(format!("open store {}: {e}", a.store.display())))?;
+    let store = GenStore::new(storage);
+    let st = node_status(&store).map_err(|e| Error::Config(format!("status failed: {e:?}")))?;
+    if a.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&st).map_err(|e| Error::Config(e.to_string()))?
+        );
+        return Ok(());
+    }
+    match st.generation {
+        Some(g) => println!("generation {g}"),
+        None => println!("generation - (nothing committed)"),
+    }
+    match &st.committed_abi_surface {
+        Some(pin) if *pin != st.abi_surface => println!(
+            "abi-surface {} (WARNING: committed generation pinned to {} — \
+             restage before rolling the substrate)",
+            st.abi_surface, pin
+        ),
+        _ => println!("abi-surface {}", st.abi_surface),
+    }
+    println!(
+        "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6}",
+        "POD-UID", "NAME", "NAMESPACE", "PHASE", "SLOT", "GEN", "MODULES", "EDGES"
+    );
+    for p in &st.pods {
+        let dash = || "-".to_string();
+        println!(
+            "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6}",
+            p.pod_uid_hex,
+            p.name,
+            p.namespace,
+            format!("{:?}", p.desired_phase),
+            p.slot.map(|v| v.to_string()).unwrap_or_else(dash),
+            p.owner_generation
+                .map(|v| v.to_string())
+                .unwrap_or_else(dash),
+            p.modules.map(|v| v.to_string()).unwrap_or_else(dash),
+            p.edges.map(|v| v.to_string()).unwrap_or_else(dash),
+        );
+    }
+    Ok(())
 }
 
 fn remove(r: RemoveArgs) -> Result<()> {
@@ -207,7 +274,8 @@ fn remove(r: RemoveArgs) -> Result<()> {
     let storage = FsStorage::open(&r.store)
         .map_err(|e| Error::Config(format!("open store {}: {e}", r.store.display())))?;
     let mut store = GenStore::new(storage);
-    let (plan, gen) = remove_pod_and_commit(&mut store, pod_uid, &linux_capacity())
+    let cap = capacity(&r.profile)?;
+    let (plan, gen) = remove_pod_and_commit(&mut store, pod_uid, &cap)
         .map_err(|e| Error::Config(format!("remove/recompose failed: {e:?}")))?;
     publish_committed_plan(&store, &r.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?;
@@ -245,7 +313,8 @@ fn commit(c: CommitArgs) -> Result<()> {
     let storage = FsStorage::open(&c.store)
         .map_err(|e| Error::Config(format!("open store {}: {e}", c.store.display())))?;
     let mut store = GenStore::new(storage);
-    let (_plan, gen) = upsert_pod_and_commit(&mut store, pod, &linux_capacity())
+    let cap = capacity(&c.profile)?;
+    let (_plan, gen) = upsert_pod_and_commit(&mut store, pod, &cap)
         .map_err(|e| Error::Config(format!("reconcile/commit failed: {e:?}")))?;
     publish_committed_plan(&store, &c.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?

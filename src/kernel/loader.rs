@@ -1654,6 +1654,48 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         eh.update(&manifest_data[0..14]);
                         eh.update([manifest_data[14] & 0xFC]);
                         eh.update(&manifest_data[15..hash_offset]);
+                        // ABI-surface attestation: at its CANONICAL offset —
+                        // integrity hash (32) then signature block (96) then
+                        // attestation (32) — and the manifest must end exactly
+                        // there. Reading "the last 32 bytes" instead would let
+                        // an inflated manifest carry a second, signed copy at
+                        // the end while parsers read a substituted value at
+                        // the canonical offset. Matches `cmd_sign`, which
+                        // hashes the freshly-serialized (slack-free) layout.
+                        if manifest_data[14] & 0x10 != 0 {
+                            let attn_offset = hash_offset + 32 + 96;
+                            if manifest_size != attn_offset + 32 {
+                                log::error!(
+                                    "[loader] {name}: attestation flag with non-canonical manifest size"
+                                );
+                                return Err(LoaderError::SignatureInvalid);
+                            }
+                            let attn = &manifest_data[attn_offset..attn_offset + 32];
+                            eh.update(attn);
+                            // Runtime ABI-surface enforcement (not just signature
+                            // coverage): a validly-signed module built against a
+                            // DIFFERENT surface than this kernel must be refused —
+                            // its hardcoded opcode/errno/flag numbers no longer
+                            // match. Compare the embedded attestation to the
+                            // kernel's OWN surface digest, from the same canonical
+                            // stream the tools hash (lockstep-tested).
+                            let mut ks = Sha256::new();
+                            crate::abi::abi_surface::write_surface(&mut |b| ks.update(b));
+                            let kd = ks.finalize();
+                            if attn != kd.as_slice() {
+                                log::error!(
+                                    "[loader] {name}: ABI-surface mismatch — module built for a different substrate"
+                                );
+                                return Err(LoaderError::SignatureInvalid);
+                            }
+                        } else if cfg!(feature = "enforce_signatures") {
+                            // Signed but unattested under enforcement: an attested
+                            // substrate is mandatory, so refuse.
+                            log::error!(
+                                "[loader] {name}: signed module carries no ABI attestation"
+                            );
+                            return Err(LoaderError::SignatureInvalid);
+                        }
                         let d = eh.finalize();
                         let mut h = [0u8; 32];
                         h.copy_from_slice(&d);

@@ -1647,6 +1647,11 @@ registerProcessor('pcm-ring', PcmRing);
       return s;
     };
     let gpuDepthTexture = null;
+    // MSAA 4x: frames render into a multisampled color target that resolves
+    // to the canvas at end of pass; depth matches the sample count and every
+    // pipeline is created with multisample.count = GPU_MSAA.
+    const GPU_MSAA = 4;
+    let gpuMsaaTexture = null;
     let gpuEncoder = null;
     let gpuPass = null;
     let gpuInitialized = false;
@@ -1739,9 +1744,16 @@ registerProcessor('pcm-ring', PcmRing);
 
           // Depth texture is created eagerly; whether a frame attaches it is
           // decided by the app's pipeline descriptor (depth flag).
+          gpuMsaaTexture = gpuDevice.createTexture({
+            size: [gpuCanvas.width, gpuCanvas.height],
+            format: gpuFormat,
+            sampleCount: GPU_MSAA,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          });
           gpuDepthTexture = gpuDevice.createTexture({
             size: [gpuCanvas.width, gpuCanvas.height],
             format: 'depth24plus',
+            sampleCount: GPU_MSAA,
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
           });
 
@@ -1835,6 +1847,7 @@ registerProcessor('pcm-ring', PcmRing);
               cullMode: cullBack ? 'back' : 'none',
               frontFace: 'ccw',
             },
+            multisample: { count: GPU_MSAA },
           };
           if (wantDepth) {
             desc.depthStencil = {
@@ -1892,9 +1905,16 @@ registerProcessor('pcm-ring', PcmRing);
         gpuCanvas.height = height;
         // Old depth texture may be referenced by an in-flight frame — drop the
         // reference, don't destroy() (see the uniform-buffer note above).
+        gpuMsaaTexture = gpuDevice.createTexture({
+          size: [width, height],
+          format: gpuFormat,
+          sampleCount: GPU_MSAA,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
         gpuDepthTexture = gpuDevice.createTexture({
           size: [width, height],
           format: 'depth24plus',
+          sampleCount: GPU_MSAA,
           usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
         return 0;
@@ -2060,7 +2080,9 @@ registerProcessor('pcm-ring', PcmRing);
         gpuEncoder = gpuDevice.createCommandEncoder();
         gpuPass = gpuEncoder.beginRenderPass({
           colorAttachments: [{
-            view: texture.createView(),
+            // Render into the 4x MSAA target, resolve to the canvas
+            view: gpuMsaaTexture.createView(),
+            resolveTarget: texture.createView(),
             loadOp: 'clear',
             storeOp: 'store',
             clearValue: { r: r, g: g, b: b, a: 1.0 },

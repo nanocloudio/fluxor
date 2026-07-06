@@ -311,18 +311,46 @@ pub fn read_layout() -> Option<FlashLayout> {
     read_layout_from_trailer()
 }
 
+/// The running kernel's own ABI-surface digest — sha256 over the
+/// canonical `abi_surface` stream, computed on demand (a few KB of
+/// hashing, called at most twice per boot from slot selection).
+#[cfg(feature = "rp")]
+pub fn kernel_abi_surface_digest() -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    crate::abi::abi_surface::write_surface(&mut |bytes| h.update(bytes));
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Does a slot's ABI-surface pin admit it under `own` (the running
+/// kernel's digest)? Strict equality, no legacy grandfather: an
+/// all-0xFF (pre-pinning) slot is as unprovable as a mismatched one,
+/// and grandfathering it would leave incompatible graphs bootable
+/// forever after an ABI change — the exact failure the pin exists to
+/// prevent. Legacy slots are rejected like corrupt headers; rewrite
+/// them with a current `fluxor slot-image`.
+#[cfg(feature = "rp")]
+fn slot_pin_admits(pin: &[u8; 32], own: &[u8; 32]) -> bool {
+    pin == own
+}
+
 #[cfg(feature = "rp")]
 fn read_layout_from_slots() -> Option<FlashLayout> {
     use crate::abi::platform::rp::flash_layout;
     let slot_a = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_A_OFFSET) as *const u8;
     let slot_b = (flash_layout::XIP_BASE + flash_layout::GRAPH_SLOT_B_OFFSET) as *const u8;
 
+    let own_digest = kernel_abi_surface_digest();
     // SAFETY: slot_a and slot_b point into the XIP-mapped flash region;
-    // `decode_slot_header` reads 256 bytes per slot, which fits within
-    // the GRAPH_SLOT_*_OFFSET aperture sizing defined by flash_layout.
-    let a = unsafe { decode_slot_header(slot_a) };
+    // `decode_slot_header` reads 256 bytes per slot (header incl. the
+    // ABI-surface pin at GRAPH_SLOT_ABI_SURFACE_OFFSET), which fits
+    // within the GRAPH_SLOT_*_OFFSET aperture sizing defined by
+    // flash_layout.
+    let a = unsafe { decode_slot_header(slot_a, &own_digest) };
     // SAFETY: as above; slot_b is the secondary slot at a fixed offset.
-    let b = unsafe { decode_slot_header(slot_b) };
+    let b = unsafe { decode_slot_header(slot_b, &own_digest) };
     let (base, hdr) = match (a, b) {
         (Some(ha), Some(hb)) => {
             if ha.epoch >= hb.epoch {
@@ -352,7 +380,7 @@ struct SlotHeader {
 }
 
 #[cfg(feature = "rp")]
-unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
+unsafe fn decode_slot_header(base: *const u8, own_digest: &[u8; 32]) -> Option<SlotHeader> {
     use crate::abi::platform::rp::flash_layout;
     let magic = read_u32(base);
     if magic != flash_layout::GRAPH_SLOT_MAGIC {
@@ -383,6 +411,17 @@ unsafe fn decode_slot_header(base: *const u8) -> Option<SlotHeader> {
         return None;
     }
     if (config_offset as u64) + (config_size as u64) > flash_layout::GRAPH_SLOT_SIZE as u64 {
+        return None;
+    }
+
+    // ABI-surface pin: a slot built for an incompatible substrate is
+    // rejected exactly like a torn header — the other slot (or the
+    // trailer) stays selectable.
+    let mut pin = [0u8; 32];
+    for (i, byte) in pin.iter_mut().enumerate() {
+        *byte = *base.add(flash_layout::GRAPH_SLOT_ABI_SURFACE_OFFSET + i);
+    }
+    if !slot_pin_admits(&pin, own_digest) {
         return None;
     }
 

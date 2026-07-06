@@ -429,6 +429,21 @@ fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool
             }
         }
     }
+    // ABI-surface freshness — the precise invalidation trigger. Mtime cannot
+    // catch a digest change that comes from a deep SDK edit (kernel_abi.rs,
+    // wire.rs, contracts/*, platform/*, internal/*) or a regenerated digest
+    // const: those files are reached via `include!` and aren't in `inputs`
+    // (and needn't be individually enumerated). Instead compare the digest
+    // the existing `.fmod` embeds against the current surface directly —
+    // any change to the surface, from any source, invalidates exactly the
+    // modules that predate it. This is what makes `fluxor modules build`
+    // sufficient after an ABI change, with no `modules clean` step: a stale
+    // artifact rebuilds automatically instead of surviving to be rejected
+    // at packaging.
+    match crate::modules::ModuleInfo::from_file(out_path) {
+        Ok(info) if info.manifest.abi_surface == Some(crate::hash::abi_surface_digest()) => {}
+        _ => return false,
+    }
     true
 }
 

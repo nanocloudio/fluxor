@@ -37,6 +37,10 @@ pub mod modules;
 pub mod modules_build;
 pub mod monitor;
 pub mod observability;
+// Local OCI image-layout content store for `.fmod` modules and workload
+// bundles (`.context/fmod_registry_plan.md` P1/P2). Offline-first: publish
+// and consume both touch only the local store.
+pub mod oci_store;
 // Standalone, unit-testable validator for `presentation.shell` /
 // `presentation.browser_overlay` descriptors (RFC browser_overlay §19).
 // Dependency-light (serde_json + error) so it dual-compiles cleanly
@@ -64,3 +68,10 @@ pub mod workspace;
 )]
 #[path = "../../modules/sdk/wire.rs"]
 pub mod wire;
+
+/// Canonical ABI wire-surface encoding — path-mounted from
+/// `modules/sdk/abi_surface.rs` so host tools and the kernel fold the
+/// exact same byte stream into the ABI-surface digest that pins graph
+/// generations to a compatible substrate.
+#[path = "../../modules/sdk/abi_surface.rs"]
+pub mod abi_surface;

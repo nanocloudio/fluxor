@@ -112,6 +112,9 @@ struct State {
     /// Accumulator for partial frames read from `in_chan`.
     frame_buf: [u8; REQ_FRAME_MAX],
     frame_fill: u16,
+    /// This build's ABI-surface digest, computed once at `module_new` —
+    /// live-slot selection and activation both gate on it.
+    own_digest: [u8; 32],
 }
 
 // ============================================================================
@@ -166,8 +169,12 @@ unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
 unsafe fn refresh_live(s: &mut State) {
     let a = (XIP_BASE + SLOT_A_OFFSET) as *const u8;
     let b = (XIP_BASE + SLOT_B_OFFSET) as *const u8;
-    let ha = decode_header(a);
-    let hb = decode_header(b);
+    // Pin admission mirrors the kernel's boot selector exactly: a slot the
+    // kernel would reject at reboot must never be reported live (or have
+    // its config served) here either — an incompatible higher-epoch slot
+    // left behind by an older writer is invisible, not authoritative.
+    let ha = decode_header(a).filter(|_| slot_pin_admits(a, &s.own_digest));
+    let hb = decode_header(b).filter(|_| slot_pin_admits(b, &s.own_digest));
     match (ha, hb) {
         (Some(ha), Some(hb)) => {
             if ha.epoch >= hb.epoch {
@@ -242,6 +249,31 @@ unsafe fn do_write(s: &mut State, sys: &SyscallTable, payload: *const u8, payloa
     sys_program_page(sys, target, payload.add(4))
 }
 
+/// This build's ABI-surface digest — sha256 of the canonical
+/// `abi::abi_surface` stream. The module and the kernel it ships with are
+/// built from the same tree, so this equals the kernel's own digest (the
+/// lockstep is enforced by `tests/harness/tests/abi_surface_digest.rs`).
+fn own_abi_surface_digest() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    abi::abi_surface::write_surface(&mut |bytes| hasher.update(bytes));
+    hasher.finalize()
+}
+
+/// Slot ABI pin admission (mirror of the kernel selector's rule):
+/// strict equality with this build's surface digest, no legacy
+/// grandfather — an unprovable slot is rejected like a corrupt one.
+unsafe fn slot_pin_admits(base_xip: *const u8, own: &[u8; 32]) -> bool {
+    let mut pin = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        pin[i] = core::ptr::read(
+            base_xip.add(abi::platform::rp::flash_layout::GRAPH_SLOT_ABI_SURFACE_OFFSET + i),
+        );
+        i += 1;
+    }
+    ct_eq32(&pin, own)
+}
+
 unsafe fn do_activate(s: &mut State) -> i32 {
     refresh_live(s);
     let candidate = inactive_slot(s.live_slot);
@@ -253,6 +285,14 @@ unsafe fn do_activate(s: &mut State) -> i32 {
     let have_live = s.live_slot <= 1;
     if have_live && hdr.epoch <= s.live_epoch {
         return E_AGAIN;
+    }
+
+    // Refuse to activate a slot the kernel's boot selector would reject:
+    // reporting success here and then losing the graph at the next reboot
+    // is the worst outcome — fail the activation now, with the old slot
+    // still live.
+    if !slot_pin_admits(base_xip, &s.own_digest) {
+        return E_INVAL;
     }
 
     let mut hasher = Sha256::new();
@@ -431,6 +471,7 @@ pub extern "C" fn module_new(
         s.live_epoch = 0;
         s._pad = [0; 2];
         s.frame_fill = 0;
+        s.own_digest = own_abi_surface_digest();
         refresh_live(s);
         0
     }

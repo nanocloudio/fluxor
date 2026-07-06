@@ -19,6 +19,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// On-storage wire records (pointer records, generation headers) —
+/// path-mounted from `modules/sdk/genstore_wire.rs` so the host store and
+/// the device-side CM5 backend share one codec by construction (the same
+/// lockstep discipline as `wire.rs` / the plan codec pair).
+#[path = "../../modules/sdk/genstore_wire.rs"]
+pub mod genstore_wire;
+pub use genstore_wire::GenState;
+use genstore_wire::{GenHeaderView, PointerRecord};
+
 // ============================================================================
 // Storage backend
 // ============================================================================
@@ -125,74 +134,11 @@ impl Storage for FsStorage {
 }
 
 // ============================================================================
-// CRC32 (IEEE) — small inline impl for pointer-record integrity
-// ============================================================================
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-// ============================================================================
 // Generation pointer (A/B, epoch-selected, two-phase commit)
 // ============================================================================
 
-const PTR_A: &str = "ptr.a";
-const PTR_B: &str = "ptr.b";
-const PTR_MAGIC: u32 = 0x4750_5452; // "GPTR"
-
-/// A generation-pointer record: which generation is committed, under a
-/// monotonic epoch, integrity-checked with a CRC.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PointerRecord {
-    epoch: u64,
-    committed_gen: u64,
-}
-
-impl PointerRecord {
-    fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(24);
-        buf.extend_from_slice(&PTR_MAGIC.to_be_bytes());
-        buf.extend_from_slice(&self.epoch.to_be_bytes());
-        buf.extend_from_slice(&self.committed_gen.to_be_bytes());
-        let crc = crc32(&buf);
-        buf.extend_from_slice(&crc.to_be_bytes());
-        buf
-    }
-
-    fn decode(bytes: &[u8]) -> Option<PointerRecord> {
-        if bytes.len() != 24 {
-            return None;
-        }
-        if u32::from_be_bytes(bytes[0..4].try_into().ok()?) != PTR_MAGIC {
-            return None;
-        }
-        let stored_crc = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-        if crc32(&bytes[0..20]) != stored_crc {
-            return None;
-        }
-        Some(PointerRecord {
-            epoch: u64::from_be_bytes(bytes[4..12].try_into().ok()?),
-            committed_gen: u64::from_be_bytes(bytes[12..20].try_into().ok()?),
-        })
-    }
-}
-
-/// Lifecycle state of a generation slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GenState {
-    Staging,
-    Candidate,
-    Committed,
-    Bad,
-}
+const PTR_A: &str = genstore_wire::PTR_A_KEY;
+const PTR_B: &str = genstore_wire::PTR_B_KEY;
 
 /// A generation slot header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +146,11 @@ pub struct Generation {
     pub id: u64,
     pub state: GenState,
     pub plan_digest: [u8; 32],
+    /// ABI wire-surface digest of the substrate this generation was built
+    /// against (`crate::hash::abi_surface_digest`). Boot selection on a
+    /// device accepts the generation only on digest equality — identity,
+    /// not version windows.
+    pub abi_surface: [u8; 32],
     /// Content digests this generation references (kept alive in the CAS).
     pub artifacts: Vec<[u8; 32]>,
     pub boot_attempts: u8,
@@ -335,6 +286,11 @@ impl<S: Storage> GenStore<S> {
             id,
             state: GenState::Staging,
             plan_digest,
+            // Pin the generation to the substrate surface this build of the
+            // tools was compiled against — the agent and the kernel it
+            // deploys move in lockstep in this repo, so the tools' own
+            // canonical surface IS the target substrate's.
+            abi_surface: crate::hash::abi_surface_digest(),
             artifacts: artifacts.iter().map(|(d, _)| *d).collect(),
             boot_attempts: 0,
         };
@@ -387,18 +343,81 @@ impl<S: Storage> GenStore<S> {
     /// store rolls back to the most recent older committed generation
     /// (rfc_k8s.md §13.3). Returns the generation to boot.
     pub fn select_for_boot(&mut self) -> Result<Generation, StoreError> {
+        self.select_for_boot_on(&crate::hash::abi_surface_digest())
+    }
+
+    /// Boot selection against an explicit substrate surface digest (`own` is
+    /// the running kernel's digest). Two rules decide which committed
+    /// generation boots, both failing closed (rfc_k8s.md §13.3):
+    ///
+    /// - ABI compatibility: a generation is bootable only when its ABI-surface
+    ///   pin equals `own`. An incompatible one is skipped without mutation —
+    ///   it remains valid on the kernel it targets, so marking it `Bad` (and
+    ///   thus GC-eligible) would destroy the rollback path when that kernel is
+    ///   flashed back. Selection falls through to the newest committed
+    ///   generation whose pin matches. (A legacy zero-pin record matches no
+    ///   real kernel: readable for desired-state continuity, never bootable.)
+    /// - Boot health: a compatible generation that exhausts its boot attempts
+    ///   is a genuine defect — marked `Bad`, and the store rolls back.
+    pub fn select_for_boot_on(&mut self, own: &[u8; 32]) -> Result<Generation, StoreError> {
         let p = self
             .live_pointer()
             .ok_or(StoreError::NoCommittedGeneration)?;
         let mut g = self
             .read_gen(p.committed_gen)
             .ok_or(StoreError::GenerationMissing)?;
+        if g.abi_surface != *own {
+            return self.select_compatible_committed(own);
+        }
         if g.boot_attempts >= MAX_BOOT_ATTEMPTS {
-            // Mark bad and roll back to the newest older committed generation.
             g.state = GenState::Bad;
             self.write_gen(&g)?;
-            return self.rollback_from(g.id);
+            return self.rollback_from_on(g.id, own);
         }
+        g.boot_attempts += 1;
+        self.write_gen(&g)?;
+        Ok(g)
+    }
+
+    /// Select the newest `Committed` generation whose ABI-surface pin equals
+    /// `own`, without mutating any incompatible generation's state (they
+    /// remain valid for the kernel they target). Fails closed when none is
+    /// compatible. This is the ABI-mismatch path: non-destructive, so a
+    /// later flash back to a matching kernel still finds its generation.
+    fn select_compatible_committed(&mut self, own: &[u8; 32]) -> Result<Generation, StoreError> {
+        let mut best: Option<Generation> = None;
+        for k in self.storage.keys() {
+            if let Some(idstr) = k.strip_prefix("gen.") {
+                if let Ok(id) = idstr.parse::<u64>() {
+                    if let Some(g) = self.read_gen(id) {
+                        if g.state == GenState::Committed
+                            && g.abi_surface == *own
+                            && best.as_ref().map(|b| g.id > b.id).unwrap_or(true)
+                        {
+                            best = Some(g);
+                        }
+                    }
+                }
+            }
+        }
+        let mut g = best.ok_or(StoreError::NoCommittedGeneration)?;
+        // Point the committed record at the selected generation so the boot
+        // actually runs it (the live pointer may reference an incompatible
+        // one). Its own boot-attempt accounting still applies.
+        if g.boot_attempts >= MAX_BOOT_ATTEMPTS {
+            g.state = GenState::Bad;
+            self.write_gen(&g)?;
+            return self.rollback_from_on(g.id, own);
+        }
+        let next_epoch = self.live_pointer().map(|p| p.epoch + 1).unwrap_or(1);
+        let rec = PointerRecord {
+            epoch: next_epoch,
+            committed_gen: g.id,
+        };
+        let slot = self.next_pointer_slot();
+        self.storage
+            .write(slot, &rec.encode())
+            .map_err(|_| StoreError::WriteFailed)?;
         g.boot_attempts += 1;
         self.write_gen(&g)?;
         Ok(g)
@@ -418,7 +437,14 @@ impl<S: Storage> GenStore<S> {
 
     /// Roll back to the newest committed generation older than `failed_id`,
     /// flipping the pointer to it. Used by automatic rollback.
-    fn rollback_from(&mut self, failed_id: u64) -> Result<Generation, StoreError> {
+    /// Roll back to the newest older committed generation whose ABI-surface
+    /// pin matches `own` — rolling back onto an incompatible generation would
+    /// just fail the same check on the next selection.
+    fn rollback_from_on(
+        &mut self,
+        failed_id: u64,
+        own: &[u8; 32],
+    ) -> Result<Generation, StoreError> {
         let mut best: Option<Generation> = None;
         for k in self.storage.keys() {
             if let Some(idstr) = k.strip_prefix("gen.") {
@@ -428,6 +454,7 @@ impl<S: Storage> GenStore<S> {
                     }
                     if let Some(g) = self.read_gen(id) {
                         if g.state == GenState::Committed
+                            && g.abi_surface == *own
                             && best.as_ref().map(|b| g.id > b.id).unwrap_or(true)
                         {
                             best = Some(g);
@@ -452,16 +479,26 @@ impl<S: Storage> GenStore<S> {
     /// Garbage-collect CAS blobs no live generation references. A blob is kept
     /// while any non-`Bad` generation references it. Restartable (it derives the
     /// keep-set fresh each run) and never touches a referenced blob.
+    ///
+    /// Fail-closed on unreadable state: a `gen.*` record that cannot be read or
+    /// decoded aborts the sweep entirely (returns 0). Its artifact references
+    /// are unknown, so excluding just that record from the keep-set would let
+    /// GC delete blobs a live-but-undecodable generation still needs — the one
+    /// unrecoverable outcome. An operator repairs or deletes the corrupt
+    /// record; GC never guesses.
     pub fn gc(&mut self) -> usize {
         let mut keep: BTreeSet<String> = BTreeSet::new();
         for k in self.storage.keys() {
             if k.starts_with("gen.") {
-                if let Some(g) = self.read_tolerant(&k).and_then(|b| decode_gen(&b)) {
-                    if g.state != GenState::Bad {
-                        for d in &g.artifacts {
-                            keep.insert(Self::cas_key(d));
+                match self.read_tolerant(&k).and_then(|b| decode_gen(&b)) {
+                    Some(g) => {
+                        if g.state != GenState::Bad {
+                            for d in &g.artifacts {
+                                keep.insert(Self::cas_key(d));
+                            }
                         }
                     }
+                    None => return 0,
                 }
             }
         }
@@ -480,15 +517,12 @@ impl<S: Storage> GenStore<S> {
 
 fn encode_gen(g: &Generation) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(&genstore_wire::GEN_MAGIC.to_be_bytes());
     buf.extend_from_slice(&g.id.to_be_bytes());
-    buf.push(match g.state {
-        GenState::Staging => 0,
-        GenState::Candidate => 1,
-        GenState::Committed => 2,
-        GenState::Bad => 3,
-    });
+    buf.push(g.state.to_u8());
     buf.push(g.boot_attempts);
     buf.extend_from_slice(&g.plan_digest);
+    buf.extend_from_slice(&g.abi_surface);
     buf.extend_from_slice(&(g.artifacts.len() as u32).to_be_bytes());
     for d in &g.artifacts {
         buf.extend_from_slice(d);
@@ -496,37 +530,107 @@ fn encode_gen(g: &Generation) -> Vec<u8> {
     buf
 }
 
+/// Decode through the shared zero-copy view, then materialize the owned
+/// host form — so the host reads exactly what a device backend would.
+///
+/// Falls back to the two earlier on-storage layouts so existing stores
+/// stay READABLE (reconciliation continues from the true current
+/// generation instead of restarting at 1 and overwriting history):
+/// the short-lived magicless 78-byte pinned layout, then the pre-pin
+/// 46-byte layout. Read ≠ bootable: a record whose pin doesn't equal
+/// the current surface (including the legacy zeroed pin) fails boot
+/// selection — there is no grandfather.
 fn decode_gen(b: &[u8]) -> Option<Generation> {
-    if b.len() < 8 + 1 + 1 + 32 + 4 {
+    if let Some(view) = GenHeaderView::parse(b) {
+        let artifacts = (0..view.artifact_count())
+            .map(|i| view.artifact(i))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(Generation {
+            id: view.id(),
+            state: view.state(),
+            plan_digest: view.plan_digest(),
+            abi_surface: view.abi_surface(),
+            artifacts,
+            boot_attempts: view.boot_attempts(),
+        });
+    }
+    decode_gen_interim(b).or_else(|| decode_gen_legacy(b))
+}
+
+/// The magicless pinned layout written between the pin's introduction and
+/// the GEN_MAGIC discriminator: `id:u64 | state | boot_attempts |
+/// plan_digest:[32] | abi_surface:[32] | count:u32 | artifacts…` (78-byte
+/// fixed header, exact length). Length classes overlap with the 46-byte
+/// legacy layout (78 + 32m == 46 + 32(m+1)), so this is tried FIRST and a
+/// mis-read is possible only when a legacy record's first artifact digest
+/// happens to end in exactly the bytes of a consistent count (~2^-32);
+/// records written since carry the magic and are unambiguous.
+fn decode_gen_interim(b: &[u8]) -> Option<Generation> {
+    const INTERIM_FIXED: usize = 8 + 1 + 1 + 32 + 32 + 4;
+    if b.len() < INTERIM_FIXED {
         return None;
     }
     let id = u64::from_be_bytes(b[0..8].try_into().ok()?);
-    let state = match b[8] {
-        0 => GenState::Staging,
-        1 => GenState::Candidate,
-        2 => GenState::Committed,
-        3 => GenState::Bad,
-        _ => return None,
-    };
+    let state = GenState::from_u8(b[8])?;
     let boot_attempts = b[9];
     let mut plan_digest = [0u8; 32];
     plan_digest.copy_from_slice(&b[10..42]);
-    let n = u32::from_be_bytes(b[42..46].try_into().ok()?) as usize;
+    let mut abi_surface = [0u8; 32];
+    abi_surface.copy_from_slice(&b[42..74]);
+    let n = u32::from_be_bytes(b[74..78].try_into().ok()?) as usize;
+    if b.len() != INTERIM_FIXED.checked_add(n.checked_mul(32)?)? {
+        return None;
+    }
     let mut artifacts = Vec::with_capacity(n);
-    let mut off = 46;
-    for _ in 0..n {
-        if off + 32 > b.len() {
-            return None;
-        }
+    for i in 0..n {
+        let off = INTERIM_FIXED + i * 32;
         let mut d = [0u8; 32];
         d.copy_from_slice(&b[off..off + 32]);
         artifacts.push(d);
-        off += 32;
     }
     Some(Generation {
         id,
         state,
         plan_digest,
+        abi_surface,
+        artifacts,
+        boot_attempts,
+    })
+}
+
+/// Pre-pin record layout: `id:u64 | state:u8 | boot_attempts:u8 |
+/// plan_digest:[u8;32] | artifact_count:u32 | artifacts…` (46-byte fixed
+/// header, no abi_surface). Only ever read — encode always writes the
+/// current (magicked) layout. Exact length required. The zeroed pin this
+/// decodes to FAILS boot selection (no grandfather); readability exists
+/// for desired-state continuity only.
+fn decode_gen_legacy(b: &[u8]) -> Option<Generation> {
+    const LEGACY_FIXED: usize = 8 + 1 + 1 + 32 + 4;
+    if b.len() < LEGACY_FIXED {
+        return None;
+    }
+    let id = u64::from_be_bytes(b[0..8].try_into().ok()?);
+    let state = GenState::from_u8(b[8])?;
+    let boot_attempts = b[9];
+    let mut plan_digest = [0u8; 32];
+    plan_digest.copy_from_slice(&b[10..42]);
+    let n = u32::from_be_bytes(b[42..46].try_into().ok()?) as usize;
+    if b.len() != LEGACY_FIXED.checked_add(n.checked_mul(32)?)? {
+        return None;
+    }
+    let mut artifacts = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = LEGACY_FIXED + i * 32;
+        let mut d = [0u8; 32];
+        d.copy_from_slice(&b[off..off + 32]);
+        artifacts.push(d);
+    }
+    Some(Generation {
+        id,
+        state,
+        plan_digest,
+        // Unknown pin — the legacy sentinel boot selection grandfathers.
+        abi_surface: [0u8; 32],
         artifacts,
         boot_attempts,
     })
@@ -715,5 +819,201 @@ mod tests {
         assert!(first >= 1);
         // second run removes nothing (idempotent / restartable)
         assert_eq!(s.gc(), 0);
+    }
+
+    /// Wire-codec lockstep: the shared `genstore_wire` records must survive
+    /// corruption checks and in-place mutation exactly as the device backend
+    /// will use them.
+    #[test]
+    fn wire_records_roundtrip_and_reject_corruption() {
+        use genstore_wire::*;
+
+        let rec = PointerRecord {
+            epoch: 7,
+            committed_gen: 42,
+        };
+        let mut bytes = rec.encode();
+        assert_eq!(PointerRecord::decode(&bytes), Some(rec));
+        // CRC bit-flip rejected (torn write).
+        bytes[5] ^= 0x01;
+        assert_eq!(PointerRecord::decode(&bytes), None);
+        // Wrong length rejected.
+        assert_eq!(PointerRecord::decode(&rec.encode()[..23]), None);
+
+        let g = Generation {
+            id: 3,
+            state: GenState::Committed,
+            plan_digest: [0xAB; 32],
+            abi_surface: [0xCD; 32],
+            artifacts: vec![[1u8; 32], [2u8; 32]],
+            boot_attempts: 1,
+        };
+        let mut enc = encode_gen(&g);
+        let view = GenHeaderView::parse(&enc).expect("valid record");
+        assert_eq!(view.id(), 3);
+        assert_eq!(view.state(), GenState::Committed);
+        assert_eq!(view.boot_attempts(), 1);
+        assert_eq!(view.plan_digest(), [0xAB; 32]);
+        assert_eq!(view.abi_surface(), [0xCD; 32]);
+        assert_eq!(view.artifact_count(), 2);
+        assert_eq!(view.artifact(1), Some([2u8; 32]));
+        assert_eq!(view.artifact(2), None);
+
+        // Device-side in-place mutation reads back through the host decoder.
+        assert!(set_boot_attempts_in_place(&mut enc, 2));
+        assert!(set_state_in_place(&mut enc, GenState::Bad));
+        let back = decode_gen(&enc).expect("still decodable");
+        assert_eq!(back.boot_attempts, 2);
+        assert_eq!(back.state, GenState::Bad);
+
+        // Truncated artifact list rejected.
+        let short = &enc[..enc.len() - 1];
+        assert!(GenHeaderView::parse(short).is_none());
+        // Unknown state byte rejected.
+        enc[GEN_STATE_OFFSET] = 9;
+        assert!(GenHeaderView::parse(&enc).is_none());
+    }
+
+    /// GC must abort (delete nothing) when any generation record is
+    /// unreadable — its artifact references are unknown, and sweeping
+    /// around it could delete blobs a live generation still needs.
+    #[test]
+    fn gc_aborts_on_undecodable_generation_record() {
+        let mut s = GenStore::new(MemStorage::default());
+        let a1 = art(1);
+        stage_commit(&mut s, 1, std::slice::from_ref(&a1));
+        // A second, corrupt generation record (e.g. written by a different
+        // record layout) alongside an orphaned blob.
+        s.storage.write("gen.2", b"garbage-record").unwrap();
+        let orphan = art(9);
+        s.storage
+            .write(&GenStore::<MemStorage>::cas_key(&orphan.0), &orphan.1)
+            .unwrap();
+
+        assert_eq!(s.gc(), 0, "sweep must abort, not guess");
+        assert!(s.read_artifact(&orphan.0).is_some(), "nothing deleted");
+
+        // Repairing (removing) the corrupt record re-enables GC.
+        s.storage.delete("gen.2");
+        assert_eq!(s.gc(), 1);
+        assert!(s.read_artifact(&orphan.0).is_none());
+        assert!(s.read_artifact(&a1.0).is_some());
+    }
+
+    /// Boot selection enforces the ABI-surface pin: a committed generation
+    /// pinned to a different substrate is skipped NON-destructively (its
+    /// state and boot-attempts untouched, so a flash back to its kernel
+    /// still boots it) while selection falls back to the newest compatible
+    /// generation.
+    #[test]
+    fn boot_selection_skips_incompatible_abi_pin_without_marking_bad() {
+        let mut s = GenStore::new(MemStorage::default());
+        stage_commit(&mut s, 1, &[art(1)]);
+        stage_commit(&mut s, 2, &[art(2)]);
+        let own = crate::hash::abi_surface_digest();
+
+        // Matching pin: gen 2 selected normally.
+        assert_eq!(s.select_for_boot_on(&own).unwrap().id, 2);
+
+        // Rewrite gen 2's pin to a DIFFERENT surface (as if committed for
+        // another kernel), and reset its boot_attempts so we can prove they
+        // stay untouched.
+        let mut g2 = s.read_gen(2).unwrap();
+        g2.abi_surface = [0x5A; 32];
+        g2.boot_attempts = 0;
+        s.write_gen(&g2).unwrap();
+
+        // Selection falls back to gen 1 — and gen 2 is untouched: still
+        // Committed (GC keeps its artifacts) with boot_attempts unmoved, so
+        // flashing kernel 0x5A back boots gen 2.
+        let selected = s.select_for_boot_on(&own).expect("falls back");
+        assert_eq!(selected.id, 1);
+        let g2_after = s.read_gen(2).unwrap();
+        assert_eq!(
+            g2_after.state,
+            GenState::Committed,
+            "incompatible != defective"
+        );
+        assert_eq!(g2_after.boot_attempts, 0, "not charged a boot attempt");
+        // GC must retain gen 2's artifact (rollback path preserved).
+        assert_eq!(s.gc(), 0);
+        assert!(s.read_artifact(&art(2).0).is_some());
+
+        // The incompatible kernel later boots and gets gen 2 back.
+        assert_eq!(s.select_for_boot_on(&[0x5A; 32]).unwrap().id, 2);
+
+        // No compatible generation for a THIRD kernel → fail closed, and
+        // nothing was marked Bad.
+        assert!(s.select_for_boot_on(&[0x77; 32]).is_err());
+        assert_eq!(s.read_gen(1).unwrap().state, GenState::Committed);
+        assert_eq!(s.read_gen(2).unwrap().state, GenState::Committed);
+    }
+
+    /// Stores written before the ABI-surface field must stay READABLE (so
+    /// reconciliation continues from the existing generation instead of
+    /// restarting at 1 and overwriting) — but NOT bootable: an unattested
+    /// generation fails the pin like any mismatch and selection fails
+    /// closed until a re-staged, pinned generation exists.
+    #[test]
+    fn legacy_generation_records_readable_but_not_bootable() {
+        // Hand-encode the pre-pin layout.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&7u64.to_be_bytes()); // id
+        legacy.push(GenState::Committed.to_u8());
+        legacy.push(1); // boot_attempts
+        legacy.extend_from_slice(&[0xAB; 32]); // plan_digest
+        legacy.extend_from_slice(&2u32.to_be_bytes()); // artifact_count
+        legacy.extend_from_slice(&[0x01; 32]);
+        legacy.extend_from_slice(&[0x02; 32]);
+
+        let g = decode_gen(&legacy).expect("legacy layout decodes");
+        assert_eq!(g.id, 7);
+        assert_eq!(g.state, GenState::Committed);
+        assert_eq!(g.plan_digest, [0xAB; 32]);
+        assert_eq!(g.artifacts, vec![[0x01; 32], [0x02; 32]]);
+        assert_eq!(g.abi_surface, [0u8; 32], "legacy pin sentinel");
+
+        // A legacy committed generation is selectable (grandfathered pin).
+        let mut s = GenStore::new(MemStorage::default());
+        s.storage.write("gen.7", &legacy).unwrap();
+        let ptr = genstore_wire::PointerRecord {
+            epoch: 1,
+            committed_gen: 7,
+        };
+        s.storage.write(PTR_A, &ptr.encode()).unwrap();
+        let own = crate::hash::abi_surface_digest();
+        // Not bootable: the zero pin matches no real kernel, so selection
+        // fails closed — but non-destructively: the record stays Committed
+        // and readable (desired-state continuity), never marked Bad.
+        assert!(s.select_for_boot_on(&own).is_err());
+        assert_eq!(s.read_gen(7).unwrap().state, GenState::Committed);
+
+        // Truncated/inflated legacy bytes are rejected (exact length).
+        assert!(decode_gen(&legacy[..legacy.len() - 1]).is_none());
+    }
+
+    /// Records written by the short-lived magicless pinned layout (between
+    /// the pin's introduction and the GEN_MAGIC discriminator) must decode
+    /// with their pin intact — an upgrade straight from that commit keeps
+    /// its committed generations readable and, when the pin matches,
+    /// bootable.
+    #[test]
+    fn interim_magicless_pinned_records_decode() {
+        let pin = [0x77u8; 32];
+        let mut interim = Vec::new();
+        interim.extend_from_slice(&9u64.to_be_bytes());
+        interim.push(GenState::Committed.to_u8());
+        interim.push(0); // boot_attempts
+        interim.extend_from_slice(&[0xAB; 32]); // plan_digest
+        interim.extend_from_slice(&pin); // abi_surface
+        interim.extend_from_slice(&1u32.to_be_bytes());
+        interim.extend_from_slice(&[0x01; 32]);
+
+        let g = decode_gen(&interim).expect("interim layout decodes");
+        assert_eq!(g.id, 9);
+        assert_eq!(g.abi_surface, pin, "pin preserved");
+        assert_eq!(g.artifacts, vec![[0x01; 32]]);
+        // Wrong length rejected.
+        assert!(decode_gen(&interim[..interim.len() - 1]).is_none());
     }
 }

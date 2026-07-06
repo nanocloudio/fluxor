@@ -563,6 +563,14 @@ pub struct Manifest {
     pub permissions: ManifestPermissions,
     pub dependencies: Vec<Dependency>,
     pub integrity_hash: Option<[u8; 32]>,
+    /// ABI wire-surface digest of the SDK/kernel tree this module was
+    /// PACKED against (`hash::abi_surface_digest`, flag bit 4 + trailing
+    /// 32-byte block in the binary). Packaging (slot-image, mktable,
+    /// combine) rejects a module whose attestation differs from the
+    /// current surface — a stale `.fmod` built before an ABI renumbering
+    /// can no longer ride into a new image. `None` on legacy modules
+    /// packed before attestation existed (accepted, unverifiable).
+    pub abi_surface: Option<[u8; 32]>,
     /// Ed25519 signature over the integrity hash. Set by the `fluxor sign`
     /// subcommand; absent on unsigned (v1) manifests.
     pub signature: Option<[u8; 64]>,
@@ -650,6 +658,7 @@ impl Default for Manifest {
             permissions: ManifestPermissions::default(),
             dependencies: Vec::new(),
             integrity_hash: None,
+            abi_surface: None,
             signature: None,
             signer_fp: None,
             commands: CommandVocabulary::default(),
@@ -1313,6 +1322,7 @@ impl Manifest {
             permissions,
             dependencies,
             integrity_hash: None, // set later by caller
+            abi_surface: None,    // set by pack (attests the packing tree)
             signature: None,
             signer_fp: None,
             commands,
@@ -1335,6 +1345,7 @@ impl Manifest {
         let has_signature = self.signature.is_some() && self.signer_fp.is_some();
         // Signature requires integrity (signature is over the hash).
         let has_signature = has_signature && has_integrity;
+        let has_abi_surface = self.abi_surface.is_some();
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
@@ -1343,7 +1354,8 @@ impl Manifest {
                 SIGNATURE_BLOCK_SIZE
             } else {
                 0
-            };
+            }
+            + if has_abi_surface { 32 } else { 0 };
         let total = MANIFEST_HEADER_SIZE + var_size;
         let mut buf = Vec::with_capacity(total);
 
@@ -1385,7 +1397,8 @@ impl Manifest {
         let flags = (if has_integrity { 1 } else { 0 })
             | (if has_signature { 2 } else { 0 })
             | (if self.isr_safe { 4 } else { 0 })
-            | (if self.pre_tick_drain { 8 } else { 0 });
+            | (if self.pre_tick_drain { 8 } else { 0 })
+            | (if has_abi_surface { 0x10 } else { 0 });
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
@@ -1433,6 +1446,13 @@ impl Manifest {
             buf.extend_from_slice(self.signer_fp.as_ref().unwrap());
         }
 
+        // ABI-surface attestation (32 bytes), LAST — appended after every
+        // block the kernel computes offsets over, so the loader's
+        // integrity/signature offset math is untouched.
+        if let Some(d) = &self.abi_surface {
+            buf.extend_from_slice(d);
+        }
+
         debug_assert_eq!(buf.len(), total);
         buf
     }
@@ -1471,6 +1491,7 @@ impl Manifest {
         let has_signature = (flags & 0x02) != 0;
         let isr_safe = (flags & 0x04) != 0;
         let pre_tick_drain = (flags & 0x08) != 0;
+        let has_abi_surface = (flags & 0x10) != 0;
         let permissions_bits = data[15]; // fine-grained permissions bitmap
 
         let expected_size = MANIFEST_HEADER_SIZE
@@ -1482,11 +1503,17 @@ impl Manifest {
                 SIGNATURE_BLOCK_SIZE
             } else {
                 0
-            };
+            }
+            + if has_abi_surface { 32 } else { 0 };
 
-        if data.len() < expected_size {
+        // EXACT size, not a lower bound: the serializer emits exact sizes,
+        // so slack is at best corruption and at worst a substitution attack
+        // (a second attestation appended past the canonical offset, aimed at
+        // a verifier that reads from the other end). Both this parser and
+        // the kernel verifier reject slack.
+        if data.len() != expected_size {
             return Err(Error::Module(format!(
-                "manifest truncated: {} bytes, expected {}",
+                "manifest size mismatch: {} bytes, layout requires exactly {}",
                 data.len(),
                 expected_size
             )));
@@ -1547,9 +1574,18 @@ impl Manifest {
             offset += 64;
             let mut fp = [0u8; 32];
             fp.copy_from_slice(&data[offset..offset + 32]);
+            offset += 32;
             (Some(sig), Some(fp))
         } else {
             (None, None)
+        };
+
+        let abi_surface = if has_abi_surface {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&data[offset..offset + 32]);
+            Some(d)
+        } else {
+            None
         };
 
         Ok(Manifest {
@@ -1563,6 +1599,7 @@ impl Manifest {
             },
             dependencies,
             integrity_hash,
+            abi_surface,
             signature,
             signer_fp,
             commands: CommandVocabulary::default(),
@@ -2200,5 +2237,36 @@ required = true
         let err = parse_toml(src).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("mutually exclusive"), "unexpected: {msg}");
+    }
+
+    /// The ABI-surface attestation block must round-trip through the binary
+    /// codec, coexist with integrity+signature blocks (it is appended LAST,
+    /// so the kernel's offset math over earlier blocks is untouched), and
+    /// stay optional for legacy manifests.
+    #[test]
+    fn abi_surface_attestation_round_trips() {
+        let mut m = Manifest {
+            integrity_hash: Some([0x11; 32]),
+            signature: Some([0x22; 64]),
+            signer_fp: Some([0x33; 32]),
+            abi_surface: Some([0x44; 32]),
+            ..Manifest::default()
+        };
+        let bytes = m.to_bytes();
+        let back = Manifest::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.abi_surface, Some([0x44; 32]));
+        assert_eq!(back.integrity_hash, Some([0x11; 32]));
+        assert_eq!(back.signature, Some([0x22; 64]));
+        assert_eq!(back.signer_fp, Some([0x33; 32]));
+
+        // Legacy manifest (no attestation) still round-trips as None.
+        m.abi_surface = None;
+        let back = Manifest::from_bytes(&m.to_bytes()).expect("decode legacy");
+        assert_eq!(back.abi_surface, None);
+
+        // Truncating the attestation block is rejected.
+        m.abi_surface = Some([0x44; 32]);
+        let bytes = m.to_bytes();
+        assert!(Manifest::from_bytes(&bytes[..bytes.len() - 1]).is_err());
     }
 }

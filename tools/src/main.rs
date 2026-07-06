@@ -58,6 +58,7 @@ pub mod rig;
 mod scenario;
 mod schema;
 mod stack_expand;
+mod store_cli;
 mod sync;
 pub mod target;
 mod text_distance;
@@ -79,6 +80,10 @@ mod workspace;
 )]
 #[path = "../../modules/sdk/wire.rs"]
 mod wire;
+
+/// Canonical ABI wire-surface encoding (see `tools/src/lib.rs` mount).
+#[path = "../../modules/sdk/abi_surface.rs"]
+mod abi_surface;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -138,7 +143,13 @@ enum Commands {
         #[arg(long)]
         binary: bool,
     },
-    /// Combine firmware + config into single UF2
+    /// Combine firmware + config into single UF2.
+    ///
+    /// Dev-flash convenience only: the trailer-embedded modules/config
+    /// this produces are NOT an OTA path. OTA-capable devices update
+    /// runtime modules exclusively through `slot-image` (graph_slot A/B),
+    /// keeping kernel and graph formally separate with independent
+    /// rollback.
     Combine {
         /// Firmware UF2 file
         firmware: PathBuf,
@@ -150,6 +161,13 @@ enum Commands {
     },
     /// Build an OTA slot image (modules + config + slot header) for
     /// writing to a graph_slot A/B region. Excludes firmware.
+    ///
+    /// This is the ONLY sanctioned module-delivery path for OTA-capable
+    /// devices: the graph slot is the sole runtime-module source, the
+    /// kernel image carries built-ins only, and the two are pinned to
+    /// each other by the ABI-surface digest in the slot header. The
+    /// `combine` trailer path is a dev-flash convenience, never an
+    /// update path.
     SlotImage {
         /// Config file (YAML or JSON)
         config: PathBuf,
@@ -524,6 +542,16 @@ enum Commands {
         action: RegistryAction,
     },
 
+    /// Inspect and maintain the local OCI artifact store
+    /// (`$XDG_DATA_HOME/fluxor/store`, override `$FLUXOR_STORE`).
+    /// Modules and workload bundles publish into it as OCI artifacts
+    /// with provenance annotations; consume paths read only from it
+    /// (offline-first).
+    Store(store_cli::StoreArgs),
+
+    /// Workload-bundle operations against the local OCI store.
+    Bundle(store_cli::BundleArgs),
+
     /// Inspect the live-workspace state (`~/.fluxor/workspace.toml`).
     ///
     /// Workspace mode is detected positionally — by whether the CWD
@@ -730,6 +758,36 @@ enum ModulesAction {
         #[arg(long)]
         json: bool,
     },
+    /// Publish built `.fmod`s into the local OCI artifact store as
+    /// content-addressed artifacts tagged `<target>/<name>:<version>`,
+    /// annotated `io.fluxor.provenance=local-build` (or `published`
+    /// with --published) and `io.fluxor.source-rev=<git sha>`.
+    Publish {
+        /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
+        /// override with $FLUXOR_STORE).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Single silicon target (default: every built target).
+        #[arg(long)]
+        target: Option<String>,
+        /// Single module (default: every owned module with a built fmod).
+        #[arg(long)]
+        module: Option<String>,
+        /// Tag override (`name:version`); requires the selection to
+        /// match exactly one (target, module) pair.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Annotate provenance=published instead of local-build.
+        #[arg(long)]
+        published: bool,
+        /// Also record each published artifact as a `[[oci_module]]`
+        /// digest pin in fluxor.lock (consume-side resolution, P2).
+        #[arg(long)]
+        pin: bool,
+        /// Project root override.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
     /// Print the resolved `<out>/<silicon>/modules` path for a target.
     /// Lets Makefiles and harness scripts refer to the artefact dir
     /// without hard-coding the layout.
@@ -867,6 +925,23 @@ fn main() {
             ModulesAction::List { project_root, json } => {
                 cmd_modules_list(project_root.as_deref(), json)
             }
+            ModulesAction::Publish {
+                store,
+                target,
+                module,
+                tag,
+                published,
+                pin,
+                project_root,
+            } => store_cli::cmd_modules_publish(
+                store.as_deref(),
+                target.as_deref(),
+                module.as_deref(),
+                tag.as_deref(),
+                published,
+                pin,
+                project_root.as_deref(),
+            ),
             ModulesAction::Resolve { target, out } => cmd_modules_resolve(&target, &out),
         },
         Commands::Publish {
@@ -926,6 +1001,20 @@ fn main() {
         },
         Commands::Workspace { action } => match action {
             WorkspaceAction::Status { json } => workspace::cmd_workspace_status(json),
+        },
+        Commands::Store(args) => store_cli::dispatch_store(args),
+        Commands::Bundle(args) => match args.command {
+            store_cli::BundleCommand::Publish {
+                bundle_dir,
+                store,
+                tag,
+                published,
+            } => store_cli::cmd_bundle_publish(
+                &bundle_dir,
+                store.as_deref(),
+                tag.as_deref(),
+                published,
+            ),
         },
     };
 
@@ -1600,7 +1689,13 @@ fn cmd_combine(
     let modules_dir = std::path::Path::new(&modules_dir_path);
     let search_paths = config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
-    let modules = parse_modules_from_config_multi(&config, modules_dir, &extra_dirs)?;
+    let store_fb = store_cli::lock_store_resolver(&crate::project::root(), &target_desc.id, None);
+    let modules = parse_modules_from_config_multi(
+        &config,
+        modules_dir,
+        &extra_dirs,
+        store_fb.as_deref().map(|f| f as _),
+    )?;
 
     // Build module caps for buffer aliasing and manifest validation
     let caps: Vec<ModuleCaps> = modules
@@ -1882,7 +1977,13 @@ fn build_packaged_blobs(
     target_desc: &target::TargetDescriptor,
     verbose: bool,
 ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
-    let modules = parse_modules_from_config_multi(config, modules_dir, extra_dirs)?;
+    let store_fb = store_cli::lock_store_resolver(&crate::project::root(), &target_desc.id, None);
+    let modules = parse_modules_from_config_multi(
+        config,
+        modules_dir,
+        extra_dirs,
+        store_fb.as_deref().map(|f| f as _),
+    )?;
 
     let caps: Vec<ModuleCaps> = modules
         .iter()
@@ -2027,6 +2128,13 @@ fn cmd_slot_image(
     out[24..28].copy_from_slice(&(config_offset as u32).to_le_bytes());
     out[28..32].copy_from_slice(&(config_data.len() as u32).to_le_bytes());
     out[32..64].copy_from_slice(&digest);
+    // ABI-surface pin (header 64..96): the wire-surface digest of the
+    // substrate this slot was built against (`hash::abi_surface_digest`).
+    // The kernel's slot selector may ignore it today; a selector that
+    // enforces it accepts the slot only on equality with its own surface —
+    // a graph built for an incompatible kernel fails closed to the other
+    // slot instead of loading modules with stale hardcoded wire values.
+    out[64..96].copy_from_slice(&hash::abi_surface_digest());
     // Payload.
     out[modules_offset..modules_offset + modules_data.len()].copy_from_slice(&modules_data);
     out[config_offset..config_offset + config_data.len()].copy_from_slice(&config_data);
@@ -3293,7 +3401,13 @@ fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Pat
     };
     let extra_dirs: Vec<&std::path::Path> =
         modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
-    let modules = parse_modules_from_config_multi(&config, primary_dir, &extra_dirs)?;
+    let store_fb = store_cli::lock_store_resolver(&project_root, &target_desc.id, None);
+    let modules = parse_modules_from_config_multi(
+        &config,
+        primary_dir,
+        &extra_dirs,
+        store_fb.as_deref().map(|f| f as _),
+    )?;
     // All-builtin configs (e.g. linux_display + host_image_codec) leave
     // `modules` empty; emit a valid 16-byte header-only table so the
     // host loader sees module_count=0 and instantiates only built-ins.
@@ -5143,6 +5257,13 @@ fn cmd_sign(
     h.update(&layout[0..14]);
     h.update([layout[14] & 0xFC]);
     h.update(&layout[15..hash_offset]);
+    // ABI-surface attestation (trailing 32 bytes when flag bit 4 is set):
+    // signed, so a stale artifact can't be re-labeled compatible by
+    // rewriting the attestation while keeping a valid signature. MUST
+    // byte-match the kernel verifier.
+    if layout[14] & 0x10 != 0 {
+        h.update(&layout[layout.len() - 32..]);
+    }
     let mut envelope_hash = [0u8; 32];
     envelope_hash.copy_from_slice(&h.finalize());
 

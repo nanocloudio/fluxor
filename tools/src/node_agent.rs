@@ -197,6 +197,106 @@ fn snapshot_from_committed<S: Storage>(
     Ok(snap)
 }
 
+/// One pod's surfaced status: the owner-tagged join of the persisted desired
+/// state and the committed plan (rfc_k8s.md §17.2 — pod UID + slot +
+/// generation is the join key between orchestrator status and device
+/// telemetry). `slot`/`owner_generation`/allocation fields are present only
+/// when the pod is in the committed generation.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PodStatus {
+    pub pod_uid_hex: String,
+    pub namespace: String,
+    pub name: String,
+    pub desired_phase: DesiredPhase,
+    pub committed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modules: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edges: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_cap: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_cap: Option<u32>,
+}
+
+/// Whole-node status snapshot.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct NodeStatus {
+    /// Committed generation id, `None` before the first commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// ABI-surface digest of THIS tool build (hex) — the substrate surface
+    /// new generations will be pinned to. The kernel deployed from the same
+    /// tree computes the identical value (locked by
+    /// `tests/harness/tests/abi_surface_digest.rs`).
+    pub abi_surface: String,
+    /// Pin recorded in the committed generation. When it differs from
+    /// `abi_surface`, the committed graph predates an ABI-surface change:
+    /// the orchestrator must restage/recommit before (or atomically with)
+    /// rolling the substrate, or the device-side pin check will reject the
+    /// generation at boot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_abi_surface: Option<String>,
+    pub pods: Vec<PodStatus>,
+}
+
+fn hex32(d: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in d {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Derive the node's per-pod status from the store: desired set joined with
+/// the committed plan's owner assignments. Read-only; safe to run while the
+/// runtime is live (the store is only ever appended by commit).
+pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreError> {
+    let desired = load_desired(store)?;
+    let plan = load_committed_plan(store);
+    let committed = store.committed();
+    let generation = committed.as_ref().map(|g| g.id);
+    let committed_abi_surface = committed.as_ref().map(|g| hex32(&g.abi_surface));
+    let mut pods: Vec<PodStatus> = desired
+        .iter()
+        .map(|p| {
+            let assignment = plan
+                .as_ref()
+                .and_then(|pl| pl.assignments.iter().find(|a| a.pod_uid == p.pod_uid));
+            let mut hex = String::with_capacity(32);
+            for b in &p.pod_uid {
+                use std::fmt::Write;
+                let _ = write!(hex, "{b:02x}");
+            }
+            PodStatus {
+                pod_uid_hex: hex,
+                namespace: p.namespace.clone(),
+                name: p.name.clone(),
+                desired_phase: p.desired_phase,
+                committed: assignment.is_some(),
+                slot: assignment.map(|a| a.slot),
+                owner_generation: assignment.map(|a| a.generation),
+                modules: assignment.map(|a| a.module_count),
+                edges: assignment.map(|a| a.edge_count),
+                state_cap: assignment.map(|a| a.state_cap),
+                buffer_cap: assignment.map(|a| a.buffer_cap),
+            }
+        })
+        .collect();
+    pods.sort_by(|a, b| a.pod_uid_hex.cmp(&b.pod_uid_hex));
+    Ok(NodeStatus {
+        generation,
+        abi_surface: hex32(&crate::hash::abi_surface_digest()),
+        committed_abi_surface,
+        pods,
+    })
+}
+
 /// Upsert `pod` into the node's persisted desired state and recompose ALL
 /// running pods into the next generation (rfc_k8s.md §6.3: one device, one
 /// composed graph). Resident pods keep their slots/generations via the
@@ -541,5 +641,34 @@ mod tests {
         assert!(matches!(r, Err(AgentError::Store(StoreError::StorageIo))));
         // The prior generation is untouched — the resident pod is not dropped.
         assert_eq!(store.committed().unwrap().id, 1);
+    }
+
+    /// `node_status` surfaces the ABI-surface pin: matching pins report
+    /// quietly; a committed generation pinned to a different surface (i.e.
+    /// committed before an ABI change) is visible to the orchestrator so it
+    /// restages before rolling the substrate.
+    #[test]
+    fn status_surfaces_abi_pin_and_mismatch() {
+        let mut store = GenStore::new(MemStorage::default());
+        let cap = cap();
+        upsert_pod_and_commit(&mut store, pod(1, 1), &cap).expect("commit");
+
+        let st = node_status(&store).expect("status");
+        assert_eq!(st.committed_abi_surface.as_ref(), Some(&st.abi_surface));
+
+        // Simulate a generation committed under an older surface: rewrite the
+        // committed record's pin bytes (GEN_ABI_SURFACE_OFFSET per
+        // genstore_wire).
+        let gen_id = st.generation.unwrap();
+        let key = format!("gen.{gen_id}");
+        let mut rec = store.storage.read(&key).unwrap().unwrap();
+        let off = crate::genstore::genstore_wire::GEN_ABI_SURFACE_OFFSET;
+        for b in &mut rec[off..off + 32] {
+            *b ^= 0xA5;
+        }
+        store.storage.write(&key, &rec).unwrap();
+
+        let st2 = node_status(&store).expect("status after tamper");
+        assert_ne!(st2.committed_abi_surface.as_ref(), Some(&st2.abi_surface));
     }
 }

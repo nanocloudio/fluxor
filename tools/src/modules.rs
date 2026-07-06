@@ -245,23 +245,87 @@ pub fn is_builtin_module(module_type: &str) -> bool {
 }
 
 /// Resolve a module .fmod file by searching primary dir, then extra dirs in order.
+/// Outcome of consulting the `fluxor.lock` `[[oci_module]]` pins for a
+/// module name (registry plan P2).
+pub enum StorePin {
+    /// No pin for this name — resolve from the on-disk dirs as usual.
+    NotPinned,
+    /// Pinned and resolved to a digest-verified store blob. AUTHORITATIVE:
+    /// a pinned module never falls back to an on-disk `.fmod`, which could
+    /// silently carry different bytes than the pinned digest.
+    Resolved(std::path::PathBuf),
+    /// Pinned but unresolvable (missing blob, integrity failure, unreadable
+    /// lockfile/store). A hard error — never a silent fall-through.
+    Failed(String),
+}
+
+/// Pin resolver — wired to `fluxor.lock` + the local OCI store by
+/// `store_cli::lock_store_resolver`.
+pub type StoreFallback<'a> = &'a dyn Fn(&str) -> StorePin;
+
 fn resolve_fmod(
     module_type: &str,
     primary_dir: &Path,
     extra_dirs: &[&Path],
-) -> Option<std::path::PathBuf> {
+    store_fallback: Option<StoreFallback<'_>>,
+) -> Result<Option<std::path::PathBuf>> {
+    // Pins are consulted FIRST and are authoritative for the names they
+    // cover: the whole point of a digest pin is that packaging cannot
+    // consume different bytes because a stale .fmod happens to sit in a
+    // search dir.
+    if let Some(f) = store_fallback {
+        match f(module_type) {
+            StorePin::Resolved(p) => return Ok(Some(p)),
+            StorePin::Failed(why) => {
+                return Err(Error::Module(format!(
+                    "module '{module_type}' is pinned in fluxor.lock but the pin \
+                     could not be resolved: {why}"
+                )))
+            }
+            StorePin::NotPinned => {}
+        }
+    }
     let filename = format!("{module_type}.fmod");
     let p = primary_dir.join(&filename);
     if p.exists() {
-        return Some(p);
+        return Ok(Some(p));
     }
     for dir in extra_dirs {
         let p = dir.join(&filename);
         if p.exists() {
-            return Some(p);
+            return Ok(Some(p));
         }
     }
-    None
+    Ok(None)
+}
+
+/// Require a packaged module's ABI-surface attestation to equal the current
+/// surface. A module whose attestation differs has hardcoded opcode/errno/
+/// flag values that do not match the kernel this image ships, so packaging
+/// it would produce an image the device rejects at load; a module carrying
+/// no attestation cannot be shown compatible at all. Both are hard errors,
+/// resolved by rebuilding the module against the current tree
+/// (`make modules`).
+fn verify_module_abi_surface(info: &ModuleInfo, path: &Path) -> Result<()> {
+    let current = crate::hash::abi_surface_digest();
+    match info.manifest.abi_surface {
+        Some(packed) if packed == current => Ok(()),
+        Some(packed) => Err(Error::Module(format!(
+            "{}: built against a different ABI surface (module attests \
+             {}, current is {}) — rebuild it with `make modules`",
+            path.display(),
+            hex12(&packed),
+            hex12(&current),
+        ))),
+        None => Err(Error::Module(format!(
+            "{}: carries no ABI-surface attestation — rebuild it with `make modules`",
+            path.display(),
+        ))),
+    }
+}
+
+fn hex12(d: &[u8; 32]) -> String {
+    d.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Parse modules from config YAML/JSON, resolving each `.fmod` against
@@ -274,6 +338,7 @@ pub fn parse_modules_from_config_multi(
     config: &serde_json::Value,
     modules_dir: &Path,
     extra_dirs: &[&Path],
+    store_fallback: Option<StoreFallback<'_>>,
 ) -> Result<Vec<ModuleInfo>> {
     let mut modules = Vec::new();
 
@@ -297,7 +362,12 @@ pub fn parse_modules_from_config_multi(
                 continue;
             }
 
-            let module_path = match resolve_fmod(module_type, modules_dir, extra_dirs) {
+            let module_path = match resolve_fmod(
+                module_type,
+                modules_dir,
+                extra_dirs,
+                store_fallback,
+            )? {
                 Some(p) => p,
                 None => {
                     // Check if this is a built-in module (no .fmod needed)
@@ -309,7 +379,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}') not found in: {}\nRun 'make modules' to build modules.",
+                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'make modules' to build modules, or pin it with 'fluxor store pin'.",
                         module_name,
                         module_type,
                         searched.join(", "),
@@ -318,6 +388,7 @@ pub fn parse_modules_from_config_multi(
             };
 
             let module_info = ModuleInfo::from_file(&module_path)?;
+            verify_module_abi_surface(&module_info, &module_path)?;
             modules.push(module_info);
         }
     } else if let Some(modules_map) = config["modules"].as_object() {
@@ -332,7 +403,12 @@ pub fn parse_modules_from_config_multi(
                 continue;
             }
 
-            let module_path = match resolve_fmod(module_type, modules_dir, extra_dirs) {
+            let module_path = match resolve_fmod(
+                module_type,
+                modules_dir,
+                extra_dirs,
+                store_fallback,
+            )? {
                 Some(p) => p,
                 None => {
                     // Check if this is a built-in module (no .fmod needed)
@@ -344,7 +420,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}') not found in: {}\nRun 'make modules' to build modules.",
+                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'make modules' to build modules, or pin it with 'fluxor store pin'.",
                         instance_name,
                         module_type,
                         searched.join(", "),
@@ -353,6 +429,7 @@ pub fn parse_modules_from_config_multi(
             };
 
             let module_info = ModuleInfo::from_file(&module_path)?;
+            verify_module_abi_surface(&module_info, &module_path)?;
             modules.push(module_info);
         }
     }
@@ -379,20 +456,22 @@ pub fn parse_modules_from_config_multi(
                 if is_builtin_module(module_type) {
                     continue;
                 }
-                let module_path = resolve_fmod(module_type, modules_dir, extra_dirs).ok_or_else(
+                let module_path = resolve_fmod(module_type, modules_dir, extra_dirs, store_fallback)?.ok_or_else(
                     || {
                         let searched: Vec<String> = std::iter::once(modules_dir)
                             .chain(extra_dirs.iter().copied())
                             .map(|d| d.display().to_string())
                             .collect();
                         Error::Module(format!(
-                            "pod module type '{}' not found in: {}\nRun 'make modules' to build modules.",
+                            "pod module type '{}' not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'make modules' to build modules, or pin it with 'fluxor store pin'.",
                             module_type,
                             searched.join(", "),
                         ))
                     },
                 )?;
-                modules.push(ModuleInfo::from_file(&module_path)?);
+                let module_info = ModuleInfo::from_file(&module_path)?;
+                verify_module_abi_surface(&module_info, &module_path)?;
+                modules.push(module_info);
             }
         }
     }
@@ -642,6 +721,24 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
     Ok((sections, symbols))
 }
 
+/// Read the compile-time ABI-surface attestation embedded by the SDK
+/// (`runtime.rs` `FLUXOR_ABI_SURFACE`, a 32-byte `.rodata` static). Returns
+/// `None` when the symbol is absent (a module built by a pre-embed SDK).
+fn read_embedded_abi_surface(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<[u8; 32]> {
+    // Substring match: the symbol is mangled (per-crate) to avoid host-link
+    // collisions when several modules link together (harness), so the exact
+    // name varies but always contains the identifier.
+    let sym = symbols
+        .iter()
+        .find(|s| s.name.contains("FLUXOR_ABI_SURFACE"))?;
+    let sec = sections.get(sym.section_idx as usize)?;
+    let start = (sym.value as usize).checked_sub(sec.addr)?;
+    let bytes = sec.data.get(start..start + 32)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(bytes);
+    Some(out)
+}
+
 /// Find a section by name
 fn find_section<'a>(sections: &'a [ElfSection], name: &str) -> Option<&'a ElfSection> {
     sections.iter().find(|s| s.name == name)
@@ -868,6 +965,33 @@ pub fn pack_fmod(
 
     // Compute integrity hash over code + data sections (use code_data which preserves layout)
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&code_data, data_data));
+    // ABI-surface attestation: take the digest the compiler embedded in the
+    // ELF and require it to equal this packer's surface. Copying the embedded
+    // value (rather than stamping the packer's own) is what attests
+    // compilation provenance — an ELF built against a different surface, e.g.
+    // a stale object repacked under current tools, is rejected here.
+    let current_surface = crate::hash::abi_surface_digest();
+    match read_embedded_abi_surface(&sections, &symbols) {
+        Some(embedded) if embedded == current_surface => {
+            module_manifest.abi_surface = Some(embedded);
+        }
+        Some(embedded) => {
+            return Err(Error::Module(format!(
+                "{}: compiled against a different ABI surface (module embeds {}, \
+                 current is {}) — rebuild it from source with `make modules`",
+                input.display(),
+                hex12(&embedded),
+                hex12(&current_surface),
+            )));
+        }
+        None => {
+            return Err(Error::Module(format!(
+                "{}: no embedded ABI-surface attestation — rebuild it from source \
+                 with `make modules`",
+                input.display(),
+            )));
+        }
+    }
 
     let manifest_bytes = module_manifest.to_bytes();
 
@@ -1075,6 +1199,26 @@ pub fn pack_fmod_wasm(
 
     // Integrity hash over the wasm code payload. Empty data section.
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&wasm_data, &[]));
+    // Compilation provenance for wasm: the SDK compiles the 32-byte
+    // `FLUXOR_ABI_SURFACE` static into the wasm module's data, so a module
+    // built against the current surface contains that digest verbatim.
+    // Require its presence — a module built against a different surface
+    // embeds a different digest, so the current bytes are absent and it is
+    // rejected. A window scan suffices; resolving the wasm data segment is
+    // unnecessary since a specific sha256 cannot plausibly occur by chance.
+    let current_surface = crate::hash::abi_surface_digest();
+    if !wasm_data
+        .windows(32)
+        .any(|w| w == current_surface.as_slice())
+    {
+        return Err(Error::Module(format!(
+            "{}: wasm module does not embed the current ABI surface ({}) — \
+             built against a different SDK; rebuild from source with `make modules`",
+            input.display(),
+            hex12(&current_surface),
+        )));
+    }
+    module_manifest.abi_surface = Some(current_surface);
 
     let manifest_bytes = module_manifest.to_bytes();
 

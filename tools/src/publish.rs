@@ -26,7 +26,7 @@ use crate::workspace;
 
 // ── Common helpers ────────────────────────────────────────────────────
 
-fn resolve_project_root(opt: Option<&Path>) -> PathBuf {
+pub(crate) fn resolve_project_root(opt: Option<&Path>) -> PathBuf {
     opt.map(PathBuf::from).unwrap_or_else(project::root)
 }
 
@@ -430,9 +430,12 @@ fn locate_member_manifest(project_root: &Path, package: &str) -> Result<PathBuf>
 
 /// One module owned by this project: tier-relative module name and
 /// the version declared in its `manifest.toml`.
-struct OwnedModule {
-    name: String,
-    version: String,
+pub(crate) struct OwnedModule {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    /// Path of the module's `manifest.toml` (metadata carried alongside
+    /// the `.fmod` when publishing into the OCI store).
+    pub(crate) manifest_path: PathBuf,
 }
 
 /// Enumerate every module this project owns by walking the local
@@ -443,7 +446,7 @@ struct OwnedModule {
 /// be re-published under this project's namespace. Modules without
 /// a `version` field in their manifest are reported as errors so
 /// the operator notices the manifest is incomplete.
-fn list_owned_modules(project_root: &Path) -> Result<Vec<OwnedModule>> {
+pub(crate) fn list_owned_modules(project_root: &Path) -> Result<Vec<OwnedModule>> {
     #[derive(serde::Deserialize)]
     struct ModuleManifest {
         version: Option<String>,
@@ -476,7 +479,11 @@ fn list_owned_modules(project_root: &Path) -> Result<Vec<OwnedModule>> {
                 )));
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            out.push(OwnedModule { name, version });
+            out.push(OwnedModule {
+                name,
+                version,
+                manifest_path,
+            });
         }
     }
     Ok(out)
@@ -645,7 +652,7 @@ pub fn cmd_publish_fmod(
     Ok(())
 }
 
-fn list_built_targets(roots: &[&PathBuf]) -> Result<Vec<String>> {
+pub(crate) fn list_built_targets(roots: &[&PathBuf]) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for root in roots {
         if !root.exists() {

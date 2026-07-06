@@ -54,6 +54,15 @@ pub mod kernel_abi {
     include!("kernel_abi.rs");
 }
 
+/// Canonical ABI wire-surface encoding (`abi_surface.rs`): the fixed
+/// (name, value) walk over every numeric allocation above whose sha256
+/// is the ABI-surface digest. Generations and slot images record the
+/// digest they were built against; a selector accepts them only on
+/// equality with the running kernel's own digest.
+pub mod abi_surface {
+    include!("abi_surface.rs");
+}
+
 pub mod contracts {
     pub mod hal {
         pub mod gpio {

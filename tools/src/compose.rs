@@ -80,6 +80,29 @@ pub struct NodeCapacity {
     pub max_domains: u8,
 }
 
+/// Node capacity for a named target profile. This is the single host-side
+/// mirror of the kernel's per-profile limits; `capacity_mirrors_kernel_sources`
+/// (below) textually extracts the kernel constants and fails when they drift.
+///
+/// `linux` and `cm5`/`bcm2712` share values because both compile the aarch64
+/// `profile_host` block (`modules/sdk/config.rs`) with the `multitenant`
+/// feature (`src/kernel/owner.rs` MAX_OWNERS). `max_endpoints` is agent-level
+/// admission policy — the kernel has no endpoint table constant yet.
+pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
+    match profile {
+        "linux" | "cm5" | "bcm2712" => Some(NodeCapacity {
+            max_owners: 64,                // owner.rs MAX_OWNERS (multitenant)
+            max_modules: 128,              // sdk config profile_host MAX_MODULES
+            max_edges: 128,                // kernel/config.rs MAX_GRAPH_EDGES
+            state_bytes: 64 * 1024 * 1024, // profile_host STATE_ARENA_SIZE
+            buffer_bytes: 8 * 1024 * 1024, // profile_host BUFFER_ARENA_SIZE
+            max_endpoints: 64,             // agent admission policy
+            max_domains: 4,                // scheduler MAX_DOMAINS
+        }),
+        _ => None,
+    }
+}
+
 /// State of one owner slot in the prior owner table (rfc_k8s.md §11 input).
 /// `generation` is the slot's persistent monotonic counter — it survives free,
 /// so reuse always issues a strictly higher generation.
@@ -783,6 +806,53 @@ mod tests {
         assert_eq!(
             decode_plan(&bytes),
             Err(PlanDecodeError::TooManyAssignments)
+        );
+    }
+
+    /// Drift guard: `capacity_for_profile` mirrors kernel constants it cannot
+    /// import (they live behind target cfgs). Textual extraction is the
+    /// accepted pattern for cross-cfg drift guards in this repo (see the ABI
+    /// wire-surface guards); when a kernel limit changes, this fails loudly
+    /// and the mirror above is the single place to update.
+    #[test]
+    fn capacity_mirrors_kernel_sources() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let read = |p: &str| std::fs::read_to_string(repo.join(p)).expect(p);
+
+        fn extract(src: &str, name: &str) -> u64 {
+            let pat = format!("pub const {name}: usize = ");
+            let start = src.find(&pat).unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &src[start + pat.len()..];
+            let expr: String = rest[..rest.find(';').expect("terminator")].to_string();
+            // Evaluate `A * B * C` integer products (the only shape used).
+            expr.split('*')
+                .map(|t| t.trim().parse::<u64>().expect("integer term"))
+                .product()
+        }
+
+        let owner = read("src/kernel/owner.rs");
+        let sdk = read("modules/sdk/config.rs");
+        let kcfg = read("src/kernel/config.rs");
+        let sched = read("src/kernel/scheduler/mod.rs");
+
+        let cap = capacity_for_profile("linux").expect("linux profile");
+        // First MAX_OWNERS in owner.rs is the multitenant value.
+        assert_eq!(cap.max_owners as u64, extract(&owner, "MAX_OWNERS"));
+        // First profile block in sdk config.rs is profile_host (aarch64).
+        assert_eq!(cap.max_modules as u64, extract(&sdk, "MAX_MODULES"));
+        assert_eq!(cap.state_bytes as u64, extract(&sdk, "STATE_ARENA_SIZE"));
+        assert_eq!(cap.buffer_bytes as u64, extract(&sdk, "BUFFER_ARENA_SIZE"));
+        assert_eq!(cap.max_edges as u64, extract(&kcfg, "MAX_GRAPH_EDGES"));
+        assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
+        // cm5/bcm2712 alias the same aarch64 profile.
+        for alias in ["cm5", "bcm2712"] {
+            let c = capacity_for_profile(alias).expect(alias);
+            assert_eq!(c.max_modules, cap.max_modules);
+            assert_eq!(c.max_owners, cap.max_owners);
+        }
+        assert!(
+            capacity_for_profile("rp2350").is_none(),
+            "single-tenant target has no agent profile"
         );
     }
 }

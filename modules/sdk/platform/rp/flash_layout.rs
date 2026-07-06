@@ -36,6 +36,13 @@ pub const GRAPH_SLOT_VERSION: u8 = 1;
 /// (magic/epoch/sizes/sha256). See `contracts/storage/graph_slot.rs`
 /// for the on-flash field layout.
 pub const GRAPH_SLOT_HEADER_SIZE: usize = 256;
+/// Header offset of the 32-byte ABI-surface pin (`abi_surface.rs` digest
+/// of the substrate the slot was built against). `fluxor slot-image`
+/// writes it; the slot selector accepts a slot only when the pin equals
+/// the running kernel's own surface digest — strict equality, no legacy
+/// grandfather (pre-pin slots must be rewritten with a current
+/// slot-image).
+pub const GRAPH_SLOT_ABI_SURFACE_OFFSET: usize = 64;
 
 // ── Runtime parameter store ──────────────────────────────────────────
 //

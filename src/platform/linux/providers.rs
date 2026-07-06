@@ -610,7 +610,7 @@ struct LinuxNetState {
     /// truncate the second `channel_read` and corrupt the next
     /// frame's header parse. Sized at 16 KiB to leave headroom for
     /// any future raise in `NET_BUF_SIZE` without re-sync.
-    cmd_buf: [u8; 16384],
+    cmd_buf: [u8; 49152],
     msg_buf: [u8; 16384],
     recv_buf: [u8; 16384],
     /// Next slot to consider when allocating a connection. Used to
@@ -650,7 +650,7 @@ impl LinuxNetState {
             for i in 0..LINUX_NET_MAX_CONNS {
                 conns.add(i).write(LinuxNetConn::EMPTY);
             }
-            addr_of_mut!((*p).cmd_buf).write([0u8; 16384]);
+            addr_of_mut!((*p).cmd_buf).write([0u8; 49152]);
             addr_of_mut!((*p).msg_buf).write([0u8; 16384]);
             addr_of_mut!((*p).recv_buf).write([0u8; 16384]);
             // Skip slot 0 in initial rotation — it's almost always the

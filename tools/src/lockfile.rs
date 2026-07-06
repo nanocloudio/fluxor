@@ -43,6 +43,15 @@ pub struct LockFile {
     pub fmods: Vec<LockedFmod>,
     #[serde(default, rename = "runtime")]
     pub runtimes: Vec<LockedRuntime>,
+    /// Modules pinned to OCI-store artifacts by digest
+    /// (`.context/fmod_registry_plan.md` P2). Written by `fluxor store
+    /// pin` / `fluxor modules publish --pin`; consumed by combine /
+    /// packaging module resolution as the fallback after the on-disk
+    /// `target/fluxor/<target>/modules/` tree. Keyed by
+    /// `(name, target)`; `digest` is the artifact-manifest digest
+    /// (identity), the `.fmod` bytes are reached through it.
+    #[serde(default, rename = "oci_module")]
+    pub oci_modules: Vec<LockedOciModule>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -67,6 +76,18 @@ pub struct LockedFmod {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LockedOciModule {
+    pub name: String,
+    /// Silicon target the pinned `.fmod` was built for.
+    pub target: String,
+    /// Artifact-manifest digest (`sha256:<hex>`) in the OCI store.
+    pub digest: String,
+    /// The tag the pin was resolved from — informational; identity is
+    /// the digest.
+    pub reference: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LockedRuntime {
     pub project: String,
     pub name: String,
@@ -78,6 +99,23 @@ pub struct LockedRuntime {
 
 pub fn lockfile_path(project_root: &Path) -> PathBuf {
     project_root.join(LOCKFILE_NAME)
+}
+
+/// Take the exclusive advisory lock guarding every `fluxor.lock`
+/// read-modify-write (`fluxor update`, `store pin`). Held for the caller's
+/// transaction; released on drop. The guard file (`.fluxor.lock.lock`) is
+/// separate from the lockfile so locking never truncates the data.
+pub fn lock_lockfile(project_root: &Path) -> Result<fs::File> {
+    fs::create_dir_all(project_root)?;
+    let path = project_root.join(".fluxor.lock.lock");
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    f.lock()
+        .map_err(|e| Error::Config(format!("lock {}: {e}", path.display())))?;
+    Ok(f)
 }
 
 pub fn read(project_root: &Path) -> Result<Option<LockFile>> {
@@ -99,7 +137,15 @@ pub fn write(project_root: &Path, lock: &LockFile) -> Result<PathBuf> {
     let serialised = toml::to_string_pretty(lock)
         .map_err(|e| Error::Config(format!("serialise lockfile: {e}")))?;
     body.push_str(&serialised);
-    fs::write(&path, body)?;
+    // Atomic replace: temp file + fsync + rename, so an interrupted write
+    // can never leave truncated/invalid TOML under the real name.
+    let tmp = path.with_extension(format!("lock.tmp.{}", std::process::id()));
+    fs::write(&tmp, body)?;
+    fs::File::open(&tmp)?.sync_all()?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(path)
 }
 
@@ -135,6 +181,11 @@ pub fn resolve(project_root: &Path, active_features: &[String]) -> Result<LockFi
         crates: Vec::new(),
         fmods: Vec::new(),
         runtimes: Vec::new(),
+        // OCI-store pins are operator-written (`fluxor store pin`), not
+        // registry-resolved: re-resolving must never drop them.
+        oci_modules: read(project_root)?
+            .map(|l| l.oci_modules)
+            .unwrap_or_default(),
     };
 
     if direct_deps.is_empty() {
@@ -531,6 +582,11 @@ pub fn cmd_update(project_root: Option<&Path>, features: &[String]) -> Result<()
     let pr = project_root
         .map(PathBuf::from)
         .unwrap_or_else(project::root);
+    // Exclusive advisory lock over the whole read-modify-write, the same
+    // guard `fluxor store pin` takes. Atomic writes alone don't prevent a
+    // concurrent `update` and `pin` from both reading the old file and one
+    // clobbering the other's result — the lock serializes the transaction.
+    let _guard = lock_lockfile(&pr)?;
     let lock = resolve(&pr, features)?;
 
     if lock.crates.is_empty() && lock.fmods.is_empty() && lock.runtimes.is_empty() {
