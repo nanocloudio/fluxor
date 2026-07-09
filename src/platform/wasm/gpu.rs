@@ -25,7 +25,16 @@
 //!                                         bit2 = line-list topology,
 //!                                         bit3 = suppress depth WRITE — for
 //!                                         overlays that test against the scene
-//!                                         but must not occlude it)
+//!                                         but must not occlude it,
+//!                                         bit4 = alpha-over blend (transparency),
+//!                                         bits8-11 = sampled-texture count N:
+//!                                           the pipeline reads N offscreen
+//!                                           targets, bound as texture@(1+2i) +
+//!                                           sampler@(2+2i); the app's shader
+//!                                           declares the matching bindings.
+//!                                           attr_count 0 → a vertexless
+//!                                           fullscreen pipeline, drawn with
+//!                                           DRAW_FULLSCREEN)
 //!     shader_format: u32                 (0 = WGSL utf8, 1 = SPIR-V,
 //!                                         2+ = reserved for native blobs;
 //!                                         a driver REJECTS formats it cannot
@@ -66,7 +75,35 @@
 //! - DRAW [0x20] [pipeline_id:u32] [slot:u32]
 //!   Draws the slot's whole buffer with the pipeline (vertex count =
 //!   slot bytes / pipeline stride; indexed if the slot has indices).
-//! - FRAME_END [0xFF]
+//!
+//! ## Offscreen render targets & multi-pass
+//!
+//! Render the scene to an offscreen texture, then run fullscreen passes that
+//! sample it — the generic substrate for post-processing (bloom / tonemap /
+//! colour-grade), screen-space reflection, and (with a depth target) shadow
+//! maps.
+//!
+//! - CREATE_TARGET [0x04] [target_id:u32] [width:u32] [height:u32] [flags:u32]
+//!   Creates/replaces offscreen target `target_id` (id 0 = swapchain, rejected).
+//!   width/height 0 track the canvas. flags bit0 = allocate a depth attachment
+//!   (needed to render the scene into the target with depth testing). The
+//!   target's colour is a sampleable texture the MSAA pass resolves into.
+//!   Device state — applied outside frame gating.
+//! - BEGIN_PASS [0x05] [frame_tick:u32] [target_id:u32] [flags:u32]
+//!                     [clear_r:f32, clear_g:f32, clear_b:f32]
+//!   Begins a render pass into `target_id` (0 = swapchain). flags bit0 = attach
+//!   depth. The first BEGIN_PASS of a frame opens the encoder and takes the
+//!   vsync gate (like FRAME_BEGIN); a later BEGIN_PASS auto-ends the previous
+//!   pass. A multi-pass frame uses BEGIN_PASS for every pass and FRAME_END to
+//!   submit; FRAME_BEGIN is the single-pass form (one swapchain pass).
+//! - BIND_TEXTURE [0x06] [pipeline_id:u32] [unit:u32] [target_id:u32]
+//!   Binds target `target_id`'s resolved colour texture to sampled `unit` of
+//!   `pipeline_id`. The pipeline draws once all its declared units are bound.
+//!   Device state.
+//! - DRAW_FULLSCREEN [0x21] [pipeline_id:u32] [vertex_count:u32]
+//!   Draws a vertexless pipeline (positions from @builtin(vertex_index);
+//!   vertex_count 3 = fullscreen triangle) sampling its bound targets.
+//! - FRAME_END [0xFF]  Ends the open pass and submits the whole encoder.
 
 use crate::kernel::{channel, scheduler, syscalls};
 
@@ -74,6 +111,9 @@ use crate::kernel::{channel, scheduler, syscalls};
 const CMD_FRAME_BEGIN: u8 = 0x01;
 const CMD_SET_UNIFORMS: u8 = 0x02;
 const CMD_SET_PIPELINE: u8 = 0x03;
+const CMD_CREATE_TARGET: u8 = 0x04;
+const CMD_BEGIN_PASS: u8 = 0x05;
+const CMD_BIND_TEXTURE: u8 = 0x06;
 const CMD_UPLOAD_VERTICES: u8 = 0x10;
 const CMD_UPLOAD_INDICES: u8 = 0x11;
 const CMD_UPLOAD_VERTICES_BEGIN: u8 = 0x12;
@@ -81,6 +121,7 @@ const CMD_UPLOAD_VERTICES_CHUNK: u8 = 0x13;
 const CMD_UPLOAD_INDICES_BEGIN: u8 = 0x14;
 const CMD_UPLOAD_INDICES_CHUNK: u8 = 0x15;
 const CMD_DRAW: u8 = 0x20;
+const CMD_DRAW_FULLSCREEN: u8 = 0x21;
 const CMD_FRAME_END: u8 = 0xFF;
 
 // Init status constants (match host_shims.js)
@@ -131,6 +172,22 @@ extern "C" {
 
     /// Draw vertex-buffer `slot` with pipeline `id`
     fn host_gpu_raster_draw(id: u32, slot: u32) -> i32;
+
+    /// Create/replace offscreen render target `id` (0 = swapchain, rejected).
+    /// w/h of 0 track the canvas size. flags bit0 = allocate depth. Returns 0/<0.
+    fn host_gpu_raster_target(id: u32, w: u32, h: u32, flags: u32) -> i32;
+
+    /// Begin a render pass into `target_id` (0 = swapchain). flags bit0 = attach
+    /// depth. The first pass of a frame opens the encoder + takes the vsync gate.
+    fn host_gpu_raster_begin_pass(target_id: u32, r: f32, g: f32, b: f32, flags: u32) -> i32;
+
+    /// Bind offscreen target `target_id`'s resolved color texture to sampled
+    /// unit `unit` of pipeline `pipeline_id`. Returns 0/<0.
+    fn host_gpu_raster_bind_texture(pipeline_id: u32, unit: u32, target_id: u32) -> i32;
+
+    /// Draw a vertexless pipeline (`count` vertices from @builtin(vertex_index))
+    /// — a fullscreen post/reflection pass. Returns 0/<0.
+    fn host_gpu_raster_draw_fullscreen(id: u32, count: u32) -> i32;
 
     /// End frame and present
     fn host_gpu_raster_end_frame() -> i32;
@@ -302,6 +359,36 @@ fn gpu_step(state: *mut u8) -> i32 {
                     st.cmd_offset += desc_len;
                 }
 
+                CMD_CREATE_TARGET => {
+                    // 16 bytes: id, width, height, flags. Device state — applied
+                    // regardless of frame gating (like pipeline/upload).
+                    if st.cmd_offset + 16 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let id = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let w = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    let h = read_u32(st.cmd_buf, st.cmd_offset as usize + 8);
+                    let flags = read_u32(st.cmd_buf, st.cmd_offset as usize + 12);
+                    st.cmd_offset += 16;
+                    if host_gpu_raster_target(id, w, h, flags) < 0 {
+                        log_msg(b"[gpu] target create failed");
+                    }
+                }
+
+                CMD_BIND_TEXTURE => {
+                    // 12 bytes: pipeline_id, unit, target_id. Device state.
+                    if st.cmd_offset + 12 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let pid = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let unit = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    let tid = read_u32(st.cmd_buf, st.cmd_offset as usize + 8);
+                    st.cmd_offset += 12;
+                    host_gpu_raster_bind_texture(pid, unit, tid);
+                }
+
                 CMD_FRAME_BEGIN => {
                     // 16 bytes: frame_tick (u32) + clear color (3 floats)
                     if st.cmd_offset + 16 > st.cmd_len {
@@ -333,6 +420,42 @@ fn gpu_step(state: *mut u8) -> i32 {
                         continue;
                     }
                     st.in_frame = true;
+                }
+
+                CMD_BEGIN_PASS => {
+                    // 24 bytes: frame_tick, target_id, flags, clear r/g/b. The
+                    // multi-pass frame opener (scene→offscreen, then post→
+                    // swapchain); gated exactly like FRAME_BEGIN.
+                    if st.cmd_offset + 24 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let frame_tick = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let target_id = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    let flags = read_u32(st.cmd_buf, st.cmd_offset as usize + 8);
+                    let r = read_f32(st.cmd_buf, st.cmd_offset as usize + 12);
+                    let g = read_f32(st.cmd_buf, st.cmd_offset as usize + 16);
+                    let b = read_f32(st.cmd_buf, st.cmd_offset as usize + 20);
+                    st.cmd_offset += 24;
+
+                    // Stale frame: keep decoding, suppress host effects.
+                    if frame_tick < st.ready_tick {
+                        st.skip_frame = true;
+                        continue;
+                    }
+                    if !st.skip_frame {
+                        let rc = host_gpu_raster_begin_pass(target_id, r, g, b, flags);
+                        // -2 = vsync gate on the frame opener → skip the whole
+                        // frame. Any other error (e.g. unknown target) is left
+                        // for FRAME_END to still submit/clean the encoder.
+                        if rc == -2 {
+                            st.skip_frame = true;
+                            continue;
+                        }
+                        if rc >= 0 {
+                            st.in_frame = true;
+                        }
+                    }
                 }
 
                 CMD_SET_UNIFORMS => {
@@ -460,6 +583,21 @@ fn gpu_step(state: *mut u8) -> i32 {
                     st.cmd_offset += 8;
                     if !st.skip_frame {
                         host_gpu_raster_draw(id, slot);
+                    }
+                }
+
+                CMD_DRAW_FULLSCREEN => {
+                    // 8 bytes: pipeline_id, vertex_count. A vertexless fullscreen
+                    // pass (post-process / reflection) sampling bound targets.
+                    if st.cmd_offset + 8 > st.cmd_len {
+                        st.cmd_offset -= 1;
+                        break;
+                    }
+                    let id = read_u32(st.cmd_buf, st.cmd_offset as usize);
+                    let count = read_u32(st.cmd_buf, st.cmd_offset as usize + 4);
+                    st.cmd_offset += 8;
+                    if !st.skip_frame {
+                        host_gpu_raster_draw_fullscreen(id, count);
                     }
                 }
 

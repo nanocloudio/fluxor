@@ -1779,12 +1779,19 @@ registerProcessor('pcm-ring', PcmRing);
     let gpuContext = null;
     let gpuCanvas = null;
     let gpuFormat = null;
-    // Slotted resources (protocol v2): pipelines and vertex buffers are
+    // Slotted resources: pipelines and vertex buffers are
     // independent id spaces; DRAW names a (pipeline_id, buffer_slot) pair.
     //   pipeline entry: { pipeline, depth, stride, uniformBuffer, bindGroup }
     //   slot entry:     { vb, bytes, ib, indexCount, pendingVB, pendingTotal, pendingCursor }
     const gpuPipelines = new Map();
     const gpuSlots = new Map();
+    // Offscreen render targets: app-created color textures the
+    // scene renders into and post-process / reflection passes sample. Each holds
+    //   { msaa, color, depth, view, colorView, w, h, matchCanvas, withDepth }
+    // where `color` is the single-sample sampled texture the `msaa` companion
+    // resolves into. Target id 0 is the swapchain (never in this map).
+    const gpuTargets = new Map();
+    let gpuLinearSampler = null;
     let gpuAnyDepth = false; // any registered pipeline declares depth
     const gpuSlot = (slot) => {
       let s = gpuSlots.get(slot);
@@ -1831,6 +1838,78 @@ registerProcessor('pcm-ring', PcmRing);
 
     // Descriptor attribute format codes → WebGPU vertex formats (gpu.rs contract)
     const GPU_ATTR_FORMATS = ['float32', 'float32x2', 'float32x3', 'float32x4', 'uint32', 'unorm8x4'];
+
+    // (Re)build a pipeline's bind group from its uniform buffer plus any bound
+    // sampled-texture views. A pipeline that declares texture units draws
+    // nothing until every unit has been bound (bindGroup stays null).
+    function gpuRebuildBindGroup(entry) {
+      if (entry.uniformSize === 0 && entry.texCount === 0) { entry.bindGroup = null; return; }
+      const entries = [];
+      if (entry.uniformSize > 0 && entry.uniformBuffer) {
+        entries.push({ binding: 0, resource: { buffer: entry.uniformBuffer } });
+      }
+      for (let i = 0; i < entry.texCount; i++) {
+        if (!entry.boundViews[i]) { entry.bindGroup = null; return; } // not all units bound yet
+        entries.push({ binding: 1 + 2 * i, resource: entry.boundViews[i] });
+        entries.push({ binding: 2 + 2 * i, resource: gpuLinearSampler });
+      }
+      entry.bindGroup = gpuDevice.createBindGroup({ layout: entry.bindGroupLayout, entries });
+    }
+
+    // Create/replace offscreen render target `id`. `reqW/reqH` of 0 track the
+    // canvas size (recreated on resize). Color is single-sample + sampleable;
+    // the MSAA companion resolves into it so sampled output is already resolved.
+    function gpuCreateTarget(id, reqW, reqH, withDepth) {
+      const width = reqW > 0 ? reqW : gpuCanvas.width;
+      const height = reqH > 0 ? reqH : gpuCanvas.height;
+      const msaa = gpuDevice.createTexture({
+        size: [width, height], format: gpuFormat, sampleCount: GPU_MSAA,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      const color = gpuDevice.createTexture({
+        size: [width, height], format: gpuFormat, sampleCount: 1,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      const depth = withDepth ? gpuDevice.createTexture({
+        size: [width, height], format: 'depth24plus', sampleCount: GPU_MSAA,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      }) : null;
+      gpuTargets.set(id, {
+        msaa, color, depth,
+        msaaView: msaa.createView(), colorView: color.createView(),
+        depthView: depth ? depth.createView() : null,
+        reqW, reqH, matchCanvas: (reqW === 0 || reqH === 0), withDepth,
+      });
+    }
+
+    // Begin a render pass into `targetId` (0 = swapchain). Every pass renders
+    // 4x MSAA and resolves — into the canvas for the swapchain, or into a
+    // target's sampleable single-sample color texture otherwise. Depth is
+    // attached only when requested AND available. Returns 0 or <0.
+    function gpuOpenPass(targetId, r, g, b, withDepth) {
+      let colorView, resolveView, depthView;
+      if (targetId === 0) {
+        colorView = gpuMsaaTexture.createView();
+        resolveView = gpuContext.getCurrentTexture().createView();
+        depthView = withDepth ? gpuDepthTexture.createView() : null;
+      } else {
+        const t = gpuTargets.get(targetId);
+        if (!t) return -1;
+        colorView = t.msaaView;
+        resolveView = t.colorView;
+        depthView = (withDepth && t.depthView) ? t.depthView : null;
+      }
+      gpuPass = gpuEncoder.beginRenderPass({
+        colorAttachments: [{
+          view: colorView, resolveTarget: resolveView,
+          loadOp: 'clear', storeOp: 'store', clearValue: { r: r, g: g, b: b, a: 1.0 },
+        }],
+        depthStencilAttachment: depthView ? {
+          view: depthView, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
+        } : undefined,
+      });
+      return 0;
+    }
 
     const webgpuShim = {
       // Initialize WebGPU device and context. Returns 0 on success, <0 on error.
@@ -1906,6 +1985,12 @@ registerProcessor('pcm-ring', PcmRing);
             sampleCount: GPU_MSAA,
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
           });
+          // One shared linear/clamp sampler for texture-sampling pipelines
+          // (offscreen render targets read by post-process / reflection passes).
+          gpuLinearSampler = gpuDevice.createSampler({
+            magFilter: 'linear', minFilter: 'linear',
+            addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
+          });
 
           // No pipeline yet: it arrives from the app via host_gpu_raster_pipeline.
           gpuInitialized = true;
@@ -1961,6 +2046,8 @@ registerProcessor('pcm-ring', PcmRing);
           const cullBack = (flags & 2) !== 0;
           const lineList = (flags & 4) !== 0;
           const noDepthWrite = (flags & 8) !== 0;
+          const wantBlend = (flags & 16) !== 0;        // bit4: alpha-over blend
+          const texCount = (flags >> 8) & 0xF;         // bits8-11: sampled textures
 
           const module = gpuDevice.createShaderModule({ code: wgsl });
           // Shader/pipeline validation is DEFERRED in WebGPU: creation returns
@@ -1973,24 +2060,51 @@ registerProcessor('pcm-ring', PcmRing);
               if (m.type === 'error') console.error(line); else console.warn(line);
             }
           });
-          const bindGroupLayout = gpuDevice.createBindGroupLayout({
-            entries: uniformSize > 0 ? [{
+          // Bind group layout: uniform at binding 0 (if any), then each sampled
+          // texture unit i as texture@(1+2i) + sampler@(2+2i). A post/reflection
+          // shader declares the matching bindings; a plain scene shader sets
+          // texCount=0 and gets the original uniform-only layout.
+          const bglEntries = [];
+          if (uniformSize > 0) {
+            bglEntries.push({
               binding: 0,
               visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
               buffer: { type: 'uniform' },
-            }] : [],
-          });
+            });
+          }
+          for (let i = 0; i < texCount; i++) {
+            bglEntries.push({
+              binding: 1 + 2 * i,
+              visibility: GPUShaderStage.FRAGMENT,
+              texture: { sampleType: 'float', viewDimension: '2d' },
+            });
+            bglEntries.push({
+              binding: 2 + 2 * i,
+              visibility: GPUShaderStage.FRAGMENT,
+              sampler: { type: 'filtering' },
+            });
+          }
+          const bindGroupLayout = gpuDevice.createBindGroupLayout({ entries: bglEntries });
           const desc = {
             layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
             vertex: {
               module,
               entryPoint: 'vs_main',
-              buffers: [{ arrayStride: stride, attributes }],
+              // A vertexless pipeline (attr_count 0, e.g. a fullscreen post pass
+              // that derives position from @builtin(vertex_index)) declares no
+              // vertex buffers.
+              buffers: attributes.length > 0 ? [{ arrayStride: stride, attributes }] : [],
             },
             fragment: {
               module,
               entryPoint: 'fs_main',
-              targets: [{ format: gpuFormat }],
+              targets: [{
+                format: gpuFormat,
+                ...(wantBlend ? { blend: {
+                  color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                  alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                } } : {}),
+              }],
             },
             primitive: {
               topology: lineList ? 'line-list' : 'triangle-list',
@@ -2018,17 +2132,21 @@ registerProcessor('pcm-ring', PcmRing);
             // them alive until their GPU work completes.
             uniformBuffer: null,
             bindGroup: null,
+            bindGroupLayout,
+            uniformSize,
+            texCount,
+            // Sampled-texture views bound via host_gpu_raster_bind_texture,
+            // one per declared unit; the bind group is (re)built once every
+            // unit is filled (a post pass draws nothing until then).
+            boundViews: new Array(texCount).fill(null),
           };
           if (uniformSize > 0) {
             entry.uniformBuffer = gpuDevice.createBuffer({
               size: uniformSize,
               usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
-            entry.bindGroup = gpuDevice.createBindGroup({
-              layout: bindGroupLayout,
-              entries: [{ binding: 0, resource: { buffer: entry.uniformBuffer } }],
-            });
           }
+          gpuRebuildBindGroup(entry);
           gpuPipelines.set(id, entry);
           gpuAnyDepth = [...gpuPipelines.values()].some((p) => p.depth);
           console.log('[webgpu] pipeline ' + id + ' created: stride=' + stride + ' attrs=' + attrCount +
@@ -2067,6 +2185,12 @@ registerProcessor('pcm-ring', PcmRing);
           sampleCount: GPU_MSAA,
           usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
+        // Recreate canvas-tracking offscreen targets at the new size. A rebound
+        // pipeline picks up the new colorView on its next bind_texture; apps
+        // that keep a target bound should re-bind after a resize.
+        for (const [id, t] of gpuTargets) {
+          if (t.matchCanvas) gpuCreateTarget(id, t.reqW, t.reqH, t.withDepth);
+        }
         return 0;
       },
 
@@ -2226,24 +2350,71 @@ registerProcessor('pcm-ring', PcmRing);
           return -1;
         }
         if (gpuFrameSubmittedThisVsync) return -2; // one frame per refresh
-        const texture = gpuContext.getCurrentTexture();
         gpuEncoder = gpuDevice.createCommandEncoder();
-        gpuPass = gpuEncoder.beginRenderPass({
-          colorAttachments: [{
-            // Render into the 4x MSAA target, resolve to the canvas
-            view: gpuMsaaTexture.createView(),
-            resolveTarget: texture.createView(),
-            loadOp: 'clear',
-            storeOp: 'store',
-            clearValue: { r: r, g: g, b: b, a: 1.0 },
-          }],
-          depthStencilAttachment: (gpuAnyDepth && gpuDepthTexture) ? {
-            view: gpuDepthTexture.createView(),
-            depthLoadOp: 'clear',
-            depthStoreOp: 'store',
-            depthClearValue: 1.0,
-          } : undefined,
-        });
+        // Single-pass form: one swapchain pass, depth iff any pipeline uses it.
+        return gpuOpenPass(0, r, g, b, gpuAnyDepth && !!gpuDepthTexture);
+      },
+
+      // Create/replace offscreen render target `id` (id 0 is the swapchain and
+      // is rejected). `flags` bit0 = allocate a depth attachment. w/h of 0 track
+      // the canvas size. Device state — safe to call outside a frame.
+      host_gpu_raster_target: (id, w, h, flags) => {
+        if (!gpuInitialized || !gpuDevice) return -1;
+        if (id === 0) return -2;
+        try {
+          gpuCreateTarget(id >>> 0, w >>> 0, h >>> 0, (flags & 1) !== 0);
+          return 0;
+        } catch (e) {
+          console.error('[webgpu] target create failed: id=' + id + ' — ' + e.message);
+          return -3;
+        }
+      },
+
+      // Begin a render pass into `targetId` (0 = swapchain) with a clear color.
+      // `flags` bit0 = attach depth. The first begin_pass of a frame opens the
+      // command encoder and takes the vsync gate (returns -2 if a frame was
+      // already submitted this refresh); a later begin_pass auto-ends the
+      // previous pass. This is the multi-pass entry point; begin_frame is the
+      // single-pass form. Both are ended by end_frame.
+      host_gpu_raster_begin_pass: (targetId, r, g, b, flags) => {
+        if (!gpuInitialized || !gpuDevice || !gpuContext) return -1;
+        if (!gpuEncoder) {
+          if (gpuFrameSubmittedThisVsync) return -2;
+          gpuEncoder = gpuDevice.createCommandEncoder();
+        } else if (gpuPass) {
+          gpuPass.end();
+          gpuPass = null;
+        }
+        return gpuOpenPass(targetId >>> 0, r, g, b, (flags & 1) !== 0);
+      },
+
+      // Bind offscreen target `targetId`'s (resolved) color texture to sampled
+      // unit `unit` of pipeline `pipelineId`. Rebuilds the pipeline's bind group;
+      // the pipeline draws once all its declared units are bound. Device state.
+      host_gpu_raster_bind_texture: (pipelineId, unit, targetId) => {
+        const p = gpuPipelines.get(pipelineId);
+        if (!p) return -1;
+        if (unit >= p.texCount) return -2;
+        const t = gpuTargets.get(targetId);
+        if (!t) return -3;
+        p.boundViews[unit] = t.colorView;
+        try { gpuRebuildBindGroup(p); } catch (e) {
+          console.error('[webgpu] bind_texture failed: ' + e.message); return -4;
+        }
+        return 0;
+      },
+
+      // Draw a vertexless pipeline (fullscreen post/reflection pass): no vertex
+      // buffer, `count` vertices from @builtin(vertex_index) — 3 for a
+      // fullscreen triangle. Skips if the pipeline's textures are not all bound.
+      host_gpu_raster_draw_fullscreen: (id, count) => {
+        if (!gpuPass) return -1;
+        const p = gpuPipelines.get(id);
+        if (!p) return 0;
+        if (p.texCount > 0 && !p.bindGroup) return 0; // textures not all bound yet
+        gpuPass.setPipeline(p.pipeline);
+        if (p.bindGroup) gpuPass.setBindGroup(0, p.bindGroup);
+        gpuPass.draw(count);
         return 0;
       },
 
@@ -2268,14 +2439,15 @@ registerProcessor('pcm-ring', PcmRing);
         return 0;
       },
 
-      // End frame and present
+      // End frame and present. Ends the open pass (if any) and submits the whole
+      // encoder — so a multi-pass frame (scene target → post to swapchain)
+      // presents all its passes in one submit.
       host_gpu_raster_end_frame: () => {
-        if (!gpuPass || !gpuEncoder || !gpuDevice) {
+        if (!gpuDevice || !gpuEncoder) {
           return -1;
         }
-        gpuPass.end();
+        if (gpuPass) { gpuPass.end(); gpuPass = null; }
         gpuDevice.queue.submit([gpuEncoder.finish()]);
-        gpuPass = null;
         gpuEncoder = null;
         gpuFrameSubmittedThisVsync = true;
         return 0;
