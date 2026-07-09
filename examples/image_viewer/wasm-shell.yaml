@@ -77,19 +77,18 @@ presentation:
   # them out responsively around the display — prev on the leading
   # edge, next on the trailing edge, never over the image.
   #
-  # SHELL-DRIVEN: these gallery controls are the only navigation. Each
-  # tap emits an `action.gallery.*` InputAction → `wasm_browser_action`
-  # → FMP next/prev → `bank`. Verified live: tapping Next advances bank
-  # (cmd_rx + idx increment per tap).
+  # SHELL-DRIVEN: these gallery controls are the only navigation. Each is
+  # named with a bare `prev`/`next` verb; the tap's action-id hash passes
+  # through `wasm_browser_action` unchanged into `bank`.
   shell:
     version: 1
     media_profile: gallery
     context: active
     controls:
       - { id: prev, kind: button, placement: primary_start, label: "‹ Prev",
-          action: action.gallery.previous, a11y: { label: Previous image } }
+          action: prev, a11y: { label: Previous image } }
       - { id: next, kind: button, placement: primary_end, label: "Next ›",
-          action: action.gallery.next, a11y: { label: Next image } }
+          action: next, a11y: { label: Next image } }
       - { id: index, kind: status, placement: above_content, field: title }
 
   browser_overlay:
@@ -103,9 +102,9 @@ presentation:
 
 modules:
   # Browser-overlay action source — the SOLE commands producer in this
-  # shell-driven variant. The overlay's Prev/Next gallery controls emit
-  # `action.gallery.{previous,next}`, which this bridges to FMP
-  # `prev`/`next` for `bank`. (The canonical wasm.yaml keeps the DOM-tap
+  # shell-driven variant. The overlay's Prev/Next gallery controls are
+  # named `prev`/`next`; this passes each action-id hash through unchanged
+  # for `bank` to match. (The canonical wasm.yaml keeps the DOM-tap
   # nav→gesture path instead; fan-in of both into one ctrl input is a
   # separate kernel concern.)
   - name: actionnav

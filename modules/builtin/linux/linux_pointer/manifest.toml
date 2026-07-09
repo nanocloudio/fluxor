@@ -1,0 +1,56 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# Native Linux pointer/touch input authority — the evdev counterpart of
+# `wasm_browser_pointer`. Reads Linux `input_event` records from an evdev
+# device (`/dev/input/eventN`) and emits `input::pointer::MSG_EVENT`
+# 16-byte records on its `events` port, so a content-plane UI
+# (truffle_shell, content_controls) can hit-test taps on a connected LCD
+# touchscreen or mouse with no host chrome.
+#
+# Absolute touch (`ABS_X`/`ABS_Y`, `ABS_MT_POSITION_X`/`_Y` + `BTN_TOUCH`)
+# and relative mouse (`REL_X`/`REL_Y` + `BTN_LEFT`) both map to
+# down/move/up pointer records, scaled from the device's axis range to the
+# surface's logical geometry. `path` may also be a FIFO carrying the same
+# `input_event` byte layout, for headless testing without hardware.
+
+[[ports]]
+name = "events"
+direction = "output"
+content_type = "PointerEvents"
+required = true
+
+# Tag 10 — evdev device (or a FIFO of input_event records).
+[[params]]
+name = "path"
+type = "str"
+default = "/dev/input/event0"
+
+# Tag 11/12 — logical surface geometry the coords are scaled into.
+[[params]]
+name = "width"
+type = "u32"
+default = 960
+
+[[params]]
+name = "height"
+type = "u32"
+default = 540
+
+# Tag 13/14 — device absolute-axis maxima for scaling. 0 = axes are
+# already in logical space (pass-through; the default for mice and for
+# pre-scaled FIFO test input).
+[[params]]
+name = "x_max"
+type = "u32"
+default = 0
+
+[[params]]
+name = "y_max"
+type = "u32"
+default = 0
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "Linux-host hardware shim — evdev input via the host OS; observed via host tooling, not an on-silicon data path"

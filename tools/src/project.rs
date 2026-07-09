@@ -236,6 +236,37 @@ pub fn root() -> PathBuf {
     discover().path
 }
 
+/// Resolve the project root for a command driven by a config file at
+/// `config_path` (e.g. `fluxor run <config>`). Resolution order:
+///
+///   1. `FLUXOR_PROJECT_ROOT` if it names a directory (same override as
+///      [`discover`]);
+///   2. the marker walk from the config file's OWN location, so the command
+///      works from any cwd — a subdirectory of the project, or entirely
+///      outside it with an absolute config path;
+///   3. cwd-based [`root`] as a last resort.
+///
+/// Unlike [`root`], step 2 does not depend on the process cwd, which is what
+/// lets `fluxor run` resolve modules/binaries the same way no matter where it
+/// is invoked from.
+pub fn root_for_config(config_path: &Path) -> PathBuf {
+    if let Ok(value) = std::env::var(ENV_PROJECT_ROOT) {
+        let p = PathBuf::from(&value);
+        if p.is_dir() {
+            return p.canonicalize().unwrap_or(p);
+        }
+    }
+    let absolute = config_path.canonicalize().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(config_path)
+    });
+    if let Some(found) = absolute.parent().and_then(discover_from) {
+        return found.path;
+    }
+    root()
+}
+
 /// `[project]` table from `fluxor.toml`. Parsed lazily by publish-side
 /// commands that need to scope artefacts into
 /// `~/.fluxor/registry/{fmod,index}/<project>/`.
@@ -583,6 +614,33 @@ pub(crate) mod tests {
         // its result; `tempdir()` on macOS returns a /var path that
         // canonicalises to /private/var.
         assert_eq!(found.path, root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn root_for_config_anchors_to_the_config_location_not_cwd() {
+        let _g = lock();
+        // SAFETY: env mutation serialised by `ENV_LOCK`. Ensure the override is
+        // absent so the config-anchored branch is exercised.
+        unsafe {
+            std::env::remove_var(ENV_PROJECT_ROOT);
+        }
+        // A project (marker) with a config nested in a subdirectory.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let config_dir = root.join("examples/hello");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(root.join(".fluxor"), b"").unwrap();
+        let config = config_dir.join("linux.yaml");
+        fs::write(&config, b"target: linux\n").unwrap();
+
+        // Resolved from the config's own location, independent of the process
+        // cwd (the test runs from elsewhere) — this is what makes `fluxor run
+        // <config>` work from any directory, including outside the tree.
+        assert_eq!(
+            root_for_config(&config),
+            root.canonicalize().unwrap(),
+            "root resolves from the config file, not the caller's cwd"
+        );
     }
 
     #[test]

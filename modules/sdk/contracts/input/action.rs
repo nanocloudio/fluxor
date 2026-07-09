@@ -1,28 +1,38 @@
-// Contract: input::action — canonical InputAction → FMP verb mapping.
+// Contract: input::action — the semantic-action wire.
 //
 // Layer: contracts/input (public, stable).
 //
-// The presentation-shell browser overlay emits canonical `InputAction`
-// ids — `action.transport.toggle`, `action.gallery.next`, … (RFC
-// browser_overlay §17.4). Consumers that speak the FMP command
-// vocabulary (`bank`, and any other selector/transport controller)
-// expect a verb: `next` / `prev` / `toggle` / `select`. Translating one
-// canonical Fluxor vocabulary into the other is canonical knowledge —
-// not application meaning — so it lives here, shared by the
-// `wasm_browser_action` built-in (which hashes incoming action ids) and
-// any future action bridge (endpoint adapters, native shells).
+// A presentation-shell overlay control carries an `action` id — an
+// opaque string chosen by the *application* that authored the shell
+// (`next`, `prev`, `toggle`, `select`, or any app-specific verb). When
+// the user activates the control, the browser overlay
+// (`browser_overlay_runtime.js`) hashes that id with FNV-1a32 and pushes
+// `[action_hash: u32 LE][value: f32 LE]` onto the host action queue; the
+// `wasm_browser_action` built-in drains the queue and emits the hash
+// **unchanged** as the FMP command type.
 //
-// On the wire only the FNV-1a32 hash of the action id travels (JS hashes
-// it in `makeHostSinks`, identically to `fnv1a32` here), so the action
-// strings never ship.
+// So the wire is a pure conduit: the command a control emits is
+// `fnv1a32(action_id)`, and the *consumer* (a `bank` selector, a player,
+// or any app module) decides what that hash means by matching it. Fluxor
+// carries no vocabulary of its own — an application that wants the
+// generic selector verbs names its controls `next`/`prev`/`toggle`
+// (which hash to `runtime.rs::MSG_{NEXT,PREV,TOGGLE}` that `bank`
+// matches); an application with its own vocabulary names them whatever it
+// likes and matches the same hash on the far side. No media, gallery, or
+// transport meaning lives here.
+//
+// On the wire only the FNV-1a32 hash travels (JS hashes it in
+// `makeHostSinks`, byte-identically to `fnv1a32` here), so the action
+// strings never ship and the two sides agree without a shared table.
 
-/// Compile-time FNV-1a 32-bit hash. Kept local (as in `graph_slot.rs`)
-/// so this contract compiles identically in the kernel and PIC build
-/// contexts without depending on a crate-relative path to the shared
-/// `wire::fnv1a32`. Byte-identical to it (offset 0x811c_9dc5, prime
-/// 0x0100_0193) and to `runtime.rs::fnv1a`, so the verbs below equal
-/// `MSG_NEXT` / `MSG_PREV` / `MSG_TOGGLE` that `bank` matches on.
-const fn fnv1a32(data: &[u8]) -> u32 {
+/// Compile-time FNV-1a 32-bit hash — the single hash both the JS overlay
+/// and the kernel-side consumer use to turn an action id into its wire
+/// command. Kept local (as in `graph_slot.rs`) so this contract compiles
+/// identically in the kernel and PIC build contexts without depending on
+/// a crate-relative path to the shared `wire::fnv1a32`. Byte-identical to
+/// it (offset 0x811c_9dc5, prime 0x0100_0193) and to `runtime.rs::fnv1a`,
+/// so e.g. `fnv1a32(b"next") == MSG_NEXT` that `bank` matches on.
+pub const fn fnv1a32(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     let mut i = 0;
     while i < data.len() {
@@ -31,28 +41,4 @@ const fn fnv1a32(data: &[u8]) -> u32 {
         i += 1;
     }
     h
-}
-
-/// FMP verb hashes (== `runtime.rs::MSG_{NEXT,PREV,TOGGLE}`).
-pub const VERB_NEXT: u32 = fnv1a32(b"next");
-pub const VERB_PREV: u32 = fnv1a32(b"prev");
-pub const VERB_TOGGLE: u32 = fnv1a32(b"toggle");
-
-// Canonical action ids the overlay emits, as FNV-1a32 hashes.
-pub const ACTION_GALLERY_NEXT: u32 = fnv1a32(b"action.gallery.next");
-pub const ACTION_TRANSPORT_NEXT: u32 = fnv1a32(b"action.transport.next");
-pub const ACTION_GALLERY_PREV: u32 = fnv1a32(b"action.gallery.previous");
-pub const ACTION_TRANSPORT_PREV: u32 = fnv1a32(b"action.transport.previous");
-pub const ACTION_TRANSPORT_TOGGLE: u32 = fnv1a32(b"action.transport.toggle");
-
-/// Map a canonical action-id hash to its FMP verb hash, or `None` for
-/// actions with no command equivalent (e.g. `seek_absolute`,
-/// `set_volume`, which need a richer consumer than a selector `bank`).
-pub fn action_to_verb(action_hash: u32) -> Option<u32> {
-    match action_hash {
-        ACTION_GALLERY_NEXT | ACTION_TRANSPORT_NEXT => Some(VERB_NEXT),
-        ACTION_GALLERY_PREV | ACTION_TRANSPORT_PREV => Some(VERB_PREV),
-        ACTION_TRANSPORT_TOGGLE => Some(VERB_TOGGLE),
-        _ => None,
-    }
 }

@@ -139,11 +139,7 @@ pub unsafe fn image_init(
 /// the BMP header parser sees them. The parent feeds the
 /// `detect_buf` bytes here before the first `image_step` call.
 pub unsafe fn image_feed_detect(s: &mut ImageState, buf: *const u8, len: usize) {
-    if !ensure_encoded(s) {
-        s.phase = Phase::Error;
-        return;
-    }
-    if s.encoded_used as usize + len > s.encoded_cap as usize {
+    if !reserve_encoded(s, len) {
         log(s, b"[img] detect bytes overflow");
         s.phase = Phase::Error;
         return;
@@ -177,18 +173,16 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
                 s.encoded_used = 0;
                 s.quiet_ticks = 0;
                 s.phase = Phase::Ingest;
-                if !ensure_encoded(s) {
-                    s.phase = Phase::Error;
+                let nn = n as usize;
+                if reserve_encoded(s, nn) {
+                    core::ptr::copy_nonoverlapping(
+                        scratch.as_ptr(),
+                        s.encoded.add(s.encoded_used as usize),
+                        nn,
+                    );
+                    s.encoded_used += nn as u32;
                 } else {
-                    let nn = n as usize;
-                    if s.encoded_used + nn as u32 <= s.encoded_cap {
-                        core::ptr::copy_nonoverlapping(
-                            scratch.as_ptr(),
-                            s.encoded.add(s.encoded_used as usize),
-                            nn,
-                        );
-                        s.encoded_used += nn as u32;
-                    }
+                    s.phase = Phase::Error;
                 }
             }
             0
@@ -226,11 +220,7 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
             let n = ((*s.syscalls).channel_read)(s.in_chan, chunk.as_mut_ptr(), chunk.len());
             if n > 0 {
                 let n = n as usize;
-                if !ensure_encoded(s) {
-                    s.phase = Phase::Error;
-                    return 0;
-                }
-                if s.encoded_used + n as u32 > s.encoded_cap {
+                if !reserve_encoded(s, n) {
                     log(s, b"[img] encoded buffer overflow");
                     s.phase = Phase::Error;
                     return 0;
@@ -267,11 +257,30 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
 // `pub(super)` so the sibling format files (`image_gif.rs`, `image_png.rs`,
 // `image_jpeg.rs`) can share the encoded/pending/scaling chassis.
 
+/// Ceiling for the encoded accumulator when `max_bytes` is unset.
+const DEFAULT_MAX_ENCODED: u32 = 8 * 1024 * 1024;
+/// Initial encoded allocation. `max_bytes` is a CEILING, not the size to
+/// grab up front — the buffer grows toward it on demand (see
+/// [`reserve_encoded`]). Eagerly allocating the full ceiling would starve
+/// the module heap: a 16 MiB `max_bytes` against the codec's 10 MiB
+/// `module_arena_size()` fails every `heap_alloc`, so the image never
+/// decodes and downstream sinks (linux_display) get no frame.
+const INITIAL_ENCODED_CAP: u32 = 256 * 1024;
+
+#[inline]
+fn encoded_ceiling(s: &ImageState) -> u32 {
+    if s.max_bytes == 0 {
+        DEFAULT_MAX_ENCODED
+    } else {
+        s.max_bytes
+    }
+}
+
 pub(super) unsafe fn ensure_encoded(s: &mut ImageState) -> bool {
     if !s.encoded.is_null() {
         return true;
     }
-    let cap = if s.max_bytes == 0 { 8 * 1024 * 1024 } else { s.max_bytes };
+    let cap = INITIAL_ENCODED_CAP.min(encoded_ceiling(s));
     let p = ((*s.syscalls).heap_alloc)(cap);
     if p.is_null() {
         log(s, b"[img] encoded alloc failed");
@@ -279,6 +288,40 @@ pub(super) unsafe fn ensure_encoded(s: &mut ImageState) -> bool {
     }
     s.encoded = p;
     s.encoded_cap = cap;
+    true
+}
+
+/// Ensure `encoded` has room for `additional` more bytes past
+/// `encoded_used`, growing the buffer (doubling, bounded by the
+/// `max_bytes` ceiling) if needed. Returns false only when the total
+/// would exceed the ceiling or a (re)allocation fails — so `max_bytes`
+/// stays a hard limit while a small image never over-allocates.
+pub(super) unsafe fn reserve_encoded(s: &mut ImageState, additional: usize) -> bool {
+    if !ensure_encoded(s) {
+        return false;
+    }
+    let ceiling = encoded_ceiling(s) as usize;
+    let needed = s.encoded_used as usize + additional;
+    if needed > ceiling {
+        return false;
+    }
+    if needed <= s.encoded_cap as usize {
+        return true;
+    }
+    let mut new_cap = s.encoded_cap as usize;
+    while new_cap < needed {
+        new_cap = new_cap.saturating_mul(2);
+    }
+    if new_cap > ceiling {
+        new_cap = ceiling;
+    }
+    let p = ((*s.syscalls).heap_realloc)(s.encoded, new_cap as u32);
+    if p.is_null() {
+        log(s, b"[img] encoded grow failed");
+        return false;
+    }
+    s.encoded = p;
+    s.encoded_cap = new_cap as u32;
     true
 }
 

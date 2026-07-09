@@ -805,14 +805,15 @@ pub fn intents_from_shell(config: &Value) -> Vec<u8> {
 }
 
 /// Serialize a config's `presentation.shell.controls` to the on-device
-/// `content_controls` `controls` blob param: per control `[icon u8, verb u32 LE]`
-/// (prefixed by a count). The icon is derived from the control's `action`
-/// (`content_render::icon_for_action`); the verb hash is the FMP verb the
-/// control emits on tap. Declaration order matches the resolver's `intents` and
-/// the layout's positional entries, so a `content_controls` instance's controls
-/// line up 1:1 with the layout's dispositions. Empty when there's no shell.
+/// `content_controls` `controls` blob param: per control `[icon u8, action u32 LE]`
+/// (prefixed by a count). The icon is a cosmetic glyph derived from the control's
+/// `action` (`content_render::icon_for_action`); the u32 is the control's
+/// action-id hash — the command it emits on tap, which the consuming app matches.
+/// Declaration order matches the resolver's `intents` and the layout's positional
+/// entries, so a `content_controls` instance's controls line up 1:1 with the
+/// layout's dispositions. Empty when there's no shell.
 pub fn content_descriptors_from_shell(config: &Value) -> Vec<u8> {
-    use crate::content_render::{fnv1a32, icon_code, icon_for_action, verb_for_action, Icon};
+    use crate::content_render::{fnv1a32, icon_code, icon_for_action, Icon};
     let controls = match config
         .pointer("/presentation/shell/controls")
         .and_then(|c| c.as_array())
@@ -833,15 +834,16 @@ pub fn content_descriptors_from_shell(config: &Value) -> Vec<u8> {
     buf.push(n as u8);
     for c in &controls[..n] {
         match c.get("action").and_then(|a| a.as_str()) {
-            // A transport action → icon + verb hash. An action outside the
-            // transport vocabulary (or no action) → Generic icon + verb 0
-            // (drawn but non-interactive), never a wrong verb.
+            // Every action carries the app's OWN action-id hash, so the tap
+            // speaks the app's vocabulary and the app — not Fluxor — decides
+            // what it means. `content_controls` emits whatever hash it is
+            // handed, so the content plane serves non-media apps without
+            // Fluxor baking in "transport". The icon is a cosmetic glyph
+            // picked from the id (`icon_for_action`); a control with no
+            // action stays a drawn-but-inert slot (hash 0).
             Some(action) => {
-                let icon = icon_for_action(action);
-                let verb = verb_for_action(action).map_or(0, |v| fnv1a32(v.as_bytes()));
-                let icon = if verb == 0 { Icon::Generic } else { icon };
-                buf.push(icon_code(icon));
-                buf.extend_from_slice(&verb.to_le_bytes());
+                buf.push(icon_code(icon_for_action(action)));
+                buf.extend_from_slice(&fnv1a32(action.as_bytes()).to_le_bytes());
             }
             None => {
                 buf.push(icon_code(Icon::Generic));
@@ -853,15 +855,16 @@ pub fn content_descriptors_from_shell(config: &Value) -> Vec<u8> {
 }
 
 /// `content_controls` is a TRANSPORT renderer: it draws tappable buttons and
-/// emits a transport verb on hit. A chrome-less panel auto-extends every control
-/// to the content plane, so a control content_controls can't actuate would draw
-/// as a dead/wrong button. When a `content_controls` module is in the graph,
-/// every shell control must be a tappable transport control (kind button/toggle
-/// with a transport `action`). Returns the first offender `(id, reason)` so
-/// config-gen rejects it instead of shipping a dead control. `None` = ok (incl.
-/// no shell → the module uses its built-in prev/play/next).
+/// emits the control's action-id hash on hit. A chrome-less panel auto-extends
+/// every control to the content plane, so a control content_controls can't
+/// actuate (no action, or a non-tappable kind) would draw as a dead button.
+/// When a `content_controls` module is in the graph, every shell control that
+/// reaches the content plane must be a tappable kind (button/toggle) WITH an
+/// action to emit — the action need not be a transport verb. Returns the first
+/// offender `(id, reason)` so config-gen rejects it instead of shipping a dead
+/// control. `None` = ok (incl. no shell → the module uses its built-in
+/// prev/play/next).
 pub fn content_controls_unrenderable(config: &Value) -> Option<(String, String)> {
-    use crate::content_render::verb_for_action;
     let controls = config
         .pointer("/presentation/shell/controls")
         .and_then(|c| c.as_array())?;
@@ -888,15 +891,13 @@ pub fn content_controls_unrenderable(config: &Value) -> Option<(String, String)>
                 format!("has kind `{kind}` — content_controls draws only tappable buttons"),
             ));
         }
-        match c.get("action").and_then(|a| a.as_str()) {
-            Some(a) if verb_for_action(a).is_some() => {}
-            Some(a) => {
-                return Some((
-                    id.to_string(),
-                    format!("action `{a}` is outside content_controls' transport vocabulary"),
-                ))
-            }
-            None => return Some((id.to_string(), "has no `action`".to_string())),
+        // A content control only needs to be STRUCTURALLY actuatable: a
+        // tappable kind with an action to emit. The action need not be a
+        // transport verb — content_controls emits the control's action-id
+        // hash and the app interprets it, so the content plane is not
+        // restricted to media apps. Reject only what can't emit anything.
+        if c.get("action").and_then(|a| a.as_str()).is_none() {
+            return Some((id.to_string(), "has no `action`".to_string()));
         }
     }
     None

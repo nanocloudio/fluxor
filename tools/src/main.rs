@@ -1115,6 +1115,18 @@ fn cmd_info_fmod(file: &Path) -> Result<()> {
     if let Some(schema) = &m.schema {
         println!("  param_schema: {} bytes", schema.len());
     }
+    // Packed-header `required_caps` (bytes 66..70) — the value the KERNEL
+    // reads and the capability gate enforces at runtime. This is distinct
+    // from the manifest-derived mask in the `manifest:` block below: the
+    // latter is recomputed from `[[resources]]`, the former is what was
+    // actually written into the header at pack time. They should match; a
+    // mismatch (header 0x0 while the manifest declares contracts) means the
+    // module was packed without its header caps populated, and every
+    // `provider_call` to a declared contract will return ENOSYS at runtime.
+    if m.data.len() >= 70 {
+        let header_caps = u32::from_le_bytes([m.data[66], m.data[67], m.data[68], m.data[69]]);
+        println!("  header required_caps (runtime-enforced): 0x{header_caps:08x}");
+    }
     println!("  manifest:");
     println!("{}", m.manifest.display());
     Ok(())
@@ -3493,7 +3505,10 @@ fn build_one(
 
     let mut config = config;
     let target_desc = resolve_target(&config, None)?;
-    let project_root = crate::project::root();
+    // Anchor to the config file's own location so a build/run works from any
+    // cwd (a subdirectory, or outside the tree with an absolute config path),
+    // while still honoring FLUXOR_PROJECT_ROOT.
+    let project_root = crate::project::root_for_config(yaml_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     let family = target_desc.family.clone();
     let silicon_id = target_desc.id.clone();
@@ -3608,9 +3623,13 @@ fn build_one(
             let modules_bin_path = out_dir.join("modules.bin");
 
             // Linux host reuses the aarch64 PIC modules built for bcm2712.
+            // Anchor to the resolved project root (not the caller's cwd) so
+            // `fluxor run <path>` finds them regardless of where it is invoked
+            // from — a bare `fluxor run examples/hello/linux.yaml` from a
+            // subdirectory must resolve the same modules as from the repo root.
             // When fluxor is consumed as a submodule, accept a sibling copy
             // at ../deps/fluxor/target/fluxor/bcm2712/modules.
-            let modules_dir = PathBuf::from("target/fluxor/bcm2712/modules");
+            let modules_dir = project_root.join("target/fluxor/bcm2712/modules");
             let mut fmod_dirs: Vec<PathBuf> = Vec::new();
             if modules_dir.exists() {
                 fmod_dirs.push(modules_dir.clone());
@@ -3622,9 +3641,11 @@ fn build_one(
                 }
             }
             if fmod_dirs.is_empty() {
-                return Err(Error::Config(
-                    "Modules not found at target/fluxor/bcm2712/modules. Run 'make modules TARGET=bcm2712' first.".into()
-                ));
+                return Err(Error::Config(format!(
+                    "Modules not found at {}. Run 'make modules TARGET=bcm2712' from the project \
+                     root (`fluxor inspect` shows where that is) first.",
+                    modules_dir.display()
+                )));
             }
             // Cross-check the YAML against the linux binary's
             // compiled-in features (host-image / host-window /
@@ -3861,7 +3882,8 @@ fn collect_yaml_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 /// that path before we reach here) or when `--print-features` exits
 /// non-zero (the binary is too old to expose its feature set).
 fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
-    let linux_bin = PathBuf::from("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+    let linux_bin = crate::project::root_for_config(yaml_path)
+        .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
     if !linux_bin.exists() {
         return Ok(());
     }
@@ -4176,7 +4198,10 @@ fn spawn_scenario(
         .parent()
         .ok_or_else(|| Error::Config("scenario path has no parent dir".into()))?;
 
-    let linux_bin = PathBuf::from("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+    // Anchor to the scenario's project root so `fluxor run <scenario>` finds the
+    // runtime binary regardless of the caller's cwd.
+    let linux_bin = crate::project::root_for_config(scenario_path)
+        .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
     if !linux_bin.exists() {
         return Err(Error::Config(format!(
             "fluxor-linux binary not found at {}. Run `make linux` first.",
@@ -4792,7 +4817,10 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
             let out_dir = result.output_path.parent().unwrap();
             let config_bin = out_dir.join("config.bin");
             let modules_bin = out_dir.join("modules.bin");
-            let linux_bin = PathBuf::from("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+            // Anchor to the resolved project root so `fluxor run <config>` finds
+            // the runtime binary regardless of the caller's cwd.
+            let linux_bin = crate::project::root_for_config(config_path)
+                .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
 
             if !linux_bin.exists() {
                 return Err(Error::Config(format!(

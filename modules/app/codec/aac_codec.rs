@@ -888,18 +888,96 @@ fn ms_decode(
 // Direct-DFT IMDCT (slow but no_std-clean) + windowing + overlap-add
 // ============================================================================
 
-fn imdct_direct(input: &[f32], output: &mut [f32]) {
-    let n2 = input.len();
-    let n = output.len();
-    let inv_n = 2.0 / n as f32;
-    let phase = PI_F32 / (2 * n) as f32;
-    for i in 0..n {
-        let mut s = 0.0f32;
-        let base = phase * ((2 * i + 1 + n2) as f32);
-        for k in 0..n2 {
-            s += input[k] * cosf(base * ((2 * k + 1) as f32));
+/// In-place radix-2 iterative complex FFT (`n` must be a power of two,
+/// `n <= re.len()`). `inv = true` uses the `e^{+i}` kernel (inverse DFT),
+/// `false` the `e^{-i}` forward kernel. Twiddles via the shared `cosf`/
+/// `sinf` LUT — the same approximation the rest of the decoder uses.
+fn fft_inplace(re: &mut [f32], im: &mut [f32], n: usize, inv: bool) {
+    // Decimation-in-time bit-reversal permutation.
+    let mut j = 0usize;
+    let mut i = 1usize;
+    while i < n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
         }
-        output[i] = inv_n * s;
+        j ^= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+        i += 1;
+    }
+    let sign = if inv { 1.0 } else { -1.0 };
+    let mut len = 2usize;
+    while len <= n {
+        let ang = sign * TWO_PI / len as f32;
+        let wr = cosf(ang);
+        let wi = sinf(ang);
+        let mut base = 0usize;
+        while base < n {
+            let mut cr = 1.0f32;
+            let mut ci = 0.0f32;
+            let half = len / 2;
+            let mut k = 0usize;
+            while k < half {
+                let a = base + k;
+                let b = a + half;
+                let vr = re[b] * cr - im[b] * ci;
+                let vi = re[b] * ci + im[b] * cr;
+                let ur = re[a];
+                let ui = im[a];
+                re[a] = ur + vr;
+                im[a] = ui + vi;
+                re[b] = ur - vr;
+                im[b] = ui - vi;
+                let ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = ncr;
+                k += 1;
+            }
+            base += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// IMDCT via a size-`N` complex FFT — O(N log N). An O(N²) direct DFT is
+/// ~0.5× realtime on aarch64 and starves the audio pipeline into silence,
+/// so the factored form below is load-bearing, not an optimisation.
+/// Accuracy vs an exact IMDCT is ~6e-4 relative (f32 FFT rounding;
+/// inaudible after windowing).
+///
+/// Derivation: the AAC IMDCT
+///   y[n] = (2/N) Σ_{k<N/2} X[k] cos((π/2N)(2n+1+N/2)(2k+1))
+/// factors as
+///   y[n] = (2/N) Re{ e^{iπn/N} · IDFT_N(Q)[n] },
+///   Q[k] = X[k] · e^{i(2k+1)(π/4 + π/2N)}  for k<N/2, else 0.
+/// `re`/`im` are size-`N` scratch (from `AacState`, not the stack).
+fn imdct(input: &[f32], output: &mut [f32], re: &mut [f32], im: &mut [f32]) {
+    let n = output.len();
+    let m = input.len(); // N/2
+    let beta = PI_F32 * 0.25 + PI_F32 / (2.0 * n as f32);
+    let mut k = 0usize;
+    while k < n {
+        if k < m {
+            let a = (2 * k + 1) as f32 * beta;
+            re[k] = input[k] * cosf(a);
+            im[k] = input[k] * sinf(a);
+        } else {
+            re[k] = 0.0;
+            im[k] = 0.0;
+        }
+        k += 1;
+    }
+    fft_inplace(re, im, n, true);
+    let scale = 2.0 / n as f32;
+    let mut nn = 0usize;
+    while nn < n {
+        let ph = PI_F32 * nn as f32 / n as f32;
+        output[nn] = scale * (cosf(ph) * re[nn] - sinf(ph) * im[nn]);
+        nn += 1;
     }
 }
 
@@ -912,10 +990,11 @@ fn pick_short_window(shape: u8) -> &'static [f32] {
 
 fn ifilter_bank_long(
     freq_in: &[f32], time_out: &mut [f32], overlap: &mut [f32],
-    buf: &mut [f32], window_long: &[f32], window_long_prev: &[f32],
+    buf: &mut [f32], fre: &mut [f32], fim: &mut [f32],
+    window_long: &[f32], window_long_prev: &[f32],
 ) {
     let nlong = 1024usize;
-    imdct_direct(freq_in, &mut buf[..2 * nlong]);
+    imdct(freq_in, &mut buf[..2 * nlong], fre, fim);
     for i in 0..nlong {
         time_out[i] = overlap[i] + buf[i] * window_long_prev[i];
     }
@@ -926,12 +1005,13 @@ fn ifilter_bank_long(
 
 fn ifilter_bank_long_start(
     freq_in: &[f32], time_out: &mut [f32], overlap: &mut [f32],
-    buf: &mut [f32], window_long_prev: &[f32], window_short: &[f32],
+    buf: &mut [f32], fre: &mut [f32], fim: &mut [f32],
+    window_long_prev: &[f32], window_short: &[f32],
 ) {
     let nlong = 1024usize;
     let nshort = 128usize;
     let nflat_ls = (nlong - nshort) / 2;
-    imdct_direct(freq_in, &mut buf[..2 * nlong]);
+    imdct(freq_in, &mut buf[..2 * nlong], fre, fim);
     for i in 0..nlong { time_out[i] = overlap[i] + buf[i] * window_long_prev[i]; }
     for i in 0..nflat_ls { overlap[i] = buf[nlong + i]; }
     for i in 0..nshort {
@@ -942,12 +1022,13 @@ fn ifilter_bank_long_start(
 
 fn ifilter_bank_long_stop(
     freq_in: &[f32], time_out: &mut [f32], overlap: &mut [f32],
-    buf: &mut [f32], window_long: &[f32], window_short_prev: &[f32],
+    buf: &mut [f32], fre: &mut [f32], fim: &mut [f32],
+    window_long: &[f32], window_short_prev: &[f32],
 ) {
     let nlong = 1024usize;
     let nshort = 128usize;
     let nflat_ls = (nlong - nshort) / 2;
-    imdct_direct(freq_in, &mut buf[..2 * nlong]);
+    imdct(freq_in, &mut buf[..2 * nlong], fre, fim);
     for i in 0..nflat_ls { time_out[i] = overlap[i]; }
     for i in 0..nshort {
         time_out[nflat_ls + i] = overlap[nflat_ls + i]
@@ -962,7 +1043,8 @@ fn ifilter_bank_long_stop(
 
 fn ifilter_bank_eight_short(
     freq_in: &[f32], time_out: &mut [f32], overlap: &mut [f32],
-    buf: &mut [f32], window_short: &[f32], window_short_prev: &[f32],
+    buf: &mut [f32], fre: &mut [f32], fim: &mut [f32],
+    window_short: &[f32], window_short_prev: &[f32],
 ) {
     let nlong = 1024usize;
     let nshort = 128usize;
@@ -971,9 +1053,11 @@ fn ifilter_bank_eight_short(
     for w in 0..8 {
         let in_off = w * nshort;
         let out_off = 2 * nshort * w;
-        imdct_direct(
+        imdct(
             &freq_in[in_off..in_off + nshort],
             &mut buf[out_off..out_off + 2 * nshort],
+            fre,
+            fim,
         );
     }
     for i in 0..nflat_ls { time_out[i] = overlap[i]; }
@@ -1100,30 +1184,40 @@ fn read_tns_data(br: &mut BitReader, info: &IcsInfo, tns: &mut TnsInfo) {
     }
 }
 
-// faad2 tns.c coefficient tables (faad2 libfaad/tns.c).
-const TNS_COEF_0_3: [f32; 16] = [
-    0.0,            0.4338837391,  0.7818314825,  0.9749279122,
-    -0.9848077530, -0.8660254038, -0.6427876097, -0.3420201433,
-    -0.4338837391, -0.7818314825, -0.9749279122, -0.9749279122,
-    -0.9848077530, -0.8660254038, -0.6427876097, -0.3420201433,
-];
-const TNS_COEF_0_4: [f32; 16] = [
-    0.0,            0.2079116908,  0.4067366431,  0.5877852523,
-    0.7431448255,   0.8660254038,  0.9510565163,  0.9945218954,
-    -0.9957341763, -0.9618256432, -0.8951632914, -0.7980172273,
-    -0.6736956436, -0.5264321629, -0.3612416662, -0.1837495178,
-];
-const TNS_COEF_1_3: [f32; 16] = [
-    0.0,            0.4338837391, -0.6427876097, -0.3420201433,
-    0.9749279122,   0.7818314825, -0.6427876097, -0.3420201433,
-    -0.4338837391, -0.7818314825, -0.6427876097, -0.3420201433,
-    -0.7818314825, -0.4338837391, -0.6427876097, -0.3420201433,
-];
-const TNS_COEF_1_4: [f32; 16] = [
-    0.0,            0.2079116908,  0.4067366431,  0.5877852523,
-    -0.6736956436, -0.5264321629, -0.3612416662, -0.1837495178,
-    0.9945218954,   0.9510565163,  0.8660254038,  0.7431448255,
-    -0.6736956436, -0.5264321629, -0.3612416662, -0.1837495178,
+// faad2 tns.c coefficient tables (faad2 libfaad/tns.c), packed into ONE
+// 2-D static [res/compress variant][coef]. A `match` returning `&TABLE_N`
+// compiles to an array of table *pointers* in .rodata, whose absolute
+// addresses are NOT relocated when this PIC module is mmap'd — the loaded
+// pointer is a link-time offset and dereferencing it SIGSEGVs (only hit by
+// content that uses TNS, e.g. most real music; the cmajor test asset does
+// not). Indexing a single 2-D static computes the address from one
+// relocated base, so no unrelocated pointer is ever stored. See the
+// pic_static_inner_pointers discipline.
+static TNS_COEF_TABLES: [[f32; 16]; 4] = [
+    [
+        0.0,            0.4338837391,  0.7818314825,  0.9749279122,
+        -0.9848077530, -0.8660254038, -0.6427876097, -0.3420201433,
+        -0.4338837391, -0.7818314825, -0.9749279122, -0.9749279122,
+        -0.9848077530, -0.8660254038, -0.6427876097, -0.3420201433,
+    ],
+    [
+        0.0,            0.2079116908,  0.4067366431,  0.5877852523,
+        0.7431448255,   0.8660254038,  0.9510565163,  0.9945218954,
+        -0.9957341763, -0.9618256432, -0.8951632914, -0.7980172273,
+        -0.6736956436, -0.5264321629, -0.3612416662, -0.1837495178,
+    ],
+    [
+        0.0,            0.4338837391, -0.6427876097, -0.3420201433,
+        0.9749279122,   0.7818314825, -0.6427876097, -0.3420201433,
+        -0.4338837391, -0.7818314825, -0.6427876097, -0.3420201433,
+        -0.7818314825, -0.4338837391, -0.6427876097, -0.3420201433,
+    ],
+    [
+        0.0,            0.2079116908,  0.4067366431,  0.5877852523,
+        -0.6736956436, -0.5264321629, -0.3612416662, -0.1837495178,
+        0.9945218954,   0.9510565163,  0.8660254038,  0.7431448255,
+        -0.6736956436, -0.5264321629, -0.3612416662, -0.1837495178,
+    ],
 ];
 
 fn tns_decode_coef(
@@ -1132,12 +1226,7 @@ fn tns_decode_coef(
 ) {
     let coef_res_bits = (coef_res + 3) as usize;
     let table_index = 2 * (coef_compress != 0) as usize + (coef_res_bits != 3) as usize;
-    let table: &[f32; 16] = match table_index {
-        0 => &TNS_COEF_0_3,
-        1 => &TNS_COEF_0_4,
-        2 => &TNS_COEF_1_3,
-        _ => &TNS_COEF_1_4,
-    };
+    let table: &[f32; 16] = &TNS_COEF_TABLES[table_index & 3];
     let mut tmp = [0.0f32; TNS_MAX_ORDER + 1];
     for i in 0..order { tmp[i] = table[(raw_coef[i] as usize) & 0x0F]; }
     let mut b = [0.0f32; TNS_MAX_ORDER + 1];
@@ -1363,6 +1452,10 @@ pub struct AacState {
     tns_r: TnsInfo,
     // IMDCT scratch (2048 samples).
     imdct_buf: [f32; 2048],
+    // Size-N complex FFT scratch for the fast IMDCT (kept in state, not on
+    // the stack — the PIC module stack is small).
+    fft_re: [f32; 2048],
+    fft_im: [f32; 2048],
     // Time-domain scratch (per channel, 1024 samples each).
     time_l: [f32; 1024],
     time_r: [f32; 1024],
@@ -1530,12 +1623,12 @@ fn decode_aac_frame(payload: *const u8, payload_len: usize, s: &mut AacState) ->
         let (left_overlap, right_overlap) = s.overlap.split_at_mut(1);
         run_filterbank(
             &info_l_local, &s.spec_l, &mut s.time_l, &mut left_overlap[0],
-            &mut s.imdct_buf, prev0,
+            &mut s.imdct_buf, &mut s.fft_re, &mut s.fft_im, prev0,
         );
         if have_r {
             run_filterbank(
                 &info_r_local, &s.spec_r, &mut s.time_r, &mut right_overlap[0],
-                &mut s.imdct_buf, prev1,
+                &mut s.imdct_buf, &mut s.fft_re, &mut s.fft_im, prev1,
             );
         } else {
             let copy_len = s.time_l.len();
@@ -1598,9 +1691,10 @@ fn read_individual_channel(
     let _ = sys;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_filterbank(
     info: &IcsInfo, spec: &[f32], time_out: &mut [f32], overlap: &mut [f32],
-    buf: &mut [f32], prev_shape: u8,
+    buf: &mut [f32], fre: &mut [f32], fim: &mut [f32], prev_shape: u8,
 ) {
     let window_long_cur  = pick_long_window(info.window_shape);
     let window_long_prev = pick_long_window(prev_shape);
@@ -1608,18 +1702,19 @@ fn run_filterbank(
     let window_short_prev = pick_short_window(prev_shape);
     match info.window_sequence {
         ONLY_LONG_SEQUENCE => {
-            ifilter_bank_long(spec, time_out, overlap, buf, window_long_cur, window_long_prev);
+            ifilter_bank_long(spec, time_out, overlap, buf, fre, fim,
+                window_long_cur, window_long_prev);
         }
         LONG_START_SEQUENCE => {
-            ifilter_bank_long_start(spec, time_out, overlap, buf,
+            ifilter_bank_long_start(spec, time_out, overlap, buf, fre, fim,
                 window_long_prev, window_short_cur);
         }
         LONG_STOP_SEQUENCE => {
-            ifilter_bank_long_stop(spec, time_out, overlap, buf,
+            ifilter_bank_long_stop(spec, time_out, overlap, buf, fre, fim,
                 window_long_cur, window_short_prev);
         }
         EIGHT_SHORT_SEQUENCE => {
-            ifilter_bank_eight_short(spec, time_out, overlap, buf,
+            ifilter_bank_eight_short(spec, time_out, overlap, buf, fre, fim,
                 window_short_cur, window_short_prev);
         }
         _ => {}

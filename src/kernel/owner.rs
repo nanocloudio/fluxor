@@ -291,6 +291,13 @@ impl OwnerTable {
         }
     }
 
+    /// The entry at `slot`, regardless of state. `None` only for an
+    /// out-of-range slot. Read-only view for status/telemetry aggregation
+    /// (rfc_k8s.md §18.2 — the owner-status surface walks resident slots).
+    pub fn entry_at(&self, slot: usize) -> Option<&OwnerEntry> {
+        self.entries.get(slot)
+    }
+
     /// Number of active workload owners (excludes the system slot).
     pub fn active_workload_count(&self) -> usize {
         self.entries[1..]

@@ -115,6 +115,12 @@ pub fn publish_committed_plan<S: Storage>(
 
 /// Key under which the node's desired pod set persists in the store.
 const DESIRED_KEY: &str = "desired.pods";
+/// Key recording where the committed plan was last published (the
+/// `FLUXOR_PLAN` file). The node runtime writes its live owner-status file
+/// (`owner_status.json`) NEXT TO the plan it consumes, so this is how a later
+/// `agent status` invocation — which only receives `--store` — locates the
+/// runtime's status surface.
+const PUBLISH_PATH_KEY: &str = "publish.path";
 /// Key holding the per-slot high-water owner generation. Slot generations must
 /// survive a slot going empty (rfc_k8s.md §11: reuse always issues a strictly
 /// higher generation, so a deleted pod's stale handles can never match), and
@@ -197,6 +203,117 @@ fn snapshot_from_committed<S: Storage>(
     Ok(snap)
 }
 
+/// Remember where the committed plan was published so `agent status` can
+/// find the runtime's `owner_status.json` beside it. Stored canonicalized —
+/// status may run from a different working directory.
+pub fn record_publish_path<S: Storage>(
+    store: &mut GenStore<S>,
+    path: &std::path::Path,
+) -> Result<(), StoreError> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    store
+        .storage
+        .write(PUBLISH_PATH_KEY, canonical.to_string_lossy().as_bytes())
+        .map_err(|_| StoreError::WriteFailed)
+}
+
+// ── Live runtime status (rfc_k8s.md §7.2 vocabulary) ────────────────────────
+//
+// These types mirror what the node runtime writes into `owner_status.json`.
+// The reason/phase enums ARE the fixed §7.2 vocabulary: deserialization
+// rejects anything outside the set, so a runtime emitting an unknown reason
+// can never leak it into the orchestrator-facing JSON (nanocloud matches on
+// these strings and rejects others).
+
+/// Aggregate pod phase as observed by the live runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RuntimePhase {
+    Activating,
+    Running,
+    Terminated,
+}
+
+/// §7.2 `state.terminated.reason` vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TerminatedReason {
+    Completed,
+    GraphNodeFault,
+    ExternalProcessExited,
+    LivenessFailure,
+    Evicted,
+    FluxorReservationInvalid,
+}
+
+/// §7.2 waiting reasons only the runtime can know (`FluxorStaging` /
+/// `FluxorActivating` are inferred by the orchestrator from committed state
+/// plus liveness and are deliberately absent here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WaitingReason {
+    FluxorReserving,
+    ActivationBackOff,
+}
+
+/// Terminal aggregate state (present only when `phase == Terminated`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TerminatedState {
+    pub reason: TerminatedReason,
+    /// 0 = Completed; non-zero = fault.
+    pub exit_code: i32,
+    /// Present when an external-process signal determined the termination.
+    #[serde(default)]
+    pub signal: Option<u8>,
+    pub finished_at: String,
+}
+
+/// One pod's LIVE runtime status, §7.2-shaped. Joined into [`PodStatus`] by
+/// pod UID; absent entirely when the runtime isn't up.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PodRuntimeStatus {
+    pub phase: RuntimePhase,
+    /// Aggregate readiness (`ContainersReady`).
+    pub ready: bool,
+    /// Aggregate startup complete.
+    pub started: bool,
+    /// Activation time (RFC 3339); present once Running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// AGGREGATE owner re-activations only — an internal module retry is
+    /// module telemetry, never a Kubernetes container restart.
+    pub restart_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminated: Option<TerminatedState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
+}
+
+/// On-disk shape of the runtime's `owner_status.json`.
+#[derive(Debug, serde::Deserialize)]
+struct RuntimeStatusFile {
+    #[allow(dead_code, reason = "self-describing on-disk field")]
+    version: u32,
+    /// Writer's process id — liveness gate for the whole file.
+    pid: u32,
+    /// Writer's process start time (clock ticks since boot, field 22 of
+    /// `/proc/<pid>/stat`). Together with `pid` this identifies THE writer
+    /// process — a recycled PID has a different start time.
+    pid_start_ticks: u64,
+    /// Plan generation the live state was derived under. The join is scoped
+    /// to it: after a new commit/publish, live state from the previous
+    /// generation must not be attached to the new durable pod records.
+    plan_generation: u64,
+    pods: Vec<RuntimeStatusPod>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RuntimeStatusPod {
+    pod_uid_hex: String,
+    /// Owner slot + generation — with the pod UID, the §17.2 join key. Both
+    /// must match the committed assignment for the join to attach.
+    slot: u16,
+    owner_generation: u32,
+    runtime: PodRuntimeStatus,
+}
+
 /// One pod's surfaced status: the owner-tagged join of the persisted desired
 /// state and the committed plan (rfc_k8s.md §17.2 — pod UID + slot +
 /// generation is the join key between orchestrator status and device
@@ -221,6 +338,11 @@ pub struct PodStatus {
     pub state_cap: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_cap: Option<u32>,
+    /// LIVE per-pod runtime status (§7.2-shaped), joined from the runtime's
+    /// `owner_status.json` by pod UID. Absent when the runtime isn't up —
+    /// additive: existing consumers of the durable fields are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<PodRuntimeStatus>,
 }
 
 /// Whole-node status snapshot.
@@ -285,6 +407,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
                 edges: assignment.map(|a| a.edge_count),
                 state_cap: assignment.map(|a| a.state_cap),
                 buffer_cap: assignment.map(|a| a.buffer_cap),
+                runtime: None,
             }
         })
         .collect();
@@ -295,6 +418,80 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
         committed_abi_surface,
         pods,
     })
+}
+
+/// `node_status` plus the LIVE per-pod runtime join: read the runtime's
+/// `owner_status.json` (located beside the plan file recorded by
+/// [`record_publish_path`]) and attach each pod's §7.2-shaped `runtime`
+/// object by the full §17.2 join key — pod UID + slot + owner generation,
+/// scoped to the committed plan generation. Best-effort and fail-absent: a
+/// missing/garbled/out-of-vocabulary file, a writer process that is no
+/// longer alive (or is a recycled PID), a file from a different plan
+/// generation, or a slot/generation mismatch yields the plain durable
+/// status with no `runtime` objects — never an error and never stale live
+/// state presented as current.
+pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreError> {
+    let mut st = node_status(store)?;
+    if let Some(file) = read_runtime_status(store) {
+        // Live state derived under a different plan generation (the runtime
+        // hasn't rebuilt onto the new commit yet, or is behind a rollback)
+        // must not be joined to the new durable records.
+        if Some(file.plan_generation) == st.generation {
+            for pod in &mut st.pods {
+                if let Some(entry) = file.pods.iter().find(|p| {
+                    p.pod_uid_hex == pod.pod_uid_hex
+                        && Some(p.slot) == pod.slot
+                        && Some(p.owner_generation) == pod.owner_generation
+                }) {
+                    pod.runtime = Some(entry.runtime.clone());
+                }
+            }
+        }
+    }
+    Ok(st)
+}
+
+/// Load + vocabulary-validate + liveness-gate the runtime status file.
+/// `None` on any failure (the pull-based contract: absent = runtime not up).
+fn read_runtime_status<S: Storage>(store: &GenStore<S>) -> Option<RuntimeStatusFile> {
+    let publish = String::from_utf8(store.storage.read(PUBLISH_PATH_KEY).ok()??).ok()?;
+    let path = std::path::Path::new(&publish)
+        .parent()?
+        .join("owner_status.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    // Strict parse: an unknown phase/reason string fails the enum and drops
+    // the whole file — out-of-vocabulary values must not reach consumers.
+    let file: RuntimeStatusFile = serde_json::from_str(&text).ok()?;
+    if !writer_alive(file.pid, file.pid_start_ticks) {
+        return None;
+    }
+    Some(file)
+}
+
+/// Is the status writer's process still alive AND the same process that
+/// wrote the file? procfs check of pid + process start time, so a
+/// recycled PID or a zombie is never mistaken for the writer. On a host
+/// without /proc (non-Linux dev machine) the file is trusted as-is.
+fn writer_alive(pid: u32, pid_start_ticks: u64) -> bool {
+    if !std::path::Path::new("/proc").exists() {
+        return true;
+    }
+    proc_start_ticks(pid) == Some(pid_start_ticks)
+}
+
+/// Start time of `pid` in clock ticks since boot — field 22 of
+/// `/proc/<pid>/stat`, parsed from after the LAST `)` so a comm containing
+/// spaces or parens cannot shift the fields. `None` when the process is gone
+/// or a zombie (state `Z`: it has exited; anything it wrote is history).
+fn proc_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = &stat[stat.rfind(')')? + 1..];
+    let mut fields = tail.split_whitespace();
+    if fields.next()? == "Z" {
+        return None;
+    }
+    // `state` was field 3; `starttime` is field 22.
+    fields.nth(18)?.parse().ok()
 }
 
 /// Upsert `pod` into the node's persisted desired state and recompose ALL
@@ -641,6 +838,209 @@ mod tests {
         assert!(matches!(r, Err(AgentError::Store(StoreError::StorageIo))));
         // The prior generation is untouched — the resident pod is not dropped.
         assert_eq!(store.committed().unwrap().id, 1);
+    }
+
+    /// Render a runtime-written `owner_status.json` body for one pod
+    /// (mirrors the linux runtime writer's fixed emission), with every
+    /// join-key field overridable so tests can stage mismatches.
+    fn runtime_status_json_at(
+        pid: u32,
+        pid_start_ticks: u64,
+        plan_generation: u64,
+        uid_hex: &str,
+        slot: u16,
+        owner_generation: u32,
+        runtime_body: &str,
+    ) -> String {
+        format!(
+            "{{\"version\":1,\"pid\":{pid},\"pid_start_ticks\":{pid_start_ticks},\
+             \"plan_generation\":{plan_generation},\
+             \"written_at\":\"2026-07-07T00:00:00Z\",\"pods\":[\
+             {{\"pod_uid_hex\":\"{uid_hex}\",\"slot\":{slot},\
+             \"owner_generation\":{owner_generation},\
+             \"runtime\":{runtime_body}}}]}}"
+        )
+    }
+
+    /// [`runtime_status_json_at`] with every join-key field matching what
+    /// [`store_with_published_pod`] commits (generation 1, slot 1, owner
+    /// generation 1) and this test process as the live writer.
+    fn runtime_status_json(pid: u32, uid_hex: &str, runtime_body: &str) -> String {
+        let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
+        runtime_status_json_at(pid, ticks, 1, uid_hex, 1, 1, runtime_body)
+    }
+
+    /// FsStorage-backed store in a fresh temp dir with pod 1 committed and
+    /// the plan published + publish-path recorded (the full agent flow).
+    fn store_with_published_pod(
+        tag: &str,
+    ) -> (GenStore<crate::genstore::FsStorage>, std::path::PathBuf) {
+        use crate::genstore::FsStorage;
+        let dir =
+            std::env::temp_dir().join(format!("fluxor-agent-rt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = GenStore::new(FsStorage::open(&dir).unwrap());
+        upsert_pod_and_commit(&mut store, pod(1, 4), &cap()).unwrap();
+        let publish = dir.join("current.plan");
+        publish_committed_plan(&store, &publish).unwrap().unwrap();
+        record_publish_path(&mut store, &publish).unwrap();
+        (store, dir)
+    }
+
+    const UID1_HEX: &str = "01000000000000000000000000000000";
+
+    #[test]
+    fn status_joins_live_runtime_by_pod_uid() {
+        let (store, dir) = store_with_published_pod("join");
+        let rt = "{\"phase\":\"Terminated\",\"ready\":false,\"started\":false,\
+                  \"restart_count\":2,\"started_at\":\"2026-07-07T00:00:01Z\",\
+                  \"terminated\":{\"reason\":\"GraphNodeFault\",\"exit_code\":2,\
+                  \"signal\":null,\"finished_at\":\"2026-07-07T00:00:02Z\"}}";
+        std::fs::write(
+            dir.join("owner_status.json"),
+            runtime_status_json(std::process::id(), UID1_HEX, rt),
+        )
+        .unwrap();
+
+        let st = node_status_with_runtime(&store).unwrap();
+        let p = st.pods.iter().find(|p| p.pod_uid_hex == UID1_HEX).unwrap();
+        let rt = p.runtime.as_ref().expect("runtime joined");
+        assert_eq!(rt.phase, RuntimePhase::Terminated);
+        assert_eq!(rt.restart_count, 2);
+        let t = rt.terminated.as_ref().unwrap();
+        assert_eq!(t.reason, TerminatedReason::GraphNodeFault);
+        assert_eq!(t.exit_code, 2);
+        assert_eq!(t.signal, None);
+
+        // The JSON stays additive: durable fields unchanged, `runtime` is a
+        // nested optional object with the exact §7.2 field names.
+        let v = serde_json::to_value(&st).unwrap();
+        let pj = &v["pods"][0];
+        assert_eq!(pj["pod_uid_hex"], UID1_HEX);
+        assert!(pj["committed"].as_bool().unwrap());
+        assert_eq!(pj["runtime"]["phase"], "Terminated");
+        assert_eq!(pj["runtime"]["terminated"]["reason"], "GraphNodeFault");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dead_writer_pid_means_runtime_absent() {
+        let (store, dir) = store_with_published_pod("deadpid");
+        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
+        // PID far above pid_max: the writer is gone; its file is history,
+        // not live state.
+        std::fs::write(
+            dir.join("owner_status.json"),
+            runtime_status_json(4_100_000, UID1_HEX, rt),
+        )
+        .unwrap();
+
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none(), "stale file not surfaced");
+
+        // Existing consumers see no `runtime` key at all.
+        let v = serde_json::to_value(&st).unwrap();
+        assert!(v["pods"][0].get("runtime").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recycled_writer_pid_means_runtime_absent() {
+        let (store, dir) = store_with_published_pod("recycled");
+        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
+        // The writer's PID is alive (it's ours) but the recorded start time
+        // belongs to a different, earlier process: the PID was recycled.
+        let wrong_ticks = proc_start_ticks(std::process::id()).unwrap_or(0) + 1;
+        std::fs::write(
+            dir.join("owner_status.json"),
+            runtime_status_json_at(std::process::id(), wrong_ticks, 1, UID1_HEX, 1, 1, rt),
+        )
+        .unwrap();
+
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none(), "recycled PID not trusted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_plan_generation_drops_the_runtime_join() {
+        let (store, dir) = store_with_published_pod("stalegen");
+        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
+        // Live state derived under a different plan generation (runtime not
+        // yet rebuilt onto the current commit) must not attach to the new
+        // durable records — same PID, same pod UID, wrong generation.
+        let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
+        std::fs::write(
+            dir.join("owner_status.json"),
+            runtime_status_json_at(std::process::id(), ticks, 999, UID1_HEX, 1, 1, rt),
+        )
+        .unwrap();
+
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none(), "cross-generation join refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slot_or_owner_generation_mismatch_drops_the_runtime_join() {
+        let rt = "{\"phase\":\"Running\",\"ready\":true,\"started\":true,\"restart_count\":0}";
+        let ticks = proc_start_ticks(std::process::id()).unwrap_or(0);
+
+        // Right pod UID, wrong slot.
+        let (store, dir) = store_with_published_pod("wrongslot");
+        std::fs::write(
+            dir.join("owner_status.json"),
+            runtime_status_json_at(std::process::id(), ticks, 1, UID1_HEX, 9, 1, rt),
+        )
+        .unwrap();
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none(), "slot mismatch refused");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Right pod UID and slot, wrong owner generation.
+        let (store, dir) = store_with_published_pod("wrongogen");
+        std::fs::write(
+            dir.join("owner_status.json"),
+            runtime_status_json_at(std::process::id(), ticks, 1, UID1_HEX, 1, 9, rt),
+        )
+        .unwrap();
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none(), "owner-generation mismatch refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_vocabulary_reason_drops_the_runtime_join() {
+        let (store, dir) = store_with_published_pod("vocab");
+        let rt = "{\"phase\":\"Terminated\",\"ready\":false,\"started\":false,\
+                  \"restart_count\":0,\"terminated\":{\"reason\":\"SomethingNew\",\
+                  \"exit_code\":1,\"signal\":null,\"finished_at\":\"2026-07-07T00:00:02Z\"}}";
+        std::fs::write(
+            dir.join("owner_status.json"),
+            runtime_status_json(std::process::id(), UID1_HEX, rt),
+        )
+        .unwrap();
+
+        // §7.2: reasons outside the fixed set are never emitted — a file
+        // carrying one fails strict parse and the join is dropped.
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_status_file_or_publish_record_is_not_an_error() {
+        // No publish path recorded at all (MemStorage, no publish).
+        let mut store = GenStore::new(MemStorage::default());
+        upsert_pod_and_commit(&mut store, pod(1, 4), &cap()).unwrap();
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none());
+
+        // Publish recorded but no owner_status.json written yet.
+        let (store, dir) = store_with_published_pod("nofile");
+        let st = node_status_with_runtime(&store).unwrap();
+        assert!(st.pods[0].runtime.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `node_status` surfaces the ABI-surface pin: matching pins report

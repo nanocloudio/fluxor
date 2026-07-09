@@ -84,6 +84,9 @@ self.onmessage = async (e) => {
   try {
     importScripts(m.shimsUrl);
 
+    // Namespace-hydration gate (set synchronously by the onNamespaceReady
+    // callback inside buildHostImports; awaited before the step loop).
+    let namespaceReadyP = Promise.resolve();
     const imports = self.fluxor.buildHostImports({
       getKernel: () => kernel,
       onLog: (level, msg) => postMessage({ type: 'log', level, msg }),
@@ -93,7 +96,14 @@ self.onmessage = async (e) => {
       fetchUrlOverride: (req) => m.assetUrl || req,
       assetBank: m.assetBank || new Map(),
       manifestUrl: m.manifestUrl,
-      onNamespaceReady: () => {},
+      // Gate the step loop on namespace hydration (manifest + OPFS): the
+      // `storage.namespace` LIST/STAT answer synchronously and treat an
+      // empty LIST as end-of-listing, so a scanner that steps before the
+      // manifest fetch lands reads an empty tree as complete and misses all
+      // shipped content permanently. The main-thread runtime.html awaits
+      // this; the Worker must too (it owns kernel_step) — else the index
+      // races the first LIST. Captured here, awaited before `runPump()`.
+      onNamespaceReady: (p) => { namespaceReadyP = p; },
       inputQueue,
     });
 
@@ -134,6 +144,11 @@ self.onmessage = async (e) => {
     kernel = await WebAssembly.instantiate(m.module, imports);
     const initRet = kernel.exports.kernel_init();
     postMessage({ type: 'log', level: 2, msg: `[worker] kernel_init() -> ${initRet}` });
+    // Wait for the namespace index (manifest + OPFS) to hydrate before the
+    // first kernel_step, so a boot scanner's LIST sees the full shipped tree
+    // instead of racing the fetch and reading it as empty.
+    await namespaceReadyP;
+    postMessage({ type: 'log', level: 2, msg: '[worker] namespace hydrated; starting pump' });
     runPump();
   } catch (err) {
     postMessage({ type: 'panic', msg: '[worker] boot failed: ' + (err && err.message || err) });

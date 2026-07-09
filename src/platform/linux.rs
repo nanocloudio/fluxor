@@ -126,6 +126,8 @@ include!("linux/linux_alsa_midi.rs");
 include!("linux/linux_surface_traits_scan.rs");
 include!("linux/linux_surface_traits.rs");
 include!("linux/linux_surface_traits_probe.rs");
+include!("linux/linux_pointer.rs");
+include!("linux/owner_status.rs");
 
 // ============================================================================
 // Graph construction (shared by boot and live rebuild)
@@ -137,6 +139,9 @@ include!("linux/linux_surface_traits_probe.rs");
 /// path in the main loop; both call `prepare_graph()` (which does the
 /// destructive arena/scheduler reset) then this.
 fn build_graph_linux() -> (usize, usize) {
+    // linux_net drains one inbound lane per wired edge (priority by
+    // wiring order) — tell graph prep not to merge its fan-in.
+    scheduler::register_multi_inbound(LINUX_NET_HASH);
     let (module_list, module_count) = match scheduler::prepare_graph() {
         Ok(v) => v,
         Err(rc) => {
@@ -174,13 +179,23 @@ fn build_graph_linux() -> (usize, usize) {
 
         if entry.name_hash == LINUX_NET_HASH {
             scheduler::set_current_module(module_idx);
-            let net_in_ch = scheduler::get_module_port(module_idx, 0, 0);
+            // Collect EVERY inbound command channel (priority lanes:
+            // one per `to: linux_net.net_in` edge, in wiring order).
+            let mut net_ins = [-1i32; LINUX_NET_MAX_INBOUND];
+            let mut lane_count = 0usize;
+            for (k, slot) in net_ins.iter_mut().enumerate() {
+                let ch = scheduler::get_module_port(module_idx, 0, k as u8);
+                *slot = ch;
+                if ch >= 0 {
+                    lane_count = k + 1;
+                }
+            }
             let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
             let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            install_state(&mut m, LinuxNetState::new(net_in_ch, net_out_ch));
+            install_state(&mut m, LinuxNetState::new(net_ins, net_out_ch));
             scheduler::store_builtin_module(module_idx, m);
             log::info!(
-                "[inst] module {module_idx} = linux_net (built-in) net_in={net_in_ch} net_out={net_out_ch}"
+                "[inst] module {module_idx} = linux_net (built-in) net_in_lanes={lane_count} net_out={net_out_ch}"
             );
             loaded_count += 1;
             continue;
@@ -238,6 +253,13 @@ fn build_graph_linux() -> (usize, usize) {
 
         if entry.name_hash == LINUX_SURFACE_TRAITS_PROBE_HASH {
             let m = build_linux_surface_traits_probe(module_idx);
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_POINTER_HASH {
+            let m = build_linux_pointer(module_idx, entry.params());
             scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;
@@ -426,23 +448,15 @@ fn main() {
         stage_plan_from(path);
         last_plan_mtime = plan_mtime(path);
     }
+    // Node-agent mode also PUBLISHES per-owner live status next to the plan
+    // it consumes (`owner_status.json`, atomic replace) so `fluxor agent
+    // status` can report truthful per-pod §7.2 state. Absent file / absent
+    // FLUXOR_PLAN ⇒ no runtime status surfaced.
+    let mut owner_status = plan_path
+        .as_deref()
+        .map(|p| OwnerStatusWriter::new(std::path::Path::new(p)));
 
     // Compile + instantiate the graph (shared with the live-rebuild path).
-    // Stage an owner plan from FLUXOR_PLAN=<file> (the host validation path; the
-    // node agent stages plans the same way on a real device). The bytes must
-    // outlive build_graph_linux's apply_staged call — keep them in main scope.
-    let _staged_plan = std::env::var("FLUXOR_PLAN")
-        .ok()
-        .and_then(|path| std::fs::read(&path).ok());
-    if let Some(ref bytes) = _staged_plan {
-        log::info!(
-            "[owner] staging plan from FLUXOR_PLAN ({} bytes)",
-            bytes.len()
-        );
-        // SAFETY: `_staged_plan` lives through the run loop, past apply_staged.
-        unsafe { fluxor::kernel::owner_plan::set_staged_plan(bytes.as_ptr(), bytes.len()) };
-    }
-
     let (mut module_count, loaded_count) = build_graph_linux();
     if loaded_count == 0 {
         log::warn!("[sched] no modules loaded, nothing to do");
@@ -454,6 +468,13 @@ fn main() {
     // owners via `apply_add`, then the multi-graph runner multiplexes them with
     // the base graph. Boot-only (not re-run on live rebuild). No-op without pods.
     scheduler::admit_resident_pods_from_config();
+
+    // Publish the initial owner status immediately (before the first 100 ms
+    // watch window) so an orchestrator polling right after activation sees
+    // the runtime up rather than a stale/absent file.
+    if let Some(w) = owner_status.as_mut() {
+        w.tick();
+    }
 
     log::info!("[sched] starting main loop, tick_us={tick_us}");
     // The per-iteration deadline is chosen by the adaptive-tick pacer
@@ -515,6 +536,11 @@ fn main() {
                     unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
                 }
             }
+            // Same cadence as the plan watch: publish per-owner live status
+            // (no-op write when the derived state is unchanged).
+            if let Some(w) = owner_status.as_mut() {
+                w.tick();
+            }
         }
 
         // Live rebuild. The reconfigure module triggers
@@ -528,6 +554,13 @@ fn main() {
             module_count = mc;
             scheduler::set_reconfigure_phase(scheduler::ReconfigurePhase::Running);
             log::info!("[reconfigure] rebuilt graph: {lc} of {mc} modules");
+            // Observe re-activation NOW, before the rebuilt modules step: a
+            // previously-terminated owner that faults again within the 100 ms
+            // status cadence would otherwise re-terminate unobserved and its
+            // aggregate restart (Terminated → re-activated) go uncounted.
+            if let Some(w) = owner_status.as_mut() {
+                w.tick();
+            }
             continue;
         }
 
@@ -656,5 +689,113 @@ fn main() {
                 last_oversleep_log_tick = tick;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercise the same syscall-table entry a PIC module calls, through the
+    /// contract gate, provider router, FS vtable, and real libc dispatcher.
+    /// The separate `fs_write_smoke` fixture covers the final mmap'd PIC jump;
+    /// this test keeps the provider behavior in the ordinary automated suite.
+    #[test]
+    fn pic_syscall_fs_create_write_fsync_close_unlink() {
+        use fluxor::abi::contracts::storage::fs as fs_contract;
+        use fluxor::kernel::config::{Config, ConfigHeader, ModuleEntry};
+
+        // SAFETY: this binary has one test; kernel/provider globals are
+        // initialized once and remain scheduler-thread-owned throughout it.
+        unsafe {
+            BOOT_INSTANT = Some(Instant::now());
+        }
+        fluxor::kernel::boot(&LINUX_HAL_OPS);
+
+        let mut cfg = Config::empty();
+        cfg.header = ConfigHeader {
+            magic: 0,
+            version: 1,
+            checksum: 0,
+            module_count: 1,
+            edge_count: 0,
+            tick_us: 1000,
+            graph_sample_rate: 0,
+        };
+        cfg.modules[0] = Some(ModuleEntry {
+            name_hash: 0xF51E_2E2E,
+            id: 0,
+            domain_id: 0,
+            pre_tick_drain: false,
+            frame_kind: 0,
+            params_ptr: core::ptr::null(),
+            params_len: 0,
+        });
+        cfg.module_count = 1;
+        loader::reset_state_arena();
+        // SAFETY: test owns the scheduler globals.
+        unsafe { scheduler::install_static_config(cfg) };
+        let _ = scheduler::prepare_graph().expect("prepare test graph");
+        scheduler::store_builtin_module(
+            0,
+            scheduler::BuiltInModule::new("linux_fs_pic_gate", |_| 0),
+        );
+        scheduler::set_module_caps(0, 0, 1u32 << fluxor::kernel::provider::contract::FS, 0);
+        scheduler::set_current_module(0);
+
+        let path = format!("/tmp/fluxor-linux-pic-fs-{}.txt", std::process::id());
+        let mut path_bytes = path.as_bytes().to_vec();
+        let payload = b"fluxor PIC filesystem e2e\n";
+        let sys = fluxor::kernel::syscalls::get_syscall_table();
+
+        // Clean up a stale path from an interrupted prior run.
+        unsafe {
+            (sys.provider_call)(
+                -1,
+                fs_contract::UNLINK,
+                path_bytes.as_mut_ptr(),
+                path_bytes.len(),
+            )
+        };
+
+        let fd = unsafe {
+            (sys.provider_call)(
+                -1,
+                fs_contract::OPEN_CREATE,
+                path_bytes.as_mut_ptr(),
+                path_bytes.len(),
+            )
+        };
+        assert!(fd >= 0, "OPEN_CREATE failed: {fd}");
+
+        let mut bytes = payload.to_vec();
+        let written =
+            unsafe { (sys.provider_call)(fd, fs_contract::WRITE, bytes.as_mut_ptr(), bytes.len()) };
+        assert_eq!(written, payload.len() as i32, "WRITE failed: {written}");
+        assert_eq!(
+            unsafe { (sys.provider_call)(fd, fs_contract::FSYNC, core::ptr::null_mut(), 0) },
+            0,
+            "FSYNC failed"
+        );
+        assert_eq!(
+            unsafe { (sys.provider_call)(fd, fs_contract::CLOSE, core::ptr::null_mut(), 0) },
+            0,
+            "CLOSE failed"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+
+        assert_eq!(
+            unsafe {
+                (sys.provider_call)(
+                    -1,
+                    fs_contract::UNLINK,
+                    path_bytes.as_mut_ptr(),
+                    path_bytes.len(),
+                )
+            },
+            0,
+            "UNLINK failed"
+        );
+        assert!(!std::path::Path::new(&path).exists());
     }
 }

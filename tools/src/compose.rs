@@ -94,7 +94,7 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
             max_owners: 64,                // owner.rs MAX_OWNERS (multitenant)
             max_modules: 128,              // sdk config profile_host MAX_MODULES
             max_edges: 128,                // kernel/config.rs MAX_GRAPH_EDGES
-            state_bytes: 64 * 1024 * 1024, // profile_host STATE_ARENA_SIZE
+            state_bytes: 96 * 1024 * 1024, // profile_host STATE_ARENA_SIZE
             buffer_bytes: 8 * 1024 * 1024, // profile_host BUFFER_ARENA_SIZE
             max_endpoints: 64,             // agent admission policy
             max_domains: 4,                // scheduler MAX_DOMAINS

@@ -126,6 +126,72 @@ class PcmRing extends AudioWorkletProcessor {
 registerProcessor('pcm-ring', PcmRing);
 `;
 
+  // ── ScriptProcessorNode fallback ring (NON-SECURE contexts) ──────────────
+  // AudioWorklet is only exposed in a SECURE context (https:// or
+  // http://localhost). Served over a plain-http LAN IP (e.g. a kiosk panel at
+  // http://192.168.x.x) `ctx.audioWorklet` is undefined, so playback would be
+  // silent. This is a byte-for-byte port of the PcmRing above (same clock-lock
+  // + underflow-freeze, no resampling drift) that runs in the deprecated-but-
+  // universally-available ScriptProcessorNode.onaudioprocess on the main
+  // thread. `ctxRate` is the AudioContext sample rate (the render rate);
+  // `inRate` is the fed-PCM rate, exactly as `sampleRate` vs `this.inRate` in
+  // the worklet.
+  class PcmRingJS {
+    constructor(ctxRate) {
+      this.ctxRate = ctxRate || 44100;
+      this.CAP = 0; this.ring = null;
+      this.writeFrame = 0; this.readFrame = 0;
+      this.inRate = this.ctxRate;
+      this.under = 0; this.over = 0;
+    }
+    _ensure(rate) {
+      if (this.ring) return;
+      this.inRate = rate || this.ctxRate;
+      this.CAP = Math.max(2048, Math.ceil(this.inRate * 0.32));
+      this.ring = new Float32Array(this.CAP * 2);
+    }
+    _push(m) {
+      if (!m || !m.pcm) return;
+      this._ensure(m.rate);
+      const pcm = m.pcm, n = pcm.length >> 1;
+      if (n <= 0) return;
+      const CAP = this.CAP, ring = this.ring;
+      const held = this.writeFrame - Math.floor(this.readFrame);
+      if (held + n > CAP) { const drop = held + n - CAP; this.readFrame += drop; this.over += drop; }
+      const w = this.writeFrame;
+      for (let f = 0; f < n; f++) {
+        const idx = (((w + f) % CAP) + CAP) % CAP * 2;
+        ring[idx] = pcm[f * 2]; ring[idx + 1] = pcm[f * 2 + 1];
+      }
+      this.writeFrame = w + n;
+    }
+    // Fill output channels for one onaudioprocess block; identical semantics to
+    // the worklet process() (silence + frozen read cursor on underflow).
+    render(L, R, N) {
+      const ring = this.ring, CAP = this.CAP;
+      const step = ring ? (this.inRate / this.ctxRate) : 1;
+      for (let i = 0; i < N; i++) {
+        if (!ring || (this.writeFrame - this.readFrame) < 1) {
+          L[i] = 0; if (R) R[i] = 0; this.under++; continue;
+        }
+        const p = this.readFrame, i0 = Math.floor(p), frac = p - i0;
+        const a = ((i0 % CAP) + CAP) % CAP * 2;
+        const hasNext = (this.writeFrame - i0) > 1;
+        const b = hasNext ? ((((i0 + 1) % CAP) + CAP) % CAP * 2) : a;
+        L[i] = ring[a] + (ring[b] - ring[a]) * frac;
+        if (R) R[i] = ring[a + 1] + (ring[b + 1] - ring[a + 1]) * frac;
+        this.readFrame = p + step;
+      }
+    }
+    // Same shape as the worklet's port report so the scheduler's stats path is
+    // identical for both backends.
+    report() {
+      const fill = this.ring ? Math.max(0, this.writeFrame - this.readFrame) : 0;
+      return { fill, inRate: this.inRate, under: this.under, over: this.over,
+               consumed: this.readFrame, playRate: 1 };
+    }
+  }
+
   // Clock-locked AudioWorklet ring scheduler (the wasm_browser_audio sink).
   // Locking playback to the audio clock keeps the producer in step; a
   // per-block scheduler could only insert silence to catch up, compounding into
@@ -182,30 +248,63 @@ registerProcessor('pcm-ring', PcmRing);
       }
       return audioCtx;
     }
+    // Fold one ring report (from the worklet port OR the ScriptProcessor
+    // fallback) into the scheduler's cached stats. Shared so both audio
+    // backends drive the identical stats/backpressure/cursor path.
+    function applyRingReport(s) {
+      ringFillFrames = s.fill; ringInRate = s.inRate || 0;
+      underCount = s.under; overCount = s.over; consumedFrames = s.consumed;
+      if (s.playRate) ringPlayRate = s.playRate;
+      if (realtimeBaseT < 0) { realtimeBaseT = performance.now(); realtimeBaseFrames = s.consumed; }
+      // Phase-0 audio perf: the backend reports far more often than the 1 s
+      // [audio] tick, so sample the LOW tail here — a near-0 dip between ticks
+      // is a hair from underflow that the instantaneous snapshot would miss.
+      if (s.inRate) { const lm = s.fill / s.inRate * 1000; if (lm < audioLeadMinMs) audioLeadMinMs = lm; }
+    }
+    // ScriptProcessorNode fallback for a NON-SECURE context (no AudioWorklet).
+    // Presents the same `{ port: { postMessage } }` + `connect` surface the
+    // rest of the scheduler expects from an AudioWorkletNode, so `schedule`,
+    // `flushPending`, `ready` and the stats line are all backend-agnostic. The
+    // ring lives on the main thread and is pulled by onaudioprocess against the
+    // context clock — the same drift-free, clock-locked contract as the worklet.
+    function ensureScriptProcessor(ctx) {
+      const BUF = 4096; // ~85ms/block at 48k; large enough to stay ahead of main-thread jitter
+      let sp;
+      try { sp = ctx.createScriptProcessor(BUF, 0, 2); }
+      catch (e) { sp = ctx.createScriptProcessor(BUF, 1, 2); } // some UAs reject 0 inputs
+      const ring = new PcmRingJS(ctx.sampleRate | 0);
+      sp.onaudioprocess = (e) => {
+        const out = e.outputBuffer;
+        const L = out.getChannelData(0);
+        const R = out.numberOfChannels > 1 ? out.getChannelData(1) : null;
+        ring.render(L, R, L.length);
+        applyRingReport(ring.report());
+      };
+      sp.connect(ctx.destination);
+      // Node-like adapter: the scheduler only ever calls `.port.postMessage(msg)`
+      // and `.connect()`; keep a ref to sp/ring so they're not GC'd.
+      workletNode = { port: { postMessage: (msg) => ring._push(msg) },
+                      connect: () => {}, _sp: sp, _ring: ring };
+      onLog(2, '[audio] ScriptProcessor fallback ready (no AudioWorklet — non-secure context; ctx=' + ctx.state + ')');
+      ctx.resume().catch(() => {});
+      flushPending();
+    }
     // Kick off the (async) worklet module load + node creation exactly once.
     // addModule works on a suspended context, so the node is ready by the time
     // the gesture resumes playback. PCM that arrives meanwhile queues, then flushes.
     function ensureWorklet(ctx) {
       if (workletInitStarted) return;
-      if (!ctx.audioWorklet) { onLog(3, '[audio] no AudioWorklet support — audio disabled'); workletInitStarted = true; return; }
       workletInitStarted = true;
+      // Non-secure context (plain-http LAN IP): no AudioWorklet → fall back to a
+      // ScriptProcessorNode so audio still plays instead of being disabled.
+      if (!ctx.audioWorklet) { ensureScriptProcessor(ctx); return; }
       workletBlobUrl = URL.createObjectURL(new Blob([PCM_RING_PROCESSOR_SRC], { type: 'application/javascript' }));
       ctx.audioWorklet.addModule(workletBlobUrl).then(() => {
         const node = new AudioWorkletNode(ctx, 'pcm-ring', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
         node.addEventListener('processorerror', (e) => {
           onLog(3, '[audio] AudioWorklet processorerror: ' + ((e && e.message) || 'render processor failed'));
         });
-        node.port.onmessage = (e) => {
-          const s = e.data;
-          ringFillFrames = s.fill; ringInRate = s.inRate || 0;
-          underCount = s.under; overCount = s.over; consumedFrames = s.consumed;
-          if (s.playRate) ringPlayRate = s.playRate;
-          if (realtimeBaseT < 0) { realtimeBaseT = performance.now(); realtimeBaseFrames = s.consumed; }
-          // Phase-0 audio perf: the worklet reports far more often than the 1 s
-          // [audio] tick, so sample the LOW tail here — a near-0 dip between ticks
-          // is a hair from underflow that the instantaneous snapshot would miss.
-          if (s.inRate) { const lm = s.fill / s.inRate * 1000; if (lm < audioLeadMinMs) audioLeadMinMs = lm; }
-        };
+        node.port.onmessage = (e) => applyRingReport(e.data);
         node.connect(ctx.destination);
         workletNode = node;
         onLog(2, '[audio] fixed-rate worklet ready (ctx=' + ctx.state + ', rate=1.00) — resuming');
@@ -1457,7 +1556,11 @@ registerProcessor('pcm-ring', PcmRing);
           const handle = nextImageHandle++;
           const job = { state: 'pending', buf: null, pos: 0, error: null, width, height };
           imageDecodes.set(handle, job);
-          fetch(url, { headers: { Range: `bytes=${off}-${off + len - 1}` } })
+          // Range header built by string concat (NOT a `${}` template literal):
+          // host_shims.js is served through env-substitution that escapes `${` to
+          // `$${`, so a template here would emit a literal, malformed Range and the
+          // server would fall back to a full-body 200 (the whole multi-MB track).
+          fetch(url, { headers: { Range: 'bytes=' + off + '-' + (off + len - 1) } })
             .then((r) => r.arrayBuffer().then((ab) => ({ status: r.status, ab })))
             .then(({ status, ab }) => {
               let bytes = new Uint8Array(ab);
@@ -1489,7 +1592,7 @@ registerProcessor('pcm-ring', PcmRing);
             .catch((err) => {
               job.state = 'error';
               job.error = err.message;
-              console.error(`host_image_decode_url[${handle}] failed: ${err.message}`);
+              console.error('host_image_decode_url[' + handle + '] failed: ' + err.message);
             });
           return handle;
         } catch (err) {
@@ -1561,6 +1664,53 @@ registerProcessor('pcm-ring', PcmRing);
               return r;
             },
             provider_call: (h, op, p, l) => {
+              // storage.namespace LIST (op 0x1302) is special: its output
+              // buffer + fence are passed as pointers EMBEDDED in the arg
+              // blob (into the CHILD's memory), not as direct args. The
+              // generic arg copy-back below can't follow embedded pointers,
+              // so the provider's page would be written into kernel memory
+              // at a child address and never reach the module (empty LIST).
+              // Bridge them explicitly: alloc kernel scratch, rewrite the
+              // embedded pointers to it, then copy the results back to the
+              // child. Arg layout (see contracts/storage/namespace.rs LIST):
+              //   [prefix_len u16][prefix][cursor_len u16][cursor]
+              //   [out_buf u64][out_cap u32][fence_ptr u64][fence_cap u16]
+              const NS_LIST_OP = 0x1302;
+              if (op === NS_LIST_OP && p && l >= 26) {
+                const cbuf = childMem();
+                const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
+                const prefixLen = cdv.getUint16(0, true);
+                const cursorOff = 2 + prefixLen;
+                if (cursorOff + 2 <= l) {
+                  const cursorLen = cdv.getUint16(cursorOff, true);
+                  const oOff = cursorOff + 2 + cursorLen; // start of out_buf
+                  if (oOff + 22 <= l) {
+                    const outBufChild = cdv.getUint32(oOff, true);       // u64 lo
+                    const outCap = cdv.getUint32(oOff + 8, true);
+                    const fenceChild = cdv.getUint32(oOff + 12, true);   // u64 lo
+                    const fenceCap = cdv.getUint16(oOff + 20, true);
+                    const k = childToKernel(p, l);
+                    if (!k) return -1;
+                    const outK = outCap ? getKernel().exports.kernel_heap_alloc(outCap) : 0;
+                    const fenceK = fenceCap ? getKernel().exports.kernel_heap_alloc(fenceCap) : 0;
+                    // Rewrite the embedded pointers in the kernel arg copy to
+                    // point at the kernel scratch (both u64: set lo + zero hi).
+                    const kbuf = kmem();
+                    const kdv = new DataView(kbuf.buffer, kbuf.byteOffset + k, l);
+                    kdv.setUint32(oOff, outK, true); kdv.setUint32(oOff + 4, 0, true);
+                    kdv.setUint32(oOff + 12, fenceK, true); kdv.setUint32(oOff + 16, 0, true);
+                    const r = getKernel().exports.provider_call(h, op, k, l);
+                    if (r > 0 && outK && outBufChild) {
+                      kernelToChild(outK, outBufChild, Math.min(r, outCap));
+                    }
+                    if (fenceK && fenceChild) kernelToChild(fenceK, fenceChild, fenceCap);
+                    if (outK) getKernel().exports.kernel_heap_free(outK);
+                    if (fenceK) getKernel().exports.kernel_heap_free(fenceK);
+                    getKernel().exports.kernel_heap_free(k);
+                    return r;
+                  }
+                }
+              }
               const k = childToKernel(p, l);
               const r = getKernel().exports.provider_call(h, op, k, l);
               if (k && l > 0) kernelToChild(k, p, l);

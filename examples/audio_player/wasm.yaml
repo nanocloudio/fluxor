@@ -61,12 +61,13 @@ presentation:
   # a status-driven progress scrubber and a volume slider, laid out
   # below the deck. Both the existing DOM-tap nav (nav → gesture → bank)
   # and these transport controls (overlay → actionnav → bank) drive
-  # playback, fanned in on `bank.commands`. The transport buttons emit
-  # `action.transport.{previous,toggle,next}` which `wasm_browser_action`
-  # maps to FMP prev/toggle/next. (The scrubber renders from a
-  # `PresentationStatus` feed once a coordinator publishes one; seek /
-  # set_volume have no FMP-verb equivalent so they reach the action hook
-  # only — see RFC §29 open question on PresentationStatus.)
+  # playback, fanned in on `bank.commands`. The transport buttons are
+  # named with the bare `prev`/`toggle`/`next` verbs; `wasm_browser_action`
+  # passes each action-id hash through unchanged and those hash to bank's
+  # prev/toggle/next. (The scrubber renders from a `PresentationStatus`
+  # feed once a coordinator publishes one; `seek` / `set_volume` carry a
+  # value bank doesn't consume, so they reach the action hook only — see
+  # RFC §29 open question on PresentationStatus.)
   shell:
     version: 1
     media_profile: music
@@ -74,15 +75,15 @@ presentation:
     status_feed: media_status
     controls:
       - { id: prev, kind: button, placement: primary_start, label: "‹‹",
-          action: action.transport.previous }
+          action: prev }
       - { id: toggle, kind: toggle, placement: secondary, label: "Play/Pause",
-          action: action.transport.toggle, status_field: playback_state }
+          action: toggle, status_field: playback_state }
       - { id: next, kind: button, placement: primary_end, label: "››",
-          action: action.transport.next }
+          action: next }
       - { id: progress, kind: scrubber, placement: secondary,
-          action: action.transport.seek_absolute, status_field: position }
+          action: seek, status_field: position }
       - { id: volume, kind: slider, placement: drawer,
-          action: action.transport.set_volume }
+          action: set_volume }
 
   browser_overlay:
     version: 1
@@ -99,8 +100,8 @@ modules:
   # triple = prev.
   - name: gesture
 
-  # Browser-overlay action source: the shell's transport controls →
-  # `action.transport.*` → FMP prev/toggle/next → bank. Fans in with
+  # Browser-overlay action source: the shell's transport controls
+  # (`prev`/`toggle`/`next`) → pass-through hash → bank. Fans in with
   # `gesture` on `bank.commands`.
   - name: actionnav
     type: wasm_browser_action

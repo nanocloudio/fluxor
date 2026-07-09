@@ -35,7 +35,7 @@ use crate::kernel::loader::{
     find_hint_for_port, query_channel_hints, reset_state_arena, ChannelHint, DynamicModule,
     ModuleLoader, StartNewResult,
 };
-use crate::kernel::owner::{OwnerHandle, OwnerTable, OWNER_SYSTEM};
+use crate::kernel::owner::{OwnerHandle, OwnerTable, MAX_OWNERS, OWNER_SYSTEM};
 use crate::kernel::step_guard::{
     self, fault_type, FaultPolicy, FaultRecord, FaultState, FaultStats, ModuleFaultInfo,
 };
@@ -5064,6 +5064,40 @@ pub fn log_arena_summary() {
 pub const INTERNAL_TEE_HASH: u32 = 0x607f045c; // "_tee"
 pub const INTERNAL_MERGE_HASH: u32 = 0x8a6bcd3e; // "_merge"
 
+/// Consumers registered here drain EVERY inbound edge to a data port as
+/// its own channel (priority lanes: lane index = the edge's position in
+/// the graph wiring), so `insert_fan_in` must NOT collapse their fan
+/// groups into a single merged FIFO. A merge would serialise latency-
+/// critical producers behind bulk ones in one queue — a web-stream
+/// flood stalling Raft peer heartbeats past their election timeout.
+/// Platforms register their multi-inbound built-ins before
+/// `prepare_graph` (e.g. linux_net).
+static mut MULTI_INBOUND_HASHES: [u32; 8] = [0; 8];
+
+/// Register a module name-hash whose data inputs support one channel
+/// per edge (see [`MULTI_INBOUND_HASHES`]). Call before `prepare_graph`.
+pub fn register_multi_inbound(name_hash: u32) {
+    // SAFETY: called single-threaded during platform bring-up, before
+    // the scheduler starts stepping.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(MULTI_INBOUND_HASHES) };
+    for slot in table.iter_mut() {
+        if *slot == name_hash {
+            return;
+        }
+        if *slot == 0 {
+            *slot = name_hash;
+            return;
+        }
+    }
+    log::error!("[graph] multi-inbound table full; {name_hash:#x} not registered");
+}
+
+fn is_multi_inbound(name_hash: u32) -> bool {
+    // SAFETY: read-only after bring-up registration.
+    let table = unsafe { &*core::ptr::addr_of!(MULTI_INBOUND_HASHES) };
+    table.iter().any(|&h| h != 0 && h == name_hash)
+}
+
 /// Build the dense module list from the validated config.
 ///
 /// Fail-closed on every malformation:
@@ -5399,6 +5433,19 @@ fn insert_fan(
 
             if group_count <= 1 {
                 continue;
+            }
+
+            // Multi-inbound consumers keep one channel per edge (priority
+            // lanes) — no merge. Only data inputs (port_key without the
+            // ctrl bit) qualify; ctrl fan-in still merges.
+            if direction == FanDirection::In && (port_key & 0x10) == 0 {
+                let consumer_hash = module_list[module_idx]
+                    .as_ref()
+                    .map(|e| e.name_hash)
+                    .unwrap_or(0);
+                if is_multi_inbound(consumer_hash) {
+                    continue;
+                }
             }
 
             // Invariant: buffer aliasing (buffer_group) is incompatible with tee/merge.
@@ -5793,6 +5840,20 @@ pub fn instantiate_one_module(
         };
         sched.required_caps[instantiated] = found_module.header.required_caps();
         sched.permissions[instantiated] = found_module.manifest_permissions();
+        // Boot-time record of what the capability gate will enforce for
+        // this slot: the packed .fmod HEADER value (`required_caps()`),
+        // which is what `check_contract_grant` gates on — distinct from the
+        // manifest-derived mask, which is recomputed from `[[resources]]`.
+        // A header of 0x0 for a module whose manifest declares contracts
+        // means the packer never populated the header field, and every
+        // `provider_call` to those contracts returns ENOSYS.
+        log::info!(
+            "[inst] module {} caps: required_caps=0x{:08x} cap_class={} permissions=0x{:02x}",
+            instantiated,
+            sched.required_caps[instantiated],
+            sched.cap_class[instantiated],
+            sched.permissions[instantiated],
+        );
         // Store export table info for resolve_export_for_module
         sched.module_code_base[instantiated] = found_module.code_base() as usize;
         sched.module_code_size[instantiated] = found_module.header.code_size;
@@ -6381,6 +6442,42 @@ fn finalize_module(module_idx: usize, error_code: Option<i32>, type_name: &str, 
 
 #[no_mangle]
 pub static mut DBG_TICK: u32 = 0;
+
+/// Rate-limit for the per-step budget monitors (`MON_HEAVY_STEP`,
+/// `MON_BUDGET_OVERRUN`, `MON_BURST_BUDGET_ABORT`). On a coarse-timer host
+/// these are meaningless per-step: the browser's `now_micros` floor is
+/// ~1–2 ms, far above the 50 µs heavy threshold and the ~1 ms domain
+/// budget, so every step trips all three and drowns the log (tens of
+/// thousands of lines/sec). Emit at most one line per monitor per
+/// `MON_LOG_THROTTLE_TICKS`, carrying the number suppressed since the last
+/// line — a genuine (rare) native overrun is still surfaced, while the
+/// wasm flood collapses to a periodic summary. Monitoring/counters are
+/// unaffected; only the log emission is throttled.
+const MON_LOG_THROTTLE_TICKS: u32 = 2000;
+static mut MON_HEAVY_LAST: u32 = 0;
+static mut MON_HEAVY_SUP: u32 = 0;
+static mut MON_OVERRUN_LAST: u32 = 0;
+static mut MON_OVERRUN_SUP: u32 = 0;
+static mut MON_BURST_LAST: u32 = 0;
+static mut MON_BURST_SUP: u32 = 0;
+
+/// Returns `Some(suppressed_since_last)` when the throttle window has
+/// elapsed (and opens a new window); else `None`, bumping the suppressed
+/// counter. Raw pointers (not `&mut` to statics) keep clear of the
+/// `static_mut_refs` lint; scheduler-thread only, so no races.
+#[inline]
+unsafe fn mon_throttle(last: *mut u32, sup: *mut u32) -> Option<u32> {
+    let now = DBG_TICK;
+    if now.wrapping_sub(*last) >= MON_LOG_THROTTLE_TICKS {
+        let n = *sup;
+        *sup = 0;
+        *last = now;
+        Some(n)
+    } else {
+        *sup = (*sup).wrapping_add(1);
+        None
+    }
+}
 
 /// Current tick count (milliseconds since boot). Used by timer FDs on aarch64.
 pub fn tick_count() -> u32 {
@@ -7543,17 +7640,26 @@ fn record_domain_budget_overrun(
 ) {
     sched.domain_budget_overruns[domain_id] =
         sched.domain_budget_overruns[domain_id].saturating_add(1);
-    log::warn!(
-        "MON_BUDGET_OVERRUN domain={} consumed_us={} limit_us={} \
-         last_mod={} overrun_count={} tick={}",
-        domain_id,
-        sched.domain_budget_us_consumed[domain_id],
-        sched.domain_budget_us_limit[domain_id],
-        last_module_idx,
-        sched.domain_budget_overruns[domain_id],
-        // SAFETY: DBG_TICK aligned u32 read.
-        unsafe { DBG_TICK },
-    );
+    // SAFETY: scheduler-thread only; throttle via raw static ptrs.
+    if let Some(sup) = unsafe {
+        mon_throttle(
+            core::ptr::addr_of_mut!(MON_OVERRUN_LAST),
+            core::ptr::addr_of_mut!(MON_OVERRUN_SUP),
+        )
+    } {
+        log::warn!(
+            "MON_BUDGET_OVERRUN domain={} consumed_us={} limit_us={} \
+             last_mod={} overrun_count={} tick={} suppressed={}",
+            domain_id,
+            sched.domain_budget_us_consumed[domain_id],
+            sched.domain_budget_us_limit[domain_id],
+            last_module_idx,
+            sched.domain_budget_overruns[domain_id],
+            // SAFETY: DBG_TICK aligned u32 read.
+            unsafe { DBG_TICK },
+            sup,
+        );
+    }
 }
 
 /// Diagnostic accessor — total budget-overrun count for `domain_id`
@@ -8178,15 +8284,24 @@ fn step_one_module(
                                 let projected =
                                     sched.domain_budget_us_consumed[d].saturating_add(elapsed_now);
                                 if projected > limit {
-                                    log::warn!(
-                                        "MON_BURST_BUDGET_ABORT module={} domain={} \
-                                         elapsed_us={} consumed_us={} limit_us={}",
-                                        module_idx,
-                                        d,
-                                        elapsed_now,
-                                        sched.domain_budget_us_consumed[d],
-                                        limit,
-                                    );
+                                    // SAFETY: scheduler-thread only.
+                                    if let Some(sup) = unsafe {
+                                        mon_throttle(
+                                            core::ptr::addr_of_mut!(MON_BURST_LAST),
+                                            core::ptr::addr_of_mut!(MON_BURST_SUP),
+                                        )
+                                    } {
+                                        log::warn!(
+                                            "MON_BURST_BUDGET_ABORT module={} domain={} \
+                                             elapsed_us={} consumed_us={} limit_us={} suppressed={}",
+                                            module_idx,
+                                            d,
+                                            elapsed_now,
+                                            sched.domain_budget_us_consumed[d],
+                                            limit,
+                                            sup,
+                                        );
+                                    }
                                     step_guard::disarm();
                                     break;
                                 }
@@ -8283,15 +8398,24 @@ fn step_one_module(
         // overrun line names whichever finished *last*, which is a
         // poor proxy for cause.
         if elapsed > MOD_STEP_HEAVY_US {
-            log::warn!(
-                "MON_HEAVY_STEP module={} domain={} elapsed_us={} tick={}",
-                module_idx,
-                d,
-                elapsed,
-                // SAFETY: DBG_TICK is an aligned u32 read; the scheduler
-                // is the only writer.
-                unsafe { DBG_TICK },
-            );
+            // SAFETY: scheduler-thread only; throttle via raw static ptrs.
+            if let Some(sup) = unsafe {
+                mon_throttle(
+                    core::ptr::addr_of_mut!(MON_HEAVY_LAST),
+                    core::ptr::addr_of_mut!(MON_HEAVY_SUP),
+                )
+            } {
+                log::warn!(
+                    "MON_HEAVY_STEP module={} domain={} elapsed_us={} tick={} suppressed={}",
+                    module_idx,
+                    d,
+                    elapsed,
+                    // SAFETY: DBG_TICK is an aligned u32 read; the scheduler
+                    // is the only writer.
+                    unsafe { DBG_TICK },
+                    sup,
+                );
+            }
         }
     }
 }
@@ -8683,6 +8807,170 @@ pub fn module_is_finished(module_idx: usize) -> bool {
     }
     // SAFETY: scheduler-thread read; module_idx bounded.
     unsafe { SCHED.finished[module_idx] }
+}
+
+/// One resident owner's live runtime aggregate: the per-MODULE fault/finish
+/// state of its plan-assigned module range folded into per-owner counts
+/// (rfc_k8s.md §18.2 — "a Fluxor owner-status store keyed by Pod UID"). This
+/// is the kernel half of the per-pod status surface: only the kernel knows
+/// the slot→module mapping, so the aggregation happens here and consumers
+/// (the node runtime's status writer, `fluxor agent status`) never see
+/// module indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerLiveStatus {
+    pub pod_uid: [u8; 16],
+    pub slot: u16,
+    pub generation: u32,
+    /// Modules stamped with this owner (0 until the graph instantiates).
+    pub modules_total: u16,
+    /// Stamped modules whose slot actually holds an instantiated module.
+    /// `< modules_total` means instantiation partially failed (the platform
+    /// logs and continues on a per-module error) — the pod must not be
+    /// reported Running.
+    pub modules_loaded: u16,
+    /// Modules that returned `StepOutcome::Done` cleanly (not via fault
+    /// termination).
+    pub modules_finished: u16,
+    /// Modules permanently terminated by the fault state machine.
+    pub modules_terminated: u16,
+    /// Modules currently `Faulted`/`Recovering` — an internal retry in
+    /// flight. Telemetry-grade unreadiness, NOT an aggregate restart.
+    pub modules_recovering: u16,
+    /// `fault_type::*` of the most recent fault among this owner's
+    /// terminated modules (`fault_type::NONE` when none terminated).
+    pub last_fault_kind: u8,
+}
+
+impl OwnerLiveStatus {
+    pub const EMPTY: OwnerLiveStatus = OwnerLiveStatus {
+        pod_uid: [0; 16],
+        slot: 0,
+        generation: 0,
+        modules_total: 0,
+        modules_loaded: 0,
+        modules_finished: 0,
+        modules_terminated: 0,
+        modules_recovering: 0,
+        last_fault_kind: fault_type::NONE,
+    };
+}
+
+/// Snapshot the live per-owner runtime status: every non-free workload slot,
+/// with the fault/finish state of its stamped module range aggregated in.
+/// Writes into `out` and returns the record count. Allocation-free;
+/// scheduler-thread only (same access class as `module_fault_state`).
+///
+/// On single-tenant builds (`MAX_OWNERS == 1`) there are no workload slots
+/// and this always returns 0.
+pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
+    // SAFETY: scheduler-thread read of the static owner table + fault state.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let mut count = 0usize;
+    for slot in 1..MAX_OWNERS {
+        let Some(e) = sched.owners.entry_at(slot) else {
+            continue;
+        };
+        if matches!(e.state, crate::kernel::owner::OwnerState::Free) {
+            continue;
+        }
+        out[count] = OwnerLiveStatus {
+            pod_uid: e.pod_uid,
+            slot: slot as u16,
+            generation: e.generation,
+            ..OwnerLiveStatus::EMPTY
+        };
+        count += 1;
+    }
+    // Fold each module's state into its owning record. A stale stamp (owner
+    // slot reused at a newer generation) attributes to nobody — the module
+    // belongs to the previous occupant, not the current one.
+    let mut last_fault_ms = [0u64; MAX_OWNERS];
+    for idx in 0..MAX_MODULES {
+        let owner = module_owner(idx);
+        if owner.is_system() {
+            continue;
+        }
+        let Some(pos) = out[..count]
+            .iter()
+            .position(|r| r.slot == owner.slot && r.generation == owner.generation)
+        else {
+            continue;
+        };
+        let rec = &mut out[pos];
+        rec.modules_total += 1;
+        if !matches!(sched.modules[idx], ModuleSlot::Empty) {
+            rec.modules_loaded += 1;
+        }
+        let fi = &sched.fault_info[idx];
+        match fi.state {
+            FaultState::Terminated => {
+                rec.modules_terminated += 1;
+                if fi.last_fault_ms >= last_fault_ms[pos] {
+                    last_fault_ms[pos] = fi.last_fault_ms;
+                    rec.last_fault_kind = fi.last_fault_type;
+                }
+            }
+            FaultState::Faulted | FaultState::Recovering => {
+                rec.modules_recovering += 1;
+            }
+            FaultState::Running => {
+                if sched.finished[idx] {
+                    rec.modules_finished += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Test-only: force module `idx`'s fault state so status-aggregation tests
+/// can stage `Terminated`/`Recovering` modules without driving the full
+/// step-guard fault path (which requires a running step loop).
+#[doc(hidden)]
+pub fn force_module_fault_state_for_test(module_idx: usize, state: FaultState, fault_kind: u8) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    // SAFETY: single-threaded test context; module_idx bounded.
+    unsafe {
+        let p = &raw mut SCHED;
+        (*p).fault_info[module_idx].state = state;
+        (*p).fault_info[module_idx].last_fault_type = fault_kind;
+    }
+}
+
+/// Test-only: force module `idx`'s slot occupied (Dummy) or empty, so
+/// status-aggregation tests can stage loaded vs failed-instantiate modules.
+#[doc(hidden)]
+pub fn force_module_loaded_for_test(module_idx: usize, loaded: bool) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    // SAFETY: single-threaded test context; module_idx bounded.
+    unsafe {
+        let p = &raw mut SCHED;
+        (*p).modules[module_idx] = if loaded {
+            ModuleSlot::Dummy(DummyModule)
+        } else {
+            ModuleSlot::Empty
+        };
+    }
+}
+
+/// Test-only: force module `idx`'s `finished` flag (StepOutcome::Done).
+#[doc(hidden)]
+pub fn force_module_finished_for_test(module_idx: usize, finished: bool) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    // SAFETY: single-threaded test context; module_idx bounded.
+    unsafe {
+        let p = &raw mut SCHED;
+        (*p).finished[module_idx] = finished;
+    }
 }
 
 /// Request a graph rebuild. The per-platform main loop consumes the request

@@ -1,18 +1,21 @@
 //! `wasm_browser_action` built-in: browser-side semantic-action source.
 //!
-//! The presentation-shell overlay (`browser_overlay_runtime.js`) emits
-//! canonical `InputAction`s — `action.transport.toggle`,
-//! `action.gallery.next`, … (RFC browser_overlay §17.4) — when the user
-//! activates a media/transport/gallery control. This built-in is the
-//! kernel-side bridge: it drains the host action queue and translates
-//! the *canonical action vocabulary* into the *canonical FMP command
-//! vocabulary* (`next` / `prev` / `toggle` / `select`) that `bank` and
-//! other controllers already consume.
+//! The presentation-shell overlay (`browser_overlay_runtime.js`) emits an
+//! opaque, *application-chosen* `action` id — `next`, `toggle`, or any
+//! app-specific verb (RFC browser_overlay §17.4) — when the user
+//! activates a control. This built-in is the kernel-side conduit: it
+//! drains the host action queue and emits each action-id hash
+//! **unchanged** as the FMP command type. The *consumer* (a `bank`
+//! selector, a player, or any app module) decides what the hash means by
+//! matching it — Fluxor carries no vocabulary of its own here.
 //!
-//! That action→verb mapping is generic Fluxor knowledge (both
-//! vocabularies are Fluxor's own), not application meaning, so it lives
-//! here rather than in a per-app module — exactly as `gesture` owns the
-//! click-count→verb mapping for physical buttons.
+//! Keeping this a pure pass-through (rather than translating a fixed
+//! media/transport vocabulary into FMP verbs) is the point: an app that
+//! wants the generic selector verbs names its controls `next`/`prev`/
+//! `toggle` — those hash to `MSG_{NEXT,PREV,TOGGLE}` that `bank` matches —
+//! and an app with its own vocabulary names them whatever it likes and
+//! matches the same hash on the far side. See
+//! `abi::contracts::input::action` for the wire.
 //!
 //! Host shim contract: `host_action_pop(buf, len)` writes one 8-byte
 //! record per call — `[action_hash: u32 LE][value: f32 LE]` — or returns
@@ -26,8 +29,6 @@ use crate::kernel::{channel, scheduler, syscalls};
 extern "C" {
     fn host_action_pop(buf: *mut u8, len: usize) -> i32;
 }
-
-use crate::abi::contracts::input::action as dev_action;
 
 /// One host action record: hash + value, little-endian.
 const RECORD_LEN: usize = 8;
@@ -106,18 +107,19 @@ fn action_step(state: *mut u8) -> i32 {
             if n < RECORD_LEN as i32 {
                 break;
             }
-            let action_hash = u32::from_le_bytes([st.buf[0], st.buf[1], st.buf[2], st.buf[3]]);
-            // value (st.buf[4..8]) is unused for the empty-payload verbs.
-            let Some(verb) = dev_action::action_to_verb(action_hash) else {
-                continue; // no FMP equivalent — drop quietly.
-            };
-            // Emit a zero-payload FMP frame: [verb: u32 LE][len=0: u16].
+            // Pass the action-id hash through unchanged as the FMP command
+            // type — the consumer (bank/player/app module) matches it and
+            // decides what it means. value (st.buf[4..8]) is not forwarded:
+            // the FMP selector verbs (next/prev/toggle) are empty-payload,
+            // and forwarding a 4-byte payload would desync their framing at
+            // `bank`. A richer value-carrying consumer is a separate wire.
+            // st.buf[0..4] already holds action_hash in LE.
+            // Emit a zero-payload FMP frame: [action_hash: u32 LE][len=0: u16].
             let mut frame = [0u8; FMP_HDR_LEN];
-            let vb = verb.to_le_bytes();
-            frame[0] = vb[0];
-            frame[1] = vb[1];
-            frame[2] = vb[2];
-            frame[3] = vb[3];
+            frame[0] = st.buf[0];
+            frame[1] = st.buf[1];
+            frame[2] = st.buf[2];
+            frame[3] = st.buf[3];
             // frame[4..6] = payload_len = 0, already zeroed.
             let written = channel::channel_write(st.out_chan, frame.as_ptr(), FMP_HDR_LEN);
             if written != FMP_HDR_LEN as i32 {

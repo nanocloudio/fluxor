@@ -241,6 +241,15 @@ static mut LAST_APPLIED_GENERATION: u64 = 0;
 /// without a fresh staged blob. `None` until the first plan is applied.
 static mut RETAINED_PLAN: Option<DecodedPlan> = None;
 
+/// Generation of the last successfully-applied plan (0 = none yet). Lets the
+/// platform's owner-status writer stamp which plan generation the live state
+/// it reports came from (rfc_k8s.md §17.2 join key).
+pub fn last_applied_generation() -> u64 {
+    let p = &raw const LAST_APPLIED_GENERATION;
+    // SAFETY: scheduler-thread read (same access class as apply_staged).
+    unsafe { *p }
+}
+
 /// Stage a binary plan to be applied at the next `apply_staged`.
 ///
 /// # Safety

@@ -154,10 +154,10 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
 
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
     // Linux implements the full read-tier + the write-tier ops
-    // that already have opcode assignments (WRITE 0x0906 +
-    // FSYNC 0x0905, both wired in this dispatcher). The reserved
-    // bits (UNLINK / TRUNCATE / MKDIR / RENAME) stay 0 — those
-    // opcodes aren't assigned yet.
+    // that already have opcode assignments (WRITE 0x0906, FSYNC
+    // 0x0905, and UNLINK 0x090A). The remaining reserved bits
+    // (TRUNCATE / MKDIR / RENAME) stay 0 — those opcodes aren't
+    // assigned yet.
     if opcode == dev_fs::CAPS {
         if arg.is_null() || arg_len < 4 {
             return errno::EINVAL;
@@ -166,7 +166,8 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             | dev_fs::caps::OPENDIR
             | dev_fs::caps::OPEN_CREATE
             | dev_fs::caps::WRITE
-            | dev_fs::caps::FSYNC;
+            | dev_fs::caps::FSYNC
+            | dev_fs::caps::UNLINK;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -253,6 +254,18 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             files[slot_idx].in_use = true;
             files[slot_idx].last_fence = Fence::Volatile;
             tag_fd(FD_TAG_FS, slot_idx as i32)
+        }
+        dev_fs::UNLINK => {
+            let mut path_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+                return e;
+            }
+            let rc = libc::unlink(path_buf.as_ptr() as *const libc::c_char);
+            if rc < 0 {
+                -*libc::__errno_location()
+            } else {
+                errno::OK
+            }
         }
         dev_fs::READ => {
             let slot_idx = handle as usize;
@@ -550,6 +563,8 @@ const CONN_TYPE_UDP_BOUND: u8 = 2;
 /// the process stack — there is no stack-resident temporary of the full
 /// struct.
 const LINUX_NET_MAX_CONNS: usize = 128;
+/// Max distinct inbound command channels (priority lanes).
+const LINUX_NET_MAX_INBOUND: usize = 8;
 /// Per-connection write backlog. Sized to hold a full Spectrum video
 /// frame's worth of WS fragments (~98 KB) so a slow peer can absorb one
 /// frame's transmission pause without the producer overflowing the
@@ -601,7 +616,15 @@ impl LinuxNetConn {
 /// a state-aliasing one. Per-instance ownership matches the rest of
 /// the host built-in family and makes the dispatch path uniform.
 struct LinuxNetState {
-    net_in: i32,
+    /// Inbound command channels, drained in INDEX ORDER each step —
+    /// index = the edge's position among `to: linux_net.net_in` lines
+    /// in the graph wiring, so earlier edges are higher priority.
+    /// Each producer gets its OWN channel: frame atomicity is
+    /// per-channel, the drain order is an explicit priority lane, and
+    /// a bulk flood on one lane (a web stream) cannot serialise ahead
+    /// of latency-critical traffic on another (Raft heartbeats racing
+    /// an election timeout).
+    net_ins: [i32; LINUX_NET_MAX_INBOUND],
     net_out: i32,
     conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
     /// Sized to absorb a full multi-MSS `CMD_SEND` payload. The
@@ -636,7 +659,7 @@ impl LinuxNetState {
     /// `Box::new_uninit` and initialising fields in place never puts the
     /// full struct on the stack (each `LinuxNetConn::EMPTY` write is one
     /// slot at a time).
-    fn new(net_in: i32, net_out: i32) -> Box<Self> {
+    fn new(net_ins: [i32; LINUX_NET_MAX_INBOUND], net_out: i32) -> Box<Self> {
         let mut b: Box<core::mem::MaybeUninit<Self>> = Box::new_uninit();
         let p = b.as_mut_ptr();
         // SAFETY: `p` points at the freshly-allocated, uninitialised Box
@@ -644,7 +667,7 @@ impl LinuxNetState {
         // `assume_init`, and the pointer is valid + aligned for `Self`.
         unsafe {
             use core::ptr::addr_of_mut;
-            addr_of_mut!((*p).net_in).write(net_in);
+            addr_of_mut!((*p).net_ins).write(net_ins);
             addr_of_mut!((*p).net_out).write(net_out);
             let conns = addr_of_mut!((*p).conns) as *mut LinuxNetConn;
             for i in 0..LINUX_NET_MAX_CONNS {
@@ -1516,110 +1539,116 @@ fn linux_net_step(state: *mut u8) -> i32 {
             had_work = true;
         }
 
-        if !heavy_pending && st.net_in >= 0 {
-            loop {
-                let mut hdr = [0u8; 3];
-                let n = channel::channel_read(st.net_in, hdr.as_mut_ptr(), 3);
-                if n < 3 {
-                    break;
-                }
-                let msg_type = hdr[0];
-                let payload_len = (hdr[1] as u16 | ((hdr[2] as u16) << 8)) as usize;
-                if payload_len > st.cmd_buf.len() {
-                    // Oversized command (a consumer exceeding MAX_CMD_DATA). The
-                    // body would NOT fit our scratch; DRAIN it from the FIFO so
-                    // the next read starts on a real header, then skip the frame
-                    // rather than parsing stale cmd_buf bytes mid-stream.
-                    let mut left = payload_len;
-                    let mut scratch = [0u8; 1024];
-                    while left > 0 {
-                        let take = left.min(scratch.len());
-                        let got = channel::channel_read(st.net_in, scratch.as_mut_ptr(), take);
-                        if got <= 0 {
-                            break;
-                        }
-                        left -= got as usize;
-                    }
-                    log::warn!("[linux_net] oversized command frame ({payload_len} B) dropped");
+        if !heavy_pending {
+            for lane in 0..LINUX_NET_MAX_INBOUND {
+                let lane_ch = st.net_ins[lane];
+                if lane_ch < 0 {
                     continue;
                 }
-                if payload_len > 0 {
-                    let n2 = channel::channel_read(st.net_in, st.cmd_buf.as_mut_ptr(), payload_len);
-                    if n2 < payload_len as i32 {
+                loop {
+                    let mut hdr = [0u8; 3];
+                    let n = channel::channel_read(lane_ch, hdr.as_mut_ptr(), 3);
+                    if n < 3 {
                         break;
                     }
-                }
+                    let msg_type = hdr[0];
+                    let payload_len = (hdr[1] as u16 | ((hdr[2] as u16) << 8)) as usize;
+                    if payload_len > st.cmd_buf.len() {
+                        // Oversized command (a consumer exceeding MAX_CMD_DATA). The
+                        // body would NOT fit our scratch; DRAIN it from the FIFO so
+                        // the next read starts on a real header, then skip the frame
+                        // rather than parsing stale cmd_buf bytes mid-stream.
+                        let mut left = payload_len;
+                        let mut scratch = [0u8; 1024];
+                        while left > 0 {
+                            let take = left.min(scratch.len());
+                            let got = channel::channel_read(lane_ch, scratch.as_mut_ptr(), take);
+                            if got <= 0 {
+                                break;
+                            }
+                            left -= got as usize;
+                        }
+                        log::warn!("[linux_net] oversized command frame ({payload_len} B) dropped");
+                        continue;
+                    }
+                    if payload_len > 0 {
+                        let n2 = channel::channel_read(lane_ch, st.cmd_buf.as_mut_ptr(), payload_len);
+                        if n2 < payload_len as i32 {
+                            break;
+                        }
+                    }
 
-                match msg_type {
-                    CMD_BIND if payload_len >= 2 => {
-                        let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                        linux_net_cmd_bind(st, port);
-                        had_work = true;
-                    }
-                    CMD_CONNECT if payload_len >= 7 => {
-                        let sock_type = st.cmd_buf[0];
-                        let ip = u32::from_le_bytes([
-                            st.cmd_buf[1],
-                            st.cmd_buf[2],
-                            st.cmd_buf[3],
-                            st.cmd_buf[4],
-                        ]);
-                        let port = u16::from_le_bytes([st.cmd_buf[5], st.cmd_buf[6]]);
-                        // Optional trailing requester tag (8-byte form), echoed in
-                        // MSG_CONNECTED / MSG_ERROR for fanned-net_out routing.
-                        let tag = if payload_len >= 8 { st.cmd_buf[7] } else { 0 };
-                        linux_net_cmd_connect(st, sock_type, ip, port, tag);
-                        had_work = true;
-                    }
-                    CMD_SEND if payload_len >= 2 => {
-                        let conn_id = st.cmd_buf[0];
-                        let data_len = payload_len - 1;
-                        let data_slice =
-                            core::slice::from_raw_parts(st.cmd_buf.as_ptr().add(1), data_len);
-                        linux_net_cmd_send(st, conn_id, data_slice);
-                        had_work = true;
-                    }
-                    CMD_CLOSE if payload_len >= 1 => {
-                        let conn_id = st.cmd_buf[0];
-                        linux_net_cmd_close(st, conn_id);
-                        had_work = true;
-                    }
-                    DG_CMD_BIND if payload_len >= 3 => {
-                        // Payload (modules/sdk/contracts/net/datagram.rs):
-                        //   [port: u16 LE] [flags: u8].
-                        let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                        linux_net_dg_cmd_bind(st, port);
-                        had_work = true;
-                    }
-                    DG_CMD_SEND_TO if payload_len >= 8 => {
-                        // IPv4 payload (datagram contract):
-                        //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...].
-                        let ep = st.cmd_buf[0] as i16;
-                        let ip = [
-                            st.cmd_buf[2],
-                            st.cmd_buf[3],
-                            st.cmd_buf[4],
-                            st.cmd_buf[5],
-                        ];
-                        let port = u16::from_le_bytes([st.cmd_buf[6], st.cmd_buf[7]]);
-                        let data_len = payload_len - 8;
-                        let data = core::slice::from_raw_parts(
-                            st.cmd_buf.as_ptr().add(8),
-                            data_len,
-                        );
-                        linux_net_dg_cmd_send_to(st, ep, ip, port, data);
-                        had_work = true;
-                    }
-                    DG_CMD_CLOSE if payload_len >= 1 => {
-                        // Payload: [ep_id: u8].
-                        let ep = st.cmd_buf[0] as i16;
-                        linux_net_dg_cmd_close(st, ep);
-                        had_work = true;
-                    }
-                    _ => {
-                        log::warn!(
-                            "[linux_net] unknown cmd 0x{msg_type:02x} pl={payload_len}"
-                        );
+                    match msg_type {
+                        CMD_BIND if payload_len >= 2 => {
+                            let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                            linux_net_cmd_bind(st, port);
+                            had_work = true;
+                        }
+                        CMD_CONNECT if payload_len >= 7 => {
+                            let sock_type = st.cmd_buf[0];
+                            let ip = u32::from_le_bytes([
+                                st.cmd_buf[1],
+                                st.cmd_buf[2],
+                                st.cmd_buf[3],
+                                st.cmd_buf[4],
+                            ]);
+                            let port = u16::from_le_bytes([st.cmd_buf[5], st.cmd_buf[6]]);
+                            // Optional trailing requester tag (8-byte form), echoed in
+                            // MSG_CONNECTED / MSG_ERROR for fanned-net_out routing.
+                            let tag = if payload_len >= 8 { st.cmd_buf[7] } else { 0 };
+                            linux_net_cmd_connect(st, sock_type, ip, port, tag);
+                            had_work = true;
+                        }
+                        CMD_SEND if payload_len >= 2 => {
+                            let conn_id = st.cmd_buf[0];
+                            let data_len = payload_len - 1;
+                            let data_slice =
+                                core::slice::from_raw_parts(st.cmd_buf.as_ptr().add(1), data_len);
+                            linux_net_cmd_send(st, conn_id, data_slice);
+                            had_work = true;
+                        }
+                        CMD_CLOSE if payload_len >= 1 => {
+                            let conn_id = st.cmd_buf[0];
+                            linux_net_cmd_close(st, conn_id);
+                            had_work = true;
+                        }
+                        DG_CMD_BIND if payload_len >= 3 => {
+                            // Payload (modules/sdk/contracts/net/datagram.rs):
+                            //   [port: u16 LE] [flags: u8].
+                            let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
+                            linux_net_dg_cmd_bind(st, port);
+                            had_work = true;
+                        }
+                        DG_CMD_SEND_TO if payload_len >= 8 => {
+                            // IPv4 payload (datagram contract):
+                            //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...].
+                            let ep = st.cmd_buf[0] as i16;
+                            let ip = [
+                                st.cmd_buf[2],
+                                st.cmd_buf[3],
+                                st.cmd_buf[4],
+                                st.cmd_buf[5],
+                            ];
+                            let port = u16::from_le_bytes([st.cmd_buf[6], st.cmd_buf[7]]);
+                            let data_len = payload_len - 8;
+                            let data = core::slice::from_raw_parts(
+                                st.cmd_buf.as_ptr().add(8),
+                                data_len,
+                            );
+                            linux_net_dg_cmd_send_to(st, ep, ip, port, data);
+                            had_work = true;
+                        }
+                        DG_CMD_CLOSE if payload_len >= 1 => {
+                            // Payload: [ep_id: u8].
+                            let ep = st.cmd_buf[0] as i16;
+                            linux_net_dg_cmd_close(st, ep);
+                            had_work = true;
+                        }
+                        _ => {
+                            log::warn!(
+                                "[linux_net] unknown cmd 0x{msg_type:02x} pl={payload_len}"
+                            );
+                        }
                     }
                 }
             }

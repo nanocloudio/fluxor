@@ -137,16 +137,18 @@ pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
         return Err("presentation.shell.version must be 1".to_string());
     }
 
-    // §19.1: media_profile recognized (or `custom`); context recognized.
+    // §19.1: media_profile is an APP-SUPPLIED hint, not a Fluxor taxonomy —
+    // a resolver/renderer may use it to tune layout, but the substrate does
+    // not enumerate app domains. Any non-empty string is accepted;
+    // `MEDIA_PROFILES` lists the well-known values a media app is likely to
+    // use (kept for docs/tooling hints, not as a gate). Context IS a
+    // Fluxor concept and stays validated below.
     let profile = shell
         .get("media_profile")
         .and_then(|v| v.as_str())
         .unwrap_or("custom");
-    if !MEDIA_PROFILES.contains(&profile) {
-        return Err(format!(
-            "presentation.shell.media_profile `{profile}` is not recognized \
-             (expected one of {MEDIA_PROFILES:?})"
-        ));
+    if profile.is_empty() {
+        return Err("presentation.shell.media_profile must be a non-empty string".to_string());
     }
     if let Some(ctx) = shell.get("context").and_then(|v| v.as_str()) {
         if !CONTEXTS.contains(&ctx) {

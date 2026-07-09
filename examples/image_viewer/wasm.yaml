@@ -80,18 +80,18 @@ presentation:
   # Both input paths drive `bank`: the existing DOM-tap nav
   # (nav → gesture → bank) AND these overlay controls
   # (overlay → actionnav → bank), fanned in on `bank.commands`. The
-  # Prev/Next controls emit `action.gallery.*` InputActions which
-  # `wasm_browser_action` (the `actionnav` module below) maps to FMP
-  # next/prev.
+  # Prev/Next controls are named with the bare `prev`/`next` verbs;
+  # `wasm_browser_action` (the `actionnav` module below) passes each
+  # action-id hash through unchanged, and those hash to bank's next/prev.
   shell:
     version: 1
     media_profile: gallery
     context: active
     controls:
       - { id: prev, kind: button, placement: primary_start, label: "‹ Prev",
-          action: action.gallery.previous, a11y: { label: Previous image } }
+          action: prev, a11y: { label: Previous image } }
       - { id: next, kind: button, placement: primary_end, label: "Next ›",
-          action: action.gallery.next, a11y: { label: Next image } }
+          action: next, a11y: { label: Next image } }
       - { id: index, kind: status, placement: above_content, field: title }
 
   browser_overlay:
@@ -120,7 +120,7 @@ modules:
     triple_click: prev
 
   # Browser-overlay action source: the shell's Prev/Next gallery
-  # controls → `action.gallery.*` → FMP next/prev → bank. Fans in with
+  # controls (`prev`/`next`) → pass-through hash → bank. Fans in with
   # `gesture` on `bank.commands` (the kernel inserts a `_merge`), so
   # both DOM taps and overlay buttons navigate.
   - name: actionnav

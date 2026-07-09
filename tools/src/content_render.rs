@@ -20,8 +20,12 @@ pub struct Rect {
     pub h: u16,
 }
 
-/// The glyph drawn on a control — transport icons cover the common media panel;
-/// `Generic` is a plain filled button for anything else.
+/// A small built-in glyph set the renderer can draw without a font — the
+/// irreducible primitives (like the 5×7 font) that any panel may reuse.
+/// `Generic` is a plain filled button; the rest are convenience glyphs a
+/// control may opt into. The renderer is glyph-agnostic — it draws
+/// whatever `Icon` a control carries and ascribes no meaning to it; the
+/// *action* the control emits is what actually drives the app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Play,
@@ -32,7 +36,10 @@ pub enum Icon {
     Generic,
 }
 
-/// Map a canonical `action.*` id (or FMP verb) to a transport icon.
+/// Convenience heuristic: pick a built-in glyph from an action id by
+/// substring, so a control named `toggle`/`next`/`prev`/… gets a fitting
+/// glyph for free. Purely cosmetic — an app that wants a specific glyph
+/// can select one directly, and anything unrecognised draws `Generic`.
 pub fn icon_for_action(action: &str) -> Icon {
     if action.contains("toggle") || action.ends_with(".play") {
         Icon::Play
@@ -59,30 +66,6 @@ pub fn icon_code(icon: Icon) -> u8 {
         Icon::Prev => 3,
         Icon::Stop => 4,
         Icon::Generic => 5,
-    }
-}
-
-/// Map a canonical `action.*` id to the short FMP transport verb a content
-/// control emits on tap — the same vocabulary `gesture` produces, so it drives a
-/// `bank`/player identically. EXACT-matches the canonical `action.transport.*`
-/// ids (not a substring test): `action.gallery.next` is NOT transport `next`,
-/// and the idempotent `play`/`pause` are NOT folded into the flip-semantics
-/// `toggle`. Returns `None` for anything outside this set — content_controls
-/// then rejects it (a control it can't actuate) rather than emitting a wrong or
-/// unsupported verb.
-///
-/// The set is exactly the verbs the canonical action bridge
-/// (`abi::contracts::input::action::action_to_verb`) resolves AND a `bank`
-/// consumer handles end-to-end (`next`/`prev`/`toggle`). `stop` is deliberately
-/// absent: there is no `action.transport.stop` mapping in the bridge and no
-/// `bank` handler for it, so certifying it would let the same shell action drive
-/// a host overlay one way and a content panel another (or silently no-op).
-pub fn verb_for_action(action: &str) -> Option<&'static str> {
-    match action {
-        "action.transport.next" => Some("next"),
-        "action.transport.previous" => Some("prev"),
-        "action.transport.toggle" => Some("toggle"),
-        _ => None,
     }
 }
 

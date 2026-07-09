@@ -18,7 +18,8 @@ use fluxor_tools::compose::{
 };
 use fluxor_tools::genstore::{FsStorage, GenStore};
 use fluxor_tools::node_agent::{
-    node_status, publish_committed_plan, remove_pod_and_commit, upsert_pod_and_commit,
+    node_status_with_runtime, publish_committed_plan, record_publish_path, remove_pod_and_commit,
+    upsert_pod_and_commit, PodRuntimeStatus, RuntimePhase,
 };
 use fluxor_tools::workload::{
     parse_manifest, parse_resource_profile, select_implementation, validate,
@@ -226,7 +227,8 @@ fn status(a: StatusArgs) -> Result<()> {
     let storage = FsStorage::open(&a.store)
         .map_err(|e| Error::Config(format!("open store {}: {e}", a.store.display())))?;
     let store = GenStore::new(storage);
-    let st = node_status(&store).map_err(|e| Error::Config(format!("status failed: {e:?}")))?;
+    let st = node_status_with_runtime(&store)
+        .map_err(|e| Error::Config(format!("status failed: {e:?}")))?;
     if a.json {
         println!(
             "{}",
@@ -247,13 +249,13 @@ fn status(a: StatusArgs) -> Result<()> {
         _ => println!("abi-surface {}", st.abi_surface),
     }
     println!(
-        "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6}",
-        "POD-UID", "NAME", "NAMESPACE", "PHASE", "SLOT", "GEN", "MODULES", "EDGES"
+        "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6} {:<24}",
+        "POD-UID", "NAME", "NAMESPACE", "PHASE", "SLOT", "GEN", "MODULES", "EDGES", "RUNTIME"
     );
     for p in &st.pods {
         let dash = || "-".to_string();
         println!(
-            "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6}",
+            "{:<32} {:<16} {:<10} {:<8} {:<5} {:<5} {:<8} {:<6} {:<24}",
             p.pod_uid_hex,
             p.name,
             p.namespace,
@@ -264,9 +266,27 @@ fn status(a: StatusArgs) -> Result<()> {
                 .unwrap_or_else(dash),
             p.modules.map(|v| v.to_string()).unwrap_or_else(dash),
             p.edges.map(|v| v.to_string()).unwrap_or_else(dash),
+            runtime_column(p.runtime.as_ref()),
         );
     }
     Ok(())
+}
+
+/// Human-readable summary of the live runtime state for the table output
+/// ("-" when the runtime isn't up; the JSON form carries the full object).
+fn runtime_column(rt: Option<&PodRuntimeStatus>) -> String {
+    let Some(rt) = rt else {
+        return "-".to_string();
+    };
+    match rt.phase {
+        RuntimePhase::Running if rt.ready => format!("Running(ready) x{}", rt.restart_count),
+        RuntimePhase::Running => format!("Running(unready) x{}", rt.restart_count),
+        RuntimePhase::Activating => "Activating".to_string(),
+        RuntimePhase::Terminated => match &rt.terminated {
+            Some(t) => format!("Terminated({:?}, exit {})", t.reason, t.exit_code),
+            None => "Terminated".to_string(),
+        },
+    }
 }
 
 fn remove(r: RemoveArgs) -> Result<()> {
@@ -279,6 +299,8 @@ fn remove(r: RemoveArgs) -> Result<()> {
         .map_err(|e| Error::Config(format!("remove/recompose failed: {e:?}")))?;
     publish_committed_plan(&store, &r.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?;
+    // Best-effort: status still works without it, just without live state.
+    let _ = record_publish_path(&mut store, &r.publish);
     println!("gen {} pods {}", gen, plan.assignments.len());
     Ok(())
 }
@@ -319,6 +341,10 @@ fn commit(c: CommitArgs) -> Result<()> {
     publish_committed_plan(&store, &c.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?
         .ok_or_else(|| Error::Config("no committed generation after commit".into()))?;
+    // Remember the publish location so `agent status` can find the runtime's
+    // owner_status.json beside it. Best-effort: status still works without
+    // it, just without live state.
+    let _ = record_publish_path(&mut store, &c.publish);
 
     // The workload handle the orchestrator tracks (rfc_k8s.md §7.2).
     println!(

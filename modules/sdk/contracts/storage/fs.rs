@@ -101,6 +101,14 @@ pub const READDIR: u32 = 0x0908;
 /// succeed.
 pub const OPEN_CREATE: u32 = 0x0909;
 
+/// Remove a filesystem entry by path.
+///
+/// `handle = -1`; `arg` points at the UTF-8 path without a NUL terminator and
+/// `arg_len` is its byte length. Returns `0` on success or a negative errno.
+/// Providers that do not support mutation return `ENOSYS` and leave
+/// [`caps::UNLINK`] clear.
+pub const UNLINK: u32 = 0x090A;
+
 /// FS provider capability bitmap. `provider_call(handle, CAPS,
 /// out, out_len)` writes a `u32` (little-endian, 4 bytes) into
 /// `out`.
@@ -180,10 +188,9 @@ pub mod caps {
     /// the bit is the discovery channel.
     pub const FSYNC:          u32 = 1 << 4;
 
-    // Reserved — no opcodes assigned yet; providers MUST return
-    // 0 until a future revision lands both the opcode and the
-    // implementation in lockstep across the listed providers.
-    /// Reserved for `UNLINK` (planned 0x090A).
+    // Unimplemented capability bits remain clear until their opcode and
+    // provider implementations land in lockstep.
+    /// [`UNLINK`] (0x090A) — remove a file by path.
     pub const UNLINK:         u32 = 1 << 5;
     /// Reserved for `TRUNCATE` (planned 0x090B).
     pub const TRUNCATE:       u32 = 1 << 6;
