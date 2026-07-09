@@ -54,6 +54,33 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // rp2350 / cm5).
     "midi.input",
     "midi.output",
+    // Transport surfaces + continuity roles (protocol_surfaces.md,
+    // capability_surface.md §Transport Surface / §Continuity Role;
+    // validated as graph structure by the `continuity` config block,
+    // rfc_protocols.md §7.3 / §9).
+    "transport.stream",
+    "transport.stream.tcp",
+    "transport.stream.secure",
+    "transport.datagram",
+    "transport.datagram.udp",
+    "transport.datagram.secure",
+    "transport.mux",
+    "transport.mux.quic",
+    "transport.packet",
+    "transport.anchor.stream",
+    "transport.anchor.stream.secure",
+    "transport.anchor.datagram",
+    "transport.anchor.mux",
+    "session.worker",
+    "session.directory",
+    "session.resume",
+    "session.handoff",
+    "session.reservation",
+    "security.tls13.stream",
+    "security.dtls13.datagram",
+    "security.key_wrap",
+    "fence.enforceable",
+    "durable.rpo_zero",
 ];
 
 /// Canonical provider-contract names accepted in

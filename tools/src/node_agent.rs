@@ -977,7 +977,10 @@ mod tests {
         .unwrap();
 
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none(), "cross-generation join refused");
+        assert!(
+            st.pods[0].runtime.is_none(),
+            "cross-generation join refused"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1005,7 +1008,10 @@ mod tests {
         )
         .unwrap();
         let st = node_status_with_runtime(&store).unwrap();
-        assert!(st.pods[0].runtime.is_none(), "owner-generation mismatch refused");
+        assert!(
+            st.pods[0].runtime.is_none(),
+            "owner-generation mismatch refused"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -4732,6 +4732,35 @@ fn validate_wiring_types(
 
 const CUTOVER_POLICIES: &[&str] = &["boundary_cut", "resumable", "anchor_preserved"];
 const CONTINUITY_POLICIES: &[&str] = &["drain", "anchor_preserved"];
+
+/// The five session continuity classes (rfc_protocols.md §7.1,
+/// `protocol_surfaces.md`). Distinct from the AV `continuity_policy`
+/// enum above, which governs presentation-group cutover only.
+const CONTINUITY_CLASSES: &[&str] = &[
+    "reroutable",
+    "drain_only",
+    "resumable",
+    "edge_anchored",
+    "transport_migratable",
+];
+
+/// `transport_migratable` migration mechanisms (rfc_protocols.md §7.1).
+const MIGRATION_MECHANISMS: &[&str] = &["native_primitive", "platform_replicated_state"];
+
+/// AEAD classes for platform-replicated-state migration
+/// (rfc_protocols.md §13.7.2).
+const AEAD_CLASSES: &[&str] = &["on_wire_sequence", "implicit_counter", "unencrypted"];
+
+/// Capabilities every platform-replicated-state `transport_migratable`
+/// declaration must resolve somewhere in the graph (§9.2 / §13.7.6
+/// R1–R5 as structure). Presence, not fault-correctness — R-invariants
+/// are proven by test, the timing budget by measurement.
+const PRS_REQUIRED_CAPS: &[&str] = &[
+    "session.reservation",
+    "security.key_wrap",
+    "fence.enforceable",
+    "durable.rpo_zero",
+];
 const MIRROR_POLICIES: &[&str] = &["independent", "strict_mirror", "partition"];
 const AUDIO_SINK_CAPS: &[&str] = &["audio.sample", "audio.encoded"];
 const VIDEO_SINK_CAPS: &[&str] = &["video.raster", "video.scanout", "video.encoded"];
@@ -4956,6 +4985,317 @@ pub fn validate_presentation_groups(
                     )));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// True when a module's declared capability satisfies `wanted` under
+/// the parent-matches-child rule (`capability_surface.md`): an exact
+/// match, or a declared child of the wanted parent
+/// (`transport.anchor.stream` satisfies `transport.anchor`). The
+/// reverse never holds, and `.secure` variants are ordinary children —
+/// security orthogonality is enforced by *which* name is wanted.
+fn cap_satisfies(declared: &str, wanted: &str) -> bool {
+    declared == wanted
+        || (declared.len() > wanted.len()
+            && declared.starts_with(wanted)
+            && declared.as_bytes()[wanted.len()] == b'.')
+}
+
+/// Validate the optional top-level `continuity` block — session
+/// continuity classes as a validated graph property (rfc_protocols.md
+/// §7.3; `protocol_surfaces.md` §Continuity Classes). Compile-time
+/// only; no binary representation in the compiled config.
+///
+/// ```yaml
+/// continuity:
+///   - id: echo_edge
+///     class: edge_anchored          # one of the five classes
+///     anchor: echo_anchor           # module owning client transport
+///     workers: [echo_worker]        # movable session workers
+///     directory: session_dir        # placement metadata service
+///     # transport_migratable only:
+///     mechanism: platform_replicated_state
+///     aead: on_wire_sequence        # platform_replicated_state only
+///     failover_budget_ms: 8000      # declared worst-case sum (§12.4)
+///     client_keepalive_ms: 20000    # deployed client's timeout
+/// ```
+///
+/// The checks are *structural* (§7.3): the required roles and
+/// capabilities exist in the graph. What cannot be checked here —
+/// whether the failover budget actually fits under the client
+/// keepalive at runtime, or whether R1–R5 hold under fault — is a
+/// measured/tested gate, not a static one. The validator still rejects
+/// a declared budget that is not below the declared keepalive, since a
+/// declaration that fails on its own constants cannot pass measurement.
+pub fn validate_continuity(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    let block = match config.get("continuity") {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let list = block
+        .as_array()
+        .ok_or_else(|| Error::Config("continuity must be a list".into()))?;
+
+    let manifest_caps = |name: &str| -> &[String] {
+        manifests
+            .get(name)
+            .map(|m| m.capabilities.as_slice())
+            .unwrap_or(&[])
+    };
+    let module_has = |name: &str, wanted: &str| -> bool {
+        manifest_caps(name).iter().any(|c| cap_satisfies(c, wanted))
+    };
+    let graph_has = |wanted: &str| -> bool { module_names.iter().any(|m| module_has(m, wanted)) };
+
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (gi, g) in list.iter().enumerate() {
+        let id = g
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Config(format!("continuity[{gi}]: required field `id` missing")))?
+            .to_string();
+        if !seen_ids.insert(id.clone()) {
+            return Err(Error::Config(format!("continuity: duplicate id `{id}`")));
+        }
+        let err = |msg: String| Error::Config(format!("continuity `{id}`: {msg}"));
+
+        let class = g
+            .get("class")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| err("required field `class` missing".into()))?;
+        if !CONTINUITY_CLASSES.contains(&class) {
+            return Err(err(format!(
+                "class `{}` is invalid (expected {})",
+                class,
+                CONTINUITY_CLASSES.join(" | ")
+            )));
+        }
+
+        // Member resolution — every named module must exist.
+        let anchor = g.get("anchor").and_then(|v| v.as_str());
+        let directory = g.get("directory").and_then(|v| v.as_str());
+        let workers: Vec<&str> = g
+            .get("workers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|w| w.as_str()).collect())
+            .unwrap_or_default();
+        for m in anchor.iter().chain(directory.iter()).chain(workers.iter()) {
+            if !module_names.iter().any(|n| n == m) {
+                return Err(err(format!("unknown module `{m}`")));
+            }
+        }
+
+        // Mechanism / AEAD fields only mean something on
+        // transport_migratable — a declaration on a weaker class is a
+        // mis-statement, not decoration (selection policy §9.5).
+        let mechanism = g.get("mechanism").and_then(|v| v.as_str());
+        let aead = g.get("aead").and_then(|v| v.as_str());
+        if class != "transport_migratable" {
+            if mechanism.is_some() {
+                return Err(err(format!(
+                    "`mechanism` is only valid with class transport_migratable (class is `{class}`)"
+                )));
+            }
+            if aead.is_some() {
+                return Err(err(format!(
+                    "`aead` is only valid with class transport_migratable (class is `{class}`)"
+                )));
+            }
+        }
+
+        match class {
+            // No structural obligations: flows may drop / drain.
+            "reroutable" | "drain_only" => {}
+
+            // §7.3: resumption state must exist somewhere in the
+            // declared member set.
+            "resumable" => {
+                let members: Vec<&str> = anchor.iter().chain(workers.iter()).copied().collect();
+                if members.is_empty() {
+                    return Err(err(
+                        "class resumable needs at least one member (`anchor` or `workers`) \
+                         declaring `session.resume`"
+                            .into(),
+                    ));
+                }
+                if !members.iter().any(|m| module_has(m, "session.resume")) {
+                    return Err(err(
+                        "class resumable but no declared member provides `session.resume`".into(),
+                    ));
+                }
+            }
+
+            // §7.3: a transport anchor must exist; workers are the
+            // movable half and must be declared as such. With more
+            // than one worker (a swap target) the workers must also
+            // support opaque export/import handoff (§13.1).
+            "edge_anchored" => {
+                let a = anchor
+                    .ok_or_else(|| err("class edge_anchored requires an `anchor` module".into()))?;
+                if !module_has(a, "transport.anchor") {
+                    return Err(err(format!(
+                        "anchor `{a}` does not declare a `transport.anchor.*` capability \
+                         (add it to the module's manifest, or pick a module that does)"
+                    )));
+                }
+                if workers.is_empty() {
+                    return Err(err(
+                        "class edge_anchored requires at least one `workers` entry".into(),
+                    ));
+                }
+                for w in &workers {
+                    if !module_has(w, "session.worker") {
+                        return Err(err(format!(
+                            "worker `{w}` does not declare `session.worker`"
+                        )));
+                    }
+                }
+                if workers.len() > 1 {
+                    for w in &workers {
+                        if !module_has(w, "session.handoff") {
+                            return Err(err(format!(
+                                "multiple workers declared (anchor-preserved swap) but worker \
+                                 `{w}` does not declare `session.handoff`"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // §7.3: the mechanism decides the obligations.
+            "transport_migratable" => {
+                let mech = mechanism.ok_or_else(|| {
+                    err(format!(
+                        "class transport_migratable requires `mechanism` (one of {})",
+                        MIGRATION_MECHANISMS.join(" | ")
+                    ))
+                })?;
+                if !MIGRATION_MECHANISMS.contains(&mech) {
+                    return Err(err(format!(
+                        "mechanism `{}` is invalid (expected {})",
+                        mech,
+                        MIGRATION_MECHANISMS.join(" | ")
+                    )));
+                }
+                match mech {
+                    "native_primitive" => {
+                        // The wire protocol itself carries migration —
+                        // a natively-migratable mux transport must be
+                        // present (e.g. transport.mux.quic).
+                        if !graph_has("transport.mux") {
+                            return Err(err(
+                                "mechanism native_primitive but no module in the graph \
+                                 provides a `transport.mux.*` transport"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    "platform_replicated_state" => {
+                        // AEAD class decides whether the class is even
+                        // reachable (§13.7.2): implicit-contiguous
+                        // counters cannot skip forward — their honest
+                        // ceiling is resumable-with-seamless-state.
+                        let ac = aead.ok_or_else(|| {
+                            err(format!(
+                                "mechanism platform_replicated_state requires `aead` \
+                                 (one of {})",
+                                AEAD_CLASSES.join(" | ")
+                            ))
+                        })?;
+                        if !AEAD_CLASSES.contains(&ac) {
+                            return Err(err(format!(
+                                "aead `{}` is invalid (expected {})",
+                                ac,
+                                AEAD_CLASSES.join(" | ")
+                            )));
+                        }
+                        if ac == "implicit_counter" {
+                            return Err(err(
+                                "aead implicit_counter cannot reach transport_migratable: \
+                                 an implicit-contiguous AEAD counter cannot skip forward on \
+                                 takeover (rfc_protocols.md §13.7.2). Declare class \
+                                 `resumable` — seamless-state resume is this transport's \
+                                 honest ceiling"
+                                    .into(),
+                            ));
+                        }
+
+                        // Anchor + single-writer directory are the
+                        // mechanism's backbone.
+                        let a = anchor.ok_or_else(|| {
+                            err("platform_replicated_state requires an `anchor` module".into())
+                        })?;
+                        if !module_has(a, "transport.anchor.datagram") {
+                            return Err(err(format!(
+                                "anchor `{a}` does not declare `transport.anchor.datagram` \
+                                 (platform-replicated-state migration is defined for \
+                                 fully-owned datagram transports)"
+                            )));
+                        }
+                        let d = directory.ok_or_else(|| {
+                            err("platform_replicated_state requires a `directory` module \
+                                 (single-writer authority per session generation)"
+                                .into())
+                        })?;
+                        if !module_has(d, "session.directory") {
+                            return Err(err(format!(
+                                "directory `{d}` does not declare `session.directory`"
+                            )));
+                        }
+
+                        // §9.2 / §13.7.6 structural requirements R1–R5.
+                        for cap in PRS_REQUIRED_CAPS {
+                            if !graph_has(cap) {
+                                return Err(err(format!(
+                                    "platform_replicated_state requires a `{cap}` provider \
+                                     in the graph (rfc_protocols.md §13.7.6); without it the \
+                                     honest class is resumable"
+                                )));
+                            }
+                        }
+
+                        // §12.4: the budget is declared here and PROVEN
+                        // by measurement (Phase 7 failover-latency test).
+                        // A declaration that fails on its own constants
+                        // can be rejected statically.
+                        let budget = g
+                            .get("failover_budget_ms")
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                err("platform_replicated_state requires \
+                                         `failover_budget_ms` (declared worst-case \
+                                         detect+fence+VIP-move+resume sum, §12.4)"
+                                    .into())
+                            })?;
+                        let keepalive = g
+                            .get("client_keepalive_ms")
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                err("platform_replicated_state requires \
+                                     `client_keepalive_ms` (the deployed client's \
+                                     transport timeout, §12.4)"
+                                    .into())
+                            })?;
+                        if budget >= keepalive {
+                            return Err(err(format!(
+                                "failover_budget_ms ({budget}) must be strictly below \
+                                 client_keepalive_ms ({keepalive}) — a budget that does not \
+                                 fit under the client's timeout cannot deliver invisible \
+                                 failover; declare class resumable instead"
+                            )));
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
         }
     }
     Ok(())
@@ -5788,6 +6128,11 @@ fn generate_config_impl(
     // `standalone: true` opt-in lands so the check can be precise.)
 
     validate_presentation_groups(config, &module_names, &manifests)?;
+
+    // Session continuity classes as a validated graph property
+    // (rfc_protocols.md §7.3). Graphs without a `continuity` block are
+    // unaffected.
+    validate_continuity(config, &module_names, &manifests)?;
 
     // Presentation-shell / browser-overlay descriptor validation
     // (RFC browser_overlay §19). Scenarios without a `presentation.shell`
@@ -8422,5 +8767,219 @@ mod module_discovery_tests {
             paths.contains(&install_modules),
             "install-root modules dir must appear in the search-paths surface; got {paths:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    //! Tests for the `continuity` block validator (rfc_protocols.md
+    //! §7.3): continuity classes as a validated graph property.
+
+    use super::*;
+
+    fn man(caps: &[&str]) -> Manifest {
+        Manifest {
+            capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            ..Manifest::default()
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Well-formed edge_anchored graph: anchor + one worker.
+    fn edge_graph() -> (Vec<String>, HashMap<String, Manifest>) {
+        let mut manifests = HashMap::new();
+        manifests.insert("anc".to_string(), man(&["transport.anchor.stream"]));
+        manifests.insert(
+            "wkr".to_string(),
+            man(&["session.worker", "session.handoff"]),
+        );
+        (names(&["anc", "wkr"]), manifests)
+    }
+
+    #[test]
+    fn continuity_absent_block_is_fine() {
+        let (n, m) = edge_graph();
+        validate_continuity(&json!({}), &n, &m).unwrap();
+    }
+
+    #[test]
+    fn continuity_rejects_unknown_class_and_duplicate_id() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [{"id": "x", "class": "bogus"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("invalid"), "got: {e:?}");
+
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "drain_only"},
+            {"id": "x", "class": "drain_only"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("duplicate"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_edge_anchored_requires_anchor_capability() {
+        let (n, m) = edge_graph();
+        // Worker posing as anchor → rejected.
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "wkr", "workers": ["wkr"]}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("transport.anchor"), "got: {e:?}");
+        // Proper anchor passes.
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "anc", "workers": ["wkr"]}]});
+        validate_continuity(&cfg, &n, &m).unwrap();
+    }
+
+    #[test]
+    fn continuity_edge_anchored_multi_worker_requires_handoff() {
+        let mut manifests = HashMap::new();
+        manifests.insert("anc".to_string(), man(&["transport.anchor.stream"]));
+        manifests.insert(
+            "w1".to_string(),
+            man(&["session.worker", "session.handoff"]),
+        );
+        manifests.insert("w2".to_string(), man(&["session.worker"])); // no handoff
+        let n = names(&["anc", "w1", "w2"]);
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "anc",
+             "workers": ["w1", "w2"]}]});
+        let e = validate_continuity(&cfg, &n, &manifests).unwrap_err();
+        assert!(format!("{e:?}").contains("session.handoff"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_resumable_needs_resume_provider() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "resumable", "workers": ["wkr"]}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("session.resume"), "got: {e:?}");
+
+        let mut m2 = HashMap::new();
+        m2.insert(
+            "wkr".to_string(),
+            man(&["session.worker", "session.resume"]),
+        );
+        validate_continuity(&cfg, &names(&["wkr"]), &m2).unwrap();
+    }
+
+    #[test]
+    fn continuity_mechanism_only_on_transport_migratable() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "anc",
+             "workers": ["wkr"], "mechanism": "native_primitive"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("only valid"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_native_primitive_needs_mux_transport() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "transport_migratable",
+             "mechanism": "native_primitive"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("transport.mux"), "got: {e:?}");
+
+        let mut m2 = HashMap::new();
+        m2.insert("quic".to_string(), man(&["transport.mux.quic"]));
+        validate_continuity(&cfg, &names(&["quic"]), &m2).unwrap();
+    }
+
+    /// Full platform-replicated-state graph with every R1–R5 provider.
+    fn prs_graph() -> (Vec<String>, HashMap<String, Manifest>) {
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "anc".to_string(),
+            man(&["transport.anchor.datagram", "session.reservation"]),
+        );
+        manifests.insert(
+            "wkr".to_string(),
+            man(&["session.worker", "session.handoff"]),
+        );
+        manifests.insert(
+            "dir".to_string(),
+            man(&["session.directory", "security.key_wrap", "durable.rpo_zero"]),
+        );
+        manifests.insert("pdu".to_string(), man(&["fence.enforceable"]));
+        (names(&["anc", "wkr", "dir", "pdu"]), manifests)
+    }
+
+    fn prs_entry() -> serde_json::Value {
+        json!({"id": "game", "class": "transport_migratable",
+               "mechanism": "platform_replicated_state",
+               "aead": "on_wire_sequence",
+               "anchor": "anc", "workers": ["wkr"], "directory": "dir",
+               "failover_budget_ms": 8000, "client_keepalive_ms": 20000})
+    }
+
+    #[test]
+    fn continuity_platform_replicated_state_full_graph_passes() {
+        let (n, m) = prs_graph();
+        let cfg = json!({"continuity": [prs_entry()]});
+        validate_continuity(&cfg, &n, &m).unwrap();
+    }
+
+    #[test]
+    fn continuity_prs_rejects_implicit_counter_aead() {
+        // §13.7.2: an implicit-contiguous AEAD counter cannot reach
+        // transport_migratable — honest ceiling is resumable.
+        let (n, m) = prs_graph();
+        let mut entry = prs_entry();
+        entry["aead"] = json!("implicit_counter");
+        let cfg = json!({"continuity": [entry]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("resumable"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_requires_every_r_capability() {
+        // Dropping the fence provider (R3) must fail with the missing
+        // capability named.
+        let (n, mut m) = prs_graph();
+        m.remove("pdu");
+        let n: Vec<String> = n.into_iter().filter(|x| x != "pdu").collect();
+        let cfg = json!({"continuity": [prs_entry()]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("fence.enforceable"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_requires_directory_role() {
+        let (n, mut m) = prs_graph();
+        // Directory module present but without the capability.
+        m.insert(
+            "dir".to_string(),
+            man(&["security.key_wrap", "durable.rpo_zero"]),
+        );
+        let cfg = json!({"continuity": [prs_entry()]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("session.directory"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_budget_must_fit_under_keepalive() {
+        let (n, m) = prs_graph();
+        let mut entry = prs_entry();
+        entry["failover_budget_ms"] = json!(20000);
+        let cfg = json!({"continuity": [entry]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("strictly below"), "got: {e:?}");
+    }
+
+    #[test]
+    fn cap_satisfies_parent_matches_child_not_reverse() {
+        assert!(cap_satisfies("transport.anchor.stream", "transport.anchor"));
+        assert!(cap_satisfies("transport.anchor", "transport.anchor"));
+        assert!(!cap_satisfies(
+            "transport.anchor",
+            "transport.anchor.stream"
+        ));
+        // Prefix without a dot boundary must not match.
+        assert!(!cap_satisfies("transport.anchorx", "transport.anchor"));
     }
 }

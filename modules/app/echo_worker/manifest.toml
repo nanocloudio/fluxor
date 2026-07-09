@@ -1,6 +1,11 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712", "linux"]
 
+# Continuity roles (capability_surface.md §Continuity Role): movable
+# session worker with opaque export/import handoff and resume support.
+# Consumed by the `continuity` config block validator.
+capabilities = ["session.worker", "session.handoff", "session.resume"]
+
 # SessionCtrlV1 control channel from the anchor.
 [[ports]]
 name = "ctrl_in"

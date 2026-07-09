@@ -962,11 +962,30 @@ session.worker                   — movable session / application worker
 session.directory                — placement and continuity metadata service
 session.resume                   — resumable session state support
 session.handoff                  — opaque export / import handoff support
+session.reservation              — durable quorum-committed nonce/sequence
+                                   block reservation authority
+                                   (rfc_protocols.md §13.7.2, R2)
+security.key_wrap                — KEK-wrapped session-key custody the
+                                   storage layer cannot read (§13.7.6, R1)
+fence.enforceable                — out-of-band emission fence: STONITH or
+                                   fabric egress cutoff (§13.7.2a, R3)
+durable.rpo_zero                 — synchronous quorum-durable-before-ack
+                                   path for security-relevant state
+                                   (§13.7.4, R5)
 ```
 
 These are manifest-level capability names. They do not consume bits in
 the `required_caps` device-class mask; they participate in the same
 string-matched capability resolution as `file.data` or `audio.sample`.
+
+The last four exist so continuity-class validation (the `continuity`
+config block, rfc_protocols.md §7.3) can check the §13.7.6 mandatory
+requirements as *structure*: a `transport_migratable` declaration whose
+mechanism is `platform_replicated_state` must be able to resolve all
+four (plus `session.directory`) somewhere in the graph, or validation
+fails. They name the *presence* of a capability, not its correctness
+under fault — R1–R5 correctness is proven by test, and the failover
+timing budget by measurement, not by the graph.
 
 ### Capability Inheritance
 

@@ -1772,6 +1772,20 @@ const MON_SESSION_BUF_SIZE: usize = 192;
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_RELOCATED: u8 = 10;
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_REJECTED: u8 = 11;
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_ERROR: u8 = 12;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_EPOCH_BUMP: u8 = 13;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_EXPORT_REQ: u8 = 14;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_RESUME_REQ: u8 = 15;
+// Failover records for platform-replicated-state transport_migratable
+// sessions (monitor-protocol.md §MON_SESSION Failover records;
+// rfc_protocols.md §10.4, §13.7).
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_FENCE_INITIATED: u8 = 16;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_FENCE_CONFIRMED: u8 = 17;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_VIP_MOVED: u8 = 18;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_RESERVATION_GRANTED: u8 = 19;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_RESERVATION_EXHAUSTED_STALL: u8 = 20;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_RPO_LOSS: u8 = 21;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_UNSAFE_RECOVERY_EPOCH_VOID: u8 = 22;
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")] pub const MON_EV_CLASS_REPORT: u8 = 23;
 
 /// Map an event code to its on-the-wire string. Empty for unknown codes.
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
@@ -1789,6 +1803,31 @@ fn mon_event_name(ev: u8) -> &'static [u8] {
         MON_EV_RELOCATED => b"relocated",
         MON_EV_REJECTED => b"rejected",
         MON_EV_ERROR => b"error",
+        MON_EV_EPOCH_BUMP => b"epoch_bump",
+        MON_EV_EXPORT_REQ => b"export_req",
+        MON_EV_RESUME_REQ => b"resume_req",
+        MON_EV_FENCE_INITIATED => b"fence_initiated",
+        MON_EV_FENCE_CONFIRMED => b"fence_confirmed",
+        MON_EV_VIP_MOVED => b"vip_moved",
+        MON_EV_RESERVATION_GRANTED => b"reservation_granted",
+        MON_EV_RESERVATION_EXHAUSTED_STALL => b"reservation_exhausted_stall",
+        MON_EV_RPO_LOSS => b"rpo_loss",
+        MON_EV_UNSAFE_RECOVERY_EPOCH_VOID => b"unsafe_recovery_epoch_void",
+        MON_EV_CLASS_REPORT => b"class_report",
+        _ => b"unknown",
+    }
+}
+
+/// Map a `CC_*` continuity-class wire constant (see
+/// `contracts/net/session_ctrl.rs`) to its `MON_SESSION` class name.
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+pub fn mon_class_name(cc: u8) -> &'static [u8] {
+    match cc {
+        1 => b"reroutable",
+        2 => b"drain_only",
+        3 => b"resumable",
+        4 => b"edge_anchored",
+        5 => b"transport_migratable",
         _ => b"unknown",
     }
 }
@@ -1876,6 +1915,56 @@ unsafe fn dev_mon_session(
     }
 
     // Severity 3 = info; same as other [echo_anc]/[echo_wkr] lines.
+    dev_log(sys, 3, scratch, pos);
+    pos
+}
+
+/// Emit a `MON_SESSION event=class_report` line: the per-session
+/// `declared_class` vs `achieved_class` pair required for
+/// platform-replicated-state `transport_migratable` sessions
+/// (monitor-protocol.md §Failover records). A session running below
+/// its declared class MUST surface the degradation through this line
+/// so a silent fall-back (budget miss, missing fence, encrypted
+/// implicit-counter AEAD) is visible in production, not inferred.
+///
+/// `declared_cc` / `achieved_cc` are `CC_*` wire constants from
+/// `contracts/net/session_ctrl.rs`.
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+unsafe fn dev_mon_session_class(
+    sys: &SyscallTable,
+    self_idx: u8,
+    session_id: *const u8, // 16 BE bytes
+    epoch: u32,
+    declared_cc: u8,
+    achieved_cc: u8,
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
+    if scratch_max < MON_SESSION_BUF_SIZE { return 0; }
+    let mut pos = 0usize;
+    let emit = |bytes: &[u8], pos: &mut usize| {
+        let mut i = 0;
+        while i < bytes.len() && *pos < scratch_max {
+            *scratch.add(*pos) = bytes[i];
+            *pos += 1;
+            i += 1;
+        }
+    };
+
+    emit(b"MON_SESSION mod=", &mut pos);
+    pos += fmt_u32_dec(self_idx as u32, scratch.add(pos));
+    emit(b" event=class_report session=", &mut pos);
+    if pos + 32 <= scratch_max {
+        hex_render(session_id, 16, scratch.add(pos));
+        pos += 32;
+    }
+    emit(b" epoch=", &mut pos);
+    pos += fmt_u32_dec(epoch, scratch.add(pos));
+    emit(b" declared_class=", &mut pos);
+    emit(mon_class_name(declared_cc), &mut pos);
+    emit(b" achieved_class=", &mut pos);
+    emit(mon_class_name(achieved_cc), &mut pos);
+
     dev_log(sys, 3, scratch, pos);
     pos
 }

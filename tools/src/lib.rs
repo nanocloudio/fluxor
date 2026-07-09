@@ -75,3 +75,11 @@ pub mod wire;
 /// generations to a compatible substrate.
 #[path = "../../modules/sdk/abi_surface.rs"]
 pub mod abi_surface;
+
+/// Reusable continuity/protocol cores (rfc_protocols.md §15.1) —
+/// path-mounted from `modules/sdk/cores/` so the host test suite
+/// exercises the exact logic modules `include!`. `nonce_reservation`
+/// carries the Phase-7 R2 fencing semantics; its tests are the
+/// executable, state-machine-level form of the §18 "R2 nonce non-reuse
+/// under forced recovery" verification gate.
+pub mod continuity_cores;

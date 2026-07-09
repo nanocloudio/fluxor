@@ -12,13 +12,13 @@
 // relocation. It is the scaffolding that continuity classes above
 // `drain_only` (see protocol_surfaces.md §Continuity Classes) rely on.
 //
-// Status: envelope reserved. No module consumes SessionCtrlV1 today;
-// the first consumers are planned to be the Phase 5 anchor/worker
-// prototype (Quantum edge, Chronicle watch streams) and the Phase 4
-// reconfigure / handoff hooks that preserve the anchor-facing channel
-// while the worker relocates. The fields below derive directly from
-// the RFC; minor revisions are possible before the first .fmod ships
-// against this contract.
+// Status: LIVE. Consumers: `echo_anchor` + `echo_worker` exercise the
+// full surface — HELLO/ATTACH/DETACH/DRAIN plus the handoff half
+// (EXPORT_BEGIN/CHUNK/END → IMPORT_BEGIN/END → RESUME/RESUMED with
+// epoch bump). Wiring the anchor with an active + standby worker pair
+// gives an anchor-preserved worker swap on a live TCP session.
+// The chunking/CRC logic is the
+// reusable `session_handoff` core in `modules/sdk/cores/`.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto, datagram, and packet so the shared SDK

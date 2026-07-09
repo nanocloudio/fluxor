@@ -122,6 +122,39 @@ Reasons (from `DETACH_*` constants in `session_ctrl.rs`): `normal`,
 Status codes (from `STATUS_*` constants): `ok`, `stale_epoch`,
 `unknown_session`, `no_capacity`, `corrupt`, `not_ready`.
 
+#### Failover records (platform-replicated-state `transport_migratable`)
+
+For sessions declared `transport_migratable` with the
+platform-replicated-state mechanism (rfc_protocols.md §13.7), the
+record set above is mandatory-extended so an unplanned failover is
+**legible** — a fallback the operator cannot see is not honest. Same
+line format; additional events:
+
+| Event                        | Emitter(s)          | When                                                                    |
+|------------------------------|---------------------|-------------------------------------------------------------------------|
+| `fence_initiated`            | directory / takeover| Enforceable emission fence (STONITH / fabric cutoff) fired at the old anchor. |
+| `fence_confirmed`            | directory / takeover| Fence CONFIRMED dead. Distinct from `fence_initiated` — the gap is safety-critical (§13.7.4); the VIP must not move before this record. |
+| `vip_moved`                  | takeover anchor     | Client-facing VIP now attracts datagrams to the takeover host.          |
+| `reservation_granted`        | anchor              | A fresh egress counter/sequence block was quorum-committed. `status=ok`. |
+| `reservation_exhausted_stall`| anchor              | Emit path stalled waiting on a reservation grant (§13.7.7 P99 spike). |
+| `rpo_loss`                   | takeover worker     | Un-checkpointed application tail lost at failover. `reason=<bound>` states what was lost (e.g. `reason=1_tick`). |
+| `unsafe_recovery_epoch_void` | directory           | Forced/unsafe quorum recovery voided all outstanding reservation blocks and forced an epoch bump (§13.7.6 R2). |
+| `class_report`               | anchor              | Per-session declared vs achieved continuity class (see below).          |
+
+`class_report` carries two extra keys:
+
+```
+MON_SESSION mod=<idx> event=class_report session=<32-hex> epoch=<n> declared_class=<c> achieved_class=<c>
+```
+
+Class names: `reroutable`, `drain_only`, `resumable`, `edge_anchored`,
+`transport_migratable` (the `CC_*` constants in `session_ctrl.rs`).
+A session running below its declared class — budget miss, missing
+fence, encrypted implicit-counter AEAD — MUST surface the degradation
+here (`achieved_class` < `declared_class`), so a silent fall-back from
+`transport_migratable` to `resumable` is visible in production, not
+inferred.
+
 #### Example
 
 ```

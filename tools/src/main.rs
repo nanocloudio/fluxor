@@ -2302,6 +2302,13 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         {
             result.add_error(e.to_string());
         }
+        // Session continuity classes (rfc_protocols.md §7.3) — same
+        // dual-path treatment as presentation groups so `fluxor
+        // validate` catches missing anchors / roles / R1–R5 capability
+        // providers without compiling.
+        if let Err(e) = crate::config::validate_continuity(&config, &module_names, &manifests) {
+            result.add_error(e.to_string());
+        }
     }
 
     // Dry-run the full config-generation pipeline so missing

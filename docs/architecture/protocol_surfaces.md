@@ -433,10 +433,21 @@ The `MON_SESSION` line format is specified in `monitor-protocol.md`:
 one line per transition, `session=` rendered as 32 hex chars big-
 endian so a single grep follows a session across all emitters.
 
-No module emits `MON_SESSION` today — the format is reserved and will
-become load-bearing when Phase 5 anchor / worker deployments wire up
-telemetry. The echo demo (`examples/test_harness/linux/web/echo_edge.yaml`) is a
-candidate first emitter.
+`echo_anchor` and `echo_worker` emit live `MON_SESSION` lines at every
+transition (attach, drain, export, import, resume, epoch bump,
+relocate, detach) via the `dev_mon_session` SDK helper and the
+`SELF_INDEX` module-index syscall. The full lifecycle is observable by
+wiring the anchor with an active + standby worker pair and a non-zero
+`handoff_after_bytes` (see §First Live Consumer below).
+
+For platform-replicated-state `transport_migratable` sessions the
+record set extends with the failover events (`fence_initiated` /
+`fence_confirmed`, `vip_moved`, `reservation_granted` /
+`reservation_exhausted_stall`, `rpo_loss`,
+`unsafe_recovery_epoch_void`) and the per-session `class_report`
+(`declared_class` vs `achieved_class`) — see `monitor-protocol.md`
+§Failover records. A session running below its declared class must
+surface the degradation there rather than leaving it to be inferred.
 
 ## Module Stack Patterns
 
@@ -658,9 +669,33 @@ Reusable protocol code lives in shared cores and helpers such as
 `tcp_core`, `udp_core`, `tls_record_core`, `quic_recovery_core`,
 `protocol_timer_core`, `stream_surface_core`, `datagram_surface_core`,
 `mux_surface_core`, `session_anchor_core`, `session_directory_core`,
-`session_handoff_core`.
+`session_handoff_core`, `nonce_reservation_core`.
 
-These are architectural reuse units, not necessarily separate `.fmod`s.
+Three cores are implemented under `modules/sdk/cores/` (host-tested
+via the `tools` test suite, `include!`d by modules — the same
+path-mount pattern as `wire.rs` / `genstore_wire.rs`):
+
+- `session_handoff.rs` — opaque export/import chunking with
+  incremental CRC32 (`HandoffExport` / `HandoffImport`); consumed by
+  `echo_worker` for the live anchor-preserved swap.
+- `nonce_reservation.rs` — windowed egress-counter reservation with
+  epoch fencing (`NonceReservation`; rfc_protocols.md §13.7.2 / R2:
+  quorum-durable-before-emit discipline, monotonic epochs, voided
+  blocks after unsafe recovery, refill-ahead double-buffering). This
+  is the ANCHOR side; the granting authority — the durable
+  single-writer session directory of §8.3/§13.7 — is implemented in
+  the clustor sibling repo (`clustor/modules/app/session_directory/`
+  over `clustor/modules/common/session_registry.rs`, documented at
+  `clustor/docs/architecture/session_directory.md`): single-writer
+  bindings, monotone never-re-handed counter grants, R4 rx floors,
+  R1 wrapped-key custody with quorum wipe, R3 fence ordering, and R2
+  unsafe-recovery voiding, with replies emitted only after quorum
+  commit.
+- `protocol_timer.rs` — nearest-deadline tracking (`ProtocolTimers`)
+  with post-import rebase, for the §Timing model.
+
+The remaining names are architectural reuse units to be extracted once
+two consumers exist; none of these are necessarily separate `.fmod`s.
 Whether a target bundles monolithic `ip`, `ip` plus `quic`, a combined
 secure ingress stack, or individual modules is a packaging decision made
 per target. Whichever packaging is chosen must expose the same surfaces,
@@ -692,10 +727,11 @@ in the tree:
   `CMD_SC_ATTACH` / `CMD_SC_DRAIN` / `CMD_SC_DETACH`, uppercases each
   byte in the data plane, returns `MSG_SC_ATTACHED` / `MSG_SC_DRAINED`
   / `MSG_SC_DETACHED` back to the anchor.
-- `examples/test_harness/linux/web/echo_edge.yaml` — graph wiring the two modules
-  against `linux_net` on port 9000. Runs with
-  `fluxor run examples/test_harness/linux/web/echo_edge.yaml` and is exercised over
-  plain TCP (`nc 127.0.0.1 9000`).
+- A minimal graph wires the two modules against `linux_net` on port
+  9000 (anchor `net_*` ↔ `linux_net`, plus the ctrl/data channel pairs
+  between anchor and worker; the anchor↔worker feedback edges need
+  `scheduler.accept_cycles`). Exercised over plain TCP
+  (`nc 127.0.0.1 9000`).
 
 The demo validates the `SessionCtrlV1` envelope end-to-end: HELLO is
 skipped (optional), `ATTACH` / `ATTACHED` open the session, raw bytes
@@ -703,11 +739,24 @@ flow bidirectionally over the data plane, and `DETACH` / `DETACHED`
 close it. Multiple sequential client sessions recycle cleanly through
 `ATTACH → ACTIVE → DETACH → LISTENING`.
 
-Live worker handoff (anchor-preserved worker swap) is deliberately
-out of scope for this demo — it needs `graph_slot` per-subgraph
-activation or an equivalent staging mechanism (see
-`architecture/protocol_surfaces.md` §Handoff and Reconfigure
-Integration).
+Live worker handoff (anchor-preserved worker swap) is exercised by
+the companion configuration: the same graph extended with a SECOND
+worker instance on the anchor's `ctrl2_*`/`data2_*` ports and a
+non-zero `handoff_after_bytes` param — active + standby, statically
+wired (the "equivalent staging mechanism" — both generations
+resident, the anchor's forwarding flip is the activation). Every
+`handoff_after_bytes` client bytes the anchor runs the full
+SessionCtrlV1 swap — DRAIN (worker finishes its in-flight tail before
+declaring DRAINED) → EXPORT_BEGIN/CHUNK…/END relayed opaquely →
+IMPORT_BEGIN/END → RESUME(epoch+1) → RESUMED → forwarding flip →
+DETACH old — while the client's TCP stream stays open. Client bytes
+arriving during the attach or rebinding window are held in the
+anchor's declared bounded ingress buffer and flushed when the worker
+goes live (the §Module Stack Patterns rebinding-buffer requirement).
+Repeated swaps on one TCP connection stay byte-exact and in order,
+with the session epoch advancing per swap.
+Fully-atomic swap via `graph_slot` per-subgraph activation remains a
+separate follow-up for staged-bundle targets.
 
 ## Implementation Fit — VoIP-as-anchor and QUIC
 
@@ -754,24 +803,33 @@ A `quic` foundation module providing `transport.mux.quic` with
 | `transport.mux.quic` capability | `capability_surface.md` |
 | `transport_migratable` continuity class | This document §Continuity Classes |
 
-What's still needed to ship: the `quic` module itself (substantial
-engineering), an HTTP/3 layer that consumes `transport.mux`, and
-config-tool validation for `transport_migratable` graphs. The
-contract envelopes are reserved in advance so this work has a stable
-target.
+The config tool validates the top-level `continuity` block
+(rfc_protocols.md §7.3): all five classes are checked as graph structure —
+`edge_anchored` requires a `transport.anchor.*` module and
+`session.worker` workers (plus `session.handoff` when more than one
+worker is declared), `resumable` requires a `session.resume` provider,
+and `transport_migratable` requires a declared mechanism:
+`native_primitive` needs a `transport.mux.*` provider;
+`platform_replicated_state` needs the declared AEAD class (an
+`implicit_counter` declaration is rejected outright — its honest
+ceiling is `resumable`), a `session.directory` module, providers for
+`session.reservation` / `security.key_wrap` / `fence.enforceable` /
+`durable.rpo_zero`, and a declared `failover_budget_ms` strictly below
+`client_keepalive_ms`. Structure only: R1–R5 correctness under fault
+and the real failover latency are proven by test and measurement, not
+by the graph.
 
 ### What's NOT in this document
 
 The following are explicitly **out of scope** of the protocol substrate:
 
 - `graph_slot` per-subgraph activation — needed for fully-atomic
-  anchor-preserved worker swap.
-- Reusable protocol cores (`tcp_core`, `quic_recovery_core`,
-  `session_handoff_core`, etc.) — code-sharing units
+  anchor-preserved worker swap on staged-bundle targets (the
+  statically-wired active/standby pattern in `echo_handoff.yaml`
+  covers the resident-generations case today).
+- Reusable protocol cores beyond the three in `modules/sdk/cores/`
+  (`tcp_core`, `quic_recovery_core`, `stream_surface_core`, etc.) —
   extracted from real implementations once two consumers exist.
-- Live `MON_SESSION` emission in modules — needs a module-index
-  syscall or a dedicated monitor module that tails SessionCtrlV1
-  channels.
 
 These are engineering follow-ups. The five-contract substrate and the
 role / capability / continuity-class vocabulary should remain stable as

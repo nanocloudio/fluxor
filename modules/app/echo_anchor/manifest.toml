@@ -1,6 +1,11 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712", "linux"]
 
+# Continuity role (capability_surface.md §Continuity Role): this module
+# owns the client-visible transport attachment. Consumed by the
+# `continuity` config block validator (class edge_anchored).
+capabilities = ["transport.anchor.stream"]
+
 # Stream Surface v1 (net_proto) channel from the IP module / linux_net.
 [[ports]]
 name = "net_in"
@@ -38,6 +43,40 @@ content_type = "OctetStream"
 [[ports]]
 name = "data_out"
 index = 2
+direction = "output"
+content_type = "OctetStream"
+
+# ── Optional standby worker (anchor-preserved handoff) ──────────────
+# When wired, `handoff_after_bytes` swaps the live session between the
+# two workers over SessionCtrlV1 EXPORT/IMPORT/RESUME while the client
+# TCP stream stays open (protocol_surfaces.md §Anchor-Preserved
+# Maintenance).
+
+# SessionCtrlV1 replies from the standby worker.
+[[ports]]
+name = "ctrl2_in"
+index = 3
+direction = "input"
+content_type = "OctetStream"
+
+# Processed byte stream from the standby worker.
+[[ports]]
+name = "data2_in"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+
+# SessionCtrlV1 commands to the standby worker.
+[[ports]]
+name = "ctrl2_out"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+# Raw byte stream to the standby worker.
+[[ports]]
+name = "data2_out"
+index = 4
 direction = "output"
 content_type = "OctetStream"
 
