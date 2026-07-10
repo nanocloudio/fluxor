@@ -1071,7 +1071,14 @@
       const audioHz = v ? (v.audioRateHz >>> 0)
         : ((w.__fluxor_audio_traits && w.__fluxor_audio_traits.rateHz) >>> 0);
       const physBtns = v ? !!v.physicalButtons : false;
-      return { vw, vh, coarse, fine, touch, pads, audioCh, audioHz, physBtns };
+      // Device pixel ratio — drives the shell's device-pixel supersampling so
+      // text/art render crisp on hi-DPI screens instead of a CSS upscale. The
+      // viewport stays in CSS px (so size-class/layout are unaffected); only the
+      // raster resolution follows DPR.
+      const dpr = v
+        ? (v.dpr || 1)
+        : ((typeof w.devicePixelRatio === 'number' && w.devicePixelRatio > 0) ? w.devicePixelRatio : 1);
+      return { vw, vh, coarse, fine, touch, pads, audioCh, audioHz, physBtns, dpr };
     }
 
     function recompute() {
@@ -1088,8 +1095,9 @@
       if (p.pads > 0) modalities |= ST.MOD_GAMEPAD;
       if (p.physBtns) modalities |= ST.MOD_PHYSICAL_BUTTONS;
 
+      const dpr8 = Math.max(0, Math.min(255, Math.round((p.dpr || 1) * 8)));
       const key = [orientation, scW, scH, p.vw, p.vh, modalities, p.pads,
-        p.audioCh, p.audioHz].join(',');
+        p.audioCh, p.audioHz, dpr8].join(',');
       if (key === lastKey) return false;
       lastKey = key;
       epoch = (epoch + 1) >>> 0;
@@ -1097,7 +1105,7 @@
         orientation, sizeClassW: scW, sizeClassH: scH,
         viewportW: p.vw, viewportH: p.vh, modalities,
         gamepadCount: p.pads, audioChannels: p.audioCh,
-        audioRateHz: p.audioHz, displayCount: 1, epoch,
+        audioRateHz: p.audioHz, displayCount: 1, epoch, dpr8,
       });
       // The publisher is installed for every runtime, but only the
       // `wasm_browser_surface_traits` built-in drains the queue. A scenario

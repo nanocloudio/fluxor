@@ -83,7 +83,20 @@ impl OwnerStatusWriter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let pods_json = derive_pods_json(&recs[..n], &mut self.tracks, &self.seeded, now);
+        // Live drain deadlines live in the drain driver; the kernel snapshot
+        // carries only owner_state. Overlay before deriving.
+        drain_overlay_for_status(&mut recs[..n], now);
+        let mut pods_json = derive_pods_json(&recs[..n], &mut self.tracks, &self.seeded, now);
+        // Drained-and-revoked owners are gone from the live snapshot; their
+        // terminal records ride alongside until retention lapses
+        // (rfc_owner_drain_and_logs.md §3.7).
+        for entry in drain_terminal_pods_json() {
+            if !pods_json.is_empty() {
+                pods_json.push(',');
+            }
+            pods_json.push_str("\n    ");
+            pods_json.push_str(&entry);
+        }
         let plan_generation = fluxor::kernel::owner_plan::last_applied_generation();
         if self
             .last_emit
@@ -216,6 +229,12 @@ fn derive_pods_json(
                 (rec.modules_total > 0).then_some("ActivationBackOff"),
             ),
         };
+        // A draining owner stops reporting ready while it is still serving
+        // (rfc_owner_drain_and_logs.md §3.1) — no new phase value, just the
+        // readiness withdrawal the terminating window needs.
+        let draining =
+            rec.owner_state == fluxor::kernel::scheduler::OWNER_STATE_DRAINING;
+        let ready = ready && !draining;
         let mut e = String::new();
         let _ = write!(
             e,
@@ -224,6 +243,18 @@ fn derive_pods_json(
              \"restart_count\":{}",
             rec.slot, rec.generation, track.restart_count,
         );
+        // New additive fields (old consumers ignore them); emitted only while
+        // draining, so non-draining output is byte-identical (rfc §3.7).
+        if draining {
+            let _ = write!(e, ",\"owner_state\":\"Draining\"");
+            if rec.drain_deadline_unix > 0 {
+                let _ = write!(
+                    e,
+                    ",\"drain_deadline_unix\":{},\"drain_remaining_secs\":{}",
+                    rec.drain_deadline_unix, rec.drain_remaining_secs
+                );
+            }
+        }
         if let Some(t) = track.started_at_unix {
             let _ = write!(e, ",\"started_at\":\"{}\"", rfc3339_utc(t));
         }
@@ -364,6 +395,34 @@ mod owner_status_tests {
         // date -u -d @1783275045 → 2026-07-05T18:10:45Z
         assert_eq!(rfc3339_utc(1_783_275_045), "2026-07-05T18:10:45Z");
         assert_eq!(rfc3339_utc(951_827_696), "2000-02-29T12:34:56Z");
+    }
+
+    #[test]
+    fn draining_owner_emits_owner_state_and_withdraws_readiness() {
+        use fluxor::kernel::scheduler::OWNER_STATE_DRAINING;
+        let mut tracks = std::collections::HashMap::new();
+        let seeds = std::collections::HashMap::new();
+
+        // A healthy owner that is NOT draining emits no owner_state field and is
+        // ready — output stays byte-identical to before this change.
+        let healthy = [rec(0xaa, 1, 7)];
+        let j = derive_pods_json(&healthy, &mut tracks, &seeds, 100);
+        assert!(!j.contains("owner_state"));
+        assert!(j.contains("\"ready\":true"));
+
+        // Flip the same owner to Draining with a deadline: owner_state appears,
+        // readiness withdraws (still serving), drain fields present.
+        let mut draining = rec(0xbb, 2, 3);
+        draining.owner_state = OWNER_STATE_DRAINING;
+        draining.drain_deadline_unix = 1_783_275_045;
+        draining.drain_remaining_secs = 12;
+        let j = derive_pods_json(&[draining], &mut tracks, &seeds, 100);
+        assert!(j.contains("\"owner_state\":\"Draining\""));
+        assert!(j.contains("\"drain_deadline_unix\":1783275045"));
+        assert!(j.contains("\"drain_remaining_secs\":12"));
+        assert!(j.contains("\"ready\":false"));
+        // Phase itself stays in the frozen vocabulary.
+        assert!(j.contains("\"phase\":\"Running\""));
     }
 
     #[test]

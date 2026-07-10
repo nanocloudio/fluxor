@@ -60,6 +60,13 @@ pub mod extbridge;
 pub mod loader;
 pub mod log_ring;
 pub mod owner;
+// Per-owner log rings. Phase 1 frames records through an allocating
+// encode (see owner_log.rs) and is consumed only by the Linux
+// platform's log tee; bare-metal builds have no global allocator, so
+// the module is host-linux-gated until the allocation-free
+// frame-in-place path lands.
+#[cfg(feature = "host-linux")]
+pub mod owner_log;
 pub mod owner_plan;
 pub mod scheduler;
 

@@ -236,9 +236,21 @@ impl OwnerTable {
         }
     }
 
-    /// True when `h` names an `Active` owner with a matching generation. This is
-    /// the fail-closed predicate access paths use before honouring a handle.
-    pub fn authorize(&self, h: OwnerHandle) -> bool {
+    /// True when `h` may keep USING resources it already holds — established
+    /// connections, held provider handles, committed queue slots. Both `Active`
+    /// and `Draining` qualify: a draining owner keeps serving until revoked
+    /// (rfc_owner_drain_and_logs.md §3.5).
+    pub fn authorize_use(&self, h: OwnerHandle) -> bool {
+        self.lookup(h)
+            .map(|e| matches!(e.state, OwnerState::Active | OwnerState::Draining))
+            .unwrap_or(false)
+    }
+
+    /// True when `h` may ADMIT new work — new allocation, open, accept, queue
+    /// grant, timer arm. Only `Active` qualifies: admission closes the moment a
+    /// drain begins, which is what lets in-flight work run dry
+    /// (rfc_owner_drain_and_logs.md §3.5).
+    pub fn authorize_admit(&self, h: OwnerHandle) -> bool {
         self.lookup(h)
             .map(|e| matches!(e.state, OwnerState::Active))
             .unwrap_or(false)

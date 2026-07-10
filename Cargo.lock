@@ -1343,6 +1343,7 @@ dependencies = [
  "embassy-usb-logger",
  "embedded-io-async",
  "env_logger",
+ "fluxor-contracts",
  "image",
  "libc",
  "log",

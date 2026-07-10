@@ -128,6 +128,8 @@ include!("linux/linux_surface_traits.rs");
 include!("linux/linux_surface_traits_probe.rs");
 include!("linux/linux_pointer.rs");
 include!("linux/owner_status.rs");
+include!("linux/owner_log_tee.rs");
+include!("linux/owner_drain.rs");
 
 // ============================================================================
 // Graph construction (shared by boot and live rebuild)
@@ -350,11 +352,12 @@ fn main() {
         BOOT_INSTANT = Some(Instant::now());
     }
 
-    // Set up logging via env_logger or simple stderr
-    // For now, just use log macros which will go to the default sink
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    // Set up logging via the owner-log tee: identical env_logger stderr
+    // formatting/filtering, plus per-owner ring routing for `fluxor agent logs`
+    // (rfc_owner_drain_and_logs.md Part B). Registers this (main) thread as the
+    // scheduler thread — the only thread whose records reach the rings.
+    install_owner_log_tee();
+    register_scheduler_thread();
 
     log::info!("[fluxor] linux platform boot");
 
@@ -455,6 +458,14 @@ fn main() {
     let mut owner_status = plan_path
         .as_deref()
         .map(|p| OwnerStatusWriter::new(std::path::Path::new(p)));
+    // Per-owner log rings are flushed into `logs/` beside `owner_status.json`,
+    // on the same tick. `fluxor agent logs` resolves this directory the same way.
+    let logs_dir: Option<std::path::PathBuf> = plan_path.as_deref().map(|p| {
+        std::path::Path::new(p)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("logs")
+    });
 
     // Compile + instantiate the graph (shared with the live-rebuild path).
     let (mut module_count, loaded_count) = build_graph_linux();
@@ -469,12 +480,29 @@ fn main() {
     // the base graph. Boot-only (not re-run on live rebuild). No-op without pods.
     scheduler::admit_resident_pods_from_config();
 
+    // A revocation the just-applied plan still lists, naming an owner that was
+    // NOT reinstalled, was mid-drain when the previous process died: the drain
+    // is forfeited and recorded as drain-timeout-by-restart
+    // (rfc_owner_drain_and_logs.md §3.6).
+    synthesize_restart_terminals(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+
     // Publish the initial owner status immediately (before the first 100 ms
     // watch window) so an orchestrator polling right after activation sees
     // the runtime up rather than a stale/absent file.
     if let Some(w) = owner_status.as_mut() {
         w.tick();
     }
+    if let Some(dir) = logs_dir.as_deref() {
+        flush_owner_rings(dir);
+    }
+
+    // Scheduler + HAL are up: log records may now resolve their owning module.
+    enable_owner_log_attribution();
 
     log::info!("[sched] starting main loop, tick_us={tick_us}");
     // The per-iteration deadline is chosen by the adaptive-tick pacer
@@ -526,20 +554,47 @@ fn main() {
         // idle 100 ms-per-iteration loop would otherwise check too rarely).
         if plan_path.is_some() && last_plan_check.elapsed() >= Duration::from_millis(100) {
             last_plan_check = Instant::now();
+            // Settle armed drains BEFORE consuming a new plan: a drain that
+            // already reached quiescence or its deadline becomes a terminal
+            // record (and its owner is freed) first, so the plan update never
+            // races a finished drain. A still-live drain is protected on the
+            // other side: the delta path refuses a plan that drops a retained
+            // revocation while its owner is installed.
+            drain_tick(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
             if let Some(path) = plan_path.as_deref() {
                 let mtime = plan_mtime(path);
                 if mtime.is_some() && mtime != last_plan_mtime {
                     last_plan_mtime = mtime;
                     log::info!("[owner] plan file changed; reloading from {path}");
                     stage_plan_from(path);
-                    // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
-                    unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+                    // A pure-drain generation (records moved from the assignment
+                    // section to the revocation section, nothing else) applies as
+                    // a live delta: the departing owner flips to Draining and the
+                    // drain driver takes over — no rebuild, co-resident owners
+                    // untouched (rfc_owner_drain_and_logs.md §3.4). Anything
+                    // structural falls through to the rebuild as before.
+                    match fluxor::kernel::owner_plan::try_apply_drain_delta() {
+                        Some(delta) => arm_drains(&delta),
+                        None => {
+                            // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
+                            unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
+                        }
+                    }
                 }
             }
             // Same cadence as the plan watch: publish per-owner live status
-            // (no-op write when the derived state is unchanged).
+            // (no-op write when the derived state is unchanged) and flush the
+            // per-owner log rings to their files.
             if let Some(w) = owner_status.as_mut() {
                 w.tick();
+            }
+            if let Some(dir) = logs_dir.as_deref() {
+                flush_owner_rings(dir);
             }
         }
 
@@ -560,6 +615,9 @@ fn main() {
             // aggregate restart (Terminated → re-activated) go uncounted.
             if let Some(w) = owner_status.as_mut() {
                 w.tick();
+            }
+            if let Some(dir) = logs_dir.as_deref() {
+                flush_owner_rings(dir);
             }
             continue;
         }

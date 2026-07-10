@@ -44,7 +44,7 @@ pub fn reconcile_and_commit<S: Storage>(
     prior: &OwnerSnapshot,
     gen_id: u64,
 ) -> Result<CompositionPlan, AgentError> {
-    let plan = stage_candidate(store, desired, cap, prior, gen_id)?;
+    let plan = stage_candidate(store, desired, cap, prior, gen_id, &[], 0)?;
     store.commit(gen_id).map_err(AgentError::Store)?;
     Ok(plan)
 }
@@ -54,14 +54,21 @@ pub fn reconcile_and_commit<S: Storage>(
 /// agent can order its own bookkeeping writes before the final commit — the
 /// commit must be the last durable write so it never becomes visible ahead of a
 /// failed bookkeeping write.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors compose()'s parameter list plus the staging identifiers; bundling them into a struct would add a type used at exactly one call site"
+)]
 fn stage_candidate<S: Storage>(
     store: &mut GenStore<S>,
     desired: &DeviceDesiredState,
     cap: &NodeCapacity,
     prior: &OwnerSnapshot,
     gen_id: u64,
+    revoke_graces: &[([u8; 16], u16)],
+    now_unix: u64,
 ) -> Result<CompositionPlan, AgentError> {
-    let plan = compose(desired, cap, prior).map_err(AgentError::Compose)?;
+    let plan =
+        compose(desired, cap, prior, revoke_graces, now_unix).map_err(AgentError::Compose)?;
     let blob = encode_plan(&plan);
     let blob_digest = sha256(&blob);
     store
@@ -191,7 +198,7 @@ fn snapshot_from_committed<S: Storage>(
             slot.generation = gen;
         }
     }
-    // ...occupancy: the committed plan.
+    // ...occupancy + retained ranges + live revocations: the committed plan.
     if let Some(plan) = load_committed_plan(store) {
         for a in &plan.assignments {
             if let Some(slot) = snap.slots.get_mut(a.slot as usize) {
@@ -199,6 +206,15 @@ fn snapshot_from_committed<S: Storage>(
                 slot.generation = slot.generation.max(a.generation);
             }
         }
+        // Revocation slots stay generation-guarded too: a reused slot must get
+        // a strictly higher generation than the draining occupant's.
+        for r in &plan.revocations {
+            if let Some(slot) = snap.slots.get_mut(r.assignment.slot as usize) {
+                slot.generation = slot.generation.max(r.assignment.generation);
+            }
+        }
+        snap.assignments = plan.assignments;
+        snap.revocations = plan.revocations;
     }
     Ok(snap)
 }
@@ -215,6 +231,16 @@ pub fn record_publish_path<S: Storage>(
         .storage
         .write(PUBLISH_PATH_KEY, canonical.to_string_lossy().as_bytes())
         .map_err(|_| StoreError::WriteFailed)
+}
+
+/// Directory the runtime writes its sidecars into — `owner_status.json` and the
+/// per-owner `logs/` ring directory (`rfc_owner_drain_and_logs.md` §4.3) — which
+/// is the parent of the recorded publish path. `None` when nothing has been
+/// published yet. Shared by `agent status` and `agent logs` so both resolve the
+/// sidecars the same way.
+pub fn published_sidecar_dir<S: Storage>(store: &GenStore<S>) -> Option<std::path::PathBuf> {
+    let publish = String::from_utf8(store.storage.read(PUBLISH_PATH_KEY).ok()??).ok()?;
+    Some(std::path::Path::new(&publish).parent()?.to_path_buf())
 }
 
 // ── Live runtime status (rfc_k8s.md §7.2 vocabulary) ────────────────────────
@@ -284,6 +310,34 @@ pub struct PodRuntimeStatus {
     pub terminated: Option<TerminatedState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<WaitingReason>,
+    /// Owner lifecycle state; `Some("Draining")` during a graceful drain, absent
+    /// when running normally (rfc_owner_drain_and_logs.md §3.7). A free-form
+    /// string, not an enum, so a future state never trips the strict reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_state: Option<String>,
+    /// Wall-clock second the drain forfeits its grace (present while draining).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_deadline_unix: Option<u64>,
+    /// Seconds left in the drain window (present while draining).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_remaining_secs: Option<u32>,
+    /// How a completed drain window closed (present on drained-owner
+    /// terminal records; rfc_owner_drain_and_logs.md §3.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainDetail>,
+}
+
+/// Terminal drain detail. Bool fields, not an enum, so a future
+/// distinction never trips the strict status reader (fields-not-enums,
+/// rfc_owner_drain_and_logs.md §3.7).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DrainDetail {
+    /// The grace deadline lapsed before the owner reached quiescence.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// A runtime restart forfeited the remainder of the window (§3.6).
+    #[serde(default)]
+    pub by_restart: bool,
 }
 
 /// On-disk shape of the runtime's `owner_status.json`.
@@ -411,6 +465,42 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
             }
         })
         .collect();
+    // Departing pods stay observable for the whole drain window: a removed
+    // pod is gone from desired state immediately, but its revocation record
+    // rides the committed plan until retention lapses
+    // (rfc_owner_drain_and_logs.md §3.7). Synthesize a row from each
+    // revocation whose UID no longer has a desired row, so `status` keeps
+    // showing the owner (and, via the runtime join, its Draining/Terminated
+    // state) instead of the pod silently vanishing mid-drain. Namespace and
+    // name left empty — the desired record that carried them is gone; the
+    // pod UID is the orchestrator's join key.
+    if let Some(pl) = plan.as_ref() {
+        for rev in &pl.revocations {
+            let a = &rev.assignment;
+            let mut hex = String::with_capacity(32);
+            for b in &a.pod_uid {
+                use std::fmt::Write;
+                let _ = write!(hex, "{b:02x}");
+            }
+            if pods.iter().any(|p| p.pod_uid_hex == hex) {
+                continue;
+            }
+            pods.push(PodStatus {
+                pod_uid_hex: hex,
+                namespace: String::new(),
+                name: String::new(),
+                desired_phase: DesiredPhase::Stopped,
+                committed: true,
+                slot: Some(a.slot),
+                owner_generation: Some(a.generation),
+                modules: Some(a.module_count),
+                edges: Some(a.edge_count),
+                state_cap: Some(a.state_cap),
+                buffer_cap: Some(a.buffer_cap),
+                runtime: None,
+            });
+        }
+    }
     pods.sort_by(|a, b| a.pod_uid_hex.cmp(&b.pod_uid_hex));
     Ok(NodeStatus {
         generation,
@@ -446,6 +536,31 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
                     pod.runtime = Some(entry.runtime.clone());
                 }
             }
+            // Runtime entries with no durable row left — a departed owner
+            // whose revocation already aged out of the plan but whose
+            // terminal record is still inside the runtime's retention
+            // window (§3.7). Surface them as runtime-only rows rather than
+            // dropping the terminal state.
+            for entry in &file.pods {
+                if st.pods.iter().any(|p| p.pod_uid_hex == entry.pod_uid_hex) {
+                    continue;
+                }
+                st.pods.push(PodStatus {
+                    pod_uid_hex: entry.pod_uid_hex.clone(),
+                    namespace: String::new(),
+                    name: String::new(),
+                    desired_phase: DesiredPhase::Stopped,
+                    committed: false,
+                    slot: Some(entry.slot),
+                    owner_generation: Some(entry.owner_generation),
+                    modules: None,
+                    edges: None,
+                    state_cap: None,
+                    buffer_cap: None,
+                    runtime: Some(entry.runtime.clone()),
+                });
+            }
+            st.pods.sort_by(|a, b| a.pod_uid_hex.cmp(&b.pod_uid_hex));
         }
     }
     Ok(st)
@@ -506,24 +621,31 @@ pub fn upsert_pod_and_commit<S: Storage>(
     let mut pods = load_desired(store).map_err(AgentError::Store)?;
     pods.retain(|p| p.pod_uid != pod.pod_uid);
     pods.push(pod);
-    recompose(store, pods, cap)
+    recompose(store, pods, cap, &[])
 }
 
-/// Remove a pod from the desired state and recompose the remainder.
+/// Remove a pod from the desired state and recompose the remainder. With a
+/// non-zero `grace_secs` the departing pod leaves through a bounded drain
+/// window: its revocation record (deadline = now + grace) rides the same single
+/// generation, and the runtime drains-then-revokes against it
+/// (rfc_owner_drain_and_logs.md §3.2). `grace_secs == 0` revokes immediately —
+/// the same code path, with an already-past deadline.
 pub fn remove_pod_and_commit<S: Storage>(
     store: &mut GenStore<S>,
     pod_uid: [u8; 16],
+    grace_secs: u16,
     cap: &NodeCapacity,
 ) -> Result<(CompositionPlan, u64), AgentError> {
     let mut pods = load_desired(store).map_err(AgentError::Store)?;
     pods.retain(|p| p.pod_uid != pod_uid);
-    recompose(store, pods, cap)
+    recompose(store, pods, cap, &[(pod_uid, grace_secs)])
 }
 
 fn recompose<S: Storage>(
     store: &mut GenStore<S>,
     pods: Vec<PodDesired>,
     cap: &NodeCapacity,
+    revoke_graces: &[([u8; 16], u16)],
 ) -> Result<(CompositionPlan, u64), AgentError> {
     let gen_id = store.committed().map(|g| g.id + 1).unwrap_or(1);
     let running: Vec<PodDesired> = pods
@@ -537,8 +659,23 @@ fn recompose<S: Storage>(
         pods: running,
     };
     let prior = snapshot_from_committed(store, cap.max_owners).map_err(AgentError::Store)?;
+    // Wall clock is consulted ONLY here, at publish (rfc_owner_drain_and_logs.md
+    // §3.2): revocation deadlines are stamped into the plan; every later check
+    // (agent expiry, runtime drain) evaluates the stamped value.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     // Stage + verify the candidate WITHOUT committing yet.
-    let plan = stage_candidate(store, &desired, cap, &prior, gen_id)?;
+    let plan = stage_candidate(
+        store,
+        &desired,
+        cap,
+        &prior,
+        gen_id,
+        revoke_graces,
+        now_unix,
+    )?;
     // Persist the node bookkeeping (desired set + slot high-water generations)
     // BEFORE the commit. The commit (pointer flip) is the LAST durable write, so
     // a bookkeeping failure leaves nothing committed and the caller's error is
@@ -546,12 +683,20 @@ fn recompose<S: Storage>(
     // a new generation is already live".
     save_desired(store, &pods).map_err(AgentError::Store)?;
     let mut gens = load_slot_gens(store).map_err(AgentError::Store)?;
-    for a in &plan.assignments {
-        let idx = a.slot as usize;
+    let mut bump = |slot: u16, generation: u32| {
+        let idx = slot as usize;
         if gens.len() <= idx {
             gens.resize(idx + 1, 0);
         }
-        gens[idx] = gens[idx].max(a.generation);
+        gens[idx] = gens[idx].max(generation);
+    };
+    for a in &plan.assignments {
+        bump(a.slot, a.generation);
+    }
+    // A draining slot's generation is retained too, so post-expiry reuse always
+    // bumps past the departed occupant.
+    for r in &plan.revocations {
+        bump(r.assignment.slot, r.assignment.generation);
     }
     save_slot_gens(store, &gens).map_err(AgentError::Store)?;
     store.commit(gen_id).map_err(AgentError::Store)?;
@@ -707,18 +852,35 @@ mod tests {
         );
         assert_eq!(b.slot, 2);
 
-        // Remove A → gen 3 holds only B, still in slot 2.
-        let (p3, g3) = remove_pod_and_commit(&mut store, uid(1), &cap()).unwrap();
+        // Remove A → ONE generation: A moves to the revocation section (its
+        // last assignment verbatim, deadline stamped), B untouched in slot 2
+        // (rfc_owner_drain_and_logs.md §3.2). B's record is byte-identical.
+        let (p3, g3) = remove_pod_and_commit(&mut store, uid(1), 0, &cap()).unwrap();
         assert_eq!(g3, 3);
         assert_eq!(p3.assignments.len(), 1);
         assert_eq!(p3.assignments[0].slot, 2);
+        assert_eq!(p3.assignments[0], *b, "survivor untouched by removal");
+        assert_eq!(p3.revocations.len(), 1);
+        let rev = &p3.revocations[0];
+        assert_eq!(rev.assignment.pod_uid, uid(1));
+        assert_eq!(
+            (rev.assignment.slot, rev.assignment.generation),
+            (a.slot, a.generation)
+        );
+        assert_eq!(rev.grace_secs, 0);
 
-        // Re-add a pod → reuses slot 1 with a bumped owner generation (stale
-        // handles from the removed pod can never match).
+        // Re-add during the drain window → the revocation still occupies slot 1,
+        // so the new pod takes the next free slot with its own fresh identity —
+        // a clean admission alongside the drain, never a resurrection.
         let (p4, _) = upsert_pod_and_commit(&mut store, pod(3, 2), &cap()).unwrap();
         let c = p4.assignments.iter().find(|a| a.pod_uid == uid(3)).unwrap();
-        assert_eq!(c.slot, 1);
-        assert!(c.generation > a.generation);
+        assert_eq!(c.slot, 3, "drain window holds slot 1");
+        // The revocation rides along until expiry.
+        assert_eq!(p4.revocations.len(), 1);
+        // Slot 1's high-water generation is retained: post-expiry reuse of the
+        // slot must bump past the departed occupant.
+        let gens = load_slot_gens(&store).unwrap();
+        assert!(gens[1] >= a.generation);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+pub mod log_ring;
 pub mod observability;
 pub mod vocabulary;
 

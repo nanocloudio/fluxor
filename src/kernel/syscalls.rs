@@ -136,6 +136,10 @@ unsafe extern "C" fn syscall_provider_open(
     if let Some(rc) = check_privileged_internal_op(open_op) {
         return rc;
     }
+    // Every provider_open mints a new held resource — §3.5 admission.
+    if admission_closed("provider_open") {
+        return crate::kernel::errno::EACCES;
+    }
     crate::kernel::provider::provider_open(contract as u16, open_op, config, config_len)
 }
 
@@ -168,6 +172,12 @@ unsafe extern "C" fn syscall_provider_call(
     // Privileged 0x0Cxx opcodes also require the matching permission bit.
     if let Some(rc) = check_privileged_internal_op(op) {
         return rc;
+    }
+    // §3.5 admission gate on the open/create/accept/arm-class opcodes —
+    // use-style ops on established handles stay state-blind so a
+    // draining owner can flush in-flight work.
+    if admission_class_op(op) && admission_closed("provider_call") {
+        return crate::kernel::errno::EACCES;
     }
     crate::kernel::provider::provider_call(handle, op, arg, arg_len)
 }
@@ -269,7 +279,54 @@ unsafe extern "C" fn syscall_channel_port(port_type: u8, index: u8) -> i32 {
 // Channel Wrappers
 // ============================================================================
 
+/// Admission gate (rfc_owner_drain_and_logs.md §3.5): true when the calling
+/// module's owner may NOT admit new work. Admission closes the moment a drain
+/// begins; existing-handle use stays state-blind (`authorize_use` semantics),
+/// which is what lets in-flight work run dry. System-owned modules always
+/// pass. Every module-facing create/open/accept/allocate/arm path consults
+/// this — the §3.5 checklist: provider open/bind, `channel_open`, open-style
+/// `provider_call` ops (`admission_class_op`), event create, heap
+/// allocation, timer arm.
+fn admission_closed(surface: &'static str) -> bool {
+    let owner =
+        crate::kernel::scheduler::module_owner(crate::kernel::scheduler::current_module_index());
+    if owner.is_system() {
+        return false;
+    }
+    if crate::kernel::scheduler::owners_mut().authorize_admit(owner) {
+        return false;
+    }
+    log::warn!("[owner] {surface} refused: admission closed (owner draining/revoked)");
+    true
+}
+
+/// Open-style / arm-style `provider_call` opcodes that CREATE new work or
+/// resources and therefore fall under the §3.5 admission gate. Use-style ops
+/// on established handles (read/write/poll/fsync/close/cancel/destroy/
+/// buffer-acquire on open channels) are deliberately absent: a draining
+/// owner must still flush in-flight work to completion.
+fn admission_class_op(op: u32) -> bool {
+    use crate::abi::contracts::storage::fs;
+    use crate::abi::kernel_abi::{channel, event, timer};
+    matches!(
+        op,
+        // New channels / endpoints (accept = new connection admission).
+        channel::OPEN | channel::CONNECT | channel::BIND | channel::LISTEN | channel::ACCEPT
+        // Timer create + arm: cancelling timers plus this gate is the
+        // operational definition of "autonomous producers stop" (§3.5).
+        | timer::CREATE | timer::SET
+        // New wake sources.
+        | event::CREATE | event::BIND_IRQ
+        // Filesystem opens (read tier and write tier — both admit a new
+        // held resource; established fds keep working).
+        | fs::OPEN | fs::OPENDIR | fs::OPEN_CREATE
+    )
+}
+
 pub fn channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
+    if admission_closed("channel_open") {
+        return -1;
+    }
     channel::syscall_channel_open(chan_type, config, config_len)
 }
 
@@ -2055,6 +2112,11 @@ unsafe extern "C" fn syscall_heap_alloc(size: u32) -> *mut u8 {
     if crate::kernel::scheduler::deny_isr_tier_syscall("heap_alloc") {
         return core::ptr::null_mut();
     }
+    // §3.5 admission gate: heap growth is new allocation. Frees (and
+    // in-place use of existing allocations) stay state-blind.
+    if admission_closed("heap_alloc") {
+        return core::ptr::null_mut();
+    }
     let idx = crate::kernel::scheduler::current_module_index();
     crate::kernel::heap::heap_alloc(idx, size as usize)
 }
@@ -2071,6 +2133,10 @@ unsafe extern "C" fn syscall_heap_free(ptr: *mut u8) {
 /// Reallocate from the calling module's heap.
 unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u8 {
     if crate::kernel::scheduler::deny_isr_tier_syscall("heap_realloc") {
+        return core::ptr::null_mut();
+    }
+    // §3.5 admission gate: realloc can grow — new allocation.
+    if admission_closed("heap_realloc") {
         return core::ptr::null_mut();
     }
     let idx = crate::kernel::scheduler::current_module_index();

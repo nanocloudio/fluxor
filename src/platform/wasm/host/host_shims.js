@@ -1304,7 +1304,7 @@ registerProcessor('pcm-ring', PcmRing);
         view.setUint32(16, (ev.epoch >>> 0), true);
         view.setUint8(20, 0);                            // AUTHORITY_BROWSER
         view.setUint8(21, (ev.displayCount == null ? 1 : ev.displayCount) & 0xFF); // a browser always has a display
-        view.setUint8(22, 0);
+        view.setUint8(22, (ev.dpr8 || 0) & 0xFF);        // pad[0] = devicePixelRatio ×8 (DPR-aware raster)
         view.setUint8(23, 0);
         return 24;
       },

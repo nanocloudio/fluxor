@@ -18,6 +18,7 @@
 )]
 
 pub mod add_subgraph;
+pub mod agent_logs;
 pub mod asset_bank;
 pub mod cargo_index;
 pub mod ci;

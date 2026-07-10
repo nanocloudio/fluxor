@@ -119,10 +119,18 @@ impl SlotState {
     };
 }
 
-/// Snapshot of the owner table, indexed by slot (slot 0 = system).
+/// Snapshot of the owner table, indexed by slot (slot 0 = system), plus the
+/// committed plan's records: prior assignments (so resident pods retain their
+/// module/edge ranges verbatim across membership changes —
+/// rfc_owner_drain_and_logs.md §3.3) and prior revocations (carried forward
+/// until expiry, §3.2).
 #[derive(Clone, Debug, Default)]
 pub struct OwnerSnapshot {
     pub slots: Vec<SlotState>,
+    /// The committed plan's assignments (empty when nothing committed).
+    pub assignments: Vec<OwnerAssignment>,
+    /// The committed plan's still-listed revocations.
+    pub revocations: Vec<PlanRevocation>,
 }
 
 impl OwnerSnapshot {
@@ -130,6 +138,8 @@ impl OwnerSnapshot {
     pub fn empty(max_owners: u16) -> Self {
         OwnerSnapshot {
             slots: vec![SlotState::EMPTY; max_owners as usize],
+            assignments: Vec::new(),
+            revocations: Vec::new(),
         }
     }
 
@@ -164,12 +174,42 @@ pub struct OwnerAssignment {
     pub buffer_cap: u32,
 }
 
+/// One departing owner: its last assignment record verbatim, plus the grace
+/// window (rfc_owner_drain_and_logs.md §3.2). Removal is ONE generation: the
+/// record moves from the assignment section to the revocation section, carrying
+/// `deadline_unix = wallclock_at_publish + grace_secs` stamped by the agent.
+/// While live (deadline not yet passed + settle margin) it occupies its slot
+/// and charges its resource footprint in admission; expiry frees both by the
+/// calendar — no acknowledgement protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanRevocation {
+    pub assignment: OwnerAssignment,
+    pub grace_secs: u16,
+    pub deadline_unix: u64,
+}
+
+/// Settle margin added to a revocation's deadline before the agent drops the
+/// record on recompose — absorbs clock skew between agent invocations
+/// (rfc_owner_drain_and_logs.md §6.1).
+pub const REVOCATION_SETTLE_SECS: u64 = 5;
+
+impl PlanRevocation {
+    /// Still occupying its slot/ranges/capacity at `now`?
+    pub fn live_at(&self, now_unix: u64) -> bool {
+        now_unix <= self.deadline_unix.saturating_add(REVOCATION_SETTLE_SECS)
+    }
+}
+
 /// A composed, validated device-graph plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompositionPlan {
     pub generation: u64,
     /// Assignments in ascending slot order.
     pub assignments: Vec<OwnerAssignment>,
+    /// Owners departing under a drain window, in ascending slot order. Usually
+    /// empty — and an empty section encodes byte-identically to the
+    /// pre-revocation format.
+    pub revocations: Vec<PlanRevocation>,
     pub plan_digest: Digest32,
 }
 
@@ -185,11 +225,55 @@ pub enum ComposeError {
     DomainsExceeded,
 }
 
-/// Compose a candidate device graph. Deterministic in `(desired, cap, prior)`.
+/// One occupied interval in an index space (module or edge).
+type Interval = (u32, u32); // (base, count)
+
+/// First-fit `count` into the space `[0, max)` avoiding `occupied` (sorted by
+/// base). Returns the base, or None when no gap holds it (free-but-fragmented
+/// space is reported honestly as exhaustion — rfc_owner_drain_and_logs.md §3.3).
+fn first_fit(occupied: &[Interval], count: u32, max: u32) -> Option<u32> {
+    if count == 0 {
+        return Some(0);
+    }
+    let mut cursor: u32 = 0;
+    for &(base, len) in occupied {
+        if base >= cursor && base - cursor >= count {
+            return Some(cursor);
+        }
+        cursor = cursor.max(base + len);
+    }
+    if max >= cursor && max - cursor >= count {
+        return Some(cursor);
+    }
+    None
+}
+
+fn insert_interval(occupied: &mut Vec<Interval>, base: u32, count: u32) {
+    if count == 0 {
+        return;
+    }
+    let pos = occupied.partition_point(|&(b, _)| b < base);
+    occupied.insert(pos, (base, count));
+}
+
+/// Compose a candidate device graph. Deterministic in
+/// `(desired, cap, prior, revoke_graces, now_unix)` — the clock is an input,
+/// stamped by the agent at publish, never read here.
+///
+/// Revocation lifecycle (rfc_owner_drain_and_logs.md §3.2–§3.3): prior
+/// revocations are carried forward until expiry; a prior occupant absent from
+/// the new running set departs as a NEW revocation record (its last assignment
+/// verbatim + `deadline_unix = now + grace`); live revocations occupy their
+/// slot, hold their module/edge ranges, and charge state/buffer capacity.
+/// Resident pods retain their prior ranges verbatim; new (or resized) pods are
+/// placed first-fit into the gaps, so a removal generation leaves every
+/// surviving assignment byte-identical.
 pub fn compose(
     desired: &DeviceDesiredState,
     cap: &NodeCapacity,
     prior: &OwnerSnapshot,
+    revoke_graces: &[(PodUid, u16)],
+    now_unix: u64,
 ) -> Result<CompositionPlan, ComposeError> {
     // 1. Only running pods are placed; sort by pod_uid for a stable order.
     let mut running: Vec<&PodDesired> = desired
@@ -199,12 +283,46 @@ pub fn compose(
         .collect();
     running.sort_by(|a, b| a.pod_uid.cmp(&b.pod_uid));
 
-    // 2. Assign owner slots. Resident pods keep their slot+generation; new pods
-    //    take the lowest free slot with a bumped generation.
-    let occupied_by_desired: Vec<u16> = running
+    // 2. Revocations: carry forward the prior plan's live records, then add one
+    //    for each prior occupant departing in this generation.
+    let mut revocations: Vec<PlanRevocation> = prior
+        .revocations
+        .iter()
+        .filter(|r| r.live_at(now_unix))
+        .copied()
+        .collect();
+    let prior_assignment_of = |uid: &PodUid| prior.assignments.iter().find(|a| &a.pod_uid == uid);
+    for a in &prior.assignments {
+        let still_running = running.iter().any(|p| p.pod_uid == a.pod_uid);
+        let already_revoked = revocations
+            .iter()
+            .any(|r| r.assignment.slot == a.slot && r.assignment.generation == a.generation);
+        if !still_running && !already_revoked {
+            let grace = revoke_graces
+                .iter()
+                .find(|(uid, _)| uid == &a.pod_uid)
+                .map(|(_, g)| *g)
+                .unwrap_or(0);
+            let rev = PlanRevocation {
+                assignment: *a,
+                grace_secs: grace,
+                deadline_unix: now_unix.saturating_add(grace as u64),
+            };
+            if rev.live_at(now_unix) {
+                revocations.push(rev);
+            }
+        }
+    }
+    revocations.sort_by_key(|r| r.assignment.slot);
+
+    // 3. Assign owner slots. Resident pods keep their slot+generation; new pods
+    //    take the lowest free slot (never one held by a live revocation) with a
+    //    bumped generation.
+    let mut occupied_slots: Vec<u16> = running
         .iter()
         .filter_map(|p| prior.slot_of(&p.pod_uid))
         .collect();
+    occupied_slots.extend(revocations.iter().map(|r| r.assignment.slot));
 
     let mut next_free: u16 = 1; // slot 0 is the system owner
     let mut free_slot = |occupied: &[u16], cap: &NodeCapacity| -> Option<u16> {
@@ -224,35 +342,68 @@ pub fn compose(
         if let Some(slot) = prior.slot_of(&p.pod_uid) {
             placed.push((slot, prior.generation_at(slot)));
         } else {
-            let slot =
-                free_slot(&occupied_by_desired, cap).ok_or(ComposeError::OwnerSlotsExhausted)?;
+            let slot = free_slot(&occupied_slots, cap).ok_or(ComposeError::OwnerSlotsExhausted)?;
             placed.push((slot, prior.generation_at(slot).wrapping_add(1)));
         }
     }
 
-    // 3. Order assignments by slot (stable graph layout), then lay out module
-    //    and edge index ranges contiguously while checking aggregate capacity.
+    // 4. Range layout (§3.3): live revocations hold their ranges; resident pods
+    //    whose profile still matches retain their prior ranges VERBATIM; new or
+    //    resized pods first-fit into the gaps. Aggregate capacity charges
+    //    running pods plus live revocations (the draining owner really is still
+    //    holding modules/state/buffers).
+    let mut module_occ: Vec<Interval> = Vec::new();
+    let mut edge_occ: Vec<Interval> = Vec::new();
+    let mut total_state: u64 = 0;
+    let mut total_buffer: u64 = 0;
+    let mut total_modules: u32 = 0;
+    let mut total_edges: u32 = 0;
+    for r in &revocations {
+        let a = &r.assignment;
+        insert_interval(&mut module_occ, a.module_base as u32, a.module_count as u32);
+        insert_interval(&mut edge_occ, a.edge_base as u32, a.edge_count as u32);
+        total_modules += a.module_count as u32;
+        total_edges += a.edge_count as u32;
+        total_state += a.state_cap as u64;
+        total_buffer += a.buffer_cap as u64;
+    }
+
+    // Retained residents first (their ranges are fixed), then the rest.
     let mut order: Vec<usize> = (0..running.len()).collect();
     order.sort_by_key(|&i| placed[i].0);
 
-    let mut module_cursor: u32 = 0;
-    let mut edge_cursor: u32 = 0;
-    let mut total_state: u64 = 0;
-    let mut total_buffer: u64 = 0;
+    struct Pending {
+        idx: usize,
+        retained: Option<(u16, u16)>, // (module_base, edge_base) kept verbatim
+    }
+    let mut pending: Vec<Pending> = Vec::with_capacity(order.len());
+    for &i in &order {
+        let p = running[i];
+        let retained = prior_assignment_of(&p.pod_uid).and_then(|a| {
+            (a.module_count == p.profile.modules && a.edge_count == p.profile.edges)
+                .then_some((a.module_base, a.edge_base))
+        });
+        if let Some((mb, eb)) = retained {
+            insert_interval(&mut module_occ, mb as u32, p.profile.modules as u32);
+            insert_interval(&mut edge_occ, eb as u32, p.profile.edges as u32);
+        }
+        pending.push(Pending { idx: i, retained });
+    }
+
     let mut total_endpoints: u32 = 0;
     let mut total_domains: u32 = 0;
     let mut assignments: Vec<OwnerAssignment> = Vec::with_capacity(order.len());
 
-    for &i in &order {
-        let p = running[i];
-        let (slot, generation) = placed[i];
+    for pend in &pending {
+        let p = running[pend.idx];
+        let (slot, generation) = placed[pend.idx];
 
-        module_cursor += p.profile.modules as u32;
-        if module_cursor > cap.max_modules as u32 {
+        total_modules += p.profile.modules as u32;
+        if total_modules > cap.max_modules as u32 {
             return Err(ComposeError::ModulesExceeded);
         }
-        edge_cursor += p.profile.edges as u32;
-        if edge_cursor > cap.max_edges as u32 {
+        total_edges += p.profile.edges as u32;
+        if total_edges > cap.max_edges as u32 {
             return Err(ComposeError::EdgesExceeded);
         }
         total_state += p.profile.state_bytes as u64;
@@ -272,23 +423,41 @@ pub fn compose(
             return Err(ComposeError::DomainsExceeded);
         }
 
+        let (module_base, edge_base) = match pend.retained {
+            Some((mb, eb)) => (mb as u32, eb as u32),
+            None => {
+                let mb = first_fit(
+                    &module_occ,
+                    p.profile.modules as u32,
+                    cap.max_modules as u32,
+                )
+                .ok_or(ComposeError::ModulesExceeded)?;
+                let eb = first_fit(&edge_occ, p.profile.edges as u32, cap.max_edges as u32)
+                    .ok_or(ComposeError::EdgesExceeded)?;
+                insert_interval(&mut module_occ, mb, p.profile.modules as u32);
+                insert_interval(&mut edge_occ, eb, p.profile.edges as u32);
+                (mb, eb)
+            }
+        };
+
         assignments.push(OwnerAssignment {
             pod_uid: p.pod_uid,
             slot,
             generation,
-            module_base: (module_cursor - p.profile.modules as u32) as u16,
+            module_base: module_base as u16,
             module_count: p.profile.modules,
-            edge_base: (edge_cursor - p.profile.edges as u32) as u16,
+            edge_base: edge_base as u16,
             edge_count: p.profile.edges,
             state_cap: p.profile.state_bytes,
             buffer_cap: p.profile.buffer_bytes,
         });
     }
 
-    let plan_digest = digest_plan(desired.generation, &assignments);
+    let plan_digest = digest_plan(desired.generation, &assignments, &revocations);
     Ok(CompositionPlan {
         generation: desired.generation,
         assignments,
+        revocations,
         plan_digest,
     })
 }
@@ -298,24 +467,56 @@ pub fn compose(
 /// + edge_base(2) + edge_count(2).
 const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
 
+/// Per-revocation fixed record width: an assignment record verbatim plus
+/// grace_secs(2) + deadline_unix(8) (rfc_owner_drain_and_logs.md §3.2).
+const REVOKE_REC_LEN: usize = ASSIGN_REC_LEN + 2 + 8;
+
+fn push_assignment(buf: &mut Vec<u8>, a: &OwnerAssignment) {
+    buf.extend_from_slice(&a.pod_uid);
+    buf.extend_from_slice(&a.slot.to_be_bytes());
+    buf.extend_from_slice(&a.generation.to_be_bytes());
+    buf.extend_from_slice(&a.module_base.to_be_bytes());
+    buf.extend_from_slice(&a.module_count.to_be_bytes());
+    buf.extend_from_slice(&a.edge_base.to_be_bytes());
+    buf.extend_from_slice(&a.edge_count.to_be_bytes());
+    buf.extend_from_slice(&a.state_cap.to_be_bytes());
+    buf.extend_from_slice(&a.buffer_cap.to_be_bytes());
+}
+
 /// Canonical, fixed-width big-endian serialization of a plan's payload
-/// (generation + count + assignments). Stable across platforms, so the digest
-/// over it — and the encoded plan — are reproducible. Shared by `digest_plan`
-/// and `encode_plan`.
-fn plan_body(generation: u64, assignments: &[OwnerAssignment]) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::with_capacity(12 + assignments.len() * ASSIGN_REC_LEN);
+/// (generation + count + assignments [+ revocation section]). Stable across
+/// platforms, so the digest over it — and the encoded plan — are reproducible.
+/// Shared by `digest_plan` and `encode_plan`.
+///
+/// The revocation section (`rev_count(4)` + records) is appended ONLY when
+/// non-empty: a plan with no revocations — the overwhelmingly common case —
+/// encodes byte-identically to the pre-revocation format, and the assignment
+/// decode path is untouched.
+fn plan_body(
+    generation: u64,
+    assignments: &[OwnerAssignment],
+    revocations: &[PlanRevocation],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(
+        12 + assignments.len() * ASSIGN_REC_LEN
+            + if revocations.is_empty() {
+                0
+            } else {
+                4 + revocations.len() * REVOKE_REC_LEN
+            },
+    );
     buf.extend_from_slice(&generation.to_be_bytes());
     buf.extend_from_slice(&(assignments.len() as u32).to_be_bytes());
     for a in assignments {
-        buf.extend_from_slice(&a.pod_uid);
-        buf.extend_from_slice(&a.slot.to_be_bytes());
-        buf.extend_from_slice(&a.generation.to_be_bytes());
-        buf.extend_from_slice(&a.module_base.to_be_bytes());
-        buf.extend_from_slice(&a.module_count.to_be_bytes());
-        buf.extend_from_slice(&a.edge_base.to_be_bytes());
-        buf.extend_from_slice(&a.edge_count.to_be_bytes());
-        buf.extend_from_slice(&a.state_cap.to_be_bytes());
-        buf.extend_from_slice(&a.buffer_cap.to_be_bytes());
+        push_assignment(&mut buf, a);
+    }
+    if !revocations.is_empty() {
+        buf.extend_from_slice(&(revocations.len() as u32).to_be_bytes());
+        for r in revocations {
+            push_assignment(&mut buf, &r.assignment);
+            buf.extend_from_slice(&r.grace_secs.to_be_bytes());
+            buf.extend_from_slice(&r.deadline_unix.to_be_bytes());
+        }
     }
     buf
 }
@@ -330,9 +531,14 @@ fn sha256_of(bytes: &[u8]) -> Digest32 {
 }
 
 /// Canonical content digest over a plan. Fixed-width big-endian encoding so the
-/// bytes — and therefore the digest — are stable across platforms.
-fn digest_plan(generation: u64, assignments: &[OwnerAssignment]) -> Digest32 {
-    sha256_of(&plan_body(generation, assignments))
+/// bytes — and therefore the digest — are stable across platforms. Covers the
+/// revocation section too: a tampered deadline fails the digest.
+fn digest_plan(
+    generation: u64,
+    assignments: &[OwnerAssignment],
+    revocations: &[PlanRevocation],
+) -> Digest32 {
+    sha256_of(&plan_body(generation, assignments, revocations))
 }
 
 // ============================================================================
@@ -363,9 +569,10 @@ pub enum PlanDecodeError {
 
 /// Encode a composed plan into the bounded binary form the kernel consumes:
 /// `[header][body][sha256(body)]`. Deterministic — identical plans encode to
-/// identical bytes.
+/// identical bytes; a plan with no revocations encodes byte-identically to the
+/// pre-revocation format.
 pub fn encode_plan(plan: &CompositionPlan) -> Vec<u8> {
-    let body = plan_body(plan.generation, &plan.assignments);
+    let body = plan_body(plan.generation, &plan.assignments, &plan.revocations);
     let digest = sha256_of(&body);
     let mut out = Vec::with_capacity(PLAN_HEADER_LEN + body.len() + 32);
     out.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
@@ -397,7 +604,36 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
     if count > MAX_PLAN_ASSIGNMENTS {
         return Err(PlanDecodeError::TooManyAssignments);
     }
-    let body_len = 12 + count * ASSIGN_REC_LEN;
+    let assign_len = 12 + count * ASSIGN_REC_LEN;
+    let base_total = PLAN_HEADER_LEN + assign_len + 32;
+    if bytes.len() < base_total {
+        return Err(PlanDecodeError::Truncated);
+    }
+    // Optional revocation section: present iff bytes remain between the
+    // assignments and the digest (an empty section is never encoded, so the
+    // no-revocation format is exactly the pre-revocation format).
+    let rev_count = if bytes.len() == base_total {
+        0usize
+    } else {
+        // A real revocation section is at least rev_count(4) + one record; any
+        // shorter surplus is trailing garbage, not a truncated section.
+        if bytes.len() < base_total + 4 + REVOKE_REC_LEN {
+            return Err(PlanDecodeError::TrailingBytes);
+        }
+        let rc = u32::from_be_bytes(body[assign_len..assign_len + 4].try_into().unwrap()) as usize;
+        if rc == 0 || rc > MAX_PLAN_ASSIGNMENTS {
+            // An explicitly-empty section is not a valid encoding; treat like
+            // trailing garbage rather than a second way to spell "none".
+            return Err(PlanDecodeError::TrailingBytes);
+        }
+        rc
+    };
+    let body_len = assign_len
+        + if rev_count > 0 {
+            4 + rev_count * REVOKE_REC_LEN
+        } else {
+            0
+        };
     let expected_total = PLAN_HEADER_LEN + body_len + 32;
     if bytes.len() < expected_total {
         return Err(PlanDecodeError::Truncated);
@@ -410,12 +646,10 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
     if sha256_of(&body[..body_len]) != digest {
         return Err(PlanDecodeError::DigestMismatch);
     }
-    let mut assignments = Vec::with_capacity(count);
-    for i in 0..count {
-        let r = &body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN];
+    let read_assignment = |r: &[u8]| -> OwnerAssignment {
         let mut pod_uid = [0u8; 16];
         pod_uid.copy_from_slice(&r[0..16]);
-        assignments.push(OwnerAssignment {
+        OwnerAssignment {
             pod_uid,
             slot: u16::from_be_bytes(r[16..18].try_into().unwrap()),
             generation: u32::from_be_bytes(r[18..22].try_into().unwrap()),
@@ -425,6 +659,28 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
             edge_count: u16::from_be_bytes(r[28..30].try_into().unwrap()),
             state_cap: u32::from_be_bytes(r[30..34].try_into().unwrap()),
             buffer_cap: u32::from_be_bytes(r[34..38].try_into().unwrap()),
+        }
+    };
+    let mut assignments = Vec::with_capacity(count);
+    for i in 0..count {
+        assignments.push(read_assignment(
+            &body[12 + i * ASSIGN_REC_LEN..12 + (i + 1) * ASSIGN_REC_LEN],
+        ));
+    }
+    let mut revocations = Vec::with_capacity(rev_count);
+    for i in 0..rev_count {
+        let base = assign_len + 4 + i * REVOKE_REC_LEN;
+        let r = &body[base..base + REVOKE_REC_LEN];
+        revocations.push(PlanRevocation {
+            assignment: read_assignment(&r[..ASSIGN_REC_LEN]),
+            grace_secs: u16::from_be_bytes(
+                r[ASSIGN_REC_LEN..ASSIGN_REC_LEN + 2].try_into().unwrap(),
+            ),
+            deadline_unix: u64::from_be_bytes(
+                r[ASSIGN_REC_LEN + 2..ASSIGN_REC_LEN + 10]
+                    .try_into()
+                    .unwrap(),
+            ),
         });
     }
     let mut plan_digest = [0u8; 32];
@@ -432,6 +688,7 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
     Ok(CompositionPlan {
         generation,
         assignments,
+        revocations,
         plan_digest,
     })
 }
@@ -584,8 +841,8 @@ mod tests {
             pods: vec![b, a],
         };
 
-        let p1 = compose(&s1, &cap(), &snap).unwrap();
-        let p2 = compose(&s2, &cap(), &snap).unwrap();
+        let p1 = compose(&s1, &cap(), &snap, &[], 0).unwrap();
+        let p2 = compose(&s2, &cap(), &snap, &[], 0).unwrap();
         assert_eq!(p1, p2);
         assert_eq!(p1.plan_digest, p2.plan_digest);
 
@@ -608,7 +865,7 @@ mod tests {
                 pod(2, DesiredPhase::Running, profile(4, 4)),
             ],
         };
-        let plan = compose(&ds, &cap(), &snap).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[], 0).unwrap();
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.assignments[0].pod_uid, uid(2));
     }
@@ -629,7 +886,7 @@ mod tests {
                 pod(3, DesiredPhase::Running, profile(4, 4)),
             ],
         };
-        let plan = compose(&ds, &cap(), &snap).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[], 0).unwrap();
         let a2 = plan
             .assignments
             .iter()
@@ -659,7 +916,7 @@ mod tests {
             system_revision: 1,
             pods: vec![pod(7, DesiredPhase::Running, profile(4, 4))],
         };
-        let plan = compose(&ds, &cap(), &snap).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[], 0).unwrap();
         assert_eq!(plan.assignments[0].slot, 1);
         assert_eq!(plan.assignments[0].generation, 10); // 9 + 1, never reused
     }
@@ -673,7 +930,7 @@ mod tests {
             pods: vec![pod(1, DesiredPhase::Running, profile(200, 4))],
         };
         assert_eq!(
-            compose(&ds, &cap(), &snap),
+            compose(&ds, &cap(), &snap, &[], 0),
             Err(ComposeError::ModulesExceeded)
         );
     }
@@ -694,7 +951,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            compose(&ds, &small, &snap),
+            compose(&ds, &small, &snap, &[], 0),
             Err(ComposeError::OwnerSlotsExhausted)
         );
     }
@@ -731,7 +988,7 @@ mod tests {
                 pod(2, DesiredPhase::Running, profile(8, 10)),
             ],
         };
-        compose(&ds, &cap(), &snap).unwrap()
+        compose(&ds, &cap(), &snap, &[], 0).unwrap()
     }
 
     #[test]
@@ -755,7 +1012,8 @@ mod tests {
         let plan = CompositionPlan {
             generation: 7,
             assignments: vec![],
-            plan_digest: digest_plan(7, &[]),
+            revocations: vec![],
+            plan_digest: digest_plan(7, &[], &[]),
         };
         assert_eq!(decode_plan(&encode_plan(&plan)).unwrap(), plan);
     }
@@ -778,6 +1036,226 @@ mod tests {
         assert_eq!(decode_plan(&bad_magic), Err(PlanDecodeError::BadMagic));
         bytes[5] = 0xFF; // version low byte
         assert_eq!(decode_plan(&bytes), Err(PlanDecodeError::BadVersion));
+    }
+
+    /// A snapshot that carries the given plan as prior state (occupancy +
+    /// retained ranges + revocations), the way `snapshot_from_committed` does.
+    fn snap_from(plan: &CompositionPlan, max_owners: u16) -> OwnerSnapshot {
+        let mut snap = OwnerSnapshot::empty(max_owners);
+        for a in &plan.assignments {
+            snap.slots[a.slot as usize].occupant = Some(a.pod_uid);
+            snap.slots[a.slot as usize].generation = a.generation;
+        }
+        for r in &plan.revocations {
+            let s = &mut snap.slots[r.assignment.slot as usize];
+            s.generation = s.generation.max(r.assignment.generation);
+        }
+        snap.assignments = plan.assignments.clone();
+        snap.revocations = plan.revocations.clone();
+        snap
+    }
+
+    #[test]
+    fn no_revocation_plan_encodes_byte_identically_to_the_prerevocation_format() {
+        // The exact pre-revocation layout, hand-built: header + generation +
+        // count + assignment records + sha256(body). A plan with an empty
+        // revocation section must produce these bytes and no more.
+        let plan = sample_plan();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
+        expected.extend_from_slice(&PLAN_VERSION.to_be_bytes());
+        expected.extend_from_slice(&0u16.to_be_bytes());
+        let mut body = Vec::new();
+        body.extend_from_slice(&plan.generation.to_be_bytes());
+        body.extend_from_slice(&(plan.assignments.len() as u32).to_be_bytes());
+        for a in &plan.assignments {
+            push_assignment(&mut body, a);
+        }
+        expected.extend_from_slice(&body);
+        expected.extend_from_slice(&sha256_of(&body));
+        assert_eq!(encode_plan(&plan), expected);
+    }
+
+    #[test]
+    fn plan_with_revocations_round_trips_and_digest_guards_the_deadline() {
+        let committed = sample_plan();
+        let snap = snap_from(&committed, 16);
+        // Remove pod 1 with a 30 s grace at t=1000.
+        let ds = DeviceDesiredState {
+            generation: 43,
+            system_revision: 1,
+            pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
+        };
+        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 30)], 1000).unwrap();
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.revocations.len(), 1);
+        let rev = &plan.revocations[0];
+        assert_eq!(rev.assignment.pod_uid, uid(1));
+        assert_eq!(rev.grace_secs, 30);
+        assert_eq!(rev.deadline_unix, 1030);
+
+        let bytes = encode_plan(&plan);
+        assert_eq!(decode_plan(&bytes).unwrap(), plan);
+
+        // Tampering with the stamped deadline fails the digest.
+        let mut tampered = bytes.clone();
+        let last_body = tampered.len() - 33; // last byte of deadline_unix
+        tampered[last_body] ^= 0xFF;
+        assert_eq!(decode_plan(&tampered), Err(PlanDecodeError::DigestMismatch));
+
+        // Truncating inside the revocation section fails closed.
+        assert!(decode_plan(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn removal_leaves_survivors_byte_identical_and_holds_the_departed_ranges() {
+        let committed = sample_plan();
+        let survivor = *committed
+            .assignments
+            .iter()
+            .find(|a| a.pod_uid == uid(2))
+            .unwrap();
+        let departed = *committed
+            .assignments
+            .iter()
+            .find(|a| a.pod_uid == uid(1))
+            .unwrap();
+        let snap = snap_from(&committed, 16);
+
+        let ds = DeviceDesiredState {
+            generation: 43,
+            system_revision: 1,
+            pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
+        };
+        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 60)], 1000).unwrap();
+        // §3.3: the survivor's record is BYTE-identical (slot, gen, ranges).
+        assert_eq!(plan.assignments, vec![survivor]);
+        // The departed owner's ranges are still held by its revocation.
+        assert_eq!(plan.revocations[0].assignment, departed);
+
+        // A new pod admitted during the drain first-fits AROUND the held
+        // ranges — it must not overlap the draining owner's modules.
+        let snap2 = snap_from(&plan, 16);
+        let ds2 = DeviceDesiredState {
+            generation: 44,
+            system_revision: 1,
+            pods: vec![
+                pod(2, DesiredPhase::Running, profile(8, 10)),
+                pod(3, DesiredPhase::Running, profile(4, 6)),
+            ],
+        };
+        let plan2 = compose(&ds2, &cap(), &snap2, &[], 1001).unwrap();
+        let newcomer = plan2
+            .assignments
+            .iter()
+            .find(|a| a.pod_uid == uid(3))
+            .unwrap();
+        let dep_end = departed.module_base + departed.module_count;
+        let new_end = newcomer.module_base + newcomer.module_count;
+        assert!(
+            new_end <= departed.module_base || newcomer.module_base >= dep_end,
+            "newcomer {}..{} overlaps draining owner {}..{}",
+            newcomer.module_base,
+            new_end,
+            departed.module_base,
+            dep_end
+        );
+    }
+
+    #[test]
+    fn expired_revocation_frees_slot_ranges_and_capacity() {
+        let committed = sample_plan();
+        let departed = *committed
+            .assignments
+            .iter()
+            .find(|a| a.pod_uid == uid(1))
+            .unwrap();
+        let snap = snap_from(&committed, 16);
+        let ds = DeviceDesiredState {
+            generation: 43,
+            system_revision: 1,
+            pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
+        };
+        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 10)], 1000).unwrap();
+        assert_eq!(plan.revocations.len(), 1, "live during the window");
+
+        // Recompose after deadline + settle: the record drops, and a new pod
+        // may reuse the freed slot (post-expiry, at a bumped generation via the
+        // high-water table — modeled here by the retained snapshot generation).
+        let snap2 = snap_from(&plan, 16);
+        let ds2 = DeviceDesiredState {
+            generation: 44,
+            system_revision: 1,
+            pods: vec![
+                pod(2, DesiredPhase::Running, profile(8, 10)),
+                pod(3, DesiredPhase::Running, profile(4, 6)),
+            ],
+        };
+        let expired_now = 1000 + 10 + REVOCATION_SETTLE_SECS + 1;
+        let plan2 = compose(&ds2, &cap(), &snap2, &[], expired_now).unwrap();
+        assert!(plan2.revocations.is_empty(), "expired record dropped");
+        let newcomer = plan2
+            .assignments
+            .iter()
+            .find(|a| a.pod_uid == uid(3))
+            .unwrap();
+        assert_eq!(newcomer.slot, departed.slot, "slot freed by the calendar");
+        assert!(
+            newcomer.generation > departed.generation,
+            "reuse bumps past the departed occupant"
+        );
+    }
+
+    #[test]
+    fn revocations_charge_capacity_honestly() {
+        // Node with room for exactly 12 modules. One 8-module pod committed.
+        let mut small = cap();
+        small.max_modules = 12;
+        let snap0 = OwnerSnapshot::empty(16);
+        let ds0 = DeviceDesiredState {
+            generation: 1,
+            system_revision: 1,
+            pods: vec![pod(1, DesiredPhase::Running, profile(8, 4))],
+        };
+        let committed = compose(&ds0, &small, &snap0, &[], 0).unwrap();
+
+        // Remove it with grace, and try to admit another 8-module pod during
+        // the window: the draining owner still holds its 8 modules, so the
+        // node honestly reports exhaustion.
+        let snap = snap_from(&committed, 16);
+        let ds = DeviceDesiredState {
+            generation: 2,
+            system_revision: 1,
+            pods: vec![pod(2, DesiredPhase::Running, profile(8, 4))],
+        };
+        assert_eq!(
+            compose(&ds, &small, &snap, &[(uid(1), 60)], 1000),
+            Err(ComposeError::ModulesExceeded)
+        );
+
+        // The removal alone (no newcomer) commits fine; its snapshot carries the
+        // live revocation forward. After expiry, recomposing with the newcomer
+        // succeeds — capacity freed by the calendar, no acknowledgement.
+        let ds_removed = DeviceDesiredState {
+            generation: 2,
+            system_revision: 1,
+            pods: vec![],
+        };
+        let removal = compose(&ds_removed, &small, &snap, &[(uid(1), 60)], 1000).unwrap();
+        assert_eq!(removal.revocations.len(), 1);
+        let snap2 = snap_from(&removal, 16);
+        let ds2 = DeviceDesiredState {
+            generation: 3,
+            system_revision: 1,
+            pods: vec![pod(2, DesiredPhase::Running, profile(8, 4))],
+        };
+        assert_eq!(
+            compose(&ds2, &small, &snap2, &[], 1000),
+            Err(ComposeError::ModulesExceeded),
+            "still exhausted during the window"
+        );
+        let expired = 1000 + 60 + REVOCATION_SETTLE_SECS + 1;
+        assert!(compose(&ds2, &small, &snap2, &[], expired).is_ok());
     }
 
     #[test]

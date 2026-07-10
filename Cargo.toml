@@ -31,6 +31,9 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
+# Shared, dependency-free contracts: the storage-surface vocabulary and the
+# per-owner log ring format/algorithm (no_std, no serde in this build).
+fluxor-contracts = { path = "contracts", default-features = false }
 # --- RP-family dependencies (Cortex-M targets) ---
 # Async executor for main task and logger task.
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"], optional = true }

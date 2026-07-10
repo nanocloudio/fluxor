@@ -41,6 +41,25 @@ pub enum AgentCommand {
     /// Report the node's committed generation and per-pod status
     /// (owner-tagged: pod UID + owner slot + generation, rfc_k8s.md §17.2).
     Status(StatusArgs),
+    /// Stream an owner's per-owner log ring (rfc_owner_drain_and_logs.md §4.5).
+    Logs(LogsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct LogsArgs {
+    /// Generation-store directory (used to locate the runtime's `logs/` sidecar).
+    #[arg(long)]
+    pub store: PathBuf,
+    /// Owner UID: 32 hex chars (dashes allowed) or the literal `system` for
+    /// owner-0 / platform records.
+    #[arg(long, visible_alias = "pod-uid")]
+    pub owner_uid: String,
+    /// Only records at or after this Unix-millisecond timestamp.
+    #[arg(long)]
+    pub since: Option<u64>,
+    /// Only the last N records.
+    #[arg(long)]
+    pub tail: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -59,9 +78,15 @@ pub struct RemoveArgs {
     pub store: PathBuf,
     #[arg(long)]
     pub publish: PathBuf,
-    /// Pod UID as 32 hex chars (dashes allowed).
-    #[arg(long)]
+    /// Owner UID as 32 hex chars (dashes allowed).
+    #[arg(long, visible_alias = "owner-uid")]
     pub pod_uid: String,
+    /// Grace window in seconds: the owner drains (admission closed, in-flight
+    /// work runs, readiness withdrawn) and is revoked at quiescence or this
+    /// deadline, whichever comes first (rfc_owner_drain_and_logs.md §3.1).
+    /// 0 = revoke immediately.
+    #[arg(long, default_value_t = 0)]
+    pub grace: u16,
     /// Target capacity profile (linux | cm5 | bcm2712) — sets the kernel
     /// limits admission checks against.
     #[arg(long, default_value = "linux")]
@@ -220,7 +245,46 @@ pub fn dispatch(args: AgentArgs) -> Result<()> {
         AgentCommand::Commit(c) => commit(c),
         AgentCommand::Remove(r) => remove(r),
         AgentCommand::Status(s) => status(s),
+        AgentCommand::Logs(l) => logs(l),
     }
+}
+
+fn logs(a: LogsArgs) -> Result<()> {
+    use fluxor_tools::agent_logs::{
+        apply_filter, parse_owner_uid, read_owner_records, render_lines, LogFilter,
+    };
+    use fluxor_tools::node_agent::published_sidecar_dir;
+
+    let uid = parse_owner_uid(&a.owner_uid).ok_or_else(|| {
+        Error::Config(format!(
+            "invalid --owner-uid '{}' (want 32 hex chars or 'system')",
+            a.owner_uid
+        ))
+    })?;
+
+    let storage = FsStorage::open(&a.store)
+        .map_err(|e| Error::Config(format!("open store {}: {e}", a.store.display())))?;
+    let store = GenStore::new(storage);
+
+    // The ring directory sits beside owner_status.json, under `logs/`. If nothing
+    // has been published (or no logs exist yet) there is simply nothing to show.
+    let Some(sidecar) = published_sidecar_dir(&store) else {
+        return Ok(());
+    };
+    let logs_dir = sidecar.join("logs");
+
+    let records = read_owner_records(&logs_dir, &uid);
+    let filtered = apply_filter(
+        &records,
+        &LogFilter {
+            since_ms: a.since,
+            tail: a.tail,
+        },
+    );
+    for line in render_lines(&filtered) {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn status(a: StatusArgs) -> Result<()> {
@@ -295,7 +359,7 @@ fn remove(r: RemoveArgs) -> Result<()> {
         .map_err(|e| Error::Config(format!("open store {}: {e}", r.store.display())))?;
     let mut store = GenStore::new(storage);
     let cap = capacity(&r.profile)?;
-    let (plan, gen) = remove_pod_and_commit(&mut store, pod_uid, &cap)
+    let (plan, gen) = remove_pod_and_commit(&mut store, pod_uid, r.grace, &cap)
         .map_err(|e| Error::Config(format!("remove/recompose failed: {e:?}")))?;
     publish_committed_plan(&store, &r.publish)
         .map_err(|e| Error::Config(format!("publish failed: {e}")))?;

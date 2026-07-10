@@ -56,7 +56,10 @@ fn main() {
     };
     let snap = OwnerSnapshot::empty(16);
 
-    let plan = compose(&ds, &cap, &snap).expect("compose");
+    // No revocation graces and a fixed clock: a fresh snapshot has no
+    // departing occupants, so no revocation records can be minted and
+    // the plan stays byte-deterministic for host validation.
+    let plan = compose(&ds, &cap, &snap, &[], 0).expect("compose");
     let bytes = encode_plan(&plan);
     std::fs::write(&out, &bytes).expect("write plan");
     eprintln!(

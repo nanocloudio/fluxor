@@ -5943,6 +5943,10 @@ pub fn instantiate_one_module(
         )
     };
     clear_instantiation_state();
+    // module_new returned — drop module context (see step_one_module):
+    // result-handling logs below are platform logs, owner-attributed to
+    // the system, not to the module just instantiated.
+    set_current_module(MAX_MODULES);
 
     match result {
         Ok(StartNewResult::Ready(dynamic)) => {
@@ -8372,6 +8376,14 @@ fn step_one_module(
             }
         }
 
+        // Module call complete — drop module context so scheduler /
+        // platform logs emitted between steps attribute to the system
+        // owner, not to whichever module happened to run last. The
+        // MAX_MODULES sentinel maps to OWNER_SYSTEM in `module_owner`
+        // (and short-circuits the contract-grant gate), matching the
+        // reconfigure reset path.
+        set_current_module(MAX_MODULES);
+
         // Accumulate wall-clock spent on this module (any outcome,
         // including Burst loops and faults) into the owning domain's
         // budget. The accumulator is reset by the caller at the top
@@ -8591,7 +8603,11 @@ pub fn call_module_drain(module_idx: usize) -> i32 {
         set_current_module(module_idx);
         // SAFETY: `m` is the dynamic-module slot's owned handle; `call_drain`
         // is its ABI surface invoked from a safe scheduler context.
-        unsafe { m.call_drain() }
+        let rc = unsafe { m.call_drain() };
+        // Drop module context (see step_one_module) so post-drain
+        // platform logs attribute to the system owner.
+        set_current_module(MAX_MODULES);
+        rc
     } else {
         -1
     }
@@ -8839,7 +8855,21 @@ pub struct OwnerLiveStatus {
     /// `fault_type::*` of the most recent fault among this owner's
     /// terminated modules (`fault_type::NONE` when none terminated).
     pub last_fault_kind: u8,
+    /// Owner lifecycle state: [`OWNER_STATE_ACTIVE`] or [`OWNER_STATE_DRAINING`]
+    /// (rfc_owner_drain_and_logs.md §3.7 — a *new field*; the phase enum stays
+    /// frozen). Always `Active` until the drain driver (Phase 3) flips it.
+    pub owner_state: u8,
+    /// Wall-clock second at which a drain forfeits its grace, or 0 when not
+    /// draining. Set by the drain driver (Phase 3).
+    pub drain_deadline_unix: u64,
+    /// Seconds remaining in the drain window, or 0 when not draining.
+    pub drain_remaining_secs: u32,
 }
+
+/// `owner_state` code: the owner is running normally.
+pub const OWNER_STATE_ACTIVE: u8 = 0;
+/// `owner_state` code: the owner is draining before revocation.
+pub const OWNER_STATE_DRAINING: u8 = 1;
 
 impl OwnerLiveStatus {
     pub const EMPTY: OwnerLiveStatus = OwnerLiveStatus {
@@ -8852,6 +8882,9 @@ impl OwnerLiveStatus {
         modules_terminated: 0,
         modules_recovering: 0,
         last_fault_kind: fault_type::NONE,
+        owner_state: OWNER_STATE_ACTIVE,
+        drain_deadline_unix: 0,
+        drain_remaining_secs: 0,
     };
 }
 
@@ -8876,10 +8909,15 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
         if matches!(e.state, crate::kernel::owner::OwnerState::Free) {
             continue;
         }
+        let owner_state = match e.state {
+            crate::kernel::owner::OwnerState::Draining => OWNER_STATE_DRAINING,
+            _ => OWNER_STATE_ACTIVE,
+        };
         out[count] = OwnerLiveStatus {
             pod_uid: e.pod_uid,
             slot: slot as u16,
             generation: e.generation,
+            owner_state,
             ..OwnerLiveStatus::EMPTY
         };
         count += 1;
@@ -8924,6 +8962,56 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
         }
     }
     count
+}
+
+/// Is a draining owner's subgraph quiescent — has every module it stamps run to
+/// its natural end (`StepOutcome::Done`) or terminal fault state? The v1 drain
+/// predicate (rfc_owner_drain_and_logs.md §3.1, narrowed: channel/timer/wake
+/// emptiness checks arrive with the admission-gate build-out; a steady-state
+/// module that never finishes drains by deadline, which is correct and
+/// observable). An owner stamping no modules is trivially quiescent. Scheduler
+/// thread only.
+pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
+    // SAFETY: scheduler-thread read of the static module/fault tables.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    for idx in 0..MAX_MODULES {
+        if module_owner(idx) != handle {
+            continue;
+        }
+        if matches!(sched.modules[idx], ModuleSlot::Empty) {
+            continue;
+        }
+        let terminal = matches!(sched.fault_info[idx].state, FaultState::Terminated);
+        if !sched.finished[idx] && !terminal {
+            return false;
+        }
+    }
+    true
+}
+
+/// Owner attribution for a module: `(pod_uid, slot, generation)`, or `None` if
+/// the module is system-owned or its owner stamp is stale (slot reused at a
+/// newer generation). Mirrors `owner_live_snapshot`'s stale-stamp rule. Used by
+/// the Linux log tee to attribute an on-step log record to its owner. Scheduler
+/// thread only.
+pub fn module_owner_attribution(module_idx: usize) -> Option<([u8; 16], u16, u32)> {
+    let handle = module_owner(module_idx);
+    if handle.is_system() {
+        return None;
+    }
+    // SAFETY: scheduler-thread read of the static owner table.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let e = sched.owners.entry_at(handle.slot as usize)?;
+    if e.generation != handle.generation {
+        return None; // stale stamp: module belongs to the slot's previous tenant
+    }
+    Some((e.pod_uid, handle.slot, handle.generation))
 }
 
 /// Test-only: force module `idx`'s fault state so status-aggregation tests
