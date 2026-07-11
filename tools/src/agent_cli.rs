@@ -43,6 +43,26 @@ pub enum AgentCommand {
     Status(StatusArgs),
     /// Stream an owner's per-owner log ring (rfc_owner_drain_and_logs.md §4.5).
     Logs(LogsArgs),
+    /// Read or set the node policy composition consults on every commit/remove
+    /// (rfc_endpoint_lease.md §5.2): today the reserved-port set.
+    Policy(PolicyArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PolicyArgs {
+    /// Generation-store directory (created if absent).
+    #[arg(long)]
+    pub store: PathBuf,
+    /// Replace the reserved-port set: comma-separated host ports no owner
+    /// export may claim (e.g. "6443,53"). An empty string clears the set.
+    /// Omitted → that field of the policy is left unchanged.
+    #[arg(long)]
+    pub reserved_ports: Option<String>,
+    /// The node substrate's platform-module prefix (platform stacks prepend
+    /// their modules): pod module ranges are placed past compiled indices
+    /// [0, N). Omitted → unchanged.
+    #[arg(long)]
+    pub system_modules: Option<u16>,
 }
 
 #[derive(Args, Debug)]
@@ -60,6 +80,11 @@ pub struct LogsArgs {
     /// Only the last N records.
     #[arg(long)]
     pub tail: Option<usize>,
+    /// Stream the live tail: after printing the filtered records, keep polling
+    /// the ring (~4×/s, the writer flushes every ~100 ms) and print new records
+    /// as they land. Runs until killed or stdout closes (broken pipe).
+    #[arg(long, short = 'f')]
+    pub follow: bool,
 }
 
 #[derive(Args, Debug)]
@@ -174,7 +199,13 @@ fn verify_artifact(bytes: &[u8], declared: &str, what: &str) -> Result<()> {
 /// fails. (Verifying a *signature over the manifest itself* is the untrusted-
 /// source path and requires the bundle to carry a signature; the format does
 /// not yet, so that layer is out of scope here.)
-fn resolve_bundle(dir: &std::path::Path) -> Result<(ResourceProfile, [u8; 32])> {
+fn resolve_bundle(
+    dir: &std::path::Path,
+) -> Result<(
+    ResourceProfile,
+    [u8; 32],
+    Vec<fluxor_tools::compose::ExportDecl>,
+)> {
     let manifest_json = std::fs::read_to_string(dir.join("workload.json"))
         .map_err(|e| Error::Config(format!("bundle {}: workload.json: {e}", dir.display())))?;
     let manifest = parse_manifest(&manifest_json).map_err(Error::Config)?;
@@ -211,7 +242,18 @@ fn resolve_bundle(dir: &std::path::Path) -> Result<(ResourceProfile, [u8; 32])> 
     // manifest, recorded on the pod so the committed generation is tied to a
     // specific workload rather than a zeroed placeholder.
     let workload_digest = sha256_bytes(manifest_json.as_bytes());
-    Ok((doc.to_compose(), workload_digest))
+    // Declared exports travel with the desired pod so `agent status` can join
+    // them against the runtime's bound report (rfc_endpoint_lease.md §4.3).
+    let exports = manifest
+        .contract
+        .exports
+        .iter()
+        .map(|e| fluxor_tools::compose::ExportDecl {
+            protocol: e.protocol.clone(),
+            port: e.port,
+        })
+        .collect();
+    Ok((doc.to_compose(), workload_digest, exports))
 }
 
 fn parse_pod_uid(hex: &str) -> Result<[u8; 16]> {
@@ -246,14 +288,63 @@ pub fn dispatch(args: AgentArgs) -> Result<()> {
         AgentCommand::Remove(r) => remove(r),
         AgentCommand::Status(s) => status(s),
         AgentCommand::Logs(l) => logs(l),
+        AgentCommand::Policy(p) => policy(p),
     }
+}
+
+/// `agent policy` — set-and-forget node policy. Setting does NOT recompose:
+/// the new reserved set applies from the next commit/remove (a retroactive
+/// sweep of already-granted leases is a revocation decision that belongs to
+/// the orchestrator, not a side effect of writing policy). Always prints the
+/// effective policy as JSON so callers can verify what composition will use.
+fn policy(a: PolicyArgs) -> Result<()> {
+    use fluxor_tools::node_agent::{load_node_policy, save_node_policy};
+
+    let storage = FsStorage::open(&a.store)
+        .map_err(|e| Error::Config(format!("open store {}: {e}", a.store.display())))?;
+    let mut store = GenStore::new(storage);
+
+    // Field-wise upsert: load the current policy, apply only the fields
+    // given, persist iff something was given. Omitting every flag is a pure
+    // read.
+    let mut effective = load_node_policy(&store)
+        .map_err(|e| Error::Config(format!("load policy failed: {e:?}")))?;
+    let mut dirty = false;
+    if let Some(spec) = a.reserved_ports {
+        let mut ports = Vec::new();
+        for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let port: u16 = tok.parse().map_err(|_| {
+                Error::Config(format!("--reserved-ports: '{tok}' is not a port (0-65535)"))
+            })?;
+            if !ports.contains(&port) {
+                ports.push(port);
+            }
+        }
+        ports.sort_unstable();
+        effective.reserved_ports = ports;
+        dirty = true;
+    }
+    if let Some(n) = a.system_modules {
+        effective.system_modules = n;
+        dirty = true;
+    }
+    if dirty {
+        save_node_policy(&mut store, &effective)
+            .map_err(|e| Error::Config(format!("save policy failed: {e:?}")))?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&effective).map_err(|e| Error::Config(e.to_string()))?
+    );
+    Ok(())
 }
 
 fn logs(a: LogsArgs) -> Result<()> {
     use fluxor_tools::agent_logs::{
-        apply_filter, parse_owner_uid, read_owner_records, render_lines, LogFilter,
+        apply_filter, parse_owner_uid, read_owner_records, FollowCursor, LineRenderer, LogFilter,
     };
     use fluxor_tools::node_agent::published_sidecar_dir;
+    use std::io::Write as _;
 
     let uid = parse_owner_uid(&a.owner_uid).ok_or_else(|| {
         Error::Config(format!(
@@ -266,14 +357,35 @@ fn logs(a: LogsArgs) -> Result<()> {
         .map_err(|e| Error::Config(format!("open store {}: {e}", a.store.display())))?;
     let store = GenStore::new(storage);
 
-    // The ring directory sits beside owner_status.json, under `logs/`. If nothing
-    // has been published (or no logs exist yet) there is simply nothing to show.
-    let Some(sidecar) = published_sidecar_dir(&store) else {
-        return Ok(());
+    // The ring directory sits beside owner_status.json, under `logs/`. If
+    // nothing has been published yet there is nothing to show; follow mode
+    // keeps polling for the publish to appear (a node whose first commit is
+    // still in flight).
+    let resolve_logs_dir =
+        |store: &GenStore<FsStorage>| published_sidecar_dir(store).map(|s| s.join("logs"));
+    let logs_dir = match resolve_logs_dir(&store) {
+        Some(dir) => Some(dir),
+        None if a.follow => None,
+        None => return Ok(()),
     };
-    let logs_dir = sidecar.join("logs");
 
-    let records = read_owner_records(&logs_dir, &uid);
+    // Emit lines and stop cleanly when the consumer hangs up: a follow stream's
+    // normal end is the reader (kubectl / an HTTP client) closing the pipe.
+    let emit = |lines: &[String]| -> bool {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for line in lines {
+            if writeln!(out, "{line}").is_err() {
+                return false;
+            }
+        }
+        out.flush().is_ok()
+    };
+
+    let records = logs_dir
+        .as_deref()
+        .map(|dir| read_owner_records(dir, &uid))
+        .unwrap_or_default();
     let filtered = apply_filter(
         &records,
         &LogFilter {
@@ -281,10 +393,38 @@ fn logs(a: LogsArgs) -> Result<()> {
             tail: a.tail,
         },
     );
-    for line in render_lines(&filtered) {
-        println!("{line}");
+    let mut renderer = LineRenderer::new();
+    if !emit(&renderer.render(&filtered)) {
+        return Ok(());
     }
-    Ok(())
+    if !a.follow {
+        return Ok(());
+    }
+
+    // Follow: poll the ring files (~4×/s; the writer flushes every ~100 ms) and
+    // stream records past what was already printed. Each poll re-reads the full
+    // retained snapshot; a torn mid-write read yields fewer valid records and
+    // the next poll catches up (per-record CRC guards partial writes). Eviction
+    // between polls surfaces as the renderer's LogsTruncated marker.
+    let mut logs_dir = logs_dir;
+    let mut cursor = FollowCursor::at_end_of(&records);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if logs_dir.is_none() {
+            logs_dir = resolve_logs_dir(&store);
+        }
+        let Some(dir) = logs_dir.as_deref() else {
+            continue; // nothing published yet; keep waiting
+        };
+        let snapshot = read_owner_records(dir, &uid);
+        let fresh = cursor.take_new(&snapshot);
+        if fresh.is_empty() {
+            continue;
+        }
+        if !emit(&renderer.render(&fresh)) {
+            return Ok(()); // consumer hung up
+        }
+    }
 }
 
 fn status(a: StatusArgs) -> Result<()> {
@@ -371,7 +511,7 @@ fn remove(r: RemoveArgs) -> Result<()> {
 
 fn commit(c: CommitArgs) -> Result<()> {
     let pod_uid = parse_pod_uid(&c.pod_uid)?;
-    let (profile, workload_digest) = match &c.bundle {
+    let (profile, workload_digest, exports) = match &c.bundle {
         Some(dir) => resolve_bundle(dir)?,
         None => (
             ResourceProfile {
@@ -384,6 +524,7 @@ fn commit(c: CommitArgs) -> Result<()> {
             },
             // No bundle → ad-hoc profile, no workload identity to pin.
             [0u8; 32],
+            Vec::new(),
         ),
     };
     let pod = PodDesired {
@@ -394,6 +535,7 @@ fn commit(c: CommitArgs) -> Result<()> {
         config_generation: 0,
         desired_phase: DesiredPhase::Running,
         profile,
+        exports,
     };
 
     let storage = FsStorage::open(&c.store)

@@ -44,7 +44,18 @@ pub fn reconcile_and_commit<S: Storage>(
     prior: &OwnerSnapshot,
     gen_id: u64,
 ) -> Result<CompositionPlan, AgentError> {
-    let plan = stage_candidate(store, desired, cap, prior, gen_id, &[], 0)?;
+    let policy = load_node_policy(store).map_err(AgentError::Store)?;
+    let plan = stage_candidate(
+        store,
+        desired,
+        cap,
+        prior,
+        gen_id,
+        &[],
+        0,
+        &policy.reserved_ports,
+        policy.system_modules,
+    )?;
     store.commit(gen_id).map_err(AgentError::Store)?;
     Ok(plan)
 }
@@ -66,9 +77,19 @@ fn stage_candidate<S: Storage>(
     gen_id: u64,
     revoke_graces: &[([u8; 16], u16)],
     now_unix: u64,
+    reserved_ports: &[u16],
+    system_modules: u16,
 ) -> Result<CompositionPlan, AgentError> {
-    let plan =
-        compose(desired, cap, prior, revoke_graces, now_unix).map_err(AgentError::Compose)?;
+    let plan = compose(
+        desired,
+        cap,
+        prior,
+        revoke_graces,
+        now_unix,
+        reserved_ports,
+        system_modules,
+    )
+    .map_err(AgentError::Compose)?;
     let blob = encode_plan(&plan);
     let blob_digest = sha256(&blob);
     store
@@ -133,6 +154,56 @@ const PUBLISH_PATH_KEY: &str = "publish.path";
 /// higher generation, so a deleted pod's stale handles can never match), and
 /// the committed plan only records currently-occupied slots.
 const SLOT_GENS_KEY: &str = "slot.generations";
+/// Key holding the node policy the orchestrator supplies out-of-band of any
+/// one pod (rfc_endpoint_lease.md §5.2): today the reserved-port set that
+/// exported endpoints must not intersect. Persisted so EVERY recompose —
+/// commit or remove, whoever triggers it — composes against the same policy.
+const NODE_POLICY_KEY: &str = "node.policy";
+
+/// Node-scoped composition policy. Additive by design: absent file or absent
+/// field means the empty default, so agents upgraded in place keep composing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodePolicy {
+    /// Host ports no owner export may claim (the orchestrator's own
+    /// listeners). Compose refuses intersecting exports at admission with
+    /// `ComposeError::EndpointConflict`.
+    #[serde(default)]
+    pub reserved_ports: Vec<u16>,
+    /// The node substrate's platform-module prefix: platform stacks PREPEND
+    /// their modules (linux_net et al.), so compiled indices [0, N) are
+    /// system infrastructure and pod module ranges must start past them
+    /// (rfc_system_services.md §1.1). 0 = no platform modules (a substrate
+    /// whose module list is entirely ownable).
+    #[serde(default)]
+    pub system_modules: u16,
+}
+
+/// Load the node policy. Absent → default (no reservations). Present but
+/// undecodable → hard error: silently composing without the reserved set
+/// could grant a lease over the orchestrator's own listener. An I/O fault is
+/// a hard error too, never "no policy".
+pub fn load_node_policy<S: Storage>(store: &GenStore<S>) -> Result<NodePolicy, StoreError> {
+    match store
+        .storage
+        .read(NODE_POLICY_KEY)
+        .map_err(|_| StoreError::StorageIo)?
+    {
+        None => Ok(NodePolicy::default()),
+        Some(b) => serde_json::from_slice(&b).map_err(|_| StoreError::CorruptState),
+    }
+}
+
+/// Persist the node policy (whole-value replace).
+pub fn save_node_policy<S: Storage>(
+    store: &mut GenStore<S>,
+    policy: &NodePolicy,
+) -> Result<(), StoreError> {
+    let bytes = serde_json::to_vec(policy).map_err(|_| StoreError::WriteFailed)?;
+    store
+        .storage
+        .write(NODE_POLICY_KEY, &bytes)
+        .map_err(|_| StoreError::WriteFailed)
+}
 
 fn load_slot_gens<S: Storage>(store: &GenStore<S>) -> Result<Vec<u32>, StoreError> {
     // Absent → first run (empty). Present but undecodable → hard error: silently
@@ -325,6 +396,64 @@ pub struct PodRuntimeStatus {
     /// terminal records; rfc_owner_drain_and_logs.md §3.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain: Option<DrainDetail>,
+    /// The runtime's RAW bound-endpoint report — which (protocol, port) pairs
+    /// are actually listening for this owner (rfc_endpoint_lease.md §4.3).
+    /// Declarations are joined by the agent, not the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_endpoints: Option<Vec<BoundEndpoint>>,
+}
+
+/// One bound (protocol, port) pair from the runtime's report.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BoundEndpoint {
+    pub protocol: String,
+    pub port: u16,
+}
+
+/// The agent's declared⇄bound join for one endpoint
+/// (rfc_endpoint_lease.md §4.3 doc 2): one entry per declared export
+/// (`bound` = a matching listener is live) plus any observed undeclared bind
+/// (`declared: false` — report-only until Part B enforces).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct EndpointStatus {
+    pub protocol: String,
+    pub port: u16,
+    pub bound: bool,
+    pub declared: bool,
+}
+
+/// Join a pod's declared exports with the runtime's bound report. Pure —
+/// unit-tested without a store or runtime. Matching is case-insensitive on
+/// protocol + numeric port equality.
+pub fn join_endpoints(
+    declared: &[crate::compose::ExportDecl],
+    bound: &[BoundEndpoint],
+) -> Vec<EndpointStatus> {
+    let mut out: Vec<EndpointStatus> = declared
+        .iter()
+        .map(|d| EndpointStatus {
+            protocol: d.protocol.to_ascii_lowercase(),
+            port: d.port,
+            bound: bound
+                .iter()
+                .any(|b| b.port == d.port && b.protocol.eq_ignore_ascii_case(&d.protocol)),
+            declared: true,
+        })
+        .collect();
+    for b in bound {
+        let matches_declared = declared
+            .iter()
+            .any(|d| d.port == b.port && d.protocol.eq_ignore_ascii_case(&b.protocol));
+        if !matches_declared {
+            out.push(EndpointStatus {
+                protocol: b.protocol.to_ascii_lowercase(),
+                port: b.port,
+                bound: true,
+                declared: false,
+            });
+        }
+    }
+    out
 }
 
 /// Terminal drain detail. Bool fields, not an enum, so a future
@@ -397,6 +526,11 @@ pub struct PodStatus {
     /// additive: existing consumers of the durable fields are unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<PodRuntimeStatus>,
+    /// Declared⇄bound endpoint join (rfc_endpoint_lease.md §4.3): present only
+    /// when live runtime state is attached — an absent runtime means "unknown",
+    /// never a claimed `bound:false`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<EndpointStatus>,
 }
 
 /// Whole-node status snapshot.
@@ -418,6 +552,16 @@ pub struct NodeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_abi_surface: Option<String>,
     pub pods: Vec<PodStatus>,
+}
+
+/// Lowercase hex of a 16-byte pod UID (the status join key encoding).
+fn uid16_hex(d: &[u8; 16]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(32);
+    for b in d {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn hex32(d: &[u8; 32]) -> String {
@@ -462,6 +606,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
                 state_cap: assignment.map(|a| a.state_cap),
                 buffer_cap: assignment.map(|a| a.buffer_cap),
                 runtime: None,
+                endpoints: Vec::new(),
             }
         })
         .collect();
@@ -498,6 +643,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
                 state_cap: Some(a.state_cap),
                 buffer_cap: Some(a.buffer_cap),
                 runtime: None,
+                endpoints: Vec::new(),
             });
         }
     }
@@ -527,12 +673,23 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
         // hasn't rebuilt onto the new commit yet, or is behind a rollback)
         // must not be joined to the new durable records.
         if Some(file.plan_generation) == st.generation {
+            // Declared exports per pod, for the declared⇄bound endpoint join
+            // (rfc_endpoint_lease.md §4.3 doc 2 — the agent owns this join;
+            // the runtime reported only raw binds).
+            let desired = load_desired(store)?;
             for pod in &mut st.pods {
                 if let Some(entry) = file.pods.iter().find(|p| {
                     p.pod_uid_hex == pod.pod_uid_hex
                         && Some(p.slot) == pod.slot
                         && Some(p.owner_generation) == pod.owner_generation
                 }) {
+                    let declared = desired
+                        .iter()
+                        .find(|d| uid16_hex(&d.pod_uid) == pod.pod_uid_hex)
+                        .map(|d| d.exports.as_slice())
+                        .unwrap_or(&[]);
+                    let bound = entry.runtime.bound_endpoints.as_deref().unwrap_or(&[]);
+                    pod.endpoints = join_endpoints(declared, bound);
                     pod.runtime = Some(entry.runtime.clone());
                 }
             }
@@ -558,6 +715,7 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
                     state_cap: None,
                     buffer_cap: None,
                     runtime: Some(entry.runtime.clone()),
+                    endpoints: Vec::new(),
                 });
             }
             st.pods.sort_by(|a, b| a.pod_uid_hex.cmp(&b.pod_uid_hex));
@@ -659,6 +817,7 @@ fn recompose<S: Storage>(
         pods: running,
     };
     let prior = snapshot_from_committed(store, cap.max_owners).map_err(AgentError::Store)?;
+    let policy = load_node_policy(store).map_err(AgentError::Store)?;
     // Wall clock is consulted ONLY here, at publish (rfc_owner_drain_and_logs.md
     // §3.2): revocation deadlines are stamped into the plan; every later check
     // (agent expiry, runtime drain) evaluates the stamped value.
@@ -675,6 +834,8 @@ fn recompose<S: Storage>(
         gen_id,
         revoke_graces,
         now_unix,
+        &policy.reserved_ports,
+        policy.system_modules,
     )?;
     // Persist the node bookkeeping (desired set + slot high-water generations)
     // BEFORE the commit. The commit (pointer flip) is the LAST durable write, so
@@ -731,6 +892,7 @@ mod tests {
                 endpoints: 1,
                 domains: 1,
             },
+            exports: Vec::new(),
         }
     }
 
@@ -829,6 +991,71 @@ mod tests {
         assert_eq!(decode_plan(&bytes).unwrap(), plan);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_policy_reserved_ports_gate_every_recompose() {
+        use crate::compose::ExportDecl;
+        let mut store = GenStore::new(MemStorage::default());
+        // No policy written → default (empty set): an exporting pod admits.
+        assert_eq!(load_node_policy(&store).unwrap(), NodePolicy::default());
+        let mut exporting = pod(1, 4);
+        exporting.exports = vec![ExportDecl {
+            protocol: "udp".into(),
+            port: 53,
+        }];
+        upsert_pod_and_commit(&mut store, exporting.clone(), &cap()).unwrap();
+        let (_, g) = remove_pod_and_commit(&mut store, uid(1), 0, &cap()).unwrap();
+
+        // Reserve 53 → the SAME pod is now refused at admission, and the
+        // failure leaves the committed generation untouched.
+        save_node_policy(
+            &mut store,
+            &NodePolicy {
+                reserved_ports: vec![6443, 53],
+                ..NodePolicy::default()
+            },
+        )
+        .unwrap();
+        let err = upsert_pod_and_commit(&mut store, exporting, &cap()).unwrap_err();
+        assert_eq!(err, AgentError::Compose(ComposeError::EndpointConflict));
+        assert_eq!(store.committed().unwrap().id, g);
+
+        // A non-intersecting export still admits under the policy.
+        let mut ok = pod(2, 4);
+        ok.exports = vec![ExportDecl {
+            protocol: "tcp".into(),
+            port: 8080,
+        }];
+        upsert_pod_and_commit(&mut store, ok, &cap()).unwrap();
+    }
+
+    #[test]
+    fn node_policy_system_modules_offset_pod_ranges() {
+        // A substrate whose platform stack prepends one module (linux_net at
+        // compiled index 0): pod ranges must start past the prefix, and a
+        // policy set AFTER a commit applies from the next recompose.
+        let mut store = GenStore::new(MemStorage::default());
+        save_node_policy(
+            &mut store,
+            &NodePolicy {
+                system_modules: 1,
+                ..NodePolicy::default()
+            },
+        )
+        .unwrap();
+        let (plan, _) = upsert_pod_and_commit(&mut store, pod(1, 2), &cap()).unwrap();
+        assert_eq!(
+            plan.assignments[0].module_base, 1,
+            "range skips the platform prefix"
+        );
+        let (plan2, _) = upsert_pod_and_commit(&mut store, pod(2, 1), &cap()).unwrap();
+        let b = plan2
+            .assignments
+            .iter()
+            .find(|a| a.pod_uid == uid(2))
+            .unwrap();
+        assert_eq!(b.module_base, 3, "second pod first-fits after the first");
     }
 
     #[test]
@@ -1238,5 +1465,68 @@ mod tests {
 
         let st2 = node_status(&store).expect("status after tamper");
         assert_ne!(st2.committed_abi_surface.as_ref(), Some(&st2.abi_surface));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_join_tests {
+    use super::*;
+    use crate::compose::ExportDecl;
+
+    fn decl(protocol: &str, port: u16) -> ExportDecl {
+        ExportDecl {
+            protocol: protocol.into(),
+            port,
+        }
+    }
+    fn bound(protocol: &str, port: u16) -> BoundEndpoint {
+        BoundEndpoint {
+            protocol: protocol.into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn join_marks_declared_exports_bound_and_flags_undeclared_binds() {
+        let declared = [decl("TCP", 8080), decl("udp", 5353)];
+        // 8080 is live; 5353 never bound; 9999 bound but never declared.
+        let live = [bound("tcp", 8080), bound("tcp", 9999)];
+        let joined = join_endpoints(&declared, &live);
+        assert_eq!(
+            joined,
+            vec![
+                EndpointStatus {
+                    protocol: "tcp".into(),
+                    port: 8080,
+                    bound: true,
+                    declared: true
+                },
+                EndpointStatus {
+                    protocol: "udp".into(),
+                    port: 5353,
+                    bound: false,
+                    declared: true
+                },
+                EndpointStatus {
+                    protocol: "tcp".into(),
+                    port: 9999,
+                    bound: true,
+                    declared: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn join_distinguishes_same_port_different_protocol() {
+        // A udp bind never satisfies a tcp declaration on the same port.
+        let joined = join_endpoints(&[decl("tcp", 7000)], &[bound("udp", 7000)]);
+        assert!(!joined[0].bound);
+        assert!(joined.iter().any(|e| e.protocol == "udp" && !e.declared));
+    }
+
+    #[test]
+    fn no_declarations_and_no_binds_yield_nothing() {
+        assert!(join_endpoints(&[], &[]).is_empty());
     }
 }

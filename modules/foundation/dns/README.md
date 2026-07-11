@@ -31,6 +31,8 @@ content_type = "NetProto"
 - `port`
 - `ttl`
 - `upstream`
+- `upstream_port` (destination port for forwarded queries, default 53 —
+  lets a delegation listener on a non-standard port be the upstream)
 
 ## Notes
 

@@ -162,11 +162,10 @@ pub fn next_seq(slot: usize) -> u64 {
 mod tests {
     use super::*;
     use fluxor_contracts::log_ring::read_ring_records;
-    use std::sync::Mutex;
 
-    // The rings are process-global `static mut`; serialize the tests that touch
-    // them (each `&raw mut RINGS` is a whole-array borrow).
-    static LOCK: Mutex<()> = Mutex::new(());
+    // The rings are process-global `static mut`; serialize on the crate-wide
+    // test lock shared with every other module that touches that global state
+    // (each `&raw mut RINGS` is a whole-array borrow).
 
     fn push_line(slot: usize, uid: [u8; 16], gen: u32, msg: &[u8]) {
         push_on_slot(slot, uid, gen, 0, 0, b"", msg);
@@ -182,7 +181,7 @@ mod tests {
 
     #[test]
     fn install_push_snapshot_round_trips_through_real_statics() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::kernel::log_ring::lock_tests();
         let slot = 5;
         let uid = [0x11; 16];
         install_slot(slot, uid, 1);
@@ -202,7 +201,7 @@ mod tests {
 
     #[test]
     fn same_triple_reinstall_keeps_ring_new_triple_resets_it() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::kernel::log_ring::lock_tests();
         let slot = 6;
         let uid = [0x22; 16];
         install_slot(slot, uid, 1);
@@ -229,7 +228,7 @@ mod tests {
 
     #[test]
     fn eviction_shows_as_a_seq_jump_readable_by_the_reader() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::kernel::log_ring::lock_tests();
         let slot = 7;
         let uid = [0x33; 16];
         install_slot(slot, uid, 1);

@@ -39,6 +39,7 @@ fn main() {
             endpoints: 0,
             domains: 1,
         },
+        exports: Vec::new(),
     };
     let ds = DeviceDesiredState {
         generation: 1,
@@ -59,7 +60,7 @@ fn main() {
     // No revocation graces and a fixed clock: a fresh snapshot has no
     // departing occupants, so no revocation records can be minted and
     // the plan stays byte-deterministic for host validation.
-    let plan = compose(&ds, &cap, &snap, &[], 0).expect("compose");
+    let plan = compose(&ds, &cap, &snap, &[], 0, &[], 0).expect("compose");
     let bytes = encode_plan(&plan);
     std::fs::write(&out, &bytes).expect("write plan");
     eprintln!(

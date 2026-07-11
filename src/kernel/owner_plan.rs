@@ -28,10 +28,20 @@ const PLAN_HEADER_LEN: usize = 8;
 /// +edge_base(2)+edge_count(2).
 const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
 /// Per-revocation record: an assignment record verbatim + grace_secs(2) +
-/// deadline_unix(8) (rfc_owner_drain_and_logs.md §3.2). The section is present
-/// only when non-empty, so a no-revocation plan is byte-identical to the
-/// pre-revocation format.
+/// deadline_unix(8) (rfc_owner_drain_and_logs.md §3.2). The revocation section
+/// is present only when non-empty.
 const REVOKE_REC_LEN: usize = ASSIGN_REC_LEN + 2 + 8;
+/// Per-lease record: slot(2) + generation(4) + protocol(1) + port(2)
+/// (rfc_endpoint_lease.md §5.1).
+const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
+/// Opens the lease section: an impossible revocation count, so the first u32
+/// of the tail discriminates sections deterministically (48-byte revocation
+/// and 9-byte lease records collide at 148 tail bytes under count-only
+/// framing). Lives inside the digested body — integrity-protected.
+const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
+/// Decoder ceiling for the lease section (bounded-binary rule). Matches
+/// `tools/src/compose.rs::MAX_PLAN_LEASES`.
+pub const MAX_PLAN_LEASES: usize = 256;
 /// At most one assignment per owner slot.
 pub const MAX_PLAN_ASSIGNMENTS: usize = MAX_OWNERS;
 
@@ -80,6 +90,25 @@ impl PlanRevocation {
     };
 }
 
+/// One granted endpoint lease: owner `(slot, generation)` may bind
+/// `(protocol, port)` — 1 = tcp, 2 = udp (rfc_endpoint_lease.md §5.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PlanLease {
+    pub slot: u16,
+    pub generation: u32,
+    pub protocol: u8,
+    pub port: u16,
+}
+
+impl PlanLease {
+    const EMPTY: PlanLease = PlanLease {
+        slot: 0,
+        generation: 0,
+        protocol: 0,
+        port: 0,
+    };
+}
+
 /// A decoded, digest-verified plan. Allocation-free.
 pub struct DecodedPlan {
     pub generation: u64,
@@ -87,6 +116,8 @@ pub struct DecodedPlan {
     assignments: [PlanAssignment; MAX_PLAN_ASSIGNMENTS],
     rev_count: usize,
     revocations: [PlanRevocation; MAX_PLAN_ASSIGNMENTS],
+    lease_count: usize,
+    leases: [PlanLease; MAX_PLAN_LEASES],
 }
 
 impl DecodedPlan {
@@ -98,6 +129,11 @@ impl DecodedPlan {
     /// The valid revocation slice (usually empty).
     pub fn revocations(&self) -> &[PlanRevocation] {
         &self.revocations[..self.rev_count]
+    }
+
+    /// The valid lease slice, empty when the plan grants no endpoints.
+    pub fn leases(&self) -> &[PlanLease] {
+        &self.leases[..self.lease_count]
     }
 }
 
@@ -156,27 +192,48 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
     if bytes.len() < base_total {
         return Err(PlanError::Truncated);
     }
-    // Optional revocation section: present iff bytes remain between the
-    // assignments and the digest. An empty section is never encoded, so the
-    // no-revocation format is exactly the pre-revocation format.
-    let rev_count = if bytes.len() == base_total {
-        0usize
-    } else {
-        if bytes.len() < base_total + 4 + REVOKE_REC_LEN {
+    // Tail grammar (rfc_endpoint_lease.md §5.1): [rev_section] [lease_section],
+    // fixed order, each omitted when empty. The first u32 of the surplus
+    // discriminates: LEASE_SECTION_MARKER opens a lease section; a valid count
+    // opens the revocation section. Lengths validate, never discriminate.
+    let mut tail_cursor = assign_len;
+    let tail_end = bytes.len() - PLAN_HEADER_LEN - 32;
+    let mut rev_count = 0usize;
+    let mut lease_count = 0usize;
+    if tail_cursor < tail_end {
+        if tail_cursor + 4 > tail_end {
             return Err(PlanError::TrailingBytes);
         }
-        let rc = be_u32(&body[assign_len..assign_len + 4]) as usize;
-        if rc == 0 || rc > MAX_PLAN_ASSIGNMENTS {
+        let first = be_u32(&body[tail_cursor..tail_cursor + 4]);
+        if first != LEASE_SECTION_MARKER {
+            let rc = first as usize;
+            if rc == 0 || rc > MAX_PLAN_ASSIGNMENTS {
+                return Err(PlanError::TrailingBytes);
+            }
+            rev_count = rc;
+            tail_cursor += 4 + rev_count * REVOKE_REC_LEN;
+            if tail_cursor > tail_end {
+                return Err(PlanError::Truncated);
+            }
+        }
+    }
+    if tail_cursor < tail_end {
+        if tail_cursor + 8 > tail_end {
             return Err(PlanError::TrailingBytes);
         }
-        rc
-    };
-    let body_len = assign_len
-        + if rev_count > 0 {
-            4 + rev_count * REVOKE_REC_LEN
-        } else {
-            0
-        };
+        if be_u32(&body[tail_cursor..tail_cursor + 4]) != LEASE_SECTION_MARKER {
+            return Err(PlanError::TrailingBytes);
+        }
+        // Count 0 is valid — a plan that grants no endpoints; only an over-cap
+        // count is rejected.
+        let lc = be_u32(&body[tail_cursor + 4..tail_cursor + 8]) as usize;
+        if lc > MAX_PLAN_LEASES {
+            return Err(PlanError::TrailingBytes);
+        }
+        lease_count = lc;
+        tail_cursor += 8 + lease_count * LEASE_REC_LEN;
+    }
+    let body_len = tail_cursor;
     let expected_total = PLAN_HEADER_LEN + body_len + 32;
     if bytes.len() < expected_total {
         return Err(PlanError::Truncated);
@@ -265,12 +322,31 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
             }
         }
     }
+    let mut leases = [PlanLease::EMPTY; MAX_PLAN_LEASES];
+    let lease_base = assign_len
+        + if rev_count > 0 {
+            4 + rev_count * REVOKE_REC_LEN
+        } else {
+            0
+        }
+        + 8; // marker + count
+    for (i, lease) in leases.iter_mut().enumerate().take(lease_count) {
+        let r = &body[lease_base + i * LEASE_REC_LEN..lease_base + (i + 1) * LEASE_REC_LEN];
+        *lease = PlanLease {
+            slot: be_u16(&r[0..2]),
+            generation: be_u32(&r[2..6]),
+            protocol: r[6],
+            port: be_u16(&r[7..9]),
+        };
+    }
     Ok(DecodedPlan {
         generation,
         count,
         assignments,
         rev_count,
         revocations,
+        lease_count,
+        leases,
     })
 }
 
@@ -388,6 +464,50 @@ pub fn retained_revocations(out: &mut [PlanRevocation; MAX_PLAN_ASSIGNMENTS]) ->
     }
 }
 
+/// Bind-gate verdict for `(slot, generation, protocol, port)` against the
+/// retained plan's lease grants (rfc_endpoint_lease.md §5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseGate {
+    /// No enforcement: no plan is retained, or the bind is an ephemeral port-0
+    /// source. A retained plan that simply grants nothing still enforces — it
+    /// refuses undeclared nonzero binds (rfc_endpoint_lease.md §5.1).
+    Ungated,
+    /// The bind matches a granted lease.
+    Granted,
+    /// The plan is lease-aware and no grant covers this bind.
+    Refused,
+}
+
+/// Consult the retained plan's grants for a bind by owner `(slot, generation)`.
+/// Scheduler thread only.
+pub fn lease_gate(slot: u16, generation: u32, protocol: u8, port: u16) -> LeaseGate {
+    // Port 0 is an ephemeral-source bind ("give me any port"), not an
+    // endpoint claim: it exports nothing, can collide with nothing, and no
+    // lease could name it. Gating it would break every module that opens an
+    // outbound datagram endpoint (e.g. dns upstream forwarding) the moment
+    // ANY admitted workload on the node declares an export. Admission
+    // (Draining refusal) still applies upstream of this gate.
+    if port == 0 {
+        return LeaseGate::Ungated;
+    }
+    let retained = &raw const RETAINED_PLAN;
+    // SAFETY: scheduler-thread read.
+    let Some(plan) = (unsafe { (*retained).as_ref() }) else {
+        return LeaseGate::Ungated;
+    };
+    // A retained plan is lease-aware; enforcement is mandatory. An owner may
+    // bind only a nonzero port it was granted — every other nonzero bind is
+    // refused, whether or not the plan grants any endpoints at all.
+    let leases = plan.leases();
+    if leases.iter().any(|l| {
+        l.slot == slot && l.generation == generation && l.protocol == protocol && l.port == port
+    }) {
+        LeaseGate::Granted
+    } else {
+        LeaseGate::Refused
+    }
+}
+
 /// One drain to arm: the platform converts `deadline_unix` to its own clock and
 /// drives quiescence/deadline against it (the kernel never reads wall clock —
 /// rfc_owner_drain_and_logs.md §3.6).
@@ -492,31 +612,7 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
 
     // Eligible: consume the staged plan and apply the delta in place.
     let _ = take_staged_plan();
-    let mut delta = DrainDelta {
-        count: 0,
-        arms: [DrainArm::EMPTY; MAX_PLAN_ASSIGNMENTS],
-    };
-    let table = crate::kernel::scheduler::owners_mut();
-    for rev in plan.revocations() {
-        let handle = crate::kernel::owner::OwnerHandle {
-            slot: rev.assignment.slot,
-            generation: rev.assignment.generation,
-        };
-        // Only a live owner drains; an already-revoked / never-installed one is
-        // a no-op (§3.4). begin_drain is idempotent for an already-Draining
-        // owner, and the platform re-arms with the record's original deadline,
-        // so a replayed record never resets the clock.
-        if table.lookup(handle).is_some() && table.begin_drain(handle) {
-            delta.arms[delta.count] = DrainArm {
-                pod_uid: rev.assignment.pod_uid,
-                slot: rev.assignment.slot,
-                generation: rev.assignment.generation,
-                grace_secs: rev.grace_secs,
-                deadline_unix: rev.deadline_unix,
-            };
-            delta.count += 1;
-        }
-    }
+    let delta = arm_revocations(&plan);
 
     let generation = plan.generation;
     // SAFETY: scheduler-thread single accessor; retain for rebuild re-apply.
@@ -529,6 +625,66 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
         delta.count
     );
     Some(delta)
+}
+
+/// `begin_drain` every still-installed owner named in `plan`'s revocation
+/// section and return their drain arms. An already-revoked / never-installed
+/// owner is a no-op; `begin_drain` is idempotent for an already-Draining owner,
+/// and the platform re-arms with the record's original deadline, so a replayed
+/// record never resets the clock.
+fn arm_revocations(plan: &DecodedPlan) -> DrainDelta {
+    let mut delta = DrainDelta {
+        count: 0,
+        arms: [DrainArm::EMPTY; MAX_PLAN_ASSIGNMENTS],
+    };
+    let table = crate::kernel::scheduler::owners_mut();
+    for rev in plan.revocations() {
+        let handle = crate::kernel::owner::OwnerHandle {
+            slot: rev.assignment.slot,
+            generation: rev.assignment.generation,
+        };
+        if table.lookup(handle).is_some() && table.begin_drain(handle) {
+            delta.arms[delta.count] = DrainArm {
+                pod_uid: rev.assignment.pod_uid,
+                slot: rev.assignment.slot,
+                generation: rev.assignment.generation,
+                grace_secs: rev.grace_secs,
+                deadline_unix: rev.deadline_unix,
+            };
+            delta.count += 1;
+        }
+    }
+    delta
+}
+
+/// Arm drains for the staged plan's revocations without consuming it or
+/// requiring delta-eligibility. The structural rebuild path calls this: a plan
+/// that adds or changes owners is not a pure-drain delta, but any owner it
+/// revokes must still drain — `begin_drain` plus a terminal record — rather than
+/// being dropped untracked by the rebuild's `reset_workloads`. The staged plan
+/// stays in place for `apply_staged`; the returned arms outlive the table reset,
+/// so the drain driver finalises each freed owner.
+pub fn arm_staged_revocation_drains() -> DrainDelta {
+    let empty = DrainDelta {
+        count: 0,
+        arms: [DrainArm::EMPTY; MAX_PLAN_ASSIGNMENTS],
+    };
+    // SAFETY: scheduler-thread single accessor.
+    let Some((ptr, len)) = (unsafe { *(&raw const STAGED_PLAN) }) else {
+        return empty;
+    };
+    // SAFETY: `set_staged_plan`'s caller upheld the validity contract.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let Ok(plan) = decode(bytes) else {
+        return empty;
+    };
+    // A rollback is rejected by the rebuild's `apply_staged`; do not arm drains
+    // for a plan that will not be applied.
+    let last = unsafe { *(&raw const LAST_APPLIED_GENERATION) };
+    if plan.generation < last {
+        return empty;
+    }
+    arm_revocations(&plan)
 }
 
 /// Establish plan ownership for the graph. Called by the platform BEFORE module
@@ -593,12 +749,12 @@ pub fn apply_staged() -> Result<usize, PlanError> {
 #[cfg(all(test, feature = "multitenant"))]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::vec::Vec;
 
-    // These tests drive the process-global staged/retained plan state and the
-    // global owner table; serialize them.
-    static LOCK: Mutex<()> = Mutex::new(());
+    // These tests drive the process-global staged/retained plan state, the
+    // global owner table, and (through `apply` → `install_slot`) the owner-log
+    // rings — so they serialize on the crate-wide test lock shared with every
+    // other module that touches that global state.
 
     fn sha256(bytes: &[u8]) -> [u8; 32] {
         let mut h = Sha256::new();
@@ -651,6 +807,37 @@ mod tests {
         out
     }
 
+    /// Append a lease section to hand-built plan BODY bytes (before digest).
+    /// Mirrors the production composer: the section (marker + count) is always
+    /// emitted, even with zero leases.
+    fn plan_bytes_with_leases(
+        generation: u64,
+        assignments: &[(u8, u16, u32)],
+        leases: &[(u16, u32, u8, u16)],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&generation.to_be_bytes());
+        body.extend_from_slice(&(assignments.len() as u32).to_be_bytes());
+        for &(uid, slot, generation) in assignments {
+            push_assignment(&mut body, uid, slot, generation);
+        }
+        body.extend_from_slice(&LEASE_SECTION_MARKER.to_be_bytes());
+        body.extend_from_slice(&(leases.len() as u32).to_be_bytes());
+        for &(slot, generation, protocol, port) in leases {
+            body.extend_from_slice(&slot.to_be_bytes());
+            body.extend_from_slice(&generation.to_be_bytes());
+            body.push(protocol);
+            body.extend_from_slice(&port.to_be_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
+        out.extend_from_slice(&PLAN_VERSION.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&sha256(&body));
+        out
+    }
+
     /// Stage plan bytes with the required 'static lifetime.
     fn stage(bytes: Vec<u8>) {
         let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
@@ -660,7 +847,7 @@ mod tests {
 
     #[test]
     fn decodes_the_revocation_section_and_digest_guards_the_deadline() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::kernel::log_ring::lock_tests();
         // Old shape (no section) still decodes with zero revocations.
         let old = plan_bytes(1, &[(0xAA, 1, 1)], &[]);
         let plan = decode(&old).expect("old-format plan");
@@ -693,7 +880,7 @@ mod tests {
 
     #[test]
     fn drain_delta_flips_only_the_departing_owner_without_reset() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::kernel::log_ring::lock_tests();
         reset_staged_plan_for_test();
 
         // Generation 10: owners A (slot 1) and B (slot 2), applied via the
@@ -739,8 +926,105 @@ mod tests {
     }
 
     #[test]
+    fn structural_rebuild_arms_drains_for_first_time_revocations() {
+        let _g = crate::kernel::log_ring::lock_tests();
+        reset_staged_plan_for_test();
+
+        // Gen 10: owners A (slot 1) and B (slot 2).
+        stage(plan_bytes(10, &[(0xAA, 1, 1), (0xBB, 2, 1)], &[]));
+        assert_eq!(apply_staged().expect("apply gen 10"), 2);
+        let a = crate::kernel::owner::OwnerHandle {
+            slot: 1,
+            generation: 1,
+        };
+
+        // Gen 11: add owner C (slot 3) AND revoke A in the same generation. C is
+        // a new assignment, so this is structural — the pure-drain delta path
+        // declines it.
+        stage(plan_bytes(
+            11,
+            &[(0xBB, 2, 1), (0xCC, 3, 1)],
+            &[(0xAA, 1, 1, 30, 99_999)],
+        ));
+        assert!(
+            try_apply_drain_delta().is_none(),
+            "structural change is not a pure-drain delta"
+        );
+
+        // The structural path still arms A's drain so the rebuild's reset does
+        // not drop it untracked: begin_drain closes admission, and the arm feeds
+        // the platform drain driver's terminal record.
+        let drains = arm_staged_revocation_drains();
+        assert_eq!(drains.count, 1);
+        assert_eq!(drains.arms[0].slot, 1);
+        assert_eq!(drains.arms[0].deadline_unix, 99_999);
+        let table = crate::kernel::scheduler::owners_mut();
+        assert!(table.authorize_use(a), "draining owner keeps serving");
+        assert!(!table.authorize_admit(a), "admission closed at drain start");
+
+        // The staged plan is untouched — the rebuild's apply_staged consumes it
+        // and installs the survivor plus the new owner (A is not reinstalled).
+        assert_eq!(apply_staged().expect("structural apply"), 2);
+
+        reset_staged_plan_for_test();
+    }
+
+    #[test]
+    fn lease_section_decodes_and_gates_binds() {
+        let _g = crate::kernel::log_ring::lock_tests();
+        reset_staged_plan_for_test();
+
+        // Owner (slot 5, gen 1) granted tcp:8080 + udp:5353.
+        let bytes =
+            plan_bytes_with_leases(30, &[(0xEE, 5, 1)], &[(5, 1, 1, 8080), (5, 1, 2, 5353)]);
+        let plan = decode(&bytes).expect("lease plan decodes");
+        assert_eq!(plan.leases().len(), 2);
+        assert_eq!(plan.leases()[0].port, 8080);
+
+        // Apply it; the gate consults the retained plan.
+        stage(bytes);
+        assert_eq!(apply_staged().expect("apply"), 1);
+        assert_eq!(lease_gate(5, 1, 1, 8080), LeaseGate::Granted);
+        assert_eq!(lease_gate(5, 1, 2, 5353), LeaseGate::Granted);
+        // Undeclared port / wrong protocol / other owner → refused.
+        assert_eq!(lease_gate(5, 1, 1, 9999), LeaseGate::Refused);
+        assert_eq!(lease_gate(5, 1, 2, 8080), LeaseGate::Refused);
+        assert_eq!(lease_gate(6, 1, 1, 8080), LeaseGate::Refused);
+        // Ephemeral-source binds (port 0) are NOT endpoint claims: ungated
+        // even under a lease-carrying plan, for ANY owner — an outbound
+        // datagram endpoint (dns upstream forwarding) must keep working when
+        // a co-resident holds leases.
+        assert_eq!(lease_gate(5, 1, 2, 0), LeaseGate::Ungated);
+        assert_eq!(lease_gate(6, 1, 2, 0), LeaseGate::Ungated);
+
+        reset_staged_plan_for_test();
+    }
+
+    #[test]
+    fn a_plan_granting_nothing_still_refuses_undeclared_binds() {
+        // A retained plan whose owner holds no grants still enforces: every
+        // undeclared nonzero bind is refused (rfc_endpoint_lease.md §5.1).
+        let _g = crate::kernel::log_ring::lock_tests();
+        reset_staged_plan_for_test();
+
+        // Owner (slot 7, gen 1) admitted with zero grants.
+        let bytes = plan_bytes_with_leases(40, &[(0x77, 7, 1)], &[]);
+        assert_eq!(decode(&bytes).expect("decodes").leases().len(), 0);
+
+        stage(bytes);
+        assert_eq!(apply_staged().expect("apply"), 1);
+        // Any nonzero-port bind is refused — no grant covers it.
+        assert_eq!(lease_gate(7, 1, 1, 6443), LeaseGate::Refused);
+        assert_eq!(lease_gate(7, 1, 2, 53), LeaseGate::Refused);
+        // Ephemeral port-0 source binds stay ungated (outbound clients still work).
+        assert_eq!(lease_gate(7, 1, 2, 0), LeaseGate::Ungated);
+
+        reset_staged_plan_for_test();
+    }
+
+    #[test]
     fn structural_change_is_not_delta_eligible_and_stays_staged() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::kernel::log_ring::lock_tests();
         reset_staged_plan_for_test();
 
         stage(plan_bytes(20, &[(0xCC, 3, 1)], &[]));
@@ -761,7 +1045,7 @@ mod tests {
 
     #[test]
     fn dropping_a_live_revocation_is_not_delta_eligible() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::kernel::log_ring::lock_tests();
         reset_staged_plan_for_test();
 
         stage(plan_bytes(30, &[(0xEE, 5, 1), (0xFF, 6, 1)], &[]));

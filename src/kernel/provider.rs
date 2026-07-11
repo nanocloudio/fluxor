@@ -455,6 +455,21 @@ pub fn provider_open(
     if crate::kernel::scheduler::deny_isr_tier_syscall("provider_open") {
         return errno::EACCES;
     }
+    // Admission gate (rfc_owner_drain_and_logs.md §3.5): opening a provider
+    // handle is NEW admission, refused for a Draining owner. Handles it already
+    // holds keep working (`authorize_use` semantics) so in-flight work can run
+    // dry. System-owned modules are unaffected.
+    #[cfg(feature = "multitenant")]
+    {
+        let owner = crate::kernel::scheduler::caller_owner();
+        if !owner.is_system() && !crate::kernel::scheduler::owners_mut().authorize_admit(owner) {
+            log::warn!(
+                "[provider] open refused: owner slot {} draining/revoked",
+                owner.slot
+            );
+            return errno::EACCES;
+        }
+    }
     let handle = match vtable_for(contract) {
         // SAFETY: vt.call is the contract's registered fn-pointer; passing
         // -1 (no handle yet) with the open opcode and caller's config buf.

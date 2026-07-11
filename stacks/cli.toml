@@ -1,0 +1,21 @@
+# The `cli` stack (rfc_cli_execution.md §4.3): one line — `platform: { cli: {} }`
+# — turns a graph into a CLI on Linux. Injects the built-in host I/O surface;
+# the app graph wires whichever ports it uses (unused wires drop in the
+# two-pass expansion):
+#
+#   cli_in.args_out   -> app arg-ingest
+#   cli_in.stdin_out  -> app stdin
+#   app stdout/stderr -> cli_out.bytes_in / cli_out.err_in
+#   app exit          -> cli_out.exit_in     ([code: i32 LE]; absent = exit 0)
+#
+# Linux-only by design: bare-metal targets have no host stdio (§2 non-goals).
+[stack]
+name = "cli"
+
+[[variant]]
+match = { family = "linux" }
+modules = [
+  { name = "cli_in" },
+  { name = "cli_out" },
+]
+wiring = []

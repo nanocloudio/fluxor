@@ -154,6 +154,18 @@ impl<const CAP: usize> ExtBridge<CAP> {
         self.len_bytes() == 0
     }
 
+    /// Whether a frame carrying `payload` bytes would currently fit (frame
+    /// header included). A single-producer caller can consult this **before**
+    /// consuming bytes from an upstream source, so a would-be-rejected push
+    /// never forces it to drop already-read bytes. Sound for the SPSC producer:
+    /// between this check and the matching `push_frame`, `tail` can only advance
+    /// (the consumer popping), which only frees space — so a frame that fits
+    /// here still fits at push time.
+    pub fn has_room_for(&self, payload: usize) -> bool {
+        let need = HDR + payload;
+        need <= CAP && CAP - self.len_bytes() >= need
+    }
+
     /// NotReady latch state (workload health aggregation reads this).
     pub fn not_ready(&self) -> bool {
         self.not_ready.load(Ordering::Acquire)

@@ -93,6 +93,9 @@ fn parse_args() -> CliArgs {
                 println!("host-image");
                 process::exit(0);
             }
+            // Everything after `--` is the app's argv — cli_in reads it
+            // from env::args() itself (rfc_cli_execution.md §4.1).
+            "--" => break,
             other => {
                 eprintln!("error: unknown argument: {other}");
                 process::exit(1);
@@ -117,6 +120,7 @@ include!("linux/providers.rs");
 include!("linux/object.rs");
 include!("linux/namespace.rs");
 include!("linux/builtin_params.rs");
+include!("linux/cli_io.rs");
 include!("linux/host_asset_source.rs");
 include!("linux/host_asset_index.rs");
 include!("linux/linux_display.rs");
@@ -141,6 +145,14 @@ include!("linux/owner_drain.rs");
 /// path in the main loop; both call `prepare_graph()` (which does the
 /// destructive arena/scheduler reset) then this.
 fn build_graph_linux() -> (usize, usize) {
+    // Close the previous graph's linux_net fds BEFORE the destructive reset
+    // drops their state: a leaked listener fd would keep its port bound and
+    // every re-issued CMD_BIND after the rebuild would die on EADDRINUSE.
+    // The endpoint report shows a bounded transient bound:false across the
+    // rebuild window (rfc_endpoint_lease.md §4.5); pure-drain removals never
+    // rebuild, so co-residents' reports don't flap on ordinary deletes.
+    linux_net_close_all_and_clear_registry();
+
     // linux_net drains one inbound lane per wired edge (priority by
     // wiring order) — tell graph prep not to merge its fan-in.
     scheduler::register_multi_inbound(LINUX_NET_HASH);
@@ -182,23 +194,47 @@ fn build_graph_linux() -> (usize, usize) {
         if entry.name_hash == LINUX_NET_HASH {
             scheduler::set_current_module(module_idx);
             // Collect EVERY inbound command channel (priority lanes:
-            // one per `to: linux_net.net_in` edge, in wiring order).
+            // one per `to: linux_net.net_in` edge, in wiring order), and
+            // resolve each lane's COMMANDING owner from its producing edge —
+            // the carried-attribution source for endpoint-lease stamps
+            // (rfc_endpoint_lease.md §4.1). Owner stamps are live here: the
+            // plan applied before instantiation (see apply_staged above).
             let mut net_ins = [-1i32; LINUX_NET_MAX_INBOUND];
+            let mut lane_owners = [fluxor::kernel::owner::OWNER_SYSTEM; LINUX_NET_MAX_INBOUND];
             let mut lane_count = 0usize;
             for (k, slot) in net_ins.iter_mut().enumerate() {
                 let ch = scheduler::get_module_port(module_idx, 0, k as u8);
                 *slot = ch;
                 if ch >= 0 {
+                    lane_owners[k] = scheduler::channel_producer_owner(ch);
                     lane_count = k + 1;
                 }
             }
             let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
             let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            install_state(&mut m, LinuxNetState::new(net_ins, net_out_ch));
+            let state = LinuxNetState::new(net_ins, lane_owners, net_out_ch);
+            // Register for the platform-side endpoint report, the owner
+            // teardown hook, and the rebuild fd close-out (§4.3–§4.5).
+            linux_net_register_state(&*state as *const LinuxNetState as *mut LinuxNetState);
+            install_state(&mut m, state);
             scheduler::store_builtin_module(module_idx, m);
             log::info!(
                 "[inst] module {module_idx} = linux_net (built-in) net_in_lanes={lane_count} net_out={net_out_ch}"
             );
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == CLI_IN_HASH {
+            let m = build_cli_in(module_idx);
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == CLI_OUT_HASH {
+            let m = build_cli_out(module_idx);
+            scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;
         }
@@ -482,13 +518,18 @@ fn main() {
 
     // A revocation the just-applied plan still lists, naming an owner that was
     // NOT reinstalled, was mid-drain when the previous process died: the drain
-    // is forfeited and recorded as drain-timeout-by-restart
-    // (rfc_owner_drain_and_logs.md §3.6).
+    // is forfeited and recorded as drain-timeout-by-restart — unless the
+    // previous process already persisted that pod's terminal outcome
+    // (rfc_owner_drain_and_logs.md §3.6, §3.7 writer seeding).
     synthesize_restart_terminals(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        &owner_status
+            .as_ref()
+            .map(|w| w.seeded_terminated_uids())
+            .unwrap_or_default(),
     );
 
     // Publish the initial owner status immediately (before the first 100 ms
@@ -581,6 +622,14 @@ fn main() {
                     match fluxor::kernel::owner_plan::try_apply_drain_delta() {
                         Some(delta) => arm_drains(&delta),
                         None => {
+                            // Structural plan: not a pure-drain delta, but it may
+                            // still revoke owners. Arm their drains before the
+                            // rebuild so each gets a terminal record — the rebuild's
+                            // reset drops the owner from the table and the next
+                            // drain_tick finalises it, instead of it vanishing
+                            // untracked.
+                            let drains = fluxor::kernel::owner_plan::arm_staged_revocation_drains();
+                            arm_drains(&drains);
                             // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
                             unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
                         }
@@ -647,8 +696,12 @@ fn main() {
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            log::info!("[sched] all modules complete, exiting");
-            process::exit(0);
+            // Plain-run/exec completion: report the CLI exit-code latch
+            // (default 0 — non-CLI graphs are unchanged). Node-agent mode
+            // never reaches here (rfc_cli_execution.md §6).
+            let code = CLI_EXIT_CODE.load(Ordering::Acquire);
+            log::info!("[sched] all modules complete, exiting (code {code})");
+            process::exit(code);
         }
 
         // Event-wake parity with RP: drain any wake bits that latched

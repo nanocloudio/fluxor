@@ -969,6 +969,30 @@ pub fn channel_set_mailbox(handle: i32) {
     debug!("channel_set_mailbox: ch {handle} enabled");
 }
 
+/// Does the channel hold undelivered data — covering BOTH transport modes:
+/// FIFO ring-buffer bytes AND a pending mailbox frame (which the byte-count
+/// accessor reports as 0). This is the drain-quiescence emptiness check
+/// (rfc_owner_drain_and_logs.md §3.1): a draining owner is not quiescent while
+/// any of its channels answers `true`. Invalid/closed handles are empty.
+pub fn channel_has_pending(handle: i32) -> bool {
+    if handle < 0 {
+        return false;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return false;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return false;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        let buf_slot = slot.buffer_slot.load(Ordering::Acquire);
+        return buf_slot >= 0 && buffer_pool::mailbox_has_data(i32::from(buf_slot));
+    }
+    slot.with_lock(|fifo, _| fifo.is_readable())
+}
+
 /// Return readable bytes in channel's ring buffer (0 for invalid/mailbox/empty).
 pub fn channel_readable_bytes(handle: i32) -> usize {
     if handle < 0 {

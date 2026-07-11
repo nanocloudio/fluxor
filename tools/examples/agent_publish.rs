@@ -48,6 +48,7 @@ fn main() {
                 endpoints: 0,
                 domains: 1,
             },
+            exports: Vec::new(),
         }],
     };
     let cap = NodeCapacity {

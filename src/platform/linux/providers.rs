@@ -530,6 +530,11 @@ const MSG_CLOSED: u8 = 0x03;
 const MSG_BOUND: u8 = 0x04;
 const MSG_CONNECTED: u8 = 0x05;
 const MSG_ERROR: u8 = 0x06;
+/// Bind refusal / failure: `[port: u16 LE][errno: u8]`. The port is the routing
+/// key (consumers sharing net_out already filter by local_port). Emitted on a
+/// bind syscall failure and on an owner-gate refusal (rfc_endpoint_lease.md
+/// §5.3), so a requester never hangs waiting for MSG_BOUND on a failed bind.
+const MSG_BIND_REFUSED: u8 = 0x07;
 
 // Net protocol command types (upstream: consumer → linux_net)
 const CMD_BIND: u8 = 0x10;
@@ -592,6 +597,11 @@ struct LinuxNetConn {
     /// Requester tag from `CMD_CONNECT`, echoed in `MSG_CONNECTED` /
     /// connect-failure `MSG_ERROR` so a fanned net_out routes the event back.
     connect_tag: u8,
+    /// The COMMANDING owner — the owner of the module whose lane issued the
+    /// bind/connect that created this slot (rfc_endpoint_lease.md §4.1:
+    /// attribution is carried via the lane, never inferred from the executing
+    /// module, which may be system-owned). Immutable for the life of the slot.
+    owner: fluxor::kernel::owner::OwnerHandle,
     write_buf: [u8; LINUX_NET_WRITE_BUF],
 }
 
@@ -604,6 +614,7 @@ impl LinuxNetConn {
         write_offset: 0,
         write_len: 0,
         connect_tag: 0,
+        owner: fluxor::kernel::owner::OWNER_SYSTEM,
         write_buf: [0u8; LINUX_NET_WRITE_BUF],
     };
 }
@@ -625,6 +636,11 @@ struct LinuxNetState {
     /// of latency-critical traffic on another (Raft heartbeats racing
     /// an election timeout).
     net_ins: [i32; LINUX_NET_MAX_INBOUND],
+    /// Owner of each lane's producer module, resolved at instantiation from
+    /// the wired edge (`channel_producer_owner`) and refreshed on every
+    /// rebuild — the carried-attribution source for bind stamps
+    /// (rfc_endpoint_lease.md §4.1).
+    lane_owners: [fluxor::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
     net_out: i32,
     conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
     /// Sized to absorb a full multi-MSS `CMD_SEND` payload. The
@@ -659,7 +675,11 @@ impl LinuxNetState {
     /// `Box::new_uninit` and initialising fields in place never puts the
     /// full struct on the stack (each `LinuxNetConn::EMPTY` write is one
     /// slot at a time).
-    fn new(net_ins: [i32; LINUX_NET_MAX_INBOUND], net_out: i32) -> Box<Self> {
+    fn new(
+        net_ins: [i32; LINUX_NET_MAX_INBOUND],
+        lane_owners: [fluxor::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
+        net_out: i32,
+    ) -> Box<Self> {
         let mut b: Box<core::mem::MaybeUninit<Self>> = Box::new_uninit();
         let p = b.as_mut_ptr();
         // SAFETY: `p` points at the freshly-allocated, uninitialised Box
@@ -668,6 +688,7 @@ impl LinuxNetState {
         unsafe {
             use core::ptr::addr_of_mut;
             addr_of_mut!((*p).net_ins).write(net_ins);
+            addr_of_mut!((*p).lane_owners).write(lane_owners);
             addr_of_mut!((*p).net_out).write(net_out);
             let conns = addr_of_mut!((*p).conns) as *mut LinuxNetConn;
             for i in 0..LINUX_NET_MAX_CONNS {
@@ -705,6 +726,103 @@ unsafe fn set_nonblocking(fd: i32) {
     if flags >= 0 {
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
+}
+
+// ----------------------------------------------------------------------
+// linux_net instance registry (rfc_endpoint_lease.md §4.3–§4.5)
+//
+// The platform needs to reach every linux_net instance's connection table
+// from OUTSIDE its step — for the owner teardown hook (drain/free), the
+// rebuild fd close-out, and the bound-endpoint report. Instances register
+// their state pointer at instantiation; the registry is swept-and-cleared
+// at the top of every graph (re)build, before the old state is torn down.
+// All access is on the single platform/scheduler thread.
+// ----------------------------------------------------------------------
+
+static mut LINUX_NET_REGISTRY: Vec<*mut LinuxNetState> = Vec::new();
+
+/// Register a freshly-instantiated linux_net state. Platform thread only.
+fn linux_net_register_state(ptr: *mut LinuxNetState) {
+    // SAFETY: single-threaded platform instantiation path.
+    unsafe {
+        let reg = &mut *(&raw mut LINUX_NET_REGISTRY);
+        reg.push(ptr);
+    }
+}
+
+/// Close every fd in every registered instance and clear the registry.
+/// Called at the top of every graph (re)build, BEFORE the destructive graph
+/// reset drops the old module state — otherwise the old listener fds leak,
+/// still holding their ports, and the re-issued CMD_BINDs after the rebuild
+/// die on EADDRINUSE (rfc_endpoint_lease.md §4.5).
+fn linux_net_close_all_and_clear_registry() {
+    // SAFETY: single-threaded; pointers registered this graph generation are
+    // still valid until prepare_graph tears the old graph down (called after).
+    unsafe {
+        let reg = &mut *(&raw mut LINUX_NET_REGISTRY);
+        for &st_ptr in reg.iter() {
+            let st = &mut *st_ptr;
+            for conn in st.conns.iter_mut() {
+                if conn.fd >= 0 {
+                    libc::close(conn.fd);
+                }
+                *conn = LinuxNetConn::EMPTY;
+            }
+        }
+        reg.clear();
+    }
+}
+
+/// Close every connection slot stamped with `owner`, across all instances.
+/// The drain driver calls this BEFORE `free_owner`, so an observer never sees
+/// the owner's terminal record while its port is still accepting
+/// (rfc_endpoint_lease.md §4.4). Platform thread only.
+fn linux_net_close_owner_conns(owner: fluxor::kernel::owner::OwnerHandle) {
+    // SAFETY: single-threaded platform access to registered live instances.
+    unsafe {
+        let reg = &*(&raw const LINUX_NET_REGISTRY);
+        for &st_ptr in reg.iter() {
+            let st = &mut *st_ptr;
+            for (i, conn) in st.conns.iter_mut().enumerate() {
+                if conn.state != 0 && conn.owner == owner {
+                    if conn.fd >= 0 {
+                        libc::close(conn.fd);
+                        log::info!(
+                            "[linux_net] closed slot {i} (owner slot {} revoked)",
+                            owner.slot
+                        );
+                    }
+                    *conn = LinuxNetConn::EMPTY;
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot the bound endpoints per owner: `(owner, protocol, port)` for every
+/// live listener / UDP socket. Protocol: 1 = tcp, 2 = udp (matching
+/// CONN_TYPE_UDP_BOUND mnemonically). The runtime's raw report — declarations
+/// are the agent's business (rfc_endpoint_lease.md §4.3). Platform thread only.
+fn linux_net_bound_endpoints() -> Vec<(fluxor::kernel::owner::OwnerHandle, u8, u16)> {
+    let mut out = Vec::new();
+    // SAFETY: single-threaded platform access to registered live instances.
+    unsafe {
+        let reg = &*(&raw const LINUX_NET_REGISTRY);
+        for &st_ptr in reg.iter() {
+            let st = &*st_ptr;
+            for conn in st.conns.iter() {
+                if conn.state == 3 && conn.fd >= 0 && conn.port != 0 {
+                    let proto = match conn.conn_type {
+                        1 => 1u8,                              // tcp listener
+                        CONN_TYPE_UDP_BOUND => 2u8,            // udp socket
+                        _ => continue,                         // data conns: not endpoints
+                    };
+                    out.push((conn.owner, proto, conn.port));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn linux_net_alloc_conn(st: &mut LinuxNetState) -> i32 {
@@ -765,33 +883,112 @@ unsafe fn linux_net_send_msg(st: &mut LinuxNetState, data: &[u8]) {
     }
 }
 
-unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
+/// Emit `MSG_BIND_REFUSED [port:2 LE][errno:1]` so a bind failure/refusal is
+/// surfaced to the requester rather than leaving it waiting for MSG_BOUND.
+unsafe fn linux_net_send_bind_refused(st: &mut LinuxNetState, port: u16, errno: u8) {
+    let pb = port.to_le_bytes();
+    let msg = [MSG_BIND_REFUSED, pb[0], pb[1], errno];
+    linux_net_send_msg(st, &msg);
+}
+
+/// Emit the datagram contract's `DG_MSG_ERROR [ep_id][errno]` for a failed
+/// `DG_CMD_BIND`, alongside `MSG_BIND_REFUSED`: datagram-contract modules
+/// (dns et al.) parse only `DG_MSG_*` opcodes in their WaitBound states, so
+/// without this frame a refused UDP bind parks them forever instead of
+/// faulting (rfc_system_services.md §7 Q1). `ep_id` 0xFF = no endpoint was
+/// allocated. Emitting both frames is additive-safe: each surface's
+/// listeners match only their own opcode.
+unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, errno: u8) {
+    let msg = [DG_MSG_ERROR, 0xFF, errno];
+    linux_net_send_msg(st, &msg);
+}
+
+/// The Part B bind gate (rfc_endpoint_lease.md §5.3) for a NEW bind by
+/// `commander`: admission must be open (a Draining owner binds nothing new —
+/// same-owner re-binds of held ports never reach this, they take the use-class
+/// fast path), and when the committed plan is lease-aware the (protocol, port)
+/// must be granted. System-owned commanders are ungated, as everywhere.
+/// Returns the refusal errno, or None to proceed.
+fn linux_net_new_bind_refusal(
+    commander: fluxor::kernel::owner::OwnerHandle,
+    protocol: u8,
+    port: u16,
+) -> Option<u8> {
+    if commander.is_system() {
+        return None;
+    }
+    if !fluxor::kernel::scheduler::owners_mut().authorize_admit(commander) {
+        log::warn!(
+            "[linux_net] bind port {port} refused: owner slot {} draining/revoked",
+            commander.slot
+        );
+        return Some(1); // EPERM
+    }
+    match fluxor::kernel::owner_plan::lease_gate(
+        commander.slot,
+        commander.generation,
+        protocol,
+        port,
+    ) {
+        fluxor::kernel::owner_plan::LeaseGate::Refused => {
+            log::warn!(
+                "[linux_net] bind port {port} refused: no lease granted to owner slot {}",
+                commander.slot
+            );
+            Some(13) // EACCES
+        }
+        _ => None,
+    }
+}
+
+unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
+    let commander = st.lane_owners[lane];
     // Embedded IP modules close their listener after each accepted
     // connection; their TCP/IP servers re-issue CMD_BIND between
     // requests. On Linux the listening fd persists, so a re-bind on
     // the same port would fail with EADDRINUSE. Acknowledge the
     // re-bind with MSG_BOUND immediately when an existing listener
-    // is alive *for the same port* — preserving the protocol contract
-    // — and skip the socket(2)/bind(2) syscalls entirely.
+    // is alive *for the same port* — but ONLY for the same commanding
+    // owner (rfc_endpoint_lease.md §4.2): the fast path was owner-blind
+    // and would silently hand one owner's listener to another. Same-owner
+    // re-bind is use-class (allowed even while Draining — the accept-loop
+    // case); a cross-owner claim on a live listener is refused.
     for (li, c) in st.conns.iter().enumerate() {
         if c.state == 3 && c.conn_type == 1 && c.fd >= 0 && c.port == port {
-            // MSG_BOUND payload: [conn_id:1][local_port:2 LE]
-            let pb = port.to_le_bytes();
-            let msg = [MSG_BOUND, li as u8, pb[0], pb[1]];
-            linux_net_send_msg(st, &msg);
+            if c.owner == commander {
+                // MSG_BOUND payload: [conn_id:1][local_port:2 LE]
+                let pb = port.to_le_bytes();
+                let msg = [MSG_BOUND, li as u8, pb[0], pb[1]];
+                linux_net_send_msg(st, &msg);
+            } else {
+                log::warn!(
+                    "[linux_net] bind port {port} refused: held by owner slot {} \
+                     (requester owner slot {})",
+                    c.owner.slot,
+                    commander.slot
+                );
+                linux_net_send_bind_refused(st, port, 98); // EADDRINUSE
+            }
             return;
         }
+    }
+
+    if let Some(errno) = linux_net_new_bind_refusal(commander, 1, port) {
+        linux_net_send_bind_refused(st, port, errno);
+        return;
     }
 
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free slots for listener");
+        linux_net_send_bind_refused(st, port, 105); // ENOBUFS
         return;
     }
 
     let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
     if fd < 0 {
         log::error!("[linux_net] socket() failed");
+        linux_net_send_bind_refused(st, port, 23); // ENFILE
         return;
     }
 
@@ -815,8 +1012,10 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         core::mem::size_of::<libc::sockaddr_in>() as u32,
     ) < 0
     {
-        log::error!("[linux_net] bind() failed on port {port}");
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        log::error!("[linux_net] bind() failed on port {port} (errno {errno})");
         libc::close(fd);
+        linux_net_send_bind_refused(st, port, errno.clamp(0, 255) as u8);
         return;
     }
 
@@ -827,6 +1026,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
     if libc::listen(fd, 128) < 0 {
         log::error!("[linux_net] listen() failed");
         libc::close(fd);
+        linux_net_send_bind_refused(st, port, 95); // EOPNOTSUPP
         return;
     }
 
@@ -837,6 +1037,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
         conn_type: 1,
         state: 3,
         port,
+        owner: commander,
         ..LinuxNetConn::EMPTY
     };
     // The scenario runner uses this stderr line as its readiness signal. Keep it
@@ -856,16 +1057,26 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16) {
 // Datagram surface — UDP bind / send_to / recvfrom on the same channel
 // ----------------------------------------------------------------------
 
-unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16) {
+unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
+    let commander = st.lane_owners[lane];
+    if let Some(errno) = linux_net_new_bind_refusal(commander, 2, port) {
+        linux_net_send_bind_refused(st, port, errno);
+        linux_net_send_dg_error(st, errno);
+        return;
+    }
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free slots for UDP bind");
+        linux_net_send_bind_refused(st, port, 105); // ENOBUFS
+        linux_net_send_dg_error(st, 105);
         return;
     }
 
     let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
     if fd < 0 {
         log::error!("[linux_net] UDP socket() failed");
+        linux_net_send_bind_refused(st, port, 23); // ENFILE
+        linux_net_send_dg_error(st, 23);
         return;
     }
     let opt: i32 = 1;
@@ -888,16 +1099,23 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16) {
         core::mem::size_of::<libc::sockaddr_in>() as u32,
     ) < 0
     {
-        log::error!("[linux_net] UDP bind() failed on port {port}");
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        log::error!("[linux_net] UDP bind() failed on port {port} (errno {errno})");
         libc::close(fd);
+        linux_net_send_bind_refused(st, port, errno.clamp(0, 255) as u8);
+        linux_net_send_dg_error(st, errno.clamp(0, 255) as u8);
         return;
     }
     set_nonblocking(fd);
     let idx = slot as usize;
+    // `port` is recorded: the endpoint report and the bind gate both need it
+    // (rfc_endpoint_lease.md §1.1).
     st.conns[idx] = LinuxNetConn {
         fd,
         conn_type: CONN_TYPE_UDP_BOUND,
         state: 3,
+        port,
+        owner: commander,
         ..LinuxNetConn::EMPTY
     };
     log::info!("[linux_net] UDP bound port {port} (slot {idx})");
@@ -1021,6 +1239,7 @@ unsafe fn linux_net_cmd_connect(
     ip: u32,
     port: u16,
     tag: u8,
+    lane: usize,
 ) {
     // STREAM-only surface (net_proto Stream Surface v1). Datagram traffic uses
     // the datagram surface (CMD_DG_BIND / CMD_DG_SEND_TO), not CMD_CONNECT, so a
@@ -1079,6 +1298,10 @@ unsafe fn linux_net_cmd_connect(
             conn_type: sock_type,
             state: 1,
             connect_tag: tag,
+            // Stamp the commanding owner so this outbound data conn is torn
+            // down with its owner on drain/revoke (rfc_endpoint_lease.md §4.4);
+            // otherwise it stays OWNER_SYSTEM and outlives revocation.
+            owner: st.lane_owners[lane],
             ..LinuxNetConn::EMPTY
         };
     } else {
@@ -1087,6 +1310,7 @@ unsafe fn linux_net_cmd_connect(
             conn_type: sock_type,
             state: 2,
             connect_tag: tag,
+            owner: st.lane_owners[lane],
             ..LinuxNetConn::EMPTY
         };
         let msg = [MSG_CONNECTED, idx as u8, tag];
@@ -1267,6 +1491,9 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
 
         let listener_fd = st.conns[li].fd;
         let listener_port = st.conns[li].port;
+        // The accepted client inherits the listener's owner so it is torn down
+        // with the owner on drain/revoke (rfc_endpoint_lease.md §4.4).
+        let listener_owner = st.conns[li].owner;
         let mut accepted_on_this_listener: u32 = 0;
         while accepted_on_this_listener < PER_TICK_ACCEPT_BUDGET {
             let mut addr: libc::sockaddr_in = core::mem::zeroed();
@@ -1283,7 +1510,7 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
                 break; // EAGAIN / EWOULDBLOCK — queue drained
             }
             accepted_on_this_listener += 1;
-            accept_one_client(st, client_fd, listener_port);
+            accept_one_client(st, client_fd, listener_port, listener_owner);
             had_work = true;
         }
     }
@@ -1299,7 +1526,12 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
 /// graphs binding distinct ports) can filter on it and only claim
 /// their own connections — the broadcast surface would otherwise
 /// double-allocate the conn_id across every consumer.
-unsafe fn accept_one_client(st: &mut LinuxNetState, client_fd: i32, listener_port: u16) {
+unsafe fn accept_one_client(
+    st: &mut LinuxNetState,
+    client_fd: i32,
+    listener_port: u16,
+    owner: fluxor::kernel::owner::OwnerHandle,
+) {
     // Enable application-friendly TCP keepalive so a silently-dead
     // peer (laptop suspended, NAT timeout without RST) is detected
     // within ~30 s instead of the kernel default ~2 h. Without
@@ -1378,6 +1610,7 @@ unsafe fn accept_one_client(st: &mut LinuxNetState, client_fd: i32, listener_por
         fd: client_fd,
         conn_type: 1,
         state: 2,
+        owner,
         ..LinuxNetConn::EMPTY
     };
 
@@ -1581,7 +1814,7 @@ fn linux_net_step(state: *mut u8) -> i32 {
                     match msg_type {
                         CMD_BIND if payload_len >= 2 => {
                             let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                            linux_net_cmd_bind(st, port);
+                            linux_net_cmd_bind(st, port, lane);
                             had_work = true;
                         }
                         CMD_CONNECT if payload_len >= 7 => {
@@ -1596,7 +1829,7 @@ fn linux_net_step(state: *mut u8) -> i32 {
                             // Optional trailing requester tag (8-byte form), echoed in
                             // MSG_CONNECTED / MSG_ERROR for fanned-net_out routing.
                             let tag = if payload_len >= 8 { st.cmd_buf[7] } else { 0 };
-                            linux_net_cmd_connect(st, sock_type, ip, port, tag);
+                            linux_net_cmd_connect(st, sock_type, ip, port, tag, lane);
                             had_work = true;
                         }
                         CMD_SEND if payload_len >= 2 => {
@@ -1616,7 +1849,7 @@ fn linux_net_step(state: *mut u8) -> i32 {
                             // Payload (modules/sdk/contracts/net/datagram.rs):
                             //   [port: u16 LE] [flags: u8].
                             let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                            linux_net_dg_cmd_bind(st, port);
+                            linux_net_dg_cmd_bind(st, port, lane);
                             had_work = true;
                         }
                         DG_CMD_SEND_TO if payload_len >= 8 => {

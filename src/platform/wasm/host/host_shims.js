@@ -700,6 +700,53 @@ registerProcessor('pcm-ring', PcmRing);
         })
       : Promise.resolve(null);
 
+    // IndexedDB fallback persistence tier. OPFS (`navigator.storage`) only
+    // exists in SECURE contexts — over plain-http (a LAN-IP dev box, the
+    // same constraint that forces the ScriptProcessor audio fallback) it is
+    // absent entirely, so an OPFS-only write tier silently loses every blob
+    // on refresh and warm-boot consumers (the shell's catalog projection)
+    // cold-scan forever. IndexedDB works in insecure contexts and Workers.
+    // OPFS is preferred when present; IDB enumeration (a key cursor) is
+    // reliable, so it needs no side index.
+    const idbOpenP = new Promise((resolve) => {
+      if (typeof indexedDB === 'undefined') return resolve(null);
+      try {
+        const req = indexedDB.open('fluxor-objects', 1);
+        req.onupgradeneeded = () => {
+          try { req.result.createObjectStore('blobs'); } catch (_) { /* exists */ }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+        req.onblocked = () => resolve(null);
+      } catch (_) { resolve(null); }
+    });
+    const idbPersist = (key, bytes) => idbOpenP.then((db) => new Promise((resolve) => {
+      if (!db) return resolve();
+      try {
+        const tx = db.transaction('blobs', 'readwrite');
+        tx.objectStore('blobs').put(bytes, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
+      } catch (_) { resolve(); }
+    }));
+    const idbHydrate = () => idbOpenP.then((db) => new Promise((resolve) => {
+      if (!db) return resolve();
+      try {
+        const cur = db.transaction('blobs', 'readonly').objectStore('blobs').openCursor();
+        cur.onsuccess = () => {
+          const c = cur.result;
+          if (!c) return resolve();
+          try {
+            const k = String(c.key);
+            if (!objStore.has(k)) objStore.set(k, new Uint8Array(c.value));
+          } catch (_) { /* skip entry */ }
+          c.continue();
+        };
+        cur.onerror = () => resolve();
+      } catch (_) { resolve(); }
+    }));
+
     // Resolve `key` ("a/b/c.bin") to an OPFS file handle, creating the
     // intermediate directories when `create` is set. Returns null if OPFS
     // is absent, or (for create=false) if any path segment is missing.
@@ -719,15 +766,44 @@ registerProcessor('pcm-ring', PcmRing);
       }
     };
 
-    // Background-persist `bytes` for `key` to OPFS. Fire-and-forget: the
-    // synchronous PUT has already populated `objStore`, so a failure here
-    // only costs durability, never correctness this session.
+    // Key index for hydration. Directory ENUMERATION (`entries()`) is not
+    // trustworthy across realms — Chromium's worker-side enumeration has
+    // been observed returning `$`-mangled segment names for entries created
+    // in the same realm (`truffle/x` enumerates as `$truffle/$x`), so a
+    // hydrate that reconstructs keys from enumerated names silently stores
+    // them under the wrong key and every later lookup misses. Name
+    // RESOLUTION (`get{Directory,File}Handle(name)`) round-trips reliably,
+    // so persistence maintains an explicit index of PUT keys at a fixed
+    // path and hydration resolves each listed key by name.
+    const OPFS_INDEX_KEY = 'fluxor-object-index.json';
+    // Background-persist `bytes` for `key` to OPFS (+ index update).
+    // Fire-and-forget but SEQUENTIALIZED: the synchronous PUT has already
+    // populated `objStore`, so a failure here only costs durability, never
+    // correctness this session; the chain keeps read-modify-write index
+    // updates from racing each other.
+    let opfsPersistChain = Promise.resolve();
     const opfsPersist = (key, bytes) => {
-      opfsResolveFile(key, true).then(async (fh) => {
+      opfsPersistChain = opfsPersistChain.then(async () => {
+        const root = await opfsRootP;
+        if (!root) { await idbPersist(key, bytes); return; }
+        const fh = await opfsResolveFile(key, true);
         if (!fh) return;
         const w = await fh.createWritable();
         await w.write(bytes);
         await w.close();
+        const idxFh = await opfsResolveFile(OPFS_INDEX_KEY, true);
+        if (!idxFh) return;
+        let keys = [];
+        try {
+          const j = JSON.parse(await (await idxFh.getFile()).text());
+          if (Array.isArray(j)) keys = j.filter((k) => typeof k === 'string');
+        } catch (_) { /* absent/garbled index — rebuild from this key */ }
+        if (!keys.includes(key)) {
+          keys.push(key);
+          const wi = await idxFh.createWritable();
+          await wi.write(JSON.stringify(keys));
+          await wi.close();
+        }
       }).catch((err) => {
         console.warn(`host_object: OPFS persist failed for "${key}": ${err && err.message}`);
       });
@@ -739,25 +815,27 @@ registerProcessor('pcm-ring', PcmRing);
     // on a complete index (see `namespaceReady` below).
     const opfsHydrate = () => {
       return opfsRootP.then(async (root) => {
-        if (!root || typeof root.entries !== 'function') return;
-        const walk = async (dir, prefix) => {
-          for await (const [name, handle] of dir.entries()) {
-            const path = prefix ? `${prefix}/${name}` : name;
-            if (handle.kind === 'directory') {
-              await walk(handle, path);
-            } else {
-              try {
-                const file = await handle.getFile();
-                const buf = new Uint8Array(await file.arrayBuffer());
-                if (!objStore.has(path)) objStore.set(path, buf);
-              } catch (_) { /* skip unreadable entry */ }
-            }
-          }
-        };
-        await walk(root, '');
-      }).catch(() => { /* no OPFS / iteration unsupported — skip */ });
+        if (!root) return;
+        // Index-driven: resolve each persisted key BY NAME (see the
+        // OPFS_INDEX_KEY comment — enumeration is not realm-stable).
+        const idxFh = await opfsResolveFile(OPFS_INDEX_KEY, false);
+        if (!idxFh) return; // nothing persisted yet
+        let keys = [];
+        try {
+          const j = JSON.parse(await (await idxFh.getFile()).text());
+          if (Array.isArray(j)) keys = j.filter((k) => typeof k === 'string');
+        } catch (_) { return; }
+        for (const key of keys) {
+          try {
+            const fh = await opfsResolveFile(key, false);
+            if (!fh) continue;
+            const buf = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+            if (!objStore.has(key)) objStore.set(key, buf);
+          } catch (_) { /* skip unreadable entry */ }
+        }
+      }).catch(() => { /* no OPFS — skip */ });
     };
-    const opfsHydrateP = opfsHydrate();
+    const opfsHydrateP = Promise.allSettled([opfsHydrate(), idbHydrate()]).then(() => {});
 
     // ── namespace index (host_ns_*, storage.namespace enumeration) ───
     // Directory enumeration over the SAME flat key space the object tier
@@ -1710,6 +1788,71 @@ registerProcessor('pcm-ring', PcmRing);
                     return r;
                   }
                 }
+              }
+              // storage.object PUT (0x1420) embeds body_ptr + fence_out_ptr
+              // (child addresses) in the arg. Unbridged, the provider would
+              // read the body from an untranslated child address in KERNEL
+              // memory (persisting garbage) and write the fence to a child
+              // address in kernel memory (heap corruption). Copy the body
+              // through kernel scratch and rewrite both pointers.
+              // Arg: [key_len:u16][key][ct_len:u8][ct][body_ptr:u64]
+              //      [body_len:u64][if_match_len:u8][if_match]
+              //      [fence_ptr:u64][fence_cap:u16]
+              const OBJ_PUT_OP = 0x1420, OBJ_RANGE_GET_OP = 0x1423;
+              if (op === OBJ_PUT_OP && p && l >= 2) {
+                // Service the PUT directly from child memory: the kernel
+                // path would need the whole (multi-MB) body staged through
+                // kernel heap scratch just to end up in THIS closure's
+                // host_object_put anyway. Same semantics (objStore +
+                // OPFS persist), zero kernel-heap pressure. The fence is
+                // left zeroed (the fence buffer lives child-side and the
+                // wasm store is LocalDurable-at-best anyway).
+                try {
+                  const cbuf = childMem();
+                  const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
+                  const keyLen = cdv.getUint16(0, true);
+                  const ctOff = 2 + keyLen;
+                  if (keyLen === 0 || ctOff + 1 > l) return -1;
+                  const ctLen = cdv.getUint8(ctOff);
+                  const bodyOff = ctOff + 1 + ctLen;
+                  if (bodyOff + 17 > l) return -1;
+                  const bodyChild = cdv.getUint32(bodyOff, true);          // u64 lo
+                  const bodyLen = Number(cdv.getBigUint64(bodyOff + 8, true));
+                  const ifLen = cdv.getUint8(bodyOff + 16);
+                  if (ifLen !== 0) return -38;                             // ENOSYS, like the kernel
+                  const key = new TextDecoder().decode(cbuf.subarray(p + 2, p + 2 + keyLen));
+                  const body = cbuf.slice(bodyChild, bodyChild + bodyLen);
+                  objStore.set(key, body);
+                  opfsPersist(key, body);
+                  return 0;
+                } catch (err) {
+                  console.error(`module OBJ_PUT bridge threw: ${err.message}`);
+                  return -1;
+                }
+              }
+              // storage.object RANGE_GET (0x1423) embeds out_ptr (child):
+              // unbridged, the provider writes the window into kernel memory
+              // at the child address — the module never sees the bytes AND
+              // kernel memory is corrupted. Alloc kernel scratch, rewrite,
+              // copy the read bytes back to the child.
+              // Arg: [offset:u64][length:u32][out_ptr:u64]
+              if (op === OBJ_RANGE_GET_OP && p && l >= 20) {
+                const cbuf = childMem();
+                const cdv = new DataView(cbuf.buffer, cbuf.byteOffset + p, l);
+                const rgLen = cdv.getUint32(8, true);
+                const outChild = cdv.getUint32(12, true);                 // u64 lo
+                const k = childToKernel(p, l);
+                if (!k) return -1;
+                const outK = rgLen ? getKernel().exports.kernel_heap_alloc(rgLen) : 0;
+                if (rgLen && !outK) { getKernel().exports.kernel_heap_free(k); return -1; }
+                const kbuf = kmem();
+                const kdv = new DataView(kbuf.buffer, kbuf.byteOffset + k, l);
+                kdv.setUint32(12, outK, true); kdv.setUint32(16, 0, true);
+                const r = getKernel().exports.provider_call(h, op, k, l);
+                if (r > 0 && outK && outChild) kernelToChild(outK, outChild, Math.min(r, rgLen));
+                if (outK) getKernel().exports.kernel_heap_free(outK);
+                getKernel().exports.kernel_heap_free(k);
+                return r;
               }
               const k = childToKernel(p, l);
               const r = getKernel().exports.provider_call(h, op, k, l);

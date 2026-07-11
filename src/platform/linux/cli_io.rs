@@ -1,0 +1,363 @@
+// cli_in / cli_out built-ins — the host stdio/argv/exit-code surface
+// (rfc_cli_execution.md §4). Host facts stay host-side: argv, stdin, stdout,
+// stderr, and the process exit code are owned by these built-ins; app modules
+// remain pure channel-in/out.
+//
+//   cli_in   args_out  (out 0)  one record: argv after `--`, NUL-separated
+//            stdin_out (out 1)  stdin bytes (worker thread → ExtBridge)
+//   cli_out  bytes_in  (in 0)   → process stdout (ExtBridge → worker thread)
+//            err_in    (in 1)   → process stderr (ditto)
+//            exit_in   (in 2)   [code: i32 LE] latches CLI_EXIT_CODE
+//
+// Blocking I/O lives on worker threads, never in `module_step` — the
+// proc_executor discipline. Backpressure is real in both directions:
+// stdin pump blocks on a full bridge (`Block` policy), and cli_out stops
+// draining a channel whose bridge is full, which backpressures the app
+// through ordinary channel fullness.
+//
+// Completion (the CLI-ness): cli_in returns Done once argv is emitted and
+// stdin has hit EOF fully flushed; cli_out returns Done when an exit record
+// arrives, or when every upstream producer is finished and its inputs and
+// bridges are drained. The plain-run completion branch then exits the
+// process with CLI_EXIT_CODE (rfc_cli_execution.md §6).
+
+use fluxor::kernel::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
+use portable_atomic::AtomicI32;
+use std::sync::Arc;
+
+const CLI_IN_HASH: u32 = 0x39EB09AD; // fnv1a32("cli_in")
+const CLI_OUT_HASH: u32 = 0xD0D89096; // fnv1a32("cli_out")
+
+/// Ring capacity per stream. Power of two, > frame header, several channel
+/// buffers deep so a slow consumer doesn't immediately stall the pump.
+const CLI_BRIDGE_CAP: usize = 8192;
+/// One frame ≤ half a default channel buffer, so a popped frame always fits
+/// the all-or-nothing channel write in at most a few steps.
+const CLI_CHUNK: usize = 1024;
+
+/// The exit code the plain-run completion branch reports (default 0). Set by
+/// cli_out's `exit_in`. Node-agent mode never reads it.
+pub(crate) static CLI_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+
+/// The process argv after the first `--`, NUL-joined (empty when no `--` or
+/// nothing follows it). Host code reads the real env::args — no config baking.
+fn argv_record() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut seen_sep = false;
+    for a in std::env::args() {
+        if seen_sep {
+            if !out.is_empty() {
+                out.push(0);
+            }
+            out.extend_from_slice(a.as_bytes());
+        } else if a == "--" {
+            seen_sep = true;
+        }
+    }
+    out
+}
+
+// ── cli_in ──────────────────────────────────────────────────────────────────
+
+struct CliInState {
+    args_out: i32,
+    stdin_out: i32,
+    args_sent: bool,
+    bridge: Option<Arc<ExtBridge<CLI_BRIDGE_CAP>>>,
+    eof: Arc<portable_atomic::AtomicBool>,
+    /// Frame bytes accepted from the bridge but not yet written to the
+    /// channel (consumer was full). Drained before the next pop.
+    pending: Vec<u8>,
+    pending_pos: usize,
+}
+
+fn cli_in_step(state: *mut u8) -> i32 {
+    // SAFETY: kernel-owned arena sized to `CliInState` by the loader.
+    let st = unsafe { instance_state::<CliInState>(state) };
+
+    // argv first: one record, retried until the channel takes it whole.
+    if !st.args_sent {
+        if st.args_out < 0 {
+            st.args_sent = true;
+        } else {
+            let rec = argv_record();
+            if rec.is_empty() {
+                // A zero-length channel write is meaningless; an absent/empty
+                // argv is simply "no record" — apps treat silence as no args.
+                st.args_sent = true;
+            } else {
+                // SAFETY: pointer/length from an owned Vec.
+                let w = unsafe { channel::channel_write(st.args_out, rec.as_ptr(), rec.len()) };
+                if w == rec.len() as i32 {
+                    st.args_sent = true;
+                } else {
+                    return 0; // channel full — retry next step, order preserved
+                }
+            }
+        }
+    }
+
+    let Some(bridge) = st.bridge.as_ref() else {
+        // stdin_out unwired: argv was the whole job.
+        return if st.args_sent { 1 } else { 0 };
+    };
+
+    // Flush pending before popping more — byte order under backpressure.
+    while st.pending_pos < st.pending.len() {
+        // SAFETY: offset/length stay within the owned Vec.
+        let w = unsafe {
+            channel::channel_write(
+                st.stdin_out,
+                st.pending.as_ptr().add(st.pending_pos),
+                st.pending.len() - st.pending_pos,
+            )
+        };
+        if w > 0 {
+            st.pending_pos += w as usize;
+        } else {
+            return 0;
+        }
+    }
+    st.pending.clear();
+    st.pending_pos = 0;
+
+    let mut frame = [0u8; CLI_CHUNK];
+    while let Some(n) = bridge.pop_frame(&mut frame) {
+        let mut written = 0usize;
+        while written < n {
+            // SAFETY: `written < n <= frame.len()`.
+            let w = unsafe {
+                channel::channel_write(st.stdin_out, frame.as_ptr().add(written), n - written)
+            };
+            if w > 0 {
+                written += w as usize;
+            } else {
+                st.pending.extend_from_slice(&frame[written..n]);
+                return 0;
+            }
+        }
+    }
+
+    if st.args_sent && st.eof.load(Ordering::Acquire) && bridge.is_empty() && st.pending.is_empty()
+    {
+        return 1; // Done: argv out, stdin closed and fully forwarded
+    }
+    0
+}
+
+/// Construct a `cli_in` built-in: read this process's argv/stdin. The stdin
+/// pump thread is spawned only when `stdin_out` is wired.
+fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
+    scheduler::set_current_module(module_idx);
+    let args_out = scheduler::get_module_port(module_idx, 1, 0);
+    let stdin_out = scheduler::get_module_port(module_idx, 1, 1);
+
+    let eof = Arc::new(portable_atomic::AtomicBool::new(false));
+    let bridge = if stdin_out >= 0 {
+        let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
+        let pump = Arc::clone(&b);
+        let pump_eof = Arc::clone(&eof);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; CLI_CHUNK];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // Block policy: the pump (never module_step) waits out
+                        // a full ring — real backpressure to the terminal/pipe.
+                        loop {
+                            match pump.push_frame(&buf[..n]) {
+                                PushOutcome::Rejected => {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            }
+            pump_eof.store(true, Ordering::Release);
+        });
+        Some(b)
+    } else {
+        eof.store(true, Ordering::Release);
+        None
+    };
+
+    let mut m = scheduler::BuiltInModule::new("cli_in", cli_in_step);
+    install_state(
+        &mut m,
+        Box::new(CliInState {
+            args_out,
+            stdin_out,
+            args_sent: false,
+            bridge,
+            eof,
+            pending: Vec::new(),
+            pending_pos: 0,
+        }),
+    );
+    log::info!(
+        "[inst] module {module_idx} = cli_in (built-in) args_out={args_out} stdin_out={stdin_out}"
+    );
+    m
+}
+
+// ── cli_out ─────────────────────────────────────────────────────────────────
+
+struct CliOutState {
+    module_idx: usize,
+    bytes_in: i32,
+    err_in: i32,
+    exit_in: i32,
+    stdout_bridge: Option<Arc<ExtBridge<CLI_BRIDGE_CAP>>>,
+    stderr_bridge: Option<Arc<ExtBridge<CLI_BRIDGE_CAP>>>,
+    exited: bool,
+}
+
+/// Drain one input channel into one bridge. Reads a chunk **only when the
+/// bridge provably has room for it**, so a full ring leaves the bytes in the
+/// channel — backpressure the producing app observes as channel fullness —
+/// rather than reading and then dropping them on a rejected push. Stops when
+/// the channel is empty or the bridge is full. Returns whether anything moved.
+fn drain_to_bridge(chan: i32, bridge: &ExtBridge<CLI_BRIDGE_CAP>) -> bool {
+    let mut moved = false;
+    let mut buf = [0u8; CLI_CHUNK];
+    loop {
+        // Prove capacity for a full chunk before consuming any bytes. A read of
+        // up to CLI_CHUNK bytes then always pushes losslessly.
+        if !bridge.has_room_for(CLI_CHUNK) {
+            break;
+        }
+        // SAFETY: stack buffer of CLI_CHUNK bytes.
+        let n = unsafe { channel::channel_read(chan, buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        match bridge.push_frame(&buf[..n as usize]) {
+            PushOutcome::Rejected => {
+                // Unreachable: we proved room for a full CLI_CHUNK and read at
+                // most that many bytes. A rejection means the capacity
+                // accounting is wrong; fail loudly in debug rather than spin,
+                // and break in release (no bytes were pushed, but none are lost
+                // — the read bytes are dropped only in this can't-happen path).
+                debug_assert!(false, "cli_out bridge rejected a capacity-proven push");
+                break;
+            }
+            _ => moved = true,
+        }
+    }
+    moved
+}
+
+fn cli_out_step(state: *mut u8) -> i32 {
+    // SAFETY: kernel-owned arena sized to `CliOutState` by the loader.
+    let st = unsafe { instance_state::<CliOutState>(state) };
+
+    let mut moved = false;
+    if let (true, Some(b)) = (st.bytes_in >= 0, st.stdout_bridge.as_ref()) {
+        // drain_to_bridge proves per-chunk capacity itself, so a full ring
+        // leaves bytes in the channel rather than dropping them.
+        moved |= drain_to_bridge(st.bytes_in, b);
+    }
+    if let (true, Some(b)) = (st.err_in >= 0, st.stderr_bridge.as_ref()) {
+        moved |= drain_to_bridge(st.err_in, b);
+    }
+
+    if st.exit_in >= 0 && !st.exited {
+        let mut rec = [0u8; 8];
+        // SAFETY: stack buffer.
+        let n = unsafe { channel::channel_read(st.exit_in, rec.as_mut_ptr(), rec.len()) };
+        if n >= 4 {
+            let code = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+            CLI_EXIT_CODE.store(code, Ordering::Release);
+            st.exited = true;
+            log::info!("[cli] exit code latched: {code}");
+        }
+    }
+
+    if moved {
+        return 0;
+    }
+
+    // Completion: an explicit exit, or every producer upstream of us is
+    // finished with nothing left in flight. Bridges must be empty so the
+    // worker threads have actually written the tail to the host fds.
+    let upstream_done = {
+        let mask = scheduler::module_upstream_mask(st.module_idx);
+        let mut done = true;
+        for i in 0..64usize {
+            if mask & (1u64 << i) != 0 && !scheduler::module_is_finished(i) {
+                done = false;
+                break;
+            }
+        }
+        done
+    };
+    let flushed = st.stdout_bridge.as_ref().is_none_or(|b| b.is_empty())
+        && st.stderr_bridge.as_ref().is_none_or(|b| b.is_empty());
+    if flushed && (st.exited || upstream_done) {
+        return 1;
+    }
+    0
+}
+
+/// Spawn a worker that pops bridge frames and writes them to a host stream.
+fn spawn_sink_worker<W: std::io::Write + Send + 'static>(
+    bridge: Arc<ExtBridge<CLI_BRIDGE_CAP>>,
+    mut sink: W,
+) {
+    std::thread::spawn(move || {
+        let mut frame = [0u8; CLI_CHUNK];
+        loop {
+            match bridge.pop_frame(&mut frame) {
+                Some(n) => {
+                    if sink.write_all(&frame[..n]).is_err() {
+                        return; // consumer hung up (broken pipe)
+                    }
+                    let _ = sink.flush();
+                }
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    });
+}
+
+/// Construct a `cli_out` built-in: own stdout/stderr and the exit-code latch.
+fn build_cli_out(module_idx: usize) -> scheduler::BuiltInModule {
+    scheduler::set_current_module(module_idx);
+    let bytes_in = scheduler::get_module_port(module_idx, 0, 0);
+    let err_in = scheduler::get_module_port(module_idx, 0, 1);
+    let exit_in = scheduler::get_module_port(module_idx, 0, 2);
+
+    let stdout_bridge = (bytes_in >= 0).then(|| {
+        let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
+        spawn_sink_worker(Arc::clone(&b), std::io::stdout());
+        b
+    });
+    let stderr_bridge = (err_in >= 0).then(|| {
+        let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
+        spawn_sink_worker(Arc::clone(&b), std::io::stderr());
+        b
+    });
+
+    let mut m = scheduler::BuiltInModule::new("cli_out", cli_out_step);
+    install_state(
+        &mut m,
+        Box::new(CliOutState {
+            module_idx,
+            bytes_in,
+            err_in,
+            exit_in,
+            stdout_bridge,
+            stderr_bridge,
+            exited: false,
+        }),
+    );
+    log::info!(
+        "[inst] module {module_idx} = cli_out (built-in) bytes_in={bytes_in} err_in={err_in} exit_in={exit_in}"
+    );
+    m
+}

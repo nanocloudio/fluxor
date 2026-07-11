@@ -1,0 +1,25 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# Host stdout/stderr sink + exit-code latch (rfc_cli_execution.md §4.1).
+# exit_in takes [code: i32 LE]; absent wiring means exit 0 on completion.
+[[ports]]
+name = "bytes_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "err_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "exit_in"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+
+[observability]
+exempt = "host stdio surface — runs on the build host, observed via host tooling, not part of the on-silicon data path"

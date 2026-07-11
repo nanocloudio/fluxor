@@ -118,6 +118,10 @@ fn drain_tick(now_unix: u64) {
         }
         let timed_out = expired && !quiescent && !gone;
         if !gone {
+            // Close the owner's network endpoints BEFORE revoking it, so an
+            // observer never sees the terminal record while a port is still
+            // accepting (rfc_endpoint_lease.md §4.4).
+            linux_net_close_owner_conns(handle);
             match fluxor::kernel::scheduler::free_owner(handle) {
                 Ok(()) => {}
                 Err(err) => log::warn!(
@@ -156,8 +160,14 @@ fn drain_tick(now_unix: u64) {
 
 /// At boot: any revocation the (just-applied) retained plan still lists, whose
 /// owner is NOT installed, was mid-drain when the previous process died. The
-/// drain is forfeited (§3.6) and the terminal record says so.
-fn synthesize_restart_terminals(now_unix: u64) {
+/// drain is forfeited (§3.6) and the terminal record says so — UNLESS the
+/// previous process already persisted a terminal state for that pod
+/// (`seeded_terminated`, from the status writer's seed of the old file): a
+/// clean `Completed` from before the restart is never rewritten (§3.7).
+fn synthesize_restart_terminals(
+    now_unix: u64,
+    seeded_terminated: &std::collections::HashSet<String>,
+) {
     let mut revs = [fluxor::kernel::owner_plan::PlanRevocation::EMPTY;
         fluxor::kernel::owner_plan::MAX_PLAN_ASSIGNMENTS];
     let n = fluxor::kernel::owner_plan::retained_revocations(&mut revs);
@@ -169,6 +179,17 @@ fn synthesize_restart_terminals(now_unix: u64) {
         };
         if fluxor::kernel::scheduler::owners_mut().lookup(handle).is_some() {
             continue; // installed → a live drain, not a forfeit
+        }
+        let uid_hex: String = rev.assignment.pod_uid.iter().fold(
+            String::with_capacity(32),
+            |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            },
+        );
+        if seeded_terminated.contains(&uid_hex) {
+            continue; // the previous process already recorded its outcome
         }
         let already = d
             .terminals

@@ -132,6 +132,12 @@ mod params_def {
         // value was supplied — set_defaults would otherwise clobber it.
         5, trace_sample_permille, u16, 0xFFFF
             => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 0xFFFF); };
+
+        // Destination port for forwarded (upstream) queries. Lets the
+        // upstream be a delegation listener on a non-standard port
+        // (rfc_system_services.md §4); default remains standard DNS.
+        6, upstream_port, u16, 53
+            => |s, d, len| { s.upstream_port = p_u16(d, len, 0, 53); };
     }
 }
 
@@ -199,6 +205,10 @@ struct DnsState {
     telemetry_chan: i32,
 
     upstream_ip: u32,
+    /// Destination port for forwarded queries. Default 53; configurable so a
+    /// host authority resolver on a non-standard port can be the upstream
+    /// (rfc_system_services.md §4 delegation).
+    upstream_port: u16,
     ttl: u32,
     listen_port: u16,
     phase: DnsPhase,
@@ -244,6 +254,7 @@ impl DnsState {
         self.net_out_chan = -1;
         self.telemetry_chan = -1;
         self.upstream_ip = 0x08080808; // 8.8.8.8
+        self.upstream_port = 53;
         self.ttl = 300;
         self.listen_port = 53;
         self.phase = DnsPhase::Init;
@@ -891,7 +902,8 @@ unsafe fn send_upstream_query(
 ) {
     let ep = (*state).upstream_ep;
     let upstream_ip = (*state).upstream_ip;
-    dg_send_to_v4(state, ep, upstream_ip, 53, dns_data, dns_len);
+    let upstream_port = (*state).upstream_port;
+    dg_send_to_v4(state, ep, upstream_ip, upstream_port, dns_data, dns_len);
 }
 
 /// Store a pending upstream query.

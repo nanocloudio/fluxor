@@ -1,11 +1,10 @@
-// Per-owner log tee (rfc_owner_drain_and_logs.md Part B, Phase 1) — the Linux
+// Per-owner log tee (rfc_owner_drain_and_logs.md Part B) — the Linux
 // realization of the owner-scoped log surface.
 //
-// Replaces env_logger as the global `log::Log`. Each record is (1) delegated to
-// an env_logger `Logger` for byte-identical stderr formatting + env-filter
-// behaviour (nothing observable changes for existing consumers), and (2), when
-// emitted on the scheduler (main) thread, owner-attributed and pushed into the
-// kernel per-owner ring for `fluxor agent logs`.
+// The global `log::Log`. Each record is (1) delegated to an env_logger `Logger`
+// for stderr formatting + env-filter behaviour, and (2), when emitted on the
+// scheduler (main) thread, owner-attributed and pushed into the kernel
+// per-owner ring for `fluxor agent logs`.
 //
 // Single-writer discipline (rfc §4.2): the kernel rings are written only by the
 // scheduler thread. The Linux runtime runs the scheduler single-threaded on the
@@ -45,7 +44,7 @@ impl log::Log for TeeLogger {
             return;
         }
         // Ring routing is scheduler-thread-only (single writer). Off-thread
-        // records are already on stderr; they are not ringed in Phase 1.
+        // records are on stderr only; they are not ringed.
         if SCHED_TID.get() != Some(&std::thread::current().id()) {
             return;
         }
@@ -59,16 +58,19 @@ impl log::Log for TeeLogger {
             };
         let ts_ms = now_unix_ms();
         let message = format!("{}", record.args());
-        // `module` is left empty in Phase 1: the message text already carries the
-        // module's own "[name] …" convention, and populating the graph module
-        // name from the module-scoped logger (never by parsing) is the §4.2
-        // refinement. `plan_generation` is 0 until wired to the committed
-        // generation accessor — retrieval filters on owner_uid, not plan_gen.
+        // The committed plan generation at emit — the §17.2 join key between a
+        // log record and the rollout it ran under. A plain static read on the
+        // scheduler thread (we are on it: the SCHED_TID gate above), safe even
+        // before HAL init; 0 until the first plan applies.
+        let plan_generation = fluxor::kernel::owner_plan::last_applied_generation();
+        // `module` is left empty: the message text already carries the module's
+        // own "[name] …" convention, and the graph module name is populated from
+        // the module-scoped logger (never by parsing), per §4.2.
         fluxor::kernel::owner_log::push_on_slot(
             slot as usize,
             uid,
             generation,
-            0,
+            plan_generation,
             ts_ms,
             &[],
             message.as_bytes(),
@@ -188,9 +190,8 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
 
 /// Write a ring file in place: `[header][ring bytes]`. Not tmp+rename — that is
 /// wrong for rings (it orphans a follower's fd); a follower tolerates a torn
-/// read via the per-record CRC (rfc §4.3). Phase 1 rewrites the whole file each
-/// flush; incremental `pwrite` of only the changed region is the §4.3
-/// optimization.
+/// read via the per-record CRC (rfc §4.3). The whole file is rewritten each
+/// flush.
 /// Returns true only when the full `[header][ring bytes]` image landed —
 /// the caller's flush high-water must not advance otherwise.
 fn write_ring_file(

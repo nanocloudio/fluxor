@@ -8856,11 +8856,11 @@ pub struct OwnerLiveStatus {
     /// terminated modules (`fault_type::NONE` when none terminated).
     pub last_fault_kind: u8,
     /// Owner lifecycle state: [`OWNER_STATE_ACTIVE`] or [`OWNER_STATE_DRAINING`]
-    /// (rfc_owner_drain_and_logs.md §3.7 — a *new field*; the phase enum stays
-    /// frozen). Always `Active` until the drain driver (Phase 3) flips it.
+    /// (rfc_owner_drain_and_logs.md §3.7). `Active` until the drain driver flips
+    /// it.
     pub owner_state: u8,
     /// Wall-clock second at which a drain forfeits its grace, or 0 when not
-    /// draining. Set by the drain driver (Phase 3).
+    /// draining. Set by the drain driver.
     pub drain_deadline_unix: u64,
     /// Seconds remaining in the drain window, or 0 when not draining.
     pub drain_remaining_secs: u32,
@@ -8964,23 +8964,31 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
     count
 }
 
-/// Is a draining owner's subgraph quiescent — has every module it stamps run to
-/// its natural end (`StepOutcome::Done`) or terminal fault state? The v1 drain
-/// predicate (rfc_owner_drain_and_logs.md §3.1, narrowed: channel/timer/wake
-/// emptiness checks arrive with the admission-gate build-out; a steady-state
-/// module that never finishes drains by deadline, which is correct and
-/// observable). An owner stamping no modules is trivially quiescent. Scheduler
-/// thread only.
+/// Is a draining owner's subgraph quiescent (rfc_owner_drain_and_logs.md §3.1)?
+/// Two structural conditions:
+///
+/// * every module the owner stamps ran to its natural end (`StepOutcome::Done`)
+///   or terminal fault state, and
+/// * every graph channel touching an owned module is EMPTY — FIFO bytes and the
+///   mailbox-mode branch both (`channel_has_pending` covers the pending frame
+///   the byte-count accessor reports as 0).
+///
+/// Remaining narrowing: owner-timer/latched-wake emptiness arrives with the
+/// full admission-gate build-out; a steady-state module that never finishes
+/// drains by deadline, which is correct and observable. An owner stamping no
+/// modules is trivially quiescent. Scheduler thread only.
 pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
-    // SAFETY: scheduler-thread read of the static module/fault tables.
+    // SAFETY: scheduler-thread read of the static module/fault/edge tables.
     let sched = unsafe {
         let p = &raw const SCHED;
         &*p
     };
-    for idx in 0..MAX_MODULES {
+    let mut owned = [false; MAX_MODULES];
+    for (idx, is_owned) in owned.iter_mut().enumerate() {
         if module_owner(idx) != handle {
             continue;
         }
+        *is_owned = true;
         if matches!(sched.modules[idx], ModuleSlot::Empty) {
             continue;
         }
@@ -8989,7 +8997,39 @@ pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
             return false;
         }
     }
+    // In-flight frames: revoking now would drop a queued input; wait for the
+    // pipeline to run dry (the deadline bounds a pipeline that never does).
+    for edge in sched.edges.iter().take(sched.edge_count) {
+        let touches_owner = (edge.from_module < MAX_MODULES && owned[edge.from_module])
+            || (edge.to_module < MAX_MODULES && owned[edge.to_module]);
+        if touches_owner && crate::kernel::channel::channel_has_pending(edge.channel) {
+            return false;
+        }
+    }
     true
+}
+
+/// Owner of the module that PRODUCES into channel `ch` — the carried-
+/// attribution source for provider modules that serve multiple owners over
+/// per-edge lanes (rfc_endpoint_lease.md §4.1: `linux_net` stamps each bind
+/// with its commanding lane's owner). `OWNER_SYSTEM` when no edge produces
+/// into the channel or the producer is system-owned. Scheduler thread only,
+/// resolved at instantiation (after plan apply) and re-resolved on rebuild.
+pub fn channel_producer_owner(ch: i32) -> OwnerHandle {
+    if ch < 0 {
+        return crate::kernel::owner::OWNER_SYSTEM;
+    }
+    // SAFETY: scheduler-thread read of the static edge table.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    for edge in sched.edges.iter().take(sched.edge_count) {
+        if edge.channel == ch && edge.from_module < MAX_MODULES {
+            return module_owner(edge.from_module);
+        }
+    }
+    crate::kernel::owner::OWNER_SYSTEM
 }
 
 /// Owner attribution for a module: `(pod_uid, slot, generation)`, or `None` if

@@ -1608,12 +1608,13 @@ const MODULES_BLOB_MAGIC: [u8; 16] = *b"FLUXOR_MOD_BLOB\0";
 const CONFIG_BLOB_MAGIC: [u8; 16] = *b"FLUXOR_CFG_BLOB\0";
 
 /// Total placeholder size for `modules.bin`, including the 32-byte
-/// header. 512 KiB is comfortably larger than the largest module set
-/// observed today (a typical browser app graph (~7-10 modules, ~40 KiB); mainline foundation
-/// stacks total ~120 KiB). Reproducible: the bundle tool fails fast if
-/// the real blob exceeds capacity, with a clear "rebuild kernel with
-/// larger placeholder" error.
-const MODULES_BLOB_TOTAL: usize = 512 * 1024;
+/// header. 1 MiB covers the largest module set observed today — a browser
+/// app graph runs ~520 KiB now that an app module can carry hi-DPI font
+/// atlases (truffle_shell ships 32px+48px DejaVu coverage, ~235 KiB, for
+/// device-pixel supersampled text). Reproducible: the bundle tool fails
+/// fast if the real blob exceeds capacity, with a clear "rebuild kernel
+/// with larger placeholder" error.
+const MODULES_BLOB_TOTAL: usize = 1024 * 1024;
 const MODULES_BLOB_CAPACITY: usize = MODULES_BLOB_TOTAL - 32;
 
 /// Total placeholder size for `config.bin`, including the 32-byte

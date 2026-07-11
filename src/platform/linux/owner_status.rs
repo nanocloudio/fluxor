@@ -72,6 +72,17 @@ impl OwnerStatusWriter {
         }
     }
 
+    /// Pods whose previous-process status file already carried a TERMINAL
+    /// state (lowercase-hex UIDs). The boot-time drain-forfeit synthesis skips
+    /// these — a persisted `Completed` is never rewritten as by-restart.
+    fn seeded_terminated_uids(&self) -> std::collections::HashSet<String> {
+        self.seeded
+            .iter()
+            .filter(|(_, seed)| seed.terminated)
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    }
+
     /// Snapshot the kernel's per-owner aggregates, roll the lifecycle
     /// latches forward, and atomically replace the status file if the
     /// derived state changed.
@@ -86,7 +97,15 @@ impl OwnerStatusWriter {
         // Live drain deadlines live in the drain driver; the kernel snapshot
         // carries only owner_state. Overlay before deriving.
         drain_overlay_for_status(&mut recs[..n], now);
-        let mut pods_json = derive_pods_json(&recs[..n], &mut self.tracks, &self.seeded, now);
+        // Bound network endpoints per owner (rfc_endpoint_lease.md §4.3): the
+        // runtime's RAW report — which (protocol, port) pairs are actually
+        // listening, owner-attributed. Declarations are the agent's business.
+        let bound = linux_net_bound_endpoints()
+            .into_iter()
+            .map(|(owner, proto, port)| (owner.slot, owner.generation, proto, port))
+            .collect::<Vec<_>>();
+        let mut pods_json =
+            derive_pods_json(&recs[..n], &mut self.tracks, &self.seeded, now, &bound);
         // Drained-and-revoked owners are gone from the live snapshot; their
         // terminal records ride alongside until retention lapses
         // (rfc_owner_drain_and_logs.md §3.7).
@@ -150,6 +169,7 @@ fn derive_pods_json(
     tracks: &mut std::collections::HashMap<[u8; 16], PodTrack>,
     seeded: &std::collections::HashMap<String, SeededPod>,
     now_unix: u64,
+    bound_endpoints: &[(u16, u32, u8, u16)], // (slot, generation, protocol, port)
 ) -> String {
     use std::fmt::Write;
     let mut entries: Vec<String> = Vec::with_capacity(recs.len());
@@ -243,6 +263,24 @@ fn derive_pods_json(
              \"restart_count\":{}",
             rec.slot, rec.generation, track.restart_count,
         );
+        // Bound network endpoints (rfc_endpoint_lease.md §4.3 doc 1): the raw
+        // owner-attributed report. Additive; omitted when the owner has no
+        // bound ports, so port-less pods' output is byte-identical.
+        let mut bound_iter = bound_endpoints
+            .iter()
+            .filter(|(slot, generation, _, _)| *slot == rec.slot && *generation == rec.generation)
+            .peekable();
+        if bound_iter.peek().is_some() {
+            let _ = write!(e, ",\"bound_endpoints\":[");
+            for (i, (_, _, proto, port)) in bound_iter.enumerate() {
+                let proto_name = if *proto == 2 { "udp" } else { "tcp" };
+                if i > 0 {
+                    e.push(',');
+                }
+                let _ = write!(e, "{{\"protocol\":\"{proto_name}\",\"port\":{port}}}");
+            }
+            e.push(']');
+        }
         // New additive fields (old consumers ignore them); emitted only while
         // draining, so non-draining output is byte-identical (rfc §3.7).
         if draining {
@@ -291,6 +329,11 @@ struct SeededPod {
     /// `started_at` stamp, or a terminal state (which counts as prior
     /// activity — a re-run after termination is a restart even in-process).
     started: bool,
+    /// The previous process persisted a TERMINAL state for this pod. Suppresses
+    /// the boot-time drain-timeout-by-restart synthesis: a clean `Completed`
+    /// from before the restart is never rewritten
+    /// (rfc_owner_drain_and_logs.md §3.6/§3.7 writer seeding).
+    terminated: bool,
 }
 
 /// Recover per-pod carryover from a previous runtime process's status file.
@@ -321,11 +364,13 @@ fn read_seed_restarts(path: &std::path::Path) -> std::collections::HashMap<Strin
             .take_while(|c| c.is_ascii_digit())
             .collect();
         if let Ok(n) = digits.parse::<u32>() {
+            let terminated = span.contains("\"terminated\"");
             seeds.insert(
                 uid,
                 SeededPod {
                     restart_count: n,
-                    started: span.contains("\"started_at\"") || span.contains("\"terminated\""),
+                    started: span.contains("\"started_at\"") || terminated,
+                    terminated,
                 },
             );
         }
@@ -398,6 +443,76 @@ mod owner_status_tests {
     }
 
     #[test]
+    fn seed_distinguishes_terminated_pods_for_by_restart_suppression() {
+        // Exactly the writer's own emission shape (read_seed_restarts scans it
+        // by substring): pod AA terminated (its outcome is persisted and must
+        // not be rewritten as by-restart after a restart), pod BB still running.
+        let dir = std::env::temp_dir().join(format!(
+            "fluxor-seed-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let plan = dir.join("current.plan");
+        let body = concat!(
+            "{\n  \"version\": 1,\n  \"pid\": 1,\n  \"pid_start_ticks\": 2,\n",
+            "  \"plan_generation\": 3,\n  \"written_at\": \"x\",\n  \"pods\": [\n",
+            "    {\"pod_uid_hex\":\"aa000000000000000000000000000000\",\"slot\":1,",
+            "\"owner_generation\":1,\"runtime\":{\"phase\":\"Terminated\",",
+            "\"ready\":false,\"started\":false,\"restart_count\":0,",
+            "\"terminated\":{\"reason\":\"Completed\",\"exit_code\":0,",
+            "\"signal\":null,\"finished_at\":\"x\"}}},\n",
+            "    {\"pod_uid_hex\":\"bb000000000000000000000000000000\",\"slot\":2,",
+            "\"owner_generation\":1,\"runtime\":{\"phase\":\"Running\",",
+            "\"ready\":true,\"started\":true,\"restart_count\":0,",
+            "\"started_at\":\"x\"}}\n  ]\n}\n",
+        );
+        std::fs::write(dir.join("owner_status.json"), body).expect("write");
+
+        let writer = OwnerStatusWriter::new(&plan);
+        let terminated = writer.seeded_terminated_uids();
+        assert!(terminated.contains("aa000000000000000000000000000000"));
+        assert!(!terminated.contains("bb000000000000000000000000000000"));
+        // The started/restart seed semantics are unchanged by the new flag.
+        assert!(writer.seeded["aa000000000000000000000000000000"].started);
+        assert!(writer.seeded["bb000000000000000000000000000000"].started);
+        assert!(!writer.seeded["bb000000000000000000000000000000"].terminated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bound_endpoints_are_attributed_to_the_owning_pod_only() {
+        let mut tracks = std::collections::HashMap::new();
+        let seeds = std::collections::HashMap::new();
+        // Pod A (slot 1 gen 7) has a tcp listener + a udp socket; pod B none.
+        let bound = [(1u16, 7u32, 1u8, 8080u16), (1, 7, 2, 5353)];
+        let j = derive_pods_json(
+            &[rec(0xaa, 1, 7), rec(0xbb, 2, 3)],
+            &mut tracks,
+            &seeds,
+            100,
+            &bound,
+        );
+        let (a, b) = j.split_at(j.find("bb000000").unwrap());
+        assert!(a.contains(
+            "\"bound_endpoints\":[{\"protocol\":\"tcp\",\"port\":8080},{\"protocol\":\"udp\",\"port\":5353}]"
+        ));
+        assert!(
+            !b.contains("bound_endpoints"),
+            "port-less pod's output is unchanged"
+        );
+        // A stale-generation entry (slot reused) never attributes.
+        let mut tracks2 = std::collections::HashMap::new();
+        let j = derive_pods_json(
+            &[rec(0xcc, 1, 8)],
+            &mut tracks2,
+            &seeds,
+            100,
+            &[(1, 7, 1, 8080)],
+        );
+        assert!(!j.contains("bound_endpoints"));
+    }
+
+    #[test]
     fn draining_owner_emits_owner_state_and_withdraws_readiness() {
         use fluxor::kernel::scheduler::OWNER_STATE_DRAINING;
         let mut tracks = std::collections::HashMap::new();
@@ -406,7 +521,7 @@ mod owner_status_tests {
         // A healthy owner that is NOT draining emits no owner_state field and is
         // ready — output stays byte-identical to before this change.
         let healthy = [rec(0xaa, 1, 7)];
-        let j = derive_pods_json(&healthy, &mut tracks, &seeds, 100);
+        let j = derive_pods_json(&healthy, &mut tracks, &seeds, 100, &[]);
         assert!(!j.contains("owner_state"));
         assert!(j.contains("\"ready\":true"));
 
@@ -416,7 +531,7 @@ mod owner_status_tests {
         draining.owner_state = OWNER_STATE_DRAINING;
         draining.drain_deadline_unix = 1_783_275_045;
         draining.drain_remaining_secs = 12;
-        let j = derive_pods_json(&[draining], &mut tracks, &seeds, 100);
+        let j = derive_pods_json(&[draining], &mut tracks, &seeds, 100, &[]);
         assert!(j.contains("\"owner_state\":\"Draining\""));
         assert!(j.contains("\"drain_deadline_unix\":1783275045"));
         assert!(j.contains("\"drain_remaining_secs\":12"));
@@ -430,7 +545,7 @@ mod owner_status_tests {
         let mut tracks = std::collections::HashMap::new();
         let seeds = std::collections::HashMap::new();
         let healthy = [rec(0xaa, 1, 7), rec(0xbb, 2, 3)];
-        let j = derive_pods_json(&healthy, &mut tracks, &seeds, 100);
+        let j = derive_pods_json(&healthy, &mut tracks, &seeds, 100, &[]);
         assert_eq!(j.matches("\"phase\":\"Running\"").count(), 2);
         assert!(j.contains("\"ready\":true"));
 
@@ -438,7 +553,7 @@ mod owner_status_tests {
         let mut faulted = healthy;
         faulted[0].modules_terminated = 1;
         faulted[0].last_fault_kind = fault_type::STEP_ERROR;
-        let j = derive_pods_json(&faulted, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&faulted, &mut tracks, &seeds, 200, &[]);
         let (a, b) = j.split_at(j.find("bb000000").unwrap());
         assert!(a.contains("\"phase\":\"Terminated\""));
         assert!(a.contains("\"reason\":\"GraphNodeFault\""));
@@ -452,18 +567,18 @@ mod owner_status_tests {
         let mut tracks = std::collections::HashMap::new();
         let seeds = std::collections::HashMap::new();
         let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100);
+        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
 
         // Module mid-retry: aggregate stays Running, unready, restart_count 0.
         r[0].modules_recovering = 1;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"phase\":\"Running\""));
         assert!(j.contains("\"ready\":false"));
         assert!(j.contains("\"restart_count\":0"));
 
         // Retry succeeded: ready again, still no restart counted.
         r[0].modules_recovering = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 300);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 300, &[]);
         assert!(j.contains("\"ready\":true"));
         assert!(j.contains("\"restart_count\":0"));
     }
@@ -473,21 +588,21 @@ mod owner_status_tests {
         let mut tracks = std::collections::HashMap::new();
         let seeds = std::collections::HashMap::new();
         let mut r = [rec(0xaa, 1, 7)];
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         assert!(j.contains("\"restart_count\":0"));
         assert!(j.contains("\"started_at\":\"1970-01-01T00:01:40Z\""));
 
         // Terminal fault…
         r[0].modules_terminated = 1;
         r[0].last_fault_kind = fault_type::TIMEOUT;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"phase\":\"Terminated\""));
         assert!(j.contains("\"restart_count\":0"), "termination isn't a restart yet");
 
         // …graph rebuilt, owner re-activated → ONE aggregate restart.
         r[0].modules_terminated = 0;
         r[0].last_fault_kind = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 300);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 300, &[]);
         assert!(j.contains("\"phase\":\"Running\""));
         assert!(j.contains("\"restart_count\":1"));
         assert!(j.contains("\"started_at\":\"1970-01-01T00:05:00Z\""), "re-stamped");
@@ -497,8 +612,8 @@ mod owner_status_tests {
     fn generation_bump_is_a_reactivation() {
         let mut tracks = std::collections::HashMap::new();
         let seeds = std::collections::HashMap::new();
-        derive_pods_json(&[rec(0xaa, 1, 7)], &mut tracks, &seeds, 100);
-        let j = derive_pods_json(&[rec(0xaa, 1, 9)], &mut tracks, &seeds, 200);
+        derive_pods_json(&[rec(0xaa, 1, 7)], &mut tracks, &seeds, 100, &[]);
+        let j = derive_pods_json(&[rec(0xaa, 1, 9)], &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"owner_generation\":9"));
         assert!(j.contains("\"restart_count\":1"));
     }
@@ -508,9 +623,9 @@ mod owner_status_tests {
         let mut tracks = std::collections::HashMap::new();
         let seeds = std::collections::HashMap::new();
         let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100);
+        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         r[0].modules_finished = 2;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"reason\":\"Completed\""));
         assert!(j.contains("\"exit_code\":0"));
     }
@@ -522,28 +637,28 @@ mod owner_status_tests {
         // A step-deadline timeout is the runtime's liveness enforcement.
         let mut tracks = std::collections::HashMap::new();
         let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100);
+        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         r[0].modules_terminated = 1;
         r[0].last_fault_kind = fault_type::TIMEOUT;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"reason\":\"LivenessFailure\""), "{j}");
 
         // A step error (module returned Err) is a graph-node fault.
         let mut tracks = std::collections::HashMap::new();
         let mut r = [rec(0xbb, 2, 3)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100);
+        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         r[0].modules_terminated = 1;
         r[0].last_fault_kind = fault_type::STEP_ERROR;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"reason\":\"GraphNodeFault\""), "{j}");
 
         // A hard fault is likewise a graph-node fault.
         let mut tracks = std::collections::HashMap::new();
         let mut r = [rec(0xcc, 3, 1)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100);
+        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         r[0].modules_terminated = 1;
         r[0].last_fault_kind = fault_type::HARD_FAULT;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"reason\":\"GraphNodeFault\""), "{j}");
     }
 
@@ -552,11 +667,11 @@ mod owner_status_tests {
         let mut tracks = std::collections::HashMap::new();
         let seeds = std::collections::HashMap::new();
         let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100);
+        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         r[0].modules_terminated = 1;
-        derive_pods_json(&r, &mut tracks, &seeds, 200);
+        derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         r[0].modules_terminated = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 300);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 300, &[]);
         assert!(j.contains("\"restart_count\":1"));
 
         // Write what the runtime would write, re-seed as a fresh process.
@@ -571,10 +686,10 @@ mod owner_status_tests {
 
         // First activation under the new process = one more restart.
         let mut tracks2 = std::collections::HashMap::new();
-        let j2 = derive_pods_json(&[rec(0xaa, 1, 7)], &mut tracks2, &seeds2, 400);
+        let j2 = derive_pods_json(&[rec(0xaa, 1, 7)], &mut tracks2, &seeds2, 400, &[]);
         assert!(j2.contains("\"restart_count\":2"));
         // A pod unknown to the previous process starts at zero.
-        let j3 = derive_pods_json(&[rec(0xbb, 2, 1)], &mut tracks2, &seeds2, 500);
+        let j3 = derive_pods_json(&[rec(0xbb, 2, 1)], &mut tracks2, &seeds2, 500, &[]);
         assert!(j3.contains("\"restart_count\":0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -587,7 +702,7 @@ mod owner_status_tests {
         let seeds = std::collections::HashMap::new();
         let mut r = [rec(0xaa, 1, 7)];
         r[0].modules_loaded = 1;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         assert!(j.contains("\"waiting_reason\":\"ActivationBackOff\""));
 
         let dir = std::env::temp_dir().join(format!("fluxor-ostat-ns-{}", std::process::id()));
@@ -601,7 +716,7 @@ mod owner_status_tests {
         // activation, not a restart.
         let mut tracks2 = std::collections::HashMap::new();
         r[0].modules_loaded = 2;
-        let j2 = derive_pods_json(&r, &mut tracks2, &seeds2, 200);
+        let j2 = derive_pods_json(&r, &mut tracks2, &seeds2, 200, &[]);
         assert!(j2.contains("\"phase\":\"Running\""));
         assert!(j2.contains("\"restart_count\":0"), "{j2}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -614,7 +729,7 @@ mod owner_status_tests {
         let mut r = [rec(0xaa, 1, 7)];
         r[0].modules_total = 0;
         r[0].modules_loaded = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         assert!(j.contains("\"phase\":\"Activating\""));
         assert!(j.contains("\"started\":false"));
         assert!(!j.contains("started_at"), "not started yet");
@@ -628,7 +743,7 @@ mod owner_status_tests {
         // One of two planned modules failed to instantiate.
         let mut r = [rec(0xaa, 1, 7)];
         r[0].modules_loaded = 1;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
         assert!(j.contains("\"phase\":\"Activating\""), "{j}");
         assert!(j.contains("\"ready\":false"));
         assert!(j.contains("\"waiting_reason\":\"ActivationBackOff\""));
@@ -636,7 +751,7 @@ mod owner_status_tests {
 
         // The missing module loads (e.g. rebuild succeeds): Running, ready.
         r[0].modules_loaded = 2;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200);
+        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
         assert!(j.contains("\"phase\":\"Running\""));
         assert!(j.contains("\"ready\":true"));
         assert!(!j.contains("waiting_reason"));

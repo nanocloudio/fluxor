@@ -55,8 +55,13 @@
       justify-content: center;
       cursor: pointer;
       user-select: none;
+      /* Touches on the app surface are APP input only. Without this a
+         touch drag BOTH feeds the app pointer stream (the app scrolls
+         its list) AND scrolls/rubber-bands the page — two compounding
+         motions that read as the screen jumbling on mobile. */
+      touch-action: none;
     }
-    .surface[data-role="display"] canvas { display: block; max-width: 100%; height: auto; }
+    .surface[data-role="display"] canvas { display: block; max-width: 100%; height: auto; touch-action: none; }
     .surface[data-role="terminal"] {
       padding: 8px 10px;
       max-height: 30vh;
@@ -737,14 +742,22 @@
       function localCoords(ev) {
         // Map page coords into the surface's logical pixel space (the canvas's
         // intrinsic raster size when mounted, else the canonical 960×540). The
-        // shared, unit-tested helper lives in browser_overlay_runtime.js.
+        // shared, unit-tested helper lives in browser_overlay_runtime.js; the
+        // fallback below mirrors it (canvas intrinsic dims, NOT a hardcoded
+        // basis — a self-describing SRF1 raster resizes per frame and a fixed
+        // 960×540 would mis-scale every tap on any other geometry).
         if (window.FluxorOverlay && window.FluxorOverlay.surfaceLocalCoords) {
           return window.FluxorOverlay.surfaceLocalCoords(el, ev.clientX, ev.clientY);
         }
-        const rect = el.getBoundingClientRect();
+        const canvas = el.tagName === 'CANVAS' ? el
+          : (el.querySelector && el.querySelector('canvas'));
+        const target = canvas || el;
+        const rect = target.getBoundingClientRect();
+        const lw = (canvas && canvas.width) || 960;
+        const lh = (canvas && canvas.height) || 540;
         return {
-          x: Math.round((ev.clientX - rect.left) * (960 / (rect.width || 960))),
-          y: Math.round((ev.clientY - rect.top) * (540 / (rect.height || 540))),
+          x: Math.round((ev.clientX - rect.left) * (lw / (rect.width || lw))),
+          y: Math.round((ev.clientY - rect.top) * (lh / (rect.height || lh))),
         };
       }
       function pushPointer(ev, kind) {

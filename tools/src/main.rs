@@ -65,6 +65,7 @@ mod text_distance;
 mod uf2;
 mod up;
 mod wasm_bundle;
+mod workload_src;
 mod workspace;
 
 /// Wire-format constants — path-mounted from `modules/sdk/wire.rs` so
@@ -301,6 +302,31 @@ enum Commands {
         /// the synthesised-host URL.
         #[arg(long)]
         open: bool,
+    },
+    /// Run an installed applet: resolve <NAME> through the applet
+    /// registry (or the project's `target/fluxor/<NAME>/` bundle) and exec
+    /// its cached bundle, passing everything after `--` to the app
+    /// (rfc_cli_execution.md §5.1).
+    Exec {
+        /// Applet name.
+        name: String,
+        /// App argv, after `--`.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Register an applet: map a name to a cached workload bundle
+    /// (rfc_cli_execution.md §5.2). Accepts a bundle dir or a source
+    /// manifest (`app.fluxor.toml` — builds first).
+    Install {
+        /// Bundle dir, or app.fluxor.toml to build-and-install.
+        bundle: PathBuf,
+        /// Applet name (default: the bundle's workload name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Also drop a busybox symlink `<DIR>/<name> -> fluxor` so the
+        /// applet dispatches by argv[0] (rfc_cli_execution.md §5.3).
+        #[arg(long, value_name = "DIR")]
+        link: Option<PathBuf>,
     },
     /// Build and flash a config to hardware
     Flash {
@@ -800,6 +826,28 @@ enum ModulesAction {
 }
 
 fn main() {
+    // Busybox multi-call dispatch (rfc_cli_execution.md §5.3): invoked
+    // through a symlink whose basename isn't `fluxor`, dispatch as
+    // `fluxor exec <basename> -- <args…>` BEFORE clap sees argv (clap would
+    // try to parse argv[1] as a subcommand). argv[0] and argv[1] are on
+    // different axes, so applet names never shadow real subcommands.
+    let argv0_stem = std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+    if let Some(stem) = argv0_stem {
+        if stem != "fluxor" {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            match workload_src::exec_applet(&stem, &args, false) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("\x1b[1;31mError:\x1b[0m {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     let cli = Cli::parse();
     let verbose = cli.verbose;
 
@@ -866,6 +914,10 @@ fn main() {
             },
             verbose,
         ),
+        Commands::Exec { name, args } => workload_src::exec_applet(&name, &args, verbose),
+        Commands::Install { bundle, name, link } => {
+            workload_src::install_applet(&bundle, name.as_deref(), link.as_deref(), verbose)
+        }
         Commands::Flash { config } => cmd_flash(&config, verbose),
         Commands::RenderTemplate {
             template,
@@ -3824,6 +3876,13 @@ fn extract_asset_pairs(
 }
 
 fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
+    // A workload source manifest — a `.toml` with a `[workload]` table
+    // (rfc_system_services.md §10) — emits the committed bundle + per-target
+    // blobs instead of a single image. Any other `.toml` falls through.
+    if workload_src::is_source_manifest(path) {
+        workload_src::emit_bundle(path, verbose)?;
+        return Ok(());
+    }
     if path.is_dir() {
         // Glob for all YAML files recursively
         let mut yamls: Vec<PathBuf> = Vec::new();
@@ -4044,6 +4103,18 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
     let config_path = config_path.ok_or_else(|| {
         Error::Config("fluxor run: missing <CONFIG> argument (omit only with --list)".into())
     })?;
+
+    // A workload bundle — source manifest, bundle root, or target subdir
+    // (rfc_system_services.md §10.4): resolve an implementation with the
+    // agent's own resolver and exec its built blobs.
+    if workload_src::is_bundle_path(config_path) {
+        if flags.any_scenario_flag() {
+            return Err(Error::Config(
+                "fluxor run <bundle>: scenario-only flags do not apply to a workload bundle".into(),
+            ));
+        }
+        return workload_src::run_bundle(config_path, verbose);
+    }
 
     if scenario::is_scenario_file(config_path) {
         return cmd_run_scenario(config_path, &flags, verbose);

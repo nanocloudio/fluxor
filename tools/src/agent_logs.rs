@@ -131,27 +131,89 @@ pub fn apply_filter(records: &[LogRecord], filter: &LogFilter) -> Vec<LogRecord>
     kept
 }
 
-/// Render the ordered records into output lines, synthesizing a
-/// `[LogsTruncated dropped=N]` line whenever a `seq` gap appears **within a
-/// generation** (a gap is per-cursor per §4.3; generation boundaries are not
-/// gaps). The record message bytes are emitted as UTF-8 (lossy).
-pub fn render_lines(records: &[LogRecord]) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut cursor = GapCursor::new();
-    let mut current_gen: Option<u32> = None;
-    for rec in records {
-        // A new generation restarts the seq space; reset the gap cursor so the
-        // jump from one generation's last seq to the next's seq 0 is not a gap.
-        if current_gen != Some(rec.owner_generation) {
-            cursor = GapCursor::new();
-            current_gen = Some(rec.owner_generation);
-        }
-        if let Some(gap) = cursor.observe(rec.seq) {
-            lines.push(format!("[LogsTruncated dropped={}]", gap.dropped));
-        }
-        lines.push(String::from_utf8_lossy(&rec.message).into_owned());
+/// Persistent line renderer: synthesizes a `[LogsTruncated dropped=N]` line
+/// whenever a `seq` gap appears **within a generation** (a gap is per-cursor
+/// per §4.3; generation boundaries are not gaps). Holds its gap state across
+/// calls so follow-mode polls form ONE continuous stream — a wrap between two
+/// polls is still reported exactly once.
+#[derive(Debug, Default)]
+pub struct LineRenderer {
+    cursor: GapCursor,
+    current_gen: Option<u32>,
+}
+
+impl LineRenderer {
+    pub fn new() -> Self {
+        Self::default()
     }
-    lines
+
+    /// Render `records` (ordered by `(generation, seq)`) into output lines,
+    /// advancing the persistent gap state. Message bytes emit as UTF-8 (lossy).
+    pub fn render(&mut self, records: &[LogRecord]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for rec in records {
+            // A new generation restarts the seq space; reset the gap cursor so
+            // the jump from one generation's last seq to the next's seq 0 is
+            // not a gap.
+            if self.current_gen != Some(rec.owner_generation) {
+                self.cursor = GapCursor::new();
+                self.current_gen = Some(rec.owner_generation);
+            }
+            if let Some(gap) = self.cursor.observe(rec.seq) {
+                lines.push(format!("[LogsTruncated dropped={}]", gap.dropped));
+            }
+            lines.push(String::from_utf8_lossy(&rec.message).into_owned());
+        }
+        lines
+    }
+}
+
+/// One-shot rendering of an ordered record slice (the non-follow path).
+pub fn render_lines(records: &[LogRecord]) -> Vec<String> {
+    LineRenderer::new().render(records)
+}
+
+/// Follow-mode position: which records a reader has already been handed.
+/// Each poll re-reads the whole retained set (the writer rewrites the ring
+/// file as a consistent snapshot every ~100 ms; a torn mid-write read simply
+/// yields fewer valid records and the next poll catches up), and `take_new`
+/// returns only records strictly after the cursor, ordered by
+/// `(owner_generation, seq)`.
+#[derive(Debug, Default)]
+pub struct FollowCursor {
+    /// Highest `(owner_generation, seq)` delivered so far.
+    position: Option<(u32, u64)>,
+}
+
+impl FollowCursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start past everything in `records` — `--follow` without `--tail` begins
+    /// at the live tail rather than replaying history (kubectl semantics).
+    pub fn at_end_of(records: &[LogRecord]) -> Self {
+        FollowCursor {
+            position: records.last().map(|r| (r.owner_generation, r.seq)),
+        }
+    }
+
+    /// The records in `records` (ordered by `(generation, seq)`) strictly after
+    /// the cursor; advances the cursor past them.
+    pub fn take_new(&mut self, records: &[LogRecord]) -> Vec<LogRecord> {
+        let fresh: Vec<LogRecord> = records
+            .iter()
+            .filter(|r| match self.position {
+                None => true,
+                Some((gen, seq)) => (r.owner_generation, r.seq) > (gen, seq),
+            })
+            .cloned()
+            .collect();
+        if let Some(last) = fresh.last() {
+            self.position = Some((last.owner_generation, last.seq));
+        }
+        fresh
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +378,74 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("logs");
         assert!(read_owner_records(&missing, &[0x11; 16]).is_empty());
+    }
+
+    fn rec(generation: u32, seq: u64, msg: &str) -> LogRecord {
+        LogRecord {
+            owner_uid: [0x77; 16],
+            owner_generation: generation,
+            plan_generation: 1,
+            timestamp_unix_ms: seq,
+            seq,
+            module: vec![],
+            message: msg.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn follow_cursor_yields_only_new_records_across_polls() {
+        let mut cursor = FollowCursor::new();
+        // Poll 1: two records.
+        let poll1 = vec![rec(1, 0, "a"), rec(1, 1, "b")];
+        let fresh = cursor.take_new(&poll1);
+        assert_eq!(fresh.len(), 2);
+        // Poll 2: same snapshot re-read → nothing new.
+        assert!(cursor.take_new(&poll1).is_empty());
+        // Poll 3: one appended record → exactly it.
+        let poll3 = vec![rec(1, 0, "a"), rec(1, 1, "b"), rec(1, 2, "c")];
+        let fresh = cursor.take_new(&poll3);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].message, b"c");
+    }
+
+    #[test]
+    fn follow_cursor_survives_eviction_and_generation_rollover() {
+        let mut cursor = FollowCursor::new();
+        cursor.take_new(&[rec(1, 0, "a"), rec(1, 1, "b")]);
+        // Ring wrapped: seqs 2..=4 evicted before this poll read them, and a
+        // re-admission started generation 2. Both the tail of gen 1 and gen 2
+        // are new; nothing already delivered repeats.
+        let poll = vec![rec(1, 5, "f"), rec(2, 0, "g2-a")];
+        let fresh = cursor.take_new(&poll);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh[0].seq, 5);
+        assert_eq!(fresh[1].owner_generation, 2);
+        // The persistent renderer reports the eviction gap exactly once,
+        // and treats the generation boundary as a boundary, not a gap.
+        let mut renderer = LineRenderer::new();
+        renderer.render(&[rec(1, 0, "a"), rec(1, 1, "b")]);
+        let lines = renderer.render(&fresh);
+        assert_eq!(
+            lines,
+            vec![
+                "[LogsTruncated dropped=3]".to_string(),
+                "f".to_string(),
+                "g2-a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn follow_starts_at_the_live_tail() {
+        let history = vec![rec(1, 0, "old-a"), rec(1, 1, "old-b")];
+        let mut cursor = FollowCursor::at_end_of(&history);
+        // Nothing from history replays…
+        assert!(cursor.take_new(&history).is_empty());
+        // …but the next appended record streams.
+        let now = vec![rec(1, 0, "old-a"), rec(1, 1, "old-b"), rec(1, 2, "new")];
+        let fresh = cursor.take_new(&now);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].message, b"new");
     }
 
     #[test]

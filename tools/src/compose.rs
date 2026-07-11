@@ -47,6 +47,16 @@ pub struct ResourceProfile {
     pub domains: u8,
 }
 
+/// One declared network export of an admitted workload (mirrors the workload
+/// manifest's `Export`, minus the name — the agent joins the runtime's bound
+/// report against these; rfc_endpoint_lease.md §4.3). Persisted with the
+/// desired pod; `#[serde(default)]` tolerates a desired pod that declares none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportDecl {
+    pub protocol: String,
+    pub port: u16,
+}
+
 /// One pod's desired state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodDesired {
@@ -57,6 +67,10 @@ pub struct PodDesired {
     pub config_generation: u64,
     pub desired_phase: DesiredPhase,
     pub profile: ResourceProfile,
+    /// Declared exports from the admitted workload manifest (empty for
+    /// flag-based commits with no bundle).
+    #[serde(default)]
+    pub exports: Vec<ExportDecl>,
 }
 
 /// Whole-device desired state (rfc_k8s.md §11).
@@ -207,16 +221,52 @@ pub struct CompositionPlan {
     /// Assignments in ascending slot order.
     pub assignments: Vec<OwnerAssignment>,
     /// Owners departing under a drain window, in ascending slot order. Usually
-    /// empty — and an empty section encodes byte-identically to the
-    /// pre-revocation format.
+    /// empty; the revocation section is omitted from the encoding when empty.
     pub revocations: Vec<PlanRevocation>,
+    /// Granted endpoint leases (rfc_endpoint_lease.md §5.1), ordered by
+    /// (slot, protocol, port), empty when the workload declares no exports. The
+    /// lease section is always encoded — its presence marks the plan lease-aware
+    /// and makes bind-gate enforcement mandatory.
+    pub leases: Vec<PlanLease>,
     pub plan_digest: Digest32,
+}
+
+/// One granted endpoint lease: owner `(slot, generation)` may bind
+/// `(protocol, port)` (rfc_endpoint_lease.md §5.1). Composed from the admitted
+/// workload's declared exports; the runtime's bind gate enforces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanLease {
+    pub slot: u16,
+    pub generation: u32,
+    /// 1 = tcp, 2 = udp (rfc_endpoint_lease.md §7.3).
+    pub protocol: u8,
+    pub port: u16,
+}
+
+/// Protocol byte values for [`PlanLease::protocol`].
+pub const LEASE_PROTO_TCP: u8 = 1;
+pub const LEASE_PROTO_UDP: u8 = 2;
+
+/// Map an export's protocol string to a lease protocol byte; `None` for
+/// protocols the lease system does not cover (reported but not granted/gated).
+pub fn lease_protocol(protocol: &str) -> Option<u8> {
+    if protocol.eq_ignore_ascii_case("tcp") {
+        Some(LEASE_PROTO_TCP)
+    } else if protocol.eq_ignore_ascii_case("udp") {
+        Some(LEASE_PROTO_UDP)
+    } else {
+        None
+    }
 }
 
 /// Why composition failed admission (rfc_k8s.md §12.1 static capacity).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComposeError {
     OwnerSlotsExhausted,
+    /// Two owners were granted the same (protocol, port), or a lease intersects
+    /// the node's reserved-port set (rfc_endpoint_lease.md §5.2) — caught at
+    /// commit, before anything runs.
+    EndpointConflict,
     ModulesExceeded,
     EdgesExceeded,
     StateBytesExceeded,
@@ -274,6 +324,8 @@ pub fn compose(
     prior: &OwnerSnapshot,
     revoke_graces: &[(PodUid, u16)],
     now_unix: u64,
+    reserved_ports: &[u16],
+    system_modules: u16,
 ) -> Result<CompositionPlan, ComposeError> {
     // 1. Only running pods are placed; sort by pod_uid for a stable order.
     let mut running: Vec<&PodDesired> = desired
@@ -354,6 +406,13 @@ pub fn compose(
     //    holding modules/state/buffers).
     let mut module_occ: Vec<Interval> = Vec::new();
     let mut edge_occ: Vec<Interval> = Vec::new();
+    // The node substrate's platform prefix (rfc_system_services.md §1.1):
+    // platform stacks PREPEND their modules (linux_net et al. at the low
+    // indices), so the ownable range starts past them. Occupied, never
+    // charged — system modules belong to no workload.
+    if system_modules > 0 {
+        insert_interval(&mut module_occ, 0, system_modules as u32);
+    }
     let mut total_state: u64 = 0;
     let mut total_buffer: u64 = 0;
     let mut total_modules: u32 = 0;
@@ -393,6 +452,7 @@ pub fn compose(
     let mut total_endpoints: u32 = 0;
     let mut total_domains: u32 = 0;
     let mut assignments: Vec<OwnerAssignment> = Vec::with_capacity(order.len());
+    let mut leases: Vec<PlanLease> = Vec::new();
 
     for pend in &pending {
         let p = running[pend.idx];
@@ -451,13 +511,51 @@ pub fn compose(
             state_cap: p.profile.state_bytes,
             buffer_cap: p.profile.buffer_bytes,
         });
+
+        // Endpoint leases (rfc_endpoint_lease.md §5.2): one per declared
+        // tcp/udp export, charged against the pod's admitted endpoint count;
+        // duplicates across owners and reserved-port intersections are
+        // admission-time errors — a bind race between co-resident pods (or
+        // with the embedding host's own listeners) never reaches the node.
+        // A DRAINING owner's ports are not in this set (revocation records
+        // carry no exports); overlap with a drain window is refused at bind
+        // time by the owner-aware fast path instead.
+        let mut pod_leases = 0u32;
+        for export in &p.exports {
+            let Some(protocol) = lease_protocol(&export.protocol) else {
+                continue; // non-tcp/udp exports are reported, not leased
+            };
+            pod_leases += 1;
+            if pod_leases > p.profile.endpoints as u32 {
+                return Err(ComposeError::EndpointsExceeded);
+            }
+            // Port 0 cannot be exported: the kernel's bind gate treats 0 as
+            // an ephemeral-source bind and never matches it to a lease, so a
+            // port-0 grant would silently never serve. Refuse the declaration.
+            if export.port == 0 || reserved_ports.contains(&export.port) {
+                return Err(ComposeError::EndpointConflict);
+            }
+            if leases
+                .iter()
+                .any(|l: &PlanLease| l.protocol == protocol && l.port == export.port)
+            {
+                return Err(ComposeError::EndpointConflict);
+            }
+            leases.push(PlanLease {
+                slot,
+                generation,
+                protocol,
+                port: export.port,
+            });
+        }
     }
 
-    let plan_digest = digest_plan(desired.generation, &assignments, &revocations);
+    let plan_digest = digest_plan(desired.generation, &assignments, &revocations, &leases);
     Ok(CompositionPlan {
         generation: desired.generation,
         assignments,
         revocations,
+        leases,
         plan_digest,
     })
 }
@@ -470,6 +568,17 @@ const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
 /// Per-revocation fixed record width: an assignment record verbatim plus
 /// grace_secs(2) + deadline_unix(8) (rfc_owner_drain_and_logs.md §3.2).
 const REVOKE_REC_LEN: usize = ASSIGN_REC_LEN + 2 + 8;
+/// Per-lease fixed record width: slot(2) + generation(4) + protocol(1) + port(2).
+const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
+/// Opens the lease section (rfc_endpoint_lease.md §5.1): an IMPOSSIBLE
+/// revocation count (counts are capped at MAX_PLAN_ASSIGNMENTS), so the first
+/// u32 of the tail deterministically discriminates the sections — no length
+/// arithmetic is trusted for discrimination (48-byte revocation and 9-byte
+/// lease records collide at e.g. 148 tail bytes). Lives inside the digested
+/// body, unlike header bits, so it is integrity-protected.
+const LEASE_SECTION_MARKER: u32 = 0xFFFF_FFFF;
+/// Decoder ceiling for the lease section (bounded-binary rule).
+pub const MAX_PLAN_LEASES: usize = 256;
 
 fn push_assignment(buf: &mut Vec<u8>, a: &OwnerAssignment) {
     buf.extend_from_slice(&a.pod_uid);
@@ -488,14 +597,14 @@ fn push_assignment(buf: &mut Vec<u8>, a: &OwnerAssignment) {
 /// platforms, so the digest over it — and the encoded plan — are reproducible.
 /// Shared by `digest_plan` and `encode_plan`.
 ///
-/// The revocation section (`rev_count(4)` + records) is appended ONLY when
-/// non-empty: a plan with no revocations — the overwhelmingly common case —
-/// encodes byte-identically to the pre-revocation format, and the assignment
-/// decode path is untouched.
+/// The revocation section (`rev_count(4)` + records) is appended only when
+/// non-empty — a plan with no revocations, the overwhelmingly common case,
+/// omits it entirely.
 fn plan_body(
     generation: u64,
     assignments: &[OwnerAssignment],
     revocations: &[PlanRevocation],
+    leases: &[PlanLease],
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(
         12 + assignments.len() * ASSIGN_REC_LEN
@@ -518,6 +627,19 @@ fn plan_body(
             buf.extend_from_slice(&r.deadline_unix.to_be_bytes());
         }
     }
+    // Lease section (rfc_endpoint_lease.md §5.1): marker + count + records,
+    // fixed order revocations-before-leases. The section is always emitted, even
+    // with zero grants: its presence is the integrity-protected signal that the
+    // plan is lease-aware, and the kernel bind gate enforces it mandatorily (an
+    // owner may bind only a nonzero port it was granted).
+    buf.extend_from_slice(&LEASE_SECTION_MARKER.to_be_bytes());
+    buf.extend_from_slice(&(leases.len() as u32).to_be_bytes());
+    for l in leases {
+        buf.extend_from_slice(&l.slot.to_be_bytes());
+        buf.extend_from_slice(&l.generation.to_be_bytes());
+        buf.push(l.protocol);
+        buf.extend_from_slice(&l.port.to_be_bytes());
+    }
     buf
 }
 
@@ -537,8 +659,9 @@ fn digest_plan(
     generation: u64,
     assignments: &[OwnerAssignment],
     revocations: &[PlanRevocation],
+    leases: &[PlanLease],
 ) -> Digest32 {
-    sha256_of(&plan_body(generation, assignments, revocations))
+    sha256_of(&plan_body(generation, assignments, revocations, leases))
 }
 
 // ============================================================================
@@ -569,10 +692,14 @@ pub enum PlanDecodeError {
 
 /// Encode a composed plan into the bounded binary form the kernel consumes:
 /// `[header][body][sha256(body)]`. Deterministic — identical plans encode to
-/// identical bytes; a plan with no revocations encodes byte-identically to the
-/// pre-revocation format.
+/// identical bytes.
 pub fn encode_plan(plan: &CompositionPlan) -> Vec<u8> {
-    let body = plan_body(plan.generation, &plan.assignments, &plan.revocations);
+    let body = plan_body(
+        plan.generation,
+        &plan.assignments,
+        &plan.revocations,
+        &plan.leases,
+    );
     let digest = sha256_of(&body);
     let mut out = Vec::with_capacity(PLAN_HEADER_LEN + body.len() + 32);
     out.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
@@ -610,30 +737,51 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
         return Err(PlanDecodeError::Truncated);
     }
     // Optional revocation section: present iff bytes remain between the
-    // assignments and the digest (an empty section is never encoded, so the
-    // no-revocation format is exactly the pre-revocation format).
-    let rev_count = if bytes.len() == base_total {
-        0usize
-    } else {
-        // A real revocation section is at least rev_count(4) + one record; any
-        // shorter surplus is trailing garbage, not a truncated section.
-        if bytes.len() < base_total + 4 + REVOKE_REC_LEN {
-            return Err(PlanDecodeError::TrailingBytes);
-        }
-        let rc = u32::from_be_bytes(body[assign_len..assign_len + 4].try_into().unwrap()) as usize;
-        if rc == 0 || rc > MAX_PLAN_ASSIGNMENTS {
-            // An explicitly-empty section is not a valid encoding; treat like
-            // trailing garbage rather than a second way to spell "none".
-            return Err(PlanDecodeError::TrailingBytes);
-        }
-        rc
+    // assignments and the digest (an empty revocation section is not encoded).
+    // Tail grammar (rfc_endpoint_lease.md §5.1): [rev_section] [lease_section],
+    // fixed order, each omitted when empty. The first u32 of the surplus
+    // discriminates deterministically: LEASE_SECTION_MARKER (an impossible
+    // revocation count) opens a lease section; a valid count (1..=cap) opens
+    // the revocation section. Length equations validate, never discriminate.
+    let mut cursor = assign_len; // offset into `body`
+    let tail_end = bytes.len() - PLAN_HEADER_LEN - 32; // end of body incl. tail
+    let read_u32_at = |off: usize| -> Option<u32> {
+        body.get(off..off + 4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
     };
-    let body_len = assign_len
-        + if rev_count > 0 {
-            4 + rev_count * REVOKE_REC_LEN
-        } else {
-            0
-        };
+    let mut rev_count = 0usize;
+    let mut lease_count = 0usize;
+    if cursor < tail_end {
+        let first = read_u32_at(cursor).ok_or(PlanDecodeError::Truncated)?;
+        if first != LEASE_SECTION_MARKER {
+            let rc = first as usize;
+            if rc == 0 || rc > MAX_PLAN_ASSIGNMENTS {
+                // An explicitly-empty section is not a valid encoding; treat
+                // like trailing garbage, not a second spelling of "none".
+                return Err(PlanDecodeError::TrailingBytes);
+            }
+            rev_count = rc;
+            cursor += 4 + rev_count * REVOKE_REC_LEN;
+            if cursor > tail_end {
+                return Err(PlanDecodeError::Truncated);
+            }
+        }
+    }
+    if cursor < tail_end {
+        let marker = read_u32_at(cursor).ok_or(PlanDecodeError::Truncated)?;
+        if marker != LEASE_SECTION_MARKER {
+            return Err(PlanDecodeError::TrailingBytes);
+        }
+        let lc = read_u32_at(cursor + 4).ok_or(PlanDecodeError::Truncated)? as usize;
+        // Count 0 is valid — a plan that grants no endpoints; only an over-cap
+        // count is rejected.
+        if lc > MAX_PLAN_LEASES {
+            return Err(PlanDecodeError::TrailingBytes);
+        }
+        lease_count = lc;
+        cursor += 4 + 4 + lease_count * LEASE_REC_LEN;
+    }
+    let body_len = cursor;
     let expected_total = PLAN_HEADER_LEN + body_len + 32;
     if bytes.len() < expected_total {
         return Err(PlanDecodeError::Truncated);
@@ -683,12 +831,31 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
             ),
         });
     }
+    let mut leases = Vec::with_capacity(lease_count);
+    let lease_base = assign_len
+        + if rev_count > 0 {
+            4 + rev_count * REVOKE_REC_LEN
+        } else {
+            0
+        }
+        + 8; // marker + count
+    for i in 0..lease_count {
+        let base = lease_base + i * LEASE_REC_LEN;
+        let r = &body[base..base + LEASE_REC_LEN];
+        leases.push(PlanLease {
+            slot: u16::from_be_bytes(r[0..2].try_into().unwrap()),
+            generation: u32::from_be_bytes(r[2..6].try_into().unwrap()),
+            protocol: r[6],
+            port: u16::from_be_bytes(r[7..9].try_into().unwrap()),
+        });
+    }
     let mut plan_digest = [0u8; 32];
     plan_digest.copy_from_slice(digest);
     Ok(CompositionPlan {
         generation,
         assignments,
         revocations,
+        leases,
         plan_digest,
     })
 }
@@ -808,6 +975,7 @@ mod tests {
             config_generation: 1,
             desired_phase: phase,
             profile: p,
+            exports: Vec::new(),
         }
     }
 
@@ -841,8 +1009,8 @@ mod tests {
             pods: vec![b, a],
         };
 
-        let p1 = compose(&s1, &cap(), &snap, &[], 0).unwrap();
-        let p2 = compose(&s2, &cap(), &snap, &[], 0).unwrap();
+        let p1 = compose(&s1, &cap(), &snap, &[], 0, &[], 0).unwrap();
+        let p2 = compose(&s2, &cap(), &snap, &[], 0, &[], 0).unwrap();
         assert_eq!(p1, p2);
         assert_eq!(p1.plan_digest, p2.plan_digest);
 
@@ -865,7 +1033,7 @@ mod tests {
                 pod(2, DesiredPhase::Running, profile(4, 4)),
             ],
         };
-        let plan = compose(&ds, &cap(), &snap, &[], 0).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.assignments[0].pod_uid, uid(2));
     }
@@ -886,7 +1054,7 @@ mod tests {
                 pod(3, DesiredPhase::Running, profile(4, 4)),
             ],
         };
-        let plan = compose(&ds, &cap(), &snap, &[], 0).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         let a2 = plan
             .assignments
             .iter()
@@ -916,7 +1084,7 @@ mod tests {
             system_revision: 1,
             pods: vec![pod(7, DesiredPhase::Running, profile(4, 4))],
         };
-        let plan = compose(&ds, &cap(), &snap, &[], 0).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
         assert_eq!(plan.assignments[0].slot, 1);
         assert_eq!(plan.assignments[0].generation, 10); // 9 + 1, never reused
     }
@@ -930,7 +1098,7 @@ mod tests {
             pods: vec![pod(1, DesiredPhase::Running, profile(200, 4))],
         };
         assert_eq!(
-            compose(&ds, &cap(), &snap, &[], 0),
+            compose(&ds, &cap(), &snap, &[], 0, &[], 0),
             Err(ComposeError::ModulesExceeded)
         );
     }
@@ -951,7 +1119,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            compose(&ds, &small, &snap, &[], 0),
+            compose(&ds, &small, &snap, &[], 0, &[], 0),
             Err(ComposeError::OwnerSlotsExhausted)
         );
     }
@@ -988,7 +1156,7 @@ mod tests {
                 pod(2, DesiredPhase::Running, profile(8, 10)),
             ],
         };
-        compose(&ds, &cap(), &snap, &[], 0).unwrap()
+        compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap()
     }
 
     #[test]
@@ -1013,9 +1181,182 @@ mod tests {
             generation: 7,
             assignments: vec![],
             revocations: vec![],
-            plan_digest: digest_plan(7, &[], &[]),
+            leases: vec![],
+            plan_digest: digest_plan(7, &[], &[], &[]),
         };
         assert_eq!(decode_plan(&encode_plan(&plan)).unwrap(), plan);
+    }
+
+    #[test]
+    fn lease_section_round_trips_alone_with_revocations_and_never_misparses() {
+        let lease = |slot: u16, port: u16| PlanLease {
+            slot,
+            generation: 1,
+            protocol: LEASE_PROTO_TCP,
+            port,
+        };
+        let base = sample_plan();
+
+        // Lease-only plan round-trips (the marker discriminates the section;
+        // pre-marker decoders would have misparsed this as revocations).
+        let mut lease_only = base.clone();
+        lease_only.leases = vec![lease(1, 8080), lease(2, 9090)];
+        lease_only.plan_digest = digest_plan(
+            lease_only.generation,
+            &lease_only.assignments,
+            &[],
+            &lease_only.leases,
+        );
+        let decoded = decode_plan(&encode_plan(&lease_only)).unwrap();
+        assert_eq!(decoded.leases, lease_only.leases);
+        assert!(decoded.revocations.is_empty());
+
+        // THE COLLISION PAIR (rfc_endpoint_lease.md §5.1): 3 revocations and 16
+        // leases both occupy 148 tail bytes. Each decodes to its own section.
+        let committed = sample_plan();
+        let snap = snap_from(&committed, 16);
+        let ds = DeviceDesiredState {
+            generation: 43,
+            system_revision: 1,
+            pods: vec![],
+        };
+        // Build a plan with exactly 3 revocations via three graced removals.
+        let mut with_revs = compose(
+            &ds,
+            &cap(),
+            &snap,
+            &[(uid(1), 60), (uid(2), 60)],
+            1000,
+            &[],
+            0,
+        )
+        .unwrap();
+        // Manufacture the third revocation by hand to hit exactly R=3.
+        let mut third = with_revs.revocations[0];
+        third.assignment.slot = 9;
+        with_revs.revocations.push(third);
+        with_revs.plan_digest = digest_plan(
+            with_revs.generation,
+            &with_revs.assignments,
+            &with_revs.revocations,
+            &[],
+        );
+        let mut sixteen_leases = base.clone();
+        sixteen_leases.leases = (0..16).map(|i| lease(1, 7000 + i as u16)).collect();
+        sixteen_leases.plan_digest = digest_plan(
+            sixteen_leases.generation,
+            &sixteen_leases.assignments,
+            &[],
+            &sixteen_leases.leases,
+        );
+        let rev_bytes = encode_plan(&with_revs);
+        let lease_bytes = encode_plan(&sixteen_leases);
+        // The pre-marker ambiguity (rfc §5.1): under count-only framing, a
+        // 3-revocation tail and a 16-lease tail would both be 148 bytes —
+        // undecidable by length. The marker adds 4 bytes to the lease section
+        // precisely to make the first u32 discriminate instead.
+        assert_eq!(
+            4 + 3 * REVOKE_REC_LEN,
+            4 + 16 * LEASE_REC_LEN,
+            "the documented 148-byte collision (marker-less framing)"
+        );
+        // …and each decodes to the correct section.
+        let r = decode_plan(&rev_bytes).unwrap();
+        assert_eq!((r.revocations.len(), r.leases.len()), (3, 0));
+        let l = decode_plan(&lease_bytes).unwrap();
+        assert_eq!((l.revocations.len(), l.leases.len()), (0, 16));
+
+        // Both sections together round-trip, order rev-then-lease.
+        let mut both = with_revs.clone();
+        both.leases = vec![lease(2, 8080)];
+        both.plan_digest = digest_plan(
+            both.generation,
+            &both.assignments,
+            &both.revocations,
+            &both.leases,
+        );
+        let d = decode_plan(&encode_plan(&both)).unwrap();
+        assert_eq!(d.revocations.len(), 3);
+        assert_eq!(d.leases, both.leases);
+
+        // Truncating inside the lease section fails closed.
+        let bytes = encode_plan(&sixteen_leases);
+        assert!(decode_plan(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn compose_grants_charges_and_conflicts_leases() {
+        let exported_pod = |n: u8, port: u16, endpoints: u16| {
+            let mut p = pod(n, DesiredPhase::Running, profile(4, 6));
+            p.profile.endpoints = endpoints;
+            p.exports = vec![ExportDecl {
+                protocol: "TCP".into(),
+                port,
+            }];
+            p
+        };
+        let snap = OwnerSnapshot::empty(16);
+
+        // Grant: an export becomes a lease bound to the pod's (slot, gen).
+        let ds = DeviceDesiredState {
+            generation: 1,
+            system_revision: 1,
+            pods: vec![exported_pod(1, 8080, 1)],
+        };
+        let plan = compose(&ds, &cap(), &snap, &[], 0, &[], 0).unwrap();
+        assert_eq!(plan.leases.len(), 1);
+        assert_eq!(plan.leases[0].port, 8080);
+        assert_eq!(plan.leases[0].slot, plan.assignments[0].slot);
+
+        // Charge: more exports than admitted endpoints → EndpointsExceeded.
+        let mut greedy = exported_pod(2, 7000, 1);
+        greedy.exports.push(ExportDecl {
+            protocol: "udp".into(),
+            port: 7001,
+        });
+        let ds = DeviceDesiredState {
+            generation: 1,
+            system_revision: 1,
+            pods: vec![greedy],
+        };
+        assert_eq!(
+            compose(&ds, &cap(), &snap, &[], 0, &[], 0),
+            Err(ComposeError::EndpointsExceeded)
+        );
+
+        // Conflict: two owners, same (protocol, port) → admission-time error.
+        let ds = DeviceDesiredState {
+            generation: 1,
+            system_revision: 1,
+            pods: vec![exported_pod(1, 8080, 1), exported_pod(2, 8080, 1)],
+        };
+        assert_eq!(
+            compose(&ds, &cap(), &snap, &[], 0, &[], 0),
+            Err(ComposeError::EndpointConflict)
+        );
+
+        // Reserved ports (the embedding host's own listeners) refuse the grant.
+        let ds = DeviceDesiredState {
+            generation: 1,
+            system_revision: 1,
+            pods: vec![exported_pod(1, 6443, 1)],
+        };
+        assert_eq!(
+            compose(&ds, &cap(), &snap, &[], 0, &[6443], 0),
+            Err(ComposeError::EndpointConflict)
+        );
+
+        // Port 0 cannot be exported: the kernel gate never matches a lease
+        // to an ephemeral bind, so the grant could silently never serve.
+        let ds = DeviceDesiredState {
+            generation: 1,
+            system_revision: 1,
+            pods: vec![exported_pod(1, 0, 1)],
+        };
+        assert_eq!(
+            compose(&ds, &cap(), &snap, &[], 0, &[], 0),
+            Err(ComposeError::EndpointConflict)
+        );
     }
 
     #[test]
@@ -1056,11 +1397,14 @@ mod tests {
     }
 
     #[test]
-    fn no_revocation_plan_encodes_byte_identically_to_the_prerevocation_format() {
-        // The exact pre-revocation layout, hand-built: header + generation +
-        // count + assignment records + sha256(body). A plan with an empty
-        // revocation section must produce these bytes and no more.
+    fn no_revocation_plan_has_the_canonical_layout_with_an_empty_lease_section() {
+        // Canonical layout, hand-built: header + generation + count + assignment
+        // records + [no revocation section] + lease section (marker + count 0) +
+        // sha256(body). The revocation section is omitted when empty; the lease
+        // section is always emitted, so a no-revocation, no-lease plan carries
+        // the 8-byte empty section and nothing more.
         let plan = sample_plan();
+        assert!(plan.revocations.is_empty() && plan.leases.is_empty());
         let mut expected = Vec::new();
         expected.extend_from_slice(&PLAN_MAGIC.to_be_bytes());
         expected.extend_from_slice(&PLAN_VERSION.to_be_bytes());
@@ -1071,6 +1415,9 @@ mod tests {
         for a in &plan.assignments {
             push_assignment(&mut body, a);
         }
+        // Always-present lease section: marker + count(0), no records.
+        body.extend_from_slice(&LEASE_SECTION_MARKER.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
         expected.extend_from_slice(&body);
         expected.extend_from_slice(&sha256_of(&body));
         assert_eq!(encode_plan(&plan), expected);
@@ -1086,7 +1433,7 @@ mod tests {
             system_revision: 1,
             pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
         };
-        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 30)], 1000).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 30)], 1000, &[], 0).unwrap();
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.revocations.len(), 1);
         let rev = &plan.revocations[0];
@@ -1097,10 +1444,13 @@ mod tests {
         let bytes = encode_plan(&plan);
         assert_eq!(decode_plan(&bytes).unwrap(), plan);
 
-        // Tampering with the stamped deadline fails the digest.
+        // Tampering with the stamped deadline fails the digest. deadline_unix is
+        // the last field of the revocation record, which sits before the 8-byte
+        // empty lease section and the 32-byte digest — structurally inert
+        // (framing unchanged) but digest-covered.
         let mut tampered = bytes.clone();
-        let last_body = tampered.len() - 33; // last byte of deadline_unix
-        tampered[last_body] ^= 0xFF;
+        let deadline_last = tampered.len() - 32 - 8 - 1; // - digest - empty lease section
+        tampered[deadline_last] ^= 0xFF;
         assert_eq!(decode_plan(&tampered), Err(PlanDecodeError::DigestMismatch));
 
         // Truncating inside the revocation section fails closed.
@@ -1127,7 +1477,7 @@ mod tests {
             system_revision: 1,
             pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
         };
-        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 60)], 1000).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 60)], 1000, &[], 0).unwrap();
         // §3.3: the survivor's record is BYTE-identical (slot, gen, ranges).
         assert_eq!(plan.assignments, vec![survivor]);
         // The departed owner's ranges are still held by its revocation.
@@ -1144,7 +1494,7 @@ mod tests {
                 pod(3, DesiredPhase::Running, profile(4, 6)),
             ],
         };
-        let plan2 = compose(&ds2, &cap(), &snap2, &[], 1001).unwrap();
+        let plan2 = compose(&ds2, &cap(), &snap2, &[], 1001, &[], 0).unwrap();
         let newcomer = plan2
             .assignments
             .iter()
@@ -1176,7 +1526,7 @@ mod tests {
             system_revision: 1,
             pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
         };
-        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 10)], 1000).unwrap();
+        let plan = compose(&ds, &cap(), &snap, &[(uid(1), 10)], 1000, &[], 0).unwrap();
         assert_eq!(plan.revocations.len(), 1, "live during the window");
 
         // Recompose after deadline + settle: the record drops, and a new pod
@@ -1192,7 +1542,7 @@ mod tests {
             ],
         };
         let expired_now = 1000 + 10 + REVOCATION_SETTLE_SECS + 1;
-        let plan2 = compose(&ds2, &cap(), &snap2, &[], expired_now).unwrap();
+        let plan2 = compose(&ds2, &cap(), &snap2, &[], expired_now, &[], 0).unwrap();
         assert!(plan2.revocations.is_empty(), "expired record dropped");
         let newcomer = plan2
             .assignments
@@ -1217,7 +1567,7 @@ mod tests {
             system_revision: 1,
             pods: vec![pod(1, DesiredPhase::Running, profile(8, 4))],
         };
-        let committed = compose(&ds0, &small, &snap0, &[], 0).unwrap();
+        let committed = compose(&ds0, &small, &snap0, &[], 0, &[], 0).unwrap();
 
         // Remove it with grace, and try to admit another 8-module pod during
         // the window: the draining owner still holds its 8 modules, so the
@@ -1229,7 +1579,7 @@ mod tests {
             pods: vec![pod(2, DesiredPhase::Running, profile(8, 4))],
         };
         assert_eq!(
-            compose(&ds, &small, &snap, &[(uid(1), 60)], 1000),
+            compose(&ds, &small, &snap, &[(uid(1), 60)], 1000, &[], 0),
             Err(ComposeError::ModulesExceeded)
         );
 
@@ -1241,7 +1591,7 @@ mod tests {
             system_revision: 1,
             pods: vec![],
         };
-        let removal = compose(&ds_removed, &small, &snap, &[(uid(1), 60)], 1000).unwrap();
+        let removal = compose(&ds_removed, &small, &snap, &[(uid(1), 60)], 1000, &[], 0).unwrap();
         assert_eq!(removal.revocations.len(), 1);
         let snap2 = snap_from(&removal, 16);
         let ds2 = DeviceDesiredState {
@@ -1250,12 +1600,12 @@ mod tests {
             pods: vec![pod(2, DesiredPhase::Running, profile(8, 4))],
         };
         assert_eq!(
-            compose(&ds2, &small, &snap2, &[], 1000),
+            compose(&ds2, &small, &snap2, &[], 1000, &[], 0),
             Err(ComposeError::ModulesExceeded),
             "still exhausted during the window"
         );
         let expired = 1000 + 60 + REVOCATION_SETTLE_SECS + 1;
-        assert!(compose(&ds2, &small, &snap2, &[], expired).is_ok());
+        assert!(compose(&ds2, &small, &snap2, &[], expired, &[], 0).is_ok());
     }
 
     #[test]

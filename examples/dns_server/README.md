@@ -15,6 +15,12 @@ cyw43 (WiFi) ⇄ ip ⇄ dns
 ## Targets
 
 - `pico2w.yaml`
+- `linux.yaml` — the rfc_system_services.md delegation shape: the dns
+  module owns an unprivileged UDP port as an owned workload and forwards
+  non-table names to a host authority on `upstream_port`. `bundle/` is the
+  matching WS-H workload (exports `udp/15353`) for `fluxor agent commit`.
+  `linux_e2e.sh` runs the whole pattern live (policy refusal → lease grant
+  → bound report → local + delegated answers → drain frees the port).
 
 ## Setup
 

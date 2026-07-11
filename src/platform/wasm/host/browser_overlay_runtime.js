@@ -1047,12 +1047,59 @@
     let epoch = 0;
     let scheduled = false;
 
+    // The width the display surface actually RENDERS at — the display
+    // container's content box, not the window. Page chrome (body margins,
+    // the .surface border) makes the container narrower than the window;
+    // reporting window.innerWidth here would have the app compose a frame
+    // wider than the box it displays in, forcing the browser to resample
+    // every pixel down by a non-integer factor (heavy blur — the exact
+    // artifact device-pixel supersampling exists to remove). The canvas
+    // keeps its aspect (`height: auto`), so an exact width ⇒ an exact
+    // height ⇒ raster px map 1:1 onto device px. Falls back to the window
+    // when no display surface is mounted (headless / terminal scenarios).
+    function displayEl() {
+      const d = w.document;
+      if (!d) return null;
+      const canvas = d.querySelector(
+        '.surface[data-role="display"] canvas, .stage canvas');
+      return canvas
+        ? canvas.parentElement
+        : d.querySelector('.surface[data-role="display"]');
+    }
+    function displayBoxWidth() {
+      try {
+        const el = displayEl();
+        if (el && el.clientWidth > 0) return el.clientWidth | 0;
+      } catch (_) { /* fall through */ }
+      return 0;
+    }
+    // The height actually AVAILABLE to the display box: the visual
+    // viewport (which tracks a mobile browser's collapsing URL bar —
+    // `innerHeight` does not) minus the box's offset from the top of the
+    // document. Reporting the raw window height makes the app compose a
+    // frame that necessarily overflows the fold by the page-header height,
+    // so its bottom rows sit off-screen (and on touch devices the page
+    // scroll needed to reach them fights the app's own scrolling).
+    function displayBoxHeight() {
+      try {
+        const el = displayEl();
+        if (!el) return 0;
+        const rect = el.getBoundingClientRect();
+        const docTop = rect.top + (w.scrollY || 0);
+        const vvh = (w.visualViewport && w.visualViewport.height)
+          || w.innerHeight || 0;
+        const avail = Math.floor(vvh - docTop);
+        return avail > 0 ? avail : 0;
+      } catch (_) { /* fall through */ }
+      return 0;
+    }
+
     function probe() {
       // Test override: opts.viewport = { width, height, coarse, fine,
       // touch, gamepads, audioChannels, audioRateHz, physicalButtons }.
       const v = opts.viewport;
-      const vw = v ? (v.width | 0) : (w.innerWidth | 0);
-      const vh = v ? (v.height | 0) : (w.innerHeight | 0);
+      const vw = v ? (v.width | 0) : (displayBoxWidth() || (w.innerWidth | 0));
+      const vh = v ? (v.height | 0) : (displayBoxHeight() || (w.innerHeight | 0));
       const mq = (q) => !!(w.matchMedia && w.matchMedia(q).matches);
       const coarse = v ? !!v.coarse : mq('(pointer: coarse)');
       const fine = v ? !!v.fine : mq('(pointer: fine)');
