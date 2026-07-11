@@ -1534,7 +1534,14 @@ pub fn get_module_state(idx: usize) -> *mut u8 {
 /// Used by `check_contract_grant` to gate `provider_*` dispatch.
 pub fn current_module_cap_class() -> u8 {
     let idx = current_module_index();
-    // SAFETY: scheduler-thread-only read; current_module_index is bounded.
+    // Guard the sentinel/out-of-range index: a live-added module can make a
+    // provider_call before CURRENT_MODULE_PER_CORE is set to its slot, leaving idx
+    // at the "no module" sentinel (== MAX_MODULES). Fall back to class 0 rather than
+    // index a fixed [_; MAX_MODULES] array out of bounds.
+    if idx >= MAX_MODULES {
+        return 0;
+    }
+    // SAFETY: idx bounded above; scheduler-thread-only read.
     unsafe { SCHED.cap_class[idx] }
 }
 
@@ -1544,7 +1551,12 @@ pub fn current_module_cap_class() -> u8 {
 /// `current_module_internal_permission`.
 pub fn current_module_required_caps() -> u32 {
     let idx = current_module_index();
-    // SAFETY: scheduler-thread-only read.
+    // Same sentinel guard as current_module_cap_class (a live-added module's early
+    // provider_call can read the "no module" sentinel index).
+    if idx >= MAX_MODULES {
+        return 0;
+    }
+    // SAFETY: idx bounded above; scheduler-thread-only read.
     unsafe { SCHED.required_caps[idx] }
 }
 
@@ -3985,8 +3997,13 @@ pub fn module_state_snapshot(module_idx: usize) -> ModuleStateSnapshot {
 pub fn channel_port_lookup(port_type: u8, index: u8) -> i32 {
     let idx = index as usize;
     let cm = current_module_index();
-    // SAFETY: scheduler-thread-only read; `cm` from `current_module_index`
-    // is bounded against MAX_MODULES.
+    // Guard the "no module" sentinel (== MAX_MODULES): a live-added module can reach
+    // a port lookup before CURRENT_MODULE_PER_CORE is set to its slot. Return -1
+    // (port not resolvable yet) rather than index a fixed [_; MAX_MODULES] array OOB.
+    if cm >= MAX_MODULES {
+        return -1;
+    }
+    // SAFETY: cm bounded above; scheduler-thread-only read.
     let ports = unsafe { &SCHED.ports[cm] };
     match port_type {
         0 => {

@@ -413,7 +413,10 @@ pub fn is_source_manifest(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "toml")
         && std::fs::read_to_string(path)
             .ok()
-            .and_then(|t| t.parse::<toml::Value>().ok())
+            // `toml::Table`'s FromStr parses a DOCUMENT; `toml::Value`'s
+            // parses a single value expression and rejects every real
+            // manifest — the sniff must use the document parse.
+            .and_then(|t| t.parse::<toml::Table>().ok())
             .is_some_and(|v| v.get("workload").is_some_and(toml::Value::is_table))
 }
 
