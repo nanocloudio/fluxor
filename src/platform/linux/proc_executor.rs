@@ -37,7 +37,17 @@ const BRIDGE_CAP: usize = 16 * 1024;
 /// Reader chunk size (also the largest frame the reader produces).
 const READ_CHUNK: usize = 1024;
 
-/// One owned external process with bounded stdin/stdout bridges.
+/// The host-side grant a spawn is scoped by (the `proc` policy §5): the process
+/// starts in `cwd` and inherits ONLY the named env vars — no ambient environment, so
+/// node secrets don't leak into `do` children. Empty `cwd` = the node's cwd.
+#[derive(Default, Clone)]
+pub struct SpawnPolicy {
+    pub cwd: Option<std::path::PathBuf>,
+    pub env_allow: Vec<String>,
+}
+
+/// One owned external process with bounded stdin/stdout bridges. stdout AND stderr are
+/// merged into the one inbound bridge (a build's errors go to stderr — you want them).
 pub struct ProcExecutor {
     pub owner: OwnerHandle,
     child: Child,
@@ -45,7 +55,39 @@ pub struct ProcExecutor {
     stdin_bridge: Arc<ExtBridge<BRIDGE_CAP>>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
+}
+
+/// Pump one child pipe (stdout or stderr) into the inbound bridge. The blocking read
+/// lives on this thread, off the scheduler; it exits on EOF/error or the stop flag. On
+/// overload (a rejecting policy) it holds the chunk so the pipe fills and the child
+/// throttles — true end-to-end backpressure.
+fn pump_reader<R: Read + Send + 'static>(
+    mut src: R,
+    bridge: Arc<ExtBridge<BRIDGE_CAP>>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; READ_CHUNK];
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            match src.read(&mut buf) {
+                Ok(0) | Err(_) => break, // EOF or pipe error
+                Ok(n) => {
+                    let mut chunk = &buf[..n];
+                    while !chunk.is_empty() && !stop.load(Ordering::Acquire) {
+                        match bridge.push_frame(chunk) {
+                            PushOutcome::Rejected => std::thread::sleep(Duration::from_millis(1)),
+                            _ => chunk = &[],
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 impl ProcExecutor {
@@ -57,13 +99,26 @@ impl ProcExecutor {
         cmd: &str,
         args: &[&str],
         stdout_policy: OverloadPolicy,
+        policy: &SpawnPolicy,
     ) -> std::io::Result<ProcExecutor> {
-        let mut child = Command::new(cmd)
+        let mut command = Command::new(cmd);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::piped()); // merged into the inbound bridge below
+        if let Some(dir) = &policy.cwd {
+            command.current_dir(dir);
+        }
+        // No ambient environment — inherit ONLY the allowlisted names, so node
+        // secrets never leak into a `do` child (§5 hygiene).
+        command.env_clear();
+        for name in &policy.env_allow {
+            if let Ok(val) = std::env::var(name) {
+                command.env(name, val);
+            }
+        }
+        let mut child = command.spawn()?;
 
         let stdout_bridge = Arc::new(ExtBridge::<BRIDGE_CAP>::new(stdout_policy));
         // Outbound is always Block: a full queue rejects the proxy's push and
@@ -71,38 +126,13 @@ impl ProcExecutor {
         let stdin_bridge = Arc::new(ExtBridge::<BRIDGE_CAP>::new(OverloadPolicy::Block));
         let stop = Arc::new(AtomicBool::new(false));
 
-        // Reader: child stdout → inbound bridge. Blocking read lives here, off
-        // the scheduler. On overload with a rejecting policy we simply stop
-        // reading (pipe fills → child throttles). Exits on EOF or stop flag.
-        let reader = {
-            let bridge = Arc::clone(&stdout_bridge);
-            let stop = Arc::clone(&stop);
-            let mut out = child.stdout.take().expect("stdout piped");
-            std::thread::spawn(move || {
-                let mut buf = [0u8; READ_CHUNK];
-                loop {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    match out.read(&mut buf) {
-                        Ok(0) | Err(_) => break, // EOF or pipe error
-                        Ok(n) => {
-                            let mut chunk = &buf[..n];
-                            while !chunk.is_empty() && !stop.load(Ordering::Acquire) {
-                                match bridge.push_frame(chunk) {
-                                    PushOutcome::Rejected => {
-                                        // Backpressure: hold the chunk, let the
-                                        // pipe fill behind us.
-                                        std::thread::sleep(Duration::from_millis(1));
-                                    }
-                                    _ => chunk = &[],
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-        };
+        // Two readers (child stdout + stderr) both pump the ONE inbound bridge,
+        // so stderr is interleaved with stdout (a build's errors show up). Blocking
+        // reads live off the scheduler; each exits on EOF or the stop flag.
+        let out = child.stdout.take().expect("stdout piped");
+        let err = child.stderr.take().expect("stderr piped");
+        let reader = pump_reader(out, Arc::clone(&stdout_bridge), Arc::clone(&stop));
+        let stderr_reader = pump_reader(err, Arc::clone(&stdout_bridge), Arc::clone(&stop));
 
         // Writer: outbound bridge → child stdin. Exits on stop flag or broken
         // pipe; parks briefly when idle.
@@ -135,6 +165,7 @@ impl ProcExecutor {
             stdin_bridge,
             stop,
             reader: Some(reader),
+            stderr_reader: Some(stderr_reader),
             writer: Some(writer),
         })
     }
@@ -166,6 +197,22 @@ impl ProcExecutor {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// The reader thread has finished — the child's stdout hit EOF, so no more
+    /// frames will ever be pushed to the inbound bridge. Combined with an empty
+    /// bridge this is the race-free "output complete" signal a consumer needs
+    /// before declaring the process done (the child can exit while a final chunk
+    /// is still in flight from the pipe to the bridge).
+    pub fn reader_finished(&self) -> bool {
+        self.reader.as_ref().map_or(true, |h| h.is_finished())
+            && self.stderr_reader.as_ref().map_or(true, |h| h.is_finished())
+    }
+
+    /// Bytes still buffered in the inbound (stdout) bridge, not yet drained by
+    /// the consumer via `poll_stdout`.
+    pub fn stdout_pending(&self) -> usize {
+        self.stdout_bridge.len_bytes()
+    }
+
     /// §6.8 quiesce order: stop new bridge reads, signal the process (SIGTERM),
     /// wait out the bounded drain deadline, then SIGKILL. Returns true if the
     /// process exited within `grace` (false = it needed the kill).
@@ -190,6 +237,9 @@ impl ProcExecutor {
             let _ = self.child.wait();
         }
         if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.stderr_reader.take() {
             let _ = h.join();
         }
         if let Some(h) = self.writer.take() {

@@ -169,6 +169,10 @@ fn linux_init_providers() {
     // `src/platform/wasm/namespace.rs`. Lets a scanner walk a host library on
     // Linux exactly as it walks the manifest-backed index in the browser.
     provider::register(dev_class::STORAGE_NAMESPACE, linux_namespace_dispatch);
+    // The impure boundary: host process executor (sector `do`). Gated by
+    // `requires_contract="proc"`; only registered on host-linux (a PIC module
+    // can't fork/exec, so a "worker" is by definition a Linux node).
+    provider::register(dev_class::PROC, linux_proc_dispatch);
 }
 /// Platform-specific per-module cleanup for Linux host.
 ///

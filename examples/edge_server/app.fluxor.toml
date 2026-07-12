@@ -1,0 +1,22 @@
+# Workload source manifest (rfc_system_services.md §10.2) for graph-hosted
+# edge HTTP serving. `fluxor build app.fluxor.toml` emits the committed
+# bundle the agent consumes. First bundle with a TCP export — the stream
+# side of the endpoint lease.
+[workload]
+name = "edge"
+version = "1.0.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[[export]]
+name = "http"
+protocol = "tcp"
+port = 18080
+binding = "http.net_out"
+
+[resources]
+state_bytes = 262144
+buffer_bytes = 65536

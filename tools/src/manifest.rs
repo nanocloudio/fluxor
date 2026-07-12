@@ -121,6 +121,9 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // vtable is not yet implemented and `provider_open` against
         // it returns ENOSYS until a host-controller driver lands.
         "usb_host" => Ok(0x15),
+        // Host process executor (the impure boundary). Host-linux only; a node
+        // without the `proc` grant ENOSYS-denies. See sector architecture §5.
+        "proc" => Ok(0x16),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -172,6 +175,7 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
         0x13 => "storage.namespace",
         0x14 => "storage.object",
         0x15 => "usb_host",
+        0x16 => "proc",
         _ => "unknown",
     }
 }
@@ -335,6 +339,17 @@ pub struct PortSpec {
     pub name: Option<String>,
     /// Explicit port index within its direction group (default: sequential).
     pub index: u8,
+    /// Requested channel ring capacity in bytes (0 = kernel default).
+    /// Serialized in the flag-bit-5 port-capacity section; replaces the
+    /// former `module_channel_hints` runtime code export (RFC flow
+    /// budgets §3.1) so capacity is knowable statically — including for
+    /// wasm payloads, whose packed export tables are empty.
+    pub buffer_size: u32,
+    /// Largest single `channel_write` this port issues (0 = undeclared).
+    /// `channel_write` is all-or-nothing: a record larger than the ring
+    /// can NEVER succeed, so the loader refuses at graph load any wiring
+    /// where `max_record` exceeds the granted ring.
+    pub max_record: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1075,6 +1090,8 @@ impl Manifest {
                 flags,
                 name: p.name,
                 index,
+                buffer_size: p.buffer_size.unwrap_or(0),
+                max_record: p.max_record.unwrap_or(0),
             });
         }
 
@@ -1346,9 +1363,19 @@ impl Manifest {
         // Signature requires integrity (signature is over the hash).
         let has_signature = has_signature && has_integrity;
         let has_abi_surface = self.abi_surface.is_some();
+        // Port-capacity section (flag bit 5): 8 bytes per port
+        // [buffer_size u32 LE][max_record u32 LE], emitted directly
+        // after the dependency records so it sits INSIDE the signed
+        // envelope region ([15..hash_offset]) — ring capacities are
+        // load-bearing metadata (a tampered max_record wedges a graph).
+        let has_port_capacity = self
+            .ports
+            .iter()
+            .any(|p| p.buffer_size != 0 || p.max_record != 0);
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
+            + if has_port_capacity { self.ports.len() * 8 } else { 0 }
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -1398,7 +1425,8 @@ impl Manifest {
             | (if has_signature { 2 } else { 0 })
             | (if self.isr_safe { 4 } else { 0 })
             | (if self.pre_tick_drain { 8 } else { 0 })
-            | (if has_abi_surface { 0x10 } else { 0 });
+            | (if has_abi_surface { 0x10 } else { 0 })
+            | (if has_port_capacity { 0x20 } else { 0 });
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
@@ -1431,6 +1459,15 @@ impl Manifest {
             buf.extend_from_slice(&d.min_version.to_le_bytes());
             buf.push(0);
             buf.push(0);
+        }
+
+        // Port-capacity section (flag bit 5): one 8-byte entry per port,
+        // in port-record order.
+        if has_port_capacity {
+            for p in &self.ports {
+                buf.extend_from_slice(&p.buffer_size.to_le_bytes());
+                buf.extend_from_slice(&p.max_record.to_le_bytes());
+            }
         }
 
         // Integrity hash (32 bytes)
@@ -1492,12 +1529,14 @@ impl Manifest {
         let isr_safe = (flags & 0x04) != 0;
         let pre_tick_drain = (flags & 0x08) != 0;
         let has_abi_surface = (flags & 0x10) != 0;
+        let has_port_capacity = (flags & 0x20) != 0;
         let permissions_bits = data[15]; // fine-grained permissions bitmap
 
         let expected_size = MANIFEST_HEADER_SIZE
             + port_count * 4
             + resource_count * 4
             + dependency_count * 8
+            + if has_port_capacity { port_count * 8 } else { 0 }
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -1529,6 +1568,8 @@ impl Manifest {
                 flags: data[offset + 2],
                 name: None,
                 index: data[offset + 3],
+                buffer_size: 0,
+                max_record: 0,
             });
             offset += 4;
         }
@@ -1557,6 +1598,25 @@ impl Manifest {
                 min_version,
             });
             offset += 8;
+        }
+
+        // Port-capacity section (flag bit 5), in port-record order.
+        if has_port_capacity {
+            for port in ports.iter_mut() {
+                port.buffer_size = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                port.max_record = u32::from_le_bytes([
+                    data[offset + 4],
+                    data[offset + 5],
+                    data[offset + 6],
+                    data[offset + 7],
+                ]);
+                offset += 8;
+            }
         }
 
         let integrity_hash = if has_integrity {
@@ -1958,6 +2018,8 @@ struct TomlPort {
     required: Option<bool>,
     name: Option<String>,
     index: Option<u8>,
+    buffer_size: Option<u32>,
+    max_record: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1991,6 +2053,59 @@ mod tests {
     fn semver_roundtrip() {
         let v = encode_semver(1, 2, 3);
         assert_eq!(decode_semver(v), (1, 2, 3));
+    }
+
+    /// Port-capacity section (flag bit 5): round-trips through the
+    /// binary form, sits inside the signed region (before the
+    /// integrity hash), and absent capacities emit no section.
+    #[test]
+    fn port_capacity_roundtrip() {
+        let mut m = Manifest::default();
+        m.ports.push(PortSpec {
+            direction: 0,
+            content_type: 3,
+            flags: 1,
+            name: None,
+            index: 0,
+            buffer_size: 65536,
+            max_record: 0,
+        });
+        m.ports.push(PortSpec {
+            direction: 1,
+            content_type: 5,
+            flags: 0,
+            name: None,
+            index: 0,
+            buffer_size: 1048576,
+            max_record: 16384,
+        });
+        let bytes = m.to_bytes();
+        assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
+        // Section sits after the port records (16 + 2*4), before any hash.
+        assert_eq!(&bytes[24..28], &65536u32.to_le_bytes());
+        assert_eq!(&bytes[32..36], &1048576u32.to_le_bytes());
+        assert_eq!(&bytes[36..40], &16384u32.to_le_bytes());
+        let back = Manifest::from_bytes(&bytes).unwrap();
+        assert_eq!(back.ports[0].buffer_size, 65536);
+        assert_eq!(back.ports[0].max_record, 0);
+        assert_eq!(back.ports[1].buffer_size, 1048576);
+        assert_eq!(back.ports[1].max_record, 16384);
+
+        // No capacities → no section, no flag, legacy-identical layout.
+        let mut plain = Manifest::default();
+        plain.ports.push(PortSpec {
+            direction: 0,
+            content_type: 3,
+            flags: 1,
+            name: None,
+            index: 0,
+            buffer_size: 0,
+            max_record: 0,
+        });
+        let pb = plain.to_bytes();
+        assert_eq!(pb[14] & 0x20, 0);
+        assert_eq!(pb.len(), 16 + 4);
+        assert!(Manifest::from_bytes(&pb).is_ok());
     }
 
     #[test]
@@ -2098,6 +2213,8 @@ mod tests {
             flags: 1,
             name: None,
             index: 0,
+            buffer_size: 0,
+            max_record: 0,
         });
         m.resources.push(ResourceClaim {
             device_class: 0x04,

@@ -488,6 +488,10 @@ pub mod fd {
     /// will tag its returned handles with this once the host stack
     /// lands. No live producer yet.
     pub const FD_TAG_USB_HOST: i32 = 24;
+    /// Host process executor handle (`provider::contract::PROC`, 0x0016):
+    /// `PROC_SPAWN` tags the returned slot with this; `PROC_READ`/`STATUS`/
+    /// `CLOSE` carry it back and the dispatcher strips it with `slot_of`.
+    pub const FD_TAG_PROC: i32 = 25;
 
     pub const TAG_SHIFT: u32 = 26;
     pub const SLOT_MASK: i32 = 0x03FF_FFFF;

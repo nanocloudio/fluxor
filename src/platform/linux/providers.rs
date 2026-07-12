@@ -517,6 +517,206 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
 }
 
 // ============================================================================
+// Linux PROC Provider — the impure boundary (host process executor, class 0x16)
+// ============================================================================
+//
+// `do <cmd>` (sector) calls this via provider_call, gated by
+// `requires_contract="proc"`. SPAWN (handle=-1) allocates a slot, spawns the
+// command through the pre-existing `ProcExecutor` (background reader thread →
+// non-blocking `poll_stdout`), and returns a `FD_TAG_PROC`-tagged handle.
+// READ/STATUS/CLOSE carry that handle back. Completion is the real process exit
+// (STATUS=0 once exited AND drained) — never a quiescence guess.
+//
+// GRANT (MVP): a hardcoded executable allowlist. The allowlist is hygiene +
+// accident-prevention, NOT a sandbox (any dev tool is RCE-equivalent — the node
+// is the boundary). Config-driven root/env/timeout scoping + OS sandboxing are
+// the documented hardening follow-ups (sector architecture §5).
+
+const PROC_SPAWN: u32 = 0x1600;
+const PROC_READ: u32 = 0x1601;
+const PROC_STATUS: u32 = 0x1602;
+const PROC_CLOSE: u32 = 0x1603;
+
+const MAX_PROCS: usize = 8;
+
+struct LinuxProcSlot {
+    exec: Option<fluxor::platform::proc_executor::ProcExecutor>,
+    in_use: bool,
+    deadline: Option<std::time::Instant>,
+}
+
+static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] =
+    [const {
+        LinuxProcSlot {
+            exec: None,
+            in_use: false,
+            deadline: None,
+        }
+    }; MAX_PROCS];
+
+/// The node's `proc` grant — WHAT `do` may run and how, sourced from the environment
+/// so the operator declares it at launch (`SECTOR_PROC_ALLOW`, `_ROOT`, `_ENV`,
+/// `_TIMEOUT_MS`), with safe defaults. The allowlist is accident-prevention + the
+/// migration-frontier surface, NOT confinement (any dev tool is RCE-equivalent — the
+/// node is the boundary, §5); `root`/`env`/`timeout` are hygiene + blast-radius bounds.
+struct ProcGrant {
+    root: Option<std::path::PathBuf>,
+    allow: std::vec::Vec<String>,
+    env_allow: std::vec::Vec<String>,
+    timeout_ms: u64,
+}
+
+fn proc_grant() -> &'static ProcGrant {
+    static GRANT: std::sync::OnceLock<ProcGrant> = std::sync::OnceLock::new();
+    GRANT.get_or_init(|| {
+        let split = |v: String| {
+            v.split([',', ' ', ':'])
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<std::vec::Vec<_>>()
+        };
+        let default_allow = || {
+            [
+                "echo", "ls", "cat", "pwd", "uname", "date", "whoami", "env", "true", "false",
+                "wc", "head", "tail", "grep", "find", "rg", "git", "cargo", "rustc", "make",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::vec::Vec<_>>()
+        };
+        let default_env = || {
+            [
+                "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "CARGO_HOME", "RUSTUP_HOME",
+                "SSH_AUTH_SOCK",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::vec::Vec<_>>()
+        };
+        ProcGrant {
+            root: std::env::var("SECTOR_PROC_ROOT")
+                .ok()
+                .map(std::path::PathBuf::from),
+            allow: std::env::var("SECTOR_PROC_ALLOW")
+                .ok()
+                .map(split)
+                .unwrap_or_else(default_allow),
+            env_allow: std::env::var("SECTOR_PROC_ENV")
+                .ok()
+                .map(split)
+                .unwrap_or_else(default_env),
+            timeout_ms: std::env::var("SECTOR_PROC_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120_000),
+        }
+    })
+}
+
+unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use fluxor::platform::proc_executor::{ProcExecutor, SpawnPolicy};
+    use fluxor::kernel::errno;
+    use fluxor::kernel::extbridge::OverloadPolicy;
+    use fluxor::kernel::fd::{slot_of, tag_fd, FD_TAG_PROC};
+    use fluxor::kernel::owner::OWNER_SYSTEM;
+
+    let procs = &mut *core::ptr::addr_of_mut!(LINUX_PROCS);
+    match opcode {
+        PROC_SPAWN => {
+            if arg.is_null() || arg_len == 0 {
+                return errno::EINVAL;
+            }
+            let bytes = core::slice::from_raw_parts(arg, arg_len);
+            let line = match core::str::from_utf8(bytes) {
+                Ok(s) => s.trim(),
+                Err(_) => return errno::EINVAL,
+            };
+            let mut parts = line.split_whitespace();
+            let cmd = match parts.next() {
+                Some(c) => c,
+                None => return errno::EINVAL,
+            };
+            let grant = proc_grant();
+            if !grant.allow.iter().any(|a| a == cmd) {
+                return errno::EACCES; // not in the node's allowlist
+            }
+            let args: std::vec::Vec<&str> = parts.collect();
+            let slot = match procs.iter().position(|s| !s.in_use) {
+                Some(i) => i,
+                None => return errno::ENOMEM,
+            };
+            // Scoped cwd + a declared (non-ambient) environment; Block policy →
+            // true end-to-end backpressure (a slow consumer throttles the child).
+            let policy = SpawnPolicy {
+                cwd: grant.root.clone(),
+                env_allow: grant.env_allow.clone(),
+            };
+            match ProcExecutor::spawn(OWNER_SYSTEM, cmd, &args, OverloadPolicy::Block, &policy) {
+                Ok(exec) => {
+                    procs[slot].exec = Some(exec);
+                    procs[slot].in_use = true;
+                    procs[slot].deadline = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_millis(grant.timeout_ms),
+                    );
+                    tag_fd(FD_TAG_PROC, slot as i32)
+                }
+                Err(_) => errno::ERROR,
+            }
+        }
+        PROC_READ => {
+            let slot = slot_of(handle) as usize;
+            if slot >= MAX_PROCS || !procs[slot].in_use || arg.is_null() || arg_len == 0 {
+                return errno::EINVAL;
+            }
+            let out = core::slice::from_raw_parts_mut(arg, arg_len);
+            match procs[slot].exec.as_ref().and_then(|e| e.poll_stdout(out)) {
+                Some(n) => n as i32,
+                None => 0, // nothing ready this step
+            }
+        }
+        PROC_STATUS => {
+            let slot = slot_of(handle) as usize;
+            if slot >= MAX_PROCS || !procs[slot].in_use {
+                return errno::EINVAL;
+            }
+            // Timeout: past the deadline, kill the child and report done — a runaway
+            // build can't wedge the pipe (bounds the blast radius, §5).
+            let timed_out = procs[slot]
+                .deadline
+                .is_some_and(|dl| std::time::Instant::now() >= dl);
+            if timed_out {
+                if let Some(e) = procs[slot].exec.as_mut() {
+                    e.shutdown(std::time::Duration::from_millis(50));
+                }
+                return 0;
+            }
+            let e = match procs[slot].exec.as_mut() {
+                Some(e) => e,
+                None => return errno::EINVAL,
+            };
+            // Done only when the child has exited AND both reader threads finished
+            // AND the inbound bridge is drained — otherwise a final in-flight chunk
+            // would be lost. 1 = more may come; 0 = truly done.
+            let running = e.alive() || !e.reader_finished() || e.stdout_pending() > 0;
+            i32::from(running)
+        }
+        PROC_CLOSE => {
+            let slot = slot_of(handle) as usize;
+            if slot < MAX_PROCS && procs[slot].in_use {
+                if let Some(mut e) = procs[slot].exec.take() {
+                    e.shutdown(std::time::Duration::from_millis(100));
+                }
+                procs[slot].in_use = false;
+                procs[slot].deadline = None;
+            }
+            0
+        }
+        _ => errno::ENOSYS,
+    }
+}
+
+// ============================================================================
 // linux_net built-in module — channel-based net_proto framing via libc sockets
 // ============================================================================
 

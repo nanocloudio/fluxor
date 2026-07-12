@@ -125,6 +125,12 @@ pub mod contract {
     /// (currently absent).
     pub const USB_HOST: u16 = 0x0015;
 
+    /// Host process executor — opcode class 0x16xx. The impure boundary: a
+    /// host-side provider (host-linux only) spawns a command and streams its
+    /// output. Gated by `requires_contract = "proc"`; a node without the grant
+    /// ENOSYS-denies. See sector `.context/architecture.md` §5.
+    pub const PROC: u16 = 0x0016;
+
     // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
     // constants — the alias just drops the prefix for callsite brevity.
@@ -354,6 +360,7 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
         _t if _t == fd::FD_TAG_STORAGE_NAMESPACE => Some(contract::STORAGE_NAMESPACE),
         _t if _t == fd::FD_TAG_STORAGE_OBJECT => Some(contract::STORAGE_OBJECT),
         _t if _t == fd::FD_TAG_HAL_PIO => Some(contract::HAL_PIO),
+        _t if _t == fd::FD_TAG_PROC => Some(contract::PROC),
         // USB host (scaffold). No live producer yet — the kernel-side
         // USB host stack is unimplemented, so `provider_open(USB_HOST,
         // ...)` never returns a tagged handle today. The lookup is

@@ -1,0 +1,43 @@
+# Edge HTTP serving (Linux hosted) — the first TCP-leased owned workload.
+#
+# One http module fronting an unprivileged TCP port as an owned workload:
+# fixed routes answer from the graph (health endpoints + a landing body),
+# everything else is 404. This is the delegation-class serving shape — the
+# graph serves bytes; cluster authority stays with the embedding host.
+#
+# The module list is the ownable substrate: `fluxor agent commit --bundle
+# <emitted bundle>` grants the pod a tcp/18080 lease and assigns it the http
+# module; linux_net stays system-owned. This is the dns_server example's
+# pattern with protocol byte 1 (tcp) — the stream side of the lease gate
+# (rfc_endpoint_lease.md §4.2 / linux_net_cmd_bind) exercised live.
+#
+# Run the full live check: examples/edge_server/linux_e2e.sh
+target: linux
+tick_us: 100
+
+# Bidirectional feedback pair: linux_net ⇄ http.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: http
+    port: 18080
+    host_tcp: 1
+    routes:
+      - path: "/healthz"
+        body: "ok"
+        content_type: "text/plain"
+      - path: "/readyz"
+        body: "ok"
+        content_type: "text/plain"
+      - path: "/"
+        body: "<html><body><h1>fluxor edge</h1><p>graph-hosted edge serving</p></body></html>"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
