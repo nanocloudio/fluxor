@@ -487,7 +487,11 @@ fn build_request(dst_ip: u32, path: &[u8], body: &[u8], req: &mut [u8]) -> usize
     putb(req, &mut pos, b"POST ");
     putb(req, &mut pos, path);
     putb(req, &mut pos, b" HTTP/1.1\r\nHost: ");
-    let ip = dst_ip.to_le_bytes(); // dst_ip stored LE per param convention
+    // `dst_ip` is held in network-order numeric form (for example
+    // 192.168.1.10 == 0xC0A8010A). CMD_CONNECT serializes that numeric value
+    // as a little-endian u32 for the internal NetProto contract, but the HTTP
+    // Host header must render the human/network-order octets.
+    let ip = dst_ip.to_be_bytes();
     push_dec(req, &mut pos, ip[0] as u32);
     putb(req, &mut pos, b".");
     push_dec(req, &mut pos, ip[1] as u32);
