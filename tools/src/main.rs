@@ -1387,7 +1387,7 @@ fn is_env_var_name(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn substitute_env_vars(input: &str) -> Result<String> {
+pub(crate) fn substitute_env_vars(input: &str) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
 
@@ -2261,9 +2261,25 @@ fn cmd_pack(
         .map(|bytes| bytes.len() >= 4 && &bytes[..4] == b"\0asm")
         .unwrap_or(false);
     let result = if is_wasm {
-        modules::pack_fmod_wasm(input, output, &module_name, module_type, manifest_path)?
+        // Standalone CLI pack has no build-target context: per-target
+        // capacity tables resolve via their `default` key.
+        modules::pack_fmod_wasm(
+            input,
+            output,
+            &module_name,
+            module_type,
+            manifest_path,
+            None,
+        )?
     } else {
-        pack_fmod(input, output, &module_name, module_type, manifest_path)?
+        pack_fmod(
+            input,
+            output,
+            &module_name,
+            module_type,
+            manifest_path,
+            None,
+        )?
     };
 
     if verbose {
@@ -5351,8 +5367,17 @@ fn cmd_sign(
     manifest.signature = Some([0u8; 64]);
     manifest.signer_fp = Some([0u8; 32]);
     let layout = manifest.to_bytes();
-    let var_size =
-        manifest.ports.len() * 4 + manifest.resources.len() * 4 + manifest.dependencies.len() * 8;
+    let var_size = manifest.ports.len() * 4
+        + manifest.resources.len() * 4
+        + manifest.dependencies.len() * 8
+        + if layout[14] & 0x20 != 0 {
+            // Port-capacity section (flag bit 5) sits before the hash —
+            // covered by the signing envelope. Must mirror the kernel
+            // verifier's offset math exactly.
+            manifest.ports.len() * 8
+        } else {
+            0
+        };
     let hash_offset = 16 + var_size;
     if hash_offset + 32 > layout.len() {
         return Err(Error::Module("manifest layout too small for hash".into()));

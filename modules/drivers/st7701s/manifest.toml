@@ -10,6 +10,7 @@ name = "pixels"
 direction = "input"
 content_type = "VideoRaster"
 required = false
+buffer_size = 4096
 
 [[resources]]
 requires_contract = "gpio"

@@ -1,0 +1,48 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser direct-decode video bridge. Reads a Matroska container from
+# `encoded`, demuxes it in the kernel (same clean-room mkv_demux the
+# PIC codec uses), and hands coded H.264/H.265 samples to the browser
+# shim's WebCodecs `VideoDecoder` — the platform (usually hardware)
+# decoder. Decoded frames present PTS-paced straight onto the page
+# canvas; HDR sources are tone-mapped by the browser's compositor.
+#
+# This is the wasm analogue of hardware-decode paths on other targets
+# (V4L2 stateless on the linux host, rpivid on cm5 — future). The
+# pure-Rust PIC `codec` module remains the software fallback for
+# Constrained Baseline H.264 where WebCodecs is unavailable.
+#
+# No output port: presentation is host-side (declare this module as
+# the display surface in `presentation:`).
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[params]]
+# tag 10 — coded width hint for VideoDecoder.configure.
+name = "width"
+type = "u16"
+required = true
+
+[[params]]
+# tag 11 — coded height hint.
+name = "height"
+type = "u16"
+required = true
+
+[[params]]
+# tag 12 — one-sample staging buffer cap. UHD remux I-frames run
+# several MB; 16 MiB default covers 4K BluRay-class streams.
+name = "max_frame_bytes"
+type = "u32"
+default = 16777216
+range = [65536, 67108864]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; carries media samples to WebCodecs, not a measurable on-device byte stream"

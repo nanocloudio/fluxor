@@ -7,23 +7,35 @@ hardware_targets = ["rp2350"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+# in[0]: net_in (from IP).
+buffer_size = 2048
 
 [[ports]]
 name = "mesh_rx"
 index = 1
 direction = "input"
 content_type = "OctetStream"
+# in[1]: from mesh.
+buffer_size = 256
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+# out[0]: net_out (to IP).
+buffer_size = 2048
+# NET_BUF_SIZE — frame assembly is bounded by the 1600-byte net_buf.
+max_record = 1600
 
 [[ports]]
 name = "mesh_tx"
 index = 1
 direction = "output"
 content_type = "OctetStream"
+# out[1]: to mesh.
+buffer_size = 256
+# CHAN_BUF_SIZE — mesh frames are guarded to total_frame <= 192.
+max_record = 192
 
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits

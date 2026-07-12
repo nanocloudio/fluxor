@@ -205,6 +205,12 @@ struct BankState {
     /// Bytes written to `out_chans[0]`. Surfaced in the heartbeat
     /// so an operator can see whether the producer side is flowing.
     total_bytes_emitted: u32,
+    /// `total_bytes_emitted` at the previous heartbeat + consecutive
+    /// heartbeats with no byte progress while a file is open — the
+    /// heartbeat's `stall=` field. Non-zero with `paused=0` and a
+    /// valid fd means the downstream is not draining.
+    hb_last_bytes: u32,
+    hb_stall: u16,
     /// FMP commands consumed from `ctrl_chan` (toggle / next / prev
     /// / select). Counterpart to `total_bytes_emitted` for the
     /// consumer side.
@@ -735,6 +741,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut t = 0;
             while t < cc.len() { *p.add(q) = cc[t]; q += 1; t += 1; }
             q += fmt_u32_raw(p.add(q), s.ctrl_chan as u32);
+            {
+                // stall= : heartbeats without byte progress while a
+                // file is open (0 = flowing).
+                if s.fs_fd >= 0 && s.total_bytes_emitted == s.hb_last_bytes {
+                    s.hb_stall = s.hb_stall.saturating_add(1);
+                } else {
+                    s.hb_stall = 0;
+                }
+                s.hb_last_bytes = s.total_bytes_emitted;
+                let st = b" stall=";
+                let mut t = 0;
+                while t < st.len() { *p.add(q) = st[t]; q += 1; t += 1; }
+                q += fmt_u32_raw(p.add(q), s.hb_stall as u32);
+            }
             dev_log(s.sys(), 3, p, q);
         }
 
@@ -896,34 +916,61 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 return 0;
             }
 
-            let poll_out = (s.sys().channel_poll)(s.out_chans[0], POLL_OUT);
-            if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 {
-                return 0;
-            }
-            let n = (s.sys().provider_call)(
-                s.fs_fd,
-                FS_READ,
-                s.buf.as_mut_ptr(),
-                BUF_SIZE,
-            );
-            if n > 0 {
-                let written = (s.sys().channel_write)(
-                    s.out_chans[0],
-                    s.buf.as_ptr(),
-                    n as usize,
-                );
-                if written > 0 {
-                    s.total_bytes_emitted =
-                        s.total_bytes_emitted.saturating_add(written as u32);
+            // Per-step transfer budget from the edge's rate class
+            // (MODULE_FLOW_BUDGET). Unclassed (control) edges get 0 →
+            // one chunk per step, the pacing the audio graphs are
+            // tuned around. Media graphs declare `rate:` on the
+            // stream edge and get a cadence-derived grant.
+            let grant = dev_flow_budget(s.sys(), 0);
+            let budget = if grant == 0 {
+                1
+            } else {
+                (grant as usize).div_ceil(BUF_SIZE).clamp(1, 64)
+            };
+            let mut moved_any = false;
+            let mut n: i32 = 0;
+            let mut hit_eof_or_err = false;
+            for _ in 0..budget {
+                let poll_out = (s.sys().channel_poll)(s.out_chans[0], POLL_OUT);
+                if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 {
+                    return if moved_any { 2 } else { 0 };
                 }
-                track_pending(written, n as usize, &mut s.pending_out, &mut s.pending_offset);
-                return 2; // Burst — keep stepping while there's data.
+                n = (s.sys().provider_call)(
+                    s.fs_fd,
+                    FS_READ,
+                    s.buf.as_mut_ptr(),
+                    BUF_SIZE,
+                );
+                if n > 0 {
+                    let written = (s.sys().channel_write)(
+                        s.out_chans[0],
+                        s.buf.as_ptr(),
+                        n as usize,
+                    );
+                    if written > 0 {
+                        s.total_bytes_emitted =
+                            s.total_bytes_emitted.saturating_add(written as u32);
+                    }
+                    track_pending(written, n as usize, &mut s.pending_out, &mut s.pending_offset);
+                    if (written as usize) < n as usize {
+                        // Ring filled mid-chunk; drain_pending picks up
+                        // the tail next step.
+                        return 2;
+                    }
+                    moved_any = true;
+                    continue;
+                }
+                hit_eof_or_err = true;
+                break;
+            }
+            if !hit_eof_or_err {
+                return 2; // Budget exhausted with data still flowing.
             }
             // EAGAIN: provider has no bytes ready but the file isn't
             // finished (async FS provider). Yield and re-read next
             // tick rather than treating "not ready" as EOF.
             if n == -11 {
-                return 0;
+                return if moved_any { 2 } else { 0 };
             }
             // EOF (n == 0) or hard error (n < 0): close and either
             // auto-advance or pause per policy.
@@ -954,20 +1001,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         0
     }
-}
-
-// ============================================================================
-// Channel Hints
-// ============================================================================
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: 256 }, // out[1]: bank notifications
-        ChannelHint { port_type: 2, port_index: 0, buffer_size: 256 }, // ctrl[0]: control events
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

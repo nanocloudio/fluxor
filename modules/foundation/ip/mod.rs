@@ -1296,63 +1296,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0
 }
 
-/// PIC module ABI entry: report per-port channel ring sizes to the loader.
-///
-/// # Safety
-/// `out` must be valid for writes of at least `max_len` bytes; the loader
-/// passes a buffer it owns and `write_channel_hints` re-checks the size
-/// against the hint table.
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_channel_hints"]
-pub unsafe extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    // Channel ring sizes are the per-tick burst budget for the IP
-    // pipeline. Default 2-4 KiB caps single-connection throughput
-    // at ~1-2 MSS / step; gigabit-class workloads need 8-16 KiB so
-    // the segmentation loop in NET_CMD_SEND can stage many MSS
-    // frames per step before back-pressuring the producer.
-    //
-    // **aarch64**: 32 KiB ETH rings (~21 MSS) + 16 KiB net rings
-    // (matches http's per-call stage). Roughly 1-cycle of cwnd at
-    // 1 ms RTT.
-    //
-    // **rp2350 / rp2040 / wasm32**: legacy 4 / 2 KiB.
-    #[cfg(target_arch = "aarch64")]
-    let eth_ring: u32 = 32768;
-    #[cfg(target_arch = "aarch64")]
-    let net_ring: u32 = 16384;
-    #[cfg(not(target_arch = "aarch64"))]
-    let eth_ring: u32 = 4096;
-    #[cfg(not(target_arch = "aarch64"))]
-    let net_ring: u32 = 2048;
-
-    let hints = [
-        ChannelHint {
-            port_type: 0,
-            port_index: 0,
-            buffer_size: eth_ring,
-        }, // in[0]: RX ethernet frames
-        ChannelHint {
-            port_type: 1,
-            port_index: 0,
-            buffer_size: eth_ring,
-        }, // out[0]: TX ethernet frames
-        ChannelHint {
-            port_type: 0,
-            port_index: 1,
-            buffer_size: net_ring,
-        }, // in[1]: net commands from consumer
-        ChannelHint {
-            port_type: 1,
-            port_index: 1,
-            buffer_size: net_ring,
-        }, // out[1]: net messages to consumer
-    ];
-    // SAFETY: `write_channel_hints` validates `max_len >= hints.len() *
-    // sizeof::<ChannelHint>()` and writes through `out` as plain bytes; the
-    // kernel passes a buffer it owns and has sized via the same struct.
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_in_place_safe"]
 pub extern "C" fn module_in_place_safe() -> u32 {

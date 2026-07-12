@@ -1,8 +1,9 @@
 # codec Module
 
-Unified essence decoder for the rp2350 target. Dispatches at runtime
-between audio-essence sub-codecs (`wav_codec`, `mp3_codec`, `aac_codec`)
-and image-essence (`image_codec`) by sniffing the encoded payload's
+Unified essence decoder. Dispatches at runtime between audio-essence
+sub-codecs (`wav_codec`, `mp3_codec`, `aac_codec`), image-essence
+(`image_codec`), and video-essence (`mkv_h264` — Matroska container +
+H.264 Constrained Baseline) by sniffing the encoded payload's
 container/magic.
 
 ## Surface contract
@@ -24,7 +25,13 @@ side simply leaves the other unwired.
 - `aac_codec.rs` — AudioSample producer (AAC)
 - `mp3_codec.rs` — AudioSample producer (MP3)
 - `wav_codec.rs` — AudioSample producer (WAV / PCM)
-- `image_codec.rs` — VideoRaster producer (JPEG / PNG)
+- `image_codec.rs` — VideoRaster producer (BMP / GIF / PNG / JPEG)
+- `mkv_h264.rs` — VideoRaster producer (MKV/H.264 video); glues the
+  demuxer to the decoder and owns the RGB565 emit path
+- `mkv_demux.rs` — clean-room Matroska/EBML incremental demuxer
+- `h264/` — H.264 Constrained-Baseline decoder, mechanical Rust port
+  of h264bsd (AOSP/Hantro, Apache-2.0). Bit-exact against ffmpeg on
+  the verification corpus; see `.context/h264_mkv_codec_plan.md`
 
 ## Interface (manifest)
 

@@ -22,6 +22,9 @@ content_type = "AudioSample"
 name = "sip_net_out"
 direction = "output"
 content_type = "OctetStream"
+# SLOT_SIZE (160) * 4. max_record omitted: sip_flush stages up to a
+# full NET_BUF_SIZE frame, which is not bounded below this ring.
+buffer_size = 640
 
 [[ports]]
 name = "jitter_net_out"

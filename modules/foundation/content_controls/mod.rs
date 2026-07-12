@@ -789,25 +789,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        // raster: one RGB565 frame is written atomically, so the buffer must
-        // hold a whole frame (≈ width*height*2). 96 KiB covers a 240×80 panel
-        // (38 400 B) with headroom up to ~256×192.
-        ChannelHint {
-            port_type: 1,
-            port_index: 0,
-            buffer_size: 96 * 1024,
-        },
-        ChannelHint {
-            port_type: 1,
-            port_index: 1,
-            buffer_size: 64,
-        }, // commands (FMP)
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
 include!("../../sdk/wasm_entry.rs");

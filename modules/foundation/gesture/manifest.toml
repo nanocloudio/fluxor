@@ -10,12 +10,18 @@ name = "raw"
 direction = "input"
 content_type = "OctetStream"
 required = true
+# in[0]: raw 0/1 bytes.
+buffer_size = 64
 
 [[ports]]
 name = "commands"
 direction = "output"
 content_type = "FmpMessage"
 required = true
+# out[0]: FMP commands.
+buffer_size = 256
+# msg_write_empty: 6-byte FMP header, no payload.
+max_record = 6
 
 [commands]
 emits = ["next", "prev", "toggle", "select", "long_press", "on", "off"]

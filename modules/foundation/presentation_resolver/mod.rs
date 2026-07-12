@@ -574,19 +574,4 @@ fn try_emit(s: &mut State, sys: &SyscallTable) -> bool {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        // layout: a whole record is written atomically; size the buffer to hold
-        // the largest the fixed arrays can produce (OUT_BUF), with headroom.
-        ChannelHint {
-            port_type: 1,
-            port_index: 0,
-            buffer_size: 1024,
-        },
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
 include!("../../sdk/wasm_entry.rs");

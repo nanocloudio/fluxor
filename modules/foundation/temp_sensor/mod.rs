@@ -228,19 +228,6 @@ const TIMER_CREATE: u32 = 0x0604;
 const TIMER_SET:    u32 = 0x0605;
 
 // ============================================================================
-// Channel Hints
-// ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 64 }, // out[0]: temp readings (4 bytes each)
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
-// ============================================================================
 // Panic Handler
 // ============================================================================
 

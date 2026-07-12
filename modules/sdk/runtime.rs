@@ -721,55 +721,6 @@ pub fn track_pending(written: i32, total: usize, pending_out: &mut u16, pending_
 // Channel Hints
 // ============================================================================
 
-/// Declares per-port buffer size requirements for a module.
-///
-/// Modules export `module_channel_hints(out, max_len) -> count` to tell the
-/// kernel how large each port's channel buffer should be. Without hints,
-/// all ports get the default kernel buffer size.
-///
-/// `buffer_size` is `u32` so chunky producers — e.g. a full 256x192
-/// RGB565 frame at 98,304 B — can request more than 64 KiB. The
-/// natural `#[repr(C)]` alignment of `u32` inserts 2 bytes of padding
-/// between `port_index` and `buffer_size`, giving an 8-byte struct;
-/// `write_channel_hints` zero-fills those bytes on the wire.
-#[repr(C)]
-pub struct ChannelHint {
-    /// Port direction: 0=in, 1=out, 2=ctrl
-    pub port_type: u8,
-    /// Port index within that direction
-    pub port_index: u8,
-    /// Requested buffer size in bytes (0 = use default).
-    pub buffer_size: u32,
-}
-
-/// Write channel hints to output buffer. Returns number of hints written,
-/// or -1 if the buffer is too small.
-///
-/// # Safety
-/// `out` must point to a buffer of at least `max_len` bytes.
-#[inline(always)]
-pub unsafe fn write_channel_hints(out: *mut u8, max_len: usize, hints: &[ChannelHint]) -> i32 {
-    let needed = hints.len() * CHANNEL_HINT_WIRE_BYTES;
-    if needed > max_len {
-        return -1;
-    }
-    let mut offset = 0;
-    for hint in hints {
-        *out.add(offset) = hint.port_type;
-        *out.add(offset + 1) = hint.port_index;
-        // Reserved bytes — must be zero on the wire.
-        *out.add(offset + 2) = 0;
-        *out.add(offset + 3) = 0;
-        let sz = hint.buffer_size.to_le_bytes();
-        *out.add(offset + 4) = sz[0];
-        *out.add(offset + 5) = sz[1];
-        *out.add(offset + 6) = sz[2];
-        *out.add(offset + 7) = sz[3];
-        offset += CHANNEL_HINT_WIRE_BYTES;
-    }
-    hints.len() as i32
-}
-
 // ============================================================================
 // Panic handler
 // ============================================================================
@@ -989,6 +940,18 @@ unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
     (sys.provider_call)(-1, 0x0603, buf.as_mut_ptr(), 8);
     u64::from_le_bytes(buf)
+}
+
+/// Per-step flow-budget grant for one of this module's output ports
+/// (MODULE_FLOW_BUDGET 0x0C46). Returns 0 when the wired edge
+/// carries no streaming rate class; callers keep their own
+/// unit-per-step pacing in that case.
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[inline(always)]
+unsafe fn dev_flow_budget(sys: &SyscallTable, port_index: u8) -> u32 {
+    let arg = [port_index];
+    let r = (sys.provider_call)(-1, 0x0C46, arg.as_ptr() as *mut u8, 1);
+    if r > 0 { r as u32 } else { 0 }
 }
 
 /// Log a message (kernel primitive LOG_WRITE, opcode 0x0C40). Level encoded as handle.

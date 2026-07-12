@@ -5,12 +5,18 @@ hardware_targets = ["bcm2712"]
 name = "frames_tx"
 direction = "input"
 content_type = "EthernetFrame"
+# in[0]: frames from ip.
+buffer_size = 4096
 
 [[ports]]
 name = "frames_rx"
 direction = "output"
 content_type = "EthernetFrame"
 required = true
+# out[0]: frames to ip.
+buffer_size = 4096
+# MAX_FRAME_SIZE — one ethernet frame per write.
+max_record = 1514
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

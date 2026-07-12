@@ -17,11 +17,17 @@ name = "notify"
 index = 1
 direction = "output"
 content_type = "FmpMessage"
+# Bank notifications.
+buffer_size = 256
+# msg_write: 6-byte FMP header + 6-byte status payload.
+max_record = 12
 
 [[ports]]
 name = "commands"
 direction = "ctrl_input"
 content_type = "FmpMessage"
+# Control events.
+buffer_size = 256
 
 [[resources]]
 requires_contract = "fs"

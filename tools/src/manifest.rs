@@ -340,16 +340,20 @@ pub struct PortSpec {
     /// Explicit port index within its direction group (default: sequential).
     pub index: u8,
     /// Requested channel ring capacity in bytes (0 = kernel default).
-    /// Serialized in the flag-bit-5 port-capacity section; replaces the
-    /// former `module_channel_hints` runtime code export (RFC flow
-    /// budgets §3.1) so capacity is knowable statically — including for
-    /// wasm payloads, whose packed export tables are empty.
+    /// Serialized in the flag-bit-5 port-capacity section so capacity
+    /// is knowable statically — including for wasm payloads, whose
+    /// packed export tables are empty.
     pub buffer_size: u32,
     /// Largest single `channel_write` this port issues (0 = undeclared).
     /// `channel_write` is all-or-nothing: a record larger than the ring
     /// can NEVER succeed, so the loader refuses at graph load any wiring
     /// where `max_record` exceeds the granted ring.
     pub max_record: u32,
+    /// Fastest rate class this port's step logic is engineered for.
+    /// Tools-side only (not serialized): wiring a faster-class edge
+    /// into the port fails `fluxor build` instead of stalling at
+    /// runtime. `None` = undeclared = unchecked.
+    pub rate_class_max: Option<fluxor_contracts::RateClass>,
 }
 
 #[derive(Debug, Clone)]
@@ -933,6 +937,13 @@ impl Manifest {
     }
 
     /// Look up a port by direction and index. Returns content_type if found.
+    /// Full port record by direction + resolved index.
+    pub fn find_port_spec(&self, direction: u8, index: u8) -> Option<&PortSpec> {
+        self.ports
+            .iter()
+            .find(|p| p.direction == direction && p.index == index)
+    }
+
     pub fn find_port(&self, direction: u8, index: u8) -> Option<u8> {
         self.ports.iter().find_map(|p| {
             if p.direction == direction && p.index == index {
@@ -1031,6 +1042,13 @@ impl Manifest {
 
     /// Parse manifest from a TOML file.
     pub fn from_toml(path: &Path) -> Result<Self> {
+        Self::from_toml_for_target(path, None)
+    }
+
+    /// Target-aware TOML load: per-target capacity tables resolve
+    /// against `silicon` (falling back to their `default` key). A
+    /// `None` silicon resolves `default` only.
+    pub fn from_toml_for_target(path: &Path, silicon: Option<&str>) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Module(format!("cannot read {}: {}", path.display(), e)))?;
         let toml_val: TomlManifest = toml::from_str(&content)
@@ -1090,8 +1108,25 @@ impl Manifest {
                 flags,
                 name: p.name,
                 index,
-                buffer_size: p.buffer_size.unwrap_or(0),
-                max_record: p.max_record.unwrap_or(0),
+                buffer_size: match &p.buffer_size {
+                    Some(v) => v.resolve(silicon, "buffer_size")?,
+                    None => 0,
+                },
+                max_record: match &p.max_record {
+                    Some(v) => v.resolve(silicon, "max_record")?,
+                    None => 0,
+                },
+                rate_class_max: match &p.rate_class_max {
+                    Some(r) => {
+                        Some(fluxor_contracts::RateClass::from_str_opt(r).ok_or_else(|| {
+                            Error::Module(format!(
+                                "unknown rate_class_max '{r}' \
+                                 (control | audio | video | bulk)"
+                            ))
+                        })?)
+                    }
+                    None => None,
+                },
             });
         }
 
@@ -1375,7 +1410,11 @@ impl Manifest {
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
-            + if has_port_capacity { self.ports.len() * 8 } else { 0 }
+            + if has_port_capacity {
+                self.ports.len() * 8
+            } else {
+                0
+            }
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -1570,6 +1609,7 @@ impl Manifest {
                 index: data[offset + 3],
                 buffer_size: 0,
                 max_record: 0,
+                rate_class_max: None,
             });
             offset += 4;
         }
@@ -2011,6 +2051,50 @@ struct TomlParam {
     required: bool,
 }
 
+/// A capacity value in port TOML: either flat (`buffer_size = 4096`)
+/// or per-target (`buffer_size = { default = 2048, bcm2712 = 16384 }`),
+/// resolved at pack time — the packer knows which silicon it is
+/// packing for. Keys are silicon ids (`rp2040`, `rp2350`, `bcm2712`,
+/// `wasm`) plus `default`; unknown keys are rejected so a typo can't
+/// silently fall back to `default`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CapacityValue {
+    Flat(u32),
+    PerTarget(std::collections::BTreeMap<String, u32>),
+}
+
+const CAPACITY_TARGET_KEYS: &[&str] = &["default", "rp2040", "rp2350", "bcm2712", "wasm"];
+
+impl CapacityValue {
+    fn resolve(&self, silicon: Option<&str>, field: &str) -> Result<u32> {
+        match self {
+            CapacityValue::Flat(v) => Ok(*v),
+            CapacityValue::PerTarget(map) => {
+                for k in map.keys() {
+                    if !CAPACITY_TARGET_KEYS.contains(&k.as_str()) {
+                        return Err(Error::Module(format!(
+                            "unknown target '{k}' in per-target `{field}` \
+                             (known: {CAPACITY_TARGET_KEYS:?})"
+                        )));
+                    }
+                }
+                if let Some(sil) = silicon {
+                    if let Some(v) = map.get(sil) {
+                        return Ok(*v);
+                    }
+                }
+                map.get("default").copied().ok_or_else(|| {
+                    Error::Module(format!(
+                        "per-target `{field}` has no entry for target {:?} and no `default`",
+                        silicon.unwrap_or("<none>")
+                    ))
+                })
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct TomlPort {
     direction: String,
@@ -2018,8 +2102,9 @@ struct TomlPort {
     required: Option<bool>,
     name: Option<String>,
     index: Option<u8>,
-    buffer_size: Option<u32>,
-    max_record: Option<u32>,
+    buffer_size: Option<CapacityValue>,
+    max_record: Option<CapacityValue>,
+    rate_class_max: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2069,6 +2154,7 @@ mod tests {
             index: 0,
             buffer_size: 65536,
             max_record: 0,
+            rate_class_max: None,
         });
         m.ports.push(PortSpec {
             direction: 1,
@@ -2078,6 +2164,7 @@ mod tests {
             index: 0,
             buffer_size: 1048576,
             max_record: 16384,
+            rate_class_max: None,
         });
         let bytes = m.to_bytes();
         assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
@@ -2091,7 +2178,7 @@ mod tests {
         assert_eq!(back.ports[1].buffer_size, 1048576);
         assert_eq!(back.ports[1].max_record, 16384);
 
-        // No capacities → no section, no flag, legacy-identical layout.
+        // No capacities → no section, no flag set.
         let mut plain = Manifest::default();
         plain.ports.push(PortSpec {
             direction: 0,
@@ -2101,6 +2188,7 @@ mod tests {
             index: 0,
             buffer_size: 0,
             max_record: 0,
+            rate_class_max: None,
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
@@ -2215,6 +2303,7 @@ mod tests {
             index: 0,
             buffer_size: 0,
             max_record: 0,
+            rate_class_max: None,
         });
         m.resources.push(ResourceClaim {
             device_class: 0x04,

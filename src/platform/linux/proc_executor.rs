@@ -204,7 +204,10 @@ impl ProcExecutor {
     /// is still in flight from the pipe to the bridge).
     pub fn reader_finished(&self) -> bool {
         self.reader.as_ref().map_or(true, |h| h.is_finished())
-            && self.stderr_reader.as_ref().map_or(true, |h| h.is_finished())
+            && self
+                .stderr_reader
+                .as_ref()
+                .map_or(true, |h| h.is_finished())
     }
 
     /// Bytes still buffered in the inbound (stdout) bridge, not yet drained by

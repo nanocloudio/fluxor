@@ -6,6 +6,8 @@ name = "brightness"
 direction = "input"
 content_type = "OctetStream"
 required = true
+# in[0]: brightness bytes.
+buffer_size = 64
 
 [[resources]]
 requires_contract = "pwm"

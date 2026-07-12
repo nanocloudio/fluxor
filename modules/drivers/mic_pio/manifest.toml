@@ -5,6 +5,10 @@ hardware_targets = ["rp2350"]
 name = "audio"
 direction = "output"
 content_type = "AudioSample"
+# OUT_BUF_SIZE = pio::RX_BUFFER_WORDS * 4 = 2048; writes emit up to one
+# full io_buf per tick.
+buffer_size = 2048
+max_record = 2048
 
 [[resources]]
 requires_contract = "pio"

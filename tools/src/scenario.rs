@@ -1075,7 +1075,9 @@ fn synthesise_host_routes(
             ))
         })?;
         let shims_path = work_dir.join("host_shims.js");
-        fs::write(&shims_path, canonical_host_shims_js_body()).map_err(|e| {
+        // Served from disk as raw bytes (fs_path route) — no config
+        // loader ever substitutes this file, so write it UNESCAPED.
+        fs::write(&shims_path, CANONICAL_HOST_SHIMS_JS_RAW).map_err(|e| {
             Error::Config(format!(
                 "scenario {}: cannot write {}: {}",
                 scenario_path.display(),

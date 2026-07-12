@@ -144,6 +144,7 @@ name = "fluxor"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "fluxor-contracts",
  "libc",
  "log",
  "portable-atomic",
@@ -151,6 +152,10 @@ dependencies = [
  "sha2",
  "toml",
 ]
+
+[[package]]
+name = "fluxor-contracts"
+version = "0.1.0"
 
 [[package]]
 name = "fluxor-mod-codec"

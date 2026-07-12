@@ -3289,93 +3289,110 @@ unsafe fn step_send_file(s: &mut HttpState) -> i32 {
 /// when empty, calls `FS_READ` for the next chunk. Closes the FD and
 /// transitions to `CloseConn` when `fs_sent == fs_total` (or FS_READ
 /// returns ≤ 0).
+///
+/// Runs up to `FS_SEND_ROUNDS` fill+send cycles per step — a single
+/// 4 KiB round per step caps serving around 2 MB/s under the
+/// scheduler's burst budget, an order of magnitude short of media
+/// streaming. Backpressure exits immediately (net_send returning 0
+/// ends the loop), so slow consumers see one-round pacing.
 unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
-    if cur_fs_fd(s) < 0 {
-        if let Some(cur) = cur_slot_mut(s) {
-            cur.phase = Phase::CloseConn;
-        }
-        return 0;
-    }
-    if cur_send_offset(s) >= cur_send_len(s) {
-        // `fs_total == u32::MAX` is the streaming sentinel — read
-        // until FS_READ signals EOF below. Otherwise close out once
-        // the declared content length is reached.
-        let length_known = cur_fs_total(s) != u32::MAX;
-        if length_known && cur_fs_sent(s) >= cur_fs_total(s) {
-            let sys = &*s.syscalls;
-            (sys.provider_call)(
-                cur_fs_fd(s),
-                0x0903, // FS_CLOSE
-                core::ptr::null_mut(),
-                0,
-            );
-            if let Some(cur) = cur_slot_mut(s) {
-                cur.fs_fd = -1;
-            }
-            // Self-delimited (Content-Length already emitted) — honour
-            // the client's keep-alive intent.
-            finish_response(s);
-            return 0;
-        }
-        // Refill: streaming reads a full SEND_BUF; length-known caps
-        // at the remaining bytes so we never over-read.
-        let sys = &*s.syscalls;
-        let want = SEND_BUF_SIZE as u32;
-        let cap = if length_known {
-            let remaining = cur_fs_total(s).saturating_sub(cur_fs_sent(s));
-            (if remaining < want { remaining } else { want }) as usize
-        } else {
-            want as usize
-        };
-        let n = (sys.provider_call)(
-            cur_fs_fd(s),
-            0x0901, // FS_READ
-            cur_send_buf_mut_ptr(s),
-            cap,
-        );
-        // EAGAIN: provider has no bytes ready but the stream isn't
-        // done. Yield; the next step re-polls. Distinguishing this
-        // from EOF matters — closing on a not-yet-ready read would
-        // truncate every async-backed file.
-        if n == -11 {
-            return 0;
-        }
-        if n <= 0 {
-            (sys.provider_call)(
-                cur_fs_fd(s),
-                0x0903, // FS_CLOSE
-                core::ptr::null_mut(),
-                0,
-            );
-            if let Some(cur) = cur_slot_mut(s) {
-                cur.fs_fd = -1;
-            }
+    const FS_SEND_ROUNDS: usize = 16;
+    let mut progressed = false;
+    for _ in 0..FS_SEND_ROUNDS {
+        if cur_fs_fd(s) < 0 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::CloseConn;
             }
             return 0;
         }
-        if let Some(cur) = cur_slot_mut(s) {
-            cur.send_offset = 0;
+        if cur_send_offset(s) >= cur_send_len(s) {
+            // `fs_total == u32::MAX` is the streaming sentinel — read
+            // until FS_READ signals EOF below. Otherwise close out once
+            // the declared content length is reached.
+            let length_known = cur_fs_total(s) != u32::MAX;
+            if length_known && cur_fs_sent(s) >= cur_fs_total(s) {
+                let sys = &*s.syscalls;
+                (sys.provider_call)(
+                    cur_fs_fd(s),
+                    0x0903, // FS_CLOSE
+                    core::ptr::null_mut(),
+                    0,
+                );
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.fs_fd = -1;
+                }
+                // Self-delimited (Content-Length already emitted) — honour
+                // the client's keep-alive intent.
+                finish_response(s);
+                return 0;
+            }
+            // Refill: streaming reads a full SEND_BUF; length-known caps
+            // at the remaining bytes so we never over-read.
+            let sys = &*s.syscalls;
+            let want = SEND_BUF_SIZE as u32;
+            let cap = if length_known {
+                let remaining = cur_fs_total(s).saturating_sub(cur_fs_sent(s));
+                (if remaining < want { remaining } else { want }) as usize
+            } else {
+                want as usize
+            };
+            let n = (sys.provider_call)(
+                cur_fs_fd(s),
+                0x0901, // FS_READ
+                cur_send_buf_mut_ptr(s),
+                cap,
+            );
+            // EAGAIN: provider has no bytes ready but the stream isn't
+            // done. Yield; the next step re-polls. Distinguishing this
+            // from EOF matters — closing on a not-yet-ready read would
+            // truncate every async-backed file.
+            if n == -11 {
+                return if progressed { 2 } else { 0 };
+            }
+            if n <= 0 {
+                (sys.provider_call)(
+                    cur_fs_fd(s),
+                    0x0903, // FS_CLOSE
+                    core::ptr::null_mut(),
+                    0,
+                );
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.fs_fd = -1;
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::CloseConn;
+                }
+                return 0;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset = 0;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_len = n as u16;
+            }
         }
-        if let Some(cur) = cur_slot_mut(s) {
-            cur.send_len = n as u16;
-        }
-    }
 
-    let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
-    let ptr = cur_send_buf_ptr(s).add(cur_send_offset(s) as usize);
-    let sent = net_send(s, ptr, remaining);
-    if sent > 0 {
-        if let Some(cur) = cur_slot_mut(s) {
-            cur.send_offset += sent as u16;
+        let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
+        let ptr = cur_send_buf_ptr(s).add(cur_send_offset(s) as usize);
+        let sent = net_send(s, ptr, remaining);
+        if sent > 0 {
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset += sent as u16;
+            }
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.fs_sent = cur.fs_sent.wrapping_add(sent as u32);
+            }
+            progressed = true;
+            if (sent as usize) < remaining {
+                // Net ring filled mid-buffer — no point retrying now.
+                return 2;
+            }
+            continue;
         }
-        if let Some(cur) = cur_slot_mut(s) {
-            cur.fs_sent = cur.fs_sent.wrapping_add(sent as u32);
-        }
-        return 2;
+        // Net backpressure with nothing accepted this round.
+        return if progressed { 2 } else { 0 };
     }
-    0
+    2
 }
 
 // ── Per-tick step machine ──────────────────────────────────────────────────

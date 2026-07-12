@@ -101,6 +101,9 @@ mod fetch;
 #[path = "wasm/image_codec.rs"]
 mod image_codec;
 
+#[path = "wasm/video_codec.rs"]
+mod video_codec;
+
 #[path = "wasm/fs.rs"]
 mod fs;
 
@@ -360,6 +363,7 @@ const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
 const WASM_BROWSER_WS_SOURCE_HASH: u32 = fnv1a32(b"wasm_browser_ws_source");
 const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
 const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
+const WASM_BROWSER_VIDEO_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_video_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
 const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 = fnv1a32(b"wasm_browser_touch_gamepad_overlay");
 const WASM_BROWSER_GPU_HASH: u32 = fnv1a32(b"wasm_browser_gpu");
@@ -974,6 +978,44 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_image_codec (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_VIDEO_CODEC_HASH {
+            // WebCodecs direct-decode bridge. `max_frame_bytes` sizes
+            // the one-sample staging buffer (a UHD remux I-frame can
+            // run several MB).
+            let mut width = 0u16;
+            let mut height = 0u16;
+            let mut max_frame_bytes = 16u32 * 1024 * 1024;
+            walk_tlv(entry.params(), |tag, value| match tag {
+                10 => width = tlv_u32(value) as u16,
+                11 => height = tlv_u32(value) as u16,
+                12 => max_frame_bytes = tlv_u32(value),
+                _ => {}
+            });
+            let heap_bytes = video_codec::heap_size_for(max_frame_bytes);
+            if !init_builtin_heap_sized(module_idx, heap_bytes) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_video_codec: STATE_ARENA full, skipping",
+                    heap_bytes as u64,
+                );
+                continue;
+            }
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let m = video_codec::build(in_chan, width, height, max_frame_bytes);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_video_codec (built-in)",
                 0,
             );
             continue;
@@ -1774,12 +1816,28 @@ fn tick_sink_step(state: *mut u8) -> i32 {
 
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
-    let msg = b"[wasm-kernel] panic";
-    // SAFETY: wasm imports; we pass a static byte array and its length.
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    // Surface the panic location — "[wasm-kernel] panic" alone has
+    // cost real debugging time. (The payload itself needs fmt
+    // machinery; file:line is enough to find the site.)
+    let mut buf = [0u8; 160];
+    let mut pos = 0usize;
+    pos = append_str(&mut buf, pos, b"[wasm-kernel] panic at ");
+    if let Some(loc) = info.location() {
+        let file = loc.file().as_bytes();
+        let tail = if file.len() > 80 {
+            &file[file.len() - 80..]
+        } else {
+            file
+        };
+        pos = append_str(&mut buf, pos, tail);
+        pos = append_str(&mut buf, pos, b":");
+        pos = append_u64(&mut buf, pos, loc.line() as u64);
+    }
+    // SAFETY: wasm imports; we pass a stack buffer and its length.
     unsafe {
-        host_log(4, msg.as_ptr(), msg.len());
-        host_panic(msg.as_ptr(), msg.len())
+        host_log(4, buf.as_ptr(), pos);
+        host_panic(buf.as_ptr(), pos)
     }
 }
 

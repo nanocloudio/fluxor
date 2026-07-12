@@ -553,16 +553,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0 // Continue
 }
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 4096 }, // in[0]: frames from ip
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 4096 }, // out[0]: frames to ip
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.

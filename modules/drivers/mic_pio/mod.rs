@@ -366,19 +366,6 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
 }
 
 // ============================================================================
-// Channel Hints
-// ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: OUT_BUF_SIZE as u32 },
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
-// ============================================================================
 // Panic Handler
 // ============================================================================
 

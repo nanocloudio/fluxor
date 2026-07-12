@@ -22,6 +22,12 @@ content_type = "SurfaceTraits"
 name = "layout"
 direction = "output"
 content_type = "PresentationLayout"
+# layout: a whole record is written atomically; size the buffer to hold
+# the largest the fixed arrays can produce (OUT_BUF), with headroom.
+buffer_size = 1024
+# OUT_BUF = LAYOUT_HEADER_LEN (8) + MAX_CONTROLS (16) * 4
+#         + MAX_CONTROLS * (1 + MAX_BTN_LEN (24)) = 472.
+max_record = 472
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

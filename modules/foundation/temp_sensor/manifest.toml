@@ -5,6 +5,9 @@ hardware_targets = ["rp2350"]
 name = "reading"
 direction = "output"
 content_type = "OctetStream"
+# out[0]: temp readings (4 bytes each).
+buffer_size = 64
+max_record = 4
 
 [[resources]]
 requires_contract = "adc"

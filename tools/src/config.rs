@@ -551,6 +551,8 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     let to_port_index = port_byte & 0x0F;
     // bytes 4-7: buffer_bytes u32 LE.
     let buffer_bytes = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+    // byte 8: rate_class (absent in truncated slices → control).
+    let rate_class = entry.get(8).copied().unwrap_or(0);
     let mut edge = serde_json::Map::new();
     edge.insert("from_id".into(), json!(from_id));
     edge.insert("to_id".into(), json!(to_id));
@@ -576,6 +578,17 @@ fn decode_graph_edge(entry: &[u8]) -> Value {
     }
     if buffer_bytes != 0 {
         edge.insert("buffer_bytes".into(), json!(buffer_bytes));
+    }
+    if rate_class != 0 {
+        let rc = fluxor_contracts::RateClass::from_str_opt(match rate_class {
+            1 => "audio",
+            2 => "video",
+            3 => "bulk",
+            _ => "control",
+        });
+        if let Some(rc) = rc {
+            edge.insert("rate".into(), json!(rc.as_str()));
+        }
     }
     Value::Object(edge)
 }
@@ -1170,10 +1183,11 @@ impl ConfigBuilder {
 // Graph Config (Version 3+)
 // =============================================================================
 
-/// Graph edge size in bytes (8 = 4-byte fixed header + 4-byte
-/// `buffer_bytes` u32 LE override). Mirrors
-/// `kernel::config::GRAPH_EDGE_SIZE`; the layout is documented there.
-const GRAPH_EDGE_SIZE: usize = 8;
+/// Graph edge size in bytes (12 = 4-byte fixed header + 4-byte
+/// `buffer_bytes` u32 LE override + rate_class u8 + 3 reserved).
+/// Mirrors `kernel::config::GRAPH_EDGE_SIZE`; the layout is
+/// documented there.
+const GRAPH_EDGE_SIZE: usize = 12;
 /// Maximum number of graph edges. Raised from 64 to 128 to fit the
 /// Quantum graph (114 edges).
 const MAX_GRAPH_EDGES: usize = 128;
@@ -4679,7 +4693,207 @@ fn validate_required_inputs_wired(
     Ok(())
 }
 
-/// Validate content-type compatibility for all wiring edges.
+/// Resolve one edge's rate class: per-edge `rate:` override, else
+/// the consumer port's content-type default, else the producer's,
+/// else control. Shared by the wiring-capacity validator and the
+/// binary edge emitter.
+fn resolve_edge_rate_class(
+    wiring_entry: Option<&Value>,
+    from_port: Option<&crate::manifest::PortSpec>,
+    to_port_spec: Option<&crate::manifest::PortSpec>,
+) -> Result<fluxor_contracts::RateClass> {
+    use fluxor_contracts::{RateClass, CONTENT_RATE_CLASS};
+    if let Some(r) = wiring_entry
+        .and_then(|e| e.get("rate"))
+        .and_then(|v| v.as_str())
+    {
+        return RateClass::from_str_opt(r).ok_or_else(|| {
+            Error::Config(format!(
+                "unknown rate class '{r}' (control | audio | video | bulk)"
+            ))
+        });
+    }
+    let ct_class = |spec: Option<&crate::manifest::PortSpec>| {
+        spec.and_then(|p| CONTENT_RATE_CLASS.get(p.content_type as usize))
+            .copied()
+    };
+    Ok(ct_class(to_port_spec)
+        .or_else(|| ct_class(from_port))
+        .unwrap_or(RateClass::Control))
+}
+
+/// Per-edge capacity + rate-class validation.
+///
+/// Static mirror of the runtime `open_channels` enforcement, using
+/// the manifests' static port capacities: for every FIFO edge, model
+/// the ring the kernel will grant and check
+///   1. producer `max_record` fits it (wedge exclusion — an
+///      all-or-nothing write larger than the ring can never succeed);
+///   2. no request exceeds the 2 MiB channel ceiling;
+///   3. the edge's rate class is satisfiable on this profile at all;
+///   4. class floor ≤ ring × nominal tick rate (a necessary-condition
+///      screen for order-of-magnitude misprovisioning, NOT a proof of
+///      sufficiency — module step logic is P3's business).
+///
+/// Edge class = per-edge `rate:` override, else the consumer port's
+/// content-type default (`CONTENT_RATE_CLASS`), else the producer's.
+/// Grouped (mailbox) edges are skipped — their capacity story is the
+/// buffer-group max, validated by the runtime group pass.
+fn validate_wiring_capacity(
+    config: &Value,
+    edges: &[(u8, u8, u8, u8, u8)],
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    from_specs: &[String],
+    to_specs: &[String],
+    embedded_profile: bool,
+) -> Result<()> {
+    use fluxor_contracts::{rate_class_floor, RateClass};
+
+    const MIN_CHAN_BYTES: u32 = 64;
+    const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+    const DEFAULT_RING: u32 = 8192; // kernel default (abi CHANNEL_BUFFER_SIZE)
+
+    let tick_us = config
+        .get("tick_us")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(1000)
+        .max(1);
+    let ticks_per_sec = 1_000_000u64 / tick_us;
+
+    let wiring = config
+        .get("wiring")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for (i, &(_, _, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
+        let entry = wiring.get(i);
+        let buffer_group = entry
+            .and_then(|e| e.get("buffer_group"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if buffer_group != 0 {
+            continue; // mailbox/group-max semantics — runtime validates
+        }
+        let buffer_bytes = entry
+            .and_then(|e| e.get("buffer_bytes"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let from_name = &module_names[edges[i].0 as usize];
+        let to_name = &module_names[edges[i].1 as usize];
+        let from_port = manifests
+            .get(from_name)
+            .and_then(|m| m.find_port_spec(1, from_port_index));
+        let to_direction = if to_port == 1 { 2u8 } else { 0u8 };
+        let to_port_spec = manifests
+            .get(to_name)
+            .and_then(|m| m.find_port_spec(to_direction, to_port_index));
+
+        // Resolve the edge's rate class (shared helper — the same
+        // resolution feeds the binary edge emitter).
+        let class = resolve_edge_rate_class(entry, from_port, to_port_spec).map_err(|e| {
+            Error::Config(format!(
+                "wiring[{i}] ({} → {}): {e}",
+                from_specs[i], to_specs[i]
+            ))
+        })?;
+
+        // A producer port may cap the class its step logic is
+        // engineered for; a faster edge fails at build.
+        if let Some(cap) = from_port.and_then(|p| p.rate_class_max) {
+            if class > cap {
+                return Err(Error::Config(format!(
+                    "wiring[{i}] ({} → {}): edge rate class '{}' exceeds the \
+                     producer port's declared rate_class_max '{}'.",
+                    from_specs[i],
+                    to_specs[i],
+                    class.as_str(),
+                    cap.as_str(),
+                )));
+            }
+        }
+
+        // Control means "no sustained-throughput guarantee" — tiny
+        // event rings (a 64-byte button edge) are legitimate. Only
+        // streaming classes get floor arithmetic; wedge/ceiling
+        // checks below still apply to every edge.
+        let floor = if class == RateClass::Control {
+            None
+        } else {
+            Some(match rate_class_floor(class, embedded_profile) {
+                Some(f) => f,
+                None => {
+                    return Err(Error::Config(format!(
+                        "wiring[{i}] ({} → {}): rate class '{}' is unsatisfiable on \
+                         this target profile (embedded buffer arenas cannot host \
+                         {}-class rings). Lower the edge's rate or move the stream \
+                         off this target.",
+                        from_specs[i],
+                        to_specs[i],
+                        class.as_str(),
+                        class.as_str(),
+                    )));
+                }
+            })
+        };
+
+        // Model the runtime grant (mirror of open_channels).
+        let prod_size = from_port.map(|p| p.buffer_size).unwrap_or(0);
+        let cons_size = to_port_spec.map(|p| p.buffer_size).unwrap_or(0);
+        let request = prod_size.max(cons_size).max(buffer_bytes);
+        // (2) ceiling.
+        if request > MAX_CHAN_BYTES {
+            return Err(Error::Config(format!(
+                "wiring[{i}] ({} → {}): requested buffer {} exceeds the channel \
+                 ceiling {} — lower the request or split the stream.",
+                from_specs[i], to_specs[i], request, MAX_CHAN_BYTES
+            )));
+        }
+        let granted = if request == 0 {
+            DEFAULT_RING
+        } else {
+            request
+                .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
+                .next_power_of_two()
+        };
+
+        // (1) wedge exclusion.
+        let max_record = from_port.map(|p| p.max_record).unwrap_or(0);
+        if max_record > 0 && max_record > granted {
+            return Err(Error::Config(format!(
+                "wiring[{i}] ({} → {}): producer declares max_record={} but the \
+                 ring grants {} bytes (requested {}); an all-or-nothing write \
+                 larger than the ring can never succeed. Raise buffer_bytes / \
+                 the port's buffer_size, or lower max_record.",
+                from_specs[i], to_specs[i], max_record, granted, request
+            )));
+        }
+
+        // (4) order-of-magnitude screen: the ring must be able to
+        // carry the class floor at the nominal tick rate even if it
+        // were drained once per tick.
+        let Some(floor) = floor else { continue };
+        let ring_rate_ceiling = granted as u64 * ticks_per_sec;
+        if (floor as u64) > ring_rate_ceiling {
+            return Err(Error::Config(format!(
+                "wiring[{i}] ({} → {}): rate class '{}' needs ≥ {} B/s but the \
+                 {}-byte ring at tick_us={} sustains at most {} B/s. Raise \
+                 buffer_bytes or lower the edge's rate class.",
+                from_specs[i],
+                to_specs[i],
+                class.as_str(),
+                floor,
+                granted,
+                tick_us,
+                ring_rate_ceiling
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_wiring_types(
     edges: &[(u8, u8, u8, u8, u8)],
     force_flags: &[bool],
@@ -6112,6 +6326,25 @@ fn generate_config_impl(
         &to_specs,
     )?;
 
+    // Per-edge capacity + rate-class validation.
+    {
+        // Callers pass the resolved SILICON id (e.g. board "pico2w" →
+        // silicon "rp2350a"); the small-buffer-arena profile is the
+        // rp2 family.
+        let embedded = silicon_opt
+            .map(|s| s.starts_with("rp2040") || s.starts_with("rp2350"))
+            .unwrap_or(false);
+        validate_wiring_capacity(
+            config,
+            &edges,
+            &module_names,
+            &manifests,
+            &from_specs,
+            &to_specs,
+            embedded,
+        )?;
+    }
+
     // Required-input-unwired detector. Manifests mark some input
     // ports `required: true` — those MUST have a wiring edge
     // connecting to them or the module will block on an empty
@@ -6243,6 +6476,35 @@ fn generate_config_impl(
 
     // Resolve per-edge edge_class from wiring entries
     let edge_classes = resolve_edge_classes(config, &module_names, &domain_names)?;
+    // Resolve per-edge rate classes for the binary edge entries —
+    // the kernel's MODULE_FLOW_BUDGET query reads byte 8. Same
+    // resolution the wiring-capacity validator applied.
+    let edge_rate_classes: Vec<u8> = {
+        let wiring_arr = config
+            .get("wiring")
+            .and_then(|w| w.as_array())
+            .cloned()
+            .unwrap_or_default();
+        edges
+            .iter()
+            .enumerate()
+            .map(|(i, &(from_id, to_id, to_port, from_pi, to_pi))| {
+                let entry = wiring_arr.get(i);
+                let from_port = module_names
+                    .get(from_id as usize)
+                    .and_then(|n| manifests.get(n))
+                    .and_then(|m| m.find_port_spec(1, from_pi));
+                let to_dir = if to_port == 1 { 2u8 } else { 0u8 };
+                let to_spec = module_names
+                    .get(to_id as usize)
+                    .and_then(|n| manifests.get(n))
+                    .and_then(|m| m.find_port_spec(to_dir, to_pi));
+                resolve_edge_rate_class(entry, from_port, to_spec)
+                    .map(|c| c as u8)
+                    .unwrap_or(0)
+            })
+            .collect()
+    };
     // Resolve per-edge `buffer_bytes` overrides from wiring entries.
     // Parallel array; entries default to 0 ("use module hints").
     let edge_buffer_bytes = resolve_edge_buffer_bytes(config);
@@ -6252,7 +6514,8 @@ fn generate_config_impl(
     //   edges  (MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE bytes)
     //   domain metadata (DOMAIN_META_SIZE bytes)
     //
-    // Edge format (8 bytes; mirrors `kernel::config::parse_graph_edge`):
+    // Edge format (GRAPH_EDGE_SIZE bytes; mirrors
+    // `kernel::config::parse_graph_edge`):
     //   byte 0:    from_id
     //   byte 1:    to_id
     //   byte 2:    bit 7    = to_port
@@ -6261,6 +6524,12 @@ fn generate_config_impl(
     //   byte 3:    bits 7:4 = from_port_index (4 bits, 0..15)
     //              bits 3:0 = to_port_index   (4 bits, 0..15)
     //   bytes 4-7: buffer_bytes (u32 LE; 0 = use module hints)
+    //   byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk)
+    //              — resolved at build time from the per-edge `rate:`
+    //              override or the consumer/producer port's content-
+    //              type default. Consumed by the kernel's
+    //              MODULE_FLOW_BUDGET query.
+    //   bytes 9-11: reserved (0)
     //
     // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`. The
     // 5-bit `buffer_group` ceiling (31) is enforced by
@@ -6290,6 +6559,8 @@ fn generate_config_impl(
         graph_section.push((to_port << 7) | ((ec & 0x03) << 5) | (group & 0x1F));
         graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
         graph_section.extend_from_slice(&buffer_bytes.to_le_bytes());
+        graph_section.push(edge_rate_classes.get(i).copied().unwrap_or(0));
+        graph_section.extend_from_slice(&[0u8; 3]);
     }
     // Pad edge entries to fixed offset, then write domain metadata
     while graph_section.len() < 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE {

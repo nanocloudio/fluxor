@@ -17,6 +17,14 @@ name = "stream"
 direction = "output"
 content_type = "OctetStream"
 required = true
+# out[0]: stream — sized comfortably above one full MAX_CHUNK_SIZE
+# chunk so a fresh emit can land without back-pressure even when the
+# consumer is one tick behind. The downstream (http) typically requests
+# 65536; the kernel takes max(producer, consumer) hints, so this value
+# matters only when the downstream isn't http.
+buffer_size = 65536
+# MAX_CHUNK_SIZE — largest single chunk emit.
+max_record = 32768
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

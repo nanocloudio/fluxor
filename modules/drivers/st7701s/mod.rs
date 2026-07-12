@@ -1334,15 +1334,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 #[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 4096 },
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
-#[no_mangle]
 #[link_section = ".text.module_deferred_ready"]
 pub extern "C" fn module_deferred_ready() {}
 

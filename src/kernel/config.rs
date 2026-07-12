@@ -540,7 +540,7 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 ///              `0` falls back to module hints / `BUFFER_SIZE`.
 ///              Otherwise `max(module_hint, buffer_bytes)` is the
 ///              size requested from `channel_open_for_module`.
-pub const GRAPH_EDGE_SIZE: usize = 8;
+pub const GRAPH_EDGE_SIZE: usize = 12;
 /// Per-domain metadata entry, bytes: `tick_us:u16 | exec_mode:u8 |
 /// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags` (RFC adaptive_tick §8).
 /// `tick_min_us`/`tick_max_us` are deliberately NOT in this (checksummed) entry:
@@ -741,6 +741,9 @@ pub struct GraphEdge {
     /// clamps to `MAX_CHAN_BYTES = 256 KiB` and rounds up to a power
     /// of two. Encoded as a u32 LE in bytes 4-7 of the edge record.
     pub buffer_bytes: u32,
+    /// Rate class of this edge: 0=control, 1=audio, 2=video,
+    /// 3=bulk. Feeds MODULE_FLOW_BUDGET grants.
+    pub rate_class: u8,
 }
 
 // ============================================================================
@@ -1404,13 +1407,18 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 /// - byte 3:    bits [7:4] = from_port_index (4-bit, 0..15)
 ///   bits [3:0] = to_port_index   (4-bit, 0..15)
 /// - bytes 4-7: buffer_bytes (u32 LE, 0 = no override)
+/// - byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk),
+///   resolved by the config compiler from the per-edge `rate:`
+///   override / port content-type defaults. Consumed by the
+///   MODULE_FLOW_BUDGET provider query.
+/// - bytes 9-11: reserved (0)
 ///
 /// Both port indices are 4 bits; the runtime caps both at
 /// `MAX_PORTS = 16` (scheduler.rs). `buffer_group` is 5 bits — group 0
 /// means no aliasing, ids 1..31 mark in-place chains. The tool's
 /// `assign_buffer_groups` enforces the 31 ceiling.
 fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
-    // SAFETY: `ptr..ptr+GRAPH_EDGE_SIZE (= 8)` is in-bounds (caller is
+    // SAFETY: `ptr..ptr+GRAPH_EDGE_SIZE (= 12)` is in-bounds (caller is
     // the edge-loop which bounds-checked `edge_count * GRAPH_EDGE_SIZE`).
     unsafe {
         let from_id = *ptr;
@@ -1423,6 +1431,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
         let from_port_index = (port_byte >> 4) & 0x0F;
         let to_port_index = port_byte & 0x0F;
         let buffer_bytes = u32::from_le_bytes([*ptr.add(4), *ptr.add(5), *ptr.add(6), *ptr.add(7)]);
+        let rate_class = *ptr.add(8);
         let edge_class = match edge_class_raw {
             1 => EdgeClass::DmaOwned,
             2 => EdgeClass::CrossCore,
@@ -1438,6 +1447,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
             buffer_group,
             edge_class,
             buffer_bytes,
+            rate_class,
         }
     }
 }

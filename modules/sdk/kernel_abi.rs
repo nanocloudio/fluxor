@@ -394,6 +394,10 @@ pub const SELF_INDEX: u32 = 0x0C42;
 /// module memory split rules out the direct path. The opcode is
 /// honoured on every target.
 pub const MODULE_INSTANCE_PARAMS: u32 = 0x0C43;
+/// Per-step flow-budget grant for one of the calling module's output
+/// ports. arg[0] = output port index. Returns the byte grant for one
+/// step (0 = no classed edge on that port — keep module pacing).
+pub const MODULE_FLOW_BUDGET: u32 = 0x0C46;
 
 /// Read the hardware-provisioned ethernet MAC address from platform
 /// sources (on bcm2712, the DTB passed by Pi 5 firmware). handle=-1,

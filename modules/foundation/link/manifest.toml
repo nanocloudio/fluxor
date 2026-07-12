@@ -5,21 +5,29 @@ hardware_targets = ["rp2350"]
 name = "audio_in"
 direction = "input"
 content_type = "AudioSample"
+buffer_size = 2048
 
 [[ports]]
 name = "audio_out"
 direction = "output"
 content_type = "AudioSample"
+# max_record omitted: block_bytes = block_size (config tag 3, u16) * 2
+# has no declared clamp below this ring.
+buffer_size = 2048
 
 [[ports]]
 name = "ctrl_fwd"
 direction = "output"
 content_type = "FmpMessage"
+# max_record omitted: forwarded FMP payload length comes off the wire
+# (up to ~MAX_WIRE_BUF) and is not bounded below this ring.
+buffer_size = 256
 
 [[ports]]
 name = "control"
 direction = "ctrl_input"
 content_type = "FmpMessage"
+buffer_size = 256
 
 [[resources]]
 requires_contract = "uart"

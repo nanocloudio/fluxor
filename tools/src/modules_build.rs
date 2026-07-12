@@ -519,6 +519,7 @@ fn compile_module_pic(
         &cand.name,
         cand.type_id,
         Some(&cand.manifest),
+        Some(spec.silicon_id),
     )?;
     Ok(BuildOutcome::Built)
 }
@@ -590,6 +591,7 @@ fn compile_module_wasm(
         &cand.name,
         cand.type_id,
         Some(&cand.manifest),
+        Some(spec.silicon_id),
     )?;
     Ok(BuildOutcome::Built)
 }

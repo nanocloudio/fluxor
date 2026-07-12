@@ -151,6 +151,113 @@ pub const CONTENT_TYPES: &[&str] = &[
     "PresentationLayout",
 ];
 
+// ── Rate classes ────────────────────────────────────────────────────────────
+
+/// Sustained-throughput class of a stream. Attached to content types
+/// (defaults below) and overridable per wiring edge (`rate:`). The
+/// config compiler validates each edge's granted ring against its
+/// class floor at build time; the kernel derives per-step pump
+/// budgets from it (`MODULE_FLOW_BUDGET`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(u8)]
+pub enum RateClass {
+    Control = 0,
+    Audio = 1,
+    Video = 2,
+    Bulk = 3,
+}
+
+impl RateClass {
+    pub fn from_str_opt(s: &str) -> Option<RateClass> {
+        match s {
+            "control" => Some(RateClass::Control),
+            "audio" => Some(RateClass::Audio),
+            "video" => Some(RateClass::Video),
+            "bulk" => Some(RateClass::Bulk),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RateClass::Control => "control",
+            RateClass::Audio => "audio",
+            RateClass::Video => "video",
+            RateClass::Bulk => "bulk",
+        }
+    }
+}
+
+use RateClass::{Audio, Control, Video};
+
+/// Default rate class per content type — POSITION-PARALLEL with
+/// `CONTENT_TYPES` (compile-time length guard below). These are
+/// conservative floors, not aspirations: a class is what every edge
+/// of that type must be provisioned for by default, so types with
+/// legitimately slow uses default low and fast graphs override at
+/// the edge. Notably `VideoRaster` defaults to `audio` (≈1 MB/s):
+/// embedded image viewers stream one raster occasionally and must
+/// not fail validation on small-profile targets; genuine motion-
+/// raster pipelines declare `rate: video` on the edge.
+pub const CONTENT_RATE_CLASS: &[RateClass] = &[
+    Control, // OctetStream (carrier — class comes from the edge)
+    Control, // Cbor
+    Control, // Json
+    Audio,   // AudioSample
+    Audio,   // AudioOpus
+    Audio,   // AudioMp3
+    Audio,   // AudioAac
+    Control, // TextPlain
+    Control, // TextHtml
+    Audio,   // VideoRaster (see note above)
+    Control, // ImageJpeg (whole-image, latency-tolerant)
+    Control, // ImagePng
+    Control, // MeshEvent
+    Control, // MeshCommand
+    Control, // MeshState
+    Control, // MeshHandle
+    Control, // InputEvent
+    Control, // GestureMatch
+    Control, // FmpMessage
+    Audio,   // EthernetFrame (embedded NICs are legitimate slow users;
+    // gigabit-class graphs override at the edge)
+    Control, // HciMessage
+    Audio,   // AudioEncoded
+    Video,   // VideoEncoded
+    Video,   // VideoDraw
+    Video,   // VideoScanout
+    Video,   // MediaMuxed
+    Control, // WsFrame (bursty envelopes; streaming uses override)
+    Control, // InputBinaryState
+    Video,   // EventTimelineVideo
+    Audio,   // EventTimelineAudio
+    Audio,   // NetProto (same reasoning as EthernetFrame)
+    Control, // PointerEvents
+    Control, // KeyEvents
+    Control, // GamepadEvents
+    Control, // MidiEvents
+    Control, // Telemetry
+    Control, // SurfaceTraits
+    Control, // PresentationLayout
+];
+
+const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
+
+/// Per-class sustained-rate floor in bytes/second, per profile family.
+/// `None` = the class is unsatisfiable on that profile (64 KiB buffer
+/// arenas cannot host video/bulk rings) — wiring such an edge is a
+/// validation error, not a per-edge arithmetic failure.
+pub fn rate_class_floor(class: RateClass, embedded: bool) -> Option<u32> {
+    match (class, embedded) {
+        (RateClass::Control, false) => Some(64 * 1024),
+        (RateClass::Audio, false) => Some(1024 * 1024),
+        (RateClass::Video, false) => Some(16 * 1024 * 1024),
+        (RateClass::Bulk, false) => Some(64 * 1024 * 1024),
+        (RateClass::Control, true) => Some(8 * 1024),
+        (RateClass::Audio, true) => Some(256 * 1024),
+        (RateClass::Video, true) | (RateClass::Bulk, true) => None,
+    }
+}
+
 /// Per-operation fence: the actual guarantee a returning operation
 /// achieved. Operations MUST NOT advertise a fence stronger than the
 /// underlying graph produced.

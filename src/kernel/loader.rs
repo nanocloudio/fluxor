@@ -23,7 +23,6 @@ pub mod export_hashes {
     pub const MODULE_INIT: u32 = 0xfb8dc9bc; // "module_init"
     pub const MODULE_NEW: u32 = 0xe6d4ac90; // "module_new"
     pub const MODULE_STEP: u32 = 0xc7ea2db4; // "module_step"
-    pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
     pub const MODULE_DRAIN: u32 = 0xc4c5636c; // "module_drain"
     pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03; // "module_isr_init"
@@ -213,8 +212,6 @@ pub type ModuleNewFn = unsafe extern "C" fn(
 ) -> i32;
 /// Function pointer type for module_step export
 pub type ModuleStepFn = unsafe extern "C" fn(*mut u8) -> i32;
-/// Function pointer type for module_channel_hints export
-pub type ModuleChannelHintsFn = unsafe extern "C" fn(*mut u8, usize) -> i32;
 /// Convert a raw address (with Thumb bit set) directly to a typed function pointer.
 ///
 /// This uses transmute_copy to go directly from u32 -> fn ptr without an
@@ -1029,6 +1026,83 @@ impl LoadedModule {
             None
         }
     }
+    /// Read the static port-capacity hints from the manifest's
+    /// flag-bit-5 capacity section. Needs no module code execution,
+    /// works for wasm payloads (whose packed export tables are
+    /// empty), and is covered by the signing envelope.
+    ///
+    /// Returns hints in the scheduler's `ChannelHint` shape. Manifest
+    /// port directions 0..=2 (input/output/ctrl_input) map directly to
+    /// hint port_types 0..=2; ctrl_output (3) ports and all-zero
+    /// entries are skipped. `(_, 0)` when the manifest is absent,
+    /// malformed, or carries no capacity section.
+    pub fn manifest_port_capacities(&self) -> ([ChannelHint; 8], usize) {
+        let mut out = [ChannelHint {
+            port_type: 0,
+            port_index: 0,
+            buffer_size: 0,
+            max_record: 0,
+        }; 8];
+        let manifest_size = self.header.manifest_size() as usize;
+        if manifest_size < 16 {
+            return (out, 0);
+        }
+        let code_size = self.header.code_size as usize;
+        let data_size = self.header.data_size as usize;
+        let export_size = self.header.export_count as usize * 8;
+        let schema_size = self.header.schema_size() as usize;
+        let manifest_offset =
+            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
+        // mapping (validated at load time); every read below is bounds-
+        // checked against manifest_size first.
+        unsafe {
+            let p = offset_ptr(self.base, manifest_offset);
+            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+            if magic != 0x464D5846 {
+                return (out, 0);
+            } // "FXMF"
+            let flags = *p.add(14);
+            if flags & 0x20 == 0 {
+                return (out, 0); // no capacity section
+            }
+            let port_count = *p.add(5) as usize;
+            let resource_count = *p.add(6) as usize;
+            let dep_count = *p.add(7) as usize;
+            // Capacity section sits directly after the dependency
+            // records (before the integrity hash) — see
+            // tools/src/manifest.rs::to_bytes.
+            let cap_offset = 16 + port_count * 4 + resource_count * 4 + dep_count * 8;
+            if manifest_size < cap_offset + port_count * 8 {
+                return (out, 0);
+            }
+            let mut n = 0usize;
+            for i in 0..port_count {
+                if n >= out.len() {
+                    break;
+                }
+                let rec = p.add(16 + i * 4);
+                let direction = *rec;
+                let index = *rec.add(3);
+                let cap = p.add(cap_offset + i * 8);
+                let buffer_size = u32::from_le_bytes([*cap, *cap.add(1), *cap.add(2), *cap.add(3)]);
+                let max_record =
+                    u32::from_le_bytes([*cap.add(4), *cap.add(5), *cap.add(6), *cap.add(7)]);
+                if direction > 2 || (buffer_size == 0 && max_record == 0) {
+                    continue;
+                }
+                out[n] = ChannelHint {
+                    port_type: direction,
+                    port_index: index,
+                    buffer_size,
+                    max_record,
+                };
+                n += 1;
+            }
+            (out, n)
+        }
+    }
+
     /// Get a function address by hash.
     /// On Cortex-M: returns u32 with Thumb bit set.
     /// On aarch64: returns usize (64-bit address, no Thumb bit).
@@ -1473,8 +1547,10 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
             found: module.header.version,
         });
     }
-    // Check code_size is reasonable (< 384KB — protocol modules may bundle firmware+NVRAM)
-    if module.header.code_size > 393216 {
+    // Sanity ceiling for the code segment (profile-tuned: media modules
+    // like the unified codec carry large decoder tables; protocol
+    // modules may bundle firmware+NVRAM).
+    if module.header.code_size as usize > crate::abi::config::kernel::MAX_MODULE_CODE_SIZE {
         log::error!(
             "[loader] {}: code too large size={}",
             name,
@@ -1575,7 +1651,16 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     // the hash is still first (signature is appended after).
                     let var_size = (manifest_data[5] as usize) * 4
                         + (manifest_data[6] as usize) * 4
-                        + (manifest_data[7] as usize) * 8;
+                        + (manifest_data[7] as usize) * 8
+                        + if (manifest_data[14] & 0x20) != 0 {
+                            // Port-capacity section (flag bit 5) sits between
+                            // the dependency records and the integrity hash —
+                            // inside the signed envelope. Mirrors
+                            // tools/src/manifest.rs::to_bytes.
+                            (manifest_data[5] as usize) * 8
+                        } else {
+                            0
+                        };
                     let hash_offset = 16 + var_size;
                     if hash_offset + 32 > manifest_size {
                         log::error!("[loader] {name}: manifest hash out of range");
@@ -1620,7 +1705,16 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                 if has_signature {
                     let var_size = (manifest_data[5] as usize) * 4
                         + (manifest_data[6] as usize) * 4
-                        + (manifest_data[7] as usize) * 8;
+                        + (manifest_data[7] as usize) * 8
+                        + if (manifest_data[14] & 0x20) != 0 {
+                            // Port-capacity section (flag bit 5) sits between
+                            // the dependency records and the integrity hash —
+                            // inside the signed envelope. Mirrors
+                            // tools/src/manifest.rs::to_bytes.
+                            (manifest_data[5] as usize) * 8
+                        } else {
+                            0
+                        };
                     let sig_offset = 16 + var_size + 32;
                     if sig_offset + 96 > manifest_size {
                         return Err(LoaderError::SignatureInvalid);
@@ -2385,59 +2479,24 @@ pub struct ChannelHint {
     /// Requested buffer size in bytes (0 = use default).
     /// 2 bytes of natural alignment padding precede this field.
     pub buffer_size: u32,
+    /// Largest single channel_write this port issues (0 = undeclared),
+    /// from the manifest's port-capacity section.
+    pub max_record: u32,
 }
 /// Wire size of one `ChannelHint` slot. Sourced from `abi::wire` so
 /// the kernel reader and the SDK writer agree on the layout.
-pub use crate::abi::wire::CHANNEL_HINT_WIRE_BYTES;
 /// Maximum number of hints we can collect per module
-const MAX_HINTS_PER_MODULE: usize = 8;
-/// Query channel hints from a loaded module.
-///
-/// Returns a slice of hints, or an empty slice if the module doesn't export
-/// `module_channel_hints`. This is optional — modules without the export
-/// get default kernel buffer sizes on all ports.
-pub fn query_channel_hints(module: &LoadedModule) -> ([ChannelHint; MAX_HINTS_PER_MODULE], usize) {
-    let mut hints = [ChannelHint {
-        port_type: 0,
-        port_index: 0,
-        buffer_size: 0,
-    }; MAX_HINTS_PER_MODULE];
-    // Look up the optional export
-    let addr = match module.get_export_addr(export_hashes::MODULE_CHANNEL_HINTS) {
-        Ok(a) => a,
-        Err(_) => return (hints, 0), // No hints export — use defaults
-    };
-    // Validate function address
-    if validate_fn_addr(addr, "module_channel_hints").is_err() {
-        return (hints, 0);
+/// Look up the declared max single-write size for a specific port.
+/// Returns 0 when undeclared.
+pub fn find_max_record_for_port(hints: &[ChannelHint], port_type: u8, port_index: u8) -> u32 {
+    for hint in hints {
+        if hint.port_type == port_type && hint.port_index == port_index {
+            return hint.max_record;
+        }
     }
-    // Call the export: module_channel_hints(out: *mut u8, max_len: usize) -> i32
-    // SAFETY: addr validated via validate_fn_addr above; ABI shape matches.
-    let hints_fn: ModuleChannelHintsFn = unsafe { fn_ptr_from_addr(addr) };
-    let buf_size = MAX_HINTS_PER_MODULE * CHANNEL_HINT_WIRE_BYTES;
-    let mut buf = [0u8; MAX_HINTS_PER_MODULE * CHANNEL_HINT_WIRE_BYTES];
-    // SAFETY: buf is sized to `buf_size`; the PIC export honours its own
-    // max_len contract.
-    let count = unsafe { hints_fn(buf.as_mut_ptr(), buf_size) };
-    if count <= 0 {
-        return (hints, 0);
-    }
-    let count = (count as usize).min(MAX_HINTS_PER_MODULE);
-    for (i, hint) in hints.iter_mut().take(count).enumerate() {
-        let offset = i * CHANNEL_HINT_WIRE_BYTES;
-        *hint = ChannelHint {
-            port_type: buf[offset],
-            port_index: buf[offset + 1],
-            buffer_size: u32::from_le_bytes([
-                buf[offset + 4],
-                buf[offset + 5],
-                buf[offset + 6],
-                buf[offset + 7],
-            ]),
-        };
-    }
-    (hints, count)
+    0
 }
+
 /// Look up buffer size hint for a specific port.
 ///
 /// Returns the requested buffer size, or 0 if no hint exists (use default).

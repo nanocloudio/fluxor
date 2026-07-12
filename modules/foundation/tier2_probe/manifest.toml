@@ -17,6 +17,7 @@ timer_class = "agnostic"
 name = "probe_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 16
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

@@ -176,19 +176,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // ============================================================================
-// Channel Hints
-// ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 64 }, // in[0]: brightness bytes
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
-// ============================================================================
 // Panic Handler
 // ============================================================================
 

@@ -12,6 +12,10 @@ name = "mixed"
 direction = "output"
 content_type = "AudioSample"
 required = true
+# Output: 2048 bytes (256 stereo frames × 4 bytes). max_record omitted:
+# a single write is bounded by that tick's input read (up to the 8 KiB
+# staging buf), not by a tighter constant.
+buffer_size = 2048
 
 [[ports]]
 name = "control"

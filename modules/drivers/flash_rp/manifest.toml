@@ -11,6 +11,9 @@ permissions = ["flash_raw", "backing_provider"]
 name = "raw"
 direction = "output"
 content_type = "OctetStream"
+# Button raw transitions (1 byte each).
+buffer_size = 64
+max_record = 1
 
 # Blob serving / asset bank source — flash-resident preset blobs
 # served on demand via IOCTL_NOTIFY. Used by waveshare image_viewer
@@ -20,6 +23,10 @@ name = "stream"
 index = 1
 direction = "output"
 content_type = "OctetStream"
+# Blob stream.
+buffer_size = 2048
+# BLOB_CHUNK_SIZE — blobs are emitted in 512-byte chunks.
+max_record = 512
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

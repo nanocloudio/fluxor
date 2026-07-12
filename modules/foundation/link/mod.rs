@@ -1008,22 +1008,6 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
     }
 }
 
-// ============================================================================
-// Channel Hints
-// ============================================================================
-
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 2048 }, // audio_in
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 2048 }, // audio_out
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: 256 },  // ctrl_fwd
-        ChannelHint { port_type: 2, port_index: 0, buffer_size: 256 },  // control
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
 #[no_mangle]
 #[link_section = ".text.module_mailbox_safe"]
 pub extern "C" fn module_mailbox_safe() -> i32 { 1 }

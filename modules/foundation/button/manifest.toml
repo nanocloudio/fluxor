@@ -5,6 +5,9 @@ hardware_targets = ["rp2350"]
 name = "raw"
 direction = "output"
 content_type = "OctetStream"
+# Raw 0/1 bytes.
+buffer_size = 64
+max_record = 1
 
 [[resources]]
 requires_contract = "gpio"

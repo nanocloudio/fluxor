@@ -751,6 +751,7 @@ pub fn pack_fmod(
     name: &str,
     module_type: u8,
     manifest_path: Option<&Path>,
+    target_silicon: Option<&str>,
 ) -> Result<PackResult> {
     let elf_data = std::fs::read(input)?;
     let (sections, symbols) = parse_elf(&elf_data)?;
@@ -914,8 +915,6 @@ pub fn pack_fmod(
         "i2s_convert_i16_mono",
         "i2s_apply_gain",
         "i2s_mix",
-        // channel hints (dynamic buffer sizing)
-        "module_channel_hints",
         // heap arena size (per-module heap allocation)
         "module_arena_size",
         // buffer capability markers
@@ -949,7 +948,7 @@ pub fn pack_fmod(
 
     // Load or create manifest
     let mut module_manifest = if let Some(mp) = manifest_path {
-        Manifest::from_toml(mp)?
+        Manifest::from_toml_for_target(mp, target_silicon)?
     } else {
         // Auto-detect: look for manifest.toml next to the input ELF
         let auto_path = input
@@ -957,7 +956,7 @@ pub fn pack_fmod(
             .unwrap_or(Path::new("."))
             .join("manifest.toml");
         if auto_path.exists() {
-            Manifest::from_toml(&auto_path)?
+            Manifest::from_toml_for_target(&auto_path, target_silicon)?
         } else {
             Manifest::default()
         }
@@ -1163,6 +1162,7 @@ pub fn pack_fmod_wasm(
     name: &str,
     module_type: u8,
     manifest_path: Option<&Path>,
+    target_silicon: Option<&str>,
 ) -> Result<PackResult> {
     let wasm_data = std::fs::read(input)?;
 
@@ -1184,14 +1184,14 @@ pub fn pack_fmod_wasm(
 
     // Load or create manifest.
     let mut module_manifest = if let Some(mp) = manifest_path {
-        Manifest::from_toml(mp)?
+        Manifest::from_toml_for_target(mp, target_silicon)?
     } else {
         let auto_path = input
             .parent()
             .unwrap_or(Path::new("."))
             .join("manifest.toml");
         if auto_path.exists() {
-            Manifest::from_toml(&auto_path)?
+            Manifest::from_toml_for_target(&auto_path, target_silicon)?
         } else {
             Manifest::default()
         }

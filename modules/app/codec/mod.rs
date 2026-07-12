@@ -64,6 +64,16 @@ mod image_gif;
 mod image_jpeg;
 mod image_png;
 
+// Video essence: Matroska container + H.264 baseline decoder (h264bsd
+// Rust port). Host-test exposes them so the harness can drive the
+// demux/decode pipeline directly.
+#[cfg(feature = "host-test")] pub mod mkv_demux;
+#[cfg(not(feature = "host-test"))] mod mkv_demux;
+#[cfg(feature = "host-test")] pub mod h264;
+#[cfg(not(feature = "host-test"))] mod h264;
+#[cfg(feature = "host-test")] pub mod mkv_h264;
+#[cfg(not(feature = "host-test"))] mod mkv_h264;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -77,10 +87,18 @@ const FMT_BMP: u8 = 4;
 const FMT_GIF: u8 = 5;
 const FMT_PNG: u8 = 6;
 const FMT_JPEG: u8 = 7;
+const FMT_MKV: u8 = 8;
 
 #[inline(always)]
 fn is_image_format(fmt: u8) -> bool {
     matches!(fmt, FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG)
+}
+
+/// Formats that own their own EOF / drain / reset cycle (the parent's
+/// audio HUP-quiesce reset must not touch them).
+#[inline(always)]
+fn owns_eof_cycle(fmt: u8) -> bool {
+    is_image_format(fmt) || fmt == FMT_MKV
 }
 
 
@@ -104,11 +122,13 @@ const CODEC_STATE_SIZE: usize = {
     let mp3_size = core::mem::size_of::<mp3_codec::Mp3State>();
     let aac_size = core::mem::size_of::<aac_codec::AacState>();
     let img_size = core::mem::size_of::<image_codec::ImageState>();
-    // Manual max of four values (const context)
+    let mkv_size = core::mem::size_of::<mkv_h264::MkvH264State>();
+    // Manual max of five values (const context)
     let mut max = wav_size;
     if mp3_size > max { max = mp3_size; }
     if aac_size > max { max = aac_size; }
     if img_size > max { max = img_size; }
+    if mkv_size > max { max = mkv_size; }
     // Align up to 4 bytes
     (max + 3) & !3
 };
@@ -211,6 +231,11 @@ impl DecoderState {
     unsafe fn img(&mut self) -> &mut image_codec::ImageState {
         &mut *(self.codec.0.as_mut_ptr() as *mut image_codec::ImageState)
     }
+
+    #[inline(always)]
+    unsafe fn mkv(&mut self) -> &mut mkv_h264::MkvH264State {
+        &mut *(self.codec.0.as_mut_ptr() as *mut mkv_h264::MkvH264State)
+    }
 }
 
 // ============================================================================
@@ -252,6 +277,11 @@ fn detect_format(buf: &[u8; DETECT_BUF_SIZE], len: u8) -> u8 {
     let n = len as usize;
     if n < 2 {
         return FMT_DETECTING;
+    }
+
+    // Matroska/WebM — EBML magic `1A 45 DF A3`.
+    if n >= 4 && buf[..4] == mkv_demux::MKV_MAGIC {
+        return FMT_MKV;
     }
 
     // BMP — `BM` magic at offset 0. Two bytes is enough to commit.
@@ -395,6 +425,30 @@ unsafe fn init_codec(s: &mut DecoderState) {
             };
             dev_log(&*syscalls, 3, tag.as_ptr(), tag.len());
         }
+        FMT_MKV => {
+            // Video emits on `pixels` (output port 1), like the image
+            // path. Params are shared with the image path's staging.
+            let pix_chan = s.pixels_chan;
+            let (dw, dh, sm, mb) = (
+                s.image_dst_w,
+                s.image_dst_h,
+                s.image_scale_mode,
+                s.image_max_bytes,
+            );
+            let mkv = &mut *(codec_ptr as *mut mkv_h264::MkvH264State);
+            mkv.dst_w = dw;
+            mkv.dst_h = dh;
+            mkv.scale_mode = sm;
+            // `max_bytes` is staged from the shared image params whose
+            // DEFAULT (8 MiB) is sized for whole-image accumulation.
+            // Video streams — the ES buffer holds at most a burst of
+            // coded frames (~200 KB each at SD), so treat the image
+            // default as unset and use 2 MiB; explicit smaller/larger
+            // YAML values pass through.
+            mkv.max_bytes = if mb == 0 || mb == 8_388_608 { 2 * 1024 * 1024 } else { mb };
+            mkv_h264::mkv_init(mkv, syscalls, in_chan, pix_chan);
+            mkv_h264::mkv_feed_detect(mkv, detect_ptr, detect_len);
+        }
         _ => {}
     }
 }
@@ -409,14 +463,16 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<DecoderState>() as u32
 }
 
-/// Per-module heap budget. Sized for the image path's worst case
-/// (8 MiB encoded BMP accumulator + 2 MiB decoded RGB565 slack); the
-/// audio paths use ~32 KB at most. Same budget covers any format
-/// since only one is active at a time per module instance.
+/// Per-module heap budget. Sized for the worst single-format case:
+/// image path = 8 MiB encoded BMP accumulator + 2 MiB RGB565 slack;
+/// video path = 2 MiB Annex B accumulator + DPB frames + RGB565
+/// staging (≈ 12.5 MiB at 1080p). Audio uses ~32 KB. Only one format
+/// is active at a time per module instance; the arena is paged in
+/// lazily on both linux and wasm hosts.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
-    10 * 1024 * 1024
+    16 * 1024 * 1024
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -494,6 +550,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // / `st=` heartbeats so a viewer connecting mid-run still
         // sees the proof line.
         s.tick_count = s.tick_count.wrapping_add(1);
+        // Video-path heartbeat: frames out + ES fill + phase, so a
+        // wedged hop is identifiable from one log line without
+        // instrumenting the peer modules.
+        if s.tick_count % 5000 == 0 && s.format == FMT_MKV {
+            let mkv = &*(s.codec.0.as_ptr() as *const mkv_h264::MkvH264State);
+            mkv_h264::mkv_heartbeat(mkv, s.sys());
+        }
         if s.tick_count % 5000 == 0 && is_image_format(s.format) {
             let img = &*(s.codec.0.as_ptr() as *const image_codec::ImageState);
             let ph = img.phase as u32;
@@ -590,7 +653,27 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // `image_codec.rs`'s phase machine — wiping their state here
         // would tear down a 1 MiB RGB565 frame mid-drain (≈ 1000
         // ticks at WRITE_CHUNK = 1024 B/tick).
-        if !is_image_format(s.format) {
+        // MKV: sub-codec signals Done (HUP + decoder flushed + all
+        // frames drained) — flush the boundary and re-arm detection
+        // so the next file can start.
+        if s.format == FMT_MKV {
+            let mkv = &*(s.codec.0.as_ptr() as *const mkv_h264::MkvH264State);
+            if mkv_h264::mkv_is_done(mkv) {
+                let in_poll = ((*s.syscalls).channel_poll)(s.in_chan, POLL_IN);
+                let has_new = (in_poll as u32) & POLL_IN != 0;
+                let errored = mkv.phase == mkv_h264::VPhase::Error;
+                // Done: reset immediately. Error: hold (heartbeat
+                // replays last_err) until fresh bytes arrive.
+                if !errored || has_new {
+                    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                    dev_log(s.sys(), 3, b"[dec] rst-mkv".as_ptr(), 13);
+                    reset_to_detect(s);
+                    return 0;
+                }
+            }
+        }
+
+        if !owns_eof_cycle(s.format) {
             let sys_ptr = s.syscalls;
             let in_chan = s.in_chan;
             let in_poll = ((*sys_ptr).channel_poll)(in_chan, POLL_IN | POLL_HUP);
@@ -640,38 +723,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             FMT_MP3 => mp3_codec::mp3_step(s.mp3()),
             FMT_AAC => aac_codec::aac_step(s.aac()),
             FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG => image_codec::image_step(s.img()),
+            FMT_MKV => mkv_h264::mkv_step(s.mkv()),
             _ => 0,
         }
     }
-}
-
-// ============================================================================
-// Channel Hints
-// ============================================================================
-
-/// Request a generous output buffer so a 4-second test asset's worth of
-/// PCM (≈720 KB) can buffer through to a slow consumer (e.g. a WS client
-/// that connects ~2 s after the source pipeline starts). With the default
-/// 8 KB buffer the codec backpressures within ~2 frames; downstream
-/// (`ws_stream` → `http`) would then either drop pre-connect bytes at the
-/// no-fan-out gate or stall. 1 MiB fits any single-asset test plus several
-/// seconds of live decode at typical bitrates.
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(hints: *mut ChannelHint, max_hints: usize) -> usize {
-    if hints.is_null() || max_hints == 0 { return 0; }
-    unsafe {
-        *hints = ChannelHint { port_type: 1, port_index: 0, buffer_size: 1048576 };
-        if max_hints > 1 {
-            // Input encoded stream — bank writes 1024 bytes per tick;
-            // size for a healthy lead so writes don't stall when the
-            // BMP path is in Phase::Draining (not reading from in_chan
-            // for ~1000 ticks while emitting the decoded frame).
-            *hints.add(1) = ChannelHint { port_type: 0, port_index: 0, buffer_size: 65536 };
-            return 2;
-        }
-    }
-    1
 }
 
 // ============================================================================

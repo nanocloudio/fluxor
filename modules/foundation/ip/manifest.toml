@@ -8,22 +8,29 @@ name = "frames_rx"
 direction = "input"
 content_type = "EthernetFrame"
 required = true
+# ETH rings are the per-tick burst budget for the IP pipeline. aarch64 uses
+# 32 KiB (~21 MSS); rp2350/wasm keep 4 KiB.
+buffer_size = { default = 4096, bcm2712 = 32768 }
 
 [[ports]]
 name = "frames_tx"
 direction = "output"
 content_type = "EthernetFrame"
 required = true
+buffer_size = { default = 4096, bcm2712 = 32768 }
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+# net rings match http's per-call stage: 16 KiB on aarch64, 2 KiB else.
+buffer_size = { default = 2048, bcm2712 = 16384 }
 
 [[ports]]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+buffer_size = { default = 2048, bcm2712 = 16384 }
 
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits

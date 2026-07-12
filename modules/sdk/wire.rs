@@ -18,10 +18,8 @@
 /// this exact value — there is no backwards-compatibility layer.
 pub const ABI_VERSION: u8 = 1;
 
-/// Wire size of one `ChannelHint` slot serialised by
-/// `write_channel_hints` and decoded by the kernel's
-/// `query_channel_hints`. The in-memory `ChannelHint` struct's
-/// natural `#[repr(C)]` alignment matches this size.
+/// Bytes per port-capacity entry in the manifest's flag-bit-5
+/// capacity section: `[buffer_size u32 LE][max_record u32 LE]`.
 pub const CHANNEL_HINT_WIRE_BYTES: usize = 8;
 
 /// FNV-1a 32-bit hash. Identifies modules and exports by name (string

@@ -1219,9 +1219,9 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_INSTANCE_PARAMS,
-        PAGED_ARENA_GET, PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT,
-        SELF_INDEX,
+        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
+        MODULE_INSTANCE_PARAMS, PAGED_ARENA_GET, PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY,
+        REPORT_STEP_EFFECT, SELF_INDEX,
     };
     use crate::kernel::scheduler;
     match opcode {
@@ -1236,6 +1236,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | HANDLE_POLL
         | RANDOM_FILL
         | MODULE_INSTANCE_PARAMS
+        | MODULE_FLOW_BUDGET
         | bridge::SELF_BRIDGES
         | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
         // ── Diagnostics / log transport ──
@@ -1345,8 +1346,8 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     use crate::abi::internal::monitor::ISR_METRICS;
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_INSTANCE_PARAMS,
-        RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
+        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
+        MODULE_INSTANCE_PARAMS, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
     };
     use crate::kernel::scheduler;
     match opcode {
@@ -1385,6 +1386,15 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 pos += 4;
             }
             need as i32
+        }
+        MODULE_FLOW_BUDGET => {
+            // arg[0] = output port index.
+            if arg.is_null() || arg_len < 1 {
+                return crate::kernel::errno::EINVAL;
+            }
+            // SAFETY: non-null, len >= 1 checked above.
+            let port_index = unsafe { *arg };
+            scheduler::syscall_flow_budget(port_index)
         }
         MODULE_INSTANCE_PARAMS => {
             let idx = scheduler::current_module_index();

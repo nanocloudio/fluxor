@@ -32,8 +32,7 @@ use crate::kernel::config::{
 };
 use crate::kernel::hal;
 use crate::kernel::loader::{
-    find_hint_for_port, query_channel_hints, reset_state_arena, ChannelHint, DynamicModule,
-    ModuleLoader, StartNewResult,
+    find_hint_for_port, reset_state_arena, ChannelHint, DynamicModule, ModuleLoader, StartNewResult,
 };
 use crate::kernel::owner::{OwnerHandle, OwnerTable, MAX_OWNERS, OWNER_SYSTEM};
 use crate::kernel::step_guard::{
@@ -216,6 +215,9 @@ pub struct Edge {
     /// `pump_isr_bridges` routine drains PIPE↔bridge in whichever
     /// direction the ISR-tier endpoint sits.
     pub bridge_slot: i8,
+    /// Rate class: 0=control, 1=audio, 2=video, 3=bulk.
+    /// Drives MODULE_FLOW_BUDGET grants.
+    pub rate_class: u8,
 }
 
 impl Edge {
@@ -238,6 +240,7 @@ impl Edge {
             buffer_group: 0,
             edge_class: crate::kernel::config::EdgeClass::Local,
             buffer_bytes: 0,
+            rate_class: 0,
             bridge_slot: -1,
         }
     }
@@ -263,6 +266,7 @@ impl Edge {
             buffer_group: 0,
             edge_class: crate::kernel::config::EdgeClass::Local,
             buffer_bytes: 0,
+            rate_class: 0,
             bridge_slot: -1,
         }
     }
@@ -403,6 +407,69 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
         } else {
             edge_min_size(edge)
         };
+
+        // ── Load-time capacity enforcement ──
+        // channel_write is all-or-nothing: a record larger than the
+        // ring can NEVER succeed, so a producer whose declared
+        // max_record exceeds what this ring will grant is a
+        // permanent-wedge-by-construction — refuse the graph now,
+        // with numbers, instead of freezing at runtime.
+        {
+            let from_hints = &module_hints[edge.from_module];
+            let max_record = crate::kernel::loader::find_max_record_for_port(
+                &from_hints.hints[..from_hints.count],
+                1, // port_type = out
+                edge.from_port_index,
+            );
+            {
+                const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+                if buf_size > MAX_CHAN_BYTES {
+                    // A request above the channel ceiling used to be
+                    // silently clamped — the producer then believed it
+                    // had headroom it didn't. Loud beats wedged.
+                    log::error!(
+                        "[graph] edge {}→{}: requested buffer {} exceeds the \
+                         channel ceiling {} — lower the request or split the stream.",
+                        edge.from_module,
+                        edge.to_module,
+                        buf_size,
+                        MAX_CHAN_BYTES,
+                    );
+                    return -1;
+                }
+            }
+            if max_record > 0 {
+                const MIN_CHAN_BYTES: u32 = 64;
+                const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+                // Model the grant the open below will actually make:
+                // sized requests are normalised (clamp + pow2); an
+                // unsized edge (buf_size == 0) takes the kernel's
+                // default ring, NOT 64 bytes — modelling it as 64
+                // would fail every max_record-only port spuriously.
+                let granted = if buf_size == 0 {
+                    crate::abi::CHANNEL_BUFFER_SIZE as u32
+                } else {
+                    buf_size
+                        .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
+                        .next_power_of_two()
+                };
+                if max_record > granted {
+                    log::error!(
+                        "[graph] edge {}→{}: producer port {} declares max_record={} \
+                         but the ring grants {} bytes (requested {}); an all-or-nothing \
+                         write larger than the ring can never succeed. Raise the edge's \
+                         buffer_bytes / the port's buffer_size, or lower max_record.",
+                        edge.from_module,
+                        edge.to_module,
+                        edge.from_port_index,
+                        max_record,
+                        granted,
+                        buf_size,
+                    );
+                    return -1;
+                }
+            }
+        }
 
         let producer_mod = edge.from_module as u8;
         let chan = if buf_size > 0 {
@@ -937,6 +1004,7 @@ impl ModuleHints {
                 port_type: 0,
                 port_index: 0,
                 buffer_size: 0,
+                max_record: 0,
             }; MAX_HINTS_PER_MODULE],
             count: 0,
         }
@@ -966,6 +1034,10 @@ impl ArenaInfo {
 pub struct SchedulerState {
     /// Graph edge wiring
     pub edges: [Edge; MAX_CHANNELS],
+    /// Flow-stall sampler state: last sampled ring fill +
+    /// consecutive-unchanged count per classed edge.
+    flow_last_fill: [u32; MAX_CHANNELS],
+    flow_stalls: [u8; MAX_CHANNELS],
     /// Number of populated entries in `edges` (post fan insertion).
     pub edge_count: usize,
     /// Instantiated module slots
@@ -1240,6 +1312,8 @@ impl SchedulerState {
         Self {
             edges: [Edge::simple(0, 0); MAX_CHANNELS],
             edge_count: 0,
+            flow_last_fill: [0; MAX_CHANNELS],
+            flow_stalls: [0; MAX_CHANNELS],
             modules: [const { ModuleSlot::Empty }; MAX_MODULES],
             ports: [ModulePorts::empty(); MAX_MODULES],
             hints: [ModuleHints::empty(); MAX_MODULES],
@@ -1812,6 +1886,51 @@ pub fn tick_us() -> u32 {
 
 /// Return the configured tick period for a specific domain.
 /// Falls back to global tick_us if domain has no override.
+/// MODULE_FLOW_BUDGET: per-step byte grant for the calling module's
+/// output port, derived from the wired edge's rate class and the
+/// module's domain cadence.
+///
+/// Grant rates are PACING targets, deliberately above the validation
+/// floors (floor = minimum acceptable provisioning; grant = what a
+/// healthy stream is paced at):
+///   control → 0 (no grant — modules keep their own unit-per-step
+///   pacing; a derived control grant could only regress them),
+///   audio → 4 MB/s, video → 24 MB/s, bulk → 96 MB/s.
+///
+/// Per-step grant = rate × domain tick period, clamped to
+/// [1 KiB, 256 KiB] so one step can neither starve nor monopolise.
+/// Uses the domain's configured cadence; when the adaptive-tick
+/// pacer stretches the period, modules step less often and should
+/// receive proportionally larger grants — that refinement lands when
+/// the pacer exposes its current period here.
+pub fn syscall_flow_budget(port_index: u8) -> i32 {
+    let idx = current_module_index();
+    if idx >= MAX_MODULES {
+        return 0;
+    }
+    // SAFETY: scheduler-thread read of SCHED edge/domain tables.
+    let (class, domain) = unsafe {
+        let p = &raw const SCHED;
+        let sched = &*p;
+        let mut class = 0u8;
+        for e in sched.edges.iter().take(sched.edge_count) {
+            if e.from_module == idx && e.from_port_index == port_index && e.rate_class > class {
+                class = e.rate_class;
+            }
+        }
+        (class, sched.domain_id[idx] as usize)
+    };
+    let rate_bytes_per_sec: u64 = match class {
+        1 => 4 * 1024 * 1024,
+        2 => 24 * 1024 * 1024,
+        3 => 96 * 1024 * 1024,
+        _ => return 0,
+    };
+    let tick_us = domain_tick_us(domain.min(MAX_DOMAINS - 1)).max(1) as u64;
+    let grant = rate_bytes_per_sec * tick_us / 1_000_000;
+    grant.clamp(1024, 256 * 1024) as i32
+}
+
 pub fn domain_tick_us(domain_id: usize) -> u32 {
     if domain_id < MAX_DOMAINS {
         // SAFETY: scheduler-thread-only read; domain_id bounded.
@@ -4300,6 +4419,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
             e.buffer_group = edge.buffer_group;
             e.edge_class = edge.edge_class;
             e.buffer_bytes = edge.buffer_bytes;
+            e.rate_class = edge.rate_class;
             edges[i] = e;
         } else {
             log::error!("[graph] edge {i} missing");
@@ -5251,12 +5371,13 @@ fn collect_module_hints(
             sched.in_place_writer[module_idx] = (flags_byte & 0x02) != 0;
         }
 
-        // Query hints
-        let (hints, count) = query_channel_hints(&loaded);
+        // Static manifest capacities (flag-bit-5 section): no module
+        // code executes, and wasm payloads (whose packed export
+        // tables are empty) are covered.
+        let (hints, count) = loaded.manifest_port_capacities();
         if count > 0 {
             module_hints[module_idx].hints = hints;
             module_hints[module_idx].count = count;
-            // hints stored for module
         }
     }
 }
@@ -6527,6 +6648,11 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
         return;
     }
     let di = domain_id.unwrap_or(0).min(MAX_DOMAINS - 1);
+    // Flow-stall sampling piggybacks on the same canonical per-tick
+    // entry point (default domain only — one sampler pass per tick).
+    if di == 0 {
+        sample_flow_stalls();
+    }
     let ms = crate::kernel::hal::now_millis();
     // Wall-clock cadence (~30 s), driven by `now_millis()` rather than a
     // `30_000_000 / tick_us` tick-count threshold. The tick-count form silently
@@ -6546,6 +6672,66 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
         None => log::info!("[sched] alive t={tick} elapsed_ms={ms}"),
     }
 }
+
+/// Flow-stall detector. Samples every classed (audio+) edge's ring
+/// fill on a ~2 s wall-clock cadence from the scheduler loop; a ring
+/// holding the SAME non-zero fill across consecutive samples is a
+/// frozen hop. Emits `MON_FLOW_STALL` at the threshold and every 32
+/// samples while stalled; clearing logs `MON_FLOW_RESUME` once so
+/// log readers see the episode close.
+pub fn sample_flow_stalls() {
+    const FLOW_SAMPLE_INTERVAL_MS: u64 = 2_000;
+    /// Consecutive unchanged samples before the first log (~8 s).
+    const STALL_THRESHOLD: u8 = 4;
+    let ms = crate::kernel::hal::now_millis();
+    let last = LAST_FLOW_SAMPLE_MS.load(Ordering::Relaxed);
+    if ms.wrapping_sub(last) < FLOW_SAMPLE_INTERVAL_MS {
+        return;
+    }
+    LAST_FLOW_SAMPLE_MS.store(ms, Ordering::Relaxed);
+    // SAFETY: called from the scheduler loop — single mutator of SCHED.
+    unsafe {
+        let p = &raw mut SCHED;
+        let sched = &mut *p;
+        for i in 0..sched.edge_count.min(MAX_CHANNELS) {
+            let e = &sched.edges[i];
+            if e.rate_class == 0 || e.channel < 0 {
+                continue;
+            }
+            let fill = crate::kernel::channel::channel_readable_bytes(e.channel) as u32;
+            if fill > 0 && fill == sched.flow_last_fill[i] {
+                let stalls = sched.flow_stalls[i].saturating_add(1);
+                sched.flow_stalls[i] = stalls;
+                if stalls == STALL_THRESHOLD
+                    || (stalls > STALL_THRESHOLD && stalls.is_multiple_of(32))
+                {
+                    log::warn!(
+                        "MON_FLOW_STALL edge={} from={} port={} class={} fill={} stalled_s={}",
+                        i,
+                        e.from_module,
+                        e.from_port_index,
+                        e.rate_class,
+                        fill,
+                        (stalls as u64) * FLOW_SAMPLE_INTERVAL_MS / 1000,
+                    );
+                }
+            } else {
+                if sched.flow_stalls[i] >= STALL_THRESHOLD {
+                    log::info!(
+                        "MON_FLOW_RESUME edge={} from={} after_s={}",
+                        i,
+                        e.from_module,
+                        (sched.flow_stalls[i] as u64) * FLOW_SAMPLE_INTERVAL_MS / 1000,
+                    );
+                }
+                sched.flow_stalls[i] = 0;
+            }
+            sched.flow_last_fill[i] = fill;
+        }
+    }
+}
+
+static LAST_FLOW_SAMPLE_MS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// Per-domain wall-clock timestamp (ms) of the last `[sched] alive` heartbeat,
 /// so the cadence is driven by `now_millis()` instead of a tick count that

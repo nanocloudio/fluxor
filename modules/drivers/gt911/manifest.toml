@@ -6,6 +6,9 @@ name = "touch"
 direction = "output"
 content_type = "InputEvent"
 required = true
+buffer_size = 256
+# size_of::<TouchEvent>() — one event record per write.
+max_record = 8
 
 [[resources]]
 requires_contract = "i2c"

@@ -15,6 +15,9 @@ hardware_targets = ["cm5", "bcm2712", "rp2350"]
 name = "events"
 direction = "output"
 content_type = "SurfaceTraits"
+buffer_size = 64
+# EVENT_RECORD — one 24-byte record per write.
+max_record = 24
 
 # PIC module: the param schema (width / height / modalities / gamepad_count /
 # display_count / audio_channels / audio_rate) is embedded via `define_params!`

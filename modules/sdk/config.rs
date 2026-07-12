@@ -77,6 +77,11 @@ mod profile_host {
         // u16. The `ModuleMask` bitmaps scale to match (MODULE_MASK_WORDS == 2
         // here). Edge capacity is the global MAX_GRAPH_EDGES.
         pub const MAX_MODULES: usize = 128;
+        /// Loader sanity ceiling for a single module's code segment.
+        /// 1 MiB fits media modules (the unified codec's decoder plus
+        /// its CAVLC/clip tables runs ~450 KiB) and protocol modules
+        /// that bundle firmware blobs.
+        pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
         // 256 KiB so the synth host can carry the inlined wasm browser shell
         // (runtime.html ~83 KiB + host_shims.js ~56 KiB) as http `body:`
         // routes. Smaller values silently truncate the http module's params
@@ -205,6 +210,9 @@ mod profile_wasm {
         // ≤12 MB payloads. Browser tabs have ample memory headroom; the
         // arena is paged in lazily by `memory.grow`.
         pub const STATE_ARENA_SIZE: usize = 96 * 1024 * 1024;
+        /// Loader sanity ceiling for a single module's code segment
+        /// (see the host profile's rationale).
+        pub const MAX_MODULE_CODE_SIZE: usize = 1024 * 1024;
         // Holds ALL channel ring buffers for the live graph. GPU-offload graphs
         // wire multi-MiB frame channels (a whole serialized frame — up to
         // ~1.57 MiB dense — must cross child->kernel in one ring fill)
@@ -252,6 +260,10 @@ mod profile_wasm {
 mod profile_embedded {
     pub mod kernel {
         pub const STATE_ARENA_SIZE: usize = 256 * 1024;
+        /// Loader sanity ceiling for a single module's code segment.
+        /// 384 KiB — an MCU profile can't host MiB-class media
+        /// modules anyway.
+        pub const MAX_MODULE_CODE_SIZE: usize = 384 * 1024;
         pub const BUFFER_ARENA_SIZE: usize = 64 * 1024;
         pub const MAX_MODULES: usize = 32;
         pub const MAX_MODULE_CONFIG_SIZE: usize = 4 * 1024;

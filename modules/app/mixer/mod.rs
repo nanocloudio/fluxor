@@ -410,17 +410,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(hints: *mut ChannelHint, max_hints: usize) -> usize {
-    if hints.is_null() || max_hints == 0 { return 0; }
-    unsafe {
-        // Output: 2048 bytes (256 stereo frames × 4 bytes)
-        *hints = ChannelHint { port_type: 1, port_index: 0, buffer_size: 2048 };
-    }
-    1
-}
-
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.

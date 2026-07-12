@@ -6,18 +6,26 @@ name = "mqtt_rx"
 direction = "input"
 content_type = "OctetStream"
 required = true
+# in[0]: from MQTT.
+buffer_size = 256
 
 [[ports]]
 name = "notify"
 index = 1
 direction = "input"
 content_type = "FmpMessage"
+# in[1]: FMP status from bank.
+buffer_size = 256
 
 [[ports]]
 name = "mqtt_tx"
 direction = "output"
 content_type = "OctetStream"
 required = true
+# out[0]: to MQTT.
+buffer_size = 256
+# CHAN_BUF_SIZE — event frames are guarded to total <= 192.
+max_record = 192
 
 [[ports]]
 name = "commands"

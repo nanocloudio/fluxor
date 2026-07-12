@@ -359,19 +359,4 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
     2
 }
 
-#[no_mangle]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        // out[0]: stream — sized comfortably above one full
-        // `MAX_CHUNK_SIZE` chunk so a fresh emit can land without
-        // back-pressure even when the consumer is one tick behind.
-        // The downstream (http) typically requests 65536; the
-        // kernel takes max(producer, consumer) hints, so this
-        // value matters only when the downstream isn't http.
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 65536 },
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
 include!("../../sdk/wasm_entry.rs");

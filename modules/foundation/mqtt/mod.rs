@@ -1205,18 +1205,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_channel_hints"]
-pub extern "C" fn module_channel_hints(out: *mut u8, max_len: usize) -> i32 {
-    let hints = [
-        ChannelHint { port_type: 0, port_index: 0, buffer_size: 2048 }, // in[0]: net_in (from IP)
-        ChannelHint { port_type: 0, port_index: 1, buffer_size: 256 },  // in[1]: from mesh
-        ChannelHint { port_type: 1, port_index: 0, buffer_size: 2048 }, // out[0]: net_out (to IP)
-        ChannelHint { port_type: 1, port_index: 1, buffer_size: 256 },  // out[1]: to mesh
-    ];
-    unsafe { write_channel_hints(out, max_len, &hints) }
-}
-
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.

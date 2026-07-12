@@ -35,11 +35,21 @@ content_type = "PresentationLayout"
 name = "raster"
 direction = "output"
 content_type = "VideoRaster"
+# raster: one RGB565 frame is written atomically, so the buffer must
+# hold a whole frame (≈ width*height*2). 96 KiB covers a 240×80 panel
+# (38 400 B) with headroom up to ~256×192.
+buffer_size = 98304
+# CHUNK — the frame is emitted in 8 KiB chunks with backpressure resume.
+max_record = 8192
 
 [[ports]]
 name = "commands"
 direction = "output"
 content_type = "FmpMessage"
+# Commands (FMP).
+buffer_size = 64
+# msg_write_empty: 6-byte FMP header, no payload.
+max_record = 6
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

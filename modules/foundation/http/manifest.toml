@@ -5,29 +5,37 @@ hardware_targets = ["rp2350", "bcm2712"]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+# Sized to absorb 8 KiB CMD_SEND payloads (the staging cap on aarch64)
+# plus in-flight headroom; embedded workloads stage 1600-byte payloads
+# on a 2 KiB budget.
+buffer_size = { default = 2048, bcm2712 = 16384 }
 
 [[ports]]
 name = "variables"
 index = 1
 direction = "input"
 content_type = "FmpMessage"
+buffer_size = 256
 
 [[ports]]
 name = "file_data"
 index = 2
 direction = "input"
 content_type = "OctetStream"
+buffer_size = { default = 2048, bcm2712 = 16384 }
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+buffer_size = { default = 2048, bcm2712 = 16384 }
 
 [[ports]]
 name = "file_ctrl"
 index = 1
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 256
 
 # WebSocket fan-out — populated only when a route uses
 # HANDLER_WEBSOCKET_FANOUT (handler value 5). On such routes the upgraded
@@ -45,6 +53,12 @@ name = "ws_in"
 index = 3
 direction = "input"
 content_type = "WsFrame"
+# WsFrame envelopes from ws_stream: [conn_id u32][opcode][fin][len u16]
+# [payload] — payload up to 65535 B, so the full envelope is ~65 KiB.
+# Channel writes are all-or-nothing: a default ring silently rejects
+# every envelope. aarch64 pipelines two envelopes; embedded fits
+# exactly one plus header.
+buffer_size = { default = 65600, bcm2712 = 131072 }
 
 # Module-scope observability (out[3], optional); wired to observe.telemetry.
 [[ports]]
