@@ -559,10 +559,10 @@ struct Fat32State {
     read_fill: u16,
     block_buf: [u8; BLOCK_SIZE],
 
-    /// Diagnostic tick counter — drives the periodic heartbeat
-    /// emitted by `module_step` so init-time state is still visible
-    /// after `log_net` starts streaming.
+    /// Diagnostic step counter — the activity denominator in `[fat32] tlm`
+    /// output. Timing is wall-clock.
     tick_count: u32,
+    last_observe_ms: u64,
 
     // ── Write state machine ────────────────────────────────────────
     //
@@ -689,9 +689,8 @@ struct Fat32State {
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
 }
 
-/// Cadence for the `[fat32] tlm` line. Matches the `hb` heartbeat
-/// period so the two can be correlated by the host parser.
-const FAT32_TLM_PERIOD: u32 = 5000;
+/// Shared wall-clock cadence for native telemetry, heartbeat, and the TLM line.
+const FAT32_OBSERVE_INTERVAL_MS: u64 = 5_000;
 
 impl Fat32State {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -720,6 +719,7 @@ impl Fat32State {
         self.block_offset = 0;
         self.read_fill = 0;
         self.tick_count = 0;
+        self.last_observe_ms = 0;
         self.write_out_chan = -1;
         self.telemetry_chan = -1;
         self.namespace = 1;
@@ -2589,6 +2589,7 @@ pub extern "C" fn module_new(
         } else {
             params_def::set_defaults(s);
         }
+        s.last_observe_ms = dev_millis(&*s.syscalls);
 
         0
     }
@@ -2607,7 +2608,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         s.tick_count = s.tick_count.wrapping_add(1);
-        if s.tick_count % 5000 == 0 {
+        let now_ms = dev_millis(&*s.syscalls);
+        let observe_due = now_ms.wrapping_sub(s.last_observe_ms) >= FAT32_OBSERVE_INTERVAL_MS;
+        if observe_due {
+            s.last_observe_ms = now_ms;
             // Module-scope telemetry: emit the current directory file count to
             // the `observe` collector (no-op when unwired). id 0 = file_count
             // per `[observability].metrics`; UpDownCounter since it's a gauge.
@@ -2674,15 +2678,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let scratch_ptr = s.tlm_scratch.as_mut_ptr();
         let scratch_len = s.tlm_scratch.len();
         let tick = s.tick_count;
-        dev_tlm_maybe_emit(
-            sys,
-            b"[fat32]",
-            &mut s.tlm,
-            tick,
-            FAT32_TLM_PERIOD,
-            scratch_ptr,
-            scratch_len,
-        );
+        if observe_due {
+            dev_tlm_maybe_emit(
+                sys,
+                b"[fat32]",
+                &mut s.tlm,
+                tick,
+                0,
+                scratch_ptr,
+                scratch_len,
+            );
+        }
         rc
     }
 }

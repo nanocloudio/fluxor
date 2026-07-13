@@ -92,7 +92,7 @@ const RESP_TIMEOUT_MICROS: u64 = 10_000_000; // 10 s
 /// Id-table text blob (delivered as `str` TLV chunks of ≤255 B each, appended).
 /// Sized for a large instrumented graph; the compiler bounds the injected table
 /// to this and warns rather than silently truncating mid-entry.
-const IDTABLE_MAX: usize = 1024;
+const IDTABLE_MAX: usize = 2048;
 /// Scratch for a resolved-or-synthesised metric name.
 const NAME_MAX: usize = 48;
 

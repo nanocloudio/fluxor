@@ -1,6 +1,9 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350"]
 permissions = ["platform_raw"]
+# Flush cadence, HTTP response timeout, and reconnect backoff all use
+# dev_micros; none are derived from scheduler step counts.
+timer_class = "wall_clock"
 
 # Module-scope telemetry arrives here as fixed-layout `TelemetryRecord`s
 # (modules/sdk/contracts/telemetry.rs) — the same edge `observe` and
@@ -19,12 +22,15 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 required = true
+buffer_size = { default = 2048, bcm2712 = 8192 }
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
 required = true
+buffer_size = { default = 2048, bcm2712 = 8192 }
+max_record = 2048
 
 # Forwards telemetry as OTLP/HTTP; originates none. Exempt from the
 # instrumentation contract (standards/observability.md §6).

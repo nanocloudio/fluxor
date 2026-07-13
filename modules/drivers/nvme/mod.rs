@@ -497,6 +497,12 @@ struct NvmeState {
 
     /// Step counter for periodic heartbeat.
     step_count: u32,
+    /// Wall-clock anchors for rescan/heartbeat/telemetry cadence, kept
+    /// independent of scheduler step cadence. Device-command timeouts use the
+    /// dedicated anchors above.
+    last_rescan_ms: u64,
+    last_heartbeat_ms: u64,
+    last_tlm_ms: u64,
 
     /// Block count of the in-flight read batch (1..=MAX_NLB). The
     /// streaming loop pushes `blk_nlb * BLOCK_SIZE` bytes per batch
@@ -586,8 +592,9 @@ struct NvmeState {
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
 }
 
-/// Cadence for the `[nvme] tlm` line.
-const NVME_TLM_PERIOD: u32 = 5000;
+const RESCAN_INTERVAL_MS: u64 = 5_000;
+const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+const NVME_TLM_INTERVAL_MS: u64 = 5_000;
 
 // ============================================================================
 // Parameters
@@ -1069,7 +1076,7 @@ unsafe fn zero_page(phys: u64) {
 /// or `@class=nvme`) to the kernel, which returns a handle carrying
 /// the device context. If the PCIe link hasn't trained yet the bind
 /// returns a negative errno; we stay in this state and nudge the
-/// kernel to re-enumerate every few thousand ticks until the card
+/// kernel to re-enumerate on a wall-clock cadence until the card
 /// appears.
 unsafe fn step_bind(s: &mut NvmeState) -> i32 {
     log_once(s, b"[nvme] Bind\0");
@@ -1088,7 +1095,9 @@ unsafe fn step_bind(s: &mut NvmeState) -> i32 {
     // Link may still be training; periodically force a kernel rescan
     // so the downstream card's BDF + BAR0 show up in the enumeration
     // table for the next BIND attempt.
-    if s.step_count % 5000 == 4999 {
+    let now = now_ms(s);
+    if now.wrapping_sub(s.last_rescan_ms) >= RESCAN_INTERVAL_MS {
+        s.last_rescan_ms = now;
         let _ = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
     }
     0
@@ -2553,7 +2562,9 @@ unsafe fn step_fault(s: &mut NvmeState) -> i32 {
     // because the link wasn't trained yet). Periodically re-trigger
     // kernel enumeration; if it now finds the device, retry the BAR
     // map and re-enter S_RESET.
-    if s.fault_code == 1 && s.step_count % 5000 == 4999 {
+    let now = now_ms(s);
+    if s.fault_code == 1 && now.wrapping_sub(s.last_rescan_ms) >= RESCAN_INTERVAL_MS {
+        s.last_rescan_ms = now;
         let sys = &*s.syscalls;
         let rescan = (sys.provider_call)(-1, PCIE_RESCAN, core::ptr::null_mut(), 0);
         // Re-attempt BAR map through the bound handle.
@@ -3709,6 +3720,11 @@ pub extern "C" fn module_new(
         // `-1` = no event yet; `enable_msix` creates on first need.
         s.msix_event = -1;
 
+        let now = dev_millis(&*s.syscalls);
+        s.last_rescan_ms = now;
+        s.last_heartbeat_ms = now;
+        s.last_tlm_ms = now;
+
         dev_log(&*s.syscalls, 3, b"[nvme] init\0".as_ptr(), 11);
         0
     }
@@ -3720,7 +3736,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut NvmeState);
 
     s.step_count = s.step_count.wrapping_add(1);
-    if s.step_count % 5000 == 0 {
+    let step_now_ms = now_ms(s);
+    if step_now_ms.wrapping_sub(s.last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS {
+        s.last_heartbeat_ms = step_now_ms;
         heartbeat(s);
     }
 
@@ -3754,15 +3772,21 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let sys = &*s.syscalls;
     let scratch_ptr = s.tlm_scratch.as_mut_ptr();
     let scratch_len = s.tlm_scratch.len();
-    dev_tlm_maybe_emit(
-        sys,
-        b"[nvme]",
-        &mut s.tlm,
-        s.step_count,
-        NVME_TLM_PERIOD,
-        scratch_ptr,
-        scratch_len,
-    );
+    if step_now_ms.wrapping_sub(s.last_tlm_ms) >= NVME_TLM_INTERVAL_MS {
+        s.last_tlm_ms = step_now_ms;
+        // This wall-clock gate is the sole emission trigger; `step_count` is
+        // only the reported activity denominator. Passing period=0 disables the
+        // helper's own step-cadence gate.
+        dev_tlm_maybe_emit(
+            sys,
+            b"[nvme]",
+            &mut s.tlm,
+            s.step_count,
+            0,
+            scratch_ptr,
+            scratch_len,
+        );
+    }
 
     rc
 }

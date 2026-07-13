@@ -354,7 +354,7 @@ install-rig-backends: tools loadgen-backend
 	done
 
 linux-bin: tools
-	$(CARGO) build --release --bin fluxor-linux --no-default-features --features host-linux --target aarch64-unknown-linux-gnu
+	$(CARGO) build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback --target aarch64-unknown-linux-gnu
 
 # Host-side tests for the linux runtime (the default cargo target is
 # bare-metal thumbv8m, which has no `test` crate — tests MUST name the

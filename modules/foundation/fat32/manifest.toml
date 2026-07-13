@@ -1,5 +1,8 @@
 version = "2.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
+# Filesystem state machines are readiness-driven; diagnostic/native telemetry
+# cadence uses dev_millis and contains no scheduler-step deadline.
+timer_class = "wall_clock"
 
 # FAT32 filesystem provider. Random-access reads go through the
 # FS_CONTRACT (`provider_call(-1, FS_OPEN, …)`); the kernel routes

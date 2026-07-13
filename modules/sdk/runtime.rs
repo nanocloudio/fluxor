@@ -954,6 +954,28 @@ unsafe fn dev_flow_budget(sys: &SyscallTable, port_index: u8) -> u32 {
     if r > 0 { r as u32 } else { 0 }
 }
 
+/// Per-step consumption budget for one of this module's input ports. Uses the
+/// same class and live domain period as [`dev_flow_budget`].
+#[allow(dead_code, reason = "only bounded consumer pumps use input budgets")]
+#[inline(always)]
+unsafe fn dev_input_flow_budget(
+    sys: &SyscallTable,
+    input_chan: i32,
+    input_port_index: u8,
+) -> u32 {
+    let channel = input_chan.to_le_bytes();
+    let arg = [
+        input_port_index,
+        1,
+        channel[0],
+        channel[1],
+        channel[2],
+        channel[3],
+    ];
+    let r = (sys.provider_call)(-1, 0x0C46, arg.as_ptr() as *mut u8, arg.len());
+    if r > 0 { r as u32 } else { 0 }
+}
+
 /// Log a message (kernel primitive LOG_WRITE, opcode 0x0C40). Level encoded as handle.
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 #[inline(always)]

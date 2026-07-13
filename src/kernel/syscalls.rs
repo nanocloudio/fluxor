@@ -883,6 +883,7 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
         | 0x0C43
         | 0x0C44
         | 0x0C45
+        | 0x0C46
         | 0x0C50
         | 0x0C51
         | 0x0C65
@@ -1388,13 +1389,31 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             need as i32
         }
         MODULE_FLOW_BUDGET => {
-            // arg[0] = output port index.
+            // arg[0] = graph port index. Optional arg[1]: 0=output,
+            // 1=input. Input requests may carry the raw channel
+            // descriptor in arg[2..6] for bridge/repacking resolution. The
+            // provider handle stays global (-1): raw channel handles are
+            // intentionally untagged and can collide with tracked provider
+            // handles during generic provider dispatch.
             if arg.is_null() || arg_len < 1 {
                 return crate::kernel::errno::EINVAL;
             }
             // SAFETY: non-null, len >= 1 checked above.
             let port_index = unsafe { *arg };
-            scheduler::syscall_flow_budget(port_index)
+            let input = arg_len >= 2 && unsafe { *arg.add(1) } == 1;
+            if input {
+                let channel = if arg_len >= 6 {
+                    // SAFETY: non-null and arg_len >= 6 checked above.
+                    i32::from_le_bytes(unsafe {
+                        [*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]
+                    })
+                } else {
+                    -1
+                };
+                scheduler::syscall_input_flow_budget(port_index, channel)
+            } else {
+                scheduler::syscall_flow_budget(port_index)
+            }
         }
         MODULE_INSTANCE_PARAMS => {
             let idx = scheduler::current_module_index();

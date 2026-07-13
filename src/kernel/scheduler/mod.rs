@@ -22,7 +22,7 @@
 
 use core::ptr::null;
 
-use portable_atomic::{AtomicBool, Ordering};
+use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::kernel::bitmask::ModuleMask;
 use crate::kernel::channel;
@@ -215,7 +215,7 @@ pub struct Edge {
     /// `pump_isr_bridges` routine drains PIPE↔bridge in whichever
     /// direction the ISR-tier endpoint sits.
     pub bridge_slot: i8,
-    /// Rate class: 0=control, 1=audio, 2=video, 3=bulk.
+    /// Rate class: 0=control, 1=audio, 2=video, 3=bulk, 4=transaction.
     /// Drives MODULE_FLOW_BUDGET grants.
     pub rate_class: u8,
 }
@@ -1884,10 +1884,8 @@ pub fn tick_us() -> u32 {
     }
 }
 
-/// Return the configured tick period for a specific domain.
-/// Falls back to global tick_us if domain has no override.
-/// MODULE_FLOW_BUDGET: per-step byte grant for the calling module's
-/// output port, derived from the wired edge's rate class and the
+/// MODULE_FLOW_BUDGET: per-step byte grant for one of the calling module's
+/// ports, derived from the wired edge's rate class and the
 /// module's domain cadence.
 ///
 /// Grant rates are PACING targets, deliberately above the validation
@@ -1895,14 +1893,43 @@ pub fn tick_us() -> u32 {
 /// healthy stream is paced at):
 ///   control → 0 (no grant — modules keep their own unit-per-step
 ///   pacing; a derived control grant could only regress them),
-///   audio → 4 MB/s, video → 24 MB/s, bulk → 96 MB/s.
+///   audio → 4 MB/s, video → 24 MB/s, bulk → 96 MB/s,
+///   transaction → 4 MB/s.
 ///
 /// Per-step grant = rate × domain tick period, clamped to
 /// [1 KiB, 256 KiB] so one step can neither starve nor monopolise.
-/// Uses the domain's configured cadence; when the adaptive-tick
-/// pacer stretches the period, modules step less often and should
-/// receive proportionally larger grants — that refinement lands when
-/// the pacer exposes its current period here.
+/// Uses the period currently selected by the adaptive-tick pacer, falling
+/// back to the configured cadence before the first pacing decision.
+/// Semantic priority of a rate class, independent of its wire discriminant.
+/// `Transaction` (discriminant 4) is latency-sensitive request/response traffic
+/// that sits just above `control`, NOT above the media classes — so raw
+/// discriminant order (`control 0 < audio 1 < video 2 < bulk 3 < transaction 4`)
+/// must not be used to pick the governing class on a port. Mirrors the build-time
+/// ordering in `tools/src/config.rs::validate_wiring_capacity`.
+fn rate_class_rank(class: u8) -> u8 {
+    match class {
+        0 => 0, // control
+        4 => 1, // transaction
+        1 => 2, // audio
+        2 => 3, // video
+        3 => 4, // bulk
+        _ => 0,
+    }
+}
+
+fn flow_budget_for_class(class: u8, domain: usize) -> i32 {
+    let rate_bytes_per_sec: u64 = match class {
+        1 => 4 * 1024 * 1024,
+        2 => 24 * 1024 * 1024,
+        3 => 96 * 1024 * 1024,
+        4 => 4 * 1024 * 1024,
+        _ => return 0,
+    };
+    let tick_us = pacer_current_period_us(domain.min(MAX_DOMAINS - 1)).max(1) as u64;
+    let grant = rate_bytes_per_sec * tick_us / 1_000_000;
+    grant.clamp(1024, 256 * 1024) as i32
+}
+
 pub fn syscall_flow_budget(port_index: u8) -> i32 {
     let idx = current_module_index();
     if idx >= MAX_MODULES {
@@ -1914,21 +1941,54 @@ pub fn syscall_flow_budget(port_index: u8) -> i32 {
         let sched = &*p;
         let mut class = 0u8;
         for e in sched.edges.iter().take(sched.edge_count) {
-            if e.from_module == idx && e.from_port_index == port_index && e.rate_class > class {
+            if e.from_module == idx
+                && e.from_port_index == port_index
+                && rate_class_rank(e.rate_class) > rate_class_rank(class)
+            {
                 class = e.rate_class;
             }
         }
         (class, sched.domain_id[idx] as usize)
     };
-    let rate_bytes_per_sec: u64 = match class {
-        1 => 4 * 1024 * 1024,
-        2 => 24 * 1024 * 1024,
-        3 => 96 * 1024 * 1024,
-        _ => return 0,
+    flow_budget_for_class(class, domain)
+}
+
+/// Input-port consumption budget. The logical port index is the stable graph
+/// contract. The channel descriptor is payload data (never a provider handle)
+/// and resolves runtime bridge/repacking aliases when necessary.
+pub fn syscall_input_flow_budget(port_index: u8, channel: i32) -> i32 {
+    let idx = current_module_index();
+    if idx >= MAX_MODULES {
+        return 0;
+    }
+    let (class, domain) = unsafe {
+        let p = &raw const SCHED;
+        let sched = &*p;
+        let mut class = 0u8;
+        let mut sole_classed = 0u8;
+        let mut classed_inputs = 0u8;
+        for e in sched.edges.iter().take(sched.edge_count) {
+            if e.to_module == idx && e.rate_class != 0 {
+                classed_inputs = classed_inputs.saturating_add(1);
+                sole_classed = e.rate_class;
+            }
+            let owns_port = e.to_module == idx && e.to_port_index == port_index;
+            let owns_channel = channel >= 0
+                && e.to_module == idx
+                && (e.channel == channel || e.consumer_channel == channel);
+            if (owns_port || owns_channel) && rate_class_rank(e.rate_class) > rate_class_rank(class) {
+                class = e.rate_class;
+            }
+        }
+        // Fall back only when the module has exactly one classed input, making
+        // the association unambiguous. Multiple classed inputs must identify
+        // their graph port or fail closed.
+        if class == 0 && classed_inputs == 1 {
+            class = sole_classed;
+        }
+        (class, sched.domain_id[idx] as usize)
     };
-    let tick_us = domain_tick_us(domain.min(MAX_DOMAINS - 1)).max(1) as u64;
-    let grant = rate_bytes_per_sec * tick_us / 1_000_000;
-    grant.clamp(1024, 256 * 1024) as i32
+    flow_budget_for_class(class, domain)
 }
 
 pub fn domain_tick_us(domain_id: usize) -> u32 {
@@ -2172,6 +2232,28 @@ static PACER_WAS_IDLE: [AtomicBool; MAX_DOMAINS] = [const { AtomicBool::new(fals
 static PACER_HOTSTART: [portable_atomic::AtomicU8; MAX_DOMAINS] =
     [const { portable_atomic::AtomicU8::new(0) }; MAX_DOMAINS];
 
+/// Period most recently selected for each domain's next scheduler pass.
+/// A zero value means no pacing decision has occurred since graph prepare;
+/// callers then fall back to the configured nominal cadence.
+static PACER_CURRENT_PERIOD_US: [AtomicU32; MAX_DOMAINS] =
+    [const { AtomicU32::new(0) }; MAX_DOMAINS];
+
+fn record_pacer_period_us(domain_id: usize, period_us: u32) -> u32 {
+    PACER_CURRENT_PERIOD_US[domain_id.min(MAX_DOMAINS - 1)]
+        .store(period_us.max(1), Ordering::Relaxed);
+    period_us.max(1)
+}
+
+/// Period currently governing per-step flow budgets for a domain.
+pub fn pacer_current_period_us(domain_id: usize) -> u32 {
+    let period = PACER_CURRENT_PERIOD_US[domain_id.min(MAX_DOMAINS - 1)].load(Ordering::Relaxed);
+    if period == 0 {
+        domain_tick_us(domain_id)
+    } else {
+        period
+    }
+}
+
 /// Hot-start window length in passes (§6.6). Matched to `MAX_PIPELINE_PASSES`
 /// (4) — the hop budget a single request-response round-trip can need — so the
 /// first request after idle converges at the floor rather than the relaxed tick.
@@ -2222,6 +2304,7 @@ fn pacer_reset_all() {
         PACER_WORK_TICK[d].store(false, Ordering::Relaxed);
         PACER_WAS_IDLE[d].store(false, Ordering::Relaxed);
         PACER_HOTSTART[d].store(0, Ordering::Relaxed);
+        PACER_CURRENT_PERIOD_US[d].store(0, Ordering::Relaxed);
     }
     // §7 graph-local pacer table — same reconfigure reset (a reused graph slot
     // must not inherit the prior graph's heat).
@@ -2362,7 +2445,7 @@ fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
 pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
     let flags = domain_adaptive_flags(domain_id);
     if flags == 0 {
-        return domain_tick_us(domain_id);
+        return record_pacer_period_us(domain_id, domain_tick_us(domain_id));
     }
     // Use the outer-tick accumulator, NOT BURST_SEEN_THIS_PASS (which is reset
     // per pipeline sub-pass and reads false after a flush-then-drain tick).
@@ -2410,7 +2493,7 @@ pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
         if (flags & ADAPTIVE_FLAG_CADENCE) != 0 {
             pacer_force_relaxed(domain_id, tick_max);
         }
-        return tick_max;
+        return record_pacer_period_us(domain_id, tick_max);
     }
     // §6.6 hot-start (busy pass): on the idle→busy edge, arm a bounded window of
     // `PACER_HOTSTART_PASSES` and return the §5.3 floor — the tightest safe
@@ -2443,13 +2526,14 @@ pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
             // Drive (b)'s ladder toward the floor so cadence stays tight when
             // the window ends.
             let _ = pacer_apply_cadence(domain_id, false, tick_max);
-            return floor;
+            return record_pacer_period_us(domain_id, floor);
         }
         // (b) AIMD cadence between the §5.3 floor and tick_max.
-        return pacer_apply_cadence(domain_id, idle, tick_max);
+        let period = pacer_apply_cadence(domain_id, idle, tick_max);
+        return record_pacer_period_us(domain_id, period);
     }
     // (a) enabled but this pass was busy, (b) disabled → nominal tick.
-    domain_tick_us(domain_id)
+    record_pacer_period_us(domain_id, domain_tick_us(domain_id))
 }
 
 // ===========================================================================

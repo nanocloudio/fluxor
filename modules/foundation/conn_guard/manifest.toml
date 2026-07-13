@@ -10,12 +10,15 @@ name = "frames_rx"
 direction = "input"
 content_type = "EthernetFrame"
 required = true
+buffer_size = { default = 2048, bcm2712 = 8192 }
 
 [[ports]]
 name = "frames_tx"
 direction = "output"
 content_type = "EthernetFrame"
 required = true
+buffer_size = { default = 2048, bcm2712 = 8192 }
+max_record = 1514
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]

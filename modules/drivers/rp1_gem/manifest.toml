@@ -21,12 +21,15 @@ pre_tick_drain = true
 name = "frames_tx"
 direction = "input"
 content_type = "EthernetFrame"
+buffer_size = 8192
 
 [[ports]]
 name = "frames_rx"
 direction = "output"
 content_type = "EthernetFrame"
 required = true
+buffer_size = 8192
+max_record = 1514
 
 [[resources]]
 requires_contract = "platform_nic_ring"

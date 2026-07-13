@@ -4107,10 +4107,10 @@ fn build_otlp_id_table_text(list: &[Value], manifests: &HashMap<String, Manifest
             let _ = write!(out, "{idx}/{local_id}={span};");
         }
     }
-    // The `otlp_http` exporter stores the table in a fixed `IDTABLE_MAX = 1024`
+    // The `otlp_http` exporter stores the table in a fixed `IDTABLE_MAX = 2048`
     // buffer. Bound it here at a `;` entry boundary so the device never receives
     // a truncated mid-entry name, and warn rather than silently dropping.
-    const OTLP_IDTABLE_MAX: usize = 1024;
+    const OTLP_IDTABLE_MAX: usize = 2048;
     if out.len() > OTLP_IDTABLE_MAX {
         let cut = out[..OTLP_IDTABLE_MAX]
             .rfind(';')
@@ -4450,6 +4450,17 @@ pub fn load_module_manifests_with_extra(
     modules_config: &Value,
     extra_dirs: &[&std::path::Path],
 ) -> HashMap<String, Manifest> {
+    load_module_manifests_with_extra_for_target(modules_config, extra_dirs, None)
+}
+
+/// Target-aware variant used by config generation. Capacity tables in module
+/// manifests are deployment inputs, so resolving them without the silicon id
+/// silently selects `default` even when the graph targets a larger host.
+pub fn load_module_manifests_with_extra_for_target(
+    modules_config: &Value,
+    extra_dirs: &[&std::path::Path],
+    target_silicon: Option<&str>,
+) -> HashMap<String, Manifest> {
     let mut manifests = HashMap::new();
     let list = match modules_config.as_array() {
         Some(l) => l,
@@ -4476,7 +4487,7 @@ pub fn load_module_manifests_with_extra(
         if !manifest_path.exists() {
             continue;
         }
-        match Manifest::from_toml(&manifest_path) {
+        match Manifest::from_toml_for_target(&manifest_path, target_silicon) {
             Ok(m) => {
                 manifests.insert(name.to_string(), m);
             }
@@ -4709,7 +4720,7 @@ fn resolve_edge_rate_class(
     {
         return RateClass::from_str_opt(r).ok_or_else(|| {
             Error::Config(format!(
-                "unknown rate class '{r}' (control | audio | video | bulk)"
+                "unknown rate class '{r}' (control | transaction | audio | video | bulk)"
             ))
         });
     }
@@ -4803,7 +4814,14 @@ fn validate_wiring_capacity(
         // A producer port may cap the class its step logic is
         // engineered for; a faster edge fails at build.
         if let Some(cap) = from_port.and_then(|p| p.rate_class_max) {
-            if class > cap {
+            let rank = |value: RateClass| match value {
+                RateClass::Control => 0,
+                RateClass::Transaction => 1,
+                RateClass::Audio => 2,
+                RateClass::Video => 3,
+                RateClass::Bulk => 4,
+            };
+            if rank(class) > rank(cap) {
                 return Err(Error::Config(format!(
                     "wiring[{i}] ({} → {}): edge rate class '{}' exceeds the \
                      producer port's declared rate_class_max '{}'.",
@@ -6259,7 +6277,11 @@ fn generate_config_impl(
     // timer-class gate below resolves pod modules too; `parse_modules_map` (emit,
     // base-only) just ignores the extra pod entries keyed by type.
     let manifest_src = Value::Array(validation_modules.clone());
-    let manifests = load_module_manifests_with_extra(&manifest_src, extra_module_dirs);
+    let manifests = load_module_manifests_with_extra_for_target(
+        &manifest_src,
+        extra_module_dirs,
+        resolved_target,
+    );
 
     // Adaptive-tick validation (range/D8/D9/D10 + timer-class gate). Run here,
     // after the full manifest map exists, so the timer-class gate resolves
@@ -6524,7 +6546,7 @@ fn generate_config_impl(
     //   byte 3:    bits 7:4 = from_port_index (4 bits, 0..15)
     //              bits 3:0 = to_port_index   (4 bits, 0..15)
     //   bytes 4-7: buffer_bytes (u32 LE; 0 = use module hints)
-    //   byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk)
+    //   byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk, 4=transaction)
     //              — resolved at build time from the per-edge `rate:`
     //              override or the consumer/producer port's content-
     //              type default. Consumed by the kernel's
@@ -8725,6 +8747,30 @@ mod scheduler_validation_tests {
             0,
             "byte-9 bits 0-2 (domain_id) should be 0 (no domain assigned in YAML)"
         );
+    }
+
+    #[test]
+    fn target_aware_manifest_loader_resolves_silicon_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("sized_stream");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\
+             [[ports]]\nname = \"stream_out\"\ndirection = \"output\"\n\
+             content_type = \"OctetStream\"\n\
+             buffer_size = { default = 2048, bcm2712 = 8192 }\n",
+        )
+        .expect("write manifest");
+
+        let modules = json!([{"name": "sized_stream", "type": "sized_stream"}]);
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let default_manifest = load_module_manifests_with_extra(&modules, &extras);
+        let bcm_manifest =
+            load_module_manifests_with_extra_for_target(&modules, &extras, Some("bcm2712"));
+
+        assert_eq!(default_manifest["sized_stream"].ports[0].buffer_size, 2048);
+        assert_eq!(bcm_manifest["sized_stream"].ports[0].buffer_size, 8192);
     }
 
     #[test]

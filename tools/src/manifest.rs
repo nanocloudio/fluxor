@@ -1121,7 +1121,7 @@ impl Manifest {
                         Some(fluxor_contracts::RateClass::from_str_opt(r).ok_or_else(|| {
                             Error::Module(format!(
                                 "unknown rate_class_max '{r}' \
-                                 (control | audio | video | bulk)"
+                                 (control | transaction | audio | video | bulk)"
                             ))
                         })?)
                     }

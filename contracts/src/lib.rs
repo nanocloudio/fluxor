@@ -165,6 +165,11 @@ pub enum RateClass {
     Audio = 1,
     Video = 2,
     Bulk = 3,
+    /// Latency-sensitive request/response traffic. Kept distinct from
+    /// media classes even though its initial byte-rate floor matches audio:
+    /// transaction graphs should not have to claim an audio contract merely
+    /// to opt into bounded flow pacing and stall detection.
+    Transaction = 4,
 }
 
 impl RateClass {
@@ -174,6 +179,7 @@ impl RateClass {
             "audio" => Some(RateClass::Audio),
             "video" => Some(RateClass::Video),
             "bulk" => Some(RateClass::Bulk),
+            "transaction" => Some(RateClass::Transaction),
             _ => None,
         }
     }
@@ -183,6 +189,7 @@ impl RateClass {
             RateClass::Audio => "audio",
             RateClass::Video => "video",
             RateClass::Bulk => "bulk",
+            RateClass::Transaction => "transaction",
         }
     }
 }
@@ -252,8 +259,10 @@ pub fn rate_class_floor(class: RateClass, embedded: bool) -> Option<u32> {
         (RateClass::Audio, false) => Some(1024 * 1024),
         (RateClass::Video, false) => Some(16 * 1024 * 1024),
         (RateClass::Bulk, false) => Some(64 * 1024 * 1024),
+        (RateClass::Transaction, false) => Some(1024 * 1024),
         (RateClass::Control, true) => Some(8 * 1024),
         (RateClass::Audio, true) => Some(256 * 1024),
+        (RateClass::Transaction, true) => Some(256 * 1024),
         (RateClass::Video, true) | (RateClass::Bulk, true) => None,
     }
 }

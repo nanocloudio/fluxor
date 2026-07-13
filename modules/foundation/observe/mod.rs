@@ -59,10 +59,8 @@ struct ObserveState {
     telemetry_in_chan: i32,
     /// User-configurable period between kernel-scope rounds, in milliseconds.
     interval_ms: u32,
-    /// Remaining ticks before the next kernel-scope round.
-    countdown_ticks: u32,
-    /// Ticks per round, derived from interval_ms in module_new.
-    round_ticks: u32,
+    /// Wall-clock anchor for the last kernel-scope round.
+    last_round_ms: u64,
 }
 
 impl ObserveState {
@@ -70,8 +68,7 @@ impl ObserveState {
         self.syscalls = syscalls;
         self.telemetry_in_chan = -1;
         self.interval_ms = 5000;
-        self.countdown_ticks = 0;
-        self.round_ticks = 0;
+        self.last_round_ms = 0;
     }
 }
 
@@ -320,13 +317,7 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        // The scheduler tick period isn't exposed to PIC modules; assume the
-        // documented dev default of tick_us=100 when converting interval_ms to
-        // ticks (same convention as `monitor`).
-        const ASSUMED_TICK_US: u32 = 100;
-        let ticks = s.interval_ms.saturating_mul(1000) / ASSUMED_TICK_US;
-        s.round_ticks = if ticks < 1000 { 1000 } else { ticks };
-        s.countdown_ticks = s.round_ticks;
+        s.last_round_ms = dev_millis(&*(s.syscalls));
 
         0
     }
@@ -348,11 +339,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         drain_telemetry(s);
 
         // Kernel-scope: emit a histogram round on the slow cadence.
-        if s.countdown_ticks > 0 {
-            s.countdown_ticks -= 1;
+        let now_ms = dev_millis(&*(s.syscalls));
+        if now_ms.wrapping_sub(s.last_round_ms) < u64::from(s.interval_ms.max(100)) {
             return 0;
         }
-        s.countdown_ticks = s.round_ticks;
+        s.last_round_ms = now_ms;
 
         let sys_ptr = s.syscalls;
         let count = (((*sys_ptr).provider_call)(

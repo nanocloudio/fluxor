@@ -394,9 +394,12 @@ pub const SELF_INDEX: u32 = 0x0C42;
 /// module memory split rules out the direct path. The opcode is
 /// honoured on every target.
 pub const MODULE_INSTANCE_PARAMS: u32 = 0x0C43;
-/// Per-step flow-budget grant for one of the calling module's output
-/// ports. arg[0] = output port index. Returns the byte grant for one
-/// step (0 = no classed edge on that port — keep module pacing).
+/// Per-step flow-budget grant for one of the calling module's ports.
+/// `arg[0] = port index`; optional `arg[1] = direction` (`0` output,
+/// `1` input). Input requests may carry the raw channel descriptor in
+/// `arg[2..6]` to resolve a runtime bridge/repacking alias. The provider handle
+/// is always global (`-1`) because raw channel descriptors are untagged. A
+/// one-byte request (`arg_len == 1`) is an output-port query.
 pub const MODULE_FLOW_BUDGET: u32 = 0x0C46;
 
 /// Read the hardware-provisioned ethernet MAC address from platform

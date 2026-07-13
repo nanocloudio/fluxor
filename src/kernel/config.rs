@@ -1407,7 +1407,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 /// - byte 3:    bits [7:4] = from_port_index (4-bit, 0..15)
 ///   bits [3:0] = to_port_index   (4-bit, 0..15)
 /// - bytes 4-7: buffer_bytes (u32 LE, 0 = no override)
-/// - byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk),
+/// - byte 8:    rate_class (0=control, 1=audio, 2=video, 3=bulk, 4=transaction),
 ///   resolved by the config compiler from the per-edge `rate:`
 ///   override / port content-type defaults. Consumed by the
 ///   MODULE_FLOW_BUDGET provider query.

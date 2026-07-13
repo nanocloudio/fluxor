@@ -1,6 +1,9 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 permissions = ["monitor", "reconfigure"]
+# Kernel histogram cadence uses dev_millis; telemetry draining is event/data
+# driven and independent of scheduler step counts.
+timer_class = "wall_clock"
 
 # Module-scope telemetry arrives here as fixed-layout `TelemetryRecord`s
 # (modules/sdk/contracts/telemetry.rs). Kernel-scope signals (step-time
